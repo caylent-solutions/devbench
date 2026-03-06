@@ -1,0 +1,100 @@
+You are executing a work unit from the project backlog for a project held to the standards of highly regulated financial services.
+
+Read and follow ALL instructions in:
+1. /workspaces/general-agent-env/CLAUDE.md (mandatory — all standards apply)
+2. /workspaces/general-agent-env/backlog/AGENT-INSTRUCTIONS.md
+3. The work unit file: {work_unit_path}
+
+--- EXECUTION SEQUENCE ---
+1. Read the work unit file completely before starting any work.
+2. Check all dependencies are done — do not proceed if dependencies are incomplete.
+3. Follow the TDD cycle strictly: RED (write a failing test first) -> GREEN (minimal code to pass) -> REFACTOR (clean up while tests stay green).
+4. Implement all acceptance criteria.
+5. Update documentation per AC-DOC requirements in the same commit as code changes.
+6. Verify all work by reading back written files and running tests.
+7. Update the work unit status to 'in-review' when done.
+8. Log all actions in the Comments section.
+
+--- MANDATORY STANDARDS (ENFORCED DURING EXECUTION) ---
+
+SOLID Principles:
+- Each class/method has a single responsibility.
+- Extend behavior through new code, not by modifying existing classes.
+- Subtypes are substitutable for base types.
+- Interfaces are focused and role-specific.
+- Depend on abstractions; inject all dependencies.
+
+DRY Principle:
+- Extract common logic into reusable methods, classes, or utilities.
+- No copy-paste code — shared behavior uses inheritance, composition, or delegation.
+
+Fail-Fast:
+- No fallback logic of any kind.
+- No silent error swallowing.
+- All failures exit with non-zero codes and clear, actionable error messages.
+
+12-Factor App:
+- No hardcoded configuration: URLs, credentials, timeouts, paths, ports, feature flags, identifiers, dates, retry counts, connection strings.
+- All config externalized via environment variables or framework config mechanisms.
+- Logs to stdout/stderr only.
+- Stateless processes.
+- Environment-agnostic artifacts.
+
+Security:
+- No hardcoded secrets, credentials, or API keys.
+- Parameterized queries only — no SQL string concatenation.
+- Validate and sanitize all input at system boundaries.
+- No eval(), exec(), or dynamic code execution with user input.
+- Use strong cryptography (AES-256, bcrypt/scrypt/Argon2, TLS 1.2+).
+- Generic error messages — no stack traces or internal details exposed.
+- Containers run as non-root with minimal images.
+
+Testing:
+- Real tests only — no stubs, no assert(true), no empty test bodies, no TODO tests.
+- Every assertion must be capable of failing if code is wrong.
+- Parameterized tests where appropriate.
+- Edge cases and error paths tested.
+- Integration tests use real integrations (test containers, test databases).
+
+Test Structure:
+- For repos with an existing flat tests/ layout (e.g., git-repo): follow the existing convention.
+- For repos being bootstrapped with new test harnesses: use tests/unit/test_*.py for unit tests and tests/functional/test_*.py for functional tests.
+- In structured repos, every unit test must be decorated with @pytest.mark.unit, every functional test with @pytest.mark.functional.
+- Register markers in conftest.py or pyproject.toml.
+- make test-unit must run pytest -m unit. make test-functional must run pytest -m functional.
+- Test fixtures go in tests/fixtures/.
+
+Git Completeness:
+- Before pushing, run git status to verify ALL work products (source, tests, config, docs) are staged.
+- NEVER leave test files or source files untracked after committing.
+- Every file created or modified for the work unit MUST be in the commit.
+
+Prohibited Patterns:
+- No time.sleep() or time-based delays — use readiness detection.
+- No bypass annotations: nosec, noqa, type: ignore, @SuppressWarnings, nolint, eslint-disable.
+- No --no-verify on git commands.
+- No shell scripts unless explicitly requested.
+- No Co-Authored-By attributions to Claude or Anthropic.
+
+Complete Replacement:
+- When replacing code, find ALL references to old code first.
+- Update ALL consumers in the same change.
+- Delete all superseded code — no dead code.
+- Replace old tests with new tests — do not patch tests for removed code.
+- Verify zero remaining references via grep.
+
+Evidence-Based Communication:
+- No speculative performance claims with specific numbers.
+- Use qualitative descriptions for unmeasured improvements.
+
+Documentation:
+- Update documentation in the same commit as code changes.
+- No stale references to removed or renamed code.
+- No summary documents unless explicitly requested.
+
+--- VERIFICATION REQUIREMENTS ---
+- After writing a file, read it back to confirm contents match intent.
+- After running a command, check exit codes and output.
+- After making changes, run the full test suite to verify behavior.
+- After delegating work, verify delegation completed successfully.
+- Document all verification steps in work unit comments.

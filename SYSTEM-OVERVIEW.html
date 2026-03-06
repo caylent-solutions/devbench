@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="" xml:lang="">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>Autonomous Backlog Execution System</title>
+  <style>
+    html {
+      color: #e0e0e0;
+      background-color: #1a1a2e;
+    }
+    body {
+      margin: 0 auto;
+      max-width: 48em;
+      padding: 50px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      line-height: 1.6;
+      hyphens: auto;
+      overflow-wrap: break-word;
+      text-rendering: optimizeLegibility;
+      font-kerning: normal;
+    }
+    h1, h2, h3, h4, h5, h6 {
+      color: #7ec8e3;
+      border-bottom: 1px solid #2a2a4a;
+      padding-bottom: 0.3em;
+      margin-top: 1.8em;
+    }
+    h1 { font-size: 2em; }
+    h2 { font-size: 1.5em; }
+    h3 { font-size: 1.2em; }
+    a { color: #7ec8e3; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    a:visited { color: #6ab0c8; }
+    p { margin: 0.8em 0; }
+    strong { color: #f0f0f0; }
+    code {
+      white-space: pre-wrap;
+      font-family: Menlo, Monaco, Consolas, 'Lucida Console', monospace;
+      font-size: 85%;
+      background-color: #16213e;
+      color: #a8d8ea;
+      padding: 2px 6px;
+      border-radius: 3px;
+    }
+    pre {
+      background-color: #0f1729;
+      border: 1px solid #2a2a4a;
+      border-radius: 6px;
+      padding: 16px;
+      margin: 1em 0;
+      overflow-x: auto;
+      line-height: 1.4;
+    }
+    pre code {
+      background: none;
+      padding: 0;
+      color: #a8d8ea;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      margin: 1em 0;
+      display: block;
+      overflow-x: auto;
+      font-variant-numeric: lining-nums tabular-nums;
+    }
+    th, td {
+      border: 1px solid #2a2a4a;
+      padding: 8px 12px;
+      text-align: left;
+    }
+    th {
+      background-color: #16213e;
+      color: #7ec8e3;
+      font-weight: 600;
+    }
+    tr:nth-child(even) { background-color: #16213e; }
+    tr:hover { background-color: #1a2744; }
+    blockquote {
+      border-left: 4px solid #7ec8e3;
+      margin: 1em 0;
+      padding: 0.5em 1em;
+      background-color: #16213e;
+      border-radius: 0 6px 6px 0;
+      color: #c0c0c0;
+    }
+    ul, ol { padding-left: 1.7em; margin-top: 1em; }
+    li { margin: 0.3em 0; }
+    li > ol, li > ul { margin-top: 0; }
+    hr {
+      background-color: #2a2a4a;
+      border: none;
+      height: 1px;
+      margin: 1em 0;
+    }
+    header { margin-bottom: 4em; text-align: center; }
+    .title { color: #7ec8e3; border-bottom: 2px solid #7ec8e3; }
+    img { max-width: 100%; }
+    span.smallcaps { font-variant: small-caps; }
+    div.columns { display: flex; gap: min(4vw, 1.5em); }
+    div.column { flex: auto; overflow-x: auto; }
+    div.hanging-indent { margin-left: 1.5em; text-indent: -1.5em; }
+    @media (max-width: 600px) {
+      body { font-size: 0.9em; padding: 12px; }
+      h1 { font-size: 1.8em; }
+    }
+    @media print {
+      html { background-color: white; }
+      body { background-color: transparent; color: black; font-size: 12pt; }
+      h1, h2, h3, h4 { color: black; border-bottom-color: #ccc; }
+      pre { background-color: #f5f5f5; border-color: #ccc; }
+      code { background-color: #f5f5f5; color: black; }
+      th { background-color: #f0f0f0; color: black; }
+      tr:nth-child(even) { background-color: #f9f9f9; }
+      p, h2, h3 { orphans: 3; widows: 3; }
+      h2, h3, h4 { page-break-after: avoid; }
+    }
+  </style>
+</head>
+<body>
+<header id="title-block-header">
+<h1 class="title">Autonomous Backlog Execution System</h1>
+</header>
+<h1 id="autonomous-backlog-execution-system-overview">Autonomous Backlog
+Execution System — Overview</h1>
+<p>An LLM-powered software development system that takes a
+specification-driven backlog and autonomously implements it: writing
+code, running tests, reviewing changes, creating PRs, and merging. The
+system runs unattended with LLM judges enforcing quality at every gate.
+A human can pause and intervene at any point during execution.</p>
+<h2 id="how-it-works">How It Works</h2>
+<p>A Claude Code agent reads work units from a structured backlog,
+implements each one following TDD, submits the work to four LLM judge
+agents for review, and upon approval creates a PR, waits for CI, merges,
+and moves to the next unit.</p>
+<pre><code>┌─────────────────────────────────────────────────────────────────┐
+│                        BACKLOG.md                               │
+│  Work units organized as Epics &gt; Features &gt; Stories &gt; Tasks     │
+│  Dependency DAG controls execution order                        │
+└────────────────────────────────┬────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    ORCHESTRATOR LOOP                            │
+│                                                                 │
+│  1. Find next actionable work unit (deps satisfied)             │
+│  2. Read work unit spec, ACs, and CLAUDE.md standards           │
+│  3. Create feature branch in target repo                        │
+│  4. Implement via TDD (RED → GREEN → REFACTOR)                  │
+│  5. Run the repo&#39;s task runners to validate changes             │
+│  6. Stage files and submit to judge review                      │
+│  7. If judges reject → inject prior feedback, fix, resubmit     │
+│  8. If judges approve → commit, push, create PR                 │
+│  9. Wait for GitHub CI checks to pass                           │
+│ 10. Merge PR, update submodule ref, mark done                   │
+│ 11. Loop back to step 1                                         │
+│                                                                 │
+│  Human can pause (Escape), give instructions, resume (Continue) │
+└────────────────────────────────┬────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    FOUR LLM JUDGES                              │
+│                                                                 │
+│  Each judge gathers evidence, sends it to Claude Opus 4.6,      │
+│  and the LLM makes the pass/fail decision.                      │
+│                                                                 │
+│  On re-review, prior feedback is injected to prevent the LLM    │
+│  from contradicting its previous findings.                      │
+│                                                                 │
+│  ┌──────────────┐  ┌───────────────┐  ┌───────────────┐         │
+│  │ code_review  │  │ test_review   │  │  doc_review   │         │
+│  │              │  │               │  │               │         │
+│  │ Evidence:    │  │ Evidence:     │  │ Evidence:     │         │
+│  │ • git diff   │  │ • make test   │  │ • git diff    │         │
+│  │ • work unit  │  │   output      │  │ • doc files   │         │
+│  │ • prior      │  │ • test files  │  │ • work unit   │         │
+│  │   feedback   │  │ • work unit   │  │ • prior       │         │
+│  │              │  │ • prior       │  │   feedback    │         │
+│  │ Evaluates:   │  │   feedback    │  │               │         │
+│  │ • AC coverage│  │               │  │ Evaluates:    │         │
+│  │ • SOLID/DRY  │  │ Evaluates:    │  │ • Accuracy    │         │
+│  │ • Fail-fast  │  │ • TDD cycle   │  │ • Completeness│         │
+│  │ • Security   │  │ • Test quality│  │ • Sync w/code │         │
+│  │ • Prohibited │  │ • Assertions  │  │ • Stale refs  │         │
+│  │   patterns   │  │ • Markers     │  │               │         │
+│  │ • 12-factor  │  │ • Task runner │  │               │         │
+│  │ • Task runner│  │   validation  │  │               │         │
+│  └──────┬───────┘  └──────┬────────┘  └──────┬────────┘         │
+│         │                 │                  │                  │
+│  ┌──────┴─────────────────┴──────────────────┴────────┐         │
+│  │              changes_manifest                      │         │
+│  │                                                    │         │
+│  │  Evidence: changed file list, diff summary         │         │
+│  │  Evaluates: actual changes vs. expected manifest   │         │
+│  └────────────────────────────────────────────────────┘         │
+│                                                                 │
+│  ALL FOUR must pass. Any failure → feedback to dev agent.       │
+└─────────────────────────────────────────────────────────────────┘</code></pre>
+<h2 id="full-sdlc-process">Full SDLC Process</h2>
+<p>Every work unit goes through the complete software development
+lifecycle.</p>
+<h3 id="planning-and-requirements">1. Planning and Requirements</h3>
+<ul>
+<li>Work units are pre-decomposed from a specification document into
+Epics, Features, Stories, and Tasks</li>
+<li>Each task has acceptance criteria, a changes manifest, dependency
+list, and spec references</li>
+<li>The backlog parser respects the dependency DAG — a task only becomes
+actionable when all its dependencies are done</li>
+</ul>
+<h3 id="branch-and-environment-setup">2. Branch and Environment
+Setup</h3>
+<ul>
+<li>Agent creates a feature branch
+(<code>backlog/&lt;unit-id&gt;</code>) in the target submodule repo</li>
+<li>Agent reads CLAUDE.md standards, AGENT-INSTRUCTIONS.md, and the full
+work unit spec before writing any code</li>
+</ul>
+<h3 id="test-driven-development">3. Test-Driven Development</h3>
+<ul>
+<li><strong>RED</strong>: Agent writes failing tests first, runs them,
+confirms they fail</li>
+<li><strong>GREEN</strong>: Agent writes minimal code to make tests
+pass</li>
+<li><strong>REFACTOR</strong>: Agent cleans up while tests stay
+green</li>
+<li>Each phase is logged in the work unit’s TDD Cycle Log with
+timestamps</li>
+</ul>
+<h3 id="task-runner-validation">4. Task Runner Validation</h3>
+<ul>
+<li>Agent runs the repo’s task runners and logs the output</li>
+<li>The test_review judge runs <code>make test</code> (if the repo has a
+Makefile with a test target) or falls back to bare
+<code>pytest</code></li>
+<li>This ensures the judge sees the same results as the developer,
+including environment variables, flags, and exclusions configured in the
+Makefile</li>
+<li>The LLM judges verify task runner correctness by reading the config
+from the diff and checking the agent log for execution evidence</li>
+</ul>
+<h3 id="documentation-synchronization">5. Documentation
+Synchronization</h3>
+<ul>
+<li>Documentation is updated in the same change as code (CLAUDE.md
+requirement)</li>
+<li>Agent updates README, contributing guides, and inline help
+comments</li>
+</ul>
+<h3 id="llm-judge-review">6. LLM Judge Review</h3>
+<ul>
+<li>Agent stages files and runs
+<code>judges.cli review &lt;unit-id&gt;</code></li>
+<li>Four independent LLM judges evaluate the work, each calling Claude
+Opus 4.6</li>
+<li>Each judge gathers its own evidence (diffs, test output, file
+contents, changed file lists)</li>
+<li>The LLM makes every pass/fail decision — no hardcoded rules</li>
+<li>Judges verify task runner correctness by reading the config in the
+diff and checking the agent log</li>
+</ul>
+<h3 id="review-feedback-loop-with-prior-feedback-injection">7. Review
+Feedback Loop with Prior Feedback Injection</h3>
+<p>When judges fail, the agent reads the feedback and fixes the issues.
+On re-review, the system injects the prior feedback to maintain
+consistency:</p>
+<pre><code>┌──────────────────────────────────────────────────────┐
+│                 FEEDBACK LOOP                        │
+│                                                      │
+│  Round 1: Fresh review → judge gives feedback        │
+│           &quot;Use xfail marker instead of --deselect&quot;   │
+│                    │                                 │
+│                    ▼                                 │
+│  Agent fixes code based on feedback                  │
+│                    │                                 │
+│                    ▼                                 │
+│  Round 2: Re-review with prior feedback injected     │
+│           LLM sees: &quot;Previous feedback said use      │
+│           xfail. Code now has xfail. ✓ Addressed.&quot;   │
+│                    │                                 │
+│           Without this → LLM might flip-flop:        │
+│           &quot;Use --deselect instead of xfail&quot; ✗        │
+│                                                      │
+│  Prior feedback is parsed from orchestrator.log      │
+│  and injected as an evidence section per judge.      │
+└──────────────────────────────────────────────────────┘</code></pre>
+<p>The prompt instructs: - If the code addresses prior feedback, do not
+re-raise the same issues - Do NOT contradict prior feedback by
+requesting the opposite change - If the code has NOT addressed the
+feedback, flag it again</p>
+<p>Up to 10 retry attempts before marking the unit as blocked.</p>
+<h3 id="security-review">8. Security Review</h3>
+<ul>
+<li>After all 4 judges pass, a security review judge queries GitHub
+CodeQL, Dependabot, and secret scanning alerts via the GitHub API</li>
+<li>The security judge evaluates whether open alerts are related to the
+current changes or pre-existing upstream issues</li>
+</ul>
+<h3 id="git-operations-and-pr">9. Git Operations and PR</h3>
+<ul>
+<li>Agent commits to the feature branch with selective
+<code>git add</code> (never <code>git add -A</code>)</li>
+<li>Pushes and creates a PR using
+<code>gh pr create --repo &lt;owner/name&gt;</code> (explicit repo
+targeting to avoid fork confusion)</li>
+<li>All <code>gh pr</code> commands use <code>--repo</code> to target
+the correct fork</li>
+</ul>
+<h3 id="cicd-gate">10. CI/CD Gate</h3>
+<ul>
+<li>Agent runs <code>gh pr checks --watch</code> and waits for all
+GitHub Actions checks to pass</li>
+<li>Target repos have branch protection on <code>main</code> requiring
+checks to pass</li>
+</ul>
+<h3 id="merge-and-status-update">11. Merge and Status Update</h3>
+<ul>
+<li>Agent merges the PR via
+<code>gh pr merge --squash --delete-branch</code></li>
+<li>Updates the parent repo’s submodule reference</li>
+<li>Marks the work unit as Done via <code>set_status()</code> — a single
+code path that updates both the work unit file and BACKLOG.md</li>
+<li>When all child tasks of a Story/Feature/Epic are Done, the parent is
+automatically rolled up to Done (cascading upward)</li>
+</ul>
+<h3 id="session-recovery">12. Session Recovery</h3>
+<ul>
+<li>If the agent session is interrupted, the next session recovers
+in-progress work</li>
+<li>Agent detects uncommitted changes on existing branches and continues
+from where it left off</li>
+</ul>
+<h2 id="architecture">Architecture</h2>
+<pre><code>/workspaces/general-agent-env/                     ← Parent repo (workspace root)
+├── BACKLOG.md                                     ← Master index: all work units with status
+├── CLAUDE.md                                      ← Engineering standards (mandatory for all code)
+├── backlog/                                       ← Work unit specs organized by epic
+│   ├── AGENT-INSTRUCTIONS.md                      ← Master prompt for dev agents
+│   └── E0-repo-tooling/                           ← Epics &gt; Features &gt; Stories &gt; Tasks
+│       └── ...
+├── judges/                                        ← Judge system (review authority)
+│   ├── cli.py                                     ← CLI + prior feedback log parsing
+│   ├── orchestrator.py                            ← Autonomous loop (background mode)
+│   ├── orchestrator-prompt.md                     ← Interactive mode prompt
+│   ├── config.py                                  ← Environment-driven configuration
+│   ├── constants.py                               ← Structural constants (regex, formats)
+│   ├── judges/                                    ← Judge implementations
+│   │   ├── base.py                                ← BaseJudge: LLM calls, prior feedback injection,
+│   │   │                                             evidence truncation with markers
+│   │   ├── code_review.py                         ← Git diff → LLM verdict
+│   │   ├── test_review.py                         ← make test / pytest → LLM verdict
+│   │   ├── doc_review.py                          ← Doc diff → LLM verdict
+│   │   ├── changes_manifest.py                    ← Changed files vs. manifest → LLM verdict
+│   │   ├── security_review.py                     ← GitHub alerts + diff → LLM verdict
+│   │   ├── blocker_resolver.py                    ← Dependency and blocker assessment
+│   │   ├── git_ops.py                             ← Commit, push, PR, merge, CI checks
+│   │   └── backlog_manager.py                     ← Status sync, rollup, traceability
+│   ├── prompts/                                   ← LLM system prompts (one per judge)
+│   ├── tests/                                     ← ~298 tests
+│   ├── requirements.txt                           ← Runtime dependencies (anthropic)
+│   └── requirements-dev.txt                       ← Dev dependencies (pytest, ruff, bandit, mypy)
+└── &lt;repo-submodules&gt;/                             ← Target repos as git submodules</code></pre>
+<h2 id="key-design-decisions">Key Design Decisions</h2>
+<table>
+<colgroup>
+<col style="width: 47%" />
+<col style="width: 52%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Decision</th>
+<th>Rationale</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>LLM-only verdicts</td>
+<td>No hardcoded pass/fail rules. The LLM evaluates context, intent, and
+quality.</td>
+</tr>
+<tr class="even">
+<td>Evidence gathering is deterministic</td>
+<td>Git diffs, test output, file lists collected reliably. Only the
+judgment is LLM.</td>
+</tr>
+<tr class="odd">
+<td>Prior feedback injection</td>
+<td>Re-reviews include previous feedback to prevent contradictory
+findings across rounds. Parsed from orchestrator log per judge per
+unit.</td>
+</tr>
+<tr class="even">
+<td>Task runner integration</td>
+<td>test_review runs <code>make test</code> when available, respecting
+repo-configured env vars and flags. Falls back to bare
+<code>pytest</code>.</td>
+</tr>
+<tr class="odd">
+<td>Evidence truncation markers</td>
+<td>Truncated content includes
+<code>[... TRUNCATED — showing N of M chars]</code> so the LLM knows
+it’s seeing a preview, not an incomplete file.</td>
+</tr>
+<tr class="even">
+<td>Four independent judges</td>
+<td>Separation of concerns: code quality, test quality, documentation,
+and scope control evaluated independently.</td>
+</tr>
+<tr class="odd">
+<td>Fail-fast feedback loop</td>
+<td>Up to 10 retry attempts with specific feedback. Agent fixes real
+issues, not noise.</td>
+</tr>
+<tr class="even">
+<td>Single status update path</td>
+<td><code>set_status()</code> always updates both the work unit file and
+BACKLOG.md. No drift possible.</td>
+</tr>
+<tr class="odd">
+<td>Automatic status rollup</td>
+<td>When all children of a Story/Feature/Epic are Done, parent
+auto-rolls to Done. Cascades upward.</td>
+</tr>
+<tr class="even">
+<td>Exact ID matching</td>
+<td>Status updates match the ID cell exactly, not as a substring.</td>
+</tr>
+<tr class="odd">
+<td>Case-insensitive status matching</td>
+<td>Recognizes both <code>in-queue</code> (lowercase) and
+<code>In Queue</code> (title-case). Writes lowercase.</td>
+</tr>
+<tr class="even">
+<td>Explicit <code>--repo</code> on all <code>gh</code> commands</td>
+<td>Prevents PRs from being created against upstream parent repos in
+fork workflows.</td>
+</tr>
+<tr class="odd">
+<td>Dynamic default branch resolution</td>
+<td><code>git rev-parse --abbrev-ref origin/HEAD</code> — works with
+main, master, or any default.</td>
+</tr>
+<tr class="even">
+<td>Graceful timeout handling</td>
+<td><code>_run_command()</code> catches <code>TimeoutExpired</code> and
+returns it as evidence instead of crashing.</td>
+</tr>
+<tr class="odd">
+<td>No commit before judge approval</td>
+<td>Agents stage files but don’t commit until all judges pass.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="evidence-gathering">Evidence Gathering</h2>
+<p>Each judge collects evidence from the repo and sends it to the LLM.
+The evidence sources cover all git states.</p>
+<table>
+<colgroup>
+<col style="width: 34%" />
+<col style="width: 27%" />
+<col style="width: 38%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Evidence Source</th>
+<th>Git Command</th>
+<th>What It Captures</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Staged changes</td>
+<td><code>git diff --cached</code></td>
+<td>Files added with <code>git add</code> but not committed</td>
+</tr>
+<tr class="even">
+<td>Unstaged changes</td>
+<td><code>git diff</code></td>
+<td>Modified tracked files not yet staged</td>
+</tr>
+<tr class="odd">
+<td>Untracked files</td>
+<td><code>git ls-files --others --exclude-standard</code></td>
+<td>New files not yet added</td>
+</tr>
+<tr class="even">
+<td>Branch changes</td>
+<td><code>git diff &lt;default-branch&gt;</code></td>
+<td>All commits on the feature branch vs. default</td>
+</tr>
+<tr class="odd">
+<td>Prior feedback</td>
+<td>Orchestrator log parsing</td>
+<td>Most recent feedback per judge for this unit</td>
+</tr>
+</tbody>
+</table>
+<p>The default branch is resolved dynamically — no hardcoded
+<code>main</code> or <code>master</code>.</p>
+<h2 id="github-security-configuration">GitHub Security
+Configuration</h2>
+<p>Target repos have security features enabled and branch protection
+configured:</p>
+<table>
+<colgroup>
+<col style="width: 40%" />
+<col style="width: 59%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Feature</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Dependabot vulnerability alerts</td>
+<td>Automated dependency vulnerability detection</td>
+</tr>
+<tr class="even">
+<td>Automated security fixes</td>
+<td>Auto-generated PRs for vulnerable dependencies</td>
+</tr>
+<tr class="odd">
+<td>CodeQL scanning</td>
+<td>Static analysis for security vulnerabilities</td>
+</tr>
+<tr class="even">
+<td>Secret scanning</td>
+<td>Detection of committed secrets and credentials</td>
+</tr>
+<tr class="odd">
+<td>Push protection</td>
+<td>Blocks pushes containing detected secrets</td>
+</tr>
+<tr class="even">
+<td>Branch protection on main</td>
+<td>PRs required, no direct push, no force push</td>
+</tr>
+<tr class="odd">
+<td>Required CI checks</td>
+<td>All checks must pass before merge</td>
+</tr>
+</tbody>
+</table>
+</body>
+</html>

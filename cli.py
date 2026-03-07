@@ -45,7 +45,7 @@ from judges.judges.doc_review import DocReviewJudge
 from judges.judges.security_review import SecurityReviewJudge
 from judges.judges.test_review import TestReviewJudge
 from judges.log_setup import setup_logging
-from judges.work_unit import WorkUnit
+from judges.work_unit import WorkUnit, WorkUnitStatus
 
 logger = logging.getLogger("judges.cli")
 
@@ -57,16 +57,25 @@ def cmd_status() -> int:
 
     counts: dict[str, int] = {}
     for unit in units:
-        key = unit.status.value
+        key = unit.status.value.lower()
         counts[key] = counts.get(key, 0) + 1
 
     total = len(units)
     print("Backlog Status Summary")
     print("=" * STATUS_SEPARATOR_WIDTH)
     for status_val in DISPLAY_STATUS_VALUES:
-        count = counts.get(status_val, 0)
+        count = counts.get(status_val.lower(), 0)
         print(f"  {status_val:<15} {count:>4}")
     print(f"  {'TOTAL':<15} {total:>4}")
+
+    active = [
+        u for u in units
+        if u.status in (WorkUnitStatus.IN_PROGRESS, WorkUnitStatus.IN_REVIEW)
+    ]
+    if active:
+        print("\nActive work units:")
+        for u in active:
+            print(f"  [{u.status.value}] {u.id} — {u.title}")
 
     actionable = parser.get_parallel_candidates(units)
     if actionable:

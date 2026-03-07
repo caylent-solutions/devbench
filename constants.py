@@ -53,7 +53,7 @@ SECURITY_ALERT_CATEGORIES: list[tuple[str, str]] = [
 # ---------------------------------------------------------------------------
 # Backlog status display values (used in CLI status summaries)
 # ---------------------------------------------------------------------------
-DISPLAY_STATUS_VALUES: list[str] = ["in-queue", "in-progress", "in-review", "done", "blocked"]
+DISPLAY_STATUS_VALUES: list[str] = ["In Queue", "In Progress", "In Review", "Done", "Blocked"]
 
 # Backlog manager recognized status labels (title-case, as in markdown tables)
 TABLE_STATUS_VALUES: frozenset[str] = frozenset(

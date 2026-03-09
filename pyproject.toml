@@ -1,0 +1,92 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "devbench"
+version = "0.1.0"
+description = "Autonomous SDLC orchestration system"
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=0.84.0",
+    "boto3>=1.35.0",
+    "botocore>=1.35.0",
+]
+
+[project.scripts]
+devbench = "devbench.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/devbench"]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=9.0.0",
+    "ruff>=0.15.0",
+    "bandit>=1.8.0",
+    "mypy>=1.15.0",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+src = ["src"]
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes
+    "I",      # isort
+    "N",      # pep8-naming
+    "UP",     # pyupgrade
+    "B",      # flake8-bugbear
+    "A",      # flake8-builtins
+    "C4",     # flake8-comprehensions
+    "DTZ",    # flake8-datetimez
+    "ISC",    # flake8-implicit-str-concat
+    "ICN",    # flake8-import-conventions
+    "PIE",    # flake8-pie
+    "PT",     # flake8-pytest-style
+    "RET",    # flake8-return
+    "SIM",    # flake8-simplify
+    "TCH",    # flake8-type-checking
+    "ARG",    # flake8-unused-arguments
+    "PTH",    # flake8-use-pathlib
+    "ERA",    # eradicate
+    "PL",     # pylint
+    "RUF",    # ruff-specific
+    "S",      # flake8-bandit
+]
+ignore = [
+    "S603",    # subprocess calls — needed for git/gh/claude CLI
+    "S607",    # partial executable path — we call known tools
+    "PLR0913", # too many arguments — judges need context
+    "S101",    # assert in tests
+    "S105",    # Possible hardcoded password — Verdict.PASS is not a password
+    "PLW1510", # subprocess.run without check — we check returncode manually
+    "S108",    # Insecure temp file — /tmp path is configurable via env var
+    "ARG002",  # unused method args — abstract base class requires signature conformance
+    "PLR2004", # magic values — thresholds are self-documenting in context
+    "PLR0915", # too many statements — orchestrator process_work_unit is a state machine
+    "SIM117",  # nested with — clearer in some test patterns
+    "RUF059",  # unpacked unused var — we unpack for clarity of tuple structure
+    "RUF005",  # list concatenation — ["git"] + args is clear
+    "PLC0415", # import not at top level — some judges do conditional imports
+    "TC003",   # move import to type-checking block — not needed for this project
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["ARG", "PLR2004", "S", "TCH", "PLC0415", "E741", "PT", "SIM117", "RUF059"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "tests"]
+python_classes = ["Test*"]
+filterwarnings = [
+    "ignore::pytest.PytestCollectionWarning",
+]

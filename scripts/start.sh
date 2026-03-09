@@ -79,8 +79,8 @@ echo ""
 echo "=== Step 5: Launching backlog orchestrator ==="
 nohup bash -c "
 source $TOKEN_FILE
-cd $WORKSPACE_DIR
-python3 -m judges.orchestrator
+cd $JUDGES_DIR
+uv run python -m devbench.execution.orchestrator
 " > "$LOG_FILE" 2>&1 &
 ORCHESTRATOR_PID=$!
 echo "Orchestrator PID: $ORCHESTRATOR_PID"
@@ -97,5 +97,5 @@ fi
 echo ""
 echo "=== Running ==="
 echo "Log:    tail -f $LOG_FILE"
-echo "Status: cd $JUDGES_DIR && python3 -m judges.cli status"
+echo "Status: cd $JUDGES_DIR && uv run python -m devbench.cli status"
 echo "Stop:   kill $ORCHESTRATOR_PID $REFRESHER_PID"

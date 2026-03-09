@@ -1,13 +1,14 @@
-"""Tests for judges.judges.doc_review module."""
+"""Tests for judges.doc_review module."""
 
 from __future__ import annotations
 
 from pathlib import Path
 from unittest.mock import patch
 
-from judges.judges.base import Verdict
-from judges.judges.doc_review import DocReviewJudge
-from judges.testing import make_llm_pass_result
+from testing import make_llm_pass_result
+
+from devbench.judges.base import Verdict
+from devbench.judges.doc_review import DocReviewJudge
 
 
 class TestDocReviewInit:

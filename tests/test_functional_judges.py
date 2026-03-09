@@ -10,15 +10,16 @@ import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
-from judges.judges.base import JudgeResult, Verdict
-from judges.judges.blocker_resolver import BlockerResolverJudge
-from judges.judges.changes_manifest import ChangesManifestJudge
-from judges.judges.code_review import CodeReviewJudge
-from judges.judges.doc_review import DocReviewJudge
-from judges.judges.git_ops import GitOpsJudge
-from judges.judges.security_review import SecurityReviewJudge
-from judges.judges.test_review import TestReviewJudge
-from judges.testing import make_llm_pass_result
+from testing import make_llm_pass_result
+
+from devbench.github.git_ops import GitOpsJudge
+from devbench.judges.base import JudgeResult, Verdict
+from devbench.judges.blocker_resolver import BlockerResolverJudge
+from devbench.judges.changes_manifest import ChangesManifestJudge
+from devbench.judges.code_review import CodeReviewJudge
+from devbench.judges.doc_review import DocReviewJudge
+from devbench.judges.security_review import SecurityReviewJudge
+from devbench.judges.test_review import TestReviewJudge
 
 
 def _init_repo(path: Path) -> None:
@@ -217,7 +218,7 @@ class TestSecurityReviewFunctional:
         judge = SecurityReviewJudge()
 
         with patch.object(judge, "_fetch_alerts", return_value=[]):
-            with patch("judges.judges.security_review.get_gh_token", return_value="tok"):
+            with patch("devbench.judges.security_review.get_gh_token", return_value="tok"):
                 with patch.object(judge, "_llm_evaluate", return_value=make_llm_pass_result("security_review")):
                     with patch.object(judge, "_get_diff", return_value=""):
                         result = judge.evaluate(wu, repo, repo="caylent-solutions/git-repo")
@@ -242,7 +243,7 @@ class TestSecurityReviewFunctional:
 
         mock_alerts = [{"rule": {"id": "sql", "description": "SQL injection"}}]
         with patch.object(judge, "_fetch_alerts", return_value=mock_alerts):
-            with patch("judges.judges.security_review.get_gh_token", return_value="tok"):
+            with patch("devbench.judges.security_review.get_gh_token", return_value="tok"):
                 with patch.object(judge, "_llm_evaluate", return_value=fail_result):
                     with patch.object(judge, "_get_diff", return_value=""):
                         result = judge.evaluate(wu, repo, repo="caylent-solutions/git-repo")

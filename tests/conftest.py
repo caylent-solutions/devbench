@@ -4,18 +4,18 @@ from __future__ import annotations
 
 import os
 
-# Redirect log file to /tmp so tests never write to the real orchestrator log.
-# Must be set before any judges modules are imported.
-os.environ["JUDGE_LOG_FILE"] = "/tmp/judges-test-orchestrator.log"
+# Set required env vars before any devbench modules are imported.
+# config.py raises RuntimeError at import time if these are unset.
+os.environ.setdefault("JUDGE_CLAUDE_MODEL", "test-model")
+os.environ.setdefault("JUDGE_LOG_FILE", "/tmp/judges-test-orchestrator.log")
 
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from testing import make_llm_pass_result
 
-from judges.judges.base import Verdict
-from judges.testing import make_llm_pass_result
-from judges.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
+from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
 
 # ---------------------------------------------------------------------------
 # Work-unit markdown template
@@ -196,5 +196,5 @@ def mock_llm_pass():
     def _mock_llm_evaluate(self, system_prompt, evidence_sections, cwd=None, timeout=None):
         return make_llm_pass_result(self.name)
 
-    with patch("judges.judges.base.BaseJudge._llm_evaluate", _mock_llm_evaluate):
+    with patch("devbench.judges.base.BaseJudge._llm_evaluate", _mock_llm_evaluate):
         yield

@@ -1,13 +1,14 @@
-"""Tests for judges.judges.blocker_resolver module."""
+"""Tests for judges.blocker_resolver module."""
 
 from __future__ import annotations
 
 from pathlib import Path
 from unittest.mock import patch
 
-from judges.judges.base import Verdict
-from judges.judges.blocker_resolver import BlockerResolverJudge
-from judges.testing import make_llm_pass_result
+from testing import make_llm_pass_result
+
+from devbench.judges.base import Verdict
+from devbench.judges.blocker_resolver import BlockerResolverJudge
 
 
 class TestBlockerResolverInit:

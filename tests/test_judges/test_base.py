@@ -1,4 +1,4 @@
-"""Tests for judges.judges.base module — _llm_evaluate, _parse_llm_response, and shared utilities."""
+"""Tests for judges.base module — _llm_evaluate, _parse_llm_response, and shared utilities."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 import anthropic as anthropic_mod
 import pytest
 
-from judges.judges.base import BaseJudge, JudgeResult, Verdict
+from devbench.judges.base import BaseJudge, JudgeResult, Verdict
 
 
 def _make_result(
@@ -97,8 +97,8 @@ class TestLlmEvaluate:
         mock_client.messages.create.return_value = mock_message
 
         with (
-            patch("judges.judges.base.get_anthropic_api_key", return_value="sk-ant-test"),
-            patch("judges.judges.base.anthropic.Anthropic", return_value=mock_client),
+            patch("devbench.judges.base.get_anthropic_api_key", return_value="sk-ant-test"),
+            patch("devbench.judges.base.anthropic.Anthropic", return_value=mock_client),
         ):
             result = judge._llm_evaluate(
                 system_prompt="Test prompt",
@@ -120,8 +120,8 @@ class TestLlmEvaluate:
         mock_client.messages.create.return_value = mock_message
 
         with (
-            patch("judges.judges.base.get_anthropic_api_key", return_value="sk-ant-test"),
-            patch("judges.judges.base.anthropic.Anthropic", return_value=mock_client),
+            patch("devbench.judges.base.get_anthropic_api_key", return_value="sk-ant-test"),
+            patch("devbench.judges.base.anthropic.Anthropic", return_value=mock_client),
         ):
             judge._llm_evaluate(
                 system_prompt="Test prompt",
@@ -145,8 +145,8 @@ class TestLlmEvaluate:
         mock_client.messages.create.return_value = mock_message
 
         with (
-            patch("judges.judges.base.get_anthropic_api_key", return_value="sk-ant-test"),
-            patch("judges.judges.base.anthropic.Anthropic", return_value=mock_client),
+            patch("devbench.judges.base.get_anthropic_api_key", return_value="sk-ant-test"),
+            patch("devbench.judges.base.anthropic.Anthropic", return_value=mock_client),
         ):
             judge._llm_evaluate(
                 system_prompt="Test prompt",
@@ -168,8 +168,8 @@ class TestLlmEvaluate:
         )
 
         with (
-            patch("judges.judges.base.get_anthropic_api_key", return_value="sk-ant-test"),
-            patch("judges.judges.base.anthropic.Anthropic", return_value=mock_client),
+            patch("devbench.judges.base.get_anthropic_api_key", return_value="sk-ant-test"),
+            patch("devbench.judges.base.anthropic.Anthropic", return_value=mock_client),
         ):
             result = judge._llm_evaluate(
                 system_prompt="Test prompt",
@@ -192,8 +192,8 @@ class TestLlmEvaluate:
         large_content = "x" * 20000
 
         with (
-            patch("judges.judges.base.get_anthropic_api_key", return_value="sk-ant-test"),
-            patch("judges.judges.base.anthropic.Anthropic", return_value=mock_client),
+            patch("devbench.judges.base.get_anthropic_api_key", return_value="sk-ant-test"),
+            patch("devbench.judges.base.anthropic.Anthropic", return_value=mock_client),
         ):
             judge._llm_evaluate(
                 system_prompt="Test prompt",
@@ -210,7 +210,7 @@ class TestLlmEvaluate:
     def test_raises_when_no_credentials(self) -> None:
         judge = _ConcreteJudge("test_judge")
 
-        with patch("judges.judges.base.get_anthropic_api_key", side_effect=RuntimeError("No credentials")):
+        with patch("devbench.judges.base.get_anthropic_api_key", side_effect=RuntimeError("No credentials")):
             with pytest.raises(RuntimeError, match="No credentials"):
                 judge._llm_evaluate(
                     system_prompt="Test prompt",

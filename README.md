@@ -50,7 +50,7 @@ Alternatively, set `JUDGE_USE_BEDROCK=1` to use AWS Bedrock for LLM calls instea
 ## How It Works
 
 ```
-Orchestrator (orchestrator.py / interactive Claude session)
+Orchestrator (execution/orchestrator.py / interactive Claude session)
   │
   ├── Parse BACKLOG.md → find next actionable work unit
   ├── Implement work unit via TDD (RED → GREEN → REFACTOR)
@@ -108,7 +108,7 @@ This prevents the LLM from mistaking system-truncated previews for incomplete so
 ### Log file
 
 ```bash
-tail -f judges/logs/orchestrator.log
+tail -f src/devbench/logs/orchestrator.log
 ```
 
 ### Work unit audit trail
@@ -120,7 +120,8 @@ Every work unit `.md` file has a `## Comments` section with timestamped entries 
 All commands run from the parent workspace root (the directory containing the `devbench` checkout):
 
 ```bash
-python3 -m judges.cli <command> [args]
+devbench <command> [args]
+# or: python3 -m devbench <command> [args]
 ```
 
 | Command | Arguments | Description |
@@ -155,47 +156,55 @@ make clean                # Remove caches
 ## Architecture
 
 ```
-judges/
-├── cli.py                     ← CLI entry point (with prior feedback parsing)
-├── orchestrator.py            ← Main loop: parse backlog, dispatch, review, merge
-├── orchestrator-prompt.md     ← System prompt for interactive Claude mode
-├── config.py                  ← Environment-driven configuration (all env vars)
-├── constants.py               ← Centralized structural constants (regex, formats)
-├── backlog_parser.py          ← Parses BACKLOG.md and work unit .md files
-├── work_unit.py               ← WorkUnit dataclass and status management
-├── claude_executor.py         ← Spawns Claude Code dev agents
-├── report.py                  ← Session progress report generator (velocity, ETA)
-├── github_security.py         ← GitHub security API integration
-├── log_setup.py               ← Dual logging (stdout + file)
-├── testing.py                 ← Shared test utilities and fixtures
-├── prompts/                   ← External prompt files for each judge
-│   ├── code_review.txt        ← 46 review rules (SOLID, DRY, 12-factor, security)
-│   ├── test_review.txt        ← 42 test quality rules (TDD, stubs, markers)
-│   ├── doc_review.txt         ← Documentation accuracy and completeness
-│   ├── changes_manifest.txt   ← Scope control and manifest verification
-│   ├── security_review.txt    ← Security alert evaluation
-│   ├── blocker_resolver.txt   ← Dependency and blocker assessment
-│   └── executor.txt           ← Dev agent execution prompt
-├── judges/
-│   ├── base.py                ← BaseJudge: LLM calls, prior feedback injection
-│   ├── code_review.py         ← Git diff + work unit → LLM verdict
-│   ├── test_review.py         ← make test / pytest + test files → LLM verdict
-│   ├── doc_review.py          ← Doc diff + work unit → LLM verdict
-│   ├── changes_manifest.py    ← Changed files vs. manifest → LLM verdict
-│   ├── security_review.py     ← GitHub alerts + diff → LLM verdict
-│   ├── blocker_resolver.py    ← Dependency and blocker assessment
-│   ├── git_ops.py             ← Commit, push, PR, merge, CI checks
-│   └── backlog_manager.py     ← Status sync, rollup, traceability
-├── tests/                     ← ~310 tests
+devbench/
+├── src/devbench/                  ← Installable package (pip install -e .)
+│   ├── cli.py                     ← CLI entry point (devbench <command>)
+│   ├── config.py                  ← Environment-driven configuration (all env vars)
+│   ├── constants.py               ← Centralized structural constants (regex, formats)
+│   ├── log_setup.py               ← Dual logging (stdout + file)
+│   ├── backlog/
+│   │   ├── parser.py              ← Parses BACKLOG.md and work unit .md files
+│   │   ├── work_unit.py           ← WorkUnit dataclass and status management
+│   │   └── manager.py             ← Status sync, rollup, traceability
+│   ├── execution/
+│   │   ├── orchestrator.py        ← Main loop: parse backlog, dispatch, review, merge
+│   │   └── executor.py            ← Spawns Claude Code dev agents
+│   ├── github/
+│   │   ├── git_ops.py             ← Commit, push, PR, merge, CI checks
+│   │   └── security.py            ← GitHub security API integration
+│   ├── judges/
+│   │   ├── base.py                ← BaseJudge: LLM calls, prior feedback injection
+│   │   ├── code_review.py         ← Git diff + work unit → LLM verdict
+│   │   ├── test_review.py         ← make test / pytest + test files → LLM verdict
+│   │   ├── doc_review.py          ← Doc diff + work unit → LLM verdict
+│   │   ├── changes_manifest.py    ← Changed files vs. manifest → LLM verdict
+│   │   ├── security_review.py     ← GitHub alerts + diff → LLM verdict
+│   │   └── blocker_resolver.py    ← Dependency and blocker assessment
+│   ├── reporting/
+│   │   └── report.py              ← Session progress report generator (velocity, ETA)
+│   └── prompts/                   ← Prompt loader (reads from top-level prompts/)
+├── prompts/                       ← External prompt files for each judge
+│   ├── code_review.txt            ← 46 review rules (SOLID, DRY, 12-factor, security)
+│   ├── test_review.txt            ← 42 test quality rules (TDD, stubs, markers)
+│   ├── doc_review.txt             ← Documentation accuracy and completeness
+│   ├── changes_manifest.txt       ← Scope control and manifest verification
+│   ├── security_review.txt        ← Security alert evaluation
+│   ├── blocker_resolver.txt       ← Dependency and blocker assessment
+│   └── executor.txt               ← Dev agent execution prompt
+├── tests/
+│   ├── conftest.py                ← Shared fixtures
+│   ├── testing.py                 ← Shared test utilities
+│   ├── test_backlog/              ← parser, work_unit, manager tests
+│   ├── test_execution/            ← executor, orchestrator tests
+│   ├── test_github/               ← git_ops, security tests
+│   ├── test_judges/               ← base, code_review, test_review, … tests
+│   └── test_reporting/            ← report tests
 ├── scripts/
-│   ├── start.sh               ← Background start script
-│   └── start-interactive.sh   ← Interactive Claude session start script
-├── requirements.txt           ← Runtime dependencies
-├── requirements-dev.txt       ← Dev dependencies (pytest, ruff, bandit, mypy)
-├── Makefile                   ← lint, format, check, test, validate, install
-├── ruff.toml                  ← Linter configuration
-├── pytest.ini                 ← Test configuration
-└── README.md                  ← This file
+│   ├── start.sh                   ← Background start script
+│   └── start-interactive.sh       ← Interactive Claude session start script
+├── pyproject.toml                 ← Build config, dependencies, ruff/mypy settings
+├── Makefile                       ← lint, format, check, test, validate, install
+└── README.md                      ← This file
 ```
 
 ### Design Principles
@@ -284,7 +293,7 @@ Restarting picks up where you left off — `done` units are skipped, and `in-pro
 After `JUDGE_MAX_RETRIES` failures (default: 10), the unit is marked `blocked`. Check the Comments section of the work unit file for the feedback trail.
 
 ### Judge contradicts its previous feedback
-This should not happen with the prior feedback injection. If it does, check whether the orchestrator log has the previous feedback entries (`grep "judge feedback for <unit-id>" judges/logs/orchestrator.log`).
+This should not happen with the prior feedback injection. If it does, check whether the orchestrator log has the previous feedback entries (`grep "judge feedback for <unit-id>" src/devbench/logs/orchestrator.log`).
 
 ### GitHub token expired
 ```bash

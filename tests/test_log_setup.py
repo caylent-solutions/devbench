@@ -6,7 +6,7 @@ import logging
 from pathlib import Path
 from unittest.mock import patch
 
-import judges.log_setup as log_setup_mod
+import devbench.log_setup as log_setup_mod
 
 
 class TestSetupLogging:

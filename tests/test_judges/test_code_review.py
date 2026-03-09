@@ -1,4 +1,4 @@
-"""Tests for judges.judges.code_review module."""
+"""Tests for judges.code_review module."""
 
 from __future__ import annotations
 
@@ -6,9 +6,10 @@ import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
-from judges.judges.base import Verdict
-from judges.judges.code_review import CodeReviewJudge
-from judges.testing import make_llm_fail_result, make_llm_pass_result
+from testing import make_llm_fail_result, make_llm_pass_result
+
+from devbench.judges.base import Verdict
+from devbench.judges.code_review import CodeReviewJudge
 
 
 class TestCodeReviewJudgeInit:

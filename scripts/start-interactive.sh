@@ -17,7 +17,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 JUDGES_DIR="$(dirname "$SCRIPT_DIR")"
 WORKSPACE_DIR="$(dirname "$JUDGES_DIR")"
 TOKEN_FILE="/tmp/gh_token_env"
-PROMPT_FILE="$JUDGES_DIR/orchestrator-prompt.md"
+PROMPTS_DIR="${JUDGE_PROMPTS_DIR:-$JUDGES_DIR/prompts}"
+PROMPT_FILE="$PROMPTS_DIR/orchestrator-prompt.md"
 
 # Source cached token if available (persists across terminals)
 if [[ -z "${GH_TOKEN:-}" && -f "$TOKEN_FILE" ]]; then

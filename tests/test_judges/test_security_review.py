@@ -1,4 +1,4 @@
-"""Tests for judges.judges.security_review module."""
+"""Tests for judges.security_review module."""
 
 from __future__ import annotations
 
@@ -7,10 +7,10 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from testing import make_llm_pass_result
 
-from judges.judges.base import Verdict
-from judges.judges.security_review import SecurityReviewJudge
-from judges.testing import make_llm_pass_result
+from devbench.judges.base import Verdict
+from devbench.judges.security_review import SecurityReviewJudge
 
 
 class TestSecurityReviewInit:
@@ -44,7 +44,7 @@ class TestEvaluate:
 
         judge = SecurityReviewJudge()
         with patch.object(judge, "_fetch_alerts", return_value=[]):
-            with patch("judges.judges.security_review.get_gh_token", return_value="test-token"):
+            with patch("devbench.judges.security_review.get_gh_token", return_value="test-token"):
                 with patch.object(judge, "_llm_evaluate", return_value=make_llm_pass_result("security_review")):
                     with patch.object(judge, "_get_diff", return_value=""):
                         result = judge.evaluate(wu_file, tmp_path, repo="caylent-solutions/git-repo")
@@ -58,7 +58,7 @@ class TestEvaluate:
         judge = SecurityReviewJudge()
         llm_pass = make_llm_pass_result("security_review")
         with patch.object(judge, "_fetch_alerts", return_value=[]):
-            with patch("judges.judges.security_review.get_gh_token", return_value="tok"):
+            with patch("devbench.judges.security_review.get_gh_token", return_value="tok"):
                 with patch.object(judge, "_llm_evaluate", return_value=llm_pass) as mock_llm:
                     with patch.object(judge, "_get_diff", return_value=""):
                         judge.evaluate(wu_file, tmp_path, repo="caylent-solutions/git-repo")
@@ -105,7 +105,7 @@ class TestFetchAlerts:
         mock_result.returncode = 0
         mock_result.stdout = json.dumps([{"id": 1}, {"id": 2}])
 
-        with patch("judges.judges.security_review.subprocess.run", return_value=mock_result):
+        with patch("devbench.judges.security_review.subprocess.run", return_value=mock_result):
             alerts = judge._fetch_alerts("repos/org/repo/alerts", "token", tmp_path)
 
         assert len(alerts) == 2
@@ -117,7 +117,7 @@ class TestFetchAlerts:
         mock_result.stdout = ""
         mock_result.stderr = "error"
 
-        with patch("judges.judges.security_review.subprocess.run", return_value=mock_result):
+        with patch("devbench.judges.security_review.subprocess.run", return_value=mock_result):
             alerts = judge._fetch_alerts("repos/org/repo/alerts", "token", tmp_path)
         assert alerts == []
 
@@ -127,7 +127,7 @@ class TestFetchAlerts:
         mock_result.returncode = 0
         mock_result.stdout = "not json"
 
-        with patch("judges.judges.security_review.subprocess.run", return_value=mock_result):
+        with patch("devbench.judges.security_review.subprocess.run", return_value=mock_result):
             alerts = judge._fetch_alerts("repos/org/repo/alerts", "token", tmp_path)
         assert alerts == []
 
@@ -137,7 +137,7 @@ class TestFetchAlerts:
         mock_result.returncode = 0
         mock_result.stdout = '{"message": "not found"}'
 
-        with patch("judges.judges.security_review.subprocess.run", return_value=mock_result):
+        with patch("devbench.judges.security_review.subprocess.run", return_value=mock_result):
             alerts = judge._fetch_alerts("repos/org/repo/alerts", "token", tmp_path)
         assert alerts == []
 
@@ -148,7 +148,7 @@ class TestFetchAlerts:
 
     def test_returns_empty_when_gh_missing(self, tmp_path: Path) -> None:
         judge = SecurityReviewJudge()
-        with patch("judges.judges.security_review.subprocess.run", side_effect=FileNotFoundError):
+        with patch("devbench.judges.security_review.subprocess.run", side_effect=FileNotFoundError):
             alerts = judge._fetch_alerts("repos/org/repo/alerts", "token", tmp_path)
         assert alerts == []
 

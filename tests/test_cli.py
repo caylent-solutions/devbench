@@ -8,9 +8,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from judges import cli
-from judges.judges.base import JudgeResult, Verdict
-from judges.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
+from devbench import cli
+from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
+from devbench.judges.base import JudgeResult, Verdict
 
 
 @pytest.fixture
@@ -75,7 +75,7 @@ class TestCmdStatus:
         mock_parser.all_done.return_value = False
         mock_parser.get_blocked_units.return_value = [mock_units[2]]
 
-        with patch("judges.cli.BacklogParser", return_value=mock_parser):
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
             result = cli.cmd_status()
 
         assert result == 0
@@ -95,7 +95,7 @@ class TestCmdStatus:
         mock_parser.get_parallel_candidates.return_value = []
         mock_parser.all_done.return_value = True
 
-        with patch("judges.cli.BacklogParser", return_value=mock_parser):
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
             result = cli.cmd_status()
 
         assert result == 0
@@ -108,7 +108,7 @@ class TestCmdStatus:
         mock_parser.all_done.return_value = False
         mock_parser.get_blocked_units.return_value = [mock_units[2]]
 
-        with patch("judges.cli.BacklogParser", return_value=mock_parser):
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
             result = cli.cmd_status()
 
         assert result == 0
@@ -123,7 +123,7 @@ class TestCmdNext:
         mock_parser.parse_index.return_value = mock_units
         mock_parser.get_parallel_candidates.return_value = [mock_units[1]]
 
-        with patch("judges.cli.BacklogParser", return_value=mock_parser):
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
             result = cli.cmd_next()
 
         assert result == 0
@@ -146,7 +146,7 @@ class TestCmdNext:
         mock_parser.get_parallel_candidates.return_value = []
         mock_parser.all_done.return_value = True
 
-        with patch("judges.cli.BacklogParser", return_value=mock_parser):
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
             result = cli.cmd_next()
 
         assert result == 0
@@ -158,7 +158,7 @@ class TestCmdNext:
         mock_parser.get_parallel_candidates.return_value = []
         mock_parser.all_done.return_value = False
 
-        with patch("judges.cli.BacklogParser", return_value=mock_parser):
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
             result = cli.cmd_next()
 
         assert result == 0
@@ -181,7 +181,7 @@ class TestCmdReview:
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = mock_units
 
-        with patch("judges.cli.BacklogParser", return_value=mock_parser):
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
             result = cli.cmd_review("NONEXISTENT")
 
         assert result == 1
@@ -209,15 +209,15 @@ class TestCmdReview:
 
         mock_mgr = MagicMock()
 
-        with patch("judges.cli.BacklogParser", return_value=mock_parser):
-            with patch("judges.cli.BACKLOG_ROOT", tmp_path / "backlog"):
-                with patch("judges.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
-                    with patch("judges.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
-                        with patch("judges.cli.BacklogManagerJudge", return_value=mock_mgr):
-                            with patch("judges.cli.CodeReviewJudge", return_value=mock_judge):
-                                with patch("judges.cli.TestReviewJudge", return_value=mock_judge):
-                                    with patch("judges.cli.DocReviewJudge", return_value=mock_judge):
-                                        with patch("judges.cli.ChangesManifestJudge", return_value=mock_judge):
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            with patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"):
+                with patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
+                    with patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+                        with patch("devbench.cli.BacklogManagerJudge", return_value=mock_mgr):
+                            with patch("devbench.cli.CodeReviewJudge", return_value=mock_judge):
+                                with patch("devbench.cli.TestReviewJudge", return_value=mock_judge):
+                                    with patch("devbench.cli.DocReviewJudge", return_value=mock_judge):
+                                        with patch("devbench.cli.ChangesManifestJudge", return_value=mock_judge):
                                             result = cli.cmd_review("E0-F1-S1-T2")
 
         assert result == 0
@@ -233,7 +233,7 @@ class TestCmdExecute:
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = mock_units
 
-        with patch("judges.cli.BacklogParser", return_value=mock_parser):
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
             result = cli.cmd_execute("NONEXISTENT")
 
         assert result == 1
@@ -241,7 +241,7 @@ class TestCmdExecute:
     def test_returns_0_on_in_review(
         self, mock_units: list[WorkUnit], tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        from judges.claude_executor import ExecutionResult, ExecutionStatus
+        from devbench.execution.executor import ExecutionResult, ExecutionStatus
 
         wu_file = tmp_path / "backlog" / "E0-F1-S1-T2.md"
         wu_file.parent.mkdir(parents=True, exist_ok=True)
@@ -251,9 +251,9 @@ class TestCmdExecute:
         mock_parser.parse_index.return_value = mock_units
         exec_result = ExecutionResult(status=ExecutionStatus.IN_REVIEW, output="done", blocker="")
 
-        with patch("judges.cli.BacklogParser", return_value=mock_parser):
-            with patch("judges.cli.BACKLOG_ROOT", tmp_path / "backlog"):
-                with patch("judges.claude_executor.execute", return_value=exec_result):
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            with patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"):
+                with patch("devbench.execution.executor.execute", return_value=exec_result):
                     result = cli.cmd_execute("E0-F1-S1-T2")
 
         assert result == 0
@@ -261,7 +261,7 @@ class TestCmdExecute:
         assert output["status"] == "in-review"
 
     def test_returns_1_on_failure(self, mock_units: list[WorkUnit], tmp_path: Path) -> None:
-        from judges.claude_executor import ExecutionResult, ExecutionStatus
+        from devbench.execution.executor import ExecutionResult, ExecutionStatus
 
         wu_file = tmp_path / "backlog" / "E0-F1-S1-T2.md"
         wu_file.parent.mkdir(parents=True, exist_ok=True)
@@ -271,9 +271,9 @@ class TestCmdExecute:
         mock_parser.parse_index.return_value = mock_units
         exec_result = ExecutionResult(status=ExecutionStatus.FAILED, output="error", blocker="")
 
-        with patch("judges.cli.BacklogParser", return_value=mock_parser):
-            with patch("judges.cli.BACKLOG_ROOT", tmp_path / "backlog"):
-                with patch("judges.claude_executor.execute", return_value=exec_result):
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            with patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"):
+                with patch("devbench.execution.executor.execute", return_value=exec_result):
                     result = cli.cmd_execute("E0-F1-S1-T2")
 
         assert result == 1
@@ -286,7 +286,7 @@ class TestCmdSecurityReview:
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = mock_units
 
-        with patch("judges.cli.BacklogParser", return_value=mock_parser):
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
             result = cli.cmd_security_review("NONEXISTENT")
 
         assert result == 1
@@ -295,8 +295,8 @@ class TestCmdSecurityReview:
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = mock_units
 
-        with patch("judges.cli.BacklogParser", return_value=mock_parser):
-            with patch("judges.cli.REPO_LOCAL_PATHS", {}):
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            with patch("devbench.cli.REPO_LOCAL_PATHS", {}):
                 result = cli.cmd_security_review("E0-F1-S1-T2")
 
         assert result == 1
@@ -321,10 +321,10 @@ class TestCmdSecurityReview:
         mock_judge = MagicMock()
         mock_judge.evaluate.return_value = pass_result
 
-        with patch("judges.cli.BacklogParser", return_value=mock_parser):
-            with patch("judges.cli.BACKLOG_ROOT", tmp_path / "backlog"):
-                with patch("judges.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
-                    with patch("judges.cli.SecurityReviewJudge", return_value=mock_judge):
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            with patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"):
+                with patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+                    with patch("devbench.cli.SecurityReviewJudge", return_value=mock_judge):
                         result = cli.cmd_security_review("E0-F1-S1-T2")
 
         assert result == 0
@@ -344,7 +344,7 @@ class TestCmdSetStatus:
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = mock_units
 
-        with patch("judges.cli.BacklogParser", return_value=mock_parser):
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
             result = cli.cmd_set_status("NONEXISTENT", "in-progress")
 
         assert result == 1
@@ -361,9 +361,9 @@ class TestCmdSetStatus:
 
         mock_mgr = MagicMock()
 
-        with patch("judges.cli.BacklogParser", return_value=mock_parser):
-            with patch("judges.cli.BACKLOG_ROOT", tmp_path / "backlog"):
-                with patch("judges.cli.BacklogManagerJudge", return_value=mock_mgr):
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            with patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"):
+                with patch("devbench.cli.BacklogManagerJudge", return_value=mock_mgr):
                     result = cli.cmd_set_status("E0-F1-S1-T2", "in-progress")
 
         assert result == 0
@@ -378,7 +378,7 @@ class TestCmdMarkDone:
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = mock_units
 
-        with patch("judges.cli.BacklogParser", return_value=mock_parser):
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
             result = cli.cmd_mark_done("NONEXISTENT")
 
         assert result == 1
@@ -395,9 +395,9 @@ class TestCmdMarkDone:
 
         mock_mgr = MagicMock()
 
-        with patch("judges.cli.BacklogParser", return_value=mock_parser):
-            with patch("judges.cli.BACKLOG_ROOT", tmp_path / "backlog"):
-                with patch("judges.cli.BacklogManagerJudge", return_value=mock_mgr):
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            with patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"):
+                with patch("devbench.cli.BacklogManagerJudge", return_value=mock_mgr):
                     result = cli.cmd_mark_done("E0-F1-S1-T2")
 
         assert result == 0
@@ -411,8 +411,8 @@ class TestCmdReviewNoRepoPath:
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = mock_units
 
-        with patch("judges.cli.BacklogParser", return_value=mock_parser):
-            with patch("judges.cli.REPO_LOCAL_PATHS", {}):
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            with patch("devbench.cli.REPO_LOCAL_PATHS", {}):
                 result = cli.cmd_review("E0-F1-S1-T2")
 
         assert result == 1

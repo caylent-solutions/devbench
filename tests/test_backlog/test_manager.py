@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from devbench.backlog.manager import VALID_STATUSES, BacklogManager
-from devbench.constants import REVIEW_JUDGE_NAMES
+from devbench.backlog.manager import BacklogManager
+from devbench.constants import REVIEW_JUDGE_NAMES, VALID_STATUSES
 
 
 @pytest.fixture
@@ -534,19 +534,24 @@ class TestBacklogManagerRename:
     """AC tests for E4-F1-S1-T1: class rename and reference cleanup."""
 
     def test_backlog_manager_symbol_exists(self) -> None:
-        """AC-1: BacklogManager class is importable from devbench.backlog.manager."""
+        """AC-1: BacklogManager class is importable with expected public interface."""
         import inspect
 
         from devbench.backlog.manager import BacklogManager
 
         assert inspect.isclass(BacklogManager)
+        assert callable(getattr(BacklogManager, "force_status", None)), "force_status must be present"
+        assert callable(getattr(BacklogManager, "validate", None)), "validate must be present"
 
     def test_no_backlog_manager_judge_symbol_in_src(self) -> None:
         """AC-5: No BacklogManagerJudge references in the three changed source files."""
+        import importlib.util
         from pathlib import Path
 
         old_name = "BacklogManagerJudge"
-        src_root = Path(__file__).parents[2] / "src" / "devbench"
+        spec = importlib.util.find_spec("devbench")
+        assert spec is not None and spec.origin is not None
+        src_root = Path(spec.origin).parent
         checked = [
             src_root / "backlog" / "manager.py",
             src_root / "cli.py",
@@ -557,19 +562,23 @@ class TestBacklogManagerRename:
 
     def test_cli_imports_backlog_manager(self) -> None:
         """AC-3: cli.py source contains BacklogManager import, not BacklogManagerJudge."""
+        import importlib.util
         from pathlib import Path
 
-        src = (Path(__file__).parents[2] / "src" / "devbench" / "cli.py").read_text(encoding="utf-8")
+        spec = importlib.util.find_spec("devbench")
+        assert spec is not None and spec.origin is not None
+        src = (Path(spec.origin).parent / "cli.py").read_text(encoding="utf-8")
         assert "BacklogManager" in src, "cli.py must import BacklogManager"
         assert "BacklogManagerJudge" not in src, "cli.py must not reference BacklogManagerJudge"
 
     def test_orchestrator_imports_backlog_manager(self) -> None:
         """AC-4: orchestrator.py source contains BacklogManager import, not BacklogManagerJudge."""
+        import importlib.util
         from pathlib import Path
 
-        src = (
-            Path(__file__).parents[2] / "src" / "devbench" / "execution" / "orchestrator.py"
-        ).read_text(encoding="utf-8")
+        spec = importlib.util.find_spec("devbench")
+        assert spec is not None and spec.origin is not None
+        src = (Path(spec.origin).parent / "execution" / "orchestrator.py").read_text(encoding="utf-8")
         assert "BacklogManager" in src, "orchestrator.py must import BacklogManager"
         assert "BacklogManagerJudge" not in src, "orchestrator.py must not reference BacklogManagerJudge"
 

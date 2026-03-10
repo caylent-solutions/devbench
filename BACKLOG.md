@@ -24,15 +24,15 @@ After E0 is done:
 
 ## Status Summary
 
-| Epic | Title | Features | Stories | Tasks | Total | Done | In Progress | In Queue |
-|------|-------|----------|---------|-------|-------|------|-------------|----------|
-| E0 | Fix Critical Issues | 1 | 2 | 4 | 7 | 0 | 0 | 7 |
-| E1 | Devcontainer Integration | 1 | 1 | 2 | 4 | 0 | 0 | 4 |
-| E2 | Reliability | 2 | 3 | 4 | 9 | 0 | 0 | 9 |
-| E3 | Prompt Overrides | 1 | 1 | 1 | 3 | 0 | 0 | 3 |
-| E4 | Backlog Manager | 1 | 1 | 1 | 4 | 0 | 1 | 3 |
-| E5 | Backlog-Native Configuration | 1 | 1 | 1 | 4 | 0 | 0 | 4 |
-| **Total** | | **7** | **9** | **13** | **31** | **0** | **0** | **31** |
+| Epic | Title | Features | Stories | Tasks | Total | Done | In Progress | In Review | In Queue |
+|------|-------|----------|---------|-------|-------|------|-------------|-----------|----------|
+| E0 | Fix Critical Issues | 1 | 2 | 4 | 7 | 0 | 0 | 0 | 7 |
+| E1 | Devcontainer Integration | 1 | 1 | 2 | 4 | 0 | 0 | 0 | 4 |
+| E2 | Reliability | 2 | 3 | 4 | 9 | 0 | 0 | 0 | 9 |
+| E3 | Prompt Overrides | 1 | 1 | 1 | 3 | 0 | 0 | 0 | 3 |
+| E4 | Backlog Manager | 1 | 1 | 1 | 4 | 0 | 0 | 1 | 3 |
+| E5 | Backlog-Native Configuration | 1 | 1 | 1 | 4 | 0 | 0 | 0 | 4 |
+| **Total** | | **7** | **9** | **13** | **31** | **0** | **0** | **1** | **30** |
 
 ---
 

@@ -2,59 +2,68 @@
 
 from __future__ import annotations
 
+import importlib
+import json
 import os
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
+from devbench import config
+from devbench.config import ALLOWED_REPOS, validate_repo
+
 
 class TestAllowedRepos:
-    """Verify ALLOWED_REPOS constant and validate_repo behaviour."""
+    """Verify ALLOWED_REPOS is driven by ALLOWED_REPOS env var."""
 
-    def test_allowed_repos_is_frozenset(self) -> None:
-        from devbench.config import ALLOWED_REPOS
-
+    def test_judge_allowed_repos_is_frozenset(self) -> None:
         assert isinstance(ALLOWED_REPOS, frozenset)
 
-    def test_allowed_repos_has_exactly_four_items(self) -> None:
-        from devbench.config import ALLOWED_REPOS
+    def test_judge_allowed_repos_reflects_env_var(self) -> None:
+        with patch.dict(os.environ, {"JUDGE_ALLOWED_REPOS": "org/repo-a,org/repo-b"}, clear=False):
+            importlib.reload(config)
+            assert frozenset({"org/repo-a", "org/repo-b"}) == config.ALLOWED_REPOS
 
-        assert len(ALLOWED_REPOS) == 4
+        importlib.reload(config)
 
-    @pytest.mark.parametrize(
-        "repo",
-        [
-            "caylent-solutions/git-repo",
-            "caylent-solutions/caylent-private-rpm",
-            "caylent-solutions/rpm-claude-marketplaces",
-            "caylent-solutions/rpm-claude-marketplaces-install",
-        ],
-    )
-    def test_validate_repo_passes_for_allowed_repo(self, repo: str) -> None:
-        from devbench.config import validate_repo
+    def test_judge_allowed_repos_strips_whitespace(self) -> None:
+        with patch.dict(os.environ, {"JUDGE_ALLOWED_REPOS": " org/repo-a , org/repo-b "}, clear=False):
+            importlib.reload(config)
+            assert frozenset({"org/repo-a", "org/repo-b"}) == config.ALLOWED_REPOS
 
-        # Should not raise
+        importlib.reload(config)
+
+    def test_judge_allowed_repos_raises_when_env_var_not_set(self) -> None:
+        env = {k: v for k, v in os.environ.items() if k != "JUDGE_ALLOWED_REPOS"}
+        with patch.dict(os.environ, env, clear=True):
+            with pytest.raises(RuntimeError, match="JUDGE_ALLOWED_REPOS"):
+                importlib.reload(config)
+
+        importlib.reload(config)
+
+    def test_judge_allowed_repos_raises_when_env_var_empty(self) -> None:
+        with patch.dict(os.environ, {"JUDGE_ALLOWED_REPOS": ""}, clear=False):
+            with pytest.raises(RuntimeError, match="JUDGE_ALLOWED_REPOS"):
+                importlib.reload(config)
+
+        importlib.reload(config)
+
+    def test_validate_repo_passes_for_allowed_repo(self) -> None:
+        repo = next(iter(ALLOWED_REPOS))
         validate_repo(repo)
 
     def test_validate_repo_raises_for_unknown_repo(self) -> None:
-        from devbench.config import validate_repo
-
         with pytest.raises(ValueError, match="not allowed"):
             validate_repo("some-org/unknown-repo")
 
     def test_validate_repo_rejects_wrong_org_when_judge_gh_org_set(self) -> None:
-        from devbench import config
-
         with patch.object(config, "ALLOWED_GH_ORG", "caylent-solutions"):
             with pytest.raises(ValueError, match="JUDGE_GH_ORG restricts access"):
                 config.validate_repo("wrong-org/git-repo")
 
     def test_validate_repo_skips_org_check_when_judge_gh_org_empty(self) -> None:
-        from devbench import config
-
         with patch.object(config, "ALLOWED_GH_ORG", ""):
-            # Should still fail on allow-list, not org check
             with pytest.raises(ValueError, match="not allowed"):
                 config.validate_repo("other-org/some-repo")
 
@@ -63,8 +72,6 @@ class TestGetGhToken:
     """Test GitHub token retrieval from file and environment."""
 
     def test_get_gh_token_reads_from_file(self, tmp_path: Path) -> None:
-        from devbench import config
-
         token_file = tmp_path / "gh_token"
         token_file.write_text("file-token-abc\n")
 
@@ -74,9 +81,6 @@ class TestGetGhToken:
         assert result == "file-token-abc"
 
     def test_get_gh_token_falls_back_to_env_var(self, tmp_path: Path) -> None:
-        from devbench import config
-
-        # Point to a file that does not exist
         missing_file = tmp_path / "nonexistent_token"
 
         with (
@@ -88,8 +92,6 @@ class TestGetGhToken:
         assert result == "env-token-xyz"
 
     def test_get_gh_token_raises_when_neither_available(self, tmp_path: Path) -> None:
-        from devbench import config
-
         missing_file = tmp_path / "nonexistent_token"
 
         with (
@@ -100,8 +102,6 @@ class TestGetGhToken:
                 config.get_gh_token()
 
     def test_get_gh_token_ignores_empty_file(self, tmp_path: Path) -> None:
-        from devbench import config
-
         token_file = tmp_path / "gh_token"
         token_file.write_text("   \n")
 
@@ -118,10 +118,6 @@ class TestGetAnthropicApiKey:
     """Test Claude credential reading from credentials file."""
 
     def test_reads_token_from_credentials_file(self, tmp_path: Path) -> None:
-        import json
-
-        from devbench import config
-
         creds_file = tmp_path / "credentials.json"
         creds_file.write_text(json.dumps({
             "claudeAiOauth": {
@@ -136,8 +132,6 @@ class TestGetAnthropicApiKey:
         assert result == "sk-ant-oat01-test-token"
 
     def test_raises_when_file_missing(self, tmp_path: Path) -> None:
-        from devbench import config
-
         missing = tmp_path / "nonexistent.json"
 
         with patch.object(config, "CLAUDE_CREDENTIALS_FILE", missing):
@@ -145,8 +139,6 @@ class TestGetAnthropicApiKey:
                 config.get_anthropic_api_key()
 
     def test_raises_when_no_oauth_section(self, tmp_path: Path) -> None:
-        from devbench import config
-
         creds_file = tmp_path / "credentials.json"
         creds_file.write_text('{"other": "data"}')
 
@@ -155,10 +147,6 @@ class TestGetAnthropicApiKey:
                 config.get_anthropic_api_key()
 
     def test_raises_when_token_empty(self, tmp_path: Path) -> None:
-        import json
-
-        from devbench import config
-
         creds_file = tmp_path / "credentials.json"
         creds_file.write_text(json.dumps({
             "claudeAiOauth": {"accessToken": "  ", "scopes": []}
@@ -169,8 +157,6 @@ class TestGetAnthropicApiKey:
                 config.get_anthropic_api_key()
 
     def test_raises_on_invalid_json(self, tmp_path: Path) -> None:
-        from devbench import config
-
         creds_file = tmp_path / "credentials.json"
         creds_file.write_text("not json {{{")
 
@@ -179,48 +165,65 @@ class TestGetAnthropicApiKey:
                 config.get_anthropic_api_key()
 
 
+class TestMergeStrategy:
+    """Test MergeStrategy enum values, flags, and env var validation."""
+
+    def test_valid_values(self) -> None:
+        from devbench.config import MergeStrategy
+
+        assert MergeStrategy("merge") is MergeStrategy.MERGE
+        assert MergeStrategy("squash") is MergeStrategy.SQUASH
+        assert MergeStrategy("rebase") is MergeStrategy.REBASE
+
+    def test_flag_property(self) -> None:
+        from devbench.config import MergeStrategy
+
+        assert MergeStrategy.MERGE.flag == "--merge"
+        assert MergeStrategy.SQUASH.flag == "--squash"
+        assert MergeStrategy.REBASE.flag == "--rebase"
+
+    def test_invalid_value_raises_runtime_error(self) -> None:
+        with patch.dict(os.environ, {"JUDGE_MERGE_STRATEGY": "fast-forward"}, clear=False):
+            with pytest.raises(RuntimeError, match="JUDGE_MERGE_STRATEGY must be one of"):
+                importlib.reload(config)
+
+        importlib.reload(config)
+
+    def test_default_is_squash(self) -> None:
+        env_copy = {k: v for k, v in os.environ.items() if k != "JUDGE_MERGE_STRATEGY"}
+        with patch.dict(os.environ, env_copy, clear=True):
+            importlib.reload(config)
+            assert config.MERGE_STRATEGY == config.MergeStrategy.SQUASH
+
+        importlib.reload(config)
+
+
 class TestConfigOverrides:
     """Test that config values can be overridden via environment variables."""
 
     def test_max_retry_attempts_from_env(self) -> None:
         with patch.dict(os.environ, {"JUDGE_MAX_RETRIES": "7"}, clear=False):
-            # Re-import to pick up env var
-            import importlib
-
-            from devbench import config
-
             importlib.reload(config)
             assert config.MAX_RETRY_ATTEMPTS == 7
 
-            # Restore default
-            with patch.dict(os.environ, {"JUDGE_MAX_RETRIES": "3"}, clear=False):
-                importlib.reload(config)
+        with patch.dict(os.environ, {"JUDGE_MAX_RETRIES": "3"}, clear=False):
+            importlib.reload(config)
 
     def test_github_check_timeout_from_env(self) -> None:
         with patch.dict(os.environ, {"JUDGE_GH_TIMEOUT": "120"}, clear=False):
-            import importlib
-
-            from devbench import config
-
             importlib.reload(config)
             assert config.GITHUB_CHECK_TIMEOUT_SECONDS == 120
 
-            # Restore default
-            with patch.dict(os.environ, {"JUDGE_GH_TIMEOUT": "600"}, clear=False):
-                importlib.reload(config)
+        with patch.dict(os.environ, {"JUDGE_GH_TIMEOUT": "600"}, clear=False):
+            importlib.reload(config)
 
     def test_backlog_root_from_env(self, tmp_path: Path) -> None:
-        custom_root = str(tmp_path / "custom-backlog")
-        with patch.dict(os.environ, {"JUDGE_BACKLOG_ROOT": custom_root}, clear=False):
-            import importlib
-
-            from devbench import config
-
+        custom_root = tmp_path / "custom-backlog"
+        with patch.dict(os.environ, {"JUDGE_BACKLOG_ROOT": str(custom_root)}, clear=False):
             importlib.reload(config)
-            assert Path(custom_root) == config.BACKLOG_ROOT
+            assert custom_root == config.BACKLOG_ROOT
 
-            # Restore
-            env_copy = os.environ.copy()
-            env_copy.pop("JUDGE_BACKLOG_ROOT", None)
-            with patch.dict(os.environ, env_copy, clear=True):
-                importlib.reload(config)
+        env_copy = os.environ.copy()
+        env_copy.pop("JUDGE_BACKLOG_ROOT", None)
+        with patch.dict(os.environ, env_copy, clear=True):
+            importlib.reload(config)

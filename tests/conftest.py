@@ -7,6 +7,8 @@ import os
 # Set required env vars before any devbench modules are imported.
 # config.py raises RuntimeError at import time if these are unset.
 os.environ.setdefault("JUDGE_CLAUDE_MODEL", "test-model")
+os.environ.setdefault("JUDGE_ALLOWED_REPOS", "caylent-solutions/git-repo,caylent-solutions/devbench")
+os.environ.setdefault("JUDGE_WORKSPACE_ROOT", "/tmp/test-workspace")
 os.environ.setdefault("JUDGE_LOG_FILE", "/tmp/judges-test-orchestrator.log")
 
 from pathlib import Path

@@ -8,9 +8,17 @@
 # 4. Launches the orchestrator in the background
 set -euo pipefail
 
+# Required environment variable guard
+required_vars=(JUDGE_CLAUDE_MODEL JUDGE_GH_ORG JUDGE_ALLOWED_REPOS JUDGE_WORKSPACE_ROOT)
+for var in "${required_vars[@]}"; do
+  if [ -z "${!var:-}" ]; then
+    echo "❌ Required environment variable $var is not set." >&2
+    exit 1
+  fi
+done
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-JUDGES_DIR="$(dirname "$SCRIPT_DIR")"
-WORKSPACE_DIR="$(dirname "$JUDGES_DIR")"
+DEVBENCH_ROOT="$(dirname "$SCRIPT_DIR")"
 LOG_FILE="${JUDGE_LOG_FILE:-/tmp/backlog-run.log}"
 TOKEN_FILE="/tmp/gh_token_env"
 
@@ -20,9 +28,7 @@ if [[ -z "${GH_TOKEN:-}" && -f "$TOKEN_FILE" ]]; then
     source "$TOKEN_FILE"
 fi
 
-# Restrict GitHub operations to this org. Unset to allow any org in allow-list.
-export JUDGE_GH_ORG="${JUDGE_GH_ORG:-caylent-solutions}"
-# Scopes are minimized to only what's needed for caylent-solutions repos.
+# Scopes are minimized to only what's needed.
 # Notably admin:org and admin:enterprise are excluded to prevent accidental
 # access to other organizations the user's account may belong to.
 GH_SCOPES=(
@@ -79,7 +85,7 @@ echo ""
 echo "=== Step 5: Launching backlog orchestrator ==="
 nohup bash -c "
 source $TOKEN_FILE
-cd $JUDGES_DIR
+cd $DEVBENCH_ROOT
 uv run python -m devbench.execution.orchestrator
 " > "$LOG_FILE" 2>&1 &
 ORCHESTRATOR_PID=$!
@@ -97,5 +103,5 @@ fi
 echo ""
 echo "=== Running ==="
 echo "Log:    tail -f $LOG_FILE"
-echo "Status: cd $JUDGES_DIR && uv run python -m devbench.cli status"
+echo "Status: cd $DEVBENCH_ROOT && uv run python -m devbench.cli status"
 echo "Stop:   kill $ORCHESTRATOR_PID $REFRESHER_PID"

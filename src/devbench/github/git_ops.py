@@ -11,6 +11,7 @@ from pathlib import Path
 from devbench.config import (
     GH_API_TIMEOUT,
     GITHUB_CHECK_TIMEOUT_SECONDS,
+    MERGE_STRATEGY,
     WORKSPACE_ROOT,
     get_gh_token,
     validate_repo,
@@ -96,7 +97,7 @@ class GitOpsJudge(BaseJudge):
         return pr_url
 
     def merge_pr(self, repo: str, pr_number: int, *, repo_path: Path | None = None) -> None:
-        """Merge a pull request using the merge commit strategy.
+        """Merge a pull request using the strategy set by JUDGE_MERGE_STRATEGY.
 
         Args:
             repo: GitHub repository in ``owner/name`` format.
@@ -110,7 +111,7 @@ class GitOpsJudge(BaseJudge):
         validate_repo(repo)
 
         rc, _, stderr = self._gh(
-            ["pr", "merge", str(pr_number), "--merge"],
+            ["pr", "merge", str(pr_number), MERGE_STRATEGY.flag],
             cwd=repo_path,
             repo=repo,
         )

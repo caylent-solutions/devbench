@@ -535,9 +535,11 @@ class TestBacklogManagerRename:
 
     def test_backlog_manager_symbol_exists(self) -> None:
         """AC-1: BacklogManager class is importable from devbench.backlog.manager."""
+        import inspect
+
         from devbench.backlog.manager import BacklogManager
 
-        assert BacklogManager is not None
+        assert inspect.isclass(BacklogManager)
 
     def test_no_backlog_manager_judge_symbol_in_src(self) -> None:
         """AC-5: No BacklogManagerJudge references in the three changed source files."""

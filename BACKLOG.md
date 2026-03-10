@@ -30,9 +30,9 @@ After E0 is done:
 | E1 | Devcontainer Integration | 1 | 1 | 2 | 4 | 0 | 0 | 0 | 4 |
 | E2 | Reliability | 2 | 3 | 4 | 9 | 0 | 0 | 0 | 9 |
 | E3 | Prompt Overrides | 1 | 1 | 1 | 3 | 0 | 0 | 0 | 3 |
-| E4 | Backlog Manager | 1 | 1 | 1 | 4 | 0 | 0 | 1 | 3 |
+| E4 | Backlog Manager | 1 | 1 | 1 | 4 | 1 | 0 | 0 | 3 |
 | E5 | Backlog-Native Configuration | 1 | 1 | 1 | 4 | 0 | 0 | 0 | 4 |
-| **Total** | | **7** | **9** | **13** | **31** | **0** | **0** | **1** | **30** |
+| **Total** | | **7** | **9** | **13** | **31** | **1** | **0** | **0** | **30** |
 
 ---
 
@@ -89,7 +89,7 @@ After E0 is done:
 
 | ID | Title | Type | Status | Dependencies | Repo | File Path |
 |----|-------|------|--------|--------------|------|-----------|
-| E4-F1-S1-T1 | Rename `BacklogManagerJudge` to `BacklogManager` and update all references | Task | in-review | E2 | devbench | `backlog/E4-backlog-manager/E4-F1-backlog-manager-rename/E4-F1-S1-backlog-manager-class/E4-F1-S1-T1-rename-backlog-manager.md` |
+| E4-F1-S1-T1 | Rename `BacklogManagerJudge` to `BacklogManager` and update all references | Task | done | E2 | devbench | `backlog/E4-backlog-manager/E4-F1-backlog-manager-rename/E4-F1-S1-backlog-manager-class/E4-F1-S1-T1-rename-backlog-manager.md` |
 | E4-F1-S1 | Rename backlog manager class and update runtime references | Story | in-queue | E2 | devbench | `backlog/E4-backlog-manager/E4-F1-backlog-manager-rename/E4-F1-S1-backlog-manager-class/E4-F1-S1.md` |
 | E4-F1 | Backlog Manager Class Rename and Decoupling | Feature | in-queue | E2 | devbench | `backlog/E4-backlog-manager/E4-F1-backlog-manager-rename/E4-F1.md` |
 | E4 | Backlog Manager | Epic | in-queue | E2 | devbench | `backlog/E4-backlog-manager/E4.md` |

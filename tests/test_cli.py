@@ -221,7 +221,7 @@ class TestCmdReview:
                                             result = cli.cmd_review("E0-F1-S1-T2")
 
         assert result == 0
-        mock_mgr.set_status.assert_called_once()
+        mock_mgr.force_status.assert_called_once()
         output = json.loads(capsys.readouterr().out)
         assert output["all_passed"] is True
 
@@ -368,7 +368,7 @@ class TestCmdSetStatus:
 
         assert result == 0
         assert "in-progress" in capsys.readouterr().out
-        mock_mgr.set_status.assert_called_once()
+        mock_mgr.force_status.assert_called_once()
 
 
 class TestCmdMarkDone:

@@ -80,12 +80,12 @@ def backlog_with_hierarchy(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
     return index_path, t2_file, story_file, feature_file
 
 
-class TestSetStatus:
-    """Test set_status updates both files."""
+class TestForceStatus:
+    """Test force_status updates both files without enforcing the done-gate."""
 
     def test_updates_both_files(self, tmp_work_unit_file: Path, backlog_index_titlecase: Path) -> None:
         judge = BacklogManagerJudge()
-        judge.set_status(tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1", "in-progress")
+        judge.force_status(tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1", "in-progress")
 
         wu_content = tmp_work_unit_file.read_text()
         assert "## Status: in-progress" in wu_content
@@ -98,11 +98,20 @@ class TestSetStatus:
         else:
             pytest.fail("E0-F1-S1-T1 not found in BACKLOG.md")
 
+    def test_allows_done_without_judge_comments(
+        self, tmp_work_unit_file: Path, backlog_index_titlecase: Path
+    ) -> None:
+        """force_status bypasses the done-gate — no judge comments required."""
+        judge = BacklogManagerJudge()
+        judge.force_status(tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1", "done")
+
+        assert "## Status: done" in tmp_work_unit_file.read_text()
+
     def test_updates_lowercase_statuses_in_backlog(
         self, tmp_work_unit_file: Path, backlog_index_lowercase: Path,
     ) -> None:
         judge = BacklogManagerJudge()
-        judge.set_status(tmp_work_unit_file, backlog_index_lowercase, "E0-F1-S1-T1", "done")
+        judge.force_status(tmp_work_unit_file, backlog_index_lowercase, "E0-F1-S1-T1", "done")
 
         index_content = backlog_index_lowercase.read_text()
         for line in index_content.splitlines():
@@ -115,7 +124,6 @@ class TestSetStatus:
     def test_accepts_all_valid_statuses(self, tmp_work_unit_file: Path, backlog_index_titlecase: Path) -> None:
         judge = BacklogManagerJudge()
         for cli_status, canonical in VALID_STATUSES.items():
-            # Reset to In Queue before each transition (fixture uses title-case)
             backlog_index_titlecase.write_text(
                 backlog_index_titlecase.read_text()
                 .replace("in-progress", "In Queue")
@@ -135,24 +143,24 @@ class TestSetStatus:
                 )
             )
 
-            judge.set_status(tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1", cli_status)
+            judge.force_status(tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1", cli_status)
             wu_content = tmp_work_unit_file.read_text()
             assert f"## Status: {canonical}" in wu_content
 
     def test_rejects_invalid_status(self, tmp_work_unit_file: Path, backlog_index_titlecase: Path) -> None:
         judge = BacklogManagerJudge()
         with pytest.raises(ValueError, match="Invalid status"):
-            judge.set_status(tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1", "invalid")
+            judge.force_status(tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1", "invalid")
 
     def test_raises_file_not_found_for_work_unit(self, tmp_path: Path, backlog_index_titlecase: Path) -> None:
         judge = BacklogManagerJudge()
         with pytest.raises(FileNotFoundError):
-            judge.set_status(tmp_path / "missing.md", backlog_index_titlecase, "E0-F1-S1-T1", "done")
+            judge.force_status(tmp_path / "missing.md", backlog_index_titlecase, "E0-F1-S1-T1", "done")
 
     def test_raises_file_not_found_for_backlog(self, tmp_work_unit_file: Path, tmp_path: Path) -> None:
         judge = BacklogManagerJudge()
         with pytest.raises(FileNotFoundError):
-            judge.set_status(tmp_work_unit_file, tmp_path / "missing.md", "E0-F1-S1-T1", "done")
+            judge.force_status(tmp_work_unit_file, tmp_path / "missing.md", "E0-F1-S1-T1", "done")
 
 
 _ALL_JUDGES_PASSED_COMMENTS = (
@@ -230,7 +238,7 @@ class TestRollupParentStatus:
 
         judge = BacklogManagerJudge()
         # T1 is already Done in the fixture. Mark T2 Done — should roll up S1.
-        judge.set_status(t2_file, index_path, "E0-F1-S1-T2", "done")
+        judge.force_status(t2_file, index_path, "E0-F1-S1-T2", "done")
 
         # Story should now be done in both files
         story_content = story_file.read_text()
@@ -251,7 +259,7 @@ class TestRollupParentStatus:
 
         judge = BacklogManagerJudge()
         # Mark T2 as in-progress — T1 is Done but T2 is not, so story stays
-        judge.set_status(t2_file, index_path, "E0-F1-S1-T2", "in-progress")
+        judge.force_status(t2_file, index_path, "E0-F1-S1-T2", "in-progress")
 
         story_content = story_file.read_text()
         assert "## Status: in-queue" in story_content
@@ -285,7 +293,7 @@ class TestRollupParentStatus:
 
         judge = BacklogManagerJudge()
         # Mark last task Done → story rolls up → feature rolls up
-        judge.set_status(t_file, index_path, "E0-F1-S2-T1", "done")
+        judge.force_status(t_file, index_path, "E0-F1-S2-T1", "done")
 
         # S2 should be done
         assert "## Status: done" in s2_file.read_text()

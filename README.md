@@ -133,7 +133,7 @@ devbench <command> [args]
 | `execute` | `<unit-id> [feedback]` | Spawn dev agent for a work unit |
 | `review` | `<unit-id>` | Run all review judges, print JSON results |
 | `security-review` | `<unit-id>` | Run security review judge |
-| `set-status` | `<unit-id> <status>` | Set work unit status |
+| `set-status` | `<unit-id> <status>` | Force any status (no gate — use for recovery/lifecycle transitions) |
 | `mark-done` | `<unit-id>` | Mark unit as Done (enforces done-gate: all judges must have passed) |
 | `validate-backlog` | — | Check backlog integrity (file existence, status sync, orphans, deps) |
 | `report` | `[since-timestamp]` | Print progress report with velocity stats |

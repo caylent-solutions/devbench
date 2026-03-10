@@ -3,8 +3,19 @@
 Provides methods to mark work units as done or blocked, update the backlog
 index, and log entries to the traceability matrix.
 
-All status transitions flow through ``set_status`` which updates both the
-work-unit file and BACKLOG.md atomically, preventing drift between the two.
+Public API
+----------
+``force_status``  — write any status to both files with no gate checks.
+                    Use for automated lifecycle transitions (in-progress,
+                    in-review) and for manual recovery overrides.
+``mark_done``     — gated completion: verifies all required review judges
+                    passed in the most recent round before writing ``done``.
+``mark_blocked``  — writes ``blocked`` and appends a reason comment.
+``validate``      — returns integrity errors (missing files, status drift,
+                    orphans, broken deps).
+
+All writes go through the private ``_set_status`` workhorse which updates
+both the work-unit file and BACKLOG.md atomically.
 """
 
 from datetime import UTC, datetime
@@ -50,16 +61,19 @@ class BacklogManagerJudge(BaseJudge):
             evidence=[],
         )
 
-    def set_status(
+    def force_status(
         self,
         work_unit_path: Path,
         backlog_index: Path,
         unit_id: str,
         new_status: str,
     ) -> None:
-        """Update the status in both the work-unit file and BACKLOG.md.
+        """Write any status to both files, bypassing all gate checks.
 
-        This is the single code path for all status transitions.
+        Use this for automated lifecycle transitions (``in-progress``,
+        ``in-review``) and for manual recovery overrides where the done-gate
+        would incorrectly block a legitimate repair.  Prefer ``mark_done``
+        for agent-driven completion — it enforces that all judges have passed.
 
         Args:
             work_unit_path: Path to the work-unit ``.md`` file.
@@ -73,24 +87,7 @@ class BacklogManagerJudge(BaseJudge):
             ValueError: If the status is invalid, the ``## Status:`` line
                 is missing, or the unit is not found in the backlog index.
         """
-        canonical = VALID_STATUSES.get(new_status.lower())
-        if canonical is None:
-            raise ValueError(
-                f"Invalid status '{new_status}'. "
-                f"Valid statuses: {', '.join(sorted(VALID_STATUSES))}"
-            )
-
-        self._update_status(work_unit_path, canonical)
-        self._update_backlog_index(backlog_index, unit_id, canonical)
-        self.logger.info(
-            "Set %s to '%s' in both work-unit file and BACKLOG.md",
-            unit_id,
-            canonical,
-        )
-
-        # When marking done, roll up parent status if all siblings are done
-        if canonical == "done":
-            self._rollup_parent_status(backlog_index, unit_id)
+        self._set_status(work_unit_path, backlog_index, unit_id, new_status)
 
     def mark_done(self, work_unit_path: Path, backlog_index: Path, unit_id: str) -> None:
         """Mark a work unit as Done in both files.
@@ -112,7 +109,7 @@ class BacklogManagerJudge(BaseJudge):
             raise RuntimeError(
                 f"Cannot mark {unit_id} done: not all required judges passed in the most recent review round"
             )
-        self.set_status(work_unit_path, backlog_index, unit_id, "done")
+        self._set_status(work_unit_path, backlog_index, unit_id, "done")
 
     def mark_blocked(self, work_unit_path: Path, backlog_index: Path, unit_id: str, reason: str) -> None:
         """Mark a work unit as Blocked in both files and append a comment.
@@ -127,7 +124,7 @@ class BacklogManagerJudge(BaseJudge):
             FileNotFoundError: If either file does not exist.
             ValueError: If the status line or unit row is not found.
         """
-        self.set_status(work_unit_path, backlog_index, unit_id, "blocked")
+        self._set_status(work_unit_path, backlog_index, unit_id, "blocked")
         self._append_comment(work_unit_path, "BLOCKED", reason)
 
     def validate(self, backlog_index: Path, backlog_root: Path) -> list[str]:
@@ -248,6 +245,37 @@ class BacklogManagerJudge(BaseJudge):
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _set_status(
+        self,
+        work_unit_path: Path,
+        backlog_index: Path,
+        unit_id: str,
+        new_status: str,
+    ) -> None:
+        """Private workhorse: write status to both files with no gate checks.
+
+        All public transition methods (``force_status``, ``mark_done``,
+        ``mark_blocked``) and internal rollup code call this method so that
+        every write goes through a single code path.
+        """
+        canonical = VALID_STATUSES.get(new_status.lower())
+        if canonical is None:
+            raise ValueError(
+                f"Invalid status '{new_status}'. "
+                f"Valid statuses: {', '.join(sorted(VALID_STATUSES))}"
+            )
+
+        self._update_status(work_unit_path, canonical)
+        self._update_backlog_index(backlog_index, unit_id, canonical)
+        self.logger.info(
+            "Set %s to '%s' in both work-unit file and BACKLOG.md",
+            unit_id,
+            canonical,
+        )
+
+        if canonical == "done":
+            self._rollup_parent_status(backlog_index, unit_id)
+
     def _last_round_all_passed(self, work_unit_path: Path) -> bool:
         """Check whether the most recent review round had all required judges pass.
 
@@ -273,8 +301,9 @@ class BacklogManagerJudge(BaseJudge):
         """If all children of the parent unit are Done, mark the parent Done too.
 
         Derives the parent ID by removing the last segment (e.g. E0-F1-S1-T1 → E0-F1-S1).
-        Cascades upward: Story → Feature → Epic via set_status() which calls this
-        method recursively for each newly-done parent.
+        Calls ``_set_status`` directly (bypassing the done-gate — parent units are
+        structurally done when all children are done, no judge review required).
+        Cascades upward by recursing through ``_set_status`` → ``_rollup_parent_status``.
         """
         parts = unit_id.rsplit("-", 1)
         if len(parts) < 2:
@@ -292,9 +321,8 @@ class BacklogManagerJudge(BaseJudge):
             return
 
         self.logger.info("All children of %s are done — rolling up status", parent_id)
-        # Route through set_status: writes both files atomically and cascades
-        # upward automatically (set_status calls _rollup_parent_status for "done").
-        self.set_status(parent_file, backlog_index, parent_id, "done")
+        # _set_status: atomic write to both files; cascades via _rollup_parent_status.
+        self._set_status(parent_file, backlog_index, parent_id, "done")
 
     def _parse_backlog_rows(self, backlog_index: Path) -> list[tuple[str, str, str]]:
         """Parse BACKLOG.md table rows into (id, status, file_path) tuples."""

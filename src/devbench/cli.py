@@ -111,7 +111,7 @@ def cmd_next() -> int:
         wu_file = WORKSPACE_ROOT / unit.file_path
     if wu_file.exists():
         mgr = BacklogManagerJudge()
-        mgr.set_status(wu_file, BACKLOG_INDEX, unit.id, "in-progress")
+        mgr.force_status(wu_file, BACKLOG_INDEX, unit.id, "in-progress")
         logger.info("Set %s to in-progress", unit.id)
 
     print(
@@ -190,7 +190,7 @@ def cmd_review(unit_id: str) -> int:
 
     # Automatically mark as in-review in both files
     mgr = BacklogManagerJudge()
-    mgr.set_status(wu_file, BACKLOG_INDEX, unit_id, "in-review")
+    mgr.force_status(wu_file, BACKLOG_INDEX, unit_id, "in-review")
     logger.info("Set %s to in-review", unit_id)
 
     judges = [
@@ -321,7 +321,7 @@ def cmd_set_status(unit_id: str, new_status: str) -> int:
         wu_file = WORKSPACE_ROOT / target.file_path
 
     mgr = BacklogManagerJudge()
-    mgr.set_status(wu_file, BACKLOG_INDEX, unit_id, new_status)
+    mgr.force_status(wu_file, BACKLOG_INDEX, unit_id, new_status)
 
     logger.info("Set %s to %s", unit_id, new_status)
     print(f"Set {unit_id} to {new_status}")

@@ -118,6 +118,7 @@ class TestProcessWorkUnit:
         mock_git_ops = MagicMock()
         mock_git_ops.create_pr.return_value = "https://github.com/org/repo/pull/1"
         mock_git_ops.wait_for_checks.return_value = True
+        mock_mgr = MagicMock()
 
         with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
             with patch(f"{_ORC}.claude_executor") as mock_exec:
@@ -128,7 +129,7 @@ class TestProcessWorkUnit:
                             with patch(f"{_ORC}.ChangesManifestJudge", return_value=mock_judge):
                                 with patch(f"{_ORC}.SecurityReviewJudge", return_value=mock_judge):
                                     with patch(f"{_ORC}.GitOpsJudge", return_value=mock_git_ops):
-                                        with patch(f"{_ORC}.BacklogManagerJudge"):
+                                        with patch(f"{_ORC}.BacklogManagerJudge", return_value=mock_mgr):
                                             with patch(f"{_ORC}.BlockerResolverJudge"):
                                                 with patch(
                                                     f"{_ORC}.BACKLOG_INDEX", tmp_path / "BACKLOG.md"
@@ -136,6 +137,11 @@ class TestProcessWorkUnit:
                                                     result = process_work_unit(unit)
 
         assert result is True
+        # Completion must go through mark_done (gated), not force_status
+        mock_mgr.mark_done.assert_called_once()
+        mock_mgr.force_status.assert_any_call(
+            unit.file_path, tmp_path / "BACKLOG.md", unit.id, "in-progress"
+        )
 
     def test_returns_false_after_max_retries(self, tmp_path: Path) -> None:
         from devbench.execution.orchestrator import process_work_unit

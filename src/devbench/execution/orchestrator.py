@@ -106,7 +106,7 @@ def process_work_unit(work_unit: WorkUnit) -> bool:
     backlog_mgr = BacklogManagerJudge()
     blocker_judge = BlockerResolverJudge()
 
-    backlog_mgr.set_status(work_unit.file_path, BACKLOG_INDEX, work_unit.id, "in-progress")
+    backlog_mgr.force_status(work_unit.file_path, BACKLOG_INDEX, work_unit.id, "in-progress")
     work_unit.log_comment("orchestrator", "START", f"Beginning work on {work_unit.id}")
 
     feedback = ""
@@ -233,8 +233,8 @@ def process_work_unit(work_unit: WorkUnit) -> bool:
             feedback = f"Git operations failed: {exc}"
             continue
 
-        # Mark done — single code path updates both files
-        backlog_mgr.set_status(work_unit.file_path, BACKLOG_INDEX, work_unit.id, "done")
+        # Mark done — gated path verifies all judges passed
+        backlog_mgr.mark_done(work_unit.file_path, BACKLOG_INDEX, work_unit.id)
         work_unit.log_comment("orchestrator", "DONE", f"Work unit {work_unit.id} completed")
         logger.info("COMPLETED: %s", work_unit.id)
         return True

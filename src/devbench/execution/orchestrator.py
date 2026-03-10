@@ -142,8 +142,10 @@ def process_work_unit(work_unit: WorkUnit) -> bool:
                     work_unit.id,
                     blocker_result.reasoning,
                 )
+                feedback = f"Blocker could not be resolved: {blocker_result.reasoning}"
                 continue
             work_unit.log_comment("orchestrator", "BLOCKER_RESOLVED", blocker_result.reasoning)
+            feedback = f"Blocker resolved: {blocker_result.reasoning}"
             continue
 
         if result.status == ExecutionStatus.FAILED:

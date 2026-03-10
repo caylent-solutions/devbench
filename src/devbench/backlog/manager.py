@@ -1,18 +1,26 @@
 """Backlog manager that updates work-unit statuses and traceability.
 
 Owns the backlog lifecycle: status writes, done-gate checks, rollups,
-comments, and backlog validation.
+comments, backlog validation, and traceability logging.
 
 Public API
 ----------
-``force_status``  — write any status to both files with no gate checks.
-                    Use for automated lifecycle transitions (in-progress,
-                    in-review) and for manual recovery overrides.
-``mark_done``     — gated completion: verifies all required review judges
-                    passed in the most recent round before writing ``done``.
-``mark_blocked``  — writes ``blocked`` and appends a reason comment.
-``validate``      — returns integrity errors (missing files, status drift,
-                    orphans, broken deps).
+``force_status``              — write any status to both files with no gate
+                                checks.  Use for automated lifecycle transitions
+                                (in-progress, in-review) and manual recovery.
+``mark_done``                 — gated completion: verifies all required review
+                                judges passed before writing ``done``.
+``mark_blocked``              — writes ``blocked`` and appends a reason comment.
+``validate``                  — returns integrity errors (missing files, status
+                                drift, orphans, broken deps).
+``log_to_traceability_matrix``— appends a spec/test mapping entry to the
+                                traceability matrix file.
+
+Constructor
+-----------
+``BacklogManager(logger=None)``
+    Accepts an optional ``logging.Logger`` instance.  Defaults to
+    ``logging.getLogger("devbench.backlog_manager")`` when omitted.
 
 All writes go through the private ``_set_status`` workhorse which updates
 both the work-unit file and BACKLOG.md atomically.
@@ -42,7 +50,7 @@ class BacklogManager:
     """Owns backlog lifecycle: status writes, done-gate checks, rollups, comments, and validation."""
 
     def __init__(self, logger: logging.Logger | None = None) -> None:
-        """Initialise the manager.
+        """Initialize the manager.
 
         Args:
             logger: Optional logger instance.  Defaults to

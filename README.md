@@ -70,7 +70,7 @@ Orchestrator (execution/orchestrator.py / interactive Claude session)
   └── Repeat until all work units are done
 ```
 
-All five judges must pass before a work unit can be merged. The done-gate enforces this at the data layer — `mark_done()` raises if the work unit's comment history does not show all four review judges passing in the most recent round.
+All five judges must pass before a work unit can be merged. Four judges (`code_review`, `test_review`, `doc_review`, `changes_manifest`) are tracked via `[REVIEW_PASS]` comments in the work unit file; the done-gate in `mark_done()` verifies all four passed in the most recent round. The security judge runs as a separate sequential gate after the four pass and before the git commit — a security failure writes `[REVIEW_REJECTED]` to reset the done-gate window, ensuring the four judges re-run after any security fix.
 
 ## Review Feedback Loop
 

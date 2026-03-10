@@ -178,6 +178,13 @@ def process_work_unit(work_unit: WorkUnit) -> bool:
                 "SECURITY_FAIL",
                 security_result.feedback,
             )
+            # Reset the done-gate window so mark_done requires a fresh judge re-run
+            # after the dev fixes the security issue and the code changes.
+            work_unit.log_comment(
+                "orchestrator",
+                "REVIEW_REJECTED",
+                f"Security review failed on attempt {attempt} — judge re-review required",
+            )
             feedback = f"Security review failed: {security_result.feedback}"
             continue
 

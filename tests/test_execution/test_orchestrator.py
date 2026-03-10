@@ -295,6 +295,44 @@ class TestProcessWorkUnit:
 
         assert result is False
 
+    def test_security_failure_writes_review_rejected_to_reset_done_gate(self, tmp_path: Path) -> None:
+        """After security fails, REVIEW_REJECTED must be written so mark_done cannot pass
+        on the stale [REVIEW_PASS] entries from the pre-security round."""
+        from devbench.execution.orchestrator import process_work_unit
+
+        unit = _make_unit(tmp_path)
+        exec_result = ExecutionResult(status=ExecutionStatus.IN_REVIEW, output="done", blocker="")
+
+        mock_review_judge = MagicMock()
+        mock_review_judge.name = "review"
+        mock_review_judge.evaluate.return_value = _pass_result("review")
+
+        mock_security = MagicMock()
+        mock_security.evaluate.return_value = _fail_result("security_review")
+
+        with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+            with patch(f"{_ORC}.claude_executor") as mock_exec:
+                mock_exec.execute.return_value = exec_result
+                with patch(f"{_ORC}.CodeReviewJudge", return_value=mock_review_judge):
+                    with patch(f"{_ORC}.TestReviewJudge", return_value=mock_review_judge):
+                        with patch(f"{_ORC}.DocReviewJudge", return_value=mock_review_judge):
+                            with patch(f"{_ORC}.ChangesManifestJudge", return_value=mock_review_judge):
+                                with patch(f"{_ORC}.SecurityReviewJudge", return_value=mock_security):
+                                    with patch(f"{_ORC}.GitOpsJudge"):
+                                        with patch(f"{_ORC}.BacklogManagerJudge"):
+                                            with patch(f"{_ORC}.BlockerResolverJudge"):
+                                                with patch(f"{_ORC}.MAX_RETRY_ATTEMPTS", 1):
+                                                    with patch(f"{_ORC}.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
+                                                        process_work_unit(unit)
+
+        content = unit.file_path.read_text(encoding="utf-8")
+        # SECURITY_FAIL must be present
+        assert "[SECURITY_FAIL]" in content
+        # REVIEW_REJECTED must follow to reset the done-gate window
+        assert "[REVIEW_REJECTED]" in content
+        # REVIEW_REJECTED must appear after SECURITY_FAIL in the file
+        assert content.index("[REVIEW_REJECTED]") > content.index("[SECURITY_FAIL]")
+
     def test_handles_git_error(self, tmp_path: Path) -> None:
         from devbench.execution.orchestrator import process_work_unit
 

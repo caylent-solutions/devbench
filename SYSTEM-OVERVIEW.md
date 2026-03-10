@@ -17,6 +17,7 @@ A Claude Code agent reads work units from a structured backlog, implements each 
 ┌─────────────────────────────────────────────────────────────────┐
 │                    ORCHESTRATOR LOOP                            │
 │                                                                 │
+│  0. Pre-flight: validate backlog integrity — abort on errors    │
 │  1. Find next actionable work unit (deps satisfied)             │
 │  2. Read work unit spec, ACs, and CLAUDE.md standards           │
 │  3. Create feature branch in target repo                        │
@@ -26,7 +27,7 @@ A Claude Code agent reads work units from a structured backlog, implements each 
 │  7. If judges reject → inject prior feedback, fix, resubmit     │
 │  8. If judges approve → commit, push, create PR                 │
 │  9. Wait for GitHub CI checks to pass                           │
-│ 10. Merge PR, update submodule ref, mark done                   │
+│ 10. Merge PR, update submodule ref, mark done (done-gate)       │
 │ 11. Loop back to step 1                                         │
 │                                                                 │
 │  Human can pause (Escape), give instructions, resume (Continue) │
@@ -183,7 +184,8 @@ Up to 10 retry attempts before marking the unit as blocked.
 - Agent merges the PR via `gh pr merge --delete-branch` using the strategy set by `JUDGE_MERGE_STRATEGY` (default: `squash`)
 - Updates the parent repo's submodule reference
 - Marks the work unit as Done via `set_status()` — a single code path that updates both the work unit file and BACKLOG.md
-- When all child tasks of a Story/Feature/Epic are Done, the parent is automatically rolled up to Done (cascading upward)
+- The `mark_done()` done-gate verifies that all four required review judges (`code_review`, `test_review`, `doc_review`, `changes_manifest`) have a `[REVIEW_PASS]` entry in the most recent review round before allowing the transition; raises `RuntimeError` otherwise
+- When all child tasks of a Story/Feature/Epic are Done, the parent is automatically rolled up to Done (cascading upward via `set_status()`)
 
 ### 12. Session Recovery
 
@@ -235,7 +237,9 @@ All configuration is via environment variables. Required variables raise `Runtim
 | Five independent judges | Separation of concerns: code quality, test quality, documentation, scope control, and security evaluated independently. |
 | Fail-fast feedback loop | Up to 10 retry attempts with specific feedback. Agent fixes real issues, not noise. |
 | Single status update path | `set_status()` always updates both the work unit file and BACKLOG.md. No drift possible. |
-| Automatic status rollup | When all children of a Story/Feature/Epic are Done, parent auto-rolls to Done. Cascades upward. |
+| Done-gate enforcement | `mark_done()` checks the work unit's comment history before writing `done`. All four review judges must have a `[REVIEW_PASS]` entry in the most recent round — `[REVIEW_REJECTED]` resets the window. Works across process restarts since the work unit file is the source of truth. |
+| Backlog integrity check | `validate-backlog` (CLI) and orchestrator pre-flight check detect missing files, status mismatches, orphaned work unit files, and invalid dependency references before any work begins. |
+| Automatic status rollup | When all children of a Story/Feature/Epic are Done, parent auto-rolls to Done. Cascades upward via `set_status()`. |
 | Exact ID matching | Status updates match the ID cell exactly, not as a substring. |
 | Case-insensitive status matching | Recognizes both `in-queue` (lowercase) and `In Queue` (title-case). Writes lowercase. |
 | Explicit `--repo` on all `gh` commands | Prevents PRs from being created against upstream parent repos in fork workflows. |

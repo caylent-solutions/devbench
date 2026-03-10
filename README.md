@@ -52,6 +52,7 @@ Alternatively, set `JUDGE_USE_BEDROCK=1` to use AWS Bedrock for LLM calls instea
 ```
 Orchestrator (execution/orchestrator.py / interactive Claude session)
   │
+  ├── Pre-flight: validate-backlog — abort if index/files are out of sync
   ├── Parse BACKLOG.md → find next actionable work unit
   ├── Implement work unit via TDD (RED → GREEN → REFACTOR)
   ├── Run repo's task runners (make test, make validate)
@@ -65,10 +66,11 @@ Orchestrator (execution/orchestrator.py / interactive Claude session)
   │     └── Prior feedback injected into re-review to prevent contradictions
   ├── Git ops: commit, push, create PR, wait for CI, merge
   ├── Update BACKLOG.md status to Done (with automatic parent rollup)
+  │     └── Done-gate: mark_done() verifies all 4 review judges passed
   └── Repeat until all work units are done
 ```
 
-All five judges must pass before a work unit can be merged.
+All five judges must pass before a work unit can be merged. The done-gate enforces this at the data layer — `mark_done()` raises if the work unit's comment history does not show all four review judges passing in the most recent round.
 
 ## Review Feedback Loop
 
@@ -132,7 +134,8 @@ devbench <command> [args]
 | `review` | `<unit-id>` | Run all review judges, print JSON results |
 | `security-review` | `<unit-id>` | Run security review judge |
 | `set-status` | `<unit-id> <status>` | Set work unit status |
-| `mark-done` | `<unit-id>` | Mark unit as Done, update BACKLOG.md |
+| `mark-done` | `<unit-id>` | Mark unit as Done (enforces done-gate: all judges must have passed) |
+| `validate-backlog` | — | Check backlog integrity (file existence, status sync, orphans, deps) |
 | `report` | `[since-timestamp]` | Print progress report with velocity stats |
 | `log` | `<message>` | Append message to log file |
 
@@ -231,8 +234,14 @@ Restarting picks up where you left off — `done` units are skipped, and `in-pro
 
 ## Troubleshooting
 
+### Backlog is out of sync with work unit files
+Run `devbench validate-backlog` to check for missing files, status mismatches, orphaned files, and invalid dependency references. Fix reported errors before running the orchestrator — it runs this check automatically at startup and aborts if any errors are found.
+
 ### Judge keeps failing the same unit
 After `JUDGE_MAX_RETRIES` failures (default: 10), the unit is marked `blocked`. Check the Comments section of the work unit file for the feedback trail.
+
+### `mark-done` fails with "not all required judges passed"
+The done-gate check found that not all four review judges (`code_review`, `test_review`, `doc_review`, `changes_manifest`) have a `[REVIEW_PASS]` entry after the most recent `[REVIEW_REJECTED]` line. Run `devbench review <unit-id>` to get the current judge verdicts.
 
 ### Judge contradicts its previous feedback
 This should not happen with the prior feedback injection. If it does, check whether the orchestrator log has the previous feedback entries (`grep "judge feedback for <unit-id>" src/devbench/logs/orchestrator.log`).

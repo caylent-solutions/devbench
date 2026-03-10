@@ -209,7 +209,7 @@ devbench/
 
 ## Configuration
 
-Required variables (`JUDGE_ALLOWED_REPOS`, `JUDGE_WORKSPACE_ROOT`, `JUDGE_CLAUDE_MODEL`) raise `RuntimeError` at startup if unset. See [SYSTEM-OVERVIEW.md](SYSTEM-OVERVIEW.md#environment-variables) for the full variable reference.
+Required variables (`JUDGE_ALLOWED_REPOS`, `JUDGE_WORKSPACE_ROOT`, `JUDGE_CLAUDE_MODEL`) raise `RuntimeError` at startup if unset. The startup scripts (`start.sh`, `start-interactive.sh`) additionally require `JUDGE_GH_ORG`. See [SYSTEM-OVERVIEW.md](SYSTEM-OVERVIEW.md#environment-variables) for the full variable reference.
 
 ## Interactive Mode
 

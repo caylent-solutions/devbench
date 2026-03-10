@@ -19,6 +19,8 @@ from testing import make_llm_pass_result
 
 from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
 
+_WORKSPACE_ROOT = os.environ.get("JUDGE_WORKSPACE_ROOT", "/tmp/test-workspace")
+
 # ---------------------------------------------------------------------------
 # Work-unit markdown template
 # ---------------------------------------------------------------------------
@@ -35,7 +37,7 @@ _WORK_UNIT_TEMPLATE = """\
 ## Target Repository
 
 - **Repo:** `{repo}`
-- **Local path:** `/workspaces/general-agent-env/{repo_short}`
+- **Local path:** `{workspace_root}/{repo_short}`
 - **Branch:** `backlog/{unit_id_lower}`
 
 ## Dependencies
@@ -72,6 +74,7 @@ def tmp_work_unit_file(tmp_path: Path) -> Path:
         repo_short="git-repo",
         unit_id_lower="e0-f1-s1-t1",
         dep_rows="| E0-F1-S1 | git-repo Makefile and Targets | Done |",
+        workspace_root=_WORKSPACE_ROOT,
     )
     file_path = tmp_path / "E0-F1-S1-T1.md"
     file_path.write_text(content)
@@ -176,6 +179,7 @@ def sample_work_unit(tmp_path: Path) -> WorkUnit:
             repo_short="git-repo",
             unit_id_lower="e0-f1-s1-t1",
             dep_rows="| E0-F1-S1 | Story One | Done |",
+            workspace_root=_WORKSPACE_ROOT,
         )
     )
     return WorkUnit(

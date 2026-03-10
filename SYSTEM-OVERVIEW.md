@@ -213,10 +213,15 @@ All configuration is via environment variables. Required variables raise `Runtim
 | `JUDGE_LLM_TIMEOUT` | `300` | LLM evaluation timeout (seconds) |
 | `JUDGE_COMMAND_TIMEOUT` | `120` | General command timeout (seconds) |
 | `JUDGE_EXECUTOR_TIMEOUT` | `1800` | Dev agent execution timeout (seconds) |
+| `JUDGE_EXECUTOR_MAX_TURNS` | `50` | Max turns for dev agent execution |
+| `JUDGE_ORCHESTRATOR_POLL_INTERVAL` | `10` | Seconds between orchestrator poll cycles |
+| `JUDGE_SECURITY_FETCH_TIMEOUT` | `120` | Security advisory fetch timeout (seconds) |
 | `JUDGE_OUTPUT_TRUNCATION` | `2000` | Output truncation limit (chars) |
 | `JUDGE_LLM_EVIDENCE_TRUNCATION` | `15000` | LLM evidence truncation (chars) |
 | `JUDGE_LLM_FILE_CONTEXT_LIMIT` | `5` | Max files sent to LLM context |
 | `JUDGE_LLM_FILE_PREVIEW_CHARS` | `3000` | Per-file preview truncation (chars) |
+| `JUDGE_ALERT_SUMMARY_LIMIT` | `10` | Max security alerts included in judge evidence |
+| `JUDGE_CLAUDE_CREDENTIALS_FILE` | `~/.claude/.credentials.json` | Claude Code OAuth credentials file path |
 
 ## Key Design Decisions
 

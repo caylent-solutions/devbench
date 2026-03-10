@@ -83,6 +83,10 @@ ignore = [
 quote-style = "double"
 indent-style = "space"
 
+[tool.mypy]
+mypy_path = ["src", "tests"]
+explicit_package_bases = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src", "tests"]

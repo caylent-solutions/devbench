@@ -70,4 +70,4 @@ report-session:
 
 ## run-backlog: Execute the autonomous backlog orchestrator (foreground, assumes GH_TOKEN is set)
 run-backlog:
-	uv run python -m devbench.orchestrator
+	uv run python -m devbench.execution.orchestrator

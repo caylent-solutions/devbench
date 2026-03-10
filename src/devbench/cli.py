@@ -5,7 +5,7 @@ can invoke judge operations, query backlog status, and execute work units.
 
 Usage::
 
-    python3 -m judges.cli <command> [args]
+    python3 -m devbench.cli <command> [args]
 
 Commands::
 
@@ -48,7 +48,7 @@ from devbench.judges.security_review import SecurityReviewJudge
 from devbench.judges.test_review import TestReviewJudge
 from devbench.log_setup import setup_logging
 
-logger = logging.getLogger("judges.cli")
+logger = logging.getLogger("devbench.cli")
 
 
 def cmd_status() -> int:
@@ -418,7 +418,7 @@ def main() -> int:
     setup_logging()
 
     if len(sys.argv) < 2:
-        print("Usage: python3 -m judges.cli <command> [args]")
+        print("Usage: python3 -m devbench.cli <command> [args]")
         print("\nCommands:")
         for name, (_, _, desc) in sorted(_COMMANDS.items()):
             print(f"  {name:<20} {desc}")

@@ -113,3 +113,13 @@ DEPENDENCY_NONE_VALUE: str = "none"
 # Epic placeholder ID
 # ---------------------------------------------------------------------------
 EPIC_PLACEHOLDER_ID: str = "--"
+
+# ---------------------------------------------------------------------------
+# Required review judge names for the done-gate check (4.1)
+# ---------------------------------------------------------------------------
+REVIEW_JUDGE_NAMES: frozenset[str] = frozenset({
+    "code_review",
+    "test_review",
+    "doc_review",
+    "changes_manifest",
+})

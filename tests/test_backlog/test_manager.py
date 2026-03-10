@@ -155,10 +155,22 @@ class TestSetStatus:
             judge.set_status(tmp_work_unit_file, tmp_path / "missing.md", "E0-F1-S1-T1", "done")
 
 
+_ALL_JUDGES_PASSED_COMMENTS = (
+    "[2024-01-01 00:00 UTC] [judge/code_review] [REVIEW_PASS] ok\n"
+    "[2024-01-01 00:01 UTC] [judge/test_review] [REVIEW_PASS] ok\n"
+    "[2024-01-01 00:02 UTC] [judge/doc_review] [REVIEW_PASS] ok\n"
+    "[2024-01-01 00:03 UTC] [judge/changes_manifest] [REVIEW_PASS] ok\n"
+)
+
+
 class TestMarkDone:
     """Test mark_done delegates to set_status and updates both files."""
 
     def test_mark_done_updates_both_files(self, tmp_work_unit_file: Path, backlog_index_titlecase: Path) -> None:
+        # Append required judge pass entries so the done-gate check passes
+        content = tmp_work_unit_file.read_text(encoding="utf-8")
+        tmp_work_unit_file.write_text(content + _ALL_JUDGES_PASSED_COMMENTS, encoding="utf-8")
+
         judge = BacklogManagerJudge()
         judge.mark_done(tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1")
 
@@ -178,7 +190,9 @@ class TestMarkDone:
 
     def test_mark_done_raises_when_no_status_line(self, tmp_path: Path, backlog_index_titlecase: Path) -> None:
         bad_file = tmp_path / "bad.md"
-        bad_file.write_text("# No status here\nJust content.\n")
+        bad_file.write_text(
+            "# No status here\nJust content.\n" + _ALL_JUDGES_PASSED_COMMENTS
+        )
 
         judge = BacklogManagerJudge()
         with pytest.raises(ValueError, match="Could not find"):
@@ -317,6 +331,119 @@ class TestLogToTraceabilityMatrix:
         assert "AC-02" in content
         lines = [line for line in content.strip().splitlines() if line.startswith("|")]
         assert len(lines) >= 4
+
+
+class TestLastRoundAllPassed:
+    """Tests for _last_round_all_passed() done-gate check."""
+
+    def _make_wu_with_comments(self, tmp_path: Path, comments: str) -> Path:
+        wu = tmp_path / "E0-F1-S1-T1.md"
+        wu.write_text(
+            f"# E0-F1-S1-T1\n\n## Status: in-review\n\n## Comments\n\n{comments}",
+            encoding="utf-8",
+        )
+        return wu
+
+    def test_returns_true_when_all_required_judges_passed(self, tmp_path: Path) -> None:
+        comments = (
+            "[2024-01-01 00:00 UTC] [judge/code_review] [REVIEW_PASS] looks good\n"
+            "[2024-01-01 00:01 UTC] [judge/test_review] [REVIEW_PASS] tests pass\n"
+            "[2024-01-01 00:02 UTC] [judge/doc_review] [REVIEW_PASS] docs ok\n"
+            "[2024-01-01 00:03 UTC] [judge/changes_manifest] [REVIEW_PASS] manifest ok\n"
+        )
+        wu = self._make_wu_with_comments(tmp_path, comments)
+        judge = BacklogManagerJudge()
+        assert judge._last_round_all_passed(wu) is True
+
+    def test_returns_false_when_judge_missing(self, tmp_path: Path) -> None:
+        comments = (
+            "[2024-01-01 00:00 UTC] [judge/code_review] [REVIEW_PASS] looks good\n"
+            "[2024-01-01 00:01 UTC] [judge/test_review] [REVIEW_PASS] tests pass\n"
+            "[2024-01-01 00:02 UTC] [judge/doc_review] [REVIEW_PASS] docs ok\n"
+            # changes_manifest missing
+        )
+        wu = self._make_wu_with_comments(tmp_path, comments)
+        judge = BacklogManagerJudge()
+        assert judge._last_round_all_passed(wu) is False
+
+    def test_returns_false_when_followed_by_review_rejected(self, tmp_path: Path) -> None:
+        """All 4 judges passed in round 1, but then REVIEW_REJECTED — round 2 has no passes."""
+        comments = (
+            # Round 1 passes (older, before REVIEW_REJECTED)
+            "[2024-01-01 00:00 UTC] [judge/code_review] [REVIEW_PASS] ok\n"
+            "[2024-01-01 00:01 UTC] [judge/test_review] [REVIEW_PASS] ok\n"
+            "[2024-01-01 00:02 UTC] [judge/doc_review] [REVIEW_PASS] ok\n"
+            "[2024-01-01 00:03 UTC] [judge/changes_manifest] [REVIEW_PASS] ok\n"
+            "[2024-01-01 00:04 UTC] [orchestrator] [REVIEW_REJECTED] attempt 1 rejected\n"
+            # Round 2 has no REVIEW_PASS entries yet (only rejection so far)
+        )
+        wu = self._make_wu_with_comments(tmp_path, comments)
+        judge = BacklogManagerJudge()
+        assert judge._last_round_all_passed(wu) is False
+
+    def test_returns_true_when_round2_passes_after_rejection(self, tmp_path: Path) -> None:
+        """Round 2 passes after a prior round was rejected."""
+        comments = (
+            # Round 1 — rejected
+            "[2024-01-01 00:00 UTC] [judge/code_review] [REVIEW_PASS] ok\n"
+            "[2024-01-01 00:01 UTC] [orchestrator] [REVIEW_REJECTED] attempt 1 rejected\n"
+            # Round 2 — all pass
+            "[2024-01-01 00:02 UTC] [judge/code_review] [REVIEW_PASS] ok\n"
+            "[2024-01-01 00:03 UTC] [judge/test_review] [REVIEW_PASS] ok\n"
+            "[2024-01-01 00:04 UTC] [judge/doc_review] [REVIEW_PASS] ok\n"
+            "[2024-01-01 00:05 UTC] [judge/changes_manifest] [REVIEW_PASS] ok\n"
+        )
+        wu = self._make_wu_with_comments(tmp_path, comments)
+        judge = BacklogManagerJudge()
+        assert judge._last_round_all_passed(wu) is True
+
+    def test_returns_false_when_no_comments(self, tmp_path: Path) -> None:
+        wu = self._make_wu_with_comments(tmp_path, "")
+        judge = BacklogManagerJudge()
+        assert judge._last_round_all_passed(wu) is False
+
+
+class TestMarkDoneGate:
+    """Test that mark_done enforces the done-gate check."""
+
+    def _make_wu(self, tmp_path: Path, comments: str = "") -> Path:
+        wu = tmp_path / "E0-F1-S1-T1.md"
+        wu.write_text(
+            f"# E0-F1-S1-T1\n\n## Status: in-review\n\n## Comments\n\n{comments}",
+            encoding="utf-8",
+        )
+        return wu
+
+    def _make_index(self, tmp_path: Path) -> Path:
+        content = (
+            "# Backlog\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Task | Task | in-review | None | repo | `backlog/E0-F1-S1-T1.md` |\n"
+        )
+        idx = tmp_path / "BACKLOG.md"
+        idx.write_text(content, encoding="utf-8")
+        return idx
+
+    def test_mark_done_raises_when_judges_not_all_passed(self, tmp_path: Path) -> None:
+        wu = self._make_wu(tmp_path, "[2024-01-01] [judge/code_review] [REVIEW_PASS] ok\n")
+        idx = self._make_index(tmp_path)
+        judge = BacklogManagerJudge()
+        with pytest.raises(RuntimeError, match="not all required judges passed"):
+            judge.mark_done(wu, idx, "E0-F1-S1-T1")
+
+    def test_mark_done_succeeds_when_all_judges_passed(self, tmp_path: Path) -> None:
+        comments = (
+            "[2024-01-01 00:00 UTC] [judge/code_review] [REVIEW_PASS] ok\n"
+            "[2024-01-01 00:01 UTC] [judge/test_review] [REVIEW_PASS] ok\n"
+            "[2024-01-01 00:02 UTC] [judge/doc_review] [REVIEW_PASS] ok\n"
+            "[2024-01-01 00:03 UTC] [judge/changes_manifest] [REVIEW_PASS] ok\n"
+        )
+        wu = self._make_wu(tmp_path, comments)
+        idx = self._make_index(tmp_path)
+        judge = BacklogManagerJudge()
+        judge.mark_done(wu, idx, "E0-F1-S1-T1")
+        assert "## Status: done" in wu.read_text(encoding="utf-8")
 
 
 class TestEvaluateNoop:

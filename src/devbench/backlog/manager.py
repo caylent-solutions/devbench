@@ -13,6 +13,7 @@ from pathlib import Path
 from devbench.constants import (
     COMMENT_ENTRY_TEMPLATE,
     COMMENTS_SECTION_HEADER,
+    REVIEW_JUDGE_NAMES,
     STATUS_LINE_RE,
     TABLE_STATUS_VALUES,
     TRACEABILITY_MATRIX_HEADER,
@@ -94,15 +95,23 @@ class BacklogManagerJudge(BaseJudge):
     def mark_done(self, work_unit_path: Path, backlog_index: Path, unit_id: str) -> None:
         """Mark a work unit as Done in both files.
 
+        Raises ``RuntimeError`` if not all required review judges have passed
+        in the most recent review round (done-gate enforcement).
+
         Args:
             work_unit_path: Path to the work-unit ``.md`` file.
             backlog_index: Path to the ``BACKLOG.md`` file.
             unit_id: The work-unit identifier.
 
         Raises:
+            RuntimeError: If not all required judges passed in the last round.
             FileNotFoundError: If either file does not exist.
             ValueError: If the status line or unit row is not found.
         """
+        if not self._last_round_all_passed(work_unit_path):
+            raise RuntimeError(
+                f"Cannot mark {unit_id} done: not all required judges passed in the most recent review round"
+            )
         self.set_status(work_unit_path, backlog_index, unit_id, "done")
 
     def mark_blocked(self, work_unit_path: Path, backlog_index: Path, unit_id: str, reason: str) -> None:
@@ -148,6 +157,27 @@ class BacklogManagerJudge(BaseJudge):
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _last_round_all_passed(self, work_unit_path: Path) -> bool:
+        """Check whether the most recent review round had all required judges pass.
+
+        Reads the work-unit file's comment history in reverse. Collects
+        ``[REVIEW_PASS]`` entries per judge; stops and resets if a
+        ``[REVIEW_REJECTED]`` line is encountered (prior round boundary).
+
+        Returns:
+            True if every judge in ``REVIEW_JUDGE_NAMES`` has a ``[REVIEW_PASS]``
+            entry in the most recent round; False otherwise.
+        """
+        content = work_unit_path.read_text(encoding="utf-8")
+        passed: set[str] = set()
+        for line in reversed(content.splitlines()):
+            if "[REVIEW_REJECTED]" in line:
+                break  # everything before this belongs to a prior round
+            for judge in REVIEW_JUDGE_NAMES:
+                if f"[judge/{judge}]" in line and "[REVIEW_PASS]" in line:
+                    passed.add(judge)
+        return REVIEW_JUDGE_NAMES <= passed
 
     def _rollup_parent_status(self, backlog_index: Path, unit_id: str) -> None:
         """If all children of the parent unit are Done, mark the parent Done too.

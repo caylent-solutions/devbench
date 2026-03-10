@@ -39,11 +39,17 @@ from devbench.constants import (
 
 
 class BacklogManager:
-    """Owns backlog lifecycle: status writes, done-gate checks, rollups, and validation."""
+    """Owns backlog lifecycle: status writes, done-gate checks, rollups, comments, and validation."""
 
-    def __init__(self) -> None:
+    def __init__(self, logger: logging.Logger | None = None) -> None:
+        """Initialise the manager.
+
+        Args:
+            logger: Optional logger instance.  Defaults to
+                ``logging.getLogger("devbench.backlog_manager")`` when omitted.
+        """
         self.name = "backlog_manager"
-        self.logger = logging.getLogger(f"devbench.{self.name}")
+        self.logger = logger or logging.getLogger(f"devbench.{self.name}")
 
     def force_status(
         self,

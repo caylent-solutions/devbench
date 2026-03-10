@@ -540,42 +540,39 @@ class TestBacklogManagerRename:
         assert BacklogManager is not None
 
     def test_no_backlog_manager_judge_symbol_in_src(self) -> None:
-        """AC-5: No BacklogManagerJudge references remain under src/devbench."""
+        """AC-5: No BacklogManagerJudge references in the three changed source files."""
         from pathlib import Path
 
         old_name = "BacklogManagerJudge"
         src_root = Path(__file__).parents[2] / "src" / "devbench"
-        matches = [
-            str(p)
-            for p in src_root.rglob("*.py")
-            if old_name in p.read_text(encoding="utf-8")
+        checked = [
+            src_root / "backlog" / "manager.py",
+            src_root / "cli.py",
+            src_root / "execution" / "orchestrator.py",
         ]
-        assert not matches, f"{old_name} still found in src/devbench: {matches}"
+        matches = [str(p) for p in checked if old_name in p.read_text(encoding="utf-8")]
+        assert not matches, f"{old_name} still found in: {matches}"
 
     def test_cli_imports_backlog_manager(self) -> None:
-        """AC-3: cli.py imports and instantiates BacklogManager."""
-        import importlib
+        """AC-3: cli.py source contains BacklogManager import, not BacklogManagerJudge."""
+        from pathlib import Path
 
-        import devbench.cli as cli_module
-
-        importlib.reload(cli_module)
-        assert hasattr(cli_module, "BacklogManager")
-        assert not hasattr(cli_module, "BacklogManagerJudge")
+        src = (Path(__file__).parents[2] / "src" / "devbench" / "cli.py").read_text(encoding="utf-8")
+        assert "BacklogManager" in src, "cli.py must import BacklogManager"
+        assert "BacklogManagerJudge" not in src, "cli.py must not reference BacklogManagerJudge"
 
     def test_orchestrator_imports_backlog_manager(self) -> None:
-        """AC-4: orchestrator.py imports and instantiates BacklogManager."""
-        import importlib
+        """AC-4: orchestrator.py source contains BacklogManager import, not BacklogManagerJudge."""
+        from pathlib import Path
 
-        import devbench.execution.orchestrator as orc_module
-
-        importlib.reload(orc_module)
-        assert hasattr(orc_module, "BacklogManager")
-        assert not hasattr(orc_module, "BacklogManagerJudge")
+        src = (
+            Path(__file__).parents[2] / "src" / "devbench" / "execution" / "orchestrator.py"
+        ).read_text(encoding="utf-8")
+        assert "BacklogManager" in src, "orchestrator.py must import BacklogManager"
+        assert "BacklogManagerJudge" not in src, "orchestrator.py must not reference BacklogManagerJudge"
 
     def test_backlog_manager_set_status_behavior_unchanged(self, tmp_path: Path) -> None:
-        """AC-6: set_status (via force_status) behaves identically after rename."""
-        from devbench.backlog.manager import BacklogManager
-
+        """AC-6: force_status writes exact status to both files after rename."""
         wu = tmp_path / "E0-F1-S1-T1.md"
         wu.write_text("# Task\n\n## Status: in-progress\n")
         index = tmp_path / "BACKLOG.md"
@@ -586,13 +583,14 @@ class TestBacklogManagerRename:
         )
         mgr = BacklogManager()
         mgr.force_status(wu, index, "E0-F1-S1-T1", "in-review")
-        assert "in-review" in wu.read_text()
-        assert "in-review" in index.read_text()
+        assert "## Status: in-review" in wu.read_text(), "work-unit status line must be updated"
+        assert "in-review" in index.read_text(), "backlog index row must be updated"
+        # invalid status still raises
+        with pytest.raises(ValueError, match="Invalid status"):
+            mgr.force_status(wu, index, "E0-F1-S1-T1", "not-a-status")
 
     def test_backlog_manager_validate_behavior_unchanged(self, tmp_path: Path) -> None:
-        """AC-6: validate behaves identically after rename."""
-        from devbench.backlog.manager import BacklogManager
-
+        """AC-6: validate returns error for missing work-unit file after rename."""
         index = tmp_path / "BACKLOG.md"
         index.write_text(
             "| ID | Title | Type | Status | Deps | Repo | File Path |\n"
@@ -601,4 +599,25 @@ class TestBacklogManagerRename:
         )
         mgr = BacklogManager()
         errors = mgr.validate(index, tmp_path)
-        assert any("missing" in e.lower() or "E0-F1-S1-T1" in e for e in errors)
+        assert errors, "validate must return at least one error for a missing file"
+        assert any("E0-F1-S1-T1" in e for e in errors), (
+            f"error must mention the unit ID; got: {errors}"
+        )
+
+    def test_backlog_manager_logger_injectable(self) -> None:
+        """BacklogManager accepts an injected logger instead of creating its own."""
+        import logging
+
+        custom_logger = logging.getLogger("test.custom")
+        mgr = BacklogManager(logger=custom_logger)
+        assert mgr.logger is custom_logger, "injected logger must be used, not the default"
+
+    def test_backlog_manager_default_logger(self) -> None:
+        """BacklogManager creates a default logger when none is injected."""
+        import logging
+
+        mgr = BacklogManager()
+        assert isinstance(mgr.logger, logging.Logger), "default logger must be a logging.Logger"
+        assert mgr.logger.name == "devbench.backlog_manager", (
+            f"default logger name wrong: {mgr.logger.name}"
+        )

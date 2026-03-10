@@ -372,7 +372,7 @@ class TestCmdSetStatus:
 
 
 class TestCmdMarkDone:
-    """Test cmd_mark_done delegates to cmd_set_status."""
+    """Test cmd_mark_done enforces the done-gate via mark_done()."""
 
     def test_returns_1_when_unit_not_found(self, mock_units: list[WorkUnit]) -> None:
         mock_parser = MagicMock()
@@ -401,7 +401,28 @@ class TestCmdMarkDone:
                     result = cli.cmd_mark_done("E0-F1-S1-T2")
 
         assert result == 0
-        mock_mgr.set_status.assert_called_once()
+        mock_mgr.mark_done.assert_called_once()
+
+    def test_returns_1_when_done_gate_fails(
+        self, mock_units: list[WorkUnit], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        wu_file = tmp_path / "backlog" / "E0-F1-S1-T2.md"
+        wu_file.parent.mkdir(parents=True, exist_ok=True)
+        wu_file.write_text("# Task\n## Status: in-review\n")
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+
+        mock_mgr = MagicMock()
+        mock_mgr.mark_done.side_effect = RuntimeError("not all required judges passed")
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            with patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"):
+                with patch("devbench.cli.BacklogManagerJudge", return_value=mock_mgr):
+                    result = cli.cmd_mark_done("E0-F1-S1-T2")
+
+        assert result == 1
+        assert "not all required judges passed" in capsys.readouterr().err
 
 
 class TestCmdReviewNoRepoPath:

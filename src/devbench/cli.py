@@ -329,8 +329,34 @@ def cmd_set_status(unit_id: str, new_status: str) -> int:
 
 
 def cmd_mark_done(unit_id: str) -> int:
-    """Mark a work unit as Done (delegates to set-status)."""
-    return cmd_set_status(unit_id, "done")
+    """Mark a work unit as Done, enforcing the done-gate check.
+
+    Calls ``BacklogManagerJudge.mark_done()`` which verifies that all required
+    review judges passed in the most recent round before allowing the transition.
+    Raises ``RuntimeError`` if the gate check fails.
+    """
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+
+    target = _find_unit(units, unit_id)
+    if target is None:
+        print(f"ERROR: Work unit '{unit_id}' not found", file=sys.stderr)
+        return 1
+
+    wu_file = BACKLOG_ROOT / target.file_path if not target.file_path.is_absolute() else target.file_path
+    if not wu_file.exists():
+        wu_file = WORKSPACE_ROOT / target.file_path
+
+    mgr = BacklogManagerJudge()
+    try:
+        mgr.mark_done(wu_file, BACKLOG_INDEX, unit_id)
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    logger.info("Marked %s as done", unit_id)
+    print(f"Marked {unit_id} as done")
+    return 0
 
 
 def cmd_validate_backlog() -> int:

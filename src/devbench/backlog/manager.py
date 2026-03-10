@@ -49,7 +49,7 @@ class BacklogManager:
                 ``logging.getLogger("devbench.backlog_manager")`` when omitted.
         """
         self.name = "backlog_manager"
-        self.logger = logger or logging.getLogger(f"devbench.{self.name}")
+        self.logger = logger or logging.getLogger("devbench.backlog_manager")
 
     def force_status(
         self,

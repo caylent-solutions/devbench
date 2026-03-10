@@ -621,3 +621,9 @@ class TestBacklogManagerRename:
         assert mgr.logger.name == "devbench.backlog_manager", (
             f"default logger name wrong: {mgr.logger.name}"
         )
+
+    def test_backlog_manager_has_no_evaluate_method(self) -> None:
+        """BacklogManager must not expose evaluate() — judge interface removed."""
+        assert not hasattr(BacklogManager, "evaluate"), (
+            "BacklogManager must not have evaluate(); judge interface was intentionally removed"
+        )

@@ -177,13 +177,14 @@ class BacklogManagerJudge(BaseJudge):
             for judge in REVIEW_JUDGE_NAMES:
                 if f"[judge/{judge}]" in line and "[REVIEW_PASS]" in line:
                     passed.add(judge)
-        return REVIEW_JUDGE_NAMES <= passed
+        return passed >= REVIEW_JUDGE_NAMES
 
     def _rollup_parent_status(self, backlog_index: Path, unit_id: str) -> None:
         """If all children of the parent unit are Done, mark the parent Done too.
 
         Derives the parent ID by removing the last segment (e.g. E0-F1-S1-T1 → E0-F1-S1).
-        Cascades upward: Story → Feature → Epic.
+        Cascades upward: Story → Feature → Epic via set_status() which calls this
+        method recursively for each newly-done parent.
         """
         parts = unit_id.rsplit("-", 1)
         if len(parts) < 2:
@@ -201,11 +202,9 @@ class BacklogManagerJudge(BaseJudge):
             return
 
         self.logger.info("All children of %s are done — rolling up status", parent_id)
-        self._update_status(parent_file, "done")
-        self._update_backlog_index(backlog_index, parent_id, "done")
-
-        # Cascade upward
-        self._rollup_parent_status(backlog_index, parent_id)
+        # Route through set_status: writes both files atomically and cascades
+        # upward automatically (set_status calls _rollup_parent_status for "done").
+        self.set_status(parent_file, backlog_index, parent_id, "done")
 
     def _parse_backlog_rows(self, backlog_index: Path) -> list[tuple[str, str, str]]:
         """Parse BACKLOG.md table rows into (id, status, file_path) tuples."""

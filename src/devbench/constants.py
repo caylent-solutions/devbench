@@ -10,8 +10,6 @@ live in ``config.py`` with environment-variable overrides.
 
 import re
 
-from devbench.config import OUTPUT_TRUNCATION_LIMIT
-
 # ---------------------------------------------------------------------------
 # Markdown section headers
 # ---------------------------------------------------------------------------
@@ -82,7 +80,6 @@ PR_BODY_TEMPLATE: str = "Automated PR for work unit {unit_id}\n\n{description}"
 ERROR_OUTPUT_PREVIEW_CHARS: int = 1000
 RAW_RESPONSE_PREVIEW_CHARS: int = 500
 TEST_OUTPUT_TAIL_CHARS: int = 500
-PR_DESCRIPTION_CHARS: int = OUTPUT_TRUNCATION_LIMIT
 
 # ---------------------------------------------------------------------------
 # LLM response format prompt
@@ -110,6 +107,52 @@ STATUS_SEPARATOR_WIDTH: int = 40
 DEPENDENCY_NONE_VALUE: str = "none"
 
 # ---------------------------------------------------------------------------
+# Work-unit lifecycle status strings (canonical lowercase-hyphenated form).
+# These are the values written into work-unit files and BACKLOG.md rows.
+# The display / title-case variants live on WorkUnitStatus in work_unit.py.
+# ---------------------------------------------------------------------------
+STATUS_IN_QUEUE: str = "in-queue"
+STATUS_IN_PROGRESS: str = "in-progress"
+STATUS_IN_REVIEW: str = "in-review"
+STATUS_DONE: str = "done"
+STATUS_BLOCKED: str = "blocked"
+
+# Ordered mapping from any accepted input form to the canonical write form.
+# Used by BacklogManagerJudge._set_status() for validation and normalisation.
+VALID_STATUSES: dict[str, str] = {
+    STATUS_IN_QUEUE: STATUS_IN_QUEUE,
+    STATUS_IN_PROGRESS: STATUS_IN_PROGRESS,
+    STATUS_IN_REVIEW: STATUS_IN_REVIEW,
+    STATUS_DONE: STATUS_DONE,
+    STATUS_BLOCKED: STATUS_BLOCKED,
+}
+
+# ---------------------------------------------------------------------------
 # Epic placeholder ID
 # ---------------------------------------------------------------------------
 EPIC_PLACEHOLDER_ID: str = "--"
+
+# ---------------------------------------------------------------------------
+# Subdirectory name under the backlog root where work-unit files live.
+# ---------------------------------------------------------------------------
+BACKLOG_SUBDIR: str = "backlog"
+
+# All values that mean "no dependency" in the BACKLOG.md dependencies column.
+# Includes DEPENDENCY_NONE_VALUE, EPIC_PLACEHOLDER_ID, the separator used in
+# some tables, and empty string.
+DEPENDENCY_NONE_VALUES: frozenset[str] = frozenset({
+    DEPENDENCY_NONE_VALUE,  # "none"
+    EPIC_PLACEHOLDER_ID,    # "--"
+    "---",
+    "",
+})
+
+# ---------------------------------------------------------------------------
+# Required review judge names for the done-gate check (4.1)
+# ---------------------------------------------------------------------------
+REVIEW_JUDGE_NAMES: frozenset[str] = frozenset({
+    "code_review",
+    "test_review",
+    "doc_review",
+    "changes_manifest",
+})

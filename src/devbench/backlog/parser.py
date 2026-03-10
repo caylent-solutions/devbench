@@ -21,6 +21,11 @@ from devbench.constants import (
     BACKLOG_STATUS_RE,
     DEPENDENCY_NONE_VALUE,
     EPIC_PLACEHOLDER_ID,
+    STATUS_BLOCKED,
+    STATUS_DONE,
+    STATUS_IN_PROGRESS,
+    STATUS_IN_QUEUE,
+    STATUS_IN_REVIEW,
 )
 
 # ---------------------------------------------------------------------------
@@ -29,11 +34,11 @@ from devbench.constants import (
 # title-case values.  This map bridges the two representations.
 # ---------------------------------------------------------------------------
 _RAW_STATUS_TO_ENUM: dict[str, WorkUnitStatus] = {
-    "in-queue": WorkUnitStatus.IN_QUEUE,
-    "in-progress": WorkUnitStatus.IN_PROGRESS,
-    "in-review": WorkUnitStatus.IN_REVIEW,
-    "done": WorkUnitStatus.DONE,
-    "blocked": WorkUnitStatus.BLOCKED,
+    STATUS_IN_QUEUE: WorkUnitStatus.IN_QUEUE,
+    STATUS_IN_PROGRESS: WorkUnitStatus.IN_PROGRESS,
+    STATUS_IN_REVIEW: WorkUnitStatus.IN_REVIEW,
+    STATUS_DONE: WorkUnitStatus.DONE,
+    STATUS_BLOCKED: WorkUnitStatus.BLOCKED,
 }
 
 # Pattern to determine work-unit type from the last segment of a compound ID.

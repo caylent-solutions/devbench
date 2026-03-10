@@ -9,11 +9,16 @@ Usage::
 
 Commands::
 
-    status                Show backlog summary (counts by status)
-    next                  Print the next actionable work unit ID and title
-    execute <id>          Spawn a Claude Code agent to execute a work unit
-    review <id>           Run all review judges on a work unit, print JSON results
-    log <message>         Append a message to the orchestrator log file
+    status                  Show backlog summary (counts by status)
+    next                    Print the next actionable work unit ID and title
+    execute <id>            Spawn a Claude Code agent to execute a work unit
+    review <id>             Run all review judges on a work unit, print JSON results
+    security-review <id>    Run the security review judge on a work unit
+    set-status <id> <s>     Force any status (no gate — use for recovery/lifecycle transitions)
+    mark-done <id>          Mark unit as Done (enforces done-gate: all judges must have passed)
+    validate-backlog        Check backlog integrity (file existence, status sync, orphans, deps)
+    report [since]          Print progress report with velocity stats
+    log <message>           Append a message to the orchestrator log file
 
 All commands exit 0 on success, non-zero on failure. Output is structured
 for easy parsing by Claude Code or other automation.
@@ -39,7 +44,12 @@ from devbench.config import (
     resolve_repo,
     validate_repo,
 )
-from devbench.constants import DISPLAY_STATUS_VALUES, STATUS_SEPARATOR_WIDTH
+from devbench.constants import (
+    DISPLAY_STATUS_VALUES,
+    STATUS_IN_PROGRESS,
+    STATUS_IN_REVIEW,
+    STATUS_SEPARATOR_WIDTH,
+)
 from devbench.judges.base import Verdict
 from devbench.judges.changes_manifest import ChangesManifestJudge
 from devbench.judges.code_review import CodeReviewJudge
@@ -111,7 +121,7 @@ def cmd_next() -> int:
         wu_file = WORKSPACE_ROOT / unit.file_path
     if wu_file.exists():
         mgr = BacklogManagerJudge()
-        mgr.set_status(wu_file, BACKLOG_INDEX, unit.id, "in-progress")
+        mgr.force_status(wu_file, BACKLOG_INDEX, unit.id, STATUS_IN_PROGRESS)
         logger.info("Set %s to in-progress", unit.id)
 
     print(
@@ -188,9 +198,12 @@ def cmd_review(unit_id: str) -> int:
     if not wu_file.exists():
         wu_file = WORKSPACE_ROOT / target.file_path
 
+    # Resolve file_path to the absolute path so log_comment writes to the right file
+    target.file_path = wu_file
+
     # Automatically mark as in-review in both files
     mgr = BacklogManagerJudge()
-    mgr.set_status(wu_file, BACKLOG_INDEX, unit_id, "in-review")
+    mgr.force_status(wu_file, BACKLOG_INDEX, unit_id, STATUS_IN_REVIEW)
     logger.info("Set %s to in-review", unit_id)
 
     judges = [
@@ -212,6 +225,20 @@ def cmd_review(unit_id: str) -> int:
         passed = judge_result.verdict == Verdict.PASS
         if not passed:
             all_passed = False
+
+        # Write judge verdict comment to the work-unit file so mark_done can verify all judges passed
+        if passed:
+            target.log_comment(
+                agent_id=f"judge/{judge.name}",
+                action="REVIEW_PASS",
+                message=judge_result.reasoning,
+            )
+        else:
+            target.log_comment(
+                agent_id=f"judge/{judge.name}",
+                action="REVIEW_FAIL",
+                message=f"{judge_result.reasoning} | Fix: {judge_result.feedback}",
+            )
 
         logger.info(
             "%s judge verdict for %s: %s", judge.name, unit_id, judge_result.verdict.value,
@@ -321,7 +348,7 @@ def cmd_set_status(unit_id: str, new_status: str) -> int:
         wu_file = WORKSPACE_ROOT / target.file_path
 
     mgr = BacklogManagerJudge()
-    mgr.set_status(wu_file, BACKLOG_INDEX, unit_id, new_status)
+    mgr.force_status(wu_file, BACKLOG_INDEX, unit_id, new_status)
 
     logger.info("Set %s to %s", unit_id, new_status)
     print(f"Set {unit_id} to {new_status}")
@@ -329,8 +356,57 @@ def cmd_set_status(unit_id: str, new_status: str) -> int:
 
 
 def cmd_mark_done(unit_id: str) -> int:
-    """Mark a work unit as Done (delegates to set-status)."""
-    return cmd_set_status(unit_id, "done")
+    """Mark a work unit as Done, enforcing the done-gate check.
+
+    Calls ``BacklogManagerJudge.mark_done()`` which verifies that all required
+    review judges passed in the most recent round before allowing the transition.
+    Raises ``RuntimeError`` if the gate check fails.
+    """
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+
+    target = _find_unit(units, unit_id)
+    if target is None:
+        print(f"ERROR: Work unit '{unit_id}' not found", file=sys.stderr)
+        return 1
+
+    wu_file = BACKLOG_ROOT / target.file_path if not target.file_path.is_absolute() else target.file_path
+    if not wu_file.exists():
+        wu_file = WORKSPACE_ROOT / target.file_path
+
+    mgr = BacklogManagerJudge()
+    try:
+        mgr.mark_done(wu_file, BACKLOG_INDEX, unit_id)
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    logger.info("Marked %s as done", unit_id)
+    print(f"Marked {unit_id} as done")
+    return 0
+
+
+def cmd_validate_backlog() -> int:
+    """Validate backlog integrity and print any inconsistencies.
+
+    Checks:
+    - Every index row has a corresponding work unit file.
+    - Every work unit file's status matches the index.
+    - No orphaned work unit files.
+    - All dependency IDs reference real work unit IDs.
+
+    Exits 0 if the backlog is consistent; 1 with actionable error messages
+    if any inconsistencies are found.
+    """
+    mgr = BacklogManagerJudge()
+    errors = mgr.validate(BACKLOG_INDEX, BACKLOG_INDEX.parent)
+    if not errors:
+        print("Backlog integrity check passed.")
+        return 0
+    print(f"Backlog integrity check FAILED ({len(errors)} error(s)):")
+    for error in errors:
+        print(f"  ERROR: {error}")
+    return 1
 
 
 def cmd_report(since: str = "") -> int:
@@ -408,6 +484,7 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
     "security-review": (cmd_security_review, 1, "Security review: security-review <id>"),
     "set-status": (cmd_set_status, 2, "Set status: set-status <id> <status>"),
     "mark-done": (cmd_mark_done, 1, "Mark done: mark-done <id>"),
+    "validate-backlog": (cmd_validate_backlog, 0, "Validate backlog integrity"),
     "log": (cmd_log, 1, "Log a message: log <message>"),
     "report": (cmd_report, 0, "Progress report: report [since-timestamp]"),
 }

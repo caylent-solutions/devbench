@@ -3,31 +3,39 @@
 Provides methods to mark work units as done or blocked, update the backlog
 index, and log entries to the traceability matrix.
 
-All status transitions flow through ``set_status`` which updates both the
-work-unit file and BACKLOG.md atomically, preventing drift between the two.
+Public API
+----------
+``force_status``  — write any status to both files with no gate checks.
+                    Use for automated lifecycle transitions (in-progress,
+                    in-review) and for manual recovery overrides.
+``mark_done``     — gated completion: verifies all required review judges
+                    passed in the most recent round before writing ``done``.
+``mark_blocked``  — writes ``blocked`` and appends a reason comment.
+``validate``      — returns integrity errors (missing files, status drift,
+                    orphans, broken deps).
+
+All writes go through the private ``_set_status`` workhorse which updates
+both the work-unit file and BACKLOG.md atomically.
 """
 
 from datetime import UTC, datetime
 from pathlib import Path
 
 from devbench.constants import (
+    BACKLOG_STATUS_RE,
+    BACKLOG_SUBDIR,
     COMMENT_ENTRY_TEMPLATE,
     COMMENTS_SECTION_HEADER,
+    DEPENDENCY_NONE_VALUES,
+    REVIEW_JUDGE_NAMES,
+    STATUS_BLOCKED,
+    STATUS_DONE,
     STATUS_LINE_RE,
     TABLE_STATUS_VALUES,
     TRACEABILITY_MATRIX_HEADER,
+    VALID_STATUSES,
 )
 from devbench.judges.base import BaseJudge, JudgeResult, Verdict
-
-# Mapping from CLI-style lowercase statuses to the canonical lowercase forms
-# used in work-unit files and BACKLOG.md table rows.
-VALID_STATUSES: dict[str, str] = {
-    "in-queue": "in-queue",
-    "in-progress": "in-progress",
-    "in-review": "in-review",
-    "done": "done",
-    "blocked": "blocked",
-}
 
 
 class BacklogManagerJudge(BaseJudge):
@@ -49,16 +57,19 @@ class BacklogManagerJudge(BaseJudge):
             evidence=[],
         )
 
-    def set_status(
+    def force_status(
         self,
         work_unit_path: Path,
         backlog_index: Path,
         unit_id: str,
         new_status: str,
     ) -> None:
-        """Update the status in both the work-unit file and BACKLOG.md.
+        """Write any status to both files, bypassing all gate checks.
 
-        This is the single code path for all status transitions.
+        Use this for automated lifecycle transitions (``in-progress``,
+        ``in-review``) and for manual recovery overrides where the done-gate
+        would incorrectly block a legitimate repair.  Prefer ``mark_done``
+        for agent-driven completion — it enforces that all judges have passed.
 
         Args:
             work_unit_path: Path to the work-unit ``.md`` file.
@@ -72,27 +83,13 @@ class BacklogManagerJudge(BaseJudge):
             ValueError: If the status is invalid, the ``## Status:`` line
                 is missing, or the unit is not found in the backlog index.
         """
-        canonical = VALID_STATUSES.get(new_status.lower())
-        if canonical is None:
-            raise ValueError(
-                f"Invalid status '{new_status}'. "
-                f"Valid statuses: {', '.join(sorted(VALID_STATUSES))}"
-            )
-
-        self._update_status(work_unit_path, canonical)
-        self._update_backlog_index(backlog_index, unit_id, canonical)
-        self.logger.info(
-            "Set %s to '%s' in both work-unit file and BACKLOG.md",
-            unit_id,
-            canonical,
-        )
-
-        # When marking done, roll up parent status if all siblings are done
-        if canonical == "done":
-            self._rollup_parent_status(backlog_index, unit_id)
+        self._set_status(work_unit_path, backlog_index, unit_id, new_status)
 
     def mark_done(self, work_unit_path: Path, backlog_index: Path, unit_id: str) -> None:
         """Mark a work unit as Done in both files.
+
+        Raises ``RuntimeError`` if not all required review judges have passed
+        in the most recent review round (done-gate enforcement).
 
         Args:
             work_unit_path: Path to the work-unit ``.md`` file.
@@ -100,10 +97,15 @@ class BacklogManagerJudge(BaseJudge):
             unit_id: The work-unit identifier.
 
         Raises:
+            RuntimeError: If not all required judges passed in the last round.
             FileNotFoundError: If either file does not exist.
             ValueError: If the status line or unit row is not found.
         """
-        self.set_status(work_unit_path, backlog_index, unit_id, "done")
+        if not self._last_round_all_passed(work_unit_path):
+            raise RuntimeError(
+                f"Cannot mark {unit_id} done: not all required judges passed in the most recent review round"
+            )
+        self._set_status(work_unit_path, backlog_index, unit_id, STATUS_DONE)
 
     def mark_blocked(self, work_unit_path: Path, backlog_index: Path, unit_id: str, reason: str) -> None:
         """Mark a work unit as Blocked in both files and append a comment.
@@ -118,8 +120,97 @@ class BacklogManagerJudge(BaseJudge):
             FileNotFoundError: If either file does not exist.
             ValueError: If the status line or unit row is not found.
         """
-        self.set_status(work_unit_path, backlog_index, unit_id, "blocked")
+        self._set_status(work_unit_path, backlog_index, unit_id, STATUS_BLOCKED)
         self._append_comment(work_unit_path, "BLOCKED", reason)
+
+    def validate(self, backlog_index: Path, workspace_root: Path) -> list[str]:
+        """Check backlog integrity and return a list of error messages.
+
+        Checks performed:
+        1. Every row in BACKLOG.md has a corresponding work unit file.
+        2. Every work unit file's status matches the index.
+        3. No orphaned work unit files (in workspace_root/backlog/ but not in index).
+        4. All dependency IDs reference real work unit IDs in the index.
+
+        Args:
+            backlog_index: Path to the ``BACKLOG.md`` index file.
+            workspace_root: Workspace root containing BACKLOG.md and the backlog/ subdirectory.
+
+        Returns:
+            A list of error strings. Empty list means the backlog is valid.
+        """
+        rows = self._parse_backlog_rows(backlog_index)
+        known_ids = {row_id for row_id, _, _ in rows if row_id and not row_id.startswith("-")}
+
+        errors: list[str] = []
+        indexed_files = self._check_files_and_statuses(rows, workspace_root, errors)
+        self._check_orphans(workspace_root, indexed_files, errors)
+        self._check_dependencies(backlog_index, known_ids, errors)
+        return errors
+
+    def _check_files_and_statuses(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> set[Path]:
+        """Check file existence and status consistency (checks 1 and 2)."""
+        indexed_files: set[Path] = set()
+        for row_id, index_status, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not file_path_str:
+                continue
+            wu_path = workspace_root / file_path_str
+            indexed_files.add(wu_path.resolve())
+
+            if not wu_path.exists():
+                errors.append(f"{row_id}: work unit file missing — expected {file_path_str}")
+                continue
+
+            content = wu_path.read_text(encoding="utf-8")
+            m = BACKLOG_STATUS_RE.search(content)
+            if m:
+                file_status = m.group(1).strip().lower()
+                if file_status != index_status:
+                    errors.append(
+                        f"{row_id}: status mismatch — index has '{index_status}', file has '{file_status}'"
+                    )
+            else:
+                errors.append(f"{row_id}: work unit file missing '## Status:' line")
+        return indexed_files
+
+    def _check_orphans(
+        self, workspace_root: Path, indexed_files: set[Path], errors: list[str]
+    ) -> None:
+        """Check 3: no orphaned work unit files."""
+        backlog_dir = workspace_root / BACKLOG_SUBDIR
+        if backlog_dir.exists():
+            for wu_file in backlog_dir.glob("*.md"):
+                if wu_file.resolve() not in indexed_files:
+                    errors.append(f"{wu_file.name}: orphaned work unit file not in BACKLOG.md")
+
+    def _check_dependencies(
+        self, backlog_index: Path, known_ids: set[str], errors: list[str]
+    ) -> None:
+        """Check 4: all dependency IDs reference real IDs."""
+        content = backlog_index.read_text(encoding="utf-8")
+        for line in content.splitlines():
+            if not line.strip().startswith("|"):
+                continue
+            cells = [c.strip() for c in line.split("|")]
+            if len(cells) < 6:
+                continue
+            row_id = cells[1]
+            if not row_id or row_id.lower() == "id" or row_id.startswith("-"):
+                continue
+            dep_cell = cells[5] if len(cells) > 5 else ""
+            for raw_dep in dep_cell.split(","):
+                dep_id = raw_dep.strip()
+                if dep_id and dep_id.lower() not in DEPENDENCY_NONE_VALUES and dep_id not in known_ids:
+                    errors.append(
+                        f"{row_id}: dependency '{dep_id}' not found in backlog index"
+                    )
 
     def log_to_traceability_matrix(self, matrix_path: Path, spec_ref: str, test_ref: str) -> None:
         """Append an entry to the traceability matrix.
@@ -149,11 +240,65 @@ class BacklogManagerJudge(BaseJudge):
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _set_status(
+        self,
+        work_unit_path: Path,
+        backlog_index: Path,
+        unit_id: str,
+        new_status: str,
+    ) -> None:
+        """Private workhorse: write status to both files with no gate checks.
+
+        All public transition methods (``force_status``, ``mark_done``,
+        ``mark_blocked``) and internal rollup code call this method so that
+        every write goes through a single code path.
+        """
+        canonical = VALID_STATUSES.get(new_status.lower())
+        if canonical is None:
+            raise ValueError(
+                f"Invalid status '{new_status}'. "
+                f"Valid statuses: {', '.join(sorted(VALID_STATUSES))}"
+            )
+
+        self._update_status(work_unit_path, canonical)
+        self._update_backlog_index(backlog_index, unit_id, canonical)
+        self.logger.info(
+            "Set %s to '%s' in both work-unit file and BACKLOG.md",
+            unit_id,
+            canonical,
+        )
+
+        if canonical == STATUS_DONE:
+            self._rollup_parent_status(backlog_index, unit_id)
+
+    def _last_round_all_passed(self, work_unit_path: Path) -> bool:
+        """Check whether the most recent review round had all required judges pass.
+
+        Reads the work-unit file's comment history in reverse. Collects
+        ``[REVIEW_PASS]`` entries per judge; stops and resets if a
+        ``[REVIEW_REJECTED]`` line is encountered (prior round boundary).
+
+        Returns:
+            True if every judge in ``REVIEW_JUDGE_NAMES`` has a ``[REVIEW_PASS]``
+            entry in the most recent round; False otherwise.
+        """
+        content = work_unit_path.read_text(encoding="utf-8")
+        passed: set[str] = set()
+        for line in reversed(content.splitlines()):
+            if "[REVIEW_REJECTED]" in line:
+                break  # everything before this belongs to a prior round
+            for judge in REVIEW_JUDGE_NAMES:
+                if f"[judge/{judge}]" in line and "[REVIEW_PASS]" in line:
+                    passed.add(judge)
+        return passed >= REVIEW_JUDGE_NAMES
+
     def _rollup_parent_status(self, backlog_index: Path, unit_id: str) -> None:
         """If all children of the parent unit are Done, mark the parent Done too.
 
         Derives the parent ID by removing the last segment (e.g. E0-F1-S1-T1 → E0-F1-S1).
-        Cascades upward: Story → Feature → Epic.
+        Calls ``_set_status`` directly (bypassing the done-gate — parent units are
+        structurally done when all children are done, no judge review required).
+        Cascades upward by recursing through ``_set_status`` → ``_rollup_parent_status``.
         """
         parts = unit_id.rsplit("-", 1)
         if len(parts) < 2:
@@ -171,11 +316,8 @@ class BacklogManagerJudge(BaseJudge):
             return
 
         self.logger.info("All children of %s are done — rolling up status", parent_id)
-        self._update_status(parent_file, "done")
-        self._update_backlog_index(backlog_index, parent_id, "done")
-
-        # Cascade upward
-        self._rollup_parent_status(backlog_index, parent_id)
+        # _set_status: atomic write to both files; cascades via _rollup_parent_status.
+        self._set_status(parent_file, backlog_index, parent_id, STATUS_DONE)
 
     def _parse_backlog_rows(self, backlog_index: Path) -> list[tuple[str, str, str]]:
         """Parse BACKLOG.md table rows into (id, status, file_path) tuples."""
@@ -212,13 +354,13 @@ class BacklogManagerJudge(BaseJudge):
         for row_id, status, _ in rows:
             if row_id == parent_id:
                 parent_found = True
-                if status == "done":
+                if status == STATUS_DONE:
                     return False  # Already done
                 continue
 
             if row_id.startswith(parent_id + "-") and row_id.count("-") == parent_depth + 1:
                 has_children = True
-                if status != "done":
+                if status != STATUS_DONE:
                     return False
 
         return parent_found and has_children

@@ -18,6 +18,7 @@ from devbench.config import (
     resolve_repo,
     validate_repo,
 )
+from devbench.constants import STATUS_BLOCKED, STATUS_IN_REVIEW
 from devbench.prompts import load_prompt
 
 logger = logging.getLogger(__name__)
@@ -26,8 +27,8 @@ logger = logging.getLogger(__name__)
 class ExecutionStatus(Enum):
     """Status of a Claude Code agent execution."""
 
-    IN_REVIEW = "in-review"
-    BLOCKED = "blocked"
+    IN_REVIEW = STATUS_IN_REVIEW
+    BLOCKED = STATUS_BLOCKED
     FAILED = "failed"
 
 
@@ -138,7 +139,7 @@ def execute(
 
         # Check if the work unit status was updated to in-review
         work_unit_content = work_unit_path.read_text(encoding="utf-8")
-        if "## Status: in-review" in work_unit_content:
+        if f"## Status: {STATUS_IN_REVIEW}" in work_unit_content:
             return ExecutionResult(
                 status=ExecutionStatus.IN_REVIEW,
                 output=output,

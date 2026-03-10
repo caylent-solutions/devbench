@@ -118,6 +118,7 @@ class TestProcessWorkUnit:
         mock_git_ops = MagicMock()
         mock_git_ops.create_pr.return_value = "https://github.com/org/repo/pull/1"
         mock_git_ops.wait_for_checks.return_value = True
+        mock_mgr = MagicMock()
 
         with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
             with patch(f"{_ORC}.claude_executor") as mock_exec:
@@ -128,7 +129,7 @@ class TestProcessWorkUnit:
                             with patch(f"{_ORC}.ChangesManifestJudge", return_value=mock_judge):
                                 with patch(f"{_ORC}.SecurityReviewJudge", return_value=mock_judge):
                                     with patch(f"{_ORC}.GitOpsJudge", return_value=mock_git_ops):
-                                        with patch(f"{_ORC}.BacklogManagerJudge"):
+                                        with patch(f"{_ORC}.BacklogManagerJudge", return_value=mock_mgr):
                                             with patch(f"{_ORC}.BlockerResolverJudge"):
                                                 with patch(
                                                     f"{_ORC}.BACKLOG_INDEX", tmp_path / "BACKLOG.md"
@@ -136,6 +137,11 @@ class TestProcessWorkUnit:
                                                     result = process_work_unit(unit)
 
         assert result is True
+        # Completion must go through mark_done (gated), not force_status
+        mock_mgr.mark_done.assert_called_once()
+        mock_mgr.force_status.assert_any_call(
+            unit.file_path, tmp_path / "BACKLOG.md", unit.id, "in-progress"
+        )
 
     def test_returns_false_after_max_retries(self, tmp_path: Path) -> None:
         from devbench.execution.orchestrator import process_work_unit
@@ -289,6 +295,44 @@ class TestProcessWorkUnit:
 
         assert result is False
 
+    def test_security_failure_writes_review_rejected_to_reset_done_gate(self, tmp_path: Path) -> None:
+        """After security fails, REVIEW_REJECTED must be written so mark_done cannot pass
+        on the stale [REVIEW_PASS] entries from the pre-security round."""
+        from devbench.execution.orchestrator import process_work_unit
+
+        unit = _make_unit(tmp_path)
+        exec_result = ExecutionResult(status=ExecutionStatus.IN_REVIEW, output="done", blocker="")
+
+        mock_review_judge = MagicMock()
+        mock_review_judge.name = "review"
+        mock_review_judge.evaluate.return_value = _pass_result("review")
+
+        mock_security = MagicMock()
+        mock_security.evaluate.return_value = _fail_result("security_review")
+
+        with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+            with patch(f"{_ORC}.claude_executor") as mock_exec:
+                mock_exec.execute.return_value = exec_result
+                with patch(f"{_ORC}.CodeReviewJudge", return_value=mock_review_judge):
+                    with patch(f"{_ORC}.TestReviewJudge", return_value=mock_review_judge):
+                        with patch(f"{_ORC}.DocReviewJudge", return_value=mock_review_judge):
+                            with patch(f"{_ORC}.ChangesManifestJudge", return_value=mock_review_judge):
+                                with patch(f"{_ORC}.SecurityReviewJudge", return_value=mock_security):
+                                    with patch(f"{_ORC}.GitOpsJudge"):
+                                        with patch(f"{_ORC}.BacklogManagerJudge"):
+                                            with patch(f"{_ORC}.BlockerResolverJudge"):
+                                                with patch(f"{_ORC}.MAX_RETRY_ATTEMPTS", 1):
+                                                    with patch(f"{_ORC}.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
+                                                        process_work_unit(unit)
+
+        content = unit.file_path.read_text(encoding="utf-8")
+        # SECURITY_FAIL must be present
+        assert "[SECURITY_FAIL]" in content
+        # REVIEW_REJECTED must follow to reset the done-gate window
+        assert "[REVIEW_REJECTED]" in content
+        # REVIEW_REJECTED must appear after SECURITY_FAIL in the file
+        assert content.index("[REVIEW_REJECTED]") > content.index("[SECURITY_FAIL]")
+
     def test_handles_git_error(self, tmp_path: Path) -> None:
         from devbench.execution.orchestrator import process_work_unit
 
@@ -353,6 +397,106 @@ class TestProcessWorkUnit:
         assert result is False
 
 
+class TestFeedbackPropagation:
+    """Test that feedback is set correctly on each retry path."""
+
+    def test_feedback_from_failed_judge_is_in_next_execute_call(self, tmp_path: Path) -> None:
+        """After review rejection, the feedback is passed to the next execute call."""
+        from devbench.execution.orchestrator import process_work_unit
+
+        unit = _make_unit(tmp_path)
+        exec_result = ExecutionResult(status=ExecutionStatus.IN_REVIEW, output="done", blocker="")
+
+        fail_judge = MagicMock()
+        fail_judge.name = "code_review"
+        fail_judge.evaluate.return_value = _fail_result("code_review")
+
+        pass_judge = MagicMock()
+        pass_judge.name = "pass"
+        pass_judge.evaluate.return_value = _pass_result("pass")
+
+        execute_calls: list[dict] = []
+
+        def capture_execute(**kwargs):
+            execute_calls.append(dict(kwargs))
+            return exec_result
+
+        mock_git_ops = MagicMock()
+        mock_git_ops.create_pr.return_value = "https://github.com/org/repo/pull/1"
+        mock_git_ops.wait_for_checks.return_value = True
+
+        attempt = [0]
+
+        def make_judge():
+            attempt[0] += 1
+            # First 4 judges (attempt 1) fail, next 4 (attempt 2) pass
+            if attempt[0] <= 4:
+                return fail_judge
+            return pass_judge
+
+        with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+            with patch(f"{_ORC}.claude_executor") as mock_exec:
+                mock_exec.execute.side_effect = capture_execute
+                with patch(f"{_ORC}.CodeReviewJudge", side_effect=make_judge):
+                    with patch(f"{_ORC}.TestReviewJudge", side_effect=make_judge):
+                        with patch(f"{_ORC}.DocReviewJudge", side_effect=make_judge):
+                            with patch(f"{_ORC}.ChangesManifestJudge", side_effect=make_judge):
+                                with patch(f"{_ORC}.SecurityReviewJudge", return_value=pass_judge):
+                                    with patch(f"{_ORC}.GitOpsJudge", return_value=mock_git_ops):
+                                        with patch(f"{_ORC}.BacklogManagerJudge"):
+                                            with patch(f"{_ORC}.BlockerResolverJudge"):
+                                                with patch(f"{_ORC}.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
+                                                    process_work_unit(unit)
+
+        assert len(execute_calls) >= 2
+        # Second call must have non-empty feedback from the failed judge
+        assert execute_calls[1]["feedback"] != ""
+        assert "code_review" in execute_calls[1]["feedback"].lower()
+
+    def test_feedback_set_on_blocked_retry_path(self, tmp_path: Path) -> None:
+        """After BLOCKED status, feedback is set from blocker resolver's reasoning."""
+        from devbench.execution.orchestrator import process_work_unit
+
+        unit = _make_unit(tmp_path)
+        blocked_result = ExecutionResult(status=ExecutionStatus.BLOCKED, output="", blocker="API key missing")
+        failed_result = ExecutionResult(status=ExecutionStatus.FAILED, output="still failed", blocker="")
+
+        mock_blocker = MagicMock()
+        mock_blocker.evaluate.return_value = JudgeResult(
+            judge_name="blocker",
+            verdict=Verdict.PASS,
+            reasoning="Resolved: use env var",
+            feedback="",
+            evidence=[],
+        )
+
+        execute_calls: list[dict] = []
+        call_count = [0]
+
+        def capture_execute(**kwargs):
+            execute_calls.append(dict(kwargs))
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return blocked_result
+            return failed_result
+
+        with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+            with patch(f"{_ORC}.claude_executor") as mock_exec:
+                mock_exec.execute.side_effect = capture_execute
+                with patch(f"{_ORC}.GitOpsJudge"):
+                    with patch(f"{_ORC}.SecurityReviewJudge"):
+                        with patch(f"{_ORC}.BacklogManagerJudge"):
+                            with patch(f"{_ORC}.BlockerResolverJudge", return_value=mock_blocker):
+                                with patch(f"{_ORC}.MAX_RETRY_ATTEMPTS", 2):
+                                    with patch(f"{_ORC}.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
+                                        process_work_unit(unit)
+
+        assert len(execute_calls) >= 2
+        # Second call must include feedback from the blocker resolver
+        assert execute_calls[1]["feedback"] != ""
+        assert "resolved" in execute_calls[1]["feedback"].lower()
+
+
 class TestMain:
     """Test orchestrator main loop."""
 
@@ -364,9 +508,27 @@ class TestMain:
         mock_parser.find_next_actionable.return_value = None
         mock_parser.all_done.return_value = True
 
+        mock_mgr = MagicMock()
+        mock_mgr.validate.return_value = []
+
         with patch(f"{_ORC}.setup_all_repos", return_value={}):
             with patch(f"{_ORC}.BacklogParser", return_value=mock_parser):
-                main()
+                with patch(f"{_ORC}.BacklogManagerJudge", return_value=mock_mgr):
+                    main()
+
+    def test_preflight_validation_aborts_on_errors(self) -> None:
+        """Orchestrator exits early if backlog validation fails."""
+        from devbench.execution.orchestrator import main
+
+        mock_mgr = MagicMock()
+        mock_mgr.validate.return_value = ["E0-T1: work unit file missing"]
+
+        with patch(f"{_ORC}.setup_all_repos", return_value={}):
+            with patch(f"{_ORC}.BacklogManagerJudge", return_value=mock_mgr):
+                with patch(f"{_ORC}.BacklogParser") as mock_parser_cls:
+                    main()
+                    # BacklogParser.parse_index should never be called — we aborted early
+                    mock_parser_cls.return_value.parse_index.assert_not_called()
 
     def test_deadlock_detection(self) -> None:
         from devbench.execution.orchestrator import main
@@ -377,9 +539,13 @@ class TestMain:
         mock_parser.all_done.return_value = False
         mock_parser.get_blocked_units.return_value = []
 
+        mock_mgr = MagicMock()
+        mock_mgr.validate.return_value = []
+
         with patch(f"{_ORC}.setup_all_repos", return_value={}):
             with patch(f"{_ORC}.BacklogParser", return_value=mock_parser):
-                main()
+                with patch(f"{_ORC}.BacklogManagerJudge", return_value=mock_mgr):
+                    main()
 
     def test_processes_one_unit_then_done(self, tmp_path: Path) -> None:
         from devbench.execution.orchestrator import main
@@ -398,10 +564,14 @@ class TestMain:
         mock_parser.find_next_actionable.side_effect = find_next
         mock_parser.all_done.return_value = True
 
+        mock_mgr = MagicMock()
+        mock_mgr.validate.return_value = []
+
         with patch(f"{_ORC}.setup_all_repos", return_value={}):
             with patch(f"{_ORC}.BacklogParser", return_value=mock_parser):
-                with patch(f"{_ORC}.process_work_unit", return_value=True):
-                    main()
+                with patch(f"{_ORC}.BacklogManagerJudge", return_value=mock_mgr):
+                    with patch(f"{_ORC}.process_work_unit", return_value=True):
+                        main()
 
     def test_blocked_units_logged(self) -> None:
         from devbench.execution.orchestrator import main
@@ -414,6 +584,10 @@ class TestMain:
         blocked.id = "T1"
         mock_parser.get_blocked_units.return_value = [blocked]
 
+        mock_mgr = MagicMock()
+        mock_mgr.validate.return_value = []
+
         with patch(f"{_ORC}.setup_all_repos", return_value={}):
             with patch(f"{_ORC}.BacklogParser", return_value=mock_parser):
-                main()
+                with patch(f"{_ORC}.BacklogManagerJudge", return_value=mock_mgr):
+                    main()

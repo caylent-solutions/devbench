@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from devbench.backlog.manager import VALID_STATUSES, BacklogManagerJudge
+from devbench.constants import REVIEW_JUDGE_NAMES
 from devbench.judges.base import Verdict
 
 
@@ -48,7 +49,7 @@ def backlog_index_lowercase(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def backlog_with_hierarchy(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+def backlog_with_hierarchy(tmp_path: Path, backlog_dir: Path) -> tuple[Path, Path, Path, Path]:
     """Create BACKLOG.md with story + tasks, plus work unit files for all."""
     content = """\
 # Backlog
@@ -65,9 +66,6 @@ def backlog_with_hierarchy(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
     index_path = tmp_path / "BACKLOG.md"
     index_path.write_text(content)
 
-    backlog_dir = tmp_path / "backlog"
-    backlog_dir.mkdir()
-
     t2_file = backlog_dir / "E0-F1-S1-T2.md"
     t2_file.write_text("# E0-F1-S1-T2\n\n## Status: in-queue\n")
 
@@ -80,12 +78,12 @@ def backlog_with_hierarchy(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
     return index_path, t2_file, story_file, feature_file
 
 
-class TestSetStatus:
-    """Test set_status updates both files."""
+class TestForceStatus:
+    """Test force_status updates both files without enforcing the done-gate."""
 
     def test_updates_both_files(self, tmp_work_unit_file: Path, backlog_index_titlecase: Path) -> None:
         judge = BacklogManagerJudge()
-        judge.set_status(tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1", "in-progress")
+        judge.force_status(tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1", "in-progress")
 
         wu_content = tmp_work_unit_file.read_text()
         assert "## Status: in-progress" in wu_content
@@ -98,11 +96,20 @@ class TestSetStatus:
         else:
             pytest.fail("E0-F1-S1-T1 not found in BACKLOG.md")
 
+    def test_allows_done_without_judge_comments(
+        self, tmp_work_unit_file: Path, backlog_index_titlecase: Path
+    ) -> None:
+        """force_status bypasses the done-gate — no judge comments required."""
+        judge = BacklogManagerJudge()
+        judge.force_status(tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1", "done")
+
+        assert "## Status: done" in tmp_work_unit_file.read_text()
+
     def test_updates_lowercase_statuses_in_backlog(
         self, tmp_work_unit_file: Path, backlog_index_lowercase: Path,
     ) -> None:
         judge = BacklogManagerJudge()
-        judge.set_status(tmp_work_unit_file, backlog_index_lowercase, "E0-F1-S1-T1", "done")
+        judge.force_status(tmp_work_unit_file, backlog_index_lowercase, "E0-F1-S1-T1", "done")
 
         index_content = backlog_index_lowercase.read_text()
         for line in index_content.splitlines():
@@ -115,7 +122,6 @@ class TestSetStatus:
     def test_accepts_all_valid_statuses(self, tmp_work_unit_file: Path, backlog_index_titlecase: Path) -> None:
         judge = BacklogManagerJudge()
         for cli_status, canonical in VALID_STATUSES.items():
-            # Reset to In Queue before each transition (fixture uses title-case)
             backlog_index_titlecase.write_text(
                 backlog_index_titlecase.read_text()
                 .replace("in-progress", "In Queue")
@@ -135,30 +141,49 @@ class TestSetStatus:
                 )
             )
 
-            judge.set_status(tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1", cli_status)
+            judge.force_status(tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1", cli_status)
             wu_content = tmp_work_unit_file.read_text()
             assert f"## Status: {canonical}" in wu_content
 
     def test_rejects_invalid_status(self, tmp_work_unit_file: Path, backlog_index_titlecase: Path) -> None:
         judge = BacklogManagerJudge()
         with pytest.raises(ValueError, match="Invalid status"):
-            judge.set_status(tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1", "invalid")
+            judge.force_status(tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1", "invalid")
 
     def test_raises_file_not_found_for_work_unit(self, tmp_path: Path, backlog_index_titlecase: Path) -> None:
         judge = BacklogManagerJudge()
         with pytest.raises(FileNotFoundError):
-            judge.set_status(tmp_path / "missing.md", backlog_index_titlecase, "E0-F1-S1-T1", "done")
+            judge.force_status(tmp_path / "missing.md", backlog_index_titlecase, "E0-F1-S1-T1", "done")
 
     def test_raises_file_not_found_for_backlog(self, tmp_work_unit_file: Path, tmp_path: Path) -> None:
         judge = BacklogManagerJudge()
         with pytest.raises(FileNotFoundError):
-            judge.set_status(tmp_work_unit_file, tmp_path / "missing.md", "E0-F1-S1-T1", "done")
+            judge.force_status(tmp_work_unit_file, tmp_path / "missing.md", "E0-F1-S1-T1", "done")
+
+
+def _judge_comment(judge_name: str, action: str, msg: str = "ok") -> str:
+    """Return a single formatted judge comment line (no trailing newline)."""
+    return f"[2024-01-01 00:00 UTC] [judge/{judge_name}] [{action}] {msg}"
+
+
+def _all_judges_pass_block() -> str:
+    """Return comment lines for all four required judges passing."""
+    return "\n".join(
+        _judge_comment(j, "REVIEW_PASS") for j in sorted(REVIEW_JUDGE_NAMES)
+    ) + "\n"
+
+
+_ALL_JUDGES_PASSED_COMMENTS = _all_judges_pass_block()
 
 
 class TestMarkDone:
     """Test mark_done delegates to set_status and updates both files."""
 
     def test_mark_done_updates_both_files(self, tmp_work_unit_file: Path, backlog_index_titlecase: Path) -> None:
+        # Append required judge pass entries so the done-gate check passes
+        content = tmp_work_unit_file.read_text(encoding="utf-8")
+        tmp_work_unit_file.write_text(content + _ALL_JUDGES_PASSED_COMMENTS, encoding="utf-8")
+
         judge = BacklogManagerJudge()
         judge.mark_done(tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1")
 
@@ -178,7 +203,9 @@ class TestMarkDone:
 
     def test_mark_done_raises_when_no_status_line(self, tmp_path: Path, backlog_index_titlecase: Path) -> None:
         bad_file = tmp_path / "bad.md"
-        bad_file.write_text("# No status here\nJust content.\n")
+        bad_file.write_text(
+            "# No status here\nJust content.\n" + _ALL_JUDGES_PASSED_COMMENTS
+        )
 
         judge = BacklogManagerJudge()
         with pytest.raises(ValueError, match="Could not find"):
@@ -216,7 +243,7 @@ class TestRollupParentStatus:
 
         judge = BacklogManagerJudge()
         # T1 is already Done in the fixture. Mark T2 Done — should roll up S1.
-        judge.set_status(t2_file, index_path, "E0-F1-S1-T2", "done")
+        judge.force_status(t2_file, index_path, "E0-F1-S1-T2", "done")
 
         # Story should now be done in both files
         story_content = story_file.read_text()
@@ -237,12 +264,12 @@ class TestRollupParentStatus:
 
         judge = BacklogManagerJudge()
         # Mark T2 as in-progress — T1 is Done but T2 is not, so story stays
-        judge.set_status(t2_file, index_path, "E0-F1-S1-T2", "in-progress")
+        judge.force_status(t2_file, index_path, "E0-F1-S1-T2", "in-progress")
 
         story_content = story_file.read_text()
         assert "## Status: in-queue" in story_content
 
-    def test_cascades_to_feature_when_all_stories_done(self, tmp_path: Path) -> None:
+    def test_cascades_to_feature_when_all_stories_done(self, tmp_path: Path, backlog_dir: Path) -> None:
         content = """\
 # Backlog
 
@@ -259,9 +286,6 @@ class TestRollupParentStatus:
         index_path = tmp_path / "BACKLOG.md"
         index_path.write_text(content)
 
-        backlog_dir = tmp_path / "backlog"
-        backlog_dir.mkdir()
-
         t_file = backlog_dir / "E0-F1-S2-T1.md"
         t_file.write_text("# E0-F1-S2-T1\n\n## Status: in-queue\n")
         s2_file = backlog_dir / "E0-F1-S2.md"
@@ -271,7 +295,7 @@ class TestRollupParentStatus:
 
         judge = BacklogManagerJudge()
         # Mark last task Done → story rolls up → feature rolls up
-        judge.set_status(t_file, index_path, "E0-F1-S2-T1", "done")
+        judge.force_status(t_file, index_path, "E0-F1-S2-T1", "done")
 
         # S2 should be done
         assert "## Status: done" in s2_file.read_text()
@@ -317,6 +341,189 @@ class TestLogToTraceabilityMatrix:
         assert "AC-02" in content
         lines = [line for line in content.strip().splitlines() if line.startswith("|")]
         assert len(lines) >= 4
+
+
+class TestLastRoundAllPassed:
+    """Tests for _last_round_all_passed() done-gate check."""
+
+    def _make_wu_with_comments(self, tmp_path: Path, comments: str) -> Path:
+        wu = tmp_path / "E0-F1-S1-T1.md"
+        wu.write_text(
+            f"# E0-F1-S1-T1\n\n## Status: in-review\n\n## Comments\n\n{comments}",
+            encoding="utf-8",
+        )
+        return wu
+
+    def test_returns_true_when_all_required_judges_passed(self, tmp_path: Path) -> None:
+        wu = self._make_wu_with_comments(tmp_path, _all_judges_pass_block())
+        judge = BacklogManagerJudge()
+        assert judge._last_round_all_passed(wu) is True
+
+    def test_returns_false_when_judge_missing(self, tmp_path: Path) -> None:
+        comments = "\n".join([
+            _judge_comment("code_review", "REVIEW_PASS"),
+            _judge_comment("test_review", "REVIEW_PASS"),
+            _judge_comment("doc_review", "REVIEW_PASS"),
+            # changes_manifest missing
+        ]) + "\n"
+        wu = self._make_wu_with_comments(tmp_path, comments)
+        judge = BacklogManagerJudge()
+        assert judge._last_round_all_passed(wu) is False
+
+    def test_returns_false_when_followed_by_review_rejected(self, tmp_path: Path) -> None:
+        """All 4 judges passed in round 1, but then REVIEW_REJECTED — round 2 has no passes."""
+        comments = (
+            # Round 1 passes (older, before REVIEW_REJECTED)
+            _all_judges_pass_block()
+            + "[2024-01-01 00:04 UTC] [orchestrator] [REVIEW_REJECTED] attempt 1 rejected\n"
+            # Round 2 has no REVIEW_PASS entries yet (only rejection so far)
+        )
+        wu = self._make_wu_with_comments(tmp_path, comments)
+        judge = BacklogManagerJudge()
+        assert judge._last_round_all_passed(wu) is False
+
+    def test_returns_true_when_round2_passes_after_rejection(self, tmp_path: Path) -> None:
+        """Round 2 passes after a prior round was rejected."""
+        comments = (
+            # Round 1 — rejected
+            _judge_comment("code_review", "REVIEW_PASS") + "\n"
+            + "[2024-01-01 00:01 UTC] [orchestrator] [REVIEW_REJECTED] attempt 1 rejected\n"
+            # Round 2 — all pass
+            + _all_judges_pass_block()
+        )
+        wu = self._make_wu_with_comments(tmp_path, comments)
+        judge = BacklogManagerJudge()
+        assert judge._last_round_all_passed(wu) is True
+
+    def test_returns_false_when_no_comments(self, tmp_path: Path) -> None:
+        wu = self._make_wu_with_comments(tmp_path, "")
+        judge = BacklogManagerJudge()
+        assert judge._last_round_all_passed(wu) is False
+
+
+class TestMarkDoneGate:
+    """Test that mark_done enforces the done-gate check."""
+
+    def _make_wu(self, tmp_path: Path, comments: str = "") -> Path:
+        wu = tmp_path / "E0-F1-S1-T1.md"
+        wu.write_text(
+            f"# E0-F1-S1-T1\n\n## Status: in-review\n\n## Comments\n\n{comments}",
+            encoding="utf-8",
+        )
+        return wu
+
+    def _make_index(self, tmp_path: Path) -> Path:
+        content = (
+            "# Backlog\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Task | Task | in-review | None | repo | `backlog/E0-F1-S1-T1.md` |\n"
+        )
+        idx = tmp_path / "BACKLOG.md"
+        idx.write_text(content, encoding="utf-8")
+        return idx
+
+    def test_mark_done_raises_when_judges_not_all_passed(self, tmp_path: Path) -> None:
+        wu = self._make_wu(tmp_path, _judge_comment("code_review", "REVIEW_PASS") + "\n")
+        idx = self._make_index(tmp_path)
+        judge = BacklogManagerJudge()
+        with pytest.raises(RuntimeError, match="not all required judges passed"):
+            judge.mark_done(wu, idx, "E0-F1-S1-T1")
+
+    def test_mark_done_succeeds_when_all_judges_passed(self, tmp_path: Path) -> None:
+        wu = self._make_wu(tmp_path, _all_judges_pass_block())
+        idx = self._make_index(tmp_path)
+        judge = BacklogManagerJudge()
+        judge.mark_done(wu, idx, "E0-F1-S1-T1")
+        assert "## Status: done" in wu.read_text(encoding="utf-8")
+
+
+class TestValidate:
+    """Tests for BacklogManagerJudge.validate() backlog integrity checks."""
+
+    def _make_index(self, tmp_path: Path, rows: str) -> Path:
+        idx = tmp_path / "BACKLOG.md"
+        idx.write_text(
+            "# Backlog\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|-----------|\n"
+            + rows,
+            encoding="utf-8",
+        )
+        return idx
+
+    def _make_wu(self, backlog_dir: Path, unit_id: str, status: str = "in-queue") -> Path:
+        wu = backlog_dir / f"{unit_id}.md"
+        wu.write_text(f"# {unit_id}\n\n## Status: {status}\n", encoding="utf-8")
+        return wu
+
+    def test_valid_backlog_returns_no_errors(self, tmp_path: Path, backlog_dir: Path) -> None:
+        self._make_wu(backlog_dir, "E0-F1-S1-T1", "in-queue")
+        self._make_wu(backlog_dir, "E0-F1-S1-T2", "done")
+        idx = self._make_index(
+            tmp_path,
+            "| E0-F1-S1-T1 | Task 1 | Task | in-queue | none | repo | `backlog/E0-F1-S1-T1.md` |\n"
+            "| E0-F1-S1-T2 | Task 2 | Task | done | E0-F1-S1-T1 | repo | `backlog/E0-F1-S1-T2.md` |\n",
+        )
+        judge = BacklogManagerJudge()
+        errors = judge.validate(idx, tmp_path)
+        assert errors == []
+
+    def test_missing_work_unit_file_is_reported(self, tmp_path: Path) -> None:
+        # Index references a file that doesn't exist
+        idx = self._make_index(
+            tmp_path,
+            "| E0-F1-S1-T1 | Task 1 | Task | in-queue | none | repo | `backlog/E0-F1-S1-T1.md` |\n",
+        )
+        judge = BacklogManagerJudge()
+        errors = judge.validate(idx, tmp_path)
+        assert any("E0-F1-S1-T1" in e and "missing" in e.lower() for e in errors)
+
+    def test_status_mismatch_is_reported(self, tmp_path: Path, backlog_dir: Path) -> None:
+        # Index says "in-queue" but file says "done"
+        self._make_wu(backlog_dir, "E0-F1-S1-T1", "done")
+        idx = self._make_index(
+            tmp_path,
+            "| E0-F1-S1-T1 | Task 1 | Task | in-queue | none | repo | `backlog/E0-F1-S1-T1.md` |\n",
+        )
+        judge = BacklogManagerJudge()
+        errors = judge.validate(idx, tmp_path)
+        assert any("E0-F1-S1-T1" in e and "status" in e.lower() for e in errors)
+
+    def test_orphaned_work_unit_file_is_reported(self, tmp_path: Path, backlog_dir: Path) -> None:
+        self._make_wu(backlog_dir, "E0-F1-S1-T1", "in-queue")
+        # Extra file not in index
+        self._make_wu(backlog_dir, "E0-F1-S1-T2", "in-queue")
+        idx = self._make_index(
+            tmp_path,
+            "| E0-F1-S1-T1 | Task 1 | Task | in-queue | none | repo | `backlog/E0-F1-S1-T1.md` |\n",
+        )
+        judge = BacklogManagerJudge()
+        errors = judge.validate(idx, tmp_path)
+        assert any("E0-F1-S1-T2" in e and "orphan" in e.lower() for e in errors)
+
+    def test_invalid_dependency_id_is_reported(self, tmp_path: Path, backlog_dir: Path) -> None:
+        self._make_wu(backlog_dir, "E0-F1-S1-T2", "in-queue")
+        # T2 depends on T1 but T1 is not in the index
+        idx = self._make_index(
+            tmp_path,
+            "| E0-F1-S1-T2 | Task 2 | Task | in-queue | E0-F1-S1-T1 | repo | `backlog/E0-F1-S1-T2.md` |\n",
+        )
+        judge = BacklogManagerJudge()
+        errors = judge.validate(idx, tmp_path)
+        assert any("E0-F1-S1-T1" in e and "depend" in e.lower() for e in errors)
+
+    def test_work_unit_file_missing_status_line_is_reported(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """Bug fix: work unit file with no ## Status: line must produce an error, not be silently skipped."""
+        wu = backlog_dir / "E0-F1-S1-T1.md"
+        wu.write_text("# E0-F1-S1-T1: Task\n\n## Description\nNo status line here.\n", encoding="utf-8")
+        idx = self._make_index(
+            tmp_path,
+            "| E0-F1-S1-T1 | Task 1 | Task | in-queue | none | repo | `backlog/E0-F1-S1-T1.md` |\n",
+        )
+        judge = BacklogManagerJudge()
+        errors = judge.validate(idx, tmp_path)
+        assert any("E0-F1-S1-T1" in e and "status" in e.lower() for e in errors)
 
 
 class TestEvaluateNoop:

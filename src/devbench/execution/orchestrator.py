@@ -19,7 +19,7 @@ from devbench.config import (
     REPO_LOCAL_PATHS,
     validate_repo,
 )
-from devbench.constants import BRANCH_NAME_TEMPLATE, PR_BODY_TEMPLATE
+from devbench.constants import BRANCH_NAME_TEMPLATE, PR_BODY_TEMPLATE, STATUS_IN_PROGRESS
 from devbench.execution import executor as claude_executor
 from devbench.execution.executor import ExecutionStatus
 from devbench.github.git_ops import GitOpsJudge
@@ -106,7 +106,7 @@ def process_work_unit(work_unit: WorkUnit) -> bool:
     backlog_mgr = BacklogManagerJudge()
     blocker_judge = BlockerResolverJudge()
 
-    backlog_mgr.set_status(work_unit.file_path, BACKLOG_INDEX, work_unit.id, "in-progress")
+    backlog_mgr.force_status(work_unit.file_path, BACKLOG_INDEX, work_unit.id, STATUS_IN_PROGRESS)
     work_unit.log_comment("orchestrator", "START", f"Beginning work on {work_unit.id}")
 
     feedback = ""
@@ -142,8 +142,10 @@ def process_work_unit(work_unit: WorkUnit) -> bool:
                     work_unit.id,
                     blocker_result.reasoning,
                 )
+                feedback = f"Blocker could not be resolved: {blocker_result.reasoning}"
                 continue
             work_unit.log_comment("orchestrator", "BLOCKER_RESOLVED", blocker_result.reasoning)
+            feedback = f"Blocker resolved: {blocker_result.reasoning}"
             continue
 
         if result.status == ExecutionStatus.FAILED:
@@ -175,6 +177,13 @@ def process_work_unit(work_unit: WorkUnit) -> bool:
                 "judge/security_review",
                 "SECURITY_FAIL",
                 security_result.feedback,
+            )
+            # Reset the done-gate window so mark_done requires a fresh judge re-run
+            # after the dev fixes the security issue and the code changes.
+            work_unit.log_comment(
+                "orchestrator",
+                "REVIEW_REJECTED",
+                f"Security review failed on attempt {attempt} — judge re-review required",
             )
             feedback = f"Security review failed: {security_result.feedback}"
             continue
@@ -231,8 +240,8 @@ def process_work_unit(work_unit: WorkUnit) -> bool:
             feedback = f"Git operations failed: {exc}"
             continue
 
-        # Mark done — single code path updates both files
-        backlog_mgr.set_status(work_unit.file_path, BACKLOG_INDEX, work_unit.id, "done")
+        # Mark done — gated path verifies all judges passed
+        backlog_mgr.mark_done(work_unit.file_path, BACKLOG_INDEX, work_unit.id)
         work_unit.log_comment("orchestrator", "DONE", f"Work unit {work_unit.id} completed")
         logger.info("COMPLETED: %s", work_unit.id)
         return True
@@ -286,6 +295,15 @@ def _wait_for_status_change(
 def main() -> None:
     """Main orchestrator loop."""
     logger.info("Starting autonomous backlog execution")
+
+    # Pre-flight: validate backlog integrity before doing any work
+    backlog_mgr_preflight = BacklogManagerJudge()
+    preflight_errors = backlog_mgr_preflight.validate(BACKLOG_INDEX, BACKLOG_INDEX.parent)
+    if preflight_errors:
+        logger.error("Backlog integrity check failed — aborting:")
+        for err in preflight_errors:
+            logger.error("  %s", err)
+        return
 
     # Phase 1: Setup GitHub security
     logger.info("Setting up GitHub security features on all repos")

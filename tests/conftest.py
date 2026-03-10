@@ -204,3 +204,12 @@ def mock_llm_pass():
 
     with patch("devbench.judges.base.BaseJudge._llm_evaluate", _mock_llm_evaluate):
         yield
+
+
+@pytest.fixture
+def backlog_dir(tmp_path: Path) -> Path:
+    """Create and return the backlog subdirectory under tmp_path."""
+    from devbench.constants import BACKLOG_SUBDIR
+    d = tmp_path / BACKLOG_SUBDIR
+    d.mkdir()
+    return d

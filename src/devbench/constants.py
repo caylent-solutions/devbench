@@ -118,7 +118,7 @@ STATUS_DONE: str = "done"
 STATUS_BLOCKED: str = "blocked"
 
 # Ordered mapping from any accepted input form to the canonical write form.
-# Used by BacklogManagerJudge._set_status() for validation and normalisation.
+# Used by BacklogManager._set_status() for validation and normalisation.
 VALID_STATUSES: dict[str, str] = {
     STATUS_IN_QUEUE: STATUS_IN_QUEUE,
     STATUS_IN_PROGRESS: STATUS_IN_PROGRESS,

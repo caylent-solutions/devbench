@@ -1,7 +1,7 @@
-"""Backlog manager judge that updates work-unit statuses and traceability.
+"""Backlog manager that updates work-unit statuses and traceability.
 
-Provides methods to mark work units as done or blocked, update the backlog
-index, and log entries to the traceability matrix.
+Owns the backlog lifecycle: status writes, done-gate checks, rollups,
+comments, and backlog validation.
 
 Public API
 ----------
@@ -18,6 +18,7 @@ All writes go through the private ``_set_status`` workhorse which updates
 both the work-unit file and BACKLOG.md atomically.
 """
 
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -35,27 +36,14 @@ from devbench.constants import (
     TRACEABILITY_MATRIX_HEADER,
     VALID_STATUSES,
 )
-from devbench.judges.base import BaseJudge, JudgeResult, Verdict
 
 
-class BacklogManagerJudge(BaseJudge):
-    """Updates backlog statuses, the backlog index, and the traceability matrix."""
+class BacklogManager:
+    """Owns backlog lifecycle: status writes, done-gate checks, rollups, and validation."""
 
     def __init__(self) -> None:
-        super().__init__("backlog_manager")
-
-    def evaluate(self, work_unit_path: Path, repo_path: Path, **kwargs: object) -> JudgeResult:
-        """Not used directly; BacklogManagerJudge exposes individual operation methods.
-
-        Returns a PASS result as a no-op when called via the evaluate interface.
-        """
-        return JudgeResult(
-            judge_name=self.name,
-            verdict=Verdict.PASS,
-            reasoning="BacklogManagerJudge.evaluate is a no-op; use specific operation methods.",
-            feedback="",
-            evidence=[],
-        )
+        self.name = "backlog_manager"
+        self.logger = logging.getLogger(f"devbench.{self.name}")
 
     def force_status(
         self,

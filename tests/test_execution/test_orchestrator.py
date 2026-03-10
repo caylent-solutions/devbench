@@ -129,7 +129,7 @@ class TestProcessWorkUnit:
                             with patch(f"{_ORC}.ChangesManifestJudge", return_value=mock_judge):
                                 with patch(f"{_ORC}.SecurityReviewJudge", return_value=mock_judge):
                                     with patch(f"{_ORC}.GitOpsJudge", return_value=mock_git_ops):
-                                        with patch(f"{_ORC}.BacklogManagerJudge", return_value=mock_mgr):
+                                        with patch(f"{_ORC}.BacklogManager", return_value=mock_mgr):
                                             with patch(f"{_ORC}.BlockerResolverJudge"):
                                                 with patch(
                                                     f"{_ORC}.BACKLOG_INDEX", tmp_path / "BACKLOG.md"
@@ -154,7 +154,7 @@ class TestProcessWorkUnit:
                 mock_exec.execute.return_value = exec_result
                 with patch(f"{_ORC}.GitOpsJudge"):
                     with patch(f"{_ORC}.SecurityReviewJudge"):
-                        with patch(f"{_ORC}.BacklogManagerJudge") as mock_mgr_cls:
+                        with patch(f"{_ORC}.BacklogManager") as mock_mgr_cls:
                             with patch(f"{_ORC}.BlockerResolverJudge"):
                                 with patch(f"{_ORC}.MAX_RETRY_ATTEMPTS", 2):
                                     with patch(f"{_ORC}.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
@@ -187,7 +187,7 @@ class TestProcessWorkUnit:
                 mock_exec.execute.side_effect = exec_side_effect
                 with patch(f"{_ORC}.GitOpsJudge"):
                     with patch(f"{_ORC}.SecurityReviewJudge"):
-                        with patch(f"{_ORC}.BacklogManagerJudge"):
+                        with patch(f"{_ORC}.BacklogManager"):
                             with patch(f"{_ORC}.BlockerResolverJudge", return_value=mock_blocker):
                                 with patch(f"{_ORC}.MAX_RETRY_ATTEMPTS", 2):
                                     with patch(f"{_ORC}.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
@@ -255,7 +255,7 @@ class TestProcessWorkUnit:
                             ):
                                 with patch(f"{_ORC}.SecurityReviewJudge", return_value=pass_judge):
                                     with patch(f"{_ORC}.GitOpsJudge", return_value=mock_git_ops):
-                                        with patch(f"{_ORC}.BacklogManagerJudge"):
+                                        with patch(f"{_ORC}.BacklogManager"):
                                             with patch(f"{_ORC}.BlockerResolverJudge"):
                                                 with patch(
                                                     f"{_ORC}.BACKLOG_INDEX", tmp_path / "BACKLOG.md"
@@ -285,7 +285,7 @@ class TestProcessWorkUnit:
                             with patch(f"{_ORC}.ChangesManifestJudge", return_value=mock_review_judge):
                                 with patch(f"{_ORC}.SecurityReviewJudge", return_value=mock_security):
                                     with patch(f"{_ORC}.GitOpsJudge"):
-                                        with patch(f"{_ORC}.BacklogManagerJudge"):
+                                        with patch(f"{_ORC}.BacklogManager"):
                                             with patch(f"{_ORC}.BlockerResolverJudge"):
                                                 with patch(f"{_ORC}.MAX_RETRY_ATTEMPTS", 1):
                                                     with patch(
@@ -319,7 +319,7 @@ class TestProcessWorkUnit:
                             with patch(f"{_ORC}.ChangesManifestJudge", return_value=mock_review_judge):
                                 with patch(f"{_ORC}.SecurityReviewJudge", return_value=mock_security):
                                     with patch(f"{_ORC}.GitOpsJudge"):
-                                        with patch(f"{_ORC}.BacklogManagerJudge"):
+                                        with patch(f"{_ORC}.BacklogManager"):
                                             with patch(f"{_ORC}.BlockerResolverJudge"):
                                                 with patch(f"{_ORC}.MAX_RETRY_ATTEMPTS", 1):
                                                     with patch(f"{_ORC}.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
@@ -354,7 +354,7 @@ class TestProcessWorkUnit:
                             with patch(f"{_ORC}.ChangesManifestJudge", return_value=mock_judge):
                                 with patch(f"{_ORC}.SecurityReviewJudge", return_value=mock_judge):
                                     with patch(f"{_ORC}.GitOpsJudge", return_value=mock_git_ops):
-                                        with patch(f"{_ORC}.BacklogManagerJudge"):
+                                        with patch(f"{_ORC}.BacklogManager"):
                                             with patch(f"{_ORC}.BlockerResolverJudge"):
                                                 with patch(f"{_ORC}.MAX_RETRY_ATTEMPTS", 1):
                                                     with patch(
@@ -386,7 +386,7 @@ class TestProcessWorkUnit:
                             with patch(f"{_ORC}.ChangesManifestJudge", return_value=mock_judge):
                                 with patch(f"{_ORC}.SecurityReviewJudge", return_value=mock_judge):
                                     with patch(f"{_ORC}.GitOpsJudge", return_value=mock_git_ops):
-                                        with patch(f"{_ORC}.BacklogManagerJudge"):
+                                        with patch(f"{_ORC}.BacklogManager"):
                                             with patch(f"{_ORC}.BlockerResolverJudge"):
                                                 with patch(f"{_ORC}.MAX_RETRY_ATTEMPTS", 1):
                                                     with patch(
@@ -443,7 +443,7 @@ class TestFeedbackPropagation:
                             with patch(f"{_ORC}.ChangesManifestJudge", side_effect=make_judge):
                                 with patch(f"{_ORC}.SecurityReviewJudge", return_value=pass_judge):
                                     with patch(f"{_ORC}.GitOpsJudge", return_value=mock_git_ops):
-                                        with patch(f"{_ORC}.BacklogManagerJudge"):
+                                        with patch(f"{_ORC}.BacklogManager"):
                                             with patch(f"{_ORC}.BlockerResolverJudge"):
                                                 with patch(f"{_ORC}.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
                                                     process_work_unit(unit)
@@ -485,7 +485,7 @@ class TestFeedbackPropagation:
                 mock_exec.execute.side_effect = capture_execute
                 with patch(f"{_ORC}.GitOpsJudge"):
                     with patch(f"{_ORC}.SecurityReviewJudge"):
-                        with patch(f"{_ORC}.BacklogManagerJudge"):
+                        with patch(f"{_ORC}.BacklogManager"):
                             with patch(f"{_ORC}.BlockerResolverJudge", return_value=mock_blocker):
                                 with patch(f"{_ORC}.MAX_RETRY_ATTEMPTS", 2):
                                     with patch(f"{_ORC}.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
@@ -513,7 +513,7 @@ class TestMain:
 
         with patch(f"{_ORC}.setup_all_repos", return_value={}):
             with patch(f"{_ORC}.BacklogParser", return_value=mock_parser):
-                with patch(f"{_ORC}.BacklogManagerJudge", return_value=mock_mgr):
+                with patch(f"{_ORC}.BacklogManager", return_value=mock_mgr):
                     main()
 
     def test_preflight_validation_aborts_on_errors(self) -> None:
@@ -524,7 +524,7 @@ class TestMain:
         mock_mgr.validate.return_value = ["E0-T1: work unit file missing"]
 
         with patch(f"{_ORC}.setup_all_repos", return_value={}):
-            with patch(f"{_ORC}.BacklogManagerJudge", return_value=mock_mgr):
+            with patch(f"{_ORC}.BacklogManager", return_value=mock_mgr):
                 with patch(f"{_ORC}.BacklogParser") as mock_parser_cls:
                     main()
                     # BacklogParser.parse_index should never be called — we aborted early
@@ -544,7 +544,7 @@ class TestMain:
 
         with patch(f"{_ORC}.setup_all_repos", return_value={}):
             with patch(f"{_ORC}.BacklogParser", return_value=mock_parser):
-                with patch(f"{_ORC}.BacklogManagerJudge", return_value=mock_mgr):
+                with patch(f"{_ORC}.BacklogManager", return_value=mock_mgr):
                     main()
 
     def test_processes_one_unit_then_done(self, tmp_path: Path) -> None:
@@ -569,7 +569,7 @@ class TestMain:
 
         with patch(f"{_ORC}.setup_all_repos", return_value={}):
             with patch(f"{_ORC}.BacklogParser", return_value=mock_parser):
-                with patch(f"{_ORC}.BacklogManagerJudge", return_value=mock_mgr):
+                with patch(f"{_ORC}.BacklogManager", return_value=mock_mgr):
                     with patch(f"{_ORC}.process_work_unit", return_value=True):
                         main()
 
@@ -589,5 +589,5 @@ class TestMain:
 
         with patch(f"{_ORC}.setup_all_repos", return_value={}):
             with patch(f"{_ORC}.BacklogParser", return_value=mock_parser):
-                with patch(f"{_ORC}.BacklogManagerJudge", return_value=mock_mgr):
+                with patch(f"{_ORC}.BacklogManager", return_value=mock_mgr):
                     main()

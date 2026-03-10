@@ -7,7 +7,7 @@ runs judge reviews at every gate, and manages the lifecycle.
 import logging
 from pathlib import Path
 
-from devbench.backlog.manager import BacklogManagerJudge
+from devbench.backlog.manager import BacklogManager
 from devbench.backlog.parser import BacklogParser
 from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus
 from devbench.config import (
@@ -103,7 +103,7 @@ def process_work_unit(work_unit: WorkUnit) -> bool:
 
     git_ops = GitOpsJudge()
     security_judge = SecurityReviewJudge()
-    backlog_mgr = BacklogManagerJudge()
+    backlog_mgr = BacklogManager()
     blocker_judge = BlockerResolverJudge()
 
     backlog_mgr.force_status(work_unit.file_path, BACKLOG_INDEX, work_unit.id, STATUS_IN_PROGRESS)
@@ -297,7 +297,7 @@ def main() -> None:
     logger.info("Starting autonomous backlog execution")
 
     # Pre-flight: validate backlog integrity before doing any work
-    backlog_mgr_preflight = BacklogManagerJudge()
+    backlog_mgr_preflight = BacklogManager()
     preflight_errors = backlog_mgr_preflight.validate(BACKLOG_INDEX, BACKLOG_INDEX.parent)
     if preflight_errors:
         logger.error("Backlog integrity check failed — aborting:")

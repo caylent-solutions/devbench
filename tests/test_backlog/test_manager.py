@@ -6,9 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from devbench.backlog.manager import VALID_STATUSES, BacklogManagerJudge
+from devbench.backlog.manager import VALID_STATUSES, BacklogManager
 from devbench.constants import REVIEW_JUDGE_NAMES
-from devbench.judges.base import Verdict
 
 
 @pytest.fixture
@@ -82,7 +81,7 @@ class TestForceStatus:
     """Test force_status updates both files without enforcing the done-gate."""
 
     def test_updates_both_files(self, tmp_work_unit_file: Path, backlog_index_titlecase: Path) -> None:
-        judge = BacklogManagerJudge()
+        judge = BacklogManager()
         judge.force_status(tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1", "in-progress")
 
         wu_content = tmp_work_unit_file.read_text()
@@ -100,7 +99,7 @@ class TestForceStatus:
         self, tmp_work_unit_file: Path, backlog_index_titlecase: Path
     ) -> None:
         """force_status bypasses the done-gate — no judge comments required."""
-        judge = BacklogManagerJudge()
+        judge = BacklogManager()
         judge.force_status(tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1", "done")
 
         assert "## Status: done" in tmp_work_unit_file.read_text()
@@ -108,7 +107,7 @@ class TestForceStatus:
     def test_updates_lowercase_statuses_in_backlog(
         self, tmp_work_unit_file: Path, backlog_index_lowercase: Path,
     ) -> None:
-        judge = BacklogManagerJudge()
+        judge = BacklogManager()
         judge.force_status(tmp_work_unit_file, backlog_index_lowercase, "E0-F1-S1-T1", "done")
 
         index_content = backlog_index_lowercase.read_text()
@@ -120,7 +119,7 @@ class TestForceStatus:
             pytest.fail("E0-F1-S1-T1 not found in BACKLOG.md")
 
     def test_accepts_all_valid_statuses(self, tmp_work_unit_file: Path, backlog_index_titlecase: Path) -> None:
-        judge = BacklogManagerJudge()
+        judge = BacklogManager()
         for cli_status, canonical in VALID_STATUSES.items():
             backlog_index_titlecase.write_text(
                 backlog_index_titlecase.read_text()
@@ -146,17 +145,17 @@ class TestForceStatus:
             assert f"## Status: {canonical}" in wu_content
 
     def test_rejects_invalid_status(self, tmp_work_unit_file: Path, backlog_index_titlecase: Path) -> None:
-        judge = BacklogManagerJudge()
+        judge = BacklogManager()
         with pytest.raises(ValueError, match="Invalid status"):
             judge.force_status(tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1", "invalid")
 
     def test_raises_file_not_found_for_work_unit(self, tmp_path: Path, backlog_index_titlecase: Path) -> None:
-        judge = BacklogManagerJudge()
+        judge = BacklogManager()
         with pytest.raises(FileNotFoundError):
             judge.force_status(tmp_path / "missing.md", backlog_index_titlecase, "E0-F1-S1-T1", "done")
 
     def test_raises_file_not_found_for_backlog(self, tmp_work_unit_file: Path, tmp_path: Path) -> None:
-        judge = BacklogManagerJudge()
+        judge = BacklogManager()
         with pytest.raises(FileNotFoundError):
             judge.force_status(tmp_work_unit_file, tmp_path / "missing.md", "E0-F1-S1-T1", "done")
 
@@ -184,7 +183,7 @@ class TestMarkDone:
         content = tmp_work_unit_file.read_text(encoding="utf-8")
         tmp_work_unit_file.write_text(content + _ALL_JUDGES_PASSED_COMMENTS, encoding="utf-8")
 
-        judge = BacklogManagerJudge()
+        judge = BacklogManager()
         judge.mark_done(tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1")
 
         wu_content = tmp_work_unit_file.read_text()
@@ -197,7 +196,7 @@ class TestMarkDone:
                 break
 
     def test_mark_done_raises_file_not_found(self, tmp_path: Path, backlog_index_titlecase: Path) -> None:
-        judge = BacklogManagerJudge()
+        judge = BacklogManager()
         with pytest.raises(FileNotFoundError):
             judge.mark_done(tmp_path / "nonexistent.md", backlog_index_titlecase, "E0-F1-S1-T1")
 
@@ -207,7 +206,7 @@ class TestMarkDone:
             "# No status here\nJust content.\n" + _ALL_JUDGES_PASSED_COMMENTS
         )
 
-        judge = BacklogManagerJudge()
+        judge = BacklogManager()
         with pytest.raises(ValueError, match="Could not find"):
             judge.mark_done(bad_file, backlog_index_titlecase, "E0-F1-S1-T1")
 
@@ -218,7 +217,7 @@ class TestMarkBlocked:
     def test_mark_blocked_updates_both_files_and_adds_comment(
         self, tmp_work_unit_file: Path, backlog_index_titlecase: Path,
     ) -> None:
-        judge = BacklogManagerJudge()
+        judge = BacklogManager()
         judge.mark_blocked(tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1", "Dependency not met")
 
         wu_content = tmp_work_unit_file.read_text()
@@ -241,7 +240,7 @@ class TestRollupParentStatus:
     ) -> None:
         index_path, t2_file, story_file, feature_file = backlog_with_hierarchy
 
-        judge = BacklogManagerJudge()
+        judge = BacklogManager()
         # T1 is already Done in the fixture. Mark T2 Done — should roll up S1.
         judge.force_status(t2_file, index_path, "E0-F1-S1-T2", "done")
 
@@ -262,7 +261,7 @@ class TestRollupParentStatus:
     ) -> None:
         index_path, t2_file, story_file, feature_file = backlog_with_hierarchy
 
-        judge = BacklogManagerJudge()
+        judge = BacklogManager()
         # Mark T2 as in-progress — T1 is Done but T2 is not, so story stays
         judge.force_status(t2_file, index_path, "E0-F1-S1-T2", "in-progress")
 
@@ -293,7 +292,7 @@ class TestRollupParentStatus:
         feature_file = backlog_dir / "E0-F1.md"
         feature_file.write_text("# E0-F1\n\n## Status: in-queue\n")
 
-        judge = BacklogManagerJudge()
+        judge = BacklogManager()
         # Mark last task Done → story rolls up → feature rolls up
         judge.force_status(t_file, index_path, "E0-F1-S2-T1", "done")
 
@@ -319,7 +318,7 @@ class TestLogToTraceabilityMatrix:
     def test_creates_matrix_file_if_absent(self, tmp_path: Path) -> None:
         matrix = tmp_path / "traceability" / "matrix.md"
 
-        judge = BacklogManagerJudge()
+        judge = BacklogManager()
         judge.log_to_traceability_matrix(matrix, "AC-FUNC-001", "test_feature")
 
         assert matrix.exists()
@@ -332,7 +331,7 @@ class TestLogToTraceabilityMatrix:
         matrix = tmp_path / "matrix.md"
         matrix.write_text("| Spec Ref | Test Ref | Verified At |\n| --- | --- | --- |\n")
 
-        judge = BacklogManagerJudge()
+        judge = BacklogManager()
         judge.log_to_traceability_matrix(matrix, "AC-01", "test_a")
         judge.log_to_traceability_matrix(matrix, "AC-02", "test_b")
 
@@ -356,7 +355,7 @@ class TestLastRoundAllPassed:
 
     def test_returns_true_when_all_required_judges_passed(self, tmp_path: Path) -> None:
         wu = self._make_wu_with_comments(tmp_path, _all_judges_pass_block())
-        judge = BacklogManagerJudge()
+        judge = BacklogManager()
         assert judge._last_round_all_passed(wu) is True
 
     def test_returns_false_when_judge_missing(self, tmp_path: Path) -> None:
@@ -367,7 +366,7 @@ class TestLastRoundAllPassed:
             # changes_manifest missing
         ]) + "\n"
         wu = self._make_wu_with_comments(tmp_path, comments)
-        judge = BacklogManagerJudge()
+        judge = BacklogManager()
         assert judge._last_round_all_passed(wu) is False
 
     def test_returns_false_when_followed_by_review_rejected(self, tmp_path: Path) -> None:
@@ -379,7 +378,7 @@ class TestLastRoundAllPassed:
             # Round 2 has no REVIEW_PASS entries yet (only rejection so far)
         )
         wu = self._make_wu_with_comments(tmp_path, comments)
-        judge = BacklogManagerJudge()
+        judge = BacklogManager()
         assert judge._last_round_all_passed(wu) is False
 
     def test_returns_true_when_round2_passes_after_rejection(self, tmp_path: Path) -> None:
@@ -392,12 +391,12 @@ class TestLastRoundAllPassed:
             + _all_judges_pass_block()
         )
         wu = self._make_wu_with_comments(tmp_path, comments)
-        judge = BacklogManagerJudge()
+        judge = BacklogManager()
         assert judge._last_round_all_passed(wu) is True
 
     def test_returns_false_when_no_comments(self, tmp_path: Path) -> None:
         wu = self._make_wu_with_comments(tmp_path, "")
-        judge = BacklogManagerJudge()
+        judge = BacklogManager()
         assert judge._last_round_all_passed(wu) is False
 
 
@@ -426,20 +425,20 @@ class TestMarkDoneGate:
     def test_mark_done_raises_when_judges_not_all_passed(self, tmp_path: Path) -> None:
         wu = self._make_wu(tmp_path, _judge_comment("code_review", "REVIEW_PASS") + "\n")
         idx = self._make_index(tmp_path)
-        judge = BacklogManagerJudge()
+        judge = BacklogManager()
         with pytest.raises(RuntimeError, match="not all required judges passed"):
             judge.mark_done(wu, idx, "E0-F1-S1-T1")
 
     def test_mark_done_succeeds_when_all_judges_passed(self, tmp_path: Path) -> None:
         wu = self._make_wu(tmp_path, _all_judges_pass_block())
         idx = self._make_index(tmp_path)
-        judge = BacklogManagerJudge()
+        judge = BacklogManager()
         judge.mark_done(wu, idx, "E0-F1-S1-T1")
         assert "## Status: done" in wu.read_text(encoding="utf-8")
 
 
 class TestValidate:
-    """Tests for BacklogManagerJudge.validate() backlog integrity checks."""
+    """Tests for BacklogManager.validate() backlog integrity checks."""
 
     def _make_index(self, tmp_path: Path, rows: str) -> Path:
         idx = tmp_path / "BACKLOG.md"
@@ -465,7 +464,7 @@ class TestValidate:
             "| E0-F1-S1-T1 | Task 1 | Task | in-queue | none | repo | `backlog/E0-F1-S1-T1.md` |\n"
             "| E0-F1-S1-T2 | Task 2 | Task | done | E0-F1-S1-T1 | repo | `backlog/E0-F1-S1-T2.md` |\n",
         )
-        judge = BacklogManagerJudge()
+        judge = BacklogManager()
         errors = judge.validate(idx, tmp_path)
         assert errors == []
 
@@ -475,7 +474,7 @@ class TestValidate:
             tmp_path,
             "| E0-F1-S1-T1 | Task 1 | Task | in-queue | none | repo | `backlog/E0-F1-S1-T1.md` |\n",
         )
-        judge = BacklogManagerJudge()
+        judge = BacklogManager()
         errors = judge.validate(idx, tmp_path)
         assert any("E0-F1-S1-T1" in e and "missing" in e.lower() for e in errors)
 
@@ -486,7 +485,7 @@ class TestValidate:
             tmp_path,
             "| E0-F1-S1-T1 | Task 1 | Task | in-queue | none | repo | `backlog/E0-F1-S1-T1.md` |\n",
         )
-        judge = BacklogManagerJudge()
+        judge = BacklogManager()
         errors = judge.validate(idx, tmp_path)
         assert any("E0-F1-S1-T1" in e and "status" in e.lower() for e in errors)
 
@@ -498,7 +497,7 @@ class TestValidate:
             tmp_path,
             "| E0-F1-S1-T1 | Task 1 | Task | in-queue | none | repo | `backlog/E0-F1-S1-T1.md` |\n",
         )
-        judge = BacklogManagerJudge()
+        judge = BacklogManager()
         errors = judge.validate(idx, tmp_path)
         assert any("E0-F1-S1-T2" in e and "orphan" in e.lower() for e in errors)
 
@@ -509,7 +508,7 @@ class TestValidate:
             tmp_path,
             "| E0-F1-S1-T2 | Task 2 | Task | in-queue | E0-F1-S1-T1 | repo | `backlog/E0-F1-S1-T2.md` |\n",
         )
-        judge = BacklogManagerJudge()
+        judge = BacklogManager()
         errors = judge.validate(idx, tmp_path)
         assert any("E0-F1-S1-T1" in e and "depend" in e.lower() for e in errors)
 
@@ -521,19 +520,85 @@ class TestValidate:
             tmp_path,
             "| E0-F1-S1-T1 | Task 1 | Task | in-queue | none | repo | `backlog/E0-F1-S1-T1.md` |\n",
         )
-        judge = BacklogManagerJudge()
+        judge = BacklogManager()
         errors = judge.validate(idx, tmp_path)
         assert any("E0-F1-S1-T1" in e and "status" in e.lower() for e in errors)
 
 
-class TestEvaluateNoop:
-    """Test that evaluate returns PASS as a no-op."""
+# ---------------------------------------------------------------------------
+# E4-F1-S1-T1: Rename BacklogManagerJudge → BacklogManager
+# ---------------------------------------------------------------------------
 
-    def test_evaluate_returns_pass(self, tmp_path: Path) -> None:
-        judge = BacklogManagerJudge()
-        result = judge.evaluate(
-            work_unit_path=tmp_path / "dummy.md",
-            repo_path=tmp_path,
+
+class TestBacklogManagerRename:
+    """AC tests for E4-F1-S1-T1: class rename and reference cleanup."""
+
+    def test_backlog_manager_symbol_exists(self) -> None:
+        """AC-1: BacklogManager class is importable from devbench.backlog.manager."""
+        from devbench.backlog.manager import BacklogManager
+
+        assert BacklogManager is not None
+
+    def test_no_backlog_manager_judge_symbol_in_src(self) -> None:
+        """AC-5: No BacklogManagerJudge references remain under src/devbench."""
+        from pathlib import Path
+
+        old_name = "BacklogManagerJudge"
+        src_root = Path(__file__).parents[2] / "src" / "devbench"
+        matches = [
+            str(p)
+            for p in src_root.rglob("*.py")
+            if old_name in p.read_text(encoding="utf-8")
+        ]
+        assert not matches, f"{old_name} still found in src/devbench: {matches}"
+
+    def test_cli_imports_backlog_manager(self) -> None:
+        """AC-3: cli.py imports and instantiates BacklogManager."""
+        import importlib
+
+        import devbench.cli as cli_module
+
+        importlib.reload(cli_module)
+        assert hasattr(cli_module, "BacklogManager")
+        assert not hasattr(cli_module, "BacklogManagerJudge")
+
+    def test_orchestrator_imports_backlog_manager(self) -> None:
+        """AC-4: orchestrator.py imports and instantiates BacklogManager."""
+        import importlib
+
+        import devbench.execution.orchestrator as orc_module
+
+        importlib.reload(orc_module)
+        assert hasattr(orc_module, "BacklogManager")
+        assert not hasattr(orc_module, "BacklogManagerJudge")
+
+    def test_backlog_manager_set_status_behavior_unchanged(self, tmp_path: Path) -> None:
+        """AC-6: set_status (via force_status) behaves identically after rename."""
+        from devbench.backlog.manager import BacklogManager
+
+        wu = tmp_path / "E0-F1-S1-T1.md"
+        wu.write_text("# Task\n\n## Status: in-progress\n")
+        index = tmp_path / "BACKLOG.md"
+        index.write_text(
+            "| ID | Title | Type | Status | Deps | Repo | File Path |\n"
+            "|---|---|---|---|---|---|---|\n"
+            "| E0-F1-S1-T1 | Task 1 | Task | in-progress | none | repo | `E0-F1-S1-T1.md` |\n"
         )
-        assert result.verdict is Verdict.PASS
-        assert "no-op" in result.reasoning.lower()
+        mgr = BacklogManager()
+        mgr.force_status(wu, index, "E0-F1-S1-T1", "in-review")
+        assert "in-review" in wu.read_text()
+        assert "in-review" in index.read_text()
+
+    def test_backlog_manager_validate_behavior_unchanged(self, tmp_path: Path) -> None:
+        """AC-6: validate behaves identically after rename."""
+        from devbench.backlog.manager import BacklogManager
+
+        index = tmp_path / "BACKLOG.md"
+        index.write_text(
+            "| ID | Title | Type | Status | Deps | Repo | File Path |\n"
+            "|---|---|---|---|---|---|---|\n"
+            "| E0-F1-S1-T1 | Task 1 | Task | in-queue | none | repo | `backlog/missing.md` |\n"
+        )
+        mgr = BacklogManager()
+        errors = mgr.validate(index, tmp_path)
+        assert any("missing" in e.lower() or "E0-F1-S1-T1" in e for e in errors)

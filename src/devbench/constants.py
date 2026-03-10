@@ -110,6 +110,27 @@ STATUS_SEPARATOR_WIDTH: int = 40
 DEPENDENCY_NONE_VALUE: str = "none"
 
 # ---------------------------------------------------------------------------
+# Work-unit lifecycle status strings (canonical lowercase-hyphenated form).
+# These are the values written into work-unit files and BACKLOG.md rows.
+# The display / title-case variants live on WorkUnitStatus in work_unit.py.
+# ---------------------------------------------------------------------------
+STATUS_IN_QUEUE: str = "in-queue"
+STATUS_IN_PROGRESS: str = "in-progress"
+STATUS_IN_REVIEW: str = "in-review"
+STATUS_DONE: str = "done"
+STATUS_BLOCKED: str = "blocked"
+
+# Ordered mapping from any accepted input form to the canonical write form.
+# Used by BacklogManagerJudge._set_status() for validation and normalisation.
+VALID_STATUSES: dict[str, str] = {
+    STATUS_IN_QUEUE: STATUS_IN_QUEUE,
+    STATUS_IN_PROGRESS: STATUS_IN_PROGRESS,
+    STATUS_IN_REVIEW: STATUS_IN_REVIEW,
+    STATUS_DONE: STATUS_DONE,
+    STATUS_BLOCKED: STATUS_BLOCKED,
+}
+
+# ---------------------------------------------------------------------------
 # Epic placeholder ID
 # ---------------------------------------------------------------------------
 EPIC_PLACEHOLDER_ID: str = "--"

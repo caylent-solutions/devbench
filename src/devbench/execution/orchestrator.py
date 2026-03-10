@@ -19,7 +19,7 @@ from devbench.config import (
     REPO_LOCAL_PATHS,
     validate_repo,
 )
-from devbench.constants import BRANCH_NAME_TEMPLATE, PR_BODY_TEMPLATE
+from devbench.constants import BRANCH_NAME_TEMPLATE, PR_BODY_TEMPLATE, STATUS_IN_PROGRESS
 from devbench.execution import executor as claude_executor
 from devbench.execution.executor import ExecutionStatus
 from devbench.github.git_ops import GitOpsJudge
@@ -106,7 +106,7 @@ def process_work_unit(work_unit: WorkUnit) -> bool:
     backlog_mgr = BacklogManagerJudge()
     blocker_judge = BlockerResolverJudge()
 
-    backlog_mgr.force_status(work_unit.file_path, BACKLOG_INDEX, work_unit.id, "in-progress")
+    backlog_mgr.force_status(work_unit.file_path, BACKLOG_INDEX, work_unit.id, STATUS_IN_PROGRESS)
     work_unit.log_comment("orchestrator", "START", f"Beginning work on {work_unit.id}")
 
     feedback = ""

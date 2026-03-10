@@ -25,21 +25,14 @@ from devbench.constants import (
     COMMENT_ENTRY_TEMPLATE,
     COMMENTS_SECTION_HEADER,
     REVIEW_JUDGE_NAMES,
+    STATUS_BLOCKED,
+    STATUS_DONE,
     STATUS_LINE_RE,
     TABLE_STATUS_VALUES,
     TRACEABILITY_MATRIX_HEADER,
+    VALID_STATUSES,
 )
 from devbench.judges.base import BaseJudge, JudgeResult, Verdict
-
-# Mapping from CLI-style lowercase statuses to the canonical lowercase forms
-# used in work-unit files and BACKLOG.md table rows.
-VALID_STATUSES: dict[str, str] = {
-    "in-queue": "in-queue",
-    "in-progress": "in-progress",
-    "in-review": "in-review",
-    "done": "done",
-    "blocked": "blocked",
-}
 
 
 class BacklogManagerJudge(BaseJudge):
@@ -109,7 +102,7 @@ class BacklogManagerJudge(BaseJudge):
             raise RuntimeError(
                 f"Cannot mark {unit_id} done: not all required judges passed in the most recent review round"
             )
-        self._set_status(work_unit_path, backlog_index, unit_id, "done")
+        self._set_status(work_unit_path, backlog_index, unit_id, STATUS_DONE)
 
     def mark_blocked(self, work_unit_path: Path, backlog_index: Path, unit_id: str, reason: str) -> None:
         """Mark a work unit as Blocked in both files and append a comment.
@@ -124,7 +117,7 @@ class BacklogManagerJudge(BaseJudge):
             FileNotFoundError: If either file does not exist.
             ValueError: If the status line or unit row is not found.
         """
-        self._set_status(work_unit_path, backlog_index, unit_id, "blocked")
+        self._set_status(work_unit_path, backlog_index, unit_id, STATUS_BLOCKED)
         self._append_comment(work_unit_path, "BLOCKED", reason)
 
     def validate(self, backlog_index: Path, backlog_root: Path) -> list[str]:
@@ -273,7 +266,7 @@ class BacklogManagerJudge(BaseJudge):
             canonical,
         )
 
-        if canonical == "done":
+        if canonical == STATUS_DONE:
             self._rollup_parent_status(backlog_index, unit_id)
 
     def _last_round_all_passed(self, work_unit_path: Path) -> bool:
@@ -322,7 +315,7 @@ class BacklogManagerJudge(BaseJudge):
 
         self.logger.info("All children of %s are done — rolling up status", parent_id)
         # _set_status: atomic write to both files; cascades via _rollup_parent_status.
-        self._set_status(parent_file, backlog_index, parent_id, "done")
+        self._set_status(parent_file, backlog_index, parent_id, STATUS_DONE)
 
     def _parse_backlog_rows(self, backlog_index: Path) -> list[tuple[str, str, str]]:
         """Parse BACKLOG.md table rows into (id, status, file_path) tuples."""
@@ -359,13 +352,13 @@ class BacklogManagerJudge(BaseJudge):
         for row_id, status, _ in rows:
             if row_id == parent_id:
                 parent_found = True
-                if status == "done":
+                if status == STATUS_DONE:
                     return False  # Already done
                 continue
 
             if row_id.startswith(parent_id + "-") and row_id.count("-") == parent_depth + 1:
                 has_children = True
-                if status != "done":
+                if status != STATUS_DONE:
                     return False
 
         return parent_found and has_children

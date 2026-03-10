@@ -39,7 +39,12 @@ from devbench.config import (
     resolve_repo,
     validate_repo,
 )
-from devbench.constants import DISPLAY_STATUS_VALUES, STATUS_SEPARATOR_WIDTH
+from devbench.constants import (
+    DISPLAY_STATUS_VALUES,
+    STATUS_IN_PROGRESS,
+    STATUS_IN_REVIEW,
+    STATUS_SEPARATOR_WIDTH,
+)
 from devbench.judges.base import Verdict
 from devbench.judges.changes_manifest import ChangesManifestJudge
 from devbench.judges.code_review import CodeReviewJudge
@@ -111,7 +116,7 @@ def cmd_next() -> int:
         wu_file = WORKSPACE_ROOT / unit.file_path
     if wu_file.exists():
         mgr = BacklogManagerJudge()
-        mgr.force_status(wu_file, BACKLOG_INDEX, unit.id, "in-progress")
+        mgr.force_status(wu_file, BACKLOG_INDEX, unit.id, STATUS_IN_PROGRESS)
         logger.info("Set %s to in-progress", unit.id)
 
     print(
@@ -190,7 +195,7 @@ def cmd_review(unit_id: str) -> int:
 
     # Automatically mark as in-review in both files
     mgr = BacklogManagerJudge()
-    mgr.force_status(wu_file, BACKLOG_INDEX, unit_id, "in-review")
+    mgr.force_status(wu_file, BACKLOG_INDEX, unit_id, STATUS_IN_REVIEW)
     logger.info("Set %s to in-review", unit_id)
 
     judges = [

@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
+from devbench.config import ALLOWED_REPOS
 from devbench.github.security import SecurityFinding, SecurityReport
 
 
@@ -106,17 +107,14 @@ class TestSetupAllRepos:
             }
             results = setup_all_repos()
 
-        # Should be called exactly once per allowed repo (4 repos)
-        assert mock_enable.call_count == 4
-
         # Verify all calls used allowed repos
-        from devbench.config import ALLOWED_REPOS
+        assert mock_enable.call_count == len(ALLOWED_REPOS)
 
         called_repos = {call.args[0] for call in mock_enable.call_args_list}
         assert called_repos == ALLOWED_REPOS
 
         # Every repo should have results
-        assert len(results) == 4
+        assert len(results) == len(ALLOWED_REPOS)
         for repo, features in results.items():
             assert repo in ALLOWED_REPOS
             assert features["codeql"] is True

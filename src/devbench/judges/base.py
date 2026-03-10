@@ -169,6 +169,7 @@ class BaseJudge(abc.ABC):
 
         effective_timeout = timeout if timeout is not None else LLM_TIMEOUT
 
+        client: anthropic.AnthropicBedrock | anthropic.Anthropic
         if USE_BEDROCK:
             self.logger.info(
                 "Calling Claude (%s) for %s evaluation via Bedrock (%s)",

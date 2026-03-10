@@ -35,11 +35,11 @@ test: test-unit test-functional
 
 ## test-unit: Run unit tests
 test-unit:
-	uv run pytest tests/ -v --tb=short -q
+	uv run pytest tests/ -v --tb=short -q --ignore=tests/functional
 
 ## test-functional: Run functional tests
 test-functional:
-	uv run pytest tests/test_functional_judges.py -v --tb=short -q
+	uv run pytest tests/functional/ -v --tb=short -q
 
 ## validate: Full validation (check + test)
 validate: check test
@@ -70,4 +70,4 @@ report-session:
 
 ## run-backlog: Execute the autonomous backlog orchestrator (foreground, assumes GH_TOKEN is set)
 run-backlog:
-	uv run python -m devbench.orchestrator
+	uv run python -m devbench.execution.orchestrator

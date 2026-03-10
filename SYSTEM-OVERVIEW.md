@@ -180,7 +180,7 @@ Up to 10 retry attempts before marking the unit as blocked.
 
 ### 11. Merge and Status Update
 
-- Agent merges the PR via `gh pr merge --squash --delete-branch`
+- Agent merges the PR via `gh pr merge --delete-branch` using the strategy set by `JUDGE_MERGE_STRATEGY` (default: `squash`)
 - Updates the parent repo's submodule reference
 - Marks the work unit as Done via `set_status()` — a single code path that updates both the work unit file and BACKLOG.md
 - When all child tasks of a Story/Feature/Epic are Done, the parent is automatically rolled up to Done (cascading upward)
@@ -190,67 +190,38 @@ Up to 10 retry attempts before marking the unit as blocked.
 - If the agent session is interrupted, the next session recovers in-progress work
 - Agent detects uncommitted changes on existing branches and continues from where it left off
 
-## Architecture
+## Environment Variables
 
-```
-<workspace>/                                       ← Parent repo (workspace root)
-├── BACKLOG.md                                     ← Master index: all work units with status
-├── CLAUDE.md                                      ← Engineering standards (mandatory for all code)
-├── backlog/                                       ← Work unit specs organized by epic
-│   ├── AGENT-INSTRUCTIONS.md                      ← Master prompt for dev agents
-│   └── E0-repo-tooling/                           ← Epics > Features > Stories > Tasks
-│       └── ...
-├── devbench/                                      ← DevBench subrepo (review authority)
-│   ├── cli.py                                     ← CLI + prior feedback log parsing
-│   ├── orchestrator.py                            ← Autonomous loop (background mode)
-│   ├── orchestrator-prompt.md                     ← Interactive mode prompt
-│   ├── config.py                                  ← Environment-driven configuration
-│   ├── constants.py                               ← Structural constants (regex, formats)
-│   ├── report.py                                  ← Session progress report (velocity, ETA)
-│   ├── testing.py                                 ← Shared test utilities and fixtures
-│   ├── judges/                                    ← Judge implementations
-│   │   ├── base.py                                ← BaseJudge: LLM calls, prior feedback injection,
-│   │   │                                             evidence truncation with markers
-│   │   ├── code_review.py                         ← Git diff → LLM verdict
-│   │   ├── test_review.py                         ← make test / pytest → LLM verdict
-│   │   ├── doc_review.py                          ← Doc diff → LLM verdict
-│   │   ├── changes_manifest.py                    ← Changed files vs. manifest → LLM verdict
-│   │   ├── security_review.py                     ← GitHub alerts + diff → LLM verdict
-│   │   ├── blocker_resolver.py                    ← Dependency and blocker assessment
-│   │   ├── git_ops.py                             ← Commit, push, PR, merge, CI checks
-│   │   └── backlog_manager.py                     ← Status sync, rollup, traceability
-│   ├── prompts/                                   ← LLM system prompts (one per judge)
-│   ├── tests/                                     ← ~310 tests
-│   ├── requirements.txt                           ← Runtime dependencies (anthropic)
-│   └── requirements-dev.txt                       ← Dev dependencies (pytest, ruff, bandit, mypy)
-└── <repo-submodules>/                             ← Target repos as git submodules
-```
+All configuration is via environment variables. Required variables raise `RuntimeError` at startup if unset.
 
-## LLM Provider Support
-
-DevBench supports two LLM backends for judge evaluation:
-
-### Anthropic API (default)
-
-Uses the Anthropic Python SDK with an OAuth access token from your Claude Code session (Pro or Enterprise subscription). No separate API key required.
-
-```bash
-# Just be logged into Claude Code
-JUDGE_CLAUDE_MODEL=claude-opus-4-6 make start-interactive
-```
-
-### AWS Bedrock
-
-Uses the Anthropic Bedrock SDK with your AWS credentials. Set `JUDGE_USE_BEDROCK=1` and ensure AWS credentials are configured (IAM role, env vars, or AWS config file).
-
-```bash
-JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-6-v1 \
-JUDGE_USE_BEDROCK=1 \
-JUDGE_BEDROCK_REGION=us-east-1 \
-make start-interactive
-```
-
-See [docs/llm-authentication.md](docs/llm-authentication.md) for details.
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `JUDGE_ALLOWED_REPOS` | *(required)* | Comma-separated list of allowed repos (`org/repo1,org/repo2`) |
+| `JUDGE_WORKSPACE_ROOT` | *(required)* | Absolute path to workspace root containing all repo clones |
+| `JUDGE_CLAUDE_MODEL` | *(required)* | Claude model identifier for LLM judge calls |
+| `JUDGE_MERGE_STRATEGY` | `squash` | PR merge strategy: `merge`, `squash`, or `rebase` |
+| `JUDGE_GH_ORG` | *(empty)* | When set, restricts all GitHub ops to this org only |
+| `JUDGE_BACKLOG_ROOT` | `<workspace>/backlog` | Backlog directory path |
+| `JUDGE_BACKLOG_INDEX` | `<workspace>/BACKLOG.md` | Backlog index file path |
+| `JUDGE_MAX_RETRIES` | `10` | Max retry attempts per work unit before marking blocked |
+| `JUDGE_USE_BEDROCK` | `false` | Use AWS Bedrock instead of Anthropic API |
+| `JUDGE_BEDROCK_REGION` | `us-east-1` | AWS region for Bedrock (falls back to `AWS_REGION`) |
+| `JUDGE_GH_TOKEN_FILE` | `~/.gh_token_env` | GitHub token file path |
+| `JUDGE_GH_TIMEOUT` | `600` | GitHub check wait timeout (seconds) |
+| `JUDGE_GH_API_TIMEOUT` | `30` | GitHub API call timeout (seconds) |
+| `JUDGE_TEST_TIMEOUT` | `300` | Test execution timeout (seconds) |
+| `JUDGE_LLM_TIMEOUT` | `300` | LLM evaluation timeout (seconds) |
+| `JUDGE_COMMAND_TIMEOUT` | `120` | General command timeout (seconds) |
+| `JUDGE_EXECUTOR_TIMEOUT` | `1800` | Dev agent execution timeout (seconds) |
+| `JUDGE_EXECUTOR_MAX_TURNS` | `50` | Max turns for dev agent execution |
+| `JUDGE_ORCHESTRATOR_POLL_INTERVAL` | `10` | Seconds between orchestrator poll cycles |
+| `JUDGE_SECURITY_FETCH_TIMEOUT` | `120` | Security advisory fetch timeout (seconds) |
+| `JUDGE_OUTPUT_TRUNCATION` | `2000` | Output truncation limit (chars) |
+| `JUDGE_LLM_EVIDENCE_TRUNCATION` | `15000` | LLM evidence truncation (chars) |
+| `JUDGE_LLM_FILE_CONTEXT_LIMIT` | `5` | Max files sent to LLM context |
+| `JUDGE_LLM_FILE_PREVIEW_CHARS` | `3000` | Per-file preview truncation (chars) |
+| `JUDGE_ALERT_SUMMARY_LIMIT` | `10` | Max security alerts included in judge evidence |
+| `JUDGE_CLAUDE_CREDENTIALS_FILE` | `~/.claude/.credentials.json` | Claude Code OAuth credentials file path |
 
 ## Key Design Decisions
 

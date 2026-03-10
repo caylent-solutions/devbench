@@ -6,6 +6,7 @@ All environment-specific values are read from environment variables with default
 
 import json
 import os
+from enum import StrEnum
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -15,19 +16,25 @@ from pathlib import Path
 # Unset or empty to allow any org in the allow-list.
 ALLOWED_GH_ORG: str = os.environ.get("JUDGE_GH_ORG", "")
 
-ALLOWED_REPOS: frozenset[str] = frozenset(
-    {
-        "caylent-solutions/git-repo",
-        "caylent-solutions/caylent-private-rpm",
-        "caylent-solutions/rpm-claude-marketplaces",
-        "caylent-solutions/rpm-claude-marketplaces-install",
-    }
-)
+# Comma-separated list of allowed repositories in org/repo format.
+_allowed_repos_raw = os.environ.get("JUDGE_ALLOWED_REPOS", "")
+if not _allowed_repos_raw:
+    raise RuntimeError(
+        "JUDGE_ALLOWED_REPOS environment variable is not set. "
+        "Provide a comma-separated list of allowed repositories (e.g. org/repo1,org/repo2)."
+    )
+ALLOWED_REPOS: frozenset[str] = frozenset(r.strip() for r in _allowed_repos_raw.split(",") if r.strip())
 
-_WORKSPACE_ROOT = Path(os.environ.get("JUDGE_WORKSPACE_ROOT", "/workspaces/general-agent-env"))
-WORKSPACE_ROOT: Path = _WORKSPACE_ROOT
+# Absolute path to the workspace root directory containing all repo clones.
+_workspace_root = os.environ.get("JUDGE_WORKSPACE_ROOT", "")
+if not _workspace_root:
+    raise RuntimeError(
+        "JUDGE_WORKSPACE_ROOT environment variable is not set. "
+        "Set it to the absolute path of your workspace root."
+    )
+WORKSPACE_ROOT: Path = Path(_workspace_root)
 
-REPO_LOCAL_PATHS: dict[str, Path] = {repo: _WORKSPACE_ROOT / repo.split("/", maxsplit=1)[1] for repo in ALLOWED_REPOS}
+REPO_LOCAL_PATHS: dict[str, Path] = {repo: WORKSPACE_ROOT / repo.split("/", maxsplit=1)[1] for repo in ALLOWED_REPOS}
 
 # Short name -> full name mapping for backlog compatibility.
 # The backlog table uses short names (e.g., "git-repo") while the allow-list
@@ -55,8 +62,8 @@ def resolve_repo(short_or_full: str) -> str:
 # ---------------------------------------------------------------------------
 # Backlog paths
 # ---------------------------------------------------------------------------
-BACKLOG_ROOT: Path = Path(os.environ.get("JUDGE_BACKLOG_ROOT", str(_WORKSPACE_ROOT / "backlog")))
-BACKLOG_INDEX: Path = Path(os.environ.get("JUDGE_BACKLOG_INDEX", str(_WORKSPACE_ROOT / "BACKLOG.md")))
+BACKLOG_ROOT: Path = Path(os.environ.get("JUDGE_BACKLOG_ROOT", str(WORKSPACE_ROOT / "backlog")))
+BACKLOG_INDEX: Path = Path(os.environ.get("JUDGE_BACKLOG_INDEX", str(WORKSPACE_ROOT / "BACKLOG.md")))
 
 # ---------------------------------------------------------------------------
 # Operational parameters
@@ -70,6 +77,26 @@ if not _claude_model:
         "Set it to a valid model identifier (e.g. us.anthropic.claude-sonnet-4-6-v1)."
     )
 CLAUDE_MODEL: str = _claude_model
+
+class MergeStrategy(StrEnum):
+    MERGE = "merge"
+    SQUASH = "squash"
+    REBASE = "rebase"
+
+    @property
+    def flag(self) -> str:
+        return f"--{self.value}"
+
+
+# Merge strategy for PRs. Defaults to squash.
+_merge_strategy = os.environ.get("JUDGE_MERGE_STRATEGY", "squash")
+try:
+    MERGE_STRATEGY: MergeStrategy = MergeStrategy(_merge_strategy)
+except ValueError:
+    raise RuntimeError(
+        f"JUDGE_MERGE_STRATEGY must be one of: {', '.join(s.value for s in MergeStrategy)}. Got: {_merge_strategy}"
+    ) from None
+
 USE_BEDROCK: bool = os.environ.get("JUDGE_USE_BEDROCK", "").lower() in ("1", "true", "yes")
 BEDROCK_REGION: str = os.environ.get("JUDGE_BEDROCK_REGION", os.environ.get("AWS_REGION", "us-east-1"))
 

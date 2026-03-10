@@ -207,67 +207,9 @@ devbench/
 └── README.md                      ← This file
 ```
 
-### Design Principles
-
-- **No hardcoded verdicts** — all pass/fail decisions are made by the LLM, not pattern matches
-- **Evidence gathering is deterministic** — git diffs, test output, file lists are collected reliably; only the judgment is LLM
-- **Prior feedback consistency** — re-reviews include previous feedback to prevent contradictory findings
-- **Task runner agnostic** — judges run `make test` if available, fall back to `pytest`; the LLM evaluates task runner config contextually
-- **Truncation transparency** — all content truncation includes markers so the LLM knows it's seeing a preview
-- **No silent failures** — every error raises with an actionable message, non-zero exit codes
-- **No fallback logic** — missing config or bad data fails fast
-- **External prompts** — all LLM system prompts in `prompts/*.txt`, not inline strings
-- **Single status update path** — `set_status()` updates both the work unit file and BACKLOG.md atomically
-- **Automatic parent rollup** — when all children are Done, parent Story/Feature/Epic auto-rolls to Done
-
-## Judge Details
-
-### Code Review (`code_review`)
-- **Evidence**: Git diff, work unit content, prior feedback
-- **Evaluates**: AC coverage, SOLID/DRY, fail-fast, 12-factor config, security, prohibited patterns, task runner validation
-
-### Test Review (`test_review`)
-- **Evidence**: `make test` output (or pytest), test file contents, work unit content, prior feedback
-- **Evaluates**: TDD discipline, test quality, meaningful assertions, stub detection, markers, task runner validation
-
-### Doc Review (`doc_review`)
-- **Evidence**: Git diff, documentation files, work unit content, prior feedback
-- **Evaluates**: Documentation accuracy, completeness, sync with code changes, stale references
-
-### Changes Manifest (`changes_manifest`)
-- **Evidence**: Changed file list, diff summary, work unit content, prior feedback
-- **Evaluates**: Actual changes vs. manifest, scope creep, unauthorized modifications
-
-### Security Review (`security_review`)
-- **Evidence**: GitHub CodeQL/Dependabot/secret-scanning alerts, git diff, work unit content
-- **Evaluates**: Open alerts, security anti-patterns, severity assessment
-- **Runs after**: The other four judges all pass — acts as a final security gate before merge
-
 ## Configuration
 
-All configuration via environment variables with sensible defaults:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `JUDGE_WORKSPACE_ROOT` | Parent of devbench checkout | Root workspace path |
-| `JUDGE_BACKLOG_ROOT` | `<workspace>/backlog` | Backlog directory |
-| `JUDGE_BACKLOG_INDEX` | `<workspace>/BACKLOG.md` | Backlog index file |
-| `JUDGE_MAX_RETRIES` | `10` | Max retry attempts per work unit |
-| `JUDGE_CLAUDE_MODEL` | *(required)* | Claude model for LLM calls |
-| `JUDGE_USE_BEDROCK` | `false` | Use AWS Bedrock instead of Anthropic API |
-| `JUDGE_BEDROCK_REGION` | `us-east-1` | AWS region for Bedrock (falls back to `AWS_REGION`) |
-| `JUDGE_LOG_FILE` | `judges/logs/orchestrator.log` | Log file path |
-| `JUDGE_GH_TOKEN_FILE` | `~/.gh_token_env` | GitHub token file path |
-| `JUDGE_GH_TIMEOUT` | `600` | GitHub check wait timeout (seconds) |
-| `JUDGE_GH_API_TIMEOUT` | `30` | GitHub API call timeout (seconds) |
-| `JUDGE_TEST_TIMEOUT` | `300` | Test execution timeout (seconds) |
-| `JUDGE_LLM_TIMEOUT` | `300` | LLM evaluation timeout (seconds) |
-| `JUDGE_COMMAND_TIMEOUT` | `120` | General command timeout (seconds) |
-| `JUDGE_EXECUTOR_TIMEOUT` | `1800` | Dev agent execution timeout (seconds) |
-| `JUDGE_OUTPUT_TRUNCATION` | `2000` | Output truncation limit (chars) |
-| `JUDGE_LLM_EVIDENCE_TRUNCATION` | `15000` | LLM evidence truncation (chars) |
-| `JUDGE_LLM_FILE_CONTEXT_LIMIT` | `5` | Max files in LLM context |
-| `JUDGE_LLM_FILE_PREVIEW_CHARS` | `3000` | File preview truncation (chars) |
+Required variables (`JUDGE_ALLOWED_REPOS`, `JUDGE_WORKSPACE_ROOT`, `JUDGE_CLAUDE_MODEL`) raise `RuntimeError` at startup if unset. The startup scripts (`start.sh`, `start-interactive.sh`) additionally require `JUDGE_GH_ORG`. See [SYSTEM-OVERVIEW.md](SYSTEM-OVERVIEW.md#environment-variables) for the full variable reference.
 
 ## Interactive Mode
 

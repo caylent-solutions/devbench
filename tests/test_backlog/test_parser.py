@@ -15,12 +15,14 @@ class TestParseIndex:
 
     def test_parse_index_from_actual_backlog(self) -> None:
         """Parse the real BACKLOG.md file and verify results."""
-        actual_backlog = Path("/workspaces/general-agent-env/BACKLOG.md")
+        import os
+        workspace = Path(os.environ.get("JUDGE_WORKSPACE_ROOT", "/tmp/test-workspace"))
+        actual_backlog = workspace / "BACKLOG.md"
         if not actual_backlog.is_file():
             pytest.skip("Actual BACKLOG.md not found")
 
         parser = BacklogParser(
-            backlog_root=Path("/workspaces/general-agent-env/backlog"),
+            backlog_root=workspace / "backlog",
             backlog_index=actual_backlog,
         )
         units = parser.parse_index()

@@ -537,6 +537,20 @@ class TestValidate:
         errors = judge.validate(idx, tmp_path)
         assert any("E0-F1-S1-T1" in e and "depend" in e.lower() for e in errors)
 
+    def test_work_unit_file_missing_status_line_is_reported(self, tmp_path: Path) -> None:
+        """Bug fix: work unit file with no ## Status: line must produce an error, not be silently skipped."""
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        wu = backlog_dir / "E0-F1-S1-T1.md"
+        wu.write_text("# E0-F1-S1-T1: Task\n\n## Description\nNo status line here.\n", encoding="utf-8")
+        idx = self._make_index(
+            tmp_path,
+            "| E0-F1-S1-T1 | Task 1 | Task | in-queue | none | repo | `backlog/E0-F1-S1-T1.md` |\n",
+        )
+        judge = BacklogManagerJudge()
+        errors = judge.validate(idx, tmp_path)
+        assert any("E0-F1-S1-T1" in e and "status" in e.lower() for e in errors)
+
 
 class TestEvaluateNoop:
     """Test that evaluate returns PASS as a no-op."""

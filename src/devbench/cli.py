@@ -193,6 +193,9 @@ def cmd_review(unit_id: str) -> int:
     if not wu_file.exists():
         wu_file = WORKSPACE_ROOT / target.file_path
 
+    # Resolve file_path to the absolute path so log_comment writes to the right file
+    target.file_path = wu_file
+
     # Automatically mark as in-review in both files
     mgr = BacklogManagerJudge()
     mgr.force_status(wu_file, BACKLOG_INDEX, unit_id, STATUS_IN_REVIEW)
@@ -217,6 +220,20 @@ def cmd_review(unit_id: str) -> int:
         passed = judge_result.verdict == Verdict.PASS
         if not passed:
             all_passed = False
+
+        # Write judge verdict comment to the work-unit file so mark_done can verify all judges passed
+        if passed:
+            target.log_comment(
+                agent_id=f"judge/{judge.name}",
+                action="REVIEW_PASS",
+                message=judge_result.reasoning,
+            )
+        else:
+            target.log_comment(
+                agent_id=f"judge/{judge.name}",
+                action="REVIEW_FAIL",
+                message=f"{judge_result.reasoning} | Fix: {judge_result.feedback}",
+            )
 
         logger.info(
             "%s judge verdict for %s: %s", judge.name, unit_id, judge_result.verdict.value,
@@ -377,7 +394,7 @@ def cmd_validate_backlog() -> int:
     if any inconsistencies are found.
     """
     mgr = BacklogManagerJudge()
-    errors = mgr.validate(BACKLOG_INDEX, BACKLOG_ROOT)
+    errors = mgr.validate(BACKLOG_INDEX, BACKLOG_INDEX.parent)
     if not errors:
         print("Backlog integrity check passed.")
         return 0

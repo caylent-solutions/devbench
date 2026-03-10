@@ -175,6 +175,8 @@ class BacklogManagerJudge(BaseJudge):
                     errors.append(
                         f"{row_id}: status mismatch — index has '{index_status}', file has '{file_status}'"
                     )
+            else:
+                errors.append(f"{row_id}: work unit file missing '## Status:' line")
         return indexed_files
 
     def _check_orphans(

@@ -212,13 +212,14 @@ class TestCmdReview:
         with patch("devbench.cli.BacklogParser", return_value=mock_parser):
             with patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"):
                 with patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
-                    with patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
-                        with patch("devbench.cli.BacklogManagerJudge", return_value=mock_mgr):
-                            with patch("devbench.cli.CodeReviewJudge", return_value=mock_judge):
-                                with patch("devbench.cli.TestReviewJudge", return_value=mock_judge):
-                                    with patch("devbench.cli.DocReviewJudge", return_value=mock_judge):
-                                        with patch("devbench.cli.ChangesManifestJudge", return_value=mock_judge):
-                                            result = cli.cmd_review("E0-F1-S1-T2")
+                    with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+                        with patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+                            with patch("devbench.cli.BacklogManagerJudge", return_value=mock_mgr):
+                                with patch("devbench.cli.CodeReviewJudge", return_value=mock_judge):
+                                    with patch("devbench.cli.TestReviewJudge", return_value=mock_judge):
+                                        with patch("devbench.cli.DocReviewJudge", return_value=mock_judge):
+                                            with patch("devbench.cli.ChangesManifestJudge", return_value=mock_judge):
+                                                result = cli.cmd_review("E0-F1-S1-T2")
 
         assert result == 0
         mock_mgr.force_status.assert_called_once()
@@ -478,6 +479,176 @@ class TestGetPriorFeedback:
             result = cli._get_prior_feedback("E0-T1")
         assert result["code_review"] == "Relevant"
         assert "E0-T2" not in str(result)
+
+
+class TestCmdReviewWritesComments:
+    """Bug fix: cmd_review must write REVIEW_PASS/REVIEW_FAIL comments to work-unit file.
+
+    Previously cmd_review only logged to the orchestrator log; it never wrote
+    judge comments to the work-unit file.  That made mark_done (which reads
+    [REVIEW_PASS] entries from the file) always fail after a successful review.
+    """
+
+    def _make_pass_result(self, judge_name: str) -> JudgeResult:
+        return JudgeResult(
+            judge_name=judge_name,
+            verdict=Verdict.PASS,
+            reasoning="all good",
+            feedback="",
+            evidence=[],
+        )
+
+    def test_cmd_review_writes_review_pass_comments_for_all_judges(
+        self, mock_units: list[WorkUnit], tmp_path: Path
+    ) -> None:
+        wu_file = tmp_path / "backlog" / "E0-F1-S1-T2.md"
+        wu_file.parent.mkdir(parents=True, exist_ok=True)
+        wu_file.write_text("# E0-F1-S1-T2: Task\n\n## Status: in-review\n", encoding="utf-8")
+
+        judge_names = ["code_review", "test_review", "doc_review", "changes_manifest"]
+        mock_judges = []
+        for name in judge_names:
+            m = MagicMock()
+            m.name = name
+            m.previous_feedback = ""
+            m.evaluate.return_value = self._make_pass_result(name)
+            mock_judges.append(m)
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+        mock_mgr = MagicMock()
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.cli.BacklogManagerJudge", return_value=mock_mgr),
+            patch("devbench.cli.CodeReviewJudge", return_value=mock_judges[0]),
+            patch("devbench.cli.TestReviewJudge", return_value=mock_judges[1]),
+            patch("devbench.cli.DocReviewJudge", return_value=mock_judges[2]),
+            patch("devbench.cli.ChangesManifestJudge", return_value=mock_judges[3]),
+            patch("devbench.cli.resolve_repo", return_value="caylent-solutions/git-repo"),
+            patch("devbench.cli.validate_repo"),
+        ):
+            result = cli.cmd_review("E0-F1-S1-T2")
+
+        assert result == 0
+        content = wu_file.read_text(encoding="utf-8")
+        assert "[REVIEW_PASS]" in content
+        for name in judge_names:
+            assert f"[judge/{name}]" in content
+
+    def test_review_then_mark_done_succeeds(
+        self, mock_units: list[WorkUnit], tmp_path: Path
+    ) -> None:
+        """Full flow: review writes comments, mark_done reads them and succeeds."""
+        from devbench.backlog.manager import BacklogManagerJudge as RealMgr
+
+        wu_file = tmp_path / "backlog" / "E0-F1-S1-T2.md"
+        wu_file.parent.mkdir(parents=True, exist_ok=True)
+        wu_file.write_text("# E0-F1-S1-T2: Task\n\n## Status: in-review\n", encoding="utf-8")
+
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text(
+            "# Backlog\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|-----------|\n"
+            "| E0-F1-S1-T2 | Second Task | Task | in-review | none | repo |"
+            " `backlog/E0-F1-S1-T2.md` |\n",
+            encoding="utf-8",
+        )
+
+        judge_names = ["code_review", "test_review", "doc_review", "changes_manifest"]
+        mock_judges = []
+        for name in judge_names:
+            m = MagicMock()
+            m.name = name
+            m.previous_feedback = ""
+            m.evaluate.return_value = self._make_pass_result(name)
+            mock_judges.append(m)
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.cli.CodeReviewJudge", return_value=mock_judges[0]),
+            patch("devbench.cli.TestReviewJudge", return_value=mock_judges[1]),
+            patch("devbench.cli.DocReviewJudge", return_value=mock_judges[2]),
+            patch("devbench.cli.ChangesManifestJudge", return_value=mock_judges[3]),
+            patch("devbench.cli.resolve_repo", return_value="caylent-solutions/git-repo"),
+            patch("devbench.cli.validate_repo"),
+        ):
+            review_result = cli.cmd_review("E0-F1-S1-T2")
+
+        assert review_result == 0
+
+        # After review, mark_done must succeed (gate passes because comments were written)
+        real_mgr = RealMgr()
+        real_mgr.mark_done(wu_file, backlog_index, "E0-F1-S1-T2")
+        assert "## Status: done" in wu_file.read_text(encoding="utf-8")
+
+
+class TestCmdValidateBacklogPathResolution:
+    """Bug fix: cmd_validate_backlog must pass workspace root (BACKLOG_INDEX.parent) to validate(),
+    not BACKLOG_ROOT — otherwise file paths of the form 'backlog/...' get resolved as
+    BACKLOG_ROOT/backlog/... which is a double 'backlog/' and causes false 'file missing' errors.
+    """
+
+    def _make_layout(self, workspace: Path) -> tuple[Path, Path]:
+        """Create realistic layout: BACKLOG.md at workspace root, work unit in workspace/backlog/."""
+        backlog_dir = workspace / "backlog"
+        backlog_dir.mkdir(parents=True, exist_ok=True)
+        wu = backlog_dir / "E0-F1-S1-T1.md"
+        wu.write_text("# E0-F1-S1-T1: Task\n\n## Status: in-queue\n", encoding="utf-8")
+        idx = workspace / "BACKLOG.md"
+        idx.write_text(
+            "# Backlog\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Task 1 | Task | in-queue | none | repo | `backlog/E0-F1-S1-T1.md` |\n",
+            encoding="utf-8",
+        )
+        return idx, backlog_dir
+
+    def test_no_false_file_missing_errors_with_real_layout(self, tmp_path: Path) -> None:
+        """When BACKLOG_INDEX is at workspace root and BACKLOG_ROOT = workspace/backlog,
+        validate-backlog must return 0 (no false 'file missing' errors).
+        """
+        idx, backlog_dir = self._make_layout(tmp_path)
+        # Simulate production: BACKLOG_INDEX at workspace, BACKLOG_ROOT = workspace/backlog
+        with (
+            patch("devbench.cli.BACKLOG_INDEX", idx),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+        ):
+            result = cli.cmd_validate_backlog()
+        assert result == 0
+
+    def test_validate_called_with_workspace_root_not_backlog_root(self, tmp_path: Path) -> None:
+        """validate() must receive backlog_index.parent (workspace root), not BACKLOG_ROOT."""
+        idx, backlog_dir = self._make_layout(tmp_path)
+        mock_mgr = MagicMock()
+        mock_mgr.validate.return_value = []
+
+        with (
+            patch("devbench.cli.BacklogManagerJudge", return_value=mock_mgr),
+            patch("devbench.cli.BACKLOG_INDEX", idx),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+        ):
+            cli.cmd_validate_backlog()
+
+        # Second arg must be workspace root (idx.parent), not BACKLOG_ROOT (backlog_dir)
+        _, call_kwargs = mock_mgr.validate.call_args
+        positional = mock_mgr.validate.call_args.args
+        workspace_root_arg = positional[1] if len(positional) > 1 else call_kwargs.get("backlog_root")
+        assert workspace_root_arg == idx.parent
+        assert workspace_root_arg != backlog_dir
 
 
 class TestCmdValidateBacklog:

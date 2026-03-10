@@ -291,7 +291,7 @@ def main() -> None:
 
     # Pre-flight: validate backlog integrity before doing any work
     backlog_mgr_preflight = BacklogManagerJudge()
-    preflight_errors = backlog_mgr_preflight.validate(BACKLOG_INDEX, BACKLOG_ROOT)
+    preflight_errors = backlog_mgr_preflight.validate(BACKLOG_INDEX, BACKLOG_INDEX.parent)
     if preflight_errors:
         logger.error("Backlog integrity check failed — aborting:")
         for err in preflight_errors:

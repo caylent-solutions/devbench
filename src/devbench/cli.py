@@ -9,11 +9,16 @@ Usage::
 
 Commands::
 
-    status                Show backlog summary (counts by status)
-    next                  Print the next actionable work unit ID and title
-    execute <id>          Spawn a Claude Code agent to execute a work unit
-    review <id>           Run all review judges on a work unit, print JSON results
-    log <message>         Append a message to the orchestrator log file
+    status                  Show backlog summary (counts by status)
+    next                    Print the next actionable work unit ID and title
+    execute <id>            Spawn a Claude Code agent to execute a work unit
+    review <id>             Run all review judges on a work unit, print JSON results
+    security-review <id>    Run the security review judge on a work unit
+    set-status <id> <s>     Force any status (no gate — use for recovery/lifecycle transitions)
+    mark-done <id>          Mark unit as Done (enforces done-gate: all judges must have passed)
+    validate-backlog        Check backlog integrity (file existence, status sync, orphans, deps)
+    report [since]          Print progress report with velocity stats
+    log <message>           Append a message to the orchestrator log file
 
 All commands exit 0 on success, non-zero on failure. Output is structured
 for easy parsing by Claude Code or other automation.

@@ -10,6 +10,7 @@ import pytest
 
 from devbench import cli
 from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
+from devbench.constants import BACKLOG_SUBDIR
 from devbench.judges.base import JudgeResult, Verdict
 
 
@@ -187,10 +188,9 @@ class TestCmdReview:
         assert result == 1
 
     def test_returns_0_when_all_pass(
-        self, mock_units: list[WorkUnit], tmp_path: Path, capsys: pytest.CaptureFixture
+        self, mock_units: list[WorkUnit], tmp_path: Path, backlog_dir: Path, capsys: pytest.CaptureFixture
     ) -> None:
-        wu_file = tmp_path / "backlog" / "E0-F1-S1-T2.md"
-        wu_file.parent.mkdir(parents=True, exist_ok=True)
+        wu_file = backlog_dir / "E0-F1-S1-T2.md"
         wu_file.write_text("# E0-F1-S1-T2: Task\n## Status: in-review\n")
 
         mock_parser = MagicMock()
@@ -210,7 +210,7 @@ class TestCmdReview:
         mock_mgr = MagicMock()
 
         with patch("devbench.cli.BacklogParser", return_value=mock_parser):
-            with patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"):
+            with patch("devbench.cli.BACKLOG_ROOT", backlog_dir):
                 with patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
                     with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
                         with patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
@@ -240,12 +240,11 @@ class TestCmdExecute:
         assert result == 1
 
     def test_returns_0_on_in_review(
-        self, mock_units: list[WorkUnit], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+        self, mock_units: list[WorkUnit], tmp_path: Path, backlog_dir: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         from devbench.execution.executor import ExecutionResult, ExecutionStatus
 
-        wu_file = tmp_path / "backlog" / "E0-F1-S1-T2.md"
-        wu_file.parent.mkdir(parents=True, exist_ok=True)
+        wu_file = backlog_dir / "E0-F1-S1-T2.md"
         wu_file.write_text("# Task\n")
 
         mock_parser = MagicMock()
@@ -253,7 +252,7 @@ class TestCmdExecute:
         exec_result = ExecutionResult(status=ExecutionStatus.IN_REVIEW, output="done", blocker="")
 
         with patch("devbench.cli.BacklogParser", return_value=mock_parser):
-            with patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"):
+            with patch("devbench.cli.BACKLOG_ROOT", backlog_dir):
                 with patch("devbench.execution.executor.execute", return_value=exec_result):
                     result = cli.cmd_execute("E0-F1-S1-T2")
 
@@ -261,11 +260,10 @@ class TestCmdExecute:
         output = json.loads(capsys.readouterr().out)
         assert output["status"] == "in-review"
 
-    def test_returns_1_on_failure(self, mock_units: list[WorkUnit], tmp_path: Path) -> None:
+    def test_returns_1_on_failure(self, mock_units: list[WorkUnit], tmp_path: Path, backlog_dir: Path) -> None:
         from devbench.execution.executor import ExecutionResult, ExecutionStatus
 
-        wu_file = tmp_path / "backlog" / "E0-F1-S1-T2.md"
-        wu_file.parent.mkdir(parents=True, exist_ok=True)
+        wu_file = backlog_dir / "E0-F1-S1-T2.md"
         wu_file.write_text("# Task\n")
 
         mock_parser = MagicMock()
@@ -273,7 +271,7 @@ class TestCmdExecute:
         exec_result = ExecutionResult(status=ExecutionStatus.FAILED, output="error", blocker="")
 
         with patch("devbench.cli.BacklogParser", return_value=mock_parser):
-            with patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"):
+            with patch("devbench.cli.BACKLOG_ROOT", backlog_dir):
                 with patch("devbench.execution.executor.execute", return_value=exec_result):
                     result = cli.cmd_execute("E0-F1-S1-T2")
 
@@ -303,10 +301,9 @@ class TestCmdSecurityReview:
         assert result == 1
 
     def test_returns_0_when_pass(
-        self, mock_units: list[WorkUnit], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+        self, mock_units: list[WorkUnit], tmp_path: Path, backlog_dir: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        wu_file = tmp_path / "backlog" / "E0-F1-S1-T2.md"
-        wu_file.parent.mkdir(parents=True, exist_ok=True)
+        wu_file = backlog_dir / "E0-F1-S1-T2.md"
         wu_file.write_text("# Task\n")
 
         mock_parser = MagicMock()
@@ -323,7 +320,7 @@ class TestCmdSecurityReview:
         mock_judge.evaluate.return_value = pass_result
 
         with patch("devbench.cli.BacklogParser", return_value=mock_parser):
-            with patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"):
+            with patch("devbench.cli.BACKLOG_ROOT", backlog_dir):
                 with patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
                     with patch("devbench.cli.SecurityReviewJudge", return_value=mock_judge):
                         result = cli.cmd_security_review("E0-F1-S1-T2")
@@ -351,10 +348,9 @@ class TestCmdSetStatus:
         assert result == 1
 
     def test_returns_0_on_success(
-        self, mock_units: list[WorkUnit], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+        self, mock_units: list[WorkUnit], tmp_path: Path, backlog_dir: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        wu_file = tmp_path / "backlog" / "E0-F1-S1-T2.md"
-        wu_file.parent.mkdir(parents=True, exist_ok=True)
+        wu_file = backlog_dir / "E0-F1-S1-T2.md"
         wu_file.write_text("# Task\n## Status: in-queue\n")
 
         mock_parser = MagicMock()
@@ -363,7 +359,7 @@ class TestCmdSetStatus:
         mock_mgr = MagicMock()
 
         with patch("devbench.cli.BacklogParser", return_value=mock_parser):
-            with patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"):
+            with patch("devbench.cli.BACKLOG_ROOT", backlog_dir):
                 with patch("devbench.cli.BacklogManagerJudge", return_value=mock_mgr):
                     result = cli.cmd_set_status("E0-F1-S1-T2", "in-progress")
 
@@ -385,10 +381,9 @@ class TestCmdMarkDone:
         assert result == 1
 
     def test_returns_0_on_success(
-        self, mock_units: list[WorkUnit], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+        self, mock_units: list[WorkUnit], tmp_path: Path, backlog_dir: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        wu_file = tmp_path / "backlog" / "E0-F1-S1-T2.md"
-        wu_file.parent.mkdir(parents=True, exist_ok=True)
+        wu_file = backlog_dir / "E0-F1-S1-T2.md"
         wu_file.write_text("# Task\n## Status: in-review\n")
 
         mock_parser = MagicMock()
@@ -397,7 +392,7 @@ class TestCmdMarkDone:
         mock_mgr = MagicMock()
 
         with patch("devbench.cli.BacklogParser", return_value=mock_parser):
-            with patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"):
+            with patch("devbench.cli.BACKLOG_ROOT", backlog_dir):
                 with patch("devbench.cli.BacklogManagerJudge", return_value=mock_mgr):
                     result = cli.cmd_mark_done("E0-F1-S1-T2")
 
@@ -405,10 +400,9 @@ class TestCmdMarkDone:
         mock_mgr.mark_done.assert_called_once()
 
     def test_returns_1_when_done_gate_fails(
-        self, mock_units: list[WorkUnit], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+        self, mock_units: list[WorkUnit], tmp_path: Path, backlog_dir: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        wu_file = tmp_path / "backlog" / "E0-F1-S1-T2.md"
-        wu_file.parent.mkdir(parents=True, exist_ok=True)
+        wu_file = backlog_dir / "E0-F1-S1-T2.md"
         wu_file.write_text("# Task\n## Status: in-review\n")
 
         mock_parser = MagicMock()
@@ -418,7 +412,7 @@ class TestCmdMarkDone:
         mock_mgr.mark_done.side_effect = RuntimeError("not all required judges passed")
 
         with patch("devbench.cli.BacklogParser", return_value=mock_parser):
-            with patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"):
+            with patch("devbench.cli.BACKLOG_ROOT", backlog_dir):
                 with patch("devbench.cli.BacklogManagerJudge", return_value=mock_mgr):
                     result = cli.cmd_mark_done("E0-F1-S1-T2")
 
@@ -499,10 +493,9 @@ class TestCmdReviewWritesComments:
         )
 
     def test_cmd_review_writes_review_pass_comments_for_all_judges(
-        self, mock_units: list[WorkUnit], tmp_path: Path
+        self, mock_units: list[WorkUnit], tmp_path: Path, backlog_dir: Path
     ) -> None:
-        wu_file = tmp_path / "backlog" / "E0-F1-S1-T2.md"
-        wu_file.parent.mkdir(parents=True, exist_ok=True)
+        wu_file = backlog_dir / "E0-F1-S1-T2.md"
         wu_file.write_text("# E0-F1-S1-T2: Task\n\n## Status: in-review\n", encoding="utf-8")
 
         judge_names = ["code_review", "test_review", "doc_review", "changes_manifest"]
@@ -520,7 +513,7 @@ class TestCmdReviewWritesComments:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
             patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
@@ -541,13 +534,12 @@ class TestCmdReviewWritesComments:
             assert f"[judge/{name}]" in content
 
     def test_review_then_mark_done_succeeds(
-        self, mock_units: list[WorkUnit], tmp_path: Path
+        self, mock_units: list[WorkUnit], tmp_path: Path, backlog_dir: Path
     ) -> None:
         """Full flow: review writes comments, mark_done reads them and succeeds."""
         from devbench.backlog.manager import BacklogManagerJudge as RealMgr
 
-        wu_file = tmp_path / "backlog" / "E0-F1-S1-T2.md"
-        wu_file.parent.mkdir(parents=True, exist_ok=True)
+        wu_file = backlog_dir / "E0-F1-S1-T2.md"
         wu_file.write_text("# E0-F1-S1-T2: Task\n\n## Status: in-review\n", encoding="utf-8")
 
         backlog_index = tmp_path / "BACKLOG.md"
@@ -574,7 +566,7 @@ class TestCmdReviewWritesComments:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
             patch("devbench.cli.BACKLOG_INDEX", backlog_index),
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
@@ -603,7 +595,7 @@ class TestCmdValidateBacklogPathResolution:
 
     def _make_layout(self, workspace: Path) -> tuple[Path, Path]:
         """Create realistic layout: BACKLOG.md at workspace root, work unit in workspace/backlog/."""
-        backlog_dir = workspace / "backlog"
+        backlog_dir = workspace / BACKLOG_SUBDIR
         backlog_dir.mkdir(parents=True, exist_ok=True)
         wu = backlog_dir / "E0-F1-S1-T1.md"
         wu.write_text("# E0-F1-S1-T1: Task\n\n## Status: in-queue\n", encoding="utf-8")

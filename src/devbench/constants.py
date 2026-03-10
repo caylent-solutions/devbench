@@ -10,8 +10,6 @@ live in ``config.py`` with environment-variable overrides.
 
 import re
 
-from devbench.config import OUTPUT_TRUNCATION_LIMIT
-
 # ---------------------------------------------------------------------------
 # Markdown section headers
 # ---------------------------------------------------------------------------
@@ -82,7 +80,6 @@ PR_BODY_TEMPLATE: str = "Automated PR for work unit {unit_id}\n\n{description}"
 ERROR_OUTPUT_PREVIEW_CHARS: int = 1000
 RAW_RESPONSE_PREVIEW_CHARS: int = 500
 TEST_OUTPUT_TAIL_CHARS: int = 500
-PR_DESCRIPTION_CHARS: int = OUTPUT_TRUNCATION_LIMIT
 
 # ---------------------------------------------------------------------------
 # LLM response format prompt
@@ -134,6 +131,21 @@ VALID_STATUSES: dict[str, str] = {
 # Epic placeholder ID
 # ---------------------------------------------------------------------------
 EPIC_PLACEHOLDER_ID: str = "--"
+
+# ---------------------------------------------------------------------------
+# Subdirectory name under the backlog root where work-unit files live.
+# ---------------------------------------------------------------------------
+BACKLOG_SUBDIR: str = "backlog"
+
+# All values that mean "no dependency" in the BACKLOG.md dependencies column.
+# Includes DEPENDENCY_NONE_VALUE, EPIC_PLACEHOLDER_ID, the separator used in
+# some tables, and empty string.
+DEPENDENCY_NONE_VALUES: frozenset[str] = frozenset({
+    DEPENDENCY_NONE_VALUE,  # "none"
+    EPIC_PLACEHOLDER_ID,    # "--"
+    "---",
+    "",
+})
 
 # ---------------------------------------------------------------------------
 # Required review judge names for the done-gate check (4.1)

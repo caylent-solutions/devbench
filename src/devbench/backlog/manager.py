@@ -22,8 +22,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from devbench.constants import (
+    BACKLOG_STATUS_RE,
+    BACKLOG_SUBDIR,
     COMMENT_ENTRY_TEMPLATE,
     COMMENTS_SECTION_HEADER,
+    DEPENDENCY_NONE_VALUES,
     REVIEW_JUDGE_NAMES,
     STATUS_BLOCKED,
     STATUS_DONE,
@@ -120,18 +123,18 @@ class BacklogManagerJudge(BaseJudge):
         self._set_status(work_unit_path, backlog_index, unit_id, STATUS_BLOCKED)
         self._append_comment(work_unit_path, "BLOCKED", reason)
 
-    def validate(self, backlog_index: Path, backlog_root: Path) -> list[str]:
+    def validate(self, backlog_index: Path, workspace_root: Path) -> list[str]:
         """Check backlog integrity and return a list of error messages.
 
         Checks performed:
         1. Every row in BACKLOG.md has a corresponding work unit file.
         2. Every work unit file's status matches the index.
-        3. No orphaned work unit files (in backlog_root but not in index).
+        3. No orphaned work unit files (in workspace_root/backlog/ but not in index).
         4. All dependency IDs reference real work unit IDs in the index.
 
         Args:
             backlog_index: Path to the ``BACKLOG.md`` index file.
-            backlog_root: Directory containing work unit ``.md`` files.
+            workspace_root: Workspace root containing BACKLOG.md and the backlog/ subdirectory.
 
         Returns:
             A list of error strings. Empty list means the backlog is valid.
@@ -140,27 +143,25 @@ class BacklogManagerJudge(BaseJudge):
         known_ids = {row_id for row_id, _, _ in rows if row_id and not row_id.startswith("-")}
 
         errors: list[str] = []
-        indexed_files = self._check_files_and_statuses(rows, backlog_root, errors)
-        self._check_orphans(backlog_root, indexed_files, errors)
+        indexed_files = self._check_files_and_statuses(rows, workspace_root, errors)
+        self._check_orphans(workspace_root, indexed_files, errors)
         self._check_dependencies(backlog_index, known_ids, errors)
         return errors
 
     def _check_files_and_statuses(
         self,
         rows: list[tuple[str, str, str]],
-        backlog_root: Path,
+        workspace_root: Path,
         errors: list[str],
     ) -> set[Path]:
-        """Check checks 1 & 2: file existence and status consistency."""
-        from devbench.constants import BACKLOG_STATUS_RE
-
+        """Check file existence and status consistency (checks 1 and 2)."""
         indexed_files: set[Path] = set()
         for row_id, index_status, file_path_str in rows:
             if not row_id or row_id.startswith("-") or row_id.lower() == "id":
                 continue
             if not file_path_str:
                 continue
-            wu_path = backlog_root / file_path_str
+            wu_path = workspace_root / file_path_str
             indexed_files.add(wu_path.resolve())
 
             if not wu_path.exists():
@@ -180,10 +181,10 @@ class BacklogManagerJudge(BaseJudge):
         return indexed_files
 
     def _check_orphans(
-        self, backlog_root: Path, indexed_files: set[Path], errors: list[str]
+        self, workspace_root: Path, indexed_files: set[Path], errors: list[str]
     ) -> None:
         """Check 3: no orphaned work unit files."""
-        backlog_dir = backlog_root / "backlog"
+        backlog_dir = workspace_root / BACKLOG_SUBDIR
         if backlog_dir.exists():
             for wu_file in backlog_dir.glob("*.md"):
                 if wu_file.resolve() not in indexed_files:
@@ -193,7 +194,6 @@ class BacklogManagerJudge(BaseJudge):
         self, backlog_index: Path, known_ids: set[str], errors: list[str]
     ) -> None:
         """Check 4: all dependency IDs reference real IDs."""
-        _dep_sentinel = {"none", "---", "--", ""}
         content = backlog_index.read_text(encoding="utf-8")
         for line in content.splitlines():
             if not line.strip().startswith("|"):
@@ -207,7 +207,7 @@ class BacklogManagerJudge(BaseJudge):
             dep_cell = cells[5] if len(cells) > 5 else ""
             for raw_dep in dep_cell.split(","):
                 dep_id = raw_dep.strip()
-                if dep_id and dep_id.lower() not in _dep_sentinel and dep_id not in known_ids:
+                if dep_id and dep_id.lower() not in DEPENDENCY_NONE_VALUES and dep_id not in known_ids:
                     errors.append(
                         f"{row_id}: dependency '{dep_id}' not found in backlog index"
                     )

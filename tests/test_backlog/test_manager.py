@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from devbench.backlog.manager import VALID_STATUSES, BacklogManagerJudge
+from devbench.constants import REVIEW_JUDGE_NAMES
 from devbench.judges.base import Verdict
 
 
@@ -48,7 +49,7 @@ def backlog_index_lowercase(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def backlog_with_hierarchy(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+def backlog_with_hierarchy(tmp_path: Path, backlog_dir: Path) -> tuple[Path, Path, Path, Path]:
     """Create BACKLOG.md with story + tasks, plus work unit files for all."""
     content = """\
 # Backlog
@@ -64,9 +65,6 @@ def backlog_with_hierarchy(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
 """
     index_path = tmp_path / "BACKLOG.md"
     index_path.write_text(content)
-
-    backlog_dir = tmp_path / "backlog"
-    backlog_dir.mkdir()
 
     t2_file = backlog_dir / "E0-F1-S1-T2.md"
     t2_file.write_text("# E0-F1-S1-T2\n\n## Status: in-queue\n")
@@ -163,12 +161,19 @@ class TestForceStatus:
             judge.force_status(tmp_work_unit_file, tmp_path / "missing.md", "E0-F1-S1-T1", "done")
 
 
-_ALL_JUDGES_PASSED_COMMENTS = (
-    "[2024-01-01 00:00 UTC] [judge/code_review] [REVIEW_PASS] ok\n"
-    "[2024-01-01 00:01 UTC] [judge/test_review] [REVIEW_PASS] ok\n"
-    "[2024-01-01 00:02 UTC] [judge/doc_review] [REVIEW_PASS] ok\n"
-    "[2024-01-01 00:03 UTC] [judge/changes_manifest] [REVIEW_PASS] ok\n"
-)
+def _judge_comment(judge_name: str, action: str, msg: str = "ok") -> str:
+    """Return a single formatted judge comment line (no trailing newline)."""
+    return f"[2024-01-01 00:00 UTC] [judge/{judge_name}] [{action}] {msg}"
+
+
+def _all_judges_pass_block() -> str:
+    """Return comment lines for all four required judges passing."""
+    return "\n".join(
+        _judge_comment(j, "REVIEW_PASS") for j in sorted(REVIEW_JUDGE_NAMES)
+    ) + "\n"
+
+
+_ALL_JUDGES_PASSED_COMMENTS = _all_judges_pass_block()
 
 
 class TestMarkDone:
@@ -264,7 +269,7 @@ class TestRollupParentStatus:
         story_content = story_file.read_text()
         assert "## Status: in-queue" in story_content
 
-    def test_cascades_to_feature_when_all_stories_done(self, tmp_path: Path) -> None:
+    def test_cascades_to_feature_when_all_stories_done(self, tmp_path: Path, backlog_dir: Path) -> None:
         content = """\
 # Backlog
 
@@ -280,9 +285,6 @@ class TestRollupParentStatus:
 """
         index_path = tmp_path / "BACKLOG.md"
         index_path.write_text(content)
-
-        backlog_dir = tmp_path / "backlog"
-        backlog_dir.mkdir()
 
         t_file = backlog_dir / "E0-F1-S2-T1.md"
         t_file.write_text("# E0-F1-S2-T1\n\n## Status: in-queue\n")
@@ -353,23 +355,17 @@ class TestLastRoundAllPassed:
         return wu
 
     def test_returns_true_when_all_required_judges_passed(self, tmp_path: Path) -> None:
-        comments = (
-            "[2024-01-01 00:00 UTC] [judge/code_review] [REVIEW_PASS] looks good\n"
-            "[2024-01-01 00:01 UTC] [judge/test_review] [REVIEW_PASS] tests pass\n"
-            "[2024-01-01 00:02 UTC] [judge/doc_review] [REVIEW_PASS] docs ok\n"
-            "[2024-01-01 00:03 UTC] [judge/changes_manifest] [REVIEW_PASS] manifest ok\n"
-        )
-        wu = self._make_wu_with_comments(tmp_path, comments)
+        wu = self._make_wu_with_comments(tmp_path, _all_judges_pass_block())
         judge = BacklogManagerJudge()
         assert judge._last_round_all_passed(wu) is True
 
     def test_returns_false_when_judge_missing(self, tmp_path: Path) -> None:
-        comments = (
-            "[2024-01-01 00:00 UTC] [judge/code_review] [REVIEW_PASS] looks good\n"
-            "[2024-01-01 00:01 UTC] [judge/test_review] [REVIEW_PASS] tests pass\n"
-            "[2024-01-01 00:02 UTC] [judge/doc_review] [REVIEW_PASS] docs ok\n"
+        comments = "\n".join([
+            _judge_comment("code_review", "REVIEW_PASS"),
+            _judge_comment("test_review", "REVIEW_PASS"),
+            _judge_comment("doc_review", "REVIEW_PASS"),
             # changes_manifest missing
-        )
+        ]) + "\n"
         wu = self._make_wu_with_comments(tmp_path, comments)
         judge = BacklogManagerJudge()
         assert judge._last_round_all_passed(wu) is False
@@ -378,11 +374,8 @@ class TestLastRoundAllPassed:
         """All 4 judges passed in round 1, but then REVIEW_REJECTED — round 2 has no passes."""
         comments = (
             # Round 1 passes (older, before REVIEW_REJECTED)
-            "[2024-01-01 00:00 UTC] [judge/code_review] [REVIEW_PASS] ok\n"
-            "[2024-01-01 00:01 UTC] [judge/test_review] [REVIEW_PASS] ok\n"
-            "[2024-01-01 00:02 UTC] [judge/doc_review] [REVIEW_PASS] ok\n"
-            "[2024-01-01 00:03 UTC] [judge/changes_manifest] [REVIEW_PASS] ok\n"
-            "[2024-01-01 00:04 UTC] [orchestrator] [REVIEW_REJECTED] attempt 1 rejected\n"
+            _all_judges_pass_block()
+            + "[2024-01-01 00:04 UTC] [orchestrator] [REVIEW_REJECTED] attempt 1 rejected\n"
             # Round 2 has no REVIEW_PASS entries yet (only rejection so far)
         )
         wu = self._make_wu_with_comments(tmp_path, comments)
@@ -393,13 +386,10 @@ class TestLastRoundAllPassed:
         """Round 2 passes after a prior round was rejected."""
         comments = (
             # Round 1 — rejected
-            "[2024-01-01 00:00 UTC] [judge/code_review] [REVIEW_PASS] ok\n"
-            "[2024-01-01 00:01 UTC] [orchestrator] [REVIEW_REJECTED] attempt 1 rejected\n"
+            _judge_comment("code_review", "REVIEW_PASS") + "\n"
+            + "[2024-01-01 00:01 UTC] [orchestrator] [REVIEW_REJECTED] attempt 1 rejected\n"
             # Round 2 — all pass
-            "[2024-01-01 00:02 UTC] [judge/code_review] [REVIEW_PASS] ok\n"
-            "[2024-01-01 00:03 UTC] [judge/test_review] [REVIEW_PASS] ok\n"
-            "[2024-01-01 00:04 UTC] [judge/doc_review] [REVIEW_PASS] ok\n"
-            "[2024-01-01 00:05 UTC] [judge/changes_manifest] [REVIEW_PASS] ok\n"
+            + _all_judges_pass_block()
         )
         wu = self._make_wu_with_comments(tmp_path, comments)
         judge = BacklogManagerJudge()
@@ -434,20 +424,14 @@ class TestMarkDoneGate:
         return idx
 
     def test_mark_done_raises_when_judges_not_all_passed(self, tmp_path: Path) -> None:
-        wu = self._make_wu(tmp_path, "[2024-01-01] [judge/code_review] [REVIEW_PASS] ok\n")
+        wu = self._make_wu(tmp_path, _judge_comment("code_review", "REVIEW_PASS") + "\n")
         idx = self._make_index(tmp_path)
         judge = BacklogManagerJudge()
         with pytest.raises(RuntimeError, match="not all required judges passed"):
             judge.mark_done(wu, idx, "E0-F1-S1-T1")
 
     def test_mark_done_succeeds_when_all_judges_passed(self, tmp_path: Path) -> None:
-        comments = (
-            "[2024-01-01 00:00 UTC] [judge/code_review] [REVIEW_PASS] ok\n"
-            "[2024-01-01 00:01 UTC] [judge/test_review] [REVIEW_PASS] ok\n"
-            "[2024-01-01 00:02 UTC] [judge/doc_review] [REVIEW_PASS] ok\n"
-            "[2024-01-01 00:03 UTC] [judge/changes_manifest] [REVIEW_PASS] ok\n"
-        )
-        wu = self._make_wu(tmp_path, comments)
+        wu = self._make_wu(tmp_path, _all_judges_pass_block())
         idx = self._make_index(tmp_path)
         judge = BacklogManagerJudge()
         judge.mark_done(wu, idx, "E0-F1-S1-T1")
@@ -473,9 +457,7 @@ class TestValidate:
         wu.write_text(f"# {unit_id}\n\n## Status: {status}\n", encoding="utf-8")
         return wu
 
-    def test_valid_backlog_returns_no_errors(self, tmp_path: Path) -> None:
-        backlog_dir = tmp_path / "backlog"
-        backlog_dir.mkdir()
+    def test_valid_backlog_returns_no_errors(self, tmp_path: Path, backlog_dir: Path) -> None:
         self._make_wu(backlog_dir, "E0-F1-S1-T1", "in-queue")
         self._make_wu(backlog_dir, "E0-F1-S1-T2", "done")
         idx = self._make_index(
@@ -497,9 +479,7 @@ class TestValidate:
         errors = judge.validate(idx, tmp_path)
         assert any("E0-F1-S1-T1" in e and "missing" in e.lower() for e in errors)
 
-    def test_status_mismatch_is_reported(self, tmp_path: Path) -> None:
-        backlog_dir = tmp_path / "backlog"
-        backlog_dir.mkdir()
+    def test_status_mismatch_is_reported(self, tmp_path: Path, backlog_dir: Path) -> None:
         # Index says "in-queue" but file says "done"
         self._make_wu(backlog_dir, "E0-F1-S1-T1", "done")
         idx = self._make_index(
@@ -510,9 +490,7 @@ class TestValidate:
         errors = judge.validate(idx, tmp_path)
         assert any("E0-F1-S1-T1" in e and "status" in e.lower() for e in errors)
 
-    def test_orphaned_work_unit_file_is_reported(self, tmp_path: Path) -> None:
-        backlog_dir = tmp_path / "backlog"
-        backlog_dir.mkdir()
+    def test_orphaned_work_unit_file_is_reported(self, tmp_path: Path, backlog_dir: Path) -> None:
         self._make_wu(backlog_dir, "E0-F1-S1-T1", "in-queue")
         # Extra file not in index
         self._make_wu(backlog_dir, "E0-F1-S1-T2", "in-queue")
@@ -524,9 +502,7 @@ class TestValidate:
         errors = judge.validate(idx, tmp_path)
         assert any("E0-F1-S1-T2" in e and "orphan" in e.lower() for e in errors)
 
-    def test_invalid_dependency_id_is_reported(self, tmp_path: Path) -> None:
-        backlog_dir = tmp_path / "backlog"
-        backlog_dir.mkdir()
+    def test_invalid_dependency_id_is_reported(self, tmp_path: Path, backlog_dir: Path) -> None:
         self._make_wu(backlog_dir, "E0-F1-S1-T2", "in-queue")
         # T2 depends on T1 but T1 is not in the index
         idx = self._make_index(
@@ -537,10 +513,8 @@ class TestValidate:
         errors = judge.validate(idx, tmp_path)
         assert any("E0-F1-S1-T1" in e and "depend" in e.lower() for e in errors)
 
-    def test_work_unit_file_missing_status_line_is_reported(self, tmp_path: Path) -> None:
+    def test_work_unit_file_missing_status_line_is_reported(self, tmp_path: Path, backlog_dir: Path) -> None:
         """Bug fix: work unit file with no ## Status: line must produce an error, not be silently skipped."""
-        backlog_dir = tmp_path / "backlog"
-        backlog_dir.mkdir()
         wu = backlog_dir / "E0-F1-S1-T1.md"
         wu.write_text("# E0-F1-S1-T1: Task\n\n## Description\nNo status line here.\n", encoding="utf-8")
         idx = self._make_index(

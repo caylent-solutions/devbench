@@ -9,6 +9,8 @@ import os
 from enum import StrEnum
 from pathlib import Path
 
+from devbench.constants import BACKLOG_SUBDIR
+
 # ---------------------------------------------------------------------------
 # Repository allow-list
 # ---------------------------------------------------------------------------
@@ -62,7 +64,7 @@ def resolve_repo(short_or_full: str) -> str:
 # ---------------------------------------------------------------------------
 # Backlog paths
 # ---------------------------------------------------------------------------
-BACKLOG_ROOT: Path = Path(os.environ.get("JUDGE_BACKLOG_ROOT", str(WORKSPACE_ROOT / "backlog")))
+BACKLOG_ROOT: Path = Path(os.environ.get("JUDGE_BACKLOG_ROOT", str(WORKSPACE_ROOT / BACKLOG_SUBDIR)))
 BACKLOG_INDEX: Path = Path(os.environ.get("JUDGE_BACKLOG_INDEX", str(WORKSPACE_ROOT / "BACKLOG.md")))
 
 # ---------------------------------------------------------------------------

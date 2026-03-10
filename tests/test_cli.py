@@ -459,6 +459,37 @@ class TestGetPriorFeedback:
         assert "E0-T2" not in str(result)
 
 
+class TestCmdValidateBacklog:
+    """Test cmd_validate_backlog command."""
+
+    def test_returns_0_when_backlog_is_valid(self, tmp_path: Path) -> None:
+        mock_mgr = MagicMock()
+        mock_mgr.validate.return_value = []
+
+        with patch("devbench.cli.BacklogManagerJudge", return_value=mock_mgr):
+            with patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
+                with patch("devbench.cli.BACKLOG_ROOT", tmp_path):
+                    result = cli.cmd_validate_backlog()
+
+        assert result == 0
+
+    def test_returns_1_and_prints_errors_when_invalid(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        mock_mgr = MagicMock()
+        mock_mgr.validate.return_value = ["E0-T1: work unit file missing", "E0-T2: status mismatch"]
+
+        with patch("devbench.cli.BacklogManagerJudge", return_value=mock_mgr):
+            with patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
+                with patch("devbench.cli.BACKLOG_ROOT", tmp_path):
+                    result = cli.cmd_validate_backlog()
+
+        assert result == 1
+        output = capsys.readouterr().out
+        assert "E0-T1" in output
+        assert "E0-T2" in output
+
+
 class TestMain:
     """Test main argument parsing."""
 

@@ -333,6 +333,29 @@ def cmd_mark_done(unit_id: str) -> int:
     return cmd_set_status(unit_id, "done")
 
 
+def cmd_validate_backlog() -> int:
+    """Validate backlog integrity and print any inconsistencies.
+
+    Checks:
+    - Every index row has a corresponding work unit file.
+    - Every work unit file's status matches the index.
+    - No orphaned work unit files.
+    - All dependency IDs reference real work unit IDs.
+
+    Exits 0 if the backlog is consistent; 1 with actionable error messages
+    if any inconsistencies are found.
+    """
+    mgr = BacklogManagerJudge()
+    errors = mgr.validate(BACKLOG_INDEX, BACKLOG_ROOT)
+    if not errors:
+        print("Backlog integrity check passed.")
+        return 0
+    print(f"Backlog integrity check FAILED ({len(errors)} error(s)):")
+    for error in errors:
+        print(f"  ERROR: {error}")
+    return 1
+
+
 def cmd_report(since: str = "") -> int:
     """Print a formatted progress report with velocity and completion stats."""
     from datetime import datetime
@@ -408,6 +431,7 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
     "security-review": (cmd_security_review, 1, "Security review: security-review <id>"),
     "set-status": (cmd_set_status, 2, "Set status: set-status <id> <status>"),
     "mark-done": (cmd_mark_done, 1, "Mark done: mark-done <id>"),
+    "validate-backlog": (cmd_validate_backlog, 0, "Validate backlog integrity"),
     "log": (cmd_log, 1, "Log a message: log <message>"),
     "report": (cmd_report, 0, "Progress report: report [since-timestamp]"),
 }

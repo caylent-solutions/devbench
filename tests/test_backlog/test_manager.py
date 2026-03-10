@@ -446,6 +446,90 @@ class TestMarkDoneGate:
         assert "## Status: done" in wu.read_text(encoding="utf-8")
 
 
+class TestValidate:
+    """Tests for BacklogManagerJudge.validate() backlog integrity checks."""
+
+    def _make_index(self, tmp_path: Path, rows: str) -> Path:
+        idx = tmp_path / "BACKLOG.md"
+        idx.write_text(
+            "# Backlog\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|-----------|\n"
+            + rows,
+            encoding="utf-8",
+        )
+        return idx
+
+    def _make_wu(self, backlog_dir: Path, unit_id: str, status: str = "in-queue") -> Path:
+        wu = backlog_dir / f"{unit_id}.md"
+        wu.write_text(f"# {unit_id}\n\n## Status: {status}\n", encoding="utf-8")
+        return wu
+
+    def test_valid_backlog_returns_no_errors(self, tmp_path: Path) -> None:
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        self._make_wu(backlog_dir, "E0-F1-S1-T1", "in-queue")
+        self._make_wu(backlog_dir, "E0-F1-S1-T2", "done")
+        idx = self._make_index(
+            tmp_path,
+            "| E0-F1-S1-T1 | Task 1 | Task | in-queue | none | repo | `backlog/E0-F1-S1-T1.md` |\n"
+            "| E0-F1-S1-T2 | Task 2 | Task | done | E0-F1-S1-T1 | repo | `backlog/E0-F1-S1-T2.md` |\n",
+        )
+        judge = BacklogManagerJudge()
+        errors = judge.validate(idx, tmp_path)
+        assert errors == []
+
+    def test_missing_work_unit_file_is_reported(self, tmp_path: Path) -> None:
+        # Index references a file that doesn't exist
+        idx = self._make_index(
+            tmp_path,
+            "| E0-F1-S1-T1 | Task 1 | Task | in-queue | none | repo | `backlog/E0-F1-S1-T1.md` |\n",
+        )
+        judge = BacklogManagerJudge()
+        errors = judge.validate(idx, tmp_path)
+        assert any("E0-F1-S1-T1" in e and "missing" in e.lower() for e in errors)
+
+    def test_status_mismatch_is_reported(self, tmp_path: Path) -> None:
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        # Index says "in-queue" but file says "done"
+        self._make_wu(backlog_dir, "E0-F1-S1-T1", "done")
+        idx = self._make_index(
+            tmp_path,
+            "| E0-F1-S1-T1 | Task 1 | Task | in-queue | none | repo | `backlog/E0-F1-S1-T1.md` |\n",
+        )
+        judge = BacklogManagerJudge()
+        errors = judge.validate(idx, tmp_path)
+        assert any("E0-F1-S1-T1" in e and "status" in e.lower() for e in errors)
+
+    def test_orphaned_work_unit_file_is_reported(self, tmp_path: Path) -> None:
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        self._make_wu(backlog_dir, "E0-F1-S1-T1", "in-queue")
+        # Extra file not in index
+        self._make_wu(backlog_dir, "E0-F1-S1-T2", "in-queue")
+        idx = self._make_index(
+            tmp_path,
+            "| E0-F1-S1-T1 | Task 1 | Task | in-queue | none | repo | `backlog/E0-F1-S1-T1.md` |\n",
+        )
+        judge = BacklogManagerJudge()
+        errors = judge.validate(idx, tmp_path)
+        assert any("E0-F1-S1-T2" in e and "orphan" in e.lower() for e in errors)
+
+    def test_invalid_dependency_id_is_reported(self, tmp_path: Path) -> None:
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        self._make_wu(backlog_dir, "E0-F1-S1-T2", "in-queue")
+        # T2 depends on T1 but T1 is not in the index
+        idx = self._make_index(
+            tmp_path,
+            "| E0-F1-S1-T2 | Task 2 | Task | in-queue | E0-F1-S1-T1 | repo | `backlog/E0-F1-S1-T2.md` |\n",
+        )
+        judge = BacklogManagerJudge()
+        errors = judge.validate(idx, tmp_path)
+        assert any("E0-F1-S1-T1" in e and "depend" in e.lower() for e in errors)
+
+
 class TestEvaluateNoop:
     """Test that evaluate returns PASS as a no-op."""
 

@@ -364,9 +364,27 @@ class TestMain:
         mock_parser.find_next_actionable.return_value = None
         mock_parser.all_done.return_value = True
 
+        mock_mgr = MagicMock()
+        mock_mgr.validate.return_value = []
+
         with patch(f"{_ORC}.setup_all_repos", return_value={}):
             with patch(f"{_ORC}.BacklogParser", return_value=mock_parser):
-                main()
+                with patch(f"{_ORC}.BacklogManagerJudge", return_value=mock_mgr):
+                    main()
+
+    def test_preflight_validation_aborts_on_errors(self) -> None:
+        """Orchestrator exits early if backlog validation fails."""
+        from devbench.execution.orchestrator import main
+
+        mock_mgr = MagicMock()
+        mock_mgr.validate.return_value = ["E0-T1: work unit file missing"]
+
+        with patch(f"{_ORC}.setup_all_repos", return_value={}):
+            with patch(f"{_ORC}.BacklogManagerJudge", return_value=mock_mgr):
+                with patch(f"{_ORC}.BacklogParser") as mock_parser_cls:
+                    main()
+                    # BacklogParser.parse_index should never be called — we aborted early
+                    mock_parser_cls.return_value.parse_index.assert_not_called()
 
     def test_deadlock_detection(self) -> None:
         from devbench.execution.orchestrator import main
@@ -377,9 +395,13 @@ class TestMain:
         mock_parser.all_done.return_value = False
         mock_parser.get_blocked_units.return_value = []
 
+        mock_mgr = MagicMock()
+        mock_mgr.validate.return_value = []
+
         with patch(f"{_ORC}.setup_all_repos", return_value={}):
             with patch(f"{_ORC}.BacklogParser", return_value=mock_parser):
-                main()
+                with patch(f"{_ORC}.BacklogManagerJudge", return_value=mock_mgr):
+                    main()
 
     def test_processes_one_unit_then_done(self, tmp_path: Path) -> None:
         from devbench.execution.orchestrator import main
@@ -398,10 +420,14 @@ class TestMain:
         mock_parser.find_next_actionable.side_effect = find_next
         mock_parser.all_done.return_value = True
 
+        mock_mgr = MagicMock()
+        mock_mgr.validate.return_value = []
+
         with patch(f"{_ORC}.setup_all_repos", return_value={}):
             with patch(f"{_ORC}.BacklogParser", return_value=mock_parser):
-                with patch(f"{_ORC}.process_work_unit", return_value=True):
-                    main()
+                with patch(f"{_ORC}.BacklogManagerJudge", return_value=mock_mgr):
+                    with patch(f"{_ORC}.process_work_unit", return_value=True):
+                        main()
 
     def test_blocked_units_logged(self) -> None:
         from devbench.execution.orchestrator import main
@@ -414,6 +440,10 @@ class TestMain:
         blocked.id = "T1"
         mock_parser.get_blocked_units.return_value = [blocked]
 
+        mock_mgr = MagicMock()
+        mock_mgr.validate.return_value = []
+
         with patch(f"{_ORC}.setup_all_repos", return_value={}):
             with patch(f"{_ORC}.BacklogParser", return_value=mock_parser):
-                main()
+                with patch(f"{_ORC}.BacklogManagerJudge", return_value=mock_mgr):
+                    main()

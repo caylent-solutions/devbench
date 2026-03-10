@@ -287,6 +287,15 @@ def main() -> None:
     """Main orchestrator loop."""
     logger.info("Starting autonomous backlog execution")
 
+    # Pre-flight: validate backlog integrity before doing any work
+    backlog_mgr_preflight = BacklogManagerJudge()
+    preflight_errors = backlog_mgr_preflight.validate(BACKLOG_INDEX, BACKLOG_ROOT)
+    if preflight_errors:
+        logger.error("Backlog integrity check failed — aborting:")
+        for err in preflight_errors:
+            logger.error("  %s", err)
+        return
+
     # Phase 1: Setup GitHub security
     logger.info("Setting up GitHub security features on all repos")
     security_results = setup_all_repos()

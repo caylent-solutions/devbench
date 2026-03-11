@@ -86,6 +86,12 @@ class TestParseLlmResponse:
 class TestLlmEvaluate:
     """Test _llm_evaluate method with mocked Anthropic SDK."""
 
+    @pytest.fixture(autouse=True)
+    def disable_bedrock(self):
+        """Force USE_BEDROCK=False so tests always exercise the Anthropic API path."""
+        with patch("devbench.judges.base.USE_BEDROCK", False):
+            yield
+
     def test_returns_pass_on_valid_response(self) -> None:
         judge = _ConcreteJudge("test_judge")
         mock_message = MagicMock()

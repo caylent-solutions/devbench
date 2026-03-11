@@ -9,12 +9,6 @@ import re
 import subprocess
 from pathlib import Path
 
-# Allowlist pattern for git branch names: starts with alphanumeric, allows
-# alphanumerics, dots, hyphens, underscores, and single forward slashes.
-# Consecutive special chars (e.g. '//', '..', '/-') are rejected to match
-# git ref naming rules (git-check-ref-format).
-_BRANCH_RE = re.compile(r"^[a-zA-Z0-9]([a-zA-Z0-9_]|[.\-/][a-zA-Z0-9_])*$")
-
 from devbench.config import (
     GH_API_TIMEOUT,
     GITHUB_CHECK_TIMEOUT_SECONDS,
@@ -27,6 +21,11 @@ from devbench.config import (
 from devbench.config_loader import get_configured_default_branch
 from devbench.judges.base import BaseJudge, JudgeResult, Verdict
 
+# Allowlist pattern for git branch names: starts with alphanumeric, allows
+# alphanumerics, dots, hyphens, underscores, and single forward slashes.
+# Consecutive special chars (e.g. '//', '..', '/-') are rejected to match
+# git ref naming rules (git-check-ref-format).
+_BRANCH_RE = re.compile(r"^[a-zA-Z0-9]([a-zA-Z0-9_]|[.\-/][a-zA-Z0-9_])*$")
 
 class GitOpsJudge(BaseJudge):
     """Handles git commit, push, PR creation, merging, tagging, and CI checks."""

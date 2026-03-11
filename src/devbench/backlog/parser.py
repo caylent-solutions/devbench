@@ -194,7 +194,7 @@ class BacklogParser:
 
             if not raw_file_path:
                 raise ValueError(f"Work unit '{effective_id}' has no file path in BACKLOG.md")
-            file_path = Path(raw_file_path)
+            file_path = (self._backlog_root.parent / raw_file_path).resolve()
 
             units.append(
                 WorkUnit(

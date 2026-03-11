@@ -52,6 +52,14 @@ class TestParseIndex:
         feature_units = [u for u in units if u.unit_type is WorkUnitType.FEATURE]
         assert len(feature_units) == 1
 
+        # file_path must be absolute and rooted at the workspace root (backlog_root.parent)
+        workspace_root = mock_backlog_index.parent.parent
+        for unit in units:
+            assert unit.file_path.is_absolute(), f"{unit.id}: file_path is not absolute: {unit.file_path}"
+            assert unit.file_path.is_relative_to(workspace_root), (
+                f"{unit.id}: file_path {unit.file_path} is not under workspace root {workspace_root}"
+            )
+
     def test_parse_index_raises_file_not_found(self, tmp_path: Path) -> None:
         parser = BacklogParser(
             backlog_root=tmp_path,

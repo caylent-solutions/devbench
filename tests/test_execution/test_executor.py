@@ -21,7 +21,7 @@ class TestBuildPrompt:
 
     def test_basic_prompt_contains_work_unit_path(self, tmp_path: Path) -> None:
         wu_path = tmp_path / "E0-F1-S1-T1.md"
-        prompt = _build_prompt(wu_path)
+        prompt = _build_prompt(wu_path, repo_path=tmp_path)
 
         assert str(wu_path) in prompt
         assert "CLAUDE.md" in prompt
@@ -31,21 +31,21 @@ class TestBuildPrompt:
 
     def test_prompt_does_not_contain_feedback_when_empty(self, tmp_path: Path) -> None:
         wu_path = tmp_path / "task.md"
-        prompt = _build_prompt(wu_path)
+        prompt = _build_prompt(wu_path, repo_path=tmp_path)
 
         assert "Previous attempt was rejected" not in prompt
 
     def test_prompt_includes_feedback_when_provided(self, tmp_path: Path) -> None:
         wu_path = tmp_path / "task.md"
         feedback = "Code review failed: hardcoded sleep detected"
-        prompt = _build_prompt(wu_path, feedback=feedback)
+        prompt = _build_prompt(wu_path, repo_path=tmp_path, feedback=feedback)
 
         assert "Previous attempt was rejected" in prompt
         assert feedback in prompt
 
     def test_prompt_contains_execution_instructions(self, tmp_path: Path) -> None:
         wu_path = tmp_path / "task.md"
-        prompt = _build_prompt(wu_path)
+        prompt = _build_prompt(wu_path, repo_path=tmp_path)
 
         assert "in-review" in prompt.lower()
         assert "comments" in prompt.lower()
@@ -53,7 +53,7 @@ class TestBuildPrompt:
 
     def test_prompt_includes_all_required_file_references(self, tmp_path: Path) -> None:
         wu_path = tmp_path / "work.md"
-        prompt = _build_prompt(wu_path)
+        prompt = _build_prompt(wu_path, repo_path=tmp_path)
 
         # Should reference CLAUDE.md, AGENT-INSTRUCTIONS.md, and the work unit
         assert "CLAUDE.md" in prompt

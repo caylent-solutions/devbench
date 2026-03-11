@@ -44,9 +44,15 @@ class ExecutionResult:
 _EXECUTOR_PROMPT_TEMPLATE = load_prompt("executor")
 
 
-def _build_prompt(work_unit_path: Path, feedback: str = "") -> str:
+def _build_prompt(work_unit_path: Path, repo_path: Path, feedback: str = "") -> str:
     """Build the prompt to send to Claude Code for executing a work unit."""
-    prompt = _EXECUTOR_PROMPT_TEMPLATE.format(work_unit_path=work_unit_path)
+    from devbench.config import WORKSPACE_ROOT
+
+    prompt = _EXECUTOR_PROMPT_TEMPLATE.format(
+        work_unit_path=work_unit_path,
+        repo_path=repo_path,
+        workspace_root=WORKSPACE_ROOT,
+    )
 
     if feedback:
         prompt += "\n\nIMPORTANT: Previous attempt was rejected by judges. Fix these issues:\n" + feedback
@@ -94,7 +100,7 @@ def execute(
     if repo_path is None:
         raise ValueError(f"No local path configured for repo: {repo}")
 
-    prompt = _build_prompt(work_unit_path, feedback)
+    prompt = _build_prompt(work_unit_path, repo_path, feedback)
 
     cmd = [
         "claude",

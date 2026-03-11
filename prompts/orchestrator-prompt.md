@@ -56,10 +56,13 @@ If the result is `NO_ACTIONABLE`, report the situation (blocked units, in-progre
 
 YOU are the development agent. Implement the work unit directly using your built-in tools.
 
-Log what you're doing:
+Log what you're doing and set the status to in-progress immediately:
 ```bash
 uv run devbench log "Starting execution of <unit-id>"
+uv run devbench set-status <unit-id> in-progress
 ```
+
+> **Status mismatch warning:** If a status mismatch warning appears after the `set-status` call, investigate before continuing — it indicates another agent may have claimed the unit or a prior run left state. Do not ignore it.
 
 Follow this execution sequence:
 

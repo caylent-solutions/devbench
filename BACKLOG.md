@@ -12,6 +12,7 @@ E1, E2, E3 can run in parallel after E0 is done.
 E4 starts after E2 is done.
 E5 starts after E0 is done.
 E6 starts after E0 is done (independent of E1–E5).
+E7 starts after E5 is done.
 E2-F2 depends on E2-F1 completing first (within E2).
 -->
 
@@ -34,7 +35,8 @@ After E0 is done:
 | E4 | Backlog Manager | 1 | 1 | 1 | 4 | 4 | 0 | 0 | 0 |
 | E5 | Backlog-Native Configuration | 1 | 1 | 2 | 5 | 2 | 3 | 0 | 0 |
 | E6 | Orchestrator Runtime Fixes | 1 | 1 | 2 | 5 | 0 | 0 | 0 | 5 |
-| **Total** | | **8** | **10** | **16** | **37** | **22** | **3** | **0** | **12** |
+| E7 | Deprecation Removal | 1 | 1 | 1 | 4 | 0 | 0 | 0 | 4 |
+| **Total** | | **9** | **11** | **17** | **41** | **22** | **3** | **0** | **16** |
 
 ---
 
@@ -115,3 +117,12 @@ After E0 is done:
 | E6-F1-S1 | Fix Orchestrator Runtime Bugs | Story | in-queue | E0 | devbench | `backlog/E6-orchestrator-runtime-fixes/E6-F1-security-and-git-fixes/E6-F1-S1-fix-orchestrator-runtime-bugs/E6-F1-S1.md` |
 | E6-F1 | Security and Git Flow Bug Fixes | Feature | in-queue | E0 | devbench | `backlog/E6-orchestrator-runtime-fixes/E6-F1-security-and-git-fixes/E6-F1.md` |
 | E6 | Orchestrator Runtime Fixes | Epic | in-queue | E0 | devbench | `backlog/E6-orchestrator-runtime-fixes/E6.md` |
+
+### E7: Deprecation Removal
+
+| ID | Title | Type | Status | Dependencies | Repo | File Path |
+|----|-------|------|--------|--------------|------|-----------|
+| E7-F1-S1-T1 | Remove JUDGE_ALLOWED_REPOS, JUDGE_BACKLOG_ROOT, JUDGE_BACKLOG_INDEX compat shims | Task | in-queue | E5 | devbench | `backlog/E7-deprecation-removal/E7-F1-remove-deprecated-env-vars/E7-F1-S1-remove-compat-shims/E7-F1-S1-T1-remove-deprecated-env-vars.md` |
+| E7-F1-S1 | Remove backward-compat code and docs for deprecated env vars | Story | in-queue | E5 | devbench | `backlog/E7-deprecation-removal/E7-F1-remove-deprecated-env-vars/E7-F1-S1-remove-compat-shims/E7-F1-S1.md` |
+| E7-F1 | Remove Deprecated Env Var Compat Shims | Feature | in-queue | E5 | devbench | `backlog/E7-deprecation-removal/E7-F1-remove-deprecated-env-vars/E7-F1.md` |
+| E7 | Deprecation Removal | Epic | in-queue | E5 | devbench | `backlog/E7-deprecation-removal/E7.md` |

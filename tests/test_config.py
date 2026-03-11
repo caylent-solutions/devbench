@@ -241,7 +241,7 @@ class TestDeprecatedPathEnvVars:
     def test_backlog_root_env_override_warns_deprecated(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """JUDGE_BACKLOG_ROOT is honored but emits a deprecation warning."""
+        """JUDGE_BACKLOG_ROOT is honored but emits a deprecation WARNING."""
         import logging
 
         custom_root = tmp_path / "custom-backlog"
@@ -249,7 +249,12 @@ class TestDeprecatedPathEnvVars:
             with caplog.at_level(logging.WARNING, logger="devbench.config"):
                 importlib.reload(config)
             assert custom_root == config.BACKLOG_ROOT
-            assert any("JUDGE_BACKLOG_ROOT" in msg and "deprecated" in msg.lower() for msg in caplog.messages)
+            matching = [
+                r for r in caplog.records
+                if "JUDGE_BACKLOG_ROOT" in r.message and "deprecated" in r.message.lower()
+            ]
+            assert matching, "Expected deprecation WARNING for JUDGE_BACKLOG_ROOT"
+            assert matching[0].levelno == logging.WARNING
 
         env_copy = os.environ.copy()
         env_copy.pop("JUDGE_BACKLOG_ROOT", None)
@@ -259,7 +264,7 @@ class TestDeprecatedPathEnvVars:
     def test_backlog_index_env_override_warns_deprecated(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """JUDGE_BACKLOG_INDEX is honored but emits a deprecation warning."""
+        """JUDGE_BACKLOG_INDEX is honored but emits a deprecation WARNING."""
         import logging
 
         custom_index = tmp_path / "CUSTOM_BACKLOG.md"
@@ -267,7 +272,12 @@ class TestDeprecatedPathEnvVars:
             with caplog.at_level(logging.WARNING, logger="devbench.config"):
                 importlib.reload(config)
             assert custom_index == config.BACKLOG_INDEX
-            assert any("JUDGE_BACKLOG_INDEX" in msg and "deprecated" in msg.lower() for msg in caplog.messages)
+            matching = [
+                r for r in caplog.records
+                if "JUDGE_BACKLOG_INDEX" in r.message and "deprecated" in r.message.lower()
+            ]
+            assert matching, "Expected deprecation WARNING for JUDGE_BACKLOG_INDEX"
+            assert matching[0].levelno == logging.WARNING
 
         env_copy = os.environ.copy()
         env_copy.pop("JUDGE_BACKLOG_INDEX", None)

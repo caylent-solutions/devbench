@@ -237,31 +237,21 @@ class TestCheckoutDirectory:
         result = load_runtime_config(cfg, {})
         assert result.repos["org/repo"].checkout_directory is None
 
-    def test_checkout_directory_rejects_absolute_path(self, tmp_path: Path) -> None:
-        """AC-3: absolute checkout_directory fails fast."""
+    @pytest.mark.parametrize(
+        ("yaml_value", "match"),
+        [
+            ("/absolute/path", "absolute"),
+            ("../escape", r"\.\.|traversal"),
+            ("123", "string"),
+        ],
+    )
+    def test_checkout_directory_rejects_invalid(self, tmp_path: Path, yaml_value: str, match: str) -> None:
+        """AC-3/AC-4: absolute paths, parent traversal, and non-strings are rejected."""
         cfg = self._write(
             tmp_path / "cfg.yaml",
-            "repos:\n  org/repo:\n    checkout_directory: /absolute/path\n",
+            f"repos:\n  org/repo:\n    checkout_directory: {yaml_value}\n",
         )
-        with pytest.raises(ValueError, match="absolute"):
-            load_runtime_config(cfg, {})
-
-    def test_checkout_directory_rejects_parent_traversal(self, tmp_path: Path) -> None:
-        """AC-4: checkout_directory containing .. fails fast."""
-        cfg = self._write(
-            tmp_path / "cfg.yaml",
-            "repos:\n  org/repo:\n    checkout_directory: ../escape\n",
-        )
-        with pytest.raises(ValueError, match=r"\.\.|traversal"):
-            load_runtime_config(cfg, {})
-
-    def test_checkout_directory_rejects_non_string(self, tmp_path: Path) -> None:
-        """checkout_directory must be a string."""
-        cfg = self._write(
-            tmp_path / "cfg.yaml",
-            "repos:\n  org/repo:\n    checkout_directory: 123\n",
-        )
-        with pytest.raises(ValueError, match="string"):
+        with pytest.raises(ValueError, match=match):
             load_runtime_config(cfg, {})
 
 

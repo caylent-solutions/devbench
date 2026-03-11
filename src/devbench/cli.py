@@ -53,10 +53,10 @@ def _pre_parse_config(argv: list[str]) -> None:
 
 _pre_parse_config(sys.argv)
 
-from devbench.backlog.manager import BacklogManager  # noqa: E402
-from devbench.backlog.parser import BacklogParser  # noqa: E402
-from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus  # noqa: E402
-from devbench.config import (  # noqa: E402
+from devbench.backlog.manager import BacklogManager
+from devbench.backlog.parser import BacklogParser
+from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus
+from devbench.config import (
     BACKLOG_INDEX,
     BACKLOG_ROOT,
     REPO_LOCAL_PATHS,
@@ -64,19 +64,19 @@ from devbench.config import (  # noqa: E402
     resolve_repo,
     validate_repo,
 )
-from devbench.constants import (  # noqa: E402
+from devbench.constants import (
     DISPLAY_STATUS_VALUES,
     STATUS_IN_PROGRESS,
     STATUS_IN_REVIEW,
     STATUS_SEPARATOR_WIDTH,
 )
-from devbench.judges.base import Verdict  # noqa: E402
-from devbench.judges.changes_manifest import ChangesManifestJudge  # noqa: E402
-from devbench.judges.code_review import CodeReviewJudge  # noqa: E402
-from devbench.judges.doc_review import DocReviewJudge  # noqa: E402
-from devbench.judges.security_review import SecurityReviewJudge  # noqa: E402
-from devbench.judges.test_review import TestReviewJudge  # noqa: E402
-from devbench.log_setup import setup_logging  # noqa: E402
+from devbench.judges.base import Verdict
+from devbench.judges.changes_manifest import ChangesManifestJudge
+from devbench.judges.code_review import CodeReviewJudge
+from devbench.judges.doc_review import DocReviewJudge
+from devbench.judges.security_review import SecurityReviewJudge
+from devbench.judges.test_review import TestReviewJudge
+from devbench.log_setup import setup_logging
 
 logger = logging.getLogger("devbench.cli")
 

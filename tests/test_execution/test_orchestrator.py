@@ -300,6 +300,43 @@ class TestProcessWorkUnit:
 
         assert result is True
 
+    def test_security_judge_called_with_repo_kwarg(self, tmp_path: Path) -> None:
+        """AC-3: security_judge.evaluate() receives repo=work_unit.repo as a kwarg."""
+        from devbench.execution.orchestrator import process_work_unit
+
+        unit = _make_unit(tmp_path)
+        exec_result = ExecutionResult(status=ExecutionStatus.IN_REVIEW, output="done", blocker="")
+        mock_review_judge = MagicMock()
+        mock_review_judge.name = "mock"
+        mock_review_judge.evaluate.return_value = _pass_result("mock")
+
+        mock_security = MagicMock()
+        mock_security.evaluate.return_value = _pass_result("security")
+
+        mock_git_ops = MagicMock()
+        mock_git_ops.create_pr.return_value = "https://github.com/org/repo/pull/1"
+        mock_git_ops.wait_for_checks.return_value = True
+
+        with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+            with patch(f"{_ORC}.claude_executor") as mock_exec:
+                mock_exec.execute.return_value = exec_result
+                with patch(f"{_ORC}.CodeReviewJudge", return_value=mock_review_judge):
+                    with patch(f"{_ORC}.TestReviewJudge", return_value=mock_review_judge):
+                        with patch(f"{_ORC}.DocReviewJudge", return_value=mock_review_judge):
+                            with patch(f"{_ORC}.ChangesManifestJudge", return_value=mock_review_judge):
+                                with patch(f"{_ORC}.SecurityReviewJudge", return_value=mock_security):
+                                    with patch(f"{_ORC}.GitOpsJudge", return_value=mock_git_ops):
+                                        with patch(f"{_ORC}.BacklogManager"):
+                                            with patch(f"{_ORC}.BlockerResolverJudge"):
+                                                with patch(f"{_ORC}.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
+                                                    process_work_unit(unit)
+
+        mock_security.evaluate.assert_called_once_with(
+            work_unit_path=unit.file_path,
+            repo_path=tmp_path,
+            repo="caylent-solutions/git-repo",
+        )
+
     def test_handles_security_review_failure(self, tmp_path: Path) -> None:
         from devbench.execution.orchestrator import process_work_unit
 

@@ -315,7 +315,12 @@ class TestGitOpsFunctional:
                 "test commit",
             )
 
-        assert mock_cmd.call_count == 3
+        assert mock_cmd.call_count == 4
+        calls = [c.args[0] for c in mock_cmd.call_args_list]
+        assert calls[0] == ["git", "checkout", "-B", "feature/test"]
+        assert calls[1] == ["git", "add", "-A"]
+        assert calls[2] == ["git", "commit", "-m", "test commit"]
+        assert calls[3] == ["git", "push", "origin", "feature/test"]
 
     def test_create_pr_returns_url(self, tmp_path: Path) -> None:
         judge = GitOpsJudge()

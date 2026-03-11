@@ -42,11 +42,17 @@ class TestCommitAndPush:
         with patch.object(judge, "_git") as mock_git:
             judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "feature/x", "commit msg")
 
-        assert mock_git.call_count == 3
+        assert mock_git.call_count == 4
         calls = [c.args[0] for c in mock_git.call_args_list]
-        assert calls[0] == ["add", "-A"]
-        assert calls[1] == ["commit", "-m", "commit msg"]
-        assert calls[2] == ["push", "origin", "feature/x"]
+        assert calls[0] == ["checkout", "-B", "feature/x"]
+        assert calls[1] == ["add", "-A"]
+        assert calls[2] == ["commit", "-m", "commit msg"]
+        assert calls[3] == ["push", "origin", "feature/x"]
+
+    def test_rejects_invalid_branch_name(self, tmp_path: Path) -> None:
+        judge = GitOpsJudge()
+        with pytest.raises(ValueError, match="Invalid branch name"):
+            judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "bad branch!", "msg")
 
     def test_raises_on_git_failure(self, tmp_path: Path) -> None:
         judge = GitOpsJudge()

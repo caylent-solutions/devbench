@@ -5,8 +5,15 @@ performing any operation.
 """
 
 import os
+import re
 import subprocess
 from pathlib import Path
+
+# Allowlist pattern for git branch names: starts with alphanumeric, allows
+# alphanumerics, dots, hyphens, underscores, and single forward slashes.
+# Consecutive special chars (e.g. '//', '..', '/-') are rejected to match
+# git ref naming rules (git-check-ref-format).
+_BRANCH_RE = re.compile(r"^[a-zA-Z0-9]([a-zA-Z0-9_]|[.\-/][a-zA-Z0-9_])*$")
 
 from devbench.config import (
     GH_API_TIMEOUT,
@@ -41,20 +48,47 @@ class GitOpsJudge(BaseJudge):
         )
 
     def commit_and_push(self, repo: str, repo_path: Path, branch: str, message: str) -> None:
-        """Stage all changes, commit, and push to the remote branch.
+        """Validate inputs, create or reset the branch, stage all changes, commit, and push.
+
+        Full operation sequence:
+
+        1. Validate *repo* against the allow-list (``validate_repo``).
+        2. Validate *branch* format against ``_BRANCH_RE`` (allowlist pattern that
+           rejects consecutive special characters per git ref naming rules).
+        3. ``git checkout -B <branch>`` — creates the branch if absent, or resets
+           it to the current HEAD if it already exists.  The ``-B`` flag is
+           idempotent, making retries safe without additional error-handling logic.
+        4. ``git add -A`` — stage all changes.
+        5. ``git commit -m <message>`` — commit staged changes.
+        6. ``git push origin <branch>`` — push to the remote.
+
+        All git commands are executed via :meth:`_git`, which invokes subprocess
+        with a list argument (never ``shell=True``), eliminating shell injection risk.
 
         Args:
             repo: GitHub repository in ``owner/name`` format.
             repo_path: Local filesystem path to the repository.
-            branch: Branch name to commit and push to.
+            branch: Branch name to create/reset and push to.  Must match
+                ``_BRANCH_RE``: starts with an alphanumeric character; subsequent
+                characters are alphanumerics, underscores, or a single separator
+                (``.``, ``-``, or ``/``) followed by an alphanumeric/underscore.
             message: Commit message.
 
         Raises:
-            ValueError: If the repo is not in the allow-list.
+            ValueError: If the repo is not in the allow-list, or the branch name
+                does not match the allowed format.
             RuntimeError: If any git command fails.
         """
         validate_repo(repo)
+        if not _BRANCH_RE.match(branch):
+            raise ValueError(
+                f"Invalid branch name '{branch}'. "
+                "Branch names must start with an alphanumeric character and contain only "
+                "alphanumerics, dots, hyphens, underscores, and forward slashes "
+                "(no consecutive special characters)."
+            )
 
+        self._git(["checkout", "-B", branch], repo_path)
         self._git(["add", "-A"], repo_path)
         self._git(["commit", "-m", message], repo_path)
         self._git(["push", "origin", branch], repo_path)

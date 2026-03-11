@@ -200,12 +200,12 @@ class BacklogManager:
             if not line.strip().startswith("|"):
                 continue
             cells = [c.strip() for c in line.split("|")]
-            if len(cells) < 6:
+            if len(cells) != 9:  # work-unit index rows have exactly 7 columns
                 continue
             row_id = cells[1]
             if not row_id or row_id.lower() == "id" or row_id.startswith("-"):
                 continue
-            dep_cell = cells[5] if len(cells) > 5 else ""
+            dep_cell = cells[5]
             for raw_dep in dep_cell.split(","):
                 dep_id = raw_dep.strip()
                 if dep_id and dep_id.lower() not in DEPENDENCY_NONE_VALUES and dep_id not in known_ids:

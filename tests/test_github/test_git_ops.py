@@ -104,8 +104,8 @@ class TestCreatePr:
 
         cmd_args, _ = mock_gh.call_args
         cmd = cmd_args[0]
-        assert "--base" in cmd
-        assert "main2" in cmd
+        base_idx = cmd.index("--base")
+        assert cmd[base_idx + 1] == "main2"
 
     def test_omits_base_branch_when_not_configured(self, tmp_path: Path) -> None:
         """create_pr omits --base when repo has no default_branch in YAML config."""

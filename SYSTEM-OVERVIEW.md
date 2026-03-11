@@ -213,6 +213,10 @@ Repos and per-repo settings are defined in `backlog/config/devbench.yaml` (relat
 2. `JUDGE_CONFIG_PATH` environment variable
 3. `<JUDGE_WORKSPACE_ROOT>/backlog/config/devbench.yaml` (default)
 
+The config file must exist at the resolved path — a missing file raises `RuntimeError` with an actionable message. If `JUDGE_ALLOWED_REPOS` is set without a YAML file, the env var is still honored (backward compatibility) but a deprecation warning is emitted.
+
+**Value-level precedence**: environment variables override YAML field values. For example, `JUDGE_BACKLOG_ROOT` overrides the path derived from `JUDGE_WORKSPACE_ROOT`, and `JUDGE_ALLOWED_REPOS` overrides the repos list from YAML.
+
 **YAML schema:**
 
 ```yaml

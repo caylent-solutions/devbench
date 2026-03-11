@@ -719,15 +719,16 @@ class TestMain:
 class TestPreParseConfig:
     """Test --config CLI pre-parse helper."""
 
-    def test_sets_env_var_and_removes_args(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_sets_env_var_and_removes_args(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         import os
 
-        argv = ["judges.cli", "--config", "/tmp/custom.yaml", "status"]
+        config_path = str(tmp_path / "custom.yaml")
+        argv = ["judges.cli", "--config", config_path, "status"]
         monkeypatch.delenv("JUDGE_CONFIG_PATH", raising=False)
         cli._pre_parse_config(argv)
-        assert os.environ.get("JUDGE_CONFIG_PATH") == "/tmp/custom.yaml"
+        assert os.environ.get("JUDGE_CONFIG_PATH") == config_path
         assert "--config" not in argv
-        assert "/tmp/custom.yaml" not in argv
+        assert config_path not in argv
         assert argv == ["judges.cli", "status"]
 
     def test_noop_when_config_not_present(self) -> None:

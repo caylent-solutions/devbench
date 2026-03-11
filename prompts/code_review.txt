@@ -73,4 +73,9 @@ Evaluate the code diff against the acceptance criteria and CLAUDE.md standards.
 45. Check the work unit's Definition of Done and Comments/Agent Log for evidence that the agent actually ran the repo's validation pipeline (e.g., "make validate passes", test output logs, lint output). If the DoD claims validation passes but there is no evidence in the agent log, flag this.
 46. If the repo has a task runner, all lint, format, test, and validate targets that exist must be consistent with the code changes. For example, if lint is configured to use ruff but the diff adds flake8 config, that is a conflict.
 
+--- OUT OF SCOPE FOR FINDINGS ---
+The following files are operational backlog-tracking artifacts. You may read them to understand acceptance criteria, Definition of Done, and agent log evidence (e.g. to verify criterion 45), but do not raise findings, flag defects, or fail based on their content or status values:
+- `BACKLOG.md` — work-unit status index
+- Any file under `backlog/` — task, story, feature, and epic specification files
+
 Be strict but fair. Fail for real violations of these standards. Do not fail for subjective style preferences that have no security, reliability, or maintainability impact.

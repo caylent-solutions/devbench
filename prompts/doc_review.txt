@@ -48,4 +48,9 @@ Evaluate whether documentation is complete, accurate, and synchronized with code
 28. Performance characteristics use qualitative descriptions unless backed by benchmarks.
 29. Migration guides provide concrete steps, not vague guidance.
 
+--- OUT OF SCOPE FOR FINDINGS ---
+The following files are operational backlog-tracking artifacts. You may read them to understand acceptance criteria, Definition of Done, and agent log evidence, but do not raise findings, flag defects, or fail based on their content or status values:
+- `BACKLOG.md` — work-unit status index
+- Any file under `backlog/` — task, story, feature, and epic specification files
+
 Be strict — misleading documentation in a regulated environment can cause compliance failures. Fail for inaccurate, outdated, or misleading documentation. Do not fail for minor formatting preferences.

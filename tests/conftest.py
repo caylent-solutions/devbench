@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 # Set required env vars before any devbench modules are imported.
 # config.py raises RuntimeError at import time if these are unset.
 os.environ.setdefault("JUDGE_CLAUDE_MODEL", "test-model")
-os.environ.setdefault("JUDGE_ALLOWED_REPOS", "caylent-solutions/git-repo,caylent-solutions/devbench")
 os.environ.setdefault("JUDGE_WORKSPACE_ROOT", "/tmp/test-workspace")
 os.environ.setdefault("JUDGE_LOG_FILE", "/tmp/judges-test-orchestrator.log")
-
-from pathlib import Path
+# Point to the test fixture YAML config so config.py can resolve ALLOWED_REPOS
+# without requiring JUDGE_ALLOWED_REPOS (which is deprecated).
+os.environ.setdefault(
+    "JUDGE_CONFIG_PATH",
+    str(Path(__file__).parent / "fixtures" / "test_devbench.yaml"),
+)
 from unittest.mock import patch
 
 import pytest

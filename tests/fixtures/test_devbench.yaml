@@ -1,0 +1,6 @@
+# DevBench test fixture config — used by tests/conftest.py
+repos:
+  caylent-solutions/git-repo:
+    default_branch: main
+  caylent-solutions/devbench:
+    default_branch: main2

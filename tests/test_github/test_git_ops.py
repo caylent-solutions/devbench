@@ -88,6 +88,43 @@ class TestCreatePr:
         assert kwargs.get("cwd") == tmp_path
         assert kwargs.get("repo") == "caylent-solutions/git-repo"
 
+    def test_uses_base_branch_from_yaml_config(self, tmp_path: Path) -> None:
+        """create_pr passes --base <branch> when YAML config has a default_branch."""
+        from devbench.config_loader import RepoConfig, RuntimeConfig
+
+        judge = GitOpsJudge()
+        runtime_config = RuntimeConfig(
+            repos={"caylent-solutions/git-repo": RepoConfig(default_branch="main2")}
+        )
+        with (
+            patch("devbench.github.git_ops.RUNTIME_CONFIG", runtime_config),
+            patch.object(judge, "_gh", return_value=(0, "https://github.com/org/repo/pull/1\n", "")) as mock_gh,
+        ):
+            judge.create_pr("caylent-solutions/git-repo", "feature-branch", "title", "body", repo_path=tmp_path)
+
+        cmd_args, _ = mock_gh.call_args
+        cmd = cmd_args[0]
+        assert "--base" in cmd
+        assert "main2" in cmd
+
+    def test_omits_base_branch_when_not_configured(self, tmp_path: Path) -> None:
+        """create_pr omits --base when repo has no default_branch in YAML config."""
+        from devbench.config_loader import RepoConfig, RuntimeConfig
+
+        judge = GitOpsJudge()
+        runtime_config = RuntimeConfig(
+            repos={"caylent-solutions/git-repo": RepoConfig(default_branch=None)}
+        )
+        with (
+            patch("devbench.github.git_ops.RUNTIME_CONFIG", runtime_config),
+            patch.object(judge, "_gh", return_value=(0, "https://github.com/org/repo/pull/1\n", "")) as mock_gh,
+        ):
+            judge.create_pr("caylent-solutions/git-repo", "feature-branch", "title", "body", repo_path=tmp_path)
+
+        cmd_args, _ = mock_gh.call_args
+        cmd = cmd_args[0]
+        assert "--base" not in cmd
+
 
 class TestMergePr:
     """Test merge_pr method."""

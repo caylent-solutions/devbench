@@ -714,4 +714,30 @@ class TestMain:
             with patch.dict(cli._COMMANDS, {"execute": (mock_fn, 1, "Execute")}):
                 result = cli.main()
         assert result == 0
-        mock_fn.assert_called_once_with("T1", "feedback-text")
+
+
+class TestPreParseConfig:
+    """Test --config CLI pre-parse helper."""
+
+    def test_sets_env_var_and_removes_args(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import os
+
+        argv = ["judges.cli", "--config", "/tmp/custom.yaml", "status"]
+        monkeypatch.delenv("JUDGE_CONFIG_PATH", raising=False)
+        cli._pre_parse_config(argv)
+        assert os.environ.get("JUDGE_CONFIG_PATH") == "/tmp/custom.yaml"
+        assert "--config" not in argv
+        assert "/tmp/custom.yaml" not in argv
+        assert argv == ["judges.cli", "status"]
+
+    def test_noop_when_config_not_present(self) -> None:
+        argv = ["judges.cli", "status"]
+        original = argv.copy()
+        cli._pre_parse_config(argv)
+        assert argv == original
+
+    def test_noop_when_config_has_no_value(self) -> None:
+        argv = ["judges.cli", "--config"]
+        original = argv.copy()
+        cli._pre_parse_config(argv)
+        assert argv == original

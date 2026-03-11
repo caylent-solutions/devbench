@@ -22,8 +22,9 @@ class DocReviewJudge(BaseJudge):
 
     def evaluate(self, work_unit_path: Path, repo_path: Path, **kwargs: object) -> JudgeResult:
         """Evaluate documentation by gathering evidence and delegating to the LLM."""
+        repo: str = str(kwargs.get("repo", ""))
         work_unit_content = self._read_file(work_unit_path)
-        diff = self._get_diff(repo_path)
+        diff = self._get_diff(repo_path, repo=repo)
         doc_contents = self._collect_doc_files(repo_path)
 
         evidence_sections: dict[str, str] = {
@@ -56,7 +57,7 @@ class DocReviewJudge(BaseJudge):
 
         return "\n".join(parts[:LLM_FILE_CONTEXT_LIMIT])
 
-    def _get_diff(self, repo_path: Path) -> str:
+    def _get_diff(self, repo_path: Path, repo: str = "") -> str:
         """Return the combined diff of all changes: staged, unstaged, and committed.
 
         Collects diffs from all sources so evidence is complete whether the
@@ -75,7 +76,7 @@ class DocReviewJudge(BaseJudge):
             parts.append(stdout)
 
         # All committed branch changes vs default branch
-        default_branch = self._get_default_branch(repo_path)
+        default_branch = self._get_default_branch(repo_path, repo=repo)
         rc, stdout, _ = self._run_command(["git", "diff", default_branch], cwd=repo_path)
         if rc == 0 and stdout.strip():
             parts.append(stdout)

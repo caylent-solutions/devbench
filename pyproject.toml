@@ -25,6 +25,7 @@ dev-dependencies = [
     "ruff>=0.15.0",
     "bandit>=1.8.0",
     "mypy>=1.15.0",
+    "types-pyyaml>=6.0.12.20250915",
 ]
 
 [tool.ruff]

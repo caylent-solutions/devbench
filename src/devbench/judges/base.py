@@ -21,9 +21,11 @@ from devbench.config import (
     COMMAND_TIMEOUT,
     LLM_EVIDENCE_TRUNCATION,
     LLM_TIMEOUT,
+    RUNTIME_CONFIG,
     USE_BEDROCK,
     get_anthropic_api_key,
 )
+from devbench.config_loader import get_configured_default_branch
 from devbench.constants import ERROR_OUTPUT_PREVIEW_CHARS, LLM_RESPONSE_FORMAT_INSTRUCTIONS, RAW_RESPONSE_PREVIEW_CHARS
 
 
@@ -63,13 +65,27 @@ class BaseJudge(abc.ABC):
         """Evaluate a work unit. Returns JudgeResult with verdict and reasoning."""
         ...
 
-    def _get_default_branch(self, repo_path: Path) -> str:
-        """Return the default branch name for the repo (e.g. ``main``, ``master``).
+    def _get_default_branch(self, repo_path: Path, repo: str = "") -> str:
+        """Return the default branch name for the repo (e.g. ``main2``, ``main``).
 
-        Uses ``git rev-parse --abbrev-ref origin/HEAD`` which respects the
-        remote's default branch setting.  Raises ``RuntimeError`` if the
-        default branch cannot be determined.
+        Resolution order:
+        1. YAML ``repos.<repo>.default_branch`` when *repo* is provided and configured.
+        2. ``git rev-parse --abbrev-ref origin/HEAD`` fallback.
+
+        Args:
+            repo_path: Local filesystem path to the repository.
+            repo: Fully-qualified repo name (e.g. ``'org/repo'``).  When
+                provided, the YAML config is consulted first.
+
+        Raises:
+            RuntimeError: If no YAML branch is configured and the git fallback
+                cannot determine the default branch.
         """
+        if repo:
+            configured = get_configured_default_branch(repo, RUNTIME_CONFIG)
+            if configured:
+                return configured
+
         rc, stdout, _ = self._run_command(
             ["git", "rev-parse", "--abbrev-ref", "origin/HEAD"], cwd=repo_path,
         )

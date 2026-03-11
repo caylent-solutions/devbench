@@ -1,0 +1,19 @@
+# DevBench runtime configuration
+#
+# Precedence: environment variables > this file > code defaults
+#
+# Config file path resolution order:
+#   1. --config <path>          CLI argument
+#   2. JUDGE_CONFIG_PATH        environment variable
+#   3. backlog/config/devbench.yaml  (this file — default)
+#
+# repos: defines allowed repositories and optional per-repo settings.
+# At least one entry is required. Keys must be in "org/repo" format.
+#
+# Per-repo fields:
+#   default_branch  (optional) — branch used for git diff and PR --base.
+#                                Omit to fall back to origin/HEAD.
+
+repos:
+  caylent-solutions/devbench:
+    default_branch: main2

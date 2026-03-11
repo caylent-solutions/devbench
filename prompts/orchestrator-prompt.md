@@ -176,9 +176,15 @@ NEVER mark a work unit as Done if judges have not all passed. Read the work unit
    **IMPORTANT: All target repos are git submodules of the workspace root (`$JUDGE_WORKSPACE_ROOT`).** You must commit inside the submodule first, then update the parent repo's submodule reference.
 
    **Step A — Review and commit inside the submodule:**
+
+   First, determine the branch name:
+   - If the work unit's **Target Repository** section specifies a branch, use that exactly.
+   - Otherwise, use `backlog/<unit-id-lowercase>`.
+   - Never invent a third naming scheme outside these two sources.
+
    ```bash
    cd $JUDGE_WORKSPACE_ROOT/<repo-name>
-   git checkout -b backlog/<unit-id-lowercase>
+   git checkout -b <resolved-branch>
    ```
 
    **Before staging anything, review ALL changed files:**
@@ -194,7 +200,7 @@ NEVER mark a work unit as Done if judges have not all passed. Read the work unit
    7. Commit and push:
       ```bash
       git commit -m "<unit-id>: <title>"
-      git push -u origin backlog/<unit-id-lowercase>
+      git push -u origin <resolved-branch>
       ```
 
    **Step B — Create PR in the submodule repo:**

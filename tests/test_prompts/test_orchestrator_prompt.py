@@ -52,3 +52,32 @@ def test_set_status_precedes_execution_sequence() -> None:
         "set-status call must appear before 'Follow this execution sequence:' — "
         "the work unit must be claimed before implementation begins"
     )
+
+
+def test_prompt_contains_branch_precedence_rule() -> None:
+    # Step 5A must state the two-rule precedence for branch naming so the agent
+    # never invents ad-hoc names. The rules are: (1) use the branch from the work
+    # unit's Target Repository section if specified, (2) otherwise fall back to
+    # backlog/<unit-id-lowercase>. If this assertion fails after a prompt refactor,
+    # confirm both rules are still present and the fallback default is documented.
+    prompt = _prompt_text()
+    assert "Target Repository" in prompt and "backlog/<unit-id-lowercase>" in prompt, (
+        "Step 5A must contain the two-rule branch naming precedence: "
+        "Target Repository branch if specified, otherwise backlog/<unit-id-lowercase>"
+    )
+
+
+def test_prompt_does_not_hardcode_backlog_branch_as_command() -> None:
+    # Step 5A must use the generic <resolved-branch> placeholder in git commands,
+    # not the literal string backlog/<unit-id-lowercase>. Hardcoding the fallback
+    # name in the command prevents the agent from using the work unit's specified
+    # branch, which causes branch naming drift across work units.
+    # If this assertion fails, replace `backlog/<unit-id-lowercase>` in git checkout
+    # and git push lines with `<resolved-branch>` and document the rule above them.
+    prompt = _prompt_text()
+    assert "git checkout -b <resolved-branch>" in prompt, (
+        "Step 5A git checkout command must use <resolved-branch>, not a hardcoded backlog/ name"
+    )
+    assert "git push -u origin <resolved-branch>" in prompt, (
+        "Step 5A git push command must use <resolved-branch>, not a hardcoded backlog/ name"
+    )

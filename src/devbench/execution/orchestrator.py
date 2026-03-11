@@ -17,6 +17,7 @@ from devbench.config import (
     ORCHESTRATOR_POLL_INTERVAL,
     OUTPUT_TRUNCATION_LIMIT,
     REPO_LOCAL_PATHS,
+    resolve_repo,
     validate_repo,
 )
 from devbench.constants import BRANCH_NAME_TEMPLATE, PR_BODY_TEMPLATE, STATUS_IN_PROGRESS
@@ -96,10 +97,13 @@ def process_work_unit(work_unit: WorkUnit) -> bool:
 
     Returns True if the work unit was completed successfully.
     """
-    validate_repo(work_unit.repo)
-    repo_path = REPO_LOCAL_PATHS.get(work_unit.repo)
+    # Canonicalize once: resolve short name (e.g. "git-repo") to full "org/repo"
+    # so all downstream calls use the consistent fully-qualified name.
+    canonical_repo = resolve_repo(work_unit.repo)
+    validate_repo(canonical_repo)
+    repo_path = REPO_LOCAL_PATHS.get(canonical_repo)
     if repo_path is None:
-        raise ValueError(f"No local path for repo: {work_unit.repo}")
+        raise ValueError(f"No local path for repo: {canonical_repo}")
 
     git_ops = GitOpsJudge()
     security_judge = SecurityReviewJudge()
@@ -122,7 +126,7 @@ def process_work_unit(work_unit: WorkUnit) -> bool:
         # Execute the work unit
         result = claude_executor.execute(
             work_unit_path=work_unit.file_path,
-            repo=work_unit.repo,
+            repo=canonical_repo,
             feedback=feedback,
         )
 
@@ -171,6 +175,7 @@ def process_work_unit(work_unit: WorkUnit) -> bool:
         security_result = security_judge.evaluate(
             work_unit_path=work_unit.file_path,
             repo_path=repo_path,
+            repo=canonical_repo,
         )
         if security_result.verdict == Verdict.FAIL:
             work_unit.log_comment(
@@ -192,13 +197,13 @@ def process_work_unit(work_unit: WorkUnit) -> bool:
         branch = BRANCH_NAME_TEMPLATE.format(unit_id=work_unit.id.lower())
         try:
             git_ops.commit_and_push(
-                repo=work_unit.repo,
+                repo=canonical_repo,
                 repo_path=repo_path,
                 branch=branch,
                 message=f"{work_unit.id}: {work_unit.title}",
             )
             pr_url = git_ops.create_pr(
-                repo=work_unit.repo,
+                repo=canonical_repo,
                 branch=branch,
                 title=f"{work_unit.id}: {work_unit.title}",
                 body=PR_BODY_TEMPLATE.format(
@@ -213,7 +218,7 @@ def process_work_unit(work_unit: WorkUnit) -> bool:
             pr_number = int(pr_url.rstrip("/").split("/")[-1])
 
             checks_passed = git_ops.wait_for_checks(
-                repo=work_unit.repo,
+                repo=canonical_repo,
                 pr_number=pr_number,
                 repo_path=repo_path,
             )
@@ -222,12 +227,12 @@ def process_work_unit(work_unit: WorkUnit) -> bool:
                 feedback = "GitHub CI checks failed on PR. Fix the issues."
                 continue
 
-            git_ops.merge_pr(repo=work_unit.repo, pr_number=pr_number, repo_path=repo_path)
+            git_ops.merge_pr(repo=canonical_repo, pr_number=pr_number, repo_path=repo_path)
             work_unit.log_comment("judge/git_ops", "PR_MERGED", pr_url)
 
             # Update parent repo's submodule reference
             git_ops.update_parent_submodule_ref(
-                repo=work_unit.repo,
+                repo=canonical_repo,
                 repo_path=repo_path,
                 message=f"{work_unit.id}: update {repo_path.name} submodule ref",
             )

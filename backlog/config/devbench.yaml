@@ -11,9 +11,14 @@
 # At least one entry is required. Keys must be in "org/repo" format.
 #
 # Per-repo fields:
-#   default_branch  (optional) — branch used for git diff and PR --base.
-#                                Omit to fall back to origin/HEAD.
+#   default_branch      (optional) — branch used for git diff and PR --base.
+#                                    Omit to fall back to origin/HEAD.
+#   checkout_directory  (optional) — relative path from JUDGE_WORKSPACE_ROOT to
+#                                    the local checkout. Must be relative (no leading
+#                                    / or .. traversal). Omit to use the repo short
+#                                    name (e.g. "devbench" for "caylent-solutions/devbench").
 
 repos:
   caylent-solutions/devbench:
     default_branch: main2
+    checkout_directory: devbench

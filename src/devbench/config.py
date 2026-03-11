@@ -25,6 +25,7 @@ from pathlib import Path
 
 from devbench.config_loader import (
     RuntimeConfig,
+    get_repo_local_path,
     load_runtime_config,
     resolve_config_path,
 )
@@ -74,7 +75,7 @@ else:
     ALLOWED_REPOS = frozenset(RUNTIME_CONFIG.repos)
 
 REPO_LOCAL_PATHS: dict[str, Path] = {
-    repo: WORKSPACE_ROOT / repo.split("/", maxsplit=1)[1] for repo in ALLOWED_REPOS
+    repo: get_repo_local_path(repo, RUNTIME_CONFIG, WORKSPACE_ROOT) for repo in ALLOWED_REPOS
 }
 
 # Short name -> full name mapping for backlog compatibility.
@@ -105,8 +106,27 @@ def resolve_repo(short_or_full: str) -> str:
 # ---------------------------------------------------------------------------
 # Backlog paths
 # ---------------------------------------------------------------------------
-BACKLOG_ROOT: Path = Path(os.environ.get("JUDGE_BACKLOG_ROOT", str(WORKSPACE_ROOT / BACKLOG_SUBDIR)))
-BACKLOG_INDEX: Path = Path(os.environ.get("JUDGE_BACKLOG_INDEX", str(WORKSPACE_ROOT / "BACKLOG.md")))
+_backlog_root_env = os.environ.get("JUDGE_BACKLOG_ROOT", "")
+if _backlog_root_env:
+    _log.warning(
+        "JUDGE_BACKLOG_ROOT is deprecated. "
+        "Backlog path is derived from JUDGE_WORKSPACE_ROOT automatically. "
+        "JUDGE_BACKLOG_ROOT will be removed in a future release."
+    )
+    BACKLOG_ROOT: Path = Path(_backlog_root_env)
+else:
+    BACKLOG_ROOT = WORKSPACE_ROOT / BACKLOG_SUBDIR
+
+_backlog_index_env = os.environ.get("JUDGE_BACKLOG_INDEX", "")
+if _backlog_index_env:
+    _log.warning(
+        "JUDGE_BACKLOG_INDEX is deprecated. "
+        "Backlog index path is derived from JUDGE_WORKSPACE_ROOT automatically. "
+        "JUDGE_BACKLOG_INDEX will be removed in a future release."
+    )
+    BACKLOG_INDEX: Path = Path(_backlog_index_env)
+else:
+    BACKLOG_INDEX = WORKSPACE_ROOT / "BACKLOG.md"
 
 # ---------------------------------------------------------------------------
 # Operational parameters

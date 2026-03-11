@@ -233,3 +233,43 @@ class TestConfigOverrides:
         env_copy.pop("JUDGE_BACKLOG_ROOT", None)
         with patch.dict(os.environ, env_copy, clear=True):
             importlib.reload(config)
+
+
+class TestDeprecatedPathEnvVars:
+    """AC-7: JUDGE_BACKLOG_ROOT and JUDGE_BACKLOG_INDEX emit deprecation warnings."""
+
+    def test_backlog_root_env_override_warns_deprecated(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """JUDGE_BACKLOG_ROOT is honored but emits a deprecation warning."""
+        import logging
+
+        custom_root = tmp_path / "custom-backlog"
+        with patch.dict(os.environ, {"JUDGE_BACKLOG_ROOT": str(custom_root)}, clear=False):
+            with caplog.at_level(logging.WARNING, logger="devbench.config"):
+                importlib.reload(config)
+            assert custom_root == config.BACKLOG_ROOT
+            assert any("JUDGE_BACKLOG_ROOT" in msg and "deprecated" in msg.lower() for msg in caplog.messages)
+
+        env_copy = os.environ.copy()
+        env_copy.pop("JUDGE_BACKLOG_ROOT", None)
+        with patch.dict(os.environ, env_copy, clear=True):
+            importlib.reload(config)
+
+    def test_backlog_index_env_override_warns_deprecated(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """JUDGE_BACKLOG_INDEX is honored but emits a deprecation warning."""
+        import logging
+
+        custom_index = tmp_path / "CUSTOM_BACKLOG.md"
+        with patch.dict(os.environ, {"JUDGE_BACKLOG_INDEX": str(custom_index)}, clear=False):
+            with caplog.at_level(logging.WARNING, logger="devbench.config"):
+                importlib.reload(config)
+            assert custom_index == config.BACKLOG_INDEX
+            assert any("JUDGE_BACKLOG_INDEX" in msg and "deprecated" in msg.lower() for msg in caplog.messages)
+
+        env_copy = os.environ.copy()
+        env_copy.pop("JUDGE_BACKLOG_INDEX", None)
+        with patch.dict(os.environ, env_copy, clear=True):
+            importlib.reload(config)

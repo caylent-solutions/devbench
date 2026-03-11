@@ -14,7 +14,7 @@
 set -euo pipefail
 
 # Required environment variable guard
-required_vars=(JUDGE_CLAUDE_MODEL JUDGE_GH_ORG JUDGE_ALLOWED_REPOS JUDGE_WORKSPACE_ROOT)
+required_vars=(JUDGE_CLAUDE_MODEL JUDGE_WORKSPACE_ROOT)
 for var in "${required_vars[@]}"; do
   if [ -z "${!var:-}" ]; then
     echo "❌ Required environment variable $var is not set." >&2

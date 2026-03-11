@@ -10,15 +10,17 @@ Config value precedence:
 
 YAML schema::
 
-    repos:                         # required — at least one entry
-      org/repo:                    # key must be "org/repo" format
-        default_branch: main2      # optional — omit to fall back to origin/HEAD
+    repos:                               # required — at least one entry
+      org/repo:                          # key must be "org/repo" format
+        default_branch: main2            # optional — omit to fall back to origin/HEAD
+        checkout_directory: my-checkout  # optional — relative to JUDGE_WORKSPACE_ROOT
 
 Example config file (``backlog/config/devbench.yaml``)::
 
     repos:
       caylent-solutions/devbench:
         default_branch: main2
+        checkout_directory: devbench
 """
 
 from __future__ import annotations
@@ -40,9 +42,14 @@ class RepoConfig:
     Attributes:
         default_branch: Explicit default branch to use for this repo.
             When ``None``, branch consumers fall back to ``origin/HEAD``.
+        checkout_directory: Path relative to ``JUDGE_WORKSPACE_ROOT`` where
+            the repo is checked out.  Must not be absolute or contain ``..``.
+            When ``None``, defaults to the repo short-name (the part after
+            the ``/`` in ``org/repo``).
     """
 
     default_branch: str | None = None
+    checkout_directory: str | None = None
 
 
 @dataclass
@@ -82,7 +89,7 @@ def resolve_config_path(
     return workspace_root / DEFAULT_CONFIG_SUBPATH
 
 
-def load_runtime_config(path: Path, env: Mapping[str, str]) -> RuntimeConfig:  # noqa: ARG001
+def load_runtime_config(path: Path, env: Mapping[str, str]) -> RuntimeConfig:  # noqa: ARG001, PLR0912
     """Load YAML at *path*, validate the schema, and return a ``RuntimeConfig``.
 
     Value precedence: environment variables > YAML values > code defaults.
@@ -135,6 +142,7 @@ def load_runtime_config(path: Path, env: Mapping[str, str]) -> RuntimeConfig:  #
                 "'org/repo' format (e.g. 'caylent-solutions/devbench')."
             )
         default_branch: str | None = None
+        checkout_directory: str | None = None
         if isinstance(repo_data, dict):
             raw_branch = repo_data.get("default_branch")
             if raw_branch is not None:
@@ -144,9 +152,55 @@ def load_runtime_config(path: Path, env: Mapping[str, str]) -> RuntimeConfig:  #
                         f"must be a string, got {type(raw_branch).__name__}."
                     )
                 default_branch = raw_branch
-        repos[repo_name] = RepoConfig(default_branch=default_branch)
+
+            raw_checkout = repo_data.get("checkout_directory")
+            if raw_checkout is not None:
+                if not isinstance(raw_checkout, str):
+                    raise ValueError(
+                        f"Config file '{path}': repos.{repo_name}.checkout_directory "
+                        f"must be a string, got {type(raw_checkout).__name__}."
+                    )
+                if Path(raw_checkout).is_absolute():
+                    raise ValueError(
+                        f"Config file '{path}': repos.{repo_name}.checkout_directory "
+                        f"must be a relative path, got absolute path '{raw_checkout}'."
+                    )
+                if ".." in Path(raw_checkout).parts:
+                    raise ValueError(
+                        f"Config file '{path}': repos.{repo_name}.checkout_directory "
+                        f"must not contain parent traversal ('..'), got '{raw_checkout}'."
+                    )
+                checkout_directory = raw_checkout
+        repos[repo_name] = RepoConfig(
+            default_branch=default_branch,
+            checkout_directory=checkout_directory,
+        )
 
     return RuntimeConfig(repos=repos)
+
+
+def get_repo_local_path(repo: str, runtime_config: RuntimeConfig, workspace_root: Path) -> Path:
+    """Return the local filesystem path for *repo*.
+
+    Resolution order:
+    1. ``repos.<repo>.checkout_directory`` resolved relative to *workspace_root*.
+    2. ``workspace_root / <repo-short-name>`` (the part after the ``/`` in ``org/repo``).
+
+    Pure function — no subprocess calls, no I/O.
+
+    Args:
+        repo: Fully-qualified repository name (e.g. ``'org/repo'``).
+        runtime_config: Loaded runtime configuration.
+        workspace_root: Absolute path to the workspace root.
+
+    Returns:
+        Absolute path to the local checkout directory.
+    """
+    repo_config = runtime_config.repos.get(repo)
+    if repo_config and repo_config.checkout_directory:
+        return workspace_root / repo_config.checkout_directory
+    short_name = repo.split("/", maxsplit=1)[1] if "/" in repo else repo
+    return workspace_root / short_name
 
 
 def get_configured_default_branch(repo: str, runtime_config: RuntimeConfig) -> str | None:

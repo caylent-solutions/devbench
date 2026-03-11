@@ -212,7 +212,11 @@ devbench/
 
 ## Configuration
 
-Required variables (`JUDGE_ALLOWED_REPOS`, `JUDGE_WORKSPACE_ROOT`, `JUDGE_CLAUDE_MODEL`) raise `RuntimeError` at startup if unset. The startup scripts (`start.sh`, `start-interactive.sh`) additionally require `JUDGE_GH_ORG`. See [SYSTEM-OVERVIEW.md](SYSTEM-OVERVIEW.md#environment-variables) for the full variable reference.
+Required variables (`JUDGE_WORKSPACE_ROOT`, `JUDGE_CLAUDE_MODEL`) raise `RuntimeError` at startup if unset. Allowed repositories and per-repo settings (default branch, checkout directory) are defined in `backlog/config/devbench.yaml` — see [SYSTEM-OVERVIEW.md](SYSTEM-OVERVIEW.md#environment-variables) for the full variable reference and YAML schema.
+
+The `--config <path>` CLI flag (or `JUDGE_CONFIG_PATH` env var) overrides the default config file location.
+
+> **Note:** `JUDGE_ALLOWED_REPOS`, `JUDGE_BACKLOG_ROOT`, and `JUDGE_BACKLOG_INDEX` are deprecated. They are still honored for backward compatibility but emit warnings. Migrate to the YAML config.
 
 ## Interactive Mode
 

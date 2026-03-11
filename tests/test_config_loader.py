@@ -16,6 +16,7 @@ from devbench.config_loader import (
     RepoConfig,
     RuntimeConfig,
     get_configured_default_branch,
+    get_repo_local_path,
     load_runtime_config,
     resolve_config_path,
 )
@@ -194,3 +195,108 @@ class TestDataclasses:
         """RepoConfig() has default_branch=None."""
         rc = RepoConfig()
         assert rc.default_branch is None
+
+    def test_repo_config_checkout_directory_none_by_default(self) -> None:
+        """RepoConfig() has checkout_directory=None by default."""
+        rc = RepoConfig()
+        assert rc.checkout_directory is None
+
+
+# ---------------------------------------------------------------------------
+# checkout_directory parsing — AC-1, AC-3, AC-4
+# ---------------------------------------------------------------------------
+
+
+class TestCheckoutDirectory:
+    """Tests for checkout_directory YAML field parsing and validation."""
+
+    @staticmethod
+    def _write(path: Path, content: str) -> Path:
+        path.write_text(textwrap.dedent(content))
+        return path
+
+    def test_parses_checkout_directory(self, tmp_path: Path) -> None:
+        """AC-1: checkout_directory is parsed when present."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                checkout_directory: my-checkout
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.repos["org/repo"].checkout_directory == "my-checkout"
+
+    def test_checkout_directory_omitted_is_none(self, tmp_path: Path) -> None:
+        """checkout_directory defaults to None when not specified."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            "repos:\n  org/repo:\n    default_branch: main\n",
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.repos["org/repo"].checkout_directory is None
+
+    def test_checkout_directory_rejects_absolute_path(self, tmp_path: Path) -> None:
+        """AC-3: absolute checkout_directory fails fast."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            "repos:\n  org/repo:\n    checkout_directory: /absolute/path\n",
+        )
+        with pytest.raises(ValueError, match="absolute"):
+            load_runtime_config(cfg, {})
+
+    def test_checkout_directory_rejects_parent_traversal(self, tmp_path: Path) -> None:
+        """AC-4: checkout_directory containing .. fails fast."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            "repos:\n  org/repo:\n    checkout_directory: ../escape\n",
+        )
+        with pytest.raises(ValueError, match=r"\.\.|traversal"):
+            load_runtime_config(cfg, {})
+
+    def test_checkout_directory_rejects_non_string(self, tmp_path: Path) -> None:
+        """checkout_directory must be a string."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            "repos:\n  org/repo:\n    checkout_directory: 123\n",
+        )
+        with pytest.raises(ValueError, match="string"):
+            load_runtime_config(cfg, {})
+
+
+# ---------------------------------------------------------------------------
+# get_repo_local_path — AC-2, AC-5
+# ---------------------------------------------------------------------------
+
+
+class TestGetRepoLocalPath:
+    """AC-2 and AC-5: get_repo_local_path returns checkout_directory or falls back to short name."""
+
+    def test_uses_checkout_directory_resolved_to_workspace(self, tmp_path: Path) -> None:
+        """AC-2: checkout_directory resolved relative to workspace_root."""
+        config = RuntimeConfig(
+            repos={"org/my-repo": RepoConfig(checkout_directory="custom-checkout")}
+        )
+        result = get_repo_local_path("org/my-repo", config, tmp_path)
+        assert result == tmp_path / "custom-checkout"
+
+    def test_falls_back_to_repo_short_name(self, tmp_path: Path) -> None:
+        """AC-5: repo short-name used when checkout_directory is absent."""
+        config = RuntimeConfig(repos={"org/my-repo": RepoConfig()})
+        result = get_repo_local_path("org/my-repo", config, tmp_path)
+        assert result == tmp_path / "my-repo"
+
+    def test_falls_back_when_repo_not_in_config(self, tmp_path: Path) -> None:
+        """AC-5: short-name fallback even when repo is missing from config."""
+        config = RuntimeConfig(repos={})
+        result = get_repo_local_path("org/unknown-repo", config, tmp_path)
+        assert result == tmp_path / "unknown-repo"
+
+    def test_checkout_directory_none_uses_short_name(self, tmp_path: Path) -> None:
+        """AC-5: explicit None checkout_directory falls back to short name."""
+        config = RuntimeConfig(
+            repos={"org/my-repo": RepoConfig(checkout_directory=None)}
+        )
+        result = get_repo_local_path("org/my-repo", config, tmp_path)
+        assert result == tmp_path / "my-repo"

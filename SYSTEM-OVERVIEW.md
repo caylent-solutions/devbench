@@ -197,15 +197,40 @@ Up to 10 retry attempts before marking the unit as blocked.
 
 All configuration is via environment variables. Required variables raise `RuntimeError` at startup if unset.
 
+### Required
+
+| Variable | Description |
+|----------|-------------|
+| `JUDGE_WORKSPACE_ROOT` | Absolute path to workspace root containing all repo clones |
+| `JUDGE_CLAUDE_MODEL` | Claude model identifier for LLM judge calls |
+
+### YAML Configuration File
+
+Repos and per-repo settings are defined in `backlog/config/devbench.yaml` (relative to `JUDGE_WORKSPACE_ROOT`).
+
+**Config file path resolution** (first match wins):
+1. `--config <path>` CLI argument
+2. `JUDGE_CONFIG_PATH` environment variable
+3. `<JUDGE_WORKSPACE_ROOT>/backlog/config/devbench.yaml` (default)
+
+**YAML schema:**
+
+```yaml
+repos:
+  org/repo:                          # key must be "org/repo" format; at least one required
+    default_branch: main2            # optional — omit to fall back to origin/HEAD
+    checkout_directory: my-checkout  # optional — relative to JUDGE_WORKSPACE_ROOT
+                                     # omit to use repo short-name (e.g. "my-repo")
+```
+
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `JUDGE_ALLOWED_REPOS` | *(required)* | Comma-separated list of allowed repos (`org/repo1,org/repo2`) |
-| `JUDGE_WORKSPACE_ROOT` | *(required)* | Absolute path to workspace root containing all repo clones |
-| `JUDGE_CLAUDE_MODEL` | *(required)* | Claude model identifier for LLM judge calls |
+| `JUDGE_CONFIG_PATH` | *(see above)* | Override YAML config file path |
+| `JUDGE_ALLOWED_REPOS` | *(deprecated)* | **Deprecated** — define repos in YAML `repos` section instead. Honored for backward compatibility; a warning is emitted. |
 | `JUDGE_MERGE_STRATEGY` | `squash` | PR merge strategy: `merge`, `squash`, or `rebase` |
 | `JUDGE_GH_ORG` | *(empty)* | When set, restricts all GitHub ops to this org only |
-| `JUDGE_BACKLOG_ROOT` | `<workspace>/backlog` | Backlog directory path |
-| `JUDGE_BACKLOG_INDEX` | `<workspace>/BACKLOG.md` | Backlog index file path |
+| `JUDGE_BACKLOG_ROOT` | `<workspace>/backlog` | **Deprecated** — derived from `JUDGE_WORKSPACE_ROOT` automatically. Honored for backward compatibility; a warning is emitted. |
+| `JUDGE_BACKLOG_INDEX` | `<workspace>/BACKLOG.md` | **Deprecated** — derived from `JUDGE_WORKSPACE_ROOT` automatically. Honored for backward compatibility; a warning is emitted. |
 | `JUDGE_MAX_RETRIES` | `10` | Max retry attempts per work unit before marking blocked |
 | `JUDGE_USE_BEDROCK` | `false` | Use AWS Bedrock instead of Anthropic API |
 | `JUDGE_BEDROCK_REGION` | `us-east-1` | AWS region for Bedrock (falls back to `AWS_REGION`) |

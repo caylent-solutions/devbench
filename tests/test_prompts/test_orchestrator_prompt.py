@@ -54,6 +54,30 @@ def test_set_status_precedes_execution_sequence() -> None:
     )
 
 
+def test_prompt_red_requires_failure_output_logged() -> None:
+    # The RED phase must require pasting actual test runner output into the TDD Cycle Log,
+    # not just claiming "test fails as expected". Without this requirement an agent can
+    # fabricate the RED phase without ever running the test — making the TDD cycle
+    # unverifiable. If this assertion fails after a prompt refactor, confirm the RED
+    # bullet still requires logging real failure output, not just confirming the failure.
+    prompt = _prompt_text()
+    assert "paste the actual failure output" in prompt, (
+        "RED bullet must require pasting actual test runner failure output into the TDD Cycle Log"
+    )
+
+
+def test_prompt_red_contains_do_not_proceed_gate() -> None:
+    # The RED phase must include an explicit gate preventing the agent from moving to GREEN
+    # before failure output has been logged. This closes the loophole where an agent
+    # writes a test, skips running it, and proceeds directly to implementation.
+    # If this assertion fails after a prompt refactor, restore the gate phrase or an
+    # equivalent instruction that blocks the GREEN phase until RED output is recorded.
+    prompt = _prompt_text()
+    assert "Do not proceed to GREEN until failure output is logged" in prompt, (
+        "RED bullet must contain the gate phrase blocking GREEN until failure output is logged"
+    )
+
+
 def test_prompt_contains_branch_precedence_rule() -> None:
     # Step 5A must state the two-rule precedence for branch naming so the agent
     # never invents ad-hoc names. The rules are: (1) use the branch from the work

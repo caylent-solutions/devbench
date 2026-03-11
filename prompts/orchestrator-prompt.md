@@ -71,7 +71,7 @@ Follow this execution sequence:
 3. **Read AGENT-INSTRUCTIONS.md** (`$JUDGE_WORKSPACE_ROOT/backlog/AGENT-INSTRUCTIONS.md`) — follow all workflow rules.
 4. **Check dependencies** — verify all dependent work units are done before proceeding.
 5. **Follow TDD strictly:**
-   - **RED:** Write a failing test first. Run the test, confirm it fails.
+   - **RED:** Write a failing test first. Run the test, confirm it fails, and paste the actual failure output into the TDD Cycle Log. Do not proceed to GREEN until failure output is logged.
    - **GREEN:** Write minimal code to make the test pass. Run the test, confirm it passes.
    - **REFACTOR:** Clean up while tests stay green.
    - Log each TDD phase in the work unit Comments section.

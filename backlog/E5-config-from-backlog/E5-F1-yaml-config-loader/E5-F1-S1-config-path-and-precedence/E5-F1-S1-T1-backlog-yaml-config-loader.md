@@ -1,6 +1,6 @@
 # E5-F1-S1-T1: Load backlog YAML config with deterministic precedence and repo branch fallback
 
-## Status: in-review
+## Status: done
 
 ## Spec Reference
 
@@ -167,4 +167,4 @@ Then `gh pr create` is invoked with `--base main2`
 
 ## Comments
 
-<!-- Agent log will be filled in during execution -->
+2026-03-11 — [REVIEW_PASS] code_review, test_review, doc_review, changes_manifest all passed after 3 review rounds. Remaining LOW/MEDIUM findings accepted as tech debt per 3-round limit. Merged to feature/config-yaml.

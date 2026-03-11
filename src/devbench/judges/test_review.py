@@ -27,13 +27,14 @@ class TestReviewJudge(BaseJudge):
 
     def evaluate(self, work_unit_path: Path, repo_path: Path, **kwargs: object) -> JudgeResult:
         """Evaluate test quality by gathering evidence and delegating to the LLM."""
+        repo: str = str(kwargs.get("repo", ""))
         work_unit_content = self._read_file(work_unit_path)
 
         # Gather test execution output
         test_output = self._run_tests(repo_path)
 
         # Gather test file contents
-        test_files_content = self._collect_test_files(repo_path)
+        test_files_content = self._collect_test_files(repo_path, repo=repo)
 
         evidence_sections: dict[str, str] = {
             "Work Unit": work_unit_content,
@@ -79,13 +80,13 @@ class TestReviewJudge(BaseJudge):
         )
         return rc == 0
 
-    def _collect_test_files(self, repo_path: Path) -> str:
+    def _collect_test_files(self, repo_path: Path, repo: str = "") -> str:
         """Collect test file contents for LLM context.
 
         Changed test files are prioritised so they appear first in the
         LLM context window.
         """
-        changed_files = self._get_changed_test_files(repo_path)
+        changed_files = self._get_changed_test_files(repo_path, repo=repo)
 
         test_dirs = [repo_path / "tests", repo_path / "test"]
         all_test_files: list[Path] = []
@@ -116,7 +117,7 @@ class TestReviewJudge(BaseJudge):
         content_parts = changed_parts + other_parts
         return "\n".join(content_parts[:LLM_FILE_CONTEXT_LIMIT])
 
-    def _get_changed_test_files(self, repo_path: Path) -> set[str]:
+    def _get_changed_test_files(self, repo_path: Path, repo: str = "") -> set[str]:
         """Return the set of test file paths changed in the current work."""
         files: set[str] = set()
         for cmd in (
@@ -131,7 +132,7 @@ class TestReviewJudge(BaseJudge):
                     if stripped and ("test_" in stripped or "_test.py" in stripped):
                         files.add(stripped)
 
-        default_branch = self._get_default_branch(repo_path)
+        default_branch = self._get_default_branch(repo_path, repo=repo)
         rc, stdout, _ = self._run_command(["git", "diff", "--name-only", default_branch], cwd=repo_path)
         if rc == 0 and stdout.strip():
             for line in stdout.splitlines():

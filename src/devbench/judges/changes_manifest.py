@@ -21,9 +21,10 @@ class ChangesManifestJudge(BaseJudge):
 
     def evaluate(self, work_unit_path: Path, repo_path: Path, **kwargs: object) -> JudgeResult:
         """Evaluate change scope by gathering evidence and delegating to the LLM."""
+        repo: str = str(kwargs.get("repo", ""))
         work_unit_content = self._read_file(work_unit_path)
-        diff_summary = self._get_diff_summary(repo_path)
-        changed_files = self._get_changed_files(repo_path)
+        diff_summary = self._get_diff_summary(repo_path, repo=repo)
+        changed_files = self._get_changed_files(repo_path, repo=repo)
 
         return self._llm_evaluate(
             system_prompt=_CHANGES_MANIFEST_SYSTEM_PROMPT,
@@ -42,7 +43,7 @@ class ChangesManifestJudge(BaseJudge):
             return set()
         return {line.strip() for line in stdout.splitlines() if line.strip()}
 
-    def _get_changed_files(self, repo_path: Path) -> list[str]:
+    def _get_changed_files(self, repo_path: Path, repo: str = "") -> list[str]:
         """Return list of ALL files changed: staged, unstaged, untracked, and committed on branch.
 
         Collects from all sources so evidence is complete whether the agent
@@ -60,12 +61,12 @@ class ChangesManifestJudge(BaseJudge):
         files |= self._collect_files(repo_path, ["git", "ls-files", "--others", "--exclude-standard"])
 
         # All committed branch changes vs default branch
-        default_branch = self._get_default_branch(repo_path)
+        default_branch = self._get_default_branch(repo_path, repo=repo)
         files |= self._collect_files(repo_path, ["git", "diff", "--name-only", default_branch])
 
         return sorted(files)
 
-    def _get_diff_summary(self, repo_path: Path) -> str:
+    def _get_diff_summary(self, repo_path: Path, repo: str = "") -> str:
         """Return a summary of all changes for LLM context.
 
         Includes staged, unstaged, untracked, and committed branch changes.
@@ -94,14 +95,14 @@ class ChangesManifestJudge(BaseJudge):
             parts.append(f"Untracked files:\n{untracked}")
 
         # All committed branch changes vs default branch
-        default_branch = self._get_default_branch(repo_path)
+        default_branch = self._get_default_branch(repo_path, repo=repo)
         rc, stat_out, _ = self._run_command(
             ["git", "diff", "--stat", default_branch], cwd=repo_path,
         )
         if rc == 0 and stat_out.strip():
             parts.append(f"Committed changes vs {default_branch}:\n{stat_out}")
 
-        all_files = self._get_changed_files(repo_path)
+        all_files = self._get_changed_files(repo_path, repo=repo)
         parts.append("All changed files:\n" + "\n".join(all_files))
 
         return "\n\n".join(parts)

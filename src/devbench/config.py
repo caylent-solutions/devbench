@@ -1,15 +1,37 @@
 """Configuration module for the judges system.
 
 Centralizes all configuration values, repo validation, and credential access.
-All environment-specific values are read from environment variables with defaults.
+
+Config precedence (highest to lowest):
+1. Environment variables
+2. YAML config file (``backlog/config/devbench.yaml`` by default)
+3. Code defaults
+
+Config file path resolution:
+1. ``--config`` CLI argument  (sets ``JUDGE_CONFIG_PATH`` before module import)
+2. ``JUDGE_CONFIG_PATH`` environment variable
+3. ``<JUDGE_WORKSPACE_ROOT>/backlog/config/devbench.yaml``
+
+``JUDGE_ALLOWED_REPOS`` is **deprecated** — define allowed repos in the YAML
+``repos`` section instead.  If ``JUDGE_ALLOWED_REPOS`` is still set in the
+environment it takes precedence (env > yaml) but a warning is emitted.
 """
 
 import json
+import logging
 import os
 from enum import StrEnum
 from pathlib import Path
 
+from devbench.config_loader import (
+    RuntimeConfig,
+    get_repo_local_path,
+    load_runtime_config,
+    resolve_config_path,
+)
 from devbench.constants import BACKLOG_SUBDIR
+
+_log = logging.getLogger("devbench.config")
 
 # ---------------------------------------------------------------------------
 # Repository allow-list
@@ -17,15 +39,6 @@ from devbench.constants import BACKLOG_SUBDIR
 # When set, restricts all GitHub operations to this org only.
 # Unset or empty to allow any org in the allow-list.
 ALLOWED_GH_ORG: str = os.environ.get("JUDGE_GH_ORG", "")
-
-# Comma-separated list of allowed repositories in org/repo format.
-_allowed_repos_raw = os.environ.get("JUDGE_ALLOWED_REPOS", "")
-if not _allowed_repos_raw:
-    raise RuntimeError(
-        "JUDGE_ALLOWED_REPOS environment variable is not set. "
-        "Provide a comma-separated list of allowed repositories (e.g. org/repo1,org/repo2)."
-    )
-ALLOWED_REPOS: frozenset[str] = frozenset(r.strip() for r in _allowed_repos_raw.split(",") if r.strip())
 
 # Absolute path to the workspace root directory containing all repo clones.
 _workspace_root = os.environ.get("JUDGE_WORKSPACE_ROOT", "")
@@ -36,12 +49,41 @@ if not _workspace_root:
     )
 WORKSPACE_ROOT: Path = Path(_workspace_root)
 
-REPO_LOCAL_PATHS: dict[str, Path] = {repo: WORKSPACE_ROOT / repo.split("/", maxsplit=1)[1] for repo in ALLOWED_REPOS}
+# ---------------------------------------------------------------------------
+# YAML config loading
+# ---------------------------------------------------------------------------
+# Resolve config path and load YAML.  Fails fast if the file cannot be found.
+_config_path: Path = resolve_config_path(None, os.environ, WORKSPACE_ROOT)
+RUNTIME_CONFIG: RuntimeConfig = load_runtime_config(_config_path, os.environ)
+
+# ---------------------------------------------------------------------------
+# Allowed repos — sourced from YAML; JUDGE_ALLOWED_REPOS env is deprecated.
+# ---------------------------------------------------------------------------
+_allowed_repos_env = os.environ.get("JUDGE_ALLOWED_REPOS", "")
+if _allowed_repos_env:
+    # JUDGE_ALLOWED_REPOS is deprecated — repos should be declared in the YAML
+    # config.  Honor env for backward compatibility (env > yaml) but warn.
+    _log.warning(
+        "JUDGE_ALLOWED_REPOS is deprecated. "
+        "Declare repos in the YAML config file instead (see backlog/config/devbench.yaml). "
+        "JUDGE_ALLOWED_REPOS will be removed in a future release."
+    )
+    ALLOWED_REPOS: frozenset[str] = frozenset(
+        r.strip() for r in _allowed_repos_env.split(",") if r.strip()
+    )
+else:
+    ALLOWED_REPOS = frozenset(RUNTIME_CONFIG.repos)
+
+REPO_LOCAL_PATHS: dict[str, Path] = {
+    repo: get_repo_local_path(repo, RUNTIME_CONFIG, WORKSPACE_ROOT) for repo in ALLOWED_REPOS
+}
 
 # Short name -> full name mapping for backlog compatibility.
 # The backlog table uses short names (e.g., "git-repo") while the allow-list
 # uses fully-qualified names (e.g., "caylent-solutions/git-repo").
-REPO_SHORT_TO_FULL: dict[str, str] = {repo.split("/", maxsplit=1)[1]: repo for repo in ALLOWED_REPOS}
+REPO_SHORT_TO_FULL: dict[str, str] = {
+    repo.split("/", maxsplit=1)[1]: repo for repo in ALLOWED_REPOS
+}
 
 
 def resolve_repo(short_or_full: str) -> str:
@@ -64,8 +106,27 @@ def resolve_repo(short_or_full: str) -> str:
 # ---------------------------------------------------------------------------
 # Backlog paths
 # ---------------------------------------------------------------------------
-BACKLOG_ROOT: Path = Path(os.environ.get("JUDGE_BACKLOG_ROOT", str(WORKSPACE_ROOT / BACKLOG_SUBDIR)))
-BACKLOG_INDEX: Path = Path(os.environ.get("JUDGE_BACKLOG_INDEX", str(WORKSPACE_ROOT / "BACKLOG.md")))
+_backlog_root_env = os.environ.get("JUDGE_BACKLOG_ROOT", "")
+if _backlog_root_env:
+    _log.warning(
+        "JUDGE_BACKLOG_ROOT is deprecated. "
+        "Backlog path is derived from JUDGE_WORKSPACE_ROOT automatically. "
+        "JUDGE_BACKLOG_ROOT will be removed in a future release."
+    )
+    BACKLOG_ROOT: Path = Path(_backlog_root_env)
+else:
+    BACKLOG_ROOT = WORKSPACE_ROOT / BACKLOG_SUBDIR
+
+_backlog_index_env = os.environ.get("JUDGE_BACKLOG_INDEX", "")
+if _backlog_index_env:
+    _log.warning(
+        "JUDGE_BACKLOG_INDEX is deprecated. "
+        "Backlog index path is derived from JUDGE_WORKSPACE_ROOT automatically. "
+        "JUDGE_BACKLOG_INDEX will be removed in a future release."
+    )
+    BACKLOG_INDEX: Path = Path(_backlog_index_env)
+else:
+    BACKLOG_INDEX = WORKSPACE_ROOT / "BACKLOG.md"
 
 # ---------------------------------------------------------------------------
 # Operational parameters
@@ -80,13 +141,17 @@ if not _claude_model:
     )
 CLAUDE_MODEL: str = _claude_model
 
+
 class MergeStrategy(StrEnum):
+    """Valid merge strategies for PR merges."""
+
     MERGE = "merge"
     SQUASH = "squash"
     REBASE = "rebase"
 
     @property
     def flag(self) -> str:
+        """Return the ``gh pr merge`` flag for this strategy."""
         return f"--{self.value}"
 
 

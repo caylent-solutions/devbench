@@ -5,7 +5,12 @@ can invoke judge operations, query backlog status, and execute work units.
 
 Usage::
 
-    python3 -m devbench.cli <command> [args]
+    python3 -m devbench.cli [--config <path>] <command> [args]
+
+Options::
+
+    --config <path>         Path to devbench YAML config (sets JUDGE_CONFIG_PATH).
+                            Overrides the JUDGE_CONFIG_PATH environment variable.
 
 Commands::
 
@@ -32,6 +37,21 @@ import sys
 from collections.abc import Callable
 from datetime import UTC
 from pathlib import Path
+
+
+# Pre-parse --config before any devbench imports so that config.py loads the
+# correct YAML at module import time (config.py reads JUDGE_CONFIG_PATH on import).
+def _pre_parse_config(argv: list[str]) -> None:
+    """Extract --config <path> from argv and set JUDGE_CONFIG_PATH env var."""
+    for i, arg in enumerate(argv):
+        if arg == "--config" and i + 1 < len(argv):
+            os.environ["JUDGE_CONFIG_PATH"] = argv[i + 1]
+            # Remove --config and its value so downstream parsing is unaffected.
+            argv.pop(i + 1)
+            argv.pop(i)
+            return
+
+_pre_parse_config(sys.argv)
 
 from devbench.backlog.manager import BacklogManager
 from devbench.backlog.parser import BacklogParser
@@ -221,7 +241,7 @@ def cmd_review(unit_id: str) -> int:
     for judge in judges:
         judge.previous_feedback = prior_feedback.get(judge.name, "")
         logger.info("Running %s judge on %s", judge.name, unit_id)
-        judge_result = judge.evaluate(work_unit_path=wu_file, repo_path=repo_path)
+        judge_result = judge.evaluate(work_unit_path=wu_file, repo_path=repo_path, repo=full_repo)
         passed = judge_result.verdict == Verdict.PASS
         if not passed:
             all_passed = False

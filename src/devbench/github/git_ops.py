@@ -12,10 +12,12 @@ from devbench.config import (
     GH_API_TIMEOUT,
     GITHUB_CHECK_TIMEOUT_SECONDS,
     MERGE_STRATEGY,
+    RUNTIME_CONFIG,
     WORKSPACE_ROOT,
     get_gh_token,
     validate_repo,
 )
+from devbench.config_loader import get_configured_default_branch
 from devbench.judges.base import BaseJudge, JudgeResult, Verdict
 
 
@@ -77,6 +79,7 @@ class GitOpsJudge(BaseJudge):
         """
         validate_repo(repo)
 
+        base_branch = get_configured_default_branch(repo, RUNTIME_CONFIG)
         cmd: list[str] = [
             "pr",
             "create",
@@ -87,6 +90,8 @@ class GitOpsJudge(BaseJudge):
             "--body",
             body,
         ]
+        if base_branch:
+            cmd += ["--base", base_branch]
 
         rc, stdout, stderr = self._gh(cmd, cwd=repo_path, repo=repo)
         if rc != 0:
@@ -202,7 +207,7 @@ class GitOpsJudge(BaseJudge):
         submodule_name = repo_path.name
 
         # Pull latest default branch into the submodule so parent sees the merged commit
-        default_branch = self._get_default_branch(repo_path)
+        default_branch = self._get_default_branch(repo_path, repo=repo)
         self._git(["checkout", default_branch], repo_path)
         self._git(["pull", "origin", default_branch], repo_path)
 

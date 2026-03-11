@@ -201,8 +201,44 @@ class TestProcessWorkUnit:
         unit = _make_unit(tmp_path)
         unit.repo = "evil/repo"
 
-        with pytest.raises(ValueError, match="not allowed"):
+        with pytest.raises(ValueError, match=r"not allowed|not recognised"):
             process_work_unit(unit)
+
+    def test_canonicalizes_short_repo_name(self, tmp_path: Path) -> None:
+        """AC-6: short repo name is resolved to full name before downstream calls."""
+        from devbench.execution.orchestrator import process_work_unit
+
+        unit = _make_unit(tmp_path)
+        unit.repo = "git-repo"  # short name, not "caylent-solutions/git-repo"
+
+        exec_result = ExecutionResult(status=ExecutionStatus.IN_REVIEW, output="done", blocker="")
+        mock_judge = MagicMock()
+        mock_judge.name = "mock"
+        mock_judge.evaluate.return_value = _pass_result("mock")
+        mock_git_ops = MagicMock()
+        mock_git_ops.create_pr.return_value = "https://github.com/org/repo/pull/1"
+        mock_git_ops.wait_for_checks.return_value = True
+        mock_mgr = MagicMock()
+
+        with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+            with patch(f"{_ORC}.claude_executor") as mock_exec:
+                mock_exec.execute.return_value = exec_result
+                with patch(f"{_ORC}.CodeReviewJudge", return_value=mock_judge):
+                    with patch(f"{_ORC}.TestReviewJudge", return_value=mock_judge):
+                        with patch(f"{_ORC}.DocReviewJudge", return_value=mock_judge):
+                            with patch(f"{_ORC}.ChangesManifestJudge", return_value=mock_judge):
+                                with patch(f"{_ORC}.SecurityReviewJudge", return_value=mock_judge):
+                                    with patch(f"{_ORC}.GitOpsJudge", return_value=mock_git_ops):
+                                        with patch(f"{_ORC}.BacklogManager", return_value=mock_mgr):
+                                            with patch(f"{_ORC}.BlockerResolverJudge"):
+                                                with patch(f"{_ORC}.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
+                                                    result = process_work_unit(unit)
+
+        assert result is True
+        # All git ops called with canonical full repo name
+        mock_git_ops.commit_and_push.assert_called_once()
+        call_kwargs = mock_git_ops.commit_and_push.call_args
+        assert call_kwargs.kwargs.get("repo") == "caylent-solutions/git-repo"
 
     def test_raises_for_missing_repo_path(self, tmp_path: Path) -> None:
         from devbench.execution.orchestrator import process_work_unit

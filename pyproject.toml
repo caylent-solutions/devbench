@@ -25,6 +25,7 @@ dev-dependencies = [
     "ruff>=0.15.0",
     "bandit>=1.8.0",
     "mypy>=1.15.0",
+    "types-pyyaml>=6.0.12.20250915",
 ]
 
 [tool.ruff]
@@ -78,6 +79,9 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["ARG", "PLR2004", "S", "TCH", "PLC0415", "E741", "PT", "SIM117", "RUF059"]
+# cli.py pre-parses --config before devbench imports so config.py loads the
+# correct YAML at import time; E402 is intentional here.
+"src/devbench/cli.py" = ["E402"]
 
 [tool.ruff.format]
 quote-style = "double"

@@ -33,7 +33,7 @@ from collections.abc import Callable
 from datetime import UTC
 from pathlib import Path
 
-from devbench.backlog.manager import BacklogManagerJudge
+from devbench.backlog.manager import BacklogManager
 from devbench.backlog.parser import BacklogParser
 from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus
 from devbench.config import (
@@ -120,7 +120,7 @@ def cmd_next() -> int:
     if not wu_file.exists():
         wu_file = WORKSPACE_ROOT / unit.file_path
     if wu_file.exists():
-        mgr = BacklogManagerJudge()
+        mgr = BacklogManager()
         mgr.force_status(wu_file, BACKLOG_INDEX, unit.id, STATUS_IN_PROGRESS)
         logger.info("Set %s to in-progress", unit.id)
 
@@ -202,7 +202,7 @@ def cmd_review(unit_id: str) -> int:
     target.file_path = wu_file
 
     # Automatically mark as in-review in both files
-    mgr = BacklogManagerJudge()
+    mgr = BacklogManager()
     mgr.force_status(wu_file, BACKLOG_INDEX, unit_id, STATUS_IN_REVIEW)
     logger.info("Set %s to in-review", unit_id)
 
@@ -347,7 +347,7 @@ def cmd_set_status(unit_id: str, new_status: str) -> int:
     if not wu_file.exists():
         wu_file = WORKSPACE_ROOT / target.file_path
 
-    mgr = BacklogManagerJudge()
+    mgr = BacklogManager()
     mgr.force_status(wu_file, BACKLOG_INDEX, unit_id, new_status)
 
     logger.info("Set %s to %s", unit_id, new_status)
@@ -358,7 +358,7 @@ def cmd_set_status(unit_id: str, new_status: str) -> int:
 def cmd_mark_done(unit_id: str) -> int:
     """Mark a work unit as Done, enforcing the done-gate check.
 
-    Calls ``BacklogManagerJudge.mark_done()`` which verifies that all required
+    Calls ``BacklogManager.mark_done()`` which verifies that all required
     review judges passed in the most recent round before allowing the transition.
     Raises ``RuntimeError`` if the gate check fails.
     """
@@ -374,7 +374,7 @@ def cmd_mark_done(unit_id: str) -> int:
     if not wu_file.exists():
         wu_file = WORKSPACE_ROOT / target.file_path
 
-    mgr = BacklogManagerJudge()
+    mgr = BacklogManager()
     try:
         mgr.mark_done(wu_file, BACKLOG_INDEX, unit_id)
     except RuntimeError as exc:
@@ -398,7 +398,7 @@ def cmd_validate_backlog() -> int:
     Exits 0 if the backlog is consistent; 1 with actionable error messages
     if any inconsistencies are found.
     """
-    mgr = BacklogManagerJudge()
+    mgr = BacklogManager()
     errors = mgr.validate(BACKLOG_INDEX, BACKLOG_INDEX.parent)
     if not errors:
         print("Backlog integrity check passed.")

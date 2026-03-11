@@ -214,7 +214,7 @@ class TestCmdReview:
                 with patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
                     with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
                         with patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
-                            with patch("devbench.cli.BacklogManagerJudge", return_value=mock_mgr):
+                            with patch("devbench.cli.BacklogManager", return_value=mock_mgr):
                                 with patch("devbench.cli.CodeReviewJudge", return_value=mock_judge):
                                     with patch("devbench.cli.TestReviewJudge", return_value=mock_judge):
                                         with patch("devbench.cli.DocReviewJudge", return_value=mock_judge):
@@ -360,7 +360,7 @@ class TestCmdSetStatus:
 
         with patch("devbench.cli.BacklogParser", return_value=mock_parser):
             with patch("devbench.cli.BACKLOG_ROOT", backlog_dir):
-                with patch("devbench.cli.BacklogManagerJudge", return_value=mock_mgr):
+                with patch("devbench.cli.BacklogManager", return_value=mock_mgr):
                     result = cli.cmd_set_status("E0-F1-S1-T2", "in-progress")
 
         assert result == 0
@@ -393,7 +393,7 @@ class TestCmdMarkDone:
 
         with patch("devbench.cli.BacklogParser", return_value=mock_parser):
             with patch("devbench.cli.BACKLOG_ROOT", backlog_dir):
-                with patch("devbench.cli.BacklogManagerJudge", return_value=mock_mgr):
+                with patch("devbench.cli.BacklogManager", return_value=mock_mgr):
                     result = cli.cmd_mark_done("E0-F1-S1-T2")
 
         assert result == 0
@@ -413,7 +413,7 @@ class TestCmdMarkDone:
 
         with patch("devbench.cli.BacklogParser", return_value=mock_parser):
             with patch("devbench.cli.BACKLOG_ROOT", backlog_dir):
-                with patch("devbench.cli.BacklogManagerJudge", return_value=mock_mgr):
+                with patch("devbench.cli.BacklogManager", return_value=mock_mgr):
                     result = cli.cmd_mark_done("E0-F1-S1-T2")
 
         assert result == 1
@@ -517,7 +517,7 @@ class TestCmdReviewWritesComments:
             patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
-            patch("devbench.cli.BacklogManagerJudge", return_value=mock_mgr),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
             patch("devbench.cli.CodeReviewJudge", return_value=mock_judges[0]),
             patch("devbench.cli.TestReviewJudge", return_value=mock_judges[1]),
             patch("devbench.cli.DocReviewJudge", return_value=mock_judges[2]),
@@ -537,7 +537,7 @@ class TestCmdReviewWritesComments:
         self, mock_units: list[WorkUnit], tmp_path: Path, backlog_dir: Path
     ) -> None:
         """Full flow: review writes comments, mark_done reads them and succeeds."""
-        from devbench.backlog.manager import BacklogManagerJudge as RealMgr
+        from devbench.backlog.manager import BacklogManager as RealMgr
 
         wu_file = backlog_dir / "E0-F1-S1-T2.md"
         wu_file.write_text("# E0-F1-S1-T2: Task\n\n## Status: in-review\n", encoding="utf-8")
@@ -629,7 +629,7 @@ class TestCmdValidateBacklogPathResolution:
         mock_mgr.validate.return_value = []
 
         with (
-            patch("devbench.cli.BacklogManagerJudge", return_value=mock_mgr),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
             patch("devbench.cli.BACKLOG_INDEX", idx),
             patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
         ):
@@ -650,7 +650,7 @@ class TestCmdValidateBacklog:
         mock_mgr = MagicMock()
         mock_mgr.validate.return_value = []
 
-        with patch("devbench.cli.BacklogManagerJudge", return_value=mock_mgr):
+        with patch("devbench.cli.BacklogManager", return_value=mock_mgr):
             with patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
                 with patch("devbench.cli.BACKLOG_ROOT", tmp_path):
                     result = cli.cmd_validate_backlog()
@@ -663,7 +663,7 @@ class TestCmdValidateBacklog:
         mock_mgr = MagicMock()
         mock_mgr.validate.return_value = ["E0-T1: work unit file missing", "E0-T2: status mismatch"]
 
-        with patch("devbench.cli.BacklogManagerJudge", return_value=mock_mgr):
+        with patch("devbench.cli.BacklogManager", return_value=mock_mgr):
             with patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
                 with patch("devbench.cli.BACKLOG_ROOT", tmp_path):
                     result = cli.cmd_validate_backlog()

@@ -1,23 +1,32 @@
-"""Backlog manager judge that updates work-unit statuses and traceability.
+"""Backlog manager that updates work-unit statuses and traceability.
 
-Provides methods to mark work units as done or blocked, update the backlog
-index, and log entries to the traceability matrix.
+Owns the backlog lifecycle: status writes, done-gate checks, rollups,
+comments, backlog validation, and traceability logging.
 
 Public API
 ----------
-``force_status``  — write any status to both files with no gate checks.
-                    Use for automated lifecycle transitions (in-progress,
-                    in-review) and for manual recovery overrides.
-``mark_done``     — gated completion: verifies all required review judges
-                    passed in the most recent round before writing ``done``.
-``mark_blocked``  — writes ``blocked`` and appends a reason comment.
-``validate``      — returns integrity errors (missing files, status drift,
-                    orphans, broken deps).
+``force_status``              — write any status to both files with no gate
+                                checks.  Use for automated lifecycle transitions
+                                (in-progress, in-review) and manual recovery.
+``mark_done``                 — gated completion: verifies all required review
+                                judges passed before writing ``done``.
+``mark_blocked``              — writes ``blocked`` and appends a reason comment.
+``validate``                  — returns integrity errors (missing files, status
+                                drift, orphans, broken deps).
+``log_to_traceability_matrix``— appends a spec/test mapping entry to the
+                                traceability matrix file.
+
+Constructor
+-----------
+``BacklogManager(logger=None)``
+    Accepts an optional ``logging.Logger`` instance.  Defaults to
+    ``logging.getLogger("devbench.backlog_manager")`` when omitted.
 
 All writes go through the private ``_set_status`` workhorse which updates
 both the work-unit file and BACKLOG.md atomically.
 """
 
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -35,27 +44,19 @@ from devbench.constants import (
     TRACEABILITY_MATRIX_HEADER,
     VALID_STATUSES,
 )
-from devbench.judges.base import BaseJudge, JudgeResult, Verdict
 
 
-class BacklogManagerJudge(BaseJudge):
-    """Updates backlog statuses, the backlog index, and the traceability matrix."""
+class BacklogManager:
+    """Owns backlog lifecycle: status writes, done-gate checks, rollups, comments, and validation."""
 
-    def __init__(self) -> None:
-        super().__init__("backlog_manager")
+    def __init__(self, logger: logging.Logger | None = None) -> None:
+        """Initialize the manager.
 
-    def evaluate(self, work_unit_path: Path, repo_path: Path, **kwargs: object) -> JudgeResult:
-        """Not used directly; BacklogManagerJudge exposes individual operation methods.
-
-        Returns a PASS result as a no-op when called via the evaluate interface.
+        Args:
+            logger: Optional logger instance.  Defaults to
+                ``logging.getLogger("devbench.backlog_manager")`` when omitted.
         """
-        return JudgeResult(
-            judge_name=self.name,
-            verdict=Verdict.PASS,
-            reasoning="BacklogManagerJudge.evaluate is a no-op; use specific operation methods.",
-            feedback="",
-            evidence=[],
-        )
+        self.logger = logger or logging.getLogger("devbench.backlog_manager")
 
     def force_status(
         self,

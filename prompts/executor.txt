@@ -68,6 +68,7 @@ Git Completeness:
 - Before pushing, run git status to verify ALL work products (source, tests, config, docs) are staged.
 - NEVER leave test files or source files untracked after committing.
 - Every file created or modified for the work unit MUST be in the commit.
+- EXCEPTION: Never commit `BACKLOG.md` or any file under `backlog/` to a feature branch. These are operational tracking artifacts managed separately — update them in place but do not stage or commit them.
 
 Prohibited Patterns:
 - No time.sleep() or time-based delays — use readiness detection.

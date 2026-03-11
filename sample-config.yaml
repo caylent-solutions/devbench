@@ -1,11 +1,13 @@
-# DevBench runtime configuration
+# DevBench runtime configuration — sample / starting point
+#
+# Copy this file to your workspace: cp sample-config.yaml backlog/config/devbench.yaml
 #
 # Precedence: environment variables > this file > code defaults
 #
 # Config file path resolution order:
 #   1. --config <path>          CLI argument
 #   2. JUDGE_CONFIG_PATH        environment variable
-#   3. backlog/config/devbench.yaml  (this file — default)
+#   3. backlog/config/devbench.yaml  (default, relative to JUDGE_WORKSPACE_ROOT)
 #
 # repos: defines allowed repositories and optional per-repo settings.
 # At least one entry is required. Keys must be in "org/repo" format.

@@ -206,7 +206,7 @@ All configuration is via environment variables. Required variables raise `Runtim
 
 ### YAML Configuration File
 
-Repos and per-repo settings are defined in `backlog/config/devbench.yaml` (relative to `JUDGE_WORKSPACE_ROOT`).
+Repos and per-repo settings are defined in `backlog/config/devbench.yaml` (relative to `JUDGE_WORKSPACE_ROOT`). Copy `sample-config.yaml` from the repo root as a starting point.
 
 **Config file path resolution** (first match wins):
 1. `--config <path>` CLI argument

@@ -54,6 +54,59 @@ def test_set_status_precedes_execution_sequence() -> None:
     )
 
 
+def test_prompt_contains_pre_review_self_check() -> None:
+    # Step 3 must include a pre-review self-check step between "Verify all work" and
+    # "Update the work unit status to in-review". Without this gate, common judge failures
+    # (missing docstrings, call-count-only assertions, untested edge cases) are not caught
+    # before the full judge round-trip. If this assertion fails after a prompt refactor,
+    # confirm that a self-check step with checklist items was preserved, not just removed.
+    prompt = _prompt_text()
+    assert "Pre-review self-check" in prompt, (
+        "Step 3 must contain a 'Pre-review self-check' step before the in-review transition"
+    )
+
+
+def test_pre_review_checklist_contains_all_five_items() -> None:
+    # All five checklist items must be present verbatim. Each item targets a specific
+    # class of judge failures observed during E6: missing docstrings, call-count assertions,
+    # untested validation logic, mock-only functional tests, and manifest drift.
+    # If this assertion fails, restore the missing item(s) — partial checklists miss the
+    # failure modes they were designed to catch.
+    prompt = _prompt_text()
+    expected_items = [
+        "Docstrings describe every new code path added, not just the happy path",
+        "Every new branch or conditional has a corresponding test assertion (not just call count)",
+        "All validation logic (regex, guard clauses, type checks) has tests for valid and invalid inputs",
+        "Functional tests assert observable behaviour, not only that mocks were called",
+        "`git diff --name-only --cached` matches the Changes Manifest exactly",
+    ]
+    for item in expected_items:
+        assert item in prompt, (
+            f"Pre-review self-check is missing required item: {item!r}"
+        )
+
+
+def test_in_review_transition_is_step_10() -> None:
+    # After inserting the pre-review self-check as step 9, the in-review transition
+    # must be renumbered to step 10. If this assertion fails, the step numbering was
+    # not updated — either the new step was not inserted or the downstream steps were
+    # not renumbered consistently.
+    prompt = _prompt_text()
+    assert "10. **Update the work unit status** to `in-review`" in prompt, (
+        "In-review transition must be numbered step 10 after the pre-review self-check is inserted as step 9"
+    )
+
+
+def test_log_actions_is_step_11() -> None:
+    # After inserting the pre-review self-check as step 9, the log-actions step must
+    # be renumbered to step 11. If this assertion fails, the step was not renumbered —
+    # restore the correct numbering to keep the sequence consistent.
+    prompt = _prompt_text()
+    assert "11. **Log all actions**" in prompt, (
+        "Log-actions step must be numbered step 11 after pre-review self-check is inserted as step 9"
+    )
+
+
 def test_prompt_red_requires_failure_output_logged() -> None:
     # The RED phase must require pasting actual test runner output into the TDD Cycle Log,
     # not just claiming "test fails as expected". Without this requirement an agent can

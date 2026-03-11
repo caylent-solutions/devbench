@@ -81,8 +81,14 @@ Follow this execution sequence:
    - Read back every file you wrote to confirm contents match intent.
    - Run the full test suite and confirm all tests pass.
    - Check for lint/type errors.
-9. **Update the work unit status** to `in-review`.
-10. **Log all actions** in the work unit's Comments section with timestamps. Put a **blank line between each log entry** so they render as separate paragraphs in markdown. Format: `[YYYY-MM-DD HH:MM UTC] [agent-id] message`
+9. **Pre-review self-check** — before requesting review, verify each item. A failure here costs a full judge round-trip:
+   - [ ] Docstrings describe every new code path added, not just the happy path
+   - [ ] Every new branch or conditional has a corresponding test assertion (not just call count)
+   - [ ] All validation logic (regex, guard clauses, type checks) has tests for valid and invalid inputs
+   - [ ] Functional tests assert observable behaviour, not only that mocks were called
+   - [ ] `git diff --name-only --cached` matches the Changes Manifest exactly
+10. **Update the work unit status** to `in-review`.
+11. **Log all actions** in the work unit's Comments section with timestamps. Put a **blank line between each log entry** so they render as separate paragraphs in markdown. Format: `[YYYY-MM-DD HH:MM UTC] [agent-id] message`
 
 **DO NOT commit or push during this step.** Code stays uncommitted on disk until judges approve it in Step 4. Git commit and push happen ONLY in Step 5, AFTER all judges pass.
 

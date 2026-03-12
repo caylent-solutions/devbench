@@ -7,7 +7,7 @@ DevBench supports two execution modes. Both follow the same lifecycle and the sa
 ## Modes at a Glance
 
 | Aspect | Automated (`make start`) | Interactive (`make start-interactive`) |
-|---|---|---|
+| --- | --- | --- |
 | Orchestrator | `orchestrator.py` Python loop | Claude Code session with `orchestrator-prompt.md` injected |
 | Executor | Subprocess: `uv run devbench execute` (spawns a Claude CLI agent) | Same Claude session (orchestrator IS the executor) |
 | Human control | Background — monitor via log file | Foreground — pause with Escape, give instructions, resume |
@@ -20,7 +20,7 @@ DevBench supports two execution modes. Both follow the same lifecycle and the sa
 
 Both modes execute the same logical steps in the same order.
 
-```
+```text
 1. Pre-flight validation
    └── Abort if BACKLOG.md or work-unit files are structurally invalid
 
@@ -78,6 +78,7 @@ These rules apply in **both modes** without exception.
 ### Executor owns: implement only
 
 The executor (subprocess agent in automated mode; the Claude session in interactive mode) is responsible for:
+
 - Reading the work-unit spec and all referenced standards
 - Writing code, tests, and documentation
 - Running the test suite
@@ -85,6 +86,7 @@ The executor (subprocess agent in automated mode; the Claude session in interact
 - Updating work-unit status to `in-review`
 
 The executor **must not**:
+
 - Create branches
 - Commit
 - Push
@@ -94,6 +96,7 @@ The executor **must not**:
 ### Orchestrator owns: review and git lifecycle
 
 The orchestrator is responsible for:
+
 - Running judge reviews (all 5 judges)
 - Injecting review feedback into retry attempts
 - All git operations: branch, commit, push, PR, CI wait, merge, submodule update
@@ -115,7 +118,7 @@ The resolved name is stored in `WorkUnit.branch` and used by the orchestrator's 
 
 ### Automated mode (`make start` / `make run-backlog`)
 
-```
+```text
 orchestrator.py (Python loop)
     │
     ├── calls claude_executor.execute(work_unit_path, repo, feedback)
@@ -135,7 +138,7 @@ The executor subprocess **cannot** be the orchestrator — it is a separate proc
 
 ### Interactive mode (`make start-interactive`)
 
-```
+```text
 Claude Code session
     │
     ├── orchestrator-prompt.md injected at session start
@@ -171,7 +174,7 @@ The BACKLOG.md index is an at-a-glance summary; the work-unit file is authoritat
 ## Retry Behaviour
 
 | Event | Automated mode | Interactive mode |
-|---|---|---|
+| --- | --- | --- |
 | Judge FAIL | Feedback injected into next `execute()` call | Claude reads JSON output, fixes code, re-runs review |
 | BLOCKED (executor reported) | `BlockerResolverJudge` evaluates; resolution or failure feedback fed to next attempt | Claude logs blocker, moves to next unit or seeks resolution |
 | Max retries exhausted (`JUDGE_MAX_RETRIES`, default 10) | `mark_blocked()` — unit marked BLOCKED in BACKLOG.md | Claude logs and marks blocked via `uv run devbench log` |

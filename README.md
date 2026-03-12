@@ -218,8 +218,6 @@ Required variables (`JUDGE_WORKSPACE_ROOT`, `JUDGE_CLAUDE_MODEL`) raise `Runtime
 
 The `--config <path>` CLI flag (or `JUDGE_CONFIG_PATH` env var) overrides the default config file location.
 
-> **Note:** `JUDGE_ALLOWED_REPOS`, `JUDGE_BACKLOG_ROOT`, and `JUDGE_BACKLOG_INDEX` are deprecated. They are still honored for backward compatibility but emit warnings. Migrate to the YAML config.
-
 ## Interactive Mode
 
 ```bash

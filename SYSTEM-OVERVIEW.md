@@ -213,9 +213,7 @@ Repos and per-repo settings are defined in `backlog/config/devbench.yaml` (relat
 2. `JUDGE_CONFIG_PATH` environment variable
 3. `<JUDGE_WORKSPACE_ROOT>/backlog/config/devbench.yaml` (default)
 
-The config file must exist at the resolved path — a missing file raises `RuntimeError` with an actionable message. If `JUDGE_ALLOWED_REPOS` is set without a YAML file, the env var is still honored (backward compatibility) but a deprecation warning is emitted.
-
-**Value-level precedence**: environment variables override YAML field values. For example, `JUDGE_BACKLOG_ROOT` overrides the path derived from `JUDGE_WORKSPACE_ROOT`, and `JUDGE_ALLOWED_REPOS` overrides the repos list from YAML.
+The config file must exist at the resolved path — a missing file raises `RuntimeError` with an actionable message.
 
 **YAML schema:**
 
@@ -230,11 +228,8 @@ repos:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `JUDGE_CONFIG_PATH` | *(see above)* | Override YAML config file path |
-| `JUDGE_ALLOWED_REPOS` | *(deprecated)* | **Deprecated** — define repos in YAML `repos` section instead. Honored for backward compatibility; a warning is emitted. |
 | `JUDGE_MERGE_STRATEGY` | `squash` | PR merge strategy: `merge`, `squash`, or `rebase` |
 | `JUDGE_GH_ORG` | *(empty)* | When set, restricts all GitHub ops to this org only |
-| `JUDGE_BACKLOG_ROOT` | `<workspace>/backlog` | **Deprecated** — derived from `JUDGE_WORKSPACE_ROOT` automatically. Honored for backward compatibility; a warning is emitted. |
-| `JUDGE_BACKLOG_INDEX` | `<workspace>/BACKLOG.md` | **Deprecated** — derived from `JUDGE_WORKSPACE_ROOT` automatically. Honored for backward compatibility; a warning is emitted. |
 | `JUDGE_MAX_RETRIES` | `10` | Max retry attempts per work unit before marking blocked |
 | `JUDGE_USE_BEDROCK` | `false` | Use AWS Bedrock instead of Anthropic API |
 | `JUDGE_BEDROCK_REGION` | `us-east-1` | AWS region for Bedrock (falls back to `AWS_REGION`) |

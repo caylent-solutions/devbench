@@ -15,29 +15,13 @@ from devbench.config import ALLOWED_REPOS, validate_repo
 
 
 class TestAllowedRepos:
-    """Verify ALLOWED_REPOS is driven by YAML config (JUDGE_ALLOWED_REPOS is deprecated)."""
+    """Verify ALLOWED_REPOS is driven exclusively by YAML config."""
 
     def test_judge_allowed_repos_is_frozenset(self) -> None:
         assert isinstance(ALLOWED_REPOS, frozenset)
 
-    def test_judge_allowed_repos_env_var_overrides_yaml(self) -> None:
-        """JUDGE_ALLOWED_REPOS env var still overrides YAML (backward compat, deprecated)."""
-        with patch.dict(os.environ, {"JUDGE_ALLOWED_REPOS": "org/repo-a,org/repo-b"}, clear=False):
-            importlib.reload(config)
-            assert frozenset({"org/repo-a", "org/repo-b"}) == config.ALLOWED_REPOS
-
-        importlib.reload(config)
-
-    def test_judge_allowed_repos_env_var_strips_whitespace(self) -> None:
-        """JUDGE_ALLOWED_REPOS values are whitespace-stripped when used."""
-        with patch.dict(os.environ, {"JUDGE_ALLOWED_REPOS": " org/repo-a , org/repo-b "}, clear=False):
-            importlib.reload(config)
-            assert frozenset({"org/repo-a", "org/repo-b"}) == config.ALLOWED_REPOS
-
-        importlib.reload(config)
-
-    def test_allowed_repos_from_yaml_when_env_var_absent(self) -> None:
-        """When JUDGE_ALLOWED_REPOS is absent, ALLOWED_REPOS comes from YAML repos keys."""
+    def test_allowed_repos_from_yaml(self) -> None:
+        """ALLOWED_REPOS is sourced exclusively from YAML repos keys."""
         env = {k: v for k, v in os.environ.items() if k != "JUDGE_ALLOWED_REPOS"}
         with patch.dict(os.environ, env, clear=True):
             importlib.reload(config)
@@ -46,10 +30,11 @@ class TestAllowedRepos:
 
         importlib.reload(config)
 
-    def test_allowed_repos_from_yaml_when_env_var_empty(self) -> None:
-        """When JUDGE_ALLOWED_REPOS is empty string, ALLOWED_REPOS comes from YAML."""
-        with patch.dict(os.environ, {"JUDGE_ALLOWED_REPOS": ""}, clear=False):
+    def test_judge_allowed_repos_env_var_has_no_effect(self) -> None:
+        """JUDGE_ALLOWED_REPOS env var is ignored — repos come from YAML only."""
+        with patch.dict(os.environ, {"JUDGE_ALLOWED_REPOS": "org/repo-a,org/repo-b"}, clear=False):
             importlib.reload(config)
+            assert frozenset({"org/repo-a", "org/repo-b"}) != config.ALLOWED_REPOS
             assert isinstance(config.ALLOWED_REPOS, frozenset)
             assert len(config.ALLOWED_REPOS) > 0
 
@@ -223,63 +208,48 @@ class TestConfigOverrides:
         with patch.dict(os.environ, {"JUDGE_GH_TIMEOUT": "600"}, clear=False):
             importlib.reload(config)
 
-    def test_backlog_root_from_env(self, tmp_path: Path) -> None:
+    def test_backlog_root_derived_from_workspace_root(self) -> None:
+        """BACKLOG_ROOT is always derived from JUDGE_WORKSPACE_ROOT, not from env."""
+        from devbench.constants import BACKLOG_SUBDIR
+
+        env_copy = {k: v for k, v in os.environ.items() if k != "JUDGE_BACKLOG_ROOT"}
+        with patch.dict(os.environ, env_copy, clear=True):
+            importlib.reload(config)
+            expected = Path(os.environ["JUDGE_WORKSPACE_ROOT"]) / BACKLOG_SUBDIR
+            assert expected == config.BACKLOG_ROOT
+
+        importlib.reload(config)
+
+    def test_backlog_index_derived_from_workspace_root(self) -> None:
+        """BACKLOG_INDEX is always derived from JUDGE_WORKSPACE_ROOT, not from env."""
+        env_copy = {k: v for k, v in os.environ.items() if k != "JUDGE_BACKLOG_INDEX"}
+        with patch.dict(os.environ, env_copy, clear=True):
+            importlib.reload(config)
+            expected = Path(os.environ["JUDGE_WORKSPACE_ROOT"]) / "BACKLOG.md"
+            assert expected == config.BACKLOG_INDEX
+
+        importlib.reload(config)
+
+    def test_judge_backlog_root_env_var_has_no_effect(self, tmp_path: Path) -> None:
+        """JUDGE_BACKLOG_ROOT env var is ignored — path derived from JUDGE_WORKSPACE_ROOT."""
+        from devbench.constants import BACKLOG_SUBDIR
+
         custom_root = tmp_path / "custom-backlog"
         with patch.dict(os.environ, {"JUDGE_BACKLOG_ROOT": str(custom_root)}, clear=False):
             importlib.reload(config)
-            assert custom_root == config.BACKLOG_ROOT
+            expected = Path(os.environ["JUDGE_WORKSPACE_ROOT"]) / BACKLOG_SUBDIR
+            assert expected == config.BACKLOG_ROOT
+            assert custom_root != config.BACKLOG_ROOT
 
-        env_copy = os.environ.copy()
-        env_copy.pop("JUDGE_BACKLOG_ROOT", None)
-        with patch.dict(os.environ, env_copy, clear=True):
-            importlib.reload(config)
+        importlib.reload(config)
 
-
-class TestDeprecatedPathEnvVars:
-    """AC-7: JUDGE_BACKLOG_ROOT and JUDGE_BACKLOG_INDEX emit deprecation warnings."""
-
-    def test_backlog_root_env_override_warns_deprecated(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """JUDGE_BACKLOG_ROOT is honored but emits a deprecation WARNING."""
-        import logging
-
-        custom_root = tmp_path / "custom-backlog"
-        with patch.dict(os.environ, {"JUDGE_BACKLOG_ROOT": str(custom_root)}, clear=False):
-            with caplog.at_level(logging.WARNING, logger="devbench.config"):
-                importlib.reload(config)
-            assert custom_root == config.BACKLOG_ROOT
-            matching = [
-                r for r in caplog.records
-                if "JUDGE_BACKLOG_ROOT" in r.message and "deprecated" in r.message.lower()
-            ]
-            assert matching, "Expected deprecation WARNING for JUDGE_BACKLOG_ROOT"
-            assert matching[0].levelno == logging.WARNING
-
-        env_copy = os.environ.copy()
-        env_copy.pop("JUDGE_BACKLOG_ROOT", None)
-        with patch.dict(os.environ, env_copy, clear=True):
-            importlib.reload(config)
-
-    def test_backlog_index_env_override_warns_deprecated(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """JUDGE_BACKLOG_INDEX is honored but emits a deprecation WARNING."""
-        import logging
-
+    def test_judge_backlog_index_env_var_has_no_effect(self, tmp_path: Path) -> None:
+        """JUDGE_BACKLOG_INDEX env var is ignored — path derived from JUDGE_WORKSPACE_ROOT."""
         custom_index = tmp_path / "CUSTOM_BACKLOG.md"
         with patch.dict(os.environ, {"JUDGE_BACKLOG_INDEX": str(custom_index)}, clear=False):
-            with caplog.at_level(logging.WARNING, logger="devbench.config"):
-                importlib.reload(config)
-            assert custom_index == config.BACKLOG_INDEX
-            matching = [
-                r for r in caplog.records
-                if "JUDGE_BACKLOG_INDEX" in r.message and "deprecated" in r.message.lower()
-            ]
-            assert matching, "Expected deprecation WARNING for JUDGE_BACKLOG_INDEX"
-            assert matching[0].levelno == logging.WARNING
-
-        env_copy = os.environ.copy()
-        env_copy.pop("JUDGE_BACKLOG_INDEX", None)
-        with patch.dict(os.environ, env_copy, clear=True):
             importlib.reload(config)
+            expected = Path(os.environ["JUDGE_WORKSPACE_ROOT"]) / "BACKLOG.md"
+            assert expected == config.BACKLOG_INDEX
+            assert custom_index != config.BACKLOG_INDEX
+
+        importlib.reload(config)

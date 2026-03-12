@@ -78,7 +78,7 @@ class TestRunReviewJudges:
             with patch(f"{_ORC}.TestReviewJudge", return_value=mock_judge):
                 with patch(f"{_ORC}.DocReviewJudge", return_value=mock_judge):
                     with patch(f"{_ORC}.ChangesManifestJudge", return_value=mock_judge):
-                        results = run_review_judges(unit, tmp_path)
+                        results = run_review_judges(unit, tmp_path, unit.repo)
 
         assert len(results) == 4
         assert all(r.verdict == Verdict.PASS for _, r in results)
@@ -95,7 +95,7 @@ class TestRunReviewJudges:
             with patch(f"{_ORC}.TestReviewJudge", return_value=mock_judge):
                 with patch(f"{_ORC}.DocReviewJudge", return_value=mock_judge):
                     with patch(f"{_ORC}.ChangesManifestJudge", return_value=mock_judge):
-                        results = run_review_judges(unit, tmp_path)
+                        results = run_review_judges(unit, tmp_path, unit.repo)
 
         assert all(r.verdict == Verdict.FAIL for _, r in results)
         # Comments should have been logged to file

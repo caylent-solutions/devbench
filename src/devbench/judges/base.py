@@ -197,6 +197,11 @@ class BaseJudge(abc.ABC):
             self.logger.info("Calling Claude (%s) for %s evaluation via API", CLAUDE_MODEL, self.name)
             client = anthropic.Anthropic(api_key=api_key, timeout=effective_timeout)
 
+        self.logger.debug(
+            "LLM request — judge=%s model=%s system_prompt=%r user_prompt=%r",
+            self.name, CLAUDE_MODEL, system_prompt, user_prompt,
+        )
+
         try:
             message = client.messages.create(
                 model=CLAUDE_MODEL,
@@ -219,6 +224,12 @@ class BaseJudge(abc.ABC):
             first_block = message.content[0]
             if hasattr(first_block, "text"):
                 raw_output = first_block.text
+
+        self.logger.debug(
+            "LLM response — judge=%s stop_reason=%s usage=%s raw_output=%r",
+            self.name, message.stop_reason, message.usage, raw_output,
+        )
+
         return self._parse_llm_response(raw_output)
 
     def _parse_llm_response(self, raw_output: str) -> JudgeResult:

@@ -3,7 +3,7 @@
 # Usage: ./scripts/start.sh
 #
 # 1. Authenticates with GitHub (opens browser if needed)
-# 2. Writes token to /tmp/gh_token_env
+# 2. Writes token to ~/.gh_token_env
 # 3. Starts a background token refresher (every 4h)
 # 4. Launches the orchestrator in the background
 set -euo pipefail
@@ -20,7 +20,7 @@ done
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEVBENCH_ROOT="$(dirname "$SCRIPT_DIR")"
 LOG_FILE="${JUDGE_LOG_FILE:-/tmp/backlog-run.log}"
-TOKEN_FILE="/tmp/gh_token_env"
+TOKEN_FILE="${JUDGE_GH_TOKEN_FILE:-${HOME}/.gh_token_env}"
 
 # Source cached token if available (persists across terminals)
 if [[ -z "${GH_TOKEN:-}" && -f "$TOKEN_FILE" ]]; then
@@ -75,7 +75,7 @@ while true; do
     unset GH_TOKEN
     gh auth refresh -h github.com ${scope_flags[*]} 2>/dev/null || true
     echo \"export GH_TOKEN=\\\"\$(gh auth token)\\\"\" > $TOKEN_FILE
-    echo \"[\$(date -u +%Y-%m-%dT%H:%M:%SZ)] token refreshed\" >> /tmp/gh_token_refresh.log
+    echo \"[\$(date -u +%Y-%m-%dT%H:%M:%SZ)] token refreshed\" >> ${JUDGE_LOG_FILE:-/tmp/backlog-run.log}.token-refresh
 done
 " >/dev/null 2>&1 &
 REFRESHER_PID=$!

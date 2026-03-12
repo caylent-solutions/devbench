@@ -260,7 +260,14 @@ class GitOpsJudge(BaseJudge):
     def _git(self, args: list[str], cwd: Path) -> tuple[int, str, str]:
         """Run a ``git`` command, raising ``RuntimeError`` on failure."""
         cmd = ["git"] + args
+        self.logger.debug("git cmd=%r cwd=%s", cmd, cwd)
         rc, stdout, stderr = self._run_command(cmd, cwd=cwd)
+        self.logger.debug(
+            "git exit=%d stdout=%r stderr=%r",
+            rc,
+            stdout[:500] if stdout else "",
+            stderr[:500] if stderr else "",
+        )
         if rc != 0:
             raise RuntimeError(f"git {' '.join(args)} failed (exit {rc}): {stderr.strip()}")
         return rc, stdout, stderr
@@ -287,6 +294,7 @@ class GitOpsJudge(BaseJudge):
         effective_timeout = timeout if timeout is not None else GH_API_TIMEOUT
         repo_args = ["--repo", repo] if repo else []
         cmd = ["gh"] + args + repo_args
+        self.logger.debug("gh cmd=%r cwd=%s", cmd, cwd)
         result = subprocess.run(
             cmd,
             capture_output=True,
@@ -294,5 +302,11 @@ class GitOpsJudge(BaseJudge):
             timeout=effective_timeout,
             env=env,
             cwd=cwd,
+        )
+        self.logger.debug(
+            "gh exit=%d stdout=%r stderr=%r",
+            result.returncode,
+            result.stdout[:500] if result.stdout else "",
+            result.stderr[:500] if result.stderr else "",
         )
         return result.returncode, result.stdout, result.stderr

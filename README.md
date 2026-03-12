@@ -49,6 +49,8 @@ Alternatively, set `JUDGE_USE_BEDROCK=1` to use AWS Bedrock for LLM calls instea
 
 ## How It Works
 
+See [docs/execution-modes.md](docs/execution-modes.md) for a full description of both execution modes, the step-by-step lifecycle, and ownership rules.
+
 ```
 Orchestrator (execution/orchestrator.py / interactive Claude session)
   │

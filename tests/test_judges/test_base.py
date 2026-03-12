@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import anthropic as anthropic_mod
@@ -222,6 +223,73 @@ class TestLlmEvaluate:
                     system_prompt="Test prompt",
                     evidence_sections={"section": "content"},
                 )
+
+
+class TestGetDiff:
+    """Test _get_diff method on BaseJudge."""
+
+    def test_includes_staged_diff(self, tmp_path: Path) -> None:
+        judge = _ConcreteJudge("test_judge")
+
+        def side_effect(cmd, cwd, **kwargs):
+            if "--cached" in cmd:
+                return (0, "staged changes", "")
+            return (0, "", "")
+
+        with patch.object(judge, "_get_default_branch", return_value="main"):
+            with patch.object(judge, "_run_command", side_effect=side_effect):
+                diff = judge._get_diff(tmp_path)
+        assert "staged changes" in diff
+
+    def test_includes_unstaged_diff(self, tmp_path: Path) -> None:
+        judge = _ConcreteJudge("test_judge")
+
+        def side_effect(cmd, cwd, **kwargs):
+            if cmd == ["git", "diff"]:
+                return (0, "unstaged changes", "")
+            return (0, "", "")
+
+        with patch.object(judge, "_get_default_branch", return_value="main"):
+            with patch.object(judge, "_run_command", side_effect=side_effect):
+                diff = judge._get_diff(tmp_path)
+        assert "unstaged changes" in diff
+
+    def test_includes_committed_branch_diff(self, tmp_path: Path) -> None:
+        judge = _ConcreteJudge("test_judge")
+
+        def side_effect(cmd, cwd, **kwargs):
+            if "main" in cmd:
+                return (0, "branch changes", "")
+            return (0, "", "")
+
+        with patch.object(judge, "_get_default_branch", return_value="main"):
+            with patch.object(judge, "_run_command", side_effect=side_effect):
+                diff = judge._get_diff(tmp_path)
+        assert "branch changes" in diff
+
+    def test_includes_untracked_file_as_synthetic_hunk(self, tmp_path: Path) -> None:
+        judge = _ConcreteJudge("test_judge")
+        new_file = tmp_path / "new_module.py"
+        new_file.write_text("def hello():\n    pass\n")
+
+        def side_effect(cmd, cwd, **kwargs):
+            if "--others" in cmd:
+                return (0, "new_module.py\n", "")
+            return (0, "", "")
+
+        with patch.object(judge, "_get_default_branch", return_value="main"):
+            with patch.object(judge, "_run_command", side_effect=side_effect):
+                diff = judge._get_diff(tmp_path)
+        assert "new_module.py" in diff
+        assert "+def hello():" in diff
+        assert "--- /dev/null" in diff
+
+    def test_returns_empty_when_all_fail(self, tmp_path: Path) -> None:
+        judge = _ConcreteJudge("test_judge")
+        with patch.object(judge, "_get_default_branch", return_value="main"):
+            with patch.object(judge, "_run_command", return_value=(1, "", "error")):
+                diff = judge._get_diff(tmp_path)
+        assert diff == ""
 
 
 class TestReadFile:

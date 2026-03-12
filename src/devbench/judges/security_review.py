@@ -133,24 +133,4 @@ class SecurityReviewJudge(BaseJudge):
             lines.append(f"  ... and {len(alerts) - ALERT_SUMMARY_LIMIT} more")
         return "\n".join(lines)
 
-    def _get_diff(self, repo_path: Path, repo: str = "") -> str:
-        """Return the combined diff of all changes: staged, unstaged, and committed."""
-        parts: list[str] = []
 
-        # Staged changes
-        rc, stdout, _ = self._run_command(["git", "diff", "--cached"], cwd=repo_path)
-        if rc == 0 and stdout.strip():
-            parts.append(stdout)
-
-        # Unstaged changes
-        rc, stdout, _ = self._run_command(["git", "diff"], cwd=repo_path)
-        if rc == 0 and stdout.strip():
-            parts.append(stdout)
-
-        # All committed branch changes vs default branch
-        default_branch = self._get_default_branch(repo_path, repo=repo)
-        rc, stdout, _ = self._run_command(["git", "diff", default_branch], cwd=repo_path)
-        if rc == 0 and stdout.strip():
-            parts.append(stdout)
-
-        return "\n".join(parts)

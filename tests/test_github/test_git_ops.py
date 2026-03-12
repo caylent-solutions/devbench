@@ -29,6 +29,7 @@ class TestEvaluate:
         assert "no-op" in result.reasoning
 
 
+
 class TestCommitAndPush:
     """Test commit_and_push method."""
 
@@ -36,18 +37,6 @@ class TestCommitAndPush:
         judge = GitOpsJudge()
         with pytest.raises(ValueError, match="not allowed"):
             judge.commit_and_push("evil/repo", tmp_path, "branch", "msg")
-
-    def test_calls_git_commands(self, tmp_path: Path) -> None:
-        judge = GitOpsJudge()
-        with patch.object(judge, "_git") as mock_git:
-            judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "feature/x", "commit msg")
-
-        assert mock_git.call_count == 4
-        calls = [c.args[0] for c in mock_git.call_args_list]
-        assert calls[0] == ["checkout", "-B", "feature/x"]
-        assert calls[1] == ["add", "-A"]
-        assert calls[2] == ["commit", "-m", "commit msg"]
-        assert calls[3] == ["push", "origin", "feature/x"]
 
     def test_rejects_invalid_branch_name(self, tmp_path: Path) -> None:
         judge = GitOpsJudge()
@@ -59,6 +48,187 @@ class TestCommitAndPush:
         with patch.object(judge, "_git", side_effect=RuntimeError("git failed")):
             with pytest.raises(RuntimeError, match="git failed"):
                 judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "b", "m")
+
+    # ------------------------------------------------------------------
+    # Branch safety: checkout behaviour
+    # ------------------------------------------------------------------
+
+    def test_skips_checkout_when_already_on_target_branch(self, tmp_path: Path) -> None:
+        """No checkout call is made when HEAD is already on the target branch."""
+        judge = GitOpsJudge()
+        git_calls: list[list[str]] = []
+
+        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
+            git_calls.append(args)
+            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, "feature/x", "")
+            if args == ["status", "--porcelain"]:
+                return (0, "M file.py\n", "")
+            return (0, "", "")
+
+        with patch.object(judge, "_git", side_effect=stub):
+            judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "feature/x", "msg")
+
+        checkout_calls = [c for c in git_calls if c[0] == "checkout"]
+        assert checkout_calls == [], "checkout should not be called when already on target branch"
+
+    def test_uses_checkout_without_create_when_branch_exists(self, tmp_path: Path) -> None:
+        """``git checkout <branch>`` (no -b) is used when the branch exists locally."""
+        judge = GitOpsJudge()
+        git_calls: list[list[str]] = []
+
+        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
+            git_calls.append(args)
+            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, "main", "")
+            if args == ["status", "--porcelain"]:
+                return (0, "M file.py\n", "")
+            return (0, "", "")
+
+        # show-ref exits 0 → branch exists
+        with (
+            patch.object(judge, "_git", side_effect=stub),
+            patch.object(judge, "_run_command", return_value=(0, "", "")),
+        ):
+            judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "feature/x", "msg")
+
+        assert ["checkout", "feature/x"] in git_calls
+        assert ["checkout", "-b", "feature/x"] not in git_calls
+
+    def test_uses_checkout_with_create_when_branch_does_not_exist(self, tmp_path: Path) -> None:
+        """``git checkout -b <branch>`` is used when the branch does not exist locally."""
+        judge = GitOpsJudge()
+        git_calls: list[list[str]] = []
+
+        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
+            git_calls.append(args)
+            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, "main", "")
+            if args == ["status", "--porcelain"]:
+                return (0, "M file.py\n", "")
+            return (0, "", "")
+
+        # First _run_command call is show-ref (rc=1 → branch absent).
+        # Second would be rev-parse --verify origin/... but we won't reach it
+        # because status is non-empty (has changes → commit path).
+        with (
+            patch.object(judge, "_git", side_effect=stub),
+            patch.object(judge, "_run_command", return_value=(1, "", "")),
+        ):
+            judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "feature/x", "msg")
+
+        assert ["checkout", "-b", "feature/x"] in git_calls
+        assert ["checkout", "feature/x"] not in git_calls
+
+    # ------------------------------------------------------------------
+    # Happy path: changes present → commit and push
+    # ------------------------------------------------------------------
+
+    def test_commits_and_pushes_when_changes_present(self, tmp_path: Path) -> None:
+        """Full commit + push sequence runs when the working tree has changes."""
+        judge = GitOpsJudge()
+        git_calls: list[list[str]] = []
+
+        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
+            git_calls.append(args)
+            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, "feature/x", "")
+            if args == ["status", "--porcelain"]:
+                return (0, "M src/foo.py\n", "")
+            return (0, "", "")
+
+        with patch.object(judge, "_git", side_effect=stub):
+            judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "feature/x", "commit msg")
+
+        assert ["add", "-A"] in git_calls
+        assert ["commit", "-m", "commit msg"] in git_calls
+        assert ["push", "origin", "feature/x"] in git_calls
+
+    # ------------------------------------------------------------------
+    # Restart scenarios: nothing to commit
+    # ------------------------------------------------------------------
+
+    def test_nothing_to_commit_skips_commit_and_push_when_remote_up_to_date(
+        self, tmp_path: Path
+    ) -> None:
+        """When working tree is clean and remote matches local HEAD, both commit and push are skipped."""
+        judge = GitOpsJudge()
+        git_calls: list[list[str]] = []
+
+        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
+            git_calls.append(args)
+            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, "feature/x", "")
+            if args == ["status", "--porcelain"]:
+                return (0, "", "")  # clean
+            if args == ["rev-parse", "HEAD"]:
+                return (0, "abc123\n", "")
+            if args == ["rev-parse", "origin/feature/x"]:
+                return (0, "abc123\n", "")  # same SHA → up to date
+            return (0, "", "")
+
+        # show-ref for origin/feature/x → rc=0 (remote exists)
+        with (
+            patch.object(judge, "_git", side_effect=stub),
+            patch.object(judge, "_run_command", return_value=(0, "", "")),
+        ):
+            judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "feature/x", "msg")
+
+        assert ["commit", "-m", "msg"] not in git_calls
+        assert ["push", "origin", "feature/x"] not in git_calls
+
+    def test_nothing_to_commit_pushes_when_remote_branch_absent(self, tmp_path: Path) -> None:
+        """When working tree is clean and the remote branch does not exist, push runs."""
+        judge = GitOpsJudge()
+        git_calls: list[list[str]] = []
+
+        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
+            git_calls.append(args)
+            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, "feature/x", "")
+            if args == ["status", "--porcelain"]:
+                return (0, "", "")  # clean
+            return (0, "", "")
+
+        # First _run_command = show-ref (skipped, already on branch).
+        # Only _run_command call = rev-parse --verify origin/feature/x → rc=1 (absent).
+        run_command_responses = iter([(1, "", "")])
+
+        with (
+            patch.object(judge, "_git", side_effect=stub),
+            patch.object(judge, "_run_command", side_effect=run_command_responses),
+        ):
+            judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "feature/x", "msg")
+
+        assert ["commit", "-m", "msg"] not in git_calls
+        assert ["push", "origin", "feature/x"] in git_calls
+
+    def test_nothing_to_commit_pushes_when_local_ahead_of_remote(self, tmp_path: Path) -> None:
+        """When working tree is clean but local SHA differs from remote SHA, push runs."""
+        judge = GitOpsJudge()
+        git_calls: list[list[str]] = []
+
+        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
+            git_calls.append(args)
+            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, "feature/x", "")
+            if args == ["status", "--porcelain"]:
+                return (0, "", "")  # clean
+            if args == ["rev-parse", "HEAD"]:
+                return (0, "newsha\n", "")
+            if args == ["rev-parse", "origin/feature/x"]:
+                return (0, "oldsha\n", "")  # different → local is ahead
+            return (0, "", "")
+
+        # _run_command for rev-parse --verify origin/feature/x → rc=0 (remote exists)
+        with (
+            patch.object(judge, "_git", side_effect=stub),
+            patch.object(judge, "_run_command", return_value=(0, "", "")),
+        ):
+            judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "feature/x", "msg")
+
+        assert ["commit", "-m", "msg"] not in git_calls
+        assert ["push", "origin", "feature/x"] in git_calls
 
 
 class TestCreatePr:

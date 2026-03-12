@@ -47,19 +47,41 @@ class GitOpsJudge(BaseJudge):
         )
 
     def commit_and_push(self, repo: str, repo_path: Path, branch: str, message: str) -> None:
-        """Validate inputs, create or reset the branch, stage all changes, commit, and push.
+        """Validate inputs, switch to the target branch, stage all changes, commit, and push.
+
+        This method is idempotent: it is safe to call on restart after a partial run.
 
         Full operation sequence:
 
         1. Validate *repo* against the allow-list (``validate_repo``).
         2. Validate *branch* format against ``_BRANCH_RE`` (allowlist pattern that
            rejects consecutive special characters per git ref naming rules).
-        3. ``git checkout -B <branch>`` — creates the branch if absent, or resets
-           it to the current HEAD if it already exists.  The ``-B`` flag is
-           idempotent, making retries safe without additional error-handling logic.
-        4. ``git add -A`` — stage all changes.
-        5. ``git commit -m <message>`` — commit staged changes.
-        6. ``git push origin <branch>`` — push to the remote.
+        3. Branch safety switch — determines how to reach the target branch without
+           resetting existing committed work:
+
+           - Already on *branch*: skip checkout entirely.
+           - On a different branch and *branch* already exists locally:
+             ``git checkout <branch>`` — switch only, no reset.
+           - On a different branch and *branch* does not exist locally:
+             ``git checkout -b <branch>`` — create from current HEAD.
+
+        4. ``git add -A`` — stage all working-tree changes.
+        5. ``git status --porcelain`` — check whether anything was staged.
+
+           - If the output is **non-empty**: proceed to commit and push (step 6–7).
+           - If the output is **empty** (nothing to commit): the working tree is
+             already clean, meaning a prior run completed the commit.  Skip the
+             commit and evaluate whether a push is still needed:
+
+             - Remote branch absent (``origin/<branch>`` does not exist): push.
+             - Remote branch present but local HEAD differs from remote HEAD: push
+               (prior run committed but push failed).
+             - Remote branch present and local HEAD matches remote HEAD: skip push
+               and return.  The desired state is fully achieved.
+
+        6. ``git commit -m <message>`` — commit staged changes (skipped when clean).
+        7. ``git push origin <branch>`` — push to the remote (skipped when remote
+           is already up to date).
 
         All git commands are executed via :meth:`_git`, which invokes subprocess
         with a list argument (never ``shell=True``), eliminating shell injection risk.
@@ -67,7 +89,7 @@ class GitOpsJudge(BaseJudge):
         Args:
             repo: GitHub repository in ``owner/name`` format.
             repo_path: Local filesystem path to the repository.
-            branch: Branch name to create/reset and push to.  Must match
+            branch: Branch name to create or switch to.  Must match
                 ``_BRANCH_RE``: starts with an alphanumeric character; subsequent
                 characters are alphanumerics, underscores, or a single separator
                 (``.``, ``-``, or ``/``) followed by an alphanumeric/underscore.
@@ -87,8 +109,41 @@ class GitOpsJudge(BaseJudge):
                 "(no consecutive special characters)."
             )
 
-        self._git(["checkout", "-B", branch], repo_path)
+        _, current_branch, _ = self._git(["rev-parse", "--abbrev-ref", "HEAD"], repo_path)
+        if current_branch.strip() != branch:
+            rc, _, _ = self._run_command(
+                ["git", "show-ref", "--verify", f"refs/heads/{branch}"], cwd=repo_path
+            )
+            if rc == 0:
+                self._git(["checkout", branch], repo_path)
+            else:
+                self._git(["checkout", "-b", branch], repo_path)
+
         self._git(["add", "-A"], repo_path)
+
+        _, status_out, _ = self._git(["status", "--porcelain"], repo_path)
+        if not status_out.strip():
+            self.logger.info("Nothing to commit on branch %s — checking remote state", branch)
+            rc, _, _ = self._run_command(
+                ["git", "rev-parse", "--verify", f"origin/{branch}"], cwd=repo_path
+            )
+            if rc != 0:
+                self.logger.info("Remote branch origin/%s does not exist — pushing", branch)
+                self._git(["push", "origin", branch], repo_path)
+            else:
+                _, local_sha, _ = self._git(["rev-parse", "HEAD"], repo_path)
+                _, remote_sha, _ = self._git(["rev-parse", f"origin/{branch}"], repo_path)
+                if local_sha.strip() != remote_sha.strip():
+                    self.logger.info(
+                        "Local branch %s is ahead of origin — pushing", branch
+                    )
+                    self._git(["push", "origin", branch], repo_path)
+                else:
+                    self.logger.info(
+                        "Branch %s already up to date with origin — skipping push", branch
+                    )
+            return
+
         self._git(["commit", "-m", message], repo_path)
         self._git(["push", "origin", branch], repo_path)
         self.logger.info("Committed and pushed to %s on %s", branch, repo)

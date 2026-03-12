@@ -185,6 +185,8 @@ devbench/
 │   │   ├── changes_manifest.py    ← Changed files vs. manifest → LLM verdict
 │   │   ├── security_review.py     ← GitHub alerts + diff → LLM verdict
 │   │   └── blocker_resolver.py    ← Dependency and blocker assessment
+│   ├── utils/
+│   │   └── process.py             ← run_command(): shared subprocess wrapper for running shell commands
 │   ├── reporting/
 │   │   └── report.py              ← Session progress report generator (velocity, ETA)
 │   └── prompts/                   ← Prompt loader (reads from top-level prompts/)
@@ -203,7 +205,8 @@ devbench/
 │   ├── test_execution/            ← executor, orchestrator tests
 │   ├── test_github/               ← git_ops, security tests
 │   ├── test_judges/               ← base, code_review, test_review, … tests
-│   └── test_reporting/            ← report tests
+│   ├── test_reporting/            ← report tests
+│   └── test_utils/                ← process.run_command tests
 ├── scripts/
 │   ├── start.sh                   ← Background start script
 │   └── start-interactive.sh       ← Interactive Claude session start script

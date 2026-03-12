@@ -27,6 +27,7 @@ def _make_unit(
         unit_type=WorkUnitType.TASK,
         file_path=fp,
         repo="caylent-solutions/git-repo",
+        branch=f"backlog/{unit_id.lower()}",
         dependencies=[],
         description="Test description",
     )
@@ -240,6 +241,78 @@ class TestProcessWorkUnit:
         call_kwargs = mock_git_ops.commit_and_push.call_args
         assert call_kwargs.kwargs.get("repo") == "caylent-solutions/git-repo"
 
+    def test_commit_and_push_uses_spec_branch(self, tmp_path: Path) -> None:
+        """commit_and_push receives the branch from the work unit spec, not the template."""
+        from devbench.execution.orchestrator import process_work_unit
+
+        unit = _make_unit(tmp_path)
+        unit.branch = "feature/my-custom-branch"
+
+        exec_result = ExecutionResult(status=ExecutionStatus.IN_REVIEW, output="done", blocker="")
+        mock_judge = MagicMock()
+        mock_judge.name = "mock"
+        mock_judge.evaluate.return_value = _pass_result("mock")
+        mock_git_ops = MagicMock()
+        mock_git_ops.create_pr.return_value = "https://github.com/org/repo/pull/42"
+        mock_git_ops.wait_for_checks.return_value = True
+        mock_mgr = MagicMock()
+
+        with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+            with patch(f"{_ORC}.claude_executor") as mock_exec:
+                mock_exec.execute.return_value = exec_result
+                with patch(f"{_ORC}.CodeReviewJudge", return_value=mock_judge):
+                    with patch(f"{_ORC}.TestReviewJudge", return_value=mock_judge):
+                        with patch(f"{_ORC}.DocReviewJudge", return_value=mock_judge):
+                            with patch(f"{_ORC}.ChangesManifestJudge", return_value=mock_judge):
+                                with patch(f"{_ORC}.SecurityReviewJudge", return_value=mock_judge):
+                                    with patch(f"{_ORC}.GitOpsJudge", return_value=mock_git_ops):
+                                        with patch(f"{_ORC}.BacklogManager", return_value=mock_mgr):
+                                            with patch(f"{_ORC}.BlockerResolverJudge"):
+                                                with patch(
+                                                    f"{_ORC}.BACKLOG_INDEX", tmp_path / "BACKLOG.md"
+                                                ):
+                                                    result = process_work_unit(unit)
+
+        assert result is True
+        call_kwargs = mock_git_ops.commit_and_push.call_args
+        assert call_kwargs.kwargs.get("branch") == "feature/my-custom-branch"
+
+    def test_commit_and_push_uses_template_branch_from_parser(self, tmp_path: Path) -> None:
+        """When spec has no Branch field, parser populates branch via template; orchestrator uses it."""
+        from devbench.execution.orchestrator import process_work_unit
+
+        unit = _make_unit(tmp_path, unit_id="E0-F1-S1-T1")
+        unit.branch = "backlog/e0-f1-s1-t1"  # as populated by BacklogParser template fallback
+
+        exec_result = ExecutionResult(status=ExecutionStatus.IN_REVIEW, output="done", blocker="")
+        mock_judge = MagicMock()
+        mock_judge.name = "mock"
+        mock_judge.evaluate.return_value = _pass_result("mock")
+        mock_git_ops = MagicMock()
+        mock_git_ops.create_pr.return_value = "https://github.com/org/repo/pull/7"
+        mock_git_ops.wait_for_checks.return_value = True
+        mock_mgr = MagicMock()
+
+        with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+            with patch(f"{_ORC}.claude_executor") as mock_exec:
+                mock_exec.execute.return_value = exec_result
+                with patch(f"{_ORC}.CodeReviewJudge", return_value=mock_judge):
+                    with patch(f"{_ORC}.TestReviewJudge", return_value=mock_judge):
+                        with patch(f"{_ORC}.DocReviewJudge", return_value=mock_judge):
+                            with patch(f"{_ORC}.ChangesManifestJudge", return_value=mock_judge):
+                                with patch(f"{_ORC}.SecurityReviewJudge", return_value=mock_judge):
+                                    with patch(f"{_ORC}.GitOpsJudge", return_value=mock_git_ops):
+                                        with patch(f"{_ORC}.BacklogManager", return_value=mock_mgr):
+                                            with patch(f"{_ORC}.BlockerResolverJudge"):
+                                                with patch(
+                                                    f"{_ORC}.BACKLOG_INDEX", tmp_path / "BACKLOG.md"
+                                                ):
+                                                    result = process_work_unit(unit)
+
+        assert result is True
+        call_kwargs = mock_git_ops.commit_and_push.call_args
+        assert call_kwargs.kwargs.get("branch") == "backlog/e0-f1-s1-t1"
+
     def test_raises_for_missing_repo_path(self, tmp_path: Path) -> None:
         from devbench.execution.orchestrator import process_work_unit
 
@@ -248,6 +321,34 @@ class TestProcessWorkUnit:
         with patch(f"{_ORC}.REPO_LOCAL_PATHS", {}):
             with pytest.raises(ValueError, match="No local path"):
                 process_work_unit(unit)
+
+    def test_raises_when_branch_is_empty(self, tmp_path: Path) -> None:
+        """process_work_unit must fail fast with a clear error when branch is empty."""
+        from devbench.execution.orchestrator import process_work_unit
+
+        unit = _make_unit(tmp_path)
+        unit.branch = ""  # simulate a WorkUnit not populated by BacklogParser
+
+        exec_result = ExecutionResult(status=ExecutionStatus.IN_REVIEW, output="done", blocker="")
+        mock_judge = MagicMock()
+        mock_judge.name = "mock"
+        mock_judge.evaluate.return_value = _pass_result("mock")
+
+        with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+            with patch(f"{_ORC}.claude_executor") as mock_exec:
+                mock_exec.execute.return_value = exec_result
+                with patch(f"{_ORC}.CodeReviewJudge", return_value=mock_judge):
+                    with patch(f"{_ORC}.TestReviewJudge", return_value=mock_judge):
+                        with patch(f"{_ORC}.DocReviewJudge", return_value=mock_judge):
+                            with patch(f"{_ORC}.ChangesManifestJudge", return_value=mock_judge):
+                                with patch(f"{_ORC}.SecurityReviewJudge", return_value=mock_judge):
+                                    with patch(f"{_ORC}.GitOpsJudge"):
+                                        with patch(f"{_ORC}.BacklogManager"):
+                                            with patch(f"{_ORC}.BlockerResolverJudge"):
+                                                with patch(f"{_ORC}.MAX_RETRY_ATTEMPTS", 1):
+                                                    with patch(f"{_ORC}.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
+                                                        with pytest.raises(ValueError, match="no branch set"):
+                                                            process_work_unit(unit)
 
     def test_handles_review_rejection_then_pass(self, tmp_path: Path) -> None:
         from devbench.execution.orchestrator import process_work_unit

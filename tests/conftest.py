@@ -148,7 +148,7 @@ def tmp_repo_dir(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def mock_backlog_index(tmp_path: Path) -> Path:
-    """Create a temporary BACKLOG.md with sample table rows."""
+    """Create a temporary BACKLOG.md with sample table rows and matching work-unit files."""
     content = """\
 # Backlog
 
@@ -166,6 +166,23 @@ def mock_backlog_index(tmp_path: Path) -> Path:
 """
     index_path = tmp_path / "BACKLOG.md"
     index_path.write_text(content)
+
+    # Create the work-unit files referenced by the index so parse_index can
+    # delegate to parse_work_unit_file for each row.
+    backlog_dir = tmp_path / "backlog"
+    backlog_dir.mkdir(exist_ok=True)
+    _work_units = [
+        ("E0-F1-S1-T1", "Create Makefile", "in-queue", "Task"),
+        ("E0-F1-S1-T2", "Lint Targets", "in-queue", "Task"),
+        ("E0-F1-S1-T3", "Test Targets", "done", "Task"),
+        ("E0-F1-S1", "Story One", "in-queue", "Story"),
+        ("E0-F1", "Feature One", "in-queue", "Feature"),
+    ]
+    for unit_id, title, status, _ in _work_units:
+        (backlog_dir / f"{unit_id}.md").write_text(
+            f"# {unit_id}: {title}\n\n## Status: {status}\n"
+        )
+
     return index_path
 
 

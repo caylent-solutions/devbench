@@ -1,6 +1,7 @@
 SHELL := /bin/bash
 .SHELLFLAGS := -euo pipefail -c
 .DEFAULT_GOAL := help
+unexport VIRTUAL_ENV
 
 .PHONY: help install lint format check test test-unit test-functional validate clean run-backlog start start-interactive report
 

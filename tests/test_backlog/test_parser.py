@@ -36,8 +36,10 @@ class TestParseIndex:
             assert isinstance(unit.unit_type, WorkUnitType)
 
     def test_parse_index_from_mock(self, mock_backlog_index: Path) -> None:
+        # mock_backlog_index is at tmp_path/BACKLOG.md; backlog files are under tmp_path/backlog/
+        workspace_root = mock_backlog_index.parent
         parser = BacklogParser(
-            backlog_root=mock_backlog_index.parent,
+            backlog_root=workspace_root / "backlog",
             backlog_index=mock_backlog_index,
         )
         units = parser.parse_index()
@@ -52,8 +54,7 @@ class TestParseIndex:
         feature_units = [u for u in units if u.unit_type is WorkUnitType.FEATURE]
         assert len(feature_units) == 1
 
-        # file_path must be absolute and rooted at the workspace root (backlog_root.parent)
-        workspace_root = mock_backlog_index.parent.parent
+        # file_path must be absolute and rooted at the workspace root
         for unit in units:
             assert unit.file_path.is_absolute(), f"{unit.id}: file_path is not absolute: {unit.file_path}"
             assert unit.file_path.is_relative_to(workspace_root), (
@@ -75,6 +76,31 @@ class TestParseIndex:
         parser = BacklogParser(backlog_root=tmp_path, backlog_index=empty_index)
         with pytest.raises(ValueError, match="No work-unit rows found"):
             parser.parse_index()
+
+    def test_parse_index_warns_on_status_mismatch(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        """A warning is emitted when BACKLOG.md row status differs from the work-unit file."""
+        import logging
+
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        wu_file = backlog_dir / "E0-F1-S1-T1.md"
+        wu_file.write_text("# E0-F1-S1-T1: Create Makefile\n\n## Status: in-progress\n")
+
+        index = tmp_path / "BACKLOG.md"
+        index.write_text(
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|----------|\n"
+            "| E0-F1-S1-T1 | Create Makefile | Task | in-queue | None | git-repo | `backlog/E0-F1-S1-T1.md` |\n"
+        )
+        parser = BacklogParser(backlog_root=backlog_dir, backlog_index=index)
+
+        with caplog.at_level(logging.WARNING, logger="devbench.backlog.parser"):
+            units = parser.parse_index()
+
+        assert len(units) == 1
+        assert units[0].status.value == "In Progress"  # file is source of truth
+        assert any("mismatch" in r.message.lower() for r in caplog.records)
 
 
 class TestParseWorkUnitFile:
@@ -124,6 +150,60 @@ class TestParseWorkUnitFile:
 
         assert len(wu.acceptance_criteria) >= 1
         assert any("AC-FUNC-001" in ac for ac in wu.acceptance_criteria)
+
+
+class TestParseWorkUnitFileBranch:
+    """Test branch field parsing in parse_work_unit_file."""
+
+    def test_parses_branch_from_spec(self, tmp_path: Path) -> None:
+        wu_file = tmp_path / "E0-F1-S1-T1.md"
+        wu_file.write_text(
+            "# E0-F1-S1-T1: My Task\n\n"
+            "## Status: in-queue\n\n"
+            "## Target Repository\n\n"
+            "- **Repo:** `caylent-solutions/git-repo`\n"
+            "- **Branch:** `feature/remove-deprecated-env-vars`\n"
+        )
+        parser = BacklogParser(backlog_root=tmp_path, backlog_index=tmp_path / "B.md")
+        wu = parser.parse_work_unit_file(wu_file)
+
+        assert wu.branch == "feature/remove-deprecated-env-vars"
+
+    def test_branch_falls_back_to_template_when_not_in_spec(self, tmp_path: Path) -> None:
+        wu_file = tmp_path / "E0-F1-S1-T1.md"
+        wu_file.write_text(
+            "# E0-F1-S1-T1: My Task\n\n"
+            "## Status: in-queue\n\n"
+            "## Target Repository\n\n"
+            "- **Repo:** `caylent-solutions/git-repo`\n"
+        )
+        parser = BacklogParser(backlog_root=tmp_path, backlog_index=tmp_path / "B.md")
+        wu = parser.parse_work_unit_file(wu_file)
+
+        assert wu.branch == "backlog/e0-f1-s1-t1"
+
+    def test_parses_branch_with_backlog_prefix(self, tmp_path: Path) -> None:
+        wu_file = tmp_path / "E0-F1-S1-T2.md"
+        wu_file.write_text(
+            "# E0-F1-S1-T2: Another Task\n\n"
+            "## Status: in-queue\n\n"
+            "## Target Repository\n\n"
+            "- **Repo:** `caylent-solutions/git-repo`\n"
+            "- **Branch:** `backlog/e0-f1-s1-t2`\n"
+        )
+        parser = BacklogParser(backlog_root=tmp_path, backlog_index=tmp_path / "B.md")
+        wu = parser.parse_work_unit_file(wu_file)
+
+        assert wu.branch == "backlog/e0-f1-s1-t2"
+
+    def test_branch_parsed_from_conftest_template(self, tmp_work_unit_file: Path) -> None:
+        parser = BacklogParser(
+            backlog_root=tmp_work_unit_file.parent,
+            backlog_index=tmp_work_unit_file.parent / "BACKLOG.md",
+        )
+        wu = parser.parse_work_unit_file(tmp_work_unit_file)
+
+        assert wu.branch == "backlog/e0-f1-s1-t1"
 
 
 class TestFindNextActionable:
@@ -473,79 +553,3 @@ class TestGetParallelCandidates:
         assert result.status is WorkUnitStatus.IN_PROGRESS
 
 
-class TestAlignStatuses:
-    """Test _align_statuses corrects mismatches between BACKLOG.md and work unit files."""
-
-    def test_file_status_overrides_index_status(self, tmp_path: Path) -> None:
-        """When the work unit file disagrees with BACKLOG.md, the file wins."""
-        # Set up a backlog dir with a work unit file that says in-progress
-        backlog_dir = tmp_path / "backlog"
-        backlog_dir.mkdir()
-        wu_file = backlog_dir / "T1.md"
-        wu_file.write_text("# E0-F1-S1-T1: Task\n\n## Status: in-progress\n")
-
-        parser = BacklogParser.__new__(BacklogParser)
-        parser._backlog_root = backlog_dir
-        parser._backlog_index = tmp_path / "BACKLOG.md"
-
-        p = Path("backlog/T1.md")
-        units = [
-            WorkUnit(
-                id="E0-F1-S1-T1",
-                title="Task",
-                status=WorkUnitStatus.DONE,  # BACKLOG.md says done
-                unit_type=WorkUnitType.TASK,
-                file_path=p,
-                repo="r",
-            ),
-        ]
-
-        parser._align_statuses(units)
-        assert units[0].status is WorkUnitStatus.IN_PROGRESS
-
-    def test_no_change_when_statuses_match(self, tmp_path: Path) -> None:
-        """No correction when both sources agree."""
-        backlog_dir = tmp_path / "backlog"
-        backlog_dir.mkdir()
-        wu_file = backlog_dir / "T1.md"
-        wu_file.write_text("# E0-F1-S1-T1: Task\n\n## Status: in-queue\n")
-
-        parser = BacklogParser.__new__(BacklogParser)
-        parser._backlog_root = backlog_dir
-        parser._backlog_index = tmp_path / "BACKLOG.md"
-
-        p = Path("backlog/T1.md")
-        units = [
-            WorkUnit(
-                id="E0-F1-S1-T1",
-                title="Task",
-                status=WorkUnitStatus.IN_QUEUE,
-                unit_type=WorkUnitType.TASK,
-                file_path=p,
-                repo="r",
-            ),
-        ]
-
-        parser._align_statuses(units)
-        assert units[0].status is WorkUnitStatus.IN_QUEUE
-
-    def test_missing_file_is_silently_skipped(self, tmp_path: Path) -> None:
-        """If the work unit file doesn't exist, no correction is made."""
-        parser = BacklogParser.__new__(BacklogParser)
-        parser._backlog_root = tmp_path
-        parser._backlog_index = tmp_path / "BACKLOG.md"
-
-        p = Path("backlog/nonexistent.md")
-        units = [
-            WorkUnit(
-                id="E0-F1-S1-T1",
-                title="Task",
-                status=WorkUnitStatus.DONE,
-                unit_type=WorkUnitType.TASK,
-                file_path=p,
-                repo="r",
-            ),
-        ]
-
-        parser._align_statuses(units)
-        assert units[0].status is WorkUnitStatus.DONE

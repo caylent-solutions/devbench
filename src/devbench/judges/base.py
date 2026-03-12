@@ -8,7 +8,6 @@ security alerts, etc.) and delegates the pass/fail decision to the LLM.
 import abc
 import json
 import logging
-import subprocess
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -18,7 +17,6 @@ import anthropic
 from devbench.config import (
     BEDROCK_REGION,
     CLAUDE_MODEL,
-    COMMAND_TIMEOUT,
     LLM_EVIDENCE_TRUNCATION,
     LLM_TIMEOUT,
     RUNTIME_CONFIG,
@@ -27,6 +25,7 @@ from devbench.config import (
 )
 from devbench.config_loader import get_configured_default_branch
 from devbench.constants import ERROR_OUTPUT_PREVIEW_CHARS, LLM_RESPONSE_FORMAT_INSTRUCTIONS, RAW_RESPONSE_PREVIEW_CHARS
+from devbench.utils.process import run_command as _run_command_util
 
 
 class Verdict(Enum):
@@ -114,24 +113,12 @@ class BaseJudge(abc.ABC):
     ) -> tuple[int, str, str]:
         """Run a shell command and return (returncode, stdout, stderr).
 
+        Delegates to :func:`devbench.utils.process.run_command`.
         Returns ``(127, "", "<error>")`` when the executable is not found
         or the command times out, avoiding crashes when a tool is missing
         or a task runner hangs.
         """
-        effective_timeout = timeout if timeout is not None else COMMAND_TIMEOUT
-        try:
-            result = subprocess.run(
-                cmd,
-                cwd=cwd,
-                capture_output=True,
-                text=True,
-                timeout=effective_timeout,
-            )
-        except FileNotFoundError:
-            return 127, "", f"{cmd[0]}: command not found"
-        except subprocess.TimeoutExpired:
-            return 127, "", f"{' '.join(cmd)}: timed out after {effective_timeout}s"
-        return result.returncode, result.stdout, result.stderr
+        return _run_command_util(cmd, cwd=cwd, timeout=timeout)
 
     def _llm_evaluate(
         self,

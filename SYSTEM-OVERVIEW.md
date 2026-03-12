@@ -238,7 +238,7 @@ repos:
 | `JUDGE_GH_API_TIMEOUT` | `30` | GitHub API call timeout (seconds) |
 | `JUDGE_TEST_TIMEOUT` | `300` | Test execution timeout (seconds) |
 | `JUDGE_LLM_TIMEOUT` | `300` | LLM evaluation timeout (seconds) |
-| `JUDGE_COMMAND_TIMEOUT` | `120` | General command timeout (seconds) |
+| `JUDGE_COMMAND_TIMEOUT` | *(see config)* | Optional. Maximum seconds to wait for a subprocess command before timing out. Positive integer (seconds). Used by `run_command()` in `utils/process.py` and all judge subprocess calls. |
 | `JUDGE_EXECUTOR_TIMEOUT` | `1800` | Dev agent execution timeout (seconds) |
 | `JUDGE_EXECUTOR_MAX_TURNS` | `50` | Max turns for dev agent execution |
 | `JUDGE_ORCHESTRATOR_POLL_INTERVAL` | `10` | Seconds between orchestrator poll cycles |

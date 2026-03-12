@@ -46,6 +46,7 @@ class WorkUnit:
     dependencies: list[str] = field(default_factory=list)
     acceptance_criteria: list[str] = field(default_factory=list)
     description: str = ""
+    branch: str = ""
 
     # ------------------------------------------------------------------
     # Type predicates

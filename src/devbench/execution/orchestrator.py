@@ -20,7 +20,7 @@ from devbench.config import (
     resolve_repo,
     validate_repo,
 )
-from devbench.constants import BRANCH_NAME_TEMPLATE, PR_BODY_TEMPLATE, STATUS_IN_PROGRESS
+from devbench.constants import PR_BODY_TEMPLATE, STATUS_IN_PROGRESS
 from devbench.execution import executor as claude_executor
 from devbench.execution.executor import ExecutionStatus
 from devbench.github.git_ops import GitOpsJudge
@@ -196,7 +196,12 @@ def process_work_unit(work_unit: WorkUnit) -> bool:
             continue
 
         # Commit, push, create PR, wait for checks, merge
-        branch = BRANCH_NAME_TEMPLATE.format(unit_id=work_unit.id.lower())
+        branch = work_unit.branch
+        if not branch:
+            raise ValueError(
+                f"Work unit '{work_unit.id}' has no branch set. "
+                "Ensure the work-unit file has a Branch: field or is parsed via BacklogParser."
+            )
         try:
             git_ops.commit_and_push(
                 repo=canonical_repo,

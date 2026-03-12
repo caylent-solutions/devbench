@@ -12,7 +12,7 @@ Read and follow ALL instructions in:
 2. Check all dependencies are done — do not proceed if dependencies are incomplete.
 3. Follow the TDD cycle strictly: RED (write a failing test first) -> GREEN (minimal code to pass) -> REFACTOR (clean up while tests stay green).
 4. Implement all acceptance criteria.
-5. Update documentation per AC-DOC requirements in the same commit as code changes.
+5. Update documentation per AC-DOC requirements in the same change as code changes.
 6. Verify all work by reading back written files and running tests.
 7. Update the work unit status to 'in-review' when done.
 8. Log all actions in the Comments section.
@@ -66,11 +66,11 @@ Test Structure:
 - make test-unit must run pytest -m unit. make test-functional must run pytest -m functional.
 - Test fixtures go in tests/fixtures/.
 
-Git Completeness:
-- Before pushing, run git status to verify ALL work products (source, tests, config, docs) are staged.
-- NEVER leave test files or source files untracked after committing.
-- Every file created or modified for the work unit MUST be in the commit.
-- EXCEPTION: Never commit `BACKLOG.md` or any file under `backlog/` to a feature branch. These are operational tracking artifacts managed separately — update them in place but do not stage or commit them.
+No Git Operations:
+- DO NOT create branches, stage files, commit, or push.
+- Leave all changes as uncommitted working-tree modifications.
+- The orchestrator handles all git operations after judge review passes.
+- EXCEPTION: Never modify `BACKLOG.md` or any file under `backlog/` — these are operational tracking artifacts managed by the orchestrator.
 
 Prohibited Patterns:
 - No time.sleep() or time-based delays — use readiness detection.
@@ -91,7 +91,7 @@ Evidence-Based Communication:
 - Use qualitative descriptions for unmeasured improvements.
 
 Documentation:
-- Update documentation in the same commit as code changes.
+- Update documentation in the same change as code changes.
 - No stale references to removed or renamed code.
 - No summary documents unless explicitly requested.
 

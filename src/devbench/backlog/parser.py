@@ -15,11 +15,12 @@ from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
 from devbench.config import BACKLOG_INDEX, BACKLOG_ROOT
 from devbench.constants import (
     BACKLOG_AC_RE,
+    BACKLOG_BRANCH_RE,
     BACKLOG_DEP_TABLE_ROW_RE,
     BACKLOG_INDEX_TABLE_ROW_RE,
     BACKLOG_REPO_RE,
     BACKLOG_STATUS_RE,
-    DEPENDENCY_NONE_VALUE,
+    BRANCH_NAME_TEMPLATE,
     EPIC_PLACEHOLDER_ID,
     STATUS_BLOCKED,
     STATUS_DONE,
@@ -102,17 +103,6 @@ def _infer_type_from_id(unit_id: str) -> WorkUnitType:
     return unit_type
 
 
-def _parse_dependencies_raw(raw: str) -> list[str]:
-    """Split a comma-separated dependency string from the index table.
-
-    Returns an empty list when the raw value is ``'None'`` or blank.
-    """
-    stripped = raw.strip()
-    if not stripped or stripped.lower() == DEPENDENCY_NONE_VALUE:
-        return []
-    return [dep.strip() for dep in stripped.split(",") if dep.strip()]
-
-
 def _extract_section(content: str, header: str) -> str:
     """Extract text between ``## <header>`` and the next ``##`` heading.
 
@@ -146,6 +136,11 @@ class BacklogParser:
     def parse_index(self) -> list[WorkUnit]:
         """Parse ``BACKLOG.md`` table rows into a list of ``WorkUnit`` objects.
 
+        Each row is used to locate the work-unit file; the complete ``WorkUnit``
+        is then constructed by delegating to :meth:`parse_work_unit_file`, which
+        is the single authoritative constructor.  This ensures all fields
+        (including ``branch``) are always populated from the file.
+
         Raises ``FileNotFoundError`` if the index file does not exist and
         ``ValueError`` if a table row cannot be parsed.
         """
@@ -155,13 +150,12 @@ class BacklogParser:
         content = self._backlog_index.read_text()
         units: list[WorkUnit] = []
 
+        logger = logging.getLogger(__name__)
+
         for match in BACKLOG_INDEX_TABLE_ROW_RE.finditer(content):
             raw_id = match.group(1).strip()
-            raw_title = match.group(2).strip()
             raw_type = match.group(3).strip()
             raw_status = match.group(4).strip()
-            raw_deps = match.group(5).strip()
-            raw_repo = match.group(6).strip()
             raw_file_path = match.group(7).strip().strip("`")
 
             # Skip header rows, separator rows, and non-work-unit rows
@@ -174,7 +168,6 @@ class BacklogParser:
             if raw_type not in _VALID_TYPE_VALUES:
                 continue
 
-            status = _parse_status(raw_status)
             unit_type = _infer_type_from_id(raw_id)
 
             # Validate that the explicit type column matches the inferred type.
@@ -183,30 +176,26 @@ class BacklogParser:
                     f"Type mismatch for '{raw_id}': column says '{raw_type}' but ID implies '{unit_type.value}'."
                 )
 
-            # For epics that use "--" as their ID, derive the real ID from
-            # the file path (e.g. ``backlog/E0-repo-tooling/E0.md`` -> ``E0``).
-            effective_id = raw_id
-            if raw_id == EPIC_PLACEHOLDER_ID:
-                file_stem = Path(raw_file_path).stem
-                effective_id = file_stem
-
-            dependencies = _parse_dependencies_raw(raw_deps)
-
             if not raw_file_path:
-                raise ValueError(f"Work unit '{effective_id}' has no file path in BACKLOG.md")
-            file_path = (self._backlog_root.parent / raw_file_path).resolve()
+                raise ValueError(f"Work unit '{raw_id}' has no file path in BACKLOG.md")
 
-            units.append(
-                WorkUnit(
-                    id=effective_id,
-                    title=raw_title,
-                    status=status,
-                    unit_type=unit_type,
-                    file_path=file_path,
-                    repo=raw_repo,
-                    dependencies=dependencies,
+            file_path = (self._backlog_root.parent / raw_file_path).resolve()
+            unit = self.parse_work_unit_file(file_path)
+
+            # Cross-check: warn when BACKLOG.md index disagrees with the work-unit file.
+            # The file is the source of truth (parse_work_unit_file already read it),
+            # so no correction is needed — only observability.
+            index_status = _RAW_STATUS_TO_ENUM.get(raw_status.lower())
+            if index_status is not None and index_status != unit.status:
+                logger.warning(
+                    "Status mismatch for %s: BACKLOG.md says '%s', "
+                    "work unit file says '%s'. Using file as source of truth.",
+                    unit.id,
+                    raw_status,
+                    unit.status.value,
                 )
-            )
+
+            units.append(unit)
 
         if not units:
             raise ValueError(
@@ -215,7 +204,6 @@ class BacklogParser:
                 "contains correctly formatted table rows."
             )
 
-        self._align_statuses(units)
         return units
 
     def parse_work_unit_file(self, file_path: Path) -> WorkUnit:
@@ -258,6 +246,15 @@ class BacklogParser:
         if repo_match is not None:
             repo = repo_match.group(1).strip()
 
+        # --- Branch ---
+        # Use the spec-defined branch when present; fall back to the standard
+        # naming convention so WorkUnit.branch is always a concrete value.
+        branch_match = BACKLOG_BRANCH_RE.search(content)
+        if branch_match is not None:
+            branch = branch_match.group(1).strip()
+        else:
+            branch = BRANCH_NAME_TEMPLATE.format(unit_id=unit_id.lower())
+
         # --- Description ---
         description = _extract_section(content, "Description")
 
@@ -276,6 +273,7 @@ class BacklogParser:
             unit_type=unit_type,
             file_path=file_path,
             repo=repo,
+            branch=branch,
             dependencies=dependencies,
             acceptance_criteria=acceptance_criteria,
             description=description,
@@ -344,40 +342,6 @@ class BacklogParser:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
-
-    def _align_statuses(self, units: list[WorkUnit]) -> None:
-        """Cross-check BACKLOG.md statuses against work unit files.
-
-        When the work unit file has a different status than BACKLOG.md,
-        the file is treated as the source of truth and the unit's status
-        is corrected in-memory. A warning is logged for each mismatch.
-        """
-        logger = logging.getLogger(__name__)
-
-        for unit in units:
-            full_path = self._backlog_root.parent / unit.file_path
-            if not full_path.is_file():
-                continue
-
-            content = full_path.read_text()
-            file_status_match = BACKLOG_STATUS_RE.search(content)
-            if file_status_match is None:
-                continue
-
-            raw_file_status = file_status_match.group(1).strip().lower()
-            file_status = _RAW_STATUS_TO_ENUM.get(raw_file_status)
-            if file_status is None:
-                continue
-
-            if file_status != unit.status:
-                logger.warning(
-                    "Status mismatch for %s: BACKLOG.md says '%s', "
-                    "work unit file says '%s'. Using file as source of truth.",
-                    unit.id,
-                    unit.status.value,
-                    file_status.value,
-                )
-                unit.status = file_status
 
     @staticmethod
     def _done_ids(units: list[WorkUnit]) -> frozenset[str]:

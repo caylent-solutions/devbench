@@ -4,7 +4,7 @@ Your working directory for all code changes is: {repo_path}
 
 Read and follow ALL instructions in:
 1. {workspace_root}/CLAUDE.md (mandatory — all standards apply)
-2. {workspace_root}/backlog/AGENT-INSTRUCTIONS.md
+2. {workspace_root}/backlog/config/AGENT-INSTRUCTIONS.md
 3. The work unit file: {work_unit_path}
 
 --- EXECUTION SEQUENCE ---

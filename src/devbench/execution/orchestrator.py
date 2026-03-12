@@ -50,6 +50,7 @@ def _format_judge_feedback(verdicts: list[tuple[str, JudgeResult]]) -> str:
 def run_review_judges(
     work_unit: WorkUnit,
     repo_path: Path,
+    repo: str,
 ) -> list[tuple[str, JudgeResult]]:
     """Run all review judges on a work unit.
 
@@ -68,6 +69,7 @@ def run_review_judges(
         result = judge.evaluate(
             work_unit_path=work_unit.file_path,
             repo_path=repo_path,
+            repo=repo,
         )
         results.append((judge.name, result))
         logger.info(
@@ -158,7 +160,7 @@ def process_work_unit(work_unit: WorkUnit) -> bool:
             continue
 
         # Status is IN_REVIEW — run judges
-        verdicts = run_review_judges(work_unit, repo_path)
+        verdicts = run_review_judges(work_unit, repo_path, repo=canonical_repo)
         all_passed = all(v.verdict == Verdict.PASS for _, v in verdicts)
 
         if not all_passed:

@@ -21,8 +21,14 @@ _DEFAULT_LOG_FILE = str(_DEFAULT_LOG_DIR / "orchestrator.log")
 _configured = False
 
 
-def setup_logging(level: int = logging.INFO) -> Path:
+def setup_logging(level: int | None = None) -> Path:
     """Configure logging with stdout and file handlers.
+
+    The log level is resolved from (in order):
+    1. The ``level`` argument if provided.
+    2. The ``JUDGE_LOG_LEVEL`` environment variable (standard level names,
+       e.g. ``DEBUG``, ``INFO``, ``WARNING``).
+    3. ``INFO`` as the default.
 
     Returns the path to the log file.
 
@@ -31,6 +37,10 @@ def setup_logging(level: int = logging.INFO) -> Path:
     global _configured  # noqa: PLW0603
     if _configured:
         return Path(os.environ.get("JUDGE_LOG_FILE", _DEFAULT_LOG_FILE))
+
+    if level is None:
+        env_level = os.environ.get("JUDGE_LOG_LEVEL", "INFO").upper()
+        level = getattr(logging, env_level, logging.INFO)
 
     log_file = Path(os.environ.get("JUDGE_LOG_FILE", _DEFAULT_LOG_FILE))
     log_file.parent.mkdir(parents=True, exist_ok=True)

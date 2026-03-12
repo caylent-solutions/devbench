@@ -69,38 +69,44 @@ class ChangesManifestJudge(BaseJudge):
     def _get_diff_summary(self, repo_path: Path, repo: str = "") -> str:
         """Return a summary of all changes for LLM context.
 
-        Includes staged, unstaged, untracked, and committed branch changes.
+        NOTE: Judges run before the orchestrator commits. At review time the
+        executor has staged files (git add) but not yet committed them.
+        Unstaged or untracked files mean the executor missed a ``git add``.
+
+        Includes staged, unstaged/untracked (needs git add), and any
+        already-committed branch changes vs the default branch.
         """
         parts: list[str] = []
 
-        # Staged changes
+        # Staged changes — executor correctly prepared these for review
         rc, stat_out, _ = self._run_command(
             ["git", "diff", "--stat", "--cached"], cwd=repo_path,
         )
         if rc == 0 and stat_out.strip():
-            parts.append(f"Staged changes:\n{stat_out}")
+            parts.append(f"Staged (ready for review):\n{stat_out}")
 
-        # Unstaged changes
+        # Unstaged modified files — executor forgot to git add these
         rc, stat_out, _ = self._run_command(
             ["git", "diff", "--stat"], cwd=repo_path,
         )
         if rc == 0 and stat_out.strip():
-            parts.append(f"Unstaged changes:\n{stat_out}")
+            parts.append(f"Unstaged/untracked (needs git add — executor missed staging these):\n{stat_out}")
 
-        # Untracked files
+        # Untracked new files — executor forgot to git add these
         rc, untracked, _ = self._run_command(
             ["git", "ls-files", "--others", "--exclude-standard"], cwd=repo_path,
         )
         if rc == 0 and untracked.strip():
-            parts.append(f"Untracked files:\n{untracked}")
+            parts.append(f"Untracked new files (needs git add — executor missed staging these):\n{untracked}")
 
-        # All committed branch changes vs default branch
+        # Already-committed branch changes vs default branch (present when
+        # executor committed directly, which is atypical — orchestrator owns commits)
         default_branch = self._get_default_branch(repo_path, repo=repo)
         rc, stat_out, _ = self._run_command(
             ["git", "diff", "--stat", default_branch], cwd=repo_path,
         )
         if rc == 0 and stat_out.strip():
-            parts.append(f"Committed changes vs {default_branch}:\n{stat_out}")
+            parts.append(f"Already committed on branch vs {default_branch}:\n{stat_out}")
 
         all_files = self._get_changed_files(repo_path, repo=repo)
         parts.append("All changed files:\n" + "\n".join(all_files))

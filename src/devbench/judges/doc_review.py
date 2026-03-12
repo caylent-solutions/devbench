@@ -57,28 +57,4 @@ class DocReviewJudge(BaseJudge):
 
         return "\n".join(parts[:LLM_FILE_CONTEXT_LIMIT])
 
-    def _get_diff(self, repo_path: Path, repo: str = "") -> str:
-        """Return the combined diff of all changes: staged, unstaged, and committed.
 
-        Collects diffs from all sources so evidence is complete whether the
-        agent has staged, committed, or left changes in the working tree.
-        """
-        parts: list[str] = []
-
-        # Staged changes
-        rc, stdout, _ = self._run_command(["git", "diff", "--cached"], cwd=repo_path)
-        if rc == 0 and stdout.strip():
-            parts.append(stdout)
-
-        # Unstaged changes
-        rc, stdout, _ = self._run_command(["git", "diff"], cwd=repo_path)
-        if rc == 0 and stdout.strip():
-            parts.append(stdout)
-
-        # All committed branch changes vs default branch
-        default_branch = self._get_default_branch(repo_path, repo=repo)
-        rc, stdout, _ = self._run_command(["git", "diff", default_branch], cwd=repo_path)
-        if rc == 0 and stdout.strip():
-            parts.append(stdout)
-
-        return "\n".join(parts)

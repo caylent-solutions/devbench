@@ -65,25 +65,3 @@ class TestCollectDocFiles:
         assert content == ""
 
 
-class TestGetDiff:
-    """Test _get_diff method."""
-
-    def test_includes_staged_diff(self, tmp_path: Path) -> None:
-        judge = DocReviewJudge()
-
-        def side_effect(cmd, cwd):
-            if "--cached" in cmd:
-                return (0, "staged changes", "")
-            return (0, "", "")
-
-        with patch.object(judge, "_get_default_branch", return_value="main"):
-            with patch.object(judge, "_run_command", side_effect=side_effect):
-                diff = judge._get_diff(tmp_path)
-        assert "staged changes" in diff
-
-    def test_returns_empty_when_all_fail(self, tmp_path: Path) -> None:
-        judge = DocReviewJudge()
-        with patch.object(judge, "_get_default_branch", return_value="main"):
-            with patch.object(judge, "_run_command", return_value=(1, "", "error")):
-                diff = judge._get_diff(tmp_path)
-        assert diff == ""

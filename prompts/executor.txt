@@ -66,10 +66,10 @@ Test Structure:
 - make test-unit must run pytest -m unit. make test-functional must run pytest -m functional.
 - Test fixtures go in tests/fixtures/.
 
-No Git Operations:
-- DO NOT create branches, stage files, commit, or push.
-- Leave all changes as uncommitted working-tree modifications.
-- The orchestrator handles all git operations after judge review passes.
+Git Operations:
+- DO NOT create branches, commit, or push.
+- Stage all changed files with `git add` before setting status to in-review — this is required for judge evidence to be complete.
+- The orchestrator handles all git operations beyond staging: branch, commit, push, PR, merge.
 - EXCEPTION: Never modify `BACKLOG.md` or any file under `backlog/` — these are operational tracking artifacts managed by the orchestrator.
 
 Prohibited Patterns:

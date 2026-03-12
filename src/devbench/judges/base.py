@@ -96,6 +96,66 @@ class BaseJudge(abc.ABC):
         # stdout is e.g. "origin/main" — strip the remote prefix
         return stdout.strip().removeprefix("origin/")
 
+    def _get_diff(self, repo_path: Path, repo: str = "") -> str:
+        """Return the combined diff of all changes: staged, unstaged, committed, and untracked.
+
+        Untracked new files are not shown by any ``git diff`` variant — they
+        must be discovered via ``git ls-files --others`` and their content
+        included directly so the LLM can review them.
+        """
+        parts: list[str] = []
+
+        rc, stdout, _ = self._run_command(["git", "diff", "--cached"], cwd=repo_path)
+        self.logger.debug("git diff --cached: rc=%d, chars=%d", rc, len(stdout))
+        if rc == 0 and stdout.strip():
+            parts.append(stdout)
+
+        rc, stdout, _ = self._run_command(["git", "diff"], cwd=repo_path)
+        self.logger.debug("git diff (unstaged): rc=%d, chars=%d", rc, len(stdout))
+        if rc == 0 and stdout.strip():
+            parts.append(stdout)
+
+        default_branch = self._get_default_branch(repo_path, repo=repo)
+        rc, stdout, _ = self._run_command(["git", "diff", default_branch], cwd=repo_path)
+        self.logger.debug("git diff %s (branch): rc=%d, chars=%d", default_branch, rc, len(stdout))
+        if rc == 0 and stdout.strip():
+            parts.append(stdout)
+
+        # Untracked new files are invisible to all git diff variants.
+        # Read and format their content as synthetic diff hunks so the LLM
+        # can review them against the Changes Manifest and Acceptance Criteria.
+        rc, stdout, _ = self._run_command(
+            ["git", "ls-files", "--others", "--exclude-standard"], cwd=repo_path,
+        )
+        self.logger.debug("git ls-files --others: rc=%d, files=%r", rc, stdout.strip())
+        if rc == 0 and stdout.strip():
+            for raw_filepath in stdout.splitlines():
+                filepath = raw_filepath.strip()
+                if not filepath:
+                    continue
+                abs_path = repo_path / filepath
+                try:
+                    content = abs_path.read_text(encoding="utf-8")
+                except OSError:
+                    self.logger.debug("Could not read untracked file: %s", filepath)
+                    continue
+                lines = content.splitlines(keepends=True)
+                added = "".join(f"+{line}" for line in lines)
+                hunk = (
+                    f"diff --git a/{filepath} b/{filepath}\n"
+                    f"new file mode 100644\n"
+                    f"--- /dev/null\n"
+                    f"+++ b/{filepath}\n"
+                    f"@@ -0,0 +1,{len(lines)} @@\n"
+                    f"{added}"
+                )
+                parts.append(hunk)
+                self.logger.debug("Included untracked file in diff: %s (%d lines)", filepath, len(lines))
+
+        combined = "\n".join(parts)
+        self.logger.debug("_get_diff total: %d chars across %d parts", len(combined), len(parts))
+        return combined
+
     def _read_file(self, path: Path) -> str:
         """Read a file and return its contents as a string.
 

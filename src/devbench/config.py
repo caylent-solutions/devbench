@@ -2,19 +2,15 @@
 
 Centralizes all configuration values, repo validation, and credential access.
 
-Config precedence (highest to lowest):
-1. Environment variables
-2. YAML config file (``backlog/config/devbench.yaml`` by default)
-3. Code defaults
-
-Config file path resolution:
+Config file path resolution (first match wins):
 1. ``--config`` CLI argument  (sets ``JUDGE_CONFIG_PATH`` before module import)
 2. ``JUDGE_CONFIG_PATH`` environment variable
 3. ``<JUDGE_WORKSPACE_ROOT>/backlog/config/devbench.yaml``
 
-``JUDGE_ALLOWED_REPOS`` is **deprecated** — define allowed repos in the YAML
-``repos`` section instead.  If ``JUDGE_ALLOWED_REPOS`` is still set in the
-environment it takes precedence (env > yaml) but a warning is emitted.
+Allowed repositories and per-repo settings are defined exclusively in the YAML
+config file (``backlog/config/devbench.yaml`` relative to
+``JUDGE_WORKSPACE_ROOT``).  The deprecated env vars ``JUDGE_ALLOWED_REPOS``,
+``JUDGE_BACKLOG_ROOT``, and ``JUDGE_BACKLOG_INDEX`` are no longer read.
 """
 
 import json
@@ -57,22 +53,9 @@ _config_path: Path = resolve_config_path(None, os.environ, WORKSPACE_ROOT)
 RUNTIME_CONFIG: RuntimeConfig = load_runtime_config(_config_path, os.environ)
 
 # ---------------------------------------------------------------------------
-# Allowed repos — sourced from YAML; JUDGE_ALLOWED_REPOS env is deprecated.
+# Allowed repos — sourced exclusively from YAML config.
 # ---------------------------------------------------------------------------
-_allowed_repos_env = os.environ.get("JUDGE_ALLOWED_REPOS", "")
-if _allowed_repos_env:
-    # JUDGE_ALLOWED_REPOS is deprecated — repos should be declared in the YAML
-    # config.  Honor env for backward compatibility (env > yaml) but warn.
-    _log.warning(
-        "JUDGE_ALLOWED_REPOS is deprecated. "
-        "Declare repos in the YAML config file instead (see backlog/config/devbench.yaml). "
-        "JUDGE_ALLOWED_REPOS will be removed in a future release."
-    )
-    ALLOWED_REPOS: frozenset[str] = frozenset(
-        r.strip() for r in _allowed_repos_env.split(",") if r.strip()
-    )
-else:
-    ALLOWED_REPOS = frozenset(RUNTIME_CONFIG.repos)
+ALLOWED_REPOS: frozenset[str] = frozenset(RUNTIME_CONFIG.repos)
 
 REPO_LOCAL_PATHS: dict[str, Path] = {
     repo: get_repo_local_path(repo, RUNTIME_CONFIG, WORKSPACE_ROOT) for repo in ALLOWED_REPOS
@@ -104,29 +87,10 @@ def resolve_repo(short_or_full: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Backlog paths
+# Backlog paths — derived from WORKSPACE_ROOT.
 # ---------------------------------------------------------------------------
-_backlog_root_env = os.environ.get("JUDGE_BACKLOG_ROOT", "")
-if _backlog_root_env:
-    _log.warning(
-        "JUDGE_BACKLOG_ROOT is deprecated. "
-        "Backlog path is derived from JUDGE_WORKSPACE_ROOT automatically. "
-        "JUDGE_BACKLOG_ROOT will be removed in a future release."
-    )
-    BACKLOG_ROOT: Path = Path(_backlog_root_env)
-else:
-    BACKLOG_ROOT = WORKSPACE_ROOT / BACKLOG_SUBDIR
-
-_backlog_index_env = os.environ.get("JUDGE_BACKLOG_INDEX", "")
-if _backlog_index_env:
-    _log.warning(
-        "JUDGE_BACKLOG_INDEX is deprecated. "
-        "Backlog index path is derived from JUDGE_WORKSPACE_ROOT automatically. "
-        "JUDGE_BACKLOG_INDEX will be removed in a future release."
-    )
-    BACKLOG_INDEX: Path = Path(_backlog_index_env)
-else:
-    BACKLOG_INDEX = WORKSPACE_ROOT / "BACKLOG.md"
+BACKLOG_ROOT: Path = WORKSPACE_ROOT / BACKLOG_SUBDIR
+BACKLOG_INDEX: Path = WORKSPACE_ROOT / "BACKLOG.md"
 
 # ---------------------------------------------------------------------------
 # Operational parameters

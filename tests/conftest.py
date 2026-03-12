@@ -11,7 +11,7 @@ os.environ.setdefault("JUDGE_CLAUDE_MODEL", "test-model")
 os.environ.setdefault("JUDGE_WORKSPACE_ROOT", "/tmp/test-workspace")
 os.environ.setdefault("JUDGE_LOG_FILE", "/tmp/judges-test-orchestrator.log")
 # Point to the test fixture YAML config so config.py can resolve ALLOWED_REPOS
-# without requiring JUDGE_ALLOWED_REPOS (which is deprecated).
+# from the YAML repos section (the only supported source).
 os.environ.setdefault(
     "JUDGE_CONFIG_PATH",
     str(Path(__file__).parent / "fixtures" / "test_devbench.yaml"),

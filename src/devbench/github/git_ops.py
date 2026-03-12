@@ -68,7 +68,7 @@ class GitOpsJudge(BaseJudge):
         4. ``git add -A`` — stage all working-tree changes.
         5. ``git status --porcelain`` — check whether anything was staged.
 
-           - If the output is **non-empty**: proceed to commit and push (step 6–7).
+           - If the output is **non-empty**: proceed to commit and push (steps 6-7).
            - If the output is **empty** (nothing to commit): the working tree is
              already clean, meaning a prior run completed the commit.  Skip the
              commit and evaluate whether a push is still needed:

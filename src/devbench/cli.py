@@ -485,8 +485,11 @@ def _get_prior_feedback(unit_id: str) -> dict[str, str]:
         rf"(\S+) judge feedback for {re.escape(unit_id)}: (.+)",
     )
 
+    marker = f" judge feedback for {unit_id}: "
     feedback: dict[str, str] = {}
     for line in log_file.read_text(encoding="utf-8").splitlines():
+        if marker not in line:
+            continue
         match = pattern.search(line)
         if match:
             judge_name = match.group(1)

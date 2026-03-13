@@ -105,6 +105,76 @@ class TestHasMakeTestTarget:
             assert judge._has_make_test_target(tmp_path) is False
 
 
+class TestRunTestsFullOutput:
+    """Test _run_tests returns full output without tail truncation — AC-8."""
+
+    def test_returns_full_output_not_tail(self, tmp_path: Path) -> None:
+        """AC-8: full combined output returned, no tail slice applied."""
+        judge = TestReviewJudge()
+        long_output = "line\n" * 500  # well over any reasonable tail limit
+        with patch.object(judge, "_has_make_test_target", return_value=False):
+            with patch.object(judge, "_run_command", return_value=(0, long_output, "")):
+                output = judge._run_tests(tmp_path)
+        assert output == long_output.strip(), (
+            "Expected full output, got only tail portion"
+        )
+
+
+class TestEvidenceIncludesDiff:
+    """Test evaluate includes Git Diff evidence section — AC-9."""
+
+    def test_includes_diff_when_non_empty(self, tmp_path: Path) -> None:
+        """AC-9: non-empty diff is included as Git Diff evidence section."""
+        wu_file = tmp_path / "wu.md"
+        wu_file.write_text("## Description\n\nspec")
+
+        judge = TestReviewJudge()
+        with (
+            patch.object(judge, "_run_command", return_value=(0, "1 passed", "")),
+            patch.object(judge, "_get_diff", return_value="diff --git a/test.py"),
+            patch.object(judge, "_llm_evaluate", return_value=make_llm_pass_result("test_review")) as mock_llm,
+        ):
+            judge.evaluate(wu_file, tmp_path)
+
+        evidence = mock_llm.call_args.kwargs["evidence_sections"]
+        assert "Git Diff" in evidence, "Expected Git Diff in evidence sections"
+        assert "diff --git" in evidence["Git Diff"]
+
+    def test_omits_diff_when_empty(self, tmp_path: Path) -> None:
+        """AC-9: empty diff is not included as an evidence section."""
+        wu_file = tmp_path / "wu.md"
+        wu_file.write_text("## Description\n\nspec")
+
+        judge = TestReviewJudge()
+        with (
+            patch.object(judge, "_run_command", return_value=(0, "1 passed", "")),
+            patch.object(judge, "_get_diff", return_value="   "),
+            patch.object(judge, "_llm_evaluate", return_value=make_llm_pass_result("test_review")) as mock_llm,
+        ):
+            judge.evaluate(wu_file, tmp_path)
+
+        evidence = mock_llm.call_args.kwargs["evidence_sections"]
+        assert "Git Diff" not in evidence, "Empty diff should not appear in evidence"
+
+    def test_work_unit_has_agent_log_stripped(self, tmp_path: Path) -> None:
+        """AC-4: work unit content passed to LLM has ## Comments section removed."""
+        wu_file = tmp_path / "wu.md"
+        wu_file.write_text("## Description\n\nspec\n## Comments\n[REVIEW_FAIL] noise")
+
+        judge = TestReviewJudge()
+        with (
+            patch.object(judge, "_run_command", return_value=(0, "1 passed", "")),
+            patch.object(judge, "_get_diff", return_value=""),
+            patch.object(judge, "_llm_evaluate", return_value=make_llm_pass_result("test_review")) as mock_llm,
+        ):
+            judge.evaluate(wu_file, tmp_path)
+
+        evidence = mock_llm.call_args.kwargs["evidence_sections"]
+        assert "[REVIEW_FAIL]" not in evidence["Work Unit"], (
+            "Agent log should be stripped from Work Unit evidence"
+        )
+
+
 class TestCollectTestFiles:
     """Test _collect_test_files gathers test content for LLM."""
 

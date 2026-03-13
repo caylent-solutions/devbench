@@ -165,6 +165,27 @@ class BaseJudge(abc.ABC):
             raise FileNotFoundError(f"Judge {self.name}: file not found: {path}")
         return path.read_text(encoding="utf-8")
 
+    @staticmethod
+    def _strip_agent_log(content: str) -> str:
+        """Return work unit content with the ## Comments / Agent Log section removed.
+
+        Judges must not see accumulated verdicts from other judges — this prevents
+        cross-judge bias. Each judge's own prior feedback is injected separately via
+        the previous_feedback mechanism.
+        """
+        marker = "\n## Comments"
+        idx = content.find(marker)
+        return content[:idx] if idx != -1 else content
+
+    def _read_work_unit(self, path: Path) -> str:
+        """Read a work unit file and strip the agent log section.
+
+        Use this instead of ``_read_file`` when reading work unit ``.md`` files
+        so that accumulated judge verdicts in ``## Comments`` are not passed to
+        the LLM as evidence.
+        """
+        return self._strip_agent_log(self._read_file(path))
+
     def _run_command(
         self,
         cmd: list[str],
@@ -206,6 +227,12 @@ class BaseJudge(abc.ABC):
         evidence_text = ""
         for section_name, content in evidence_sections.items():
             if len(content) > LLM_EVIDENCE_TRUNCATION:
+                self.logger.warning(
+                    "Evidence section '%s' truncated: %d → %d chars",
+                    section_name,
+                    len(content),
+                    LLM_EVIDENCE_TRUNCATION,
+                )
                 truncated = (
                     content[:LLM_EVIDENCE_TRUNCATION]
                     + f"\n\n[... TRUNCATED — showing {LLM_EVIDENCE_TRUNCATION} of "

@@ -32,7 +32,7 @@ class SecurityReviewJudge(BaseJudge):
 
         validate_repo(repo)
 
-        work_unit_content = self._read_file(work_unit_path)
+        work_unit_content = self._read_work_unit(work_unit_path)
         token = get_gh_token()
 
         # Gather security alert evidence

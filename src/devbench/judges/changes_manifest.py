@@ -22,7 +22,7 @@ class ChangesManifestJudge(BaseJudge):
     def evaluate(self, work_unit_path: Path, repo_path: Path, **kwargs: object) -> JudgeResult:
         """Evaluate change scope by gathering evidence and delegating to the LLM."""
         repo: str = str(kwargs.get("repo", ""))
-        work_unit_content = self._read_file(work_unit_path)
+        work_unit_content = self._read_work_unit(work_unit_path)
         diff_summary = self._get_diff_summary(repo_path, repo=repo)
         changed_files = self._get_changed_files(repo_path, repo=repo)
 

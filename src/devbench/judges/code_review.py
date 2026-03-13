@@ -22,7 +22,7 @@ class CodeReviewJudge(BaseJudge):
     def evaluate(self, work_unit_path: Path, repo_path: Path, **kwargs: object) -> JudgeResult:
         """Evaluate code changes by gathering evidence and delegating to the LLM."""
         repo: str = str(kwargs.get("repo", ""))
-        work_unit_content = self._read_file(work_unit_path)
+        work_unit_content = self._read_work_unit(work_unit_path)
         diff = self._get_diff(repo_path, repo=repo)
 
         if not diff.strip():

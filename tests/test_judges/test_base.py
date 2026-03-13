@@ -305,3 +305,105 @@ class TestReadFile:
         judge = _ConcreteJudge("test_judge")
         with pytest.raises(FileNotFoundError):
             judge._read_file(tmp_path / "missing.txt")
+
+
+class TestStripAgentLog:
+    """Test _strip_agent_log removes ## Comments section from work unit content."""
+
+    def test_removes_comments_section(self) -> None:
+        """AC-1: content with \\n## Comments is truncated before that marker."""
+        content = "## Description\n\nsome spec\n## Comments\n[REVIEW_FAIL] bad"
+        result = _ConcreteJudge._strip_agent_log(content)
+        assert result == "## Description\n\nsome spec", (
+            f"Expected spec only, got: {result!r}"
+        )
+
+    def test_no_op_when_absent(self) -> None:
+        """AC-2: content without ## Comments section is returned unchanged."""
+        content = "## Description\n\nsome spec\n## Definition of Done\n- [ ] item"
+        result = _ConcreteJudge._strip_agent_log(content)
+        assert result == content, f"Expected unchanged content, got: {result!r}"
+
+    def test_boundary_returns_empty_string(self) -> None:
+        """AC-3: content ending exactly at \\n## Comments returns empty string."""
+        content = "\n## Comments"
+        result = _ConcreteJudge._strip_agent_log(content)
+        assert result == "", f"Expected empty string at boundary, got: {result!r}"
+
+
+class TestReadWorkUnit:
+    """Test _read_work_unit reads file and strips agent log."""
+
+    def test_strips_agent_log_from_file(self, tmp_path: Path) -> None:
+        """AC-4: _read_work_unit returns content with ## Comments section removed."""
+        wu = tmp_path / "wu.md"
+        wu.write_text("## Description\n\nspec\n## Comments\n[REVIEW_FAIL] noise")
+        judge = _ConcreteJudge("test_judge")
+        result = judge._read_work_unit(wu)
+        assert result == "## Description\n\nspec", (
+            f"Expected stripped content, got: {result!r}"
+        )
+
+    def test_raises_for_missing_file(self, tmp_path: Path) -> None:
+        judge = _ConcreteJudge("test_judge")
+        with pytest.raises(FileNotFoundError):
+            judge._read_work_unit(tmp_path / "missing.md")
+
+
+class TestLlmEvaluateTruncationWarning:
+    """Test _llm_evaluate emits warning when evidence sections are truncated."""
+
+    @pytest.fixture(autouse=True)
+    def disable_bedrock(self):
+        with patch("devbench.judges.base.USE_BEDROCK", False):
+            yield
+
+    def _make_mock_client(self):
+        mock_message = MagicMock()
+        mock_message.content = [
+            MagicMock(text='{"verdict": "pass", "reasoning": "ok", "feedback": "", "evidence": []}')
+        ]
+        mock_client = MagicMock()
+        mock_client.messages.create.return_value = mock_message
+        return mock_client
+
+    def test_warns_when_section_truncated(self) -> None:
+        """AC-6: warning logged with section name and char counts when truncated."""
+        judge = _ConcreteJudge("test_judge")
+        large_content = "x" * 20000
+
+        mock_client = self._make_mock_client()
+        with (
+            patch("devbench.judges.base.get_anthropic_api_key", return_value="sk-ant-test"),
+            patch("devbench.judges.base.anthropic.Anthropic", return_value=mock_client),
+        ):
+            with patch.object(judge, "logger") as mock_logger:
+                judge._llm_evaluate(
+                    system_prompt="Test prompt",
+                    evidence_sections={"big_section": large_content},
+                )
+        mock_logger.warning.assert_called_once()
+        warning_args = mock_logger.warning.call_args[0]
+        assert "big_section" in warning_args[1], (
+            "Warning should include the section name"
+        )
+        assert 20000 in warning_args, (
+            "Warning should include the original char count"
+        )
+
+    def test_no_warning_when_under_limit(self) -> None:
+        """AC-7: no warning logged when no section exceeds LLM_EVIDENCE_TRUNCATION."""
+        judge = _ConcreteJudge("test_judge")
+        small_content = "x" * 100
+
+        mock_client = self._make_mock_client()
+        with (
+            patch("devbench.judges.base.get_anthropic_api_key", return_value="sk-ant-test"),
+            patch("devbench.judges.base.anthropic.Anthropic", return_value=mock_client),
+        ):
+            with patch.object(judge, "logger") as mock_logger:
+                judge._llm_evaluate(
+                    system_prompt="Test prompt",
+                    evidence_sections={"small_section": small_content},
+                )
+        mock_logger.warning.assert_not_called()

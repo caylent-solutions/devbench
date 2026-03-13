@@ -29,6 +29,7 @@ Plugin agent bridge commands (used by devbench plugin agents)::
 
     read-unit <id>                          Return work unit content and repo path as JSON
     get-diff <id>                           Return combined git diff for the work unit's repo
+    run-tests <id>                          Run test suite for the work unit's repo
     log-verdict <judge> <id> <v> [msg]      Log a judge verdict (pass|fail) to work unit Comments
 
 All commands exit 0 on success, non-zero on failure. Output is structured
@@ -72,9 +73,9 @@ from devbench.config import (
     validate_repo,
 )
 from devbench.config_loader import get_configured_default_branch
-from devbench.constants import COMMENT_ENTRY_TEMPLATE, COMMENTS_SECTION_HEADER
-from devbench.utils.process import run_command
 from devbench.constants import (
+    COMMENT_ENTRY_TEMPLATE,
+    COMMENTS_SECTION_HEADER,
     DISPLAY_STATUS_VALUES,
     STATUS_IN_PROGRESS,
     STATUS_IN_REVIEW,
@@ -87,6 +88,7 @@ from devbench.judges.doc_review import DocReviewJudge
 from devbench.judges.security_review import SecurityReviewJudge
 from devbench.judges.test_review import TestReviewJudge
 from devbench.log_setup import setup_logging
+from devbench.utils.process import run_command
 
 logger = logging.getLogger("devbench.cli")
 
@@ -592,6 +594,39 @@ def cmd_get_diff(unit_id: str) -> int:
     return 0
 
 
+def cmd_run_tests(unit_id: str) -> int:
+    """Run the test suite for the work unit's target repo and return the output.
+
+    Uses ``make test`` when the repo has a Makefile with a ``test`` target,
+    otherwise falls back to ``pytest``.  Exits non-zero if the test run fails.
+
+    Used by the test-reviewer agent to obtain test execution evidence.
+    """
+    from devbench.config import TEST_TIMEOUT
+
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    unit = _find_unit(units, unit_id)
+    if unit is None:
+        print(f"ERROR: Work unit '{unit_id}' not found in backlog", file=sys.stderr)
+        return 1
+
+    canonical_repo = resolve_repo(unit.repo)
+    validate_repo(canonical_repo)
+    repo_path = REPO_LOCAL_PATHS.get(canonical_repo)
+    if repo_path is None:
+        print(f"ERROR: No local path configured for repo '{canonical_repo}'", file=sys.stderr)
+        return 1
+
+    rc, stdout, _ = run_command(["make", "-n", "test"], cwd=repo_path)
+    cmd = ["make", "test"] if rc == 0 else ["pytest", "--no-header", "-q", "-p", "no:cacheprovider"]
+
+    rc, stdout, stderr = run_command(cmd, cwd=repo_path, timeout=TEST_TIMEOUT)
+    combined = "\n".join(part for part in (stdout, stderr) if part.strip())
+    print(combined if combined else "(no output)")
+    return rc
+
+
 def cmd_log_verdict(judge_name: str, unit_id: str, verdict: str, feedback: str = "") -> int:
     """Append a judge verdict to the work unit's Comments section and log feedback.
 
@@ -702,6 +737,7 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
     # Plugin agent bridge commands — used by devbench plugin agents
     "read-unit": (cmd_read_unit, 1, "Return work unit content and repo path as JSON: read-unit <id>"),
     "get-diff": (cmd_get_diff, 1, "Return combined git diff for work unit's repo: get-diff <id>"),
+    "run-tests": (cmd_run_tests, 1, "Run test suite for work unit's repo: run-tests <id>"),
     "log-verdict": (cmd_log_verdict, 3, "Log judge verdict: log-verdict <judge> <id> <pass|fail> [feedback]"),
 }
 

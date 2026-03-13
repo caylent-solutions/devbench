@@ -14,6 +14,9 @@ Work unit and repo context:
 Git diff (staged, unstaged, branch, untracked):
 !`uv run devbench get-diff $ARGUMENTS`
 
+Test output:
+!`uv run devbench run-tests $ARGUMENTS`
+
 ---
 
 You are a strict test quality reviewer for a project held to the standards of highly regulated financial services.

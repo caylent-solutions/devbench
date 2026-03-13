@@ -112,6 +112,13 @@ def process_work_unit(work_unit: WorkUnit) -> bool:
     backlog_mgr = BacklogManager()
     blocker_judge = BlockerResolverJudge()
 
+    branch = work_unit.branch
+    if not branch:
+        raise ValueError(
+            f"Work unit '{work_unit.id}' has no branch set. "
+            "Ensure the work-unit file has a Branch: field or is parsed via BacklogParser."
+        )
+
     backlog_mgr.force_status(work_unit.file_path, BACKLOG_INDEX, work_unit.id, STATUS_IN_PROGRESS)
     work_unit.log_comment("orchestrator", "START", f"Beginning work on {work_unit.id}")
 
@@ -123,6 +130,12 @@ def process_work_unit(work_unit: WorkUnit) -> bool:
             attempt,
             MAX_RETRY_ATTEMPTS,
             work_unit.id,
+        )
+
+        git_ops.ensure_branch(
+            repo=canonical_repo,
+            repo_path=repo_path,
+            branch=branch,
         )
 
         # Execute the work unit
@@ -196,12 +209,6 @@ def process_work_unit(work_unit: WorkUnit) -> bool:
             continue
 
         # Commit, push, create PR, wait for checks, merge
-        branch = work_unit.branch
-        if not branch:
-            raise ValueError(
-                f"Work unit '{work_unit.id}' has no branch set. "
-                "Ensure the work-unit file has a Branch: field or is parsed via BacklogParser."
-            )
         try:
             git_ops.commit_and_push(
                 repo=canonical_repo,

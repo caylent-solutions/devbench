@@ -46,54 +46,25 @@ class GitOpsJudge(BaseJudge):
             evidence=[],
         )
 
-    def commit_and_push(self, repo: str, repo_path: Path, branch: str, message: str) -> None:
-        """Validate inputs, switch to the target branch, stage all changes, commit, and push.
+    def ensure_branch(self, repo: str, repo_path: Path, branch: str) -> None:
+        """Ensure the repository is on *branch* before the executor stages files.
 
-        This method is idempotent: it is safe to call on restart after a partial run.
+        Must be called from the orchestrator **before** ``claude_executor.execute()``
+        so that the working tree is on the correct branch before any files are staged.
 
-        Full operation sequence:
+        Operation:
 
-        1. Validate *repo* against the allow-list (``validate_repo``).
-        2. Validate *branch* format against ``_BRANCH_RE`` (allowlist pattern that
-           rejects consecutive special characters per git ref naming rules).
-        3. Branch safety switch — determines how to reach the target branch without
-           resetting existing committed work:
-
-           - Already on *branch*: skip checkout entirely.
-           - On a different branch and *branch* already exists locally:
-             ``git checkout <branch>`` — switch only, no reset.
-           - On a different branch and *branch* does not exist locally:
-             ``git checkout -b <branch>`` — create from current HEAD.
-
-        4. ``git add -A`` — stage all working-tree changes.
-        5. ``git status --porcelain`` — check whether anything was staged.
-
-           - If the output is **non-empty**: proceed to commit and push (steps 6-7).
-           - If the output is **empty** (nothing to commit): the working tree is
-             already clean, meaning a prior run completed the commit.  Skip the
-             commit and evaluate whether a push is still needed:
-
-             - Remote branch absent (``origin/<branch>`` does not exist): push.
-             - Remote branch present but local HEAD differs from remote HEAD: push
-               (prior run committed but push failed).
-             - Remote branch present and local HEAD matches remote HEAD: skip push
-               and return.  The desired state is fully achieved.
-
-        6. ``git commit -m <message>`` — commit staged changes (skipped when clean).
-        7. ``git push origin <branch>`` — push to the remote (skipped when remote
-           is already up to date).
-
-        All git commands are executed via :meth:`_git`, which invokes subprocess
-        with a list argument (never ``shell=True``), eliminating shell injection risk.
+        - Already on *branch*: no-op.
+        - On a different branch — check whether the tree is dirty (staged or unstaged
+          changes).  If dirty: ``git stash``.
+        - If *branch* exists locally: ``git checkout <branch>``.
+        - If *branch* does not exist locally: ``git checkout -b <branch>``.
+        - If the tree was stashed: ``git stash pop``.
 
         Args:
             repo: GitHub repository in ``owner/name`` format.
             repo_path: Local filesystem path to the repository.
-            branch: Branch name to create or switch to.  Must match
-                ``_BRANCH_RE``: starts with an alphanumeric character; subsequent
-                characters are alphanumerics, underscores, or a single separator
-                (``.``, ``-``, or ``/``) followed by an alphanumeric/underscore.
-            message: Commit message.
+            branch: Target branch name.  Must match ``_BRANCH_RE``.
 
         Raises:
             ValueError: If the repo is not in the allow-list, or the branch name
@@ -110,14 +81,75 @@ class GitOpsJudge(BaseJudge):
             )
 
         _, current_branch, _ = self._git(["rev-parse", "--abbrev-ref", "HEAD"], repo_path)
-        if current_branch.strip() != branch:
-            rc, _, _ = self._run_command(
-                ["git", "show-ref", "--verify", f"refs/heads/{branch}"], cwd=repo_path
-            )
-            if rc == 0:
-                self._git(["checkout", branch], repo_path)
-            else:
-                self._git(["checkout", "-b", branch], repo_path)
+        if current_branch.strip() == branch:
+            self.logger.debug("Already on branch %s — no-op", branch)
+            return
+
+        rc_ref, _, _ = self._run_command(
+            ["git", "show-ref", "--verify", f"refs/heads/{branch}"], cwd=repo_path
+        )
+        branch_exists = rc_ref == 0
+
+        _, status_out, _ = self._git(["status", "--porcelain"], repo_path)
+        is_dirty = bool(status_out.strip())
+
+        if is_dirty:
+            self._git(["stash"], repo_path)
+
+        if branch_exists:
+            self._git(["checkout", branch], repo_path)
+        else:
+            self._git(["checkout", "-b", branch], repo_path)
+
+        if is_dirty:
+            self._git(["stash", "pop"], repo_path)
+
+        self.logger.info("Switched to branch %s in %s", branch, repo)
+
+    def commit_and_push(self, repo: str, repo_path: Path, branch: str, message: str) -> None:
+        """Stage all changes on the current branch, commit, and push.
+
+        Assumes the repository is already on *branch* (call :meth:`ensure_branch`
+        from the orchestrator before the executor runs).
+
+        This method is idempotent: it is safe to call on restart after a partial run.
+
+        Full operation sequence:
+
+        1. Validate *repo* against the allow-list (``validate_repo``).
+        2. ``git add -A`` — stage all working-tree changes.
+        3. ``git status --porcelain`` — check whether anything was staged.
+
+           - If the output is **non-empty**: proceed to commit and push (steps 4-5).
+           - If the output is **empty** (nothing to commit): the working tree is
+             already clean, meaning a prior run completed the commit.  Skip the
+             commit and evaluate whether a push is still needed:
+
+             - Remote branch absent (``origin/<branch>`` does not exist): push.
+             - Remote branch present but local HEAD differs from remote HEAD: push
+               (prior run committed but push failed).
+             - Remote branch present and local HEAD matches remote HEAD: skip push
+               and return.  The desired state is fully achieved.
+
+        4. ``git commit -m <message>`` — commit staged changes (skipped when clean).
+        5. ``git push origin <branch>`` — push to the remote (skipped when remote
+           is already up to date).
+
+        All git commands are executed via :meth:`_git`, which invokes subprocess
+        with a list argument (never ``shell=True``), eliminating shell injection risk.
+
+        Args:
+            repo: GitHub repository in ``owner/name`` format.
+            repo_path: Local filesystem path to the repository.
+            branch: Branch name (must already be checked out).  Branch name
+                validation is performed by :meth:`ensure_branch` before execution.
+            message: Commit message.
+
+        Raises:
+            ValueError: If the repo is not in the allow-list.
+            RuntimeError: If any git command fails.
+        """
+        validate_repo(repo)
 
         self._git(["add", "-A"], repo_path)
 

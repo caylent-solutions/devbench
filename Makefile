@@ -3,7 +3,7 @@ SHELL := /bin/bash
 .DEFAULT_GOAL := help
 unexport VIRTUAL_ENV
 
-.PHONY: help install lint format check test test-unit test-functional validate clean run-backlog start start-interactive report
+.PHONY: help install plugin-install plugin-uninstall lint format check test test-unit test-functional validate clean run-backlog start start-interactive report
 
 ## help: Show available targets
 help:
@@ -15,6 +15,16 @@ help:
 ## install: Install runtime and dev dependencies
 install:
 	uv sync --all-extras
+
+## plugin-install: Register devbench marketplace and install plugin (user scope)
+plugin-install:
+	claude plugin marketplace add ./plugin --scope user
+	claude plugin install devbench --scope user
+
+## plugin-uninstall: Uninstall devbench plugin and remove marketplace
+plugin-uninstall:
+	claude plugin uninstall devbench
+	claude plugin marketplace remove devbench
 
 ## lint: Run ruff linter and bandit security scan
 lint:

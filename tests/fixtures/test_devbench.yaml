@@ -6,6 +6,9 @@ repos:
   caylent-solutions/devbench:
     default_branch: main2
 
+allowed_orgs:
+  - caylent-solutions
+
 merge_strategy: squash
 max_retries: 3
 use_bedrock: false

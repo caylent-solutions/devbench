@@ -24,3 +24,43 @@ repos:
   caylent-solutions/devbench:
     default_branch: main2
     checkout_directory: devbench
+
+# allowed_orgs: (optional) restrict all repos to these GitHub organisations.
+# When non-empty, any repo whose org is not in this list is rejected at load time
+# and by validate_repo() at runtime.  Leave empty (or omit) to allow any org.
+#
+# allowed_orgs:
+#   - caylent-solutions
+
+# Model configuration (optional — auth-dependent defaults applied when absent).
+#
+# judge_model:    model identifier used by LLM judge agents.
+# executor_model: model identifier used by the executor (Claude CLI subprocess).
+#
+# Both fields are optional.  When absent and no env var override is set, the
+# auth-dependent default env var is used:
+#   use_bedrock: false  →  JUDGE_DEFAULT_MODEL_DIRECT  (direct Anthropic API)
+#   use_bedrock: true   →  JUDGE_DEFAULT_MODEL_BEDROCK  (AWS Bedrock)
+# A RuntimeError is raised at startup if no model is configured and the applicable
+# default env var is not set.
+#
+# The ANTHROPIC_MODEL env var overrides both models silently.
+# The deprecated JUDGE_CLAUDE_MODEL env var also overrides both (with a WARNING).
+#
+# judge_model: <model-id>
+# executor_model: <model-id>
+
+# AWS Bedrock configuration (optional — default is direct Anthropic API).
+# Uncomment the block below to route all LLM calls through AWS Bedrock.
+# When use_bedrock is true, the executor subprocess also receives
+# CLAUDE_CODE_USE_BEDROCK=1 in its environment.
+#
+# NOTE: bedrock_region is REQUIRED when use_bedrock: true.
+# A RuntimeError is raised at startup if use_bedrock is true and no region
+# is available from JUDGE_BEDROCK_REGION, AWS_REGION, or bedrock_region.
+#
+# use_bedrock: true
+# bedrock_region: <aws-region>
+#
+# Set JUDGE_DEFAULT_MODEL_BEDROCK env var to the Bedrock model ID to use
+# when judge_model/executor_model are absent and ANTHROPIC_MODEL is not set.

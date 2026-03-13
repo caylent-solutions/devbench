@@ -202,11 +202,10 @@ All configuration is via environment variables. Required variables raise `Runtim
 | Variable | Description |
 |----------|-------------|
 | `JUDGE_WORKSPACE_ROOT` | Absolute path to workspace root containing all repo clones |
-| `JUDGE_CLAUDE_MODEL` | Claude model identifier for LLM judge calls |
 
 ### YAML Configuration File
 
-Repos and per-repo settings are defined in `backlog/config/devbench.yaml` (relative to `JUDGE_WORKSPACE_ROOT`). Copy `sample-config.yaml` from the repo root as a starting point.
+Repos, model identifiers, and per-repo settings are defined in `backlog/config/devbench.yaml` (relative to `JUDGE_WORKSPACE_ROOT`). Copy `sample-config.yaml` from the repo root as a starting point.
 
 **Config file path resolution** (first match wins):
 1. `--config <path>` CLI argument
@@ -223,16 +222,41 @@ repos:
     default_branch: main2            # optional — omit to fall back to origin/HEAD
     checkout_directory: my-checkout  # optional — relative to JUDGE_WORKSPACE_ROOT
                                      # omit to use repo short-name (e.g. "my-repo")
+
+allowed_orgs:                        # optional — restrict repos to these GitHub orgs
+  - caylent-solutions
+
+judge_model: claude-sonnet-4-6-20251001     # optional — model for LLM judge agents
+executor_model: claude-sonnet-4-6-20251001  # optional — model for executor subprocess
+
+use_bedrock: false                   # optional — route LLM calls via AWS Bedrock
+bedrock_region: us-east-1            # required when use_bedrock: true — AWS region (env var override: JUDGE_BEDROCK_REGION)
 ```
+
+**Model configuration precedence** (first match wins, applied to both `CLAUDE_MODEL` and `EXECUTOR_MODEL`):
+1. `ANTHROPIC_MODEL` env var — silently overrides both models
+2. `JUDGE_CLAUDE_MODEL` env var — **deprecated**; populates both models with a WARNING
+3. `judge_model` / `executor_model` in YAML — sets each model independently
+4. Auth-dependent default env var: `JUDGE_DEFAULT_MODEL_DIRECT` (when `use_bedrock=false`) or `JUDGE_DEFAULT_MODEL_BEDROCK` (when `use_bedrock=true`). A `RuntimeError` is raised at startup if neither YAML field nor the applicable default env var is set.
+
+**Auth (USE_BEDROCK) precedence:**
+1. `JUDGE_USE_BEDROCK` env var — overrides YAML value
+2. `use_bedrock` in YAML — default `false`
+
+When `use_bedrock` is `true`, the executor subprocess receives `CLAUDE_CODE_USE_BEDROCK=1` in its environment. When `false`, `CLAUDE_CODE_USE_BEDROCK` is explicitly removed from the subprocess environment.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `JUDGE_CONFIG_PATH` | *(see above)* | Override YAML config file path |
 | `JUDGE_MERGE_STRATEGY` | `squash` | PR merge strategy: `merge`, `squash`, or `rebase` |
-| `JUDGE_GH_ORG` | *(empty)* | When set, restricts all GitHub ops to this org only |
+| `ANTHROPIC_MODEL` | *(YAML or default)* | Silently overrides both `CLAUDE_MODEL` and `EXECUTOR_MODEL` |
+| `JUDGE_DEFAULT_MODEL_DIRECT` | *(required when no YAML model and not using Bedrock)* | Default model ID for direct Anthropic API path. RuntimeError at startup if unset and no YAML model or `ANTHROPIC_MODEL` is configured. |
+| `JUDGE_DEFAULT_MODEL_BEDROCK` | *(required when no YAML model and using Bedrock)* | Default model ID for AWS Bedrock path. RuntimeError at startup if unset and no YAML model or `ANTHROPIC_MODEL` is configured. |
+| `JUDGE_CLAUDE_MODEL` | *(deprecated)* | **Deprecated.** Use `judge_model`/`executor_model` in YAML or `ANTHROPIC_MODEL` instead |
+| `JUDGE_GH_ORG` | *(deprecated)* | **Deprecated.** Use `allowed_orgs` in YAML instead |
 | `JUDGE_MAX_RETRIES` | `10` | Max retry attempts per work unit before marking blocked |
-| `JUDGE_USE_BEDROCK` | `false` | Use AWS Bedrock instead of Anthropic API |
-| `JUDGE_BEDROCK_REGION` | `us-east-1` | AWS region for Bedrock (falls back to `AWS_REGION`) |
+| `JUDGE_USE_BEDROCK` | *(YAML value)* | Override `use_bedrock` from YAML. `1`/`true`/`yes` enables Bedrock |
+| `JUDGE_BEDROCK_REGION` | *(required when use_bedrock=true)* | AWS region for Bedrock; falls back to `AWS_REGION`, then `bedrock_region` in YAML. RuntimeError if all absent and `use_bedrock=true`. |
 | `JUDGE_GH_TOKEN_FILE` | `~/.gh_token_env` | GitHub token file path |
 | `JUDGE_GH_TIMEOUT` | `600` | GitHub check wait timeout (seconds) |
 | `JUDGE_GH_API_TIMEOUT` | `30` | GitHub API call timeout (seconds) |

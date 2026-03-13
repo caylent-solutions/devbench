@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import logging
 import os
 from pathlib import Path
 from unittest.mock import patch
@@ -20,7 +21,9 @@ from devbench.config import ALLOWED_REPOS, validate_repo
 # ---------------------------------------------------------------------------
 _FIXTURE_ORG = "caylent-solutions"
 _ALLOWED_REPO_IN_FIXTURE = f"{_FIXTURE_ORG}/git-repo"
-_UNKNOWN_REPO = "test-sentinel-org/unknown-repo"  # deliberately absent from fixture
+# Repo absent from ALLOWED_REPOS but from an org that IS in allowed_orgs,
+# so the "not allowed" (repo-level) error is raised rather than the org-level error.
+_UNKNOWN_REPO = f"{_FIXTURE_ORG}/unknown-sentinel-repo"
 _WRONG_ORG_REPO = "wrong-org/git-repo"  # org not matching _FIXTURE_ORG
 
 
@@ -87,13 +90,13 @@ class TestAllowedRepos:
         with pytest.raises(ValueError, match="not allowed"):
             validate_repo(_UNKNOWN_REPO)
 
-    def test_validate_repo_rejects_wrong_org_when_judge_gh_org_set(self) -> None:
-        with patch.object(config, "ALLOWED_GH_ORG", _FIXTURE_ORG):
-            with pytest.raises(ValueError, match="JUDGE_GH_ORG restricts access"):
+    def test_validate_repo_rejects_wrong_org_when_allowed_gh_orgs_set(self) -> None:
+        with patch.object(config, "ALLOWED_GH_ORGS", [_FIXTURE_ORG]):
+            with pytest.raises(ValueError, match="allowed_orgs"):
                 config.validate_repo(_WRONG_ORG_REPO)
 
-    def test_validate_repo_skips_org_check_when_judge_gh_org_empty(self) -> None:
-        with patch.object(config, "ALLOWED_GH_ORG", ""):
+    def test_validate_repo_skips_org_check_when_allowed_gh_orgs_empty(self) -> None:
+        with patch.object(config, "ALLOWED_GH_ORGS", []):
             with pytest.raises(ValueError, match="not allowed"):
                 config.validate_repo("other-org/some-repo")
 
@@ -294,5 +297,363 @@ class TestConfigOverrides:
             expected = Path(os.environ["JUDGE_WORKSPACE_ROOT"]) / "BACKLOG.md"
             assert expected == config.BACKLOG_INDEX
             assert custom_index != config.BACKLOG_INDEX
+
+        importlib.reload(config)
+
+
+# ---------------------------------------------------------------------------
+# AC-1, AC-2, AC-3: allowed_orgs and validate_repo list semantics
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestAllowedOrgs:
+    """AC-1/2/3: allowed_orgs from YAML populates ALLOWED_GH_ORGS; validate_repo list check."""
+
+    def test_allowed_orgs_from_yaml_populates_allowed_gh_orgs(self) -> None:
+        """
+        AC-1: allowed_orgs in YAML populates RUNTIME_CONFIG.allowed_orgs and ALLOWED_GH_ORGS.
+        Given: fixture YAML does not specify allowed_orgs (empty list)
+        Then: ALLOWED_GH_ORGS is a list (may be empty)
+        """
+        assert isinstance(config.ALLOWED_GH_ORGS, list), (
+            f"Expected ALLOWED_GH_ORGS to be a list, got {type(config.ALLOWED_GH_ORGS).__name__}"
+        )
+
+    def test_validate_repo_passes_when_org_in_allowed_orgs(self, tmp_path: Path) -> None:
+        """
+        AC-2: validate_repo passes when repo org is in allowed_orgs list.
+        Given: ALLOWED_GH_ORGS = ['permitted-org']
+        When: validate_repo is called with 'permitted-org/some-repo' in ALLOWED_REPOS
+        Then: no exception is raised
+        """
+        with (
+            patch.object(config, "ALLOWED_GH_ORGS", ["permitted-org"]),
+            patch.object(config, "ALLOWED_REPOS", frozenset(["permitted-org/some-repo"])),
+        ):
+            config.validate_repo("permitted-org/some-repo")
+
+    def test_validate_repo_raises_when_org_not_in_allowed_orgs(self, tmp_path: Path) -> None:
+        """
+        AC-3: validate_repo raises when repo org is not in allowed_orgs (when list is non-empty).
+        Given: ALLOWED_GH_ORGS = ['permitted-org']
+        When: validate_repo is called with a repo from 'other-org'
+        Then: ValueError is raised with an org-restriction message
+        """
+        with (
+            patch.object(config, "ALLOWED_GH_ORGS", ["permitted-org"]),
+            patch.object(config, "ALLOWED_REPOS", frozenset(["other-org/some-repo"])),
+        ):
+            with pytest.raises(ValueError, match="allowed_orgs"):
+                config.validate_repo("other-org/some-repo")
+
+    def test_validate_repo_skips_org_check_when_allowed_orgs_empty(self) -> None:
+        """
+        AC-3: when allowed_orgs is empty, org check is skipped (any org in ALLOWED_REPOS passes).
+        """
+        with (
+            patch.object(config, "ALLOWED_GH_ORGS", []),
+            patch.object(config, "ALLOWED_REPOS", frozenset(["any-org/repo"])),
+        ):
+            config.validate_repo("any-org/repo")
+
+    def test_validate_repo_raises_for_unknown_repo_regardless_of_orgs(self) -> None:
+        """
+        validate_repo still raises for repos not in ALLOWED_REPOS even when org is permitted.
+        """
+        with (
+            patch.object(config, "ALLOWED_GH_ORGS", []),
+            patch.object(config, "ALLOWED_REPOS", frozenset(["org/allowed"])),
+        ):
+            with pytest.raises(ValueError, match="not allowed"):
+                config.validate_repo("org/not-in-list")
+
+
+# ---------------------------------------------------------------------------
+# AC-4: JUDGE_GH_ORG deprecated env var
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestJudgeGhOrgDeprecation:
+    """AC-4: JUDGE_GH_ORG env var still restricts access but emits WARNING."""
+
+    def test_judge_gh_org_env_var_warns_deprecated(self, caplog: pytest.LogCaptureFixture) -> None:
+        """
+        AC-4: When JUDGE_GH_ORG is set, a WARNING-level log message is emitted.
+        """
+        env_without_gh_org = {k: v for k, v in os.environ.items() if k != "JUDGE_GH_ORG"}
+        with caplog.at_level(logging.WARNING, logger="devbench.config"):
+            with patch.dict(os.environ, {**env_without_gh_org, "JUDGE_GH_ORG": "some-org"}, clear=True):
+                importlib.reload(config)
+
+        assert any("JUDGE_GH_ORG" in r.message and "deprecated" in r.message.lower() for r in caplog.records), (
+            f"Expected a deprecation WARNING for JUDGE_GH_ORG. Log records: {[r.message for r in caplog.records]}"
+        )
+        importlib.reload(config)
+
+    def test_judge_gh_org_merged_into_allowed_gh_orgs(self) -> None:
+        """
+        AC-4: When JUDGE_GH_ORG is set, it is included in ALLOWED_GH_ORGS.
+        """
+        env_without_gh_org = {k: v for k, v in os.environ.items() if k != "JUDGE_GH_ORG"}
+        with patch.dict(os.environ, {**env_without_gh_org, "JUDGE_GH_ORG": "legacy-org"}, clear=True):
+            importlib.reload(config)
+            assert "legacy-org" in config.ALLOWED_GH_ORGS, (
+                f"Expected 'legacy-org' in ALLOWED_GH_ORGS after JUDGE_GH_ORG set, "
+                f"got {config.ALLOWED_GH_ORGS}"
+            )
+
+        importlib.reload(config)
+
+
+# ---------------------------------------------------------------------------
+# AC-5, AC-6, AC-7, AC-8, AC-9, AC-10: model configuration
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestModelConfig:
+    """AC-5 through AC-10: CLAUDE_MODEL / EXECUTOR_MODEL configuration."""
+
+    def test_judge_model_from_yaml_sets_claude_model(self) -> None:
+        """
+        AC-5: judge_model in YAML sets CLAUDE_MODEL when ANTHROPIC_MODEL absent.
+        The test fixture sets judge_model: test-judge-model.
+        """
+        env_without_overrides = {
+            k: v for k, v in os.environ.items()
+            if k not in ("ANTHROPIC_MODEL", "JUDGE_CLAUDE_MODEL")
+        }
+        with patch.dict(os.environ, env_without_overrides, clear=True):
+            importlib.reload(config)
+            assert config.CLAUDE_MODEL == "test-judge-model", (
+                f"Expected CLAUDE_MODEL='test-judge-model' from YAML, got {config.CLAUDE_MODEL!r}"
+            )
+
+        importlib.reload(config)
+
+    def test_executor_model_from_yaml_sets_executor_model(self) -> None:
+        """
+        AC-6: executor_model in YAML sets EXECUTOR_MODEL when ANTHROPIC_MODEL absent.
+        The test fixture sets executor_model: test-executor-model.
+        """
+        env_without_overrides = {
+            k: v for k, v in os.environ.items()
+            if k not in ("ANTHROPIC_MODEL", "JUDGE_CLAUDE_MODEL")
+        }
+        with patch.dict(os.environ, env_without_overrides, clear=True):
+            importlib.reload(config)
+            assert config.EXECUTOR_MODEL == "test-executor-model", (
+                f"Expected EXECUTOR_MODEL='test-executor-model' from YAML, got {config.EXECUTOR_MODEL!r}"
+            )
+
+        importlib.reload(config)
+
+    def test_anthropic_model_env_overrides_both_silently(self) -> None:
+        """
+        AC-7: ANTHROPIC_MODEL env var silently overrides both CLAUDE_MODEL and EXECUTOR_MODEL.
+        """
+        env_with_anthropic = {
+            k: v for k, v in os.environ.items()
+            if k not in ("ANTHROPIC_MODEL", "JUDGE_CLAUDE_MODEL")
+        }
+        env_with_anthropic["ANTHROPIC_MODEL"] = "override-model"
+        with patch.dict(os.environ, env_with_anthropic, clear=True):
+            importlib.reload(config)
+            assert config.CLAUDE_MODEL == "override-model", (
+                f"Expected CLAUDE_MODEL='override-model' from ANTHROPIC_MODEL, got {config.CLAUDE_MODEL!r}"
+            )
+            assert config.EXECUTOR_MODEL == "override-model", (
+                f"Expected EXECUTOR_MODEL='override-model' from ANTHROPIC_MODEL, got {config.EXECUTOR_MODEL!r}"
+            )
+
+        importlib.reload(config)
+
+    def test_judge_claude_model_env_warns_deprecated(self, caplog: pytest.LogCaptureFixture) -> None:
+        """
+        AC-8: JUDGE_CLAUDE_MODEL env var populates both constants but emits deprecation WARNING.
+        """
+        env = {
+            k: v for k, v in os.environ.items()
+            if k not in ("ANTHROPIC_MODEL", "JUDGE_CLAUDE_MODEL")
+        }
+        env["JUDGE_CLAUDE_MODEL"] = "legacy-model"
+        with caplog.at_level(logging.WARNING, logger="devbench.config"):
+            with patch.dict(os.environ, env, clear=True):
+                importlib.reload(config)
+
+        assert any(
+            "JUDGE_CLAUDE_MODEL" in r.message and "deprecated" in r.message.lower()
+            for r in caplog.records
+        ), (
+            f"Expected a deprecation WARNING for JUDGE_CLAUDE_MODEL. "
+            f"Log records: {[r.message for r in caplog.records]}"
+        )
+        importlib.reload(config)
+
+    def test_judge_claude_model_env_populates_both_constants(self) -> None:
+        """
+        AC-8: JUDGE_CLAUDE_MODEL populates both CLAUDE_MODEL and EXECUTOR_MODEL as fallback.
+        """
+        env = {
+            k: v for k, v in os.environ.items()
+            if k not in ("ANTHROPIC_MODEL", "JUDGE_CLAUDE_MODEL")
+        }
+        env["JUDGE_CLAUDE_MODEL"] = "legacy-model"
+        with patch.dict(os.environ, env, clear=True):
+            importlib.reload(config)
+            assert config.CLAUDE_MODEL == "legacy-model", (
+                f"Expected CLAUDE_MODEL='legacy-model' from JUDGE_CLAUDE_MODEL, got {config.CLAUDE_MODEL!r}"
+            )
+            assert config.EXECUTOR_MODEL == "legacy-model", (
+                f"Expected EXECUTOR_MODEL='legacy-model' from JUDGE_CLAUDE_MODEL, got {config.EXECUTOR_MODEL!r}"
+            )
+
+        importlib.reload(config)
+
+    def test_model_defaults_to_direct_api_id_when_no_bedrock(self, tmp_path: Path) -> None:
+        """
+        AC-9/AC-10: When no model is in YAML/env and use_bedrock=false,
+        JUDGE_DEFAULT_MODEL_DIRECT env var is used as the auth-dependent default.
+        """
+        cfg = tmp_path / "minimal.yaml"
+        cfg.write_text(
+            "repos:\n  caylent-solutions/git-repo:\n    default_branch: main\n"
+            "use_bedrock: false\n",
+            encoding="utf-8",
+        )
+        env = {
+            k: v for k, v in os.environ.items()
+            if k not in ("ANTHROPIC_MODEL", "JUDGE_CLAUDE_MODEL", "JUDGE_USE_BEDROCK",
+                         "JUDGE_DEFAULT_MODEL_DIRECT", "JUDGE_DEFAULT_MODEL_BEDROCK")
+        }
+        env["JUDGE_CONFIG_PATH"] = str(cfg)
+        env["JUDGE_DEFAULT_MODEL_DIRECT"] = "env-direct-default-model"
+        with patch.dict(os.environ, env, clear=True):
+            importlib.reload(config)
+            assert config.CLAUDE_MODEL == "env-direct-default-model", (
+                f"Expected CLAUDE_MODEL='env-direct-default-model' from JUDGE_DEFAULT_MODEL_DIRECT, "
+                f"got {config.CLAUDE_MODEL!r}"
+            )
+            assert config.EXECUTOR_MODEL == "env-direct-default-model", (
+                f"Expected EXECUTOR_MODEL='env-direct-default-model' from JUDGE_DEFAULT_MODEL_DIRECT, "
+                f"got {config.EXECUTOR_MODEL!r}"
+            )
+
+        importlib.reload(config)
+
+    def test_model_defaults_to_bedrock_id_when_use_bedrock_true(self, tmp_path: Path) -> None:
+        """
+        AC-10: use_bedrock: true in YAML → JUDGE_DEFAULT_MODEL_BEDROCK env var used as default.
+        bedrock_region is required when use_bedrock=true (fail-fast).
+        """
+        cfg = tmp_path / "bedrock.yaml"
+        cfg.write_text(
+            "repos:\n  caylent-solutions/git-repo:\n    default_branch: main\n"
+            "use_bedrock: true\n"
+            "bedrock_region: us-west-2\n",
+            encoding="utf-8",
+        )
+        env = {
+            k: v for k, v in os.environ.items()
+            if k not in ("ANTHROPIC_MODEL", "JUDGE_CLAUDE_MODEL", "JUDGE_USE_BEDROCK",
+                         "JUDGE_DEFAULT_MODEL_DIRECT", "JUDGE_DEFAULT_MODEL_BEDROCK")
+        }
+        env["JUDGE_CONFIG_PATH"] = str(cfg)
+        env["JUDGE_DEFAULT_MODEL_BEDROCK"] = "env-bedrock-default-model"
+        with patch.dict(os.environ, env, clear=True):
+            importlib.reload(config)
+            assert config.CLAUDE_MODEL == "env-bedrock-default-model", (
+                f"Expected CLAUDE_MODEL='env-bedrock-default-model' from JUDGE_DEFAULT_MODEL_BEDROCK, "
+                f"got {config.CLAUDE_MODEL!r}"
+            )
+            assert config.EXECUTOR_MODEL == "env-bedrock-default-model", (
+                f"Expected EXECUTOR_MODEL='env-bedrock-default-model' from JUDGE_DEFAULT_MODEL_BEDROCK, "
+                f"got {config.EXECUTOR_MODEL!r}"
+            )
+
+        importlib.reload(config)
+
+    def test_bedrock_region_required_when_use_bedrock_true(self, tmp_path: Path) -> None:
+        """
+        BEDROCK_REGION is required when use_bedrock=true.
+        If no region is available from JUDGE_BEDROCK_REGION, AWS_REGION, or YAML,
+        a RuntimeError is raised at config load time (fail-fast).
+        """
+        cfg = tmp_path / "bedrock_no_region.yaml"
+        cfg.write_text(
+            "repos:\n  caylent-solutions/git-repo:\n    default_branch: main\n"
+            "use_bedrock: true\n",
+            encoding="utf-8",
+        )
+        env = {
+            k: v for k, v in os.environ.items()
+            if k not in ("ANTHROPIC_MODEL", "JUDGE_CLAUDE_MODEL", "JUDGE_USE_BEDROCK",
+                         "JUDGE_BEDROCK_REGION", "AWS_REGION")
+        }
+        env["JUDGE_CONFIG_PATH"] = str(cfg)
+        with patch.dict(os.environ, env, clear=True):
+            with pytest.raises(RuntimeError, match="BEDROCK_REGION is required"):
+                importlib.reload(config)
+
+        importlib.reload(config)
+
+    def test_judge_use_bedrock_env_overrides_yaml(self, tmp_path: Path) -> None:
+        """
+        AC-13: JUDGE_USE_BEDROCK=1 env var silently overrides YAML value.
+        JUDGE_BEDROCK_REGION is provided because use_bedrock=true requires a region.
+        JUDGE_DEFAULT_MODEL_BEDROCK is provided because no model is set in YAML.
+        """
+        cfg = tmp_path / "no_bedrock.yaml"
+        cfg.write_text(
+            "repos:\n  caylent-solutions/git-repo:\n    default_branch: main\n"
+            "use_bedrock: false\n",
+            encoding="utf-8",
+        )
+        env = {
+            k: v for k, v in os.environ.items()
+            if k not in ("ANTHROPIC_MODEL", "JUDGE_CLAUDE_MODEL", "JUDGE_USE_BEDROCK",
+                         "JUDGE_BEDROCK_REGION", "AWS_REGION",
+                         "JUDGE_DEFAULT_MODEL_DIRECT", "JUDGE_DEFAULT_MODEL_BEDROCK")
+        }
+        env["JUDGE_CONFIG_PATH"] = str(cfg)
+        env["JUDGE_USE_BEDROCK"] = "1"
+        env["JUDGE_BEDROCK_REGION"] = "us-east-1"
+        env["JUDGE_DEFAULT_MODEL_BEDROCK"] = "env-bedrock-override-model"
+        with patch.dict(os.environ, env, clear=True):
+            importlib.reload(config)
+            assert config.USE_BEDROCK is True, (
+                f"Expected USE_BEDROCK=True when JUDGE_USE_BEDROCK=1 overrides YAML, "
+                f"got {config.USE_BEDROCK!r}"
+            )
+            assert config.CLAUDE_MODEL == "env-bedrock-override-model", (
+                f"Expected CLAUDE_MODEL='env-bedrock-override-model' when bedrock overridden via env, "
+                f"got {config.CLAUDE_MODEL!r}"
+            )
+
+        importlib.reload(config)
+
+    def test_model_default_raises_when_no_default_env_var_set(self, tmp_path: Path) -> None:
+        """
+        AC-9: When no model is in YAML/env AND JUDGE_DEFAULT_MODEL_DIRECT is unset,
+        RuntimeError is raised at config load time (fail-fast).
+        """
+        cfg = tmp_path / "no_model.yaml"
+        cfg.write_text(
+            "repos:\n  caylent-solutions/git-repo:\n    default_branch: main\n"
+            "use_bedrock: false\n",
+            encoding="utf-8",
+        )
+        env = {
+            k: v for k, v in os.environ.items()
+            if k not in ("ANTHROPIC_MODEL", "JUDGE_CLAUDE_MODEL", "JUDGE_USE_BEDROCK",
+                         "JUDGE_DEFAULT_MODEL_DIRECT", "JUDGE_DEFAULT_MODEL_BEDROCK")
+        }
+        env["JUDGE_CONFIG_PATH"] = str(cfg)
+        # Do NOT set JUDGE_DEFAULT_MODEL_DIRECT → should raise
+        with patch.dict(os.environ, env, clear=True):
+            with pytest.raises(RuntimeError, match="JUDGE_DEFAULT_MODEL_DIRECT"):
+                importlib.reload(config)
 
         importlib.reload(config)

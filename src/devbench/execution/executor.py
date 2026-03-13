@@ -11,14 +11,19 @@ from enum import Enum
 from pathlib import Path
 
 from devbench.config import (
-    CLAUDE_MODEL,
     EXECUTOR_MAX_TURNS,
+    EXECUTOR_MODEL,
     EXECUTOR_TIMEOUT,
     REPO_LOCAL_PATHS,
+    USE_BEDROCK,
     resolve_repo,
     validate_repo,
 )
-from devbench.constants import STATUS_BLOCKED, STATUS_IN_REVIEW
+from devbench.constants import (
+    CLAUDE_CODE_USE_BEDROCK_ENV_KEY,
+    STATUS_BLOCKED,
+    STATUS_IN_REVIEW,
+)
 from devbench.prompts import load_prompt
 
 logger = logging.getLogger(__name__)
@@ -107,13 +112,19 @@ def execute(
         "--print",
         "--dangerously-skip-permissions",
         "--model",
-        CLAUDE_MODEL,
+        EXECUTOR_MODEL,
         "--max-turns",
         str(EXECUTOR_MAX_TURNS),
         prompt,
     ]
 
     logger.info("Spawning Claude Code agent for %s in %s", work_unit_path.name, repo_path)
+
+    subprocess_env = {**os.environ, "CLAUDE_NO_TELEMETRY": "1"}
+    if USE_BEDROCK:
+        subprocess_env[CLAUDE_CODE_USE_BEDROCK_ENV_KEY] = "1"
+    else:
+        subprocess_env.pop(CLAUDE_CODE_USE_BEDROCK_ENV_KEY, None)
 
     try:
         result = subprocess.run(
@@ -122,7 +133,7 @@ def execute(
             capture_output=True,
             text=True,
             timeout=effective_timeout,
-            env={**os.environ, "CLAUDE_NO_TELEMETRY": "1"},
+            env=subprocess_env,
         )
 
         output = result.stdout

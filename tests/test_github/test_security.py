@@ -137,7 +137,7 @@ class TestEnableSecurityFeatures:
         from devbench.github.security import enable_security_features
 
         with pytest.raises(ValueError, match="not allowed"):
-            enable_security_features("evil-org/bad-repo")
+            enable_security_features("caylent-solutions/nonexistent-test-repo")
 
     def test_calls_gh_api_for_allowed_repo(self) -> None:
         from devbench.github.security import enable_security_features
@@ -211,7 +211,7 @@ class TestGetSecurityReport:
         from devbench.github.security import get_security_report
 
         with pytest.raises(ValueError, match="not allowed"):
-            get_security_report("evil-org/bad-repo")
+            get_security_report("caylent-solutions/nonexistent-test-repo")
 
     def test_returns_clean_report_on_no_alerts(self) -> None:
         from devbench.github.security import get_security_report

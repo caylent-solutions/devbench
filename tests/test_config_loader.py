@@ -935,3 +935,41 @@ class TestPostSchemaValidation:
         assert "any-org/repo" in result.repos, (
             f"Expected 'any-org/repo' in repos, got {set(result.repos)}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Model default env vars — JUDGE_DEFAULT_MODEL_DIRECT / JUDGE_DEFAULT_MODEL_BEDROCK
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestModelDefaultEnvVars:
+    """Verify that config_loader does not define model default constants.
+
+    Model default strings are environment-driven (JUDGE_DEFAULT_MODEL_DIRECT,
+    JUDGE_DEFAULT_MODEL_BEDROCK).  config_loader.py must not define them.
+    """
+
+    def test_config_loader_has_no_default_model_direct_constant(self) -> None:
+        """
+        Given: the config_loader module
+        Then: DEFAULT_MODEL_DIRECT is not defined (removed — model IDs live in env vars only)
+        """
+        import devbench.config_loader as loader_module
+
+        assert not hasattr(loader_module, "DEFAULT_MODEL_DIRECT"), (
+            "DEFAULT_MODEL_DIRECT must not be defined in config_loader — "
+            "model IDs are externalized via JUDGE_DEFAULT_MODEL_DIRECT env var"
+        )
+
+    def test_config_loader_has_no_default_model_bedrock_constant(self) -> None:
+        """
+        Given: the config_loader module
+        Then: DEFAULT_MODEL_BEDROCK is not defined (removed — model IDs live in env vars only)
+        """
+        import devbench.config_loader as loader_module
+
+        assert not hasattr(loader_module, "DEFAULT_MODEL_BEDROCK"), (
+            "DEFAULT_MODEL_BEDROCK must not be defined in config_loader — "
+            "model IDs are externalized via JUDGE_DEFAULT_MODEL_BEDROCK env var"
+        )

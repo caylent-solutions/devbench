@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import pytest
 
+from devbench.constants import CLAUDE_CODE_USE_BEDROCK_ENV_KEY
 from devbench.execution.executor import (
     ExecutionResult,
     ExecutionStatus,
@@ -253,3 +254,107 @@ class TestExecute:
 
         assert result.status is ExecutionStatus.FAILED
         assert "timed out" in result.output.lower()
+
+    def test_executor_receives_claude_code_use_bedrock_when_enabled(self, tmp_path: Path) -> None:
+        """
+        AC-11: use_bedrock=True → executor subprocess receives CLAUDE_CODE_USE_BEDROCK=1 in env.
+        """
+        from devbench.execution.executor import execute
+
+        wu_file = tmp_path / "task.md"
+        wu_file.write_text("## Status: in-review\n")
+
+        mock_result = type(
+            "Result",
+            (),
+            {"returncode": 0, "stdout": "done", "stderr": ""},
+        )()
+
+        captured_env: dict = {}
+
+        def capture_run(*args, **kwargs):
+            captured_env.update(kwargs.get("env") or {})
+            return mock_result
+
+        with (
+            patch("devbench.execution.executor.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.execution.executor.USE_BEDROCK", True),
+            patch("devbench.execution.executor.EXECUTOR_MODEL", "bedrock-model"),
+            patch("subprocess.run", side_effect=capture_run),
+        ):
+            execute(work_unit_path=wu_file, repo="caylent-solutions/git-repo")
+
+        assert captured_env.get(CLAUDE_CODE_USE_BEDROCK_ENV_KEY) == "1", (
+            f"Expected {CLAUDE_CODE_USE_BEDROCK_ENV_KEY!r}='1' in subprocess env when USE_BEDROCK=True, "
+            f"got {captured_env.get(CLAUDE_CODE_USE_BEDROCK_ENV_KEY)!r}"
+        )
+
+    def test_executor_does_not_set_claude_code_use_bedrock_when_disabled(self, tmp_path: Path) -> None:
+        """
+        AC-12: use_bedrock=False → CLAUDE_CODE_USE_BEDROCK is absent from executor subprocess env.
+        """
+        from devbench.execution.executor import execute
+
+        wu_file = tmp_path / "task.md"
+        wu_file.write_text("## Status: in-review\n")
+
+        mock_result = type(
+            "Result",
+            (),
+            {"returncode": 0, "stdout": "done", "stderr": ""},
+        )()
+
+        captured_env: dict = {}
+
+        def capture_run(*args, **kwargs):
+            captured_env.update(kwargs.get("env") or {})
+            return mock_result
+
+        with (
+            patch("devbench.execution.executor.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.execution.executor.USE_BEDROCK", False),
+            patch("devbench.execution.executor.EXECUTOR_MODEL", "direct-model"),
+            patch("subprocess.run", side_effect=capture_run),
+        ):
+            execute(work_unit_path=wu_file, repo="caylent-solutions/git-repo")
+
+        assert CLAUDE_CODE_USE_BEDROCK_ENV_KEY not in captured_env, (
+            f"Expected {CLAUDE_CODE_USE_BEDROCK_ENV_KEY!r} to be absent from subprocess env when USE_BEDROCK=False, "
+            f"but found {captured_env.get(CLAUDE_CODE_USE_BEDROCK_ENV_KEY)!r}"
+        )
+
+    def test_execute_passes_executor_model_as_model_flag(self, tmp_path: Path) -> None:
+        """
+        Executor subprocess receives EXECUTOR_MODEL as --model flag (not CLAUDE_MODEL).
+        """
+        from devbench.execution.executor import execute
+
+        wu_file = tmp_path / "task.md"
+        wu_file.write_text("## Status: in-review\n")
+
+        mock_result = type(
+            "Result",
+            (),
+            {"returncode": 0, "stdout": "done", "stderr": ""},
+        )()
+
+        captured_cmd: list = []
+
+        def capture_run(cmd, *args, **kwargs):
+            captured_cmd.extend(cmd)
+            return mock_result
+
+        with (
+            patch("devbench.execution.executor.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.execution.executor.USE_BEDROCK", False),
+            patch("devbench.execution.executor.EXECUTOR_MODEL", "my-executor-model"),
+            patch("subprocess.run", side_effect=capture_run),
+        ):
+            execute(work_unit_path=wu_file, repo="caylent-solutions/git-repo")
+
+        assert "--model" in captured_cmd, "Expected '--model' flag in subprocess command"
+        model_idx = captured_cmd.index("--model")
+        assert captured_cmd[model_idx + 1] == "my-executor-model", (
+            f"Expected EXECUTOR_MODEL='my-executor-model' passed after --model, "
+            f"got {captured_cmd[model_idx + 1]!r}"
+        )

@@ -13,45 +13,84 @@ import pytest
 from devbench import config
 from devbench.config import ALLOWED_REPOS, validate_repo
 
+# ---------------------------------------------------------------------------
+# Test constants derived from the test fixture (tests/fixtures/test_devbench.yaml)
+# so that test data is not embedded as inline deployment-configuration literals.
+# The fixture defines repos under "caylent-solutions"; these constants mirror that.
+# ---------------------------------------------------------------------------
+_FIXTURE_ORG = "caylent-solutions"
+_ALLOWED_REPO_IN_FIXTURE = f"{_FIXTURE_ORG}/git-repo"
+_UNKNOWN_REPO = "test-sentinel-org/unknown-repo"  # deliberately absent from fixture
+_WRONG_ORG_REPO = "wrong-org/git-repo"  # org not matching _FIXTURE_ORG
 
+
+@pytest.mark.unit
 class TestAllowedRepos:
     """Verify ALLOWED_REPOS is driven exclusively by YAML config."""
 
     def test_judge_allowed_repos_is_frozenset(self) -> None:
-        assert isinstance(ALLOWED_REPOS, frozenset)
+        assert isinstance(ALLOWED_REPOS, frozenset), (
+            f"Expected ALLOWED_REPOS to be a frozenset, got {type(ALLOWED_REPOS).__name__}"
+        )
 
     def test_allowed_repos_from_yaml(self) -> None:
         """ALLOWED_REPOS is sourced exclusively from YAML repos keys."""
         env = {k: v for k, v in os.environ.items() if k != "JUDGE_ALLOWED_REPOS"}
         with patch.dict(os.environ, env, clear=True):
             importlib.reload(config)
-            assert isinstance(config.ALLOWED_REPOS, frozenset)
-            assert len(config.ALLOWED_REPOS) > 0
+            assert isinstance(config.ALLOWED_REPOS, frozenset), (
+                f"Expected ALLOWED_REPOS to be a frozenset after reload, "
+                f"got {type(config.ALLOWED_REPOS).__name__}"
+            )
+            assert len(config.ALLOWED_REPOS) > 0, (
+                "Expected ALLOWED_REPOS to be non-empty (sourced from YAML fixture)"
+            )
 
         importlib.reload(config)
 
     def test_judge_allowed_repos_env_var_has_no_effect(self) -> None:
         """JUDGE_ALLOWED_REPOS env var is ignored — repos come from YAML only."""
+        # Capture the baseline ALLOWED_REPOS before patching.
+        baseline = frozenset(config.ALLOWED_REPOS)
+        assert len(baseline) > 0, (
+            "Baseline ALLOWED_REPOS must be non-empty for this test to be meaningful"
+        )
+
         with patch.dict(os.environ, {"JUDGE_ALLOWED_REPOS": "org/repo-a,org/repo-b"}, clear=False):
             importlib.reload(config)
-            assert frozenset({"org/repo-a", "org/repo-b"}) != config.ALLOWED_REPOS
-            assert isinstance(config.ALLOWED_REPOS, frozenset)
-            assert len(config.ALLOWED_REPOS) > 0
+            # The env var must not alter ALLOWED_REPOS — it must remain the same as baseline.
+            assert baseline == config.ALLOWED_REPOS, (
+                f"ALLOWED_REPOS changed after setting JUDGE_ALLOWED_REPOS — "
+                f"it must only come from YAML. Before: {baseline}, After: {config.ALLOWED_REPOS}"
+            )
 
         importlib.reload(config)
 
     def test_validate_repo_passes_for_allowed_repo(self) -> None:
+        """
+        Given: a repo name that is in ALLOWED_REPOS
+        When: validate_repo is called
+        Then: it completes without raising, and ALLOWED_REPOS still contains the repo
+              (state is unchanged — validate_repo is a pure validator with no side effects)
+        """
         repo = next(iter(ALLOWED_REPOS))
+        assert repo in ALLOWED_REPOS, (
+            f"Precondition failed: '{repo}' should be in ALLOWED_REPOS"
+        )
         validate_repo(repo)
+        assert repo in ALLOWED_REPOS, (
+            f"Post-condition failed: validate_repo must not modify ALLOWED_REPOS; "
+            f"'{repo}' was removed after the call"
+        )
 
     def test_validate_repo_raises_for_unknown_repo(self) -> None:
         with pytest.raises(ValueError, match="not allowed"):
-            validate_repo("some-org/unknown-repo")
+            validate_repo(_UNKNOWN_REPO)
 
     def test_validate_repo_rejects_wrong_org_when_judge_gh_org_set(self) -> None:
-        with patch.object(config, "ALLOWED_GH_ORG", "caylent-solutions"):
+        with patch.object(config, "ALLOWED_GH_ORG", _FIXTURE_ORG):
             with pytest.raises(ValueError, match="JUDGE_GH_ORG restricts access"):
-                config.validate_repo("wrong-org/git-repo")
+                config.validate_repo(_WRONG_ORG_REPO)
 
     def test_validate_repo_skips_org_check_when_judge_gh_org_empty(self) -> None:
         with patch.object(config, "ALLOWED_GH_ORG", ""):
@@ -59,6 +98,7 @@ class TestAllowedRepos:
                 config.validate_repo("other-org/some-repo")
 
 
+@pytest.mark.unit
 class TestGetGhToken:
     """Test GitHub token retrieval from file and environment."""
 
@@ -105,6 +145,7 @@ class TestGetGhToken:
         assert result == "fallback-token"
 
 
+@pytest.mark.unit
 class TestGetAnthropicApiKey:
     """Test Claude credential reading from credentials file."""
 
@@ -156,6 +197,7 @@ class TestGetAnthropicApiKey:
                 config.get_anthropic_api_key()
 
 
+@pytest.mark.unit
 class TestMergeStrategy:
     """Test MergeStrategy enum values, flags, and env var validation."""
 
@@ -189,6 +231,7 @@ class TestMergeStrategy:
         importlib.reload(config)
 
 
+@pytest.mark.unit
 class TestConfigOverrides:
     """Test that config values can be overridden via environment variables."""
 

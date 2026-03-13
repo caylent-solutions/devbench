@@ -11,6 +11,7 @@ dependencies = [
     "anthropic>=0.84.0",
     "boto3>=1.35.0",
     "botocore>=1.35.0",
+    "jsonschema>=4.0.0",
 ]
 
 [project.scripts]
@@ -26,6 +27,7 @@ dev-dependencies = [
     "bandit>=1.8.0",
     "mypy>=1.15.0",
     "types-pyyaml>=6.0.12.20250915",
+    "types-jsonschema>=4.23.0.20241208",
 ]
 
 [tool.ruff]
@@ -97,4 +99,8 @@ pythonpath = ["src", "tests"]
 python_classes = ["Test*"]
 filterwarnings = [
     "ignore::pytest.PytestCollectionWarning",
+]
+markers = [
+    "unit: unit tests (run with pytest -m unit)",
+    "functional: functional/integration tests (run with pytest -m functional)",
 ]

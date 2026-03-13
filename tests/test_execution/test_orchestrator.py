@@ -329,26 +329,58 @@ class TestProcessWorkUnit:
         unit = _make_unit(tmp_path)
         unit.branch = ""  # simulate a WorkUnit not populated by BacklogParser
 
+        with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+            with patch(f"{_ORC}.GitOpsJudge"):
+                with patch(f"{_ORC}.BacklogManager"):
+                    with patch(f"{_ORC}.BlockerResolverJudge"):
+                        with patch(f"{_ORC}.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
+                            with pytest.raises(ValueError, match="no branch set"):
+                                process_work_unit(unit)
+
+    def test_orchestrator_calls_ensure_branch_before_execute(self, tmp_path: Path) -> None:
+        """AC-1: ensure_branch is called before claude_executor.execute() on every attempt."""
+        from devbench.execution.orchestrator import process_work_unit
+
+        unit = _make_unit(tmp_path)
         exec_result = ExecutionResult(status=ExecutionStatus.IN_REVIEW, output="done", blocker="")
         mock_judge = MagicMock()
         mock_judge.name = "mock"
         mock_judge.evaluate.return_value = _pass_result("mock")
 
+        call_order: list[str] = []
+
+        mock_git_ops = MagicMock()
+        mock_git_ops.create_pr.return_value = "https://github.com/org/repo/pull/1"
+        mock_git_ops.wait_for_checks.return_value = True
+
+        def ensure_branch_side_effect(**kwargs):
+            call_order.append("ensure_branch")
+
+        mock_git_ops.ensure_branch.side_effect = ensure_branch_side_effect
+
+        def execute_side_effect(**kwargs):
+            call_order.append("execute")
+            return exec_result
+
+        mock_mgr = MagicMock()
+
         with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
             with patch(f"{_ORC}.claude_executor") as mock_exec:
-                mock_exec.execute.return_value = exec_result
+                mock_exec.execute.side_effect = execute_side_effect
                 with patch(f"{_ORC}.CodeReviewJudge", return_value=mock_judge):
                     with patch(f"{_ORC}.TestReviewJudge", return_value=mock_judge):
                         with patch(f"{_ORC}.DocReviewJudge", return_value=mock_judge):
                             with patch(f"{_ORC}.ChangesManifestJudge", return_value=mock_judge):
                                 with patch(f"{_ORC}.SecurityReviewJudge", return_value=mock_judge):
-                                    with patch(f"{_ORC}.GitOpsJudge"):
-                                        with patch(f"{_ORC}.BacklogManager"):
+                                    with patch(f"{_ORC}.GitOpsJudge", return_value=mock_git_ops):
+                                        with patch(f"{_ORC}.BacklogManager", return_value=mock_mgr):
                                             with patch(f"{_ORC}.BlockerResolverJudge"):
-                                                with patch(f"{_ORC}.MAX_RETRY_ATTEMPTS", 1):
-                                                    with patch(f"{_ORC}.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
-                                                        with pytest.raises(ValueError, match="no branch set"):
-                                                            process_work_unit(unit)
+                                                with patch(f"{_ORC}.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
+                                                    process_work_unit(unit)
+
+        ensure_idx = call_order.index("ensure_branch")
+        execute_idx = call_order.index("execute")
+        assert ensure_idx < execute_idx, "ensure_branch must be called before execute"
 
     def test_handles_review_rejection_then_pass(self, tmp_path: Path) -> None:
         from devbench.execution.orchestrator import process_work_unit

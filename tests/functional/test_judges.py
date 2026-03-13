@@ -307,8 +307,6 @@ class TestGitOpsFunctional:
         judge = GitOpsJudge()
 
         def _side_effect(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
-            if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
-                return (0, "feature/test", "")
             if cmd == ["git", "status", "--porcelain"]:
                 return (0, "M newfile.txt\n", "")
             return (0, "", "")
@@ -321,19 +319,17 @@ class TestGitOpsFunctional:
                 "test commit",
             )
 
-        # Expected calls (already on target branch, has staged changes):
-        # 1. git rev-parse --abbrev-ref HEAD  (branch check)
-        # 2. git add -A
-        # 3. git status --porcelain
-        # 4. git commit -m "test commit"
-        # 5. git push origin feature/test
-        assert mock_cmd.call_count == 5
+        # Expected calls (branch already set up by ensure_branch; has staged changes):
+        # 1. git add -A
+        # 2. git status --porcelain
+        # 3. git commit -m "test commit"
+        # 4. git push origin feature/test
+        assert mock_cmd.call_count == 4
         calls = [c.args[0] for c in mock_cmd.call_args_list]
-        assert calls[0] == ["git", "rev-parse", "--abbrev-ref", "HEAD"]
-        assert calls[1] == ["git", "add", "-A"]
-        assert calls[2] == ["git", "status", "--porcelain"]
-        assert calls[3] == ["git", "commit", "-m", "test commit"]
-        assert calls[4] == ["git", "push", "origin", "feature/test"]
+        assert calls[0] == ["git", "add", "-A"]
+        assert calls[1] == ["git", "status", "--porcelain"]
+        assert calls[2] == ["git", "commit", "-m", "test commit"]
+        assert calls[3] == ["git", "push", "origin", "feature/test"]
 
     def test_create_pr_returns_url(self, tmp_path: Path) -> None:
         judge = GitOpsJudge()

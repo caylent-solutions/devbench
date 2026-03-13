@@ -9,6 +9,24 @@
             "command": "bash \"${CLAUDE_PLUGIN_DIR}/scripts/guard-bash.sh\""
           }
         ]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_DIR}/scripts/guard-backlog.sh\""
+          }
+        ]
+      },
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_DIR}/scripts/guard-backlog.sh\""
+          }
+        ]
       }
     ]
   }

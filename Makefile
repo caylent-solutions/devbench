@@ -3,7 +3,7 @@ SHELL := /bin/bash
 .DEFAULT_GOAL := help
 unexport VIRTUAL_ENV
 
-.PHONY: help install plugin-install plugin-uninstall lint format check test test-unit validate clean run-backlog start start-interactive report
+.PHONY: help install plugin-install plugin-uninstall lint format check test test-unit validate clean start start-interactive report report-session
 
 ## help: Show available targets
 help:
@@ -59,13 +59,13 @@ clean:
 	find . -type d -name .ruff_cache -exec rm -rf {} + 2>/dev/null || true
 	find . -type d -name .mypy_cache -exec rm -rf {} + 2>/dev/null || true
 
-## start: Auth GitHub, refresh token, launch backlog plugin in background
+## start: Run orchestrate skill non-interactively via Claude Agent SDK
 start:
-	@bash scripts/start.sh
+	uv run python -m devbench.cli start
 
-## start-interactive: Auth GitHub, launch interactive Claude session (pause/steer/resume)
+## start-interactive: Launch interactive Claude session with devbench plugin loaded
 start-interactive:
-	@bash scripts/start-interactive.sh
+	claude --plugin-dir plugin/devbench
 
 ## report: Show backlog progress report (full session)
 report:
@@ -75,6 +75,3 @@ report:
 report-session:
 	uv run python -m devbench.cli report "$(SINCE)"
 
-## run-backlog: Run the devbench orchestrate skill via Claude Code plugin (foreground, assumes GH_TOKEN is set)
-run-backlog:
-	claude --plugin-dir plugin/devbench "Run the devbench:orchestrate skill to process the backlog until complete"

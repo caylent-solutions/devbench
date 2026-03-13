@@ -1,9 +1,10 @@
-"""Git operations judge that handles git and GitHub interactions.
+"""Git operations module handling git and GitHub interactions.
 
 All methods validate the target repository against the allow-list before
 performing any operation.
 """
 
+import logging
 import os
 import re
 import subprocess
@@ -19,7 +20,7 @@ from devbench.config import (
     validate_repo,
 )
 from devbench.config_loader import get_configured_default_branch
-from devbench.judges.base import BaseJudge, JudgeResult, Verdict
+from devbench.utils.process import run_command
 
 # Allowlist pattern for git branch names: starts with alphanumeric, allows
 # alphanumerics, dots, hyphens, underscores, and single forward slashes.
@@ -27,24 +28,13 @@ from devbench.judges.base import BaseJudge, JudgeResult, Verdict
 # git ref naming rules (git-check-ref-format).
 _BRANCH_RE = re.compile(r"^[a-zA-Z0-9]([a-zA-Z0-9_]|[.\-/][a-zA-Z0-9_])*$")
 
-class GitOpsJudge(BaseJudge):
+
+class GitOpsJudge:
     """Handles git commit, push, PR creation, merging, tagging, and CI checks."""
 
     def __init__(self) -> None:
-        super().__init__("git_ops")
-
-    def evaluate(self, work_unit_path: Path, repo_path: Path, **kwargs: object) -> JudgeResult:
-        """Not used directly; GitOpsJudge exposes individual operation methods.
-
-        Returns a PASS result as a no-op when called via the evaluate interface.
-        """
-        return JudgeResult(
-            judge_name=self.name,
-            verdict=Verdict.PASS,
-            reasoning="GitOpsJudge.evaluate is a no-op; use specific operation methods.",
-            feedback="",
-            evidence=[],
-        )
+        self.name = "git_ops"
+        self.logger = logging.getLogger(f"devbench.{self.name}")
 
     def commit_and_push(self, repo: str, repo_path: Path, branch: str, message: str) -> None:
         """Validate inputs, switch to the target branch, stage all changes, commit, and push.
@@ -111,7 +101,7 @@ class GitOpsJudge(BaseJudge):
 
         _, current_branch, _ = self._git(["rev-parse", "--abbrev-ref", "HEAD"], repo_path)
         if current_branch.strip() != branch:
-            rc, _, _ = self._run_command(
+            rc, _, _ = run_command(
                 ["git", "show-ref", "--verify", f"refs/heads/{branch}"], cwd=repo_path
             )
             if rc == 0:
@@ -124,7 +114,7 @@ class GitOpsJudge(BaseJudge):
         _, status_out, _ = self._git(["status", "--porcelain"], repo_path)
         if not status_out.strip():
             self.logger.info("Nothing to commit on branch %s — checking remote state", branch)
-            rc, _, _ = self._run_command(
+            rc, _, _ = run_command(
                 ["git", "rev-parse", "--verify", f"origin/{branch}"], cwd=repo_path
             )
             if rc != 0:
@@ -312,11 +302,37 @@ class GitOpsJudge(BaseJudge):
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _get_default_branch(self, repo_path: Path, repo: str = "") -> str:
+        """Return the default branch name for the repo (e.g. ``main``, ``main3``).
+
+        Resolution order:
+        1. YAML ``repos.<repo>.default_branch`` when *repo* is provided and configured.
+        2. ``git rev-parse --abbrev-ref origin/HEAD`` fallback.
+
+        Raises:
+            RuntimeError: If no YAML branch is configured and the git fallback
+                cannot determine the default branch.
+        """
+        if repo:
+            configured = get_configured_default_branch(repo, RUNTIME_CONFIG)
+            if configured:
+                return configured
+
+        rc, stdout, _ = run_command(
+            ["git", "rev-parse", "--abbrev-ref", "origin/HEAD"], cwd=repo_path,
+        )
+        if rc != 0 or not stdout.strip():
+            raise RuntimeError(
+                f"Cannot determine default branch in {repo_path}. "
+                "Run 'git remote set-head origin --auto' to configure it."
+            )
+        return stdout.strip().removeprefix("origin/")
+
     def _git(self, args: list[str], cwd: Path) -> tuple[int, str, str]:
         """Run a ``git`` command, raising ``RuntimeError`` on failure."""
         cmd = ["git"] + args
         self.logger.debug("git cmd=%r cwd=%s", cmd, cwd)
-        rc, stdout, stderr = self._run_command(cmd, cwd=cwd)
+        rc, stdout, stderr = run_command(cmd, cwd=cwd)
         self.logger.debug(
             "git exit=%d stdout=%r stderr=%r",
             rc,

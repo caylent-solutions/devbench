@@ -19,8 +19,10 @@ Commands::
     set-status <id> <s>     Force any status (no gate — use for recovery/lifecycle transitions)
     mark-done <id>          Mark unit as Done (enforces done-gate: all judges must have passed)
     validate-backlog        Check backlog integrity (file existence, status sync, orphans, deps)
+    git-ops <id>            Run full git operations sequence for a completed work unit
     report [since]          Print progress report with velocity stats
     log <message>           Append a message to the orchestrator log file
+    start                   Run the orchestrate skill via the Claude Agent SDK (non-interactive)
 
 Plugin agent bridge commands (used by devbench plugin agents)::
 
@@ -483,6 +485,104 @@ def cmd_log_verdict(judge_name: str, unit_id: str, verdict: str, feedback: str =
     return 0
 
 
+def cmd_git_ops(unit_id: str) -> int:
+    """Run the full git operations sequence for a completed work unit.
+
+    Sequence:
+    1. Resolve repo and local path from the work unit.
+    2. Determine branch name from work unit ID (``backlog/<id-lower>``).
+    3. Commit and push staged changes.
+    4. Create a pull request.
+    5. Wait for CI checks to pass.
+    6. Merge the pull request.
+    7. Update the parent submodule reference.
+
+    Used by the orchestrate skill after all review judges have passed.
+    """
+    from devbench.github.git_ops import GitOpsJudge
+
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    unit = _find_unit(units, unit_id)
+    if unit is None:
+        print(f"ERROR: Work unit '{unit_id}' not found in backlog", file=sys.stderr)
+        return 1
+
+    canonical_repo = resolve_repo(unit.repo)
+    validate_repo(canonical_repo)
+    repo_path = REPO_LOCAL_PATHS.get(canonical_repo)
+    if repo_path is None:
+        print(f"ERROR: No local path configured for repo '{canonical_repo}'", file=sys.stderr)
+        return 1
+
+    branch = f"backlog/{unit_id.lower()}"
+    commit_message = f"{unit_id}: {unit.title}"
+    pr_title = f"{unit_id}: {unit.title}"
+    pr_body = f"Automated PR for work unit {unit_id}.\n\n{unit.title}"
+
+    ops = GitOpsJudge()
+
+    ops.commit_and_push(canonical_repo, repo_path, branch, commit_message)
+    logger.info("Committed and pushed %s", unit_id)
+
+    pr_url = ops.create_pr(canonical_repo, branch, pr_title, pr_body, repo_path=repo_path)
+    logger.info("Created PR: %s", pr_url)
+
+    # Extract PR number from URL (e.g. https://github.com/org/repo/pull/42)
+    pr_number_str = pr_url.rstrip("/").split("/")[-1]
+    if not pr_number_str.isdigit():
+        print(f"ERROR: Could not parse PR number from URL: {pr_url}", file=sys.stderr)
+        return 1
+    pr_number = int(pr_number_str)
+
+    checks_passed = ops.wait_for_checks(canonical_repo, pr_number, repo_path=repo_path)
+    if not checks_passed:
+        print(f"ERROR: CI checks failed for PR #{pr_number} on {canonical_repo}", file=sys.stderr)
+        return 1
+
+    ops.merge_pr(canonical_repo, pr_number, repo_path=repo_path)
+    logger.info("Merged PR #%d for %s", pr_number, unit_id)
+
+    ops.update_parent_submodule_ref(
+        canonical_repo,
+        repo_path,
+        f"chore: update {repo_path.name} submodule after {unit_id}",
+    )
+
+    print(json.dumps({"unit_id": unit_id, "pr_url": pr_url, "pr_number": pr_number}))
+    return 0
+
+
+def cmd_start() -> int:
+    """Run the devbench orchestrate skill non-interactively via the Claude Agent SDK.
+
+    Loads the devbench plugin from the plugin directory adjacent to this package
+    and invokes the orchestrate skill, which processes the backlog until all
+    work units are complete or blocked.
+
+    Equivalent to running ``claude --plugin-dir <plugin>`` and invoking
+    the orchestrate skill interactively, but suitable for CI/unattended runs.
+    """
+    import asyncio
+
+    from claude_agent_sdk import ClaudeAgentOptions, query
+
+    plugin_path = Path(__file__).parent.parent.parent / "plugin" / "devbench"
+
+    async def _run() -> None:
+        async for message in query(
+            prompt="Run the devbench:orchestrate skill to process the backlog until complete",
+            options=ClaudeAgentOptions(
+                setting_sources=["project"],
+                plugins=[{"type": "local", "path": str(plugin_path)}],
+            ),
+        ):
+            logger.info("sdk message: %s", message)
+
+    asyncio.run(_run())
+    return 0
+
+
 def _find_unit(units: list[WorkUnit], unit_id: str) -> WorkUnit | None:
     """Find a work unit by ID (case-insensitive)."""
     for unit in units:
@@ -498,8 +598,10 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
     "set-status": (cmd_set_status, 2, "Set status: set-status <id> <status>"),
     "mark-done": (cmd_mark_done, 1, "Mark done: mark-done <id>"),
     "validate-backlog": (cmd_validate_backlog, 0, "Validate backlog integrity"),
+    "git-ops": (cmd_git_ops, 1, "Run git operations for a work unit: git-ops <id>"),
     "log": (cmd_log, 1, "Log a message: log <message>"),
     "report": (cmd_report, 0, "Progress report: report [since-timestamp]"),
+    "start": (cmd_start, 0, "Run orchestrate skill via Agent SDK (non-interactive)"),
     # Plugin agent bridge commands — used by devbench plugin agents
     "read-unit": (cmd_read_unit, 1, "Return work unit content and repo path as JSON: read-unit <id>"),
     "get-diff": (cmd_get_diff, 1, "Return combined git diff for work unit's repo: get-diff <id>"),

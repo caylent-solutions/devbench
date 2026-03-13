@@ -1,7 +1,7 @@
 """CLI entry point for the devbench system.
 
 Provides shell-callable commands so Claude Code (or any external process)
-can query backlog status, execute work units, and bridge plugin agents to repo context.
+can query backlog status and bridge plugin agents to repo context.
 
 Usage::
 
@@ -16,7 +16,6 @@ Commands::
 
     status                  Show backlog summary (counts by status)
     next                    Print the next actionable work unit ID and title
-    execute <id>            Spawn a Claude Code agent to execute a work unit
     set-status <id> <s>     Force any status (no gate — use for recovery/lifecycle transitions)
     mark-done <id>          Mark unit as Done (enforces done-gate: all judges must have passed)
     validate-backlog        Check backlog integrity (file existence, status sync, orphans, deps)
@@ -158,45 +157,6 @@ def cmd_next() -> int:
         )
     )
     return 0
-
-
-def cmd_execute(unit_id: str, feedback: str = "") -> int:
-    """Spawn a Claude Code agent to execute a work unit."""
-    from devbench.execution import executor as claude_executor
-
-    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
-    units = parser.parse_index()
-
-    target = _find_unit(units, unit_id)
-    if target is None:
-        print(f"ERROR: Work unit '{unit_id}' not found in backlog", file=sys.stderr)
-        return 1
-
-    wu_file = BACKLOG_ROOT / target.file_path if not target.file_path.is_absolute() else target.file_path
-    if not wu_file.exists():
-        # Try resolving relative to workspace
-        wu_file = WORKSPACE_ROOT / target.file_path
-
-    logger.info("Executing work unit %s (repo: %s)", unit_id, target.repo)
-
-    result = claude_executor.execute(
-        work_unit_path=wu_file,
-        repo=target.repo,
-        feedback=feedback,
-    )
-
-    logger.info("Execution result for %s: status=%s", unit_id, result.status.value)
-    if result.blocker:
-        logger.info("Execution blocker for %s: %s", unit_id, result.blocker[:500])
-
-    output = {
-        "unit_id": unit_id,
-        "status": result.status.value,
-        "blocker": result.blocker,
-        "output_length": len(result.output),
-    }
-    print(json.dumps(output))
-    return 0 if result.status.value == "in-review" else 1
 
 
 def cmd_set_status(unit_id: str, new_status: str) -> int:
@@ -483,8 +443,7 @@ def cmd_log_verdict(judge_name: str, unit_id: str, verdict: str, feedback: str =
     The entry written to the work unit uses the same format as the orchestrator:
     ``[judge/<name>] [REVIEW_PASS|REVIEW_FAIL] <feedback>``
 
-    Feedback is also written to the orchestrator log so that ``_get_prior_feedback``
-    can retrieve it for the next execution attempt.
+    Feedback is also written to the orchestrator log for audit purposes.
     """
     verdict_lower = verdict.strip().lower()
     if verdict_lower not in ("pass", "fail"):
@@ -516,7 +475,7 @@ def cmd_log_verdict(judge_name: str, unit_id: str, verdict: str, feedback: str =
         content = content.rstrip("\n") + "\n\n" + COMMENTS_SECTION_HEADER + "\n\n" + entry
     wu_file.write_text(content, encoding="utf-8")
 
-    # Log feedback so _get_prior_feedback can retrieve it for the next attempt.
+    # Log feedback for audit trail.
     if feedback:
         logger.info("%s judge feedback for %s: %s", judge_name, unit_id, feedback)
 
@@ -536,7 +495,6 @@ def _find_unit(units: list[WorkUnit], unit_id: str) -> WorkUnit | None:
 _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
     "status": (cmd_status, 0, "Show backlog summary"),
     "next": (cmd_next, 0, "Print next actionable work unit"),
-    "execute": (cmd_execute, 1, "Execute a work unit: execute <id> [feedback]"),
     "set-status": (cmd_set_status, 2, "Set status: set-status <id> <status>"),
     "mark-done": (cmd_mark_done, 1, "Mark done: mark-done <id>"),
     "validate-backlog": (cmd_validate_backlog, 0, "Validate backlog integrity"),

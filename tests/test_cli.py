@@ -174,57 +174,6 @@ class TestCmdLog:
         assert "Logged" in capsys.readouterr().out
 
 
-class TestCmdExecute:
-    """Test cmd_execute command."""
-
-    def test_returns_1_when_unit_not_found(self, mock_units: list[WorkUnit]) -> None:
-        mock_parser = MagicMock()
-        mock_parser.parse_index.return_value = mock_units
-
-        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
-            result = cli.cmd_execute("NONEXISTENT")
-
-        assert result == 1
-
-    def test_returns_0_on_in_review(
-        self, mock_units: list[WorkUnit], tmp_path: Path, backlog_dir: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        from devbench.execution.executor import ExecutionResult, ExecutionStatus
-
-        wu_file = backlog_dir / "E0-F1-S1-T2.md"
-        wu_file.write_text("# Task\n")
-
-        mock_parser = MagicMock()
-        mock_parser.parse_index.return_value = mock_units
-        exec_result = ExecutionResult(status=ExecutionStatus.IN_REVIEW, output="done", blocker="")
-
-        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
-            with patch("devbench.cli.BACKLOG_ROOT", backlog_dir):
-                with patch("devbench.execution.executor.execute", return_value=exec_result):
-                    result = cli.cmd_execute("E0-F1-S1-T2")
-
-        assert result == 0
-        output = json.loads(capsys.readouterr().out)
-        assert output["status"] == "in-review"
-
-    def test_returns_1_on_failure(self, mock_units: list[WorkUnit], tmp_path: Path, backlog_dir: Path) -> None:
-        from devbench.execution.executor import ExecutionResult, ExecutionStatus
-
-        wu_file = backlog_dir / "E0-F1-S1-T2.md"
-        wu_file.write_text("# Task\n")
-
-        mock_parser = MagicMock()
-        mock_parser.parse_index.return_value = mock_units
-        exec_result = ExecutionResult(status=ExecutionStatus.FAILED, output="error", blocker="")
-
-        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
-            with patch("devbench.cli.BACKLOG_ROOT", backlog_dir):
-                with patch("devbench.execution.executor.execute", return_value=exec_result):
-                    result = cli.cmd_execute("E0-F1-S1-T2")
-
-        assert result == 1
-
-
 class TestCmdSetStatus:
     """Test cmd_set_status command."""
 

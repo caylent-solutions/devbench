@@ -20,7 +20,7 @@ class BlockerResolverJudge(BaseJudge):
 
     def evaluate(self, work_unit_path: Path, repo_path: Path, **kwargs: object) -> JudgeResult:
         """Evaluate blockers by delegating to the LLM."""
-        work_unit_content = self._read_file(work_unit_path)
+        work_unit_content = self._read_work_unit(work_unit_path)
 
         # Quick check: if no "Blocked By" section exists, pass immediately
         if "blocked by" not in work_unit_content.lower():

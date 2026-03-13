@@ -1,6 +1,6 @@
 """Test review judge that validates TDD cycle adherence and test quality.
 
-Gathers test execution output, test file contents, and work-unit content,
+Gathers test execution output, git diff, test file contents, and work-unit content,
 then delegates the full review to the LLM which evaluates TDD discipline,
 test quality, meaningful assertions, and stub detection.
 """
@@ -12,7 +12,6 @@ from devbench.config import (
     LLM_FILE_PREVIEW_CHARS,
     TEST_TIMEOUT,
 )
-from devbench.constants import TEST_OUTPUT_TAIL_CHARS
 from devbench.judges.base import BaseJudge, JudgeResult
 from devbench.prompts import load_prompt
 
@@ -28,17 +27,18 @@ class TestReviewJudge(BaseJudge):
     def evaluate(self, work_unit_path: Path, repo_path: Path, **kwargs: object) -> JudgeResult:
         """Evaluate test quality by gathering evidence and delegating to the LLM."""
         repo: str = str(kwargs.get("repo", ""))
-        work_unit_content = self._read_file(work_unit_path)
+        work_unit_content = self._read_work_unit(work_unit_path)
 
-        # Gather test execution output
+        # Gather evidence
+        diff = self._get_diff(repo_path, repo=repo)
         test_output = self._run_tests(repo_path)
-
-        # Gather test file contents
         test_files_content = self._collect_test_files(repo_path, repo=repo)
 
         evidence_sections: dict[str, str] = {
             "Work Unit": work_unit_content,
         }
+        if diff.strip():
+            evidence_sections["Git Diff"] = diff
         if test_output:
             evidence_sections["Test Output"] = test_output
         if test_files_content:
@@ -51,7 +51,7 @@ class TestReviewJudge(BaseJudge):
         )
 
     def _run_tests(self, repo_path: Path) -> str:
-        """Run the repo's test pipeline and return the output.
+        """Run the repo's test pipeline and return the full output.
 
         Uses ``make test`` when a Makefile with a ``test`` target exists,
         so that the repo's configured environment variables, flags, and
@@ -67,8 +67,7 @@ class TestReviewJudge(BaseJudge):
                 cmd.extend(targets)
 
         rc, stdout, stderr = self._run_command(cmd, cwd=repo_path, timeout=TEST_TIMEOUT)
-        combined_output = (stdout + stderr).strip()
-        return combined_output[-TEST_OUTPUT_TAIL_CHARS:] if combined_output else ""
+        return (stdout + stderr).strip()
 
     def _has_make_test_target(self, repo_path: Path) -> bool:
         """Check if the repo has a Makefile with a ``test`` target."""

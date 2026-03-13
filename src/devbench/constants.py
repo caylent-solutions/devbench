@@ -79,7 +79,6 @@ PR_BODY_TEMPLATE: str = "Automated PR for work unit {unit_id}\n\n{description}"
 # ---------------------------------------------------------------------------
 ERROR_OUTPUT_PREVIEW_CHARS: int = 1000
 RAW_RESPONSE_PREVIEW_CHARS: int = 500
-TEST_OUTPUT_TAIL_CHARS: int = 500
 
 # ---------------------------------------------------------------------------
 # LLM response format prompt

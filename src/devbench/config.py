@@ -32,9 +32,9 @@ _log = logging.getLogger("devbench.config")
 # ---------------------------------------------------------------------------
 # Repository allow-list
 # ---------------------------------------------------------------------------
-# When set, restricts all GitHub operations to this org only.
-# Unset or empty to allow any org in the allow-list.
-ALLOWED_GH_ORG: str = os.environ.get("JUDGE_GH_ORG", "")
+# ALLOWED_GH_ORG is the legacy single-org restriction (now deprecated).
+# ALLOWED_GH_ORGS is the new list sourced from RUNTIME_CONFIG.allowed_orgs
+# and is populated after RUNTIME_CONFIG is loaded below.
 
 # Absolute path to the workspace root directory containing all repo clones.
 _workspace_root = os.environ.get("JUDGE_WORKSPACE_ROOT", "")
@@ -51,6 +51,20 @@ WORKSPACE_ROOT: Path = Path(_workspace_root)
 # Resolve config path and load YAML.  Fails fast if the file cannot be found.
 _config_path: Path = resolve_config_path(None, os.environ, WORKSPACE_ROOT)
 RUNTIME_CONFIG: RuntimeConfig = load_runtime_config(_config_path, os.environ)
+
+# ---------------------------------------------------------------------------
+# Allowed orgs — sourced from YAML allowed_orgs, with JUDGE_GH_ORG as deprecated fallback.
+# ---------------------------------------------------------------------------
+_allowed_gh_orgs: list[str] = list(RUNTIME_CONFIG.allowed_orgs)
+_legacy_gh_org: str = os.environ.get("JUDGE_GH_ORG", "")
+if _legacy_gh_org:
+    _log.warning(
+        "JUDGE_GH_ORG is deprecated. Add '%s' to allowed_orgs in your devbench.yaml instead.",
+        _legacy_gh_org,
+    )
+    if _legacy_gh_org not in _allowed_gh_orgs:
+        _allowed_gh_orgs.append(_legacy_gh_org)
+ALLOWED_GH_ORGS: list[str] = _allowed_gh_orgs
 
 # ---------------------------------------------------------------------------
 # Allowed repos — sourced exclusively from YAML config.
@@ -97,13 +111,87 @@ BACKLOG_INDEX: Path = WORKSPACE_ROOT / "BACKLOG.md"
 # ---------------------------------------------------------------------------
 MAX_RETRY_ATTEMPTS: int = int(os.environ.get("JUDGE_MAX_RETRIES", "10"))
 GITHUB_CHECK_TIMEOUT_SECONDS: int = int(os.environ.get("JUDGE_GH_TIMEOUT", "600"))
-_claude_model = os.environ.get("JUDGE_CLAUDE_MODEL", "")
-if not _claude_model:
+
+# ---------------------------------------------------------------------------
+# USE_BEDROCK / BEDROCK_REGION — env var overrides YAML value.
+# ---------------------------------------------------------------------------
+_use_bedrock_env = os.environ.get("JUDGE_USE_BEDROCK", "")
+if _use_bedrock_env:
+    USE_BEDROCK: bool = _use_bedrock_env.lower() in ("1", "true", "yes")
+else:
+    USE_BEDROCK = RUNTIME_CONFIG.use_bedrock
+
+_bedrock_region_resolved: str = os.environ.get(
+    "JUDGE_BEDROCK_REGION",
+    os.environ.get("AWS_REGION", RUNTIME_CONFIG.bedrock_region or ""),
+)
+if USE_BEDROCK and not _bedrock_region_resolved:
     raise RuntimeError(
-        "JUDGE_CLAUDE_MODEL environment variable is not set. "
-        "Set it to a valid model identifier (e.g. us.anthropic.claude-sonnet-4-6-v1)."
+        "BEDROCK_REGION is required when use_bedrock is true. "
+        "Set JUDGE_BEDROCK_REGION, AWS_REGION, or bedrock_region in devbench.yaml."
     )
-CLAUDE_MODEL: str = _claude_model
+BEDROCK_REGION: str = _bedrock_region_resolved
+
+# ---------------------------------------------------------------------------
+# Model identifiers — resolution order per model field:
+# 1. ANTHROPIC_MODEL env var (overrides both CLAUDE_MODEL and EXECUTOR_MODEL silently)
+# 2. JUDGE_CLAUDE_MODEL env var (deprecated fallback — populates both, emits WARNING)
+# 3. YAML judge_model / executor_model field
+# 4. Auth-dependent default env var:
+#    - JUDGE_DEFAULT_MODEL_BEDROCK when USE_BEDROCK is True
+#    - JUDGE_DEFAULT_MODEL_DIRECT when USE_BEDROCK is False
+#    If the default env var is also absent, RuntimeError is raised (fail-fast).
+# ---------------------------------------------------------------------------
+_anthropic_model_override: str = os.environ.get("ANTHROPIC_MODEL", "")
+_judge_claude_model_legacy: str = os.environ.get("JUDGE_CLAUDE_MODEL", "")
+
+
+def _resolve_default_model(use_bedrock: bool) -> str:
+    """Return the auth-dependent default model from environment variables.
+
+    Raises:
+        RuntimeError: When neither the Bedrock nor Direct default env var is set.
+    """
+    if use_bedrock:
+        default = os.environ.get("JUDGE_DEFAULT_MODEL_BEDROCK", "")
+        if not default:
+            raise RuntimeError(
+                "JUDGE_DEFAULT_MODEL_BEDROCK environment variable is not set. "
+                "Set it to the AWS Bedrock model ID to use when judge_model/executor_model "
+                "are absent from devbench.yaml and ANTHROPIC_MODEL is not set."
+            )
+        return default
+    default = os.environ.get("JUDGE_DEFAULT_MODEL_DIRECT", "")
+    if not default:
+        raise RuntimeError(
+            "JUDGE_DEFAULT_MODEL_DIRECT environment variable is not set. "
+            "Set it to the Anthropic model ID to use when judge_model/executor_model "
+            "are absent from devbench.yaml and ANTHROPIC_MODEL is not set."
+        )
+    return default
+
+
+if _anthropic_model_override:
+    # ANTHROPIC_MODEL silently overrides both models (Claude CLI convention).
+    CLAUDE_MODEL: str = _anthropic_model_override
+    EXECUTOR_MODEL: str = _anthropic_model_override
+elif _judge_claude_model_legacy:
+    # JUDGE_CLAUDE_MODEL is deprecated; it still populates both constants as a fallback.
+    _log.warning(
+        "JUDGE_CLAUDE_MODEL is deprecated. Use judge_model/executor_model in devbench.yaml "
+        "or ANTHROPIC_MODEL env var instead."
+    )
+    CLAUDE_MODEL = _judge_claude_model_legacy
+    EXECUTOR_MODEL = _judge_claude_model_legacy
+else:
+    _default_model: str = (
+        RUNTIME_CONFIG.judge_model or _resolve_default_model(USE_BEDROCK)
+    )
+    _default_executor_model: str = (
+        RUNTIME_CONFIG.executor_model or _resolve_default_model(USE_BEDROCK)
+    )
+    CLAUDE_MODEL = _default_model
+    EXECUTOR_MODEL = _default_executor_model
 
 
 class MergeStrategy(StrEnum):
@@ -127,9 +215,6 @@ except ValueError:
     raise RuntimeError(
         f"JUDGE_MERGE_STRATEGY must be one of: {', '.join(s.value for s in MergeStrategy)}. Got: {_merge_strategy}"
     ) from None
-
-USE_BEDROCK: bool = os.environ.get("JUDGE_USE_BEDROCK", "").lower() in ("1", "true", "yes")
-BEDROCK_REGION: str = os.environ.get("JUDGE_BEDROCK_REGION", os.environ.get("AWS_REGION", "us-east-1"))
 
 # ---------------------------------------------------------------------------
 # Timeouts — all values in seconds
@@ -174,17 +259,17 @@ CLAUDE_CREDENTIALS_FILE: Path = Path(
 
 
 def validate_repo(repo: str) -> None:
-    """Raise ``ValueError`` if *repo* is not in the allow-list or wrong org.
+    """Raise ``ValueError`` if *repo* is not in the allow-list or from a disallowed org.
 
-    When ``JUDGE_GH_ORG`` is set, also validates that the repo belongs
-    to the specified organization.
+    When ``allowed_orgs`` is non-empty (from YAML or the deprecated ``JUDGE_GH_ORG``),
+    also validates that the repo's org is in that list.
     """
-    if ALLOWED_GH_ORG and "/" in repo:
+    if ALLOWED_GH_ORGS and "/" in repo:
         org = repo.split("/", maxsplit=1)[0]
-        if org != ALLOWED_GH_ORG:
+        if org not in ALLOWED_GH_ORGS:
             raise ValueError(
                 f"Repository '{repo}' belongs to org '{org}', "
-                f"but JUDGE_GH_ORG restricts access to '{ALLOWED_GH_ORG}'."
+                f"which is not in allowed_orgs: {ALLOWED_GH_ORGS}."
             )
     if repo not in ALLOWED_REPOS:
         raise ValueError(f"Repository '{repo}' is not allowed. Allowed repositories: {sorted(ALLOWED_REPOS)}")

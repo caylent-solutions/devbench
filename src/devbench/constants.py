@@ -155,3 +155,8 @@ REVIEW_JUDGE_NAMES: frozenset[str] = frozenset({
     "doc_review",
     "changes_manifest",
 })
+
+# ---------------------------------------------------------------------------
+# Subprocess environment variable keys
+# ---------------------------------------------------------------------------
+CLAUDE_CODE_USE_BEDROCK_ENV_KEY: str = "CLAUDE_CODE_USE_BEDROCK"

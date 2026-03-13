@@ -36,7 +36,7 @@ class TestEvaluate:
         wu_file = tmp_path / "wu.md"
         wu_file.write_text("# Task\n")
         with pytest.raises(ValueError, match="not allowed"):
-            judge.evaluate(wu_file, tmp_path, repo="evil-org/evil-repo")
+            judge.evaluate(wu_file, tmp_path, repo="caylent-solutions/nonexistent-test-repo")
 
     def test_passes_when_llm_passes(self, tmp_path: Path) -> None:
         wu_file = tmp_path / "wu.md"

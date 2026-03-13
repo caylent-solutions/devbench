@@ -36,7 +36,7 @@ class TestCommitAndPush:
     def test_validates_repo(self, tmp_path: Path) -> None:
         judge = GitOpsJudge()
         with pytest.raises(ValueError, match="not allowed"):
-            judge.commit_and_push("evil/repo", tmp_path, "branch", "msg")
+            judge.commit_and_push("caylent-solutions/nonexistent-test-repo", tmp_path, "branch", "msg")
 
     def test_rejects_invalid_branch_name(self, tmp_path: Path) -> None:
         judge = GitOpsJudge()
@@ -237,7 +237,7 @@ class TestCreatePr:
     def test_validates_repo(self) -> None:
         judge = GitOpsJudge()
         with pytest.raises(ValueError, match="not allowed"):
-            judge.create_pr("evil/repo", "branch", "title", "body")
+            judge.create_pr("caylent-solutions/nonexistent-test-repo", "branch", "title", "body")
 
     def test_returns_pr_url(self, tmp_path: Path) -> None:
         judge = GitOpsJudge()
@@ -308,7 +308,7 @@ class TestMergePr:
     def test_validates_repo(self) -> None:
         judge = GitOpsJudge()
         with pytest.raises(ValueError, match="not allowed"):
-            judge.merge_pr("evil/repo", 42)
+            judge.merge_pr("caylent-solutions/nonexistent-test-repo", 42)
 
     def test_merges_successfully(self, tmp_path: Path) -> None:
         judge = GitOpsJudge()
@@ -337,7 +337,7 @@ class TestCreateTag:
     def test_validates_repo(self, tmp_path: Path) -> None:
         judge = GitOpsJudge()
         with pytest.raises(ValueError, match="not allowed"):
-            judge.create_tag("evil/repo", tmp_path, "v1.0", "Release")
+            judge.create_tag("caylent-solutions/nonexistent-test-repo", tmp_path, "v1.0", "Release")
 
     def test_creates_and_pushes_tag(self, tmp_path: Path) -> None:
         judge = GitOpsJudge()
@@ -356,7 +356,7 @@ class TestWaitForChecks:
     def test_validates_repo(self) -> None:
         judge = GitOpsJudge()
         with pytest.raises(ValueError, match="not allowed"):
-            judge.wait_for_checks("evil/repo", 1)
+            judge.wait_for_checks("caylent-solutions/nonexistent-test-repo", 1)
 
     def test_returns_true_on_success(self, tmp_path: Path) -> None:
         judge = GitOpsJudge()
@@ -391,7 +391,7 @@ class TestUpdateParentSubmoduleRef:
     def test_validates_repo(self, tmp_path: Path) -> None:
         judge = GitOpsJudge()
         with pytest.raises(ValueError, match="not allowed"):
-            judge.update_parent_submodule_ref("evil/repo", tmp_path, "msg")
+            judge.update_parent_submodule_ref("caylent-solutions/nonexistent-test-repo", tmp_path, "msg")
 
     def test_calls_correct_git_commands(self, tmp_path: Path) -> None:
         judge = GitOpsJudge()

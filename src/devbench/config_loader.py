@@ -6,7 +6,14 @@ Config file path precedence (first match wins):
 3. Default path: ``<WORKSPACE_ROOT>/backlog/config/devbench.yaml``
 
 Config value precedence:
-- Environment variables override YAML values; YAML values override code defaults.
+- YAML values override code defaults.  Environment variable overrides are applied
+  by ``config.py``, not by this module.
+
+This module is parse/validate only — it does not read environment variables.
+All env-var-driven defaults for operational parameters (timeouts, limits, model
+identifiers, region) are applied by ``config.py``.  Optional fields in the
+dataclasses default to ``None``; callers are responsible for substituting
+environment-driven values when ``None`` is encountered.
 
 YAML schema::
 
@@ -14,6 +21,34 @@ YAML schema::
       org/repo:                          # key must be "org/repo" format
         default_branch: main2            # optional — omit to fall back to origin/HEAD
         checkout_directory: my-checkout  # optional — relative to JUDGE_WORKSPACE_ROOT
+        merge_strategy: squash           # optional — overrides top-level merge_strategy
+
+    merge_strategy: squash               # optional — default merge strategy for all repos
+    max_retries: <integer>               # optional — max retry attempts
+    use_bedrock: false                   # optional — route LLM calls via AWS Bedrock
+    bedrock_region: <aws-region-string>  # optional — AWS region for Bedrock (env var override applied by config.py)
+    judge_model: <model-id>              # optional — model for judge agents (env var override applied by config.py)
+    executor_model: <model-id>           # optional — model for executor agent (env var override applied by config.py)
+    allowed_orgs:                        # optional — permitted GitHub organisations
+      - caylent-solutions
+
+    timeouts:                            # optional — all values in seconds; env var overrides applied by config.py
+      gh_api: <integer>
+      test: <integer>
+      security_fetch: <integer>
+      llm: <integer>
+      command: <integer>
+      executor: <integer>
+      executor_max_turns: <integer>
+      orchestrator_poll_interval: <integer>
+      github_check: <integer>
+
+    limits:                              # optional — threshold values; env var overrides applied by config.py
+      alert_summary: <integer>
+      output_truncation: <integer>
+      llm_evidence_truncation: <integer>
+      llm_file_context: <integer>
+      llm_file_preview_chars: <integer>
 
 Example config file (``backlog/config/devbench.yaml``)::
 
@@ -25,14 +60,73 @@ Example config file (``backlog/config/devbench.yaml``)::
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import jsonschema
 import yaml
 
 # Relative path from WORKSPACE_ROOT to the default config file location.
 DEFAULT_CONFIG_SUBPATH: str = "backlog/config/devbench.yaml"
+
+# Load the JSON Schema once at module import time.
+_SCHEMA_PATH: Path = Path(__file__).parent / "config-schema.json"
+with _SCHEMA_PATH.open(encoding="utf-8") as _f:
+    _SCHEMA: dict = json.load(_f)
+
+
+@dataclass
+class TimeoutConfig:
+    """Timeout values (in seconds) for various operations.
+
+    Fields default to ``None`` when not specified in YAML.  ``config.py``
+    applies environment-variable-driven defaults for any ``None`` field.
+
+    Attributes:
+        gh_api: GitHub API call timeout.
+        test: Test suite run timeout.
+        security_fetch: Security advisory fetch timeout.
+        llm: LLM API call timeout.
+        command: Shell command execution timeout.
+        executor: Executor agent overall timeout.
+        executor_max_turns: Maximum number of executor turns.
+        orchestrator_poll_interval: Orchestrator polling interval.
+        github_check: GitHub check status polling timeout.
+    """
+
+    gh_api: int | None = None
+    test: int | None = None
+    security_fetch: int | None = None
+    llm: int | None = None
+    command: int | None = None
+    executor: int | None = None
+    executor_max_turns: int | None = None
+    orchestrator_poll_interval: int | None = None
+    github_check: int | None = None
+
+
+@dataclass
+class LimitConfig:
+    """Threshold and limit values.
+
+    Fields default to ``None`` when not specified in YAML.  ``config.py``
+    applies environment-variable-driven defaults for any ``None`` field.
+
+    Attributes:
+        alert_summary: Maximum number of security alert summaries to include.
+        output_truncation: Character limit for command output truncation.
+        llm_evidence_truncation: Character limit for LLM evidence content truncation.
+        llm_file_context: Maximum number of files included in LLM context.
+        llm_file_preview_chars: Character limit for per-file LLM preview.
+    """
+
+    alert_summary: int | None = None
+    output_truncation: int | None = None
+    llm_evidence_truncation: int | None = None
+    llm_file_context: int | None = None
+    llm_file_preview_chars: int | None = None
 
 
 @dataclass
@@ -46,22 +140,47 @@ class RepoConfig:
             the repo is checked out.  Must not be absolute or contain ``..``.
             When ``None``, defaults to the repo short-name (the part after
             the ``/`` in ``org/repo``).
+        merge_strategy: Per-repo PR merge strategy override.  When ``None``,
+            the top-level ``RuntimeConfig.merge_strategy`` is used.
     """
 
     default_branch: str | None = None
     checkout_directory: str | None = None
+    merge_strategy: str | None = None
 
 
 @dataclass
 class RuntimeConfig:
     """Merged runtime configuration loaded from the YAML config file.
 
+    Optional fields default to ``None`` when not specified in YAML.
+    ``config.py`` applies environment-variable-driven defaults for any
+    ``None`` field before exposing configuration to the rest of the system.
+
     Attributes:
         repos: Mapping of fully-qualified ``org/repo`` names to their
             per-repository configuration.
+        timeouts: Timeout values for various operations.
+        limits: Threshold and limit values.
+        allowed_orgs: List of permitted GitHub organisations.
+        judge_model: Model identifier used by judge agents.
+        executor_model: Model identifier used by the executor agent.
+        use_bedrock: Whether to route LLM calls through AWS Bedrock.
+        bedrock_region: AWS region for Bedrock API calls.
+        merge_strategy: Default PR merge strategy for all repos.
+        max_retries: Maximum number of retry attempts.
     """
 
     repos: dict[str, RepoConfig] = field(default_factory=dict)
+    timeouts: TimeoutConfig = field(default_factory=TimeoutConfig)
+    limits: LimitConfig = field(default_factory=LimitConfig)
+    allowed_orgs: list[str] = field(default_factory=list)
+    judge_model: str | None = None
+    executor_model: str | None = None
+    use_bedrock: bool = False
+    bedrock_region: str | None = None
+    merge_strategy: str | None = None
+    max_retries: int | None = None
 
 
 def resolve_config_path(
@@ -89,16 +208,95 @@ def resolve_config_path(
     return workspace_root / DEFAULT_CONFIG_SUBPATH
 
 
-def load_runtime_config(path: Path, env: Mapping[str, str]) -> RuntimeConfig:  # noqa: ARG001, PLR0912
-    """Load YAML at *path*, validate the schema, and return a ``RuntimeConfig``.
+def _parse_repo_config(path: Path, repo_name: str, repo_data: object) -> RepoConfig:
+    """Parse and validate a single repo entry from raw YAML.
 
-    Value precedence: environment variables > YAML values > code defaults.
-    The ``env`` argument is accepted for future per-key overrides; current
-    implementation uses it for schema validation context only.
+    Args:
+        path: Config file path (used in error messages).
+        repo_name: The ``org/repo`` key.
+        repo_data: Raw value from YAML (may be None or a dict after schema validation).
+
+    Returns:
+        ``RepoConfig`` populated from *repo_data*.
+
+    Raises:
+        ValueError: If *checkout_directory* is absolute or contains ``..``.
+    """
+    if not isinstance(repo_data, dict):
+        return RepoConfig()
+
+    default_branch: str | None = repo_data.get("default_branch")
+    repo_merge_strategy: str | None = repo_data.get("merge_strategy")
+
+    raw_checkout = repo_data.get("checkout_directory")
+    if raw_checkout is None:
+        return RepoConfig(
+            default_branch=default_branch,
+            merge_strategy=repo_merge_strategy,
+        )
+
+    if Path(raw_checkout).is_absolute():
+        raise ValueError(
+            f"Config file '{path}': repos.{repo_name}.checkout_directory "
+            f"must be a relative path, got absolute path '{raw_checkout}'."
+        )
+    if ".." in Path(raw_checkout).parts:
+        raise ValueError(
+            f"Config file '{path}': repos.{repo_name}.checkout_directory "
+            f"must not contain parent traversal ('..'), got '{raw_checkout}'."
+        )
+    return RepoConfig(
+        default_branch=default_branch,
+        checkout_directory=raw_checkout,
+        merge_strategy=repo_merge_strategy,
+    )
+
+
+def _parse_repos(
+    path: Path, repos_raw: dict, allowed_orgs: list[str]
+) -> dict[str, RepoConfig]:
+    """Build the repos mapping from the raw YAML ``repos`` block.
+
+    When *allowed_orgs* is non-empty, every repo key's organisation component
+    must appear in *allowed_orgs*.
+
+    Args:
+        path: Config file path (used in error messages).
+        repos_raw: Raw ``repos`` dict from YAML (already schema-validated).
+        allowed_orgs: Permitted GitHub organisations.  Empty list means any org.
+
+    Returns:
+        Mapping of ``org/repo`` → ``RepoConfig``.
+
+    Raises:
+        ValueError: If a repo key's org is not in *allowed_orgs*.
+    """
+    repos: dict[str, RepoConfig] = {}
+    for repo_key, repo_data in repos_raw.items():
+        repo_name = str(repo_key)
+        if allowed_orgs:
+            org = repo_name.split("/", maxsplit=1)[0]
+            if org not in allowed_orgs:
+                raise ValueError(
+                    f"Config file '{path}': repo '{repo_name}' belongs to org '{org}', "
+                    f"which is not in allowed_orgs: {allowed_orgs}."
+                )
+        repos[repo_name] = _parse_repo_config(path, repo_name, repo_data)
+    return repos
+
+
+def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
+    """Load YAML at *path*, validate against JSON Schema, and return a ``RuntimeConfig``.
+
+    Value precedence: YAML values override code defaults.  The ``_env`` argument
+    is accepted for API compatibility; this function does not read env vars.
+
+    Optional fields not present in YAML are set to ``None``.  ``config.py``
+    applies environment-variable-driven defaults for any ``None`` field.
 
     Args:
         path: Path to the YAML config file.  Must exist.
-        env: Environment variable mapping (typically ``os.environ``).
+        _env: Environment variable mapping (accepted for API compatibility; not read).
 
     Returns:
         ``RuntimeConfig`` populated from the YAML file.
@@ -126,57 +324,53 @@ def load_runtime_config(path: Path, env: Mapping[str, str]) -> RuntimeConfig:  #
             f"got {type(raw).__name__}."
         )
 
-    repos_raw = raw.get("repos")
-    if not repos_raw or not isinstance(repos_raw, dict):
+    # JSON Schema validation — catches unknown keys, type errors, and enum violations.
+    try:
+        jsonschema.validate(raw, _SCHEMA)
+    except jsonschema.ValidationError as exc:
         raise ValueError(
-            f"Config file '{path}' must contain a 'repos' mapping with at least one "
-            "entry. Example:\n  repos:\n    org/repo:\n      default_branch: main"
-        )
+            f"Config file '{path}' failed schema validation: {exc.message}"
+        ) from exc
 
-    repos: dict[str, RepoConfig] = {}
-    for _repo_key, repo_data in repos_raw.items():
-        repo_name = str(_repo_key)
-        if "/" not in repo_name:
-            raise ValueError(
-                f"Config file '{path}': repo key '{repo_name}' must be in "
-                "'org/repo' format (e.g. 'caylent-solutions/devbench')."
-            )
-        default_branch: str | None = None
-        checkout_directory: str | None = None
-        if isinstance(repo_data, dict):
-            raw_branch = repo_data.get("default_branch")
-            if raw_branch is not None:
-                if not isinstance(raw_branch, str):
-                    raise ValueError(
-                        f"Config file '{path}': repos.{repo_name}.default_branch "
-                        f"must be a string, got {type(raw_branch).__name__}."
-                    )
-                default_branch = raw_branch
+    allowed_orgs: list[str] = raw.get("allowed_orgs") or []
+    repos = _parse_repos(path, raw.get("repos") or {}, allowed_orgs)
 
-            raw_checkout = repo_data.get("checkout_directory")
-            if raw_checkout is not None:
-                if not isinstance(raw_checkout, str):
-                    raise ValueError(
-                        f"Config file '{path}': repos.{repo_name}.checkout_directory "
-                        f"must be a string, got {type(raw_checkout).__name__}."
-                    )
-                if Path(raw_checkout).is_absolute():
-                    raise ValueError(
-                        f"Config file '{path}': repos.{repo_name}.checkout_directory "
-                        f"must be a relative path, got absolute path '{raw_checkout}'."
-                    )
-                if ".." in Path(raw_checkout).parts:
-                    raise ValueError(
-                        f"Config file '{path}': repos.{repo_name}.checkout_directory "
-                        f"must not contain parent traversal ('..'), got '{raw_checkout}'."
-                    )
-                checkout_directory = raw_checkout
-        repos[repo_name] = RepoConfig(
-            default_branch=default_branch,
-            checkout_directory=checkout_directory,
-        )
+    # Populate TimeoutConfig from YAML timeouts block (absent keys yield None).
+    timeouts_raw = raw.get("timeouts") or {}
+    timeouts = TimeoutConfig(
+        gh_api=timeouts_raw.get("gh_api"),
+        test=timeouts_raw.get("test"),
+        security_fetch=timeouts_raw.get("security_fetch"),
+        llm=timeouts_raw.get("llm"),
+        command=timeouts_raw.get("command"),
+        executor=timeouts_raw.get("executor"),
+        executor_max_turns=timeouts_raw.get("executor_max_turns"),
+        orchestrator_poll_interval=timeouts_raw.get("orchestrator_poll_interval"),
+        github_check=timeouts_raw.get("github_check"),
+    )
 
-    return RuntimeConfig(repos=repos)
+    # Populate LimitConfig from YAML limits block (absent keys yield None).
+    limits_raw = raw.get("limits") or {}
+    limits = LimitConfig(
+        alert_summary=limits_raw.get("alert_summary"),
+        output_truncation=limits_raw.get("output_truncation"),
+        llm_evidence_truncation=limits_raw.get("llm_evidence_truncation"),
+        llm_file_context=limits_raw.get("llm_file_context"),
+        llm_file_preview_chars=limits_raw.get("llm_file_preview_chars"),
+    )
+
+    return RuntimeConfig(
+        repos=repos,
+        timeouts=timeouts,
+        limits=limits,
+        allowed_orgs=allowed_orgs,
+        judge_model=raw.get("judge_model") or None,
+        executor_model=raw.get("executor_model") or None,
+        use_bedrock=bool(raw.get("use_bedrock", False)),
+        bedrock_region=raw.get("bedrock_region") or None,
+        merge_strategy=raw.get("merge_strategy") or None,
+        max_retries=raw.get("max_retries") or None,
+    )
 
 
 def get_repo_local_path(repo: str, runtime_config: RuntimeConfig, workspace_root: Path) -> Path:

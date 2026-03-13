@@ -165,6 +165,7 @@ devbench/
 ├── src/devbench/                  ← Installable package (pip install -e .)
 │   ├── cli.py                     ← CLI entry point (devbench <command>)
 │   ├── config.py                  ← Environment-driven configuration (all env vars)
+│   ├── config_loader.py           ← YAML config parser and schema validator (parse/validate only — no env var access)
 │   ├── constants.py               ← Centralized structural constants (regex, formats)
 │   ├── log_setup.py               ← Dual logging (stdout + file)
 │   ├── backlog/

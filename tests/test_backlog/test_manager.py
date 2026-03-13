@@ -544,7 +544,7 @@ class TestBacklogManagerRename:
         assert callable(getattr(BacklogManager, "validate", None)), "validate must be present"
 
     def test_no_backlog_manager_judge_symbol_in_src(self) -> None:
-        """AC-5: No BacklogManagerJudge references in the three changed source files."""
+        """AC-5: No BacklogManagerJudge references in the changed source files."""
         import importlib.util
         from pathlib import Path
 
@@ -555,7 +555,6 @@ class TestBacklogManagerRename:
         checked = [
             src_root / "backlog" / "manager.py",
             src_root / "cli.py",
-            src_root / "execution" / "orchestrator.py",
         ]
         matches = [str(p) for p in checked if old_name in p.read_text(encoding="utf-8")]
         assert not matches, f"{old_name} still found in: {matches}"
@@ -571,16 +570,6 @@ class TestBacklogManagerRename:
         assert "BacklogManager" in src, "cli.py must import BacklogManager"
         assert "BacklogManagerJudge" not in src, "cli.py must not reference BacklogManagerJudge"
 
-    def test_orchestrator_imports_backlog_manager(self) -> None:
-        """AC-4: orchestrator.py source contains BacklogManager import, not BacklogManagerJudge."""
-        import importlib.util
-        from pathlib import Path
-
-        spec = importlib.util.find_spec("devbench")
-        assert spec is not None and spec.origin is not None
-        src = (Path(spec.origin).parent / "execution" / "orchestrator.py").read_text(encoding="utf-8")
-        assert "BacklogManager" in src, "orchestrator.py must import BacklogManager"
-        assert "BacklogManagerJudge" not in src, "orchestrator.py must not reference BacklogManagerJudge"
 
     def test_backlog_manager_set_status_behavior_unchanged(self, tmp_path: Path) -> None:
         """AC-6: force_status writes exact status to both files after rename."""

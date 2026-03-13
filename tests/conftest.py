@@ -1,4 +1,4 @@
-"""Shared pytest fixtures for the judges test suite."""
+"""Shared pytest fixtures for the devbench test suite."""
 
 from __future__ import annotations
 
@@ -16,10 +16,7 @@ os.environ.setdefault(
     "JUDGE_CONFIG_PATH",
     str(Path(__file__).parent / "fixtures" / "test_devbench.yaml"),
 )
-from unittest.mock import patch
-
 import pytest
-from testing import make_llm_pass_result
 
 from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
 
@@ -214,17 +211,6 @@ def sample_work_unit(tmp_path: Path) -> WorkUnit:
         acceptance_criteria=["AC-FUNC-001", "AC-TEST-001"],
         description="Sample description.",
     )
-
-
-@pytest.fixture
-def mock_llm_pass():
-    """Context manager fixture that mocks _llm_evaluate to return PASS for any judge."""
-
-    def _mock_llm_evaluate(self, system_prompt, evidence_sections, cwd=None, timeout=None):
-        return make_llm_pass_result(self.name)
-
-    with patch("devbench.judges.base.BaseJudge._llm_evaluate", _mock_llm_evaluate):
-        yield
 
 
 @pytest.fixture

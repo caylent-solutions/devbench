@@ -63,7 +63,7 @@ clean:
 	find . -type d -name .ruff_cache -exec rm -rf {} + 2>/dev/null || true
 	find . -type d -name .mypy_cache -exec rm -rf {} + 2>/dev/null || true
 
-## start: Auth GitHub, refresh token, launch backlog orchestrator in background
+## start: Auth GitHub, refresh token, launch backlog plugin in background
 start:
 	@bash scripts/start.sh
 
@@ -79,6 +79,6 @@ report:
 report-session:
 	uv run python -m devbench.cli report "$(SINCE)"
 
-## run-backlog: Execute the autonomous backlog orchestrator (foreground, assumes GH_TOKEN is set)
+## run-backlog: Run the devbench orchestrate skill via Claude Code plugin (foreground, assumes GH_TOKEN is set)
 run-backlog:
-	uv run python -m devbench.execution.orchestrator
+	claude --plugin-dir plugin/devbench "Run the devbench:orchestrate skill to process the backlog until complete"

@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# guard-bash.sh — PreToolUse hook: block destructive bash commands.
+#
+# Receives JSON on stdin with structure:
+#   { "tool_name": "Bash", "tool_input": { "command": "..." } }
+#
+# Exit 0  → command is allowed (Claude proceeds)
+# Exit 2  → command is blocked (stderr becomes Claude's feedback)
+
+set -euo pipefail
+
+INPUT=$(cat)
+COMMAND=$(printf '%s' "$INPUT" | python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('tool_input', {}).get('command', ''))" 2>/dev/null || true)
+
+if [[ -z "$COMMAND" ]]; then
+  exit 0
+fi
+
+BLOCKED_PATTERNS=(
+  "rm -rf"
+  "rm -fr"
+  "git push --force"
+  "git push -f"
+  "git reset --hard"
+  "git checkout --"
+  "git clean -f"
+  "git clean -fd"
+  "git clean -fdx"
+  "> /dev/null 2>&1 &"
+)
+
+for pattern in "${BLOCKED_PATTERNS[@]}"; do
+  if [[ "$COMMAND" == *"$pattern"* ]]; then
+    echo "guard-bash: blocked destructive command matching pattern '${pattern}'" >&2
+    echo "Command: ${COMMAND}" >&2
+    echo "Fix: use a safer alternative or request explicit approval." >&2
+    exit 2
+  fi
+done
+
+exit 0

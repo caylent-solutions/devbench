@@ -25,6 +25,12 @@ Commands::
     report [since]          Print progress report with velocity stats
     log <message>           Append a message to the orchestrator log file
 
+Plugin agent bridge commands (used by devbench plugin agents)::
+
+    read-unit <id>                          Return work unit content and repo path as JSON
+    get-diff <id>                           Return combined git diff for the work unit's repo
+    log-verdict <judge> <id> <v> [msg]      Log a judge verdict (pass|fail) to work unit Comments
+
 All commands exit 0 on success, non-zero on failure. Output is structured
 for easy parsing by Claude Code or other automation.
 """
@@ -35,7 +41,7 @@ import os
 import re
 import sys
 from collections.abc import Callable
-from datetime import UTC
+from datetime import UTC, datetime
 from pathlib import Path
 
 
@@ -60,10 +66,14 @@ from devbench.config import (
     BACKLOG_INDEX,
     BACKLOG_ROOT,
     REPO_LOCAL_PATHS,
+    RUNTIME_CONFIG,
     WORKSPACE_ROOT,
     resolve_repo,
     validate_repo,
 )
+from devbench.config_loader import get_configured_default_branch
+from devbench.constants import COMMENT_ENTRY_TEMPLATE, COMMENTS_SECTION_HEADER
+from devbench.utils.process import run_command
 from devbench.constants import (
     DISPLAY_STATUS_VALUES,
     STATUS_IN_PROGRESS,
@@ -456,6 +466,185 @@ def cmd_log(message: str) -> int:
     return 0
 
 
+def cmd_read_unit(unit_id: str) -> int:
+    """Return work unit content and resolved repo path as JSON.
+
+    Output::
+
+        {
+          "unit_id": "E0-F1-S1-T1",
+          "work_unit_path": "/abs/path/to/unit.md",
+          "repo_path": "/abs/path/to/repo",
+          "repo": "org/repo",
+          "content": "<full work unit markdown>"
+        }
+
+    Used by plugin agents to get repo context without knowing devbench.yaml.
+    """
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    unit = _find_unit(units, unit_id)
+    if unit is None:
+        print(f"ERROR: Work unit '{unit_id}' not found in backlog", file=sys.stderr)
+        return 1
+
+    wu_file = BACKLOG_ROOT / unit.file_path if not unit.file_path.is_absolute() else unit.file_path
+    if not wu_file.exists():
+        wu_file = WORKSPACE_ROOT / unit.file_path
+
+    canonical_repo = resolve_repo(unit.repo)
+    validate_repo(canonical_repo)
+    repo_path = REPO_LOCAL_PATHS.get(canonical_repo)
+    if repo_path is None:
+        print(f"ERROR: No local path configured for repo '{canonical_repo}'", file=sys.stderr)
+        return 1
+
+    content = wu_file.read_text(encoding="utf-8")
+    print(json.dumps({
+        "unit_id": unit.id,
+        "work_unit_path": str(wu_file),
+        "repo_path": str(repo_path),
+        "repo": canonical_repo,
+        "content": content,
+    }))
+    return 0
+
+
+def cmd_get_diff(unit_id: str) -> int:
+    """Return the combined git diff for the work unit's target repo.
+
+    Includes staged changes, unstaged changes, branch diff vs default branch,
+    and untracked files formatted as synthetic diff hunks.
+
+    Used by plugin agents instead of running raw git commands so they do not
+    need to know the repo path.
+    """
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    unit = _find_unit(units, unit_id)
+    if unit is None:
+        print(f"ERROR: Work unit '{unit_id}' not found in backlog", file=sys.stderr)
+        return 1
+
+    canonical_repo = resolve_repo(unit.repo)
+    validate_repo(canonical_repo)
+    repo_path = REPO_LOCAL_PATHS.get(canonical_repo)
+    if repo_path is None:
+        print(f"ERROR: No local path configured for repo '{canonical_repo}'", file=sys.stderr)
+        return 1
+
+    parts: list[str] = []
+
+    rc, stdout, _ = run_command(["git", "diff", "--cached"], cwd=repo_path)
+    if rc == 0 and stdout.strip():
+        parts.append(stdout)
+
+    rc, stdout, _ = run_command(["git", "diff"], cwd=repo_path)
+    if rc == 0 and stdout.strip():
+        parts.append(stdout)
+
+    configured = get_configured_default_branch(canonical_repo, RUNTIME_CONFIG)
+    if configured:
+        default_branch = configured
+    else:
+        rc, stdout, _ = run_command(
+            ["git", "rev-parse", "--abbrev-ref", "origin/HEAD"], cwd=repo_path,
+        )
+        if rc != 0 or not stdout.strip():
+            print(
+                f"ERROR: Cannot determine default branch for '{canonical_repo}'. "
+                "Run 'git remote set-head origin --auto' to configure it.",
+                file=sys.stderr,
+            )
+            return 1
+        default_branch = stdout.strip().removeprefix("origin/")
+
+    rc, stdout, _ = run_command(["git", "diff", default_branch], cwd=repo_path)
+    if rc == 0 and stdout.strip():
+        parts.append(stdout)
+
+    rc, stdout, _ = run_command(
+        ["git", "ls-files", "--others", "--exclude-standard"], cwd=repo_path,
+    )
+    if rc == 0 and stdout.strip():
+        for raw_filepath in stdout.splitlines():
+            filepath = raw_filepath.strip()
+            if not filepath:
+                continue
+            abs_path = repo_path / filepath
+            try:
+                file_content = abs_path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            lines = file_content.splitlines(keepends=True)
+            added = "".join(f"+{line}" for line in lines)
+            hunk = (
+                f"diff --git a/{filepath} b/{filepath}\n"
+                f"new file mode 100644\n"
+                f"--- /dev/null\n"
+                f"+++ b/{filepath}\n"
+                f"@@ -0,0 +1,{len(lines)} @@\n"
+                f"{added}"
+            )
+            parts.append(hunk)
+
+    print("\n".join(parts) if parts else "(no changes)")
+    return 0
+
+
+def cmd_log_verdict(judge_name: str, unit_id: str, verdict: str, feedback: str = "") -> int:
+    """Append a judge verdict to the work unit's Comments section and log feedback.
+
+    Arguments:
+        judge_name:  Judge identifier, e.g. ``code_review`` (matches REVIEW_JUDGE_NAMES).
+        unit_id:     Work unit ID, e.g. ``E0-F1-S1-T1``.
+        verdict:     ``pass`` or ``fail``.
+        feedback:    One-line summary of the verdict (required for ``fail``).
+
+    The entry written to the work unit uses the same format as the orchestrator:
+    ``[judge/<name>] [REVIEW_PASS|REVIEW_FAIL] <feedback>``
+
+    Feedback is also written to the orchestrator log so that ``_get_prior_feedback``
+    can retrieve it for the next execution attempt.
+    """
+    verdict_lower = verdict.strip().lower()
+    if verdict_lower not in ("pass", "fail"):
+        print(f"ERROR: verdict must be 'pass' or 'fail', got '{verdict}'", file=sys.stderr)
+        return 1
+
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    unit = _find_unit(units, unit_id)
+    if unit is None:
+        print(f"ERROR: Work unit '{unit_id}' not found in backlog", file=sys.stderr)
+        return 1
+
+    wu_file = BACKLOG_ROOT / unit.file_path if not unit.file_path.is_absolute() else unit.file_path
+    if not wu_file.exists():
+        wu_file = WORKSPACE_ROOT / unit.file_path
+
+    action = "REVIEW_PASS" if verdict_lower == "pass" else "REVIEW_FAIL"
+    agent_id = f"judge/{judge_name}"
+    timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+    entry = COMMENT_ENTRY_TEMPLATE.format(
+        timestamp=timestamp, agent_id=agent_id, action=action, message=feedback,
+    )
+
+    content = wu_file.read_text(encoding="utf-8")
+    if COMMENTS_SECTION_HEADER in content:
+        content = content.rstrip("\n") + "\n\n" + entry
+    else:
+        content = content.rstrip("\n") + "\n\n" + COMMENTS_SECTION_HEADER + "\n\n" + entry
+    wu_file.write_text(content, encoding="utf-8")
+
+    # Log feedback so _get_prior_feedback can retrieve it for the next attempt.
+    if feedback:
+        logger.info("%s judge feedback for %s: %s", judge_name, unit_id, feedback)
+
+    print(json.dumps({"unit_id": unit_id, "judge": judge_name, "verdict": verdict_lower}))
+    return 0
+
+
 def _find_unit(units: list[WorkUnit], unit_id: str) -> WorkUnit | None:
     """Find a work unit by ID (case-insensitive)."""
     for unit in units:
@@ -510,6 +699,10 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
     "validate-backlog": (cmd_validate_backlog, 0, "Validate backlog integrity"),
     "log": (cmd_log, 1, "Log a message: log <message>"),
     "report": (cmd_report, 0, "Progress report: report [since-timestamp]"),
+    # Plugin agent bridge commands — used by devbench plugin agents
+    "read-unit": (cmd_read_unit, 1, "Return work unit content and repo path as JSON: read-unit <id>"),
+    "get-diff": (cmd_get_diff, 1, "Return combined git diff for work unit's repo: get-diff <id>"),
+    "log-verdict": (cmd_log_verdict, 3, "Log judge verdict: log-verdict <judge> <id> <pass|fail> [feedback]"),
 }
 
 

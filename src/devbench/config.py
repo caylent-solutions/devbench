@@ -154,12 +154,6 @@ LLM_FILE_CONTEXT_LIMIT: int = int(os.environ.get("JUDGE_LLM_FILE_CONTEXT_LIMIT",
 LLM_FILE_PREVIEW_CHARS: int = int(os.environ.get("JUDGE_LLM_FILE_PREVIEW_CHARS", "3000"))
 
 # ---------------------------------------------------------------------------
-# Claude executor
-# ---------------------------------------------------------------------------
-EXECUTOR_TIMEOUT: int = int(os.environ.get("JUDGE_EXECUTOR_TIMEOUT", "1800"))
-EXECUTOR_MAX_TURNS: int = int(os.environ.get("JUDGE_EXECUTOR_MAX_TURNS", "50"))
-
-# ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 ORCHESTRATOR_POLL_INTERVAL: int = int(os.environ.get("JUDGE_ORCHESTRATOR_POLL_INTERVAL", "10"))

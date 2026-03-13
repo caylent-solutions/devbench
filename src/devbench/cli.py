@@ -1,7 +1,7 @@
-"""CLI entry point for the judges system.
+"""CLI entry point for the devbench system.
 
 Provides shell-callable commands so Claude Code (or any external process)
-can invoke judge operations, query backlog status, and execute work units.
+can query backlog status, execute work units, and bridge plugin agents to repo context.
 
 Usage::
 
@@ -17,8 +17,6 @@ Commands::
     status                  Show backlog summary (counts by status)
     next                    Print the next actionable work unit ID and title
     execute <id>            Spawn a Claude Code agent to execute a work unit
-    review <id>             Run all review judges on a work unit, print JSON results
-    security-review <id>    Run the security review judge on a work unit
     set-status <id> <s>     Force any status (no gate — use for recovery/lifecycle transitions)
     mark-done <id>          Mark unit as Done (enforces done-gate: all judges must have passed)
     validate-backlog        Check backlog integrity (file existence, status sync, orphans, deps)
@@ -29,6 +27,7 @@ Plugin agent bridge commands (used by devbench plugin agents)::
 
     read-unit <id>                          Return work unit content and repo path as JSON
     get-diff <id>                           Return combined git diff for the work unit's repo
+    run-tests <id>                          Run test suite for the work unit's repo
     log-verdict <judge> <id> <v> [msg]      Log a judge verdict (pass|fail) to work unit Comments
 
 All commands exit 0 on success, non-zero on failure. Output is structured
@@ -38,7 +37,6 @@ for easy parsing by Claude Code or other automation.
 import json
 import logging
 import os
-import re
 import sys
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -72,21 +70,15 @@ from devbench.config import (
     validate_repo,
 )
 from devbench.config_loader import get_configured_default_branch
-from devbench.constants import COMMENT_ENTRY_TEMPLATE, COMMENTS_SECTION_HEADER
-from devbench.utils.process import run_command
 from devbench.constants import (
+    COMMENT_ENTRY_TEMPLATE,
+    COMMENTS_SECTION_HEADER,
     DISPLAY_STATUS_VALUES,
     STATUS_IN_PROGRESS,
-    STATUS_IN_REVIEW,
     STATUS_SEPARATOR_WIDTH,
 )
-from devbench.judges.base import Verdict
-from devbench.judges.changes_manifest import ChangesManifestJudge
-from devbench.judges.code_review import CodeReviewJudge
-from devbench.judges.doc_review import DocReviewJudge
-from devbench.judges.security_review import SecurityReviewJudge
-from devbench.judges.test_review import TestReviewJudge
 from devbench.log_setup import setup_logging
+from devbench.utils.process import run_command
 
 logger = logging.getLogger("devbench.cli")
 
@@ -205,152 +197,6 @@ def cmd_execute(unit_id: str, feedback: str = "") -> int:
     }
     print(json.dumps(output))
     return 0 if result.status.value == "in-review" else 1
-
-
-def cmd_review(unit_id: str) -> int:
-    """Run all review judges on a work unit and print JSON results."""
-    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
-    units = parser.parse_index()
-
-    target = _find_unit(units, unit_id)
-    if target is None:
-        print(f"ERROR: Work unit '{unit_id}' not found in backlog", file=sys.stderr)
-        return 1
-
-    full_repo = resolve_repo(target.repo)
-    validate_repo(full_repo)
-    repo_path = REPO_LOCAL_PATHS.get(full_repo)
-    if repo_path is None:
-        print(f"ERROR: No local path for repo '{target.repo}'", file=sys.stderr)
-        return 1
-
-    wu_file = BACKLOG_ROOT / target.file_path if not target.file_path.is_absolute() else target.file_path
-    if not wu_file.exists():
-        wu_file = WORKSPACE_ROOT / target.file_path
-
-    # Resolve file_path to the absolute path so log_comment writes to the right file
-    target.file_path = wu_file
-
-    # Automatically mark as in-review in both files
-    mgr = BacklogManager()
-    mgr.force_status(wu_file, BACKLOG_INDEX, unit_id, STATUS_IN_REVIEW)
-    logger.info("Set %s to in-review", unit_id)
-
-    judges = [
-        CodeReviewJudge(),
-        TestReviewJudge(),
-        DocReviewJudge(),
-        ChangesManifestJudge(),
-    ]
-
-    results: list[dict[str, object]] = []
-    all_passed = True
-
-    prior_feedback = _get_prior_feedback(unit_id)
-
-    for judge in judges:
-        judge.previous_feedback = prior_feedback.get(judge.name, "")
-        logger.info("Running %s judge on %s", judge.name, unit_id)
-        judge_result = judge.evaluate(work_unit_path=wu_file, repo_path=repo_path, repo=full_repo)
-        passed = judge_result.verdict == Verdict.PASS
-        if not passed:
-            all_passed = False
-
-        # Write judge verdict comment to the work-unit file so mark_done can verify all judges passed
-        if passed:
-            target.log_comment(
-                agent_id=f"judge/{judge.name}",
-                action="REVIEW_PASS",
-                message=judge_result.reasoning,
-            )
-        else:
-            target.log_comment(
-                agent_id=f"judge/{judge.name}",
-                action="REVIEW_FAIL",
-                message=f"{judge_result.reasoning} | Fix: {judge_result.feedback}",
-            )
-
-        logger.info(
-            "%s judge verdict for %s: %s", judge.name, unit_id, judge_result.verdict.value,
-        )
-        if not passed:
-            logger.info(
-                "%s judge reasoning for %s: %s", judge.name, unit_id, judge_result.reasoning,
-            )
-            logger.info(
-                "%s judge feedback for %s: %s", judge.name, unit_id, judge_result.feedback[:2000],
-            )
-        if judge_result.evidence:
-            logger.info(
-                "%s judge evidence for %s: %s", judge.name, unit_id, "; ".join(judge_result.evidence),
-            )
-
-        results.append(
-            {
-                "judge": judge.name,
-                "verdict": judge_result.verdict.value,
-                "reasoning": judge_result.reasoning,
-                "feedback": judge_result.feedback,
-                "evidence": judge_result.evidence,
-            }
-        )
-
-    passed_names = [str(r["judge"]) for r in results if r["verdict"] == "pass"]
-    failed_names = [str(r["judge"]) for r in results if r["verdict"] == "fail"]
-    logger.info(
-        "Review complete for %s: %s. Passed: [%s] Failed: [%s]",
-        unit_id,
-        "ALL PASSED" if all_passed else "FAILED",
-        ", ".join(passed_names),
-        ", ".join(failed_names),
-    )
-
-    output = {
-        "unit_id": unit_id,
-        "all_passed": all_passed,
-        "results": results,
-    }
-    print(json.dumps(output, indent=2))
-    return 0 if all_passed else 1
-
-
-def cmd_security_review(unit_id: str) -> int:
-    """Run the security review judge on a work unit."""
-    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
-    units = parser.parse_index()
-
-    target = _find_unit(units, unit_id)
-    if target is None:
-        print(f"ERROR: Work unit '{unit_id}' not found in backlog", file=sys.stderr)
-        return 1
-
-    full_repo = resolve_repo(target.repo)
-    validate_repo(full_repo)
-    repo_path = REPO_LOCAL_PATHS.get(full_repo)
-    if repo_path is None:
-        print(f"ERROR: No local path for repo '{target.repo}'", file=sys.stderr)
-        return 1
-
-    wu_file = BACKLOG_ROOT / target.file_path if not target.file_path.is_absolute() else target.file_path
-    if not wu_file.exists():
-        wu_file = WORKSPACE_ROOT / target.file_path
-
-    judge = SecurityReviewJudge()
-    logger.info("Running security_review judge on %s", unit_id)
-    result = judge.evaluate(work_unit_path=wu_file, repo_path=repo_path, repo=full_repo)
-    logger.info("security_review verdict for %s: %s", unit_id, result.verdict.value)
-    if result.verdict != Verdict.PASS:
-        logger.info("security_review feedback for %s: %s", unit_id, result.feedback[:500])
-
-    output = {
-        "judge": "security_review",
-        "verdict": result.verdict.value,
-        "reasoning": result.reasoning,
-        "feedback": result.feedback,
-        "evidence": result.evidence,
-    }
-    print(json.dumps(output, indent=2))
-    return 0 if result.verdict == Verdict.PASS else 1
 
 
 def cmd_set_status(unit_id: str, new_status: str) -> int:
@@ -592,6 +438,39 @@ def cmd_get_diff(unit_id: str) -> int:
     return 0
 
 
+def cmd_run_tests(unit_id: str) -> int:
+    """Run the test suite for the work unit's target repo and return the output.
+
+    Uses ``make test`` when the repo has a Makefile with a ``test`` target,
+    otherwise falls back to ``pytest``.  Exits non-zero if the test run fails.
+
+    Used by the test-reviewer agent to obtain test execution evidence.
+    """
+    from devbench.config import TEST_TIMEOUT
+
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    unit = _find_unit(units, unit_id)
+    if unit is None:
+        print(f"ERROR: Work unit '{unit_id}' not found in backlog", file=sys.stderr)
+        return 1
+
+    canonical_repo = resolve_repo(unit.repo)
+    validate_repo(canonical_repo)
+    repo_path = REPO_LOCAL_PATHS.get(canonical_repo)
+    if repo_path is None:
+        print(f"ERROR: No local path configured for repo '{canonical_repo}'", file=sys.stderr)
+        return 1
+
+    rc, stdout, _ = run_command(["make", "-n", "test"], cwd=repo_path)
+    cmd = ["make", "test"] if rc == 0 else ["pytest", "--no-header", "-q", "-p", "no:cacheprovider"]
+
+    rc, stdout, stderr = run_command(cmd, cwd=repo_path, timeout=TEST_TIMEOUT)
+    combined = "\n".join(part for part in (stdout, stderr) if part.strip())
+    print(combined if combined else "(no output)")
+    return rc
+
+
 def cmd_log_verdict(judge_name: str, unit_id: str, verdict: str, feedback: str = "") -> int:
     """Append a judge verdict to the work unit's Comments section and log feedback.
 
@@ -653,47 +532,11 @@ def _find_unit(units: list[WorkUnit], unit_id: str) -> WorkUnit | None:
     return None
 
 
-def _get_prior_feedback(unit_id: str) -> dict[str, str]:
-    """Extract the most recent review feedback per judge from the orchestrator log.
-
-    Parses log lines matching the pattern::
-
-        <timestamp> [judges.cli] INFO <judge_name> judge feedback for <unit_id>: <text>
-
-    Returns a dict mapping judge name to its most recent feedback string.
-    Only the last feedback entry per judge is kept (most recent review round).
-    """
-    log_file = Path(os.environ.get(
-        "JUDGE_LOG_FILE",
-        str(Path(__file__).resolve().parent / "logs" / "orchestrator.log"),
-    ))
-    if not log_file.exists():
-        return {}
-
-    pattern = re.compile(
-        rf"(\S+) judge feedback for {re.escape(unit_id)}: (.+)",
-    )
-
-    marker = f" judge feedback for {unit_id}: "
-    feedback: dict[str, str] = {}
-    for line in log_file.read_text(encoding="utf-8").splitlines():
-        if marker not in line:
-            continue
-        match = pattern.search(line)
-        if match:
-            judge_name = match.group(1)
-            feedback[judge_name] = match.group(2)
-
-    return feedback
-
-
 # Command registry: name -> (handler, min_args, description)
 _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
     "status": (cmd_status, 0, "Show backlog summary"),
     "next": (cmd_next, 0, "Print next actionable work unit"),
     "execute": (cmd_execute, 1, "Execute a work unit: execute <id> [feedback]"),
-    "review": (cmd_review, 1, "Review a work unit: review <id>"),
-    "security-review": (cmd_security_review, 1, "Security review: security-review <id>"),
     "set-status": (cmd_set_status, 2, "Set status: set-status <id> <status>"),
     "mark-done": (cmd_mark_done, 1, "Mark done: mark-done <id>"),
     "validate-backlog": (cmd_validate_backlog, 0, "Validate backlog integrity"),
@@ -702,6 +545,7 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
     # Plugin agent bridge commands — used by devbench plugin agents
     "read-unit": (cmd_read_unit, 1, "Return work unit content and repo path as JSON: read-unit <id>"),
     "get-diff": (cmd_get_diff, 1, "Return combined git diff for work unit's repo: get-diff <id>"),
+    "run-tests": (cmd_run_tests, 1, "Run test suite for work unit's repo: run-tests <id>"),
     "log-verdict": (cmd_log_verdict, 3, "Log judge verdict: log-verdict <judge> <id> <pass|fail> [feedback]"),
 }
 

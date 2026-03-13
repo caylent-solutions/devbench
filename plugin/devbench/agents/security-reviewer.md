@@ -1,7 +1,7 @@
 ---
 name: security-reviewer
 description: Reviews security posture against SOC 2, PCI DSS, FINRA, SEC, GDPR, CCPA, and SOX standards. Invoke with a work unit ID (e.g. E0-F1-S1-T1).
-model: haiku
+model: sonnet
 tools: Bash
 disallowedTools: Write, Edit, Read, Glob, Grep
 ---

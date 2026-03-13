@@ -1,7 +1,7 @@
 ---
 name: blocker-resolver
 description: Analyzes blockers in a work unit and proposes compliant resolutions or escalation paths. Invoke with a work unit ID (e.g. E0-F1-S1-T1).
-model: haiku
+model: sonnet
 tools: Bash
 disallowedTools: Write, Edit, Read, Glob, Grep
 ---

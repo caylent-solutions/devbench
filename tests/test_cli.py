@@ -1,4 +1,4 @@
-"""Tests for judges.cli module."""
+"""Tests for devbench.cli module."""
 
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ import pytest
 from devbench import cli
 from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
 from devbench.constants import BACKLOG_SUBDIR
-from devbench.judges.base import JudgeResult, Verdict
 
 
 @pytest.fixture
@@ -175,58 +174,6 @@ class TestCmdLog:
         assert "Logged" in capsys.readouterr().out
 
 
-class TestCmdReview:
-    """Test cmd_review command."""
-
-    def test_returns_1_when_unit_not_found(self, mock_units: list[WorkUnit]) -> None:
-        mock_parser = MagicMock()
-        mock_parser.parse_index.return_value = mock_units
-
-        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
-            result = cli.cmd_review("NONEXISTENT")
-
-        assert result == 1
-
-    def test_returns_0_when_all_pass(
-        self, mock_units: list[WorkUnit], tmp_path: Path, backlog_dir: Path, capsys: pytest.CaptureFixture
-    ) -> None:
-        wu_file = backlog_dir / "E0-F1-S1-T2.md"
-        wu_file.write_text("# E0-F1-S1-T2: Task\n## Status: in-review\n")
-
-        mock_parser = MagicMock()
-        mock_parser.parse_index.return_value = mock_units
-
-        pass_result = JudgeResult(
-            judge_name="test",
-            verdict=Verdict.PASS,
-            reasoning="ok",
-            feedback="",
-            evidence=[],
-        )
-        mock_judge = MagicMock()
-        mock_judge.name = "mock_judge"
-        mock_judge.evaluate.return_value = pass_result
-
-        mock_mgr = MagicMock()
-
-        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
-            with patch("devbench.cli.BACKLOG_ROOT", backlog_dir):
-                with patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
-                    with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
-                        with patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
-                            with patch("devbench.cli.BacklogManager", return_value=mock_mgr):
-                                with patch("devbench.cli.CodeReviewJudge", return_value=mock_judge):
-                                    with patch("devbench.cli.TestReviewJudge", return_value=mock_judge):
-                                        with patch("devbench.cli.DocReviewJudge", return_value=mock_judge):
-                                            with patch("devbench.cli.ChangesManifestJudge", return_value=mock_judge):
-                                                result = cli.cmd_review("E0-F1-S1-T2")
-
-        assert result == 0
-        mock_mgr.force_status.assert_called_once()
-        output = json.loads(capsys.readouterr().out)
-        assert output["all_passed"] is True
-
-
 class TestCmdExecute:
     """Test cmd_execute command."""
 
@@ -276,58 +223,6 @@ class TestCmdExecute:
                     result = cli.cmd_execute("E0-F1-S1-T2")
 
         assert result == 1
-
-
-class TestCmdSecurityReview:
-    """Test cmd_security_review command."""
-
-    def test_returns_1_when_unit_not_found(self, mock_units: list[WorkUnit]) -> None:
-        mock_parser = MagicMock()
-        mock_parser.parse_index.return_value = mock_units
-
-        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
-            result = cli.cmd_security_review("NONEXISTENT")
-
-        assert result == 1
-
-    def test_returns_1_when_no_repo_path(self, mock_units: list[WorkUnit]) -> None:
-        mock_parser = MagicMock()
-        mock_parser.parse_index.return_value = mock_units
-
-        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
-            with patch("devbench.cli.REPO_LOCAL_PATHS", {}):
-                result = cli.cmd_security_review("E0-F1-S1-T2")
-
-        assert result == 1
-
-    def test_returns_0_when_pass(
-        self, mock_units: list[WorkUnit], tmp_path: Path, backlog_dir: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        wu_file = backlog_dir / "E0-F1-S1-T2.md"
-        wu_file.write_text("# Task\n")
-
-        mock_parser = MagicMock()
-        mock_parser.parse_index.return_value = mock_units
-
-        pass_result = JudgeResult(
-            judge_name="security_review",
-            verdict=Verdict.PASS,
-            reasoning="clean",
-            feedback="",
-            evidence=[],
-        )
-        mock_judge = MagicMock()
-        mock_judge.evaluate.return_value = pass_result
-
-        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
-            with patch("devbench.cli.BACKLOG_ROOT", backlog_dir):
-                with patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
-                    with patch("devbench.cli.SecurityReviewJudge", return_value=mock_judge):
-                        result = cli.cmd_security_review("E0-F1-S1-T2")
-
-        assert result == 0
-        output = json.loads(capsys.readouterr().out)
-        assert output["verdict"] == "pass"
 
 
 class TestCmdSetStatus:
@@ -418,173 +313,6 @@ class TestCmdMarkDone:
 
         assert result == 1
         assert "not all required judges passed" in capsys.readouterr().err
-
-
-class TestCmdReviewNoRepoPath:
-    """Test cmd_review when repo path is missing."""
-
-    def test_returns_1_when_no_repo_path(self, mock_units: list[WorkUnit]) -> None:
-        mock_parser = MagicMock()
-        mock_parser.parse_index.return_value = mock_units
-
-        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
-            with patch("devbench.cli.REPO_LOCAL_PATHS", {}):
-                result = cli.cmd_review("E0-F1-S1-T2")
-
-        assert result == 1
-
-
-class TestGetPriorFeedback:
-    """Test _get_prior_feedback parses orchestrator log for previous review feedback."""
-
-    def test_returns_empty_when_no_log(self, tmp_path: Path) -> None:
-        with patch.dict("os.environ", {"JUDGE_LOG_FILE": str(tmp_path / "missing.log")}):
-            result = cli._get_prior_feedback("E0-F1-S1-T1")
-        assert result == {}
-
-    def test_extracts_feedback_per_judge(self, tmp_path: Path) -> None:
-        log_file = tmp_path / "test.log"
-        log_file.write_text(
-            "2026-03-05T05:22:05Z [judges.cli] INFO code_review judge feedback for E0-F1-S1-T1: Fix the timeout\n"
-            "2026-03-05T05:22:31Z [judges.cli] INFO test_review judge feedback for E0-F1-S1-T1: Add assertions\n"
-        )
-        with patch.dict("os.environ", {"JUDGE_LOG_FILE": str(log_file)}):
-            result = cli._get_prior_feedback("E0-F1-S1-T1")
-        assert result["code_review"] == "Fix the timeout"
-        assert result["test_review"] == "Add assertions"
-
-    def test_keeps_only_latest_feedback(self, tmp_path: Path) -> None:
-        log_file = tmp_path / "test.log"
-        log_file.write_text(
-            "2026-03-05T05:00:00Z [judges.cli] INFO code_review judge feedback for E0-T1: Old feedback\n"
-            "2026-03-05T06:00:00Z [judges.cli] INFO code_review judge feedback for E0-T1: New feedback\n"
-        )
-        with patch.dict("os.environ", {"JUDGE_LOG_FILE": str(log_file)}):
-            result = cli._get_prior_feedback("E0-T1")
-        assert result["code_review"] == "New feedback"
-
-    def test_ignores_other_unit_ids(self, tmp_path: Path) -> None:
-        log_file = tmp_path / "test.log"
-        log_file.write_text(
-            "2026-03-05T05:00:00Z [judges.cli] INFO code_review judge feedback for E0-T1: Relevant\n"
-            "2026-03-05T05:00:00Z [judges.cli] INFO code_review judge feedback for E0-T2: Irrelevant\n"
-        )
-        with patch.dict("os.environ", {"JUDGE_LOG_FILE": str(log_file)}):
-            result = cli._get_prior_feedback("E0-T1")
-        assert result["code_review"] == "Relevant"
-        assert "E0-T2" not in str(result)
-
-
-class TestCmdReviewWritesComments:
-    """Bug fix: cmd_review must write REVIEW_PASS/REVIEW_FAIL comments to work-unit file.
-
-    Previously cmd_review only logged to the orchestrator log; it never wrote
-    judge comments to the work-unit file.  That made mark_done (which reads
-    [REVIEW_PASS] entries from the file) always fail after a successful review.
-    """
-
-    def _make_pass_result(self, judge_name: str) -> JudgeResult:
-        return JudgeResult(
-            judge_name=judge_name,
-            verdict=Verdict.PASS,
-            reasoning="all good",
-            feedback="",
-            evidence=[],
-        )
-
-    def test_cmd_review_writes_review_pass_comments_for_all_judges(
-        self, mock_units: list[WorkUnit], tmp_path: Path, backlog_dir: Path
-    ) -> None:
-        wu_file = backlog_dir / "E0-F1-S1-T2.md"
-        wu_file.write_text("# E0-F1-S1-T2: Task\n\n## Status: in-review\n", encoding="utf-8")
-
-        judge_names = ["code_review", "test_review", "doc_review", "changes_manifest"]
-        mock_judges = []
-        for name in judge_names:
-            m = MagicMock()
-            m.name = name
-            m.previous_feedback = ""
-            m.evaluate.return_value = self._make_pass_result(name)
-            mock_judges.append(m)
-
-        mock_parser = MagicMock()
-        mock_parser.parse_index.return_value = mock_units
-        mock_mgr = MagicMock()
-
-        with (
-            patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
-            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
-            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
-            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
-            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
-            patch("devbench.cli.CodeReviewJudge", return_value=mock_judges[0]),
-            patch("devbench.cli.TestReviewJudge", return_value=mock_judges[1]),
-            patch("devbench.cli.DocReviewJudge", return_value=mock_judges[2]),
-            patch("devbench.cli.ChangesManifestJudge", return_value=mock_judges[3]),
-            patch("devbench.cli.resolve_repo", return_value="caylent-solutions/git-repo"),
-            patch("devbench.cli.validate_repo"),
-        ):
-            result = cli.cmd_review("E0-F1-S1-T2")
-
-        assert result == 0
-        content = wu_file.read_text(encoding="utf-8")
-        assert "[REVIEW_PASS]" in content
-        for name in judge_names:
-            assert f"[judge/{name}]" in content
-
-    def test_review_then_mark_done_succeeds(
-        self, mock_units: list[WorkUnit], tmp_path: Path, backlog_dir: Path
-    ) -> None:
-        """Full flow: review writes comments, mark_done reads them and succeeds."""
-        from devbench.backlog.manager import BacklogManager as RealMgr
-
-        wu_file = backlog_dir / "E0-F1-S1-T2.md"
-        wu_file.write_text("# E0-F1-S1-T2: Task\n\n## Status: in-review\n", encoding="utf-8")
-
-        backlog_index = tmp_path / "BACKLOG.md"
-        backlog_index.write_text(
-            "# Backlog\n\n"
-            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
-            "|-----|-------|------|--------|-------------|------|-----------|\n"
-            "| E0-F1-S1-T2 | Second Task | Task | in-review | none | repo |"
-            " `backlog/E0-F1-S1-T2.md` |\n",
-            encoding="utf-8",
-        )
-
-        judge_names = ["code_review", "test_review", "doc_review", "changes_manifest"]
-        mock_judges = []
-        for name in judge_names:
-            m = MagicMock()
-            m.name = name
-            m.previous_feedback = ""
-            m.evaluate.return_value = self._make_pass_result(name)
-            mock_judges.append(m)
-
-        mock_parser = MagicMock()
-        mock_parser.parse_index.return_value = mock_units
-
-        with (
-            patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
-            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
-            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
-            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
-            patch("devbench.cli.CodeReviewJudge", return_value=mock_judges[0]),
-            patch("devbench.cli.TestReviewJudge", return_value=mock_judges[1]),
-            patch("devbench.cli.DocReviewJudge", return_value=mock_judges[2]),
-            patch("devbench.cli.ChangesManifestJudge", return_value=mock_judges[3]),
-            patch("devbench.cli.resolve_repo", return_value="caylent-solutions/git-repo"),
-            patch("devbench.cli.validate_repo"),
-        ):
-            review_result = cli.cmd_review("E0-F1-S1-T2")
-
-        assert review_result == 0
-
-        # After review, mark_done must succeed (gate passes because comments were written)
-        real_mgr = RealMgr()
-        real_mgr.mark_done(wu_file, backlog_index, "E0-F1-S1-T2")
-        assert "## Status: done" in wu_file.read_text(encoding="utf-8")
 
 
 class TestCmdValidateBacklogPathResolution:

@@ -443,6 +443,125 @@ class TestRollupMissingParent:
             pytest.fail("E0-F1-S1 story row not found in BACKLOG.md")
 
 
+class TestUpdateBacklogIndexStatusSummary:
+    """Tests for _update_backlog_index() when a Status Summary row precedes the index row.
+
+    The crash scenario: BACKLOG.md contains a Status Summary section (e.g.
+    ``| E24 | Git Ops Branch Hygiene | 1 | 1 | 2 | 5 | 0 | 0 | 0 | 5 |``) that
+    appears before the Full Work Unit Index row (e.g.
+    ``| E24 | ... | Epic | in-queue | ... |``).
+
+    ``_update_backlog_index`` scans lines for a row whose first ID cell matches
+    the target ID.  The Status Summary row matches the ID but contains only
+    integer count cells — none of which are recognized statuses.  The old code
+    unconditionally wrote the (unmodified) line back and broke out of the loop,
+    leaving ``updated=False`` and raising ``ValueError``.
+
+    The fix: only ``break`` from the scan when a recognized status cell was
+    actually found and replaced (i.e., ``updated=True``).  If the matching row
+    has no recognized status cell, continue scanning.
+    """
+
+    def _make_index_with_status_summary(self, tmp_path: Path, backlog_dir: Path) -> tuple[Path, Path]:
+        """Build a BACKLOG.md where a Status Summary row for E9 precedes the index row.
+
+        The Status Summary row has integer cells only (no recognized status value).
+        The Full Work Unit Index row has the real ``in-queue`` status that must be updated.
+        """
+        content = """\
+# Backlog
+
+## Status Summary
+
+| Epic | Title | Features | Stories | Tasks | Total | Done | In Progress | In Review | In Queue |
+|------|-------|----------|---------|-------|-------|------|-------------|-----------|----------|
+| E9 | Config Schema | 1 | 2 | 8 | 12 | 7 | 0 | 0 | 5 |
+
+## Full Work Unit Index
+
+| ID | Title | Type | Status | Dependencies | Repo | File Path |
+|-----|-------|------|--------|-------------|------|-----------|
+| E9 | Config Schema | Epic | in-queue | None | devbench | `backlog/E9.md` |
+"""
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(content)
+
+        epic_file = backlog_dir / "E9.md"
+        epic_file.write_text("# E9\n\n## Status: in-queue\n")
+
+        return index_path, epic_file
+
+    def test_update_backlog_index_skips_status_summary_row(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """_update_backlog_index must skip the Status Summary row and update the index row.
+
+        Given: A BACKLOG.md with a Status Summary row for E9 appearing before the
+               Full Work Unit Index row for E9
+        When: _update_backlog_index is called to set E9 status to 'done'
+        Then: The Full Work Unit Index row is updated to 'done'
+              The Status Summary row is left unchanged (integers intact)
+              No ValueError is raised
+        Spec: manager.py:_update_backlog_index
+        """
+        index_path, _ = self._make_index_with_status_summary(tmp_path, backlog_dir)
+
+        manager = BacklogManager()
+        # Must not raise even though the Status Summary row matches E9 first
+        manager._update_backlog_index(index_path, "E9", "done")
+
+        updated = index_path.read_text(encoding="utf-8")
+        lines = updated.splitlines()
+
+        # The Full Work Unit Index row must now show 'done'
+        index_row = next(
+            (l for l in lines if "| E9 |" in l and "Epic" in l),
+            None,
+        )
+        assert index_row is not None, "Full Work Unit Index row for E9 not found"
+        assert " done " in index_row, (
+            f"Expected 'done' in index row but got: {index_row!r}"
+        )
+
+        # The Status Summary row must be unchanged (integers, no status keyword injected)
+        summary_row = next(
+            (l for l in lines if "| E9 |" in l and "Config Schema" in l and "Epic" not in l),
+            None,
+        )
+        assert summary_row is not None, "Status Summary row for E9 not found"
+        assert "done" not in summary_row, (
+            f"Status Summary row must not be modified but got: {summary_row!r}"
+        )
+
+    def test_update_backlog_index_no_status_summary_still_works(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """_update_backlog_index works correctly when no Status Summary section exists.
+
+        Given: A BACKLOG.md with only a Full Work Unit Index (no Status Summary)
+        When: _update_backlog_index is called
+        Then: The index row is updated correctly and no exception is raised
+        Spec: manager.py:_update_backlog_index
+        """
+        content = """\
+# Backlog
+
+## Full Work Unit Index
+
+| ID | Title | Type | Status | Dependencies | Repo | File Path |
+|-----|-------|------|--------|-------------|------|-----------|
+| E9 | Config Schema | Epic | in-queue | None | devbench | `backlog/E9.md` |
+"""
+        index_path = tmp_path / "BACKLOG2.md"
+        index_path.write_text(content)
+
+        manager = BacklogManager()
+        manager._update_backlog_index(index_path, "E9", "done")
+
+        updated = index_path.read_text(encoding="utf-8")
+        assert " done " in updated, "Index row must be updated to 'done'"
+
+
 class TestLogToTraceabilityMatrix:
     """Test traceability matrix logging."""
 

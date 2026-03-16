@@ -22,10 +22,11 @@ DEVBENCH_ROOT="$(dirname "$SCRIPT_DIR")"
 LOG_FILE="${JUDGE_LOG_FILE:-/tmp/backlog-run.log}"
 TOKEN_FILE="${JUDGE_GH_TOKEN_FILE:-${HOME}/.gh_token_env}"
 
-# Source cached token if available (persists across terminals)
+# Load cached token if available (persists across terminals)
+# TOKEN_FILE contains a bare token (no shell syntax) — read directly.
 if [[ -z "${GH_TOKEN:-}" && -f "$TOKEN_FILE" ]]; then
-    # shellcheck source=/dev/null
-    source "$TOKEN_FILE"
+    GH_TOKEN="$(cat "$TOKEN_FILE")"
+    export GH_TOKEN
 fi
 
 # Scopes are minimized to only what's needed.
@@ -47,7 +48,7 @@ done
 if [[ -n "${GH_TOKEN:-}" ]]; then
     echo "=== Step 1: Using pre-configured GH_TOKEN ==="
     echo "Skipping gh auth (GH_TOKEN already set)."
-    echo "export GH_TOKEN=\"${GH_TOKEN}\"" > "$TOKEN_FILE"
+    echo "${GH_TOKEN}" > "$TOKEN_FILE"
     echo "Token written to $TOKEN_FILE"
 else
     echo "=== Step 1: GitHub Authentication ==="
@@ -62,7 +63,7 @@ else
         GH_TOKEN="$(gh auth token)"
     fi
 
-    echo "export GH_TOKEN=\"${GH_TOKEN}\"" > "$TOKEN_FILE"
+    echo "${GH_TOKEN}" > "$TOKEN_FILE"
     export GH_TOKEN
     echo "Token written to $TOKEN_FILE"
 fi
@@ -74,7 +75,7 @@ while true; do
     sleep 14400
     unset GH_TOKEN
     gh auth refresh -h github.com ${scope_flags[*]} 2>/dev/null || true
-    echo \"export GH_TOKEN=\\\"\$(gh auth token)\\\"\" > $TOKEN_FILE
+    gh auth token > $TOKEN_FILE
     echo \"[\$(date -u +%Y-%m-%dT%H:%M:%SZ)] token refreshed\" >> ${JUDGE_LOG_FILE:-/tmp/backlog-run.log}.token-refresh
 done
 " >/dev/null 2>&1 &
@@ -84,7 +85,7 @@ echo "Token refresher PID: $REFRESHER_PID"
 echo ""
 echo "=== Step 5: Launching backlog orchestrator ==="
 nohup bash -c "
-source $TOKEN_FILE
+export GH_TOKEN=\$(cat $TOKEN_FILE)
 cd $DEVBENCH_ROOT
 uv run python -m devbench.execution.orchestrator
 " > "$LOG_FILE" 2>&1 &

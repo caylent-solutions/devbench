@@ -491,3 +491,59 @@ class TestCmdGitOpsSubmoduleGate:
             repo_path,
             "chore: update devbench submodule after E202-F1-S1-T3",
         )
+
+
+@pytest.mark.unit
+class TestCmdEnsureBranch:
+    """Tests for cmd_ensure_branch (T1 AC-1)."""
+
+    def _make_unit(self) -> WorkUnit:
+        return WorkUnit(
+            id="E202-F1-S1-T1",
+            title="ensure_branch task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E202-F1-S1-T1.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+
+    def test_cmd_ensure_branch_calls_git_ops(self, tmp_path: Path) -> None:
+        """
+        Given: a valid work unit ID
+        When: cmd_ensure_branch is called
+        Then: GitOpsJudge.ensure_branch is called with the correct repo, path, and branch (AC-1)
+        """
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        mock_ops = MagicMock()
+        repo_path = tmp_path / "devbench"
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
+            patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+        ):
+            result = cli.cmd_ensure_branch("E202-F1-S1-T1")
+
+        assert result == 0
+        mock_ops.ensure_branch.assert_called_once_with(
+            "caylent-solutions/devbench",
+            repo_path,
+            "backlog/e202-f1-s1-t1",
+        )
+
+    def test_cmd_ensure_branch_returns_1_when_unit_not_found(self) -> None:
+        """
+        Given: a unit ID not in the backlog
+        When: cmd_ensure_branch is called
+        Then: returns 1
+        """
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = []
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_ensure_branch("NONEXISTENT")
+
+        assert result == 1

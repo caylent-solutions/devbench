@@ -19,6 +19,7 @@ Commands::
     set-status <id> <s>     Force any status (no gate — use for recovery/lifecycle transitions)
     mark-done <id>          Mark unit as Done (enforces done-gate: all judges must have passed)
     validate-backlog        Check backlog integrity (file existence, status sync, orphans, deps)
+    ensure-branch <id>      Create or switch to work unit branch before executor runs
     git-ops <id>            Run full git operations sequence for a completed work unit
     report [since]          Print progress report with velocity stats
     log <message>           Append a message to the orchestrator log file
@@ -486,6 +487,39 @@ def cmd_log_verdict(judge_name: str, unit_id: str, verdict: str, feedback: str =
     return 0
 
 
+def cmd_ensure_branch(unit_id: str) -> int:
+    """Create or switch to the feature branch for a work unit before executor runs.
+
+    Derives the branch name from the work unit ID (``backlog/<id-lower>``) and
+    calls :meth:`~devbench.github.git_ops.GitOpsJudge.ensure_branch` to switch
+    to it, stashing and popping if the working tree is dirty.
+
+    Used by the orchestrate skill immediately after ``devbench next`` and before
+    invoking the executor agent.
+    """
+    from devbench.github.git_ops import GitOpsJudge
+
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    unit = _find_unit(units, unit_id)
+    if unit is None:
+        print(f"ERROR: Work unit '{unit_id}' not found in backlog", file=sys.stderr)
+        return 1
+
+    canonical_repo = resolve_repo(unit.repo)
+    validate_repo(canonical_repo)
+    repo_path = REPO_LOCAL_PATHS.get(canonical_repo)
+    if repo_path is None:
+        print(f"ERROR: No local path configured for repo '{canonical_repo}'", file=sys.stderr)
+        return 1
+
+    branch = f"backlog/{unit_id.lower()}"
+    ops = GitOpsJudge()
+    ops.ensure_branch(canonical_repo, repo_path, branch)
+    logger.info("Branch ready: %s on %s", branch, canonical_repo)
+    return 0
+
+
 def cmd_git_ops(unit_id: str) -> int:
     """Run the full git operations sequence for a completed work unit.
 
@@ -600,6 +634,7 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
     "set-status": (cmd_set_status, 2, "Set status: set-status <id> <status>"),
     "mark-done": (cmd_mark_done, 1, "Mark done: mark-done <id>"),
     "validate-backlog": (cmd_validate_backlog, 0, "Validate backlog integrity"),
+    "ensure-branch": (cmd_ensure_branch, 1, "Create or switch to work unit branch: ensure-branch <id>"),
     "git-ops": (cmd_git_ops, 1, "Run git operations for a work unit: git-ops <id>"),
     "log": (cmd_log, 1, "Log a message: log <message>"),
     "report": (cmd_report, 0, "Progress report: report [since-timestamp]"),

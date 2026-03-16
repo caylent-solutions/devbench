@@ -39,77 +39,6 @@ class TestCommitAndPush:
                 judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "b", "m")
 
     # ------------------------------------------------------------------
-    # Branch safety: checkout behaviour
-    # ------------------------------------------------------------------
-
-    def test_skips_checkout_when_already_on_target_branch(self, tmp_path: Path) -> None:
-        """No checkout call is made when HEAD is already on the target branch."""
-        judge = GitOpsJudge()
-        git_calls: list[list[str]] = []
-
-        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
-            git_calls.append(args)
-            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
-                return (0, "feature/x", "")
-            if args == ["status", "--porcelain"]:
-                return (0, "M file.py\n", "")
-            return (0, "", "")
-
-        with patch.object(judge, "_git", side_effect=stub):
-            judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "feature/x", "msg")
-
-        checkout_calls = [c for c in git_calls if c[0] == "checkout"]
-        assert checkout_calls == [], "checkout should not be called when already on target branch"
-
-    def test_uses_checkout_without_create_when_branch_exists(self, tmp_path: Path) -> None:
-        """``git checkout <branch>`` (no -b) is used when the branch exists locally."""
-        judge = GitOpsJudge()
-        git_calls: list[list[str]] = []
-
-        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
-            git_calls.append(args)
-            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
-                return (0, "main", "")
-            if args == ["status", "--porcelain"]:
-                return (0, "M file.py\n", "")
-            return (0, "", "")
-
-        # show-ref exits 0 → branch exists
-        with (
-            patch.object(judge, "_git", side_effect=stub),
-            patch("devbench.github.git_ops.run_command", return_value=(0, "", "")),
-        ):
-            judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "feature/x", "msg")
-
-        assert ["checkout", "feature/x"] in git_calls
-        assert ["checkout", "-b", "feature/x"] not in git_calls
-
-    def test_uses_checkout_with_create_when_branch_does_not_exist(self, tmp_path: Path) -> None:
-        """``git checkout -b <branch>`` is used when the branch does not exist locally."""
-        judge = GitOpsJudge()
-        git_calls: list[list[str]] = []
-
-        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
-            git_calls.append(args)
-            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
-                return (0, "main", "")
-            if args == ["status", "--porcelain"]:
-                return (0, "M file.py\n", "")
-            return (0, "", "")
-
-        # First run_command call is show-ref (rc=1 → branch absent).
-        # Second would be rev-parse --verify origin/... but we won't reach it
-        # because status is non-empty (has changes → commit path).
-        with (
-            patch.object(judge, "_git", side_effect=stub),
-            patch("devbench.github.git_ops.run_command", return_value=(1, "", "")),
-        ):
-            judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "feature/x", "msg")
-
-        assert ["checkout", "-b", "feature/x"] in git_calls
-        assert ["checkout", "feature/x"] not in git_calls
-
-    # ------------------------------------------------------------------
     # Happy path: changes present → commit and push
     # ------------------------------------------------------------------
 
@@ -120,8 +49,6 @@ class TestCommitAndPush:
 
         def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
             git_calls.append(args)
-            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
-                return (0, "feature/x", "")
             if args == ["status", "--porcelain"]:
                 return (0, "M src/foo.py\n", "")
             return (0, "", "")
@@ -146,8 +73,6 @@ class TestCommitAndPush:
 
         def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
             git_calls.append(args)
-            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
-                return (0, "feature/x", "")
             if args == ["status", "--porcelain"]:
                 return (0, "", "")  # clean
             if args == ["rev-parse", "HEAD"]:
@@ -173,8 +98,6 @@ class TestCommitAndPush:
 
         def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
             git_calls.append(args)
-            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
-                return (0, "feature/x", "")
             if args == ["status", "--porcelain"]:
                 return (0, "", "")  # clean
             return (0, "", "")
@@ -198,8 +121,6 @@ class TestCommitAndPush:
 
         def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
             git_calls.append(args)
-            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
-                return (0, "feature/x", "")
             if args == ["status", "--porcelain"]:
                 return (0, "", "")  # clean
             if args == ["rev-parse", "HEAD"]:
@@ -217,6 +138,213 @@ class TestCommitAndPush:
 
         assert ["commit", "-m", "msg"] not in git_calls
         assert ["push", "origin", "feature/x"] in git_calls
+
+    # ------------------------------------------------------------------
+    # AC-2: commit_and_push must not call git checkout
+    # ------------------------------------------------------------------
+
+    def test_commit_and_push_does_not_call_git_checkout(self, tmp_path: Path) -> None:
+        """commit_and_push never calls git checkout — branch setup is ensure_branch's job. AC-2"""
+        judge = GitOpsJudge()
+        git_calls: list[list[str]] = []
+
+        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
+            git_calls.append(args)
+            if args == ["status", "--porcelain"]:
+                return (0, "M file.py\n", "")  # has changes → commit path
+            return (0, "", "")
+
+        with patch.object(judge, "_git", side_effect=stub):
+            judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "feature/x", "msg")
+
+        checkout_calls = [c for c in git_calls if c[0] == "checkout"]
+        assert checkout_calls == [], "commit_and_push must not call git checkout"
+
+
+@pytest.mark.unit
+class TestEnsureBranch:
+    """Tests for GitOpsJudge.ensure_branch method (T1 AC-3 through AC-10)."""
+
+    def test_ensure_branch_noop_when_already_on_branch(self, tmp_path: Path) -> None:
+        """
+        Given: current branch is the target branch
+        When: ensure_branch is called
+        Then: no stash, checkout, or pop is performed (AC-3)
+        """
+        judge = GitOpsJudge()
+        git_calls: list[list[str]] = []
+
+        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
+            git_calls.append(args)
+            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, "feature/x", "")
+            return (0, "", "")
+
+        with patch.object(judge, "_git", side_effect=stub):
+            judge.ensure_branch("caylent-solutions/git-repo", tmp_path, "feature/x")
+
+        assert ["stash"] not in git_calls
+        assert not any(c[0] == "checkout" for c in git_calls)
+        assert ["stash", "pop"] not in git_calls
+
+    def test_ensure_branch_checks_out_existing_branch_when_clean(self, tmp_path: Path) -> None:
+        """
+        Given: different branch, clean tree, target branch exists locally
+        When: ensure_branch is called
+        Then: checkout (no -b) is performed without stash (AC-4)
+        """
+        judge = GitOpsJudge()
+        git_calls: list[list[str]] = []
+
+        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
+            git_calls.append(args)
+            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, "main", "")
+            return (0, "", "")
+
+        # run_command calls: status → clean, show-ref → branch exists
+        run_command_responses = iter([(0, "", ""), (0, "", "")])
+
+        with (
+            patch.object(judge, "_git", side_effect=stub),
+            patch("devbench.github.git_ops.run_command", side_effect=run_command_responses),
+        ):
+            judge.ensure_branch("caylent-solutions/git-repo", tmp_path, "feature/x")
+
+        assert ["checkout", "feature/x"] in git_calls
+        assert ["checkout", "-b", "feature/x"] not in git_calls
+        assert ["stash"] not in git_calls
+        assert ["stash", "pop"] not in git_calls
+
+    def test_ensure_branch_stashes_before_checkout_when_staged_changes(self, tmp_path: Path) -> None:
+        """
+        Given: different branch, staged changes in tree, target branch exists
+        When: ensure_branch is called
+        Then: stash → checkout → stash pop (AC-5)
+        """
+        judge = GitOpsJudge()
+        git_calls: list[list[str]] = []
+
+        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
+            git_calls.append(args)
+            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, "main", "")
+            return (0, "", "")
+
+        # run_command: status → staged changes, show-ref → branch exists
+        run_command_responses = iter([(0, "M  file.py\n", ""), (0, "", "")])
+
+        with (
+            patch.object(judge, "_git", side_effect=stub),
+            patch("devbench.github.git_ops.run_command", side_effect=run_command_responses),
+        ):
+            judge.ensure_branch("caylent-solutions/git-repo", tmp_path, "feature/x")
+
+        assert ["stash"] in git_calls
+        assert ["checkout", "feature/x"] in git_calls
+        assert ["stash", "pop"] in git_calls
+        # Verify order: stash before checkout, pop after
+        stash_idx = git_calls.index(["stash"])
+        checkout_idx = git_calls.index(["checkout", "feature/x"])
+        pop_idx = git_calls.index(["stash", "pop"])
+        assert stash_idx < checkout_idx < pop_idx
+
+    def test_ensure_branch_stashes_before_checkout_when_unstaged_changes(self, tmp_path: Path) -> None:
+        """
+        Given: different branch, unstaged changes in tree, target branch exists
+        When: ensure_branch is called
+        Then: stash → checkout → stash pop (AC-6)
+        """
+        judge = GitOpsJudge()
+        git_calls: list[list[str]] = []
+
+        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
+            git_calls.append(args)
+            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, "main", "")
+            return (0, "", "")
+
+        # run_command: status → unstaged changes, show-ref → branch exists
+        run_command_responses = iter([(0, " M file.py\n", ""), (0, "", "")])
+
+        with (
+            patch.object(judge, "_git", side_effect=stub),
+            patch("devbench.github.git_ops.run_command", side_effect=run_command_responses),
+        ):
+            judge.ensure_branch("caylent-solutions/git-repo", tmp_path, "feature/x")
+
+        assert ["stash"] in git_calls
+        assert ["stash", "pop"] in git_calls
+
+    def test_ensure_branch_creates_branch_when_absent(self, tmp_path: Path) -> None:
+        """
+        Given: different branch, clean tree, target branch does not exist locally
+        When: ensure_branch is called
+        Then: checkout -b is used (AC-7)
+        """
+        judge = GitOpsJudge()
+        git_calls: list[list[str]] = []
+
+        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
+            git_calls.append(args)
+            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, "main", "")
+            return (0, "", "")
+
+        # run_command: status → clean, show-ref → branch absent
+        run_command_responses = iter([(0, "", ""), (1, "", "")])
+
+        with (
+            patch.object(judge, "_git", side_effect=stub),
+            patch("devbench.github.git_ops.run_command", side_effect=run_command_responses),
+        ):
+            judge.ensure_branch("caylent-solutions/git-repo", tmp_path, "new-branch")
+
+        assert ["checkout", "-b", "new-branch"] in git_calls
+        assert ["checkout", "new-branch"] not in git_calls
+
+    def test_ensure_branch_validates_branch_name(self, tmp_path: Path) -> None:
+        """
+        Given: an invalid branch name
+        When: ensure_branch is called
+        Then: ValueError is raised with 'Invalid branch name' (AC-8)
+        """
+        judge = GitOpsJudge()
+        with pytest.raises(ValueError, match="Invalid branch name"):
+            judge.ensure_branch("caylent-solutions/git-repo", tmp_path, "bad branch!")
+
+    def test_ensure_branch_validates_repo(self, tmp_path: Path) -> None:
+        """
+        Given: a repo not in the allow-list
+        When: ensure_branch is called
+        Then: ValueError is raised with 'not allowed' (AC-9)
+        """
+        judge = GitOpsJudge()
+        with pytest.raises(ValueError, match="not allowed"):
+            judge.ensure_branch("evil/repo", tmp_path, "feature/x")
+
+    def test_ensure_branch_raises_on_dirty_status_error(self, tmp_path: Path) -> None:
+        """
+        Given: git status --porcelain exits non-zero (genuine git error)
+        When: ensure_branch is called
+        Then: RuntimeError is raised (not silently treated as clean) (AC-10)
+        """
+        judge = GitOpsJudge()
+
+        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
+            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, "main", "")
+            return (0, "", "")
+
+        # run_command: status → non-zero exit (git error)
+        run_command_responses = iter([(1, "", "fatal: not a git repository")])
+
+        with (
+            patch.object(judge, "_git", side_effect=stub),
+            patch("devbench.github.git_ops.run_command", side_effect=run_command_responses),
+        ):
+            with pytest.raises(RuntimeError, match="git status"):
+                judge.ensure_branch("caylent-solutions/git-repo", tmp_path, "feature/x")
 
 
 class TestCreatePr:

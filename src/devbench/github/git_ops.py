@@ -36,8 +36,80 @@ class GitOpsJudge:
         self.name = "git_ops"
         self.logger = logging.getLogger(f"devbench.{self.name}")
 
+    def ensure_branch(self, repo: str, repo_path: Path, branch: str) -> None:
+        """Ensure the repository is on *branch*, creating it if necessary.
+
+        Must be called before the executor agent stages any files.  Handles all
+        four cases:
+
+        1. Already on *branch*: no-op.
+        2. On a different branch, tree is clean, *branch* exists locally:
+           ``git checkout <branch>``.
+        3. On a different branch, tree is clean, *branch* does not exist:
+           ``git checkout -b <branch>``.
+        4. On a different branch, tree is dirty (staged or unstaged changes):
+           ``git stash`` → checkout (with or without ``-b``) → ``git stash pop``.
+
+        A non-zero exit from ``git status --porcelain`` is a genuine git error
+        and raises ``RuntimeError`` immediately (never silently treated as clean).
+
+        Args:
+            repo: GitHub repository in ``owner/name`` format.
+            repo_path: Local filesystem path to the repository.
+            branch: Branch name to switch to or create.  Must match ``_BRANCH_RE``.
+
+        Raises:
+            ValueError: If the repo is not in the allow-list, or the branch
+                name does not match the allowed format.
+            RuntimeError: If ``git status --porcelain`` exits non-zero, or any
+                git command fails.
+        """
+        validate_repo(repo)
+        if not _BRANCH_RE.match(branch):
+            raise ValueError(
+                f"Invalid branch name '{branch}'. "
+                "Branch names must start with an alphanumeric character and contain only "
+                "alphanumerics, dots, hyphens, underscores, and forward slashes "
+                "(no consecutive special characters)."
+            )
+
+        _, current_branch, _ = self._git(["rev-parse", "--abbrev-ref", "HEAD"], repo_path)
+        if current_branch.strip() == branch:
+            self.logger.info("Already on branch %s — no-op", branch)
+            return
+
+        rc_status, status_out, status_err = run_command(
+            ["git", "status", "--porcelain"], cwd=repo_path
+        )
+        if rc_status != 0:
+            raise RuntimeError(
+                f"git status --porcelain failed (exit {rc_status}): {status_err.strip()}"
+            )
+        dirty = bool(status_out.strip())
+
+        rc_ref, _, _ = run_command(
+            ["git", "show-ref", "--verify", f"refs/heads/{branch}"], cwd=repo_path
+        )
+        branch_exists = rc_ref == 0
+
+        if dirty:
+            self._git(["stash"], repo_path)
+
+        if branch_exists:
+            self._git(["checkout", branch], repo_path)
+        else:
+            self._git(["checkout", "-b", branch], repo_path)
+
+        if dirty:
+            self._git(["stash", "pop"], repo_path)
+
+        self.logger.info("Switched to branch %s in %s", branch, repo)
+
     def commit_and_push(self, repo: str, repo_path: Path, branch: str, message: str) -> None:
-        """Validate inputs, switch to the target branch, stage all changes, commit, and push.
+        """Validate inputs, stage all changes, commit, and push.
+
+        Assumes the repository is already on the correct branch — call
+        :meth:`ensure_branch` before the executor agent stages files.
 
         This method is idempotent: it is safe to call on restart after a partial run.
 
@@ -46,19 +118,10 @@ class GitOpsJudge:
         1. Validate *repo* against the allow-list (``validate_repo``).
         2. Validate *branch* format against ``_BRANCH_RE`` (allowlist pattern that
            rejects consecutive special characters per git ref naming rules).
-        3. Branch safety switch — determines how to reach the target branch without
-           resetting existing committed work:
+        3. ``git add -A`` — stage all working-tree changes.
+        4. ``git status --porcelain`` — check whether anything was staged.
 
-           - Already on *branch*: skip checkout entirely.
-           - On a different branch and *branch* already exists locally:
-             ``git checkout <branch>`` — switch only, no reset.
-           - On a different branch and *branch* does not exist locally:
-             ``git checkout -b <branch>`` — create from current HEAD.
-
-        4. ``git add -A`` — stage all working-tree changes.
-        5. ``git status --porcelain`` — check whether anything was staged.
-
-           - If the output is **non-empty**: proceed to commit and push (steps 6-7).
+           - If the output is **non-empty**: proceed to commit and push (steps 5-6).
            - If the output is **empty** (nothing to commit): the working tree is
              already clean, meaning a prior run completed the commit.  Skip the
              commit and evaluate whether a push is still needed:
@@ -69,8 +132,8 @@ class GitOpsJudge:
              - Remote branch present and local HEAD matches remote HEAD: skip push
                and return.  The desired state is fully achieved.
 
-        6. ``git commit -m <message>`` — commit staged changes (skipped when clean).
-        7. ``git push origin <branch>`` — push to the remote (skipped when remote
+        5. ``git commit -m <message>`` — commit staged changes (skipped when clean).
+        6. ``git push origin <branch>`` — push to the remote (skipped when remote
            is already up to date).
 
         All git commands are executed via :meth:`_git`, which invokes subprocess
@@ -79,7 +142,9 @@ class GitOpsJudge:
         Args:
             repo: GitHub repository in ``owner/name`` format.
             repo_path: Local filesystem path to the repository.
-            branch: Branch name to create or switch to.  Must match
+            branch: The branch name the repository is already on (set up by
+                :meth:`ensure_branch` before the executor runs).  Used for
+                validation, remote state detection, and push target.  Must match
                 ``_BRANCH_RE``: starts with an alphanumeric character; subsequent
                 characters are alphanumerics, underscores, or a single separator
                 (``.``, ``-``, or ``/``) followed by an alphanumeric/underscore.
@@ -98,16 +163,6 @@ class GitOpsJudge:
                 "alphanumerics, dots, hyphens, underscores, and forward slashes "
                 "(no consecutive special characters)."
             )
-
-        _, current_branch, _ = self._git(["rev-parse", "--abbrev-ref", "HEAD"], repo_path)
-        if current_branch.strip() != branch:
-            rc, _, _ = run_command(
-                ["git", "show-ref", "--verify", f"refs/heads/{branch}"], cwd=repo_path
-            )
-            if rc == 0:
-                self._git(["checkout", branch], repo_path)
-            else:
-                self._git(["checkout", "-b", branch], repo_path)
 
         self._git(["add", "-A"], repo_path)
 

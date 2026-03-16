@@ -26,6 +26,19 @@
     ],
     "PostToolUse": [
       {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/hook-logger.sh"
+          },
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/assert-tests-pass.sh"
+          }
+        ]
+      },
+      {
         "matcher": ".*",
         "hooks": [
           {

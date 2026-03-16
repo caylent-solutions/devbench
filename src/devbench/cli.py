@@ -122,7 +122,15 @@ def cmd_status() -> int:
 
 
 def cmd_next() -> int:
-    """Print the next actionable work unit."""
+    """Print the next actionable work unit.
+
+    Secondary dep guard: after ``get_parallel_candidates`` returns candidates,
+    the top candidate's dependencies are re-verified against the full ``done``
+    set.  If any dependency is not ``done``, the command exits 1 with an
+    actionable error on stderr listing each unmet dep ID and its current status.
+    This guard catches any unit that slips through when ``sync-blocked`` has not
+    been run.
+    """
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     units = parser.parse_index()
     candidates = parser.get_parallel_candidates(units)
@@ -135,6 +143,16 @@ def cmd_next() -> int:
         return 0
 
     unit = candidates[0]
+
+    # Secondary dep guard: verify all deps are done before claiming the unit.
+    unmet = _unmet_deps(unit, units)
+    if unmet:
+        dep_list = "; ".join(f"{dep_id} (status: {status})" for dep_id, status in unmet)
+        print(
+            f"ERROR: {unit.id} has unmet dependencies: {dep_list}",
+            file=sys.stderr,
+        )
+        return 1
 
     # Automatically mark as in-progress in both files
     wu_file = BACKLOG_ROOT / unit.file_path if not unit.file_path.is_absolute() else unit.file_path
@@ -160,7 +178,13 @@ def cmd_next() -> int:
 
 
 def cmd_execute(unit_id: str, feedback: str = "") -> int:
-    """Spawn a Claude Code agent to execute a work unit."""
+    """Spawn a Claude Code agent to execute a work unit.
+
+    Pre-run dep guard: before spawning the agent, all listed dependencies of
+    the target unit are checked against the full ``done`` set.  If any
+    dependency is not ``done``, the command exits 1 with an actionable error
+    on stderr that names each unmet dep ID and its current status.
+    """
     from devbench.execution import executor as claude_executor
 
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
@@ -169,6 +193,16 @@ def cmd_execute(unit_id: str, feedback: str = "") -> int:
     target = _find_unit(units, unit_id)
     if target is None:
         print(f"ERROR: Work unit '{unit_id}' not found in backlog", file=sys.stderr)
+        return 1
+
+    # Pre-run dep guard: refuse to execute if any dep is not done.
+    unmet = _unmet_deps(target, units)
+    if unmet:
+        dep_list = "; ".join(f"{dep_id} (status: {status})" for dep_id, status in unmet)
+        print(
+            f"ERROR: {unit_id} has unmet dependencies: {dep_list}",
+            file=sys.stderr,
+        )
         return 1
 
     wu_file = BACKLOG_ROOT / target.file_path if not target.file_path.is_absolute() else target.file_path
@@ -533,6 +567,23 @@ def _find_unit(units: list[WorkUnit], unit_id: str) -> WorkUnit | None:
         if unit.id.lower() == unit_id.lower():
             return unit
     return None
+
+
+def _unmet_deps(unit: WorkUnit, all_units: list[WorkUnit]) -> list[tuple[str, str]]:
+    """Return a list of ``(dep_id, status_string)`` for each unmet dependency.
+
+    A dependency is *met* only when its status is ``done``.  If a dep ID is
+    not found in ``all_units``, it is reported with status ``"unknown"``.
+
+    Returns an empty list when all deps are satisfied.
+    """
+    status_by_id = {u.id: u.status.value.lower() for u in all_units}
+    done_ids = frozenset(u.id for u in all_units if u.status is WorkUnitStatus.DONE)
+    return [
+        (dep_id, status_by_id.get(dep_id, "unknown"))
+        for dep_id in unit.dependencies
+        if dep_id not in done_ids
+    ]
 
 
 def _get_prior_feedback(unit_id: str) -> dict[str, str]:

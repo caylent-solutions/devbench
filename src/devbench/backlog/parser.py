@@ -3,6 +3,20 @@
 Parses ``BACKLOG.md`` index tables and individual work-unit Markdown files
 into ``WorkUnit`` objects. Provides methods for querying actionable,
 blocked, and parallel-candidate work units.
+
+Supported Status Values
+-----------------------
+The parser recognises the full runtime status vocabulary:
+
+- ``in-queue``     — work unit is ready to be picked up.
+- ``in-progress``  — an agent is actively working on this unit.
+- ``in-review``    — agent has completed work and requested human review.
+- ``done``         — all judges passed, work is merged.
+- ``blocked``      — unit cannot proceed due to an unresolved blocker.
+
+All five values are valid in both the BACKLOG.md index and individual
+work-unit files.  Status mismatches between the index and the file are
+logged as warnings; the file is the authoritative source of truth.
 """
 
 from __future__ import annotations

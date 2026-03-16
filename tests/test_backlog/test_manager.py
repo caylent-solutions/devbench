@@ -440,10 +440,19 @@ class TestMarkDoneGate:
 class TestValidate:
     """Tests for BacklogManager.validate() backlog integrity checks."""
 
-    def _make_index(self, tmp_path: Path, rows: str) -> Path:
+    def _make_index(self, tmp_path: Path, rows: str, summary: str = "") -> Path:
         idx = tmp_path / "BACKLOG.md"
+        summary_section = (
+            "## Status Summary\n\n"
+            + summary
+            + "\n---\n\n"
+            if summary
+            else ""
+        )
         idx.write_text(
             "# Backlog\n\n"
+            + summary_section
+            + "## Full Work Unit Index\n\n"
             "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
             "|-----|-------|------|--------|-------------|------|-----------|\n"
             + rows,
@@ -451,9 +460,10 @@ class TestValidate:
         )
         return idx
 
-    def _make_wu(self, backlog_dir: Path, unit_id: str, status: str = "in-queue") -> Path:
+    def _make_wu(self, backlog_dir: Path, unit_id: str, status: str = "in-queue", with_comments: bool = True) -> Path:
         wu = backlog_dir / f"{unit_id}.md"
-        wu.write_text(f"# {unit_id}\n\n## Status: {status}\n", encoding="utf-8")
+        comments = "\n## Comments\n" if with_comments else ""
+        wu.write_text(f"# {unit_id}\n\n## Status: {status}\n{comments}", encoding="utf-8")
         return wu
 
     def test_valid_backlog_returns_no_errors(self, tmp_path: Path, backlog_dir: Path) -> None:
@@ -466,7 +476,7 @@ class TestValidate:
         )
         judge = BacklogManager()
         errors = judge.validate(idx, tmp_path)
-        assert errors == []
+        assert errors == [], f"Expected no errors but got: {errors}"
 
     def test_missing_work_unit_file_is_reported(self, tmp_path: Path) -> None:
         # Index references a file that doesn't exist
@@ -523,6 +533,189 @@ class TestValidate:
         judge = BacklogManager()
         errors = judge.validate(idx, tmp_path)
         assert any("E0-F1-S1-T1" in e and "status" in e.lower() for e in errors)
+
+    # ------------------------------------------------------------------
+    # AC-1: Status Summary count drift detection
+    # ------------------------------------------------------------------
+
+    def test_validate_backlog_detects_status_summary_count_drift(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """AC-1: validate reports an error when Status Summary counts don't match index counts."""
+        self._make_wu(backlog_dir, "E0-F1-S1-T1", "in-queue")
+        self._make_wu(backlog_dir, "E0-F1-S1-T2", "in-queue")
+        # Summary claims 1 in-queue but index has 2
+        summary = (
+            "| Epic | Title | In Queue | Done |\n"
+            "|------|-------|----------|------|\n"
+            "| E0 | Fixes | 1 | 0 |\n"
+        )
+        idx = self._make_index(
+            tmp_path,
+            "| E0-F1-S1-T1 | Task 1 | Task | in-queue | none | repo | `backlog/E0-F1-S1-T1.md` |\n"
+            "| E0-F1-S1-T2 | Task 2 | Task | in-queue | none | repo | `backlog/E0-F1-S1-T2.md` |\n",
+            summary=summary,
+        )
+        judge = BacklogManager()
+        errors = judge.validate(idx, tmp_path)
+        assert any("summary" in e.lower() or "count" in e.lower() for e in errors), (
+            f"Expected count drift error but got: {errors}"
+        )
+
+    def test_validate_backlog_no_summary_count_errors_when_counts_match(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """AC-1: validate reports no summary errors when counts match the index."""
+        self._make_wu(backlog_dir, "E0-F1-S1-T1", "in-queue")
+        self._make_wu(backlog_dir, "E0-F1-S1-T2", "done")
+        summary = (
+            "| Epic | Title | In Queue | Done |\n"
+            "|------|-------|----------|------|\n"
+            "| E0 | Fixes | 1 | 1 |\n"
+        )
+        idx = self._make_index(
+            tmp_path,
+            "| E0-F1-S1-T1 | Task 1 | Task | in-queue | none | repo | `backlog/E0-F1-S1-T1.md` |\n"
+            "| E0-F1-S1-T2 | Task 2 | Task | done | none | repo | `backlog/E0-F1-S1-T2.md` |\n",
+            summary=summary,
+        )
+        judge = BacklogManager()
+        errors = judge.validate(idx, tmp_path)
+        summary_errors = [e for e in errors if "summary" in e.lower() or "count" in e.lower()]
+        assert summary_errors == [], f"Expected no count errors but got: {summary_errors}"
+
+    def test_validate_backlog_no_summary_errors_when_no_summary_section(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """AC-1: validate skips count check gracefully when no Status Summary section is present."""
+        self._make_wu(backlog_dir, "E0-F1-S1-T1", "in-queue")
+        idx = self._make_index(
+            tmp_path,
+            "| E0-F1-S1-T1 | Task 1 | Task | in-queue | none | repo | `backlog/E0-F1-S1-T1.md` |\n",
+        )
+        judge = BacklogManager()
+        errors = judge.validate(idx, tmp_path)
+        summary_errors = [e for e in errors if "summary" in e.lower() or "count" in e.lower()]
+        assert summary_errors == [], f"Expected no count errors but got: {summary_errors}"
+
+    # ------------------------------------------------------------------
+    # AC-2: blocked status recognized in validation
+    # ------------------------------------------------------------------
+
+    def test_validate_backlog_accepts_blocked_status(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """AC-2: validate accepts blocked status in both index and work-unit file without spurious errors."""
+        self._make_wu(backlog_dir, "E0-F1-S1-T1", "blocked")
+        idx = self._make_index(
+            tmp_path,
+            "| E0-F1-S1-T1 | Task 1 | Task | blocked | none | repo | `backlog/E0-F1-S1-T1.md` |\n",
+        )
+        judge = BacklogManager()
+        errors = judge.validate(idx, tmp_path)
+        status_errors = [e for e in errors if "E0-F1-S1-T1" in e and "status" in e.lower()]
+        assert status_errors == [], (
+            f"blocked status should not produce a status error but got: {status_errors}"
+        )
+
+    def test_validate_backlog_reports_mismatch_when_blocked_vs_other(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """AC-2: validate reports status mismatch when index says blocked but file says in-queue."""
+        self._make_wu(backlog_dir, "E0-F1-S1-T1", "in-queue")
+        idx = self._make_index(
+            tmp_path,
+            "| E0-F1-S1-T1 | Task 1 | Task | blocked | none | repo | `backlog/E0-F1-S1-T1.md` |\n",
+        )
+        judge = BacklogManager()
+        errors = judge.validate(idx, tmp_path)
+        assert any("E0-F1-S1-T1" in e and "status" in e.lower() for e in errors), (
+            f"Expected mismatch error for blocked vs in-queue but got: {errors}"
+        )
+
+    # ------------------------------------------------------------------
+    # AC-3: required section headers in task files
+    # ------------------------------------------------------------------
+
+    def test_validate_backlog_reports_missing_comments_header(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """AC-3: validate reports an error when a task file has no ## Comments section."""
+        self._make_wu(backlog_dir, "E0-F1-S1-T1", "in-queue", with_comments=False)
+        idx = self._make_index(
+            tmp_path,
+            "| E0-F1-S1-T1 | Task 1 | Task | in-queue | none | repo | `backlog/E0-F1-S1-T1.md` |\n",
+        )
+        judge = BacklogManager()
+        errors = judge.validate(idx, tmp_path)
+        assert any("E0-F1-S1-T1" in e and "comments" in e.lower() for e in errors), (
+            f"Expected missing comments header error but got: {errors}"
+        )
+
+    def test_validate_backlog_no_comments_error_when_header_present(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """AC-3: validate does not report a comments error when ## Comments section is present."""
+        self._make_wu(backlog_dir, "E0-F1-S1-T1", "in-queue", with_comments=True)
+        idx = self._make_index(
+            tmp_path,
+            "| E0-F1-S1-T1 | Task 1 | Task | in-queue | none | repo | `backlog/E0-F1-S1-T1.md` |\n",
+        )
+        judge = BacklogManager()
+        errors = judge.validate(idx, tmp_path)
+        comments_errors = [e for e in errors if "comments" in e.lower()]
+        assert comments_errors == [], f"Expected no comments errors but got: {comments_errors}"
+
+    # ------------------------------------------------------------------
+    # AC-5: existing checks remain intact
+    # ------------------------------------------------------------------
+
+    def test_validate_backlog_keeps_existing_integrity_checks(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """AC-5: all four original integrity checks still function after new checks are added."""
+        # Check 1: missing file
+        idx1 = self._make_index(
+            tmp_path,
+            "| E0-F1-S1-T1 | Task 1 | Task | in-queue | none | repo | `backlog/E0-F1-S1-T1.md` |\n",
+        )
+        errors1 = BacklogManager().validate(idx1, tmp_path)
+        assert any("E0-F1-S1-T1" in e and "missing" in e.lower() for e in errors1), (
+            f"file existence check broken: {errors1}"
+        )
+
+        # Check 2: status mismatch
+        self._make_wu(backlog_dir, "E0-F1-S1-T2", "done")
+        idx2 = self._make_index(
+            tmp_path,
+            "| E0-F1-S1-T2 | Task 2 | Task | in-queue | none | repo | `backlog/E0-F1-S1-T2.md` |\n",
+        )
+        errors2 = BacklogManager().validate(idx2, tmp_path)
+        assert any("E0-F1-S1-T2" in e and "status" in e.lower() for e in errors2), (
+            f"status mismatch check broken: {errors2}"
+        )
+
+        # Check 3: orphan detection
+        self._make_wu(backlog_dir, "E0-F1-S1-T3", "in-queue")
+        idx3 = self._make_index(
+            tmp_path,
+            "| E0-F1-S1-T2 | Task 2 | Task | done | none | repo | `backlog/E0-F1-S1-T2.md` |\n",
+        )
+        errors3 = BacklogManager().validate(idx3, tmp_path)
+        assert any("orphan" in e.lower() for e in errors3), (
+            f"orphan detection check broken: {errors3}"
+        )
+
+        # Check 4: broken dependency
+        self._make_wu(backlog_dir, "E0-F1-S1-T4", "in-queue")
+        idx4 = self._make_index(
+            tmp_path,
+            "| E0-F1-S1-T4 | Task 4 | Task | in-queue | E0-NONEXISTENT | repo | `backlog/E0-F1-S1-T4.md` |\n",
+        )
+        errors4 = BacklogManager().validate(idx4, tmp_path)
+        assert any("E0-NONEXISTENT" in e and "depend" in e.lower() for e in errors4), (
+            f"dependency check broken: {errors4}"
+        )
 
 
 # ---------------------------------------------------------------------------

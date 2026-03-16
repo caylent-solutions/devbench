@@ -1130,3 +1130,210 @@ class TestCmdSyncBlocked:
         assert result == 0
         out = capsys.readouterr().out
         assert "Blocked 1 unit(s). 1 already blocked. 2 in-queue units have all deps met." in out
+
+
+# ---------------------------------------------------------------------------
+# Helpers shared by TestDepGuardExecute / TestDepGuardNext
+# ---------------------------------------------------------------------------
+
+def _make_dep_guard_units(backlog_dir: Path) -> tuple[list, object, object]:
+    """Build units for dep-guard tests.
+
+    Returns (units_list, epic_unit, task_unit) where:
+      - epic_unit (E9) is in-progress (not done)
+      - task_unit (E15-F1-S1-T1) depends on E9
+    """
+    epic = _make_unit("E9", "Epic Nine", WorkUnitStatus.IN_PROGRESS, [])
+    task = _make_unit(
+        "E15-F1-S1-T1",
+        "Dep Guard Task",
+        WorkUnitStatus.IN_QUEUE,
+        ["E9"],
+        backlog_dir / "E15-F1-S1-T1.md",
+    )
+    return [epic, task], epic, task
+
+
+class TestDepGuardExecute:
+    """Tests for the pre-run dep guard in cmd_execute (AC-1, AC-2, AC-4)."""
+
+    def test_execute_refuses_unit_with_incomplete_dep(
+        self,
+        tmp_path: Path,
+        backlog_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """
+        Given: E15-F1-S1-T1 depends on E9 which is in-progress (not done)
+        When: execute E15-F1-S1-T1 is invoked
+        Then: exits 1; error on stderr names E9 and its status
+        Spec: AC-1
+        """
+        units, epic, task = _make_dep_guard_units(backlog_dir)
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = units
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+        ):
+            result = cli.cmd_execute("E15-F1-S1-T1")
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "E9" in err
+        assert "in progress" in err.lower()
+
+    def test_execute_proceeds_when_all_deps_done(
+        self,
+        tmp_path: Path,
+        backlog_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """
+        Given: E15-F1-S1-T1 depends on E9 which is done
+        When: execute E15-F1-S1-T1 is invoked
+        Then: the guard passes and the executor is called
+        Spec: AC-2
+        """
+        from devbench.execution.executor import ExecutionResult, ExecutionStatus
+
+        wu_file = backlog_dir / "E15-F1-S1-T1.md"
+        wu_file.write_text("# E15-F1-S1-T1: Dep Guard Task\n\n## Status: in-queue\n")
+
+        epic_done = _make_unit("E9", "Epic Nine", WorkUnitStatus.DONE, [])
+        task = _make_unit(
+            "E15-F1-S1-T1",
+            "Dep Guard Task",
+            WorkUnitStatus.IN_QUEUE,
+            ["E9"],
+            wu_file,
+        )
+        units = [epic_done, task]
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = units
+
+        exec_result = ExecutionResult(status=ExecutionStatus.IN_REVIEW, output="done", blocker="")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.execution.executor.execute", return_value=exec_result),
+        ):
+            result = cli.cmd_execute("E15-F1-S1-T1")
+
+        assert result == 0
+        output = json.loads(capsys.readouterr().out)
+        assert output["status"] == "in-review"
+
+    def test_execute_dep_guard_error_on_stderr_not_stdout(
+        self,
+        tmp_path: Path,
+        backlog_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """
+        Given: E15-F1-S1-T1 has unmet dep E9
+        When: execute E15-F1-S1-T1 is invoked
+        Then: the dep error appears on stderr; stdout is empty
+        Spec: AC-4
+        """
+        units, epic, task = _make_dep_guard_units(backlog_dir)
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = units
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+        ):
+            cli.cmd_execute("E15-F1-S1-T1")
+
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+        assert "E9" in captured.err
+
+
+class TestDepGuardNext:
+    """Tests for the secondary dep guard in cmd_next (AC-3, AC-4)."""
+
+    def test_next_secondary_guard_blocks_unit_with_unmet_dep(
+        self,
+        tmp_path: Path,
+        backlog_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """
+        Given: get_parallel_candidates returns a task whose epic dep is in-progress
+        When: cmd_next is invoked
+        Then: exits 1; error on stderr lists the unmet dep ID and status;
+              BacklogManager.force_status is NOT called
+        Spec: AC-3
+        """
+        epic = _make_unit("E9", "Epic Nine", WorkUnitStatus.IN_PROGRESS, [])
+        task = _make_unit(
+            "E15-F1-S1-T1",
+            "Dep Guard Task",
+            WorkUnitStatus.IN_QUEUE,
+            ["E9"],
+            backlog_dir / "E15-F1-S1-T1.md",
+        )
+        units = [epic, task]
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = units
+        # Simulate the guard being triggered: candidates returns the task
+        # even though its dep is unmet (this is the safety-net scenario)
+        mock_parser.get_parallel_candidates.return_value = [task]
+
+        mock_mgr = MagicMock()
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+        ):
+            result = cli.cmd_next()
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "E9" in err
+        mock_mgr.force_status.assert_not_called()
+
+    def test_next_dep_guard_error_on_stderr_not_stdout(
+        self,
+        tmp_path: Path,
+        backlog_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """
+        Given: cmd_next candidate has unmet dep
+        When: cmd_next is invoked
+        Then: error on stderr; stdout is empty
+        Spec: AC-4
+        """
+        epic = _make_unit("E9", "Epic Nine", WorkUnitStatus.IN_PROGRESS, [])
+        task = _make_unit(
+            "E15-F1-S1-T1",
+            "Dep Guard Task",
+            WorkUnitStatus.IN_QUEUE,
+            ["E9"],
+            backlog_dir / "E15-F1-S1-T1.md",
+        )
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [epic, task]
+        mock_parser.get_parallel_candidates.return_value = [task]
+
+        mock_mgr = MagicMock()
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+        ):
+            cli.cmd_next()
+
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+        assert "E9" in captured.err

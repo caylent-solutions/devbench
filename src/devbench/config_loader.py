@@ -79,6 +79,7 @@ __all__ = [
     "TimeoutConfig",
     "get_configured_default_branch",
     "get_repo_local_path",
+    "get_schema_default",
     "load_runtime_config",
     "resolve_config_path",
 ]
@@ -90,6 +91,29 @@ DEFAULT_CONFIG_SUBPATH: str = "backlog/config/devbench.yaml"
 _SCHEMA_PATH: Path = Path(__file__).parent / "config-schema.json"
 with _SCHEMA_PATH.open(encoding="utf-8") as _f:
     _SCHEMA: dict = json.load(_f)
+
+
+def get_schema_default(section: str, field: str) -> int:
+    """Return the schema-defined default integer for a timeout or limit field.
+
+    Defaults are declared in ``config-schema.json`` under
+    ``properties.<section>.properties.<field>.default``.
+
+    Args:
+        section: Top-level schema section name (e.g. ``"timeouts"``, ``"limits"``).
+            Use ``""`` (empty string) for top-level fields (e.g. ``"max_retries"``).
+        field: Field name within the section (e.g. ``"gh_api"``).
+
+    Returns:
+        The integer default value from the schema.
+
+    Raises:
+        KeyError: If *section* or *field* is not found in the schema, or if the
+            field has no ``"default"`` key.  This indicates a programming error —
+            the caller requested a default for a field that does not define one.
+    """
+    field_schema = _SCHEMA["properties"][section]["properties"][field] if section else _SCHEMA["properties"][field]
+    return int(field_schema["default"])
 
 
 @dataclass

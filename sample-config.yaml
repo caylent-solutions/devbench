@@ -65,6 +65,39 @@ repos:
 # Set JUDGE_DEFAULT_MODEL_BEDROCK env var to the Bedrock model ID to use
 # when judge_model/executor_model are absent and ANTHROPIC_MODEL is not set.
 
+# Retry and timeout configuration (optional — schema defaults shown).
+#
+# All timeout/limit/max_retries values are overridable at runtime via the
+# corresponding environment variable (see SYSTEM-OVERVIEW.md for the full
+# mapping).  Env var overrides are silent — no deprecation warning is emitted.
+# Setting an env var to empty string (e.g. JUDGE_GH_TIMEOUT=) raises ValueError
+# at startup — unset the variable or provide a valid integer.
+#
+# Precedence for each value (first match wins):
+#   1. Environment variable override (silent)
+#   2. Value in this YAML file
+#   3. Schema default (defined in config-schema.json; no hardcoded values in Python)
+#
+# max_retries: 10       # JUDGE_MAX_RETRIES — max retry attempts per work unit
+#
+# timeouts:             # all values in seconds
+#   github_check: 600   # JUDGE_GH_TIMEOUT — GitHub check status poll timeout
+#   gh_api: 30          # JUDGE_GH_API_TIMEOUT — GitHub API call timeout
+#   test: 300           # JUDGE_TEST_TIMEOUT — test suite run timeout
+#   security_fetch: 120 # JUDGE_SECURITY_FETCH_TIMEOUT — security fetch timeout
+#   llm: 300            # JUDGE_LLM_TIMEOUT — LLM API call timeout
+#   command: 120        # JUDGE_COMMAND_TIMEOUT — subprocess command timeout
+#   executor: 1800      # JUDGE_EXECUTOR_TIMEOUT — executor agent overall timeout
+#   executor_max_turns: 50  # JUDGE_EXECUTOR_MAX_TURNS — max executor turns
+#   orchestrator_poll_interval: 10  # JUDGE_ORCHESTRATOR_POLL_INTERVAL — poll interval
+#
+# limits:
+#   alert_summary: 10        # JUDGE_ALERT_SUMMARY_LIMIT — max security alerts in evidence
+#   output_truncation: 2000  # JUDGE_OUTPUT_TRUNCATION — command output char limit
+#   llm_evidence_truncation: 15000  # JUDGE_LLM_EVIDENCE_TRUNCATION — LLM evidence char limit
+#   llm_file_context: 5      # JUDGE_LLM_FILE_CONTEXT_LIMIT — max files in LLM context
+#   llm_file_preview_chars: 3000  # JUDGE_LLM_FILE_PREVIEW_CHARS — per-file preview limit
+
 # Git workflow behaviour settings (optional — defaults shown).
 #
 # git_ops.update_submodule: enable only when all target repos are git submodules

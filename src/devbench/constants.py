@@ -116,6 +116,11 @@ STATUS_IN_REVIEW: str = "in-review"
 STATUS_DONE: str = "done"
 STATUS_BLOCKED: str = "blocked"
 
+# Statuses that require all deps to be 'done' before a unit may start.
+# Units with any other status (blocked, done, in-review) are exempt from
+# the dep-status check in BacklogManager.validate().
+DEP_STATUS_CHECK_STATUSES: frozenset[str] = frozenset({STATUS_IN_QUEUE, STATUS_IN_PROGRESS})
+
 # Ordered mapping from any accepted input form to the canonical write form.
 # Used by BacklogManager._set_status() for validation and normalisation.
 VALID_STATUSES: dict[str, str] = {

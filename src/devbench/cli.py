@@ -21,7 +21,7 @@ Commands::
     security-review <id>    Run the security review judge on a work unit
     set-status <id> <s>     Force any status (no gate — use for recovery/lifecycle transitions)
     mark-done <id>          Mark unit as Done (enforces done-gate: all judges must have passed)
-    validate-backlog        Check backlog integrity (file existence, status sync, orphans, deps)
+    validate-backlog        Check backlog integrity (file existence, status sync, orphans, deps, dep-status)
     sync-blocked            Scan in-queue units and mark those with unmet deps as blocked
     report [since]          Print progress report with velocity stats
     log <message>           Append a message to the orchestrator log file
@@ -449,6 +449,9 @@ def cmd_validate_backlog() -> int:
     - Every work unit file's status matches the index.
     - No orphaned work unit files.
     - All dependency IDs reference real work unit IDs.
+    - Status Summary counts match actual per-status counts in the index.
+    - Every work unit file contains a '## Comments' section header.
+    - Every in-queue or in-progress unit has all deps with status 'done'.
 
     Exits 0 if the backlog is consistent; 1 with actionable error messages
     if any inconsistencies are found.

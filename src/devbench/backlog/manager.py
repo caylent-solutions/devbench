@@ -13,7 +13,8 @@ Public API
 ``mark_blocked``              — writes ``blocked`` and appends a reason comment.
 ``validate``                  — returns integrity errors (missing files, status
                                 drift, orphans, broken deps, Status Summary count
-                                drift, and missing required section headers).
+                                drift, missing required section headers, and
+                                dep-status violations).
 ``log_to_traceability_matrix``— appends a spec/test mapping entry to the
                                 traceability matrix file.
 
@@ -28,7 +29,7 @@ both the work-unit file and BACKLOG.md atomically.
 
 Validation Checks
 -----------------
-``validate`` runs six integrity checks in order:
+``validate`` runs seven integrity checks in order:
 
 1. Every row in BACKLOG.md has a corresponding work unit file.
 2. Every work unit file's status matches the index.
@@ -41,6 +42,10 @@ Validation Checks
 6. Every work unit file contains a ``## Comments`` section header.  This is
    required by the backlog contract so that agents have a designated location
    to append log entries.
+7. For every unit whose status is ``in-queue`` or ``in-progress``, all listed
+   dependency IDs must have status ``done``.  Units with status ``blocked``,
+   ``done``, or ``in-review`` are not checked.  Errors use the format:
+   ``<unit-id>: dep '<dep-id>' is '<dep-status>' but unit is '<unit-status>'``
 
 The full runtime status vocabulary is: ``in-queue``, ``in-progress``,
 ``in-review``, ``done``, ``blocked``.  All five values are valid in both the
@@ -59,6 +64,7 @@ from devbench.constants import (
     BACKLOG_SUBDIR,
     COMMENT_ENTRY_TEMPLATE,
     COMMENTS_SECTION_HEADER,
+    DEP_STATUS_CHECK_STATUSES,
     DEPENDENCY_NONE_VALUES,
     REVIEW_JUDGE_NAMES,
     STATUS_BLOCKED,
@@ -160,6 +166,11 @@ class BacklogManager:
            Only status columns present in the Summary table are compared.
            Silently skipped when no Status Summary section is found.
         6. Every work unit file contains a ``## Comments`` section header.
+        7. For every unit whose status is ``in-queue`` or ``in-progress``, all
+           listed dependency IDs must have status ``done``.  Units with status
+           ``blocked``, ``done``, or ``in-review`` are not checked.  Errors use
+           the format:
+           ``<unit-id>: dep '<dep-id>' is '<dep-status>' but unit is '<unit-status>'``
 
         Args:
             backlog_index: Path to the ``BACKLOG.md`` index file.
@@ -177,6 +188,7 @@ class BacklogManager:
         self._check_dependencies(backlog_index, known_ids, errors)
         self._check_status_summary_counts(backlog_index, rows, errors)
         self._check_required_section_headers(rows, workspace_root, errors)
+        self._check_dep_statuses(backlog_index, rows, errors)
         return errors
 
     def _check_files_and_statuses(
@@ -437,6 +449,57 @@ class BacklogManager:
                 errors.append(
                     f"{row_id}: work unit file missing '## Comments' section header"
                 )
+
+    def _check_dep_statuses(
+        self,
+        backlog_index: Path,
+        rows: list[tuple[str, str, str]],
+        errors: list[str],
+    ) -> None:
+        """Check 7: dep-status violations for in-queue and in-progress units.
+
+        For every unit whose status is ``in-queue`` or ``in-progress``, verify
+        that all its listed dependency IDs have status ``done``.  Units with
+        status ``blocked``, ``done``, or ``in-review`` are skipped — they are
+        either intentionally waiting or already finished.
+
+        Error format:
+        ``<unit-id>: dep '<dep-id>' is '<dep-status>' but unit is '<unit-status>'``
+
+        Args:
+            backlog_index: Path to the ``BACKLOG.md`` index file.
+            rows: Parsed ``(id, status, file_path)`` tuples from the Full Work Unit Index.
+            errors: Mutable list to which error strings are appended.
+        """
+        id_to_status: dict[str, str] = {
+            row_id: row_status
+            for row_id, row_status, _ in rows
+            if row_id and not row_id.startswith("-") and row_id.lower() != "id"
+        }
+
+        content = backlog_index.read_text(encoding="utf-8")
+        for line in content.splitlines():
+            if not line.strip().startswith("|"):
+                continue
+            cells = [c.strip() for c in line.split("|")]
+            if len(cells) != 9:
+                continue
+            row_id = cells[1]
+            if not row_id or row_id.lower() == "id" or row_id.startswith("-"):
+                continue
+            unit_status = id_to_status.get(row_id, "")
+            if unit_status not in DEP_STATUS_CHECK_STATUSES:
+                continue
+            dep_cell = cells[5]
+            for raw_dep in dep_cell.split(","):
+                dep_id = raw_dep.strip()
+                if not dep_id or dep_id.lower() in DEPENDENCY_NONE_VALUES:
+                    continue
+                dep_status = id_to_status.get(dep_id, "")
+                if dep_status != STATUS_DONE:
+                    errors.append(
+                        f"{row_id}: dep '{dep_id}' is '{dep_status}' but unit is '{unit_status}'"
+                    )
 
     def log_to_traceability_matrix(self, matrix_path: Path, spec_ref: str, test_ref: str) -> None:
         """Append an entry to the traceability matrix.

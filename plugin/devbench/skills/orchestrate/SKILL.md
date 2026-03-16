@@ -14,29 +14,33 @@ Process the backlog using the steps below, repeating until all work units are do
    - If output is `NO_ACTIONABLE`: print a blocked summary and exit.
    - Otherwise: parse the JSON to get `id`, `title`, `repo`.
 
-3. Invoke `devbench:executor` with the unit ID.
+3. `uv run devbench ensure-branch <id>` — create or switch to the work unit's
+   feature branch before the executor stages any files. Stashes and pops if the
+   working tree is dirty.
 
-4. Invoke each review agent in sequence with the unit ID:
+4. Invoke `devbench:executor` with the unit ID.
+
+5. Invoke each review agent in sequence with the unit ID:
    - `devbench:code-reviewer`
    - `devbench:test-reviewer`
    - `devbench:doc-reviewer`
    - `devbench:changes-manifest`
 
-5. If any review agent logs a `REVIEW_FAIL` verdict:
+6. If any review agent logs a `REVIEW_FAIL` verdict:
    - Collect all fail feedback from the work unit Comments.
    - Retry `devbench:executor` with the unit ID (the executor reads prior Comments for context).
    - Repeat review sequence.
    - After `max_retries` failures, log a blocker comment and move to step 2 (skip this unit).
 
-6. Once all 4 review agents pass:
+7. Once all 4 review agents pass:
    - Invoke `devbench:security-reviewer` with the unit ID.
    - If security fails: log a blocker comment and move to step 2.
 
-7. `uv run devbench git-ops <id>` — commit, push, create PR, wait for CI, merge.
+8. `uv run devbench git-ops <id>` — commit, push, create PR, wait for CI, merge.
 
-8. `uv run devbench mark-done <id>` — mark the unit done (enforces done-gate).
+9. `uv run devbench mark-done <id>` — mark the unit done (enforces done-gate).
 
-9. Return to step 1.
+10. Return to step 1.
 
 ## Standards
 

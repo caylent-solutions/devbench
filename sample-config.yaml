@@ -19,11 +19,21 @@
 #                                    the local checkout. Must be relative (no leading
 #                                    / or .. traversal). Omit to use the repo short
 #                                    name (e.g. "devbench" for "caylent-solutions/devbench").
+#   merge_strategy      (optional) — per-repo PR merge strategy: merge, squash, or rebase.
+#                                    Overrides the top-level merge_strategy for this repo only.
+#                                    Omit to use the top-level default.
 
 repos:
   caylent-solutions/devbench:
     default_branch: main2
     checkout_directory: devbench
+    # merge_strategy: squash  # optional — overrides global merge_strategy for this repo
+
+# merge_strategy: squash  # (optional) default PR merge strategy for all repos.
+#                         # Valid values: merge, squash, rebase. Default: squash.
+#                         # Overridden per-repo via repos.<repo>.merge_strategy.
+#                         # JUDGE_MERGE_STRATEGY env var also overrides this — deprecated,
+#                         # prefer setting merge_strategy here instead.
 
 # allowed_orgs: (optional) restrict all repos to these GitHub organisations.
 # When non-empty, any repo whose org is not in this list is rejected at load time

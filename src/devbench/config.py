@@ -26,6 +26,9 @@ from devbench.config_loader import (
     load_runtime_config,
     resolve_config_path,
 )
+from devbench.config_loader import (
+    get_repo_merge_strategy as _get_repo_merge_strategy,
+)
 from devbench.constants import BACKLOG_SUBDIR
 
 _log = logging.getLogger("devbench.config")
@@ -248,14 +251,72 @@ class MergeStrategy(StrEnum):
         return f"--{self.value}"
 
 
-# Merge strategy for PRs. Defaults to squash.
-_merge_strategy = os.environ.get("JUDGE_MERGE_STRATEGY", "squash")
-try:
-    MERGE_STRATEGY: MergeStrategy = MergeStrategy(_merge_strategy)
-except ValueError:
-    raise RuntimeError(
-        f"JUDGE_MERGE_STRATEGY must be one of: {', '.join(s.value for s in MergeStrategy)}. Got: {_merge_strategy}"
-    ) from None
+# ---------------------------------------------------------------------------
+# Merge strategy — yaml-with-env-override (JUDGE_MERGE_STRATEGY is deprecated).
+#
+# Precedence (first match wins):
+# 1. JUDGE_MERGE_STRATEGY env var — still honored but emits deprecation WARNING.
+# 2. YAML top-level merge_strategy field.
+# 3. Code default: squash.
+# ---------------------------------------------------------------------------
+
+
+def _resolve_merge_strategy() -> MergeStrategy:
+    """Resolve the global merge strategy from env var, YAML, or code default.
+
+    Emits a deprecation WARNING when ``JUDGE_MERGE_STRATEGY`` is used.
+
+    Returns:
+        The resolved ``MergeStrategy`` enum value.
+
+    Raises:
+        RuntimeError: If the resolved strategy string is not a valid ``MergeStrategy`` value.
+    """
+    env_val: str = os.environ.get("JUDGE_MERGE_STRATEGY", "")
+    if env_val:
+        _log.warning(
+            "JUDGE_MERGE_STRATEGY is deprecated. Set merge_strategy in devbench.yaml instead."
+        )
+        raw = env_val
+        source = "JUDGE_MERGE_STRATEGY env var"
+    elif RUNTIME_CONFIG.merge_strategy:
+        raw = RUNTIME_CONFIG.merge_strategy
+        source = "devbench.yaml"
+    else:
+        raw = "squash"
+        source = "code default"
+
+    try:
+        return MergeStrategy(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"merge_strategy must be one of: {', '.join(s.value for s in MergeStrategy)}. "
+            f"Got: {raw!r} (from {source})"
+        ) from exc
+
+
+MERGE_STRATEGY: MergeStrategy = _resolve_merge_strategy()
+
+
+def get_repo_merge_strategy(repo: str) -> str:
+    """Return the effective merge strategy for *repo*.
+
+    Delegates to :func:`config_loader.get_repo_merge_strategy`, passing the
+    module-level ``RUNTIME_CONFIG`` and the resolved global ``MERGE_STRATEGY``
+    string as the default.
+
+    Resolution order (first match wins):
+    1. ``repos.<repo>.merge_strategy`` in the YAML config (per-repo override).
+    2. Global ``MERGE_STRATEGY`` (resolved from YAML + env-var precedence above).
+
+    Args:
+        repo: Fully-qualified repository name (e.g. ``'org/repo'``).
+
+    Returns:
+        The effective merge strategy string for *repo*.
+    """
+    return _get_repo_merge_strategy(repo, RUNTIME_CONFIG, MERGE_STRATEGY.value)
+
 
 # ---------------------------------------------------------------------------
 # Timeouts — all values in seconds

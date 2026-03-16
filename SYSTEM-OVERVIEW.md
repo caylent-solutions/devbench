@@ -222,6 +222,12 @@ repos:
     default_branch: main2            # optional — omit to fall back to origin/HEAD
     checkout_directory: my-checkout  # optional — relative to JUDGE_WORKSPACE_ROOT
                                      # omit to use repo short-name (e.g. "my-repo")
+    merge_strategy: squash           # optional — per-repo override; valid: merge, squash, rebase
+                                     # omit to use the top-level merge_strategy default
+
+merge_strategy: squash               # optional — default PR merge strategy for all repos.
+                                     # Valid values: merge, squash, rebase. Default: squash.
+                                     # Per-repo repos.<repo>.merge_strategy overrides this field.
 
 allowed_orgs:                        # optional — restrict repos to these GitHub orgs
   - caylent-solutions

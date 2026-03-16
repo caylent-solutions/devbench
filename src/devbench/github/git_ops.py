@@ -12,10 +12,11 @@ from pathlib import Path
 from devbench.config import (
     GH_API_TIMEOUT,
     GITHUB_CHECK_TIMEOUT_SECONDS,
-    MERGE_STRATEGY,
     RUNTIME_CONFIG,
     WORKSPACE_ROOT,
+    MergeStrategy,
     get_gh_token,
+    get_repo_merge_strategy,
     validate_repo,
 )
 from devbench.config_loader import get_configured_default_branch
@@ -274,7 +275,11 @@ class GitOpsJudge(BaseJudge):
         return pr_url
 
     def merge_pr(self, repo: str, pr_number: int, *, repo_path: Path | None = None) -> None:
-        """Merge a pull request using the strategy set by JUDGE_MERGE_STRATEGY.
+        """Merge a pull request using the per-repo or global merge strategy.
+
+        The strategy is resolved by :func:`~devbench.config.get_repo_merge_strategy`,
+        which checks for a per-repo ``merge_strategy`` override in the YAML config
+        before falling back to the global default.
 
         Args:
             repo: GitHub repository in ``owner/name`` format.
@@ -287,8 +292,9 @@ class GitOpsJudge(BaseJudge):
         """
         validate_repo(repo)
 
+        strategy = MergeStrategy(get_repo_merge_strategy(repo))
         rc, _, stderr = self._gh(
-            ["pr", "merge", str(pr_number), MERGE_STRATEGY.flag],
+            ["pr", "merge", str(pr_number), strategy.flag],
             cwd=repo_path,
             repo=repo,
         )

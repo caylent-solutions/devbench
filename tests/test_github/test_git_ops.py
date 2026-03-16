@@ -1,4 +1,4 @@
-"""Tests for judges.git_ops module."""
+"""Tests for github.git_ops module."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from devbench.github.git_ops import GitOpsJudge
-from devbench.judges.base import Verdict
 
 
 class TestGitOpsInit:
@@ -17,16 +16,6 @@ class TestGitOpsInit:
     def test_name(self) -> None:
         judge = GitOpsJudge()
         assert judge.name == "git_ops"
-
-
-class TestEvaluate:
-    """Test the no-op evaluate method."""
-
-    def test_returns_pass(self, tmp_path: Path) -> None:
-        judge = GitOpsJudge()
-        result = judge.evaluate(tmp_path / "wu.md", tmp_path)
-        assert result.verdict is Verdict.PASS
-        assert "no-op" in result.reasoning
 
 
 
@@ -88,7 +77,7 @@ class TestCommitAndPush:
         # show-ref exits 0 → branch exists
         with (
             patch.object(judge, "_git", side_effect=stub),
-            patch.object(judge, "_run_command", return_value=(0, "", "")),
+            patch("devbench.github.git_ops.run_command", return_value=(0, "", "")),
         ):
             judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "feature/x", "msg")
 
@@ -108,12 +97,12 @@ class TestCommitAndPush:
                 return (0, "M file.py\n", "")
             return (0, "", "")
 
-        # First _run_command call is show-ref (rc=1 → branch absent).
+        # First run_command call is show-ref (rc=1 → branch absent).
         # Second would be rev-parse --verify origin/... but we won't reach it
         # because status is non-empty (has changes → commit path).
         with (
             patch.object(judge, "_git", side_effect=stub),
-            patch.object(judge, "_run_command", return_value=(1, "", "")),
+            patch("devbench.github.git_ops.run_command", return_value=(1, "", "")),
         ):
             judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "feature/x", "msg")
 
@@ -170,7 +159,7 @@ class TestCommitAndPush:
         # show-ref for origin/feature/x → rc=0 (remote exists)
         with (
             patch.object(judge, "_git", side_effect=stub),
-            patch.object(judge, "_run_command", return_value=(0, "", "")),
+            patch("devbench.github.git_ops.run_command", return_value=(0, "", "")),
         ):
             judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "feature/x", "msg")
 
@@ -190,13 +179,12 @@ class TestCommitAndPush:
                 return (0, "", "")  # clean
             return (0, "", "")
 
-        # First _run_command = show-ref (skipped, already on branch).
-        # Only _run_command call = rev-parse --verify origin/feature/x → rc=1 (absent).
+        # Only run_command call = rev-parse --verify origin/feature/x → rc=1 (absent).
         run_command_responses = iter([(1, "", "")])
 
         with (
             patch.object(judge, "_git", side_effect=stub),
-            patch.object(judge, "_run_command", side_effect=run_command_responses),
+            patch("devbench.github.git_ops.run_command", side_effect=run_command_responses),
         ):
             judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "feature/x", "msg")
 
@@ -220,10 +208,10 @@ class TestCommitAndPush:
                 return (0, "oldsha\n", "")  # different → local is ahead
             return (0, "", "")
 
-        # _run_command for rev-parse --verify origin/feature/x → rc=0 (remote exists)
+        # run_command for rev-parse --verify origin/feature/x → rc=0 (remote exists)
         with (
             patch.object(judge, "_git", side_effect=stub),
-            patch.object(judge, "_run_command", return_value=(0, "", "")),
+            patch("devbench.github.git_ops.run_command", return_value=(0, "", "")),
         ):
             judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "feature/x", "msg")
 
@@ -440,13 +428,13 @@ class TestGitHelper:
 
     def test_raises_runtime_error_on_failure(self, tmp_path: Path) -> None:
         judge = GitOpsJudge()
-        with patch.object(judge, "_run_command", return_value=(1, "", "fatal: error")):
+        with patch("devbench.github.git_ops.run_command", return_value=(1, "", "fatal: error")):
             with pytest.raises(RuntimeError, match=r"git .* failed"):
                 judge._git(["status"], tmp_path)
 
     def test_returns_tuple_on_success(self, tmp_path: Path) -> None:
         judge = GitOpsJudge()
-        with patch.object(judge, "_run_command", return_value=(0, "output", "")):
+        with patch("devbench.github.git_ops.run_command", return_value=(0, "output", "")):
             rc, stdout, stderr = judge._git(["status"], tmp_path)
         assert rc == 0
         assert stdout == "output"

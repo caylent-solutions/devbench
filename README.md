@@ -204,6 +204,24 @@ devbench/
 │   ├── security_review.txt        ← Security alert evaluation
 │   ├── blocker_resolver.txt       ← Dependency and blocker assessment
 │   └── executor.txt               ← Dev agent execution prompt
+├── plugin/                        ← Claude Code plugin (agents, hooks, skills)
+│   └── devbench/
+│       ├── agents/                ← Slash-command agent definitions
+│       │   ├── executor.md        ← Dev agent: implements work units via TDD
+│       │   ├── code-reviewer.md   ← Code review judge agent
+│       │   ├── test-reviewer.md   ← Test quality judge agent
+│       │   ├── doc-reviewer.md    ← Documentation review judge agent
+│       │   ├── changes-manifest.md ← Scope/manifest review judge agent
+│       │   ├── security-reviewer.md ← Security review judge agent
+│       │   └── blocker-resolver.md  ← Dependency blocker assessment agent
+│       ├── hooks/
+│       │   └── hooks.json         ← Hook registrations (PreToolUse, PostToolUse, …)
+│       └── scripts/               ← Hook scripts invoked by hooks.json
+│           ├── hook-logger.sh     ← Logs every tool call to the hook log
+│           ├── guard-bash.sh      ← PreToolUse: blocks dangerous Bash commands
+│           ├── guard-backlog.sh   ← PreToolUse: prevents writes to backlog/ tracking files
+│           ├── guard-verdict-format.sh ← PreToolUse: validates log-verdict argument format
+│           └── assert-tests-pass.sh    ← PostToolUse: enforces test suite passes after Bash
 ├── tests/
 │   ├── conftest.py                ← Shared fixtures
 │   ├── testing.py                 ← Shared test utilities
@@ -212,7 +230,10 @@ devbench/
 │   ├── test_github/               ← git_ops, security tests
 │   ├── test_judges/               ← base, code_review, test_review, … tests
 │   ├── test_reporting/            ← report tests
-│   └── test_utils/                ← process.run_command tests
+│   ├── test_utils/                ← process.run_command tests
+│   └── unit/                      ← Unit tests for plugin hook scripts
+│       ├── test_guard_verdict_format.py ← Tests for guard-verdict-format.sh
+│       └── test_assert_tests_pass.py    ← Tests for assert-tests-pass.sh
 ├── scripts/
 │   ├── start.sh                   ← Background start script
 │   └── start-interactive.sh       ← Interactive Claude session start script
@@ -220,6 +241,35 @@ devbench/
 ├── Makefile                       ← lint, format, check, test, validate, install
 └── README.md                      ← This file
 ```
+
+## Plugin Hooks
+
+The `plugin/devbench/` directory is a Claude Code plugin that registers deterministic guards on Bash tool calls. Hooks are configured in `plugin/devbench/hooks/hooks.json`.
+
+### PreToolUse hooks (Bash)
+
+These hooks fire before every Bash tool call and can block execution by exiting with code 2:
+
+| Script | Purpose |
+|--------|---------|
+| `hook-logger.sh` | Logs the tool call (tool name, command) to the hook log for audit |
+| `guard-bash.sh` | Blocks Bash commands that are destructive or prohibited (e.g. `rm -rf /`) |
+| `guard-backlog.sh` | Prevents writes to `backlog/` tracking files (BACKLOG.md, work unit .md files) |
+| `guard-verdict-format.sh` | Validates `uv run devbench log-verdict` calls: verdict must be `pass` or `fail`, judge name must be a known identifier, and feedback must be non-empty when verdict is `fail` |
+
+### PostToolUse hooks (Bash)
+
+These hooks fire after every Bash tool call:
+
+| Script | Purpose |
+|--------|---------|
+| `hook-logger.sh` | Logs the tool result |
+| `assert-tests-pass.sh` | Runs the test suite after any Bash command that modifies source files; blocks if tests fail |
+
+### Hook exit codes
+
+- **Exit 0** — allow the tool call to proceed (or acknowledge post-use)
+- **Exit 2** — block the tool call; stderr message is shown to the agent as feedback
 
 ## Configuration
 

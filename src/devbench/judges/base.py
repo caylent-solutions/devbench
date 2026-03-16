@@ -64,7 +64,7 @@ class BaseJudge(abc.ABC):
         """Evaluate a work unit. Returns JudgeResult with verdict and reasoning."""
         ...
 
-    def _get_default_branch(self, repo_path: Path, repo: str = "") -> str:
+    def _get_default_branch(self, repo_path: Path, repo: str = "", *, remote: bool = False) -> str:
         """Return the default branch name for the repo (e.g. ``main2``, ``main``).
 
         Resolution order:
@@ -75,6 +75,11 @@ class BaseJudge(abc.ABC):
             repo_path: Local filesystem path to the repository.
             repo: Fully-qualified repo name (e.g. ``'org/repo'``).  When
                 provided, the YAML config is consulted first.
+            remote: When ``True``, return the fully-qualified remote ref
+                (e.g. ``"origin/main2"``) so callers can diff against the
+                authoritative remote state rather than a potentially-stale
+                local ref.  When ``False`` (default), return the bare branch
+                name (e.g. ``"main2"``).
 
         Raises:
             RuntimeError: If no YAML branch is configured and the git fallback
@@ -83,7 +88,7 @@ class BaseJudge(abc.ABC):
         if repo:
             configured = get_configured_default_branch(repo, RUNTIME_CONFIG)
             if configured:
-                return configured
+                return f"origin/{configured}" if remote else configured
 
         rc, stdout, _ = self._run_command(
             ["git", "rev-parse", "--abbrev-ref", "origin/HEAD"], cwd=repo_path,
@@ -93,8 +98,9 @@ class BaseJudge(abc.ABC):
                 f"Cannot determine default branch in {repo_path}. "
                 "Run 'git remote set-head origin --auto' to configure it."
             )
-        # stdout is e.g. "origin/main" — strip the remote prefix
-        return stdout.strip().removeprefix("origin/")
+        # stdout is e.g. "origin/main2"
+        full = stdout.strip()
+        return full if remote else full.removeprefix("origin/")
 
     def _get_diff(self, repo_path: Path, repo: str = "") -> str:
         """Return the combined diff of all changes: staged, unstaged, committed, and untracked.
@@ -115,7 +121,7 @@ class BaseJudge(abc.ABC):
         if rc == 0 and stdout.strip():
             parts.append(stdout)
 
-        default_branch = self._get_default_branch(repo_path, repo=repo)
+        default_branch = self._get_default_branch(repo_path, repo=repo, remote=True)
         rc, stdout, _ = self._run_command(["git", "diff", default_branch], cwd=repo_path)
         self.logger.debug("git diff %s (branch): rc=%d, chars=%d", default_branch, rc, len(stdout))
         if rc == 0 and stdout.strip():

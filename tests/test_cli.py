@@ -421,6 +421,7 @@ class TestPreParseConfig:
         assert argv == original
 
 
+@pytest.mark.unit
 class TestCmdGitOpsSubmoduleGate:
     """Tests for T3 AC-1 and AC-2: UPDATE_SUBMODULE gates update_parent_submodule_ref."""
 

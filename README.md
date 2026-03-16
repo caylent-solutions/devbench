@@ -264,7 +264,7 @@ These hooks fire after every Bash tool call:
 | Script | Purpose |
 |--------|---------|
 | `hook-logger.sh` | Logs the tool result |
-| `assert-tests-pass.sh` | Runs the test suite after any Bash command that modifies source files; blocks if tests fail |
+| `assert-tests-pass.sh` | Validates that explicit test-runner commands (`pytest`, `make test`, `make test-unit`, `make test-functional`, `make validate`, `uv run pytest`) succeed; blocks if a test command exits with non-zero |
 
 ### Hook exit codes
 

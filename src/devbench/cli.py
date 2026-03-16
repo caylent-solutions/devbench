@@ -609,7 +609,6 @@ def cmd_start() -> int:
         async for message in query(
             prompt="Run the devbench:orchestrate skill to process the backlog until complete",
             options=ClaudeAgentOptions(
-                setting_sources=["project"],
                 plugins=[{"type": "local", "path": str(plugin_path)}],
                 permission_mode="bypassPermissions",
             ),

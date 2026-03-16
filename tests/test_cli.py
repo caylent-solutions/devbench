@@ -494,6 +494,72 @@ class TestCmdGitOpsSubmoduleGate:
 
 
 @pytest.mark.unit
+class TestCmdGitOpsChecksGate:
+    """Tests for T2 AC-4 and AC-5: CI checks gate in cmd_git_ops."""
+
+    def _make_unit(self) -> WorkUnit:
+        return WorkUnit(
+            id="E202-F1-S1-T2",
+            title="Test task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E202-F1-S1-T2.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+
+    def test_cmd_git_ops_returns_error_when_checks_fail(self, tmp_path: Path) -> None:
+        """
+        Given: wait_for_checks returns False (checks failed)
+        When: cmd_git_ops is called
+        Then: returns 1 and merge_pr is never called (AC-4)
+        """
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        mock_ops = MagicMock()
+        mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/99"
+        mock_ops.wait_for_checks.return_value = False
+        repo_path = tmp_path / "devbench"
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
+            patch("devbench.cli.UPDATE_SUBMODULE", False),
+            patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+        ):
+            result = cli.cmd_git_ops("E202-F1-S1-T2")
+
+        assert result == 1
+        mock_ops.merge_pr.assert_not_called()
+
+    def test_cmd_git_ops_merges_when_checks_pass(self, tmp_path: Path) -> None:
+        """
+        Given: wait_for_checks returns True (all checks passed or no checks)
+        When: cmd_git_ops is called
+        Then: merge_pr is called and returns 0 (AC-5)
+        """
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        mock_ops = MagicMock()
+        mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/99"
+        mock_ops.wait_for_checks.return_value = True
+        repo_path = tmp_path / "devbench"
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
+            patch("devbench.cli.UPDATE_SUBMODULE", False),
+            patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+        ):
+            result = cli.cmd_git_ops("E202-F1-S1-T2")
+
+        assert result == 0
+        mock_ops.merge_pr.assert_called_once()
+
+
+@pytest.mark.unit
 class TestCmdEnsureBranch:
     """Tests for cmd_ensure_branch (T1 AC-1)."""
 

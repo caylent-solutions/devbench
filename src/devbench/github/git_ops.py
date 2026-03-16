@@ -142,7 +142,9 @@ class GitOpsJudge:
         Args:
             repo: GitHub repository in ``owner/name`` format.
             repo_path: Local filesystem path to the repository.
-            branch: Branch name to create or switch to.  Must match
+            branch: The branch name the repository is already on (set up by
+                :meth:`ensure_branch` before the executor runs).  Used for
+                validation, remote state detection, and push target.  Must match
                 ``_BRANCH_RE``: starts with an alphanumeric character; subsequent
                 characters are alphanumerics, underscores, or a single separator
                 (``.``, ``-``, or ``/``) followed by an alphanumeric/underscore.

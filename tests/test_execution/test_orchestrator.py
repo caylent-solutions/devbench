@@ -602,6 +602,81 @@ class TestProcessWorkUnit:
 
         assert result is False
 
+    def test_orchestrator_retries_when_checks_failed(self, tmp_path: Path) -> None:
+        """AC-4: when wait_for_checks returns False, orchestrator logs CHECKS_FAILED and retries."""
+        from devbench.execution.orchestrator import process_work_unit
+
+        unit = _make_unit(tmp_path)
+        exec_result = ExecutionResult(status=ExecutionStatus.IN_REVIEW, output="done", blocker="")
+        mock_judge = MagicMock()
+        mock_judge.name = "mock"
+        mock_judge.evaluate.return_value = _pass_result("mock")
+
+        mock_git_ops = MagicMock()
+        mock_git_ops.create_pr.return_value = "https://github.com/org/repo/pull/1"
+        mock_git_ops.wait_for_checks.return_value = False
+
+        execute_calls: list[dict] = []
+
+        def capture_execute(**kwargs):
+            execute_calls.append(dict(kwargs))
+            return exec_result
+
+        with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+            with patch(f"{_ORC}.claude_executor") as mock_exec:
+                mock_exec.execute.side_effect = capture_execute
+                with patch(f"{_ORC}.CodeReviewJudge", return_value=mock_judge):
+                    with patch(f"{_ORC}.TestReviewJudge", return_value=mock_judge):
+                        with patch(f"{_ORC}.DocReviewJudge", return_value=mock_judge):
+                            with patch(f"{_ORC}.ChangesManifestJudge", return_value=mock_judge):
+                                with patch(f"{_ORC}.SecurityReviewJudge", return_value=mock_judge):
+                                    with patch(f"{_ORC}.GitOpsJudge", return_value=mock_git_ops):
+                                        with patch(f"{_ORC}.BacklogManager"):
+                                            with patch(f"{_ORC}.BlockerResolverJudge"):
+                                                with patch(f"{_ORC}.MAX_RETRY_ATTEMPTS", 2):
+                                                    with patch(f"{_ORC}.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
+                                                        process_work_unit(unit)
+
+        # CHECKS_FAILED must be written to the work unit file
+        content = unit.file_path.read_text(encoding="utf-8")
+        assert "CHECKS_FAILED" in content
+        # Second attempt must receive non-empty CI failure feedback
+        assert len(execute_calls) >= 2
+        assert execute_calls[1]["feedback"] != ""
+        assert "CI" in execute_calls[1]["feedback"] or "checks" in execute_calls[1]["feedback"].lower()
+
+    def test_orchestrator_merges_when_checks_pass(self, tmp_path: Path) -> None:
+        """AC-5: when wait_for_checks returns True, orchestrator proceeds to merge."""
+        from devbench.execution.orchestrator import process_work_unit
+
+        unit = _make_unit(tmp_path)
+        exec_result = ExecutionResult(status=ExecutionStatus.IN_REVIEW, output="done", blocker="")
+        mock_judge = MagicMock()
+        mock_judge.name = "mock"
+        mock_judge.evaluate.return_value = _pass_result("mock")
+
+        mock_git_ops = MagicMock()
+        mock_git_ops.create_pr.return_value = "https://github.com/org/repo/pull/1"
+        mock_git_ops.wait_for_checks.return_value = True
+        mock_mgr = MagicMock()
+
+        with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+            with patch(f"{_ORC}.claude_executor") as mock_exec:
+                mock_exec.execute.return_value = exec_result
+                with patch(f"{_ORC}.CodeReviewJudge", return_value=mock_judge):
+                    with patch(f"{_ORC}.TestReviewJudge", return_value=mock_judge):
+                        with patch(f"{_ORC}.DocReviewJudge", return_value=mock_judge):
+                            with patch(f"{_ORC}.ChangesManifestJudge", return_value=mock_judge):
+                                with patch(f"{_ORC}.SecurityReviewJudge", return_value=mock_judge):
+                                    with patch(f"{_ORC}.GitOpsJudge", return_value=mock_git_ops):
+                                        with patch(f"{_ORC}.BacklogManager", return_value=mock_mgr):
+                                            with patch(f"{_ORC}.BlockerResolverJudge"):
+                                                with patch(f"{_ORC}.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
+                                                    result = process_work_unit(unit)
+
+        assert result is True
+        mock_git_ops.merge_pr.assert_called_once()
+
 
 class TestFeedbackPropagation:
     """Test that feedback is set correctly on each retry path."""

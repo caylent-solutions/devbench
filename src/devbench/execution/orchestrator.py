@@ -236,6 +236,8 @@ def process_work_unit(work_unit: WorkUnit) -> bool:
                 pr_number=pr_number,
                 repo_path=repo_path,
             )
+            # Gate: CI must pass before merge. wait_for_checks returns True for
+            # rc==0 (all pass) or rc!=0 with "no checks reported" (no CI configured).
             if not checks_passed:
                 work_unit.log_comment("judge/git_ops", "CHECKS_FAILED", "GitHub checks failed")
                 feedback = "GitHub CI checks failed on PR. Fix the issues."

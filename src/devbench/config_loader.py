@@ -79,6 +79,7 @@ __all__ = [
     "TimeoutConfig",
     "get_configured_default_branch",
     "get_repo_local_path",
+    "get_repo_merge_strategy",
     "get_schema_default",
     "load_runtime_config",
     "resolve_config_path",
@@ -475,3 +476,32 @@ def get_configured_default_branch(repo: str, runtime_config: RuntimeConfig) -> s
     if repo_config and repo_config.default_branch:
         return repo_config.default_branch
     return None
+
+
+def get_repo_merge_strategy(
+    repo: str,
+    runtime_config: RuntimeConfig,
+    global_default: str,
+) -> str:
+    """Return the effective merge strategy for *repo*.
+
+    Resolution order (first match wins):
+    1. ``repos.<repo>.merge_strategy`` in *runtime_config* (per-repo override).
+    2. *global_default* (the caller-resolved global value, already accounting for
+       YAML and env-var precedence).
+
+    Pure function — no subprocess calls, no I/O, no env-var reads.
+
+    Args:
+        repo: Fully-qualified repository name (e.g. ``'org/repo'``).
+        runtime_config: Loaded runtime configuration.
+        global_default: Resolved global merge strategy string (caller applies
+            YAML + env-var precedence before passing this value).
+
+    Returns:
+        The effective merge strategy string for *repo*.
+    """
+    repo_config = runtime_config.repos.get(repo)
+    if repo_config and repo_config.merge_strategy:
+        return repo_config.merge_strategy
+    return global_default

@@ -221,7 +221,7 @@ class TestMergeStrategy:
 
     def test_invalid_value_raises_runtime_error(self) -> None:
         with patch.dict(os.environ, {"JUDGE_MERGE_STRATEGY": "fast-forward"}, clear=False):
-            with pytest.raises(RuntimeError, match="JUDGE_MERGE_STRATEGY must be one of"):
+            with pytest.raises(RuntimeError, match="merge_strategy must be one of"):
                 importlib.reload(config)
 
         importlib.reload(config)
@@ -1086,3 +1086,185 @@ class TestMaxRetriesYamlPattern:
                 f"got {actual}"
             )
         importlib.reload(config)
+
+
+# ---------------------------------------------------------------------------
+# E9-F1-S2-T4: merge_strategy — global YAML default + per-repo override
+# ---------------------------------------------------------------------------
+
+def _minimal_yaml_with_merge_strategy(
+    tmp_path: Path,
+    *,
+    global_strategy: str | None = None,
+    repo_strategy: str | None = None,
+) -> Path:
+    """Return path to a minimal valid config YAML written to *tmp_path*.
+
+    Writes a YAML with two repos under caylent-solutions:
+    - ``caylent-solutions/git-repo`` with an optional per-repo merge_strategy
+    - ``caylent-solutions/devbench`` with no per-repo merge_strategy
+
+    Optionally sets a top-level ``merge_strategy`` field.
+    """
+    lines = [
+        "repos:",
+        "  caylent-solutions/git-repo:",
+        "    default_branch: main",
+    ]
+    if repo_strategy is not None:
+        lines.append(f"    merge_strategy: {repo_strategy}")
+    lines += [
+        "  caylent-solutions/devbench:",
+        "    default_branch: main2",
+        "allowed_orgs:",
+        "  - caylent-solutions",
+        "judge_model: test-judge-model",
+        "executor_model: test-executor-model",
+        "use_bedrock: false",
+        "bedrock_region: us-east-1",
+    ]
+    if global_strategy is not None:
+        lines.append(f"merge_strategy: {global_strategy}")
+    cfg = tmp_path / "test.yaml"
+    cfg.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return cfg
+
+
+@pytest.mark.unit
+class TestMergeStrategyYamlPattern:
+    """AC-1 through AC-7: merge_strategy global default + per-repo override."""
+
+    def test_merge_strategy_global_default_from_yaml(self, tmp_path: Path) -> None:
+        """
+        AC-1: merge_strategy: rebase in YAML sets global default when JUDGE_MERGE_STRATEGY absent.
+
+        Given: merge_strategy: rebase in YAML, JUDGE_MERGE_STRATEGY not set
+        When: config module is loaded
+        Then: MERGE_STRATEGY == MergeStrategy.REBASE
+        """
+        cfg = _minimal_yaml_with_merge_strategy(tmp_path, global_strategy="rebase")
+        env = {k: v for k, v in os.environ.items() if k != "JUDGE_MERGE_STRATEGY"}
+        env["JUDGE_CONFIG_PATH"] = str(cfg)
+        with patch.dict(os.environ, env, clear=True):
+            importlib.reload(config)
+            assert config.MERGE_STRATEGY == config.MergeStrategy.REBASE, (
+                f"Expected MERGE_STRATEGY=rebase from YAML, got {config.MERGE_STRATEGY!r}"
+            )
+        importlib.reload(config)
+
+    def test_per_repo_merge_strategy_overrides_global(self, tmp_path: Path) -> None:
+        """
+        AC-2: Per-repo merge_strategy overrides global YAML default for that repo only.
+
+        Given: global merge_strategy: squash, caylent-solutions/git-repo merge_strategy: rebase
+        When: get_repo_merge_strategy('caylent-solutions/git-repo') is called
+        Then: returns 'rebase' (per-repo overrides global)
+        And: get_repo_merge_strategy('caylent-solutions/devbench') returns 'squash' (global default)
+        """
+        cfg = _minimal_yaml_with_merge_strategy(
+            tmp_path, global_strategy="squash", repo_strategy="rebase"
+        )
+        env = {k: v for k, v in os.environ.items() if k != "JUDGE_MERGE_STRATEGY"}
+        env["JUDGE_CONFIG_PATH"] = str(cfg)
+        with patch.dict(os.environ, env, clear=True):
+            importlib.reload(config)
+            per_repo = config.get_repo_merge_strategy("caylent-solutions/git-repo")
+            global_fallback = config.get_repo_merge_strategy("caylent-solutions/devbench")
+        importlib.reload(config)
+
+        assert per_repo == "rebase", (
+            f"Expected per-repo strategy 'rebase', got {per_repo!r}"
+        )
+        assert global_fallback == "squash", (
+            f"Expected global fallback 'squash' for repo without strategy, got {global_fallback!r}"
+        )
+
+    def test_judge_merge_strategy_env_warns_deprecated(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """
+        AC-3: JUDGE_MERGE_STRATEGY=merge env var overrides YAML and emits deprecation WARNING.
+
+        Given: YAML has merge_strategy: rebase, JUDGE_MERGE_STRATEGY=merge
+        When: config module is loaded
+        Then: MERGE_STRATEGY == MergeStrategy.MERGE
+        And: a WARNING-level log message mentioning JUDGE_MERGE_STRATEGY and 'deprecated' is emitted
+        """
+        cfg = _minimal_yaml_with_merge_strategy(tmp_path, global_strategy="rebase")
+        env = dict(os.environ)
+        env["JUDGE_CONFIG_PATH"] = str(cfg)
+        env["JUDGE_MERGE_STRATEGY"] = "merge"
+        with caplog.at_level(logging.WARNING, logger="devbench.config"):
+            with patch.dict(os.environ, env, clear=True):
+                importlib.reload(config)
+                strategy = config.MERGE_STRATEGY
+
+        assert strategy == config.MergeStrategy.MERGE, (
+            f"Expected MERGE_STRATEGY=merge from JUDGE_MERGE_STRATEGY, got {strategy!r}"
+        )
+        assert any(
+            "JUDGE_MERGE_STRATEGY" in r.message and "deprecated" in r.message.lower()
+            for r in caplog.records
+        ), (
+            f"Expected a deprecation WARNING for JUDGE_MERGE_STRATEGY. "
+            f"Log records: {[r.message for r in caplog.records]}"
+        )
+        importlib.reload(config)
+
+    def test_get_repo_merge_strategy_importable_from_config(self) -> None:
+        """
+        AC-5: get_repo_merge_strategy is importable from devbench.config.
+
+        Given: devbench.config module is loaded
+        When: get_repo_merge_strategy is accessed
+        Then: it is callable without raising ImportError
+        """
+        from devbench.config import get_repo_merge_strategy
+
+        assert callable(get_repo_merge_strategy), (
+            "get_repo_merge_strategy must be callable"
+        )
+
+    def test_repo_without_strategy_falls_back_to_global(self, tmp_path: Path) -> None:
+        """
+        AC-6: Repo with no merge_strategy field falls back to global YAML default.
+
+        Given: global merge_strategy: rebase in YAML, caylent-solutions/devbench has no per-repo field
+        When: get_repo_merge_strategy('caylent-solutions/devbench') is called
+        Then: returns 'rebase' (global default)
+        """
+        cfg = _minimal_yaml_with_merge_strategy(tmp_path, global_strategy="rebase", repo_strategy=None)
+        env = {k: v for k, v in os.environ.items() if k != "JUDGE_MERGE_STRATEGY"}
+        env["JUDGE_CONFIG_PATH"] = str(cfg)
+        with patch.dict(os.environ, env, clear=True):
+            importlib.reload(config)
+            result = config.get_repo_merge_strategy("caylent-solutions/devbench")
+        importlib.reload(config)
+
+        assert result == "rebase", (
+            f"Expected 'rebase' (global YAML default) for repo without per-repo strategy, got {result!r}"
+        )
+
+    def test_merge_strategy_default_is_squash(self, tmp_path: Path) -> None:
+        """
+        AC-7: Omitting merge_strategy from YAML entirely uses 'squash' (code default).
+
+        Given: YAML has no merge_strategy field, JUDGE_MERGE_STRATEGY not set
+        When: get_repo_merge_strategy is called for any repo
+        Then: returns 'squash'
+        """
+        cfg = _minimal_yaml_with_merge_strategy(tmp_path, global_strategy=None, repo_strategy=None)
+        env = {k: v for k, v in os.environ.items() if k != "JUDGE_MERGE_STRATEGY"}
+        env["JUDGE_CONFIG_PATH"] = str(cfg)
+        with patch.dict(os.environ, env, clear=True):
+            importlib.reload(config)
+            result = config.get_repo_merge_strategy("caylent-solutions/git-repo")
+            merge_strategy_const = config.MERGE_STRATEGY
+        importlib.reload(config)
+
+        assert result == "squash", (
+            f"Expected 'squash' (code default) when merge_strategy absent from YAML, got {result!r}"
+        )
+        assert merge_strategy_const == config.MergeStrategy.SQUASH, (
+            f"Expected MERGE_STRATEGY=squash (code default), got {merge_strategy_const!r}"
+        )

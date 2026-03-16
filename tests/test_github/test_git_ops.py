@@ -395,6 +395,29 @@ class TestMergePr:
         assert kwargs.get("cwd") == tmp_path
         assert kwargs.get("repo") == "caylent-solutions/git-repo"
 
+    def test_git_ops_uses_per_repo_merge_strategy(self, tmp_path: Path) -> None:
+        """
+        AC-4: git_ops.merge_pr() uses the per-repo strategy, not the global constant.
+
+        Given: get_repo_merge_strategy returns 'rebase' for the target repo
+        When: merge_pr is called
+        Then: _gh is called with the '--rebase' flag (per-repo strategy)
+        """
+        from devbench.config import MergeStrategy
+
+        judge = GitOpsJudge()
+        with (
+            patch("devbench.github.git_ops.get_repo_merge_strategy", return_value="rebase"),
+            patch.object(judge, "_gh", return_value=(0, "", "")) as mock_gh,
+        ):
+            judge.merge_pr("caylent-solutions/git-repo", 42, repo_path=tmp_path)
+
+        cmd_args, _ = mock_gh.call_args
+        cmd = cmd_args[0]
+        assert MergeStrategy.REBASE.flag in cmd, (
+            f"Expected '{MergeStrategy.REBASE.flag}' in gh command, got: {cmd}"
+        )
+
 
 class TestCreateTag:
     """Test create_tag method."""

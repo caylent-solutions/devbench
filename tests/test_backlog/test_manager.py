@@ -967,6 +967,142 @@ class TestValidate:
             f"dependency check broken: {errors4}"
         )
 
+    # ------------------------------------------------------------------
+    # Check 7: dep-status violation detection (E15-F2-S1-T2)
+    # ------------------------------------------------------------------
+
+    def test_validate_reports_in_queue_unit_with_incomplete_dep(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """AC-1: validate reports an error when an in-queue unit has an in-queue dep.
+
+        Given: T2 is in-queue and depends on T1 which is also in-queue
+        When: validate is called
+        Then: An error is emitted for T2 indicating T1 is 'in-queue'
+        Spec: E15-F2-S1-T2 AC-1
+        """
+        self._make_wu(backlog_dir, "E0-F1-S1-T1", "in-queue")
+        self._make_wu(backlog_dir, "E0-F1-S1-T2", "in-queue")
+        idx = self._make_index(
+            tmp_path,
+            "| E0-F1-S1-T1 | Task 1 | Task | in-queue | none | repo | `backlog/E0-F1-S1-T1.md` |\n"
+            "| E0-F1-S1-T2 | Task 2 | Task | in-queue | E0-F1-S1-T1 | repo | `backlog/E0-F1-S1-T2.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        assert any(
+            "E0-F1-S1-T2" in e
+            and "E0-F1-S1-T1" in e
+            and "in-queue" in e
+            for e in errors
+        ), f"Expected dep-status error for T2 but got: {errors}"
+
+    def test_validate_reports_in_progress_unit_with_blocked_dep(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """AC-2: validate reports an error when an in-progress unit has a blocked dep.
+
+        Given: T2 is in-progress and depends on T1 which is blocked
+        When: validate is called
+        Then: An error is emitted for T2 indicating T1 is 'blocked'
+        Spec: E15-F2-S1-T2 AC-2
+        """
+        self._make_wu(backlog_dir, "E0-F1-S1-T1", "blocked")
+        self._make_wu(backlog_dir, "E0-F1-S1-T2", "in-progress")
+        idx = self._make_index(
+            tmp_path,
+            "| E0-F1-S1-T1 | Task 1 | Task | blocked | none | repo | `backlog/E0-F1-S1-T1.md` |\n"
+            "| E0-F1-S1-T2 | Task 2 | Task | in-progress | E0-F1-S1-T1 | repo | `backlog/E0-F1-S1-T2.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        assert any(
+            "E0-F1-S1-T2" in e
+            and "E0-F1-S1-T1" in e
+            and "blocked" in e
+            for e in errors
+        ), f"Expected dep-status error for T2 with blocked dep but got: {errors}"
+
+    def test_validate_passes_when_all_deps_done(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """AC-3: validate does not report an error when all deps of an in-queue unit are done.
+
+        Given: T2 is in-queue and depends on T1 which is done
+        When: validate is called
+        Then: No dep-status error is emitted
+        Spec: E15-F2-S1-T2 AC-3
+        """
+        self._make_wu(backlog_dir, "E0-F1-S1-T1", "done")
+        self._make_wu(backlog_dir, "E0-F1-S1-T2", "in-queue")
+        idx = self._make_index(
+            tmp_path,
+            "| E0-F1-S1-T1 | Task 1 | Task | done | none | repo | `backlog/E0-F1-S1-T1.md` |\n"
+            "| E0-F1-S1-T2 | Task 2 | Task | in-queue | E0-F1-S1-T1 | repo | `backlog/E0-F1-S1-T2.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        dep_status_errors = [
+            e for e in errors
+            if "E0-F1-S1-T2" in e and "E0-F1-S1-T1" in e and ("is '" in e or "but unit" in e)
+        ]
+        assert dep_status_errors == [], (
+            f"Expected no dep-status errors but got: {dep_status_errors}"
+        )
+
+    def test_validate_does_not_flag_blocked_units(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """AC-4: validate does not report dep-status errors for blocked units.
+
+        Given: T2 is blocked and depends on T1 which is in-queue
+        When: validate is called
+        Then: No dep-status error is emitted for T2
+        Spec: E15-F2-S1-T2 AC-4
+        """
+        self._make_wu(backlog_dir, "E0-F1-S1-T1", "in-queue")
+        self._make_wu(backlog_dir, "E0-F1-S1-T2", "blocked")
+        idx = self._make_index(
+            tmp_path,
+            "| E0-F1-S1-T1 | Task 1 | Task | in-queue | none | repo | `backlog/E0-F1-S1-T1.md` |\n"
+            "| E0-F1-S1-T2 | Task 2 | Task | blocked | E0-F1-S1-T1 | repo | `backlog/E0-F1-S1-T2.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        dep_status_errors = [
+            e for e in errors
+            if "E0-F1-S1-T2" in e and ("is '" in e or "but unit" in e)
+        ]
+        assert dep_status_errors == [], (
+            f"blocked units must not be flagged for dep-status but got: {dep_status_errors}"
+        )
+
+    def test_validate_error_includes_dep_status(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """AC-5: error message includes dep ID and its current status.
+
+        Given: T2 is in-queue with dep T1 that is in-review
+        When: validate is called
+        Then: Error contains T1's ID and status 'in-review', and T2's status 'in-queue'
+        Spec: E15-F2-S1-T2 AC-5
+        """
+        self._make_wu(backlog_dir, "E0-F1-S1-T1", "in-review")
+        self._make_wu(backlog_dir, "E0-F1-S1-T2", "in-queue")
+        idx = self._make_index(
+            tmp_path,
+            "| E0-F1-S1-T1 | Task 1 | Task | in-review | none | repo | `backlog/E0-F1-S1-T1.md` |\n"
+            "| E0-F1-S1-T2 | Task 2 | Task | in-queue | E0-F1-S1-T1 | repo | `backlog/E0-F1-S1-T2.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        # Error must match: "<unit-id>: dep '<dep-id>' is '<dep-status>' but unit is '<unit-status>'"
+        matching = [
+            e for e in errors
+            if "E0-F1-S1-T2" in e
+            and "E0-F1-S1-T1" in e
+            and "in-review" in e
+            and "in-queue" in e
+        ]
+        assert matching, (
+            f"Expected error with dep ID 'E0-F1-S1-T1' and status 'in-review' but got: {errors}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # E4-F1-S1-T1: Rename BacklogManagerJudge → BacklogManager

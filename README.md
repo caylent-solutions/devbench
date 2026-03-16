@@ -219,9 +219,10 @@ devbench/
 │       └── scripts/               ← Hook scripts invoked by hooks.json
 │           ├── hook-logger.sh     ← Logs every tool call to the hook log
 │           ├── guard-bash.sh      ← PreToolUse: blocks dangerous Bash commands
-│           ├── guard-backlog.sh   ← PreToolUse: prevents writes to backlog/ tracking files
+│           ├── guard-backlog.sh   ← PreToolUse: prevents direct writes to backlog/ tracking files (Bash)
 │           ├── guard-verdict-format.sh ← PreToolUse: validates log-verdict argument format
 │           ├── guard-git-stage.sh      ← PreToolUse: blocks git commit when no files are staged
+│           ├── guard-work-unit-write.sh ← PreToolUse: blocks Write/Edit to work unit .md files under backlog/
 │           └── assert-tests-pass.sh    ← PostToolUse: enforces test suite passes after Bash
 ├── tests/
 │   ├── conftest.py                ← Shared fixtures
@@ -233,9 +234,10 @@ devbench/
 │   ├── test_reporting/            ← report tests
 │   ├── test_utils/                ← process.run_command tests
 │   └── unit/                      ← Unit tests for plugin hook scripts
-│       ├── test_guard_verdict_format.py ← Tests for guard-verdict-format.sh
-│       ├── test_guard_git_stage.py      ← Tests for guard-git-stage.sh
-│       └── test_assert_tests_pass.py    ← Tests for assert-tests-pass.sh
+│       ├── test_guard_verdict_format.py  ← Tests for guard-verdict-format.sh
+│       ├── test_guard_git_stage.py       ← Tests for guard-git-stage.sh
+│       ├── test_guard_work_unit_write.py ← Tests for guard-work-unit-write.sh
+│       └── test_assert_tests_pass.py     ← Tests for assert-tests-pass.sh
 ├── scripts/
 │   ├── start.sh                   ← Background start script
 │   └── start-interactive.sh       ← Interactive Claude session start script
@@ -246,7 +248,7 @@ devbench/
 
 ## Plugin Hooks
 
-The `plugin/devbench/` directory is a Claude Code plugin that registers deterministic guards on Bash tool calls. Hooks are configured in `plugin/devbench/hooks/hooks.json`.
+The `plugin/devbench/` directory is a Claude Code plugin that registers deterministic guards on Bash, Write, and Edit tool calls. Hooks are configured in `plugin/devbench/hooks/hooks.json`.
 
 ### PreToolUse hooks (Bash)
 
@@ -256,9 +258,16 @@ These hooks fire before every Bash tool call and can block execution by exiting 
 |--------|---------|
 | `hook-logger.sh` | Logs the tool call (tool name, command) to the hook log for audit |
 | `guard-bash.sh` | Blocks Bash commands that are destructive or prohibited (e.g. `rm -rf /`) |
-| `guard-backlog.sh` | Prevents writes to `backlog/` tracking files (BACKLOG.md, work unit .md files) |
 | `guard-verdict-format.sh` | Validates `uv run devbench log-verdict` calls: verdict must be `pass` or `fail`, judge name must be a known identifier, and feedback must be non-empty when verdict is `fail` |
 | `guard-git-stage.sh` | Blocks `git commit` when no files are staged; runs `git diff --cached --quiet` and exits 2 with guidance to run `git add` if the index is empty |
+
+### PreToolUse hooks (Write and Edit)
+
+These hooks fire before every Write and Edit tool call and can block execution by exiting with code 2:
+
+| Script | Purpose |
+|--------|---------|
+| `guard-work-unit-write.sh` | Blocks direct Write/Edit to work unit `.md` files under `backlog/` (excludes `BACKLOG.md` and files under `backlog/config/`); work unit files are managed exclusively by the orchestrate skill |
 
 ### PostToolUse hooks (Bash)
 

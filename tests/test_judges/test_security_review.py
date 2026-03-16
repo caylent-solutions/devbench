@@ -90,10 +90,15 @@ class TestSummarizeAlerts:
         assert "high" in summary
 
     def test_truncates_at_limit(self) -> None:
+        from devbench.config import ALERT_SUMMARY_LIMIT
+
         judge = SecurityReviewJudge()
-        alerts: list[dict[str, object]] = [{"secret_type_display_name": f"Secret-{i}"} for i in range(15)]
+        total = ALERT_SUMMARY_LIMIT + 10
+        alerts: list[dict[str, object]] = [
+            {"secret_type_display_name": f"Secret-{i}"} for i in range(total)
+        ]
         summary = judge._summarize_alerts(alerts, "secret-scanning")
-        assert "and 5 more" in summary
+        assert "and 10 more" in summary
 
 
 class TestFetchAlerts:

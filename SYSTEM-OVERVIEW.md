@@ -248,34 +248,41 @@ git_ops:                             # optional — git workflow behaviour setti
 
 When `use_bedrock` is `true`, the executor subprocess receives `CLAUDE_CODE_USE_BEDROCK=1` in its environment. When `false`, `CLAUDE_CODE_USE_BEDROCK` is explicitly removed from the subprocess environment.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `JUDGE_CONFIG_PATH` | *(see above)* | Override YAML config file path |
-| `JUDGE_MERGE_STRATEGY` | `squash` | PR merge strategy: `merge`, `squash`, or `rebase` |
-| `ANTHROPIC_MODEL` | *(YAML or default)* | Silently overrides both `CLAUDE_MODEL` and `EXECUTOR_MODEL` |
-| `JUDGE_DEFAULT_MODEL_DIRECT` | *(required when no YAML model and not using Bedrock)* | Default model ID for direct Anthropic API path. RuntimeError at startup if unset and no YAML model or `ANTHROPIC_MODEL` is configured. |
-| `JUDGE_DEFAULT_MODEL_BEDROCK` | *(required when no YAML model and using Bedrock)* | Default model ID for AWS Bedrock path. RuntimeError at startup if unset and no YAML model or `ANTHROPIC_MODEL` is configured. |
-| `JUDGE_CLAUDE_MODEL` | *(deprecated)* | **Deprecated.** Use `judge_model`/`executor_model` in YAML or `ANTHROPIC_MODEL` instead |
-| `JUDGE_GH_ORG` | *(deprecated)* | **Deprecated.** Use `allowed_orgs` in YAML instead |
-| `JUDGE_MAX_RETRIES` | `10` | Max retry attempts per work unit before marking blocked |
-| `JUDGE_USE_BEDROCK` | *(YAML value)* | Override `use_bedrock` from YAML. `1`/`true`/`yes` enables Bedrock |
-| `JUDGE_BEDROCK_REGION` | *(required when use_bedrock=true)* | AWS region for Bedrock; falls back to `AWS_REGION`, then `bedrock_region` in YAML. RuntimeError if all absent and `use_bedrock=true`. |
-| `JUDGE_GH_TOKEN_FILE` | `~/.gh_token_env` | GitHub token file path |
-| `JUDGE_GH_TIMEOUT` | `600` | GitHub check wait timeout (seconds) |
-| `JUDGE_GH_API_TIMEOUT` | `30` | GitHub API call timeout (seconds) |
-| `JUDGE_TEST_TIMEOUT` | `300` | Test execution timeout (seconds) |
-| `JUDGE_LLM_TIMEOUT` | `300` | LLM evaluation timeout (seconds) |
-| `JUDGE_COMMAND_TIMEOUT` | *(see config)* | Optional. Maximum seconds to wait for a subprocess command before timing out. Positive integer (seconds). Used by `run_command()` in `utils/process.py` and all judge subprocess calls. |
-| `JUDGE_EXECUTOR_TIMEOUT` | `1800` | Dev agent execution timeout (seconds) |
-| `JUDGE_EXECUTOR_MAX_TURNS` | `50` | Max turns for dev agent execution |
-| `JUDGE_ORCHESTRATOR_POLL_INTERVAL` | `10` | Seconds between orchestrator poll cycles |
-| `JUDGE_SECURITY_FETCH_TIMEOUT` | `120` | Security advisory fetch timeout (seconds) |
-| `JUDGE_OUTPUT_TRUNCATION` | `2000` | Output truncation limit (chars) |
-| `JUDGE_LLM_EVIDENCE_TRUNCATION` | `15000` | LLM evidence truncation (chars) |
-| `JUDGE_LLM_FILE_CONTEXT_LIMIT` | `5` | Max files sent to LLM context |
-| `JUDGE_LLM_FILE_PREVIEW_CHARS` | `3000` | Per-file preview truncation (chars) |
-| `JUDGE_ALERT_SUMMARY_LIMIT` | `10` | Max security alerts included in judge evidence |
-| `JUDGE_CLAUDE_CREDENTIALS_FILE` | `~/.claude/.credentials.json` | Claude Code OAuth credentials file path |
+**Timeout, limit, and max_retries precedence** (first match wins, silent — no warning emitted):
+1. Environment variable override
+2. YAML field (`timeouts.*`, `limits.*`, or `max_retries`)
+3. Schema default (defined in `config-schema.json`; no hardcoded values in Python)
+
+Setting a timeout/limit env var to an empty string (`VAR=`) is a misconfiguration and raises `ValueError` at startup. Unset the variable or provide a valid integer.
+
+| Variable | YAML Field | Schema Default | Description |
+|----------|------------|--------------|-------------|
+| `JUDGE_CONFIG_PATH` | — | *(see above)* | Override YAML config file path |
+| `JUDGE_MERGE_STRATEGY` | — | `squash` | PR merge strategy: `merge`, `squash`, or `rebase` |
+| `ANTHROPIC_MODEL` | — | *(YAML or default)* | Silently overrides both `CLAUDE_MODEL` and `EXECUTOR_MODEL` |
+| `JUDGE_DEFAULT_MODEL_DIRECT` | — | *(required when no YAML model and not using Bedrock)* | Default model ID for direct Anthropic API path. RuntimeError at startup if unset and no YAML model or `ANTHROPIC_MODEL` is configured. |
+| `JUDGE_DEFAULT_MODEL_BEDROCK` | — | *(required when no YAML model and using Bedrock)* | Default model ID for AWS Bedrock path. RuntimeError at startup if unset and no YAML model or `ANTHROPIC_MODEL` is configured. |
+| `JUDGE_CLAUDE_MODEL` | — | *(deprecated)* | **Deprecated.** Use `judge_model`/`executor_model` in YAML or `ANTHROPIC_MODEL` instead |
+| `JUDGE_GH_ORG` | — | *(deprecated)* | **Deprecated.** Use `allowed_orgs` in YAML instead |
+| `JUDGE_MAX_RETRIES` | `max_retries` | `10` | Max retry attempts per work unit before marking blocked |
+| `JUDGE_USE_BEDROCK` | `use_bedrock` | *(YAML value)* | Override `use_bedrock` from YAML. `1`/`true`/`yes` enables Bedrock |
+| `JUDGE_BEDROCK_REGION` | `bedrock_region` | *(required when use_bedrock=true)* | AWS region for Bedrock; falls back to `AWS_REGION`, then `bedrock_region` in YAML. RuntimeError if all absent and `use_bedrock=true`. |
+| `JUDGE_GH_TOKEN_FILE` | — | `~/.gh_token_env` | GitHub token file path |
+| `JUDGE_GH_TIMEOUT` | `timeouts.github_check` | `600` (schema) | GitHub check wait timeout (seconds) |
+| `JUDGE_GH_API_TIMEOUT` | `timeouts.gh_api` | `30` (schema) | GitHub API call timeout (seconds) |
+| `JUDGE_TEST_TIMEOUT` | `timeouts.test` | `300` (schema) | Test execution timeout (seconds) |
+| `JUDGE_LLM_TIMEOUT` | `timeouts.llm` | `300` (schema) | LLM evaluation timeout (seconds) |
+| `JUDGE_COMMAND_TIMEOUT` | `timeouts.command` | `120` (schema) | Maximum seconds to wait for a subprocess command before timing out. Used by `run_command()` in `utils/process.py` and all judge subprocess calls. |
+| `JUDGE_EXECUTOR_TIMEOUT` | `timeouts.executor` | `1800` (schema) | Dev agent execution timeout (seconds) |
+| `JUDGE_EXECUTOR_MAX_TURNS` | `timeouts.executor_max_turns` | `50` (schema) | Max turns for dev agent execution |
+| `JUDGE_ORCHESTRATOR_POLL_INTERVAL` | `timeouts.orchestrator_poll_interval` | `10` (schema) | Seconds between orchestrator poll cycles |
+| `JUDGE_SECURITY_FETCH_TIMEOUT` | `timeouts.security_fetch` | `120` (schema) | Security advisory fetch timeout (seconds) |
+| `JUDGE_OUTPUT_TRUNCATION` | `limits.output_truncation` | `2000` (schema) | Output truncation limit (chars) |
+| `JUDGE_LLM_EVIDENCE_TRUNCATION` | `limits.llm_evidence_truncation` | `15000` (schema) | LLM evidence truncation (chars) |
+| `JUDGE_LLM_FILE_CONTEXT_LIMIT` | `limits.llm_file_context` | `5` (schema) | Max files sent to LLM context |
+| `JUDGE_LLM_FILE_PREVIEW_CHARS` | `limits.llm_file_preview_chars` | `3000` (schema) | Per-file preview truncation (chars) |
+| `JUDGE_ALERT_SUMMARY_LIMIT` | `limits.alert_summary` | `10` (schema) | Max security alerts included in judge evidence |
+| `JUDGE_CLAUDE_CREDENTIALS_FILE` | — | `~/.claude/.credentials.json` | Claude Code OAuth credentials file path |
 
 ## Key Design Decisions
 

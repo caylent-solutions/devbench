@@ -42,6 +42,7 @@
     "max_retries": {
       "type": "integer",
       "minimum": 1,
+      "default": 10,
       "description": "Maximum number of retry attempts."
     },
     "use_bedrock": {
@@ -75,46 +76,55 @@
         "gh_api": {
           "type": "integer",
           "minimum": 1,
+          "default": 30,
           "description": "GitHub API call timeout in seconds."
         },
         "test": {
           "type": "integer",
           "minimum": 1,
+          "default": 300,
           "description": "Test suite run timeout in seconds."
         },
         "security_fetch": {
           "type": "integer",
           "minimum": 1,
+          "default": 120,
           "description": "Security advisory fetch timeout in seconds."
         },
         "llm": {
           "type": "integer",
           "minimum": 1,
+          "default": 300,
           "description": "LLM API call timeout in seconds."
         },
         "command": {
           "type": "integer",
           "minimum": 1,
+          "default": 120,
           "description": "Shell command execution timeout in seconds."
         },
         "executor": {
           "type": "integer",
           "minimum": 1,
+          "default": 1800,
           "description": "Executor agent overall timeout in seconds."
         },
         "executor_max_turns": {
           "type": "integer",
           "minimum": 1,
+          "default": 50,
           "description": "Maximum number of turns for the executor agent."
         },
         "orchestrator_poll_interval": {
           "type": "integer",
           "minimum": 1,
+          "default": 10,
           "description": "Orchestrator polling interval in seconds."
         },
         "github_check": {
           "type": "integer",
           "minimum": 1,
+          "default": 600,
           "description": "GitHub check status polling timeout in seconds."
         }
       }
@@ -138,26 +148,31 @@
         "alert_summary": {
           "type": "integer",
           "minimum": 1,
+          "default": 10,
           "description": "Maximum number of security alert summaries to include."
         },
         "output_truncation": {
           "type": "integer",
           "minimum": 1,
+          "default": 2000,
           "description": "Character limit for command output truncation."
         },
         "llm_evidence_truncation": {
           "type": "integer",
           "minimum": 1,
+          "default": 15000,
           "description": "Character limit for LLM evidence content truncation."
         },
         "llm_file_context": {
           "type": "integer",
           "minimum": 1,
+          "default": 5,
           "description": "Maximum number of files included in LLM context."
         },
         "llm_file_preview_chars": {
           "type": "integer",
           "minimum": 1,
+          "default": 3000,
           "description": "Character limit for per-file LLM preview."
         }
       }

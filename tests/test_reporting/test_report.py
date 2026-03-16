@@ -183,7 +183,8 @@ class TestLlmEvaluateBedrock:
         ):
             result = judge._llm_evaluate("prompt", {"s": "c"})
 
-        mock_cls.assert_called_once_with(aws_region="us-east-1", timeout=300)
+        from devbench.config import LLM_TIMEOUT
+        mock_cls.assert_called_once_with(aws_region="us-east-1", timeout=LLM_TIMEOUT)
         assert result.verdict is Verdict.PASS
 
     def test_bedrock_does_not_call_get_api_key(self) -> None:

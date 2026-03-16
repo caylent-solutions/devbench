@@ -22,6 +22,7 @@ from pathlib import Path
 from devbench.config_loader import (
     RuntimeConfig,
     get_repo_local_path,
+    get_schema_default,
     load_runtime_config,
     resolve_config_path,
 )
@@ -109,8 +110,48 @@ BACKLOG_INDEX: Path = WORKSPACE_ROOT / "BACKLOG.md"
 # ---------------------------------------------------------------------------
 # Operational parameters
 # ---------------------------------------------------------------------------
-MAX_RETRY_ATTEMPTS: int = int(os.environ.get("JUDGE_MAX_RETRIES", "10"))
-GITHUB_CHECK_TIMEOUT_SECONDS: int = int(os.environ.get("JUDGE_GH_TIMEOUT", "600"))
+
+
+def _env_int(env_var: str, yaml_value: int | None, schema_section: str, schema_field: str) -> int:
+    """Return an integer config value using yaml-with-env-override precedence.
+
+    Precedence (first match wins):
+    1. Environment variable *env_var* (silent override — no warning logged).
+    2. YAML value *yaml_value* (when not ``None``).
+    3. Schema default from ``config-schema.json`` (``schema_section.schema_field``).
+
+    Args:
+        env_var: Name of the environment variable override.
+        yaml_value: Value loaded from YAML, or ``None`` when absent.
+        schema_section: Schema section name for default lookup (e.g. ``"timeouts"``).
+            Pass ``""`` for top-level fields (e.g. ``"max_retries"``).
+        schema_field: Field name within *schema_section* for default lookup.
+
+    Returns:
+        Resolved integer configuration value.
+
+    Raises:
+        ValueError: If *env_var* is set to an empty string.  An explicitly empty
+            env var is a misconfiguration; unset the variable or provide a valid
+            integer value.
+        ValueError: If *env_var* is set to a non-integer string.
+    """
+    raw = os.environ.get(env_var)
+    if raw is not None:
+        if not raw:
+            raise ValueError(
+                f"{env_var} is set but empty; provide a valid integer or unset it."
+            )
+        return int(raw)
+    if yaml_value is not None:
+        return yaml_value
+    return get_schema_default(schema_section, schema_field)
+
+
+MAX_RETRY_ATTEMPTS: int = _env_int("JUDGE_MAX_RETRIES", RUNTIME_CONFIG.max_retries, "", "max_retries")
+GITHUB_CHECK_TIMEOUT_SECONDS: int = _env_int(
+    "JUDGE_GH_TIMEOUT", RUNTIME_CONFIG.timeouts.github_check, "timeouts", "github_check"
+)
 
 # ---------------------------------------------------------------------------
 # USE_BEDROCK / BEDROCK_REGION — env var overrides YAML value.
@@ -219,35 +260,56 @@ except ValueError:
 # ---------------------------------------------------------------------------
 # Timeouts — all values in seconds
 # ---------------------------------------------------------------------------
-GH_API_TIMEOUT: int = int(os.environ.get("JUDGE_GH_API_TIMEOUT", "30"))
-TEST_TIMEOUT: int = int(os.environ.get("JUDGE_TEST_TIMEOUT", "300"))
-SECURITY_FETCH_TIMEOUT: int = int(os.environ.get("JUDGE_SECURITY_FETCH_TIMEOUT", "120"))
-LLM_TIMEOUT: int = int(os.environ.get("JUDGE_LLM_TIMEOUT", "300"))
-COMMAND_TIMEOUT: int = int(os.environ.get("JUDGE_COMMAND_TIMEOUT", "120"))
+GH_API_TIMEOUT: int = _env_int("JUDGE_GH_API_TIMEOUT", RUNTIME_CONFIG.timeouts.gh_api, "timeouts", "gh_api")
+TEST_TIMEOUT: int = _env_int("JUDGE_TEST_TIMEOUT", RUNTIME_CONFIG.timeouts.test, "timeouts", "test")
+SECURITY_FETCH_TIMEOUT: int = _env_int(
+    "JUDGE_SECURITY_FETCH_TIMEOUT", RUNTIME_CONFIG.timeouts.security_fetch, "timeouts", "security_fetch"
+)
+LLM_TIMEOUT: int = _env_int("JUDGE_LLM_TIMEOUT", RUNTIME_CONFIG.timeouts.llm, "timeouts", "llm")
+COMMAND_TIMEOUT: int = _env_int("JUDGE_COMMAND_TIMEOUT", RUNTIME_CONFIG.timeouts.command, "timeouts", "command")
 
 # ---------------------------------------------------------------------------
 # Thresholds and limits
 # ---------------------------------------------------------------------------
-ALERT_SUMMARY_LIMIT: int = int(os.environ.get("JUDGE_ALERT_SUMMARY_LIMIT", "10"))
-OUTPUT_TRUNCATION_LIMIT: int = int(os.environ.get("JUDGE_OUTPUT_TRUNCATION", "2000"))
-LLM_EVIDENCE_TRUNCATION: int = int(os.environ.get("JUDGE_LLM_EVIDENCE_TRUNCATION", "15000"))
+ALERT_SUMMARY_LIMIT: int = _env_int(
+    "JUDGE_ALERT_SUMMARY_LIMIT", RUNTIME_CONFIG.limits.alert_summary, "limits", "alert_summary"
+)
+OUTPUT_TRUNCATION_LIMIT: int = _env_int(
+    "JUDGE_OUTPUT_TRUNCATION", RUNTIME_CONFIG.limits.output_truncation, "limits", "output_truncation"
+)
+LLM_EVIDENCE_TRUNCATION: int = _env_int(
+    "JUDGE_LLM_EVIDENCE_TRUNCATION", RUNTIME_CONFIG.limits.llm_evidence_truncation, "limits", "llm_evidence_truncation"
+)
 
 # ---------------------------------------------------------------------------
 # LLM context limits
 # ---------------------------------------------------------------------------
-LLM_FILE_CONTEXT_LIMIT: int = int(os.environ.get("JUDGE_LLM_FILE_CONTEXT_LIMIT", "5"))
-LLM_FILE_PREVIEW_CHARS: int = int(os.environ.get("JUDGE_LLM_FILE_PREVIEW_CHARS", "3000"))
+LLM_FILE_CONTEXT_LIMIT: int = _env_int(
+    "JUDGE_LLM_FILE_CONTEXT_LIMIT", RUNTIME_CONFIG.limits.llm_file_context, "limits", "llm_file_context"
+)
+LLM_FILE_PREVIEW_CHARS: int = _env_int(
+    "JUDGE_LLM_FILE_PREVIEW_CHARS", RUNTIME_CONFIG.limits.llm_file_preview_chars, "limits", "llm_file_preview_chars"
+)
 
 # ---------------------------------------------------------------------------
 # Claude executor
 # ---------------------------------------------------------------------------
-EXECUTOR_TIMEOUT: int = int(os.environ.get("JUDGE_EXECUTOR_TIMEOUT", "1800"))
-EXECUTOR_MAX_TURNS: int = int(os.environ.get("JUDGE_EXECUTOR_MAX_TURNS", "50"))
+EXECUTOR_TIMEOUT: int = _env_int(
+    "JUDGE_EXECUTOR_TIMEOUT", RUNTIME_CONFIG.timeouts.executor, "timeouts", "executor"
+)
+EXECUTOR_MAX_TURNS: int = _env_int(
+    "JUDGE_EXECUTOR_MAX_TURNS", RUNTIME_CONFIG.timeouts.executor_max_turns, "timeouts", "executor_max_turns"
+)
 
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
-ORCHESTRATOR_POLL_INTERVAL: int = int(os.environ.get("JUDGE_ORCHESTRATOR_POLL_INTERVAL", "10"))
+ORCHESTRATOR_POLL_INTERVAL: int = _env_int(
+    "JUDGE_ORCHESTRATOR_POLL_INTERVAL",
+    RUNTIME_CONFIG.timeouts.orchestrator_poll_interval,
+    "timeouts",
+    "orchestrator_poll_interval",
+)
 
 # ---------------------------------------------------------------------------
 # Git ops behaviour flags — sourced from YAML git_ops block.

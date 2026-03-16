@@ -13,6 +13,7 @@ import pytest
 
 from devbench import config
 from devbench.config import ALLOWED_REPOS, validate_repo
+from devbench.config_loader import get_schema_default
 
 # ---------------------------------------------------------------------------
 # Test constants derived from the test fixture (tests/fixtures/test_devbench.yaml)
@@ -656,4 +657,432 @@ class TestModelConfig:
             with pytest.raises(RuntimeError, match="JUDGE_DEFAULT_MODEL_DIRECT"):
                 importlib.reload(config)
 
+        importlib.reload(config)
+
+
+# ---------------------------------------------------------------------------
+# Helper: build a minimal YAML with specific timeouts/limits sections.
+# ---------------------------------------------------------------------------
+
+def _minimal_yaml_with_overrides(
+    tmp_path: Path,
+    *,
+    timeouts: dict | None = None,
+    limits: dict | None = None,
+    max_retries: int | None = None,
+) -> Path:
+    """Return path to a minimal valid config YAML written to *tmp_path*.
+
+    The YAML includes the test fixture's required repos/model/orgs fields and
+    optionally injects a ``timeouts:`` and/or ``limits:`` block.
+    """
+    lines = [
+        "repos:",
+        "  caylent-solutions/git-repo:",
+        "    default_branch: main",
+        "allowed_orgs:",
+        "  - caylent-solutions",
+        "judge_model: test-judge-model",
+        "executor_model: test-executor-model",
+        "use_bedrock: false",
+        "bedrock_region: us-east-1",
+    ]
+    if max_retries is not None:
+        lines.append(f"max_retries: {max_retries}")
+    if timeouts is not None:
+        lines.append("timeouts:")
+        for key, val in timeouts.items():
+            lines.append(f"  {key}: {val}")
+    if limits is not None:
+        lines.append("limits:")
+        for key, val in limits.items():
+            lines.append(f"  {key}: {val}")
+    cfg = tmp_path / "test.yaml"
+    cfg.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return cfg
+
+
+def _reload_with_config(path: Path, extra_env: dict | None = None) -> None:
+    """Reload ``config`` module using *path* as ``JUDGE_CONFIG_PATH``.
+
+    Strips timeout/limit env var overrides so that YAML values are visible.
+    The caller is responsible for calling ``importlib.reload(config)`` to
+    restore the original module state after the assertion.
+    """
+    _timeout_env_vars = {
+        "JUDGE_GH_TIMEOUT",
+        "JUDGE_GH_API_TIMEOUT",
+        "JUDGE_TEST_TIMEOUT",
+        "JUDGE_SECURITY_FETCH_TIMEOUT",
+        "JUDGE_LLM_TIMEOUT",
+        "JUDGE_COMMAND_TIMEOUT",
+        "JUDGE_EXECUTOR_TIMEOUT",
+        "JUDGE_EXECUTOR_MAX_TURNS",
+        "JUDGE_ORCHESTRATOR_POLL_INTERVAL",
+        "JUDGE_ALERT_SUMMARY_LIMIT",
+        "JUDGE_OUTPUT_TRUNCATION",
+        "JUDGE_LLM_EVIDENCE_TRUNCATION",
+        "JUDGE_LLM_FILE_CONTEXT_LIMIT",
+        "JUDGE_LLM_FILE_PREVIEW_CHARS",
+        "JUDGE_MAX_RETRIES",
+    }
+    env = {k: v for k, v in os.environ.items() if k not in _timeout_env_vars}
+    env["JUDGE_CONFIG_PATH"] = str(path)
+    if extra_env:
+        env.update(extra_env)
+    importlib.reload(config)
+
+
+# ---------------------------------------------------------------------------
+# Parametrized data: (constant_name, yaml_timeout_key, env_var, yaml_value)
+# Schema defaults are read via get_schema_default() — no hardcoded values here.
+# ---------------------------------------------------------------------------
+
+_TIMEOUT_CASES = [
+    ("GITHUB_CHECK_TIMEOUT_SECONDS", "github_check", "JUDGE_GH_TIMEOUT", 77),
+    ("GH_API_TIMEOUT", "gh_api", "JUDGE_GH_API_TIMEOUT", 77),
+    ("TEST_TIMEOUT", "test", "JUDGE_TEST_TIMEOUT", 77),
+    ("SECURITY_FETCH_TIMEOUT", "security_fetch", "JUDGE_SECURITY_FETCH_TIMEOUT", 77),
+    ("LLM_TIMEOUT", "llm", "JUDGE_LLM_TIMEOUT", 77),
+    ("COMMAND_TIMEOUT", "command", "JUDGE_COMMAND_TIMEOUT", 77),
+    ("EXECUTOR_TIMEOUT", "executor", "JUDGE_EXECUTOR_TIMEOUT", 77),
+    ("EXECUTOR_MAX_TURNS", "executor_max_turns", "JUDGE_EXECUTOR_MAX_TURNS", 77),
+    ("ORCHESTRATOR_POLL_INTERVAL", "orchestrator_poll_interval", "JUDGE_ORCHESTRATOR_POLL_INTERVAL", 77),
+]
+
+_LIMIT_CASES = [
+    ("ALERT_SUMMARY_LIMIT", "alert_summary", "JUDGE_ALERT_SUMMARY_LIMIT", 77),
+    ("OUTPUT_TRUNCATION_LIMIT", "output_truncation", "JUDGE_OUTPUT_TRUNCATION", 77),
+    ("LLM_EVIDENCE_TRUNCATION", "llm_evidence_truncation", "JUDGE_LLM_EVIDENCE_TRUNCATION", 77),
+    ("LLM_FILE_CONTEXT_LIMIT", "llm_file_context", "JUDGE_LLM_FILE_CONTEXT_LIMIT", 77),
+    ("LLM_FILE_PREVIEW_CHARS", "llm_file_preview_chars", "JUDGE_LLM_FILE_PREVIEW_CHARS", 77),
+]
+
+
+@pytest.mark.unit
+class TestTimeoutYamlPattern:
+    """AC-1/AC-2/AC-3/AC-4: yaml-with-env-override pattern for timeout constants."""
+
+    @pytest.mark.parametrize(
+        "constant_name,yaml_key,env_var,yaml_value",
+        _TIMEOUT_CASES,
+        ids=[c[0] for c in _TIMEOUT_CASES],
+    )
+    def test_timeout_from_yaml_when_env_absent(
+        self,
+        tmp_path: Path,
+        constant_name: str,
+        yaml_key: str,
+        env_var: str,
+        yaml_value: int,
+    ) -> None:
+        """
+        AC-1/AC-4: YAML value sets constant when env var is absent.
+        Given: timeouts.<yaml_key>: <yaml_value> in YAML, env var absent
+        When: config module is loaded
+        Then: config.<constant_name> == yaml_value
+        """
+        cfg = _minimal_yaml_with_overrides(tmp_path, timeouts={yaml_key: yaml_value})
+        env = {k: v for k, v in os.environ.items() if k != env_var}
+        env["JUDGE_CONFIG_PATH"] = str(cfg)
+        with patch.dict(os.environ, env, clear=True):
+            importlib.reload(config)
+            actual = getattr(config, constant_name)
+            assert actual == yaml_value, (
+                f"{constant_name}: expected {yaml_value} from YAML, got {actual}"
+            )
+        importlib.reload(config)
+
+    @pytest.mark.parametrize(
+        "constant_name,yaml_key,env_var,yaml_value",
+        _TIMEOUT_CASES,
+        ids=[c[0] for c in _TIMEOUT_CASES],
+    )
+    def test_timeout_env_overrides_yaml_silently(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        constant_name: str,
+        yaml_key: str,
+        env_var: str,
+        yaml_value: int,
+    ) -> None:
+        """
+        AC-2/AC-4: Env var silently overrides YAML value (no warning logged).
+        Given: YAML sets timeout to yaml_value, env var set to 999
+        When: config module is loaded
+        Then: config.<constant_name> == 999 and no WARNING emitted
+        """
+        cfg = _minimal_yaml_with_overrides(tmp_path, timeouts={yaml_key: yaml_value})
+        env = dict(os.environ)
+        env["JUDGE_CONFIG_PATH"] = str(cfg)
+        env[env_var] = "999"
+        with caplog.at_level(logging.WARNING, logger="devbench.config"):
+            with patch.dict(os.environ, env, clear=True):
+                importlib.reload(config)
+                actual = getattr(config, constant_name)
+        assert actual == 999, (
+            f"{constant_name}: expected 999 from env var override, got {actual}"
+        )
+        warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        timeout_warnings = [m for m in warning_messages if env_var in m]
+        assert not timeout_warnings, (
+            f"{constant_name}: expected silent env override but got warnings: {timeout_warnings}"
+        )
+        importlib.reload(config)
+
+    @pytest.mark.parametrize(
+        "constant_name,yaml_key,env_var,yaml_value",
+        _TIMEOUT_CASES,
+        ids=[c[0] for c in _TIMEOUT_CASES],
+    )
+    def test_timeout_empty_env_var_raises(
+        self,
+        tmp_path: Path,
+        constant_name: str,
+        yaml_key: str,
+        env_var: str,
+        yaml_value: int,
+    ) -> None:
+        """
+        Rule 11: Env var set to empty string raises ValueError (fail-fast, not silent fallback).
+        Given: YAML sets timeout to yaml_value, env var set to ""
+        When: config module is loaded
+        Then: ValueError is raised with a message identifying the env var
+        """
+        cfg = _minimal_yaml_with_overrides(tmp_path, timeouts={yaml_key: yaml_value})
+        env = dict(os.environ)
+        env["JUDGE_CONFIG_PATH"] = str(cfg)
+        env[env_var] = ""
+        with patch.dict(os.environ, env, clear=True):
+            with pytest.raises(ValueError, match=env_var):
+                importlib.reload(config)
+        importlib.reload(config)
+
+    def test_timeouts_schema_default_when_yaml_section_omitted(self, tmp_path: Path) -> None:
+        """
+        AC-3: When timeouts: section is absent from YAML, schema defaults are used.
+        Given: YAML has no timeouts: block, no timeout env vars set
+        When: config module is loaded
+        Then: all timeout constants equal their schema-defined defaults
+        """
+        cfg = _minimal_yaml_with_overrides(tmp_path, timeouts=None)
+        timeout_env_vars = {c[2] for c in _TIMEOUT_CASES}
+        env = {k: v for k, v in os.environ.items() if k not in timeout_env_vars}
+        env["JUDGE_CONFIG_PATH"] = str(cfg)
+        with patch.dict(os.environ, env, clear=True):
+            importlib.reload(config)
+            for constant_name, yaml_key, _env_var, _yaml_value in _TIMEOUT_CASES:
+                schema_default = get_schema_default("timeouts", yaml_key)
+                actual = getattr(config, constant_name)
+                assert actual == schema_default, (
+                    f"{constant_name}: expected schema default {schema_default} "
+                    f"when timeouts: absent from YAML, got {actual}"
+                )
+        importlib.reload(config)
+
+
+@pytest.mark.unit
+class TestLimitYamlPattern:
+    """AC-4: yaml-with-env-override pattern for limit constants."""
+
+    @pytest.mark.parametrize(
+        "constant_name,yaml_key,env_var,yaml_value",
+        _LIMIT_CASES,
+        ids=[c[0] for c in _LIMIT_CASES],
+    )
+    def test_limit_from_yaml_when_env_absent(
+        self,
+        tmp_path: Path,
+        constant_name: str,
+        yaml_key: str,
+        env_var: str,
+        yaml_value: int,
+    ) -> None:
+        """
+        AC-4: YAML value sets limit constant when env var is absent.
+        Given: limits.<yaml_key>: <yaml_value> in YAML, env var absent
+        When: config module is loaded
+        Then: config.<constant_name> == yaml_value
+        """
+        cfg = _minimal_yaml_with_overrides(tmp_path, limits={yaml_key: yaml_value})
+        env = {k: v for k, v in os.environ.items() if k != env_var}
+        env["JUDGE_CONFIG_PATH"] = str(cfg)
+        with patch.dict(os.environ, env, clear=True):
+            importlib.reload(config)
+            actual = getattr(config, constant_name)
+            assert actual == yaml_value, (
+                f"{constant_name}: expected {yaml_value} from YAML, got {actual}"
+            )
+        importlib.reload(config)
+
+    @pytest.mark.parametrize(
+        "constant_name,yaml_key,env_var,yaml_value",
+        _LIMIT_CASES,
+        ids=[c[0] for c in _LIMIT_CASES],
+    )
+    def test_limit_env_overrides_yaml_silently(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        constant_name: str,
+        yaml_key: str,
+        env_var: str,
+        yaml_value: int,
+    ) -> None:
+        """
+        AC-4: Env var silently overrides YAML limit value (no warning logged).
+        Given: YAML sets limit to yaml_value, env var set to 888
+        When: config module is loaded
+        Then: config.<constant_name> == 888 and no WARNING emitted
+        """
+        cfg = _minimal_yaml_with_overrides(tmp_path, limits={yaml_key: yaml_value})
+        env = dict(os.environ)
+        env["JUDGE_CONFIG_PATH"] = str(cfg)
+        env[env_var] = "888"
+        with caplog.at_level(logging.WARNING, logger="devbench.config"):
+            with patch.dict(os.environ, env, clear=True):
+                importlib.reload(config)
+                actual = getattr(config, constant_name)
+        assert actual == 888, (
+            f"{constant_name}: expected 888 from env var override, got {actual}"
+        )
+        warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        limit_warnings = [m for m in warning_messages if env_var in m]
+        assert not limit_warnings, (
+            f"{constant_name}: expected silent env override but got warnings: {limit_warnings}"
+        )
+        importlib.reload(config)
+
+    @pytest.mark.parametrize(
+        "constant_name,yaml_key,env_var,yaml_value",
+        _LIMIT_CASES,
+        ids=[c[0] for c in _LIMIT_CASES],
+    )
+    def test_limit_empty_env_var_raises(
+        self,
+        tmp_path: Path,
+        constant_name: str,
+        yaml_key: str,
+        env_var: str,
+        yaml_value: int,
+    ) -> None:
+        """
+        Rule 11: Env var set to empty string raises ValueError (fail-fast, not silent fallback).
+        Given: YAML sets limit to yaml_value, env var set to ""
+        When: config module is loaded
+        Then: ValueError is raised with a message identifying the env var
+        """
+        cfg = _minimal_yaml_with_overrides(tmp_path, limits={yaml_key: yaml_value})
+        env = dict(os.environ)
+        env["JUDGE_CONFIG_PATH"] = str(cfg)
+        env[env_var] = ""
+        with patch.dict(os.environ, env, clear=True):
+            with pytest.raises(ValueError, match=env_var):
+                importlib.reload(config)
+        importlib.reload(config)
+
+    def test_limits_schema_default_when_yaml_section_omitted(self, tmp_path: Path) -> None:
+        """
+        AC-3/AC-4: When limits: section is absent from YAML, schema defaults are used.
+        Given: YAML has no limits: block, no limit env vars set
+        When: config module is loaded
+        Then: all limit constants equal their schema-defined defaults
+        """
+        cfg = _minimal_yaml_with_overrides(tmp_path, limits=None)
+        limit_env_vars = {c[2] for c in _LIMIT_CASES}
+        env = {k: v for k, v in os.environ.items() if k not in limit_env_vars}
+        env["JUDGE_CONFIG_PATH"] = str(cfg)
+        with patch.dict(os.environ, env, clear=True):
+            importlib.reload(config)
+            for constant_name, yaml_key, _env_var, _yaml_value in _LIMIT_CASES:
+                schema_default = get_schema_default("limits", yaml_key)
+                actual = getattr(config, constant_name)
+                assert actual == schema_default, (
+                    f"{constant_name}: expected schema default {schema_default} "
+                    f"when limits: absent from YAML, got {actual}"
+                )
+        importlib.reload(config)
+
+
+@pytest.mark.unit
+class TestMaxRetriesYamlPattern:
+    """AC-5: yaml-with-env-override pattern for MAX_RETRY_ATTEMPTS."""
+
+    def test_max_retries_from_yaml(self, tmp_path: Path) -> None:
+        """
+        AC-5: max_retries in YAML sets MAX_RETRY_ATTEMPTS when JUDGE_MAX_RETRIES absent.
+        Given: max_retries: 5 in YAML, JUDGE_MAX_RETRIES not set
+        When: config module is loaded
+        Then: config.MAX_RETRY_ATTEMPTS == 5
+        """
+        cfg = _minimal_yaml_with_overrides(tmp_path, max_retries=5)
+        env = {k: v for k, v in os.environ.items() if k != "JUDGE_MAX_RETRIES"}
+        env["JUDGE_CONFIG_PATH"] = str(cfg)
+        with patch.dict(os.environ, env, clear=True):
+            importlib.reload(config)
+            assert config.MAX_RETRY_ATTEMPTS == 5, (
+                f"Expected MAX_RETRY_ATTEMPTS=5 from YAML, got {config.MAX_RETRY_ATTEMPTS}"
+            )
+        importlib.reload(config)
+
+    def test_max_retries_env_overrides_yaml_silently(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """
+        AC-5: JUDGE_MAX_RETRIES silently overrides YAML max_retries (no warning logged).
+        Given: max_retries: 5 in YAML, JUDGE_MAX_RETRIES=20
+        When: config module is loaded
+        Then: config.MAX_RETRY_ATTEMPTS == 20 and no WARNING emitted
+        """
+        cfg = _minimal_yaml_with_overrides(tmp_path, max_retries=5)
+        env = dict(os.environ)
+        env["JUDGE_CONFIG_PATH"] = str(cfg)
+        env["JUDGE_MAX_RETRIES"] = "20"
+        with caplog.at_level(logging.WARNING, logger="devbench.config"):
+            with patch.dict(os.environ, env, clear=True):
+                importlib.reload(config)
+                actual = config.MAX_RETRY_ATTEMPTS
+        assert actual == 20, (
+            f"Expected MAX_RETRY_ATTEMPTS=20 from env override, got {actual}"
+        )
+        warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        retries_warnings = [m for m in warning_messages if "JUDGE_MAX_RETRIES" in m]
+        assert not retries_warnings, (
+            f"Expected silent env override but got warnings: {retries_warnings}"
+        )
+        importlib.reload(config)
+
+    def test_max_retries_empty_env_var_raises(self, tmp_path: Path) -> None:
+        """
+        Rule 11: JUDGE_MAX_RETRIES set to empty string raises ValueError (fail-fast).
+        Given: JUDGE_MAX_RETRIES="" (explicitly empty)
+        When: config module is loaded
+        Then: ValueError is raised identifying the env var
+        """
+        cfg = _minimal_yaml_with_overrides(tmp_path, max_retries=5)
+        env = dict(os.environ)
+        env["JUDGE_CONFIG_PATH"] = str(cfg)
+        env["JUDGE_MAX_RETRIES"] = ""
+        with patch.dict(os.environ, env, clear=True):
+            with pytest.raises(ValueError, match="JUDGE_MAX_RETRIES"):
+                importlib.reload(config)
+        importlib.reload(config)
+
+    def test_max_retries_schema_default_when_yaml_absent(self, tmp_path: Path) -> None:
+        """
+        AC-3/AC-5: When max_retries absent from YAML and JUDGE_MAX_RETRIES not set,
+        MAX_RETRY_ATTEMPTS equals the schema-defined default.
+        """
+        cfg = _minimal_yaml_with_overrides(tmp_path, max_retries=None)
+        env = {k: v for k, v in os.environ.items() if k != "JUDGE_MAX_RETRIES"}
+        env["JUDGE_CONFIG_PATH"] = str(cfg)
+        schema_default = get_schema_default("", "max_retries")
+        with patch.dict(os.environ, env, clear=True):
+            importlib.reload(config)
+            actual = config.MAX_RETRY_ATTEMPTS
+            assert actual == schema_default, (
+                f"Expected MAX_RETRY_ATTEMPTS={schema_default} (schema default) when YAML absent, "
+                f"got {actual}"
+            )
         importlib.reload(config)

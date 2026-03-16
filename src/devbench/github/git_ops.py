@@ -290,7 +290,9 @@ class GitOpsJudge:
             repo_path: Local filesystem path to the repository.
 
         Returns:
-            ``True`` if all checks passed, ``False`` otherwise.
+            ``True`` if all checks passed, or if the repo has no CI configured
+            (``gh`` exits non-zero with ``"no checks reported"`` in stderr).
+            ``False`` if checks were reported and one or more failed.
 
         Raises:
             ValueError: If the repo is not in the allow-list.
@@ -307,6 +309,13 @@ class GitOpsJudge:
         )
 
         if rc != 0:
+            if "no checks reported" in stderr:
+                self.logger.warning(
+                    "No CI checks configured for PR #%d on %s — treating as pass",
+                    pr_number,
+                    repo,
+                )
+                return True
             self.logger.warning(
                 "Checks did not pass for PR #%d on %s: %s",
                 pr_number,

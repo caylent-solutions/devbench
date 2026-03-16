@@ -484,6 +484,12 @@ class TestWaitForChecks:
         with patch.object(judge, "_gh", return_value=(1, "", "checks failed")):
             assert judge.wait_for_checks("caylent-solutions/git-repo", 42, repo_path=tmp_path) is False
 
+    def test_returns_true_when_no_checks_reported(self, tmp_path: Path) -> None:
+        """Returns True when gh exits non-zero with 'no checks reported' (no CI configured). AC-1"""
+        judge = GitOpsJudge()
+        with patch.object(judge, "_gh", return_value=(1, "", "no checks reported")):
+            assert judge.wait_for_checks("caylent-solutions/git-repo", 42, repo_path=tmp_path) is True
+
     def test_uses_custom_timeout(self, tmp_path: Path) -> None:
         judge = GitOpsJudge()
         with patch.object(judge, "_gh", return_value=(0, "", "")) as mock_gh:

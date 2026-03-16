@@ -423,15 +423,25 @@ class TestWaitForChecks:
         with pytest.raises(ValueError, match="not allowed"):
             judge.wait_for_checks("caylent-solutions/nonexistent-test-repo", 1)
 
-    def test_returns_true_on_success(self, tmp_path: Path) -> None:
+    def test_returns_true_when_no_checks_reported(self, tmp_path: Path) -> None:
+        """AC-1: rc != 0 but stderr contains 'no checks reported' → True (no CI configured)."""
         judge = GitOpsJudge()
-        with patch.object(judge, "_gh", return_value=(0, "All checks passed", "")):
+        with patch.object(
+            judge, "_gh", return_value=(1, "", "no checks reported on the 'main2' branch")
+        ):
             assert judge.wait_for_checks("caylent-solutions/git-repo", 42, repo_path=tmp_path) is True
 
-    def test_returns_false_on_failure(self, tmp_path: Path) -> None:
+    def test_returns_false_when_checks_failed(self, tmp_path: Path) -> None:
+        """AC-2: rc != 0 and stderr does NOT contain 'no checks reported' → False (CI failed)."""
         judge = GitOpsJudge()
         with patch.object(judge, "_gh", return_value=(1, "", "checks failed")):
             assert judge.wait_for_checks("caylent-solutions/git-repo", 42, repo_path=tmp_path) is False
+
+    def test_returns_true_on_success(self, tmp_path: Path) -> None:
+        """AC-3: rc == 0 → True (all checks passed)."""
+        judge = GitOpsJudge()
+        with patch.object(judge, "_gh", return_value=(0, "All checks passed", "")):
+            assert judge.wait_for_checks("caylent-solutions/git-repo", 42, repo_path=tmp_path) is True
 
     def test_uses_custom_timeout(self, tmp_path: Path) -> None:
         judge = GitOpsJudge()

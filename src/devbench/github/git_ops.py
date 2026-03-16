@@ -294,6 +294,13 @@ class GitOpsJudge(BaseJudge):
         )
 
         if rc != 0:
+            if "no checks reported" in stderr:
+                self.logger.warning(
+                    "No CI configured for PR #%d on %s — treating as pass",
+                    pr_number,
+                    repo,
+                )
+                return True
             self.logger.warning(
                 "Checks did not pass for PR #%d on %s: %s",
                 pr_number,

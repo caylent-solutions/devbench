@@ -187,6 +187,7 @@ devbench/
 │   │   ├── security_review.py     ← GitHub alerts + diff → LLM verdict
 │   │   └── blocker_resolver.py    ← Dependency and blocker assessment
 │   ├── utils/
+│   │   ├── greeting.py            ← get_greeting(name): greeting utility for POC pipeline verification
 │   │   └── process.py             ← run_command(): shared subprocess wrapper for running shell commands
 │   ├── reporting/
 │   │   └── report.py              ← Session progress report generator (velocity, ETA)

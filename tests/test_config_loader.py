@@ -973,3 +973,64 @@ class TestModelDefaultEnvVars:
             "DEFAULT_MODEL_BEDROCK must not be defined in config_loader — "
             "model IDs are externalized via JUDGE_DEFAULT_MODEL_BEDROCK env var"
         )
+
+
+class TestGitOpsConfig:
+    """Tests for GitOpsConfig dataclass and RuntimeConfig.git_ops integration."""
+
+    def _write_config(self, tmp_path: Path, content: str) -> Path:
+        cfg = tmp_path / "devbench.yaml"
+        cfg.write_text(content, encoding="utf-8")
+        return cfg
+
+    def test_update_submodule_defaults_to_false_when_git_ops_absent(self, tmp_path: Path) -> None:
+        """AC-3: omitting git_ops entirely defaults update_submodule to False with no error."""
+        from devbench.config_loader import load_runtime_config
+
+        cfg = self._write_config(tmp_path, "repos:\n  caylent-solutions/devbench:\n")
+        result = load_runtime_config(cfg, {})
+        assert result.git_ops.update_submodule is False
+
+    def test_update_submodule_defaults_to_false_when_field_absent(self, tmp_path: Path) -> None:
+        """AC-3: git_ops present but update_submodule absent → defaults to False."""
+        from devbench.config_loader import load_runtime_config
+
+        cfg = self._write_config(
+            tmp_path,
+            "repos:\n  caylent-solutions/devbench:\ngit_ops: {}\n",
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.git_ops.update_submodule is False
+
+    def test_update_submodule_true_from_yaml(self, tmp_path: Path) -> None:
+        """AC-4: git_ops.update_submodule: true in YAML sets field to True."""
+        from devbench.config_loader import load_runtime_config
+
+        cfg = self._write_config(
+            tmp_path,
+            "repos:\n  caylent-solutions/devbench:\ngit_ops:\n  update_submodule: true\n",
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.git_ops.update_submodule is True
+
+    def test_schema_rejects_non_boolean_update_submodule(self, tmp_path: Path) -> None:
+        """AC-5: non-boolean value for git_ops.update_submodule raises ValueError."""
+        from devbench.config_loader import load_runtime_config
+
+        cfg = self._write_config(
+            tmp_path,
+            "repos:\n  caylent-solutions/devbench:\ngit_ops:\n  update_submodule: yes-please\n",
+        )
+        with pytest.raises(ValueError, match="schema validation"):
+            load_runtime_config(cfg, {})
+
+    def test_schema_rejects_unknown_git_ops_keys(self, tmp_path: Path) -> None:
+        """AC-6: unknown keys inside git_ops are rejected by schema (additionalProperties: false)."""
+        from devbench.config_loader import load_runtime_config
+
+        cfg = self._write_config(
+            tmp_path,
+            "repos:\n  caylent-solutions/devbench:\ngit_ops:\n  unknown_key: true\n",
+        )
+        with pytest.raises(ValueError, match="schema validation"):
+            load_runtime_config(cfg, {})

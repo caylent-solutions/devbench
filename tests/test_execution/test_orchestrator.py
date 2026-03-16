@@ -677,6 +677,72 @@ class TestProcessWorkUnit:
         assert result is True
         mock_git_ops.merge_pr.assert_called_once()
 
+    def test_orchestrator_skips_submodule_update_when_flag_false(self, tmp_path: Path) -> None:
+        """AC-1: update_parent_submodule_ref is never called when UPDATE_SUBMODULE is False."""
+        from devbench.execution.orchestrator import process_work_unit
+
+        unit = _make_unit(tmp_path)
+        exec_result = ExecutionResult(status=ExecutionStatus.IN_REVIEW, output="done", blocker="")
+        mock_judge = MagicMock()
+        mock_judge.name = "mock"
+        mock_judge.evaluate.return_value = _pass_result("mock")
+
+        mock_git_ops = MagicMock()
+        mock_git_ops.create_pr.return_value = "https://github.com/org/repo/pull/1"
+        mock_git_ops.wait_for_checks.return_value = True
+        mock_mgr = MagicMock()
+
+        with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+            with patch(f"{_ORC}.UPDATE_SUBMODULE", False):
+                with patch(f"{_ORC}.claude_executor") as mock_exec:
+                    mock_exec.execute.return_value = exec_result
+                    with patch(f"{_ORC}.CodeReviewJudge", return_value=mock_judge):
+                        with patch(f"{_ORC}.TestReviewJudge", return_value=mock_judge):
+                            with patch(f"{_ORC}.DocReviewJudge", return_value=mock_judge):
+                                with patch(f"{_ORC}.ChangesManifestJudge", return_value=mock_judge):
+                                    with patch(f"{_ORC}.SecurityReviewJudge", return_value=mock_judge):
+                                        with patch(f"{_ORC}.GitOpsJudge", return_value=mock_git_ops):
+                                            with patch(f"{_ORC}.BacklogManager", return_value=mock_mgr):
+                                                with patch(f"{_ORC}.BlockerResolverJudge"):
+                                                    with patch(f"{_ORC}.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
+                                                        result = process_work_unit(unit)
+
+        assert result is True
+        mock_git_ops.update_parent_submodule_ref.assert_not_called()
+
+    def test_orchestrator_calls_submodule_update_when_flag_true(self, tmp_path: Path) -> None:
+        """AC-2: update_parent_submodule_ref is called after merge when UPDATE_SUBMODULE is True."""
+        from devbench.execution.orchestrator import process_work_unit
+
+        unit = _make_unit(tmp_path)
+        exec_result = ExecutionResult(status=ExecutionStatus.IN_REVIEW, output="done", blocker="")
+        mock_judge = MagicMock()
+        mock_judge.name = "mock"
+        mock_judge.evaluate.return_value = _pass_result("mock")
+
+        mock_git_ops = MagicMock()
+        mock_git_ops.create_pr.return_value = "https://github.com/org/repo/pull/1"
+        mock_git_ops.wait_for_checks.return_value = True
+        mock_mgr = MagicMock()
+
+        with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+            with patch(f"{_ORC}.UPDATE_SUBMODULE", True):
+                with patch(f"{_ORC}.claude_executor") as mock_exec:
+                    mock_exec.execute.return_value = exec_result
+                    with patch(f"{_ORC}.CodeReviewJudge", return_value=mock_judge):
+                        with patch(f"{_ORC}.TestReviewJudge", return_value=mock_judge):
+                            with patch(f"{_ORC}.DocReviewJudge", return_value=mock_judge):
+                                with patch(f"{_ORC}.ChangesManifestJudge", return_value=mock_judge):
+                                    with patch(f"{_ORC}.SecurityReviewJudge", return_value=mock_judge):
+                                        with patch(f"{_ORC}.GitOpsJudge", return_value=mock_git_ops):
+                                            with patch(f"{_ORC}.BacklogManager", return_value=mock_mgr):
+                                                with patch(f"{_ORC}.BlockerResolverJudge"):
+                                                    with patch(f"{_ORC}.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
+                                                        result = process_work_unit(unit)
+
+        assert result is True
+        mock_git_ops.update_parent_submodule_ref.assert_called_once()
+
 
 class TestFeedbackPropagation:
     """Test that feedback is set correctly on each retry path."""

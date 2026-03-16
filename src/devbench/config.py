@@ -250,6 +250,11 @@ EXECUTOR_MAX_TURNS: int = int(os.environ.get("JUDGE_EXECUTOR_MAX_TURNS", "50"))
 ORCHESTRATOR_POLL_INTERVAL: int = int(os.environ.get("JUDGE_ORCHESTRATOR_POLL_INTERVAL", "10"))
 
 # ---------------------------------------------------------------------------
+# Git ops behaviour flags — sourced from YAML git_ops block.
+# ---------------------------------------------------------------------------
+UPDATE_SUBMODULE: bool = RUNTIME_CONFIG.git_ops.update_submodule
+
+# ---------------------------------------------------------------------------
 # Credentials
 # ---------------------------------------------------------------------------
 GH_TOKEN_FILE: Path = Path(os.environ.get("JUDGE_GH_TOKEN_FILE", str(Path.home() / ".gh_token_env")))

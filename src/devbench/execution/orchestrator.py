@@ -17,6 +17,7 @@ from devbench.config import (
     ORCHESTRATOR_POLL_INTERVAL,
     OUTPUT_TRUNCATION_LIMIT,
     REPO_LOCAL_PATHS,
+    UPDATE_SUBMODULE,
     resolve_repo,
     validate_repo,
 )
@@ -246,15 +247,16 @@ def process_work_unit(work_unit: WorkUnit) -> bool:
             git_ops.merge_pr(repo=canonical_repo, pr_number=pr_number, repo_path=repo_path)
             work_unit.log_comment("judge/git_ops", "PR_MERGED", pr_url)
 
-            # Update parent repo's submodule reference
-            git_ops.update_parent_submodule_ref(
-                repo=canonical_repo,
-                repo_path=repo_path,
-                message=f"{work_unit.id}: update {repo_path.name} submodule ref",
-            )
-            work_unit.log_comment(
-                "judge/git_ops", "SUBMODULE_UPDATED", repo_path.name,
-            )
+            # Update parent repo's submodule reference — opt-in via git_ops.update_submodule
+            if UPDATE_SUBMODULE:
+                git_ops.update_parent_submodule_ref(
+                    repo=canonical_repo,
+                    repo_path=repo_path,
+                    message=f"{work_unit.id}: update {repo_path.name} submodule ref",
+                )
+                work_unit.log_comment(
+                    "judge/git_ops", "SUBMODULE_UPDATED", repo_path.name,
+                )
 
         except Exception as exc:
             work_unit.log_comment("orchestrator", "GIT_ERROR", str(exc))

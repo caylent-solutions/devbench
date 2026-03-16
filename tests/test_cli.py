@@ -742,3 +742,391 @@ class TestPreParseConfig:
         original = argv.copy()
         cli._pre_parse_config(argv)
         assert argv == original
+
+
+# ---------------------------------------------------------------------------
+# Fixtures shared by TestCmdSyncBlocked
+# ---------------------------------------------------------------------------
+
+def _make_unit(
+    unit_id: str,
+    title: str,
+    status: WorkUnitStatus,
+    deps: list[str],
+    file_path: Path | None = None,
+) -> WorkUnit:
+    """Factory for WorkUnit instances used in sync-blocked tests."""
+    return WorkUnit(
+        id=unit_id,
+        title=title,
+        status=status,
+        unit_type=WorkUnitType.TASK,
+        file_path=file_path or Path(f"backlog/{unit_id}.md"),
+        repo="caylent-solutions/devbench",
+        dependencies=deps,
+    )
+
+
+class TestCmdSyncBlocked:
+    """Tests for the sync-blocked CLI command (AC-1 through AC-6)."""
+
+    # ------------------------------------------------------------------
+    # AC-1: in-queue tasks with incomplete deps are marked blocked
+    # ------------------------------------------------------------------
+
+    def test_sync_blocked_marks_tasks_with_incomplete_epic_dep(
+        self,
+        tmp_path: Path,
+        backlog_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """
+        Given: E14-F2-T1 depends on E9 which is in-progress (not done)
+        When: sync-blocked is run
+        Then: E14-F2-T1 is blocked; report lists it with E9 as unmet dep
+        Spec: AC-1
+        """
+        e9_file = backlog_dir / "E9.md"
+        e9_file.write_text("# E9: Epic Nine\n\n## Status: in-progress\n")
+        e14_file = backlog_dir / "E14-F2-T1.md"
+        e14_file.write_text("# E14-F2-T1: Feature Two Task\n\n## Status: in-queue\n")
+
+        e9 = _make_unit("E9", "Epic Nine", WorkUnitStatus.IN_PROGRESS, [], e9_file)
+        e14_t1 = _make_unit("E14-F2-T1", "Feature Two Task", WorkUnitStatus.IN_QUEUE, ["E9"], e14_file)
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [e9, e14_t1]
+
+        mock_mgr = MagicMock()
+        backlog_index = tmp_path / "BACKLOG.md"
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+        ):
+            result = cli.cmd_sync_blocked()
+
+        assert result == 0
+        mock_mgr.force_status.assert_called_once_with(e14_file, backlog_index, "E14-F2-T1", "blocked")
+        out = capsys.readouterr().out
+        assert "E14-F2-T1" in out
+        assert "E9" in out
+
+    # ------------------------------------------------------------------
+    # AC-2: idempotent — running twice produces same state
+    # ------------------------------------------------------------------
+
+    def test_sync_blocked_idempotent(
+        self,
+        tmp_path: Path,
+        backlog_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """
+        Given: E14-F2-T1 is already blocked (second run)
+        When: sync-blocked is run again
+        Then: force_status is NOT called again; exit 0
+        Spec: AC-2
+        """
+        e9_file = backlog_dir / "E9.md"
+        e9_file.write_text("# E9: Epic Nine\n\n## Status: in-progress\n")
+        e14_file = backlog_dir / "E14-F2-T1.md"
+        e14_file.write_text("# E14-F2-T1: Feature Two Task\n\n## Status: blocked\n")
+
+        e9 = _make_unit("E9", "Epic Nine", WorkUnitStatus.IN_PROGRESS, [], e9_file)
+        # Already blocked — sync-blocked must not re-process it
+        e14_t1 = _make_unit("E14-F2-T1", "Feature Two Task", WorkUnitStatus.BLOCKED, ["E9"], e14_file)
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [e9, e14_t1]
+
+        mock_mgr = MagicMock()
+        backlog_index = tmp_path / "BACKLOG.md"
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+        ):
+            result = cli.cmd_sync_blocked()
+
+        assert result == 0
+        mock_mgr.force_status.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # AC-3: in-queue units with all deps done stay in-queue
+    # ------------------------------------------------------------------
+
+    def test_sync_blocked_leaves_satisfied_units_in_queue(
+        self,
+        tmp_path: Path,
+        backlog_dir: Path,
+    ) -> None:
+        """
+        Given: T2 depends on T1 which is done
+        When: sync-blocked is run
+        Then: T2 status is unchanged (not blocked)
+        Spec: AC-3
+        """
+        t1_file = backlog_dir / "E0-T1.md"
+        t1_file.write_text("# E0-T1: Task One\n\n## Status: done\n")
+        t2_file = backlog_dir / "E0-T2.md"
+        t2_file.write_text("# E0-T2: Task Two\n\n## Status: in-queue\n")
+
+        t1 = _make_unit("E0-T1", "Task One", WorkUnitStatus.DONE, [], t1_file)
+        t2 = _make_unit("E0-T2", "Task Two", WorkUnitStatus.IN_QUEUE, ["E0-T1"], t2_file)
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [t1, t2]
+
+        mock_mgr = MagicMock()
+        backlog_index = tmp_path / "BACKLOG.md"
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+        ):
+            result = cli.cmd_sync_blocked()
+
+        assert result == 0
+        mock_mgr.force_status.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # AC-4: already-blocked units are not double-processed
+    # ------------------------------------------------------------------
+
+    def test_sync_blocked_skips_already_blocked_units(
+        self,
+        tmp_path: Path,
+        backlog_dir: Path,
+    ) -> None:
+        """
+        Given: T3 is already blocked (with unmet dep T1 that is in-queue)
+        When: sync-blocked is run
+        Then: force_status is NOT called for T3 (already blocked)
+        Spec: AC-4
+        """
+        t1_file = backlog_dir / "E0-T1.md"
+        t1_file.write_text("# E0-T1: Task One\n\n## Status: in-queue\n")
+        t3_file = backlog_dir / "E0-T3.md"
+        t3_file.write_text("# E0-T3: Task Three\n\n## Status: blocked\n")
+
+        t1 = _make_unit("E0-T1", "Task One", WorkUnitStatus.IN_QUEUE, [], t1_file)
+        t3 = _make_unit("E0-T3", "Task Three", WorkUnitStatus.BLOCKED, ["E0-T1"], t3_file)
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [t1, t3]
+
+        mock_mgr = MagicMock()
+        backlog_index = tmp_path / "BACKLOG.md"
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+        ):
+            result = cli.cmd_sync_blocked()
+
+        assert result == 0
+        mock_mgr.force_status.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # AC-5: done/in-progress/in-review units are not touched
+    # ------------------------------------------------------------------
+
+    def test_sync_blocked_skips_done_in_progress_in_review(
+        self,
+        tmp_path: Path,
+        backlog_dir: Path,
+    ) -> None:
+        """
+        Given: units in done, in-progress, in-review status with unmet deps
+        When: sync-blocked is run
+        Then: none of them are changed
+        Spec: AC-5
+        """
+        dep_file = backlog_dir / "E0-DEP.md"
+        dep_file.write_text("# E0-DEP: Dep Unit\n\n## Status: in-queue\n")
+        done_file = backlog_dir / "E0-DONE.md"
+        done_file.write_text("# E0-DONE: Done Unit\n\n## Status: done\n")
+        prog_file = backlog_dir / "E0-PROG.md"
+        prog_file.write_text("# E0-PROG: Progress Unit\n\n## Status: in-progress\n")
+        rev_file = backlog_dir / "E0-REV.md"
+        rev_file.write_text("# E0-REV: Review Unit\n\n## Status: in-review\n")
+
+        dep = _make_unit("E0-DEP", "Dep Unit", WorkUnitStatus.IN_QUEUE, [], dep_file)
+        done_unit = _make_unit("E0-DONE", "Done Unit", WorkUnitStatus.DONE, ["E0-DEP"], done_file)
+        prog_unit = _make_unit("E0-PROG", "Progress Unit", WorkUnitStatus.IN_PROGRESS, ["E0-DEP"], prog_file)
+        rev_unit = _make_unit("E0-REV", "Review Unit", WorkUnitStatus.IN_REVIEW, ["E0-DEP"], rev_file)
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [dep, done_unit, prog_unit, rev_unit]
+
+        mock_mgr = MagicMock()
+        backlog_index = tmp_path / "BACKLOG.md"
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+        ):
+            result = cli.cmd_sync_blocked()
+
+        assert result == 0
+        mock_mgr.force_status.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # AC-6: output lists each newly blocked unit with its unmet dep IDs
+    # ------------------------------------------------------------------
+
+    def test_sync_blocked_report_lists_unmet_deps(
+        self,
+        tmp_path: Path,
+        backlog_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """
+        Given: T2 depends on T1 (in-queue) and T3 (in-queue) — both unmet
+        When: sync-blocked is run
+        Then: report lists T2 with both T1 and T3 as unmet dep IDs
+        Spec: AC-6
+        """
+        t1_file = backlog_dir / "E0-T1.md"
+        t1_file.write_text("# E0-T1: Task One\n\n## Status: in-queue\n")
+        t3_file = backlog_dir / "E0-T3.md"
+        t3_file.write_text("# E0-T3: Task Three\n\n## Status: in-queue\n")
+        t2_file = backlog_dir / "E0-T2.md"
+        t2_file.write_text("# E0-T2: Task Two\n\n## Status: in-queue\n")
+
+        t1 = _make_unit("E0-T1", "Task One", WorkUnitStatus.IN_QUEUE, [], t1_file)
+        t3 = _make_unit("E0-T3", "Task Three", WorkUnitStatus.IN_QUEUE, [], t3_file)
+        t2 = _make_unit("E0-T2", "Task Two", WorkUnitStatus.IN_QUEUE, ["E0-T1", "E0-T3"], t2_file)
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [t1, t3, t2]
+
+        mock_mgr = MagicMock()
+        backlog_index = tmp_path / "BACKLOG.md"
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+        ):
+            result = cli.cmd_sync_blocked()
+
+        assert result == 0
+        out = capsys.readouterr().out
+        assert "E0-T2" in out
+        assert "E0-T1" in out
+        assert "E0-T3" in out
+
+    # ------------------------------------------------------------------
+    # Fail-fast: missing work unit file
+    # ------------------------------------------------------------------
+
+    def test_sync_blocked_missing_file_returns_nonzero(
+        self,
+        tmp_path: Path,
+        backlog_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """
+        Given: T2 has unmet dep T1 but T2's file_path does not exist on disk
+        When: sync-blocked is run
+        Then: exits 1 with an error message on stderr naming the unit and path
+        Spec: Fail-fast principle — no silent fallback
+        """
+        # T1 file exists (it's done); T2's file does NOT exist on disk
+        t1_file = backlog_dir / "E0-T1.md"
+        t1_file.write_text("# E0-T1: Task One\n\n## Status: in-queue\n")
+        # Provide an absolute path that does not exist
+        missing_file = backlog_dir / "E0-T2-nonexistent.md"
+
+        t1 = _make_unit("E0-T1", "Task One", WorkUnitStatus.IN_QUEUE, [], t1_file)
+        t2 = _make_unit("E0-T2", "Task Two", WorkUnitStatus.IN_QUEUE, ["E0-T1"], missing_file)
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [t1, t2]
+
+        mock_mgr = MagicMock()
+        backlog_index = tmp_path / "BACKLOG.md"
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+        ):
+            result = cli.cmd_sync_blocked()
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "ERROR" in err
+        assert "E0-T2" in err
+        mock_mgr.force_status.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # Summary line format
+    # ------------------------------------------------------------------
+
+    def test_sync_blocked_summary_line(
+        self,
+        tmp_path: Path,
+        backlog_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """
+        Given: 1 newly blocked, 1 already blocked, 2 satisfied in-queue
+               (one with no deps, one whose dep is done)
+        When: sync-blocked is run
+        Then: summary line reads 'Blocked 1 unit(s). 1 already blocked. 2 in-queue units have all deps met.'
+        Spec: Definition of Done — summary line
+        """
+        dep_file = backlog_dir / "E0-DEP.md"
+        dep_file.write_text("# E0-DEP: Dep\n\n## Status: in-queue\n")
+        done_dep_file = backlog_dir / "E0-DONE-DEP.md"
+        done_dep_file.write_text("# E0-DONE-DEP: Done Dep\n\n## Status: done\n")
+        t_blocked_already_file = backlog_dir / "E0-TB.md"
+        t_blocked_already_file.write_text("# E0-TB: Already Blocked\n\n## Status: blocked\n")
+        t_new_blocked_file = backlog_dir / "E0-TN.md"
+        t_new_blocked_file.write_text("# E0-TN: New Block\n\n## Status: in-queue\n")
+        t_satisfied_file = backlog_dir / "E0-TS.md"
+        t_satisfied_file.write_text("# E0-TS: Satisfied\n\n## Status: in-queue\n")
+
+        # dep: in-queue, no deps → counted as satisfied in-queue (1)
+        dep = _make_unit("E0-DEP", "Dep", WorkUnitStatus.IN_QUEUE, [], dep_file)
+        done_dep = _make_unit("E0-DONE-DEP", "Done Dep", WorkUnitStatus.DONE, [], done_dep_file)
+        t_blocked_already = _make_unit(
+            "E0-TB", "Already Blocked", WorkUnitStatus.BLOCKED, ["E0-DEP"], t_blocked_already_file
+        )
+        # t_new_blocked: in-queue, dep on E0-DEP (in-queue, not done) → newly blocked (1)
+        t_new_blocked = _make_unit("E0-TN", "New Block", WorkUnitStatus.IN_QUEUE, ["E0-DEP"], t_new_blocked_file)
+        # t_satisfied: in-queue, dep on E0-DONE-DEP (done) → satisfied in-queue (2)
+        t_satisfied = _make_unit("E0-TS", "Satisfied", WorkUnitStatus.IN_QUEUE, ["E0-DONE-DEP"], t_satisfied_file)
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [dep, done_dep, t_blocked_already, t_new_blocked, t_satisfied]
+
+        mock_mgr = MagicMock()
+        backlog_index = tmp_path / "BACKLOG.md"
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+        ):
+            result = cli.cmd_sync_blocked()
+
+        assert result == 0
+        out = capsys.readouterr().out
+        assert "Blocked 1 unit(s). 1 already blocked. 2 in-queue units have all deps met." in out

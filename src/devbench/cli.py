@@ -22,6 +22,7 @@ Commands::
     set-status <id> <s>     Force any status (no gate — use for recovery/lifecycle transitions)
     mark-done <id>          Mark unit as Done (enforces done-gate: all judges must have passed)
     validate-backlog        Check backlog integrity (file existence, status sync, orphans, deps)
+    sync-blocked            Scan in-queue units and mark those with unmet deps as blocked
     report [since]          Print progress report with velocity stats
     log <message>           Append a message to the orchestrator log file
 
@@ -456,6 +457,76 @@ def cmd_log(message: str) -> int:
     return 0
 
 
+def cmd_sync_blocked() -> int:
+    """Scan all in-queue work units and mark those with unmet deps as blocked.
+
+    Algorithm:
+
+    1. Parse all units from the backlog index.
+    2. For each unit whose status is ``in-queue``:
+
+       a. Check whether all its deps have status ``done``.
+       b. If any dep is not done, call ``BacklogManager.force_status`` with
+          ``blocked`` and record the unit ID, title, and unmet dep IDs.
+
+    3. Print a structured report listing each newly blocked unit and its
+       unmet dependency IDs.
+    4. Print a summary line::
+
+           Blocked N unit(s). M already blocked. K in-queue units have all deps met.
+
+    5. Exit 0 (changed units are not an error condition).
+
+    The command is idempotent: running it twice produces the same final state.
+    Already-blocked units and units in any other non-``in-queue`` status are
+    not touched.
+    """
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+
+    done_ids = frozenset(u.id for u in units if u.status is WorkUnitStatus.DONE)
+
+    mgr = BacklogManager()
+
+    newly_blocked: list[tuple[str, str, list[str]]] = []  # (id, title, unmet_deps)
+    already_blocked_count = 0
+    satisfied_in_queue_count = 0
+
+    for unit in units:
+        if unit.status is WorkUnitStatus.BLOCKED:
+            already_blocked_count += 1
+            continue
+
+        if unit.status is not WorkUnitStatus.IN_QUEUE:
+            continue
+
+        unmet = [dep for dep in unit.dependencies if dep not in done_ids]
+        if not unmet:
+            satisfied_in_queue_count += 1
+            continue
+
+        wu_file = BACKLOG_ROOT / unit.file_path if not unit.file_path.is_absolute() else unit.file_path
+        if not wu_file.exists():
+            print(
+                f"ERROR: cannot resolve file for unit {unit.id}: {wu_file} does not exist",
+                file=sys.stderr,
+            )
+            return 1
+
+        mgr.force_status(wu_file, BACKLOG_INDEX, unit.id, "blocked")
+        newly_blocked.append((unit.id, unit.title, unmet))
+
+    for unit_id, title, unmet_deps in newly_blocked:
+        print(f"  BLOCKED {unit_id} ({title}) — unmet deps: {', '.join(unmet_deps)}")
+
+    print(
+        f"Blocked {len(newly_blocked)} unit(s). "
+        f"{already_blocked_count} already blocked. "
+        f"{satisfied_in_queue_count} in-queue units have all deps met."
+    )
+    return 0
+
+
 def _find_unit(units: list[WorkUnit], unit_id: str) -> WorkUnit | None:
     """Find a work unit by ID (case-insensitive)."""
     for unit in units:
@@ -508,6 +579,7 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
     "set-status": (cmd_set_status, 2, "Set status: set-status <id> <status>"),
     "mark-done": (cmd_mark_done, 1, "Mark done: mark-done <id>"),
     "validate-backlog": (cmd_validate_backlog, 0, "Validate backlog integrity"),
+    "sync-blocked": (cmd_sync_blocked, 0, "Mark in-queue units with unmet deps as blocked"),
     "log": (cmd_log, 1, "Log a message: log <message>"),
     "report": (cmd_report, 0, "Progress report: report [since-timestamp]"),
 }

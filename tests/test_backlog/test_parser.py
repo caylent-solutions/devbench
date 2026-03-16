@@ -756,6 +756,205 @@ class TestDepsSatisfied:
         assert not hasattr(BacklogParser, "_task_ids")
 
 
+class TestParseIndexInjectsIndexDeps:
+    """Tests for AC-1 through AC-5 of E15-F2-S1-T1.
+
+    parse_index overwrites unit.dependencies from the BACKLOG.md index column.
+    """
+
+    def _make_index_and_wu(
+        self,
+        tmp_path: Path,
+        index_deps_col: str,
+        file_dep_rows: str = "",
+    ) -> tuple[Path, Path]:
+        """Write an index file and a work-unit file, return (index_path, backlog_dir)."""
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir(exist_ok=True)
+
+        dep_table = (
+            "## Dependencies\n\n"
+            "| ID | Title | Status |\n"
+            "|----|-------|--------|\n"
+            f"{file_dep_rows}\n"
+        ) if file_dep_rows else ""
+
+        wu_file = backlog_dir / "E0-F1-S1-T1.md"
+        wu_file.write_text(
+            "# E0-F1-S1-T1: Task One\n\n"
+            "## Status: in-queue\n\n"
+            f"{dep_table}"
+        )
+
+        index = tmp_path / "BACKLOG.md"
+        index.write_text(
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|----------|\n"
+            f"| E0-F1-S1-T1 | Task One | Task | in-queue | {index_deps_col} | git-repo | `backlog/E0-F1-S1-T1.md` |\n"
+        )
+        return index, backlog_dir
+
+    def test_spec_e15_f2_s1_t1_ac1_index_dep_injected_when_no_file_dep_table(
+        self, tmp_path: Path
+    ) -> None:
+        """AC-1: A unit with E9 in the index column but no dep table in the file
+        has dependencies == ["E9"].
+
+        Given: Index row has "E9" in the Dependencies column; work-unit file has
+               no ## Dependencies section.
+        When:  parse_index is called.
+        Then:  The returned WorkUnit has dependencies == ["E9"].
+        Spec:  E15-F2-S1-T1 AC-1.
+        """
+        index, backlog_dir = self._make_index_and_wu(
+            tmp_path, index_deps_col="E9", file_dep_rows=""
+        )
+        parser = BacklogParser(backlog_root=backlog_dir, backlog_index=index)
+        units = parser.parse_index()
+
+        assert len(units) == 1
+        assert units[0].dependencies == ["E9"]
+
+    def test_spec_e15_f2_s1_t1_ac2_none_sentinel_produces_empty_deps(
+        self, tmp_path: Path
+    ) -> None:
+        """AC-2: A unit with None in the index column has dependencies == [].
+
+        Given: Index row has "None" in the Dependencies column.
+        When:  parse_index is called.
+        Then:  The returned WorkUnit has dependencies == [].
+        Spec:  E15-F2-S1-T1 AC-2.
+        """
+        index, backlog_dir = self._make_index_and_wu(
+            tmp_path, index_deps_col="None", file_dep_rows="| E9 | Epic 9 | done |"
+        )
+        parser = BacklogParser(backlog_root=backlog_dir, backlog_index=index)
+        units = parser.parse_index()
+
+        assert len(units) == 1
+        assert units[0].dependencies == []
+
+    def test_spec_e15_f2_s1_t1_ac2_dash_dash_sentinel_produces_empty_deps(
+        self, tmp_path: Path
+    ) -> None:
+        """AC-2 variant: -- sentinel in the index column produces dependencies == [].
+
+        Given: Index row has "--" in the Dependencies column.
+        When:  parse_index is called.
+        Then:  The returned WorkUnit has dependencies == [].
+        Spec:  E15-F2-S1-T1 AC-2.
+        """
+        index, backlog_dir = self._make_index_and_wu(
+            tmp_path, index_deps_col="--", file_dep_rows="| E9 | Epic 9 | done |"
+        )
+        parser = BacklogParser(backlog_root=backlog_dir, backlog_index=index)
+        units = parser.parse_index()
+
+        assert len(units) == 1
+        assert units[0].dependencies == []
+
+    def test_spec_e15_f2_s1_t1_ac3_index_dep_overrides_file_dep(
+        self, tmp_path: Path
+    ) -> None:
+        """AC-3: Changing only the index column dep updates the unit's deps
+        without modifying the work-unit file.
+
+        Given: Index row has "E14-F1-S1-T1" in Dependencies column; file has
+               "E9" in its ## Dependencies table.
+        When:  parse_index is called.
+        Then:  The returned WorkUnit has dependencies == ["E14-F1-S1-T1"]
+               (index wins over file).
+        Spec:  E15-F2-S1-T1 AC-3.
+        """
+        index, backlog_dir = self._make_index_and_wu(
+            tmp_path,
+            index_deps_col="E14-F1-S1-T1",
+            file_dep_rows="| E9 | Epic 9 | done |",
+        )
+        parser = BacklogParser(backlog_root=backlog_dir, backlog_index=index)
+        units = parser.parse_index()
+
+        assert len(units) == 1
+        assert units[0].dependencies == ["E14-F1-S1-T1"]
+
+    def test_spec_e15_f2_s1_t1_ac4_parse_work_unit_file_still_reads_file_deps(
+        self, tmp_path: Path
+    ) -> None:
+        """AC-4: parse_work_unit_file called directly still reads deps from the
+        file dep table (unaffected by parse_index changes).
+
+        Given: A work-unit file with "E9" in its ## Dependencies table.
+        When:  parse_work_unit_file is called directly (not via parse_index).
+        Then:  The returned WorkUnit has dependencies == ["E9"].
+        Spec:  E15-F2-S1-T1 AC-4.
+        """
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        wu_file = backlog_dir / "E0-F1-S1-T1.md"
+        wu_file.write_text(
+            "# E0-F1-S1-T1: Task One\n\n"
+            "## Status: in-queue\n\n"
+            "## Dependencies\n\n"
+            "| ID | Title | Status |\n"
+            "|----|-------|--------|\n"
+            "| E9 | Epic 9 | done |\n"
+        )
+        parser = BacklogParser(backlog_root=backlog_dir, backlog_index=tmp_path / "BACKLOG.md")
+        unit = parser.parse_work_unit_file(wu_file)
+
+        assert unit.dependencies == ["E9"]
+
+    def test_spec_e15_f2_s1_t1_ac5_mismatch_logs_debug(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """AC-5: Mismatch between index and file emits a DEBUG-level log line.
+
+        Given: Index row has "E14-F1-S1-T1" in Dependencies column; file has
+               "E9" in its ## Dependencies table.
+        When:  parse_index is called with DEBUG logging enabled.
+        Then:  A DEBUG-level log record referencing the mismatch is emitted.
+        Spec:  E15-F2-S1-T1 AC-5.
+        """
+        import logging
+
+        index, backlog_dir = self._make_index_and_wu(
+            tmp_path,
+            index_deps_col="E14-F1-S1-T1",
+            file_dep_rows="| E9 | Epic 9 | done |",
+        )
+        parser = BacklogParser(backlog_root=backlog_dir, backlog_index=index)
+
+        with caplog.at_level(logging.DEBUG, logger="devbench.backlog.parser"):
+            units = parser.parse_index()
+
+        assert len(units) == 1
+        assert units[0].dependencies == ["E14-F1-S1-T1"]
+        assert any(
+            r.levelno == logging.DEBUG and "dep" in r.message.lower()
+            for r in caplog.records
+        ), f"Expected DEBUG dep-mismatch log. Got: {[r.message for r in caplog.records]}"
+
+    def test_spec_e15_f2_s1_t1_ac1_multiple_deps_in_index_column(
+        self, tmp_path: Path
+    ) -> None:
+        """AC-1 extended: Comma-separated IDs in index column are all injected.
+
+        Given: Index row has "E9, E14-F1-S1-T1" in the Dependencies column.
+        When:  parse_index is called.
+        Then:  The returned WorkUnit has dependencies == ["E9", "E14-F1-S1-T1"].
+        Spec:  E15-F2-S1-T1 AC-1.
+        """
+        index, backlog_dir = self._make_index_and_wu(
+            tmp_path, index_deps_col="E9, E14-F1-S1-T1", file_dep_rows=""
+        )
+        parser = BacklogParser(backlog_root=backlog_dir, backlog_index=index)
+        units = parser.parse_index()
+
+        assert len(units) == 1
+        assert units[0].dependencies == ["E9", "E14-F1-S1-T1"]
+
+
 class TestNumericSortCandidates:
     """Tests for numeric-aware sort order in get_parallel_candidates.
 

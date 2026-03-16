@@ -806,6 +806,131 @@ class TestIsCommittedAndPushed:
             )
 
 
+class TestRebaseOntoDefault:
+    """Test rebase_onto_default method."""
+
+    def test_validates_repo(self, tmp_path: Path) -> None:
+        """Raises ValueError when repo is not in the allow-list."""
+        judge = GitOpsJudge()
+        with pytest.raises(ValueError, match="not allowed"):
+            judge.rebase_onto_default("caylent-solutions/nonexistent-test-repo", tmp_path, "feature/x")
+
+    def test_rebase_onto_default_fetches_then_rebases_then_force_pushes(self, tmp_path: Path) -> None:
+        """AC-4: rebase_onto_default fetches origin, rebases, then force-pushes with --force-with-lease.
+
+        Given: A feature branch that is behind origin/<default_branch>
+        When: rebase_onto_default is called
+        Then: git fetch origin, git rebase origin/<default_branch>, git push --force-with-lease are called in order
+        """
+        judge = GitOpsJudge()
+        git_calls: list[list[str]] = []
+
+        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
+            git_calls.append(args)
+            return (0, "", "")
+
+        from devbench.config_loader import RepoConfig, RuntimeConfig
+        runtime_config = RuntimeConfig(
+            repos={"caylent-solutions/git-repo": RepoConfig(default_branch="main2")}
+        )
+        with (
+            patch("devbench.github.git_ops.RUNTIME_CONFIG", runtime_config),
+            patch.object(judge, "_git", side_effect=stub),
+        ):
+            judge.rebase_onto_default("caylent-solutions/git-repo", tmp_path, "feature/x")
+
+        assert ["fetch", "origin"] in git_calls
+        assert ["rebase", "origin/main2"] in git_calls
+        assert ["push", "--force-with-lease", "origin", "feature/x"] in git_calls
+
+        fetch_idx = git_calls.index(["fetch", "origin"])
+        rebase_idx = git_calls.index(["rebase", "origin/main2"])
+        push_idx = git_calls.index(["push", "--force-with-lease", "origin", "feature/x"])
+        assert fetch_idx < rebase_idx < push_idx
+
+    def test_rebase_onto_default_raises_on_rebase_failure(self, tmp_path: Path) -> None:
+        """AC-3: Rebase failure raises RuntimeError with a clear message.
+
+        Given: git rebase fails (e.g., conflicts)
+        When: rebase_onto_default is called
+        Then: RuntimeError is raised with actionable message; no loop back to create_pr
+        """
+        judge = GitOpsJudge()
+
+        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
+            if args[0] == "rebase":
+                raise RuntimeError("git rebase origin/main2 failed (exit 1): conflict in foo.py")
+            return (0, "", "")
+
+        from devbench.config_loader import RepoConfig, RuntimeConfig
+        runtime_config = RuntimeConfig(
+            repos={"caylent-solutions/git-repo": RepoConfig(default_branch="main2")}
+        )
+        with (
+            patch("devbench.github.git_ops.RUNTIME_CONFIG", runtime_config),
+            patch.object(judge, "_git", side_effect=stub),
+            pytest.raises(RuntimeError, match="rebase"),
+        ):
+            judge.rebase_onto_default("caylent-solutions/git-repo", tmp_path, "feature/x")
+
+    def test_rebase_onto_default_uses_force_with_lease_not_force(self, tmp_path: Path) -> None:
+        """AC-4: --force-with-lease is used, not --force.
+
+        Given: rebase_onto_default runs successfully
+        When: the force-push step executes
+        Then: the push command uses --force-with-lease, not --force
+        """
+        judge = GitOpsJudge()
+        git_calls: list[list[str]] = []
+
+        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
+            git_calls.append(args)
+            return (0, "", "")
+
+        from devbench.config_loader import RepoConfig, RuntimeConfig
+        runtime_config = RuntimeConfig(
+            repos={"caylent-solutions/git-repo": RepoConfig(default_branch="main2")}
+        )
+        with (
+            patch("devbench.github.git_ops.RUNTIME_CONFIG", runtime_config),
+            patch.object(judge, "_git", side_effect=stub),
+        ):
+            judge.rebase_onto_default("caylent-solutions/git-repo", tmp_path, "feature/x")
+
+        push_calls = [c for c in git_calls if c[0] == "push"]
+        assert len(push_calls) == 1
+        assert "--force-with-lease" in push_calls[0]
+        assert "--force" not in push_calls[0] or "--force-with-lease" in push_calls[0]
+        # More specifically: --force alone must NOT appear
+        assert push_calls[0] != ["push", "--force", "origin", "feature/x"]
+
+    def test_rebase_onto_default_uses_configured_default_branch(self, tmp_path: Path) -> None:
+        """rebase_onto_default uses get_configured_default_branch to determine the rebase target.
+
+        Given: RUNTIME_CONFIG has default_branch='develop' for the repo
+        When: rebase_onto_default is called
+        Then: git rebase origin/develop is executed
+        """
+        judge = GitOpsJudge()
+        git_calls: list[list[str]] = []
+
+        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
+            git_calls.append(args)
+            return (0, "", "")
+
+        from devbench.config_loader import RepoConfig, RuntimeConfig
+        runtime_config = RuntimeConfig(
+            repos={"caylent-solutions/git-repo": RepoConfig(default_branch="develop")}
+        )
+        with (
+            patch("devbench.github.git_ops.RUNTIME_CONFIG", runtime_config),
+            patch.object(judge, "_git", side_effect=stub),
+        ):
+            judge.rebase_onto_default("caylent-solutions/git-repo", tmp_path, "feature/x")
+
+        assert ["rebase", "origin/develop"] in git_calls
+
+
 class TestGitHelper:
     """Test _git helper method."""
 

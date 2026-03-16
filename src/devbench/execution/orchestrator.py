@@ -48,6 +48,88 @@ def _format_judge_feedback(verdicts: list[tuple[str, JudgeResult]]) -> str:
     return "\n".join(feedback_parts)
 
 
+def _run_executor_and_review(
+    work_unit: WorkUnit,
+    repo_path: Path,
+    repo: str,
+    attempt: int,
+    feedback: str,
+    blocker_judge: BlockerResolverJudge,
+    security_judge: SecurityReviewJudge,
+) -> str | None:
+    """Run executor, blocker resolution, review judges, and security check for one attempt.
+
+    Returns:
+        ``str`` — feedback to pass on the next retry (retry required).
+        ``None`` — all gates passed; caller should proceed to git ops.
+    """
+    result = claude_executor.execute(
+        work_unit_path=work_unit.file_path,
+        repo=repo,
+        feedback=feedback,
+    )
+
+    if result.status == ExecutionStatus.BLOCKED:
+        work_unit.log_comment(
+            "orchestrator",
+            "BLOCKED",
+            f"Agent reported blocker: {result.blocker}",
+        )
+        blocker_result = blocker_judge.evaluate(
+            work_unit_path=work_unit.file_path,
+            repo_path=repo_path,
+        )
+        if blocker_result.verdict == Verdict.FAIL:
+            logger.warning(
+                "Blocker unresolvable for %s: %s",
+                work_unit.id,
+                blocker_result.reasoning,
+            )
+            return f"Blocker could not be resolved: {blocker_result.reasoning}"
+        work_unit.log_comment("orchestrator", "BLOCKER_RESOLVED", blocker_result.reasoning)
+        return f"Blocker resolved: {blocker_result.reasoning}"
+
+    if result.status == ExecutionStatus.FAILED:
+        work_unit.log_comment("orchestrator", "AGENT_FAILED", f"Attempt {attempt} failed")
+        return f"Previous attempt failed. Output: {result.output[:OUTPUT_TRUNCATION_LIMIT]}"
+
+    # Status is IN_REVIEW — run judges
+    verdicts = run_review_judges(work_unit, repo_path, repo=repo)
+    all_passed = all(v.verdict == Verdict.PASS for _, v in verdicts)
+
+    if not all_passed:
+        work_unit.log_comment(
+            "orchestrator",
+            "REVIEW_REJECTED",
+            f"Attempt {attempt}: judges rejected, retrying",
+        )
+        return _format_judge_feedback(verdicts)
+
+    # All judges passed — security check
+    logger.info("All review judges passed for %s, checking security", work_unit.id)
+    security_result = security_judge.evaluate(
+        work_unit_path=work_unit.file_path,
+        repo_path=repo_path,
+        repo=repo,
+    )
+    if security_result.verdict == Verdict.FAIL:
+        work_unit.log_comment(
+            "judge/security_review",
+            "SECURITY_FAIL",
+            security_result.feedback,
+        )
+        # Reset the done-gate window so mark_done requires a fresh judge re-run
+        # after the dev fixes the security issue and the code changes.
+        work_unit.log_comment(
+            "orchestrator",
+            "REVIEW_REJECTED",
+            f"Security review failed on attempt {attempt} — judge re-review required",
+        )
+        return f"Security review failed: {security_result.feedback}"
+
+    return None
+
+
 def run_review_judges(
     work_unit: WorkUnit,
     repo_path: Path,
@@ -139,75 +221,27 @@ def process_work_unit(work_unit: WorkUnit) -> bool:
             branch=branch,
         )
 
-        # Execute the work unit
-        result = claude_executor.execute(
-            work_unit_path=work_unit.file_path,
+        if git_ops.is_committed_and_pushed(
             repo=canonical_repo,
-            feedback=feedback,
-        )
-
-        if result.status == ExecutionStatus.BLOCKED:
-            work_unit.log_comment(
-                "orchestrator",
-                "BLOCKED",
-                f"Agent reported blocker: {result.blocker}",
-            )
-            blocker_result = blocker_judge.evaluate(
-                work_unit_path=work_unit.file_path,
-                repo_path=repo_path,
-            )
-            if blocker_result.verdict == Verdict.FAIL:
-                logger.warning(
-                    "Blocker unresolvable for %s: %s",
-                    work_unit.id,
-                    blocker_result.reasoning,
-                )
-                feedback = f"Blocker could not be resolved: {blocker_result.reasoning}"
-                continue
-            work_unit.log_comment("orchestrator", "BLOCKER_RESOLVED", blocker_result.reasoning)
-            feedback = f"Blocker resolved: {blocker_result.reasoning}"
-            continue
-
-        if result.status == ExecutionStatus.FAILED:
-            work_unit.log_comment("orchestrator", "AGENT_FAILED", f"Attempt {attempt} failed")
-            feedback = f"Previous attempt failed. Output: {result.output[:OUTPUT_TRUNCATION_LIMIT]}"
-            continue
-
-        # Status is IN_REVIEW — run judges
-        verdicts = run_review_judges(work_unit, repo_path, repo=canonical_repo)
-        all_passed = all(v.verdict == Verdict.PASS for _, v in verdicts)
-
-        if not all_passed:
-            feedback = _format_judge_feedback(verdicts)
-            work_unit.log_comment(
-                "orchestrator",
-                "REVIEW_REJECTED",
-                f"Attempt {attempt}: judges rejected, retrying",
-            )
-            continue
-
-        # All judges passed — security check
-        logger.info("All review judges passed for %s, checking security", work_unit.id)
-        security_result = security_judge.evaluate(
-            work_unit_path=work_unit.file_path,
             repo_path=repo_path,
-            repo=canonical_repo,
-        )
-        if security_result.verdict == Verdict.FAIL:
-            work_unit.log_comment(
-                "judge/security_review",
-                "SECURITY_FAIL",
-                security_result.feedback,
+            branch=branch,
+        ):
+            logger.info(
+                "Branch %s already committed and pushed — skipping re-review", branch
             )
-            # Reset the done-gate window so mark_done requires a fresh judge re-run
-            # after the dev fixes the security issue and the code changes.
-            work_unit.log_comment(
-                "orchestrator",
-                "REVIEW_REJECTED",
-                f"Security review failed on attempt {attempt} — judge re-review required",
+        else:
+            retry_feedback = _run_executor_and_review(
+                work_unit=work_unit,
+                repo_path=repo_path,
+                repo=canonical_repo,
+                attempt=attempt,
+                feedback=feedback,
+                blocker_judge=blocker_judge,
+                security_judge=security_judge,
             )
-            feedback = f"Security review failed: {security_result.feedback}"
-            continue
+            if retry_feedback is not None:
+                feedback = retry_feedback
+                continue
 
         # Commit, push, create PR, wait for checks, merge
         try:

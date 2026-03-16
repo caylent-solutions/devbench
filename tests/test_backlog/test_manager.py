@@ -312,6 +312,137 @@ class TestRollupParentStatus:
             pytest.fail("E0-F1 feature row not found")
 
 
+class TestRollupMissingParent:
+    """Tests for _rollup_parent_status() when parent ID is absent from the backlog index.
+
+    The crash scenario: a parent row exists in BACKLOG.md but with no recognized status
+    cell (e.g. an epic-level row like ``| E6 | Epic Title | | | | | backlog/E6.md |``).
+    ``_all_children_done()`` sees the row (parent_found=True, status=""), treats it as
+    not-yet-done, and returns True once all children are done.  ``_find_work_unit_file``
+    then resolves the parent file.  ``_set_status`` calls ``_update_backlog_index``, which
+    finds the row by ID but cannot locate a recognized status cell → raises ``ValueError``.
+
+    The fix: in ``_rollup_parent_status()``, check whether the parent ID has a recognized
+    status entry in the parsed rows before calling ``_set_status()``.  If absent, log
+    DEBUG and return without raising.
+    """
+
+    def _make_index_with_statusless_parent(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> tuple[Path, Path, Path]:
+        """Build a BACKLOG.md where the parent row has no recognized status cell.
+
+        E0-F1-S1-T1 and E0-F1-S1-T2 are both children (T2 is already Done).
+        E0-F1-S1 is the parent row, present in the index but with an empty Status
+        column so ``_update_backlog_index`` cannot update it.
+        """
+        content = """\
+# Backlog
+
+## Full Work Unit Index
+
+| ID | Title | Type | Status | Dependencies | Repo | File Path |
+|-----|-------|------|--------|-------------|------|-----------|
+| E0-F1-S1-T1 | Task A | Task | in-queue | None | git-repo | `backlog/E0-F1-S1-T1.md` |
+| E0-F1-S1-T2 | Task B | Task | Done | None | git-repo | `backlog/E0-F1-S1-T2.md` |
+| E0-F1-S1 | Story A | Story | | None | git-repo | `backlog/E0-F1-S1.md` |
+"""
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(content)
+
+        t1_file = backlog_dir / "E0-F1-S1-T1.md"
+        t1_file.write_text("# E0-F1-S1-T1\n\n## Status: in-queue\n")
+        story_file = backlog_dir / "E0-F1-S1.md"
+        story_file.write_text("# E0-F1-S1\n\n## Status: in-queue\n")
+
+        return index_path, t1_file, story_file
+
+    def test_set_status_completes_when_parent_absent_from_index(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """AC-4: set_status on a child completes successfully when the parent has no updatable index row.
+
+        Given: A backlog index where the parent row (E0-F1-S1) has no recognized status cell
+        When: force_status is called on the last child (E0-F1-S1-T1) with status 'done'
+        Then: No exception is raised and the child status is written correctly
+        Spec: manager.py:_rollup_parent_status
+        """
+        index_path, t1_file, _ = self._make_index_with_statusless_parent(tmp_path, backlog_dir)
+
+        manager = BacklogManager()
+        # Must not raise even though parent E0-F1-S1 has no recognized status cell
+        manager.force_status(t1_file, index_path, "E0-F1-S1-T1", "done")
+
+        # Child status is persisted correctly
+        assert "## Status: done" in t1_file.read_text(encoding="utf-8")
+
+    def test_debug_logged_when_rollup_skipped(
+        self, tmp_path: Path, backlog_dir: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """AC-5: a DEBUG message is emitted when rollup is skipped for a missing parent.
+
+        Given: A backlog index where the parent row (E0-F1-S1) has no recognized status cell
+        When: force_status marks the last child done and rollup would fire
+        Then: A DEBUG log message is emitted that identifies the missing parent ID
+        Spec: manager.py:_rollup_parent_status
+        """
+        import logging
+
+        index_path, t1_file, _ = self._make_index_with_statusless_parent(tmp_path, backlog_dir)
+
+        manager = BacklogManager()
+        with caplog.at_level(logging.DEBUG, logger="devbench.backlog_manager"):
+            manager.force_status(t1_file, index_path, "E0-F1-S1-T1", "done")
+
+        debug_messages = [r.message for r in caplog.records if r.levelno == logging.DEBUG]
+        assert any("E0-F1-S1" in msg for msg in debug_messages), (
+            f"Expected DEBUG message mentioning 'E0-F1-S1' but got: {debug_messages}"
+        )
+
+    def test_rollup_proceeds_normally_when_parent_present(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """AC-3: rollup behaviour is unchanged when the parent ID is present with a recognized status.
+
+        Given: A backlog index where both child and parent have rows with recognized statuses
+        When: force_status marks the last child done
+        Then: The parent status is rolled up to 'done' as before
+        Spec: manager.py:_rollup_parent_status
+        """
+        content = """\
+# Backlog
+
+## Full Work Unit Index
+
+| ID | Title | Type | Status | Dependencies | Repo | File Path |
+|-----|-------|------|--------|-------------|------|-----------|
+| E0-F1-S1-T1 | Task A | Task | in-queue | None | git-repo | `backlog/E0-F1-S1-T1.md` |
+| E0-F1-S1-T2 | Task B | Task | Done | None | git-repo | `backlog/E0-F1-S1-T2.md` |
+| E0-F1-S1 | Story A | Story | in-queue | None | git-repo | `backlog/E0-F1-S1.md` |
+"""
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(content)
+
+        t1_file = backlog_dir / "E0-F1-S1-T1.md"
+        t1_file.write_text("# E0-F1-S1-T1\n\n## Status: in-queue\n")
+        story_file = backlog_dir / "E0-F1-S1.md"
+        story_file.write_text("# E0-F1-S1\n\n## Status: in-queue\n")
+
+        manager = BacklogManager()
+        manager.force_status(t1_file, index_path, "E0-F1-S1-T1", "done")
+
+        assert "## Status: done" in story_file.read_text(encoding="utf-8"), (
+            "Parent story should be rolled up to done when all children are done"
+        )
+        index_content = index_path.read_text()
+        for line in index_content.splitlines():
+            if "| E0-F1-S1 |" in line and "Story" in line:
+                assert " done " in line
+                break
+        else:
+            pytest.fail("E0-F1-S1 story row not found in BACKLOG.md")
+
+
 class TestLogToTraceabilityMatrix:
     """Test traceability matrix logging."""
 

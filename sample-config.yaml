@@ -64,3 +64,13 @@ repos:
 #
 # Set JUDGE_DEFAULT_MODEL_BEDROCK env var to the Bedrock model ID to use
 # when judge_model/executor_model are absent and ANTHROPIC_MODEL is not set.
+
+# Git workflow behaviour settings (optional — defaults shown).
+#
+# git_ops.update_submodule: enable only when all target repos are git submodules
+# of a parent workspace repo. When true, the orchestrator stages and commits the
+# updated submodule pointer in the parent repo after each PR is merged.
+# Default is false — omit the block entirely to keep it disabled.
+#
+# git_ops:
+#   update_submodule: false

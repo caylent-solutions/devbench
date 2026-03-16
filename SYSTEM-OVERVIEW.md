@@ -231,6 +231,9 @@ executor_model: claude-sonnet-4-6-20251001  # optional — model for executor su
 
 use_bedrock: false                   # optional — route LLM calls via AWS Bedrock
 bedrock_region: us-east-1            # required when use_bedrock: true — AWS region (env var override: JUDGE_BEDROCK_REGION)
+
+git_ops:                             # optional — git workflow behaviour settings
+  update_submodule: false            # set true only when repos are git submodules of a parent repo
 ```
 
 **Model configuration precedence** (first match wins, applied to both `CLAUDE_MODEL` and `EXECUTOR_MODEL`):

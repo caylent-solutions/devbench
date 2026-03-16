@@ -35,6 +35,7 @@ from devbench.constants import (
     BACKLOG_REPO_RE,
     BACKLOG_STATUS_RE,
     BRANCH_NAME_TEMPLATE,
+    DEPENDENCY_NONE_VALUES,
     EPIC_PLACEHOLDER_ID,
     STATUS_BLOCKED,
     STATUS_DONE,
@@ -151,9 +152,15 @@ class BacklogParser:
         """Parse ``BACKLOG.md`` table rows into a list of ``WorkUnit`` objects.
 
         Each row is used to locate the work-unit file; the complete ``WorkUnit``
-        is then constructed by delegating to :meth:`parse_work_unit_file`, which
-        is the single authoritative constructor.  This ensures all fields
-        (including ``branch``) are always populated from the file.
+        is then constructed by delegating to :meth:`parse_work_unit_file`.
+        After parsing the file, ``unit.dependencies`` is **overwritten** with
+        the dependency IDs from the ``Dependencies`` column of the index row.
+        This makes ``BACKLOG.md`` the single authoritative source for the
+        dependency DAG — rewiring dependencies requires only an index edit,
+        not a change to individual work-unit files.
+
+        If the index column deps differ from the file deps, a DEBUG-level log
+        line is emitted (observability only — the index always wins).
 
         Raises ``FileNotFoundError`` if the index file does not exist and
         ``ValueError`` if a table row cannot be parsed.
@@ -170,6 +177,7 @@ class BacklogParser:
             raw_id = match.group(1).strip()
             raw_type = match.group(3).strip()
             raw_status = match.group(4).strip()
+            raw_index_deps = match.group(5).strip()
             raw_file_path = match.group(7).strip().strip("`")
 
             # Skip header rows, separator rows, and non-work-unit rows
@@ -197,7 +205,7 @@ class BacklogParser:
             unit = self.parse_work_unit_file(file_path)
 
             # Cross-check: warn when BACKLOG.md index disagrees with the work-unit file.
-            # The file is the source of truth (parse_work_unit_file already read it),
+            # The file is the source of truth for status (parse_work_unit_file already read it),
             # so no correction is needed — only observability.
             index_status = _RAW_STATUS_TO_ENUM.get(raw_status.lower())
             if index_status is not None and index_status != unit.status:
@@ -208,6 +216,18 @@ class BacklogParser:
                     raw_status,
                     unit.status.value,
                 )
+
+            # Overwrite deps from the index column — index is authoritative for DAG.
+            index_deps = self._parse_index_dep_column(raw_index_deps)
+            if index_deps != unit.dependencies:
+                logger.debug(
+                    "Dep mismatch for %s: index column has %r, file has %r. "
+                    "Using index column as authoritative source.",
+                    unit.id,
+                    index_deps,
+                    unit.dependencies,
+                )
+            unit.dependencies = index_deps
 
             units.append(unit)
 
@@ -387,6 +407,22 @@ class BacklogParser:
         ``done_ids``.  An empty dependency list is always considered satisfied.
         """
         return all(dep in done_ids for dep in unit.dependencies)
+
+    @staticmethod
+    def _parse_index_dep_column(raw: str) -> list[str]:
+        """Parse the ``Dependencies`` column of a BACKLOG.md index row.
+
+        The column may contain:
+        - A comma-separated list of dependency IDs (e.g. ``"E9, E14-F1-S1-T1"``)
+        - A sentinel meaning "no dependencies" (``None``, ``--``, ``---``, or empty)
+
+        Returns an empty list for any sentinel value, otherwise returns the
+        list of stripped dependency IDs.
+        """
+        stripped = raw.strip()
+        if stripped.lower() in DEPENDENCY_NONE_VALUES:
+            return []
+        return [token.strip() for token in stripped.split(",") if token.strip()]
 
     @staticmethod
     def _parse_dependency_table(content: str) -> list[str]:

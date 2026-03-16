@@ -221,6 +221,7 @@ devbench/
 │           ├── guard-bash.sh      ← PreToolUse: blocks dangerous Bash commands
 │           ├── guard-backlog.sh   ← PreToolUse: prevents writes to backlog/ tracking files
 │           ├── guard-verdict-format.sh ← PreToolUse: validates log-verdict argument format
+│           ├── guard-git-stage.sh      ← PreToolUse: blocks git commit when no files are staged
 │           └── assert-tests-pass.sh    ← PostToolUse: enforces test suite passes after Bash
 ├── tests/
 │   ├── conftest.py                ← Shared fixtures
@@ -233,6 +234,7 @@ devbench/
 │   ├── test_utils/                ← process.run_command tests
 │   └── unit/                      ← Unit tests for plugin hook scripts
 │       ├── test_guard_verdict_format.py ← Tests for guard-verdict-format.sh
+│       ├── test_guard_git_stage.py      ← Tests for guard-git-stage.sh
 │       └── test_assert_tests_pass.py    ← Tests for assert-tests-pass.sh
 ├── scripts/
 │   ├── start.sh                   ← Background start script
@@ -256,6 +258,7 @@ These hooks fire before every Bash tool call and can block execution by exiting 
 | `guard-bash.sh` | Blocks Bash commands that are destructive or prohibited (e.g. `rm -rf /`) |
 | `guard-backlog.sh` | Prevents writes to `backlog/` tracking files (BACKLOG.md, work unit .md files) |
 | `guard-verdict-format.sh` | Validates `uv run devbench log-verdict` calls: verdict must be `pass` or `fail`, judge name must be a known identifier, and feedback must be non-empty when verdict is `fail` |
+| `guard-git-stage.sh` | Blocks `git commit` when no files are staged; runs `git diff --cached --quiet` and exits 2 with guidance to run `git add` if the index is empty |
 
 ### PostToolUse hooks (Bash)
 

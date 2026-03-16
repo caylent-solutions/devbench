@@ -756,3 +756,111 @@ class TestDepsSatisfied:
         assert not hasattr(BacklogParser, "_task_ids")
 
 
+class TestNumericSortCandidates:
+    """Tests for numeric-aware sort order in get_parallel_candidates.
+
+    These tests verify AC-1 through AC-4 of E15-F1-S1-T4.
+    """
+
+    def _parser(self) -> BacklogParser:
+        parser = BacklogParser.__new__(BacklogParser)
+        parser._backlog_root = Path("/dev/null")
+        parser._backlog_index = Path("/dev/null")
+        return parser
+
+    def _task(self, unit_id: str, status: WorkUnitStatus, deps: list[str] | None = None) -> WorkUnit:
+        return WorkUnit(
+            id=unit_id,
+            title=unit_id,
+            status=status,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("/dev/null"),
+            repo="r",
+            dependencies=deps or [],
+        )
+
+    def test_candidates_e9_before_e15(self) -> None:
+        """AC-1: E9-* candidates appear before E15-* candidates when both are actionable.
+
+        Given: Two IN_QUEUE tasks with IDs E9-F1-S1-T1 and E15-F1-S1-T1, both with
+               no unsatisfied dependencies.
+        When:  get_parallel_candidates is called.
+        Then:  E9-F1-S1-T1 appears before E15-F1-S1-T1 in the result list.
+        Spec:  E15 plan: earlier epics must be picked up before later ones.
+        """
+        parser = self._parser()
+        e15_task = self._task("E15-F1-S1-T1", WorkUnitStatus.IN_QUEUE)
+        e9_task = self._task("E9-F1-S1-T1", WorkUnitStatus.IN_QUEUE)
+        candidates = parser.get_parallel_candidates([e15_task, e9_task])
+        ids = [u.id for u in candidates]
+        assert ids.index("E9-F1-S1-T1") < ids.index("E15-F1-S1-T1"), (
+            f"Expected E9-F1-S1-T1 before E15-F1-S1-T1 but got order: {ids}"
+        )
+
+    def test_candidates_e1_before_e2_before_e10(self) -> None:
+        """AC-2: E1-* candidates appear before E2-* and E10-* candidates.
+
+        Given: Three IN_QUEUE tasks with IDs E10-F1-S1-T1, E2-F1-S1-T1, and E1-F1-S1-T1,
+               all with no unsatisfied dependencies.
+        When:  get_parallel_candidates is called.
+        Then:  The order is E1-F1-S1-T1, E2-F1-S1-T1, E10-F1-S1-T1.
+        Spec:  E15 plan: earlier epics must be picked up before later ones.
+        """
+        parser = self._parser()
+        e10_task = self._task("E10-F1-S1-T1", WorkUnitStatus.IN_QUEUE)
+        e2_task = self._task("E2-F1-S1-T1", WorkUnitStatus.IN_QUEUE)
+        e1_task = self._task("E1-F1-S1-T1", WorkUnitStatus.IN_QUEUE)
+        candidates = parser.get_parallel_candidates([e10_task, e2_task, e1_task])
+        ids = [u.id for u in candidates]
+        assert ids.index("E1-F1-S1-T1") < ids.index("E2-F1-S1-T1"), (
+            f"Expected E1 before E2 but got order: {ids}"
+        )
+        assert ids.index("E2-F1-S1-T1") < ids.index("E10-F1-S1-T1"), (
+            f"Expected E2 before E10 but got order: {ids}"
+        )
+
+    def test_in_progress_priority_over_in_queue_regardless_of_id(self) -> None:
+        """AC-3: IN_PROGRESS tasks still take priority over IN_QUEUE tasks regardless of ID.
+
+        Given: An IN_QUEUE task E1-F1-S1-T1 and an IN_PROGRESS task E15-F1-S1-T1,
+               both with no unsatisfied dependencies.
+        When:  get_parallel_candidates is called.
+        Then:  E15-F1-S1-T1 (IN_PROGRESS) appears before E1-F1-S1-T1 (IN_QUEUE)
+               despite having a numerically higher epic ID.
+        Spec:  IN_PROGRESS tasks are returned before IN_QUEUE tasks (interrupted work resumed).
+        """
+        parser = self._parser()
+        e1_queued = self._task("E1-F1-S1-T1", WorkUnitStatus.IN_QUEUE)
+        e15_in_progress = self._task("E15-F1-S1-T1", WorkUnitStatus.IN_PROGRESS)
+        candidates = parser.get_parallel_candidates([e1_queued, e15_in_progress])
+        assert len(candidates) == 2
+        assert candidates[0].id == "E15-F1-S1-T1", (
+            f"Expected IN_PROGRESS E15 task first, got {candidates[0].id}"
+        )
+        assert candidates[0].status is WorkUnitStatus.IN_PROGRESS
+        assert candidates[1].id == "E1-F1-S1-T1"
+        assert candidates[1].status is WorkUnitStatus.IN_QUEUE
+
+    def test_within_epic_task_order_preserved(self) -> None:
+        """AC-4: Within the same epic, task ordering is preserved (T1 before T2 before T3).
+
+        Given: Three IN_QUEUE tasks in the same epic: E9-F1-S1-T3, E9-F1-S1-T1, E9-F1-S1-T2,
+               all with no unsatisfied dependencies.
+        When:  get_parallel_candidates is called.
+        Then:  The order is T1, T2, T3.
+        Spec:  Within the same epic, earlier tasks are picked up first.
+        """
+        parser = self._parser()
+        t3 = self._task("E9-F1-S1-T3", WorkUnitStatus.IN_QUEUE)
+        t1 = self._task("E9-F1-S1-T1", WorkUnitStatus.IN_QUEUE)
+        t2 = self._task("E9-F1-S1-T2", WorkUnitStatus.IN_QUEUE)
+        candidates = parser.get_parallel_candidates([t3, t1, t2])
+        ids = [u.id for u in candidates]
+        assert ids.index("E9-F1-S1-T1") < ids.index("E9-F1-S1-T2"), (
+            f"Expected T1 before T2 but got order: {ids}"
+        )
+        assert ids.index("E9-F1-S1-T2") < ids.index("E9-F1-S1-T3"), (
+            f"Expected T2 before T3 but got order: {ids}"
+        )
+
+

@@ -319,7 +319,7 @@ class BacklogParser:
         return [u for u in units if u.status is WorkUnitStatus.BLOCKED]
 
     def get_parallel_candidates(self, units: list[WorkUnit]) -> list[WorkUnit]:
-        """Return all actionable tasks sorted by ID.
+        """Return all actionable tasks sorted by numeric-aware ID order.
 
         A task is *actionable* when:
         - Its status is ``IN_QUEUE`` or ``IN_PROGRESS`` (resume interrupted work)
@@ -327,7 +327,9 @@ class BacklogParser:
         - All of its dependencies have status ``DONE``
 
         ``IN_PROGRESS`` tasks are returned before ``IN_QUEUE`` tasks so that
-        interrupted work is resumed before new work is started.
+        interrupted work is resumed before new work is started.  Within the
+        same status group, tasks are ordered by numeric-aware ID so that
+        ``E9-*`` sorts before ``E15-*`` (numeric, not lexicographic).
 
         All dependency types (Task, Story, Feature, Epic) are blocking.
         A dependency is only satisfied when it appears in the ``done`` set.
@@ -346,14 +348,30 @@ class BacklogParser:
             candidates.append(unit)
 
         # IN_PROGRESS first (resume interrupted work), then IN_QUEUE; within
-        # the same status group, sort by ID for deterministic ordering.
+        # the same status group, sort by numeric-aware ID for deterministic
+        # ordering (e.g. E9 before E15, T1 before T2 before T10).
         status_priority = {WorkUnitStatus.IN_PROGRESS: 0, WorkUnitStatus.IN_QUEUE: 1}
-        candidates.sort(key=lambda u: (status_priority.get(u.status, 2), u.id))
+        candidates.sort(key=lambda u: (status_priority.get(u.status, 2), self._id_sort_key(u.id)))
         return candidates
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _id_sort_key(unit_id: str) -> tuple:
+        """Return a numeric-aware sort key for a work-unit ID.
+
+        Splits the ID on digit boundaries and converts numeric segments to
+        ``int`` so that ``E9-*`` sorts before ``E15-*`` (numeric order, not
+        lexicographic).
+
+        Examples::
+
+            _id_sort_key("E9-F1-S1-T1")  -> ("E", 9, "-F", 1, "-S", 1, "-T", 1)
+            _id_sort_key("E15-F1-S1-T1") -> ("E", 15, "-F", 1, "-S", 1, "-T", 1)
+        """
+        return tuple(int(p) if p.isdigit() else p for p in re.split(r"(\d+)", unit_id) if p)
 
     @staticmethod
     def _done_ids(units: list[WorkUnit]) -> frozenset[str]:

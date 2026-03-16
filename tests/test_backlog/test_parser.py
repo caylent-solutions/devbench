@@ -643,3 +643,116 @@ class TestGetParallelCandidates:
         assert result.status is WorkUnitStatus.IN_PROGRESS
 
 
+class TestDepsSatisfied:
+    """Tests for the fixed _deps_satisfied: all dep types are blocking.
+
+    These tests verify AC-1 through AC-5 of E15-F1-S1-T1.
+    """
+
+    def _parser(self) -> BacklogParser:
+        parser = BacklogParser.__new__(BacklogParser)
+        parser._backlog_root = Path("/dev/null")
+        parser._backlog_index = Path("/dev/null")
+        return parser
+
+    def _task(self, unit_id: str, status: WorkUnitStatus, deps: list[str] | None = None) -> WorkUnit:
+        return WorkUnit(
+            id=unit_id,
+            title=unit_id,
+            status=status,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("/dev/null"),
+            repo="r",
+            dependencies=deps or [],
+        )
+
+    def _epic(self, unit_id: str, status: WorkUnitStatus) -> WorkUnit:
+        return WorkUnit(
+            id=unit_id,
+            title=unit_id,
+            status=status,
+            unit_type=WorkUnitType.EPIC,
+            file_path=Path("/dev/null"),
+            repo="r",
+        )
+
+    def _feature(self, unit_id: str, status: WorkUnitStatus) -> WorkUnit:
+        return WorkUnit(
+            id=unit_id,
+            title=unit_id,
+            status=status,
+            unit_type=WorkUnitType.FEATURE,
+            file_path=Path("/dev/null"),
+            repo="r",
+        )
+
+    def test_deps_satisfied_blocks_on_incomplete_epic(self) -> None:
+        """AC-1: A task whose only dep is an in-queue epic is NOT returned.
+
+        Given: A task with a single dependency on an in-queue epic.
+        When:  get_parallel_candidates is called.
+        Then:  The task is not returned (dep is unsatisfied).
+        """
+        parser = self._parser()
+        epic = self._epic("E14", WorkUnitStatus.IN_QUEUE)
+        task = self._task("E15-F1-S1-T1", WorkUnitStatus.IN_QUEUE, deps=["E14"])
+        candidates = parser.get_parallel_candidates([epic, task])
+        ids = [u.id for u in candidates]
+        assert "E15-F1-S1-T1" not in ids
+
+    def test_deps_satisfied_passes_when_epic_done(self) -> None:
+        """AC-2: A task whose only dep is a done epic IS returned.
+
+        Given: A task with a single dependency on a done epic.
+        When:  get_parallel_candidates is called.
+        Then:  The task is returned (dep is satisfied).
+        """
+        parser = self._parser()
+        epic = self._epic("E14", WorkUnitStatus.DONE)
+        task = self._task("E15-F1-S1-T1", WorkUnitStatus.IN_QUEUE, deps=["E14"])
+        candidates = parser.get_parallel_candidates([epic, task])
+        ids = [u.id for u in candidates]
+        assert "E15-F1-S1-T1" in ids
+
+    def test_deps_satisfied_passes_when_no_deps(self) -> None:
+        """AC-3: A task with no deps IS returned.
+
+        Given: A task with an empty dependencies list.
+        When:  get_parallel_candidates is called.
+        Then:  The task is returned.
+        """
+        parser = self._parser()
+        task = self._task("E15-F1-S1-T1", WorkUnitStatus.IN_QUEUE)
+        candidates = parser.get_parallel_candidates([task])
+        ids = [u.id for u in candidates]
+        assert "E15-F1-S1-T1" in ids
+
+    def test_deps_satisfied_blocks_when_feature_dep_incomplete(self) -> None:
+        """AC-4: Task-level dep done but feature-level dep in-queue → NOT returned.
+
+        Given: A task with two deps: a done task and an in-queue feature.
+        When:  get_parallel_candidates is called.
+        Then:  The task is not returned (feature dep is unsatisfied).
+        """
+        parser = self._parser()
+        done_task = self._task("E15-F1-S1-T1", WorkUnitStatus.DONE)
+        feature = self._feature("E15-F1", WorkUnitStatus.IN_QUEUE)
+        blocked_task = self._task(
+            "E15-F1-S1-T2",
+            WorkUnitStatus.IN_QUEUE,
+            deps=["E15-F1-S1-T1", "E15-F1"],
+        )
+        candidates = parser.get_parallel_candidates([done_task, feature, blocked_task])
+        ids = [u.id for u in candidates]
+        assert "E15-F1-S1-T2" not in ids
+
+    def test_task_ids_helper_removed(self) -> None:
+        """AC-5: _task_ids helper no longer exists in BacklogParser.
+
+        Given: The BacklogParser class.
+        When:  Checking for the _task_ids attribute.
+        Then:  It does not exist.
+        """
+        assert not hasattr(BacklogParser, "_task_ids")
+
+

@@ -138,6 +138,7 @@ devbench <command> [args]
 | `set-status` | `<unit-id> <status>` | Force any status (no gate — use for recovery/lifecycle transitions) |
 | `mark-done` | `<unit-id>` | Mark unit as Done (enforces done-gate: all judges must have passed) |
 | `validate-backlog` | — | Check backlog integrity (file existence, status sync, orphans, deps) |
+| `sync-blocked` | — | Scan in-queue units and mark those with unmet deps as blocked |
 | `report` | `[since-timestamp]` | Print progress report with velocity stats |
 | `log` | `<message>` | Append message to log file |
 

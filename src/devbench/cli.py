@@ -611,6 +611,7 @@ def cmd_start() -> int:
             options=ClaudeAgentOptions(
                 setting_sources=["project"],
                 plugins=[{"type": "local", "path": str(plugin_path)}],
+                permission_mode="bypassPermissions",
             ),
         ):
             logger.info("sdk message: %s", message)

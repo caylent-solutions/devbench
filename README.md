@@ -131,13 +131,17 @@ devbench <command> [args]
 | Command | Arguments | Description |
 |---------|-----------|-------------|
 | `status` | — | Show backlog summary (counts by status) |
-| `next` | — | Print next actionable work unit as JSON |
-| `execute` | `<unit-id> [feedback]` | Spawn dev agent for a work unit |
-| `review` | `<unit-id>` | Run all review judges, print JSON results |
-| `security-review` | `<unit-id>` | Run security review judge |
-| `set-status` | `<unit-id> <status>` | Force any status (no gate — use for recovery/lifecycle transitions) |
+| `next` | — | Print next actionable work unit as JSON, set it to in-progress |
+| `ensure-branch` | `<unit-id>` | Create or switch to work unit branch before executor runs |
+| `git-ops` | `<unit-id>` | Commit, push, create PR, wait for CI, merge |
 | `mark-done` | `<unit-id>` | Mark unit as Done (enforces done-gate: all judges must have passed) |
+| `log-verdict` | `<judge> <unit-id> <pass\|fail> [msg]` | Record a judge verdict in the work unit Comments |
+| `set-status` | `<unit-id> <status>` | Force any status (no gate — use for recovery/lifecycle transitions) |
 | `validate-backlog` | — | Check backlog integrity (file existence, status sync, orphans, deps) |
+| `read-unit` | `<unit-id>` | Print work unit spec as markdown (for agent context) |
+| `get-diff` | `<unit-id>` | Print git diff vs default branch (for review agents) |
+| `run-tests` | `<unit-id>` | Run test suite in the work unit's repo |
+| `start` | — | Run orchestrate skill via Agent SDK (non-interactive) |
 | `report` | `[since-timestamp]` | Print progress report with velocity stats |
 | `log` | `<message>` | Append message to log file |
 
@@ -187,6 +191,7 @@ devbench/
 │   │   ├── security_review.py     ← GitHub alerts + diff → LLM verdict
 │   │   └── blocker_resolver.py    ← Dependency and blocker assessment
 │   ├── utils/
+│   │   ├── greeting.py            ← get_greeting(name): greeting utility for POC pipeline verification
 │   │   └── process.py             ← run_command(): shared subprocess wrapper for running shell commands
 │   ├── reporting/
 │   │   └── report.py              ← Session progress report generator (velocity, ETA)
@@ -249,7 +254,7 @@ Run `devbench validate-backlog` to check for missing files, status mismatches, o
 After `JUDGE_MAX_RETRIES` failures (default: 10), the unit is marked `blocked`. Check the Comments section of the work unit file for the feedback trail.
 
 ### `mark-done` fails with "not all required judges passed"
-The done-gate check found that not all four review judges (`code_review`, `test_review`, `doc_review`, `changes_manifest`) have a `[REVIEW_PASS]` entry after the most recent `[REVIEW_REJECTED]` line. Run `devbench review <unit-id>` to get the current judge verdicts.
+The done-gate check found that not all four review judges (`code_review`, `test_review`, `doc_review`, `changes_manifest`) have a `[REVIEW_PASS]` entry after the most recent `[REVIEW_REJECTED]` line. Check the Comments section of the work unit file for the current judge verdicts, then re-run any failing agents via the orchestrate skill.
 
 ### Judge contradicts its previous feedback
 This should not happen with the prior feedback injection. If it does, check whether the orchestrator log has the previous feedback entries (`grep "judge feedback for <unit-id>" src/devbench/logs/orchestrator.log`).

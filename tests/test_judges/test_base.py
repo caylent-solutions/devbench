@@ -225,58 +225,6 @@ class TestLlmEvaluate:
                 )
 
 
-class TestGetDefaultBranch:
-    """Test _get_default_branch remote flag (AC-1 through AC-3, E25-F1-S1-T1)."""
-
-    # --- YAML-config path (remote x bare) ---
-
-    @pytest.mark.parametrize("remote,expected", [
-        (False, "main2"),
-        (True, "origin/main2"),
-    ])
-    def test_yaml_path(self, tmp_path: Path, remote: bool, expected: str) -> None:
-        judge = _ConcreteJudge("test_judge")
-        with patch("devbench.judges.base.get_configured_default_branch", return_value="main2"):
-            result = judge._get_default_branch(tmp_path, repo="org/repo", remote=remote)
-        assert result == expected
-
-    # --- git-fallback path (remote x bare) ---
-
-    @pytest.mark.parametrize("remote,git_output,expected", [
-        (False, "origin/main\n", "main"),
-        (True, "origin/main2\n", "origin/main2"),
-    ])
-    def test_git_fallback_path(
-        self, tmp_path: Path, remote: bool, git_output: str, expected: str
-    ) -> None:
-        judge = _ConcreteJudge("test_judge")
-        with patch("devbench.judges.base.get_configured_default_branch", return_value=None):
-            with patch.object(judge, "_run_command", return_value=(0, git_output, "")):
-                result = judge._get_default_branch(tmp_path, repo="org/repo", remote=remote)
-        assert result == expected
-
-    def test_default_remote_is_false(self, tmp_path: Path) -> None:
-        """Omitting remote= preserves existing bare-name behaviour for all callers."""
-        judge = _ConcreteJudge("test_judge")
-        with patch("devbench.judges.base.get_configured_default_branch", return_value="main2"):
-            result = judge._get_default_branch(tmp_path, repo="org/repo")
-        assert result == "main2"
-
-    @pytest.mark.parametrize("rc,stdout", [
-        (1, ""),
-        (0, ""),
-    ])
-    def test_git_fallback_raises_when_git_fails(
-        self, tmp_path: Path, rc: int, stdout: str
-    ) -> None:
-        """RuntimeError is raised when git cannot determine the default branch."""
-        judge = _ConcreteJudge("test_judge")
-        with patch("devbench.judges.base.get_configured_default_branch", return_value=None):
-            with patch.object(judge, "_run_command", return_value=(rc, stdout, "")):
-                with pytest.raises(RuntimeError, match="Cannot determine default branch"):
-                    judge._get_default_branch(tmp_path, repo="org/repo")
-
-
 class TestGetDiff:
     """Test _get_diff method on BaseJudge."""
 
@@ -288,7 +236,7 @@ class TestGetDiff:
                 return (0, "staged changes", "")
             return (0, "", "")
 
-        with patch.object(judge, "_get_default_branch", return_value="origin/main"):
+        with patch.object(judge, "_get_default_branch", return_value="main"):
             with patch.object(judge, "_run_command", side_effect=side_effect):
                 diff = judge._get_diff(tmp_path)
         assert "staged changes" in diff
@@ -301,7 +249,7 @@ class TestGetDiff:
                 return (0, "unstaged changes", "")
             return (0, "", "")
 
-        with patch.object(judge, "_get_default_branch", return_value="origin/main"):
+        with patch.object(judge, "_get_default_branch", return_value="main"):
             with patch.object(judge, "_run_command", side_effect=side_effect):
                 diff = judge._get_diff(tmp_path)
         assert "unstaged changes" in diff
@@ -310,11 +258,11 @@ class TestGetDiff:
         judge = _ConcreteJudge("test_judge")
 
         def side_effect(cmd, cwd, **kwargs):
-            if "origin/main" in cmd:
+            if "main" in cmd:
                 return (0, "branch changes", "")
             return (0, "", "")
 
-        with patch.object(judge, "_get_default_branch", return_value="origin/main"):
+        with patch.object(judge, "_get_default_branch", return_value="main"):
             with patch.object(judge, "_run_command", side_effect=side_effect):
                 diff = judge._get_diff(tmp_path)
         assert "branch changes" in diff
@@ -329,7 +277,7 @@ class TestGetDiff:
                 return (0, "new_module.py\n", "")
             return (0, "", "")
 
-        with patch.object(judge, "_get_default_branch", return_value="origin/main"):
+        with patch.object(judge, "_get_default_branch", return_value="main"):
             with patch.object(judge, "_run_command", side_effect=side_effect):
                 diff = judge._get_diff(tmp_path)
         assert "new_module.py" in diff
@@ -338,7 +286,7 @@ class TestGetDiff:
 
     def test_returns_empty_when_all_fail(self, tmp_path: Path) -> None:
         judge = _ConcreteJudge("test_judge")
-        with patch.object(judge, "_get_default_branch", return_value="origin/main"):
+        with patch.object(judge, "_get_default_branch", return_value="main"):
             with patch.object(judge, "_run_command", return_value=(1, "", "error")):
                 diff = judge._get_diff(tmp_path)
         assert diff == ""

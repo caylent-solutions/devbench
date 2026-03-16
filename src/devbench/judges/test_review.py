@@ -131,7 +131,7 @@ class TestReviewJudge(BaseJudge):
                     if stripped and ("test_" in stripped or "_test.py" in stripped):
                         files.add(stripped)
 
-        default_branch = self._get_default_branch(repo_path, repo=repo, remote=True)
+        default_branch = self._get_default_branch(repo_path, repo=repo)
         rc, stdout, _ = self._run_command(["git", "diff", "--name-only", default_branch], cwd=repo_path)
         if rc == 0 and stdout.strip():
             for line in stdout.splitlines():

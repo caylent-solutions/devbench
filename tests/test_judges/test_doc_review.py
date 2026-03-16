@@ -27,7 +27,7 @@ class TestEvaluate:
         wu_file = tmp_path / "wu.md"
         wu_file.write_text("# Task\n\n## Acceptance Criteria\n\n- [ ] AC-FUNC-001 feature\n")
 
-        with patch.object(judge, "_get_default_branch", return_value="origin/main"):
+        with patch.object(judge, "_get_default_branch", return_value="main"):
             with patch.object(judge, "_llm_evaluate", return_value=make_llm_pass_result("doc_review")):
                 result = judge.evaluate(wu_file, tmp_path)
 

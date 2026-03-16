@@ -61,7 +61,7 @@ class ChangesManifestJudge(BaseJudge):
         files |= self._collect_files(repo_path, ["git", "ls-files", "--others", "--exclude-standard"])
 
         # All committed branch changes vs default branch
-        default_branch = self._get_default_branch(repo_path, repo=repo, remote=True)
+        default_branch = self._get_default_branch(repo_path, repo=repo)
         files |= self._collect_files(repo_path, ["git", "diff", "--name-only", default_branch])
 
         return sorted(files)
@@ -101,7 +101,7 @@ class ChangesManifestJudge(BaseJudge):
 
         # Already-committed branch changes vs default branch (present when
         # executor committed directly, which is atypical — orchestrator owns commits)
-        default_branch = self._get_default_branch(repo_path, repo=repo, remote=True)
+        default_branch = self._get_default_branch(repo_path, repo=repo)
         rc, stat_out, _ = self._run_command(
             ["git", "diff", "--stat", default_branch], cwd=repo_path,
         )

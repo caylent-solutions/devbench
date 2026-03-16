@@ -63,7 +63,7 @@ class TestRunTests:
 
     def test_falls_back_to_pytest_without_makefile(self, tmp_path: Path) -> None:
         judge = TestReviewJudge()
-        with patch.object(judge, "_get_default_branch", return_value="origin/main"):
+        with patch.object(judge, "_get_default_branch", return_value="main"):
             with patch.object(judge, "_run_command", return_value=(0, "5 passed\n", "")) as mock_cmd:
                 judge._run_tests(tmp_path)
         last_call_cmd = mock_cmd.call_args_list[-1].args[0]
@@ -79,7 +79,7 @@ class TestRunTests:
     def test_returns_empty_when_no_output(self, tmp_path: Path) -> None:
         judge = TestReviewJudge()
         with patch.object(judge, "_has_make_test_target", return_value=False):
-            with patch.object(judge, "_get_default_branch", return_value="origin/main"):
+            with patch.object(judge, "_get_default_branch", return_value="main"):
                 with patch.object(judge, "_run_command", return_value=(0, "", "")):
                     output = judge._run_tests(tmp_path)
         assert output == ""
@@ -184,13 +184,13 @@ class TestCollectTestFiles:
         (tests_dir / "test_sample.py").write_text("def test_sample():\n    assert 1 + 1 == 2\n")
 
         judge = TestReviewJudge()
-        with patch.object(judge, "_get_default_branch", return_value="origin/main"):
+        with patch.object(judge, "_get_default_branch", return_value="main"):
             content = judge._collect_test_files(tmp_path)
         assert "test_sample" in content
 
     def test_returns_empty_when_no_tests(self, tmp_path: Path) -> None:
         judge = TestReviewJudge()
-        with patch.object(judge, "_get_default_branch", return_value="origin/main"):
+        with patch.object(judge, "_get_default_branch", return_value="main"):
             content = judge._collect_test_files(tmp_path)
         assert content == ""
 
@@ -201,7 +201,7 @@ class TestCollectTestFiles:
         (tests_dir / "test_large.py").write_text(large_content)
 
         judge = TestReviewJudge()
-        with patch.object(judge, "_get_default_branch", return_value="origin/main"):
+        with patch.object(judge, "_get_default_branch", return_value="main"):
             content = judge._collect_test_files(tmp_path)
         assert "TRUNCATED" in content
         assert "complete on disk" in content

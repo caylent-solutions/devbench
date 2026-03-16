@@ -106,6 +106,58 @@ class GitOpsJudge(BaseJudge):
 
         self.logger.info("Switched to branch %s in %s", branch, repo)
 
+    def is_committed_and_pushed(self, repo: str, repo_path: Path, branch: str) -> bool:
+        """Return ``True`` when the working tree is clean and local HEAD matches ``origin/<branch>``.
+
+        Used by the orchestrator to skip executor and judge re-runs when a prior
+        iteration already committed and pushed all changes.
+
+        Conditions for ``True``:
+
+        1. ``git status --porcelain`` returns empty output (clean working tree).
+        2. ``git rev-parse --verify origin/<branch>`` succeeds (remote branch exists).
+        3. Local HEAD SHA equals remote HEAD SHA (nothing left to push).
+
+        Returns ``False`` when any condition is not met.
+
+        Args:
+            repo: GitHub repository in ``owner/name`` format.
+            repo_path: Local filesystem path to the repository.
+            branch: Branch name to check against its remote counterpart.
+
+        Raises:
+            ValueError: If the repo is not in the allow-list.
+            RuntimeError: If any git command fails unexpectedly.
+        """
+        validate_repo(repo)
+
+        _, status_out, _ = self._git(["status", "--porcelain"], repo_path)
+        if status_out.strip():
+            self.logger.debug("is_committed_and_pushed: working tree is dirty on %s", branch)
+            return False
+
+        rc, _, _ = self._run_command(
+            ["git", "rev-parse", "--verify", f"origin/{branch}"], cwd=repo_path
+        )
+        if rc != 0:
+            self.logger.debug(
+                "is_committed_and_pushed: origin/%s does not exist", branch
+            )
+            return False
+
+        _, local_sha, _ = self._git(["rev-parse", "HEAD"], repo_path)
+        _, remote_sha, _ = self._git(["rev-parse", f"origin/{branch}"], repo_path)
+        if local_sha.strip() != remote_sha.strip():
+            self.logger.debug(
+                "is_committed_and_pushed: local HEAD differs from origin/%s", branch
+            )
+            return False
+
+        self.logger.debug(
+            "is_committed_and_pushed: branch %s is clean and synced with origin", branch
+        )
+        return True
+
     def commit_and_push(self, repo: str, repo_path: Path, branch: str, message: str) -> None:
         """Stage all changes on the current branch, commit, and push.
 

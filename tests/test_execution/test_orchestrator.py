@@ -150,10 +150,13 @@ class TestProcessWorkUnit:
         unit = _make_unit(tmp_path)
         exec_result = ExecutionResult(status=ExecutionStatus.FAILED, output="error", blocker="")
 
+        mock_git_ops = MagicMock()
+        mock_git_ops.is_committed_and_pushed.return_value = False
+
         with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
             with patch(f"{_ORC}.claude_executor") as mock_exec:
                 mock_exec.execute.return_value = exec_result
-                with patch(f"{_ORC}.GitOpsJudge"):
+                with patch(f"{_ORC}.GitOpsJudge", return_value=mock_git_ops):
                     with patch(f"{_ORC}.SecurityReviewJudge"):
                         with patch(f"{_ORC}.BacklogManager") as mock_mgr_cls:
                             with patch(f"{_ORC}.BlockerResolverJudge"):
@@ -174,6 +177,9 @@ class TestProcessWorkUnit:
         mock_blocker = MagicMock()
         mock_blocker.evaluate.return_value = _fail_result("blocker")
 
+        mock_git_ops = MagicMock()
+        mock_git_ops.is_committed_and_pushed.return_value = False
+
         call_count = 0
 
         def exec_side_effect(**kwargs):
@@ -186,7 +192,7 @@ class TestProcessWorkUnit:
         with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
             with patch(f"{_ORC}.claude_executor") as mock_exec:
                 mock_exec.execute.side_effect = exec_side_effect
-                with patch(f"{_ORC}.GitOpsJudge"):
+                with patch(f"{_ORC}.GitOpsJudge", return_value=mock_git_ops):
                     with patch(f"{_ORC}.SecurityReviewJudge"):
                         with patch(f"{_ORC}.BacklogManager"):
                             with patch(f"{_ORC}.BlockerResolverJudge", return_value=mock_blocker):
@@ -350,6 +356,7 @@ class TestProcessWorkUnit:
         call_order: list[str] = []
 
         mock_git_ops = MagicMock()
+        mock_git_ops.is_committed_and_pushed.return_value = False
         mock_git_ops.create_pr.return_value = "https://github.com/org/repo/pull/1"
         mock_git_ops.wait_for_checks.return_value = True
 
@@ -447,6 +454,7 @@ class TestProcessWorkUnit:
         mock_security.evaluate.return_value = _pass_result("security")
 
         mock_git_ops = MagicMock()
+        mock_git_ops.is_committed_and_pushed.return_value = False
         mock_git_ops.create_pr.return_value = "https://github.com/org/repo/pull/1"
         mock_git_ops.wait_for_checks.return_value = True
 
@@ -482,6 +490,9 @@ class TestProcessWorkUnit:
         mock_security = MagicMock()
         mock_security.evaluate.return_value = _fail_result("security")
 
+        mock_git_ops = MagicMock()
+        mock_git_ops.is_committed_and_pushed.return_value = False
+
         with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
             with patch(f"{_ORC}.claude_executor") as mock_exec:
                 mock_exec.execute.return_value = exec_result
@@ -490,7 +501,7 @@ class TestProcessWorkUnit:
                         with patch(f"{_ORC}.DocReviewJudge", return_value=mock_review_judge):
                             with patch(f"{_ORC}.ChangesManifestJudge", return_value=mock_review_judge):
                                 with patch(f"{_ORC}.SecurityReviewJudge", return_value=mock_security):
-                                    with patch(f"{_ORC}.GitOpsJudge"):
+                                    with patch(f"{_ORC}.GitOpsJudge", return_value=mock_git_ops):
                                         with patch(f"{_ORC}.BacklogManager"):
                                             with patch(f"{_ORC}.BlockerResolverJudge"):
                                                 with patch(f"{_ORC}.MAX_RETRY_ATTEMPTS", 1):
@@ -516,6 +527,9 @@ class TestProcessWorkUnit:
         mock_security = MagicMock()
         mock_security.evaluate.return_value = _fail_result("security_review")
 
+        mock_git_ops = MagicMock()
+        mock_git_ops.is_committed_and_pushed.return_value = False
+
         with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
             with patch(f"{_ORC}.claude_executor") as mock_exec:
                 mock_exec.execute.return_value = exec_result
@@ -524,7 +538,7 @@ class TestProcessWorkUnit:
                         with patch(f"{_ORC}.DocReviewJudge", return_value=mock_review_judge):
                             with patch(f"{_ORC}.ChangesManifestJudge", return_value=mock_review_judge):
                                 with patch(f"{_ORC}.SecurityReviewJudge", return_value=mock_security):
-                                    with patch(f"{_ORC}.GitOpsJudge"):
+                                    with patch(f"{_ORC}.GitOpsJudge", return_value=mock_git_ops):
                                         with patch(f"{_ORC}.BacklogManager"):
                                             with patch(f"{_ORC}.BlockerResolverJudge"):
                                                 with patch(f"{_ORC}.MAX_RETRY_ATTEMPTS", 1):
@@ -613,6 +627,7 @@ class TestProcessWorkUnit:
         mock_judge.evaluate.return_value = _pass_result("mock")
 
         mock_git_ops = MagicMock()
+        mock_git_ops.is_committed_and_pushed.return_value = False
         mock_git_ops.create_pr.return_value = "https://github.com/org/repo/pull/1"
         mock_git_ops.wait_for_checks.return_value = False
 
@@ -744,6 +759,86 @@ class TestProcessWorkUnit:
         mock_git_ops.update_parent_submodule_ref.assert_called_once()
 
 
+class TestSkipReviewWhenCommittedAndPushed:
+    """Tests for the orchestrator's is_committed_and_pushed skip logic (AC-5, AC-6)."""
+
+    def test_orchestrator_skips_review_when_committed_and_pushed(self, tmp_path: Path) -> None:
+        """AC-5: Orchestrator skips executor and run_review_judges when is_committed_and_pushed returns True.
+
+        Given: is_committed_and_pushed returns True (branch already committed and pushed)
+        When: process_work_unit runs
+        Then: claude_executor.execute and run_review_judges are NOT called; git ops are called
+        """
+        from devbench.execution.orchestrator import process_work_unit
+
+        unit = _make_unit(tmp_path)
+
+        mock_git_ops = MagicMock()
+        mock_git_ops.is_committed_and_pushed.return_value = True
+        mock_git_ops.create_pr.return_value = "https://github.com/org/repo/pull/1"
+        mock_git_ops.wait_for_checks.return_value = True
+        mock_mgr = MagicMock()
+
+        mock_judge = MagicMock()
+        mock_judge.name = "security"
+        mock_judge.evaluate.return_value = _pass_result("security")
+
+        with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+            with patch(f"{_ORC}.claude_executor") as mock_exec:
+                with patch(f"{_ORC}.SecurityReviewJudge", return_value=mock_judge):
+                    with patch(f"{_ORC}.GitOpsJudge", return_value=mock_git_ops):
+                        with patch(f"{_ORC}.BacklogManager", return_value=mock_mgr):
+                            with patch(f"{_ORC}.BlockerResolverJudge"):
+                                with patch(f"{_ORC}.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
+                                    with patch(f"{_ORC}.run_review_judges") as mock_run_review:
+                                        result = process_work_unit(unit)
+
+        assert result is True
+        mock_exec.execute.assert_not_called()
+        mock_run_review.assert_not_called()
+        mock_git_ops.commit_and_push.assert_called_once()
+
+    def test_orchestrator_runs_review_when_not_committed_and_pushed(self, tmp_path: Path) -> None:
+        """AC-6: Orchestrator calls executor and run_review_judges when is_committed_and_pushed returns False.
+
+        Given: is_committed_and_pushed returns False (normal case — work not yet done)
+        When: process_work_unit runs
+        Then: claude_executor.execute and run_review_judges ARE called normally
+        """
+        from devbench.execution.orchestrator import process_work_unit
+
+        unit = _make_unit(tmp_path)
+        exec_result = ExecutionResult(status=ExecutionStatus.IN_REVIEW, output="done", blocker="")
+
+        mock_git_ops = MagicMock()
+        mock_git_ops.is_committed_and_pushed.return_value = False
+        mock_git_ops.create_pr.return_value = "https://github.com/org/repo/pull/1"
+        mock_git_ops.wait_for_checks.return_value = True
+        mock_mgr = MagicMock()
+
+        mock_judge = MagicMock()
+        mock_judge.name = "mock"
+        mock_judge.evaluate.return_value = _pass_result("mock")
+
+        with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+            with patch(f"{_ORC}.claude_executor") as mock_exec:
+                mock_exec.execute.return_value = exec_result
+                with patch(f"{_ORC}.CodeReviewJudge", return_value=mock_judge):
+                    with patch(f"{_ORC}.TestReviewJudge", return_value=mock_judge):
+                        with patch(f"{_ORC}.DocReviewJudge", return_value=mock_judge):
+                            with patch(f"{_ORC}.ChangesManifestJudge", return_value=mock_judge):
+                                with patch(f"{_ORC}.SecurityReviewJudge", return_value=mock_judge):
+                                    with patch(f"{_ORC}.GitOpsJudge", return_value=mock_git_ops):
+                                        with patch(f"{_ORC}.BacklogManager", return_value=mock_mgr):
+                                            with patch(f"{_ORC}.BlockerResolverJudge"):
+                                                with patch(f"{_ORC}.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
+                                                    result = process_work_unit(unit)
+
+        assert result is True
+        mock_exec.execute.assert_called_once()
+        mock_git_ops.commit_and_push.assert_called_once()
+
+
 class TestFeedbackPropagation:
     """Test that feedback is set correctly on each retry path."""
 
@@ -769,6 +864,7 @@ class TestFeedbackPropagation:
             return exec_result
 
         mock_git_ops = MagicMock()
+        mock_git_ops.is_committed_and_pushed.return_value = False
         mock_git_ops.create_pr.return_value = "https://github.com/org/repo/pull/1"
         mock_git_ops.wait_for_checks.return_value = True
 
@@ -817,6 +913,9 @@ class TestFeedbackPropagation:
             evidence=[],
         )
 
+        mock_git_ops = MagicMock()
+        mock_git_ops.is_committed_and_pushed.return_value = False
+
         execute_calls: list[dict] = []
         call_count = [0]
 
@@ -830,7 +929,7 @@ class TestFeedbackPropagation:
         with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
             with patch(f"{_ORC}.claude_executor") as mock_exec:
                 mock_exec.execute.side_effect = capture_execute
-                with patch(f"{_ORC}.GitOpsJudge"):
+                with patch(f"{_ORC}.GitOpsJudge", return_value=mock_git_ops):
                     with patch(f"{_ORC}.SecurityReviewJudge"):
                         with patch(f"{_ORC}.BacklogManager"):
                             with patch(f"{_ORC}.BlockerResolverJudge", return_value=mock_blocker):

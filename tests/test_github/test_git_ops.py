@@ -510,6 +510,132 @@ class TestUpdateParentSubmoduleRef:
                 )
 
 
+class TestIsCommittedAndPushed:
+    """Tests for GitOpsJudge.is_committed_and_pushed."""
+
+    def test_is_committed_and_pushed_false_when_dirty(self, tmp_path: Path) -> None:
+        """AC-1: Returns False when working tree has staged changes.
+
+        Given: Working tree has staged (dirty) changes
+        When: is_committed_and_pushed is called
+        Then: Returns False
+        """
+        judge = GitOpsJudge()
+
+        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
+            if args == ["status", "--porcelain"]:
+                return (0, "M src/foo.py\n", "")
+            return (0, "", "")
+
+        with patch.object(judge, "_git", side_effect=stub):
+            result = judge.is_committed_and_pushed(
+                repo="caylent-solutions/git-repo",
+                repo_path=tmp_path,
+                branch="feature/x",
+            )
+
+        assert result is False
+
+    def test_is_committed_and_pushed_false_when_not_pushed(self, tmp_path: Path) -> None:
+        """AC-2: Returns False when working tree is clean but branch not pushed.
+
+        Given: Working tree is clean, remote branch does not exist (rc != 0)
+        When: is_committed_and_pushed is called
+        Then: Returns False
+        """
+        judge = GitOpsJudge()
+
+        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
+            if args == ["status", "--porcelain"]:
+                return (0, "", "")  # clean
+            return (0, "", "")
+
+        # rev-parse origin/<branch> → rc=1 means branch not pushed
+        with (
+            patch.object(judge, "_git", side_effect=stub),
+            patch.object(judge, "_run_command", return_value=(1, "", "fatal: ambiguous argument")),
+        ):
+            result = judge.is_committed_and_pushed(
+                repo="caylent-solutions/git-repo",
+                repo_path=tmp_path,
+                branch="feature/x",
+            )
+
+        assert result is False
+
+    def test_is_committed_and_pushed_false_when_ahead_of_remote(self, tmp_path: Path) -> None:
+        """AC-3: Returns False when local HEAD differs from origin/<branch>.
+
+        Given: Working tree is clean, remote branch exists but SHA differs
+        When: is_committed_and_pushed is called
+        Then: Returns False
+        """
+        judge = GitOpsJudge()
+
+        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
+            if args == ["status", "--porcelain"]:
+                return (0, "", "")  # clean
+            if args == ["rev-parse", "HEAD"]:
+                return (0, "newsha\n", "")
+            if args == ["rev-parse", "origin/feature/x"]:
+                return (0, "oldsha\n", "")
+            return (0, "", "")
+
+        # rev-parse --verify origin/feature/x → rc=0 (remote exists)
+        with (
+            patch.object(judge, "_git", side_effect=stub),
+            patch.object(judge, "_run_command", return_value=(0, "", "")),
+        ):
+            result = judge.is_committed_and_pushed(
+                repo="caylent-solutions/git-repo",
+                repo_path=tmp_path,
+                branch="feature/x",
+            )
+
+        assert result is False
+
+    def test_is_committed_and_pushed_true_when_clean_and_synced(self, tmp_path: Path) -> None:
+        """AC-4: Returns True when working tree is clean and local HEAD matches origin/<branch>.
+
+        Given: Working tree is clean, remote branch exists, local SHA equals remote SHA
+        When: is_committed_and_pushed is called
+        Then: Returns True
+        """
+        judge = GitOpsJudge()
+
+        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
+            if args == ["status", "--porcelain"]:
+                return (0, "", "")  # clean
+            if args == ["rev-parse", "HEAD"]:
+                return (0, "abc123\n", "")
+            if args == ["rev-parse", "origin/feature/x"]:
+                return (0, "abc123\n", "")  # same SHA
+            return (0, "", "")
+
+        # rev-parse --verify origin/feature/x → rc=0 (remote exists)
+        with (
+            patch.object(judge, "_git", side_effect=stub),
+            patch.object(judge, "_run_command", return_value=(0, "", "")),
+        ):
+            result = judge.is_committed_and_pushed(
+                repo="caylent-solutions/git-repo",
+                repo_path=tmp_path,
+                branch="feature/x",
+            )
+
+        assert result is True
+
+    def test_is_committed_and_pushed_validates_repo(self, tmp_path: Path) -> None:
+        """Raises ValueError when repo is not in the allow-list."""
+        judge = GitOpsJudge()
+        with pytest.raises(ValueError, match="not allowed"):
+            judge.is_committed_and_pushed(
+                repo="caylent-solutions/nonexistent-test-repo",
+                repo_path=tmp_path,
+                branch="feature/x",
+            )
+
+
 class TestGitHelper:
     """Test _git helper method."""
 

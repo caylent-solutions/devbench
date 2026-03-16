@@ -324,18 +324,16 @@ class BacklogParser:
         A task is *actionable* when:
         - Its status is ``IN_QUEUE`` or ``IN_PROGRESS`` (resume interrupted work)
         - Its type is ``TASK``
-        - All of its *task-level* dependencies have status ``DONE``
+        - All of its dependencies have status ``DONE``
 
         ``IN_PROGRESS`` tasks are returned before ``IN_QUEUE`` tasks so that
         interrupted work is resumed before new work is started.
 
-        Dependencies on non-task units (Stories, Features, Epics) are treated
-        as structural parent relationships and are always considered satisfied.
-        Only task-to-task dependencies are blocking.
+        All dependency types (Task, Story, Feature, Epic) are blocking.
+        A dependency is only satisfied when it appears in the ``done`` set.
         """
         actionable_statuses = {WorkUnitStatus.IN_QUEUE, WorkUnitStatus.IN_PROGRESS}
         done_ids = self._done_ids(units)
-        task_ids = self._task_ids(units)
         candidates: list[WorkUnit] = []
 
         for unit in units:
@@ -343,7 +341,7 @@ class BacklogParser:
                 continue
             if unit.unit_type is not WorkUnitType.TASK:
                 continue
-            if not self._deps_satisfied(unit, done_ids, task_ids):
+            if not self._deps_satisfied(unit, done_ids):
                 continue
             candidates.append(unit)
 
@@ -363,22 +361,14 @@ class BacklogParser:
         return frozenset(u.id for u in units if u.status is WorkUnitStatus.DONE)
 
     @staticmethod
-    def _task_ids(units: list[WorkUnit]) -> frozenset[str]:
-        """Collect IDs of all units whose type is ``TASK``."""
-        return frozenset(u.id for u in units if u.unit_type is WorkUnitType.TASK)
+    def _deps_satisfied(unit: WorkUnit, done_ids: frozenset[str]) -> bool:
+        """Return ``True`` if every listed dependency is satisfied.
 
-    @staticmethod
-    def _deps_satisfied(unit: WorkUnit, done_ids: frozenset[str], task_ids: frozenset[str]) -> bool:
-        """Return ``True`` if all blocking dependencies are satisfied.
-
-        Only dependencies that refer to other *tasks* are blocking.
-        Dependencies on stories, features, or epics are structural
-        parent relationships and are always considered satisfied.
+        All dependency types (Task, Story, Feature, Epic) are treated as
+        blocking.  A dependency is satisfied only when its ID appears in
+        ``done_ids``.  An empty dependency list is always considered satisfied.
         """
-        return all(
-            dep not in task_ids or dep in done_ids
-            for dep in unit.dependencies
-        )
+        return all(dep in done_ids for dep in unit.dependencies)
 
     @staticmethod
     def _parse_dependency_table(content: str) -> list[str]:

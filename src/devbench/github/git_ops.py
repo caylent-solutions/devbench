@@ -313,6 +313,39 @@ class GitOpsJudge(BaseJudge):
             raise RuntimeError(f"Failed to merge PR #{pr_number} on {repo}: {stderr.strip()}")
         self.logger.info("Merged PR #%d on %s", pr_number, repo)
 
+    def rebase_onto_default(self, repo: str, repo_path: Path, branch: str) -> None:
+        """Rebase *branch* onto ``origin/<default_branch>`` and force-push.
+
+        Called by the orchestrator when ``merge_pr`` fails because the PR is not
+        mergeable (GitHub cannot create a clean merge commit).
+
+        Operation sequence:
+
+        1. ``git fetch origin`` — update remote refs.
+        2. ``git rebase origin/<default_branch>`` — replay branch commits on top of
+           the latest default branch.
+        3. ``git push --force-with-lease origin <branch>`` — update the remote
+           branch, using ``--force-with-lease`` (not ``--force``) to avoid
+           overwriting concurrent pushes.
+
+        Args:
+            repo: GitHub repository in ``owner/name`` format.
+            repo_path: Local filesystem path to the repository.
+            branch: The feature branch to rebase and force-push.
+
+        Raises:
+            ValueError: If the repo is not in the allow-list.
+            RuntimeError: If any git command fails (e.g. rebase conflict).
+        """
+        validate_repo(repo)
+
+        default_branch = get_configured_default_branch(repo, RUNTIME_CONFIG)
+
+        self._git(["fetch", "origin"], repo_path)
+        self._git(["rebase", f"origin/{default_branch}"], repo_path)
+        self._git(["push", "--force-with-lease", "origin", branch], repo_path)
+        self.logger.info("Rebased %s onto origin/%s and force-pushed", branch, default_branch)
+
     def create_tag(self, repo: str, repo_path: Path, tag: str, message: str) -> None:
         """Create an annotated git tag and push it to the remote.
 

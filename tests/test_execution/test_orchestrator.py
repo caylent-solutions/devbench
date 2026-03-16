@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -941,6 +943,200 @@ class TestFeedbackPropagation:
         # Second call must include feedback from the blocker resolver
         assert execute_calls[1]["feedback"] != ""
         assert "resolved" in execute_calls[1]["feedback"].lower()
+
+
+@contextmanager
+def _patch_process_work_unit(
+    tmp_path: Path,
+    mock_git_ops: MagicMock,
+    mock_judge: MagicMock,
+    mock_mgr: MagicMock | None = None,
+    max_retry_attempts: int = 3,
+) -> Generator[MagicMock, None, None]:
+    """Context manager that applies all patches needed for process_work_unit integration tests.
+
+    Yields the mock executor so callers can set return values or assert calls.
+    """
+    effective_mgr = mock_mgr if mock_mgr is not None else MagicMock()
+    with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+        with patch(f"{_ORC}.claude_executor") as mock_exec:
+            with patch(f"{_ORC}.CodeReviewJudge", return_value=mock_judge):
+                with patch(f"{_ORC}.TestReviewJudge", return_value=mock_judge):
+                    with patch(f"{_ORC}.DocReviewJudge", return_value=mock_judge):
+                        with patch(f"{_ORC}.ChangesManifestJudge", return_value=mock_judge):
+                            with patch(f"{_ORC}.SecurityReviewJudge", return_value=mock_judge):
+                                with patch(f"{_ORC}.GitOpsJudge", return_value=mock_git_ops):
+                                    with patch(f"{_ORC}.BacklogManager", return_value=effective_mgr):
+                                        with patch(f"{_ORC}.BlockerResolverJudge"):
+                                            with patch(f"{_ORC}.MAX_RETRY_ATTEMPTS", max_retry_attempts):
+                                                with patch(
+                                                    f"{_ORC}.BACKLOG_INDEX", tmp_path / "BACKLOG.md"
+                                                ):
+                                                    yield mock_exec
+
+
+class TestConflictingPrRebase:
+    """Tests for AC-1 through AC-4: CONFLICTING PR rebase-and-retry logic."""
+
+    def test_conflicting_pr_triggers_rebase_and_retry(self, tmp_path: Path) -> None:
+        """AC-1: A CONFLICTING PR triggers rebase_onto_default + force-push + retry merge.
+
+        Given: merge_pr raises RuntimeError containing 'not mergeable' on the first call
+        When: process_work_unit runs
+        Then: rebase_onto_default is called, then merge_pr is retried and succeeds
+        """
+        from devbench.execution.orchestrator import process_work_unit
+
+        unit = _make_unit(tmp_path)
+        exec_result = ExecutionResult(status=ExecutionStatus.IN_REVIEW, output="done", blocker="")
+        mock_judge = MagicMock()
+        mock_judge.name = "mock"
+        mock_judge.evaluate.return_value = _pass_result("mock")
+        mock_mgr = MagicMock()
+
+        mock_git_ops = MagicMock()
+        mock_git_ops.is_committed_and_pushed.return_value = False
+        mock_git_ops.create_pr.return_value = "https://github.com/org/repo/pull/5"
+        mock_git_ops.wait_for_checks.return_value = True
+
+        merge_calls = [0]
+
+        def merge_side_effect(**kwargs):
+            merge_calls[0] += 1
+            if merge_calls[0] == 1:
+                raise RuntimeError(
+                    "Failed to merge PR #5 on caylent-solutions/git-repo: "
+                    "not mergeable: the merge commit cannot be cleanly created"
+                )
+
+        mock_git_ops.merge_pr.side_effect = merge_side_effect
+
+        with _patch_process_work_unit(tmp_path, mock_git_ops, mock_judge, mock_mgr) as mock_exec:
+            mock_exec.execute.return_value = exec_result
+            result = process_work_unit(unit)
+
+        assert result is True
+        mock_git_ops.rebase_onto_default.assert_called_once()
+        assert merge_calls[0] == 2  # first failed, second succeeded
+
+    def test_clean_pr_no_rebase(self, tmp_path: Path) -> None:
+        """AC-2: A cleanly mergeable PR goes straight to merge (no rebase attempted).
+
+        Given: merge_pr succeeds on the first call (no conflict)
+        When: process_work_unit runs
+        Then: rebase_onto_default is NOT called
+        """
+        from devbench.execution.orchestrator import process_work_unit
+
+        unit = _make_unit(tmp_path)
+        exec_result = ExecutionResult(status=ExecutionStatus.IN_REVIEW, output="done", blocker="")
+        mock_judge = MagicMock()
+        mock_judge.name = "mock"
+        mock_judge.evaluate.return_value = _pass_result("mock")
+        mock_mgr = MagicMock()
+
+        mock_git_ops = MagicMock()
+        mock_git_ops.is_committed_and_pushed.return_value = False
+        mock_git_ops.create_pr.return_value = "https://github.com/org/repo/pull/3"
+        mock_git_ops.wait_for_checks.return_value = True
+        # merge_pr succeeds immediately (no exception)
+
+        with _patch_process_work_unit(tmp_path, mock_git_ops, mock_judge, mock_mgr) as mock_exec:
+            mock_exec.execute.return_value = exec_result
+            result = process_work_unit(unit)
+
+        assert result is True
+        mock_git_ops.rebase_onto_default.assert_not_called()
+
+    def test_rebase_failure_raises_not_loops(self, tmp_path: Path) -> None:
+        """AC-3: Rebase failure surfaces as error; orchestrator does not loop back to create_pr.
+
+        Given: merge_pr fails with 'not mergeable', then rebase_onto_default raises RuntimeError
+        When: process_work_unit runs with MAX_RETRY_ATTEMPTS=3
+        Then: GIT_ERROR is logged and create_pr is called exactly once (no looping back)
+
+        Using MAX_RETRY_ATTEMPTS=3 proves the fix works independently of the retry cap:
+        if the old loop-back-to-create_pr behavior were restored, create_pr would be called
+        3 times (once per attempt). Asserting pr_create_calls[0] == 1 with 3 attempts available
+        demonstrates that rebase failure causes fast-exit from the git ops block, not iteration restart.
+        """
+        from devbench.execution.orchestrator import process_work_unit
+
+        unit = _make_unit(tmp_path)
+        exec_result = ExecutionResult(status=ExecutionStatus.IN_REVIEW, output="done", blocker="")
+        mock_judge = MagicMock()
+        mock_judge.name = "mock"
+        mock_judge.evaluate.return_value = _pass_result("mock")
+
+        pr_create_calls = [0]
+        mock_git_ops = MagicMock()
+        mock_git_ops.is_committed_and_pushed.return_value = False
+
+        def create_pr_side_effect(**kwargs):
+            pr_create_calls[0] += 1
+            return f"https://github.com/org/repo/pull/{pr_create_calls[0]}"
+
+        mock_git_ops.create_pr.side_effect = create_pr_side_effect
+        mock_git_ops.wait_for_checks.return_value = True
+        mock_git_ops.merge_pr.side_effect = RuntimeError(
+            "Failed to merge PR: not mergeable: the merge commit cannot be cleanly created"
+        )
+        mock_git_ops.rebase_onto_default.side_effect = RuntimeError(
+            "git rebase origin/main2 failed (exit 1): conflict in src/foo.py"
+        )
+
+        with _patch_process_work_unit(
+            tmp_path, mock_git_ops, mock_judge, max_retry_attempts=3
+        ) as mock_exec:
+            mock_exec.execute.return_value = exec_result
+            result = process_work_unit(unit)
+
+        assert result is False
+        # With MAX_RETRY_ATTEMPTS=3, if the old loop-back behavior were present create_pr
+        # would be called 3 times. Asserting exactly 1 proves rebase failure causes fast-exit.
+        assert pr_create_calls[0] == 1
+        # GIT_ERROR must be logged in the work unit file
+        content = unit.file_path.read_text(encoding="utf-8")
+        assert "GIT_ERROR" in content
+
+    def test_rebase_retry_does_not_consume_extra_attempt(self, tmp_path: Path) -> None:
+        """The rebase+retry is handled within the same iteration (no extra attempt consumed).
+
+        Given: merge_pr fails with 'not mergeable' then succeeds after rebase
+        When: process_work_unit runs with MAX_RETRY_ATTEMPTS=1
+        Then: result is True (completed within the single attempt)
+        """
+        from devbench.execution.orchestrator import process_work_unit
+
+        unit = _make_unit(tmp_path)
+        exec_result = ExecutionResult(status=ExecutionStatus.IN_REVIEW, output="done", blocker="")
+        mock_judge = MagicMock()
+        mock_judge.name = "mock"
+        mock_judge.evaluate.return_value = _pass_result("mock")
+        mock_mgr = MagicMock()
+
+        mock_git_ops = MagicMock()
+        mock_git_ops.is_committed_and_pushed.return_value = False
+        mock_git_ops.create_pr.return_value = "https://github.com/org/repo/pull/7"
+        mock_git_ops.wait_for_checks.return_value = True
+
+        merge_calls = [0]
+
+        def merge_side_effect(**kwargs):
+            merge_calls[0] += 1
+            if merge_calls[0] == 1:
+                raise RuntimeError("not mergeable: the merge commit cannot be cleanly created")
+
+        mock_git_ops.merge_pr.side_effect = merge_side_effect
+
+        with _patch_process_work_unit(
+            tmp_path, mock_git_ops, mock_judge, mock_mgr, max_retry_attempts=1
+        ) as mock_exec:
+            mock_exec.execute.return_value = exec_result
+            result = process_work_unit(unit)
+
+        assert result is True
+        mock_git_ops.rebase_onto_default.assert_called_once()
 
 
 class TestMain:

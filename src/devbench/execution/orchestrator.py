@@ -278,7 +278,25 @@ def process_work_unit(work_unit: WorkUnit) -> bool:
                 feedback = "GitHub CI checks failed on PR. Fix the issues."
                 continue
 
-            git_ops.merge_pr(repo=canonical_repo, pr_number=pr_number, repo_path=repo_path)
+            try:
+                git_ops.merge_pr(repo=canonical_repo, pr_number=pr_number, repo_path=repo_path)
+            except RuntimeError as merge_exc:
+                if "not mergeable" not in str(merge_exc):
+                    raise
+                work_unit.log_comment(
+                    "judge/git_ops",
+                    "CONFLICTING_PR",
+                    f"PR #{pr_number} not mergeable — rebasing onto default branch",
+                )
+                # rebase_onto_default and the retry merge_pr are not retryable:
+                # if either fails, the exception propagates to the outer except which
+                # breaks the retry loop (terminal failure).
+                git_ops.rebase_onto_default(
+                    repo=canonical_repo,
+                    repo_path=repo_path,
+                    branch=branch,
+                )
+                git_ops.merge_pr(repo=canonical_repo, pr_number=pr_number, repo_path=repo_path)
             work_unit.log_comment("judge/git_ops", "PR_MERGED", pr_url)
 
             # Update parent repo's submodule reference — opt-in via git_ops.update_submodule
@@ -295,7 +313,7 @@ def process_work_unit(work_unit: WorkUnit) -> bool:
         except Exception as exc:
             work_unit.log_comment("orchestrator", "GIT_ERROR", str(exc))
             feedback = f"Git operations failed: {exc}"
-            continue
+            break
 
         # Mark done — gated path verifies all judges passed
         backlog_mgr.mark_done(work_unit.file_path, BACKLOG_INDEX, work_unit.id)

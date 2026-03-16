@@ -935,3 +935,115 @@ class TestPostSchemaValidation:
         assert "any-org/repo" in result.repos, (
             f"Expected 'any-org/repo' in repos, got {set(result.repos)}"
         )
+
+# ---------------------------------------------------------------------------
+# GitOpsConfig — T3 AC-3, AC-4, AC-5, AC-6
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestGitOpsConfig:
+    """Tests for git_ops.update_submodule config flag (T3)."""
+
+    def _write(self, path: Path, content: str) -> Path:
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    def test_update_submodule_defaults_to_false_when_git_ops_absent(self, tmp_path: Path) -> None:
+        """
+        Given: a config file with no 'git_ops' section
+        When: load_runtime_config is called
+        Then: RuntimeConfig.git_ops.update_submodule is False (AC-3)
+        """
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.git_ops.update_submodule is False, (
+            f"Expected git_ops.update_submodule=False when git_ops absent, got {result.git_ops.update_submodule}"
+        )
+
+    def test_update_submodule_defaults_to_false_when_field_absent(self, tmp_path: Path) -> None:
+        """
+        Given: a config file with git_ops: {} (no update_submodule key)
+        When: load_runtime_config is called
+        Then: RuntimeConfig.git_ops.update_submodule is False (AC-3)
+        """
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            git_ops: {}
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.git_ops.update_submodule is False, (
+            f"Expected git_ops.update_submodule=False when field absent, got {result.git_ops.update_submodule}"
+        )
+
+    def test_update_submodule_true_from_yaml(self, tmp_path: Path) -> None:
+        """
+        Given: a config file with git_ops.update_submodule: true
+        When: load_runtime_config is called
+        Then: RuntimeConfig.git_ops.update_submodule is True (AC-4)
+        """
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            git_ops:
+              update_submodule: true
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.git_ops.update_submodule is True, (
+            f"Expected git_ops.update_submodule=True, got {result.git_ops.update_submodule}"
+        )
+
+    def test_schema_rejects_non_boolean_update_submodule(self, tmp_path: Path) -> None:
+        """
+        Given: a config file with git_ops.update_submodule set to a string
+        When: load_runtime_config is called
+        Then: ValueError is raised (schema requires boolean) (AC-5)
+        """
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            git_ops:
+              update_submodule: "yes"
+            """,
+        )
+        with pytest.raises(ValueError, match="schema validation"):
+            load_runtime_config(cfg, {})
+
+    def test_schema_rejects_unknown_git_ops_keys(self, tmp_path: Path) -> None:
+        """
+        Given: a config file with an unknown key under git_ops
+        When: load_runtime_config is called
+        Then: ValueError is raised (additionalProperties: false) (AC-6)
+        """
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            git_ops:
+              update_submodule: false
+              unknown_key: true
+            """,
+        )
+        with pytest.raises(ValueError, match="schema validation"):
+            load_runtime_config(cfg, {})

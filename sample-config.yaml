@@ -24,3 +24,13 @@ repos:
   caylent-solutions/devbench:
     default_branch: main2
     checkout_directory: devbench
+
+# git_ops: controls git workflow behaviour after PR merge.
+#
+# update_submodule  (optional, default false) — set true only when target repos
+#                   are git submodules of a parent workspace repo.  When true,
+#                   cmd_git_ops will stage and commit the updated submodule
+#                   pointer in the parent repo after each PR merge.
+#
+# git_ops:
+#   update_submodule: false

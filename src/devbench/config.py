@@ -128,6 +128,7 @@ except ValueError:
         f"JUDGE_MERGE_STRATEGY must be one of: {', '.join(s.value for s in MergeStrategy)}. Got: {_merge_strategy}"
     ) from None
 
+UPDATE_SUBMODULE: bool = RUNTIME_CONFIG.git_ops.update_submodule
 USE_BEDROCK: bool = os.environ.get("JUDGE_USE_BEDROCK", "").lower() in ("1", "true", "yes")
 BEDROCK_REGION: str = os.environ.get("JUDGE_BEDROCK_REGION", os.environ.get("AWS_REGION", "us-east-1"))
 

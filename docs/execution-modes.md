@@ -62,7 +62,7 @@ Both modes execute the same logical steps in the same order.
    ├── e. Create PR (--base from devbench.yaml repos.<org/repo>.default_branch)
    ├── f. Wait for CI checks to pass
    ├── g. Squash-merge PR, delete branch
-   └── h. Update parent repo's submodule reference
+   └── h. Update parent repo's submodule reference (only when git_ops.update_submodule: true)
 
 9. Mark Done (done-gate: verifies all 4 judges passed in most recent round)
 
@@ -99,7 +99,7 @@ The orchestrator is responsible for:
 
 - Running judge reviews (all 5 judges)
 - Injecting review feedback into retry attempts
-- All git operations: branch, commit, push, PR, CI wait, merge, submodule update
+- All git operations: branch, commit, push, PR, CI wait, merge, and submodule update (when git_ops.update_submodule: true in devbench.yaml)
 - Marking work units Done (via the done-gate)
 - Marking work units Blocked (after max retries)
 
@@ -131,7 +131,7 @@ orchestrator.py (Python loop)
     │
     ├── runs security judge
     │
-    └── runs GitOpsJudge: branch → commit → push → PR → CI wait → merge → submodule
+    └── runs GitOpsJudge: branch → commit → push → PR → CI wait → merge → submodule (if enabled)
 ```
 
 The executor subprocess **cannot** be the orchestrator — it is a separate process with no access to the orchestrator's state.

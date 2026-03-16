@@ -66,6 +66,7 @@ from devbench.config import (
     BACKLOG_ROOT,
     REPO_LOCAL_PATHS,
     RUNTIME_CONFIG,
+    UPDATE_SUBMODULE,
     WORKSPACE_ROOT,
     resolve_repo,
     validate_repo,
@@ -495,7 +496,7 @@ def cmd_git_ops(unit_id: str) -> int:
     4. Create a pull request.
     5. Wait for CI checks to pass.
     6. Merge the pull request.
-    7. Update the parent submodule reference.
+    7. Update the parent submodule reference (only when ``UPDATE_SUBMODULE`` is ``True``).
 
     Used by the orchestrate skill after all review judges have passed.
     """
@@ -543,11 +544,12 @@ def cmd_git_ops(unit_id: str) -> int:
     ops.merge_pr(canonical_repo, pr_number, repo_path=repo_path)
     logger.info("Merged PR #%d for %s", pr_number, unit_id)
 
-    ops.update_parent_submodule_ref(
-        canonical_repo,
-        repo_path,
-        f"chore: update {repo_path.name} submodule after {unit_id}",
-    )
+    if UPDATE_SUBMODULE:
+        ops.update_parent_submodule_ref(
+            canonical_repo,
+            repo_path,
+            f"chore: update {repo_path.name} submodule after {unit_id}",
+        )
 
     print(json.dumps({"unit_id": unit_id, "pr_url": pr_url, "pr_number": pr_number}))
     return 0

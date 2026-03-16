@@ -419,3 +419,75 @@ class TestPreParseConfig:
         original = argv.copy()
         cli._pre_parse_config(argv)
         assert argv == original
+
+
+@pytest.mark.unit
+class TestCmdGitOpsSubmoduleGate:
+    """Tests for T3 AC-1 and AC-2: UPDATE_SUBMODULE gates update_parent_submodule_ref."""
+
+    def _make_unit(self) -> WorkUnit:
+        return WorkUnit(
+            id="E202-F1-S1-T3",
+            title="Test task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E202-F1-S1-T3.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+
+    def _build_mock_ops(self) -> MagicMock:
+        mock_ops = MagicMock()
+        mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/42"
+        mock_ops.wait_for_checks.return_value = True
+        return mock_ops
+
+    def test_cmd_git_ops_skips_submodule_update_when_flag_false(self, tmp_path: Path) -> None:
+        """
+        Given: UPDATE_SUBMODULE is False
+        When: cmd_git_ops is called
+        Then: update_parent_submodule_ref is never called (AC-1)
+        """
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        mock_ops = self._build_mock_ops()
+        repo_path = tmp_path / "devbench"
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
+            patch("devbench.cli.UPDATE_SUBMODULE", False),
+            patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+        ):
+            result = cli.cmd_git_ops("E202-F1-S1-T3")
+
+        assert result == 0
+        mock_ops.update_parent_submodule_ref.assert_not_called()
+
+    def test_cmd_git_ops_calls_submodule_update_when_flag_true(self, tmp_path: Path) -> None:
+        """
+        Given: UPDATE_SUBMODULE is True
+        When: cmd_git_ops is called
+        Then: update_parent_submodule_ref is called with correct args (AC-2)
+        """
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        mock_ops = self._build_mock_ops()
+        repo_path = tmp_path / "devbench"
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
+            patch("devbench.cli.UPDATE_SUBMODULE", True),
+            patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+        ):
+            result = cli.cmd_git_ops("E202-F1-S1-T3")
+
+        assert result == 0
+        mock_ops.update_parent_submodule_ref.assert_called_once_with(
+            "caylent-solutions/devbench",
+            repo_path,
+            "chore: update devbench submodule after E202-F1-S1-T3",
+        )

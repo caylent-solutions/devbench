@@ -27,7 +27,7 @@ A Claude Code agent reads work units from a structured backlog, implements each 
 │  7. If judges reject → inject prior feedback, fix, resubmit     │
 │  8. If judges approve → commit, push, create PR                 │
 │  9. Wait for GitHub CI checks to pass                           │
-│ 10. Merge PR, update submodule ref, mark done (done-gate)       │
+│ 10. Merge PR, update submodule ref if enabled, mark done        │
 │ 11. Loop back to step 1                                         │
 │                                                                 │
 │  Human can pause (Escape), give instructions, resume (Continue) │
@@ -182,7 +182,7 @@ Up to 10 retry attempts before marking the unit as blocked.
 ### 11. Merge and Status Update
 
 - Agent merges the PR via `gh pr merge --delete-branch` using the strategy set by `JUDGE_MERGE_STRATEGY` (default: `squash`)
-- Updates the parent repo's submodule reference
+- Updates the parent repo's submodule reference when `git_ops.update_submodule: true` in the YAML config (opt-in; default `false`; set `true` only when target repos are git submodules of a parent workspace repo)
 - Marks the work unit as Done via `mark_done()` — enforces the done-gate before writing
 - The done-gate verifies all four required review judges (`code_review`, `test_review`, `doc_review`, `changes_manifest`) have a `[REVIEW_PASS]` entry in the most recent round; raises `RuntimeError` otherwise
 - All writes go through the private `_set_status()` workhorse which atomically updates both the work unit file and BACKLOG.md
@@ -223,6 +223,9 @@ repos:
     default_branch: main2            # optional — omit to fall back to origin/HEAD
     checkout_directory: my-checkout  # optional — relative to JUDGE_WORKSPACE_ROOT
                                      # omit to use repo short-name (e.g. "my-repo")
+
+git_ops:                             # optional — git workflow settings
+  update_submodule: false            # set true only when repos are git submodules of a parent repo
 ```
 
 | Variable | Default | Description |

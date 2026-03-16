@@ -119,6 +119,17 @@
         }
       }
     },
+    "git_ops": {
+      "type": "object",
+      "description": "Git operations workflow settings.",
+      "additionalProperties": false,
+      "properties": {
+        "update_submodule": {
+          "type": "boolean",
+          "description": "When true, update the parent repo's submodule reference after each PR merge. Set to true only when target repos are git submodules of a parent workspace repo."
+        }
+      }
+    },
     "limits": {
       "type": "object",
       "description": "Threshold and limit values.",

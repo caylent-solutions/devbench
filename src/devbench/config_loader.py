@@ -50,6 +50,9 @@ YAML schema::
       llm_file_context: <integer>
       llm_file_preview_chars: <integer>
 
+    git_ops:                             # optional — git workflow settings
+      update_submodule: false            # set true only when repos are git submodules of a parent repo
+
 Example config file (``backlog/config/devbench.yaml``)::
 
     repos:
@@ -130,6 +133,20 @@ class LimitConfig:
 
 
 @dataclass
+class GitOpsConfig:
+    """Git operations workflow settings.
+
+    Attributes:
+        update_submodule: When ``True``, update the parent repo's submodule
+            reference after each PR merge.  Set to ``True`` only when target
+            repos are git submodules of a parent workspace repo.  Defaults
+            to ``False`` (opt-in).
+    """
+
+    update_submodule: bool = False
+
+
+@dataclass
 class RepoConfig:
     """Per-repository configuration.
 
@@ -162,6 +179,7 @@ class RuntimeConfig:
             per-repository configuration.
         timeouts: Timeout values for various operations.
         limits: Threshold and limit values.
+        git_ops: Git operations workflow settings.
         allowed_orgs: List of permitted GitHub organisations.
         judge_model: Model identifier used by judge agents.
         executor_model: Model identifier used by the executor agent.
@@ -174,6 +192,7 @@ class RuntimeConfig:
     repos: dict[str, RepoConfig] = field(default_factory=dict)
     timeouts: TimeoutConfig = field(default_factory=TimeoutConfig)
     limits: LimitConfig = field(default_factory=LimitConfig)
+    git_ops: GitOpsConfig = field(default_factory=GitOpsConfig)
     allowed_orgs: list[str] = field(default_factory=list)
     judge_model: str | None = None
     executor_model: str | None = None
@@ -359,10 +378,17 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         llm_file_preview_chars=limits_raw.get("llm_file_preview_chars"),
     )
 
+    # Populate GitOpsConfig from YAML git_ops block (absent keys yield defaults).
+    git_ops_raw = raw.get("git_ops") or {}
+    git_ops = GitOpsConfig(
+        update_submodule=bool(git_ops_raw.get("update_submodule", False)),
+    )
+
     return RuntimeConfig(
         repos=repos,
         timeouts=timeouts,
         limits=limits,
+        git_ops=git_ops,
         allowed_orgs=allowed_orgs,
         judge_model=raw.get("judge_model") or None,
         executor_model=raw.get("executor_model") or None,

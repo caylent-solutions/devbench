@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from devbench.config_loader import RepoConfig, RuntimeConfig
 from devbench.github.git_ops import GitOpsJudge
 from devbench.judges.base import Verdict
 
@@ -130,7 +131,101 @@ class TestEnsureBranch:
         assert ["stash", "pop"] in git_calls
 
     def test_creates_branch_when_absent(self, tmp_path: Path) -> None:
-        """``git checkout -b <branch>`` is used when branch does not exist locally."""
+        """``git checkout -b <branch> origin/<default>`` is used when branch does not exist locally."""
+        judge = GitOpsJudge()
+        git_calls: list[list[str]] = []
+
+        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
+            git_calls.append(args)
+            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, "main", "")
+            if args == ["status", "--porcelain"]:
+                return (0, "", "")  # clean
+            return (0, "", "")
+
+        runtime_config = RuntimeConfig(
+            repos={"caylent-solutions/git-repo": RepoConfig(default_branch="main")}
+        )
+        with (
+            patch("devbench.github.git_ops.RUNTIME_CONFIG", runtime_config),
+            patch.object(judge, "_git", side_effect=stub),
+            patch.object(judge, "_run_command", return_value=(1, "", "")),  # show-ref → absent
+        ):
+            judge.ensure_branch("caylent-solutions/git-repo", tmp_path, "feature/x")
+
+        assert ["checkout", "-b", "feature/x", "origin/main"] in git_calls
+        assert ["checkout", "feature/x"] not in git_calls
+
+    def test_ensure_branch_new_branch_uses_default_branch_as_base(self, tmp_path: Path) -> None:
+        """AC-1: New branch is created from origin/<default_branch>, not current HEAD.
+
+        Given: Branch does not exist locally and current HEAD is a feature branch
+        When: ensure_branch is called for a new branch
+        Then: git checkout -b <branch> origin/<default_branch> is called (not just -b <branch>)
+        """
+        judge = GitOpsJudge()
+        git_calls: list[list[str]] = []
+
+        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
+            git_calls.append(args)
+            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, "feature/prior-task", "")
+            if args == ["status", "--porcelain"]:
+                return (0, "", "")  # clean
+            return (0, "", "")
+
+        runtime_config = RuntimeConfig(
+            repos={"caylent-solutions/git-repo": RepoConfig(default_branch="main2")}
+        )
+        with (
+            patch("devbench.github.git_ops.RUNTIME_CONFIG", runtime_config),
+            patch.object(judge, "_git", side_effect=stub),
+            patch.object(judge, "_run_command", return_value=(1, "", "")),  # show-ref → absent
+        ):
+            judge.ensure_branch("caylent-solutions/git-repo", tmp_path, "feature/new-task")
+
+        assert ["checkout", "-b", "feature/new-task", "origin/main2"] in git_calls
+        assert ["checkout", "-b", "feature/new-task"] not in git_calls
+
+    def test_ensure_branch_new_branch_fetches_origin_first(self, tmp_path: Path) -> None:
+        """AC-1: origin is fetched before creating a new branch to ensure origin/<default_branch> is current.
+
+        Given: Branch does not exist locally
+        When: ensure_branch is called
+        Then: git fetch origin is called before git checkout -b
+        """
+        judge = GitOpsJudge()
+        git_calls: list[list[str]] = []
+
+        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
+            git_calls.append(args)
+            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, "main2", "")
+            if args == ["status", "--porcelain"]:
+                return (0, "", "")  # clean
+            return (0, "", "")
+
+        runtime_config = RuntimeConfig(
+            repos={"caylent-solutions/git-repo": RepoConfig(default_branch="main2")}
+        )
+        with (
+            patch("devbench.github.git_ops.RUNTIME_CONFIG", runtime_config),
+            patch.object(judge, "_git", side_effect=stub),
+            patch.object(judge, "_run_command", return_value=(1, "", "")),  # show-ref → absent
+        ):
+            judge.ensure_branch("caylent-solutions/git-repo", tmp_path, "feature/new-task")
+
+        fetch_idx = git_calls.index(["fetch", "origin"])
+        checkout_idx = git_calls.index(["checkout", "-b", "feature/new-task", "origin/main2"])
+        assert fetch_idx < checkout_idx
+
+    def test_ensure_branch_existing_branch_no_fetch(self, tmp_path: Path) -> None:
+        """AC-2: Existing branch path does not trigger a fetch.
+
+        Given: Branch already exists locally
+        When: ensure_branch is called
+        Then: git fetch origin is NOT called (existing branch path unchanged)
+        """
         judge = GitOpsJudge()
         git_calls: list[list[str]] = []
 
@@ -144,12 +239,68 @@ class TestEnsureBranch:
 
         with (
             patch.object(judge, "_git", side_effect=stub),
+            patch.object(judge, "_run_command", return_value=(0, "", "")),  # show-ref → exists
+        ):
+            judge.ensure_branch("caylent-solutions/git-repo", tmp_path, "feature/x")
+
+        assert ["fetch", "origin"] not in git_calls
+
+    def test_ensure_branch_uses_configured_default_branch(self, tmp_path: Path) -> None:
+        """AC-3: get_configured_default_branch is used to determine the base branch name.
+
+        Given: RUNTIME_CONFIG has default_branch='develop' for the repo
+        When: ensure_branch creates a new branch
+        Then: origin/develop is used as the base, not origin/main
+        """
+        judge = GitOpsJudge()
+        git_calls: list[list[str]] = []
+
+        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
+            git_calls.append(args)
+            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, "main", "")
+            if args == ["status", "--porcelain"]:
+                return (0, "", "")  # clean
+            return (0, "", "")
+
+        runtime_config = RuntimeConfig(
+            repos={"caylent-solutions/git-repo": RepoConfig(default_branch="develop")}
+        )
+        with (
+            patch("devbench.github.git_ops.RUNTIME_CONFIG", runtime_config),
+            patch.object(judge, "_git", side_effect=stub),
             patch.object(judge, "_run_command", return_value=(1, "", "")),  # show-ref → absent
         ):
             judge.ensure_branch("caylent-solutions/git-repo", tmp_path, "feature/x")
 
-        assert ["checkout", "-b", "feature/x"] in git_calls
-        assert ["checkout", "feature/x"] not in git_calls
+        assert ["checkout", "-b", "feature/x", "origin/develop"] in git_calls
+
+    def test_ensure_branch_raises_when_no_default_branch_configured(self, tmp_path: Path) -> None:
+        """AC-3: Raises ValueError (fail-fast) when no default_branch is configured.
+
+        Given: RUNTIME_CONFIG has no default_branch for the repo
+        When: ensure_branch attempts to create a new branch
+        Then: ValueError is raised with a clear actionable message
+        """
+        judge = GitOpsJudge()
+
+        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
+            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, "main", "")
+            if args == ["status", "--porcelain"]:
+                return (0, "", "")  # clean
+            return (0, "", "")
+
+        runtime_config = RuntimeConfig(
+            repos={"caylent-solutions/git-repo": RepoConfig(default_branch=None)}
+        )
+        with (
+            patch("devbench.github.git_ops.RUNTIME_CONFIG", runtime_config),
+            patch.object(judge, "_git", side_effect=stub),
+            patch.object(judge, "_run_command", return_value=(1, "", "")),  # show-ref → absent
+            pytest.raises(ValueError, match="No default_branch configured for repo"),
+        ):
+            judge.ensure_branch("caylent-solutions/git-repo", tmp_path, "feature/x")
 
 
 class TestCommitAndPush:
@@ -331,8 +482,6 @@ class TestCreatePr:
 
     def test_uses_base_branch_from_yaml_config(self, tmp_path: Path) -> None:
         """create_pr passes --base <branch> when YAML config has a default_branch."""
-        from devbench.config_loader import RepoConfig, RuntimeConfig
-
         judge = GitOpsJudge()
         runtime_config = RuntimeConfig(
             repos={"caylent-solutions/git-repo": RepoConfig(default_branch="main2")}
@@ -350,8 +499,6 @@ class TestCreatePr:
 
     def test_omits_base_branch_when_not_configured(self, tmp_path: Path) -> None:
         """create_pr omits --base when repo has no default_branch in YAML config."""
-        from devbench.config_loader import RepoConfig, RuntimeConfig
-
         judge = GitOpsJudge()
         runtime_config = RuntimeConfig(
             repos={"caylent-solutions/git-repo": RepoConfig(default_branch=None)}

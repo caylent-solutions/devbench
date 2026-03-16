@@ -59,7 +59,10 @@ class GitOpsJudge(BaseJudge):
         - On a different branch — check whether the tree is dirty (staged or unstaged
           changes).  If dirty: ``git stash``.
         - If *branch* exists locally: ``git checkout <branch>``.
-        - If *branch* does not exist locally: ``git checkout -b <branch>``.
+        - If *branch* does not exist locally: ``git fetch origin``, then
+          ``git checkout -b <branch> origin/<default_branch>`` where
+          *default_branch* comes from
+          :func:`~devbench.config_loader.get_configured_default_branch`.
         - If the tree was stashed: ``git stash pop``.
 
         Args:
@@ -68,8 +71,9 @@ class GitOpsJudge(BaseJudge):
             branch: Target branch name.  Must match ``_BRANCH_RE``.
 
         Raises:
-            ValueError: If the repo is not in the allow-list, or the branch name
-                does not match the allowed format.
+            ValueError: If the repo is not in the allow-list, the branch name
+                does not match the allowed format, or no ``default_branch`` is
+                configured for *repo* in ``RUNTIME_CONFIG``.
             RuntimeError: If any git command fails.
         """
         validate_repo(repo)
@@ -100,7 +104,14 @@ class GitOpsJudge(BaseJudge):
         if branch_exists:
             self._git(["checkout", branch], repo_path)
         else:
-            self._git(["checkout", "-b", branch], repo_path)
+            self._git(["fetch", "origin"], repo_path)
+            default_branch = get_configured_default_branch(repo, RUNTIME_CONFIG)
+            if not default_branch:
+                raise ValueError(
+                    f"No default_branch configured for repo '{repo}'. "
+                    "Set default_branch in RUNTIME_CONFIG."
+                )
+            self._git(["checkout", "-b", branch, f"origin/{default_branch}"], repo_path)
 
         if is_dirty:
             self._git(["stash", "pop"], repo_path)

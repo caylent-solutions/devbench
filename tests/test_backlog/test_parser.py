@@ -422,6 +422,96 @@ class TestGetBlockedUnits:
         assert parser.get_blocked_units(units) == []
 
 
+class TestParserStatusVocabulary:
+    """Test that BacklogParser recognises all five runtime status values.
+
+    These tests cover the status vocabulary documented in the parser.py module
+    docstring (AC-DOC-1 of E8-F1-S1-T1): in-queue, in-progress, in-review,
+    done, and blocked must all be accepted by parse_work_unit_file without error.
+    """
+
+    def _make_wu_file(self, tmp_path: Path, status: str) -> Path:
+        """Write a minimal compliant work-unit file with the given status."""
+        wu = tmp_path / "E0-F1-S1-T1.md"
+        wu.write_text(
+            f"# E0-F1-S1-T1: Task Title\n\n## Status: {status}\n\n## Comments\n",
+            encoding="utf-8",
+        )
+        return wu
+
+    @pytest.mark.parametrize(
+        "raw_status",
+        ["in-queue", "in-progress", "in-review", "done", "blocked"],
+    )
+    def test_parse_work_unit_file_accepts_all_runtime_statuses(
+        self, tmp_path: Path, raw_status: str
+    ) -> None:
+        """parse_work_unit_file must parse every status in the runtime vocabulary.
+
+        Given: A work-unit file whose ## Status: line contains one of the five
+               valid runtime status values.
+        When:  parse_work_unit_file is called.
+        Then:  The returned WorkUnit carries the corresponding WorkUnitStatus
+               value without raising.
+        """
+        wu_file = self._make_wu_file(tmp_path, raw_status)
+        parser = BacklogParser(backlog_root=tmp_path, backlog_index=tmp_path / "BACKLOG.md")
+        unit = parser.parse_work_unit_file(wu_file)
+        assert unit.status.value.lower().replace(" ", "-") == raw_status, (
+            f"Expected status '{raw_status}' but got '{unit.status.value}'"
+        )
+
+    def test_parse_work_unit_file_rejects_unknown_status(self, tmp_path: Path) -> None:
+        """parse_work_unit_file must raise ValueError for an unrecognised status.
+
+        Given: A work-unit file whose ## Status: line contains an invalid value.
+        When:  parse_work_unit_file is called.
+        Then:  ValueError is raised with the unrecognised status in the message.
+        """
+        wu_file = self._make_wu_file(tmp_path, "not-a-status")
+        parser = BacklogParser(backlog_root=tmp_path, backlog_index=tmp_path / "BACKLOG.md")
+        with pytest.raises(ValueError, match="not-a-status"):
+            parser.parse_work_unit_file(wu_file)
+
+    def test_blocked_status_does_not_appear_in_parallel_candidates(
+        self, tmp_path: Path
+    ) -> None:
+        """A BLOCKED work unit must not appear in get_parallel_candidates.
+
+        Given: A list containing one BLOCKED task and one IN_QUEUE task with
+               no unsatisfied dependencies.
+        When:  get_parallel_candidates is called.
+        Then:  Only the IN_QUEUE task is returned; the BLOCKED task is excluded.
+        """
+        parser = BacklogParser.__new__(BacklogParser)
+        parser._backlog_root = tmp_path
+        parser._backlog_index = tmp_path / "BACKLOG.md"
+
+        p = Path("/dev/null")
+        units = [
+            WorkUnit(
+                id="E0-F1-S1-T1",
+                title="blocked task",
+                status=WorkUnitStatus.BLOCKED,
+                unit_type=WorkUnitType.TASK,
+                file_path=p,
+                repo="r",
+            ),
+            WorkUnit(
+                id="E0-F1-S1-T2",
+                title="queued task",
+                status=WorkUnitStatus.IN_QUEUE,
+                unit_type=WorkUnitType.TASK,
+                file_path=p,
+                repo="r",
+            ),
+        ]
+        candidates = parser.get_parallel_candidates(units)
+        ids = [u.id for u in candidates]
+        assert "E0-F1-S1-T1" not in ids, "BLOCKED task must not appear in parallel candidates"
+        assert "E0-F1-S1-T2" in ids, "IN_QUEUE task must appear in parallel candidates"
+
+
 class TestGetParallelCandidates:
     """Test get_parallel_candidates returns multiple actionable tasks."""
 

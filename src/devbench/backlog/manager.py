@@ -12,7 +12,8 @@ Public API
                                 judges passed before writing ``done``.
 ``mark_blocked``              — writes ``blocked`` and appends a reason comment.
 ``validate``                  — returns integrity errors (missing files, status
-                                drift, orphans, broken deps).
+                                drift, orphans, broken deps, Status Summary count
+                                drift, and missing required section headers).
 ``log_to_traceability_matrix``— appends a spec/test mapping entry to the
                                 traceability matrix file.
 
@@ -24,9 +25,32 @@ Constructor
 
 All writes go through the private ``_set_status`` workhorse which updates
 both the work-unit file and BACKLOG.md atomically.
+
+Validation Checks
+-----------------
+``validate`` runs six integrity checks in order:
+
+1. Every row in BACKLOG.md has a corresponding work unit file.
+2. Every work unit file's status matches the index.
+3. No orphaned work unit files (in workspace_root/backlog/ but not in index).
+4. All dependency IDs reference real work unit IDs in the index.
+5. Status Summary counts match actual per-status counts in the Full Work Unit
+   Index.  Only status columns present in the Summary table are compared.
+   ``blocked`` units count toward their respective status column.  This check
+   is silently skipped when no Status Summary section is found.
+6. Every work unit file contains a ``## Comments`` section header.  This is
+   required by the backlog contract so that agents have a designated location
+   to append log entries.
+
+The full runtime status vocabulary is: ``in-queue``, ``in-progress``,
+``in-review``, ``done``, ``blocked``.  All five values are valid in both the
+work-unit file and the BACKLOG.md index; status mismatches are reported
+regardless of which status value is involved.
 """
 
+import contextlib
 import logging
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -132,6 +156,10 @@ class BacklogManager:
         2. Every work unit file's status matches the index.
         3. No orphaned work unit files (in workspace_root/backlog/ but not in index).
         4. All dependency IDs reference real work unit IDs in the index.
+        5. Status Summary counts match the actual per-status counts in the index.
+           Only status columns present in the Summary table are compared.
+           Silently skipped when no Status Summary section is found.
+        6. Every work unit file contains a ``## Comments`` section header.
 
         Args:
             backlog_index: Path to the ``BACKLOG.md`` index file.
@@ -147,6 +175,8 @@ class BacklogManager:
         indexed_files = self._check_files_and_statuses(rows, workspace_root, errors)
         self._check_orphans(workspace_root, indexed_files, errors)
         self._check_dependencies(backlog_index, known_ids, errors)
+        self._check_status_summary_counts(backlog_index, rows, errors)
+        self._check_required_section_headers(rows, workspace_root, errors)
         return errors
 
     def _check_files_and_statuses(
@@ -212,6 +242,201 @@ class BacklogManager:
                     errors.append(
                         f"{row_id}: dependency '{dep_id}' not found in backlog index"
                     )
+
+    def _check_status_summary_counts(
+        self,
+        backlog_index: Path,
+        rows: list[tuple[str, str, str]],
+        errors: list[str],
+    ) -> None:
+        """Check 5: Status Summary counts match actual per-status counts in the index.
+
+        Parses the ``## Status Summary`` section from ``backlog_index`` and extracts
+        the total count for each status column present in that table.  Counts the
+        corresponding statuses from ``rows`` (the parsed Full Work Unit Index), then
+        reports an error for every column where the declared count differs from the
+        actual count.
+
+        Only columns present in the Summary table header are checked.  Columns not
+        present in the header are ignored.  When no Status Summary section is found,
+        this check is silently skipped.
+
+        Args:
+            backlog_index: Path to the ``BACKLOG.md`` index file.
+            rows: Parsed ``(id, status, file_path)`` tuples from the Full Work Unit Index.
+            errors: Mutable list to which error strings are appended.
+        """
+        status_col_indices = self._parse_summary_status_columns(backlog_index)
+        if status_col_indices is None:
+            return
+
+        declared_counts = self._sum_summary_declared_counts(backlog_index, status_col_indices)
+        actual_counts = self._count_index_statuses(rows, status_col_indices)
+
+        for status in status_col_indices:
+            declared = declared_counts[status]
+            actual = actual_counts[status]
+            if declared != actual:
+                errors.append(
+                    f"Status Summary count mismatch for '{status}': "
+                    f"summary declares {declared} but index has {actual}"
+                )
+
+    @staticmethod
+    def _parse_summary_table_rows(summary_text: str) -> tuple[list[str], list[list[str]]]:
+        """Parse a markdown table from summary_text into a header row and data rows.
+
+        Returns a tuple of (header_cells, data_rows) where header_cells is a list
+        of lowercase column names and data_rows is a list of cell lists.  Separator
+        rows (all-dash cells) are excluded.  Returns empty lists when no table is found.
+        """
+        header_row: list[str] = []
+        data_rows: list[list[str]] = []
+        for line in summary_text.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("|"):
+                continue
+            cells = [c.strip() for c in stripped.split("|") if c.strip()]
+            if not cells:
+                continue
+            if all(set(c) <= {"-", " "} for c in cells):
+                continue
+            if not header_row:
+                header_row = [c.lower() for c in cells]
+            else:
+                data_rows.append(cells)
+        return header_row, data_rows
+
+    def _parse_summary_status_columns(self, backlog_index: Path) -> dict[str, int] | None:
+        """Return a mapping of canonical status name -> column index from the Status Summary.
+
+        Returns ``None`` when no Status Summary section or no recognisable status
+        columns are found, indicating the count check should be skipped.
+
+        The column name mapping normalises display names (e.g. ``"in queue"``) to
+        canonical hyphenated names (e.g. ``"in-queue"``).
+        """
+        content = backlog_index.read_text(encoding="utf-8")
+        summary_match = re.search(
+            r"^##\s+Status Summary\s*\n(.*?)(?=^##\s|\Z)",
+            content,
+            re.MULTILINE | re.DOTALL,
+        )
+        if summary_match is None:
+            return None
+
+        header_row, _ = self._parse_summary_table_rows(summary_match.group(1))
+        if not header_row:
+            return None
+
+        display_to_canonical: dict[str, str] = {
+            "in queue": "in-queue",
+            "in progress": "in-progress",
+            "in review": "in-review",
+            "done": "done",
+            "blocked": "blocked",
+        }
+        status_col_indices: dict[str, int] = {
+            display_to_canonical[col_name]: col_idx
+            for col_idx, col_name in enumerate(header_row)
+            if col_name in display_to_canonical
+        }
+        return status_col_indices if status_col_indices else None
+
+    def _sum_summary_declared_counts(
+        self,
+        backlog_index: Path,
+        status_col_indices: dict[str, int],
+    ) -> dict[str, int]:
+        """Sum declared counts from the Status Summary table for each status column.
+
+        Non-numeric cells (e.g. bold ``**Total**`` rows) are silently ignored.
+
+        Args:
+            backlog_index: Path to the ``BACKLOG.md`` index file.
+            status_col_indices: Mapping from canonical status name to column index.
+
+        Returns:
+            A dict mapping each status to its declared total count.
+        """
+        content = backlog_index.read_text(encoding="utf-8")
+        summary_match = re.search(
+            r"^##\s+Status Summary\s*\n(.*?)(?=^##\s|\Z)",
+            content,
+            re.MULTILINE | re.DOTALL,
+        )
+        declared_counts = dict.fromkeys(status_col_indices, 0)
+        if summary_match is None:
+            return declared_counts
+
+        _, data_rows = self._parse_summary_table_rows(summary_match.group(1))
+        for row_cells in data_rows:
+            for status, col_idx in status_col_indices.items():
+                if col_idx < len(row_cells):
+                    with contextlib.suppress(ValueError):
+                        declared_counts[status] += int(row_cells[col_idx].strip())
+        return declared_counts
+
+    @staticmethod
+    def _count_index_statuses(
+        rows: list[tuple[str, str, str]],
+        status_col_indices: dict[str, int],
+    ) -> dict[str, int]:
+        """Count actual statuses in the index for each status present in status_col_indices.
+
+        Only rows with a non-empty ``file_path`` are counted as real work-unit rows;
+        rows without a file path are header rows, separator rows, or Status Summary
+        data rows incidentally parsed by ``_parse_backlog_rows``.
+
+        Args:
+            rows: Parsed ``(id, status, file_path)`` tuples from the Full Work Unit Index.
+            status_col_indices: Mapping from canonical status name to column index (used
+                only to determine which statuses to count).
+
+        Returns:
+            A dict mapping each status to its actual count in the index.
+        """
+        actual_counts = dict.fromkeys(status_col_indices, 0)
+        for row_id, row_status, file_path_str in rows:
+            if not row_id or row_id.lower() == "id" or row_id.startswith("-"):
+                continue
+            if not file_path_str:
+                continue
+            if row_status in actual_counts:
+                actual_counts[row_status] += 1
+        return actual_counts
+
+    def _check_required_section_headers(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """Check 6: every work unit file contains a ``## Comments`` section header.
+
+        The backlog contract requires a ``## Comments`` section in every work unit
+        file so that agents have a designated location for log entries.  This check
+        reports an error for each file where the header is absent.  Files that do
+        not exist on disk are skipped (already reported by check 1).
+
+        Args:
+            rows: Parsed ``(id, status, file_path)`` tuples from the Full Work Unit Index.
+            workspace_root: Workspace root used to resolve relative file paths.
+            errors: Mutable list to which error strings are appended.
+        """
+        for row_id, _, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not file_path_str:
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.exists():
+                continue  # Already reported by _check_files_and_statuses.
+            content = wu_path.read_text(encoding="utf-8")
+            if COMMENTS_SECTION_HEADER not in content:
+                errors.append(
+                    f"{row_id}: work unit file missing '## Comments' section header"
+                )
 
     def log_to_traceability_matrix(self, matrix_path: Path, spec_ref: str, test_ref: str) -> None:
         """Append an entry to the traceability matrix.

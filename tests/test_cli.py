@@ -598,7 +598,7 @@ class TestCmdValidateBacklogPathResolution:
         backlog_dir = workspace / BACKLOG_SUBDIR
         backlog_dir.mkdir(parents=True, exist_ok=True)
         wu = backlog_dir / "E0-F1-S1-T1.md"
-        wu.write_text("# E0-F1-S1-T1: Task\n\n## Status: in-queue\n", encoding="utf-8")
+        wu.write_text("# E0-F1-S1-T1: Task\n\n## Status: in-queue\n\n## Comments\n", encoding="utf-8")
         idx = workspace / "BACKLOG.md"
         idx.write_text(
             "# Backlog\n\n"

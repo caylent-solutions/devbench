@@ -536,6 +536,15 @@ class BacklogManager:
         if not self._all_children_done(rows, parent_id):
             return
 
+        parent_ids_with_status = {row_id for row_id, status, _ in rows if row_id and status}
+        if parent_id not in parent_ids_with_status:
+            self.logger.debug(
+                "Skipping rollup for '%s': not found with a recognized status in %s",
+                parent_id,
+                backlog_index,
+            )
+            return
+
         parent_file = self._find_work_unit_file(rows, parent_id, backlog_index.parent)
         if parent_file is None:
             self.logger.warning("Could not find file for parent %s — skipping rollup", parent_id)

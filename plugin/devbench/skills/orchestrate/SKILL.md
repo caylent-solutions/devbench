@@ -18,6 +18,16 @@ Process the backlog using the steps below, repeating until all work units are do
    feature branch before the executor stages any files. Stashes and pops if the
    working tree is dirty.
 
+3b. Git state check — determine if implementation and review work are already complete:
+    a. Run `uv run devbench read-unit <id>` to get `repo_path` and the work unit `content`.
+    b. In `repo_path`, run `git diff --staged --name-only`.
+    c. If staged files exist: proceed to step 4.
+    d. If no staged files AND the work unit Comments contain REVIEW_PASS entries for
+       `code_review`, `test_review`, `doc_review`, and `changes_manifest` in the most
+       recent round: skip to step 8 (git-ops — implementation and reviews are done).
+    e. If no staged files AND reviews are not all present: proceed to step 4 (executor
+       did not stage its output — recovery run).
+
 4. Invoke `devbench:executor` with the unit ID.
 
 5. Invoke `review-supervisor` with the unit ID.

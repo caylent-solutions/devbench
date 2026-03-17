@@ -181,7 +181,7 @@ Up to 10 retry attempts before marking the unit as blocked.
 
 ### 11. Merge and Status Update
 
-- Agent merges the PR via `gh pr merge --delete-branch` using the strategy set by `JUDGE_MERGE_STRATEGY` (default: `squash`)
+- Agent merges the PR via `gh pr merge --delete-branch` using the strategy set by `merge_strategy` in `devbench.yaml` (default: `squash`)
 - Updates the parent repo's submodule reference
 - Marks the work unit as Done via `mark_done()` — enforces the done-gate before writing
 - The done-gate verifies all four required review judges (`code_review`, `test_review`, `doc_review`, `changes_manifest`) have a `[REVIEW_PASS]` entry in the most recent round; raises `RuntimeError` otherwise
@@ -244,9 +244,8 @@ git_ops:                             # optional — git workflow behaviour setti
 
 **Model configuration precedence** (first match wins, applied to both `CLAUDE_MODEL` and `EXECUTOR_MODEL`):
 1. `ANTHROPIC_MODEL` env var — silently overrides both models
-2. `JUDGE_CLAUDE_MODEL` env var — **deprecated**; populates both models with a WARNING
-3. `judge_model` / `executor_model` in YAML — sets each model independently
-4. Auth-dependent default env var: `JUDGE_DEFAULT_MODEL_DIRECT` (when `use_bedrock=false`) or `JUDGE_DEFAULT_MODEL_BEDROCK` (when `use_bedrock=true`). A `RuntimeError` is raised at startup if neither YAML field nor the applicable default env var is set.
+2. `judge_model` / `executor_model` in YAML — sets each model independently
+3. Auth-dependent default env var: `JUDGE_DEFAULT_MODEL_DIRECT` (when `use_bedrock=false`) or `JUDGE_DEFAULT_MODEL_BEDROCK` (when `use_bedrock=true`). A `RuntimeError` is raised at startup if neither YAML field nor the applicable default env var is set.
 
 **Auth (USE_BEDROCK) precedence:**
 1. `JUDGE_USE_BEDROCK` env var — overrides YAML value
@@ -264,12 +263,9 @@ Setting a timeout/limit env var to an empty string (`VAR=`) is a misconfiguratio
 | Variable | YAML Field | Schema Default | Description |
 |----------|------------|--------------|-------------|
 | `JUDGE_CONFIG_PATH` | — | *(see above)* | Override YAML config file path |
-| `JUDGE_MERGE_STRATEGY` | — | `squash` | PR merge strategy: `merge`, `squash`, or `rebase` |
 | `ANTHROPIC_MODEL` | — | *(YAML or default)* | Silently overrides both `CLAUDE_MODEL` and `EXECUTOR_MODEL` |
 | `JUDGE_DEFAULT_MODEL_DIRECT` | — | *(required when no YAML model and not using Bedrock)* | Default model ID for direct Anthropic API path. RuntimeError at startup if unset and no YAML model or `ANTHROPIC_MODEL` is configured. |
 | `JUDGE_DEFAULT_MODEL_BEDROCK` | — | *(required when no YAML model and using Bedrock)* | Default model ID for AWS Bedrock path. RuntimeError at startup if unset and no YAML model or `ANTHROPIC_MODEL` is configured. |
-| `JUDGE_CLAUDE_MODEL` | — | *(deprecated)* | **Deprecated.** Use `judge_model`/`executor_model` in YAML or `ANTHROPIC_MODEL` instead |
-| `JUDGE_GH_ORG` | — | *(deprecated)* | **Deprecated.** Use `allowed_orgs` in YAML instead |
 | `JUDGE_MAX_RETRIES` | `max_retries` | `10` | Max retry attempts per work unit before marking blocked |
 | `JUDGE_USE_BEDROCK` | `use_bedrock` | *(YAML value)* | Override `use_bedrock` from YAML. `1`/`true`/`yes` enables Bedrock |
 | `JUDGE_BEDROCK_REGION` | `bedrock_region` | *(required when use_bedrock=true)* | AWS region for Bedrock; falls back to `AWS_REGION`, then `bedrock_region` in YAML. RuntimeError if all absent and `use_bedrock=true`. |

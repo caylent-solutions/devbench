@@ -219,7 +219,7 @@ devbench/
 
 ## Configuration
 
-Required variables (`JUDGE_WORKSPACE_ROOT`, `JUDGE_CLAUDE_MODEL`) raise `RuntimeError` at startup if unset. Allowed repositories and per-repo settings (default branch, checkout directory) are defined in `backlog/config/devbench.yaml` (relative to `JUDGE_WORKSPACE_ROOT`) — copy `sample-config.yaml` as a starting point. See [SYSTEM-OVERVIEW.md](SYSTEM-OVERVIEW.md#environment-variables) for the full variable reference and YAML schema.
+The required variable `JUDGE_WORKSPACE_ROOT` raises `RuntimeError` at startup if unset. Allowed repositories, model identifiers, and per-repo settings are defined in `backlog/config/devbench.yaml` (relative to `JUDGE_WORKSPACE_ROOT`) — copy `sample-config.yaml` as a starting point. See [SYSTEM-OVERVIEW.md](SYSTEM-OVERVIEW.md#environment-variables) for the full variable reference and YAML schema.
 
 The `--config <path>` CLI flag (or `JUDGE_CONFIG_PATH` env var) overrides the default config file location.
 

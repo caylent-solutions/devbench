@@ -551,6 +551,7 @@ class BacklogManager:
 
         self._update_status(work_unit_path, canonical)
         self._update_backlog_index(backlog_index, unit_id, canonical)
+        self._update_status_summary(backlog_index)
         self.logger.info(
             "Set %s to '%s' in both work-unit file and BACKLOG.md",
             unit_id,
@@ -616,6 +617,236 @@ class BacklogManager:
         self.logger.info("All children of %s are done — rolling up status", parent_id)
         # _set_status: atomic write to both files; cascades via _rollup_parent_status.
         self._set_status(parent_file, backlog_index, parent_id, STATUS_DONE)
+
+    def _update_status_summary(self, backlog_index: Path) -> None:
+        """Rewrite the Status Summary table to match actual counts in the Full Work Unit Index.
+
+        Parses all Full Work Unit Index rows, groups by epic prefix, counts
+        done/in-progress/in-review/in-queue and feature/story/task counts per
+        epic, then rewrites each epic row and the **Total** row in the Status
+        Summary section.  If no Status Summary section is present in the file,
+        this method returns without modifying anything.
+
+        Args:
+            backlog_index: Path to the ``BACKLOG.md`` file.
+        """
+        content = backlog_index.read_text(encoding="utf-8")
+
+        summary_match = re.search(
+            r"^##\s+Status Summary\s*\n(.*?)(?=^##\s|\Z)",
+            content,
+            re.MULTILINE | re.DOTALL,
+        )
+        if summary_match is None:
+            return
+
+        # Parse the Status Summary header to discover which columns are present
+        # and their order so we can rewrite rows accurately.
+        summary_text = summary_match.group(1)
+        header_row, _ = self._parse_summary_table_rows(summary_text)
+        if not header_row:
+            return
+
+        # Build per-epic counts from the Full Work Unit Index.
+        rows_with_type = self._parse_index_rows_with_type(backlog_index)
+        epic_counts = self._compute_epic_counts(rows_with_type)
+
+        # Map column names to their positions in the header.
+        col_index: dict[str, int] = {name: i for i, name in enumerate(header_row)}
+
+        # Rewrite each data row in the Status Summary section.
+        updated_content = self._rewrite_summary_rows(
+            content, summary_match, col_index, epic_counts
+        )
+        backlog_index.write_text(updated_content, encoding="utf-8")
+
+    def _parse_index_rows_with_type(
+        self, backlog_index: Path
+    ) -> list[tuple[str, str, str]]:
+        """Parse Full Work Unit Index rows into (id, status, type) tuples.
+
+        Only rows with exactly 7 pipe-separated data columns (the standard index
+        row format) are included.  Header and separator rows are skipped.
+
+        Returns:
+            List of ``(unit_id, status, unit_type)`` where ``unit_type`` is the
+            raw string value from the Type column (e.g. ``"Task"``).
+        """
+        recognized_statuses = (
+            {v.lower() for v in TABLE_STATUS_VALUES} | {v.lower() for v in VALID_STATUSES}
+        )
+        content = backlog_index.read_text(encoding="utf-8")
+        result: list[tuple[str, str, str]] = []
+
+        for line in content.splitlines():
+            if not line.strip().startswith("|"):
+                continue
+            cells = [c.strip() for c in line.split("|")]
+            # Standard index rows: | ID | Title | Type | Status | Deps | Repo | Path |
+            # After split on |, cells has 9 elements (leading/trailing empty)
+            if len(cells) != 9:
+                continue
+            row_id = cells[1]
+            if not row_id or row_id.lower() == "id" or row_id.startswith("-"):
+                continue
+            unit_type = cells[3]
+            # Find the status cell (one of the recognized values)
+            status = ""
+            for cell in cells:
+                if cell.lower() in recognized_statuses:
+                    status = cell.lower()
+                    break
+            if not status or not unit_type:
+                continue
+            result.append((row_id, status, unit_type))
+
+        return result
+
+    @staticmethod
+    def _compute_epic_counts(
+        rows_with_type: list[tuple[str, str, str]],
+    ) -> dict[str, dict[str, int]]:
+        """Count features, stories, tasks, and per-status units per epic prefix.
+
+        Returns a dict mapping each epic prefix (e.g. ``"E26"``) to a nested
+        dict with keys ``"feature"``, ``"story"``, ``"task"``, ``"done"``,
+        ``"in-progress"``, ``"in-review"``, ``"in-queue"``.
+
+        Only Task/Story/Feature/Epic rows are counted.  The epic prefix is the
+        first hyphen-delimited segment of the unit ID (e.g. ``"E26"``).
+        """
+        counts: dict[str, dict[str, int]] = {}
+        type_key_map = {
+            "feature": "feature",
+            "story": "story",
+            "task": "task",
+        }
+        for unit_id, status, unit_type in rows_with_type:
+            prefix = unit_id.split("-")[0]
+            if not prefix:
+                continue
+            if prefix not in counts:
+                counts[prefix] = {
+                    "feature": 0,
+                    "story": 0,
+                    "task": 0,
+                    "done": 0,
+                    "in-progress": 0,
+                    "in-review": 0,
+                    "in-queue": 0,
+                }
+            type_lower = unit_type.lower()
+            if type_lower in type_key_map:
+                counts[prefix][type_key_map[type_lower]] += 1
+            if status in counts[prefix]:
+                counts[prefix][status] += 1
+
+        return counts
+
+    def _rewrite_summary_rows(
+        self,
+        content: str,
+        summary_match: re.Match[str],
+        col_index: dict[str, int],
+        epic_counts: dict[str, dict[str, int]],
+    ) -> str:
+        """Rewrite the epic data rows and **Total** row in the Status Summary section.
+
+        Only modifies lines within the Status Summary section that are table data
+        rows (not the header, not separator rows).  Returns the full updated file
+        content.
+
+        Args:
+            content: Full file content string.
+            summary_match: Regex match for the Status Summary section.
+            col_index: Mapping from lowercase column name to column position.
+            epic_counts: Per-epic counts from ``_compute_epic_counts``.
+        """
+        # Column name → count dict key mappings (display name → internal key)
+        display_to_key: dict[str, str] = {
+            "done": "done",
+            "in progress": "in-progress",
+            "in review": "in-review",
+            "in queue": "in-queue",
+            "features": "feature",
+            "stories": "story",
+            "tasks": "task",
+        }
+
+        summary_start = summary_match.start(1)
+        summary_end = summary_match.end(1)
+        summary_text = content[summary_start:summary_end]
+
+        # Build aggregate totals across all epics present in the summary.
+        # We collect epic IDs from the summary rows themselves so only epics
+        # that appear in the summary contribute to the Total row.
+        totals: dict[str, int] = dict.fromkeys(display_to_key.values(), 0)
+
+        rewritten_lines: list[str] = []
+        for line in summary_text.splitlines(keepends=True):
+            rewritten = self._rewrite_summary_line(
+                line, col_index, display_to_key, epic_counts, totals
+            )
+            rewritten_lines.append(rewritten)
+
+        updated_summary = "".join(rewritten_lines)
+        return content[:summary_start] + updated_summary + content[summary_end:]
+
+    @staticmethod
+    def _rewrite_summary_line(
+        line: str,
+        col_index: dict[str, int],
+        display_to_key: dict[str, str],
+        epic_counts: dict[str, dict[str, int]],
+        totals: dict[str, int],
+    ) -> str:
+        """Rewrite a single line of the Status Summary section if it is a data row.
+
+        Returns the line unchanged if it is not a table data row.  For epic rows
+        and the **Total** row, replaces count cells with the computed values and
+        accumulates totals in-place.
+
+        Args:
+            line: Raw line (with newline) from the Status Summary text block.
+            col_index: Lowercase column name → zero-based column position.
+            display_to_key: Display column name → internal count key mapping.
+            epic_counts: Per-epic computed counts from ``_compute_epic_counts``.
+            totals: Mutable aggregate totals dict accumulated across epic rows.
+        """
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            return line
+        raw_cells = stripped.split("|")
+        stripped_cells = [c.strip() for c in raw_cells]
+        # Skip separator rows
+        if all(set(c) <= {"-", " "} for c in stripped_cells if c):
+            return line
+        first_cell = stripped_cells[1] if len(stripped_cells) > 1 else ""
+        # Skip header row
+        if first_cell.lower() == "epic":
+            return line
+        is_total = "**total**" in first_cell.lower()
+        if not is_total:
+            epic_prefix = first_cell.strip("*").strip().split()[0]
+            if epic_prefix not in epic_counts:
+                return line
+            ec = epic_counts[epic_prefix]
+            cells = list(raw_cells)
+            for display_name, key in display_to_key.items():
+                if display_name in col_index:
+                    idx = col_index[display_name] + 1
+                    if idx < len(cells):
+                        cells[idx] = f" {ec.get(key, 0)} "
+                        totals[key] += ec.get(key, 0)
+            return "|".join(cells).rstrip("\n") + "\n"
+        # Total row
+        cells = list(raw_cells)
+        for display_name, key in display_to_key.items():
+            if display_name in col_index:
+                idx = col_index[display_name] + 1
+                if idx < len(cells):
+                    cells[idx] = f" **{totals.get(key, 0)}** "
+        return "|".join(cells).rstrip("\n") + "\n"
 
     def _parse_backlog_rows(self, backlog_index: Path) -> list[tuple[str, str, str]]:
         """Parse BACKLOG.md table rows into (id, status, file_path) tuples."""

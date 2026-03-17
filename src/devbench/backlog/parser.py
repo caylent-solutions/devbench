@@ -13,8 +13,9 @@ The parser recognises the full runtime status vocabulary:
 - ``in-review``    — agent has completed work and requested human review.
 - ``done``         — all judges passed, work is merged.
 - ``blocked``      — unit cannot proceed due to an unresolved blocker.
+- ``hold``         — unit is under debate or deferred; not actionable.
 
-All five values are valid in both the BACKLOG.md index and individual
+All six values are valid in both the BACKLOG.md index and individual
 work-unit files.  Status mismatches between the index and the file are
 logged as warnings; the file is the authoritative source of truth.
 """
@@ -39,6 +40,7 @@ from devbench.constants import (
     EPIC_PLACEHOLDER_ID,
     STATUS_BLOCKED,
     STATUS_DONE,
+    STATUS_HOLD,
     STATUS_IN_PROGRESS,
     STATUS_IN_QUEUE,
     STATUS_IN_REVIEW,
@@ -55,6 +57,7 @@ _RAW_STATUS_TO_ENUM: dict[str, WorkUnitStatus] = {
     STATUS_IN_REVIEW: WorkUnitStatus.IN_REVIEW,
     STATUS_DONE: WorkUnitStatus.DONE,
     STATUS_BLOCKED: WorkUnitStatus.BLOCKED,
+    STATUS_HOLD: WorkUnitStatus.HOLD,
 }
 
 # Pattern to determine work-unit type from the last segment of a compound ID.

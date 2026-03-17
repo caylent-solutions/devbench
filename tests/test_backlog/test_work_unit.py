@@ -27,9 +27,12 @@ class TestWorkUnitStatusEnum:
     def test_blocked_value(self) -> None:
         assert WorkUnitStatus.BLOCKED.value == "Blocked"
 
+    def test_hold_value(self) -> None:
+        assert WorkUnitStatus.HOLD.value == "Hold"
+
     def test_all_statuses_present(self) -> None:
         names = {s.name for s in WorkUnitStatus}
-        assert names == {"IN_QUEUE", "IN_PROGRESS", "IN_REVIEW", "DONE", "BLOCKED"}
+        assert names == {"IN_QUEUE", "IN_PROGRESS", "IN_REVIEW", "DONE", "BLOCKED", "HOLD"}
 
 
 class TestWorkUnitTypeEnum:

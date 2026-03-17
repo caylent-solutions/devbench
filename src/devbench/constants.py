@@ -51,7 +51,7 @@ SECURITY_ALERT_CATEGORIES: list[tuple[str, str]] = [
 # ---------------------------------------------------------------------------
 # Backlog status display values (used in CLI status summaries)
 # ---------------------------------------------------------------------------
-DISPLAY_STATUS_VALUES: list[str] = ["In Queue", "In Progress", "In Review", "Done", "Blocked"]
+DISPLAY_STATUS_VALUES: list[str] = ["In Queue", "In Progress", "In Review", "Done", "Blocked", "Hold"]
 
 # Backlog manager recognized status labels (title-case, as in markdown tables)
 TABLE_STATUS_VALUES: frozenset[str] = frozenset(
@@ -115,9 +115,10 @@ STATUS_IN_PROGRESS: str = "in-progress"
 STATUS_IN_REVIEW: str = "in-review"
 STATUS_DONE: str = "done"
 STATUS_BLOCKED: str = "blocked"
+STATUS_HOLD: str = "hold"
 
 # Statuses that require all deps to be 'done' before a unit may start.
-# Units with any other status (blocked, done, in-review) are exempt from
+# Units with any other status (blocked, done, in-review, hold) are exempt from
 # the dep-status check in BacklogManager.validate().
 DEP_STATUS_CHECK_STATUSES: frozenset[str] = frozenset({STATUS_IN_QUEUE, STATUS_IN_PROGRESS})
 
@@ -129,6 +130,7 @@ VALID_STATUSES: dict[str, str] = {
     STATUS_IN_REVIEW: STATUS_IN_REVIEW,
     STATUS_DONE: STATUS_DONE,
     STATUS_BLOCKED: STATUS_BLOCKED,
+    STATUS_HOLD: STATUS_HOLD,
 }
 
 # ---------------------------------------------------------------------------

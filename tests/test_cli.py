@@ -1758,3 +1758,73 @@ class TestCmdNextReadOnly:
         assert "Cannot claim" in captured.err
         assert "E0-F1-S1-T2" in captured.err
         mock_mgr.force_status.assert_not_called()
+
+
+class TestCmdSetStatusHold:
+    """Test that cmd_set_status accepts 'hold' as a valid target status.
+
+    AC-3: devbench set-status <id> hold succeeds.
+    AC-2: hold units are never returned by get_parallel_candidates().
+    """
+
+    def test_set_status_hold_accepted(
+        self,
+        mock_units: list[WorkUnit],
+        tmp_path: Path,
+        backlog_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """AC-3: cmd_set_status returns 0 and calls force_status when status is 'hold'.
+
+        Given: A valid unit ID and status value 'hold'
+        When: cmd_set_status is invoked
+        Then: Returns 0 (success), force_status is called with 'hold'
+        Spec: AC-3
+        """
+        wu_file = backlog_dir / "E0-F1-S1-T2.md"
+        wu_file.write_text("# E0-F1-S1-T2\n\n## Status: in-queue\n\n## Comments\n")
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+        mock_mgr = MagicMock()
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            with patch("devbench.cli.BACKLOG_ROOT", backlog_dir):
+                with patch("devbench.cli.BacklogManager", return_value=mock_mgr):
+                    result = cli.cmd_set_status("E0-F1-S1-T2", "hold")
+
+        assert result == 0
+        assert "hold" in capsys.readouterr().out
+        mock_mgr.force_status.assert_called_once()
+
+    def test_hold_excluded_from_parallel_candidates(
+        self, mock_units: list[WorkUnit], tmp_path: Path
+    ) -> None:
+        """AC-2: get_parallel_candidates never returns units with status 'hold'.
+
+        Given: A list of work units that includes one with status HOLD
+        When: get_parallel_candidates is called
+        Then: The HOLD unit is not in the returned candidates
+        Spec: AC-2
+        """
+        from devbench.backlog.parser import BacklogParser
+        from devbench.backlog.work_unit import WorkUnitStatus, WorkUnitType
+
+        hold_unit = WorkUnit(
+            id="E0-F1-S1-T99",
+            title="Hold Task",
+            status=WorkUnitStatus.HOLD,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T99.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+        units = [*mock_units, hold_unit]
+
+        parser = BacklogParser(backlog_root=tmp_path, backlog_index=tmp_path / "BACKLOG.md")
+        candidates = parser.get_parallel_candidates(units)
+
+        candidate_ids = [u.id for u in candidates]
+        assert "E0-F1-S1-T99" not in candidate_ids, (
+            "A unit with status 'hold' must never be returned by get_parallel_candidates"
+        )

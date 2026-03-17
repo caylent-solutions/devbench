@@ -53,9 +53,9 @@ Validation Checks
    ``duplicate branch '<name>' shared by: <id1>, <id2>, ...``
 
 The full runtime status vocabulary is: ``in-queue``, ``in-progress``,
-``in-review``, ``done``, ``blocked``.  All five values are valid in both the
-work-unit file and the BACKLOG.md index; status mismatches are reported
-regardless of which status value is involved.
+``in-review``, ``done``, ``blocked``, ``hold``.  All six values are valid in
+both the work-unit file and the BACKLOG.md index; status mismatches are
+reported regardless of which status value is involved.
 """
 
 import contextlib

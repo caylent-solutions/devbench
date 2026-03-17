@@ -22,6 +22,7 @@ class WorkUnitStatus(Enum):
     IN_REVIEW = "In Review"
     DONE = "Done"
     BLOCKED = "Blocked"
+    HOLD = "Hold"
 
 
 class WorkUnitType(Enum):

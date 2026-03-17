@@ -78,7 +78,6 @@ __all__ = [
     "RuntimeConfig",
     "TimeoutConfig",
     "get_configured_default_branch",
-    "get_repo_local_path",
     "get_repo_merge_strategy",
     "get_schema_default",
     "load_runtime_config",
@@ -182,11 +181,14 @@ class GitOpsConfig:
     update_submodule: bool = False
 
 
-@dataclass
+@dataclass(frozen=True)
 class RepoConfig:
     """Per-repository configuration.
 
     Attributes:
+        name: Fully-qualified repository name in ``org/repo`` format.
+        short_name: Repository short name (the part after ``/`` in ``org/repo``).
+        local_path: Absolute local filesystem path to the repository checkout.
         default_branch: Explicit default branch to use for this repo.
             When ``None``, branch consumers fall back to ``origin/HEAD``.
         checkout_directory: Path relative to ``JUDGE_WORKSPACE_ROOT`` where
@@ -197,6 +199,9 @@ class RepoConfig:
             the top-level ``RuntimeConfig.merge_strategy`` is used.
     """
 
+    name: str
+    short_name: str
+    local_path: Path
     default_branch: str | None = None
     checkout_directory: str | None = None
     merge_strategy: str | None = None
@@ -263,8 +268,10 @@ def resolve_config_path(
     return workspace_root / DEFAULT_CONFIG_SUBPATH
 
 
-def _parse_repo_config(path: Path, repo_name: str, repo_data: object) -> RepoConfig:
-    """Parse and validate a single repo entry from raw YAML.
+def _parse_repo_yaml_fields(
+    path: Path, repo_name: str, repo_data: object
+) -> tuple[str | None, str | None, str | None]:
+    """Parse and validate the YAML-sourced optional fields for a single repo entry.
 
     Args:
         path: Config file path (used in error messages).
@@ -272,23 +279,20 @@ def _parse_repo_config(path: Path, repo_name: str, repo_data: object) -> RepoCon
         repo_data: Raw value from YAML (may be None or a dict after schema validation).
 
     Returns:
-        ``RepoConfig`` populated from *repo_data*.
+        Tuple of ``(default_branch, checkout_directory, merge_strategy)``.
 
     Raises:
         ValueError: If *checkout_directory* is absolute or contains ``..``.
     """
     if not isinstance(repo_data, dict):
-        return RepoConfig()
+        return (None, None, None)
 
     default_branch: str | None = repo_data.get("default_branch")
     repo_merge_strategy: str | None = repo_data.get("merge_strategy")
 
     raw_checkout = repo_data.get("checkout_directory")
     if raw_checkout is None:
-        return RepoConfig(
-            default_branch=default_branch,
-            merge_strategy=repo_merge_strategy,
-        )
+        return (default_branch, None, repo_merge_strategy)
 
     if Path(raw_checkout).is_absolute():
         raise ValueError(
@@ -300,15 +304,11 @@ def _parse_repo_config(path: Path, repo_name: str, repo_data: object) -> RepoCon
             f"Config file '{path}': repos.{repo_name}.checkout_directory "
             f"must not contain parent traversal ('..'), got '{raw_checkout}'."
         )
-    return RepoConfig(
-        default_branch=default_branch,
-        checkout_directory=raw_checkout,
-        merge_strategy=repo_merge_strategy,
-    )
+    return (default_branch, raw_checkout, repo_merge_strategy)
 
 
 def _parse_repos(
-    path: Path, repos_raw: dict, allowed_orgs: list[str]
+    path: Path, repos_raw: dict, allowed_orgs: list[str], workspace_root: Path
 ) -> dict[str, RepoConfig]:
     """Build the repos mapping from the raw YAML ``repos`` block.
 
@@ -319,6 +319,8 @@ def _parse_repos(
         path: Config file path (used in error messages).
         repos_raw: Raw ``repos`` dict from YAML (already schema-validated).
         allowed_orgs: Permitted GitHub organisations.  Empty list means any org.
+        workspace_root: Absolute path to the workspace root; used to compute
+            each repo's ``local_path``.
 
     Returns:
         Mapping of ``org/repo`` → ``RepoConfig``.
@@ -336,11 +338,31 @@ def _parse_repos(
                     f"Config file '{path}': repo '{repo_name}' belongs to org '{org}', "
                     f"which is not in allowed_orgs: {allowed_orgs}."
                 )
-        repos[repo_name] = _parse_repo_config(path, repo_name, repo_data)
+        short_name = repo_name.split("/", maxsplit=1)[1] if "/" in repo_name else repo_name
+        default_branch, checkout_directory, merge_strategy = _parse_repo_yaml_fields(
+            path, repo_name, repo_data
+        )
+        local_path = (
+            workspace_root / checkout_directory
+            if checkout_directory
+            else workspace_root / short_name
+        )
+        repos[repo_name] = RepoConfig(
+            name=repo_name,
+            short_name=short_name,
+            local_path=local_path,
+            default_branch=default_branch,
+            checkout_directory=checkout_directory,
+            merge_strategy=merge_strategy,
+        )
     return repos
 
 
-def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
+def load_runtime_config(
+    path: Path,
+    _env: Mapping[str, str],
+    workspace_root: Path,
+) -> RuntimeConfig:
     """Load YAML at *path*, validate against JSON Schema, and return a ``RuntimeConfig``.
 
     Value precedence: YAML values override code defaults.  The ``_env`` argument
@@ -352,6 +374,8 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
     Args:
         path: Path to the YAML config file.  Must exist.
         _env: Environment variable mapping (accepted for API compatibility; not read).
+        workspace_root: Absolute path to the workspace root used to resolve each
+            repo's ``local_path``.
 
     Returns:
         ``RuntimeConfig`` populated from the YAML file.
@@ -388,7 +412,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         ) from exc
 
     allowed_orgs: list[str] = raw.get("allowed_orgs") or []
-    repos = _parse_repos(path, raw.get("repos") or {}, allowed_orgs)
+    repos = _parse_repos(path, raw.get("repos") or {}, allowed_orgs, workspace_root)
 
     # Populate TimeoutConfig from YAML timeouts block (absent keys yield None).
     timeouts_raw = raw.get("timeouts") or {}
@@ -434,29 +458,6 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         max_retries=raw.get("max_retries") or None,
     )
 
-
-def get_repo_local_path(repo: str, runtime_config: RuntimeConfig, workspace_root: Path) -> Path:
-    """Return the local filesystem path for *repo*.
-
-    Resolution order:
-    1. ``repos.<repo>.checkout_directory`` resolved relative to *workspace_root*.
-    2. ``workspace_root / <repo-short-name>`` (the part after the ``/`` in ``org/repo``).
-
-    Pure function — no subprocess calls, no I/O.
-
-    Args:
-        repo: Fully-qualified repository name (e.g. ``'org/repo'``).
-        runtime_config: Loaded runtime configuration.
-        workspace_root: Absolute path to the workspace root.
-
-    Returns:
-        Absolute path to the local checkout directory.
-    """
-    repo_config = runtime_config.repos.get(repo)
-    if repo_config and repo_config.checkout_directory:
-        return workspace_root / repo_config.checkout_directory
-    short_name = repo.split("/", maxsplit=1)[1] if "/" in repo else repo
-    return workspace_root / short_name
 
 
 def get_configured_default_branch(repo: str, runtime_config: RuntimeConfig) -> str | None:

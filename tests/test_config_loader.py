@@ -18,10 +18,36 @@ from devbench.config_loader import (
     RuntimeConfig,
     TimeoutConfig,
     get_configured_default_branch,
-    get_repo_local_path,
     load_runtime_config,
     resolve_config_path,
 )
+
+
+def _make_repo_config(
+    name: str = "org/repo",
+    *,
+    default_branch: str | None = None,
+    checkout_directory: str | None = None,
+    merge_strategy: str | None = None,
+    workspace_root: Path | None = None,
+) -> RepoConfig:
+    """Factory for RepoConfig test fixtures with all required fields populated.
+
+    ``local_path`` is derived from ``workspace_root / checkout_directory``
+    (or ``workspace_root / short_name`` when ``checkout_directory`` is None).
+    When ``workspace_root`` is not given, ``/tmp`` is used as a stand-in.
+    """
+    root = workspace_root or Path("/tmp")
+    short_name = name.split("/", maxsplit=1)[1] if "/" in name else name
+    local_path = root / checkout_directory if checkout_directory else root / short_name
+    return RepoConfig(
+        name=name,
+        short_name=short_name,
+        local_path=local_path,
+        default_branch=default_branch,
+        checkout_directory=checkout_directory,
+        merge_strategy=merge_strategy,
+    )
 
 # ---------------------------------------------------------------------------
 # resolve_config_path — AC-2
@@ -100,7 +126,7 @@ class TestLoadRuntimeConfig:
         """
         missing = tmp_path / "nonexistent.yaml"
         with pytest.raises(FileNotFoundError, match="DevBench config file not found"):
-            load_runtime_config(missing, {})
+            load_runtime_config(missing, {}, workspace_root=tmp_path)
 
     def test_raises_value_error_on_invalid_yaml(self, tmp_path: Path) -> None:
         """
@@ -111,7 +137,7 @@ class TestLoadRuntimeConfig:
         bad = tmp_path / "bad.yaml"
         bad.write_text("key: [\ninvalid", encoding="utf-8")
         with pytest.raises(ValueError, match="Invalid YAML"):
-            load_runtime_config(bad, {})
+            load_runtime_config(bad, {}, workspace_root=tmp_path)
 
     def test_raises_value_error_when_repos_missing(self, tmp_path: Path) -> None:
         """
@@ -121,7 +147,7 @@ class TestLoadRuntimeConfig:
         """
         cfg = self._write_yaml(tmp_path / "cfg.yaml", "env:\n  FOO: bar\n")
         with pytest.raises(ValueError):
-            load_runtime_config(cfg, {})
+            load_runtime_config(cfg, {}, workspace_root=tmp_path)
 
     def test_raises_value_error_when_repos_empty(self, tmp_path: Path) -> None:
         """
@@ -131,7 +157,7 @@ class TestLoadRuntimeConfig:
         """
         cfg = self._write_yaml(tmp_path / "cfg.yaml", "repos: {}\n")
         with pytest.raises(ValueError):
-            load_runtime_config(cfg, {})
+            load_runtime_config(cfg, {}, workspace_root=tmp_path)
 
     def test_raises_value_error_on_invalid_repo_key_format(self, tmp_path: Path) -> None:
         """
@@ -144,7 +170,7 @@ class TestLoadRuntimeConfig:
             "repos:\n  notavalidrepo:\n    default_branch: main\n",
         )
         with pytest.raises(ValueError, match="notavalidrepo"):
-            load_runtime_config(cfg, {})
+            load_runtime_config(cfg, {}, workspace_root=tmp_path)
 
     def test_parses_single_repo_without_default_branch(self, tmp_path: Path) -> None:
         """
@@ -153,7 +179,7 @@ class TestLoadRuntimeConfig:
         Then: RepoConfig.default_branch is None
         """
         cfg = self._write_yaml(tmp_path / "cfg.yaml", "repos:\n  org/repo:\n")
-        result = load_runtime_config(cfg, {})
+        result = load_runtime_config(cfg, {}, workspace_root=tmp_path)
         assert "org/repo" in result.repos, "Expected 'org/repo' in repos"
         assert result.repos["org/repo"].default_branch is None, (
             "Expected default_branch to be None when not specified in YAML"
@@ -169,7 +195,7 @@ class TestLoadRuntimeConfig:
             tmp_path / "cfg.yaml",
             "repos:\n  org/repo:\n    default_branch: main2\n",
         )
-        result = load_runtime_config(cfg, {})
+        result = load_runtime_config(cfg, {}, workspace_root=tmp_path)
         assert result.repos["org/repo"].default_branch == "main2", (
             f"Expected default_branch='main2', got {result.repos['org/repo'].default_branch!r}"
         )
@@ -190,7 +216,7 @@ class TestLoadRuntimeConfig:
                 "    default_branch: develop\n"
             ),
         )
-        result = load_runtime_config(cfg, {})
+        result = load_runtime_config(cfg, {}, workspace_root=tmp_path)
         assert set(result.repos) == {"org/repo-a", "org/repo-b"}, (
             f"Expected repos {{org/repo-a, org/repo-b}}, got {set(result.repos)}"
         )
@@ -208,7 +234,7 @@ class TestLoadRuntimeConfig:
         Then: a RuntimeConfig instance is returned
         """
         cfg = self._write_yaml(tmp_path / "cfg.yaml", "repos:\n  org/r:\n")
-        result = load_runtime_config(cfg, {})
+        result = load_runtime_config(cfg, {}, workspace_root=tmp_path)
         assert isinstance(result, RuntimeConfig), (
             f"Expected RuntimeConfig instance, got {type(result).__name__}"
         )
@@ -224,7 +250,7 @@ class TestLoadRuntimeConfig:
             "repos:\n  org/repo:\n    default_branch: 42\n",
         )
         with pytest.raises(ValueError, match="string"):
-            load_runtime_config(cfg, {})
+            load_runtime_config(cfg, {}, workspace_root=tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +268,7 @@ class TestGetConfiguredDefaultBranch:
         When: get_configured_default_branch is called
         Then: the configured branch string is returned
         """
-        config = RuntimeConfig(repos={"org/repo": RepoConfig(default_branch="main2")})
+        config = RuntimeConfig(repos={"org/repo": _make_repo_config("org/repo", default_branch="main2")})
         result = get_configured_default_branch("org/repo", config)
         assert result == "main2", f"Expected 'main2', got {result!r}"
 
@@ -252,7 +278,7 @@ class TestGetConfiguredDefaultBranch:
         When: get_configured_default_branch is called
         Then: None is returned
         """
-        config = RuntimeConfig(repos={"org/repo": RepoConfig(default_branch=None)})
+        config = RuntimeConfig(repos={"org/repo": _make_repo_config("org/repo", default_branch=None)})
         result = get_configured_default_branch("org/repo", config)
         assert result is None, f"Expected None for repo with no branch, got {result!r}"
 
@@ -282,13 +308,13 @@ class TestDataclasses:
         assert cfg.repos == {}, f"Expected empty dict, got {cfg.repos!r}"
 
     def test_repo_config_default_branch_none(self) -> None:
-        """RepoConfig() has default_branch=None."""
-        rc = RepoConfig()
+        """RepoConfig has default_branch=None when not specified."""
+        rc = _make_repo_config()
         assert rc.default_branch is None, f"Expected None, got {rc.default_branch!r}"
 
     def test_repo_config_checkout_directory_none_by_default(self) -> None:
-        """RepoConfig() has checkout_directory=None by default."""
-        rc = RepoConfig()
+        """RepoConfig has checkout_directory=None when not specified."""
+        rc = _make_repo_config()
         assert rc.checkout_directory is None, (
             f"Expected checkout_directory=None, got {rc.checkout_directory!r}"
         )
@@ -322,7 +348,7 @@ class TestCheckoutDirectory:
                 checkout_directory: my-checkout
             """,
         )
-        result = load_runtime_config(cfg, {})
+        result = load_runtime_config(cfg, {}, workspace_root=tmp_path)
         assert result.repos["org/repo"].checkout_directory == "my-checkout", (
             f"Expected 'my-checkout', got {result.repos['org/repo'].checkout_directory!r}"
         )
@@ -337,7 +363,7 @@ class TestCheckoutDirectory:
             tmp_path / "cfg.yaml",
             "repos:\n  org/repo:\n    default_branch: main\n",
         )
-        result = load_runtime_config(cfg, {})
+        result = load_runtime_config(cfg, {}, workspace_root=tmp_path)
         assert result.repos["org/repo"].checkout_directory is None, (
             "Expected checkout_directory=None when not specified"
         )
@@ -361,68 +387,74 @@ class TestCheckoutDirectory:
             f"repos:\n  org/repo:\n    checkout_directory: {yaml_value}\n",
         )
         with pytest.raises(ValueError, match=match):
-            load_runtime_config(cfg, {})
+            load_runtime_config(cfg, {}, workspace_root=tmp_path)
 
 
 # ---------------------------------------------------------------------------
-# get_repo_local_path — AC-2, AC-5
+# RepoConfig.local_path — AC-2 (replaces former get_repo_local_path tests)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
-class TestGetRepoLocalPath:
-    """AC-2 and AC-5: get_repo_local_path returns checkout_directory or falls back to short name."""
+class TestRepoConfigLocalPath:
+    """AC-2: load_runtime_config populates RepoConfig.local_path from workspace_root."""
 
     def test_uses_checkout_directory_resolved_to_workspace(self, tmp_path: Path) -> None:
         """
-        Given: a repo config with checkout_directory='custom-checkout'
-        When: get_repo_local_path is called
-        Then: the path is workspace_root / 'custom-checkout'
+        Given: a repo with checkout_directory='custom-checkout'
+        When: load_runtime_config is called with workspace_root=tmp_path
+        Then: RepoConfig.local_path == workspace_root / 'custom-checkout'
         """
-        config = RuntimeConfig(
-            repos={"org/my-repo": RepoConfig(checkout_directory="custom-checkout")}
+        cfg = tmp_path / "cfg.yaml"
+        cfg.write_text(
+            "repos:\n  org/my-repo:\n    checkout_directory: custom-checkout\n",
+            encoding="utf-8",
         )
-        result = get_repo_local_path("org/my-repo", config, tmp_path)
-        assert result == tmp_path / "custom-checkout", (
-            f"Expected {tmp_path / 'custom-checkout'}, got {result}"
+        result = load_runtime_config(cfg, {}, workspace_root=tmp_path)
+        assert result.repos["org/my-repo"].local_path == tmp_path / "custom-checkout", (
+            f"Expected {tmp_path / 'custom-checkout'}, "
+            f"got {result.repos['org/my-repo'].local_path}"
         )
 
     def test_falls_back_to_repo_short_name(self, tmp_path: Path) -> None:
         """
-        Given: a repo config with no checkout_directory
-        When: get_repo_local_path is called
-        Then: the path is workspace_root / short-name
+        Given: a repo with no checkout_directory
+        When: load_runtime_config is called with workspace_root=tmp_path
+        Then: RepoConfig.local_path == workspace_root / short-name
         """
-        config = RuntimeConfig(repos={"org/my-repo": RepoConfig()})
-        result = get_repo_local_path("org/my-repo", config, tmp_path)
-        assert result == tmp_path / "my-repo", (
-            f"Expected {tmp_path / 'my-repo'}, got {result}"
+        cfg = tmp_path / "cfg.yaml"
+        cfg.write_text("repos:\n  org/my-repo:\n", encoding="utf-8")
+        result = load_runtime_config(cfg, {}, workspace_root=tmp_path)
+        assert result.repos["org/my-repo"].local_path == tmp_path / "my-repo", (
+            f"Expected {tmp_path / 'my-repo'}, "
+            f"got {result.repos['org/my-repo'].local_path}"
         )
 
-    def test_falls_back_when_repo_not_in_config(self, tmp_path: Path) -> None:
-        """
-        Given: a RuntimeConfig with no repos
-        When: get_repo_local_path is called for a repo not in config
-        Then: the path falls back to workspace_root / short-name
-        """
-        config = RuntimeConfig(repos={})
-        result = get_repo_local_path("org/unknown-repo", config, tmp_path)
-        assert result == tmp_path / "unknown-repo", (
-            f"Expected {tmp_path / 'unknown-repo'}, got {result}"
-        )
+    def test_repo_config_is_frozen(self) -> None:
+        """AC-1: RepoConfig is frozen — attempting to set a field raises FrozenInstanceError."""
+        import dataclasses
 
-    def test_checkout_directory_none_uses_short_name(self, tmp_path: Path) -> None:
-        """
-        Given: a repo config with explicit checkout_directory=None
-        When: get_repo_local_path is called
-        Then: the path falls back to workspace_root / short-name
-        """
-        config = RuntimeConfig(
-            repos={"org/my-repo": RepoConfig(checkout_directory=None)}
-        )
-        result = get_repo_local_path("org/my-repo", config, tmp_path)
-        assert result == tmp_path / "my-repo", (
-            f"Expected {tmp_path / 'my-repo'}, got {result}"
+        rc = _make_repo_config()
+        with pytest.raises((dataclasses.FrozenInstanceError, AttributeError)):
+            rc.default_branch = "should-fail"  # type: ignore[misc]
+
+    def test_repo_config_requires_name_field(self) -> None:
+        """AC-1: Constructing RepoConfig without required positional fields raises TypeError."""
+        with pytest.raises(TypeError):
+            RepoConfig()  # type: ignore[call-arg]
+
+    def test_repo_config_is_hashable(self) -> None:
+        """AC-1: Frozen RepoConfig instances are hashable (can be used in sets/dicts)."""
+        rc = _make_repo_config()
+        assert hash(rc) is not None
+        s = {rc}
+        assert rc in s
+
+    def test_repo_config_merge_strategy_accessible(self) -> None:
+        """AC-8: RepoConfig.merge_strategy is accessible (present from E9)."""
+        rc = _make_repo_config(merge_strategy="squash")
+        assert rc.merge_strategy == "squash", (
+            f"Expected merge_strategy='squash', got {rc.merge_strategy!r}"
         )
 
 
@@ -456,7 +488,7 @@ class TestJsonSchemaValidation:
             """,
         )
         with pytest.raises(ValueError, match="typo_key"):
-            load_runtime_config(cfg, {})
+            load_runtime_config(cfg, {}, workspace_root=tmp_path)
 
     def test_schema_rejects_unknown_repo_field(self, tmp_path: Path) -> None:
         """
@@ -474,7 +506,7 @@ class TestJsonSchemaValidation:
             """,
         )
         with pytest.raises(ValueError, match="unknown_field"):
-            load_runtime_config(cfg, {})
+            load_runtime_config(cfg, {}, workspace_root=tmp_path)
 
     def test_schema_enforces_org_repo_key_format(self, tmp_path: Path) -> None:
         """
@@ -491,7 +523,7 @@ class TestJsonSchemaValidation:
             """,
         )
         with pytest.raises(ValueError, match="notavalidrepo"):
-            load_runtime_config(cfg, {})
+            load_runtime_config(cfg, {}, workspace_root=tmp_path)
 
     def test_schema_rejects_invalid_merge_strategy(self, tmp_path: Path) -> None:
         """
@@ -509,7 +541,7 @@ class TestJsonSchemaValidation:
             """,
         )
         with pytest.raises(ValueError):
-            load_runtime_config(cfg, {})
+            load_runtime_config(cfg, {}, workspace_root=tmp_path)
 
     def test_schema_rejects_non_integer_timeout(self, tmp_path: Path) -> None:
         """
@@ -528,7 +560,7 @@ class TestJsonSchemaValidation:
             """,
         )
         with pytest.raises(ValueError):
-            load_runtime_config(cfg, {})
+            load_runtime_config(cfg, {}, workspace_root=tmp_path)
 
     def test_schema_rejects_zero_timeout(self, tmp_path: Path) -> None:
         """
@@ -547,7 +579,7 @@ class TestJsonSchemaValidation:
             """,
         )
         with pytest.raises(ValueError):
-            load_runtime_config(cfg, {})
+            load_runtime_config(cfg, {}, workspace_root=tmp_path)
 
     def test_loader_raises_valueerror_with_jsonschema_message(self, tmp_path: Path) -> None:
         """
@@ -565,7 +597,7 @@ class TestJsonSchemaValidation:
             """,
         )
         with pytest.raises(ValueError, match="unknown_key"):
-            load_runtime_config(cfg, {})
+            load_runtime_config(cfg, {}, workspace_root=tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -650,7 +682,7 @@ class TestRuntimeConfigPopulation:
               test: 600
             """,
         )
-        result = load_runtime_config(cfg, {})
+        result = load_runtime_config(cfg, {}, workspace_root=tmp_path)
         assert result.timeouts.gh_api == 45, f"Expected gh_api=45, got {result.timeouts.gh_api!r}"
         assert result.timeouts.test == 600, f"Expected test=600, got {result.timeouts.test!r}"
         assert result.timeouts.llm is None, (
@@ -674,7 +706,7 @@ class TestRuntimeConfigPopulation:
               output_truncation: 4000
             """,
         )
-        result = load_runtime_config(cfg, {})
+        result = load_runtime_config(cfg, {}, workspace_root=tmp_path)
         assert result.limits.alert_summary == 20, (
             f"Expected alert_summary=20, got {result.limits.alert_summary!r}"
         )
@@ -703,7 +735,7 @@ class TestRuntimeConfigPopulation:
             bedrock_region: us-west-2
             """,
         )
-        result = load_runtime_config(cfg, {})
+        result = load_runtime_config(cfg, {}, workspace_root=tmp_path)
         assert result.merge_strategy == "merge", (
             f"Expected merge_strategy='merge', got {result.merge_strategy!r}"
         )
@@ -727,7 +759,7 @@ class TestRuntimeConfigPopulation:
                 default_branch: main
             """,
         )
-        result = load_runtime_config(cfg, {})
+        result = load_runtime_config(cfg, {}, workspace_root=tmp_path)
         assert result.merge_strategy is None, (
             f"Expected merge_strategy=None when absent from YAML, got {result.merge_strategy!r}"
         )
@@ -765,7 +797,7 @@ class TestRuntimeConfigPopulation:
                 merge_strategy: rebase
             """,
         )
-        result = load_runtime_config(cfg, {})
+        result = load_runtime_config(cfg, {}, workspace_root=tmp_path)
         assert result.repos["org/repo"].merge_strategy == "rebase", (
             f"Expected merge_strategy='rebase', got {result.repos['org/repo'].merge_strategy!r}"
         )
@@ -784,7 +816,7 @@ class TestRuntimeConfigPopulation:
                 default_branch: main
             """,
         )
-        result = load_runtime_config(cfg, {})
+        result = load_runtime_config(cfg, {}, workspace_root=tmp_path)
         assert result.repos["org/repo"].merge_strategy is None, (
             f"Expected merge_strategy=None, got {result.repos['org/repo'].merge_strategy!r}"
         )
@@ -875,7 +907,7 @@ class TestPostSchemaValidation:
             """,
         )
         with pytest.raises(ValueError, match=error_match):
-            load_runtime_config(cfg, {})
+            load_runtime_config(cfg, {}, workspace_root=tmp_path)
 
     def test_ac8_repo_org_not_in_allowed_orgs_raises(self, tmp_path: Path) -> None:
         """
@@ -894,7 +926,7 @@ class TestPostSchemaValidation:
             """,
         )
         with pytest.raises(ValueError, match="other-org"):
-            load_runtime_config(cfg, {})
+            load_runtime_config(cfg, {}, workspace_root=tmp_path)
 
     def test_ac8_repo_org_in_allowed_orgs_accepted(self, tmp_path: Path) -> None:
         """
@@ -912,7 +944,7 @@ class TestPostSchemaValidation:
                 default_branch: main
             """,
         )
-        result = load_runtime_config(cfg, {})
+        result = load_runtime_config(cfg, {}, workspace_root=tmp_path)
         assert "permitted-org/repo" in result.repos, (
             f"Expected 'permitted-org/repo' in repos, got {set(result.repos)}"
         )
@@ -931,7 +963,7 @@ class TestPostSchemaValidation:
                 default_branch: main
             """,
         )
-        result = load_runtime_config(cfg, {})
+        result = load_runtime_config(cfg, {}, workspace_root=tmp_path)
         assert "any-org/repo" in result.repos, (
             f"Expected 'any-org/repo' in repos, got {set(result.repos)}"
         )
@@ -988,7 +1020,7 @@ class TestGitOpsConfig:
         from devbench.config_loader import load_runtime_config
 
         cfg = self._write_config(tmp_path, "repos:\n  caylent-solutions/devbench:\n")
-        result = load_runtime_config(cfg, {})
+        result = load_runtime_config(cfg, {}, workspace_root=tmp_path)
         assert result.git_ops.update_submodule is False
 
     def test_update_submodule_defaults_to_false_when_field_absent(self, tmp_path: Path) -> None:
@@ -999,7 +1031,7 @@ class TestGitOpsConfig:
             tmp_path,
             "repos:\n  caylent-solutions/devbench:\ngit_ops: {}\n",
         )
-        result = load_runtime_config(cfg, {})
+        result = load_runtime_config(cfg, {}, workspace_root=tmp_path)
         assert result.git_ops.update_submodule is False
 
     def test_update_submodule_true_from_yaml(self, tmp_path: Path) -> None:
@@ -1010,7 +1042,7 @@ class TestGitOpsConfig:
             tmp_path,
             "repos:\n  caylent-solutions/devbench:\ngit_ops:\n  update_submodule: true\n",
         )
-        result = load_runtime_config(cfg, {})
+        result = load_runtime_config(cfg, {}, workspace_root=tmp_path)
         assert result.git_ops.update_submodule is True
 
     def test_schema_rejects_non_boolean_update_submodule(self, tmp_path: Path) -> None:
@@ -1022,7 +1054,7 @@ class TestGitOpsConfig:
             "repos:\n  caylent-solutions/devbench:\ngit_ops:\n  update_submodule: yes-please\n",
         )
         with pytest.raises(ValueError, match="schema validation"):
-            load_runtime_config(cfg, {})
+            load_runtime_config(cfg, {}, workspace_root=tmp_path)
 
     def test_schema_rejects_unknown_git_ops_keys(self, tmp_path: Path) -> None:
         """AC-6: unknown keys inside git_ops are rejected by schema (additionalProperties: false)."""
@@ -1033,4 +1065,4 @@ class TestGitOpsConfig:
             "repos:\n  caylent-solutions/devbench:\ngit_ops:\n  unknown_key: true\n",
         )
         with pytest.raises(ValueError, match="schema validation"):
-            load_runtime_config(cfg, {})
+            load_runtime_config(cfg, {}, workspace_root=tmp_path)

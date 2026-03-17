@@ -9,7 +9,7 @@ import logging
 import subprocess
 from dataclasses import dataclass, field
 
-from devbench.config import ALLOWED_REPOS, GH_API_TIMEOUT, get_gh_token, validate_repo
+from devbench.config import GH_API_TIMEOUT, REPO_CONFIGS, get_gh_token, validate_repo
 from devbench.constants import SECURITY_ALERT_CATEGORIES
 
 logger = logging.getLogger(__name__)
@@ -179,8 +179,8 @@ def get_security_report(repo: str) -> SecurityReport:
 
 
 def setup_all_repos() -> dict[str, dict[str, bool]]:
-    """Enable security features on all allowed repositories."""
+    """Enable security features on all configured repositories."""
     results = {}
-    for repo in sorted(ALLOWED_REPOS):
+    for repo in sorted(REPO_CONFIGS):
         results[repo] = enable_security_features(repo)
     return results

@@ -14,10 +14,8 @@ from devbench.config import (
     EXECUTOR_MAX_TURNS,
     EXECUTOR_MODEL,
     EXECUTOR_TIMEOUT,
-    REPO_LOCAL_PATHS,
     USE_BEDROCK,
     resolve_repo,
-    validate_repo,
 )
 from devbench.constants import (
     CLAUDE_CODE_USE_BEDROCK_ENV_KEY,
@@ -99,11 +97,8 @@ def execute(
         )
 
     effective_timeout = timeout_seconds if timeout_seconds is not None else EXECUTOR_TIMEOUT
-    repo = resolve_repo(repo)
-    validate_repo(repo)
-    repo_path = REPO_LOCAL_PATHS.get(repo)
-    if repo_path is None:
-        raise ValueError(f"No local path configured for repo: {repo}")
+    repo_config = resolve_repo(repo)
+    repo_path = repo_config.local_path
 
     prompt = _build_prompt(work_unit_path, repo_path, feedback)
 

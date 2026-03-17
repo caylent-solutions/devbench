@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import pytest
 
+from devbench.config_loader import RepoConfig
 from devbench.constants import CLAUDE_CODE_USE_BEDROCK_ENV_KEY
 from devbench.execution.executor import (
     ExecutionResult,
@@ -169,15 +170,14 @@ class TestExecute:
                 repo="evil-org/bad-repo",
             )
 
-    def test_execute_raises_for_missing_local_path(self) -> None:
+    def test_execute_raises_for_unrecognised_repo(self) -> None:
         from devbench.execution.executor import execute
 
-        with patch("devbench.execution.executor.REPO_LOCAL_PATHS", {}):
-            with pytest.raises(ValueError, match="No local path"):
-                execute(
-                    work_unit_path=Path("/tmp/task.md"),
-                    repo="caylent-solutions/git-repo",
-                )
+        with pytest.raises(ValueError, match="not recognised"):
+            execute(
+                work_unit_path=Path("/tmp/task.md"),
+                repo="evil-org/bad-repo",
+            )
 
     def test_execute_returns_in_review_on_success(self, tmp_path: Path) -> None:
         from devbench.execution.executor import execute
@@ -195,8 +195,13 @@ class TestExecute:
             },
         )()
 
+        _repo_config = RepoConfig(
+            name="caylent-solutions/git-repo",
+            short_name="git-repo",
+            local_path=tmp_path,
+        )
         with (
-            patch("devbench.execution.executor.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.execution.executor.resolve_repo", return_value=_repo_config),
             patch("subprocess.run", return_value=mock_result),
         ):
             result = execute(
@@ -222,8 +227,13 @@ class TestExecute:
             },
         )()
 
+        _repo_config = RepoConfig(
+            name="caylent-solutions/git-repo",
+            short_name="git-repo",
+            local_path=tmp_path,
+        )
         with (
-            patch("devbench.execution.executor.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.execution.executor.resolve_repo", return_value=_repo_config),
             patch("subprocess.run", return_value=mock_result),
         ):
             result = execute(
@@ -242,8 +252,13 @@ class TestExecute:
         wu_file = tmp_path / "task.md"
         wu_file.write_text("## Status: In Queue\n")
 
+        _repo_config = RepoConfig(
+            name="caylent-solutions/git-repo",
+            short_name="git-repo",
+            local_path=tmp_path,
+        )
         with (
-            patch("devbench.execution.executor.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.execution.executor.resolve_repo", return_value=_repo_config),
             patch("subprocess.run", side_effect=sp.TimeoutExpired(cmd="claude", timeout=10)),
         ):
             result = execute(
@@ -276,8 +291,13 @@ class TestExecute:
             captured_env.update(kwargs.get("env") or {})
             return mock_result
 
+        _repo_config = RepoConfig(
+            name="caylent-solutions/git-repo",
+            short_name="git-repo",
+            local_path=tmp_path,
+        )
         with (
-            patch("devbench.execution.executor.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.execution.executor.resolve_repo", return_value=_repo_config),
             patch("devbench.execution.executor.USE_BEDROCK", True),
             patch("devbench.execution.executor.EXECUTOR_MODEL", "bedrock-model"),
             patch("subprocess.run", side_effect=capture_run),
@@ -310,8 +330,13 @@ class TestExecute:
             captured_env.update(kwargs.get("env") or {})
             return mock_result
 
+        _repo_config = RepoConfig(
+            name="caylent-solutions/git-repo",
+            short_name="git-repo",
+            local_path=tmp_path,
+        )
         with (
-            patch("devbench.execution.executor.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.execution.executor.resolve_repo", return_value=_repo_config),
             patch("devbench.execution.executor.USE_BEDROCK", False),
             patch("devbench.execution.executor.EXECUTOR_MODEL", "direct-model"),
             patch("subprocess.run", side_effect=capture_run),
@@ -344,8 +369,13 @@ class TestExecute:
             captured_cmd.extend(cmd)
             return mock_result
 
+        _repo_config = RepoConfig(
+            name="caylent-solutions/git-repo",
+            short_name="git-repo",
+            local_path=tmp_path,
+        )
         with (
-            patch("devbench.execution.executor.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.execution.executor.resolve_repo", return_value=_repo_config),
             patch("devbench.execution.executor.USE_BEDROCK", False),
             patch("devbench.execution.executor.EXECUTOR_MODEL", "my-executor-model"),
             patch("subprocess.run", side_effect=capture_run),

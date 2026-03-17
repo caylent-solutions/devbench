@@ -464,11 +464,19 @@ class TestCmdReview:
 
         mock_mgr = MagicMock()
 
+        from devbench.config_loader import RepoConfig
+
+        mock_repo_config = RepoConfig(
+            name="caylent-solutions/git-repo",
+            short_name="git-repo",
+            local_path=tmp_path,
+        )
+
         with patch("devbench.cli.BacklogParser", return_value=mock_parser):
             with patch("devbench.cli.BACKLOG_ROOT", backlog_dir):
                 with patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
                     with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
-                        with patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+                        with patch("devbench.cli.resolve_repo", return_value=mock_repo_config):
                             with patch("devbench.cli.BacklogManager", return_value=mock_mgr):
                                 with patch("devbench.cli.CodeReviewJudge", return_value=mock_judge):
                                     with patch("devbench.cli.TestReviewJudge", return_value=mock_judge):
@@ -545,15 +553,15 @@ class TestCmdSecurityReview:
 
         assert result == 1
 
-    def test_returns_1_when_no_repo_path(self, mock_units: list[WorkUnit]) -> None:
+    def test_raises_for_unknown_repo(self, mock_units: list[WorkUnit]) -> None:
+        """resolve_repo raises ValueError for unrecognised repos (fail-fast)."""
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = mock_units
 
         with patch("devbench.cli.BacklogParser", return_value=mock_parser):
-            with patch("devbench.cli.REPO_LOCAL_PATHS", {}):
-                result = cli.cmd_security_review("E0-F1-S1-T2")
-
-        assert result == 1
+            with patch("devbench.cli.resolve_repo", side_effect=ValueError("not recognised")):
+                with pytest.raises(ValueError, match="not recognised"):
+                    cli.cmd_security_review("E0-F1-S1-T2")
 
     def test_returns_0_when_pass(
         self, mock_units: list[WorkUnit], tmp_path: Path, backlog_dir: Path, capsys: pytest.CaptureFixture[str]
@@ -574,9 +582,17 @@ class TestCmdSecurityReview:
         mock_judge = MagicMock()
         mock_judge.evaluate.return_value = pass_result
 
+        from devbench.config_loader import RepoConfig
+
+        mock_repo_config = RepoConfig(
+            name="caylent-solutions/git-repo",
+            short_name="git-repo",
+            local_path=tmp_path,
+        )
+
         with patch("devbench.cli.BacklogParser", return_value=mock_parser):
             with patch("devbench.cli.BACKLOG_ROOT", backlog_dir):
-                with patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+                with patch("devbench.cli.resolve_repo", return_value=mock_repo_config):
                     with patch("devbench.cli.SecurityReviewJudge", return_value=mock_judge):
                         result = cli.cmd_security_review("E0-F1-S1-T2")
 
@@ -676,17 +692,17 @@ class TestCmdMarkDone:
 
 
 class TestCmdReviewNoRepoPath:
-    """Test cmd_review when repo path is missing."""
+    """Test cmd_review raises for unrecognised repos."""
 
-    def test_returns_1_when_no_repo_path(self, mock_units: list[WorkUnit]) -> None:
+    def test_raises_for_unknown_repo(self, mock_units: list[WorkUnit]) -> None:
+        """resolve_repo raises ValueError for unrecognised repos (fail-fast)."""
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = mock_units
 
         with patch("devbench.cli.BacklogParser", return_value=mock_parser):
-            with patch("devbench.cli.REPO_LOCAL_PATHS", {}):
-                result = cli.cmd_review("E0-F1-S1-T2")
-
-        assert result == 1
+            with patch("devbench.cli.resolve_repo", side_effect=ValueError("not recognised")):
+                with pytest.raises(ValueError, match="not recognised"):
+                    cli.cmd_review("E0-F1-S1-T2")
 
 
 class TestGetPriorFeedback:
@@ -766,19 +782,25 @@ class TestCmdReviewWritesComments:
         mock_parser.parse_index.return_value = mock_units
         mock_mgr = MagicMock()
 
+        from devbench.config_loader import RepoConfig
+
+        mock_repo_config = RepoConfig(
+            name="caylent-solutions/git-repo",
+            short_name="git-repo",
+            local_path=tmp_path,
+        )
+
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
             patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
             patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
-            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.cli.resolve_repo", return_value=mock_repo_config),
             patch("devbench.cli.BacklogManager", return_value=mock_mgr),
             patch("devbench.cli.CodeReviewJudge", return_value=mock_judges[0]),
             patch("devbench.cli.TestReviewJudge", return_value=mock_judges[1]),
             patch("devbench.cli.DocReviewJudge", return_value=mock_judges[2]),
             patch("devbench.cli.ChangesManifestJudge", return_value=mock_judges[3]),
-            patch("devbench.cli.resolve_repo", return_value="caylent-solutions/git-repo"),
-            patch("devbench.cli.validate_repo"),
         ):
             result = cli.cmd_review("E0-F1-S1-T2")
 
@@ -819,18 +841,24 @@ class TestCmdReviewWritesComments:
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = mock_units
 
+        from devbench.config_loader import RepoConfig
+
+        mock_repo_config = RepoConfig(
+            name="caylent-solutions/git-repo",
+            short_name="git-repo",
+            local_path=tmp_path,
+        )
+
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
             patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
             patch("devbench.cli.BACKLOG_INDEX", backlog_index),
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
-            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.cli.resolve_repo", return_value=mock_repo_config),
             patch("devbench.cli.CodeReviewJudge", return_value=mock_judges[0]),
             patch("devbench.cli.TestReviewJudge", return_value=mock_judges[1]),
             patch("devbench.cli.DocReviewJudge", return_value=mock_judges[2]),
             patch("devbench.cli.ChangesManifestJudge", return_value=mock_judges[3]),
-            patch("devbench.cli.resolve_repo", return_value="caylent-solutions/git-repo"),
-            patch("devbench.cli.validate_repo"),
         ):
             review_result = cli.cmd_review("E0-F1-S1-T2")
 

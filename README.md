@@ -165,7 +165,7 @@ make clean                # Remove caches
 devbench/
 ├── src/devbench/                  ← Installable package (pip install -e .)
 │   ├── cli.py                     ← CLI entry point (devbench <command>)
-│   ├── config.py                  ← Environment-driven configuration (all env vars)
+│   ├── config.py                  ← Environment-driven configuration; exposes REPO_CONFIGS (single repo lookup map replacing ALLOWED_REPOS/REPO_LOCAL_PATHS/REPO_SHORT_TO_FULL), resolve_repo(), validate_repo(), and all runtime settings
 │   ├── config_loader.py           ← YAML config parser and schema validator (parse/validate only — no env var access)
 │   ├── constants.py               ← Centralized structural constants (regex, formats)
 │   ├── log_setup.py               ← Dual logging (stdout + file)

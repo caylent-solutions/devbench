@@ -16,11 +16,10 @@ from devbench.config import (
     MAX_RETRY_ATTEMPTS,
     ORCHESTRATOR_POLL_INTERVAL,
     OUTPUT_TRUNCATION_LIMIT,
-    REPO_LOCAL_PATHS,
     UPDATE_SUBMODULE,
     resolve_repo,
-    validate_repo,
 )
+from devbench.config_loader import RepoConfig
 from devbench.constants import PR_BODY_TEMPLATE, STATUS_IN_PROGRESS
 from devbench.execution import executor as claude_executor
 from devbench.execution.executor import ExecutionStatus
@@ -50,8 +49,7 @@ def _format_judge_feedback(verdicts: list[tuple[str, JudgeResult]]) -> str:
 
 def _run_executor_and_review(
     work_unit: WorkUnit,
-    repo_path: Path,
-    repo: str,
+    repo_config: RepoConfig,
     attempt: int,
     feedback: str,
     blocker_judge: BlockerResolverJudge,
@@ -65,7 +63,7 @@ def _run_executor_and_review(
     """
     result = claude_executor.execute(
         work_unit_path=work_unit.file_path,
-        repo=repo,
+        repo=repo_config.name,
         feedback=feedback,
     )
 
@@ -77,7 +75,7 @@ def _run_executor_and_review(
         )
         blocker_result = blocker_judge.evaluate(
             work_unit_path=work_unit.file_path,
-            repo_path=repo_path,
+            repo_path=repo_config.local_path,
         )
         if blocker_result.verdict == Verdict.FAIL:
             logger.warning(
@@ -93,8 +91,8 @@ def _run_executor_and_review(
         work_unit.log_comment("orchestrator", "AGENT_FAILED", f"Attempt {attempt} failed")
         return f"Previous attempt failed. Output: {result.output[:OUTPUT_TRUNCATION_LIMIT]}"
 
-    # Status is IN_REVIEW — run judges
-    verdicts = run_review_judges(work_unit, repo_path, repo=repo)
+    # Status is IN_REVIEW — run judges (signature unchanged: repo: str, repo_path: Path)
+    verdicts = run_review_judges(work_unit, repo_config.local_path, repo=repo_config.name)
     all_passed = all(v.verdict == Verdict.PASS for _, v in verdicts)
 
     if not all_passed:
@@ -109,8 +107,8 @@ def _run_executor_and_review(
     logger.info("All review judges passed for %s, checking security", work_unit.id)
     security_result = security_judge.evaluate(
         work_unit_path=work_unit.file_path,
-        repo_path=repo_path,
-        repo=repo,
+        repo_path=repo_config.local_path,
+        repo=repo_config.name,
     )
     if security_result.verdict == Verdict.FAIL:
         work_unit.log_comment(
@@ -182,13 +180,9 @@ def process_work_unit(work_unit: WorkUnit) -> bool:
 
     Returns True if the work unit was completed successfully.
     """
-    # Canonicalize once: resolve short name (e.g. "git-repo") to full "org/repo"
-    # so all downstream calls use the consistent fully-qualified name.
-    canonical_repo = resolve_repo(work_unit.repo)
-    validate_repo(canonical_repo)
-    repo_path = REPO_LOCAL_PATHS.get(canonical_repo)
-    if repo_path is None:
-        raise ValueError(f"No local path for repo: {canonical_repo}")
+    # Resolve once: short name (e.g. "git-repo") or fully-qualified → RepoConfig.
+    # All downstream calls use repo_config directly.
+    repo_config = resolve_repo(work_unit.repo)
 
     git_ops = GitOpsJudge()
     security_judge = SecurityReviewJudge()
@@ -220,14 +214,12 @@ def process_work_unit(work_unit: WorkUnit) -> bool:
         )
 
         git_ops.ensure_branch(
-            repo=canonical_repo,
-            repo_path=repo_path,
+            repo_config=repo_config,
             branch=branch,
         )
 
         if git_ops.is_committed_and_pushed(
-            repo=canonical_repo,
-            repo_path=repo_path,
+            repo_config=repo_config,
             branch=branch,
         ):
             logger.info(
@@ -236,8 +228,7 @@ def process_work_unit(work_unit: WorkUnit) -> bool:
         else:
             retry_feedback = _run_executor_and_review(
                 work_unit=work_unit,
-                repo_path=repo_path,
-                repo=canonical_repo,
+                repo_config=repo_config,
                 attempt=attempt,
                 feedback=feedback,
                 blocker_judge=blocker_judge,
@@ -250,20 +241,18 @@ def process_work_unit(work_unit: WorkUnit) -> bool:
         # Commit, push, create PR, wait for checks, merge
         try:
             git_ops.commit_and_push(
-                repo=canonical_repo,
-                repo_path=repo_path,
+                repo_config=repo_config,
                 branch=branch,
                 message=f"{work_unit.id}: {work_unit.title}",
             )
             pr_url = git_ops.create_pr(
-                repo=canonical_repo,
+                repo_config=repo_config,
                 branch=branch,
                 title=f"{work_unit.id}: {work_unit.title}",
                 body=PR_BODY_TEMPLATE.format(
                     unit_id=work_unit.id,
                     description=work_unit.description[:OUTPUT_TRUNCATION_LIMIT],
                 ),
-                repo_path=repo_path,
             )
             work_unit.log_comment("judge/git_ops", "PR_CREATED", pr_url)
 
@@ -271,9 +260,8 @@ def process_work_unit(work_unit: WorkUnit) -> bool:
             pr_number = int(pr_url.rstrip("/").split("/")[-1])
 
             checks_passed = git_ops.wait_for_checks(
-                repo=canonical_repo,
+                repo_config=repo_config,
                 pr_number=pr_number,
-                repo_path=repo_path,
             )
             # Gate: CI must pass before merge. wait_for_checks returns True for
             # rc==0 (all pass) or rc!=0 with "no checks reported" (no CI configured).
@@ -283,7 +271,7 @@ def process_work_unit(work_unit: WorkUnit) -> bool:
                 continue
 
             try:
-                git_ops.merge_pr(repo=canonical_repo, pr_number=pr_number, repo_path=repo_path)
+                git_ops.merge_pr(repo_config=repo_config, pr_number=pr_number)
             except RuntimeError as merge_exc:
                 if "not mergeable" not in str(merge_exc):
                     raise
@@ -296,24 +284,22 @@ def process_work_unit(work_unit: WorkUnit) -> bool:
                 # if either fails, the exception propagates to the outer except which
                 # breaks the retry loop (terminal failure).
                 git_ops.rebase_onto_default(
-                    repo=canonical_repo,
-                    repo_path=repo_path,
+                    repo_config=repo_config,
                     branch=branch,
                 )
-                git_ops.merge_pr(repo=canonical_repo, pr_number=pr_number, repo_path=repo_path)
+                git_ops.merge_pr(repo_config=repo_config, pr_number=pr_number)
             work_unit.log_comment("judge/git_ops", "PR_MERGED", pr_url)
 
-            git_ops.checkout_default_branch(repo=canonical_repo, repo_path=repo_path)
+            git_ops.checkout_default_branch(repo_config=repo_config)
 
             # Update parent repo's submodule reference — opt-in via git_ops.update_submodule
             if UPDATE_SUBMODULE:
                 git_ops.update_parent_submodule_ref(
-                    repo=canonical_repo,
-                    repo_path=repo_path,
-                    message=f"{work_unit.id}: update {repo_path.name} submodule ref",
+                    repo_config=repo_config,
+                    message=f"{work_unit.id}: update {repo_config.local_path.name} submodule ref",
                 )
                 work_unit.log_comment(
-                    "judge/git_ops", "SUBMODULE_UPDATED", repo_path.name,
+                    "judge/git_ops", "SUBMODULE_UPDATED", repo_config.local_path.name,
                 )
 
         except Exception as exc:

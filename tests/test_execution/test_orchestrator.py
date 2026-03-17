@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
+from devbench.config_loader import RepoConfig
 from devbench.execution.executor import ExecutionResult, ExecutionStatus
 from devbench.judges.base import JudgeResult, Verdict
 
@@ -32,6 +33,15 @@ def _make_unit(
         branch=f"backlog/{unit_id.lower()}",
         dependencies=[],
         description="Test description",
+    )
+
+
+def _make_repo_config(local_path: Path) -> RepoConfig:
+    """Factory for a test RepoConfig with the given local_path."""
+    return RepoConfig(
+        name="caylent-solutions/git-repo",
+        short_name="git-repo",
+        local_path=local_path,
     )
 
 
@@ -123,7 +133,7 @@ class TestProcessWorkUnit:
         mock_git_ops.wait_for_checks.return_value = True
         mock_mgr = MagicMock()
 
-        with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+        with patch(f"{_ORC}.resolve_repo", return_value=_make_repo_config(tmp_path)):
             with patch(f"{_ORC}.claude_executor") as mock_exec:
                 mock_exec.execute.return_value = exec_result
                 with patch(f"{_ORC}.CodeReviewJudge", return_value=mock_judge):
@@ -155,7 +165,7 @@ class TestProcessWorkUnit:
         mock_git_ops = MagicMock()
         mock_git_ops.is_committed_and_pushed.return_value = False
 
-        with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+        with patch(f"{_ORC}.resolve_repo", return_value=_make_repo_config(tmp_path)):
             with patch(f"{_ORC}.claude_executor") as mock_exec:
                 mock_exec.execute.return_value = exec_result
                 with patch(f"{_ORC}.GitOpsJudge", return_value=mock_git_ops):
@@ -191,7 +201,7 @@ class TestProcessWorkUnit:
                 return blocked_result
             return failed_result
 
-        with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+        with patch(f"{_ORC}.resolve_repo", return_value=_make_repo_config(tmp_path)):
             with patch(f"{_ORC}.claude_executor") as mock_exec:
                 mock_exec.execute.side_effect = exec_side_effect
                 with patch(f"{_ORC}.GitOpsJudge", return_value=mock_git_ops):
@@ -229,7 +239,7 @@ class TestProcessWorkUnit:
         mock_git_ops.wait_for_checks.return_value = True
         mock_mgr = MagicMock()
 
-        with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+        with patch(f"{_ORC}.resolve_repo", return_value=_make_repo_config(tmp_path)):
             with patch(f"{_ORC}.claude_executor") as mock_exec:
                 mock_exec.execute.return_value = exec_result
                 with patch(f"{_ORC}.CodeReviewJudge", return_value=mock_judge):
@@ -244,10 +254,12 @@ class TestProcessWorkUnit:
                                                     result = process_work_unit(unit)
 
         assert result is True
-        # All git ops called with canonical full repo name
+        # All git ops called with a RepoConfig whose name is the canonical full repo name
         mock_git_ops.commit_and_push.assert_called_once()
         call_kwargs = mock_git_ops.commit_and_push.call_args
-        assert call_kwargs.kwargs.get("repo") == "caylent-solutions/git-repo"
+        repo_config_arg = call_kwargs.kwargs.get("repo_config")
+        assert repo_config_arg is not None
+        assert repo_config_arg.name == "caylent-solutions/git-repo"
 
     def test_commit_and_push_uses_spec_branch(self, tmp_path: Path) -> None:
         """commit_and_push receives the branch from the work unit spec, not the template."""
@@ -265,7 +277,7 @@ class TestProcessWorkUnit:
         mock_git_ops.wait_for_checks.return_value = True
         mock_mgr = MagicMock()
 
-        with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+        with patch(f"{_ORC}.resolve_repo", return_value=_make_repo_config(tmp_path)):
             with patch(f"{_ORC}.claude_executor") as mock_exec:
                 mock_exec.execute.return_value = exec_result
                 with patch(f"{_ORC}.CodeReviewJudge", return_value=mock_judge):
@@ -301,7 +313,7 @@ class TestProcessWorkUnit:
         mock_git_ops.wait_for_checks.return_value = True
         mock_mgr = MagicMock()
 
-        with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+        with patch(f"{_ORC}.resolve_repo", return_value=_make_repo_config(tmp_path)):
             with patch(f"{_ORC}.claude_executor") as mock_exec:
                 mock_exec.execute.return_value = exec_result
                 with patch(f"{_ORC}.CodeReviewJudge", return_value=mock_judge):
@@ -326,8 +338,8 @@ class TestProcessWorkUnit:
 
         unit = _make_unit(tmp_path)
 
-        with patch(f"{_ORC}.REPO_LOCAL_PATHS", {}):
-            with pytest.raises(ValueError, match="No local path"):
+        with patch(f"{_ORC}.resolve_repo", side_effect=ValueError("not recognised")):
+            with pytest.raises(ValueError, match="not recognised"):
                 process_work_unit(unit)
 
     def test_raises_when_branch_is_empty(self, tmp_path: Path) -> None:
@@ -337,7 +349,7 @@ class TestProcessWorkUnit:
         unit = _make_unit(tmp_path)
         unit.branch = ""  # simulate a WorkUnit not populated by BacklogParser
 
-        with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+        with patch(f"{_ORC}.resolve_repo", return_value=_make_repo_config(tmp_path)):
             with patch(f"{_ORC}.GitOpsJudge"):
                 with patch(f"{_ORC}.BacklogManager"):
                     with patch(f"{_ORC}.BlockerResolverJudge"):
@@ -373,7 +385,7 @@ class TestProcessWorkUnit:
 
         mock_mgr = MagicMock()
 
-        with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+        with patch(f"{_ORC}.resolve_repo", return_value=_make_repo_config(tmp_path)):
             with patch(f"{_ORC}.claude_executor") as mock_exec:
                 mock_exec.execute.side_effect = execute_side_effect
                 with patch(f"{_ORC}.CodeReviewJudge", return_value=mock_judge):
@@ -422,7 +434,7 @@ class TestProcessWorkUnit:
 
             return factory
 
-        with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+        with patch(f"{_ORC}.resolve_repo", return_value=_make_repo_config(tmp_path)):
             with patch(f"{_ORC}.claude_executor") as mock_exec:
                 mock_exec.execute.return_value = exec_result
                 with patch(f"{_ORC}.CodeReviewJudge", side_effect=make_judge_factory("code")):
@@ -460,7 +472,7 @@ class TestProcessWorkUnit:
         mock_git_ops.create_pr.return_value = "https://github.com/org/repo/pull/1"
         mock_git_ops.wait_for_checks.return_value = True
 
-        with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+        with patch(f"{_ORC}.resolve_repo", return_value=_make_repo_config(tmp_path)):
             with patch(f"{_ORC}.claude_executor") as mock_exec:
                 mock_exec.execute.return_value = exec_result
                 with patch(f"{_ORC}.CodeReviewJudge", return_value=mock_review_judge):
@@ -495,7 +507,7 @@ class TestProcessWorkUnit:
         mock_git_ops = MagicMock()
         mock_git_ops.is_committed_and_pushed.return_value = False
 
-        with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+        with patch(f"{_ORC}.resolve_repo", return_value=_make_repo_config(tmp_path)):
             with patch(f"{_ORC}.claude_executor") as mock_exec:
                 mock_exec.execute.return_value = exec_result
                 with patch(f"{_ORC}.CodeReviewJudge", return_value=mock_review_judge):
@@ -532,7 +544,7 @@ class TestProcessWorkUnit:
         mock_git_ops = MagicMock()
         mock_git_ops.is_committed_and_pushed.return_value = False
 
-        with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+        with patch(f"{_ORC}.resolve_repo", return_value=_make_repo_config(tmp_path)):
             with patch(f"{_ORC}.claude_executor") as mock_exec:
                 mock_exec.execute.return_value = exec_result
                 with patch(f"{_ORC}.CodeReviewJudge", return_value=mock_review_judge):
@@ -567,7 +579,7 @@ class TestProcessWorkUnit:
         mock_git_ops = MagicMock()
         mock_git_ops.commit_and_push.side_effect = RuntimeError("push failed")
 
-        with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+        with patch(f"{_ORC}.resolve_repo", return_value=_make_repo_config(tmp_path)):
             with patch(f"{_ORC}.claude_executor") as mock_exec:
                 mock_exec.execute.return_value = exec_result
                 with patch(f"{_ORC}.CodeReviewJudge", return_value=mock_judge):
@@ -599,7 +611,7 @@ class TestProcessWorkUnit:
         mock_git_ops.create_pr.return_value = "https://github.com/org/repo/pull/1"
         mock_git_ops.wait_for_checks.return_value = False
 
-        with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+        with patch(f"{_ORC}.resolve_repo", return_value=_make_repo_config(tmp_path)):
             with patch(f"{_ORC}.claude_executor") as mock_exec:
                 mock_exec.execute.return_value = exec_result
                 with patch(f"{_ORC}.CodeReviewJudge", return_value=mock_judge):
@@ -639,7 +651,7 @@ class TestProcessWorkUnit:
             execute_calls.append(dict(kwargs))
             return exec_result
 
-        with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+        with patch(f"{_ORC}.resolve_repo", return_value=_make_repo_config(tmp_path)):
             with patch(f"{_ORC}.claude_executor") as mock_exec:
                 mock_exec.execute.side_effect = capture_execute
                 with patch(f"{_ORC}.CodeReviewJudge", return_value=mock_judge):
@@ -677,7 +689,7 @@ class TestProcessWorkUnit:
         mock_git_ops.wait_for_checks.return_value = True
         mock_mgr = MagicMock()
 
-        with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+        with patch(f"{_ORC}.resolve_repo", return_value=_make_repo_config(tmp_path)):
             with patch(f"{_ORC}.claude_executor") as mock_exec:
                 mock_exec.execute.return_value = exec_result
                 with patch(f"{_ORC}.CodeReviewJudge", return_value=mock_judge):
@@ -709,7 +721,7 @@ class TestProcessWorkUnit:
         mock_git_ops.wait_for_checks.return_value = True
         mock_mgr = MagicMock()
 
-        with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+        with patch(f"{_ORC}.resolve_repo", return_value=_make_repo_config(tmp_path)):
             with patch(f"{_ORC}.UPDATE_SUBMODULE", False):
                 with patch(f"{_ORC}.claude_executor") as mock_exec:
                     mock_exec.execute.return_value = exec_result
@@ -742,7 +754,7 @@ class TestProcessWorkUnit:
         mock_git_ops.wait_for_checks.return_value = True
         mock_mgr = MagicMock()
 
-        with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+        with patch(f"{_ORC}.resolve_repo", return_value=_make_repo_config(tmp_path)):
             with patch(f"{_ORC}.UPDATE_SUBMODULE", True):
                 with patch(f"{_ORC}.claude_executor") as mock_exec:
                     mock_exec.execute.return_value = exec_result
@@ -785,7 +797,7 @@ class TestSkipReviewWhenCommittedAndPushed:
         mock_judge.name = "security"
         mock_judge.evaluate.return_value = _pass_result("security")
 
-        with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+        with patch(f"{_ORC}.resolve_repo", return_value=_make_repo_config(tmp_path)):
             with patch(f"{_ORC}.claude_executor") as mock_exec:
                 with patch(f"{_ORC}.SecurityReviewJudge", return_value=mock_judge):
                     with patch(f"{_ORC}.GitOpsJudge", return_value=mock_git_ops):
@@ -822,7 +834,7 @@ class TestSkipReviewWhenCommittedAndPushed:
         mock_judge.name = "mock"
         mock_judge.evaluate.return_value = _pass_result("mock")
 
-        with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+        with patch(f"{_ORC}.resolve_repo", return_value=_make_repo_config(tmp_path)):
             with patch(f"{_ORC}.claude_executor") as mock_exec:
                 mock_exec.execute.return_value = exec_result
                 with patch(f"{_ORC}.CodeReviewJudge", return_value=mock_judge):
@@ -879,7 +891,7 @@ class TestFeedbackPropagation:
                 return fail_judge
             return pass_judge
 
-        with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+        with patch(f"{_ORC}.resolve_repo", return_value=_make_repo_config(tmp_path)):
             with patch(f"{_ORC}.claude_executor") as mock_exec:
                 mock_exec.execute.side_effect = capture_execute
                 with patch(f"{_ORC}.CodeReviewJudge", side_effect=make_judge):
@@ -928,7 +940,7 @@ class TestFeedbackPropagation:
                 return blocked_result
             return failed_result
 
-        with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+        with patch(f"{_ORC}.resolve_repo", return_value=_make_repo_config(tmp_path)):
             with patch(f"{_ORC}.claude_executor") as mock_exec:
                 mock_exec.execute.side_effect = capture_execute
                 with patch(f"{_ORC}.GitOpsJudge", return_value=mock_git_ops):
@@ -958,7 +970,7 @@ def _patch_process_work_unit(
     Yields the mock executor so callers can set return values or assert calls.
     """
     effective_mgr = mock_mgr if mock_mgr is not None else MagicMock()
-    with patch(f"{_ORC}.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}):
+    with patch(f"{_ORC}.resolve_repo", return_value=_make_repo_config(tmp_path)):
         with patch(f"{_ORC}.claude_executor") as mock_exec:
             with patch(f"{_ORC}.CodeReviewJudge", return_value=mock_judge):
                 with patch(f"{_ORC}.TestReviewJudge", return_value=mock_judge):

@@ -15,12 +15,13 @@ relative to ``JUDGE_WORKSPACE_ROOT``).
 import json
 import logging
 import os
+import types
 from enum import StrEnum
 from pathlib import Path
 
 from devbench.config_loader import (
+    RepoConfig,
     RuntimeConfig,
-    get_repo_local_path,
     get_schema_default,
     load_runtime_config,
     resolve_config_path,
@@ -50,7 +51,7 @@ WORKSPACE_ROOT: Path = Path(_workspace_root)
 # ---------------------------------------------------------------------------
 # Resolve config path and load YAML.  Fails fast if the file cannot be found.
 _config_path: Path = resolve_config_path(None, os.environ, WORKSPACE_ROOT)
-RUNTIME_CONFIG: RuntimeConfig = load_runtime_config(_config_path, os.environ)
+RUNTIME_CONFIG: RuntimeConfig = load_runtime_config(_config_path, os.environ, WORKSPACE_ROOT)
 
 # ---------------------------------------------------------------------------
 # Allowed orgs — sourced exclusively from YAML allowed_orgs.
@@ -58,36 +59,50 @@ RUNTIME_CONFIG: RuntimeConfig = load_runtime_config(_config_path, os.environ)
 ALLOWED_GH_ORGS: list[str] = list(RUNTIME_CONFIG.allowed_orgs)
 
 # ---------------------------------------------------------------------------
-# Allowed repos — sourced exclusively from YAML config.
+# REPO_CONFIGS — single lookup map from fully-qualified repo name → RepoConfig.
+# Replaces the former ALLOWED_REPOS, REPO_LOCAL_PATHS, and REPO_SHORT_TO_FULL.
+# Exposed as a read-only mapping to prevent accidental mutation.
 # ---------------------------------------------------------------------------
-ALLOWED_REPOS: frozenset[str] = frozenset(RUNTIME_CONFIG.repos)
+REPO_CONFIGS: types.MappingProxyType[str, RepoConfig] = types.MappingProxyType(
+    dict(RUNTIME_CONFIG.repos)
+)
 
-REPO_LOCAL_PATHS: dict[str, Path] = {
-    repo: get_repo_local_path(repo, RUNTIME_CONFIG, WORKSPACE_ROOT) for repo in ALLOWED_REPOS
-}
+# Internal short-name → RepoConfig index for resolve_repo.
+# Fail-fast: raise at startup if two repos share the same short name.
+_short_to_config: dict[str, RepoConfig] = {}
+for _rc in REPO_CONFIGS.values():
+    if _rc.short_name in _short_to_config:
+        raise RuntimeError(
+            f"Short-name collision: repos '{_short_to_config[_rc.short_name].name}' and "
+            f"'{_rc.name}' both have short name '{_rc.short_name}'. "
+            "Rename one repo's checkout_directory in devbench.yaml to resolve the conflict."
+        )
+    _short_to_config[_rc.short_name] = _rc
+_REPO_SHORT_TO_CONFIG: types.MappingProxyType[str, RepoConfig] = types.MappingProxyType(
+    _short_to_config
+)
 
-# Short name -> full name mapping for backlog compatibility.
-# The backlog table uses short names (e.g., "git-repo") while the allow-list
-# uses fully-qualified names (e.g., "caylent-solutions/git-repo").
-REPO_SHORT_TO_FULL: dict[str, str] = {
-    repo.split("/", maxsplit=1)[1]: repo for repo in ALLOWED_REPOS
-}
 
+def resolve_repo(short_or_full: str) -> RepoConfig:
+    """Resolve a short or fully-qualified repo name to its ``RepoConfig``.
 
-def resolve_repo(short_or_full: str) -> str:
-    """Resolve a short repo name to its fully-qualified form.
+    If the name is already fully-qualified (present in ``REPO_CONFIGS``), the
+    corresponding ``RepoConfig`` is returned directly.  If it is a short name
+    (the part after ``/`` in ``org/repo``), the matching ``RepoConfig`` is
+    returned.
 
-    If the name is already fully-qualified, it is returned as-is.
-    Raises ``ValueError`` if the name cannot be resolved.
+    Raises:
+        ValueError: If the name cannot be resolved to any known repository.
     """
-    if short_or_full in ALLOWED_REPOS:
-        return short_or_full
-    full = REPO_SHORT_TO_FULL.get(short_or_full)
-    if full is not None:
-        return full
+    if short_or_full in REPO_CONFIGS:
+        return REPO_CONFIGS[short_or_full]
+    config = _REPO_SHORT_TO_CONFIG.get(short_or_full)
+    if config is not None:
+        return config
     raise ValueError(
         f"Repository '{short_or_full}' is not recognised. "
-        f"Allowed: {sorted(ALLOWED_REPOS)} or short names: {sorted(REPO_SHORT_TO_FULL)}"
+        f"Known repos: {sorted(REPO_CONFIGS)} "
+        f"or short names: {sorted(_REPO_SHORT_TO_CONFIG)}"
     )
 
 
@@ -349,21 +364,28 @@ CLAUDE_CREDENTIALS_FILE: Path = Path(
 )
 
 
-def validate_repo(repo: str) -> None:
+def validate_repo(repo: str | RepoConfig) -> None:
     """Raise ``ValueError`` if *repo* is not in the allow-list or from a disallowed org.
+
+    Accepts either a fully-qualified repo name string (``'org/repo'``) or a
+    ``RepoConfig`` instance (defense-in-depth for mixed callers).
 
     When ``allowed_orgs`` is non-empty (from YAML ``allowed_orgs``),
     also validates that the repo's org is in that list.
     """
-    if ALLOWED_GH_ORGS and "/" in repo:
-        org = repo.split("/", maxsplit=1)[0]
+    repo_name: str = repo.name if isinstance(repo, RepoConfig) else repo
+    if ALLOWED_GH_ORGS and "/" in repo_name:
+        org = repo_name.split("/", maxsplit=1)[0]
         if org not in ALLOWED_GH_ORGS:
             raise ValueError(
-                f"Repository '{repo}' belongs to org '{org}', "
+                f"Repository '{repo_name}' belongs to org '{org}', "
                 f"which is not in allowed_orgs: {ALLOWED_GH_ORGS}."
             )
-    if repo not in ALLOWED_REPOS:
-        raise ValueError(f"Repository '{repo}' is not allowed. Allowed repositories: {sorted(ALLOWED_REPOS)}")
+    if repo_name not in REPO_CONFIGS:
+        raise ValueError(
+            f"Repository '{repo_name}' is not allowed. "
+            f"Allowed repositories: {sorted(REPO_CONFIGS)}"
+        )
 
 
 def get_anthropic_api_key() -> str:

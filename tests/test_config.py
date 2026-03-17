@@ -12,8 +12,8 @@ from unittest.mock import patch
 import pytest
 
 from devbench import config
-from devbench.config import ALLOWED_REPOS, validate_repo
-from devbench.config_loader import get_schema_default
+from devbench.config import REPO_CONFIGS, validate_repo
+from devbench.config_loader import RepoConfig, get_schema_default
 
 # ---------------------------------------------------------------------------
 # Test constants derived from the test fixture (tests/fixtures/test_devbench.yaml)
@@ -21,71 +21,78 @@ from devbench.config_loader import get_schema_default
 # The fixture defines repos under "caylent-solutions"; these constants mirror that.
 # ---------------------------------------------------------------------------
 _FIXTURE_ORG = "caylent-solutions"
-_ALLOWED_REPO_IN_FIXTURE = f"{_FIXTURE_ORG}/git-repo"
-# Repo absent from ALLOWED_REPOS but from an org that IS in allowed_orgs,
+_KNOWN_REPO_IN_FIXTURE = f"{_FIXTURE_ORG}/git-repo"
+# Repo absent from REPO_CONFIGS but from an org that IS in allowed_orgs,
 # so the "not allowed" (repo-level) error is raised rather than the org-level error.
 _UNKNOWN_REPO = f"{_FIXTURE_ORG}/unknown-sentinel-repo"
 _WRONG_ORG_REPO = "wrong-org/git-repo"  # org not matching _FIXTURE_ORG
 
 
 @pytest.mark.unit
-class TestAllowedRepos:
-    """Verify ALLOWED_REPOS is driven exclusively by YAML config."""
+class TestRepoConfigs:
+    """Verify REPO_CONFIGS is a read-only MappingProxyType driven exclusively by YAML config."""
 
-    def test_judge_allowed_repos_is_frozenset(self) -> None:
-        assert isinstance(ALLOWED_REPOS, frozenset), (
-            f"Expected ALLOWED_REPOS to be a frozenset, got {type(ALLOWED_REPOS).__name__}"
+    def test_repo_configs_is_mapping_proxy(self) -> None:
+        import types
+
+        assert isinstance(REPO_CONFIGS, types.MappingProxyType), (
+            f"Expected REPO_CONFIGS to be a MappingProxyType, got {type(REPO_CONFIGS).__name__}"
         )
 
-    def test_allowed_repos_from_yaml(self) -> None:
-        """ALLOWED_REPOS is sourced exclusively from YAML repos keys."""
+    def test_repo_configs_from_yaml(self) -> None:
+        """REPO_CONFIGS is sourced exclusively from YAML repos keys."""
         env = {k: v for k, v in os.environ.items() if k != "JUDGE_ALLOWED_REPOS"}
         with patch.dict(os.environ, env, clear=True):
             importlib.reload(config)
-            assert isinstance(config.ALLOWED_REPOS, frozenset), (
-                f"Expected ALLOWED_REPOS to be a frozenset after reload, "
-                f"got {type(config.ALLOWED_REPOS).__name__}"
+            import types
+            assert isinstance(config.REPO_CONFIGS, types.MappingProxyType), (
+                f"Expected REPO_CONFIGS to be a MappingProxyType after reload, "
+                f"got {type(config.REPO_CONFIGS).__name__}"
             )
-            assert len(config.ALLOWED_REPOS) > 0, (
-                "Expected ALLOWED_REPOS to be non-empty (sourced from YAML fixture)"
-            )
-
-        importlib.reload(config)
-
-    def test_judge_allowed_repos_env_var_has_no_effect(self) -> None:
-        """JUDGE_ALLOWED_REPOS env var is ignored — repos come from YAML only."""
-        # Capture the baseline ALLOWED_REPOS before patching.
-        baseline = frozenset(config.ALLOWED_REPOS)
-        assert len(baseline) > 0, (
-            "Baseline ALLOWED_REPOS must be non-empty for this test to be meaningful"
-        )
-
-        with patch.dict(os.environ, {"JUDGE_ALLOWED_REPOS": "org/repo-a,org/repo-b"}, clear=False):
-            importlib.reload(config)
-            # The env var must not alter ALLOWED_REPOS — it must remain the same as baseline.
-            assert baseline == config.ALLOWED_REPOS, (
-                f"ALLOWED_REPOS changed after setting JUDGE_ALLOWED_REPOS — "
-                f"it must only come from YAML. Before: {baseline}, After: {config.ALLOWED_REPOS}"
+            assert len(config.REPO_CONFIGS) > 0, (
+                "Expected REPO_CONFIGS to be non-empty (sourced from YAML fixture)"
             )
 
         importlib.reload(config)
 
-    def test_validate_repo_passes_for_allowed_repo(self) -> None:
-        """
-        Given: a repo name that is in ALLOWED_REPOS
-        When: validate_repo is called
-        Then: it completes without raising, and ALLOWED_REPOS still contains the repo
-              (state is unchanged — validate_repo is a pure validator with no side effects)
-        """
-        repo = next(iter(ALLOWED_REPOS))
-        assert repo in ALLOWED_REPOS, (
-            f"Precondition failed: '{repo}' should be in ALLOWED_REPOS"
+    def test_repo_configs_values_are_repo_config_instances(self) -> None:
+        """All values in REPO_CONFIGS are RepoConfig instances."""
+        for repo_name, rc in REPO_CONFIGS.items():
+            assert isinstance(rc, RepoConfig), (
+                f"Expected RepoConfig for '{repo_name}', got {type(rc).__name__}"
+            )
+
+    def test_repo_config_has_required_fields(self) -> None:
+        """Each RepoConfig carries name, short_name, and local_path."""
+        for repo_name, rc in REPO_CONFIGS.items():
+            assert rc.name == repo_name, (
+                f"RepoConfig.name mismatch: key '{repo_name}' but rc.name='{rc.name}'"
+            )
+            assert isinstance(rc.short_name, str) and rc.short_name, (
+                f"Expected non-empty short_name for '{repo_name}'"
+            )
+            assert hasattr(rc, "local_path"), (
+                f"Expected local_path attribute on RepoConfig for '{repo_name}'"
+            )
+
+    def test_repo_configs_local_path_matches_expected(self) -> None:
+        """AC-2: REPO_CONFIGS[repo].local_path is computed from workspace root and short-name."""
+        from devbench.config import WORKSPACE_ROOT
+
+        rc = REPO_CONFIGS[_KNOWN_REPO_IN_FIXTURE]
+        # local_path must be rooted at WORKSPACE_ROOT
+        assert rc.local_path.is_relative_to(WORKSPACE_ROOT), (
+            f"Expected local_path '{rc.local_path}' to be under WORKSPACE_ROOT '{WORKSPACE_ROOT}'"
         )
-        validate_repo(repo)
-        assert repo in ALLOWED_REPOS, (
-            f"Post-condition failed: validate_repo must not modify ALLOWED_REPOS; "
-            f"'{repo}' was removed after the call"
-        )
+
+    def test_validate_repo_passes_for_known_repo_string(self) -> None:
+        """validate_repo accepts a string repo name present in REPO_CONFIGS."""
+        validate_repo(_KNOWN_REPO_IN_FIXTURE)
+
+    def test_validate_repo_passes_for_repo_config_instance(self) -> None:
+        """validate_repo accepts a RepoConfig instance (defense-in-depth)."""
+        rc = REPO_CONFIGS[_KNOWN_REPO_IN_FIXTURE]
+        validate_repo(rc)
 
     def test_validate_repo_raises_for_unknown_repo(self) -> None:
         with pytest.raises(ValueError, match="not allowed"):
@@ -100,6 +107,38 @@ class TestAllowedRepos:
         with patch.object(config, "ALLOWED_GH_ORGS", []):
             with pytest.raises(ValueError, match="not allowed"):
                 config.validate_repo("other-org/some-repo")
+
+    def test_resolve_repo_short_name_returns_repo_config(self) -> None:
+        """AC-3: resolve_repo('git-repo') returns a RepoConfig with name == 'caylent-solutions/git-repo'."""
+        from devbench.config import resolve_repo
+
+        rc = resolve_repo("git-repo")
+        assert isinstance(rc, RepoConfig), f"Expected RepoConfig, got {type(rc).__name__}"
+        assert rc.name == _KNOWN_REPO_IN_FIXTURE, (
+            f"Expected name='{_KNOWN_REPO_IN_FIXTURE}', got '{rc.name}'"
+        )
+
+    def test_resolve_repo_full_name_returns_same_repo_config(self) -> None:
+        """AC-4: resolve_repo('caylent-solutions/git-repo') returns same RepoConfig as REPO_CONFIGS."""
+        from devbench.config import resolve_repo
+
+        rc = resolve_repo(_KNOWN_REPO_IN_FIXTURE)
+        assert rc == REPO_CONFIGS[_KNOWN_REPO_IN_FIXTURE], (
+            "resolve_repo with full name must return the same RepoConfig as REPO_CONFIGS[name]"
+        )
+
+    def test_resolve_repo_unknown_raises_value_error(self) -> None:
+        """AC-5: Passing an unknown name to resolve_repo raises ValueError."""
+        from devbench.config import resolve_repo
+
+        with pytest.raises(ValueError, match="not recognised"):
+            resolve_repo("totally-unknown-repo-xyz")
+
+    def test_no_old_constants_in_config_module(self) -> None:
+        """AC-7: ALLOWED_REPOS, REPO_LOCAL_PATHS, REPO_SHORT_TO_FULL are absent from config."""
+        assert not hasattr(config, "ALLOWED_REPOS"), "ALLOWED_REPOS must not exist in config"
+        assert not hasattr(config, "REPO_LOCAL_PATHS"), "REPO_LOCAL_PATHS must not exist in config"
+        assert not hasattr(config, "REPO_SHORT_TO_FULL"), "REPO_SHORT_TO_FULL must not exist in config"
 
 
 @pytest.mark.unit
@@ -330,12 +369,20 @@ class TestAllowedOrgs:
         """
         AC-2: validate_repo passes when repo org is in allowed_orgs list.
         Given: ALLOWED_GH_ORGS = ['permitted-org']
-        When: validate_repo is called with 'permitted-org/some-repo' in ALLOWED_REPOS
+        When: validate_repo is called with 'permitted-org/some-repo' in REPO_CONFIGS
         Then: no exception is raised
         """
+        import types
+        from pathlib import Path as _Path
+
+        dummy_rc = RepoConfig(
+            name="permitted-org/some-repo",
+            short_name="some-repo",
+            local_path=_Path("/tmp/some-repo"),
+        )
         with (
             patch.object(config, "ALLOWED_GH_ORGS", ["permitted-org"]),
-            patch.object(config, "ALLOWED_REPOS", frozenset(["permitted-org/some-repo"])),
+            patch.object(config, "REPO_CONFIGS", types.MappingProxyType({"permitted-org/some-repo": dummy_rc})),
         ):
             config.validate_repo("permitted-org/some-repo")
 
@@ -346,30 +393,54 @@ class TestAllowedOrgs:
         When: validate_repo is called with a repo from 'other-org'
         Then: ValueError is raised with an org-restriction message
         """
+        import types
+        from pathlib import Path as _Path
+
+        dummy_rc = RepoConfig(
+            name="other-org/some-repo",
+            short_name="some-repo",
+            local_path=_Path("/tmp/some-repo"),
+        )
         with (
             patch.object(config, "ALLOWED_GH_ORGS", ["permitted-org"]),
-            patch.object(config, "ALLOWED_REPOS", frozenset(["other-org/some-repo"])),
+            patch.object(config, "REPO_CONFIGS", types.MappingProxyType({"other-org/some-repo": dummy_rc})),
         ):
             with pytest.raises(ValueError, match="allowed_orgs"):
                 config.validate_repo("other-org/some-repo")
 
     def test_validate_repo_skips_org_check_when_allowed_orgs_empty(self) -> None:
         """
-        AC-3: when allowed_orgs is empty, org check is skipped (any org in ALLOWED_REPOS passes).
+        AC-3: when allowed_orgs is empty, org check is skipped (any org in REPO_CONFIGS passes).
         """
+        import types
+        from pathlib import Path as _Path
+
+        dummy_rc = RepoConfig(
+            name="any-org/repo",
+            short_name="repo",
+            local_path=_Path("/tmp/repo"),
+        )
         with (
             patch.object(config, "ALLOWED_GH_ORGS", []),
-            patch.object(config, "ALLOWED_REPOS", frozenset(["any-org/repo"])),
+            patch.object(config, "REPO_CONFIGS", types.MappingProxyType({"any-org/repo": dummy_rc})),
         ):
             config.validate_repo("any-org/repo")
 
     def test_validate_repo_raises_for_unknown_repo_regardless_of_orgs(self) -> None:
         """
-        validate_repo still raises for repos not in ALLOWED_REPOS even when org is permitted.
+        validate_repo still raises for repos not in REPO_CONFIGS even when org is permitted.
         """
+        import types
+        from pathlib import Path as _Path
+
+        dummy_rc = RepoConfig(
+            name="org/allowed",
+            short_name="allowed",
+            local_path=_Path("/tmp/allowed"),
+        )
         with (
             patch.object(config, "ALLOWED_GH_ORGS", []),
-            patch.object(config, "ALLOWED_REPOS", frozenset(["org/allowed"])),
+            patch.object(config, "REPO_CONFIGS", types.MappingProxyType({"org/allowed": dummy_rc})),
         ):
             with pytest.raises(ValueError, match="not allowed"):
                 config.validate_repo("org/not-in-list")

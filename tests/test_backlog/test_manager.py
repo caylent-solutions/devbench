@@ -957,3 +957,64 @@ class TestValidateBacklogSummary:
         assert not summary_errors, (
             f"Unexpected status summary errors: {summary_errors}"
         )
+
+
+# ---------------------------------------------------------------------------
+# E230-F1-S1-T1: _append_agent_comment and _resolve_unit_file
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestAppendAgentComment:
+    """AC-6: BacklogManager._append_agent_comment writes COMMENT_AGENT_TEMPLATE format."""
+
+    def test_append_agent_comment_writes_agent_template_format(self, tmp_path: Path) -> None:
+        """_append_agent_comment appends '[timestamp] [agent/<name>] <message>' to Comments."""
+        wu = tmp_path / "E230-F1-S1-T1.md"
+        wu.write_text(
+            "# E230-F1-S1-T1\n\n## Status: in-progress\n\n## Comments\n",
+            encoding="utf-8",
+        )
+        mgr = BacklogManager()
+        mgr._append_agent_comment(wu, "git_ops", "[PR_CREATED] https://github.com/org/repo/pull/42")
+
+        content = wu.read_text(encoding="utf-8")
+        assert "[agent/git_ops]" in content
+        assert "[PR_CREATED] https://github.com/org/repo/pull/42" in content
+
+    def test_append_agent_comment_creates_comments_section_when_absent(self, tmp_path: Path) -> None:
+        """_append_agent_comment creates ## Comments section when not present."""
+        wu = tmp_path / "E230-F1-S1-T1.md"
+        wu.write_text("# E230-F1-S1-T1\n\n## Status: in-progress\n", encoding="utf-8")
+        mgr = BacklogManager()
+        mgr._append_agent_comment(wu, "orchestrator", "[DONE] Work unit E230-F1-S1-T1 completed")
+
+        content = wu.read_text(encoding="utf-8")
+        assert "## Comments" in content
+        assert "[agent/orchestrator]" in content
+        assert "[DONE] Work unit E230-F1-S1-T1 completed" in content
+
+    def test_append_agent_comment_contains_no_review_token(self, tmp_path: Path) -> None:
+        """AC-5: Event entries contain no [REVIEW_PASS] or [REVIEW_FAIL] token."""
+        wu = tmp_path / "E230-F1-S1-T1.md"
+        wu.write_text("# E230-F1-S1-T1\n\n## Status: in-progress\n\n## Comments\n", encoding="utf-8")
+        mgr = BacklogManager()
+        mgr._append_agent_comment(wu, "git_ops", "[PR_MERGED] https://github.com/org/repo/pull/42")
+
+        content = wu.read_text(encoding="utf-8")
+        assert "[REVIEW_PASS]" not in content
+        assert "[REVIEW_FAIL]" not in content
+
+    def test_append_agent_comment_includes_timestamp(self, tmp_path: Path) -> None:
+        """_append_agent_comment includes a UTC timestamp in the entry."""
+        wu = tmp_path / "E230-F1-S1-T1.md"
+        wu.write_text("# E230-F1-S1-T1\n\n## Status: in-progress\n\n## Comments\n", encoding="utf-8")
+        mgr = BacklogManager()
+        mgr._append_agent_comment(wu, "git_ops", "[PR_CREATED] https://github.com/org/repo/pull/1")
+
+        content = wu.read_text(encoding="utf-8")
+        # Timestamp format: [YYYY-MM-DD HH:MM UTC]
+        import re
+        assert re.search(r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC\]", content), (
+            f"No UTC timestamp found in: {content}"
+        )

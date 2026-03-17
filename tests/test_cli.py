@@ -165,6 +165,94 @@ class TestCmdNext:
         assert result == 0
         assert "NO_ACTIONABLE" in capsys.readouterr().out
 
+    def test_next_does_not_mutate_status(
+        self, mock_units: list[WorkUnit], capsys: pytest.CaptureFixture
+    ) -> None:
+        """cmd_next must be read-only: BacklogManager.force_status must never be called."""
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+        mock_parser.get_parallel_candidates.return_value = [mock_units[1]]
+
+        mock_mgr = MagicMock()
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            with patch("devbench.cli.BacklogManager", return_value=mock_mgr):
+                result = cli.cmd_next()
+
+        assert result == 0
+        mock_mgr.force_status.assert_not_called()
+
+    def test_next_returns_json_descriptor(
+        self, mock_units: list[WorkUnit], capsys: pytest.CaptureFixture
+    ) -> None:
+        """cmd_next emits a JSON object with id, title, repo, file_path, and dependencies."""
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+        mock_parser.get_parallel_candidates.return_value = [mock_units[1]]
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_next()
+
+        assert result == 0
+        data = json.loads(capsys.readouterr().out.strip())
+        assert data["id"] == "E0-F1-S1-T2"
+        assert data["title"] == "Second Task"
+        assert data["repo"] == "caylent-solutions/git-repo"
+        assert "file_path" in data
+        assert "dependencies" in data
+
+
+class TestCmdClaim:
+    """Test cmd_claim command."""
+
+    def test_claim_sets_unit_in_progress(
+        self,
+        mock_units: list[WorkUnit],
+        backlog_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """cmd_claim transitions the work unit to in-progress via force_status.
+
+        mock_units[1].file_path is Path("backlog/E0-F1-S1-T2.md"), so BACKLOG_ROOT
+        must be set to backlog_dir.parent (tmp_path) so that the resolved path is
+        tmp_path / "backlog/E0-F1-S1-T2.md" == backlog_dir / "E0-F1-S1-T2.md".
+        """
+        wu_file = backlog_dir / "E0-F1-S1-T2.md"
+        wu_file.write_text("# Task\n## Status: in-queue\n")
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+
+        mock_mgr = MagicMock()
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            with patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent):
+                with patch("devbench.cli.BacklogManager", return_value=mock_mgr):
+                    result = cli.cmd_claim("E0-F1-S1-T2")
+
+        assert result == 0
+        mock_mgr.force_status.assert_called_once()
+        call_args = mock_mgr.force_status.call_args
+        assert call_args[0][2] == "E0-F1-S1-T2"
+        from devbench.constants import STATUS_IN_PROGRESS
+        assert call_args[0][3] == STATUS_IN_PROGRESS
+        assert "Claimed E0-F1-S1-T2" in capsys.readouterr().out
+
+    def test_claim_returns_nonzero_for_unknown_id(
+        self,
+        mock_units: list[WorkUnit],
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """cmd_claim exits non-zero with a clear error when the unit ID is not found."""
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_claim("NONEXISTENT-ID")
+
+        assert result == 1
+        assert "NONEXISTENT-ID" in capsys.readouterr().err
+
 
 class TestCmdLog:
     """Test cmd_log command."""

@@ -16,6 +16,7 @@ Commands::
 
     status                  Show backlog summary (counts by status)
     next                    Print the next actionable work unit ID and title
+    claim <id>              Claim a work unit (transition to in-progress)
     set-status <id> <s>     Force any status (no gate — use for recovery/lifecycle transitions)
     mark-done <id>          Mark unit as Done (enforces done-gate: all judges must have passed)
     validate-backlog        Check backlog integrity (file existence, status sync, orphans, deps, summary)
@@ -142,15 +143,6 @@ def cmd_next() -> int:
 
     unit = candidates[0]
 
-    # Automatically mark as in-progress in both files
-    wu_file = BACKLOG_ROOT / unit.file_path if not unit.file_path.is_absolute() else unit.file_path
-    if not wu_file.exists():
-        wu_file = WORKSPACE_ROOT / unit.file_path
-    if wu_file.exists():
-        mgr = BacklogManager()
-        mgr.force_status(wu_file, BACKLOG_INDEX, unit.id, STATUS_IN_PROGRESS)
-        logger.info("Set %s to in-progress", unit.id)
-
     print(
         json.dumps(
             {
@@ -162,6 +154,30 @@ def cmd_next() -> int:
             }
         )
     )
+    return 0
+
+
+def cmd_claim(unit_id: str) -> int:
+    """Transition a work unit to in-progress (claim it for execution).
+
+    Use after ``devbench next`` to explicitly mark the unit as owned before
+    the executor begins work.
+    """
+    units = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX).parse_index()
+    unit = next((u for u in units if u.id == unit_id), None)
+    if unit is None:
+        print(f"ERROR: unit '{unit_id}' not found in backlog index", file=sys.stderr)
+        return 1
+    wu_file = BACKLOG_ROOT / unit.file_path if not unit.file_path.is_absolute() else unit.file_path
+    if not wu_file.exists():
+        wu_file = WORKSPACE_ROOT / unit.file_path
+    if not wu_file.exists():
+        print(f"ERROR: work unit file not found for '{unit_id}'", file=sys.stderr)
+        return 1
+    mgr = BacklogManager()
+    mgr.force_status(wu_file, BACKLOG_INDEX, unit_id, STATUS_IN_PROGRESS)
+    logger.info("Claimed %s (set to in-progress)", unit_id)
+    print(f"Claimed {unit_id}")
     return 0
 
 
@@ -717,6 +733,7 @@ def _find_unit(units: list[WorkUnit], unit_id: str) -> WorkUnit | None:
 _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
     "status": (cmd_status, 0, "Show backlog summary"),
     "next": (cmd_next, 0, "Print next actionable work unit"),
+    "claim": (cmd_claim, 1, "Claim a work unit: claim <id>"),
     "set-status": (cmd_set_status, 2, "Set status: set-status <id> <status>"),
     "mark-done": (cmd_mark_done, 1, "Mark done: mark-done <id>"),
     "validate-backlog": (cmd_validate_backlog, 0, "Validate backlog integrity"),

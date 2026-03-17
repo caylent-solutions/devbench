@@ -202,6 +202,10 @@ def process_work_unit(work_unit: WorkUnit) -> bool:
             "Ensure the work-unit file has a Branch: field or is parsed via BacklogParser."
         )
 
+    # Claim the unit as in-progress before executing.  This is the orchestrator's
+    # equivalent of `devbench next --claim`: force_status is called directly here
+    # so that the unit is marked in-progress whether it was surfaced by `next` (read-only)
+    # or discovered through internal parser calls.  AC-3: claim always precedes execute.
     backlog_mgr.force_status(work_unit.file_path, BACKLOG_INDEX, work_unit.id, STATUS_IN_PROGRESS)
     work_unit.log_comment("orchestrator", "START", f"Beginning work on {work_unit.id}")
 

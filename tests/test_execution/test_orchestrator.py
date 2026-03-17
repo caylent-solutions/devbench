@@ -1280,3 +1280,54 @@ class TestOrchestratorCheckoutAfterMerge:
         merge_idx = call_order.index("merge_pr")
         checkout_idx = call_order.index("checkout_default_branch")
         assert merge_idx < checkout_idx, "checkout_default_branch must come after merge_pr"
+
+
+class TestProcessWorkUnitClaimsUnit:
+    """AC-3: Orchestrator still claims unit as in-progress before executing."""
+
+    def test_orchestrator_claims_unit_before_execute(self, tmp_path: Path) -> None:
+        """
+        Given: process_work_unit is called with a valid work unit
+        When: the work unit succeeds
+        Then: force_status is called with in-progress before the executor runs
+        Spec: AC-3
+        """
+        from devbench.execution.orchestrator import process_work_unit
+
+        unit = _make_unit(tmp_path)
+        exec_result = ExecutionResult(status=ExecutionStatus.IN_REVIEW, output="done", blocker="")
+        mock_judge = MagicMock()
+        mock_judge.name = "mock"
+        mock_judge.evaluate.return_value = _pass_result("mock")
+
+        mock_git_ops = MagicMock()
+        mock_git_ops.is_committed_and_pushed.return_value = False
+        mock_git_ops.create_pr.return_value = "https://github.com/org/repo/pull/1"
+        mock_git_ops.wait_for_checks.return_value = True
+        mock_mgr = MagicMock()
+
+        call_order: list[str] = []
+
+        def force_status_side_effect(*args: object, **kwargs: object) -> None:
+            call_order.append("force_status")
+
+        def execute_side_effect(**kwargs: object) -> ExecutionResult:
+            call_order.append("execute")
+            return exec_result
+
+        mock_mgr.force_status.side_effect = force_status_side_effect
+
+        with _patch_process_work_unit(tmp_path, mock_git_ops, mock_judge, mock_mgr) as mock_exec:
+            mock_exec.execute.side_effect = execute_side_effect
+            result = process_work_unit(unit)
+
+        assert result is True
+        # force_status (claim) must precede execute
+        assert "force_status" in call_order, "force_status must be called"
+        assert "execute" in call_order, "execute must be called"
+        claim_idx = call_order.index("force_status")
+        execute_idx = call_order.index("execute")
+        assert claim_idx < execute_idx, "unit must be claimed before executor runs"
+        # Verify the claim was for in-progress
+        first_force_call = mock_mgr.force_status.call_args_list[0]
+        assert first_force_call.args[3] == "in-progress"

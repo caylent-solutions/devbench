@@ -18,7 +18,9 @@ Commands::
                             With --detail: also lists all in-queue Tasks in
                             priority order and all blocked Tasks with their
                             unresolved dependency IDs.
-    next                    Print the next actionable work unit ID and title
+    next [--claim]          Print the next actionable work unit ID and title.
+                            Read-only by default; with --claim also sets the
+                            unit status to in-progress.
     execute <id>            Spawn a Claude Code agent to execute a work unit
     review <id>             Run all review judges on a work unit, print JSON results
     security-review <id>    Run the security review judge on a work unit
@@ -168,8 +170,12 @@ def _print_status_detail(
         print(f"  {unit.id}  waiting on: {waiting}")
 
 
-def cmd_next() -> int:
+def cmd_next(claim: bool = False) -> int:
     """Print the next actionable work unit.
+
+    By default this command is read-only: it prints the next unit's JSON without
+    mutating any status.  Pass ``claim=True`` (or ``--claim`` on the CLI) to
+    additionally set the unit's status to ``in-progress``.
 
     Secondary dep guard: after ``get_parallel_candidates`` returns candidates,
     the top candidate's dependencies are re-verified against the full ``done``
@@ -201,11 +207,16 @@ def cmd_next() -> int:
         )
         return 1
 
-    # Automatically mark as in-progress in both files
-    wu_file = BACKLOG_ROOT / unit.file_path if not unit.file_path.is_absolute() else unit.file_path
-    if not wu_file.exists():
-        wu_file = WORKSPACE_ROOT / unit.file_path
-    if wu_file.exists():
+    if claim:
+        wu_file = BACKLOG_ROOT / unit.file_path if not unit.file_path.is_absolute() else unit.file_path
+        if not wu_file.exists():
+            wu_file = WORKSPACE_ROOT / unit.file_path
+        if not wu_file.exists():
+            print(
+                f"Cannot claim {unit.id}: work unit file not found at {wu_file}",
+                file=sys.stderr,
+            )
+            return 1
         mgr = BacklogManager()
         mgr.force_status(wu_file, BACKLOG_INDEX, unit.id, STATUS_IN_PROGRESS)
         logger.info("Set %s to in-progress", unit.id)
@@ -673,7 +684,7 @@ def _get_prior_feedback(unit_id: str) -> dict[str, str]:
 # Command registry: name -> (handler, min_args, description)
 _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
     "status": (cmd_status, 0, "Show backlog summary"),
-    "next": (cmd_next, 0, "Print next actionable work unit"),
+    "next": (cmd_next, 0, "Print next actionable work unit (read-only; --claim sets in-progress)"),
     "execute": (cmd_execute, 1, "Execute a work unit: execute <id> [feedback]"),
     "review": (cmd_review, 1, "Review a work unit: review <id>"),
     "security-review": (cmd_security_review, 1, "Security review: security-review <id>"),
@@ -706,7 +717,8 @@ def main() -> int:
     func, min_args, _ = _COMMANDS[command]
     raw_args = sys.argv[2:]
     detail = "--detail" in raw_args
-    args = [a for a in raw_args if a != "--detail"]
+    claim = "--claim" in raw_args
+    args = [a for a in raw_args if a not in ("--detail", "--claim")]
 
     if len(args) < min_args:
         print(f"Command '{command}' requires at least {min_args} argument(s)", file=sys.stderr)
@@ -714,6 +726,9 @@ def main() -> int:
 
     if command == "status" and detail:
         return func(detail=True)
+
+    if command == "next" and claim:
+        return func(claim=True)
 
     return func(*args[: min_args + 1]) if len(args) > min_args else func(*args[:min_args])
 

@@ -1592,3 +1592,169 @@ class TestDepGuardNext:
         captured = capsys.readouterr()
         assert captured.out.strip() == ""
         assert "E9" in captured.err
+
+
+class TestCmdNextReadOnly:
+    """Tests for AC-1, AC-2, AC-4: next is read-only; --claim sets in-progress."""
+
+    def test_next_does_not_mutate_status(
+        self,
+        mock_units: list[WorkUnit],
+        tmp_path: Path,
+        backlog_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """
+        Given: a valid actionable work unit
+        When: cmd_next() is called without --claim
+        Then: JSON is printed AND force_status is never called
+        Spec: AC-1
+        """
+        wu_file = backlog_dir / "E0-F1-S1-T2.md"
+        wu_file.write_text("# E0-F1-S1-T2: Task\n\n## Status: in-queue\n")
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+        mock_parser.get_parallel_candidates.return_value = [mock_units[1]]
+
+        mock_mgr = MagicMock()
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+        ):
+            result = cli.cmd_next()
+
+        assert result == 0
+        output = json.loads(capsys.readouterr().out.strip())
+        assert output["id"] == "E0-F1-S1-T2"
+        mock_mgr.force_status.assert_not_called()
+
+    def test_next_claim_sets_in_progress(
+        self,
+        mock_units: list[WorkUnit],
+        tmp_path: Path,
+        backlog_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """
+        Given: a valid actionable work unit
+        When: cmd_next(claim=True) is called
+        Then: JSON is printed AND force_status is called with in-progress
+        Spec: AC-2
+        """
+        wu_file = backlog_dir / "E0-F1-S1-T2.md"
+        wu_file.write_text("# E0-F1-S1-T2: Task\n\n## Status: in-queue\n")
+
+        # Use an absolute file_path so the code resolves it directly without BACKLOG_ROOT
+        claimable_unit = WorkUnit(
+            id="E0-F1-S1-T2",
+            title="Second Task",
+            status=WorkUnitStatus.IN_QUEUE,
+            unit_type=WorkUnitType.TASK,
+            file_path=wu_file,
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+        units = [mock_units[0], claimable_unit, mock_units[2]]
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = units
+        mock_parser.get_parallel_candidates.return_value = [claimable_unit]
+
+        mock_mgr = MagicMock()
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+        ):
+            result = cli.cmd_next(claim=True)
+
+        assert result == 0
+        output = json.loads(capsys.readouterr().out.strip())
+        assert output["id"] == "E0-F1-S1-T2"
+        mock_mgr.force_status.assert_called_once()
+        call_args = mock_mgr.force_status.call_args
+        assert call_args.args[3] == "in-progress"
+
+    def test_next_twice_returns_same_unit(
+        self,
+        mock_units: list[WorkUnit],
+        backlog_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """
+        Given: an actionable work unit
+        When: cmd_next() is called twice (without --claim)
+        Then: both calls return the same unit ID (no status mutation between calls)
+        Spec: AC-4
+        """
+        wu_file = backlog_dir / "E0-F1-S1-T2.md"
+        wu_file.write_text("# E0-F1-S1-T2: Task\n\n## Status: in-queue\n")
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+        mock_parser.get_parallel_candidates.return_value = [mock_units[1]]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+        ):
+            result1 = cli.cmd_next()
+            out1 = json.loads(capsys.readouterr().out.strip())
+            result2 = cli.cmd_next()
+            out2 = json.loads(capsys.readouterr().out.strip())
+
+        assert result1 == 0
+        assert result2 == 0
+        assert out1["id"] == out2["id"] == "E0-F1-S1-T2"
+
+    def test_next_claim_missing_file_returns_1(
+        self,
+        mock_units: list[WorkUnit],
+        tmp_path: Path,
+        backlog_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """
+        Given: a candidate work unit whose file does not exist on disk
+        When: cmd_next(claim=True) is called
+        Then: exit code is 1, error message on stderr, force_status is never called
+        Spec: AC-2 (fail-fast on missing file during claim)
+        """
+        # Unit with an absolute path pointing to a file that does NOT exist
+        missing_file = backlog_dir / "E0-F1-S1-T2.md"
+        # Intentionally do NOT create the file
+        claimable_unit = WorkUnit(
+            id="E0-F1-S1-T2",
+            title="Second Task",
+            status=WorkUnitStatus.IN_QUEUE,
+            unit_type=WorkUnitType.TASK,
+            file_path=missing_file,
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+        units = [mock_units[0], claimable_unit, mock_units[2]]
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = units
+        mock_parser.get_parallel_candidates.return_value = [claimable_unit]
+
+        mock_mgr = MagicMock()
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            result = cli.cmd_next(claim=True)
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "Cannot claim" in captured.err
+        assert "E0-F1-S1-T2" in captured.err
+        mock_mgr.force_status.assert_not_called()

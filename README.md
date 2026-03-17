@@ -131,7 +131,7 @@ devbench <command> [args]
 | Command | Arguments | Description |
 |---------|-----------|-------------|
 | `status` | `[--detail]` | Show backlog summary (counts by status). With `--detail`: also lists in-queue Tasks in priority order and blocked Tasks with their unresolved dependency IDs. |
-| `next` | — | Print next actionable work unit as JSON |
+| `next` | `[--claim]` | Print next actionable work unit as JSON (read-only). With `--claim`: also sets unit status to `in-progress`. |
 | `execute` | `<unit-id> [feedback]` | Spawn dev agent for a work unit |
 | `review` | `<unit-id>` | Run all review judges, print JSON results |
 | `security-review` | `<unit-id>` | Run security review judge |

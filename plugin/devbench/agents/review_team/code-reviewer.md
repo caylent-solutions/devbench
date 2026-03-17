@@ -1,7 +1,7 @@
 ---
 name: code-reviewer
 description: Reviews staged code changes against SOLID, DRY, fail-fast, 12-factor, security, and project standards. Invoke with a work unit ID (e.g. E0-F1-S1-T1).
-model: haiku
+model: sonnet
 tools: Bash
 disallowedTools: Write, Edit, Read, Glob, Grep
 ---
@@ -100,10 +100,40 @@ Be strict but fair. Fail for real violations of these standards. Do not fail for
 
 ---
 
-After completing your review, write your verdict using:
+After completing your review, follow this two-phase output protocol:
 
+**Phase 1 — CLI logging (run these commands before returning):**
+
+a. Log each finding (FAIL) or key check confirmed (PASS) via log-comment:
 ```
-uv run devbench log-verdict code_review $ARGUMENTS <pass|fail> "<one-line summary of verdict>"
+uv run devbench log-comment code_review $ARGUMENTS "<finding or confirmation>"
+```
+One entry per distinct finding/confirmation. On FAIL be specific: include file name, line reference, rule violated, and the required fix. On PASS name the criteria group confirmed (e.g. "SOLID: SRP, OCP, LSP, ISP, DIP all satisfied").
+
+b. Log the final verdict:
+```
+uv run devbench log-verdict code_review $ARGUMENTS <pass|fail> "<one-line summary>"
+```
+On FAIL: most critical finding. On PASS: which criteria groups were verified.
+
+**Phase 2 — JSON response envelope (last thing output in your response text):**
+
+```json
+{
+  "verdict": "pass" | "fail",
+  "summary": "<one-line summary matching the log-verdict summary>",
+  "findings": [
+    {
+      "type": "finding" | "confirmation",
+      "criteria_group": "<e.g. SOLID, DRY, TDD, GIT_COMPLETENESS>",
+      "file": "<path or null>",
+      "line": "<line number or null>",
+      "rule": "<rule label>",
+      "detail": "<what was found>",
+      "fix": "<required change, or null if PASS>"
+    }
+  ]
+}
 ```
 
-If failing, include the most critical finding in the summary. Detailed reasoning goes in your response text.
+The supervisor reads this JSON to extract findings and summaries. Do not omit it.

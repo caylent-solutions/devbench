@@ -1018,3 +1018,128 @@ class TestAppendAgentComment:
         assert re.search(r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC\]", content), (
             f"No UTC timestamp found in: {content}"
         )
+
+
+# ---------------------------------------------------------------------------
+# E231-F2-S1-T1: _append_tdd_entry and log-tdd command
+# ---------------------------------------------------------------------------
+
+_WORK_UNIT_WITH_TDD_LOG = """\
+# E231-F2-S1-T1: TDD Test
+
+## Status: in-progress
+
+## Comments
+
+## TDD Cycle Log
+"""
+
+
+@pytest.mark.unit
+class TestAppendTddEntry:
+    """Tests for BacklogManager._append_tdd_entry() — AC-1 through AC-6."""
+
+    def _make_wu_with_tdd_section(self, tmp_path: Path, extra: str = "") -> Path:
+        """Create a work unit file with both ## Comments and ## TDD Cycle Log sections."""
+        wu = tmp_path / "E231-F2-S1-T1.md"
+        wu.write_text(_WORK_UNIT_WITH_TDD_LOG + extra, encoding="utf-8")
+        return wu
+
+    def _make_wu_without_tdd_section(self, tmp_path: Path) -> Path:
+        """Create a work unit file WITHOUT ## TDD Cycle Log section."""
+        wu = tmp_path / "E231-F2-S1-T1-no-tdd.md"
+        wu.write_text(
+            "# E231-F2-S1-T1\n\n## Status: in-progress\n\n## Comments\n",
+            encoding="utf-8",
+        )
+        return wu
+
+    def test_log_tdd_red_appends_to_tdd_cycle_log(self, tmp_path: Path) -> None:
+        """AC-1: RED entry appears in ## TDD Cycle Log section."""
+        wu = self._make_wu_with_tdd_section(tmp_path)
+        mgr = BacklogManager()
+        mgr._append_tdd_entry(
+            wu, "RED", "Tests: tests/test_foo.py. Command: make test-unit. Exit: 1. Failures: 2 failed.",
+        )
+
+        content = wu.read_text(encoding="utf-8")
+        tdd_section_start = content.find("## TDD Cycle Log")
+        assert tdd_section_start != -1, "## TDD Cycle Log section must exist"
+        tdd_section = content[tdd_section_start:]
+        assert "[RED]" in tdd_section, f"[RED] tag not found in TDD Cycle Log: {tdd_section}"
+        assert "make test-unit" in tdd_section
+
+    def test_log_tdd_green_appends_to_tdd_cycle_log(self, tmp_path: Path) -> None:
+        """AC-2: GREEN entry appears in ## TDD Cycle Log section."""
+        wu = self._make_wu_with_tdd_section(tmp_path)
+        mgr = BacklogManager()
+        mgr._append_tdd_entry(
+            wu, "GREEN", "Command: make test-unit. Result: 5 passed, 0 failed. Files changed: src/foo.py",
+        )
+
+        content = wu.read_text(encoding="utf-8")
+        tdd_section_start = content.find("## TDD Cycle Log")
+        tdd_section = content[tdd_section_start:]
+        assert "[GREEN]" in tdd_section, f"[GREEN] tag not found in TDD Cycle Log: {tdd_section}"
+
+    def test_log_tdd_refactor_appends_to_tdd_cycle_log(self, tmp_path: Path) -> None:
+        """AC-3: REFACTOR entry appears in ## TDD Cycle Log section."""
+        wu = self._make_wu_with_tdd_section(tmp_path)
+        mgr = BacklogManager()
+        mgr._append_tdd_entry(wu, "REFACTOR", "No refactor needed. Tests: 5 passed, 0 failed")
+
+        content = wu.read_text(encoding="utf-8")
+        tdd_section_start = content.find("## TDD Cycle Log")
+        tdd_section = content[tdd_section_start:]
+        assert "[REFACTOR]" in tdd_section, f"[REFACTOR] tag not found in TDD Cycle Log: {tdd_section}"
+
+    def test_entry_format_matches_spec(self, tmp_path: Path) -> None:
+        """AC-5: Entry matches '- [<PHASE>] <ISO-8601 timestamp> — <message>'."""
+        import re
+        wu = self._make_wu_with_tdd_section(tmp_path)
+        mgr = BacklogManager()
+        mgr._append_tdd_entry(wu, "RED", "some test message")
+
+        content = wu.read_text(encoding="utf-8")
+        # Pattern: - [RED] <ISO-8601 datetime> — <message>
+        pattern = r"- \[RED\] \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[^ ]* — some test message"
+        assert re.search(pattern, content), (
+            f"Entry format does not match expected pattern in: {content}"
+        )
+
+    def test_entry_appears_in_tdd_section_not_comments(self, tmp_path: Path) -> None:
+        """AC-11: TDD entries do not appear in ## Comments section."""
+        wu = self._make_wu_with_tdd_section(tmp_path)
+        mgr = BacklogManager()
+        mgr._append_tdd_entry(wu, "RED", "unique-tdd-marker-123")
+
+        content = wu.read_text(encoding="utf-8")
+        comments_start = content.find("## Comments")
+        tdd_start = content.find("## TDD Cycle Log")
+
+        # Extract the Comments section (between ## Comments and ## TDD Cycle Log)
+        comments_section = content[comments_start:tdd_start] if tdd_start > comments_start else content[comments_start:]
+        assert "unique-tdd-marker-123" not in comments_section, (
+            f"TDD entry leaked into ## Comments section: {comments_section}"
+        )
+
+    def test_missing_tdd_section_raises_value_error(self, tmp_path: Path) -> None:
+        """AC-6: Raises ValueError when ## TDD Cycle Log section does not exist."""
+        wu = self._make_wu_without_tdd_section(tmp_path)
+        mgr = BacklogManager()
+        with pytest.raises(ValueError, match="TDD Cycle Log"):
+            mgr._append_tdd_entry(wu, "RED", "some message")
+
+    def test_multiple_entries_are_appended_in_order(self, tmp_path: Path) -> None:
+        """Multiple TDD entries are appended sequentially within the section."""
+        wu = self._make_wu_with_tdd_section(tmp_path)
+        mgr = BacklogManager()
+        mgr._append_tdd_entry(wu, "RED", "first-red-entry")
+        mgr._append_tdd_entry(wu, "GREEN", "second-green-entry")
+
+        content = wu.read_text(encoding="utf-8")
+        red_pos = content.find("[RED]")
+        green_pos = content.find("[GREEN]")
+        assert red_pos < green_pos, "RED entry must appear before GREEN entry"
+        assert "first-red-entry" in content
+        assert "second-green-entry" in content

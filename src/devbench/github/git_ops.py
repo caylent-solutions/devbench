@@ -313,6 +313,40 @@ class GitOpsJudge(BaseJudge):
             raise RuntimeError(f"Failed to merge PR #{pr_number} on {repo}: {stderr.strip()}")
         self.logger.info("Merged PR #%d on %s", pr_number, repo)
 
+    def checkout_default_branch(self, repo: str, repo_path: Path) -> None:
+        """Checkout the configured default branch and pull from origin.
+
+        Called by the orchestrator after every successful ``merge_pr`` so the
+        working tree starts the next work unit from a current default branch
+        rather than the stale completed feature branch.
+
+        Operation sequence:
+
+        1. Resolve the default branch via
+           :func:`~devbench.config_loader.get_configured_default_branch`.
+        2. ``git checkout <default_branch>``
+        3. ``git pull origin <default_branch>``
+
+        Args:
+            repo: GitHub repository in ``owner/name`` format.
+            repo_path: Local filesystem path to the repository.
+
+        Raises:
+            ValueError: If the repo is not in the allow-list.
+            RuntimeError: If ``git checkout`` or ``git pull`` fails.
+        """
+        validate_repo(repo)
+
+        default_branch = get_configured_default_branch(repo, RUNTIME_CONFIG)
+        if not default_branch:
+            raise ValueError(
+                f"No default_branch configured for repo '{repo}'. "
+                "Set default_branch in RUNTIME_CONFIG."
+            )
+        self._git(["checkout", default_branch], repo_path)
+        self._git(["pull", "origin", default_branch], repo_path)
+        self.logger.info("Checked out and pulled default branch %s in %s", default_branch, repo)
+
     def rebase_onto_default(self, repo: str, repo_path: Path, branch: str) -> None:
         """Rebase *branch* onto ``origin/<default_branch>`` and force-push.
 

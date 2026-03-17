@@ -1233,3 +1233,50 @@ class TestMain:
             with patch(f"{_ORC}.BacklogParser", return_value=mock_parser):
                 with patch(f"{_ORC}.BacklogManager", return_value=mock_mgr):
                     main()
+
+
+class TestOrchestratorCheckoutAfterMerge:
+    """Tests for AC-1: orchestrator calls checkout_default_branch after every successful merge_pr."""
+
+    def test_orchestrator_calls_checkout_default_branch_after_merge(self, tmp_path: Path) -> None:
+        """AC-1: checkout_default_branch is called immediately after a successful merge_pr.
+
+        Given: merge_pr succeeds
+        When: process_work_unit runs
+        Then: checkout_default_branch is called after merge_pr, before mark_done
+        """
+        from devbench.execution.orchestrator import process_work_unit
+
+        unit = _make_unit(tmp_path)
+        exec_result = ExecutionResult(status=ExecutionStatus.IN_REVIEW, output="done", blocker="")
+        mock_judge = MagicMock()
+        mock_judge.name = "mock"
+        mock_judge.evaluate.return_value = _pass_result("mock")
+        mock_mgr = MagicMock()
+
+        call_order: list[str] = []
+
+        mock_git_ops = MagicMock()
+        mock_git_ops.is_committed_and_pushed.return_value = False
+        mock_git_ops.create_pr.return_value = "https://github.com/org/repo/pull/99"
+        mock_git_ops.wait_for_checks.return_value = True
+
+        def merge_pr_side_effect(**kwargs: object) -> None:
+            call_order.append("merge_pr")
+
+        def checkout_default_side_effect(**kwargs: object) -> None:
+            call_order.append("checkout_default_branch")
+
+        mock_git_ops.merge_pr.side_effect = merge_pr_side_effect
+        mock_git_ops.checkout_default_branch.side_effect = checkout_default_side_effect
+
+        with _patch_process_work_unit(tmp_path, mock_git_ops, mock_judge, mock_mgr) as mock_exec:
+            mock_exec.execute.return_value = exec_result
+            result = process_work_unit(unit)
+
+        assert result is True
+        assert "merge_pr" in call_order, "merge_pr must be called"
+        assert "checkout_default_branch" in call_order, "checkout_default_branch must be called after merge_pr"
+        merge_idx = call_order.index("merge_pr")
+        checkout_idx = call_order.index("checkout_default_branch")
+        assert merge_idx < checkout_idx, "checkout_default_branch must come after merge_pr"

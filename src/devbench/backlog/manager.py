@@ -15,6 +15,8 @@ Public API
                                 drift, orphans, broken deps, summary mismatch).
 ``log_to_traceability_matrix``— appends a spec/test mapping entry to the
                                 traceability matrix file.
+``_append_tdd_entry``         — appends a timestamped TDD phase entry to the
+                                ``## TDD Cycle Log`` section of a work-unit file.
 
 Constructor
 -----------
@@ -51,6 +53,8 @@ from devbench.constants import (
     STATUS_SUMMARY_TABLE_HEADER,
     STRIP_SUMMARY_RE,
     TABLE_STATUS_VALUES,
+    TDD_CYCLE_LOG_SECTION_HEADER,
+    TDD_ENTRY_TEMPLATE,
     TRACEABILITY_MATRIX_HEADER,
     VALID_STATUSES,
 )
@@ -477,6 +481,34 @@ class BacklogManager:
         else:
             content = content.rstrip("\n") + "\n\n" + COMMENTS_SECTION_HEADER + "\n\n" + entry
 
+        work_unit_path.write_text(content, encoding="utf-8")
+
+    def _append_tdd_entry(self, work_unit_path: Path, phase: str, message: str) -> None:
+        """Append a TDD phase entry to the TDD Cycle Log section of a work-unit file.
+
+        Writes: ``- [<PHASE>] <ISO-8601 timestamp> — <message>``
+
+        Args:
+            work_unit_path: Path to the work-unit ``.md`` file.
+            phase: TDD phase — must be one of ``RED``, ``GREEN``, or ``REFACTOR``
+                (caller must pass normalized uppercase value).
+            message: Description of the TDD phase outcome.
+
+        Raises:
+            ValueError: If the ``## TDD Cycle Log`` section does not exist in the file.
+        """
+        timestamp = datetime.now(tz=UTC).isoformat()
+        entry = TDD_ENTRY_TEMPLATE.format(phase=phase, timestamp=timestamp, message=message)
+
+        content = work_unit_path.read_text(encoding="utf-8")
+
+        if TDD_CYCLE_LOG_SECTION_HEADER not in content:
+            raise ValueError(
+                f"'## TDD Cycle Log' section not found in {work_unit_path}. "
+                "The section must already exist in the work unit file (it is defined in the task spec template)."
+            )
+
+        content = content.rstrip("\n") + "\n\n" + entry
         work_unit_path.write_text(content, encoding="utf-8")
 
     def _update_status_summary(self, backlog_index: Path) -> None:

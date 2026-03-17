@@ -29,13 +29,25 @@ Read and follow ALL instructions in:
 2. Check all dependencies are done — do not proceed if dependencies are incomplete.
 3. Follow the TDD cycle strictly:
    - RED: Write a failing test first. Run the test suite (use `make test-unit` or equivalent
-     in repo_path). Paste the actual test runner output (command, exit code, failure lines)
-     into the work unit Comments via `uv run devbench log-comment executor <id> "RED: <paste output>"`.
+     in repo_path). Confirm the test fails for the right reason, then log:
+     ```bash
+     uv run devbench log-tdd $ARGUMENTS RED "Tests: <comma-separated test file paths created>. Command: <test command>. Exit: <exit code>. Failures: <N failed, M passed>. Output snippet: <first meaningful failure line(s)>"
+     ```
      Do not proceed to GREEN until the test is confirmed failing for the right reason.
    - GREEN: Write the minimal implementation to make the failing test pass. Re-run the
-     test suite to confirm all tests pass.
+     test suite to confirm all tests pass, then log:
+     ```bash
+     uv run devbench log-tdd $ARGUMENTS GREEN "Command: <test command>. Result: <N passed, 0 failed>. Files changed: <comma-separated implementation files>"
+     ```
    - REFACTOR: Clean up the implementation while all tests stay green. Re-run the suite
-     after refactor to confirm.
+     after refactor to confirm, then log:
+     ```bash
+     uv run devbench log-tdd $ARGUMENTS REFACTOR "Changes: <description of refactor>. Command: <test command>. Result: <N passed, 0 failed>"
+     ```
+     If no refactoring was needed, log:
+     ```bash
+     uv run devbench log-tdd $ARGUMENTS REFACTOR "No refactor needed. Tests: <N passed, 0 failed>"
+     ```
 4. Implement all acceptance criteria.
 5. Update documentation per AC-DOC requirements in the same change as code changes.
 6. Verify all work by reading back written files and running tests.

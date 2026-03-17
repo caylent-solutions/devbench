@@ -33,6 +33,7 @@ Plugin agent bridge commands (used by devbench plugin agents)::
     run-tests <id>                          Run test suite for the work unit's repo
     log-verdict <judge> <id> <v> [msg]      Log a judge verdict (pass|fail) to work unit Comments
     log-comment <agent> <id> <message>      Log a non-verdict agent comment to work unit Comments
+    log-tdd <id> <phase> <message>          Log a TDD phase entry (RED|GREEN|REFACTOR) to TDD Cycle Log
 
 All commands exit 0 on success, non-zero on failure. Output is structured
 for easy parsing by Claude Code or other automation.
@@ -82,6 +83,7 @@ from devbench.constants import (
     DISPLAY_STATUS_VALUES,
     STATUS_IN_PROGRESS,
     STATUS_SEPARATOR_WIDTH,
+    VALID_TDD_PHASES,
 )
 from devbench.log_setup import setup_logging
 from devbench.utils.process import run_command
@@ -569,6 +571,52 @@ def cmd_log_comment(agent_name: str, unit_id: str, message: str) -> int:
     return 0
 
 
+def cmd_log_tdd(unit_id: str, phase: str, message: str) -> int:
+    """Append a TDD phase entry to the work unit's TDD Cycle Log section.
+
+    Writes: ``- [<PHASE>] <ISO-8601 timestamp> — <message>``
+
+    Arguments:
+        unit_id:  Work unit ID, e.g. ``E0-F1-S1-T1``.
+        phase:    TDD phase — ``RED``, ``GREEN``, or ``REFACTOR`` (case-insensitive).
+        message:  Description of the TDD phase outcome.
+
+    Exits 0 on success, non-zero on any error.  The ``## TDD Cycle Log``
+    section must already exist in the work unit file; this command fails fast
+    if the section is absent rather than silently creating it.
+    """
+    phase_upper = phase.upper()
+    if phase_upper not in VALID_TDD_PHASES:
+        print(
+            f"ERROR: Invalid TDD phase '{phase}'. "
+            f"Valid phases: {', '.join(sorted(VALID_TDD_PHASES))}",
+            file=sys.stderr,
+        )
+        return 1
+
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    unit = _find_unit(units, unit_id)
+    if unit is None:
+        print(f"ERROR: Work unit '{unit_id}' not found in backlog", file=sys.stderr)
+        return 1
+
+    wu_file = BACKLOG_ROOT / unit.file_path if not unit.file_path.is_absolute() else unit.file_path
+    if not wu_file.exists():
+        wu_file = WORKSPACE_ROOT / unit.file_path
+
+    mgr = BacklogManager()
+    try:
+        mgr._append_tdd_entry(wu_file, phase_upper, message)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    logger.info("TDD %s entry logged for %s", phase_upper, unit_id)
+    print(json.dumps({"unit_id": unit_id, "phase": phase_upper}))
+    return 0
+
+
 def cmd_ensure_branch(unit_id: str) -> int:
     """Create or switch to the feature branch for a work unit before executor runs.
 
@@ -782,6 +830,7 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
     "run-tests": (cmd_run_tests, 1, "Run test suite for work unit's repo: run-tests <id>"),
     "log-verdict": (cmd_log_verdict, 3, "Log judge verdict: log-verdict <judge> <id> <pass|fail> [feedback]"),
     "log-comment": (cmd_log_comment, 3, "Log agent comment: log-comment <agent> <id> <message>"),
+    "log-tdd": (cmd_log_tdd, 3, "Log TDD phase: log-tdd <id> <RED|GREEN|REFACTOR> <message>"),
 }
 
 

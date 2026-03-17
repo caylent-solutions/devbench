@@ -1597,3 +1597,272 @@ class TestResolveUnitFile:
 
         assert result is not None
         assert result == ws_file
+
+
+# ---------------------------------------------------------------------------
+# E231-F2-S1-T1: cmd_log_tdd and log-tdd command registration
+# ---------------------------------------------------------------------------
+
+_WORK_UNIT_WITH_TDD_LOG_TEMPLATE = """\
+# {unit_id}: TDD Test
+
+## Status: in-progress
+
+## Comments
+
+## TDD Cycle Log
+"""
+
+
+def _make_wu_with_tdd_section(tmp_path: Path, unit_id: str = "E231-F2-S1-T1") -> Path:
+    """Create a work unit file with a ## TDD Cycle Log section."""
+    wu = tmp_path / f"{unit_id}.md"
+    wu.write_text(_WORK_UNIT_WITH_TDD_LOG_TEMPLATE.format(unit_id=unit_id), encoding="utf-8")
+    return wu
+
+
+def _make_backlog_index_for_tdd(tmp_path: Path, unit_id: str, wu_file: Path) -> Path:
+    """Create a minimal BACKLOG.md referencing the given work unit file."""
+    content = (
+        "# Backlog\n\n"
+        "## Full Work Unit Index\n\n"
+        "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+        "|-----|-------|------|--------|-------------|------|----------|\n"
+        f"| {unit_id} | TDD Test | Task | in-progress | None | caylent-solutions/devbench |"
+        f" `backlog/{unit_id}.md` |\n"
+    )
+    idx = tmp_path / "BACKLOG.md"
+    idx.write_text(content, encoding="utf-8")
+    return idx
+
+
+@pytest.mark.unit
+class TestCmdLogTdd:
+    """Tests for cmd_log_tdd — AC-1 through AC-6, AC-11."""
+
+    def _setup(self, tmp_path: Path, unit_id: str = "E231-F2-S1-T1") -> tuple[Path, Path]:
+        """Return (wu_file, backlog_index) with TDD Cycle Log section."""
+        wu_file = _make_wu_with_tdd_section(tmp_path, unit_id)
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir(exist_ok=True)
+        # Copy wu_file into backlog subdir so _resolve_unit_file finds it
+        backlog_wu = backlog_dir / f"{unit_id}.md"
+        backlog_wu.write_text(wu_file.read_text(encoding="utf-8"), encoding="utf-8")
+        backlog_index = _make_backlog_index_for_tdd(tmp_path, unit_id, backlog_wu)
+        return backlog_wu, backlog_index
+
+    def test_log_tdd_red_appends_to_tdd_cycle_log(self, tmp_path: Path) -> None:
+        """AC-1: log-tdd RED appends [RED] entry to ## TDD Cycle Log section."""
+        wu_file, backlog_index = self._setup(tmp_path)
+        unit = WorkUnit(
+            id="E231-F2-S1-T1",
+            title="TDD Test",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E231-F2-S1-T1.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_log_tdd("E231-F2-S1-T1", "RED", "Tests: test_foo.py. Command: make test-unit. Exit: 1.")
+
+        assert result == 0
+        content = wu_file.read_text(encoding="utf-8")
+        tdd_start = content.find("## TDD Cycle Log")
+        assert tdd_start != -1
+        tdd_section = content[tdd_start:]
+        assert "[RED]" in tdd_section
+
+    def test_log_tdd_green_appends_to_tdd_cycle_log(self, tmp_path: Path) -> None:
+        """AC-2: log-tdd GREEN appends [GREEN] entry to ## TDD Cycle Log section."""
+        wu_file, backlog_index = self._setup(tmp_path)
+        unit = WorkUnit(
+            id="E231-F2-S1-T1",
+            title="TDD Test",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E231-F2-S1-T1.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_log_tdd("E231-F2-S1-T1", "GREEN", "Command: make test-unit. Result: 5 passed, 0 failed.")
+
+        assert result == 0
+        content = wu_file.read_text(encoding="utf-8")
+        tdd_start = content.find("## TDD Cycle Log")
+        tdd_section = content[tdd_start:]
+        assert "[GREEN]" in tdd_section
+
+    def test_log_tdd_refactor_appends_to_tdd_cycle_log(self, tmp_path: Path) -> None:
+        """AC-3: log-tdd REFACTOR appends [REFACTOR] entry to ## TDD Cycle Log section."""
+        wu_file, backlog_index = self._setup(tmp_path)
+        unit = WorkUnit(
+            id="E231-F2-S1-T1",
+            title="TDD Test",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E231-F2-S1-T1.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_log_tdd("E231-F2-S1-T1", "REFACTOR", "No refactor needed. Tests: 5 passed, 0 failed")
+
+        assert result == 0
+        content = wu_file.read_text(encoding="utf-8")
+        tdd_start = content.find("## TDD Cycle Log")
+        tdd_section = content[tdd_start:]
+        assert "[REFACTOR]" in tdd_section
+
+    def test_log_tdd_phase_case_insensitive(self, tmp_path: Path) -> None:
+        """AC-4: Phase argument is case-insensitive — 'red' normalized to 'RED'."""
+        wu_file, backlog_index = self._setup(tmp_path)
+        unit = WorkUnit(
+            id="E231-F2-S1-T1",
+            title="TDD Test",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E231-F2-S1-T1.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_log_tdd("E231-F2-S1-T1", "red", "lowercase phase message")
+
+        assert result == 0
+        content = wu_file.read_text(encoding="utf-8")
+        # Entry should be normalized to uppercase [RED]
+        assert "[RED]" in content
+
+    def test_log_tdd_invalid_phase_exits_nonzero(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """AC-4: Invalid phase value exits non-zero with clear error message."""
+        wu_file, backlog_index = self._setup(tmp_path)
+        unit = WorkUnit(
+            id="E231-F2-S1-T1",
+            title="TDD Test",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E231-F2-S1-T1.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_log_tdd("E231-F2-S1-T1", "BLUE", "invalid phase")
+
+        assert result != 0
+        captured = capsys.readouterr()
+        assert "BLUE" in captured.err or "phase" in captured.err.lower()
+
+    def test_log_tdd_missing_section_exits_nonzero(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """AC-6: Exits non-zero when ## TDD Cycle Log section does not exist in the file."""
+        # Create a work unit WITHOUT the TDD Cycle Log section
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir(exist_ok=True)
+        wu_file = backlog_dir / "E231-F2-S1-T1.md"
+        wu_file.write_text(
+            "# E231-F2-S1-T1\n\n## Status: in-progress\n\n## Comments\n",
+            encoding="utf-8",
+        )
+        backlog_index = _make_backlog_index_for_tdd(tmp_path, "E231-F2-S1-T1", wu_file)
+        unit = WorkUnit(
+            id="E231-F2-S1-T1",
+            title="TDD Test",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E231-F2-S1-T1.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_log_tdd("E231-F2-S1-T1", "RED", "message without tdd section")
+
+        assert result != 0
+        captured = capsys.readouterr()
+        assert "TDD Cycle Log" in captured.err or "tdd" in captured.err.lower()
+
+    def test_log_tdd_cli_command_registered(self) -> None:
+        """AC-1: 'log-tdd' is a recognized command in the CLI command registry."""
+        assert "log-tdd" in cli._COMMANDS, (
+            "log-tdd command must be registered in cli._COMMANDS"
+        )
+
+    def test_log_tdd_entry_not_in_comments_section(self, tmp_path: Path) -> None:
+        """AC-11: TDD Cycle Log entries do not appear in ## Comments section."""
+        wu_file, backlog_index = self._setup(tmp_path)
+        unit = WorkUnit(
+            id="E231-F2-S1-T1",
+            title="TDD Test",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E231-F2-S1-T1.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            cli.cmd_log_tdd("E231-F2-S1-T1", "RED", "unique-tdd-marker-xyz")
+
+        content = wu_file.read_text(encoding="utf-8")
+        comments_start = content.find("## Comments")
+        tdd_start = content.find("## TDD Cycle Log")
+        # Extract comments section (before TDD Cycle Log)
+        comments_section = content[comments_start:tdd_start] if tdd_start > comments_start else content[comments_start:]
+        assert "unique-tdd-marker-xyz" not in comments_section, (
+            f"TDD entry leaked into ## Comments: {comments_section}"
+        )

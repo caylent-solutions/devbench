@@ -177,6 +177,13 @@ ALL_REQUIRED_JUDGE_NAMES: frozenset[str] = REVIEW_JUDGE_NAMES | SECURITY_JUDGE_N
 COMMENT_AGENT_TEMPLATE: str = "[{timestamp}] [agent/{name}] {message}\n"
 
 # ---------------------------------------------------------------------------
+# TDD Cycle Log section header and entry format template
+# ---------------------------------------------------------------------------
+TDD_CYCLE_LOG_SECTION_HEADER: str = "## TDD Cycle Log"
+TDD_ENTRY_TEMPLATE: str = "- [{phase}] {timestamp} \u2014 {message}\n"
+VALID_TDD_PHASES: frozenset[str] = frozenset({"RED", "GREEN", "REFACTOR"})
+
+# ---------------------------------------------------------------------------
 # Epic ID regex — matches top-level epic IDs such as "E200", "E1", etc.
 # A row is an epic row when its ID is exactly E<digits> with no hyphen suffix.
 # ---------------------------------------------------------------------------

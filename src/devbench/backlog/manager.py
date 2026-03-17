@@ -37,6 +37,7 @@ from devbench.constants import (
     ALL_REQUIRED_JUDGE_NAMES,
     BACKLOG_STATUS_RE,
     BACKLOG_SUBDIR,
+    COMMENT_AGENT_TEMPLATE,
     COMMENT_ENTRY_TEMPLATE,
     COMMENTS_SECTION_HEADER,
     DEPENDENCY_NONE_VALUES,
@@ -451,6 +452,30 @@ class BacklogManager:
             content = content.rstrip("\n") + "\n\n" + entry
         else:
             content = content.rstrip("\n") + "\n\n" + comments_header + "\n\n" + entry
+
+        work_unit_path.write_text(content, encoding="utf-8")
+
+    def _append_agent_comment(self, work_unit_path: Path, agent_name: str, message: str) -> None:
+        """Append an agent comment using COMMENT_AGENT_TEMPLATE format.
+
+        Writes: ``[YYYY-MM-DD HH:MM UTC] [agent/<agent_name>] <message>``
+
+        Args:
+            work_unit_path: Path to the work-unit ``.md`` file.
+            agent_name: Agent name (e.g. ``git_ops``, ``orchestrator``).
+            message: Message to append (may contain token and detail).
+        """
+        timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+        entry = COMMENT_AGENT_TEMPLATE.format(
+            timestamp=timestamp, name=agent_name, message=message,
+        )
+
+        content = work_unit_path.read_text(encoding="utf-8")
+
+        if COMMENTS_SECTION_HEADER in content:
+            content = content.rstrip("\n") + "\n\n" + entry
+        else:
+            content = content.rstrip("\n") + "\n\n" + COMMENTS_SECTION_HEADER + "\n\n" + entry
 
         work_unit_path.write_text(content, encoding="utf-8")
 

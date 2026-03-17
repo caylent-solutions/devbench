@@ -292,7 +292,7 @@ class TestCmdSetStatus:
         mock_mgr = MagicMock()
 
         with patch("devbench.cli.BacklogParser", return_value=mock_parser):
-            with patch("devbench.cli.BACKLOG_ROOT", backlog_dir):
+            with patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent):
                 with patch("devbench.cli.BacklogManager", return_value=mock_mgr):
                     result = cli.cmd_set_status("E0-F1-S1-T2", "in-progress")
 
@@ -325,7 +325,7 @@ class TestCmdMarkDone:
         mock_mgr = MagicMock()
 
         with patch("devbench.cli.BacklogParser", return_value=mock_parser):
-            with patch("devbench.cli.BACKLOG_ROOT", backlog_dir):
+            with patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent):
                 with patch("devbench.cli.BacklogManager", return_value=mock_mgr):
                     result = cli.cmd_mark_done("E0-F1-S1-T2")
 
@@ -345,7 +345,7 @@ class TestCmdMarkDone:
         mock_mgr.mark_done.side_effect = RuntimeError("not all required judges passed")
 
         with patch("devbench.cli.BacklogParser", return_value=mock_parser):
-            with patch("devbench.cli.BACKLOG_ROOT", backlog_dir):
+            with patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent):
                 with patch("devbench.cli.BacklogManager", return_value=mock_mgr):
                     result = cli.cmd_mark_done("E0-F1-S1-T2")
 
@@ -1200,3 +1200,400 @@ class TestCmdLogComment:
 
         assert result == 1
         assert "not found" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# E230-F1-S1-T1: Discrete event comments in cmd_git_ops and cmd_mark_done
+# ---------------------------------------------------------------------------
+
+
+def _make_git_ops_unit(unit_id: str = "E230-F1-S1-T1") -> WorkUnit:
+    """Return a WorkUnit suitable for cmd_git_ops tests."""
+    return WorkUnit(
+        id=unit_id,
+        title="Git ops comment test",
+        status=WorkUnitStatus.IN_PROGRESS,
+        unit_type=WorkUnitType.TASK,
+        file_path=Path(f"backlog/{unit_id}.md"),
+        repo="caylent-solutions/devbench",
+        dependencies=[],
+    )
+
+
+@pytest.mark.unit
+class TestCmdGitOpsEventComments:
+    """Tests for AC-1, AC-2, AC-3, AC-5, AC-7: git_ops appends audit comments."""
+
+    def _build_mock_ops(self, pr_url: str = "https://github.com/org/repo/pull/42") -> MagicMock:
+        mock_ops = MagicMock()
+        mock_ops.create_pr.return_value = pr_url
+        mock_ops.wait_for_checks.return_value = True
+        return mock_ops
+
+    def _make_wu_file(self, tmp_path: Path, unit_id: str) -> Path:
+        """Create wu_file at tmp_path/backlog/{unit_id}.md (matches BACKLOG_ROOT=tmp_path)."""
+        backlog_subdir = tmp_path / "backlog"
+        backlog_subdir.mkdir(exist_ok=True)
+        wu_file = backlog_subdir / f"{unit_id}.md"
+        wu_file.write_text(f"# {unit_id}\n\n## Status: in-progress\n\n## Comments\n", encoding="utf-8")
+        return wu_file
+
+    def test_git_ops_appends_pr_created_comment(
+        self, tmp_path: Path
+    ) -> None:
+        """AC-1: After create_pr succeeds, Comments contains [agent/git_ops] [PR_CREATED] <url>."""
+        unit_id = "E230-F1-S1-T1"
+        pr_url = "https://github.com/org/repo/pull/42"
+        unit = _make_git_ops_unit(unit_id)
+
+        wu_file = self._make_wu_file(tmp_path, unit_id)
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        mock_ops = self._build_mock_ops(pr_url)
+        repo_path = tmp_path / "devbench"
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.UPDATE_SUBMODULE", False),
+            patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+        ):
+            result = cli.cmd_git_ops(unit_id)
+
+        assert result == 0
+        content = wu_file.read_text(encoding="utf-8")
+        assert "[agent/git_ops]" in content, f"[agent/git_ops] not found in:\n{content}"
+        assert "[PR_CREATED]" in content, f"[PR_CREATED] not found in:\n{content}"
+        assert pr_url in content, f"PR URL not found in:\n{content}"
+
+    def test_git_ops_appends_pr_merged_comment_normal_path(
+        self, tmp_path: Path
+    ) -> None:
+        """AC-2: After merge_pr succeeds (normal), Comments contains [agent/git_ops] [PR_MERGED] <url>."""
+        unit_id = "E230-F1-S1-T1"
+        pr_url = "https://github.com/org/repo/pull/42"
+        unit = _make_git_ops_unit(unit_id)
+
+        wu_file = self._make_wu_file(tmp_path, unit_id)
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        mock_ops = self._build_mock_ops(pr_url)
+        repo_path = tmp_path / "devbench"
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.UPDATE_SUBMODULE", False),
+            patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+        ):
+            result = cli.cmd_git_ops(unit_id)
+
+        assert result == 0
+        content = wu_file.read_text(encoding="utf-8")
+        assert "[agent/git_ops]" in content
+        assert "[PR_MERGED]" in content, f"[PR_MERGED] not found in:\n{content}"
+        assert pr_url in content
+
+    def test_git_ops_appends_pr_merged_comment_rebase_retry_path(
+        self, tmp_path: Path
+    ) -> None:
+        """AC-3: After merge_pr succeeds via rebase-retry, Comments contains [agent/git_ops] [PR_MERGED] <url>."""
+        from devbench.github.git_ops import ConflictingPRError
+
+        unit_id = "E230-F1-S1-T1"
+        pr_url = "https://github.com/org/repo/pull/42"
+        unit = _make_git_ops_unit(unit_id)
+
+        wu_file = self._make_wu_file(tmp_path, unit_id)
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        mock_ops = self._build_mock_ops(pr_url)
+        # First merge raises ConflictingPRError, second succeeds
+        mock_ops.merge_pr.side_effect = [ConflictingPRError("CONFLICTING"), None]
+        repo_path = tmp_path / "devbench"
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.UPDATE_SUBMODULE", False),
+            patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+        ):
+            result = cli.cmd_git_ops(unit_id)
+
+        assert result == 0
+        content = wu_file.read_text(encoding="utf-8")
+        assert "[PR_MERGED]" in content, f"[PR_MERGED] not found after rebase-retry in:\n{content}"
+        assert pr_url in content
+
+    def test_event_comments_contain_no_review_token(
+        self, tmp_path: Path
+    ) -> None:
+        """AC-5: git_ops event entries contain no [REVIEW_PASS] or [REVIEW_FAIL] token."""
+        unit_id = "E230-F1-S1-T1"
+        pr_url = "https://github.com/org/repo/pull/42"
+        unit = _make_git_ops_unit(unit_id)
+
+        wu_file = self._make_wu_file(tmp_path, unit_id)
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        mock_ops = self._build_mock_ops(pr_url)
+        repo_path = tmp_path / "devbench"
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.UPDATE_SUBMODULE", False),
+            patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+        ):
+            result = cli.cmd_git_ops(unit_id)
+
+        assert result == 0
+        content = wu_file.read_text(encoding="utf-8")
+        assert "[REVIEW_PASS]" not in content
+        assert "[REVIEW_FAIL]" not in content
+
+    def test_git_ops_warns_but_does_not_fail_when_unit_file_missing(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-7: If work unit file cannot be resolved, cmd_git_ops warns but does not fail."""
+        unit_id = "E230-F1-S1-T1"
+        pr_url = "https://github.com/org/repo/pull/42"
+        unit = _make_git_ops_unit(unit_id)
+        # Note: wu_file is NOT created — file resolution should fail gracefully
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        mock_ops = self._build_mock_ops(pr_url)
+        repo_path = tmp_path / "devbench"
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.UPDATE_SUBMODULE", False),
+            patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+        ):
+            result = cli.cmd_git_ops(unit_id)
+
+        # Must NOT fail due to missing file — git ops already succeeded
+        assert result == 0
+
+
+@pytest.mark.unit
+class TestCmdMarkDoneEventComment:
+    """Tests for AC-4, AC-5: cmd_mark_done appends [orchestrator] [DONE] comment."""
+
+    def test_mark_done_appends_done_comment(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-4: After cmd_mark_done completes, Comments contains [orchestrator] [DONE] Work unit <id> completed.
+
+        Uses a real BacklogManager (not mocked) so that _append_agent_comment actually writes to the file.
+        Provides a real BACKLOG.md so mark_done can update it.
+        """
+        from devbench.constants import ALL_REQUIRED_JUDGE_NAMES
+
+        unit_id = "E230-F1-S1-T1"
+        unit = WorkUnit(
+            id=unit_id,
+            title="Mark done comment test",
+            status=WorkUnitStatus.IN_REVIEW,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path(f"backlog/{unit_id}.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+
+        # Build BACKLOG.md with the unit row
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text(
+            "# Backlog\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|---|---|---|---|---|---|---|\n"
+            f"| {unit_id} | Mark done comment test | Task | in-review | None | repo | `backlog/{unit_id}.md` |\n",
+            encoding="utf-8",
+        )
+
+        # All judges pass so mark_done gate is satisfied
+        all_pass_comments = "".join(
+            f"[2026-01-01 00:00 UTC] [judge/{j}] [REVIEW_PASS] ok\n"
+            for j in sorted(ALL_REQUIRED_JUDGE_NAMES)
+        )
+
+        backlog_subdir = tmp_path / "backlog"
+        backlog_subdir.mkdir()
+        wu_file = backlog_subdir / f"{unit_id}.md"
+        wu_file.write_text(
+            f"# {unit_id}\n\n## Status: in-review\n\n## Comments\n\n{all_pass_comments}",
+            encoding="utf-8",
+        )
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_mark_done(unit_id)
+
+        assert result == 0
+        content = wu_file.read_text(encoding="utf-8")
+        assert "[agent/orchestrator]" in content, f"[agent/orchestrator] not found in:\n{content}"
+        assert "[DONE]" in content, f"[DONE] not found in:\n{content}"
+        assert unit_id in content
+
+    def test_mark_done_done_comment_contains_no_review_token(
+        self, tmp_path: Path
+    ) -> None:
+        """AC-5: [DONE] entry appended by cmd_mark_done has no [REVIEW_PASS] or [REVIEW_FAIL] token."""
+        from devbench.constants import ALL_REQUIRED_JUDGE_NAMES
+
+        unit_id = "E230-F1-S1-T1"
+        unit = WorkUnit(
+            id=unit_id,
+            title="Mark done comment test",
+            status=WorkUnitStatus.IN_REVIEW,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path(f"backlog/{unit_id}.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text(
+            "# Backlog\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|---|---|---|---|---|---|---|\n"
+            f"| {unit_id} | Mark done comment test | Task | in-review | None | repo | `backlog/{unit_id}.md` |\n",
+            encoding="utf-8",
+        )
+
+        all_pass_comments = "".join(
+            f"[2026-01-01 00:00 UTC] [judge/{j}] [REVIEW_PASS] ok\n"
+            for j in sorted(ALL_REQUIRED_JUDGE_NAMES)
+        )
+
+        backlog_subdir = tmp_path / "backlog"
+        backlog_subdir.mkdir()
+        wu_file = backlog_subdir / f"{unit_id}.md"
+        wu_file.write_text(
+            f"# {unit_id}\n\n## Status: in-review\n\n## Comments\n\n{all_pass_comments}",
+            encoding="utf-8",
+        )
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            cli.cmd_mark_done(unit_id)
+
+        content = wu_file.read_text(encoding="utf-8")
+        # The [DONE] comment appended by cmd_mark_done must not contain review tokens
+        # The existing [REVIEW_PASS] lines from the all_pass_comments are present in content
+        # but we only need to verify the NEW entry (last line) doesn't have them.
+        # Split on the comments that were there before:
+        done_section = content.split("[REVIEW_PASS] ok")[-1]
+        assert "[REVIEW_PASS]" not in done_section
+        assert "[REVIEW_FAIL]" not in done_section
+
+
+@pytest.mark.unit
+class TestResolveUnitFile:
+    """AC-8: _resolve_unit_file helper extracted and used by relevant commands."""
+
+    def test_resolve_unit_file_returns_path_when_found_under_backlog_root(
+        self, tmp_path: Path
+    ) -> None:
+        """_resolve_unit_file returns the file path when found under BACKLOG_ROOT."""
+        unit = WorkUnit(
+            id="E230-F1-S1-T1",
+            title="Test",
+            status=WorkUnitStatus.IN_QUEUE,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E230-F1-S1-T1.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+        wu_file = tmp_path / "backlog" / "E230-F1-S1-T1.md"
+        wu_file.parent.mkdir(parents=True, exist_ok=True)
+        wu_file.write_text("# E230-F1-S1-T1\n\n## Status: in-queue\n", encoding="utf-8")
+
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+        ):
+            result = cli._resolve_unit_file(unit)
+
+        assert result is not None
+        assert result == wu_file
+
+    def test_resolve_unit_file_returns_none_when_not_found(
+        self, tmp_path: Path
+    ) -> None:
+        """AC-8: _resolve_unit_file returns None when file not found in either location."""
+        unit = WorkUnit(
+            id="E230-F1-S1-T1",
+            title="Test",
+            status=WorkUnitStatus.IN_QUEUE,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E230-F1-S1-T1.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+        # No file is created — both paths will be missing
+
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog_root"),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace_root"),
+        ):
+            result = cli._resolve_unit_file(unit)
+
+        assert result is None
+
+    def test_resolve_unit_file_falls_back_to_workspace_root(
+        self, tmp_path: Path
+    ) -> None:
+        """_resolve_unit_file falls back to WORKSPACE_ROOT when file not found under BACKLOG_ROOT."""
+        unit = WorkUnit(
+            id="E230-F1-S1-T1",
+            title="Test",
+            status=WorkUnitStatus.IN_QUEUE,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E230-F1-S1-T1.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+        # File exists only under workspace_root
+        ws_file = tmp_path / "workspace" / "backlog" / "E230-F1-S1-T1.md"
+        ws_file.parent.mkdir(parents=True, exist_ok=True)
+        ws_file.write_text("# E230-F1-S1-T1\n\n## Status: in-queue\n", encoding="utf-8")
+
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog_root"),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+        ):
+            result = cli._resolve_unit_file(unit)
+
+        assert result is not None
+        assert result == ws_file

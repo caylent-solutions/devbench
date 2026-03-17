@@ -168,10 +168,8 @@ def cmd_claim(unit_id: str) -> int:
     if unit is None:
         print(f"ERROR: unit '{unit_id}' not found in backlog index", file=sys.stderr)
         return 1
-    wu_file = BACKLOG_ROOT / unit.file_path if not unit.file_path.is_absolute() else unit.file_path
-    if not wu_file.exists():
-        wu_file = WORKSPACE_ROOT / unit.file_path
-    if not wu_file.exists():
+    wu_file = _resolve_unit_file(unit)
+    if wu_file is None:
         print(f"ERROR: work unit file not found for '{unit_id}'", file=sys.stderr)
         return 1
     mgr = BacklogManager()
@@ -201,9 +199,10 @@ def cmd_set_status(unit_id: str, new_status: str) -> int:
         print(f"ERROR: Work unit '{unit_id}' not found", file=sys.stderr)
         return 1
 
-    wu_file = BACKLOG_ROOT / target.file_path if not target.file_path.is_absolute() else target.file_path
-    if not wu_file.exists():
-        wu_file = WORKSPACE_ROOT / target.file_path
+    wu_file = _resolve_unit_file(target)
+    if wu_file is None:
+        print(f"ERROR: Work unit file not found for '{unit_id}'", file=sys.stderr)
+        return 1
 
     mgr = BacklogManager()
     mgr.force_status(wu_file, BACKLOG_INDEX, unit_id, new_status)
@@ -228,9 +227,10 @@ def cmd_mark_done(unit_id: str) -> int:
         print(f"ERROR: Work unit '{unit_id}' not found", file=sys.stderr)
         return 1
 
-    wu_file = BACKLOG_ROOT / target.file_path if not target.file_path.is_absolute() else target.file_path
-    if not wu_file.exists():
-        wu_file = WORKSPACE_ROOT / target.file_path
+    wu_file = _resolve_unit_file(target)
+    if wu_file is None:
+        print(f"ERROR: Work unit file not found for '{unit_id}'", file=sys.stderr)
+        return 1
 
     mgr = BacklogManager()
     try:
@@ -238,6 +238,8 @@ def cmd_mark_done(unit_id: str) -> int:
     except RuntimeError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
+
+    mgr._append_agent_comment(wu_file, "orchestrator", f"[DONE] Work unit {unit_id} completed")
 
     logger.info("Marked %s as done", unit_id)
     print(f"Marked {unit_id} as done")
@@ -639,11 +641,22 @@ def cmd_git_ops(unit_id: str) -> int:
 
     from devbench.github.git_ops import ConflictingPRError
 
+    wu_file = _resolve_unit_file(unit)
+    if wu_file is None:
+        logger.warning(
+            "Could not resolve work unit file for %s — audit comments will be skipped", unit_id
+        )
+
+    mgr = BacklogManager()
+
     ops.commit_and_push(canonical_repo, repo_path, branch, commit_message)
     logger.info("Committed and pushed %s", unit_id)
 
     pr_url = ops.create_pr(canonical_repo, branch, pr_title, pr_body, repo_path=repo_path)
     logger.info("Created PR: %s", pr_url)
+
+    if wu_file is not None:
+        mgr._append_agent_comment(wu_file, "git_ops", f"[PR_CREATED] {pr_url}")
 
     # Extract PR number from URL (e.g. https://github.com/org/repo/pull/42)
     pr_number_str = pr_url.rstrip("/").split("/")[-1]
@@ -674,6 +687,9 @@ def cmd_git_ops(unit_id: str) -> int:
                 file=sys.stderr,
             )
             return 1
+
+    if wu_file is not None:
+        mgr._append_agent_comment(wu_file, "git_ops", f"[PR_MERGED] {pr_url}")
 
     logger.info("Merged PR #%d for %s", pr_number, unit_id)
 
@@ -727,6 +743,24 @@ def _find_unit(units: list[WorkUnit], unit_id: str) -> WorkUnit | None:
         if unit.id.lower() == unit_id.lower():
             return unit
     return None
+
+
+def _resolve_unit_file(unit: WorkUnit) -> Path | None:
+    """Return the absolute path to the work unit file, or None if not found.
+
+    Tries BACKLOG_ROOT / unit.file_path first, then WORKSPACE_ROOT / unit.file_path.
+
+    Args:
+        unit: WorkUnit whose file_path must be resolved.
+
+    Returns:
+        The resolved :class:`pathlib.Path` if the file exists, ``None`` otherwise.
+    """
+    wu_file = BACKLOG_ROOT / unit.file_path if not unit.file_path.is_absolute() else unit.file_path
+    if wu_file.exists():
+        return wu_file
+    wu_file = WORKSPACE_ROOT / unit.file_path
+    return wu_file if wu_file.exists() else None
 
 
 # Command registry: name -> (handler, min_args, description)

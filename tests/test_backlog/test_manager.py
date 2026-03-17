@@ -1533,3 +1533,130 @@ class TestUpdateStatusSummary:
         assert "in-progress" in index_rows[0], (
             f"Index row must show in-progress, got: {index_rows[0]!r}"
         )
+
+
+class TestHoldStatus:
+    """Tests for the 'hold' status value.
+
+    AC-1: 'hold' is a recognized status (no validation error).
+    AC-2: 'hold' units are never returned by get_parallel_candidates().
+    AC-4: 'hold' units are not treated as 'blocked' or 'in-queue'.
+    """
+
+    def test_hold_is_valid_status(self) -> None:
+        """AC-1: 'hold' is a recognized status value in VALID_STATUSES.
+
+        Given: The VALID_STATUSES mapping in constants
+        When: 'hold' is looked up
+        Then: It is present as a valid status key
+        Spec: AC-1
+        """
+        assert "hold" in VALID_STATUSES
+
+    def test_hold_constant_exists(self) -> None:
+        """AC-1: STATUS_HOLD constant exists in constants module.
+
+        Given: The constants module
+        When: STATUS_HOLD is imported
+        Then: Its value is 'hold'
+        Spec: AC-1
+        """
+        from devbench.constants import STATUS_HOLD
+        assert STATUS_HOLD == "hold"
+
+    def test_validate_does_not_report_hold_as_unknown_status(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """AC-1: validate() does not report 'hold' as an unknown status.
+
+        Given: A BACKLOG.md with a unit whose status is 'hold'
+              and a corresponding work-unit file with '## Status: hold'
+        When: BacklogManager.validate() is called
+        Then: No error about unknown/invalid status is returned for the unit
+        Spec: AC-1
+        """
+        wu_file = backlog_dir / "E0-F1-S1-T1.md"
+        wu_file.write_text("# E0-F1-S1-T1\n\n## Status: hold\n\n## Comments\n")
+
+        index_content = (
+            "# Backlog\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|----------|\n"
+            "| E0-F1-S1-T1 | Hold Task | Task | hold | None | git-repo | `backlog/E0-F1-S1-T1.md` |\n"
+        )
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(index_content)
+
+        manager = BacklogManager()
+        errors = manager.validate(index_path, tmp_path)
+
+        status_errors = [e for e in errors if "E0-F1-S1-T1" in e and "status" in e.lower()]
+        assert not status_errors, f"Unexpected status errors for hold unit: {status_errors}"
+
+    def test_hold_not_treated_as_blocked_or_in_queue(self) -> None:
+        """AC-4: 'hold' is distinct from 'blocked' and 'in-queue' in VALID_STATUSES.
+
+        Given: The VALID_STATUSES mapping
+        When: The canonical form of 'hold' is inspected
+        Then: It is 'hold', not 'blocked' and not 'in-queue'
+        Spec: AC-4
+        """
+        assert VALID_STATUSES["hold"] == "hold"
+        assert VALID_STATUSES["hold"] != "blocked"
+        assert VALID_STATUSES["hold"] != "in-queue"
+
+    def test_hold_excluded_from_dep_status_check(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """AC-4: validate() does not flag a 'hold' unit for dep-status violations.
+
+        Given: A BACKLOG.md where a 'hold' unit has an unsatisfied dependency
+        When: BacklogManager.validate() is called
+        Then: No dep-status error is reported for the 'hold' unit
+        Spec: AC-4
+        """
+        dep_file = backlog_dir / "E0-F1-S1-T1.md"
+        dep_file.write_text("# E0-F1-S1-T1\n\n## Status: in-queue\n\n## Comments\n")
+
+        hold_file = backlog_dir / "E0-F1-S1-T2.md"
+        hold_file.write_text("# E0-F1-S1-T2\n\n## Status: hold\n\n## Comments\n")
+
+        index_content = (
+            "# Backlog\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|----------|\n"
+            "| E0-F1-S1-T1 | Dep Task | Task | in-queue | None | git-repo | `backlog/E0-F1-S1-T1.md` |\n"
+            "| E0-F1-S1-T2 | Hold Task | Task | hold | E0-F1-S1-T1 | git-repo | `backlog/E0-F1-S1-T2.md` |\n"
+        )
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(index_content)
+
+        manager = BacklogManager()
+        errors = manager.validate(index_path, tmp_path)
+
+        dep_status_errors = [
+            e for e in errors
+            if "E0-F1-S1-T2" in e and "dep" in e.lower()
+        ]
+        assert not dep_status_errors, (
+            f"'hold' unit must not be flagged for dep-status violations: {dep_status_errors}"
+        )
+
+    def test_force_status_accepts_hold(
+        self, tmp_work_unit_file: Path, backlog_index_titlecase: Path
+    ) -> None:
+        """AC-3: force_status accepts 'hold' as a valid target status.
+
+        Given: A work-unit file and a BACKLOG.md index
+        When: force_status is called with 'hold'
+        Then: The work-unit file is updated to '## Status: hold'
+              No ValueError is raised
+        Spec: AC-3
+        """
+        manager = BacklogManager()
+        manager.force_status(tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1", "hold")
+
+        content = tmp_work_unit_file.read_text()
+        assert "## Status: hold" in content

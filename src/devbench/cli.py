@@ -16,8 +16,8 @@ Commands::
 
     status [--detail]       Show backlog summary (counts by status).
                             With --detail: also lists all in-queue Tasks in
-                            priority order and all blocked Tasks with their
-                            unresolved dependency IDs.
+                            priority order, all blocked Tasks with their
+                            unresolved dependency IDs, and all hold Tasks.
     next [--claim]          Print the next actionable work unit ID and title.
                             Read-only by default; with --claim also sets the
                             unit status to in-progress.
@@ -89,29 +89,36 @@ logger = logging.getLogger("devbench.cli")
 def cmd_status(detail: bool = False) -> int:
     """Print backlog summary grouped by status.
 
-    When ``detail`` is ``True``, appends two extra sections after the summary:
+    When ``detail`` is ``True``, appends three extra sections after the summary:
 
     - **In Queue (N):** all actionable Task-level work units in priority order
       (in-progress first, then in-queue sorted by numeric ID), matching the
       order returned by ``get_parallel_candidates``.
     - **Blocked (N):** all blocked Task-level work units with the dependency
       IDs they are waiting on.
+    - **Hold (N):** all hold Task-level work units (no dep context; they are on
+      hold rather than blocked by a specific dependency).
 
     Story, Feature, and Epic rollup rows are never shown in the detail sections.
     """
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     units = parser.parse_index()
 
-    counts: dict[str, int] = {}
+    # Build a mapping from display string to enum member.  If any entry in
+    # DISPLAY_STATUS_VALUES does not correspond to a known WorkUnitStatus enum
+    # member, this raises KeyError immediately (fail-fast — no silent mismatch).
+    _status_by_display = {s.value: s for s in WorkUnitStatus}
+
+    counts: dict[WorkUnitStatus, int] = {}
     for unit in units:
-        key = unit.status.value.lower()
-        counts[key] = counts.get(key, 0) + 1
+        counts[unit.status] = counts.get(unit.status, 0) + 1
 
     total = len(units)
     print("Backlog Status Summary")
     print("=" * STATUS_SEPARATOR_WIDTH)
     for status_val in DISPLAY_STATUS_VALUES:
-        count = counts.get(status_val.lower(), 0)
+        status_enum = _status_by_display[status_val]  # KeyError if not in enum — fail-fast
+        count = counts.get(status_enum, 0)
         print(f"  {status_val:<15} {count:>4}")
     print(f"  {'TOTAL':<15} {total:>4}")
 
@@ -143,7 +150,7 @@ def _print_status_detail(
     in_queue_candidates: list[WorkUnit],
     all_units: list[WorkUnit],
 ) -> None:
-    """Print the --detail sections: in-queue Tasks and blocked Tasks.
+    """Print the --detail sections: in-queue Tasks, blocked Tasks, and hold Tasks.
 
     ``in_queue_candidates`` is already sorted by priority (from
     ``get_parallel_candidates``), so order is preserved as-is.
@@ -167,6 +174,15 @@ def _print_status_detail(
         unmet = [dep for dep in unit.dependencies if dep not in done_ids]
         waiting = ", ".join(unmet) if unmet else "(no blocking dep — re-check deps)"
         print(f"  {unit.id}  waiting on: {waiting}")
+
+    # Hold tasks (no dep context — they are on hold, not blocked by a specific dep)
+    hold_tasks = [
+        u for u in all_units
+        if u.status is WorkUnitStatus.HOLD and u.unit_type is WorkUnitType.TASK
+    ]
+    print(f"\nHold ({len(hold_tasks)}):")
+    for unit in hold_tasks:
+        print(f"  {unit.id}  {unit.title}")
 
 
 def cmd_next(claim: bool = False) -> int:

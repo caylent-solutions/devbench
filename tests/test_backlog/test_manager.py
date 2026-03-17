@@ -1217,3 +1217,191 @@ class TestBacklogManagerRename:
         assert not hasattr(BacklogManager, "evaluate"), (
             "BacklogManager must not have evaluate(); judge interface was intentionally removed"
         )
+
+
+# ---------------------------------------------------------------------------
+# E26-F1-S1-T1: _update_status_summary keeps Status Summary in sync
+# ---------------------------------------------------------------------------
+
+
+class TestUpdateStatusSummary:
+    """AC tests for E26-F1-S1-T1: _set_status keeps Status Summary table in sync."""
+
+    def _make_index_with_summary(
+        self,
+        tmp_path: Path,
+        backlog_dir: Path,
+        *,
+        e26_t1_status: str = "in-queue",
+    ) -> tuple[Path, Path]:
+        """Build a minimal BACKLOG.md with a Status Summary and a Full Work Unit Index.
+
+        Returns (index_path, work_unit_file for E26-F1-S1-T1).
+
+        Two tasks exist for E26-F1-S1 so that marking T1 done does NOT trigger
+        rollup (T2 remains in-queue).  This keeps the test focused on the
+        summary update logic rather than the rollup logic.
+        """
+        content = f"""\
+# Backlog
+
+## Status Summary
+
+| Epic | Title | Features | Stories | Tasks | Total | Done | In Progress | In Review | In Queue |
+|------|-------|----------|---------|-------|-------|------|-------------|-----------|----------|
+| E26 | Backlog Status Summary Sync | 1 | 1 | 2 | 5 | 0 | 0 | 0 | 5 |
+| **Total** | | **1** | **1** | **2** | **5** | **0** | **0** | **0** | **5** |
+
+## Full Work Unit Index
+
+| ID | Title | Type | Status | Dependencies | Repo | File Path |
+|----|-------|------|--------|--------------|------|-----------|
+| E26-F1-S1-T1 | Update Status Summary | Task | {e26_t1_status} | None | devbench | `backlog/E26-F1-S1-T1.md` |
+| E26-F1-S1-T2 | Another Task | Task | in-queue | None | devbench | `backlog/E26-F1-S1-T2.md` |
+| E26-F1-S1 | Update Summary Story | Story | in-queue | None | devbench | `backlog/E26-F1-S1.md` |
+| E26-F1 | Sync Feature | Feature | in-queue | None | devbench | `backlog/E26-F1.md` |
+| E26 | Backlog Status Summary Sync | Epic | in-queue | None | devbench | `backlog/E26.md` |
+"""
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(content, encoding="utf-8")
+
+        wu_file = backlog_dir / "E26-F1-S1-T1.md"
+        wu_file.write_text(
+            f"# E26-F1-S1-T1\n\n## Status: {e26_t1_status}\n\n## Comments\n",
+            encoding="utf-8",
+        )
+        for unit_id in ("E26-F1-S1-T2", "E26-F1-S1", "E26-F1", "E26"):
+            (backlog_dir / f"{unit_id}.md").write_text(
+                f"# {unit_id}\n\n## Status: in-queue\n\n## Comments\n",
+                encoding="utf-8",
+            )
+
+        return index_path, wu_file
+
+    def test_set_status_updates_status_summary_done_count(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """AC-1: Calling _set_status updates Status Summary done/in-queue counts.
+
+        Given: A BACKLOG.md with Status Summary showing E26 has 0 done, 4 in-queue
+               and a Full Work Unit Index where E26-F1-S1-T1 is in-queue
+        When: force_status sets E26-F1-S1-T1 to done
+        Then: The Status Summary row for E26 shows 1 done and 3 in-queue
+        Spec: AC-1
+        """
+        index_path, wu_file = self._make_index_with_summary(tmp_path, backlog_dir)
+
+        manager = BacklogManager()
+        manager.force_status(wu_file, index_path, "E26-F1-S1-T1", "done")
+
+        content = index_path.read_text(encoding="utf-8")
+        summary_lines = [
+            ln for ln in content.splitlines()
+            if "E26" in ln and "Backlog Status Summary Sync" in ln
+            and "Epic" not in ln
+        ]
+        assert summary_lines, f"E26 Status Summary row not found in:\n{content}"
+        summary_row = summary_lines[0]
+        # Strip leading/trailing pipe and split; preserve all cells including empty ones
+        cells = [c.strip() for c in summary_row.strip().strip("|").split("|")]
+        # columns (0-indexed after stripping outer pipes):
+        # Epic, Title, Features, Stories, Tasks, Total, Done, In Progress, In Review, In Queue
+        done_idx = 6
+        in_queue_idx = 9
+        assert cells[done_idx] == "1", (
+            f"Done count must be 1 after marking T1 done, got {cells[done_idx]!r} in row: {summary_row!r}"
+        )
+        assert cells[in_queue_idx] == "4", (
+            f"In Queue count must be 4 after marking T1 done (T2+S1+F1+E26 remain), "
+            f"got {cells[in_queue_idx]!r} in row: {summary_row!r}"
+        )
+
+    def test_set_status_updates_status_summary_total_row(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """AC-2: The **Total** row in the Status Summary reflects aggregate counts after each write.
+
+        Given: A BACKLOG.md with a **Total** row showing 0 done, 4 in-queue
+        When: force_status sets E26-F1-S1-T1 to done
+        Then: The **Total** row shows 1 done and 3 in-queue
+        Spec: AC-2
+        """
+        index_path, wu_file = self._make_index_with_summary(tmp_path, backlog_dir)
+
+        manager = BacklogManager()
+        manager.force_status(wu_file, index_path, "E26-F1-S1-T1", "done")
+
+        content = index_path.read_text(encoding="utf-8")
+        total_lines = [
+            ln for ln in content.splitlines()
+            if "**Total**" in ln
+        ]
+        assert total_lines, f"**Total** row not found in Status Summary:\n{content}"
+        total_row = total_lines[0]
+        # Split preserving all cells including empty ones; strip leading/trailing pipes
+        cells = [c.strip() for c in total_row.strip().strip("|").split("|")]
+        # columns (0-indexed): Epic/Total, Title, Features, Stories, Tasks,
+        # Total-count, Done, In Progress, In Review, In Queue
+        done_idx = 6
+        in_queue_idx = 9
+        done_val = cells[done_idx].strip("*")
+        in_queue_val = cells[in_queue_idx].strip("*")
+        assert done_val == "1", (
+            f"Total done count must be 1 after marking T1 done, got {done_val!r} in row: {total_row!r}"
+        )
+        assert in_queue_val == "4", (
+            f"Total in-queue count must be 4 after marking T1 done (T2+S1+F1+E26 remain), "
+            f"got {in_queue_val!r} in row: {total_row!r}"
+        )
+
+    def test_validate_passes_after_set_status(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """AC-3: validate-backlog passes immediately after any status change via _set_status.
+
+        Given: A BACKLOG.md with a consistent Status Summary and Full Work Unit Index
+        When: force_status changes E26-F1-S1-T1 to in-progress
+        Then: validate() returns no Status Summary count errors
+        Spec: AC-3
+        """
+        index_path, wu_file = self._make_index_with_summary(tmp_path, backlog_dir)
+
+        manager = BacklogManager()
+        manager.force_status(wu_file, index_path, "E26-F1-S1-T1", "in-progress")
+
+        errors = manager.validate(index_path, tmp_path)
+        summary_errors = [e for e in errors if "Status Summary" in e]
+        assert summary_errors == [], (
+            f"Expected no Status Summary errors after set_status, got: {summary_errors}"
+        )
+
+    def test_set_status_still_writes_index_row(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """AC-4: Existing behaviour of _set_status (work-unit file write, index row write) is unchanged.
+
+        Given: A BACKLOG.md with E26-F1-S1-T1 in-queue
+        When: force_status sets E26-F1-S1-T1 to in-progress
+        Then: The work-unit file is updated to in-progress
+              The Full Work Unit Index row is updated to in-progress
+        Spec: AC-4
+        """
+        index_path, wu_file = self._make_index_with_summary(tmp_path, backlog_dir)
+
+        manager = BacklogManager()
+        manager.force_status(wu_file, index_path, "E26-F1-S1-T1", "in-progress")
+
+        wu_content = wu_file.read_text(encoding="utf-8")
+        assert "## Status: in-progress" in wu_content, (
+            "Work-unit file must be updated to in-progress"
+        )
+
+        index_content = index_path.read_text(encoding="utf-8")
+        index_rows = [
+            ln for ln in index_content.splitlines()
+            if "E26-F1-S1-T1" in ln and "Task" in ln
+        ]
+        assert index_rows, "E26-F1-S1-T1 Task row not found in index"
+        assert "in-progress" in index_rows[0], (
+            f"Index row must show in-progress, got: {index_rows[0]!r}"
+        )

@@ -557,6 +557,8 @@ def cmd_git_ops(unit_id: str) -> int:
 
     ops = GitOpsJudge()
 
+    from devbench.github.git_ops import ConflictingPRError
+
     ops.commit_and_push(canonical_repo, repo_path, branch, commit_message)
     logger.info("Committed and pushed %s", unit_id)
 
@@ -575,8 +577,28 @@ def cmd_git_ops(unit_id: str) -> int:
         print(f"ERROR: CI checks failed for PR #{pr_number} on {canonical_repo}", file=sys.stderr)
         return 1
 
-    ops.merge_pr(canonical_repo, pr_number, repo_path=repo_path)
+    try:
+        ops.merge_pr(canonical_repo, pr_number, repo_path=repo_path)
+    except ConflictingPRError:
+        logger.warning(
+            "PR #%d on %s is CONFLICTING — rebasing and retrying merge once",
+            pr_number,
+            canonical_repo,
+        )
+        ops.rebase_and_force_push(canonical_repo, repo_path, branch)
+        try:
+            ops.merge_pr(canonical_repo, pr_number, repo_path=repo_path)
+        except Exception as retry_exc:
+            print(
+                f"ERROR: Merge retry failed for PR #{pr_number} on {canonical_repo}: {retry_exc}",
+                file=sys.stderr,
+            )
+            return 1
+
     logger.info("Merged PR #%d for %s", pr_number, unit_id)
+
+    ops.checkout_default_branch(canonical_repo, repo_path)
+    logger.info("Checked out default branch after merge for %s", unit_id)
 
     if UPDATE_SUBMODULE:
         ops.update_parent_submodule_ref(

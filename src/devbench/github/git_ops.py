@@ -22,6 +22,10 @@ from devbench.config import (
 from devbench.config_loader import get_configured_default_branch
 from devbench.utils.process import run_command
 
+
+class ConflictingPRError(RuntimeError):
+    """Raised when a pull request is in CONFLICTING merge state."""
+
 # Allowlist pattern for git branch names: starts with alphanumeric, allows
 # alphanumerics, dots, hyphens, underscores, and single forward slashes.
 # Consecutive special chars (e.g. '//', '..', '/-') are rejected to match
@@ -98,7 +102,9 @@ class GitOpsJudge:
         if branch_exists:
             self._git(["checkout", branch], repo_path)
         else:
-            self._git(["checkout", "-b", branch], repo_path)
+            self._git(["fetch", "origin"], repo_path)
+            default_branch = self._get_default_branch(repo_path, repo=repo)
+            self._git(["checkout", "-b", branch, f"origin/{default_branch}"], repo_path)
 
         if dirty:
             self._git(["stash", "pop"], repo_path)
@@ -254,6 +260,10 @@ class GitOpsJudge:
             repo=repo,
         )
         if rc != 0:
+            if "CONFLICTING" in stderr:
+                raise ConflictingPRError(
+                    f"PR #{pr_number} on {repo} is in CONFLICTING state: {stderr.strip()}"
+                )
             raise RuntimeError(f"Failed to merge PR #{pr_number} on {repo}: {stderr.strip()}")
         self.logger.info("Merged PR #%d on %s", pr_number, repo)
 
@@ -327,6 +337,54 @@ class GitOpsJudge:
         self.logger.info("All checks passed for PR #%d on %s", pr_number, repo)
         return True
 
+    def checkout_default_branch(self, repo: str, repo_path: Path) -> None:
+        """Check out the default branch and pull latest changes.
+
+        Runs ``git checkout <default_branch>`` followed by
+        ``git pull origin <default_branch>`` so the working tree is on a
+        clean, up-to-date default branch after a merge.
+
+        Args:
+            repo: GitHub repository in ``owner/name`` format.
+            repo_path: Local filesystem path to the repository.
+
+        Raises:
+            RuntimeError: If any git command fails or the default branch
+                cannot be determined.
+        """
+        default_branch = self._get_default_branch(repo_path, repo=repo)
+        self._git(["checkout", default_branch], repo_path)
+        self._git(["pull", "origin", default_branch], repo_path)
+        self.logger.info(
+            "Checked out default branch %s in %s", default_branch, repo_path
+        )
+
+    def rebase_and_force_push(self, repo: str, repo_path: Path, branch: str) -> None:
+        """Rebase the current branch onto the remote default branch and force-push.
+
+        Used as a one-time conflict recovery step when ``merge_pr`` raises
+        :class:`ConflictingPRError`.  Runs:
+
+        1. ``git fetch origin``
+        2. ``git rebase origin/<default_branch>``
+        3. ``git push --force-with-lease origin <branch>``
+
+        Args:
+            repo: GitHub repository in ``owner/name`` format.
+            repo_path: Local filesystem path to the repository.
+            branch: Branch name to force-push after rebasing.
+
+        Raises:
+            RuntimeError: If any git command fails.
+        """
+        default_branch = self._get_default_branch(repo_path, repo=repo)
+        self._git(["fetch", "origin"], repo_path)
+        self._git(["rebase", f"origin/{default_branch}"], repo_path)
+        self._git(["push", "--force-with-lease", "origin", branch], repo_path)
+        self.logger.info(
+            "Rebased %s onto origin/%s and force-pushed", branch, default_branch
+        )
+
     def update_parent_submodule_ref(self, repo: str, repo_path: Path, message: str) -> None:
         """Update the parent repo's submodule reference after a merge.
 
@@ -349,9 +407,7 @@ class GitOpsJudge:
         submodule_name = repo_path.name
 
         # Pull latest default branch into the submodule so parent sees the merged commit
-        default_branch = self._get_default_branch(repo_path, repo=repo)
-        self._git(["checkout", default_branch], repo_path)
-        self._git(["pull", "origin", default_branch], repo_path)
+        self.checkout_default_branch(repo, repo_path)
 
         # Stage the submodule reference update in the parent
         self._git(["add", submodule_name], parent_path)

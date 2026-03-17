@@ -208,12 +208,14 @@ devbench/
 │   └── devbench/
 │       ├── agents/                ← Slash-command agent definitions
 │       │   ├── executor.md        ← Dev agent: implements work units via TDD
-│       │   ├── code-reviewer.md   ← Code review judge agent
-│       │   ├── test-reviewer.md   ← Test quality judge agent
-│       │   ├── doc-reviewer.md    ← Documentation review judge agent
-│       │   ├── changes-manifest.md ← Scope/manifest review judge agent
+│       │   ├── review-supervisor.md ← Discovers and invokes all review_team agents in parallel
 │       │   ├── security-reviewer.md ← Security review judge agent
-│       │   └── blocker-resolver.md  ← Dependency blocker assessment agent
+│       │   ├── blocker-resolver.md  ← Dependency blocker assessment agent
+│       │   └── review_team/       ← Review team agents invoked by review-supervisor
+│       │       ├── code-reviewer.md   ← Code review judge agent
+│       │       ├── test-reviewer.md   ← Test quality judge agent
+│       │       ├── doc-reviewer.md    ← Documentation review judge agent
+│       │       └── changes-manifest.md ← Scope/manifest review judge agent
 │       ├── hooks/
 │       │   └── hooks.json         ← Hook registrations (PreToolUse, PostToolUse, …)
 │       └── scripts/               ← Hook scripts invoked by hooks.json

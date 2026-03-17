@@ -13,6 +13,7 @@ Process the backlog using the steps below, repeating until all work units are do
    - If output is `ALL_DONE`: print a completion summary and exit.
    - If output is `NO_ACTIONABLE`: print a blocked summary and exit.
    - Otherwise: parse the JSON to get `id`, `title`, `repo`.
+   - Run `uv run devbench claim <id>` to mark the unit in-progress before proceeding.
 
 3. `uv run devbench ensure-branch <id>` — create or switch to the work unit's
    feature branch before the executor stages any files. Stashes and pops if the

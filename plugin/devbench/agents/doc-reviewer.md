@@ -70,6 +70,7 @@ Evaluate whether documentation is complete, accurate, and synchronized with code
 The following files are operational backlog-tracking artifacts. You may read them to understand acceptance criteria, Definition of Done, and agent log evidence, but do not raise findings, flag defects, or fail based on their content or status values:
 - `BACKLOG.md` — work-unit status index
 - Any file under `backlog/` — task, story, feature, and epic specification files
+- Documentation updates explicitly deferred to a named future work unit. If the task spec's Description or Comments explicitly identifies that a documentation change belongs to a different work unit (e.g., "SKILL.md update is E203-F1-S2-T1's responsibility"), do not fail on that item — it is intentionally out of scope for the current task.
 
 Be strict — misleading documentation in a regulated environment can cause compliance failures. Fail for inaccurate, outdated, or misleading documentation. Do not fail for minor formatting preferences.
 

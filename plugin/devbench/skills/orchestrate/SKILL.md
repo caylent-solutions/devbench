@@ -20,21 +20,19 @@ Process the backlog using the steps below, repeating until all work units are do
 
 4. Invoke `devbench:executor` with the unit ID.
 
-5. Invoke each review agent in sequence with the unit ID:
-   - `devbench:code-reviewer`
-   - `devbench:test-reviewer`
-   - `devbench:doc-reviewer`
-   - `devbench:changes-manifest`
+5. Invoke `review-supervisor` with the unit ID.
+   - If result is REVIEW_FAIL: go to step 6.
+   - If result is REVIEW_PASS: go to step 7.
 
-6. If any review agent logs a `REVIEW_FAIL` verdict:
-   - Collect all fail feedback from the work unit Comments.
-   - Retry `devbench:executor` with the unit ID (the executor reads prior Comments for context).
-   - Repeat review sequence.
-   - After `max_retries` failures, log a blocker comment and move to step 2 (skip this unit).
+6. On REVIEW_FAIL:
+   - Retry `devbench:executor` with the unit ID (executor reads prior Comments for context).
+   - Return to step 5 — invoke `review-supervisor` again. Do NOT invoke security-reviewer here.
+   - After `max_retries` consecutive failures, log a blocker comment and return to step 2.
 
-7. Once all 4 review agents pass:
+7. On review team REVIEW_PASS:
    - Invoke `devbench:security-reviewer` with the unit ID.
-   - If security fails: log a blocker comment and move to step 2.
+   - If security PASS: proceed immediately to step 8. Do NOT re-run review-supervisor.
+   - If security FAIL: log a blocker comment and return to step 2.
 
 8. `uv run devbench git-ops <id>` — commit, push, create PR, wait for CI, merge.
 
@@ -45,6 +43,7 @@ Process the backlog using the steps below, repeating until all work units are do
 ## Standards
 
 - Never modify files under `backlog/` directly — use `uv run devbench log-verdict` and `mark-done`.
-- Never bypass the done-gate — all 4 review judges must pass before git-ops.
-- Security review runs after all 4 review judges pass, not before.
+- Never bypass the done-gate — review-supervisor must pass before git-ops.
+- Security review runs exactly once per work unit — after review-supervisor passes. If security passes, go directly to step 8.
+- The retry loop (step 6) re-runs only review-supervisor, never security-reviewer.
 - Log all significant actions and decisions to the work unit Comments via `log-verdict`.

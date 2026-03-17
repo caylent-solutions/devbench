@@ -219,18 +219,23 @@ class TestMergeStrategy:
         assert MergeStrategy.SQUASH.flag == "--squash"
         assert MergeStrategy.REBASE.flag == "--rebase"
 
-    def test_invalid_value_raises_runtime_error(self) -> None:
-        with patch.dict(os.environ, {"JUDGE_MERGE_STRATEGY": "fast-forward"}, clear=False):
-            with pytest.raises(RuntimeError, match="merge_strategy must be one of"):
+    def test_invalid_value_raises_on_load(self, tmp_path: Path) -> None:
+        cfg = tmp_path / "bad_strategy.yaml"
+        cfg.write_text(
+            "repos:\n  caylent-solutions/git-repo:\n    default_branch: main\n"
+            "merge_strategy: fast-forward\n"
+            "judge_model: test-model\n",
+            encoding="utf-8",
+        )
+        with patch.dict(os.environ, {"JUDGE_CONFIG_PATH": str(cfg)}, clear=False):
+            with pytest.raises((RuntimeError, ValueError), match="fast-forward"):
                 importlib.reload(config)
 
         importlib.reload(config)
 
     def test_default_is_squash(self) -> None:
-        env_copy = {k: v for k, v in os.environ.items() if k != "JUDGE_MERGE_STRATEGY"}
-        with patch.dict(os.environ, env_copy, clear=True):
-            importlib.reload(config)
-            assert config.MERGE_STRATEGY == config.MergeStrategy.SQUASH
+        importlib.reload(config)
+        assert config.MERGE_STRATEGY == config.MergeStrategy.SQUASH
 
         importlib.reload(config)
 
@@ -371,44 +376,6 @@ class TestAllowedOrgs:
 
 
 # ---------------------------------------------------------------------------
-# AC-4: JUDGE_GH_ORG deprecated env var
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.unit
-class TestJudgeGhOrgDeprecation:
-    """AC-4: JUDGE_GH_ORG env var still restricts access but emits WARNING."""
-
-    def test_judge_gh_org_env_var_warns_deprecated(self, caplog: pytest.LogCaptureFixture) -> None:
-        """
-        AC-4: When JUDGE_GH_ORG is set, a WARNING-level log message is emitted.
-        """
-        env_without_gh_org = {k: v for k, v in os.environ.items() if k != "JUDGE_GH_ORG"}
-        with caplog.at_level(logging.WARNING, logger="devbench.config"):
-            with patch.dict(os.environ, {**env_without_gh_org, "JUDGE_GH_ORG": "some-org"}, clear=True):
-                importlib.reload(config)
-
-        assert any("JUDGE_GH_ORG" in r.message and "deprecated" in r.message.lower() for r in caplog.records), (
-            f"Expected a deprecation WARNING for JUDGE_GH_ORG. Log records: {[r.message for r in caplog.records]}"
-        )
-        importlib.reload(config)
-
-    def test_judge_gh_org_merged_into_allowed_gh_orgs(self) -> None:
-        """
-        AC-4: When JUDGE_GH_ORG is set, it is included in ALLOWED_GH_ORGS.
-        """
-        env_without_gh_org = {k: v for k, v in os.environ.items() if k != "JUDGE_GH_ORG"}
-        with patch.dict(os.environ, {**env_without_gh_org, "JUDGE_GH_ORG": "legacy-org"}, clear=True):
-            importlib.reload(config)
-            assert "legacy-org" in config.ALLOWED_GH_ORGS, (
-                f"Expected 'legacy-org' in ALLOWED_GH_ORGS after JUDGE_GH_ORG set, "
-                f"got {config.ALLOWED_GH_ORGS}"
-            )
-
-        importlib.reload(config)
-
-
-# ---------------------------------------------------------------------------
 # AC-5, AC-6, AC-7, AC-8, AC-9, AC-10: model configuration
 # ---------------------------------------------------------------------------
 
@@ -424,7 +391,7 @@ class TestModelConfig:
         """
         env_without_overrides = {
             k: v for k, v in os.environ.items()
-            if k not in ("ANTHROPIC_MODEL", "JUDGE_CLAUDE_MODEL")
+            if k != "ANTHROPIC_MODEL"
         }
         with patch.dict(os.environ, env_without_overrides, clear=True):
             importlib.reload(config)
@@ -441,7 +408,7 @@ class TestModelConfig:
         """
         env_without_overrides = {
             k: v for k, v in os.environ.items()
-            if k not in ("ANTHROPIC_MODEL", "JUDGE_CLAUDE_MODEL")
+            if k != "ANTHROPIC_MODEL"
         }
         with patch.dict(os.environ, env_without_overrides, clear=True):
             importlib.reload(config)
@@ -457,7 +424,7 @@ class TestModelConfig:
         """
         env_with_anthropic = {
             k: v for k, v in os.environ.items()
-            if k not in ("ANTHROPIC_MODEL", "JUDGE_CLAUDE_MODEL")
+            if k != "ANTHROPIC_MODEL"
         }
         env_with_anthropic["ANTHROPIC_MODEL"] = "override-model"
         with patch.dict(os.environ, env_with_anthropic, clear=True):
@@ -471,48 +438,6 @@ class TestModelConfig:
 
         importlib.reload(config)
 
-    def test_judge_claude_model_env_warns_deprecated(self, caplog: pytest.LogCaptureFixture) -> None:
-        """
-        AC-8: JUDGE_CLAUDE_MODEL env var populates both constants but emits deprecation WARNING.
-        """
-        env = {
-            k: v for k, v in os.environ.items()
-            if k not in ("ANTHROPIC_MODEL", "JUDGE_CLAUDE_MODEL")
-        }
-        env["JUDGE_CLAUDE_MODEL"] = "legacy-model"
-        with caplog.at_level(logging.WARNING, logger="devbench.config"):
-            with patch.dict(os.environ, env, clear=True):
-                importlib.reload(config)
-
-        assert any(
-            "JUDGE_CLAUDE_MODEL" in r.message and "deprecated" in r.message.lower()
-            for r in caplog.records
-        ), (
-            f"Expected a deprecation WARNING for JUDGE_CLAUDE_MODEL. "
-            f"Log records: {[r.message for r in caplog.records]}"
-        )
-        importlib.reload(config)
-
-    def test_judge_claude_model_env_populates_both_constants(self) -> None:
-        """
-        AC-8: JUDGE_CLAUDE_MODEL populates both CLAUDE_MODEL and EXECUTOR_MODEL as fallback.
-        """
-        env = {
-            k: v for k, v in os.environ.items()
-            if k not in ("ANTHROPIC_MODEL", "JUDGE_CLAUDE_MODEL")
-        }
-        env["JUDGE_CLAUDE_MODEL"] = "legacy-model"
-        with patch.dict(os.environ, env, clear=True):
-            importlib.reload(config)
-            assert config.CLAUDE_MODEL == "legacy-model", (
-                f"Expected CLAUDE_MODEL='legacy-model' from JUDGE_CLAUDE_MODEL, got {config.CLAUDE_MODEL!r}"
-            )
-            assert config.EXECUTOR_MODEL == "legacy-model", (
-                f"Expected EXECUTOR_MODEL='legacy-model' from JUDGE_CLAUDE_MODEL, got {config.EXECUTOR_MODEL!r}"
-            )
-
-        importlib.reload(config)
-
     def test_model_defaults_to_direct_api_id_when_no_bedrock(self, tmp_path: Path) -> None:
         """
         AC-9/AC-10: When no model is in YAML/env and use_bedrock=false,
@@ -521,12 +446,13 @@ class TestModelConfig:
         cfg = tmp_path / "minimal.yaml"
         cfg.write_text(
             "repos:\n  caylent-solutions/git-repo:\n    default_branch: main\n"
-            "use_bedrock: false\n",
+            "use_bedrock: false\n"
+            "merge_strategy: squash\n",
             encoding="utf-8",
         )
         env = {
             k: v for k, v in os.environ.items()
-            if k not in ("ANTHROPIC_MODEL", "JUDGE_CLAUDE_MODEL", "JUDGE_USE_BEDROCK",
+            if k not in ("ANTHROPIC_MODEL", "JUDGE_USE_BEDROCK",
                          "JUDGE_DEFAULT_MODEL_DIRECT", "JUDGE_DEFAULT_MODEL_BEDROCK")
         }
         env["JUDGE_CONFIG_PATH"] = str(cfg)
@@ -553,12 +479,13 @@ class TestModelConfig:
         cfg.write_text(
             "repos:\n  caylent-solutions/git-repo:\n    default_branch: main\n"
             "use_bedrock: true\n"
-            "bedrock_region: us-west-2\n",
+            "bedrock_region: us-west-2\n"
+            "merge_strategy: squash\n",
             encoding="utf-8",
         )
         env = {
             k: v for k, v in os.environ.items()
-            if k not in ("ANTHROPIC_MODEL", "JUDGE_CLAUDE_MODEL", "JUDGE_USE_BEDROCK",
+            if k not in ("ANTHROPIC_MODEL", "JUDGE_USE_BEDROCK",
                          "JUDGE_DEFAULT_MODEL_DIRECT", "JUDGE_DEFAULT_MODEL_BEDROCK")
         }
         env["JUDGE_CONFIG_PATH"] = str(cfg)
@@ -590,7 +517,7 @@ class TestModelConfig:
         )
         env = {
             k: v for k, v in os.environ.items()
-            if k not in ("ANTHROPIC_MODEL", "JUDGE_CLAUDE_MODEL", "JUDGE_USE_BEDROCK",
+            if k not in ("ANTHROPIC_MODEL", "JUDGE_USE_BEDROCK",
                          "JUDGE_BEDROCK_REGION", "AWS_REGION")
         }
         env["JUDGE_CONFIG_PATH"] = str(cfg)
@@ -609,12 +536,13 @@ class TestModelConfig:
         cfg = tmp_path / "no_bedrock.yaml"
         cfg.write_text(
             "repos:\n  caylent-solutions/git-repo:\n    default_branch: main\n"
-            "use_bedrock: false\n",
+            "use_bedrock: false\n"
+            "merge_strategy: squash\n",
             encoding="utf-8",
         )
         env = {
             k: v for k, v in os.environ.items()
-            if k not in ("ANTHROPIC_MODEL", "JUDGE_CLAUDE_MODEL", "JUDGE_USE_BEDROCK",
+            if k not in ("ANTHROPIC_MODEL", "JUDGE_USE_BEDROCK",
                          "JUDGE_BEDROCK_REGION", "AWS_REGION",
                          "JUDGE_DEFAULT_MODEL_DIRECT", "JUDGE_DEFAULT_MODEL_BEDROCK")
         }
@@ -648,7 +576,7 @@ class TestModelConfig:
         )
         env = {
             k: v for k, v in os.environ.items()
-            if k not in ("ANTHROPIC_MODEL", "JUDGE_CLAUDE_MODEL", "JUDGE_USE_BEDROCK",
+            if k not in ("ANTHROPIC_MODEL", "JUDGE_USE_BEDROCK",
                          "JUDGE_DEFAULT_MODEL_DIRECT", "JUDGE_DEFAULT_MODEL_BEDROCK")
         }
         env["JUDGE_CONFIG_PATH"] = str(cfg)
@@ -686,6 +614,7 @@ def _minimal_yaml_with_overrides(
         "executor_model: test-executor-model",
         "use_bedrock: false",
         "bedrock_region: us-east-1",
+        "merge_strategy: squash",
     ]
     if max_retries is not None:
         lines.append(f"max_retries: {max_retries}")
@@ -1136,14 +1065,14 @@ class TestMergeStrategyYamlPattern:
 
     def test_merge_strategy_global_default_from_yaml(self, tmp_path: Path) -> None:
         """
-        AC-1: merge_strategy: rebase in YAML sets global default when JUDGE_MERGE_STRATEGY absent.
+        AC-1: merge_strategy: rebase in YAML sets global default.
 
-        Given: merge_strategy: rebase in YAML, JUDGE_MERGE_STRATEGY not set
+        Given: merge_strategy: rebase in YAML
         When: config module is loaded
         Then: MERGE_STRATEGY == MergeStrategy.REBASE
         """
         cfg = _minimal_yaml_with_merge_strategy(tmp_path, global_strategy="rebase")
-        env = {k: v for k, v in os.environ.items() if k != "JUDGE_MERGE_STRATEGY"}
+        env = dict(os.environ)
         env["JUDGE_CONFIG_PATH"] = str(cfg)
         with patch.dict(os.environ, env, clear=True):
             importlib.reload(config)
@@ -1164,7 +1093,7 @@ class TestMergeStrategyYamlPattern:
         cfg = _minimal_yaml_with_merge_strategy(
             tmp_path, global_strategy="squash", repo_strategy="rebase"
         )
-        env = {k: v for k, v in os.environ.items() if k != "JUDGE_MERGE_STRATEGY"}
+        env = dict(os.environ)
         env["JUDGE_CONFIG_PATH"] = str(cfg)
         with patch.dict(os.environ, env, clear=True):
             importlib.reload(config)
@@ -1178,38 +1107,6 @@ class TestMergeStrategyYamlPattern:
         assert global_fallback == "squash", (
             f"Expected global fallback 'squash' for repo without strategy, got {global_fallback!r}"
         )
-
-    def test_judge_merge_strategy_env_warns_deprecated(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """
-        AC-3: JUDGE_MERGE_STRATEGY=merge env var overrides YAML and emits deprecation WARNING.
-
-        Given: YAML has merge_strategy: rebase, JUDGE_MERGE_STRATEGY=merge
-        When: config module is loaded
-        Then: MERGE_STRATEGY == MergeStrategy.MERGE
-        And: a WARNING-level log message mentioning JUDGE_MERGE_STRATEGY and 'deprecated' is emitted
-        """
-        cfg = _minimal_yaml_with_merge_strategy(tmp_path, global_strategy="rebase")
-        env = dict(os.environ)
-        env["JUDGE_CONFIG_PATH"] = str(cfg)
-        env["JUDGE_MERGE_STRATEGY"] = "merge"
-        with caplog.at_level(logging.WARNING, logger="devbench.config"):
-            with patch.dict(os.environ, env, clear=True):
-                importlib.reload(config)
-                strategy = config.MERGE_STRATEGY
-
-        assert strategy == config.MergeStrategy.MERGE, (
-            f"Expected MERGE_STRATEGY=merge from JUDGE_MERGE_STRATEGY, got {strategy!r}"
-        )
-        assert any(
-            "JUDGE_MERGE_STRATEGY" in r.message and "deprecated" in r.message.lower()
-            for r in caplog.records
-        ), (
-            f"Expected a deprecation WARNING for JUDGE_MERGE_STRATEGY. "
-            f"Log records: {[r.message for r in caplog.records]}"
-        )
-        importlib.reload(config)
 
     def test_get_repo_merge_strategy_importable_from_config(self) -> None:
         """
@@ -1234,7 +1131,7 @@ class TestMergeStrategyYamlPattern:
         Then: returns 'rebase' (global default)
         """
         cfg = _minimal_yaml_with_merge_strategy(tmp_path, global_strategy="rebase", repo_strategy=None)
-        env = {k: v for k, v in os.environ.items() if k != "JUDGE_MERGE_STRATEGY"}
+        env = dict(os.environ)
         env["JUDGE_CONFIG_PATH"] = str(cfg)
         with patch.dict(os.environ, env, clear=True):
             importlib.reload(config)
@@ -1245,26 +1142,111 @@ class TestMergeStrategyYamlPattern:
             f"Expected 'rebase' (global YAML default) for repo without per-repo strategy, got {result!r}"
         )
 
-    def test_merge_strategy_default_is_squash(self, tmp_path: Path) -> None:
+    def test_merge_strategy_absent_raises_runtime_error(self, tmp_path: Path) -> None:
         """
-        AC-7: Omitting merge_strategy from YAML entirely uses 'squash' (code default).
+        AC-7: Omitting merge_strategy from YAML entirely raises RuntimeError (fail-fast).
 
-        Given: YAML has no merge_strategy field, JUDGE_MERGE_STRATEGY not set
-        When: get_repo_merge_strategy is called for any repo
-        Then: returns 'squash'
+        Given: YAML has no merge_strategy field
+        When: config module is loaded
+        Then: RuntimeError is raised requiring merge_strategy to be set in YAML
         """
         cfg = _minimal_yaml_with_merge_strategy(tmp_path, global_strategy=None, repo_strategy=None)
-        env = {k: v for k, v in os.environ.items() if k != "JUDGE_MERGE_STRATEGY"}
+        env = dict(os.environ)
+        env["JUDGE_CONFIG_PATH"] = str(cfg)
+        with patch.dict(os.environ, env, clear=True):
+            with pytest.raises(RuntimeError, match=r"merge_strategy must be set in devbench\.yaml"):
+                importlib.reload(config)
+        importlib.reload(config)
+
+
+# ---------------------------------------------------------------------------
+# AC-1, AC-2, AC-3: compat shims fully removed — YAML-only behaviour
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestRemovedCompatShims:
+    """Verify the three deprecated env vars have no effect on runtime behaviour."""
+
+    def test_allowed_gh_orgs_from_yaml_when_judge_gh_org_absent(self, tmp_path: Path) -> None:
+        """
+        AC-1, AC-5: ALLOWED_GH_ORGS is sourced from YAML allowed_orgs only.
+
+        Given: JUDGE_GH_ORG is absent from the environment
+        When: config module is loaded with YAML that has allowed_orgs: [test-org]
+        Then: ALLOWED_GH_ORGS == ['test-org'] (from YAML, no compat shim)
+        """
+        cfg = tmp_path / "orgs.yaml"
+        cfg.write_text(
+            "repos:\n  caylent-solutions/git-repo:\n    default_branch: main\n"
+            "allowed_orgs:\n  - caylent-solutions\n"
+            "judge_model: test-model\n"
+            "merge_strategy: squash\n",
+            encoding="utf-8",
+        )
+        env = {k: v for k, v in os.environ.items() if k != "JUDGE_GH_ORG"}
         env["JUDGE_CONFIG_PATH"] = str(cfg)
         with patch.dict(os.environ, env, clear=True):
             importlib.reload(config)
-            result = config.get_repo_merge_strategy("caylent-solutions/git-repo")
-            merge_strategy_const = config.MERGE_STRATEGY
+            assert config.ALLOWED_GH_ORGS == ["caylent-solutions"], (
+                f"Expected ALLOWED_GH_ORGS=['caylent-solutions'] from YAML, got {config.ALLOWED_GH_ORGS!r}"
+            )
         importlib.reload(config)
 
-        assert result == "squash", (
-            f"Expected 'squash' (code default) when merge_strategy absent from YAML, got {result!r}"
+    def test_merge_strategy_from_yaml_when_judge_merge_strategy_absent(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        AC-2, AC-6: MERGE_STRATEGY is sourced from YAML merge_strategy only.
+
+        Given: YAML has merge_strategy: rebase
+        When: config module is loaded
+        Then: MERGE_STRATEGY == MergeStrategy.REBASE (from YAML)
+        """
+        cfg = tmp_path / "strategy.yaml"
+        cfg.write_text(
+            "repos:\n  caylent-solutions/git-repo:\n    default_branch: main\n"
+            "merge_strategy: rebase\n"
+            "judge_model: test-model\n",
+            encoding="utf-8",
         )
-        assert merge_strategy_const == config.MergeStrategy.SQUASH, (
-            f"Expected MERGE_STRATEGY=squash (code default), got {merge_strategy_const!r}"
+        env = dict(os.environ)
+        env["JUDGE_CONFIG_PATH"] = str(cfg)
+        with patch.dict(os.environ, env, clear=True):
+            importlib.reload(config)
+            assert config.MERGE_STRATEGY == config.MergeStrategy.REBASE, (
+                f"Expected MERGE_STRATEGY=rebase from YAML, got {config.MERGE_STRATEGY!r}"
+            )
+        importlib.reload(config)
+
+    def test_model_defaults_used_when_judge_claude_model_absent(self, tmp_path: Path) -> None:
+        """
+        AC-3, AC-7: Model constants fall back to YAML or auth-dependent defaults when
+        JUDGE_CLAUDE_MODEL is absent.
+
+        Given: JUDGE_CLAUDE_MODEL is absent, YAML sets judge_model and executor_model
+        When: config module is loaded
+        Then: CLAUDE_MODEL and EXECUTOR_MODEL come from YAML (no compat shim)
+        """
+        cfg = tmp_path / "models.yaml"
+        cfg.write_text(
+            "repos:\n  caylent-solutions/git-repo:\n    default_branch: main\n"
+            "judge_model: yaml-judge-model\n"
+            "executor_model: yaml-executor-model\n"
+            "merge_strategy: squash\n",
+            encoding="utf-8",
         )
+        env = {
+            k: v for k, v in os.environ.items()
+            if k not in ("ANTHROPIC_MODEL", "JUDGE_CLAUDE_MODEL")
+        }
+        env["JUDGE_CONFIG_PATH"] = str(cfg)
+        with patch.dict(os.environ, env, clear=True):
+            importlib.reload(config)
+            assert config.CLAUDE_MODEL == "yaml-judge-model", (
+                f"Expected CLAUDE_MODEL='yaml-judge-model' from YAML, got {config.CLAUDE_MODEL!r}"
+            )
+            assert config.EXECUTOR_MODEL == "yaml-executor-model", (
+                f"Expected EXECUTOR_MODEL='yaml-executor-model' from YAML, got {config.EXECUTOR_MODEL!r}"
+            )
+        importlib.reload(config)

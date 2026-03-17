@@ -37,8 +37,9 @@ This file contains a `claudeAiOauth` object with an `accessToken` that has the `
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `JUDGE_CLAUDE_CREDENTIALS_FILE` | `~/.claude/.credentials.json` | Path to the Claude Code credentials file |
-| `JUDGE_CLAUDE_MODEL` | *(required)* | Model used for LLM evaluation (e.g. `claude-opus-4-6`) |
 | `JUDGE_LLM_TIMEOUT` | `300` | Timeout for LLM API calls (seconds) |
+
+Set `judge_model` in `devbench.yaml` to specify the model for LLM evaluation (e.g. `claude-opus-4-6`).
 
 ### Verifying Authentication
 
@@ -46,7 +47,7 @@ Check that the credentials file exists and contains a valid token:
 
 ```bash
 python3 -c "
-from judges.config import get_anthropic_api_key
+from devbench.config import get_anthropic_api_key
 token = get_anthropic_api_key()
 print(f'Token found: {token[:15]}...')
 "
@@ -111,14 +112,14 @@ When `JUDGE_USE_BEDROCK=1` is set, DevBench uses `anthropic.AnthropicBedrock` in
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `JUDGE_USE_BEDROCK` | `false` | Set to `1`, `true`, or `yes` to enable Bedrock |
-| `JUDGE_BEDROCK_REGION` | `us-east-1` | AWS region for Bedrock API calls (falls back to `AWS_REGION`) |
-| `JUDGE_CLAUDE_MODEL` | *(required)* | Bedrock model ID (e.g. `us.anthropic.claude-opus-4-6-v1`) |
+| `JUDGE_BEDROCK_REGION` | *(required when use_bedrock=true)* | AWS region for Bedrock API calls; falls back to `AWS_REGION`, then `bedrock_region` in YAML. `RuntimeError` at startup if all absent and `use_bedrock=true`. |
 | `JUDGE_LLM_TIMEOUT` | `300` | Timeout for LLM API calls (seconds) |
+
+Set `judge_model` in `devbench.yaml` to specify the Bedrock model ID (e.g. `us.anthropic.claude-opus-4-6-v1`).
 
 ### Usage
 
 ```bash
-JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-6-v1 \
 JUDGE_USE_BEDROCK=1 \
 JUDGE_BEDROCK_REGION=us-east-1 \
 make start-interactive
@@ -127,9 +128,9 @@ make start-interactive
 ### Verifying Authentication
 
 ```bash
-JUDGE_USE_BEDROCK=1 JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-6-v1 \
+JUDGE_USE_BEDROCK=1 \
 python3 -c "
-from judges.config import USE_BEDROCK, BEDROCK_REGION
+from devbench.config import USE_BEDROCK, BEDROCK_REGION
 print(f'Bedrock enabled: {USE_BEDROCK}')
 print(f'Region: {BEDROCK_REGION}')
 "

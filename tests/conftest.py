@@ -8,7 +8,7 @@ from pathlib import Path
 # Set required env vars before any devbench modules are imported.
 # config.py raises RuntimeError at import time if JUDGE_WORKSPACE_ROOT is unset.
 # Model configuration is sourced from judge_model/executor_model in the YAML fixture
-# (tests/fixtures/test_devbench.yaml) — no JUDGE_CLAUDE_MODEL env var needed.
+# (tests/fixtures/test_devbench.yaml).
 os.environ.setdefault("JUDGE_WORKSPACE_ROOT", "/tmp/test-workspace")
 os.environ.setdefault("JUDGE_LOG_FILE", "/tmp/judges-test-orchestrator.log")
 # Point to the test fixture YAML config so config.py can resolve ALLOWED_REPOS
@@ -17,11 +17,9 @@ os.environ.setdefault(
     "JUDGE_CONFIG_PATH",
     str(Path(__file__).parent / "fixtures" / "test_devbench.yaml"),
 )
-# Ensure deprecated single-model env vars are unset so YAML fixture model fields are used.
-os.environ.pop("JUDGE_CLAUDE_MODEL", None)
 # Provide auth-dependent default model env vars for tests that exercise the default path.
 # These are only used when judge_model/executor_model are absent from YAML and
-# ANTHROPIC_MODEL/JUDGE_CLAUDE_MODEL are unset.
+# ANTHROPIC_MODEL is unset.
 os.environ.setdefault("JUDGE_DEFAULT_MODEL_DIRECT", "test-default-direct-model")
 os.environ.setdefault("JUDGE_DEFAULT_MODEL_BEDROCK", "test-default-bedrock-model")
 from unittest.mock import patch

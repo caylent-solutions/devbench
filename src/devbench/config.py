@@ -7,10 +7,9 @@ Config file path resolution (first match wins):
 2. ``JUDGE_CONFIG_PATH`` environment variable
 3. ``<JUDGE_WORKSPACE_ROOT>/backlog/config/devbench.yaml``
 
-Allowed repositories and per-repo settings are defined exclusively in the YAML
-config file (``backlog/config/devbench.yaml`` relative to
-``JUDGE_WORKSPACE_ROOT``).  The deprecated env vars ``JUDGE_ALLOWED_REPOS``,
-``JUDGE_BACKLOG_ROOT``, and ``JUDGE_BACKLOG_INDEX`` are no longer read.
+Allowed repositories, model identifiers, merge strategy, and per-repo settings
+are defined exclusively in the YAML config file (``backlog/config/devbench.yaml``
+relative to ``JUDGE_WORKSPACE_ROOT``).
 """
 
 import json
@@ -34,11 +33,8 @@ from devbench.constants import BACKLOG_SUBDIR
 _log = logging.getLogger("devbench.config")
 
 # ---------------------------------------------------------------------------
-# Repository allow-list
+# Workspace root
 # ---------------------------------------------------------------------------
-# ALLOWED_GH_ORG is the legacy single-org restriction (now deprecated).
-# ALLOWED_GH_ORGS is the new list sourced from RUNTIME_CONFIG.allowed_orgs
-# and is populated after RUNTIME_CONFIG is loaded below.
 
 # Absolute path to the workspace root directory containing all repo clones.
 _workspace_root = os.environ.get("JUDGE_WORKSPACE_ROOT", "")
@@ -57,18 +53,9 @@ _config_path: Path = resolve_config_path(None, os.environ, WORKSPACE_ROOT)
 RUNTIME_CONFIG: RuntimeConfig = load_runtime_config(_config_path, os.environ)
 
 # ---------------------------------------------------------------------------
-# Allowed orgs — sourced from YAML allowed_orgs, with JUDGE_GH_ORG as deprecated fallback.
+# Allowed orgs — sourced exclusively from YAML allowed_orgs.
 # ---------------------------------------------------------------------------
-_allowed_gh_orgs: list[str] = list(RUNTIME_CONFIG.allowed_orgs)
-_legacy_gh_org: str = os.environ.get("JUDGE_GH_ORG", "")
-if _legacy_gh_org:
-    _log.warning(
-        "JUDGE_GH_ORG is deprecated. Add '%s' to allowed_orgs in your devbench.yaml instead.",
-        _legacy_gh_org,
-    )
-    if _legacy_gh_org not in _allowed_gh_orgs:
-        _allowed_gh_orgs.append(_legacy_gh_org)
-ALLOWED_GH_ORGS: list[str] = _allowed_gh_orgs
+ALLOWED_GH_ORGS: list[str] = list(RUNTIME_CONFIG.allowed_orgs)
 
 # ---------------------------------------------------------------------------
 # Allowed repos — sourced exclusively from YAML config.
@@ -179,15 +166,13 @@ BEDROCK_REGION: str = _bedrock_region_resolved
 # ---------------------------------------------------------------------------
 # Model identifiers — resolution order per model field:
 # 1. ANTHROPIC_MODEL env var (overrides both CLAUDE_MODEL and EXECUTOR_MODEL silently)
-# 2. JUDGE_CLAUDE_MODEL env var (deprecated fallback — populates both, emits WARNING)
-# 3. YAML judge_model / executor_model field
-# 4. Auth-dependent default env var:
+# 2. YAML judge_model / executor_model field
+# 3. Auth-dependent default env var:
 #    - JUDGE_DEFAULT_MODEL_BEDROCK when USE_BEDROCK is True
 #    - JUDGE_DEFAULT_MODEL_DIRECT when USE_BEDROCK is False
 #    If the default env var is also absent, RuntimeError is raised (fail-fast).
 # ---------------------------------------------------------------------------
 _anthropic_model_override: str = os.environ.get("ANTHROPIC_MODEL", "")
-_judge_claude_model_legacy: str = os.environ.get("JUDGE_CLAUDE_MODEL", "")
 
 
 def _resolve_default_model(use_bedrock: bool) -> str:
@@ -219,14 +204,6 @@ if _anthropic_model_override:
     # ANTHROPIC_MODEL silently overrides both models (Claude CLI convention).
     CLAUDE_MODEL: str = _anthropic_model_override
     EXECUTOR_MODEL: str = _anthropic_model_override
-elif _judge_claude_model_legacy:
-    # JUDGE_CLAUDE_MODEL is deprecated; it still populates both constants as a fallback.
-    _log.warning(
-        "JUDGE_CLAUDE_MODEL is deprecated. Use judge_model/executor_model in devbench.yaml "
-        "or ANTHROPIC_MODEL env var instead."
-    )
-    CLAUDE_MODEL = _judge_claude_model_legacy
-    EXECUTOR_MODEL = _judge_claude_model_legacy
 else:
     _default_model: str = (
         RUNTIME_CONFIG.judge_model or _resolve_default_model(USE_BEDROCK)
@@ -252,46 +229,32 @@ class MergeStrategy(StrEnum):
 
 
 # ---------------------------------------------------------------------------
-# Merge strategy — yaml-with-env-override (JUDGE_MERGE_STRATEGY is deprecated).
-#
-# Precedence (first match wins):
-# 1. JUDGE_MERGE_STRATEGY env var — still honored but emits deprecation WARNING.
-# 2. YAML top-level merge_strategy field.
-# 3. Code default: squash.
+# Merge strategy — sourced exclusively from YAML merge_strategy field.
 # ---------------------------------------------------------------------------
 
 
 def _resolve_merge_strategy() -> MergeStrategy:
-    """Resolve the global merge strategy from env var, YAML, or code default.
-
-    Emits a deprecation WARNING when ``JUDGE_MERGE_STRATEGY`` is used.
+    """Resolve the global merge strategy from YAML.
 
     Returns:
         The resolved ``MergeStrategy`` enum value.
 
     Raises:
+        RuntimeError: If ``merge_strategy`` is absent or empty in the YAML config.
         RuntimeError: If the resolved strategy string is not a valid ``MergeStrategy`` value.
     """
-    env_val: str = os.environ.get("JUDGE_MERGE_STRATEGY", "")
-    if env_val:
-        _log.warning(
-            "JUDGE_MERGE_STRATEGY is deprecated. Set merge_strategy in devbench.yaml instead."
+    if not RUNTIME_CONFIG.merge_strategy:
+        raise RuntimeError(
+            "merge_strategy must be set in devbench.yaml. "
+            f"Valid values: {', '.join(s.value for s in MergeStrategy)}."
         )
-        raw = env_val
-        source = "JUDGE_MERGE_STRATEGY env var"
-    elif RUNTIME_CONFIG.merge_strategy:
-        raw = RUNTIME_CONFIG.merge_strategy
-        source = "devbench.yaml"
-    else:
-        raw = "squash"
-        source = "code default"
-
+    raw = RUNTIME_CONFIG.merge_strategy
     try:
         return MergeStrategy(raw)
     except ValueError as exc:
         raise RuntimeError(
             f"merge_strategy must be one of: {', '.join(s.value for s in MergeStrategy)}. "
-            f"Got: {raw!r} (from {source})"
+            f"Got: {raw!r} (from devbench.yaml)"
         ) from exc
 
 
@@ -307,7 +270,7 @@ def get_repo_merge_strategy(repo: str) -> str:
 
     Resolution order (first match wins):
     1. ``repos.<repo>.merge_strategy`` in the YAML config (per-repo override).
-    2. Global ``MERGE_STRATEGY`` (resolved from YAML + env-var precedence above).
+    2. Global ``MERGE_STRATEGY`` (resolved exclusively from YAML ``merge_strategy`` field).
 
     Args:
         repo: Fully-qualified repository name (e.g. ``'org/repo'``).
@@ -389,7 +352,7 @@ CLAUDE_CREDENTIALS_FILE: Path = Path(
 def validate_repo(repo: str) -> None:
     """Raise ``ValueError`` if *repo* is not in the allow-list or from a disallowed org.
 
-    When ``allowed_orgs`` is non-empty (from YAML or the deprecated ``JUDGE_GH_ORG``),
+    When ``allowed_orgs`` is non-empty (from YAML ``allowed_orgs``),
     also validates that the repo's org is in that list.
     """
     if ALLOWED_GH_ORGS and "/" in repo:

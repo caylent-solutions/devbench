@@ -13,8 +13,9 @@ Public API
 ``mark_blocked``              — writes ``blocked`` and appends a reason comment.
 ``validate``                  — returns integrity errors (missing files, status
                                 drift, orphans, broken deps, Status Summary count
-                                drift, missing required section headers, and
-                                dep-status violations).
+                                drift, missing required section headers,
+                                dep-status violations, and duplicate task branch
+                                names).
 ``log_to_traceability_matrix``— appends a spec/test mapping entry to the
                                 traceability matrix file.
 
@@ -29,7 +30,7 @@ both the work-unit file and BACKLOG.md atomically.
 
 Validation Checks
 -----------------
-``validate`` runs seven integrity checks in order:
+``validate`` runs eight integrity checks in order:
 
 1. Every row in BACKLOG.md has a corresponding work unit file.
 2. Every work unit file's status matches the index.
@@ -46,6 +47,10 @@ Validation Checks
    dependency IDs must have status ``done``.  Units with status ``blocked``,
    ``done``, or ``in-review`` are not checked.  Errors use the format:
    ``<unit-id>: dep '<dep-id>' is '<dep-status>' but unit is '<unit-status>'``
+8. Every Task work unit (IDs matching ``-T\\d+$``) must declare a unique
+   ``**Branch:**`` value.  Task files without a ``**Branch:**`` field are
+   silently skipped.  Error format:
+   ``duplicate branch '<name>' shared by: <id1>, <id2>, ...``
 
 The full runtime status vocabulary is: ``in-queue``, ``in-progress``,
 ``in-review``, ``done``, ``blocked``.  All five values are valid in both the
@@ -171,6 +176,10 @@ class BacklogManager:
            ``blocked``, ``done``, or ``in-review`` are not checked.  Errors use
            the format:
            ``<unit-id>: dep '<dep-id>' is '<dep-status>' but unit is '<unit-status>'``
+        8. Every Task work unit (IDs matching ``-T\\d+$``) must declare a unique
+           ``**Branch:**`` value.  Task files without a ``**Branch:**`` field are
+           silently skipped.  Error format:
+           ``duplicate branch '<name>' shared by: <id1>, <id2>, ...``
 
         Args:
             backlog_index: Path to the ``BACKLOG.md`` index file.
@@ -189,6 +198,7 @@ class BacklogManager:
         self._check_status_summary_counts(backlog_index, rows, errors)
         self._check_required_section_headers(rows, workspace_root, errors)
         self._check_dep_statuses(backlog_index, rows, errors)
+        self._check_unique_task_branches(rows, workspace_root, errors)
         return errors
 
     def _check_files_and_statuses(
@@ -500,6 +510,51 @@ class BacklogManager:
                     errors.append(
                         f"{row_id}: dep '{dep_id}' is '{dep_status}' but unit is '{unit_status}'"
                     )
+
+    def _check_unique_task_branches(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """Check 8: every Task work unit has a unique branch name.
+
+        Reads the ``**Branch:**`` field from every Task work-unit file (row IDs
+        matching ``-T\\d+$``) and reports an error for each branch name shared
+        by more than one task.  Task files with no ``**Branch:**`` field are
+        silently skipped.
+
+        Error format:
+        ``duplicate branch '<name>' shared by: <id1>, <id2>, ...``
+
+        Args:
+            rows: Parsed ``(id, status, file_path)`` tuples from the Full Work Unit Index.
+            workspace_root: Workspace root used to resolve relative file paths.
+            errors: Mutable list to which error strings are appended.
+        """
+        branch_re = re.compile(r"\*\*Branch:\*\*\s+`([^`]+)`")
+        branch_to_tasks: dict[str, list[str]] = {}
+
+        for row_id, _, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not file_path_str:
+                continue
+            if not re.search(r"-T\d+$", row_id):
+                continue  # Only Task rows
+            wu_path = workspace_root / file_path_str
+            if not wu_path.exists():
+                continue
+            content = wu_path.read_text(encoding="utf-8")
+            m = branch_re.search(content)
+            if m:
+                branch_to_tasks.setdefault(m.group(1), []).append(row_id)
+
+        for branch, task_ids in branch_to_tasks.items():
+            if len(task_ids) > 1:
+                errors.append(
+                    f"duplicate branch '{branch}' shared by: {', '.join(sorted(task_ids))}"
+                )
 
     def log_to_traceability_matrix(self, matrix_path: Path, spec_ref: str, test_ref: str) -> None:
         """Append an entry to the traceability matrix.

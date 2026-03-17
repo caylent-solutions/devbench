@@ -1103,6 +1103,134 @@ class TestValidate:
             f"Expected error with dep ID 'E0-F1-S1-T1' and status 'in-review' but got: {errors}"
         )
 
+    # ------------------------------------------------------------------
+    # E19-F1-S1-T1: Check 8 — unique task branch names
+    # ------------------------------------------------------------------
+
+    def test_check_8_duplicate_branch_names_reported(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """AC-1: Two Task files sharing a branch name → error listing both task IDs.
+
+        Given: T1 and T2 are both Task rows whose work-unit files declare
+               the same **Branch:** value
+        When: validate is called
+        Then: An error is returned that contains both task IDs and the shared
+              branch name
+        Spec: E19-F1-S1-T1 AC-1
+        """
+        t1 = backlog_dir / "E1-F1-S1-T1.md"
+        t1.write_text(
+            "# E1-F1-S1-T1\n\n## Status: in-queue\n\n## Target Repository\n\n"
+            "- **Branch:** `feature/shared-branch`\n\n## Comments\n",
+            encoding="utf-8",
+        )
+        t2 = backlog_dir / "E1-F1-S1-T2.md"
+        t2.write_text(
+            "# E1-F1-S1-T2\n\n## Status: in-queue\n\n## Target Repository\n\n"
+            "- **Branch:** `feature/shared-branch`\n\n## Comments\n",
+            encoding="utf-8",
+        )
+        idx = self._make_index(
+            tmp_path,
+            "| E1-F1-S1-T1 | Task 1 | Task | in-queue | none | repo | `backlog/E1-F1-S1-T1.md` |\n"
+            "| E1-F1-S1-T2 | Task 2 | Task | in-queue | none | repo | `backlog/E1-F1-S1-T2.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        duplicate_errors = [e for e in errors if "shared-branch" in e]
+        assert duplicate_errors, f"Expected duplicate-branch error but got: {errors}"
+        assert any("E1-F1-S1-T1" in e for e in duplicate_errors)
+        assert any("E1-F1-S1-T2" in e for e in duplicate_errors)
+
+    def test_check_8_unique_branch_names_pass(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """AC-2: Two Task files with different branches → no error.
+
+        Given: T1 declares branch 'feature/branch-a' and T2 declares 'feature/branch-b'
+        When: validate is called
+        Then: No duplicate-branch error is emitted
+        Spec: E19-F1-S1-T1 AC-2
+        """
+        t1 = backlog_dir / "E1-F1-S1-T1.md"
+        t1.write_text(
+            "# E1-F1-S1-T1\n\n## Status: in-queue\n\n## Target Repository\n\n"
+            "- **Branch:** `feature/branch-a`\n\n## Comments\n",
+            encoding="utf-8",
+        )
+        t2 = backlog_dir / "E1-F1-S1-T2.md"
+        t2.write_text(
+            "# E1-F1-S1-T2\n\n## Status: in-queue\n\n## Target Repository\n\n"
+            "- **Branch:** `feature/branch-b`\n\n## Comments\n",
+            encoding="utf-8",
+        )
+        idx = self._make_index(
+            tmp_path,
+            "| E1-F1-S1-T1 | Task 1 | Task | in-queue | none | repo | `backlog/E1-F1-S1-T1.md` |\n"
+            "| E1-F1-S1-T2 | Task 2 | Task | in-queue | none | repo | `backlog/E1-F1-S1-T2.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        branch_errors = [e for e in errors if "duplicate branch" in e]
+        assert branch_errors == [], f"Expected no duplicate-branch errors but got: {branch_errors}"
+
+    def test_check_8_non_task_files_ignored(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """AC-3: Story/Feature files sharing a branch value → not flagged.
+
+        Given: A Story row and a Feature row both declare the same **Branch:** value
+        When: validate is called
+        Then: No duplicate-branch error is emitted (only Task rows are checked)
+        Spec: E19-F1-S1-T1 AC-3
+        """
+        story = backlog_dir / "E1-F1-S1.md"
+        story.write_text(
+            "# E1-F1-S1\n\n## Status: in-queue\n\n## Target Repository\n\n"
+            "- **Branch:** `feature/shared-non-task`\n\n## Comments\n",
+            encoding="utf-8",
+        )
+        feature = backlog_dir / "E1-F1.md"
+        feature.write_text(
+            "# E1-F1\n\n## Status: in-queue\n\n## Target Repository\n\n"
+            "- **Branch:** `feature/shared-non-task`\n\n## Comments\n",
+            encoding="utf-8",
+        )
+        idx = self._make_index(
+            tmp_path,
+            "| E1-F1-S1 | Story 1 | Story | in-queue | none | repo | `backlog/E1-F1-S1.md` |\n"
+            "| E1-F1 | Feature 1 | Feature | in-queue | none | repo | `backlog/E1-F1.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        branch_errors = [e for e in errors if "duplicate branch" in e]
+        assert branch_errors == [], (
+            f"Non-Task rows must not be checked for branch uniqueness but got: {branch_errors}"
+        )
+
+    def test_check_8_task_without_branch_field_skipped(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """AC-4: Task file with no **Branch:** field → not flagged.
+
+        Given: A Task work-unit file contains no '**Branch:**' line
+        When: validate is called
+        Then: No error is emitted for that task (graceful skip)
+        Spec: E19-F1-S1-T1 AC-4
+        """
+        t1 = backlog_dir / "E1-F1-S1-T1.md"
+        t1.write_text(
+            "# E1-F1-S1-T1\n\n## Status: in-queue\n\n## Comments\n",
+            encoding="utf-8",
+        )
+        idx = self._make_index(
+            tmp_path,
+            "| E1-F1-S1-T1 | Task 1 | Task | in-queue | none | repo | `backlog/E1-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        branch_errors = [e for e in errors if "duplicate branch" in e]
+        assert branch_errors == [], (
+            f"Task with no Branch field must not generate errors but got: {branch_errors}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # E4-F1-S1-T1: Rename BacklogManagerJudge → BacklogManager

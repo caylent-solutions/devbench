@@ -900,3 +900,131 @@ class TestCmdGetDiff:
             "Upstream-merged file appeared in output — bare branch ref was used instead of origin/"
         )
         assert "new_feature.py" in output, "Branch-specific diff should appear in output"
+
+
+@pytest.mark.unit
+class TestCmdReadUnitStripComments:
+    """Tests for --strip-comments flag on cmd_read_unit (E216-F1-S1-T1)."""
+
+    def _make_unit(self, wu_file: Path) -> WorkUnit:
+        return WorkUnit(
+            id="E216-F1-S1-T1",
+            title="Strip comments test",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=wu_file,
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+
+    def _make_wu_file(self, tmp_path: Path, content: str) -> Path:
+        wu_file = tmp_path / "E216-F1-S1-T1.md"
+        wu_file.write_text(content, encoding="utf-8")
+        return wu_file
+
+    def test_read_unit_strip_comments_removes_comments_section(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-2: --strip-comments removes ## Comments section and everything after."""
+        content = (
+            "# E216-F1-S1-T1: Strip Test\n\n"
+            "## Status: in-progress\n\n"
+            "## Description\n\nSome description.\n"
+            "\n## Comments\n\n"
+            "[judge/executor] [REVIEW_PASS] looks good\n"
+        )
+        wu_file = self._make_wu_file(tmp_path, content)
+        unit = self._make_unit(wu_file)
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": tmp_path}),
+        ):
+            result = cli.cmd_read_unit("--strip-comments", "E216-F1-S1-T1")
+
+        assert result == 0
+        output = capsys.readouterr().out
+        data = json.loads(output)
+        assert "## Comments" not in data["content"], (
+            "Comments section should be stripped when --strip-comments is used"
+        )
+        assert "[REVIEW_PASS]" not in data["content"], (
+            "Comment entries should be removed when --strip-comments is used"
+        )
+        assert "## Description" in data["content"], (
+            "Content before ## Comments should be preserved"
+        )
+
+    def test_read_unit_without_flag_returns_full_content(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-3: Without --strip-comments, output is unchanged (backward compatible)."""
+        content = (
+            "# E216-F1-S1-T1: Strip Test\n\n"
+            "## Status: in-progress\n\n"
+            "## Comments\n\n"
+            "[judge/executor] [REVIEW_PASS] looks good\n"
+        )
+        wu_file = self._make_wu_file(tmp_path, content)
+        unit = self._make_unit(wu_file)
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": tmp_path}),
+        ):
+            result = cli.cmd_read_unit("E216-F1-S1-T1")
+
+        assert result == 0
+        output = capsys.readouterr().out
+        data = json.loads(output)
+        assert "## Comments" in data["content"], (
+            "Without --strip-comments, full content including Comments should be returned"
+        )
+        assert "[REVIEW_PASS]" in data["content"], (
+            "Without --strip-comments, comment entries should be present"
+        )
+
+    def test_read_unit_strip_comments_without_unit_id_returns_error(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-4: --strip-comments without unit ID exits with non-zero and clear error."""
+        result = cli.cmd_read_unit("--strip-comments")
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "unit_id" in err.lower() or "required" in err.lower(), (
+            f"Expected clear error about missing unit_id, got: {err!r}"
+        )
+
+    def test_read_unit_strip_comments_unit_has_no_comments_section(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-2 edge case: --strip-comments on a file with no ## Comments section is a no-op."""
+        content = (
+            "# E216-F1-S1-T1: Strip Test\n\n"
+            "## Status: in-progress\n\n"
+            "## Description\n\nSome description.\n"
+        )
+        wu_file = self._make_wu_file(tmp_path, content)
+        unit = self._make_unit(wu_file)
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": tmp_path}),
+        ):
+            result = cli.cmd_read_unit("--strip-comments", "E216-F1-S1-T1")
+
+        assert result == 0
+        output = capsys.readouterr().out
+        data = json.loads(output)
+        assert "## Description" in data["content"], (
+            "Content should be fully preserved when no ## Comments section exists"
+        )
+        assert data["content"].strip() == content.strip(), (
+            "Content should be unchanged when no ## Comments section is present"
+        )

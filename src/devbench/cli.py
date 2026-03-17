@@ -277,8 +277,13 @@ def cmd_log(message: str) -> int:
     return 0
 
 
-def cmd_read_unit(unit_id: str) -> int:
+def cmd_read_unit(first_arg: str, second_arg: str = "") -> int:
     """Return work unit content and resolved repo path as JSON.
+
+    Usage::
+
+        read-unit <id>
+        read-unit --strip-comments <id>
 
     Output::
 
@@ -290,8 +295,22 @@ def cmd_read_unit(unit_id: str) -> int:
           "content": "<full work unit markdown>"
         }
 
+    When ``--strip-comments`` is passed, the ``content`` field contains the
+    work unit text up to (but not including) the ``\\n## Comments`` marker.
+    This prevents reviewer agents from seeing prior verdict entries.
+
     Used by plugin agents to get repo context without knowing devbench.yaml.
     """
+    if first_arg == "--strip-comments":
+        strip_comments = True
+        unit_id = second_arg
+        if not unit_id:
+            print("ERROR: unit_id required after --strip-comments", file=sys.stderr)
+            return 1
+    else:
+        strip_comments = False
+        unit_id = first_arg
+
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     units = parser.parse_index()
     unit = _find_unit(units, unit_id)
@@ -311,6 +330,12 @@ def cmd_read_unit(unit_id: str) -> int:
         return 1
 
     content = wu_file.read_text(encoding="utf-8")
+    if strip_comments:
+        marker = "\n## Comments"
+        idx = content.find(marker)
+        if idx != -1:
+            content = content[:idx]
+
     print(json.dumps({
         "unit_id": unit.id,
         "work_unit_path": str(wu_file),
@@ -663,7 +688,7 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
     "report": (cmd_report, 0, "Progress report: report [since-timestamp]"),
     "start": (cmd_start, 0, "Run orchestrate skill via Agent SDK (non-interactive)"),
     # Plugin agent bridge commands — used by devbench plugin agents
-    "read-unit": (cmd_read_unit, 1, "Return work unit content and repo path as JSON: read-unit <id>"),
+    "read-unit": (cmd_read_unit, 1, "Work unit content + repo path as JSON: read-unit [--strip-comments] <id>"),
     "get-diff": (cmd_get_diff, 1, "Return combined git diff for work unit's repo: get-diff <id>"),
     "run-tests": (cmd_run_tests, 1, "Run test suite for work unit's repo: run-tests <id>"),
     "log-verdict": (cmd_log_verdict, 3, "Log judge verdict: log-verdict <judge> <id> <pass|fail> [feedback]"),

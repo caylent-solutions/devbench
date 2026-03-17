@@ -9,7 +9,7 @@ disallowedTools: Write, Edit, Read, Glob, Grep
 ## Evidence
 
 Work unit and repo context:
-!`uv run devbench read-unit $ARGUMENTS`
+!`uv run devbench read-unit --strip-comments $ARGUMENTS`
 
 Git diff (staged, unstaged, branch, untracked):
 !`uv run devbench get-diff $ARGUMENTS`

@@ -30,7 +30,7 @@ Read and follow ALL instructions in:
 3. Follow the TDD cycle strictly:
    - RED: Write a failing test first. Run the test suite (use `make test-unit` or equivalent
      in repo_path). Paste the actual test runner output (command, exit code, failure lines)
-     into the work unit Comments via `uv run devbench log-verdict executor <id> pass "RED: <paste output>"`.
+     into the work unit Comments via `uv run devbench log-comment executor <id> "RED: <paste output>"`.
      Do not proceed to GREEN until the test is confirmed failing for the right reason.
    - GREEN: Write the minimal implementation to make the failing test pass. Re-run the
      test suite to confirm all tests pass.
@@ -139,11 +139,11 @@ Documentation:
 When implementation is complete and all files are staged, log your completion:
 
 ```
-uv run devbench log-verdict executor $ARGUMENTS pass "implementation complete: <one-line summary of what was done>"
+uv run devbench log-comment executor $ARGUMENTS "implementation complete: <one-line summary of what was done>"
 ```
 
 If you cannot complete the work unit (blocked, dependency missing, standards violation required), log failure:
 
 ```
-uv run devbench log-verdict executor $ARGUMENTS fail "<reason for failure>"
+uv run devbench log-comment executor $ARGUMENTS "fail: <reason for failure>"
 ```

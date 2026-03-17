@@ -31,6 +31,7 @@ Plugin agent bridge commands (used by devbench plugin agents)::
     get-diff <id>                           Return combined git diff for the work unit's repo
     run-tests <id>                          Run test suite for the work unit's repo
     log-verdict <judge> <id> <v> [msg]      Log a judge verdict (pass|fail) to work unit Comments
+    log-comment <agent> <id> <message>      Log a non-verdict agent comment to work unit Comments
 
 All commands exit 0 on success, non-zero on failure. Output is structured
 for easy parsing by Claude Code or other automation.
@@ -74,6 +75,7 @@ from devbench.config import (
 )
 from devbench.config_loader import get_configured_default_branch
 from devbench.constants import (
+    COMMENT_AGENT_TEMPLATE,
     COMMENT_ENTRY_TEMPLATE,
     COMMENTS_SECTION_HEADER,
     DISPLAY_STATUS_VALUES,
@@ -513,6 +515,42 @@ def cmd_log_verdict(judge_name: str, unit_id: str, verdict: str, feedback: str =
     return 0
 
 
+def cmd_log_comment(agent_name: str, unit_id: str, message: str) -> int:
+    """Append a non-verdict agent comment to the work unit's Comments section.
+
+    Writes: ``[YYYY-MM-DD HH:MM UTC] [agent/<name>] <message>``
+
+    Use for non-judge actors (executor, blocker-resolver, review-supervisor summary)
+    that need to log progress without emitting a REVIEW_PASS/REVIEW_FAIL token.
+    """
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    unit = _find_unit(units, unit_id)
+    if unit is None:
+        print(f"ERROR: Work unit '{unit_id}' not found in backlog", file=sys.stderr)
+        return 1
+
+    wu_file = BACKLOG_ROOT / unit.file_path if not unit.file_path.is_absolute() else unit.file_path
+    if not wu_file.exists():
+        wu_file = WORKSPACE_ROOT / unit.file_path
+
+    timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+    entry = COMMENT_AGENT_TEMPLATE.format(
+        timestamp=timestamp, name=agent_name, message=message,
+    )
+
+    content = wu_file.read_text(encoding="utf-8")
+    if COMMENTS_SECTION_HEADER in content:
+        content = content.rstrip("\n") + "\n\n" + entry
+    else:
+        content = content.rstrip("\n") + "\n\n" + COMMENTS_SECTION_HEADER + "\n\n" + entry
+    wu_file.write_text(content, encoding="utf-8")
+
+    logger.info("agent/%s comment for %s: %s", agent_name, unit_id, message)
+    print(json.dumps({"unit_id": unit_id, "agent": agent_name}))
+    return 0
+
+
 def cmd_ensure_branch(unit_id: str) -> int:
     """Create or switch to the feature branch for a work unit before executor runs.
 
@@ -692,6 +730,7 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
     "get-diff": (cmd_get_diff, 1, "Return combined git diff for work unit's repo: get-diff <id>"),
     "run-tests": (cmd_run_tests, 1, "Run test suite for work unit's repo: run-tests <id>"),
     "log-verdict": (cmd_log_verdict, 3, "Log judge verdict: log-verdict <judge> <id> <pass|fail> [feedback]"),
+    "log-comment": (cmd_log_comment, 3, "Log agent comment: log-comment <agent> <id> <message>"),
 }
 
 

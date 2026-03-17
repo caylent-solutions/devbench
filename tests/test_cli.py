@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -1028,3 +1029,86 @@ class TestCmdReadUnitStripComments:
         assert data["content"].strip() == content.strip(), (
             "Content should be unchanged when no ## Comments section is present"
         )
+
+
+@pytest.mark.unit
+class TestCmdLogComment:
+    """Tests for cmd_log_comment (AC-1, AC-2)."""
+
+    def _make_wu_file(self, tmp_path: Path, with_comments_section: bool = True) -> tuple[Path, Path]:
+        """Return (backlog_dir, wu_file) with a minimal work-unit file."""
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        wu_file = backlog_dir / "E0-F1-S1-T1.md"
+        header = "# E0-F1-S1-T1\n\n## Status: in-progress\n\n"
+        if with_comments_section:
+            header += "## Comments\n"
+        wu_file.write_text(header, encoding="utf-8")
+        return backlog_dir, wu_file
+
+    def _make_mock_unit(self, backlog_dir: Path) -> WorkUnit:
+        return WorkUnit(
+            id="E0-F1-S1-T1",
+            title="Test Task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=backlog_dir / "E0-F1-S1-T1.md",
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+
+    def test_log_comment_appends_agent_format_to_comments(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-1: log-comment appends [YYYY-MM-DD HH:MM UTC] [agent/<agent>] <message>."""
+        backlog_dir, wu_file = self._make_wu_file(tmp_path)
+        unit = self._make_mock_unit(backlog_dir)
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            result = cli.cmd_log_comment("executor", "E0-F1-S1-T1", "implementation complete")
+
+        assert result == 0
+        content = wu_file.read_text(encoding="utf-8")
+        timestamp_pattern = r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC\]"
+        assert re.search(timestamp_pattern, content), "Timestamp not found in comment"
+        assert "[agent/executor]" in content, "Agent prefix not in comment"
+        assert "implementation complete" in content, "Message not in comment"
+
+    def test_log_comment_contains_no_review_token(
+        self, tmp_path: Path
+    ) -> None:
+        """AC-2: log-comment entries must not contain [REVIEW_PASS] or [REVIEW_FAIL]."""
+        backlog_dir, wu_file = self._make_wu_file(tmp_path)
+        unit = self._make_mock_unit(backlog_dir)
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            cli.cmd_log_comment("executor", "E0-F1-S1-T1", "pass")
+
+        content = wu_file.read_text(encoding="utf-8")
+        assert "[REVIEW_PASS]" not in content
+        assert "[REVIEW_FAIL]" not in content
+
+    def test_log_comment_returns_1_when_unit_not_found(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """log-comment fails fast when unit is missing from the index."""
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = []
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_log_comment("executor", "NONEXISTENT", "message")
+
+        assert result == 1
+        assert "not found" in capsys.readouterr().err

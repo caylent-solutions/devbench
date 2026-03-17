@@ -62,8 +62,8 @@ uv run devbench log-verdict test_review $ARGUMENTS REVIEW_PASS "test-reviewer pa
 uv run devbench log-verdict doc_review $ARGUMENTS REVIEW_PASS "doc-reviewer passed"
 uv run devbench log-verdict changes_manifest $ARGUMENTS REVIEW_PASS "changes-manifest passed"
 
-# Log the supervisor-level PASS
-uv run devbench log-verdict review-supervisor $ARGUMENTS REVIEW_PASS "All review_team members passed"
+# Log the supervisor-level summary (non-verdict)
+uv run devbench log-comment review-supervisor $ARGUMENTS "All review_team members passed"
 ```
 
 Then return REVIEW_PASS to the caller.

@@ -72,7 +72,7 @@ The following files are operational backlog-tracking artifacts. You may read the
 After completing your analysis, write your verdict using:
 
 ```
-uv run devbench log-verdict blocker_resolver $ARGUMENTS <pass|fail> "<one-line summary: resolved|escalated|blocked>"
+uv run devbench log-comment blocker_resolver $ARGUMENTS "<resolved|escalated|blocked>: <one-line summary>"
 ```
 
-Use `pass` if blockers can be resolved within project standards, `fail` if escalation is required. Detailed resolution strategies go in your response text.
+Use `resolved` if blockers can be resolved within project standards, `escalated` if escalation is required. Detailed resolution strategies go in your response text.

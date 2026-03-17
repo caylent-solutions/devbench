@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from devbench.backlog.manager import BacklogManager
-from devbench.constants import REVIEW_JUDGE_NAMES, VALID_STATUSES
+from devbench.constants import ALL_REQUIRED_JUDGE_NAMES, REVIEW_JUDGE_NAMES, SECURITY_JUDGE_NAMES, VALID_STATUSES
 
 
 @pytest.fixture
@@ -172,7 +172,14 @@ def _all_judges_pass_block() -> str:
     ) + "\n"
 
 
-_ALL_JUDGES_PASSED_COMMENTS = _all_judges_pass_block()
+def _all_five_judges_pass_block() -> str:
+    """Return comment lines for all five required judges (4 review_team + security_review) passing."""
+    return "\n".join(
+        _judge_comment(j, "REVIEW_PASS") for j in sorted(ALL_REQUIRED_JUDGE_NAMES)
+    ) + "\n"
+
+
+_ALL_JUDGES_PASSED_COMMENTS = _all_five_judges_pass_block()
 
 
 class TestMarkDone:
@@ -354,7 +361,7 @@ class TestLastRoundAllPassed:
         return wu
 
     def test_returns_true_when_all_required_judges_passed(self, tmp_path: Path) -> None:
-        wu = self._make_wu_with_comments(tmp_path, _all_judges_pass_block())
+        wu = self._make_wu_with_comments(tmp_path, _all_five_judges_pass_block())
         judge = BacklogManager()
         assert judge._last_round_all_passed(wu) is True
 
@@ -387,8 +394,8 @@ class TestLastRoundAllPassed:
             # Round 1 — rejected
             _judge_comment("code_review", "REVIEW_PASS") + "\n"
             + "[2024-01-01 00:01 UTC] [orchestrator] [REVIEW_REJECTED] attempt 1 rejected\n"
-            # Round 2 — all pass
-            + _all_judges_pass_block()
+            # Round 2 — all five judges pass
+            + _all_five_judges_pass_block()
         )
         wu = self._make_wu_with_comments(tmp_path, comments)
         judge = BacklogManager()
@@ -398,6 +405,57 @@ class TestLastRoundAllPassed:
         wu = self._make_wu_with_comments(tmp_path, "")
         judge = BacklogManager()
         assert judge._last_round_all_passed(wu) is False
+
+
+class TestSecurityGate:
+    """Tests for the security_review gate in _last_round_all_passed (AC-4, AC-5)."""
+
+    def _make_wu_with_comments(self, tmp_path: Path, comments: str) -> Path:
+        wu = tmp_path / "E0-F1-S1-T1.md"
+        wu.write_text(
+            f"# E0-F1-S1-T1\n\n## Status: in-review\n\n## Comments\n\n{comments}",
+            encoding="utf-8",
+        )
+        return wu
+
+    def test_constants_security_judge_names_exists(self) -> None:
+        """AC-3: SECURITY_JUDGE_NAMES must be a frozenset containing 'security_review'."""
+        assert "security_review" in SECURITY_JUDGE_NAMES
+        assert isinstance(SECURITY_JUDGE_NAMES, frozenset)
+
+    def test_constants_all_required_judge_names_includes_security(self) -> None:
+        """AC-3: ALL_REQUIRED_JUDGE_NAMES must include both REVIEW_JUDGE_NAMES and SECURITY_JUDGE_NAMES."""
+        assert ALL_REQUIRED_JUDGE_NAMES >= REVIEW_JUDGE_NAMES
+        assert ALL_REQUIRED_JUDGE_NAMES >= SECURITY_JUDGE_NAMES
+        assert "security_review" in ALL_REQUIRED_JUDGE_NAMES
+        assert isinstance(ALL_REQUIRED_JUDGE_NAMES, frozenset)
+
+    def test_last_round_all_passed_false_when_only_review_team_passes(self, tmp_path: Path) -> None:
+        """AC-4: Returns False when all 4 review_team judges pass but security_review is absent."""
+        comments = _all_judges_pass_block()  # only the 4 review_team judges
+        wu = self._make_wu_with_comments(tmp_path, comments)
+        judge = BacklogManager()
+        assert judge._last_round_all_passed(wu) is False
+
+    def test_last_round_all_passed_requires_security_review(self, tmp_path: Path) -> None:
+        """AC-4: Returns False when security_review REVIEW_PASS is absent."""
+        comments = "\n".join([
+            _judge_comment("code_review", "REVIEW_PASS"),
+            _judge_comment("test_review", "REVIEW_PASS"),
+            _judge_comment("doc_review", "REVIEW_PASS"),
+            _judge_comment("changes_manifest", "REVIEW_PASS"),
+            # security_review deliberately absent
+        ]) + "\n"
+        wu = self._make_wu_with_comments(tmp_path, comments)
+        judge = BacklogManager()
+        assert judge._last_round_all_passed(wu) is False
+
+    def test_last_round_all_passed_true_when_all_five_judges_pass(self, tmp_path: Path) -> None:
+        """AC-5: Returns True only when all 5 judges (4 review_team + security_review) have REVIEW_PASS."""
+        comments = _all_five_judges_pass_block()
+        wu = self._make_wu_with_comments(tmp_path, comments)
+        judge = BacklogManager()
+        assert judge._last_round_all_passed(wu) is True
 
 
 class TestMarkDoneGate:
@@ -430,7 +488,7 @@ class TestMarkDoneGate:
             judge.mark_done(wu, idx, "E0-F1-S1-T1")
 
     def test_mark_done_succeeds_when_all_judges_passed(self, tmp_path: Path) -> None:
-        wu = self._make_wu(tmp_path, _all_judges_pass_block())
+        wu = self._make_wu(tmp_path, _all_five_judges_pass_block())
         idx = self._make_index(tmp_path)
         judge = BacklogManager()
         judge.mark_done(wu, idx, "E0-F1-S1-T1")

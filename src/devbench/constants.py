@@ -167,6 +167,15 @@ REVIEW_JUDGE_NAMES: frozenset[str] = frozenset({
     "changes_manifest",
 })
 
+SECURITY_JUDGE_NAMES: frozenset[str] = frozenset({"security_review"})
+
+ALL_REQUIRED_JUDGE_NAMES: frozenset[str] = REVIEW_JUDGE_NAMES | SECURITY_JUDGE_NAMES
+
+# ---------------------------------------------------------------------------
+# Non-verdict agent comment format template
+# ---------------------------------------------------------------------------
+COMMENT_AGENT_TEMPLATE: str = "[{timestamp}] [agent/{name}] {message}\n"
+
 # ---------------------------------------------------------------------------
 # Epic ID regex — matches top-level epic IDs such as "E200", "E1", etc.
 # A row is an epic row when its ID is exactly E<digits> with no hyphen suffix.

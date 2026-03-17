@@ -34,13 +34,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from devbench.constants import (
+    ALL_REQUIRED_JUDGE_NAMES,
     BACKLOG_STATUS_RE,
     BACKLOG_SUBDIR,
     COMMENT_ENTRY_TEMPLATE,
     COMMENTS_SECTION_HEADER,
     DEPENDENCY_NONE_VALUES,
     EPIC_ID_RE,
-    REVIEW_JUDGE_NAMES,
     STATUS_BLOCKED,
     STATUS_DONE,
     STATUS_IN_PROGRESS,
@@ -292,7 +292,7 @@ class BacklogManager:
         ``[REVIEW_REJECTED]`` line is encountered (prior round boundary).
 
         Returns:
-            True if every judge in ``REVIEW_JUDGE_NAMES`` has a ``[REVIEW_PASS]``
+            True if every judge in ``ALL_REQUIRED_JUDGE_NAMES`` has a ``[REVIEW_PASS]``
             entry in the most recent round; False otherwise.
         """
         content = work_unit_path.read_text(encoding="utf-8")
@@ -300,10 +300,10 @@ class BacklogManager:
         for line in reversed(content.splitlines()):
             if "[REVIEW_REJECTED]" in line:
                 break  # everything before this belongs to a prior round
-            for judge in REVIEW_JUDGE_NAMES:
+            for judge in ALL_REQUIRED_JUDGE_NAMES:
                 if f"[judge/{judge}]" in line and "[REVIEW_PASS]" in line:
                     passed.add(judge)
-        return passed >= REVIEW_JUDGE_NAMES
+        return passed >= ALL_REQUIRED_JUDGE_NAMES
 
     def _rollup_parent_status(self, backlog_index: Path, unit_id: str) -> None:
         """If all children of the parent unit are Done, mark the parent Done too.

@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
-from devbench.config import ALLOWED_REPOS
+from devbench.config import REPO_CONFIGS
 from devbench.github.security import SecurityFinding, SecurityReport
 
 
@@ -98,6 +98,8 @@ class TestSetupAllRepos:
     def test_setup_all_repos_calls_enable_for_each_allowed(self) -> None:
         from devbench.github.security import setup_all_repos
 
+        _allowed_repos = set(REPO_CONFIGS.keys())
+
         with patch("devbench.github.security.enable_security_features") as mock_enable:
             mock_enable.return_value = {
                 "dependabot_alerts": True,
@@ -107,16 +109,16 @@ class TestSetupAllRepos:
             }
             results = setup_all_repos()
 
-        # Verify all calls used allowed repos
-        assert mock_enable.call_count == len(ALLOWED_REPOS)
+        # Verify all calls used repos from REPO_CONFIGS
+        assert mock_enable.call_count == len(_allowed_repos)
 
         called_repos = {call.args[0] for call in mock_enable.call_args_list}
-        assert called_repos == ALLOWED_REPOS
+        assert called_repos == _allowed_repos
 
         # Every repo should have results
-        assert len(results) == len(ALLOWED_REPOS)
+        assert len(results) == len(_allowed_repos)
         for repo, features in results.items():
-            assert repo in ALLOWED_REPOS
+            assert repo in _allowed_repos
             assert features["codeql"] is True
 
     def test_setup_all_repos_does_not_call_disallowed(self) -> None:

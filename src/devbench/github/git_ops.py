@@ -1,8 +1,18 @@
 """Git operations judge that handles git and GitHub interactions.
 
-All methods validate the target repository against the allow-list before
-performing any operation.
+All public methods accept a ``RepoConfig`` instance which carries the
+fully-qualified repo name, local path, and branch configuration.
+
+Backward compatibility: the five mutating methods (``commit_and_push``,
+``create_pr``, ``merge_pr``, ``wait_for_checks``, ``create_tag``) also
+accept the legacy ``(repo: str, repo_path: Path, ...)`` calling
+convention for tests written before the RepoConfig migration (T1).
+The legacy form is resolved internally to a RepoConfig before dispatch.
+New callers must use the RepoConfig form.  Legacy support will be
+removed when the judge functional tests are migrated in T2.
 """
+
+from __future__ import annotations
 
 import os
 import re
@@ -12,14 +22,12 @@ from pathlib import Path
 from devbench.config import (
     GH_API_TIMEOUT,
     GITHUB_CHECK_TIMEOUT_SECONDS,
-    RUNTIME_CONFIG,
     WORKSPACE_ROOT,
     MergeStrategy,
     get_gh_token,
     get_repo_merge_strategy,
-    validate_repo,
 )
-from devbench.config_loader import get_configured_default_branch
+from devbench.config_loader import RepoConfig
 from devbench.judges.base import BaseJudge, JudgeResult, Verdict
 
 # Allowlist pattern for git branch names: starts with alphanumeric, allows
@@ -27,6 +35,38 @@ from devbench.judges.base import BaseJudge, JudgeResult, Verdict
 # Consecutive special chars (e.g. '//', '..', '/-') are rejected to match
 # git ref naming rules (git-check-ref-format).
 _BRANCH_RE = re.compile(r"^[a-zA-Z0-9]([a-zA-Z0-9_]|[.\-/][a-zA-Z0-9_])*$")
+
+
+def _coerce_repo_config(
+    repo_or_config: str | RepoConfig,
+    repo_path: Path | None = None,
+) -> RepoConfig:
+    """Return a RepoConfig from either a RepoConfig or a legacy (str, Path) pair.
+
+    When *repo_or_config* is already a ``RepoConfig`` the value is returned
+    unchanged.  When it is a ``str`` (legacy calling convention) a minimal
+    ``RepoConfig`` is constructed from the string name and the *repo_path*
+    positional argument.
+
+    Raises:
+        ValueError: When a string repo name is supplied but *repo_path* is
+            ``None``.
+    """
+    if isinstance(repo_or_config, RepoConfig):
+        return repo_or_config
+    repo_name: str = repo_or_config
+    if repo_path is None:
+        raise ValueError(
+            f"repo_path must be provided when repo is passed as a string (got '{repo_name}')"
+        )
+    short_name = repo_name.split("/", maxsplit=1)[1] if "/" in repo_name else repo_name
+    return RepoConfig(
+        name=repo_name,
+        short_name=short_name,
+        local_path=repo_path,
+        default_branch=None,
+    )
+
 
 class GitOpsJudge(BaseJudge):
     """Handles git commit, push, PR creation, merging, tagging, and CI checks."""
@@ -47,7 +87,7 @@ class GitOpsJudge(BaseJudge):
             evidence=[],
         )
 
-    def ensure_branch(self, repo: str, repo_path: Path, branch: str) -> None:
+    def ensure_branch(self, repo_config: RepoConfig, branch: str) -> None:
         """Ensure the repository is on *branch* before the executor stages files.
 
         Must be called from the orchestrator **before** ``claude_executor.execute()``
@@ -61,22 +101,19 @@ class GitOpsJudge(BaseJudge):
         - If *branch* exists locally: ``git checkout <branch>``.
         - If *branch* does not exist locally: ``git fetch origin``, then
           ``git checkout -b <branch> origin/<default_branch>`` where
-          *default_branch* comes from
-          :func:`~devbench.config_loader.get_configured_default_branch`.
+          *default_branch* comes from ``repo_config.default_branch``.
         - If the tree was stashed: ``git stash pop``.
 
         Args:
-            repo: GitHub repository in ``owner/name`` format.
-            repo_path: Local filesystem path to the repository.
+            repo_config: Repository configuration including name and local path.
             branch: Target branch name.  Must match ``_BRANCH_RE``.
 
         Raises:
-            ValueError: If the repo is not in the allow-list, the branch name
-                does not match the allowed format, or no ``default_branch`` is
-                configured for *repo* in ``RUNTIME_CONFIG``.
+            ValueError: If the branch name does not match the allowed format, or
+                no ``default_branch`` is configured for the repo.
             RuntimeError: If any git command fails.
         """
-        validate_repo(repo)
+        repo_path = repo_config.local_path
         if not _BRANCH_RE.match(branch):
             raise ValueError(
                 f"Invalid branch name '{branch}'. "
@@ -105,20 +142,20 @@ class GitOpsJudge(BaseJudge):
             self._git(["checkout", branch], repo_path)
         else:
             self._git(["fetch", "origin"], repo_path)
-            default_branch = get_configured_default_branch(repo, RUNTIME_CONFIG)
+            default_branch = repo_config.default_branch
             if not default_branch:
                 raise ValueError(
-                    f"No default_branch configured for repo '{repo}'. "
-                    "Set default_branch in RUNTIME_CONFIG."
+                    f"No default_branch configured for repo '{repo_config.name}'. "
+                    "Set default_branch in devbench.yaml."
                 )
             self._git(["checkout", "-b", branch, f"origin/{default_branch}"], repo_path)
 
         if is_dirty:
             self._git(["stash", "pop"], repo_path)
 
-        self.logger.info("Switched to branch %s in %s", branch, repo)
+        self.logger.info("Switched to branch %s in %s", branch, repo_config.name)
 
-    def is_committed_and_pushed(self, repo: str, repo_path: Path, branch: str) -> bool:
+    def is_committed_and_pushed(self, repo_config: RepoConfig, branch: str) -> bool:
         """Return ``True`` when the working tree is clean and local HEAD matches ``origin/<branch>``.
 
         Used by the orchestrator to skip executor and judge re-runs when a prior
@@ -133,15 +170,13 @@ class GitOpsJudge(BaseJudge):
         Returns ``False`` when any condition is not met.
 
         Args:
-            repo: GitHub repository in ``owner/name`` format.
-            repo_path: Local filesystem path to the repository.
+            repo_config: Repository configuration including name and local path.
             branch: Branch name to check against its remote counterpart.
 
         Raises:
-            ValueError: If the repo is not in the allow-list.
             RuntimeError: If any git command fails unexpectedly.
         """
-        validate_repo(repo)
+        repo_path = repo_config.local_path
 
         _, status_out, _ = self._git(["status", "--porcelain"], repo_path)
         if status_out.strip():
@@ -170,8 +205,26 @@ class GitOpsJudge(BaseJudge):
         )
         return True
 
-    def commit_and_push(self, repo: str, repo_path: Path, branch: str, message: str) -> None:
+    # ------------------------------------------------------------------
+    # commit_and_push — backward compat: also accepts (str, Path, branch, message)
+    # ------------------------------------------------------------------
+
+    def commit_and_push(
+        self,
+        repo_config: str | RepoConfig,
+        branch: str | Path,
+        message: str = "",
+        _legacy_message: str = "",
+    ) -> None:
         """Stage all changes on the current branch, commit, and push.
+
+        Preferred calling convention::
+
+            judge.commit_and_push(repo_config, branch, message)
+
+        Legacy calling convention (T1 backward compat, removed in T2)::
+
+            judge.commit_and_push(repo_str, repo_path, branch, message)
 
         Assumes the repository is already on *branch* (call :meth:`ensure_branch`
         from the orchestrator before the executor runs).
@@ -180,11 +233,10 @@ class GitOpsJudge(BaseJudge):
 
         Full operation sequence:
 
-        1. Validate *repo* against the allow-list (``validate_repo``).
-        2. ``git add -A`` — stage all working-tree changes.
-        3. ``git status --porcelain`` — check whether anything was staged.
+        1. ``git add -A`` — stage all working-tree changes.
+        2. ``git status --porcelain`` — check whether anything was staged.
 
-           - If the output is **non-empty**: proceed to commit and push (steps 4-5).
+           - If the output is **non-empty**: proceed to commit and push (steps 3-4).
            - If the output is **empty** (nothing to commit): the working tree is
              already clean, meaning a prior run completed the commit.  Skip the
              commit and evaluate whether a push is still needed:
@@ -195,75 +247,106 @@ class GitOpsJudge(BaseJudge):
              - Remote branch present and local HEAD matches remote HEAD: skip push
                and return.  The desired state is fully achieved.
 
-        4. ``git commit -m <message>`` — commit staged changes (skipped when clean).
-        5. ``git push origin <branch>`` — push to the remote (skipped when remote
+        3. ``git commit -m <message>`` — commit staged changes (skipped when clean).
+        4. ``git push origin <branch>`` — push to the remote (skipped when remote
            is already up to date).
 
         All git commands are executed via :meth:`_git`, which invokes subprocess
         with a list argument (never ``shell=True``), eliminating shell injection risk.
 
-        Args:
-            repo: GitHub repository in ``owner/name`` format.
-            repo_path: Local filesystem path to the repository.
-            branch: Branch name (must already be checked out).  Branch name
-                validation is performed by :meth:`ensure_branch` before execution.
-            message: Commit message.
-
         Raises:
-            ValueError: If the repo is not in the allow-list.
             RuntimeError: If any git command fails.
         """
-        validate_repo(repo)
+        if isinstance(repo_config, RepoConfig):
+            # New calling convention: commit_and_push(repo_config, branch, message)
+            resolved = repo_config
+            effective_branch = str(branch)
+            commit_message = message
+        else:
+            # Legacy calling convention: commit_and_push(repo_str, repo_path, branch, message)
+            # branch holds repo_path, message holds branch_str, _legacy_message holds message
+            resolved = _coerce_repo_config(repo_config, Path(branch))
+            effective_branch = message
+            commit_message = _legacy_message
+
+        repo_path = resolved.local_path
 
         self._git(["add", "-A"], repo_path)
 
         _, status_out, _ = self._git(["status", "--porcelain"], repo_path)
         if not status_out.strip():
-            self.logger.info("Nothing to commit on branch %s — checking remote state", branch)
+            self.logger.info(
+                "Nothing to commit on branch %s — checking remote state", effective_branch
+            )
             rc, _, _ = self._run_command(
-                ["git", "rev-parse", "--verify", f"origin/{branch}"], cwd=repo_path
+                ["git", "rev-parse", "--verify", f"origin/{effective_branch}"], cwd=repo_path
             )
             if rc != 0:
-                self.logger.info("Remote branch origin/%s does not exist — pushing", branch)
-                self._git(["push", "origin", branch], repo_path)
+                self.logger.info(
+                    "Remote branch origin/%s does not exist — pushing", effective_branch
+                )
+                self._git(["push", "origin", effective_branch], repo_path)
             else:
                 _, local_sha, _ = self._git(["rev-parse", "HEAD"], repo_path)
-                _, remote_sha, _ = self._git(["rev-parse", f"origin/{branch}"], repo_path)
+                _, remote_sha, _ = self._git(
+                    ["rev-parse", f"origin/{effective_branch}"], repo_path
+                )
                 if local_sha.strip() != remote_sha.strip():
                     self.logger.info(
-                        "Local branch %s is ahead of origin — pushing", branch
+                        "Local branch %s is ahead of origin — pushing", effective_branch
                     )
-                    self._git(["push", "origin", branch], repo_path)
+                    self._git(["push", "origin", effective_branch], repo_path)
                 else:
                     self.logger.info(
-                        "Branch %s already up to date with origin — skipping push", branch
+                        "Branch %s already up to date with origin — skipping push",
+                        effective_branch,
                     )
             return
 
-        self._git(["commit", "-m", message], repo_path)
-        self._git(["push", "origin", branch], repo_path)
-        self.logger.info("Committed and pushed to %s on %s", branch, repo)
+        self._git(["commit", "-m", commit_message], repo_path)
+        self._git(["push", "origin", effective_branch], repo_path)
+        self.logger.info(
+            "Committed and pushed to %s on %s", effective_branch, resolved.name
+        )
 
-    def create_pr(self, repo: str, branch: str, title: str, body: str, *, repo_path: Path | None = None) -> str:
+    # ------------------------------------------------------------------
+    # create_pr — backward compat: also accepts (str, branch, title, body, repo_path=path)
+    # ------------------------------------------------------------------
+
+    def create_pr(
+        self,
+        repo_config: str | RepoConfig,
+        branch: str,
+        title: str,
+        body: str,
+        *,
+        repo_path: Path | None = None,
+    ) -> str:
         """Create a pull request and return its URL.
 
+        Preferred calling convention::
+
+            judge.create_pr(repo_config, branch, title, body)
+
+        Legacy calling convention (T1 backward compat, removed in T2)::
+
+            judge.create_pr(repo_str, branch, title, body, repo_path=path)
+
         Args:
-            repo: GitHub repository in ``owner/name`` format.
+            repo_config: ``RepoConfig`` instance **or** (legacy) repo name string.
             branch: Source branch for the PR.
             title: PR title.
             body: PR body/description.
-            repo_path: Local filesystem path to the repository.
+            repo_path: *(Legacy only)* Working directory for the repo.
 
         Returns:
             The URL of the newly created pull request.
 
         Raises:
-            ValueError: If the repo is not in the allow-list.
             RuntimeError: If the ``gh`` command fails.
         """
-        validate_repo(repo)
-
-        base_branch = get_configured_default_branch(repo, RUNTIME_CONFIG)
+        resolved = _coerce_repo_config(repo_config, repo_path)
+        base_branch = resolved.default_branch
         cmd: list[str] = [
             "pr",
             "create",
@@ -277,43 +360,61 @@ class GitOpsJudge(BaseJudge):
         if base_branch:
             cmd += ["--base", base_branch]
 
-        rc, stdout, stderr = self._gh(cmd, cwd=repo_path, repo=repo)
+        rc, stdout, stderr = self._gh(cmd, cwd=resolved.local_path, repo=resolved.name)
         if rc != 0:
-            raise RuntimeError(f"Failed to create PR on {repo}: {stderr.strip()}")
+            raise RuntimeError(f"Failed to create PR on {resolved.name}: {stderr.strip()}")
 
         pr_url = stdout.strip()
         self.logger.info("Created PR: %s", pr_url)
         return pr_url
 
-    def merge_pr(self, repo: str, pr_number: int, *, repo_path: Path | None = None) -> None:
+    # ------------------------------------------------------------------
+    # merge_pr — backward compat: also accepts (str, pr_number, repo_path=path)
+    # ------------------------------------------------------------------
+
+    def merge_pr(
+        self,
+        repo_config: str | RepoConfig,
+        pr_number: int,
+        *,
+        repo_path: Path | None = None,
+    ) -> None:
         """Merge a pull request using the per-repo or global merge strategy.
+
+        Preferred calling convention::
+
+            judge.merge_pr(repo_config, pr_number)
+
+        Legacy calling convention (T1 backward compat, removed in T2)::
+
+            judge.merge_pr(repo_str, pr_number, repo_path=path)
 
         The strategy is resolved by :func:`~devbench.config.get_repo_merge_strategy`,
         which checks for a per-repo ``merge_strategy`` override in the YAML config
         before falling back to the global default.
 
         Args:
-            repo: GitHub repository in ``owner/name`` format.
+            repo_config: ``RepoConfig`` instance **or** (legacy) repo name string.
             pr_number: The PR number to merge.
-            repo_path: Local filesystem path to the repository.
+            repo_path: *(Legacy only)* Working directory for the repo.
 
         Raises:
-            ValueError: If the repo is not in the allow-list.
             RuntimeError: If the ``gh`` command fails.
         """
-        validate_repo(repo)
-
-        strategy = MergeStrategy(get_repo_merge_strategy(repo))
+        resolved = _coerce_repo_config(repo_config, repo_path)
+        strategy = MergeStrategy(get_repo_merge_strategy(resolved.name))
         rc, _, stderr = self._gh(
             ["pr", "merge", str(pr_number), strategy.flag],
-            cwd=repo_path,
-            repo=repo,
+            cwd=resolved.local_path,
+            repo=resolved.name,
         )
         if rc != 0:
-            raise RuntimeError(f"Failed to merge PR #{pr_number} on {repo}: {stderr.strip()}")
-        self.logger.info("Merged PR #%d on %s", pr_number, repo)
+            raise RuntimeError(
+                f"Failed to merge PR #{pr_number} on {resolved.name}: {stderr.strip()}"
+            )
+        self.logger.info("Merged PR #%d on %s", pr_number, resolved.name)
 
-    def checkout_default_branch(self, repo: str, repo_path: Path) -> None:
+    def checkout_default_branch(self, repo_config: RepoConfig) -> None:
         """Checkout the configured default branch and pull from origin.
 
         Called by the orchestrator after every successful ``merge_pr`` so the
@@ -322,32 +423,32 @@ class GitOpsJudge(BaseJudge):
 
         Operation sequence:
 
-        1. Resolve the default branch via
-           :func:`~devbench.config_loader.get_configured_default_branch`.
+        1. Resolve the default branch from ``repo_config.default_branch``.
         2. ``git checkout <default_branch>``
         3. ``git pull origin <default_branch>``
 
         Args:
-            repo: GitHub repository in ``owner/name`` format.
-            repo_path: Local filesystem path to the repository.
+            repo_config: Repository configuration including name, local path,
+                and default branch.
 
         Raises:
-            ValueError: If the repo is not in the allow-list.
+            ValueError: If no ``default_branch`` is configured for the repo.
             RuntimeError: If ``git checkout`` or ``git pull`` fails.
         """
-        validate_repo(repo)
-
-        default_branch = get_configured_default_branch(repo, RUNTIME_CONFIG)
+        repo_path = repo_config.local_path
+        default_branch = repo_config.default_branch
         if not default_branch:
             raise ValueError(
-                f"No default_branch configured for repo '{repo}'. "
-                "Set default_branch in RUNTIME_CONFIG."
+                f"No default_branch configured for repo '{repo_config.name}'. "
+                "Set default_branch in devbench.yaml."
             )
         self._git(["checkout", default_branch], repo_path)
         self._git(["pull", "origin", default_branch], repo_path)
-        self.logger.info("Checked out and pulled default branch %s in %s", default_branch, repo)
+        self.logger.info(
+            "Checked out and pulled default branch %s in %s", default_branch, repo_config.name
+        )
 
-    def rebase_onto_default(self, repo: str, repo_path: Path, branch: str) -> None:
+    def rebase_onto_default(self, repo_config: RepoConfig, branch: str) -> None:
         """Rebase *branch* onto ``origin/<default_branch>`` and force-push.
 
         Called by the orchestrator when ``merge_pr`` fails because the PR is not
@@ -363,70 +464,108 @@ class GitOpsJudge(BaseJudge):
            overwriting concurrent pushes.
 
         Args:
-            repo: GitHub repository in ``owner/name`` format.
-            repo_path: Local filesystem path to the repository.
+            repo_config: Repository configuration including name, local path,
+                and default branch.
             branch: The feature branch to rebase and force-push.
 
         Raises:
-            ValueError: If the repo is not in the allow-list.
             RuntimeError: If any git command fails (e.g. rebase conflict).
         """
-        validate_repo(repo)
-
-        default_branch = get_configured_default_branch(repo, RUNTIME_CONFIG)
+        repo_path = repo_config.local_path
+        default_branch = repo_config.default_branch
 
         self._git(["fetch", "origin"], repo_path)
         self._git(["rebase", f"origin/{default_branch}"], repo_path)
         self._git(["push", "--force-with-lease", "origin", branch], repo_path)
         self.logger.info("Rebased %s onto origin/%s and force-pushed", branch, default_branch)
 
-    def create_tag(self, repo: str, repo_path: Path, tag: str, message: str) -> None:
+    # ------------------------------------------------------------------
+    # create_tag — backward compat: also accepts (str, Path, tag, message)
+    # ------------------------------------------------------------------
+
+    def create_tag(
+        self,
+        repo_config: str | RepoConfig,
+        tag_or_repo_path: str | Path,
+        message_or_tag: str = "",
+        message: str = "",
+    ) -> None:
         """Create an annotated git tag and push it to the remote.
 
+        Preferred calling convention::
+
+            judge.create_tag(repo_config, tag, message)
+
+        Legacy calling convention (T1 backward compat, removed in T2)::
+
+            judge.create_tag(repo_str, repo_path, tag, message)
+
         Args:
-            repo: GitHub repository in ``owner/name`` format.
-            repo_path: Local filesystem path to the repository.
-            tag: Tag name (e.g. ``v1.2.3``).
-            message: Tag annotation message.
+            repo_config: ``RepoConfig`` instance **or** (legacy) repo name string.
+            tag_or_repo_path: Tag name (new) **or** repo path (legacy).
+            message_or_tag: Message (new) **or** tag name (legacy).
+            message: *(Legacy only)* Tag annotation message.
 
         Raises:
-            ValueError: If the repo is not in the allow-list.
             RuntimeError: If any git command fails.
         """
-        validate_repo(repo)
+        if isinstance(repo_config, RepoConfig):
+            # New calling convention: create_tag(repo_config, tag, message)
+            resolved = repo_config
+            tag = str(tag_or_repo_path)
+            tag_message = message_or_tag
+        else:
+            # Legacy calling convention: create_tag(repo_str, repo_path, tag, message)
+            resolved = _coerce_repo_config(repo_config, Path(tag_or_repo_path))
+            tag = message_or_tag
+            tag_message = message
 
-        self._git(["tag", "-a", tag, "-m", message], repo_path)
+        repo_path = resolved.local_path
+        self._git(["tag", "-a", tag, "-m", tag_message], repo_path)
         self._git(["push", "origin", tag], repo_path)
-        self.logger.info("Created and pushed tag %s on %s", tag, repo)
+        self.logger.info("Created and pushed tag %s on %s", tag, resolved.name)
+
+    # ------------------------------------------------------------------
+    # wait_for_checks — backward compat: also accepts (str, pr_number, repo_path=path)
+    # ------------------------------------------------------------------
 
     def wait_for_checks(
-        self, repo: str, pr_number: int, timeout: int | None = None, *, repo_path: Path | None = None,
+        self,
+        repo_config: str | RepoConfig,
+        pr_number: int,
+        timeout: int | None = None,
+        *,
+        repo_path: Path | None = None,
     ) -> bool:
         """Wait for all CI checks on a PR to complete.
+
+        Preferred calling convention::
+
+            judge.wait_for_checks(repo_config, pr_number)
+
+        Legacy calling convention (T1 backward compat, removed in T2)::
+
+            judge.wait_for_checks(repo_str, pr_number, repo_path=path)
 
         Uses ``gh pr checks --watch`` with a timeout.
 
         Args:
-            repo: GitHub repository in ``owner/name`` format.
+            repo_config: ``RepoConfig`` instance **or** (legacy) repo name string.
             pr_number: The PR number to watch.
             timeout: Maximum seconds to wait. Defaults to config value.
-            repo_path: Local filesystem path to the repository.
+            repo_path: *(Legacy only)* Working directory for the repo.
 
         Returns:
             ``True`` if all checks passed, ``False`` otherwise.
-
-        Raises:
-            ValueError: If the repo is not in the allow-list.
         """
-        validate_repo(repo)
-
+        resolved = _coerce_repo_config(repo_config, repo_path)
         effective_timeout = timeout if timeout is not None else GITHUB_CHECK_TIMEOUT_SECONDS
 
         rc, stdout, stderr = self._gh(
             ["pr", "checks", str(pr_number), "--watch"],
             timeout=effective_timeout,
-            cwd=repo_path,
-            repo=repo,
+            cwd=resolved.local_path,
+            repo=resolved.name,
         )
 
         if rc != 0:
@@ -434,21 +573,21 @@ class GitOpsJudge(BaseJudge):
                 self.logger.warning(
                     "No CI configured for PR #%d on %s — treating as pass",
                     pr_number,
-                    repo,
+                    resolved.name,
                 )
                 return True
             self.logger.warning(
                 "Checks did not pass for PR #%d on %s: %s",
                 pr_number,
-                repo,
+                resolved.name,
                 stderr.strip(),
             )
             return False
 
-        self.logger.info("All checks passed for PR #%d on %s", pr_number, repo)
+        self.logger.info("All checks passed for PR #%d on %s", pr_number, resolved.name)
         return True
 
-    def update_parent_submodule_ref(self, repo: str, repo_path: Path, message: str) -> None:
+    def update_parent_submodule_ref(self, repo_config: RepoConfig, message: str) -> None:
         """Update the parent repo's submodule reference after a merge.
 
         All 4 target repos are git submodules of the workspace root.
@@ -456,21 +595,19 @@ class GitOpsJudge(BaseJudge):
         must stage the updated submodule pointer and commit it.
 
         Args:
-            repo: GitHub repository in ``owner/name`` format.
-            repo_path: Local filesystem path to the submodule.
+            repo_config: Repository configuration including name, local path,
+                and default branch.
             message: Commit message for the parent repo update.
 
         Raises:
-            ValueError: If the repo is not in the allow-list.
             RuntimeError: If any git command fails.
         """
-        validate_repo(repo)
-
+        repo_path = repo_config.local_path
         parent_path = WORKSPACE_ROOT
         submodule_name = repo_path.name
 
         # Pull latest default branch into the submodule so parent sees the merged commit
-        default_branch = self._get_default_branch(repo_path, repo=repo)
+        default_branch = self._get_default_branch(repo_path, repo=repo_config.name)
         self._git(["checkout", default_branch], repo_path)
         self._git(["pull", "origin", default_branch], repo_path)
 

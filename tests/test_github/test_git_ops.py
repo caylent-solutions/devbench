@@ -7,9 +7,26 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from devbench.config_loader import RepoConfig, RuntimeConfig
+from devbench.config_loader import RepoConfig
 from devbench.github.git_ops import GitOpsJudge
 from devbench.judges.base import Verdict
+
+
+def _make_repo_config(
+    name: str = "caylent-solutions/git-repo",
+    *,
+    local_path: Path | None = None,
+    default_branch: str | None = "main2",
+) -> RepoConfig:
+    """Factory for RepoConfig test fixtures with all required fields populated."""
+    short_name = name.split("/", maxsplit=1)[1] if "/" in name else name
+    path = local_path or Path("/tmp") / short_name
+    return RepoConfig(
+        name=name,
+        short_name=short_name,
+        local_path=path,
+        default_branch=default_branch,
+    )
 
 
 class TestGitOpsInit:
@@ -32,21 +49,15 @@ class TestEvaluate:
 
 
 class TestEnsureBranch:
-    """Test ensure_branch method."""
+    """Test ensure_branch method.
 
-    def test_validates_repo(self, tmp_path: Path) -> None:
-        judge = GitOpsJudge()
-        with pytest.raises(ValueError, match="not allowed"):
-            judge.ensure_branch("caylent-solutions/nonexistent-test-repo", tmp_path, "branch")
+    AC-6: git_ops public methods accept a RepoConfig and no longer call validate_repo internally.
+    """
 
-    def test_rejects_invalid_branch_name(self, tmp_path: Path) -> None:
+    def test_git_ops_accepts_repo_config(self, tmp_path: Path) -> None:
+        """AC-6: ensure_branch accepts a RepoConfig and uses repo_config.local_path."""
         judge = GitOpsJudge()
-        with pytest.raises(ValueError, match="Invalid branch name"):
-            judge.ensure_branch("caylent-solutions/git-repo", tmp_path, "bad branch!")
-
-    def test_noop_when_already_on_target_branch(self, tmp_path: Path) -> None:
-        """No checkout or stash call is made when HEAD is already on the target branch."""
-        judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path, default_branch="main2")
         git_calls: list[list[str]] = []
 
         def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
@@ -56,7 +67,31 @@ class TestEnsureBranch:
             return (0, "", "")
 
         with patch.object(judge, "_git", side_effect=stub):
-            judge.ensure_branch("caylent-solutions/git-repo", tmp_path, "feature/x")
+            # Calling with a RepoConfig must not raise — this is AC-6
+            judge.ensure_branch(repo_config, "feature/x")
+
+        assert ["checkout", "feature/x"] not in git_calls  # already on branch
+
+    def test_rejects_invalid_branch_name(self, tmp_path: Path) -> None:
+        judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path)
+        with pytest.raises(ValueError, match="Invalid branch name"):
+            judge.ensure_branch(repo_config, "bad branch!")
+
+    def test_noop_when_already_on_target_branch(self, tmp_path: Path) -> None:
+        """No checkout or stash call is made when HEAD is already on the target branch."""
+        judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path)
+        git_calls: list[list[str]] = []
+
+        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
+            git_calls.append(args)
+            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, "feature/x", "")
+            return (0, "", "")
+
+        with patch.object(judge, "_git", side_effect=stub):
+            judge.ensure_branch(repo_config, "feature/x")
 
         assert ["checkout", "feature/x"] not in git_calls
         assert ["checkout", "-b", "feature/x"] not in git_calls
@@ -65,6 +100,7 @@ class TestEnsureBranch:
     def test_checks_out_existing_branch_when_clean(self, tmp_path: Path) -> None:
         """``git checkout <branch>`` (no -b) is used when tree is clean and branch exists locally."""
         judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path)
         git_calls: list[list[str]] = []
 
         def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
@@ -80,7 +116,7 @@ class TestEnsureBranch:
             patch.object(judge, "_git", side_effect=stub),
             patch.object(judge, "_run_command", return_value=(0, "", "")),
         ):
-            judge.ensure_branch("caylent-solutions/git-repo", tmp_path, "feature/x")
+            judge.ensure_branch(repo_config, "feature/x")
 
         assert ["checkout", "feature/x"] in git_calls
         assert ["checkout", "-b", "feature/x"] not in git_calls
@@ -89,6 +125,7 @@ class TestEnsureBranch:
     def test_stashes_before_checkout_when_staged_changes(self, tmp_path: Path) -> None:
         """stash → checkout → stash pop when tree has staged changes."""
         judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path)
         git_calls: list[list[str]] = []
 
         def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
@@ -103,7 +140,7 @@ class TestEnsureBranch:
             patch.object(judge, "_git", side_effect=stub),
             patch.object(judge, "_run_command", return_value=(0, "", "")),  # show-ref → exists
         ):
-            judge.ensure_branch("caylent-solutions/git-repo", tmp_path, "feature/x")
+            judge.ensure_branch(repo_config, "feature/x")
 
         assert git_calls.index(["stash"]) < git_calls.index(["checkout", "feature/x"])
         assert git_calls.index(["checkout", "feature/x"]) < git_calls.index(["stash", "pop"])
@@ -111,6 +148,7 @@ class TestEnsureBranch:
     def test_stashes_before_checkout_when_unstaged_changes(self, tmp_path: Path) -> None:
         """stash → checkout → stash pop when tree has unstaged changes."""
         judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path)
         git_calls: list[list[str]] = []
 
         def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
@@ -125,7 +163,7 @@ class TestEnsureBranch:
             patch.object(judge, "_git", side_effect=stub),
             patch.object(judge, "_run_command", return_value=(0, "", "")),  # show-ref → exists
         ):
-            judge.ensure_branch("caylent-solutions/git-repo", tmp_path, "feature/x")
+            judge.ensure_branch(repo_config, "feature/x")
 
         assert ["stash"] in git_calls
         assert ["stash", "pop"] in git_calls
@@ -133,6 +171,7 @@ class TestEnsureBranch:
     def test_creates_branch_when_absent(self, tmp_path: Path) -> None:
         """``git checkout -b <branch> origin/<default>`` is used when branch does not exist locally."""
         judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path, default_branch="main")
         git_calls: list[list[str]] = []
 
         def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
@@ -143,15 +182,11 @@ class TestEnsureBranch:
                 return (0, "", "")  # clean
             return (0, "", "")
 
-        runtime_config = RuntimeConfig(
-            repos={"caylent-solutions/git-repo": RepoConfig(default_branch="main")}
-        )
         with (
-            patch("devbench.github.git_ops.RUNTIME_CONFIG", runtime_config),
             patch.object(judge, "_git", side_effect=stub),
             patch.object(judge, "_run_command", return_value=(1, "", "")),  # show-ref → absent
         ):
-            judge.ensure_branch("caylent-solutions/git-repo", tmp_path, "feature/x")
+            judge.ensure_branch(repo_config, "feature/x")
 
         assert ["checkout", "-b", "feature/x", "origin/main"] in git_calls
         assert ["checkout", "feature/x"] not in git_calls
@@ -164,6 +199,7 @@ class TestEnsureBranch:
         Then: git checkout -b <branch> origin/<default_branch> is called (not just -b <branch>)
         """
         judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path, default_branch="main2")
         git_calls: list[list[str]] = []
 
         def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
@@ -174,15 +210,11 @@ class TestEnsureBranch:
                 return (0, "", "")  # clean
             return (0, "", "")
 
-        runtime_config = RuntimeConfig(
-            repos={"caylent-solutions/git-repo": RepoConfig(default_branch="main2")}
-        )
         with (
-            patch("devbench.github.git_ops.RUNTIME_CONFIG", runtime_config),
             patch.object(judge, "_git", side_effect=stub),
             patch.object(judge, "_run_command", return_value=(1, "", "")),  # show-ref → absent
         ):
-            judge.ensure_branch("caylent-solutions/git-repo", tmp_path, "feature/new-task")
+            judge.ensure_branch(repo_config, "feature/new-task")
 
         assert ["checkout", "-b", "feature/new-task", "origin/main2"] in git_calls
         assert ["checkout", "-b", "feature/new-task"] not in git_calls
@@ -195,6 +227,7 @@ class TestEnsureBranch:
         Then: git fetch origin is called before git checkout -b
         """
         judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path, default_branch="main2")
         git_calls: list[list[str]] = []
 
         def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
@@ -205,15 +238,11 @@ class TestEnsureBranch:
                 return (0, "", "")  # clean
             return (0, "", "")
 
-        runtime_config = RuntimeConfig(
-            repos={"caylent-solutions/git-repo": RepoConfig(default_branch="main2")}
-        )
         with (
-            patch("devbench.github.git_ops.RUNTIME_CONFIG", runtime_config),
             patch.object(judge, "_git", side_effect=stub),
             patch.object(judge, "_run_command", return_value=(1, "", "")),  # show-ref → absent
         ):
-            judge.ensure_branch("caylent-solutions/git-repo", tmp_path, "feature/new-task")
+            judge.ensure_branch(repo_config, "feature/new-task")
 
         fetch_idx = git_calls.index(["fetch", "origin"])
         checkout_idx = git_calls.index(["checkout", "-b", "feature/new-task", "origin/main2"])
@@ -227,6 +256,7 @@ class TestEnsureBranch:
         Then: git fetch origin is NOT called (existing branch path unchanged)
         """
         judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path)
         git_calls: list[list[str]] = []
 
         def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
@@ -241,18 +271,19 @@ class TestEnsureBranch:
             patch.object(judge, "_git", side_effect=stub),
             patch.object(judge, "_run_command", return_value=(0, "", "")),  # show-ref → exists
         ):
-            judge.ensure_branch("caylent-solutions/git-repo", tmp_path, "feature/x")
+            judge.ensure_branch(repo_config, "feature/x")
 
         assert ["fetch", "origin"] not in git_calls
 
     def test_ensure_branch_uses_configured_default_branch(self, tmp_path: Path) -> None:
-        """AC-3: get_configured_default_branch is used to determine the base branch name.
+        """AC-3: default_branch from RepoConfig is used to determine the base branch name.
 
-        Given: RUNTIME_CONFIG has default_branch='develop' for the repo
+        Given: repo_config.default_branch is 'develop'
         When: ensure_branch creates a new branch
         Then: origin/develop is used as the base, not origin/main
         """
         judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path, default_branch="develop")
         git_calls: list[list[str]] = []
 
         def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
@@ -263,26 +294,23 @@ class TestEnsureBranch:
                 return (0, "", "")  # clean
             return (0, "", "")
 
-        runtime_config = RuntimeConfig(
-            repos={"caylent-solutions/git-repo": RepoConfig(default_branch="develop")}
-        )
         with (
-            patch("devbench.github.git_ops.RUNTIME_CONFIG", runtime_config),
             patch.object(judge, "_git", side_effect=stub),
             patch.object(judge, "_run_command", return_value=(1, "", "")),  # show-ref → absent
         ):
-            judge.ensure_branch("caylent-solutions/git-repo", tmp_path, "feature/x")
+            judge.ensure_branch(repo_config, "feature/x")
 
         assert ["checkout", "-b", "feature/x", "origin/develop"] in git_calls
 
     def test_ensure_branch_raises_when_no_default_branch_configured(self, tmp_path: Path) -> None:
         """AC-3: Raises ValueError (fail-fast) when no default_branch is configured.
 
-        Given: RUNTIME_CONFIG has no default_branch for the repo
+        Given: repo_config.default_branch is None
         When: ensure_branch attempts to create a new branch
         Then: ValueError is raised with a clear actionable message
         """
         judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path, default_branch=None)
 
         def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
             if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
@@ -291,35 +319,28 @@ class TestEnsureBranch:
                 return (0, "", "")  # clean
             return (0, "", "")
 
-        runtime_config = RuntimeConfig(
-            repos={"caylent-solutions/git-repo": RepoConfig(default_branch=None)}
-        )
         with (
-            patch("devbench.github.git_ops.RUNTIME_CONFIG", runtime_config),
             patch.object(judge, "_git", side_effect=stub),
             patch.object(judge, "_run_command", return_value=(1, "", "")),  # show-ref → absent
             pytest.raises(ValueError, match="No default_branch configured for repo"),
         ):
-            judge.ensure_branch("caylent-solutions/git-repo", tmp_path, "feature/x")
+            judge.ensure_branch(repo_config, "feature/x")
 
 
 class TestCommitAndPush:
     """Test commit_and_push method."""
 
-    def test_validates_repo(self, tmp_path: Path) -> None:
-        judge = GitOpsJudge()
-        with pytest.raises(ValueError, match="not allowed"):
-            judge.commit_and_push("caylent-solutions/nonexistent-test-repo", tmp_path, "branch", "msg")
-
     def test_raises_on_git_failure(self, tmp_path: Path) -> None:
         judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path)
         with patch.object(judge, "_git", side_effect=RuntimeError("git failed")):
             with pytest.raises(RuntimeError, match="git failed"):
-                judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "b", "m")
+                judge.commit_and_push(repo_config, "b", "m")
 
     def test_does_not_call_git_checkout(self, tmp_path: Path) -> None:
         """commit_and_push never calls git checkout — branch setup is ensure_branch's job."""
         judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path)
         git_calls: list[list[str]] = []
 
         def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
@@ -331,7 +352,7 @@ class TestCommitAndPush:
             return (0, "", "")
 
         with patch.object(judge, "_git", side_effect=stub):
-            judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "feature/x", "msg")
+            judge.commit_and_push(repo_config, "feature/x", "msg")
 
         checkout_calls = [c for c in git_calls if c[0] == "checkout"]
         assert checkout_calls == [], "commit_and_push must not call git checkout"
@@ -343,6 +364,7 @@ class TestCommitAndPush:
     def test_commits_and_pushes_when_changes_present(self, tmp_path: Path) -> None:
         """Full commit + push sequence runs when the working tree has changes."""
         judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path)
         git_calls: list[list[str]] = []
 
         def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
@@ -354,7 +376,7 @@ class TestCommitAndPush:
             return (0, "", "")
 
         with patch.object(judge, "_git", side_effect=stub):
-            judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "feature/x", "commit msg")
+            judge.commit_and_push(repo_config, "feature/x", "commit msg")
 
         assert ["add", "-A"] in git_calls
         assert ["commit", "-m", "commit msg"] in git_calls
@@ -369,6 +391,7 @@ class TestCommitAndPush:
     ) -> None:
         """When working tree is clean and remote matches local HEAD, both commit and push are skipped."""
         judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path)
         git_calls: list[list[str]] = []
 
         def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
@@ -388,7 +411,7 @@ class TestCommitAndPush:
             patch.object(judge, "_git", side_effect=stub),
             patch.object(judge, "_run_command", return_value=(0, "", "")),
         ):
-            judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "feature/x", "msg")
+            judge.commit_and_push(repo_config, "feature/x", "msg")
 
         assert ["commit", "-m", "msg"] not in git_calls
         assert ["push", "origin", "feature/x"] not in git_calls
@@ -396,6 +419,7 @@ class TestCommitAndPush:
     def test_nothing_to_commit_pushes_when_remote_branch_absent(self, tmp_path: Path) -> None:
         """When working tree is clean and the remote branch does not exist, push runs."""
         judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path)
         git_calls: list[list[str]] = []
 
         def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
@@ -406,15 +430,14 @@ class TestCommitAndPush:
                 return (0, "", "")  # clean
             return (0, "", "")
 
-        # First _run_command = show-ref (skipped, already on branch).
-        # Only _run_command call = rev-parse --verify origin/feature/x → rc=1 (absent).
+        # rev-parse --verify origin/feature/x → rc=1 (absent)
         run_command_responses = iter([(1, "", "")])
 
         with (
             patch.object(judge, "_git", side_effect=stub),
             patch.object(judge, "_run_command", side_effect=run_command_responses),
         ):
-            judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "feature/x", "msg")
+            judge.commit_and_push(repo_config, "feature/x", "msg")
 
         assert ["commit", "-m", "msg"] not in git_calls
         assert ["push", "origin", "feature/x"] in git_calls
@@ -422,6 +445,7 @@ class TestCommitAndPush:
     def test_nothing_to_commit_pushes_when_local_ahead_of_remote(self, tmp_path: Path) -> None:
         """When working tree is clean but local SHA differs from remote SHA, push runs."""
         judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path)
         git_calls: list[list[str]] = []
 
         def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
@@ -441,56 +465,53 @@ class TestCommitAndPush:
             patch.object(judge, "_git", side_effect=stub),
             patch.object(judge, "_run_command", return_value=(0, "", "")),
         ):
-            judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "feature/x", "msg")
+            judge.commit_and_push(repo_config, "feature/x", "msg")
 
         assert ["commit", "-m", "msg"] not in git_calls
         assert ["push", "origin", "feature/x"] in git_calls
 
 
 class TestCreatePr:
-    """Test create_pr method."""
+    """Test create_pr method.
 
-    def test_validates_repo(self) -> None:
-        judge = GitOpsJudge()
-        with pytest.raises(ValueError, match="not allowed"):
-            judge.create_pr("caylent-solutions/nonexistent-test-repo", "branch", "title", "body")
+    AC-6: git_ops public methods accept a RepoConfig and no longer call validate_repo internally.
+    """
 
     def test_returns_pr_url(self, tmp_path: Path) -> None:
         judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path)
         with patch.object(
             judge,
             "_gh",
             return_value=(0, "https://github.com/org/repo/pull/42\n", ""),
         ):
-            url = judge.create_pr("caylent-solutions/git-repo", "branch", "title", "body", repo_path=tmp_path)
+            url = judge.create_pr(repo_config, "branch", "title", "body")
         assert url == "https://github.com/org/repo/pull/42"
 
     def test_raises_on_failure(self, tmp_path: Path) -> None:
         judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path)
         with patch.object(judge, "_gh", return_value=(1, "", "error msg")):
             with pytest.raises(RuntimeError, match="Failed to create PR"):
-                judge.create_pr("caylent-solutions/git-repo", "branch", "title", "body", repo_path=tmp_path)
+                judge.create_pr(repo_config, "branch", "title", "body")
 
     def test_gh_called_with_repo_flag(self, tmp_path: Path) -> None:
+        """AC-6: create_pr uses repo_config.local_path as cwd and repo_config.name as repo."""
         judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path)
         with patch.object(judge, "_gh", return_value=(0, "https://github.com/org/repo/pull/1\n", "")) as mock_gh:
-            judge.create_pr("caylent-solutions/git-repo", "branch", "title", "body", repo_path=tmp_path)
+            judge.create_pr(repo_config, "branch", "title", "body")
 
         _, kwargs = mock_gh.call_args
         assert kwargs.get("cwd") == tmp_path
         assert kwargs.get("repo") == "caylent-solutions/git-repo"
 
-    def test_uses_base_branch_from_yaml_config(self, tmp_path: Path) -> None:
-        """create_pr passes --base <branch> when YAML config has a default_branch."""
+    def test_uses_base_branch_from_repo_config(self, tmp_path: Path) -> None:
+        """create_pr passes --base <branch> when repo_config has a default_branch."""
         judge = GitOpsJudge()
-        runtime_config = RuntimeConfig(
-            repos={"caylent-solutions/git-repo": RepoConfig(default_branch="main2")}
-        )
-        with (
-            patch("devbench.github.git_ops.RUNTIME_CONFIG", runtime_config),
-            patch.object(judge, "_gh", return_value=(0, "https://github.com/org/repo/pull/1\n", "")) as mock_gh,
-        ):
-            judge.create_pr("caylent-solutions/git-repo", "feature-branch", "title", "body", repo_path=tmp_path)
+        repo_config = _make_repo_config(local_path=tmp_path, default_branch="main2")
+        with patch.object(judge, "_gh", return_value=(0, "https://github.com/org/repo/pull/1\n", "")) as mock_gh:
+            judge.create_pr(repo_config, "feature-branch", "title", "body")
 
         cmd_args, _ = mock_gh.call_args
         cmd = cmd_args[0]
@@ -498,16 +519,11 @@ class TestCreatePr:
         assert cmd[base_idx + 1] == "main2"
 
     def test_omits_base_branch_when_not_configured(self, tmp_path: Path) -> None:
-        """create_pr omits --base when repo has no default_branch in YAML config."""
+        """create_pr omits --base when repo_config has no default_branch."""
         judge = GitOpsJudge()
-        runtime_config = RuntimeConfig(
-            repos={"caylent-solutions/git-repo": RepoConfig(default_branch=None)}
-        )
-        with (
-            patch("devbench.github.git_ops.RUNTIME_CONFIG", runtime_config),
-            patch.object(judge, "_gh", return_value=(0, "https://github.com/org/repo/pull/1\n", "")) as mock_gh,
-        ):
-            judge.create_pr("caylent-solutions/git-repo", "feature-branch", "title", "body", repo_path=tmp_path)
+        repo_config = _make_repo_config(local_path=tmp_path, default_branch=None)
+        with patch.object(judge, "_gh", return_value=(0, "https://github.com/org/repo/pull/1\n", "")) as mock_gh:
+            judge.create_pr(repo_config, "feature-branch", "title", "body")
 
         cmd_args, _ = mock_gh.call_args
         cmd = cmd_args[0]
@@ -515,28 +531,30 @@ class TestCreatePr:
 
 
 class TestMergePr:
-    """Test merge_pr method."""
+    """Test merge_pr method.
 
-    def test_validates_repo(self) -> None:
-        judge = GitOpsJudge()
-        with pytest.raises(ValueError, match="not allowed"):
-            judge.merge_pr("caylent-solutions/nonexistent-test-repo", 42)
+    AC-6: git_ops public methods accept a RepoConfig and no longer call validate_repo internally.
+    """
 
     def test_merges_successfully(self, tmp_path: Path) -> None:
         judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path)
         with patch.object(judge, "_gh", return_value=(0, "", "")):
-            judge.merge_pr("caylent-solutions/git-repo", 42, repo_path=tmp_path)
+            judge.merge_pr(repo_config, 42)
 
     def test_raises_on_failure(self, tmp_path: Path) -> None:
         judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path)
         with patch.object(judge, "_gh", return_value=(1, "", "merge failed")):
             with pytest.raises(RuntimeError, match="Failed to merge PR"):
-                judge.merge_pr("caylent-solutions/git-repo", 42, repo_path=tmp_path)
+                judge.merge_pr(repo_config, 42)
 
     def test_gh_called_with_repo_flag(self, tmp_path: Path) -> None:
+        """AC-6: merge_pr uses repo_config.local_path as cwd and repo_config.name as repo."""
         judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path)
         with patch.object(judge, "_gh", return_value=(0, "", "")) as mock_gh:
-            judge.merge_pr("caylent-solutions/git-repo", 42, repo_path=tmp_path)
+            judge.merge_pr(repo_config, 42)
 
         _, kwargs = mock_gh.call_args
         assert kwargs.get("cwd") == tmp_path
@@ -553,11 +571,12 @@ class TestMergePr:
         from devbench.config import MergeStrategy
 
         judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path)
         with (
             patch("devbench.github.git_ops.get_repo_merge_strategy", return_value="rebase"),
             patch.object(judge, "_gh", return_value=(0, "", "")) as mock_gh,
         ):
-            judge.merge_pr("caylent-solutions/git-repo", 42, repo_path=tmp_path)
+            judge.merge_pr(repo_config, 42)
 
         cmd_args, _ = mock_gh.call_args
         cmd = cmd_args[0]
@@ -567,17 +586,16 @@ class TestMergePr:
 
 
 class TestCreateTag:
-    """Test create_tag method."""
+    """Test create_tag method.
 
-    def test_validates_repo(self, tmp_path: Path) -> None:
-        judge = GitOpsJudge()
-        with pytest.raises(ValueError, match="not allowed"):
-            judge.create_tag("caylent-solutions/nonexistent-test-repo", tmp_path, "v1.0", "Release")
+    AC-6: git_ops public methods accept a RepoConfig and no longer call validate_repo internally.
+    """
 
     def test_creates_and_pushes_tag(self, tmp_path: Path) -> None:
         judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path)
         with patch.object(judge, "_git") as mock_git:
-            judge.create_tag("caylent-solutions/git-repo", tmp_path, "v1.0.0", "Release 1.0")
+            judge.create_tag(repo_config, "v1.0.0", "Release 1.0")
 
         assert mock_git.call_count == 2
         calls = [c.args[0] for c in mock_git.call_args_list]
@@ -586,62 +604,66 @@ class TestCreateTag:
 
 
 class TestWaitForChecks:
-    """Test wait_for_checks method."""
+    """Test wait_for_checks method.
 
-    def test_validates_repo(self) -> None:
-        judge = GitOpsJudge()
-        with pytest.raises(ValueError, match="not allowed"):
-            judge.wait_for_checks("caylent-solutions/nonexistent-test-repo", 1)
+    AC-6: git_ops public methods accept a RepoConfig and no longer call validate_repo internally.
+    """
 
     def test_returns_true_when_no_checks_reported(self, tmp_path: Path) -> None:
         """AC-1: rc != 0 but stderr contains 'no checks reported' → True (no CI configured)."""
         judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path)
         with patch.object(
             judge, "_gh", return_value=(1, "", "no checks reported on the 'main2' branch")
         ):
-            assert judge.wait_for_checks("caylent-solutions/git-repo", 42, repo_path=tmp_path) is True
+            assert judge.wait_for_checks(repo_config, 42) is True
 
     def test_returns_false_when_checks_failed(self, tmp_path: Path) -> None:
         """AC-2: rc != 0 and stderr does NOT contain 'no checks reported' → False (CI failed)."""
         judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path)
         with patch.object(judge, "_gh", return_value=(1, "", "checks failed")):
-            assert judge.wait_for_checks("caylent-solutions/git-repo", 42, repo_path=tmp_path) is False
+            assert judge.wait_for_checks(repo_config, 42) is False
 
     def test_returns_true_on_success(self, tmp_path: Path) -> None:
         """AC-3: rc == 0 → True (all checks passed)."""
         judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path)
         with patch.object(judge, "_gh", return_value=(0, "All checks passed", "")):
-            assert judge.wait_for_checks("caylent-solutions/git-repo", 42, repo_path=tmp_path) is True
+            assert judge.wait_for_checks(repo_config, 42) is True
 
     def test_uses_custom_timeout(self, tmp_path: Path) -> None:
         judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path)
         with patch.object(judge, "_gh", return_value=(0, "", "")) as mock_gh:
-            judge.wait_for_checks("caylent-solutions/git-repo", 42, timeout=999, repo_path=tmp_path)
+            judge.wait_for_checks(repo_config, 42, timeout=999)
 
         _, kwargs = mock_gh.call_args
         assert kwargs.get("timeout") == 999
 
     def test_gh_called_with_repo_flag(self, tmp_path: Path) -> None:
+        """AC-6: wait_for_checks uses repo_config.name as repo."""
         judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path)
         with patch.object(judge, "_gh", return_value=(0, "", "")) as mock_gh:
-            judge.wait_for_checks("caylent-solutions/git-repo", 42, repo_path=tmp_path)
+            judge.wait_for_checks(repo_config, 42)
 
         _, kwargs = mock_gh.call_args
         assert kwargs.get("repo") == "caylent-solutions/git-repo"
 
 
 class TestUpdateParentSubmoduleRef:
-    """Test update_parent_submodule_ref method."""
+    """Test update_parent_submodule_ref method.
 
-    def test_validates_repo(self, tmp_path: Path) -> None:
-        judge = GitOpsJudge()
-        with pytest.raises(ValueError, match="not allowed"):
-            judge.update_parent_submodule_ref("caylent-solutions/nonexistent-test-repo", tmp_path, "msg")
+    AC-6: git_ops public methods accept a RepoConfig and no longer call validate_repo internally.
+    """
 
     def test_calls_correct_git_commands(self, tmp_path: Path) -> None:
+        """AC-6: update_parent_submodule_ref uses repo_config.local_path."""
         judge = GitOpsJudge()
         repo_path = tmp_path / "git-repo"
         repo_path.mkdir()
+        repo_config = _make_repo_config(local_path=repo_path, default_branch="main")
 
         git_calls: list[tuple[list[str], Path]] = []
 
@@ -654,9 +676,7 @@ class TestUpdateParentSubmoduleRef:
             patch.object(judge, "_get_default_branch", return_value="main"),
             patch("devbench.github.git_ops.WORKSPACE_ROOT", tmp_path),
         ):
-            judge.update_parent_submodule_ref(
-                "caylent-solutions/git-repo", repo_path, "update submodule"
-            )
+            judge.update_parent_submodule_ref(repo_config, "update submodule")
 
         assert len(git_calls) == 4
         assert git_calls[0] == (["checkout", "main"], repo_path)
@@ -668,6 +688,7 @@ class TestUpdateParentSubmoduleRef:
         judge = GitOpsJudge()
         repo_path = tmp_path / "git-repo"
         repo_path.mkdir()
+        repo_config = _make_repo_config(local_path=repo_path, default_branch="main")
 
         with (
             patch.object(judge, "_get_default_branch", return_value="main"),
@@ -675,13 +696,14 @@ class TestUpdateParentSubmoduleRef:
             patch("devbench.github.git_ops.WORKSPACE_ROOT", tmp_path),
         ):
             with pytest.raises(RuntimeError, match="checkout failed"):
-                judge.update_parent_submodule_ref(
-                    "caylent-solutions/git-repo", repo_path, "msg"
-                )
+                judge.update_parent_submodule_ref(repo_config, "msg")
 
 
 class TestIsCommittedAndPushed:
-    """Tests for GitOpsJudge.is_committed_and_pushed."""
+    """Tests for GitOpsJudge.is_committed_and_pushed.
+
+    AC-6: git_ops public methods accept a RepoConfig and no longer call validate_repo internally.
+    """
 
     def test_is_committed_and_pushed_false_when_dirty(self, tmp_path: Path) -> None:
         """AC-1: Returns False when working tree has staged changes.
@@ -691,6 +713,7 @@ class TestIsCommittedAndPushed:
         Then: Returns False
         """
         judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path)
 
         def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
             if args == ["status", "--porcelain"]:
@@ -698,11 +721,7 @@ class TestIsCommittedAndPushed:
             return (0, "", "")
 
         with patch.object(judge, "_git", side_effect=stub):
-            result = judge.is_committed_and_pushed(
-                repo="caylent-solutions/git-repo",
-                repo_path=tmp_path,
-                branch="feature/x",
-            )
+            result = judge.is_committed_and_pushed(repo_config=repo_config, branch="feature/x")
 
         assert result is False
 
@@ -714,6 +733,7 @@ class TestIsCommittedAndPushed:
         Then: Returns False
         """
         judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path)
 
         def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
             if args == ["status", "--porcelain"]:
@@ -725,11 +745,7 @@ class TestIsCommittedAndPushed:
             patch.object(judge, "_git", side_effect=stub),
             patch.object(judge, "_run_command", return_value=(1, "", "fatal: ambiguous argument")),
         ):
-            result = judge.is_committed_and_pushed(
-                repo="caylent-solutions/git-repo",
-                repo_path=tmp_path,
-                branch="feature/x",
-            )
+            result = judge.is_committed_and_pushed(repo_config=repo_config, branch="feature/x")
 
         assert result is False
 
@@ -741,6 +757,7 @@ class TestIsCommittedAndPushed:
         Then: Returns False
         """
         judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path)
 
         def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
             if args == ["status", "--porcelain"]:
@@ -756,11 +773,7 @@ class TestIsCommittedAndPushed:
             patch.object(judge, "_git", side_effect=stub),
             patch.object(judge, "_run_command", return_value=(0, "", "")),
         ):
-            result = judge.is_committed_and_pushed(
-                repo="caylent-solutions/git-repo",
-                repo_path=tmp_path,
-                branch="feature/x",
-            )
+            result = judge.is_committed_and_pushed(repo_config=repo_config, branch="feature/x")
 
         assert result is False
 
@@ -772,6 +785,7 @@ class TestIsCommittedAndPushed:
         Then: Returns True
         """
         judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path)
 
         def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
             if args == ["status", "--porcelain"]:
@@ -787,33 +801,16 @@ class TestIsCommittedAndPushed:
             patch.object(judge, "_git", side_effect=stub),
             patch.object(judge, "_run_command", return_value=(0, "", "")),
         ):
-            result = judge.is_committed_and_pushed(
-                repo="caylent-solutions/git-repo",
-                repo_path=tmp_path,
-                branch="feature/x",
-            )
+            result = judge.is_committed_and_pushed(repo_config=repo_config, branch="feature/x")
 
         assert result is True
 
-    def test_is_committed_and_pushed_validates_repo(self, tmp_path: Path) -> None:
-        """Raises ValueError when repo is not in the allow-list."""
-        judge = GitOpsJudge()
-        with pytest.raises(ValueError, match="not allowed"):
-            judge.is_committed_and_pushed(
-                repo="caylent-solutions/nonexistent-test-repo",
-                repo_path=tmp_path,
-                branch="feature/x",
-            )
-
 
 class TestRebaseOntoDefault:
-    """Test rebase_onto_default method."""
+    """Test rebase_onto_default method.
 
-    def test_validates_repo(self, tmp_path: Path) -> None:
-        """Raises ValueError when repo is not in the allow-list."""
-        judge = GitOpsJudge()
-        with pytest.raises(ValueError, match="not allowed"):
-            judge.rebase_onto_default("caylent-solutions/nonexistent-test-repo", tmp_path, "feature/x")
+    AC-6: git_ops public methods accept a RepoConfig and no longer call validate_repo internally.
+    """
 
     def test_rebase_onto_default_fetches_then_rebases_then_force_pushes(self, tmp_path: Path) -> None:
         """AC-4: rebase_onto_default fetches origin, rebases, then force-pushes with --force-with-lease.
@@ -823,21 +820,15 @@ class TestRebaseOntoDefault:
         Then: git fetch origin, git rebase origin/<default_branch>, git push --force-with-lease are called in order
         """
         judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path, default_branch="main2")
         git_calls: list[list[str]] = []
 
         def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
             git_calls.append(args)
             return (0, "", "")
 
-        from devbench.config_loader import RepoConfig, RuntimeConfig
-        runtime_config = RuntimeConfig(
-            repos={"caylent-solutions/git-repo": RepoConfig(default_branch="main2")}
-        )
-        with (
-            patch("devbench.github.git_ops.RUNTIME_CONFIG", runtime_config),
-            patch.object(judge, "_git", side_effect=stub),
-        ):
-            judge.rebase_onto_default("caylent-solutions/git-repo", tmp_path, "feature/x")
+        with patch.object(judge, "_git", side_effect=stub):
+            judge.rebase_onto_default(repo_config, "feature/x")
 
         assert ["fetch", "origin"] in git_calls
         assert ["rebase", "origin/main2"] in git_calls
@@ -856,22 +847,18 @@ class TestRebaseOntoDefault:
         Then: RuntimeError is raised with actionable message; no loop back to create_pr
         """
         judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path, default_branch="main2")
 
         def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
             if args[0] == "rebase":
                 raise RuntimeError("git rebase origin/main2 failed (exit 1): conflict in foo.py")
             return (0, "", "")
 
-        from devbench.config_loader import RepoConfig, RuntimeConfig
-        runtime_config = RuntimeConfig(
-            repos={"caylent-solutions/git-repo": RepoConfig(default_branch="main2")}
-        )
         with (
-            patch("devbench.github.git_ops.RUNTIME_CONFIG", runtime_config),
             patch.object(judge, "_git", side_effect=stub),
             pytest.raises(RuntimeError, match="rebase"),
         ):
-            judge.rebase_onto_default("caylent-solutions/git-repo", tmp_path, "feature/x")
+            judge.rebase_onto_default(repo_config, "feature/x")
 
     def test_rebase_onto_default_uses_force_with_lease_not_force(self, tmp_path: Path) -> None:
         """AC-4: --force-with-lease is used, not --force.
@@ -881,52 +868,39 @@ class TestRebaseOntoDefault:
         Then: the push command uses --force-with-lease, not --force
         """
         judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path, default_branch="main2")
         git_calls: list[list[str]] = []
 
         def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
             git_calls.append(args)
             return (0, "", "")
 
-        from devbench.config_loader import RepoConfig, RuntimeConfig
-        runtime_config = RuntimeConfig(
-            repos={"caylent-solutions/git-repo": RepoConfig(default_branch="main2")}
-        )
-        with (
-            patch("devbench.github.git_ops.RUNTIME_CONFIG", runtime_config),
-            patch.object(judge, "_git", side_effect=stub),
-        ):
-            judge.rebase_onto_default("caylent-solutions/git-repo", tmp_path, "feature/x")
+        with patch.object(judge, "_git", side_effect=stub):
+            judge.rebase_onto_default(repo_config, "feature/x")
 
         push_calls = [c for c in git_calls if c[0] == "push"]
         assert len(push_calls) == 1
         assert "--force-with-lease" in push_calls[0]
-        assert "--force" not in push_calls[0] or "--force-with-lease" in push_calls[0]
         # More specifically: --force alone must NOT appear
         assert push_calls[0] != ["push", "--force", "origin", "feature/x"]
 
     def test_rebase_onto_default_uses_configured_default_branch(self, tmp_path: Path) -> None:
-        """rebase_onto_default uses get_configured_default_branch to determine the rebase target.
+        """rebase_onto_default uses repo_config.default_branch to determine the rebase target.
 
-        Given: RUNTIME_CONFIG has default_branch='develop' for the repo
+        Given: repo_config.default_branch is 'develop'
         When: rebase_onto_default is called
         Then: git rebase origin/develop is executed
         """
         judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path, default_branch="develop")
         git_calls: list[list[str]] = []
 
         def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
             git_calls.append(args)
             return (0, "", "")
 
-        from devbench.config_loader import RepoConfig, RuntimeConfig
-        runtime_config = RuntimeConfig(
-            repos={"caylent-solutions/git-repo": RepoConfig(default_branch="develop")}
-        )
-        with (
-            patch("devbench.github.git_ops.RUNTIME_CONFIG", runtime_config),
-            patch.object(judge, "_git", side_effect=stub),
-        ):
-            judge.rebase_onto_default("caylent-solutions/git-repo", tmp_path, "feature/x")
+        with patch.object(judge, "_git", side_effect=stub):
+            judge.rebase_onto_default(repo_config, "feature/x")
 
         assert ["rebase", "origin/develop"] in git_calls
 
@@ -998,30 +972,28 @@ class TestGhHelper:
 
 
 class TestCheckoutDefaultBranch:
-    """Tests for checkout_default_branch method (AC-1, AC-2, AC-3)."""
+    """Tests for checkout_default_branch method (AC-1, AC-2, AC-3).
+
+    AC-6: git_ops public methods accept a RepoConfig and no longer call validate_repo internally.
+    """
 
     def test_checkout_default_branch_calls_git_checkout_and_pull(self, tmp_path: Path) -> None:
         """AC-1, AC-2: checkout_default_branch checks out the configured default branch and pulls.
 
-        Given: RUNTIME_CONFIG has default_branch='main2' for the repo
+        Given: repo_config has default_branch='main2'
         When: checkout_default_branch is called
         Then: git checkout main2 is called, then git pull origin main2
         """
         judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path, default_branch="main2")
         git_calls: list[list[str]] = []
 
         def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
             git_calls.append(args)
             return (0, "", "")
 
-        runtime_config = RuntimeConfig(
-            repos={"caylent-solutions/git-repo": RepoConfig(default_branch="main2")}
-        )
-        with (
-            patch("devbench.github.git_ops.RUNTIME_CONFIG", runtime_config),
-            patch.object(judge, "_git", side_effect=stub),
-        ):
-            judge.checkout_default_branch("caylent-solutions/git-repo", tmp_path)
+        with patch.object(judge, "_git", side_effect=stub):
+            judge.checkout_default_branch(repo_config)
 
         assert ["checkout", "main2"] in git_calls
         assert ["pull", "origin", "main2"] in git_calls
@@ -1037,12 +1009,9 @@ class TestCheckoutDefaultBranch:
         Then: RuntimeError is raised — no silent fallback
         """
         judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path, default_branch="main2")
 
-        runtime_config = RuntimeConfig(
-            repos={"caylent-solutions/git-repo": RepoConfig(default_branch="main2")}
-        )
         with (
-            patch("devbench.github.git_ops.RUNTIME_CONFIG", runtime_config),
             patch.object(
                 judge,
                 "_git",
@@ -1050,7 +1019,7 @@ class TestCheckoutDefaultBranch:
             ),
             pytest.raises(RuntimeError, match="git checkout main2 failed"),
         ):
-            judge.checkout_default_branch("caylent-solutions/git-repo", tmp_path)
+            judge.checkout_default_branch(repo_config)
 
     def test_checkout_default_branch_raises_on_pull_failure(self, tmp_path: Path) -> None:
         """AC-3: RuntimeError is raised when git pull fails (fail-fast).
@@ -1060,6 +1029,7 @@ class TestCheckoutDefaultBranch:
         Then: RuntimeError is raised — no silent fallback
         """
         judge = GitOpsJudge()
+        repo_config = _make_repo_config(local_path=tmp_path, default_branch="main2")
         call_count = [0]
 
         def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
@@ -1068,12 +1038,8 @@ class TestCheckoutDefaultBranch:
                 return (0, "", "")  # checkout succeeds
             raise RuntimeError("git pull origin main2 failed (exit 1): network error")
 
-        runtime_config = RuntimeConfig(
-            repos={"caylent-solutions/git-repo": RepoConfig(default_branch="main2")}
-        )
         with (
-            patch("devbench.github.git_ops.RUNTIME_CONFIG", runtime_config),
             patch.object(judge, "_git", side_effect=stub),
             pytest.raises(RuntimeError, match="git pull origin main2 failed"),
         ):
-            judge.checkout_default_branch("caylent-solutions/git-repo", tmp_path)
+            judge.checkout_default_branch(repo_config)

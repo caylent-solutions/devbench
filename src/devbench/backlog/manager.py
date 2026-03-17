@@ -425,10 +425,11 @@ class BacklogManager:
             for j, cell in enumerate(cells):
                 if cell.strip().lower() in recognized:
                     cells[j] = f" {new_status} "
+                    lines[i] = "|".join(cells)
                     updated = True
                     break
-            lines[i] = "|".join(cells)
-            break
+            if updated:
+                break
 
         if not updated:
             raise ValueError(f"Could not find unit '{unit_id}' with a recognized status in {backlog_index}")

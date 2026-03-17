@@ -12,7 +12,7 @@ Public API
                                 judges passed before writing ``done``.
 ``mark_blocked``              — writes ``blocked`` and appends a reason comment.
 ``validate``                  — returns integrity errors (missing files, status
-                                drift, orphans, broken deps).
+                                drift, orphans, broken deps, summary mismatch).
 ``log_to_traceability_matrix``— appends a spec/test mapping entry to the
                                 traceability matrix file.
 
@@ -23,10 +23,13 @@ Constructor
     ``logging.getLogger("devbench.backlog_manager")`` when omitted.
 
 All writes go through the private ``_set_status`` workhorse which updates
-both the work-unit file and BACKLOG.md atomically.
+both the work-unit file and BACKLOG.md atomically.  After each write,
+``_set_status`` calls the private ``_update_status_summary`` helper to keep
+the ``## Status Summary`` table in sync.
 """
 
 import logging
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -36,10 +39,16 @@ from devbench.constants import (
     COMMENT_ENTRY_TEMPLATE,
     COMMENTS_SECTION_HEADER,
     DEPENDENCY_NONE_VALUES,
+    EPIC_ID_RE,
     REVIEW_JUDGE_NAMES,
     STATUS_BLOCKED,
     STATUS_DONE,
+    STATUS_IN_PROGRESS,
+    STATUS_IN_QUEUE,
     STATUS_LINE_RE,
+    STATUS_SUMMARY_SECTION_HEADER,
+    STATUS_SUMMARY_TABLE_HEADER,
+    STRIP_SUMMARY_RE,
     TABLE_STATUS_VALUES,
     TRACEABILITY_MATRIX_HEADER,
     VALID_STATUSES,
@@ -132,6 +141,7 @@ class BacklogManager:
         2. Every work unit file's status matches the index.
         3. No orphaned work unit files (in workspace_root/backlog/ but not in index).
         4. All dependency IDs reference real work unit IDs in the index.
+        5. Status Summary table exists and counts match the Full Work Unit Index.
 
         Args:
             backlog_index: Path to the ``BACKLOG.md`` index file.
@@ -147,6 +157,7 @@ class BacklogManager:
         indexed_files = self._check_files_and_statuses(rows, workspace_root, errors)
         self._check_orphans(workspace_root, indexed_files, errors)
         self._check_dependencies(backlog_index, known_ids, errors)
+        self._check_status_summary(backlog_index, rows, errors)
         return errors
 
     def _check_files_and_statuses(
@@ -263,6 +274,7 @@ class BacklogManager:
 
         self._update_status(work_unit_path, canonical)
         self._update_backlog_index(backlog_index, unit_id, canonical)
+        self._update_status_summary(backlog_index)
         self.logger.info(
             "Set %s to '%s' in both work-unit file and BACKLOG.md",
             unit_id,
@@ -440,3 +452,186 @@ class BacklogManager:
             content = content.rstrip("\n") + "\n\n" + comments_header + "\n\n" + entry
 
         work_unit_path.write_text(content, encoding="utf-8")
+
+    def _update_status_summary(self, backlog_index: Path) -> None:
+        """Rewrite the Status Summary table section in BACKLOG.md.
+
+        Reads all rows from the Full Work Unit Index, groups descendants by epic,
+        counts statuses, and either inserts or replaces the ``## Status Summary``
+        section immediately before ``## Full Work Unit Index``.
+
+        An epic row is identified as any row whose ID matches the pattern
+        ``E<digits>`` (no hyphen suffix). Counts are computed over all descendant
+        rows — rows whose ID starts with ``<epic-id>-``.
+        """
+        rows = self._parse_backlog_rows(backlog_index)
+        epic_titles = self._parse_epic_titles(backlog_index)
+        epic_counts = self._compute_epic_counts(rows)
+        summary_block = self._build_summary_block(epic_counts, epic_titles)
+
+        content = backlog_index.read_text(encoding="utf-8")
+
+        # Remove any existing Status Summary section
+        if STATUS_SUMMARY_SECTION_HEADER in content:
+            content = self._strip_summary_section(content)
+
+        # Insert before the Full Work Unit Index heading
+        full_index_marker = "## Full Work Unit Index"
+        if full_index_marker in content:
+            content = content.replace(
+                full_index_marker,
+                summary_block + full_index_marker,
+                1,
+            )
+        else:
+            content = content.rstrip("\n") + "\n\n" + summary_block
+
+        backlog_index.write_text(content, encoding="utf-8")
+
+    def _parse_epic_titles(self, backlog_index: Path) -> dict[str, str]:
+        """Parse epic IDs to their titles from BACKLOG.md table rows.
+
+        Returns a dict mapping epic_id -> title string.
+        """
+        titles: dict[str, str] = {}
+        content = backlog_index.read_text(encoding="utf-8")
+
+        for line in content.splitlines():
+            if not line.strip().startswith("|"):
+                continue
+            cells = [c.strip() for c in line.split("|")]
+            if len(cells) < 4:
+                continue
+            row_id = cells[1]
+            if EPIC_ID_RE.match(row_id):
+                titles[row_id] = cells[2]
+
+        return titles
+
+    def _compute_epic_counts(
+        self, rows: list[tuple[str, str, str]]
+    ) -> dict[str, dict[str, int]]:
+        """Compute per-epic status counts from backlog rows.
+
+        Returns a dict mapping epic_id -> {status: count} where status is one of
+        the canonical status strings (``done``, ``in-progress``, ``in-queue``,
+        ``blocked``).  Only descendant rows (those starting with
+        ``<epic-id>-``) are counted; the epic row itself is excluded.
+        """
+        epic_order: list[str] = []
+        for row_id, _, _ in rows:
+            if row_id and EPIC_ID_RE.match(row_id):
+                epic_order.append(row_id)
+
+        counts: dict[str, dict[str, int]] = {
+            epic_id: {STATUS_DONE: 0, STATUS_IN_PROGRESS: 0, STATUS_IN_QUEUE: 0, STATUS_BLOCKED: 0}
+            for epic_id in epic_order
+        }
+
+        for row_id, status, _ in rows:
+            if not row_id or not status:
+                continue
+            for epic_id in epic_order:
+                if row_id.startswith(epic_id + "-"):
+                    canonical_status = status.lower()
+                    if canonical_status in counts[epic_id]:
+                        counts[epic_id][canonical_status] += 1
+                    break
+
+        return counts
+
+    def _build_summary_block(
+        self,
+        epic_counts: dict[str, dict[str, int]],
+        epic_titles: dict[str, str],
+    ) -> str:
+        """Build the full Status Summary section as a markdown string."""
+        table_rows = ""
+        for epic_id, c in epic_counts.items():
+            title = epic_titles.get(epic_id, "")
+            table_rows += (
+                f"| {epic_id} | {title} | {c[STATUS_DONE]} | "
+                f"{c[STATUS_IN_PROGRESS]} | {c[STATUS_IN_QUEUE]} | {c[STATUS_BLOCKED]} |\n"
+            )
+
+        return (
+            STATUS_SUMMARY_SECTION_HEADER + "\n\n"
+            + STATUS_SUMMARY_TABLE_HEADER
+            + table_rows
+            + "\n"
+        )
+
+    def _strip_summary_section(self, content: str) -> str:
+        """Remove the existing Status Summary section from BACKLOG.md content."""
+        without_summary = STRIP_SUMMARY_RE.sub("", content)
+        # Collapse any resulting triple+ blank lines to double blank lines
+        return re.sub(r"\n{3,}", "\n\n", without_summary)
+
+    def _check_status_summary(
+        self,
+        backlog_index: Path,
+        rows: list[tuple[str, str, str]],
+        errors: list[str],
+    ) -> None:
+        """Check 5: Status Summary table exists and counts match the index."""
+        content = backlog_index.read_text(encoding="utf-8")
+
+        if STATUS_SUMMARY_SECTION_HEADER not in content:
+            errors.append(
+                "Status Summary section missing from BACKLOG.md — "
+                "run '_update_status_summary' to generate it"
+            )
+            return
+
+        # Compute expected counts and parse the actual table
+        epic_counts = self._compute_epic_counts(rows)
+        actual_counts = self._parse_summary_table(content)
+
+        for epic_id, expected in epic_counts.items():
+            if epic_id not in actual_counts:
+                errors.append(
+                    f"Status Summary missing epic row '{epic_id}'"
+                )
+                continue
+            actual = actual_counts[epic_id]
+            for status_key in (STATUS_DONE, STATUS_IN_PROGRESS, STATUS_IN_QUEUE, STATUS_BLOCKED):
+                if expected[status_key] != actual.get(status_key, -1):
+                    errors.append(
+                        f"Status Summary mismatch for {epic_id}: "
+                        f"expected {status_key}={expected[status_key]}, "
+                        f"got {actual.get(status_key, 'missing')}"
+                    )
+
+    def _parse_summary_table(self, content: str) -> dict[str, dict[str, int]]:
+        """Parse the Status Summary table from BACKLOG.md content.
+
+        Returns a dict mapping epic_id -> {status: count}.
+        """
+        result: dict[str, dict[str, int]] = {}
+
+        in_summary = False
+        for line in content.splitlines():
+            if line.strip() == STATUS_SUMMARY_SECTION_HEADER:
+                in_summary = True
+                continue
+            if in_summary and line.startswith("##"):
+                break
+            if not in_summary or not line.strip().startswith("|"):
+                continue
+            cells = [c.strip() for c in line.split("|")]
+            if len(cells) < 7:
+                continue
+            row_id = cells[1]
+            if not EPIC_ID_RE.match(row_id):
+                continue
+            try:
+                result[row_id] = {
+                    STATUS_DONE: int(cells[3]),
+                    STATUS_IN_PROGRESS: int(cells[4]),
+                    STATUS_IN_QUEUE: int(cells[5]),
+                    STATUS_BLOCKED: int(cells[6]),
+                }
+            except (ValueError, IndexError):
+                continue
+
+        return result

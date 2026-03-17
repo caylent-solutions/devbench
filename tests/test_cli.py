@@ -279,6 +279,11 @@ class TestCmdValidateBacklogPathResolution:
         idx = workspace / "BACKLOG.md"
         idx.write_text(
             "# Backlog\n\n"
+            "## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
+            "|------|-------|------|-------------|----------|---------|\n"
+            "\n"
+            "## Full Work Unit Index\n\n"
             "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
             "|-----|-------|------|--------|-------------|------|-----------|\n"
             "| E0-F1-S1-T1 | Task 1 | Task | in-queue | none | repo | `backlog/E0-F1-S1-T1.md` |\n",

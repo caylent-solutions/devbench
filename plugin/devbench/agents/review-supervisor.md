@@ -52,9 +52,17 @@ Then return a consolidated failure summary to the caller indicating which review
 
 **If all reviewers passed:**
 
-Log the overall pass:
+Log each individual reviewer's PASS verdict (the done-gate requires all four names in `REVIEW_JUDGE_NAMES` to have REVIEW_PASS entries):
 
 ```bash
+# For each reviewer that passed, log its individual PASS verdict
+# (done-gate requires all four names in REVIEW_JUDGE_NAMES to have REVIEW_PASS)
+uv run devbench log-verdict code_review $ARGUMENTS REVIEW_PASS "code-reviewer passed"
+uv run devbench log-verdict test_review $ARGUMENTS REVIEW_PASS "test-reviewer passed"
+uv run devbench log-verdict doc_review $ARGUMENTS REVIEW_PASS "doc-reviewer passed"
+uv run devbench log-verdict changes_manifest $ARGUMENTS REVIEW_PASS "changes-manifest passed"
+
+# Log the supervisor-level PASS
 uv run devbench log-verdict review-supervisor $ARGUMENTS REVIEW_PASS "All review_team members passed"
 ```
 

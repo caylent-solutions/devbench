@@ -437,13 +437,38 @@ class TestMarkDoneGate:
         assert "## Status: done" in wu.read_text(encoding="utf-8")
 
 
+def _extract_summary_lines(content: str) -> list[str]:
+    """Extract table data lines from the Status Summary section only."""
+    in_summary = False
+    lines = []
+    for line in content.splitlines():
+        if line.strip() == "## Status Summary":
+            in_summary = True
+            continue
+        if in_summary and line.startswith("##"):
+            break
+        if in_summary and line.strip().startswith("|"):
+            cells = [c.strip() for c in line.split("|")]
+            # Skip the header row (contains 'Epic' as first cell) and separator
+            if len(cells) > 1 and cells[1] not in ("Epic", "------", "---"):
+                lines.append(line)
+    return lines
+
+
 class TestValidate:
     """Tests for BacklogManager.validate() backlog integrity checks."""
 
     def _make_index(self, tmp_path: Path, rows: str) -> Path:
         idx = tmp_path / "BACKLOG.md"
+        # Include a valid Status Summary section to pass AC-4 check.
+        # Use a known epic prefix pattern that won't clash with test data.
         idx.write_text(
             "# Backlog\n\n"
+            "## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
+            "|------|-------|------|-------------|----------|---------|\n"
+            "\n"
+            "## Full Work Unit Index\n\n"
             "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
             "|-----|-------|------|--------|-------------|------|-----------|\n"
             + rows,
@@ -626,4 +651,251 @@ class TestBacklogManagerRename:
         """BacklogManager must not expose evaluate() — judge interface removed."""
         assert not hasattr(BacklogManager, "evaluate"), (
             "BacklogManager must not have evaluate(); judge interface was intentionally removed"
+        )
+
+
+# ---------------------------------------------------------------------------
+# E226-F1-S1-T1: Status Summary table and _update_status_summary
+# ---------------------------------------------------------------------------
+
+_BACKLOG_WITH_SUMMARY_TEMPLATE = """\
+# Backlog
+
+## Status Summary
+
+| Epic | Title | Done | In Progress | In Queue | Blocked |
+|------|-------|------|-------------|----------|---------|
+{summary_rows}
+## Full Work Unit Index
+
+| ID | Title | Type | Status | Dependencies | Repo | File Path |
+|----|-------|------|--------|--------------|------|-----------|
+{index_rows}
+"""
+
+_BACKLOG_WITHOUT_SUMMARY = """\
+# Backlog
+
+## Full Work Unit Index
+
+| ID | Title | Type | Status | Dependencies | Repo | File Path |
+|----|-------|------|--------|--------------|------|-----------|
+| E0 | Tooling | Epic | in-queue | None | repo | `backlog/E0.md` |
+| E0-F1-S1-T1 | Task 1 | Task | done | None | repo | `backlog/E0-F1-S1-T1.md` |
+| E0-F1-S1-T2 | Task 2 | Task | in-queue | None | repo | `backlog/E0-F1-S1-T2.md` |
+"""
+
+
+def _make_backlog_with_epics(tmp_path: Path, backlog_dir: Path) -> tuple[Path, dict[str, Path]]:
+    """Create a BACKLOG.md with a known epic/task structure and corresponding WU files.
+
+    Returns (index_path, {unit_id: wu_file_path}).
+    """
+    content = (
+        "# Backlog\n\n"
+        "## Full Work Unit Index\n\n"
+        "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+        "|----|-------|------|--------|--------------|------|----------|\n"
+        "| E1 | Epic One | Epic | in-queue | None | repo | `backlog/E1.md` |\n"
+        "| E1-F1-S1-T1 | Task A | Task | done | None | repo | `backlog/E1-F1-S1-T1.md` |\n"
+        "| E1-F1-S1-T2 | Task B | Task | in-progress | None | repo | `backlog/E1-F1-S1-T2.md` |\n"
+        "| E1-F1-S1-T3 | Task C | Task | in-queue | None | repo | `backlog/E1-F1-S1-T3.md` |\n"
+        "| E2 | Epic Two | Epic | in-queue | None | repo | `backlog/E2.md` |\n"
+        "| E2-F1-S1-T1 | Task D | Task | blocked | None | repo | `backlog/E2-F1-S1-T1.md` |\n"
+    )
+    index_path = tmp_path / "BACKLOG.md"
+    index_path.write_text(content, encoding="utf-8")
+
+    files: dict[str, Path] = {}
+    units = [
+        ("E1", "in-queue"),
+        ("E1-F1-S1-T1", "done"),
+        ("E1-F1-S1-T2", "in-progress"),
+        ("E1-F1-S1-T3", "in-queue"),
+        ("E2", "in-queue"),
+        ("E2-F1-S1-T1", "blocked"),
+    ]
+    for uid, status in units:
+        wu = backlog_dir / f"{uid}.md"
+        wu.write_text(f"# {uid}\n\n## Status: {status}\n", encoding="utf-8")
+        files[uid] = wu
+
+    return index_path, files
+
+
+class TestUpdateStatusSummary:
+    """Tests for BacklogManager._update_status_summary() — AC-2."""
+
+    def test_method_exists(self) -> None:
+        """AC-2: _update_status_summary method must exist on BacklogManager."""
+        assert hasattr(BacklogManager, "_update_status_summary"), (
+            "BacklogManager must have _update_status_summary method"
+        )
+        assert callable(BacklogManager._update_status_summary)
+
+    def test_rewrites_summary_table_when_already_present(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """AC-2: _update_status_summary rewrites the Status Summary section in place."""
+        index_path, _ = _make_backlog_with_epics(tmp_path, backlog_dir)
+        mgr = BacklogManager()
+
+        # Inject a stale summary section
+        content = index_path.read_text(encoding="utf-8")
+        stale_summary = (
+            "## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
+            "|------|-------|------|-------------|----------|----------|\n"
+            "| E1 | OLD | 0 | 0 | 0 | 0 |\n\n"
+        )
+        index_path.write_text(stale_summary + content, encoding="utf-8")
+
+        mgr._update_status_summary(index_path)
+
+        result = index_path.read_text(encoding="utf-8")
+        # Summary section must be present
+        assert "## Status Summary" in result
+        # Extract only the summary section rows
+        summary_rows = _extract_summary_lines(result)
+        e1_lines = [l for l in summary_rows if "| E1 |" in l]
+        e2_lines = [l for l in summary_rows if "| E2 |" in l]
+        assert len(e1_lines) == 1, f"Expected exactly 1 E1 summary row, got: {e1_lines}"
+        assert len(e2_lines) == 1, f"Expected exactly 1 E2 summary row, got: {e2_lines}"
+        e1_line = e1_lines[0]
+        cells = [c.strip() for c in e1_line.split("|")]
+        # cells[0]='', cells[1]=epic, cells[2]=title
+        # cells[3]=done, cells[4]=in-prog, cells[5]=in-queue, cells[6]=blocked
+        assert cells[3] == "1", f"E1 done count wrong: {e1_line}"
+        assert cells[4] == "1", f"E1 in-progress count wrong: {e1_line}"
+        assert cells[5] == "1", f"E1 in-queue count wrong: {e1_line}"
+        assert cells[6] == "0", f"E1 blocked count wrong: {e1_line}"
+
+    def test_creates_summary_section_when_absent(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """AC-2: _update_status_summary inserts the Status Summary section when not present."""
+        index_path, _ = _make_backlog_with_epics(tmp_path, backlog_dir)
+        mgr = BacklogManager()
+
+        # No summary section in the index
+        assert "## Status Summary" not in index_path.read_text(encoding="utf-8")
+
+        mgr._update_status_summary(index_path)
+
+        result = index_path.read_text(encoding="utf-8")
+        assert "## Status Summary" in result
+        assert "| E1 |" in result
+        assert "| E2 |" in result
+
+    def test_counts_only_descendant_rows_not_epic_itself(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """AC-2: counts reflect descendant rows; the epic-level row itself is not double-counted."""
+        index_path, _ = _make_backlog_with_epics(tmp_path, backlog_dir)
+        mgr = BacklogManager()
+        mgr._update_status_summary(index_path)
+
+        result = index_path.read_text(encoding="utf-8")
+        summary_rows = _extract_summary_lines(result)
+        e2_lines = [l for l in summary_rows if "| E2 |" in l]
+        assert len(e2_lines) == 1, f"Expected exactly 1 E2 summary row, got: {e2_lines}"
+        e2_line = e2_lines[0]
+        cells = [c.strip() for c in e2_line.split("|")]
+        # E2 has only one descendant: E2-F1-S1-T1 with status blocked
+        assert cells[6] == "1", f"E2 blocked count wrong: {e2_line}"
+        # Done, in-progress, in-queue should be 0
+        assert cells[3] == "0", f"E2 done count should be 0: {e2_line}"
+
+
+class TestSetStatusCallsUpdateStatusSummary:
+    """Tests that _set_status calls _update_status_summary — AC-3."""
+
+    def test_set_status_updates_summary_table(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """AC-3: After force_status, the Status Summary table reflects the new status."""
+        index_path, files = _make_backlog_with_epics(tmp_path, backlog_dir)
+        mgr = BacklogManager()
+
+        # Prime the summary by calling it once
+        mgr._update_status_summary(index_path)
+
+        # Now change T3 from in-queue to done via force_status
+        mgr.force_status(files["E1-F1-S1-T3"], index_path, "E1-F1-S1-T3", "done")
+
+        result = index_path.read_text(encoding="utf-8")
+        summary_rows = _extract_summary_lines(result)
+        e1_lines = [l for l in summary_rows if "| E1 |" in l]
+        assert len(e1_lines) == 1, "Summary table must have exactly one E1 row"
+        e1_line = e1_lines[0]
+        cells = [c.strip() for c in e1_line.split("|")]
+        # E1 should now have 2 done (T1 + T3), 1 in-progress (T2), 0 in-queue, 0 blocked
+        assert cells[3] == "2", f"E1 done should be 2 after marking T3 done: {e1_line}"
+        assert cells[5] == "0", f"E1 in-queue should be 0 after marking T3 done: {e1_line}"
+
+
+class TestValidateBacklogSummary:
+    """Tests for validate-backlog Status Summary checks — AC-4."""
+
+    def _make_backlog_no_summary(self, tmp_path: Path, backlog_dir: Path) -> tuple[Path, dict[str, Path]]:
+        """Return an index without a Status Summary section."""
+        return _make_backlog_with_epics(tmp_path, backlog_dir)
+
+    def _make_backlog_with_correct_summary(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> tuple[Path, dict[str, Path]]:
+        """Return an index with a correct Status Summary section."""
+        index_path, files = _make_backlog_with_epics(tmp_path, backlog_dir)
+        mgr = BacklogManager()
+        mgr._update_status_summary(index_path)
+        return index_path, files
+
+    def _make_backlog_with_wrong_summary(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> tuple[Path, dict[str, Path]]:
+        """Return an index with a Status Summary section that has wrong counts."""
+        index_path, files = _make_backlog_with_epics(tmp_path, backlog_dir)
+        content = index_path.read_text(encoding="utf-8")
+        wrong_summary = (
+            "## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
+            "|------|-------|------|-------------|----------|----------|\n"
+            "| E1 | Epic One | 99 | 99 | 99 | 99 |\n"
+            "| E2 | Epic Two | 99 | 99 | 99 | 99 |\n\n"
+        )
+        index_path.write_text(wrong_summary + content, encoding="utf-8")
+        return index_path, files
+
+    def test_validate_fails_when_summary_table_missing(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """AC-4: validate reports an error when ## Status Summary section is absent."""
+        index_path, _ = self._make_backlog_no_summary(tmp_path, backlog_dir)
+        mgr = BacklogManager()
+        errors = mgr.validate(index_path, tmp_path)
+        assert any("status summary" in e.lower() for e in errors), (
+            f"Expected status summary error, got: {errors}"
+        )
+
+    def test_validate_fails_when_summary_counts_mismatch(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """AC-4: validate reports an error when summary counts don't match index."""
+        index_path, _ = self._make_backlog_with_wrong_summary(tmp_path, backlog_dir)
+        mgr = BacklogManager()
+        errors = mgr.validate(index_path, tmp_path)
+        assert any("status summary" in e.lower() or "mismatch" in e.lower() for e in errors), (
+            f"Expected status summary mismatch error, got: {errors}"
+        )
+
+    def test_validate_passes_when_summary_matches_index(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """AC-4: validate returns no summary errors when counts are correct."""
+        index_path, _ = self._make_backlog_with_correct_summary(tmp_path, backlog_dir)
+        mgr = BacklogManager()
+        errors = mgr.validate(index_path, tmp_path)
+        summary_errors = [e for e in errors if "status summary" in e.lower()]
+        assert not summary_errors, (
+            f"Unexpected status summary errors: {summary_errors}"
         )

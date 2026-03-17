@@ -15,6 +15,17 @@ import re
 # ---------------------------------------------------------------------------
 COMMENTS_SECTION_HEADER: str = "## Comments"
 STATUS_SECTION_PREFIX: str = "## Status:"
+STATUS_SUMMARY_SECTION_HEADER: str = "## Status Summary"
+STATUS_SUMMARY_TABLE_HEADER: str = (
+    "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
+    "|------|-------|------|-------------|----------|---------|\n"
+)
+# Pre-compiled pattern to strip the Status Summary section from BACKLOG.md content.
+# Matches from the header up to (but not including) the next ## heading or end of string.
+STRIP_SUMMARY_RE = re.compile(
+    r"## Status Summary\n.*?(?=\n## |\Z)",
+    re.DOTALL,
+)
 
 # ---------------------------------------------------------------------------
 # Work-unit markdown format patterns
@@ -155,3 +166,9 @@ REVIEW_JUDGE_NAMES: frozenset[str] = frozenset({
     "doc_review",
     "changes_manifest",
 })
+
+# ---------------------------------------------------------------------------
+# Epic ID regex — matches top-level epic IDs such as "E200", "E1", etc.
+# A row is an epic row when its ID is exactly E<digits> with no hyphen suffix.
+# ---------------------------------------------------------------------------
+EPIC_ID_RE = re.compile(r"^E\d+$")

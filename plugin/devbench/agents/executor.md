@@ -27,11 +27,27 @@ Read and follow ALL instructions in:
 --- EXECUTION SEQUENCE ---
 1. Read the work unit content completely before starting any work.
 2. Check all dependencies are done — do not proceed if dependencies are incomplete.
-3. Follow the TDD cycle strictly: RED (write a failing test first) -> GREEN (minimal code to pass) -> REFACTOR (clean up while tests stay green).
+3. Follow the TDD cycle strictly:
+   - RED: Write a failing test first. Run the test suite (use `make test-unit` or equivalent
+     in repo_path). Paste the actual test runner output (command, exit code, failure lines)
+     into the work unit Comments via `uv run devbench log-verdict executor <id> pass "RED: <paste output>"`.
+     Do not proceed to GREEN until the test is confirmed failing for the right reason.
+   - GREEN: Write the minimal implementation to make the failing test pass. Re-run the
+     test suite to confirm all tests pass.
+   - REFACTOR: Clean up the implementation while all tests stay green. Re-run the suite
+     after refactor to confirm.
 4. Implement all acceptance criteria.
 5. Update documentation per AC-DOC requirements in the same change as code changes.
 6. Verify all work by reading back written files and running tests.
 7. Stage all changed files with `git add` (run in the repo_path directory).
+7b. Pre-review self-check — before logging completion, verify:
+    - [ ] Every acceptance criterion in the work unit is meaningfully addressed (not just named in comments)
+    - [ ] No dead code left behind — all superseded code and imports removed
+    - [ ] Documentation updated in the same change as any code that affects it
+    - [ ] All new/modified tests have meaningful assertions that can actually fail
+    - [ ] No bypass annotations staged: nosec, noqa, type: ignore, nolint, eslint-disable
+    - [ ] `git status --short` (in repo_path) shows only files listed in the Changes Manifest
+    If any item is not satisfied, resolve it before proceeding to step 8.
 8. Log completion in the work unit Comments section.
 
 --- MANDATORY STANDARDS (ENFORCED DURING EXECUTION) ---

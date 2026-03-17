@@ -18,7 +18,7 @@ Commands::
     next                    Print the next actionable work unit ID and title
     set-status <id> <s>     Force any status (no gate — use for recovery/lifecycle transitions)
     mark-done <id>          Mark unit as Done (enforces done-gate: all judges must have passed)
-    validate-backlog        Check backlog integrity (file existence, status sync, orphans, deps)
+    validate-backlog        Check backlog integrity (file existence, status sync, orphans, deps, summary)
     ensure-branch <id>      Create or switch to work unit branch before executor runs
     git-ops <id>            Run full git operations sequence for a completed work unit
     report [since]          Print progress report with velocity stats
@@ -234,6 +234,7 @@ def cmd_validate_backlog() -> int:
     - Every work unit file's status matches the index.
     - No orphaned work unit files.
     - All dependency IDs reference real work unit IDs.
+    - Status Summary table exists and counts match the Full Work Unit Index.
 
     Exits 0 if the backlog is consistent; 1 with actionable error messages
     if any inconsistencies are found.

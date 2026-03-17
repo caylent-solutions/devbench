@@ -137,7 +137,7 @@ devbench <command> [args]
 | `mark-done` | `<unit-id>` | Mark unit as Done (enforces done-gate: all judges must have passed) |
 | `log-verdict` | `<judge> <unit-id> <pass\|fail> [msg]` | Record a judge verdict in the work unit Comments |
 | `set-status` | `<unit-id> <status>` | Force any status (no gate — use for recovery/lifecycle transitions) |
-| `validate-backlog` | — | Check backlog integrity (file existence, status sync, orphans, deps) |
+| `validate-backlog` | — | Check backlog integrity (file existence, status sync, orphans, deps, summary table) |
 | `read-unit` | `<unit-id>` | Print work unit spec as markdown (for agent context) |
 | `get-diff` | `<unit-id>` | Print git diff vs default branch (for review agents) |
 | `run-tests` | `<unit-id>` | Run test suite in the work unit's repo |
@@ -312,7 +312,7 @@ Restarting picks up where you left off — `done` units are skipped, and `in-pro
 ## Troubleshooting
 
 ### Backlog is out of sync with work unit files
-Run `devbench validate-backlog` to check for missing files, status mismatches, orphaned files, and invalid dependency references. Fix reported errors before running the orchestrator — it runs this check automatically at startup and aborts if any errors are found.
+Run `devbench validate-backlog` to check for missing files, status mismatches, orphaned files, invalid dependency references, and Status Summary table count mismatches. Fix reported errors before running the orchestrator — it runs this check automatically at startup and aborts if any errors are found.
 
 ### Judge keeps failing the same unit
 After `JUDGE_MAX_RETRIES` failures (default: 10), the unit is marked `blocked`. Check the Comments section of the work unit file for the feedback trail.

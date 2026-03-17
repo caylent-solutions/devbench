@@ -299,6 +299,8 @@ def process_work_unit(work_unit: WorkUnit) -> bool:
                 git_ops.merge_pr(repo=canonical_repo, pr_number=pr_number, repo_path=repo_path)
             work_unit.log_comment("judge/git_ops", "PR_MERGED", pr_url)
 
+            git_ops.checkout_default_branch(repo=canonical_repo, repo_path=repo_path)
+
             # Update parent repo's submodule reference — opt-in via git_ops.update_submodule
             if UPDATE_SUBMODULE:
                 git_ops.update_parent_submodule_ref(

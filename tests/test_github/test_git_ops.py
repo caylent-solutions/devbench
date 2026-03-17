@@ -995,3 +995,85 @@ class TestGhHelper:
 
         cmd = mock_run.call_args.args[0]
         assert "--repo" not in cmd
+
+
+class TestCheckoutDefaultBranch:
+    """Tests for checkout_default_branch method (AC-1, AC-2, AC-3)."""
+
+    def test_checkout_default_branch_calls_git_checkout_and_pull(self, tmp_path: Path) -> None:
+        """AC-1, AC-2: checkout_default_branch checks out the configured default branch and pulls.
+
+        Given: RUNTIME_CONFIG has default_branch='main2' for the repo
+        When: checkout_default_branch is called
+        Then: git checkout main2 is called, then git pull origin main2
+        """
+        judge = GitOpsJudge()
+        git_calls: list[list[str]] = []
+
+        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
+            git_calls.append(args)
+            return (0, "", "")
+
+        runtime_config = RuntimeConfig(
+            repos={"caylent-solutions/git-repo": RepoConfig(default_branch="main2")}
+        )
+        with (
+            patch("devbench.github.git_ops.RUNTIME_CONFIG", runtime_config),
+            patch.object(judge, "_git", side_effect=stub),
+        ):
+            judge.checkout_default_branch("caylent-solutions/git-repo", tmp_path)
+
+        assert ["checkout", "main2"] in git_calls
+        assert ["pull", "origin", "main2"] in git_calls
+        checkout_idx = git_calls.index(["checkout", "main2"])
+        pull_idx = git_calls.index(["pull", "origin", "main2"])
+        assert checkout_idx < pull_idx
+
+    def test_checkout_default_branch_raises_on_checkout_failure(self, tmp_path: Path) -> None:
+        """AC-3: RuntimeError is raised when git checkout fails (fail-fast).
+
+        Given: git checkout exits with non-zero code
+        When: checkout_default_branch is called
+        Then: RuntimeError is raised — no silent fallback
+        """
+        judge = GitOpsJudge()
+
+        runtime_config = RuntimeConfig(
+            repos={"caylent-solutions/git-repo": RepoConfig(default_branch="main2")}
+        )
+        with (
+            patch("devbench.github.git_ops.RUNTIME_CONFIG", runtime_config),
+            patch.object(
+                judge,
+                "_git",
+                side_effect=RuntimeError("git checkout main2 failed (exit 1): error"),
+            ),
+            pytest.raises(RuntimeError, match="git checkout main2 failed"),
+        ):
+            judge.checkout_default_branch("caylent-solutions/git-repo", tmp_path)
+
+    def test_checkout_default_branch_raises_on_pull_failure(self, tmp_path: Path) -> None:
+        """AC-3: RuntimeError is raised when git pull fails (fail-fast).
+
+        Given: git checkout succeeds but git pull fails
+        When: checkout_default_branch is called
+        Then: RuntimeError is raised — no silent fallback
+        """
+        judge = GitOpsJudge()
+        call_count = [0]
+
+        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return (0, "", "")  # checkout succeeds
+            raise RuntimeError("git pull origin main2 failed (exit 1): network error")
+
+        runtime_config = RuntimeConfig(
+            repos={"caylent-solutions/git-repo": RepoConfig(default_branch="main2")}
+        )
+        with (
+            patch("devbench.github.git_ops.RUNTIME_CONFIG", runtime_config),
+            patch.object(judge, "_git", side_effect=stub),
+            pytest.raises(RuntimeError, match="git pull origin main2 failed"),
+        ):
+            judge.checkout_default_branch("caylent-solutions/git-repo", tmp_path)

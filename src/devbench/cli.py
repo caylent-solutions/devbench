@@ -14,7 +14,10 @@ Options::
 
 Commands::
 
-    status                  Show backlog summary (counts by status)
+    status [--detail]       Show backlog summary (counts by status).
+                            With --detail: also lists all in-queue Tasks in
+                            priority order and all blocked Tasks with their
+                            unresolved dependency IDs.
     next                    Print the next actionable work unit ID and title
     execute <id>            Spawn a Claude Code agent to execute a work unit
     review <id>             Run all review judges on a work unit, print JSON results
@@ -56,7 +59,7 @@ _pre_parse_config(sys.argv)
 
 from devbench.backlog.manager import BacklogManager
 from devbench.backlog.parser import BacklogParser
-from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus
+from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
 from devbench.config import (
     BACKLOG_INDEX,
     BACKLOG_ROOT,
@@ -82,8 +85,19 @@ from devbench.log_setup import setup_logging
 logger = logging.getLogger("devbench.cli")
 
 
-def cmd_status() -> int:
-    """Print backlog summary grouped by status."""
+def cmd_status(detail: bool = False) -> int:
+    """Print backlog summary grouped by status.
+
+    When ``detail`` is ``True``, appends two extra sections after the summary:
+
+    - **In Queue (N):** all actionable Task-level work units in priority order
+      (in-progress first, then in-queue sorted by numeric ID), matching the
+      order returned by ``get_parallel_candidates``.
+    - **Blocked (N):** all blocked Task-level work units with the dependency
+      IDs they are waiting on.
+
+    Story, Feature, and Epic rollup rows are never shown in the detail sections.
+    """
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     units = parser.parse_index()
 
@@ -118,7 +132,40 @@ def cmd_status() -> int:
         blocked = parser.get_blocked_units(units)
         print(f"\nNo actionable units. {len(blocked)} blocked.")
 
+    if detail:
+        _print_status_detail(actionable, units)
+
     return 0
+
+
+def _print_status_detail(
+    in_queue_candidates: list[WorkUnit],
+    all_units: list[WorkUnit],
+) -> None:
+    """Print the --detail sections: in-queue Tasks and blocked Tasks.
+
+    ``in_queue_candidates`` is already sorted by priority (from
+    ``get_parallel_candidates``), so order is preserved as-is.
+
+    Only Task-level work units are shown; Story/Feature/Epic rollups are excluded.
+    """
+    # In-queue / in-progress actionable tasks (already priority-sorted)
+    task_candidates = [u for u in in_queue_candidates if u.unit_type is WorkUnitType.TASK]
+    print(f"\nIn Queue ({len(task_candidates)}):")
+    for i, unit in enumerate(task_candidates, start=1):
+        print(f"  {i}. {unit.id}  {unit.title}")
+
+    # Blocked tasks with their unresolved dep IDs
+    done_ids = frozenset(u.id for u in all_units if u.status is WorkUnitStatus.DONE)
+    blocked_tasks = [
+        u for u in all_units
+        if u.status is WorkUnitStatus.BLOCKED and u.unit_type is WorkUnitType.TASK
+    ]
+    print(f"\nBlocked ({len(blocked_tasks)}):")
+    for unit in blocked_tasks:
+        unmet = [dep for dep in unit.dependencies if dep not in done_ids]
+        waiting = ", ".join(unmet) if unmet else "(no blocking dep — re-check deps)"
+        print(f"  {unit.id}  waiting on: {waiting}")
 
 
 def cmd_next() -> int:
@@ -657,11 +704,16 @@ def main() -> int:
         return 1
 
     func, min_args, _ = _COMMANDS[command]
-    args = sys.argv[2:]
+    raw_args = sys.argv[2:]
+    detail = "--detail" in raw_args
+    args = [a for a in raw_args if a != "--detail"]
 
     if len(args) < min_args:
         print(f"Command '{command}' requires at least {min_args} argument(s)", file=sys.stderr)
         return 1
+
+    if command == "status" and detail:
+        return func(detail=True)
 
     return func(*args[: min_args + 1]) if len(args) > min_args else func(*args[:min_args])
 

@@ -116,6 +116,261 @@ class TestCmdStatus:
         assert "1 blocked" in capsys.readouterr().out
 
 
+@pytest.fixture
+def detail_units() -> list[WorkUnit]:
+    """Work units for --detail flag tests.
+
+    Contains:
+    - A done TASK (E1-F1-S1-T1)
+    - An in-queue TASK with satisfied deps (E1-F1-S1-T2, dep on T1 which is done)
+    - An in-queue TASK with unsatisfied deps / blocked (E2-F1-S1-T1, dep on E2 not done)
+    - A STORY rollup that should be excluded from --detail output (E1-F1-S1)
+    - A FEATURE rollup that should be excluded from --detail output (E1-F1)
+    - A blocked TASK with an unresolvable dep reference (E3-F1-S1-T1, dep on E99)
+    """
+    return [
+        WorkUnit(
+            id="E1-F1-S1-T1",
+            title="Done task",
+            status=WorkUnitStatus.DONE,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E1-F1-S1-T1.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        ),
+        WorkUnit(
+            id="E1-F1-S1-T2",
+            title="In-queue task with met dep",
+            status=WorkUnitStatus.IN_QUEUE,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E1-F1-S1-T2.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=["E1-F1-S1-T1"],
+        ),
+        WorkUnit(
+            id="E2-F1-S1-T1",
+            title="Blocked task with unmet dep",
+            status=WorkUnitStatus.BLOCKED,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E2-F1-S1-T1.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=["E2"],
+        ),
+        WorkUnit(
+            id="E1-F1-S1",
+            title="Story rollup",
+            status=WorkUnitStatus.IN_QUEUE,
+            unit_type=WorkUnitType.STORY,
+            file_path=Path("backlog/E1-F1-S1.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        ),
+        WorkUnit(
+            id="E1-F1",
+            title="Feature rollup",
+            status=WorkUnitStatus.IN_QUEUE,
+            unit_type=WorkUnitType.FEATURE,
+            file_path=Path("backlog/E1-F1.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        ),
+        WorkUnit(
+            id="E3-F1-S1-T1",
+            title="Blocked task unknown dep",
+            status=WorkUnitStatus.BLOCKED,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E3-F1-S1-T1.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=["E99"],
+        ),
+    ]
+
+
+class TestCmdStatusDetail:
+    """Test cmd_status --detail flag (AC-1 through AC-4)."""
+
+    def test_status_detail_shows_in_queue_tasks(
+        self, detail_units: list[WorkUnit], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: backlog with in-queue TASK units
+        When: cmd_status(detail=True) is called
+        Then: in-queue Tasks are listed under 'In Queue' section
+        Spec: AC-1
+        """
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = detail_units
+        # T2 is the only in-queue task with all deps met
+        mock_parser.get_parallel_candidates.return_value = [detail_units[1]]
+        mock_parser.all_done.return_value = False
+        mock_parser.get_blocked_units.return_value = [detail_units[2], detail_units[5]]
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_status(detail=True)
+
+        assert result == 0
+        out = capsys.readouterr().out
+        assert "In Queue" in out
+        assert "E1-F1-S1-T2" in out
+        assert "In-queue task with met dep" in out
+
+    def test_status_detail_in_queue_tasks_in_priority_order(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: multiple in-queue Tasks
+        When: cmd_status(detail=True) is called
+        Then: in-queue Tasks appear in priority order (in-progress first, then by numeric ID)
+        Spec: AC-1
+        """
+        units = [
+            WorkUnit(
+                id="E9-F1-S1-T1",
+                title="Numeric nine task",
+                status=WorkUnitStatus.IN_QUEUE,
+                unit_type=WorkUnitType.TASK,
+                file_path=Path("backlog/E9-F1-S1-T1.md"),
+                repo="caylent-solutions/devbench",
+                dependencies=[],
+            ),
+            WorkUnit(
+                id="E15-F1-S1-T1",
+                title="Numeric fifteen task",
+                status=WorkUnitStatus.IN_QUEUE,
+                unit_type=WorkUnitType.TASK,
+                file_path=Path("backlog/E15-F1-S1-T1.md"),
+                repo="caylent-solutions/devbench",
+                dependencies=[],
+            ),
+            WorkUnit(
+                id="E2-F1-S1-T1",
+                title="In-progress task",
+                status=WorkUnitStatus.IN_PROGRESS,
+                unit_type=WorkUnitType.TASK,
+                file_path=Path("backlog/E2-F1-S1-T1.md"),
+                repo="caylent-solutions/devbench",
+                dependencies=[],
+            ),
+        ]
+        # get_parallel_candidates returns in-progress first, then in-queue by numeric ID
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = units
+        mock_parser.get_parallel_candidates.return_value = [units[2], units[0], units[1]]
+        mock_parser.all_done.return_value = False
+        mock_parser.get_blocked_units.return_value = []
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_status(detail=True)
+
+        assert result == 0
+        out = capsys.readouterr().out
+        pos_in_progress = out.index("E2-F1-S1-T1")
+        pos_nine = out.index("E9-F1-S1-T1")
+        pos_fifteen = out.index("E15-F1-S1-T1")
+        assert pos_in_progress < pos_nine < pos_fifteen
+
+    def test_status_detail_shows_blocked_tasks_with_deps(
+        self, detail_units: list[WorkUnit], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: backlog with blocked TASK units that have unresolved deps
+        When: cmd_status(detail=True) is called
+        Then: blocked Tasks appear under 'Blocked' section with their unresolved dep IDs
+        Spec: AC-2
+        """
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = detail_units
+        mock_parser.get_parallel_candidates.return_value = [detail_units[1]]
+        mock_parser.all_done.return_value = False
+        mock_parser.get_blocked_units.return_value = [detail_units[2], detail_units[5]]
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_status(detail=True)
+
+        assert result == 0
+        out = capsys.readouterr().out
+        assert "Blocked" in out
+        assert "E2-F1-S1-T1" in out
+        # dep ID must appear next to the blocked unit
+        assert "E2" in out
+        assert "E3-F1-S1-T1" in out
+        assert "E99" in out
+
+    def test_status_detail_excludes_non_task_units(
+        self, detail_units: list[WorkUnit], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: backlog with Story and Feature rollup units alongside Tasks
+        When: cmd_status(detail=True) is called
+        Then: Story and Feature IDs do NOT appear in the --detail sections
+        Spec: AC-3
+        """
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = detail_units
+        mock_parser.get_parallel_candidates.return_value = [detail_units[1]]
+        mock_parser.all_done.return_value = False
+        mock_parser.get_blocked_units.return_value = [detail_units[2], detail_units[5]]
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_status(detail=True)
+
+        assert result == 0
+        out = capsys.readouterr().out
+        # Extract just the --detail sections (after the summary separator)
+        # Story and Feature rollup IDs must not appear in the detail sections
+        assert "E1-F1-S1\n" not in out  # story
+        assert "E1-F1\n" not in out     # feature
+
+    def test_status_without_detail_unchanged(
+        self, detail_units: list[WorkUnit], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: any backlog state
+        When: cmd_status() is called without detail=True
+        Then: output does NOT contain 'In Queue (' or 'Blocked (' detail sections
+        Spec: AC-4
+        """
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = detail_units
+        mock_parser.get_parallel_candidates.return_value = [detail_units[1]]
+        mock_parser.all_done.return_value = False
+        mock_parser.get_blocked_units.return_value = [detail_units[2], detail_units[5]]
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_status()
+
+        assert result == 0
+        out = capsys.readouterr().out
+        # Detail sections must not appear in plain status
+        assert "In Queue (" not in out
+        assert "Blocked (" not in out
+
+    def test_status_detail_via_main_dispatch(
+        self, detail_units: list[WorkUnit], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: sys.argv contains ['devbench', 'status', '--detail']
+        When: main() is called
+        Then: cmd_status is invoked with detail=True and detail sections are printed
+        Spec: AC-1, AC-4
+        """
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = detail_units
+        mock_parser.get_parallel_candidates.return_value = [detail_units[1]]
+        mock_parser.all_done.return_value = False
+        mock_parser.get_blocked_units.return_value = [detail_units[2], detail_units[5]]
+
+        with (
+            patch("sys.argv", ["devbench", "status", "--detail"]),
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+        ):
+            result = cli.main()
+
+        assert result == 0
+        out = capsys.readouterr().out
+        assert "In Queue (" in out or "Blocked (" in out
+
+
 class TestCmdNext:
     """Test cmd_next command."""
 

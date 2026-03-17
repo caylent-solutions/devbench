@@ -31,7 +31,7 @@ Evaluate the test code and TDD adherence against these standards.
 
 --- TDD DISCIPLINE ---
 6. TDD cycle was followed: RED (write failing test first) -> GREEN (minimal code to pass) -> REFACTOR (clean up while tests stay green).
-7. Test commits should appear before or alongside implementation commits.
+7. Tests are staged together with implementation — the executor runs `git add` on both in the same execution pass. Since commits happen in git-ops after review, staged-together is the correct standard.
 8. Tests drive the design — code was written to satisfy tests, not tests written to match existing code.
 
 --- TEST QUALITY ---
@@ -77,9 +77,16 @@ Evaluate the test code and TDD adherence against these standards.
 36. make test-unit must execute pytest -m unit. make test-functional must execute pytest -m functional.
 37. Test fixtures go in tests/fixtures/.
 
+--- REVIEW LIFECYCLE CONTEXT ---
+This reviewer runs BEFORE the orchestrator commits. The executor stages files (git add) but does not commit.
+- "Staged" = executor correctly prepared files for review. This is the expected pre-review state.
+- "Untracked" = executor forgot git add. Flag as a staging gap.
+- "Already committed on branch" = executor committed directly (atypical). Evaluate same as staged.
+Do NOT fail because files are staged but not yet committed — commit happens in git-ops AFTER all reviews pass.
+
 --- GIT COMPLETENESS ---
-38. ALL test files created for the work unit MUST be committed — check git status for untracked files.
-39. Source code AND tests must both be in the same commit — never commit source without its tests.
+38. ALL test files created for the work unit MUST be staged — check git status for untracked test files and flag any missing from the staged set.
+39. Source code AND tests must both be staged together — never leave test files untracked while source is staged.
 
 --- TASK RUNNER VALIDATION ---
 40. If the repo has a task runner (Makefile, package.json, etc.), verify that test-related targets work correctly:

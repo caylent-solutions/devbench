@@ -34,36 +34,47 @@ Each `.md` file in `plugin/devbench/agents/review_team/` is a reviewer. Read the
 
 In a **single response**, invoke all discovered reviewers using the Agent tool — one Agent tool call per reviewer. Pass `$ARGUMENTS` (the work unit ID) to each. Do not invoke them sequentially; all calls must appear in the same response so they run in parallel.
 
-## Step 3: Collect Verdicts
+## Step 3: Parse JSON Response Envelopes
 
-Wait for all Agent tool calls to complete. Read each reviewer's output and identify any `REVIEW_FAIL` verdict lines.
+Wait for all Agent tool calls to complete. Each reviewer outputs a JSON envelope as the last content in its response. Parse each reviewer's JSON envelope to extract:
+- `verdict` — `"pass"` or `"fail"`
+- `summary` — one-line summary of the reviewer's verdict
+- `findings` — array of finding/confirmation objects
+
+A reviewer FAILS if `verdict == "fail"`.
 
 ## Step 4: Aggregate and Log Results
 
-**If any reviewer returned REVIEW_FAIL:**
+**If any reviewer returned `"verdict": "fail"`:**
 
-For each failing reviewer, log the verdict:
+For each failing reviewer, log each finding as a comment, then log the verdict using the reviewer's actual JSON summary:
 
 ```bash
-uv run devbench log-verdict <reviewer-name> $ARGUMENTS REVIEW_FAIL "<reviewer-name>: <feedback text>"
+# For each finding in the reviewer's JSON findings array:
+uv run devbench log-comment <reviewer-name> $ARGUMENTS "<finding.criteria_group>: <finding.detail> — fix: <finding.fix>"
+
+# Then log the verdict using the reviewer's actual summary:
+uv run devbench log-verdict <reviewer-name> $ARGUMENTS fail "<reviewer JSON summary>"
 ```
 
 Then return a consolidated failure summary to the caller indicating which reviewers failed and their feedback.
 
 **If all reviewers passed:**
 
-Log each individual reviewer's PASS verdict (the done-gate requires all four names in `REVIEW_JUDGE_NAMES` to have REVIEW_PASS entries):
+For each reviewer that passed, log each confirmation comment, then log the verdict using the reviewer's actual JSON summary (not a hardcoded string):
 
 ```bash
-# For each reviewer that passed, log its individual PASS verdict
-# (done-gate requires all four names in REVIEW_JUDGE_NAMES to have REVIEW_PASS)
-uv run devbench log-verdict code_review $ARGUMENTS REVIEW_PASS "code-reviewer passed"
-uv run devbench log-verdict test_review $ARGUMENTS REVIEW_PASS "test-reviewer passed"
-uv run devbench log-verdict doc_review $ARGUMENTS REVIEW_PASS "doc-reviewer passed"
-uv run devbench log-verdict changes_manifest $ARGUMENTS REVIEW_PASS "changes-manifest passed"
+# For each confirmation in the reviewer's JSON findings array:
+uv run devbench log-comment <reviewer-name> $ARGUMENTS "<finding.criteria_group>: <finding.detail>"
 
-# Log the supervisor-level summary (non-verdict)
+# Log the verdict using the reviewer's actual summary from the JSON envelope:
+uv run devbench log-verdict <reviewer-name> $ARGUMENTS pass "<reviewer JSON summary>"
+```
+
+After logging all individual verdicts, log the supervisor-level summary:
+
+```bash
 uv run devbench log-comment review-supervisor $ARGUMENTS "All review_team members passed"
 ```
 
-Then return REVIEW_PASS to the caller.
+Then return the consolidated pass result to the caller.

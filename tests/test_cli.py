@@ -613,3 +613,164 @@ class TestCmdEnsureBranch:
             result = cli.cmd_ensure_branch("NONEXISTENT")
 
         assert result == 1
+
+
+@pytest.mark.unit
+class TestCmdGitOpsPostMergeCheckout:
+    """Tests for AC-1: cmd_git_ops checks out default branch after merge."""
+
+    def _make_unit(self) -> WorkUnit:
+        return WorkUnit(
+            id="E224-F1-S1-T1",
+            title="Post-merge checkout test",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E224-F1-S1-T1.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+
+    def test_cmd_git_ops_checks_out_default_branch_after_merge(self, tmp_path: Path) -> None:
+        """
+        Given: merge_pr succeeds
+        When: cmd_git_ops is called
+        Then: checkout_default_branch is called after merge_pr succeeds (AC-1)
+        """
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        mock_ops = MagicMock()
+        mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/42"
+        mock_ops.wait_for_checks.return_value = True
+        repo_path = tmp_path / "devbench"
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
+            patch("devbench.cli.UPDATE_SUBMODULE", False),
+            patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+        ):
+            result = cli.cmd_git_ops("E224-F1-S1-T1")
+
+        assert result == 0
+        mock_ops.checkout_default_branch.assert_called_once_with(
+            "caylent-solutions/devbench", repo_path
+        )
+
+    def test_cmd_git_ops_calls_checkout_before_submodule_update(self, tmp_path: Path) -> None:
+        """
+        Given: merge_pr succeeds and UPDATE_SUBMODULE is True
+        When: cmd_git_ops is called
+        Then: checkout_default_branch is called before update_parent_submodule_ref (AC-1)
+        """
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        call_order: list[str] = []
+        mock_ops = MagicMock()
+        mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/42"
+        mock_ops.wait_for_checks.return_value = True
+        mock_ops.checkout_default_branch.side_effect = lambda *_: call_order.append("checkout")
+        mock_ops.update_parent_submodule_ref.side_effect = lambda *_: call_order.append("submodule")
+        repo_path = tmp_path / "devbench"
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
+            patch("devbench.cli.UPDATE_SUBMODULE", True),
+            patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+        ):
+            result = cli.cmd_git_ops("E224-F1-S1-T1")
+
+        assert result == 0
+        assert call_order.index("checkout") < call_order.index("submodule")
+
+
+@pytest.mark.unit
+class TestCmdGitOpsConflictingRetry:
+    """Tests for AC-6 and AC-7: ConflictingPRError retry logic in cmd_git_ops."""
+
+    def _make_unit(self) -> WorkUnit:
+        return WorkUnit(
+            id="E224-F1-S1-T1",
+            title="Conflicting retry test",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E224-F1-S1-T1.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+
+    def test_cmd_git_ops_retries_merge_after_conflicting(self, tmp_path: Path) -> None:
+        """
+        Given: first merge_pr raises ConflictingPRError, retry succeeds
+        When: cmd_git_ops is called
+        Then: rebase_and_force_push is called, then merge_pr is retried and returns 0 (AC-6)
+        """
+        from devbench.github.git_ops import ConflictingPRError
+
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        mock_ops = MagicMock()
+        mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/42"
+        mock_ops.wait_for_checks.return_value = True
+        # First call raises ConflictingPRError, second succeeds
+        mock_ops.merge_pr.side_effect = [
+            ConflictingPRError("CONFLICTING"),
+            None,
+        ]
+        repo_path = tmp_path / "devbench"
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
+            patch("devbench.cli.UPDATE_SUBMODULE", False),
+            patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+        ):
+            result = cli.cmd_git_ops("E224-F1-S1-T1")
+
+        assert result == 0
+        mock_ops.rebase_and_force_push.assert_called_once_with(
+            "caylent-solutions/devbench",
+            repo_path,
+            "backlog/e224-f1-s1-t1",
+        )
+        assert mock_ops.merge_pr.call_count == 2
+
+    def test_cmd_git_ops_exits_nonzero_if_retry_merge_fails(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: first merge_pr raises ConflictingPRError, retry also fails
+        When: cmd_git_ops is called
+        Then: returns 1 with clear error message, no further retry (AC-7)
+        """
+        from devbench.github.git_ops import ConflictingPRError
+
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        mock_ops = MagicMock()
+        mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/42"
+        mock_ops.wait_for_checks.return_value = True
+        # Both calls fail
+        mock_ops.merge_pr.side_effect = [
+            ConflictingPRError("CONFLICTING"),
+            RuntimeError("merge still failed"),
+        ]
+        repo_path = tmp_path / "devbench"
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
+            patch("devbench.cli.UPDATE_SUBMODULE", False),
+            patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+        ):
+            result = cli.cmd_git_ops("E224-F1-S1-T1")
+
+        assert result == 1
+        err_output = capsys.readouterr().err
+        assert "merge" in err_output.lower() or "ERROR" in err_output
+        # Must not call merge_pr a third time
+        assert mock_ops.merge_pr.call_count == 2

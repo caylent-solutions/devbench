@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from devbench.github.git_ops import GitOpsJudge
+from devbench.github.git_ops import ConflictingPRError, GitOpsJudge
 
 
 class TestGitOpsInit:
@@ -280,7 +280,7 @@ class TestEnsureBranch:
         """
         Given: different branch, clean tree, target branch does not exist locally
         When: ensure_branch is called
-        Then: checkout -b is used (AC-7)
+        Then: fetch origin is run, checkout -b uses origin/<default_branch> as base (AC-3/AC-7)
         """
         judge = GitOpsJudge()
         git_calls: list[list[str]] = []
@@ -296,11 +296,13 @@ class TestEnsureBranch:
 
         with (
             patch.object(judge, "_git", side_effect=stub),
+            patch.object(judge, "_get_default_branch", return_value="main"),
             patch("devbench.github.git_ops.run_command", side_effect=run_command_responses),
         ):
             judge.ensure_branch("caylent-solutions/git-repo", tmp_path, "new-branch")
 
-        assert ["checkout", "-b", "new-branch"] in git_calls
+        assert ["fetch", "origin"] in git_calls
+        assert ["checkout", "-b", "new-branch", "origin/main"] in git_calls
         assert ["checkout", "new-branch"] not in git_calls
 
     def test_ensure_branch_validates_branch_name(self, tmp_path: Path) -> None:
@@ -621,3 +623,188 @@ class TestGhHelper:
 
         cmd = mock_run.call_args.args[0]
         assert "--repo" not in cmd
+
+
+@pytest.mark.unit
+class TestCheckoutDefaultBranch:
+    """Tests for GitOpsJudge.checkout_default_branch (AC-2)."""
+
+    def test_checkout_default_branch_runs_checkout_and_pull(self, tmp_path: Path) -> None:
+        """
+        Given: a repo with a default branch of 'main'
+        When: checkout_default_branch is called
+        Then: git checkout <default_branch> and git pull origin <default_branch> are called
+        """
+        judge = GitOpsJudge()
+        git_calls: list[list[str]] = []
+
+        def capture_git(args: list[str], cwd: Path) -> tuple[int, str, str]:
+            git_calls.append(args)
+            return (0, "", "")
+
+        with (
+            patch.object(judge, "_git", side_effect=capture_git),
+            patch.object(judge, "_get_default_branch", return_value="main"),
+        ):
+            judge.checkout_default_branch("caylent-solutions/git-repo", tmp_path)
+
+        assert ["checkout", "main"] in git_calls
+        assert ["pull", "origin", "main"] in git_calls
+        # Verify order: checkout before pull
+        checkout_idx = git_calls.index(["checkout", "main"])
+        pull_idx = git_calls.index(["pull", "origin", "main"])
+        assert checkout_idx < pull_idx
+
+    def test_update_parent_submodule_ref_calls_checkout_default_branch(self, tmp_path: Path) -> None:
+        """
+        Given: update_parent_submodule_ref is called
+        When: the method executes
+        Then: checkout_default_branch is called (not duplicate git commands inline)
+        """
+        judge = GitOpsJudge()
+        repo_path = tmp_path / "git-repo"
+        repo_path.mkdir()
+
+        checkout_default_branch_calls: list[tuple[str, Path]] = []
+
+        def capture_checkout(repo: str, rp: Path) -> None:
+            checkout_default_branch_calls.append((repo, rp))
+
+        with (
+            patch.object(judge, "checkout_default_branch", side_effect=capture_checkout),
+            patch.object(judge, "_git", return_value=(0, "", "")),
+            patch.object(judge, "_get_default_branch", return_value="main"),
+            patch("devbench.github.git_ops.WORKSPACE_ROOT", tmp_path),
+        ):
+            judge.update_parent_submodule_ref(
+                "caylent-solutions/git-repo", repo_path, "update submodule"
+            )
+
+        assert len(checkout_default_branch_calls) == 1
+        assert checkout_default_branch_calls[0] == ("caylent-solutions/git-repo", repo_path)
+
+
+@pytest.mark.unit
+class TestEnsureBranchNewBranchBase:
+    """Tests for ensure_branch new-branch base on origin/<default_branch> (AC-3, AC-4)."""
+
+    def test_ensure_branch_new_branch_fetches_and_bases_on_origin(self, tmp_path: Path) -> None:
+        """
+        Given: target branch does not exist locally, clean tree
+        When: ensure_branch is called
+        Then: fetch origin is run and checkout -b uses origin/<default_branch> as base (AC-3)
+        """
+        judge = GitOpsJudge()
+        git_calls: list[list[str]] = []
+
+        def capture_git(args: list[str], cwd: Path) -> tuple[int, str, str]:
+            git_calls.append(args)
+            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, "main", "")
+            return (0, "", "")
+
+        # run_command: status → clean, show-ref → branch absent
+        run_command_responses = iter([(0, "", ""), (1, "", "")])
+
+        with (
+            patch.object(judge, "_git", side_effect=capture_git),
+            patch.object(judge, "_get_default_branch", return_value="main"),
+            patch("devbench.github.git_ops.run_command", side_effect=run_command_responses),
+        ):
+            judge.ensure_branch("caylent-solutions/git-repo", tmp_path, "new-branch")
+
+        assert ["fetch", "origin"] in git_calls
+        assert ["checkout", "-b", "new-branch", "origin/main"] in git_calls
+        # Plain checkout -b without the base must NOT appear
+        assert ["checkout", "-b", "new-branch"] not in git_calls
+
+    def test_ensure_branch_existing_branch_no_fetch(self, tmp_path: Path) -> None:
+        """
+        Given: target branch already exists locally, clean tree
+        When: ensure_branch is called
+        Then: fetch is NOT run, just git checkout <branch> (AC-4)
+        """
+        judge = GitOpsJudge()
+        git_calls: list[list[str]] = []
+
+        def capture_git(args: list[str], cwd: Path) -> tuple[int, str, str]:
+            git_calls.append(args)
+            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, "main", "")
+            return (0, "", "")
+
+        # run_command: status → clean, show-ref → branch exists
+        run_command_responses = iter([(0, "", ""), (0, "", "")])
+
+        with (
+            patch.object(judge, "_git", side_effect=capture_git),
+            patch("devbench.github.git_ops.run_command", side_effect=run_command_responses),
+        ):
+            judge.ensure_branch("caylent-solutions/git-repo", tmp_path, "feature/x")
+
+        assert ["fetch", "origin"] not in git_calls
+        assert ["checkout", "feature/x"] in git_calls
+
+
+@pytest.mark.unit
+class TestConflictingPRError:
+    """Tests for ConflictingPRError exception and merge_pr raising it (AC-5)."""
+
+    def test_merge_pr_raises_conflicting_pr_error_on_conflict(self, tmp_path: Path) -> None:
+        """
+        Given: gh pr merge returns non-zero with CONFLICTING in stderr
+        When: merge_pr is called
+        Then: ConflictingPRError is raised (AC-5)
+        """
+        judge = GitOpsJudge()
+        with patch.object(
+            judge, "_gh", return_value=(1, "", "GraphQL: CONFLICTING merge state")
+        ):
+            with pytest.raises(ConflictingPRError):
+                judge.merge_pr("caylent-solutions/git-repo", 42, repo_path=tmp_path)
+
+    def test_merge_pr_raises_runtime_error_on_non_conflict_failure(self, tmp_path: Path) -> None:
+        """
+        Given: gh pr merge returns non-zero without CONFLICTING in stderr
+        When: merge_pr is called
+        Then: RuntimeError (not ConflictingPRError) is raised
+        """
+        judge = GitOpsJudge()
+        with patch.object(judge, "_gh", return_value=(1, "", "some other error")):
+            with pytest.raises(RuntimeError) as exc_info:
+                judge.merge_pr("caylent-solutions/git-repo", 42, repo_path=tmp_path)
+        # Must not be a ConflictingPRError for generic failures
+        assert type(exc_info.value) is RuntimeError
+
+
+@pytest.mark.unit
+class TestRebaseAndForcePush:
+    """Tests for GitOpsJudge.rebase_and_force_push (AC-8)."""
+
+    def test_rebase_and_force_push_runs_correct_git_commands(self, tmp_path: Path) -> None:
+        """
+        Given: a repo with a default branch of 'main'
+        When: rebase_and_force_push is called for 'feature/x'
+        Then: fetch origin, rebase origin/main, push --force-with-lease origin feature/x (AC-8)
+        """
+        judge = GitOpsJudge()
+        git_calls: list[list[str]] = []
+
+        def capture_git(args: list[str], cwd: Path) -> tuple[int, str, str]:
+            git_calls.append(args)
+            return (0, "", "")
+
+        with (
+            patch.object(judge, "_git", side_effect=capture_git),
+            patch.object(judge, "_get_default_branch", return_value="main"),
+        ):
+            judge.rebase_and_force_push("caylent-solutions/git-repo", tmp_path, "feature/x")
+
+        assert ["fetch", "origin"] in git_calls
+        assert ["rebase", "origin/main"] in git_calls
+        assert ["push", "--force-with-lease", "origin", "feature/x"] in git_calls
+        # Verify order
+        fetch_idx = git_calls.index(["fetch", "origin"])
+        rebase_idx = git_calls.index(["rebase", "origin/main"])
+        push_idx = git_calls.index(["push", "--force-with-lease", "origin", "feature/x"])
+        assert fetch_idx < rebase_idx < push_idx

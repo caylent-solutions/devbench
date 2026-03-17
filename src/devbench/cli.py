@@ -369,7 +369,7 @@ def cmd_get_diff(unit_id: str) -> int:
             return 1
         default_branch = stdout.strip().removeprefix("origin/")
 
-    rc, stdout, _ = run_command(["git", "diff", default_branch], cwd=repo_path)
+    rc, stdout, _ = run_command(["git", "diff", f"origin/{default_branch}"], cwd=repo_path)
     if rc == 0 and stdout.strip():
         parts.append(stdout)
 

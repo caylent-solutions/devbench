@@ -774,3 +774,124 @@ class TestCmdGitOpsConflictingRetry:
         assert "merge" in err_output.lower() or "ERROR" in err_output
         # Must not call merge_pr a third time
         assert mock_ops.merge_pr.call_count == 2
+
+
+@pytest.mark.unit
+class TestCmdGetDiff:
+    """Tests for cmd_get_diff origin/<default_branch> fix (E225-F1-S1-T1)."""
+
+    def _make_unit(self) -> WorkUnit:
+        return WorkUnit(
+            id="E225-F1-S1-T1",
+            title="get-diff test task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E225-F1-S1-T1.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+
+    def test_get_diff_uses_origin_remote_ref_for_branch_diff(self, tmp_path: Path) -> None:
+        """
+        Given: a configured default branch of 'main3'
+        When: cmd_get_diff is called
+        Then: run_command is invoked with ['git', 'diff', 'origin/main3'], not ['git', 'diff', 'main3'] (AC-1)
+        """
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        repo_path = tmp_path / "devbench"
+
+        diff_calls: list[list[str]] = []
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd[:2] == ["git", "diff"]:
+                diff_calls.append(cmd)
+            return (0, "", "")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
+            patch("devbench.cli.get_configured_default_branch", return_value="main3"),
+            patch("devbench.cli.run_command", side_effect=fake_run_command),
+        ):
+            cli.cmd_get_diff("E225-F1-S1-T1")
+
+        branch_diff_calls = [c for c in diff_calls if len(c) == 3 and c[2] not in ("--cached",)]
+        assert len(branch_diff_calls) == 1, f"Expected exactly one branch diff call, got: {branch_diff_calls}"
+        assert branch_diff_calls[0] == ["git", "diff", "origin/main3"], (
+            f"Expected 'origin/main3' ref but got: {branch_diff_calls[0]}"
+        )
+
+    def test_get_diff_output_unchanged_when_local_ref_current(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: local 'main3' ref is up-to-date with 'origin/main3' (identical diff output)
+        When: cmd_get_diff is called
+        Then: the diff output is produced correctly and return code is 0 (AC-2)
+        """
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        repo_path = tmp_path / "devbench"
+        expected_diff = "diff --git a/foo.py b/foo.py\n--- a/foo.py\n+++ b/foo.py\n@@ -1 +1 @@\n-old\n+new\n"
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd == ["git", "diff", "origin/main3"]:
+                return (0, expected_diff, "")
+            return (0, "", "")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
+            patch("devbench.cli.get_configured_default_branch", return_value="main3"),
+            patch("devbench.cli.run_command", side_effect=fake_run_command),
+        ):
+            result = cli.cmd_get_diff("E225-F1-S1-T1")
+
+        assert result == 0
+        output = capsys.readouterr().out
+        assert "foo.py" in output, "Expected diff content to appear in output when local ref is current"
+
+    def test_get_diff_excludes_upstream_merged_files_when_local_ref_stale(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: local 'main3' is behind 'origin/main3' (stale)
+        When: cmd_get_diff is called
+        Then: only work-unit-branch changes appear (git diff uses origin/main3, not bare main3) (AC-3)
+        """
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        repo_path = tmp_path / "devbench"
+
+        # Simulate: bare main3 would include upstream-merged file, origin/main3 would not
+        branch_only_diff = (
+            "diff --git a/new_feature.py b/new_feature.py\n"
+            "+++ b/new_feature.py\n@@ -0,0 +1 @@\n+feature\n"
+        )
+        stale_extra_diff = branch_only_diff + "diff --git a/upstream_merged.py b/upstream_merged.py\n"
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd == ["git", "diff", "origin/main3"]:
+                return (0, branch_only_diff, "")
+            if cmd == ["git", "diff", "main3"]:
+                return (0, stale_extra_diff, "")
+            return (0, "", "")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
+            patch("devbench.cli.get_configured_default_branch", return_value="main3"),
+            patch("devbench.cli.run_command", side_effect=fake_run_command),
+        ):
+            result = cli.cmd_get_diff("E225-F1-S1-T1")
+
+        assert result == 0
+        output = capsys.readouterr().out
+        assert "upstream_merged.py" not in output, (
+            "Upstream-merged file appeared in output — bare branch ref was used instead of origin/"
+        )
+        assert "new_feature.py" in output, "Branch-specific diff should appear in output"

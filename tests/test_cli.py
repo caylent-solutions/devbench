@@ -115,6 +115,48 @@ class TestCmdStatus:
         assert result == 0
         assert "1 blocked" in capsys.readouterr().out
 
+    def test_status_shows_hold_count(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """test_status_shows_hold_count: AC-1.
+
+        Given: a backlog with one hold Task and other statuses
+        When: cmd_status() is called (no --detail)
+        Then: output includes a 'Hold' line with the correct count
+        Spec: AC-1
+        """
+        hold_unit = WorkUnit(
+            id="E1-F1-S1-T1",
+            title="Hold Task",
+            status=WorkUnitStatus.HOLD,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E1-F1-S1-T1.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+        done_unit = WorkUnit(
+            id="E1-F1-S1-T2",
+            title="Done Task",
+            status=WorkUnitStatus.DONE,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E1-F1-S1-T2.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [hold_unit, done_unit]
+        mock_parser.get_parallel_candidates.return_value = []
+        mock_parser.all_done.return_value = False
+        mock_parser.get_blocked_units.return_value = []
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_status()
+
+        assert result == 0
+        out = capsys.readouterr().out
+        assert "Hold" in out
+        # The count line must show 1 for Hold
+        hold_line = next(line for line in out.splitlines() if "Hold" in line and line.strip().startswith("Hold"))
+        assert hold_line.strip().endswith("1")
+
 
 @pytest.fixture
 def detail_units() -> list[WorkUnit]:
@@ -369,6 +411,117 @@ class TestCmdStatusDetail:
         assert result == 0
         out = capsys.readouterr().out
         assert "In Queue (" in out or "Blocked (" in out
+
+    def test_status_detail_shows_hold_tasks(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """test_status_detail_shows_hold_tasks: AC-2.
+
+        Given: a backlog with Task-level hold units
+        When: cmd_status(detail=True) is called
+        Then: a 'Hold (N):' section lists the hold Task IDs
+        Spec: AC-2
+        """
+        hold_task = WorkUnit(
+            id="E5-F1-S1-T1",
+            title="On Hold Task",
+            status=WorkUnitStatus.HOLD,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E5-F1-S1-T1.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+        done_task = WorkUnit(
+            id="E5-F1-S1-T2",
+            title="Done Task",
+            status=WorkUnitStatus.DONE,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E5-F1-S1-T2.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [done_task, hold_task]
+        mock_parser.get_parallel_candidates.return_value = []
+        mock_parser.all_done.return_value = False
+        mock_parser.get_blocked_units.return_value = []
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_status(detail=True)
+
+        assert result == 0
+        out = capsys.readouterr().out
+        assert "Hold (1):" in out
+        assert "E5-F1-S1-T1" in out
+        assert "On Hold Task" in out
+
+    def test_status_detail_excludes_non_task_hold(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """test_status_detail_excludes_non_task_hold: AC-3.
+
+        Given: a backlog with Story/Feature/Epic-level hold units alongside a hold Task
+        When: cmd_status(detail=True) is called
+        Then: only the Task-level hold unit appears in the 'Hold' section;
+              Story/Feature/Epic rollup IDs do NOT appear there
+        Spec: AC-3
+        """
+        hold_task = WorkUnit(
+            id="E6-F1-S1-T1",
+            title="Hold Task",
+            status=WorkUnitStatus.HOLD,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E6-F1-S1-T1.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+        hold_story = WorkUnit(
+            id="E6-F1-S1",
+            title="Hold Story",
+            status=WorkUnitStatus.HOLD,
+            unit_type=WorkUnitType.STORY,
+            file_path=Path("backlog/E6-F1-S1.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+        hold_feature = WorkUnit(
+            id="E6-F1",
+            title="Hold Feature",
+            status=WorkUnitStatus.HOLD,
+            unit_type=WorkUnitType.FEATURE,
+            file_path=Path("backlog/E6-F1.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [hold_task, hold_story, hold_feature]
+        mock_parser.get_parallel_candidates.return_value = []
+        mock_parser.all_done.return_value = False
+        mock_parser.get_blocked_units.return_value = []
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_status(detail=True)
+
+        assert result == 0
+        out = capsys.readouterr().out
+        # Only 1 Task-level hold unit — section header must reflect that
+        assert "Hold (1):" in out
+        # Task must be listed
+        assert "E6-F1-S1-T1" in out
+        # Story and Feature rollup IDs must NOT appear in the Hold detail section.
+        # Parse line-by-line to check for whole-token absence (avoids false pass
+        # when the ID appears mid-line such as "E6-F1-S1  Hold Story").
+        hold_section_start = out.find("Hold (1):")
+        hold_section = out[hold_section_start:]
+        hold_lines = hold_section.splitlines()
+        for line in hold_lines:
+            tokens = line.split()
+            assert "E6-F1-S1" not in tokens, (
+                f"Story ID 'E6-F1-S1' unexpectedly found as a token in Hold section line: {line!r}"
+            )
+            assert "E6-F1" not in tokens, (
+                f"Feature ID 'E6-F1' unexpectedly found as a token in Hold section line: {line!r}"
+            )
 
 
 class TestCmdNext:

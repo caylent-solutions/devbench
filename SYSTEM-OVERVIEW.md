@@ -123,9 +123,9 @@ Every work unit goes through the complete software development lifecycle.
 
 ### 6. LLM Judge Review
 
-- Agent stages files and runs `judges.cli review <unit-id>`
-- Four independent LLM judges evaluate the work (code_review, test_review, doc_review, changes_manifest), each calling the configured Claude model
-- Each judge gathers its own evidence (diffs, test output, file contents, changed file lists)
+- Agent stages files and invokes the `devbench:review-supervisor` agent
+- The review-supervisor runs four independent judge agents in parallel (code-reviewer, test-reviewer, doc-reviewer, changes-manifest), each calling Claude to make a verdict
+- Each judge agent gathers its own evidence (diffs, test output, file contents, changed file lists) via `devbench` CLI commands (`get-diff`, `run-tests`, `read-unit`)
 - The LLM makes every pass/fail decision — no hardcoded rules
 - Judges verify task runner correctness by reading the config in the diff and checking the agent log
 

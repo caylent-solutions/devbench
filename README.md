@@ -52,18 +52,18 @@ Alternatively, set `JUDGE_USE_BEDROCK=1` to use AWS Bedrock for LLM calls instea
 See [docs/execution-modes.md](docs/execution-modes.md) for a full description of both execution modes, the step-by-step lifecycle, and ownership rules.
 
 ```
-Orchestrator (execution/orchestrator.py / interactive Claude session)
+Orchestrator (orchestrate SKILL.md / interactive Claude session)
   │
   ├── Pre-flight: validate-backlog — abort if index/files are out of sync
   ├── Parse BACKLOG.md → find next actionable work unit
-  ├── Implement work unit via TDD (RED → GREEN → REFACTOR)
+  ├── Implement work unit via TDD (RED → GREEN → REFACTOR)  [devbench:executor agent]
   ├── Run repo's task runners (make test, make validate)
-  ├── Stage files and submit to judge review
-  │     ├── code_review       — SOLID, DRY, fail-fast, security, 12-factor
-  │     ├── test_review        — TDD discipline, test quality, assertions
-  │     ├── doc_review         — accuracy, completeness, sync with code
-  │     ├── changes_manifest   — actual changes vs. expected manifest
-  │     └── security_review    — CodeQL, Dependabot, secret scanning alerts
+  ├── Stage files and submit to judge review  [devbench:review-supervisor agent]
+  │     ├── code-reviewer       — SOLID, DRY, fail-fast, security, 12-factor
+  │     ├── test-reviewer       — TDD discipline, test quality, assertions
+  │     ├── doc-reviewer        — accuracy, completeness, sync with code
+  │     ├── changes-manifest    — actual changes vs. expected manifest
+  │     └── security-reviewer   — CodeQL, Dependabot, secret scanning alerts
   ├── If judges fail → read feedback, fix, resubmit (≤10 tries)
   │     └── Prior feedback injected into re-review to prevent contradictions
   ├── Git ops: commit, push, create PR, wait for CI, merge
@@ -131,11 +131,14 @@ devbench <command> [args]
 | Command | Arguments | Description |
 |---------|-----------|-------------|
 | `status` | — | Show backlog summary (counts by status) |
-| `next` | — | Print next actionable work unit as JSON, set it to in-progress |
+| `next` | — | Print next actionable work unit as JSON |
+| `claim` | `<unit-id>` | Claim a work unit (set to in-progress) |
 | `ensure-branch` | `<unit-id>` | Create or switch to work unit branch before executor runs |
 | `git-ops` | `<unit-id>` | Commit, push, create PR, wait for CI, merge |
 | `mark-done` | `<unit-id>` | Mark unit as Done (enforces done-gate: all judges must have passed) |
 | `log-verdict` | `<judge> <unit-id> <pass\|fail> [msg]` | Record a judge verdict in the work unit Comments |
+| `log-comment` | `<agent> <unit-id> <message>` | Append an agent comment to the work unit Comments |
+| `log-tdd` | `<unit-id> <RED\|GREEN\|REFACTOR> <message>` | Append a TDD phase entry to the work unit TDD Cycle Log |
 | `set-status` | `<unit-id> <status>` | Force any status (no gate — use for recovery/lifecycle transitions) |
 | `validate-backlog` | — | Check backlog integrity (file existence, status sync, orphans, deps, summary table) |
 | `read-unit` | `<unit-id>` | Print work unit spec as markdown (for agent context) |
@@ -170,43 +173,25 @@ devbench/
 │   ├── cli.py                     ← CLI entry point (devbench <command>)
 │   ├── config.py                  ← Environment-driven configuration (all env vars)
 │   ├── config_loader.py           ← YAML config parser and schema validator (parse/validate only — no env var access)
+│   ├── config-schema.json         ← JSON schema for devbench.yaml validation
 │   ├── constants.py               ← Centralized structural constants (regex, formats)
 │   ├── log_setup.py               ← Dual logging (stdout + file)
 │   ├── backlog/
 │   │   ├── parser.py              ← Parses BACKLOG.md and work unit .md files
 │   │   ├── work_unit.py           ← WorkUnit dataclass and status management
 │   │   └── manager.py             ← Status sync, rollup, traceability
-│   ├── execution/
-│   │   ├── orchestrator.py        ← Main loop: parse backlog, dispatch, review, merge
-│   │   └── executor.py            ← Spawns Claude Code dev agents
 │   ├── github/
 │   │   ├── git_ops.py             ← Commit, push, PR, merge, CI checks
 │   │   └── security.py            ← GitHub security API integration
-│   ├── judges/
-│   │   ├── base.py                ← BaseJudge: LLM calls, prior feedback injection
-│   │   ├── code_review.py         ← Git diff + work unit → LLM verdict
-│   │   ├── test_review.py         ← make test / pytest + test files → LLM verdict
-│   │   ├── doc_review.py          ← Doc diff + work unit → LLM verdict
-│   │   ├── changes_manifest.py    ← Changed files vs. manifest → LLM verdict
-│   │   ├── security_review.py     ← GitHub alerts + diff → LLM verdict
-│   │   └── blocker_resolver.py    ← Dependency and blocker assessment
 │   ├── utils/
 │   │   ├── greeting.py            ← get_greeting(name): greeting utility for POC pipeline verification
 │   │   └── process.py             ← run_command(): shared subprocess wrapper for running shell commands
 │   ├── reporting/
 │   │   └── report.py              ← Session progress report generator (velocity, ETA)
-│   └── prompts/                   ← Prompt loader (reads from top-level prompts/)
-├── prompts/                       ← External prompt files for each judge
-│   ├── code_review.txt            ← 46 review rules (SOLID, DRY, 12-factor, security)
-│   ├── test_review.txt            ← 42 test quality rules (TDD, stubs, markers)
-│   ├── doc_review.txt             ← Documentation accuracy and completeness
-│   ├── changes_manifest.txt       ← Scope control and manifest verification
-│   ├── security_review.txt        ← Security alert evaluation
-│   ├── blocker_resolver.txt       ← Dependency and blocker assessment
-│   └── executor.txt               ← Dev agent execution prompt
+│   └── prompts/                   ← Prompt loader (reads agent prompt files)
 ├── plugin/                        ← Claude Code plugin (agents, hooks, skills)
 │   └── devbench/
-│       ├── agents/                ← Slash-command agent definitions
+│       ├── agents/                ← Agent definitions invoked by orchestrate skill
 │       │   ├── executor.md        ← Dev agent: implements work units via TDD
 │       │   ├── review-supervisor.md ← Discovers and invokes all review_team agents in parallel
 │       │   ├── security-reviewer.md ← Security review judge agent
@@ -216,6 +201,9 @@ devbench/
 │       │       ├── test-reviewer.md   ← Test quality judge agent
 │       │       ├── doc-reviewer.md    ← Documentation review judge agent
 │       │       └── changes-manifest.md ← Scope/manifest review judge agent
+│       ├── skills/
+│       │   └── orchestrate/
+│       │       └── SKILL.md       ← Orchestrate skill: main backlog execution loop
 │       ├── hooks/
 │       │   └── hooks.json         ← Hook registrations (PreToolUse, PostToolUse, …)
 │       └── scripts/               ← Hook scripts invoked by hooks.json
@@ -229,10 +217,14 @@ devbench/
 ├── tests/
 │   ├── conftest.py                ← Shared fixtures
 │   ├── testing.py                 ← Shared test utilities
+│   ├── fixtures/                  ← Shared test fixture files
+│   ├── functional/                ← Functional tests
 │   ├── test_backlog/              ← parser, work_unit, manager tests
-│   ├── test_execution/            ← executor, orchestrator tests
+│   ├── test_execution/            ← execution path tests
 │   ├── test_github/               ← git_ops, security tests
-│   ├── test_judges/               ← base, code_review, test_review, … tests
+│   ├── test_judges/               ← judge-related tests
+│   ├── test_plugin/               ← plugin integration tests
+│   ├── test_prompts/              ← prompt loader tests
 │   ├── test_reporting/            ← report tests
 │   ├── test_utils/                ← process.run_command tests
 │   └── unit/                      ← Unit tests for plugin hook scripts

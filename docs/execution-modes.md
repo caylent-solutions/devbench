@@ -1,6 +1,6 @@
 # Execution Modes
 
-DevBench supports two execution modes. Both follow the same lifecycle and the same ownership rules — the difference is where the orchestrator and executor run.
+DevBench supports two execution modes. Both follow the same lifecycle and the same ownership rules — the difference is whether the orchestrate skill runs interactively (human in the loop) or non-interactively (background/unattended).
 
 ---
 
@@ -8,10 +8,10 @@ DevBench supports two execution modes. Both follow the same lifecycle and the sa
 
 | Aspect | Automated (`make start`) | Interactive (`make start-interactive`) |
 | --- | --- | --- |
-| Orchestrator | `orchestrator.py` Python loop | Claude Code session with `orchestrator-prompt.md` injected |
-| Executor | Subprocess: `uv run devbench execute` (spawns a Claude CLI agent) | Same Claude session (orchestrator IS the executor) |
+| Orchestrator | `uv run devbench start` → Agent SDK `query()` runs orchestrate SKILL.md non-interactively | Claude Code session with orchestrate SKILL.md active |
+| Executor | `devbench:executor` agent (invoked by orchestrate skill) | Same — orchestrate skill invokes `devbench:executor` agent |
 | Human control | Background — monitor via log file | Foreground — pause with Escape, give instructions, resume |
-| Git operations | `orchestrator.py` via `GitOpsJudge` | Claude session via Bash tool |
+| Git operations | `devbench:executor` agent via `devbench git-ops` CLI command | Same |
 | Best for | Unattended runs, CI-like pipelines | Active oversight, course correction, debugging |
 
 ---
@@ -33,7 +33,7 @@ Both modes execute the same logical steps in the same order.
    └── IN_PROGRESS tasks first (resume interrupted work), then IN_QUEUE
    └── Task-level dependencies must all be DONE
 
-4. Implement the work unit  [EXECUTOR RESPONSIBILITY]
+4. Implement the work unit  [devbench:executor AGENT RESPONSIBILITY]
    ├── Read work-unit file, CLAUDE.md, AGENT-INSTRUCTIONS.md
    ├── Check dependencies
    ├── TDD cycle: RED → GREEN → REFACTOR
@@ -43,18 +43,19 @@ Both modes execute the same logical steps in the same order.
    ├── Stage changed files (git add — NO commit)
    └── Update work-unit status to in-review
 
-5. Judge review  [ORCHESTRATOR RESPONSIBILITY]
-   ├── code_review    — SOLID, DRY, fail-fast, 12-factor
-   ├── test_review    — TDD discipline, test quality, coverage
-   ├── doc_review     — accuracy, completeness, sync with code
-   └── changes_manifest — actual changes vs. declared manifest
+5. Judge review  [devbench:review-supervisor AGENT RESPONSIBILITY]
+   ├── code-reviewer    — SOLID, DRY, fail-fast, 12-factor
+   ├── test-reviewer    — TDD discipline, test quality, coverage
+   ├── doc-reviewer     — accuracy, completeness, sync with code
+   └── changes-manifest — actual changes vs. declared manifest
+   (review-supervisor invokes all four judge agents in parallel)
 
 6. If any judge FAILs → inject feedback, return to step 4 (max JUDGE_MAX_RETRIES)
 
-7. Security review (after all 4 judges pass)  [ORCHESTRATOR RESPONSIBILITY]
+7. Security review (after all 4 judges pass)  [devbench:security-reviewer AGENT RESPONSIBILITY]
    └── If FAIL → write SECURITY_FAIL + REVIEW_REJECTED, return to step 4
 
-8. Git operations  [ORCHESTRATOR RESPONSIBILITY — ALWAYS, BOTH MODES]
+8. Git operations  [devbench:executor AGENT RESPONSIBILITY — ALWAYS, BOTH MODES]
    ├── a. Create/checkout branch in the target submodule
    ├── b. Stage files from the Changes Manifest (selective — never git add -A)
    ├── c. Commit: "<unit-id>: <title>"
@@ -77,7 +78,7 @@ These rules apply in **both modes** without exception.
 
 ### Executor owns: implement only
 
-The executor (subprocess agent in automated mode; the Claude session in interactive mode) is responsible for:
+The `devbench:executor` agent is responsible for:
 
 - Reading the work-unit spec and all referenced standards
 - Writing code, tests, and documentation
@@ -95,13 +96,15 @@ The executor **must not**:
 
 ### Orchestrator owns: review and git lifecycle
 
-The orchestrator is responsible for:
+The orchestrate skill is responsible for:
 
-- Running judge reviews (all 5 judges)
+- Invoking `devbench:review-supervisor` (which runs all four judge agents in parallel)
 - Injecting review feedback into retry attempts
-- All git operations: branch, commit, push, PR, CI wait, merge, and submodule update (when git_ops.update_submodule: true in devbench.yaml)
+- Invoking `devbench:security-reviewer` after the four judges pass
+- Delegating git operations to the executor agent (`devbench git-ops`)
 - Marking work units Done (via the done-gate)
 - Marking work units Blocked (after max retries)
+- Optionally invoking `devbench:blocker-resolver` when a unit is stuck
 
 ### Branch name resolution
 
@@ -110,7 +113,7 @@ Branch name is resolved **once, at parse time**, in `BacklogParser.parse_work_un
 1. If the work-unit file's **Target Repository** section has a `Branch:` field, use it exactly.
 2. Otherwise, derive it: `backlog/<unit-id-lowercase>` (e.g., `E0-F1-S1-T1` → `backlog/e0-f1-s1-t1`).
 
-The resolved name is stored in `WorkUnit.branch` and used by the orchestrator's git operations. Neither the executor nor the orchestrator invents a third naming scheme.
+The resolved name is stored in `WorkUnit.branch` and used by the executor's git operations. Neither the executor nor the orchestrate skill invents a third naming scheme.
 
 ---
 
@@ -119,43 +122,42 @@ The resolved name is stored in `WorkUnit.branch` and used by the orchestrator's 
 ### Automated mode (`make start` / `make run-backlog`)
 
 ```text
-orchestrator.py (Python loop)
+uv run devbench start
     │
-    ├── calls claude_executor.execute(work_unit_path, repo, feedback)
-    │       └── spawns: uv run claude --print --dangerously-skip-permissions ...
-    │               (executor.txt injected as system prompt)
-    │
-    ├── polls execution result (IN_REVIEW / FAILED / BLOCKED)
-    │
-    ├── runs judges (run_review_judges → CodeReviewJudge, TestReviewJudge, ...)
-    │
-    ├── runs security judge
-    │
-    └── runs GitOpsJudge: branch → commit → push → PR → CI wait → merge → submodule (if enabled)
+    └── Agent SDK query() runs orchestrate SKILL.md non-interactively
+            │
+            ├── invokes devbench:executor agent to implement each work unit
+            │
+            ├── invokes devbench:review-supervisor agent to run judge review
+            │       └── review-supervisor runs all 4 judge agents in parallel
+            │
+            ├── invokes devbench:security-reviewer agent
+            │
+            ├── invokes devbench:executor agent to run git-ops
+            │
+            └── invokes devbench:blocker-resolver when a unit is stuck (optional)
 ```
 
-The executor subprocess **cannot** be the orchestrator — it is a separate process with no access to the orchestrator's state.
+The Agent SDK session runs the orchestrate skill with `--dangerously-skip-permissions` so it can invoke CLI tools and agents without interactive approval prompts.
 
 ### Interactive mode (`make start-interactive`)
 
 ```text
-Claude Code session
+Claude Code session (with devbench plugin active)
     │
-    ├── orchestrator-prompt.md injected at session start
+    ├── orchestrate SKILL.md active from session start
     │
-    ├── Claude IS the executor: uses Read/Write/Edit/Bash tools directly
-    │       (does NOT call uv run devbench execute — that spawns a nested subprocess)
+    ├── Claude invokes devbench:executor agent for implementation
     │
-    ├── judge review: uv run devbench review <unit-id>
-    │       └── CLI delegates to the same judge classes as automated mode
+    ├── Claude invokes devbench:review-supervisor for judge review
+    │       └── review-supervisor runs all 4 judge agents in parallel
     │
-    ├── security review: uv run devbench security-review <unit-id>
+    ├── Claude invokes devbench:security-reviewer for security gate
     │
-    └── git operations: Claude runs Bash commands directly
-            (git checkout -b, git add, git commit, git push, gh pr create, gh pr merge)
+    └── Claude invokes devbench:executor for git-ops (commit, push, PR, merge)
 ```
 
-The human can pause at any time (Escape), give instructions, and resume. The same ownership rules apply — Claude does not commit until all judges pass.
+The human can pause at any time (Escape), give instructions, and resume. The same ownership rules apply — the executor does not commit until all judges pass.
 
 ---
 
@@ -173,9 +175,9 @@ The BACKLOG.md index is an at-a-glance summary; the work-unit file is authoritat
 
 ## Retry Behaviour
 
-| Event | Automated mode | Interactive mode |
-| --- | --- | --- |
-| Judge FAIL | Feedback injected into next `execute()` call | Claude reads JSON output, fixes code, re-runs review |
-| BLOCKED (executor reported) | `BlockerResolverJudge` evaluates; resolution or failure feedback fed to next attempt | Claude logs blocker, moves to next unit or seeks resolution |
-| Max retries exhausted (`JUDGE_MAX_RETRIES`, default 10) | `mark_blocked()` — unit marked BLOCKED in BACKLOG.md | Claude logs and marks blocked via `uv run devbench log` |
-| Security FAIL | `SECURITY_FAIL` + `REVIEW_REJECTED` written to work-unit; done-gate reset; retry | Same — Claude reads security-review JSON output, fixes, re-reviews |
+| Event | Both modes |
+| --- | --- |
+| Judge FAIL | Feedback injected into next executor invocation; executor reads feedback, fixes code, re-runs review |
+| BLOCKED (executor reported) | `devbench:blocker-resolver` evaluates; resolution or failure feedback fed to next attempt |
+| Max retries exhausted (`JUDGE_MAX_RETRIES`, default 10) | `devbench set-status <id> blocked` — unit marked BLOCKED in BACKLOG.md |
+| Security FAIL | `SECURITY_FAIL` + `REVIEW_REJECTED` written to work-unit; done-gate reset; retry |

@@ -7,8 +7,13 @@ from unittest.mock import patch
 
 from testing import make_llm_pass_result
 
+from devbench.config_loader import RepoConfig
 from devbench.judges.base import Verdict
 from devbench.judges.test_review import TestReviewJudge
+
+
+def _make_repo_config(local_path: Path) -> RepoConfig:
+    return RepoConfig(name="org/repo", short_name="repo", local_path=local_path)
 
 
 class TestTestReviewInit:
@@ -32,7 +37,7 @@ class TestEvaluate:
         judge = TestReviewJudge()
         with patch.object(judge, "_run_command", return_value=(0, "1 passed", "")):
             with patch.object(judge, "_llm_evaluate", return_value=make_llm_pass_result("test_review")):
-                result = judge.evaluate(wu_file, tmp_path)
+                result = judge.evaluate(wu_file, _make_repo_config(tmp_path))
 
         assert result.verdict is Verdict.PASS
 
@@ -43,7 +48,7 @@ class TestEvaluate:
         judge = TestReviewJudge()
         with patch.object(judge, "_run_command", return_value=(0, "3 passed", "")):
             with patch.object(judge, "_llm_evaluate", return_value=make_llm_pass_result("test_review")) as mock_llm:
-                judge.evaluate(wu_file, tmp_path)
+                judge.evaluate(wu_file, _make_repo_config(tmp_path))
 
         evidence = mock_llm.call_args.kwargs["evidence_sections"]
         assert "Work Unit" in evidence
@@ -134,7 +139,7 @@ class TestEvidenceIncludesDiff:
             patch.object(judge, "_get_diff", return_value="diff --git a/test.py"),
             patch.object(judge, "_llm_evaluate", return_value=make_llm_pass_result("test_review")) as mock_llm,
         ):
-            judge.evaluate(wu_file, tmp_path)
+            judge.evaluate(wu_file, _make_repo_config(tmp_path))
 
         evidence = mock_llm.call_args.kwargs["evidence_sections"]
         assert "Git Diff" in evidence, "Expected Git Diff in evidence sections"
@@ -151,7 +156,7 @@ class TestEvidenceIncludesDiff:
             patch.object(judge, "_get_diff", return_value="   "),
             patch.object(judge, "_llm_evaluate", return_value=make_llm_pass_result("test_review")) as mock_llm,
         ):
-            judge.evaluate(wu_file, tmp_path)
+            judge.evaluate(wu_file, _make_repo_config(tmp_path))
 
         evidence = mock_llm.call_args.kwargs["evidence_sections"]
         assert "Git Diff" not in evidence, "Empty diff should not appear in evidence"
@@ -167,7 +172,7 @@ class TestEvidenceIncludesDiff:
             patch.object(judge, "_get_diff", return_value=""),
             patch.object(judge, "_llm_evaluate", return_value=make_llm_pass_result("test_review")) as mock_llm,
         ):
-            judge.evaluate(wu_file, tmp_path)
+            judge.evaluate(wu_file, _make_repo_config(tmp_path))
 
         evidence = mock_llm.call_args.kwargs["evidence_sections"]
         assert "[REVIEW_FAIL]" not in evidence["Work Unit"], (

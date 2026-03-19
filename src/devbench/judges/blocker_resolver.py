@@ -6,6 +6,7 @@ LLM, which evaluates blocker severity and suggests resolution strategies.
 
 from pathlib import Path
 
+from devbench.config_loader import RepoConfig
 from devbench.judges.base import BaseJudge, JudgeResult, Verdict
 from devbench.prompts import load_prompt
 
@@ -18,7 +19,7 @@ class BlockerResolverJudge(BaseJudge):
     def __init__(self) -> None:
         super().__init__("blocker_resolver")
 
-    def evaluate(self, work_unit_path: Path, repo_path: Path, **kwargs: object) -> JudgeResult:
+    def evaluate(self, work_unit_path: Path, repo_config: RepoConfig, **kwargs: object) -> JudgeResult:
         """Evaluate blockers by delegating to the LLM."""
         work_unit_content = self._read_work_unit(work_unit_path)
 
@@ -37,5 +38,5 @@ class BlockerResolverJudge(BaseJudge):
             evidence_sections={
                 "Work Unit": work_unit_content,
             },
-            cwd=repo_path,
+            cwd=repo_config.local_path,
         )

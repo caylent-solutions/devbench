@@ -42,7 +42,7 @@ class TestEvaluate:
 
     def test_returns_pass(self, tmp_path: Path) -> None:
         judge = GitOpsJudge()
-        result = judge.evaluate(tmp_path / "wu.md", tmp_path)
+        result = judge.evaluate(tmp_path / "wu.md", _make_repo_config(local_path=tmp_path))
         assert result.verdict is Verdict.PASS
         assert "no-op" in result.reasoning
 

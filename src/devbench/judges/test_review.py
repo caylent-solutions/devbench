@@ -12,6 +12,7 @@ from devbench.config import (
     LLM_FILE_PREVIEW_CHARS,
     TEST_TIMEOUT,
 )
+from devbench.config_loader import RepoConfig
 from devbench.judges.base import BaseJudge, JudgeResult
 from devbench.prompts import load_prompt
 
@@ -24,15 +25,14 @@ class TestReviewJudge(BaseJudge):
     def __init__(self) -> None:
         super().__init__("test_review")
 
-    def evaluate(self, work_unit_path: Path, repo_path: Path, **kwargs: object) -> JudgeResult:
+    def evaluate(self, work_unit_path: Path, repo_config: RepoConfig, **kwargs: object) -> JudgeResult:
         """Evaluate test quality by gathering evidence and delegating to the LLM."""
-        repo: str = str(kwargs.get("repo", ""))
         work_unit_content = self._read_work_unit(work_unit_path)
 
         # Gather evidence
-        diff = self._get_diff(repo_path, repo=repo)
-        test_output = self._run_tests(repo_path)
-        test_files_content = self._collect_test_files(repo_path, repo=repo)
+        diff = self._get_diff(repo_config.local_path, repo=repo_config.name)
+        test_output = self._run_tests(repo_config.local_path)
+        test_files_content = self._collect_test_files(repo_config.local_path, repo=repo_config.name)
 
         evidence_sections: dict[str, str] = {
             "Work Unit": work_unit_content,
@@ -47,7 +47,7 @@ class TestReviewJudge(BaseJudge):
         return self._llm_evaluate(
             system_prompt=_TEST_REVIEW_SYSTEM_PROMPT,
             evidence_sections=evidence_sections,
-            cwd=repo_path,
+            cwd=repo_config.local_path,
         )
 
     def _run_tests(self, repo_path: Path) -> str:

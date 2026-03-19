@@ -7,6 +7,7 @@ and prohibited-pattern detection.
 
 from pathlib import Path
 
+from devbench.config_loader import RepoConfig
 from devbench.judges.base import BaseJudge, JudgeResult, Verdict
 from devbench.prompts import load_prompt
 
@@ -19,11 +20,10 @@ class CodeReviewJudge(BaseJudge):
     def __init__(self) -> None:
         super().__init__("code_review")
 
-    def evaluate(self, work_unit_path: Path, repo_path: Path, **kwargs: object) -> JudgeResult:
+    def evaluate(self, work_unit_path: Path, repo_config: RepoConfig, **kwargs: object) -> JudgeResult:
         """Evaluate code changes by gathering evidence and delegating to the LLM."""
-        repo: str = str(kwargs.get("repo", ""))
         work_unit_content = self._read_work_unit(work_unit_path)
-        diff = self._get_diff(repo_path, repo=repo)
+        diff = self._get_diff(repo_config.local_path, repo=repo_config.name)
 
         if not diff.strip():
             return JudgeResult(
@@ -40,7 +40,7 @@ class CodeReviewJudge(BaseJudge):
                 "Work Unit": work_unit_content,
                 "Git Diff": diff,
             },
-            cwd=repo_path,
+            cwd=repo_config.local_path,
         )
 
 

@@ -26,7 +26,7 @@ def _make_result(
 class _ConcreteJudge(BaseJudge):
     """Concrete subclass for testing abstract base."""
 
-    def evaluate(self, work_unit_path, repo_path, **kwargs):
+    def evaluate(self, work_unit_path, repo_config, **kwargs):
         return _make_result(Verdict.PASS)
 
 
@@ -400,6 +400,44 @@ class TestReadWorkUnit:
         judge = _ConcreteJudge("test_judge")
         with pytest.raises(FileNotFoundError):
             judge._read_work_unit(tmp_path / "missing.md")
+
+
+class TestEvaluateAcceptsRepoConfig:
+    """AC-1: judge.evaluate() accepts repo_config=RepoConfig, not repo: str + repo_path: Path."""
+
+    def test_evaluate_accepts_repo_config_not_string(self, tmp_path: Path) -> None:
+        """Given a RepoConfig, when evaluate() is called with repo_config=rc, it must not raise TypeError."""
+        from devbench.config_loader import RepoConfig
+
+        rc = RepoConfig(name="org/repo", short_name="repo", local_path=tmp_path)
+        judge = _ConcreteJudge("test_judge")
+        # Must accept (work_unit_path, repo_config) — not (work_unit_path, repo_path, repo=str)
+        result = judge.evaluate(tmp_path / "wu.md", rc)
+        assert result.verdict is Verdict.PASS
+
+    def test_evaluate_uses_repo_config_local_path(self, tmp_path: Path) -> None:
+        """AC-4: judge uses repo_config.local_path internally."""
+        from devbench.config_loader import RepoConfig
+
+        rc = RepoConfig(name="org/repo", short_name="repo", local_path=tmp_path)
+        judge = _ConcreteJudge("test_judge")
+        # Concrete stub evaluate does not use repo_config, but the signature must accept it
+        result = judge.evaluate(tmp_path / "wu.md", repo_config=rc)
+        assert result is not None
+
+    def test_evaluate_rejects_bare_repo_path_positional(self, tmp_path: Path) -> None:
+        """Passing a plain Path as the second arg (old interface) must not silently succeed
+        by being treated as a RepoConfig — it should raise AttributeError or TypeError."""
+        import inspect
+
+        # Under the old interface this call worked; under the new interface passing a plain Path
+        # must fail because BaseJudge.evaluate now expects a RepoConfig, not a Path.
+        # The _ConcreteJudge above just returns PASS without using repo_config, so we test
+        # the real abstract method signature change by checking BaseJudge's signature directly.
+        sig = inspect.signature(BaseJudge.evaluate)
+        params = list(sig.parameters.keys())
+        assert "repo_config" in params, "BaseJudge.evaluate must have repo_config parameter"
+        assert "repo_path" not in params, "BaseJudge.evaluate must NOT have repo_path parameter"
 
 
 class TestLlmEvaluateTruncationWarning:

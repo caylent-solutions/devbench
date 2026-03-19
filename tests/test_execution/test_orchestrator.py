@@ -83,6 +83,7 @@ class TestRunReviewJudges:
         from devbench.execution.orchestrator import run_review_judges
 
         unit = _make_unit(tmp_path)
+        repo_config = _make_repo_config(tmp_path)
         mock_judge = MagicMock()
         mock_judge.name = "mock"
         mock_judge.evaluate.return_value = _pass_result("mock")
@@ -91,7 +92,7 @@ class TestRunReviewJudges:
             with patch(f"{_ORC}.TestReviewJudge", return_value=mock_judge):
                 with patch(f"{_ORC}.DocReviewJudge", return_value=mock_judge):
                     with patch(f"{_ORC}.ChangesManifestJudge", return_value=mock_judge):
-                        results = run_review_judges(unit, tmp_path, unit.repo)
+                        results = run_review_judges(unit, repo_config)
 
         assert len(results) == 4
         assert all(r.verdict == Verdict.PASS for _, r in results)
@@ -100,6 +101,7 @@ class TestRunReviewJudges:
         from devbench.execution.orchestrator import run_review_judges
 
         unit = _make_unit(tmp_path)
+        repo_config = _make_repo_config(tmp_path)
         mock_judge = MagicMock()
         mock_judge.name = "failing_judge"
         mock_judge.evaluate.return_value = _fail_result("failing_judge")
@@ -108,12 +110,24 @@ class TestRunReviewJudges:
             with patch(f"{_ORC}.TestReviewJudge", return_value=mock_judge):
                 with patch(f"{_ORC}.DocReviewJudge", return_value=mock_judge):
                     with patch(f"{_ORC}.ChangesManifestJudge", return_value=mock_judge):
-                        results = run_review_judges(unit, tmp_path, unit.repo)
+                        results = run_review_judges(unit, repo_config)
 
         assert all(r.verdict == Verdict.FAIL for _, r in results)
         # Comments should have been logged to file
         content = unit.file_path.read_text()
         assert "REVIEW_FAIL" in content
+
+    def test_run_review_judges_accepts_repo_config(self, tmp_path: Path) -> None:
+        """AC-2: run_review_judges(work_unit, repo_config) — repo_config is a RepoConfig."""
+        import inspect
+
+        from devbench.execution.orchestrator import run_review_judges
+
+        sig = inspect.signature(run_review_judges)
+        params = list(sig.parameters.keys())
+        assert "repo_config" in params, "run_review_judges must have repo_config parameter"
+        assert "repo_path" not in params, "run_review_judges must NOT have repo_path parameter"
+        assert "repo" not in params, "run_review_judges must NOT have repo parameter"
 
 
 class TestProcessWorkUnit:
@@ -454,8 +468,8 @@ class TestProcessWorkUnit:
 
         assert result is True
 
-    def test_security_judge_called_with_repo_kwarg(self, tmp_path: Path) -> None:
-        """AC-3: security_judge.evaluate() receives repo=work_unit.repo as a kwarg."""
+    def test_security_judge_called_with_repo_config(self, tmp_path: Path) -> None:
+        """AC-3: security_judge.evaluate() receives repo_config=RepoConfig (not repo: str)."""
         from devbench.execution.orchestrator import process_work_unit
 
         unit = _make_unit(tmp_path)
@@ -472,7 +486,9 @@ class TestProcessWorkUnit:
         mock_git_ops.create_pr.return_value = "https://github.com/org/repo/pull/1"
         mock_git_ops.wait_for_checks.return_value = True
 
-        with patch(f"{_ORC}.resolve_repo", return_value=_make_repo_config(tmp_path)):
+        expected_repo_config = _make_repo_config(tmp_path)
+
+        with patch(f"{_ORC}.resolve_repo", return_value=expected_repo_config):
             with patch(f"{_ORC}.claude_executor") as mock_exec:
                 mock_exec.execute.return_value = exec_result
                 with patch(f"{_ORC}.CodeReviewJudge", return_value=mock_review_judge):
@@ -488,8 +504,7 @@ class TestProcessWorkUnit:
 
         mock_security.evaluate.assert_called_once_with(
             work_unit_path=unit.file_path,
-            repo_path=tmp_path,
-            repo="caylent-solutions/git-repo",
+            repo_config=expected_repo_config,
         )
 
     def test_handles_security_review_failure(self, tmp_path: Path) -> None:

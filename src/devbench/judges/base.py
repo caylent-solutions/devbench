@@ -23,7 +23,7 @@ from devbench.config import (
     USE_BEDROCK,
     get_anthropic_api_key,
 )
-from devbench.config_loader import get_configured_default_branch
+from devbench.config_loader import RepoConfig, get_configured_default_branch
 from devbench.constants import ERROR_OUTPUT_PREVIEW_CHARS, LLM_RESPONSE_FORMAT_INSTRUCTIONS, RAW_RESPONSE_PREVIEW_CHARS
 from devbench.utils.process import run_command as _run_command_util
 
@@ -60,7 +60,7 @@ class BaseJudge(abc.ABC):
         self.previous_feedback: str = ""
 
     @abc.abstractmethod
-    def evaluate(self, work_unit_path: Path, repo_path: Path, **kwargs: object) -> JudgeResult:
+    def evaluate(self, work_unit_path: Path, repo_config: RepoConfig, **kwargs: object) -> JudgeResult:
         """Evaluate a work unit. Returns JudgeResult with verdict and reasoning."""
         ...
 

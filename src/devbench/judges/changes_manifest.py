@@ -7,6 +7,7 @@ section in the work unit.
 
 from pathlib import Path
 
+from devbench.config_loader import RepoConfig
 from devbench.judges.base import BaseJudge, JudgeResult
 from devbench.prompts import load_prompt
 
@@ -19,12 +20,11 @@ class ChangesManifestJudge(BaseJudge):
     def __init__(self) -> None:
         super().__init__("changes_manifest")
 
-    def evaluate(self, work_unit_path: Path, repo_path: Path, **kwargs: object) -> JudgeResult:
+    def evaluate(self, work_unit_path: Path, repo_config: RepoConfig, **kwargs: object) -> JudgeResult:
         """Evaluate change scope by gathering evidence and delegating to the LLM."""
-        repo: str = str(kwargs.get("repo", ""))
         work_unit_content = self._read_work_unit(work_unit_path)
-        diff_summary = self._get_diff_summary(repo_path, repo=repo)
-        changed_files = self._get_changed_files(repo_path, repo=repo)
+        diff_summary = self._get_diff_summary(repo_config.local_path, repo=repo_config.name)
+        changed_files = self._get_changed_files(repo_config.local_path, repo=repo_config.name)
 
         return self._llm_evaluate(
             system_prompt=_CHANGES_MANIFEST_SYSTEM_PROMPT,
@@ -33,7 +33,7 @@ class ChangesManifestJudge(BaseJudge):
                 "Git Diff Summary": diff_summary,
                 "Changed Files": "\n".join(changed_files),
             },
-            cwd=repo_path,
+            cwd=repo_config.local_path,
         )
 
     def _collect_files(self, repo_path: Path, cmd: list[str]) -> set[str]:

@@ -8,8 +8,13 @@ from unittest.mock import patch
 
 from testing import make_llm_fail_result, make_llm_pass_result
 
+from devbench.config_loader import RepoConfig
 from devbench.judges.base import Verdict
 from devbench.judges.changes_manifest import ChangesManifestJudge
+
+
+def _make_repo_config(local_path: Path) -> RepoConfig:
+    return RepoConfig(name="org/repo", short_name="repo", local_path=local_path)
 
 
 class TestChangesManifestJudgeInit:
@@ -34,7 +39,7 @@ class TestEvaluate:
         subprocess.run(["git", "commit", "-m", "Match"], cwd=tmp_repo_dir, capture_output=True, check=True)
 
         judge = ChangesManifestJudge()
-        result = judge.evaluate(work_unit_path=tmp_work_unit_file, repo_path=tmp_repo_dir)
+        result = judge.evaluate(work_unit_path=tmp_work_unit_file, repo_config=_make_repo_config(tmp_repo_dir))
         assert result.verdict is Verdict.PASS
 
     def test_fails_when_llm_fails(self, tmp_work_unit_file: Path, tmp_repo_dir: Path) -> None:
@@ -47,7 +52,7 @@ class TestEvaluate:
 
         judge = ChangesManifestJudge()
         with patch.object(judge, "_llm_evaluate", return_value=make_llm_fail_result("changes_manifest")):
-            result = judge.evaluate(work_unit_path=tmp_work_unit_file, repo_path=tmp_repo_dir)
+            result = judge.evaluate(work_unit_path=tmp_work_unit_file, repo_config=_make_repo_config(tmp_repo_dir))
 
         assert result.verdict is Verdict.FAIL
 
@@ -60,7 +65,7 @@ class TestEvaluate:
 
         judge = ChangesManifestJudge()
         with patch.object(judge, "_llm_evaluate", return_value=make_llm_pass_result("changes_manifest")) as mock_llm:
-            judge.evaluate(work_unit_path=tmp_work_unit_file, repo_path=tmp_repo_dir)
+            judge.evaluate(work_unit_path=tmp_work_unit_file, repo_config=_make_repo_config(tmp_repo_dir))
 
         evidence = mock_llm.call_args.kwargs["evidence_sections"]
         assert "Work Unit" in evidence

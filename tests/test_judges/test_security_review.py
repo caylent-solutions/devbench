@@ -9,8 +9,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 from testing import make_llm_pass_result
 
+from devbench.config_loader import RepoConfig
 from devbench.judges.base import Verdict
 from devbench.judges.security_review import SecurityReviewJudge
+
+
+def _make_repo_config(local_path: Path, name: str = "caylent-solutions/git-repo") -> RepoConfig:
+    return RepoConfig(name=name, short_name=name.rsplit("/", maxsplit=1)[-1], local_path=local_path)
 
 
 class TestSecurityReviewInit:
@@ -24,19 +29,12 @@ class TestSecurityReviewInit:
 class TestEvaluate:
     """Test evaluate delegates to LLM with security evidence."""
 
-    def test_requires_repo_kwarg(self, tmp_path: Path) -> None:
-        judge = SecurityReviewJudge()
-        wu_file = tmp_path / "wu.md"
-        wu_file.write_text("# Task\n")
-        with pytest.raises(ValueError, match="requires 'repo'"):
-            judge.evaluate(wu_file, tmp_path)
-
     def test_validates_repo_allowlist(self, tmp_path: Path) -> None:
         judge = SecurityReviewJudge()
         wu_file = tmp_path / "wu.md"
         wu_file.write_text("# Task\n")
         with pytest.raises(ValueError, match="not allowed"):
-            judge.evaluate(wu_file, tmp_path, repo="caylent-solutions/nonexistent-test-repo")
+            judge.evaluate(wu_file, _make_repo_config(tmp_path, "caylent-solutions/nonexistent-test-repo"))
 
     def test_passes_when_llm_passes(self, tmp_path: Path) -> None:
         wu_file = tmp_path / "wu.md"
@@ -47,7 +45,7 @@ class TestEvaluate:
             with patch("devbench.judges.security_review.get_gh_token", return_value="test-token"):
                 with patch.object(judge, "_llm_evaluate", return_value=make_llm_pass_result("security_review")):
                     with patch.object(judge, "_get_diff", return_value=""):
-                        result = judge.evaluate(wu_file, tmp_path, repo="caylent-solutions/git-repo")
+                        result = judge.evaluate(wu_file, _make_repo_config(tmp_path))
 
         assert result.verdict is Verdict.PASS
 
@@ -61,7 +59,7 @@ class TestEvaluate:
             with patch("devbench.judges.security_review.get_gh_token", return_value="tok"):
                 with patch.object(judge, "_llm_evaluate", return_value=llm_pass) as mock_llm:
                     with patch.object(judge, "_get_diff", return_value=""):
-                        judge.evaluate(wu_file, tmp_path, repo="caylent-solutions/git-repo")
+                        judge.evaluate(wu_file, _make_repo_config(tmp_path))
 
         evidence = mock_llm.call_args.kwargs["evidence_sections"]
         assert "Work Unit" in evidence

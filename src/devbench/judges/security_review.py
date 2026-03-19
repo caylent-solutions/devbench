@@ -11,6 +11,7 @@ import subprocess
 from pathlib import Path
 
 from devbench.config import ALERT_SUMMARY_LIMIT, SECURITY_FETCH_TIMEOUT, get_gh_token, validate_repo
+from devbench.config_loader import RepoConfig
 from devbench.constants import SECURITY_ALERT_CATEGORIES
 from devbench.judges.base import BaseJudge, JudgeResult
 from devbench.prompts import load_prompt
@@ -24,20 +25,16 @@ class SecurityReviewJudge(BaseJudge):
     def __init__(self) -> None:
         super().__init__("security_review")
 
-    def evaluate(self, work_unit_path: Path, repo_path: Path, **kwargs: object) -> JudgeResult:
+    def evaluate(self, work_unit_path: Path, repo_config: RepoConfig, **kwargs: object) -> JudgeResult:
         """Evaluate security by gathering alerts and delegating to the LLM."""
-        repo: str = str(kwargs.get("repo", ""))
-        if not repo:
-            raise ValueError("SecurityReviewJudge requires 'repo' keyword argument (e.g. 'owner/name').")
-
-        validate_repo(repo)
+        validate_repo(repo_config)
 
         work_unit_content = self._read_work_unit(work_unit_path)
         token = get_gh_token()
 
         # Gather security alert evidence
-        alert_details = self._gather_alert_evidence(repo, token, repo_path)
-        diff = self._get_diff(repo_path, repo=repo)
+        alert_details = self._gather_alert_evidence(repo_config.name, token, repo_config.local_path)
+        diff = self._get_diff(repo_config.local_path, repo=repo_config.name)
 
         evidence_sections: dict[str, str] = {
             "Work Unit": work_unit_content,
@@ -50,7 +47,7 @@ class SecurityReviewJudge(BaseJudge):
         return self._llm_evaluate(
             system_prompt=_SECURITY_REVIEW_SYSTEM_PROMPT,
             evidence_sections=evidence_sections,
-            cwd=repo_path,
+            cwd=repo_config.local_path,
         )
 
     def _gather_alert_evidence(self, repo: str, token: str, repo_path: Path) -> str:

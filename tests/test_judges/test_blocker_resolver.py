@@ -7,8 +7,13 @@ from unittest.mock import patch
 
 from testing import make_llm_pass_result
 
+from devbench.config_loader import RepoConfig
 from devbench.judges.base import Verdict
 from devbench.judges.blocker_resolver import BlockerResolverJudge
+
+
+def _make_repo_config(local_path: Path) -> RepoConfig:
+    return RepoConfig(name="org/repo", short_name="repo", local_path=local_path)
 
 
 class TestBlockerResolverInit:
@@ -27,7 +32,7 @@ class TestEvaluate:
         wu_file.write_text("# Task\n\n## Status: In Queue\n\n## Comments\n")
 
         judge = BlockerResolverJudge()
-        result = judge.evaluate(wu_file, tmp_path)
+        result = judge.evaluate(wu_file, _make_repo_config(tmp_path))
         assert result.verdict is Verdict.PASS
         assert "No blockers" in result.reasoning
 
@@ -39,7 +44,7 @@ class TestEvaluate:
 
         judge = BlockerResolverJudge()
         with patch.object(judge, "_llm_evaluate", return_value=make_llm_pass_result("blocker_resolver")):
-            result = judge.evaluate(wu_file, tmp_path)
+            result = judge.evaluate(wu_file, _make_repo_config(tmp_path))
         assert result.verdict is Verdict.PASS
 
     def test_sends_work_unit_to_llm(self, tmp_path: Path) -> None:
@@ -50,7 +55,7 @@ class TestEvaluate:
 
         judge = BlockerResolverJudge()
         with patch.object(judge, "_llm_evaluate", return_value=make_llm_pass_result("blocker_resolver")) as mock_llm:
-            judge.evaluate(wu_file, tmp_path)
+            judge.evaluate(wu_file, _make_repo_config(tmp_path))
 
         evidence = mock_llm.call_args.kwargs["evidence_sections"]
         assert "Work Unit" in evidence

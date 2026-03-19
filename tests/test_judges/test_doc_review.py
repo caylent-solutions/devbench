@@ -7,8 +7,13 @@ from unittest.mock import patch
 
 from testing import make_llm_pass_result
 
+from devbench.config_loader import RepoConfig
 from devbench.judges.base import Verdict
 from devbench.judges.doc_review import DocReviewJudge
+
+
+def _make_repo_config(local_path: Path) -> RepoConfig:
+    return RepoConfig(name="org/repo", short_name="repo", local_path=local_path)
 
 
 class TestDocReviewInit:
@@ -29,7 +34,7 @@ class TestEvaluate:
 
         with patch.object(judge, "_get_default_branch", return_value="origin/main"):
             with patch.object(judge, "_llm_evaluate", return_value=make_llm_pass_result("doc_review")):
-                result = judge.evaluate(wu_file, tmp_path)
+                result = judge.evaluate(wu_file, _make_repo_config(tmp_path))
 
         assert result.verdict is Verdict.PASS
 
@@ -40,7 +45,7 @@ class TestEvaluate:
 
         with patch.object(judge, "_llm_evaluate", return_value=make_llm_pass_result("doc_review")) as mock_llm:
             with patch.object(judge, "_get_diff", return_value="diff content"):
-                judge.evaluate(wu_file, tmp_path)
+                judge.evaluate(wu_file, _make_repo_config(tmp_path))
 
         evidence = mock_llm.call_args.kwargs["evidence_sections"]
         assert "Work Unit" in evidence

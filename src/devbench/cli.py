@@ -317,7 +317,6 @@ def cmd_review(unit_id: str) -> int:
 
     repo_config = resolve_repo(target.repo)
     validate_repo(repo_config)
-    repo_path = repo_config.local_path
 
     wu_file = BACKLOG_ROOT / target.file_path if not target.file_path.is_absolute() else target.file_path
     if not wu_file.exists():
@@ -346,7 +345,7 @@ def cmd_review(unit_id: str) -> int:
     for judge in judges:
         judge.previous_feedback = prior_feedback.get(judge.name, "")
         logger.info("Running %s judge on %s", judge.name, unit_id)
-        judge_result = judge.evaluate(work_unit_path=wu_file, repo_path=repo_path, repo=repo_config.name)
+        judge_result = judge.evaluate(work_unit_path=wu_file, repo_config=repo_config)
         passed = judge_result.verdict == Verdict.PASS
         if not passed:
             all_passed = False
@@ -421,7 +420,6 @@ def cmd_security_review(unit_id: str) -> int:
 
     repo_config = resolve_repo(target.repo)
     validate_repo(repo_config)
-    repo_path = repo_config.local_path
 
     wu_file = BACKLOG_ROOT / target.file_path if not target.file_path.is_absolute() else target.file_path
     if not wu_file.exists():
@@ -429,7 +427,7 @@ def cmd_security_review(unit_id: str) -> int:
 
     judge = SecurityReviewJudge()
     logger.info("Running security_review judge on %s", unit_id)
-    result = judge.evaluate(work_unit_path=wu_file, repo_path=repo_path, repo=repo_config.name)
+    result = judge.evaluate(work_unit_path=wu_file, repo_config=repo_config)
     logger.info("security_review verdict for %s: %s", unit_id, result.verdict.value)
     if result.verdict != Verdict.PASS:
         logger.info("security_review feedback for %s: %s", unit_id, result.feedback[:500])

@@ -74,7 +74,7 @@ class GitOpsJudge(BaseJudge):
     def __init__(self) -> None:
         super().__init__("git_ops")
 
-    def evaluate(self, work_unit_path: Path, repo_path: Path, **kwargs: object) -> JudgeResult:
+    def evaluate(self, work_unit_path: Path, repo_config: RepoConfig, **kwargs: object) -> JudgeResult:
         """Not used directly; GitOpsJudge exposes individual operation methods.
 
         Returns a PASS result as a no-op when called via the evaluate interface.

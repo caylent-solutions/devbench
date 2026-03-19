@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from testing import make_llm_pass_result
 
+from devbench.config_loader import RepoConfig
 from devbench.github.git_ops import GitOpsJudge
 from devbench.judges.base import JudgeResult, Verdict
 from devbench.judges.blocker_resolver import BlockerResolverJudge
@@ -69,6 +70,16 @@ def _make_wu_file(tmp_path: Path, unit_id: str = "E0-F1-S1-T1") -> Path:
     return wu
 
 
+def _make_repo_config(local_path: Path) -> RepoConfig:
+    """Create a RepoConfig for caylent-solutions/git-repo pointing at local_path."""
+    return RepoConfig(
+        name="caylent-solutions/git-repo",
+        short_name="git-repo",
+        local_path=local_path,
+        default_branch=None,
+    )
+
+
 class TestCodeReviewFunctional:
     """Functional tests for CodeReviewJudge."""
 
@@ -92,7 +103,7 @@ class TestCodeReviewFunctional:
         judge = CodeReviewJudge()
 
         with patch.object(judge, "_llm_evaluate", return_value=make_llm_pass_result("code_review")):
-            result = judge.evaluate(wu, repo)
+            result = judge.evaluate(wu, _make_repo_config(repo))
 
         assert isinstance(result, JudgeResult)
         assert result.judge_name == "code_review"
@@ -123,7 +134,7 @@ class TestCodeReviewFunctional:
             evidence=["config.py contains hardcoded secret"],
         )
         with patch.object(judge, "_llm_evaluate", return_value=fail_result):
-            result = judge.evaluate(wu, repo)
+            result = judge.evaluate(wu, _make_repo_config(repo))
 
         assert result.verdict is Verdict.FAIL
 
@@ -144,7 +155,7 @@ class TestTestReviewFunctional:
 
         with patch.object(judge, "_llm_evaluate", return_value=make_llm_pass_result("test_review")):
             with patch.object(judge, "_run_command", return_value=(0, "1 passed, 0 failed\n", "")):
-                result = judge.evaluate(wu, repo)
+                result = judge.evaluate(wu, _make_repo_config(repo))
 
         assert isinstance(result, JudgeResult)
         assert result.verdict is Verdict.PASS
@@ -171,7 +182,7 @@ class TestDocReviewFunctional:
         judge = DocReviewJudge()
 
         with patch.object(judge, "_llm_evaluate", return_value=make_llm_pass_result("doc_review")):
-            result = judge.evaluate(wu, repo)
+            result = judge.evaluate(wu, _make_repo_config(repo))
 
         assert isinstance(result, JudgeResult)
         assert result.verdict is Verdict.PASS
@@ -200,7 +211,7 @@ class TestChangesManifestFunctional:
         judge = ChangesManifestJudge()
 
         with patch.object(judge, "_llm_evaluate", return_value=make_llm_pass_result("changes_manifest")):
-            result = judge.evaluate(wu, repo)
+            result = judge.evaluate(wu, _make_repo_config(repo))
 
         assert isinstance(result, JudgeResult)
         assert result.verdict is Verdict.PASS
@@ -221,7 +232,7 @@ class TestSecurityReviewFunctional:
             with patch("devbench.judges.security_review.get_gh_token", return_value="tok"):
                 with patch.object(judge, "_llm_evaluate", return_value=make_llm_pass_result("security_review")):
                     with patch.object(judge, "_get_diff", return_value=""):
-                        result = judge.evaluate(wu, repo, repo="caylent-solutions/git-repo")
+                        result = judge.evaluate(wu, _make_repo_config(repo))
 
         assert result.verdict is Verdict.PASS
 
@@ -246,7 +257,7 @@ class TestSecurityReviewFunctional:
             with patch("devbench.judges.security_review.get_gh_token", return_value="tok"):
                 with patch.object(judge, "_llm_evaluate", return_value=fail_result):
                     with patch.object(judge, "_get_diff", return_value=""):
-                        result = judge.evaluate(wu, repo, repo="caylent-solutions/git-repo")
+                        result = judge.evaluate(wu, _make_repo_config(repo))
 
         assert result.verdict is Verdict.FAIL
 
@@ -261,7 +272,7 @@ class TestBlockerResolverFunctional:
 
         wu = _make_wu_file(tmp_path)
         judge = BlockerResolverJudge()
-        result = judge.evaluate(wu, repo)
+        result = judge.evaluate(wu, _make_repo_config(repo))
 
         assert result.verdict is Verdict.PASS
         assert "No blockers" in result.reasoning
@@ -283,7 +294,7 @@ class TestBlockerResolverFunctional:
         judge = BlockerResolverJudge()
 
         with patch.object(judge, "_llm_evaluate", return_value=make_llm_pass_result("blocker_resolver")):
-            result = judge.evaluate(wu, repo)
+            result = judge.evaluate(wu, _make_repo_config(repo))
 
         assert isinstance(result, JudgeResult)
         assert result.verdict is Verdict.PASS
@@ -294,7 +305,7 @@ class TestGitOpsFunctional:
 
     def test_evaluate_returns_pass_noop(self, tmp_path: Path) -> None:
         judge = GitOpsJudge()
-        result = judge.evaluate(tmp_path / "wu.md", tmp_path)
+        result = judge.evaluate(tmp_path / "wu.md", _make_repo_config(tmp_path))
         assert result.verdict is Verdict.PASS
 
     def test_commit_and_push_runs_git(self, tmp_path: Path) -> None:

@@ -5,7 +5,6 @@ runs judge reviews at every gate, and manages the lifecycle.
 """
 
 import logging
-from pathlib import Path
 
 from devbench.backlog.manager import BacklogManager
 from devbench.backlog.parser import BacklogParser
@@ -75,7 +74,7 @@ def _run_executor_and_review(
         )
         blocker_result = blocker_judge.evaluate(
             work_unit_path=work_unit.file_path,
-            repo_path=repo_config.local_path,
+            repo_config=repo_config,
         )
         if blocker_result.verdict == Verdict.FAIL:
             logger.warning(
@@ -91,8 +90,8 @@ def _run_executor_and_review(
         work_unit.log_comment("orchestrator", "AGENT_FAILED", f"Attempt {attempt} failed")
         return f"Previous attempt failed. Output: {result.output[:OUTPUT_TRUNCATION_LIMIT]}"
 
-    # Status is IN_REVIEW — run judges (signature unchanged: repo: str, repo_path: Path)
-    verdicts = run_review_judges(work_unit, repo_config.local_path, repo=repo_config.name)
+    # Status is IN_REVIEW — run judges
+    verdicts = run_review_judges(work_unit, repo_config)
     all_passed = all(v.verdict == Verdict.PASS for _, v in verdicts)
 
     if not all_passed:
@@ -107,8 +106,7 @@ def _run_executor_and_review(
     logger.info("All review judges passed for %s, checking security", work_unit.id)
     security_result = security_judge.evaluate(
         work_unit_path=work_unit.file_path,
-        repo_path=repo_config.local_path,
-        repo=repo_config.name,
+        repo_config=repo_config,
     )
     if security_result.verdict == Verdict.FAIL:
         work_unit.log_comment(
@@ -130,8 +128,7 @@ def _run_executor_and_review(
 
 def run_review_judges(
     work_unit: WorkUnit,
-    repo_path: Path,
-    repo: str,
+    repo_config: RepoConfig,
 ) -> list[tuple[str, JudgeResult]]:
     """Run all review judges on a work unit.
 
@@ -149,8 +146,7 @@ def run_review_judges(
         logger.info("Running %s judge on %s", judge.name, work_unit.id)
         result = judge.evaluate(
             work_unit_path=work_unit.file_path,
-            repo_path=repo_path,
-            repo=repo,
+            repo_config=repo_config,
         )
         results.append((judge.name, result))
         logger.info(

@@ -8,6 +8,7 @@ accuracy, completeness, and sync with code changes.
 from pathlib import Path
 
 from devbench.config import LLM_FILE_CONTEXT_LIMIT, LLM_FILE_PREVIEW_CHARS
+from devbench.config_loader import RepoConfig
 from devbench.judges.base import BaseJudge, JudgeResult
 from devbench.prompts import load_prompt
 
@@ -20,12 +21,11 @@ class DocReviewJudge(BaseJudge):
     def __init__(self) -> None:
         super().__init__("doc_review")
 
-    def evaluate(self, work_unit_path: Path, repo_path: Path, **kwargs: object) -> JudgeResult:
+    def evaluate(self, work_unit_path: Path, repo_config: RepoConfig, **kwargs: object) -> JudgeResult:
         """Evaluate documentation by gathering evidence and delegating to the LLM."""
-        repo: str = str(kwargs.get("repo", ""))
         work_unit_content = self._read_work_unit(work_unit_path)
-        diff = self._get_diff(repo_path, repo=repo)
-        doc_contents = self._collect_doc_files(repo_path)
+        diff = self._get_diff(repo_config.local_path, repo=repo_config.name)
+        doc_contents = self._collect_doc_files(repo_config.local_path)
 
         evidence_sections: dict[str, str] = {
             "Work Unit": work_unit_content,
@@ -38,7 +38,7 @@ class DocReviewJudge(BaseJudge):
         return self._llm_evaluate(
             system_prompt=_DOC_REVIEW_SYSTEM_PROMPT,
             evidence_sections=evidence_sections,
-            cwd=repo_path,
+            cwd=repo_config.local_path,
         )
 
     def _collect_doc_files(self, repo_path: Path) -> str:

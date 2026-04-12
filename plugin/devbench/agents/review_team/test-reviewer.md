@@ -96,6 +96,17 @@ Do NOT fail because files are staged but not yet committed — commit happens in
 41. Check the work unit's Definition of Done and Comments/Agent Log for evidence that the agent ran the full test pipeline through the task runner (not just bare pytest). If the DoD includes "make validate passes" or similar, there must be evidence in the agent log that it was actually executed.
 42. If the work unit creates or modifies test-related task runner targets, verify those targets are tested (e.g., a test that runs make test --dry-run or inspects the Makefile to verify the command).
 
+--- DEPLOYMENT SMOKE TESTS ---
+43. Every work unit that adds or modifies a deployed API endpoint MUST include smoke tests in `tests/smoke/`. Smoke tests run against a live deployed environment via HTTP and are distinct from unit and integration tests.
+44. Required smoke test coverage: a `/health` endpoint check asserting HTTP 200 and correct response body, plus one happy-path request per new endpoint group asserting the correct HTTP status code.
+45. Required smoke test coverage: at least one negative test per new endpoint verifying authentication/authorization rejection (missing or invalid Bearer token returns 401/422).
+46. Smoke tests must read all configuration (`API_BASE_URL`, credentials) exclusively from environment variables — no hardcoded hostnames, ports, or tokens.
+47. The `Makefile` must expose a `test-smoke` target that runs `pytest tests/smoke/ -v`. If `tests/smoke/` does not yet exist and the work unit adds a deployed endpoint, both directory and target are required.
+
+--- INTEGRATION TEST COMPLETENESS ---
+48. Integration tests must use real backing services wherever available in the local Docker Compose stack or CI (DynamoDB Local, MCP containers). Mocking a service that is available locally is a test quality violation.
+49. Where real services are genuinely unavailable in CI, mock-integration tests are acceptable — but the test must document in a comment which real service it approximates and why mock-only is acceptable.
+
 Be strict but fair. Fail for real test quality violations. Do not fail for subjective naming preferences that do not affect test reliability.
 
 --- OUT OF SCOPE FOR FINDINGS ---

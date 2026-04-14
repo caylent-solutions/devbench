@@ -1,0 +1,166 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "DevBench Configuration",
+  "description": "Schema for backlog/config/devbench.yaml",
+  "type": "object",
+  "required": ["repos"],
+  "additionalProperties": false,
+  "properties": {
+    "repos": {
+      "type": "object",
+      "description": "Map of org/repo keys to per-repository configuration.",
+      "minProperties": 1,
+      "patternProperties": {
+        "^[^/]+/[^/]+$": {
+          "type": ["object", "null"],
+          "description": "Per-repository configuration.",
+          "additionalProperties": false,
+          "properties": {
+            "default_branch": {
+              "type": "string",
+              "description": "Default branch for this repo."
+            },
+            "checkout_directory": {
+              "type": "string",
+              "description": "Relative path under JUDGE_WORKSPACE_ROOT for this repo's checkout."
+            },
+            "merge_strategy": {
+              "type": "string",
+              "enum": ["merge", "squash", "rebase"],
+              "description": "Per-repo PR merge strategy override."
+            }
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "merge_strategy": {
+      "type": "string",
+      "enum": ["merge", "squash", "rebase"],
+      "description": "Default PR merge strategy for all repos."
+    },
+    "max_retries": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Maximum number of retry attempts."
+    },
+    "use_bedrock": {
+      "type": "boolean",
+      "description": "Whether to route LLM calls through AWS Bedrock."
+    },
+    "bedrock_region": {
+      "type": "string",
+      "description": "AWS region for Bedrock API calls."
+    },
+    "judge_model": {
+      "type": "string",
+      "description": "Model identifier used by judge agents."
+    },
+    "executor_model": {
+      "type": "string",
+      "description": "Model identifier used by the executor agent."
+    },
+    "allowed_orgs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "List of GitHub organisations permitted for operations."
+    },
+    "timeouts": {
+      "type": "object",
+      "description": "Timeout values in seconds.",
+      "additionalProperties": false,
+      "properties": {
+        "gh_api": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "GitHub API call timeout in seconds."
+        },
+        "test": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Test suite run timeout in seconds."
+        },
+        "security_fetch": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Security advisory fetch timeout in seconds."
+        },
+        "llm": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "LLM API call timeout in seconds."
+        },
+        "command": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Shell command execution timeout in seconds."
+        },
+        "executor": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Executor agent overall timeout in seconds."
+        },
+        "executor_max_turns": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum number of turns for the executor agent."
+        },
+        "orchestrator_poll_interval": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Orchestrator polling interval in seconds."
+        },
+        "github_check": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "GitHub check status polling timeout in seconds."
+        }
+      }
+    },
+    "git_ops": {
+      "type": "object",
+      "description": "Git operations workflow settings.",
+      "additionalProperties": false,
+      "properties": {
+        "update_submodule": {
+          "type": "boolean",
+          "description": "When true, update the parent repo's submodule reference after each PR merge. Set to true only when target repos are git submodules of a parent workspace repo."
+        }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "description": "Threshold and limit values.",
+      "additionalProperties": false,
+      "properties": {
+        "alert_summary": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum number of security alert summaries to include."
+        },
+        "output_truncation": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Character limit for command output truncation."
+        },
+        "llm_evidence_truncation": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Character limit for LLM evidence content truncation."
+        },
+        "llm_file_context": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum number of files included in LLM context."
+        },
+        "llm_file_preview_chars": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Character limit for per-file LLM preview."
+        }
+      }
+    }
+  }
+}

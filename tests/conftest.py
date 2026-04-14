@@ -1,21 +1,26 @@
-"""Shared pytest fixtures for the judges test suite."""
+"""Shared pytest fixtures for the devbench test suite."""
 
 from __future__ import annotations
 
 import os
-
-# Redirect log file to /tmp so tests never write to the real orchestrator log.
-# Must be set before any judges modules are imported.
-os.environ["JUDGE_LOG_FILE"] = "/tmp/judges-test-orchestrator.log"
-
 from pathlib import Path
-from unittest.mock import patch
 
+# Set required env vars before any devbench modules are imported.
+# config.py raises RuntimeError at import time if these are unset.
+os.environ.setdefault("JUDGE_CLAUDE_MODEL", "test-model")
+os.environ.setdefault("JUDGE_WORKSPACE_ROOT", "/tmp/test-workspace")
+os.environ.setdefault("JUDGE_LOG_FILE", "/tmp/judges-test-orchestrator.log")
+# Point to the test fixture YAML config so config.py can resolve ALLOWED_REPOS
+# from the YAML repos section (the only supported source).
+os.environ.setdefault(
+    "JUDGE_CONFIG_PATH",
+    str(Path(__file__).parent / "fixtures" / "test_devbench.yaml"),
+)
 import pytest
 
-from judges.judges.base import Verdict
-from judges.testing import make_llm_pass_result
-from judges.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
+from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
+
+_WORKSPACE_ROOT = os.environ.get("JUDGE_WORKSPACE_ROOT", "/tmp/test-workspace")
 
 # ---------------------------------------------------------------------------
 # Work-unit markdown template
@@ -33,7 +38,7 @@ _WORK_UNIT_TEMPLATE = """\
 ## Target Repository
 
 - **Repo:** `{repo}`
-- **Local path:** `/workspaces/general-agent-env/{repo_short}`
+- **Local path:** `{workspace_root}/{repo_short}`
 - **Branch:** `backlog/{unit_id_lower}`
 
 ## Dependencies
@@ -70,6 +75,7 @@ def tmp_work_unit_file(tmp_path: Path) -> Path:
         repo_short="git-repo",
         unit_id_lower="e0-f1-s1-t1",
         dep_rows="| E0-F1-S1 | git-repo Makefile and Targets | Done |",
+        workspace_root=_WORKSPACE_ROOT,
     )
     file_path = tmp_path / "E0-F1-S1-T1.md"
     file_path.write_text(content)
@@ -139,7 +145,7 @@ def tmp_repo_dir(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def mock_backlog_index(tmp_path: Path) -> Path:
-    """Create a temporary BACKLOG.md with sample table rows."""
+    """Create a temporary BACKLOG.md with sample table rows and matching work-unit files."""
     content = """\
 # Backlog
 
@@ -157,6 +163,23 @@ def mock_backlog_index(tmp_path: Path) -> Path:
 """
     index_path = tmp_path / "BACKLOG.md"
     index_path.write_text(content)
+
+    # Create the work-unit files referenced by the index so parse_index can
+    # delegate to parse_work_unit_file for each row.
+    backlog_dir = tmp_path / "backlog"
+    backlog_dir.mkdir(exist_ok=True)
+    _work_units = [
+        ("E0-F1-S1-T1", "Create Makefile", "in-queue", "Task"),
+        ("E0-F1-S1-T2", "Lint Targets", "in-queue", "Task"),
+        ("E0-F1-S1-T3", "Test Targets", "done", "Task"),
+        ("E0-F1-S1", "Story One", "in-queue", "Story"),
+        ("E0-F1", "Feature One", "in-queue", "Feature"),
+    ]
+    for unit_id, title, status, _ in _work_units:
+        (backlog_dir / f"{unit_id}.md").write_text(
+            f"# {unit_id}: {title}\n\n## Status: {status}\n"
+        )
+
     return index_path
 
 
@@ -174,6 +197,7 @@ def sample_work_unit(tmp_path: Path) -> WorkUnit:
             repo_short="git-repo",
             unit_id_lower="e0-f1-s1-t1",
             dep_rows="| E0-F1-S1 | Story One | Done |",
+            workspace_root=_WORKSPACE_ROOT,
         )
     )
     return WorkUnit(
@@ -190,11 +214,9 @@ def sample_work_unit(tmp_path: Path) -> WorkUnit:
 
 
 @pytest.fixture
-def mock_llm_pass():
-    """Context manager fixture that mocks _llm_evaluate to return PASS for any judge."""
-
-    def _mock_llm_evaluate(self, system_prompt, evidence_sections, cwd=None, timeout=None):
-        return make_llm_pass_result(self.name)
-
-    with patch("judges.judges.base.BaseJudge._llm_evaluate", _mock_llm_evaluate):
-        yield
+def backlog_dir(tmp_path: Path) -> Path:
+    """Create and return the backlog subdirectory under tmp_path."""
+    from devbench.constants import BACKLOG_SUBDIR
+    d = tmp_path / BACKLOG_SUBDIR
+    d.mkdir()
+    return d

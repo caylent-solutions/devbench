@@ -13,11 +13,20 @@
 #   Ctrl+C      — stop (progress saved in BACKLOG.md)
 set -euo pipefail
 
+# Required environment variable guard
+required_vars=(JUDGE_CLAUDE_MODEL JUDGE_WORKSPACE_ROOT)
+for var in "${required_vars[@]}"; do
+  if [ -z "${!var:-}" ]; then
+    echo "❌ Required environment variable $var is not set." >&2
+    exit 1
+  fi
+done
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-JUDGES_DIR="$(dirname "$SCRIPT_DIR")"
-WORKSPACE_DIR="$(dirname "$JUDGES_DIR")"
+DEVBENCH_ROOT="$(dirname "$SCRIPT_DIR")"
 TOKEN_FILE="/tmp/gh_token_env"
-PROMPT_FILE="$JUDGES_DIR/orchestrator-prompt.md"
+PROMPTS_DIR="${JUDGE_PROMPTS_DIR:-$DEVBENCH_ROOT/prompts}"
+PROMPT_FILE="$PROMPTS_DIR/orchestrator-prompt.md"
 
 # Source cached token if available (persists across terminals)
 if [[ -z "${GH_TOKEN:-}" && -f "$TOKEN_FILE" ]]; then
@@ -25,9 +34,7 @@ if [[ -z "${GH_TOKEN:-}" && -f "$TOKEN_FILE" ]]; then
     source "$TOKEN_FILE"
 fi
 
-# Restrict GitHub operations to this org. Unset to allow any org in allow-list.
-export JUDGE_GH_ORG="${JUDGE_GH_ORG:-caylent-solutions}"
-# Scopes are minimized to only what's needed for caylent-solutions repos.
+# Scopes are minimized to only what's needed.
 # Notably admin:org and admin:enterprise are excluded to prevent accidental
 # access to other organizations the user's account may belong to.
 GH_SCOPES=(
@@ -101,18 +108,12 @@ echo ""
 echo "---"
 echo ""
 
-cd "$WORKSPACE_DIR"
+cd "$JUDGE_WORKSPACE_ROOT"
 
 echo "Working directory: $(pwd)"
 echo "Prompt file: $PROMPT_FILE ($(wc -c < "$PROMPT_FILE") bytes)"
 echo "Launching claude..."
 echo ""
-
-if [[ -z "${JUDGE_CLAUDE_MODEL:-}" ]]; then
-    echo "ERROR: JUDGE_CLAUDE_MODEL environment variable is not set."
-    echo "Set it to a valid model identifier (e.g. us.anthropic.claude-sonnet-4-6-v1)."
-    exit 1
-fi
 
 exec claude \
     --dangerously-skip-permissions \

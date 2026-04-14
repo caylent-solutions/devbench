@@ -3,16 +3,24 @@
 # Usage: ./scripts/start.sh
 #
 # 1. Authenticates with GitHub (opens browser if needed)
-# 2. Writes token to /tmp/gh_token_env
+# 2. Writes token to ~/.gh_token_env
 # 3. Starts a background token refresher (every 4h)
 # 4. Launches the orchestrator in the background
 set -euo pipefail
 
+# Required environment variable guard
+required_vars=(JUDGE_CLAUDE_MODEL JUDGE_WORKSPACE_ROOT)
+for var in "${required_vars[@]}"; do
+  if [ -z "${!var:-}" ]; then
+    echo "❌ Required environment variable $var is not set." >&2
+    exit 1
+  fi
+done
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-JUDGES_DIR="$(dirname "$SCRIPT_DIR")"
-WORKSPACE_DIR="$(dirname "$JUDGES_DIR")"
+DEVBENCH_ROOT="$(dirname "$SCRIPT_DIR")"
 LOG_FILE="${JUDGE_LOG_FILE:-/tmp/backlog-run.log}"
-TOKEN_FILE="/tmp/gh_token_env"
+TOKEN_FILE="${JUDGE_GH_TOKEN_FILE:-${HOME}/.gh_token_env}"
 
 # Source cached token if available (persists across terminals)
 if [[ -z "${GH_TOKEN:-}" && -f "$TOKEN_FILE" ]]; then
@@ -20,9 +28,7 @@ if [[ -z "${GH_TOKEN:-}" && -f "$TOKEN_FILE" ]]; then
     source "$TOKEN_FILE"
 fi
 
-# Restrict GitHub operations to this org. Unset to allow any org in allow-list.
-export JUDGE_GH_ORG="${JUDGE_GH_ORG:-caylent-solutions}"
-# Scopes are minimized to only what's needed for caylent-solutions repos.
+# Scopes are minimized to only what's needed.
 # Notably admin:org and admin:enterprise are excluded to prevent accidental
 # access to other organizations the user's account may belong to.
 GH_SCOPES=(
@@ -69,7 +75,7 @@ while true; do
     unset GH_TOKEN
     gh auth refresh -h github.com ${scope_flags[*]} 2>/dev/null || true
     echo \"export GH_TOKEN=\\\"\$(gh auth token)\\\"\" > $TOKEN_FILE
-    echo \"[\$(date -u +%Y-%m-%dT%H:%M:%SZ)] token refreshed\" >> /tmp/gh_token_refresh.log
+    echo \"[\$(date -u +%Y-%m-%dT%H:%M:%SZ)] token refreshed\" >> ${JUDGE_LOG_FILE:-/tmp/backlog-run.log}.token-refresh
 done
 " >/dev/null 2>&1 &
 REFRESHER_PID=$!
@@ -79,8 +85,8 @@ echo ""
 echo "=== Step 5: Launching backlog orchestrator ==="
 nohup bash -c "
 source $TOKEN_FILE
-cd $WORKSPACE_DIR
-python3 -m judges.orchestrator
+cd $DEVBENCH_ROOT
+uv run python -m devbench.execution.orchestrator
 " > "$LOG_FILE" 2>&1 &
 ORCHESTRATOR_PID=$!
 echo "Orchestrator PID: $ORCHESTRATOR_PID"
@@ -97,5 +103,5 @@ fi
 echo ""
 echo "=== Running ==="
 echo "Log:    tail -f $LOG_FILE"
-echo "Status: cd $JUDGES_DIR && python3 -m judges.cli status"
+echo "Status: cd $DEVBENCH_ROOT && uv run python -m devbench.cli status"
 echo "Stop:   kill $ORCHESTRATOR_PID $REFRESHER_PID"

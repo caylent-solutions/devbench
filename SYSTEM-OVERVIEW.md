@@ -17,6 +17,7 @@ A Claude Code agent reads work units from a structured backlog, implements each 
 ┌─────────────────────────────────────────────────────────────────┐
 │                    ORCHESTRATOR LOOP                            │
 │                                                                 │
+│  0. Pre-flight: validate backlog integrity — abort on errors    │
 │  1. Find next actionable work unit (deps satisfied)             │
 │  2. Read work unit spec, ACs, and CLAUDE.md standards           │
 │  3. Create feature branch in target repo                        │
@@ -26,7 +27,7 @@ A Claude Code agent reads work units from a structured backlog, implements each 
 │  7. If judges reject → inject prior feedback, fix, resubmit     │
 │  8. If judges approve → commit, push, create PR                 │
 │  9. Wait for GitHub CI checks to pass                           │
-│ 10. Merge PR, update submodule ref, mark done                   │
+│ 10. Merge PR, update submodule ref if enabled, mark done        │
 │ 11. Loop back to step 1                                         │
 │                                                                 │
 │  Human can pause (Escape), give instructions, resume (Continue) │
@@ -122,9 +123,9 @@ Every work unit goes through the complete software development lifecycle.
 
 ### 6. LLM Judge Review
 
-- Agent stages files and runs `judges.cli review <unit-id>`
-- Four independent LLM judges evaluate the work (code_review, test_review, doc_review, changes_manifest), each calling the configured Claude model
-- Each judge gathers its own evidence (diffs, test output, file contents, changed file lists)
+- Agent stages files and invokes the `devbench:review-supervisor` agent
+- The review-supervisor runs four independent judge agents in parallel (code-reviewer, test-reviewer, doc-reviewer, changes-manifest), each calling Claude to make a verdict
+- Each judge agent gathers its own evidence (diffs, test output, file contents, changed file lists) via `devbench` CLI commands (`get-diff`, `run-tests`, `read-unit`)
 - The LLM makes every pass/fail decision — no hardcoded rules
 - Judges verify task runner correctness by reading the config in the diff and checking the agent log
 
@@ -180,77 +181,77 @@ Up to 10 retry attempts before marking the unit as blocked.
 
 ### 11. Merge and Status Update
 
-- Agent merges the PR via `gh pr merge --squash --delete-branch`
-- Updates the parent repo's submodule reference
-- Marks the work unit as Done via `set_status()` — a single code path that updates both the work unit file and BACKLOG.md
-- When all child tasks of a Story/Feature/Epic are Done, the parent is automatically rolled up to Done (cascading upward)
+- Agent merges the PR via `gh pr merge --delete-branch` using the strategy set by `JUDGE_MERGE_STRATEGY` (default: `squash`)
+- Updates the parent repo's submodule reference when `git_ops.update_submodule: true` in the YAML config (opt-in; default `false`; set `true` only when target repos are git submodules of a parent workspace repo)
+- Marks the work unit as Done via `mark_done()` — enforces the done-gate before writing
+- The done-gate verifies all four required review judges (`code_review`, `test_review`, `doc_review`, `changes_manifest`) have a `[REVIEW_PASS]` entry in the most recent round; raises `RuntimeError` otherwise
+- All writes go through the private `_set_status()` workhorse which atomically updates both the work unit file and BACKLOG.md
+- When all child tasks of a Story/Feature/Epic are Done, the parent is automatically rolled up to Done via `_set_status()` (cascading upward; gate bypassed since rollup is structurally correct)
 
 ### 12. Session Recovery
 
 - If the agent session is interrupted, the next session recovers in-progress work
 - Agent detects uncommitted changes on existing branches and continues from where it left off
 
-## Architecture
+## Environment Variables
 
-```
-<workspace>/                                       ← Parent repo (workspace root)
-├── BACKLOG.md                                     ← Master index: all work units with status
-├── CLAUDE.md                                      ← Engineering standards (mandatory for all code)
-├── backlog/                                       ← Work unit specs organized by epic
-│   ├── AGENT-INSTRUCTIONS.md                      ← Master prompt for dev agents
-│   └── E0-repo-tooling/                           ← Epics > Features > Stories > Tasks
-│       └── ...
-├── devbench/                                      ← DevBench subrepo (review authority)
-│   ├── cli.py                                     ← CLI + prior feedback log parsing
-│   ├── orchestrator.py                            ← Autonomous loop (background mode)
-│   ├── orchestrator-prompt.md                     ← Interactive mode prompt
-│   ├── config.py                                  ← Environment-driven configuration
-│   ├── constants.py                               ← Structural constants (regex, formats)
-│   ├── report.py                                  ← Session progress report (velocity, ETA)
-│   ├── testing.py                                 ← Shared test utilities and fixtures
-│   ├── judges/                                    ← Judge implementations
-│   │   ├── base.py                                ← BaseJudge: LLM calls, prior feedback injection,
-│   │   │                                             evidence truncation with markers
-│   │   ├── code_review.py                         ← Git diff → LLM verdict
-│   │   ├── test_review.py                         ← make test / pytest → LLM verdict
-│   │   ├── doc_review.py                          ← Doc diff → LLM verdict
-│   │   ├── changes_manifest.py                    ← Changed files vs. manifest → LLM verdict
-│   │   ├── security_review.py                     ← GitHub alerts + diff → LLM verdict
-│   │   ├── blocker_resolver.py                    ← Dependency and blocker assessment
-│   │   ├── git_ops.py                             ← Commit, push, PR, merge, CI checks
-│   │   └── backlog_manager.py                     ← Status sync, rollup, traceability
-│   ├── prompts/                                   ← LLM system prompts (one per judge)
-│   ├── tests/                                     ← ~310 tests
-│   ├── requirements.txt                           ← Runtime dependencies (anthropic)
-│   └── requirements-dev.txt                       ← Dev dependencies (pytest, ruff, bandit, mypy)
-└── <repo-submodules>/                             ← Target repos as git submodules
-```
+All configuration is via environment variables. Required variables raise `RuntimeError` at startup if unset.
 
-## LLM Provider Support
+### Required
 
-DevBench supports two LLM backends for judge evaluation:
+| Variable | Description |
+|----------|-------------|
+| `JUDGE_WORKSPACE_ROOT` | Absolute path to workspace root containing all repo clones |
+| `JUDGE_CLAUDE_MODEL` | Claude model identifier for LLM judge calls |
 
-### Anthropic API (default)
+### YAML Configuration File
 
-Uses the Anthropic Python SDK with an OAuth access token from your Claude Code session (Pro or Enterprise subscription). No separate API key required.
+Repos and per-repo settings are defined in `backlog/config/devbench.yaml` (relative to `JUDGE_WORKSPACE_ROOT`). Copy `sample-config.yaml` from the repo root as a starting point.
 
-```bash
-# Just be logged into Claude Code
-JUDGE_CLAUDE_MODEL=claude-opus-4-6 make start-interactive
+**Config file path resolution** (first match wins):
+1. `--config <path>` CLI argument
+2. `JUDGE_CONFIG_PATH` environment variable
+3. `<JUDGE_WORKSPACE_ROOT>/backlog/config/devbench.yaml` (default)
+
+The config file must exist at the resolved path — a missing file raises `RuntimeError` with an actionable message.
+
+**YAML schema:**
+
+```yaml
+repos:
+  org/repo:                          # key must be "org/repo" format; at least one required
+    default_branch: main2            # optional — omit to fall back to origin/HEAD
+    checkout_directory: my-checkout  # optional — relative to JUDGE_WORKSPACE_ROOT
+                                     # omit to use repo short-name (e.g. "my-repo")
+
+git_ops:                             # optional — git workflow settings
+  update_submodule: false            # set true only when repos are git submodules of a parent repo
 ```
 
-### AWS Bedrock
-
-Uses the Anthropic Bedrock SDK with your AWS credentials. Set `JUDGE_USE_BEDROCK=1` and ensure AWS credentials are configured (IAM role, env vars, or AWS config file).
-
-```bash
-JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-6-v1 \
-JUDGE_USE_BEDROCK=1 \
-JUDGE_BEDROCK_REGION=us-east-1 \
-make start-interactive
-```
-
-See [docs/llm-authentication.md](docs/llm-authentication.md) for details.
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `JUDGE_CONFIG_PATH` | *(see above)* | Override YAML config file path |
+| `JUDGE_MERGE_STRATEGY` | `squash` | PR merge strategy: `merge`, `squash`, or `rebase` |
+| `JUDGE_GH_ORG` | *(empty)* | When set, restricts all GitHub ops to this org only |
+| `JUDGE_MAX_RETRIES` | `10` | Max retry attempts per work unit before marking blocked |
+| `JUDGE_USE_BEDROCK` | `false` | Use AWS Bedrock instead of Anthropic API |
+| `JUDGE_BEDROCK_REGION` | `us-east-1` | AWS region for Bedrock (falls back to `AWS_REGION`) |
+| `JUDGE_GH_TOKEN_FILE` | `~/.gh_token_env` | GitHub token file path |
+| `JUDGE_GH_TIMEOUT` | `600` | GitHub check wait timeout (seconds) |
+| `JUDGE_GH_API_TIMEOUT` | `30` | GitHub API call timeout (seconds) |
+| `JUDGE_TEST_TIMEOUT` | `300` | Test execution timeout (seconds) |
+| `JUDGE_LLM_TIMEOUT` | `300` | LLM evaluation timeout (seconds) |
+| `JUDGE_COMMAND_TIMEOUT` | *(see config)* | Optional. Maximum seconds to wait for a subprocess command before timing out. Positive integer (seconds). Used by `run_command()` in `utils/process.py` and all judge subprocess calls. |
+| `JUDGE_EXECUTOR_TIMEOUT` | `1800` | Dev agent execution timeout (seconds) |
+| `JUDGE_EXECUTOR_MAX_TURNS` | `50` | Max turns for dev agent execution |
+| `JUDGE_ORCHESTRATOR_POLL_INTERVAL` | `10` | Seconds between orchestrator poll cycles |
+| `JUDGE_SECURITY_FETCH_TIMEOUT` | `120` | Security advisory fetch timeout (seconds) |
+| `JUDGE_OUTPUT_TRUNCATION` | `2000` | Output truncation limit (chars) |
+| `JUDGE_LLM_EVIDENCE_TRUNCATION` | `15000` | LLM evidence truncation (chars) |
+| `JUDGE_LLM_FILE_CONTEXT_LIMIT` | `5` | Max files sent to LLM context |
+| `JUDGE_LLM_FILE_PREVIEW_CHARS` | `3000` | Per-file preview truncation (chars) |
+| `JUDGE_ALERT_SUMMARY_LIMIT` | `10` | Max security alerts included in judge evidence |
+| `JUDGE_CLAUDE_CREDENTIALS_FILE` | `~/.claude/.credentials.json` | Claude Code OAuth credentials file path |
 
 ## Key Design Decisions
 
@@ -263,8 +264,11 @@ See [docs/llm-authentication.md](docs/llm-authentication.md) for details.
 | Evidence truncation markers | Truncated content includes `[... TRUNCATED — showing N of M chars]` so the LLM knows it's seeing a preview, not an incomplete file. |
 | Five independent judges | Separation of concerns: code quality, test quality, documentation, scope control, and security evaluated independently. |
 | Fail-fast feedback loop | Up to 10 retry attempts with specific feedback. Agent fixes real issues, not noise. |
-| Single status update path | `set_status()` always updates both the work unit file and BACKLOG.md. No drift possible. |
-| Automatic status rollup | When all children of a Story/Feature/Epic are Done, parent auto-rolls to Done. Cascades upward. |
+| Private write path | `_set_status()` is the single private workhorse: always writes both the work unit file and BACKLOG.md atomically. No public caller can write to just one file. |
+| Public API separation | `force_status()` — any status, no gate (lifecycle transitions and recovery). `mark_done()` — gated completion only. `mark_blocked()` — blocked with reason. Rollups call `_set_status()` directly (structurally correct, no judge review required). |
+| Done-gate enforcement | `mark_done()` checks the work unit's comment history before writing `done`. All four review judges must have a `[REVIEW_PASS]` entry in the most recent round — `[REVIEW_REJECTED]` resets the window. Works across process restarts since the work unit file is the source of truth. |
+| Backlog integrity check | `validate-backlog` (CLI) and orchestrator pre-flight check detect missing files, status mismatches, orphaned work unit files, and invalid dependency references before any work begins. |
+| Automatic status rollup | When all children of a Story/Feature/Epic are Done, parent auto-rolls to Done via `_set_status()`. Cascades upward. |
 | Exact ID matching | Status updates match the ID cell exactly, not as a substring. |
 | Case-insensitive status matching | Recognizes both `in-queue` (lowercase) and `In Queue` (title-case). Writes lowercase. |
 | Explicit `--repo` on all `gh` commands | Prevents PRs from being created against upstream parent repos in fork workflows. |

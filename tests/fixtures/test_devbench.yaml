@@ -1,0 +1,32 @@
+# DevBench test fixture config — used by tests/conftest.py
+repos:
+  caylent-solutions/git-repo:
+    default_branch: main
+    merge_strategy: squash
+  caylent-solutions/devbench:
+    default_branch: main2
+
+merge_strategy: squash
+max_retries: 3
+use_bedrock: false
+bedrock_region: us-east-1
+judge_model: test-judge-model
+executor_model: test-executor-model
+
+timeouts:
+  gh_api: 10
+  test: 60
+  security_fetch: 30
+  llm: 60
+  command: 30
+  executor: 300
+  executor_max_turns: 10
+  orchestrator_poll_interval: 5
+  github_check: 60
+
+limits:
+  alert_summary: 5
+  output_truncation: 500
+  llm_evidence_truncation: 3000
+  llm_file_context: 3
+  llm_file_preview_chars: 500

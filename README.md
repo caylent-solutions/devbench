@@ -49,26 +49,30 @@ Alternatively, set `JUDGE_USE_BEDROCK=1` to use AWS Bedrock for LLM calls instea
 
 ## How It Works
 
+See [docs/execution-modes.md](docs/execution-modes.md) for a full description of both execution modes, the step-by-step lifecycle, and ownership rules.
+
 ```
-Orchestrator (orchestrator.py / interactive Claude session)
+Orchestrator (orchestrate SKILL.md / interactive Claude session)
   │
+  ├── Pre-flight: validate-backlog — abort if index/files are out of sync
   ├── Parse BACKLOG.md → find next actionable work unit
-  ├── Implement work unit via TDD (RED → GREEN → REFACTOR)
+  ├── Implement work unit via TDD (RED → GREEN → REFACTOR)  [devbench:executor agent]
   ├── Run repo's task runners (make test, make validate)
-  ├── Stage files and submit to judge review
-  │     ├── code_review       — SOLID, DRY, fail-fast, security, 12-factor
-  │     ├── test_review        — TDD discipline, test quality, assertions
-  │     ├── doc_review         — accuracy, completeness, sync with code
-  │     ├── changes_manifest   — actual changes vs. expected manifest
-  │     └── security_review    — CodeQL, Dependabot, secret scanning alerts
+  ├── Stage files and submit to judge review  [devbench:review-supervisor agent]
+  │     ├── code-reviewer       — SOLID, DRY, fail-fast, security, 12-factor
+  │     ├── test-reviewer       — TDD discipline, test quality, assertions
+  │     ├── doc-reviewer        — accuracy, completeness, sync with code
+  │     ├── changes-manifest    — actual changes vs. expected manifest
+  │     └── security-reviewer   — CodeQL, Dependabot, secret scanning alerts
   ├── If judges fail → read feedback, fix, resubmit (≤10 tries)
   │     └── Prior feedback injected into re-review to prevent contradictions
   ├── Git ops: commit, push, create PR, wait for CI, merge
   ├── Update BACKLOG.md status to Done (with automatic parent rollup)
+  │     └── Done-gate: mark_done() verifies all 4 review judges passed
   └── Repeat until all work units are done
 ```
 
-All five judges must pass before a work unit can be merged.
+All five judges must pass before a work unit can be merged. Four judges (`code_review`, `test_review`, `doc_review`, `changes_manifest`) are tracked via `[REVIEW_PASS]` comments in the work unit file; the done-gate in `mark_done()` verifies all four passed in the most recent round. The security judge runs as a separate sequential gate after the four pass and before the git commit — a security failure writes `[SECURITY_FAIL]` and then `[REVIEW_REJECTED]` to the work-unit comment history — the `[SECURITY_FAIL]` records the rejection reason; the `[REVIEW_REJECTED]` resets the done-gate window, ensuring the four judges re-run after any security fix.
 
 ## Review Feedback Loop
 
@@ -108,7 +112,7 @@ This prevents the LLM from mistaking system-truncated previews for incomplete so
 ### Log file
 
 ```bash
-tail -f judges/logs/orchestrator.log
+tail -f src/devbench/logs/orchestrator.log
 ```
 
 ### Work unit audit trail
@@ -120,18 +124,27 @@ Every work unit `.md` file has a `## Comments` section with timestamped entries 
 All commands run from the parent workspace root (the directory containing the `devbench` checkout):
 
 ```bash
-python3 -m judges.cli <command> [args]
+devbench <command> [args]
+# or: python3 -m devbench <command> [args]
 ```
 
 | Command | Arguments | Description |
 |---------|-----------|-------------|
 | `status` | — | Show backlog summary (counts by status) |
 | `next` | — | Print next actionable work unit as JSON |
-| `execute` | `<unit-id> [feedback]` | Spawn dev agent for a work unit |
-| `review` | `<unit-id>` | Run all review judges, print JSON results |
-| `security-review` | `<unit-id>` | Run security review judge |
-| `set-status` | `<unit-id> <status>` | Set work unit status |
-| `mark-done` | `<unit-id>` | Mark unit as Done, update BACKLOG.md |
+| `claim` | `<unit-id>` | Claim a work unit (set to in-progress) |
+| `ensure-branch` | `<unit-id>` | Create or switch to work unit branch before executor runs |
+| `git-ops` | `<unit-id>` | Commit, push, create PR, wait for CI, merge |
+| `mark-done` | `<unit-id>` | Mark unit as Done (enforces done-gate: all judges must have passed) |
+| `log-verdict` | `<judge> <unit-id> <pass\|fail> [msg]` | Record a judge verdict in the work unit Comments |
+| `log-comment` | `<agent> <unit-id> <message>` | Append an agent comment to the work unit Comments |
+| `log-tdd` | `<unit-id> <RED\|GREEN\|REFACTOR> <message>` | Append a TDD phase entry to the work unit TDD Cycle Log |
+| `set-status` | `<unit-id> <status>` | Force any status (no gate — use for recovery/lifecycle transitions) |
+| `validate-backlog` | — | Check backlog integrity (file existence, status sync, orphans, deps, summary table) |
+| `read-unit` | `<unit-id>` | Print work unit spec as markdown (for agent context) |
+| `get-diff` | `<unit-id>` | Print git diff vs default branch (for review agents) |
+| `run-tests` | `<unit-id>` | Run test suite in the work unit's repo |
+| `start` | — | Run orchestrate skill via Agent SDK (non-interactive) |
 | `report` | `[since-timestamp]` | Print progress report with velocity stats |
 | `log` | `<message>` | Append message to log file |
 
@@ -155,110 +168,120 @@ make clean                # Remove caches
 ## Architecture
 
 ```
-judges/
-├── cli.py                     ← CLI entry point (with prior feedback parsing)
-├── orchestrator.py            ← Main loop: parse backlog, dispatch, review, merge
-├── orchestrator-prompt.md     ← System prompt for interactive Claude mode
-├── config.py                  ← Environment-driven configuration (all env vars)
-├── constants.py               ← Centralized structural constants (regex, formats)
-├── backlog_parser.py          ← Parses BACKLOG.md and work unit .md files
-├── work_unit.py               ← WorkUnit dataclass and status management
-├── claude_executor.py         ← Spawns Claude Code dev agents
-├── report.py                  ← Session progress report generator (velocity, ETA)
-├── github_security.py         ← GitHub security API integration
-├── log_setup.py               ← Dual logging (stdout + file)
-├── testing.py                 ← Shared test utilities and fixtures
-├── prompts/                   ← External prompt files for each judge
-│   ├── code_review.txt        ← 46 review rules (SOLID, DRY, 12-factor, security)
-│   ├── test_review.txt        ← 42 test quality rules (TDD, stubs, markers)
-│   ├── doc_review.txt         ← Documentation accuracy and completeness
-│   ├── changes_manifest.txt   ← Scope control and manifest verification
-│   ├── security_review.txt    ← Security alert evaluation
-│   ├── blocker_resolver.txt   ← Dependency and blocker assessment
-│   └── executor.txt           ← Dev agent execution prompt
-├── judges/
-│   ├── base.py                ← BaseJudge: LLM calls, prior feedback injection
-│   ├── code_review.py         ← Git diff + work unit → LLM verdict
-│   ├── test_review.py         ← make test / pytest + test files → LLM verdict
-│   ├── doc_review.py          ← Doc diff + work unit → LLM verdict
-│   ├── changes_manifest.py    ← Changed files vs. manifest → LLM verdict
-│   ├── security_review.py     ← GitHub alerts + diff → LLM verdict
-│   ├── blocker_resolver.py    ← Dependency and blocker assessment
-│   ├── git_ops.py             ← Commit, push, PR, merge, CI checks
-│   └── backlog_manager.py     ← Status sync, rollup, traceability
-├── tests/                     ← ~310 tests
+devbench/
+├── src/devbench/                  ← Installable package (pip install -e .)
+│   ├── cli.py                     ← CLI entry point (devbench <command>)
+│   ├── config.py                  ← Environment-driven configuration (all env vars)
+│   ├── config_loader.py           ← YAML config parser and schema validator (parse/validate only — no env var access)
+│   ├── config-schema.json         ← JSON schema for devbench.yaml validation
+│   ├── constants.py               ← Centralized structural constants (regex, formats)
+│   ├── log_setup.py               ← Dual logging (stdout + file)
+│   ├── backlog/
+│   │   ├── parser.py              ← Parses BACKLOG.md and work unit .md files
+│   │   ├── work_unit.py           ← WorkUnit dataclass and status management
+│   │   └── manager.py             ← Status sync, rollup, traceability
+│   ├── github/
+│   │   ├── git_ops.py             ← Commit, push, PR, merge, CI checks
+│   │   └── security.py            ← GitHub security API integration
+│   ├── utils/
+│   │   ├── greeting.py            ← get_greeting(name): greeting utility for POC pipeline verification
+│   │   └── process.py             ← run_command(): shared subprocess wrapper for running shell commands
+│   ├── reporting/
+│   │   └── report.py              ← Session progress report generator (velocity, ETA)
+│   └── prompts/                   ← Prompt loader (reads agent prompt files)
+├── plugin/                        ← Claude Code plugin (agents, hooks, skills)
+│   └── devbench/
+│       ├── agents/                ← Agent definitions invoked by orchestrate skill
+│       │   ├── executor.md        ← Dev agent: implements work units via TDD
+│       │   ├── review-supervisor.md ← Discovers and invokes all review_team agents in parallel
+│       │   ├── security-reviewer.md ← Security review judge agent
+│       │   ├── blocker-resolver.md  ← Dependency blocker assessment agent
+│       │   └── review_team/       ← Review team agents invoked by review-supervisor
+│       │       ├── code-reviewer.md   ← Code review judge agent
+│       │       ├── test-reviewer.md   ← Test quality judge agent
+│       │       ├── doc-reviewer.md    ← Documentation review judge agent
+│       │       └── changes-manifest.md ← Scope/manifest review judge agent
+│       ├── skills/
+│       │   └── orchestrate/
+│       │       └── SKILL.md       ← Orchestrate skill: main backlog execution loop
+│       ├── hooks/
+│       │   └── hooks.json         ← Hook registrations (PreToolUse, PostToolUse, …)
+│       └── scripts/               ← Hook scripts invoked by hooks.json
+│           ├── hook-logger.sh     ← Logs every tool call to the hook log
+│           ├── guard-bash.sh      ← PreToolUse: blocks dangerous Bash commands
+│           ├── guard-backlog.sh   ← PreToolUse: prevents direct writes to backlog/ tracking files (Bash)
+│           ├── guard-verdict-format.sh ← PreToolUse: validates log-verdict argument format
+│           ├── guard-git-stage.sh      ← PreToolUse: blocks git commit when no files are staged
+│           ├── guard-work-unit-write.sh ← PreToolUse: blocks Write/Edit to work unit .md files under backlog/
+│           └── assert-tests-pass.sh    ← PostToolUse: enforces test suite passes after Bash
+├── tests/
+│   ├── conftest.py                ← Shared fixtures
+│   ├── testing.py                 ← Shared test utilities
+│   ├── fixtures/                  ← Shared test fixture files
+│   ├── functional/                ← Functional tests
+│   ├── test_backlog/              ← parser, work_unit, manager tests
+│   ├── test_execution/            ← execution path tests
+│   ├── test_github/               ← git_ops, security tests
+│   ├── test_judges/               ← judge-related tests
+│   ├── test_plugin/               ← plugin integration tests
+│   ├── test_prompts/              ← prompt loader tests
+│   ├── test_reporting/            ← report tests
+│   ├── test_utils/                ← process.run_command tests
+│   └── unit/                      ← Unit tests for plugin hook scripts
+│       ├── test_guard_verdict_format.py  ← Tests for guard-verdict-format.sh
+│       ├── test_guard_git_stage.py       ← Tests for guard-git-stage.sh
+│       ├── test_guard_work_unit_write.py ← Tests for guard-work-unit-write.sh
+│       └── test_assert_tests_pass.py     ← Tests for assert-tests-pass.sh
 ├── scripts/
-│   ├── start.sh               ← Background start script
-│   └── start-interactive.sh   ← Interactive Claude session start script
-├── requirements.txt           ← Runtime dependencies
-├── requirements-dev.txt       ← Dev dependencies (pytest, ruff, bandit, mypy)
-├── Makefile                   ← lint, format, check, test, validate, install
-├── ruff.toml                  ← Linter configuration
-├── pytest.ini                 ← Test configuration
-└── README.md                  ← This file
+│   ├── start.sh                   ← Background start script
+│   └── start-interactive.sh       ← Interactive Claude session start script
+├── pyproject.toml                 ← Build config, dependencies, ruff/mypy settings
+├── Makefile                       ← lint, format, check, test, validate, install
+└── README.md                      ← This file
 ```
 
-### Design Principles
+## Plugin Hooks
 
-- **No hardcoded verdicts** — all pass/fail decisions are made by the LLM, not pattern matches
-- **Evidence gathering is deterministic** — git diffs, test output, file lists are collected reliably; only the judgment is LLM
-- **Prior feedback consistency** — re-reviews include previous feedback to prevent contradictory findings
-- **Task runner agnostic** — judges run `make test` if available, fall back to `pytest`; the LLM evaluates task runner config contextually
-- **Truncation transparency** — all content truncation includes markers so the LLM knows it's seeing a preview
-- **No silent failures** — every error raises with an actionable message, non-zero exit codes
-- **No fallback logic** — missing config or bad data fails fast
-- **External prompts** — all LLM system prompts in `prompts/*.txt`, not inline strings
-- **Single status update path** — `set_status()` updates both the work unit file and BACKLOG.md atomically
-- **Automatic parent rollup** — when all children are Done, parent Story/Feature/Epic auto-rolls to Done
+The `plugin/devbench/` directory is a Claude Code plugin that registers deterministic guards on Bash, Write, and Edit tool calls. Hooks are configured in `plugin/devbench/hooks/hooks.json`.
 
-## Judge Details
+### PreToolUse hooks (Bash)
 
-### Code Review (`code_review`)
-- **Evidence**: Git diff, work unit content, prior feedback
-- **Evaluates**: AC coverage, SOLID/DRY, fail-fast, 12-factor config, security, prohibited patterns, task runner validation
+These hooks fire before every Bash tool call and can block execution by exiting with code 2:
 
-### Test Review (`test_review`)
-- **Evidence**: `make test` output (or pytest), test file contents, work unit content, prior feedback
-- **Evaluates**: TDD discipline, test quality, meaningful assertions, stub detection, markers, task runner validation
+| Script | Purpose |
+|--------|---------|
+| `hook-logger.sh` | Logs the tool call (tool name, command) to the hook log for audit |
+| `guard-bash.sh` | Blocks Bash commands that are destructive or prohibited (e.g. `rm -rf /`) |
+| `guard-verdict-format.sh` | Validates `uv run devbench log-verdict` calls: verdict must be `pass` or `fail`, judge name must be a known identifier, and feedback must be non-empty when verdict is `fail` |
+| `guard-git-stage.sh` | Blocks `git commit` when no files are staged; runs `git diff --cached --quiet` and exits 2 with guidance to run `git add` if the index is empty |
 
-### Doc Review (`doc_review`)
-- **Evidence**: Git diff, documentation files, work unit content, prior feedback
-- **Evaluates**: Documentation accuracy, completeness, sync with code changes, stale references
+### PreToolUse hooks (Write and Edit)
 
-### Changes Manifest (`changes_manifest`)
-- **Evidence**: Changed file list, diff summary, work unit content, prior feedback
-- **Evaluates**: Actual changes vs. manifest, scope creep, unauthorized modifications
+These hooks fire before every Write and Edit tool call and can block execution by exiting with code 2:
 
-### Security Review (`security_review`)
-- **Evidence**: GitHub CodeQL/Dependabot/secret-scanning alerts, git diff, work unit content
-- **Evaluates**: Open alerts, security anti-patterns, severity assessment
-- **Runs after**: The other four judges all pass — acts as a final security gate before merge
+| Script | Purpose |
+|--------|---------|
+| `guard-work-unit-write.sh` | Blocks direct Write/Edit to work unit `.md` files under `backlog/` (excludes `BACKLOG.md` and files under `backlog/config/`); work unit files are managed exclusively by the orchestrate skill |
+
+### PostToolUse hooks (Bash)
+
+These hooks fire after every Bash tool call:
+
+| Script | Purpose |
+|--------|---------|
+| `hook-logger.sh` | Logs the tool result |
+| `assert-tests-pass.sh` | Validates that explicit test-runner commands (`pytest`, `make test`, `make test-unit`, `make test-functional`, `make validate`, `uv run pytest`) succeed; blocks if a test command exits with non-zero |
+
+### Hook exit codes
+
+- **Exit 0** — allow the tool call to proceed (or acknowledge post-use)
+- **Exit 2** — block the tool call; stderr message is shown to the agent as feedback
 
 ## Configuration
 
-All configuration via environment variables with sensible defaults:
+Required variables (`JUDGE_WORKSPACE_ROOT`, `JUDGE_CLAUDE_MODEL`) raise `RuntimeError` at startup if unset. Allowed repositories and per-repo settings (default branch, checkout directory) are defined in `backlog/config/devbench.yaml` (relative to `JUDGE_WORKSPACE_ROOT`) — copy `sample-config.yaml` as a starting point. See [SYSTEM-OVERVIEW.md](SYSTEM-OVERVIEW.md#environment-variables) for the full variable reference and YAML schema.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `JUDGE_WORKSPACE_ROOT` | Parent of devbench checkout | Root workspace path |
-| `JUDGE_BACKLOG_ROOT` | `<workspace>/backlog` | Backlog directory |
-| `JUDGE_BACKLOG_INDEX` | `<workspace>/BACKLOG.md` | Backlog index file |
-| `JUDGE_MAX_RETRIES` | `10` | Max retry attempts per work unit |
-| `JUDGE_CLAUDE_MODEL` | *(required)* | Claude model for LLM calls |
-| `JUDGE_USE_BEDROCK` | `false` | Use AWS Bedrock instead of Anthropic API |
-| `JUDGE_BEDROCK_REGION` | `us-east-1` | AWS region for Bedrock (falls back to `AWS_REGION`) |
-| `JUDGE_LOG_FILE` | `judges/logs/orchestrator.log` | Log file path |
-| `JUDGE_GH_TOKEN_FILE` | `~/.gh_token_env` | GitHub token file path |
-| `JUDGE_GH_TIMEOUT` | `600` | GitHub check wait timeout (seconds) |
-| `JUDGE_GH_API_TIMEOUT` | `30` | GitHub API call timeout (seconds) |
-| `JUDGE_TEST_TIMEOUT` | `300` | Test execution timeout (seconds) |
-| `JUDGE_LLM_TIMEOUT` | `300` | LLM evaluation timeout (seconds) |
-| `JUDGE_COMMAND_TIMEOUT` | `120` | General command timeout (seconds) |
-| `JUDGE_EXECUTOR_TIMEOUT` | `1800` | Dev agent execution timeout (seconds) |
-| `JUDGE_OUTPUT_TRUNCATION` | `2000` | Output truncation limit (chars) |
-| `JUDGE_LLM_EVIDENCE_TRUNCATION` | `15000` | LLM evidence truncation (chars) |
-| `JUDGE_LLM_FILE_CONTEXT_LIMIT` | `5` | Max files in LLM context |
-| `JUDGE_LLM_FILE_PREVIEW_CHARS` | `3000` | File preview truncation (chars) |
+The `--config <path>` CLI flag (or `JUDGE_CONFIG_PATH` env var) overrides the default config file location.
 
 ## Interactive Mode
 
@@ -280,11 +303,17 @@ Restarting picks up where you left off — `done` units are skipped, and `in-pro
 
 ## Troubleshooting
 
+### Backlog is out of sync with work unit files
+Run `devbench validate-backlog` to check for missing files, status mismatches, orphaned files, invalid dependency references, and Status Summary table count mismatches. Fix reported errors before running the orchestrator — it runs this check automatically at startup and aborts if any errors are found.
+
 ### Judge keeps failing the same unit
 After `JUDGE_MAX_RETRIES` failures (default: 10), the unit is marked `blocked`. Check the Comments section of the work unit file for the feedback trail.
 
+### `mark-done` fails with "not all required judges passed"
+The done-gate check found that not all four review judges (`code_review`, `test_review`, `doc_review`, `changes_manifest`) have a `[REVIEW_PASS]` entry after the most recent `[REVIEW_REJECTED]` line. Check the Comments section of the work unit file for the current judge verdicts, then re-run any failing agents via the orchestrate skill.
+
 ### Judge contradicts its previous feedback
-This should not happen with the prior feedback injection. If it does, check whether the orchestrator log has the previous feedback entries (`grep "judge feedback for <unit-id>" judges/logs/orchestrator.log`).
+This should not happen with the prior feedback injection. If it does, check whether the orchestrator log has the previous feedback entries (`grep "judge feedback for <unit-id>" src/devbench/logs/orchestrator.log`).
 
 ### GitHub token expired
 ```bash

@@ -1,0 +1,36 @@
+# DevBench runtime configuration — sample / starting point
+#
+# Copy this file to your workspace: cp sample-config.yaml backlog/config/devbench.yaml
+#
+# Precedence: environment variables > this file > code defaults
+#
+# Config file path resolution order:
+#   1. --config <path>          CLI argument
+#   2. JUDGE_CONFIG_PATH        environment variable
+#   3. backlog/config/devbench.yaml  (default, relative to JUDGE_WORKSPACE_ROOT)
+#
+# repos: defines allowed repositories and optional per-repo settings.
+# At least one entry is required. Keys must be in "org/repo" format.
+#
+# Per-repo fields:
+#   default_branch      (optional) — branch used for git diff and PR --base.
+#                                    Omit to fall back to origin/HEAD.
+#   checkout_directory  (optional) — relative path from JUDGE_WORKSPACE_ROOT to
+#                                    the local checkout. Must be relative (no leading
+#                                    / or .. traversal). Omit to use the repo short
+#                                    name (e.g. "devbench" for "caylent-solutions/devbench").
+
+repos:
+  caylent-solutions/devbench:
+    default_branch: main
+    checkout_directory: devbench
+
+# git_ops: controls git workflow behaviour after PR merge.
+#
+# update_submodule  (optional, default false) — set true only when target repos
+#                   are git submodules of a parent workspace repo.  When true,
+#                   cmd_git_ops will stage and commit the updated submodule
+#                   pointer in the parent repo after each PR merge.
+#
+# git_ops:
+#   update_submodule: false

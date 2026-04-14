@@ -46,7 +46,7 @@ Check that the credentials file exists and contains a valid token:
 
 ```bash
 python3 -c "
-from judges.config import get_anthropic_api_key
+from devbench.config import get_anthropic_api_key
 token = get_anthropic_api_key()
 print(f'Token found: {token[:15]}...')
 "
@@ -129,7 +129,7 @@ make start-interactive
 ```bash
 JUDGE_USE_BEDROCK=1 JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-6-v1 \
 python3 -c "
-from judges.config import USE_BEDROCK, BEDROCK_REGION
+from devbench.config import USE_BEDROCK, BEDROCK_REGION
 print(f'Bedrock enabled: {USE_BEDROCK}')
 print(f'Region: {BEDROCK_REGION}')
 "

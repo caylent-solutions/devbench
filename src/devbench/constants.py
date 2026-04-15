@@ -65,9 +65,7 @@ SECURITY_ALERT_CATEGORIES: list[tuple[str, str]] = [
 DISPLAY_STATUS_VALUES: list[str] = ["In Queue", "In Progress", "In Review", "Done", "Blocked"]
 
 # Backlog manager recognized status labels (title-case, as in markdown tables)
-TABLE_STATUS_VALUES: frozenset[str] = frozenset(
-    {"In Queue", "In Progress", "In Review", "Done", "Blocked"}
-)
+TABLE_STATUS_VALUES: frozenset[str] = frozenset({"In Queue", "In Progress", "In Review", "Done", "Blocked"})
 
 # ---------------------------------------------------------------------------
 # Traceability matrix format
@@ -150,22 +148,26 @@ BACKLOG_SUBDIR: str = "backlog"
 # All values that mean "no dependency" in the BACKLOG.md dependencies column.
 # Includes DEPENDENCY_NONE_VALUE, EPIC_PLACEHOLDER_ID, the separator used in
 # some tables, and empty string.
-DEPENDENCY_NONE_VALUES: frozenset[str] = frozenset({
-    DEPENDENCY_NONE_VALUE,  # "none"
-    EPIC_PLACEHOLDER_ID,    # "--"
-    "---",
-    "",
-})
+DEPENDENCY_NONE_VALUES: frozenset[str] = frozenset(
+    {
+        DEPENDENCY_NONE_VALUE,  # "none"
+        EPIC_PLACEHOLDER_ID,  # "--"
+        "---",
+        "",
+    }
+)
 
 # ---------------------------------------------------------------------------
 # Required review judge names for the done-gate check (4.1)
 # ---------------------------------------------------------------------------
-REVIEW_JUDGE_NAMES: frozenset[str] = frozenset({
-    "code_review",
-    "test_review",
-    "doc_review",
-    "changes_manifest",
-})
+REVIEW_JUDGE_NAMES: frozenset[str] = frozenset(
+    {
+        "code_review",
+        "test_review",
+        "doc_review",
+        "changes_manifest",
+    }
+)
 
 SECURITY_JUDGE_NAMES: frozenset[str] = frozenset({"security_review"})
 

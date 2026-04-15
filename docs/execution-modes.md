@@ -56,6 +56,7 @@ Both modes execute the same logical steps in the same order.
    └── If FAIL → write SECURITY_FAIL + REVIEW_REJECTED, return to step 4
 
 8. Git operations  [devbench:executor AGENT RESPONSIBILITY — ALWAYS, BOTH MODES]
+   Standard mode (default):
    ├── a. Create/checkout branch in the target submodule
    ├── b. Stage files from the Changes Manifest (selective — never git add -A)
    ├── c. Commit: "<unit-id>: <title>"
@@ -64,6 +65,12 @@ Both modes execute the same logical steps in the same order.
    ├── f. Wait for CI checks to pass
    ├── g. Squash-merge PR, delete branch
    └── h. Update parent repo's submodule reference (only when git_ops.update_submodule: true)
+
+   Single-branch mode (git_ops.single_branch + git_ops.defer_pr: true):
+   ├── a. ensure-branch creates/checks out the shared branch (same for all tasks)
+   ├── b. Stage files
+   ├── c. Commit locally: "<unit-id>: <title>" (no push, no PR, no merge)
+   └── d. After ALL tasks done: `devbench git-ops-finalize <repo>` pushes and creates PR
 
 9. Mark Done (done-gate: verifies all 4 judges passed in most recent round)
 

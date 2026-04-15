@@ -16,6 +16,7 @@ class TestParseIndex:
     def test_parse_index_from_actual_backlog(self) -> None:
         """Parse the real BACKLOG.md file and verify results."""
         import os
+
         workspace = Path(os.environ.get("JUDGE_WORKSPACE_ROOT", "/tmp/test-workspace"))
         actual_backlog = workspace / "BACKLOG.md"
         if not actual_backlog.is_file():
@@ -553,3 +554,118 @@ class TestGetParallelCandidates:
         assert result.status is WorkUnitStatus.IN_PROGRESS
 
 
+class TestParseStatusEdgeCases:
+    """Test _parse_status with invalid input."""
+
+    def test_raises_for_unrecognised_status(self) -> None:
+        """Line 72: raises ValueError for unrecognised status string."""
+        from devbench.backlog.parser import _parse_status
+
+        with pytest.raises(ValueError, match="Unrecognised work-unit status"):
+            _parse_status("invalid-status")
+
+
+class TestInferTypeFromIdEdgeCases:
+    """Test _infer_type_from_id with edge cases."""
+
+    def test_returns_epic_for_placeholder_id(self) -> None:
+        """Line 87: returns EPIC for the placeholder ID '--'."""
+        from devbench.backlog.parser import _infer_type_from_id
+
+        result = _infer_type_from_id("--")
+        assert result is WorkUnitType.EPIC
+
+    def test_empty_id_note(self) -> None:
+        """Line 91: dead code -- str.split('-') on '' returns [''], never [], so `not parts` is never True."""
+        # This is intentionally a documentation-only test.
+        # The guard `if not parts:` at line 90 of parser.py is unreachable because
+        # Python's str.split("-") always returns a list with at least one element.
+        result = str.split("", "-")
+        assert len(result) > 0, "str.split always returns non-empty list"
+
+    def test_raises_for_unknown_segment_prefix(self) -> None:
+        """Line 98: raises ValueError when last segment has unknown prefix."""
+        from devbench.backlog.parser import _infer_type_from_id
+
+        with pytest.raises(ValueError, match="Cannot infer work-unit type"):
+            _infer_type_from_id("E0-F1-X1")
+
+
+class TestParseIndexEdgeCases:
+    """Test parse_index edge cases."""
+
+    def test_raises_when_type_column_mismatches_inferred(self, tmp_path: Path) -> None:
+        """Lines 174-175 (169 already covered): raises ValueError on type mismatch."""
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        index_path = tmp_path / "BACKLOG.md"
+        # Row claims type "Story" but ID E0-F1-S1-T1 implies "Task"
+        index_path.write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|-----------||\n"
+            "| E0-F1-S1-T1 | Mismatched | Story | in-queue | None | git-repo | `backlog/E0-F1-S1-T1.md` |\n"
+        )
+        (backlog_dir / "E0-F1-S1-T1.md").write_text("# E0-F1-S1-T1: Mismatched\n\n## Status: in-queue\n")
+
+        parser = BacklogParser(backlog_root=backlog_dir, backlog_index=index_path)
+        with pytest.raises(ValueError, match="Type mismatch"):
+            parser.parse_index()
+
+    def test_raises_when_file_path_empty(self, tmp_path: Path) -> None:
+        """Line 180: raises ValueError when work unit has no file path."""
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|-----------||\n"
+            "| E0-F1-S1-T1 | No Path | Task | in-queue | None | git-repo |  |\n"
+        )
+
+        parser = BacklogParser(backlog_root=tmp_path / "backlog", backlog_index=index_path)
+        with pytest.raises(ValueError, match="has no file path"):
+            parser.parse_index()
+
+    def test_raises_when_no_work_unit_rows(self, tmp_path: Path) -> None:
+        """Lines 200-205: raises ValueError when index has no parseable rows."""
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text("# Backlog\n\n## Full Work Unit Index\n\nNo table here.\n")
+
+        parser = BacklogParser(backlog_root=tmp_path / "backlog", backlog_index=index_path)
+        with pytest.raises(ValueError, match="No work-unit rows found"):
+            parser.parse_index()
+
+    def test_skips_rows_with_unknown_type(self, tmp_path: Path) -> None:
+        """Line 169: rows with non-WorkUnitType values are skipped (e.g. Doc, Template)."""
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        index_path = tmp_path / "BACKLOG.md"
+        # One valid Task row and one invalid "Doc" type row
+        index_path.write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|-----------||\n"
+            "| E0-F1-S1-T1 | Valid Task | Task | in-queue | None | git-repo | `backlog/E0-F1-S1-T1.md` |\n"
+            "| DOC-1 | Some Doc | Doc | in-queue | None | git-repo | `backlog/DOC-1.md` |\n"
+        )
+        (backlog_dir / "E0-F1-S1-T1.md").write_text("# E0-F1-S1-T1: Valid Task\n\n## Status: in-queue\n")
+        (backlog_dir / "DOC-1.md").write_text("# DOC-1: Some Doc\n\n## Status: in-queue\n")
+
+        parser = BacklogParser(backlog_root=backlog_dir, backlog_index=index_path)
+        units = parser.parse_index()
+        # Only the valid Task row should be parsed; the Doc row is skipped
+        assert len(units) == 1
+        assert units[0].id == "E0-F1-S1-T1"
+
+
+class TestParseWorkUnitFileEdgeCases:
+    """Test parse_work_unit_file edge cases."""
+
+    def test_raises_when_no_status_line(self, tmp_path: Path) -> None:
+        """Line 237: raises ValueError when work-unit file has no ## Status: line."""
+        wu_file = tmp_path / "unit.md"
+        wu_file.write_text("# E0-F1-S1-T1: Test Task\n\nSome content without status.\n")
+
+        parser = BacklogParser(backlog_root=tmp_path, backlog_index=tmp_path / "B.md")
+        with pytest.raises(ValueError, match="No '## Status:' line found"):
+            parser.parse_work_unit_file(wu_file)

@@ -126,17 +126,23 @@ def tmp_repo_dir(tmp_path: Path) -> Path:
     # Ensure branch is called "main" regardless of system git defaults
     subprocess.run(
         ["git", "branch", "-M", "main"],
-        cwd=repo_dir, capture_output=True, check=True,
+        cwd=repo_dir,
+        capture_output=True,
+        check=True,
     )
     # Set up origin so _get_default_branch() works: point origin at self,
     # fetch to create origin/main, then write origin/HEAD symref.
     subprocess.run(
         ["git", "remote", "add", "origin", repo_dir.as_posix()],
-        cwd=repo_dir, capture_output=True, check=True,
+        cwd=repo_dir,
+        capture_output=True,
+        check=True,
     )
     subprocess.run(
         ["git", "fetch", "origin"],
-        cwd=repo_dir, capture_output=True, check=True,
+        cwd=repo_dir,
+        capture_output=True,
+        check=True,
     )
     head_ref = repo_dir / ".git" / "refs" / "remotes" / "origin" / "HEAD"
     head_ref.write_text("ref: refs/remotes/origin/main\n")
@@ -176,9 +182,7 @@ def mock_backlog_index(tmp_path: Path) -> Path:
         ("E0-F1", "Feature One", "in-queue", "Feature"),
     ]
     for unit_id, title, status, _ in _work_units:
-        (backlog_dir / f"{unit_id}.md").write_text(
-            f"# {unit_id}: {title}\n\n## Status: {status}\n"
-        )
+        (backlog_dir / f"{unit_id}.md").write_text(f"# {unit_id}: {title}\n\n## Status: {status}\n")
 
     return index_path
 
@@ -217,6 +221,7 @@ def sample_work_unit(tmp_path: Path) -> WorkUnit:
 def backlog_dir(tmp_path: Path) -> Path:
     """Create and return the backlog subdirectory under tmp_path."""
     from devbench.constants import BACKLOG_SUBDIR
+
     d = tmp_path / BACKLOG_SUBDIR
     d.mkdir()
     return d

@@ -1,0 +1,72 @@
+---
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint-ruff:
+    name: Lint (ruff)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --all-extras
+        shell: bash
+      - run: make lint-ruff
+        shell: bash
+
+  lint-bandit:
+    name: Lint (bandit)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --all-extras
+        shell: bash
+      - run: make lint-bandit
+        shell: bash
+
+  format-check:
+    name: Format check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --all-extras
+        shell: bash
+      - run: make format-check
+        shell: bash
+
+  typecheck:
+    name: Type check (mypy)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --all-extras
+        shell: bash
+      - run: make typecheck
+        shell: bash
+
+  test-coverage:
+    name: Tests + coverage (>=90%)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --all-extras
+        shell: bash
+      - run: make test-coverage
+        shell: bash

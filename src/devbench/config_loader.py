@@ -141,9 +141,23 @@ class GitOpsConfig:
             reference after each PR merge.  Set to ``True`` only when target
             repos are git submodules of a parent workspace repo.  Defaults
             to ``False`` (opt-in).
+        single_branch: When set, all work units use this branch name instead
+            of per-unit ``backlog/<id>`` branches.  Enables accumulating
+            multiple commits on one branch for a single PR.  Defaults to
+            ``None`` (per-unit branches).
+        defer_pr: When ``True``, ``git-ops`` commits and stages only --
+            it does not push, create a PR, or merge.  Use
+            ``git-ops-finalize`` to push and create the PR after all work
+            units are complete.  Only meaningful when ``single_branch``
+            is set.  Defaults to ``False``.
     """
 
     update_submodule: bool = False
+    single_branch: str | None = None
+    defer_pr: bool = False
+    token_cost_per_million_input: float = 15.0
+    token_cost_per_million_output: float = 75.0
+    token_cost_input_ratio: float = 0.80
 
 
 @dataclass
@@ -271,9 +285,7 @@ def _parse_repo_config(path: Path, repo_name: str, repo_data: object) -> RepoCon
     )
 
 
-def _parse_repos(
-    path: Path, repos_raw: dict, allowed_orgs: list[str]
-) -> dict[str, RepoConfig]:
+def _parse_repos(path: Path, repos_raw: dict, allowed_orgs: list[str]) -> dict[str, RepoConfig]:
     """Build the repos mapping from the raw YAML ``repos`` block.
 
     When *allowed_orgs* is non-empty, every repo key's organisation component
@@ -338,18 +350,13 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         raise ValueError(f"Invalid YAML in config file '{path}': {exc}") from exc
 
     if not isinstance(raw, dict):
-        raise ValueError(
-            f"Config file '{path}' must be a YAML mapping at the top level, "
-            f"got {type(raw).__name__}."
-        )
+        raise ValueError(f"Config file '{path}' must be a YAML mapping at the top level, got {type(raw).__name__}.")
 
     # JSON Schema validation — catches unknown keys, type errors, and enum violations.
     try:
         jsonschema.validate(raw, _SCHEMA)
     except jsonschema.ValidationError as exc:
-        raise ValueError(
-            f"Config file '{path}' failed schema validation: {exc.message}"
-        ) from exc
+        raise ValueError(f"Config file '{path}' failed schema validation: {exc.message}") from exc
 
     allowed_orgs: list[str] = raw.get("allowed_orgs") or []
     repos = _parse_repos(path, raw.get("repos") or {}, allowed_orgs)
@@ -380,8 +387,17 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
 
     # Populate GitOpsConfig from YAML git_ops block (absent keys yield defaults).
     git_ops_raw = raw.get("git_ops") or {}
+    single_branch_raw = git_ops_raw.get("single_branch") or None
+    defer_pr = bool(git_ops_raw.get("defer_pr", False))
+    if defer_pr and not single_branch_raw:
+        raise ValueError(f"Config file '{path}': git_ops.defer_pr requires git_ops.single_branch to be set.")
     git_ops = GitOpsConfig(
         update_submodule=bool(git_ops_raw.get("update_submodule", False)),
+        single_branch=single_branch_raw,
+        defer_pr=defer_pr,
+        token_cost_per_million_input=float(git_ops_raw.get("token_cost_per_million_input", 15.0)),
+        token_cost_per_million_output=float(git_ops_raw.get("token_cost_per_million_output", 75.0)),
+        token_cost_input_ratio=float(git_ops_raw.get("token_cost_input_ratio", 0.80)),
     )
 
     return RuntimeConfig(

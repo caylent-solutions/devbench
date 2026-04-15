@@ -147,6 +147,11 @@ class BacklogManager:
         3. No orphaned work unit files (in workspace_root/backlog/ but not in index).
         4. All dependency IDs reference real work unit IDs in the index.
         5. Status Summary table exists and counts match the Full Work Unit Index.
+        6. Task files have non-empty ## Description section.
+        7. Task files have ## Acceptance Criteria with at least one AC- item.
+        8. Task files have ## Changes Manifest with at least one entry.
+        9. Task files have ## Definition of Done section.
+        10. No em-dash character (U+2014) in work unit files.
 
         Args:
             backlog_index: Path to the ``BACKLOG.md`` index file.
@@ -163,6 +168,7 @@ class BacklogManager:
         self._check_orphans(workspace_root, indexed_files, errors)
         self._check_dependencies(backlog_index, known_ids, errors)
         self._check_status_summary(backlog_index, rows, errors)
+        self._check_task_content(rows, workspace_root, errors)
         return errors
 
     def _check_files_and_statuses(
@@ -190,26 +196,21 @@ class BacklogManager:
             if m:
                 file_status = m.group(1).strip().lower()
                 if file_status != index_status:
-                    errors.append(
-                        f"{row_id}: status mismatch — index has '{index_status}', file has '{file_status}'"
-                    )
+                    errors.append(f"{row_id}: status mismatch — index has '{index_status}', file has '{file_status}'")
             else:
                 errors.append(f"{row_id}: work unit file missing '## Status:' line")
         return indexed_files
 
-    def _check_orphans(
-        self, workspace_root: Path, indexed_files: set[Path], errors: list[str]
-    ) -> None:
+    def _check_orphans(self, workspace_root: Path, indexed_files: set[Path], errors: list[str]) -> None:
         """Check 3: no orphaned work unit files."""
         backlog_dir = workspace_root / BACKLOG_SUBDIR
         if backlog_dir.exists():
-            for wu_file in backlog_dir.glob("*.md"):
+            for wu_file in backlog_dir.rglob("*.md"):
                 if wu_file.resolve() not in indexed_files:
-                    errors.append(f"{wu_file.name}: orphaned work unit file not in BACKLOG.md")
+                    rel = wu_file.relative_to(backlog_dir)
+                    errors.append(f"{rel}: orphaned work unit file not in BACKLOG.md")
 
-    def _check_dependencies(
-        self, backlog_index: Path, known_ids: set[str], errors: list[str]
-    ) -> None:
+    def _check_dependencies(self, backlog_index: Path, known_ids: set[str], errors: list[str]) -> None:
         """Check 4: all dependency IDs reference real IDs."""
         content = backlog_index.read_text(encoding="utf-8")
         for line in content.splitlines():
@@ -225,9 +226,7 @@ class BacklogManager:
             for raw_dep in dep_cell.split(","):
                 dep_id = raw_dep.strip()
                 if dep_id and dep_id.lower() not in DEPENDENCY_NONE_VALUES and dep_id not in known_ids:
-                    errors.append(
-                        f"{row_id}: dependency '{dep_id}' not found in backlog index"
-                    )
+                    errors.append(f"{row_id}: dependency '{dep_id}' not found in backlog index")
 
     def log_to_traceability_matrix(self, matrix_path: Path, spec_ref: str, test_ref: str) -> None:
         """Append an entry to the traceability matrix.
@@ -272,10 +271,7 @@ class BacklogManager:
         """
         canonical = VALID_STATUSES.get(new_status.lower())
         if canonical is None:
-            raise ValueError(
-                f"Invalid status '{new_status}'. "
-                f"Valid statuses: {', '.join(sorted(VALID_STATUSES))}"
-            )
+            raise ValueError(f"Invalid status '{new_status}'. Valid statuses: {', '.join(sorted(VALID_STATUSES))}")
 
         self._update_status(work_unit_path, canonical)
         self._update_backlog_index(backlog_index, unit_id, canonical)
@@ -384,7 +380,10 @@ class BacklogManager:
         return parent_found and has_children
 
     def _find_work_unit_file(
-        self, rows: list[tuple[str, str, str]], unit_id: str, workspace_root: Path,
+        self,
+        rows: list[tuple[str, str, str]],
+        unit_id: str,
+        workspace_root: Path,
     ) -> Path | None:
         """Find the work unit file path for a given ID."""
         for row_id, _, file_path in rows:
@@ -446,7 +445,10 @@ class BacklogManager:
         """Append a comment entry to the Comments section of a work-unit file."""
         timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
         entry = COMMENT_ENTRY_TEMPLATE.format(
-            timestamp=timestamp, agent_id="backlog_manager", action=action, message=message,
+            timestamp=timestamp,
+            agent_id="backlog_manager",
+            action=action,
+            message=message,
         )
 
         content = work_unit_path.read_text(encoding="utf-8")
@@ -471,7 +473,9 @@ class BacklogManager:
         """
         timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
         entry = COMMENT_AGENT_TEMPLATE.format(
-            timestamp=timestamp, name=agent_name, message=message,
+            timestamp=timestamp,
+            name=agent_name,
+            message=message,
         )
 
         content = work_unit_path.read_text(encoding="utf-8")
@@ -566,9 +570,7 @@ class BacklogManager:
 
         return titles
 
-    def _compute_epic_counts(
-        self, rows: list[tuple[str, str, str]]
-    ) -> dict[str, dict[str, int]]:
+    def _compute_epic_counts(self, rows: list[tuple[str, str, str]]) -> dict[str, dict[str, int]]:
         """Compute per-epic status counts from backlog rows.
 
         Returns a dict mapping epic_id -> {status: count} where status is one of
@@ -612,12 +614,7 @@ class BacklogManager:
                 f"{c[STATUS_IN_PROGRESS]} | {c[STATUS_IN_QUEUE]} | {c[STATUS_BLOCKED]} |\n"
             )
 
-        return (
-            STATUS_SUMMARY_SECTION_HEADER + "\n\n"
-            + STATUS_SUMMARY_TABLE_HEADER
-            + table_rows
-            + "\n"
-        )
+        return STATUS_SUMMARY_SECTION_HEADER + "\n\n" + STATUS_SUMMARY_TABLE_HEADER + table_rows + "\n"
 
     def _strip_summary_section(self, content: str) -> str:
         """Remove the existing Status Summary section from BACKLOG.md content."""
@@ -636,8 +633,7 @@ class BacklogManager:
 
         if STATUS_SUMMARY_SECTION_HEADER not in content:
             errors.append(
-                "Status Summary section missing from BACKLOG.md — "
-                "run '_update_status_summary' to generate it"
+                "Status Summary section missing from BACKLOG.md — run '_update_status_summary' to generate it"
             )
             return
 
@@ -647,9 +643,7 @@ class BacklogManager:
 
         for epic_id, expected in epic_counts.items():
             if epic_id not in actual_counts:
-                errors.append(
-                    f"Status Summary missing epic row '{epic_id}'"
-                )
+                errors.append(f"Status Summary missing epic row '{epic_id}'")
                 continue
             actual = actual_counts[epic_id]
             for status_key in (STATUS_DONE, STATUS_IN_PROGRESS, STATUS_IN_QUEUE, STATUS_BLOCKED):
@@ -693,3 +687,87 @@ class BacklogManager:
                 continue
 
         return result
+
+    def _check_task_content(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """Checks 6-10: validate content quality for task-level work units.
+
+        Only task files (IDs ending with -T{n}) are checked. Epic, Feature,
+        and Story files are skipped because they do not require the same
+        level of detail.
+        """
+        for row_id, _, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not file_path_str:
+                continue
+            if not self._is_task_id(row_id):
+                continue
+
+            wu_path = workspace_root / file_path_str
+            if not wu_path.exists():
+                continue  # Already reported by _check_files_and_statuses
+
+            content = wu_path.read_text(encoding="utf-8")
+            sections = self._extract_sections(content)
+
+            # Check 6: non-empty Description
+            if "Description" not in sections:
+                errors.append(f"{row_id}: missing required '## Description' section")
+            elif not sections["Description"].strip():
+                errors.append(f"{row_id}: '## Description' section is empty")
+
+            # Check 7: Acceptance Criteria with AC- items
+            if "Acceptance Criteria" not in sections:
+                errors.append(f"{row_id}: missing required '## Acceptance Criteria' section")
+            elif "AC-" not in sections["Acceptance Criteria"]:
+                errors.append(f"{row_id}: '## Acceptance Criteria' has no AC- items")
+
+            # Check 8: Changes Manifest with entries
+            if "Changes Manifest" not in sections:
+                errors.append(f"{row_id}: missing required '## Changes Manifest' section")
+
+            # Check 9: Definition of Done
+            if "Definition of Done" not in sections:
+                errors.append(f"{row_id}: missing required '## Definition of Done' section")
+
+            # Check 10: no em-dash (U+2014)
+            if "\u2014" in content:
+                errors.append(f"{row_id}: contains em-dash character (U+2014) -- use double hyphen instead")
+
+    @staticmethod
+    def _is_task_id(unit_id: str) -> bool:
+        """Return True if the ID represents a task (contains -T followed by digits)."""
+        parts = unit_id.split("-")
+        return any(p.startswith("T") and p[1:].isdigit() for p in parts)
+
+    @staticmethod
+    def _extract_sections(content: str) -> dict[str, str]:
+        """Extract ## sections from markdown content into a dict.
+
+        Keys are section names (without '## ' prefix), values are the
+        body text between this heading and the next ## heading.
+        """
+        sections: dict[str, str] = {}
+        current_name: str | None = None
+        current_lines: list[str] = []
+
+        for line in content.splitlines():
+            if line.startswith("## "):
+                if current_name is not None:
+                    sections[current_name] = "\n".join(current_lines)
+                heading = line[3:].strip()
+                # Handle "## Status: in-queue" -> key "Status"
+                current_name = heading.split(":")[0].strip()
+                current_lines = []
+            elif current_name is not None:
+                current_lines.append(line)
+
+        if current_name is not None:
+            sections[current_name] = "\n".join(current_lines)
+
+        return sections

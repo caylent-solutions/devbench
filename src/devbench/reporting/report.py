@@ -12,11 +12,18 @@ from pathlib import Path
 
 from devbench.backlog.parser import BacklogParser
 from devbench.backlog.work_unit import WorkUnitStatus, WorkUnitType
-from devbench.config import BACKLOG_INDEX, BACKLOG_ROOT
+from devbench.config import (
+    BACKLOG_INDEX,
+    BACKLOG_ROOT,
+    TOKEN_COST_INPUT_RATIO,
+    TOKEN_COST_PER_M_INPUT,
+    TOKEN_COST_PER_M_OUTPUT,
+)
 
-_DONE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})Z .* Set (E\S+) to done", re.MULTILINE)
-_PROGRESS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})Z .* Set (E\S+) to in-progress", re.MULTILINE)
+_DONE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})Z .* Set (E\S+) to 'done'", re.MULTILINE)
+_PROGRESS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})Z .* Set (E\S+) to 'in-progress'", re.MULTILINE)
 _TIMESTAMP_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})Z", re.MULTILINE)
+_TOTAL_TOKENS_RE = re.compile(r'"totalTokens":(\d+)')
 
 
 def _parse_ts(raw: str) -> datetime:
@@ -72,10 +79,7 @@ def generate_report(log_path: Path, since: datetime | None = None) -> str:
     session_hours = (session_end - session_start).total_seconds() / 3600
 
     # Tasks done in session (from log, filtered by since)
-    task_ids_done_session = {
-        uid for uid, ts in done_times.items()
-        if "-T" in uid and ts >= session_start
-    }
+    task_ids_done_session = {uid for uid, ts in done_times.items() if "-T" in uid and ts >= session_start}
     tasks_in_session = len(task_ids_done_session)
 
     # Per-task durations (in-progress -> done), filtered by since.
@@ -92,6 +96,28 @@ def generate_report(log_path: Path, since: datetime | None = None) -> str:
     avg_minutes = sum(task_durations) / len(task_durations) if task_durations else 0.0
     tasks_remaining = len(tasks) - len(tasks_done)
     est_hours = (tasks_remaining * avg_minutes) / 60 if avg_minutes else 0.0
+
+    # Parse token usage from hook-logs.jsonl (sibling to BACKLOG.md).
+    hook_log_path = log_path.parent.parent / "hook-logs.jsonl"
+    if not hook_log_path.is_file():
+        # Try workspace root (where BACKLOG.md lives).
+        hook_log_path = BACKLOG_INDEX.parent / "hook-logs.jsonl"
+
+    total_tokens = 0
+    if hook_log_path.is_file():
+        hook_text = hook_log_path.read_text(encoding="utf-8")
+        for m in _TOTAL_TOKENS_RE.finditer(hook_text):
+            total_tokens += int(m.group(1))
+
+    blended_per_m = TOKEN_COST_PER_M_INPUT * TOKEN_COST_INPUT_RATIO + TOKEN_COST_PER_M_OUTPUT * (
+        1.0 - TOKEN_COST_INPUT_RATIO
+    )
+    total_tokens_m = total_tokens / 1_000_000
+    est_cost = total_tokens_m * blended_per_m
+    tokens_per_task = total_tokens / tasks_in_session if tasks_in_session else 0.0
+    est_total_cost = (
+        est_cost + (tokens_per_task * tasks_remaining / 1_000_000 * blended_per_m) if tokens_per_task else 0.0
+    )
 
     # Render table
     lines: list[str] = []
@@ -130,6 +156,14 @@ def generate_report(log_path: Path, since: datetime | None = None) -> str:
     row("Tasks remaining", str(tasks_remaining))
     sep()
     row("Estimated time to complete", f"~{est_hours:.1f} hours")
+    sep()
+    row("Tokens consumed", f"{total_tokens:,}")
+    sep()
+    row("Estimated cost so far", f"~${est_cost:.2f}")
+    sep()
+    row("Avg tokens per task", f"{tokens_per_task:,.0f}" if tokens_per_task else "n/a")
+    sep()
+    row("Estimated total cost at completion", f"~${est_total_cost:.2f}" if est_total_cost else "n/a")
 
     lines.append("\u2514" + "\u2500" * 62 + "\u2534" + "\u2500" * 18 + "\u2518")
     lines.append("")
@@ -138,5 +172,13 @@ def generate_report(log_path: Path, since: datetime | None = None) -> str:
         f"the remaining {tasks_remaining} tasks should take roughly "
         f"{est_hours:.1f} more hours of continuous execution."
     )
+    if est_total_cost:
+        lines.append(
+            f"Token cost estimate uses blended rate "
+            f"(${blended_per_m:.0f}/M tokens, "
+            f"{TOKEN_COST_INPUT_RATIO:.0%} input @ ${TOKEN_COST_PER_M_INPUT:.0f}/M, "
+            f"{1.0 - TOKEN_COST_INPUT_RATIO:.0%} output @ ${TOKEN_COST_PER_M_OUTPUT:.0f}/M). "
+            f"Override in devbench.yaml under git_ops."
+        )
 
     return "\n".join(lines)

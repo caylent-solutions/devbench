@@ -39,12 +39,9 @@ class TestAllowedRepos:
         with patch.dict(os.environ, env, clear=True):
             importlib.reload(config)
             assert isinstance(config.ALLOWED_REPOS, frozenset), (
-                f"Expected ALLOWED_REPOS to be a frozenset after reload, "
-                f"got {type(config.ALLOWED_REPOS).__name__}"
+                f"Expected ALLOWED_REPOS to be a frozenset after reload, got {type(config.ALLOWED_REPOS).__name__}"
             )
-            assert len(config.ALLOWED_REPOS) > 0, (
-                "Expected ALLOWED_REPOS to be non-empty (sourced from YAML fixture)"
-            )
+            assert len(config.ALLOWED_REPOS) > 0, "Expected ALLOWED_REPOS to be non-empty (sourced from YAML fixture)"
 
         importlib.reload(config)
 
@@ -52,9 +49,7 @@ class TestAllowedRepos:
         """JUDGE_ALLOWED_REPOS env var is ignored — repos come from YAML only."""
         # Capture the baseline ALLOWED_REPOS before patching.
         baseline = frozenset(config.ALLOWED_REPOS)
-        assert len(baseline) > 0, (
-            "Baseline ALLOWED_REPOS must be non-empty for this test to be meaningful"
-        )
+        assert len(baseline) > 0, "Baseline ALLOWED_REPOS must be non-empty for this test to be meaningful"
 
         with patch.dict(os.environ, {"JUDGE_ALLOWED_REPOS": "org/repo-a,org/repo-b"}, clear=False):
             importlib.reload(config)
@@ -74,13 +69,10 @@ class TestAllowedRepos:
               (state is unchanged — validate_repo is a pure validator with no side effects)
         """
         repo = next(iter(ALLOWED_REPOS))
-        assert repo in ALLOWED_REPOS, (
-            f"Precondition failed: '{repo}' should be in ALLOWED_REPOS"
-        )
+        assert repo in ALLOWED_REPOS, f"Precondition failed: '{repo}' should be in ALLOWED_REPOS"
         validate_repo(repo)
         assert repo in ALLOWED_REPOS, (
-            f"Post-condition failed: validate_repo must not modify ALLOWED_REPOS; "
-            f"'{repo}' was removed after the call"
+            f"Post-condition failed: validate_repo must not modify ALLOWED_REPOS; '{repo}' was removed after the call"
         )
 
     def test_validate_repo_raises_for_unknown_repo(self) -> None:
@@ -96,6 +88,27 @@ class TestAllowedRepos:
         with patch.object(config, "ALLOWED_GH_ORG", ""):
             with pytest.raises(ValueError, match="not allowed"):
                 config.validate_repo("other-org/some-repo")
+
+
+@pytest.mark.unit
+class TestResolveRepo:
+    """Test resolve_repo resolution logic."""
+
+    def test_returns_full_name_when_already_in_allowed_repos(self) -> None:
+        """Line 75-76: returns immediately when input is already a full name."""
+        result = config.resolve_repo(_ALLOWED_REPO_IN_FIXTURE)
+        assert result == _ALLOWED_REPO_IN_FIXTURE
+
+    def test_resolves_short_name_to_full_name(self) -> None:
+        """Lines 77-79: resolves a short repo name to its fully-qualified form."""
+        # The fixture has "caylent-solutions/git-repo", so "git-repo" should resolve
+        result = config.resolve_repo("git-repo")
+        assert result == _ALLOWED_REPO_IN_FIXTURE
+
+    def test_raises_for_unknown_name(self) -> None:
+        """Line 80-83: raises ValueError when the name is not in either mapping."""
+        with pytest.raises(ValueError, match="not recognised"):
+            config.resolve_repo("completely-unknown-repo")
 
 
 @pytest.mark.unit
@@ -151,12 +164,16 @@ class TestGetAnthropicApiKey:
 
     def test_reads_token_from_credentials_file(self, tmp_path: Path) -> None:
         creds_file = tmp_path / "credentials.json"
-        creds_file.write_text(json.dumps({
-            "claudeAiOauth": {
-                "accessToken": "sk-ant-oat01-test-token",
-                "scopes": ["user:inference"],
-            }
-        }))
+        creds_file.write_text(
+            json.dumps(
+                {
+                    "claudeAiOauth": {
+                        "accessToken": "sk-ant-oat01-test-token",
+                        "scopes": ["user:inference"],
+                    }
+                }
+            )
+        )
 
         with patch.object(config, "CLAUDE_CREDENTIALS_FILE", creds_file):
             result = config.get_anthropic_api_key()
@@ -180,9 +197,7 @@ class TestGetAnthropicApiKey:
 
     def test_raises_when_token_empty(self, tmp_path: Path) -> None:
         creds_file = tmp_path / "credentials.json"
-        creds_file.write_text(json.dumps({
-            "claudeAiOauth": {"accessToken": "  ", "scopes": []}
-        }))
+        creds_file.write_text(json.dumps({"claudeAiOauth": {"accessToken": "  ", "scopes": []}}))
 
         with patch.object(config, "CLAUDE_CREDENTIALS_FILE", creds_file):
             with pytest.raises(RuntimeError, match="No access token"):

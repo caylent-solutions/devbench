@@ -163,5 +163,3 @@ class TestRunCommandTimeout:
         with patch("devbench.utils.process.subprocess.run", side_effect=exc):
             rc, _, _ = run_command(["hang"], timeout=1)
         assert rc == 127
-
-

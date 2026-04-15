@@ -40,8 +40,7 @@ ALLOWED_GH_ORG: str = os.environ.get("JUDGE_GH_ORG", "")
 _workspace_root = os.environ.get("JUDGE_WORKSPACE_ROOT", "")
 if not _workspace_root:
     raise RuntimeError(
-        "JUDGE_WORKSPACE_ROOT environment variable is not set. "
-        "Set it to the absolute path of your workspace root."
+        "JUDGE_WORKSPACE_ROOT environment variable is not set. Set it to the absolute path of your workspace root."
     )
 WORKSPACE_ROOT: Path = Path(_workspace_root)
 
@@ -64,9 +63,7 @@ REPO_LOCAL_PATHS: dict[str, Path] = {
 # Short name -> full name mapping for backlog compatibility.
 # The backlog table uses short names (e.g., "git-repo") while the allow-list
 # uses fully-qualified names (e.g., "caylent-solutions/git-repo").
-REPO_SHORT_TO_FULL: dict[str, str] = {
-    repo.split("/", maxsplit=1)[1]: repo for repo in ALLOWED_REPOS
-}
+REPO_SHORT_TO_FULL: dict[str, str] = {repo.split("/", maxsplit=1)[1]: repo for repo in ALLOWED_REPOS}
 
 
 def resolve_repo(short_or_full: str) -> str:
@@ -129,6 +126,11 @@ except ValueError:
     ) from None
 
 UPDATE_SUBMODULE: bool = RUNTIME_CONFIG.git_ops.update_submodule
+SINGLE_BRANCH: str | None = RUNTIME_CONFIG.git_ops.single_branch
+DEFER_PR: bool = RUNTIME_CONFIG.git_ops.defer_pr
+TOKEN_COST_PER_M_INPUT: float = RUNTIME_CONFIG.git_ops.token_cost_per_million_input
+TOKEN_COST_PER_M_OUTPUT: float = RUNTIME_CONFIG.git_ops.token_cost_per_million_output
+TOKEN_COST_INPUT_RATIO: float = RUNTIME_CONFIG.git_ops.token_cost_input_ratio
 USE_BEDROCK: bool = os.environ.get("JUDGE_USE_BEDROCK", "").lower() in ("1", "true", "yes")
 BEDROCK_REGION: str = os.environ.get("JUDGE_BEDROCK_REGION", os.environ.get("AWS_REGION", "us-east-1"))
 
@@ -178,8 +180,7 @@ def validate_repo(repo: str) -> None:
         org = repo.split("/", maxsplit=1)[0]
         if org != ALLOWED_GH_ORG:
             raise ValueError(
-                f"Repository '{repo}' belongs to org '{org}', "
-                f"but JUDGE_GH_ORG restricts access to '{ALLOWED_GH_ORG}'."
+                f"Repository '{repo}' belongs to org '{org}', but JUDGE_GH_ORG restricts access to '{ALLOWED_GH_ORG}'."
             )
     if repo not in ALLOWED_REPOS:
         raise ValueError(f"Repository '{repo}' is not allowed. Allowed repositories: {sorted(ALLOWED_REPOS)}")
@@ -205,15 +206,12 @@ def get_anthropic_api_key() -> str:
         raw = CLAUDE_CREDENTIALS_FILE.read_text(encoding="utf-8")
         data = json.loads(raw)
     except (OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError(
-            f"Failed to read Claude credentials from '{CLAUDE_CREDENTIALS_FILE}': {exc}"
-        ) from exc
+        raise RuntimeError(f"Failed to read Claude credentials from '{CLAUDE_CREDENTIALS_FILE}': {exc}") from exc
 
     oauth = data.get("claudeAiOauth")
     if not isinstance(oauth, dict):
         raise RuntimeError(
-            f"Unexpected credentials structure in '{CLAUDE_CREDENTIALS_FILE}': "
-            "missing 'claudeAiOauth' object."
+            f"Unexpected credentials structure in '{CLAUDE_CREDENTIALS_FILE}': missing 'claudeAiOauth' object."
         )
 
     token = oauth.get("accessToken", "").strip()

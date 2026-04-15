@@ -165,6 +165,34 @@ class TestEnableSecurityFeatures:
         assert results["dependabot_alerts"] is True
 
 
+class TestRequireField:
+    """Test _require_field helper function."""
+
+    def test_raises_when_intermediate_key_is_not_dict(self) -> None:
+        """Line 23: raises RuntimeError when intermediate value is not a dict."""
+        from devbench.github.security import _require_field
+
+        data = {"rule": "not_a_dict"}
+        with pytest.raises(RuntimeError, match="Expected dict"):
+            _require_field(data, "rule", "id")
+
+    def test_raises_when_key_is_missing(self) -> None:
+        """Line 26: raises RuntimeError when required key is missing."""
+        from devbench.github.security import _require_field
+
+        data = {"rule": {"severity": "high"}}
+        with pytest.raises(RuntimeError, match="Required field"):
+            _require_field(data, "rule", "id")
+
+    def test_returns_value_when_present(self) -> None:
+        """Verify happy path returns the value as string."""
+        from devbench.github.security import _require_field
+
+        data = {"rule": {"id": "py/sql-injection"}}
+        result = _require_field(data, "rule", "id")
+        assert result == "py/sql-injection"
+
+
 class TestGhApi:
     """Test _gh_api helper function."""
 

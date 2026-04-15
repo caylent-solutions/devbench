@@ -138,9 +138,7 @@ def get_security_report(repo: str) -> SecurityReport:
         try:
             alerts = json.loads(output)
         except json.JSONDecodeError as exc:
-            raise RuntimeError(
-                f"Failed to parse {category} alerts for {repo}: {exc}"
-            ) from exc
+            raise RuntimeError(f"Failed to parse {category} alerts for {repo}: {exc}") from exc
 
         for alert in alerts:
             if category == "code-scanning":

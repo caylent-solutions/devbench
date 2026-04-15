@@ -7,12 +7,7 @@ from pathlib import Path
 
 import pytest
 
-AGENTS_DIR = (
-    Path(__file__).parent.parent.parent
-    / "plugin"
-    / "devbench"
-    / "agents"
-)
+AGENTS_DIR = Path(__file__).parent.parent.parent / "plugin" / "devbench" / "agents"
 
 REVIEW_TEAM_DIR = AGENTS_DIR / "review_team"
 
@@ -30,9 +25,7 @@ class TestReviewTeamDirectory:
 
     def test_review_team_dir_exists(self) -> None:
         """review_team/ directory must exist under agents/."""
-        assert REVIEW_TEAM_DIR.is_dir(), (
-            f"Expected directory not found: {REVIEW_TEAM_DIR}"
-        )
+        assert REVIEW_TEAM_DIR.is_dir(), f"Expected directory not found: {REVIEW_TEAM_DIR}"
 
     def test_review_team_dir_contains_exactly_four_agents(self) -> None:
         """AC-1: review_team/ must contain exactly code-reviewer, test-reviewer, doc-reviewer, changes-manifest."""
@@ -44,9 +37,7 @@ class TestReviewTeamDirectory:
         }
         actual = {p.name for p in REVIEW_TEAM_DIR.glob("*.md")}
         assert actual == expected, (
-            f"review_team/ contents mismatch.\n"
-            f"  Expected: {sorted(expected)}\n"
-            f"  Actual:   {sorted(actual)}"
+            f"review_team/ contents mismatch.\n  Expected: {sorted(expected)}\n  Actual:   {sorted(actual)}"
         )
 
 
@@ -58,9 +49,7 @@ class TestReviewSupervisorFrontmatter:
 
     def test_review_supervisor_file_exists(self) -> None:
         """review-supervisor.md must exist at agents/review-supervisor.md."""
-        assert self._SUPERVISOR_PATH.exists(), (
-            f"review-supervisor.md not found at {self._SUPERVISOR_PATH}"
-        )
+        assert self._SUPERVISOR_PATH.exists(), f"review-supervisor.md not found at {self._SUPERVISOR_PATH}"
 
     def test_review_supervisor_frontmatter_valid(self) -> None:
         """AC-2: Frontmatter must contain name: review-supervisor and tools: Bash, Agent(...)."""
@@ -81,15 +70,9 @@ class TestReviewSupervisorFrontmatter:
         assert "name: review-supervisor" in frontmatter, (
             f"Frontmatter must contain 'name: review-supervisor'. Got:\n{frontmatter}"
         )
-        assert "tools:" in frontmatter, (
-            f"Frontmatter must contain a tools: field. Got:\n{frontmatter}"
-        )
-        assert "Bash" in frontmatter, (
-            f"Frontmatter tools must include Bash. Got:\n{frontmatter}"
-        )
-        assert "Agent" in frontmatter, (
-            f"Frontmatter tools must include Agent(...). Got:\n{frontmatter}"
-        )
+        assert "tools:" in frontmatter, f"Frontmatter must contain a tools: field. Got:\n{frontmatter}"
+        assert "Bash" in frontmatter, f"Frontmatter tools must include Bash. Got:\n{frontmatter}"
+        assert "Agent" in frontmatter, f"Frontmatter tools must include Agent(...). Got:\n{frontmatter}"
 
 
 @pytest.mark.unit
@@ -104,9 +87,7 @@ class TestSecurityReviewerNotInReviewTeam:
 
     def test_security_reviewer_at_agents_root(self) -> None:
         """AC-7: security-reviewer.md must exist at agents/ root."""
-        assert (AGENTS_DIR / "security-reviewer.md").exists(), (
-            "security-reviewer.md must remain at agents/ root"
-        )
+        assert (AGENTS_DIR / "security-reviewer.md").exists(), "security-reviewer.md must remain at agents/ root"
 
 
 @pytest.mark.unit
@@ -143,9 +124,7 @@ class TestReviewTeamModelUpgrade:
         content = agent_path.read_text()
 
         lines = content.splitlines()
-        assert lines[0].strip() == "---", (
-            f"{agent_filename} must start with --- frontmatter delimiter"
-        )
+        assert lines[0].strip() == "---", f"{agent_filename} must start with --- frontmatter delimiter"
         end_idx = next(
             (i for i, line in enumerate(lines[1:], start=1) if line.strip() == "---"),
             None,
@@ -154,8 +133,7 @@ class TestReviewTeamModelUpgrade:
         frontmatter = "\n".join(lines[1:end_idx])
 
         assert re.search(r"^model:\s*sonnet\s*$", frontmatter, re.MULTILINE), (
-            f"{agent_filename} must declare 'model: sonnet' in frontmatter.\n"
-            f"Found frontmatter:\n{frontmatter}"
+            f"{agent_filename} must declare 'model: sonnet' in frontmatter.\nFound frontmatter:\n{frontmatter}"
         )
 
 
@@ -203,9 +181,7 @@ class TestReviewerLogCommentBeforeLogVerdict:
     """AC-1, AC-3: Reviewers must instruct agents to log-comment before log-verdict."""
 
     @pytest.mark.parametrize("agent_filename", REVIEW_TEAM_AGENTS)
-    def test_reviewer_instructs_log_comment_before_log_verdict(
-        self, agent_filename: str
-    ) -> None:
+    def test_reviewer_instructs_log_comment_before_log_verdict(self, agent_filename: str) -> None:
         """AC-1, AC-3: Each reviewer prompt must instruct log-comment before log-verdict."""
         agent_path = REVIEW_TEAM_DIR / agent_filename
         content = agent_path.read_text()
@@ -214,9 +190,7 @@ class TestReviewerLogCommentBeforeLogVerdict:
             f"{agent_filename} must instruct the agent to call log-comment "
             "for each finding or confirmation before logging the verdict."
         )
-        assert "log-verdict" in content, (
-            f"{agent_filename} must instruct the agent to call log-verdict."
-        )
+        assert "log-verdict" in content, f"{agent_filename} must instruct the agent to call log-verdict."
 
         log_comment_pos = content.find("log-comment")
         log_verdict_pos = content.find("log-verdict")
@@ -237,15 +211,9 @@ class TestReviewerJsonEnvelope:
         agent_path = REVIEW_TEAM_DIR / agent_filename
         content = agent_path.read_text()
 
-        assert '"verdict"' in content, (
-            f"{agent_filename} must include JSON envelope format with 'verdict' field."
-        )
-        assert '"summary"' in content, (
-            f"{agent_filename} must include JSON envelope format with 'summary' field."
-        )
-        assert '"findings"' in content, (
-            f"{agent_filename} must include JSON envelope format with 'findings' array."
-        )
+        assert '"verdict"' in content, f"{agent_filename} must include JSON envelope format with 'verdict' field."
+        assert '"summary"' in content, f"{agent_filename} must include JSON envelope format with 'summary' field."
+        assert '"findings"' in content, f"{agent_filename} must include JSON envelope format with 'findings' array."
 
     @pytest.mark.parametrize("agent_filename", REVIEW_TEAM_AGENTS)
     def test_reviewer_json_envelope_is_last_output(self, agent_filename: str) -> None:
@@ -258,10 +226,7 @@ class TestReviewerJsonEnvelope:
             r"last\s+(thing|content|output)\b",
             content,
             re.IGNORECASE,
-        ), (
-            f"{agent_filename} must instruct the agent that the JSON envelope is "
-            "the last thing output in the response."
-        )
+        ), f"{agent_filename} must instruct the agent that the JSON envelope is the last thing output in the response."
 
 
 @pytest.mark.unit
@@ -289,14 +254,12 @@ class TestReviewSupervisorUsesJsonEnvelope:
         """AC-6, AC-9: Supervisor must instruct parsing of reviewer JSON envelope."""
         content = self._SUPERVISOR_PATH.read_text()
         assert re.search(r"\bjson\b", content, re.IGNORECASE), (
-            "review-supervisor.md must instruct parsing the reviewer JSON envelope "
-            "to extract verdicts and summaries."
+            "review-supervisor.md must instruct parsing the reviewer JSON envelope to extract verdicts and summaries."
         )
 
     def test_supervisor_fail_branch_logs_findings_as_comments(self) -> None:
         """AC-6: Supervisor FAIL branch must relay individual findings via log-comment."""
         content = self._SUPERVISOR_PATH.read_text()
         assert "log-comment" in content, (
-            "review-supervisor.md must use log-comment to relay reviewer findings "
-            "in the FAIL branch."
+            "review-supervisor.md must use log-comment to relay reviewer findings in the FAIL branch."
         )

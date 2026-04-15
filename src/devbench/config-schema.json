@@ -127,6 +127,26 @@
         "update_submodule": {
           "type": "boolean",
           "description": "When true, update the parent repo's submodule reference after each PR merge. Set to true only when target repos are git submodules of a parent workspace repo."
+        },
+        "single_branch": {
+          "type": "string",
+          "description": "When set, all work units use this branch name instead of per-unit backlog/<id> branches. Enables accumulating multiple commits on one branch for a single PR."
+        },
+        "defer_pr": {
+          "type": "boolean",
+          "description": "When true, git-ops commits locally only (no push, no PR, no merge). Use git-ops-finalize to push and create the PR after all work units are complete. Only meaningful when single_branch is set."
+        },
+        "token_cost_per_million_input": {
+          "type": "number",
+          "description": "Cost per million input tokens in USD. Used for report cost estimates. Default: 15.0 (Opus list price)."
+        },
+        "token_cost_per_million_output": {
+          "type": "number",
+          "description": "Cost per million output tokens in USD. Used for report cost estimates. Default: 75.0 (Opus list price)."
+        },
+        "token_cost_input_ratio": {
+          "type": "number",
+          "description": "Estimated fraction of tokens that are input (0.0-1.0). Used for blended cost calculation. Default: 0.80."
         }
       }
     },

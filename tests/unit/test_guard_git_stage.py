@@ -10,13 +10,7 @@ from pathlib import Path
 
 import pytest
 
-SCRIPT_PATH = (
-    Path(__file__).parent.parent.parent
-    / "plugin"
-    / "devbench"
-    / "scripts"
-    / "guard-git-stage.sh"
-)
+SCRIPT_PATH = Path(__file__).parent.parent.parent / "plugin" / "devbench" / "scripts" / "guard-git-stage.sh"
 
 
 def _run_hook(payload: dict, cwd: str | None = None) -> subprocess.CompletedProcess:
@@ -94,9 +88,9 @@ class TestGuardGitStageHook:
         assert result.returncode == 2
         stderr_lower = result.stderr.lower()
         # Must mention staging, git add, or similar guidance
-        assert any(
-            word in stderr_lower for word in ["stage", "git add", "staged", "nothing"]
-        ), f"Error message not actionable: {result.stderr}"
+        assert any(word in stderr_lower for word in ["stage", "git add", "staged", "nothing"]), (
+            f"Error message not actionable: {result.stderr}"
+        )
 
     def test_git_commit_with_no_changes_message_mentions_git_add(self) -> None:
         """AC-2: Error message must tell the user to use git add."""

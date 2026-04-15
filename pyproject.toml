@@ -24,6 +24,7 @@ packages = ["src/devbench"]
 [tool.uv]
 dev-dependencies = [
     "pytest>=9.0.0",
+    "pytest-cov>=7.0.0",
     "ruff>=0.15.0",
     "bandit>=1.8.0",
     "mypy>=1.15.0",

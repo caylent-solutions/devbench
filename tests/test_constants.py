@@ -14,6 +14,7 @@ class TestStatusStringConstants:
             STATUS_IN_QUEUE,
             STATUS_IN_REVIEW,
         )
+
         assert STATUS_IN_QUEUE == "in-queue"
         assert STATUS_IN_PROGRESS == "in-progress"
         assert STATUS_IN_REVIEW == "in-review"
@@ -22,6 +23,7 @@ class TestStatusStringConstants:
 
     def test_valid_statuses_is_in_constants(self) -> None:
         from devbench.constants import VALID_STATUSES
+
         assert isinstance(VALID_STATUSES, dict)
         assert set(VALID_STATUSES.keys()) == {"in-queue", "in-progress", "in-review", "done", "blocked"}
 
@@ -34,6 +36,7 @@ class TestStatusStringConstants:
             STATUS_IN_REVIEW,
             VALID_STATUSES,
         )
+
         assert STATUS_IN_QUEUE in VALID_STATUSES
         assert STATUS_IN_PROGRESS in VALID_STATUSES
         assert STATUS_IN_REVIEW in VALID_STATUSES
@@ -43,4 +46,5 @@ class TestStatusStringConstants:
     def test_valid_statuses_still_importable_from_manager(self) -> None:
         """Backward-compatible re-export from manager.py."""
         from devbench.backlog.manager import VALID_STATUSES
+
         assert "done" in VALID_STATUSES

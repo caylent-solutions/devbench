@@ -126,19 +126,17 @@ blended_per_M = (5.0 * 0.80) + (25.0 * 0.20) = $9.00 / 1M tokens
 
 ---
 
-## Current code defaults vs published rates
+## Current code defaults
 
 `src/devbench/constants.py` defines:
 
 ```python
-DEFAULT_TOKEN_COST_PER_M_INPUT: float = 15.0
-DEFAULT_TOKEN_COST_PER_M_OUTPUT: float = 75.0
+DEFAULT_TOKEN_COST_PER_M_INPUT: float = 5.0
+DEFAULT_TOKEN_COST_PER_M_OUTPUT: float = 25.0
 DEFAULT_TOKEN_COST_INPUT_RATIO: float = 0.80
 ```
 
-These reflect **Opus 4.1 / Opus 4** pricing, not the current Opus 4.7. If you do not override them in your `report:` section, `devbench report` will overstate cost by ~3x when running Opus 4.7.
-
-**Recommendation:** set `report:` values explicitly in your `devbench.yaml` to match your model. The code defaults can be refreshed in a follow-up code change to track current Opus pricing — that's a separate code task tracked outside this doc.
+These reflect current **Opus 4.7** pricing. If you run a different model — Sonnet, Haiku, or any older Opus generation — set the `report:` values explicitly in your `devbench.yaml` using the table above so `devbench report` produces accurate cost estimates for your model.
 
 ---
 

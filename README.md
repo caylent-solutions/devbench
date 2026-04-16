@@ -355,12 +355,12 @@ The `report` command shows token consumption and estimated cost. Pricing is conf
 
 ```yaml
 report:
-  token_cost_per_million_input: 5.0     # Opus 4.7 (default constant: 15.0)
-  token_cost_per_million_output: 25.0   # Opus 4.7 (default constant: 75.0)
+  token_cost_per_million_input: 5.0     # Opus 4.7 (matches default constant)
+  token_cost_per_million_output: 25.0   # Opus 4.7 (matches default constant)
   token_cost_input_ratio: 0.80          # default: 0.80 (assumed input/output mix)
 ```
 
-> The current code defaults (`15.0` / `75.0`) reflect Opus 4.1 pricing. If you are running Opus 4.7 or newer, set the values above explicitly to avoid overstating cost by ~3x. See the [model pricing doc](docs/model-pricing.md) for the full rate table.
+> Code defaults match Opus 4.7. If you run a different model (Sonnet, Haiku, or an older Opus generation), override the values above per the [model pricing doc](docs/model-pricing.md).
 
 Token data is read from `hook-logs.jsonl` in the workspace root (written by Claude Code hooks). Cost is a blended estimate based on the input/output ratio — actual billing depends on your account terms and active prompt caching.
 

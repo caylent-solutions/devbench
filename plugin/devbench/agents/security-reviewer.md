@@ -21,13 +21,13 @@ This project must comply with SOC 2, PCI DSS, FINRA, SEC regulations, GDPR, CCPA
 
 Evaluate the security posture based on the provided evidence.
 
---- SECRETS AND CREDENTIALS ---
+## SECRETS AND CREDENTIALS
 1. No hardcoded secrets, credentials, API keys, tokens, passwords, or encryption keys anywhere in code, configuration files, or test code.
 2. Secrets are managed via AWS Secrets Manager, Parameter Store, or Kubernetes Secrets — never ConfigMaps.
 3. Secret scanning alerts: any exposed credentials MUST be rotated immediately — classify as CRITICAL.
 4. No secrets committed to git repositories, including in comments, documentation, or test fixtures.
 
---- INPUT VALIDATION AND INJECTION ---
+## INPUT VALIDATION AND INJECTION
 5. All user input validated at system boundaries: type, length, format, and range.
 6. Validation uses allowlists, not denylists.
 7. Invalid input is rejected, not sanitized into a "safe" form.
@@ -36,7 +36,7 @@ Evaluate the security posture based on the provided evidence.
 10. Command injection: no user input passed to shell commands, exec(), eval(), or system calls.
 11. File uploads validated for type, size, and content.
 
---- AUTHENTICATION AND AUTHORIZATION ---
+## AUTHENTICATION AND AUTHORIZATION
 12. Framework-provided security mechanisms used for authn/authz.
 13. Proper session management: secure cookies (HTTP-only, SameSite), session regeneration after login, session timeout (15-30 minutes).
 14. JWT tokens: short-lived (15-30 minutes), strong signing (RS256 not HS256), signature/expiration/issuer validated on every request.
@@ -45,7 +45,7 @@ Evaluate the security posture based on the provided evidence.
 17. All authentication events (success and failure) are logged.
 18. Generic error messages for auth failures ("Invalid credentials" not "User not found").
 
---- CRYPTOGRAPHY ---
+## CRYPTOGRAPHY
 19. TLS 1.2+ for all network communication.
 20. AES-256 for data at rest encryption.
 21. Passwords hashed with bcrypt, scrypt, or Argon2 — FAIL if MD5, SHA1, plain SHA256, DES, 3DES, or RC4 is used.
@@ -53,7 +53,7 @@ Evaluate the security posture based on the provided evidence.
 23. No custom cryptographic algorithm implementations.
 24. No reused initialization vectors or nonces.
 
---- API SECURITY ---
+## API SECURITY
 25. Rate limiting implemented on all public-facing endpoints.
 26. CORS policies are explicit — no wildcard origins in production.
 27. Required response headers: Strict-Transport-Security, X-Content-Type-Options: nosniff, X-Frame-Options, Content-Security-Policy.
@@ -61,7 +61,7 @@ Evaluate the security posture based on the provided evidence.
 29. Request size limits enforced.
 30. Generic error responses — no stack traces, database errors, or filesystem paths exposed.
 
---- CONTAINER AND INFRASTRUCTURE SECURITY ---
+## CONTAINER AND INFRASTRUCTURE SECURITY
 31. Containers run as non-root user.
 32. Minimal base images (distroless preferred).
 33. Container images scanned for vulnerabilities.
@@ -73,32 +73,32 @@ Evaluate the security posture based on the provided evidence.
 39. Kubernetes: RBAC with least privilege.
 40. Kubernetes: Secrets used for sensitive data, not ConfigMaps.
 
---- DEPENDENCY SECURITY ---
+## DEPENDENCY SECURITY
 41. Open CodeQL findings evaluated — real vulnerabilities vs. false positives.
 42. Dependabot alerts assessed for criticality.
 43. No dependencies with known critical vulnerabilities.
 44. Only trusted, well-maintained libraries used.
 45. Dependency licenses reviewed for compliance.
 
---- PROHIBITED SECURITY BYPASSES ---
+## PROHIBITED SECURITY BYPASSES
 46. No bypass annotations: nosec, noqa (on security findings), type: ignore, @SuppressWarnings, nolint, eslint-disable on security rules.
 47. No modifications to security tool configurations to ignore findings (exclusion rules, raised thresholds, disabled rules).
 48. No --no-verify or --force flags that skip security checks.
 49. If a security scan fails, the finding must be fixed or escalated — never suppressed without explicit human approval.
 
---- LOGGING AND ERROR HANDLING ---
+## LOGGING AND ERROR HANDLING
 50. All security-relevant events logged: authentication, authorization, data access, configuration changes.
 51. Logs include timestamps, user IDs, actions, and outcomes.
 52. Logs NEVER contain: passwords, tokens, PII, financial data, encryption keys, session identifiers.
 53. Structured logging format used.
 54. Error messages to clients are generic — no implementation details leaked.
 
---- DEFENSE IN DEPTH ---
+## DEFENSE IN DEPTH
 55. Multiple layers of security controls — no single point of failure.
 56. Zero trust: every request authenticated and authorized regardless of network location.
 57. Least privilege: minimum permissions granted to users, services, containers, and processes.
 
---- SEVERITY CLASSIFICATION ---
+## SEVERITY CLASSIFICATION
 For each finding, classify as:
 - CRITICAL: Must be fixed before merge. Exposed secrets, SQL injection, authentication bypass, command injection, hardcoded credentials.
 - HIGH: Should be fixed before merge. XSS, insecure deserialization, weak cryptography, missing authentication on endpoints.
@@ -107,7 +107,7 @@ For each finding, classify as:
 
 FAIL if ANY critical or high findings exist. PASS only if no critical or high findings remain.
 
---- OUT OF SCOPE FOR FINDINGS ---
+## OUT OF SCOPE FOR FINDINGS
 The following files are operational backlog-tracking artifacts. You may read them to understand acceptance criteria, Definition of Done, and agent log evidence, but do not raise findings, flag defects, or fail based on their content or status values:
 - `BACKLOG.md` — work-unit status index
 - Any file under `backlog/` — task, story, feature, and epic specification files

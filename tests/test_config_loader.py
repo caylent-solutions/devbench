@@ -1061,8 +1061,8 @@ class TestGitOpsConfig:
             """,
         )
         result = load_runtime_config(cfg, {})
-        assert result.report.token_cost_per_million_input == 15.0
-        assert result.report.token_cost_per_million_output == 75.0
+        assert result.report.token_cost_per_million_input == 5.0
+        assert result.report.token_cost_per_million_output == 25.0
         assert result.report.token_cost_input_ratio == 0.80
 
     def test_token_cost_overrides_from_yaml(self, tmp_path: Path) -> None:
@@ -1096,7 +1096,7 @@ class TestGitOpsConfig:
         )
         result = load_runtime_config(cfg, {})
         assert result.report.token_cost_per_million_input == 8.0
-        assert result.report.token_cost_per_million_output == 75.0
+        assert result.report.token_cost_per_million_output == 25.0
         assert result.report.token_cost_input_ratio == 0.80
 
     def test_schema_rejects_unknown_git_ops_keys(self, tmp_path: Path) -> None:

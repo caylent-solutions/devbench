@@ -558,14 +558,10 @@ Pulled from the in-queue items in [ROADMAP.md](../ROADMAP.md) and the architectu
 
 ## 11. Known issues to address separately
 
-These are issues found during the documentation audit that are out of scope for the doc-only pass that produced this file. They require code, prompt, or test changes and are queued as follow-up work:
+Items found during the documentation audit and queued for separate follow-up work. The earlier round of fixes in this PR closed out the `list-agents` reference, the non-standard agent prompt headers, and the stale token cost defaults; the items below remain open:
 
-- **`review-supervisor.md` references a non-existent CLI command.** The agent's discovery step says to run `uv run devbench list-agents review_team`, but `list-agents` is not a registered command in `cli.py`. The bash fallback (`ls plugin/devbench/agents/review_team/*.md`) is what actually works. Future fix: either implement the CLI command or remove the misleading reference from the prompt.
-- **Several agent prompt files use non-standard `--- SECTION ---` headers** instead of standard `## Section` markdown. Renders fine but inconsistent with `review-supervisor.md` which uses standard headers. Future cleanup pass.
 - **Out-of-scope-findings boilerplate is duplicated across all 8 agent prompts.** Should be extracted to a shared section the agents reference. Future prompt cleanup.
 - **Cost report's `tasks_in_session` semantics are confusing.** Without `--since`, the report covers the entire log history, which is rarely what "session" means to a user. Either change the default behavior to use the most recent orchestrator restart as the session start, or rename the field.
-- **`docs/llm-authentication.md` previously claimed a token refresher runs every 4 hours.** No such code exists. Fixed in the current doc pass; flag here in case the claim resurfaces in another doc.
-- **Code defaults for token cost are stale.** `DEFAULT_TOKEN_COST_PER_M_INPUT = 15.0` and `DEFAULT_TOKEN_COST_PER_M_OUTPUT = 75.0` reflect Opus 4.1 pricing, not the current Opus 4.7 rates of $5/$25. See [model-pricing.md](model-pricing.md). Update in a follow-up code change.
 
 ---
 

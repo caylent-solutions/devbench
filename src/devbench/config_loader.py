@@ -75,7 +75,6 @@ from devbench.constants import (
     DEFAULT_STOP_HOOK_MAX_BLOCKS,
     DEFAULT_STOP_HOOK_STALE_TASK_MINUTES,
     DEFAULT_STOP_HOOK_WINDOW_SECONDS,
-    DEFAULT_TOKEN_COST_INPUT_RATIO,
     DEFAULT_TOKEN_COST_PER_M_INPUT,
     DEFAULT_TOKEN_COST_PER_M_OUTPUT,
 )
@@ -173,15 +172,25 @@ class ReportConfig:
     Attributes:
         token_cost_per_million_input: Cost per million input tokens in USD.
         token_cost_per_million_output: Cost per million output tokens in USD.
-        token_cost_input_ratio: Estimated fraction of tokens that are input (0.0-1.0).
         display_timezone: IANA timezone name for displaying report timestamps.
             ``None`` means use the host's system local timezone.
+        cache_read_multiplier: Cost multiplier for cache-read tokens, relative
+            to the base input rate. ``None`` means use the constant default.
+        cache_write_5min_multiplier: Cost multiplier for 5-minute prompt-cache
+            write tokens, relative to the base input rate.
+        cache_write_1hr_multiplier: Cost multiplier for 1-hour prompt-cache
+            write tokens, relative to the base input rate.
+        data_residency_multiplier: Cost multiplier when usage.inference_geo
+            is set (US-only inference).
     """
 
     token_cost_per_million_input: float = DEFAULT_TOKEN_COST_PER_M_INPUT
     token_cost_per_million_output: float = DEFAULT_TOKEN_COST_PER_M_OUTPUT
-    token_cost_input_ratio: float = DEFAULT_TOKEN_COST_INPUT_RATIO
     display_timezone: str | None = None
+    cache_read_multiplier: float | None = None
+    cache_write_5min_multiplier: float | None = None
+    cache_write_1hr_multiplier: float | None = None
+    data_residency_multiplier: float | None = None
 
 
 @dataclass
@@ -450,10 +459,19 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         token_cost_per_million_output=float(
             report_raw.get("token_cost_per_million_output", DEFAULT_TOKEN_COST_PER_M_OUTPUT),
         ),
-        token_cost_input_ratio=float(
-            report_raw.get("token_cost_input_ratio", DEFAULT_TOKEN_COST_INPUT_RATIO),
-        ),
         display_timezone=report_raw.get("display_timezone") or None,
+        cache_read_multiplier=(
+            float(report_raw["cache_read_multiplier"]) if "cache_read_multiplier" in report_raw else None
+        ),
+        cache_write_5min_multiplier=(
+            float(report_raw["cache_write_5min_multiplier"]) if "cache_write_5min_multiplier" in report_raw else None
+        ),
+        cache_write_1hr_multiplier=(
+            float(report_raw["cache_write_1hr_multiplier"]) if "cache_write_1hr_multiplier" in report_raw else None
+        ),
+        data_residency_multiplier=(
+            float(report_raw["data_residency_multiplier"]) if "data_residency_multiplier" in report_raw else None
+        ),
     )
 
     # Populate StopHookConfig from YAML stop_hook block.

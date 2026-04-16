@@ -1063,7 +1063,12 @@ class TestGitOpsConfig:
         result = load_runtime_config(cfg, {})
         assert result.report.token_cost_per_million_input == 5.0
         assert result.report.token_cost_per_million_output == 25.0
-        assert result.report.token_cost_input_ratio == 0.80
+        # Cache multipliers default to None in the parsed YAML layer; config.py
+        # applies the constant defaults via _resolve_float (env > YAML > const).
+        assert result.report.cache_read_multiplier is None
+        assert result.report.cache_write_5min_multiplier is None
+        assert result.report.cache_write_1hr_multiplier is None
+        assert result.report.data_residency_multiplier is None
 
     def test_token_cost_overrides_from_yaml(self, tmp_path: Path) -> None:
         cfg = self._write(
@@ -1075,13 +1080,19 @@ class TestGitOpsConfig:
             report:
               token_cost_per_million_input: 10.0
               token_cost_per_million_output: 50.0
-              token_cost_input_ratio: 0.75
+              cache_read_multiplier: 0.05
+              cache_write_5min_multiplier: 1.5
+              cache_write_1hr_multiplier: 2.5
+              data_residency_multiplier: 1.2
             """,
         )
         result = load_runtime_config(cfg, {})
         assert result.report.token_cost_per_million_input == 10.0
         assert result.report.token_cost_per_million_output == 50.0
-        assert result.report.token_cost_input_ratio == 0.75
+        assert result.report.cache_read_multiplier == 0.05
+        assert result.report.cache_write_5min_multiplier == 1.5
+        assert result.report.cache_write_1hr_multiplier == 2.5
+        assert result.report.data_residency_multiplier == 1.2
 
     def test_token_cost_partial_override(self, tmp_path: Path) -> None:
         cfg = self._write(
@@ -1097,7 +1108,8 @@ class TestGitOpsConfig:
         result = load_runtime_config(cfg, {})
         assert result.report.token_cost_per_million_input == 8.0
         assert result.report.token_cost_per_million_output == 25.0
-        assert result.report.token_cost_input_ratio == 0.80
+        # Unspecified multiplier fields stay None (meaning "fall back to constant default").
+        assert result.report.cache_read_multiplier is None
 
     def test_schema_rejects_unknown_git_ops_keys(self, tmp_path: Path) -> None:
         """

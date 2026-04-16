@@ -458,8 +458,12 @@ git_ops:
 report:
   token_cost_per_million_input: 5.0    # Opus 4.7 default
   token_cost_per_million_output: 25.0
-  token_cost_input_ratio: 0.80
   display_timezone: America/Denver     # IANA name; defaults to system local TZ
+  # Cache multipliers — override only on non-Anthropic platforms.
+  # cache_read_multiplier: 0.10
+  # cache_write_5min_multiplier: 1.25
+  # cache_write_1hr_multiplier: 2.0
+  # data_residency_multiplier: 1.10
 
 # Stop hook circuit breaker
 stop_hook:
@@ -552,8 +556,8 @@ Pulled from the in-queue items in [ROADMAP.md](../ROADMAP.md) and the architectu
 - **`blocker-resolver` agent not invoked**: The agent file at `plugin/devbench/agents/blocker-resolver.md` exists but the orchestrate skill does not currently call it. Blocked work units stay blocked until human intervention.
 - **No topological sort for parallel candidates**: `get_parallel_candidates` returns units in linear order rather than running a topological sort over the dep graph. This affects ordering when many parallel candidates exist.
 - **Per-judge retry limits don't exist**: `max_executor_retries` is global; you can't configure "retry the executor 5 times if test-reviewer fails but only 2 times if doc-reviewer fails."
-- **Cost report doesn't model cache savings**: `devbench report` uses base input rates; real cost is lower when prompt caching is active. Estimates may overstate spend.
-- **Cost report doesn't split by role**: Single blended rate; no per-agent (executor vs judge) cost breakdown.
+- **Cost report doesn't split by role**: Aggregate cost only; no per-agent (executor vs judge) cost breakdown.
+- **Per-call data-residency and fast-mode premiums not applied**: `usage.inference_geo` and `usage.speed` are counted for display but not multiplied into per-call cost; counts of 0 in practice today.
 - **`devbench list-agents` CLI command doesn't exist**: Referenced in `review-supervisor.md` but the bash fallback (`ls plugin/devbench/agents/review_team/*.md`) is what works in practice. See [Known issues](#11-known-issues-to-address-separately).
 
 ---

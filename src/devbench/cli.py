@@ -296,10 +296,13 @@ def cmd_report(since: str = "", watch_interval: int = 0) -> int:
     if watch_interval > 0:
         import time
 
+        # Capture watch loop start once so the "This run" column tracks activity
+        # since the user kicked off `devbench report --watch`, not since each tick.
+        report_started_at = datetime.now(UTC)
         try:
             while True:
                 print("\033[H\033[J", end="")  # clear screen
-                report = generate_report(log_path=log_file, since=since_dt)
+                report = generate_report(log_path=log_file, since=since_dt, report_started_at=report_started_at)
                 print(report)
                 time.sleep(watch_interval)
         except KeyboardInterrupt:

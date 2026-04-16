@@ -29,7 +29,11 @@ from devbench.constants import (
     BACKLOG_SUBDIR,
     DEFAULT_ALERT_SUMMARY_LIMIT,
     DEFAULT_BEDROCK_REGION,
+    DEFAULT_CACHE_READ_MULTIPLIER,
+    DEFAULT_CACHE_WRITE_1HR_MULTIPLIER,
+    DEFAULT_CACHE_WRITE_5MIN_MULTIPLIER,
     DEFAULT_COMMAND_TIMEOUT,
+    DEFAULT_DATA_RESIDENCY_MULTIPLIER,
     DEFAULT_GH_API_TIMEOUT,
     DEFAULT_GITHUB_CHECK_TIMEOUT_SECONDS,
     DEFAULT_LLM_EVIDENCE_TRUNCATION,
@@ -44,7 +48,6 @@ from devbench.constants import (
     DEFAULT_STOP_HOOK_STALE_TASK_MINUTES,
     DEFAULT_STOP_HOOK_WINDOW_SECONDS,
     DEFAULT_TEST_TIMEOUT,
-    DEFAULT_TOKEN_COST_INPUT_RATIO,
     DEFAULT_TOKEN_COST_PER_M_INPUT,
     DEFAULT_TOKEN_COST_PER_M_OUTPUT,
 )
@@ -217,13 +220,32 @@ TOKEN_COST_PER_M_INPUT: float = _resolve_float(
 TOKEN_COST_PER_M_OUTPUT: float = _resolve_float(
     None, RUNTIME_CONFIG.report.token_cost_per_million_output, DEFAULT_TOKEN_COST_PER_M_OUTPUT
 )
-TOKEN_COST_INPUT_RATIO: float = _resolve_float(
-    None, RUNTIME_CONFIG.report.token_cost_input_ratio, DEFAULT_TOKEN_COST_INPUT_RATIO
-)
 # IANA timezone name for displaying timestamps in `devbench report`.
 # None means "use the host's system local timezone." Resolution: env > YAML > None.
 REPORT_DISPLAY_TIMEZONE: str | None = _resolve_optional_str(
     "JUDGE_REPORT_TIMEZONE", RUNTIME_CONFIG.report.display_timezone
+)
+# Cost-calculation multipliers for `devbench report`. Defaults match Anthropic's
+# published pricing structure (see constants.py for source).
+REPORT_CACHE_READ_MULTIPLIER: float = _resolve_float(
+    "JUDGE_REPORT_CACHE_READ_MULTIPLIER",
+    RUNTIME_CONFIG.report.cache_read_multiplier,
+    DEFAULT_CACHE_READ_MULTIPLIER,
+)
+REPORT_CACHE_WRITE_5MIN_MULTIPLIER: float = _resolve_float(
+    "JUDGE_REPORT_CACHE_WRITE_5MIN_MULTIPLIER",
+    RUNTIME_CONFIG.report.cache_write_5min_multiplier,
+    DEFAULT_CACHE_WRITE_5MIN_MULTIPLIER,
+)
+REPORT_CACHE_WRITE_1HR_MULTIPLIER: float = _resolve_float(
+    "JUDGE_REPORT_CACHE_WRITE_1HR_MULTIPLIER",
+    RUNTIME_CONFIG.report.cache_write_1hr_multiplier,
+    DEFAULT_CACHE_WRITE_1HR_MULTIPLIER,
+)
+REPORT_DATA_RESIDENCY_MULTIPLIER: float = _resolve_float(
+    "JUDGE_REPORT_DATA_RESIDENCY_MULTIPLIER",
+    RUNTIME_CONFIG.report.data_residency_multiplier,
+    DEFAULT_DATA_RESIDENCY_MULTIPLIER,
 )
 STOP_HOOK_MAX_BLOCKS: int = _resolve_int(
     "JUDGE_STOP_MAX_BLOCKS", RUNTIME_CONFIG.stop_hook.max_blocks, DEFAULT_STOP_HOOK_MAX_BLOCKS

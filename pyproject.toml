@@ -21,8 +21,8 @@ devbench = "devbench.cli:main"
 [tool.hatch.build.targets.wheel]
 packages = ["src/devbench"]
 
-[tool.uv]
-dev-dependencies = [
+[dependency-groups]
+dev = [
     "pytest>=9.0.0",
     "pytest-cov>=7.0.0",
     "pre-commit>=4.0.0",

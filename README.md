@@ -357,14 +357,23 @@ The `report` command shows token consumption and estimated cost. Pricing is conf
 report:
   token_cost_per_million_input: 5.0     # Opus 4.7 (matches default constant)
   token_cost_per_million_output: 25.0   # Opus 4.7 (matches default constant)
-  token_cost_input_ratio: 0.80          # default: 0.80 (assumed input/output mix)
+  # Caching multipliers (relative to input rate). Only override when running
+  # on a platform with different caching pricing (e.g. some Bedrock configs).
+  # cache_read_multiplier: 0.10
+  # cache_write_5min_multiplier: 1.25
+  # cache_write_1hr_multiplier: 2.0
 ```
 
 > Code defaults match Opus 4.7. If you run a different model (Sonnet, Haiku, or an older Opus generation), override the values above per the [model pricing doc](docs/model-pricing.md).
 
-Token data is read from `hook-logs.jsonl` in the workspace root (written by Claude Code hooks). Cost is a blended estimate based on the input/output ratio — actual billing depends on your account terms and active prompt caching.
+Token data is aggregated from two sources, both filtered by the report window:
 
-By default, `devbench report` renders **two** windows: an **All-time** table covering the entire orchestrator log, and a **Current run** table covering only the most recent contiguous block of orchestration events. The boundary between runs is detected as a gap of more than 10 minutes between consecutive `Set X to ...` log lines (a proxy for "the orchestrator was restarted here"). If no such gap exists in the log, the two tables show the same numbers. Pass `--since <ISO-8601>` to render a single window starting at a custom timestamp instead.
+1. **`hook-logs.jsonl`** in the workspace root — captures Agent (subagent) tool calls with their full per-token-type usage (input, output, cache reads, cache writes).
+2. **Claude Code transcript files** under `~/.claude/projects/<workspace-slug>/*.jsonl` — captures the outer orchestrate session's per-turn LLM usage (the reasoning between Agent calls). The transcript directory is auto-discovered from the `transcript_path` field in any hook-log entry.
+
+**Cost is computed per call, per token type, from real `usage` data on every LLM call.** Each call contributes: `input_tokens × input_rate + output_tokens × output_rate + cache_read_tokens × input_rate × 0.10 + cache_write_5m × input_rate × 1.25 + cache_write_1h × input_rate × 2.0`. There is no blended-rate fallback and no estimated input/output ratio — if an entry lacks a `usage` block (legacy / non-LLM tool call) it contributes zero cost rather than a masked estimate. The `Lifetime input / output share (measured)` row in the report is **purely descriptive**: it shows what your actual workload ratio is; it never feeds back into the cost formula. Actual billing depends on your account terms; this estimate aims to closely match the Anthropic Console.
+
+By default, `devbench report` renders a Backlog state + lifetime totals box at the top, then a multi-column Window stats table with **All-time** (since the log started) and **Current session** (since the most recent gap of more than 30 minutes between consecutive non-noise log entries — a proxy for "the orchestrator was restarted here"). With `--watch N`, a third **This run** column tracks activity since the watch loop started. Pass `--since <ISO-8601>` to render a single custom-window table instead of the multi-column layout.
 
 **Display timezone.** Window-start timestamps in the report are rendered in your machine's local timezone (with TZ abbreviation); internal calculations stay in UTC. If you run devbench inside a devcontainer or VM whose system TZ differs from your actual location (e.g., the container is UTC but you're on EST), set the IANA zone name explicitly:
 

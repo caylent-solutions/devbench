@@ -201,7 +201,6 @@ DEFAULT_STOP_HOOK_WINDOW_SECONDS: int = 180
 DEFAULT_STOP_HOOK_STALE_TASK_MINUTES: int = 120
 DEFAULT_TOKEN_COST_PER_M_INPUT: float = 5.0
 DEFAULT_TOKEN_COST_PER_M_OUTPUT: float = 25.0
-DEFAULT_TOKEN_COST_INPUT_RATIO: float = 0.80
 
 # Timeout defaults (seconds)
 DEFAULT_GH_API_TIMEOUT: int = 30
@@ -273,10 +272,32 @@ DEFAULT_REPORT_WATCH_INTERVAL: int = 3
 # ---------------------------------------------------------------------------
 # Report window detection
 # ---------------------------------------------------------------------------
-# Gap (in minutes) between consecutive orchestration events that signals
-# an orchestrator restart, used to identify the "current run" boundary
-# in `devbench report`.
-DEFAULT_CURRENT_RUN_GAP_MINUTES: int = 10
+# Gap (in minutes) between consecutive log entries that signals an orchestrator
+# restart, used to identify the "current session" boundary in `devbench report`.
+# 30 minutes is generous enough to span a long single task (which can take
+# 17+ minutes) without misclassifying mid-task quiet as a session boundary.
+DEFAULT_SESSION_GAP_MINUTES: int = 30
+
+# Logger name to filter out of session-boundary detection. The log_setup
+# logger fires once per CLI invocation including every `devbench report --watch`
+# tick, which would otherwise look like noise that resets the session boundary.
+LOG_NOISE_LOGGER_NAME: str = "judges.log_setup"
+
+# ---------------------------------------------------------------------------
+# Anthropic prompt-caching multipliers (relative to base input rate).
+# Universal across Anthropic-served Claude models.
+# Source: https://platform.claude.com/docs/en/about-claude/pricing (2026-04-16).
+# Override per-deployment via `report.cache_*_multiplier` in devbench.yaml.
+# ---------------------------------------------------------------------------
+DEFAULT_CACHE_READ_MULTIPLIER: float = 0.10
+DEFAULT_CACHE_WRITE_5MIN_MULTIPLIER: float = 1.25
+DEFAULT_CACHE_WRITE_1HR_MULTIPLIER: float = 2.0
+# Data-residency premium when usage.inference_geo is set (US-only inference;
+# applies to Opus 4.7, Opus 4.6, Sonnet 4.6+).
+DEFAULT_DATA_RESIDENCY_MULTIPLIER: float = 1.10
+# Fast-mode premium when usage.speed == "fast" (Opus 4.6 only at the time of
+# this snapshot). Counted but not applied per-call in v1.
+DEFAULT_FAST_MODE_MULTIPLIER: float = 6.0
 
 # ---------------------------------------------------------------------------
 # Report table render widths (characters)

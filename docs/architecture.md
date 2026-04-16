@@ -558,9 +558,8 @@ Pulled from the in-queue items in [ROADMAP.md](../ROADMAP.md) and the architectu
 
 ## 11. Known issues to address separately
 
-Items found during the documentation audit and queued for separate follow-up work. The earlier round of fixes in this PR closed out the `list-agents` reference, the non-standard agent prompt headers, and the stale token cost defaults; the items below remain open:
+Items found during the documentation audit and queued for separate follow-up work. The earlier round of fixes in this PR closed out the `list-agents` reference, the non-standard agent prompt headers, and the stale token cost defaults; the item below remains open:
 
-- **Out-of-scope-findings boilerplate is duplicated across all 8 agent prompts.** Should be extracted to a shared section the agents reference. Future prompt cleanup.
 - **Cost report's `tasks_in_session` semantics are confusing.** Without `--since`, the report covers the entire log history, which is rarely what "session" means to a user. Either change the default behavior to use the most recent orchestrator restart as the session start, or rename the field.
 
 ---

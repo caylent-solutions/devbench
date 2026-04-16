@@ -100,10 +100,21 @@ resolved before Claude sees the agent content.
 
 ### Per-role model assignment
 
-Agents specify their model in frontmatter. The executor uses Opus for complex implementation work.
-Review agents use Haiku for structured evidence evaluation. The security reviewer uses Sonnet for
-security reasoning. This was not possible when a single global `JUDGE_CLAUDE_MODEL` applied to all
-roles.
+Each agent file declares its model in YAML frontmatter:
+
+```markdown
+---
+name: code-reviewer
+model: sonnet
+tools: Bash
+---
+```
+
+Claude Code reads the `model:` field when invoking the agent and routes the inference call to that model. There is no per-role wiring in the Python code — the routing is data-driven by the agent file itself.
+
+This was not possible when a single global `JUDGE_CLAUDE_MODEL` applied to all roles. With the per-agent model field, the executor can use Opus (long context, complex implementation), the four review judges can use Sonnet or Haiku (shorter, structured evaluation), and the security reviewer can use Sonnet (security reasoning) — all configured independently and changeable without code changes.
+
+Agent files live at `plugin/devbench/agents/` (top-level agents: executor, review-supervisor, security-reviewer, blocker-resolver) and `plugin/devbench/agents/review_team/` (the four parallel review judges).
 
 ---
 
@@ -135,3 +146,11 @@ roles.
   resolution, and git operations.
 - `devbench.yaml` workspace configuration is unchanged and continues to live at
   `$JUDGE_WORKSPACE_ROOT/backlog/config/devbench.yaml`, outside the plugin.
+
+---
+
+## See also
+
+- [architecture.md](../architecture.md) — End-to-end system architecture, diagrams, and current gaps
+- [plugin-architecture.md](../plugin-architecture.md) — Implementation details of the plugin layer this ADR introduced
+- [execution-modes.md](../execution-modes.md) — Per-step lifecycle for both interactive and automated modes

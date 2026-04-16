@@ -1,7 +1,21 @@
 # Backlog Contract
 
-This document defines the required format for all backlog files. `devbench validate-backlog`
-enforces this contract at startup and aborts if any violation is found.
+This document defines the required format for all backlog files. `devbench validate-backlog` enforces this contract at startup and aborts if any violation is found.
+
+## Table of contents
+
+- [File Hierarchy](#file-hierarchy)
+- [Config Validation](#config-validation)
+- [ID Format](#id-format)
+- [Status Values](#status-values)
+- [BACKLOG.md Index](#backlogmd-index)
+- [Work Unit File Structure](#work-unit-file-structure)
+- [Required Sections — Task Files](#required-sections--task-files)
+- [Comments Section Format](#comments-section-format)
+- [Auto-rollup behavior](#auto-rollup-behavior)
+- [Dependency Format](#dependency-format)
+- [Branch Name Resolution](#branch-name-resolution)
+- [Validation Checks](#validation-checks)
 
 ---
 
@@ -46,8 +60,19 @@ repos:
     checkout_directory: my-repo    # relative -- resolves via symlink
 ```
 
-The `checkout_directory` must be relative (absolute paths and ``..`` traversal are rejected).
 Symlinks bridge the gap between the backlog repo and target repos outside it.
+
+---
+
+## Config Validation
+
+Validation of `backlog/config/devbench.yaml` happens at config load time (before the orchestrator starts), separate from work-unit validation. Notable rules:
+
+- `checkout_directory` must be **relative** to `JUDGE_WORKSPACE_ROOT`. Absolute paths and `..` traversal are rejected — the loader raises `ValueError` immediately.
+- `git_ops.defer_pr: true` requires `git_ops.single_branch` to be set. Misconfigured combinations raise `ValueError`.
+- The full YAML is JSON-Schema validated (`additionalProperties: false`), so typos in keys produce a clear schema error rather than being silently ignored.
+
+For the full annotated YAML and value-resolution precedence (env var → YAML → constant default), see the [Configuration model](architecture.md#8-configuration-model) section of the architecture doc.
 
 ---
 
@@ -74,25 +99,34 @@ IDs are case-insensitive in status matching but written in uppercase by conventi
 | Done | Merged and closed | `done` |
 | Blocked | Max retries exhausted or dependency blocked | `blocked` |
 
-Status is stored in the **work unit file** (the `## Status:` line). `BACKLOG.md` is a derived index
-— the file is authoritative. `validate-backlog` warns on mismatch between the two.
+Status is stored in the **work unit file** (the `## Status:` line). `BACKLOG.md` is a derived index that mirrors the work-unit files; the work-unit file is the source of truth. `validate-backlog` reports mirror drift between the two as an error so it can be reconciled — it does not auto-correct.
 
 ---
 
 ## BACKLOG.md Index
 
-`BACKLOG.md` is the master index. It must contain a Status Summary table and one row per work unit:
+`BACKLOG.md` is the master index. It must contain a Status Summary table and one row per work unit.
+
+### Canonical Status Summary format (per-epic)
+
+The canonical Status Summary format is **per-epic** — one row per top-level epic, with columns for each status. This is the format `BacklogManager._update_status_summary()` writes:
 
 ```markdown
 ## Status Summary
 
-| Status | Count |
-|--------|-------|
-| In Queue | 4 |
-| In Progress | 1 |
-| Done | 12 |
-| Blocked | 0 |
+| Epic | Title | Done | In Progress | In Queue | Blocked |
+|------|-------|------|-------------|----------|---------|
+| E1   | Backlog tooling | 8 | 1 | 2 | 0 |
+| E2   | Migration scripts | 4 | 0 | 5 | 1 |
+```
 
+`in-review` is a transient state during the review tier and is not surfaced in the summary; units in review are still counted under `In Progress` for summary purposes.
+
+### Index rows
+
+Below the Status Summary, one row per work unit:
+
+```markdown
 ## Work Units
 
 | ID | Title | Status | File |
@@ -100,8 +134,7 @@ Status is stored in the **work unit file** (the `## Status:` line). `BACKLOG.md`
 | E1-F1-S1-T1 | Add greeting utility | done | backlog/E1-name/E1-F1-name/E1-F1-S1-name/E1-F1-S1-T1-name.md |
 ```
 
-The `File` column must be a path relative to `JUDGE_WORKSPACE_ROOT`. `validate-backlog` verifies
-each file exists at that path.
+The `File` column must be a path relative to `JUDGE_WORKSPACE_ROOT`. `validate-backlog` verifies each file exists at that path.
 
 ---
 
@@ -217,9 +250,41 @@ Events written by the CLI:
 | `[SECURITY_FAIL]` | `devbench log-verdict` | Security review failed |
 | `[comment]` | `devbench log-comment` | Free-form agent observation |
 
-The done-gate (`devbench mark-done`) requires that the four review judges (`code_review`,
-`test_review`, `doc_review`, `changes_manifest`) each have a `[REVIEW_PASS]` entry after the most
-recent `[REVIEW_REJECTED]` line (or after the start of the Comments section if no rejection exists).
+The done-gate (`devbench mark-done`) requires that the four review judges (`code_review`, `test_review`, `doc_review`, `changes_manifest`) each have a `[REVIEW_PASS]` entry after the most recent `[REVIEW_REJECTED]` line (or after the start of the Comments section if no rejection exists).
+
+### Example entries
+
+A real Comments section looks like this:
+
+```
+## Comments
+
+[2026-04-15T14:23:11Z] [agent/executor] [comment] Implemented greeting utility per AC-1, AC-2.
+[2026-04-15T14:25:33Z] [judge/code_review] [REVIEW_PASS] SOLID, DRY, fail-fast all satisfied.
+[2026-04-15T14:25:42Z] [judge/test_review] [REVIEW_PASS] Real tests cover both branches.
+[2026-04-15T14:25:48Z] [judge/doc_review] [REVIEW_PASS] README updated alongside code change.
+[2026-04-15T14:26:01Z] [judge/changes_manifest] [REVIEW_PASS] Manifest matches staged files.
+[2026-04-15T14:27:14Z] [judge/security_review] [REVIEW_PASS] No vulnerabilities found.
+[2026-04-15T14:30:00Z] [agent/orchestrator] [comment] Auto-rolled to done — all children completed.
+```
+
+---
+
+## Auto-rollup behavior
+
+When `devbench mark-done <task-id>` succeeds, `BacklogManager._rollup_parent_status()` walks up the parent chain:
+
+1. If all sibling tasks of the parent story are now done, the parent story is marked done.
+2. If marking that story done causes all sibling stories of the parent feature to be done, the parent feature is marked done.
+3. Likewise for feature → epic.
+
+Each auto-rollup writes an audit comment to the parent's Comments section so the trail is visible:
+
+```
+[2026-04-15T14:30:00Z] [agent/orchestrator] [comment] Auto-rolled to done — all children completed.
+```
+
+Rollup happens synchronously inside `mark-done`. There is no background process and no race condition.
 
 ---
 

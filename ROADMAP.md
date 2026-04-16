@@ -2,6 +2,19 @@
 
 Planned work items and technical debt. Items derived from the incomplete backlog and prior review findings.
 
+## Table of contents
+
+- [Dependency Order](#dependency-order)
+- [Status legend](#status-legend)
+- [In-queue / blocked work items](#in-queue--blocked-work-items)
+- [Technical debt](#technical-debt)
+
+## Status legend
+
+- **in-queue** — Ready to execute. No unmet dependencies.
+- **blocked** — Cannot start until a listed dependency completes.
+- **done** — Completed (omitted from this list; see `BACKLOG.md` index for completed items).
+
 ---
 
 ## Dependency Order
@@ -115,7 +128,7 @@ The backlog parser's `_deps_satisfied` check only evaluates task-to-task depende
 
 | ID | Title | Status |
 |----|-------|--------|
-| E215-F1-S1-T1 | Fix _deps_satisfied to check all dep types; add devbench sync-blocked command; harden validate-backlog dep warnings | blocked (on E222-F1-S1-T1) |
+| E215-F1-S1-T1 | Fix _deps_satisfied to check all dep types; add devbench sync-blocked command; harden validate-backlog dep warnings | blocked (depends on E222-F1-S1-T1) |
 
 ---
 
@@ -187,29 +200,58 @@ Provides canonical template files for epic, feature, story, and task `.md` files
 
 ---
 
-## Technical Debt (from Prior Review)
+## Technical debt
 
-Issues carried over from prior review, mapped to actual current file paths.
+Issues carried over from prior review, mapped to current file paths. Listed by severity within each group; each entry uses a definition-list format to keep file paths readable without column overflow.
 
-### Code Quality
+### Code quality
 
-| Severity | Finding | File |
-|----------|---------|------|
-| CRITICAL | `# noqa: PLW0603` bypass annotation suppresses global variable warning | `src/devbench/log_setup.py:31` |
-| HIGH | `setattr()` dynamic attribute setting on dataclass loses type safety | `src/devbench/github/security.py:136` |
-| MEDIUM | Raw API exception message may be exposed in judge feedback (error disclosure) | `src/devbench/github/security.py` (security fetch error handling) |
-| MEDIUM | CLI args not validated at system boundary (type/format/range) | `src/devbench/cli.py` |
-| MEDIUM | kwargs values concatenated into gh CLI args without sanitization | `src/devbench/github/security.py:62-64` |
-| LOW | `SecurityReview` logic mixes API fetching, parsing, and summarization (SRP) | `src/devbench/github/security.py` |
+**HIGH — Dynamic attribute setting on dataclass loses type safety**
+File: `src/devbench/github/security.py:136`
+`setattr()` on a dataclass instance bypasses the type checker; refactor to direct field assignment.
 
-### Test Quality
+**MEDIUM — Raw API exception messages may leak details into judge feedback**
+File: `src/devbench/github/security.py` (security fetch error handling)
+Wrap exception messages before they reach judge feedback to avoid disclosing internal API details.
 
-| Severity | Finding | File |
-|----------|---------|------|
-| CRITICAL | Hardcoded path in test | `tests/test_backlog/test_parser.py:18-20` |
-| CRITICAL | Hardcoded `/tmp` log path — should use `tmp_path` fixture | `tests/conftest.py:10` |
-| HIGH | No `@pytest.mark.unit` / `@pytest.mark.functional` decorators on any test | All test files |
-| HIGH | Fixtures defined in `conftest.py` instead of `tests/fixtures/` | `tests/conftest.py` |
-| MEDIUM | `importlib.reload(config)` causes test state pollution across test run | `tests/test_config.py:185-210` |
-| MEDIUM | Duplicate predicate tests not parameterized | `tests/test_backlog/test_work_unit.py:203-251` |
-| MEDIUM | `cmd_next` assertions only check one field of JSON output | `tests/test_cli.py:132` |
+**MEDIUM — CLI args not validated at system boundary**
+File: `src/devbench/cli.py`
+Add type / format / range validation at the CLI entry point rather than relying on downstream code to fail fast.
+
+**MEDIUM — kwargs concatenated into `gh` CLI args without sanitization**
+File: `src/devbench/github/security.py:62-64`
+Validate or shell-escape kwargs values before they become subprocess arguments.
+
+**LOW — `SecurityReview` mixes API fetching, parsing, and summarization (SRP violation)**
+File: `src/devbench/github/security.py`
+Split into a fetch service, a parser, and a summarizer for testability.
+
+### Test quality
+
+**CRITICAL — Hardcoded path in test**
+File: `tests/test_backlog/test_parser.py:18-20`
+Replace with the pytest `tmp_path` fixture.
+
+**CRITICAL — Hardcoded `/tmp` log path**
+File: `tests/conftest.py:10`
+Use the pytest `tmp_path` fixture instead of writing to a fixed `/tmp` path.
+
+**HIGH — No `@pytest.mark.unit` / `@pytest.mark.functional` decorators on any test**
+File: all test files
+Categorize tests so `make test-unit` and `make test-functional` can target subsets.
+
+**HIGH — Fixtures defined in `conftest.py` instead of `tests/fixtures/`**
+File: `tests/conftest.py`
+Move data fixtures out of `conftest.py` into a dedicated fixtures directory.
+
+**MEDIUM — `importlib.reload(config)` causes test state pollution**
+File: `tests/test_config.py:185-210`
+Refactor to use a fixture-scoped fresh config rather than mutating module state.
+
+**MEDIUM — Duplicate predicate tests not parameterized**
+File: `tests/test_backlog/test_work_unit.py:203-251`
+Collapse with `@pytest.mark.parametrize`.
+
+**MEDIUM — `cmd_next` assertions only check one field of JSON output**
+File: `tests/test_cli.py:132`
+Assert on the full envelope shape, not just one field.

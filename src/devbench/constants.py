@@ -182,7 +182,7 @@ COMMENT_AGENT_TEMPLATE: str = "[{timestamp}] [agent/{name}] {message}\n"
 # TDD Cycle Log section header and entry format template
 # ---------------------------------------------------------------------------
 TDD_CYCLE_LOG_SECTION_HEADER: str = "## TDD Cycle Log"
-TDD_ENTRY_TEMPLATE: str = "- [{phase}] {timestamp} \u2014 {message}\n"
+TDD_ENTRY_TEMPLATE: str = "- [{phase}] {timestamp} -- {message}\n"
 VALID_TDD_PHASES: frozenset[str] = frozenset({"RED", "GREEN", "REFACTOR"})
 
 # ---------------------------------------------------------------------------

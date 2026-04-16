@@ -1287,7 +1287,7 @@ class TestAppendTddEntry:
         assert "[REFACTOR]" in tdd_section, f"[REFACTOR] tag not found in TDD Cycle Log: {tdd_section}"
 
     def test_entry_format_matches_spec(self, tmp_path: Path) -> None:
-        """AC-5: Entry matches '- [<PHASE>] <ISO-8601 timestamp> — <message>'."""
+        """AC-5: Entry matches '- [<PHASE>] <ISO-8601 timestamp> -- <message>'."""
         import re
 
         wu = self._make_wu_with_tdd_section(tmp_path)
@@ -1295,8 +1295,9 @@ class TestAppendTddEntry:
         mgr._append_tdd_entry(wu, "RED", "some test message")
 
         content = wu.read_text(encoding="utf-8")
-        # Pattern: - [RED] <ISO-8601 datetime> — <message>
-        pattern = r"- \[RED\] \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[^ ]* — some test message"
+        # Pattern: - [RED] <ISO-8601 datetime> -- <message>
+        # Double-hyphen separator required: em-dash is rejected by validate-backlog.
+        pattern = r"- \[RED\] \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[^ ]* -- some test message"
         assert re.search(pattern, content), f"Entry format does not match expected pattern in: {content}"
 
     def test_entry_appears_in_tdd_section_not_comments(self, tmp_path: Path) -> None:
@@ -1335,6 +1336,18 @@ class TestAppendTddEntry:
         assert red_pos < green_pos, "RED entry must appear before GREEN entry"
         assert "first-red-entry" in content
         assert "second-green-entry" in content
+
+    def test_tdd_entry_has_no_emdash(self, tmp_path: Path) -> None:
+        """Regression guard: TDD_ENTRY_TEMPLATE must not emit em-dash into work unit files.
+
+        The validate-backlog check (manager.py Check 10) rejects work unit files
+        containing U+2014, so a writer that produces em-dash blocks the
+        orchestrator loop on the next validate-backlog run.
+        """
+        wu = self._make_wu_with_tdd_section(tmp_path)
+        BacklogManager()._append_tdd_entry(wu, "RED", "some failure detail")
+
+        assert "\u2014" not in wu.read_text(encoding="utf-8")
 
 
 class TestRollupParentStatusEdgeCases:
@@ -1402,6 +1415,31 @@ class TestRollupParentStatusEdgeCases:
         assert "Auto-rolled to done" in result
         # Should still contain the previous comment
         assert "Previous comment" in result
+
+    def test_rollup_comment_has_no_emdash(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """Regression guard: the auto-rollup comment must not contain U+2014.
+
+        The validate-backlog check (manager.py Check 10) rejects work unit files
+        that contain em-dash, so any writer emitting em-dash into a work unit
+        file is a self-inflicted block of the orchestrator loop. Keep writers
+        using '--' instead.
+        """
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(
+            "# Backlog\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|-----------||\n"
+            "| E0-F1 | Feature | Feature | in-queue | None | git-repo | `backlog/E0-F1.md` |\n"
+            "| E0-F1-S1 | Story | Story | done | None | git-repo | `backlog/E0-F1-S1.md` |\n"
+        )
+        parent_file = backlog_dir / "E0-F1.md"
+        parent_file.write_text("# E0-F1: Feature\n\n## Status: in-queue\n")
+        child_file = backlog_dir / "E0-F1-S1.md"
+        child_file.write_text("# E0-F1-S1\n\n## Status: done\n")
+
+        BacklogManager()._rollup_parent_status(index_path, "E0-F1-S1")
+
+        assert "\u2014" not in parent_file.read_text(encoding="utf-8")
 
 
 class TestParseBacklogRowsEdgeCases:

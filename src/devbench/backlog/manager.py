@@ -340,7 +340,7 @@ class BacklogManager:
         rollup_comment = COMMENT_AGENT_TEMPLATE.format(
             timestamp=timestamp,
             name="orchestrator",
-            message="Auto-rolled to done — all children completed",
+            message="Auto-rolled to done -- all children completed",
         )
         content = parent_file.read_text(encoding="utf-8")
         if COMMENTS_SECTION_HEADER in content:

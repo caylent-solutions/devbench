@@ -3,11 +3,11 @@ SHELL := /bin/bash
 .DEFAULT_GOAL := help
 unexport VIRTUAL_ENV
 
-.PHONY: help install plugin-install plugin-uninstall lint format check test test-unit validate clean start start-interactive report report-session
+.PHONY: help install install-hooks plugin-install plugin-uninstall lint lint-ruff lint-bandit format format-check typecheck test test-unit test-coverage validate clean start start-interactive report report-session pre-commit-check pre-push-check
 
 ## help: Show available targets
 help:
-	@echo "DevBench — Make Targets"
+	@echo "DevBench -- Make Targets"
 	@echo ""
 	@grep -E '^## ' $(MAKEFILE_LIST) | sed 's/^## /  /'
 	@echo ""
@@ -15,6 +15,11 @@ help:
 ## install: Install runtime and dev dependencies
 install:
 	uv sync --all-extras
+
+## install-hooks: Install pre-commit and pre-push git hooks
+install-hooks:
+	uv run pre-commit install
+	uv run pre-commit install --hook-type pre-push
 
 ## plugin-install: Register devbench marketplace and install plugin (user scope)
 plugin-install:
@@ -26,31 +31,52 @@ plugin-uninstall:
 	claude plugin uninstall devbench
 	claude plugin marketplace remove devbench
 
-## lint: Run ruff linter and bandit security scan
-lint:
+## lint-ruff: Run ruff linter
+lint-ruff:
 	uv run ruff check .
+
+## lint-bandit: Run bandit security scan
+lint-bandit:
 	uv run bandit -r . -ll --exclude ./tests,./.venv
+
+## lint: Run all linters (ruff + bandit)
+lint: lint-ruff lint-bandit
 
 ## format: Auto-format code with ruff
 format:
 	uv run ruff format .
 	uv run ruff check . --fix
 
-## check: Run lint + type check
-check:
-	uv run ruff check .
-	uv run mypy .
+## format-check: Check formatting without modifying files
+format-check:
+	uv run ruff format --check .
 
-## test: Run all tests
-test: test-unit
+## typecheck: Run mypy type checking
+typecheck:
+	uv run mypy .
 
 ## test-unit: Run unit tests
 test-unit:
 	uv run pytest tests/ -v --tb=short -q
 
-## validate: Full validation (check + test)
-validate: check test
+## test-coverage: Run tests with coverage report (fails below 90%)
+test-coverage:
+	uv run pytest tests/ --cov=devbench --cov-report=term-missing --cov-fail-under=90
+
+## test: Run all tests
+test: test-unit
+
+## validate: Full validation (all checks -- identical to CI and pre-push)
+validate: lint-ruff lint-bandit format-check typecheck test-coverage
 	@echo "All validations passed"
+
+## pre-commit-check: Checks that run on every commit (fast)
+pre-commit-check: lint-ruff format-check
+	@echo "Pre-commit checks passed"
+
+## pre-push-check: Checks that run before push (full -- identical to CI)
+pre-push-check: validate
+	@echo "Pre-push checks passed"
 
 ## clean: Remove build artifacts
 clean:
@@ -74,4 +100,3 @@ report:
 ## report-session: Show progress since a timestamp (e.g. make report-session SINCE=2026-03-05T16:13:00Z)
 report-session:
 	uv run python -m devbench.cli report "$(SINCE)"
-

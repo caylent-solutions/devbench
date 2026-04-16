@@ -20,11 +20,13 @@ from devbench.config import (
     validate_repo,
 )
 from devbench.config_loader import get_configured_default_branch
+from devbench.constants import RAW_RESPONSE_PREVIEW_CHARS
 from devbench.utils.process import run_command
 
 
 class ConflictingPRError(RuntimeError):
     """Raised when a pull request is in CONFLICTING merge state."""
+
 
 # Allowlist pattern for git branch names: starts with alphanumeric, allows
 # alphanumerics, dots, hyphens, underscores, and single forward slashes.
@@ -82,18 +84,12 @@ class GitOpsJudge:
             self.logger.info("Already on branch %s — no-op", branch)
             return
 
-        rc_status, status_out, status_err = run_command(
-            ["git", "status", "--porcelain"], cwd=repo_path
-        )
+        rc_status, status_out, status_err = run_command(["git", "status", "--porcelain"], cwd=repo_path)
         if rc_status != 0:
-            raise RuntimeError(
-                f"git status --porcelain failed (exit {rc_status}): {status_err.strip()}"
-            )
+            raise RuntimeError(f"git status --porcelain failed (exit {rc_status}): {status_err.strip()}")
         dirty = bool(status_out.strip())
 
-        rc_ref, _, _ = run_command(
-            ["git", "show-ref", "--verify", f"refs/heads/{branch}"], cwd=repo_path
-        )
+        rc_ref, _, _ = run_command(["git", "show-ref", "--verify", f"refs/heads/{branch}"], cwd=repo_path)
         branch_exists = rc_ref == 0
 
         if dirty:
@@ -175,9 +171,7 @@ class GitOpsJudge:
         _, status_out, _ = self._git(["status", "--porcelain"], repo_path)
         if not status_out.strip():
             self.logger.info("Nothing to commit on branch %s — checking remote state", branch)
-            rc, _, _ = run_command(
-                ["git", "rev-parse", "--verify", f"origin/{branch}"], cwd=repo_path
-            )
+            rc, _, _ = run_command(["git", "rev-parse", "--verify", f"origin/{branch}"], cwd=repo_path)
             if rc != 0:
                 self.logger.info("Remote branch origin/%s does not exist — pushing", branch)
                 self._git(["push", "origin", branch], repo_path)
@@ -185,19 +179,50 @@ class GitOpsJudge:
                 _, local_sha, _ = self._git(["rev-parse", "HEAD"], repo_path)
                 _, remote_sha, _ = self._git(["rev-parse", f"origin/{branch}"], repo_path)
                 if local_sha.strip() != remote_sha.strip():
-                    self.logger.info(
-                        "Local branch %s is ahead of origin — pushing", branch
-                    )
+                    self.logger.info("Local branch %s is ahead of origin — pushing", branch)
                     self._git(["push", "origin", branch], repo_path)
                 else:
-                    self.logger.info(
-                        "Branch %s already up to date with origin — skipping push", branch
-                    )
+                    self.logger.info("Branch %s already up to date with origin — skipping push", branch)
             return
 
         self._git(["commit", "-m", message], repo_path)
         self._git(["push", "origin", branch], repo_path)
         self.logger.info("Committed and pushed to %s on %s", branch, repo)
+
+    def commit_local(self, repo: str, repo_path: Path, branch: str, message: str) -> None:
+        """Stage and commit locally without pushing.
+
+        Used in single-branch / defer-PR mode.  Commits are accumulated
+        on the branch and pushed later by ``git-ops-finalize``.
+
+        Args:
+            repo: GitHub repository in ``owner/name`` format.
+            repo_path: Local filesystem path to the repository.
+            branch: Branch name (must already be checked out).
+            message: Commit message.
+
+        Raises:
+            ValueError: If the repo is not in the allow-list or branch is invalid.
+            RuntimeError: If any git command fails.
+        """
+        validate_repo(repo)
+        if not _BRANCH_RE.match(branch):
+            raise ValueError(
+                f"Invalid branch name '{branch}'. "
+                "Branch names must start with an alphanumeric character and contain only "
+                "alphanumerics, dots, hyphens, underscores, and forward slashes "
+                "(no consecutive special characters)."
+            )
+
+        self._git(["add", "-A"], repo_path)
+
+        _, status_out, _ = self._git(["status", "--porcelain"], repo_path)
+        if not status_out.strip():
+            self.logger.info("Nothing to commit on branch %s -- skipping", branch)
+            return
+
+        self._git(["commit", "-m", message], repo_path)
+        self.logger.info("Committed locally to %s on %s (push deferred)", branch, repo)
 
     def create_pr(self, repo: str, branch: str, title: str, body: str, *, repo_path: Path | None = None) -> str:
         """Create a pull request and return its URL.
@@ -261,9 +286,7 @@ class GitOpsJudge:
         )
         if rc != 0:
             if "CONFLICTING" in stderr:
-                raise ConflictingPRError(
-                    f"PR #{pr_number} on {repo} is in CONFLICTING state: {stderr.strip()}"
-                )
+                raise ConflictingPRError(f"PR #{pr_number} on {repo} is in CONFLICTING state: {stderr.strip()}")
             raise RuntimeError(f"Failed to merge PR #{pr_number} on {repo}: {stderr.strip()}")
         self.logger.info("Merged PR #%d on %s", pr_number, repo)
 
@@ -287,7 +310,12 @@ class GitOpsJudge:
         self.logger.info("Created and pushed tag %s on %s", tag, repo)
 
     def wait_for_checks(
-        self, repo: str, pr_number: int, timeout: int | None = None, *, repo_path: Path | None = None,
+        self,
+        repo: str,
+        pr_number: int,
+        timeout: int | None = None,
+        *,
+        repo_path: Path | None = None,
     ) -> bool:
         """Wait for all CI checks on a PR to complete.
 
@@ -355,9 +383,7 @@ class GitOpsJudge:
         default_branch = self._get_default_branch(repo_path, repo=repo)
         self._git(["checkout", default_branch], repo_path)
         self._git(["pull", "origin", default_branch], repo_path)
-        self.logger.info(
-            "Checked out default branch %s in %s", default_branch, repo_path
-        )
+        self.logger.info("Checked out default branch %s in %s", default_branch, repo_path)
 
     def rebase_and_force_push(self, repo: str, repo_path: Path, branch: str) -> None:
         """Rebase the current branch onto the remote default branch and force-push.
@@ -381,9 +407,7 @@ class GitOpsJudge:
         self._git(["fetch", "origin"], repo_path)
         self._git(["rebase", f"origin/{default_branch}"], repo_path)
         self._git(["push", "--force-with-lease", "origin", branch], repo_path)
-        self.logger.info(
-            "Rebased %s onto origin/%s and force-pushed", branch, default_branch
-        )
+        self.logger.info("Rebased %s onto origin/%s and force-pushed", branch, default_branch)
 
     def update_parent_submodule_ref(self, repo: str, repo_path: Path, message: str) -> None:
         """Update the parent repo's submodule reference after a merge.
@@ -439,7 +463,8 @@ class GitOpsJudge:
                 return configured
 
         rc, stdout, _ = run_command(
-            ["git", "rev-parse", "--abbrev-ref", "origin/HEAD"], cwd=repo_path,
+            ["git", "rev-parse", "--abbrev-ref", "origin/HEAD"],
+            cwd=repo_path,
         )
         if rc != 0 or not stdout.strip():
             raise RuntimeError(
@@ -456,8 +481,8 @@ class GitOpsJudge:
         self.logger.debug(
             "git exit=%d stdout=%r stderr=%r",
             rc,
-            stdout[:500] if stdout else "",
-            stderr[:500] if stderr else "",
+            stdout[:RAW_RESPONSE_PREVIEW_CHARS] if stdout else "",
+            stderr[:RAW_RESPONSE_PREVIEW_CHARS] if stderr else "",
         )
         if rc != 0:
             raise RuntimeError(f"git {' '.join(args)} failed (exit {rc}): {stderr.strip()}")
@@ -497,7 +522,7 @@ class GitOpsJudge:
         self.logger.debug(
             "gh exit=%d stdout=%r stderr=%r",
             result.returncode,
-            result.stdout[:500] if result.stdout else "",
-            result.stderr[:500] if result.stderr else "",
+            result.stdout[:RAW_RESPONSE_PREVIEW_CHARS] if result.stdout else "",
+            result.stderr[:RAW_RESPONSE_PREVIEW_CHARS] if result.stderr else "",
         )
         return result.returncode, result.stdout, result.stderr

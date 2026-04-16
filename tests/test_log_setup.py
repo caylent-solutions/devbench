@@ -14,7 +14,7 @@ class TestSetupLogging:
 
     def setup_method(self) -> None:
         """Reset the configured flag before each test."""
-        log_setup_mod._configured = False
+        log_setup_mod._state[0] = False
         # Clear root handlers
         logging.getLogger().handlers.clear()
 
@@ -68,7 +68,7 @@ class TestSetupLogging:
         assert "Hello from test" in content
 
     def test_uses_default_path_when_env_not_set(self, tmp_path: Path) -> None:
-        log_setup_mod._configured = False
+        log_setup_mod._state[0] = False
         default_log = tmp_path / "logs" / "orchestrator.log"
         with patch.object(log_setup_mod, "_DEFAULT_LOG_FILE", str(default_log)):
             with patch.dict("os.environ", {}, clear=False):
@@ -82,5 +82,5 @@ class TestSetupLogging:
 
     def teardown_method(self) -> None:
         """Clean up after each test."""
-        log_setup_mod._configured = False
+        log_setup_mod._state[0] = False
         logging.getLogger().handlers.clear()

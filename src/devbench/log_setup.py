@@ -12,13 +12,18 @@ import os
 import sys
 from pathlib import Path
 
-_LOG_FORMAT = "%(asctime)s [%(name)s] %(levelname)s %(message)s"
-_LOG_DATE_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+from devbench.constants import (
+    DEFAULT_LOG_FILENAME,
+    DEFAULT_LOG_LEVEL,
+    DEFAULT_LOG_SUBDIR,
+    LOG_DATE_FORMAT,
+    LOG_FORMAT,
+)
 
-_DEFAULT_LOG_DIR = Path(__file__).resolve().parent / "logs"
-_DEFAULT_LOG_FILE = str(_DEFAULT_LOG_DIR / "orchestrator.log")
+_DEFAULT_LOG_DIR = Path(__file__).resolve().parent / DEFAULT_LOG_SUBDIR
+_DEFAULT_LOG_FILE = str(_DEFAULT_LOG_DIR / DEFAULT_LOG_FILENAME)
 
-_configured = False
+_state = [False]
 
 
 def setup_logging(level: int | None = None) -> Path:
@@ -34,12 +39,11 @@ def setup_logging(level: int | None = None) -> Path:
 
     Safe to call multiple times — only configures on the first call.
     """
-    global _configured  # noqa: PLW0603
-    if _configured:
+    if _state[0]:
         return Path(os.environ.get("JUDGE_LOG_FILE", _DEFAULT_LOG_FILE))
 
     if level is None:
-        env_level = os.environ.get("JUDGE_LOG_LEVEL", "INFO").upper()
+        env_level = os.environ.get("JUDGE_LOG_LEVEL", DEFAULT_LOG_LEVEL).upper()
         level = getattr(logging, env_level, logging.INFO)
 
     log_file = Path(os.environ.get("JUDGE_LOG_FILE", _DEFAULT_LOG_FILE))
@@ -51,7 +55,7 @@ def setup_logging(level: int | None = None) -> Path:
     # Clear any existing handlers (prevents duplicates on re-import)
     root_logger.handlers.clear()
 
-    formatter = logging.Formatter(_LOG_FORMAT, datefmt=_LOG_DATE_FORMAT)
+    formatter = logging.Formatter(LOG_FORMAT, datefmt=LOG_DATE_FORMAT)
 
     # Stdout handler — real-time visibility in Claude Code terminal
     stdout_handler = logging.StreamHandler(sys.stdout)
@@ -65,6 +69,6 @@ def setup_logging(level: int | None = None) -> Path:
     file_handler.setFormatter(formatter)
     root_logger.addHandler(file_handler)
 
-    _configured = True
+    _state[0] = True
     logging.getLogger("judges.log_setup").info("Logging to stdout and %s", log_file)
     return log_file

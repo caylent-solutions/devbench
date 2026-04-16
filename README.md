@@ -283,6 +283,123 @@ Required variables (`JUDGE_WORKSPACE_ROOT`, `JUDGE_CLAUDE_MODEL`) raise `Runtime
 
 The `--config <path>` CLI flag (or `JUDGE_CONFIG_PATH` env var) overrides the default config file location.
 
+### Single-branch mode
+
+By default, DevBench creates a separate branch per work unit and merges each independently. For projects that need all changes on one branch with one PR at the end, enable single-branch mode:
+
+```yaml
+# backlog/config/devbench.yaml
+git_ops:
+  single_branch: feat/my-feature
+  defer_pr: true
+```
+
+In this mode:
+- `ensure-branch` creates/checks out `feat/my-feature` for every task (instead of `backlog/<id>`)
+- `git-ops` commits locally only (no push, no PR, no merge) -- one commit per task
+- After all work units are done, run `devbench git-ops-finalize <repo>` to push the branch and create the PR
+
+This produces a single branch with one commit per completed task, resulting in one PR for review.
+
+`defer_pr` requires `single_branch` to be set (raises an error otherwise).
+
+### Token cost estimates
+
+The `report` command shows token consumption and estimated cost. Pricing defaults to Opus list rates but can be overridden for enterprise discounts:
+
+```yaml
+report:
+  token_cost_per_million_input: 10.0    # default: 15.0
+  token_cost_per_million_output: 50.0   # default: 75.0
+  token_cost_input_ratio: 0.80          # default: 0.80 (80% input, 20% output)
+```
+
+Token data is read from `hook-logs.jsonl` in the workspace root (written by Claude Code hooks). Cost is a blended estimate based on the input/output ratio -- actual billing depends on your account terms.
+
+### Stop hook (circuit breaker)
+
+The orchestrator registers a Claude Code Stop hook (`continue-orchestration.sh`) that prevents the agent from stopping mid-loop when a task is in-progress. After context compaction, Claude may attempt to stop; the hook blocks the stop and injects the current task ID, file path, last action, and a specific next step so the agent can resume.
+
+A circuit breaker prevents infinite stop-block loops: after `max_blocks` blocks within `window_seconds`, the hook allows the stop and logs a `[CIRCUIT_BREAKER]` comment to the work unit.
+
+```yaml
+stop_hook:
+  max_blocks: 5              # default: 5
+  window_seconds: 180        # default: 180
+  stale_task_minutes: 120    # default: 120
+```
+
+Environment variable overrides: `JUDGE_STOP_MAX_BLOCKS`, `JUDGE_STOP_WINDOW_SECONDS`, `JUDGE_STOP_STALE_MINUTES`.
+
+## Workspace Setup
+
+### Recommended: keep the backlog in its own git repo
+
+The backlog (`BACKLOG.md`, `backlog/`, specs) should live in a dedicated local git repo, separate from the target repositories DevBench modifies. This lets you track backlog progress with commits without mixing backlog changes into the target repos.
+
+```
+/workspaces/my-project/
+  my-backlog/              <-- JUDGE_WORKSPACE_ROOT (its own git repo)
+    BACKLOG.md
+    backlog/
+      config/devbench.yaml
+      E0/...
+    specs/
+  target-repo/             <-- the repo DevBench modifies (separate git repo)
+```
+
+Set `JUDGE_WORKSPACE_ROOT` to the backlog repo directory. Then create symlinks inside it pointing to your target repos, and reference them as relative paths in `backlog/config/devbench.yaml`:
+
+```bash
+# Create symlinks to target repos inside the backlog repo
+ln -s /workspaces/my-project/target-repo /workspaces/my-project/my-backlog/target-repo
+```
+
+```yaml
+# backlog/config/devbench.yaml
+repos:
+  org/target-repo:
+    default_branch: main
+    checkout_directory: target-repo    # relative -- resolves via symlink
+```
+
+The `checkout_directory` must be a relative path (devbench rejects absolute paths and `..` traversal). Symlinks bridge the gap between the backlog repo and the target repos cleanly.
+
+For multiple target repos, create one symlink per repo:
+
+```bash
+ln -s /workspaces/my-project/repo-a /workspaces/my-project/my-backlog/repo-a
+ln -s /workspaces/my-project/repo-b /workspaces/my-project/my-backlog/repo-b
+```
+
+```yaml
+repos:
+  org/repo-a:
+    default_branch: main
+    checkout_directory: repo-a
+  org/repo-b:
+    default_branch: main
+    checkout_directory: repo-b
+```
+
+### Quick start
+
+```bash
+# Shell 1: start interactive session
+cd /path/to/devbench && \
+  JUDGE_WORKSPACE_ROOT=/path/to/my-backlog \
+  JUDGE_CLAUDE_MODEL=claude-opus-4-6 \
+  claude --plugin-dir plugin/devbench
+
+# Shell 2: watch progress
+cd /path/to/devbench && watch -n 30 \
+  'JUDGE_WORKSPACE_ROOT=/path/to/my-backlog \
+   JUDGE_CLAUDE_MODEL=claude-opus-4-6 \
+   uv run devbench status'
+```
+
+In the interactive session, set your model with `/model`, then type: `Run the devbench:orchestrate skill to process the backlog`
+
 ## Interactive Mode
 
 ```bash
@@ -307,7 +424,7 @@ Restarting picks up where you left off — `done` units are skipped, and `in-pro
 Run `devbench validate-backlog` to check for missing files, status mismatches, orphaned files, invalid dependency references, and Status Summary table count mismatches. Fix reported errors before running the orchestrator — it runs this check automatically at startup and aborts if any errors are found.
 
 ### Judge keeps failing the same unit
-After `JUDGE_MAX_RETRIES` failures (default: 10), the unit is marked `blocked`. Check the Comments section of the work unit file for the feedback trail.
+After `max_executor_retries` failures (default: 10, configurable in `devbench.yaml` or via `JUDGE_MAX_RETRIES` env var), the unit is marked `blocked`. Check the Comments section of the work unit file for the feedback trail.
 
 ### `mark-done` fails with "not all required judges passed"
 The done-gate check found that not all four review judges (`code_review`, `test_review`, `doc_review`, `changes_manifest`) have a `[REVIEW_PASS]` entry after the most recent `[REVIEW_REJECTED]` line. Check the Comments section of the work unit file for the current judge verdicts, then re-run any failing agents via the orchestrate skill.

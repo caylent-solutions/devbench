@@ -39,12 +39,9 @@ class TestAllowedRepos:
         with patch.dict(os.environ, env, clear=True):
             importlib.reload(config)
             assert isinstance(config.ALLOWED_REPOS, frozenset), (
-                f"Expected ALLOWED_REPOS to be a frozenset after reload, "
-                f"got {type(config.ALLOWED_REPOS).__name__}"
+                f"Expected ALLOWED_REPOS to be a frozenset after reload, got {type(config.ALLOWED_REPOS).__name__}"
             )
-            assert len(config.ALLOWED_REPOS) > 0, (
-                "Expected ALLOWED_REPOS to be non-empty (sourced from YAML fixture)"
-            )
+            assert len(config.ALLOWED_REPOS) > 0, "Expected ALLOWED_REPOS to be non-empty (sourced from YAML fixture)"
 
         importlib.reload(config)
 
@@ -52,9 +49,7 @@ class TestAllowedRepos:
         """JUDGE_ALLOWED_REPOS env var is ignored — repos come from YAML only."""
         # Capture the baseline ALLOWED_REPOS before patching.
         baseline = frozenset(config.ALLOWED_REPOS)
-        assert len(baseline) > 0, (
-            "Baseline ALLOWED_REPOS must be non-empty for this test to be meaningful"
-        )
+        assert len(baseline) > 0, "Baseline ALLOWED_REPOS must be non-empty for this test to be meaningful"
 
         with patch.dict(os.environ, {"JUDGE_ALLOWED_REPOS": "org/repo-a,org/repo-b"}, clear=False):
             importlib.reload(config)
@@ -74,13 +69,10 @@ class TestAllowedRepos:
               (state is unchanged — validate_repo is a pure validator with no side effects)
         """
         repo = next(iter(ALLOWED_REPOS))
-        assert repo in ALLOWED_REPOS, (
-            f"Precondition failed: '{repo}' should be in ALLOWED_REPOS"
-        )
+        assert repo in ALLOWED_REPOS, f"Precondition failed: '{repo}' should be in ALLOWED_REPOS"
         validate_repo(repo)
         assert repo in ALLOWED_REPOS, (
-            f"Post-condition failed: validate_repo must not modify ALLOWED_REPOS; "
-            f"'{repo}' was removed after the call"
+            f"Post-condition failed: validate_repo must not modify ALLOWED_REPOS; '{repo}' was removed after the call"
         )
 
     def test_validate_repo_raises_for_unknown_repo(self) -> None:
@@ -96,6 +88,27 @@ class TestAllowedRepos:
         with patch.object(config, "ALLOWED_GH_ORG", ""):
             with pytest.raises(ValueError, match="not allowed"):
                 config.validate_repo("other-org/some-repo")
+
+
+@pytest.mark.unit
+class TestResolveRepo:
+    """Test resolve_repo resolution logic."""
+
+    def test_returns_full_name_when_already_in_allowed_repos(self) -> None:
+        """Line 75-76: returns immediately when input is already a full name."""
+        result = config.resolve_repo(_ALLOWED_REPO_IN_FIXTURE)
+        assert result == _ALLOWED_REPO_IN_FIXTURE
+
+    def test_resolves_short_name_to_full_name(self) -> None:
+        """Lines 77-79: resolves a short repo name to its fully-qualified form."""
+        # The fixture has "caylent-solutions/git-repo", so "git-repo" should resolve
+        result = config.resolve_repo("git-repo")
+        assert result == _ALLOWED_REPO_IN_FIXTURE
+
+    def test_raises_for_unknown_name(self) -> None:
+        """Line 80-83: raises ValueError when the name is not in either mapping."""
+        with pytest.raises(ValueError, match="not recognised"):
+            config.resolve_repo("completely-unknown-repo")
 
 
 @pytest.mark.unit
@@ -151,12 +164,16 @@ class TestGetAnthropicApiKey:
 
     def test_reads_token_from_credentials_file(self, tmp_path: Path) -> None:
         creds_file = tmp_path / "credentials.json"
-        creds_file.write_text(json.dumps({
-            "claudeAiOauth": {
-                "accessToken": "sk-ant-oat01-test-token",
-                "scopes": ["user:inference"],
-            }
-        }))
+        creds_file.write_text(
+            json.dumps(
+                {
+                    "claudeAiOauth": {
+                        "accessToken": "sk-ant-oat01-test-token",
+                        "scopes": ["user:inference"],
+                    }
+                }
+            )
+        )
 
         with patch.object(config, "CLAUDE_CREDENTIALS_FILE", creds_file):
             result = config.get_anthropic_api_key()
@@ -180,9 +197,7 @@ class TestGetAnthropicApiKey:
 
     def test_raises_when_token_empty(self, tmp_path: Path) -> None:
         creds_file = tmp_path / "credentials.json"
-        creds_file.write_text(json.dumps({
-            "claudeAiOauth": {"accessToken": "  ", "scopes": []}
-        }))
+        creds_file.write_text(json.dumps({"claudeAiOauth": {"accessToken": "  ", "scopes": []}}))
 
         with patch.object(config, "CLAUDE_CREDENTIALS_FILE", creds_file):
             with pytest.raises(RuntimeError, match="No access token"):
@@ -295,4 +310,104 @@ class TestConfigOverrides:
             assert expected == config.BACKLOG_INDEX
             assert custom_index != config.BACKLOG_INDEX
 
+        importlib.reload(config)
+
+
+@pytest.mark.unit
+class TestResolveHelpers:
+    """Tests for _resolve_int and _resolve_float config resolution helpers."""
+
+    def test_resolve_int_env_var_wins(self) -> None:
+        with patch.dict(os.environ, {"TEST_VAR": "42"}, clear=False):
+            result = config._resolve_int("TEST_VAR", 10, 5)
+        assert result == 42
+
+    def test_resolve_int_yaml_when_env_absent(self) -> None:
+        env_copy = {k: v for k, v in os.environ.items() if k != "TEST_VAR_ABSENT"}
+        with patch.dict(os.environ, env_copy, clear=True):
+            result = config._resolve_int("TEST_VAR_ABSENT", 10, 5)
+        assert result == 10
+
+    def test_resolve_int_default_when_both_absent(self) -> None:
+        env_copy = {k: v for k, v in os.environ.items() if k != "TEST_VAR_ABSENT"}
+        with patch.dict(os.environ, env_copy, clear=True):
+            result = config._resolve_int("TEST_VAR_ABSENT", None, 5)
+        assert result == 5
+
+    def test_resolve_float_env_var_wins(self) -> None:
+        with patch.dict(os.environ, {"TEST_FLOAT": "1.5"}, clear=False):
+            result = config._resolve_float("TEST_FLOAT", 2.0, 3.0)
+        assert result == 1.5
+
+    def test_resolve_float_yaml_when_env_absent(self) -> None:
+        env_copy = {k: v for k, v in os.environ.items() if k != "TEST_FLOAT_ABSENT"}
+        with patch.dict(os.environ, env_copy, clear=True):
+            result = config._resolve_float("TEST_FLOAT_ABSENT", 2.0, 3.0)
+        assert result == 2.0
+
+    def test_resolve_float_default_when_both_absent(self) -> None:
+        env_copy = {k: v for k, v in os.environ.items() if k != "TEST_FLOAT_ABSENT"}
+        with patch.dict(os.environ, env_copy, clear=True):
+            result = config._resolve_float("TEST_FLOAT_ABSENT", None, 3.0)
+        assert result == 3.0
+
+    def test_resolve_float_no_env_var_name(self) -> None:
+        """When env_var is None, skip env lookup entirely."""
+        result = config._resolve_float(None, 2.5, 3.0)
+        assert result == 2.5
+
+
+@pytest.mark.unit
+class TestStopHookConfigExposed:
+    """Verify stop hook constants are exported from config module."""
+
+    def test_stop_hook_max_blocks_exposed(self) -> None:
+        assert hasattr(config, "STOP_HOOK_MAX_BLOCKS")
+        assert isinstance(config.STOP_HOOK_MAX_BLOCKS, int)
+
+    def test_stop_hook_window_seconds_exposed(self) -> None:
+        assert hasattr(config, "STOP_HOOK_WINDOW_SECONDS")
+        assert isinstance(config.STOP_HOOK_WINDOW_SECONDS, int)
+
+    def test_stop_hook_stale_task_minutes_exposed(self) -> None:
+        assert hasattr(config, "STOP_HOOK_STALE_TASK_MINUTES")
+        assert isinstance(config.STOP_HOOK_STALE_TASK_MINUTES, int)
+
+    def test_stop_hook_max_blocks_env_override(self) -> None:
+        with patch.dict(os.environ, {"JUDGE_STOP_MAX_BLOCKS": "3"}, clear=False):
+            importlib.reload(config)
+            assert config.STOP_HOOK_MAX_BLOCKS == 3
+        importlib.reload(config)
+
+    def test_stop_hook_window_seconds_env_override(self) -> None:
+        with patch.dict(os.environ, {"JUDGE_STOP_WINDOW_SECONDS": "60"}, clear=False):
+            importlib.reload(config)
+            assert config.STOP_HOOK_WINDOW_SECONDS == 60
+        importlib.reload(config)
+
+    def test_stop_hook_stale_task_minutes_env_override(self) -> None:
+        with patch.dict(os.environ, {"JUDGE_STOP_STALE_MINUTES": "30"}, clear=False):
+            importlib.reload(config)
+            assert config.STOP_HOOK_STALE_TASK_MINUTES == 30
+        importlib.reload(config)
+
+
+@pytest.mark.unit
+class TestMaxRetriesYamlFirst:
+    """Verify max_executor_retries reads YAML first, env var overrides."""
+
+    def test_max_executor_retries_env_overrides(self) -> None:
+        with patch.dict(os.environ, {"JUDGE_MAX_RETRIES": "15"}, clear=False):
+            importlib.reload(config)
+            assert config.MAX_RETRY_ATTEMPTS == 15
+        importlib.reload(config)
+
+    def test_max_executor_retries_uses_yaml_when_env_absent(self) -> None:
+        """When JUDGE_MAX_RETRIES is not set, the YAML value is used."""
+        env_copy = {k: v for k, v in os.environ.items() if k != "JUDGE_MAX_RETRIES"}
+        with patch.dict(os.environ, env_copy, clear=True):
+            importlib.reload(config)
+            # Value should come from YAML or default — it should be an int > 0
+            assert isinstance(config.MAX_RETRY_ATTEMPTS, int)
+            assert config.MAX_RETRY_ATTEMPTS > 0
         importlib.reload(config)

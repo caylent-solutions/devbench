@@ -9,13 +9,7 @@ from pathlib import Path
 
 import pytest
 
-SCRIPT_PATH = (
-    Path(__file__).parent.parent.parent
-    / "plugin"
-    / "devbench"
-    / "scripts"
-    / "guard-work-unit-write.sh"
-)
+SCRIPT_PATH = Path(__file__).parent.parent.parent / "plugin" / "devbench" / "scripts" / "guard-work-unit-write.sh"
 
 
 def _run_hook(payload: dict) -> subprocess.CompletedProcess:
@@ -72,8 +66,7 @@ class TestGuardWorkUnitWriteHook:
         payload = _make_write_payload(file_path)
         result = _run_hook(payload)
         assert result.returncode == 2, (
-            f"Expected exit 2 for Write to '{file_path}', got {result.returncode}. "
-            f"stderr: {result.stderr}"
+            f"Expected exit 2 for Write to '{file_path}', got {result.returncode}. stderr: {result.stderr}"
         )
         assert "guard-work-unit-write" in result.stderr
 
@@ -90,8 +83,7 @@ class TestGuardWorkUnitWriteHook:
         payload = _make_edit_payload(file_path)
         result = _run_hook(payload)
         assert result.returncode == 2, (
-            f"Expected exit 2 for Edit to '{file_path}', got {result.returncode}. "
-            f"stderr: {result.stderr}"
+            f"Expected exit 2 for Edit to '{file_path}', got {result.returncode}. stderr: {result.stderr}"
         )
         assert "guard-work-unit-write" in result.stderr
 
@@ -101,10 +93,9 @@ class TestGuardWorkUnitWriteHook:
         result = _run_hook(payload)
         assert result.returncode == 2
         stderr_lower = result.stderr.lower()
-        assert any(
-            word in stderr_lower
-            for word in ["backlog", "work unit", "orchestrate", "blocked"]
-        ), f"Error message not actionable: {result.stderr}"
+        assert any(word in stderr_lower for word in ["backlog", "work unit", "orchestrate", "blocked"]), (
+            f"Error message not actionable: {result.stderr}"
+        )
 
     # ------------------------------------------------------------------ AC-3: non-backlog paths are allowed
 
@@ -127,8 +118,7 @@ class TestGuardWorkUnitWriteHook:
         payload = _make_write_payload(file_path)
         result = _run_hook(payload)
         assert result.returncode == 0, (
-            f"Expected exit 0 for Write to '{file_path}', got {result.returncode}. "
-            f"stderr: {result.stderr}"
+            f"Expected exit 0 for Write to '{file_path}', got {result.returncode}. stderr: {result.stderr}"
         )
 
     def test_backlog_non_md_file_is_allowed(self) -> None:
@@ -136,8 +126,7 @@ class TestGuardWorkUnitWriteHook:
         payload = _make_write_payload("backlog/some-output.json")
         result = _run_hook(payload)
         assert result.returncode == 0, (
-            f"Expected exit 0 for non-.md file under backlog/, got {result.returncode}. "
-            f"stderr: {result.stderr}"
+            f"Expected exit 0 for non-.md file under backlog/, got {result.returncode}. stderr: {result.stderr}"
         )
 
     def test_empty_file_path_is_allowed(self) -> None:

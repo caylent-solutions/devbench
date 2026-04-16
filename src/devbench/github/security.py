@@ -10,7 +10,12 @@ import subprocess
 from dataclasses import dataclass, field
 
 from devbench.config import ALLOWED_REPOS, GH_API_TIMEOUT, get_gh_token, validate_repo
-from devbench.constants import SECURITY_ALERT_CATEGORIES
+from devbench.constants import (
+    CODEQL_QUERY_SUITE,
+    CODEQL_STATE,
+    SECURITY_ALERT_CATEGORIES,
+    SECURITY_FEATURE_ENABLED,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,8 +99,8 @@ def enable_security_features(repo: str) -> dict[str, bool]:
     rc, output = _gh_api(
         f"repos/{repo}/code-scanning/default-setup",
         "PATCH",
-        state="configured",
-        query_suite="default",
+        state=CODEQL_STATE,
+        query_suite=CODEQL_QUERY_SUITE,
     )
     results["codeql"] = rc == 0
     if rc != 0:
@@ -106,8 +111,8 @@ def enable_security_features(repo: str) -> dict[str, bool]:
         f"repos/{repo}",
         "PATCH",
         **{
-            "security_and_analysis[secret_scanning][status]": "enabled",
-            "security_and_analysis[secret_scanning_push_protection][status]": "enabled",
+            "security_and_analysis[secret_scanning][status]": SECURITY_FEATURE_ENABLED,
+            "security_and_analysis[secret_scanning_push_protection][status]": SECURITY_FEATURE_ENABLED,
         },
     )
     results["secret_scanning"] = rc == 0
@@ -138,9 +143,7 @@ def get_security_report(repo: str) -> SecurityReport:
         try:
             alerts = json.loads(output)
         except json.JSONDecodeError as exc:
-            raise RuntimeError(
-                f"Failed to parse {category} alerts for {repo}: {exc}"
-            ) from exc
+            raise RuntimeError(f"Failed to parse {category} alerts for {repo}: {exc}") from exc
 
         for alert in alerts:
             if category == "code-scanning":

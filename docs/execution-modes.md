@@ -50,12 +50,13 @@ Both modes execute the same logical steps in the same order.
    └── changes-manifest — actual changes vs. declared manifest
    (review-supervisor invokes all four judge agents in parallel)
 
-6. If any judge FAILs → inject feedback, return to step 4 (max JUDGE_MAX_RETRIES)
+6. If any judge FAILs → inject feedback, return to step 4 (max max_executor_retries)
 
 7. Security review (after all 4 judges pass)  [devbench:security-reviewer AGENT RESPONSIBILITY]
    └── If FAIL → write SECURITY_FAIL + REVIEW_REJECTED, return to step 4
 
 8. Git operations  [devbench:executor AGENT RESPONSIBILITY — ALWAYS, BOTH MODES]
+   Standard mode (default):
    ├── a. Create/checkout branch in the target submodule
    ├── b. Stage files from the Changes Manifest (selective — never git add -A)
    ├── c. Commit: "<unit-id>: <title>"
@@ -64,6 +65,12 @@ Both modes execute the same logical steps in the same order.
    ├── f. Wait for CI checks to pass
    ├── g. Squash-merge PR, delete branch
    └── h. Update parent repo's submodule reference (only when git_ops.update_submodule: true)
+
+   Single-branch mode (git_ops.single_branch + git_ops.defer_pr: true):
+   ├── a. ensure-branch creates/checks out the shared branch (same for all tasks)
+   ├── b. Stage files
+   ├── c. Commit locally: "<unit-id>: <title>" (no push, no PR, no merge)
+   └── d. After ALL tasks done: `devbench git-ops-finalize <repo>` pushes and creates PR
 
 9. Mark Done (done-gate: verifies all 4 judges passed in most recent round)
 
@@ -179,5 +186,43 @@ The BACKLOG.md index is an at-a-glance summary; the work-unit file is authoritat
 | --- | --- |
 | Judge FAIL | Feedback injected into next executor invocation; executor reads feedback, fixes code, re-runs review |
 | BLOCKED (executor reported) | `devbench:blocker-resolver` evaluates; resolution or failure feedback fed to next attempt |
-| Max retries exhausted (`JUDGE_MAX_RETRIES`, default 10) | `devbench set-status <id> blocked` — unit marked BLOCKED in BACKLOG.md |
+| Max executor retries exhausted (`max_executor_retries` / `JUDGE_MAX_RETRIES`, default 10) | `devbench set-status <id> blocked` — unit marked BLOCKED in BACKLOG.md |
 | Security FAIL | `SECURITY_FAIL` + `REVIEW_REJECTED` written to work-unit; done-gate reset; retry |
+
+---
+
+## Stop Hook and Circuit Breaker
+
+The orchestrator registers a Claude Code **Stop hook** (`continue-orchestration.sh`) that fires whenever Claude attempts to stop responding. When an orchestration loop is active (any task is in-progress in `BACKLOG.md`), the hook blocks the stop and injects context so the agent can resume.
+
+### What the hook injects
+
+- **Task ID and file path** extracted from the `BACKLOG.md` in-progress row
+- **Last action** parsed from the most recent `[judge/...]` or `[agent/...]` comment in the work-unit file
+- **Specific next step** based on the last action (e.g. "run review-supervisor" after executor, "run git-ops" after security pass)
+
+### Circuit breaker
+
+If the agent enters a tight stop-block loop (stops, gets blocked, does nothing useful, stops again), the circuit breaker prevents infinite cycling:
+
+- After `max_blocks` blocks within `window_seconds`, the hook allows the stop
+- The counter resets when the time window expires
+- When the circuit breaker trips, a `[CIRCUIT_BREAKER]` comment is logged to the work unit for audit
+
+### Blocked transitional state
+
+If the work-unit file says `blocked` but `BACKLOG.md` still shows `in-progress` (timing mismatch), the hook detects this and instructs the agent to run `devbench next` to find the next actionable task.
+
+### Stale task detection
+
+If a task has been in-progress longer than `stale_task_minutes`, the hook warns that the task may be stale from a crashed session and recommends running `devbench status` to assess.
+
+### Configuration
+
+All values are configured in `backlog/config/devbench.yaml` under `stop_hook:`, with environment variable overrides:
+
+| YAML key | Env var | Default | Description |
+| --- | --- | --- | --- |
+| `max_blocks` | `JUDGE_STOP_MAX_BLOCKS` | 5 | Circuit breaker trips after this many blocks |
+| `window_seconds` | `JUDGE_STOP_WINDOW_SECONDS` | 180 | Counter resets after this period |
+| `stale_task_minutes` | `JUDGE_STOP_STALE_MINUTES` | 120 | Warn about stale tasks older than this |

@@ -24,7 +24,7 @@ YAML schema::
         merge_strategy: squash           # optional — overrides top-level merge_strategy
 
     merge_strategy: squash               # optional — default merge strategy for all repos
-    max_retries: <integer>               # optional — max retry attempts
+    max_executor_retries: <integer>      # optional — max executor retries per work unit on judge failure
     use_bedrock: false                   # optional — route LLM calls via AWS Bedrock
     bedrock_region: <aws-region-string>  # optional — AWS region for Bedrock (env var override applied by config.py)
     judge_model: <model-id>              # optional — model for judge agents (env var override applied by config.py)
@@ -70,6 +70,15 @@ from pathlib import Path
 
 import jsonschema
 import yaml
+
+from devbench.constants import (
+    DEFAULT_STOP_HOOK_MAX_BLOCKS,
+    DEFAULT_STOP_HOOK_STALE_TASK_MINUTES,
+    DEFAULT_STOP_HOOK_WINDOW_SECONDS,
+    DEFAULT_TOKEN_COST_INPUT_RATIO,
+    DEFAULT_TOKEN_COST_PER_M_INPUT,
+    DEFAULT_TOKEN_COST_PER_M_OUTPUT,
+)
 
 # Relative path from WORKSPACE_ROOT to the default config file location.
 DEFAULT_CONFIG_SUBPATH: str = "backlog/config/devbench.yaml"
@@ -141,9 +150,50 @@ class GitOpsConfig:
             reference after each PR merge.  Set to ``True`` only when target
             repos are git submodules of a parent workspace repo.  Defaults
             to ``False`` (opt-in).
+        single_branch: When set, all work units use this branch name instead
+            of per-unit ``backlog/<id>`` branches.  Enables accumulating
+            multiple commits on one branch for a single PR.  Defaults to
+            ``None`` (per-unit branches).
+        defer_pr: When ``True``, ``git-ops`` commits and stages only --
+            it does not push, create a PR, or merge.  Use
+            ``git-ops-finalize`` to push and create the PR after all work
+            units are complete.  Only meaningful when ``single_branch``
+            is set.  Defaults to ``False``.
     """
 
     update_submodule: bool = False
+    single_branch: str | None = None
+    defer_pr: bool = False
+
+
+@dataclass
+class ReportConfig:
+    """Report and cost estimation settings.
+
+    Attributes:
+        token_cost_per_million_input: Cost per million input tokens in USD.
+        token_cost_per_million_output: Cost per million output tokens in USD.
+        token_cost_input_ratio: Estimated fraction of tokens that are input (0.0-1.0).
+    """
+
+    token_cost_per_million_input: float = DEFAULT_TOKEN_COST_PER_M_INPUT
+    token_cost_per_million_output: float = DEFAULT_TOKEN_COST_PER_M_OUTPUT
+    token_cost_input_ratio: float = DEFAULT_TOKEN_COST_INPUT_RATIO
+
+
+@dataclass
+class StopHookConfig:
+    """Stop hook circuit breaker settings.
+
+    Attributes:
+        max_blocks: Maximum consecutive stop-hook blocks before circuit breaker trips.
+        window_seconds: Time window for counting blocks. Counter resets after this period.
+        stale_task_minutes: Minutes before an in-progress task is considered stale.
+    """
+
+    max_blocks: int = DEFAULT_STOP_HOOK_MAX_BLOCKS
+    window_seconds: int = DEFAULT_STOP_HOOK_WINDOW_SECONDS
+    stale_task_minutes: int = DEFAULT_STOP_HOOK_STALE_TASK_MINUTES
 
 
 @dataclass
@@ -180,26 +230,31 @@ class RuntimeConfig:
         timeouts: Timeout values for various operations.
         limits: Threshold and limit values.
         git_ops: Git operations workflow settings.
+        report: Report and cost estimation settings.
+        stop_hook: Stop hook circuit breaker settings.
         allowed_orgs: List of permitted GitHub organisations.
         judge_model: Model identifier used by judge agents.
         executor_model: Model identifier used by the executor agent.
         use_bedrock: Whether to route LLM calls through AWS Bedrock.
         bedrock_region: AWS region for Bedrock API calls.
         merge_strategy: Default PR merge strategy for all repos.
-        max_retries: Maximum number of retry attempts.
+        max_executor_retries: Maximum executor retry attempts per work unit
+            when judge reviews fail.
     """
 
     repos: dict[str, RepoConfig] = field(default_factory=dict)
     timeouts: TimeoutConfig = field(default_factory=TimeoutConfig)
     limits: LimitConfig = field(default_factory=LimitConfig)
     git_ops: GitOpsConfig = field(default_factory=GitOpsConfig)
+    report: ReportConfig = field(default_factory=ReportConfig)
+    stop_hook: StopHookConfig = field(default_factory=StopHookConfig)
     allowed_orgs: list[str] = field(default_factory=list)
     judge_model: str | None = None
     executor_model: str | None = None
     use_bedrock: bool = False
     bedrock_region: str | None = None
     merge_strategy: str | None = None
-    max_retries: int | None = None
+    max_executor_retries: int | None = None
 
 
 def resolve_config_path(
@@ -271,9 +326,7 @@ def _parse_repo_config(path: Path, repo_name: str, repo_data: object) -> RepoCon
     )
 
 
-def _parse_repos(
-    path: Path, repos_raw: dict, allowed_orgs: list[str]
-) -> dict[str, RepoConfig]:
+def _parse_repos(path: Path, repos_raw: dict, allowed_orgs: list[str]) -> dict[str, RepoConfig]:
     """Build the repos mapping from the raw YAML ``repos`` block.
 
     When *allowed_orgs* is non-empty, every repo key's organisation component
@@ -338,18 +391,13 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         raise ValueError(f"Invalid YAML in config file '{path}': {exc}") from exc
 
     if not isinstance(raw, dict):
-        raise ValueError(
-            f"Config file '{path}' must be a YAML mapping at the top level, "
-            f"got {type(raw).__name__}."
-        )
+        raise ValueError(f"Config file '{path}' must be a YAML mapping at the top level, got {type(raw).__name__}.")
 
     # JSON Schema validation — catches unknown keys, type errors, and enum violations.
     try:
         jsonschema.validate(raw, _SCHEMA)
     except jsonschema.ValidationError as exc:
-        raise ValueError(
-            f"Config file '{path}' failed schema validation: {exc.message}"
-        ) from exc
+        raise ValueError(f"Config file '{path}' failed schema validation: {exc.message}") from exc
 
     allowed_orgs: list[str] = raw.get("allowed_orgs") or []
     repos = _parse_repos(path, raw.get("repos") or {}, allowed_orgs)
@@ -380,8 +428,42 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
 
     # Populate GitOpsConfig from YAML git_ops block (absent keys yield defaults).
     git_ops_raw = raw.get("git_ops") or {}
+    single_branch_raw = git_ops_raw.get("single_branch") or None
+    defer_pr = bool(git_ops_raw.get("defer_pr", False))
+    if defer_pr and not single_branch_raw:
+        raise ValueError(f"Config file '{path}': git_ops.defer_pr requires git_ops.single_branch to be set.")
     git_ops = GitOpsConfig(
         update_submodule=bool(git_ops_raw.get("update_submodule", False)),
+        single_branch=single_branch_raw,
+        defer_pr=defer_pr,
+    )
+
+    # Populate ReportConfig from YAML report block.
+    report_raw = raw.get("report") or {}
+    report = ReportConfig(
+        token_cost_per_million_input=float(
+            report_raw.get("token_cost_per_million_input", DEFAULT_TOKEN_COST_PER_M_INPUT),
+        ),
+        token_cost_per_million_output=float(
+            report_raw.get("token_cost_per_million_output", DEFAULT_TOKEN_COST_PER_M_OUTPUT),
+        ),
+        token_cost_input_ratio=float(
+            report_raw.get("token_cost_input_ratio", DEFAULT_TOKEN_COST_INPUT_RATIO),
+        ),
+    )
+
+    # Populate StopHookConfig from YAML stop_hook block.
+    stop_hook_raw = raw.get("stop_hook") or {}
+    stop_hook = StopHookConfig(
+        max_blocks=int(
+            stop_hook_raw.get("max_blocks", DEFAULT_STOP_HOOK_MAX_BLOCKS),
+        ),
+        window_seconds=int(
+            stop_hook_raw.get("window_seconds", DEFAULT_STOP_HOOK_WINDOW_SECONDS),
+        ),
+        stale_task_minutes=int(
+            stop_hook_raw.get("stale_task_minutes", DEFAULT_STOP_HOOK_STALE_TASK_MINUTES),
+        ),
     )
 
     return RuntimeConfig(
@@ -389,13 +471,15 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         timeouts=timeouts,
         limits=limits,
         git_ops=git_ops,
+        report=report,
+        stop_hook=stop_hook,
         allowed_orgs=allowed_orgs,
         judge_model=raw.get("judge_model") or None,
         executor_model=raw.get("executor_model") or None,
         use_bedrock=bool(raw.get("use_bedrock", False)),
         bedrock_region=raw.get("bedrock_region") or None,
         merge_strategy=raw.get("merge_strategy") or None,
-        max_retries=raw.get("max_retries") or None,
+        max_executor_retries=raw.get("max_executor_retries") or None,
     )
 
 

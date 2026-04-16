@@ -165,9 +165,7 @@ class TestCmdNext:
         assert result == 0
         assert "NO_ACTIONABLE" in capsys.readouterr().out
 
-    def test_next_does_not_mutate_status(
-        self, mock_units: list[WorkUnit], capsys: pytest.CaptureFixture
-    ) -> None:
+    def test_next_does_not_mutate_status(self, mock_units: list[WorkUnit], capsys: pytest.CaptureFixture) -> None:
         """cmd_next must be read-only: BacklogManager.force_status must never be called."""
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = mock_units
@@ -182,9 +180,7 @@ class TestCmdNext:
         assert result == 0
         mock_mgr.force_status.assert_not_called()
 
-    def test_next_returns_json_descriptor(
-        self, mock_units: list[WorkUnit], capsys: pytest.CaptureFixture
-    ) -> None:
+    def test_next_returns_json_descriptor(self, mock_units: list[WorkUnit], capsys: pytest.CaptureFixture) -> None:
         """cmd_next emits a JSON object with id, title, repo, file_path, and dependencies."""
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = mock_units
@@ -235,6 +231,7 @@ class TestCmdClaim:
         call_args = mock_mgr.force_status.call_args
         assert call_args[0][2] == "E0-F1-S1-T2"
         from devbench.constants import STATUS_IN_PROGRESS
+
         assert call_args[0][3] == STATUS_IN_PROGRESS
         assert "Claimed E0-F1-S1-T2" in capsys.readouterr().out
 
@@ -364,7 +361,17 @@ class TestCmdValidateBacklogPathResolution:
         backlog_dir = workspace / BACKLOG_SUBDIR
         backlog_dir.mkdir(parents=True, exist_ok=True)
         wu = backlog_dir / "E0-F1-S1-T1.md"
-        wu.write_text("# E0-F1-S1-T1: Task\n\n## Status: in-queue\n", encoding="utf-8")
+        wu.write_text(
+            "# E0-F1-S1-T1: Task\n\n## Status: in-queue\n\n"
+            "## Target Repository\n\n- **Repo:** `org/repo`\n\n"
+            "## Description\n\nTest task.\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-FUNC-001 Placeholder\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `f.py` | New |\n\n"
+            "## Definition of Done\n\n- [ ] All ACs checked\n\n"
+            "## TDD Cycle Log\n\n## Comments\n",
+            encoding="utf-8",
+        )
         idx = workspace / "BACKLOG.md"
         idx.write_text(
             "# Backlog\n\n"
@@ -428,9 +435,7 @@ class TestCmdValidateBacklog:
 
         assert result == 0
 
-    def test_returns_1_and_prints_errors_when_invalid(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_returns_1_and_prints_errors_when_invalid(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         mock_mgr = MagicMock()
         mock_mgr.validate.return_value = ["E0-T1: work unit file missing", "E0-T2: status mismatch"]
 
@@ -747,9 +752,7 @@ class TestCmdGitOpsPostMergeCheckout:
             result = cli.cmd_git_ops("E224-F1-S1-T1")
 
         assert result == 0
-        mock_ops.checkout_default_branch.assert_called_once_with(
-            "caylent-solutions/devbench", repo_path
-        )
+        mock_ops.checkout_default_branch.assert_called_once_with("caylent-solutions/devbench", repo_path)
 
     def test_cmd_git_ops_calls_checkout_before_submodule_update(self, tmp_path: Path) -> None:
         """
@@ -963,8 +966,7 @@ class TestCmdGetDiff:
 
         # Simulate: bare main3 would include upstream-merged file, origin/main3 would not
         branch_only_diff = (
-            "diff --git a/new_feature.py b/new_feature.py\n"
-            "+++ b/new_feature.py\n@@ -0,0 +1 @@\n+feature\n"
+            "diff --git a/new_feature.py b/new_feature.py\n+++ b/new_feature.py\n@@ -0,0 +1 @@\n+feature\n"
         )
         stale_extra_diff = branch_only_diff + "diff --git a/upstream_merged.py b/upstream_merged.py\n"
 
@@ -1036,15 +1038,9 @@ class TestCmdReadUnitStripComments:
         assert result == 0
         output = capsys.readouterr().out
         data = json.loads(output)
-        assert "## Comments" not in data["content"], (
-            "Comments section should be stripped when --strip-comments is used"
-        )
-        assert "[REVIEW_PASS]" not in data["content"], (
-            "Comment entries should be removed when --strip-comments is used"
-        )
-        assert "## Description" in data["content"], (
-            "Content before ## Comments should be preserved"
-        )
+        assert "## Comments" not in data["content"], "Comments section should be stripped when --strip-comments is used"
+        assert "[REVIEW_PASS]" not in data["content"], "Comment entries should be removed when --strip-comments is used"
+        assert "## Description" in data["content"], "Content before ## Comments should be preserved"
 
     def test_read_unit_without_flag_returns_full_content(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -1073,13 +1069,9 @@ class TestCmdReadUnitStripComments:
         assert "## Comments" in data["content"], (
             "Without --strip-comments, full content including Comments should be returned"
         )
-        assert "[REVIEW_PASS]" in data["content"], (
-            "Without --strip-comments, comment entries should be present"
-        )
+        assert "[REVIEW_PASS]" in data["content"], "Without --strip-comments, comment entries should be present"
 
-    def test_read_unit_strip_comments_without_unit_id_returns_error(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_read_unit_strip_comments_without_unit_id_returns_error(self, capsys: pytest.CaptureFixture[str]) -> None:
         """AC-4: --strip-comments without unit ID exits with non-zero and clear error."""
         result = cli.cmd_read_unit("--strip-comments")
         assert result == 1
@@ -1092,11 +1084,7 @@ class TestCmdReadUnitStripComments:
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """AC-2 edge case: --strip-comments on a file with no ## Comments section is a no-op."""
-        content = (
-            "# E216-F1-S1-T1: Strip Test\n\n"
-            "## Status: in-progress\n\n"
-            "## Description\n\nSome description.\n"
-        )
+        content = "# E216-F1-S1-T1: Strip Test\n\n## Status: in-progress\n\n## Description\n\nSome description.\n"
         wu_file = self._make_wu_file(tmp_path, content)
         unit = self._make_unit(wu_file)
         mock_parser = MagicMock()
@@ -1168,9 +1156,7 @@ class TestCmdLogComment:
         assert "[agent/executor]" in content, "Agent prefix not in comment"
         assert "implementation complete" in content, "Message not in comment"
 
-    def test_log_comment_contains_no_review_token(
-        self, tmp_path: Path
-    ) -> None:
+    def test_log_comment_contains_no_review_token(self, tmp_path: Path) -> None:
         """AC-2: log-comment entries must not contain [REVIEW_PASS] or [REVIEW_FAIL]."""
         backlog_dir, wu_file = self._make_wu_file(tmp_path)
         unit = self._make_mock_unit(backlog_dir)
@@ -1238,9 +1224,7 @@ class TestCmdGitOpsEventComments:
         wu_file.write_text(f"# {unit_id}\n\n## Status: in-progress\n\n## Comments\n", encoding="utf-8")
         return wu_file
 
-    def test_git_ops_appends_pr_created_comment(
-        self, tmp_path: Path
-    ) -> None:
+    def test_git_ops_appends_pr_created_comment(self, tmp_path: Path) -> None:
         """AC-1: After create_pr succeeds, Comments contains [agent/git_ops] [PR_CREATED] <url>."""
         unit_id = "E230-F1-S1-T1"
         pr_url = "https://github.com/org/repo/pull/42"
@@ -1269,9 +1253,7 @@ class TestCmdGitOpsEventComments:
         assert "[PR_CREATED]" in content, f"[PR_CREATED] not found in:\n{content}"
         assert pr_url in content, f"PR URL not found in:\n{content}"
 
-    def test_git_ops_appends_pr_merged_comment_normal_path(
-        self, tmp_path: Path
-    ) -> None:
+    def test_git_ops_appends_pr_merged_comment_normal_path(self, tmp_path: Path) -> None:
         """AC-2: After merge_pr succeeds (normal), Comments contains [agent/git_ops] [PR_MERGED] <url>."""
         unit_id = "E230-F1-S1-T1"
         pr_url = "https://github.com/org/repo/pull/42"
@@ -1300,9 +1282,7 @@ class TestCmdGitOpsEventComments:
         assert "[PR_MERGED]" in content, f"[PR_MERGED] not found in:\n{content}"
         assert pr_url in content
 
-    def test_git_ops_appends_pr_merged_comment_rebase_retry_path(
-        self, tmp_path: Path
-    ) -> None:
+    def test_git_ops_appends_pr_merged_comment_rebase_retry_path(self, tmp_path: Path) -> None:
         """AC-3: After merge_pr succeeds via rebase-retry, Comments contains [agent/git_ops] [PR_MERGED] <url>."""
         from devbench.github.git_ops import ConflictingPRError
 
@@ -1334,9 +1314,7 @@ class TestCmdGitOpsEventComments:
         assert "[PR_MERGED]" in content, f"[PR_MERGED] not found after rebase-retry in:\n{content}"
         assert pr_url in content
 
-    def test_event_comments_contain_no_review_token(
-        self, tmp_path: Path
-    ) -> None:
+    def test_event_comments_contain_no_review_token(self, tmp_path: Path) -> None:
         """AC-5: git_ops event entries contain no [REVIEW_PASS] or [REVIEW_FAIL] token."""
         unit_id = "E230-F1-S1-T1"
         pr_url = "https://github.com/org/repo/pull/42"
@@ -1396,9 +1374,7 @@ class TestCmdGitOpsEventComments:
 class TestCmdMarkDoneEventComment:
     """Tests for AC-4, AC-5: cmd_mark_done appends [orchestrator] [DONE] comment."""
 
-    def test_mark_done_appends_done_comment(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_mark_done_appends_done_comment(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         """AC-4: After cmd_mark_done completes, Comments contains [orchestrator] [DONE] Work unit <id> completed.
 
         Uses a real BacklogManager (not mocked) so that _append_agent_comment actually writes to the file.
@@ -1429,8 +1405,7 @@ class TestCmdMarkDoneEventComment:
 
         # All judges pass so mark_done gate is satisfied
         all_pass_comments = "".join(
-            f"[2026-01-01 00:00 UTC] [judge/{j}] [REVIEW_PASS] ok\n"
-            for j in sorted(ALL_REQUIRED_JUDGE_NAMES)
+            f"[2026-01-01 00:00 UTC] [judge/{j}] [REVIEW_PASS] ok\n" for j in sorted(ALL_REQUIRED_JUDGE_NAMES)
         )
 
         backlog_subdir = tmp_path / "backlog"
@@ -1458,9 +1433,7 @@ class TestCmdMarkDoneEventComment:
         assert "[DONE]" in content, f"[DONE] not found in:\n{content}"
         assert unit_id in content
 
-    def test_mark_done_done_comment_contains_no_review_token(
-        self, tmp_path: Path
-    ) -> None:
+    def test_mark_done_done_comment_contains_no_review_token(self, tmp_path: Path) -> None:
         """AC-5: [DONE] entry appended by cmd_mark_done has no [REVIEW_PASS] or [REVIEW_FAIL] token."""
         from devbench.constants import ALL_REQUIRED_JUDGE_NAMES
 
@@ -1485,8 +1458,7 @@ class TestCmdMarkDoneEventComment:
         )
 
         all_pass_comments = "".join(
-            f"[2026-01-01 00:00 UTC] [judge/{j}] [REVIEW_PASS] ok\n"
-            for j in sorted(ALL_REQUIRED_JUDGE_NAMES)
+            f"[2026-01-01 00:00 UTC] [judge/{j}] [REVIEW_PASS] ok\n" for j in sorted(ALL_REQUIRED_JUDGE_NAMES)
         )
 
         backlog_subdir = tmp_path / "backlog"
@@ -1522,9 +1494,7 @@ class TestCmdMarkDoneEventComment:
 class TestResolveUnitFile:
     """AC-8: _resolve_unit_file helper extracted and used by relevant commands."""
 
-    def test_resolve_unit_file_returns_path_when_found_under_backlog_root(
-        self, tmp_path: Path
-    ) -> None:
+    def test_resolve_unit_file_returns_path_when_found_under_backlog_root(self, tmp_path: Path) -> None:
         """_resolve_unit_file returns the file path when found under BACKLOG_ROOT."""
         unit = WorkUnit(
             id="E230-F1-S1-T1",
@@ -1548,9 +1518,7 @@ class TestResolveUnitFile:
         assert result is not None
         assert result == wu_file
 
-    def test_resolve_unit_file_returns_none_when_not_found(
-        self, tmp_path: Path
-    ) -> None:
+    def test_resolve_unit_file_returns_none_when_not_found(self, tmp_path: Path) -> None:
         """AC-8: _resolve_unit_file returns None when file not found in either location."""
         unit = WorkUnit(
             id="E230-F1-S1-T1",
@@ -1571,9 +1539,7 @@ class TestResolveUnitFile:
 
         assert result is None
 
-    def test_resolve_unit_file_falls_back_to_workspace_root(
-        self, tmp_path: Path
-    ) -> None:
+    def test_resolve_unit_file_falls_back_to_workspace_root(self, tmp_path: Path) -> None:
         """_resolve_unit_file falls back to WORKSPACE_ROOT when file not found under BACKLOG_ROOT."""
         unit = WorkUnit(
             id="E230-F1-S1-T1",
@@ -1831,9 +1797,7 @@ class TestCmdLogTdd:
 
     def test_log_tdd_cli_command_registered(self) -> None:
         """AC-1: 'log-tdd' is a recognized command in the CLI command registry."""
-        assert "log-tdd" in cli._COMMANDS, (
-            "log-tdd command must be registered in cli._COMMANDS"
-        )
+        assert "log-tdd" in cli._COMMANDS, "log-tdd command must be registered in cli._COMMANDS"
 
     def test_log_tdd_entry_not_in_comments_section(self, tmp_path: Path) -> None:
         """AC-11: TDD Cycle Log entries do not appear in ## Comments section."""
@@ -1863,6 +1827,1188 @@ class TestCmdLogTdd:
         tdd_start = content.find("## TDD Cycle Log")
         # Extract comments section (before TDD Cycle Log)
         comments_section = content[comments_start:tdd_start] if tdd_start > comments_start else content[comments_start:]
-        assert "unique-tdd-marker-xyz" not in comments_section, (
-            f"TDD entry leaked into ## Comments: {comments_section}"
+        assert "unique-tdd-marker-xyz" not in comments_section, f"TDD entry leaked into ## Comments: {comments_section}"
+
+
+class TestCmdStatusActiveUnits:
+    """Test cmd_status shows active work units (IN_PROGRESS / IN_REVIEW)."""
+
+    def test_shows_active_work_units(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Lines 116-118: active IN_PROGRESS and IN_REVIEW units are printed."""
+        in_progress_unit = WorkUnit(
+            id="E0-F1-S1-T1",
+            title="Active Task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T1.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
         )
+        in_review_unit = WorkUnit(
+            id="E0-F1-S1-T2",
+            title="Reviewing Task",
+            status=WorkUnitStatus.IN_REVIEW,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T2.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [in_progress_unit, in_review_unit]
+        mock_parser.get_parallel_candidates.return_value = [in_progress_unit]
+        mock_parser.all_done.return_value = False
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_status()
+
+        assert result == 0
+        output = capsys.readouterr().out
+        assert "Active work units:" in output
+        assert "E0-F1-S1-T1" in output
+        assert "E0-F1-S1-T2" in output
+
+
+class TestCmdClaimFileNotFound:
+    """Test cmd_claim when work unit file is not found on disk."""
+
+    def test_claim_returns_1_when_file_missing(
+        self, mock_units: list[WorkUnit], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Lines 174-175: file not found for resolved unit."""
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=None),
+        ):
+            result = cli.cmd_claim("E0-F1-S1-T2")
+
+        assert result == 1
+        assert "file not found" in capsys.readouterr().err.lower()
+
+
+class TestCmdSetStatusFileNotFound:
+    """Test cmd_set_status when work unit file is not found on disk."""
+
+    def test_set_status_returns_1_when_file_missing(
+        self, mock_units: list[WorkUnit], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Lines 204-205: work unit file not found."""
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=None),
+        ):
+            result = cli.cmd_set_status("E0-F1-S1-T2", "in-progress")
+
+        assert result == 1
+        assert "file not found" in capsys.readouterr().err.lower()
+
+
+class TestCmdMarkDoneFileNotFound:
+    """Test cmd_mark_done when work unit file is not found on disk."""
+
+    def test_mark_done_returns_1_when_file_missing(
+        self, mock_units: list[WorkUnit], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Lines 232-233: work unit file not found."""
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli._resolve_unit_file", return_value=None),
+        ):
+            result = cli.cmd_mark_done("E0-F1-S1-T2")
+
+        assert result == 1
+        assert "file not found" in capsys.readouterr().err.lower()
+
+
+class TestCmdReadUnitFileResolution:
+    """Test cmd_read_unit file path resolution branches."""
+
+    def _make_unit(self, file_path: Path) -> WorkUnit:
+        return WorkUnit(
+            id="E0-F1-S1-T1",
+            title="Test Task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=file_path,
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+
+    def test_read_unit_not_found_returns_1(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Lines 340-341: unit not found in backlog index."""
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = []
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_read_unit("NONEXISTENT")
+
+        assert result == 1
+        assert "not found" in capsys.readouterr().err.lower()
+
+    def test_read_unit_falls_back_to_workspace_root(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """Lines 345, 351-352: file resolution from BACKLOG_ROOT falls back to WORKSPACE_ROOT."""
+        unit = self._make_unit(Path("backlog/E0-F1-S1-T1.md"))
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        # File exists under WORKSPACE_ROOT, not BACKLOG_ROOT
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        wu_file = workspace / "backlog" / "E0-F1-S1-T1.md"
+        wu_file.parent.mkdir(parents=True)
+        wu_file.write_text("# E0-F1-S1-T1: Test\n\n## Status: in-progress\n", encoding="utf-8")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "missing_backlog"),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+        ):
+            result = cli.cmd_read_unit("E0-F1-S1-T1")
+
+        assert result == 0
+
+    def test_read_unit_no_local_path_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """Lines 351-352: no local path configured for repo."""
+        wu_file = tmp_path / "backlog" / "E0-F1-S1-T1.md"
+        wu_file.parent.mkdir(parents=True)
+        wu_file.write_text("# E0-F1-S1-T1: Test\n\n## Status: in-progress\n", encoding="utf-8")
+        unit = self._make_unit(wu_file)
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {}),
+        ):
+            result = cli.cmd_read_unit("E0-F1-S1-T1")
+
+        assert result == 1
+        assert "no local path" in capsys.readouterr().err.lower()
+
+
+class TestCmdGetDiffEdgeCases:
+    """Test cmd_get_diff edge cases and error branches."""
+
+    def _make_unit(self) -> WorkUnit:
+        return WorkUnit(
+            id="E0-F1-S1-T1",
+            title="Test Task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T1.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+
+    def test_get_diff_unit_not_found(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Lines 388-389: unit not found."""
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = []
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_get_diff("NONEXISTENT")
+
+        assert result == 1
+        assert "not found" in capsys.readouterr().err.lower()
+
+    def test_get_diff_no_local_path(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Lines 395-396: no local path configured for repo."""
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {}),
+        ):
+            result = cli.cmd_get_diff("E0-F1-S1-T1")
+
+        assert result == 1
+        assert "no local path" in capsys.readouterr().err.lower()
+
+    def test_get_diff_falls_back_to_git_default_branch(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Lines 412-423: when no configured default branch, falls back to git rev-parse."""
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd == ["git", "rev-parse", "--abbrev-ref", "origin/HEAD"]:
+                return (0, "origin/main\n", "")
+            return (0, "", "")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.cli.get_configured_default_branch", return_value=None),
+            patch("devbench.cli.run_command", side_effect=fake_run_command),
+        ):
+            result = cli.cmd_get_diff("E0-F1-S1-T1")
+
+        assert result == 0
+
+    def test_get_diff_returns_error_when_no_default_branch(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Lines 417-422: git rev-parse fails and no configured branch."""
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd == ["git", "rev-parse", "--abbrev-ref", "origin/HEAD"]:
+                return (1, "", "fatal: error")
+            return (0, "", "")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.cli.get_configured_default_branch", return_value=None),
+            patch("devbench.cli.run_command", side_effect=fake_run_command),
+        ):
+            result = cli.cmd_get_diff("E0-F1-S1-T1")
+
+        assert result == 1
+        assert "cannot determine default branch" in capsys.readouterr().err.lower()
+
+    def test_get_diff_includes_untracked_files(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """Lines 434-453: untracked files are included as synthetic diff hunks."""
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        # Create an untracked file for the synthetic diff
+        untracked_file = repo_path / "new_file.py"
+        untracked_file.write_text("print('hello')\n", encoding="utf-8")
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd == ["git", "ls-files", "--others", "--exclude-standard"]:
+                return (0, "new_file.py\n", "")
+            return (0, "", "")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
+            patch("devbench.cli.get_configured_default_branch", return_value="main"),
+            patch("devbench.cli.run_command", side_effect=fake_run_command),
+        ):
+            result = cli.cmd_get_diff("E0-F1-S1-T1")
+
+        assert result == 0
+        output = capsys.readouterr().out
+        assert "new_file.py" in output
+        assert "+print('hello')" in output
+
+    def test_get_diff_includes_staged_and_unstaged_diffs(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Lines 402, 406: staged and unstaged diffs are included in output."""
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd == ["git", "diff", "--cached"]:
+                return (0, "staged-diff-content\n", "")
+            if cmd == ["git", "diff"] and len(cmd) == 2:
+                return (0, "unstaged-diff-content\n", "")
+            return (0, "", "")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.cli.get_configured_default_branch", return_value="main"),
+            patch("devbench.cli.run_command", side_effect=fake_run_command),
+        ):
+            result = cli.cmd_get_diff("E0-F1-S1-T1")
+
+        assert result == 0
+        output = capsys.readouterr().out
+        assert "staged-diff-content" in output
+        assert "unstaged-diff-content" in output
+
+    def test_get_diff_skips_unreadable_untracked_files(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Lines 441-442: OSError reading untracked file is skipped gracefully."""
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        # Do NOT create the file so reading it raises OSError
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd == ["git", "ls-files", "--others", "--exclude-standard"]:
+                return (0, "nonexistent_file.py\n", "")
+            return (0, "", "")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
+            patch("devbench.cli.get_configured_default_branch", return_value="main"),
+            patch("devbench.cli.run_command", side_effect=fake_run_command),
+        ):
+            result = cli.cmd_get_diff("E0-F1-S1-T1")
+
+        assert result == 0
+
+    def test_get_diff_skips_empty_filepath_lines(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """Line 437: empty filepath lines among valid ones are skipped."""
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        # Create a valid file so one line succeeds, and one blank line gets skipped
+        valid_file = repo_path / "valid.py"
+        valid_file.write_text("x = 1\n", encoding="utf-8")
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd == ["git", "ls-files", "--others", "--exclude-standard"]:
+                # Mix of a valid file and an empty line
+                return (0, "valid.py\n\n", "")
+            return (0, "", "")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
+            patch("devbench.cli.get_configured_default_branch", return_value="main"),
+            patch("devbench.cli.run_command", side_effect=fake_run_command),
+        ):
+            result = cli.cmd_get_diff("E0-F1-S1-T1")
+
+        assert result == 0
+        output = capsys.readouterr().out
+        assert "valid.py" in output
+
+
+class TestCmdLogVerdictFileResolution:
+    """Test cmd_log_verdict file resolution fallback."""
+
+    def test_log_verdict_falls_back_to_workspace_root(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """Line 520: file resolution falls back to WORKSPACE_ROOT when not under BACKLOG_ROOT."""
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        wu_file = workspace / "backlog" / "E0-F1-S1-T1.md"
+        wu_file.parent.mkdir(parents=True)
+        wu_file.write_text("# E0-F1-S1-T1\n\n## Status: in-progress\n\n## Comments\n", encoding="utf-8")
+
+        unit = WorkUnit(
+            id="E0-F1-S1-T1",
+            title="Test Task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T1.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "missing"),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+        ):
+            result = cli.cmd_log_verdict("code_review", "E0-F1-S1-T1", "pass", "ok")
+
+        assert result == 0
+        content = wu_file.read_text(encoding="utf-8")
+        assert "[REVIEW_PASS]" in content
+
+
+class TestCmdLogCommentNoCommentsSection:
+    """Test cmd_log_comment when Comments section is missing."""
+
+    def test_log_comment_creates_comments_section_when_missing(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Line 577: creates ## Comments section header when it doesn't exist."""
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        wu_file = backlog_dir / "E0-F1-S1-T1.md"
+        wu_file.write_text("# E0-F1-S1-T1\n\n## Status: in-progress\n", encoding="utf-8")
+
+        unit = WorkUnit(
+            id="E0-F1-S1-T1",
+            title="Test Task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=backlog_dir / "E0-F1-S1-T1.md",
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            result = cli.cmd_log_comment("executor", "E0-F1-S1-T1", "message")
+
+        assert result == 0
+        content = wu_file.read_text(encoding="utf-8")
+        assert "## Comments" in content
+        assert "[agent/executor]" in content
+
+
+class TestCmdLogTddUnitNotFound:
+    """Test cmd_log_tdd when unit is not found."""
+
+    def test_log_tdd_returns_1_when_unit_not_found(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Lines 611-612: unit not found returns 1."""
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = []
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_log_tdd("NONEXISTENT", "RED", "message")
+
+        assert result == 1
+        assert "not found" in capsys.readouterr().err.lower()
+
+
+class TestCmdRunTests:
+    """Test cmd_run_tests command."""
+
+    def _make_unit(self) -> WorkUnit:
+        return WorkUnit(
+            id="E0-F1-S1-T1",
+            title="Test Task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T1.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+
+    def test_run_tests_unit_not_found(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Lines 473: unit not found returns 1."""
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = []
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_run_tests("NONEXISTENT")
+
+        assert result == 1
+
+    def test_run_tests_no_local_path(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Lines 480: no local path configured for repo."""
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {}),
+        ):
+            result = cli.cmd_run_tests("E0-F1-S1-T1")
+
+        assert result == 1
+
+    def test_run_tests_uses_make_test_when_available(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """Lines 483-489: uses make test when Makefile has test target."""
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        calls: list[list[str]] = []
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            calls.append(cmd)
+            if cmd == ["make", "-n", "test"]:
+                return (0, "", "")  # test target exists
+            if cmd == ["make", "test"]:
+                return (0, "Tests passed", "")
+            return (0, "", "")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.cli.run_command", side_effect=fake_run_command),
+        ):
+            result = cli.cmd_run_tests("E0-F1-S1-T1")
+
+        assert result == 0
+        assert ["make", "test"] in calls
+
+    def test_run_tests_falls_back_to_pytest(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """Lines 483-489: falls back to pytest when Makefile test target absent."""
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        calls: list[list[str]] = []
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            calls.append(cmd)
+            if cmd == ["make", "-n", "test"]:
+                return (1, "", "No rule to make target")  # no test target
+            return (0, "5 passed", "")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.cli.run_command", side_effect=fake_run_command),
+        ):
+            result = cli.cmd_run_tests("E0-F1-S1-T1")
+
+        assert result == 0
+        pytest_calls = [c for c in calls if c[0] == "pytest"]
+        assert len(pytest_calls) == 1
+
+
+class TestCmdLogVerdict:
+    """Test cmd_log_verdict command."""
+
+    def _make_unit(self) -> WorkUnit:
+        return WorkUnit(
+            id="E0-F1-S1-T1",
+            title="Test Task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T1.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+
+    def test_log_verdict_invalid_verdict(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Lines 507-509: invalid verdict returns 1."""
+        result = cli.cmd_log_verdict("code_review", "E0-F1-S1-T1", "invalid")
+        assert result == 1
+        assert "pass" in capsys.readouterr().err.lower()
+
+    def test_log_verdict_unit_not_found(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Lines 515-516: unit not found returns 1."""
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = []
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_log_verdict("code_review", "NONEXISTENT", "pass")
+
+        assert result == 1
+
+    def test_log_verdict_pass_appends_review_pass(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """Lines 506-544: pass verdict appends REVIEW_PASS to work unit."""
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        wu_file = backlog_dir / "E0-F1-S1-T1.md"
+        wu_file.write_text("# E0-F1-S1-T1\n\n## Status: in-progress\n\n## Comments\n", encoding="utf-8")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            result = cli.cmd_log_verdict("code_review", "E0-F1-S1-T1", "pass", "looks good")
+
+        assert result == 0
+        content = wu_file.read_text(encoding="utf-8")
+        assert "[REVIEW_PASS]" in content
+        assert "judge/code_review" in content
+
+    def test_log_verdict_fail_appends_review_fail(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """Lines 506-544: fail verdict appends REVIEW_FAIL to work unit."""
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        wu_file = backlog_dir / "E0-F1-S1-T1.md"
+        wu_file.write_text("# E0-F1-S1-T1\n\n## Status: in-progress\n\n## Comments\n", encoding="utf-8")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            result = cli.cmd_log_verdict("code_review", "E0-F1-S1-T1", "fail", "needs fixes")
+
+        assert result == 0
+        content = wu_file.read_text(encoding="utf-8")
+        assert "[REVIEW_FAIL]" in content
+
+    def test_log_verdict_creates_comments_section_when_missing(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Lines 535-536: creates ## Comments section when absent."""
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        wu_file = backlog_dir / "E0-F1-S1-T1.md"
+        wu_file.write_text("# E0-F1-S1-T1\n\n## Status: in-progress\n", encoding="utf-8")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            result = cli.cmd_log_verdict("code_review", "E0-F1-S1-T1", "pass")
+
+        assert result == 0
+        content = wu_file.read_text(encoding="utf-8")
+        assert "## Comments" in content
+
+
+class TestCmdLogCommentFileResolution:
+    """Test cmd_log_comment file resolution fallback paths."""
+
+    def test_log_comment_falls_back_to_workspace_root(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """Lines 564, 577: when BACKLOG_ROOT path missing, falls back to WORKSPACE_ROOT."""
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        wu_file = workspace / "backlog" / "E0-F1-S1-T1.md"
+        wu_file.parent.mkdir(parents=True)
+        wu_file.write_text("# E0-F1-S1-T1\n\n## Status: in-progress\n\n## Comments\n", encoding="utf-8")
+
+        unit = WorkUnit(
+            id="E0-F1-S1-T1",
+            title="Test Task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T1.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "missing_backlog"),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+        ):
+            result = cli.cmd_log_comment("executor", "E0-F1-S1-T1", "done")
+
+        assert result == 0
+        content = wu_file.read_text(encoding="utf-8")
+        assert "[agent/executor]" in content
+
+
+class TestCmdLogTddFileResolution:
+    """Test cmd_log_tdd file resolution fallback paths."""
+
+    def test_log_tdd_falls_back_to_workspace_root(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """Lines 611-612, 616: file resolution falls back to WORKSPACE_ROOT."""
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        wu_file = workspace / "backlog" / "E0-F1-S1-T1.md"
+        wu_file.parent.mkdir(parents=True)
+        wu_file.write_text(
+            "# E0-F1-S1-T1: Test\n\n## Status: in-progress\n\n## Comments\n\n## TDD Cycle Log\n",
+            encoding="utf-8",
+        )
+
+        unit = WorkUnit(
+            id="E0-F1-S1-T1",
+            title="TDD Test",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T1.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "missing"),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+        ):
+            result = cli.cmd_log_tdd("E0-F1-S1-T1", "RED", "tdd message")
+
+        assert result == 0
+        content = wu_file.read_text(encoding="utf-8")
+        assert "[RED]" in content
+
+
+class TestCmdEnsureBranchNoLocalPath:
+    """Test cmd_ensure_branch when repo has no local path configured."""
+
+    def test_ensure_branch_returns_1_when_no_local_path(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Lines 653-654: no local path configured."""
+        unit = WorkUnit(
+            id="E0-F1-S1-T1",
+            title="Test Task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T1.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {}),
+        ):
+            result = cli.cmd_ensure_branch("E0-F1-S1-T1")
+
+        assert result == 1
+        assert "no local path" in capsys.readouterr().err.lower()
+
+
+class TestResolveGitOpsContext:
+    """Test _resolve_git_ops_context helper exits."""
+
+    def test_exits_when_unit_not_found(self) -> None:
+        """Lines 678-679: sys.exit(1) when unit not found."""
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = []
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            cli._resolve_git_ops_context("NONEXISTENT")
+
+        assert exc_info.value.code == 1
+
+    def test_exits_when_no_local_path(self) -> None:
+        """Lines 685-686: sys.exit(1) when no local path configured."""
+        unit = WorkUnit(
+            id="E0-F1-S1-T1",
+            title="Test Task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T1.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {}),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            cli._resolve_git_ops_context("E0-F1-S1-T1")
+
+        assert exc_info.value.code == 1
+
+
+class TestCmdGitOpsDeferMode:
+    """Test cmd_git_ops with DEFER_PR mode."""
+
+    def test_git_ops_uses_defer_mode(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """Line 732: when DEFER_PR is True, delegates to _git_ops_deferred."""
+        unit = WorkUnit(
+            id="E0-F1-S1-T1",
+            title="Test Task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T1.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        mock_ops = MagicMock()
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.config.DEFER_PR", True),
+            patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
+            patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+            patch("devbench.cli._resolve_unit_file", return_value=None),
+        ):
+            result = cli.cmd_git_ops("E0-F1-S1-T1")
+
+        assert result == 0
+        mock_ops.commit_local.assert_called_once()
+
+
+class TestCmdGitOpsBadPrNumber:
+    """Test cmd_git_ops when PR URL does not end with a number."""
+
+    def test_returns_1_when_pr_number_not_parseable(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """Lines 761-762: PR URL that doesn't end in a number."""
+        unit = WorkUnit(
+            id="E0-F1-S1-T1",
+            title="Test Task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T1.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        mock_ops = MagicMock()
+        mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/not-a-number"
+        mock_ops.wait_for_checks.return_value = True
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.cli.UPDATE_SUBMODULE", False),
+            patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+        ):
+            result = cli.cmd_git_ops("E0-F1-S1-T1")
+
+        assert result == 1
+        assert "could not parse pr number" in capsys.readouterr().err.lower()
+
+
+class TestCmdGitOpsFinalizeHappyPath:
+    """Test cmd_git_ops_finalize happy path."""
+
+    def test_finalize_pushes_and_creates_pr(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """Lines 831-855: full happy path for git-ops-finalize."""
+        mock_ops = MagicMock()
+        mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/99"
+
+        with (
+            patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
+            patch("devbench.config.DEFER_PR", True),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+        ):
+            result = cli.cmd_git_ops_finalize("caylent-solutions/git-repo")
+
+        assert result == 0
+        output = json.loads(capsys.readouterr().out.strip())
+        assert output["pr_url"] == "https://github.com/org/repo/pull/99"
+        mock_ops.commit_and_push.assert_called_once()
+        mock_ops.create_pr.assert_called_once()
+
+    def test_finalize_returns_1_when_no_local_path(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Lines 837-838: no local path configured for repo."""
+        with (
+            patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
+            patch("devbench.config.DEFER_PR", True),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {}),
+        ):
+            result = cli.cmd_git_ops_finalize("caylent-solutions/git-repo")
+
+        assert result == 1
+        assert "no local path" in capsys.readouterr().err.lower()
+
+
+class TestCmdStart:
+    """Test cmd_start command by mocking claude_agent_sdk."""
+
+    def test_cmd_start_invokes_agent_sdk(self) -> None:
+        """Lines 868-885: cmd_start creates an async runner and returns 0."""
+        import sys
+        import types
+
+        # Create a mock claude_agent_sdk module
+        mock_sdk = types.ModuleType("claude_agent_sdk")
+
+        mock_options_cls = MagicMock()
+        mock_sdk.ClaudeAgentOptions = mock_options_cls  # type: ignore[attr-defined]
+
+        async def mock_query(**kwargs: object) -> object:
+            # Async generator that yields a message to cover line 882
+            yield "test message"
+
+        mock_sdk.query = mock_query  # type: ignore[attr-defined]
+
+        with patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}):
+            result = cli.cmd_start()
+
+        assert result == 0
+
+
+class TestMainMinArgs:
+    """Test main() when a command doesn't have enough arguments."""
+
+    def test_returns_1_with_insufficient_args(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Lines 959-960: command requires more arguments than provided."""
+        with patch("sys.argv", ["devbench", "claim"]):
+            result = cli.main()
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "requires at least" in err
+
+
+class TestCmdReport:
+    """Test cmd_report command."""
+
+    def test_cmd_report_returns_zero(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """cmd_report returns 0 and prints the generated report."""
+        with patch("devbench.cli.generate_report", create=True) as mock_gen:
+            mock_gen.return_value = "Test report output"
+            with patch("devbench.reporting.report.generate_report", mock_gen):
+                result = cli.cmd_report()
+
+        assert result == 0
+        assert "Test report output" in capsys.readouterr().out
+
+    def test_cmd_report_with_since_timestamp(self) -> None:
+        """cmd_report parses the 'since' argument into a datetime and passes it to generate_report."""
+        from datetime import UTC, datetime
+
+        captured_kwargs: dict = {}
+
+        def fake_generate_report(**kwargs: object) -> str:
+            captured_kwargs.update(kwargs)
+            return "report"
+
+        with patch("devbench.reporting.report.generate_report", side_effect=fake_generate_report):
+            result = cli.cmd_report(since="2025-01-15T10:30:00Z")
+
+        assert result == 0
+        assert captured_kwargs["since"] == datetime(2025, 1, 15, 10, 30, 0, tzinfo=UTC)
+
+    def test_cmd_report_watch_zero_runs_once(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """cmd_report with watch_interval=0 runs once (one-shot mode)."""
+        with patch("devbench.reporting.report.generate_report", return_value="one-shot report"):
+            result = cli.cmd_report(watch_interval=0)
+
+        assert result == 0
+        assert "one-shot report" in capsys.readouterr().out
+
+    def test_cmd_report_watch_mode_interrupted(self) -> None:
+        """cmd_report with watch_interval > 0 loops until KeyboardInterrupt (lines 296-306)."""
+        call_count = 0
+
+        def fake_generate_report(**kwargs: object) -> str:
+            nonlocal call_count
+            call_count += 1
+            return f"report iteration {call_count}"
+
+        def fake_sleep(seconds: float) -> None:
+            raise KeyboardInterrupt
+
+        with (
+            patch("devbench.reporting.report.generate_report", side_effect=fake_generate_report),
+            patch("time.sleep", side_effect=fake_sleep),
+        ):
+            result = cli.cmd_report(watch_interval=5)
+
+        assert result == 0
+        assert call_count == 1
+
+
+class TestMainWatchFlagParsing:
+    """Test --watch / -w flag extraction in main() (lines 978-988)."""
+
+    def test_watch_flag_extracted_from_args(self) -> None:
+        """--watch <N> is extracted from sys.argv for the report command (lines 978-988)."""
+        with (
+            patch("sys.argv", ["devbench", "report", "--watch", "10"]),
+            patch("devbench.cli.cmd_report", return_value=0) as mock_report,
+        ):
+            result = cli.main()
+
+        assert result == 0
+        mock_report.assert_called_once_with(since="", watch_interval=10)
+
+    def test_short_watch_flag_extracted(self) -> None:
+        """-w <N> is equivalent to --watch <N>."""
+        with (
+            patch("sys.argv", ["devbench", "report", "-w", "3"]),
+            patch("devbench.cli.cmd_report", return_value=0) as mock_report,
+        ):
+            result = cli.main()
+
+        assert result == 0
+        mock_report.assert_called_once_with(since="", watch_interval=3)
+
+    def test_watch_flag_with_since_arg(self) -> None:
+        """--watch is separated from the since timestamp argument (lines 996-998)."""
+        with (
+            patch("sys.argv", ["devbench", "report", "--watch", "5", "2025-01-15T10:30:00Z"]),
+            patch("devbench.cli.cmd_report", return_value=0) as mock_report,
+        ):
+            result = cli.main()
+
+        assert result == 0
+        mock_report.assert_called_once_with(since="2025-01-15T10:30:00Z", watch_interval=5)
+
+    def test_report_without_watch_dispatches_normally(self) -> None:
+        """report without --watch goes through normal dispatch (line 1002)."""
+        mock_fn = MagicMock(return_value=0)
+        with (
+            patch("sys.argv", ["devbench", "report"]),
+            patch.dict(cli._COMMANDS, {"report": (mock_fn, 0, "Progress report")}),
+        ):
+            result = cli.main()
+
+        assert result == 0
+        mock_fn.assert_called_once()
+
+
+class TestMainExtraArgsWarning:
+    """Test extra args warning in main() (lines 1000-1001)."""
+
+    def test_extra_args_warning_printed(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """When more args than min_args+1 are provided, a warning is printed to stderr (line 1001)."""
+        mock_fn = MagicMock(return_value=0)
+        with (
+            patch("sys.argv", ["devbench", "mycmd", "arg1", "arg2", "arg3", "arg4"]),
+            patch.dict(cli._COMMANDS, {"mycmd": (mock_fn, 1, "Test cmd")}),
+        ):
+            result = cli.main()
+
+        assert result == 0
+        err = capsys.readouterr().err
+        assert "Warning: ignoring" in err
+        assert "extra argument(s)" in err
+
+
+class TestMainDispatchLine:
+    """Test the final dispatch line in main() (line 1002/1006)."""
+
+    def test_dispatch_with_min_args(self) -> None:
+        """Dispatch passes exactly min_args arguments to the handler (line 1002)."""
+        mock_fn = MagicMock(return_value=0)
+        with (
+            patch("sys.argv", ["devbench", "mycmd", "val1"]),
+            patch.dict(cli._COMMANDS, {"mycmd": (mock_fn, 1, "Test")}),
+        ):
+            result = cli.main()
+
+        assert result == 0
+        mock_fn.assert_called_once_with("val1")
+
+    def test_dispatch_with_optional_extra_arg(self) -> None:
+        """Dispatch passes up to min_args+1 arguments (line 1002)."""
+        mock_fn = MagicMock(return_value=0)
+        with (
+            patch("sys.argv", ["devbench", "mycmd", "val1", "val2"]),
+            patch.dict(cli._COMMANDS, {"mycmd": (mock_fn, 1, "Test")}),
+        ):
+            result = cli.main()
+
+        assert result == 0
+        mock_fn.assert_called_once_with("val1", "val2")
+
+
+class TestGitOpsDeferred:
+    """Test _git_ops_deferred helper."""
+
+    def test_git_ops_deferred_commits_locally(
+        self,
+        capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
+    ) -> None:
+        """_git_ops_deferred calls commit_local and returns 0."""
+        unit = WorkUnit(
+            id="E0-F1-S1-T1",
+            title="Test Task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T1.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+        mock_ops = MagicMock()
+        mock_mgr = MagicMock()
+
+        with (
+            patch("devbench.cli.GitOpsJudge", return_value=mock_ops, create=True),
+            patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+            patch("devbench.cli._resolve_unit_file", return_value=None),
+        ):
+            result = cli._git_ops_deferred(
+                "E0-F1-S1-T1",
+                unit,
+                "caylent-solutions/git-repo",
+                tmp_path,
+                "feature/x",
+            )
+
+        assert result == 0
+        mock_ops.commit_local.assert_called_once_with(
+            "caylent-solutions/git-repo",
+            tmp_path,
+            "feature/x",
+            "E0-F1-S1-T1: Test Task",
+        )
+        output = json.loads(capsys.readouterr().out.strip())
+        assert output["mode"] == "deferred"
+
+    def test_git_ops_deferred_logs_comment(self, tmp_path: Path) -> None:
+        """_git_ops_deferred appends agent comment when work-unit file exists."""
+        wu_file = tmp_path / "E0-F1-S1-T1.md"
+        wu_file.write_text("# placeholder")
+
+        unit = WorkUnit(
+            id="E0-F1-S1-T1",
+            title="Test Task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T1.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+        mock_ops = MagicMock()
+        mock_mgr = MagicMock()
+
+        with (
+            patch("devbench.cli.GitOpsJudge", return_value=mock_ops, create=True),
+            patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
+        ):
+            result = cli._git_ops_deferred(
+                "E0-F1-S1-T1",
+                unit,
+                "caylent-solutions/git-repo",
+                tmp_path,
+                "feature/x",
+            )
+
+        assert result == 0
+        mock_mgr._append_agent_comment.assert_called_once()
+        call_args = mock_mgr._append_agent_comment.call_args
+        assert call_args[0][0] == wu_file
+        assert "COMMIT_DEFERRED" in call_args[0][2]
+
+
+class TestCmdGitOpsFinalize:
+    """Test cmd_git_ops_finalize command."""
+
+    def test_git_ops_finalize_requires_single_branch(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """cmd_git_ops_finalize returns 1 when SINGLE_BRANCH is not set."""
+        with patch("devbench.config.SINGLE_BRANCH", None):
+            result = cli.cmd_git_ops_finalize("caylent-solutions/git-repo")
+
+        assert result == 1
+        assert "single_branch" in capsys.readouterr().err.lower()
+
+    def test_git_ops_finalize_requires_defer_pr(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """cmd_git_ops_finalize returns 1 when DEFER_PR is False."""
+        with (
+            patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
+            patch("devbench.config.DEFER_PR", False),
+        ):
+            result = cli.cmd_git_ops_finalize("caylent-solutions/git-repo")
+
+        assert result == 1
+        assert "defer_pr" in capsys.readouterr().err.lower()

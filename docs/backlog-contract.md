@@ -26,6 +26,29 @@ backlog/
 Only task files (`*-T[n].md`) are implemented by agents. Epic, feature, and story files track
 rollup status only.
 
+### Keeping the backlog in a separate git repo
+
+The backlog should live in its own local git repo, separate from the target repositories DevBench
+modifies. This lets you commit backlog progress (status changes, TDD logs, judge comments) without
+mixing them into target repo history.
+
+Set `JUDGE_WORKSPACE_ROOT` to the backlog repo. Create symlinks inside it pointing to target
+repos, and reference them as relative paths in `devbench.yaml`:
+
+```bash
+ln -s /real/path/to/my-repo /path/to/my-backlog/my-repo
+```
+
+```yaml
+repos:
+  org/my-repo:
+    default_branch: main
+    checkout_directory: my-repo    # relative -- resolves via symlink
+```
+
+The `checkout_directory` must be relative (absolute paths and ``..`` traversal are rejected).
+Symlinks bridge the gap between the backlog repo and target repos outside it.
+
 ---
 
 ## ID Format
@@ -235,12 +258,23 @@ re-derived at runtime.
 
 `devbench validate-backlog` enforces:
 
-- Every file path in `BACKLOG.md` index exists on disk
-- Every work unit file referenced in the index can be parsed (required sections present)
-- Status in the index row matches status in the work unit file (mismatch = WARNING)
-- Every dependency ID in every work unit file exists in `BACKLOG.md`
-- Status Summary counts in `BACKLOG.md` match actual status distribution
-- No two task units derive the same branch name
+**Structural integrity (all work unit types):**
+
+1. Every file path in `BACKLOG.md` index exists on disk
+2. Every work unit file's status matches the index (mismatch = error)
+3. No orphaned work unit files in `backlog/` or subdirectories (recursive scan)
+4. Every dependency ID in every work unit references a real ID in `BACKLOG.md`
+5. Status Summary counts in `BACKLOG.md` match actual status distribution
+
+**Content quality (task files only -- IDs containing `-T{n}`):**
+
+6. `## Description` section exists and is non-empty
+7. `## Acceptance Criteria` section exists with at least one `AC-` prefixed item
+8. `## Changes Manifest` section exists with at least one entry
+9. `## Definition of Done` section exists
+10. No em-dash character (U+2014) anywhere in the work unit file
+
+Non-task files (Epics, Features, Stories) are exempt from content quality checks.
 
 Run before starting the orchestrator. The orchestrate skill runs it automatically at startup and
 aborts if any error is found.

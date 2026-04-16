@@ -21,7 +21,8 @@ Commands::
     mark-done <id>          Mark unit as Done (enforces done-gate: all judges must have passed)
     validate-backlog        Check backlog integrity (file existence, status sync, orphans, deps, summary)
     ensure-branch <id>      Create or switch to work unit branch before executor runs
-    git-ops <id>            Run full git operations sequence for a completed work unit
+    git-ops <id>            Run git operations for a work unit (commit-only when defer_pr is set)
+    git-ops-finalize <repo> Push single branch and create PR (after all deferred commits)
     report [since]          Print progress report with velocity stats
     log <message>           Append a message to the orchestrator log file
     start                   Run the orchestrate skill via the Claude Agent SDK (non-interactive)
@@ -60,6 +61,7 @@ def _pre_parse_config(argv: list[str]) -> None:
             argv.pop(i)
             return
 
+
 _pre_parse_config(sys.argv)
 
 from devbench.backlog.manager import BacklogManager
@@ -79,8 +81,14 @@ from devbench.config_loader import get_configured_default_branch
 from devbench.constants import (
     COMMENT_AGENT_TEMPLATE,
     COMMENT_ENTRY_TEMPLATE,
+    COMMENT_TIMESTAMP_FORMAT,
     COMMENTS_SECTION_HEADER,
+    DEFAULT_LOG_FILENAME,
+    DEFAULT_LOG_SUBDIR,
+    DEFAULT_PLUGIN_SUBPATH,
     DISPLAY_STATUS_VALUES,
+    FINALIZE_COMMIT_TEMPLATE,
+    FINALIZE_PR_TITLE_TEMPLATE,
     STATUS_IN_PROGRESS,
     STATUS_SEPARATOR_WIDTH,
     VALID_TDD_PHASES,
@@ -109,10 +117,7 @@ def cmd_status() -> int:
         print(f"  {status_val:<15} {count:>4}")
     print(f"  {'TOTAL':<15} {total:>4}")
 
-    active = [
-        u for u in units
-        if u.status in (WorkUnitStatus.IN_PROGRESS, WorkUnitStatus.IN_REVIEW)
-    ]
+    active = [u for u in units if u.status in (WorkUnitStatus.IN_PROGRESS, WorkUnitStatus.IN_REVIEW)]
     if active:
         print("\nActive work units:")
         for u in active:
@@ -187,8 +192,7 @@ def cmd_set_status(unit_id: str, new_status: str) -> int:
 
     if new_status.lower() not in VALID_STATUSES:
         print(
-            f"ERROR: Invalid status '{new_status}'. "
-            f"Valid: {', '.join(sorted(VALID_STATUSES))}",
+            f"ERROR: Invalid status '{new_status}'. Valid: {', '.join(sorted(VALID_STATUSES))}",
             file=sys.stderr,
         )
         return 1
@@ -272,24 +276,38 @@ def cmd_validate_backlog() -> int:
     return 1
 
 
-def cmd_report(since: str = "") -> int:
+def cmd_report(since: str = "", watch_interval: int = 0) -> int:
     """Print a formatted progress report with velocity and completion stats."""
     from datetime import datetime
 
     from devbench.reporting.report import generate_report
 
-    log_file = Path(os.environ.get(
-        "JUDGE_LOG_FILE",
-        str(Path(__file__).resolve().parent / "logs" / "orchestrator.log"),
-    ))
+    log_file = Path(
+        os.environ.get(
+            "JUDGE_LOG_FILE",
+            str(Path(__file__).resolve().parent / DEFAULT_LOG_SUBDIR / DEFAULT_LOG_FILENAME),
+        )
+    )
 
     since_dt = None
     if since:
         since_dt = datetime.strptime(since, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
 
-    report = generate_report(log_path=log_file, since=since_dt)
-    print(report)
-    return 0
+    if watch_interval > 0:
+        import time
+
+        try:
+            while True:
+                print("\033[H\033[J", end="")  # clear screen
+                report = generate_report(log_path=log_file, since=since_dt)
+                print(report)
+                time.sleep(watch_interval)
+        except KeyboardInterrupt:
+            return 0
+    else:
+        report = generate_report(log_path=log_file, since=since_dt)
+        print(report)
+        return 0
 
 
 def cmd_log(message: str) -> int:
@@ -353,18 +371,22 @@ def cmd_read_unit(first_arg: str, second_arg: str = "") -> int:
 
     content = wu_file.read_text(encoding="utf-8")
     if strip_comments:
-        marker = "\n## Comments"
+        marker = f"\n{COMMENTS_SECTION_HEADER}"
         idx = content.find(marker)
         if idx != -1:
             content = content[:idx]
 
-    print(json.dumps({
-        "unit_id": unit.id,
-        "work_unit_path": str(wu_file),
-        "repo_path": str(repo_path),
-        "repo": canonical_repo,
-        "content": content,
-    }))
+    print(
+        json.dumps(
+            {
+                "unit_id": unit.id,
+                "work_unit_path": str(wu_file),
+                "repo_path": str(repo_path),
+                "repo": canonical_repo,
+                "content": content,
+            }
+        )
+    )
     return 0
 
 
@@ -406,7 +428,8 @@ def cmd_get_diff(unit_id: str) -> int:
         default_branch = configured
     else:
         rc, stdout, _ = run_command(
-            ["git", "rev-parse", "--abbrev-ref", "origin/HEAD"], cwd=repo_path,
+            ["git", "rev-parse", "--abbrev-ref", "origin/HEAD"],
+            cwd=repo_path,
         )
         if rc != 0 or not stdout.strip():
             print(
@@ -422,7 +445,8 @@ def cmd_get_diff(unit_id: str) -> int:
         parts.append(stdout)
 
     rc, stdout, _ = run_command(
-        ["git", "ls-files", "--others", "--exclude-standard"], cwd=repo_path,
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=repo_path,
     )
     if rc == 0 and stdout.strip():
         for raw_filepath in stdout.splitlines():
@@ -515,9 +539,12 @@ def cmd_log_verdict(judge_name: str, unit_id: str, verdict: str, feedback: str =
 
     action = "REVIEW_PASS" if verdict_lower == "pass" else "REVIEW_FAIL"
     agent_id = f"judge/{judge_name}"
-    timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+    timestamp = datetime.now(tz=UTC).strftime(COMMENT_TIMESTAMP_FORMAT)
     entry = COMMENT_ENTRY_TEMPLATE.format(
-        timestamp=timestamp, agent_id=agent_id, action=action, message=feedback,
+        timestamp=timestamp,
+        agent_id=agent_id,
+        action=action,
+        message=feedback,
     )
 
     content = wu_file.read_text(encoding="utf-8")
@@ -554,9 +581,11 @@ def cmd_log_comment(agent_name: str, unit_id: str, message: str) -> int:
     if not wu_file.exists():
         wu_file = WORKSPACE_ROOT / unit.file_path
 
-    timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+    timestamp = datetime.now(tz=UTC).strftime(COMMENT_TIMESTAMP_FORMAT)
     entry = COMMENT_AGENT_TEMPLATE.format(
-        timestamp=timestamp, name=agent_name, message=message,
+        timestamp=timestamp,
+        name=agent_name,
+        message=message,
     )
 
     content = wu_file.read_text(encoding="utf-8")
@@ -588,8 +617,7 @@ def cmd_log_tdd(unit_id: str, phase: str, message: str) -> int:
     phase_upper = phase.upper()
     if phase_upper not in VALID_TDD_PHASES:
         print(
-            f"ERROR: Invalid TDD phase '{phase}'. "
-            f"Valid phases: {', '.join(sorted(VALID_TDD_PHASES))}",
+            f"ERROR: Invalid TDD phase '{phase}'. Valid phases: {', '.join(sorted(VALID_TDD_PHASES))}",
             file=sys.stderr,
         )
         return 1
@@ -643,10 +671,56 @@ def cmd_ensure_branch(unit_id: str) -> int:
         print(f"ERROR: No local path configured for repo '{canonical_repo}'", file=sys.stderr)
         return 1
 
-    branch = f"backlog/{unit_id.lower()}"
+    from devbench.config import SINGLE_BRANCH
+
+    branch = SINGLE_BRANCH if SINGLE_BRANCH else f"backlog/{unit_id.lower()}"
     ops = GitOpsJudge()
     ops.ensure_branch(canonical_repo, repo_path, branch)
     logger.info("Branch ready: %s on %s", branch, canonical_repo)
+    return 0
+
+
+def _resolve_git_ops_context(unit_id: str) -> tuple[WorkUnit, str, Path]:
+    """Resolve unit, canonical repo, and local path for git-ops commands.
+
+    Returns:
+        Tuple of (unit, canonical_repo, repo_path).
+
+    Raises:
+        SystemExit: If the unit is not found or the repo path is not configured.
+    """
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    unit = _find_unit(units, unit_id)
+    if unit is None:
+        print(f"ERROR: Work unit '{unit_id}' not found in backlog", file=sys.stderr)
+        sys.exit(1)
+
+    canonical_repo = resolve_repo(unit.repo)
+    validate_repo(canonical_repo)
+    repo_path = REPO_LOCAL_PATHS.get(canonical_repo)
+    if repo_path is None:
+        print(f"ERROR: No local path configured for repo '{canonical_repo}'", file=sys.stderr)
+        sys.exit(1)
+
+    return unit, canonical_repo, repo_path
+
+
+def _git_ops_deferred(unit_id: str, unit: WorkUnit, canonical_repo: str, repo_path: Path, branch: str) -> int:
+    """Commit locally only (no push/PR/merge) for single-branch deferred mode."""
+    from devbench.github.git_ops import GitOpsJudge
+
+    ops = GitOpsJudge()
+    commit_message = f"{unit_id}: {unit.title}"
+
+    wu_file = _resolve_unit_file(unit)
+    mgr = BacklogManager()
+
+    ops.commit_local(canonical_repo, repo_path, branch, commit_message)
+    logger.info("Committed locally (deferred PR): %s on %s", unit_id, branch)
+    if wu_file is not None:
+        mgr._append_agent_comment(wu_file, "git_ops", f"[COMMIT_DEFERRED] {commit_message}")
+    print(json.dumps({"unit_id": unit_id, "mode": "deferred", "branch": branch}))
     return 0
 
 
@@ -666,36 +740,29 @@ def cmd_git_ops(unit_id: str) -> int:
     """
     from devbench.github.git_ops import GitOpsJudge
 
-    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
-    units = parser.parse_index()
-    unit = _find_unit(units, unit_id)
-    if unit is None:
-        print(f"ERROR: Work unit '{unit_id}' not found in backlog", file=sys.stderr)
-        return 1
+    unit, canonical_repo, repo_path = _resolve_git_ops_context(unit_id)
 
-    canonical_repo = resolve_repo(unit.repo)
-    validate_repo(canonical_repo)
-    repo_path = REPO_LOCAL_PATHS.get(canonical_repo)
-    if repo_path is None:
-        print(f"ERROR: No local path configured for repo '{canonical_repo}'", file=sys.stderr)
-        return 1
+    from devbench.config import DEFER_PR, SINGLE_BRANCH
 
-    branch = f"backlog/{unit_id.lower()}"
+    branch = SINGLE_BRANCH if SINGLE_BRANCH else f"backlog/{unit_id.lower()}"
+
+    if DEFER_PR:
+        return _git_ops_deferred(unit_id, unit, canonical_repo, repo_path, branch)
+
+    # Standard mode: commit, push, PR, CI, merge.
     commit_message = f"{unit_id}: {unit.title}"
     pr_title = f"{unit_id}: {unit.title}"
     pr_body = f"Automated PR for work unit {unit_id}.\n\n{unit.title}"
 
     ops = GitOpsJudge()
 
-    from devbench.github.git_ops import ConflictingPRError
-
     wu_file = _resolve_unit_file(unit)
     if wu_file is None:
-        logger.warning(
-            "Could not resolve work unit file for %s — audit comments will be skipped", unit_id
-        )
+        logger.warning("Could not resolve work unit file for %s -- audit comments will be skipped", unit_id)
 
     mgr = BacklogManager()
+
+    from devbench.github.git_ops import ConflictingPRError
 
     ops.commit_and_push(canonical_repo, repo_path, branch, commit_message)
     logger.info("Committed and pushed %s", unit_id)
@@ -722,7 +789,7 @@ def cmd_git_ops(unit_id: str) -> int:
         ops.merge_pr(canonical_repo, pr_number, repo_path=repo_path)
     except ConflictingPRError:
         logger.warning(
-            "PR #%d on %s is CONFLICTING — rebasing and retrying merge once",
+            "PR #%d on %s is CONFLICTING -- rebasing and retrying merge once",
             pr_number,
             canonical_repo,
         )
@@ -755,6 +822,57 @@ def cmd_git_ops(unit_id: str) -> int:
     return 0
 
 
+def cmd_git_ops_finalize(repo_name: str) -> int:
+    """Push the single branch and create a PR after all deferred commits.
+
+    Used after all work units are complete in single-branch / defer-PR mode.
+    Pushes the accumulated commits to the remote and creates a pull request.
+
+    Arguments:
+        repo_name: Repository name (short or fully-qualified).
+    """
+    from devbench.config import DEFER_PR, SINGLE_BRANCH
+
+    if not SINGLE_BRANCH:
+        print(
+            "ERROR: git-ops-finalize requires git_ops.single_branch to be set in devbench.yaml",
+            file=sys.stderr,
+        )
+        return 1
+    if not DEFER_PR:
+        print(
+            "ERROR: git-ops-finalize requires git_ops.defer_pr to be true in devbench.yaml",
+            file=sys.stderr,
+        )
+        return 1
+
+    from devbench.github.git_ops import GitOpsJudge
+
+    canonical_repo = resolve_repo(repo_name)
+    validate_repo(canonical_repo)
+    repo_path = REPO_LOCAL_PATHS.get(canonical_repo)
+    if repo_path is None:
+        print(f"ERROR: No local path configured for repo '{canonical_repo}'", file=sys.stderr)
+        return 1
+
+    branch = SINGLE_BRANCH
+    pr_title = FINALIZE_PR_TITLE_TEMPLATE.format(branch=branch)
+    pr_body = (
+        f"Accumulated commits from DevBench single-branch execution.\n\nBranch: `{branch}`\nRepo: `{canonical_repo}`"
+    )
+
+    ops = GitOpsJudge()
+
+    ops.commit_and_push(canonical_repo, repo_path, branch, FINALIZE_COMMIT_TEMPLATE.format(branch=branch))
+    logger.info("Pushed branch %s to %s", branch, canonical_repo)
+
+    pr_url = ops.create_pr(canonical_repo, branch, pr_title, pr_body, repo_path=repo_path)
+    logger.info("Created PR: %s", pr_url)
+
+    print(json.dumps({"repo": canonical_repo, "branch": branch, "pr_url": pr_url}))
+    return 0
+
+
 def cmd_start() -> int:
     """Run the devbench orchestrate skill non-interactively via the Claude Agent SDK.
 
@@ -769,7 +887,7 @@ def cmd_start() -> int:
 
     from claude_agent_sdk import ClaudeAgentOptions, query
 
-    plugin_path = Path(__file__).parent.parent.parent / "plugin" / "devbench"
+    plugin_path = Path(__file__).parent.parent.parent / DEFAULT_PLUGIN_SUBPATH
 
     async def _run() -> None:
         async for message in query(
@@ -821,8 +939,9 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
     "validate-backlog": (cmd_validate_backlog, 0, "Validate backlog integrity"),
     "ensure-branch": (cmd_ensure_branch, 1, "Create or switch to work unit branch: ensure-branch <id>"),
     "git-ops": (cmd_git_ops, 1, "Run git operations for a work unit: git-ops <id>"),
+    "git-ops-finalize": (cmd_git_ops_finalize, 1, "Push single branch and create PR: git-ops-finalize <repo>"),
     "log": (cmd_log, 1, "Log a message: log <message>"),
-    "report": (cmd_report, 0, "Progress report: report [since-timestamp]"),
+    "report": (cmd_report, 0, "Progress report: report [--watch N] [since-timestamp]"),
     "start": (cmd_start, 0, "Run orchestrate skill via Agent SDK (non-interactive)"),
     # Plugin agent bridge commands — used by devbench plugin agents
     "read-unit": (cmd_read_unit, 1, "Work unit content + repo path as JSON: read-unit [--strip-comments] <id>"),
@@ -852,12 +971,34 @@ def main() -> int:
         return 1
 
     func, min_args, _ = _COMMANDS[command]
-    args = sys.argv[2:]
+
+    # Handle --watch/-w flag for the report command
+    watch_interval = 0
+    if command == "report":
+        filtered_args: list[str] = []
+        i = 0
+        raw_args = sys.argv[2:]
+        while i < len(raw_args):
+            if raw_args[i] in ("--watch", "-w") and i + 1 < len(raw_args):
+                watch_interval = int(raw_args[i + 1])
+                i += 2
+            else:
+                filtered_args.append(raw_args[i])
+                i += 1
+        args = filtered_args
+    else:
+        args = sys.argv[2:]
 
     if len(args) < min_args:
         print(f"Command '{command}' requires at least {min_args} argument(s)", file=sys.stderr)
         return 1
 
+    if command == "report" and watch_interval > 0:
+        since_arg = args[0] if args else ""
+        return cmd_report(since=since_arg, watch_interval=watch_interval)
+
+    if len(args) > min_args + 1:
+        print(f"Warning: ignoring {len(args) - min_args - 1} extra argument(s)", file=sys.stderr)
     return func(*args[: min_args + 1]) if len(args) > min_args else func(*args[:min_args])
 
 

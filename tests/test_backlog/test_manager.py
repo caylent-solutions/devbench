@@ -95,9 +95,7 @@ class TestForceStatus:
         else:
             pytest.fail("E0-F1-S1-T1 not found in BACKLOG.md")
 
-    def test_allows_done_without_judge_comments(
-        self, tmp_work_unit_file: Path, backlog_index_titlecase: Path
-    ) -> None:
+    def test_allows_done_without_judge_comments(self, tmp_work_unit_file: Path, backlog_index_titlecase: Path) -> None:
         """force_status bypasses the done-gate — no judge comments required."""
         judge = BacklogManager()
         judge.force_status(tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1", "done")
@@ -105,7 +103,9 @@ class TestForceStatus:
         assert "## Status: done" in tmp_work_unit_file.read_text()
 
     def test_updates_lowercase_statuses_in_backlog(
-        self, tmp_work_unit_file: Path, backlog_index_lowercase: Path,
+        self,
+        tmp_work_unit_file: Path,
+        backlog_index_lowercase: Path,
     ) -> None:
         judge = BacklogManager()
         judge.force_status(tmp_work_unit_file, backlog_index_lowercase, "E0-F1-S1-T1", "done")
@@ -167,16 +167,12 @@ def _judge_comment(judge_name: str, action: str, msg: str = "ok") -> str:
 
 def _all_judges_pass_block() -> str:
     """Return comment lines for all four required judges passing."""
-    return "\n".join(
-        _judge_comment(j, "REVIEW_PASS") for j in sorted(REVIEW_JUDGE_NAMES)
-    ) + "\n"
+    return "\n".join(_judge_comment(j, "REVIEW_PASS") for j in sorted(REVIEW_JUDGE_NAMES)) + "\n"
 
 
 def _all_five_judges_pass_block() -> str:
     """Return comment lines for all five required judges (4 review_team + security_review) passing."""
-    return "\n".join(
-        _judge_comment(j, "REVIEW_PASS") for j in sorted(ALL_REQUIRED_JUDGE_NAMES)
-    ) + "\n"
+    return "\n".join(_judge_comment(j, "REVIEW_PASS") for j in sorted(ALL_REQUIRED_JUDGE_NAMES)) + "\n"
 
 
 _ALL_JUDGES_PASSED_COMMENTS = _all_five_judges_pass_block()
@@ -209,9 +205,7 @@ class TestMarkDone:
 
     def test_mark_done_raises_when_no_status_line(self, tmp_path: Path, backlog_index_titlecase: Path) -> None:
         bad_file = tmp_path / "bad.md"
-        bad_file.write_text(
-            "# No status here\nJust content.\n" + _ALL_JUDGES_PASSED_COMMENTS
-        )
+        bad_file.write_text("# No status here\nJust content.\n" + _ALL_JUDGES_PASSED_COMMENTS)
 
         judge = BacklogManager()
         with pytest.raises(ValueError, match="Could not find"):
@@ -222,7 +216,9 @@ class TestMarkBlocked:
     """Test mark_blocked updates both files and appends comment."""
 
     def test_mark_blocked_updates_both_files_and_adds_comment(
-        self, tmp_work_unit_file: Path, backlog_index_titlecase: Path,
+        self,
+        tmp_work_unit_file: Path,
+        backlog_index_titlecase: Path,
     ) -> None:
         judge = BacklogManager()
         judge.mark_blocked(tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1", "Dependency not met")
@@ -243,7 +239,8 @@ class TestRollupParentStatus:
     """Test that marking the last child Done rolls up to parent."""
 
     def test_story_marked_done_when_all_tasks_done(
-        self, backlog_with_hierarchy: tuple[Path, Path, Path, Path],
+        self,
+        backlog_with_hierarchy: tuple[Path, Path, Path, Path],
     ) -> None:
         index_path, t2_file, story_file, feature_file = backlog_with_hierarchy
 
@@ -264,7 +261,8 @@ class TestRollupParentStatus:
             pytest.fail("E0-F1-S1 story row not found in BACKLOG.md")
 
     def test_no_rollup_when_siblings_not_done(
-        self, backlog_with_hierarchy: tuple[Path, Path, Path, Path],
+        self,
+        backlog_with_hierarchy: tuple[Path, Path, Path, Path],
     ) -> None:
         index_path, t2_file, story_file, feature_file = backlog_with_hierarchy
 
@@ -366,12 +364,17 @@ class TestLastRoundAllPassed:
         assert judge._last_round_all_passed(wu) is True
 
     def test_returns_false_when_judge_missing(self, tmp_path: Path) -> None:
-        comments = "\n".join([
-            _judge_comment("code_review", "REVIEW_PASS"),
-            _judge_comment("test_review", "REVIEW_PASS"),
-            _judge_comment("doc_review", "REVIEW_PASS"),
-            # changes_manifest missing
-        ]) + "\n"
+        comments = (
+            "\n".join(
+                [
+                    _judge_comment("code_review", "REVIEW_PASS"),
+                    _judge_comment("test_review", "REVIEW_PASS"),
+                    _judge_comment("doc_review", "REVIEW_PASS"),
+                    # changes_manifest missing
+                ]
+            )
+            + "\n"
+        )
         wu = self._make_wu_with_comments(tmp_path, comments)
         judge = BacklogManager()
         assert judge._last_round_all_passed(wu) is False
@@ -380,8 +383,7 @@ class TestLastRoundAllPassed:
         """All 4 judges passed in round 1, but then REVIEW_REJECTED — round 2 has no passes."""
         comments = (
             # Round 1 passes (older, before REVIEW_REJECTED)
-            _all_judges_pass_block()
-            + "[2024-01-01 00:04 UTC] [orchestrator] [REVIEW_REJECTED] attempt 1 rejected\n"
+            _all_judges_pass_block() + "[2024-01-01 00:04 UTC] [orchestrator] [REVIEW_REJECTED] attempt 1 rejected\n"
             # Round 2 has no REVIEW_PASS entries yet (only rejection so far)
         )
         wu = self._make_wu_with_comments(tmp_path, comments)
@@ -392,7 +394,8 @@ class TestLastRoundAllPassed:
         """Round 2 passes after a prior round was rejected."""
         comments = (
             # Round 1 — rejected
-            _judge_comment("code_review", "REVIEW_PASS") + "\n"
+            _judge_comment("code_review", "REVIEW_PASS")
+            + "\n"
             + "[2024-01-01 00:01 UTC] [orchestrator] [REVIEW_REJECTED] attempt 1 rejected\n"
             # Round 2 — all five judges pass
             + _all_five_judges_pass_block()
@@ -439,13 +442,18 @@ class TestSecurityGate:
 
     def test_last_round_all_passed_requires_security_review(self, tmp_path: Path) -> None:
         """AC-4: Returns False when security_review REVIEW_PASS is absent."""
-        comments = "\n".join([
-            _judge_comment("code_review", "REVIEW_PASS"),
-            _judge_comment("test_review", "REVIEW_PASS"),
-            _judge_comment("doc_review", "REVIEW_PASS"),
-            _judge_comment("changes_manifest", "REVIEW_PASS"),
-            # security_review deliberately absent
-        ]) + "\n"
+        comments = (
+            "\n".join(
+                [
+                    _judge_comment("code_review", "REVIEW_PASS"),
+                    _judge_comment("test_review", "REVIEW_PASS"),
+                    _judge_comment("doc_review", "REVIEW_PASS"),
+                    _judge_comment("changes_manifest", "REVIEW_PASS"),
+                    # security_review deliberately absent
+                ]
+            )
+            + "\n"
+        )
         wu = self._make_wu_with_comments(tmp_path, comments)
         judge = BacklogManager()
         assert judge._last_round_all_passed(wu) is False
@@ -528,15 +536,26 @@ class TestValidate:
             "\n"
             "## Full Work Unit Index\n\n"
             "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
-            "|-----|-------|------|--------|-------------|------|-----------|\n"
-            + rows,
+            "|-----|-------|------|--------|-------------|------|-----------|\n" + rows,
             encoding="utf-8",
         )
         return idx
 
     def _make_wu(self, backlog_dir: Path, unit_id: str, status: str = "in-queue") -> Path:
         wu = backlog_dir / f"{unit_id}.md"
-        wu.write_text(f"# {unit_id}\n\n## Status: {status}\n", encoding="utf-8")
+        # Include all required sections so content validation passes for task IDs.
+        content = (
+            f"# {unit_id}\n\n"
+            f"## Status: {status}\n\n"
+            "## Target Repository\n\n- **Repo:** `org/repo`\n\n"
+            "## Description\n\nTest work unit.\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-FUNC-001 Placeholder\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `f.py` | New |\n\n"
+            "## Definition of Done\n\n- [ ] All ACs checked\n\n"
+            "## TDD Cycle Log\n\n## Comments\n"
+        )
+        wu.write_text(content, encoding="utf-8")
         return wu
 
     def test_valid_backlog_returns_no_errors(self, tmp_path: Path, backlog_dir: Path) -> None:
@@ -584,6 +603,35 @@ class TestValidate:
         errors = judge.validate(idx, tmp_path)
         assert any("E0-F1-S1-T2" in e and "orphan" in e.lower() for e in errors)
 
+    def test_orphaned_nested_work_unit_file_is_reported(self, tmp_path: Path, backlog_dir: Path) -> None:
+        self._make_wu(backlog_dir, "E0-F1-S1-T1", "in-queue")
+        # Nested orphan in a subdirectory
+        nested_dir = backlog_dir / "E0-epic"
+        nested_dir.mkdir()
+        nested_wu = nested_dir / "E0-F1-S1-T3.md"
+        nested_wu.write_text("# E0-F1-S1-T3\n\n## Status: in-queue\n", encoding="utf-8")
+        idx = self._make_index(
+            tmp_path,
+            "| E0-F1-S1-T1 | Task 1 | Task | in-queue | none | repo | `backlog/E0-F1-S1-T1.md` |\n",
+        )
+        judge = BacklogManager()
+        errors = judge.validate(idx, tmp_path)
+        assert any("E0-F1-S1-T3" in e and "orphan" in e.lower() for e in errors)
+
+    def test_indexed_nested_work_unit_not_orphaned(self, tmp_path: Path, backlog_dir: Path) -> None:
+        # Nested file that IS in the index should not be flagged
+        nested_dir = backlog_dir / "E0-epic"
+        nested_dir.mkdir()
+        nested_wu = nested_dir / "E0-F1-S1-T1.md"
+        nested_wu.write_text("# E0-F1-S1-T1\n\n## Status: in-queue\n", encoding="utf-8")
+        idx = self._make_index(
+            tmp_path,
+            "| E0-F1-S1-T1 | Task 1 | Task | in-queue | none | repo | `backlog/E0-epic/E0-F1-S1-T1.md` |\n",
+        )
+        judge = BacklogManager()
+        errors = judge.validate(idx, tmp_path)
+        assert not any("orphan" in e.lower() for e in errors)
+
     def test_invalid_dependency_id_is_reported(self, tmp_path: Path, backlog_dir: Path) -> None:
         self._make_wu(backlog_dir, "E0-F1-S1-T2", "in-queue")
         # T2 depends on T1 but T1 is not in the index
@@ -609,7 +657,176 @@ class TestValidate:
 
 
 # ---------------------------------------------------------------------------
-# E4-F1-S1-T1: Rename BacklogManagerJudge → BacklogManager
+# Content quality validation (checks 6-10)
+# ---------------------------------------------------------------------------
+
+
+class TestValidateContent:
+    """Tests for work unit content quality validation (checks 6-10)."""
+
+    def _make_index(self, tmp_path: Path, rows: str) -> Path:
+        idx = tmp_path / "BACKLOG.md"
+        idx.write_text(
+            "# Backlog\n\n"
+            "## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
+            "|------|-------|------|-------------|----------|---------|\n"
+            "\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|-----------|\n" + rows,
+            encoding="utf-8",
+        )
+        return idx
+
+    def _make_task(self, backlog_dir: Path, unit_id: str, content: str) -> Path:
+        wu = backlog_dir / f"{unit_id}.md"
+        wu.write_text(content, encoding="utf-8")
+        return wu
+
+    def test_task_missing_description_section_is_reported(self, tmp_path: Path, backlog_dir: Path) -> None:
+        self._make_task(
+            backlog_dir,
+            "E0-F1-S1-T1",
+            "# E0-F1-S1-T1\n\n## Status: in-queue\n\n## Target Repository\n\n- **Repo:** `org/repo`\n",
+        )
+        idx = self._make_index(
+            tmp_path,
+            "| E0-F1-S1-T1 | Task | Task | in-queue | none | repo | `backlog/E0-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        assert any("E0-F1-S1-T1" in e and "Description" in e for e in errors)
+
+    def test_task_empty_description_is_reported(self, tmp_path: Path, backlog_dir: Path) -> None:
+        self._make_task(
+            backlog_dir,
+            "E0-F1-S1-T1",
+            "# E0-F1-S1-T1\n\n## Status: in-queue\n\n## Target Repository\n\n"
+            "- **Repo:** `org/repo`\n\n## Description\n\n## Dependencies\n",
+        )
+        idx = self._make_index(
+            tmp_path,
+            "| E0-F1-S1-T1 | Task | Task | in-queue | none | repo | `backlog/E0-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        assert any("E0-F1-S1-T1" in e and "Description" in e and "empty" in e.lower() for e in errors)
+
+    def test_task_missing_acceptance_criteria_is_reported(self, tmp_path: Path, backlog_dir: Path) -> None:
+        self._make_task(
+            backlog_dir,
+            "E0-F1-S1-T1",
+            "# E0-F1-S1-T1\n\n## Status: in-queue\n\n## Target Repository\n\n"
+            "- **Repo:** `org/repo`\n\n## Description\n\nDo something.\n\n## Dependencies\n",
+        )
+        idx = self._make_index(
+            tmp_path,
+            "| E0-F1-S1-T1 | Task | Task | in-queue | none | repo | `backlog/E0-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        assert any("E0-F1-S1-T1" in e and "Acceptance Criteria" in e for e in errors)
+
+    def test_task_acceptance_criteria_without_ac_items_is_reported(self, tmp_path: Path, backlog_dir: Path) -> None:
+        self._make_task(
+            backlog_dir,
+            "E0-F1-S1-T1",
+            "# E0-F1-S1-T1\n\n## Status: in-queue\n\n## Target Repository\n\n"
+            "- **Repo:** `org/repo`\n\n## Description\n\nDo something.\n\n"
+            "## Acceptance Criteria\n\nNo checklist items here.\n",
+        )
+        idx = self._make_index(
+            tmp_path,
+            "| E0-F1-S1-T1 | Task | Task | in-queue | none | repo | `backlog/E0-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        assert any("E0-F1-S1-T1" in e and "AC-" in e for e in errors)
+
+    def test_task_missing_changes_manifest_is_reported(self, tmp_path: Path, backlog_dir: Path) -> None:
+        self._make_task(
+            backlog_dir,
+            "E0-F1-S1-T1",
+            "# E0-F1-S1-T1\n\n## Status: in-queue\n\n## Target Repository\n\n"
+            "- **Repo:** `org/repo`\n\n## Description\n\nDo something.\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-FUNC-001 Something\n",
+        )
+        idx = self._make_index(
+            tmp_path,
+            "| E0-F1-S1-T1 | Task | Task | in-queue | none | repo | `backlog/E0-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        assert any("E0-F1-S1-T1" in e and "Changes Manifest" in e for e in errors)
+
+    def test_task_missing_definition_of_done_is_reported(self, tmp_path: Path, backlog_dir: Path) -> None:
+        self._make_task(
+            backlog_dir,
+            "E0-F1-S1-T1",
+            "# E0-F1-S1-T1\n\n## Status: in-queue\n\n## Target Repository\n\n"
+            "- **Repo:** `org/repo`\n\n## Description\n\nDo something.\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-FUNC-001 Something\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `f.py` | New |\n",
+        )
+        idx = self._make_index(
+            tmp_path,
+            "| E0-F1-S1-T1 | Task | Task | in-queue | none | repo | `backlog/E0-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        assert any("E0-F1-S1-T1" in e and "Definition of Done" in e for e in errors)
+
+    def test_task_with_em_dash_is_reported(self, tmp_path: Path, backlog_dir: Path) -> None:
+        self._make_task(
+            backlog_dir,
+            "E0-F1-S1-T1",
+            "# E0-F1-S1-T1\n\n## Status: in-queue\n\n## Target Repository\n\n"
+            "- **Repo:** `org/repo`\n\n## Description\n\nDo something \u2014 with em-dash.\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-FUNC-001 Something\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `f.py` | New |\n\n"
+            "## Definition of Done\n\n- [ ] All ACs checked\n",
+        )
+        idx = self._make_index(
+            tmp_path,
+            "| E0-F1-S1-T1 | Task | Task | in-queue | none | repo | `backlog/E0-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        assert any("E0-F1-S1-T1" in e and "em-dash" in e.lower() for e in errors)
+
+    def test_valid_task_passes_content_checks(self, tmp_path: Path, backlog_dir: Path) -> None:
+        self._make_task(
+            backlog_dir,
+            "E0-F1-S1-T1",
+            "# E0-F1-S1-T1\n\n## Status: in-queue\n\n## Target Repository\n\n"
+            "- **Repo:** `org/repo`\n\n## Description\n\nDo something real.\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-FUNC-001 Something testable\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `f.py` | New |\n\n"
+            "## Definition of Done\n\n- [ ] All ACs checked\n\n"
+            "## TDD Cycle Log\n\n## Comments\n",
+        )
+        idx = self._make_index(
+            tmp_path,
+            "| E0-F1-S1-T1 | Task | Task | in-queue | none | repo | `backlog/E0-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        assert errors == []
+
+    def test_epic_skips_content_checks(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """Non-task files (Epic, Feature, Story) skip content quality checks."""
+        self._make_task(
+            backlog_dir,
+            "E0",
+            "# E0\n\n## Status: in-queue\n\n## Description\n\nEpic summary.\n",
+        )
+        idx = self._make_index(
+            tmp_path,
+            "| E0 | Epic | Epic | in-queue | none | repo | `backlog/E0.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        # Epic should NOT be flagged for missing AC, Changes Manifest, etc.
+        assert not any("Acceptance Criteria" in e for e in errors)
+        assert not any("Changes Manifest" in e for e in errors)
+        assert not any("Definition of Done" in e for e in errors)
+
+
+# ---------------------------------------------------------------------------
+# E4-F1-S1-T1: Rename BacklogManagerJudge -> BacklogManager
 # ---------------------------------------------------------------------------
 
 
@@ -653,7 +870,6 @@ class TestBacklogManagerRename:
         assert "BacklogManager" in src, "cli.py must import BacklogManager"
         assert "BacklogManagerJudge" not in src, "cli.py must not reference BacklogManagerJudge"
 
-
     def test_backlog_manager_set_status_behavior_unchanged(self, tmp_path: Path) -> None:
         """AC-6: force_status writes exact status to both files after rename."""
         wu = tmp_path / "E0-F1-S1-T1.md"
@@ -683,9 +899,7 @@ class TestBacklogManagerRename:
         mgr = BacklogManager()
         errors = mgr.validate(index, tmp_path)
         assert errors, "validate must return at least one error for a missing file"
-        assert any("E0-F1-S1-T1" in e for e in errors), (
-            f"error must mention the unit ID; got: {errors}"
-        )
+        assert any("E0-F1-S1-T1" in e for e in errors), f"error must mention the unit ID; got: {errors}"
 
     def test_backlog_manager_logger_injectable(self) -> None:
         """BacklogManager accepts an injected logger instead of creating its own."""
@@ -701,9 +915,7 @@ class TestBacklogManagerRename:
 
         mgr = BacklogManager()
         assert isinstance(mgr.logger, logging.Logger), "default logger must be a logging.Logger"
-        assert mgr.logger.name == "devbench.backlog_manager", (
-            f"default logger name wrong: {mgr.logger.name}"
-        )
+        assert mgr.logger.name == "devbench.backlog_manager", f"default logger name wrong: {mgr.logger.name}"
 
     def test_backlog_manager_has_no_evaluate_method(self) -> None:
         """BacklogManager must not expose evaluate() — judge interface removed."""
@@ -791,9 +1003,7 @@ class TestUpdateStatusSummary:
         )
         assert callable(BacklogManager._update_status_summary)
 
-    def test_rewrites_summary_table_when_already_present(
-        self, tmp_path: Path, backlog_dir: Path
-    ) -> None:
+    def test_rewrites_summary_table_when_already_present(self, tmp_path: Path, backlog_dir: Path) -> None:
         """AC-2: _update_status_summary rewrites the Status Summary section in place."""
         index_path, _ = _make_backlog_with_epics(tmp_path, backlog_dir)
         mgr = BacklogManager()
@@ -828,9 +1038,7 @@ class TestUpdateStatusSummary:
         assert cells[5] == "1", f"E1 in-queue count wrong: {e1_line}"
         assert cells[6] == "0", f"E1 blocked count wrong: {e1_line}"
 
-    def test_creates_summary_section_when_absent(
-        self, tmp_path: Path, backlog_dir: Path
-    ) -> None:
+    def test_creates_summary_section_when_absent(self, tmp_path: Path, backlog_dir: Path) -> None:
         """AC-2: _update_status_summary inserts the Status Summary section when not present."""
         index_path, _ = _make_backlog_with_epics(tmp_path, backlog_dir)
         mgr = BacklogManager()
@@ -845,9 +1053,7 @@ class TestUpdateStatusSummary:
         assert "| E1 |" in result
         assert "| E2 |" in result
 
-    def test_counts_only_descendant_rows_not_epic_itself(
-        self, tmp_path: Path, backlog_dir: Path
-    ) -> None:
+    def test_counts_only_descendant_rows_not_epic_itself(self, tmp_path: Path, backlog_dir: Path) -> None:
         """AC-2: counts reflect descendant rows; the epic-level row itself is not double-counted."""
         index_path, _ = _make_backlog_with_epics(tmp_path, backlog_dir)
         mgr = BacklogManager()
@@ -868,9 +1074,7 @@ class TestUpdateStatusSummary:
 class TestSetStatusCallsUpdateStatusSummary:
     """Tests that _set_status calls _update_status_summary — AC-3."""
 
-    def test_set_status_updates_summary_table(
-        self, tmp_path: Path, backlog_dir: Path
-    ) -> None:
+    def test_set_status_updates_summary_table(self, tmp_path: Path, backlog_dir: Path) -> None:
         """AC-3: After force_status, the Status Summary table reflects the new status."""
         index_path, files = _make_backlog_with_epics(tmp_path, backlog_dir)
         mgr = BacklogManager()
@@ -899,18 +1103,14 @@ class TestValidateBacklogSummary:
         """Return an index without a Status Summary section."""
         return _make_backlog_with_epics(tmp_path, backlog_dir)
 
-    def _make_backlog_with_correct_summary(
-        self, tmp_path: Path, backlog_dir: Path
-    ) -> tuple[Path, dict[str, Path]]:
+    def _make_backlog_with_correct_summary(self, tmp_path: Path, backlog_dir: Path) -> tuple[Path, dict[str, Path]]:
         """Return an index with a correct Status Summary section."""
         index_path, files = _make_backlog_with_epics(tmp_path, backlog_dir)
         mgr = BacklogManager()
         mgr._update_status_summary(index_path)
         return index_path, files
 
-    def _make_backlog_with_wrong_summary(
-        self, tmp_path: Path, backlog_dir: Path
-    ) -> tuple[Path, dict[str, Path]]:
+    def _make_backlog_with_wrong_summary(self, tmp_path: Path, backlog_dir: Path) -> tuple[Path, dict[str, Path]]:
         """Return an index with a Status Summary section that has wrong counts."""
         index_path, files = _make_backlog_with_epics(tmp_path, backlog_dir)
         content = index_path.read_text(encoding="utf-8")
@@ -924,20 +1124,14 @@ class TestValidateBacklogSummary:
         index_path.write_text(wrong_summary + content, encoding="utf-8")
         return index_path, files
 
-    def test_validate_fails_when_summary_table_missing(
-        self, tmp_path: Path, backlog_dir: Path
-    ) -> None:
+    def test_validate_fails_when_summary_table_missing(self, tmp_path: Path, backlog_dir: Path) -> None:
         """AC-4: validate reports an error when ## Status Summary section is absent."""
         index_path, _ = self._make_backlog_no_summary(tmp_path, backlog_dir)
         mgr = BacklogManager()
         errors = mgr.validate(index_path, tmp_path)
-        assert any("status summary" in e.lower() for e in errors), (
-            f"Expected status summary error, got: {errors}"
-        )
+        assert any("status summary" in e.lower() for e in errors), f"Expected status summary error, got: {errors}"
 
-    def test_validate_fails_when_summary_counts_mismatch(
-        self, tmp_path: Path, backlog_dir: Path
-    ) -> None:
+    def test_validate_fails_when_summary_counts_mismatch(self, tmp_path: Path, backlog_dir: Path) -> None:
         """AC-4: validate reports an error when summary counts don't match index."""
         index_path, _ = self._make_backlog_with_wrong_summary(tmp_path, backlog_dir)
         mgr = BacklogManager()
@@ -946,17 +1140,13 @@ class TestValidateBacklogSummary:
             f"Expected status summary mismatch error, got: {errors}"
         )
 
-    def test_validate_passes_when_summary_matches_index(
-        self, tmp_path: Path, backlog_dir: Path
-    ) -> None:
+    def test_validate_passes_when_summary_matches_index(self, tmp_path: Path, backlog_dir: Path) -> None:
         """AC-4: validate returns no summary errors when counts are correct."""
         index_path, _ = self._make_backlog_with_correct_summary(tmp_path, backlog_dir)
         mgr = BacklogManager()
         errors = mgr.validate(index_path, tmp_path)
         summary_errors = [e for e in errors if "status summary" in e.lower()]
-        assert not summary_errors, (
-            f"Unexpected status summary errors: {summary_errors}"
-        )
+        assert not summary_errors, f"Unexpected status summary errors: {summary_errors}"
 
 
 # ---------------------------------------------------------------------------
@@ -1015,9 +1205,8 @@ class TestAppendAgentComment:
         content = wu.read_text(encoding="utf-8")
         # Timestamp format: [YYYY-MM-DD HH:MM UTC]
         import re
-        assert re.search(r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC\]", content), (
-            f"No UTC timestamp found in: {content}"
-        )
+
+        assert re.search(r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC\]", content), f"No UTC timestamp found in: {content}"
 
 
 # ---------------------------------------------------------------------------
@@ -1059,7 +1248,9 @@ class TestAppendTddEntry:
         wu = self._make_wu_with_tdd_section(tmp_path)
         mgr = BacklogManager()
         mgr._append_tdd_entry(
-            wu, "RED", "Tests: tests/test_foo.py. Command: make test-unit. Exit: 1. Failures: 2 failed.",
+            wu,
+            "RED",
+            "Tests: tests/test_foo.py. Command: make test-unit. Exit: 1. Failures: 2 failed.",
         )
 
         content = wu.read_text(encoding="utf-8")
@@ -1074,7 +1265,9 @@ class TestAppendTddEntry:
         wu = self._make_wu_with_tdd_section(tmp_path)
         mgr = BacklogManager()
         mgr._append_tdd_entry(
-            wu, "GREEN", "Command: make test-unit. Result: 5 passed, 0 failed. Files changed: src/foo.py",
+            wu,
+            "GREEN",
+            "Command: make test-unit. Result: 5 passed, 0 failed. Files changed: src/foo.py",
         )
 
         content = wu.read_text(encoding="utf-8")
@@ -1096,6 +1289,7 @@ class TestAppendTddEntry:
     def test_entry_format_matches_spec(self, tmp_path: Path) -> None:
         """AC-5: Entry matches '- [<PHASE>] <ISO-8601 timestamp> — <message>'."""
         import re
+
         wu = self._make_wu_with_tdd_section(tmp_path)
         mgr = BacklogManager()
         mgr._append_tdd_entry(wu, "RED", "some test message")
@@ -1103,9 +1297,7 @@ class TestAppendTddEntry:
         content = wu.read_text(encoding="utf-8")
         # Pattern: - [RED] <ISO-8601 datetime> — <message>
         pattern = r"- \[RED\] \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[^ ]* — some test message"
-        assert re.search(pattern, content), (
-            f"Entry format does not match expected pattern in: {content}"
-        )
+        assert re.search(pattern, content), f"Entry format does not match expected pattern in: {content}"
 
     def test_entry_appears_in_tdd_section_not_comments(self, tmp_path: Path) -> None:
         """AC-11: TDD entries do not appear in ## Comments section."""
@@ -1143,3 +1335,205 @@ class TestAppendTddEntry:
         assert red_pos < green_pos, "RED entry must appear before GREEN entry"
         assert "first-red-entry" in content
         assert "second-green-entry" in content
+
+
+class TestRollupParentStatusEdgeCases:
+    """Test edge cases in _rollup_parent_status."""
+
+    def test_rollup_returns_early_for_top_level_id(self, tmp_path: Path) -> None:
+        """Line 319: early return when unit_id has no parent (no hyphen)."""
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(
+            "# Backlog\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|-----------||\n"
+            "| E0 | Epic | Epic | done | None | git-repo | `backlog/E0.md` |\n"
+        )
+        mgr = BacklogManager()
+        # Should return without error for a single-segment ID
+        mgr._rollup_parent_status(index_path, "E0")
+
+    def test_rollup_warns_when_parent_file_missing(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """Lines 329-330: warns and skips rollup when parent file is missing."""
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(
+            "# Backlog\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|-----------||\n"
+            "| E0-F1 | Feature | Feature | in-queue | None | git-repo | `backlog/E0-F1.md` |\n"
+            "| E0-F1-S1 | Story | Story | done | None | git-repo | `backlog/E0-F1-S1.md` |\n"
+        )
+        # Only create child file, not parent file
+        child_file = backlog_dir / "E0-F1-S1.md"
+        child_file.write_text("# E0-F1-S1\n\n## Status: done\n")
+        # Parent file E0-F1.md does NOT exist
+
+        mgr = BacklogManager()
+        # Should warn but not raise
+        mgr._rollup_parent_status(index_path, "E0-F1-S1")
+
+    def test_rollup_appends_comment_when_comments_section_exists(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """Line 347: when parent already has ## Comments, the rollup comment is appended
+        to the existing section (no duplicate header created)."""
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(
+            "# Backlog\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|-----------||\n"
+            "| E0-F1 | Feature | Feature | in-queue | None | git-repo | `backlog/E0-F1.md` |\n"
+            "| E0-F1-S1 | Story | Story | done | None | git-repo | `backlog/E0-F1-S1.md` |\n"
+        )
+        # Parent file already contains ## Comments section
+        parent_file = backlog_dir / "E0-F1.md"
+        parent_file.write_text(
+            "# E0-F1: Feature\n\n## Status: in-queue\n\n## Comments\n\n"
+            "[2026-01-01 00:00 UTC] [agent/orchestrator] Previous comment\n"
+        )
+        child_file = backlog_dir / "E0-F1-S1.md"
+        child_file.write_text("# E0-F1-S1\n\n## Status: done\n")
+
+        mgr = BacklogManager()
+        mgr._rollup_parent_status(index_path, "E0-F1-S1")
+
+        result = parent_file.read_text(encoding="utf-8")
+        # Should contain exactly one ## Comments header (not duplicated)
+        assert result.count("## Comments") == 1
+        # Should contain the auto-rollup comment
+        assert "Auto-rolled to done" in result
+        # Should still contain the previous comment
+        assert "Previous comment" in result
+
+
+class TestParseBacklogRowsEdgeCases:
+    """Test _parse_backlog_rows with edge-case input."""
+
+    def test_skips_rows_with_fewer_than_5_cells(self, tmp_path: Path) -> None:
+        """Line 347: rows with < 5 cells are skipped."""
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(
+            "# Backlog\n\n"
+            "| Only | Two |\n"
+            "| E0-F1-S1-T1 | Create Makefile | Task | in-queue | None | git-repo | `backlog/E0-F1-S1-T1.md` |\n"
+        )
+        mgr = BacklogManager()
+        rows = mgr._parse_backlog_rows(index_path)
+        # Only the valid row should be parsed
+        ids = [r[0] for r in rows]
+        assert "E0-F1-S1-T1" in ids
+
+
+class TestAllChildrenDoneEdgeCases:
+    """Test _all_children_done edge cases."""
+
+    def test_returns_false_when_parent_already_done(self) -> None:
+        """Line 372: returns False if parent is already Done."""
+        rows = [
+            ("E0-F1", "done", "backlog/E0-F1.md"),
+            ("E0-F1-S1", "done", "backlog/E0-F1-S1.md"),
+        ]
+        mgr = BacklogManager()
+        assert mgr._all_children_done(rows, "E0-F1") is False
+
+
+class TestFindWorkUnitFileEdgeCases:
+    """Test _find_work_unit_file edge cases."""
+
+    def test_returns_none_when_file_does_not_exist(self, tmp_path: Path) -> None:
+        """Line 394: returns None when candidate file doesn't exist."""
+        rows = [
+            ("E0-F1-S1-T1", "in-queue", "backlog/E0-F1-S1-T1.md"),
+        ]
+        mgr = BacklogManager()
+        result = mgr._find_work_unit_file(rows, "E0-F1-S1-T1", tmp_path)
+        assert result is None
+
+    def test_returns_none_when_id_not_in_rows(self, tmp_path: Path) -> None:
+        """Line 394: returns None when unit_id not found in rows."""
+        rows = [
+            ("E0-F1-S1-T1", "in-queue", "backlog/E0-F1-S1-T1.md"),
+        ]
+        mgr = BacklogManager()
+        result = mgr._find_work_unit_file(rows, "NONEXISTENT", tmp_path)
+        assert result is None
+
+
+class TestUpdateBacklogIndexNotFound:
+    """Test _update_backlog_index raises when unit not found."""
+
+    def test_raises_when_unit_not_in_index(self, tmp_path: Path) -> None:
+        """Line 439: raises ValueError when the unit ID is not found in BACKLOG.md."""
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(
+            "# Backlog\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|-----------||\n"
+            "| E0-F1-S1-T1 | Task | Task | in-queue | None | git-repo | `backlog/E0-F1-S1-T1.md` |\n"
+        )
+        mgr = BacklogManager()
+        with pytest.raises(ValueError, match="Could not find unit"):
+            mgr._update_backlog_index(index_path, "NONEXISTENT", "done")
+
+
+class TestAppendCommentNoSection:
+    """Test _append_comment when Comments section is absent."""
+
+    def test_creates_comments_section_when_missing(self, tmp_path: Path) -> None:
+        """Line 460: appends Comments header when section doesn't exist."""
+        wu = tmp_path / "unit.md"
+        wu.write_text("# Unit\n\n## Status: in-queue\n")
+
+        mgr = BacklogManager()
+        mgr._append_comment(wu, "TEST_ACTION", "test message")
+
+        content = wu.read_text(encoding="utf-8")
+        assert "## Comments" in content
+        assert "[TEST_ACTION]" in content
+        assert "test message" in content
+
+
+class TestParseEpicTitlesEdgeCases:
+    """Test _parse_epic_titles edge cases."""
+
+    def test_skips_rows_with_fewer_than_4_cells(self, tmp_path: Path) -> None:
+        """Line 566: rows with < 4 cells are skipped."""
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(
+            "# Backlog\n\n| Short |\n| E0 | Epic Zero | Epic | in-queue | None | git-repo | `backlog/E0.md` |\n"
+        )
+        mgr = BacklogManager()
+        titles = mgr._parse_epic_titles(index_path)
+        assert "E0" in titles
+
+
+class TestParseSummaryTableEdgeCases:
+    """Test _parse_summary_table edge cases."""
+
+    def test_skips_rows_with_fewer_than_7_cells(self) -> None:
+        """Line 675: rows with < 7 cells in summary table are skipped."""
+        content = (
+            "## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
+            "|------|-------|------|-------------|----------|---------|\n"
+            "| Short |\n"
+            "| E0 | Epic | 1 | 2 | 3 | 0 |\n"
+            "\n## Full Work Unit Index\n"
+        )
+        mgr = BacklogManager()
+        result = mgr._parse_summary_table(content)
+        assert "E0" in result
+
+    def test_skips_rows_with_non_integer_counts(self) -> None:
+        """Lines 686-687: rows with non-integer count values are skipped."""
+        content = (
+            "## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
+            "|------|-------|------|-------------|----------|---------|\n"
+            "| E0 | Epic | NaN | two | 3 | 0 |\n"
+            "| E1 | Other | 1 | 2 | 3 | 0 |\n"
+            "\n## Full Work Unit Index\n"
+        )
+        mgr = BacklogManager()
+        result = mgr._parse_summary_table(content)
+        # E0 should be skipped due to ValueError, E1 should be parsed
+        assert "E0" not in result
+        assert "E1" in result

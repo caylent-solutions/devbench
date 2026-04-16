@@ -182,13 +182,7 @@ class TestLoadRuntimeConfig:
         """
         cfg = self._write_yaml(
             tmp_path / "cfg.yaml",
-            (
-                "repos:\n"
-                "  org/repo-a:\n"
-                "    default_branch: main\n"
-                "  org/repo-b:\n"
-                "    default_branch: develop\n"
-            ),
+            ("repos:\n  org/repo-a:\n    default_branch: main\n  org/repo-b:\n    default_branch: develop\n"),
         )
         result = load_runtime_config(cfg, {})
         assert set(result.repos) == {"org/repo-a", "org/repo-b"}, (
@@ -209,9 +203,7 @@ class TestLoadRuntimeConfig:
         """
         cfg = self._write_yaml(tmp_path / "cfg.yaml", "repos:\n  org/r:\n")
         result = load_runtime_config(cfg, {})
-        assert isinstance(result, RuntimeConfig), (
-            f"Expected RuntimeConfig instance, got {type(result).__name__}"
-        )
+        assert isinstance(result, RuntimeConfig), f"Expected RuntimeConfig instance, got {type(result).__name__}"
 
     def test_raises_value_error_on_non_string_default_branch(self, tmp_path: Path) -> None:
         """
@@ -289,9 +281,7 @@ class TestDataclasses:
     def test_repo_config_checkout_directory_none_by_default(self) -> None:
         """RepoConfig() has checkout_directory=None by default."""
         rc = RepoConfig()
-        assert rc.checkout_directory is None, (
-            f"Expected checkout_directory=None, got {rc.checkout_directory!r}"
-        )
+        assert rc.checkout_directory is None, f"Expected checkout_directory=None, got {rc.checkout_directory!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -379,13 +369,9 @@ class TestGetRepoLocalPath:
         When: get_repo_local_path is called
         Then: the path is workspace_root / 'custom-checkout'
         """
-        config = RuntimeConfig(
-            repos={"org/my-repo": RepoConfig(checkout_directory="custom-checkout")}
-        )
+        config = RuntimeConfig(repos={"org/my-repo": RepoConfig(checkout_directory="custom-checkout")})
         result = get_repo_local_path("org/my-repo", config, tmp_path)
-        assert result == tmp_path / "custom-checkout", (
-            f"Expected {tmp_path / 'custom-checkout'}, got {result}"
-        )
+        assert result == tmp_path / "custom-checkout", f"Expected {tmp_path / 'custom-checkout'}, got {result}"
 
     def test_falls_back_to_repo_short_name(self, tmp_path: Path) -> None:
         """
@@ -395,9 +381,7 @@ class TestGetRepoLocalPath:
         """
         config = RuntimeConfig(repos={"org/my-repo": RepoConfig()})
         result = get_repo_local_path("org/my-repo", config, tmp_path)
-        assert result == tmp_path / "my-repo", (
-            f"Expected {tmp_path / 'my-repo'}, got {result}"
-        )
+        assert result == tmp_path / "my-repo", f"Expected {tmp_path / 'my-repo'}, got {result}"
 
     def test_falls_back_when_repo_not_in_config(self, tmp_path: Path) -> None:
         """
@@ -407,9 +391,7 @@ class TestGetRepoLocalPath:
         """
         config = RuntimeConfig(repos={})
         result = get_repo_local_path("org/unknown-repo", config, tmp_path)
-        assert result == tmp_path / "unknown-repo", (
-            f"Expected {tmp_path / 'unknown-repo'}, got {result}"
-        )
+        assert result == tmp_path / "unknown-repo", f"Expected {tmp_path / 'unknown-repo'}, got {result}"
 
     def test_checkout_directory_none_uses_short_name(self, tmp_path: Path) -> None:
         """
@@ -417,13 +399,9 @@ class TestGetRepoLocalPath:
         When: get_repo_local_path is called
         Then: the path falls back to workspace_root / short-name
         """
-        config = RuntimeConfig(
-            repos={"org/my-repo": RepoConfig(checkout_directory=None)}
-        )
+        config = RuntimeConfig(repos={"org/my-repo": RepoConfig(checkout_directory=None)})
         result = get_repo_local_path("org/my-repo", config, tmp_path)
-        assert result == tmp_path / "my-repo", (
-            f"Expected {tmp_path / 'my-repo'}, got {result}"
-        )
+        assert result == tmp_path / "my-repo", f"Expected {tmp_path / 'my-repo'}, got {result}"
 
 
 # ---------------------------------------------------------------------------
@@ -653,9 +631,7 @@ class TestRuntimeConfigPopulation:
         result = load_runtime_config(cfg, {})
         assert result.timeouts.gh_api == 45, f"Expected gh_api=45, got {result.timeouts.gh_api!r}"
         assert result.timeouts.test == 600, f"Expected test=600, got {result.timeouts.test!r}"
-        assert result.timeouts.llm is None, (
-            f"Expected unspecified field llm=None, got {result.timeouts.llm!r}"
-        )
+        assert result.timeouts.llm is None, f"Expected unspecified field llm=None, got {result.timeouts.llm!r}"
 
     def test_runtime_config_populates_limits_from_yaml(self, tmp_path: Path) -> None:
         """
@@ -675,9 +651,7 @@ class TestRuntimeConfigPopulation:
             """,
         )
         result = load_runtime_config(cfg, {})
-        assert result.limits.alert_summary == 20, (
-            f"Expected alert_summary=20, got {result.limits.alert_summary!r}"
-        )
+        assert result.limits.alert_summary == 20, f"Expected alert_summary=20, got {result.limits.alert_summary!r}"
         assert result.limits.output_truncation == 4000, (
             f"Expected output_truncation=4000, got {result.limits.output_truncation!r}"
         )
@@ -698,16 +672,14 @@ class TestRuntimeConfigPopulation:
               org/repo:
                 default_branch: main
             merge_strategy: merge
-            max_retries: 5
+            max_executor_retries: 5
             use_bedrock: true
             bedrock_region: us-west-2
             """,
         )
         result = load_runtime_config(cfg, {})
-        assert result.merge_strategy == "merge", (
-            f"Expected merge_strategy='merge', got {result.merge_strategy!r}"
-        )
-        assert result.max_retries == 5, f"Expected max_retries=5, got {result.max_retries!r}"
+        assert result.merge_strategy == "merge", f"Expected merge_strategy='merge', got {result.merge_strategy!r}"
+        assert result.max_executor_retries == 5, f"Expected max_executor_retries=5, got {result.max_executor_retries!r}"
         assert result.use_bedrock is True, f"Expected use_bedrock=True, got {result.use_bedrock!r}"
         assert result.bedrock_region == "us-west-2", (
             f"Expected bedrock_region='us-west-2', got {result.bedrock_region!r}"
@@ -731,8 +703,8 @@ class TestRuntimeConfigPopulation:
         assert result.merge_strategy is None, (
             f"Expected merge_strategy=None when absent from YAML, got {result.merge_strategy!r}"
         )
-        assert result.max_retries is None, (
-            f"Expected max_retries=None when absent from YAML, got {result.max_retries!r}"
+        assert result.max_executor_retries is None, (
+            f"Expected max_executor_retries=None when absent from YAML, got {result.max_executor_retries!r}"
         )
         assert result.use_bedrock is False, (
             f"Expected use_bedrock=False (explicit bool default), got {result.use_bedrock!r}"
@@ -740,9 +712,7 @@ class TestRuntimeConfigPopulation:
         assert result.bedrock_region is None, (
             f"Expected bedrock_region=None when absent from YAML, got {result.bedrock_region!r}"
         )
-        assert result.allowed_orgs == [], (
-            f"Expected allowed_orgs=[], got {result.allowed_orgs!r}"
-        )
+        assert result.allowed_orgs == [], f"Expected allowed_orgs=[], got {result.allowed_orgs!r}"
         assert result.judge_model is None, (
             f"Expected judge_model=None when absent from YAML, got {result.judge_model!r}"
         )
@@ -831,9 +801,7 @@ class TestConfigLoaderNoEnvVars:
             ):
                 env_read_calls.append("os.getenv")
 
-        assert env_read_calls == [], (
-            f"config_loader.py must not read env vars — found: {env_read_calls}"
-        )
+        assert env_read_calls == [], f"config_loader.py must not read env vars — found: {env_read_calls}"
 
 
 # ---------------------------------------------------------------------------
@@ -913,9 +881,7 @@ class TestPostSchemaValidation:
             """,
         )
         result = load_runtime_config(cfg, {})
-        assert "permitted-org/repo" in result.repos, (
-            f"Expected 'permitted-org/repo' in repos, got {set(result.repos)}"
-        )
+        assert "permitted-org/repo" in result.repos, f"Expected 'permitted-org/repo' in repos, got {set(result.repos)}"
 
     def test_ac8_empty_allowed_orgs_allows_any_org(self, tmp_path: Path) -> None:
         """
@@ -932,9 +898,8 @@ class TestPostSchemaValidation:
             """,
         )
         result = load_runtime_config(cfg, {})
-        assert "any-org/repo" in result.repos, (
-            f"Expected 'any-org/repo' in repos, got {set(result.repos)}"
-        )
+        assert "any-org/repo" in result.repos, f"Expected 'any-org/repo' in repos, got {set(result.repos)}"
+
 
 # ---------------------------------------------------------------------------
 # GitOpsConfig — T3 AC-3, AC-4, AC-5, AC-6
@@ -1028,6 +993,112 @@ class TestGitOpsConfig:
         with pytest.raises(ValueError, match="schema validation"):
             load_runtime_config(cfg, {})
 
+    def test_single_branch_defaults_to_none(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.git_ops.single_branch is None
+        assert result.git_ops.defer_pr is False
+
+    def test_single_branch_parsed_from_yaml(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            git_ops:
+              single_branch: feat/my-feature
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.git_ops.single_branch == "feat/my-feature"
+        assert result.git_ops.defer_pr is False
+
+    def test_defer_pr_parsed_from_yaml(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            git_ops:
+              single_branch: feat/my-feature
+              defer_pr: true
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.git_ops.single_branch == "feat/my-feature"
+        assert result.git_ops.defer_pr is True
+
+    def test_defer_pr_without_single_branch_raises(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            git_ops:
+              defer_pr: true
+            """,
+        )
+        with pytest.raises(ValueError, match=r"defer_pr requires.*single_branch"):
+            load_runtime_config(cfg, {})
+
+    def test_token_cost_defaults(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.report.token_cost_per_million_input == 15.0
+        assert result.report.token_cost_per_million_output == 75.0
+        assert result.report.token_cost_input_ratio == 0.80
+
+    def test_token_cost_overrides_from_yaml(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            report:
+              token_cost_per_million_input: 10.0
+              token_cost_per_million_output: 50.0
+              token_cost_input_ratio: 0.75
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.report.token_cost_per_million_input == 10.0
+        assert result.report.token_cost_per_million_output == 50.0
+        assert result.report.token_cost_input_ratio == 0.75
+
+    def test_token_cost_partial_override(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            report:
+              token_cost_per_million_input: 8.0
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.report.token_cost_per_million_input == 8.0
+        assert result.report.token_cost_per_million_output == 75.0
+        assert result.report.token_cost_input_ratio == 0.80
+
     def test_schema_rejects_unknown_git_ops_keys(self, tmp_path: Path) -> None:
         """
         Given: a config file with an unknown key under git_ops
@@ -1047,3 +1118,87 @@ class TestGitOpsConfig:
         )
         with pytest.raises(ValueError, match="schema validation"):
             load_runtime_config(cfg, {})
+
+    def test_raises_when_yaml_is_not_mapping(self, tmp_path: Path) -> None:
+        """
+        Line 353: raises ValueError when YAML top-level is not a dict (e.g. a list).
+        """
+        cfg = tmp_path / "cfg.yaml"
+        cfg.write_text("- item1\n- item2\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="must be a YAML mapping"):
+            load_runtime_config(cfg, {})
+
+    def test_stop_hook_max_blocks_defaults(self, tmp_path: Path) -> None:
+        """stop_hook_max_blocks defaults to DEFAULT_STOP_HOOK_MAX_BLOCKS when not in YAML."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        from devbench.constants import DEFAULT_STOP_HOOK_MAX_BLOCKS
+
+        assert result.stop_hook.max_blocks == DEFAULT_STOP_HOOK_MAX_BLOCKS
+
+    def test_stop_hook_max_blocks_from_yaml(self, tmp_path: Path) -> None:
+        """max_blocks is read from YAML stop_hook section."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            stop_hook:
+              max_blocks: 3
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.stop_hook.max_blocks == 3
+
+    def test_stop_hook_window_seconds_from_yaml(self, tmp_path: Path) -> None:
+        """window_seconds is read from YAML stop_hook section."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            stop_hook:
+              window_seconds: 60
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.stop_hook.window_seconds == 60
+
+    def test_stop_hook_stale_task_minutes_defaults(self, tmp_path: Path) -> None:
+        """stale_task_minutes defaults to DEFAULT_STOP_HOOK_STALE_TASK_MINUTES when not in YAML."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        from devbench.constants import DEFAULT_STOP_HOOK_STALE_TASK_MINUTES
+
+        assert result.stop_hook.stale_task_minutes == DEFAULT_STOP_HOOK_STALE_TASK_MINUTES
+
+    def test_stop_hook_stale_task_minutes_from_yaml(self, tmp_path: Path) -> None:
+        """stale_task_minutes is read from YAML stop_hook section."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            stop_hook:
+              stale_task_minutes: 30
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.stop_hook.stale_task_minutes == 30

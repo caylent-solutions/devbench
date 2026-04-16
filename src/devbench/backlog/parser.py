@@ -361,10 +361,7 @@ class BacklogParser:
         Dependencies on stories, features, or epics are structural
         parent relationships and are always considered satisfied.
         """
-        return all(
-            dep not in task_ids or dep in done_ids
-            for dep in unit.dependencies
-        )
+        return all(dep not in task_ids or dep in done_ids for dep in unit.dependencies)
 
     @staticmethod
     def _parse_dependency_table(content: str) -> list[str]:

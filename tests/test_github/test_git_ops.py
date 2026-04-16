@@ -18,7 +18,6 @@ class TestGitOpsInit:
         assert judge.name == "git_ops"
 
 
-
 class TestCommitAndPush:
     """Test commit_and_push method."""
 
@@ -64,9 +63,7 @@ class TestCommitAndPush:
     # Restart scenarios: nothing to commit
     # ------------------------------------------------------------------
 
-    def test_nothing_to_commit_skips_commit_and_push_when_remote_up_to_date(
-        self, tmp_path: Path
-    ) -> None:
+    def test_nothing_to_commit_skips_commit_and_push_when_remote_up_to_date(self, tmp_path: Path) -> None:
         """When working tree is clean and remote matches local HEAD, both commit and push are skipped."""
         judge = GitOpsJudge()
         git_calls: list[list[str]] = []
@@ -387,9 +384,7 @@ class TestCreatePr:
         from devbench.config_loader import RepoConfig, RuntimeConfig
 
         judge = GitOpsJudge()
-        runtime_config = RuntimeConfig(
-            repos={"caylent-solutions/git-repo": RepoConfig(default_branch="main2")}
-        )
+        runtime_config = RuntimeConfig(repos={"caylent-solutions/git-repo": RepoConfig(default_branch="main2")})
         with (
             patch("devbench.github.git_ops.RUNTIME_CONFIG", runtime_config),
             patch.object(judge, "_gh", return_value=(0, "https://github.com/org/repo/pull/1\n", "")) as mock_gh,
@@ -406,9 +401,7 @@ class TestCreatePr:
         from devbench.config_loader import RepoConfig, RuntimeConfig
 
         judge = GitOpsJudge()
-        runtime_config = RuntimeConfig(
-            repos={"caylent-solutions/git-repo": RepoConfig(default_branch=None)}
-        )
+        runtime_config = RuntimeConfig(repos={"caylent-solutions/git-repo": RepoConfig(default_branch=None)})
         with (
             patch("devbench.github.git_ops.RUNTIME_CONFIG", runtime_config),
             patch.object(judge, "_gh", return_value=(0, "https://github.com/org/repo/pull/1\n", "")) as mock_gh,
@@ -533,9 +526,7 @@ class TestUpdateParentSubmoduleRef:
             patch.object(judge, "_get_default_branch", return_value="main"),
             patch("devbench.github.git_ops.WORKSPACE_ROOT", tmp_path),
         ):
-            judge.update_parent_submodule_ref(
-                "caylent-solutions/git-repo", repo_path, "update submodule"
-            )
+            judge.update_parent_submodule_ref("caylent-solutions/git-repo", repo_path, "update submodule")
 
         assert len(git_calls) == 4
         assert git_calls[0] == (["checkout", "main"], repo_path)
@@ -554,9 +545,7 @@ class TestUpdateParentSubmoduleRef:
             patch("devbench.github.git_ops.WORKSPACE_ROOT", tmp_path),
         ):
             with pytest.raises(RuntimeError, match="checkout failed"):
-                judge.update_parent_submodule_ref(
-                    "caylent-solutions/git-repo", repo_path, "msg"
-                )
+                judge.update_parent_submodule_ref("caylent-solutions/git-repo", repo_path, "msg")
 
 
 class TestGitHelper:
@@ -676,9 +665,7 @@ class TestCheckoutDefaultBranch:
             patch.object(judge, "_get_default_branch", return_value="main"),
             patch("devbench.github.git_ops.WORKSPACE_ROOT", tmp_path),
         ):
-            judge.update_parent_submodule_ref(
-                "caylent-solutions/git-repo", repo_path, "update submodule"
-            )
+            judge.update_parent_submodule_ref("caylent-solutions/git-repo", repo_path, "update submodule")
 
         assert len(checkout_default_branch_calls) == 1
         assert checkout_default_branch_calls[0] == ("caylent-solutions/git-repo", repo_path)
@@ -757,9 +744,7 @@ class TestConflictingPRError:
         Then: ConflictingPRError is raised (AC-5)
         """
         judge = GitOpsJudge()
-        with patch.object(
-            judge, "_gh", return_value=(1, "", "GraphQL: CONFLICTING merge state")
-        ):
+        with patch.object(judge, "_gh", return_value=(1, "", "GraphQL: CONFLICTING merge state")):
             with pytest.raises(ConflictingPRError):
                 judge.merge_pr("caylent-solutions/git-repo", 42, repo_path=tmp_path)
 
@@ -808,3 +793,118 @@ class TestRebaseAndForcePush:
         rebase_idx = git_calls.index(["rebase", "origin/main"])
         push_idx = git_calls.index(["push", "--force-with-lease", "origin", "feature/x"])
         assert fetch_idx < rebase_idx < push_idx
+
+
+class TestCommitLocal:
+    """Test commit_local method."""
+
+    def test_commit_local_stages_and_commits(self, tmp_path: Path) -> None:
+        """commit_local stages files and commits when there are changes."""
+        judge = GitOpsJudge()
+        git_calls: list[list[str]] = []
+
+        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
+            git_calls.append(args)
+            if args == ["status", "--porcelain"]:
+                return (0, "M src/foo.py\n", "")
+            return (0, "", "")
+
+        with patch.object(judge, "_git", side_effect=stub):
+            judge.commit_local(
+                "caylent-solutions/git-repo",
+                tmp_path,
+                "feature/x",
+                "local commit",
+            )
+
+        assert ["add", "-A"] in git_calls
+        assert ["status", "--porcelain"] in git_calls
+        assert ["commit", "-m", "local commit"] in git_calls
+        # Verify push was NOT called (commit_local is local only)
+        push_calls = [c for c in git_calls if c[0] == "push"]
+        assert push_calls == []
+
+    def test_commit_local_skips_when_nothing_staged(self, tmp_path: Path) -> None:
+        """commit_local skips commit when working tree is clean after staging."""
+        judge = GitOpsJudge()
+        git_calls: list[list[str]] = []
+
+        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
+            git_calls.append(args)
+            if args == ["status", "--porcelain"]:
+                return (0, "", "")
+            return (0, "", "")
+
+        with patch.object(judge, "_git", side_effect=stub):
+            judge.commit_local(
+                "caylent-solutions/git-repo",
+                tmp_path,
+                "feature/x",
+                "local commit",
+            )
+
+        assert ["add", "-A"] in git_calls
+        assert ["status", "--porcelain"] in git_calls
+        # Commit should NOT have been called
+        commit_calls = [c for c in git_calls if c[0] == "commit"]
+        assert commit_calls == []
+
+    def test_commit_local_rejects_invalid_branch(self, tmp_path: Path) -> None:
+        """Line 209: commit_local raises ValueError for invalid branch names."""
+        judge = GitOpsJudge()
+        with pytest.raises(ValueError, match="Invalid branch name"):
+            judge.commit_local("caylent-solutions/git-repo", tmp_path, "bad branch!", "msg")
+
+
+class TestGetDefaultBranch:
+    """Test _get_default_branch fallback logic."""
+
+    def test_returns_configured_branch_when_available(self, tmp_path: Path) -> None:
+        """Lines 459-462: returns YAML-configured branch when available."""
+        from devbench.config_loader import RepoConfig, RuntimeConfig
+
+        judge = GitOpsJudge()
+        runtime_config = RuntimeConfig(repos={"caylent-solutions/git-repo": RepoConfig(default_branch="main2")})
+        with patch("devbench.github.git_ops.RUNTIME_CONFIG", runtime_config):
+            result = judge._get_default_branch(tmp_path, repo="caylent-solutions/git-repo")
+        assert result == "main2"
+
+    def test_falls_back_to_git_when_no_config(self, tmp_path: Path) -> None:
+        """Lines 464-473: falls back to git rev-parse when no YAML config."""
+        from devbench.config_loader import RepoConfig, RuntimeConfig
+
+        judge = GitOpsJudge()
+        runtime_config = RuntimeConfig(repos={"caylent-solutions/git-repo": RepoConfig(default_branch=None)})
+        with (
+            patch("devbench.github.git_ops.RUNTIME_CONFIG", runtime_config),
+            patch("devbench.github.git_ops.run_command", return_value=(0, "origin/main\n", "")),
+        ):
+            result = judge._get_default_branch(tmp_path, repo="caylent-solutions/git-repo")
+        assert result == "main"
+
+    def test_raises_when_git_fallback_fails(self, tmp_path: Path) -> None:
+        """Lines 468-472: raises RuntimeError when git fallback fails."""
+        from devbench.config_loader import RepoConfig, RuntimeConfig
+
+        judge = GitOpsJudge()
+        runtime_config = RuntimeConfig(repos={"caylent-solutions/git-repo": RepoConfig(default_branch=None)})
+        with (
+            patch("devbench.github.git_ops.RUNTIME_CONFIG", runtime_config),
+            patch("devbench.github.git_ops.run_command", return_value=(1, "", "fatal: error")),
+        ):
+            with pytest.raises(RuntimeError, match="Cannot determine default branch"):
+                judge._get_default_branch(tmp_path, repo="caylent-solutions/git-repo")
+
+    def test_falls_back_to_git_when_no_repo_provided(self, tmp_path: Path) -> None:
+        """Lines 459, 464-473: falls back to git when no repo string is provided."""
+        judge = GitOpsJudge()
+        with patch("devbench.github.git_ops.run_command", return_value=(0, "origin/develop\n", "")):
+            result = judge._get_default_branch(tmp_path)
+        assert result == "develop"
+
+    def test_raises_when_git_returns_empty_stdout(self, tmp_path: Path) -> None:
+        """Lines 468-472: raises when git returns empty stdout."""
+        judge = GitOpsJudge()
+        with patch("devbench.github.git_ops.run_command", return_value=(0, "", "")):
+            with pytest.raises(RuntimeError, match="Cannot determine default branch"):
+                judge._get_default_branch(tmp_path)

@@ -6,14 +6,7 @@ from pathlib import Path
 
 import pytest
 
-SKILL_PATH = (
-    Path(__file__).parent.parent.parent
-    / "plugin"
-    / "devbench"
-    / "skills"
-    / "orchestrate"
-    / "SKILL.md"
-)
+SKILL_PATH = Path(__file__).parent.parent.parent / "plugin" / "devbench" / "skills" / "orchestrate" / "SKILL.md"
 
 
 @pytest.mark.unit
@@ -23,9 +16,7 @@ class TestOrchestrateSkillReviewSupervisor:
     def test_skill_references_review_supervisor(self) -> None:
         """AC-1: SKILL.md must reference review-supervisor."""
         content = SKILL_PATH.read_text()
-        assert "review-supervisor" in content, (
-            "SKILL.md must invoke review-supervisor in step 5"
-        )
+        assert "review-supervisor" in content, "SKILL.md must invoke review-supervisor in step 5"
 
     def test_skill_no_individual_reviewer_invocations(self) -> None:
         """AC-8: SKILL.md must not reference individual review agents."""
@@ -38,8 +29,7 @@ class TestOrchestrateSkillReviewSupervisor:
         ]
         for agent in forbidden:
             assert agent not in content, (
-                f"SKILL.md must not reference individual reviewer '{agent}' — "
-                f"use review-supervisor instead"
+                f"SKILL.md must not reference individual reviewer '{agent}' — use review-supervisor instead"
             )
 
 
@@ -50,16 +40,12 @@ class TestOrchestrateSkillStep5Branching:
     def test_step5_branches_on_review_pass(self) -> None:
         """AC-2: Step 5 must explicitly route REVIEW_PASS to step 7."""
         content = SKILL_PATH.read_text()
-        assert "REVIEW_PASS" in content, (
-            "SKILL.md step 5 must explicitly handle REVIEW_PASS"
-        )
+        assert "REVIEW_PASS" in content, "SKILL.md step 5 must explicitly handle REVIEW_PASS"
 
     def test_step5_branches_on_review_fail(self) -> None:
         """AC-2: Step 5 must explicitly route REVIEW_FAIL to step 6."""
         content = SKILL_PATH.read_text()
-        assert "REVIEW_FAIL" in content, (
-            "SKILL.md step 5 must explicitly handle REVIEW_FAIL"
-        )
+        assert "REVIEW_FAIL" in content, "SKILL.md step 5 must explicitly handle REVIEW_FAIL"
 
 
 @pytest.mark.unit
@@ -69,9 +55,7 @@ class TestOrchestrateSkillStep6RetryLoop:
     def test_step6_return_to_step5(self) -> None:
         """AC-3: Step 6 must explicitly say 'Return to step 5'."""
         content = SKILL_PATH.read_text()
-        assert "Return to step 5" in content, (
-            "SKILL.md step 6 must say 'Return to step 5' explicitly"
-        )
+        assert "Return to step 5" in content, "SKILL.md step 6 must say 'Return to step 5' explicitly"
 
     def test_step6_excludes_security(self) -> None:
         """AC-3: Step 6 must explicitly say do NOT invoke security-reviewer."""
@@ -108,8 +92,7 @@ class TestOrchestrateSkillStandards:
         """AC-6: Standards section must state security runs exactly once per work unit."""
         content = SKILL_PATH.read_text()
         assert "Security review runs exactly once per work unit" in content, (
-            "SKILL.md Standards section must state "
-            "'Security review runs exactly once per work unit'"
+            "SKILL.md Standards section must state 'Security review runs exactly once per work unit'"
         )
 
     def test_standards_retry_loop_no_security(self) -> None:

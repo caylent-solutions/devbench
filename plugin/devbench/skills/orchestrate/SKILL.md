@@ -5,6 +5,8 @@ description: Run the devbench backlog execution loop until all work units are co
 
 Process the backlog using the steps below, repeating until all work units are done or no actionable units remain.
 
+**CRITICAL: This is an autonomous loop. Never stop to ask the user if you should proceed. Never ask "Should I continue?" After completing a work unit, immediately return to step 1 and process the next one. The only valid exit conditions are ALL_DONE or NO_ACTIONABLE from step 2. If the context was compacted, re-read this instruction and continue the loop.**
+
 ## Loop
 
 1. `uv run devbench validate-backlog` — abort if the backlog has integrity errors.
@@ -38,18 +40,20 @@ Process the backlog using the steps below, repeating until all work units are do
 6. On REVIEW_FAIL:
    - Retry `devbench:executor` with the unit ID (executor reads prior Comments for context).
    - Return to step 5 — invoke `review-supervisor` again. Do NOT invoke security-reviewer here.
-   - After `max_retries` consecutive failures, log a blocker comment and return to step 2.
+   - After `max_executor_retries` consecutive failures, log a blocker comment and return to step 2.
 
 7. On review team REVIEW_PASS:
    - Invoke `devbench:security-reviewer` with the unit ID.
    - If security PASS: proceed immediately to step 8. Do NOT re-run review-supervisor.
    - If security FAIL: log a blocker comment and return to step 2.
 
-8. `uv run devbench git-ops <id>` — commit, push, create PR, wait for CI, merge.
+8. `uv run devbench git-ops <id>` — In standard mode: commit, push, create PR, wait for CI, merge. In single-branch mode (when `git_ops.defer_pr: true` in devbench.yaml): commit locally only (no push, no PR, no merge). The branch is shared across all work units.
 
 9. `uv run devbench mark-done <id>` — mark the unit done (enforces done-gate).
 
 10. Return to step 1.
+
+11. When all work units are done and `defer_pr` mode is active, run `uv run devbench git-ops-finalize <repo>` to push the single branch and create the PR.
 
 ## Standards
 

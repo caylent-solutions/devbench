@@ -9,13 +9,7 @@ from pathlib import Path
 
 import pytest
 
-SCRIPT_PATH = (
-    Path(__file__).parent.parent.parent
-    / "plugin"
-    / "devbench"
-    / "scripts"
-    / "guard-verdict-format.sh"
-)
+SCRIPT_PATH = Path(__file__).parent.parent.parent / "plugin" / "devbench" / "scripts" / "guard-verdict-format.sh"
 
 
 def _run_hook(payload: dict) -> subprocess.CompletedProcess:
@@ -75,9 +69,7 @@ class TestGuardVerdictFormatHook:
 
     def test_fail_verdict_with_feedback_exits_0(self) -> None:
         """AC-2: Exit 0 when verdict is 'fail' and feedback is provided."""
-        payload = _make_payload(
-            'uv run devbench log-verdict executor E201-F1-S2-T1 fail "some reason"'
-        )
+        payload = _make_payload('uv run devbench log-verdict executor E201-F1-S2-T1 fail "some reason"')
         result = _run_hook(payload)
         assert result.returncode == 0, f"stderr: {result.stderr}"
 
@@ -89,9 +81,7 @@ class TestGuardVerdictFormatHook:
 
     def test_pass_verdict_with_feedback_exits_0(self) -> None:
         """AC-2: Exit 0 when verdict is 'pass' with optional feedback."""
-        payload = _make_payload(
-            'uv run devbench log-verdict executor E201-F1-S2-T1 pass "looks good"'
-        )
+        payload = _make_payload('uv run devbench log-verdict executor E201-F1-S2-T1 pass "looks good"')
         result = _run_hook(payload)
         assert result.returncode == 0, f"stderr: {result.stderr}"
 
@@ -111,9 +101,7 @@ class TestGuardVerdictFormatHook:
     )
     def test_known_judge_names_are_accepted(self, judge_name: str) -> None:
         """AC-2: All known judge identifiers are accepted."""
-        payload = _make_payload(
-            f"uv run devbench log-verdict {judge_name} E201-F1-S2-T1 pass"
-        )
+        payload = _make_payload(f"uv run devbench log-verdict {judge_name} E201-F1-S2-T1 pass")
         result = _run_hook(payload)
         assert result.returncode == 0, f"judge '{judge_name}' was incorrectly rejected: {result.stderr}"
 

@@ -1,0 +1,4 @@
+# Global code owners for devbench.
+# Every PR requires approval from at least one listed owner.
+# Documented at: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+* @matt-dresden-caylent @pabdavis

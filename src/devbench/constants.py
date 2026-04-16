@@ -190,3 +190,30 @@ VALID_TDD_PHASES: frozenset[str] = frozenset({"RED", "GREEN", "REFACTOR"})
 # A row is an epic row when its ID is exactly E<digits> with no hyphen suffix.
 # ---------------------------------------------------------------------------
 EPIC_ID_RE = re.compile(r"^E\d+$")
+
+# ---------------------------------------------------------------------------
+# Operational parameter defaults
+# ---------------------------------------------------------------------------
+DEFAULT_MAX_RETRY_ATTEMPTS: int = 10
+DEFAULT_GITHUB_CHECK_TIMEOUT_SECONDS: int = 600
+DEFAULT_STOP_HOOK_MAX_BLOCKS: int = 5
+DEFAULT_STOP_HOOK_WINDOW_SECONDS: int = 180
+DEFAULT_STOP_HOOK_STALE_TASK_MINUTES: int = 120
+DEFAULT_TOKEN_COST_PER_M_INPUT: float = 15.0
+DEFAULT_TOKEN_COST_PER_M_OUTPUT: float = 75.0
+DEFAULT_TOKEN_COST_INPUT_RATIO: float = 0.80
+
+# Timeout defaults (seconds)
+DEFAULT_GH_API_TIMEOUT: int = 30
+DEFAULT_TEST_TIMEOUT: int = 300
+DEFAULT_SECURITY_FETCH_TIMEOUT: int = 120
+DEFAULT_LLM_TIMEOUT: int = 300
+DEFAULT_COMMAND_TIMEOUT: int = 120
+DEFAULT_ORCHESTRATOR_POLL_INTERVAL: int = 10
+
+# Threshold / limit defaults
+DEFAULT_ALERT_SUMMARY_LIMIT: int = 10
+DEFAULT_OUTPUT_TRUNCATION_LIMIT: int = 2000
+DEFAULT_LLM_EVIDENCE_TRUNCATION: int = 15000
+DEFAULT_LLM_FILE_CONTEXT_LIMIT: int = 5
+DEFAULT_LLM_FILE_PREVIEW_CHARS: int = 3000

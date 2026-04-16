@@ -24,7 +24,7 @@ YAML schema::
         merge_strategy: squash           # optional — overrides top-level merge_strategy
 
     merge_strategy: squash               # optional — default merge strategy for all repos
-    max_retries: <integer>               # optional — max retry attempts
+    max_executor_retries: <integer>      # optional — max executor retries per work unit on judge failure
     use_bedrock: false                   # optional — route LLM calls via AWS Bedrock
     bedrock_region: <aws-region-string>  # optional — AWS region for Bedrock (env var override applied by config.py)
     judge_model: <model-id>              # optional — model for judge agents (env var override applied by config.py)
@@ -70,6 +70,15 @@ from pathlib import Path
 
 import jsonschema
 import yaml
+
+from devbench.constants import (
+    DEFAULT_STOP_HOOK_MAX_BLOCKS,
+    DEFAULT_STOP_HOOK_STALE_TASK_MINUTES,
+    DEFAULT_STOP_HOOK_WINDOW_SECONDS,
+    DEFAULT_TOKEN_COST_INPUT_RATIO,
+    DEFAULT_TOKEN_COST_PER_M_INPUT,
+    DEFAULT_TOKEN_COST_PER_M_OUTPUT,
+)
 
 # Relative path from WORKSPACE_ROOT to the default config file location.
 DEFAULT_CONFIG_SUBPATH: str = "backlog/config/devbench.yaml"
@@ -155,9 +164,12 @@ class GitOpsConfig:
     update_submodule: bool = False
     single_branch: str | None = None
     defer_pr: bool = False
-    token_cost_per_million_input: float = 15.0
-    token_cost_per_million_output: float = 75.0
-    token_cost_input_ratio: float = 0.80
+    token_cost_per_million_input: float = DEFAULT_TOKEN_COST_PER_M_INPUT
+    token_cost_per_million_output: float = DEFAULT_TOKEN_COST_PER_M_OUTPUT
+    token_cost_input_ratio: float = DEFAULT_TOKEN_COST_INPUT_RATIO
+    stop_hook_max_blocks: int = DEFAULT_STOP_HOOK_MAX_BLOCKS
+    stop_hook_window_seconds: int = DEFAULT_STOP_HOOK_WINDOW_SECONDS
+    stop_hook_stale_task_minutes: int = DEFAULT_STOP_HOOK_STALE_TASK_MINUTES
 
 
 @dataclass
@@ -200,7 +212,8 @@ class RuntimeConfig:
         use_bedrock: Whether to route LLM calls through AWS Bedrock.
         bedrock_region: AWS region for Bedrock API calls.
         merge_strategy: Default PR merge strategy for all repos.
-        max_retries: Maximum number of retry attempts.
+        max_executor_retries: Maximum executor retry attempts per work unit
+            when judge reviews fail.
     """
 
     repos: dict[str, RepoConfig] = field(default_factory=dict)
@@ -213,7 +226,7 @@ class RuntimeConfig:
     use_bedrock: bool = False
     bedrock_region: str | None = None
     merge_strategy: str | None = None
-    max_retries: int | None = None
+    max_executor_retries: int | None = None
 
 
 def resolve_config_path(
@@ -395,9 +408,24 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         update_submodule=bool(git_ops_raw.get("update_submodule", False)),
         single_branch=single_branch_raw,
         defer_pr=defer_pr,
-        token_cost_per_million_input=float(git_ops_raw.get("token_cost_per_million_input", 15.0)),
-        token_cost_per_million_output=float(git_ops_raw.get("token_cost_per_million_output", 75.0)),
-        token_cost_input_ratio=float(git_ops_raw.get("token_cost_input_ratio", 0.80)),
+        token_cost_per_million_input=float(
+            git_ops_raw.get("token_cost_per_million_input", DEFAULT_TOKEN_COST_PER_M_INPUT),
+        ),
+        token_cost_per_million_output=float(
+            git_ops_raw.get("token_cost_per_million_output", DEFAULT_TOKEN_COST_PER_M_OUTPUT),
+        ),
+        token_cost_input_ratio=float(
+            git_ops_raw.get("token_cost_input_ratio", DEFAULT_TOKEN_COST_INPUT_RATIO),
+        ),
+        stop_hook_max_blocks=int(
+            git_ops_raw.get("stop_hook_max_blocks", DEFAULT_STOP_HOOK_MAX_BLOCKS),
+        ),
+        stop_hook_window_seconds=int(
+            git_ops_raw.get("stop_hook_window_seconds", DEFAULT_STOP_HOOK_WINDOW_SECONDS),
+        ),
+        stop_hook_stale_task_minutes=int(
+            git_ops_raw.get("stop_hook_stale_task_minutes", DEFAULT_STOP_HOOK_STALE_TASK_MINUTES),
+        ),
     )
 
     return RuntimeConfig(
@@ -411,7 +439,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         use_bedrock=bool(raw.get("use_bedrock", False)),
         bedrock_region=raw.get("bedrock_region") or None,
         merge_strategy=raw.get("merge_strategy") or None,
-        max_retries=raw.get("max_retries") or None,
+        max_executor_retries=raw.get("max_executor_retries") or None,
     )
 
 

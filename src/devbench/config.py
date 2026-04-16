@@ -25,9 +25,59 @@ from devbench.config_loader import (
     load_runtime_config,
     resolve_config_path,
 )
-from devbench.constants import BACKLOG_SUBDIR
+from devbench.constants import (
+    BACKLOG_SUBDIR,
+    DEFAULT_ALERT_SUMMARY_LIMIT,
+    DEFAULT_COMMAND_TIMEOUT,
+    DEFAULT_GH_API_TIMEOUT,
+    DEFAULT_GITHUB_CHECK_TIMEOUT_SECONDS,
+    DEFAULT_LLM_EVIDENCE_TRUNCATION,
+    DEFAULT_LLM_FILE_CONTEXT_LIMIT,
+    DEFAULT_LLM_FILE_PREVIEW_CHARS,
+    DEFAULT_LLM_TIMEOUT,
+    DEFAULT_MAX_RETRY_ATTEMPTS,
+    DEFAULT_ORCHESTRATOR_POLL_INTERVAL,
+    DEFAULT_OUTPUT_TRUNCATION_LIMIT,
+    DEFAULT_SECURITY_FETCH_TIMEOUT,
+    DEFAULT_STOP_HOOK_MAX_BLOCKS,
+    DEFAULT_STOP_HOOK_STALE_TASK_MINUTES,
+    DEFAULT_STOP_HOOK_WINDOW_SECONDS,
+    DEFAULT_TEST_TIMEOUT,
+    DEFAULT_TOKEN_COST_INPUT_RATIO,
+    DEFAULT_TOKEN_COST_PER_M_INPUT,
+    DEFAULT_TOKEN_COST_PER_M_OUTPUT,
+)
 
 _log = logging.getLogger("devbench.config")
+
+
+def _resolve_int(env_var: str, yaml_value: int | None, default: int) -> int:
+    """Resolve an integer config value with explicit precedence.
+
+    Precedence: environment variable > YAML value > default constant.
+    """
+    env_val = os.environ.get(env_var)
+    if env_val is not None:
+        return int(env_val)
+    if yaml_value is not None:
+        return yaml_value
+    return default
+
+
+def _resolve_float(env_var: str | None, yaml_value: float | None, default: float) -> float:
+    """Resolve a float config value with explicit precedence.
+
+    Precedence: environment variable > YAML value > default constant.
+    When *env_var* is ``None``, skip env var lookup (YAML-only field).
+    """
+    if env_var is not None:
+        env_val = os.environ.get(env_var)
+        if env_val is not None:
+            return float(env_val)
+    if yaml_value is not None:
+        return yaml_value
+    return default
+
 
 # ---------------------------------------------------------------------------
 # Repository allow-list
@@ -92,8 +142,12 @@ BACKLOG_INDEX: Path = WORKSPACE_ROOT / "BACKLOG.md"
 # ---------------------------------------------------------------------------
 # Operational parameters
 # ---------------------------------------------------------------------------
-MAX_RETRY_ATTEMPTS: int = int(os.environ.get("JUDGE_MAX_RETRIES", "10"))
-GITHUB_CHECK_TIMEOUT_SECONDS: int = int(os.environ.get("JUDGE_GH_TIMEOUT", "600"))
+MAX_RETRY_ATTEMPTS: int = _resolve_int(
+    "JUDGE_MAX_RETRIES", RUNTIME_CONFIG.max_executor_retries, DEFAULT_MAX_RETRY_ATTEMPTS
+)
+GITHUB_CHECK_TIMEOUT_SECONDS: int = _resolve_int(
+    "JUDGE_GH_TIMEOUT", RUNTIME_CONFIG.timeouts.github_check, DEFAULT_GITHUB_CHECK_TIMEOUT_SECONDS
+)
 _claude_model = os.environ.get("JUDGE_CLAUDE_MODEL", "")
 if not _claude_model:
     raise RuntimeError(
@@ -128,38 +182,71 @@ except ValueError:
 UPDATE_SUBMODULE: bool = RUNTIME_CONFIG.git_ops.update_submodule
 SINGLE_BRANCH: str | None = RUNTIME_CONFIG.git_ops.single_branch
 DEFER_PR: bool = RUNTIME_CONFIG.git_ops.defer_pr
-TOKEN_COST_PER_M_INPUT: float = RUNTIME_CONFIG.git_ops.token_cost_per_million_input
-TOKEN_COST_PER_M_OUTPUT: float = RUNTIME_CONFIG.git_ops.token_cost_per_million_output
-TOKEN_COST_INPUT_RATIO: float = RUNTIME_CONFIG.git_ops.token_cost_input_ratio
+TOKEN_COST_PER_M_INPUT: float = _resolve_float(
+    None, RUNTIME_CONFIG.git_ops.token_cost_per_million_input, DEFAULT_TOKEN_COST_PER_M_INPUT
+)
+TOKEN_COST_PER_M_OUTPUT: float = _resolve_float(
+    None, RUNTIME_CONFIG.git_ops.token_cost_per_million_output, DEFAULT_TOKEN_COST_PER_M_OUTPUT
+)
+TOKEN_COST_INPUT_RATIO: float = _resolve_float(
+    None, RUNTIME_CONFIG.git_ops.token_cost_input_ratio, DEFAULT_TOKEN_COST_INPUT_RATIO
+)
+STOP_HOOK_MAX_BLOCKS: int = _resolve_int(
+    "JUDGE_STOP_MAX_BLOCKS", RUNTIME_CONFIG.git_ops.stop_hook_max_blocks, DEFAULT_STOP_HOOK_MAX_BLOCKS
+)
+STOP_HOOK_WINDOW_SECONDS: int = _resolve_int(
+    "JUDGE_STOP_WINDOW_SECONDS", RUNTIME_CONFIG.git_ops.stop_hook_window_seconds, DEFAULT_STOP_HOOK_WINDOW_SECONDS
+)
+STOP_HOOK_STALE_TASK_MINUTES: int = _resolve_int(
+    "JUDGE_STOP_STALE_MINUTES",
+    RUNTIME_CONFIG.git_ops.stop_hook_stale_task_minutes,
+    DEFAULT_STOP_HOOK_STALE_TASK_MINUTES,
+)
 USE_BEDROCK: bool = os.environ.get("JUDGE_USE_BEDROCK", "").lower() in ("1", "true", "yes")
 BEDROCK_REGION: str = os.environ.get("JUDGE_BEDROCK_REGION", os.environ.get("AWS_REGION", "us-east-1"))
 
 # ---------------------------------------------------------------------------
 # Timeouts — all values in seconds
 # ---------------------------------------------------------------------------
-GH_API_TIMEOUT: int = int(os.environ.get("JUDGE_GH_API_TIMEOUT", "30"))
-TEST_TIMEOUT: int = int(os.environ.get("JUDGE_TEST_TIMEOUT", "300"))
-SECURITY_FETCH_TIMEOUT: int = int(os.environ.get("JUDGE_SECURITY_FETCH_TIMEOUT", "120"))
-LLM_TIMEOUT: int = int(os.environ.get("JUDGE_LLM_TIMEOUT", "300"))
-COMMAND_TIMEOUT: int = int(os.environ.get("JUDGE_COMMAND_TIMEOUT", "120"))
+GH_API_TIMEOUT: int = _resolve_int("JUDGE_GH_API_TIMEOUT", RUNTIME_CONFIG.timeouts.gh_api, DEFAULT_GH_API_TIMEOUT)
+TEST_TIMEOUT: int = _resolve_int("JUDGE_TEST_TIMEOUT", RUNTIME_CONFIG.timeouts.test, DEFAULT_TEST_TIMEOUT)
+SECURITY_FETCH_TIMEOUT: int = _resolve_int(
+    "JUDGE_SECURITY_FETCH_TIMEOUT", RUNTIME_CONFIG.timeouts.security_fetch, DEFAULT_SECURITY_FETCH_TIMEOUT
+)
+LLM_TIMEOUT: int = _resolve_int("JUDGE_LLM_TIMEOUT", RUNTIME_CONFIG.timeouts.llm, DEFAULT_LLM_TIMEOUT)
+COMMAND_TIMEOUT: int = _resolve_int("JUDGE_COMMAND_TIMEOUT", RUNTIME_CONFIG.timeouts.command, DEFAULT_COMMAND_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # Thresholds and limits
 # ---------------------------------------------------------------------------
-ALERT_SUMMARY_LIMIT: int = int(os.environ.get("JUDGE_ALERT_SUMMARY_LIMIT", "10"))
-OUTPUT_TRUNCATION_LIMIT: int = int(os.environ.get("JUDGE_OUTPUT_TRUNCATION", "2000"))
-LLM_EVIDENCE_TRUNCATION: int = int(os.environ.get("JUDGE_LLM_EVIDENCE_TRUNCATION", "15000"))
+ALERT_SUMMARY_LIMIT: int = _resolve_int(
+    "JUDGE_ALERT_SUMMARY_LIMIT", RUNTIME_CONFIG.limits.alert_summary, DEFAULT_ALERT_SUMMARY_LIMIT
+)
+OUTPUT_TRUNCATION_LIMIT: int = _resolve_int(
+    "JUDGE_OUTPUT_TRUNCATION", RUNTIME_CONFIG.limits.output_truncation, DEFAULT_OUTPUT_TRUNCATION_LIMIT
+)
+LLM_EVIDENCE_TRUNCATION: int = _resolve_int(
+    "JUDGE_LLM_EVIDENCE_TRUNCATION", RUNTIME_CONFIG.limits.llm_evidence_truncation, DEFAULT_LLM_EVIDENCE_TRUNCATION
+)
 
 # ---------------------------------------------------------------------------
 # LLM context limits
 # ---------------------------------------------------------------------------
-LLM_FILE_CONTEXT_LIMIT: int = int(os.environ.get("JUDGE_LLM_FILE_CONTEXT_LIMIT", "5"))
-LLM_FILE_PREVIEW_CHARS: int = int(os.environ.get("JUDGE_LLM_FILE_PREVIEW_CHARS", "3000"))
+LLM_FILE_CONTEXT_LIMIT: int = _resolve_int(
+    "JUDGE_LLM_FILE_CONTEXT_LIMIT", RUNTIME_CONFIG.limits.llm_file_context, DEFAULT_LLM_FILE_CONTEXT_LIMIT
+)
+LLM_FILE_PREVIEW_CHARS: int = _resolve_int(
+    "JUDGE_LLM_FILE_PREVIEW_CHARS", RUNTIME_CONFIG.limits.llm_file_preview_chars, DEFAULT_LLM_FILE_PREVIEW_CHARS
+)
 
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
-ORCHESTRATOR_POLL_INTERVAL: int = int(os.environ.get("JUDGE_ORCHESTRATOR_POLL_INTERVAL", "10"))
+ORCHESTRATOR_POLL_INTERVAL: int = _resolve_int(
+    "JUDGE_ORCHESTRATOR_POLL_INTERVAL",
+    RUNTIME_CONFIG.timeouts.orchestrator_poll_interval,
+    DEFAULT_ORCHESTRATOR_POLL_INTERVAL,
+)
 
 # ---------------------------------------------------------------------------
 # Credentials

@@ -672,14 +672,14 @@ class TestRuntimeConfigPopulation:
               org/repo:
                 default_branch: main
             merge_strategy: merge
-            max_retries: 5
+            max_executor_retries: 5
             use_bedrock: true
             bedrock_region: us-west-2
             """,
         )
         result = load_runtime_config(cfg, {})
         assert result.merge_strategy == "merge", f"Expected merge_strategy='merge', got {result.merge_strategy!r}"
-        assert result.max_retries == 5, f"Expected max_retries=5, got {result.max_retries!r}"
+        assert result.max_executor_retries == 5, f"Expected max_executor_retries=5, got {result.max_executor_retries!r}"
         assert result.use_bedrock is True, f"Expected use_bedrock=True, got {result.use_bedrock!r}"
         assert result.bedrock_region == "us-west-2", (
             f"Expected bedrock_region='us-west-2', got {result.bedrock_region!r}"
@@ -703,8 +703,8 @@ class TestRuntimeConfigPopulation:
         assert result.merge_strategy is None, (
             f"Expected merge_strategy=None when absent from YAML, got {result.merge_strategy!r}"
         )
-        assert result.max_retries is None, (
-            f"Expected max_retries=None when absent from YAML, got {result.max_retries!r}"
+        assert result.max_executor_retries is None, (
+            f"Expected max_executor_retries=None when absent from YAML, got {result.max_executor_retries!r}"
         )
         assert result.use_bedrock is False, (
             f"Expected use_bedrock=False (explicit bool default), got {result.use_bedrock!r}"
@@ -1127,3 +1127,78 @@ class TestGitOpsConfig:
         cfg.write_text("- item1\n- item2\n", encoding="utf-8")
         with pytest.raises(ValueError, match="must be a YAML mapping"):
             load_runtime_config(cfg, {})
+
+    def test_stop_hook_max_blocks_defaults(self, tmp_path: Path) -> None:
+        """stop_hook_max_blocks defaults to DEFAULT_STOP_HOOK_MAX_BLOCKS when not in YAML."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        from devbench.constants import DEFAULT_STOP_HOOK_MAX_BLOCKS
+
+        assert result.git_ops.stop_hook_max_blocks == DEFAULT_STOP_HOOK_MAX_BLOCKS
+
+    def test_stop_hook_max_blocks_from_yaml(self, tmp_path: Path) -> None:
+        """stop_hook_max_blocks is read from YAML git_ops section."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            git_ops:
+              stop_hook_max_blocks: 3
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.git_ops.stop_hook_max_blocks == 3
+
+    def test_stop_hook_window_seconds_from_yaml(self, tmp_path: Path) -> None:
+        """stop_hook_window_seconds is read from YAML git_ops section."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            git_ops:
+              stop_hook_window_seconds: 60
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.git_ops.stop_hook_window_seconds == 60
+
+    def test_stop_hook_stale_task_minutes_defaults(self, tmp_path: Path) -> None:
+        """stop_hook_stale_task_minutes defaults to DEFAULT_STOP_HOOK_STALE_TASK_MINUTES when not in YAML."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        from devbench.constants import DEFAULT_STOP_HOOK_STALE_TASK_MINUTES
+
+        assert result.git_ops.stop_hook_stale_task_minutes == DEFAULT_STOP_HOOK_STALE_TASK_MINUTES
+
+    def test_stop_hook_stale_task_minutes_from_yaml(self, tmp_path: Path) -> None:
+        """stop_hook_stale_task_minutes is read from YAML git_ops section."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            git_ops:
+              stop_hook_stale_task_minutes: 30
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.git_ops.stop_hook_stale_task_minutes == 30

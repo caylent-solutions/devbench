@@ -316,6 +316,21 @@ git_ops:
 
 Token data is read from `hook-logs.jsonl` in the workspace root (written by Claude Code hooks). Cost is a blended estimate based on the input/output ratio -- actual billing depends on your account terms.
 
+### Stop hook (circuit breaker)
+
+The orchestrator registers a Claude Code Stop hook (`continue-orchestration.sh`) that prevents the agent from stopping mid-loop when a task is in-progress. After context compaction, Claude may attempt to stop; the hook blocks the stop and injects the current task ID, file path, last action, and a specific next step so the agent can resume.
+
+A circuit breaker prevents infinite stop-block loops: after `stop_hook_max_blocks` blocks within `stop_hook_window_seconds`, the hook allows the stop and logs a `[CIRCUIT_BREAKER]` comment to the work unit.
+
+```yaml
+git_ops:
+  stop_hook_max_blocks: 5              # default: 5
+  stop_hook_window_seconds: 180        # default: 180
+  stop_hook_stale_task_minutes: 120    # default: 120
+```
+
+Environment variable overrides: `JUDGE_STOP_MAX_BLOCKS`, `JUDGE_STOP_WINDOW_SECONDS`, `JUDGE_STOP_STALE_MINUTES`.
+
 ## Workspace Setup
 
 ### Recommended: keep the backlog in its own git repo
@@ -409,7 +424,7 @@ Restarting picks up where you left off — `done` units are skipped, and `in-pro
 Run `devbench validate-backlog` to check for missing files, status mismatches, orphaned files, invalid dependency references, and Status Summary table count mismatches. Fix reported errors before running the orchestrator — it runs this check automatically at startup and aborts if any errors are found.
 
 ### Judge keeps failing the same unit
-After `JUDGE_MAX_RETRIES` failures (default: 10), the unit is marked `blocked`. Check the Comments section of the work unit file for the feedback trail.
+After `max_executor_retries` failures (default: 10, configurable in `devbench.yaml` or via `JUDGE_MAX_RETRIES` env var), the unit is marked `blocked`. Check the Comments section of the work unit file for the feedback trail.
 
 ### `mark-done` fails with "not all required judges passed"
 The done-gate check found that not all four review judges (`code_review`, `test_review`, `doc_review`, `changes_manifest`) have a `[REVIEW_PASS]` entry after the most recent `[REVIEW_REJECTED]` line. Check the Comments section of the work unit file for the current judge verdicts, then re-run any failing agents via the orchestrate skill.

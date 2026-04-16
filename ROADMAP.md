@@ -63,7 +63,7 @@ Extends `devbench.yaml` to cover all non-secret configuration: model selection (
 
 | ID | Title | Status |
 |----|-------|--------|
-| E210-F1-S1-T1 | Add judge_model, executor_model, merge_strategy, max_retries, all timeout values to YAML schema and config_loader.py | in-queue |
+| E210-F1-S1-T1 | Add judge_model, executor_model, merge_strategy, max_executor_retries, all timeout values to YAML schema and config_loader.py | in-queue |
 
 ---
 

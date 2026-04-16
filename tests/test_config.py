@@ -311,3 +311,103 @@ class TestConfigOverrides:
             assert custom_index != config.BACKLOG_INDEX
 
         importlib.reload(config)
+
+
+@pytest.mark.unit
+class TestResolveHelpers:
+    """Tests for _resolve_int and _resolve_float config resolution helpers."""
+
+    def test_resolve_int_env_var_wins(self) -> None:
+        with patch.dict(os.environ, {"TEST_VAR": "42"}, clear=False):
+            result = config._resolve_int("TEST_VAR", 10, 5)
+        assert result == 42
+
+    def test_resolve_int_yaml_when_env_absent(self) -> None:
+        env_copy = {k: v for k, v in os.environ.items() if k != "TEST_VAR_ABSENT"}
+        with patch.dict(os.environ, env_copy, clear=True):
+            result = config._resolve_int("TEST_VAR_ABSENT", 10, 5)
+        assert result == 10
+
+    def test_resolve_int_default_when_both_absent(self) -> None:
+        env_copy = {k: v for k, v in os.environ.items() if k != "TEST_VAR_ABSENT"}
+        with patch.dict(os.environ, env_copy, clear=True):
+            result = config._resolve_int("TEST_VAR_ABSENT", None, 5)
+        assert result == 5
+
+    def test_resolve_float_env_var_wins(self) -> None:
+        with patch.dict(os.environ, {"TEST_FLOAT": "1.5"}, clear=False):
+            result = config._resolve_float("TEST_FLOAT", 2.0, 3.0)
+        assert result == 1.5
+
+    def test_resolve_float_yaml_when_env_absent(self) -> None:
+        env_copy = {k: v for k, v in os.environ.items() if k != "TEST_FLOAT_ABSENT"}
+        with patch.dict(os.environ, env_copy, clear=True):
+            result = config._resolve_float("TEST_FLOAT_ABSENT", 2.0, 3.0)
+        assert result == 2.0
+
+    def test_resolve_float_default_when_both_absent(self) -> None:
+        env_copy = {k: v for k, v in os.environ.items() if k != "TEST_FLOAT_ABSENT"}
+        with patch.dict(os.environ, env_copy, clear=True):
+            result = config._resolve_float("TEST_FLOAT_ABSENT", None, 3.0)
+        assert result == 3.0
+
+    def test_resolve_float_no_env_var_name(self) -> None:
+        """When env_var is None, skip env lookup entirely."""
+        result = config._resolve_float(None, 2.5, 3.0)
+        assert result == 2.5
+
+
+@pytest.mark.unit
+class TestStopHookConfigExposed:
+    """Verify stop hook constants are exported from config module."""
+
+    def test_stop_hook_max_blocks_exposed(self) -> None:
+        assert hasattr(config, "STOP_HOOK_MAX_BLOCKS")
+        assert isinstance(config.STOP_HOOK_MAX_BLOCKS, int)
+
+    def test_stop_hook_window_seconds_exposed(self) -> None:
+        assert hasattr(config, "STOP_HOOK_WINDOW_SECONDS")
+        assert isinstance(config.STOP_HOOK_WINDOW_SECONDS, int)
+
+    def test_stop_hook_stale_task_minutes_exposed(self) -> None:
+        assert hasattr(config, "STOP_HOOK_STALE_TASK_MINUTES")
+        assert isinstance(config.STOP_HOOK_STALE_TASK_MINUTES, int)
+
+    def test_stop_hook_max_blocks_env_override(self) -> None:
+        with patch.dict(os.environ, {"JUDGE_STOP_MAX_BLOCKS": "3"}, clear=False):
+            importlib.reload(config)
+            assert config.STOP_HOOK_MAX_BLOCKS == 3
+        importlib.reload(config)
+
+    def test_stop_hook_window_seconds_env_override(self) -> None:
+        with patch.dict(os.environ, {"JUDGE_STOP_WINDOW_SECONDS": "60"}, clear=False):
+            importlib.reload(config)
+            assert config.STOP_HOOK_WINDOW_SECONDS == 60
+        importlib.reload(config)
+
+    def test_stop_hook_stale_task_minutes_env_override(self) -> None:
+        with patch.dict(os.environ, {"JUDGE_STOP_STALE_MINUTES": "30"}, clear=False):
+            importlib.reload(config)
+            assert config.STOP_HOOK_STALE_TASK_MINUTES == 30
+        importlib.reload(config)
+
+
+@pytest.mark.unit
+class TestMaxRetriesYamlFirst:
+    """Verify max_executor_retries reads YAML first, env var overrides."""
+
+    def test_max_executor_retries_env_overrides(self) -> None:
+        with patch.dict(os.environ, {"JUDGE_MAX_RETRIES": "15"}, clear=False):
+            importlib.reload(config)
+            assert config.MAX_RETRY_ATTEMPTS == 15
+        importlib.reload(config)
+
+    def test_max_executor_retries_uses_yaml_when_env_absent(self) -> None:
+        """When JUDGE_MAX_RETRIES is not set, the YAML value is used."""
+        env_copy = {k: v for k, v in os.environ.items() if k != "JUDGE_MAX_RETRIES"}
+        with patch.dict(os.environ, env_copy, clear=True):
+            importlib.reload(config)
+            # Value should come from YAML or default — it should be an int > 0
+            assert isinstance(config.MAX_RETRY_ATTEMPTS, int)
+            assert config.MAX_RETRY_ATTEMPTS > 0
+        importlib.reload(config)

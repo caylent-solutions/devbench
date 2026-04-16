@@ -40,7 +40,7 @@ Process the backlog using the steps below, repeating until all work units are do
 6. On REVIEW_FAIL:
    - Retry `devbench:executor` with the unit ID (executor reads prior Comments for context).
    - Return to step 5 — invoke `review-supervisor` again. Do NOT invoke security-reviewer here.
-   - After `max_retries` consecutive failures, log a blocker comment and return to step 2.
+   - After `max_executor_retries` consecutive failures, log a blocker comment and return to step 2.
 
 7. On review team REVIEW_PASS:
    - Invoke `devbench:security-reviewer` with the unit ID.

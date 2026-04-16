@@ -39,10 +39,10 @@
       "enum": ["merge", "squash", "rebase"],
       "description": "Default PR merge strategy for all repos."
     },
-    "max_retries": {
+    "max_executor_retries": {
       "type": "integer",
       "minimum": 1,
-      "description": "Maximum number of retry attempts."
+      "description": "Maximum number of executor retry attempts per work unit when judge reviews fail. Default: 10."
     },
     "use_bedrock": {
       "type": "boolean",
@@ -147,6 +147,21 @@
         "token_cost_input_ratio": {
           "type": "number",
           "description": "Estimated fraction of tokens that are input (0.0-1.0). Used for blended cost calculation. Default: 0.80."
+        },
+        "stop_hook_max_blocks": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum consecutive stop-hook blocks before circuit breaker trips and allows stop. Default: 5."
+        },
+        "stop_hook_window_seconds": {
+          "type": "integer",
+          "minimum": 10,
+          "description": "Time window in seconds for counting stop-hook blocks. Counter resets after this period. Default: 180."
+        },
+        "stop_hook_stale_task_minutes": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Minutes before an in-progress task is considered stale. Hook warns instead of blindly blocking. Default: 120."
         }
       }
     },

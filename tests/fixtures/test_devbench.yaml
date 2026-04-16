@@ -7,7 +7,7 @@ repos:
     default_branch: main2
 
 merge_strategy: squash
-max_retries: 3
+max_executor_retries: 3
 use_bedrock: false
 bedrock_region: us-east-1
 judge_model: test-judge-model

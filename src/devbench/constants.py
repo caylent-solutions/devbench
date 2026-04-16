@@ -271,6 +271,28 @@ SECURITY_FEATURE_ENABLED: str = "enabled"
 DEFAULT_REPORT_WATCH_INTERVAL: int = 3
 
 # ---------------------------------------------------------------------------
+# Report window detection
+# ---------------------------------------------------------------------------
+# Gap (in minutes) between consecutive orchestration events that signals
+# an orchestrator restart, used to identify the "current run" boundary
+# in `devbench report`.
+DEFAULT_CURRENT_RUN_GAP_MINUTES: int = 10
+
+# ---------------------------------------------------------------------------
+# Report table render widths (characters)
+# ---------------------------------------------------------------------------
+REPORT_METRIC_COLUMN_WIDTH: int = 60
+REPORT_VALUE_COLUMN_WIDTH: int = 16
+
+# ---------------------------------------------------------------------------
+# Time unit conversions
+# ---------------------------------------------------------------------------
+MS_PER_SECOND: int = 1000
+SECONDS_PER_MINUTE: int = 60
+SECONDS_PER_HOUR: int = 3600
+PERCENT_MULTIPLIER: int = 100
+
+# ---------------------------------------------------------------------------
 # Backlog index column count
 # The BACKLOG.md table has 7 data columns. Splitting a pipe-delimited row
 # by "|" produces 9 cells (empty leading cell + 7 data + empty trailing cell).

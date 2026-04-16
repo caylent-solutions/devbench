@@ -78,6 +78,7 @@ What devbench does today, grouped by theme:
 
 ### Reporting & observability
 - `devbench report` shows tasks completed, velocity, tokens consumed, estimated cost, and projection to completion.
+- Renders **two windows by default**: an **All-time** table (full orchestrator log) and a **Current run** table (most recent contiguous block of orchestration events; boundary detected as a >10-minute gap between consecutive `Set X to ...` log lines, configurable via `DEFAULT_CURRENT_RUN_GAP_MINUTES`). Pass `--since <ISO-8601>` for a single custom-window view. Display timestamps render in the timezone configured by `report.display_timezone` (or `JUDGE_REPORT_TIMEZONE` env var); when neither is set, the host's system local timezone is used. Internal computation stays in UTC. This matters when running inside a devcontainer or VM whose system TZ differs from your actual location.
 - `--watch N` flag refreshes the report every N seconds (replaces the external `watch` command pattern).
 - Token cost configurable per-model — see [model-pricing.md](model-pricing.md).
 - Rollup metrics: stories / features / epics auto-rolled to done.
@@ -458,6 +459,7 @@ report:
   token_cost_per_million_input: 5.0    # Opus 4.7 default
   token_cost_per_million_output: 25.0
   token_cost_input_ratio: 0.80
+  display_timezone: America/Denver     # IANA name; defaults to system local TZ
 
 # Stop hook circuit breaker
 stop_hook:
@@ -558,9 +560,14 @@ Pulled from the in-queue items in [ROADMAP.md](../ROADMAP.md) and the architectu
 
 ## 11. Known issues to address separately
 
-Items found during the documentation audit and queued for separate follow-up work. The earlier round of fixes in this PR closed out the `list-agents` reference, the non-standard agent prompt headers, and the stale token cost defaults; the item below remains open:
+All items the documentation audit raised have been resolved in this PR:
 
-- **Cost report's `tasks_in_session` semantics are confusing.** Without `--since`, the report covers the entire log history, which is rarely what "session" means to a user. Either change the default behavior to use the most recent orchestrator restart as the session start, or rename the field.
+- ✅ `list-agents` CLI reference in `review-supervisor.md` — removed (bash fallback is the documented method).
+- ✅ Non-standard `--- SECTION ---` agent prompt headers — converted to standard `##`.
+- ✅ Stale Opus 4.1 token cost defaults — updated to current Opus 4.7 rates.
+- ✅ Confusing `tasks_in_session` semantics — `devbench report` now renders **two** windows by default: All-time (full log) and Current run (most recent contiguous block of orchestration events, boundary at a >10-minute gap). See [Hooks layer](#9-hooks-layer) and the [report capability](#2-capabilities) entry for usage.
+
+If you find a new issue, file it on the ROADMAP rather than this section.
 
 ---
 

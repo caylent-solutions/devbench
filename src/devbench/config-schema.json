@@ -208,6 +208,10 @@
         "token_cost_input_ratio": {
           "type": "number",
           "description": "Estimated fraction of tokens that are input (0.0-1.0). Used for blended cost calculation. Default: 0.80."
+        },
+        "display_timezone": {
+          "type": "string",
+          "description": "IANA timezone name (e.g. 'America/Denver', 'Europe/London') for displaying timestamps in `devbench report`. Defaults to the host system's local timezone. Useful when running inside a devcontainer or VM whose system TZ differs from your actual location. Override via JUDGE_REPORT_TIMEZONE env var."
         }
       }
     }

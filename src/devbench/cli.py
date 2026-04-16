@@ -941,7 +941,11 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
     "git-ops": (cmd_git_ops, 1, "Run git operations for a work unit: git-ops <id>"),
     "git-ops-finalize": (cmd_git_ops_finalize, 1, "Push single branch and create PR: git-ops-finalize <repo>"),
     "log": (cmd_log, 1, "Log a message: log <message>"),
-    "report": (cmd_report, 0, "Progress report: report [--watch N] [since-timestamp]"),
+    "report": (
+        cmd_report,
+        0,
+        "Progress report — renders All-time + Current run windows by default: report [--watch N] [since-timestamp]",
+    ),
     "start": (cmd_start, 0, "Run orchestrate skill via Agent SDK (non-interactive)"),
     # Plugin agent bridge commands — used by devbench plugin agents
     "read-unit": (cmd_read_unit, 1, "Work unit content + repo path as JSON: read-unit [--strip-comments] <id>"),

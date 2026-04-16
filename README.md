@@ -192,7 +192,7 @@ devbench <command> [args]
 
 `start` — run the orchestrate skill non-interactively via the Agent SDK. No arguments.
 
-`report [--watch N] [since-timestamp]` — print the progress report with velocity, token consumption, and cost estimates. With `--watch N`, refreshes every N seconds (Ctrl+C to exit). Optional `since-timestamp` (ISO-8601) limits to events after that time.
+`report [--watch N] [since-timestamp]` — print the progress report with velocity, token consumption, and cost estimates. By default renders **two** tables: an **All-time** window covering the full orchestrator log and a **Current run** window covering only the most recent contiguous block of orchestration events (boundary detected as a >10-minute gap between consecutive `Set X to ...` log lines). With `--watch N`, refreshes every N seconds (Ctrl+C to exit). Optional `since-timestamp` (ISO-8601) renders a single window starting at that timestamp instead of the dual layout.
 
 ## Make Targets
 
@@ -363,6 +363,17 @@ report:
 > Code defaults match Opus 4.7. If you run a different model (Sonnet, Haiku, or an older Opus generation), override the values above per the [model pricing doc](docs/model-pricing.md).
 
 Token data is read from `hook-logs.jsonl` in the workspace root (written by Claude Code hooks). Cost is a blended estimate based on the input/output ratio — actual billing depends on your account terms and active prompt caching.
+
+By default, `devbench report` renders **two** windows: an **All-time** table covering the entire orchestrator log, and a **Current run** table covering only the most recent contiguous block of orchestration events. The boundary between runs is detected as a gap of more than 10 minutes between consecutive `Set X to ...` log lines (a proxy for "the orchestrator was restarted here"). If no such gap exists in the log, the two tables show the same numbers. Pass `--since <ISO-8601>` to render a single window starting at a custom timestamp instead.
+
+**Display timezone.** Window-start timestamps in the report are rendered in your machine's local timezone (with TZ abbreviation); internal calculations stay in UTC. If you run devbench inside a devcontainer or VM whose system TZ differs from your actual location (e.g., the container is UTC but you're on EST), set the IANA zone name explicitly:
+
+```yaml
+report:
+  display_timezone: America/Denver   # any IANA zone name
+```
+
+Or override via env var: `JUDGE_REPORT_TIMEZONE=America/Denver`. An invalid name logs a warning and falls back to system local.
 
 ### Stop hook (circuit breaker)
 

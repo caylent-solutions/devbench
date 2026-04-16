@@ -174,11 +174,14 @@ class ReportConfig:
         token_cost_per_million_input: Cost per million input tokens in USD.
         token_cost_per_million_output: Cost per million output tokens in USD.
         token_cost_input_ratio: Estimated fraction of tokens that are input (0.0-1.0).
+        display_timezone: IANA timezone name for displaying report timestamps.
+            ``None`` means use the host's system local timezone.
     """
 
     token_cost_per_million_input: float = DEFAULT_TOKEN_COST_PER_M_INPUT
     token_cost_per_million_output: float = DEFAULT_TOKEN_COST_PER_M_OUTPUT
     token_cost_input_ratio: float = DEFAULT_TOKEN_COST_INPUT_RATIO
+    display_timezone: str | None = None
 
 
 @dataclass
@@ -450,6 +453,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         token_cost_input_ratio=float(
             report_raw.get("token_cost_input_ratio", DEFAULT_TOKEN_COST_INPUT_RATIO),
         ),
+        display_timezone=report_raw.get("display_timezone") or None,
     )
 
     # Populate StopHookConfig from YAML stop_hook block.

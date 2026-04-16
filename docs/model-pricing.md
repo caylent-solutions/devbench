@@ -138,6 +138,20 @@ DEFAULT_TOKEN_COST_INPUT_RATIO: float = 0.80
 
 These reflect current **Opus 4.7** pricing. If you run a different model — Sonnet, Haiku, or any older Opus generation — set the `report:` values explicitly in your `devbench.yaml` using the table above so `devbench report` produces accurate cost estimates for your model.
 
+### Other settings under `report:`
+
+The `report:` section also accepts a `display_timezone` field (IANA zone name) to control which timezone the report renders timestamps in:
+
+```yaml
+report:
+  token_cost_per_million_input: 5.0
+  token_cost_per_million_output: 25.0
+  token_cost_input_ratio: 0.80
+  display_timezone: America/Denver   # optional; defaults to system local TZ
+```
+
+When unset (or set to a name that isn't a valid IANA zone), the report falls back to the host's system local timezone. Override per-invocation via `JUDGE_REPORT_TIMEZONE=<zone>`. This setting is useful when running devbench inside a devcontainer or VM whose system clock is UTC but you want to read timestamps in your actual location's TZ.
+
 ---
 
 ## Long context, batch, and cache pricing

@@ -78,6 +78,21 @@ def _resolve_str(env_var: str, yaml_value: str | None, default: str) -> str:
     return default
 
 
+def _resolve_optional_str(env_var: str, yaml_value: str | None) -> str | None:
+    """Resolve an optional string config value with explicit precedence.
+
+    Returns ``None`` when neither the environment variable nor the YAML value is
+    set. Empty strings are treated as unset (so ``JUDGE_FOO=`` does not override).
+    Precedence: environment variable > YAML value > None.
+    """
+    env_val = os.environ.get(env_var)
+    if env_val:
+        return env_val
+    if yaml_value:
+        return yaml_value
+    return None
+
+
 def _resolve_float(env_var: str | None, yaml_value: float | None, default: float) -> float:
     """Resolve a float config value with explicit precedence.
 
@@ -204,6 +219,11 @@ TOKEN_COST_PER_M_OUTPUT: float = _resolve_float(
 )
 TOKEN_COST_INPUT_RATIO: float = _resolve_float(
     None, RUNTIME_CONFIG.report.token_cost_input_ratio, DEFAULT_TOKEN_COST_INPUT_RATIO
+)
+# IANA timezone name for displaying timestamps in `devbench report`.
+# None means "use the host's system local timezone." Resolution: env > YAML > None.
+REPORT_DISPLAY_TIMEZONE: str | None = _resolve_optional_str(
+    "JUDGE_REPORT_TIMEZONE", RUNTIME_CONFIG.report.display_timezone
 )
 STOP_HOOK_MAX_BLOCKS: int = _resolve_int(
     "JUDGE_STOP_MAX_BLOCKS", RUNTIME_CONFIG.stop_hook.max_blocks, DEFAULT_STOP_HOOK_MAX_BLOCKS

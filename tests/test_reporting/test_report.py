@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
+from devbench.backlog.work_unit import WorkUnitStatus, WorkUnitType
 from devbench.reporting.report import generate_report
 
 
@@ -201,6 +202,173 @@ class TestTokenCostReport:
             report = generate_report(log_path=log_file)
 
         assert "Override in devbench.yaml" in report
+
+
+class TestEpicsDoneReport:
+    """Test report with epics that are done (covers line 92/97: epics list comprehension)."""
+
+    def test_report_shows_epics_done_count(self, tmp_path: Path) -> None:
+        """When the backlog contains a done epic, the report displays its count."""
+        from devbench.backlog.work_unit import WorkUnit
+
+        done_epic = WorkUnit(
+            id="E0",
+            title="Epic Zero",
+            status=WorkUnitStatus.DONE,
+            unit_type=WorkUnitType.EPIC,
+            file_path=Path("backlog/E0.md"),
+            repo="git-repo",
+            dependencies=[],
+        )
+        done_task = WorkUnit(
+            id="E0-F1-S1-T1",
+            title="Task One",
+            status=WorkUnitStatus.DONE,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T1.md"),
+            repo="git-repo",
+            dependencies=[],
+        )
+
+        with patch("devbench.reporting.report.BacklogParser") as mock_cls:
+            mock_cls.return_value.parse_index.return_value = [done_epic, done_task]
+
+            log_file = tmp_path / "test.log"
+            log_file.write_text(
+                _make_log(
+                    [
+                        "2026-03-05T10:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                        "2026-03-05T10:05:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'",
+                    ]
+                )
+            )
+
+            report = generate_report(log_path=log_file)
+
+        assert "Epics auto-rolled to done" in report
+        # The value column should show "1"
+        assert "\u2502 Epics auto-rolled to done" in report
+
+
+class TestHookLogDurationMetrics:
+    """Test API processing time from hook-logs.jsonl (covers lines 61-63, 70-71)."""
+
+    def test_api_duration_accumulates_from_hook_log(self, tmp_path: Path) -> None:
+        """totalDurationMs values in hook-logs.jsonl are summed into API processing time."""
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    "2026-03-05T10:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                    "2026-03-05T10:05:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'",
+                ]
+            )
+        )
+        hook_log = tmp_path / "hook-logs.jsonl"
+        hook_log.write_text(
+            '{"timestamp":"2026-03-05T10:02:00Z","event":"PostToolUse","input":{"tool_response":{"totalTokens":10000,"totalDurationMs":60000}}}\n'
+            '{"timestamp":"2026-03-05T10:04:00Z","event":"PostToolUse","input":{"tool_response":{"totalTokens":20000,"totalDurationMs":120000}}}\n'
+        )
+
+        with patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
+            report = generate_report(log_path=log_file)
+
+        # 60000 + 120000 = 180000 ms = 180 s = 0.05 hours
+        assert "API processing time" in report
+
+    def test_hook_log_entry_before_since_is_excluded(self, tmp_path: Path) -> None:
+        """Entries with timestamp before session_start are filtered out (lines 60-61)."""
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    "2026-03-05T10:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                    "2026-03-05T10:05:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'",
+                ]
+            )
+        )
+        hook_log = tmp_path / "hook-logs.jsonl"
+        hook_log.write_text(
+            # This entry is before session_start, should be excluded
+            '{"timestamp":"2026-03-05T08:00:00Z","event":"PostToolUse","input":{"tool_response":{"totalTokens":99999,"totalDurationMs":999999}}}\n'
+            # This entry is within session, should be included
+            '{"timestamp":"2026-03-05T10:03:00Z","event":"PostToolUse","input":{"tool_response":{"totalTokens":10000,"totalDurationMs":60000}}}\n'
+        )
+
+        since = datetime(2026, 3, 5, 10, 0, 0, tzinfo=UTC)
+        with patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
+            report = generate_report(log_path=log_file, since=since)
+
+        # Only 10,000 tokens should be counted (the pre-session entry excluded)
+        assert "10,000" in report
+
+    def test_hook_log_skips_blank_lines(self, tmp_path: Path) -> None:
+        """Blank lines in hook-logs.jsonl are skipped (line 51)."""
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    "2026-03-05T10:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                    "2026-03-05T10:05:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'",
+                ]
+            )
+        )
+        hook_log = tmp_path / "hook-logs.jsonl"
+        hook_log.write_text(
+            '{"timestamp":"2026-03-05T10:03:00Z","event":"PostToolUse","input":{"tool_response":{"totalTokens":5000}}}\n'
+            "\n"
+            "   \n"
+            '{"timestamp":"2026-03-05T10:04:00Z","event":"PostToolUse","input":{"tool_response":{"totalTokens":3000}}}\n'
+        )
+
+        with patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
+            report = generate_report(log_path=log_file)
+
+        assert "8,000" in report
+
+    def test_hook_log_skips_invalid_json_lines(self, tmp_path: Path) -> None:
+        """Malformed JSON lines are silently skipped (lines 54-55)."""
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    "2026-03-05T10:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                    "2026-03-05T10:05:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'",
+                ]
+            )
+        )
+        hook_log = tmp_path / "hook-logs.jsonl"
+        hook_log.write_text(
+            "NOT VALID JSON\n"
+            '{"timestamp":"2026-03-05T10:03:00Z","event":"PostToolUse","input":{"tool_response":{"totalTokens":7000}}}\n'
+        )
+
+        with patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
+            report = generate_report(log_path=log_file)
+
+        assert "7,000" in report
+
+    def test_hook_log_invalid_timestamp_format_still_included(self, tmp_path: Path) -> None:
+        """Entries with unparseable timestamps are still processed (lines 62-63)."""
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    "2026-03-05T10:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                    "2026-03-05T10:05:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'",
+                ]
+            )
+        )
+        hook_log = tmp_path / "hook-logs.jsonl"
+        hook_log.write_text(
+            '{"timestamp":"not-a-date","event":"PostToolUse","input":{"tool_response":{"totalTokens":12000,"totalDurationMs":30000}}}\n'
+        )
+
+        with patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
+            report = generate_report(log_path=log_file)
+
+        # Even with invalid timestamp, the tokens should be counted (falls through ValueError)
+        assert "12,000" in report
 
 
 class TestBedrockConfig:

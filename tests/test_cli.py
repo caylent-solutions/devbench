@@ -2777,6 +2777,130 @@ class TestCmdReport:
         assert result == 0
         assert captured_kwargs["since"] == datetime(2025, 1, 15, 10, 30, 0, tzinfo=UTC)
 
+    def test_cmd_report_watch_zero_runs_once(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """cmd_report with watch_interval=0 runs once (one-shot mode)."""
+        with patch("devbench.reporting.report.generate_report", return_value="one-shot report"):
+            result = cli.cmd_report(watch_interval=0)
+
+        assert result == 0
+        assert "one-shot report" in capsys.readouterr().out
+
+    def test_cmd_report_watch_mode_interrupted(self) -> None:
+        """cmd_report with watch_interval > 0 loops until KeyboardInterrupt (lines 296-306)."""
+        call_count = 0
+
+        def fake_generate_report(**kwargs: object) -> str:
+            nonlocal call_count
+            call_count += 1
+            return f"report iteration {call_count}"
+
+        def fake_sleep(seconds: float) -> None:
+            raise KeyboardInterrupt
+
+        with (
+            patch("devbench.reporting.report.generate_report", side_effect=fake_generate_report),
+            patch("time.sleep", side_effect=fake_sleep),
+        ):
+            result = cli.cmd_report(watch_interval=5)
+
+        assert result == 0
+        assert call_count == 1
+
+
+class TestMainWatchFlagParsing:
+    """Test --watch / -w flag extraction in main() (lines 978-988)."""
+
+    def test_watch_flag_extracted_from_args(self) -> None:
+        """--watch <N> is extracted from sys.argv for the report command (lines 978-988)."""
+        with (
+            patch("sys.argv", ["devbench", "report", "--watch", "10"]),
+            patch("devbench.cli.cmd_report", return_value=0) as mock_report,
+        ):
+            result = cli.main()
+
+        assert result == 0
+        mock_report.assert_called_once_with(since="", watch_interval=10)
+
+    def test_short_watch_flag_extracted(self) -> None:
+        """-w <N> is equivalent to --watch <N>."""
+        with (
+            patch("sys.argv", ["devbench", "report", "-w", "3"]),
+            patch("devbench.cli.cmd_report", return_value=0) as mock_report,
+        ):
+            result = cli.main()
+
+        assert result == 0
+        mock_report.assert_called_once_with(since="", watch_interval=3)
+
+    def test_watch_flag_with_since_arg(self) -> None:
+        """--watch is separated from the since timestamp argument (lines 996-998)."""
+        with (
+            patch("sys.argv", ["devbench", "report", "--watch", "5", "2025-01-15T10:30:00Z"]),
+            patch("devbench.cli.cmd_report", return_value=0) as mock_report,
+        ):
+            result = cli.main()
+
+        assert result == 0
+        mock_report.assert_called_once_with(since="2025-01-15T10:30:00Z", watch_interval=5)
+
+    def test_report_without_watch_dispatches_normally(self) -> None:
+        """report without --watch goes through normal dispatch (line 1002)."""
+        mock_fn = MagicMock(return_value=0)
+        with (
+            patch("sys.argv", ["devbench", "report"]),
+            patch.dict(cli._COMMANDS, {"report": (mock_fn, 0, "Progress report")}),
+        ):
+            result = cli.main()
+
+        assert result == 0
+        mock_fn.assert_called_once()
+
+
+class TestMainExtraArgsWarning:
+    """Test extra args warning in main() (lines 1000-1001)."""
+
+    def test_extra_args_warning_printed(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """When more args than min_args+1 are provided, a warning is printed to stderr (line 1001)."""
+        mock_fn = MagicMock(return_value=0)
+        with (
+            patch("sys.argv", ["devbench", "mycmd", "arg1", "arg2", "arg3", "arg4"]),
+            patch.dict(cli._COMMANDS, {"mycmd": (mock_fn, 1, "Test cmd")}),
+        ):
+            result = cli.main()
+
+        assert result == 0
+        err = capsys.readouterr().err
+        assert "Warning: ignoring" in err
+        assert "extra argument(s)" in err
+
+
+class TestMainDispatchLine:
+    """Test the final dispatch line in main() (line 1002/1006)."""
+
+    def test_dispatch_with_min_args(self) -> None:
+        """Dispatch passes exactly min_args arguments to the handler (line 1002)."""
+        mock_fn = MagicMock(return_value=0)
+        with (
+            patch("sys.argv", ["devbench", "mycmd", "val1"]),
+            patch.dict(cli._COMMANDS, {"mycmd": (mock_fn, 1, "Test")}),
+        ):
+            result = cli.main()
+
+        assert result == 0
+        mock_fn.assert_called_once_with("val1")
+
+    def test_dispatch_with_optional_extra_arg(self) -> None:
+        """Dispatch passes up to min_args+1 arguments (line 1002)."""
+        mock_fn = MagicMock(return_value=0)
+        with (
+            patch("sys.argv", ["devbench", "mycmd", "val1", "val2"]),
+            patch.dict(cli._COMMANDS, {"mycmd": (mock_fn, 1, "Test")}),
+        ):
+            result = cli.main()
+
+        assert result == 0
+        mock_fn.assert_called_once_with("val1", "val2")
+
 
 class TestGitOpsDeferred:
     """Test _git_ops_deferred helper."""

@@ -28,6 +28,7 @@ from devbench.config_loader import (
 from devbench.constants import (
     BACKLOG_SUBDIR,
     DEFAULT_ALERT_SUMMARY_LIMIT,
+    DEFAULT_BEDROCK_REGION,
     DEFAULT_COMMAND_TIMEOUT,
     DEFAULT_GH_API_TIMEOUT,
     DEFAULT_GITHUB_CHECK_TIMEOUT_SECONDS,
@@ -59,6 +60,19 @@ def _resolve_int(env_var: str, yaml_value: int | None, default: int) -> int:
     env_val = os.environ.get(env_var)
     if env_val is not None:
         return int(env_val)
+    if yaml_value is not None:
+        return yaml_value
+    return default
+
+
+def _resolve_str(env_var: str, yaml_value: str | None, default: str) -> str:
+    """Resolve a string config value with explicit precedence.
+
+    Precedence: environment variable > YAML value > default constant.
+    """
+    env_val = os.environ.get(env_var)
+    if env_val is not None:
+        return env_val
     if yaml_value is not None:
         return yaml_value
     return default
@@ -203,7 +217,11 @@ STOP_HOOK_STALE_TASK_MINUTES: int = _resolve_int(
     DEFAULT_STOP_HOOK_STALE_TASK_MINUTES,
 )
 USE_BEDROCK: bool = os.environ.get("JUDGE_USE_BEDROCK", "").lower() in ("1", "true", "yes")
-BEDROCK_REGION: str = os.environ.get("JUDGE_BEDROCK_REGION", os.environ.get("AWS_REGION", "us-east-1"))
+BEDROCK_REGION: str = _resolve_str(
+    "JUDGE_BEDROCK_REGION",
+    RUNTIME_CONFIG.bedrock_region,
+    os.environ.get("AWS_REGION", DEFAULT_BEDROCK_REGION),
+)
 
 # ---------------------------------------------------------------------------
 # Timeouts — all values in seconds

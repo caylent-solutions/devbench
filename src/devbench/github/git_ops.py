@@ -20,6 +20,7 @@ from devbench.config import (
     validate_repo,
 )
 from devbench.config_loader import get_configured_default_branch
+from devbench.constants import RAW_RESPONSE_PREVIEW_CHARS
 from devbench.utils.process import run_command
 
 
@@ -480,8 +481,8 @@ class GitOpsJudge:
         self.logger.debug(
             "git exit=%d stdout=%r stderr=%r",
             rc,
-            stdout[:500] if stdout else "",
-            stderr[:500] if stderr else "",
+            stdout[:RAW_RESPONSE_PREVIEW_CHARS] if stdout else "",
+            stderr[:RAW_RESPONSE_PREVIEW_CHARS] if stderr else "",
         )
         if rc != 0:
             raise RuntimeError(f"git {' '.join(args)} failed (exit {rc}): {stderr.strip()}")
@@ -521,7 +522,7 @@ class GitOpsJudge:
         self.logger.debug(
             "gh exit=%d stdout=%r stderr=%r",
             result.returncode,
-            result.stdout[:500] if result.stdout else "",
-            result.stderr[:500] if result.stderr else "",
+            result.stdout[:RAW_RESPONSE_PREVIEW_CHARS] if result.stdout else "",
+            result.stderr[:RAW_RESPONSE_PREVIEW_CHARS] if result.stderr else "",
         )
         return result.returncode, result.stdout, result.stderr

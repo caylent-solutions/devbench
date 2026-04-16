@@ -81,8 +81,14 @@ from devbench.config_loader import get_configured_default_branch
 from devbench.constants import (
     COMMENT_AGENT_TEMPLATE,
     COMMENT_ENTRY_TEMPLATE,
+    COMMENT_TIMESTAMP_FORMAT,
     COMMENTS_SECTION_HEADER,
+    DEFAULT_LOG_FILENAME,
+    DEFAULT_LOG_SUBDIR,
+    DEFAULT_PLUGIN_SUBPATH,
     DISPLAY_STATUS_VALUES,
+    FINALIZE_COMMIT_TEMPLATE,
+    FINALIZE_PR_TITLE_TEMPLATE,
     STATUS_IN_PROGRESS,
     STATUS_SEPARATOR_WIDTH,
     VALID_TDD_PHASES,
@@ -270,7 +276,7 @@ def cmd_validate_backlog() -> int:
     return 1
 
 
-def cmd_report(since: str = "") -> int:
+def cmd_report(since: str = "", watch_interval: int = 0) -> int:
     """Print a formatted progress report with velocity and completion stats."""
     from datetime import datetime
 
@@ -279,7 +285,7 @@ def cmd_report(since: str = "") -> int:
     log_file = Path(
         os.environ.get(
             "JUDGE_LOG_FILE",
-            str(Path(__file__).resolve().parent / "logs" / "orchestrator.log"),
+            str(Path(__file__).resolve().parent / DEFAULT_LOG_SUBDIR / DEFAULT_LOG_FILENAME),
         )
     )
 
@@ -287,9 +293,21 @@ def cmd_report(since: str = "") -> int:
     if since:
         since_dt = datetime.strptime(since, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
 
-    report = generate_report(log_path=log_file, since=since_dt)
-    print(report)
-    return 0
+    if watch_interval > 0:
+        import time
+
+        try:
+            while True:
+                print("\033[H\033[J", end="")  # clear screen
+                report = generate_report(log_path=log_file, since=since_dt)
+                print(report)
+                time.sleep(watch_interval)
+        except KeyboardInterrupt:
+            return 0
+    else:
+        report = generate_report(log_path=log_file, since=since_dt)
+        print(report)
+        return 0
 
 
 def cmd_log(message: str) -> int:
@@ -353,7 +371,7 @@ def cmd_read_unit(first_arg: str, second_arg: str = "") -> int:
 
     content = wu_file.read_text(encoding="utf-8")
     if strip_comments:
-        marker = "\n## Comments"
+        marker = f"\n{COMMENTS_SECTION_HEADER}"
         idx = content.find(marker)
         if idx != -1:
             content = content[:idx]
@@ -521,7 +539,7 @@ def cmd_log_verdict(judge_name: str, unit_id: str, verdict: str, feedback: str =
 
     action = "REVIEW_PASS" if verdict_lower == "pass" else "REVIEW_FAIL"
     agent_id = f"judge/{judge_name}"
-    timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+    timestamp = datetime.now(tz=UTC).strftime(COMMENT_TIMESTAMP_FORMAT)
     entry = COMMENT_ENTRY_TEMPLATE.format(
         timestamp=timestamp,
         agent_id=agent_id,
@@ -563,7 +581,7 @@ def cmd_log_comment(agent_name: str, unit_id: str, message: str) -> int:
     if not wu_file.exists():
         wu_file = WORKSPACE_ROOT / unit.file_path
 
-    timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+    timestamp = datetime.now(tz=UTC).strftime(COMMENT_TIMESTAMP_FORMAT)
     entry = COMMENT_AGENT_TEMPLATE.format(
         timestamp=timestamp,
         name=agent_name,
@@ -838,14 +856,14 @@ def cmd_git_ops_finalize(repo_name: str) -> int:
         return 1
 
     branch = SINGLE_BRANCH
-    pr_title = f"feat: {branch}"
+    pr_title = FINALIZE_PR_TITLE_TEMPLATE.format(branch=branch)
     pr_body = (
         f"Accumulated commits from DevBench single-branch execution.\n\nBranch: `{branch}`\nRepo: `{canonical_repo}`"
     )
 
     ops = GitOpsJudge()
 
-    ops.commit_and_push(canonical_repo, repo_path, branch, f"finalize: {branch}")
+    ops.commit_and_push(canonical_repo, repo_path, branch, FINALIZE_COMMIT_TEMPLATE.format(branch=branch))
     logger.info("Pushed branch %s to %s", branch, canonical_repo)
 
     pr_url = ops.create_pr(canonical_repo, branch, pr_title, pr_body, repo_path=repo_path)
@@ -869,7 +887,7 @@ def cmd_start() -> int:
 
     from claude_agent_sdk import ClaudeAgentOptions, query
 
-    plugin_path = Path(__file__).parent.parent.parent / "plugin" / "devbench"
+    plugin_path = Path(__file__).parent.parent.parent / DEFAULT_PLUGIN_SUBPATH
 
     async def _run() -> None:
         async for message in query(
@@ -923,7 +941,7 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
     "git-ops": (cmd_git_ops, 1, "Run git operations for a work unit: git-ops <id>"),
     "git-ops-finalize": (cmd_git_ops_finalize, 1, "Push single branch and create PR: git-ops-finalize <repo>"),
     "log": (cmd_log, 1, "Log a message: log <message>"),
-    "report": (cmd_report, 0, "Progress report: report [since-timestamp]"),
+    "report": (cmd_report, 0, "Progress report: report [--watch N] [since-timestamp]"),
     "start": (cmd_start, 0, "Run orchestrate skill via Agent SDK (non-interactive)"),
     # Plugin agent bridge commands — used by devbench plugin agents
     "read-unit": (cmd_read_unit, 1, "Work unit content + repo path as JSON: read-unit [--strip-comments] <id>"),
@@ -953,12 +971,34 @@ def main() -> int:
         return 1
 
     func, min_args, _ = _COMMANDS[command]
-    args = sys.argv[2:]
+
+    # Handle --watch/-w flag for the report command
+    watch_interval = 0
+    if command == "report":
+        filtered_args: list[str] = []
+        i = 0
+        raw_args = sys.argv[2:]
+        while i < len(raw_args):
+            if raw_args[i] in ("--watch", "-w") and i + 1 < len(raw_args):
+                watch_interval = int(raw_args[i + 1])
+                i += 2
+            else:
+                filtered_args.append(raw_args[i])
+                i += 1
+        args = filtered_args
+    else:
+        args = sys.argv[2:]
 
     if len(args) < min_args:
         print(f"Command '{command}' requires at least {min_args} argument(s)", file=sys.stderr)
         return 1
 
+    if command == "report" and watch_interval > 0:
+        since_arg = args[0] if args else ""
+        return cmd_report(since=since_arg, watch_interval=watch_interval)
+
+    if len(args) > min_args + 1:
+        print(f"Warning: ignoring {len(args) - min_args - 1} extra argument(s)", file=sys.stderr)
     return func(*args[: min_args + 1]) if len(args) > min_args else func(*args[:min_args])
 
 

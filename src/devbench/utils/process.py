@@ -13,6 +13,7 @@ import subprocess
 from pathlib import Path
 
 from devbench.config import COMMAND_TIMEOUT
+from devbench.constants import SUBPROCESS_ERROR_EXIT_CODE
 
 
 def run_command(
@@ -46,7 +47,7 @@ def run_command(
             timeout=effective_timeout,
         )
     except FileNotFoundError:
-        return 127, "", f"{cmd[0]}: command not found"
+        return SUBPROCESS_ERROR_EXIT_CODE, "", f"{cmd[0]}: command not found"
     except subprocess.TimeoutExpired:
-        return 127, "", f"{' '.join(cmd)}: timed out after {effective_timeout}s"
+        return SUBPROCESS_ERROR_EXIT_CODE, "", f"{' '.join(cmd)}: timed out after {effective_timeout}s"
     return result.returncode, result.stdout, result.stderr

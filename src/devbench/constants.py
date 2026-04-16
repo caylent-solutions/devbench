@@ -217,3 +217,62 @@ DEFAULT_OUTPUT_TRUNCATION_LIMIT: int = 2000
 DEFAULT_LLM_EVIDENCE_TRUNCATION: int = 15000
 DEFAULT_LLM_FILE_CONTEXT_LIMIT: int = 5
 DEFAULT_LLM_FILE_PREVIEW_CHARS: int = 3000
+
+# ---------------------------------------------------------------------------
+# Logging defaults
+# ---------------------------------------------------------------------------
+LOG_FORMAT: str = "%(asctime)s [%(name)s] %(levelname)s %(message)s"
+LOG_DATE_FORMAT: str = "%Y-%m-%dT%H:%M:%SZ"
+DEFAULT_LOG_LEVEL: str = "INFO"
+DEFAULT_LOG_SUBDIR: str = "logs"
+DEFAULT_LOG_FILENAME: str = "orchestrator.log"
+
+# ---------------------------------------------------------------------------
+# Comment timestamp format (used in work-unit Comments entries)
+# ---------------------------------------------------------------------------
+COMMENT_TIMESTAMP_FORMAT: str = "%Y-%m-%d %H:%M UTC"
+
+# ---------------------------------------------------------------------------
+# Git message templates for finalize operations
+# ---------------------------------------------------------------------------
+FINALIZE_COMMIT_TEMPLATE: str = "finalize: {branch}"
+FINALIZE_PR_TITLE_TEMPLATE: str = "feat: {branch}"
+
+# ---------------------------------------------------------------------------
+# Plugin path (relative to package root)
+# ---------------------------------------------------------------------------
+DEFAULT_PLUGIN_SUBPATH: str = "plugin/devbench"
+
+# ---------------------------------------------------------------------------
+# Subprocess error exit code (Unix convention for command-not-found / timeout)
+# ---------------------------------------------------------------------------
+SUBPROCESS_ERROR_EXIT_CODE: int = 127
+
+# ---------------------------------------------------------------------------
+# Token arithmetic
+# ---------------------------------------------------------------------------
+TOKENS_PER_MILLION: int = 1_000_000
+
+# ---------------------------------------------------------------------------
+# AWS / Bedrock defaults
+# ---------------------------------------------------------------------------
+DEFAULT_BEDROCK_REGION: str = "us-east-1"
+
+# ---------------------------------------------------------------------------
+# GitHub security feature constants
+# ---------------------------------------------------------------------------
+CODEQL_STATE: str = "configured"
+CODEQL_QUERY_SUITE: str = "default"
+SECURITY_FEATURE_ENABLED: str = "enabled"
+
+# ---------------------------------------------------------------------------
+# Report watch interval default (seconds)
+# ---------------------------------------------------------------------------
+DEFAULT_REPORT_WATCH_INTERVAL: int = 3
+
+# ---------------------------------------------------------------------------
+# Backlog index column count
+# The BACKLOG.md table has 7 data columns. Splitting a pipe-delimited row
+# by "|" produces 9 cells (empty leading cell + 7 data + empty trailing cell).
+# ---------------------------------------------------------------------------
+BACKLOG_INDEX_CELL_COUNT: int = 9

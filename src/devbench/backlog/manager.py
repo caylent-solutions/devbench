@@ -37,10 +37,12 @@ from pathlib import Path
 
 from devbench.constants import (
     ALL_REQUIRED_JUDGE_NAMES,
+    BACKLOG_INDEX_CELL_COUNT,
     BACKLOG_STATUS_RE,
     BACKLOG_SUBDIR,
     COMMENT_AGENT_TEMPLATE,
     COMMENT_ENTRY_TEMPLATE,
+    COMMENT_TIMESTAMP_FORMAT,
     COMMENTS_SECTION_HEADER,
     DEPENDENCY_NONE_VALUES,
     EPIC_ID_RE,
@@ -217,7 +219,7 @@ class BacklogManager:
             if not line.strip().startswith("|"):
                 continue
             cells = [c.strip() for c in line.split("|")]
-            if len(cells) != 9:  # work-unit index rows have exactly 7 columns
+            if len(cells) != BACKLOG_INDEX_CELL_COUNT:
                 continue
             row_id = cells[1]
             if not row_id or row_id.lower() == "id" or row_id.startswith("-"):
@@ -332,6 +334,20 @@ class BacklogManager:
         self.logger.info("All children of %s are done — rolling up status", parent_id)
         # _set_status: atomic write to both files; cascades via _rollup_parent_status.
         self._set_status(parent_file, backlog_index, parent_id, STATUS_DONE)
+
+        # Write audit comment to parent work unit
+        timestamp = datetime.now(tz=UTC).strftime(COMMENT_TIMESTAMP_FORMAT)
+        rollup_comment = COMMENT_AGENT_TEMPLATE.format(
+            timestamp=timestamp,
+            name="orchestrator",
+            message="Auto-rolled to done — all children completed",
+        )
+        content = parent_file.read_text(encoding="utf-8")
+        if COMMENTS_SECTION_HEADER in content:
+            content = content.rstrip("\n") + "\n\n" + rollup_comment
+        else:
+            content = content.rstrip("\n") + "\n\n" + COMMENTS_SECTION_HEADER + "\n\n" + rollup_comment
+        parent_file.write_text(content, encoding="utf-8")
 
     def _parse_backlog_rows(self, backlog_index: Path) -> list[tuple[str, str, str]]:
         """Parse BACKLOG.md table rows into (id, status, file_path) tuples."""
@@ -633,7 +649,7 @@ class BacklogManager:
 
         if STATUS_SUMMARY_SECTION_HEADER not in content:
             errors.append(
-                "Status Summary section missing from BACKLOG.md — run '_update_status_summary' to generate it"
+                "Status Summary section missing from BACKLOG.md — run 'devbench validate-backlog' to regenerate it"
             )
             return
 

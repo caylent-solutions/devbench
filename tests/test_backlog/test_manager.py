@@ -1372,6 +1372,37 @@ class TestRollupParentStatusEdgeCases:
         # Should warn but not raise
         mgr._rollup_parent_status(index_path, "E0-F1-S1")
 
+    def test_rollup_appends_comment_when_comments_section_exists(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """Line 347: when parent already has ## Comments, the rollup comment is appended
+        to the existing section (no duplicate header created)."""
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(
+            "# Backlog\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|-----------||\n"
+            "| E0-F1 | Feature | Feature | in-queue | None | git-repo | `backlog/E0-F1.md` |\n"
+            "| E0-F1-S1 | Story | Story | done | None | git-repo | `backlog/E0-F1-S1.md` |\n"
+        )
+        # Parent file already contains ## Comments section
+        parent_file = backlog_dir / "E0-F1.md"
+        parent_file.write_text(
+            "# E0-F1: Feature\n\n## Status: in-queue\n\n## Comments\n\n"
+            "[2026-01-01 00:00 UTC] [agent/orchestrator] Previous comment\n"
+        )
+        child_file = backlog_dir / "E0-F1-S1.md"
+        child_file.write_text("# E0-F1-S1\n\n## Status: done\n")
+
+        mgr = BacklogManager()
+        mgr._rollup_parent_status(index_path, "E0-F1-S1")
+
+        result = parent_file.read_text(encoding="utf-8")
+        # Should contain exactly one ## Comments header (not duplicated)
+        assert result.count("## Comments") == 1
+        # Should contain the auto-rollup comment
+        assert "Auto-rolled to done" in result
+        # Should still contain the previous comment
+        assert "Previous comment" in result
+
 
 class TestParseBacklogRowsEdgeCases:
     """Test _parse_backlog_rows with edge-case input."""

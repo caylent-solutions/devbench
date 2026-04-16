@@ -453,10 +453,13 @@ class TestCmdValidateBacklog:
 class TestMain:
     """Test main argument parsing."""
 
-    def test_no_args_returns_1(self) -> None:
+    def test_no_args_prints_usage_and_returns_0(self, capsys: pytest.CaptureFixture[str]) -> None:
         with patch("sys.argv", ["judges.cli"]):
             result = cli.main()
-        assert result == 1
+        out = capsys.readouterr().out
+        assert result == 0
+        assert "Usage: devbench" in out
+        assert "status" in out  # one of the registered commands
 
     def test_unknown_command_returns_1(self) -> None:
         with patch("sys.argv", ["judges.cli", "nonexistent"]):
@@ -490,6 +493,54 @@ class TestMain:
             with patch.dict(cli._COMMANDS, {"execute": (mock_fn, 1, "Execute")}):
                 result = cli.main()
         assert result == 0
+
+
+class TestHelp:
+    """`devbench --help` / `-h` at top-level and per-command must print usage and exit 0."""
+
+    def test_top_level_long_flag(self, capsys: pytest.CaptureFixture[str]) -> None:
+        with patch("sys.argv", ["judges.cli", "--help"]):
+            result = cli.main()
+        out = capsys.readouterr().out
+        assert result == 0
+        assert "Usage: devbench" in out
+        assert "status" in out
+
+    def test_top_level_short_flag(self, capsys: pytest.CaptureFixture[str]) -> None:
+        with patch("sys.argv", ["judges.cli", "-h"]):
+            result = cli.main()
+        out = capsys.readouterr().out
+        assert result == 0
+        assert "Usage: devbench" in out
+
+    def test_per_command_long_flag_does_not_dispatch(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """`<cmd> --help` prints the registry description and must not call the handler."""
+        mock_fn = MagicMock(return_value=0)
+        with patch("sys.argv", ["judges.cli", "status", "--help"]):
+            with patch.dict(cli._COMMANDS, {"status": (mock_fn, 0, "Show backlog summary")}):
+                result = cli.main()
+        out = capsys.readouterr().out
+        assert result == 0
+        assert "Show backlog summary" in out
+        mock_fn.assert_not_called()
+
+    def test_per_command_short_flag_does_not_dispatch(self, capsys: pytest.CaptureFixture[str]) -> None:
+        mock_fn = MagicMock(return_value=0)
+        with patch("sys.argv", ["judges.cli", "status", "-h"]):
+            with patch.dict(cli._COMMANDS, {"status": (mock_fn, 0, "Show backlog summary")}):
+                result = cli.main()
+        out = capsys.readouterr().out
+        assert result == 0
+        assert "Show backlog summary" in out
+        mock_fn.assert_not_called()
+
+    def test_unknown_command_still_returns_1(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Typos must still fail fast — --help is not a wildcard excuse."""
+        with patch("sys.argv", ["judges.cli", "nonexistent-command"]):
+            result = cli.main()
+        err = capsys.readouterr().err
+        assert result == 1
+        assert "Unknown command" in err
 
 
 class TestPreParseConfig:
@@ -3012,3 +3063,45 @@ class TestCmdGitOpsFinalize:
 
         assert result == 1
         assert "defer_pr" in capsys.readouterr().err.lower()
+
+
+class TestRejectEmDash:
+    """Agent-supplied text with U+2014 must be rejected at the CLI input boundary.
+
+    The validate-backlog Check 10 rejects work-unit files containing em-dash,
+    so any CLI writer that accepts free-form agent text must fail fast rather
+    than silently poisoning the file.
+    """
+
+    _EM_DASH_FEEDBACK = "issue A -\u2014 still broken"
+
+    def test_log_verdict_fail_feedback_with_em_dash_rejected(self, capsys: pytest.CaptureFixture[str]) -> None:
+        result = cli.cmd_log_verdict("code_review", "E0-F1-S1-T1", "fail", self._EM_DASH_FEEDBACK)
+        err = capsys.readouterr().err
+        assert result == 1
+        assert "em-dash" in err
+        assert "U+2014" in err
+
+    def test_log_verdict_pass_feedback_with_em_dash_rejected(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Pass verdicts can still carry feedback — em-dash must still be rejected."""
+        result = cli.cmd_log_verdict("code_review", "E0-F1-S1-T1", "pass", self._EM_DASH_FEEDBACK)
+        err = capsys.readouterr().err
+        assert result == 1
+        assert "em-dash" in err
+
+    def test_log_comment_with_em_dash_rejected(self, capsys: pytest.CaptureFixture[str]) -> None:
+        result = cli.cmd_log_comment("executor", "E0-F1-S1-T1", self._EM_DASH_FEEDBACK)
+        err = capsys.readouterr().err
+        assert result == 1
+        assert "em-dash" in err
+
+    def test_log_tdd_with_em_dash_rejected(self, capsys: pytest.CaptureFixture[str]) -> None:
+        result = cli.cmd_log_tdd("E0-F1-S1-T1", "RED", self._EM_DASH_FEEDBACK)
+        err = capsys.readouterr().err
+        assert result == 1
+        assert "em-dash" in err
+
+    def test_clean_feedback_is_not_rejected_by_em_dash_guard(self) -> None:
+        """The guard must return None for clean text — double-hyphen is fine."""
+        assert cli._reject_em_dash("feedback", "issue A -- still broken") is None
+        assert cli._reject_em_dash("feedback", "") is None

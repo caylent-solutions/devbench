@@ -202,6 +202,12 @@ DEFAULT_STOP_HOOK_STALE_TASK_MINUTES: int = 120
 DEFAULT_TOKEN_COST_PER_M_INPUT: float = 5.0
 DEFAULT_TOKEN_COST_PER_M_OUTPUT: float = 25.0
 
+# Em-dash (U+2014). Prohibited in work-unit markdown files by the
+# validate-backlog Check 10 (manager.py). Any CLI writer that accepts
+# free-form agent text must reject em-dash at the input boundary so the
+# validator can trust its own data.
+EM_DASH: str = "\u2014"
+
 # Timeout defaults (seconds)
 DEFAULT_GH_API_TIMEOUT: int = 30
 DEFAULT_TEST_TIMEOUT: int = 300

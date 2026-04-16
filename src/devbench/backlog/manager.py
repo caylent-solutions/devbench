@@ -45,6 +45,7 @@ from devbench.constants import (
     COMMENT_TIMESTAMP_FORMAT,
     COMMENTS_SECTION_HEADER,
     DEPENDENCY_NONE_VALUES,
+    EM_DASH,
     EPIC_ID_RE,
     STATUS_BLOCKED,
     STATUS_DONE,
@@ -752,7 +753,7 @@ class BacklogManager:
                 errors.append(f"{row_id}: missing required '## Definition of Done' section")
 
             # Check 10: no em-dash (U+2014)
-            if "\u2014" in content:
+            if EM_DASH in content:
                 errors.append(f"{row_id}: contains em-dash character (U+2014) -- use double hyphen instead")
 
     @staticmethod

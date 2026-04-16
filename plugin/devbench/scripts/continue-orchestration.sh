@@ -47,9 +47,9 @@ _read_yaml_int() {
     echo "$default"
 }
 
-MAX_BLOCKS=$(_read_yaml_int "stop_hook_max_blocks" "5" "JUDGE_STOP_MAX_BLOCKS")
-WINDOW_SECONDS=$(_read_yaml_int "stop_hook_window_seconds" "180" "JUDGE_STOP_WINDOW_SECONDS")
-STALE_MINUTES=$(_read_yaml_int "stop_hook_stale_task_minutes" "120" "JUDGE_STOP_STALE_MINUTES")
+MAX_BLOCKS=$(_read_yaml_int "max_blocks" "5" "JUDGE_STOP_MAX_BLOCKS")
+WINDOW_SECONDS=$(_read_yaml_int "window_seconds" "180" "JUDGE_STOP_WINDOW_SECONDS")
+STALE_MINUTES=$(_read_yaml_int "stale_task_minutes" "120" "JUDGE_STOP_STALE_MINUTES")
 
 # --- Check for in-progress task ---
 

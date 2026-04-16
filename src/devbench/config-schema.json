@@ -135,30 +135,25 @@
         "defer_pr": {
           "type": "boolean",
           "description": "When true, git-ops commits locally only (no push, no PR, no merge). Use git-ops-finalize to push and create the PR after all work units are complete. Only meaningful when single_branch is set."
-        },
-        "token_cost_per_million_input": {
-          "type": "number",
-          "description": "Cost per million input tokens in USD. Used for report cost estimates. Default: 15.0 (Opus list price)."
-        },
-        "token_cost_per_million_output": {
-          "type": "number",
-          "description": "Cost per million output tokens in USD. Used for report cost estimates. Default: 75.0 (Opus list price)."
-        },
-        "token_cost_input_ratio": {
-          "type": "number",
-          "description": "Estimated fraction of tokens that are input (0.0-1.0). Used for blended cost calculation. Default: 0.80."
-        },
-        "stop_hook_max_blocks": {
+        }
+      }
+    },
+    "stop_hook": {
+      "type": "object",
+      "description": "Stop hook circuit breaker settings.",
+      "additionalProperties": false,
+      "properties": {
+        "max_blocks": {
           "type": "integer",
           "minimum": 1,
           "description": "Maximum consecutive stop-hook blocks before circuit breaker trips and allows stop. Default: 5."
         },
-        "stop_hook_window_seconds": {
+        "window_seconds": {
           "type": "integer",
           "minimum": 10,
           "description": "Time window in seconds for counting stop-hook blocks. Counter resets after this period. Default: 180."
         },
-        "stop_hook_stale_task_minutes": {
+        "stale_task_minutes": {
           "type": "integer",
           "minimum": 1,
           "description": "Minutes before an in-progress task is considered stale. Hook warns instead of blindly blocking. Default: 120."
@@ -194,6 +189,25 @@
           "type": "integer",
           "minimum": 1,
           "description": "Character limit for per-file LLM preview."
+        }
+      }
+    },
+    "report": {
+      "type": "object",
+      "description": "Report and cost estimation settings.",
+      "additionalProperties": false,
+      "properties": {
+        "token_cost_per_million_input": {
+          "type": "number",
+          "description": "Cost per million input tokens in USD. Default: 15.0 (Opus list price)."
+        },
+        "token_cost_per_million_output": {
+          "type": "number",
+          "description": "Cost per million output tokens in USD. Default: 75.0 (Opus list price)."
+        },
+        "token_cost_input_ratio": {
+          "type": "number",
+          "description": "Estimated fraction of tokens that are input (0.0-1.0). Used for blended cost calculation. Default: 0.80."
         }
       }
     }

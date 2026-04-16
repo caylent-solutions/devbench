@@ -205,7 +205,7 @@ The orchestrator registers a Claude Code **Stop hook** (`continue-orchestration.
 
 If the agent enters a tight stop-block loop (stops, gets blocked, does nothing useful, stops again), the circuit breaker prevents infinite cycling:
 
-- After `stop_hook_max_blocks` blocks within `stop_hook_window_seconds`, the hook allows the stop
+- After `max_blocks` blocks within `window_seconds`, the hook allows the stop
 - The counter resets when the time window expires
 - When the circuit breaker trips, a `[CIRCUIT_BREAKER]` comment is logged to the work unit for audit
 
@@ -215,14 +215,14 @@ If the work-unit file says `blocked` but `BACKLOG.md` still shows `in-progress` 
 
 ### Stale task detection
 
-If a task has been in-progress longer than `stop_hook_stale_task_minutes`, the hook warns that the task may be stale from a crashed session and recommends running `devbench status` to assess.
+If a task has been in-progress longer than `stale_task_minutes`, the hook warns that the task may be stale from a crashed session and recommends running `devbench status` to assess.
 
 ### Configuration
 
-All values are configured in `backlog/config/devbench.yaml` under `git_ops:`, with environment variable overrides:
+All values are configured in `backlog/config/devbench.yaml` under `stop_hook:`, with environment variable overrides:
 
 | YAML key | Env var | Default | Description |
 | --- | --- | --- | --- |
-| `stop_hook_max_blocks` | `JUDGE_STOP_MAX_BLOCKS` | 5 | Circuit breaker trips after this many blocks |
-| `stop_hook_window_seconds` | `JUDGE_STOP_WINDOW_SECONDS` | 180 | Counter resets after this period |
-| `stop_hook_stale_task_minutes` | `JUDGE_STOP_STALE_MINUTES` | 120 | Warn about stale tasks older than this |
+| `max_blocks` | `JUDGE_STOP_MAX_BLOCKS` | 5 | Circuit breaker trips after this many blocks |
+| `window_seconds` | `JUDGE_STOP_WINDOW_SECONDS` | 180 | Counter resets after this period |
+| `stale_task_minutes` | `JUDGE_STOP_STALE_MINUTES` | 120 | Warn about stale tasks older than this |

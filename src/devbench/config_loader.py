@@ -164,12 +164,36 @@ class GitOpsConfig:
     update_submodule: bool = False
     single_branch: str | None = None
     defer_pr: bool = False
+
+
+@dataclass
+class ReportConfig:
+    """Report and cost estimation settings.
+
+    Attributes:
+        token_cost_per_million_input: Cost per million input tokens in USD.
+        token_cost_per_million_output: Cost per million output tokens in USD.
+        token_cost_input_ratio: Estimated fraction of tokens that are input (0.0-1.0).
+    """
+
     token_cost_per_million_input: float = DEFAULT_TOKEN_COST_PER_M_INPUT
     token_cost_per_million_output: float = DEFAULT_TOKEN_COST_PER_M_OUTPUT
     token_cost_input_ratio: float = DEFAULT_TOKEN_COST_INPUT_RATIO
-    stop_hook_max_blocks: int = DEFAULT_STOP_HOOK_MAX_BLOCKS
-    stop_hook_window_seconds: int = DEFAULT_STOP_HOOK_WINDOW_SECONDS
-    stop_hook_stale_task_minutes: int = DEFAULT_STOP_HOOK_STALE_TASK_MINUTES
+
+
+@dataclass
+class StopHookConfig:
+    """Stop hook circuit breaker settings.
+
+    Attributes:
+        max_blocks: Maximum consecutive stop-hook blocks before circuit breaker trips.
+        window_seconds: Time window for counting blocks. Counter resets after this period.
+        stale_task_minutes: Minutes before an in-progress task is considered stale.
+    """
+
+    max_blocks: int = DEFAULT_STOP_HOOK_MAX_BLOCKS
+    window_seconds: int = DEFAULT_STOP_HOOK_WINDOW_SECONDS
+    stale_task_minutes: int = DEFAULT_STOP_HOOK_STALE_TASK_MINUTES
 
 
 @dataclass
@@ -206,6 +230,8 @@ class RuntimeConfig:
         timeouts: Timeout values for various operations.
         limits: Threshold and limit values.
         git_ops: Git operations workflow settings.
+        report: Report and cost estimation settings.
+        stop_hook: Stop hook circuit breaker settings.
         allowed_orgs: List of permitted GitHub organisations.
         judge_model: Model identifier used by judge agents.
         executor_model: Model identifier used by the executor agent.
@@ -220,6 +246,8 @@ class RuntimeConfig:
     timeouts: TimeoutConfig = field(default_factory=TimeoutConfig)
     limits: LimitConfig = field(default_factory=LimitConfig)
     git_ops: GitOpsConfig = field(default_factory=GitOpsConfig)
+    report: ReportConfig = field(default_factory=ReportConfig)
+    stop_hook: StopHookConfig = field(default_factory=StopHookConfig)
     allowed_orgs: list[str] = field(default_factory=list)
     judge_model: str | None = None
     executor_model: str | None = None
@@ -408,23 +436,33 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         update_submodule=bool(git_ops_raw.get("update_submodule", False)),
         single_branch=single_branch_raw,
         defer_pr=defer_pr,
+    )
+
+    # Populate ReportConfig from YAML report block.
+    report_raw = raw.get("report") or {}
+    report = ReportConfig(
         token_cost_per_million_input=float(
-            git_ops_raw.get("token_cost_per_million_input", DEFAULT_TOKEN_COST_PER_M_INPUT),
+            report_raw.get("token_cost_per_million_input", DEFAULT_TOKEN_COST_PER_M_INPUT),
         ),
         token_cost_per_million_output=float(
-            git_ops_raw.get("token_cost_per_million_output", DEFAULT_TOKEN_COST_PER_M_OUTPUT),
+            report_raw.get("token_cost_per_million_output", DEFAULT_TOKEN_COST_PER_M_OUTPUT),
         ),
         token_cost_input_ratio=float(
-            git_ops_raw.get("token_cost_input_ratio", DEFAULT_TOKEN_COST_INPUT_RATIO),
+            report_raw.get("token_cost_input_ratio", DEFAULT_TOKEN_COST_INPUT_RATIO),
         ),
-        stop_hook_max_blocks=int(
-            git_ops_raw.get("stop_hook_max_blocks", DEFAULT_STOP_HOOK_MAX_BLOCKS),
+    )
+
+    # Populate StopHookConfig from YAML stop_hook block.
+    stop_hook_raw = raw.get("stop_hook") or {}
+    stop_hook = StopHookConfig(
+        max_blocks=int(
+            stop_hook_raw.get("max_blocks", DEFAULT_STOP_HOOK_MAX_BLOCKS),
         ),
-        stop_hook_window_seconds=int(
-            git_ops_raw.get("stop_hook_window_seconds", DEFAULT_STOP_HOOK_WINDOW_SECONDS),
+        window_seconds=int(
+            stop_hook_raw.get("window_seconds", DEFAULT_STOP_HOOK_WINDOW_SECONDS),
         ),
-        stop_hook_stale_task_minutes=int(
-            git_ops_raw.get("stop_hook_stale_task_minutes", DEFAULT_STOP_HOOK_STALE_TASK_MINUTES),
+        stale_task_minutes=int(
+            stop_hook_raw.get("stale_task_minutes", DEFAULT_STOP_HOOK_STALE_TASK_MINUTES),
         ),
     )
 
@@ -433,6 +471,8 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         timeouts=timeouts,
         limits=limits,
         git_ops=git_ops,
+        report=report,
+        stop_hook=stop_hook,
         allowed_orgs=allowed_orgs,
         judge_model=raw.get("judge_model") or None,
         executor_model=raw.get("executor_model") or None,

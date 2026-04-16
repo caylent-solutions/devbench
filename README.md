@@ -308,7 +308,7 @@ This produces a single branch with one commit per completed task, resulting in o
 The `report` command shows token consumption and estimated cost. Pricing defaults to Opus list rates but can be overridden for enterprise discounts:
 
 ```yaml
-git_ops:
+report:
   token_cost_per_million_input: 10.0    # default: 15.0
   token_cost_per_million_output: 50.0   # default: 75.0
   token_cost_input_ratio: 0.80          # default: 0.80 (80% input, 20% output)
@@ -320,13 +320,13 @@ Token data is read from `hook-logs.jsonl` in the workspace root (written by Clau
 
 The orchestrator registers a Claude Code Stop hook (`continue-orchestration.sh`) that prevents the agent from stopping mid-loop when a task is in-progress. After context compaction, Claude may attempt to stop; the hook blocks the stop and injects the current task ID, file path, last action, and a specific next step so the agent can resume.
 
-A circuit breaker prevents infinite stop-block loops: after `stop_hook_max_blocks` blocks within `stop_hook_window_seconds`, the hook allows the stop and logs a `[CIRCUIT_BREAKER]` comment to the work unit.
+A circuit breaker prevents infinite stop-block loops: after `max_blocks` blocks within `window_seconds`, the hook allows the stop and logs a `[CIRCUIT_BREAKER]` comment to the work unit.
 
 ```yaml
-git_ops:
-  stop_hook_max_blocks: 5              # default: 5
-  stop_hook_window_seconds: 180        # default: 180
-  stop_hook_stale_task_minutes: 120    # default: 120
+stop_hook:
+  max_blocks: 5              # default: 5
+  window_seconds: 180        # default: 180
+  stale_task_minutes: 120    # default: 120
 ```
 
 Environment variable overrides: `JUDGE_STOP_MAX_BLOCKS`, `JUDGE_STOP_WINDOW_SECONDS`, `JUDGE_STOP_STALE_MINUTES`.

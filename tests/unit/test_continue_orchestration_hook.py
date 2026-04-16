@@ -226,7 +226,7 @@ class TestCircuitBreaker:
         backlog.write_text("| E0-F1-S1-T1 | Task | Task | in-progress | none | repo | `backlog/t1.md` |\n")
         config_dir = tmp_path / "backlog" / "config"
         config_dir.mkdir(parents=True)
-        (config_dir / "devbench.yaml").write_text("repos:\n  org/repo: {}\ngit_ops:\n  stop_hook_max_blocks: 1\n")
+        (config_dir / "devbench.yaml").write_text("repos:\n  org/repo: {}\nstop_hook:\n  max_blocks: 1\n")
         # First block.
         result = _run_hook(str(tmp_path))
         output = json.loads(result.stdout)
@@ -240,7 +240,7 @@ class TestCircuitBreaker:
         backlog.write_text("| E0-F1-S1-T1 | Task | Task | in-progress | none | repo | `backlog/t1.md` |\n")
         config_dir = tmp_path / "backlog" / "config"
         config_dir.mkdir(parents=True)
-        (config_dir / "devbench.yaml").write_text("repos:\n  org/repo: {}\ngit_ops:\n  stop_hook_max_blocks: 10\n")
+        (config_dir / "devbench.yaml").write_text("repos:\n  org/repo: {}\nstop_hook:\n  max_blocks: 10\n")
         # Env var should override YAML — set to 1.
         result = _run_hook(str(tmp_path), extra_env={"JUDGE_STOP_MAX_BLOCKS": "1"})
         output = json.loads(result.stdout)

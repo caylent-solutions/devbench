@@ -197,23 +197,23 @@ UPDATE_SUBMODULE: bool = RUNTIME_CONFIG.git_ops.update_submodule
 SINGLE_BRANCH: str | None = RUNTIME_CONFIG.git_ops.single_branch
 DEFER_PR: bool = RUNTIME_CONFIG.git_ops.defer_pr
 TOKEN_COST_PER_M_INPUT: float = _resolve_float(
-    None, RUNTIME_CONFIG.git_ops.token_cost_per_million_input, DEFAULT_TOKEN_COST_PER_M_INPUT
+    None, RUNTIME_CONFIG.report.token_cost_per_million_input, DEFAULT_TOKEN_COST_PER_M_INPUT
 )
 TOKEN_COST_PER_M_OUTPUT: float = _resolve_float(
-    None, RUNTIME_CONFIG.git_ops.token_cost_per_million_output, DEFAULT_TOKEN_COST_PER_M_OUTPUT
+    None, RUNTIME_CONFIG.report.token_cost_per_million_output, DEFAULT_TOKEN_COST_PER_M_OUTPUT
 )
 TOKEN_COST_INPUT_RATIO: float = _resolve_float(
-    None, RUNTIME_CONFIG.git_ops.token_cost_input_ratio, DEFAULT_TOKEN_COST_INPUT_RATIO
+    None, RUNTIME_CONFIG.report.token_cost_input_ratio, DEFAULT_TOKEN_COST_INPUT_RATIO
 )
 STOP_HOOK_MAX_BLOCKS: int = _resolve_int(
-    "JUDGE_STOP_MAX_BLOCKS", RUNTIME_CONFIG.git_ops.stop_hook_max_blocks, DEFAULT_STOP_HOOK_MAX_BLOCKS
+    "JUDGE_STOP_MAX_BLOCKS", RUNTIME_CONFIG.stop_hook.max_blocks, DEFAULT_STOP_HOOK_MAX_BLOCKS
 )
 STOP_HOOK_WINDOW_SECONDS: int = _resolve_int(
-    "JUDGE_STOP_WINDOW_SECONDS", RUNTIME_CONFIG.git_ops.stop_hook_window_seconds, DEFAULT_STOP_HOOK_WINDOW_SECONDS
+    "JUDGE_STOP_WINDOW_SECONDS", RUNTIME_CONFIG.stop_hook.window_seconds, DEFAULT_STOP_HOOK_WINDOW_SECONDS
 )
 STOP_HOOK_STALE_TASK_MINUTES: int = _resolve_int(
     "JUDGE_STOP_STALE_MINUTES",
-    RUNTIME_CONFIG.git_ops.stop_hook_stale_task_minutes,
+    RUNTIME_CONFIG.stop_hook.stale_task_minutes,
     DEFAULT_STOP_HOOK_STALE_TASK_MINUTES,
 )
 USE_BEDROCK: bool = os.environ.get("JUDGE_USE_BEDROCK", "").lower() in ("1", "true", "yes")

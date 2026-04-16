@@ -1061,9 +1061,9 @@ class TestGitOpsConfig:
             """,
         )
         result = load_runtime_config(cfg, {})
-        assert result.git_ops.token_cost_per_million_input == 15.0
-        assert result.git_ops.token_cost_per_million_output == 75.0
-        assert result.git_ops.token_cost_input_ratio == 0.80
+        assert result.report.token_cost_per_million_input == 15.0
+        assert result.report.token_cost_per_million_output == 75.0
+        assert result.report.token_cost_input_ratio == 0.80
 
     def test_token_cost_overrides_from_yaml(self, tmp_path: Path) -> None:
         cfg = self._write(
@@ -1072,16 +1072,16 @@ class TestGitOpsConfig:
             repos:
               caylent-solutions/devbench:
                 default_branch: main
-            git_ops:
+            report:
               token_cost_per_million_input: 10.0
               token_cost_per_million_output: 50.0
               token_cost_input_ratio: 0.75
             """,
         )
         result = load_runtime_config(cfg, {})
-        assert result.git_ops.token_cost_per_million_input == 10.0
-        assert result.git_ops.token_cost_per_million_output == 50.0
-        assert result.git_ops.token_cost_input_ratio == 0.75
+        assert result.report.token_cost_per_million_input == 10.0
+        assert result.report.token_cost_per_million_output == 50.0
+        assert result.report.token_cost_input_ratio == 0.75
 
     def test_token_cost_partial_override(self, tmp_path: Path) -> None:
         cfg = self._write(
@@ -1090,14 +1090,14 @@ class TestGitOpsConfig:
             repos:
               caylent-solutions/devbench:
                 default_branch: main
-            git_ops:
+            report:
               token_cost_per_million_input: 8.0
             """,
         )
         result = load_runtime_config(cfg, {})
-        assert result.git_ops.token_cost_per_million_input == 8.0
-        assert result.git_ops.token_cost_per_million_output == 75.0
-        assert result.git_ops.token_cost_input_ratio == 0.80
+        assert result.report.token_cost_per_million_input == 8.0
+        assert result.report.token_cost_per_million_output == 75.0
+        assert result.report.token_cost_input_ratio == 0.80
 
     def test_schema_rejects_unknown_git_ops_keys(self, tmp_path: Path) -> None:
         """
@@ -1141,40 +1141,40 @@ class TestGitOpsConfig:
         result = load_runtime_config(cfg, {})
         from devbench.constants import DEFAULT_STOP_HOOK_MAX_BLOCKS
 
-        assert result.git_ops.stop_hook_max_blocks == DEFAULT_STOP_HOOK_MAX_BLOCKS
+        assert result.stop_hook.max_blocks == DEFAULT_STOP_HOOK_MAX_BLOCKS
 
     def test_stop_hook_max_blocks_from_yaml(self, tmp_path: Path) -> None:
-        """stop_hook_max_blocks is read from YAML git_ops section."""
+        """max_blocks is read from YAML stop_hook section."""
         cfg = self._write(
             tmp_path / "cfg.yaml",
             """\
             repos:
               caylent-solutions/devbench:
                 default_branch: main
-            git_ops:
-              stop_hook_max_blocks: 3
+            stop_hook:
+              max_blocks: 3
             """,
         )
         result = load_runtime_config(cfg, {})
-        assert result.git_ops.stop_hook_max_blocks == 3
+        assert result.stop_hook.max_blocks == 3
 
     def test_stop_hook_window_seconds_from_yaml(self, tmp_path: Path) -> None:
-        """stop_hook_window_seconds is read from YAML git_ops section."""
+        """window_seconds is read from YAML stop_hook section."""
         cfg = self._write(
             tmp_path / "cfg.yaml",
             """\
             repos:
               caylent-solutions/devbench:
                 default_branch: main
-            git_ops:
-              stop_hook_window_seconds: 60
+            stop_hook:
+              window_seconds: 60
             """,
         )
         result = load_runtime_config(cfg, {})
-        assert result.git_ops.stop_hook_window_seconds == 60
+        assert result.stop_hook.window_seconds == 60
 
     def test_stop_hook_stale_task_minutes_defaults(self, tmp_path: Path) -> None:
-        """stop_hook_stale_task_minutes defaults to DEFAULT_STOP_HOOK_STALE_TASK_MINUTES when not in YAML."""
+        """stale_task_minutes defaults to DEFAULT_STOP_HOOK_STALE_TASK_MINUTES when not in YAML."""
         cfg = self._write(
             tmp_path / "cfg.yaml",
             """\
@@ -1186,19 +1186,19 @@ class TestGitOpsConfig:
         result = load_runtime_config(cfg, {})
         from devbench.constants import DEFAULT_STOP_HOOK_STALE_TASK_MINUTES
 
-        assert result.git_ops.stop_hook_stale_task_minutes == DEFAULT_STOP_HOOK_STALE_TASK_MINUTES
+        assert result.stop_hook.stale_task_minutes == DEFAULT_STOP_HOOK_STALE_TASK_MINUTES
 
     def test_stop_hook_stale_task_minutes_from_yaml(self, tmp_path: Path) -> None:
-        """stop_hook_stale_task_minutes is read from YAML git_ops section."""
+        """stale_task_minutes is read from YAML stop_hook section."""
         cfg = self._write(
             tmp_path / "cfg.yaml",
             """\
             repos:
               caylent-solutions/devbench:
                 default_branch: main
-            git_ops:
-              stop_hook_stale_task_minutes: 30
+            stop_hook:
+              stale_task_minutes: 30
             """,
         )
         result = load_runtime_config(cfg, {})
-        assert result.git_ops.stop_hook_stale_task_minutes == 30
+        assert result.stop_hook.stale_task_minutes == 30

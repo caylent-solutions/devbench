@@ -18,12 +18,6 @@ You are the review supervisor. Your job is to discover all review_team members, 
 
 List the agents directory to find all team members:
 
-```
-uv run devbench list-agents review_team
-```
-
-Or via Bash:
-
 ```bash
 ls plugin/devbench/agents/review_team/*.md
 ```

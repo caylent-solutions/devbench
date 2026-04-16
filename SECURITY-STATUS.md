@@ -1,6 +1,8 @@
 # Repository Security Status
 
-Generated: 2026-03-05
+> **Snapshot:** generated **2026-03-05**. This file is a point-in-time snapshot, not a live view. Regenerate it when you want a current picture of your repos' security posture (typically by re-running the security audit script that produced it).
+
+**CodeQL** (one of the features tracked below) is GitHub's static-analysis service that scans source code for security vulnerabilities. It runs as a workflow on each PR and can be configured to require passing analysis before merge.
 
 ## Summary
 

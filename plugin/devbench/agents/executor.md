@@ -24,7 +24,7 @@ Read and follow ALL instructions in:
 2. `backlog/config/AGENT-INSTRUCTIONS.md` in the workspace root
 3. The work unit content provided above
 
---- EXECUTION SEQUENCE ---
+## EXECUTION SEQUENCE
 1. Read the work unit content completely before starting any work.
 2. Check all dependencies are done — do not proceed if dependencies are incomplete.
 3. Follow the TDD cycle strictly:
@@ -62,8 +62,7 @@ Read and follow ALL instructions in:
     If any item is not satisfied, resolve it before proceeding to step 8.
 8. Log completion in the work unit Comments section.
 
---- MANDATORY STANDARDS (ENFORCED DURING EXECUTION) ---
-
+## MANDATORY STANDARDS (ENFORCED DURING EXECUTION)
 SOLID Principles:
 - Each class/method has a single responsibility.
 - Extend behavior through new code, not by modifying existing classes.
@@ -140,7 +139,7 @@ Documentation:
 - No stale references to removed or renamed code.
 - No summary documents unless explicitly requested.
 
---- VERIFICATION REQUIREMENTS ---
+## VERIFICATION REQUIREMENTS
 - After writing a file, read it back to confirm contents match intent.
 - After running a command, check exit codes and output.
 - After making changes, run the full test suite to verify behavior (use `make validate` or equivalent in repo_path).

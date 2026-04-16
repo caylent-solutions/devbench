@@ -1,3 +1,18 @@
+<!--
+This is a template for a task work unit. Copy it when creating a new task and replace the
+placeholders shown in {curly braces} with concrete values.
+
+Placeholder legend:
+  {ID}                       Uppercase work unit ID, e.g. E1-F1-S1-T1
+  {id_lower}                 Lowercase form of the ID, e.g. e1-f1-s1-t1
+  {Title}                    Human-readable title, sentence case
+  {org}/{repo}               Fully-qualified GitHub repo name
+  {repo_short}               Short name (the part after the slash)
+  {downstream_id}            ID of a work unit that depends on this one (delete row if none)
+  {test_file}, {source_file} File paths inside the target repo
+  {function/class}, {doc_file} Names referenced in the Approach section
+-->
+
 # {ID}: {Title}
 
 ## Status: in-queue
@@ -36,7 +51,7 @@
 
 ### Code Standards
 
-All code in this work unit MUST comply with the following. These are non-negotiable and will be enforced by LLM judges.
+All code in this work unit MUST comply with the following rules. These are checked by the LLM review judges (`code_review`, `test_review`, `doc_review`, `changes_manifest`) and trigger `REVIEW_FAIL` when violated. The work unit cannot reach `done` until every judge logs `REVIEW_PASS`.
 
 #### Critical Rules (Violation = Automatic Rejection)
 

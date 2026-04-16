@@ -2,6 +2,18 @@
 
 DevBench supports two execution modes. Both follow the same lifecycle and the same ownership rules — the difference is whether the orchestrate skill runs interactively (human in the loop) or non-interactively (background/unattended).
 
+For the wider context (component architecture, judge tier, multi-PR vs single-PR mode), see the [architecture overview](architecture.md). This doc focuses on the per-step lifecycle and ownership rules.
+
+## Table of contents
+
+- [Modes at a Glance](#modes-at-a-glance)
+- [Lifecycle: Step-by-Step](#lifecycle-step-by-step)
+- [Ownership rules](#ownership-rules)
+- [Mode-Specific Details](#mode-specific-details)
+- [Status Source of Truth](#status-source-of-truth)
+- [Retry Behaviour](#retry-behaviour)
+- [Stop Hook and Circuit Breaker](#stop-hook-and-circuit-breaker)
+
 ---
 
 ## Modes at a Glance
@@ -55,22 +67,24 @@ Both modes execute the same logical steps in the same order.
 7. Security review (after all 4 judges pass)  [devbench:security-reviewer AGENT RESPONSIBILITY]
    └── If FAIL → write SECURITY_FAIL + REVIEW_REJECTED, return to step 4
 
-8. Git operations  [devbench:executor AGENT RESPONSIBILITY — ALWAYS, BOTH MODES]
-   Standard mode (default):
-   ├── a. Create/checkout branch in the target submodule
-   ├── b. Stage files from the Changes Manifest (selective — never git add -A)
-   ├── c. Commit: "<unit-id>: <title>"
-   ├── d. Push branch to origin
-   ├── e. Create PR (--base from devbench.yaml repos.<org/repo>.default_branch)
-   ├── f. Wait for CI checks to pass
-   ├── g. Squash-merge PR, delete branch
-   └── h. Update parent repo's submodule reference (only when git_ops.update_submodule: true)
+8a. Git operations — STANDARD MODE (default; per-task branch + per-task PR)
+    [devbench:executor AGENT RESPONSIBILITY]
+    ├── Create/checkout branch in the target repo
+    ├── Stage files from the Changes Manifest (selective — never git add -A)
+    ├── Commit: "<unit-id>: <title>"
+    ├── Push branch to origin
+    ├── Create PR (--base from devbench.yaml repos.<org/repo>.default_branch)
+    ├── Wait for CI checks to pass
+    ├── Squash-merge PR, delete branch
+    └── Update parent repo's submodule reference (only when git_ops.update_submodule: true)
 
-   Single-branch mode (git_ops.single_branch + git_ops.defer_pr: true):
-   ├── a. ensure-branch creates/checks out the shared branch (same for all tasks)
-   ├── b. Stage files
-   ├── c. Commit locally: "<unit-id>: <title>" (no push, no PR, no merge)
-   └── d. After ALL tasks done: `devbench git-ops-finalize <repo>` pushes and creates PR
+8b. Git operations — SINGLE-BRANCH MODE (git_ops.single_branch + git_ops.defer_pr: true)
+    [devbench:executor AGENT RESPONSIBILITY for per-task; orchestrate finalizes]
+    ├── ensure-branch creates/checks out the shared branch (same for every task)
+    ├── Stage files
+    ├── Commit locally: "<unit-id>: <title>" (no push, no PR, no merge)
+    └── After ALL tasks are done: `devbench git-ops-finalize <repo>` pushes the
+        accumulated commits and creates one PR for the batch
 
 9. Mark Done (done-gate: verifies all 4 judges passed in most recent round)
 
@@ -111,16 +125,12 @@ The orchestrate skill is responsible for:
 - Delegating git operations to the executor agent (`devbench git-ops`)
 - Marking work units Done (via the done-gate)
 - Marking work units Blocked (after max retries)
-- Optionally invoking `devbench:blocker-resolver` when a unit is stuck
+
+> A `devbench:blocker-resolver` agent file exists in the plugin but the orchestrate skill does not currently invoke it. Blocked work units stay blocked until human intervention. See [Current gaps](architecture.md#10-current-gaps-known-limitations).
 
 ### Branch name resolution
 
-Branch name is resolved **once, at parse time**, in `BacklogParser.parse_work_unit_file`:
-
-1. If the work-unit file's **Target Repository** section has a `Branch:` field, use it exactly.
-2. Otherwise, derive it: `backlog/<unit-id-lowercase>` (e.g., `E0-F1-S1-T1` → `backlog/e0-f1-s1-t1`).
-
-The resolved name is stored in `WorkUnit.branch` and used by the executor's git operations. Neither the executor nor the orchestrate skill invents a third naming scheme.
+Branch name is resolved once at parse time. See the canonical rules in the [backlog contract](backlog-contract.md#branch-name-resolution). The resolved name is stored on `WorkUnit.branch` and used by the executor's git operations; neither the executor nor the orchestrate skill re-derives it at runtime.
 
 ---
 
@@ -142,7 +152,7 @@ uv run devbench start
             │
             ├── invokes devbench:executor agent to run git-ops
             │
-            └── invokes devbench:blocker-resolver when a unit is stuck (optional)
+            └── (devbench:blocker-resolver agent file exists but is NOT currently invoked)
 ```
 
 The Agent SDK session runs the orchestrate skill with `--dangerously-skip-permissions` so it can invoke CLI tools and agents without interactive approval prompts.
@@ -182,12 +192,12 @@ The BACKLOG.md index is an at-a-glance summary; the work-unit file is authoritat
 
 ## Retry Behaviour
 
-| Event | Both modes |
+| Event | Behaviour |
 | --- | --- |
-| Judge FAIL | Feedback injected into next executor invocation; executor reads feedback, fixes code, re-runs review |
-| BLOCKED (executor reported) | `devbench:blocker-resolver` evaluates; resolution or failure feedback fed to next attempt |
-| Max executor retries exhausted (`max_executor_retries` / `JUDGE_MAX_RETRIES`, default 10) | `devbench set-status <id> blocked` — unit marked BLOCKED in BACKLOG.md |
-| Security FAIL | `SECURITY_FAIL` + `REVIEW_REJECTED` written to work-unit; done-gate reset; retry |
+| Judge FAIL | Feedback injected into the next executor invocation; executor reads feedback, fixes code, re-runs review. |
+| BLOCKED (executor reported) | Work unit marked `blocked`. Stays blocked until human intervention (the `blocker-resolver` agent is not currently invoked — see architecture doc gaps). |
+| Max executor retries exhausted (`max_executor_retries` / `JUDGE_MAX_RETRIES`, default 10) | `devbench set-status <id> blocked` — unit marked BLOCKED in BACKLOG.md and orchestrator moves on. |
+| Security FAIL | `SECURITY_FAIL` + `REVIEW_REJECTED` written to work unit; done-gate window reset; review tier re-runs after fix. Security tier is **not** retried. |
 
 ---
 

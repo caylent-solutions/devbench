@@ -205,9 +205,25 @@
           "type": "number",
           "description": "Cost per million output tokens in USD. Default: 75.0 (Opus list price)."
         },
-        "token_cost_input_ratio": {
+        "display_timezone": {
+          "type": "string",
+          "description": "IANA timezone name (e.g. 'America/Denver', 'Europe/London') for displaying timestamps in `devbench report`. Defaults to the host system's local timezone. Useful when running inside a devcontainer or VM whose system TZ differs from your actual location. Override via JUDGE_REPORT_TIMEZONE env var."
+        },
+        "cache_read_multiplier": {
           "type": "number",
-          "description": "Estimated fraction of tokens that are input (0.0-1.0). Used for blended cost calculation. Default: 0.80."
+          "description": "Cost multiplier for cache-read tokens, relative to base input rate. Defaults to 0.10 (Anthropic's published rate). Override only when running on a platform with different caching pricing (e.g. some Bedrock configurations)."
+        },
+        "cache_write_5min_multiplier": {
+          "type": "number",
+          "description": "Cost multiplier for 5-minute prompt-cache write tokens, relative to base input rate. Defaults to 1.25 (Anthropic's published rate)."
+        },
+        "cache_write_1hr_multiplier": {
+          "type": "number",
+          "description": "Cost multiplier for 1-hour prompt-cache write tokens, relative to base input rate. Defaults to 2.0 (Anthropic's published rate)."
+        },
+        "data_residency_multiplier": {
+          "type": "number",
+          "description": "Cost multiplier when usage.inference_geo is set (US-only inference). Defaults to 1.10 (Anthropic's published rate). Counted in v1 but not yet applied per-call."
         }
       }
     }

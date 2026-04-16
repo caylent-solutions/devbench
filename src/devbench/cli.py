@@ -87,6 +87,7 @@ from devbench.constants import (
     DEFAULT_LOG_SUBDIR,
     DEFAULT_PLUGIN_SUBPATH,
     DISPLAY_STATUS_VALUES,
+    EM_DASH,
     FINALIZE_COMMIT_TEMPLATE,
     FINALIZE_PR_TITLE_TEMPLATE,
     STATUS_IN_PROGRESS,
@@ -296,10 +297,13 @@ def cmd_report(since: str = "", watch_interval: int = 0) -> int:
     if watch_interval > 0:
         import time
 
+        # Capture watch loop start once so the "This run" column tracks activity
+        # since the user kicked off `devbench report --watch`, not since each tick.
+        report_started_at = datetime.now(UTC)
         try:
             while True:
                 print("\033[H\033[J", end="")  # clear screen
-                report = generate_report(log_path=log_file, since=since_dt)
+                report = generate_report(log_path=log_file, since=since_dt, report_started_at=report_started_at)
                 print(report)
                 time.sleep(watch_interval)
         except KeyboardInterrupt:
@@ -507,6 +511,27 @@ def cmd_run_tests(unit_id: str) -> int:
     return rc
 
 
+def _reject_em_dash(field_name: str, text: str) -> int | None:
+    """Reject any agent-supplied text containing U+2014 before it reaches the backlog.
+
+    The validate-backlog Check 10 rejects work-unit files containing em-dash,
+    so any CLI writer that accepts free-form agent text must reject em-dash at
+    the input boundary — otherwise LLM-written verdict feedback (which naturally
+    uses em-dashes) poisons the file and blocks the next validate-backlog run.
+
+    Returns:
+        ``1`` (non-zero exit code) with stderr populated when em-dash is found;
+        ``None`` when the text is clean. Callers return the int on non-None.
+    """
+    if EM_DASH in text:
+        print(
+            f"ERROR: {field_name} contains em-dash character (U+2014); use '--' (double hyphen) instead.",
+            file=sys.stderr,
+        )
+        return 1
+    return None
+
+
 def cmd_log_verdict(judge_name: str, unit_id: str, verdict: str, feedback: str = "") -> int:
     """Append a judge verdict to the work unit's Comments section and log feedback.
 
@@ -525,6 +550,10 @@ def cmd_log_verdict(judge_name: str, unit_id: str, verdict: str, feedback: str =
     if verdict_lower not in ("pass", "fail"):
         print(f"ERROR: verdict must be 'pass' or 'fail', got '{verdict}'", file=sys.stderr)
         return 1
+
+    rc = _reject_em_dash("feedback", feedback)
+    if rc is not None:
+        return rc
 
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     units = parser.parse_index()
@@ -570,6 +599,10 @@ def cmd_log_comment(agent_name: str, unit_id: str, message: str) -> int:
     Use for non-judge actors (executor, blocker-resolver, review-supervisor summary)
     that need to log progress without emitting a REVIEW_PASS/REVIEW_FAIL token.
     """
+    rc = _reject_em_dash("message", message)
+    if rc is not None:
+        return rc
+
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     units = parser.parse_index()
     unit = _find_unit(units, unit_id)
@@ -603,11 +636,11 @@ def cmd_log_comment(agent_name: str, unit_id: str, message: str) -> int:
 def cmd_log_tdd(unit_id: str, phase: str, message: str) -> int:
     """Append a TDD phase entry to the work unit's TDD Cycle Log section.
 
-    Writes: ``- [<PHASE>] <ISO-8601 timestamp> — <message>``
+    Writes: ``- [<PHASE>] <ISO-8601 timestamp> -- <message>``
 
     Arguments:
         unit_id:  Work unit ID, e.g. ``E0-F1-S1-T1``.
-        phase:    TDD phase — ``RED``, ``GREEN``, or ``REFACTOR`` (case-insensitive).
+        phase:    TDD phase, one of ``RED``, ``GREEN``, ``REFACTOR`` (case-insensitive).
         message:  Description of the TDD phase outcome.
 
     Exits 0 on success, non-zero on any error.  The ``## TDD Cycle Log``
@@ -621,6 +654,10 @@ def cmd_log_tdd(unit_id: str, phase: str, message: str) -> int:
             file=sys.stderr,
         )
         return 1
+
+    rc = _reject_em_dash("message", message)
+    if rc is not None:
+        return rc
 
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     units = parser.parse_index()
@@ -941,7 +978,11 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
     "git-ops": (cmd_git_ops, 1, "Run git operations for a work unit: git-ops <id>"),
     "git-ops-finalize": (cmd_git_ops_finalize, 1, "Push single branch and create PR: git-ops-finalize <repo>"),
     "log": (cmd_log, 1, "Log a message: log <message>"),
-    "report": (cmd_report, 0, "Progress report: report [--watch N] [since-timestamp]"),
+    "report": (
+        cmd_report,
+        0,
+        "Progress report — renders All-time + Current run windows by default: report [--watch N] [since-timestamp]",
+    ),
     "start": (cmd_start, 0, "Run orchestrate skill via Agent SDK (non-interactive)"),
     # Plugin agent bridge commands — used by devbench plugin agents
     "read-unit": (cmd_read_unit, 1, "Work unit content + repo path as JSON: read-unit [--strip-comments] <id>"),
@@ -953,22 +994,43 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
 }
 
 
+_HELP_FLAGS: frozenset[str] = frozenset({"--help", "-h"})
+
+
+def _print_usage() -> None:
+    """Print top-level usage and command list. Shared by the `-h`/`--help` path and the no-args path."""
+    print("Usage: devbench <command> [args]")
+    print("       devbench <command> --help    (per-command usage)")
+    print("       devbench --help              (this message)")
+    print("\nCommands:")
+    for name, (_, _, desc) in sorted(_COMMANDS.items()):
+        print(f"  {name:<20} {desc}")
+
+
 def main() -> int:
     """Parse arguments and dispatch to the appropriate command."""
     setup_logging()
 
-    if len(sys.argv) < 2:
-        print("Usage: python3 -m devbench.cli <command> [args]")
-        print("\nCommands:")
-        for name, (_, _, desc) in sorted(_COMMANDS.items()):
-            print(f"  {name:<20} {desc}")
-        return 1
+    # Top-level: `devbench`, `devbench --help`, `devbench -h` all print usage and exit 0.
+    # Only a typo'd command (e.g. `devbench foo`) returns 1.
+    if len(sys.argv) < 2 or sys.argv[1] in _HELP_FLAGS:
+        _print_usage()
+        return 0
 
     command = sys.argv[1]
     if command not in _COMMANDS:
         print(f"Unknown command: {command}", file=sys.stderr)
         print(f"Available: {', '.join(sorted(_COMMANDS))}", file=sys.stderr)
         return 1
+
+    # Per-command help: `devbench <cmd> --help` / `-h` prints the registry
+    # description (single source of truth) and exits 0. The description
+    # strings already embed the "<summary>: <syntax>" form, so we print
+    # them plainly rather than wrapping them in another "Usage:" prefix.
+    if any(arg in _HELP_FLAGS for arg in sys.argv[2:]):
+        _, _, desc = _COMMANDS[command]
+        print(desc)
+        return 0
 
     func, min_args, _ = _COMMANDS[command]
 

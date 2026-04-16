@@ -1,8 +1,20 @@
 # DevBench Plugin Architecture
 
-This document describes the structure and design of the DevBench Claude Code plugin. For the
-rationale behind this architecture and the tradeoffs considered, see
-[docs/adr/01-claude-agent-sdk-with-plugins.md](adr/01-claude-agent-sdk-with-plugins.md).
+This document describes the structure and design of the DevBench Claude Code plugin. For the wider system context (orchestration loop, judge tier, multi-PR vs single-PR mode), see the [architecture overview](architecture.md). For the rationale behind this architecture and the tradeoffs considered, see [adr/01-claude-agent-sdk-with-plugins.md](adr/01-claude-agent-sdk-with-plugins.md). For the per-step lifecycle, see [execution-modes.md](execution-modes.md).
+
+## Table of contents
+
+- [Plugin Directory Structure](#plugin-directory-structure)
+- [Agent Definition Pattern](#agent-definition-pattern)
+- [Evidence](#evidence)
+- [Setup](#setup)
+- [Model Per Role](#model-per-role)
+- [Hook Safety Model](#hook-safety-model)
+- [Python CLI: Thin Bridge, Not Orchestration](#python-cli-thin-bridge-not-orchestration)
+- [Interactive vs Automated Gap](#interactive-vs-automated-gap)
+- [SDK Bootstrap](#sdk-bootstrap)
+- [Workspace Layout](#workspace-layout)
+- [Unchanged Modules](#unchanged-modules)
 
 ---
 
@@ -100,9 +112,9 @@ Each agent specifies its own model in the frontmatter:
 
 ## Hook Safety Model
 
-`hooks/hooks.json` registers filesystem hooks that fire in both interactive and automated sessions
-with identical behavior. Guard hooks exit with code 2 to block the tool call; stderr is shown to
-the agent as feedback.
+`hooks/hooks.json` registers Claude Code hooks that fire in both interactive and automated sessions. Guard hooks exit with code 2 to block the tool call; stderr is shown to the agent as feedback. Hook command strings use `${CLAUDE_PLUGIN_ROOT}`, which Claude Code interpolates at runtime to the absolute path of the loaded plugin directory (the value passed to `--plugin-dir`).
+
+The current `hooks.json` registers nine hook event types. Below shows the structure for the events that gate tool calls (PreToolUse and PostToolUse); the catch-all logger entries for the remaining events (`PostToolUseFailure`, `UserPromptSubmit`, `Stop`, `SubagentStart`, `SubagentStop`, `PreCompact`, `PermissionRequest`, `Notification`) follow the same pattern.
 
 ```json
 {
@@ -111,17 +123,22 @@ the agent as feedback.
       {
         "matcher": "Bash",
         "hooks": [
-          {"type": "command", "command": "${CLAUDE_SKILL_DIR}/../scripts/hook-logger.sh"},
-          {"type": "command", "command": "${CLAUDE_SKILL_DIR}/../scripts/guard-bash.sh"},
-          {"type": "command", "command": "${CLAUDE_SKILL_DIR}/../scripts/guard-verdict-format.sh"},
-          {"type": "command", "command": "${CLAUDE_SKILL_DIR}/../scripts/guard-git-stage.sh"},
-          {"type": "command", "command": "${CLAUDE_SKILL_DIR}/../scripts/guard-backlog.sh"}
+          {"type": "command", "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/hook-logger.sh"},
+          {"type": "command", "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/guard-bash.sh"},
+          {"type": "command", "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/guard-verdict-format.sh"},
+          {"type": "command", "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/guard-git-stage.sh"}
         ]
       },
       {
-        "matcher": "Write|Edit",
+        "matcher": "Write",
         "hooks": [
-          {"type": "command", "command": "${CLAUDE_SKILL_DIR}/../scripts/guard-work-unit-write.sh"}
+          {"type": "command", "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/guard-work-unit-write.sh"}
+        ]
+      },
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {"type": "command", "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/guard-work-unit-write.sh"}
         ]
       }
     ],
@@ -129,8 +146,16 @@ the agent as feedback.
       {
         "matcher": "Bash",
         "hooks": [
-          {"type": "command", "command": "${CLAUDE_SKILL_DIR}/../scripts/hook-logger.sh"},
-          {"type": "command", "command": "${CLAUDE_SKILL_DIR}/../scripts/assert-tests-pass.sh"}
+          {"type": "command", "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/hook-logger.sh"},
+          {"type": "command", "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/assert-tests-pass.sh"}
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {"type": "command", "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/hook-logger.sh"},
+          {"type": "command", "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/continue-orchestration.sh"}
         ]
       }
     ]
@@ -138,9 +163,15 @@ the agent as feedback.
 }
 ```
 
+For the full hook table (all nine event types and their scripts), see [Hooks layer](architecture.md#9-hooks-layer) in the architecture doc.
+
+### The Stop hook circuit breaker
+
+`continue-orchestration.sh` is the headline reliability feature: it prevents Claude Code from stopping mid-loop after context compaction by injecting a continuation instruction with the current task ID, file path, last action, and recommended next step. A circuit breaker with configurable thresholds (`stop_hook.max_blocks`, `stop_hook.window_seconds` in `devbench.yaml`) prevents infinite block-stop loops. See [architecture.md → Hooks layer](architecture.md#9-hooks-layer) for the full design.
+
 Hook exit codes:
-- **Exit 0** — allow the tool call to proceed
-- **Exit 2** — block the tool call; stderr shown to the agent as feedback
+- **Exit 0** — allow the tool call to proceed (or, for Stop hooks, allow the stop)
+- **Exit 2** — block the tool call; stderr shown to the agent as feedback (Stop hooks emit a JSON `{"decision": "block", "reason": "..."}` envelope to the same effect)
 
 ---
 

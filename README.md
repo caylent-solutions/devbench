@@ -2,6 +2,25 @@
 
 An LLM-as-Judge orchestration system that processes a backlog of work units autonomously. Development agents write code; judge agents review it. All review decisions are made by Claude LLM evaluation — no hardcoded pass/fail rules.
 
+> **New here?** Start with the [Architecture overview](docs/architecture.md) for the end-to-end picture (diagrams, capabilities, gaps), then come back here for install + commands.
+
+## Table of contents
+
+- [Quick Start](#quick-start)
+- [How It Works](#how-it-works)
+- [Evidence Truncation](#evidence-truncation)
+- [Monitoring](#monitoring)
+- [CLI Reference](#cli-reference)
+- [Make Targets](#make-targets)
+- [Architecture](#architecture)
+- [Configuration](#configuration)
+  - [Single-branch mode](#single-branch-mode)
+  - [Token cost estimates](#token-cost-estimates)
+  - [Stop hook (circuit breaker)](#stop-hook-circuit-breaker)
+- [Workspace Setup](#workspace-setup)
+- [Interactive Mode](#interactive-mode)
+- [Troubleshooting](#troubleshooting)
+
 ## Quick Start
 
 ### Interactive (recommended)
@@ -24,7 +43,9 @@ cd <workspace>/devbench
 make start
 ```
 
-Runs the orchestrator in the background. Monitor with `tail -f /tmp/backlog-run.log`.
+Runs the orchestrator in the background. Monitor with `tail -f src/devbench/logs/orchestrator.log`.
+
+The orchestrator is hardened against context-compaction stalls by a [Stop hook circuit breaker](#stop-hook-circuit-breaker) — if Claude tries to stop while a task is still in-progress, the hook injects a continuation instruction and re-enters the loop.
 
 ### Pre-configured token (skip OAuth)
 
@@ -38,8 +59,7 @@ make start-interactive
 ### Both modes:
 1. Authenticate with GitHub (or skip if `GH_TOKEN` is already set)
 2. Grant required token scopes (repo, workflow, read:org, admin:repo_hook, security_events)
-3. Start a background token refresher (every 4 hours, skipped if using pre-set token)
-4. Launch the orchestrator
+3. Launch the orchestrator
 
 ### LLM Authentication (no API key required)
 
@@ -128,25 +148,51 @@ devbench <command> [args]
 # or: python3 -m devbench <command> [args]
 ```
 
-| Command | Arguments | Description |
-|---------|-----------|-------------|
-| `status` | — | Show backlog summary (counts by status) |
-| `next` | — | Print next actionable work unit as JSON |
-| `claim` | `<unit-id>` | Claim a work unit (set to in-progress) |
-| `ensure-branch` | `<unit-id>` | Create or switch to work unit branch before executor runs |
-| `git-ops` | `<unit-id>` | Commit, push, create PR, wait for CI, merge |
-| `mark-done` | `<unit-id>` | Mark unit as Done (enforces done-gate: all judges must have passed) |
-| `log-verdict` | `<judge> <unit-id> <pass\|fail> [msg]` | Record a judge verdict in the work unit Comments |
-| `log-comment` | `<agent> <unit-id> <message>` | Append an agent comment to the work unit Comments |
-| `log-tdd` | `<unit-id> <RED\|GREEN\|REFACTOR> <message>` | Append a TDD phase entry to the work unit TDD Cycle Log |
-| `set-status` | `<unit-id> <status>` | Force any status (no gate — use for recovery/lifecycle transitions) |
-| `validate-backlog` | — | Check backlog integrity (file existence, status sync, orphans, deps, summary table) |
-| `read-unit` | `<unit-id>` | Print work unit spec as markdown (for agent context) |
-| `get-diff` | `<unit-id>` | Print git diff vs default branch (for review agents) |
-| `run-tests` | `<unit-id>` | Run test suite in the work unit's repo |
-| `start` | — | Run orchestrate skill via Agent SDK (non-interactive) |
-| `report` | `[since-timestamp]` | Print progress report with velocity stats |
-| `log` | `<message>` | Append message to log file |
+### Backlog navigation and status
+
+`status` — show backlog summary (counts by status). No arguments.
+
+`next` — print the next actionable work unit as JSON. No arguments.
+
+`claim <unit-id>` — claim a work unit (set status to `in-progress`).
+
+`set-status <unit-id> <status>` — force any status (no gate; use for recovery or lifecycle transitions).
+
+`mark-done <unit-id>` — mark unit as `done`. Enforces the done-gate: all four review judges must have logged `REVIEW_PASS` in the most recent round.
+
+`validate-backlog` — check backlog integrity (file existence, status sync, orphans, dep references, summary table counts, content rules). No arguments.
+
+### Reading work unit context (for agents)
+
+`read-unit <unit-id>` — print the work unit spec as markdown (for agent context).
+
+`get-diff <unit-id>` — print git diff vs default branch (for review agents).
+
+`run-tests <unit-id>` — run the test suite in the work unit's target repo.
+
+### Logging
+
+`log-verdict <judge> <unit-id> <pass|fail> [msg]` — record a judge verdict in the work unit Comments.
+
+`log-comment <agent> <unit-id> <message>` — append a non-verdict agent comment to the work unit Comments.
+
+`log-tdd <unit-id> <RED|GREEN|REFACTOR> <message>` — append a TDD phase entry to the work unit TDD Cycle Log.
+
+`log <message>` — append a free-form message to the orchestrator log file.
+
+### Git operations
+
+`ensure-branch <unit-id>` — create or switch to the work unit branch before the executor runs.
+
+`git-ops <unit-id>` — commit, push, create PR, wait for CI, merge. In single-branch + defer-PR mode, commits locally only.
+
+`git-ops-finalize <repo>` — single-branch mode only: push the shared branch and create one PR for all accumulated commits.
+
+### Orchestration and reporting
+
+`start` — run the orchestrate skill non-interactively via the Agent SDK. No arguments.
+
+`report [--watch N] [since-timestamp]` — print the progress report with velocity, token consumption, and cost estimates. By default renders **two** tables: an **All-time** window covering the full orchestrator log and a **Current run** window covering only the most recent contiguous block of orchestration events (boundary detected as a >10-minute gap between consecutive `Set X to ...` log lines). With `--watch N`, refreshes every N seconds (Ctrl+C to exit). Optional `since-timestamp` (ISO-8601) renders a single window starting at that timestamp instead of the dual layout.
 
 ## Make Targets
 
@@ -279,7 +325,7 @@ These hooks fire after every Bash tool call:
 
 ## Configuration
 
-Required variables (`JUDGE_WORKSPACE_ROOT`, `JUDGE_CLAUDE_MODEL`) raise `RuntimeError` at startup if unset. Allowed repositories and per-repo settings (default branch, checkout directory) are defined in `backlog/config/devbench.yaml` (relative to `JUDGE_WORKSPACE_ROOT`) — copy `sample-config.yaml` as a starting point. See [SYSTEM-OVERVIEW.md](SYSTEM-OVERVIEW.md#environment-variables) for the full variable reference and YAML schema.
+Required variables (`JUDGE_WORKSPACE_ROOT`, `JUDGE_CLAUDE_MODEL`) raise `RuntimeError` at startup if unset. Allowed repositories and per-repo settings (default branch, checkout directory) are defined in `backlog/config/devbench.yaml` (relative to `JUDGE_WORKSPACE_ROOT`). See the [Configuration model](docs/architecture.md#8-configuration-model) section of the architecture doc for the full annotated YAML and value-resolution precedence.
 
 The `--config <path>` CLI flag (or `JUDGE_CONFIG_PATH` env var) overrides the default config file location.
 
@@ -305,16 +351,38 @@ This produces a single branch with one commit per completed task, resulting in o
 
 ### Token cost estimates
 
-The `report` command shows token consumption and estimated cost. Pricing defaults to Opus list rates but can be overridden for enterprise discounts:
+The `report` command shows token consumption and estimated cost. Pricing is configurable per model — see [docs/model-pricing.md](docs/model-pricing.md) for the published rates of every Claude 4.x model and the YAML snippet to drop in for your specific model:
 
 ```yaml
 report:
-  token_cost_per_million_input: 10.0    # default: 15.0
-  token_cost_per_million_output: 50.0   # default: 75.0
-  token_cost_input_ratio: 0.80          # default: 0.80 (80% input, 20% output)
+  token_cost_per_million_input: 5.0     # Opus 4.7 (matches default constant)
+  token_cost_per_million_output: 25.0   # Opus 4.7 (matches default constant)
+  # Caching multipliers (relative to input rate). Only override when running
+  # on a platform with different caching pricing (e.g. some Bedrock configs).
+  # cache_read_multiplier: 0.10
+  # cache_write_5min_multiplier: 1.25
+  # cache_write_1hr_multiplier: 2.0
 ```
 
-Token data is read from `hook-logs.jsonl` in the workspace root (written by Claude Code hooks). Cost is a blended estimate based on the input/output ratio -- actual billing depends on your account terms.
+> Code defaults match Opus 4.7. If you run a different model (Sonnet, Haiku, or an older Opus generation), override the values above per the [model pricing doc](docs/model-pricing.md).
+
+Token data is aggregated from two sources, both filtered by the report window:
+
+1. **`hook-logs.jsonl`** in the workspace root — captures Agent (subagent) tool calls with their full per-token-type usage (input, output, cache reads, cache writes).
+2. **Claude Code transcript files** under `~/.claude/projects/<workspace-slug>/*.jsonl` — captures the outer orchestrate session's per-turn LLM usage (the reasoning between Agent calls). The transcript directory is auto-discovered from the `transcript_path` field in any hook-log entry.
+
+**Cost is computed per call, per token type, from real `usage` data on every LLM call.** Each call contributes: `input_tokens × input_rate + output_tokens × output_rate + cache_read_tokens × input_rate × 0.10 + cache_write_5m × input_rate × 1.25 + cache_write_1h × input_rate × 2.0`. There is no blended-rate fallback and no estimated input/output ratio — if an entry lacks a `usage` block (legacy / non-LLM tool call) it contributes zero cost rather than a masked estimate. The `Lifetime input / output share (measured)` row in the report is **purely descriptive**: it shows what your actual workload ratio is; it never feeds back into the cost formula. Actual billing depends on your account terms; this estimate aims to closely match the Anthropic Console.
+
+By default, `devbench report` renders a Backlog state + lifetime totals box at the top, then a multi-column Window stats table with **All-time** (since the log started) and **Current session** (since the most recent gap of more than 30 minutes between consecutive non-noise log entries — a proxy for "the orchestrator was restarted here"). With `--watch N`, a third **This run** column tracks activity since the watch loop started. Pass `--since <ISO-8601>` to render a single custom-window table instead of the multi-column layout.
+
+**Display timezone.** Window-start timestamps in the report are rendered in your machine's local timezone (with TZ abbreviation); internal calculations stay in UTC. If you run devbench inside a devcontainer or VM whose system TZ differs from your actual location (e.g., the container is UTC but you're on EST), set the IANA zone name explicitly:
+
+```yaml
+report:
+  display_timezone: America/Denver   # any IANA zone name
+```
+
+Or override via env var: `JUDGE_REPORT_TIMEZONE=America/Denver`. An invalid name logs a warning and falls back to system local.
 
 ### Stop hook (circuit breaker)
 

@@ -3,7 +3,7 @@ SHELL := /bin/bash
 .DEFAULT_GOAL := help
 unexport VIRTUAL_ENV
 
-.PHONY: help install plugin-install plugin-uninstall lint lint-ruff lint-bandit format format-check typecheck test test-unit test-coverage validate clean start start-interactive report report-session pre-commit-check pre-push-check
+.PHONY: help install install-hooks plugin-install plugin-uninstall lint lint-ruff lint-bandit format format-check typecheck test test-unit test-coverage validate clean start start-interactive report report-session pre-commit-check pre-push-check
 
 ## help: Show available targets
 help:
@@ -15,6 +15,11 @@ help:
 ## install: Install runtime and dev dependencies
 install:
 	uv sync --all-extras
+
+## install-hooks: Install pre-commit and pre-push git hooks
+install-hooks:
+	uv run pre-commit install
+	uv run pre-commit install --hook-type pre-push
 
 ## plugin-install: Register devbench marketplace and install plugin (user scope)
 plugin-install:

@@ -44,6 +44,7 @@ from devbench.backlog.work_unit import WorkUnitStatus, WorkUnitType
 from devbench.config import (
     BACKLOG_INDEX,
     BACKLOG_ROOT,
+    RECENT_PACE_TASKS,
     REPORT_CACHE_READ_MULTIPLIER,
     REPORT_CACHE_WRITE_1HR_MULTIPLIER,
     REPORT_CACHE_WRITE_5MIN_MULTIPLIER,
@@ -54,10 +55,12 @@ from devbench.config import (
 from devbench.constants import (
     DEFAULT_SESSION_GAP_MINUTES,
     LOG_NOISE_LOGGER_NAME,
+    MIN_PACE_SAMPLES,
     MS_PER_SECOND,
     PERCENT_MULTIPLIER,
     SECONDS_PER_HOUR,
     SECONDS_PER_MINUTE,
+    SIDE_BY_SIDE_GAP_CHARS,
     TOKENS_PER_MILLION,
 )
 
@@ -121,6 +124,17 @@ class WindowStats:
     est_total_cost: float
     api_hours: float
     api_efficiency: float | None  # None when window_hours == 0
+    # Number of completed-task duration samples that produced ``avg_minutes``.
+    # When < MIN_PACE_SAMPLES the display marks the pace as fragile so a single
+    # sample (e.g. a freshly-restarted Session window with one completion)
+    # cannot drive a multi-task projection.
+    pace_sample_count: int = 0
+    # Average minutes per task across the most-recently-completed N tasks
+    # (N = RECENT_PACE_TASKS), regardless of window. None when fewer than N
+    # task completions exist log-wide. Used in preference to ``avg_minutes``
+    # for projections so the rate metric reflects current orchestrator pace
+    # rather than being anchored by historical completions.
+    recent_pace_minutes: float | None = None
 
     @property
     def total_tokens(self) -> int:
@@ -409,15 +423,48 @@ def _compute_cost(
     )
 
 
+def _recent_pace_minutes(
+    done_times: dict[str, datetime],
+    progress_times: dict[str, datetime],
+    n: int,
+) -> float | None:
+    """Average minutes per task across the most-recent ``n`` task completions.
+
+    Looks log-wide (not window-bounded) so the metric reflects current
+    orchestrator pace rather than being anchored by historical completions.
+    Returns None when fewer than ``n`` task completions have valid durations.
+    """
+    task_done = [(tid, ts) for tid, ts in done_times.items() if "-T" in tid]
+    task_done.sort(key=lambda kv: kv[1], reverse=True)
+    durations: list[float] = []
+    for tid, dt in task_done:
+        if tid not in progress_times:
+            continue
+        dur = (dt - progress_times[tid]).total_seconds() / SECONDS_PER_MINUTE
+        if dur > 0:
+            durations.append(dur)
+        if len(durations) >= n:
+            break
+    if len(durations) < n:
+        return None
+    return sum(durations) / len(durations)
+
+
 def _compute_window_stats(
     log_path: Path,
     window_start: datetime,
     window_end: datetime,
     done_times: dict[str, datetime],
     progress_times: dict[str, datetime],
-    tasks_remaining: int,
+    tasks_active: int,
 ) -> WindowStats:
-    """Compute all time-windowed statistics for a single window."""
+    """Compute all time-windowed statistics for a single window.
+
+    ``tasks_active`` is the count of non-Done tasks that the orchestrator can
+    still finish on its own (in-queue / in-progress / in-review). Blocked
+    tasks are excluded — they need external action and have unbounded ETA, so
+    rolling them into the projection multiplier produces misleading numbers.
+    """
     window_hours = (window_end - window_start).total_seconds() / SECONDS_PER_HOUR
 
     task_ids_done = {uid for uid, ts in done_times.items() if "-T" in uid and window_start <= ts <= window_end}
@@ -430,8 +477,21 @@ def _compute_window_stats(
             dur = (done_times[tid] - effective_start).total_seconds() / SECONDS_PER_MINUTE
             if dur > 0:
                 task_durations.append(dur)
-    avg_minutes = sum(task_durations) / len(task_durations) if task_durations else 0.0
-    est_hours = (tasks_remaining * avg_minutes) / SECONDS_PER_MINUTE if avg_minutes else 0.0
+    pace_sample_count = len(task_durations)
+    # B3: pace from too-few samples is fragile — display as n/a rather than
+    # projecting from a single completion. The sample count is preserved on
+    # WindowStats so the renderer can append "(N=X samples)".
+    avg_minutes = sum(task_durations) / pace_sample_count if pace_sample_count >= MIN_PACE_SAMPLES else 0.0
+
+    # B4: rolling Recent pace from the last N completed tasks (log-wide,
+    # regardless of window). Used for projections so the rate metric reflects
+    # current orchestrator pace and stops drifting after dozens of completions.
+    recent_pace_minutes: float | None = _recent_pace_minutes(done_times, progress_times, RECENT_PACE_TASKS)
+
+    # Use recent pace for projections when available; otherwise fall back to
+    # the window's avg_minutes (which is itself n/a for too-few samples per B3).
+    pace_for_projection = recent_pace_minutes if recent_pace_minutes is not None else avg_minutes
+    est_hours = (tasks_active * pace_for_projection) / SECONDS_PER_MINUTE if pace_for_projection else 0.0
 
     # Combine usage from two sources, both filtered by window_start:
     #   1. hook-logs.jsonl: subagent (Agent tool) invocations — captures executor / judge / etc costs
@@ -464,7 +524,7 @@ def _compute_window_stats(
         + totals.cache_write_1h_tokens
     )
     tokens_per_task = total_tokens_window / tasks_in_window if tasks_in_window else 0.0
-    est_total_cost = cost.total_cost + (cost.total_cost / tasks_in_window * tasks_remaining if tasks_in_window else 0.0)
+    est_total_cost = cost.total_cost + (cost.total_cost / tasks_in_window * tasks_active if tasks_in_window else 0.0)
 
     api_hours = totals.total_duration_ms / MS_PER_SECOND / SECONDS_PER_HOUR
     api_efficiency = (api_hours / window_hours * PERCENT_MULTIPLIER) if window_hours > 0 else None
@@ -482,6 +542,8 @@ def _compute_window_stats(
         est_total_cost=est_total_cost,
         api_hours=api_hours,
         api_efficiency=api_efficiency,
+        pace_sample_count=pace_sample_count,
+        recent_pace_minutes=recent_pace_minutes,
     )
 
 
@@ -536,14 +598,16 @@ def _render_table(title: str, rows: list[tuple[str, str]], value_w: int = 18) ->
 def _render_multi_column_table(
     title: str,
     column_labels: list[str],
-    rows: list[tuple[str, list[str]]],
+    rows: list[tuple[str, list[str] | str]],
     value_w: int = 16,
 ) -> list[str]:
     """Render a bordered table with one metric column and N value columns.
 
     ``column_labels`` is the header row for the value columns.
-    ``rows`` is a list of (metric, [value_per_column]). Each row's value list
-    must match ``column_labels`` in length.
+    ``rows`` is a list of (metric, value). ``value`` is either a list with one
+    entry per column (normal row) OR a single string (spanning row — used when
+    a metric is window-agnostic, e.g. log-wide Recent pace / projected ETA; the
+    same number repeating in every column is just noise).
 
     The metric column auto-sizes to the longest label (or the title), and each
     value column widens to the longest value (or its label) so future label
@@ -552,10 +616,20 @@ def _render_multi_column_table(
     n_cols = len(column_labels)
     metric_w = max((len(metric) for metric, _ in rows), default=0)
     metric_w = max(metric_w, len(title))
-    # Value column width = max of: default minimum, label width, max cell width across all rows.
-    max_cell = max((max((len(v) for v in vals), default=0) for _, vals in rows), default=0)
+
+    # Value column width = max of: default minimum, label width, max cell width.
+    # Spanning rows (value is str) are accounted for separately below so a very
+    # long spanning value doesn't distort the per-column width.
+    def _cells_of(v: list[str] | str) -> list[str]:
+        return v if isinstance(v, list) else []
+
+    max_cell = max((max((len(v) for v in _cells_of(vals)), default=0) for _, vals in rows), default=0)
     max_label = max((len(label) for label in column_labels), default=0)
     value_w = max(value_w, max_cell, max_label)
+
+    # Width a spanning cell occupies (covers all n_cols value columns plus the
+    # n_cols-1 internal "│" separators that would otherwise split them).
+    spanning_w = n_cols * (value_w + 2) + (n_cols - 1) - 2  # -2 for leading/trailing space padding
 
     def hborder(left: str, junction_metric: str, junction_inner: str, right: str) -> str:
         return (
@@ -578,10 +652,43 @@ def _render_multi_column_table(
     for i, (metric, values) in enumerate(rows):
         if i > 0:
             lines.append(border_mid)
-        cells = [f" {metric:<{metric_w}} "] + [f" {v:>{value_w}} " for v in values]
-        lines.append("\u2502" + "\u2502".join(cells) + "\u2502")
+        if isinstance(values, str):
+            # Spanning row: a single right-aligned value occupies the full width
+            # of all value columns (including the column separators). The top /
+            # bottom borders of this row still show the regular ┬/┴ junctions
+            # so the column boundaries stay visually consistent throughout the
+            # table; only the content row's internal │ separators are merged.
+            lines.append(f"\u2502 {metric:<{metric_w}} \u2502 {values:>{spanning_w}} \u2502")
+        else:
+            cells = [f" {metric:<{metric_w}} "] + [f" {v:>{value_w}} " for v in values]
+            lines.append("\u2502" + "\u2502".join(cells) + "\u2502")
     lines.append(border_bot)
     return lines
+
+
+def _render_side_by_side(left: list[str], right: list[str], gap: int = SIDE_BY_SIDE_GAP_CHARS) -> list[str]:
+    """Merge two pre-rendered table block lists onto the same rows, left-right.
+
+    The shorter list is padded with whitespace matching its own rendered
+    width so the resulting output stays rectangular — i.e. the right block
+    does not shift left on rows where the left block has ended. An empty
+    input on either side returns the other unchanged.
+    """
+    if not left:
+        return list(right)
+    if not right:
+        return list(left)
+    left_width = max(len(line) for line in left)
+    right_width = max(len(line) for line in right)
+    row_count = max(len(left), len(right))
+    out: list[str] = []
+    blank_left = " " * left_width
+    blank_right = " " * right_width
+    for i in range(row_count):
+        lft = left[i] if i < len(left) else blank_left
+        rgt = right[i] if i < len(right) else blank_right
+        out.append(lft.ljust(left_width) + " " * gap + rgt)
+    return out
 
 
 def _format_int(n: int) -> str:
@@ -604,15 +711,34 @@ def _short_window_label(label: str, start: datetime, display_tz: tzinfo | None) 
 
 def _stats_to_value_list(stats: WindowStats) -> list[str]:
     """Return the per-row value list for a single window, in display order matching METRIC_LABELS."""
-    api_eff = f"{stats.api_efficiency:.1f}%" if stats.api_efficiency is not None else "n/a"
+    # API utilization > 100% means API time exceeds wall time — concurrent
+    # subagent calls (legitimate parallelism) or two orchestrators writing to
+    # the same hook log. The raw percentage reads as broken; surface the
+    # condition explicitly. The underlying WindowStats.api_efficiency stays
+    # untouched for programmatic callers.
+    if stats.api_efficiency is None:
+        api_eff = "n/a"
+    elif stats.api_efficiency > PERCENT_MULTIPLIER:
+        api_eff = ">100% (parallel)"
+    else:
+        api_eff = f"{stats.api_efficiency:.1f}%"
     cache_hit = f"{stats.cache_hit_rate:.2f}%" if stats.cache_hit_rate is not None else "n/a"
     tokens_per_task = f"{stats.tokens_per_task:,.0f}" if stats.tokens_per_task else "n/a"
     est_total = f"~${stats.est_total_cost:.2f}" if stats.est_total_cost else "n/a"
-    # Per-task averages are meaningful only when at least one task completed in the window;
-    # otherwise the rate is undefined and the projection is meaningless. Show "n/a" rather
-    # than misleading "0.0 min" / "~0.0 h" rows.
-    avg_min_display = f"{stats.avg_minutes:.1f} min" if stats.avg_minutes else "n/a"
-    est_hours_display = f"~{stats.est_hours:.1f} h" if stats.avg_minutes else "n/a"
+    # Per-task averages are meaningful only when ≥ MIN_PACE_SAMPLES tasks
+    # completed in the window. Below that, _compute_window_stats sets avg=0
+    # and we display "n/a" with the actual sample count so the reader knows
+    # whether the metric is genuinely empty (N=0) or fragile (1 ≤ N < min).
+    if stats.avg_minutes:
+        avg_min_display = f"{stats.avg_minutes:.1f} min"
+    elif stats.pace_sample_count > 0:
+        avg_min_display = f"n/a (N={stats.pace_sample_count} sample{'s' if stats.pace_sample_count != 1 else ''})"
+    else:
+        avg_min_display = "n/a"
+    # Recent pace is log-wide; same value across all window columns. None
+    # when fewer than RECENT_PACE_TASKS completions exist.
+    recent_pace_display = f"{stats.recent_pace_minutes:.1f} min" if stats.recent_pace_minutes is not None else "n/a"
+    est_hours_display = f"~{stats.est_hours:.1f} h" if stats.est_hours else "n/a"
     if stats.input_share is None:
         input_share = "n/a"
     else:
@@ -623,6 +749,7 @@ def _stats_to_value_list(stats: WindowStats) -> list[str]:
         f"{stats.window_hours:.1f} h",
         str(stats.tasks_in_window),
         avg_min_display,
+        recent_pace_display,
         est_hours_display,
         f"{stats.api_hours:.1f} h",
         api_eff,
@@ -645,6 +772,7 @@ _METRIC_LABELS: list[str] = [
     "Time span",
     "Tasks completed in window",
     "Average time per task",
+    f"Recent pace (last {RECENT_PACE_TASKS} tasks)",
     "Est. time to complete remaining",
     "API processing time",
     "API utilization",
@@ -661,6 +789,33 @@ _METRIC_LABELS: list[str] = [
     "Estimated total cost at completion",
 ]
 
+# Rows whose value is window-agnostic (identical across every window column).
+# These render as a single cell spanning all value columns instead of repeating
+# the same number per column. Recent pace is log-wide by construction; Est. time
+# to complete remaining = tasks_active * log-wide pace / 60 when recent pace is
+# available (the usual case after RECENT_PACE_TASKS completions).
+_SPANNING_METRIC_LABELS: frozenset[str] = frozenset(
+    {
+        f"Recent pace (last {RECENT_PACE_TASKS} tasks)",
+        "Est. time to complete remaining",
+    }
+)
+
+
+def _merge_spanning_values(metric: str, values: list[str]) -> list[str] | str:
+    """Collapse a per-column value list into a single spanning str when applicable.
+
+    Spanning only triggers when the metric is in ``_SPANNING_METRIC_LABELS`` AND
+    every value is identical — if values differ (e.g. recent pace falls back to
+    per-window avg_minutes when log-wide samples are insufficient), keep the
+    per-column layout so any divergence stays visible.
+    """
+    if metric not in _SPANNING_METRIC_LABELS:
+        return values
+    if len(set(values)) == 1:
+        return values[0]
+    return values
+
 
 def _stats_to_rows_single(stats: WindowStats) -> list[tuple[str, str]]:
     """Convert one WindowStats into (metric, value) rows for the single-column table."""
@@ -671,31 +826,53 @@ def _stats_to_rows_single(stats: WindowStats) -> list[tuple[str, str]]:
 def _resolve_window_endpoints(log_timestamps: list[datetime]) -> tuple[datetime, datetime, datetime | None]:
     """Return (log_start_for_window, window_end, log_started) for an empty or non-empty log.
 
-    For an empty log, both window endpoints fall back to ``datetime.now(UTC)`` and
-    ``log_started`` is None.
+    ``window_end`` is the report-generation moment, bounded below by
+    ``datetime.now(UTC)``. Without that bound, a "This run" window whose
+    ``start`` post-dates every log entry (common in watch mode when no new
+    log lines have arrived yet) yields a negative span and an n/a cascade
+    across every derived metric.
+
+    For an empty log, both window endpoints fall back to ``datetime.now(UTC)``
+    and ``log_started`` is None.
     """
+    now = datetime.now(UTC)
     if log_timestamps:
         log_started = min(log_timestamps)
-        return log_started, max(log_timestamps), log_started
-    now = datetime.now(UTC)
+        return log_started, max(*log_timestamps, now), log_started
     return now, now, None
 
 
-def _summary_line(stats: WindowStats, tasks_remaining: int) -> str:
+def _summary_line(stats: WindowStats, tasks_active: int, tasks_blocked: int) -> str:
     """Trailing one-line completion projection.
 
-    The estimate uses the All-time average (most stable sample); narrower windows
-    can have zero completed tasks (e.g. just after a restart), which would give a
-    meaningless projection.
+    Projects against ``tasks_active`` (in-queue / in-progress / in-review) only;
+    blocked tasks need external action and are reported separately so the user
+    knows why the projection is lower than naive ``tasks_remaining * pace``.
+
+    The pace prefers ``recent_pace_minutes`` (rolling average of the last N
+    completions) when available — that metric reflects current orchestrator
+    rate. Falls back to All-time ``avg_minutes`` otherwise.
     """
-    if not stats.avg_minutes:
+    blocked_note = f" -- {tasks_blocked} blocked excluded" if tasks_blocked else ""
+    if tasks_active == 0:
+        if tasks_blocked:
+            return (
+                f"0 active tasks. {tasks_blocked} blocked task(s) remaining -- "
+                "need external action before the orchestrator can proceed."
+            )
+        return "All tasks complete."
+    pace_label, pace_minutes = (
+        ("Recent", stats.recent_pace_minutes)
+        if stats.recent_pace_minutes is not None
+        else ("All-time", stats.avg_minutes)
+    )
+    if not pace_minutes:
         return (
-            f"{tasks_remaining} tasks remaining. "
-            "(Not enough completed tasks in the All-time window for a pace estimate.)"
+            f"{tasks_active} active task(s) remaining{blocked_note}. (Not enough completed tasks for a pace estimate.)"
         )
     return (
-        f"At the All-time pace of ~{stats.avg_minutes:.1f} minutes per task, "
-        f"the remaining {tasks_remaining} tasks should take roughly "
+        f"At the {pace_label} pace of ~{pace_minutes:.1f} minutes per task, "
+        f"the remaining {tasks_active} active task(s){blocked_note} should take roughly "
         f"{stats.est_hours:.1f} more hours of continuous execution."
     )
 
@@ -728,7 +905,12 @@ class _BacklogTotals:
     stories_done: int
     features_done: int
     epics_done: int
-    tasks_remaining: int
+    tasks_remaining: int  # all non-Done tasks (active + blocked); kept for backward-compat
+    tasks_blocked: int  # non-Done tasks with status == BLOCKED
+    tasks_active: int  # tasks_remaining - tasks_blocked (in-queue / in-progress / in-review)
+    tasks_in_progress: int  # non-Done tasks with status == IN_PROGRESS (subset of tasks_active)
+    tasks_in_queue: int  # non-Done tasks with status == IN_QUEUE (subset of tasks_active)
+    tasks_in_review: int  # non-Done tasks with status == IN_REVIEW (subset of tasks_active)
 
 
 def _backlog_totals_from_units(units: list) -> _BacklogTotals:
@@ -737,6 +919,11 @@ def _backlog_totals_from_units(units: list) -> _BacklogTotals:
     features = [u for u in units if u.unit_type == WorkUnitType.FEATURE]
     epics = [u for u in units if u.unit_type == WorkUnitType.EPIC]
     tasks_done = [t for t in tasks if t.status == WorkUnitStatus.DONE]
+    tasks_blocked = [t for t in tasks if t.status == WorkUnitStatus.BLOCKED]
+    tasks_in_progress = [t for t in tasks if t.status == WorkUnitStatus.IN_PROGRESS]
+    tasks_in_queue = [t for t in tasks if t.status == WorkUnitStatus.IN_QUEUE]
+    tasks_in_review = [t for t in tasks if t.status == WorkUnitStatus.IN_REVIEW]
+    tasks_remaining = len(tasks) - len(tasks_done)
     return _BacklogTotals(
         tasks_total=len(tasks),
         tasks_done=len(tasks_done),
@@ -745,7 +932,12 @@ def _backlog_totals_from_units(units: list) -> _BacklogTotals:
         stories_done=len([s for s in stories if s.status == WorkUnitStatus.DONE]),
         features_done=len([f for f in features if f.status == WorkUnitStatus.DONE]),
         epics_done=len([e for e in epics if e.status == WorkUnitStatus.DONE]),
-        tasks_remaining=len(tasks) - len(tasks_done),
+        tasks_remaining=tasks_remaining,
+        tasks_blocked=len(tasks_blocked),
+        tasks_active=tasks_remaining - len(tasks_blocked),
+        tasks_in_progress=len(tasks_in_progress),
+        tasks_in_queue=len(tasks_in_queue),
+        tasks_in_review=len(tasks_in_review),
     )
 
 
@@ -765,7 +957,11 @@ def _backlog_state_rows(b: _BacklogTotals, lifetime: WindowStats | None = None) 
             "Work units done (tasks + auto-rolled stories/features/epics)",
             f"{b.units_done} of {b.units_total} ({total_pct}%)",
         ),
-        ("Tasks remaining", str(b.tasks_remaining)),
+        # Three user-requested status rows. No separate "Tasks done" row — the
+        # headline "Tasks completed: X of Y (Z%)" above already carries that count.
+        ("Tasks in-progress", str(b.tasks_in_progress)),
+        ("Tasks blocked", str(b.tasks_blocked)),
+        ("Tasks remaining (total)", str(b.tasks_active + b.tasks_blocked)),
         (
             "Stories / Features / Epics auto-rolled to done",
             f"{b.stories_done} / {b.features_done} / {b.epics_done}",
@@ -795,6 +991,33 @@ def _backlog_state_rows(b: _BacklogTotals, lifetime: WindowStats | None = None) 
             ]
         )
     return rows
+
+
+def _unit_status_listing(units: list, status: WorkUnitStatus, header: str) -> list[str]:
+    """Return `[<blank>, "<header>:", "  - <id>: <title>", ...]` for task units in the given status.
+
+    Returns an empty list when no task matches — the caller then omits the
+    whole section (no empty `In-progress tasks:` header in reports where
+    everything is done or everything is blocked, etc.). Listings are task-only
+    (unit_type == TASK); parent Story/Feature/Epic units are excluded since
+    their status is derived from their children via auto-rollup.
+    """
+    matches = [u for u in units if u.unit_type == WorkUnitType.TASK and u.status == status]
+    if not matches:
+        return []
+    lines = ["", f"{header}:"]
+    lines.extend(f"  - {u.id}: {u.title}" for u in matches)
+    return lines
+
+
+def _in_progress_listing(units: list) -> list[str]:
+    """B9: list every in-progress task so the user sees which one is active."""
+    return _unit_status_listing(units, WorkUnitStatus.IN_PROGRESS, "In-progress tasks")
+
+
+def _blocked_listing(units: list) -> list[str]:
+    """B9: list every blocked task so the user sees which ones need external action."""
+    return _unit_status_listing(units, WorkUnitStatus.BLOCKED, "Blocked tasks")
 
 
 def generate_report(
@@ -839,20 +1062,23 @@ def generate_report(
     # are visible at a glance without scanning across the wider window-stats table.
     lifetime_stats: WindowStats | None = (
         _compute_window_stats(
-            log_path, log_start_for_window, window_end, done_times, progress_times, backlog.tasks_remaining
+            log_path, log_start_for_window, window_end, done_times, progress_times, backlog.tasks_active
         )
         if log_started is not None
         else None
     )
 
     lines: list[str] = []
-    lines.extend(_render_table("Backlog state", _backlog_state_rows(backlog, lifetime_stats)))
+    backlog_state_block = _render_table("Backlog state", _backlog_state_rows(backlog, lifetime_stats))
 
     if since is not None:
         # Single-window mode (legacy API for callers passing --since explicitly).
+        # Kept stacked — the single window block stays beneath the Backlog state
+        # box the way older callers / tests expect it.
         single_stats = _compute_window_stats(
-            log_path, since, window_end, done_times, progress_times, backlog.tasks_remaining
+            log_path, since, window_end, done_times, progress_times, backlog.tasks_active
         )
+        lines.extend(backlog_state_block)
         lines.append("")
         lines.extend(
             _render_table(
@@ -864,7 +1090,9 @@ def generate_report(
         lines.append(f"\nTasks in this session: {single_stats.tasks_in_window}")
         summary_stats = single_stats
     else:
-        # Default: render Backlog state + multi-column window-stats table.
+        # Default: Backlog state (LEFT) and multi-column Window stats (RIGHT),
+        # rendered side-by-side with a SIDE_BY_SIDE_GAP_CHARS-wide gutter so
+        # both boxes are visible on one screen of sufficient width.
         # Lifetime stats (already computed above) double as the All-time column,
         # so we don't re-walk the hook log for the same window.
         windows: list[WindowSpec] = [
@@ -883,27 +1111,35 @@ def generate_report(
             else:
                 all_window_stats.append(
                     _compute_window_stats(
-                        log_path, w.start, window_end, done_times, progress_times, backlog.tasks_remaining
+                        log_path, w.start, window_end, done_times, progress_times, backlog.tasks_active
                     )
                 )
 
         column_labels = [_short_window_label(w.label, w.start, display_tz) for w in windows]
         value_columns = [_stats_to_value_list(s) for s in all_window_stats]
-        # Transpose: rows = list of (metric, [value_for_each_window])
-        multi_rows = [(metric, [col[i] for col in value_columns]) for i, metric in enumerate(_METRIC_LABELS)]
+        # Transpose: rows = list of (metric, [value_for_each_window]).
+        # Spanning metrics collapse into a single value cell when every column
+        # holds the same number — see `_merge_spanning_values`.
+        multi_rows: list[tuple[str, list[str] | str]] = [
+            (metric, _merge_spanning_values(metric, [col[i] for col in value_columns]))
+            for i, metric in enumerate(_METRIC_LABELS)
+        ]
 
-        lines.append("")
-        lines.extend(_render_multi_column_table("Window stats", column_labels, multi_rows))
+        window_stats_block = _render_multi_column_table("Window stats", column_labels, multi_rows)
+        lines.extend(_render_side_by_side(backlog_state_block, window_stats_block))
         # Use the All-time stats for the trailing prose projection — they're the
         # most stable sample. Narrower windows can have zero completed tasks
         # (e.g. just after a restart) which would project meaningless numbers.
         summary_stats = all_window_stats[0]
 
     lines.append("")
-    lines.append(_summary_line(summary_stats, backlog.tasks_remaining))
+    lines.append(_summary_line(summary_stats, backlog.tasks_active, backlog.tasks_blocked))
     if summary_stats.cost.total_cost:
         lines.append(_cost_basis_line())
     if since is None:
         lines.append("\n" + _windows_explanation())
+        # B9: per-unit listings at the very end so the user can act on each.
+        lines.extend(_in_progress_listing(units))
+        lines.extend(_blocked_listing(units))
 
     return "\n".join(lines)

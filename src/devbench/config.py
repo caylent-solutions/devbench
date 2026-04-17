@@ -43,6 +43,7 @@ from devbench.constants import (
     DEFAULT_MAX_RETRY_ATTEMPTS,
     DEFAULT_ORCHESTRATOR_POLL_INTERVAL,
     DEFAULT_OUTPUT_TRUNCATION_LIMIT,
+    DEFAULT_RECENT_PACE_TASKS,
     DEFAULT_SECURITY_FETCH_TIMEOUT,
     DEFAULT_STOP_HOOK_MAX_BLOCKS,
     DEFAULT_STOP_HOOK_STALE_TASK_MINUTES,
@@ -246,6 +247,13 @@ REPORT_DATA_RESIDENCY_MULTIPLIER: float = _resolve_float(
     "JUDGE_REPORT_DATA_RESIDENCY_MULTIPLIER",
     RUNTIME_CONFIG.report.data_residency_multiplier,
     DEFAULT_DATA_RESIDENCY_MULTIPLIER,
+)
+# Number of most-recent task completions averaged for the "Recent pace"
+# projection in `devbench report`. Resolution precedence: env > YAML > constant.
+RECENT_PACE_TASKS: int = _resolve_int(
+    "JUDGE_REPORT_RECENT_PACE_TASKS",
+    RUNTIME_CONFIG.report.recent_pace_tasks,
+    DEFAULT_RECENT_PACE_TASKS,
 )
 STOP_HOOK_MAX_BLOCKS: int = _resolve_int(
     "JUDGE_STOP_MAX_BLOCKS", RUNTIME_CONFIG.stop_hook.max_blocks, DEFAULT_STOP_HOOK_MAX_BLOCKS

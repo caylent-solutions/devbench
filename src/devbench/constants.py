@@ -208,6 +208,26 @@ DEFAULT_TOKEN_COST_PER_M_OUTPUT: float = 25.0
 # validator can trust its own data.
 EM_DASH: str = "\u2014"
 
+# Minimum number of completed tasks required before per-window pace numbers
+# (avg_minutes, est_hours) are considered statistically meaningful. Below this
+# threshold the report renders "n/a (N=X samples)" rather than projecting from
+# a single completion that could swing wildly with the next task. 3 is small
+# enough to be responsive once a session has produced a few completions but
+# large enough to avoid the N=1 fragility seen in production reports.
+MIN_PACE_SAMPLES: int = 3
+
+# Default number of most recently completed tasks to average for the "Recent
+# pace" projection. Used when at least this many completions exist; otherwise
+# the report falls back to All-time pace. Overridable via
+# `report.recent_pace_tasks` YAML or `JUDGE_REPORT_RECENT_PACE_TASKS` env.
+DEFAULT_RECENT_PACE_TASKS: int = 10
+
+# Whitespace columns between the two side-by-side tables rendered by
+# `devbench report` (Backlog state on left, Window stats on right). Pure
+# rendering affordance — kept as a constant so the gap is consistent and
+# editable from one place.
+SIDE_BY_SIDE_GAP_CHARS: int = 4
+
 # Timeout defaults (seconds)
 DEFAULT_GH_API_TIMEOUT: int = 30
 DEFAULT_TEST_TIMEOUT: int = 300

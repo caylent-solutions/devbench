@@ -224,6 +224,11 @@
         "data_residency_multiplier": {
           "type": "number",
           "description": "Cost multiplier when usage.inference_geo is set (US-only inference). Defaults to 1.10 (Anthropic's published rate). Counted in v1 but not yet applied per-call."
+        },
+        "recent_pace_tasks": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Number of most-recently-completed tasks averaged for the 'Recent pace' projection in `devbench report`. Defaults to 10. Lower for more responsiveness, higher for more stability. Override via JUDGE_REPORT_RECENT_PACE_TASKS env var."
         }
       }
     }

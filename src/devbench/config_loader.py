@@ -182,6 +182,9 @@ class ReportConfig:
             write tokens, relative to the base input rate.
         data_residency_multiplier: Cost multiplier when usage.inference_geo
             is set (US-only inference).
+        recent_pace_tasks: Number of most recently completed tasks to average
+            for the "Recent pace" projection. ``None`` falls back to
+            ``DEFAULT_RECENT_PACE_TASKS``.
     """
 
     token_cost_per_million_input: float = DEFAULT_TOKEN_COST_PER_M_INPUT
@@ -191,6 +194,7 @@ class ReportConfig:
     cache_write_5min_multiplier: float | None = None
     cache_write_1hr_multiplier: float | None = None
     data_residency_multiplier: float | None = None
+    recent_pace_tasks: int | None = None
 
 
 @dataclass
@@ -472,6 +476,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         data_residency_multiplier=(
             float(report_raw["data_residency_multiplier"]) if "data_residency_multiplier" in report_raw else None
         ),
+        recent_pace_tasks=(int(report_raw["recent_pace_tasks"]) if "recent_pace_tasks" in report_raw else None),
     )
 
     # Populate StopHookConfig from YAML stop_hook block.

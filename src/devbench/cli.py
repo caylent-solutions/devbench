@@ -43,10 +43,19 @@ for easy parsing by Claude Code or other automation.
 import json
 import logging
 import os
+import shutil
+import subprocess
 import sys
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
+
+# Resolved once at import time so each watch tick doesn't re-PATH-search.
+# Used by `cmd_report --watch` to clear both the viewport AND the scrollback
+# between frames. The fallback escape sequence ``\033c`` is the VT100 RIS
+# (Reset to Initial State) — works on every modern terminal but is more
+# disruptive (resets colors). Prefer the OS clear binary when available.
+_TERMINAL_CLEAR_CMD: str | None = shutil.which("clear") or shutil.which("cls")
 
 
 # Pre-parse --config before any devbench imports so that config.py loads the
@@ -302,7 +311,16 @@ def cmd_report(since: str = "", watch_interval: int = 0) -> int:
         report_started_at = datetime.now(UTC)
         try:
             while True:
-                print("\033[H\033[J", end="")  # clear screen
+                # Delegate to the OS clear binary when available (`clear` /
+                # `cls`); it uses terminfo and reliably wipes scrollback on
+                # xterm.js (VS Code), iTerm, GNOME Terminal, Windows Terminal.
+                # Fallback: VT100 full reset (\033c) which works on every
+                # ANSI terminal but is more disruptive. The prior \033[3J
+                # escape didn't reliably clear scrollback in all terminals.
+                if _TERMINAL_CLEAR_CMD:
+                    subprocess.run([_TERMINAL_CLEAR_CMD], check=False)
+                else:
+                    print("\033c", end="", flush=True)
                 report = generate_report(log_path=log_file, since=since_dt, report_started_at=report_started_at)
                 print(report)
                 time.sleep(watch_interval)

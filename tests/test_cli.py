@@ -2857,6 +2857,60 @@ class TestCmdReport:
         assert result == 0
         assert call_count == 1
 
+    def test_cmd_report_watch_invokes_clear_command_each_tick(self) -> None:
+        """Each watch tick must clear the terminal viewport AND scrollback.
+
+        When the OS provides a `clear` (or `cls`) binary, we delegate to it via
+        subprocess — terminfo handles the right sequence per terminal, including
+        the scrollback erase that bare `\\033[H\\033[2J` does not perform on
+        all terminals (notably VS Code's xterm.js where the prior `\\033[3J`
+        approach was unreliable).
+        """
+
+        def fake_sleep(seconds: float) -> None:
+            raise KeyboardInterrupt
+
+        captured_clear_calls: list[list[str]] = []
+
+        def fake_run(cmd: list[str], **kwargs: object) -> object:
+            captured_clear_calls.append(cmd)
+
+            class _Done:
+                returncode = 0
+
+            return _Done()
+
+        with (
+            patch("devbench.reporting.report.generate_report", return_value="frame"),
+            patch("time.sleep", side_effect=fake_sleep),
+            patch("devbench.cli._TERMINAL_CLEAR_CMD", "/usr/bin/clear"),
+            patch("devbench.cli.subprocess.run", side_effect=fake_run),
+        ):
+            result = cli.cmd_report(watch_interval=1)
+
+        assert result == 0
+        # First tick must have called subprocess.run with the resolved clear path.
+        assert captured_clear_calls
+        assert captured_clear_calls[0] == ["/usr/bin/clear"]
+
+    def test_cmd_report_watch_falls_back_to_ris_when_no_clear_binary(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """When no `clear`/`cls` binary is on PATH, fall back to VT100 RIS."""
+
+        def fake_sleep(seconds: float) -> None:
+            raise KeyboardInterrupt
+
+        with (
+            patch("devbench.reporting.report.generate_report", return_value="frame"),
+            patch("time.sleep", side_effect=fake_sleep),
+            patch("devbench.cli._TERMINAL_CLEAR_CMD", None),
+        ):
+            result = cli.cmd_report(watch_interval=1)
+
+        out = capsys.readouterr().out
+        assert result == 0
+        # Full reset escape (RIS) emitted on stdout.
+        assert "\033c" in out
+
 
 class TestMainWatchFlagParsing:
     """Test --watch / -w flag extraction in main() (lines 978-988)."""

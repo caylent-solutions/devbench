@@ -58,6 +58,7 @@ What devbench does today, grouped by theme:
 - A separate security judge runs sequentially after the review tier passes.
 - Done-gate enforces all four review judges must REVIEW_PASS before a unit can be marked done.
 - Review failures inject prior feedback into the next executor attempt to prevent loops.
+- A fifth, conditional judge (`manifest-amender`) runs before `review-supervisor` when an executor-emitted amendment request file is pending. On approval the amender invokes `apply-amendment`, which atomically updates the Changes Manifest and runs a deterministic Layer 3 post-check (em-dash scan plus `validate-backlog`) with rollback on any failure. Opt-in via `manifest_amendment.enabled: true` in `backlog/config/devbench.yaml`; see [authoring-manifests.md](authoring-manifests.md) and [manifest-amendments.md](manifest-amendments.md).
 
 ### Reliability
 - **Stop hook circuit breaker** prevents the orchestrator from stopping mid-loop when Claude Code attempts to stop after context compaction. Configurable max blocks within a time window before allowing stop.
@@ -80,6 +81,8 @@ What devbench does today, grouped by theme:
 - `devbench report` shows tasks completed, velocity, tokens consumed, estimated cost, and projection to completion.
 - Renders **two windows by default**: an **All-time** table (full orchestrator log) and a **Current run** table (most recent contiguous block of orchestration events; boundary detected as a >10-minute gap between consecutive `Set X to ...` log lines, configurable via `DEFAULT_CURRENT_RUN_GAP_MINUTES`). Pass `--since <ISO-8601>` for a single custom-window view. Display timestamps render in the timezone configured by `report.display_timezone` (or `JUDGE_REPORT_TIMEZONE` env var); when neither is set, the host's system local timezone is used. Internal computation stays in UTC. This matters when running inside a devcontainer or VM whose system TZ differs from your actual location.
 - `--watch N` flag refreshes the report every N seconds (replaces the external `watch` command pattern).
+- `devbench watch` prints a one-screen live dashboard of the currently-active orchestration (mode, active task, phase, latest agent thinking, recent tool calls, repo state, pending amendment). Read-only. Also supports `--watch N` for live refresh. See [watch-activity.md](watch-activity.md) and [ADR-04](adr/04-watch-dashboard.md).
+- **Task factory**: when an amendment is rejected because the fixes fall outside the source task's scope, the orchestrator invokes `blocker-resolver` + `task-factory` to generate draft work units with status `proposed`. The human reviews, edits, and promotes or rejects each draft. See [task-factory.md](task-factory.md) and [ADR-03](adr/03-task-factory.md). Opt-in per backlog via `task_factory.enabled: true`.
 - Token cost configurable per-model — see [model-pricing.md](model-pricing.md).
 - Rollup metrics: stories / features / epics auto-rolled to done.
 - Every tool call is logged to `hook-logs.jsonl` for cost accounting and audit.

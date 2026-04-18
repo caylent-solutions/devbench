@@ -125,6 +125,15 @@ All code in this work unit MUST comply with the following rules. These are check
 
 ## Changes Manifest
 
+<!--
+This template uses the pre-declared pattern: both the test file and the production file are listed
+so TDD GREEN can stage either or both without tripping the changes_manifest judge. See
+docs/authoring-manifests.md for the alternative patterns:
+  * Pattern 2: test-only, with Approach that says "stop and escalate if production fix is needed"
+  * Pattern 3: rely on the amendment workflow (docs/manifest-amendments.md) -- valid when the fix
+    is genuinely unpredictable at authoring time
+-->
+
 | File | Change |
 |------|--------|
 | `src/{path}/{file}.py` | New/Updated -- description |

@@ -97,6 +97,7 @@ class TestGuardVerdictFormatHook:
             "executor",
             "security_review",
             "blocker_resolver",
+            "manifest_amender",
         ],
     )
     def test_known_judge_names_are_accepted(self, judge_name: str) -> None:

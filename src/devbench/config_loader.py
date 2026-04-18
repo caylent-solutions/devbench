@@ -197,6 +197,46 @@ class ReportConfig:
     recent_pace_tasks: int | None = None
 
 
+@dataclass(frozen=True)
+class TaskFactoryConfig:
+    """Per-backlog task-factory configuration.
+
+    Controls whether the orchestrator invokes blocker-resolver + task-factory
+    after an amendment reject to generate `proposed` work units for the
+    out-of-scope production fixes the amender surfaced.
+
+    Attributes:
+        enabled: Whether the task-factory loop runs. Defaults to ``False``
+            so existing backlogs see no behavior change. Requires
+            ``manifest_amendment.enabled: true`` (task-factory runs from
+            the amendment-reject path).
+    """
+
+    enabled: bool = False
+
+
+@dataclass(frozen=True)
+class AmendmentConfig:
+    """Per-backlog Changes Manifest amendment workflow configuration.
+
+    Loaded from the ``manifest_amendment`` YAML section (opt-in, defaults off).
+    Consumed by the Layer 1 PreFilter in ``devbench.backlog.amendment``.
+
+    Attributes:
+        enabled: Whether the amendment workflow is active for this backlog.
+            Default ``False`` -- backlogs must explicitly opt in.
+        allowed_reasons: Set of amendment reasons this backlog accepts.
+            Requests whose reason is not in this set are rejected by the
+            pre-filter.
+        max_requests_per_execution: Upper bound on amendments applied to a
+            single task during one executor run; prevents amendment loops.
+    """
+
+    enabled: bool = False
+    allowed_reasons: frozenset[str] = field(default_factory=lambda: frozenset({"tdd_green_production_fix"}))
+    max_requests_per_execution: int = 1
+
+
 @dataclass
 class StopHookConfig:
     """Stop hook circuit breaker settings.
@@ -264,6 +304,8 @@ class RuntimeConfig:
     git_ops: GitOpsConfig = field(default_factory=GitOpsConfig)
     report: ReportConfig = field(default_factory=ReportConfig)
     stop_hook: StopHookConfig = field(default_factory=StopHookConfig)
+    manifest_amendment: AmendmentConfig = field(default_factory=AmendmentConfig)
+    task_factory: TaskFactoryConfig = field(default_factory=TaskFactoryConfig)
     allowed_orgs: list[str] = field(default_factory=list)
     judge_model: str | None = None
     executor_model: str | None = None
@@ -479,6 +521,36 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         recent_pace_tasks=(int(report_raw["recent_pace_tasks"]) if "recent_pace_tasks" in report_raw else None),
     )
 
+    # Populate ManifestAmendment config from YAML manifest_amendment block.
+    amendment_raw = raw.get("manifest_amendment") or {}
+    default_amendment = AmendmentConfig()
+    manifest_amendment = AmendmentConfig(
+        enabled=bool(amendment_raw.get("enabled", default_amendment.enabled)),
+        allowed_reasons=(
+            frozenset(amendment_raw["allowed_reasons"])
+            if "allowed_reasons" in amendment_raw
+            else default_amendment.allowed_reasons
+        ),
+        max_requests_per_execution=int(
+            amendment_raw.get("max_requests_per_execution", default_amendment.max_requests_per_execution)
+        ),
+    )
+
+    # Populate TaskFactory config from YAML task_factory block. Requires
+    # manifest_amendment.enabled when task_factory.enabled is true -- the
+    # loop runs after an amendment reject, so it has nothing to do when the
+    # amendment workflow itself is off.
+    task_factory_raw = raw.get("task_factory") or {}
+    default_task_factory = TaskFactoryConfig()
+    task_factory = TaskFactoryConfig(
+        enabled=bool(task_factory_raw.get("enabled", default_task_factory.enabled)),
+    )
+    if task_factory.enabled and not manifest_amendment.enabled:
+        raise ValueError(
+            f"Config file '{path}': task_factory.enabled: true requires manifest_amendment.enabled: true. "
+            "Task-factory runs from the amendment-reject path; it has nothing to do when amendments are off."
+        )
+
     # Populate StopHookConfig from YAML stop_hook block.
     stop_hook_raw = raw.get("stop_hook") or {}
     stop_hook = StopHookConfig(
@@ -500,6 +572,8 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         git_ops=git_ops,
         report=report,
         stop_hook=stop_hook,
+        manifest_amendment=manifest_amendment,
+        task_factory=task_factory,
         allowed_orgs=allowed_orgs,
         judge_model=raw.get("judge_model") or None,
         executor_model=raw.get("executor_model") or None,

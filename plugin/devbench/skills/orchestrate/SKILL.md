@@ -33,6 +33,24 @@ Process the backlog using the steps below, repeating until all work units are do
 
 4. Invoke `devbench:executor` with the unit ID.
 
+4b. Amendment check — handles TDD GREEN production fixes that were not pre-declared in the Changes Manifest:
+    a. Check whether the file `$JUDGE_WORKSPACE_ROOT/.devbench/amendments/<id>.json` exists. Use `test -f "$JUDGE_WORKSPACE_ROOT/.devbench/amendments/<id>.json"` in Bash.
+    b. If absent: proceed to step 5 unchanged. The executor did not request an amendment; the standard review pipeline applies.
+    c. If present: invoke `devbench:manifest-amender` with the unit ID.
+       - The agent reads the pending request, the work unit, and the staged diff; decides `apply` or `reject` on three semantic questions (Approach authorisation, scope minimality, justification coherence).
+       - On `apply`: the agent invokes `uv run devbench apply-amendment <id>`, which appends rows to the Changes Manifest and runs the Layer 3 deterministic post-check (manifest re-parse, em-dash scan, full `validate-backlog`). If post-check fails, `apply-amendment` atomically rolls back the write and the task is blocked via an audit comment.
+       - On `reject`: the agent first reverts every file listed in the pending request from the target repo (unstages, restores the tracked baseline, and cleans untracked additions) so stale staged edits do not leak into subsequent tasks. It then invokes `uv run devbench reject-amendment <id> "<reason>"`, which writes an audit comment, transitions the task to `blocked`, and archives the pending request to `<workspace>/.devbench/rejected-requests/<id>-<timestamp>.json` for blocker-resolver input. The git-cleanup recipe (restore --staged, checkout --, clean -f) appears in `plugin/devbench/agents/manifest-amender.md` and runs BEFORE the CLI invocation.
+       - Either way the agent finishes by running `uv run devbench log-verdict manifest_amender <id> <pass|fail> "<summary>"`.
+    d. After `manifest-amender` returns:
+       - If the verdict was `pass` (amendment applied and post-check passed): proceed to step 5. The review-supervisor judges now see the updated Changes Manifest.
+       - If the verdict was `fail` (rejected, or post-check rolled back): the task is already marked `blocked` with an audit comment. If `task_factory.enabled: true` in `backlog/config/devbench.yaml`, proceed to step 4c (blocker-resolver + task-factory). Otherwise, log a blocker comment and return to step 2.
+
+4c. Task-factory loop (runs only when `task_factory.enabled: true` and the amender just rejected):
+    a. Invoke `devbench:blocker-resolver` with the blocked task's ID. The agent reads the rejected-requests archive written by `reject-amendment` and emits a structured proposal JSON via `uv run devbench write-proposal <source-id>` describing one or more new work units that own the out-of-scope fixes.
+    b. If blocker-resolver's verdict is not `proposed` (e.g. `escalated` -- the rejection was legitimate but not decomposable into new work units): log a blocker comment and return to step 2.
+    c. Invoke `devbench:task-factory` with the same source task ID. The agent calls `uv run devbench materialise-proposal <source-id>`, which reads the proposal JSON, writes one draft `.md` per proposed task with `## Status: proposed`, and appends a row to `BACKLOG.md` for each.
+    d. After task-factory returns: log a blocker comment on the source task summarising the N proposed tasks created, then return to step 2. The source task remains `blocked` until the operator reviews and promotes the proposed tasks (via `uv run devbench promote-proposal <id>`) and they complete; promotion automatically wires the source task's dependencies so the orchestrator picks the source task back up only after the fixes land.
+
 5. Invoke `review-supervisor` with the unit ID.
    - If result is REVIEW_FAIL: go to step 6.
    - If result is REVIEW_PASS: go to step 7.

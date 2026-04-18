@@ -30,7 +30,9 @@ plugin/devbench/
 │   ├── executor.md              ← dev agent: implements work units via TDD
 │   ├── review-supervisor.md     ← discovers and invokes all review_team agents in parallel
 │   ├── security-reviewer.md     ← security review gate agent
-│   ├── blocker-resolver.md      ← dependency blocker assessment agent
+│   ├── blocker-resolver.md      ← dependency blocker assessment agent + proposal emission after amendment reject
+│   ├── manifest-amender.md      ← conditional judge for TDD GREEN manifest amendments
+│   ├── task-factory.md          ← materialises blocker-resolver proposals into draft `proposed` work units
 │   └── review_team/             ← review team agents invoked by review-supervisor
 │       ├── code-reviewer.md     ← SOLID, DRY, fail-fast, 12-factor review
 │       ├── test-reviewer.md     ← TDD discipline, test quality, assertions

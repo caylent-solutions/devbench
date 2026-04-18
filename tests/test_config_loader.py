@@ -1214,3 +1214,105 @@ class TestGitOpsConfig:
         )
         result = load_runtime_config(cfg, {})
         assert result.stop_hook.stale_task_minutes == 30
+
+
+class TestManifestAmendmentConfig:
+    """YAML loader correctly parses the opt-in manifest_amendment section."""
+
+    @staticmethod
+    def _write(path: Path, content: str) -> Path:
+        import textwrap
+
+        path.write_text(textwrap.dedent(content))
+        return path
+
+    def test_defaults_when_section_absent(self, tmp_path: Path) -> None:
+        """When the manifest_amendment section is omitted, the feature is disabled."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.manifest_amendment.enabled is False
+        assert result.manifest_amendment.max_requests_per_execution == 1
+        assert "tdd_green_production_fix" in result.manifest_amendment.allowed_reasons
+
+    def test_enabled_from_yaml(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            manifest_amendment:
+              enabled: true
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.manifest_amendment.enabled is True
+
+    def test_allowed_reasons_from_yaml(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            manifest_amendment:
+              enabled: true
+              allowed_reasons:
+                - tdd_green_production_fix
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.manifest_amendment.allowed_reasons == frozenset({"tdd_green_production_fix"})
+
+    def test_max_requests_per_execution_from_yaml(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            manifest_amendment:
+              enabled: true
+              max_requests_per_execution: 3
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.manifest_amendment.max_requests_per_execution == 3
+
+    def test_rejects_disallowed_reason(self, tmp_path: Path) -> None:
+        """Schema enumerates allowed_reasons values; unknown values fail validation."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            manifest_amendment:
+              enabled: true
+              allowed_reasons:
+                - unknown_reason
+            """,
+        )
+        with pytest.raises(ValueError, match="schema validation"):
+            load_runtime_config(cfg, {})
+
+    def test_rejects_unknown_key(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            manifest_amendment:
+              unknown_field: true
+            """,
+        )
+        with pytest.raises(ValueError, match="schema validation"):
+            load_runtime_config(cfg, {})

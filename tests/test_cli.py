@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from typing import Any, ClassVar
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -3159,3 +3160,728 @@ class TestRejectEmDash:
         """The guard must return None for clean text — double-hyphen is fine."""
         assert cli._reject_em_dash("feedback", "issue A -- still broken") is None
         assert cli._reject_em_dash("feedback", "") is None
+
+
+# ---------------------------------------------------------------------------
+# Amendment CLI commands
+# ---------------------------------------------------------------------------
+
+
+class TestCmdRequestAmendment:
+    """cmd_request_amendment reads JSON from stdin and delegates to write_request."""
+
+    _VALID_PAYLOAD: ClassVar[dict[str, Any]] = {
+        "reason": "tdd_green_production_fix",
+        "justification": "Test required a minimum production fix.",
+        "files_to_add": [{"path": "src/example/parser.py", "change": "use utf-8-sig codec"}],
+        "linked_acs": ["AC-TEST-001"],
+    }
+
+    def _stdin(self, monkeypatch: pytest.MonkeyPatch, text: str) -> None:
+        import io
+
+        monkeypatch.setattr("sys.stdin", io.StringIO(text))
+
+    def test_happy_path_writes_request(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._stdin(monkeypatch, json.dumps(self._VALID_PAYLOAD))
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_request_amendment("EX-F1-S1-T1")
+        assert rc == 0
+        out = capsys.readouterr().out
+        summary = json.loads(out)
+        assert summary["task_id"] == "EX-F1-S1-T1"
+        assert summary["reason"] == "tdd_green_production_fix"
+        assert (tmp_path / ".devbench/amendments/EX-F1-S1-T1.json").exists()
+
+    def test_empty_stdin_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._stdin(monkeypatch, "")
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_request_amendment("EX-F1-S1-T1")
+        assert rc == 1
+        assert "must be provided on stdin" in capsys.readouterr().err
+
+    def test_invalid_json_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._stdin(monkeypatch, "{not json")
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_request_amendment("EX-F1-S1-T1")
+        assert rc == 1
+        assert "not valid JSON" in capsys.readouterr().err
+
+    def test_non_object_payload_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._stdin(monkeypatch, json.dumps(["array", "not", "object"]))
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_request_amendment("EX-F1-S1-T1")
+        assert rc == 1
+        assert "must be a JSON object" in capsys.readouterr().err
+
+    def test_schema_violation_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        bad = dict(self._VALID_PAYLOAD)
+        del bad["reason"]
+        self._stdin(monkeypatch, json.dumps(bad))
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_request_amendment("EX-F1-S1-T1")
+        assert rc == 1
+        assert "invalid" in capsys.readouterr().err
+
+    def test_duplicate_request_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._stdin(monkeypatch, json.dumps(self._VALID_PAYLOAD))
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            assert cli.cmd_request_amendment("EX-F1-S1-T1") == 0
+        # Second call with a fresh stdin attempts to write duplicate
+        self._stdin(monkeypatch, json.dumps(self._VALID_PAYLOAD))
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_request_amendment("EX-F1-S1-T1")
+        assert rc == 1
+        assert "already exists" in capsys.readouterr().err
+
+
+class TestCmdApplyAmendment:
+    """cmd_apply_amendment delegates to apply_amendment and handles AmendmentError."""
+
+    def test_happy_path(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+
+        with patch("devbench.cli.apply_amendment") as mock_apply:
+            mock_apply.return_value = None
+            rc = cli.cmd_apply_amendment("EX-F1-S1-T1")
+        assert rc == 0
+        assert "applied" in capsys.readouterr().out
+        mock_apply.assert_called_once()
+
+    def test_amendment_error_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        from devbench.backlog.amendment import AmendmentError
+
+        with patch("devbench.cli.apply_amendment", side_effect=AmendmentError("post-check failed")):
+            rc = cli.cmd_apply_amendment("EX-F1-S1-T1")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "post-check failed" in err
+
+
+class TestCmdRejectAmendment:
+    """cmd_reject_amendment delegates to reject_amendment and handles AmendmentError."""
+
+    def test_happy_path(self, capsys: pytest.CaptureFixture[str]) -> None:
+        with patch("devbench.cli.reject_amendment") as mock_reject:
+            mock_reject.return_value = None
+            rc = cli.cmd_reject_amendment("EX-F1-S1-T1", "files not in diff")
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "rejected" in out
+        mock_reject.assert_called_once()
+
+    def test_em_dash_in_reason_rejected(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_reject_amendment("EX-F1-S1-T1", "bad\u2014reason")
+        assert rc == 1
+        assert "em-dash" in capsys.readouterr().err
+
+    def test_amendment_error_returns_1(self, capsys: pytest.CaptureFixture[str]) -> None:
+        from devbench.backlog.amendment import AmendmentError
+
+        with patch(
+            "devbench.cli.reject_amendment",
+            side_effect=AmendmentError("no pending request"),
+        ):
+            rc = cli.cmd_reject_amendment("EX-F1-S1-T1", "because")
+        assert rc == 1
+        assert "no pending request" in capsys.readouterr().err
+
+
+class TestCmdWatch:
+    """cmd_watch snapshot + live-tail behaviour."""
+
+    def _fake_snapshot(self) -> object:
+        from devbench.activity import ActivitySnapshot
+
+        return ActivitySnapshot(
+            now=__import__("datetime").datetime.now(tz=__import__("datetime").timezone.utc),
+            mode_label="standard multi-PR",
+            active_task_id=None,
+            active_task_title=None,
+            active_task_status=None,
+            claimed_at=None,
+            phase="idle",
+            last_tool_call_at=None,
+            subagent=None,
+            recent_cli=[],
+            repo_state=None,
+            amendment=None,
+            idle_seconds=0,
+        )
+
+    def test_cmd_watch_one_shot_returns_zero(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """watch_interval=0 runs once, prints the snapshot, and returns 0."""
+        fake_snap = self._fake_snapshot()
+        with (
+            patch("devbench.activity.collect_snapshot", return_value=fake_snap),
+            patch("devbench.activity.render_snapshot", return_value="dashboard frame"),
+        ):
+            rc = cli.cmd_watch(watch_interval=0)
+        assert rc == 0
+        assert "dashboard frame" in capsys.readouterr().out
+
+    def test_cmd_watch_watch_mode_interrupted(self) -> None:
+        """watch_interval > 0 loops until KeyboardInterrupt, exit code 0."""
+        calls = {"renders": 0}
+
+        def fake_render(_snapshot: object) -> str:
+            calls["renders"] += 1
+            return f"frame {calls['renders']}"
+
+        def fake_sleep(_seconds: float) -> None:
+            raise KeyboardInterrupt
+
+        with (
+            patch("devbench.activity.collect_snapshot", return_value=self._fake_snapshot()),
+            patch("devbench.activity.render_snapshot", side_effect=fake_render),
+            patch("time.sleep", side_effect=fake_sleep),
+        ):
+            rc = cli.cmd_watch(watch_interval=5)
+        assert rc == 0
+        assert calls["renders"] == 1
+
+    def test_cmd_watch_invokes_clear_command(self) -> None:
+        """Live mode clears the terminal between frames when a clear binary exists."""
+
+        def fake_sleep(_seconds: float) -> None:
+            raise KeyboardInterrupt
+
+        captured: list[list[str]] = []
+
+        def fake_run(cmd: list[str], **_kw: object) -> object:
+            captured.append(cmd)
+
+            class _Done:
+                returncode = 0
+
+            return _Done()
+
+        with (
+            patch("devbench.activity.collect_snapshot", return_value=self._fake_snapshot()),
+            patch("devbench.activity.render_snapshot", return_value="frame"),
+            patch("time.sleep", side_effect=fake_sleep),
+            patch("devbench.cli._TERMINAL_CLEAR_CMD", "/usr/bin/clear"),
+            patch("devbench.cli.subprocess.run", side_effect=fake_run),
+        ):
+            rc = cli.cmd_watch(watch_interval=1)
+        assert rc == 0
+        assert captured and captured[0] == ["/usr/bin/clear"]
+
+    def test_cmd_watch_falls_back_to_ris(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Without a clear binary, cmd_watch falls back to the VT100 RIS escape."""
+
+        def fake_sleep(_seconds: float) -> None:
+            raise KeyboardInterrupt
+
+        with (
+            patch("devbench.activity.collect_snapshot", return_value=self._fake_snapshot()),
+            patch("devbench.activity.render_snapshot", return_value="frame"),
+            patch("time.sleep", side_effect=fake_sleep),
+            patch("devbench.cli._TERMINAL_CLEAR_CMD", None),
+        ):
+            rc = cli.cmd_watch(watch_interval=1)
+        assert rc == 0
+        assert "\033c" in capsys.readouterr().out
+
+    def test_cmd_watch_registered_in_commands(self) -> None:
+        assert "watch" in cli._COMMANDS
+
+    def test_resolver_returns_none_on_unknown_repo(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """The inline repo resolver returns None when resolve_repo rejects the name."""
+        captured_resolver: dict[str, object] = {}
+
+        def fake_collect(**kwargs: object) -> object:
+            captured_resolver["fn"] = kwargs["repo_path_resolver"]
+            return self._fake_snapshot()
+
+        with (
+            patch("devbench.activity.collect_snapshot", side_effect=fake_collect),
+            patch("devbench.activity.render_snapshot", return_value="ok"),
+        ):
+            cli.cmd_watch(watch_interval=0)
+
+        resolver = captured_resolver["fn"]
+        assert callable(resolver)
+        assert resolver("no-such-repo") is None
+
+
+class TestMainWatchCommand:
+    """main() --watch dispatch for the watch command."""
+
+    def test_main_watch_with_watch_flag(self) -> None:
+        with (
+            patch("sys.argv", ["devbench", "watch", "--watch", "3"]),
+            patch("devbench.cli.cmd_watch", return_value=0) as mock_watch,
+        ):
+            rc = cli.main()
+        assert rc == 0
+        mock_watch.assert_called_once_with(watch_interval=3)
+
+    def test_main_watch_short_flag(self) -> None:
+        with (
+            patch("sys.argv", ["devbench", "watch", "-w", "2"]),
+            patch("devbench.cli.cmd_watch", return_value=0) as mock_watch,
+        ):
+            rc = cli.main()
+        assert rc == 0
+        mock_watch.assert_called_once_with(watch_interval=2)
+
+    def test_main_watch_no_flag_runs_once(self) -> None:
+        mock_fn = MagicMock(return_value=0)
+        with (
+            patch("sys.argv", ["devbench", "watch"]),
+            patch.dict(cli._COMMANDS, {"watch": (mock_fn, 0, "Dashboard")}),
+        ):
+            rc = cli.main()
+        assert rc == 0
+        mock_fn.assert_called_once_with()
+
+
+class TestCmdListProposals:
+    def test_none_when_no_proposals(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_list_proposals()
+        assert rc == 0
+        assert "No pending proposals" in capsys.readouterr().out
+
+    def test_lists_when_present(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        from devbench.backlog.proposal import Proposal, ProposedTask, write_proposal
+
+        proposal = Proposal(
+            source_task_id="E0-F1-S1-T1",
+            generated_at="2026-04-18T00:00:00Z",
+            rejection_reason="r",
+            proposed_tasks=[
+                ProposedTask(
+                    suggested_id="E0-F1-S1-T2",
+                    title="Fix X",
+                    files_to_own=["src/x.py"],
+                    linked_scenarios=["SC-01"],
+                    suggested_acs=["AC-FUNC-001 fix"],
+                    suggested_approach="ok",
+                )
+            ],
+        )
+        write_proposal(tmp_path, proposal)
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_list_proposals()
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "Pending proposals (1)" in out
+        assert "E0-F1-S1-T2" in out
+
+
+class TestCmdPromoteProposal:
+    def test_missing_args(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_promote_proposal("")
+        assert rc == 1
+
+    def test_all_from_requires_source(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_promote_proposal("--all-from", "")
+        assert rc == 1
+
+    def test_promote_error_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        from devbench.backlog.proposal import ProposalError
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli.promote_proposal", side_effect=ProposalError("nope")),
+        ):
+            rc = cli.cmd_promote_proposal("E0-F1-S1-T2")
+        assert rc == 1
+        assert "nope" in capsys.readouterr().err
+
+    def test_promote_happy_path(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        draft = tmp_path / "t.md"
+        draft.write_text("x")
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli.promote_proposal", return_value=draft),
+        ):
+            rc = cli.cmd_promote_proposal("E0-F1-S1-T2")
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "E0-F1-S1-T2" in out
+        assert "in-queue" in out
+
+    def test_promote_with_no_dep_flag(self, tmp_path: Path) -> None:
+        draft = tmp_path / "t.md"
+        draft.write_text("x")
+        seen: dict = {}
+
+        def fake(
+            *, workspace_root: Path, backlog_root: Path, backlog_index: Path, task_id: str, dep_on_source: bool = True
+        ) -> Path:
+            seen["dep"] = dep_on_source
+            seen["id"] = task_id
+            return draft
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli.promote_proposal", side_effect=fake),
+        ):
+            rc = cli.cmd_promote_proposal("--no-dep-on-source", "E0-F1-S1-T2")
+        assert rc == 0
+        assert seen["dep"] is False
+        assert seen["id"] == "E0-F1-S1-T2"
+
+    def test_promote_all_from_happy(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli.promote_all_from_source", return_value=[tmp_path / "a.md", tmp_path / "b.md"]),
+        ):
+            rc = cli.cmd_promote_proposal("--all-from", "E0-F1-S1-T1")
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert '"promoted_count": 2' in out
+
+    def test_promote_all_from_error(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        from devbench.backlog.proposal import ProposalError
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli.promote_all_from_source", side_effect=ProposalError("nothing to do")),
+        ):
+            rc = cli.cmd_promote_proposal("--all-from", "E0-F1-S1-T1")
+        assert rc == 1
+        assert "nothing to do" in capsys.readouterr().err
+
+
+class TestCmdRejectProposal:
+    def test_missing_reason(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_reject_proposal("E0-F1-S1-T2")
+        assert rc == 1
+
+    def test_reason_without_value(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_reject_proposal("E0-F1-S1-T2", "--reason")
+        assert rc == 1
+        assert "requires a value" in capsys.readouterr().err
+
+    def test_em_dash_in_reason_rejected(self, capsys: pytest.CaptureFixture[str]) -> None:
+        # Generic missing-value path (--reason without a value) returns 1.
+        rc = cli.cmd_reject_proposal("E0-F1-S1-T2", "--reason")
+        assert rc == 1
+
+    def test_em_dash_blocked_by_validator(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+        ):
+            # task_id first, then --reason with em-dash value.
+            rc = cli.cmd_reject_proposal("E0-F1-S1-T2", "--reason", "bad\u2014reason")
+        assert rc == 1
+        assert "em-dash" in capsys.readouterr().err
+
+    def test_happy_path(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        archive = tmp_path / "archive.md"
+        archive.write_text("x")
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli.reject_proposal", return_value=archive),
+        ):
+            rc = cli.cmd_reject_proposal("E0-F1-S1-T2", "--reason")
+            # "--reason" without value returns 1; the API requires both args.
+            assert rc == 1
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli.reject_proposal", return_value=archive),
+        ):
+            # Correct shape: task id first, then --reason <val> as separate args.
+            import sys as _sys
+
+            with patch.object(_sys, "argv", ["devbench", "reject-proposal", "E0-F1-S1-T2", "--reason", "wrong"]):
+                rc = cli.main()
+        assert rc == 0
+
+    def test_proposal_error_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        from devbench.backlog.proposal import ProposalError
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli.reject_proposal", side_effect=ProposalError("bad")),
+        ):
+            rc = cli.cmd_reject_proposal("E0-F1-S1-T2", "--reason")
+            assert rc == 1  # Without reason value
+
+
+class TestProposalCommandsRegistered:
+    def test_list_proposals_registered(self) -> None:
+        assert "list-proposals" in cli._COMMANDS
+        assert "promote-proposal" in cli._COMMANDS
+        assert "reject-proposal" in cli._COMMANDS
+
+
+class TestCmdMaterialiseProposal:
+    def test_missing_proposal(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+        ):
+            rc = cli.cmd_materialise_proposal("E0-F1-S1-T1")
+        assert rc == 1
+        assert "No proposal" in capsys.readouterr().err
+
+    def test_backlog_parse_error(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        from devbench.backlog.proposal import Proposal, ProposedTask, write_proposal
+
+        proposal = Proposal(
+            source_task_id="E0-F1-S1-T1",
+            generated_at="x",
+            rejection_reason="x",
+            proposed_tasks=[
+                ProposedTask(
+                    suggested_id="E0-F1-S1-T2",
+                    title="t",
+                    files_to_own=[],
+                    linked_scenarios=[],
+                    suggested_acs=[],
+                    suggested_approach="",
+                )
+            ],
+        )
+        write_proposal(tmp_path, proposal)
+        # BACKLOG.md missing -> parse_index raises FileNotFoundError.
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+        ):
+            rc = cli.cmd_materialise_proposal("E0-F1-S1-T1")
+        assert rc == 1
+
+    def test_source_task_not_in_backlog(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        from devbench.backlog.proposal import Proposal, ProposedTask, write_proposal
+
+        # Build minimal workspace where source-id in proposal doesn't exist in BACKLOG.
+        (tmp_path / "BACKLOG.md").write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F9-S9-T9 | Other | Task | done | None | caylent-solutions/git-repo | `backlog/E0-F9-S9-T9.md` |\n"
+        )
+        (tmp_path / "backlog").mkdir()
+        (tmp_path / "backlog" / "E0-F9-S9-T9.md").write_text("# E0-F9-S9-T9: Other\n\n## Status: done\n")
+        proposal = Proposal(
+            source_task_id="E0-F1-S1-T1",
+            generated_at="x",
+            rejection_reason="x",
+            proposed_tasks=[
+                ProposedTask(
+                    suggested_id="E0-F1-S1-T2",
+                    title="t",
+                    files_to_own=[],
+                    linked_scenarios=[],
+                    suggested_acs=[],
+                    suggested_approach="",
+                )
+            ],
+        )
+        write_proposal(tmp_path, proposal)
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+        ):
+            rc = cli.cmd_materialise_proposal("E0-F1-S1-T1")
+        assert rc == 1
+        assert "not found" in capsys.readouterr().err
+
+    def test_happy_path(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        from devbench.backlog.proposal import Proposal, ProposedTask, write_proposal
+
+        source_row = (
+            "| E0-F1-S1-T1 | Source | Task | blocked | None "
+            "| caylent-solutions/example | `backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |"
+        )
+        (tmp_path / "BACKLOG.md").write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            f"{source_row}\n"
+        )
+        story_dir = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+        (story_dir / "E0-F1-S1-T1.md").write_text(
+            "# E0-F1-S1-T1: Source\n\n## Status: blocked\n\n"
+            "## Target Repository\n\n- **Repo:** `caylent-solutions/example`\n\n"
+            "## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-TEST-001\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `a.py` | x |\n\n"
+            "## Definition of Done\n\n- [ ] complete\n"
+        )
+        proposal = Proposal(
+            source_task_id="E0-F1-S1-T1",
+            generated_at="2026-04-18T00:00:00Z",
+            rejection_reason="x",
+            proposed_tasks=[
+                ProposedTask(
+                    suggested_id="E0-F1-S1-T2",
+                    title="t",
+                    files_to_own=["src/a.py"],
+                    linked_scenarios=["SC-01"],
+                    suggested_acs=["AC-FUNC-001"],
+                    suggested_approach="do",
+                )
+            ],
+        )
+        write_proposal(tmp_path, proposal)
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+        ):
+            rc = cli.cmd_materialise_proposal("E0-F1-S1-T1")
+        assert rc == 0
+        assert "E0-F1-S1-T2" in capsys.readouterr().out
+
+
+class TestCmdWriteProposal:
+    def test_stdin_empty_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import io
+
+        monkeypatch.setattr("sys.stdin", io.StringIO(""))
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_write_proposal("E0-F1-S1-T1")
+        assert rc == 1
+        assert "required on stdin" in capsys.readouterr().err
+
+    def test_stdin_invalid_json(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import io
+
+        monkeypatch.setattr("sys.stdin", io.StringIO("not json"))
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_write_proposal("E0-F1-S1-T1")
+        assert rc == 1
+        assert "not valid JSON" in capsys.readouterr().err
+
+    def test_stdin_schema_violation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import io
+
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"source_task_id": "x"})))
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_write_proposal("E0-F1-S1-T1")
+        assert rc == 1
+        assert "invalid" in capsys.readouterr().err
+
+    def test_source_mismatch(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import io
+
+        payload = {
+            "source_task_id": "OTHER-SRC",
+            "generated_at": "t",
+            "rejection_reason": "r",
+            "proposed_tasks": [],
+        }
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_write_proposal("E0-F1-S1-T1")
+        assert rc == 1
+        assert "does not match argument" in capsys.readouterr().err
+
+    def test_happy_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import io
+
+        payload = {
+            "source_task_id": "E0-F1-S1-T1",
+            "generated_at": "2026-04-18T00:00:00Z",
+            "rejection_reason": "x",
+            "proposed_tasks": [
+                {
+                    "suggested_id": "E0-F1-S1-T2",
+                    "title": "t",
+                    "files_to_own": [],
+                    "linked_scenarios": [],
+                    "suggested_acs": [],
+                    "suggested_approach": "",
+                }
+            ],
+        }
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_write_proposal("E0-F1-S1-T1")
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "proposal_path" in out
+
+    def test_duplicate_write_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import io
+
+        from devbench.backlog.proposal import Proposal, ProposedTask, write_proposal
+
+        proposal = Proposal(
+            source_task_id="E0-F1-S1-T1",
+            generated_at="t",
+            rejection_reason="r",
+            proposed_tasks=[
+                ProposedTask(
+                    suggested_id="E0-F1-S1-T2",
+                    title="t",
+                    files_to_own=[],
+                    linked_scenarios=[],
+                    suggested_acs=[],
+                    suggested_approach="",
+                )
+            ],
+        )
+        write_proposal(tmp_path, proposal)
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(proposal.to_dict())))
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_write_proposal("E0-F1-S1-T1")
+        assert rc == 1
+        assert "already exists" in capsys.readouterr().err
+
+    def test_stdin_os_error_returns_1(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        class _FailStdin:
+            def read(self) -> str:
+                raise OSError("disconnected")
+
+        monkeypatch.setattr("sys.stdin", _FailStdin())
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_write_proposal("E0-F1-S1-T1")
+        assert rc == 1
+        assert "cannot read stdin" in capsys.readouterr().err

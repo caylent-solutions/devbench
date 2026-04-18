@@ -414,8 +414,10 @@ class TestDualWindowReport:
         # Multi-column header includes both window labels
         assert "All-time" in report
         assert "Session" in report
-        assert "Backlog state" in report
-        assert "Window stats" in report
+        # Consolidated grouped table uses uppercase section headers for
+        # BACKLOG STATE and the windowed sections.
+        assert "BACKLOG STATE" in report
+        assert "THROUGHPUT" in report
         # No "This run <timestamp>" column header when not in watch mode.
         # ("This run" appears in the trailing prose explanation, so check the
         # header form specifically.)
@@ -694,10 +696,12 @@ class TestAccurateCost:
         with _patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
             report = generate_report(log_path=log_file)
 
-        # All token types should appear in the lifetime breakdown rows of the top box.
-        assert "Lifetime tokens consumed" in report
+        # Token breakdown rows live in the TOKENS section of the consolidated
+        # table now (no more duplicated "Lifetime X" rows -- those were the
+        # same data as the All-time column and have been consolidated away).
+        assert "Tokens consumed" in report
         assert "1,000" in report  # cache reads
-        assert "Lifetime cache hit rate" in report
+        assert "Cache hit rate" in report
 
     def test_input_share_property(self) -> None:
         """input_share returns the measured input/output ratio (display-only metric)."""
@@ -1326,6 +1330,27 @@ class TestUnitListings:
         assert _in_progress_listing(units) == []
         assert _blocked_listing(units) == []
 
+    def test_proposed_listing_omitted_when_empty(self) -> None:
+        from devbench.backlog.work_unit import WorkUnitStatus
+        from devbench.reporting.report import _proposed_listing
+
+        units = [self._mk_unit("E0-F1-S1-T1", "t", WorkUnitStatus.IN_QUEUE)]
+        assert _proposed_listing(units) == []
+
+    def test_proposed_listing_renders_title_and_path(self) -> None:
+        from devbench.backlog.work_unit import WorkUnitStatus
+        from devbench.reporting.report import _proposed_listing
+
+        units = [
+            self._mk_unit("E0-F1-S1-T9", "Fix the gitdir guard", WorkUnitStatus.PROPOSED),
+            self._mk_unit("E0-F1-S1-T10", "Enable version subcommand", WorkUnitStatus.PROPOSED),
+        ]
+        lines = _proposed_listing(units)
+        assert lines[1] == "Proposed (2):"
+        # Each row: title (with padding) then file path.
+        assert any("Fix the gitdir guard" in line for line in lines)
+        assert any("Enable version subcommand" in line for line in lines)
+
 
 class TestSideBySideLayout:
     """B10: _render_side_by_side merges two blocks with a gap; the full report uses it."""
@@ -1350,10 +1375,11 @@ class TestSideBySideLayout:
         assert _render_side_by_side([], ["A", "B"]) == ["A", "B"]
         assert _render_side_by_side(["A", "B"], []) == ["A", "B"]
 
-    def test_generate_report_renders_tables_side_by_side(self, tmp_path: Path) -> None:
-        """End-to-end: every data row of the report contains BOTH a Backlog-state border
-        char AND a Window-stats border char on the same line — impossible in the old
-        stacked layout."""
+    def test_generate_report_renders_one_grouped_table(self, tmp_path: Path) -> None:
+        """End-to-end: the consolidated layout is a single grouped table with
+        uppercase section headers (BACKLOG STATE, THROUGHPUT, API USAGE,
+        TOKENS, COST), in that order, with the Metric | All-time | Session
+        column layout. The old two-box layout is gone."""
         log_file = tmp_path / "test.log"
         log_file.write_text(
             _make_log(
@@ -1364,11 +1390,20 @@ class TestSideBySideLayout:
             )
         )
         report = generate_report(log_path=log_file)
-        # At least one line must start with the top-left corner of the LEFT table
-        # AND contain the top-left corner of the RIGHT table mid-line. The old
-        # stacked layout only had one such corner per line.
-        combined_lines = [ln for ln in report.splitlines() if ln.count("\u250c") >= 2]
-        assert combined_lines, "Expected side-by-side layout (two top-left corners on one line) not found"
+        # Single table -- exactly ONE top-left corner appears in the output.
+        top_corners = report.count("\u250c")
+        assert top_corners == 1, f"Expected 1 grouped table, got {top_corners} top-left corners in report"
+        # Section headers in the required order.
+        for section in ("BACKLOG STATE", "THROUGHPUT", "API USAGE", "TOKENS", "COST"):
+            assert section in report, f"Missing section header: {section}"
+        backlog_idx = report.find("BACKLOG STATE")
+        throughput_idx = report.find("THROUGHPUT")
+        tokens_idx = report.find("TOKENS")
+        cost_idx = report.find("COST")
+        assert backlog_idx < throughput_idx < tokens_idx < cost_idx, "Section headers must appear in plan order"
+        # First column is labelled "Metric"; the old "Backlog state" and
+        # "Window stats" table titles are gone.
+        assert "Metric " in report
 
 
 class TestSpanningRows:

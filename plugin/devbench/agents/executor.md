@@ -39,6 +39,44 @@ Read and follow ALL instructions in:
      ```bash
      uv run devbench log-tdd $ARGUMENTS GREEN "Command: <test command>. Result: <N passed, 0 failed>. Files changed: <comma-separated implementation files>"
      ```
+     **Amendment path for TDD-discovered production fixes.** If the failing test exposed a
+     genuine bug that requires changing a production file (or any file) that was not
+     pre-declared in the work unit's `## Changes Manifest`, you have two options.
+     Pick the correct one based on the backlog's amendment configuration:
+
+     1. Check whether amendments are enabled for this backlog:
+        ```bash
+        grep -A 1 '^manifest_amendment:' "$JUDGE_WORKSPACE_ROOT/backlog/config/devbench.yaml" 2>/dev/null | grep -q 'enabled: true'
+        ```
+        Exit code 0 means amendments are enabled; non-zero means disabled (or the
+        config file is absent, which also counts as disabled).
+
+     2. If amendments are enabled:
+        a. Stage the minimum production fix needed for the test to pass (`git add <file>`).
+        b. Request an amendment by piping a JSON request on stdin:
+           ```bash
+           cat <<'EOF' | uv run devbench request-amendment $ARGUMENTS
+           {
+             "reason": "tdd_green_production_fix",
+             "justification": "<one or two sentences stating what the test exposed and why the minimum change is necessary>",
+             "files_to_add": [
+               {"path": "<staged file path>", "change": "<one-line description of the diff>"}
+             ],
+             "linked_acs": ["<AC-ID linked to this fix>"]
+           }
+           EOF
+           ```
+           The orchestrator's next step runs the `manifest-amender` agent, which decides
+           whether to apply or reject the amendment. Continue to REFACTOR and Phase 8
+           logging as normal; do NOT attempt to run the amender yourself.
+
+     3. If amendments are disabled: do NOT stage the production fix. Unstage anything
+        you staged with `git restore --staged <file>`. Log an escalation comment and
+        stop -- the task will be left for human review on the next orchestration
+        pickup:
+        ```bash
+        uv run devbench log-comment executor $ARGUMENTS "NEEDS_ESCALATION: test exposed a production bug outside the declared Changes Manifest. Files that would need to change: <list>. Amendment workflow is disabled for this backlog; a human must broaden the Changes Manifest or change the Approach before this task can proceed."
+        ```
    - REFACTOR: Clean up the implementation while all tests stay green. Re-run the suite
      after refactor to confirm, then log:
      ```bash

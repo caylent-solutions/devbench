@@ -48,7 +48,7 @@ Cache-write tokens are read from the nested `usage.cache_creation.ephemeral_5m_i
 
 **No blended-rate fallback.** If an entry lacks a `usage` block (a non-LLM tool call like Read/Bash, or a legacy record), it contributes zero cost. The duration is still counted for API-utilization metrics, but the token cost stays at zero rather than being filled in from a blended estimate. This is the fail-fast posture — missing cost data surfaces as a visibly-low number rather than a masked estimate.
 
-**No estimated input/output ratio.** The `Lifetime input / output share (measured)` row in the report is purely descriptive — it shows what your actual workload ratio works out to from real data. It is never used as an input to the cost formula.
+**No estimated input/output ratio.** The `Input / output share (measured)` row in the TOKENS section of the consolidated report is purely descriptive — it shows what your actual workload ratio works out to from real data. It is never used as an input to the cost formula.
 
 ---
 

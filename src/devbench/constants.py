@@ -62,10 +62,10 @@ SECURITY_ALERT_CATEGORIES: list[tuple[str, str]] = [
 # ---------------------------------------------------------------------------
 # Backlog status display values (used in CLI status summaries)
 # ---------------------------------------------------------------------------
-DISPLAY_STATUS_VALUES: list[str] = ["In Queue", "In Progress", "In Review", "Done", "Blocked"]
+DISPLAY_STATUS_VALUES: list[str] = ["In Queue", "In Progress", "In Review", "Done", "Blocked", "Proposed"]
 
 # Backlog manager recognized status labels (title-case, as in markdown tables)
-TABLE_STATUS_VALUES: frozenset[str] = frozenset({"In Queue", "In Progress", "In Review", "Done", "Blocked"})
+TABLE_STATUS_VALUES: frozenset[str] = frozenset({"In Queue", "In Progress", "In Review", "Done", "Blocked", "Proposed"})
 
 # ---------------------------------------------------------------------------
 # Traceability matrix format
@@ -124,6 +124,7 @@ STATUS_IN_PROGRESS: str = "in-progress"
 STATUS_IN_REVIEW: str = "in-review"
 STATUS_DONE: str = "done"
 STATUS_BLOCKED: str = "blocked"
+STATUS_PROPOSED: str = "proposed"
 
 # Ordered mapping from any accepted input form to the canonical write form.
 # Used by BacklogManager._set_status() for validation and normalisation.
@@ -133,6 +134,7 @@ VALID_STATUSES: dict[str, str] = {
     STATUS_IN_REVIEW: STATUS_IN_REVIEW,
     STATUS_DONE: STATUS_DONE,
     STATUS_BLOCKED: STATUS_BLOCKED,
+    STATUS_PROPOSED: STATUS_PROPOSED,
 }
 
 # ---------------------------------------------------------------------------

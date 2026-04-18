@@ -69,10 +69,44 @@ The following files are operational backlog-tracking artifacts. You may read the
 
 ---
 
+## PROPOSAL EMISSION (after amendment reject)
+
+When this agent is invoked immediately after the `manifest-amender` rejected an amendment (task-factory workflow), the following extra step applies. Detect this mode by checking for a rejected-requests archive file:
+
+```bash
+ls "$JUDGE_WORKSPACE_ROOT/.devbench/rejected-requests/$ARGUMENTS-"*.json 2>/dev/null
+```
+
+If any archive exists, decompose the rejected changes into one or more structured work units, each owning a distinct file or feature area from the rejected diff. Output the proposal JSON on stdout piped into `devbench write-proposal`:
+
+```bash
+cat <<'EOF' | uv run devbench write-proposal $ARGUMENTS
+{
+  "source_task_id": "<SOURCE-TASK-ID>",
+  "generated_at": "<UTC ISO-8601 timestamp>",
+  "rejection_reason": "<amender's rejection rationale>",
+  "proposed_tasks": [
+    {
+      "suggested_id": "<NEXT-FREE-TASK-ID>",
+      "title": "<short imperative title>",
+      "files_to_own": ["<relative/path/from/repo>"],
+      "linked_scenarios": ["<scenario or AC ID>"],
+      "suggested_acs": ["AC-... describe what the new task must satisfy"],
+      "suggested_approach": "<multi-line TDD approach: RED, GREEN, verify>"
+    }
+  ]
+}
+EOF
+```
+
+Allocate suggested IDs via `uv run devbench next` patterns or by scanning the Story directory yourself; the task-factory validates they are free before writing drafts. Skip emission when no rejected-requests archive exists (the normal `resolved`/`escalated` path below applies). Do NOT emit a proposal that re-proposes work the source task already owns -- the proposal must describe the out-of-scope fixes the amender surfaced, not a rewrite of the source task.
+
+---
+
 After completing your analysis, write your verdict using:
 
 ```
-uv run devbench log-comment blocker_resolver $ARGUMENTS "<resolved|escalated|blocked>: <one-line summary>"
+uv run devbench log-comment blocker_resolver $ARGUMENTS "<resolved|escalated|blocked|proposed>: <one-line summary>"
 ```
 
-Use `resolved` if blockers can be resolved within project standards, `escalated` if escalation is required. Detailed resolution strategies go in your response text.
+Use `resolved` if blockers can be resolved within project standards, `escalated` if escalation is required, or `proposed` if a proposal JSON was emitted for task-factory consumption. Detailed resolution strategies go in your response text.

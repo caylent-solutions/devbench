@@ -268,7 +268,7 @@ Context windows compress over time. Having the rules fresh in every work unit pr
 - `AC-SEC-NNN` -- Security requirements
 
 **5. Changes Manifest uses table format:**
-`| File | Change |` with one row per file. This is what the changes_manifest judge validates against.
+`| File | Change |` with one row per file. This is what the changes_manifest judge validates against. See [docs/authoring-manifests.md](authoring-manifests.md) for the three patterns that avoid the most common authoring defect (test-only manifests on tasks whose Approach authorises TDD GREEN production fixes), and for the runtime amendment workflow that rescues cases the author could not anticipate.
 
 **6. Every implementation task needs a lifecycle cycle AC:**
 If a task implements behavior, it must have an `AC-CYCLE` that proves the behavior works in a real operation cycle -- not just that a unit test passes. Example: "After implementation, create a temp git repo, call the function, verify the output."

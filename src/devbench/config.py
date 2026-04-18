@@ -215,6 +215,8 @@ except ValueError:
 UPDATE_SUBMODULE: bool = RUNTIME_CONFIG.git_ops.update_submodule
 SINGLE_BRANCH: str | None = RUNTIME_CONFIG.git_ops.single_branch
 DEFER_PR: bool = RUNTIME_CONFIG.git_ops.defer_pr
+MANIFEST_AMENDMENT_CONFIG = RUNTIME_CONFIG.manifest_amendment
+TASK_FACTORY_CONFIG = RUNTIME_CONFIG.task_factory
 TOKEN_COST_PER_M_INPUT: float = _resolve_float(
     None, RUNTIME_CONFIG.report.token_cost_per_million_input, DEFAULT_TOKEN_COST_PER_M_INPUT
 )

@@ -34,3 +34,26 @@ repos:
 #
 # git_ops:
 #   update_submodule: false
+
+# manifest_amendment: opt-in Changes Manifest amendment workflow.
+#
+# When enabled, executors that discover a required production fix during
+# TDD GREEN can request an amendment to the work unit's Changes Manifest.
+# A dedicated judge reviews the request, and on approval the manifest is
+# updated atomically with a Layer 3 deterministic post-check. When
+# disabled (the default), executors that hit an undeclared production fix
+# escalate for human review instead of staging the file.
+#
+# enabled                   (optional, default false) — set true to opt the
+#                           backlog into the amendment workflow.
+# allowed_reasons           (optional) — list of amendment reasons accepted
+#                           by this backlog. Default: ["tdd_green_production_fix"].
+# max_requests_per_execution (optional, default 1) — upper bound on
+#                           amendments applied to one task during one
+#                           executor run.
+#
+# manifest_amendment:
+#   enabled: false
+#   allowed_reasons:
+#     - tdd_green_production_fix
+#   max_requests_per_execution: 1

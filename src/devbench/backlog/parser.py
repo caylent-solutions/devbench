@@ -27,6 +27,7 @@ from devbench.constants import (
     STATUS_IN_PROGRESS,
     STATUS_IN_QUEUE,
     STATUS_IN_REVIEW,
+    STATUS_PROPOSED,
 )
 
 # ---------------------------------------------------------------------------
@@ -40,6 +41,7 @@ _RAW_STATUS_TO_ENUM: dict[str, WorkUnitStatus] = {
     STATUS_IN_REVIEW: WorkUnitStatus.IN_REVIEW,
     STATUS_DONE: WorkUnitStatus.DONE,
     STATUS_BLOCKED: WorkUnitStatus.BLOCKED,
+    STATUS_PROPOSED: WorkUnitStatus.PROPOSED,
 }
 
 # Pattern to determine work-unit type from the last segment of a compound ID.

@@ -13,6 +13,7 @@ class TestStatusStringConstants:
             STATUS_IN_PROGRESS,
             STATUS_IN_QUEUE,
             STATUS_IN_REVIEW,
+            STATUS_PROPOSED,
         )
 
         assert STATUS_IN_QUEUE == "in-queue"
@@ -20,12 +21,20 @@ class TestStatusStringConstants:
         assert STATUS_IN_REVIEW == "in-review"
         assert STATUS_DONE == "done"
         assert STATUS_BLOCKED == "blocked"
+        assert STATUS_PROPOSED == "proposed"
 
     def test_valid_statuses_is_in_constants(self) -> None:
         from devbench.constants import VALID_STATUSES
 
         assert isinstance(VALID_STATUSES, dict)
-        assert set(VALID_STATUSES.keys()) == {"in-queue", "in-progress", "in-review", "done", "blocked"}
+        assert set(VALID_STATUSES.keys()) == {
+            "in-queue",
+            "in-progress",
+            "in-review",
+            "done",
+            "blocked",
+            "proposed",
+        }
 
     def test_valid_statuses_keys_match_constants(self) -> None:
         from devbench.constants import (
@@ -34,6 +43,7 @@ class TestStatusStringConstants:
             STATUS_IN_PROGRESS,
             STATUS_IN_QUEUE,
             STATUS_IN_REVIEW,
+            STATUS_PROPOSED,
             VALID_STATUSES,
         )
 
@@ -42,6 +52,7 @@ class TestStatusStringConstants:
         assert STATUS_IN_REVIEW in VALID_STATUSES
         assert STATUS_DONE in VALID_STATUSES
         assert STATUS_BLOCKED in VALID_STATUSES
+        assert STATUS_PROPOSED in VALID_STATUSES
 
     def test_valid_statuses_still_importable_from_manager(self) -> None:
         """Backward-compatible re-export from manager.py."""

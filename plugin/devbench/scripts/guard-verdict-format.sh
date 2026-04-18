@@ -29,6 +29,7 @@ KNOWN_JUDGES=(
   "executor"
   "security_review"
   "blocker_resolver"
+  "manifest_amender"
 )
 
 EXPECTED_ORDER="log-verdict <judge> <unit-id> <verdict> [feedback]"

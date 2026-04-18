@@ -231,6 +231,41 @@
           "description": "Number of most-recently-completed tasks averaged for the 'Recent pace' projection in `devbench report`. Defaults to 10. Lower for more responsiveness, higher for more stability. Override via JUDGE_REPORT_RECENT_PACE_TASKS env var."
         }
       }
+    },
+    "manifest_amendment": {
+      "type": "object",
+      "description": "Opt-in configuration for the Changes Manifest amendment workflow. When enabled, executors that discover a required production fix during TDD GREEN can request an amendment to the Changes Manifest; a dedicated judge reviews the request, and on approval the manifest is updated atomically with a Layer 3 deterministic post-check.",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Whether the amendment workflow is active for this backlog. Default false (opt-in)."
+        },
+        "allowed_reasons": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["tdd_green_production_fix"]
+          },
+          "description": "List of amendment reasons this backlog accepts. Amendment requests whose reason is not in this list are rejected by the Layer 1 pre-filter. Default: ['tdd_green_production_fix']."
+        },
+        "max_requests_per_execution": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum amendments applied to one task during one executor run. Default 1. Prevents amendment loops."
+        }
+      }
+    },
+    "task_factory": {
+      "type": "object",
+      "description": "Opt-in configuration for the task-factory loop. When enabled, the orchestrator invokes blocker-resolver + task-factory after an amendment reject to generate new `proposed` work units for the out-of-scope production fixes the amender surfaced. Requires manifest_amendment.enabled: true.",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Whether the task-factory loop runs after amendment rejects. Default false (opt-in). Requires manifest_amendment.enabled: true."
+        }
+      }
     }
   }
 }

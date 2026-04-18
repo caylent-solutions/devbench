@@ -1,0 +1,162 @@
+"""Changes Manifest parser and writer for work-unit Markdown files.
+
+The Changes Manifest is a declarative table in each work-unit file that lists
+the files the executor is authorized to stage and the reason for each change.
+The ``changes_manifest`` judge enforces that the staged file set matches this
+manifest exactly.
+
+This module provides:
+
+- ``ManifestRow`` -- typed row with ``file`` and ``change`` fields.
+- ``parse_manifest`` -- extract rows from a work-unit Markdown string.
+- ``render_manifest_rows`` -- format rows as a stable Markdown table.
+- ``append_rows`` -- splice additional rows into an existing work-unit
+  Markdown string without modifying anything outside the Changes Manifest
+  section body.
+
+The writer is used by the manifest amendment workflow to add production-fix
+rows to a work-unit's manifest at runtime after a judge has approved the
+amendment. It is never used to remove rows.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+
+EM_DASH = "\u2014"
+MANIFEST_HEADER = "Changes Manifest"
+
+_SECTION_RE = re.compile(
+    rf"^(##\s+{re.escape(MANIFEST_HEADER)}\s*\n)(.*?)(?=^##\s|\Z)",
+    re.MULTILINE | re.DOTALL,
+)
+
+
+class ManifestParseError(ValueError):
+    """Raised when the Changes Manifest section cannot be parsed."""
+
+
+@dataclass(frozen=True)
+class ManifestRow:
+    """One row of the Changes Manifest table.
+
+    ``file`` is the path of the staged file, relative to the repo root.
+    ``change`` is a one-line description of what the executor changed.
+    Both values are validated on construction.
+    """
+
+    file: str
+    change: str
+
+    def __post_init__(self) -> None:
+        if not self.file:
+            raise ValueError("ManifestRow.file must be non-empty")
+        if self.file != self.file.strip():
+            raise ValueError(f"ManifestRow.file must not have leading/trailing whitespace: {self.file!r}")
+        if not self.change or not self.change.strip():
+            raise ValueError("ManifestRow.change must be non-empty")
+        if EM_DASH in self.file or EM_DASH in self.change:
+            raise ValueError(
+                "ManifestRow must not contain em-dash (U+2014). Use '--' instead. "
+                f"file={self.file!r} change={self.change!r}"
+            )
+
+
+def parse_manifest(content: str) -> list[ManifestRow]:
+    """Return the rows of the Changes Manifest table parsed from ``content``.
+
+    Returns an empty list when the section exists but contains only a header
+    and separator (no data rows).
+
+    Raises ``ManifestParseError`` if the ``## Changes Manifest`` section is
+    missing, if a row does not have exactly two columns, or if a cell
+    contains content that violates ``ManifestRow`` invariants (empty value,
+    em-dash, leading/trailing whitespace in the file path).
+    """
+    match = _SECTION_RE.search(content)
+    if match is None:
+        raise ManifestParseError(f"'## {MANIFEST_HEADER}' section not found in work-unit content")
+    return _parse_body(match.group(2))
+
+
+def render_manifest_rows(rows: list[ManifestRow]) -> str:
+    """Render ``rows`` as a Markdown table.
+
+    The output always has a ``| File | Change |`` header and a separator row.
+    When ``rows`` is empty the header and separator are returned with no
+    data rows. The output ends with a single newline so it can be spliced
+    directly into a Markdown document.
+    """
+    lines = ["| File | Change |", "|------|--------|"]
+    for row in rows:
+        lines.append(f"| `{row.file}` | {row.change} |")
+    return "\n".join(lines) + "\n"
+
+
+def append_rows(content: str, new_rows: list[ManifestRow]) -> str:
+    """Return ``content`` with ``new_rows`` appended to the Changes Manifest.
+
+    Existing manifest rows are preserved; new rows are appended in the
+    order given. Content outside the Changes Manifest section is left
+    byte-for-byte identical. Within the section, rows are re-rendered with
+    the canonical formatter so the resulting table is internally consistent.
+
+    Returns ``content`` unchanged when ``new_rows`` is empty. Raises
+    ``ManifestParseError`` if the section is missing or malformed.
+    """
+    if not new_rows:
+        return content
+
+    match = _SECTION_RE.search(content)
+    if match is None:
+        raise ManifestParseError(f"'## {MANIFEST_HEADER}' section not found in work-unit content")
+
+    existing = _parse_body(match.group(2))
+    combined = existing + list(new_rows)
+    rendered = render_manifest_rows(combined)
+
+    replacement = match.group(1) + "\n" + rendered + "\n"
+    return content[: match.start()] + replacement + content[match.end() :]
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _parse_body(body: str) -> list[ManifestRow]:
+    """Parse the body of the Changes Manifest section into typed rows."""
+    rows: list[ManifestRow] = []
+    for raw_line in body.splitlines():
+        line = raw_line.strip()
+        if not line or not line.startswith("|"):
+            continue
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        if _is_header_row(cells) or _is_separator_row(cells):
+            continue
+        if len(cells) != 2:
+            raise ManifestParseError(f"Manifest row must have exactly 2 columns, got {len(cells)}: {line!r}")
+        file_cell = cells[0].strip("`").strip()
+        change_cell = cells[1]
+        try:
+            rows.append(ManifestRow(file=file_cell, change=change_cell))
+        except ValueError as exc:
+            raise ManifestParseError(f"Invalid manifest row {line!r}: {exc}") from exc
+    return rows
+
+
+def _is_header_row(cells: list[str]) -> bool:
+    """Return ``True`` if ``cells`` is the ``| File | Change |`` header row."""
+    if len(cells) < 2:
+        return False
+    return cells[0].lower() == "file" and cells[1].lower() == "change"
+
+
+def _is_separator_row(cells: list[str]) -> bool:
+    """Return ``True`` if every cell in ``cells`` is an all-dashes separator."""
+    for cell in cells:
+        stripped = cell.replace(":", "").strip()
+        if not stripped or any(c != "-" for c in stripped):
+            return False
+    return bool(cells)

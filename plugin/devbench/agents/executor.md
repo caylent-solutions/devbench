@@ -243,6 +243,36 @@ Procedure (execute in order — each step is load-bearing):
 
 Scope discipline: use this procedure ONLY when the task itself is a validation gate. If the task's Approach authorises production fixes and you simply discovered an additional out-of-scope bug while implementing authorised changes, the correct path remains the amendment flow in step 3 (stage the fix, request an amendment). Do not use bug-escalation to route around a rejected amendment.
 
+## COMMENT LANGUAGE DISCIPLINE
+
+When you call `uv run devbench log-comment` or return a final assistant message, you MUST describe conditions factually. You MUST NOT use imperatives that direct the orchestrator's loop. The orchestrator decides its own control flow based ONLY on `uv run devbench next` and the stop-hook circuit breaker -- per the SKILL halt-discipline rule. Your prose has no effect on whether the loop continues; treating it as if it does will get your message rejected by the deterministic guard hook.
+
+Forbidden phrases (case-insensitive substring match -- enforced by `plugin/devbench/scripts/guard-comment-format.sh`):
+
+- `halt orchestration`
+- `halting orchestration`
+- `halt the loop`
+- `halt loop`
+- `stop the loop`
+- `stop orchestration`
+- `abort orchestration`
+- `operator action required`
+- `resume orchestration once`
+- `emergency halt`
+- `do not continue`
+
+Recommended pattern: name the condition, name the file paths or commit SHAs involved, suggest a technical fix if useful, then stop. Do NOT prescribe what the orchestrator should do with the loop.
+
+**Bad** (the hook will reject this `log-comment` call with exit 2):
+
+> Halting orchestration: commit abc1234 included files outside its manifest. Operator action required: revert the commit and resume orchestration once state is clean.
+
+**Good** (accepted):
+
+> Pollution detected: commit abc1234 staged 2 files outside its Changes Manifest (path/a.py, path/b.py). Those files contain failing tests that fail make validate at AC-FINAL-008. Recommended fix: revert abc1234 and re-run the source task, OR promote the proposed cleanup tasks if task-factory has emitted them.
+
+If the `guard-comment-format.sh` hook rejects your call with stderr `forbidden control-language phrase '<phrase>'`, rewrite the message removing the phrase and retry. Do NOT add `# noqa`-style bypass annotations or attempt to evade the hook -- that violates the prohibited-bypass rule.
+
 ## VERIFICATION REQUIREMENTS
 - After writing a file, read it back to confirm contents match intent.
 - After running a command, check exit codes and output.

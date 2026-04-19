@@ -65,6 +65,20 @@ Three possible causes:
 
 The orchestrator halts ONLY when (a) `devbench next` returns `ALL_DONE` / `NO_ACTIONABLE` or (b) the stop-hook circuit breaker trips. Per-task failures (git-ops orphan branch, manifest-scope violation, push rejection, executor retry budget exhausted, amendment rejected without a proposal) MUST mark the task `blocked` and return to step 2 -- they never halt the whole loop. If your orchestrator stopped on a per-task failure, the agent was running an older skill prompt; reinstall the plugin (`claude plugin install devbench --scope user`) to pick up the tightened halt-discipline rules.
 
+### Why did my `log-comment` call get rejected with "forbidden control-language phrase"?
+
+The `guard-comment-format.sh` PreToolUse hook rejects `uv run devbench log-comment` calls whose message body contains imperatives directed at the orchestrator's loop: `halt orchestration`, `halting orchestration`, `halt the loop`, `halt loop`, `stop the loop`, `stop orchestration`, `abort orchestration`, `operator action required`, `resume orchestration once`, `emergency halt`, `do not continue` (case-insensitive substring match).
+
+The rule exists because subagent prose is diagnostic narration, not loop control. The orchestrator's loop is owned exclusively by `uv run devbench next` and the stop-hook circuit breaker; any text in a subagent log-comment that reads as a halt directive is a prompt-injection vector that can make the orchestrator stop even when the SKILL halt-discipline rule says to continue. Prior incident: a downstream executor logged a comment opening with "Halting orchestration: ..." and the orchestrator LLM obeyed the prose instead of continuing the loop, leaving the orchestration idle for hours.
+
+Fix: rewrite the message describing the condition factually. Keep the diagnostic content; drop the imperatives. Example replacements:
+
+- `Halting orchestration: <X>` -> `<X> detected: ...`
+- `Operator action required: <Y>` -> `Recommended fix: <Y>`
+- `Resume orchestration once <Z>` -> `Source task remains blocked until <Z>`
+
+Do NOT add `# noqa`-style bypass annotations or attempt to evade the hook -- that violates the prohibited-bypass rule in CLAUDE.md. The hook is one of three defenses in depth; the other two are the SKILL halt-discipline section and the executor prompt's `COMMENT LANGUAGE DISCIPLINE` section.
+
 ## Task factory (proposed work units)
 
 ### My task got blocked with proposals -- what do I do?

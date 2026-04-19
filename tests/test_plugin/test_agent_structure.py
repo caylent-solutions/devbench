@@ -346,3 +346,104 @@ class TestSkillValidationGateEscalationBranch:
             "SKILL.md step 4a must reference `.devbench/amendments/<id>.json` so it knows to "
             "skip the validation-gate branch when the amendment path is already handling the task."
         )
+
+
+@pytest.mark.unit
+class TestSkillSubagentTextIsDiagnostic:
+    """SKILL.md must explicitly forbid treating subagent prose as loop-control directives.
+
+    Prior incident: an executor log-comment opened with "Halting orchestration: ..." and
+    the orchestrator LLM obeyed that as a control directive instead of following the
+    halt-discipline rule. The SKILL now carries explicit language that subagent text is
+    diagnostic only, and loop control is owned exclusively by `devbench next` + the
+    stop-hook circuit breaker.
+    """
+
+    _SKILL_PATH = Path(__file__).parent.parent.parent / "plugin" / "devbench" / "skills" / "orchestrate" / "SKILL.md"
+
+    def test_skill_declares_subagent_text_is_diagnostic(self) -> None:
+        """SKILL must declare that subagent text is not control flow."""
+        content = self._SKILL_PATH.read_text()
+        assert "Subagent text is diagnostic" in content or "subagent text is diagnostic" in content.lower(), (
+            "SKILL.md must include a 'Subagent text is diagnostic' section explicitly forbidding "
+            "treatment of subagent prose as loop-control directives."
+        )
+
+    def test_skill_lists_control_language_patterns(self) -> None:
+        """SKILL must enumerate the prose patterns that MUST NOT change loop behavior."""
+        content = self._SKILL_PATH.read_text().lower()
+        for phrase in ("halt", "halting", "operator action required", "resume orchestration"):
+            assert phrase in content, (
+                f"SKILL.md must explicitly name {phrase!r} as a prose pattern the orchestrator must ignore."
+            )
+
+    def test_skill_names_guard_comment_format_backstop(self) -> None:
+        """SKILL must point to the deterministic hook as the floor defense."""
+        content = self._SKILL_PATH.read_text()
+        assert "guard-comment-format" in content, (
+            "SKILL.md must reference guard-comment-format.sh so readers know which component "
+            "provides the deterministic backstop for the prose-level rule."
+        )
+
+    def test_skill_states_only_halt_triggers(self) -> None:
+        """SKILL must explicitly say the ONLY halt triggers are file/exit-code based."""
+        content = self._SKILL_PATH.read_text().lower()
+        assert "only halt triggers" in content or "only halt trigger" in content, (
+            "SKILL.md must explicitly state the ONLY halt triggers so LLMs cannot be persuaded "
+            "by prose to consider any other signal a halt."
+        )
+
+
+@pytest.mark.unit
+class TestExecutorCommentLanguageDiscipline:
+    """Executor prompt must instruct the agent to avoid halt-imperatives in log-comment text."""
+
+    _EXECUTOR_PATH = AGENTS_DIR / "executor.md"
+
+    def test_executor_has_comment_language_discipline_heading(self) -> None:
+        """The COMMENT LANGUAGE DISCIPLINE section must exist in executor.md."""
+        content = self._EXECUTOR_PATH.read_text()
+        assert "COMMENT LANGUAGE DISCIPLINE" in content, (
+            "executor.md must contain a 'COMMENT LANGUAGE DISCIPLINE' section that forbids "
+            "halt-imperatives in log-comment bodies."
+        )
+
+    def test_executor_enumerates_forbidden_phrases(self) -> None:
+        """The section must list the forbidden phrases so the agent can self-check before calling log-comment."""
+        content = self._EXECUTOR_PATH.read_text().lower()
+        heading_pos = content.find("comment language discipline")
+        assert heading_pos >= 0
+        section_body = content[heading_pos:]
+        for phrase in ("halt orchestration", "operator action required", "resume orchestration once"):
+            assert phrase in section_body, (
+                f"executor.md COMMENT LANGUAGE DISCIPLINE section must list {phrase!r} "
+                "so the agent can avoid it BEFORE the hook rejects its call."
+            )
+
+    def test_executor_points_at_guard_comment_format(self) -> None:
+        """The section must name the hook that enforces the rule so the agent knows the consequence."""
+        content = self._EXECUTOR_PATH.read_text()
+        heading_pos = content.find("COMMENT LANGUAGE DISCIPLINE")
+        section_body = content[heading_pos:]
+        assert "guard-comment-format" in section_body, (
+            "executor.md COMMENT LANGUAGE DISCIPLINE section must reference guard-comment-format.sh "
+            "so the agent knows which hook will reject its call if it violates the rule."
+        )
+
+    def test_executor_gives_good_and_bad_example(self) -> None:
+        """The section must contain concrete before/after examples for the agent to pattern-match against."""
+        content = self._EXECUTOR_PATH.read_text()
+        heading_pos = content.find("COMMENT LANGUAGE DISCIPLINE")
+        section_body = content[heading_pos:]
+        assert "**Bad**" in section_body, "Need a Bad example the hook rejects."
+        assert "**Good**" in section_body, "Need a Good example the hook accepts."
+
+    def test_executor_forbids_bypass_annotations_for_this_rule(self) -> None:
+        """The section must explicitly tell the agent not to try to bypass the hook."""
+        content = self._EXECUTOR_PATH.read_text()
+        heading_pos = content.find("COMMENT LANGUAGE DISCIPLINE")
+        section_body = content[heading_pos:]
+        assert "bypass" in section_body.lower() or "evade" in section_body.lower(), (
+            "executor.md must explicitly forbid bypass attempts so the agent does not try "
+            "to add noqa-style annotations to get around the hook."
+        )

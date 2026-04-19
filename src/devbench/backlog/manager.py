@@ -48,6 +48,7 @@ from devbench.constants import (
     EM_DASH,
     EPIC_ID_RE,
     STATUS_BLOCKED,
+    STATUS_DECLINED,
     STATUS_DONE,
     STATUS_IN_PROGRESS,
     STATUS_IN_QUEUE,
@@ -61,6 +62,11 @@ from devbench.constants import (
     TRACEABILITY_MATRIX_HEADER,
     VALID_STATUSES,
 )
+
+# Terminal statuses for parent-rollup purposes: a child in either state is
+# "finalised" and does not block its parent from rolling to done. Kept at
+# module level so tests can import and assert the exact set.
+_TERMINAL_CHILD_STATUSES: frozenset[str] = frozenset({STATUS_DONE, STATUS_DECLINED})
 
 
 class BacklogManager:
@@ -141,6 +147,28 @@ class BacklogManager:
         self._set_status(work_unit_path, backlog_index, unit_id, STATUS_BLOCKED)
         self._append_comment(work_unit_path, "BLOCKED", reason)
 
+    def mark_declined(self, work_unit_path: Path, backlog_index: Path, unit_id: str, reason: str) -> None:
+        """Mark a work unit as Declined in both files and append a comment.
+
+        Declined means "this work has been determined to never be done" -- a
+        deliberate, final decision distinct from Blocked (waiting) and Done
+        (completed). Children marked Declined count as terminal-complete for
+        parent rollup purposes (see :meth:`_all_children_done`).
+
+        Args:
+            work_unit_path: Path to the work-unit ``.md`` file.
+            backlog_index: Path to the ``BACKLOG.md`` file.
+            unit_id: The work-unit identifier.
+            reason: Human-readable rationale for the decision. Captured in
+                the Comments audit trail alongside a ``[DECLINED]`` marker.
+
+        Raises:
+            FileNotFoundError: If either file does not exist.
+            ValueError: If the status line or unit row is not found.
+        """
+        self._set_status(work_unit_path, backlog_index, unit_id, STATUS_DECLINED)
+        self._append_comment(work_unit_path, "DECLINED", reason)
+
     def validate(self, backlog_index: Path, workspace_root: Path) -> list[str]:
         """Check backlog integrity and return a list of error messages.
 
@@ -214,10 +242,25 @@ class BacklogManager:
                     errors.append(f"{rel}: orphaned work unit file not in BACKLOG.md")
 
     def _check_dependencies(self, backlog_index: Path, known_ids: set[str], errors: list[str]) -> None:
-        """Check 4: all dependency IDs reference real IDs."""
+        """Check 4: all dependency IDs in the Full Work Unit Index reference real IDs.
+
+        The Status Summary table has the same cell count as the Full Work
+        Unit Index after the Declined column was added, so a naive pipe-row
+        scan would mis-parse Summary rows as index rows. Track the current
+        ``##`` section to scope dependency parsing to the index only.
+        """
         content = backlog_index.read_text(encoding="utf-8")
+        in_full_index = False
         for line in content.splitlines():
-            if not line.strip().startswith("|"):
+            # Section tracking: dependency parsing is valid only inside the
+            # Full Work Unit Index section. Any other ## header closes it.
+            stripped = line.strip()
+            if stripped.startswith("## "):
+                in_full_index = "Full Work Unit Index" in stripped
+                continue
+            if not in_full_index:
+                continue
+            if not stripped.startswith("|"):
                 continue
             cells = [c.strip() for c in line.split("|")]
             if len(cells) != BACKLOG_INDEX_CELL_COUNT:
@@ -377,7 +420,13 @@ class BacklogManager:
         return rows
 
     def _all_children_done(self, rows: list[tuple[str, str, str]], parent_id: str) -> bool:
-        """Check if the parent exists, is not already Done, and all direct children are Done."""
+        """Check if the parent exists, is not already Done, and all direct children are in a terminal state.
+
+        A child is "terminal" when its status is Done OR Declined. Declined
+        work has been intentionally taken off the table; it should not block
+        the parent from rolling to Done. Done + Declined together mean every
+        child has been resolved one way or the other.
+        """
         parent_depth = parent_id.count("-")
         parent_found = False
         has_children = False
@@ -391,7 +440,7 @@ class BacklogManager:
 
             if row_id.startswith(parent_id + "-") and row_id.count("-") == parent_depth + 1:
                 has_children = True
-                if status != STATUS_DONE:
+                if status not in _TERMINAL_CHILD_STATUSES:
                     return False
 
         return parent_found and has_children
@@ -590,10 +639,11 @@ class BacklogManager:
     def _compute_epic_counts(self, rows: list[tuple[str, str, str]]) -> dict[str, dict[str, int]]:
         """Compute per-epic status counts from backlog rows.
 
-        Returns a dict mapping epic_id -> {status: count} where status is one of
-        the canonical status strings (``done``, ``in-progress``, ``in-queue``,
-        ``blocked``).  Only descendant rows (those starting with
-        ``<epic-id>-``) are counted; the epic row itself is excluded.
+        Returns a dict mapping epic_id -> {status: count} where status is one
+        of ``done``, ``in-progress``, ``in-queue``, ``blocked``, ``declined``.
+        Only descendant rows (those starting with ``<epic-id>-``) are counted;
+        the epic row itself is excluded. Proposed children are not surfaced
+        in the summary (they are inert drafts awaiting operator action).
         """
         epic_order: list[str] = []
         for row_id, _, _ in rows:
@@ -601,7 +651,13 @@ class BacklogManager:
                 epic_order.append(row_id)
 
         counts: dict[str, dict[str, int]] = {
-            epic_id: {STATUS_DONE: 0, STATUS_IN_PROGRESS: 0, STATUS_IN_QUEUE: 0, STATUS_BLOCKED: 0}
+            epic_id: {
+                STATUS_DONE: 0,
+                STATUS_IN_PROGRESS: 0,
+                STATUS_IN_QUEUE: 0,
+                STATUS_BLOCKED: 0,
+                STATUS_DECLINED: 0,
+            }
             for epic_id in epic_order
         }
 
@@ -628,7 +684,8 @@ class BacklogManager:
             title = epic_titles.get(epic_id, "")
             table_rows += (
                 f"| {epic_id} | {title} | {c[STATUS_DONE]} | "
-                f"{c[STATUS_IN_PROGRESS]} | {c[STATUS_IN_QUEUE]} | {c[STATUS_BLOCKED]} |\n"
+                f"{c[STATUS_IN_PROGRESS]} | {c[STATUS_IN_QUEUE]} | "
+                f"{c[STATUS_BLOCKED]} | {c[STATUS_DECLINED]} |\n"
             )
 
         return STATUS_SUMMARY_SECTION_HEADER + "\n\n" + STATUS_SUMMARY_TABLE_HEADER + table_rows + "\n"
@@ -663,7 +720,7 @@ class BacklogManager:
                 errors.append(f"Status Summary missing epic row '{epic_id}'")
                 continue
             actual = actual_counts[epic_id]
-            for status_key in (STATUS_DONE, STATUS_IN_PROGRESS, STATUS_IN_QUEUE, STATUS_BLOCKED):
+            for status_key in (STATUS_DONE, STATUS_IN_PROGRESS, STATUS_IN_QUEUE, STATUS_BLOCKED, STATUS_DECLINED):
                 if expected[status_key] != actual.get(status_key, -1):
                     errors.append(
                         f"Status Summary mismatch for {epic_id}: "
@@ -688,17 +745,25 @@ class BacklogManager:
             if not in_summary or not line.strip().startswith("|"):
                 continue
             cells = [c.strip() for c in line.split("|")]
+            # Splitting "|" around a pipe-delimited row produces empty flank
+            # cells, so a 6-data-column row yields 8 cells total and a
+            # 7-data-column row (with the new trailing Declined column)
+            # yields 9. Both shapes are accepted for backward compatibility;
+            # legacy rows default Declined to 0 until the backlog is
+            # regenerated.
             if len(cells) < 7:
                 continue
             row_id = cells[1]
             if not EPIC_ID_RE.match(row_id):
                 continue
             try:
+                declined_count = int(cells[7]) if len(cells) >= 9 else 0
                 result[row_id] = {
                     STATUS_DONE: int(cells[3]),
                     STATUS_IN_PROGRESS: int(cells[4]),
                     STATUS_IN_QUEUE: int(cells[5]),
                     STATUS_BLOCKED: int(cells[6]),
+                    STATUS_DECLINED: declined_count,
                 }
             except (ValueError, IndexError):
                 continue

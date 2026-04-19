@@ -60,7 +60,7 @@ If any post-check fails, the atomic rename is reversed and the work-unit file is
 4. The orchestrator detects the pending request file after the executor returns and invokes the `manifest-amender` agent.
 5. The agent reads the work unit, the staged diff, and the request JSON; decides `apply` or `reject`.
 6. On `apply`: the agent runs `uv run devbench apply-amendment <task-id>`. CLI appends rows, writes audit, atomically commits to disk, runs Layer 3 post-check. On success the request file is deleted; on failure the write is rolled back and the agent logs REVIEW_FAIL.
-7. On `reject`: the agent runs `uv run devbench reject-amendment <task-id> "<reason>"`. CLI writes a rejection audit comment, transitions the task to `blocked`, and deletes the request file.
+7. On `reject`: the agent (a) first reverts every file listed in the pending request from the target repo (`git restore --staged`, `checkout --`, `clean -f --`) so stale staged edits do not leak into subsequent tasks, then (b) runs `uv run devbench reject-amendment <task-id> "<reason>"`. CLI writes a rejection audit comment, transitions the task to `blocked`, and **archives** the pending request to `<workspace>/.devbench/rejected-requests/<task-id>-<timestamp>.json` so `blocker-resolver` + `task-factory` (opt-in, see [ADR-03](adr/03-task-factory.md)) can read it afterwards. The agent MUST verify the archive exists on disk before logging its verdict -- the manifest-amender prompt has a numbered execute-and-verify recipe with a final `test -f .devbench/rejected-requests/...` assertion that aborts the verdict if the side-effect did not land.
 8. On post-Layer-3 success the standard review-supervisor runs against the updated manifest; the rest of the pipeline is unchanged.
 
 ## Amendment request JSON schema
@@ -93,6 +93,15 @@ The amender also logs a final `REVIEW_PASS` or `REVIEW_FAIL` verdict via `log-ve
 - **It does not let the executor edit work-unit files directly.** The guard hook `guard-work-unit-write.sh` continues to block Edit/Write on `backlog/**/*.md`. The CLI writes via subprocess, bypassing the hook the same way `log-verdict` has always worked.
 - **It does not allow amendments outside the staged diff.** Every file in `files_to_add` must be in the staged diff against base; the pre-filter rejects attempts to include unrelated files.
 - **It does not retry.** One pending request per task at a time; `max_requests_per_execution` caps the total per executor run. If the amender rejects, the task blocks for human review.
+- **It does not cover validation-gate tasks.** Validation gates (empty Changes Manifest / Approach that forbids production-code changes) never stage a fix, so they never produce an amendment request for the amender to review. When a validation gate surfaces an out-of-scope production bug, the executor uses a separate path -- the BUG ESCALATION FOR VALIDATION GATES procedure in `plugin/devbench/agents/executor.md`, which writes a proposal JSON directly so task-factory can materialise follow-up work units. See [ADR-06: Validation-gate bug escalation](adr/06-validation-gate-bug-escalation.md) and [docs/task-factory.md](task-factory.md) for the full flow.
+
+### Amendments vs. bug-escalation -- which applies?
+
+| Scenario | Use this path |
+|----------|---------------|
+| The task's Approach authorises production fixes, and TDD exposed a bug in a file already in the Changes Manifest | Standard TDD: stage the fix, proceed to review. No amendment needed. |
+| The task's Approach authorises production fixes, and TDD exposed a bug in a file NOT in the Changes Manifest | Amendment workflow: stage the fix, call `request-amendment`, let the amender decide. |
+| The task's Approach forbids production fixes (validation gate), and verifications surfaced confirmed production bugs | Bug-escalation workflow: do NOT stage; call `write-proposal` with a decomposed proposal JSON and log NEEDS_ESCALATION. Task-factory materialises drafts independently. |
 
 ## Related code and tests
 

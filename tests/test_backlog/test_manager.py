@@ -273,6 +273,35 @@ class TestRollupParentStatus:
         story_content = story_file.read_text()
         assert "## Status: in-queue" in story_content
 
+    def test_rollup_treats_declined_children_as_complete(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """Parent rolls to done when every child is either Done or Declined."""
+        content = """\
+# Backlog
+
+## Full Work Unit Index
+
+| ID | Title | Type | Status | Dependencies | Repo | File Path |
+|-----|-------|------|--------|-------------|------|-----------|
+| E0-F1-S1-T1 | Task A | Task | done | None | git-repo | `backlog/E0-F1-S1-T1.md` |
+| E0-F1-S1-T2 | Task B | Task | declined | None | git-repo | `backlog/E0-F1-S1-T2.md` |
+| E0-F1-S1-T3 | Task C | Task | in-queue | None | git-repo | `backlog/E0-F1-S1-T3.md` |
+| E0-F1-S1 | Story A | Story | in-queue | None | git-repo | `backlog/E0-F1-S1.md` |
+"""
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(content)
+
+        t3_file = backlog_dir / "E0-F1-S1-T3.md"
+        t3_file.write_text("# E0-F1-S1-T3\n\n## Status: in-queue\n")
+        story_file = backlog_dir / "E0-F1-S1.md"
+        story_file.write_text("# E0-F1-S1\n\n## Status: in-queue\n")
+
+        judge = BacklogManager()
+        # Mark the final in-queue task Done. The other sibling is Declined.
+        # Rollup should succeed because declined children are terminal-complete.
+        judge.force_status(t3_file, index_path, "E0-F1-S1-T3", "done")
+
+        assert "## Status: done" in story_file.read_text()
+
     def test_cascades_to_feature_when_all_stories_done(self, tmp_path: Path, backlog_dir: Path) -> None:
         content = """\
 # Backlog

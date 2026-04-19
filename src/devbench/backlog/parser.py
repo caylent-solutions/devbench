@@ -23,6 +23,7 @@ from devbench.constants import (
     BRANCH_NAME_TEMPLATE,
     EPIC_PLACEHOLDER_ID,
     STATUS_BLOCKED,
+    STATUS_DECLINED,
     STATUS_DONE,
     STATUS_IN_PROGRESS,
     STATUS_IN_QUEUE,
@@ -42,6 +43,7 @@ _RAW_STATUS_TO_ENUM: dict[str, WorkUnitStatus] = {
     STATUS_DONE: WorkUnitStatus.DONE,
     STATUS_BLOCKED: WorkUnitStatus.BLOCKED,
     STATUS_PROPOSED: WorkUnitStatus.PROPOSED,
+    STATUS_DECLINED: WorkUnitStatus.DECLINED,
 }
 
 # Pattern to determine work-unit type from the last segment of a compound ID.

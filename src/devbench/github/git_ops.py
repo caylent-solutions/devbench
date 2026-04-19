@@ -42,6 +42,25 @@ class GitOpsJudge:
         self.name = "git_ops"
         self.logger = logging.getLogger(f"devbench.{self.name}")
 
+    def assert_on_branch(self, repo_path: Path, expected_branch: str) -> None:
+        """Verify the working tree is checked out to ``expected_branch``.
+
+        Fails fast with a precise diagnostic when HEAD is on a different
+        branch, in detached-HEAD state, or when ``rev-parse`` itself fails.
+        Called from every commit path so a drifted HEAD can never silently
+        produce an orphan-branch commit.
+        """
+        rc, current, err = self._git(["rev-parse", "--abbrev-ref", "HEAD"], repo_path)
+        if rc != 0:
+            raise RuntimeError(f"git rev-parse --abbrev-ref HEAD failed in {repo_path} (exit {rc}): {err.strip()}")
+        actual = current.strip()
+        if actual != expected_branch:
+            raise RuntimeError(
+                f"Branch assertion failed in {repo_path}: expected '{expected_branch}', "
+                f"HEAD is on '{actual}'. Refusing to commit on the wrong branch. "
+                "Call ensure_branch() before commit_local()/commit_and_push() to switch first."
+            )
+
     def ensure_branch(self, repo: str, repo_path: Path, branch: str) -> None:
         """Ensure the repository is on *branch*, creating it if necessary.
 
@@ -166,6 +185,11 @@ class GitOpsJudge:
                 "(no consecutive special characters)."
             )
 
+        # Refuse to commit if HEAD has drifted off the expected branch (e.g.
+        # leftover detached-HEAD state from a previous task). Prevents the
+        # orphan-branch class of bug where a commit lands on backlog/<id>
+        # instead of the configured single_branch.
+        self.assert_on_branch(repo_path, branch)
         self._git(["add", "-A"], repo_path)
 
         _, status_out, _ = self._git(["status", "--porcelain"], repo_path)
@@ -214,6 +238,9 @@ class GitOpsJudge:
                 "(no consecutive special characters)."
             )
 
+        # Same orphan-branch protection as commit_and_push -- refuse to
+        # commit when HEAD has drifted off the expected branch.
+        self.assert_on_branch(repo_path, branch)
         self._git(["add", "-A"], repo_path)
 
         _, status_out, _ = self._git(["status", "--porcelain"], repo_path)

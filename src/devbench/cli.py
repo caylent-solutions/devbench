@@ -19,6 +19,7 @@ Commands::
     claim <id>              Claim a work unit (transition to in-progress)
     set-status <id> <s>     Force any status (no gate — use for recovery/lifecycle transitions)
     mark-done <id>          Mark unit as Done (enforces done-gate: all judges must have passed)
+    decline <id> --reason M Mark unit Declined (won't ever be done); captures the rationale
     validate-backlog        Check backlog integrity (file existence, status sync, orphans, deps, summary)
     ensure-branch <id>      Create or switch to work unit branch before executor runs
     git-ops <id>            Run git operations for a work unit (commit-only when defer_pr is set)
@@ -286,6 +287,62 @@ def cmd_mark_done(unit_id: str) -> int:
 
     logger.info("Marked %s as done", unit_id)
     print(f"Marked {unit_id} as done")
+    return 0
+
+
+def cmd_decline(*argv: str) -> int:
+    """Mark a work unit as Declined (won't ever be done) with a captured reason.
+
+    Usage::
+
+        decline <id> --reason "<message>"
+
+    Declined is a deliberate final-decision status, distinct from Blocked
+    (waiting on something) and Done (completed). Declined children count
+    as terminal-complete for parent rollup. The ``--reason`` is REQUIRED
+    because the decision must leave an audit trail; em-dashes are
+    rejected at the input boundary for backlog hygiene.
+    """
+    task_id = ""
+    reason = ""
+    args = list(argv)
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if not arg:
+            i += 1
+            continue
+        if arg == "--reason":
+            if i + 1 >= len(args) or not args[i + 1]:
+                print("ERROR: --reason requires a value", file=sys.stderr)
+                return 1
+            reason = args[i + 1]
+            i += 2
+            continue
+        if not task_id:
+            task_id = arg
+        i += 1
+    if not task_id or not reason:
+        print("ERROR: decline requires <id> --reason <message>", file=sys.stderr)
+        return 1
+    rc = _reject_em_dash("reason", reason)
+    if rc is not None:
+        return rc
+
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    target = _find_unit(units, task_id)
+    if target is None:
+        print(f"ERROR: Work unit '{task_id}' not found", file=sys.stderr)
+        return 1
+    wu_file = _resolve_unit_file(target)
+    if wu_file is None:
+        print(f"ERROR: Work unit file not found for '{task_id}'", file=sys.stderr)
+        return 1
+
+    BacklogManager().mark_declined(wu_file, BACKLOG_INDEX, task_id, reason)
+    logger.info("Declined %s: %s", task_id, reason)
+    print(json.dumps({"task_id": task_id, "status": "declined", "reason": reason}))
     return 0
 
 
@@ -790,6 +847,7 @@ def _resolve_git_ops_context(unit_id: str) -> tuple[WorkUnit, str, Path]:
 
 def _git_ops_deferred(unit_id: str, unit: WorkUnit, canonical_repo: str, repo_path: Path, branch: str) -> int:
     """Commit locally only (no push/PR/merge) for single-branch deferred mode."""
+    from devbench.backlog.manifest import assert_staged_matches_manifest, parse_manifest
     from devbench.github.git_ops import GitOpsJudge
 
     ops = GitOpsJudge()
@@ -797,6 +855,22 @@ def _git_ops_deferred(unit_id: str, unit: WorkUnit, canonical_repo: str, repo_pa
 
     wu_file = _resolve_unit_file(unit)
     mgr = BacklogManager()
+
+    # Re-affirm the working tree is on the configured branch before
+    # committing. ensure_branch is a no-op when HEAD is already correct
+    # but corrects drift (detached HEAD, switched branch from a previous
+    # task, etc.) without an operator round-trip. commit_local then runs
+    # its own assert_on_branch as a final fail-fast guard.
+    ops.ensure_branch(canonical_repo, repo_path, branch)
+
+    # Manifest-scope check: every staged path must be in the work unit's
+    # Changes Manifest. Catches the TRACE_FILE / dst/ / fixture-pollution
+    # class of bug deterministically before commit. Skipped only when the
+    # work-unit file isn't resolvable (orchestrator runs without a backlog
+    # context never reach this path in practice).
+    if wu_file is not None:
+        manifest_rows = parse_manifest(wu_file.read_text(encoding="utf-8"))
+        assert_staged_matches_manifest(repo_path, [r.file for r in manifest_rows])
 
     ops.commit_local(canonical_repo, repo_path, branch, commit_message)
     logger.info("Committed locally (deferred PR): %s on %s", unit_id, branch)
@@ -844,7 +918,15 @@ def cmd_git_ops(unit_id: str) -> int:
 
     mgr = BacklogManager()
 
+    from devbench.backlog.manifest import assert_staged_matches_manifest, parse_manifest
     from devbench.github.git_ops import ConflictingPRError
+
+    # Manifest-scope check: every staged path must be in the work unit's
+    # Changes Manifest. Catches scope-violation pollution deterministically
+    # before commit. Skipped only when the work-unit file isn't resolvable.
+    if wu_file is not None:
+        manifest_rows = parse_manifest(wu_file.read_text(encoding="utf-8"))
+        assert_staged_matches_manifest(repo_path, [r.file for r in manifest_rows])
 
     ops.commit_and_push(canonical_repo, repo_path, branch, commit_message)
     logger.info("Committed and pushed %s", unit_id)
@@ -1397,6 +1479,11 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
     "claim": (cmd_claim, 1, "Claim a work unit: claim <id>"),
     "set-status": (cmd_set_status, 2, "Set status: set-status <id> <status>"),
     "mark-done": (cmd_mark_done, 1, "Mark done: mark-done <id>"),
+    "decline": (
+        cmd_decline,
+        2,
+        "Mark a work unit Declined (won't ever be done) with a reason: decline <id> --reason <message>",
+    ),
     "validate-backlog": (cmd_validate_backlog, 0, "Validate backlog integrity"),
     "ensure-branch": (cmd_ensure_branch, 1, "Create or switch to work unit branch: ensure-branch <id>"),
     "git-ops": (cmd_git_ops, 1, "Run git operations for a work unit: git-ops <id>"),

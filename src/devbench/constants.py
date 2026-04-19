@@ -17,8 +17,8 @@ COMMENTS_SECTION_HEADER: str = "## Comments"
 STATUS_SECTION_PREFIX: str = "## Status:"
 STATUS_SUMMARY_SECTION_HEADER: str = "## Status Summary"
 STATUS_SUMMARY_TABLE_HEADER: str = (
-    "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
-    "|------|-------|------|-------------|----------|---------|\n"
+    "| Epic | Title | Done | In Progress | In Queue | Blocked | Declined |\n"
+    "|------|-------|------|-------------|----------|---------|----------|\n"
 )
 # Pre-compiled pattern to strip the Status Summary section from BACKLOG.md content.
 # Matches from the header up to (but not including) the next ## heading or end of string.
@@ -62,10 +62,20 @@ SECURITY_ALERT_CATEGORIES: list[tuple[str, str]] = [
 # ---------------------------------------------------------------------------
 # Backlog status display values (used in CLI status summaries)
 # ---------------------------------------------------------------------------
-DISPLAY_STATUS_VALUES: list[str] = ["In Queue", "In Progress", "In Review", "Done", "Blocked", "Proposed"]
+DISPLAY_STATUS_VALUES: list[str] = [
+    "In Queue",
+    "In Progress",
+    "In Review",
+    "Done",
+    "Blocked",
+    "Proposed",
+    "Declined",
+]
 
 # Backlog manager recognized status labels (title-case, as in markdown tables)
-TABLE_STATUS_VALUES: frozenset[str] = frozenset({"In Queue", "In Progress", "In Review", "Done", "Blocked", "Proposed"})
+TABLE_STATUS_VALUES: frozenset[str] = frozenset(
+    {"In Queue", "In Progress", "In Review", "Done", "Blocked", "Proposed", "Declined"}
+)
 
 # ---------------------------------------------------------------------------
 # Traceability matrix format
@@ -125,6 +135,7 @@ STATUS_IN_REVIEW: str = "in-review"
 STATUS_DONE: str = "done"
 STATUS_BLOCKED: str = "blocked"
 STATUS_PROPOSED: str = "proposed"
+STATUS_DECLINED: str = "declined"
 
 # Ordered mapping from any accepted input form to the canonical write form.
 # Used by BacklogManager._set_status() for validation and normalisation.
@@ -135,6 +146,7 @@ VALID_STATUSES: dict[str, str] = {
     STATUS_DONE: STATUS_DONE,
     STATUS_BLOCKED: STATUS_BLOCKED,
     STATUS_PROPOSED: STATUS_PROPOSED,
+    STATUS_DECLINED: STATUS_DECLINED,
 }
 
 # ---------------------------------------------------------------------------

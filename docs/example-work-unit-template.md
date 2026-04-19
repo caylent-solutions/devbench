@@ -15,6 +15,17 @@ Placeholder legend:
 
 # {ID}: {Title}
 
+<!--
+Valid status values: in-queue, in-progress, in-review, done, blocked, proposed, declined.
+  - in-queue: default for new work units; actionable.
+  - in-progress: orchestrator has claimed the unit.
+  - in-review: all executor work done; judges are running.
+  - done: work completed and shipped.
+  - blocked: waiting on external resolution (dependency, human, infra).
+  - proposed: task-factory draft awaiting human promotion (inert).
+  - declined: operator has decided this work will never be done (terminal).
+See docs/faq.md and docs/adr/05-declined-status.md for the full semantics.
+-->
 ## Status: in-queue
 
 ## Target Repository

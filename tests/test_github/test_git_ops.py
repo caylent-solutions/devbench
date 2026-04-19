@@ -50,6 +50,8 @@ class TestCommitAndPush:
             git_calls.append(args)
             if args == ["status", "--porcelain"]:
                 return (0, "M src/foo.py\n", "")
+            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, "feature/x", "")
             return (0, "", "")
 
         with patch.object(judge, "_git", side_effect=stub):
@@ -76,6 +78,8 @@ class TestCommitAndPush:
                 return (0, "abc123\n", "")
             if args == ["rev-parse", "origin/feature/x"]:
                 return (0, "abc123\n", "")  # same SHA → up to date
+            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, "feature/x", "")
             return (0, "", "")
 
         # show-ref for origin/feature/x → rc=0 (remote exists)
@@ -97,6 +101,8 @@ class TestCommitAndPush:
             git_calls.append(args)
             if args == ["status", "--porcelain"]:
                 return (0, "", "")  # clean
+            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, "feature/x", "")
             return (0, "", "")
 
         # Only run_command call = rev-parse --verify origin/feature/x → rc=1 (absent).
@@ -124,6 +130,8 @@ class TestCommitAndPush:
                 return (0, "newsha\n", "")
             if args == ["rev-parse", "origin/feature/x"]:
                 return (0, "oldsha\n", "")  # different → local is ahead
+            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, "feature/x", "")
             return (0, "", "")
 
         # run_command for rev-parse --verify origin/feature/x → rc=0 (remote exists)
@@ -149,6 +157,8 @@ class TestCommitAndPush:
             git_calls.append(args)
             if args == ["status", "--porcelain"]:
                 return (0, "M file.py\n", "")  # has changes → commit path
+            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, "feature/x", "")
             return (0, "", "")
 
         with patch.object(judge, "_git", side_effect=stub):
@@ -807,6 +817,8 @@ class TestCommitLocal:
             git_calls.append(args)
             if args == ["status", "--porcelain"]:
                 return (0, "M src/foo.py\n", "")
+            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, "feature/x", "")
             return (0, "", "")
 
         with patch.object(judge, "_git", side_effect=stub):
@@ -833,6 +845,8 @@ class TestCommitLocal:
             git_calls.append(args)
             if args == ["status", "--porcelain"]:
                 return (0, "", "")
+            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, "feature/x", "")
             return (0, "", "")
 
         with patch.object(judge, "_git", side_effect=stub):
@@ -850,10 +864,71 @@ class TestCommitLocal:
         assert commit_calls == []
 
     def test_commit_local_rejects_invalid_branch(self, tmp_path: Path) -> None:
-        """Line 209: commit_local raises ValueError for invalid branch names."""
+        """commit_local raises ValueError for invalid branch names."""
         judge = GitOpsJudge()
         with pytest.raises(ValueError, match="Invalid branch name"):
             judge.commit_local("caylent-solutions/git-repo", tmp_path, "bad branch!", "msg")
+
+
+class TestAssertOnBranch:
+    """Branch verification before any commit path runs."""
+
+    def test_passes_when_head_matches(self, tmp_path: Path) -> None:
+        judge = GitOpsJudge()
+        with patch.object(judge, "_git", return_value=(0, "feature/x\n", "")):
+            judge.assert_on_branch(tmp_path, "feature/x")  # no raise
+
+    def test_strips_trailing_newline(self, tmp_path: Path) -> None:
+        judge = GitOpsJudge()
+        with patch.object(judge, "_git", return_value=(0, "feature/x", "")):
+            judge.assert_on_branch(tmp_path, "feature/x")
+
+    def test_raises_on_wrong_branch(self, tmp_path: Path) -> None:
+        judge = GitOpsJudge()
+        with patch.object(judge, "_git", return_value=(0, "main\n", "")):
+            with pytest.raises(
+                RuntimeError,
+                match=r"Branch assertion failed.*expected 'feature/x'.*HEAD is on 'main'",
+            ):
+                judge.assert_on_branch(tmp_path, "feature/x")
+
+    def test_raises_on_rev_parse_failure(self, tmp_path: Path) -> None:
+        judge = GitOpsJudge()
+        with patch.object(judge, "_git", return_value=(128, "", "fatal: not a git repository")):
+            with pytest.raises(RuntimeError, match="git rev-parse --abbrev-ref HEAD failed"):
+                judge.assert_on_branch(tmp_path, "feature/x")
+
+
+class TestCommitMethodsRejectWrongBranch:
+    """commit_local + commit_and_push must abort when HEAD is on a different branch."""
+
+    def test_commit_local_rejects_when_head_drifted(self, tmp_path: Path) -> None:
+        judge = GitOpsJudge()
+
+        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
+            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, "backlog/wrong-branch\n", "")
+            return (0, "", "")
+
+        with (
+            patch.object(judge, "_git", side_effect=stub),
+            pytest.raises(RuntimeError, match="HEAD is on 'backlog/wrong-branch'"),
+        ):
+            judge.commit_local("caylent-solutions/git-repo", tmp_path, "feature/x", "msg")
+
+    def test_commit_and_push_rejects_when_head_drifted(self, tmp_path: Path) -> None:
+        judge = GitOpsJudge()
+
+        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
+            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, "main\n", "")
+            return (0, "", "")
+
+        with (
+            patch.object(judge, "_git", side_effect=stub),
+            pytest.raises(RuntimeError, match="HEAD is on 'main'"),
+        ):
+            judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "feature/x", "msg")
 
 
 class TestGetDefaultBranch:

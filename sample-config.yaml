@@ -57,3 +57,36 @@ repos:
 #   allowed_reasons:
 #     - tdd_green_production_fix
 #   max_requests_per_execution: 1
+
+# task_factory: opt-in task-factory loop.
+#
+# When enabled (and manifest_amendment is also enabled), a legitimate
+# amendment rejection triggers blocker-resolver -> task-factory, which
+# drafts one or more new work units with status `proposed` covering
+# the out-of-scope production fixes the amender surfaced. The operator
+# reviews, edits, and promotes each draft via `devbench promote-proposal`
+# or rejects it via `devbench reject-proposal`.
+#
+# enabled  (optional, default false) -- requires manifest_amendment.enabled: true.
+#
+# task_factory:
+#   enabled: false
+
+# Work-unit lifecycle statuses
+# ---------------------------------------------------------------------------
+# The `## Status:` line in every work-unit .md accepts these values:
+#   in-queue      actionable, orchestrator will claim this
+#   in-progress   orchestrator has claimed the unit
+#   in-review     executor done; judges running
+#   done          completed and shipped
+#   blocked       waiting on external resolution (dependency, human, infra)
+#   proposed      task-factory draft awaiting human promotion (inert)
+#   declined      operator decided this work will never be done (terminal)
+#
+# The `declined` status is universal (not opt-in). Mark work declined with:
+#   uv run devbench decline <id> --reason "<message>"
+#
+# Declined children count as "terminal-complete" for parent rollup: a
+# Story/Feature/Epic rolls to done once every child is Done or Declined.
+# Declined tasks are excluded from tasks_remaining and from projection ETAs,
+# and surface in a dedicated `Declined (N):` panel in `devbench report`.

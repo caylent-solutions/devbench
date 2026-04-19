@@ -48,7 +48,7 @@ plugin/devbench/
     ├── guard-bash.sh            ← blocks dangerous Bash commands
     ├── guard-backlog.sh         ← blocks direct Bash writes to backlog/ tracking files
     ├── guard-verdict-format.sh  ← validates log-verdict argument format
-    ├── guard-git-stage.sh       ← blocks git commit when no files are staged
+    ├── guard-git-stage.sh       ← blocks `git commit` with nothing staged AND `git add <path>` when path is outside the work unit's Changes Manifest
     ├── guard-work-unit-write.sh ← blocks Write/Edit to work unit .md files
     └── assert-tests-pass.sh     ← enforces test suite passes after Bash
 ```

@@ -1351,6 +1351,39 @@ class TestUnitListings:
         assert any("Fix the gitdir guard" in line for line in lines)
         assert any("Enable version subcommand" in line for line in lines)
 
+    def test_declined_listing_omitted_when_empty(self) -> None:
+        from devbench.backlog.work_unit import WorkUnitStatus
+        from devbench.reporting.report import _declined_listing
+
+        units = [self._mk_unit("E0-F1-S1-T1", "t", WorkUnitStatus.IN_QUEUE)]
+        assert _declined_listing(units) == []
+
+    def test_declined_listing_renders_title_and_path(self) -> None:
+        from devbench.backlog.work_unit import WorkUnitStatus
+        from devbench.reporting.report import _declined_listing
+
+        units = [
+            self._mk_unit("E0-F1-S1-T11", "Deprecated feature", WorkUnitStatus.DECLINED),
+            self._mk_unit("E0-F1-S1-T12", "Out-of-scope cleanup", WorkUnitStatus.DECLINED),
+        ]
+        lines = _declined_listing(units)
+        assert lines[1] == "Declined (2):"
+        assert any("Deprecated feature" in line for line in lines)
+        assert any("Out-of-scope cleanup" in line for line in lines)
+
+    def test_backlog_state_includes_tasks_declined_row(self) -> None:
+        from devbench.backlog.work_unit import WorkUnitStatus, WorkUnitType
+        from devbench.reporting.report import _backlog_state_rows, _backlog_totals_from_units
+
+        units = [
+            self._mk_unit("E0-F1-S1-T1", "a", WorkUnitStatus.DONE, WorkUnitType.TASK),
+            self._mk_unit("E0-F1-S1-T2", "b", WorkUnitStatus.DECLINED, WorkUnitType.TASK),
+        ]
+        totals = _backlog_totals_from_units(units)
+        assert totals.tasks_declined == 1
+        rows = _backlog_state_rows(totals)
+        assert ("Tasks declined", "1") in rows
+
 
 class TestSideBySideLayout:
     """B10: _render_side_by_side merges two blocks with a gap; the full report uses it."""

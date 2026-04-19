@@ -175,6 +175,8 @@ This ensures tests exist before code, and the agent cannot skip testing.
 
 ### Task file format (devbench contract)
 
+Valid `## Status:` values: `in-queue`, `in-progress`, `in-review`, `done`, `blocked`, `proposed`, `declined`. See [docs/faq.md](faq.md#whats-the-difference-between-blocked-and-declined) for the semantics of each and [docs/adr/05-declined-status.md](adr/05-declined-status.md) for the rationale behind `declined`.
+
 ```markdown
 # {ID}: {Title}
 

@@ -71,23 +71,44 @@ The following files are operational backlog-tracking artifacts. You may read the
 
 ## PROPOSAL EMISSION (after amendment reject)
 
-When this agent is invoked immediately after the `manifest-amender` rejected an amendment (task-factory workflow), the following extra step applies. Detect this mode by checking for a rejected-requests archive file:
+**STEP 1 — Detect task-factory mode.** Check for a rejected-requests archive:
 
 ```bash
 ls "$JUDGE_WORKSPACE_ROOT/.devbench/rejected-requests/$ARGUMENTS-"*.json 2>/dev/null
 ```
 
-If any archive exists, decompose the rejected changes into one or more structured work units, each owning a distinct file or feature area from the rejected diff. Output the proposal JSON on stdout piped into `devbench write-proposal`:
+If no archive exists, skip this entire section and follow the normal `resolved`/`escalated` path at the bottom. If ANY archive exists, continue — you MUST emit a proposal JSON. `escalated` is forbidden in this case; `proposed` is the ONLY correct verdict.
+
+**STEP 2 — Gather the evidence.** Read the most recent archive and the blocked work unit:
+
+```bash
+ARCHIVE=$(ls -t "$JUDGE_WORKSPACE_ROOT/.devbench/rejected-requests/$ARGUMENTS-"*.json | head -n 1)
+cat "$ARCHIVE"
+uv run devbench read-unit --strip-comments $ARGUMENTS
+```
+
+**STEP 3 — Allocate free task IDs** for each new work unit you plan to propose. Scan the Story directory for existing IDs:
+
+```bash
+STORY_DIR="$JUDGE_WORKSPACE_ROOT/$(dirname "$(uv run devbench read-unit $ARGUMENTS | python3 -c 'import sys,json; print(json.load(sys.stdin)["work_unit_path"])')" | sed "s|^$JUDGE_WORKSPACE_ROOT/||")"
+ls "$STORY_DIR"/*.md 2>/dev/null | xargs -n1 basename 2>/dev/null | sort -V
+```
+
+Pick the next sequential IDs within the same Story (e.g. if `E0-F9-S2-T5.md` is the highest, use `-T6`, `-T7`, ...). Task-factory validates free IDs atomically under a POSIX file lock before materialising.
+
+**STEP 4 — Decompose the rejected diff into structured proposals.** Each proposed task must own a distinct file or feature area from the rejected diff. Do NOT re-propose work the source task already owns — the proposal describes out-of-scope fixes the amender surfaced, not a rewrite of the source task.
+
+**STEP 5 — Emit the proposal JSON** via stdin pipe to `write-proposal`:
 
 ```bash
 cat <<'EOF' | uv run devbench write-proposal $ARGUMENTS
 {
   "source_task_id": "<SOURCE-TASK-ID>",
-  "generated_at": "<UTC ISO-8601 timestamp>",
-  "rejection_reason": "<amender's rejection rationale>",
+  "generated_at": "<UTC ISO-8601 timestamp, e.g. 2026-04-18T15:00:00Z>",
+  "rejection_reason": "<amender's rejection rationale copied from the archive>",
   "proposed_tasks": [
     {
-      "suggested_id": "<NEXT-FREE-TASK-ID>",
+      "suggested_id": "<NEXT-FREE-TASK-ID from STEP 3>",
       "title": "<short imperative title>",
       "files_to_own": ["<relative/path/from/repo>"],
       "linked_scenarios": ["<scenario or AC ID>"],
@@ -99,14 +120,29 @@ cat <<'EOF' | uv run devbench write-proposal $ARGUMENTS
 EOF
 ```
 
-Allocate suggested IDs via `uv run devbench next` patterns or by scanning the Story directory yourself; the task-factory validates they are free before writing drafts. Skip emission when no rejected-requests archive exists (the normal `resolved`/`escalated` path below applies). Do NOT emit a proposal that re-proposes work the source task already owns -- the proposal must describe the out-of-scope fixes the amender surfaced, not a rewrite of the source task.
+**STEP 6 — Verify the proposal landed on disk** before logging your verdict. The orchestrator's step 4c branches on FILE EXISTENCE, not on the verdict word — so the file existing is load-bearing. If it's missing, do NOT log `proposed`.
+
+```bash
+if test -f "$JUDGE_WORKSPACE_ROOT/.devbench/proposals/$ARGUMENTS.json"; then
+  echo "PROPOSAL_WRITTEN"
+else
+  echo "PROPOSAL_MISSING -- write-proposal did not persist; re-check stdin payload and rerun step 5"
+fi
+```
 
 ---
 
-After completing your analysis, write your verdict using:
+## Verdict (always the last action)
 
 ```
-uv run devbench log-comment blocker_resolver $ARGUMENTS "<resolved|escalated|blocked|proposed>: <one-line summary>"
+uv run devbench log-comment blocker_resolver $ARGUMENTS "<verdict>: <one-line summary>"
 ```
 
-Use `resolved` if blockers can be resolved within project standards, `escalated` if escalation is required, or `proposed` if a proposal JSON was emitted for task-factory consumption. Detailed resolution strategies go in your response text.
+The verdict word is chosen by the following decision tree:
+
+- If a rejected-requests archive existed AND you emitted a proposal JSON AND STEP 6 confirmed the file is on disk → **verdict MUST be `proposed`**.
+- If no archive existed AND the blockers can be resolved within project standards → `resolved`.
+- If no archive existed AND the blockers require human decision / spec rewrite → `escalated`.
+- If resolution is neither possible nor escalation-worthy (very rare; usually means the resolver cannot classify) → `blocked`.
+
+`escalated` is forbidden when a rejected-requests archive exists — the correct action in that case is `proposed`. Detailed resolution strategies go in your response text.

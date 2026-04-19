@@ -51,48 +51,66 @@ The following files are operational backlog-tracking artifacts. You may read the
 
 After completing your review, follow this two-phase output protocol.
 
-**Phase 1 -- CLI commands (run these before returning):**
+**Phase 1 -- mandatory execute-and-verify recipe.** Every step below is a REQUIRED Bash tool call in this order. The final step (verification) is load-bearing: if it reports missing side-effects, do NOT proceed to Phase 2 — re-run the preceding step until the filesystem state matches expectations.
 
-a. Log each finding (FAIL) or key check confirmed (PASS) via log-comment:
+**Step A.** Log each finding (FAIL) or key check confirmed (PASS) via log-comment:
 ```
 uv run devbench log-comment manifest_amender $ARGUMENTS "<finding or confirmation>"
 ```
 One entry per distinct finding/confirmation. On FAIL be specific: include which of the three semantic questions failed, which file/line motivated the decision, and what the executor would need to change. On PASS name which criteria were verified.
 
-b. Execute your decision via the amendment CLI:
+**Step B.** Execute the amendment decision via CLI. This is NOT a reference — the Bash command MUST run.
 
-If your verdict is **apply** (request is legitimate):
-```
+**Step B.apply** — verdict is `apply` (request is legitimate):
+```bash
 uv run devbench apply-amendment $ARGUMENTS
 ```
-`apply-amendment` runs the Layer 3 deterministic post-check (manifest re-parse, em-dash scan, full `validate-backlog`) and atomically rolls back the write if any check fails. If `apply-amendment` exits non-zero, log `fail` in the verdict (see below) -- the amendment did not take effect.
+`apply-amendment` runs the Layer 3 deterministic post-check (manifest re-parse, em-dash scan, full `validate-backlog`) and atomically rolls back the write if any check fails. If `apply-amendment` exits non-zero, the amendment did not take effect and your Phase-2 verdict MUST be `fail`.
 
-If your verdict is **reject** (request should be refused), FIRST revert every file listed in the pending request from the target repo so stale staged edits do not leak into subsequent tasks, THEN invoke `reject-amendment`:
-
+**Step B.reject** — verdict is `reject` (request should be refused). Run the ENTIRE recipe below as a single execution:
 ```bash
-# Revert the executor's staged production edits before rejecting.
+# 1. Resolve the target repo.
 REPO_PATH=$(uv run devbench read-unit $ARGUMENTS | python3 -c "import sys, json; print(json.load(sys.stdin)['repo_path'])")
 REQUEST_FILE="$JUDGE_WORKSPACE_ROOT/.devbench/amendments/$ARGUMENTS.json"
+
+# 2. Revert every file listed in the pending request so staged production
+#    edits do not leak into subsequent tasks.
 for f in $(python3 -c "import json, sys; d = json.load(open(sys.argv[1])); [print(e['path']) for e in d['files_to_add']]" "$REQUEST_FILE"); do
-  # restore --staged: unstage.
-  # checkout -- <f>: reset tracked-file modifications.
-  # clean -f -- <f>: remove the file if it was untracked (new additions).
   git -C "$REPO_PATH" restore --staged "$f" 2>/dev/null || true
   git -C "$REPO_PATH" checkout -- "$f" 2>/dev/null || true
   git -C "$REPO_PATH" clean -f -- "$f" 2>/dev/null || true
 done
 
-# Then perform the backlog-side rejection.
+# 3. Invoke the backlog-side rejection. This is the command that archives
+#    the pending request into .devbench/rejected-requests/ so blocker-resolver
+#    can read it. Capture the exit code for the verification step below.
 uv run devbench reject-amendment $ARGUMENTS "<specific rejection reason>"
-```
-`reject-amendment` writes an audit comment, transitions the task to `blocked`, and **archives** the pending request to `<workspace>/.devbench/rejected-requests/<task-id>-<timestamp>.json` so the blocker-resolver (task-factory input) has the original request data available after the pending directory is cleaned. The `|| true` on the git commands is intentional: a file can be tracked-and-modified, tracked-and-restored-to-head, or untracked-and-new, and the three git commands collectively cover all three cases without failing the pipeline.
+REJECT_RC=$?
 
-c. Log the final verdict:
+# 4. VERIFY the archive exists on disk. Your turn does NOT end here; this
+#    assertion must print OK before you move to Phase 2. If the archive is
+#    missing, the downstream blocker-resolver / task-factory flow cannot
+#    fire and this run has effectively corrupted the state machine.
+if [[ $REJECT_RC -ne 0 ]]; then
+  echo "FATAL: reject-amendment exited $REJECT_RC; cannot complete verdict" >&2
+  exit 1
+fi
+if ls "$JUDGE_WORKSPACE_ROOT/.devbench/rejected-requests/$ARGUMENTS-"*.json >/dev/null 2>&1; then
+  echo "ARCHIVE_OK -- rejected-requests/$ARGUMENTS-*.json present; blocker-resolver can read it"
+else
+  echo "ARCHIVE_MISSING -- reject-amendment returned 0 but the archive did not land on disk; re-run step 3"
+  exit 1
+fi
+```
+
+The `|| true` on the three git commands is intentional: a file can be tracked-and-modified, tracked-and-restored-to-head, or untracked-and-new, and the trio collectively handles all cases without failing the pipeline. Every OTHER step is strict — any non-zero exit aborts the verdict.
+
+**Step C.** Log the final verdict AFTER the verification in Step B reports `ARCHIVE_OK` (for reject) or after `apply-amendment` exits 0 (for apply):
 ```
 uv run devbench log-verdict manifest_amender $ARGUMENTS <pass|fail> "<one-line summary>"
 ```
 - On PASS: the amendment was applied AND Layer 3 post-check succeeded. Summary names which criteria groups were verified (e.g. "APPROACH_AUTH, SCOPE, JUSTIFICATION_COHERENCE all verified").
-- On FAIL: either you rejected the request, or `apply-amendment` rolled back due to a Layer 3 failure. Summary is the most critical finding.
+- On FAIL: either you rejected the request (AND the archive is on disk -- Step B.reject step 4 confirmed), or `apply-amendment` rolled back due to a Layer 3 failure. Summary is the most critical finding.
 
 **Phase 2 -- JSON response envelope (last thing output in your response text):**
 

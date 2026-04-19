@@ -1296,6 +1296,8 @@ class TestCmdGitOpsEventComments:
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
             patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+            patch("devbench.backlog.manifest.parse_manifest", return_value=[]),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
         ):
             result = cli.cmd_git_ops(unit_id)
 
@@ -1325,6 +1327,8 @@ class TestCmdGitOpsEventComments:
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
             patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+            patch("devbench.backlog.manifest.parse_manifest", return_value=[]),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
         ):
             result = cli.cmd_git_ops(unit_id)
 
@@ -1358,6 +1362,8 @@ class TestCmdGitOpsEventComments:
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
             patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+            patch("devbench.backlog.manifest.parse_manifest", return_value=[]),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
         ):
             result = cli.cmd_git_ops(unit_id)
 
@@ -1386,6 +1392,8 @@ class TestCmdGitOpsEventComments:
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
             patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+            patch("devbench.backlog.manifest.parse_manifest", return_value=[]),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
         ):
             result = cli.cmd_git_ops(unit_id)
 
@@ -1415,6 +1423,8 @@ class TestCmdGitOpsEventComments:
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
             patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+            patch("devbench.backlog.manifest.parse_manifest", return_value=[]),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
         ):
             result = cli.cmd_git_ops(unit_id)
 
@@ -3053,6 +3063,38 @@ class TestGitOpsDeferred:
         output = json.loads(capsys.readouterr().out.strip())
         assert output["mode"] == "deferred"
 
+    def test_git_ops_deferred_calls_ensure_branch_before_commit(self, tmp_path: Path) -> None:
+        """ensure_branch() must run before commit_local() so a drifted HEAD is corrected."""
+        unit = WorkUnit(
+            id="E0-F1-S1-T1",
+            title="Test Task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T1.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+        call_order: list[str] = []
+        mock_ops = MagicMock()
+        mock_ops.ensure_branch.side_effect = lambda *_a, **_k: call_order.append("ensure_branch")
+        mock_ops.commit_local.side_effect = lambda *_a, **_k: call_order.append("commit_local")
+
+        with (
+            patch("devbench.cli.GitOpsJudge", return_value=mock_ops, create=True),
+            patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+            patch("devbench.cli.BacklogManager", return_value=MagicMock()),
+            patch("devbench.cli._resolve_unit_file", return_value=None),
+        ):
+            cli._git_ops_deferred(
+                "E0-F1-S1-T1",
+                unit,
+                "caylent-solutions/git-repo",
+                tmp_path,
+                "feature/x",
+            )
+
+        assert call_order == ["ensure_branch", "commit_local"]
+
     def test_git_ops_deferred_logs_comment(self, tmp_path: Path) -> None:
         """_git_ops_deferred appends agent comment when work-unit file exists."""
         wu_file = tmp_path / "E0-F1-S1-T1.md"
@@ -3075,6 +3117,11 @@ class TestGitOpsDeferred:
             patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
             patch("devbench.cli.BacklogManager", return_value=mock_mgr),
             patch("devbench.cli._resolve_unit_file", return_value=wu_file),
+            # Bypass manifest-scope check: this test only cares that the
+            # audit comment was appended, not about manifest enforcement
+            # (which has its own dedicated tests).
+            patch("devbench.backlog.manifest.parse_manifest", return_value=[]),
+            patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
         ):
             result = cli._git_ops_deferred(
                 "E0-F1-S1-T1",
@@ -3885,3 +3932,72 @@ class TestCmdWriteProposal:
             rc = cli.cmd_write_proposal("E0-F1-S1-T1")
         assert rc == 1
         assert "cannot read stdin" in capsys.readouterr().err
+
+
+class TestCmdDecline:
+    """Slice 5c: cmd_decline CLI command."""
+
+    def _make_minimal_unit(self, tmp_path: Path, unit_id: str = "EX-F1-S1-T1") -> tuple[Path, Path]:
+        backlog_md = tmp_path / "BACKLOG.md"
+        backlog_md.write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            f"| {unit_id} | Test | Task | in-queue | None | caylent-solutions/git-repo | `backlog/{unit_id}.md` |\n"
+        )
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir(exist_ok=True)
+        wu_file = backlog_dir / f"{unit_id}.md"
+        wu_file.write_text(f"# {unit_id}: Test\n\n## Status: in-queue\n\n## Description\n\nx\n")
+        return backlog_md, wu_file
+
+    def test_happy_path_flips_status_and_audits(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        backlog_md, wu_file = self._make_minimal_unit(tmp_path)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_decline("EX-F1-S1-T1", "--reason", "scope determined unnecessary")
+        assert rc == 0
+        content = wu_file.read_text()
+        assert "## Status: declined" in content
+        assert "[DECLINED]" in content
+        assert "scope determined unnecessary" in content
+        out = json.loads(capsys.readouterr().out.strip())
+        assert out["task_id"] == "EX-F1-S1-T1"
+        assert out["status"] == "declined"
+        assert out["reason"] == "scope determined unnecessary"
+
+    def test_missing_reason_rejected(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_decline("EX-F1-S1-T1")
+        assert rc == 1
+        assert "requires" in capsys.readouterr().err
+
+    def test_reason_without_value_rejected(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_decline("EX-F1-S1-T1", "--reason")
+        assert rc == 1
+        assert "requires a value" in capsys.readouterr().err
+
+    def test_em_dash_in_reason_blocked(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        backlog_md, _ = self._make_minimal_unit(tmp_path)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+        ):
+            rc = cli.cmd_decline("EX-F1-S1-T1", "--reason", "bad\u2014reason")
+        assert rc == 1
+        assert "em-dash" in capsys.readouterr().err
+
+    def test_unknown_unit_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        backlog_md, _ = self._make_minimal_unit(tmp_path)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+        ):
+            rc = cli.cmd_decline("NO-SUCH-ID", "--reason", "n/a")
+        assert rc == 1
+        assert "not found" in capsys.readouterr().err
+
+    def test_registered_in_commands(self) -> None:
+        assert "decline" in cli._COMMANDS

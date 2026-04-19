@@ -22,10 +22,18 @@ amendment. It is never used to remove rows.
 from __future__ import annotations
 
 import re
+import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 
 EM_DASH = "\u2014"
 MANIFEST_HEADER = "Changes Manifest"
+
+# Bounded timeout (seconds) for the read-only ``git diff --cached --name-only``
+# call used by ``assert_staged_matches_manifest``. Kept generous so a slow
+# checkout still completes; far below the global command timeout so a hung
+# git process surfaces fast.
+_GIT_DIFF_TIMEOUT: int = 30
 
 _SECTION_RE = re.compile(
     rf"^(##\s+{re.escape(MANIFEST_HEADER)}\s*\n)(.*?)(?=^##\s|\Z)",
@@ -92,6 +100,61 @@ def render_manifest_rows(rows: list[ManifestRow]) -> str:
     for row in rows:
         lines.append(f"| `{row.file}` | {row.change} |")
     return "\n".join(lines) + "\n"
+
+
+def list_staged_files(repo_path: Path) -> list[str]:
+    """Return the staged file set for ``repo_path`` via ``git diff --cached --name-only``.
+
+    Pure read-only operation. Bounded by ``_GIT_DIFF_TIMEOUT``. Returns paths
+    relative to ``repo_path`` -- the same shape that appears in the Changes
+    Manifest. Raises ``RuntimeError`` if git itself fails (not when the diff
+    is empty -- that's an empty list).
+    """
+    cmd = ["git", "-C", str(repo_path), "diff", "--cached", "--name-only"]
+    try:
+        result = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_GIT_DIFF_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"git diff --cached --name-only timed out in {repo_path}") from exc
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"git diff --cached --name-only failed in {repo_path} (exit {result.returncode}): {result.stderr.strip()}"
+        )
+    return [line for line in result.stdout.splitlines() if line.strip()]
+
+
+def assert_staged_matches_manifest(repo_path: Path, manifest_files: list[str]) -> None:
+    """Verify every staged path appears in ``manifest_files``; raise otherwise.
+
+    Called from every commit path so a TRACE_FILE / dst/ / fixture-pollution
+    style scope violation cannot reach the commit. Pure deterministic check;
+    no LLM involvement.
+
+    Args:
+        repo_path: Local repo root the diff is computed against.
+        manifest_files: The exact file-path list from the work unit's
+            ``## Changes Manifest`` (parsed via :func:`parse_manifest`).
+
+    Raises:
+        RuntimeError: when one or more staged paths are NOT in
+            ``manifest_files``. The error message lists every offending
+            path so the operator (or executor) can act precisely.
+    """
+    staged = list_staged_files(repo_path)
+    allowed = set(manifest_files)
+    out_of_scope = [p for p in staged if p not in allowed]
+    if out_of_scope:
+        raise RuntimeError(
+            f"Manifest scope violation in {repo_path}: "
+            f"{len(out_of_scope)} staged file(s) not in Changes Manifest: {out_of_scope}. "
+            f"Manifest declares: {sorted(allowed)}. Unstage the offending files or "
+            "amend the work unit's Changes Manifest before committing."
+        )
 
 
 def append_rows(content: str, new_rows: list[ManifestRow]) -> str:

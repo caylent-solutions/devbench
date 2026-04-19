@@ -36,6 +36,35 @@ Four review-team judges run in parallel via `review-supervisor` after the execut
 
 The executor retries up to `max_executor_retries` times on `REVIEW_FAIL`. Each retry re-runs the executor with the prior judge comments in its context. If the same finding appears across retries, either the executor is not reading the finding correctly (very rare; usually a prompt-alignment issue) or the finding reflects a real structural gap that the work unit cannot satisfy. In the second case the task blocks after the retry budget is exhausted, which is the correct outcome -- the work unit needs a human edit, not more executor attempts.
 
+## Lifecycle statuses
+
+### What's the difference between Blocked and Declined?
+
+- **Blocked**: the work is waiting on something external (a dependency, infra repair, human judgement) and WILL eventually progress once the blocker is resolved. The stop-hook circuit breaker has specific behaviour around blocked tasks.
+- **Declined**: the work has been determined to NEVER be done -- scope rewritten, functionality being deleted instead, different task delivered the same outcome, or the risk / cost is no longer justified. Terminal state; a deliberate human decision. Captured via `devbench decline <id> --reason "<message>"`.
+
+Declined children count as "terminal-complete" for parent (Story/Feature/Epic) auto-rollup -- a parent rolls to `done` once every child is either `done` or `declined`. Declined tasks are excluded from `tasks_remaining` and from projection ETAs, and surface in a dedicated `Declined (N):` panel in `devbench report`. See [docs/adr/05-declined-status.md](adr/05-declined-status.md).
+
+### What happens when my validation-gate task finds bugs it can't fix?
+
+A validation-gate task is one whose Changes Manifest is empty and whose Approach explicitly forbids production-code changes -- its job is to run existing verifications (test suite, lint, coverage, manual integration scenarios) and report. When such a gate surfaces a confirmed production bug that falls outside its scope, the executor prompt's BUG ESCALATION FOR VALIDATION GATES section instructs it to emit a proposal JSON directly via `uv run devbench write-proposal <source-id>` rather than staging any fix.
+
+The orchestrate skill detects the proposal file at step 4a and invokes `devbench:task-factory` straight away (no blocker-resolver hop, because the executor already did the decomposition). Task-factory materialises one draft `.md` per proposed task with `## Status: proposed` and writes the matching BACKLOG.md rows. The source validation-gate task then proceeds to its own review pipeline at step 5 and may complete normally -- validation-gate escalation does NOT auto-block the source; the source's own acceptance criteria govern whether it passes.
+
+This requires `task_factory.enabled: true` in `backlog/config/devbench.yaml`. If disabled, the executor still logs `NEEDS_ESCALATION` but no drafts are materialised; the orchestrator logs an audit comment naming the pending proposal for operator review. See [ADR-06: Validation-gate bug escalation](adr/06-validation-gate-bug-escalation.md) and [docs/task-factory.md](task-factory.md) for the full flow.
+
+### Why didn't task-factory fire after my amendment was rejected?
+
+Three possible causes:
+
+1. **The amender never executed `reject-amendment`.** The old prompt treated the CLI block as reference; the current prompt requires the amender to run it AND verify the archive file exists before logging the verdict. If you see a rejection comment on the work unit but no file at `<workspace>/.devbench/rejected-requests/<id>-*.json`, the amender hit this pre-tightening bug. Manually recreate the archive from the rejection comment's content, then re-run `devbench:blocker-resolver` for that task.
+2. **The blocker-resolver classified the issue as `escalated` instead of `proposed`.** Step 4c in the orchestrate SKILL now branches on `.devbench/proposals/<id>.json` FILE EXISTENCE (not the verdict word), and the blocker-resolver prompt mandates emitting a proposal JSON whenever a rejected-requests archive exists. If the proposal file is missing, task-factory doesn't fire -- by design. Check whether an archive existed when the resolver ran.
+3. **`task_factory.enabled` is false.** The whole loop is opt-in. Confirm `backlog/config/devbench.yaml` has `task_factory.enabled: true` AND `manifest_amendment.enabled: true`.
+
+### Why did the orchestrator halt instead of continuing?
+
+The orchestrator halts ONLY when (a) `devbench next` returns `ALL_DONE` / `NO_ACTIONABLE` or (b) the stop-hook circuit breaker trips. Per-task failures (git-ops orphan branch, manifest-scope violation, push rejection, executor retry budget exhausted, amendment rejected without a proposal) MUST mark the task `blocked` and return to step 2 -- they never halt the whole loop. If your orchestrator stopped on a per-task failure, the agent was running an older skill prompt; reinstall the plugin (`claude plugin install devbench --scope user`) to pick up the tightened halt-discipline rules.
+
 ## Task factory (proposed work units)
 
 ### My task got blocked with proposals -- what do I do?

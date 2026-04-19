@@ -1001,6 +1001,7 @@ class _BacklogTotals:
     tasks_in_queue: int  # non-Done tasks with status == IN_QUEUE (subset of tasks_active)
     tasks_in_review: int  # non-Done tasks with status == IN_REVIEW (subset of tasks_active)
     tasks_proposed: int  # task-factory-generated drafts awaiting human review
+    tasks_declined: int  # explicitly declined work (won't ever be done)
 
 
 def _backlog_totals_from_units(units: list) -> _BacklogTotals:
@@ -1014,12 +1015,12 @@ def _backlog_totals_from_units(units: list) -> _BacklogTotals:
     tasks_in_queue = [t for t in tasks if t.status == WorkUnitStatus.IN_QUEUE]
     tasks_in_review = [t for t in tasks if t.status == WorkUnitStatus.IN_REVIEW]
     tasks_proposed = [t for t in tasks if t.status == WorkUnitStatus.PROPOSED]
-    # Proposed tasks are inert (no actionable status) so they do NOT count
-    # against tasks_remaining or tasks_active. They are surfaced in a
-    # dedicated Proposed panel + a "Tasks proposed" metric row so the human
-    # can see how many drafts are waiting for review without the projection
-    # pace being distorted by not-yet-approved work.
-    tasks_remaining = len(tasks) - len(tasks_done) - len(tasks_proposed)
+    tasks_declined = [t for t in tasks if t.status == WorkUnitStatus.DECLINED]
+    # Proposed tasks are inert drafts awaiting human review; Declined tasks
+    # are deliberate "won't ever be done" decisions. Neither counts against
+    # tasks_remaining or tasks_active -- the orchestrator will never execute
+    # either, so they must not distort pace / ETA projections.
+    tasks_remaining = len(tasks) - len(tasks_done) - len(tasks_proposed) - len(tasks_declined)
     return _BacklogTotals(
         tasks_total=len(tasks),
         tasks_done=len(tasks_done),
@@ -1035,6 +1036,7 @@ def _backlog_totals_from_units(units: list) -> _BacklogTotals:
         tasks_in_queue=len(tasks_in_queue),
         tasks_in_review=len(tasks_in_review),
         tasks_proposed=len(tasks_proposed),
+        tasks_declined=len(tasks_declined),
     )
 
 
@@ -1058,6 +1060,7 @@ def _backlog_state_rows(b: _BacklogTotals, lifetime: WindowStats | None = None) 
         ),
         ("Tasks in-progress", str(b.tasks_in_progress)),
         ("Tasks proposed", str(b.tasks_proposed)),
+        ("Tasks declined", str(b.tasks_declined)),
         ("Tasks blocked", str(b.tasks_blocked)),
         ("Tasks remaining (total)", str(b.tasks_active + b.tasks_blocked)),
         (
@@ -1152,13 +1155,24 @@ def _proposed_listing(units: list) -> list[str]:
     promoted). Omitted entirely when no proposed tasks exist -- the plan
     requires the panel to disappear rather than print an empty "Proposed (0):".
     """
-    matches = [u for u in units if u.unit_type == WorkUnitType.TASK and u.status == WorkUnitStatus.PROPOSED]
+    return _listing_by_status(units, WorkUnitStatus.PROPOSED, "Proposed")
+
+
+def _declined_listing(units: list) -> list[str]:
+    """List every Declined task so the human can audit the decisions.
+
+    Same shape as the Proposed panel -- ``Declined (N):`` followed by one
+    ``  <title>    <path>`` line per task. Omitted when no declined tasks.
+    """
+    return _listing_by_status(units, WorkUnitStatus.DECLINED, "Declined")
+
+
+def _listing_by_status(units: list, status: WorkUnitStatus, label: str) -> list[str]:
+    """Shared renderer for the Proposed + Declined title/path panels."""
+    matches = [u for u in units if u.unit_type == WorkUnitType.TASK and u.status == status]
     if not matches:
         return []
-    lines = ["", f"Proposed ({len(matches)}):"]
-    # Emit title then file path with enough space that the paths align
-    # roughly the same column across rows. The path is relative to the
-    # backlog root so the display is short enough to read.
+    lines = ["", f"{label} ({len(matches)}):"]
     title_col = max((len(u.title) for u in matches), default=0)
     for u in matches:
         try:
@@ -1304,9 +1318,12 @@ def generate_report(
     if since is None:
         lines.append("\n" + _windows_explanation())
         # B9: per-unit listings at the very end so the user can act on each.
-        # Proposed panel renders FIRST (before In Progress / Blocked) so the
-        # "waiting on human decision" set is the most prominent listing.
+        # Proposed + Declined panels render FIRST (before In Progress / Blocked)
+        # because they represent human-decision state: drafts awaiting review
+        # and tasks that have been taken off the table. Both are omitted when
+        # their respective status has zero tasks.
         lines.extend(_proposed_listing(units))
+        lines.extend(_declined_listing(units))
         lines.extend(_in_progress_listing(units))
         lines.extend(_blocked_listing(units))
 

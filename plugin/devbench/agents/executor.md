@@ -177,6 +177,72 @@ Documentation:
 - No stale references to removed or renamed code.
 - No summary documents unless explicitly requested.
 
+## BUG ESCALATION FOR VALIDATION GATES
+
+Some work units are **validation gates**: their Approach runs existing verifications (test suite, lint, coverage, manual integration scenarios) and reports pass / fail. They are NOT supposed to fix bugs. These units are recognisable by:
+
+- A Changes Manifest that is empty (`| none | | |`) or absent, AND
+- An Approach that explicitly describes the work as "run and report", "validation gate", "verify only", or equivalent wording that forbids production-code changes.
+
+If the gate's verifications surface confirmed production bugs that the task's Approach does not authorise you to fix, you MUST NOT stage or land the fixes yourself — the existing amendment flow only applies to tasks whose Approach already authorises production work. Instead, emit a proposal JSON so task-factory can materialise the fixes as new work units, which the operator reviews and promotes.
+
+Procedure (execute in order — each step is load-bearing):
+
+1. Confirm the trigger applies. Re-read the Changes Manifest and Approach. If the manifest contains ANY files or the Approach authorises production changes, do NOT use this procedure — use the TDD + amendment path in step 3 above instead.
+
+2. For each confirmed out-of-scope bug, draft one `proposed_tasks` entry with the following shape:
+
+   ```json
+   {
+     "suggested_id": "<next free task ID in the appropriate Story directory>",
+     "title": "<short imperative title>",
+     "files_to_own": ["<path/to/file.py>", "..."],
+     "linked_scenarios": ["<scenario ID surfaced by this gate>"],
+     "suggested_acs": [
+       "AC-TEST-001 <what the reproducing test asserts>",
+       "AC-CODE-001 <what the production change does>"
+     ],
+     "suggested_approach": "<TDD RED/GREEN/REFACTOR sketch in one or two sentences>"
+   }
+   ```
+
+   Allocate `suggested_id` by listing sibling task files in the target Story directory and picking the next free `-T<N>` integer. When in doubt, colocate the proposed tasks in the same Story as this gate so the "fix what the gate found" relationship is obvious.
+
+3. Build the outer proposal JSON envelope:
+
+   ```json
+   {
+     "source_task_id": "<this work unit's ID>",
+     "generated_at": "<UTC ISO-8601 timestamp>",
+     "rejection_reason": "Validation gate surfaced bugs outside its Approach scope; <brief summary>",
+     "proposed_tasks": [ ... ]
+   }
+   ```
+
+4. Pipe the JSON into `write-proposal` on stdin:
+
+   ```bash
+   cat <<'EOF' | uv run devbench write-proposal $ARGUMENTS
+   {...full envelope...}
+   EOF
+   ```
+
+5. Verify the proposal landed on disk. This step is NOT optional — the orchestrate skill branches on file existence, so a missing file silently suppresses task-factory:
+
+   ```bash
+   test -f "$JUDGE_WORKSPACE_ROOT/.devbench/proposals/$ARGUMENTS.json" || { echo "FATAL: proposal did not land on disk"; exit 1; }
+   ```
+
+6. Log a NEEDS_ESCALATION comment naming the proposal path and the titles of the proposed tasks:
+
+   ```bash
+   uv run devbench log-comment executor $ARGUMENTS "NEEDS_ESCALATION: validation gate surfaced N out-of-scope production bugs. Proposal emitted: .devbench/proposals/$ARGUMENTS.json with N proposed tasks (<T-ID-1: title>, <T-ID-2: title>, ...). Source task should be marked done iff its own ACs passed; the proposed tasks are independent follow-ups."
+   ```
+
+7. The orchestrate skill (step 4c) detects the proposal file and invokes `devbench:task-factory`, which materialises the drafts at `## Status: proposed`. Do NOT attempt to run task-factory yourself.
+
+Scope discipline: use this procedure ONLY when the task itself is a validation gate. If the task's Approach authorises production fixes and you simply discovered an additional out-of-scope bug while implementing authorised changes, the correct path remains the amendment flow in step 3 (stage the fix, request an amendment). Do not use bug-escalation to route around a rejected amendment.
+
 ## VERIFICATION REQUIREMENTS
 - After writing a file, read it back to confirm contents match intent.
 - After running a command, check exit codes and output.

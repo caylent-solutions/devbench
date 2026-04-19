@@ -374,3 +374,73 @@ class TestAppendRows:
 """
         with pytest.raises(ManifestParseError, match="2 columns"):
             append_rows(bad, [ManifestRow(file="a", change="b")])
+
+
+# ---------------------------------------------------------------------------
+# Slice 3b: list_staged_files + assert_staged_matches_manifest
+# ---------------------------------------------------------------------------
+
+import subprocess as _subprocess  # noqa: E402
+from pathlib import Path as _Path  # noqa: E402
+from unittest.mock import patch as _patch  # noqa: E402
+
+from devbench.backlog.manifest import assert_staged_matches_manifest, list_staged_files  # noqa: E402
+
+
+def _init_repo_with_file(path: _Path, filename: str, contents: str = "x") -> None:
+    _subprocess.run(["git", "init"], cwd=path, check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.email", "t@ex.com"], cwd=path, check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.name", "Test"], cwd=path, check=True, capture_output=True)
+    (path / filename).parent.mkdir(parents=True, exist_ok=True)
+    (path / filename).write_text(contents)
+
+
+class TestListStagedFiles:
+    def test_empty_staged_returns_empty_list(self, tmp_path: _Path) -> None:
+        _init_repo_with_file(tmp_path, "README.md")
+        assert list_staged_files(tmp_path) == []
+
+    def test_staged_files_returned_relative(self, tmp_path: _Path) -> None:
+        _init_repo_with_file(tmp_path, "src/a.py")
+        _init_repo_with_file(tmp_path, "src/b.py")
+        _subprocess.run(["git", "add", "src/a.py", "src/b.py"], cwd=tmp_path, check=True, capture_output=True)
+        staged = list_staged_files(tmp_path)
+        assert sorted(staged) == ["src/a.py", "src/b.py"]
+
+    def test_non_git_dir_raises(self, tmp_path: _Path) -> None:
+        with pytest.raises(RuntimeError, match="git diff --cached --name-only failed"):
+            list_staged_files(tmp_path)
+
+    def test_timeout_raises_runtime_error(self, tmp_path: _Path) -> None:
+        _init_repo_with_file(tmp_path, "x.txt")
+        with (
+            _patch(
+                "subprocess.run",
+                side_effect=_subprocess.TimeoutExpired(cmd="git", timeout=1),
+            ),
+            pytest.raises(RuntimeError, match="timed out"),
+        ):
+            list_staged_files(tmp_path)
+
+
+class TestAssertStagedMatchesManifest:
+    def test_empty_staged_passes(self, tmp_path: _Path) -> None:
+        _init_repo_with_file(tmp_path, "README.md")
+        assert_staged_matches_manifest(tmp_path, ["src/a.py"])  # no raise
+
+    def test_all_staged_in_manifest_passes(self, tmp_path: _Path) -> None:
+        _init_repo_with_file(tmp_path, "src/a.py")
+        _subprocess.run(["git", "add", "src/a.py"], cwd=tmp_path, check=True, capture_output=True)
+        assert_staged_matches_manifest(tmp_path, ["src/a.py", "tests/test_a.py"])
+
+    def test_out_of_manifest_rejected_with_paths(self, tmp_path: _Path) -> None:
+        _init_repo_with_file(tmp_path, "src/a.py")
+        _init_repo_with_file(tmp_path, "TRACE_FILE")
+        _subprocess.run(["git", "add", "src/a.py", "TRACE_FILE"], cwd=tmp_path, check=True, capture_output=True)
+        with pytest.raises(RuntimeError) as exc:
+            assert_staged_matches_manifest(tmp_path, ["src/a.py"])
+        msg = str(exc.value)
+        assert "Manifest scope violation" in msg
+        assert "TRACE_FILE" in msg
+        # src/a.py appears in the "Manifest declares" list but not in the offender list
+        assert "staged file(s) not in Changes Manifest: ['TRACE_FILE']" in msg

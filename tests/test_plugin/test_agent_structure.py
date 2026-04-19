@@ -263,3 +263,86 @@ class TestReviewSupervisorUsesJsonEnvelope:
         assert "log-comment" in content, (
             "review-supervisor.md must use log-comment to relay reviewer findings in the FAIL branch."
         )
+
+
+@pytest.mark.unit
+class TestExecutorValidationGateEscalation:
+    """Executor prompt must instruct bug-escalation for validation-gate tasks (ADR-06)."""
+
+    _EXECUTOR_PATH = AGENTS_DIR / "executor.md"
+
+    def test_executor_has_bug_escalation_heading(self) -> None:
+        """The BUG ESCALATION FOR VALIDATION GATES section must exist in executor.md.
+
+        The orchestrate SKILL step 4a branches on .devbench/proposals/<id>.json file
+        existence to decide whether to invoke task-factory. If the executor prompt
+        does not teach the agent to emit that file for validation-gate bugs, the
+        long-term fix for ADR-06 regresses silently.
+        """
+        assert self._EXECUTOR_PATH.exists(), f"executor.md not found at {self._EXECUTOR_PATH}"
+        content = self._EXECUTOR_PATH.read_text()
+        assert "BUG ESCALATION FOR VALIDATION GATES" in content, (
+            "executor.md must contain a 'BUG ESCALATION FOR VALIDATION GATES' section "
+            "per ADR-06 so validation-gate tasks that surface out-of-scope production "
+            "bugs can trigger task-factory via `uv run devbench write-proposal`."
+        )
+
+    def test_executor_bug_escalation_names_write_proposal(self) -> None:
+        """The bug-escalation section must reference `write-proposal` as the emission CLI."""
+        content = self._EXECUTOR_PATH.read_text()
+        heading_pos = content.find("BUG ESCALATION FOR VALIDATION GATES")
+        assert heading_pos >= 0
+        section_body = content[heading_pos:]
+        assert "write-proposal" in section_body, (
+            "The BUG ESCALATION section must name `uv run devbench write-proposal` as "
+            "the command the executor uses to persist the proposal JSON to disk."
+        )
+
+    def test_executor_bug_escalation_verifies_proposal_file(self) -> None:
+        """The section must instruct the agent to verify the proposal file landed on disk."""
+        content = self._EXECUTOR_PATH.read_text()
+        heading_pos = content.find("BUG ESCALATION FOR VALIDATION GATES")
+        section_body = content[heading_pos:]
+        assert "test -f" in section_body and ".devbench/proposals/" in section_body, (
+            "The BUG ESCALATION section must instruct the agent to `test -f "
+            "$JUDGE_WORKSPACE_ROOT/.devbench/proposals/<id>.json` after write-proposal; "
+            "the orchestrate SKILL branches on file existence, so a missing file silently "
+            "suppresses task-factory."
+        )
+
+
+@pytest.mark.unit
+class TestSkillValidationGateEscalationBranch:
+    """Orchestrate SKILL must have a step 4a branch that fires task-factory on executor-emitted proposals."""
+
+    _SKILL_PATH = Path(__file__).parent.parent.parent / "plugin" / "devbench" / "skills" / "orchestrate" / "SKILL.md"
+
+    def test_skill_file_exists(self) -> None:
+        assert self._SKILL_PATH.exists(), f"orchestrate/SKILL.md not found at {self._SKILL_PATH}"
+
+    def test_skill_has_validation_gate_branch(self) -> None:
+        """SKILL.md must contain a step 4a that handles validation-gate bug escalation."""
+        content = self._SKILL_PATH.read_text()
+        assert "4a." in content, "SKILL.md must declare a step 4a for validation-gate bug escalation."
+        assert "Validation-gate bug-escalation" in content or "validation-gate bug-escalation" in content.lower(), (
+            "SKILL.md step 4a must name the validation-gate bug-escalation trigger explicitly."
+        )
+
+    def test_skill_step_4a_branches_on_proposal_file(self) -> None:
+        """Step 4a must branch on `.devbench/proposals/<id>.json` existence (deterministic trigger)."""
+        content = self._SKILL_PATH.read_text()
+        assert ".devbench/proposals/" in content, (
+            "SKILL.md must reference `.devbench/proposals/<id>.json` -- the file-existence trigger."
+        )
+        assert "test -f" in content, (
+            "SKILL.md step 4a must use `test -f` to check for the proposal file; "
+            "the trigger must be deterministic, not verdict-word-based."
+        )
+
+    def test_skill_step_4a_short_circuits_on_amendment_file(self) -> None:
+        """When an amendment file ALSO exists, step 4a must defer to step 4b/4c to avoid double-fire."""
+        content = self._SKILL_PATH.read_text()
+        assert ".devbench/amendments/" in content, (
+            "SKILL.md step 4a must reference `.devbench/amendments/<id>.json` so it knows to "
+            "skip the validation-gate branch when the amendment path is already handling the task."
+        )

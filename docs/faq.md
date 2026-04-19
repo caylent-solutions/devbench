@@ -104,3 +104,14 @@ Run `devbench watch` in another terminal. It prints a one-screen snapshot of the
 ### Is `devbench watch` safe to run while an orchestration is active?
 
 Yes. The command is strictly read-only. It invokes only `git -C <repo> status --porcelain=v1` and `git -C <repo> rev-parse HEAD` (both read-only), opens every file in read mode, and never signals or writes back to the running process. Safe to run continuously via `make watch-live INTERVAL=2`.
+
+### How do I watch agent hook activity live (instead of a snapshot)?
+
+Run `devbench hook-tail` in another terminal. It pretty-prints every PreToolUse / PostToolUse / subagent / stop / user-prompt event from the plugin's `hook-logs.jsonl` as a one-line colorized summary, in real time:
+
+```
+23:57:45 -> review-super Bash     List all tests collected
+23:58:16 <- review-super Bash     Check test coverage  |  ===== 21 passed in 27.93s =====
+```
+
+Timestamps default to the OS local timezone; override with `--tz America/New_York` (or any IANA zoneinfo name). Complementary to `devbench watch`: watch shows *current state* refreshed every N seconds; hook-tail shows *events as they happen*, append-only. Also read-only. See [docs/hook-activity.md](hook-activity.md).

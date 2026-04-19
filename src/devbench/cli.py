@@ -1091,6 +1091,88 @@ def cmd_watch(watch_interval: int = 0) -> int:
         return 0
 
 
+def cmd_hook_tail(*argv: str) -> int:
+    """Pretty-tail the plugin's hook-logs.jsonl stream.
+
+    Usage::
+
+        hook-tail [<path>] [--tz <zoneinfo-name>] [--no-follow] [--from-start]
+
+    Defaults ``<path>`` to ``$JUDGE_WORKSPACE_ROOT/hook-logs.jsonl`` (the same
+    location ``devbench watch`` reads from). Renders timestamps in the OS
+    local timezone; ``--tz`` overrides with any IANA zoneinfo name. Disables
+    ANSI color when ``NO_COLOR`` is set or stdout is not a TTY.
+    """
+    from devbench.hook_tail import (
+        FollowOptions,
+        InvalidTimezoneError,
+        follow,
+        render_header,
+        resolve_timezone,
+        should_use_color,
+    )
+
+    tz_name: str | None = None
+    no_follow = False
+    from_start = False
+    path_override = ""
+    args = list(argv)
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if not arg:
+            i += 1
+            continue
+        if arg == "--tz":
+            if i + 1 >= len(args) or not args[i + 1]:
+                print("ERROR: --tz requires a value", file=sys.stderr)
+                return 2
+            tz_name = args[i + 1]
+            i += 2
+            continue
+        if arg == "--no-follow":
+            no_follow = True
+            i += 1
+            continue
+        if arg == "--from-start":
+            from_start = True
+            i += 1
+            continue
+        if arg.startswith("--"):
+            print(f"ERROR: unknown flag: {arg}", file=sys.stderr)
+            return 2
+        if not path_override:
+            path_override = arg
+            i += 1
+            continue
+        print(f"ERROR: unexpected positional argument: {arg}", file=sys.stderr)
+        return 2
+
+    try:
+        tz = resolve_timezone(tz_name)
+    except InvalidTimezoneError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        print("Provide an IANA zoneinfo name (e.g. America/New_York, UTC).", file=sys.stderr)
+        return 2
+
+    path = Path(path_override) if path_override else WORKSPACE_ROOT / "hook-logs.jsonl"
+    color = should_use_color(sys.stdout)
+
+    print(render_header(path, tz, color=color))
+    sys.stdout.flush()
+
+    return follow(
+        path,
+        FollowOptions(
+            tz=tz,
+            from_start=from_start,
+            no_follow=no_follow,
+            color=color,
+        ),
+        sys.stdout,
+    )
+
+
 def cmd_start() -> int:
     """Run the devbench orchestrate skill non-interactively via the Claude Agent SDK.
 
@@ -1500,6 +1582,11 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
         0,
         "Dashboard view of the currently-active orchestration: watch [--watch N]",
     ),
+    "hook-tail": (
+        cmd_hook_tail,
+        0,
+        "Pretty-tail $WORKSPACE_ROOT/hook-logs.jsonl: hook-tail [<path>] [--tz <zone>] [--no-follow] [--from-start]",
+    ),
     # Plugin agent bridge commands — used by devbench plugin agents
     "read-unit": (cmd_read_unit, 1, "Work unit content + repo path as JSON: read-unit [--strip-comments] <id>"),
     "get-diff": (cmd_get_diff, 1, "Return combined git diff for work unit's repo: get-diff <id>"),
@@ -1551,6 +1638,12 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
 
 
 _HELP_FLAGS: frozenset[str] = frozenset({"--help", "-h"})
+
+# Commands that parse their own flag grammar and need the full trailing-arg
+# list instead of the dispatcher's fixed-arity slice. Additions here are
+# deliberate -- the slice is a guardrail against typos for fixed-arity
+# commands, so variadic opt-in should be narrow.
+_VARIADIC_COMMANDS: frozenset[str] = frozenset({"hook-tail"})
 
 
 def _print_usage() -> None:
@@ -1626,9 +1719,16 @@ def main() -> int:
     if watch_rc is not None:
         return watch_rc
 
-    if len(args) > min_args + 1:
-        print(f"Warning: ignoring {len(args) - min_args - 1} extra argument(s)", file=sys.stderr)
-    return func(*args[: min_args + 1]) if len(args) > min_args else func(*args[:min_args])
+    # Variadic commands receive the full trailing-arg list -- they own their
+    # own flag parsing. Fixed-arity commands get sliced to ``min_args + 1``
+    # so a stray extra positional is reported instead of silently absorbed.
+    if command in _VARIADIC_COMMANDS:
+        sliced_args: list[str] = list(args)
+    else:
+        if len(args) > min_args + 1:
+            print(f"Warning: ignoring {len(args) - min_args - 1} extra argument(s)", file=sys.stderr)
+        sliced_args = list(args[: min_args + 1]) if len(args) > min_args else list(args[:min_args])
+    return func(*sliced_args)
 
 
 if __name__ == "__main__":

@@ -4001,3 +4001,47 @@ class TestCmdDecline:
 
     def test_registered_in_commands(self) -> None:
         assert "decline" in cli._COMMANDS
+
+
+class TestCmdHookTail:
+    """``devbench hook-tail`` argument parsing and dispatcher registration.
+
+    Runtime behaviour (file-following, formatting) lives in
+    ``tests/unit/test_hook_tail.py`` and
+    ``tests/test_integration/test_hook_tail_lifecycle.py``; this block
+    covers ONLY the CLI-level flag parsing that ``cmd_hook_tail`` owns.
+    """
+
+    def test_registered_in_commands(self) -> None:
+        assert "hook-tail" in cli._COMMANDS
+
+    def test_is_variadic_so_flags_reach_handler(self) -> None:
+        """The dispatcher truncates positional args for fixed-arity commands;
+        hook-tail must be in the variadic opt-in set so --tz etc. reach it."""
+        assert "hook-tail" in cli._VARIADIC_COMMANDS
+
+    def test_missing_tz_value_returns_2(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_hook_tail("--tz")
+        assert rc == 2
+        assert "--tz requires a value" in capsys.readouterr().err
+
+    def test_empty_tz_value_returns_2(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_hook_tail("--tz", "")
+        assert rc == 2
+
+    def test_unknown_flag_returns_2(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_hook_tail("--bogus")
+        assert rc == 2
+        assert "unknown flag" in capsys.readouterr().err
+
+    def test_two_positional_paths_return_2(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_hook_tail("/tmp/a", "/tmp/b")
+        assert rc == 2
+        assert "unexpected positional argument" in capsys.readouterr().err
+
+    def test_invalid_tz_returns_2(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_hook_tail("--tz", "Not/AZone")
+        assert rc == 2
+        captured = capsys.readouterr()
+        assert "unknown timezone" in captured.err
+        assert "Not/AZone" in captured.err

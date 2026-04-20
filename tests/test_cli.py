@@ -353,7 +353,7 @@ class TestCmdMarkDone:
 
 class TestCmdValidateBacklogPathResolution:
     """Bug fix: cmd_validate_backlog must pass workspace root (BACKLOG_INDEX.parent) to validate(),
-    not BACKLOG_ROOT — otherwise file paths of the form 'backlog/...' get resolved as
+    not BACKLOG_ROOT -- otherwise file paths of the form 'backlog/...' get resolved as
     BACKLOG_ROOT/backlog/... which is a double 'backlog/' and causes false 'file missing' errors.
     """
 
@@ -536,7 +536,7 @@ class TestHelp:
         mock_fn.assert_not_called()
 
     def test_unknown_command_still_returns_1(self, capsys: pytest.CaptureFixture[str]) -> None:
-        """Typos must still fail fast — --help is not a wildcard excuse."""
+        """Typos must still fail fast -- --help is not a wildcard excuse."""
         with patch("sys.argv", ["judges.cli", "nonexistent-command"]):
             result = cli.main()
         err = capsys.readouterr().err
@@ -1040,7 +1040,7 @@ class TestCmdGetDiff:
         assert result == 0
         output = capsys.readouterr().out
         assert "upstream_merged.py" not in output, (
-            "Upstream-merged file appeared in output — bare branch ref was used instead of origin/"
+            "Upstream-merged file appeared in output -- bare branch ref was used instead of origin/"
         )
         assert "new_feature.py" in output, "Branch-specific diff should appear in output"
 
@@ -1409,7 +1409,7 @@ class TestCmdGitOpsEventComments:
         unit_id = "E230-F1-S1-T1"
         pr_url = "https://github.com/org/repo/pull/42"
         unit = _make_git_ops_unit(unit_id)
-        # Note: wu_file is NOT created — file resolution should fail gracefully
+        # Note: wu_file is NOT created -- file resolution should fail gracefully
 
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
@@ -1428,7 +1428,7 @@ class TestCmdGitOpsEventComments:
         ):
             result = cli.cmd_git_ops(unit_id)
 
-        # Must NOT fail due to missing file — git ops already succeeded
+        # Must NOT fail due to missing file -- git ops already succeeded
         assert result == 0
 
 
@@ -1591,7 +1591,7 @@ class TestResolveUnitFile:
             repo="caylent-solutions/devbench",
             dependencies=[],
         )
-        # No file is created — both paths will be missing
+        # No file is created -- both paths will be missing
 
         with (
             patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog_root"),
@@ -1666,7 +1666,7 @@ def _make_backlog_index_for_tdd(tmp_path: Path, unit_id: str, wu_file: Path) -> 
 
 @pytest.mark.unit
 class TestCmdLogTdd:
-    """Tests for cmd_log_tdd — AC-1 through AC-6, AC-11."""
+    """Tests for cmd_log_tdd -- AC-1 through AC-6, AC-11."""
 
     def _setup(self, tmp_path: Path, unit_id: str = "E231-F2-S1-T1") -> tuple[Path, Path]:
         """Return (wu_file, backlog_index) with TDD Cycle Log section."""
@@ -1768,7 +1768,7 @@ class TestCmdLogTdd:
         assert "[REFACTOR]" in tdd_section
 
     def test_log_tdd_phase_case_insensitive(self, tmp_path: Path) -> None:
-        """AC-4: Phase argument is case-insensitive — 'red' normalized to 'RED'."""
+        """AC-4: Phase argument is case-insensitive -- 'red' normalized to 'RED'."""
         wu_file, backlog_index = self._setup(tmp_path)
         unit = WorkUnit(
             id="E231-F2-S1-T1",
@@ -2872,7 +2872,7 @@ class TestCmdReport:
         """Each watch tick must clear the terminal viewport AND scrollback.
 
         When the OS provides a `clear` (or `cls`) binary, we delegate to it via
-        subprocess — terminfo handles the right sequence per terminal, including
+        subprocess -- terminfo handles the right sequence per terminal, including
         the scrollback erase that bare `\\033[H\\033[2J` does not perform on
         all terminals (notably VS Code's xterm.js where the prior `\\033[3J`
         approach was unreliable).
@@ -3185,7 +3185,7 @@ class TestRejectEmDash:
         assert "U+2014" in err
 
     def test_log_verdict_pass_feedback_with_em_dash_rejected(self, capsys: pytest.CaptureFixture[str]) -> None:
-        """Pass verdicts can still carry feedback — em-dash must still be rejected."""
+        """Pass verdicts can still carry feedback -- em-dash must still be rejected."""
         result = cli.cmd_log_verdict("code_review", "E0-F1-S1-T1", "pass", self._EM_DASH_FEEDBACK)
         err = capsys.readouterr().err
         assert result == 1
@@ -3204,7 +3204,7 @@ class TestRejectEmDash:
         assert "em-dash" in err
 
     def test_clean_feedback_is_not_rejected_by_em_dash_guard(self) -> None:
-        """The guard must return None for clean text — double-hyphen is fine."""
+        """The guard must return None for clean text -- double-hyphen is fine."""
         assert cli._reject_em_dash("feedback", "issue A -- still broken") is None
         assert cli._reject_em_dash("feedback", "") is None
 
@@ -3680,11 +3680,463 @@ class TestCmdRejectProposal:
             assert rc == 1  # Without reason value
 
 
+class TestCmdStatusUnmaterialisedLine:
+    """ADR-08 slice B: ``devbench status`` must always print an 'Un-materialised' row."""
+
+    def test_status_prints_zero_line_when_no_proposals(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Row always renders so regressions to zero are visible."""
+        parser = MagicMock()
+        parser.parse_index.return_value = []
+        parser.get_parallel_candidates.return_value = []
+        parser.get_blocked_units.return_value = []
+        parser.all_done.return_value = False
+        with (
+            patch("devbench.cli.BacklogParser", return_value=parser),
+            patch("devbench.cli._count_unmaterialised_proposed_tasks", return_value=0),
+        ):
+            rc = cli.cmd_status()
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "Un-materialised" in out, "status must always print the Un-materialised row."
+        assert re.search(r"Un-materialised\s+0\b", out), (
+            "Un-materialised row must render a zero count when no proposal JSONs are pending."
+        )
+
+    def test_status_prints_nonzero_count(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        parser = MagicMock()
+        parser.parse_index.return_value = []
+        parser.get_parallel_candidates.return_value = []
+        parser.get_blocked_units.return_value = []
+        parser.all_done.return_value = False
+        with (
+            patch("devbench.cli.BacklogParser", return_value=parser),
+            patch("devbench.cli._count_unmaterialised_proposed_tasks", return_value=7),
+        ):
+            rc = cli.cmd_status()
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert re.search(r"Un-materialised\s+7\b", out)
+
+
+class TestCmdListProposalsStateLabels:
+    """ADR-08 slice D: each listing line has a ``[state]`` label prefix."""
+
+    def test_labels_per_task_state(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        from devbench.backlog.proposal import (
+            Proposal,
+            ProposalTaskState,
+            ProposedTask,
+            write_proposal,
+        )
+
+        proposal = Proposal(
+            source_task_id="E0-F1-S1-T1",
+            generated_at="2026-04-19T00:00:00Z",
+            rejection_reason="r",
+            proposed_tasks=[
+                ProposedTask(
+                    suggested_id="E0-F1-S1-T2",
+                    title="Umat",
+                    files_to_own=["src/x.py"],
+                    linked_scenarios=["SC-01"],
+                    suggested_acs=["AC-001 fix"],
+                    suggested_approach="ok",
+                ),
+                ProposedTask(
+                    suggested_id="E0-F1-S1-T3",
+                    title="Prop",
+                    files_to_own=["src/y.py"],
+                    linked_scenarios=["SC-02"],
+                    suggested_acs=["AC-002 fix"],
+                    suggested_approach="ok",
+                ),
+            ],
+        )
+        write_proposal(tmp_path, proposal)
+
+        def fake_classify(backlog_root: Path, workspace_root: Path, task_id: str) -> ProposalTaskState:
+            return {
+                "E0-F1-S1-T2": ProposalTaskState.UNMATERIALISED,
+                "E0-F1-S1-T3": ProposalTaskState.PROPOSED,
+            }[task_id]
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.classify_proposed_task", side_effect=fake_classify),
+        ):
+            rc = cli.cmd_list_proposals()
+        assert rc == 0
+        out = capsys.readouterr().out
+        # Labels must be present and distinct.
+        assert "[unmaterialised]" in out, "Every un-materialised task gets an [unmaterialised] label"
+        assert "[proposed]" in out, "Every proposed task gets a [proposed] label"
+        # Sanity: both suggested ids present.
+        assert "E0-F1-S1-T2" in out and "E0-F1-S1-T3" in out
+
+
+class TestCmdRejectProposalUnmaterialised:
+    """ADR-08 slice E: ``reject-proposal --unmaterialised <id> --reason <msg>`` CLI form."""
+
+    def test_unmaterialised_flag_dispatches_through_api(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        archive = tmp_path / "a.json"
+        archive.write_text("{}")
+        seen: dict = {}
+
+        def fake_reject(
+            *,
+            workspace_root: Path,
+            backlog_root: Path,
+            backlog_index: Path,
+            task_id: str = "",
+            unmaterialised_source_id: str = "",
+            reason: str,
+        ) -> Path | None:
+            seen["task_id"] = task_id
+            seen["umid"] = unmaterialised_source_id
+            seen["reason"] = reason
+            return archive
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli.reject_proposal", side_effect=fake_reject),
+        ):
+            rc = cli.cmd_reject_proposal("--unmaterialised", "E0-F1-S1-T1", "--reason", "redundant")
+        assert rc == 0, capsys.readouterr().err
+        assert seen == {
+            "task_id": "",
+            "umid": "E0-F1-S1-T1",
+            "reason": "redundant",
+        }
+        out = capsys.readouterr().out
+        assert "rejected-unmaterialised" in out
+        assert "E0-F1-S1-T1" in out
+
+    def test_both_forms_supplied_errors(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+        ):
+            rc = cli.cmd_reject_proposal("E0-F1-S1-T2", "--unmaterialised", "E0-F1-S1-T1", "--reason", "no")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "not both" in err or "supply exactly one" in err
+
+    def test_neither_form_supplied_errors(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_reject_proposal("--reason", "lonely")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "requires either" in err
+
+    def test_unmaterialised_without_value_errors(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_reject_proposal("--unmaterialised", "--reason", "x")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "source-task-id" in err
+
+
+class TestCmdSweepProposals:
+    """ADR-08 slice J: ``devbench sweep-proposals`` best-effort materialises un-materialised JSONs."""
+
+    def test_nothing_to_do_when_no_proposals(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+        ):
+            rc = cli.cmd_sweep_proposals()
+        assert rc == 0
+        assert "nothing to do" in capsys.readouterr().out
+
+    def test_materialises_one_unmaterialised_proposal(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from devbench.backlog.proposal import (
+            Proposal,
+            ProposalTaskState,
+            ProposedTask,
+            write_proposal,
+        )
+
+        proposal = Proposal(
+            source_task_id="E0-F1-S1-T1",
+            generated_at="2026-04-19T00:00:00Z",
+            rejection_reason="r",
+            proposed_tasks=[
+                ProposedTask(
+                    suggested_id="E0-F1-S1-T2",
+                    title="x",
+                    files_to_own=["src/x.py"],
+                    linked_scenarios=["SC-01"],
+                    suggested_acs=["AC-001 fix"],
+                    suggested_approach="ok",
+                )
+            ],
+        )
+        write_proposal(tmp_path, proposal)
+
+        parser = MagicMock()
+        unit = MagicMock()
+        unit.id = "E0-F1-S1-T1"
+        unit.repo = "caylent-solutions/example"
+        parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli.BacklogParser", return_value=parser),
+            patch(
+                "devbench.cli.classify_proposed_task",
+                return_value=ProposalTaskState.UNMATERIALISED,
+            ),
+            patch("devbench.cli.materialise_proposal", return_value=[tmp_path / "a.md"]),
+        ):
+            rc = cli.cmd_sweep_proposals()
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "materialised E0-F1-S1-T1: 1 new, 0 skipped" in out
+
+    def test_tolerates_proposal_error_per_entry(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """A ProposalError on one proposal must be logged and skipped, not raised."""
+        from devbench.backlog.proposal import (
+            Proposal,
+            ProposalError,
+            ProposalTaskState,
+            ProposedTask,
+            write_proposal,
+        )
+
+        proposal = Proposal(
+            source_task_id="E0-F1-S1-T1",
+            generated_at="2026-04-19T00:00:00Z",
+            rejection_reason="r",
+            proposed_tasks=[
+                ProposedTask(
+                    suggested_id="E0-F1-S1-T2",
+                    title="x",
+                    files_to_own=["src/x.py"],
+                    linked_scenarios=["SC-01"],
+                    suggested_acs=["AC-001 fix"],
+                    suggested_approach="ok",
+                )
+            ],
+        )
+        write_proposal(tmp_path, proposal)
+
+        parser = MagicMock()
+        unit = MagicMock()
+        unit.id = "E0-F1-S1-T1"
+        unit.repo = "caylent-solutions/example"
+        parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli.BacklogParser", return_value=parser),
+            patch(
+                "devbench.cli.classify_proposed_task",
+                return_value=ProposalTaskState.UNMATERIALISED,
+            ),
+            patch(
+                "devbench.cli.materialise_proposal",
+                side_effect=ProposalError("guard: prior proposed tasks exist"),
+            ),
+        ):
+            rc = cli.cmd_sweep_proposals()
+        assert rc == 0, "sweep must tolerate per-proposal ProposalError without crashing"
+        out = capsys.readouterr().out
+        assert "skipped E0-F1-S1-T1" in out
+        assert "prior proposed tasks exist" in out
+
+    def test_no_op_when_every_task_already_materialised(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from devbench.backlog.proposal import (
+            Proposal,
+            ProposalTaskState,
+            ProposedTask,
+            write_proposal,
+        )
+
+        proposal = Proposal(
+            source_task_id="E0-F1-S1-T1",
+            generated_at="2026-04-19T00:00:00Z",
+            rejection_reason="r",
+            proposed_tasks=[
+                ProposedTask(
+                    suggested_id="E0-F1-S1-T2",
+                    title="x",
+                    files_to_own=["src/x.py"],
+                    linked_scenarios=["SC-01"],
+                    suggested_acs=["AC-001 fix"],
+                    suggested_approach="ok",
+                )
+            ],
+        )
+        write_proposal(tmp_path, proposal)
+
+        parser = MagicMock()
+        parser.parse_index.return_value = []
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli.BacklogParser", return_value=parser),
+            patch(
+                "devbench.cli.classify_proposed_task",
+                return_value=ProposalTaskState.PROPOSED,
+            ),
+        ):
+            rc = cli.cmd_sweep_proposals()
+        assert rc == 0
+        assert "no-op E0-F1-S1-T1" in capsys.readouterr().out
+
+
+class TestCmdSweepProposalsResurrectionGuard:
+    """ADR-09: rejected drafts must not resurrect on the next sweep tick."""
+
+    def test_rejected_draft_not_recreated_by_sweep(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """End-to-end: write JSON -> materialise -> reject -> sweep -> no resurrection."""
+        from devbench.backlog import proposal as proposal_mod
+        from devbench.backlog.proposal import (
+            Proposal,
+            ProposedTask,
+            materialise_proposal,
+            reject_proposal,
+            write_proposal,
+        )
+
+        # Build a real workspace so materialise + reject + sweep exercise the real code.
+        backlog_dir = tmp_path / "backlog"
+        story_dir = backlog_dir / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+        source_file = story_dir / "E0-F1-S1-T1.md"
+        source_file.write_text(
+            "# E0-F1-S1-T1: Source Task\n\n## Status: blocked\n\n"
+            "## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-TEST-001 x\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `x.py` | x |\n\n"
+            "## Definition of Done\n\n- [ ] AC complete\n"
+        )
+        backlog_md = tmp_path / "BACKLOG.md"
+        backlog_md.write_text(
+            "# Backlog\n\n## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
+            "|------|-------|------|-------------|----------|---------|\n"
+            "| E0 | Ex | 0 | 0 | 0 | 1 |\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Source | Task | blocked | None | caylent-solutions/example | "
+            "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n"
+        )
+
+        proposal = Proposal(
+            source_task_id="E0-F1-S1-T1",
+            generated_at="2026-04-19T00:00:00Z",
+            rejection_reason="r",
+            proposed_tasks=[
+                ProposedTask(
+                    suggested_id="E0-F1-S1-T2",
+                    title="Fix",
+                    files_to_own=["src/a.py"],
+                    linked_scenarios=["SC-01"],
+                    suggested_acs=["AC-001 fix"],
+                    suggested_approach=(
+                        "Context: the unit test fixture for ADR-09 resurrection guard. "
+                        "Scope: src/a.py and its companion unit test. "
+                        "TDD approach: 1. RED -- write the failing test. "
+                        "2. GREEN -- apply the minimal production fix. "
+                        "3. REFACTOR -- no behaviour change. "
+                        "Verify: make lint && make test-unit exit zero."
+                    ),
+                )
+            ],
+        )
+        write_proposal(tmp_path, proposal)
+        materialise_proposal(
+            workspace_root=tmp_path,
+            backlog_root=backlog_dir,
+            backlog_index=backlog_md,
+            proposal=proposal,
+            repo="caylent-solutions/example",
+        )
+        reject_proposal(
+            workspace_root=tmp_path,
+            backlog_root=backlog_dir,
+            backlog_index=backlog_md,
+            task_id="E0-F1-S1-T2",
+            reason="superseded",
+        )
+        draft_path = story_dir / "E0-F1-S1-T2.md"
+        assert not draft_path.exists(), "per-draft reject must archive the .md"
+        assert any(
+            proposal_mod.REJECTED_PROPOSAL_DIR_NAME in str(p)
+            for p in (tmp_path / proposal_mod.REJECTED_PROPOSAL_DIR_NAME).iterdir()
+        )
+
+        # Now run sweep-proposals. Expect no-op because the only task is
+        # REJECTED (archive exists) -- classify_proposed_task returns REJECTED,
+        # sweep's unmaterialised_before count is zero, hits the no-op branch.
+        source_unit = MagicMock()
+        source_unit.id = "E0-F1-S1-T1"
+        source_unit.repo = "caylent-solutions/example"
+        parser = MagicMock()
+        parser.parse_index.return_value = [source_unit]
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.BacklogParser", return_value=parser),
+        ):
+            rc = cli.cmd_sweep_proposals()
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "no-op E0-F1-S1-T1" in out, out
+        # The crucial assertion: the rejected draft file was NOT recreated.
+        assert not draft_path.exists(), "sweep-proposals must not resurrect a rejected draft"
+
+
 class TestProposalCommandsRegistered:
     def test_list_proposals_registered(self) -> None:
         assert "list-proposals" in cli._COMMANDS
         assert "promote-proposal" in cli._COMMANDS
         assert "reject-proposal" in cli._COMMANDS
+
+    def test_sweep_proposals_registered(self) -> None:
+        assert "sweep-proposals" in cli._COMMANDS
 
 
 class TestCmdMaterialiseProposal:
@@ -3798,7 +4250,12 @@ class TestCmdMaterialiseProposal:
                     files_to_own=["src/a.py"],
                     linked_scenarios=["SC-01"],
                     suggested_acs=["AC-FUNC-001"],
-                    suggested_approach="do",
+                    suggested_approach=(
+                        "Context: unit test fixture for cmd_materialise_proposal happy path. "
+                        "Scope: this draft is synthetic; no real files affected. "
+                        "TDD approach: 1. RED -- n/a. 2. GREEN -- n/a. 3. REFACTOR -- n/a. "
+                        "Verify: the materialise-proposal CLI command exits 0."
+                    ),
                 )
             ],
         )

@@ -460,7 +460,7 @@ class TestDualWindowReport:
                     # Noise entries every 3 seconds for 1 hour (just one example to prove filtering)
                     "2026-03-05T08:30:00Z [judges.log_setup] INFO Logging to stdout and ...",
                     "2026-03-05T09:00:00Z [judges.log_setup] INFO Logging to stdout and ...",
-                    # A real orchestration event 70 minutes after the last real one — new session
+                    # A real orchestration event 70 minutes after the last real one -- new session
                     "2026-03-05T09:15:00Z [judges.cli] INFO Set E0-F1-S1-T2 to 'in-progress'",
                 ]
             )
@@ -599,7 +599,7 @@ class TestDisplayTimezone:
         # "Not_A_Real_Zone" is invalid; should fall back to local.
         with _patch("devbench.reporting.report.REPORT_DISPLAY_TIMEZONE", "Not_A_Real_Zone"):
             report = generate_report(log_path=log_file)
-        # Just check report rendered — no exception, has the expected sections.
+        # Just check report rendered -- no exception, has the expected sections.
         assert "All-time" in report
         assert "Session" in report
 
@@ -676,7 +676,7 @@ class TestAccurateCost:
         assert cost.total_cost == pytest.approx(0.030524, abs=1e-5)
 
         # A naive totalTokens * blended-rate estimate would give $0.355527 for
-        # the same call — confirming per-token-type costing is >10x lower for
+        # the same call -- confirming per-token-type costing is >10x lower for
         # cache-heavy workloads. Naive: (1+332+38712+458) * 9 / 1M.
         naive_blended_cost = (1 + 332 + 38712 + 458) * 9.0 / 1_000_000
         assert naive_blended_cost / cost.total_cost > 10
@@ -1098,7 +1098,7 @@ class TestActiveVsBlockedRemaining:
 
     def test_min_pace_samples_guard_n_below_threshold(self, tmp_path: Path) -> None:
         """B3: a window with fewer than MIN_PACE_SAMPLES completions must
-        produce avg_minutes=0 (display as n/a) and est_hours=0 — but still
+        produce avg_minutes=0 (display as n/a) and est_hours=0 -- but still
         records the sample count for diagnostic display."""
         from devbench.constants import MIN_PACE_SAMPLES
         from devbench.reporting.report import _compute_window_stats
@@ -1312,13 +1312,13 @@ class TestUnitListings:
         from devbench.backlog.work_unit import WorkUnitStatus
         from devbench.reporting.report import _blocked_listing, _in_progress_listing
 
-        # Only done tasks — no in-progress, no blocked.
+        # Only done tasks -- no in-progress, no blocked.
         units = [self._mk_unit("E0-F1-S1-T1", "t", WorkUnitStatus.DONE)]
         assert _in_progress_listing(units) == []
         assert _blocked_listing(units) == []
 
     def test_listings_skip_non_task_units(self) -> None:
-        """Story/Feature/Epic status is auto-rolled from children — never list them."""
+        """Story/Feature/Epic status is auto-rolled from children -- never list them."""
         from devbench.backlog.work_unit import WorkUnitStatus, WorkUnitType
         from devbench.reporting.report import _blocked_listing, _in_progress_listing
 
@@ -1383,6 +1383,116 @@ class TestUnitListings:
         assert totals.tasks_declined == 1
         rows = _backlog_state_rows(totals)
         assert ("Tasks declined", "1") in rows
+
+    def test_unmaterialised_proposals_listing_empty_when_no_proposals(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ADR-08: panel disappears when no proposal JSONs exist at all."""
+        import devbench.reporting.report as report_mod
+
+        monkeypatch.setattr(report_mod, "BACKLOG_ROOT", tmp_path / "backlog")
+        (tmp_path / "backlog").mkdir(exist_ok=True)
+
+        assert report_mod._unmaterialised_proposals_listing() == []
+
+    def test_unmaterialised_proposals_listing_renders_entries(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ADR-08: each proposal-JSON task in UNMATERIALISED state gets a row."""
+        import devbench.reporting.report as report_mod
+        from devbench.backlog.proposal import (
+            PROPOSAL_DIR_NAME,
+            Proposal,
+            ProposedTask,
+            write_proposal,
+        )
+
+        backlog_root = tmp_path / "backlog"
+        backlog_root.mkdir(exist_ok=True)
+        monkeypatch.setattr(report_mod, "BACKLOG_ROOT", backlog_root)
+
+        (tmp_path / PROPOSAL_DIR_NAME).mkdir(parents=True)
+        write_proposal(
+            tmp_path,
+            Proposal(
+                source_task_id="E1-F1-S2-T1",
+                generated_at="2026-04-19T00:00:00Z",
+                rejection_reason="scope",
+                proposed_tasks=[
+                    ProposedTask(
+                        suggested_id="E1-F1-S2-T6",
+                        title="Fix symlink guard",
+                        files_to_own=["src/x.py"],
+                        linked_scenarios=["SC-01"],
+                        suggested_acs=["AC-001 fix"],
+                        suggested_approach=(
+                            "Context: unit test fixture. Scope: src/x.py. "
+                            "TDD approach: 1. RED 2. GREEN 3. REFACTOR no-op. "
+                            "Verify: make lint && make test-unit all exit zero."
+                        ),
+                    ),
+                ],
+            ),
+        )
+
+        lines = report_mod._unmaterialised_proposals_listing()
+        assert lines, "Panel must render when a proposal-JSON task is in UNMATERIALISED state."
+        assert any("Proposal JSONs pending materialisation" in line for line in lines)
+        assert any("E1-F1-S2-T6" in line for line in lines)
+        assert any("Fix symlink guard" in line for line in lines)
+        assert any("from E1-F1-S2-T1" in line for line in lines)
+
+    def test_unmaterialised_proposals_listing_omits_materialised(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If a draft .md exists for the suggested_id the entry is not un-materialised -> omitted."""
+        import devbench.reporting.report as report_mod
+        from devbench.backlog.proposal import (
+            PROPOSAL_DIR_NAME,
+            Proposal,
+            ProposedTask,
+            _extract_story_id,
+            _story_dir,
+            write_proposal,
+        )
+
+        backlog_root = tmp_path / "backlog"
+        backlog_root.mkdir(exist_ok=True)
+        monkeypatch.setattr(report_mod, "BACKLOG_ROOT", backlog_root)
+
+        (tmp_path / PROPOSAL_DIR_NAME).mkdir(parents=True)
+        write_proposal(
+            tmp_path,
+            Proposal(
+                source_task_id="E1-F1-S2-T1",
+                generated_at="2026-04-19T00:00:00Z",
+                rejection_reason="scope",
+                proposed_tasks=[
+                    ProposedTask(
+                        suggested_id="E1-F1-S2-T6",
+                        title="Fix symlink guard",
+                        files_to_own=["src/x.py"],
+                        linked_scenarios=["SC-01"],
+                        suggested_acs=["AC-001 fix"],
+                        suggested_approach=(
+                            "Context: unit test fixture. Scope: src/x.py. "
+                            "TDD approach: 1. RED 2. GREEN 3. REFACTOR no-op. "
+                            "Verify: make lint && make test-unit all exit zero."
+                        ),
+                    ),
+                ],
+            ),
+        )
+        # Materialise out-of-band by writing a draft .md under the story dir.
+        story = _story_dir(backlog_root, _extract_story_id("E1-F1-S2-T6"))
+        story.mkdir(parents=True, exist_ok=True)
+        (story / "E1-F1-S2-T6.md").write_text("# E1-F1-S2-T6: Fix\n\n## Status: proposed\n\n## Description\n\nx\n")
+
+        lines = report_mod._unmaterialised_proposals_listing()
+        assert lines == [], (
+            "Panel must be empty when every proposed_tasks entry already has a draft .md "
+            "(i.e. none remain in UNMATERIALISED state)."
+        )
 
 
 class TestSideBySideLayout:
@@ -1482,7 +1592,7 @@ class TestSpanningRows:
 
     def test_report_end_to_end_spans_recent_pace_and_est_time(self, tmp_path: Path) -> None:
         """In the rendered report, Recent pace and Est. time rows are single spanning cells
-        — the underlying value appears exactly once on the row even with multiple window columns."""
+        -- the underlying value appears exactly once on the row even with multiple window columns."""
         from unittest.mock import patch
 
         from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType

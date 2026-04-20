@@ -24,13 +24,13 @@ You run BEFORE the orchestrator commits. The executor stages files (git add) but
 - "Staged (ready for review)" = executor correctly prepared these files. This is the primary evidence.
 - "Unstaged/untracked (needs git add)" = executor forgot to run git add on these files. Flag as a staging gap, NOT a commit integrity failure.
 - "Already committed on branch" = executor committed directly (atypical). Evaluate these the same as staged changes.
-Do NOT treat unstaged or untracked files as evidence that the committed branch is broken — commits have not happened yet.
+Do NOT treat unstaged or untracked files as evidence that the committed branch is broken -- commits have not happened yet.
 
 ## SCOPE VERIFICATION
 1. All changed files are expected and justified by the work unit's scope.
 2. No unexpected files were modified that could introduce unplanned side effects.
-3. Files listed in the manifest but NOT changed — determine if intentionally skipped or forgotten.
-4. The scope of changes is proportional to the work unit's requirements — no over-engineering.
+3. Files listed in the manifest but NOT changed -- determine if intentionally skipped or forgotten.
+4. The scope of changes is proportional to the work unit's requirements -- no over-engineering.
 5. No unrelated changes bundled into this work unit (scope creep).
 
 ## CRITICAL FILE CHANGES
@@ -38,13 +38,13 @@ Do NOT treat unstaged or untracked files as evidence that the committed branch i
 7. CI/CD workflow files (.github/workflows/*.yml) modified only with justification.
 8. Kubernetes manifests (cd/k8s/**/*.yaml) modified only with justification.
 9. DevContainer configuration (.devcontainer/**) modified only with justification.
-10. Linter, formatter, and security tool configuration files modified only with justification — never to suppress findings.
+10. Linter, formatter, and security tool configuration files modified only with justification -- never to suppress findings.
 11. Application configuration files (application*.yml, *.properties, *.toml) modified only with justification.
 
 ## COMPLETE REPLACEMENT VERIFICATION
 12. If code was replaced or refactored, ALL consumers of the old code are updated in the same change.
 13. No orphaned imports, references, or tests for removed code.
-14. Old/superseded code is fully deleted — no dead code left behind.
+14. Old/superseded code is fully deleted -- no dead code left behind.
 15. A grep for the old function/class name returns zero results across the entire codebase.
 
 ## PROHIBITED CHANGES
@@ -69,14 +69,14 @@ If unexpected files appear, assess whether they are reasonable supporting change
 
 ## OUT OF SCOPE FOR FINDINGS
 The following files are operational backlog-tracking artifacts. You may read them to understand acceptance criteria, Definition of Done, and agent log evidence, but do not raise findings, flag defects, or fail based on their content or status values:
-- `BACKLOG.md` — work-unit status index
-- Any file under `backlog/` — task, story, feature, and epic specification files
+- `BACKLOG.md` -- work-unit status index
+- Any file under `backlog/` -- task, story, feature, and epic specification files
 
 ---
 
 After completing your review, follow this two-phase output protocol:
 
-**Phase 1 — CLI logging (run these commands before returning):**
+**Phase 1 -- CLI logging (run these commands before returning):**
 
 a. Log each finding (FAIL) or key check confirmed (PASS) via log-comment:
 ```
@@ -90,7 +90,7 @@ uv run devbench log-verdict changes_manifest $ARGUMENTS <pass|fail> "<one-line s
 ```
 On FAIL: most critical finding. On PASS: which criteria groups were verified.
 
-**Phase 2 — JSON response envelope (last thing output in your response text):**
+**Phase 2 -- JSON response envelope (last thing output in your response text):**
 
 ```json
 {

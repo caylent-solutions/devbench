@@ -30,7 +30,7 @@ Evaluate whether blockers listed in the work unit can be resolved or need escala
 6. Is the dependency real or artificial (could the work unit be restructured to remove it)?
 
 ## TECHNICAL BLOCKERS
-7. Can the technical blocker be resolved within project standards — no workarounds that violate:
+7. Can the technical blocker be resolved within project standards -- no workarounds that violate:
    - Fail-fast philosophy (no fallback logic to "work around" the blocker)
    - 12-factor principles (no hardcoded values as temporary fixes)
    - Security standards (no security shortcuts to unblock progress)
@@ -51,7 +51,7 @@ Evaluate whether blockers listed in the work unit can be resolved or need escala
 13. Proposed resolutions must not bypass security controls or weaken security posture.
 14. Proposed resolutions must not introduce hardcoded configuration values.
 15. Proposed resolutions must not create technical debt that violates CLAUDE.md standards.
-16. Proposed resolutions must not skip testing — even temporary implementations need real tests.
+16. Proposed resolutions must not skip testing -- even temporary implementations need real tests.
 17. Proposed workarounds must be flagged as temporary with a tracked follow-up item.
 
 ## ESCALATION CRITERIA
@@ -64,22 +64,22 @@ Provide specific, actionable resolution strategies for each unresolved blocker. 
 
 ## OUT OF SCOPE FOR FINDINGS
 The following files are operational backlog-tracking artifacts. You may read them to understand acceptance criteria, Definition of Done, and agent log evidence, but do not raise findings, flag defects, or fail based on their content or status values:
-- `BACKLOG.md` — work-unit status index
-- Any file under `backlog/` — task, story, feature, and epic specification files
+- `BACKLOG.md` -- work-unit status index
+- Any file under `backlog/` -- task, story, feature, and epic specification files
 
 ---
 
 ## PROPOSAL EMISSION (after amendment reject)
 
-**STEP 1 — Detect task-factory mode.** Check for a rejected-requests archive:
+**STEP 1 -- Detect task-factory mode.** Check for a rejected-requests archive:
 
 ```bash
 ls "$JUDGE_WORKSPACE_ROOT/.devbench/rejected-requests/$ARGUMENTS-"*.json 2>/dev/null
 ```
 
-If no archive exists, skip this entire section and follow the normal `resolved`/`escalated` path at the bottom. If ANY archive exists, continue — you MUST emit a proposal JSON. `escalated` is forbidden in this case; `proposed` is the ONLY correct verdict.
+If no archive exists, skip this entire section and follow the normal `resolved`/`escalated` path at the bottom. If ANY archive exists, continue -- you MUST emit a proposal JSON. `escalated` is forbidden in this case; `proposed` is the ONLY correct verdict.
 
-**STEP 2 — Gather the evidence.** Read the most recent archive and the blocked work unit:
+**STEP 2 -- Gather the evidence.** Read the most recent archive and the blocked work unit:
 
 ```bash
 ARCHIVE=$(ls -t "$JUDGE_WORKSPACE_ROOT/.devbench/rejected-requests/$ARGUMENTS-"*.json | head -n 1)
@@ -87,7 +87,7 @@ cat "$ARCHIVE"
 uv run devbench read-unit --strip-comments $ARGUMENTS
 ```
 
-**STEP 3 — Allocate free task IDs** for each new work unit you plan to propose. Scan the Story directory for existing IDs:
+**STEP 3 -- Allocate free task IDs** for each new work unit you plan to propose. Scan the Story directory for existing IDs:
 
 ```bash
 STORY_DIR="$JUDGE_WORKSPACE_ROOT/$(dirname "$(uv run devbench read-unit $ARGUMENTS | python3 -c 'import sys,json; print(json.load(sys.stdin)["work_unit_path"])')" | sed "s|^$JUDGE_WORKSPACE_ROOT/||")"
@@ -96,9 +96,20 @@ ls "$STORY_DIR"/*.md 2>/dev/null | xargs -n1 basename 2>/dev/null | sort -V
 
 Pick the next sequential IDs within the same Story (e.g. if `E0-F9-S2-T5.md` is the highest, use `-T6`, `-T7`, ...). Task-factory validates free IDs atomically under a POSIX file lock before materialising.
 
-**STEP 4 — Decompose the rejected diff into structured proposals.** Each proposed task must own a distinct file or feature area from the rejected diff. Do NOT re-propose work the source task already owns — the proposal describes out-of-scope fixes the amender surfaced, not a rewrite of the source task.
+**STEP 4 -- Decompose the rejected diff into structured proposals.** Each proposed task must own a distinct file or feature area from the rejected diff. Do NOT re-propose work the source task already owns -- the proposal describes out-of-scope fixes the amender surfaced, not a rewrite of the source task.
 
-**STEP 5 — Emit the proposal JSON** via stdin pipe to `write-proposal`:
+**STEP 5 -- Emit the proposal JSON** via stdin pipe to `write-proposal`.
+
+Every field is load-bearing. In particular, `suggested_approach` MUST be a rich, multi-sentence narrative -- it flows verbatim into the draft's ## Description section and downstream executors work from it. A thin one-line RED/GREEN blurb will be rejected by `materialise-proposal` with a `suggested_approach too terse` error, and the operator will have to re-run you with tighter inputs. Produce the four-section structure below.
+
+`suggested_approach` MUST contain at least the following four labelled sections, concatenated into one string:
+
+1. **Context** (1-3 sentences): which source task prompted this follow-up, which production file is affected, what the bug or gap is, and why the follow-up is necessary.
+2. **Scope**: the exact files the follow-up will touch; whether it's production code, tests, or docs; what is out of scope.
+3. **TDD approach**: numbered RED / GREEN / REFACTOR steps with one sentence each explaining what each step proves or changes.
+4. **Verify**: the exact `make` commands the executor should run to confirm green.
+
+`title` MUST be in imperative form (`Fix X`, `Add Y`, `Document Z`) -- not descriptive (`Fixes X`, `Describes Y`). `files_to_own` MUST include every file the task will touch (production + tests + docs). `suggested_acs` MUST be concrete enough that a reviewer can verify each one without further clarification.
 
 ```bash
 cat <<'EOF' | uv run devbench write-proposal $ARGUMENTS
@@ -110,17 +121,21 @@ cat <<'EOF' | uv run devbench write-proposal $ARGUMENTS
     {
       "suggested_id": "<NEXT-FREE-TASK-ID from STEP 3>",
       "title": "<short imperative title>",
-      "files_to_own": ["<relative/path/from/repo>"],
+      "files_to_own": ["<every file the task will touch>"],
       "linked_scenarios": ["<scenario or AC ID>"],
-      "suggested_acs": ["AC-... describe what the new task must satisfy"],
-      "suggested_approach": "<multi-line TDD approach: RED, GREEN, verify>"
+      "suggested_acs": ["AC-... concrete enough to verify without clarification"],
+      "suggested_approach": "Context: <...>. Scope: <...>. TDD approach: 1. RED <...>. 2. GREEN <...>. 3. REFACTOR <...>. Verify: <make commands>."
     }
   ]
 }
 EOF
 ```
 
-**STEP 6 — Verify the proposal landed on disk** before logging your verdict. The orchestrator's step 4c branches on FILE EXISTENCE, not on the verdict word — so the file existing is load-bearing. If it's missing, do NOT log `proposed`.
+Example of an acceptable `suggested_approach` (honest four-section structure, above the minimum-length floor):
+
+> Context: Source task E1-F1-S11-T1 exposed a bug in src/kanon_cli/core/install.py where create_source_dirs raises OSError on permission-denied but the CLI silently exits 0 instead of surfacing the error. Scope: src/kanon_cli/core/install.py plus tests/unit/test_install.py. No doc changes. TDD approach: 1. RED -- monkeypatch Path.mkdir to raise PermissionError and assert SystemExit(1) with stderr containing 'Error:'. 2. GREEN -- wrap the mkdir call in try/except OSError, print to stderr, sys.exit(1). 3. REFACTOR -- no-op. Verify: make lint && make format-check && make test-unit && make security-scan all exit zero.
+
+**STEP 6 -- Verify the proposal landed on disk** before logging your verdict. The orchestrator's step 4c branches on FILE EXISTENCE, not on the verdict word -- so the file existing is load-bearing. If it's missing, do NOT log `proposed`.
 
 ```bash
 if test -f "$JUDGE_WORKSPACE_ROOT/.devbench/proposals/$ARGUMENTS.json"; then
@@ -145,4 +160,4 @@ The verdict word is chosen by the following decision tree:
 - If no archive existed AND the blockers require human decision / spec rewrite → `escalated`.
 - If resolution is neither possible nor escalation-worthy (very rare; usually means the resolver cannot classify) → `blocked`.
 
-`escalated` is forbidden when a rejected-requests archive exists — the correct action in that case is `proposed`. Detailed resolution strategies go in your response text.
+`escalated` is forbidden when a rejected-requests archive exists -- the correct action in that case is `proposed`. Detailed resolution strategies go in your response text.

@@ -58,7 +58,44 @@ If the operator decides that some proposed drafts should never be promoted, they
    - `devbench promote-proposal --all-from <source-id>` promotes every draft from a single proposal.
    - `devbench promote-proposal --no-dep-on-source <id>` skips the automatic dependency wiring.
    - `devbench reject-proposal <id> --reason "..."` archives the draft to `<workspace>/.devbench/rejected-proposals/<id>-<timestamp>.md`, removes the BACKLOG.md row, and appends a `[PROPOSAL_REJECTED]` audit comment to the source task.
-9. **Source task auto-unblocks** when every promoted dependency completes. Orchestrator re-claims the source, the production bugs are fixed, and the source task's test suite now passes.
+9. **Source task auto-unblocks** when every promoted dependency completes. The `BacklogManager._auto_requeue_marker_dependents` cascade (see the "Auto-requeue on proposal completion" section below) flips the source from `blocked` back to `in-queue` and writes an `[AUTO_UNBLOCKED]` audit comment. The orchestrator then re-claims the source naturally on the next `devbench next` iteration.
+
+## Auto-requeue on proposal completion
+
+Promoting a draft via `devbench promote-proposal <id>` (without `--no-dep-on-source`) does three writes on the source task:
+
+1. Appends the draft ID to the source's `## Dependencies` table.
+2. Writes a `[PROPOSAL_PROMOTED]` audit comment.
+3. On the same comment line, writes a `[BLOCKED_PENDING_PROPOSAL] <draft-id>` state marker.
+
+When the promoted draft later transitions to `done` via the standard lifecycle (`mark-done`), `BacklogManager._set_status` fires a reactive scan -- the sideways counterpart to the upward parent-rollup cascade. The scan finds every blocked task whose declared dependencies include the just-done task AND whose Comments section carries at least one `[BLOCKED_PENDING_PROPOSAL]` marker. If every marker ID is terminal (`done` or `declined`), the scan flips the source from `blocked` to `in-queue` and writes an `[AUTO_UNBLOCKED]` audit comment naming every marker ID.
+
+The cascade is scoped narrowly by design:
+
+| Source state | Marker present? | All marker IDs terminal? | Source auto-requeued? |
+|--------------|-----------------|--------------------------|-----------------------|
+| `blocked` | Yes | Yes | **Yes** |
+| `blocked` | Yes | No (any marker is still open) | No (partial completion) |
+| `blocked` | No | N/A | No (non-proposal block; operator must intervene) |
+| non-`blocked` (in-queue / in-progress / in-review / done / declined) | Any | Any | No (scan only flips `blocked`) |
+
+Unknown marker IDs (for example, a previously-promoted draft that was later archived via `reject-proposal`) would count as non-terminal if they remained on the source -- so per-draft `reject-proposal` strips the rejected draft's marker from the source before re-running the cascade. This closes a real regression: a reject that left the marker in place would have left the source `blocked` forever even after its siblings completed. See the "Rejecting a promoted draft strips the marker and re-invokes the cascade" subsection below and [ADR-08](adr/08-proposal-lifecycle-observability.md).
+
+`--no-dep-on-source` skips the dependency wiring entirely, so no marker is written and no auto-requeue can fire. Use it when the promoted draft is independent of the source.
+
+See [ADR-07: Auto-requeue on proposal completion](adr/07-auto-requeue-on-proposal-completion.md) for rationale and the rejected alternatives.
+
+### Rejecting a promoted draft strips the marker and re-invokes the cascade
+
+Per-draft `reject-proposal <draft-id> --reason "..."` does the following, in order:
+
+1. Archives the draft to `<workspace>/.devbench/rejected-proposals/<id>-<timestamp>.md`.
+2. Removes the draft's row from `BACKLOG.md`.
+3. Appends a `[PROPOSAL_REJECTED]` audit comment to the source task.
+4. **Strips every `[BLOCKED_PENDING_PROPOSAL] <rejected-id>` line from the source's Comments section.** Without this, the cascade would see a marker pointing at an ID that no longer exists in the index, treat it as non-terminal (unknown), and never fire again.
+5. **Invokes `_auto_requeue_marker_dependents`** with the rejected ID as the newly-terminal signal. The source is re-evaluated; if every remaining marker points at a terminal ID, the source auto-flips to `in-queue` with an `[AUTO_UNBLOCKED]` audit comment. If any remaining marker is still non-terminal, the source stays `blocked` (correct -- there is still pending work).
+
+Net effect: the operator can safely reject one promoted draft out of many; the source does the right thing automatically. No manual marker editing, no manual `set-status in-queue`.
 
 ## Validation-gate bug escalation (direct executor emission)
 
@@ -112,9 +149,77 @@ POSIX-only (Linux + macOS). DevBench's `.devcontainer` and CI targets are Linux;
 
 If the source task blocks a second time while previous proposals are still in `proposed` status, `materialise_proposal` raises `ProposalError("Skipped proposal generation -- unresolved proposed tasks already exist")`. This prevents duplicate proposals from piling up and forces the operator to engage with the existing drafts before new ones appear.
 
+## Un-materialised proposal JSONs and the sweep
+
+A proposal written via `write-proposal` sits in `.devbench/proposals/<source-id>.json` until `materialise-proposal` converts it into draft `.md` files. Two failure modes can leave a JSON in the "un-materialised" state:
+
+- The safety guard above fired (prior proposed tasks still unresolved).
+- The operator wrote the JSON by hand (for example, copying a blocker-resolver result) and never invoked `materialise-proposal`.
+
+DevBench surfaces this state in three places:
+
+- **`devbench status`** prints a persistent `Un-materialised  N` row (rendered at zero so regressions stay visible).
+- **`devbench report`** renders a `Proposal JSONs pending materialisation (N)` panel listing one row per task in an un-materialised JSON. Omitted when zero.
+- **`devbench list-proposals`** prefixes every entry with a `[state]` label -- `[unmaterialised]` / `[proposed]` / `[promoted]` / `[done]` / `[declined]` / `[rejected]` -- so every JSON entry is classified independently of the others.
+
+### `devbench sweep-proposals`
+
+At the top of every orchestrate loop iteration (SKILL step 0, before `validate-backlog`), the orchestrator runs `uv run devbench sweep-proposals`. The sweep walks every pending proposal JSON and best-effort materialises those whose proposed tasks are in un-materialised state. A proposal that remains blocked by the safety guard is skipped (not an error) so the sweep is idempotent.
+
+Output per proposal:
+
+- `sweep-proposals: materialised <source-id>: N task(s)` -- drafts successfully created.
+- `sweep-proposals: skipped <source-id>: <reason>` -- safety guard or thin-approach refusal fired.
+- `sweep-proposals: no-op <source-id>` -- every task already has a draft.
+
+The operator can also run `devbench sweep-proposals` manually at any time.
+
+### Un-materialised form of `reject-proposal`
+
+To discard an un-materialised JSON without ever producing drafts, use:
+
+```
+uv run devbench reject-proposal --unmaterialised <source-task-id> --reason "<message>"
+```
+
+The command archives the JSON to `.devbench/rejected-proposals/<source-id>-unmaterialised-<timestamp>.json` and writes a `[PROPOSAL_JSON_REJECTED]` audit comment on the source task. It refuses when any task in the JSON already has a materialised draft; in that case use per-draft reject for those drafts first.
+
+### `materialise-proposal` is idempotent
+
+Calling `materialise-proposal <source-id>` (or the sweep step 0 in the orchestrate SKILL) on the same JSON repeatedly is safe. The command classifies every `proposed_tasks[]` entry through `classify_proposed_task` before attempting any draft write:
+
+| Task state | Action |
+|------------|--------|
+| `UNMATERIALISED` | Create draft `.md` and BACKLOG.md row. |
+| `PROPOSED` / `PROMOTED` / `DONE` / `DECLINED` | Skip; leave existing draft untouched. |
+| `REJECTED` (archive exists under `rejected-proposals/<id>-*.md`) | Skip; do NOT recreate the draft. The operator's rejection decision is preserved across sweeps, orchestrator restarts, and replay attempts. |
+
+Practical consequences:
+
+- **Rejected drafts do not resurrect.** A draft you reject today stays rejected on tomorrow's sweep tick, next orchestrator loop, or any future manual materialise call.
+- **Retry is safe after a partial failure.** If a previous materialise run crashed halfway through (e.g. filesystem error on task 2 of 3), re-running materialise skips the already-materialised tasks and creates the rest.
+- **Concurrent sweep + manual-materialise calls do not fight.** Whichever call creates a given draft first wins; the other classifies the same task as PROPOSED and skips.
+
+CLI output distinguishes the two outcomes per task:
+- `"materialised"` list contains paths that were just created on this call.
+- `"skipped"` map associates every skipped task ID to its current classifier state.
+
+See [ADR-09](adr/09-idempotent-materialise-proposal.md) for the rationale and rejected alternatives.
+
 ## Rejected proposals are archived, not deleted
 
-`reject-proposal` moves the draft to `<workspace>/.devbench/rejected-proposals/<id>-<timestamp>.md`. The BACKLOG.md row is removed (so `validate-backlog` stays clean), but the draft content is preserved for later review or recovery. A future `devbench list-rejected-proposals` command can surface these without a migration.
+`reject-proposal` moves the draft to `<workspace>/.devbench/rejected-proposals/<id>-<timestamp>.md` (or `<source-id>-unmaterialised-<timestamp>.json` for the un-materialised form). The BACKLOG.md row is removed (so `validate-backlog` stays clean), but the content is preserved for later review or recovery. Audit archived rejections directly with `ls <workspace>/.devbench/rejected-proposals/`.
+
+## suggested_approach is a four-section contract
+
+`blocker-resolver` produces the `suggested_approach` string for each proposed task; `task-factory` writes it verbatim as the draft's Description. To keep drafts production-ready at materialise time, `blocker-resolver` is required to emit AT LEAST four labelled sections:
+
+1. **Context** (1-3 sentences): which source task, which production file, what the bug is, why the follow-up is needed.
+2. **Scope**: exactly which files the follow-up will touch; whether production code, tests, or docs.
+3. **TDD approach**: numbered RED / GREEN / REFACTOR steps with one sentence each.
+4. **Verify**: the exact `make` commands the executor should run to confirm green.
+
+`materialise_proposal` enforces a minimum length (160 characters) and refuses a proposal JSON whose `suggested_approach` is shorter -- the refusal names the source ID so the operator can re-run blocker-resolver with the tightened instructions. Every `Changes Manifest` row must have a concrete change description; a literal `TODO -- describe change` row also triggers refusal.
 
 ## Safety properties
 

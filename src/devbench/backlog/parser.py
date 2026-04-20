@@ -188,7 +188,7 @@ class BacklogParser:
 
             # Cross-check: warn when BACKLOG.md index disagrees with the work-unit file.
             # The file is the source of truth (parse_work_unit_file already read it),
-            # so no correction is needed — only observability.
+            # so no correction is needed -- only observability.
             index_status = _RAW_STATUS_TO_ENUM.get(raw_status.lower())
             if index_status is not None and index_status != unit.status:
                 logger.warning(

@@ -11,9 +11,9 @@ Planned work items and technical debt. Items derived from the incomplete backlog
 
 ## Status legend
 
-- **in-queue** — Ready to execute. No unmet dependencies.
-- **blocked** — Cannot start until a listed dependency completes.
-- **done** — Completed (omitted from this list; see `BACKLOG.md` index for completed items).
+- **in-queue** -- Ready to execute. No unmet dependencies.
+- **blocked** -- Cannot start until a listed dependency completes.
+- **done** -- Completed (omitted from this list; see `BACKLOG.md` index for completed items).
 
 ---
 
@@ -64,7 +64,7 @@ Adds a `docs/backlog-contract.md` schema reference that defines the required sec
 
 ### E210: YAML Schema and Full Config Migration
 
-Extends `devbench.yaml` to cover all non-secret configuration: model selection (`judge_model`, `executor_model`), merge strategy, max retries, and timeout values. After this epic, only `JUDGE_WORKSPACE_ROOT` and credentials need to be environment variables — everything else lives in the YAML config file with env vars as optional silent overrides.
+Extends `devbench.yaml` to cover all non-secret configuration: model selection (`judge_model`, `executor_model`), merge strategy, max retries, and timeout values. After this epic, only `JUDGE_WORKSPACE_ROOT` and credentials need to be environment variables -- everything else lives in the YAML config file with env vars as optional silent overrides.
 
 **Files**: `src/devbench/config_loader.py`, `src/devbench/config.py`, `backlog/config/devbench.yaml` schema
 
@@ -116,7 +116,7 @@ Enriches `RepoConfig` in `config_loader.py` with runtime-resolved fields (resolv
 
 ### E215: Dependency Integrity Enforcement
 
-The backlog parser's `_deps_satisfied` check only evaluates task-to-task dependencies — dependencies on epics, features, and stories are silently treated as satisfied. Fixes this to check all dependency types and adds a `sync-blocked` CLI command to bulk-update blocked status.
+The backlog parser's `_deps_satisfied` check only evaluates task-to-task dependencies -- dependencies on epics, features, and stories are silently treated as satisfied. Fixes this to check all dependency types and adds a `sync-blocked` CLI command to bulk-update blocked status.
 
 **Files**: `src/devbench/backlog/parser.py`, `src/devbench/cli.py`
 
@@ -206,52 +206,52 @@ Issues carried over from prior review, mapped to current file paths. Listed by s
 
 ### Code quality
 
-**HIGH — Dynamic attribute setting on dataclass loses type safety**
+**HIGH -- Dynamic attribute setting on dataclass loses type safety**
 File: `src/devbench/github/security.py:136`
 `setattr()` on a dataclass instance bypasses the type checker; refactor to direct field assignment.
 
-**MEDIUM — Raw API exception messages may leak details into judge feedback**
+**MEDIUM -- Raw API exception messages may leak details into judge feedback**
 File: `src/devbench/github/security.py` (security fetch error handling)
 Wrap exception messages before they reach judge feedback to avoid disclosing internal API details.
 
-**MEDIUM — CLI args not validated at system boundary**
+**MEDIUM -- CLI args not validated at system boundary**
 File: `src/devbench/cli.py`
 Add type / format / range validation at the CLI entry point rather than relying on downstream code to fail fast.
 
-**MEDIUM — kwargs concatenated into `gh` CLI args without sanitization**
+**MEDIUM -- kwargs concatenated into `gh` CLI args without sanitization**
 File: `src/devbench/github/security.py:62-64`
 Validate or shell-escape kwargs values before they become subprocess arguments.
 
-**LOW — `SecurityReview` mixes API fetching, parsing, and summarization (SRP violation)**
+**LOW -- `SecurityReview` mixes API fetching, parsing, and summarization (SRP violation)**
 File: `src/devbench/github/security.py`
 Split into a fetch service, a parser, and a summarizer for testability.
 
 ### Test quality
 
-**CRITICAL — Hardcoded path in test**
+**CRITICAL -- Hardcoded path in test**
 File: `tests/test_backlog/test_parser.py:18-20`
 Replace with the pytest `tmp_path` fixture.
 
-**CRITICAL — Hardcoded `/tmp` log path**
+**CRITICAL -- Hardcoded `/tmp` log path**
 File: `tests/conftest.py:10`
 Use the pytest `tmp_path` fixture instead of writing to a fixed `/tmp` path.
 
-**HIGH — No `@pytest.mark.unit` / `@pytest.mark.functional` decorators on any test**
+**HIGH -- No `@pytest.mark.unit` / `@pytest.mark.functional` decorators on any test**
 File: all test files
 Categorize tests so `make test-unit` and `make test-functional` can target subsets.
 
-**HIGH — Fixtures defined in `conftest.py` instead of `tests/fixtures/`**
+**HIGH -- Fixtures defined in `conftest.py` instead of `tests/fixtures/`**
 File: `tests/conftest.py`
 Move data fixtures out of `conftest.py` into a dedicated fixtures directory.
 
-**MEDIUM — `importlib.reload(config)` causes test state pollution**
+**MEDIUM -- `importlib.reload(config)` causes test state pollution**
 File: `tests/test_config.py:185-210`
 Refactor to use a fixture-scoped fresh config rather than mutating module state.
 
-**MEDIUM — Duplicate predicate tests not parameterized**
+**MEDIUM -- Duplicate predicate tests not parameterized**
 File: `tests/test_backlog/test_work_unit.py:203-251`
 Collapse with `@pytest.mark.parametrize`.
 
-**MEDIUM — `cmd_next` assertions only check one field of JSON output**
+**MEDIUM -- `cmd_next` assertions only check one field of JSON output**
 File: `tests/test_cli.py:132`
 Assert on the full envelope shape, not just one field.

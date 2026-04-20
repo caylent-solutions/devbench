@@ -27,6 +27,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
+from enum import Enum
 from pathlib import Path
 
 from devbench.backlog.manager import BacklogManager
@@ -35,6 +36,8 @@ from devbench.constants import (
     COMMENT_AGENT_TEMPLATE,
     COMMENT_TIMESTAMP_FORMAT,
     COMMENTS_SECTION_HEADER,
+    STATUS_DECLINED,
+    STATUS_DONE,
     STATUS_IN_QUEUE,
     STATUS_PROPOSED,
 )
@@ -44,6 +47,103 @@ logger = logging.getLogger(__name__)
 PROPOSAL_DIR_NAME = ".devbench/proposals"
 REJECTED_PROPOSAL_DIR_NAME = ".devbench/rejected-proposals"
 LOCK_FILE_NAME = ".devbench/task-factory.lock"
+
+# Minimum character length for a ``suggested_approach`` field. Enforced by
+# ``materialise_proposal`` as a fail-fast contract against thin auto-generated
+# drafts that previously required operator hand-editing on every promotion.
+# Threshold calibrated to the four-section minimum (Context + Scope + TDD
+# approach + Verify) that ``blocker-resolver.md`` now requires: a genuinely
+# complete approach narrative cannot fit under 160 characters.
+_SUGGESTED_APPROACH_MIN_CHARS: int = 160
+
+
+class ProposalTaskState(Enum):
+    """Lifecycle state of a single ``proposed_tasks[].suggested_id``.
+
+    Used by observability surfaces (``devbench status`` un-materialised count,
+    ``devbench report`` panel, ``devbench list-proposals`` state labels) and
+    by ``reject_proposal``'s un-materialised-rejection guard to discriminate
+    "can drop the JSON" from "drafts already exist, use per-task reject".
+
+    - ``UNMATERIALISED`` -- the proposal JSON names this id but no .md draft
+      has been created anywhere (task-factory has not run for this source, or
+      its "skip when prior unresolved" safety guard fired).
+    - ``PROPOSED`` -- draft .md exists with ``## Status: proposed``; operator
+      has not yet promoted or rejected.
+    - ``PROMOTED`` -- draft .md has been promoted to an active lifecycle
+      status (``in-queue`` / ``in-progress`` / ``in-review`` / ``blocked``).
+      ``blocked`` is lumped here because proposal-lifecycle tracking cares
+      about "past promotion", not current runability.
+    - ``DONE`` -- draft completed its lifecycle.
+    - ``DECLINED`` -- draft terminated via ``devbench decline``.
+    - ``REJECTED`` -- draft was archived by ``reject-proposal`` into
+      ``.devbench/rejected-proposals/``; no live .md remains in the tree.
+    """
+
+    UNMATERIALISED = "unmaterialised"
+    PROPOSED = "proposed"
+    PROMOTED = "promoted"
+    DONE = "done"
+    DECLINED = "declined"
+    REJECTED = "rejected"
+
+
+def classify_proposed_task(backlog_root: Path, workspace_root: Path, suggested_id: str) -> ProposalTaskState:
+    """Return the lifecycle state of a proposed-task id.
+
+    Looks first for a live draft .md under ``backlog_root`` via
+    ``_find_draft_file``. If present, reads the ``## Status:`` line and
+    maps to the appropriate state. If absent, checks the
+    ``.devbench/rejected-proposals/`` archive for a matching file to
+    distinguish ``REJECTED`` from ``UNMATERIALISED``.
+
+    Args:
+        backlog_root: Root of the backlog tree (``<workspace>/backlog``).
+        workspace_root: Workspace root (parent of ``backlog/`` and
+            ``.devbench/``). Needed because the rejected-proposals archive
+            lives under the workspace, not the backlog.
+        suggested_id: The ``proposed_tasks[].suggested_id`` from a proposal
+            JSON.
+
+    Returns:
+        A ``ProposalTaskState`` value. Always returns; never raises for
+        missing files (missing means ``UNMATERIALISED`` unless an archive
+        entry exists).
+    """
+    draft = _find_draft_file(backlog_root, suggested_id)
+    if draft is None:
+        archive_dir = workspace_root / REJECTED_PROPOSAL_DIR_NAME
+        if archive_dir.is_dir():
+            for archived in archive_dir.glob(f"{suggested_id}-*.md"):
+                if archived.is_file():
+                    return ProposalTaskState.REJECTED
+        return ProposalTaskState.UNMATERIALISED
+
+    status_value = _read_draft_status(draft).lower()
+    if status_value == STATUS_PROPOSED:
+        return ProposalTaskState.PROPOSED
+    if status_value == STATUS_DONE:
+        return ProposalTaskState.DONE
+    if status_value == STATUS_DECLINED:
+        return ProposalTaskState.DECLINED
+    # in-queue / in-progress / in-review / blocked all count as PROMOTED:
+    # proposal-lifecycle tracking only cares whether the draft has advanced
+    # past operator review, not what activity the draft is currently in.
+    return ProposalTaskState.PROMOTED
+
+
+def _read_draft_status(draft_path: Path) -> str:
+    """Read the ``## Status:`` value from a draft .md file.
+
+    Returns the empty string when the file has no ``## Status:`` line
+    (malformed draft); callers treat that as ``PROMOTED`` conservatively.
+    """
+    for line in draft_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## Status:"):
+            return stripped[len("## Status:") :].strip()
+    return ""
+
 
 # Matches valid Story IDs such as ``E0-F1-S1``. Used by ``allocate_next_ids``
 # to derive the on-disk directory layout (``backlog/E0/E0-F1/E0-F1-S1/``).
@@ -405,21 +505,76 @@ def materialise_proposal(
     Returns the list of materialised draft files. The caller is responsible
     for asserting that the proposal's source task is in ``blocked`` state
     beforehand; task-factory runs exclusively from that path.
+
+    Refuses (with ``ProposalError``) when any proposed task's
+    ``suggested_approach`` is too terse to produce a useful draft. The
+    threshold is a module-level constant; blocker-resolver's prompt
+    (``plugin/devbench/agents/blocker-resolver.md``) requires the
+    Context / Scope / TDD approach / Verify four-section structure whose
+    minimum honest length exceeds the threshold. Drafts below the floor
+    always require operator hand-editing before promotion, so stopping
+    them at the materialise boundary surfaces the defect upstream in
+    blocker-resolver where it can be fixed once, instead of downstream
+    every time a thin draft lands.
     """
-    if _has_unresolved_proposals(backlog_index):
-        raise ProposalError(
-            "Skipped proposal generation -- unresolved proposed tasks already exist. "
-            "Resolve those via promote-proposal or reject-proposal before generating new proposals."
-        )
+    # Thin-approach refusal -- fail fast before any file write so a partial
+    # materialisation cannot leave the backlog half-written. Applies to the
+    # whole proposal, even if some tasks are already resolved, because a
+    # JSON with thin content should not be accepted regardless of which
+    # specific tasks would be created on this call.
+    for proposed in proposal.proposed_tasks:
+        approach = (proposed.suggested_approach or "").strip()
+        if len(approach) < _SUGGESTED_APPROACH_MIN_CHARS:
+            raise ProposalError(
+                f"suggested_approach too terse for {proposed.suggested_id} "
+                f"({len(approach)} chars, minimum {_SUGGESTED_APPROACH_MIN_CHARS}); "
+                "re-run blocker-resolver with the Context / Scope / TDD approach / Verify "
+                "four-section structure documented in blocker-resolver.md."
+            )
+
+    # Classify every task up front so we know which ones actually need
+    # creating. The classifier is the single source of truth for proposal
+    # lifecycle state -- it reads the backlog tree AND the
+    # rejected-proposals/ archive, so a previously-rejected draft classifies
+    # as REJECTED (not UNMATERIALISED) and is skipped here.
+    classifications = [
+        (proposed, classify_proposed_task(backlog_root, workspace_root, proposed.suggested_id))
+        for proposed in proposal.proposed_tasks
+    ]
+    needs_create = any(state is ProposalTaskState.UNMATERIALISED for _, state in classifications)
+
+    # Unresolved-prior-proposals guard applies only when this call would
+    # actually create new `proposed` rows. Exclude this proposal's own
+    # task IDs so a partial re-materialise (some tasks already PROPOSED)
+    # doesn't see itself as the blocker.
+    if needs_create:
+        exclude = frozenset(t.suggested_id for t in proposal.proposed_tasks)
+        if _has_unresolved_proposals(backlog_index, exclude_task_ids=exclude):
+            raise ProposalError(
+                "Skipped proposal generation -- unresolved proposed tasks already exist. "
+                "Resolve those via promote-proposal or reject-proposal before generating new proposals."
+            )
+
     drafts: list[Path] = []
     mgr = BacklogManager()
-    for proposed in proposal.proposed_tasks:
+    for proposed, state in classifications:
+        if state is not ProposalTaskState.UNMATERIALISED:
+            # Classify-aware skip. The task is already in one of the
+            # terminal-for-materialise states: a draft exists (PROPOSED,
+            # PROMOTED, DONE, DECLINED) or a reject archive exists
+            # (REJECTED). Recreating the draft would resurrect rejected
+            # work or duplicate in-flight work.
+            logger.info(
+                "materialise_proposal: skipping %s in state %s "
+                "(already materialised, rejected, promoted, done, or declined)",
+                proposed.suggested_id,
+                state.value,
+            )
+            continue
         story_id = _extract_story_id(proposed.suggested_id)
         story_dir = _story_dir(backlog_root, story_id)
         story_dir.mkdir(parents=True, exist_ok=True)
         target = story_dir / f"{proposed.suggested_id}.md"
-        if target.exists():
-            raise ProposalError(f"Draft file for {proposed.suggested_id} already exists at {target}")
         content = generate_draft_md(
             proposed,
             repo=repo,
@@ -438,13 +593,21 @@ def materialise_proposal(
         _append_backlog_row(backlog_index, row)
         drafts.append(target)
         logger.info("Materialised proposed task %s -> %s", proposed.suggested_id, target)
-    # Rebuild Status Summary counts so the `proposed` rows appear.
-    mgr._update_status_summary(backlog_index)
+    if drafts:
+        # Rebuild Status Summary counts so the `proposed` rows appear.
+        # Skipped entirely when no drafts were created -- the summary is
+        # already correct.
+        mgr._update_status_summary(backlog_index)
     return drafts
 
 
-def _has_unresolved_proposals(backlog_index: Path) -> bool:
-    """Return True when any row in BACKLOG.md already carries status ``proposed``."""
+def _has_unresolved_proposals(backlog_index: Path, *, exclude_task_ids: frozenset[str] = frozenset()) -> bool:
+    """Return True when any row in BACKLOG.md already carries status ``proposed``.
+
+    ``exclude_task_ids`` skips rows whose ID is in the set, which lets
+    ``materialise_proposal`` re-run on an already-partially-materialised
+    proposal without the guard misfiring on the proposal's own tasks.
+    """
     if not backlog_index.is_file():
         return False
     for line in backlog_index.read_text(encoding="utf-8").splitlines():
@@ -452,6 +615,9 @@ def _has_unresolved_proposals(backlog_index: Path) -> bool:
             continue
         cells = [c.strip() for c in line.split("|")]
         if len(cells) < 5:
+            continue
+        task_id = cells[1] if len(cells) >= 2 else ""
+        if task_id in exclude_task_ids:
             continue
         status_cell = cells[4].lower() if len(cells) >= 5 else ""
         if status_cell == STATUS_PROPOSED:
@@ -595,12 +761,29 @@ def promote_proposal(
 
 
 def _append_promote_comment(source_file: Path, source_task_id: str, promoted_task_id: str) -> None:
-    """Append a ``[PROPOSAL_PROMOTED]`` audit line to ``source_file``'s Comments section."""
+    """Append an audit line naming both the promotion and the pending-proposal marker.
+
+    Writes a single comment to ``source_file``'s Comments section containing
+    two structured markers:
+
+    - ``[PROPOSAL_PROMOTED]`` -- audit detail describing the wiring event.
+    - ``[BLOCKED_PENDING_PROPOSAL] <id>`` -- state marker read by
+      ``BacklogManager._auto_requeue_marker_dependents`` when the promoted
+      dependency eventually completes, so the source task auto-flips from
+      ``blocked`` back to ``in-queue`` without manual intervention.
+
+    Writing both markers on the same comment line keeps the audit trail
+    compact while preserving the state marker's scan-scoped position in
+    the Comments section.
+    """
     timestamp = datetime.now(tz=UTC).strftime(COMMENT_TIMESTAMP_FORMAT)
     entry = COMMENT_AGENT_TEMPLATE.format(
         timestamp=timestamp,
         name="task_factory",
-        message=f"[PROPOSAL_PROMOTED] {promoted_task_id} promoted and wired as dependency of {source_task_id}.",
+        message=(
+            f"[PROPOSAL_PROMOTED] {promoted_task_id} promoted and wired as dependency of {source_task_id}. "
+            f"[BLOCKED_PENDING_PROPOSAL] {promoted_task_id}"
+        ),
     )
     content = source_file.read_text(encoding="utf-8")
     if COMMENTS_SECTION_HEADER in content:
@@ -655,17 +838,72 @@ def reject_proposal(
     workspace_root: Path,
     backlog_root: Path,
     backlog_index: Path,
-    task_id: str,
+    task_id: str = "",
+    unmaterialised_source_id: str = "",
     reason: str,
 ) -> Path | None:
-    """Archive a proposed task's draft, remove its BACKLOG.md row, audit on source.
+    """Reject a proposed draft (per-task) OR a whole un-materialised JSON (per-source).
 
-    Returns the archive path of the removed draft, or ``None`` when the draft
-    file was missing (e.g. already rejected). Raises :class:`ProposalError`
-    if ``reason`` is empty.
+    Two mutually-exclusive forms:
+
+    - ``task_id`` set: classic per-draft rejection. Archive the draft .md,
+      remove its BACKLOG.md row, audit on source, AND strip the corresponding
+      ``[BLOCKED_PENDING_PROPOSAL]`` marker from source Comments. After the
+      strip, invoke the auto-requeue cascade so a source whose remaining
+      markers are all terminal flips back to ``in-queue`` cleanly.
+    - ``unmaterialised_source_id`` set: rejects an entire proposal JSON whose
+      drafts have never been materialised. Archive the JSON to
+      ``.devbench/rejected-proposals/<source>-unmaterialised-<ts>.json``,
+      delete the live JSON, audit a ``[PROPOSAL_JSON_REJECTED]`` comment on
+      the source. Refuses when any task in the JSON has already been
+      materialised in any form (fail-fast).
+
+    Supplying neither or both raises :class:`ProposalError`.
+
+    Returns the archive path (``.md`` for per-task, ``.json`` for
+    un-materialised). Returns ``None`` only when the per-task form runs
+    against a draft that was already missing (idempotent no-op).
     """
     if not reason or not reason.strip():
         raise ProposalError("reject_proposal requires a non-empty reason")
+
+    # Fail-fast on the mutual exclusion guard. Either form must be chosen
+    # explicitly; the defaults (empty strings) are what ``cmd_reject_proposal``
+    # passes when a flag was not supplied.
+    has_task_id = bool(task_id)
+    has_source_id = bool(unmaterialised_source_id)
+    if has_task_id and has_source_id:
+        raise ProposalError("reject_proposal: supply exactly one of task_id or unmaterialised_source_id, not both")
+    if not has_task_id and not has_source_id:
+        raise ProposalError("reject_proposal: supply exactly one of task_id or unmaterialised_source_id")
+
+    if has_source_id:
+        return _reject_unmaterialised_proposal(
+            workspace_root=workspace_root,
+            backlog_root=backlog_root,
+            backlog_index=backlog_index,
+            source_task_id=unmaterialised_source_id,
+            reason=reason,
+        )
+
+    return _reject_per_draft_proposal(
+        workspace_root=workspace_root,
+        backlog_root=backlog_root,
+        backlog_index=backlog_index,
+        task_id=task_id,
+        reason=reason,
+    )
+
+
+def _reject_per_draft_proposal(
+    *,
+    workspace_root: Path,
+    backlog_root: Path,
+    backlog_index: Path,
+    task_id: str,
+    reason: str,
+) -> Path | None:
+    """Per-draft rejection path: archive + remove row + strip marker + cascade."""
     draft = _find_draft_file(backlog_root, task_id)
     archive: Path | None = None
     if draft is not None:
@@ -679,21 +917,122 @@ def reject_proposal(
     # Suppress is intentional here: rejection is idempotent, so a missing
     # BACKLOG.md row (e.g. already rejected) is a no-op.
 
-    # Audit comment on the source task.
     source = _find_originating_source_task(workspace_root, task_id)
     if source is not None:
         source_file = _find_source_task_file(backlog_root, backlog_index, source)
         if source_file is not None:
-            timestamp = datetime.now(tz=UTC).strftime(COMMENT_TIMESTAMP_FORMAT)
-            message = f"[PROPOSAL_REJECTED] {task_id} rejected: {reason}"
-            entry = COMMENT_AGENT_TEMPLATE.format(timestamp=timestamp, name="task_factory", message=message)
-            content = source_file.read_text(encoding="utf-8")
-            if COMMENTS_SECTION_HEADER in content:
-                content = content.rstrip("\n") + "\n\n" + entry
-            else:
-                content = content.rstrip("\n") + "\n\n" + COMMENTS_SECTION_HEADER + "\n\n" + entry
-            source_file.write_text(content, encoding="utf-8")
+            _append_reject_audit_comment(source_file, task_id, reason)
+            # Strip the BLOCKED_PENDING_PROPOSAL marker for this specific
+            # rejected task so the auto-requeue cascade can correctly
+            # evaluate the remaining markers. Without this strip, the
+            # cascade would see a marker pointing at a now-rejected ID,
+            # treat it as non-terminal (unknown), and refuse to requeue
+            # even when all other markers are terminal.
+            _strip_pending_proposal_marker(source_file, task_id)
+            # Invoke the cascade on the just-rejected id as the "newly
+            # terminal" signal for the scan's dependent walk. Source gets
+            # re-evaluated; remaining markers all terminal -> source flips.
+            # Remaining markers include non-terminal OR no markers remain ->
+            # scan abstains per the existing ADR-07 contract.
+            BacklogManager()._auto_requeue_marker_dependents(backlog_index, task_id)
 
     # Refresh Status Summary so the deleted row is no longer counted.
     BacklogManager()._update_status_summary(backlog_index)
     return archive
+
+
+def _reject_unmaterialised_proposal(
+    *,
+    workspace_root: Path,
+    backlog_root: Path,
+    backlog_index: Path,
+    source_task_id: str,
+    reason: str,
+) -> Path:
+    """Reject an entire proposal JSON whose drafts have not been materialised.
+
+    Refuses when any task in the JSON has any state other than
+    ``UNMATERIALISED`` (a partial-materialise situation the operator should
+    resolve with per-task rejection instead).
+    """
+    json_path = proposal_path(workspace_root, source_task_id)
+    if not json_path.is_file():
+        raise ProposalError(f"No proposal JSON found at {json_path}")
+
+    proposal = read_proposal(workspace_root, source_task_id)
+    for task in proposal.proposed_tasks:
+        state = classify_proposed_task(backlog_root, workspace_root, task.suggested_id)
+        if state is not ProposalTaskState.UNMATERIALISED:
+            raise ProposalError(
+                f"Cannot reject {source_task_id} as un-materialised: "
+                f"draft {task.suggested_id} is already in state {state.value}. "
+                f"Use per-task reject (reject-proposal {task.suggested_id} --reason ...) "
+                f"or resolve the draft first."
+            )
+
+    # Archive the JSON. Use a dedicated suffix so audit-reviewers can tell
+    # un-materialised rejections apart from per-draft rejections at a glance.
+    archive_dir = workspace_root / REJECTED_PROPOSAL_DIR_NAME
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%SZ")
+    archive_path = archive_dir / f"{source_task_id}-unmaterialised-{timestamp}.json"
+    json_path.rename(archive_path)
+
+    source_file = _find_source_task_file(backlog_root, backlog_index, source_task_id)
+    if source_file is not None:
+        timestamp_human = datetime.now(tz=UTC).strftime(COMMENT_TIMESTAMP_FORMAT)
+        message = f"[PROPOSAL_JSON_REJECTED] {source_task_id} rejected (un-materialised): {reason}"
+        entry = COMMENT_AGENT_TEMPLATE.format(timestamp=timestamp_human, name="task_factory", message=message)
+        content = source_file.read_text(encoding="utf-8")
+        if COMMENTS_SECTION_HEADER in content:
+            content = content.rstrip("\n") + "\n\n" + entry
+        else:
+            content = content.rstrip("\n") + "\n\n" + COMMENTS_SECTION_HEADER + "\n\n" + entry
+        source_file.write_text(content, encoding="utf-8")
+
+    return archive_path
+
+
+def _append_reject_audit_comment(source_file: Path, task_id: str, reason: str) -> None:
+    """Write a ``[PROPOSAL_REJECTED]`` audit line to the source task."""
+    timestamp = datetime.now(tz=UTC).strftime(COMMENT_TIMESTAMP_FORMAT)
+    message = f"[PROPOSAL_REJECTED] {task_id} rejected: {reason}"
+    entry = COMMENT_AGENT_TEMPLATE.format(timestamp=timestamp, name="task_factory", message=message)
+    content = source_file.read_text(encoding="utf-8")
+    if COMMENTS_SECTION_HEADER in content:
+        content = content.rstrip("\n") + "\n\n" + entry
+    else:
+        content = content.rstrip("\n") + "\n\n" + COMMENTS_SECTION_HEADER + "\n\n" + entry
+    source_file.write_text(content, encoding="utf-8")
+
+
+# Single-marker regex lifted from manager.py. Duplicated here (as a constant,
+# not an import) to keep the proposal <-> manager module seam one-way: manager
+# depends on nothing in proposal; proposal depends on manager for the cascade
+# invocation. If the marker format ever changes, both constants must move in
+# lockstep -- the pin in tests/test_plugin/test_agent_structure.py catches
+# drift.
+_REJECT_MARKER_STRIP_RE = re.compile(r"^.*\[BLOCKED_PENDING_PROPOSAL\]\s+(\S+).*$\n?", re.MULTILINE)
+
+
+def _strip_pending_proposal_marker(source_file: Path, rejected_task_id: str) -> None:
+    """Remove ``[BLOCKED_PENDING_PROPOSAL] <rejected_task_id>`` marker lines.
+
+    Strips every full comment line (not just the marker substring) whose
+    marker ID matches ``rejected_task_id`` exactly. Collapses any resulting
+    consecutive blank lines down to one so the Comments section stays
+    readable.
+
+    No-op when the source file has no matching marker -- safe to call even
+    when the rejected task was never promoted.
+    """
+    content = source_file.read_text(encoding="utf-8")
+
+    def _drop_if_match(match: re.Match[str]) -> str:
+        return "" if match.group(1) == rejected_task_id else match.group(0)
+
+    updated = _REJECT_MARKER_STRIP_RE.sub(_drop_if_match, content)
+    # Collapse runs of 3+ newlines down to 2 (one blank line between paragraphs).
+    updated = re.sub(r"\n{3,}", "\n\n", updated)
+    if updated != content:
+        source_file.write_text(updated, encoding="utf-8")

@@ -2,6 +2,14 @@
 
 Short answers to questions that come up repeatedly. For broader design context, see [docs/architecture.md](architecture.md).
 
+## Contents
+
+- [Changes Manifest and amendments](#changes-manifest-and-amendments)
+- [Judges and reviews](#judges-and-reviews)
+- [Lifecycle statuses](#lifecycle-statuses)
+- [Task factory (proposed work units)](#task-factory-proposed-work-units)
+- [Live activity dashboard](#live-activity-dashboard)
+
 ## Changes Manifest and amendments
 
 ### Why did my task block with "Changes Manifest mismatch"?
@@ -53,6 +61,14 @@ The orchestrate skill detects the proposal file at step 4a and invokes `devbench
 
 This requires `task_factory.enabled: true` in `backlog/config/devbench.yaml`. If disabled, the executor still logs `NEEDS_ESCALATION` but no drafts are materialised; the orchestrator logs an audit comment naming the pending proposal for operator review. See [ADR-06: Validation-gate bug escalation](adr/06-validation-gate-bug-escalation.md) and [docs/task-factory.md](task-factory.md) for the full flow.
 
+### Do blocked tasks auto-unblock when their promoted proposals complete?
+
+Yes -- specifically, blocks caused by a `devbench promote-proposal` wiring auto-unblock when every promoted dep completes. The cascade is narrow by design: the scan only fires for tasks carrying a `[BLOCKED_PENDING_PROPOSAL]` marker comment (written by `promote-proposal` at wiring time). Blocks from other causes -- review failures, git-ops errors, operator intervention -- stay manual and need `devbench set-status <id> in-queue` from the operator.
+
+The sequence: operator runs `devbench promote-proposal <draft>`. The command appends the draft ID to the source's Dependencies table and writes `[BLOCKED_PENDING_PROPOSAL] <draft>` on the source. Later, when the draft passes reviews and `mark-done` runs, `BacklogManager._set_status` fires a reactive scan: for every blocked task whose declared deps include the just-done task AND whose markers are all pointing at terminal IDs (`done` or `declined`), the source auto-flips to `in-queue` with an `[AUTO_UNBLOCKED]` audit comment. See [ADR-07](adr/07-auto-requeue-on-proposal-completion.md) and [docs/task-factory.md](task-factory.md) for the full mechanism.
+
+Partial completion (one of two promoted drafts is done, the other is still in-queue) keeps the source blocked. Unknown marker IDs (drafts that were later rejected and removed from the index) count as non-terminal, so a stray rejected-proposal marker can never trigger a spurious auto-requeue.
+
 ### Why didn't task-factory fire after my amendment was rejected?
 
 Three possible causes:
@@ -90,6 +106,40 @@ The `task-factory` generated one or more draft work units for the production fix
 3. `devbench promote-proposal --all-from <source-id>` promotes every draft from a single proposal in one step.
 
 The source task stays blocked until every promoted dependency completes. Once those land, the source task becomes actionable again; the orchestrator re-runs it. See [docs/task-factory.md](task-factory.md).
+
+### How do I tell what state a pending proposal is in?
+
+`devbench list-proposals` prints one line per proposed task with a `[state]` label prefix: `[unmaterialised]` (JSON names this id but no draft `.md` exists), `[proposed]` (draft exists with `## Status: proposed`), `[promoted]` (draft flipped to in-queue / in-progress / in-review / blocked), `[done]`, `[declined]`, `[rejected]` (draft archived via `reject-proposal`). `devbench status` prints a persistent `Un-materialised` count row so you can see at a glance if any JSONs are waiting to become drafts, and `devbench report` renders a `Proposal JSONs pending materialisation` panel listing each entry (omitted when empty). See [ADR-08](adr/08-proposal-lifecycle-observability.md).
+
+### A proposal JSON exists but no draft -- how do I throw it away?
+
+Use the un-materialised form of `reject-proposal`:
+
+```
+uv run devbench reject-proposal --unmaterialised <source-task-id> --reason "<message>"
+```
+
+This archives the JSON to `.devbench/rejected-proposals/<source-id>-unmaterialised-<timestamp>.json` and writes a `[PROPOSAL_JSON_REJECTED]` audit comment on the source task. The command refuses when any proposed task in the JSON already has a materialised draft; in that case use per-draft `reject-proposal <draft-id> --reason "..."` for each draft first. Also note that `devbench sweep-proposals` runs automatically at the top of every orchestrate loop iteration, so an un-materialised JSON whose safety guard clears will become drafts on its own -- you only need the manual reject path for JSONs you know you want to discard.
+
+### I rejected a promoted draft; will the source task auto-unblock?
+
+Yes, if the source's remaining `[BLOCKED_PENDING_PROPOSAL]` markers are all terminal (`done` or `declined`). Per-draft `reject-proposal` strips the rejected draft's marker from the source's Comments section and re-invokes the ADR-07 auto-requeue cascade. If the remaining markers are all terminal the source flips to `in-queue` with an `[AUTO_UNBLOCKED]` audit comment. If any remaining marker is still non-terminal (another in-queue / in-progress / blocked draft), the source stays `blocked` until that one resolves -- same contract as the ADR-07 cascade on the happy path. See [ADR-07](adr/07-auto-requeue-on-proposal-completion.md) and [ADR-08](adr/08-proposal-lifecycle-observability.md).
+
+### I rejected a proposal but it came back on the next loop iteration -- why?
+
+Pre-ADR-09 behaviour: `reject-proposal <draft-id>` archived the draft and removed its BACKLOG.md row, but left the source proposal JSON unchanged. The next `sweep-proposals` call (SKILL step 0) or any manual `materialise-proposal` call walked the JSON's `proposed_tasks[]`, saw no live `.md` for the rejected task, and re-created the draft. Classic case of two layers disagreeing: the classifier (via the rejection archive) knew the task was `REJECTED`, but the materialiser did not ask.
+
+ADR-09 fixed this: `materialise_proposal` now classifies every task before deciding to create a draft and only materialises `UNMATERIALISED` tasks. Rejected drafts stay rejected across any number of sweeps, orchestrator restarts, and replay attempts. If you see a resurrected draft after ADR-09 ships, report it as a regression -- the test pin at `tests/test_cli.py::TestCmdSweepProposalsResurrectionGuard` would have failed.
+
+See [ADR-09](adr/09-idempotent-materialise-proposal.md) for the rationale and [docs/task-factory.md](task-factory.md)'s "materialise-proposal is idempotent" section for the full skip contract.
+
+### My task says `blocker: executor retry budget exhausted`. What does that mean?
+
+The executor is allowed a bounded number of retry rounds on `REVIEW_FAIL`. When that budget is exhausted the SKILL marks the task `blocked` and returns to the loop. The block is not a judgement about the work; it's a cost ceiling that prevents a task that cannot converge from burning unbounded tokens. Recovery path:
+
+1. Open the work unit's Comments and read the last `[REVIEW_REJECTED]` block. The reviewer's finding is the actionable signal.
+2. Either fix the underlying issue manually (tighten an AC, split scope, correct a Changes Manifest row) or `uv run devbench set-status <id> in-queue` to retry from scratch if you believe the failure was transient.
+3. The retry budget is a prompt variable inside `plugin/devbench/skills/orchestrate/SKILL.md` (search for `max_executor_retries`). Adjust downward for cost control or upward if your task class is genuinely slow to converge; the default is documented inline in the SKILL.
 
 ### I don't see "Lifetime X" rows in the report anymore, where did they go?
 

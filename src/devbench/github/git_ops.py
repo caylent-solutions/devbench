@@ -100,7 +100,7 @@ class GitOpsJudge:
 
         _, current_branch, _ = self._git(["rev-parse", "--abbrev-ref", "HEAD"], repo_path)
         if current_branch.strip() == branch:
-            self.logger.info("Already on branch %s — no-op", branch)
+            self.logger.info("Already on branch %s -- no-op", branch)
             return
 
         rc_status, status_out, status_err = run_command(["git", "status", "--porcelain"], cwd=repo_path)
@@ -129,7 +129,7 @@ class GitOpsJudge:
     def commit_and_push(self, repo: str, repo_path: Path, branch: str, message: str) -> None:
         """Validate inputs, stage all changes, commit, and push.
 
-        Assumes the repository is already on the correct branch — call
+        Assumes the repository is already on the correct branch -- call
         :meth:`ensure_branch` before the executor agent stages files.
 
         This method is idempotent: it is safe to call on restart after a partial run.
@@ -139,8 +139,8 @@ class GitOpsJudge:
         1. Validate *repo* against the allow-list (``validate_repo``).
         2. Validate *branch* format against ``_BRANCH_RE`` (allowlist pattern that
            rejects consecutive special characters per git ref naming rules).
-        3. ``git add -A`` — stage all working-tree changes.
-        4. ``git status --porcelain`` — check whether anything was staged.
+        3. ``git add -A`` -- stage all working-tree changes.
+        4. ``git status --porcelain`` -- check whether anything was staged.
 
            - If the output is **non-empty**: proceed to commit and push (steps 5-6).
            - If the output is **empty** (nothing to commit): the working tree is
@@ -153,8 +153,8 @@ class GitOpsJudge:
              - Remote branch present and local HEAD matches remote HEAD: skip push
                and return.  The desired state is fully achieved.
 
-        5. ``git commit -m <message>`` — commit staged changes (skipped when clean).
-        6. ``git push origin <branch>`` — push to the remote (skipped when remote
+        5. ``git commit -m <message>`` -- commit staged changes (skipped when clean).
+        6. ``git push origin <branch>`` -- push to the remote (skipped when remote
            is already up to date).
 
         All git commands are executed via :meth:`_git`, which invokes subprocess
@@ -194,19 +194,19 @@ class GitOpsJudge:
 
         _, status_out, _ = self._git(["status", "--porcelain"], repo_path)
         if not status_out.strip():
-            self.logger.info("Nothing to commit on branch %s — checking remote state", branch)
+            self.logger.info("Nothing to commit on branch %s -- checking remote state", branch)
             rc, _, _ = run_command(["git", "rev-parse", "--verify", f"origin/{branch}"], cwd=repo_path)
             if rc != 0:
-                self.logger.info("Remote branch origin/%s does not exist — pushing", branch)
+                self.logger.info("Remote branch origin/%s does not exist -- pushing", branch)
                 self._git(["push", "origin", branch], repo_path)
             else:
                 _, local_sha, _ = self._git(["rev-parse", "HEAD"], repo_path)
                 _, remote_sha, _ = self._git(["rev-parse", f"origin/{branch}"], repo_path)
                 if local_sha.strip() != remote_sha.strip():
-                    self.logger.info("Local branch %s is ahead of origin — pushing", branch)
+                    self.logger.info("Local branch %s is ahead of origin -- pushing", branch)
                     self._git(["push", "origin", branch], repo_path)
                 else:
-                    self.logger.info("Branch %s already up to date with origin — skipping push", branch)
+                    self.logger.info("Branch %s already up to date with origin -- skipping push", branch)
             return
 
         self._git(["commit", "-m", message], repo_path)
@@ -376,7 +376,7 @@ class GitOpsJudge:
         if rc != 0:
             if "no checks reported" in stderr:
                 self.logger.warning(
-                    "No CI checks configured for PR #%d on %s — treating as pass",
+                    "No CI checks configured for PR #%d on %s -- treating as pass",
                     pr_number,
                     repo,
                 )

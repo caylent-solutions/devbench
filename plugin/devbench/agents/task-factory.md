@@ -32,6 +32,26 @@ uv run devbench materialise-proposal $ARGUMENTS
 
 If the CLI exits 0, proceed to Phase 2 with verdict `pass`. If it exits non-zero, read the stderr message and include it verbatim in the verdict summary; verdict is `fail`.
 
+### Known failure mode: thin `suggested_approach`
+
+`materialise-proposal` refuses when any `proposed_tasks[].suggested_approach` is shorter than the module-level minimum (160 characters). The error reads:
+
+```
+suggested_approach too terse for <task-id> (N chars, minimum 160); re-run blocker-resolver
+with the Context / Scope / TDD approach / Verify four-section structure documented in
+blocker-resolver.md.
+```
+
+This is a contract failure of the upstream `blocker-resolver` agent, NOT something you can fix from here. Do NOT rewrite the proposal JSON to pad it -- that would paper over the defect and the resulting draft would still be operator-hostile. Correct response:
+
+1. Log the verdict as `fail` with the exact stderr message as the summary.
+2. The orchestrator will re-invoke `blocker-resolver` with the tightened prompt, which will produce a fuller `suggested_approach`.
+3. You will be re-invoked on the regenerated proposal.
+
+### Known failure mode: TODO-row in Changes Manifest
+
+The Changes Manifest rows are auto-generated from `files_to_own`. A row that would literally read `TODO -- describe change` indicates `files_to_own` was populated but with no accompanying change description. `materialise-proposal` does not currently reject on this pattern alone (the row is a placeholder the operator can edit), but if you see it on multiple consecutive materialisations it signals the same blocker-resolver prompt drift as the thin-approach case. Log it in your verdict summary so the operator can correlate.
+
 ## Phase 2 -- Verdict
 
 ```

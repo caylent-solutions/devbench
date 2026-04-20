@@ -447,3 +447,126 @@ class TestExecutorCommentLanguageDiscipline:
             "executor.md must explicitly forbid bypass attempts so the agent does not try "
             "to add noqa-style annotations to get around the hook."
         )
+
+
+@pytest.mark.unit
+class TestReviewSupervisorCanonicalJudgeNames:
+    """ADR-08 slice G: supervisor must use underscored canonical judge names in log-verdict."""
+
+    _SUPERVISOR_PATH = AGENTS_DIR / "review-supervisor.md"
+
+    _CANONICAL_JUDGE_NAMES = (
+        "code_review",
+        "test_review",
+        "doc_review",
+        "changes_manifest",
+        "security_review",
+    )
+
+    _HYPHENATED_REVIEWER_NAMES = (
+        "code-reviewer",
+        "test-reviewer",
+        "doc-reviewer",
+    )
+
+    def test_supervisor_contains_all_canonical_judge_names(self) -> None:
+        """Each underscored name must appear in the supervisor's log-verdict examples."""
+        content = self._SUPERVISOR_PATH.read_text()
+        for name in self._CANONICAL_JUDGE_NAMES:
+            assert name in content, (
+                f"review-supervisor.md must reference canonical judge name '{name}' "
+                "so the supervisor emits the exact string the done-gate parser looks for."
+            )
+
+    def test_supervisor_has_no_hyphenated_log_verdict_calls(self) -> None:
+        """Regression pin: no ``log-verdict <hyphenated-name>`` examples in supervisor."""
+        content = self._SUPERVISOR_PATH.read_text()
+        for name in self._HYPHENATED_REVIEWER_NAMES:
+            bad = f"log-verdict {name}"
+            assert bad not in content, (
+                f"review-supervisor.md must not contain '{bad}'. "
+                "Hyphenated reviewer frontmatter names do not match the done-gate parser's "
+                "canonical underscored set. Use e.g. 'log-verdict code_review' instead."
+            )
+
+    def test_supervisor_has_mapping_or_warning(self) -> None:
+        """Prompt must explicitly warn against deriving the judge name from frontmatter."""
+        content = self._SUPERVISOR_PATH.read_text().lower()
+        assert "frontmatter" in content or "canonical" in content, (
+            "review-supervisor.md must contain a caution or mapping that steers the agent "
+            "away from the reviewer's frontmatter name toward the canonical underscored form."
+        )
+
+
+@pytest.mark.unit
+class TestBlockerResolverSuggestedApproachStructure:
+    """ADR-08 slice H: blocker-resolver must require the four-section suggested_approach."""
+
+    _BLOCKER_RESOLVER_PATH = AGENTS_DIR / "blocker-resolver.md"
+
+    def test_prompt_requires_four_sections(self) -> None:
+        """The prompt must name the four required sections so produced drafts are not thin."""
+        content = self._BLOCKER_RESOLVER_PATH.read_text()
+        for label in ("Context", "Scope", "TDD approach", "Verify"):
+            assert label in content, (
+                f"blocker-resolver.md must name '{label}' as a required section of suggested_approach."
+            )
+
+
+@pytest.mark.unit
+class TestTaskFactoryTodoRowRefusal:
+    """ADR-08 slice H: task-factory must warn about thin-approach and TODO-row refusal."""
+
+    _TASK_FACTORY_PATH = AGENTS_DIR / "task-factory.md"
+
+    def test_prompt_mentions_todo_row_refusal(self) -> None:
+        """The prompt must explain that literal 'TODO -- describe change' rows cause refusal."""
+        content = self._TASK_FACTORY_PATH.read_text()
+        assert "TODO -- describe change" in content, (
+            "task-factory.md must warn that a literal 'TODO -- describe change' Changes Manifest row "
+            "will be refused by materialise-proposal so drafts never enter the backlog half-written."
+        )
+
+    def test_prompt_mentions_thin_approach_refusal(self) -> None:
+        """The prompt must explain that a too-short suggested_approach causes refusal."""
+        content = self._TASK_FACTORY_PATH.read_text().lower()
+        assert "thin" in content or "too short" in content or "too terse" in content, (
+            "task-factory.md must explain that thin/short suggested_approach values "
+            "cause materialise-proposal to refuse."
+        )
+
+
+@pytest.mark.unit
+class TestExecutorPreFlightAndAmendmentScope:
+    """ADR-08 slice I: executor must have pre-flight reset + amendment-scope discipline."""
+
+    _EXECUTOR_PATH = AGENTS_DIR / "executor.md"
+
+    def test_executor_has_preflight_reset_section(self) -> None:
+        """Executor must contain a pre-flight reset step so target-repo pollution is cleaned."""
+        content = self._EXECUTOR_PATH.read_text().lower()
+        assert "pre-flight" in content, (
+            "executor.md must contain a 'pre-flight' step that cleans target-repo state "
+            "before TDD RED to avoid contaminating the next task's scope."
+        )
+        assert "target-repo state" in content or "working tree" in content, (
+            "executor.md pre-flight step must reference the target-repo working-tree cleanup."
+        )
+
+    def test_executor_preflight_references_git_status(self) -> None:
+        """The pre-flight step must name the command the executor runs to detect pollution."""
+        content = self._EXECUTOR_PATH.read_text()
+        assert "git" in content.lower() and "status" in content.lower(), (
+            "executor.md pre-flight step must name a git command (status/restore/etc.) "
+            "so the agent can execute the cleanup concretely."
+        )
+
+    def test_executor_forbids_unrelated_files_in_amendment(self) -> None:
+        """Amendment-scope tightening must forbid pulling unrelated dirty files into an amendment."""
+        content = self._EXECUTOR_PATH.read_text().lower()
+        assert "amendment" in content, "executor.md must reference amendments."
+        # The key rule: do not include pre-existing pollution in an amendment request.
+        assert "pre-existing" in content or "unrelated" in content, (
+            "executor.md amendment section must explicitly forbid including pre-existing / unrelated "
+            "dirty files in an amendment request."
+        )

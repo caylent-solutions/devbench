@@ -23,15 +23,15 @@ Evaluate the security posture based on the provided evidence.
 
 ## SECRETS AND CREDENTIALS
 1. No hardcoded secrets, credentials, API keys, tokens, passwords, or encryption keys anywhere in code, configuration files, or test code.
-2. Secrets are managed via AWS Secrets Manager, Parameter Store, or Kubernetes Secrets — never ConfigMaps.
-3. Secret scanning alerts: any exposed credentials MUST be rotated immediately — classify as CRITICAL.
+2. Secrets are managed via AWS Secrets Manager, Parameter Store, or Kubernetes Secrets -- never ConfigMaps.
+3. Secret scanning alerts: any exposed credentials MUST be rotated immediately -- classify as CRITICAL.
 4. No secrets committed to git repositories, including in comments, documentation, or test fixtures.
 
 ## INPUT VALIDATION AND INJECTION
 5. All user input validated at system boundaries: type, length, format, and range.
 6. Validation uses allowlists, not denylists.
 7. Invalid input is rejected, not sanitized into a "safe" form.
-8. SQL injection: all database queries use parameterized queries or ORM — no string concatenation. FAIL if any query concatenates user input.
+8. SQL injection: all database queries use parameterized queries or ORM -- no string concatenation. FAIL if any query concatenates user input.
 9. XSS: all output is escaped by default, Content-Security-Policy headers are set.
 10. Command injection: no user input passed to shell commands, exec(), eval(), or system calls.
 11. File uploads validated for type, size, and content.
@@ -48,18 +48,18 @@ Evaluate the security posture based on the provided evidence.
 ## CRYPTOGRAPHY
 19. TLS 1.2+ for all network communication.
 20. AES-256 for data at rest encryption.
-21. Passwords hashed with bcrypt, scrypt, or Argon2 — FAIL if MD5, SHA1, plain SHA256, DES, 3DES, or RC4 is used.
+21. Passwords hashed with bcrypt, scrypt, or Argon2 -- FAIL if MD5, SHA1, plain SHA256, DES, 3DES, or RC4 is used.
 22. Cryptographically secure random number generators used.
 23. No custom cryptographic algorithm implementations.
 24. No reused initialization vectors or nonces.
 
 ## API SECURITY
 25. Rate limiting implemented on all public-facing endpoints.
-26. CORS policies are explicit — no wildcard origins in production.
+26. CORS policies are explicit -- no wildcard origins in production.
 27. Required response headers: Strict-Transport-Security, X-Content-Type-Options: nosniff, X-Frame-Options, Content-Security-Policy.
 28. X-Powered-By and other identifying headers removed.
 29. Request size limits enforced.
-30. Generic error responses — no stack traces, database errors, or filesystem paths exposed.
+30. Generic error responses -- no stack traces, database errors, or filesystem paths exposed.
 
 ## CONTAINER AND INFRASTRUCTURE SECURITY
 31. Containers run as non-root user.
@@ -74,7 +74,7 @@ Evaluate the security posture based on the provided evidence.
 40. Kubernetes: Secrets used for sensitive data, not ConfigMaps.
 
 ## DEPENDENCY SECURITY
-41. Open CodeQL findings evaluated — real vulnerabilities vs. false positives.
+41. Open CodeQL findings evaluated -- real vulnerabilities vs. false positives.
 42. Dependabot alerts assessed for criticality.
 43. No dependencies with known critical vulnerabilities.
 44. Only trusted, well-maintained libraries used.
@@ -84,17 +84,17 @@ Evaluate the security posture based on the provided evidence.
 46. No bypass annotations: nosec, noqa (on security findings), type: ignore, @SuppressWarnings, nolint, eslint-disable on security rules.
 47. No modifications to security tool configurations to ignore findings (exclusion rules, raised thresholds, disabled rules).
 48. No --no-verify or --force flags that skip security checks.
-49. If a security scan fails, the finding must be fixed or escalated — never suppressed without explicit human approval.
+49. If a security scan fails, the finding must be fixed or escalated -- never suppressed without explicit human approval.
 
 ## LOGGING AND ERROR HANDLING
 50. All security-relevant events logged: authentication, authorization, data access, configuration changes.
 51. Logs include timestamps, user IDs, actions, and outcomes.
 52. Logs NEVER contain: passwords, tokens, PII, financial data, encryption keys, session identifiers.
 53. Structured logging format used.
-54. Error messages to clients are generic — no implementation details leaked.
+54. Error messages to clients are generic -- no implementation details leaked.
 
 ## DEFENSE IN DEPTH
-55. Multiple layers of security controls — no single point of failure.
+55. Multiple layers of security controls -- no single point of failure.
 56. Zero trust: every request authenticated and authorized regardless of network location.
 57. Least privilege: minimum permissions granted to users, services, containers, and processes.
 
@@ -109,8 +109,8 @@ FAIL if ANY critical or high findings exist. PASS only if no critical or high fi
 
 ## OUT OF SCOPE FOR FINDINGS
 The following files are operational backlog-tracking artifacts. You may read them to understand acceptance criteria, Definition of Done, and agent log evidence, but do not raise findings, flag defects, or fail based on their content or status values:
-- `BACKLOG.md` — work-unit status index
-- Any file under `backlog/` — task, story, feature, and epic specification files
+- `BACKLOG.md` -- work-unit status index
+- Any file under `backlog/` -- task, story, feature, and epic specification files
 
 ---
 

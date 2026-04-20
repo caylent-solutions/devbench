@@ -92,7 +92,7 @@ class HookLogTotals:
     ``_compute_cost``. There is no blended-rate fallback: an LLM call that
     lacks a usage breakdown in the source log is excluded from cost (its
     duration is still counted in ``total_duration_ms`` for API-utilization
-    metrics). This is the fail-fast posture — missing cost data surfaces as
+    metrics). This is the fail-fast posture -- missing cost data surfaces as
     visibly-low cost rather than silently-masked blended estimates.
     """
 
@@ -367,7 +367,7 @@ def _accumulate_entry(entry: dict, totals_acc: dict[str, int]) -> None:
     """Fold one hook-log entry's metrics into the running totals accumulator.
 
     Entries without a ``usage`` block contribute duration only (for
-    API-utilization accounting). Their token counts are skipped — there is
+    API-utilization accounting). Their token counts are skipped -- there is
     no blended-rate fallback.
     """
     tool_resp = (entry.get("input") or {}).get("tool_response") or {}
@@ -414,7 +414,7 @@ def _compute_cost(
     """Compute per-token-type cost subtotals and the rolled-up total. Pure function.
 
     Cost is always computed from real per-token-type counts. No blended rate,
-    no estimated input/output ratio — if an LLM call didn't record ``usage``,
+    no estimated input/output ratio -- if an LLM call didn't record ``usage``,
     it contributes zero cost (and an audit-visible gap in ``entries_with_usage``).
     """
     input_cost = totals.input_tokens * input_rate / TOKENS_PER_MILLION
@@ -473,7 +473,7 @@ def _compute_window_stats(
 
     ``tasks_active`` is the count of non-Done tasks that the orchestrator can
     still finish on its own (in-queue / in-progress / in-review). Blocked
-    tasks are excluded — they need external action and have unbounded ETA, so
+    tasks are excluded -- they need external action and have unbounded ETA, so
     rolling them into the projection multiplier produces misleading numbers.
     """
     window_hours = (window_end - window_start).total_seconds() / SECONDS_PER_HOUR
@@ -489,7 +489,7 @@ def _compute_window_stats(
             if dur > 0:
                 task_durations.append(dur)
     pace_sample_count = len(task_durations)
-    # B3: pace from too-few samples is fragile — display as n/a rather than
+    # B3: pace from too-few samples is fragile -- display as n/a rather than
     # projecting from a single completion. The sample count is preserved on
     # WindowStats so the renderer can append "(N=X samples)".
     avg_minutes = sum(task_durations) / pace_sample_count if pace_sample_count >= MIN_PACE_SAMPLES else 0.0
@@ -505,8 +505,8 @@ def _compute_window_stats(
     est_hours = (tasks_active * pace_for_projection) / SECONDS_PER_MINUTE if pace_for_projection else 0.0
 
     # Combine usage from two sources, both filtered by window_start:
-    #   1. hook-logs.jsonl: subagent (Agent tool) invocations — captures executor / judge / etc costs
-    #   2. Claude Code transcripts: per-turn outer-session reasoning — captures what the orchestrate
+    #   1. hook-logs.jsonl: subagent (Agent tool) invocations -- captures executor / judge / etc costs
+    #   2. Claude Code transcripts: per-turn outer-session reasoning -- captures what the orchestrate
     #      skill itself spends between Agent calls. Without these, cost can be off by 10-20x.
     hook_log_path = _hook_log_path(log_path)
     totals_hook = _parse_hook_log_metrics(log_path, window_start)
@@ -616,7 +616,7 @@ def _render_multi_column_table(
 
     ``column_labels`` is the header row for the value columns.
     ``rows`` is a list of (metric, value). ``value`` is either a list with one
-    entry per column (normal row) OR a single string (spanning row — used when
+    entry per column (normal row) OR a single string (spanning row -- used when
     a metric is window-agnostic, e.g. log-wide Recent pace / projected ETA; the
     same number repeating in every column is just noise).
 
@@ -759,7 +759,7 @@ def _render_side_by_side(left: list[str], right: list[str], gap: int = SIDE_BY_S
     """Merge two pre-rendered table block lists onto the same rows, left-right.
 
     The shorter list is padded with whitespace matching its own rendered
-    width so the resulting output stays rectangular — i.e. the right block
+    width so the resulting output stays rectangular -- i.e. the right block
     does not shift left on rows where the left block has ended. An empty
     input on either side returns the other unchanged.
     """
@@ -800,7 +800,7 @@ def _short_window_label(label: str, start: datetime, display_tz: tzinfo | None) 
 
 def _stats_to_value_list(stats: WindowStats) -> list[str]:
     """Return the per-row value list for a single window, in display order matching METRIC_LABELS."""
-    # API utilization > 100% means API time exceeds wall time — concurrent
+    # API utilization > 100% means API time exceeds wall time -- concurrent
     # subagent calls (legitimate parallelism) or two orchestrators writing to
     # the same hook log. The raw percentage reads as broken; surface the
     # condition explicitly. The underlying WindowStats.api_efficiency stays
@@ -895,7 +895,7 @@ def _merge_spanning_values(metric: str, values: list[str]) -> list[str] | str:
     """Collapse a per-column value list into a single spanning str when applicable.
 
     Spanning only triggers when the metric is in ``_SPANNING_METRIC_LABELS`` AND
-    every value is identical — if values differ (e.g. recent pace falls back to
+    every value is identical -- if values differ (e.g. recent pace falls back to
     per-window avg_minutes when log-wide samples are insufficient), keep the
     per-column layout so any divergence stays visible.
     """
@@ -939,7 +939,7 @@ def _summary_line(stats: WindowStats, tasks_active: int, tasks_blocked: int) -> 
     knows why the projection is lower than naive ``tasks_remaining * pace``.
 
     The pace prefers ``recent_pace_minutes`` (rolling average of the last N
-    completions) when available — that metric reflects current orchestrator
+    completions) when available -- that metric reflects current orchestrator
     rate. Falls back to All-time ``avg_minutes`` otherwise.
     """
     blocked_note = f" -- {tasks_blocked} blocked excluded" if tasks_blocked else ""
@@ -1123,7 +1123,7 @@ def _section_for_metric(metric: str) -> str:
 def _unit_status_listing(units: list, status: WorkUnitStatus, header: str) -> list[str]:
     """Return `[<blank>, "<header>:", "  - <id>: <title>", ...]` for task units in the given status.
 
-    Returns an empty list when no task matches — the caller then omits the
+    Returns an empty list when no task matches -- the caller then omits the
     whole section (no empty `In-progress tasks:` header in reports where
     everything is done or everything is blocked, etc.). Listings are task-only
     (unit_type == TASK); parent Story/Feature/Epic units are excluded since
@@ -1165,6 +1165,44 @@ def _declined_listing(units: list) -> list[str]:
     ``  <title>    <path>`` line per task. Omitted when no declined tasks.
     """
     return _listing_by_status(units, WorkUnitStatus.DECLINED, "Declined")
+
+
+def _unmaterialised_proposals_listing() -> list[str]:
+    """List every proposal-JSON entry whose draft .md has not yet been created.
+
+    Reads ``<workspace>/.devbench/proposals/*.json`` via ``list_proposals`` and
+    filters each ``proposed_tasks[].suggested_id`` through
+    ``classify_proposed_task``. Entries in ``UNMATERIALISED`` state get one row
+    per task in a dedicated panel so the operator can see at a glance which
+    proposal JSONs are waiting for ``devbench sweep-proposals`` /
+    ``materialise-proposal`` to produce drafts.
+
+    Omitted entirely when no un-materialised entries exist, mirroring the
+    Proposed / Declined panels' empty-state discipline.
+    """
+    from devbench.backlog.proposal import (
+        ProposalTaskState,
+        classify_proposed_task,
+        list_proposals,
+    )
+
+    workspace_root = BACKLOG_ROOT.parent
+    entries: list[tuple[str, str, str, str]] = []
+    for proposal in list_proposals(workspace_root):
+        for task in proposal.proposed_tasks:
+            state = classify_proposed_task(BACKLOG_ROOT, workspace_root, task.suggested_id)
+            if state is ProposalTaskState.UNMATERIALISED:
+                entries.append((task.suggested_id, task.title, proposal.source_task_id, proposal.generated_at))
+
+    if not entries:
+        return []
+
+    lines = ["", f"Proposal JSONs pending materialisation ({len(entries)}):"]
+    id_col = max(len(sid) for sid, _, _, _ in entries)
+    title_col = max(len(title) for _, title, _, _ in entries)
+    for sid, title, source, generated in entries:
+        lines.append(f"  {sid:<{id_col}}  {title:<{title_col}}  (from {source}, generated {generated})")
+    return lines
 
 
 def _listing_by_status(units: list, status: WorkUnitStatus, label: str) -> list[str]:
@@ -1323,6 +1361,7 @@ def generate_report(
         # and tasks that have been taken off the table. Both are omitted when
         # their respective status has zero tasks.
         lines.extend(_proposed_listing(units))
+        lines.extend(_unmaterialised_proposals_listing())
         lines.extend(_declined_listing(units))
         lines.extend(_in_progress_listing(units))
         lines.extend(_blocked_listing(units))

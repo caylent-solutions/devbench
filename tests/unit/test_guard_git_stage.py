@@ -219,7 +219,7 @@ class TestGuardGitStageHook:
         """AC-4: A command that contains 'git commit' as a substring in another context is handled correctly."""
         payload = _make_payload("echo 'git commit -m test'")
         result = _run_hook(payload)
-        # This is an echo command, not a real git commit — should be allowed
+        # This is an echo command, not a real git commit -- should be allowed
         assert result.returncode == 0
 
 

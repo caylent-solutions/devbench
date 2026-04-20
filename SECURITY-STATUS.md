@@ -1,6 +1,6 @@
 # Repository Security Status
 
-> **Snapshot:** generated **2026-03-05**. This file is a point-in-time snapshot, not a live view. Regenerate it when you want a current picture of your repos' security posture (typically by re-running the security audit script that produced it).
+> **Snapshot:** generated **2026-03-05**. This file is a point-in-time snapshot, not a live view. For the authoritative current state, check each repository's **Security** tab on GitHub (Dependabot alerts, CodeQL results, secret scanning). Regenerate this snapshot when you want a captured picture of all tracked repos in one place (typically by re-running the security audit script that produced it).
 
 **CodeQL** (one of the features tracked below) is GitHub's static-analysis service that scans source code for security vulnerabilities. It runs as a workflow on each PR and can be configured to require passing analysis before merge.
 
@@ -23,5 +23,5 @@
 
 - **CodeQL languages**: Only `git-repo` has detected languages (python) because it has code. The other 3 repos will detect languages once code is added by the backlog.
 - **Required checks**: Only `git-repo` has a required check (`Analyze (python)` from CodeQL). The other repos will get required checks auto-discovered when CI workflows are created by the backlog and the orchestrator re-runs `enable_security_features`.
-- **Branch protection**: All repos require PRs to merge to main — no direct push, no force push, branches must be up-to-date before merge.
-- **No open alerts**: All 4 repos are clean — zero Dependabot and zero secret scanning alerts.
+- **Branch protection**: All repos require PRs to merge to main -- no direct push, no force push, branches must be up-to-date before merge.
+- **No open alerts**: All 4 repos are clean -- zero Dependabot and zero secret scanning alerts.

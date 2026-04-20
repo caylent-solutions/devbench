@@ -135,7 +135,7 @@ _config_path: Path = resolve_config_path(None, os.environ, WORKSPACE_ROOT)
 RUNTIME_CONFIG: RuntimeConfig = load_runtime_config(_config_path, os.environ)
 
 # ---------------------------------------------------------------------------
-# Allowed repos — sourced exclusively from YAML config.
+# Allowed repos -- sourced exclusively from YAML config.
 # ---------------------------------------------------------------------------
 ALLOWED_REPOS: frozenset[str] = frozenset(RUNTIME_CONFIG.repos)
 
@@ -167,7 +167,7 @@ def resolve_repo(short_or_full: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Backlog paths — derived from WORKSPACE_ROOT.
+# Backlog paths -- derived from WORKSPACE_ROOT.
 # ---------------------------------------------------------------------------
 BACKLOG_ROOT: Path = WORKSPACE_ROOT / BACKLOG_SUBDIR
 BACKLOG_INDEX: Path = WORKSPACE_ROOT / "BACKLOG.md"
@@ -276,7 +276,7 @@ BEDROCK_REGION: str = _resolve_str(
 )
 
 # ---------------------------------------------------------------------------
-# Timeouts — all values in seconds
+# Timeouts -- all values in seconds
 # ---------------------------------------------------------------------------
 GH_API_TIMEOUT: int = _resolve_int("JUDGE_GH_API_TIMEOUT", RUNTIME_CONFIG.timeouts.gh_api, DEFAULT_GH_API_TIMEOUT)
 TEST_TIMEOUT: int = _resolve_int("JUDGE_TEST_TIMEOUT", RUNTIME_CONFIG.timeouts.test, DEFAULT_TEST_TIMEOUT)

@@ -285,9 +285,9 @@ def test_report_renders_tables_side_by_side() -> None:
     workspace = Path(WORKSPACE_ROOT_ENV)
     report = _run_report(workspace, os.environ["JUDGE_CLAUDE_MODEL"])
 
-    # At least one line must contain two top-left corners (\u250c) — one per table.
+    # At least one line must contain two top-left corners (\u250c) -- one per table.
     two_corner_lines = [ln for ln in report.splitlines() if ln.count("\u250c") >= 2]
-    assert two_corner_lines, "Side-by-side layout missing — expected two top-left corners on one line"
+    assert two_corner_lines, "Side-by-side layout missing -- expected two top-left corners on one line"
 
     # And at least one line must contain both the 'Backlog state' header label and
     # the 'Window stats' header label, confirming they're on the same row.

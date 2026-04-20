@@ -24,7 +24,7 @@ from devbench.config_loader import (
 )
 
 # ---------------------------------------------------------------------------
-# resolve_config_path — AC-2
+# resolve_config_path -- AC-2
 # ---------------------------------------------------------------------------
 
 
@@ -80,7 +80,7 @@ class TestResolveConfigPath:
 
 
 # ---------------------------------------------------------------------------
-# load_runtime_config — AC-3, AC-4, AC-5
+# load_runtime_config -- AC-3, AC-4, AC-5
 # ---------------------------------------------------------------------------
 
 
@@ -220,7 +220,7 @@ class TestLoadRuntimeConfig:
 
 
 # ---------------------------------------------------------------------------
-# get_configured_default_branch — AC-6 (pure function)
+# get_configured_default_branch -- AC-6 (pure function)
 # ---------------------------------------------------------------------------
 
 
@@ -285,7 +285,7 @@ class TestDataclasses:
 
 
 # ---------------------------------------------------------------------------
-# checkout_directory parsing — AC-1, AC-3, AC-4
+# checkout_directory parsing -- AC-1, AC-3, AC-4
 # ---------------------------------------------------------------------------
 
 
@@ -355,7 +355,7 @@ class TestCheckoutDirectory:
 
 
 # ---------------------------------------------------------------------------
-# get_repo_local_path — AC-2, AC-5
+# get_repo_local_path -- AC-2, AC-5
 # ---------------------------------------------------------------------------
 
 
@@ -405,7 +405,7 @@ class TestGetRepoLocalPath:
 
 
 # ---------------------------------------------------------------------------
-# JSON Schema validation — AC-1, AC-2, AC-3, AC-4, AC-5, AC-6
+# JSON Schema validation -- AC-1, AC-2, AC-3, AC-4, AC-5, AC-6
 # ---------------------------------------------------------------------------
 
 
@@ -547,7 +547,7 @@ class TestJsonSchemaValidation:
 
 
 # ---------------------------------------------------------------------------
-# TimeoutConfig / LimitConfig dataclasses — AC-9
+# TimeoutConfig / LimitConfig dataclasses -- AC-9
 # ---------------------------------------------------------------------------
 
 
@@ -598,7 +598,7 @@ class TestLimitConfigDefaults:
 
 
 # ---------------------------------------------------------------------------
-# RuntimeConfig population from YAML — AC-9
+# RuntimeConfig population from YAML -- AC-9
 # ---------------------------------------------------------------------------
 
 
@@ -801,7 +801,7 @@ class TestConfigLoaderNoEnvVars:
             ):
                 env_read_calls.append("os.getenv")
 
-        assert env_read_calls == [], f"config_loader.py must not read env vars — found: {env_read_calls}"
+        assert env_read_calls == [], f"config_loader.py must not read env vars -- found: {env_read_calls}"
 
 
 # ---------------------------------------------------------------------------
@@ -902,7 +902,7 @@ class TestPostSchemaValidation:
 
 
 # ---------------------------------------------------------------------------
-# GitOpsConfig — T3 AC-3, AC-4, AC-5, AC-6
+# GitOpsConfig -- T3 AC-3, AC-4, AC-5, AC-6
 # ---------------------------------------------------------------------------
 
 

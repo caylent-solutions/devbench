@@ -210,7 +210,7 @@ class TestCircuitBreaker:
         result = _run_hook(str(tmp_path), extra_env={"JUDGE_STOP_MAX_BLOCKS": "5"})
         output = json.loads(result.stdout)
         assert output["decision"] == "block"
-        # Verify counter was reset — state file should show count 1.
+        # Verify counter was reset -- state file should show count 1.
         state = json.loads(STATE_FILE.read_text())
         assert state["count"] == 1
 
@@ -241,7 +241,7 @@ class TestCircuitBreaker:
         config_dir = tmp_path / "backlog" / "config"
         config_dir.mkdir(parents=True)
         (config_dir / "devbench.yaml").write_text("repos:\n  org/repo: {}\nstop_hook:\n  max_blocks: 10\n")
-        # Env var should override YAML — set to 1.
+        # Env var should override YAML -- set to 1.
         result = _run_hook(str(tmp_path), extra_env={"JUDGE_STOP_MAX_BLOCKS": "1"})
         output = json.loads(result.stdout)
         assert output["decision"] == "block"
@@ -252,7 +252,7 @@ class TestCircuitBreaker:
     def test_defaults_when_no_yaml_no_env(self, tmp_path: Path) -> None:
         backlog = tmp_path / "BACKLOG.md"
         backlog.write_text("| E0-F1-S1-T1 | Task | Task | in-progress | none | repo | `backlog/t1.md` |\n")
-        # No config file, no env vars — should use default max_blocks=5.
+        # No config file, no env vars -- should use default max_blocks=5.
         result = _run_hook(str(tmp_path))
         output = json.loads(result.stdout)
         assert "5" in output["reason"]  # "N/5 blocks"

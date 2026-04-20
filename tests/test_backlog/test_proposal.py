@@ -119,7 +119,15 @@ def _sample_proposal(source_task_id: str = "E0-F1-S1-T1", *, task_ids: list[str]
             files_to_own=[f"src/{tid}.py"],
             linked_scenarios=[f"SC-{i:02d}"],
             suggested_acs=[f"AC-FUNC-{i:03d} fix the scenario"],
-            suggested_approach=f"1. Reproduce SC-{i:02d} locally.\n2. Fix the bug.\n3. Verify.",
+            suggested_approach=(
+                f"Context: Scenario SC-{i:02d} failed against the current implementation. "
+                f"Scope: One production file and its companion unit test. "
+                f"TDD approach: 1. RED -- Reproduce SC-{i:02d} locally in a unit test. "
+                "2. GREEN -- Apply the minimal fix in the production module. "
+                "3. REFACTOR -- Clean up without changing behaviour. "
+                "Verify: make lint && make format-check && make test-unit && make test-integration "
+                "all exit zero."
+            ),
         )
         for i, tid in enumerate(task_ids, start=1)
     ]
@@ -492,18 +500,164 @@ class TestMaterialiseProposal:
                 repo="caylent-solutions/example",
             )
 
-    def test_refuses_when_draft_file_already_exists(self, tmp_path: Path) -> None:
+    def test_skips_task_when_draft_file_already_exists(self, tmp_path: Path) -> None:
+        """ADR-09: materialise is idempotent. A pre-existing draft is left alone."""
         workspace = _build_workspace(tmp_path)
         story_dir = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
-        (story_dir / "E0-F1-S1-T2.md").write_text("existing")
-        with pytest.raises(ProposalError, match=r"Draft file .* already exists"):
-            materialise_proposal(
-                workspace_root=workspace,
-                backlog_root=workspace / "backlog",
-                backlog_index=workspace / "BACKLOG.md",
-                proposal=_sample_proposal(),
-                repo="caylent-solutions/example",
-            )
+        existing_path = story_dir / "E0-F1-S1-T2.md"
+        existing_path.write_text("# E0-F1-S1-T2: X\n\n## Status: proposed\n\nexisting\n")
+
+        proposal = _sample_proposal(task_ids=["E0-F1-S1-T2"])
+        drafts = materialise_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            proposal=proposal,
+            repo="caylent-solutions/example",
+        )
+
+        # No draft was created -- the existing file classifies as PROPOSED and is skipped.
+        assert drafts == []
+        # Existing file content preserved (no overwrite).
+        assert "existing" in existing_path.read_text()
+
+
+class TestMaterialiseProposalIdempotent:
+    """ADR-09: materialise_proposal is classify-aware and idempotent."""
+
+    def _two_task_proposal(self) -> Proposal:
+        return _sample_proposal(task_ids=["E0-F1-S1-T2", "E0-F1-S1-T3"])
+
+    def test_skips_rejected_task_from_archive(self, tmp_path: Path) -> None:
+        """Rejected archive -> classifier returns REJECTED -> materialise does NOT recreate."""
+        from devbench.backlog.proposal import REJECTED_PROPOSAL_DIR_NAME
+
+        workspace = _build_workspace(tmp_path)
+        # Seed a per-draft reject archive for T2 at the canonical location.
+        archive_dir = workspace / REJECTED_PROPOSAL_DIR_NAME
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        (archive_dir / "E0-F1-S1-T2-20260419T000000Z.md").write_text("archived draft body")
+
+        proposal = _sample_proposal(task_ids=["E0-F1-S1-T2"])
+        drafts = materialise_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            proposal=proposal,
+            repo="caylent-solutions/example",
+        )
+
+        assert drafts == []
+        story_dir = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        assert not (story_dir / "E0-F1-S1-T2.md").exists(), "rejected draft must not be resurrected"
+        # BACKLOG.md must not have gained a row for the skipped task.
+        assert "E0-F1-S1-T2" not in (workspace / "BACKLOG.md").read_text()
+
+    @pytest.mark.parametrize("status_value", ["in-queue", "in-progress", "in-review", "blocked", "done", "declined"])
+    def test_skips_promoted_done_declined_states(self, tmp_path: Path, status_value: str) -> None:
+        """Any non-PROPOSED / non-UNMATERIALISED state -> skip, no recreation."""
+        workspace = _build_workspace(tmp_path)
+        story_dir = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        draft = story_dir / "E0-F1-S1-T2.md"
+        draft.write_text(f"# E0-F1-S1-T2: X\n\n## Status: {status_value}\n\nbody\n")
+        original_body = draft.read_text()
+
+        drafts = materialise_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            proposal=_sample_proposal(task_ids=["E0-F1-S1-T2"]),
+            repo="caylent-solutions/example",
+        )
+        assert drafts == []
+        assert draft.read_text() == original_body
+
+    def test_creates_remaining_tasks_when_others_skipped(self, tmp_path: Path) -> None:
+        """Partial state: one task rejected (archive), the other materialises normally."""
+        from devbench.backlog.proposal import REJECTED_PROPOSAL_DIR_NAME
+
+        workspace = _build_workspace(tmp_path)
+        # Reject T2 via archive; T3 should still materialise on the same call.
+        archive_dir = workspace / REJECTED_PROPOSAL_DIR_NAME
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        (archive_dir / "E0-F1-S1-T2-20260419T000000Z.md").write_text("archived")
+
+        drafts = materialise_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            proposal=self._two_task_proposal(),
+            repo="caylent-solutions/example",
+        )
+
+        assert len(drafts) == 1, "only T3 should be materialised; T2 stays rejected"
+        assert drafts[0].name == "E0-F1-S1-T3.md"
+        story_dir = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        assert not (story_dir / "E0-F1-S1-T2.md").exists()
+        assert (story_dir / "E0-F1-S1-T3.md").exists()
+
+    def test_double_call_is_noop(self, tmp_path: Path) -> None:
+        """Calling materialise twice on the same fresh JSON: second call creates nothing."""
+        workspace = _build_workspace(tmp_path)
+        proposal = self._two_task_proposal()
+
+        first = materialise_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            proposal=proposal,
+            repo="caylent-solutions/example",
+        )
+        assert len(first) == 2
+
+        # Second call: every task now classifies as PROPOSED (draft file has
+        # Status: proposed). materialise must skip both and return empty.
+        second = materialise_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            proposal=proposal,
+            repo="caylent-solutions/example",
+        )
+        assert second == []
+
+        # BACKLOG.md has exactly one row per task (no duplicates). Each row
+        # mentions the id twice (id cell + file-path cell); count the
+        # row-start form to measure row count.
+        backlog_text = (workspace / "BACKLOG.md").read_text()
+        assert backlog_text.count("| E0-F1-S1-T2 |") == 1
+        assert backlog_text.count("| E0-F1-S1-T3 |") == 1
+
+    def test_rejected_draft_does_not_resurrect_on_re_materialise(self, tmp_path: Path) -> None:
+        """End-to-end: reject a materialised draft, then re-materialise. Archive stays; no recreation."""
+        workspace = _build_workspace(tmp_path)
+        proposal = self._two_task_proposal()
+        write_proposal(workspace, proposal)
+        materialise_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            proposal=proposal,
+            repo="caylent-solutions/example",
+        )
+        reject_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            task_id="E0-F1-S1-T2",
+            reason="superseded",
+        )
+        # T2's draft is archived now. Re-materialise the same JSON.
+        result = materialise_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            proposal=proposal,
+            repo="caylent-solutions/example",
+        )
+        assert result == [], "rejected draft must not be resurrected on re-materialise"
+        story_dir = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        assert not (story_dir / "E0-F1-S1-T2.md").exists()
 
 
 class TestHasUnresolvedProposals:
@@ -535,6 +689,24 @@ class TestHasUnresolvedProposals:
     def test_non_pipe_line_skipped(self, tmp_path: Path) -> None:
         (tmp_path / "BACKLOG.md").write_text("plain line\n")
         assert _has_unresolved_proposals(tmp_path / "BACKLOG.md") is False
+
+    def test_exclude_task_ids_filters_own_proposed_rows(self, tmp_path: Path) -> None:
+        """ADR-09: re-materialising a proposal must not see its own proposed rows as blockers."""
+        workspace = _build_workspace(tmp_path)
+        _append_backlog_row(
+            workspace / "BACKLOG.md",
+            _render_backlog_row(
+                "E0-F1-S1-T2",
+                "Mine",
+                "proposed",
+                "caylent-solutions/example",
+                "backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T2.md",
+            ),
+        )
+        # Without the exclude set, this row makes the guard fire.
+        assert _has_unresolved_proposals(workspace / "BACKLOG.md") is True
+        # Excluding the same id returns False -- the row is ignored.
+        assert _has_unresolved_proposals(workspace / "BACKLOG.md", exclude_task_ids=frozenset({"E0-F1-S1-T2"})) is False
 
 
 # ---------------------------------------------------------------------------
@@ -627,6 +799,63 @@ class TestPromoteProposal:
         )
         source = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
         assert "| E0-F1-S1-T2 |" not in source.read_text()
+
+    def test_promote_writes_blocked_pending_proposal_marker(self, tmp_path: Path) -> None:
+        """The wiring write must include the ``[BLOCKED_PENDING_PROPOSAL]`` marker.
+
+        The marker is what ``BacklogManager._auto_requeue_marker_dependents``
+        reads on the source task to decide whether a subsequent ``mark_done``
+        of the promoted dep should auto-unblock the source. Regressions here
+        silently break the auto-requeue cascade without any CI signal.
+        """
+        workspace = _build_workspace(tmp_path)
+        proposal = _sample_proposal(task_ids=["E0-F1-S1-T2"])
+        write_proposal(workspace, proposal)
+        materialise_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            proposal=proposal,
+            repo="caylent-solutions/example",
+        )
+        promote_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            task_id="E0-F1-S1-T2",
+        )
+        source = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
+        source_text = source.read_text()
+        assert "[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2" in source_text
+        # Both markers should be on the same audit comment line.
+        for line in source_text.splitlines():
+            if "[PROPOSAL_PROMOTED] E0-F1-S1-T2" in line:
+                assert "[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2" in line
+                break
+        else:
+            raise AssertionError("did not find [PROPOSAL_PROMOTED] audit line")
+
+    def test_promote_with_no_dep_on_source_skips_marker(self, tmp_path: Path) -> None:
+        """``--no-dep-on-source`` implies no auto-requeue wiring; marker MUST be absent."""
+        workspace = _build_workspace(tmp_path)
+        proposal = _sample_proposal(task_ids=["E0-F1-S1-T2"])
+        write_proposal(workspace, proposal)
+        materialise_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            proposal=proposal,
+            repo="caylent-solutions/example",
+        )
+        promote_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            task_id="E0-F1-S1-T2",
+            dep_on_source=False,
+        )
+        source = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
+        assert "[BLOCKED_PENDING_PROPOSAL]" not in source.read_text()
 
 
 class TestPromoteAllFromSource:
@@ -815,3 +1044,521 @@ class TestAppendPromoteCommentNoExistingComments:
         updated = source_file.read_text()
         assert "## Comments" in updated
         assert "[PROPOSAL_PROMOTED]" in updated
+
+
+# ---------------------------------------------------------------------------
+# Proposal-lifecycle observability + cleanup (ADR-08 slices A / E / F / H).
+# ---------------------------------------------------------------------------
+
+
+def _draft_body(status: str, task_id: str = "E0-F1-S1-T1") -> str:
+    """Return a minimal draft-file body with the given ## Status value.
+
+    The heading uses ``task_id`` so ``BacklogParser.parse_work_unit_file``
+    recovers the same ID the enclosing test is using.
+    """
+    return f"# {task_id}: X\n\n## Status: {status}\n\n## Description\n\nx\n"
+
+
+def _seed_draft(backlog_root: Path, task_id: str, status: str) -> Path:
+    """Create a draft .md for ``task_id`` with the given status under a story dir."""
+    from devbench.backlog.proposal import _extract_story_id, _story_dir
+
+    story_dir = _story_dir(backlog_root, _extract_story_id(task_id))
+    story_dir.mkdir(parents=True, exist_ok=True)
+    draft = story_dir / f"{task_id}.md"
+    draft.write_text(_draft_body(status, task_id=task_id))
+    return draft
+
+
+class TestClassifyProposedTask:
+    """Every ``ProposalTaskState`` value has a deterministic fixture scenario."""
+
+    def test_unmaterialised_when_no_draft_and_no_archive(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import (
+            ProposalTaskState,
+            classify_proposed_task,
+        )
+
+        (tmp_path / "backlog").mkdir()
+        state = classify_proposed_task(tmp_path / "backlog", tmp_path, "E0-F1-S1-T9")
+        assert state is ProposalTaskState.UNMATERIALISED
+
+    def test_rejected_when_archive_entry_exists(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import (
+            REJECTED_PROPOSAL_DIR_NAME,
+            ProposalTaskState,
+            classify_proposed_task,
+        )
+
+        (tmp_path / "backlog").mkdir()
+        archive_dir = tmp_path / REJECTED_PROPOSAL_DIR_NAME
+        archive_dir.mkdir(parents=True)
+        (archive_dir / "E0-F1-S1-T9-20260101T000000Z.md").write_text("archived")
+        state = classify_proposed_task(tmp_path / "backlog", tmp_path, "E0-F1-S1-T9")
+        assert state is ProposalTaskState.REJECTED
+
+    @pytest.mark.parametrize(
+        "status,expected_state",
+        [
+            ("proposed", "PROPOSED"),
+            ("done", "DONE"),
+            ("declined", "DECLINED"),
+            ("in-queue", "PROMOTED"),
+            ("in-progress", "PROMOTED"),
+            ("in-review", "PROMOTED"),
+            ("blocked", "PROMOTED"),
+        ],
+    )
+    def test_draft_status_maps_to_state(self, tmp_path: Path, status: str, expected_state: str) -> None:
+        from devbench.backlog.proposal import (
+            ProposalTaskState,
+            classify_proposed_task,
+        )
+
+        backlog_root = tmp_path / "backlog"
+        backlog_root.mkdir()
+        _seed_draft(backlog_root, "E0-F1-S1-T2", status)
+        state = classify_proposed_task(backlog_root, tmp_path, "E0-F1-S1-T2")
+        assert state is ProposalTaskState[expected_state]
+
+    def test_malformed_draft_with_no_status_line_treated_as_promoted(self, tmp_path: Path) -> None:
+        """Defensive: a draft missing its Status line is still classified (as PROMOTED)."""
+        from devbench.backlog.proposal import (
+            ProposalTaskState,
+            _extract_story_id,
+            _story_dir,
+            classify_proposed_task,
+        )
+
+        backlog_root = tmp_path / "backlog"
+        story_dir = _story_dir(backlog_root, _extract_story_id("E0-F1-S1-T2"))
+        story_dir.mkdir(parents=True)
+        (story_dir / "E0-F1-S1-T2.md").write_text("# header only\n")
+        state = classify_proposed_task(backlog_root, tmp_path, "E0-F1-S1-T2")
+        assert state is ProposalTaskState.PROMOTED
+
+
+class TestMaterialiseProposalThinApproachRefusal:
+    """ADR-08 slice H: materialise refuses thin ``suggested_approach`` fail-fast."""
+
+    def _mini_workspace(self, tmp_path: Path, approach: str) -> tuple[Path, Proposal]:
+        """Build a tmp workspace with a single proposal carrying ``approach``."""
+        from devbench.backlog.proposal import (
+            Proposal,
+            ProposedTask,
+        )
+
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        story_dir = backlog_dir / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+        (story_dir / "E0-F1-S1-T1.md").write_text(_draft_body("blocked"))
+        (tmp_path / "BACKLOG.md").write_text(
+            "# Backlog\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Source | Task | blocked | None | r | `backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n"
+        )
+        proposal = Proposal(
+            source_task_id="E0-F1-S1-T1",
+            generated_at="2026-04-19T00:00:00Z",
+            rejection_reason="scope",
+            proposed_tasks=[
+                ProposedTask(
+                    suggested_id="E0-F1-S1-T2",
+                    title="Fix",
+                    files_to_own=["src/a.py"],
+                    linked_scenarios=["SC-01"],
+                    suggested_acs=["AC-001 fix"],
+                    suggested_approach=approach,
+                )
+            ],
+        )
+        return tmp_path, proposal
+
+    def test_empty_approach_raises_proposal_error(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import ProposalError, materialise_proposal
+
+        workspace, proposal = self._mini_workspace(tmp_path, approach="")
+        with pytest.raises(ProposalError, match="suggested_approach too terse"):
+            materialise_proposal(
+                workspace_root=workspace,
+                backlog_root=workspace / "backlog",
+                backlog_index=workspace / "BACKLOG.md",
+                proposal=proposal,
+                repo="r",
+            )
+
+    def test_below_threshold_approach_raises(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import ProposalError, materialise_proposal
+
+        workspace, proposal = self._mini_workspace(tmp_path, approach="RED. GREEN. Verify.")
+        with pytest.raises(ProposalError, match="suggested_approach too terse"):
+            materialise_proposal(
+                workspace_root=workspace,
+                backlog_root=workspace / "backlog",
+                backlog_index=workspace / "BACKLOG.md",
+                proposal=proposal,
+                repo="r",
+            )
+
+    def test_at_threshold_passes(self, tmp_path: Path) -> None:
+        """A single-char-above-threshold approach materialises successfully."""
+        from devbench.backlog.proposal import (
+            _SUGGESTED_APPROACH_MIN_CHARS,
+            materialise_proposal,
+        )
+
+        padded = "x" * (_SUGGESTED_APPROACH_MIN_CHARS + 1)
+        workspace, proposal = self._mini_workspace(tmp_path, approach=padded)
+        drafts = materialise_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            proposal=proposal,
+            repo="r",
+        )
+        assert len(drafts) == 1
+
+    def test_thin_approach_error_names_task_id(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import ProposalError, materialise_proposal
+
+        workspace, proposal = self._mini_workspace(tmp_path, approach="nope")
+        with pytest.raises(ProposalError, match="E0-F1-S1-T2"):
+            materialise_proposal(
+                workspace_root=workspace,
+                backlog_root=workspace / "backlog",
+                backlog_index=workspace / "BACKLOG.md",
+                proposal=proposal,
+                repo="r",
+            )
+
+
+class TestRejectProposalArgumentForms:
+    """ADR-08 slice E: the two mutually-exclusive rejection forms."""
+
+    def test_neither_form_supplied_raises(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import ProposalError, reject_proposal
+
+        with pytest.raises(ProposalError, match="exactly one of"):
+            reject_proposal(
+                workspace_root=tmp_path,
+                backlog_root=tmp_path / "backlog",
+                backlog_index=tmp_path / "BACKLOG.md",
+                reason="r",
+            )
+
+    def test_both_forms_supplied_raises(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import ProposalError, reject_proposal
+
+        with pytest.raises(ProposalError, match="not both"):
+            reject_proposal(
+                workspace_root=tmp_path,
+                backlog_root=tmp_path / "backlog",
+                backlog_index=tmp_path / "BACKLOG.md",
+                task_id="E0-F1-S1-T2",
+                unmaterialised_source_id="E0-F1-S1-T1",
+                reason="r",
+            )
+
+    def test_empty_reason_raises(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import ProposalError, reject_proposal
+
+        with pytest.raises(ProposalError, match="non-empty reason"):
+            reject_proposal(
+                workspace_root=tmp_path,
+                backlog_root=tmp_path / "backlog",
+                backlog_index=tmp_path / "BACKLOG.md",
+                task_id="E0-F1-S1-T2",
+                reason="",
+            )
+
+
+class TestRejectUnmaterialisedProposal:
+    """The new ``--unmaterialised <source-id>`` form."""
+
+    def _mini_workspace(self, tmp_path: Path) -> Path:
+        """Build a workspace with a source task + one proposal JSON (un-materialised drafts)."""
+        from devbench.backlog.proposal import (
+            PROPOSAL_DIR_NAME,
+            Proposal,
+            ProposedTask,
+            write_proposal,
+        )
+
+        backlog_dir = tmp_path / "backlog"
+        story_dir = backlog_dir / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+        source_file = story_dir / "E0-F1-S1-T1.md"
+        source_file.write_text(_draft_body("blocked", task_id="E0-F1-S1-T1"))
+        (tmp_path / "BACKLOG.md").write_text(
+            "# Backlog\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Source | Task | blocked | None | r | "
+            "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n"
+        )
+        (tmp_path / PROPOSAL_DIR_NAME).mkdir(parents=True, exist_ok=True)
+        write_proposal(
+            tmp_path,
+            Proposal(
+                source_task_id="E0-F1-S1-T1",
+                generated_at="2026-04-19T00:00:00Z",
+                rejection_reason="scope",
+                proposed_tasks=[
+                    ProposedTask(
+                        suggested_id="E0-F1-S1-T2",
+                        title="Fix",
+                        files_to_own=["src/a.py"],
+                        linked_scenarios=["SC-01"],
+                        suggested_acs=["AC-001 fix"],
+                        suggested_approach=(
+                            "Context: unit test. Scope: src/a.py. "
+                            "TDD approach: 1. RED. 2. GREEN. 3. REFACTOR no-op. "
+                            "Verify: make lint && make test-unit exit zero."
+                        ),
+                    )
+                ],
+            ),
+        )
+        return tmp_path
+
+    def test_happy_path_archives_json_and_audits_source(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import (
+            PROPOSAL_DIR_NAME,
+            REJECTED_PROPOSAL_DIR_NAME,
+            reject_proposal,
+        )
+
+        workspace = self._mini_workspace(tmp_path)
+        archive = reject_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            unmaterialised_source_id="E0-F1-S1-T1",
+            reason="redundant with T3",
+        )
+
+        # Archive created with the '-unmaterialised-' infix.
+        assert archive is not None
+        assert archive.is_file()
+        assert archive.parent == workspace / REJECTED_PROPOSAL_DIR_NAME
+        assert "unmaterialised" in archive.name
+
+        # Live JSON removed.
+        assert not (workspace / PROPOSAL_DIR_NAME / "E0-F1-S1-T1.json").exists()
+
+        # Source task has the audit comment.
+        source_text = (workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md").read_text()
+        assert "[PROPOSAL_JSON_REJECTED]" in source_text
+        assert "redundant with T3" in source_text
+
+    def test_refuses_when_any_task_already_materialised(self, tmp_path: Path) -> None:
+        """If any proposed task has a draft .md, per-source rejection must refuse."""
+        from devbench.backlog.proposal import ProposalError, reject_proposal
+
+        workspace = self._mini_workspace(tmp_path)
+        # Materialise the T2 draft out-of-band so it's in PROPOSED state.
+        _seed_draft(workspace / "backlog", "E0-F1-S1-T2", "proposed")
+
+        with pytest.raises(ProposalError, match="already in state"):
+            reject_proposal(
+                workspace_root=workspace,
+                backlog_root=workspace / "backlog",
+                backlog_index=workspace / "BACKLOG.md",
+                unmaterialised_source_id="E0-F1-S1-T1",
+                reason="r",
+            )
+
+    def test_refuses_when_json_missing(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import ProposalError, reject_proposal
+
+        (tmp_path / "backlog").mkdir()
+        (tmp_path / "BACKLOG.md").write_text("# Backlog\n")
+        with pytest.raises(ProposalError, match="No proposal JSON found"):
+            reject_proposal(
+                workspace_root=tmp_path,
+                backlog_root=tmp_path / "backlog",
+                backlog_index=tmp_path / "BACKLOG.md",
+                unmaterialised_source_id="E0-F1-S1-T1",
+                reason="r",
+            )
+
+    def test_happy_path_appends_to_existing_comments_section(self, tmp_path: Path) -> None:
+        """When the source already has ``## Comments``, the audit line is appended to it."""
+        from devbench.backlog.proposal import REJECTED_PROPOSAL_DIR_NAME, reject_proposal
+
+        workspace = self._mini_workspace(tmp_path)
+        source_md = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
+        existing = source_md.read_text() + "\n## Comments\n\n[2026-04-18 14:00 UTC] [agent/test] prior\n"
+        source_md.write_text(existing)
+
+        archive = reject_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            unmaterialised_source_id="E0-F1-S1-T1",
+            reason="appended",
+        )
+        assert archive is not None
+        assert archive.parent == workspace / REJECTED_PROPOSAL_DIR_NAME
+        final_text = source_md.read_text()
+        assert "prior" in final_text
+        assert "[PROPOSAL_JSON_REJECTED]" in final_text
+        assert "appended" in final_text
+
+
+class TestRejectProposalMarkerStrip:
+    """ADR-08 slice F: per-draft rejection strips the marker + invokes cascade."""
+
+    def _workspace_with_marker(
+        self,
+        tmp_path: Path,
+        *,
+        second_draft_status: str = "done",
+    ) -> tuple[Path, Path]:
+        """Build a workspace where source T1 has markers for T2 + T3.
+
+        T2 is the draft we'll reject; T3 is seeded with ``second_draft_status``.
+        Returns (workspace, source_file).
+        """
+        from devbench.backlog.proposal import (
+            PROPOSAL_DIR_NAME,
+            Proposal,
+            ProposedTask,
+            write_proposal,
+        )
+
+        backlog_dir = tmp_path / "backlog"
+        story_dir = backlog_dir / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+        source_file = story_dir / "E0-F1-S1-T1.md"
+        source_file.write_text(
+            "# E0-F1-S1-T1: Source\n\n## Status: blocked\n\n## Description\n\nx\n\n"
+            "## Dependencies\n\n"
+            "| ID | Title | Status |\n|----|-------|--------|\n"
+            "| E0-F1-S1-T2 | (auto) | proposed |\n"
+            "| E0-F1-S1-T3 | (auto) | proposed |\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-TEST-001 x\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `x.py` | x |\n\n"
+            "## Definition of Done\n\n- [ ] AC complete\n\n"
+            "## Comments\n\n"
+            "[2026-04-19 14:00 UTC] [agent/task_factory] [PROPOSAL_PROMOTED] E0-F1-S1-T2 "
+            "promoted and wired as dependency of E0-F1-S1-T1. [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2\n\n"
+            "[2026-04-19 14:01 UTC] [agent/task_factory] [PROPOSAL_PROMOTED] E0-F1-S1-T3 "
+            "promoted and wired as dependency of E0-F1-S1-T1. [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T3\n"
+        )
+        _seed_draft(backlog_dir, "E0-F1-S1-T2", "in-queue")
+        _seed_draft(backlog_dir, "E0-F1-S1-T3", second_draft_status)
+        (tmp_path / "BACKLOG.md").write_text(
+            "# Backlog\n\n"
+            "## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked | Declined |\n"
+            "|------|-------|------|-------------|----------|---------|----------|\n"
+            "| E0 | Ex | 0 | 0 | 1 | 1 | 0 |\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0 | Ex | Epic | in-queue | None | r | `backlog/E0.md` |\n"
+            "| E0-F1-S1-T1 | Src | Task | blocked | None | r | "
+            "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n"
+            "| E0-F1-S1-T2 | Dep1 | Task | in-queue | None | r | "
+            "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T2.md` |\n"
+            f"| E0-F1-S1-T3 | Dep2 | Task | {second_draft_status} | None | r | "
+            "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T3.md` |\n"
+        )
+        (backlog_dir / "E0.md").write_text("# E0: Ex\n\n## Status: in-queue\n")
+        # Seed a proposal JSON so _find_originating_source_task resolves T2's source.
+        (tmp_path / PROPOSAL_DIR_NAME).mkdir(parents=True, exist_ok=True)
+        write_proposal(
+            tmp_path,
+            Proposal(
+                source_task_id="E0-F1-S1-T1",
+                generated_at="2026-04-19T00:00:00Z",
+                rejection_reason="scope",
+                proposed_tasks=[
+                    ProposedTask(
+                        suggested_id="E0-F1-S1-T2",
+                        title="Dep1",
+                        files_to_own=["src/a.py"],
+                        linked_scenarios=["SC-01"],
+                        suggested_acs=["AC-001 fix"],
+                        suggested_approach=(
+                            "Context: unit test fixture. Scope: a. "
+                            "TDD: 1 RED 2 GREEN 3 REFACTOR no-op. "
+                            "Verify: make lint && make test-unit all exit zero."
+                        ),
+                    ),
+                    ProposedTask(
+                        suggested_id="E0-F1-S1-T3",
+                        title="Dep2",
+                        files_to_own=["src/b.py"],
+                        linked_scenarios=["SC-02"],
+                        suggested_acs=["AC-002 fix"],
+                        suggested_approach=(
+                            "Context: unit test fixture. Scope: b. "
+                            "TDD: 1 RED 2 GREEN 3 REFACTOR no-op. "
+                            "Verify: make lint && make test-unit all exit zero."
+                        ),
+                    ),
+                ],
+            ),
+        )
+        return tmp_path, source_file
+
+    def test_rejecting_draft_strips_marker_and_cascade_fires(self, tmp_path: Path) -> None:
+        """T3 is already done; reject T2 -> cascade sees T1's remaining markers all terminal -> requeue."""
+        from devbench.backlog.proposal import reject_proposal
+
+        workspace, source_file = self._workspace_with_marker(tmp_path, second_draft_status="done")
+
+        reject_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            task_id="E0-F1-S1-T2",
+            reason="redundant",
+        )
+
+        updated = source_file.read_text()
+        # T2 marker stripped.
+        assert "[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2" not in updated
+        # T3 marker preserved.
+        assert "[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T3" in updated
+        # Cascade fired: source auto-flipped because remaining marker (T3) is terminal.
+        assert "## Status: in-queue" in updated
+        assert "[AUTO_UNBLOCKED]" in updated
+
+    def test_rejecting_draft_when_other_marker_still_active_keeps_blocked(self, tmp_path: Path) -> None:
+        """T3 is still in-queue (non-terminal); reject T2 -> cascade abstains."""
+        from devbench.backlog.proposal import reject_proposal
+
+        workspace, source_file = self._workspace_with_marker(tmp_path, second_draft_status="in-queue")
+
+        reject_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            task_id="E0-F1-S1-T2",
+            reason="redundant",
+        )
+
+        updated = source_file.read_text()
+        assert "[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2" not in updated
+        assert "[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T3" in updated
+        # T3 still non-terminal -> source stays blocked.
+        assert "## Status: blocked" in updated
+        assert "[AUTO_UNBLOCKED]" not in updated
+
+    def test_strip_marker_on_source_with_no_matching_marker_is_noop(self, tmp_path: Path) -> None:
+        """Calling reject for a task whose marker was never on the source is safe."""
+        from devbench.backlog.proposal import _strip_pending_proposal_marker
+
+        source_file = tmp_path / "src.md"
+        original = "# x\n\n## Comments\n\n[some comment]\n"
+        source_file.write_text(original)
+        _strip_pending_proposal_marker(source_file, "E0-F1-S1-T99")
+        assert source_file.read_text() == original

@@ -5,17 +5,17 @@ comments, backlog validation, and traceability logging.
 
 Public API
 ----------
-``force_status``              — write any status to both files with no gate
+``force_status``              -- write any status to both files with no gate
                                 checks.  Use for automated lifecycle transitions
                                 (in-progress, in-review) and manual recovery.
-``mark_done``                 — gated completion: verifies all required review
+``mark_done``                 -- gated completion: verifies all required review
                                 judges passed before writing ``done``.
-``mark_blocked``              — writes ``blocked`` and appends a reason comment.
-``validate``                  — returns integrity errors (missing files, status
+``mark_blocked``              -- writes ``blocked`` and appends a reason comment.
+``validate``                  -- returns integrity errors (missing files, status
                                 drift, orphans, broken deps, summary mismatch).
-``log_to_traceability_matrix``— appends a spec/test mapping entry to the
+``log_to_traceability_matrix``-- appends a spec/test mapping entry to the
                                 traceability matrix file.
-``_append_tdd_entry``         — appends a timestamped TDD phase entry to the
+``_append_tdd_entry``         -- appends a timestamped TDD phase entry to the
                                 ``## TDD Cycle Log`` section of a work-unit file.
 
 Constructor
@@ -68,6 +68,16 @@ from devbench.constants import (
 # module level so tests can import and assert the exact set.
 _TERMINAL_CHILD_STATUSES: frozenset[str] = frozenset({STATUS_DONE, STATUS_DECLINED})
 
+# Marker written by ``promote-proposal`` to the source task's Comments section
+# whenever a proposed draft is wired as a dependency. The auto-requeue scan
+# (``_auto_requeue_marker_dependents``) reads these to discriminate blocks
+# caused by a promoted proposal chain (auto-recoverable) from blocks caused by
+# review failures, git-ops errors, or operator decisions (stay manual). The
+# regex captures the target task ID in group 1; the scan is scoped to the
+# Comments section so markers quoted in Description/Approach text cannot
+# trigger the cascade.
+_BLOCKED_PENDING_PROPOSAL_RE: re.Pattern[str] = re.compile(r"\[BLOCKED_PENDING_PROPOSAL\]\s+(\S+)")
+
 
 class BacklogManager:
     """Owns backlog lifecycle: status writes, done-gate checks, rollups, comments, and validation."""
@@ -93,7 +103,7 @@ class BacklogManager:
         Use this for automated lifecycle transitions (``in-progress``,
         ``in-review``) and for manual recovery overrides where the done-gate
         would incorrectly block a legitimate repair.  Prefer ``mark_done``
-        for agent-driven completion — it enforces that all judges have passed.
+        for agent-driven completion -- it enforces that all judges have passed.
 
         Args:
             work_unit_path: Path to the work-unit ``.md`` file.
@@ -219,7 +229,7 @@ class BacklogManager:
             indexed_files.add(wu_path.resolve())
 
             if not wu_path.exists():
-                errors.append(f"{row_id}: work unit file missing — expected {file_path_str}")
+                errors.append(f"{row_id}: work unit file missing -- expected {file_path_str}")
                 continue
 
             content = wu_path.read_text(encoding="utf-8")
@@ -227,7 +237,7 @@ class BacklogManager:
             if m:
                 file_status = m.group(1).strip().lower()
                 if file_status != index_status:
-                    errors.append(f"{row_id}: status mismatch — index has '{index_status}', file has '{file_status}'")
+                    errors.append(f"{row_id}: status mismatch -- index has '{index_status}', file has '{file_status}'")
             else:
                 errors.append(f"{row_id}: work unit file missing '## Status:' line")
         return indexed_files
@@ -329,6 +339,10 @@ class BacklogManager:
         )
 
         if canonical == STATUS_DONE:
+            # Auto-requeue reverse-dependents first so the rollup check that
+            # follows sees any freshly-unblocked children as non-terminal and
+            # correctly declines to promote the parent to done.
+            self._auto_requeue_marker_dependents(backlog_index, unit_id)
             self._rollup_parent_status(backlog_index, unit_id)
 
     def _last_round_all_passed(self, work_unit_path: Path) -> bool:
@@ -356,7 +370,7 @@ class BacklogManager:
         """If all children of the parent unit are Done, mark the parent Done too.
 
         Derives the parent ID by removing the last segment (e.g. E0-F1-S1-T1 → E0-F1-S1).
-        Calls ``_set_status`` directly (bypassing the done-gate — parent units are
+        Calls ``_set_status`` directly (bypassing the done-gate -- parent units are
         structurally done when all children are done, no judge review required).
         Cascades upward by recursing through ``_set_status`` → ``_rollup_parent_status``.
         """
@@ -372,10 +386,10 @@ class BacklogManager:
 
         parent_file = self._find_work_unit_file(rows, parent_id, backlog_index.parent)
         if parent_file is None:
-            self.logger.warning("Could not find file for parent %s — skipping rollup", parent_id)
+            self.logger.warning("Could not find file for parent %s -- skipping rollup", parent_id)
             return
 
-        self.logger.info("All children of %s are done — rolling up status", parent_id)
+        self.logger.info("All children of %s are done -- rolling up status", parent_id)
         # _set_status: atomic write to both files; cascades via _rollup_parent_status.
         self._set_status(parent_file, backlog_index, parent_id, STATUS_DONE)
 
@@ -392,6 +406,145 @@ class BacklogManager:
         else:
             content = content.rstrip("\n") + "\n\n" + COMMENTS_SECTION_HEADER + "\n\n" + rollup_comment
         parent_file.write_text(content, encoding="utf-8")
+
+    def _extract_pending_proposal_markers(self, work_unit_path: Path) -> set[str]:
+        """Return the set of task IDs flagged by ``[BLOCKED_PENDING_PROPOSAL]`` markers.
+
+        Scans only the ``## Comments`` body of ``work_unit_path`` so marker
+        text quoted in Description, Approach, or other narrative sections
+        cannot trigger the auto-requeue cascade. Returns an empty set when
+        the file is missing, has no Comments section, or carries no markers.
+
+        Args:
+            work_unit_path: Path to the work-unit ``.md`` file.
+
+        Returns:
+            Set of promoted-dependency task IDs that the source task is
+            currently waiting on.
+        """
+        if not work_unit_path.exists():
+            return set()
+        content = work_unit_path.read_text(encoding="utf-8")
+        sections = self._extract_sections(content)
+        comments = sections.get("Comments", "")
+        return set(_BLOCKED_PENDING_PROPOSAL_RE.findall(comments))
+
+    def _auto_requeue_marker_dependents(self, backlog_index: Path, newly_done_id: str) -> None:
+        """Auto-requeue any blocked task whose promoted proposals are now all terminal.
+
+        Symmetric counterpart to :meth:`_rollup_parent_status`: both fire
+        from ``_set_status`` when a task transitions to ``done``; the rollup
+        cascades upward (child done -> parent done), this cascade runs
+        sideways (dep done -> blocked dependent requeued).
+
+        Narrow trigger. A blocked candidate is auto-requeued only when ALL
+        of the following hold:
+
+        1. Its status is ``blocked`` (non-blocked candidates are skipped).
+        2. The just-completed task (``newly_done_id``) appears in the
+           candidate's declared Dependencies table.
+        3. The candidate's Comments section carries at least one
+           ``[BLOCKED_PENDING_PROPOSAL]`` marker.
+        4. Every task ID named by those markers is in a terminal state
+           (``done`` or ``declined``). Unknown IDs (e.g. rejected proposals
+           no longer in the index) count as non-terminal so the cascade
+           stays conservative.
+
+        Tasks that block for other reasons (review failure, git-ops error,
+        operator intervention) never carry the marker and stay manual. The
+        transition uses :meth:`force_status` and writes an ``[AUTO_UNBLOCKED]``
+        audit comment naming every marker ID.
+
+        The scan operates directly on ``_parse_backlog_rows`` output (the
+        same lightweight tuple-based view ``_rollup_parent_status`` uses)
+        rather than the full ``BacklogParser.parse_index`` object model,
+        because the latter validates every file in the index exists and a
+        single missing sibling file would otherwise abort the whole scan.
+
+        Args:
+            backlog_index: Path to ``BACKLOG.md``.
+            newly_done_id: The task that just transitioned to ``done``.
+        """
+        try:
+            rows = self._parse_backlog_rows(backlog_index)
+        except FileNotFoundError as exc:
+            self.logger.warning("Auto-requeue scan skipped -- %s", exc)
+            return
+
+        terminal_ids = {row_id for row_id, status, _ in rows if row_id and status in _TERMINAL_CHILD_STATUSES}
+        workspace = backlog_index.parent
+
+        for row_id, status, file_path in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if status != STATUS_BLOCKED:
+                continue
+            if not file_path:
+                continue
+            candidate_file = workspace / file_path
+            if not candidate_file.exists():
+                self.logger.warning(
+                    "Auto-requeue scan: candidate file missing for %s at %s -- skipping",
+                    row_id,
+                    candidate_file,
+                )
+                continue
+
+            # Must be a declared dep. Parse inline from the file content so
+            # the scan never depends on the full index being loadable.
+            content = candidate_file.read_text(encoding="utf-8")
+            if newly_done_id not in self._parse_candidate_dependencies(content):
+                continue
+
+            marker_ids = self._extract_pending_proposal_markers(candidate_file)
+            if not marker_ids:
+                continue
+            if not marker_ids.issubset(terminal_ids):
+                continue
+
+            sorted_markers = sorted(marker_ids)
+            self.logger.info(
+                "Auto-requeuing %s -- promoted proposals %s are terminal",
+                row_id,
+                sorted_markers,
+            )
+            self.force_status(candidate_file, backlog_index, row_id, STATUS_IN_QUEUE)
+            self._append_agent_comment(
+                candidate_file,
+                "backlog_manager",
+                f"[AUTO_UNBLOCKED] promoted proposals {sorted_markers} are terminal; re-queuing",
+            )
+
+    @staticmethod
+    def _parse_candidate_dependencies(content: str) -> list[str]:
+        """Extract declared dependency task IDs from a work-unit file's content.
+
+        Scoped to the ``## Dependencies`` section body. Header rows
+        (``| ID | Title | Status |``), separator rows (``|----|...``), and
+        the ``| none | | |`` sentinel are all filtered out. Mirrors the
+        parser's ``_parse_dependency_table`` but works on already-loaded
+        content and does not require instantiating a full parser.
+        """
+        deps: list[str] = []
+        in_deps_section = False
+        for raw_line in content.splitlines():
+            stripped = raw_line.strip()
+            if stripped.startswith("## "):
+                in_deps_section = stripped == "## Dependencies"
+                continue
+            if not in_deps_section or not stripped.startswith("|"):
+                continue
+            cells = [c.strip() for c in stripped.split("|")]
+            if len(cells) < 4:
+                continue
+            first = cells[1]
+            if not first:
+                continue
+            lowered = first.lower()
+            if lowered == "id" or lowered in DEPENDENCY_NONE_VALUES or first.startswith("-"):
+                continue
+            deps.append(first)
+        return deps
 
     def _parse_backlog_rows(self, backlog_index: Path) -> list[tuple[str, str, str]]:
         """Parse BACKLOG.md table rows into (id, status, file_path) tuples."""
@@ -556,11 +709,11 @@ class BacklogManager:
     def _append_tdd_entry(self, work_unit_path: Path, phase: str, message: str) -> None:
         """Append a TDD phase entry to the TDD Cycle Log section of a work-unit file.
 
-        Writes: ``- [<PHASE>] <ISO-8601 timestamp> — <message>``
+        Writes: ``- [<PHASE>] <ISO-8601 timestamp> -- <message>``
 
         Args:
             work_unit_path: Path to the work-unit ``.md`` file.
-            phase: TDD phase — must be one of ``RED``, ``GREEN``, or ``REFACTOR``
+            phase: TDD phase -- must be one of ``RED``, ``GREEN``, or ``REFACTOR``
                 (caller must pass normalized uppercase value).
             message: Description of the TDD phase outcome.
 
@@ -590,7 +743,7 @@ class BacklogManager:
 
         An epic row is identified as any row whose ID matches the pattern
         ``E<digits>`` (no hyphen suffix). Counts are computed over all descendant
-        rows — rows whose ID starts with ``<epic-id>-``.
+        rows -- rows whose ID starts with ``<epic-id>-``.
         """
         rows = self._parse_backlog_rows(backlog_index)
         epic_titles = self._parse_epic_titles(backlog_index)
@@ -707,7 +860,7 @@ class BacklogManager:
 
         if STATUS_SUMMARY_SECTION_HEADER not in content:
             errors.append(
-                "Status Summary section missing from BACKLOG.md — run 'devbench validate-backlog' to regenerate it"
+                "Status Summary section missing from BACKLOG.md -- run 'devbench validate-backlog' to regenerate it"
             )
             return
 

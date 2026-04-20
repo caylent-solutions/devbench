@@ -200,7 +200,7 @@ TDD_ENTRY_TEMPLATE: str = "- [{phase}] {timestamp} -- {message}\n"
 VALID_TDD_PHASES: frozenset[str] = frozenset({"RED", "GREEN", "REFACTOR"})
 
 # ---------------------------------------------------------------------------
-# Epic ID regex — matches top-level epic IDs such as "E200", "E1", etc.
+# Epic ID regex -- matches top-level epic IDs such as "E200", "E1", etc.
 # A row is an epic row when its ID is exactly E<digits> with no hyphen suffix.
 # ---------------------------------------------------------------------------
 EPIC_ID_RE = re.compile(r"^E\d+$")
@@ -238,7 +238,7 @@ DEFAULT_RECENT_PACE_TASKS: int = 10
 
 # Whitespace columns between the two side-by-side tables rendered by
 # `devbench report` (Backlog state on left, Window stats on right). Pure
-# rendering affordance — kept as a constant so the gap is consistent and
+# rendering affordance -- kept as a constant so the gap is consistent and
 # editable from one place.
 SIDE_BY_SIDE_GAP_CHARS: int = 4
 

@@ -149,7 +149,7 @@ class TestCommitAndPush:
     # ------------------------------------------------------------------
 
     def test_commit_and_push_does_not_call_git_checkout(self, tmp_path: Path) -> None:
-        """commit_and_push never calls git checkout — branch setup is ensure_branch's job. AC-2"""
+        """commit_and_push never calls git checkout -- branch setup is ensure_branch's job. AC-2"""
         judge = GitOpsJudge()
         git_calls: list[list[str]] = []
 

@@ -17,7 +17,7 @@ Commands::
     status                  Show backlog summary (counts by status)
     next                    Print the next actionable work unit ID and title
     claim <id>              Claim a work unit (transition to in-progress)
-    set-status <id> <s>     Force any status (no gate — use for recovery/lifecycle transitions)
+    set-status <id> <s>     Force any status (no gate -- use for recovery/lifecycle transitions)
     mark-done <id>          Mark unit as Done (enforces done-gate: all judges must have passed)
     decline <id> --reason M Mark unit Declined (won't ever be done); captures the rationale
     validate-backlog        Check backlog integrity (file existence, status sync, orphans, deps, summary)
@@ -64,7 +64,7 @@ from pathlib import Path
 # Resolved once at import time so each watch tick doesn't re-PATH-search.
 # Used by `cmd_report --watch` to clear both the viewport AND the scrollback
 # between frames. The fallback escape sequence ``\033c`` is the VT100 RIS
-# (Reset to Initial State) — works on every modern terminal but is more
+# (Reset to Initial State) -- works on every modern terminal but is more
 # disruptive (resets colors). Prefer the OS clear binary when available.
 _TERMINAL_CLEAR_CMD: str | None = shutil.which("clear") or shutil.which("cls")
 
@@ -95,6 +95,8 @@ from devbench.backlog.manager import BacklogManager
 from devbench.backlog.parser import BacklogParser
 from devbench.backlog.proposal import (
     ProposalError,
+    ProposalTaskState,
+    classify_proposed_task,
     list_proposals,
     materialise_proposal,
     promote_all_from_source,
@@ -148,22 +150,28 @@ def cmd_status() -> int:
         counts[key] = counts.get(key, 0) + 1
 
     total = len(units)
+    # Count un-materialised proposed tasks -- proposal JSONs on disk whose
+    # suggested_id values have no backlog row yet. These sit outside the
+    # parser's view (which only sees BACKLOG.md rows) and would otherwise
+    # be invisible until the operator explicitly ran ``list-proposals``.
+    unmaterialised_count = _count_unmaterialised_proposed_tasks()
     print("Backlog Status Summary")
     print("=" * STATUS_SEPARATOR_WIDTH)
     for status_val in DISPLAY_STATUS_VALUES:
         count = counts.get(status_val.lower(), 0)
         print(f"  {status_val:<15} {count:>4}")
+    print(f"  {'Un-materialised':<15} {unmaterialised_count:>4}")
     print(f"  {'TOTAL':<15} {total:>4}")
 
     active = [u for u in units if u.status in (WorkUnitStatus.IN_PROGRESS, WorkUnitStatus.IN_REVIEW)]
     if active:
         print("\nActive work units:")
         for u in active:
-            print(f"  [{u.status.value}] {u.id} — {u.title}")
+            print(f"  [{u.status.value}] {u.id} -- {u.title}")
 
     actionable = parser.get_parallel_candidates(units)
     if actionable:
-        print(f"\nNext actionable: {actionable[0].id} — {actionable[0].title}")
+        print(f"\nNext actionable: {actionable[0].id} -- {actionable[0].title}")
     elif parser.all_done(units):
         print("\nAll work units are DONE.")
     else:
@@ -618,7 +626,7 @@ def _reject_em_dash(field_name: str, text: str) -> int | None:
 
     The validate-backlog Check 10 rejects work-unit files containing em-dash,
     so any CLI writer that accepts free-form agent text must reject em-dash at
-    the input boundary — otherwise LLM-written verdict feedback (which naturally
+    the input boundary -- otherwise LLM-written verdict feedback (which naturally
     uses em-dashes) poisons the file and blocks the next validate-backlog run.
 
     Returns:
@@ -1299,6 +1307,94 @@ def cmd_reject_amendment(unit_id: str, rejection_reason: str) -> int:
     return 0
 
 
+def cmd_sweep_proposals() -> int:
+    """Best-effort materialisation of every un-materialised proposal JSON.
+
+    Walks ``<workspace>/.devbench/proposals/*.json`` and for each JSON whose
+    ``proposed_tasks`` include at least one id in ``UNMATERIALISED`` state,
+    attempts ``materialise_proposal``. The per-proposal call can still be
+    refused by task-factory's "skip when prior unresolved proposed tasks
+    exist" safety guard (which raises ``ProposalError``) -- the sweep logs
+    that outcome and continues to the next proposal. The sweep is invoked
+    at orchestrate loop start so stale JSONs don't remain invisible.
+
+    Prints one line per proposal with the outcome:
+
+    - ``materialised <source-id>: N tasks``  -- drafts successfully created.
+    - ``skipped <source-id>: <reason>``      -- safety guard or other
+                                                ProposalError fired.
+    - ``no-op <source-id>``                  -- every task in this proposal
+                                                is already materialised.
+
+    Prints ``nothing to do`` and returns 0 when no proposal JSONs exist or
+    nothing needed materialising. Never returns non-zero for per-proposal
+    refusals; a refused proposal is a soft state the operator resolves via
+    promote-proposal / reject-proposal.
+    """
+    proposals = list_proposals(WORKSPACE_ROOT)
+    if not proposals:
+        print("sweep-proposals: nothing to do (no proposal JSONs on disk)")
+        return 0
+
+    # Resolve source-task repo once for the whole sweep -- read index here
+    # rather than per-proposal so the sweep runs with O(1) index parses.
+    try:
+        parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+        units = parser.parse_index()
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"ERROR: cannot read backlog index: {exc}", file=sys.stderr)
+        return 1
+    unit_by_id = {u.id: u for u in units}
+
+    touched = 0
+    for proposal in proposals:
+        # Pre-classify so we can (a) take a fast-path no-op when every task
+        # is already resolved, without even touching the backlog parser,
+        # and (b) report "N new, M skipped" accurately.
+        # materialise_proposal itself is idempotent and classify-aware
+        # (ADR-09), so calling it unconditionally is safe.
+        pre_states = {
+            task.suggested_id: classify_proposed_task(BACKLOG_ROOT, WORKSPACE_ROOT, task.suggested_id)
+            for task in proposal.proposed_tasks
+        }
+        unmaterialised_before = sum(1 for state in pre_states.values() if state is ProposalTaskState.UNMATERIALISED)
+
+        if unmaterialised_before == 0:
+            # Every task in this proposal is already in a terminal-for-
+            # materialise state. Nothing for the sweep to do.
+            print(f"sweep-proposals: no-op {proposal.source_task_id}")
+            continue
+
+        source_unit = unit_by_id.get(proposal.source_task_id)
+        if source_unit is None:
+            print(
+                f"sweep-proposals: skipped {proposal.source_task_id}: source not found in backlog index",
+                file=sys.stderr,
+            )
+            continue
+
+        try:
+            drafts = materialise_proposal(
+                workspace_root=WORKSPACE_ROOT,
+                backlog_root=BACKLOG_ROOT,
+                backlog_index=BACKLOG_INDEX,
+                proposal=proposal,
+                repo=source_unit.repo,
+            )
+        except ProposalError as exc:
+            # Soft failure: safety guard (unresolved prior proposed tasks),
+            # thin-approach refusal, etc. Log and continue.
+            print(f"sweep-proposals: skipped {proposal.source_task_id}: {exc}")
+            continue
+
+        skipped_count = len(proposal.proposed_tasks) - len(drafts)
+        touched += len(drafts)
+        print(f"sweep-proposals: materialised {proposal.source_task_id}: {len(drafts)} new, {skipped_count} skipped")
+
+    logger.info("sweep-proposals touched %d draft(s) across %d proposal(s)", touched, len(proposals))
+    return 0
+
+
 def cmd_materialise_proposal(source_task_id: str) -> int:
     """Materialise a pending proposal into draft work-unit files.
 
@@ -1326,6 +1422,14 @@ def cmd_materialise_proposal(source_task_id: str) -> int:
         print(f"ERROR: source task {source_task_id} not found in backlog", file=sys.stderr)
         return 1
 
+    # Pre-classify each proposed task so the CLI output can distinguish
+    # "skipped because already resolved" from "materialised just now".
+    # materialise_proposal itself logs the same skip rationale at INFO.
+    pre_states = {
+        task.suggested_id: classify_proposed_task(BACKLOG_ROOT, WORKSPACE_ROOT, task.suggested_id)
+        for task in proposal.proposed_tasks
+    }
+
     try:
         drafts = materialise_proposal(
             workspace_root=WORKSPACE_ROOT,
@@ -1337,12 +1441,19 @@ def cmd_materialise_proposal(source_task_id: str) -> int:
     except ProposalError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-    logger.info("Materialised %d proposed task(s) from %s", len(drafts), source_task_id)
+    skipped = {tid: state.value for tid, state in pre_states.items() if state is not ProposalTaskState.UNMATERIALISED}
+    logger.info(
+        "Materialised %d proposed task(s) from %s (skipped %d)",
+        len(drafts),
+        source_task_id,
+        len(skipped),
+    )
     print(
         json.dumps(
             {
                 "source_task_id": source_task_id,
                 "materialised": [str(p) for p in drafts],
+                "skipped": skipped,
             }
         )
     )
@@ -1391,10 +1502,13 @@ def cmd_write_proposal(source_task_id: str) -> int:
 
 
 def cmd_list_proposals() -> int:
-    """Print every pending task-factory proposal grouped by source task.
+    """Print every pending task-factory proposal with per-task lifecycle labels.
 
     Output is a short human-readable listing with one line per proposed
-    task, suitable for quick human review. For machine parsing, read
+    task. Each line is prefixed with a state label so the operator can
+    distinguish un-materialised entries (JSON-only, no draft yet) from
+    proposed drafts, promoted / done / declined drafts, and archived
+    rejections. For machine parsing, read
     ``<workspace>/.devbench/proposals/<source-id>.json`` directly.
     """
     proposals = list_proposals(WORKSPACE_ROOT)
@@ -1405,11 +1519,37 @@ def cmd_list_proposals() -> int:
     print(f"Pending proposals ({total}):")
     for proposal in proposals:
         for task in proposal.proposed_tasks:
+            state = classify_proposed_task(BACKLOG_ROOT, WORKSPACE_ROOT, task.suggested_id)
+            label = f"[{state.value}]".ljust(_PROPOSAL_STATE_LABEL_WIDTH)
             print(
-                f"  {task.suggested_id}  {task.title}  "
+                f"  {label} {task.suggested_id}  {task.title}  "
                 f"(from {proposal.source_task_id}, generated {proposal.generated_at})"
             )
     return 0
+
+
+# Width pre-computed from the longest ProposalTaskState value
+# ("unmaterialised" -> 14 chars + surrounding brackets). Updating the enum
+# triggers the test in ``tests/test_cli.py::TestCmdListProposals`` that pins
+# alignment.
+_PROPOSAL_STATE_LABEL_WIDTH = max(len(s.value) for s in ProposalTaskState) + 2
+
+
+def _count_unmaterialised_proposed_tasks() -> int:
+    """Return the count of proposal JSON entries that have no draft .md yet.
+
+    A single JSON may contribute multiple un-materialised tasks; each
+    ``proposed_tasks[].suggested_id`` is classified independently. Used
+    by ``cmd_status`` to surface the count next to the other lifecycle
+    totals.
+    """
+    count = 0
+    for proposal in list_proposals(WORKSPACE_ROOT):
+        for task in proposal.proposed_tasks:
+            state = classify_proposed_task(BACKLOG_ROOT, WORKSPACE_ROOT, task.suggested_id)
+            if state is ProposalTaskState.UNMATERIALISED:
+                count += 1
+    return count
 
 
 def cmd_promote_proposal(first_arg: str, second_arg: str = "") -> int:
@@ -1475,39 +1615,21 @@ def _run_promote_all(source_task_id: str) -> int:
 
 
 def cmd_reject_proposal(*argv: str) -> int:
-    """Archive a proposed task's draft and remove its BACKLOG.md row.
+    """Archive a proposed task's draft or a whole un-materialised proposal JSON.
 
     Usage::
 
-        reject-proposal <id> --reason "<message>"
+        reject-proposal <task-id> --reason "<message>"
+        reject-proposal --unmaterialised <source-task-id> --reason "<message>"
 
-    The ``--reason`` is required because rejection is destructive. The
-    draft file is moved to ``<workspace>/.devbench/rejected-proposals/<id>-<timestamp>.md``
-    and a ``[PROPOSAL_REJECTED]`` audit comment is appended to the source
-    task.
+    See ``_parse_reject_proposal_argv`` for the full form / flag contract.
     """
-    task_id = ""
-    reason = ""
-    i = 0
-    args = list(argv)
-    while i < len(args):
-        arg = args[i]
-        if not arg:
-            i += 1
-            continue
-        if arg == "--reason":
-            if i + 1 >= len(args) or not args[i + 1]:
-                print("ERROR: --reason requires a value", file=sys.stderr)
-                return 1
-            reason = args[i + 1]
-            i += 2
-            continue
-        if not task_id:
-            task_id = arg
-        i += 1
-    if not task_id or not reason:
-        print("ERROR: reject-proposal requires <id> --reason <message>", file=sys.stderr)
+    try:
+        task_id, unmaterialised_source_id, reason = _parse_reject_proposal_argv(argv)
+    except _RejectProposalArgError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
         return 1
+
     rc = _reject_em_dash("reason", reason)
     if rc is not None:
         return rc
@@ -1518,14 +1640,90 @@ def cmd_reject_proposal(*argv: str) -> int:
             backlog_root=BACKLOG_ROOT,
             backlog_index=BACKLOG_INDEX,
             task_id=task_id,
+            unmaterialised_source_id=unmaterialised_source_id,
             reason=reason,
         )
     except ProposalError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-    logger.info("Rejected proposal %s", task_id)
-    print(json.dumps({"task_id": task_id, "status": "rejected", "archive": str(archive) if archive else None}))
+
+    _print_reject_proposal_outcome(task_id, unmaterialised_source_id, archive)
     return 0
+
+
+class _RejectProposalArgError(ValueError):
+    """Raised by ``_parse_reject_proposal_argv`` on invalid / missing / conflicting flags."""
+
+
+def _parse_reject_proposal_argv(argv: tuple[str, ...]) -> tuple[str, str, str]:
+    """Parse the reject-proposal flag grammar.
+
+    Returns ``(task_id, unmaterialised_source_id, reason)``. Exactly one of
+    the first two is non-empty; ``reason`` is always non-empty. Raises
+    ``_RejectProposalArgError`` on:
+
+    - unknown flags
+    - ``--reason`` or ``--unmaterialised`` without a value
+    - both ``<task-id>`` and ``--unmaterialised`` supplied
+    - neither supplied
+    - missing ``--reason``
+    """
+    task_id = ""
+    unmaterialised_source_id = ""
+    reason = ""
+    args = list(argv)
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if not arg:
+            i += 1
+            continue
+        if arg == "--reason":
+            if i + 1 >= len(args) or not args[i + 1]:
+                raise _RejectProposalArgError("--reason requires a value")
+            reason = args[i + 1]
+            i += 2
+            continue
+        if arg == "--unmaterialised":
+            if i + 1 >= len(args) or not args[i + 1] or args[i + 1].startswith("--"):
+                raise _RejectProposalArgError("--unmaterialised requires a source-task-id")
+            unmaterialised_source_id = args[i + 1]
+            i += 2
+            continue
+        if arg.startswith("--"):
+            raise _RejectProposalArgError(f"unknown flag: {arg}")
+        if not task_id:
+            task_id = arg
+        i += 1
+
+    if task_id and unmaterialised_source_id:
+        raise _RejectProposalArgError(
+            "reject-proposal: supply exactly one of <task-id> or --unmaterialised <source-id>, not both"
+        )
+    if not task_id and not unmaterialised_source_id:
+        raise _RejectProposalArgError("reject-proposal requires either <task-id> or --unmaterialised <source-id>")
+    if not reason:
+        raise _RejectProposalArgError("reject-proposal requires --reason <message>")
+    return task_id, unmaterialised_source_id, reason
+
+
+def _print_reject_proposal_outcome(task_id: str, unmaterialised_source_id: str, archive: Path | None) -> None:
+    """Print the reject-proposal JSON result + log INFO line."""
+    if unmaterialised_source_id:
+        logger.info("Rejected un-materialised proposal %s", unmaterialised_source_id)
+        payload: dict[str, str | None] = {
+            "source_task_id": unmaterialised_source_id,
+            "status": "rejected-unmaterialised",
+            "archive": str(archive) if archive else None,
+        }
+    else:
+        logger.info("Rejected proposal %s", task_id)
+        payload = {
+            "task_id": task_id,
+            "status": "rejected",
+            "archive": str(archive) if archive else None,
+        }
+    print(json.dumps(payload))
 
 
 def _find_unit(units: list[WorkUnit], unit_id: str) -> WorkUnit | None:
@@ -1574,7 +1772,7 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
     "report": (
         cmd_report,
         0,
-        "Progress report — renders All-time + Current run windows by default: report [--watch N] [since-timestamp]",
+        "Progress report, renders All-time + Current run windows by default: report [--watch N] [since-timestamp]",
     ),
     "start": (cmd_start, 0, "Run orchestrate skill via Agent SDK (non-interactive)"),
     "watch": (
@@ -1587,7 +1785,7 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
         0,
         "Pretty-tail $WORKSPACE_ROOT/hook-logs.jsonl: hook-tail [<path>] [--tz <zone>] [--no-follow] [--from-start]",
     ),
-    # Plugin agent bridge commands — used by devbench plugin agents
+    # Plugin agent bridge commands -- used by devbench plugin agents
     "read-unit": (cmd_read_unit, 1, "Work unit content + repo path as JSON: read-unit [--strip-comments] <id>"),
     "get-diff": (cmd_get_diff, 1, "Return combined git diff for work unit's repo: get-diff <id>"),
     "run-tests": (cmd_run_tests, 1, "Run test suite for work unit's repo: run-tests <id>"),
@@ -1628,6 +1826,11 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
         cmd_materialise_proposal,
         1,
         "Materialise a pending proposal into draft files: materialise-proposal <source-task-id>",
+    ),
+    "sweep-proposals": (
+        cmd_sweep_proposals,
+        0,
+        "Best-effort materialise every pending proposal JSON (fires at orchestrate loop start)",
     ),
     "write-proposal": (
         cmd_write_proposal,

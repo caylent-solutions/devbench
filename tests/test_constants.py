@@ -1,4 +1,4 @@
-"""Tests for constants module — status string constants and VALID_STATUSES."""
+"""Tests for constants module -- status string constants and VALID_STATUSES."""
 
 from __future__ import annotations
 

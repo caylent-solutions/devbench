@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# guard-backlog.sh — PreToolUse hook: block Write/Edit to backlog/ tracking artifacts.
+# guard-backlog.sh -- PreToolUse hook: block Write/Edit to backlog/ tracking artifacts.
 #
 # Receives JSON on stdin with structure:
 #   { "tool_name": "Write"|"Edit", "tool_input": { "file_path": "..." } }
@@ -16,7 +16,7 @@ if [[ -z "$FILE_PATH" ]]; then
   exit 0
 fi
 
-# Block writes to backlog/ directory and BACKLOG.md — managed by orchestrate skill only
+# Block writes to backlog/ directory and BACKLOG.md -- managed by orchestrate skill only
 if [[ "$FILE_PATH" == */backlog/* ]] || [[ "$FILE_PATH" == */BACKLOG.md ]]; then
   echo "guard-backlog: blocked write to backlog tracking artifact: ${FILE_PATH}" >&2
   echo "Fix: backlog/ files and BACKLOG.md are managed exclusively by the orchestrate skill." >&2

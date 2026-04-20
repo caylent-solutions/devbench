@@ -9,7 +9,7 @@ Config value precedence:
 - YAML values override code defaults.  Environment variable overrides are applied
   by ``config.py``, not by this module.
 
-This module is parse/validate only — it does not read environment variables.
+This module is parse/validate only -- it does not read environment variables.
 All env-var-driven defaults for operational parameters (timeouts, limits, model
 identifiers, region) are applied by ``config.py``.  Optional fields in the
 dataclasses default to ``None``; callers are responsible for substituting
@@ -17,22 +17,22 @@ environment-driven values when ``None`` is encountered.
 
 YAML schema::
 
-    repos:                               # required — at least one entry
+    repos:                               # required -- at least one entry
       org/repo:                          # key must be "org/repo" format
-        default_branch: main2            # optional — omit to fall back to origin/HEAD
-        checkout_directory: my-checkout  # optional — relative to JUDGE_WORKSPACE_ROOT
-        merge_strategy: squash           # optional — overrides top-level merge_strategy
+        default_branch: main2            # optional -- omit to fall back to origin/HEAD
+        checkout_directory: my-checkout  # optional -- relative to JUDGE_WORKSPACE_ROOT
+        merge_strategy: squash           # optional -- overrides top-level merge_strategy
 
-    merge_strategy: squash               # optional — default merge strategy for all repos
-    max_executor_retries: <integer>      # optional — max executor retries per work unit on judge failure
-    use_bedrock: false                   # optional — route LLM calls via AWS Bedrock
-    bedrock_region: <aws-region-string>  # optional — AWS region for Bedrock (env var override applied by config.py)
-    judge_model: <model-id>              # optional — model for judge agents (env var override applied by config.py)
-    executor_model: <model-id>           # optional — model for executor agent (env var override applied by config.py)
-    allowed_orgs:                        # optional — permitted GitHub organisations
+    merge_strategy: squash               # optional -- default merge strategy for all repos
+    max_executor_retries: <integer>      # optional -- max executor retries per work unit on judge failure
+    use_bedrock: false                   # optional -- route LLM calls via AWS Bedrock
+    bedrock_region: <aws-region-string>  # optional -- AWS region for Bedrock (env var override applied by config.py)
+    judge_model: <model-id>              # optional -- model for judge agents (env var override applied by config.py)
+    executor_model: <model-id>           # optional -- model for executor agent (env var override applied by config.py)
+    allowed_orgs:                        # optional -- permitted GitHub organisations
       - caylent-solutions
 
-    timeouts:                            # optional — all values in seconds; env var overrides applied by config.py
+    timeouts:                            # optional -- all values in seconds; env var overrides applied by config.py
       gh_api: <integer>
       test: <integer>
       security_fetch: <integer>
@@ -43,14 +43,14 @@ YAML schema::
       orchestrator_poll_interval: <integer>
       github_check: <integer>
 
-    limits:                              # optional — threshold values; env var overrides applied by config.py
+    limits:                              # optional -- threshold values; env var overrides applied by config.py
       alert_summary: <integer>
       output_truncation: <integer>
       llm_evidence_truncation: <integer>
       llm_file_context: <integer>
       llm_file_preview_chars: <integer>
 
-    git_ops:                             # optional — git workflow settings
+    git_ops:                             # optional -- git workflow settings
       update_submodule: false            # set true only when repos are git submodules of a parent repo
 
 Example config file (``backlog/config/devbench.yaml``)::
@@ -329,7 +329,7 @@ def resolve_config_path(
             (value of ``JUDGE_WORKSPACE_ROOT``).
 
     Returns:
-        Resolved config file path.  The path may not exist on disk — callers
+        Resolved config file path.  The path may not exist on disk -- callers
         are responsible for checking existence.
     """
     if explicit_path:
@@ -451,7 +451,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
     if not isinstance(raw, dict):
         raise ValueError(f"Config file '{path}' must be a YAML mapping at the top level, got {type(raw).__name__}.")
 
-    # JSON Schema validation — catches unknown keys, type errors, and enum violations.
+    # JSON Schema validation -- catches unknown keys, type errors, and enum violations.
     try:
         jsonschema.validate(raw, _SCHEMA)
     except jsonschema.ValidationError as exc:
@@ -591,7 +591,7 @@ def get_repo_local_path(repo: str, runtime_config: RuntimeConfig, workspace_root
     1. ``repos.<repo>.checkout_directory`` resolved relative to *workspace_root*.
     2. ``workspace_root / <repo-short-name>`` (the part after the ``/`` in ``org/repo``).
 
-    Pure function — no subprocess calls, no I/O.
+    Pure function -- no subprocess calls, no I/O.
 
     Args:
         repo: Fully-qualified repository name (e.g. ``'org/repo'``).
@@ -611,7 +611,7 @@ def get_repo_local_path(repo: str, runtime_config: RuntimeConfig, workspace_root
 def get_configured_default_branch(repo: str, runtime_config: RuntimeConfig) -> str | None:
     """Return YAML-configured default branch for *repo*, or ``None`` if absent.
 
-    Pure function — no subprocess calls, no I/O.
+    Pure function -- no subprocess calls, no I/O.
 
     Args:
         repo: Fully-qualified repository name (e.g. ``'org/repo'``).

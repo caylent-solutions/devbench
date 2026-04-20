@@ -9,7 +9,7 @@ DevBench supports two LLM backends for judge evaluation. Choose one based on you
 
 ## Option 1: Anthropic API via Claude Code OAuth (default)
 
-Uses your existing Claude Code OAuth credentials — no separate Anthropic API key needed. Requires a Claude Pro or Enterprise subscription.
+Uses your existing Claude Code OAuth credentials -- no separate Anthropic API key needed. Requires a Claude Pro or Enterprise subscription.
 
 ### How It Works
 
@@ -33,9 +33,9 @@ This file contains a `claudeAiOauth` object with an `accessToken` that has the `
 
 ### Requirements
 
-- **Claude Code authenticated** — run `claude` at least once and complete the browser login
-- **Claude Pro or Enterprise subscription** — the OAuth token requires a valid subscription with `user:inference` scope
-- **No ANTHROPIC_API_KEY needed** — the system reads credentials from the file, not from environment variables
+- **Claude Code authenticated** -- run `claude` at least once and complete the browser login
+- **Claude Pro or Enterprise subscription** -- the OAuth token requires a valid subscription with `user:inference` scope
+- **No ANTHROPIC_API_KEY needed** -- the system reads credentials from the file, not from environment variables
 
 ### Configuration
 
@@ -100,13 +100,13 @@ The expected structure is:
 
 Claude Code OAuth tokens have an expiration timestamp embedded in `~/.claude/.credentials.json`. When you launch a Claude Code interactive session (`claude` in the terminal), the Claude Code CLI itself manages token refresh as long as the session is active.
 
-DevBench's `cmd_start()` (the SDK entry point used by `make start`) does **not** run a background token refresher — it reads the credential file at startup and trusts that whoever launched the orchestrator has a valid token. If the token expires mid-run, the next LLM call fails with an API error and the orchestrator stops.
+DevBench's `cmd_start()` (the SDK entry point used by `make start`) does **not** run a background token refresher -- it reads the credential file at startup and trusts that whoever launched the orchestrator has a valid token. If the token expires mid-run, the next LLM call fails with an API error and the orchestrator stops.
 
 To recover: re-authenticate Claude Code (`claude` → complete the browser flow) and restart the orchestrator.
 
 ## Option 2: AWS Bedrock
 
-Uses the Anthropic Bedrock SDK with your AWS credentials. No Claude Code subscription required — billing goes through your AWS account.
+Uses the Anthropic Bedrock SDK with your AWS credentials. No Claude Code subscription required -- billing goes through your AWS account.
 
 ### How It Works
 
@@ -114,9 +114,9 @@ When `JUDGE_USE_BEDROCK=1` is set, DevBench uses `anthropic.AnthropicBedrock` in
 
 ### Requirements
 
-- **AWS credentials configured** — via IAM role, `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, or `~/.aws/credentials`
-- **Bedrock model access enabled** — the configured model must be enabled in your AWS account for the target region
-- **No Claude Code login needed** — authentication is handled entirely through AWS
+- **AWS credentials configured** -- via IAM role, `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, or `~/.aws/credentials`
+- **Bedrock model access enabled** -- the configured model must be enabled in your AWS account for the target region
+- **No Claude Code login needed** -- authentication is handled entirely through AWS
 
 ### Configuration
 
@@ -159,7 +159,7 @@ When `JUDGE_USE_BEDROCK=1`, the Anthropic SDK delegates AWS auth to boto3, which
 4. Container credentials (ECS task role)
 5. Instance metadata (EC2 IAM role)
 
-If you get "Could not resolve credentials," start by running `aws sts get-caller-identity` in the same shell — it uses the same chain and will show you where boto3 is looking.
+If you get "Could not resolve credentials," start by running `aws sts get-caller-identity` in the same shell -- it uses the same chain and will show you where boto3 is looking.
 
 #### "Could not resolve credentials"
 

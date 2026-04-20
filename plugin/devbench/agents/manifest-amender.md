@@ -51,7 +51,7 @@ The following files are operational backlog-tracking artifacts. You may read the
 
 After completing your review, follow this two-phase output protocol.
 
-**Phase 1 -- mandatory execute-and-verify recipe.** Every step below is a REQUIRED Bash tool call in this order. The final step (verification) is load-bearing: if it reports missing side-effects, do NOT proceed to Phase 2 — re-run the preceding step until the filesystem state matches expectations.
+**Phase 1 -- mandatory execute-and-verify recipe.** Every step below is a REQUIRED Bash tool call in this order. The final step (verification) is load-bearing: if it reports missing side-effects, do NOT proceed to Phase 2 -- re-run the preceding step until the filesystem state matches expectations.
 
 **Step A.** Log each finding (FAIL) or key check confirmed (PASS) via log-comment:
 ```
@@ -59,15 +59,15 @@ uv run devbench log-comment manifest_amender $ARGUMENTS "<finding or confirmatio
 ```
 One entry per distinct finding/confirmation. On FAIL be specific: include which of the three semantic questions failed, which file/line motivated the decision, and what the executor would need to change. On PASS name which criteria were verified.
 
-**Step B.** Execute the amendment decision via CLI. This is NOT a reference — the Bash command MUST run.
+**Step B.** Execute the amendment decision via CLI. This is NOT a reference -- the Bash command MUST run.
 
-**Step B.apply** — verdict is `apply` (request is legitimate):
+**Step B.apply** -- verdict is `apply` (request is legitimate):
 ```bash
 uv run devbench apply-amendment $ARGUMENTS
 ```
 `apply-amendment` runs the Layer 3 deterministic post-check (manifest re-parse, em-dash scan, full `validate-backlog`) and atomically rolls back the write if any check fails. If `apply-amendment` exits non-zero, the amendment did not take effect and your Phase-2 verdict MUST be `fail`.
 
-**Step B.reject** — verdict is `reject` (request should be refused). Run the ENTIRE recipe below as a single execution:
+**Step B.reject** -- verdict is `reject` (request should be refused). Run the ENTIRE recipe below as a single execution:
 ```bash
 # 1. Resolve the target repo.
 REPO_PATH=$(uv run devbench read-unit $ARGUMENTS | python3 -c "import sys, json; print(json.load(sys.stdin)['repo_path'])")
@@ -103,7 +103,7 @@ else
 fi
 ```
 
-The `|| true` on the three git commands is intentional: a file can be tracked-and-modified, tracked-and-restored-to-head, or untracked-and-new, and the trio collectively handles all cases without failing the pipeline. Every OTHER step is strict — any non-zero exit aborts the verdict.
+The `|| true` on the three git commands is intentional: a file can be tracked-and-modified, tracked-and-restored-to-head, or untracked-and-new, and the trio collectively handles all cases without failing the pipeline. Every OTHER step is strict -- any non-zero exit aborts the verdict.
 
 **Step C.** Log the final verdict AFTER the verification in Step B reports `ARCHIVE_OK` (for reject) or after `apply-amendment` exits 0 (for apply):
 ```

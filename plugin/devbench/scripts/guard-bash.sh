@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# guard-bash.sh — PreToolUse hook: block destructive bash commands.
+# guard-bash.sh -- PreToolUse hook: block destructive bash commands.
 #
 # Receives JSON on stdin with structure:
 #   { "tool_name": "Bash", "tool_input": { "command": "..." } }

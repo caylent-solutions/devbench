@@ -46,16 +46,16 @@ class TestAllowedRepos:
         importlib.reload(config)
 
     def test_judge_allowed_repos_env_var_has_no_effect(self) -> None:
-        """JUDGE_ALLOWED_REPOS env var is ignored — repos come from YAML only."""
+        """JUDGE_ALLOWED_REPOS env var is ignored -- repos come from YAML only."""
         # Capture the baseline ALLOWED_REPOS before patching.
         baseline = frozenset(config.ALLOWED_REPOS)
         assert len(baseline) > 0, "Baseline ALLOWED_REPOS must be non-empty for this test to be meaningful"
 
         with patch.dict(os.environ, {"JUDGE_ALLOWED_REPOS": "org/repo-a,org/repo-b"}, clear=False):
             importlib.reload(config)
-            # The env var must not alter ALLOWED_REPOS — it must remain the same as baseline.
+            # The env var must not alter ALLOWED_REPOS -- it must remain the same as baseline.
             assert baseline == config.ALLOWED_REPOS, (
-                f"ALLOWED_REPOS changed after setting JUDGE_ALLOWED_REPOS — "
+                f"ALLOWED_REPOS changed after setting JUDGE_ALLOWED_REPOS -- "
                 f"it must only come from YAML. Before: {baseline}, After: {config.ALLOWED_REPOS}"
             )
 
@@ -66,7 +66,7 @@ class TestAllowedRepos:
         Given: a repo name that is in ALLOWED_REPOS
         When: validate_repo is called
         Then: it completes without raising, and ALLOWED_REPOS still contains the repo
-              (state is unchanged — validate_repo is a pure validator with no side effects)
+              (state is unchanged -- validate_repo is a pure validator with no side effects)
         """
         repo = next(iter(ALLOWED_REPOS))
         assert repo in ALLOWED_REPOS, f"Precondition failed: '{repo}' should be in ALLOWED_REPOS"
@@ -289,7 +289,7 @@ class TestConfigOverrides:
         importlib.reload(config)
 
     def test_judge_backlog_root_env_var_has_no_effect(self, tmp_path: Path) -> None:
-        """JUDGE_BACKLOG_ROOT env var is ignored — path derived from JUDGE_WORKSPACE_ROOT."""
+        """JUDGE_BACKLOG_ROOT env var is ignored -- path derived from JUDGE_WORKSPACE_ROOT."""
         from devbench.constants import BACKLOG_SUBDIR
 
         custom_root = tmp_path / "custom-backlog"
@@ -302,7 +302,7 @@ class TestConfigOverrides:
         importlib.reload(config)
 
     def test_judge_backlog_index_env_var_has_no_effect(self, tmp_path: Path) -> None:
-        """JUDGE_BACKLOG_INDEX env var is ignored — path derived from JUDGE_WORKSPACE_ROOT."""
+        """JUDGE_BACKLOG_INDEX env var is ignored -- path derived from JUDGE_WORKSPACE_ROOT."""
         custom_index = tmp_path / "CUSTOM_BACKLOG.md"
         with patch.dict(os.environ, {"JUDGE_BACKLOG_INDEX": str(custom_index)}, clear=False):
             importlib.reload(config)
@@ -407,7 +407,7 @@ class TestMaxRetriesYamlFirst:
         env_copy = {k: v for k, v in os.environ.items() if k != "JUDGE_MAX_RETRIES"}
         with patch.dict(os.environ, env_copy, clear=True):
             importlib.reload(config)
-            # Value should come from YAML or default — it should be an int > 0
+            # Value should come from YAML or default -- it should be an int > 0
             assert isinstance(config.MAX_RETRY_ATTEMPTS, int)
             assert config.MAX_RETRY_ATTEMPTS > 0
         importlib.reload(config)

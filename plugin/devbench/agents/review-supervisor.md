@@ -26,43 +26,87 @@ Each `.md` file in `plugin/devbench/agents/review_team/` is a reviewer. Read the
 
 ## Step 2: Invoke All Reviewers in Parallel
 
-In a **single response**, invoke all discovered reviewers using the Agent tool — one Agent tool call per reviewer. Pass `$ARGUMENTS` (the work unit ID) to each. Do not invoke them sequentially; all calls must appear in the same response so they run in parallel.
+In a **single response**, invoke all discovered reviewers using the Agent tool -- one Agent tool call per reviewer. Pass `$ARGUMENTS` (the work unit ID) to each. Do not invoke them sequentially; all calls must appear in the same response so they run in parallel.
 
 ## Step 3: Parse JSON Response Envelopes
 
 Wait for all Agent tool calls to complete. Each reviewer outputs a JSON envelope as the last content in its response. Parse each reviewer's JSON envelope to extract:
-- `verdict` — `"pass"` or `"fail"`
-- `summary` — one-line summary of the reviewer's verdict
-- `findings` — array of finding/confirmation objects
+- `verdict` -- `"pass"` or `"fail"`
+- `summary` -- one-line summary of the reviewer's verdict
+- `findings` -- array of finding/confirmation objects
 
 A reviewer FAILS if `verdict == "fail"`.
 
 ## Step 4: Aggregate and Log Results
 
+### CRITICAL: use canonical underscored judge names in `log-verdict`
+
+The `<judge>` positional argument to `uv run devbench log-verdict` MUST be one of these exact canonical strings, in lowercase with underscores:
+
+- `code_review`
+- `test_review`
+- `doc_review`
+- `changes_manifest`
+- `security_review`
+
+**Do NOT derive the judge name from the agent's frontmatter `name:` field.** The reviewer agents live at `plugin/devbench/agents/review_team/code-reviewer.md`, `test-reviewer.md`, `doc-reviewer.md`, and `changes-manifest.md` -- their filenames and frontmatter names are hyphenated (`code-reviewer`, etc.), but those strings are NOT valid judge identifiers. `BacklogManager._last_round_all_passed` parses the underscored forms only; passing the hyphenated form means the done-gate will never recognise the verdict and every `mark-done` will fail with "not all required judges passed". This is a recurring defect that has blocked orchestration runs in the past -- do not re-introduce it.
+
+Mapping table (agent frontmatter name -> canonical judge name for `log-verdict`):
+
+| Agent frontmatter `name:` | Canonical judge name |
+|---------------------------|----------------------|
+| `code-reviewer`           | `code_review`        |
+| `test-reviewer`           | `test_review`        |
+| `doc-reviewer`            | `doc_review`         |
+| `changes-manifest`        | `changes_manifest`   |
+| `security-reviewer`       | `security_review`    |
+
+Use `log-comment <reviewer-name>` with the hyphenated frontmatter form (that's the agent identity); use `log-verdict <canonical-judge>` with the underscored form (that's the done-gate identity).
+
 **If any reviewer returned `"verdict": "fail"`:**
 
-For each failing reviewer, log each finding as a comment, then log the verdict using the reviewer's actual JSON summary:
+For each failing reviewer, log each finding as a comment (under the reviewer's hyphenated frontmatter name), then log the verdict using the canonical underscored judge name:
 
 ```bash
 # For each finding in the reviewer's JSON findings array:
-uv run devbench log-comment <reviewer-name> $ARGUMENTS "<finding.criteria_group>: <finding.detail> — fix: <finding.fix>"
+uv run devbench log-comment <reviewer-name> $ARGUMENTS "<finding.criteria_group>: <finding.detail> -- fix: <finding.fix>"
 
-# Then log the verdict using the reviewer's actual summary:
-uv run devbench log-verdict <reviewer-name> $ARGUMENTS fail "<reviewer JSON summary>"
+# Then log the verdict using the CANONICAL judge name (not the reviewer's frontmatter name):
+uv run devbench log-verdict <canonical-judge> $ARGUMENTS fail "<reviewer JSON summary>"
+```
+
+Concrete examples:
+
+```bash
+uv run devbench log-verdict code_review      $ARGUMENTS fail "AC-TEST-005 stderr not asserted"
+uv run devbench log-verdict test_review      $ARGUMENTS fail "capsys fixture unused; no stderr content asserted"
+uv run devbench log-verdict doc_review       $ARGUMENTS fail "API docstring contradicts behaviour"
+uv run devbench log-verdict changes_manifest $ARGUMENTS fail "Staged file outside manifest"
+uv run devbench log-verdict security_review  $ARGUMENTS fail "Hardcoded token in test fixture"
 ```
 
 Then return a consolidated failure summary to the caller indicating which reviewers failed and their feedback.
 
 **If all reviewers passed:**
 
-For each reviewer that passed, log each confirmation comment, then log the verdict using the reviewer's actual JSON summary (not a hardcoded string):
+For each reviewer that passed, log each confirmation comment, then log the verdict using the canonical underscored judge name:
 
 ```bash
 # For each confirmation in the reviewer's JSON findings array:
 uv run devbench log-comment <reviewer-name> $ARGUMENTS "<finding.criteria_group>: <finding.detail>"
 
-# Log the verdict using the reviewer's actual summary from the JSON envelope:
-uv run devbench log-verdict <reviewer-name> $ARGUMENTS pass "<reviewer JSON summary>"
+# Log the verdict using the CANONICAL judge name:
+uv run devbench log-verdict <canonical-judge> $ARGUMENTS pass "<reviewer JSON summary>"
+```
+
+Concrete pass examples:
+
+```bash
+uv run devbench log-verdict code_review      $ARGUMENTS pass "All review criteria satisfied"
+uv run devbench log-verdict test_review      $ARGUMENTS pass "Tests cover every AC with meaningful assertions"
+uv run devbench log-verdict doc_review       $ARGUMENTS pass "Docs and code agree"
+uv run devbench log-verdict changes_manifest $ARGUMENTS pass "Staged files match manifest exactly"
+uv run devbench log-verdict security_review  $ARGUMENTS pass "No security findings"
 ```
 
 After logging all individual verdicts, log the supervisor-level summary:

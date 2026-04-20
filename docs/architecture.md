@@ -40,7 +40,7 @@ graph LR
   CLI --> Backlog
 ```
 
-The arrows back to BACKLOG.md represent status writes and audit comments — every action by every agent is recorded in the work unit file's `## Comments` section so the loop can resume from any point after a restart.
+The arrows back to BACKLOG.md represent status writes and audit comments -- every action by every agent is recorded in the work unit file's `## Comments` section so the loop can resume from any point after a restart.
 
 ---
 
@@ -64,7 +64,7 @@ What devbench does today, grouped by theme:
 - **Stop hook circuit breaker** prevents the orchestrator from stopping mid-loop when Claude Code attempts to stop after context compaction. Configurable max blocks within a time window before allowing stop.
 - **Stale task detection** warns when a task has been in-progress longer than a configurable threshold.
 - **Pre-commit and pre-push hooks** block destructive bash commands, missing git stages, malformed verdict logs, and direct edits to work-unit markdown.
-- **Idempotent git operations** — `commit_and_push` skips if nothing staged; `ensure_branch` handles dirty trees with stash/pop.
+- **Idempotent git operations** -- `commit_and_push` skips if nothing staged; `ensure_branch` handles dirty trees with stash/pop.
 
 ### Git workflow flexibility
 - **Multi-PR mode (default)**: one branch and one PR per work unit. CI runs per PR.
@@ -86,8 +86,11 @@ What devbench does today, grouped by theme:
 - **Task factory**: the orchestrator invokes `task-factory` to generate draft work units with status `proposed` whenever a proposal JSON lands at `<workspace>/.devbench/proposals/<source-id>.json`. Two independent triggers write that file: (1) an amendment-rejected path where `blocker-resolver` decomposes the rejection, and (2) a validation-gate bug-escalation path where the executor itself emits the proposal via `uv run devbench write-proposal` because the task's Approach forbids production fixes. The human reviews, edits, and promotes or rejects each draft. See [task-factory.md](task-factory.md), [ADR-03](adr/03-task-factory.md), and [ADR-06](adr/06-validation-gate-bug-escalation.md). Opt-in per backlog via `task_factory.enabled: true`.
 - **Declined status**: `devbench decline <id> --reason "<msg>"` marks a work unit terminal-closed when the operator decides it will never be done (spec rewritten, scope removed, etc.). Declined children roll up as terminal-complete. Declined tasks are excluded from `tasks_remaining` and projection ETAs but are visible in a `Declined (N):` panel in `devbench report`. See [ADR-05](adr/05-declined-status.md).
 - **Git-ops safety rails (universal)**: every commit path asserts HEAD is on the expected branch before committing (rejects orphan-branch commits) and every staged file is in the work unit's Changes Manifest (rejects scope-violation pollution). Both are deterministic fail-fast checks, no LLM involved. See `GitOpsJudge.assert_on_branch` and `devbench.backlog.manifest.assert_staged_matches_manifest`.
+- **Auto-requeue cascade (universal)**: when a task transitions to `done`, `BacklogManager._auto_requeue_marker_dependents` scans for `blocked` tasks carrying `[BLOCKED_PENDING_PROPOSAL]` markers (written by `promote-proposal` at wiring time) and auto-flips them to `in-queue` once every marker ID is terminal. Symmetric sideways complement to the upward parent-rollup cascade. See [ADR-07](adr/07-auto-requeue-on-proposal-completion.md). Per-draft `reject-proposal` strips the rejected draft's marker from the source before re-invoking the cascade, so a reject-then-unblock chain is automatic. See [ADR-08](adr/08-proposal-lifecycle-observability.md).
+- **Proposal-lifecycle observability (universal)**: un-materialised proposal JSONs (drafts not yet written) are surfaced in `devbench status` (persistent `Un-materialised` count row), `devbench report` (a `Proposal JSONs pending materialisation` panel), and `devbench list-proposals` (per-entry `[state]` labels: `[unmaterialised]` / `[proposed]` / `[promoted]` / `[done]` / `[declined]` / `[rejected]`). Un-materialised JSONs can be discarded via `reject-proposal --unmaterialised <source-id>`. See [ADR-08](adr/08-proposal-lifecycle-observability.md).
+- **Orchestration hygiene (universal)**: each orchestrate loop iteration begins with `uv run devbench sweep-proposals` (best-effort materialise any pending un-materialised JSONs) and the executor prompt's pre-flight step 0 (restore / delete any target-repo working-tree pollution not in the current task's Changes Manifest). The review-supervisor prompt uses the five canonical underscored judge names (`code_review`, `test_review`, `doc_review`, `changes_manifest`, `security_review`) that the done-gate parser expects, pinned by a regression test. Together these close the observed gaps that left tasks blocked or reviewed against polluted trees. See [ADR-08](adr/08-proposal-lifecycle-observability.md).
 - **Loop-control isolation (universal)**: the orchestrator's loop is driven exclusively by `uv run devbench next` return values and the stop-hook circuit breaker exit code -- never by subagent prose. The `guard-comment-format.sh` PreToolUse hook rejects `uv run devbench log-comment` calls whose message body contains control-language imperatives (`halt orchestration`, `stop the loop`, `operator action required`, etc.). Together with the SKILL halt-discipline rule and the executor prompt's `COMMENT LANGUAGE DISCIPLINE` section, the hook forms a three-layer defense against prompt-injection of halt directives from downstream agents.
-- Token cost configurable per-model — see [model-pricing.md](model-pricing.md).
+- Token cost configurable per-model -- see [model-pricing.md](model-pricing.md).
 - Rollup metrics: stories / features / epics auto-rolled to done (including `declined` children as terminal-complete).
 - Every tool call is logged to `hook-logs.jsonl` for cost accounting and audit.
 
@@ -135,7 +138,7 @@ graph TB
   CLI --> Logging
 ```
 
-The CLI is the single entry point that the runtime prompts (skill, agents, hooks) call into. All Python logic lives behind the CLI. The plugin layer above the CLI is data — markdown prompts and JSON config — not code.
+The CLI is the single entry point that the runtime prompts (skill, agents, hooks) call into. All Python logic lives behind the CLI. The plugin layer above the CLI is data -- markdown prompts and JSON config -- not code.
 
 ### Module map
 
@@ -163,7 +166,7 @@ The CLI is the single entry point that the runtime prompts (skill, agents, hooks
 
 ## 4. Process flow (orchestration loop)
 
-The `orchestrate` skill drives the loop. Each iteration processes one work unit. The skill never asks for confirmation — it loops until all units are done or no actionable units remain.
+The `orchestrate` skill drives the loop. Each iteration processes one work unit. The skill never asks for confirmation -- it loops until all units are done or no actionable units remain.
 
 ```mermaid
 sequenceDiagram
@@ -221,7 +224,7 @@ stateDiagram-v2
 
 ### Key behaviours
 
-- **Done-gate**: `BacklogManager._last_round_all_passed()` scans the work-unit Comments in reverse, collecting REVIEW_PASS entries per judge. It stops at the first `[REVIEW_REJECTED]` line — that means a prior round was invalidated and only entries after that count. The gate passes only if all four judges in `REVIEW_JUDGE_NAMES` have a REVIEW_PASS in the most recent round.
+- **Done-gate**: `BacklogManager._last_round_all_passed()` scans the work-unit Comments in reverse, collecting REVIEW_PASS entries per judge. It stops at the first `[REVIEW_REJECTED]` line -- that means a prior round was invalidated and only entries after that count. The gate passes only if all four judges in `REVIEW_JUDGE_NAMES` have a REVIEW_PASS in the most recent round.
 - **Retry feedback injection**: On REVIEW_FAIL, the orchestrator pulls prior judge feedback from the orchestrator log and feeds it back to the executor on the next attempt, so the executor knows what to fix.
 - **Auto-rollup**: When a task is marked done and all sibling tasks of its parent story are done, the parent story is auto-rolled to done with an audit comment. This cascades up to features and epics.
 - **Stop hook intercepts**: If Claude Code attempts to stop while any task is in-progress in BACKLOG.md, `continue-orchestration.sh` blocks the stop and injects a continuation instruction (current task ID, file path, last action, recommended next step). After `stop_hook.max_blocks` blocks within `stop_hook.window_seconds`, the circuit breaker trips and allows the stop, logging an audit comment to the work unit.
@@ -272,7 +275,7 @@ repos:
     checkout_directory: my-repo
 ```
 
-There is no special "single-repo mode" — the multi-repo model handles both cases.
+There is no special "single-repo mode" -- the multi-repo model handles both cases.
 
 ### How the CLI resolves repos
 
@@ -299,7 +302,7 @@ DevBench supports two git workflow patterns. Both share the same review pipeline
 
 ### Multi-PR (default)
 
-No special config — leave `git_ops.single_branch` and `git_ops.defer_pr` unset.
+No special config -- leave `git_ops.single_branch` and `git_ops.defer_pr` unset.
 
 ```yaml
 git_ops:
@@ -317,13 +320,13 @@ git_ops:
 ```
 
 - Every work unit's `ensure-branch` checks out `feat/embed-repo-tool` instead of `backlog/<id>`.
-- Every work unit's `git-ops` runs `commit_local()` only — no push, no PR.
+- Every work unit's `git-ops` runs `commit_local()` only -- no push, no PR.
 - A `[COMMIT_DEFERRED]` comment is appended to each work unit so the audit trail shows what was committed.
 - After all work units are complete (or any time you want to flush the batch), run `devbench git-ops-finalize <repo>`. This pushes the accumulated commits, creates the single PR, waits for CI, and merges.
 
 ### Validation rule
 
-`git_ops.defer_pr: true` requires `git_ops.single_branch` to be set. The config loader raises `ValueError` at startup if you set `defer_pr` without a branch — the orchestrator can't run with that misconfiguration.
+`git_ops.defer_pr: true` requires `git_ops.single_branch` to be set. The config loader raises `ValueError` at startup if you set `defer_pr` without a branch -- the orchestrator can't run with that misconfiguration.
 
 ---
 
@@ -348,20 +351,20 @@ graph TD
   SR -- FAIL --> Block["mark blocked +<br/>[REVIEW_REJECTED]"]
 ```
 
-### Tier 1 — Review tier (parallel, gated)
+### Tier 1 -- Review tier (parallel, gated)
 
 Four judges in `plugin/devbench/agents/review_team/`:
 
-- `code-reviewer.md` — SOLID, DRY, fail-fast, evidence-based communication, security smells
-- `test-reviewer.md` — TDD discipline, real tests not stubs, test framework discipline
-- `doc-reviewer.md` — documentation accuracy, sync with code, no stale docs
-- `changes-manifest.md` — declared changes match staged changes, no out-of-scope edits
+- `code-reviewer.md` -- SOLID, DRY, fail-fast, evidence-based communication, security smells
+- `test-reviewer.md` -- TDD discipline, real tests not stubs, test framework discipline
+- `doc-reviewer.md` -- documentation accuracy, sync with code, no stale docs
+- `changes-manifest.md` -- declared changes match staged changes, no out-of-scope edits
 
 `review-supervisor.md` invokes all four in parallel (single response with multiple `Agent` tool calls), aggregates verdicts, and emits a single REVIEW_PASS or REVIEW_FAIL.
 
-### Tier 2 — Security gate (sequential, separate)
+### Tier 2 -- Security gate (sequential, separate)
 
-`security-reviewer.md` runs only after all four review judges PASS. A SECURITY_FAIL writes both `[SECURITY_FAIL]` and `[REVIEW_REJECTED]` comments — the latter resets the done-gate window, forcing the four review judges to re-run after the security fix lands. Security review is **not** retried; if it fails, the unit goes to blocked.
+`security-reviewer.md` runs only after all four review judges PASS. A SECURITY_FAIL writes both `[SECURITY_FAIL]` and `[REVIEW_REJECTED]` comments -- the latter resets the done-gate window, forcing the four review judges to re-run after the security fix lands. Security review is **not** retried; if it fails, the unit goes to blocked.
 
 ### Source of truth
 
@@ -381,20 +384,20 @@ The done-gate (`BacklogManager._last_round_all_passed`) checks **only** `REVIEW_
 
 Walkthrough adding a hypothetical `api-contract` judge that verifies API changes against an OpenAPI spec:
 
-1. Create `plugin/devbench/agents/review_team/api-contract.md` with the standard agent frontmatter (`name`, `description`, `model`, `tools`, `disallowedTools`) and the review logic body. Use one of the existing judges as a template — the `name:` field becomes the judge's identifier in the verdict log.
+1. Create `plugin/devbench/agents/review_team/api-contract.md` with the standard agent frontmatter (`name`, `description`, `model`, `tools`, `disallowedTools`) and the review logic body. Use one of the existing judges as a template -- the `name:` field becomes the judge's identifier in the verdict log.
 2. Add `"api_contract"` to `REVIEW_JUDGE_NAMES` in `constants.py`.
 3. (Optional) If `plugin/devbench/scripts/guard-verdict-format.sh` hard-codes the allowed judge names rather than importing from constants, update it to include the new name.
 4. Mention the new judge in `docs/example-work-unit-template.md` so backlog authors know it exists.
 5. Run `make validate` to confirm tests still pass.
 6. Test end-to-end on a sample work unit.
 
-`review-supervisor` discovers judges by listing `plugin/devbench/agents/review_team/*.md` at runtime, so no change to `review-supervisor.md` is required — it picks up the new agent automatically.
+`review-supervisor` discovers judges by listing `plugin/devbench/agents/review_team/*.md` at runtime, so no change to `review-supervisor.md` is required -- it picks up the new agent automatically.
 
 ### Removing a judge
 
 1. Delete the agent markdown file from `plugin/devbench/agents/review_team/`.
 2. Remove the name from `REVIEW_JUDGE_NAMES` in `constants.py`.
-3. Existing work units that have stale REVIEW_PASS entries from the removed judge in their Comments are still valid — the done-gate just ignores extra entries.
+3. Existing work units that have stale REVIEW_PASS entries from the removed judge in their Comments are still valid -- the done-gate just ignores extra entries.
 
 ### Swapping a judge's logic
 
@@ -431,7 +434,7 @@ For each individual config value, three sources are consulted in priority order:
 env var → YAML value → default constant
 ```
 
-This is implemented by `_resolve_int`, `_resolve_float`, and `_resolve_str` in `src/devbench/config.py`. The first non-`None` source wins. There is no fallback chain (`a or b or c`) — each helper checks the env var explicitly, then the YAML field, then returns the default.
+This is implemented by `_resolve_int`, `_resolve_float`, and `_resolve_str` in `src/devbench/config.py`. The first non-`None` source wins. There is no fallback chain (`a or b or c`) -- each helper checks the env var explicitly, then the YAML field, then returns the default.
 
 ### Annotated YAML (every section)
 
@@ -466,7 +469,7 @@ report:
   token_cost_per_million_input: 5.0    # Opus 4.7 default
   token_cost_per_million_output: 25.0
   display_timezone: America/Denver     # IANA name; defaults to system local TZ
-  # Cache multipliers — override only on non-Anthropic platforms.
+  # Cache multipliers -- override only on non-Anthropic platforms.
   # cache_read_multiplier: 0.10
   # cache_write_5min_multiplier: 1.25
   # cache_write_1hr_multiplier: 2.0
@@ -528,7 +531,7 @@ DevBench registers hooks for Claude Code events via `plugin/devbench/hooks/hooks
 
 ### The Stop hook circuit breaker (the headline reliability feature)
 
-Why it exists: After Claude Code compacts its context (which it does automatically when context fills up), the resulting conversation can lose the orchestrate skill instructions. Without intervention, Claude would correctly conclude the conversation is over and stop — leaving an in-progress task hanging.
+Why it exists: After Claude Code compacts its context (which it does automatically when context fills up), the resulting conversation can lose the orchestrate skill instructions. Without intervention, Claude would correctly conclude the conversation is over and stop -- leaving an in-progress task hanging.
 
 What `continue-orchestration.sh` does:
 
@@ -554,7 +557,7 @@ Configuration is under `stop_hook:` in the YAML, with env var overrides `JUDGE_S
 Pulled from the in-queue items in [ROADMAP.md](../ROADMAP.md) and the architecture audit:
 
 - **Configuration completeness**: Not all model selection / timeout values are YAML-configurable yet (E210). Some values still require env-var overrides.
-- **Misleading class name**: `GitOpsJudge` should be `GitOpsService` — it isn't actually a judge in the LLM-judge sense (E214). Pure rename, no behavior change.
+- **Misleading class name**: `GitOpsJudge` should be `GitOpsService` -- it isn't actually a judge in the LLM-judge sense (E214). Pure rename, no behavior change.
 - **Branch uniqueness**: `validate-backlog` doesn't catch branch-name collisions across work units (E219). Manual editing of the Branch field in two units to the same value will not error.
 - **Work-unit scaffolding**: No CLI command to scaffold a new epic / feature / story / task from a template (E223). Authors copy-paste from `docs/example-work-unit-template.md` today.
 - **`hold` status not implemented**: The `hold` status (for paused-by-human work) is planned but not implemented (E222). This blocks E215 and E220.
@@ -565,7 +568,6 @@ Pulled from the in-queue items in [ROADMAP.md](../ROADMAP.md) and the architectu
 - **Per-judge retry limits don't exist**: `max_executor_retries` is global; you can't configure "retry the executor 5 times if test-reviewer fails but only 2 times if doc-reviewer fails."
 - **Cost report doesn't split by role**: Aggregate cost only; no per-agent (executor vs judge) cost breakdown.
 - **Per-call data-residency and fast-mode premiums not applied**: `usage.inference_geo` and `usage.speed` are counted for display but not multiplied into per-call cost; counts of 0 in practice today.
-- **`devbench list-agents` CLI command doesn't exist**: Referenced in `review-supervisor.md` but the bash fallback (`ls plugin/devbench/agents/review_team/*.md`) is what works in practice. See [Known issues](#11-known-issues-to-address-separately).
 
 ---
 
@@ -573,10 +575,10 @@ Pulled from the in-queue items in [ROADMAP.md](../ROADMAP.md) and the architectu
 
 All items the documentation audit raised have been resolved in this PR:
 
-- ✅ `list-agents` CLI reference in `review-supervisor.md` — removed (bash fallback is the documented method).
-- ✅ Non-standard `--- SECTION ---` agent prompt headers — converted to standard `##`.
-- ✅ Stale Opus 4.1 token cost defaults — updated to current Opus 4.7 rates.
-- ✅ Confusing `tasks_in_session` semantics — `devbench report` now renders **two** windows by default: All-time (full log) and Current run (most recent contiguous block of orchestration events, boundary at a >10-minute gap). See [Hooks layer](#9-hooks-layer) and the [report capability](#2-capabilities) entry for usage.
+- ✅ `list-agents` CLI reference in `review-supervisor.md` -- removed (bash fallback is the documented method).
+- ✅ Non-standard `--- SECTION ---` agent prompt headers -- converted to standard `##`.
+- ✅ Stale Opus 4.1 token cost defaults -- updated to current Opus 4.7 rates.
+- ✅ Confusing `tasks_in_session` semantics -- `devbench report` now renders **two** windows by default: All-time (full log) and Current run (most recent contiguous block of orchestration events, boundary at a >10-minute gap). See [Hooks layer](#9-hooks-layer) and the [report capability](#2-capabilities) entry for usage.
 
 If you find a new issue, file it on the ROADMAP rather than this section.
 
@@ -584,37 +586,37 @@ If you find a new issue, file it on the ROADMAP rather than this section.
 
 ## 12. Glossary
 
-- **Work unit** — Any node in the backlog hierarchy (epic, feature, story, or task). Each work unit has its own markdown file under `backlog/`.
-- **Task** — A leaf-level work unit (`E*-F*-S*-T*` ID format). Tasks are the only nodes the executor agent operates on; parents are status-roll-up containers.
-- **Story** — A grouping of tasks that share a goal. ID format `E*-F*-S*`.
-- **Feature** — A grouping of stories. ID format `E*-F*`.
-- **Epic** — Top-level grouping. ID format `E*` (e.g., `E0`, `E215`).
-- **Judge** — An LLM agent that evaluates the executor's work and emits a REVIEW_PASS or REVIEW_FAIL verdict.
-- **Review tier** — The four parallel review judges (code, test, doc, changes-manifest). All must REVIEW_PASS for the done-gate to pass.
-- **Security gate** — The single security-reviewer judge that runs sequentially after the review tier passes.
-- **Done-gate** — The check (`BacklogManager._last_round_all_passed`) that ensures all four review judges have REVIEW_PASS in the most recent review round before a work unit can be marked done.
-- **REVIEW_PASS** — Successful judge verdict, written to the work unit's Comments section.
-- **REVIEW_FAIL** — Failed judge verdict, triggers retry of the executor with prior feedback injected.
-- **REVIEW_REJECTED** — Sentinel comment that resets the done-gate window. Written when security fails to force the review tier to re-evaluate after a security fix.
-- **Multi-PR mode** — Default git workflow: one branch and one PR per work unit.
-- **Single-PR mode** — `git_ops.single_branch` + `git_ops.defer_pr: true`. All work units commit to one branch; one PR for the batch.
-- **Stop hook** — Claude Code hook (`continue-orchestration.sh`) that blocks unintended stops mid-loop, with a circuit breaker to prevent infinite block-stop loops.
-- **Circuit breaker** — Counter-and-window mechanism in the Stop hook that allows a stop after N blocks within T seconds.
-- **Auto-rollup** — When all children of a parent work unit are done, the parent is automatically marked done with an audit comment.
-- **Traceability matrix** — Table of `Spec Ref | Test Ref | Verified At` rows maintained by `BacklogManager.log_to_traceability_matrix()`.
-- **Comments section** — The `## Comments` block in each work-unit markdown file. All judge verdicts and agent comments are appended here as the audit trail.
+- **Work unit** -- Any node in the backlog hierarchy (epic, feature, story, or task). Each work unit has its own markdown file under `backlog/`.
+- **Task** -- A leaf-level work unit (`E*-F*-S*-T*` ID format). Tasks are the only nodes the executor agent operates on; parents are status-roll-up containers.
+- **Story** -- A grouping of tasks that share a goal. ID format `E*-F*-S*`.
+- **Feature** -- A grouping of stories. ID format `E*-F*`.
+- **Epic** -- Top-level grouping. ID format `E*` (e.g., `E0`, `E215`).
+- **Judge** -- An LLM agent that evaluates the executor's work and emits a REVIEW_PASS or REVIEW_FAIL verdict.
+- **Review tier** -- The four parallel review judges (code, test, doc, changes-manifest). All must REVIEW_PASS for the done-gate to pass.
+- **Security gate** -- The single security-reviewer judge that runs sequentially after the review tier passes.
+- **Done-gate** -- The check (`BacklogManager._last_round_all_passed`) that ensures all four review judges have REVIEW_PASS in the most recent review round before a work unit can be marked done.
+- **REVIEW_PASS** -- Successful judge verdict, written to the work unit's Comments section.
+- **REVIEW_FAIL** -- Failed judge verdict, triggers retry of the executor with prior feedback injected.
+- **REVIEW_REJECTED** -- Sentinel comment that resets the done-gate window. Written when security fails to force the review tier to re-evaluate after a security fix.
+- **Multi-PR mode** -- Default git workflow: one branch and one PR per work unit.
+- **Single-PR mode** -- `git_ops.single_branch` + `git_ops.defer_pr: true`. All work units commit to one branch; one PR for the batch.
+- **Stop hook** -- Claude Code hook (`continue-orchestration.sh`) that blocks unintended stops mid-loop, with a circuit breaker to prevent infinite block-stop loops.
+- **Circuit breaker** -- Counter-and-window mechanism in the Stop hook that allows a stop after N blocks within T seconds.
+- **Auto-rollup** -- When all children of a parent work unit are done, the parent is automatically marked done with an audit comment.
+- **Traceability matrix** -- Table of `Spec Ref | Test Ref | Verified At` rows maintained by `BacklogManager.log_to_traceability_matrix()`.
+- **Comments section** -- The `## Comments` block in each work-unit markdown file. All judge verdicts and agent comments are appended here as the audit trail.
 
 ---
 
 ## 13. See also
 
-- [README.md](../README.md) — Quick start, install, basic usage
-- [model-pricing.md](model-pricing.md) — Per-model token costs and YAML snippets
-- [execution-modes.md](execution-modes.md) — Detailed step-by-step lifecycle for both interactive and automated modes
-- [backlog-contract.md](backlog-contract.md) — Required structure of `BACKLOG.md` and work-unit files
-- [creating-specs-and-backlogs.md](creating-specs-and-backlogs.md) — How to author a new backlog from a spec
-- [example-work-unit-template.md](example-work-unit-template.md) — Concrete template to copy when authoring tasks
-- [plugin-architecture.md](plugin-architecture.md) — Plugin / agent / hook implementation details
-- [llm-authentication.md](llm-authentication.md) — How devbench authenticates with the Claude API and Bedrock
-- [adr/01-claude-agent-sdk-with-plugins.md](adr/01-claude-agent-sdk-with-plugins.md) — The decision record behind the SDK + plugins architecture
-- [ROADMAP.md](../ROADMAP.md) — In-queue, blocked, and technical-debt items
+- [README.md](../README.md) -- Quick start, install, basic usage
+- [model-pricing.md](model-pricing.md) -- Per-model token costs and YAML snippets
+- [execution-modes.md](execution-modes.md) -- Detailed step-by-step lifecycle for both interactive and automated modes
+- [backlog-contract.md](backlog-contract.md) -- Required structure of `BACKLOG.md` and work-unit files
+- [creating-specs-and-backlogs.md](creating-specs-and-backlogs.md) -- How to author a new backlog from a spec
+- [example-work-unit-template.md](example-work-unit-template.md) -- Concrete template to copy when authoring tasks
+- [plugin-architecture.md](plugin-architecture.md) -- Plugin / agent / hook implementation details
+- [llm-authentication.md](llm-authentication.md) -- How devbench authenticates with the Claude API and Bedrock
+- [adr/01-claude-agent-sdk-with-plugins.md](adr/01-claude-agent-sdk-with-plugins.md) -- The decision record behind the SDK + plugins architecture
+- [ROADMAP.md](../ROADMAP.md) -- In-queue, blocked, and technical-debt items

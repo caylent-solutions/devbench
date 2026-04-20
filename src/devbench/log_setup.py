@@ -40,7 +40,7 @@ def setup_logging(level: int | None = None) -> Path:
 
     Returns the path to the log file.
 
-    Safe to call multiple times — only configures on the first call.
+    Safe to call multiple times -- only configures on the first call.
     """
     if _state[0]:
         return Path(os.environ.get("JUDGE_LOG_FILE", _DEFAULT_LOG_FILE))
@@ -60,14 +60,14 @@ def setup_logging(level: int | None = None) -> Path:
 
     formatter = logging.Formatter(LOG_FORMAT, datefmt=LOG_DATE_FORMAT)
 
-    # Stderr handler — real-time visibility in Claude Code terminal without
+    # Stderr handler -- real-time visibility in Claude Code terminal without
     # polluting stdout for commands that emit data (report, get-diff, status).
     stderr_handler = logging.StreamHandler(sys.stderr)
     stderr_handler.setLevel(level)
     stderr_handler.setFormatter(formatter)
     root_logger.addHandler(stderr_handler)
 
-    # File handler — persistent log for review
+    # File handler -- persistent log for review
     file_handler = logging.FileHandler(str(log_file), encoding="utf-8")
     file_handler.setLevel(level)
     file_handler.setFormatter(formatter)

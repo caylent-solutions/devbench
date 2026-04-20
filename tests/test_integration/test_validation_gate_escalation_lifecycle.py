@@ -121,9 +121,13 @@ def _validation_gate_proposal() -> Proposal:
                     "AC-CODE-001 warnings.warn call preserved for pytest inspection",
                 ],
                 suggested_approach=(
-                    "1. TDD RED: subprocess-level test asserts stderr contains deprecation text.\n"
-                    "2. TDD GREEN: augment warn call with print to stderr.\n"
-                    "3. REFACTOR: extract message into constant."
+                    "Context: DeprecationWarning emitted via warnings.warn is invisible in "
+                    "subprocess context because Python's default filter suppresses it. "
+                    "Scope: src/example_cli/commands/install.py. "
+                    "TDD approach: 1. RED -- subprocess-level test asserts stderr contains the "
+                    "deprecation text. 2. GREEN -- augment the warn call with print to stderr. "
+                    "3. REFACTOR -- extract the message into a module-level constant. "
+                    "Verify: make lint && make test-unit all exit zero."
                 ),
             ),
             ProposedTask(
@@ -136,9 +140,13 @@ def _validation_gate_proposal() -> Proposal:
                     "AC-CODE-001 version sourced from package metadata, not hard-coded",
                 ],
                 suggested_approach=(
-                    "1. TDD RED: integration test invokes subprocess, asserts exit 0.\n"
-                    "2. TDD GREEN: create version.py, register in dispatcher.\n"
-                    "3. REFACTOR: none expected."
+                    "Context: example repo version subcommand is missing entirely; invocation "
+                    "exits 1 with 'version is not a repo command'. "
+                    "Scope: src/example_cli/repo/subcmds/version.py plus dispatcher registration. "
+                    "TDD approach: 1. RED -- integration test invokes subprocess and asserts exit 0. "
+                    "2. GREEN -- create version.py and register in the dispatcher. "
+                    "3. REFACTOR -- none expected. "
+                    "Verify: make lint && make test-integration all exit zero."
                 ),
             ),
         ],

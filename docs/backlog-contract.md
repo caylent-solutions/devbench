@@ -338,8 +338,27 @@ re-derived at runtime.
 8. `## Changes Manifest` section exists with at least one entry
 9. `## Definition of Done` section exists
 10. No em-dash character (U+2014) anywhere in the work unit file
+11. No Changes Manifest path begins with a `<checkout_directory>/` prefix (see below)
 
 Non-task files (Epics, Features, Stories) are exempt from content quality checks.
+
+**Changes Manifest path-prefix rule (check 11):** manifest paths must be
+**repo-relative**. If `backlog/config/devbench.yaml` sets `checkout_directory: <dir>`
+for a work unit's target repo, entries in that unit's `## Changes Manifest` MUST NOT
+begin with `<dir>/`. The git-ops safety rail
+(`src/devbench/backlog/manifest.py::assert_staged_matches_manifest`) compares manifest
+entries against `git diff --name-only` output, which is always repo-relative; a
+`checkout_directory` prefix on a manifest path produces a guaranteed miss at commit
+time, blocking the commit after the executor has done the work. Example: for a repo
+with `checkout_directory: example-repo`, the manifest row must read
+```
+| `README.md` | update |
+```
+not
+```
+| `example-repo/README.md` | update |
+```
+`validate-backlog` surfaces this at authoring / startup time so it never reaches git-ops.
 
 Run before starting the orchestrator. The orchestrate skill runs it automatically at startup and
 aborts if any error is found.

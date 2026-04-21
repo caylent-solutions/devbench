@@ -841,13 +841,13 @@ def cmd_ensure_branch(unit_id: str) -> int:
     """Create or switch to the feature branch for a work unit before executor runs.
 
     Derives the branch name from the work unit ID (``backlog/<id-lower>``) and
-    calls :meth:`~devbench.github.git_ops.GitOpsJudge.ensure_branch` to switch
+    calls :meth:`~devbench.github.git_ops.GitOpsService.ensure_branch` to switch
     to it, stashing and popping if the working tree is dirty.
 
     Used by the orchestrate skill immediately after ``devbench next`` and before
     invoking the executor agent.
     """
-    from devbench.github.git_ops import GitOpsJudge
+    from devbench.github.git_ops import GitOpsService
 
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     units = parser.parse_index()
@@ -866,7 +866,7 @@ def cmd_ensure_branch(unit_id: str) -> int:
     from devbench.config import SINGLE_BRANCH
 
     branch = SINGLE_BRANCH if SINGLE_BRANCH else f"backlog/{unit_id.lower()}"
-    ops = GitOpsJudge()
+    ops = GitOpsService()
     ops.ensure_branch(canonical_repo, repo_path, branch)
     logger.info("Branch ready: %s on %s", branch, canonical_repo)
     return 0
@@ -901,9 +901,9 @@ def _resolve_git_ops_context(unit_id: str) -> tuple[WorkUnit, str, Path]:
 def _git_ops_deferred(unit_id: str, unit: WorkUnit, canonical_repo: str, repo_path: Path, branch: str) -> int:
     """Commit locally only (no push/PR/merge) for single-branch deferred mode."""
     from devbench.backlog.manifest import assert_staged_matches_manifest, parse_manifest
-    from devbench.github.git_ops import GitOpsJudge
+    from devbench.github.git_ops import GitOpsService
 
-    ops = GitOpsJudge()
+    ops = GitOpsService()
     commit_message = f"{unit_id}: {unit.title}"
 
     wu_file = _resolve_unit_file(unit)
@@ -947,7 +947,7 @@ def cmd_git_ops(unit_id: str) -> int:
 
     Used by the orchestrate skill after all review judges have passed.
     """
-    from devbench.github.git_ops import GitOpsJudge
+    from devbench.github.git_ops import GitOpsService
 
     unit, canonical_repo, repo_path = _resolve_git_ops_context(unit_id)
 
@@ -963,7 +963,7 @@ def cmd_git_ops(unit_id: str) -> int:
     pr_title = f"{unit_id}: {unit.title}"
     pr_body = f"Automated PR for work unit {unit_id}.\n\n{unit.title}"
 
-    ops = GitOpsJudge()
+    ops = GitOpsService()
 
     wu_file = _resolve_unit_file(unit)
     if wu_file is None:
@@ -1063,7 +1063,7 @@ def cmd_git_ops_finalize(repo_name: str) -> int:
         )
         return 1
 
-    from devbench.github.git_ops import GitOpsJudge
+    from devbench.github.git_ops import GitOpsService
 
     canonical_repo = resolve_repo(repo_name)
     validate_repo(canonical_repo)
@@ -1078,7 +1078,7 @@ def cmd_git_ops_finalize(repo_name: str) -> int:
         f"Accumulated commits from DevBench single-branch execution.\n\nBranch: `{branch}`\nRepo: `{canonical_repo}`"
     )
 
-    ops = GitOpsJudge()
+    ops = GitOpsService()
 
     ops.commit_and_push(canonical_repo, repo_path, branch, FINALIZE_COMMIT_TEMPLATE.format(branch=branch))
     logger.info("Pushed branch %s to %s", branch, canonical_repo)

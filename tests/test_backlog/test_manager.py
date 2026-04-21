@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from devbench.backlog.manager import BacklogManager
+from devbench.config_loader import RepoConfig, RuntimeConfig
 from devbench.constants import ALL_REQUIRED_JUDGE_NAMES, REVIEW_JUDGE_NAMES, SECURITY_JUDGE_NAMES, VALID_STATUSES
 
 
@@ -852,6 +854,275 @@ class TestValidateContent:
         assert not any("Acceptance Criteria" in e for e in errors)
         assert not any("Changes Manifest" in e for e in errors)
         assert not any("Definition of Done" in e for e in errors)
+
+
+# ---------------------------------------------------------------------------
+# Check 11: Changes Manifest paths must be repo-relative (no checkout_directory prefix)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestValidateManifestPathPrefix:
+    """Tests for check 11 -- reject Changes Manifest paths that begin with
+    a ``checkout_directory/`` prefix. ``assert_staged_matches_manifest``
+    compares against repo-relative ``git diff --name-only`` output, so a
+    ``checkout_directory`` prefix on a manifest path is a guaranteed miss
+    at git-ops time. Surfacing it at ``validate-backlog`` time catches the
+    drafting defect before any executor cycle spends work on it."""
+
+    def _make_index(self, tmp_path: Path, rows: str) -> Path:
+        idx = tmp_path / "BACKLOG.md"
+        idx.write_text(
+            "# Backlog\n\n"
+            "## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
+            "|------|-------|------|-------------|----------|---------|\n"
+            "\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|-----------|\n" + rows,
+            encoding="utf-8",
+        )
+        return idx
+
+    def _make_task(
+        self,
+        backlog_dir: Path,
+        unit_id: str,
+        repo: str,
+        manifest_rows: str,
+    ) -> Path:
+        wu = backlog_dir / f"{unit_id}.md"
+        wu.write_text(
+            f"# {unit_id}\n\n"
+            f"## Status: in-queue\n\n"
+            f"## Target Repository\n\n"
+            f"- **Repo:** `{repo}`\n\n"
+            f"## Description\n\nTest task.\n\n"
+            f"## Acceptance Criteria\n\n- [ ] AC-TEST-001\n\n"
+            f"## Changes Manifest\n\n"
+            f"| File | Change |\n"
+            f"|------|--------|\n"
+            f"{manifest_rows}\n"
+            f"## Definition of Done\n\n- [ ] Done\n",
+            encoding="utf-8",
+        )
+        return wu
+
+    def _run_validate(
+        self,
+        tmp_path: Path,
+        runtime_config: RuntimeConfig,
+    ) -> list[str]:
+        idx = tmp_path / "BACKLOG.md"
+        with patch("devbench.config.RUNTIME_CONFIG", runtime_config):
+            return BacklogManager().validate(idx, tmp_path)
+
+    def test_manifest_without_checkout_prefix_passes(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """Repo-relative manifest path with configured checkout_directory: no error."""
+        self._make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "example-org/example-repo",
+            "| `README.md` | update |\n",
+        )
+        self._make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | Task | Task | in-queue | none | example-org/example-repo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        rt_cfg = RuntimeConfig(repos={"example-org/example-repo": RepoConfig(checkout_directory="example-repo")})
+        errors = self._run_validate(tmp_path, rt_cfg)
+        assert not any("Changes Manifest path" in e and "begins with" in e for e in errors)
+
+    def test_manifest_with_checkout_prefix_fails(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """Manifest path starting with checkout_directory prefix: one error,
+        message quotes the offending path, the prefix, and names the doc."""
+        self._make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "example-org/example-repo",
+            "| `example-repo/README.md` | update |\n",
+        )
+        self._make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | Task | Task | in-queue | none | example-org/example-repo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        rt_cfg = RuntimeConfig(repos={"example-org/example-repo": RepoConfig(checkout_directory="example-repo")})
+        errors = self._run_validate(tmp_path, rt_cfg)
+        prefix_errors = [e for e in errors if "Changes Manifest path" in e and "begins with" in e]
+        assert len(prefix_errors) == 1
+        assert "EX-F1-S1-T1" in prefix_errors[0]
+        assert "'example-repo/README.md'" in prefix_errors[0]
+        assert "'example-repo/'" in prefix_errors[0]
+        assert "docs/backlog-contract.md" in prefix_errors[0]
+
+    def test_check_skipped_when_checkout_directory_unset(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """Repo without checkout_directory: the check does not apply, regardless of manifest path."""
+        self._make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "example-org/example-repo",
+            "| `anything/goes/here.py` | update |\n",
+        )
+        self._make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | Task | Task | in-queue | none | example-org/example-repo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        rt_cfg = RuntimeConfig(repos={"example-org/example-repo": RepoConfig(checkout_directory=None)})
+        errors = self._run_validate(tmp_path, rt_cfg)
+        assert not any("Changes Manifest path" in e and "begins with" in e for e in errors)
+
+    def test_multiple_repos_different_checkout_dirs(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """Each WU checked against its own repo's prefix; no cross-repo contamination."""
+        self._make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "org-a/repo-a",
+            "| `repo-a/file.py` | update |\n",
+        )
+        self._make_task(
+            backlog_dir,
+            "EX-F1-S1-T2",
+            "org-b/repo-b",
+            "| `repo-a/file.py` | update |\n",
+        )
+        self._make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | Task | Task | in-queue | none | org-a/repo-a | `backlog/EX-F1-S1-T1.md` |\n"
+            "| EX-F1-S1-T2 | Task | Task | in-queue | none | org-b/repo-b | `backlog/EX-F1-S1-T2.md` |\n",
+        )
+        rt_cfg = RuntimeConfig(
+            repos={
+                "org-a/repo-a": RepoConfig(checkout_directory="repo-a"),
+                "org-b/repo-b": RepoConfig(checkout_directory="repo-b"),
+            }
+        )
+        errors = self._run_validate(tmp_path, rt_cfg)
+        prefix_errors = [e for e in errors if "Changes Manifest path" in e and "begins with" in e]
+        # WU1's path is `repo-a/file.py`, matches its own prefix -> flagged.
+        # WU2's path is also `repo-a/file.py` but WU2's prefix is `repo-b/` -> NOT flagged.
+        assert len(prefix_errors) == 1
+        assert "EX-F1-S1-T1" in prefix_errors[0]
+        assert "EX-F1-S1-T2" not in prefix_errors[0]
+
+    def test_nested_prefix_path_flagged(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """Deeply nested paths under the prefix are also flagged."""
+        self._make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "example-org/example-repo",
+            "| `example-repo/src/nested/deeper/file.py` | update |\n",
+        )
+        self._make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | Task | Task | in-queue | none | example-org/example-repo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        rt_cfg = RuntimeConfig(repos={"example-org/example-repo": RepoConfig(checkout_directory="example-repo")})
+        errors = self._run_validate(tmp_path, rt_cfg)
+        prefix_errors = [e for e in errors if "Changes Manifest path" in e and "begins with" in e]
+        assert len(prefix_errors) == 1
+        assert "'example-repo/src/nested/deeper/file.py'" in prefix_errors[0]
+
+    def test_empty_manifest_section_does_not_error(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """Work unit with only the Changes Manifest header + blank body: check does not error
+        (other checks handle missing-entries)."""
+        wu = backlog_dir / "EX-F1-S1-T1.md"
+        wu.write_text(
+            "# EX-F1-S1-T1\n\n"
+            "## Status: in-queue\n\n"
+            "## Target Repository\n\n"
+            "- **Repo:** `example-org/example-repo`\n\n"
+            "## Description\n\nTask.\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-TEST-001\n\n"
+            "## Changes Manifest\n\n"
+            "## Definition of Done\n\n- [ ] Done\n",
+            encoding="utf-8",
+        )
+        self._make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | Task | Task | in-queue | none | example-org/example-repo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        rt_cfg = RuntimeConfig(repos={"example-org/example-repo": RepoConfig(checkout_directory="example-repo")})
+        errors = self._run_validate(tmp_path, rt_cfg)
+        assert not any("Changes Manifest path" in e and "begins with" in e for e in errors)
+
+    def test_work_unit_for_unknown_repo_skipped(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """If the WU's repo isn't in runtime_config.repos, the check skips it."""
+        self._make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "unknown-org/unknown-repo",
+            "| `unknown-repo/file.py` | update |\n",
+        )
+        self._make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | Task | Task | in-queue | none | unknown-org/unknown-repo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        rt_cfg = RuntimeConfig(repos={"example-org/example-repo": RepoConfig(checkout_directory="example-repo")})
+        errors = self._run_validate(tmp_path, rt_cfg)
+        assert not any("Changes Manifest path" in e and "begins with" in e for e in errors)
+
+    def test_error_message_is_actionable(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """Error string must name the WU id, quote the offending path and the prefix,
+        and point at the doc that explains the rule."""
+        self._make_task(
+            backlog_dir,
+            "EX-F2-S3-T4",
+            "example-org/example-repo",
+            "| `example-repo/CONTRIBUTING.md` | update |\n",
+        )
+        self._make_index(
+            tmp_path,
+            "| EX-F2-S3-T4 | Task | Task | in-queue | none | example-org/example-repo | `backlog/EX-F2-S3-T4.md` |\n",
+        )
+        rt_cfg = RuntimeConfig(repos={"example-org/example-repo": RepoConfig(checkout_directory="example-repo")})
+        errors = self._run_validate(tmp_path, rt_cfg)
+        prefix_errors = [e for e in errors if "Changes Manifest path" in e and "begins with" in e]
+        assert len(prefix_errors) == 1
+        err = prefix_errors[0]
+        assert "EX-F2-S3-T4" in err
+        assert "'example-repo/CONTRIBUTING.md'" in err
+        assert "'example-repo/'" in err
+        assert "repo-relative" in err
+        assert "docs/backlog-contract.md" in err
+
+    def test_check_runs_on_every_work_unit_file(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """Three WUs on disk, only the middle one has the defect; errors list has exactly
+        one entry and it names only WU2."""
+        self._make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "example-org/example-repo",
+            "| `README.md` | update |\n",
+        )
+        self._make_task(
+            backlog_dir,
+            "EX-F1-S1-T2",
+            "example-org/example-repo",
+            "| `example-repo/docs/bad.md` | update |\n",
+        )
+        self._make_task(
+            backlog_dir,
+            "EX-F1-S1-T3",
+            "example-org/example-repo",
+            "| `src/good.py` | update |\n",
+        )
+        self._make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | Task | Task | in-queue | none | example-org/example-repo | "
+            "`backlog/EX-F1-S1-T1.md` |\n"
+            "| EX-F1-S1-T2 | Task | Task | in-queue | none | example-org/example-repo | "
+            "`backlog/EX-F1-S1-T2.md` |\n"
+            "| EX-F1-S1-T3 | Task | Task | in-queue | none | example-org/example-repo | "
+            "`backlog/EX-F1-S1-T3.md` |\n",
+        )
+        rt_cfg = RuntimeConfig(repos={"example-org/example-repo": RepoConfig(checkout_directory="example-repo")})
+        errors = self._run_validate(tmp_path, rt_cfg)
+        prefix_errors = [e for e in errors if "Changes Manifest path" in e and "begins with" in e]
+        assert len(prefix_errors) == 1
+        assert "EX-F1-S1-T2" in prefix_errors[0]
+        assert "EX-F1-S1-T1" not in prefix_errors[0]
+        assert "EX-F1-S1-T3" not in prefix_errors[0]
 
 
 # ---------------------------------------------------------------------------

@@ -609,7 +609,7 @@ class TestCmdGitOpsSubmoduleGate:
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
-            patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
         ):
             result = cli.cmd_git_ops("E202-F1-S1-T3")
 
@@ -632,7 +632,7 @@ class TestCmdGitOpsSubmoduleGate:
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
             patch("devbench.cli.UPDATE_SUBMODULE", True),
-            patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
         ):
             result = cli.cmd_git_ops("E202-F1-S1-T3")
 
@@ -677,7 +677,7 @@ class TestCmdGitOpsChecksGate:
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
-            patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
         ):
             result = cli.cmd_git_ops("E202-F1-S1-T2")
 
@@ -702,7 +702,7 @@ class TestCmdGitOpsChecksGate:
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
-            patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
         ):
             result = cli.cmd_git_ops("E202-F1-S1-T2")
 
@@ -729,7 +729,7 @@ class TestCmdEnsureBranch:
         """
         Given: a valid work unit ID
         When: cmd_ensure_branch is called
-        Then: GitOpsJudge.ensure_branch is called with the correct repo, path, and branch (AC-1)
+        Then: GitOpsService.ensure_branch is called with the correct repo, path, and branch (AC-1)
         """
         unit = self._make_unit()
         mock_parser = MagicMock()
@@ -740,7 +740,7 @@ class TestCmdEnsureBranch:
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
-            patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
         ):
             result = cli.cmd_ensure_branch("E202-F1-S1-T1")
 
@@ -799,7 +799,7 @@ class TestCmdGitOpsPostMergeCheckout:
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
-            patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
         ):
             result = cli.cmd_git_ops("E224-F1-S1-T1")
 
@@ -827,7 +827,7 @@ class TestCmdGitOpsPostMergeCheckout:
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
             patch("devbench.cli.UPDATE_SUBMODULE", True),
-            patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
         ):
             result = cli.cmd_git_ops("E224-F1-S1-T1")
 
@@ -875,7 +875,7 @@ class TestCmdGitOpsConflictingRetry:
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
-            patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
         ):
             result = cli.cmd_git_ops("E224-F1-S1-T1")
 
@@ -914,7 +914,7 @@ class TestCmdGitOpsConflictingRetry:
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
-            patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
         ):
             result = cli.cmd_git_ops("E224-F1-S1-T1")
 
@@ -1295,7 +1295,7 @@ class TestCmdGitOpsEventComments:
             patch("devbench.cli.BACKLOG_ROOT", tmp_path),
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
-            patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
             patch("devbench.backlog.manifest.parse_manifest", return_value=[]),
             patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
         ):
@@ -1326,7 +1326,7 @@ class TestCmdGitOpsEventComments:
             patch("devbench.cli.BACKLOG_ROOT", tmp_path),
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
-            patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
             patch("devbench.backlog.manifest.parse_manifest", return_value=[]),
             patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
         ):
@@ -1361,7 +1361,7 @@ class TestCmdGitOpsEventComments:
             patch("devbench.cli.BACKLOG_ROOT", tmp_path),
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
-            patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
             patch("devbench.backlog.manifest.parse_manifest", return_value=[]),
             patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
         ):
@@ -1391,7 +1391,7 @@ class TestCmdGitOpsEventComments:
             patch("devbench.cli.BACKLOG_ROOT", tmp_path),
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
-            patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
             patch("devbench.backlog.manifest.parse_manifest", return_value=[]),
             patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
         ):
@@ -1422,7 +1422,7 @@ class TestCmdGitOpsEventComments:
             patch("devbench.cli.BACKLOG_ROOT", tmp_path),
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
-            patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
             patch("devbench.backlog.manifest.parse_manifest", return_value=[]),
             patch("devbench.backlog.manifest.assert_staged_matches_manifest"),
         ):
@@ -2948,7 +2948,7 @@ class TestCmdGitOpsDeferMode:
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
             patch("devbench.config.DEFER_PR", True),
             patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
-            patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
             patch("devbench.cli._resolve_unit_file", return_value=None),
         ):
             result = cli.cmd_git_ops("E0-F1-S1-T1")
@@ -2981,7 +2981,7 @@ class TestCmdGitOpsBadPrNumber:
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
-            patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
         ):
             result = cli.cmd_git_ops("E0-F1-S1-T1")
 
@@ -3001,7 +3001,7 @@ class TestCmdGitOpsFinalizeHappyPath:
             patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
             patch("devbench.config.DEFER_PR", True),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
-            patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
         ):
             result = cli.cmd_git_ops_finalize("caylent-solutions/git-repo")
 
@@ -3292,8 +3292,8 @@ class TestGitOpsDeferred:
         mock_mgr = MagicMock()
 
         with (
-            patch("devbench.cli.GitOpsJudge", return_value=mock_ops, create=True),
-            patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+            patch("devbench.cli.GitOpsService", return_value=mock_ops, create=True),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
             patch("devbench.cli.BacklogManager", return_value=mock_mgr),
             patch("devbench.cli._resolve_unit_file", return_value=None),
         ):
@@ -3332,8 +3332,8 @@ class TestGitOpsDeferred:
         mock_ops.commit_local.side_effect = lambda *_a, **_k: call_order.append("commit_local")
 
         with (
-            patch("devbench.cli.GitOpsJudge", return_value=mock_ops, create=True),
-            patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+            patch("devbench.cli.GitOpsService", return_value=mock_ops, create=True),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
             patch("devbench.cli.BacklogManager", return_value=MagicMock()),
             patch("devbench.cli._resolve_unit_file", return_value=None),
         ):
@@ -3365,8 +3365,8 @@ class TestGitOpsDeferred:
         mock_mgr = MagicMock()
 
         with (
-            patch("devbench.cli.GitOpsJudge", return_value=mock_ops, create=True),
-            patch("devbench.github.git_ops.GitOpsJudge", return_value=mock_ops),
+            patch("devbench.cli.GitOpsService", return_value=mock_ops, create=True),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
             patch("devbench.cli.BacklogManager", return_value=mock_mgr),
             patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             # Bypass manifest-scope check: this test only cares that the

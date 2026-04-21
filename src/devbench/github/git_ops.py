@@ -35,7 +35,7 @@ class ConflictingPRError(RuntimeError):
 _BRANCH_RE = re.compile(r"^[a-zA-Z0-9]([a-zA-Z0-9_]|[.\-/][a-zA-Z0-9_])*$")
 
 
-class GitOpsJudge:
+class GitOpsService:
     """Handles git commit, push, PR creation, merging, tagging, and CI checks."""
 
     def __init__(self) -> None:

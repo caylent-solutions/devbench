@@ -106,7 +106,7 @@ Print every pending task-factory proposal with a per-task `[state]` label: `[unm
 uv run devbench validate-backlog
 ```
 
-Integrity check across the full backlog: file existence, status sync between BACKLOG.md and work-unit files, orphaned files, invalid dependency references, Status Summary table count accuracy, content-rule violations. Exits 1 and prints every finding when any violation is found.
+Integrity check across the full backlog: file existence, status sync between BACKLOG.md and work-unit files, orphaned files, invalid dependency references, Status Summary table count accuracy, content-rule violations, and Changes Manifest path-prefix violations (reject any manifest entry that begins with a `<checkout_directory>/` prefix; see [backlog-contract.md](backlog-contract.md) for the path-prefix rule). Exits 1 and prints every finding when any violation is found.
 
 Invoked automatically at orchestrator startup; operators should run it after hand-edits.
 

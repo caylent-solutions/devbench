@@ -50,6 +50,14 @@ This was the 2026-04-20 kanon misread, fixed by ADR-12. If your backlog runs in 
 
 The fix is structural: `devbench get-diff` is now mode-aware. In defer_pr mode it emits only the current task's staged + unstaged changes (plus `git show HEAD` when the working tree is clean post-commit), never the accumulated branch-vs-default diff. Upgrade devbench to a version that carries ADR-12 and the misread stops occurring. Tasks already blocked on this misread can be unblocked with `devbench set-status <id> done` once you have verified via `git diff --staged --name-only` that the actually-staged set matches the Changes Manifest.
 
+### My task blocked at git-ops with "staged files do not match Manifest declarations" -- what do I do?
+
+The git-ops safety rail (`src/devbench/backlog/manifest.py::assert_staged_matches_manifest`) compares your Changes Manifest entries against `git diff --name-only` output, which is always **repo-relative**. The most common cause of this block is a **`checkout_directory` path-prefix** on one or more manifest rows. If your `backlog/config/devbench.yaml` sets `checkout_directory: <dir>` for the repo, manifest entries MUST NOT begin with `<dir>/`. Example: for a repo with `checkout_directory: example-repo`, `| \`example-repo/README.md\` | ... |` is wrong; `| \`README.md\` | ... |` is correct.
+
+Fix: edit the task's `## Changes Manifest` section, drop the prefix from every offending row, then `devbench set-status <id> in-queue` to re-queue. The orchestrator will re-run the task cleanly.
+
+Prevention: `devbench validate-backlog` now includes a path-prefix check (check 11) that surfaces this defect at authoring / startup time, before the executor does the work. Run `validate-backlog` after any bulk edit to the backlog. See [backlog-contract.md](backlog-contract.md) for the full rule.
+
 ## Lifecycle statuses
 
 ### What's the difference between Blocked and Declined?

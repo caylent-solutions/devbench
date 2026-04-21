@@ -193,6 +193,7 @@ class BacklogManager:
         8. Task files have ## Changes Manifest with at least one entry.
         9. Task files have ## Definition of Done section.
         10. No em-dash character (U+2014) in work unit files.
+        11. Changes Manifest paths do not start with a ``checkout_directory`` prefix.
 
         Args:
             backlog_index: Path to the ``BACKLOG.md`` index file.
@@ -210,6 +211,7 @@ class BacklogManager:
         self._check_dependencies(backlog_index, known_ids, errors)
         self._check_status_summary(backlog_index, rows, errors)
         self._check_task_content(rows, workspace_root, errors)
+        self._check_manifest_path_prefixes(rows, workspace_root, errors)
         return errors
 
     def _check_files_and_statuses(
@@ -973,6 +975,71 @@ class BacklogManager:
             # Check 10: no em-dash (U+2014)
             if EM_DASH in content:
                 errors.append(f"{row_id}: contains em-dash character (U+2014) -- use double hyphen instead")
+
+    def _check_manifest_path_prefixes(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """Check 11: Changes Manifest paths must be repo-relative.
+
+        For every task work unit whose target repo has ``checkout_directory``
+        configured in ``backlog/config/devbench.yaml``, reject any manifest
+        row whose path begins with ``<checkout_directory>/``. Such paths
+        block at ``git-ops`` time because ``assert_staged_matches_manifest``
+        (``src/devbench/backlog/manifest.py``) compares manifest entries
+        against ``git diff --name-only`` output, which is always
+        repo-relative.
+
+        This is a state-based discriminator, not a silent-on-failure
+        fallback: work units for repos without a configured
+        ``checkout_directory`` are skipped because the check genuinely
+        does not apply there (no prefix to compare against).
+        """
+        from devbench.backlog.manifest import parse_manifest
+        from devbench.config import RUNTIME_CONFIG
+
+        for row_id, _, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not file_path_str:
+                continue
+            if not self._is_task_id(row_id):
+                continue
+
+            wu_path = workspace_root / file_path_str
+            if not wu_path.exists():
+                continue  # already reported by _check_files_and_statuses
+
+            content = wu_path.read_text(encoding="utf-8")
+            repo = self._extract_repo(content)
+            if repo is None or repo not in RUNTIME_CONFIG.repos:
+                continue
+
+            checkout_dir = RUNTIME_CONFIG.repos[repo].checkout_directory
+            if not checkout_dir:
+                continue
+
+            prefix = f"{checkout_dir.rstrip('/')}/"
+            for manifest_row in parse_manifest(content):
+                if manifest_row.file.startswith(prefix):
+                    errors.append(
+                        f"{row_id}: Changes Manifest path {manifest_row.file!r} "
+                        f"begins with checkout_directory prefix {prefix!r}. "
+                        f"Paths must be repo-relative (drop the prefix); "
+                        f"see docs/backlog-contract.md."
+                    )
+
+    @staticmethod
+    def _extract_repo(content: str) -> str | None:
+        """Extract the canonical ``org/repo`` string from a work-unit ``## Target Repository`` section.
+
+        Returns ``None`` if the section is absent or malformed; callers
+        treat that case as "check does not apply".
+        """
+        m = re.search(r"\*\*Repo:\*\*\s*`([^`]+)`", content)
+        return m.group(1) if m else None
 
     @staticmethod
     def _is_task_id(unit_id: str) -> bool:

@@ -114,7 +114,7 @@ Full per-command details, flags, and examples live in [docs/cli-reference.md](do
 | **Backlog write** | `claim`, `set-status`, `mark-done`, `decline`, `start` |
 | **Orchestrator helpers** | `log`, `log-verdict`, `log-comment`, `log-tdd`, `get-diff`, `run-tests`, `ensure-branch`, `git-ops`, `git-ops-finalize` |
 | **Amendment workflow** | `request-amendment`, `apply-amendment`, `reject-amendment` |
-| **Proposal workflow** | `write-proposal`, `materialise-proposal`, `sweep-proposals`, `promote-proposal`, `reject-proposal` |
+| **Proposal workflow** | `write-proposal`, `materialise-proposal`, `sweep-proposals`, `promote-proposal`, `reject-proposal`, `add-dep` |
 
 All commands run from the parent workspace root (the directory containing the `devbench` checkout):
 

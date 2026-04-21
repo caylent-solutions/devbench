@@ -11,8 +11,10 @@ disallowedTools: Write, Edit, Read, Glob, Grep
 Work unit and repo context:
 !`uv run devbench read-unit --strip-comments $ARGUMENTS`
 
-Git diff (staged, unstaged, branch, untracked):
+Git diff (authoritative work-unit scope per ADR-12):
 !`uv run devbench get-diff $ARGUMENTS`
+
+**Scope contract:** `devbench get-diff` is the AUTHORITATIVE source of "what changed in this work unit". Do NOT run `git diff origin/main`, `git diff main...HEAD`, or any other raw-git command to compute scope; in single-branch + defer_pr mode those views include accumulated work from prior tasks (ADR-12) and produce false positives.
 
 ---
 

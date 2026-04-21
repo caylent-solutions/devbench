@@ -200,6 +200,10 @@ Provides canonical template files for epic, feature, story, and task `.md` files
 
 ---
 
+## Future features (design sketches)
+
+**Operator-attention alerting surface.** When a proposed draft or a blocked-needs-attention task exists, surface it proactively rather than requiring the operator to poll. Three implementation options and open questions are recorded in [SPEC-OPERATOR-ATTENTION-ALERTS.md](SPEC-OPERATOR-ATTENTION-ALERTS.md). No owner assigned.
+
 ## Technical debt
 
 Issues carried over from prior review, mapped to current file paths. Listed by severity within each group; each entry uses a definition-list format to keep file paths readable without column overflow.

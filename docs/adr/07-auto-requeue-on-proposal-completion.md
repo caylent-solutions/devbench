@@ -67,4 +67,8 @@ Blocks without markers are untouched. Blocks whose markers include at least one 
 - **Tests.** `tests/test_backlog/test_manager.py::TestExtractPendingProposalMarkers` + `TestAutoRequeueMarkerDependents` + `TestParseCandidateDependencies`. `tests/test_backlog/test_proposal.py::TestPromoteProposal` (new marker-write cases). `tests/test_integration/test_task_factory_lifecycle.py::TestTaskFactoryLifecycleHappyPath::test_source_auto_requeues_when_all_promoted_deps_complete`.
 - **Docs.** `docs/task-factory.md` (new "Auto-requeue on proposal completion" section), `docs/faq.md` (new entry), `docs/architecture.md` (capabilities bullet).
 - **Coverage gate.** `Makefile::test-coverage-new` now includes `devbench.backlog.manager` to pin the cascade at 100%.
-- **Related ADRs.** [ADR-03: Task factory](03-task-factory.md), [ADR-05: Declined status](05-declined-status.md), [ADR-06: Validation-gate bug escalation](06-validation-gate-bug-escalation.md).
+- **Related ADRs.** [ADR-03: Task factory](03-task-factory.md), [ADR-05: Declined status](05-declined-status.md), [ADR-06: Validation-gate bug escalation](06-validation-gate-bug-escalation.md), [ADR-10: Multi-target proposal wiring](10-multi-target-proposal-wiring.md).
+
+## Cross-reference with ADR-10
+
+[ADR-10](10-multi-target-proposal-wiring.md) extends `promote-proposal` to write the `[BLOCKED_PENDING_PROPOSAL]` marker on `[source_task_id] + affected_task_ids` instead of just the source. The cascade body described in this ADR does not change -- it already iterates per-marker correctly and treats N markers the same as one. ADR-10 changes WHERE markers are written, not HOW they are consumed.

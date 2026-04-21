@@ -1,4 +1,4 @@
-# DevBench runtime configuration — sample / starting point
+# DevBench runtime configuration -- sample / starting point
 #
 # Copy this file to your workspace: cp sample-config.yaml backlog/config/devbench.yaml
 #
@@ -13,9 +13,9 @@
 # At least one entry is required. Keys must be in "org/repo" format.
 #
 # Per-repo fields:
-#   default_branch      (optional) — branch used for git diff and PR --base.
+#   default_branch      (optional) -- branch used for git diff and PR --base.
 #                                    Omit to fall back to origin/HEAD.
-#   checkout_directory  (optional) — relative path from JUDGE_WORKSPACE_ROOT to
+#   checkout_directory  (optional) -- relative path from JUDGE_WORKSPACE_ROOT to
 #                                    the local checkout. Must be relative (no leading
 #                                    / or .. traversal). Omit to use the repo short
 #                                    name (e.g. "devbench" for "caylent-solutions/devbench").
@@ -27,7 +27,7 @@ repos:
 
 # git_ops: controls git workflow behaviour after PR merge.
 #
-# update_submodule  (optional, default false) — set true only when target repos
+# update_submodule  (optional, default false) -- set true only when target repos
 #                   are git submodules of a parent workspace repo.  When true,
 #                   cmd_git_ops will stage and commit the updated submodule
 #                   pointer in the parent repo after each PR merge.
@@ -44,11 +44,11 @@ repos:
 # disabled (the default), executors that hit an undeclared production fix
 # escalate for human review instead of staging the file.
 #
-# enabled                   (optional, default false) — set true to opt the
+# enabled                   (optional, default false) -- set true to opt the
 #                           backlog into the amendment workflow.
-# allowed_reasons           (optional) — list of amendment reasons accepted
+# allowed_reasons           (optional) -- list of amendment reasons accepted
 #                           by this backlog. Default: ["tdd_green_production_fix"].
-# max_requests_per_execution (optional, default 1) — upper bound on
+# max_requests_per_execution (optional, default 1) -- upper bound on
 #                           amendments applied to one task during one
 #                           executor run.
 #
@@ -67,10 +67,19 @@ repos:
 # reviews, edits, and promotes each draft via `devbench promote-proposal`
 # or rejects it via `devbench reject-proposal`.
 #
-# enabled  (optional, default false) -- requires manifest_amendment.enabled: true.
+# enabled                  (optional, default false) -- requires manifest_amendment.enabled: true.
+# auto_accept_proposals    (optional, default false) -- when true, devbench
+#                          sweep-proposals auto-promotes every produced draft
+#                          at the next orchestrate loop tick instead of
+#                          leaving it at `proposed` for human review. Every
+#                          auto-promoted draft's [PROPOSAL_PROMOTED] comment
+#                          carries the `(auto-accepted via ...)` suffix so
+#                          the audit trail reflects the tool, not a human.
+#                          See docs/adr/11-auto-accept-proposals.md.
 #
 # task_factory:
 #   enabled: false
+#   auto_accept_proposals: false
 
 # Work-unit lifecycle statuses
 # ---------------------------------------------------------------------------

@@ -54,6 +54,7 @@ for easy parsing by Claude Code or other automation.
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -94,8 +95,11 @@ from devbench.backlog.amendment import (
 from devbench.backlog.manager import BacklogManager
 from devbench.backlog.parser import BacklogParser
 from devbench.backlog.proposal import (
+    BlockedTaskState,
     ProposalError,
     ProposalTaskState,
+    add_dep,
+    classify_blocked_task,
     classify_proposed_task,
     list_proposals,
     materialise_proposal,
@@ -155,9 +159,19 @@ def cmd_status() -> int:
     # parser's view (which only sees BACKLOG.md rows) and would otherwise
     # be invisible until the operator explicitly ran ``list-proposals``.
     unmaterialised_count = _count_unmaterialised_proposed_tasks()
+    # Split the `Blocked` count into auto-clearing (has markers the ADR-07
+    # cascade will resolve) vs needs-operator-attention (needs a human).
+    # See ADR-10 and BlockedTaskState for the classification contract.
+    auto_count, attn_count = _count_blocked_split(units)
     print("Backlog Status Summary")
     print("=" * STATUS_SEPARATOR_WIDTH)
     for status_val in DISPLAY_STATUS_VALUES:
+        if status_val == "Blocked":
+            # Replace the single Blocked line with a two-line split. Both
+            # rows always render, so a regression to zero stays visible.
+            print(f"  {'Blocked (auto)':<15} {auto_count:>4}")
+            print(f"  {'Blocked (attn)':<15} {attn_count:>4}")
+            continue
         count = counts.get(status_val.lower(), 0)
         print(f"  {status_val:<15} {count:>4}")
     print(f"  {'Un-materialised':<15} {unmaterialised_count:>4}")
@@ -504,15 +518,73 @@ def cmd_read_unit(first_arg: str, second_arg: str = "") -> int:
     return 0
 
 
+def _resolve_default_branch(canonical_repo: str, repo_path: Path) -> str | None:
+    """Return the configured default branch name or fall back to `origin/HEAD`.
+
+    Returns None when neither source yields a branch name; in that case
+    the caller should exit non-zero and surface an error to stderr.
+    """
+    configured = get_configured_default_branch(canonical_repo, RUNTIME_CONFIG)
+    if configured:
+        return configured
+
+    rc, stdout, _ = run_command(
+        ["git", "rev-parse", "--abbrev-ref", "origin/HEAD"],
+        cwd=repo_path,
+    )
+    if rc != 0 or not stdout.strip():
+        return None
+    return stdout.strip().removeprefix("origin/")
+
+
+def _render_untracked_hunks(repo_path: Path) -> list[str]:
+    """Return synthetic diff hunks for every untracked file the repo reports."""
+    hunks: list[str] = []
+    rc, stdout, _ = run_command(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=repo_path,
+    )
+    if rc != 0 or not stdout.strip():
+        return hunks
+
+    for raw_filepath in stdout.splitlines():
+        filepath = raw_filepath.strip()
+        if not filepath:
+            continue
+        abs_path = repo_path / filepath
+        try:
+            file_content = abs_path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        lines = file_content.splitlines(keepends=True)
+        added = "".join(f"+{line}" for line in lines)
+        hunks.append(
+            f"diff --git a/{filepath} b/{filepath}\n"
+            f"new file mode 100644\n"
+            f"--- /dev/null\n"
+            f"+++ b/{filepath}\n"
+            f"@@ -0,0 +1,{len(lines)} @@\n"
+            f"{added}"
+        )
+    return hunks
+
+
 def cmd_get_diff(unit_id: str) -> int:
     """Return the combined git diff for the work unit's target repo.
 
-    Includes staged changes, unstaged changes, branch diff vs default branch,
-    and untracked files formatted as synthetic diff hunks.
+    Mode-aware per ADR-12. In the default per-task-branch mode, emits
+    staged + unstaged + branch-vs-default + untracked hunks. In defer_pr
+    mode (single_branch + defer_pr: true), the branch-vs-default hunk is
+    omitted because it accumulates every prior task's commits on the
+    shared branch; instead the function emits staged + unstaged +
+    untracked, and substitutes `git show HEAD` when staged/unstaged are
+    both empty (a post-commit judge invocation).
 
-    Used by plugin agents instead of running raw git commands so they do not
-    need to know the repo path.
+    Used by plugin agents instead of running raw git commands so they do
+    not need to know the repo path or the mode.
     """
+    from devbench.config import DEFER_PR
+
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     units = parser.parse_index()
     unit = _find_unit(units, unit_id)
@@ -537,52 +609,25 @@ def cmd_get_diff(unit_id: str) -> int:
     if rc == 0 and stdout.strip():
         parts.append(stdout)
 
-    configured = get_configured_default_branch(canonical_repo, RUNTIME_CONFIG)
-    if configured:
-        default_branch = configured
+    if DEFER_PR:
+        if not parts:
+            rc, stdout, _ = run_command(["git", "show", "--format=", "HEAD"], cwd=repo_path)
+            if rc == 0 and stdout.strip():
+                parts.append(stdout)
     else:
-        rc, stdout, _ = run_command(
-            ["git", "rev-parse", "--abbrev-ref", "origin/HEAD"],
-            cwd=repo_path,
-        )
-        if rc != 0 or not stdout.strip():
+        default_branch = _resolve_default_branch(canonical_repo, repo_path)
+        if default_branch is None:
             print(
                 f"ERROR: Cannot determine default branch for '{canonical_repo}'. "
                 "Run 'git remote set-head origin --auto' to configure it.",
                 file=sys.stderr,
             )
             return 1
-        default_branch = stdout.strip().removeprefix("origin/")
+        rc, stdout, _ = run_command(["git", "diff", f"origin/{default_branch}"], cwd=repo_path)
+        if rc == 0 and stdout.strip():
+            parts.append(stdout)
 
-    rc, stdout, _ = run_command(["git", "diff", f"origin/{default_branch}"], cwd=repo_path)
-    if rc == 0 and stdout.strip():
-        parts.append(stdout)
-
-    rc, stdout, _ = run_command(
-        ["git", "ls-files", "--others", "--exclude-standard"],
-        cwd=repo_path,
-    )
-    if rc == 0 and stdout.strip():
-        for raw_filepath in stdout.splitlines():
-            filepath = raw_filepath.strip()
-            if not filepath:
-                continue
-            abs_path = repo_path / filepath
-            try:
-                file_content = abs_path.read_text(encoding="utf-8")
-            except OSError:
-                continue
-            lines = file_content.splitlines(keepends=True)
-            added = "".join(f"+{line}" for line in lines)
-            hunk = (
-                f"diff --git a/{filepath} b/{filepath}\n"
-                f"new file mode 100644\n"
-                f"--- /dev/null\n"
-                f"+++ b/{filepath}\n"
-                f"@@ -0,0 +1,{len(lines)} @@\n"
-                f"{added}"
-            )
-            parts.append(hunk)
+    parts.extend(_render_untracked_hunks(repo_path))
 
     print("\n".join(parts) if parts else "(no changes)")
     return 0
@@ -1346,6 +1391,11 @@ def cmd_sweep_proposals() -> int:
         return 1
     unit_by_id = {u.id: u for u in units}
 
+    auto_accept = RUNTIME_CONFIG.task_factory.auto_accept_proposals
+    # ADR-11 audit suffix written on every auto-promoted draft's Comments
+    # so a reviewer can tell at a glance that no human pressed the button.
+    auto_audit_suffix = "(auto-accepted via task_factory.auto_accept_proposals=true)"
+
     touched = 0
     for proposal in proposals:
         # Pre-classify so we can (a) take a fast-path no-op when every task
@@ -1358,10 +1408,13 @@ def cmd_sweep_proposals() -> int:
             for task in proposal.proposed_tasks
         }
         unmaterialised_before = sum(1 for state in pre_states.values() if state is ProposalTaskState.UNMATERIALISED)
+        proposed_before = sum(1 for state in pre_states.values() if state is ProposalTaskState.PROPOSED)
+        needs_materialise = unmaterialised_before > 0
+        needs_auto_promote = auto_accept and (unmaterialised_before > 0 or proposed_before > 0)
 
-        if unmaterialised_before == 0:
-            # Every task in this proposal is already in a terminal-for-
-            # materialise state. Nothing for the sweep to do.
+        if not needs_materialise and not needs_auto_promote:
+            # Every task in this proposal is already resolved (promoted,
+            # done, declined, or rejected). Nothing for the sweep to do.
             print(f"sweep-proposals: no-op {proposal.source_task_id}")
             continue
 
@@ -1373,23 +1426,56 @@ def cmd_sweep_proposals() -> int:
             )
             continue
 
-        try:
-            drafts = materialise_proposal(
-                workspace_root=WORKSPACE_ROOT,
-                backlog_root=BACKLOG_ROOT,
-                backlog_index=BACKLOG_INDEX,
-                proposal=proposal,
-                repo=source_unit.repo,
-            )
-        except ProposalError as exc:
-            # Soft failure: safety guard (unresolved prior proposed tasks),
-            # thin-approach refusal, etc. Log and continue.
-            print(f"sweep-proposals: skipped {proposal.source_task_id}: {exc}")
-            continue
+        drafts: list[Path] = []
+        if needs_materialise:
+            try:
+                drafts = materialise_proposal(
+                    workspace_root=WORKSPACE_ROOT,
+                    backlog_root=BACKLOG_ROOT,
+                    backlog_index=BACKLOG_INDEX,
+                    proposal=proposal,
+                    repo=source_unit.repo,
+                )
+            except ProposalError as exc:
+                # Soft failure: safety guard (unresolved prior proposed tasks),
+                # thin-approach refusal, etc. Log and continue.
+                print(f"sweep-proposals: skipped {proposal.source_task_id}: {exc}")
+                continue
+
+        # ADR-11 auto-accept: once materialise has run (or when the flag was
+        # flipped on after earlier drafts already materialised), promote every
+        # task currently in PROPOSED state. promote_proposal is idempotent --
+        # a task in any other state is skipped by the per-task classify guard
+        # below, so re-running the sweep causes no duplicate marker writes.
+        auto_promoted = 0
+        if auto_accept:
+            for task in proposal.proposed_tasks:
+                state = classify_proposed_task(BACKLOG_ROOT, WORKSPACE_ROOT, task.suggested_id)
+                if state is not ProposalTaskState.PROPOSED:
+                    continue
+                try:
+                    promote_proposal(
+                        workspace_root=WORKSPACE_ROOT,
+                        backlog_root=BACKLOG_ROOT,
+                        backlog_index=BACKLOG_INDEX,
+                        task_id=task.suggested_id,
+                        audit_suffix=auto_audit_suffix,
+                    )
+                    auto_promoted += 1
+                except ProposalError as exc:
+                    # Soft failure per draft; other drafts in the same
+                    # proposal still get a promote attempt.
+                    print(
+                        f"sweep-proposals: auto-promote failed for {task.suggested_id}: {exc}",
+                        file=sys.stderr,
+                    )
 
         skipped_count = len(proposal.proposed_tasks) - len(drafts)
         touched += len(drafts)
-        print(f"sweep-proposals: materialised {proposal.source_task_id}: {len(drafts)} new, {skipped_count} skipped")
+        line = f"sweep-proposals: materialised {proposal.source_task_id}: {len(drafts)} new, {skipped_count} skipped"
+        if auto_accept:
+            line += f" (auto-promoted: {auto_promoted})"
+        print(line)
 
     logger.info("sweep-proposals touched %d draft(s) across %d proposal(s)", touched, len(proposals))
     return 0
@@ -1552,6 +1638,27 @@ def _count_unmaterialised_proposed_tasks() -> int:
     return count
 
 
+def _count_blocked_split(units: list[WorkUnit]) -> tuple[int, int]:
+    """Return ``(auto_count, attn_count)`` for the blocked-task UX split (ADR-10).
+
+    Iterates every blocked work unit and classifies it via
+    :func:`classify_blocked_task`. The two counts always sum to the total
+    number of blocked tasks in ``units`` so the aggregate is recoverable
+    by addition.
+    """
+    auto = 0
+    attn = 0
+    for u in units:
+        if u.status != WorkUnitStatus.BLOCKED:
+            continue
+        state = classify_blocked_task(BACKLOG_ROOT, BACKLOG_INDEX, u.id)
+        if state is BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL:
+            auto += 1
+        else:
+            attn += 1
+    return auto, attn
+
+
 def cmd_promote_proposal(first_arg: str, second_arg: str = "") -> int:
     """Flip a proposed task to ``in-queue`` and wire dependencies.
 
@@ -1582,7 +1689,7 @@ def cmd_promote_proposal(first_arg: str, second_arg: str = "") -> int:
         return 1
 
     try:
-        draft = promote_proposal(
+        result = promote_proposal(
             workspace_root=WORKSPACE_ROOT,
             backlog_root=BACKLOG_ROOT,
             backlog_index=BACKLOG_INDEX,
@@ -1592,8 +1699,21 @@ def cmd_promote_proposal(first_arg: str, second_arg: str = "") -> int:
     except ProposalError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-    logger.info("Promoted proposal %s -> in-queue", task_id)
-    print(json.dumps({"task_id": task_id, "status": "in-queue", "file_path": str(draft)}))
+    logger.info(
+        "Promoted proposal %s -> in-queue; wired marker on %d task(s)",
+        task_id,
+        len(result.wired_targets),
+    )
+    print(
+        json.dumps(
+            {
+                "task_id": task_id,
+                "status": "in-queue",
+                "file_path": str(result.draft_path),
+                "wired_targets": list(result.wired_targets),
+            }
+        )
+    )
     return 0
 
 
@@ -1612,6 +1732,150 @@ def _run_promote_all(source_task_id: str) -> int:
         logger.info("Promoted %s", path.stem)
     print(json.dumps({"source_task_id": source_task_id, "promoted_count": len(promoted)}))
     return 0
+
+
+def cmd_add_dep(*argv: str) -> int:
+    """Wire a cross-task dependency + marker on an existing work unit.
+
+    Usage::
+
+        add-dep <blocked-task-id> <blocker-task-id> [--reason "<audit message>"]
+
+    Writes a Dependencies-table row and a ``[WU_WIRED] ... [BLOCKED_PENDING_PROPOSAL] <blocker>``
+    audit comment on the blocked task's file. The ADR-07 auto-requeue cascade
+    then auto-unblocks the task when the blocker reaches ``done`` / ``declined``.
+
+    Used for three scenarios the ``promote-proposal`` flow does not cover:
+
+    1. Operator realises AFTER a promote that an additional task should have
+       been listed in the proposal's ``affected_task_ids``.
+    2. Operator hand-authored a work unit (not via task-factory) that
+       unblocks another task and wants to wire the marker without touching
+       the file by hand.
+    3. Operator corrects a proposal authored without ``affected_task_ids``
+       retroactively.
+
+    Fail-fast:
+      - Both IDs must match the task-ID regex.
+      - Blocker must exist in the backlog index.
+      - Blocker must not be in a terminal state (``done`` / ``declined``).
+      - Blocked must exist in the backlog index.
+      - Blocked and blocker cannot be the same.
+
+    Warns (but does not refuse) when the blocked task is not currently in
+    ``blocked`` status. The cascade only fires on blocked tasks, so wiring a
+    marker on an in-queue task is harmless metadata; the operator almost
+    certainly meant to flip to blocked first.
+
+    Idempotent: if either the dep row or the marker is already present, the
+    corresponding write is skipped. ``wired: true`` in the output JSON means
+    at least one of the two was newly written on this call; ``wired: false``
+    means the call was a complete no-op.
+    """
+    blocked_task_id, blocker_task_id, reason = _parse_add_dep_argv(argv)
+    if blocked_task_id is None:
+        return 1
+
+    rc = _reject_em_dash("reason", reason) if reason else None
+    if rc is not None:
+        return rc
+
+    # Warn when blocked is not in `blocked` status (ADR-10 soft guidance).
+    try:
+        parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+        units = parser.parse_index()
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"ERROR: cannot read backlog index: {exc}", file=sys.stderr)
+        return 1
+    blocked_unit = next((u for u in units if u.id == blocked_task_id), None)
+    if blocked_unit is None:
+        print(
+            f"ERROR: add-dep: blocked task '{blocked_task_id}' not found in backlog index",
+            file=sys.stderr,
+        )
+        return 1
+    if blocked_unit.status != WorkUnitStatus.BLOCKED:
+        print(
+            f"WARNING: add-dep: {blocked_task_id} is currently '{blocked_unit.status.value}', "
+            "not 'blocked'. The ADR-07 cascade only fires on blocked tasks -- the marker "
+            "written by this call will be inert until the task is blocked.",
+            file=sys.stderr,
+        )
+
+    try:
+        wired = add_dep(
+            backlog_root=BACKLOG_ROOT,
+            backlog_index=BACKLOG_INDEX,
+            blocked_task_id=blocked_task_id,
+            blocker_task_id=blocker_task_id,
+            reason=reason,
+        )
+    except ProposalError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    logger.info(
+        "add-dep: %s blocked on %s (wired=%s)",
+        blocked_task_id,
+        blocker_task_id,
+        wired,
+    )
+    print(
+        json.dumps(
+            {
+                "blocked": blocked_task_id,
+                "blocker": blocker_task_id,
+                "wired": wired,
+                "reason": reason,
+            }
+        )
+    )
+    return 0
+
+
+def _parse_add_dep_argv(argv: tuple[str, ...]) -> tuple[str | None, str, str]:
+    """Parse the add-dep flag grammar.
+
+    Returns ``(blocked_id, blocker_id, reason)``. Returns ``(None, "", "")``
+    after printing a usage error to stderr so the caller can ``return 1``.
+    """
+    task_id_re = re.compile(r"^E\d+-F\d+-S\d+-T\d+$")
+    positional: list[str] = []
+    reason = ""
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if not arg:
+            i += 1
+            continue
+        if arg == "--reason":
+            if i + 1 >= len(argv) or not argv[i + 1]:
+                print("ERROR: --reason requires a value", file=sys.stderr)
+                return None, "", ""
+            reason = argv[i + 1]
+            i += 2
+            continue
+        if arg.startswith("--"):
+            print(f"ERROR: unknown flag: {arg}", file=sys.stderr)
+            return None, "", ""
+        positional.append(arg)
+        i += 1
+
+    if len(positional) != 2:
+        print(
+            "ERROR: add-dep requires exactly two task ids: <blocked-task-id> <blocker-task-id>",
+            file=sys.stderr,
+        )
+        return None, "", ""
+    blocked_id, blocker_id = positional
+    for label, tid in (("blocked", blocked_id), ("blocker", blocker_id)):
+        if not task_id_re.match(tid):
+            print(
+                f"ERROR: add-dep: {label} task id '{tid}' does not match E<N>-F<N>-S<N>-T<N> format",
+                file=sys.stderr,
+            )
+            return None, "", ""
+    return blocked_id, blocker_id, reason
 
 
 def cmd_reject_proposal(*argv: str) -> int:
@@ -1821,6 +2085,11 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
         cmd_reject_proposal,
         2,
         "Archive a proposed task's draft: reject-proposal <id> --reason <message>",
+    ),
+    "add-dep": (
+        cmd_add_dep,
+        2,
+        "Wire a cross-task BLOCKED_PENDING_PROPOSAL marker: add-dep <blocked-id> <blocker-id> [--reason <msg>]",
     ),
     "materialise-proposal": (
         cmd_materialise_proposal,

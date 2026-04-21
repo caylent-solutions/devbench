@@ -117,6 +117,7 @@ cat <<'EOF' | uv run devbench write-proposal $ARGUMENTS
   "source_task_id": "<SOURCE-TASK-ID>",
   "generated_at": "<UTC ISO-8601 timestamp, e.g. 2026-04-18T15:00:00Z>",
   "rejection_reason": "<amender's rejection rationale copied from the archive>",
+  "affected_task_ids": [],
   "proposed_tasks": [
     {
       "suggested_id": "<NEXT-FREE-TASK-ID from STEP 3>",
@@ -129,6 +130,38 @@ cat <<'EOF' | uv run devbench write-proposal $ARGUMENTS
   ]
 }
 EOF
+```
+
+### `affected_task_ids` -- list peer tasks the fix unblocks (ADR-10)
+
+The `affected_task_ids` field lists OTHER currently-blocked work units that share the same root-cause bug as `source_task_id`. When the operator runs `promote-proposal`, the `[BLOCKED_PENDING_PROPOSAL]` marker is wired on EVERY id in `[source_task_id] + affected_task_ids`, so the ADR-07 auto-requeue cascade clears them all together when the fix reaches `done`. Populating this field correctly eliminates a whole class of manual operator wiring.
+
+Default is an empty list. Populate it when -- and only when -- you have clear evidence that another blocked task is waiting on the same bug this proposal will fix. Evidence means at least one of:
+
+- Both blocked tasks have the SAME failing test name listed in their most recent `[REVIEW_FAIL]` or `[BLOCKED]` comment, and your proposed fix will make that test pass.
+- Both blocked tasks have the SAME production file in their blocker commentary, and your proposed fix touches that file.
+- Both blocked tasks reference the SAME commit-hash / CI failure as the root cause, and your proposed fix addresses that root cause.
+
+Discovery procedure (run BEFORE emitting the proposal):
+
+```bash
+uv run devbench status                       # list currently-blocked tasks
+# For each blocked task that looks related, read its most recent blocker comment:
+uv run devbench read-unit <candidate-id> | tail -100
+```
+
+Only add a candidate to `affected_task_ids` if the evidence above holds. Do NOT speculate or pattern-match loosely -- a wrong entry wires a spurious marker that the operator then has to unwind with `add-dep` retraction steps. When in doubt, leave the list empty; the operator can always run `add-dep <blocked-id> <promoted-id>` post-promote to wire additional targets.
+
+Do NOT list `source_task_id` itself in `affected_task_ids` (the source is always wired; `materialise-proposal` will reject the JSON if you do).
+
+Example populated payload (source task E1-F1-S16-T1 is blocked on 14 failing consumer tests; the same 14 tests are also blocking E1-F1-S15-T1 -- one fix task covers both):
+
+```json
+{
+  "source_task_id": "E1-F1-S16-T1",
+  "affected_task_ids": ["E1-F1-S15-T1"],
+  "proposed_tasks": [ { "suggested_id": "E1-F1-S16-T2", "title": "Fix 14 stale SystemExit test expectations", ... } ]
+}
 ```
 
 Example of an acceptable `suggested_approach` (honest four-section structure, above the minimum-length floor):

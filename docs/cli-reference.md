@@ -184,7 +184,14 @@ These commands are the API surface the orchestrate SKILL and its subagents use. 
 uv run devbench get-diff <id>
 ```
 
-Print the combined git diff for the work unit's target repo, relative to the repo's default branch. Used by review agents to see what changed. No filter flags; the diff includes staged and unstaged changes.
+Print the combined git diff for the work unit's target repo, scoped to *what this work unit changed*. Used by review agents (all five review judges plus `security-reviewer`) as the authoritative scope source; agents must not run raw `git diff origin/main` to compute scope (see ADR-12).
+
+Mode-aware per ADR-12:
+
+- **Per-task-branch mode** (default, `git_ops.defer_pr: false`): emits staged + unstaged + `git diff origin/<default_branch>` + untracked hunks. Each work unit runs on its own branch, so the branch-vs-default diff IS the task's scope.
+- **defer_pr mode** (`git_ops.single_branch: <branch>` + `git_ops.defer_pr: true`): emits staged + unstaged + untracked only. When staged and unstaged are both empty the executor has just committed, so `git show HEAD` is substituted. The branch-vs-default hunk is deliberately skipped because it would include every prior completed task's commits on the shared branch.
+
+Exit 0 on success; exit 1 when the work unit is not found or no local path is configured for its repo. Output is `(no changes)` when every hunk is empty.
 
 ### `run-tests`
 
@@ -343,6 +350,14 @@ Best-effort materialise every pending proposal JSON in `<workspace>/.devbench/pr
 - `sweep-proposals: no-op <source-id>` (every task already resolved)
 - `sweep-proposals: nothing to do (no proposal JSONs on disk)`
 
+When `task_factory.auto_accept_proposals: true` is set in `backlog/config/devbench.yaml` (ADR-11), sweep also auto-promotes every `PROPOSED` draft in each proposal after the materialise pass. The output line gains a parenthetical count:
+
+```
+sweep-proposals: materialised <source-id>: N new, M skipped (auto-promoted: K)
+```
+
+Per-draft promote failures are logged to stderr and do not abort the sweep. When the flag is `false` (default), the output is byte-identical to the pre-ADR-11 format. See [ADR-11: Auto-accept proposals](adr/11-auto-accept-proposals.md) and the [task-factory doc](task-factory.md) for the full auto-accept contract.
+
 Invoked by the orchestrate SKILL as step 0 on every loop iteration; safe to run manually at any time.
 
 ### `promote-proposal`
@@ -352,10 +367,62 @@ uv run devbench promote-proposal [--no-dep-on-source] <task-id>
 uv run devbench promote-proposal --all-from <source-task-id>
 ```
 
-Flip a proposed draft from `proposed` to `in-queue` and wire it as a dependency of the source task that originated it. Writes `[PROPOSAL_PROMOTED]` on the source and adds a `[BLOCKED_PENDING_PROPOSAL]` marker that the ADR-07 auto-requeue cascade consumes.
+Flip a proposed draft from `proposed` to `in-queue` and wire it as a dependency of the source task + every peer listed in the proposal's `affected_task_ids` field (ADR-10). Writes `[PROPOSAL_PROMOTED]` + a `[BLOCKED_PENDING_PROPOSAL] <task-id>` marker on every wired target so the ADR-07 auto-requeue cascade reaches each of them when this task completes.
 
-- `--no-dep-on-source` skips the dependency wiring (use when the promoted draft is independent of the source).
+- `--no-dep-on-source` skips the Dependencies-table row on the SOURCE task only; every entry in `affected_task_ids` still gets its marker + row. Use the flag when the promoted draft is independent of its source task, not to suppress peer-task wiring.
 - `--all-from <source-task-id>` promotes every task in that source's proposal in one call.
+
+Fail-fast: if any target in `[source_task_id] + affected_task_ids` is missing from the backlog index, the call raises `ProposalError` BEFORE writing anything, so a missing peer never leaves the source half-wired.
+
+Output JSON:
+
+```json
+{
+  "task_id": "E1-F1-S16-T2",
+  "status": "in-queue",
+  "file_path": "/abs/path/E1-F1-S16-T2.md",
+  "wired_targets": ["E1-F1-S16-T1", "E1-F1-S15-T1"]
+}
+```
+
+`wired_targets` lists every task that received a marker on this call (source first, then affected in declared order).
+
+### `add-dep`
+
+```
+uv run devbench add-dep <blocked-task-id> <blocker-task-id> [--reason "<audit message>"]
+```
+
+Wire a `[BLOCKED_PENDING_PROPOSAL] <blocker-task-id>` marker and a Dependencies-table row on `<blocked-task-id>`'s work-unit file. The ADR-07 cascade then auto-unblocks `<blocked-task-id>` when `<blocker-task-id>` reaches `done` or `declined`. See [ADR-10: Multi-target proposal wiring](adr/10-multi-target-proposal-wiring.md).
+
+Use this when the `promote-proposal` flow does not cover your case:
+
+- You realise AFTER a promote that a peer task should have been in `affected_task_ids` and want to wire it retroactively.
+- You hand-authored a work unit (not via task-factory) that unblocks another task.
+- You are correcting a proposal authored without `affected_task_ids`.
+
+Fail-fast:
+
+- Both IDs must match the `E<N>-F<N>-S<N>-T<N>` task-ID format.
+- `<blocker-task-id>` must exist in the backlog index.
+- `<blocker-task-id>` must NOT be in a terminal state (`done` / `declined`); wiring a dep on terminal work is a no-op and almost always a mistake.
+- `<blocked-task-id>` must exist in the backlog index.
+- `<blocked-task-id>` and `<blocker-task-id>` cannot be the same.
+
+Warns (does not refuse) when `<blocked-task-id>` is not currently in `blocked` status -- the ADR-07 cascade only fires on blocked tasks, so wiring a marker on an in-queue task is harmless metadata; the operator almost certainly meant to flip to blocked first.
+
+Idempotent: if either the Dependencies row or the marker is already present, the corresponding write is skipped. `wired: false` in the output JSON means the call was a complete no-op.
+
+Output JSON:
+
+```json
+{
+  "blocked": "E1-F1-S16-T1",
+  "blocker": "E1-F1-S16-T2",
+  "wired": true,
+  "reason": "post-promote correction for shared 14-test blocker"
+}
+```
 
 ### `reject-proposal`
 

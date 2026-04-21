@@ -86,6 +86,12 @@ Both modes execute the same logical steps in the same order.
     └── After ALL tasks are done: `devbench git-ops-finalize <repo>` pushes the
         accumulated commits and creates one PR for the batch
 
+    Note: In this mode `devbench get-diff` returns the current task's
+    commit-local scope only (staged + unstaged + untracked, or `git show
+    HEAD` post-commit). The branch-vs-default hunk is deliberately omitted
+    because it would include every prior completed task's commits on the
+    shared branch. See ADR-12.
+
 9. Mark Done (done-gate: verifies all 4 judges passed in most recent round)
 
 10. Repeat from step 2

@@ -210,9 +210,15 @@ class TaskFactoryConfig:
             so existing backlogs see no behavior change. Requires
             ``manifest_amendment.enabled: true`` (task-factory runs from
             the amendment-reject path).
+        auto_accept_proposals: When ``True``, ``devbench sweep-proposals``
+            auto-promotes every task-factory-produced draft to ``in-queue``
+            immediately, skipping the human review step. Default ``False``
+            preserves pre-ADR-11 behaviour (drafts land at ``proposed``
+            and wait for the operator). See ADR-11.
     """
 
     enabled: bool = False
+    auto_accept_proposals: bool = False
 
 
 @dataclass(frozen=True)
@@ -544,6 +550,9 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
     default_task_factory = TaskFactoryConfig()
     task_factory = TaskFactoryConfig(
         enabled=bool(task_factory_raw.get("enabled", default_task_factory.enabled)),
+        auto_accept_proposals=bool(
+            task_factory_raw.get("auto_accept_proposals", default_task_factory.auto_accept_proposals)
+        ),
     )
     if task_factory.enabled and not manifest_amendment.enabled:
         raise ValueError(

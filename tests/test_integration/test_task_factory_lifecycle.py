@@ -342,6 +342,140 @@ class TestUnmaterialisedRejectLifecycle:
         assert list_proposals(workspace) == []
 
 
+class TestAffectedTaskIdsLifecycle:
+    """ADR-10 end-to-end: multi-target wiring + cascade across source + 2 siblings."""
+
+    def test_promote_wires_all_three_and_cascade_unblocks_each(self, tmp_path: Path) -> None:
+        """Source + 2 peers all get markers; cascade flips all 3 when the fix completes."""
+        from devbench.backlog.manager import BacklogManager
+        from devbench.backlog.proposal import promote_proposal
+
+        # Build a workspace with three blocked tasks (source + 2 peers) sharing a bug.
+        (tmp_path / "BACKLOG.md").write_text(
+            "# Backlog\n\n"
+            "## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
+            "|------|-------|------|-------------|----------|---------|\n"
+            "| E0 | Example Epic | 0 | 0 | 0 | 3 |\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Src | Task | blocked | None | caylent-solutions/example | "
+            "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n"
+            "| E0-F1-S1-T3 | Peer1 | Task | blocked | None | caylent-solutions/example | "
+            "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T3.md` |\n"
+            "| E0-F1-S1-T4 | Peer2 | Task | blocked | None | caylent-solutions/example | "
+            "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T4.md` |\n"
+        )
+        story = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        story.mkdir(parents=True)
+        for tid in ("E0-F1-S1-T1", "E0-F1-S1-T3", "E0-F1-S1-T4"):
+            (story / f"{tid}.md").write_text(_SOURCE_TEMPLATE.replace("E0-F1-S1-T1", tid))
+
+        proposal = Proposal(
+            source_task_id="E0-F1-S1-T1",
+            generated_at="2026-04-20T00:00:00Z",
+            rejection_reason="shared bug blocking three tasks",
+            proposed_tasks=[
+                ProposedTask(
+                    suggested_id="E0-F1-S1-T2",
+                    title="Fix shared bug",
+                    files_to_own=["src/fix.py"],
+                    linked_scenarios=["SC-01"],
+                    suggested_acs=["AC-FUNC-001 fix the bug"],
+                    suggested_approach=(
+                        "Context: ADR-10 end-to-end lifecycle fixture. "
+                        "Scope: src/fix.py plus unit test. "
+                        "TDD approach: 1. RED -- add failing test. "
+                        "2. GREEN -- minimal fix. 3. REFACTOR -- none. "
+                        "Verify: make lint && make test-unit exit zero."
+                    ),
+                )
+            ],
+            affected_task_ids=["E0-F1-S1-T3", "E0-F1-S1-T4"],
+        )
+        write_proposal(tmp_path, proposal)
+        materialise_proposal(
+            workspace_root=tmp_path,
+            backlog_root=tmp_path / "backlog",
+            backlog_index=tmp_path / "BACKLOG.md",
+            proposal=proposal,
+            repo="caylent-solutions/example",
+        )
+
+        result = promote_proposal(
+            workspace_root=tmp_path,
+            backlog_root=tmp_path / "backlog",
+            backlog_index=tmp_path / "BACKLOG.md",
+            task_id="E0-F1-S1-T2",
+        )
+        assert result.wired_targets == ["E0-F1-S1-T1", "E0-F1-S1-T3", "E0-F1-S1-T4"]
+        for tid in result.wired_targets:
+            assert "[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2" in (story / f"{tid}.md").read_text()
+
+        # Transition the fix to done; cascade should flip all three blocked peers.
+        mgr = BacklogManager()
+        t2 = story / "E0-F1-S1-T2.md"
+        mgr.force_status(t2, tmp_path / "BACKLOG.md", "E0-F1-S1-T2", "done")
+
+        # The cascade runs inside force_status / _set_status. All three peers
+        # must now be in-queue with [AUTO_UNBLOCKED] audit.
+        for tid in ("E0-F1-S1-T1", "E0-F1-S1-T3", "E0-F1-S1-T4"):
+            text = (story / f"{tid}.md").read_text()
+            assert "## Status: in-queue" in text, f"{tid} did not auto-unblock"
+            assert "[AUTO_UNBLOCKED]" in text, f"{tid} missing AUTO_UNBLOCKED audit"
+
+
+class TestAutoAcceptProposalsLifecycle:
+    """ADR-11 end-to-end: flag=true causes sweep-proposals to auto-promote every draft."""
+
+    def test_auto_accept_promotes_every_draft_end_to_end(self, tmp_path: Path) -> None:
+        """Materialise via sweep-proposals with flag=true; every draft ends at in-queue + audit suffix."""
+        from unittest.mock import MagicMock, patch
+
+        from devbench import cli
+
+        workspace = _workspace(tmp_path)
+        proposal = _proposal()
+        write_proposal(workspace, proposal)
+
+        # Source-task row is already in BACKLOG.md via _workspace; its file exists.
+        # Build a RUNTIME_CONFIG mock with auto_accept_proposals=True and the
+        # BacklogParser resolving the source unit so the sweep reaches materialise.
+        unit = MagicMock()
+        unit.id = "E0-F1-S1-T1"
+        unit.repo = "caylent-solutions/example"
+        parser = MagicMock()
+        parser.parse_index.return_value = [unit]
+        runtime_cfg = MagicMock()
+        runtime_cfg.task_factory.auto_accept_proposals = True
+        runtime_cfg.task_factory.enabled = True
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.BACKLOG_ROOT", workspace / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", workspace / "BACKLOG.md"),
+            patch("devbench.cli.BacklogParser", return_value=parser),
+            patch("devbench.cli.RUNTIME_CONFIG", runtime_cfg),
+        ):
+            rc = cli.cmd_sweep_proposals()
+        assert rc == 0
+
+        # Both drafts ended at in-queue.
+        story = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        t2 = (story / "E0-F1-S1-T2.md").read_text()
+        t3 = (story / "E0-F1-S1-T3.md").read_text()
+        assert "## Status: in-queue" in t2
+        assert "## Status: in-queue" in t3
+
+        # Audit suffix landed on source task comments (one per wired draft).
+        source_text = (story / "E0-F1-S1-T1.md").read_text()
+        assert source_text.count("auto-accepted via task_factory.auto_accept_proposals=true") == 2
+        # BLOCKED_PENDING_PROPOSAL markers also present per ADR-07 contract.
+        assert "[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2" in source_text
+        assert "[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T3" in source_text
+
+
 class TestTaskFactoryLifecycleSkipWhenUnresolved:
     def test_second_materialise_skipped_when_prior_unresolved(self, tmp_path: Path) -> None:
         workspace = _workspace(tmp_path)

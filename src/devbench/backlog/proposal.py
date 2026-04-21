@@ -25,7 +25,7 @@ import logging
 import re
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -132,6 +132,75 @@ def classify_proposed_task(backlog_root: Path, workspace_root: Path, suggested_i
     return ProposalTaskState.PROMOTED
 
 
+class BlockedTaskState(Enum):
+    """Lifecycle classifier for ``blocked`` work units (ADR-10 companion to ADR-08).
+
+    Separates blocked tasks the operator should engage with from blocked
+    tasks the ADR-07 auto-requeue cascade will resolve on its own.
+
+    - ``AUTO_CLEARING_VIA_PROPOSAL`` -- carries at least one
+      ``[BLOCKED_PENDING_PROPOSAL]`` marker whose targets all exist in the
+      backlog AND at least one of which is non-terminal. The cascade fires
+      the moment every marker target reaches ``done`` / ``declined``.
+    - ``NEEDS_OPERATOR_ATTENTION`` -- everything else. No markers, OR some
+      marker targets are unknown to the backlog, OR every marker is already
+      terminal (cascade should have fired already and did not -- diagnostic
+      signal worth surfacing).
+    """
+
+    AUTO_CLEARING_VIA_PROPOSAL = "auto-clearing"
+    NEEDS_OPERATOR_ATTENTION = "needs-attention"
+
+
+def classify_blocked_task(
+    backlog_root: Path,
+    backlog_index: Path,
+    task_id: str,
+) -> BlockedTaskState:
+    """Classify ``task_id`` as auto-clearing vs needs-operator-attention.
+
+    Caller is responsible for having already determined the task is
+    currently in ``blocked`` status; this function does not re-check status.
+
+    Reuses :meth:`BacklogManager._extract_pending_proposal_markers` and
+    :meth:`BacklogManager._parse_backlog_rows` so the classification logic
+    stays in lockstep with the ADR-07 cascade's own view of marker state.
+    """
+    source_file = _find_source_task_file(backlog_root, backlog_index, task_id)
+    if source_file is None:
+        return BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+
+    mgr = BacklogManager()
+    marker_ids = mgr._extract_pending_proposal_markers(source_file)
+    if not marker_ids:
+        return BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+
+    try:
+        rows = mgr._parse_backlog_rows(backlog_index)
+    except FileNotFoundError:
+        return BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+    status_by_id = {row_id: status for row_id, status, _ in rows if row_id}
+
+    terminal = {STATUS_DONE, STATUS_DECLINED}
+    non_terminal_marker_found = False
+    for marker in marker_ids:
+        if marker not in status_by_id:
+            # Marker points at an ID that is no longer in the backlog -- the
+            # cascade cannot resolve this. Operator attention required.
+            return BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+        if status_by_id[marker] not in terminal:
+            non_terminal_marker_found = True
+
+    if not non_terminal_marker_found:
+        # Every marker is already terminal; cascade should have fired. It
+        # did not (otherwise this task would not still be blocked). Flag
+        # for operator review -- something went wrong or this task carries
+        # an extra non-cascade blocker the operator needs to address.
+        return BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+
+    return BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL
+
+
 def _read_draft_status(draft_path: Path) -> str:
     """Read the ``## Status:`` value from a draft .md file.
 
@@ -178,12 +247,21 @@ class ProposedTask:
 
 @dataclass(frozen=True)
 class Proposal:
-    """Complete payload emitted by blocker-resolver after an amendment reject."""
+    """Complete payload emitted by blocker-resolver after an amendment reject.
+
+    ``affected_task_ids`` (ADR-10) lists peer tasks that share the same underlying
+    blocker as ``source_task_id``. When ``promote-proposal`` runs, the
+    ``[BLOCKED_PENDING_PROPOSAL]`` marker + Dependencies-table row is written on
+    the source AND on every id in ``affected_task_ids``, so the ADR-07 cascade
+    auto-unblocks each of them when the fix completes. Field is optional; empty
+    list preserves pre-ADR-10 1:1 wiring.
+    """
 
     source_task_id: str
     generated_at: str
     rejection_reason: str
     proposed_tasks: list[ProposedTask]
+    affected_task_ids: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         """JSON-serialisable form used for on-disk storage."""
@@ -192,6 +270,7 @@ class Proposal:
             "generated_at": self.generated_at,
             "rejection_reason": self.rejection_reason,
             "proposed_tasks": [asdict(t) for t in self.proposed_tasks],
+            "affected_task_ids": list(self.affected_task_ids),
         }
 
     @classmethod
@@ -230,12 +309,46 @@ class Proposal:
                     suggested_approach=str(entry["suggested_approach"]),
                 )
             )
+
+        source_id = str(data["source_task_id"]).strip()
+        affected = _parse_affected_task_ids(data.get("affected_task_ids", []), source_id)
+
         return cls(
-            source_task_id=str(data["source_task_id"]).strip(),
+            source_task_id=source_id,
             generated_at=str(data["generated_at"]),
             rejection_reason=str(data["rejection_reason"]),
             proposed_tasks=tasks,
+            affected_task_ids=affected,
         )
+
+
+def _parse_affected_task_ids(raw: object, source_id: str) -> list[str]:
+    """Validate + normalise the ``affected_task_ids`` field of a proposal JSON.
+
+    Extracted from ``Proposal.from_dict`` to keep that classmethod's branch
+    count under the project's complexity ceiling. Raises ``ValueError`` with
+    a message naming the offending entry on any schema violation.
+    """
+    if not isinstance(raw, list):
+        raise ValueError("Proposal.affected_task_ids must be a list of task IDs")
+    affected: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, str):
+            raise ValueError(f"Proposal.affected_task_ids entry must be a string, got {type(item).__name__}")
+        normalised = item.strip()
+        if not normalised:
+            raise ValueError("Proposal.affected_task_ids contains an empty entry")
+        if normalised == source_id:
+            raise ValueError(
+                f"Proposal.affected_task_ids duplicates source_task_id '{source_id}'; "
+                "the source is always wired, so it must not appear in affected_task_ids"
+            )
+        if normalised in seen:
+            raise ValueError(f"Proposal.affected_task_ids contains duplicate entry '{normalised}'")
+        seen.add(normalised)
+        affected.append(normalised)
+    return affected
 
 
 class ProposalError(RuntimeError):
@@ -730,6 +843,36 @@ def _find_source_task_file(backlog_root: Path, backlog_index: Path, task_id: str
     return None
 
 
+@dataclass(frozen=True)
+class PromoteResult:
+    """Return value of :func:`promote_proposal`.
+
+    - ``draft_path`` -- file path of the promoted draft (backward-compatible
+      with pre-ADR-10 callers that expected a ``Path``).
+    - ``wired_targets`` -- ordered list of task IDs that received the
+      ``[BLOCKED_PENDING_PROPOSAL]`` marker. Always starts with the source
+      task ID (when ``dep_on_source=True``); every entry from
+      :attr:`Proposal.affected_task_ids` follows in declared order.
+    """
+
+    draft_path: Path
+    wired_targets: list[str]
+
+
+def _find_originating_proposal(workspace_root: Path, promoted_task_id: str) -> Proposal | None:
+    """Return the ``Proposal`` that authored ``promoted_task_id``, or ``None``.
+
+    Companion to :func:`_find_originating_source_task` that surfaces the full
+    payload so callers can read :attr:`Proposal.affected_task_ids` without a
+    second disk read.
+    """
+    for proposal in list_proposals(workspace_root):
+        for task in proposal.proposed_tasks:
+            if task.suggested_id == promoted_task_id:
+                return proposal
+    return None
+
+
 def promote_proposal(
     *,
     workspace_root: Path,
@@ -737,10 +880,28 @@ def promote_proposal(
     backlog_index: Path,
     task_id: str,
     dep_on_source: bool = True,
-) -> Path:
-    """Flip a proposed task to ``in-queue`` and (optionally) wire it as a source-task dep.
+    audit_suffix: str = "",
+) -> PromoteResult:
+    """Flip a proposed task to ``in-queue`` and wire it as a source + affected-task dep.
 
-    Returns the path to the promoted draft file.
+    Wiring targets (ADR-10): ``[source_task_id] + affected_task_ids`` from the
+    originating proposal, deduplicated, order-preserved. Every target receives
+    the ``[BLOCKED_PENDING_PROPOSAL] <task_id>`` marker on its Comments section
+    so the ADR-07 cascade can auto-unblock each of them when ``task_id``
+    reaches a terminal state.
+
+    ``dep_on_source=False`` skips adding the Dependencies-table row on the
+    source task only. Every entry in ``affected_task_ids`` still gets its row
+    and marker -- the flag addresses the narrow case where the promoted draft
+    is independent of its source, not peer tasks that an author explicitly
+    listed as affected.
+
+    Fail-fast: if any target in the computed list is not present in the
+    backlog index, the function raises :class:`ProposalError` BEFORE writing
+    anything so a partial wiring cannot happen.
+
+    Returns :class:`PromoteResult` carrying the draft path and the list of
+    wired task IDs (for CLI output + audit).
     """
     draft = _find_draft_file(backlog_root, task_id)
     if draft is None:
@@ -750,17 +911,50 @@ def promote_proposal(
     # Refresh Status Summary counts after the status flip.
     BacklogManager()._update_status_summary(backlog_index)
 
-    if dep_on_source:
-        source = _find_originating_source_task(workspace_root, task_id)
-        if source is not None:
-            _append_dependency_to_source(backlog_root, backlog_index, source, task_id)
-            source_file = _find_source_task_file(backlog_root, backlog_index, source)
-            if source_file is not None:
-                _append_promote_comment(source_file, source, task_id)
-    return draft
+    wired_targets: list[str] = []
+    proposal = _find_originating_proposal(workspace_root, task_id)
+    if proposal is not None:
+        # Compute the dedup'd, order-preserved target list.
+        targets: list[str] = [proposal.source_task_id]
+        for extra in proposal.affected_task_ids:
+            if extra not in targets:
+                targets.append(extra)
+
+        # Fail-fast: every affected target must exist in the backlog.
+        # _find_originating_proposal always returns the actual source so it
+        # is guaranteed to be present; we only need to validate the affected
+        # entries. Validation happens BEFORE any write so a missing peer does
+        # not leave the source half-wired.
+        for target_id in targets[1:]:
+            if _find_source_task_file(backlog_root, backlog_index, target_id) is None:
+                raise ProposalError(
+                    f"promote-proposal {task_id}: affected target '{target_id}' "
+                    "not found in backlog index; cannot wire dependency."
+                )
+
+        # Now wire every target. Writes are idempotent-per-file individually
+        # (the helpers append but do not duplicate existing rows/markers).
+        for target_id in targets:
+            source_file = _find_source_task_file(backlog_root, backlog_index, target_id)
+            if source_file is None:
+                # Source itself was not in index; back-compat with pre-ADR-10
+                # tests that build minimal fixtures without a full backlog.
+                continue
+            if dep_on_source or target_id != proposal.source_task_id:
+                _append_dependency_to_source(backlog_root, backlog_index, target_id, task_id)
+                _append_promote_comment(source_file, target_id, task_id, audit_suffix=audit_suffix)
+                wired_targets.append(target_id)
+                logger.info("promote-proposal: wired marker + dep on %s", target_id)
+
+    return PromoteResult(draft_path=draft, wired_targets=wired_targets)
 
 
-def _append_promote_comment(source_file: Path, source_task_id: str, promoted_task_id: str) -> None:
+def _append_promote_comment(
+    source_file: Path,
+    source_task_id: str,
+    promoted_task_id: str,
+    audit_suffix: str = "",
+) -> None:
     """Append an audit line naming both the promotion and the pending-proposal marker.
 
     Writes a single comment to ``source_file``'s Comments section containing
@@ -775,13 +969,20 @@ def _append_promote_comment(source_file: Path, source_task_id: str, promoted_tas
     Writing both markers on the same comment line keeps the audit trail
     compact while preserving the state marker's scan-scoped position in
     the Comments section.
+
+    ``audit_suffix`` (ADR-11) -- optional short parenthetical inserted
+    between the ``[PROPOSAL_PROMOTED]`` description and the
+    ``[BLOCKED_PENDING_PROPOSAL]`` marker. Used by the sweep-time auto-
+    accept path to record that no human pressed the button. Default empty
+    preserves pre-ADR-11 byte-identical audit output.
     """
     timestamp = datetime.now(tz=UTC).strftime(COMMENT_TIMESTAMP_FORMAT)
+    suffix = f" {audit_suffix.strip()}" if audit_suffix.strip() else ""
     entry = COMMENT_AGENT_TEMPLATE.format(
         timestamp=timestamp,
         name="task_factory",
         message=(
-            f"[PROPOSAL_PROMOTED] {promoted_task_id} promoted and wired as dependency of {source_task_id}. "
+            f"[PROPOSAL_PROMOTED] {promoted_task_id} promoted and wired as dependency of {source_task_id}.{suffix} "
             f"[BLOCKED_PENDING_PROPOSAL] {promoted_task_id}"
         ),
     )
@@ -791,6 +992,125 @@ def _append_promote_comment(source_file: Path, source_task_id: str, promoted_tas
     else:
         content = content.rstrip("\n") + "\n\n" + COMMENTS_SECTION_HEADER + "\n\n" + entry
     source_file.write_text(content, encoding="utf-8")
+
+
+def _append_manual_dep_comment(
+    source_file: Path,
+    blocked_task_id: str,
+    blocker_task_id: str,
+    reason: str,
+) -> None:
+    """Append a ``[WU_WIRED] ... [BLOCKED_PENDING_PROPOSAL]`` audit line (ADR-10 operator path).
+
+    Parallels :func:`_append_promote_comment` but signs the comment with
+    ``name="operator"`` instead of ``name="task_factory"`` so reviewers can
+    distinguish an ad-hoc wire (`devbench add-dep`) from the task-factory
+    promote flow. The underlying ``[BLOCKED_PENDING_PROPOSAL] <id>`` marker
+    is byte-identical to the promote-written one so the ADR-07 cascade
+    treats both the same.
+
+    Idempotent: callers pass a source file already verified to not contain
+    the marker; this helper only does the write.
+    """
+    timestamp = datetime.now(tz=UTC).strftime(COMMENT_TIMESTAMP_FORMAT)
+    reason_body = f": {reason}" if reason else ""
+    entry = COMMENT_AGENT_TEMPLATE.format(
+        timestamp=timestamp,
+        name="operator",
+        message=(
+            f"[WU_WIRED] {blocked_task_id} manually blocked on {blocker_task_id} "
+            f"via `devbench add-dep`{reason_body}. "
+            f"[BLOCKED_PENDING_PROPOSAL] {blocker_task_id}"
+        ),
+    )
+    content = source_file.read_text(encoding="utf-8")
+    if COMMENTS_SECTION_HEADER in content:
+        content = content.rstrip("\n") + "\n\n" + entry
+    else:
+        content = content.rstrip("\n") + "\n\n" + COMMENTS_SECTION_HEADER + "\n\n" + entry
+    source_file.write_text(content, encoding="utf-8")
+
+
+def _comments_have_marker(source_file: Path, marker_task_id: str) -> bool:
+    """Return True when the source file already carries a ``[BLOCKED_PENDING_PROPOSAL] <id>`` marker."""
+    needle = f"[BLOCKED_PENDING_PROPOSAL] {marker_task_id}"
+    return needle in source_file.read_text(encoding="utf-8")
+
+
+def _dep_row_has_task(source_file: Path, dep_task_id: str) -> bool:
+    """Return True when the source file's ``## Dependencies`` table already lists ``dep_task_id``."""
+    text = source_file.read_text(encoding="utf-8")
+    # Match "| <id> |" in a Dependencies row; conservative enough to catch
+    # pre-existing rows written by _append_dependency_to_source or hand-edits.
+    return f"| {dep_task_id} |" in text
+
+
+def add_dep(
+    *,
+    backlog_root: Path,
+    backlog_index: Path,
+    blocked_task_id: str,
+    blocker_task_id: str,
+    reason: str = "",
+) -> bool:
+    """Wire ``blocker_task_id`` as a dependency of ``blocked_task_id``. Idempotent.
+
+    Writes a Dependencies-table row AND a ``[WU_WIRED] ... [BLOCKED_PENDING_PROPOSAL] <blocker>``
+    audit comment on the blocked task's file. Used by ``devbench add-dep`` to wire
+    cross-task markers post-promote, for hand-authored tasks, or to correct a
+    proposal that was authored without ``affected_task_ids``.
+
+    Fail-fast:
+      - ``blocker_task_id`` must be present in the backlog index.
+      - ``blocker_task_id`` must NOT be in a terminal state (``done`` / ``declined``).
+      - ``blocked_task_id`` must be present in the backlog index.
+
+    Returns ``True`` when at least one of (dep row, marker) was newly written,
+    ``False`` when the call was a complete no-op (both already present).
+
+    The ADR-07 cascade fires only when the blocked task's status is ``blocked``.
+    If ``blocked_task_id`` is currently NOT in ``blocked`` status, this function
+    still writes the marker (harmless metadata) but the CLI wrapper surfaces a
+    warning so the operator can choose whether to flip the status.
+    """
+    from devbench.backlog.parser import BacklogParser
+    from devbench.backlog.work_unit import WorkUnitStatus
+
+    if blocked_task_id == blocker_task_id:
+        raise ProposalError(f"add-dep: blocked and blocker cannot be the same task ({blocked_task_id})")
+
+    blocker_file = _find_source_task_file(backlog_root, backlog_index, blocker_task_id)
+    if blocker_file is None:
+        raise ProposalError(
+            f"add-dep: blocker task '{blocker_task_id}' not found in backlog index; cannot wire dependency."
+        )
+
+    blocked_file = _find_source_task_file(backlog_root, backlog_index, blocked_task_id)
+    if blocked_file is None:
+        raise ProposalError(
+            f"add-dep: blocked task '{blocked_task_id}' not found in backlog index; cannot wire dependency."
+        )
+
+    parser = BacklogParser(backlog_root=backlog_root, backlog_index=backlog_index)
+    units = parser.parse_index()
+    blocker_unit = next((u for u in units if u.id == blocker_task_id), None)
+    if blocker_unit is not None and blocker_unit.status in (WorkUnitStatus.DONE, WorkUnitStatus.DECLINED):
+        raise ProposalError(
+            f"add-dep: blocker task '{blocker_task_id}' is already terminal "
+            f"(status={blocker_unit.status.value}); wiring a dep on a terminal task is a no-op."
+        )
+
+    wrote_row = False
+    if not _dep_row_has_task(blocked_file, blocker_task_id):
+        _append_dependency_to_source(backlog_root, backlog_index, blocked_task_id, blocker_task_id)
+        wrote_row = True
+
+    wrote_marker = False
+    if not _comments_have_marker(blocked_file, blocker_task_id):
+        _append_manual_dep_comment(blocked_file, blocked_task_id, blocker_task_id, reason)
+        wrote_marker = True
+
+    return wrote_row or wrote_marker
 
 
 def _find_originating_source_task(workspace_root: Path, promoted_task_id: str) -> str | None:
@@ -821,15 +1141,14 @@ def promote_all_from_source(
         raise ProposalError(f"Cannot resolve proposals for {source_task_id}: {exc}") from exc
     promoted: list[Path] = []
     for entry in proposal.proposed_tasks:
-        promoted.append(
-            promote_proposal(
-                workspace_root=workspace_root,
-                backlog_root=backlog_root,
-                backlog_index=backlog_index,
-                task_id=entry.suggested_id,
-                dep_on_source=dep_on_source,
-            )
+        result = promote_proposal(
+            workspace_root=workspace_root,
+            backlog_root=backlog_root,
+            backlog_index=backlog_index,
+            task_id=entry.suggested_id,
+            dep_on_source=dep_on_source,
         )
+        promoted.append(result.draft_path)
     return promoted
 
 

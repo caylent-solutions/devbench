@@ -259,9 +259,12 @@ Procedure (execute in order -- each step is load-bearing):
      "source_task_id": "<this work unit's ID>",
      "generated_at": "<UTC ISO-8601 timestamp>",
      "rejection_reason": "Validation gate surfaced bugs outside its Approach scope; <brief summary>",
+     "affected_task_ids": [],
      "proposed_tasks": [ ... ]
    }
    ```
+
+   The `affected_task_ids` field (ADR-10) is OPTIONAL and defaults to an empty list. Populate it ONLY when you have concrete evidence that another currently-blocked work unit is waiting on the same bug this proposal will fix (same failing test name, same production file in both blocker comments, etc.). See `blocker-resolver.md` > "`affected_task_ids` -- list peer tasks the fix unblocks" for the full evidence rubric. When in doubt leave it empty; the operator can wire additional targets later via `devbench add-dep`.
 
 4. Pipe the JSON into `write-proposal` on stdin:
 

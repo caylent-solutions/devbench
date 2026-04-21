@@ -95,3 +95,7 @@ Implement twelve small slices as one PR. Every slice has tests.
 - `docs/task-factory.md`
 - `docs/faq.md`
 - `docs/architecture.md`
+
+## Cross-reference with ADR-10
+
+[ADR-10: Multi-target proposal wiring](10-multi-target-proposal-wiring.md) adds `affected_task_ids` to the proposal schema and extends `promote_proposal` to wire the marker on every task in the list. ADR-10 does not introduce a new lifecycle state -- the six-state model documented in this ADR is unchanged, and `classify_proposed_task` renders identical output for both single-target and multi-target proposals.

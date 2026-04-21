@@ -1316,3 +1316,115 @@ class TestManifestAmendmentConfig:
         )
         with pytest.raises(ValueError, match="schema validation"):
             load_runtime_config(cfg, {})
+
+
+class TestTaskFactoryConfig:
+    """ADR-11: YAML loader correctly parses the opt-in task_factory section including auto_accept_proposals."""
+
+    @staticmethod
+    def _write(path: Path, content: str) -> Path:
+        import textwrap
+
+        path.write_text(textwrap.dedent(content))
+        return path
+
+    def test_defaults_when_section_absent(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.task_factory.enabled is False
+        assert result.task_factory.auto_accept_proposals is False
+
+    def test_auto_accept_defaults_false_when_key_omitted(self, tmp_path: Path) -> None:
+        """Key omitted inside an enabled task_factory block -> default False (backward-compatible)."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            manifest_amendment:
+              enabled: true
+            task_factory:
+              enabled: true
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.task_factory.enabled is True
+        assert result.task_factory.auto_accept_proposals is False
+
+    def test_auto_accept_accepts_explicit_false(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            manifest_amendment:
+              enabled: true
+            task_factory:
+              enabled: true
+              auto_accept_proposals: false
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.task_factory.auto_accept_proposals is False
+
+    def test_auto_accept_accepts_explicit_true(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            manifest_amendment:
+              enabled: true
+            task_factory:
+              enabled: true
+              auto_accept_proposals: true
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.task_factory.auto_accept_proposals is True
+
+    def test_schema_rejects_auto_accept_non_boolean_string(self, tmp_path: Path) -> None:
+        """String "true" is not a YAML boolean; schema validation must reject."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            manifest_amendment:
+              enabled: true
+            task_factory:
+              enabled: true
+              auto_accept_proposals: "true"
+            """,
+        )
+        with pytest.raises(ValueError, match="schema validation"):
+            load_runtime_config(cfg, {})
+
+    def test_schema_rejects_auto_accept_integer(self, tmp_path: Path) -> None:
+        """Integer 1 is not a boolean for schema purposes."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            manifest_amendment:
+              enabled: true
+            task_factory:
+              enabled: true
+              auto_accept_proposals: 1
+            """,
+        )
+        with pytest.raises(ValueError, match="schema validation"):
+            load_runtime_config(cfg, {})

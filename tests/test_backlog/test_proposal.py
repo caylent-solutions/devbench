@@ -764,15 +764,17 @@ class TestPromoteProposal:
             proposal=proposal,
             repo="caylent-solutions/example",
         )
-        draft = promote_proposal(
+        result = promote_proposal(
             workspace_root=workspace,
             backlog_root=workspace / "backlog",
             backlog_index=workspace / "BACKLOG.md",
             task_id="E0-F1-S1-T2",
         )
-        assert draft.is_file()
+        assert result.draft_path.is_file()
         # Draft status flipped.
-        assert "## Status: in-queue" in draft.read_text()
+        assert "## Status: in-queue" in result.draft_path.read_text()
+        # Source task was the sole wired target (no affected_task_ids in fixture).
+        assert result.wired_targets == ["E0-F1-S1-T1"]
         # Source task now has a dep on the promoted task.
         source = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
         assert "| E0-F1-S1-T2 |" in source.read_text()
@@ -858,6 +860,42 @@ class TestPromoteProposal:
         assert "[BLOCKED_PENDING_PROPOSAL]" not in source.read_text()
 
 
+class TestPromoteCommentAuditSuffix:
+    """ADR-11: _append_promote_comment optional audit_suffix kwarg."""
+
+    def test_append_promote_comment_has_no_suffix_when_not_supplied(self, tmp_path: Path) -> None:
+        """Back-compat pin: today's byte-identical marker line."""
+        from devbench.backlog.proposal import _append_promote_comment
+
+        source = tmp_path / "src.md"
+        source.write_text("# E0-F1-S1-T1: X\n\n## Status: blocked\n\n## Description\n\nx\n")
+        _append_promote_comment(source, "E0-F1-S1-T1", "E0-F1-S1-T2")
+        text = source.read_text()
+        assert (
+            "[PROPOSAL_PROMOTED] E0-F1-S1-T2 promoted and wired as dependency of E0-F1-S1-T1. "
+            "[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2"
+        ) in text
+        assert "auto-accepted" not in text
+
+    def test_append_promote_comment_appends_audit_suffix_when_supplied(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import _append_promote_comment
+
+        source = tmp_path / "src.md"
+        source.write_text("# E0-F1-S1-T1: X\n\n## Status: blocked\n\n## Description\n\nx\n")
+        _append_promote_comment(
+            source,
+            "E0-F1-S1-T1",
+            "E0-F1-S1-T2",
+            audit_suffix="(auto-accepted via task_factory.auto_accept_proposals=true)",
+        )
+        text = source.read_text()
+        assert (
+            "[PROPOSAL_PROMOTED] E0-F1-S1-T2 promoted and wired as dependency of E0-F1-S1-T1."
+            " (auto-accepted via task_factory.auto_accept_proposals=true) "
+            "[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2"
+        ) in text
+
+
 class TestPromoteAllFromSource:
     def test_missing_proposal_raises(self, tmp_path: Path) -> None:
         workspace = _build_workspace(tmp_path)
@@ -887,6 +925,333 @@ class TestPromoteAllFromSource:
             source_task_id="E0-F1-S1-T1",
         )
         assert len(promoted) == 2
+
+
+class TestProposalAffectedTaskIds:
+    """ADR-10: Proposal.affected_task_ids schema."""
+
+    def _base_payload(self) -> dict:
+        return {
+            "source_task_id": "E0-F1-S1-T1",
+            "generated_at": "2026-04-20T00:00:00Z",
+            "rejection_reason": "test fixture",
+            "proposed_tasks": [],
+        }
+
+    def test_from_dict_accepts_missing_field_defaults_empty(self) -> None:
+        payload = self._base_payload()
+        assert "affected_task_ids" not in payload
+        p = Proposal.from_dict(payload)
+        assert p.affected_task_ids == []
+
+    def test_from_dict_accepts_empty_list(self) -> None:
+        payload = {**self._base_payload(), "affected_task_ids": []}
+        assert Proposal.from_dict(payload).affected_task_ids == []
+
+    def test_from_dict_accepts_single_entry(self) -> None:
+        payload = {**self._base_payload(), "affected_task_ids": ["E0-F1-S1-T9"]}
+        assert Proposal.from_dict(payload).affected_task_ids == ["E0-F1-S1-T9"]
+
+    def test_from_dict_accepts_multiple_entries(self) -> None:
+        payload = {**self._base_payload(), "affected_task_ids": ["E0-F2-S1-T1", "E0-F3-S1-T1"]}
+        assert Proposal.from_dict(payload).affected_task_ids == ["E0-F2-S1-T1", "E0-F3-S1-T1"]
+
+    def test_from_dict_rejects_non_list(self) -> None:
+        payload = {**self._base_payload(), "affected_task_ids": "E0-F1-S1-T9"}
+        with pytest.raises(ValueError, match="must be a list"):
+            Proposal.from_dict(payload)
+
+    def test_from_dict_rejects_non_string_entry(self) -> None:
+        payload = {**self._base_payload(), "affected_task_ids": [123]}
+        with pytest.raises(ValueError, match="must be a string"):
+            Proposal.from_dict(payload)
+
+    def test_from_dict_rejects_empty_string_entry(self) -> None:
+        payload = {**self._base_payload(), "affected_task_ids": [""]}
+        with pytest.raises(ValueError, match="empty entry"):
+            Proposal.from_dict(payload)
+
+    def test_from_dict_rejects_duplicate_entries(self) -> None:
+        payload = {**self._base_payload(), "affected_task_ids": ["E0-F2-S1-T1", "E0-F2-S1-T1"]}
+        with pytest.raises(ValueError, match="duplicate entry"):
+            Proposal.from_dict(payload)
+
+    def test_from_dict_rejects_source_task_id_duplicated_in_affected(self) -> None:
+        payload = {**self._base_payload(), "affected_task_ids": ["E0-F1-S1-T1"]}
+        with pytest.raises(ValueError, match="duplicates source_task_id"):
+            Proposal.from_dict(payload)
+
+    def test_from_dict_strips_whitespace(self) -> None:
+        payload = {**self._base_payload(), "affected_task_ids": ["  E0-F2-S1-T1  "]}
+        assert Proposal.from_dict(payload).affected_task_ids == ["E0-F2-S1-T1"]
+
+    def test_to_dict_round_trip_preserves_order(self) -> None:
+        original = Proposal(
+            source_task_id="E0-F1-S1-T1",
+            generated_at="t",
+            rejection_reason="r",
+            proposed_tasks=[],
+            affected_task_ids=["E0-F3-S1-T1", "E0-F2-S1-T1"],
+        )
+        reloaded = Proposal.from_dict(original.to_dict())
+        assert reloaded.affected_task_ids == ["E0-F3-S1-T1", "E0-F2-S1-T1"]
+
+    def test_to_dict_always_emits_key_even_when_empty(self) -> None:
+        p = Proposal(
+            source_task_id="E0-F1-S1-T1",
+            generated_at="t",
+            rejection_reason="r",
+            proposed_tasks=[],
+        )
+        out = p.to_dict()
+        assert "affected_task_ids" in out
+        assert out["affected_task_ids"] == []
+
+
+class TestPromoteProposalAffectedWiring:
+    """ADR-10: promote_proposal wires [source] + affected_task_ids; fail-fast on missing targets."""
+
+    def _build_workspace_with_peers(self, tmp_path: Path, peer_ids: list[str]) -> Path:
+        """Build a workspace with source task T1 + one peer task per id in peer_ids."""
+        (tmp_path / "BACKLOG.md").write_text(_BACKLOG_TEMPLATE)
+        story_dir = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+        (story_dir / "E0-F1-S1-T1.md").write_text(_SOURCE_TASK_TEMPLATE.format(task_id="E0-F1-S1-T1"))
+        for peer_id in peer_ids:
+            (story_dir / f"{peer_id}.md").write_text(_SOURCE_TASK_TEMPLATE.format(task_id=peer_id))
+            _append_backlog_row(
+                tmp_path / "BACKLOG.md",
+                _render_backlog_row(
+                    peer_id,
+                    f"Peer {peer_id}",
+                    "blocked",
+                    "caylent-solutions/example",
+                    f"backlog/E0/E0-F1/E0-F1-S1/{peer_id}.md",
+                ),
+            )
+        return tmp_path
+
+    def _materialise_fixture(self, workspace: Path, peer_ids: list[str]) -> None:
+        proposal = Proposal(
+            source_task_id="E0-F1-S1-T1",
+            generated_at="2026-04-20T00:00:00Z",
+            rejection_reason="r",
+            proposed_tasks=[
+                ProposedTask(
+                    suggested_id="E0-F1-S1-T2",
+                    title="Fix",
+                    files_to_own=["src/x.py"],
+                    linked_scenarios=["SC-01"],
+                    suggested_acs=["AC-001 fix"],
+                    suggested_approach=(
+                        "Context: ADR-10 multi-target wiring unit-test fixture. "
+                        "Scope: src/x.py and a matching unit test. "
+                        "TDD approach: 1. RED -- write failing assertion. "
+                        "2. GREEN -- minimal fix. 3. REFACTOR -- no behaviour change. "
+                        "Verify: make lint && make test-unit both exit zero."
+                    ),
+                )
+            ],
+            affected_task_ids=peer_ids,
+        )
+        write_proposal(workspace, proposal)
+        materialise_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            proposal=proposal,
+            repo="caylent-solutions/example",
+        )
+
+    def test_promote_wires_source_only_when_affected_empty(self, tmp_path: Path) -> None:
+        """Back-compat: empty affected_task_ids wires only the source task."""
+        workspace = self._build_workspace_with_peers(tmp_path, peer_ids=[])
+        self._materialise_fixture(workspace, peer_ids=[])
+
+        result = promote_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            task_id="E0-F1-S1-T2",
+        )
+        assert result.wired_targets == ["E0-F1-S1-T1"]
+
+    def test_promote_wires_source_plus_affected_when_populated(self, tmp_path: Path) -> None:
+        """ADR-10 primary behaviour: marker + dep land on source + every affected entry."""
+        workspace = self._build_workspace_with_peers(tmp_path, peer_ids=["E0-F1-S1-T3", "E0-F1-S1-T4"])
+        self._materialise_fixture(workspace, peer_ids=["E0-F1-S1-T3", "E0-F1-S1-T4"])
+
+        result = promote_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            task_id="E0-F1-S1-T2",
+        )
+        assert result.wired_targets == ["E0-F1-S1-T1", "E0-F1-S1-T3", "E0-F1-S1-T4"]
+        # Marker lands on every target's Comments.
+        for tid in result.wired_targets:
+            text = (workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / f"{tid}.md").read_text()
+            assert "[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2" in text
+
+    def test_promote_fails_fast_when_affected_target_missing_from_backlog(self, tmp_path: Path) -> None:
+        """Missing peer ID raises before any write so the source is never half-wired."""
+        workspace = self._build_workspace_with_peers(tmp_path, peer_ids=[])
+        # peer T99 is in affected_task_ids but does NOT exist in backlog.
+        self._materialise_fixture(workspace, peer_ids=["E0-F1-S1-T99"])
+
+        with pytest.raises(ProposalError, match=r"E0-F1-S1-T99.*not found in backlog"):
+            promote_proposal(
+                workspace_root=workspace,
+                backlog_root=workspace / "backlog",
+                backlog_index=workspace / "BACKLOG.md",
+                task_id="E0-F1-S1-T2",
+            )
+        # Source task must NOT have been partially wired -- no marker written.
+        source_text = (workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md").read_text()
+        assert "[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2" not in source_text
+
+    def test_promote_no_dep_on_source_still_wires_affected_deps(self, tmp_path: Path) -> None:
+        """`--no-dep-on-source` skips only the source; affected entries still get their row + marker."""
+        workspace = self._build_workspace_with_peers(tmp_path, peer_ids=["E0-F1-S1-T3"])
+        self._materialise_fixture(workspace, peer_ids=["E0-F1-S1-T3"])
+
+        result = promote_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            task_id="E0-F1-S1-T2",
+            dep_on_source=False,
+        )
+        assert result.wired_targets == ["E0-F1-S1-T3"]
+        # Source did NOT get the marker.
+        source = (workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md").read_text()
+        assert "[BLOCKED_PENDING_PROPOSAL]" not in source
+        # Peer DID get the marker.
+        peer = (workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T3.md").read_text()
+        assert "[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2" in peer
+
+    def test_promote_wires_in_declared_order(self, tmp_path: Path) -> None:
+        """Target list preserves declared order so audit reads naturally."""
+        workspace = self._build_workspace_with_peers(tmp_path, peer_ids=["E0-F1-S1-T4", "E0-F1-S1-T3"])
+        self._materialise_fixture(workspace, peer_ids=["E0-F1-S1-T4", "E0-F1-S1-T3"])
+
+        result = promote_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            task_id="E0-F1-S1-T2",
+        )
+        # Source first, then affected in declared order.
+        assert result.wired_targets == ["E0-F1-S1-T1", "E0-F1-S1-T4", "E0-F1-S1-T3"]
+
+
+class TestAddDepCoreHelper:
+    """ADR-10: add_dep() core helper (called by cmd_add_dep)."""
+
+    def _workspace(self, tmp_path: Path) -> Path:
+        (tmp_path / "BACKLOG.md").write_text(_BACKLOG_TEMPLATE)
+        story_dir = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+        (story_dir / "E0-F1-S1-T1.md").write_text(_SOURCE_TASK_TEMPLATE.format(task_id="E0-F1-S1-T1"))
+        (story_dir / "E0-F1-S1-T2.md").write_text(_SOURCE_TASK_TEMPLATE.format(task_id="E0-F1-S1-T2"))
+        _append_backlog_row(
+            tmp_path / "BACKLOG.md",
+            _render_backlog_row(
+                "E0-F1-S1-T2",
+                "Fix",
+                "in-queue",
+                "caylent-solutions/example",
+                "backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T2.md",
+            ),
+        )
+        return tmp_path
+
+    def test_add_dep_writes_row_and_marker_when_absent(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import add_dep
+
+        workspace = self._workspace(tmp_path)
+        wrote = add_dep(
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            blocked_task_id="E0-F1-S1-T1",
+            blocker_task_id="E0-F1-S1-T2",
+            reason="ADR-10 smoke test",
+        )
+        assert wrote is True
+        source_text = (workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md").read_text()
+        assert "| E0-F1-S1-T2 |" in source_text
+        assert "[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2" in source_text
+        assert "[WU_WIRED]" in source_text
+        assert "[agent/operator]" in source_text
+        assert "ADR-10 smoke test" in source_text
+
+    def test_add_dep_is_idempotent_on_repeated_call(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import add_dep
+
+        workspace = self._workspace(tmp_path)
+        first = add_dep(
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            blocked_task_id="E0-F1-S1-T1",
+            blocker_task_id="E0-F1-S1-T2",
+        )
+        second = add_dep(
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            blocked_task_id="E0-F1-S1-T1",
+            blocker_task_id="E0-F1-S1-T2",
+        )
+        assert first is True
+        assert second is False
+        # Marker appears exactly once.
+        text = (workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md").read_text()
+        assert text.count("[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2") == 1
+
+    def test_add_dep_fails_fast_when_blocker_missing_from_backlog(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import add_dep
+
+        workspace = self._workspace(tmp_path)
+        with pytest.raises(ProposalError, match="blocker task 'E0-F1-S1-T99' not found"):
+            add_dep(
+                backlog_root=workspace / "backlog",
+                backlog_index=workspace / "BACKLOG.md",
+                blocked_task_id="E0-F1-S1-T1",
+                blocker_task_id="E0-F1-S1-T99",
+            )
+
+    def test_add_dep_rejects_self_wire(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import add_dep
+
+        workspace = self._workspace(tmp_path)
+        with pytest.raises(ProposalError, match="cannot be the same task"):
+            add_dep(
+                backlog_root=workspace / "backlog",
+                backlog_index=workspace / "BACKLOG.md",
+                blocked_task_id="E0-F1-S1-T1",
+                blocker_task_id="E0-F1-S1-T1",
+            )
+
+    def test_add_dep_fails_fast_when_blocker_is_done(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import add_dep
+
+        workspace = self._workspace(tmp_path)
+        # Flip T2 to done manually.
+        t2 = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T2.md"
+        t2.write_text(t2.read_text().replace("## Status: blocked", "## Status: done"))
+        idx = workspace / "BACKLOG.md"
+        idx.write_text(
+            idx.read_text().replace(
+                "| E0-F1-S1-T2 | Fix | Task | in-queue |",
+                "| E0-F1-S1-T2 | Fix | Task | done |",
+            )
+        )
+        with pytest.raises(ProposalError, match="already terminal"):
+            add_dep(
+                backlog_root=workspace / "backlog",
+                backlog_index=workspace / "BACKLOG.md",
+                blocked_task_id="E0-F1-S1-T1",
+                blocker_task_id="E0-F1-S1-T2",
+            )
 
 
 class TestRejectProposal:
@@ -1137,6 +1502,229 @@ class TestClassifyProposedTask:
         (story_dir / "E0-F1-S1-T2.md").write_text("# header only\n")
         state = classify_proposed_task(backlog_root, tmp_path, "E0-F1-S1-T2")
         assert state is ProposalTaskState.PROMOTED
+
+
+class TestClassifyBlockedTask:
+    """ADR-10: classify_blocked_task distinguishes auto-clearing from needs-attention."""
+
+    def _workspace_with_markers(self, tmp_path: Path, marker_target_status_pairs: list[tuple[str, str]]) -> Path:
+        """Build a workspace where E0-F1-S1-T1 carries markers for each (id, status) pair.
+
+        Every marker target gets a corresponding row in BACKLOG.md with the
+        given status. The blocked-source task itself (T1) has ``blocked``
+        status + one comment line per marker target.
+        """
+        backlog_dir = tmp_path / "backlog"
+        story_dir = backlog_dir / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+
+        # Source task with the markers in its Comments section.
+        comments_block = "\n## Comments\n\n" + "\n".join(
+            f"[2026-04-20 00:00 UTC] [agent/task_factory] [PROPOSAL_PROMOTED] {tid} "
+            f"promoted and wired as dependency of E0-F1-S1-T1. [BLOCKED_PENDING_PROPOSAL] {tid}"
+            for tid, _ in marker_target_status_pairs
+        )
+        source_file = story_dir / "E0-F1-S1-T1.md"
+        source_file.write_text(
+            "# E0-F1-S1-T1: Source\n\n## Status: blocked\n\n"
+            "## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n" + comments_block
+        )
+
+        # Marker target files and BACKLOG.md rows.
+        rows = ["| E0-F1-S1-T1 | Source | Task | blocked | None | r | `backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |"]
+        for tid, status in marker_target_status_pairs:
+            (story_dir / f"{tid}.md").write_text(f"# {tid}: X\n\n## Status: {status}\n")
+            rows.append(f"| {tid} | Marker | Task | {status} | None | r | `backlog/E0/E0-F1/E0-F1-S1/{tid}.md` |")
+
+        (tmp_path / "BACKLOG.md").write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n" + "\n".join(rows) + "\n"
+        )
+        return tmp_path
+
+    def test_task_with_all_active_markers_is_auto_clearing(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        workspace = self._workspace_with_markers(
+            tmp_path, [("E0-F1-S1-T2", "in-queue"), ("E0-F1-S1-T3", "in-progress")]
+        )
+        state = classify_blocked_task(workspace / "backlog", workspace / "BACKLOG.md", "E0-F1-S1-T1")
+        assert state is BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL
+
+    def test_task_with_mixed_markers_is_auto_clearing(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        workspace = self._workspace_with_markers(tmp_path, [("E0-F1-S1-T2", "done"), ("E0-F1-S1-T3", "in-queue")])
+        state = classify_blocked_task(workspace / "backlog", workspace / "BACKLOG.md", "E0-F1-S1-T1")
+        assert state is BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL
+
+    def test_task_with_all_terminal_markers_is_needs_attention(self, tmp_path: Path) -> None:
+        """Cascade should already have fired; the task is still blocked = diagnostic signal."""
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        workspace = self._workspace_with_markers(tmp_path, [("E0-F1-S1-T2", "done"), ("E0-F1-S1-T3", "declined")])
+        state = classify_blocked_task(workspace / "backlog", workspace / "BACKLOG.md", "E0-F1-S1-T1")
+        assert state is BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+
+    def test_task_with_unknown_marker_id_is_needs_attention(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        workspace = self._workspace_with_markers(tmp_path, [("E0-F1-S1-T2", "in-queue")])
+        # Add a second marker pointing at an ID with no backlog row.
+        source_file = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
+        source_file.write_text(
+            source_file.read_text()
+            + "\n[2026-04-20 00:00 UTC] [agent/task_factory] [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T99\n"
+        )
+        state = classify_blocked_task(workspace / "backlog", workspace / "BACKLOG.md", "E0-F1-S1-T1")
+        assert state is BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+
+    def test_task_with_no_markers_is_needs_attention(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Reach the empty-markers branch without depending on BacklogParser internals."""
+        from devbench.backlog import proposal as proposal_mod
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        source = tmp_path / "fake.md"
+        source.write_text("# fake\n\n## Status: blocked\n")
+        monkeypatch.setattr(proposal_mod, "_find_source_task_file", lambda *a, **kw: source)
+
+        class _NoMarkers:
+            def _extract_pending_proposal_markers(self, _p):
+                return set()
+
+            def _parse_backlog_rows(self, _path):
+                return []
+
+        monkeypatch.setattr(proposal_mod, "BacklogManager", _NoMarkers)
+        state = classify_blocked_task(tmp_path / "backlog", tmp_path / "BACKLOG.md", "E0-F1-S1-T1")
+        assert state is BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+
+    def test_task_not_in_backlog_is_needs_attention(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        (tmp_path / "BACKLOG.md").write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+        )
+        state = classify_blocked_task(tmp_path / "backlog", tmp_path / "BACKLOG.md", "E0-F1-S1-T99")
+        assert state is BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+
+    def test_missing_backlog_index_is_needs_attention(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """ADR-10: if _parse_backlog_rows raises FileNotFoundError, classifier defaults to needs-attention."""
+        from devbench.backlog import proposal as proposal_mod
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        backlog_dir = tmp_path / "backlog"
+        story_dir = backlog_dir / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+        source = story_dir / "E0-F1-S1-T1.md"
+        source.write_text(
+            "# E0-F1-S1-T1: Source\n\n## Status: blocked\n\n"
+            "## Comments\n\n"
+            "[2026-04-20 00:00 UTC] [agent/task_factory] [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2\n"
+        )
+        monkeypatch.setattr(proposal_mod, "_find_source_task_file", lambda *a, **kw: source)
+
+        class _Exploding:
+            def _extract_pending_proposal_markers(self, _p):
+                return {"E0-F1-S1-T2"}
+
+            def _parse_backlog_rows(self, _path):
+                raise FileNotFoundError("forced")
+
+        monkeypatch.setattr(proposal_mod, "BacklogManager", _Exploding)
+        state = classify_blocked_task(backlog_dir, tmp_path / "BACKLOG.md", "E0-F1-S1-T1")
+        assert state is BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+
+
+class TestAddDepBlockedMissing:
+    def test_add_dep_raises_when_blocked_task_missing_from_backlog(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import add_dep
+
+        (tmp_path / "BACKLOG.md").write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T2 | Fix | Task | in-queue | None | r | "
+            "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T2.md` |\n"
+        )
+        story = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        story.mkdir(parents=True)
+        (story / "E0-F1-S1-T2.md").write_text("# E0-F1-S1-T2: Fix\n\n## Status: in-queue\n\n## Description\n\nx\n")
+        with pytest.raises(ProposalError, match=r"blocked task 'E0-F1-S1-T99' not found"):
+            add_dep(
+                backlog_root=tmp_path / "backlog",
+                backlog_index=tmp_path / "BACKLOG.md",
+                blocked_task_id="E0-F1-S1-T99",
+                blocker_task_id="E0-F1-S1-T2",
+            )
+
+
+class TestManualDepCommentNoCommentsSection:
+    def test_append_manual_dep_creates_comments_section_when_missing(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import _append_manual_dep_comment
+
+        f = tmp_path / "x.md"
+        f.write_text("# E0-F1-S1-T1: X\n\n## Status: blocked\n\n## Description\n\nno comments section yet\n")
+        _append_manual_dep_comment(f, "E0-F1-S1-T1", "E0-F1-S1-T2", "slice I coverage")
+        text = f.read_text()
+        assert "## Comments" in text
+        assert "[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2" in text
+
+    def test_append_manual_dep_appends_to_existing_comments_section(self, tmp_path: Path) -> None:
+        """Line 1015: when the file already has ## Comments, the entry is appended to it."""
+        from devbench.backlog.proposal import _append_manual_dep_comment
+
+        f = tmp_path / "y.md"
+        f.write_text(
+            "# E0-F1-S1-T1: X\n\n## Status: blocked\n\n## Description\n\nx\n\n"
+            "## Comments\n\n[2026-04-19 09:00 UTC] [agent/other] prior entry\n"
+        )
+        _append_manual_dep_comment(f, "E0-F1-S1-T1", "E0-F1-S1-T2", "")
+        text = f.read_text()
+        # Prior entry still there + the new marker.
+        assert "prior entry" in text
+        assert "[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2" in text
+        # Only ONE "## Comments" header (we did not append a duplicate section).
+        assert text.count("## Comments") == 1
+
+
+class TestFindOriginatingProposalMiss:
+    def test_find_originating_proposal_returns_none_when_no_match(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import _find_originating_proposal
+
+        assert _find_originating_proposal(tmp_path, "E0-F1-S1-T99") is None
+
+
+class TestPromoteProposalSourceFileMissing:
+    def test_promote_loops_through_missing_source_file(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Continue-branch coverage when _find_source_task_file returns None during the wire loop."""
+        from devbench.backlog import proposal as proposal_mod
+
+        workspace = _build_workspace(tmp_path)
+        proposal = _sample_proposal(task_ids=["E0-F1-S1-T2"])
+        write_proposal(workspace, proposal)
+        materialise_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            proposal=proposal,
+            repo="caylent-solutions/example",
+        )
+        # Single-task proposal means the fail-fast loop skips _find_source_task_file
+        # (targets[1:] is empty); the wire loop then calls it once for the source.
+        # Patch it to return None so the continue branch is exercised.
+        monkeypatch.setattr(proposal_mod, "_find_source_task_file", lambda *a, **kw: None)
+        result = proposal_mod.promote_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            task_id="E0-F1-S1-T2",
+        )
+        assert result.wired_targets == []
 
 
 class TestMaterialiseProposalThinApproachRefusal:

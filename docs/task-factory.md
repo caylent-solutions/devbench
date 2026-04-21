@@ -81,9 +81,33 @@ The cascade is scoped narrowly by design:
 
 Unknown marker IDs (for example, a previously-promoted draft that was later archived via `reject-proposal`) would count as non-terminal if they remained on the source -- so per-draft `reject-proposal` strips the rejected draft's marker from the source before re-running the cascade. This closes a real regression: a reject that left the marker in place would have left the source `blocked` forever even after its siblings completed. See the "Rejecting a promoted draft strips the marker and re-invokes the cascade" subsection below and [ADR-08](adr/08-proposal-lifecycle-observability.md).
 
-`--no-dep-on-source` skips the dependency wiring entirely, so no marker is written and no auto-requeue can fire. Use it when the promoted draft is independent of the source.
+`--no-dep-on-source` skips the dependency wiring on the SOURCE task only. Every entry in `affected_task_ids` (see next subsection) still gets its marker + dep row. Use the flag when the promoted draft is independent of the source, not as a way to suppress peer-task wiring that an author explicitly listed.
 
 See [ADR-07: Auto-requeue on proposal completion](adr/07-auto-requeue-on-proposal-completion.md) for rationale and the rejected alternatives.
+
+### When to use `affected_task_ids` (ADR-10)
+
+A single fix often unblocks more than one task. The canonical case is a pre-existing bug that breaks multiple work units simultaneously: fix the bug once, and every task that was waiting on it should unblock together. The proposal JSON carries an optional `affected_task_ids: list[str]` field for exactly this case:
+
+```json
+{
+  "source_task_id": "E1-F1-S16-T1",
+  "affected_task_ids": ["E1-F1-S15-T1"],
+  "proposed_tasks": [
+    { "suggested_id": "E1-F1-S16-T2", "title": "Fix 14 stale SystemExit test expectations", ... }
+  ]
+}
+```
+
+When `promote-proposal E1-F1-S16-T2` runs, the `[BLOCKED_PENDING_PROPOSAL] E1-F1-S16-T2` marker + Dependencies row is written on BOTH `E1-F1-S16-T1` (source) AND `E1-F1-S15-T1` (listed in `affected_task_ids`). The ADR-07 auto-requeue cascade then unblocks both of them when `E1-F1-S16-T2` reaches `done`.
+
+Populate the field at authoring time only when you have direct evidence that the listed peer is waiting on the same bug (same failing test name, same production file in the blocker comment, same commit-hash as the root cause). Speculation produces spurious markers that the operator later has to unwind. When in doubt, leave the list empty; the operator can still wire additional targets post-promote via `devbench add-dep` (see [docs/cli-reference.md](cli-reference.md)).
+
+Fail-fast: `promote-proposal` refuses to wire if ANY target in `[source_task_id] + affected_task_ids` is missing from the backlog index. The source is never left half-wired on a missing peer.
+
+Backward-compatible: proposal JSONs without the field load as `affected_task_ids=[]` and follow the pre-ADR-10 1:1 wiring path.
+
+See [ADR-10: Multi-target proposal wiring](adr/10-multi-target-proposal-wiring.md) for the full design.
 
 ### Rejecting a promoted draft strips the marker and re-invokes the cascade
 
@@ -173,6 +197,39 @@ Output per proposal:
 - `sweep-proposals: no-op <source-id>` -- every task already has a draft.
 
 The operator can also run `devbench sweep-proposals` manually at any time.
+
+### Auto-accepting proposals (ADR-11)
+
+Some backlogs trust blocker-resolver + task-factory to produce sensible drafts every time and do not want a human in the loop on every promote. For those workspaces, opt in by setting `task_factory.auto_accept_proposals: true` in `backlog/config/devbench.yaml`:
+
+```yaml
+task_factory:
+  enabled: true
+  auto_accept_proposals: true
+```
+
+When the flag is `true`, `devbench sweep-proposals` calls `promote-proposal` automatically for every draft currently at `## Status: proposed`. Auto-promote runs on the standard SKILL step 0 tick, so no separate command or cron job is required. The flag is workspace-wide -- every proposal produced in this workspace gets auto-accepted, not individual proposals.
+
+Behavioural details:
+
+- **Default is `false`.** Omitting the key, or setting it explicitly to `false`, preserves the "human reviews every proposal" posture.
+- **Idempotent.** A draft already past `PROPOSED` (promoted, done, declined, rejected) is skipped on the next sweep tick; no duplicate markers are written.
+- **Legacy drafts get picked up too.** Flipping the flag on with PROPOSED drafts already waiting causes the next sweep tick to promote them. No extra operator action.
+- **Audit signal.** Every auto-promoted draft's `[PROPOSAL_PROMOTED]` comment on the source task gains the suffix `(auto-accepted via task_factory.auto_accept_proposals=true)` between the description and the `[BLOCKED_PENDING_PROPOSAL]` marker. Reviewers of the work-unit file see at a glance that the tool, not a human, pressed the button.
+- **Rejection still works.** An auto-promoted draft the operator later decides is wrong is rejected via the standard `reject-proposal <id> --reason "..."` flow; the ADR-07 marker-strip + cascade handle it exactly like any other reject.
+- **Downstream behaviour unchanged.** ADR-07 auto-requeue, ADR-10 multi-target wiring on `affected_task_ids`, and the done-gate all continue to work exactly as they do under manual promote -- auto-accept shifts who calls `promote_proposal()`, not what the function does.
+
+Sweep output gains an explicit auto-promote count when the flag is `true`:
+
+```
+sweep-proposals: materialised E1-F1-S2-T1: 2 new, 0 skipped (auto-promoted: 2)
+```
+
+When the flag is `false`, sweep output is byte-identical to today's.
+
+**When NOT to use.** If your backlog's blocker-resolver sometimes produces drafts whose scope or wording needs operator review before they enter the queue, leave the flag off. Auto-accept removes the human-review step; it does not evaluate individual drafts for quality.
+
+See [ADR-11](adr/11-auto-accept-proposals.md) for the full design and the alternatives that were rejected.
 
 ### Un-materialised form of `reject-proposal`
 

@@ -1295,7 +1295,40 @@ class TestUnitListings:
         assert lines[1] == "In-progress tasks:"
         assert lines[2] == "  - E0-F1-S1-T1: Active task"
 
+    def test_blocked_listing_splits_auto_vs_attn_when_classifier_disagrees(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ADR-10: _blocked_listing renders two panels when both classes are non-empty."""
+        from devbench.backlog.proposal import BlockedTaskState
+        from devbench.backlog.work_unit import WorkUnitStatus
+        from devbench.reporting import report as report_mod
+
+        unit_auto = self._mk_unit("E0-F1-S1-T1", "Auto-clearing", WorkUnitStatus.BLOCKED)
+        unit_attn = self._mk_unit("E0-F1-S1-T2", "Needs attention", WorkUnitStatus.BLOCKED)
+
+        def fake_classify(backlog_root: Path, backlog_index: Path, task_id: str) -> BlockedTaskState:
+            return {
+                "E0-F1-S1-T1": BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL,
+                "E0-F1-S1-T2": BlockedTaskState.NEEDS_OPERATOR_ATTENTION,
+            }[task_id]
+
+        class _FakeMgr:
+            def _extract_pending_proposal_markers(self, _file_path: Path) -> set:
+                return {"E0-F1-S1-T9"}
+
+        monkeypatch.setattr("devbench.backlog.proposal.classify_blocked_task", fake_classify)
+        monkeypatch.setattr("devbench.backlog.manager.BacklogManager", _FakeMgr)
+
+        lines = report_mod._blocked_listing([unit_auto, unit_attn])
+        assert "Blocked tasks (auto-clearing via proposal) (1):" in lines
+        assert "Blocked tasks (needs operator attention) (1):" in lines
+        # Auto-clearing row names the waiting-on target.
+        assert any("E0-F1-S1-T1" in line and "waiting on" in line for line in lines)
+        # Attn row is plain.
+        assert any(line == "  - E0-F1-S1-T2: Needs attention" for line in lines)
+
     def test_blocked_listing_present_when_task_blocked(self) -> None:
+        """ADR-10: without markers every blocked task renders under the 'needs attention' panel."""
         from devbench.backlog.work_unit import WorkUnitStatus
         from devbench.reporting.report import _blocked_listing
 
@@ -1304,9 +1337,13 @@ class TestUnitListings:
             self._mk_unit("E0-F5-S2-T2", "Pipeline tests", WorkUnitStatus.BLOCKED),
         ]
         lines = _blocked_listing(units)
-        assert lines[1] == "Blocked tasks:"
+        # Fake units have no work-unit file on disk; classifier returns
+        # NEEDS_OPERATOR_ATTENTION, so only the attn panel renders.
+        assert "Blocked tasks (needs operator attention) (2):" in lines
         assert "  - E0-F2-S1-T3: Disable pager" in lines
         assert "  - E0-F5-S2-T2: Pipeline tests" in lines
+        # Auto panel NOT rendered because no auto-clearing tasks in fixture.
+        assert not any("auto-clearing" in line for line in lines)
 
     def test_listings_empty_when_no_matching_tasks(self) -> None:
         from devbench.backlog.work_unit import WorkUnitStatus

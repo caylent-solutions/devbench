@@ -1143,8 +1143,55 @@ def _in_progress_listing(units: list) -> list[str]:
 
 
 def _blocked_listing(units: list) -> list[str]:
-    """B9: list every blocked task so the user sees which ones need external action."""
-    return _unit_status_listing(units, WorkUnitStatus.BLOCKED, "Blocked tasks")
+    """ADR-10: render blocked tasks in two panels (auto-clearing + needs-attention).
+
+    The split lets operators scan only the ``(needs operator attention)``
+    panel to find work that requires a decision; the ``(auto-clearing via
+    proposal)`` panel is informational -- the ADR-07 cascade will resolve
+    each of those tasks when its markers reach terminal state.
+
+    Each auto-clearing row names the task IDs it is waiting on in square
+    brackets so the operator can trace the chain without opening the
+    work-unit file. Needs-attention rows carry just ID + title; the operator
+    opens the file to read the blocker comment.
+
+    Both panels are omitted when empty, matching the Proposed / Declined /
+    Un-materialised panel discipline.
+    """
+    from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+    blocked_tasks = [u for u in units if u.unit_type == WorkUnitType.TASK and u.status == WorkUnitStatus.BLOCKED]
+    if not blocked_tasks:
+        return []
+
+    auto_rows: list[tuple] = []  # (unit, list[str] of marker targets)
+    attn_rows: list = []
+    for u in blocked_tasks:
+        state = classify_blocked_task(BACKLOG_ROOT, BACKLOG_INDEX, u.id)
+        if state is BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL:
+            # Surface which task(s) this one is waiting on. Reuse the same
+            # marker-extract helper the cascade uses so the string is always
+            # accurate.
+            from devbench.backlog.manager import BacklogManager
+
+            waiting_on = sorted(BacklogManager()._extract_pending_proposal_markers(u.file_path))
+            auto_rows.append((u, waiting_on))
+        else:
+            attn_rows.append(u)
+
+    lines: list[str] = []
+    if auto_rows:
+        lines.append("")
+        lines.append(f"Blocked tasks (auto-clearing via proposal) ({len(auto_rows)}):")
+        for u, waiting_on in auto_rows:
+            suffix = f"    [waiting on {', '.join(waiting_on)}]" if waiting_on else ""
+            lines.append(f"  - {u.id}: {u.title}{suffix}")
+    if attn_rows:
+        lines.append("")
+        lines.append(f"Blocked tasks (needs operator attention) ({len(attn_rows)}):")
+        for u in attn_rows:
+            lines.append(f"  - {u.id}: {u.title}")
+    return lines
 
 
 def _proposed_listing(units: list) -> list[str]:

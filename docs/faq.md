@@ -44,6 +44,12 @@ Four review-team judges run in parallel via `review-supervisor` after the execut
 
 The executor retries up to `max_executor_retries` times on `REVIEW_FAIL`. Each retry re-runs the executor with the prior judge comments in its context. If the same finding appears across retries, either the executor is not reading the finding correctly (very rare; usually a prompt-alignment issue) or the finding reflects a real structural gap that the work unit cannot satisfy. In the second case the task blocks after the retry budget is exhausted, which is the correct outcome -- the work unit needs a human edit, not more executor attempts.
 
+### My task blocked on reviewers saying N files are staged but `git diff --staged` shows only 1 -- why?
+
+This was the 2026-04-20 kanon misread, fixed by ADR-12. If your backlog runs in `git_ops.single_branch: <branch>` + `git_ops.defer_pr: true` mode, versions of devbench before ADR-12 concatenated `git diff origin/<default>` into the output of `devbench get-diff`, which every review judge consumes. After N prior completed tasks have committed to the shared branch, that hunk contains N tasks' accumulated changes, and every judge correctly (by its prompt) reports "files staged outside the Changes Manifest" on subsequent tasks.
+
+The fix is structural: `devbench get-diff` is now mode-aware. In defer_pr mode it emits only the current task's staged + unstaged changes (plus `git show HEAD` when the working tree is clean post-commit), never the accumulated branch-vs-default diff. Upgrade devbench to a version that carries ADR-12 and the misread stops occurring. Tasks already blocked on this misread can be unblocked with `devbench set-status <id> done` once you have verified via `git diff --staged --name-only` that the actually-staged set matches the Changes Manifest.
+
 ## Lifecycle statuses
 
 ### What's the difference between Blocked and Declined?
@@ -125,6 +131,17 @@ This archives the JSON to `.devbench/rejected-proposals/<source-id>-unmaterialis
 
 Yes, if the source's remaining `[BLOCKED_PENDING_PROPOSAL]` markers are all terminal (`done` or `declined`). Per-draft `reject-proposal` strips the rejected draft's marker from the source's Comments section and re-invokes the ADR-07 auto-requeue cascade. If the remaining markers are all terminal the source flips to `in-queue` with an `[AUTO_UNBLOCKED]` audit comment. If any remaining marker is still non-terminal (another in-queue / in-progress / blocked draft), the source stays `blocked` until that one resolves -- same contract as the ADR-07 cascade on the happy path. See [ADR-07](adr/07-auto-requeue-on-proposal-completion.md) and [ADR-08](adr/08-proposal-lifecycle-observability.md).
 
+### The orchestrator promoted a fix, but a sibling task that shares the same blocker did not unblock -- why?
+
+The proposal's `affected_task_ids` list was empty. By default `promote-proposal` wires the `[BLOCKED_PENDING_PROPOSAL]` marker on the proposal's `source_task_id` only -- not on any peer task that happens to share the same root-cause bug. The ADR-07 auto-requeue cascade only fires on tasks that carry a marker, so a peer without one never unblocks from the fix.
+
+Two fixes, depending on where you are in the lifecycle:
+
+1. **Before promote.** Populate the proposal's `affected_task_ids: list[str]` field with the peer task IDs. The `blocker-resolver` prompt now instructs the agent to populate this field when a shared-root-cause signature is evident (same failing test name, same production file in both blocker comments, etc.). If the agent missed a peer, you can also edit the JSON on disk at `.devbench/proposals/<source-id>.json` before `materialise-proposal` runs.
+2. **After promote.** Run `uv run devbench add-dep <peer-task-id> <promoted-task-id> --reason "..."`. This wires the marker + Dependencies row on the peer task idempotently; the ADR-07 cascade picks the peer up when the promoted fix completes. See the [cli-reference entry](cli-reference.md#add-dep).
+
+See [ADR-10: Multi-target proposal wiring](adr/10-multi-target-proposal-wiring.md) for the full design and the alternatives that were rejected.
+
 ### I rejected a proposal but it came back on the next loop iteration -- why?
 
 Pre-ADR-09 behaviour: `reject-proposal <draft-id>` archived the draft and removed its BACKLOG.md row, but left the source proposal JSON unchanged. The next `sweep-proposals` call (SKILL step 0) or any manual `materialise-proposal` call walked the JSON's `proposed_tasks[]`, saw no live `.md` for the rejected task, and re-created the draft. Classic case of two layers disagreeing: the classifier (via the rejection archive) knew the task was `REJECTED`, but the materialiser did not ask.
@@ -132,6 +149,24 @@ Pre-ADR-09 behaviour: `reject-proposal <draft-id>` archived the draft and remove
 ADR-09 fixed this: `materialise_proposal` now classifies every task before deciding to create a draft and only materialises `UNMATERIALISED` tasks. Rejected drafts stay rejected across any number of sweeps, orchestrator restarts, and replay attempts. If you see a resurrected draft after ADR-09 ships, report it as a regression -- the test pin at `tests/test_cli.py::TestCmdSweepProposalsResurrectionGuard` would have failed.
 
 See [ADR-09](adr/09-idempotent-materialise-proposal.md) for the rationale and [docs/task-factory.md](task-factory.md)'s "materialise-proposal is idempotent" section for the full skip contract.
+
+### How do I make devbench auto-promote every proposal?
+
+Set `task_factory.auto_accept_proposals: true` in `backlog/config/devbench.yaml`:
+
+```yaml
+task_factory:
+  enabled: true
+  auto_accept_proposals: true
+```
+
+Once the flag is on, `devbench sweep-proposals` (which runs as SKILL step 0 of every orchestrate loop tick) auto-calls `promote-proposal` for every draft currently at `## Status: proposed`. Drafts land at `in-queue` without any operator action; the ADR-07 auto-requeue cascade and ADR-10 multi-target wiring continue to work exactly as under manual promote.
+
+Every auto-promoted draft's `[PROPOSAL_PROMOTED]` comment on the source task carries the suffix `(auto-accepted via task_factory.auto_accept_proposals=true)` so the audit trail reflects the tool, not a human, pressed the button.
+
+Default is `false`. Omitting the key or leaving it `false` preserves the "human reviews every proposal" default. See [ADR-11](adr/11-auto-accept-proposals.md) and the "Auto-accepting proposals" section of [task-factory.md](task-factory.md).
+
+**Reverting an auto-accepted draft:** use the standard `uv run devbench reject-proposal <id> --reason "..."` flow. Marker-strip + cascade handle it exactly like any other reject.
 
 ### My task says `blocker: executor retry budget exhausted`. What does that mean?
 

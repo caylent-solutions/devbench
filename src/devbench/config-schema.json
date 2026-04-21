@@ -264,6 +264,10 @@
         "enabled": {
           "type": "boolean",
           "description": "Whether the task-factory loop runs after amendment rejects. Default false (opt-in). Requires manifest_amendment.enabled: true."
+        },
+        "auto_accept_proposals": {
+          "type": "boolean",
+          "description": "When true, devbench auto-promotes every task-factory-produced draft at sweep time instead of leaving it at status `proposed` for operator review. Default false. ADR-11."
         }
       }
     }

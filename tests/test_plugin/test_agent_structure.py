@@ -570,3 +570,119 @@ class TestExecutorPreFlightAndAmendmentScope:
             "executor.md amendment section must explicitly forbid including pre-existing / unrelated "
             "dirty files in an amendment request."
         )
+
+
+@pytest.mark.unit
+class TestBlockerResolverAffectedTaskIdsInstruction:
+    """ADR-10 regression pin: blocker-resolver + executor prompts document `affected_task_ids`."""
+
+    _BLOCKER_RESOLVER_PATH = AGENTS_DIR / "blocker-resolver.md"
+    _EXECUTOR_PATH = AGENTS_DIR / "executor.md"
+
+    def test_blocker_resolver_documents_affected_task_ids(self) -> None:
+        content = self._BLOCKER_RESOLVER_PATH.read_text()
+        assert "affected_task_ids" in content, (
+            "blocker-resolver.md must document the affected_task_ids field so agents know when to populate it."
+        )
+
+    def test_blocker_resolver_describes_evidence_rubric(self) -> None:
+        """The prompt must tell the agent what evidence qualifies a peer for the field."""
+        content = self._BLOCKER_RESOLVER_PATH.read_text().lower()
+        # Evidence rubric keywords -- at least one of these three must appear near
+        # the affected_task_ids discussion so the agent doesn't speculate.
+        assert "evidence" in content, "blocker-resolver.md must require evidence before populating affected_task_ids"
+        assert "same failing test" in content or "same production file" in content, (
+            "blocker-resolver.md must list concrete shared-blocker evidence examples"
+        )
+
+    def test_blocker_resolver_forbids_self_reference(self) -> None:
+        """The prompt must warn against listing source_task_id itself in affected_task_ids."""
+        content = self._BLOCKER_RESOLVER_PATH.read_text()
+        assert "source_task_id" in content and "affected_task_ids" in content
+        # Look for the "do not list source" directive somewhere in the same file.
+        lowered = content.lower()
+        assert "do not list" in lowered or "must not appear" in lowered or "do not speculate" in lowered, (
+            "blocker-resolver.md must instruct the agent not to list source_task_id or speculate"
+        )
+
+    def test_executor_cross_references_affected_task_ids(self) -> None:
+        content = self._EXECUTOR_PATH.read_text()
+        assert "affected_task_ids" in content, (
+            "executor.md validation-gate section must reference affected_task_ids so "
+            "validation-gate-emitted proposals populate it when applicable."
+        )
+
+
+ALL_REVIEW_JUDGE_PATHS = [
+    REVIEW_TEAM_DIR / "code-reviewer.md",
+    REVIEW_TEAM_DIR / "test-reviewer.md",
+    REVIEW_TEAM_DIR / "doc-reviewer.md",
+    REVIEW_TEAM_DIR / "changes-manifest.md",
+    AGENTS_DIR / "security-reviewer.md",
+]
+
+
+@pytest.mark.unit
+class TestReviewJudgesUseGetDiffForScope:
+    """ADR-12: all five review judges must use `devbench get-diff` for scope
+    and carry the scope-contract line that pins the anti-pattern.
+
+    These tests are regression pins -- they exist so that a future prompt
+    edit that reintroduces `git diff origin/main` or drops the
+    ADR-12 contract line will fail CI before merging.
+    """
+
+    @pytest.mark.parametrize("judge_path", ALL_REVIEW_JUDGE_PATHS, ids=lambda p: p.name)
+    def test_every_review_judge_invokes_devbench_get_diff_at_prompt_top(self, judge_path: Path) -> None:
+        """Each of the 5 judges must invoke `uv run devbench get-diff $ARGUMENTS`
+        before the main body of instructions. Salience at the top is what
+        makes the scope contract stick; placing it lower risks the judge
+        reading half the rubric before seeing the scope constraint."""
+        content = judge_path.read_text(encoding="utf-8")
+        invocation = "`uv run devbench get-diff $ARGUMENTS`"
+        assert invocation in content, (
+            f"{judge_path.name} must invoke `uv run devbench get-diff $ARGUMENTS` "
+            "as the authoritative scope source per ADR-12."
+        )
+        body_markers = ["You are a strict", "You are the "]
+        body_positions = [content.find(m) for m in body_markers if m in content]
+        assert body_positions, f"{judge_path.name} does not contain a 'You are...' body marker to anchor on."
+        body_start = min(body_positions)
+        invocation_pos = content.find(invocation)
+        assert invocation_pos < body_start, (
+            f"{judge_path.name} places `devbench get-diff` at offset {invocation_pos} "
+            f"but the instruction body starts at offset {body_start}; "
+            "the get-diff invocation MUST appear before the instruction body."
+        )
+
+    @pytest.mark.parametrize("judge_path", ALL_REVIEW_JUDGE_PATHS, ids=lambda p: p.name)
+    def test_no_review_judge_contains_git_diff_origin_main_antipattern(self, judge_path: Path) -> None:
+        """ADR-12 anti-pattern: a judge prompt must never instruct the agent to
+        compute its own `git diff origin/main` or `git diff main...HEAD` scope.
+        Those views double-count prior tasks on single-branch + defer_pr mode."""
+        content = judge_path.read_text(encoding="utf-8")
+        forbidden = [
+            "git diff origin/main",
+            "git diff main...HEAD",
+            "git diff main..HEAD",
+        ]
+        for pattern in forbidden:
+            if pattern in content:
+                idx = content.find(pattern)
+                preamble = content[max(0, idx - 300) : idx]
+                preamble_lower = preamble.lower()
+                assert "Do NOT" in preamble or "do not run" in preamble_lower, (
+                    f"{judge_path.name} contains `{pattern}` outside the ADR-12 anti-pattern warning. "
+                    "This is the exact pattern that caused the 2026-04-20 judge misread."
+                )
+
+    @pytest.mark.parametrize("judge_path", ALL_REVIEW_JUDGE_PATHS, ids=lambda p: p.name)
+    def test_every_review_judge_references_adr_12_scope_contract(self, judge_path: Path) -> None:
+        """Each judge prompt must carry the ADR-12 scope-contract line that
+        names get-diff as authoritative and warns against raw git."""
+        content = judge_path.read_text(encoding="utf-8")
+        assert "Scope contract" in content, f"{judge_path.name} must include a **Scope contract:** line per ADR-12."
+        assert "ADR-12" in content, f"{judge_path.name} must reference ADR-12 so readers can trace the rationale."
+        assert "AUTHORITATIVE" in content, (
+            f"{judge_path.name} must state that `devbench get-diff` is the AUTHORITATIVE scope source."
+        )

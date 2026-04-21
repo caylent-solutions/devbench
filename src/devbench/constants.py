@@ -17,8 +17,8 @@ COMMENTS_SECTION_HEADER: str = "## Comments"
 STATUS_SECTION_PREFIX: str = "## Status:"
 STATUS_SUMMARY_SECTION_HEADER: str = "## Status Summary"
 STATUS_SUMMARY_TABLE_HEADER: str = (
-    "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
-    "|------|-------|------|-------------|----------|---------|\n"
+    "| Epic | Title | Done | In Progress | In Queue | Blocked | Declined |\n"
+    "|------|-------|------|-------------|----------|---------|----------|\n"
 )
 # Pre-compiled pattern to strip the Status Summary section from BACKLOG.md content.
 # Matches from the header up to (but not including) the next ## heading or end of string.
@@ -62,10 +62,20 @@ SECURITY_ALERT_CATEGORIES: list[tuple[str, str]] = [
 # ---------------------------------------------------------------------------
 # Backlog status display values (used in CLI status summaries)
 # ---------------------------------------------------------------------------
-DISPLAY_STATUS_VALUES: list[str] = ["In Queue", "In Progress", "In Review", "Done", "Blocked"]
+DISPLAY_STATUS_VALUES: list[str] = [
+    "In Queue",
+    "In Progress",
+    "In Review",
+    "Done",
+    "Blocked",
+    "Proposed",
+    "Declined",
+]
 
 # Backlog manager recognized status labels (title-case, as in markdown tables)
-TABLE_STATUS_VALUES: frozenset[str] = frozenset({"In Queue", "In Progress", "In Review", "Done", "Blocked"})
+TABLE_STATUS_VALUES: frozenset[str] = frozenset(
+    {"In Queue", "In Progress", "In Review", "Done", "Blocked", "Proposed", "Declined"}
+)
 
 # ---------------------------------------------------------------------------
 # Traceability matrix format
@@ -124,6 +134,8 @@ STATUS_IN_PROGRESS: str = "in-progress"
 STATUS_IN_REVIEW: str = "in-review"
 STATUS_DONE: str = "done"
 STATUS_BLOCKED: str = "blocked"
+STATUS_PROPOSED: str = "proposed"
+STATUS_DECLINED: str = "declined"
 
 # Ordered mapping from any accepted input form to the canonical write form.
 # Used by BacklogManager._set_status() for validation and normalisation.
@@ -133,6 +145,8 @@ VALID_STATUSES: dict[str, str] = {
     STATUS_IN_REVIEW: STATUS_IN_REVIEW,
     STATUS_DONE: STATUS_DONE,
     STATUS_BLOCKED: STATUS_BLOCKED,
+    STATUS_PROPOSED: STATUS_PROPOSED,
+    STATUS_DECLINED: STATUS_DECLINED,
 }
 
 # ---------------------------------------------------------------------------
@@ -186,7 +200,7 @@ TDD_ENTRY_TEMPLATE: str = "- [{phase}] {timestamp} -- {message}\n"
 VALID_TDD_PHASES: frozenset[str] = frozenset({"RED", "GREEN", "REFACTOR"})
 
 # ---------------------------------------------------------------------------
-# Epic ID regex — matches top-level epic IDs such as "E200", "E1", etc.
+# Epic ID regex -- matches top-level epic IDs such as "E200", "E1", etc.
 # A row is an epic row when its ID is exactly E<digits> with no hyphen suffix.
 # ---------------------------------------------------------------------------
 EPIC_ID_RE = re.compile(r"^E\d+$")
@@ -207,6 +221,26 @@ DEFAULT_TOKEN_COST_PER_M_OUTPUT: float = 25.0
 # free-form agent text must reject em-dash at the input boundary so the
 # validator can trust its own data.
 EM_DASH: str = "\u2014"
+
+# Minimum number of completed tasks required before per-window pace numbers
+# (avg_minutes, est_hours) are considered statistically meaningful. Below this
+# threshold the report renders "n/a (N=X samples)" rather than projecting from
+# a single completion that could swing wildly with the next task. 3 is small
+# enough to be responsive once a session has produced a few completions but
+# large enough to avoid the N=1 fragility seen in production reports.
+MIN_PACE_SAMPLES: int = 3
+
+# Default number of most recently completed tasks to average for the "Recent
+# pace" projection. Used when at least this many completions exist; otherwise
+# the report falls back to All-time pace. Overridable via
+# `report.recent_pace_tasks` YAML or `JUDGE_REPORT_RECENT_PACE_TASKS` env.
+DEFAULT_RECENT_PACE_TASKS: int = 10
+
+# Whitespace columns between the two side-by-side tables rendered by
+# `devbench report` (Backlog state on left, Window stats on right). Pure
+# rendering affordance -- kept as a constant so the gap is consistent and
+# editable from one place.
+SIDE_BY_SIDE_GAP_CHARS: int = 4
 
 # Timeout defaults (seconds)
 DEFAULT_GH_API_TIMEOUT: int = 30

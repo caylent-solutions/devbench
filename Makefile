@@ -3,7 +3,7 @@ SHELL := /bin/bash
 .DEFAULT_GOAL := help
 unexport VIRTUAL_ENV
 
-.PHONY: help install install-hooks plugin-install plugin-uninstall lint lint-ruff lint-bandit format format-check typecheck test test-unit test-coverage validate clean start start-interactive report report-session pre-commit-check pre-push-check
+.PHONY: help install install-hooks plugin-install plugin-uninstall lint lint-ruff lint-bandit format format-check typecheck test test-unit test-coverage validate clean start start-interactive report report-session pre-commit-check pre-push-check watch watch-live
 
 ## help: Show available targets
 help:
@@ -63,11 +63,15 @@ test-unit:
 test-coverage:
 	uv run pytest tests/ --cov=devbench --cov-report=term-missing --cov-fail-under=90
 
+## test-coverage-new: Enforce 100% line coverage on modules introduced or hardened by the manifest-amendment, task-factory, watch, git-ops-assertion, hook-tail, and auto-requeue features
+test-coverage-new:
+	uv run pytest tests/ --cov=devbench.backlog.manifest --cov=devbench.backlog.amendment --cov=devbench.backlog.proposal --cov=devbench.backlog.manager --cov=devbench.activity --cov=devbench.github.git_ops --cov=devbench.hook_tail --cov-report=term-missing --cov-fail-under=100
+
 ## test: Run all tests
 test: test-unit
 
 ## validate: Full validation (all checks -- identical to CI and pre-push)
-validate: lint-ruff lint-bandit format-check typecheck test-coverage
+validate: lint-ruff lint-bandit format-check typecheck test-coverage test-coverage-new
 	@echo "All validations passed"
 
 ## pre-commit-check: Checks that run on every commit (fast)
@@ -100,3 +104,11 @@ report:
 ## report-session: Show progress since a timestamp (e.g. make report-session SINCE=2026-03-05T16:13:00Z)
 report-session:
 	uv run python -m devbench.cli report "$(SINCE)"
+
+## watch: Show live dashboard of the currently-active orchestration (one-shot)
+watch:
+	uv run python -m devbench.cli watch
+
+## watch-live: Refresh the activity dashboard every N seconds (default 5; override with INTERVAL=2)
+watch-live:
+	uv run python -m devbench.cli watch --watch $${INTERVAL:-5}

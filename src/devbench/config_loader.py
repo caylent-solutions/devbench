@@ -9,7 +9,7 @@ Config value precedence:
 - YAML values override code defaults.  Environment variable overrides are applied
   by ``config.py``, not by this module.
 
-This module is parse/validate only — it does not read environment variables.
+This module is parse/validate only -- it does not read environment variables.
 All env-var-driven defaults for operational parameters (timeouts, limits, model
 identifiers, region) are applied by ``config.py``.  Optional fields in the
 dataclasses default to ``None``; callers are responsible for substituting
@@ -17,22 +17,22 @@ environment-driven values when ``None`` is encountered.
 
 YAML schema::
 
-    repos:                               # required — at least one entry
+    repos:                               # required -- at least one entry
       org/repo:                          # key must be "org/repo" format
-        default_branch: main2            # optional — omit to fall back to origin/HEAD
-        checkout_directory: my-checkout  # optional — relative to JUDGE_WORKSPACE_ROOT
-        merge_strategy: squash           # optional — overrides top-level merge_strategy
+        default_branch: main2            # optional -- omit to fall back to origin/HEAD
+        checkout_directory: my-checkout  # optional -- relative to JUDGE_WORKSPACE_ROOT
+        merge_strategy: squash           # optional -- overrides top-level merge_strategy
 
-    merge_strategy: squash               # optional — default merge strategy for all repos
-    max_executor_retries: <integer>      # optional — max executor retries per work unit on judge failure
-    use_bedrock: false                   # optional — route LLM calls via AWS Bedrock
-    bedrock_region: <aws-region-string>  # optional — AWS region for Bedrock (env var override applied by config.py)
-    judge_model: <model-id>              # optional — model for judge agents (env var override applied by config.py)
-    executor_model: <model-id>           # optional — model for executor agent (env var override applied by config.py)
-    allowed_orgs:                        # optional — permitted GitHub organisations
+    merge_strategy: squash               # optional -- default merge strategy for all repos
+    max_executor_retries: <integer>      # optional -- max executor retries per work unit on judge failure
+    use_bedrock: false                   # optional -- route LLM calls via AWS Bedrock
+    bedrock_region: <aws-region-string>  # optional -- AWS region for Bedrock (env var override applied by config.py)
+    judge_model: <model-id>              # optional -- model for judge agents (env var override applied by config.py)
+    executor_model: <model-id>           # optional -- model for executor agent (env var override applied by config.py)
+    allowed_orgs:                        # optional -- permitted GitHub organisations
       - caylent-solutions
 
-    timeouts:                            # optional — all values in seconds; env var overrides applied by config.py
+    timeouts:                            # optional -- all values in seconds; env var overrides applied by config.py
       gh_api: <integer>
       test: <integer>
       security_fetch: <integer>
@@ -43,14 +43,14 @@ YAML schema::
       orchestrator_poll_interval: <integer>
       github_check: <integer>
 
-    limits:                              # optional — threshold values; env var overrides applied by config.py
+    limits:                              # optional -- threshold values; env var overrides applied by config.py
       alert_summary: <integer>
       output_truncation: <integer>
       llm_evidence_truncation: <integer>
       llm_file_context: <integer>
       llm_file_preview_chars: <integer>
 
-    git_ops:                             # optional — git workflow settings
+    git_ops:                             # optional -- git workflow settings
       update_submodule: false            # set true only when repos are git submodules of a parent repo
 
 Example config file (``backlog/config/devbench.yaml``)::
@@ -182,6 +182,9 @@ class ReportConfig:
             write tokens, relative to the base input rate.
         data_residency_multiplier: Cost multiplier when usage.inference_geo
             is set (US-only inference).
+        recent_pace_tasks: Number of most recently completed tasks to average
+            for the "Recent pace" projection. ``None`` falls back to
+            ``DEFAULT_RECENT_PACE_TASKS``.
     """
 
     token_cost_per_million_input: float = DEFAULT_TOKEN_COST_PER_M_INPUT
@@ -191,6 +194,53 @@ class ReportConfig:
     cache_write_5min_multiplier: float | None = None
     cache_write_1hr_multiplier: float | None = None
     data_residency_multiplier: float | None = None
+    recent_pace_tasks: int | None = None
+
+
+@dataclass(frozen=True)
+class TaskFactoryConfig:
+    """Per-backlog task-factory configuration.
+
+    Controls whether the orchestrator invokes blocker-resolver + task-factory
+    after an amendment reject to generate `proposed` work units for the
+    out-of-scope production fixes the amender surfaced.
+
+    Attributes:
+        enabled: Whether the task-factory loop runs. Defaults to ``False``
+            so existing backlogs see no behavior change. Requires
+            ``manifest_amendment.enabled: true`` (task-factory runs from
+            the amendment-reject path).
+        auto_accept_proposals: When ``True``, ``devbench sweep-proposals``
+            auto-promotes every task-factory-produced draft to ``in-queue``
+            immediately, skipping the human review step. Default ``False``
+            preserves pre-ADR-11 behaviour (drafts land at ``proposed``
+            and wait for the operator). See ADR-11.
+    """
+
+    enabled: bool = False
+    auto_accept_proposals: bool = False
+
+
+@dataclass(frozen=True)
+class AmendmentConfig:
+    """Per-backlog Changes Manifest amendment workflow configuration.
+
+    Loaded from the ``manifest_amendment`` YAML section (opt-in, defaults off).
+    Consumed by the Layer 1 PreFilter in ``devbench.backlog.amendment``.
+
+    Attributes:
+        enabled: Whether the amendment workflow is active for this backlog.
+            Default ``False`` -- backlogs must explicitly opt in.
+        allowed_reasons: Set of amendment reasons this backlog accepts.
+            Requests whose reason is not in this set are rejected by the
+            pre-filter.
+        max_requests_per_execution: Upper bound on amendments applied to a
+            single task during one executor run; prevents amendment loops.
+    """
+
+    enabled: bool = False
+    allowed_reasons: frozenset[str] = field(default_factory=lambda: frozenset({"tdd_green_production_fix"}))
+    max_requests_per_execution: int = 1
 
 
 @dataclass
@@ -260,6 +310,8 @@ class RuntimeConfig:
     git_ops: GitOpsConfig = field(default_factory=GitOpsConfig)
     report: ReportConfig = field(default_factory=ReportConfig)
     stop_hook: StopHookConfig = field(default_factory=StopHookConfig)
+    manifest_amendment: AmendmentConfig = field(default_factory=AmendmentConfig)
+    task_factory: TaskFactoryConfig = field(default_factory=TaskFactoryConfig)
     allowed_orgs: list[str] = field(default_factory=list)
     judge_model: str | None = None
     executor_model: str | None = None
@@ -283,7 +335,7 @@ def resolve_config_path(
             (value of ``JUDGE_WORKSPACE_ROOT``).
 
     Returns:
-        Resolved config file path.  The path may not exist on disk — callers
+        Resolved config file path.  The path may not exist on disk -- callers
         are responsible for checking existence.
     """
     if explicit_path:
@@ -405,7 +457,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
     if not isinstance(raw, dict):
         raise ValueError(f"Config file '{path}' must be a YAML mapping at the top level, got {type(raw).__name__}.")
 
-    # JSON Schema validation — catches unknown keys, type errors, and enum violations.
+    # JSON Schema validation -- catches unknown keys, type errors, and enum violations.
     try:
         jsonschema.validate(raw, _SCHEMA)
     except jsonschema.ValidationError as exc:
@@ -472,7 +524,41 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         data_residency_multiplier=(
             float(report_raw["data_residency_multiplier"]) if "data_residency_multiplier" in report_raw else None
         ),
+        recent_pace_tasks=(int(report_raw["recent_pace_tasks"]) if "recent_pace_tasks" in report_raw else None),
     )
+
+    # Populate ManifestAmendment config from YAML manifest_amendment block.
+    amendment_raw = raw.get("manifest_amendment") or {}
+    default_amendment = AmendmentConfig()
+    manifest_amendment = AmendmentConfig(
+        enabled=bool(amendment_raw.get("enabled", default_amendment.enabled)),
+        allowed_reasons=(
+            frozenset(amendment_raw["allowed_reasons"])
+            if "allowed_reasons" in amendment_raw
+            else default_amendment.allowed_reasons
+        ),
+        max_requests_per_execution=int(
+            amendment_raw.get("max_requests_per_execution", default_amendment.max_requests_per_execution)
+        ),
+    )
+
+    # Populate TaskFactory config from YAML task_factory block. Requires
+    # manifest_amendment.enabled when task_factory.enabled is true -- the
+    # loop runs after an amendment reject, so it has nothing to do when the
+    # amendment workflow itself is off.
+    task_factory_raw = raw.get("task_factory") or {}
+    default_task_factory = TaskFactoryConfig()
+    task_factory = TaskFactoryConfig(
+        enabled=bool(task_factory_raw.get("enabled", default_task_factory.enabled)),
+        auto_accept_proposals=bool(
+            task_factory_raw.get("auto_accept_proposals", default_task_factory.auto_accept_proposals)
+        ),
+    )
+    if task_factory.enabled and not manifest_amendment.enabled:
+        raise ValueError(
+            f"Config file '{path}': task_factory.enabled: true requires manifest_amendment.enabled: true. "
+            "Task-factory runs from the amendment-reject path; it has nothing to do when amendments are off."
+        )
 
     # Populate StopHookConfig from YAML stop_hook block.
     stop_hook_raw = raw.get("stop_hook") or {}
@@ -495,6 +581,8 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         git_ops=git_ops,
         report=report,
         stop_hook=stop_hook,
+        manifest_amendment=manifest_amendment,
+        task_factory=task_factory,
         allowed_orgs=allowed_orgs,
         judge_model=raw.get("judge_model") or None,
         executor_model=raw.get("executor_model") or None,
@@ -512,7 +600,7 @@ def get_repo_local_path(repo: str, runtime_config: RuntimeConfig, workspace_root
     1. ``repos.<repo>.checkout_directory`` resolved relative to *workspace_root*.
     2. ``workspace_root / <repo-short-name>`` (the part after the ``/`` in ``org/repo``).
 
-    Pure function — no subprocess calls, no I/O.
+    Pure function -- no subprocess calls, no I/O.
 
     Args:
         repo: Fully-qualified repository name (e.g. ``'org/repo'``).
@@ -532,7 +620,7 @@ def get_repo_local_path(repo: str, runtime_config: RuntimeConfig, workspace_root
 def get_configured_default_branch(repo: str, runtime_config: RuntimeConfig) -> str | None:
     """Return YAML-configured default branch for *repo*, or ``None`` if absent.
 
-    Pure function — no subprocess calls, no I/O.
+    Pure function -- no subprocess calls, no I/O.
 
     Args:
         repo: Fully-qualified repository name (e.g. ``'org/repo'``).

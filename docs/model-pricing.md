@@ -2,7 +2,7 @@
 
 Per-model token pricing for the Claude models supported by devbench, with the YAML snippet to drop into your `devbench.yaml` for accurate cost estimates in `devbench report`.
 
-> **Pricing snapshot:** captured from <https://platform.claude.com/docs/en/about-claude/pricing> on **2026-04-16**. Rates change. Verify against the canonical source before relying on cost estimates for budgeting.
+> **Pricing snapshot:** captured from <https://platform.claude.com/docs/en/about-claude/pricing> on **2026-04-16**. Rates and regional / platform-specific premiums change over time. Always verify against the canonical source before relying on these numbers for billing or budgeting decisions. This file is a captured reference, not a live feed.
 
 ---
 
@@ -46,9 +46,9 @@ call_cost =   usage.input_tokens        × input_rate
 
 Cache-write tokens are read from the nested `usage.cache_creation.ephemeral_5m_input_tokens` / `ephemeral_1h_input_tokens` fields; older `cache_creation_input_tokens` values are counted as 5-minute writes.
 
-**No blended-rate fallback.** If an entry lacks a `usage` block (a non-LLM tool call like Read/Bash, or a legacy record), it contributes zero cost. The duration is still counted for API-utilization metrics, but the token cost stays at zero rather than being filled in from a blended estimate. This is the fail-fast posture — missing cost data surfaces as a visibly-low number rather than a masked estimate.
+**No blended-rate fallback.** If an entry lacks a `usage` block (a non-LLM tool call like Read/Bash, or a legacy record), it contributes zero cost. The duration is still counted for API-utilization metrics, but the token cost stays at zero rather than being filled in from a blended estimate. This is the fail-fast posture -- missing cost data surfaces as a visibly-low number rather than a masked estimate.
 
-**No estimated input/output ratio.** The `Lifetime input / output share (measured)` row in the report is purely descriptive — it shows what your actual workload ratio works out to from real data. It is never used as an input to the cost formula.
+**No estimated input/output ratio.** The `Input / output share (measured)` row in the TOKENS section of the consolidated report is purely descriptive -- it shows what your actual workload ratio works out to from real data. It is never used as an input to the cost formula.
 
 ---
 
@@ -68,9 +68,9 @@ Cache-write tokens are read from the nested `usage.cache_creation.ephemeral_5m_i
 | Claude Haiku 3.5  | $0.80 | $4    | $0.08      | $1                | $1.60            |
 | Claude Haiku 3    | $0.25 | $1.25 | $0.03      | $0.30             | $0.50            |
 
-> Opus 4.7 introduced a new tokenizer that may use up to ~35% more tokens for the same fixed text compared to earlier models — factor this into cost projections when migrating between Opus generations.
+> Opus 4.7 introduced a new tokenizer that may use up to ~35% more tokens for the same fixed text compared to earlier models -- factor this into cost projections when migrating between Opus generations.
 
-The cache columns are derived from the input rate via the standard Anthropic multipliers (0.10x for reads, 1.25x for 5-min writes, 2.0x for 1-hr writes) and are applied automatically by `devbench report` — you do not need to set them unless your deployment platform uses different multipliers.
+The cache columns are derived from the input rate via the standard Anthropic multipliers (0.10x for reads, 1.25x for 5-min writes, 2.0x for 1-hr writes) and are applied automatically by `devbench report` -- you do not need to set them unless your deployment platform uses different multipliers.
 
 ---
 
@@ -120,7 +120,7 @@ report:
 
 ### Mixed-model setups
 
-If your orchestrator uses different models for different roles (for example, Opus for executor and Sonnet for judges via `executor_model` / `judge_model` in `devbench.yaml`), pick the rate of the model that consumes the most tokens — usually the executor — for the most accurate single-figure estimate. There is no per-role cost split in `devbench report` yet (see [Current gaps](architecture.md#section-10--current-gaps-known-limitations) in the architecture doc).
+If your orchestrator uses different models for different roles (for example, Opus for executor and Sonnet for judges via `executor_model` / `judge_model` in `devbench.yaml`), pick the rate of the model that consumes the most tokens -- usually the executor -- for the most accurate single-figure estimate. There is no per-role cost split in `devbench report` yet (see [Current gaps](architecture.md#section-10--current-gaps-known-limitations) in the architecture doc).
 
 ---
 
@@ -164,7 +164,7 @@ DEFAULT_CACHE_WRITE_1HR_MULTIPLIER: float = 2.0
 DEFAULT_DATA_RESIDENCY_MULTIPLIER: float = 1.10
 ```
 
-These reflect current **Opus 4.7** pricing and Anthropic's published cache/data-residency multipliers. If you run a different model — Sonnet, Haiku, or any older Opus generation — set the `report:` values explicitly in your `devbench.yaml` using the table above so `devbench report` produces accurate cost estimates for your model.
+These reflect current **Opus 4.7** pricing and Anthropic's published cache/data-residency multipliers. If you run a different model -- Sonnet, Haiku, or any older Opus generation -- set the `report:` values explicitly in your `devbench.yaml` using the table above so `devbench report` produces accurate cost estimates for your model.
 
 ### Other settings under `report:`
 
@@ -183,7 +183,7 @@ When unset (or set to a name that isn't a valid IANA zone), the report falls bac
 
 ## Long context and batch pricing
 
-Claude Opus 4.7, Opus 4.6, and Sonnet 4.6 support a **1M-token context window** at the same per-token rate as smaller requests — there is no long-context premium for these models on the Claude API.
+Claude Opus 4.7, Opus 4.6, and Sonnet 4.6 support a **1M-token context window** at the same per-token rate as smaller requests -- there is no long-context premium for these models on the Claude API.
 
 The **Batch API** offers 50% off input and output for asynchronous workloads (devbench does not currently use the Batch API; the orchestrator runs interactive sessions).
 
@@ -195,8 +195,8 @@ For full pricing details, multipliers, and platform-specific rates (Bedrock, Ver
 
 Pricing on AWS Bedrock, Google Vertex AI, and Microsoft Foundry is set by the platform vendor, not Anthropic. The standard Anthropic rates above are a reasonable starting estimate but verify against your platform's pricing page:
 
-- AWS Bedrock — <https://aws.amazon.com/bedrock/pricing/>
-- Google Vertex AI — <https://cloud.google.com/vertex-ai/generative-ai/pricing#claude-models>
-- Microsoft Foundry — <https://azure.microsoft.com/en-us/pricing/details/microsoft-foundry/>
+- AWS Bedrock -- <https://aws.amazon.com/bedrock/pricing/>
+- Google Vertex AI -- <https://cloud.google.com/vertex-ai/generative-ai/pricing#claude-models>
+- Microsoft Foundry -- <https://azure.microsoft.com/en-us/pricing/details/microsoft-foundry/>
 
 Starting with Sonnet 4.5 and Haiku 4.5, regional and multi-region endpoints on Bedrock and Vertex AI carry a 10% premium over global endpoints. Override `report.data_residency_multiplier` in your YAML if you want the estimator to apply this premium.

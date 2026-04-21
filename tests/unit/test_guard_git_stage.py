@@ -219,5 +219,103 @@ class TestGuardGitStageHook:
         """AC-4: A command that contains 'git commit' as a substring in another context is handled correctly."""
         payload = _make_payload("echo 'git commit -m test'")
         result = _run_hook(payload)
-        # This is an echo command, not a real git commit — should be allowed
+        # This is an echo command, not a real git commit -- should be allowed
+        assert result.returncode == 0
+
+
+def _write_manifest_unit(path: Path, files: list[str]) -> Path:
+    """Write a minimal work-unit file with a Changes Manifest containing ``files``."""
+    rows = "\n".join(f"| `{f}` | update |" for f in files)
+    content = (
+        "# EX-F1-S1-T1: Sample\n\n"
+        "## Status: in-progress\n\n"
+        "## Description\n\nbody\n\n"
+        "## Changes Manifest\n\n"
+        "| File | Change |\n"
+        "|------|--------|\n"
+        f"{rows}\n"
+    )
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
+@pytest.mark.unit
+class TestGuardGitStageManifestScope:
+    """Slice 3b: `git add <path>` must target files listed in the active work unit's manifest."""
+
+    def _env_with_unit(self, cwd: str, unit_path: Path) -> dict[str, str]:
+        env = os.environ.copy()
+        env["PWD"] = cwd
+        env["CURRENT_WORK_UNIT_FILE"] = str(unit_path)
+        return env
+
+    def _run(self, payload: dict, env: dict[str, str], cwd: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["bash", str(SCRIPT_PATH)],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            cwd=cwd,
+            env=env,
+        )
+
+    def test_add_path_in_manifest_allowed(self, tmp_path: Path) -> None:
+        unit = _write_manifest_unit(tmp_path / "unit.md", ["src/a.py", "tests/test_a.py"])
+        payload = _make_payload("git add src/a.py")
+        result = self._run(payload, self._env_with_unit(str(tmp_path), unit), cwd=str(tmp_path))
+        assert result.returncode == 0, result.stderr
+
+    def test_add_path_out_of_manifest_rejected(self, tmp_path: Path) -> None:
+        unit = _write_manifest_unit(tmp_path / "unit.md", ["src/a.py"])
+        payload = _make_payload("git add TRACE_FILE")
+        result = self._run(payload, self._env_with_unit(str(tmp_path), unit), cwd=str(tmp_path))
+        assert result.returncode == 2
+        assert "manifest scope violation" in result.stderr
+        assert "TRACE_FILE" in result.stderr
+
+    def test_mixed_in_and_out_of_manifest_rejected(self, tmp_path: Path) -> None:
+        unit = _write_manifest_unit(tmp_path / "unit.md", ["src/a.py"])
+        payload = _make_payload("git add src/a.py dst/pollution.py")
+        result = self._run(payload, self._env_with_unit(str(tmp_path), unit), cwd=str(tmp_path))
+        assert result.returncode == 2
+        assert "dst/pollution.py" in result.stderr
+        # src/a.py must NOT appear as an offender, only in the manifest listing
+        assert result.stderr.count("src/a.py") == 1  # only the manifest-declares line
+
+    def test_blanket_add_dash_a_allowed_here_caught_at_commit(self, tmp_path: Path) -> None:
+        """`git add -A` is allowed through the hook; the commit-time assert catches violations."""
+        unit = _write_manifest_unit(tmp_path / "unit.md", ["src/a.py"])
+        payload = _make_payload("git add -A")
+        result = self._run(payload, self._env_with_unit(str(tmp_path), unit), cwd=str(tmp_path))
+        assert result.returncode == 0
+
+    def test_blanket_add_dot_allowed(self, tmp_path: Path) -> None:
+        unit = _write_manifest_unit(tmp_path / "unit.md", ["src/a.py"])
+        payload = _make_payload("git add .")
+        result = self._run(payload, self._env_with_unit(str(tmp_path), unit), cwd=str(tmp_path))
+        assert result.returncode == 0
+
+    def test_no_work_unit_env_skips_manifest_check(self, tmp_path: Path) -> None:
+        """Without CURRENT_WORK_UNIT_FILE the hook allows the add (backward compatibility)."""
+        env = os.environ.copy()
+        env.pop("CURRENT_WORK_UNIT_FILE", None)
+        env["PWD"] = str(tmp_path)
+        payload = _make_payload("git add anything.py")
+        result = self._run(payload, env, cwd=str(tmp_path))
+        assert result.returncode == 0
+
+    def test_missing_work_unit_file_skips_check(self, tmp_path: Path) -> None:
+        env = os.environ.copy()
+        env["PWD"] = str(tmp_path)
+        env["CURRENT_WORK_UNIT_FILE"] = str(tmp_path / "does-not-exist.md")
+        payload = _make_payload("git add anything.py")
+        result = self._run(payload, env, cwd=str(tmp_path))
+        assert result.returncode == 0
+
+    def test_work_unit_without_manifest_section_fails_open(self, tmp_path: Path) -> None:
+        """A work unit with no Changes Manifest section lets the hook fall through; commit-time check will catch."""
+        unit = tmp_path / "unit.md"
+        unit.write_text("# EX-F1-S1-T1: Sample\n\n## Status: in-progress\n\n## Description\n\nbody\n")
+        payload = _make_payload("git add anything.py")
+        result = self._run(payload, self._env_with_unit(str(tmp_path), unit), cwd=str(tmp_path))
         assert result.returncode == 0

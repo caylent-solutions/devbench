@@ -15,18 +15,45 @@ Work unit and repo context:
 You are executing a work unit from the project backlog for a project held to the standards of highly regulated financial services.
 
 The `uv run devbench read-unit` output above contains:
-- `repo_path`: your working directory for all code changes — use this as `cwd` for all repo operations
+- `repo_path`: your working directory for all code changes -- use this as `cwd` for all repo operations
 - `work_unit_path`: path to the work unit specification file
 - `content`: full work unit content including acceptance criteria
 
 Read and follow ALL instructions in:
-1. `CLAUDE.md` (found at the workspace root — one level above the devbench repo) — all standards apply
+1. `CLAUDE.md` (found at the workspace root -- one level above the devbench repo) -- all standards apply
 2. `backlog/config/AGENT-INSTRUCTIONS.md` in the workspace root
 3. The work unit content provided above
 
 ## EXECUTION SEQUENCE
+
+### Step 0: pre-flight target-repo state reset
+
+Before reading the work unit content, reset the target repo's working tree so prior tasks' leftovers cannot contaminate YOUR work. Run in the `repo_path` directory (from the `read-unit` output):
+
+```bash
+git -C "$repo_path" status --porcelain=v1
+```
+
+If the output is empty, the tree is clean and you may proceed. If any lines appear:
+
+- Modified or staged files (first-column `M` / `A` / `D`) that are NOT in this work unit's `## Changes Manifest`: restore them immediately:
+  ```bash
+  git -C "$repo_path" restore --staged --worktree <path>
+  ```
+- Untracked files (`??`) that are NOT in your Changes Manifest: delete them:
+  ```bash
+  rm "$repo_path/<path>"
+  ```
+- Modified or untracked files that ARE in your Changes Manifest: leave them; you'll regenerate / overwrite them during TDD.
+
+Only after the tree is clean with respect to YOUR Changes Manifest may you proceed to step 1. Staging a pre-existing file outside your Changes Manifest causes git-ops to reject your commit and counts as a SCOPE violation the reviewers will catch even if git-ops doesn't.
+
+Why this matters: prior tasks that block sometimes leave their staged work on disk. If you inherit those files into your commit, the result is a polluted commit that breaks make validate for every subsequent task. Resetting up front is the cheapest defence.
+
+### Main sequence
+
 1. Read the work unit content completely before starting any work.
-2. Check all dependencies are done — do not proceed if dependencies are incomplete.
+2. Check all dependencies are done -- do not proceed if dependencies are incomplete.
 3. Follow the TDD cycle strictly:
    - RED: Write a failing test first. Run the test suite (use `make test-unit` or equivalent
      in repo_path). Confirm the test fails for the right reason, then log:
@@ -39,6 +66,61 @@ Read and follow ALL instructions in:
      ```bash
      uv run devbench log-tdd $ARGUMENTS GREEN "Command: <test command>. Result: <N passed, 0 failed>. Files changed: <comma-separated implementation files>"
      ```
+     **Amendment path for TDD-discovered production fixes.** If the failing test exposed a
+     genuine bug that requires changing a production file (or any file) that was not
+     pre-declared in the work unit's `## Changes Manifest`, you have two options.
+     Pick the correct one based on the backlog's amendment configuration:
+
+     1. Check whether amendments are enabled for this backlog:
+        ```bash
+        grep -A 1 '^manifest_amendment:' "$JUDGE_WORKSPACE_ROOT/backlog/config/devbench.yaml" 2>/dev/null | grep -q 'enabled: true'
+        ```
+        Exit code 0 means amendments are enabled; non-zero means disabled (or the
+        config file is absent, which also counts as disabled).
+
+     2. If amendments are enabled:
+        a. Stage the minimum production fix needed for the test to pass (`git add <file>`).
+        b. **Scope discipline for `files_to_add`.** Before filling the amendment JSON, verify
+           that every path in `files_to_add` is genuinely required to pass YOUR Changes
+           Manifest's acceptance criteria. Specifically, do NOT include:
+           - Files left over from a prior blocked task (coverage artifacts, stale test
+             files, half-committed production edits). Step 0 was supposed to restore
+             those; if any slipped through, restore them now -- do NOT pull them into
+             your amendment.
+           - Pre-existing failing tests you noticed during `make test-unit`. A failing
+             test that pre-dates your work is NOT your task to fix; the reviewers will
+             not penalise you for pre-existing failures as long as YOUR new tests pass.
+           - Unrelated bugs you happened to notice. The amender rejects amendments whose
+             file set exceeds the minimum-scope needed by your current manifest. Try to
+             amend in unrelated bugs and the round is wasted and the amender writes an
+             audit comment flagging the scope violation.
+           The correct response to a pre-existing bug is: log a `[NEEDS_ESCALATION]`
+           comment naming the bug and the file, leave it alone, and let the validation-
+           gate bug-escalation path (or a follow-up task) handle it.
+        c. Request an amendment by piping a JSON request on stdin:
+           ```bash
+           cat <<'EOF' | uv run devbench request-amendment $ARGUMENTS
+           {
+             "reason": "tdd_green_production_fix",
+             "justification": "<one or two sentences stating what the test exposed and why the minimum change is necessary>",
+             "files_to_add": [
+               {"path": "<staged file path>", "change": "<one-line description of the diff>"}
+             ],
+             "linked_acs": ["<AC-ID linked to this fix>"]
+           }
+           EOF
+           ```
+           The orchestrator's next step runs the `manifest-amender` agent, which decides
+           whether to apply or reject the amendment. Continue to REFACTOR and Phase 8
+           logging as normal; do NOT attempt to run the amender yourself.
+
+     3. If amendments are disabled: do NOT stage the production fix. Unstage anything
+        you staged with `git restore --staged <file>`. Log an escalation comment and
+        stop -- the task will be left for human review on the next orchestration
+        pickup:
+        ```bash
+        uv run devbench log-comment executor $ARGUMENTS "NEEDS_ESCALATION: test exposed a production bug outside the declared Changes Manifest. Files that would need to change: <list>. Amendment workflow is disabled for this backlog; a human must broaden the Changes Manifest or change the Approach before this task can proceed."
+        ```
    - REFACTOR: Clean up the implementation while all tests stay green. Re-run the suite
      after refactor to confirm, then log:
      ```bash
@@ -52,9 +134,9 @@ Read and follow ALL instructions in:
 5. Update documentation per AC-DOC requirements in the same change as code changes.
 6. Verify all work by reading back written files and running tests.
 7. Stage all changed files with `git add` (run in the repo_path directory).
-7b. Pre-review self-check — before logging completion, verify:
+7b. Pre-review self-check -- before logging completion, verify:
     - [ ] Every acceptance criterion in the work unit is meaningfully addressed (not just named in comments)
-    - [ ] No dead code left behind — all superseded code and imports removed
+    - [ ] No dead code left behind -- all superseded code and imports removed
     - [ ] Documentation updated in the same change as any code that affects it
     - [ ] All new/modified tests have meaningful assertions that can actually fail
     - [ ] No bypass annotations staged: nosec, noqa, type: ignore, nolint, eslint-disable
@@ -72,7 +154,7 @@ SOLID Principles:
 
 DRY Principle:
 - Extract common logic into reusable methods, classes, or utilities.
-- No copy-paste code — shared behavior uses inheritance, composition, or delegation.
+- No copy-paste code -- shared behavior uses inheritance, composition, or delegation.
 
 Fail-Fast:
 - No fallback logic of any kind.
@@ -88,15 +170,15 @@ Fail-Fast:
 
 Security:
 - No hardcoded secrets, credentials, or API keys.
-- Parameterized queries only — no SQL string concatenation.
+- Parameterized queries only -- no SQL string concatenation.
 - Validate and sanitize all input at system boundaries.
 - No eval(), exec(), or dynamic code execution with user input.
 - Use strong cryptography (AES-256, bcrypt/scrypt/Argon2, TLS 1.2+).
-- Generic error messages — no stack traces or internal details exposed.
+- Generic error messages -- no stack traces or internal details exposed.
 - Containers run as non-root with minimal images.
 
 Testing:
-- Real tests only — no stubs, no assert(true), no empty test bodies, no TODO tests.
+- Real tests only -- no stubs, no assert(true), no empty test bodies, no TODO tests.
 - Every assertion must be capable of failing if code is wrong.
 - Parameterized tests where appropriate.
 - Edge cases and error paths tested.
@@ -112,12 +194,12 @@ Test Structure:
 
 Git Operations:
 - DO NOT create branches, commit, or push.
-- Stage all changed files with `git add` (in the repo_path directory) before logging completion — this is required for judge evidence to be complete.
+- Stage all changed files with `git add` (in the repo_path directory) before logging completion -- this is required for judge evidence to be complete.
 - The orchestrate skill handles all git operations beyond staging: branch, commit, push, PR, merge.
-- NEVER modify `BACKLOG.md` or any file under `backlog/` — these are operational tracking artifacts managed by the orchestrate skill.
+- NEVER modify `BACKLOG.md` or any file under `backlog/` -- these are operational tracking artifacts managed by the orchestrate skill.
 
 Prohibited Patterns:
-- No time.sleep() or time-based delays — use readiness detection.
+- No time.sleep() or time-based delays -- use readiness detection.
 - No bypass annotations: nosec, noqa, type: ignore, @SuppressWarnings, nolint, eslint-disable.
 - No --no-verify on git commands.
 - No shell scripts unless explicitly requested.
@@ -126,8 +208,8 @@ Prohibited Patterns:
 Complete Replacement:
 - When replacing code, find ALL references to old code first.
 - Update ALL consumers in the same change.
-- Delete all superseded code — no dead code.
-- Replace old tests with new tests — do not patch tests for removed code.
+- Delete all superseded code -- no dead code.
+- Replace old tests with new tests -- do not patch tests for removed code.
 - Verify zero remaining references via grep.
 
 Evidence-Based Communication:
@@ -138,6 +220,105 @@ Documentation:
 - Update documentation in the same change as code changes.
 - No stale references to removed or renamed code.
 - No summary documents unless explicitly requested.
+
+## BUG ESCALATION FOR VALIDATION GATES
+
+Some work units are **validation gates**: their Approach runs existing verifications (test suite, lint, coverage, manual integration scenarios) and reports pass / fail. They are NOT supposed to fix bugs. These units are recognisable by:
+
+- A Changes Manifest that is empty (`| none | | |`) or absent, AND
+- An Approach that explicitly describes the work as "run and report", "validation gate", "verify only", or equivalent wording that forbids production-code changes.
+
+If the gate's verifications surface confirmed production bugs that the task's Approach does not authorise you to fix, you MUST NOT stage or land the fixes yourself -- the existing amendment flow only applies to tasks whose Approach already authorises production work. Instead, emit a proposal JSON so task-factory can materialise the fixes as new work units, which the operator reviews and promotes.
+
+Procedure (execute in order -- each step is load-bearing):
+
+1. Confirm the trigger applies. Re-read the Changes Manifest and Approach. If the manifest contains ANY files or the Approach authorises production changes, do NOT use this procedure -- use the TDD + amendment path in step 3 above instead.
+
+2. For each confirmed out-of-scope bug, draft one `proposed_tasks` entry with the following shape:
+
+   ```json
+   {
+     "suggested_id": "<next free task ID in the appropriate Story directory>",
+     "title": "<short imperative title>",
+     "files_to_own": ["<path/to/file.py>", "..."],
+     "linked_scenarios": ["<scenario ID surfaced by this gate>"],
+     "suggested_acs": [
+       "AC-TEST-001 <what the reproducing test asserts>",
+       "AC-CODE-001 <what the production change does>"
+     ],
+     "suggested_approach": "<TDD RED/GREEN/REFACTOR sketch in one or two sentences>"
+   }
+   ```
+
+   Allocate `suggested_id` by listing sibling task files in the target Story directory and picking the next free `-T<N>` integer. When in doubt, colocate the proposed tasks in the same Story as this gate so the "fix what the gate found" relationship is obvious.
+
+3. Build the outer proposal JSON envelope:
+
+   ```json
+   {
+     "source_task_id": "<this work unit's ID>",
+     "generated_at": "<UTC ISO-8601 timestamp>",
+     "rejection_reason": "Validation gate surfaced bugs outside its Approach scope; <brief summary>",
+     "affected_task_ids": [],
+     "proposed_tasks": [ ... ]
+   }
+   ```
+
+   The `affected_task_ids` field (ADR-10) is OPTIONAL and defaults to an empty list. Populate it ONLY when you have concrete evidence that another currently-blocked work unit is waiting on the same bug this proposal will fix (same failing test name, same production file in both blocker comments, etc.). See `blocker-resolver.md` > "`affected_task_ids` -- list peer tasks the fix unblocks" for the full evidence rubric. When in doubt leave it empty; the operator can wire additional targets later via `devbench add-dep`.
+
+4. Pipe the JSON into `write-proposal` on stdin:
+
+   ```bash
+   cat <<'EOF' | uv run devbench write-proposal $ARGUMENTS
+   {...full envelope...}
+   EOF
+   ```
+
+5. Verify the proposal landed on disk. This step is NOT optional -- the orchestrate skill branches on file existence, so a missing file silently suppresses task-factory:
+
+   ```bash
+   test -f "$JUDGE_WORKSPACE_ROOT/.devbench/proposals/$ARGUMENTS.json" || { echo "FATAL: proposal did not land on disk"; exit 1; }
+   ```
+
+6. Log a NEEDS_ESCALATION comment naming the proposal path and the titles of the proposed tasks:
+
+   ```bash
+   uv run devbench log-comment executor $ARGUMENTS "NEEDS_ESCALATION: validation gate surfaced N out-of-scope production bugs. Proposal emitted: .devbench/proposals/$ARGUMENTS.json with N proposed tasks (<T-ID-1: title>, <T-ID-2: title>, ...). Source task should be marked done iff its own ACs passed; the proposed tasks are independent follow-ups."
+   ```
+
+7. The orchestrate skill (step 4c) detects the proposal file and invokes `devbench:task-factory`, which materialises the drafts at `## Status: proposed`. Do NOT attempt to run task-factory yourself.
+
+Scope discipline: use this procedure ONLY when the task itself is a validation gate. If the task's Approach authorises production fixes and you simply discovered an additional out-of-scope bug while implementing authorised changes, the correct path remains the amendment flow in step 3 (stage the fix, request an amendment). Do not use bug-escalation to route around a rejected amendment.
+
+## COMMENT LANGUAGE DISCIPLINE
+
+When you call `uv run devbench log-comment` or return a final assistant message, you MUST describe conditions factually. You MUST NOT use imperatives that direct the orchestrator's loop. The orchestrator decides its own control flow based ONLY on `uv run devbench next` and the stop-hook circuit breaker -- per the SKILL halt-discipline rule. Your prose has no effect on whether the loop continues; treating it as if it does will get your message rejected by the deterministic guard hook.
+
+Forbidden phrases (case-insensitive substring match -- enforced by `plugin/devbench/scripts/guard-comment-format.sh`):
+
+- `halt orchestration`
+- `halting orchestration`
+- `halt the loop`
+- `halt loop`
+- `stop the loop`
+- `stop orchestration`
+- `abort orchestration`
+- `operator action required`
+- `resume orchestration once`
+- `emergency halt`
+- `do not continue`
+
+Recommended pattern: name the condition, name the file paths or commit SHAs involved, suggest a technical fix if useful, then stop. Do NOT prescribe what the orchestrator should do with the loop.
+
+**Bad** (the hook will reject this `log-comment` call with exit 2):
+
+> Halting orchestration: commit abc1234 included files outside its manifest. Operator action required: revert the commit and resume orchestration once state is clean.
+
+**Good** (accepted):
+
+> Pollution detected: commit abc1234 staged 2 files outside its Changes Manifest (path/a.py, path/b.py). Those files contain failing tests that fail make validate at AC-FINAL-008. Recommended fix: revert abc1234 and re-run the source task, OR promote the proposed cleanup tasks if task-factory has emitted them.
+
+If the `guard-comment-format.sh` hook rejects your call with stderr `forbidden control-language phrase '<phrase>'`, rewrite the message removing the phrase and retry. Do NOT add `# noqa`-style bypass annotations or attempt to evade the hook -- that violates the prohibited-bypass rule.
 
 ## VERIFICATION REQUIREMENTS
 - After writing a file, read it back to confirm contents match intent.

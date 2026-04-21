@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# guard-verdict-format.sh — PreToolUse hook: validate 'uv run devbench log-verdict' calls.
+# guard-verdict-format.sh -- PreToolUse hook: validate 'uv run devbench log-verdict' calls.
 #
 # Receives JSON on stdin with structure:
 #   { "tool_name": "Bash", "tool_input": { "command": "..." } }
@@ -29,6 +29,8 @@ KNOWN_JUDGES=(
   "executor"
   "security_review"
   "blocker_resolver"
+  "manifest_amender"
+  "task_factory"
 )
 
 EXPECTED_ORDER="log-verdict <judge> <unit-id> <verdict> [feedback]"
@@ -41,7 +43,7 @@ d = json.load(sys.stdin)
 print(d.get('tool_input', {}).get('command', ''))
 " 2>/dev/null || true)
 
-# No command to inspect — allow.
+# No command to inspect -- allow.
 if [[ -z "$COMMAND" ]]; then
   exit 0
 fi
@@ -52,7 +54,7 @@ if ! printf '%s' "$COMMAND" | grep -qE '(^|[[:space:]])uv[[:space:]]+run[[:space
 fi
 
 # Parse arguments from the command string using Python's shlex for safe
-# shell-word splitting — no eval, no user-controlled string execution.
+# shell-word splitting -- no eval, no user-controlled string execution.
 #
 # The Python block writes 5 lines to stdout:
 #   line 1: "HELP" if --help/-h appears after log-verdict, else empty

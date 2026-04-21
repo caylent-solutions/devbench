@@ -1,6 +1,6 @@
 # Execution Modes
 
-DevBench supports two execution modes. Both follow the same lifecycle and the same ownership rules — the difference is whether the orchestrate skill runs interactively (human in the loop) or non-interactively (background/unattended).
+DevBench supports two execution modes. Both follow the same lifecycle and the same ownership rules -- the difference is whether the orchestrate skill runs interactively (human in the loop) or non-interactively (background/unattended).
 
 For the wider context (component architecture, judge tier, multi-PR vs single-PR mode), see the [architecture overview](architecture.md). This doc focuses on the per-step lifecycle and ownership rules.
 
@@ -21,8 +21,8 @@ For the wider context (component architecture, judge tier, multi-PR vs single-PR
 | Aspect | Automated (`make start`) | Interactive (`make start-interactive`) |
 | --- | --- | --- |
 | Orchestrator | `uv run devbench start` → Agent SDK `query()` runs orchestrate SKILL.md non-interactively | Claude Code session with orchestrate SKILL.md active |
-| Executor | `devbench:executor` agent (invoked by orchestrate skill) | Same — orchestrate skill invokes `devbench:executor` agent |
-| Human control | Background — monitor via log file | Foreground — pause with Escape, give instructions, resume |
+| Executor | `devbench:executor` agent (invoked by orchestrate skill) | Same -- orchestrate skill invokes `devbench:executor` agent |
+| Human control | Background -- monitor via log file | Foreground -- pause with Escape, give instructions, resume |
 | Git operations | `devbench:executor` agent via `devbench git-ops` CLI command | Same |
 | Best for | Unattended runs, CI-like pipelines | Active oversight, course correction, debugging |
 
@@ -52,14 +52,14 @@ Both modes execute the same logical steps in the same order.
    ├── Implement all acceptance criteria
    ├── Update documentation in the same change as code
    ├── Run full test suite, confirm passing
-   ├── Stage changed files (git add — NO commit)
+   ├── Stage changed files (git add -- NO commit)
    └── Update work-unit status to in-review
 
 5. Judge review  [devbench:review-supervisor AGENT RESPONSIBILITY]
-   ├── code-reviewer    — SOLID, DRY, fail-fast, 12-factor
-   ├── test-reviewer    — TDD discipline, test quality, coverage
-   ├── doc-reviewer     — accuracy, completeness, sync with code
-   └── changes-manifest — actual changes vs. declared manifest
+   ├── code-reviewer    -- SOLID, DRY, fail-fast, 12-factor
+   ├── test-reviewer    -- TDD discipline, test quality, coverage
+   ├── doc-reviewer     -- accuracy, completeness, sync with code
+   └── changes-manifest -- actual changes vs. declared manifest
    (review-supervisor invokes all four judge agents in parallel)
 
 6. If any judge FAILs → inject feedback, return to step 4 (max max_executor_retries)
@@ -67,10 +67,10 @@ Both modes execute the same logical steps in the same order.
 7. Security review (after all 4 judges pass)  [devbench:security-reviewer AGENT RESPONSIBILITY]
    └── If FAIL → write SECURITY_FAIL + REVIEW_REJECTED, return to step 4
 
-8a. Git operations — STANDARD MODE (default; per-task branch + per-task PR)
+8a. Git operations -- STANDARD MODE (default; per-task branch + per-task PR)
     [devbench:executor AGENT RESPONSIBILITY]
     ├── Create/checkout branch in the target repo
-    ├── Stage files from the Changes Manifest (selective — never git add -A)
+    ├── Stage files from the Changes Manifest (selective -- never git add -A)
     ├── Commit: "<unit-id>: <title>"
     ├── Push branch to origin
     ├── Create PR (--base from devbench.yaml repos.<org/repo>.default_branch)
@@ -78,13 +78,19 @@ Both modes execute the same logical steps in the same order.
     ├── Squash-merge PR, delete branch
     └── Update parent repo's submodule reference (only when git_ops.update_submodule: true)
 
-8b. Git operations — SINGLE-BRANCH MODE (git_ops.single_branch + git_ops.defer_pr: true)
+8b. Git operations -- SINGLE-BRANCH MODE (git_ops.single_branch + git_ops.defer_pr: true)
     [devbench:executor AGENT RESPONSIBILITY for per-task; orchestrate finalizes]
     ├── ensure-branch creates/checks out the shared branch (same for every task)
     ├── Stage files
     ├── Commit locally: "<unit-id>: <title>" (no push, no PR, no merge)
     └── After ALL tasks are done: `devbench git-ops-finalize <repo>` pushes the
         accumulated commits and creates one PR for the batch
+
+    Note: In this mode `devbench get-diff` returns the current task's
+    commit-local scope only (staged + unstaged + untracked, or `git show
+    HEAD` post-commit). The branch-vs-default hunk is deliberately omitted
+    because it would include every prior completed task's commits on the
+    shared branch. See ADR-12.
 
 9. Mark Done (done-gate: verifies all 4 judges passed in most recent round)
 
@@ -174,7 +180,7 @@ Claude Code session (with devbench plugin active)
     └── Claude invokes devbench:executor for git-ops (commit, push, PR, merge)
 ```
 
-The human can pause at any time (Escape), give instructions, and resume. The same ownership rules apply — the executor does not commit until all judges pass.
+The human can pause at any time (Escape), give instructions, and resume. The same ownership rules apply -- the executor does not commit until all judges pass.
 
 ---
 
@@ -195,8 +201,8 @@ The BACKLOG.md index is an at-a-glance summary; the work-unit file is authoritat
 | Event | Behaviour |
 | --- | --- |
 | Judge FAIL | Feedback injected into the next executor invocation; executor reads feedback, fixes code, re-runs review. |
-| BLOCKED (executor reported) | Work unit marked `blocked`. Stays blocked until human intervention (the `blocker-resolver` agent is not currently invoked — see architecture doc gaps). |
-| Max executor retries exhausted (`max_executor_retries` / `JUDGE_MAX_RETRIES`, default 10) | `devbench set-status <id> blocked` — unit marked BLOCKED in BACKLOG.md and orchestrator moves on. |
+| BLOCKED (executor reported) | Work unit marked `blocked`. Stays blocked until human intervention (the `blocker-resolver` agent is not currently invoked -- see architecture doc gaps). |
+| Max executor retries exhausted (`max_executor_retries` / `JUDGE_MAX_RETRIES`, default 10) | `devbench set-status <id> blocked` -- unit marked BLOCKED in BACKLOG.md and orchestrator moves on. |
 | Security FAIL | `SECURITY_FAIL` + `REVIEW_REJECTED` written to work unit; done-gate window reset; review tier re-runs after fix. Security tier is **not** retried. |
 
 ---

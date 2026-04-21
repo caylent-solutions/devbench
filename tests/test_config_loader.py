@@ -24,7 +24,7 @@ from devbench.config_loader import (
 )
 
 # ---------------------------------------------------------------------------
-# resolve_config_path — AC-2
+# resolve_config_path -- AC-2
 # ---------------------------------------------------------------------------
 
 
@@ -80,7 +80,7 @@ class TestResolveConfigPath:
 
 
 # ---------------------------------------------------------------------------
-# load_runtime_config — AC-3, AC-4, AC-5
+# load_runtime_config -- AC-3, AC-4, AC-5
 # ---------------------------------------------------------------------------
 
 
@@ -220,7 +220,7 @@ class TestLoadRuntimeConfig:
 
 
 # ---------------------------------------------------------------------------
-# get_configured_default_branch — AC-6 (pure function)
+# get_configured_default_branch -- AC-6 (pure function)
 # ---------------------------------------------------------------------------
 
 
@@ -285,7 +285,7 @@ class TestDataclasses:
 
 
 # ---------------------------------------------------------------------------
-# checkout_directory parsing — AC-1, AC-3, AC-4
+# checkout_directory parsing -- AC-1, AC-3, AC-4
 # ---------------------------------------------------------------------------
 
 
@@ -355,7 +355,7 @@ class TestCheckoutDirectory:
 
 
 # ---------------------------------------------------------------------------
-# get_repo_local_path — AC-2, AC-5
+# get_repo_local_path -- AC-2, AC-5
 # ---------------------------------------------------------------------------
 
 
@@ -405,7 +405,7 @@ class TestGetRepoLocalPath:
 
 
 # ---------------------------------------------------------------------------
-# JSON Schema validation — AC-1, AC-2, AC-3, AC-4, AC-5, AC-6
+# JSON Schema validation -- AC-1, AC-2, AC-3, AC-4, AC-5, AC-6
 # ---------------------------------------------------------------------------
 
 
@@ -547,7 +547,7 @@ class TestJsonSchemaValidation:
 
 
 # ---------------------------------------------------------------------------
-# TimeoutConfig / LimitConfig dataclasses — AC-9
+# TimeoutConfig / LimitConfig dataclasses -- AC-9
 # ---------------------------------------------------------------------------
 
 
@@ -598,7 +598,7 @@ class TestLimitConfigDefaults:
 
 
 # ---------------------------------------------------------------------------
-# RuntimeConfig population from YAML — AC-9
+# RuntimeConfig population from YAML -- AC-9
 # ---------------------------------------------------------------------------
 
 
@@ -801,7 +801,7 @@ class TestConfigLoaderNoEnvVars:
             ):
                 env_read_calls.append("os.getenv")
 
-        assert env_read_calls == [], f"config_loader.py must not read env vars — found: {env_read_calls}"
+        assert env_read_calls == [], f"config_loader.py must not read env vars -- found: {env_read_calls}"
 
 
 # ---------------------------------------------------------------------------
@@ -902,7 +902,7 @@ class TestPostSchemaValidation:
 
 
 # ---------------------------------------------------------------------------
-# GitOpsConfig — T3 AC-3, AC-4, AC-5, AC-6
+# GitOpsConfig -- T3 AC-3, AC-4, AC-5, AC-6
 # ---------------------------------------------------------------------------
 
 
@@ -1214,3 +1214,217 @@ class TestGitOpsConfig:
         )
         result = load_runtime_config(cfg, {})
         assert result.stop_hook.stale_task_minutes == 30
+
+
+class TestManifestAmendmentConfig:
+    """YAML loader correctly parses the opt-in manifest_amendment section."""
+
+    @staticmethod
+    def _write(path: Path, content: str) -> Path:
+        import textwrap
+
+        path.write_text(textwrap.dedent(content))
+        return path
+
+    def test_defaults_when_section_absent(self, tmp_path: Path) -> None:
+        """When the manifest_amendment section is omitted, the feature is disabled."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.manifest_amendment.enabled is False
+        assert result.manifest_amendment.max_requests_per_execution == 1
+        assert "tdd_green_production_fix" in result.manifest_amendment.allowed_reasons
+
+    def test_enabled_from_yaml(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            manifest_amendment:
+              enabled: true
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.manifest_amendment.enabled is True
+
+    def test_allowed_reasons_from_yaml(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            manifest_amendment:
+              enabled: true
+              allowed_reasons:
+                - tdd_green_production_fix
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.manifest_amendment.allowed_reasons == frozenset({"tdd_green_production_fix"})
+
+    def test_max_requests_per_execution_from_yaml(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            manifest_amendment:
+              enabled: true
+              max_requests_per_execution: 3
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.manifest_amendment.max_requests_per_execution == 3
+
+    def test_rejects_disallowed_reason(self, tmp_path: Path) -> None:
+        """Schema enumerates allowed_reasons values; unknown values fail validation."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            manifest_amendment:
+              enabled: true
+              allowed_reasons:
+                - unknown_reason
+            """,
+        )
+        with pytest.raises(ValueError, match="schema validation"):
+            load_runtime_config(cfg, {})
+
+    def test_rejects_unknown_key(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            manifest_amendment:
+              unknown_field: true
+            """,
+        )
+        with pytest.raises(ValueError, match="schema validation"):
+            load_runtime_config(cfg, {})
+
+
+class TestTaskFactoryConfig:
+    """ADR-11: YAML loader correctly parses the opt-in task_factory section including auto_accept_proposals."""
+
+    @staticmethod
+    def _write(path: Path, content: str) -> Path:
+        import textwrap
+
+        path.write_text(textwrap.dedent(content))
+        return path
+
+    def test_defaults_when_section_absent(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.task_factory.enabled is False
+        assert result.task_factory.auto_accept_proposals is False
+
+    def test_auto_accept_defaults_false_when_key_omitted(self, tmp_path: Path) -> None:
+        """Key omitted inside an enabled task_factory block -> default False (backward-compatible)."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            manifest_amendment:
+              enabled: true
+            task_factory:
+              enabled: true
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.task_factory.enabled is True
+        assert result.task_factory.auto_accept_proposals is False
+
+    def test_auto_accept_accepts_explicit_false(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            manifest_amendment:
+              enabled: true
+            task_factory:
+              enabled: true
+              auto_accept_proposals: false
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.task_factory.auto_accept_proposals is False
+
+    def test_auto_accept_accepts_explicit_true(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            manifest_amendment:
+              enabled: true
+            task_factory:
+              enabled: true
+              auto_accept_proposals: true
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.task_factory.auto_accept_proposals is True
+
+    def test_schema_rejects_auto_accept_non_boolean_string(self, tmp_path: Path) -> None:
+        """String "true" is not a YAML boolean; schema validation must reject."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            manifest_amendment:
+              enabled: true
+            task_factory:
+              enabled: true
+              auto_accept_proposals: "true"
+            """,
+        )
+        with pytest.raises(ValueError, match="schema validation"):
+            load_runtime_config(cfg, {})
+
+    def test_schema_rejects_auto_accept_integer(self, tmp_path: Path) -> None:
+        """Integer 1 is not a boolean for schema purposes."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            manifest_amendment:
+              enabled: true
+            task_factory:
+              enabled: true
+              auto_accept_proposals: 1
+            """,
+        )
+        with pytest.raises(ValueError, match="schema validation"):
+            load_runtime_config(cfg, {})

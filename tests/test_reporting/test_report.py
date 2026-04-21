@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
 from devbench.backlog.work_unit import WorkUnitStatus, WorkUnitType
-from devbench.reporting.report import generate_report
+from devbench.reporting.report import WindowStats, generate_report
 
 
 @pytest.fixture(autouse=True)
@@ -68,25 +68,31 @@ class TestGenerateReport:
     def test_report_uses_session_start_for_tasks_started_before_since(self, tmp_path: Path) -> None:
         """When a task was set to 'in-progress' before --since but done after, the
         duration should be measured from session_start, not from the original
-        in-progress time."""
+        in-progress time. Uses 3 completed tasks so the pace metric clears the
+        MIN_PACE_SAMPLES threshold."""
         log_file = tmp_path / "test.log"
         log_file.write_text(
             _make_log(
                 [
                     "2026-03-05T08:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
                     "2026-03-05T10:30:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'",
+                    "2026-03-05T10:30:00Z [judges.cli] INFO Set E0-F1-S1-T2 to 'in-progress'",
+                    "2026-03-05T11:00:00Z [judges.cli] INFO Set E0-F1-S1-T2 to 'done'",
+                    "2026-03-05T11:00:00Z [judges.cli] INFO Set E0-F1-S1-T3 to 'in-progress'",
+                    "2026-03-05T11:30:00Z [judges.cli] INFO Set E0-F1-S1-T3 to 'done'",
                 ]
             )
         )
 
         since = datetime(2026, 3, 5, 10, 0, 0, tzinfo=UTC)
         report = generate_report(log_path=log_file, since=since)
-        # Task done at 10:30, session starts at 10:00 -> 30 min duration
-        assert "30.0 minutes" in report
+        # Three tasks done at 30 min each -> avg 30 min per task in window
+        assert "30.0 min" in report
 
     def test_report_keeps_latest_in_progress_timestamp(self, tmp_path: Path) -> None:
         """When a task is set to 'in-progress' multiple times, the latest
-        timestamp should be used for duration calculation."""
+        timestamp should be used for duration calculation. Padded with two
+        more completions to clear MIN_PACE_SAMPLES."""
         log_file = tmp_path / "test.log"
         log_file.write_text(
             _make_log(
@@ -94,14 +100,18 @@ class TestGenerateReport:
                     "2026-03-05T08:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
                     "2026-03-05T10:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
                     "2026-03-05T10:20:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'",
+                    "2026-03-05T10:20:00Z [judges.cli] INFO Set E0-F1-S1-T2 to 'in-progress'",
+                    "2026-03-05T10:40:00Z [judges.cli] INFO Set E0-F1-S1-T2 to 'done'",
+                    "2026-03-05T10:40:00Z [judges.cli] INFO Set E0-F1-S1-T3 to 'in-progress'",
+                    "2026-03-05T11:00:00Z [judges.cli] INFO Set E0-F1-S1-T3 to 'done'",
                 ]
             )
         )
 
         since = datetime(2026, 3, 5, 9, 0, 0, tzinfo=UTC)
         report = generate_report(log_path=log_file, since=since)
-        # Latest in-progress at 10:00, done at 10:20 -> 20 min
-        assert "20.0 minutes" in report
+        # Three tasks done at 20 min each -> avg 20 min per task in window
+        assert "20.0 min" in report
 
     def test_report_handles_empty_log(self, tmp_path: Path) -> None:
         log_file = tmp_path / "empty.log"
@@ -131,9 +141,9 @@ class TestGenerateReport:
         )
 
         report = generate_report(log_path=log_file)
-        # Summary line uses All-time pace (renamed from "current pace") and shows remaining count.
-        assert "At the All-time pace" in report
-        assert "remaining" in report
+        # Backlog parser is mocked to return zero units, so tasks_active = 0;
+        # the summary line takes the "All tasks complete." branch.
+        assert "All tasks complete." in report
 
 
 class TestTokenCostReport:
@@ -404,8 +414,10 @@ class TestDualWindowReport:
         # Multi-column header includes both window labels
         assert "All-time" in report
         assert "Session" in report
-        assert "Backlog state" in report
-        assert "Window stats" in report
+        # Consolidated grouped table uses uppercase section headers for
+        # BACKLOG STATE and the windowed sections.
+        assert "BACKLOG STATE" in report
+        assert "THROUGHPUT" in report
         # No "This run <timestamp>" column header when not in watch mode.
         # ("This run" appears in the trailing prose explanation, so check the
         # header form specifically.)
@@ -448,7 +460,7 @@ class TestDualWindowReport:
                     # Noise entries every 3 seconds for 1 hour (just one example to prove filtering)
                     "2026-03-05T08:30:00Z [judges.log_setup] INFO Logging to stdout and ...",
                     "2026-03-05T09:00:00Z [judges.log_setup] INFO Logging to stdout and ...",
-                    # A real orchestration event 70 minutes after the last real one — new session
+                    # A real orchestration event 70 minutes after the last real one -- new session
                     "2026-03-05T09:15:00Z [judges.cli] INFO Set E0-F1-S1-T2 to 'in-progress'",
                 ]
             )
@@ -587,7 +599,7 @@ class TestDisplayTimezone:
         # "Not_A_Real_Zone" is invalid; should fall back to local.
         with _patch("devbench.reporting.report.REPORT_DISPLAY_TIMEZONE", "Not_A_Real_Zone"):
             report = generate_report(log_path=log_file)
-        # Just check report rendered — no exception, has the expected sections.
+        # Just check report rendered -- no exception, has the expected sections.
         assert "All-time" in report
         assert "Session" in report
 
@@ -664,7 +676,7 @@ class TestAccurateCost:
         assert cost.total_cost == pytest.approx(0.030524, abs=1e-5)
 
         # A naive totalTokens * blended-rate estimate would give $0.355527 for
-        # the same call — confirming per-token-type costing is >10x lower for
+        # the same call -- confirming per-token-type costing is >10x lower for
         # cache-heavy workloads. Naive: (1+332+38712+458) * 9 / 1M.
         naive_blended_cost = (1 + 332 + 38712 + 458) * 9.0 / 1_000_000
         assert naive_blended_cost / cost.total_cost > 10
@@ -684,10 +696,12 @@ class TestAccurateCost:
         with _patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
             report = generate_report(log_path=log_file)
 
-        # All token types should appear in the lifetime breakdown rows of the top box.
-        assert "Lifetime tokens consumed" in report
+        # Token breakdown rows live in the TOKENS section of the consolidated
+        # table now (no more duplicated "Lifetime X" rows -- those were the
+        # same data as the All-time column and have been consolidated away).
+        assert "Tokens consumed" in report
         assert "1,000" in report  # cache reads
-        assert "Lifetime cache hit rate" in report
+        assert "Cache hit rate" in report
 
     def test_input_share_property(self) -> None:
         """input_share returns the measured input/output ratio (display-only metric)."""
@@ -854,3 +868,828 @@ class TestBedrockConfig:
 
         assert isinstance(BEDROCK_REGION, str)
         assert len(BEDROCK_REGION) > 0
+
+
+class TestResolveWindowEndpoints:
+    """`window_end` must be bounded below by now so a 'This run' window whose
+    start post-dates the last log entry never produces a negative span."""
+
+    def test_window_end_uses_now_when_logs_are_older(self) -> None:
+        from devbench.reporting.report import _resolve_window_endpoints
+
+        # All log timestamps are an hour old.
+        old = datetime.now(UTC) - timedelta(hours=1)
+        log_ts = [old, old + timedelta(minutes=10), old + timedelta(minutes=30)]
+
+        before = datetime.now(UTC)
+        log_start, window_end, log_started = _resolve_window_endpoints(log_ts)
+        after = datetime.now(UTC)
+
+        assert log_start == old
+        assert log_started == old
+        # window_end must be at least "now" (clamped above the latest log entry)
+        assert window_end >= before
+        assert window_end <= after
+
+    def test_window_end_uses_latest_log_when_newer_than_now(self) -> None:
+        """If somehow a log timestamp is in the future (clock skew), respect it
+        rather than silently truncating it to now."""
+        from devbench.reporting.report import _resolve_window_endpoints
+
+        future = datetime.now(UTC) + timedelta(hours=2)
+        log_ts = [datetime.now(UTC) - timedelta(hours=1), future]
+
+        _, window_end, _ = _resolve_window_endpoints(log_ts)
+        assert window_end == future
+
+    def test_window_for_run_started_after_last_log_has_non_negative_span(self) -> None:
+        """A 'This run' window whose start post-dates every log entry must have
+        a span >= 0; this is the regression that produced -0.0 h in production."""
+        from devbench.reporting.report import _resolve_window_endpoints
+
+        old = datetime.now(UTC) - timedelta(hours=1)
+        _, window_end, _ = _resolve_window_endpoints([old])
+        run_start = datetime.now(UTC)  # later than every log entry
+        # window_end is bounded by now, so the span is at least 0 (within microseconds).
+        span = (window_end - run_start).total_seconds()
+        # Allow tiny negative drift caused by datetime.now() racing with the
+        # window_end computation; anything within 100ms is non-negative for
+        # display purposes.
+        assert span >= -0.1
+
+
+class TestApiUtilizationDisplay:
+    """API utilization > 100% must render as a labeled marker, not a raw percentage."""
+
+    @staticmethod
+    def _make_stats(api_efficiency: float | None) -> WindowStats:
+        from devbench.reporting.report import CostBreakdown, HookLogTotals, WindowStats
+
+        return WindowStats(
+            window_start=datetime(2026, 4, 16, 12, 0, 0, tzinfo=UTC),
+            window_hours=1.0,
+            tasks_in_window=1,
+            avg_minutes=10.0,
+            est_hours=0.0,
+            totals=HookLogTotals(),
+            cost=CostBreakdown(0, 0, 0, 0, 0, 0),
+            cache_hit_rate=None,
+            tokens_per_task=0.0,
+            est_total_cost=0.0,
+            api_hours=0.0,
+            api_efficiency=api_efficiency,
+        )
+
+    def test_efficiency_above_100_shows_parallel_marker(self) -> None:
+        from devbench.reporting.report import _stats_to_value_list
+
+        values = _stats_to_value_list(self._make_stats(719.0))
+        # API utilization is the 6th value (index 5) in METRIC_LABELS order.
+        assert ">100% (parallel)" in values
+
+    def test_efficiency_at_or_below_100_shows_raw_percentage(self) -> None:
+        from devbench.reporting.report import _stats_to_value_list
+
+        values = _stats_to_value_list(self._make_stats(75.0))
+        assert "75.0%" in values
+        assert ">100%" not in " ".join(values)
+
+    def test_efficiency_exactly_100_shows_raw_percentage(self) -> None:
+        from devbench.reporting.report import _stats_to_value_list
+
+        values = _stats_to_value_list(self._make_stats(100.0))
+        assert "100.0%" in values
+        assert ">100%" not in " ".join(values)
+
+    def test_efficiency_none_shows_na(self) -> None:
+        from devbench.reporting.report import _stats_to_value_list
+
+        values = _stats_to_value_list(self._make_stats(None))
+        assert "n/a" in values
+
+
+class TestActiveVsBlockedRemaining:
+    """B1 + B2: tasks_remaining splits into active + blocked; projections use active only."""
+
+    @staticmethod
+    def _make_units(active_n: int, blocked_n: int, done_n: int) -> list:
+        from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
+
+        units = []
+        for i in range(done_n):
+            units.append(
+                WorkUnit(
+                    id=f"E0-F1-S1-T{i + 1}",
+                    title=f"done-{i}",
+                    status=WorkUnitStatus.DONE,
+                    unit_type=WorkUnitType.TASK,
+                    file_path=Path(f"backlog/done-{i}.md"),
+                    repo="caylent-solutions/git-repo",
+                    dependencies=[],
+                )
+            )
+        for i in range(active_n):
+            units.append(
+                WorkUnit(
+                    id=f"E0-F1-S2-T{i + 1}",
+                    title=f"active-{i}",
+                    status=WorkUnitStatus.IN_PROGRESS,
+                    unit_type=WorkUnitType.TASK,
+                    file_path=Path(f"backlog/active-{i}.md"),
+                    repo="caylent-solutions/git-repo",
+                    dependencies=[],
+                )
+            )
+        for i in range(blocked_n):
+            units.append(
+                WorkUnit(
+                    id=f"E0-F1-S3-T{i + 1}",
+                    title=f"blocked-{i}",
+                    status=WorkUnitStatus.BLOCKED,
+                    unit_type=WorkUnitType.TASK,
+                    file_path=Path(f"backlog/blocked-{i}.md"),
+                    repo="caylent-solutions/git-repo",
+                    dependencies=[],
+                )
+            )
+        return units
+
+    def test_backlog_totals_partition_active_and_blocked(self) -> None:
+        from devbench.reporting.report import _backlog_totals_from_units
+
+        b = _backlog_totals_from_units(self._make_units(active_n=1, blocked_n=4, done_n=84))
+        assert b.tasks_total == 89
+        assert b.tasks_done == 84
+        assert b.tasks_remaining == 5
+        assert b.tasks_blocked == 4
+        assert b.tasks_active == 1
+
+    def test_backlog_state_rows_show_in_progress_blocked_and_total(self) -> None:
+        """B8: top box shows in-progress + blocked + total-remaining as distinct rows.
+        The older `Tasks remaining (active)` / `Tasks remaining (blocked, ...)` rows
+        are replaced by this cleaner breakdown."""
+        from devbench.reporting.report import _backlog_state_rows, _backlog_totals_from_units
+
+        b = _backlog_totals_from_units(self._make_units(active_n=1, blocked_n=4, done_n=84))
+        rows = dict(_backlog_state_rows(b, lifetime=None))
+        assert rows["Tasks in-progress"] == "1"
+        assert rows["Tasks blocked"] == "4"
+        assert rows["Tasks remaining (total)"] == "5"
+        # Old labels must be gone.
+        assert "Tasks remaining (active)" not in rows
+        assert "Tasks remaining (blocked, excluded from ETA)" not in rows
+
+    def test_est_hours_uses_tasks_active_not_tasks_remaining(self, tmp_path: Path) -> None:
+        """B2: a window with avg=20min and 1 active + 4 blocked must project 0.33h, not 1.67h.
+
+        Uses 3 completed tasks to clear MIN_PACE_SAMPLES; otherwise the pace
+        is treated as fragile and est_hours stays 0.
+        """
+        from devbench.reporting.report import _compute_window_stats
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text("ignored\n")
+        done = {
+            "E0-F1-S1-T1": datetime(2026, 4, 15, 10, 20, tzinfo=UTC),
+            "E0-F1-S1-T2": datetime(2026, 4, 15, 10, 50, tzinfo=UTC),
+            "E0-F1-S1-T3": datetime(2026, 4, 15, 11, 20, tzinfo=UTC),
+        }
+        prog = {
+            "E0-F1-S1-T1": datetime(2026, 4, 15, 10, 0, tzinfo=UTC),
+            "E0-F1-S1-T2": datetime(2026, 4, 15, 10, 30, tzinfo=UTC),
+            "E0-F1-S1-T3": datetime(2026, 4, 15, 11, 0, tzinfo=UTC),
+        }
+        stats = _compute_window_stats(
+            log_file,
+            datetime(2026, 4, 15, 9, 0, tzinfo=UTC),
+            datetime(2026, 4, 15, 12, 0, tzinfo=UTC),
+            done,
+            prog,
+            tasks_active=1,
+        )
+        # 3 tasks * 20 min -> avg 20 min; only 3 completions log-wide but
+        # RECENT_PACE_TASKS default is 10, so recent_pace_minutes is None and
+        # est_hours falls back to avg_minutes.
+        assert stats.avg_minutes == pytest.approx(20.0)
+        assert stats.pace_sample_count == 3
+        assert stats.est_hours == pytest.approx(20.0 / 60.0)
+
+    def test_summary_line_excludes_blocked_count(self) -> None:
+        from devbench.reporting.report import CostBreakdown, HookLogTotals, WindowStats, _summary_line
+
+        stats = WindowStats(
+            window_start=datetime(2026, 4, 15, 10, 0, tzinfo=UTC),
+            window_hours=1.0,
+            tasks_in_window=2,
+            avg_minutes=20.0,
+            est_hours=20.0 / 60.0,
+            totals=HookLogTotals(),
+            cost=CostBreakdown(0, 0, 0, 0, 0, 0),
+            cache_hit_rate=None,
+            tokens_per_task=0.0,
+            est_total_cost=0.0,
+            api_hours=0.0,
+            api_efficiency=None,
+        )
+        line = _summary_line(stats, tasks_active=1, tasks_blocked=4)
+        assert "1 active task(s)" in line
+        assert "4 blocked excluded" in line
+        assert "0.3 more hours" in line
+
+    def test_min_pace_samples_guard_n_below_threshold(self, tmp_path: Path) -> None:
+        """B3: a window with fewer than MIN_PACE_SAMPLES completions must
+        produce avg_minutes=0 (display as n/a) and est_hours=0 -- but still
+        records the sample count for diagnostic display."""
+        from devbench.constants import MIN_PACE_SAMPLES
+        from devbench.reporting.report import _compute_window_stats
+
+        # Use only 1 completed task (well below MIN_PACE_SAMPLES=3).
+        log_file = tmp_path / "test.log"
+        log_file.write_text("ignored\n")
+        done = {"E0-F1-S1-T1": datetime(2026, 4, 15, 10, 30, tzinfo=UTC)}
+        prog = {"E0-F1-S1-T1": datetime(2026, 4, 15, 10, 0, tzinfo=UTC)}
+
+        stats = _compute_window_stats(
+            log_file,
+            datetime(2026, 4, 15, 9, 0, tzinfo=UTC),
+            datetime(2026, 4, 15, 11, 0, tzinfo=UTC),
+            done,
+            prog,
+            tasks_active=1,
+        )
+        assert MIN_PACE_SAMPLES >= 3
+        assert stats.pace_sample_count == 1
+        assert stats.avg_minutes == 0.0  # below threshold → reported as 0
+        assert stats.recent_pace_minutes is None  # only 1 completion log-wide
+        assert stats.est_hours == 0.0  # no usable pace → no projection
+
+    def test_n_equals_1_renders_as_na_with_sample_count(self) -> None:
+        """B3 display: n/a (N=1 sample) appears in the rendered row when below threshold."""
+        from devbench.reporting.report import CostBreakdown, HookLogTotals, WindowStats, _stats_to_value_list
+
+        stats = WindowStats(
+            window_start=datetime(2026, 4, 15, 10, 0, tzinfo=UTC),
+            window_hours=1.0,
+            tasks_in_window=1,
+            avg_minutes=0.0,
+            est_hours=0.0,
+            totals=HookLogTotals(),
+            cost=CostBreakdown(0, 0, 0, 0, 0, 0),
+            cache_hit_rate=None,
+            tokens_per_task=0.0,
+            est_total_cost=0.0,
+            api_hours=0.0,
+            api_efficiency=None,
+            pace_sample_count=1,
+            recent_pace_minutes=None,
+        )
+        values = _stats_to_value_list(stats)
+        assert "n/a (N=1 sample)" in values
+
+    def test_recent_pace_used_for_projection_when_available(self, tmp_path: Path) -> None:
+        """B4: when ≥ RECENT_PACE_TASKS completions exist log-wide, est_hours
+        derives from recent_pace_minutes, not from the window's avg_minutes."""
+        from devbench.config import RECENT_PACE_TASKS
+        from devbench.reporting.report import _compute_window_stats
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text("ignored\n")
+        # Build N+1 done tasks with last 10 averaging 50 min each, earlier ones 5 min.
+        done = {}
+        prog = {}
+        n_total = RECENT_PACE_TASKS + 5
+        base = datetime(2026, 4, 15, 8, 0, tzinfo=UTC)
+        for i in range(n_total):
+            tid = f"E0-F1-S1-T{i + 1}"
+            # Recent 10 tasks: 50 min each. Older: 5 min each.
+            dur = 50 if i >= n_total - RECENT_PACE_TASKS else 5
+            start = base + timedelta(hours=i)
+            prog[tid] = start
+            done[tid] = start + timedelta(minutes=dur)
+
+        stats = _compute_window_stats(
+            log_file,
+            base,
+            base + timedelta(hours=n_total + 1),
+            done,
+            prog,
+            tasks_active=2,
+        )
+        # avg_minutes mixes 5- and 50-min tasks; recent_pace_minutes is exactly 50.
+        assert stats.recent_pace_minutes == pytest.approx(50.0)
+        # est_hours uses recent pace x tasks_active: 50 x 2 / 60 = 1.667h
+        assert stats.est_hours == pytest.approx(50.0 * 2 / 60.0)
+
+    def test_summary_line_uses_recent_pace_when_available(self) -> None:
+        """B4 prose: trailing summary cites Recent pace, not All-time, when set."""
+        from devbench.reporting.report import CostBreakdown, HookLogTotals, WindowStats, _summary_line
+
+        stats = WindowStats(
+            window_start=datetime(2026, 4, 15, 10, 0, tzinfo=UTC),
+            window_hours=10.0,
+            tasks_in_window=84,
+            avg_minutes=18.6,
+            est_hours=0.5,
+            totals=HookLogTotals(),
+            cost=CostBreakdown(0, 0, 0, 0, 0, 0),
+            cache_hit_rate=None,
+            tokens_per_task=0.0,
+            est_total_cost=0.0,
+            api_hours=0.0,
+            api_efficiency=None,
+            pace_sample_count=84,
+            recent_pace_minutes=31.4,
+        )
+        line = _summary_line(stats, tasks_active=1, tasks_blocked=4)
+        assert "At the Recent pace of ~31.4 minutes per task" in line
+        assert "All-time pace" not in line  # superseded when recent is available
+
+    def test_summary_line_reports_when_only_blocked_remain(self) -> None:
+        from devbench.reporting.report import CostBreakdown, HookLogTotals, WindowStats, _summary_line
+
+        stats = WindowStats(
+            window_start=datetime(2026, 4, 15, 10, 0, tzinfo=UTC),
+            window_hours=1.0,
+            tasks_in_window=0,
+            avg_minutes=0.0,
+            est_hours=0.0,
+            totals=HookLogTotals(),
+            cost=CostBreakdown(0, 0, 0, 0, 0, 0),
+            cache_hit_rate=None,
+            tokens_per_task=0.0,
+            est_total_cost=0.0,
+            api_hours=0.0,
+            api_efficiency=None,
+        )
+        line = _summary_line(stats, tasks_active=0, tasks_blocked=3)
+        assert "0 active tasks" in line
+        assert "3 blocked task(s)" in line
+        assert "external action" in line
+
+
+class TestBacklogStatusBreakdown:
+    """B8: _BacklogTotals carries per-status counts; sum matches tasks_remaining."""
+
+    @staticmethod
+    def _make_mixed_units() -> list:
+        from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
+
+        def _mk(uid: str, status: WorkUnitStatus) -> WorkUnit:
+            return WorkUnit(
+                id=uid,
+                title=f"task-{uid}",
+                status=status,
+                unit_type=WorkUnitType.TASK,
+                file_path=Path(f"backlog/{uid}.md"),
+                repo="caylent-solutions/git-repo",
+                dependencies=[],
+            )
+
+        return [
+            _mk("E0-F1-S1-T1", WorkUnitStatus.DONE),
+            _mk("E0-F1-S1-T2", WorkUnitStatus.DONE),
+            _mk("E0-F1-S2-T1", WorkUnitStatus.IN_PROGRESS),
+            _mk("E0-F1-S2-T2", WorkUnitStatus.IN_QUEUE),
+            _mk("E0-F1-S2-T3", WorkUnitStatus.IN_QUEUE),
+            _mk("E0-F1-S3-T1", WorkUnitStatus.IN_REVIEW),
+            _mk("E0-F1-S4-T1", WorkUnitStatus.BLOCKED),
+            _mk("E0-F1-S4-T2", WorkUnitStatus.BLOCKED),
+        ]
+
+    def test_per_status_fields_populated(self) -> None:
+        from devbench.reporting.report import _backlog_totals_from_units
+
+        b = _backlog_totals_from_units(self._make_mixed_units())
+        assert b.tasks_done == 2
+        assert b.tasks_in_progress == 1
+        assert b.tasks_in_queue == 2
+        assert b.tasks_in_review == 1
+        assert b.tasks_blocked == 2
+        # Invariant: every non-Done task is in exactly one status bucket.
+        assert (b.tasks_in_progress + b.tasks_in_queue + b.tasks_in_review + b.tasks_blocked) == b.tasks_remaining
+
+
+class TestUnitListings:
+    """B9: in-progress and blocked listings appear at the end of the report."""
+
+    @staticmethod
+    def _mk_unit(uid: str, title: str, status, utype=None) -> object:
+        from devbench.backlog.work_unit import WorkUnit, WorkUnitType
+
+        return WorkUnit(
+            id=uid,
+            title=title,
+            status=status,
+            unit_type=utype if utype is not None else WorkUnitType.TASK,
+            file_path=Path(f"backlog/{uid}.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+
+    def test_in_progress_listing_present_when_task_in_progress(self) -> None:
+        from devbench.backlog.work_unit import WorkUnitStatus
+        from devbench.reporting.report import _in_progress_listing
+
+        units = [self._mk_unit("E0-F1-S1-T1", "Active task", WorkUnitStatus.IN_PROGRESS)]
+        lines = _in_progress_listing(units)
+        assert lines[1] == "In-progress tasks:"
+        assert lines[2] == "  - E0-F1-S1-T1: Active task"
+
+    def test_blocked_listing_splits_auto_vs_attn_when_classifier_disagrees(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ADR-10: _blocked_listing renders two panels when both classes are non-empty."""
+        from devbench.backlog.proposal import BlockedTaskState
+        from devbench.backlog.work_unit import WorkUnitStatus
+        from devbench.reporting import report as report_mod
+
+        unit_auto = self._mk_unit("E0-F1-S1-T1", "Auto-clearing", WorkUnitStatus.BLOCKED)
+        unit_attn = self._mk_unit("E0-F1-S1-T2", "Needs attention", WorkUnitStatus.BLOCKED)
+
+        def fake_classify(backlog_root: Path, backlog_index: Path, task_id: str) -> BlockedTaskState:
+            return {
+                "E0-F1-S1-T1": BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL,
+                "E0-F1-S1-T2": BlockedTaskState.NEEDS_OPERATOR_ATTENTION,
+            }[task_id]
+
+        class _FakeMgr:
+            def _extract_pending_proposal_markers(self, _file_path: Path) -> set:
+                return {"E0-F1-S1-T9"}
+
+        monkeypatch.setattr("devbench.backlog.proposal.classify_blocked_task", fake_classify)
+        monkeypatch.setattr("devbench.backlog.manager.BacklogManager", _FakeMgr)
+
+        lines = report_mod._blocked_listing([unit_auto, unit_attn])
+        assert "Blocked tasks (auto-clearing via proposal) (1):" in lines
+        assert "Blocked tasks (needs operator attention) (1):" in lines
+        # Auto-clearing row names the waiting-on target.
+        assert any("E0-F1-S1-T1" in line and "waiting on" in line for line in lines)
+        # Attn row is plain.
+        assert any(line == "  - E0-F1-S1-T2: Needs attention" for line in lines)
+
+    def test_blocked_listing_present_when_task_blocked(self) -> None:
+        """ADR-10: without markers every blocked task renders under the 'needs attention' panel."""
+        from devbench.backlog.work_unit import WorkUnitStatus
+        from devbench.reporting.report import _blocked_listing
+
+        units = [
+            self._mk_unit("E0-F2-S1-T3", "Disable pager", WorkUnitStatus.BLOCKED),
+            self._mk_unit("E0-F5-S2-T2", "Pipeline tests", WorkUnitStatus.BLOCKED),
+        ]
+        lines = _blocked_listing(units)
+        # Fake units have no work-unit file on disk; classifier returns
+        # NEEDS_OPERATOR_ATTENTION, so only the attn panel renders.
+        assert "Blocked tasks (needs operator attention) (2):" in lines
+        assert "  - E0-F2-S1-T3: Disable pager" in lines
+        assert "  - E0-F5-S2-T2: Pipeline tests" in lines
+        # Auto panel NOT rendered because no auto-clearing tasks in fixture.
+        assert not any("auto-clearing" in line for line in lines)
+
+    def test_listings_empty_when_no_matching_tasks(self) -> None:
+        from devbench.backlog.work_unit import WorkUnitStatus
+        from devbench.reporting.report import _blocked_listing, _in_progress_listing
+
+        # Only done tasks -- no in-progress, no blocked.
+        units = [self._mk_unit("E0-F1-S1-T1", "t", WorkUnitStatus.DONE)]
+        assert _in_progress_listing(units) == []
+        assert _blocked_listing(units) == []
+
+    def test_listings_skip_non_task_units(self) -> None:
+        """Story/Feature/Epic status is auto-rolled from children -- never list them."""
+        from devbench.backlog.work_unit import WorkUnitStatus, WorkUnitType
+        from devbench.reporting.report import _blocked_listing, _in_progress_listing
+
+        units = [
+            self._mk_unit("E0-F1", "Feature", WorkUnitStatus.IN_PROGRESS, WorkUnitType.FEATURE),
+            self._mk_unit("E0-F1-S1", "Story", WorkUnitStatus.BLOCKED, WorkUnitType.STORY),
+            self._mk_unit("E0", "Epic", WorkUnitStatus.IN_PROGRESS, WorkUnitType.EPIC),
+        ]
+        assert _in_progress_listing(units) == []
+        assert _blocked_listing(units) == []
+
+    def test_proposed_listing_omitted_when_empty(self) -> None:
+        from devbench.backlog.work_unit import WorkUnitStatus
+        from devbench.reporting.report import _proposed_listing
+
+        units = [self._mk_unit("E0-F1-S1-T1", "t", WorkUnitStatus.IN_QUEUE)]
+        assert _proposed_listing(units) == []
+
+    def test_proposed_listing_renders_title_and_path(self) -> None:
+        from devbench.backlog.work_unit import WorkUnitStatus
+        from devbench.reporting.report import _proposed_listing
+
+        units = [
+            self._mk_unit("E0-F1-S1-T9", "Fix the gitdir guard", WorkUnitStatus.PROPOSED),
+            self._mk_unit("E0-F1-S1-T10", "Enable version subcommand", WorkUnitStatus.PROPOSED),
+        ]
+        lines = _proposed_listing(units)
+        assert lines[1] == "Proposed (2):"
+        # Each row: title (with padding) then file path.
+        assert any("Fix the gitdir guard" in line for line in lines)
+        assert any("Enable version subcommand" in line for line in lines)
+
+    def test_declined_listing_omitted_when_empty(self) -> None:
+        from devbench.backlog.work_unit import WorkUnitStatus
+        from devbench.reporting.report import _declined_listing
+
+        units = [self._mk_unit("E0-F1-S1-T1", "t", WorkUnitStatus.IN_QUEUE)]
+        assert _declined_listing(units) == []
+
+    def test_declined_listing_renders_title_and_path(self) -> None:
+        from devbench.backlog.work_unit import WorkUnitStatus
+        from devbench.reporting.report import _declined_listing
+
+        units = [
+            self._mk_unit("E0-F1-S1-T11", "Deprecated feature", WorkUnitStatus.DECLINED),
+            self._mk_unit("E0-F1-S1-T12", "Out-of-scope cleanup", WorkUnitStatus.DECLINED),
+        ]
+        lines = _declined_listing(units)
+        assert lines[1] == "Declined (2):"
+        assert any("Deprecated feature" in line for line in lines)
+        assert any("Out-of-scope cleanup" in line for line in lines)
+
+    def test_backlog_state_includes_tasks_declined_row(self) -> None:
+        from devbench.backlog.work_unit import WorkUnitStatus, WorkUnitType
+        from devbench.reporting.report import _backlog_state_rows, _backlog_totals_from_units
+
+        units = [
+            self._mk_unit("E0-F1-S1-T1", "a", WorkUnitStatus.DONE, WorkUnitType.TASK),
+            self._mk_unit("E0-F1-S1-T2", "b", WorkUnitStatus.DECLINED, WorkUnitType.TASK),
+        ]
+        totals = _backlog_totals_from_units(units)
+        assert totals.tasks_declined == 1
+        rows = _backlog_state_rows(totals)
+        assert ("Tasks declined", "1") in rows
+
+    def test_unmaterialised_proposals_listing_empty_when_no_proposals(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ADR-08: panel disappears when no proposal JSONs exist at all."""
+        import devbench.reporting.report as report_mod
+
+        monkeypatch.setattr(report_mod, "BACKLOG_ROOT", tmp_path / "backlog")
+        (tmp_path / "backlog").mkdir(exist_ok=True)
+
+        assert report_mod._unmaterialised_proposals_listing() == []
+
+    def test_unmaterialised_proposals_listing_renders_entries(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ADR-08: each proposal-JSON task in UNMATERIALISED state gets a row."""
+        import devbench.reporting.report as report_mod
+        from devbench.backlog.proposal import (
+            PROPOSAL_DIR_NAME,
+            Proposal,
+            ProposedTask,
+            write_proposal,
+        )
+
+        backlog_root = tmp_path / "backlog"
+        backlog_root.mkdir(exist_ok=True)
+        monkeypatch.setattr(report_mod, "BACKLOG_ROOT", backlog_root)
+
+        (tmp_path / PROPOSAL_DIR_NAME).mkdir(parents=True)
+        write_proposal(
+            tmp_path,
+            Proposal(
+                source_task_id="E1-F1-S2-T1",
+                generated_at="2026-04-19T00:00:00Z",
+                rejection_reason="scope",
+                proposed_tasks=[
+                    ProposedTask(
+                        suggested_id="E1-F1-S2-T6",
+                        title="Fix symlink guard",
+                        files_to_own=["src/x.py"],
+                        linked_scenarios=["SC-01"],
+                        suggested_acs=["AC-001 fix"],
+                        suggested_approach=(
+                            "Context: unit test fixture. Scope: src/x.py. "
+                            "TDD approach: 1. RED 2. GREEN 3. REFACTOR no-op. "
+                            "Verify: make lint && make test-unit all exit zero."
+                        ),
+                    ),
+                ],
+            ),
+        )
+
+        lines = report_mod._unmaterialised_proposals_listing()
+        assert lines, "Panel must render when a proposal-JSON task is in UNMATERIALISED state."
+        assert any("Proposal JSONs pending materialisation" in line for line in lines)
+        assert any("E1-F1-S2-T6" in line for line in lines)
+        assert any("Fix symlink guard" in line for line in lines)
+        assert any("from E1-F1-S2-T1" in line for line in lines)
+
+    def test_unmaterialised_proposals_listing_omits_materialised(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If a draft .md exists for the suggested_id the entry is not un-materialised -> omitted."""
+        import devbench.reporting.report as report_mod
+        from devbench.backlog.proposal import (
+            PROPOSAL_DIR_NAME,
+            Proposal,
+            ProposedTask,
+            _extract_story_id,
+            _story_dir,
+            write_proposal,
+        )
+
+        backlog_root = tmp_path / "backlog"
+        backlog_root.mkdir(exist_ok=True)
+        monkeypatch.setattr(report_mod, "BACKLOG_ROOT", backlog_root)
+
+        (tmp_path / PROPOSAL_DIR_NAME).mkdir(parents=True)
+        write_proposal(
+            tmp_path,
+            Proposal(
+                source_task_id="E1-F1-S2-T1",
+                generated_at="2026-04-19T00:00:00Z",
+                rejection_reason="scope",
+                proposed_tasks=[
+                    ProposedTask(
+                        suggested_id="E1-F1-S2-T6",
+                        title="Fix symlink guard",
+                        files_to_own=["src/x.py"],
+                        linked_scenarios=["SC-01"],
+                        suggested_acs=["AC-001 fix"],
+                        suggested_approach=(
+                            "Context: unit test fixture. Scope: src/x.py. "
+                            "TDD approach: 1. RED 2. GREEN 3. REFACTOR no-op. "
+                            "Verify: make lint && make test-unit all exit zero."
+                        ),
+                    ),
+                ],
+            ),
+        )
+        # Materialise out-of-band by writing a draft .md under the story dir.
+        story = _story_dir(backlog_root, _extract_story_id("E1-F1-S2-T6"))
+        story.mkdir(parents=True, exist_ok=True)
+        (story / "E1-F1-S2-T6.md").write_text("# E1-F1-S2-T6: Fix\n\n## Status: proposed\n\n## Description\n\nx\n")
+
+        lines = report_mod._unmaterialised_proposals_listing()
+        assert lines == [], (
+            "Panel must be empty when every proposed_tasks entry already has a draft .md "
+            "(i.e. none remain in UNMATERIALISED state)."
+        )
+
+
+class TestSideBySideLayout:
+    """B10: _render_side_by_side merges two blocks with a gap; the full report uses it."""
+
+    def test_left_shorter_is_padded_with_blanks(self) -> None:
+        from devbench.reporting.report import _render_side_by_side
+
+        merged = _render_side_by_side(["AAA", "BBB"], ["X", "Y", "Z"], gap=4)
+        # Left width = 3, gap = 4 → blank-left line is "   " + "    " + "Z" = "       Z"
+        assert merged == ["AAA    X", "BBB    Y", "       Z"]
+
+    def test_right_shorter_is_padded(self) -> None:
+        from devbench.reporting.report import _render_side_by_side
+
+        merged = _render_side_by_side(["AAAA", "BBBB", "CCCC"], ["X", "Y"], gap=2)
+        # Third line should have the right side padded with spaces (width 1).
+        assert merged == ["AAAA  X", "BBBB  Y", "CCCC   "]
+
+    def test_empty_side_returns_other(self) -> None:
+        from devbench.reporting.report import _render_side_by_side
+
+        assert _render_side_by_side([], ["A", "B"]) == ["A", "B"]
+        assert _render_side_by_side(["A", "B"], []) == ["A", "B"]
+
+    def test_generate_report_renders_one_grouped_table(self, tmp_path: Path) -> None:
+        """End-to-end: the consolidated layout is a single grouped table with
+        uppercase section headers (BACKLOG STATE, THROUGHPUT, API USAGE,
+        TOKENS, COST), in that order, with the Metric | All-time | Session
+        column layout. The old two-box layout is gone."""
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    "2026-03-05T10:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                    "2026-03-05T10:05:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'",
+                ]
+            )
+        )
+        report = generate_report(log_path=log_file)
+        # Single table -- exactly ONE top-left corner appears in the output.
+        top_corners = report.count("\u250c")
+        assert top_corners == 1, f"Expected 1 grouped table, got {top_corners} top-left corners in report"
+        # Section headers in the required order.
+        for section in ("BACKLOG STATE", "THROUGHPUT", "API USAGE", "TOKENS", "COST"):
+            assert section in report, f"Missing section header: {section}"
+        backlog_idx = report.find("BACKLOG STATE")
+        throughput_idx = report.find("THROUGHPUT")
+        tokens_idx = report.find("TOKENS")
+        cost_idx = report.find("COST")
+        assert backlog_idx < throughput_idx < tokens_idx < cost_idx, "Section headers must appear in plan order"
+        # First column is labelled "Metric"; the old "Backlog state" and
+        # "Window stats" table titles are gone.
+        assert "Metric " in report
+
+
+class TestSpanningRows:
+    """B11: window-agnostic metrics (Recent pace, Est. time) render once across all cols."""
+
+    def test_merge_spanning_values_collapses_identical(self) -> None:
+        from devbench.reporting.report import _merge_spanning_values
+
+        merged = _merge_spanning_values("Est. time to complete remaining", ["~0.5 h", "~0.5 h", "~0.5 h"])
+        assert merged == "~0.5 h"
+
+    def test_merge_spanning_values_keeps_list_when_values_differ(self) -> None:
+        """If values differ across columns, preserve per-column layout so divergence stays visible."""
+        from devbench.reporting.report import _merge_spanning_values
+
+        values = ["~0.5 h", "~0.5 h", "~1.0 h"]
+        merged = _merge_spanning_values("Est. time to complete remaining", values)
+        assert merged == values
+
+    def test_merge_spanning_values_ignores_non_spanning_labels(self) -> None:
+        from devbench.reporting.report import _merge_spanning_values
+
+        values = ["32.4 h", "32.4 h"]
+        merged = _merge_spanning_values("Time span", values)
+        assert merged == values
+
+    def test_multi_column_table_renders_spanning_row(self) -> None:
+        """Passing a bare str value produces a single wide cell with only 3 vertical bars."""
+        from devbench.reporting.report import _render_multi_column_table
+
+        lines = _render_multi_column_table(
+            "Window stats",
+            ["All-time", "Session"],
+            [
+                ("Time span", ["32.4 h", "0.6 h"]),
+                ("Recent pace", "31.4 min"),
+            ],
+        )
+        pace_line = next(ln for ln in lines if "Recent pace" in ln)
+        # Spanning rows have 3 │ (left + metric-sep + right), normal rows have 4.
+        assert pace_line.count("\u2502") == 3, f"Expected 3 │ in spanning row, got: {pace_line!r}"
+        assert pace_line.count("31.4 min") == 1
+
+    def test_report_end_to_end_spans_recent_pace_and_est_time(self, tmp_path: Path) -> None:
+        """In the rendered report, Recent pace and Est. time rows are single spanning cells
+        -- the underlying value appears exactly once on the row even with multiple window columns."""
+        from unittest.mock import patch
+
+        from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
+
+        # Build 10 completed tasks so recent pace has enough samples (>= RECENT_PACE_TASKS=10)
+        # and one in-progress task so tasks_active > 0 and est_hours > 0.
+        log_lines = []
+        for i in range(10):
+            start = f"2026-03-05T10:{i * 5:02d}:00Z"
+            done = f"2026-03-05T10:{i * 5 + 4:02d}:30Z"
+            log_lines.append(f"{start} [judges.cli] INFO Set E0-F1-S1-T{i + 1} to 'in-progress'")
+            log_lines.append(f"{done} [judges.cli] INFO Set E0-F1-S1-T{i + 1} to 'done'")
+        log_file = tmp_path / "test.log"
+        log_file.write_text(_make_log(log_lines))
+
+        fake_units = [
+            WorkUnit(
+                id=f"E0-F1-S1-T{i + 1}",
+                title=f"done-{i}",
+                status=WorkUnitStatus.DONE,
+                unit_type=WorkUnitType.TASK,
+                file_path=Path(f"backlog/done-{i}.md"),
+                repo="caylent-solutions/git-repo",
+                dependencies=[],
+            )
+            for i in range(10)
+        ]
+        fake_units.append(
+            WorkUnit(
+                id="E0-F1-S2-T1",
+                title="active-task",
+                status=WorkUnitStatus.IN_PROGRESS,
+                unit_type=WorkUnitType.TASK,
+                file_path=Path("backlog/active.md"),
+                repo="caylent-solutions/git-repo",
+                dependencies=[],
+            )
+        )
+
+        # Override the autouse mock_backlog_parser fixture's empty-list default.
+        with patch("devbench.reporting.report.BacklogParser") as mock_cls:
+            mock_cls.return_value.parse_index.return_value = fake_units
+            report = generate_report(log_path=log_file)
+
+        # Pull the window-stats half of each spanning row. Side-by-side rendering
+        # means each line also carries bars from the Backlog-state table on the
+        # left, so counting total │ chars is ambiguous. Instead, find each row
+        # and assert its window-table value string occurs exactly ONCE (not 2x/3x).
+        for row_label, expected_substr in (
+            ("Recent pace (last 10 tasks)", "4.5 min"),  # avg of 4m30s per task
+            ("Est. time to complete remaining", " h"),
+        ):
+            row_line = next((ln for ln in report.splitlines() if row_label in ln), None)
+            assert row_line is not None, f"Row '{row_label}' not found"
+            # The window-stats side of the row starts after the 4-space side-by-side gap.
+            # After splitting on that gap, the right half is the Window stats row; the
+            # spanning value must appear exactly once in that half.
+            right_half = row_line.split("    ", 1)[-1]
+            occurrences = right_half.count(expected_substr)
+            assert occurrences == 1, (
+                f"Row '{row_label}' expected '{expected_substr}' exactly once in Window stats half, "
+                f"got {occurrences}: {right_half!r}"
+            )

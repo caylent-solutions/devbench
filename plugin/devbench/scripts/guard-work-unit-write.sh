@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# guard-work-unit-write.sh — PreToolUse hook: block Write/Edit to work unit .md files.
+# guard-work-unit-write.sh -- PreToolUse hook: block Write/Edit to work unit .md files.
 #
 # Receives JSON on stdin with structure:
 #   { "tool_name": "Write"|"Edit", "tool_input": { "file_path": "..." } }
@@ -30,19 +30,19 @@ if [[ -z "$FILE_PATH" ]]; then
   exit 0
 fi
 
-# Allow BACKLOG.md at any level — this is the top-level tracking index,
+# Allow BACKLOG.md at any level -- this is the top-level tracking index,
 # not a work unit file. Only backlog/**/*.md files are work units.
 if [[ "$FILE_PATH" == "BACKLOG.md" ]] || [[ "$FILE_PATH" == */BACKLOG.md ]]; then
   exit 0
 fi
 
-# Allow writes to files inside backlog/config/ — these are configuration artifacts,
+# Allow writes to files inside backlog/config/ -- these are configuration artifacts,
 # not work unit files. Config files are managed by the workspace setup.
 if [[ "$FILE_PATH" == */backlog/config/* ]] || [[ "$FILE_PATH" == backlog/config/* ]]; then
   exit 0
 fi
 
-# Block writes to .md files under backlog/ — these are work unit files.
+# Block writes to .md files under backlog/ -- these are work unit files.
 # Work unit files are managed exclusively by the orchestrate skill.
 if [[ "$FILE_PATH" == */backlog/*.md ]] || [[ "$FILE_PATH" == backlog/*.md ]]; then
   echo "guard-work-unit-write: blocked write to work unit file: ${FILE_PATH}" >&2

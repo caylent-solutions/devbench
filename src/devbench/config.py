@@ -43,6 +43,7 @@ from devbench.constants import (
     DEFAULT_MAX_RETRY_ATTEMPTS,
     DEFAULT_ORCHESTRATOR_POLL_INTERVAL,
     DEFAULT_OUTPUT_TRUNCATION_LIMIT,
+    DEFAULT_RECENT_PACE_TASKS,
     DEFAULT_SECURITY_FETCH_TIMEOUT,
     DEFAULT_STOP_HOOK_MAX_BLOCKS,
     DEFAULT_STOP_HOOK_STALE_TASK_MINUTES,
@@ -134,7 +135,7 @@ _config_path: Path = resolve_config_path(None, os.environ, WORKSPACE_ROOT)
 RUNTIME_CONFIG: RuntimeConfig = load_runtime_config(_config_path, os.environ)
 
 # ---------------------------------------------------------------------------
-# Allowed repos — sourced exclusively from YAML config.
+# Allowed repos -- sourced exclusively from YAML config.
 # ---------------------------------------------------------------------------
 ALLOWED_REPOS: frozenset[str] = frozenset(RUNTIME_CONFIG.repos)
 
@@ -166,7 +167,7 @@ def resolve_repo(short_or_full: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Backlog paths — derived from WORKSPACE_ROOT.
+# Backlog paths -- derived from WORKSPACE_ROOT.
 # ---------------------------------------------------------------------------
 BACKLOG_ROOT: Path = WORKSPACE_ROOT / BACKLOG_SUBDIR
 BACKLOG_INDEX: Path = WORKSPACE_ROOT / "BACKLOG.md"
@@ -214,6 +215,8 @@ except ValueError:
 UPDATE_SUBMODULE: bool = RUNTIME_CONFIG.git_ops.update_submodule
 SINGLE_BRANCH: str | None = RUNTIME_CONFIG.git_ops.single_branch
 DEFER_PR: bool = RUNTIME_CONFIG.git_ops.defer_pr
+MANIFEST_AMENDMENT_CONFIG = RUNTIME_CONFIG.manifest_amendment
+TASK_FACTORY_CONFIG = RUNTIME_CONFIG.task_factory
 TOKEN_COST_PER_M_INPUT: float = _resolve_float(
     None, RUNTIME_CONFIG.report.token_cost_per_million_input, DEFAULT_TOKEN_COST_PER_M_INPUT
 )
@@ -247,6 +250,13 @@ REPORT_DATA_RESIDENCY_MULTIPLIER: float = _resolve_float(
     RUNTIME_CONFIG.report.data_residency_multiplier,
     DEFAULT_DATA_RESIDENCY_MULTIPLIER,
 )
+# Number of most-recent task completions averaged for the "Recent pace"
+# projection in `devbench report`. Resolution precedence: env > YAML > constant.
+RECENT_PACE_TASKS: int = _resolve_int(
+    "JUDGE_REPORT_RECENT_PACE_TASKS",
+    RUNTIME_CONFIG.report.recent_pace_tasks,
+    DEFAULT_RECENT_PACE_TASKS,
+)
 STOP_HOOK_MAX_BLOCKS: int = _resolve_int(
     "JUDGE_STOP_MAX_BLOCKS", RUNTIME_CONFIG.stop_hook.max_blocks, DEFAULT_STOP_HOOK_MAX_BLOCKS
 )
@@ -266,7 +276,7 @@ BEDROCK_REGION: str = _resolve_str(
 )
 
 # ---------------------------------------------------------------------------
-# Timeouts — all values in seconds
+# Timeouts -- all values in seconds
 # ---------------------------------------------------------------------------
 GH_API_TIMEOUT: int = _resolve_int("JUDGE_GH_API_TIMEOUT", RUNTIME_CONFIG.timeouts.gh_api, DEFAULT_GH_API_TIMEOUT)
 TEST_TIMEOUT: int = _resolve_int("JUDGE_TEST_TIMEOUT", RUNTIME_CONFIG.timeouts.test, DEFAULT_TEST_TIMEOUT)

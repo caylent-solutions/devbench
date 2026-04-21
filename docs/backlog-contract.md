@@ -10,7 +10,7 @@ This document defines the required format for all backlog files. `devbench valid
 - [Status Values](#status-values)
 - [BACKLOG.md Index](#backlogmd-index)
 - [Work Unit File Structure](#work-unit-file-structure)
-- [Required Sections — Task Files](#required-sections--task-files)
+- [Required Sections -- Task Files](#required-sections--task-files)
 - [Comments Section Format](#comments-section-format)
 - [Auto-rollup behavior](#auto-rollup-behavior)
 - [Dependency Format](#dependency-format)
@@ -32,7 +32,7 @@ backlog/
 │       ├── E1-F1.md                 ← Feature spec
 │       └── E1-F1-S1-name/
 │           ├── E1-F1-S1.md          ← Story spec
-│           └── E1-F1-S1-T1-name.md  ← Task spec (leaf node — what agents implement)
+│           └── E1-F1-S1-T1-name.md  ← Task spec (leaf node -- what agents implement)
 └── config/
     └── devbench.yaml                ← workspace configuration (not a work unit)
 ```
@@ -68,7 +68,7 @@ Symlinks bridge the gap between the backlog repo and target repos outside it.
 
 Validation of `backlog/config/devbench.yaml` happens at config load time (before the orchestrator starts), separate from work-unit validation. Notable rules:
 
-- `checkout_directory` must be **relative** to `JUDGE_WORKSPACE_ROOT`. Absolute paths and `..` traversal are rejected — the loader raises `ValueError` immediately.
+- `checkout_directory` must be **relative** to `JUDGE_WORKSPACE_ROOT`. Absolute paths and `..` traversal are rejected -- the loader raises `ValueError` immediately.
 - `git_ops.defer_pr: true` requires `git_ops.single_branch` to be set. Misconfigured combinations raise `ValueError`.
 - The full YAML is JSON-Schema validated (`additionalProperties: false`), so typos in keys produce a clear schema error rather than being silently ignored.
 
@@ -99,7 +99,7 @@ IDs are case-insensitive in status matching but written in uppercase by conventi
 | Done | Merged and closed | `done` |
 | Blocked | Max retries exhausted or dependency blocked | `blocked` |
 
-Status is stored in the **work unit file** (the `## Status:` line). `BACKLOG.md` is a derived index that mirrors the work-unit files; the work-unit file is the source of truth. `validate-backlog` reports mirror drift between the two as an error so it can be reconciled — it does not auto-correct.
+Status is stored in the **work unit file** (the `## Status:` line). `BACKLOG.md` is a derived index that mirrors the work-unit files; the work-unit file is the source of truth. `validate-backlog` reports mirror drift between the two as an error so it can be reconciled -- it does not auto-correct.
 
 ---
 
@@ -109,7 +109,7 @@ Status is stored in the **work unit file** (the `## Status:` line). `BACKLOG.md`
 
 ### Canonical Status Summary format (per-epic)
 
-The canonical Status Summary format is **per-epic** — one row per top-level epic, with columns for each status. This is the format `BacklogManager._update_status_summary()` writes:
+The canonical Status Summary format is **per-epic** -- one row per top-level epic, with columns for each status. This is the format `BacklogManager._update_status_summary()` writes:
 
 ```markdown
 ## Status Summary
@@ -142,7 +142,7 @@ The `File` column must be a path relative to `JUDGE_WORKSPACE_ROOT`. `validate-b
 
 All sections below are required unless noted as optional.
 
-### Task file (leaf — what agents implement)
+### Task file (leaf -- what agents implement)
 
 ```markdown
 # {ID}: {Title}
@@ -174,9 +174,9 @@ All sections below are required unless noted as optional.
 
 | File | Change |
 |------|--------|
-| `src/foo/bar.py` | New — description |
-| `tests/test_bar.py` | New — unit tests |
-| `README.md` | Updated — architecture section |
+| `src/foo/bar.py` | New -- description |
+| `tests/test_bar.py` | New -- unit tests |
+| `README.md` | Updated -- architecture section |
 
 ## Definition of Done
 
@@ -216,7 +216,7 @@ Status rolls up automatically when all children reach `done`.
 
 ---
 
-## Required Sections — Task Files
+## Required Sections -- Task Files
 
 | Section | Required | Populated by |
 |---------|----------|-------------|
@@ -265,7 +265,7 @@ A real Comments section looks like this:
 [2026-04-15T14:25:48Z] [judge/doc_review] [REVIEW_PASS] README updated alongside code change.
 [2026-04-15T14:26:01Z] [judge/changes_manifest] [REVIEW_PASS] Manifest matches staged files.
 [2026-04-15T14:27:14Z] [judge/security_review] [REVIEW_PASS] No vulnerabilities found.
-[2026-04-15T14:30:00Z] [agent/orchestrator] [comment] Auto-rolled to done — all children completed.
+[2026-04-15T14:30:00Z] [agent/orchestrator] [comment] Auto-rolled to done -- all children completed.
 ```
 
 ---
@@ -281,7 +281,7 @@ When `devbench mark-done <task-id>` succeeds, `BacklogManager._rollup_parent_sta
 Each auto-rollup writes an audit comment to the parent's Comments section so the trail is visible:
 
 ```
-[2026-04-15T14:30:00Z] [agent/orchestrator] [comment] Auto-rolled to done — all children completed.
+[2026-04-15T14:30:00Z] [agent/orchestrator] [comment] Auto-rolled to done -- all children completed.
 ```
 
 Rollup happens synchronously inside `mark-done`. There is no background process and no race condition.
@@ -302,7 +302,7 @@ actionable only when all listed dependencies have status `done`.
 | E2-F1-S1-T1 | Another prerequisite | done |
 ```
 
-The Status column in the dependency table is informational — the parser reads authoritative status
+The Status column in the dependency table is informational -- the parser reads authoritative status
 from each work unit file, not from this table.
 
 ---
@@ -338,8 +338,27 @@ re-derived at runtime.
 8. `## Changes Manifest` section exists with at least one entry
 9. `## Definition of Done` section exists
 10. No em-dash character (U+2014) anywhere in the work unit file
+11. No Changes Manifest path begins with a `<checkout_directory>/` prefix (see below)
 
 Non-task files (Epics, Features, Stories) are exempt from content quality checks.
+
+**Changes Manifest path-prefix rule (check 11):** manifest paths must be
+**repo-relative**. If `backlog/config/devbench.yaml` sets `checkout_directory: <dir>`
+for a work unit's target repo, entries in that unit's `## Changes Manifest` MUST NOT
+begin with `<dir>/`. The git-ops safety rail
+(`src/devbench/backlog/manifest.py::assert_staged_matches_manifest`) compares manifest
+entries against `git diff --name-only` output, which is always repo-relative; a
+`checkout_directory` prefix on a manifest path produces a guaranteed miss at commit
+time, blocking the commit after the executor has done the work. Example: for a repo
+with `checkout_directory: example-repo`, the manifest row must read
+```
+| `README.md` | update |
+```
+not
+```
+| `example-repo/README.md` | update |
+```
+`validate-backlog` surfaces this at authoring / startup time so it never reaches git-ops.
 
 Run before starting the orchestrator. The orchestrate skill runs it automatically at startup and
 aborts if any error is found.

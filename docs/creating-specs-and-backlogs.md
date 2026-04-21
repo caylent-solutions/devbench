@@ -22,13 +22,13 @@ DevBench executes work from a structured backlog. The quality of execution depen
 
 The process has seven phases (this guide walks through each):
 
-1. **Spec** — Understand the problem, audit the codebase, document every detail
-2. **Backlog structure** — Pick a hierarchy (epics → features → stories → tasks)
-3. **Work unit authoring** — Write each task with the required sections
-4. **Code Standards block** — Embed the rules every task must follow
-5. **Lifecycle Journey Tests** — Add end-to-end cycle ACs
-6. **Git Strategy** — Multi-PR (default) vs single-PR mode
-7. **Validation** — Run `devbench validate-backlog` before execution
+1. **Spec** -- Understand the problem, audit the codebase, document every detail
+2. **Backlog structure** -- Pick a hierarchy (epics → features → stories → tasks)
+3. **Work unit authoring** -- Write each task with the required sections
+4. **Code Standards block** -- Embed the rules every task must follow
+5. **Lifecycle Journey Tests** -- Add end-to-end cycle ACs
+6. **Git Strategy** -- Multi-PR (default) vs single-PR mode
+7. **Validation** -- Run `devbench validate-backlog` before execution
 
 For the wider context (how the orchestrator consumes this backlog, multi-PR vs single-PR mode, judge architecture), see the [architecture overview](architecture.md).
 
@@ -175,6 +175,8 @@ This ensures tests exist before code, and the agent cannot skip testing.
 
 ### Task file format (devbench contract)
 
+Valid `## Status:` values: `in-queue`, `in-progress`, `in-review`, `done`, `blocked`, `proposed`, `declined`. See [docs/faq.md](faq.md#whats-the-difference-between-blocked-and-declined) for the semantics of each and [docs/adr/05-declined-status.md](adr/05-declined-status.md) for the rationale behind `declined`.
+
 ```markdown
 # {ID}: {Title}
 
@@ -210,7 +212,7 @@ This ensures tests exist before code, and the agent cannot skip testing.
 
 ### Code Standards
 
-{Full code standards block — copy from [Phase 4: Code Standards Block](#phase-4-code-standards-block) below.}
+{Full code standards block -- copy from [Phase 4: Code Standards Block](#phase-4-code-standards-block) below.}
 
 ### Related Specifications
 
@@ -268,7 +270,7 @@ Context windows compress over time. Having the rules fresh in every work unit pr
 - `AC-SEC-NNN` -- Security requirements
 
 **5. Changes Manifest uses table format:**
-`| File | Change |` with one row per file. This is what the changes_manifest judge validates against.
+`| File | Change |` with one row per file. This is what the changes_manifest judge validates against. See [docs/authoring-manifests.md](authoring-manifests.md) for the three patterns that avoid the most common authoring defect (test-only manifests on tasks whose Approach authorises TDD GREEN production fixes), and for the runtime amendment workflow that rescues cases the author could not anticipate.
 
 **6. Every implementation task needs a lifecycle cycle AC:**
 If a task implements behavior, it must have an `AC-CYCLE` that proves the behavior works in a real operation cycle -- not just that a unit test passes. Example: "After implementation, create a temp git repo, call the function, verify the output."
@@ -342,10 +344,10 @@ Each journey test should:
 
 ## Phase 6: Git Strategy
 
-DevBench supports two git workflow modes — choose one when planning the backlog:
+DevBench supports two git workflow modes -- choose one when planning the backlog:
 
-- **Multi-PR (default)** — one branch and one PR per task. Best for independent work that can ship separately.
-- **Single-PR (single-branch + defer_pr)** — all tasks commit to one shared branch; one PR for the batch via `devbench git-ops-finalize <repo>` after all units complete. Best for large migrations where the entire backlog ships as one reviewable PR.
+- **Multi-PR (default)** -- one branch and one PR per task. Best for independent work that can ship separately.
+- **Single-PR (single-branch + defer_pr)** -- all tasks commit to one shared branch; one PR for the batch via `devbench git-ops-finalize <repo>` after all units complete. Best for large migrations where the entire backlog ships as one reviewable PR.
 
 Single-PR mode is enabled in `devbench.yaml`:
 

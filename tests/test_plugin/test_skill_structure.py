@@ -29,7 +29,7 @@ class TestOrchestrateSkillReviewSupervisor:
         ]
         for agent in forbidden:
             assert agent not in content, (
-                f"SKILL.md must not reference individual reviewer '{agent}' — use review-supervisor instead"
+                f"SKILL.md must not reference individual reviewer '{agent}' -- use review-supervisor instead"
             )
 
 
@@ -101,4 +101,29 @@ class TestOrchestrateSkillStandards:
         assert "never security-reviewer" in content, (
             "SKILL.md Standards section must state the retry loop "
             "re-runs only review-supervisor, never security-reviewer"
+        )
+
+
+@pytest.mark.unit
+class TestOrchestrateSkillStepZeroSweepProposals:
+    """ADR-08 slice J: SKILL must have a step 0 that sweeps un-materialised proposal JSONs."""
+
+    def test_skill_references_sweep_proposals(self) -> None:
+        """The SKILL must invoke ``devbench sweep-proposals`` so un-materialised JSONs are surfaced."""
+        content = SKILL_PATH.read_text()
+        assert "sweep-proposals" in content, (
+            "SKILL.md must invoke `devbench sweep-proposals` as step 0 so every loop iteration "
+            "best-effort materialises any un-materialised proposal JSONs before validate-backlog runs."
+        )
+
+    def test_skill_sweep_proposals_appears_before_validate_backlog(self) -> None:
+        """The sweep must run BEFORE validate-backlog so freshly materialised drafts are visible."""
+        content = SKILL_PATH.read_text()
+        sweep_pos = content.find("sweep-proposals")
+        validate_pos = content.find("validate-backlog")
+        assert sweep_pos >= 0, "SKILL.md must reference sweep-proposals"
+        assert validate_pos >= 0, "SKILL.md must reference validate-backlog"
+        assert sweep_pos < validate_pos, (
+            "sweep-proposals must run BEFORE validate-backlog so any drafts created by the sweep "
+            "are visible to the parse + pre-flight checks of the main loop."
         )

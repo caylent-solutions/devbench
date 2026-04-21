@@ -5,20 +5,31 @@ report showing velocity, completion stats, time estimates, and token cost.
 
 Output structure:
 
-- **Backlog state** — single small table with time-independent counts
-  (tasks completed, total work units done, tasks remaining, rollups).
-- **Window stats** — single multi-column table with one metric column and
-  one column per window. Default windows:
+The default (no ``since``) output is ONE grouped table with a single
+"Metric" column followed by one column per window. Rows are grouped into
+five sections:
 
-  - **All-time** — cumulative across the entire orchestrator log history.
-  - **Current session** — since the most recent gap of more than
-    ``DEFAULT_SESSION_GAP_MINUTES`` between consecutive log entries (a
-    proxy for "the orchestrator was restarted here"). Filters out noise
-    from the ``judges.log_setup`` logger that fires on every CLI tick.
-  - **This run** (watch mode only) — since the report watch loop began.
+- **BACKLOG STATE** -- instantaneous snapshots (task counts, rollups).
+  Only the All-time column is populated; Session and This run are blank.
+- **THROUGHPUT** -- per-window task completion and pace metrics.
+- **API USAGE** -- API processing time and utilization.
+- **TOKENS** -- per-window token breakdown, input/output share,
+  cache hit rate, and average tokens per task.
+- **COST** -- estimated cost so far and projected total at completion.
+
+Default windows for the non-``since`` path:
+
+- **All-time** -- cumulative across the entire orchestrator log history.
+- **Current session** -- since the most recent gap of more than
+  ``DEFAULT_SESSION_GAP_MINUTES`` between consecutive log entries (a
+  proxy for "the orchestrator was restarted here"). Filters out noise
+  from the ``judges.log_setup`` logger that fires on every CLI tick.
+- **This run** (watch mode only) -- since the report watch loop began.
 
 When ``generate_report`` is called with an explicit ``since`` timestamp,
-only one window is reported, labeled with that timestamp.
+the legacy two-box layout is used (Backlog state on top, a single-window
+stats box beneath) for backward compatibility with callers that grep the
+output in a known shape.
 
 Cost calculation uses the per-token-type breakdown from
 ``hook-logs.jsonl`` (``usage.input_tokens``, ``output_tokens``,
@@ -44,6 +55,7 @@ from devbench.backlog.work_unit import WorkUnitStatus, WorkUnitType
 from devbench.config import (
     BACKLOG_INDEX,
     BACKLOG_ROOT,
+    RECENT_PACE_TASKS,
     REPORT_CACHE_READ_MULTIPLIER,
     REPORT_CACHE_WRITE_1HR_MULTIPLIER,
     REPORT_CACHE_WRITE_5MIN_MULTIPLIER,
@@ -54,10 +66,12 @@ from devbench.config import (
 from devbench.constants import (
     DEFAULT_SESSION_GAP_MINUTES,
     LOG_NOISE_LOGGER_NAME,
+    MIN_PACE_SAMPLES,
     MS_PER_SECOND,
     PERCENT_MULTIPLIER,
     SECONDS_PER_HOUR,
     SECONDS_PER_MINUTE,
+    SIDE_BY_SIDE_GAP_CHARS,
     TOKENS_PER_MILLION,
 )
 
@@ -78,7 +92,7 @@ class HookLogTotals:
     ``_compute_cost``. There is no blended-rate fallback: an LLM call that
     lacks a usage breakdown in the source log is excluded from cost (its
     duration is still counted in ``total_duration_ms`` for API-utilization
-    metrics). This is the fail-fast posture — missing cost data surfaces as
+    metrics). This is the fail-fast posture -- missing cost data surfaces as
     visibly-low cost rather than silently-masked blended estimates.
     """
 
@@ -121,6 +135,17 @@ class WindowStats:
     est_total_cost: float
     api_hours: float
     api_efficiency: float | None  # None when window_hours == 0
+    # Number of completed-task duration samples that produced ``avg_minutes``.
+    # When < MIN_PACE_SAMPLES the display marks the pace as fragile so a single
+    # sample (e.g. a freshly-restarted Session window with one completion)
+    # cannot drive a multi-task projection.
+    pace_sample_count: int = 0
+    # Average minutes per task across the most-recently-completed N tasks
+    # (N = RECENT_PACE_TASKS), regardless of window. None when fewer than N
+    # task completions exist log-wide. Used in preference to ``avg_minutes``
+    # for projections so the rate metric reflects current orchestrator pace
+    # rather than being anchored by historical completions.
+    recent_pace_minutes: float | None = None
 
     @property
     def total_tokens(self) -> int:
@@ -342,7 +367,7 @@ def _accumulate_entry(entry: dict, totals_acc: dict[str, int]) -> None:
     """Fold one hook-log entry's metrics into the running totals accumulator.
 
     Entries without a ``usage`` block contribute duration only (for
-    API-utilization accounting). Their token counts are skipped — there is
+    API-utilization accounting). Their token counts are skipped -- there is
     no blended-rate fallback.
     """
     tool_resp = (entry.get("input") or {}).get("tool_response") or {}
@@ -389,7 +414,7 @@ def _compute_cost(
     """Compute per-token-type cost subtotals and the rolled-up total. Pure function.
 
     Cost is always computed from real per-token-type counts. No blended rate,
-    no estimated input/output ratio — if an LLM call didn't record ``usage``,
+    no estimated input/output ratio -- if an LLM call didn't record ``usage``,
     it contributes zero cost (and an audit-visible gap in ``entries_with_usage``).
     """
     input_cost = totals.input_tokens * input_rate / TOKENS_PER_MILLION
@@ -409,15 +434,48 @@ def _compute_cost(
     )
 
 
+def _recent_pace_minutes(
+    done_times: dict[str, datetime],
+    progress_times: dict[str, datetime],
+    n: int,
+) -> float | None:
+    """Average minutes per task across the most-recent ``n`` task completions.
+
+    Looks log-wide (not window-bounded) so the metric reflects current
+    orchestrator pace rather than being anchored by historical completions.
+    Returns None when fewer than ``n`` task completions have valid durations.
+    """
+    task_done = [(tid, ts) for tid, ts in done_times.items() if "-T" in tid]
+    task_done.sort(key=lambda kv: kv[1], reverse=True)
+    durations: list[float] = []
+    for tid, dt in task_done:
+        if tid not in progress_times:
+            continue
+        dur = (dt - progress_times[tid]).total_seconds() / SECONDS_PER_MINUTE
+        if dur > 0:
+            durations.append(dur)
+        if len(durations) >= n:
+            break
+    if len(durations) < n:
+        return None
+    return sum(durations) / len(durations)
+
+
 def _compute_window_stats(
     log_path: Path,
     window_start: datetime,
     window_end: datetime,
     done_times: dict[str, datetime],
     progress_times: dict[str, datetime],
-    tasks_remaining: int,
+    tasks_active: int,
 ) -> WindowStats:
-    """Compute all time-windowed statistics for a single window."""
+    """Compute all time-windowed statistics for a single window.
+
+    ``tasks_active`` is the count of non-Done tasks that the orchestrator can
+    still finish on its own (in-queue / in-progress / in-review). Blocked
+    tasks are excluded -- they need external action and have unbounded ETA, so
+    rolling them into the projection multiplier produces misleading numbers.
+    """
     window_hours = (window_end - window_start).total_seconds() / SECONDS_PER_HOUR
 
     task_ids_done = {uid for uid, ts in done_times.items() if "-T" in uid and window_start <= ts <= window_end}
@@ -430,12 +488,25 @@ def _compute_window_stats(
             dur = (done_times[tid] - effective_start).total_seconds() / SECONDS_PER_MINUTE
             if dur > 0:
                 task_durations.append(dur)
-    avg_minutes = sum(task_durations) / len(task_durations) if task_durations else 0.0
-    est_hours = (tasks_remaining * avg_minutes) / SECONDS_PER_MINUTE if avg_minutes else 0.0
+    pace_sample_count = len(task_durations)
+    # B3: pace from too-few samples is fragile -- display as n/a rather than
+    # projecting from a single completion. The sample count is preserved on
+    # WindowStats so the renderer can append "(N=X samples)".
+    avg_minutes = sum(task_durations) / pace_sample_count if pace_sample_count >= MIN_PACE_SAMPLES else 0.0
+
+    # B4: rolling Recent pace from the last N completed tasks (log-wide,
+    # regardless of window). Used for projections so the rate metric reflects
+    # current orchestrator pace and stops drifting after dozens of completions.
+    recent_pace_minutes: float | None = _recent_pace_minutes(done_times, progress_times, RECENT_PACE_TASKS)
+
+    # Use recent pace for projections when available; otherwise fall back to
+    # the window's avg_minutes (which is itself n/a for too-few samples per B3).
+    pace_for_projection = recent_pace_minutes if recent_pace_minutes is not None else avg_minutes
+    est_hours = (tasks_active * pace_for_projection) / SECONDS_PER_MINUTE if pace_for_projection else 0.0
 
     # Combine usage from two sources, both filtered by window_start:
-    #   1. hook-logs.jsonl: subagent (Agent tool) invocations — captures executor / judge / etc costs
-    #   2. Claude Code transcripts: per-turn outer-session reasoning — captures what the orchestrate
+    #   1. hook-logs.jsonl: subagent (Agent tool) invocations -- captures executor / judge / etc costs
+    #   2. Claude Code transcripts: per-turn outer-session reasoning -- captures what the orchestrate
     #      skill itself spends between Agent calls. Without these, cost can be off by 10-20x.
     hook_log_path = _hook_log_path(log_path)
     totals_hook = _parse_hook_log_metrics(log_path, window_start)
@@ -464,7 +535,7 @@ def _compute_window_stats(
         + totals.cache_write_1h_tokens
     )
     tokens_per_task = total_tokens_window / tasks_in_window if tasks_in_window else 0.0
-    est_total_cost = cost.total_cost + (cost.total_cost / tasks_in_window * tasks_remaining if tasks_in_window else 0.0)
+    est_total_cost = cost.total_cost + (cost.total_cost / tasks_in_window * tasks_active if tasks_in_window else 0.0)
 
     api_hours = totals.total_duration_ms / MS_PER_SECOND / SECONDS_PER_HOUR
     api_efficiency = (api_hours / window_hours * PERCENT_MULTIPLIER) if window_hours > 0 else None
@@ -482,6 +553,8 @@ def _compute_window_stats(
         est_total_cost=est_total_cost,
         api_hours=api_hours,
         api_efficiency=api_efficiency,
+        pace_sample_count=pace_sample_count,
+        recent_pace_minutes=recent_pace_minutes,
     )
 
 
@@ -536,14 +609,16 @@ def _render_table(title: str, rows: list[tuple[str, str]], value_w: int = 18) ->
 def _render_multi_column_table(
     title: str,
     column_labels: list[str],
-    rows: list[tuple[str, list[str]]],
+    rows: list[tuple[str, list[str] | str]],
     value_w: int = 16,
 ) -> list[str]:
     """Render a bordered table with one metric column and N value columns.
 
     ``column_labels`` is the header row for the value columns.
-    ``rows`` is a list of (metric, [value_per_column]). Each row's value list
-    must match ``column_labels`` in length.
+    ``rows`` is a list of (metric, value). ``value`` is either a list with one
+    entry per column (normal row) OR a single string (spanning row -- used when
+    a metric is window-agnostic, e.g. log-wide Recent pace / projected ETA; the
+    same number repeating in every column is just noise).
 
     The metric column auto-sizes to the longest label (or the title), and each
     value column widens to the longest value (or its label) so future label
@@ -552,10 +627,20 @@ def _render_multi_column_table(
     n_cols = len(column_labels)
     metric_w = max((len(metric) for metric, _ in rows), default=0)
     metric_w = max(metric_w, len(title))
-    # Value column width = max of: default minimum, label width, max cell width across all rows.
-    max_cell = max((max((len(v) for v in vals), default=0) for _, vals in rows), default=0)
+
+    # Value column width = max of: default minimum, label width, max cell width.
+    # Spanning rows (value is str) are accounted for separately below so a very
+    # long spanning value doesn't distort the per-column width.
+    def _cells_of(v: list[str] | str) -> list[str]:
+        return v if isinstance(v, list) else []
+
+    max_cell = max((max((len(v) for v in _cells_of(vals)), default=0) for _, vals in rows), default=0)
     max_label = max((len(label) for label in column_labels), default=0)
     value_w = max(value_w, max_cell, max_label)
+
+    # Width a spanning cell occupies (covers all n_cols value columns plus the
+    # n_cols-1 internal "│" separators that would otherwise split them).
+    spanning_w = n_cols * (value_w + 2) + (n_cols - 1) - 2  # -2 for leading/trailing space padding
 
     def hborder(left: str, junction_metric: str, junction_inner: str, right: str) -> str:
         return (
@@ -578,10 +663,121 @@ def _render_multi_column_table(
     for i, (metric, values) in enumerate(rows):
         if i > 0:
             lines.append(border_mid)
-        cells = [f" {metric:<{metric_w}} "] + [f" {v:>{value_w}} " for v in values]
-        lines.append("\u2502" + "\u2502".join(cells) + "\u2502")
+        if isinstance(values, str):
+            # Spanning row: a single right-aligned value occupies the full width
+            # of all value columns (including the column separators). The top /
+            # bottom borders of this row still show the regular ┬/┴ junctions
+            # so the column boundaries stay visually consistent throughout the
+            # table; only the content row's internal │ separators are merged.
+            lines.append(f"\u2502 {metric:<{metric_w}} \u2502 {values:>{spanning_w}} \u2502")
+        else:
+            cells = [f" {metric:<{metric_w}} "] + [f" {v:>{value_w}} " for v in values]
+            lines.append("\u2502" + "\u2502".join(cells) + "\u2502")
     lines.append(border_bot)
     return lines
+
+
+def _render_grouped_progress_table(
+    title: str,
+    column_labels: list[str],
+    sections: list[tuple[str, list[tuple[str, list[str] | str]]]],
+    value_w: int = 16,
+) -> list[str]:
+    """Render a single unified progress table with section headers.
+
+    ``sections`` is a list of ``(section_label, rows)``. Each ``rows`` entry
+    is ``(metric_label, values)`` with the same semantics as
+    :func:`_render_multi_column_table`: ``list[str]`` for per-column values
+    (empty strings render as blank cells) and ``str`` for spanning values
+    that collapse across every value column.
+
+    Section-label rows are emitted as full-width merged cells (spanning the
+    metric column + every value column + their internal separators), with
+    mid-borders above and below, so the reader scans:
+    header row -> BACKLOG STATE rows -> THROUGHPUT rows -> ... -> bottom border.
+    """
+    n_cols = len(column_labels)
+    all_rows = [row for _, section_rows in sections for row in section_rows]
+    metric_w = max((len(metric) for metric, _ in all_rows), default=0)
+    metric_w = max(metric_w, len(title), max((len(name) for name, _ in sections), default=0))
+
+    def _cells_of(v: list[str] | str) -> list[str]:
+        return v if isinstance(v, list) else []
+
+    max_cell = max((max((len(v) for v in _cells_of(vals)), default=0) for _, vals in all_rows), default=0)
+    max_label = max((len(label) for label in column_labels), default=0)
+    value_w = max(value_w, max_cell, max_label)
+
+    # Width a spanning cell occupies across all n_cols value columns (plus
+    # the n_cols-1 internal separators). Used for both the section-header row
+    # and any individual metric whose value was merged into a str.
+    spanning_w = n_cols * (value_w + 2) + (n_cols - 1) - 2
+    # Width of the ENTIRE merged cell for a section-header row: metric column
+    # + all value columns + every separator between them - leading/trailing
+    # padding (2 spaces).
+    section_w = metric_w + 2 + 1 + (n_cols * (value_w + 2) + (n_cols - 1)) - 2
+
+    def hborder(left: str, junction_metric: str, junction_inner: str, right: str) -> str:
+        return (
+            left
+            + "\u2500" * (metric_w + 2)
+            + junction_metric
+            + (("\u2500" * (value_w + 2) + junction_inner) * (n_cols - 1))
+            + "\u2500" * (value_w + 2)
+            + right
+        )
+
+    border_top = hborder("\u250c", "\u252c", "\u252c", "\u2510")
+    border_mid = hborder("\u251c", "\u253c", "\u253c", "\u2524")
+    border_bot = hborder("\u2514", "\u2534", "\u2534", "\u2518")
+
+    header_cells = [f" {title:<{metric_w}} "] + [f" {label:>{value_w}} " for label in column_labels]
+    header_line = "\u2502" + "\u2502".join(header_cells) + "\u2502"
+
+    lines: list[str] = [border_top, header_line]
+
+    for section_label, rows in sections:
+        if not rows:
+            continue
+        # One mid-border divides the previous section (or the column-header
+        # row) from this section. The section-label row flows directly into
+        # the first metric row with no additional border between them, so
+        # the sections read as compact visual blocks like the plan's mockup.
+        lines.append(border_mid)
+        lines.append(f"\u2502 {section_label.upper():<{section_w}} \u2502")
+        for metric, values in rows:
+            if isinstance(values, str):
+                lines.append(f"\u2502 {metric:<{metric_w}} \u2502 {values:>{spanning_w}} \u2502")
+            else:
+                cells = [f" {metric:<{metric_w}} "] + [f" {v:>{value_w}} " for v in values]
+                lines.append("\u2502" + "\u2502".join(cells) + "\u2502")
+    lines.append(border_bot)
+    return lines
+
+
+def _render_side_by_side(left: list[str], right: list[str], gap: int = SIDE_BY_SIDE_GAP_CHARS) -> list[str]:
+    """Merge two pre-rendered table block lists onto the same rows, left-right.
+
+    The shorter list is padded with whitespace matching its own rendered
+    width so the resulting output stays rectangular -- i.e. the right block
+    does not shift left on rows where the left block has ended. An empty
+    input on either side returns the other unchanged.
+    """
+    if not left:
+        return list(right)
+    if not right:
+        return list(left)
+    left_width = max(len(line) for line in left)
+    right_width = max(len(line) for line in right)
+    row_count = max(len(left), len(right))
+    out: list[str] = []
+    blank_left = " " * left_width
+    blank_right = " " * right_width
+    for i in range(row_count):
+        lft = left[i] if i < len(left) else blank_left
+        rgt = right[i] if i < len(right) else blank_right
+        out.append(lft.ljust(left_width) + " " * gap + rgt)
+    return out
 
 
 def _format_int(n: int) -> str:
@@ -604,15 +800,34 @@ def _short_window_label(label: str, start: datetime, display_tz: tzinfo | None) 
 
 def _stats_to_value_list(stats: WindowStats) -> list[str]:
     """Return the per-row value list for a single window, in display order matching METRIC_LABELS."""
-    api_eff = f"{stats.api_efficiency:.1f}%" if stats.api_efficiency is not None else "n/a"
+    # API utilization > 100% means API time exceeds wall time -- concurrent
+    # subagent calls (legitimate parallelism) or two orchestrators writing to
+    # the same hook log. The raw percentage reads as broken; surface the
+    # condition explicitly. The underlying WindowStats.api_efficiency stays
+    # untouched for programmatic callers.
+    if stats.api_efficiency is None:
+        api_eff = "n/a"
+    elif stats.api_efficiency > PERCENT_MULTIPLIER:
+        api_eff = ">100% (parallel)"
+    else:
+        api_eff = f"{stats.api_efficiency:.1f}%"
     cache_hit = f"{stats.cache_hit_rate:.2f}%" if stats.cache_hit_rate is not None else "n/a"
     tokens_per_task = f"{stats.tokens_per_task:,.0f}" if stats.tokens_per_task else "n/a"
     est_total = f"~${stats.est_total_cost:.2f}" if stats.est_total_cost else "n/a"
-    # Per-task averages are meaningful only when at least one task completed in the window;
-    # otherwise the rate is undefined and the projection is meaningless. Show "n/a" rather
-    # than misleading "0.0 min" / "~0.0 h" rows.
-    avg_min_display = f"{stats.avg_minutes:.1f} min" if stats.avg_minutes else "n/a"
-    est_hours_display = f"~{stats.est_hours:.1f} h" if stats.avg_minutes else "n/a"
+    # Per-task averages are meaningful only when ≥ MIN_PACE_SAMPLES tasks
+    # completed in the window. Below that, _compute_window_stats sets avg=0
+    # and we display "n/a" with the actual sample count so the reader knows
+    # whether the metric is genuinely empty (N=0) or fragile (1 ≤ N < min).
+    if stats.avg_minutes:
+        avg_min_display = f"{stats.avg_minutes:.1f} min"
+    elif stats.pace_sample_count > 0:
+        avg_min_display = f"n/a (N={stats.pace_sample_count} sample{'s' if stats.pace_sample_count != 1 else ''})"
+    else:
+        avg_min_display = "n/a"
+    # Recent pace is log-wide; same value across all window columns. None
+    # when fewer than RECENT_PACE_TASKS completions exist.
+    recent_pace_display = f"{stats.recent_pace_minutes:.1f} min" if stats.recent_pace_minutes is not None else "n/a"
+    est_hours_display = f"~{stats.est_hours:.1f} h" if stats.est_hours else "n/a"
     if stats.input_share is None:
         input_share = "n/a"
     else:
@@ -623,6 +838,7 @@ def _stats_to_value_list(stats: WindowStats) -> list[str]:
         f"{stats.window_hours:.1f} h",
         str(stats.tasks_in_window),
         avg_min_display,
+        recent_pace_display,
         est_hours_display,
         f"{stats.api_hours:.1f} h",
         api_eff,
@@ -645,6 +861,7 @@ _METRIC_LABELS: list[str] = [
     "Time span",
     "Tasks completed in window",
     "Average time per task",
+    f"Recent pace (last {RECENT_PACE_TASKS} tasks)",
     "Est. time to complete remaining",
     "API processing time",
     "API utilization",
@@ -661,6 +878,33 @@ _METRIC_LABELS: list[str] = [
     "Estimated total cost at completion",
 ]
 
+# Rows whose value is window-agnostic (identical across every window column).
+# These render as a single cell spanning all value columns instead of repeating
+# the same number per column. Recent pace is log-wide by construction; Est. time
+# to complete remaining = tasks_active * log-wide pace / 60 when recent pace is
+# available (the usual case after RECENT_PACE_TASKS completions).
+_SPANNING_METRIC_LABELS: frozenset[str] = frozenset(
+    {
+        f"Recent pace (last {RECENT_PACE_TASKS} tasks)",
+        "Est. time to complete remaining",
+    }
+)
+
+
+def _merge_spanning_values(metric: str, values: list[str]) -> list[str] | str:
+    """Collapse a per-column value list into a single spanning str when applicable.
+
+    Spanning only triggers when the metric is in ``_SPANNING_METRIC_LABELS`` AND
+    every value is identical -- if values differ (e.g. recent pace falls back to
+    per-window avg_minutes when log-wide samples are insufficient), keep the
+    per-column layout so any divergence stays visible.
+    """
+    if metric not in _SPANNING_METRIC_LABELS:
+        return values
+    if len(set(values)) == 1:
+        return values[0]
+    return values
+
 
 def _stats_to_rows_single(stats: WindowStats) -> list[tuple[str, str]]:
     """Convert one WindowStats into (metric, value) rows for the single-column table."""
@@ -671,31 +915,53 @@ def _stats_to_rows_single(stats: WindowStats) -> list[tuple[str, str]]:
 def _resolve_window_endpoints(log_timestamps: list[datetime]) -> tuple[datetime, datetime, datetime | None]:
     """Return (log_start_for_window, window_end, log_started) for an empty or non-empty log.
 
-    For an empty log, both window endpoints fall back to ``datetime.now(UTC)`` and
-    ``log_started`` is None.
+    ``window_end`` is the report-generation moment, bounded below by
+    ``datetime.now(UTC)``. Without that bound, a "This run" window whose
+    ``start`` post-dates every log entry (common in watch mode when no new
+    log lines have arrived yet) yields a negative span and an n/a cascade
+    across every derived metric.
+
+    For an empty log, both window endpoints fall back to ``datetime.now(UTC)``
+    and ``log_started`` is None.
     """
+    now = datetime.now(UTC)
     if log_timestamps:
         log_started = min(log_timestamps)
-        return log_started, max(log_timestamps), log_started
-    now = datetime.now(UTC)
+        return log_started, max(*log_timestamps, now), log_started
     return now, now, None
 
 
-def _summary_line(stats: WindowStats, tasks_remaining: int) -> str:
+def _summary_line(stats: WindowStats, tasks_active: int, tasks_blocked: int) -> str:
     """Trailing one-line completion projection.
 
-    The estimate uses the All-time average (most stable sample); narrower windows
-    can have zero completed tasks (e.g. just after a restart), which would give a
-    meaningless projection.
+    Projects against ``tasks_active`` (in-queue / in-progress / in-review) only;
+    blocked tasks need external action and are reported separately so the user
+    knows why the projection is lower than naive ``tasks_remaining * pace``.
+
+    The pace prefers ``recent_pace_minutes`` (rolling average of the last N
+    completions) when available -- that metric reflects current orchestrator
+    rate. Falls back to All-time ``avg_minutes`` otherwise.
     """
-    if not stats.avg_minutes:
+    blocked_note = f" -- {tasks_blocked} blocked excluded" if tasks_blocked else ""
+    if tasks_active == 0:
+        if tasks_blocked:
+            return (
+                f"0 active tasks. {tasks_blocked} blocked task(s) remaining -- "
+                "need external action before the orchestrator can proceed."
+            )
+        return "All tasks complete."
+    pace_label, pace_minutes = (
+        ("Recent", stats.recent_pace_minutes)
+        if stats.recent_pace_minutes is not None
+        else ("All-time", stats.avg_minutes)
+    )
+    if not pace_minutes:
         return (
-            f"{tasks_remaining} tasks remaining. "
-            "(Not enough completed tasks in the All-time window for a pace estimate.)"
+            f"{tasks_active} active task(s) remaining{blocked_note}. (Not enough completed tasks for a pace estimate.)"
         )
     return (
-        f"At the All-time pace of ~{stats.avg_minutes:.1f} minutes per task, "
-        f"the remaining {tasks_remaining} tasks should take roughly "
+        f"At the {pace_label} pace of ~{pace_minutes:.1f} minutes per task, "
+        f"the remaining {tasks_active} active task(s){blocked_note} should take roughly "
         f"{stats.est_hours:.1f} more hours of continuous execution."
     )
 
@@ -728,7 +994,14 @@ class _BacklogTotals:
     stories_done: int
     features_done: int
     epics_done: int
-    tasks_remaining: int
+    tasks_remaining: int  # all non-Done tasks (active + blocked); kept for backward-compat
+    tasks_blocked: int  # non-Done tasks with status == BLOCKED
+    tasks_active: int  # tasks_remaining - tasks_blocked (in-queue / in-progress / in-review)
+    tasks_in_progress: int  # non-Done tasks with status == IN_PROGRESS (subset of tasks_active)
+    tasks_in_queue: int  # non-Done tasks with status == IN_QUEUE (subset of tasks_active)
+    tasks_in_review: int  # non-Done tasks with status == IN_REVIEW (subset of tasks_active)
+    tasks_proposed: int  # task-factory-generated drafts awaiting human review
+    tasks_declined: int  # explicitly declined work (won't ever be done)
 
 
 def _backlog_totals_from_units(units: list) -> _BacklogTotals:
@@ -737,6 +1010,17 @@ def _backlog_totals_from_units(units: list) -> _BacklogTotals:
     features = [u for u in units if u.unit_type == WorkUnitType.FEATURE]
     epics = [u for u in units if u.unit_type == WorkUnitType.EPIC]
     tasks_done = [t for t in tasks if t.status == WorkUnitStatus.DONE]
+    tasks_blocked = [t for t in tasks if t.status == WorkUnitStatus.BLOCKED]
+    tasks_in_progress = [t for t in tasks if t.status == WorkUnitStatus.IN_PROGRESS]
+    tasks_in_queue = [t for t in tasks if t.status == WorkUnitStatus.IN_QUEUE]
+    tasks_in_review = [t for t in tasks if t.status == WorkUnitStatus.IN_REVIEW]
+    tasks_proposed = [t for t in tasks if t.status == WorkUnitStatus.PROPOSED]
+    tasks_declined = [t for t in tasks if t.status == WorkUnitStatus.DECLINED]
+    # Proposed tasks are inert drafts awaiting human review; Declined tasks
+    # are deliberate "won't ever be done" decisions. Neither counts against
+    # tasks_remaining or tasks_active -- the orchestrator will never execute
+    # either, so they must not distort pace / ETA projections.
+    tasks_remaining = len(tasks) - len(tasks_done) - len(tasks_proposed) - len(tasks_declined)
     return _BacklogTotals(
         tasks_total=len(tasks),
         tasks_done=len(tasks_done),
@@ -745,56 +1029,243 @@ def _backlog_totals_from_units(units: list) -> _BacklogTotals:
         stories_done=len([s for s in stories if s.status == WorkUnitStatus.DONE]),
         features_done=len([f for f in features if f.status == WorkUnitStatus.DONE]),
         epics_done=len([e for e in epics if e.status == WorkUnitStatus.DONE]),
-        tasks_remaining=len(tasks) - len(tasks_done),
+        tasks_remaining=tasks_remaining,
+        tasks_blocked=len(tasks_blocked),
+        tasks_active=tasks_remaining - len(tasks_blocked),
+        tasks_in_progress=len(tasks_in_progress),
+        tasks_in_queue=len(tasks_in_queue),
+        tasks_in_review=len(tasks_in_review),
+        tasks_proposed=len(tasks_proposed),
+        tasks_declined=len(tasks_declined),
     )
 
 
 def _backlog_state_rows(b: _BacklogTotals, lifetime: WindowStats | None = None) -> list[tuple[str, str]]:
-    """Rows for the top "Backlog state + lifetime totals" box.
+    """Instantaneous backlog-state rows (task counts, percentages, rollups).
 
-    When ``lifetime`` is provided (i.e., we have orchestrator log data), the
-    box also shows lifetime cost / token / cache-hit metrics so the all-time
-    totals are visible at a glance without having to read across the wider
-    multi-column window-stats table below.
+    ``lifetime`` is accepted for backward compatibility with callers that
+    pass it, but the Lifetime cost / token / cache-hit rows it used to
+    inject were duplicates of the All-time column in the consolidated table
+    and have been removed. The argument is ignored; the rows returned here
+    carry only instantaneous state that does not belong in a windowed view.
     """
+    _ = lifetime  # retained for API compatibility; no longer emits Lifetime rows.
     task_pct = round(PERCENT_MULTIPLIER * b.tasks_done / b.tasks_total) if b.tasks_total else 0
     total_pct = round(PERCENT_MULTIPLIER * b.units_done / b.units_total) if b.units_total else 0
-    rows: list[tuple[str, str]] = [
+    return [
         ("Tasks completed", f"{b.tasks_done} of {b.tasks_total} ({task_pct}%)"),
         (
             "Work units done (tasks + auto-rolled stories/features/epics)",
             f"{b.units_done} of {b.units_total} ({total_pct}%)",
         ),
-        ("Tasks remaining", str(b.tasks_remaining)),
+        ("Tasks in-progress", str(b.tasks_in_progress)),
+        ("Tasks proposed", str(b.tasks_proposed)),
+        ("Tasks declined", str(b.tasks_declined)),
+        ("Tasks blocked", str(b.tasks_blocked)),
+        ("Tasks remaining (total)", str(b.tasks_active + b.tasks_blocked)),
         (
             "Stories / Features / Epics auto-rolled to done",
             f"{b.stories_done} / {b.features_done} / {b.epics_done}",
         ),
     ]
-    if lifetime is not None:
-        cache_hit = f"{lifetime.cache_hit_rate:.2f}%" if lifetime.cache_hit_rate is not None else "n/a"
-        est_total = f"~${lifetime.est_total_cost:.2f}" if lifetime.est_total_cost else "n/a"
-        if lifetime.input_share is None:
-            input_share = "n/a"
+
+
+# ---------------------------------------------------------------------------
+# Per-section metric grouping for the consolidated progress table
+# ---------------------------------------------------------------------------
+# The Window stats rows are split into four logical sections: THROUGHPUT,
+# API USAGE, TOKENS, COST. Order within each section is preserved from
+# ``_METRIC_LABELS``; the ordering in ``_METRIC_LABELS`` is therefore the
+# single source of truth for how rows appear in the output.
+
+_SECTION_THROUGHPUT: frozenset[str] = frozenset(
+    {
+        "Time span",
+        "Tasks completed in window",
+        "Average time per task",
+        f"Recent pace (last {RECENT_PACE_TASKS} tasks)",
+        "Est. time to complete remaining",
+    }
+)
+
+_SECTION_API_USAGE: frozenset[str] = frozenset(
+    {
+        "API processing time",
+        "API utilization",
+    }
+)
+
+_SECTION_COST: frozenset[str] = frozenset(
+    {
+        "Estimated cost so far",
+        "Estimated total cost at completion",
+    }
+)
+
+# Every row in ``_METRIC_LABELS`` that is not in THROUGHPUT, API USAGE, or
+# COST falls into TOKENS by elimination. That includes the token-breakdown
+# rows, Input/output share, Cache hit rate, and Avg tokens per task -- the
+# plan's TOKENS section ends with "Avg tokens per task" immediately before
+# the COST section begins.
+
+
+def _section_for_metric(metric: str) -> str:
+    """Return the section label ("Throughput"/"API usage"/"Tokens"/"Cost") for a metric row."""
+    if metric in _SECTION_THROUGHPUT:
+        return "Throughput"
+    if metric in _SECTION_API_USAGE:
+        return "API usage"
+    if metric in _SECTION_COST:
+        return "Cost"
+    return "Tokens"
+
+
+def _unit_status_listing(units: list, status: WorkUnitStatus, header: str) -> list[str]:
+    """Return `[<blank>, "<header>:", "  - <id>: <title>", ...]` for task units in the given status.
+
+    Returns an empty list when no task matches -- the caller then omits the
+    whole section (no empty `In-progress tasks:` header in reports where
+    everything is done or everything is blocked, etc.). Listings are task-only
+    (unit_type == TASK); parent Story/Feature/Epic units are excluded since
+    their status is derived from their children via auto-rollup.
+    """
+    matches = [u for u in units if u.unit_type == WorkUnitType.TASK and u.status == status]
+    if not matches:
+        return []
+    lines = ["", f"{header}:"]
+    lines.extend(f"  - {u.id}: {u.title}" for u in matches)
+    return lines
+
+
+def _in_progress_listing(units: list) -> list[str]:
+    """B9: list every in-progress task so the user sees which one is active."""
+    return _unit_status_listing(units, WorkUnitStatus.IN_PROGRESS, "In-progress tasks")
+
+
+def _blocked_listing(units: list) -> list[str]:
+    """ADR-10: render blocked tasks in two panels (auto-clearing + needs-attention).
+
+    The split lets operators scan only the ``(needs operator attention)``
+    panel to find work that requires a decision; the ``(auto-clearing via
+    proposal)`` panel is informational -- the ADR-07 cascade will resolve
+    each of those tasks when its markers reach terminal state.
+
+    Each auto-clearing row names the task IDs it is waiting on in square
+    brackets so the operator can trace the chain without opening the
+    work-unit file. Needs-attention rows carry just ID + title; the operator
+    opens the file to read the blocker comment.
+
+    Both panels are omitted when empty, matching the Proposed / Declined /
+    Un-materialised panel discipline.
+    """
+    from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+    blocked_tasks = [u for u in units if u.unit_type == WorkUnitType.TASK and u.status == WorkUnitStatus.BLOCKED]
+    if not blocked_tasks:
+        return []
+
+    auto_rows: list[tuple] = []  # (unit, list[str] of marker targets)
+    attn_rows: list = []
+    for u in blocked_tasks:
+        state = classify_blocked_task(BACKLOG_ROOT, BACKLOG_INDEX, u.id)
+        if state is BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL:
+            # Surface which task(s) this one is waiting on. Reuse the same
+            # marker-extract helper the cascade uses so the string is always
+            # accurate.
+            from devbench.backlog.manager import BacklogManager
+
+            waiting_on = sorted(BacklogManager()._extract_pending_proposal_markers(u.file_path))
+            auto_rows.append((u, waiting_on))
         else:
-            in_pct = lifetime.input_share * PERCENT_MULTIPLIER
-            out_pct = (1 - lifetime.input_share) * PERCENT_MULTIPLIER
-            input_share = f"{in_pct:.1f}% / {out_pct:.1f}%"
-        rows.extend(
-            [
-                ("Lifetime tokens consumed", _format_int(lifetime.total_tokens)),
-                ("  ├─ input (uncached)", _format_int(lifetime.totals.input_tokens)),
-                ("  ├─ cache reads", _format_int(lifetime.totals.cache_read_tokens)),
-                ("  ├─ cache writes 5-min", _format_int(lifetime.totals.cache_write_5m_tokens)),
-                ("  ├─ cache writes 1-hour", _format_int(lifetime.totals.cache_write_1h_tokens)),
-                ("  └─ output", _format_int(lifetime.totals.output_tokens)),
-                ("Lifetime input / output share (measured)", input_share),
-                ("Lifetime cache hit rate", cache_hit),
-                ("Lifetime estimated cost so far", f"~${lifetime.cost.total_cost:.2f}"),
-                ("Lifetime estimated total cost at completion", est_total),
-            ]
-        )
-    return rows
+            attn_rows.append(u)
+
+    lines: list[str] = []
+    if auto_rows:
+        lines.append("")
+        lines.append(f"Blocked tasks (auto-clearing via proposal) ({len(auto_rows)}):")
+        for u, waiting_on in auto_rows:
+            suffix = f"    [waiting on {', '.join(waiting_on)}]" if waiting_on else ""
+            lines.append(f"  - {u.id}: {u.title}{suffix}")
+    if attn_rows:
+        lines.append("")
+        lines.append(f"Blocked tasks (needs operator attention) ({len(attn_rows)}):")
+        for u in attn_rows:
+            lines.append(f"  - {u.id}: {u.title}")
+    return lines
+
+
+def _proposed_listing(units: list) -> list[str]:
+    """List every proposed task-factory draft so the human knows which drafts await review.
+
+    Rendered before the In-progress / Blocked panels so the "waiting on human
+    decision" set is front-and-center (task-factory proposals are inert until
+    promoted). Omitted entirely when no proposed tasks exist -- the plan
+    requires the panel to disappear rather than print an empty "Proposed (0):".
+    """
+    return _listing_by_status(units, WorkUnitStatus.PROPOSED, "Proposed")
+
+
+def _declined_listing(units: list) -> list[str]:
+    """List every Declined task so the human can audit the decisions.
+
+    Same shape as the Proposed panel -- ``Declined (N):`` followed by one
+    ``  <title>    <path>`` line per task. Omitted when no declined tasks.
+    """
+    return _listing_by_status(units, WorkUnitStatus.DECLINED, "Declined")
+
+
+def _unmaterialised_proposals_listing() -> list[str]:
+    """List every proposal-JSON entry whose draft .md has not yet been created.
+
+    Reads ``<workspace>/.devbench/proposals/*.json`` via ``list_proposals`` and
+    filters each ``proposed_tasks[].suggested_id`` through
+    ``classify_proposed_task``. Entries in ``UNMATERIALISED`` state get one row
+    per task in a dedicated panel so the operator can see at a glance which
+    proposal JSONs are waiting for ``devbench sweep-proposals`` /
+    ``materialise-proposal`` to produce drafts.
+
+    Omitted entirely when no un-materialised entries exist, mirroring the
+    Proposed / Declined panels' empty-state discipline.
+    """
+    from devbench.backlog.proposal import (
+        ProposalTaskState,
+        classify_proposed_task,
+        list_proposals,
+    )
+
+    workspace_root = BACKLOG_ROOT.parent
+    entries: list[tuple[str, str, str, str]] = []
+    for proposal in list_proposals(workspace_root):
+        for task in proposal.proposed_tasks:
+            state = classify_proposed_task(BACKLOG_ROOT, workspace_root, task.suggested_id)
+            if state is ProposalTaskState.UNMATERIALISED:
+                entries.append((task.suggested_id, task.title, proposal.source_task_id, proposal.generated_at))
+
+    if not entries:
+        return []
+
+    lines = ["", f"Proposal JSONs pending materialisation ({len(entries)}):"]
+    id_col = max(len(sid) for sid, _, _, _ in entries)
+    title_col = max(len(title) for _, title, _, _ in entries)
+    for sid, title, source, generated in entries:
+        lines.append(f"  {sid:<{id_col}}  {title:<{title_col}}  (from {source}, generated {generated})")
+    return lines
+
+
+def _listing_by_status(units: list, status: WorkUnitStatus, label: str) -> list[str]:
+    """Shared renderer for the Proposed + Declined title/path panels."""
+    matches = [u for u in units if u.unit_type == WorkUnitType.TASK and u.status == status]
+    if not matches:
+        return []
+    lines = ["", f"{label} ({len(matches)}):"]
+    title_col = max((len(u.title) for u in matches), default=0)
+    for u in matches:
+        try:
+            rel = u.file_path.relative_to(BACKLOG_ROOT.parent)
+        except ValueError:
+            rel = u.file_path
+        lines.append(f"  {u.title:<{title_col}}    {rel}")
+    return lines
 
 
 def generate_report(
@@ -839,20 +1310,23 @@ def generate_report(
     # are visible at a glance without scanning across the wider window-stats table.
     lifetime_stats: WindowStats | None = (
         _compute_window_stats(
-            log_path, log_start_for_window, window_end, done_times, progress_times, backlog.tasks_remaining
+            log_path, log_start_for_window, window_end, done_times, progress_times, backlog.tasks_active
         )
         if log_started is not None
         else None
     )
 
     lines: list[str] = []
-    lines.extend(_render_table("Backlog state", _backlog_state_rows(backlog, lifetime_stats)))
 
     if since is not None:
         # Single-window mode (legacy API for callers passing --since explicitly).
+        # Kept stacked -- the single window block stays beneath the Backlog state
+        # box the way older callers / tests expect it.
+        backlog_state_block = _render_table("Backlog state", _backlog_state_rows(backlog))
         single_stats = _compute_window_stats(
-            log_path, since, window_end, done_times, progress_times, backlog.tasks_remaining
+            log_path, since, window_end, done_times, progress_times, backlog.tasks_active
         )
+        lines.extend(backlog_state_block)
         lines.append("")
         lines.extend(
             _render_table(
@@ -864,9 +1338,11 @@ def generate_report(
         lines.append(f"\nTasks in this session: {single_stats.tasks_in_window}")
         summary_stats = single_stats
     else:
-        # Default: render Backlog state + multi-column window-stats table.
-        # Lifetime stats (already computed above) double as the All-time column,
-        # so we don't re-walk the hook log for the same window.
+        # Default: ONE unified grouped table with sections (BACKLOG STATE,
+        # THROUGHPUT, API USAGE, TOKENS, COST). The reader scans top-down;
+        # the Backlog state rows have only the All-time column populated
+        # (Session and This run cells render as blank); the windowed rows
+        # populate every column.
         windows: list[WindowSpec] = [
             WindowSpec(label="All-time", start=log_start_for_window, is_log_started=True),
         ]
@@ -883,27 +1359,58 @@ def generate_report(
             else:
                 all_window_stats.append(
                     _compute_window_stats(
-                        log_path, w.start, window_end, done_times, progress_times, backlog.tasks_remaining
+                        log_path, w.start, window_end, done_times, progress_times, backlog.tasks_active
                     )
                 )
 
         column_labels = [_short_window_label(w.label, w.start, display_tz) for w in windows]
+        n_cols = len(column_labels)
         value_columns = [_stats_to_value_list(s) for s in all_window_stats]
-        # Transpose: rows = list of (metric, [value_for_each_window])
-        multi_rows = [(metric, [col[i] for col in value_columns]) for i, metric in enumerate(_METRIC_LABELS)]
+        # Transpose per-window stats into (metric, values) rows and group by
+        # section label. Spanning metrics (Recent pace / Est. time) still
+        # collapse into a single cell when every column agrees.
+        windowed_rows: list[tuple[str, list[str] | str]] = [
+            (metric, _merge_spanning_values(metric, [col[i] for col in value_columns]))
+            for i, metric in enumerate(_METRIC_LABELS)
+        ]
+        sections_by_label: dict[str, list[tuple[str, list[str] | str]]] = {
+            "Backlog state": [(m, [v, *[""] * (n_cols - 1)]) for m, v in _backlog_state_rows(backlog)],
+            "Throughput": [],
+            "API usage": [],
+            "Tokens": [],
+            "Cost": [],
+        }
+        for metric, values in windowed_rows:
+            sections_by_label[_section_for_metric(metric)].append((metric, values))
 
-        lines.append("")
-        lines.extend(_render_multi_column_table("Window stats", column_labels, multi_rows))
-        # Use the All-time stats for the trailing prose projection — they're the
+        sections: list[tuple[str, list[tuple[str, list[str] | str]]]] = [
+            ("Backlog state", sections_by_label["Backlog state"]),
+            ("Throughput", sections_by_label["Throughput"]),
+            ("API usage", sections_by_label["API usage"]),
+            ("Tokens", sections_by_label["Tokens"]),
+            ("Cost", sections_by_label["Cost"]),
+        ]
+        lines.extend(_render_grouped_progress_table("Metric", column_labels, sections))
+        # Use the All-time stats for the trailing prose projection -- they're the
         # most stable sample. Narrower windows can have zero completed tasks
         # (e.g. just after a restart) which would project meaningless numbers.
         summary_stats = all_window_stats[0]
 
     lines.append("")
-    lines.append(_summary_line(summary_stats, backlog.tasks_remaining))
+    lines.append(_summary_line(summary_stats, backlog.tasks_active, backlog.tasks_blocked))
     if summary_stats.cost.total_cost:
         lines.append(_cost_basis_line())
     if since is None:
         lines.append("\n" + _windows_explanation())
+        # B9: per-unit listings at the very end so the user can act on each.
+        # Proposed + Declined panels render FIRST (before In Progress / Blocked)
+        # because they represent human-decision state: drafts awaiting review
+        # and tasks that have been taken off the table. Both are omitted when
+        # their respective status has zero tasks.
+        lines.extend(_proposed_listing(units))
+        lines.extend(_unmaterialised_proposals_listing())
+        lines.extend(_declined_listing(units))
+        lines.extend(_in_progress_listing(units))
+        lines.extend(_blocked_listing(units))
 
     return "\n".join(lines)

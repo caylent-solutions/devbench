@@ -35,12 +35,31 @@ class ConflictingPRError(RuntimeError):
 _BRANCH_RE = re.compile(r"^[a-zA-Z0-9]([a-zA-Z0-9_]|[.\-/][a-zA-Z0-9_])*$")
 
 
-class GitOpsJudge:
+class GitOpsService:
     """Handles git commit, push, PR creation, merging, tagging, and CI checks."""
 
     def __init__(self) -> None:
         self.name = "git_ops"
         self.logger = logging.getLogger(f"devbench.{self.name}")
+
+    def assert_on_branch(self, repo_path: Path, expected_branch: str) -> None:
+        """Verify the working tree is checked out to ``expected_branch``.
+
+        Fails fast with a precise diagnostic when HEAD is on a different
+        branch, in detached-HEAD state, or when ``rev-parse`` itself fails.
+        Called from every commit path so a drifted HEAD can never silently
+        produce an orphan-branch commit.
+        """
+        rc, current, err = self._git(["rev-parse", "--abbrev-ref", "HEAD"], repo_path)
+        if rc != 0:
+            raise RuntimeError(f"git rev-parse --abbrev-ref HEAD failed in {repo_path} (exit {rc}): {err.strip()}")
+        actual = current.strip()
+        if actual != expected_branch:
+            raise RuntimeError(
+                f"Branch assertion failed in {repo_path}: expected '{expected_branch}', "
+                f"HEAD is on '{actual}'. Refusing to commit on the wrong branch. "
+                "Call ensure_branch() before commit_local()/commit_and_push() to switch first."
+            )
 
     def ensure_branch(self, repo: str, repo_path: Path, branch: str) -> None:
         """Ensure the repository is on *branch*, creating it if necessary.
@@ -81,7 +100,7 @@ class GitOpsJudge:
 
         _, current_branch, _ = self._git(["rev-parse", "--abbrev-ref", "HEAD"], repo_path)
         if current_branch.strip() == branch:
-            self.logger.info("Already on branch %s — no-op", branch)
+            self.logger.info("Already on branch %s -- no-op", branch)
             return
 
         rc_status, status_out, status_err = run_command(["git", "status", "--porcelain"], cwd=repo_path)
@@ -110,7 +129,7 @@ class GitOpsJudge:
     def commit_and_push(self, repo: str, repo_path: Path, branch: str, message: str) -> None:
         """Validate inputs, stage all changes, commit, and push.
 
-        Assumes the repository is already on the correct branch — call
+        Assumes the repository is already on the correct branch -- call
         :meth:`ensure_branch` before the executor agent stages files.
 
         This method is idempotent: it is safe to call on restart after a partial run.
@@ -120,8 +139,8 @@ class GitOpsJudge:
         1. Validate *repo* against the allow-list (``validate_repo``).
         2. Validate *branch* format against ``_BRANCH_RE`` (allowlist pattern that
            rejects consecutive special characters per git ref naming rules).
-        3. ``git add -A`` — stage all working-tree changes.
-        4. ``git status --porcelain`` — check whether anything was staged.
+        3. ``git add -A`` -- stage all working-tree changes.
+        4. ``git status --porcelain`` -- check whether anything was staged.
 
            - If the output is **non-empty**: proceed to commit and push (steps 5-6).
            - If the output is **empty** (nothing to commit): the working tree is
@@ -134,8 +153,8 @@ class GitOpsJudge:
              - Remote branch present and local HEAD matches remote HEAD: skip push
                and return.  The desired state is fully achieved.
 
-        5. ``git commit -m <message>`` — commit staged changes (skipped when clean).
-        6. ``git push origin <branch>`` — push to the remote (skipped when remote
+        5. ``git commit -m <message>`` -- commit staged changes (skipped when clean).
+        6. ``git push origin <branch>`` -- push to the remote (skipped when remote
            is already up to date).
 
         All git commands are executed via :meth:`_git`, which invokes subprocess
@@ -166,23 +185,28 @@ class GitOpsJudge:
                 "(no consecutive special characters)."
             )
 
+        # Refuse to commit if HEAD has drifted off the expected branch (e.g.
+        # leftover detached-HEAD state from a previous task). Prevents the
+        # orphan-branch class of bug where a commit lands on backlog/<id>
+        # instead of the configured single_branch.
+        self.assert_on_branch(repo_path, branch)
         self._git(["add", "-A"], repo_path)
 
         _, status_out, _ = self._git(["status", "--porcelain"], repo_path)
         if not status_out.strip():
-            self.logger.info("Nothing to commit on branch %s — checking remote state", branch)
+            self.logger.info("Nothing to commit on branch %s -- checking remote state", branch)
             rc, _, _ = run_command(["git", "rev-parse", "--verify", f"origin/{branch}"], cwd=repo_path)
             if rc != 0:
-                self.logger.info("Remote branch origin/%s does not exist — pushing", branch)
+                self.logger.info("Remote branch origin/%s does not exist -- pushing", branch)
                 self._git(["push", "origin", branch], repo_path)
             else:
                 _, local_sha, _ = self._git(["rev-parse", "HEAD"], repo_path)
                 _, remote_sha, _ = self._git(["rev-parse", f"origin/{branch}"], repo_path)
                 if local_sha.strip() != remote_sha.strip():
-                    self.logger.info("Local branch %s is ahead of origin — pushing", branch)
+                    self.logger.info("Local branch %s is ahead of origin -- pushing", branch)
                     self._git(["push", "origin", branch], repo_path)
                 else:
-                    self.logger.info("Branch %s already up to date with origin — skipping push", branch)
+                    self.logger.info("Branch %s already up to date with origin -- skipping push", branch)
             return
 
         self._git(["commit", "-m", message], repo_path)
@@ -214,6 +238,9 @@ class GitOpsJudge:
                 "(no consecutive special characters)."
             )
 
+        # Same orphan-branch protection as commit_and_push -- refuse to
+        # commit when HEAD has drifted off the expected branch.
+        self.assert_on_branch(repo_path, branch)
         self._git(["add", "-A"], repo_path)
 
         _, status_out, _ = self._git(["status", "--porcelain"], repo_path)
@@ -349,7 +376,7 @@ class GitOpsJudge:
         if rc != 0:
             if "no checks reported" in stderr:
                 self.logger.warning(
-                    "No CI checks configured for PR #%d on %s — treating as pass",
+                    "No CI checks configured for PR #%d on %s -- treating as pass",
                     pr_number,
                     repo,
                 )

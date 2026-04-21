@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# assert-tests-pass.sh — PostToolUse hook: block silent progression when a test
+# assert-tests-pass.sh -- PostToolUse hook: block silent progression when a test
 # command exits non-zero.
 #
 # Receives JSON on stdin with structure:
@@ -33,12 +33,12 @@ code = result.get('exit_code', 0)
 print(int(code))
 " 2>/dev/null || true)
 
-# No command to inspect — allow.
+# No command to inspect -- allow.
 if [[ -z "$COMMAND" ]]; then
   exit 0
 fi
 
-# No exit code parsed — allow.
+# No exit code parsed -- allow.
 if [[ -z "$EXIT_CODE" ]]; then
   exit 0
 fi
@@ -56,18 +56,18 @@ if [[ "$COMMAND" =~ (^|[[:space:]]|\&\&|\|)make[[:space:]]+(test|test-unit|test-
   IS_TEST_COMMAND=1
 fi
 
-# Not a test command — allow regardless of exit code.
+# Not a test command -- allow regardless of exit code.
 if [[ "$IS_TEST_COMMAND" -eq 0 ]]; then
   exit 0
 fi
 
-# Test command passed — allow.
+# Test command passed -- allow.
 if [[ "$EXIT_CODE" -eq 0 ]]; then
   exit 0
 fi
 
-# Test command failed — block with a clear, actionable error message.
-echo "assert-tests-pass: test command exited with code ${EXIT_CODE} — fix all failures before proceeding." >&2
+# Test command failed -- block with a clear, actionable error message.
+echo "assert-tests-pass: test command exited with code ${EXIT_CODE} -- fix all failures before proceeding." >&2
 echo "Command: ${COMMAND}" >&2
 echo "Fix: resolve the failing tests shown above, then re-run the test command." >&2
 exit 2

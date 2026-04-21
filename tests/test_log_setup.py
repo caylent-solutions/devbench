@@ -33,7 +33,13 @@ class TestSetupLogging:
 
         assert result == log_file
 
-    def test_adds_stdout_and_file_handlers(self, tmp_path: Path) -> None:
+    def test_adds_stderr_and_file_handlers(self, tmp_path: Path) -> None:
+        """B6: stream handler must target stderr, not stdout, so commands like
+        `devbench report` can be piped/redirected without log lines polluting
+        the data stream on stdout.
+        """
+        import sys
+
         log_file = tmp_path / "test.log"
         with patch.dict("os.environ", {"JUDGE_LOG_FILE": str(log_file)}):
             log_setup_mod.setup_logging()
@@ -42,6 +48,18 @@ class TestSetupLogging:
         handler_types = {type(h).__name__ for h in root.handlers}
         assert "StreamHandler" in handler_types
         assert "FileHandler" in handler_types
+
+        # `type(h).__name__ == "StreamHandler"` matches *only* the base StreamHandler
+        # (not FileHandler, which inherits from it). Use isinstance + exact type check
+        # so mypy narrows `handler` to StreamHandler and can see the `.stream` attribute.
+        stream_handlers = [
+            h for h in root.handlers if isinstance(h, logging.StreamHandler) and type(h) is logging.StreamHandler
+        ]
+        assert stream_handlers, "expected at least one StreamHandler"
+        for handler in stream_handlers:
+            assert handler.stream is sys.stderr, (
+                f"StreamHandler must target stderr (got {handler.stream}); stdout is reserved for command data output."
+            )
 
     def test_idempotent_on_second_call(self, tmp_path: Path) -> None:
         log_file = tmp_path / "test.log"

@@ -10,13 +10,13 @@
 DevBench originally used a Python-heavy orchestration model (referred to internally as main2) where
 behavior was split across two parallel representations per judge:
 
-- `prompts/*.txt` — the LLM system prompt
-- `judges/*.py` — the Python class that gathered evidence and called the LLM
+- `prompts/*.txt` -- the LLM system prompt
+- `judges/*.py` -- the Python class that gathered evidence and called the LLM
 
 And two separate orchestration paths:
 
-- `execution/orchestrator.py` — for unattended (SDK) execution
-- `orchestrator-prompt.md` — loaded interactively via Claude Code session
+- `execution/orchestrator.py` -- for unattended (SDK) execution
+- `orchestrator-prompt.md` -- loaded interactively via Claude Code session
 
 This created compounding maintenance problems:
 
@@ -43,7 +43,7 @@ This created compounding maintenance problems:
 ## Decision
 
 Restructure DevBench as a Claude Code plugin where all orchestration behavior lives in filesystem
-artifacts — agents (`.md`), skills (`SKILL.md`), and hooks (`hooks.json`) — that are loaded
+artifacts -- agents (`.md`), skills (`SKILL.md`), and hooks (`hooks.json`) -- that are loaded
 identically by both interactive (`claude --plugin-dir`) and automated (Agent SDK `query()` with
 `plugins=`) sessions.
 
@@ -58,11 +58,11 @@ structured I/O. No LLM logic remains in Python.
 | `prompts/*.txt` (5 LLM system prompts) | Merged into each agent's `.md` file |
 | `execution/orchestrator.py` | `plugin/devbench/skills/orchestrate/SKILL.md` |
 | `execution/executor.py` | `plugin/devbench/agents/executor.md` |
-| `orchestrator-prompt.md` | Deleted — same `SKILL.md` serves both modes |
+| `orchestrator-prompt.md` | Deleted -- same `SKILL.md` serves both modes |
 | No hooks | `plugin/devbench/hooks/hooks.json` + 7 guard scripts |
 | One global model config | Per-agent `model:` frontmatter |
-| `devbench review <id>` CLI command | Removed — agents invoke directly |
-| `devbench execute <id>` CLI command | Removed — executor agent invoked by orchestrate skill |
+| `devbench review <id>` CLI command | Removed -- agents invoke directly |
+| `devbench execute <id>` CLI command | Removed -- executor agent invoked by orchestrate skill |
 
 ---
 
@@ -110,9 +110,9 @@ tools: Bash
 ---
 ```
 
-Claude Code reads the `model:` field when invoking the agent and routes the inference call to that model. There is no per-role wiring in the Python code — the routing is data-driven by the agent file itself.
+Claude Code reads the `model:` field when invoking the agent and routes the inference call to that model. There is no per-role wiring in the Python code -- the routing is data-driven by the agent file itself.
 
-This was not possible when a single global `JUDGE_CLAUDE_MODEL` applied to all roles. With the per-agent model field, the executor can use Opus (long context, complex implementation), the four review judges can use Sonnet or Haiku (shorter, structured evaluation), and the security reviewer can use Sonnet (security reasoning) — all configured independently and changeable without code changes.
+This was not possible when a single global `JUDGE_CLAUDE_MODEL` applied to all roles. With the per-agent model field, the executor can use Opus (long context, complex implementation), the four review judges can use Sonnet or Haiku (shorter, structured evaluation), and the security reviewer can use Sonnet (security reasoning) -- all configured independently and changeable without code changes.
 
 Agent files live at `plugin/devbench/agents/` (top-level agents: executor, review-supervisor, security-reviewer, blocker-resolver) and `plugin/devbench/agents/review_team/` (the four parallel review judges).
 
@@ -124,7 +124,7 @@ Agent files live at `plugin/devbench/agents/` (top-level agents: executor, revie
 
 - Interactive and automated modes share identical behavior without manual synchronization.
 - Safety hooks propagate into subagents without additional configuration.
-- Adding a new review dimension requires one new `.md` agent file — no Python class, no prompt
+- Adding a new review dimension requires one new `.md` agent file -- no Python class, no prompt
   file, no CLI command.
 - Per-agent model selection optimizes cost and capability by role.
 - The orchestrate skill, executor agent, and review agents are readable and editable by anyone
@@ -151,6 +151,6 @@ Agent files live at `plugin/devbench/agents/` (top-level agents: executor, revie
 
 ## See also
 
-- [architecture.md](../architecture.md) — End-to-end system architecture, diagrams, and current gaps
-- [plugin-architecture.md](../plugin-architecture.md) — Implementation details of the plugin layer this ADR introduced
-- [execution-modes.md](../execution-modes.md) — Per-step lifecycle for both interactive and automated modes
+- [architecture.md](../architecture.md) -- End-to-end system architecture, diagrams, and current gaps
+- [plugin-architecture.md](../plugin-architecture.md) -- Implementation details of the plugin layer this ADR introduced
+- [execution-modes.md](../execution-modes.md) -- Per-step lifecycle for both interactive and automated modes

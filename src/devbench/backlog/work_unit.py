@@ -22,6 +22,8 @@ class WorkUnitStatus(Enum):
     IN_REVIEW = "In Review"
     DONE = "Done"
     BLOCKED = "Blocked"
+    PROPOSED = "Proposed"
+    DECLINED = "Declined"
 
 
 class WorkUnitType(Enum):

@@ -30,7 +30,9 @@ plugin/devbench/
 │   ├── executor.md              ← dev agent: implements work units via TDD
 │   ├── review-supervisor.md     ← discovers and invokes all review_team agents in parallel
 │   ├── security-reviewer.md     ← security review gate agent
-│   ├── blocker-resolver.md      ← dependency blocker assessment agent
+│   ├── blocker-resolver.md      ← dependency blocker assessment agent + proposal emission after amendment reject
+│   ├── manifest-amender.md      ← conditional judge for TDD GREEN manifest amendments
+│   ├── task-factory.md          ← materialises blocker-resolver proposals into draft `proposed` work units
 │   └── review_team/             ← review team agents invoked by review-supervisor
 │       ├── code-reviewer.md     ← SOLID, DRY, fail-fast, 12-factor review
 │       ├── test-reviewer.md     ← TDD discipline, test quality, assertions
@@ -46,7 +48,7 @@ plugin/devbench/
     ├── guard-bash.sh            ← blocks dangerous Bash commands
     ├── guard-backlog.sh         ← blocks direct Bash writes to backlog/ tracking files
     ├── guard-verdict-format.sh  ← validates log-verdict argument format
-    ├── guard-git-stage.sh       ← blocks git commit when no files are staged
+    ├── guard-git-stage.sh       ← blocks `git commit` with nothing staged AND `git add <path>` when path is outside the work unit's Changes Manifest
     ├── guard-work-unit-write.sh ← blocks Write/Edit to work unit .md files
     └── assert-tests-pass.sh     ← enforces test suite passes after Bash
 ```
@@ -170,8 +172,8 @@ For the full hook table (all nine event types and their scripts), see [Hooks lay
 `continue-orchestration.sh` is the headline reliability feature: it prevents Claude Code from stopping mid-loop after context compaction by injecting a continuation instruction with the current task ID, file path, last action, and recommended next step. A circuit breaker with configurable thresholds (`stop_hook.max_blocks`, `stop_hook.window_seconds` in `devbench.yaml`) prevents infinite block-stop loops. See [architecture.md → Hooks layer](architecture.md#9-hooks-layer) for the full design.
 
 Hook exit codes:
-- **Exit 0** — allow the tool call to proceed (or, for Stop hooks, allow the stop)
-- **Exit 2** — block the tool call; stderr shown to the agent as feedback (Stop hooks emit a JSON `{"decision": "block", "reason": "..."}` envelope to the same effect)
+- **Exit 0** -- allow the tool call to proceed (or, for Stop hooks, allow the stop)
+- **Exit 2** -- block the tool call; stderr shown to the agent as feedback (Stop hooks emit a JSON `{"decision": "block", "reason": "..."}` envelope to the same effect)
 
 ---
 
@@ -261,7 +263,7 @@ orchestrator or executor Python modules exist.
 
 ## Workspace Layout
 
-`devbench.yaml` lives at `$JUDGE_WORKSPACE_ROOT/backlog/config/devbench.yaml` — the workspace root,
+`devbench.yaml` lives at `$JUDGE_WORKSPACE_ROOT/backlog/config/devbench.yaml` -- the workspace root,
 one level above the devbench tool repo. It is workspace-specific configuration (target repos,
 branches, merge strategy, timeouts). The plugin is config-agnostic.
 

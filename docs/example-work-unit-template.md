@@ -15,6 +15,17 @@ Placeholder legend:
 
 # {ID}: {Title}
 
+<!--
+Valid status values: in-queue, in-progress, in-review, done, blocked, proposed, declined.
+  - in-queue: default for new work units; actionable.
+  - in-progress: orchestrator has claimed the unit.
+  - in-review: all executor work done; judges are running.
+  - done: work completed and shipped.
+  - blocked: waiting on external resolution (dependency, human, infra).
+  - proposed: task-factory draft awaiting human promotion (inert).
+  - declined: operator has decided this work will never be done (terminal).
+See docs/faq.md and docs/adr/05-declined-status.md for the full semantics.
+-->
 ## Status: in-queue
 
 ## Target Repository
@@ -124,6 +135,15 @@ All code in this work unit MUST comply with the following rules. These are check
 - [ ] AC-SEC-002 No security bypass annotations (`nosec`, `noqa`, `type: ignore`)
 
 ## Changes Manifest
+
+<!--
+This template uses the pre-declared pattern: both the test file and the production file are listed
+so TDD GREEN can stage either or both without tripping the changes_manifest judge. See
+docs/authoring-manifests.md for the alternative patterns:
+  * Pattern 2: test-only, with Approach that says "stop and escalate if production fix is needed"
+  * Pattern 3: rely on the amendment workflow (docs/manifest-amendments.md) -- valid when the fix
+    is genuinely unpredictable at authoring time
+-->
 
 | File | Change |
 |------|--------|

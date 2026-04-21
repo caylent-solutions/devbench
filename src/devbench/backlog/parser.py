@@ -23,10 +23,12 @@ from devbench.constants import (
     BRANCH_NAME_TEMPLATE,
     EPIC_PLACEHOLDER_ID,
     STATUS_BLOCKED,
+    STATUS_DECLINED,
     STATUS_DONE,
     STATUS_IN_PROGRESS,
     STATUS_IN_QUEUE,
     STATUS_IN_REVIEW,
+    STATUS_PROPOSED,
 )
 
 # ---------------------------------------------------------------------------
@@ -40,6 +42,8 @@ _RAW_STATUS_TO_ENUM: dict[str, WorkUnitStatus] = {
     STATUS_IN_REVIEW: WorkUnitStatus.IN_REVIEW,
     STATUS_DONE: WorkUnitStatus.DONE,
     STATUS_BLOCKED: WorkUnitStatus.BLOCKED,
+    STATUS_PROPOSED: WorkUnitStatus.PROPOSED,
+    STATUS_DECLINED: WorkUnitStatus.DECLINED,
 }
 
 # Pattern to determine work-unit type from the last segment of a compound ID.
@@ -184,7 +188,7 @@ class BacklogParser:
 
             # Cross-check: warn when BACKLOG.md index disagrees with the work-unit file.
             # The file is the source of truth (parse_work_unit_file already read it),
-            # so no correction is needed — only observability.
+            # so no correction is needed -- only observability.
             index_status = _RAW_STATUS_TO_ENUM.get(raw_status.lower())
             if index_status is not None and index_status != unit.status:
                 logger.warning(

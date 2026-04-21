@@ -263,3 +263,426 @@ class TestReviewSupervisorUsesJsonEnvelope:
         assert "log-comment" in content, (
             "review-supervisor.md must use log-comment to relay reviewer findings in the FAIL branch."
         )
+
+
+@pytest.mark.unit
+class TestExecutorValidationGateEscalation:
+    """Executor prompt must instruct bug-escalation for validation-gate tasks (ADR-06)."""
+
+    _EXECUTOR_PATH = AGENTS_DIR / "executor.md"
+
+    def test_executor_has_bug_escalation_heading(self) -> None:
+        """The BUG ESCALATION FOR VALIDATION GATES section must exist in executor.md.
+
+        The orchestrate SKILL step 4a branches on .devbench/proposals/<id>.json file
+        existence to decide whether to invoke task-factory. If the executor prompt
+        does not teach the agent to emit that file for validation-gate bugs, the
+        long-term fix for ADR-06 regresses silently.
+        """
+        assert self._EXECUTOR_PATH.exists(), f"executor.md not found at {self._EXECUTOR_PATH}"
+        content = self._EXECUTOR_PATH.read_text()
+        assert "BUG ESCALATION FOR VALIDATION GATES" in content, (
+            "executor.md must contain a 'BUG ESCALATION FOR VALIDATION GATES' section "
+            "per ADR-06 so validation-gate tasks that surface out-of-scope production "
+            "bugs can trigger task-factory via `uv run devbench write-proposal`."
+        )
+
+    def test_executor_bug_escalation_names_write_proposal(self) -> None:
+        """The bug-escalation section must reference `write-proposal` as the emission CLI."""
+        content = self._EXECUTOR_PATH.read_text()
+        heading_pos = content.find("BUG ESCALATION FOR VALIDATION GATES")
+        assert heading_pos >= 0
+        section_body = content[heading_pos:]
+        assert "write-proposal" in section_body, (
+            "The BUG ESCALATION section must name `uv run devbench write-proposal` as "
+            "the command the executor uses to persist the proposal JSON to disk."
+        )
+
+    def test_executor_bug_escalation_verifies_proposal_file(self) -> None:
+        """The section must instruct the agent to verify the proposal file landed on disk."""
+        content = self._EXECUTOR_PATH.read_text()
+        heading_pos = content.find("BUG ESCALATION FOR VALIDATION GATES")
+        section_body = content[heading_pos:]
+        assert "test -f" in section_body and ".devbench/proposals/" in section_body, (
+            "The BUG ESCALATION section must instruct the agent to `test -f "
+            "$JUDGE_WORKSPACE_ROOT/.devbench/proposals/<id>.json` after write-proposal; "
+            "the orchestrate SKILL branches on file existence, so a missing file silently "
+            "suppresses task-factory."
+        )
+
+
+@pytest.mark.unit
+class TestSkillValidationGateEscalationBranch:
+    """Orchestrate SKILL must have a step 4a branch that fires task-factory on executor-emitted proposals."""
+
+    _SKILL_PATH = Path(__file__).parent.parent.parent / "plugin" / "devbench" / "skills" / "orchestrate" / "SKILL.md"
+
+    def test_skill_file_exists(self) -> None:
+        assert self._SKILL_PATH.exists(), f"orchestrate/SKILL.md not found at {self._SKILL_PATH}"
+
+    def test_skill_has_validation_gate_branch(self) -> None:
+        """SKILL.md must contain a step 4a that handles validation-gate bug escalation."""
+        content = self._SKILL_PATH.read_text()
+        assert "4a." in content, "SKILL.md must declare a step 4a for validation-gate bug escalation."
+        assert "Validation-gate bug-escalation" in content or "validation-gate bug-escalation" in content.lower(), (
+            "SKILL.md step 4a must name the validation-gate bug-escalation trigger explicitly."
+        )
+
+    def test_skill_step_4a_branches_on_proposal_file(self) -> None:
+        """Step 4a must branch on `.devbench/proposals/<id>.json` existence (deterministic trigger)."""
+        content = self._SKILL_PATH.read_text()
+        assert ".devbench/proposals/" in content, (
+            "SKILL.md must reference `.devbench/proposals/<id>.json` -- the file-existence trigger."
+        )
+        assert "test -f" in content, (
+            "SKILL.md step 4a must use `test -f` to check for the proposal file; "
+            "the trigger must be deterministic, not verdict-word-based."
+        )
+
+    def test_skill_step_4a_short_circuits_on_amendment_file(self) -> None:
+        """When an amendment file ALSO exists, step 4a must defer to step 4b/4c to avoid double-fire."""
+        content = self._SKILL_PATH.read_text()
+        assert ".devbench/amendments/" in content, (
+            "SKILL.md step 4a must reference `.devbench/amendments/<id>.json` so it knows to "
+            "skip the validation-gate branch when the amendment path is already handling the task."
+        )
+
+
+@pytest.mark.unit
+class TestSkillSubagentTextIsDiagnostic:
+    """SKILL.md must explicitly forbid treating subagent prose as loop-control directives.
+
+    Prior incident: an executor log-comment opened with "Halting orchestration: ..." and
+    the orchestrator LLM obeyed that as a control directive instead of following the
+    halt-discipline rule. The SKILL now carries explicit language that subagent text is
+    diagnostic only, and loop control is owned exclusively by `devbench next` + the
+    stop-hook circuit breaker.
+    """
+
+    _SKILL_PATH = Path(__file__).parent.parent.parent / "plugin" / "devbench" / "skills" / "orchestrate" / "SKILL.md"
+
+    def test_skill_declares_subagent_text_is_diagnostic(self) -> None:
+        """SKILL must declare that subagent text is not control flow."""
+        content = self._SKILL_PATH.read_text()
+        assert "Subagent text is diagnostic" in content or "subagent text is diagnostic" in content.lower(), (
+            "SKILL.md must include a 'Subagent text is diagnostic' section explicitly forbidding "
+            "treatment of subagent prose as loop-control directives."
+        )
+
+    def test_skill_lists_control_language_patterns(self) -> None:
+        """SKILL must enumerate the prose patterns that MUST NOT change loop behavior."""
+        content = self._SKILL_PATH.read_text().lower()
+        for phrase in ("halt", "halting", "operator action required", "resume orchestration"):
+            assert phrase in content, (
+                f"SKILL.md must explicitly name {phrase!r} as a prose pattern the orchestrator must ignore."
+            )
+
+    def test_skill_names_guard_comment_format_backstop(self) -> None:
+        """SKILL must point to the deterministic hook as the floor defense."""
+        content = self._SKILL_PATH.read_text()
+        assert "guard-comment-format" in content, (
+            "SKILL.md must reference guard-comment-format.sh so readers know which component "
+            "provides the deterministic backstop for the prose-level rule."
+        )
+
+    def test_skill_states_only_halt_triggers(self) -> None:
+        """SKILL must explicitly say the ONLY halt triggers are file/exit-code based."""
+        content = self._SKILL_PATH.read_text().lower()
+        assert "only halt triggers" in content or "only halt trigger" in content, (
+            "SKILL.md must explicitly state the ONLY halt triggers so LLMs cannot be persuaded "
+            "by prose to consider any other signal a halt."
+        )
+
+
+@pytest.mark.unit
+class TestExecutorCommentLanguageDiscipline:
+    """Executor prompt must instruct the agent to avoid halt-imperatives in log-comment text."""
+
+    _EXECUTOR_PATH = AGENTS_DIR / "executor.md"
+
+    def test_executor_has_comment_language_discipline_heading(self) -> None:
+        """The COMMENT LANGUAGE DISCIPLINE section must exist in executor.md."""
+        content = self._EXECUTOR_PATH.read_text()
+        assert "COMMENT LANGUAGE DISCIPLINE" in content, (
+            "executor.md must contain a 'COMMENT LANGUAGE DISCIPLINE' section that forbids "
+            "halt-imperatives in log-comment bodies."
+        )
+
+    def test_executor_enumerates_forbidden_phrases(self) -> None:
+        """The section must list the forbidden phrases so the agent can self-check before calling log-comment."""
+        content = self._EXECUTOR_PATH.read_text().lower()
+        heading_pos = content.find("comment language discipline")
+        assert heading_pos >= 0
+        section_body = content[heading_pos:]
+        for phrase in ("halt orchestration", "operator action required", "resume orchestration once"):
+            assert phrase in section_body, (
+                f"executor.md COMMENT LANGUAGE DISCIPLINE section must list {phrase!r} "
+                "so the agent can avoid it BEFORE the hook rejects its call."
+            )
+
+    def test_executor_points_at_guard_comment_format(self) -> None:
+        """The section must name the hook that enforces the rule so the agent knows the consequence."""
+        content = self._EXECUTOR_PATH.read_text()
+        heading_pos = content.find("COMMENT LANGUAGE DISCIPLINE")
+        section_body = content[heading_pos:]
+        assert "guard-comment-format" in section_body, (
+            "executor.md COMMENT LANGUAGE DISCIPLINE section must reference guard-comment-format.sh "
+            "so the agent knows which hook will reject its call if it violates the rule."
+        )
+
+    def test_executor_gives_good_and_bad_example(self) -> None:
+        """The section must contain concrete before/after examples for the agent to pattern-match against."""
+        content = self._EXECUTOR_PATH.read_text()
+        heading_pos = content.find("COMMENT LANGUAGE DISCIPLINE")
+        section_body = content[heading_pos:]
+        assert "**Bad**" in section_body, "Need a Bad example the hook rejects."
+        assert "**Good**" in section_body, "Need a Good example the hook accepts."
+
+    def test_executor_forbids_bypass_annotations_for_this_rule(self) -> None:
+        """The section must explicitly tell the agent not to try to bypass the hook."""
+        content = self._EXECUTOR_PATH.read_text()
+        heading_pos = content.find("COMMENT LANGUAGE DISCIPLINE")
+        section_body = content[heading_pos:]
+        assert "bypass" in section_body.lower() or "evade" in section_body.lower(), (
+            "executor.md must explicitly forbid bypass attempts so the agent does not try "
+            "to add noqa-style annotations to get around the hook."
+        )
+
+
+@pytest.mark.unit
+class TestReviewSupervisorCanonicalJudgeNames:
+    """ADR-08 slice G: supervisor must use underscored canonical judge names in log-verdict."""
+
+    _SUPERVISOR_PATH = AGENTS_DIR / "review-supervisor.md"
+
+    _CANONICAL_JUDGE_NAMES = (
+        "code_review",
+        "test_review",
+        "doc_review",
+        "changes_manifest",
+        "security_review",
+    )
+
+    _HYPHENATED_REVIEWER_NAMES = (
+        "code-reviewer",
+        "test-reviewer",
+        "doc-reviewer",
+    )
+
+    def test_supervisor_contains_all_canonical_judge_names(self) -> None:
+        """Each underscored name must appear in the supervisor's log-verdict examples."""
+        content = self._SUPERVISOR_PATH.read_text()
+        for name in self._CANONICAL_JUDGE_NAMES:
+            assert name in content, (
+                f"review-supervisor.md must reference canonical judge name '{name}' "
+                "so the supervisor emits the exact string the done-gate parser looks for."
+            )
+
+    def test_supervisor_has_no_hyphenated_log_verdict_calls(self) -> None:
+        """Regression pin: no ``log-verdict <hyphenated-name>`` examples in supervisor."""
+        content = self._SUPERVISOR_PATH.read_text()
+        for name in self._HYPHENATED_REVIEWER_NAMES:
+            bad = f"log-verdict {name}"
+            assert bad not in content, (
+                f"review-supervisor.md must not contain '{bad}'. "
+                "Hyphenated reviewer frontmatter names do not match the done-gate parser's "
+                "canonical underscored set. Use e.g. 'log-verdict code_review' instead."
+            )
+
+    def test_supervisor_has_mapping_or_warning(self) -> None:
+        """Prompt must explicitly warn against deriving the judge name from frontmatter."""
+        content = self._SUPERVISOR_PATH.read_text().lower()
+        assert "frontmatter" in content or "canonical" in content, (
+            "review-supervisor.md must contain a caution or mapping that steers the agent "
+            "away from the reviewer's frontmatter name toward the canonical underscored form."
+        )
+
+
+@pytest.mark.unit
+class TestBlockerResolverSuggestedApproachStructure:
+    """ADR-08 slice H: blocker-resolver must require the four-section suggested_approach."""
+
+    _BLOCKER_RESOLVER_PATH = AGENTS_DIR / "blocker-resolver.md"
+
+    def test_prompt_requires_four_sections(self) -> None:
+        """The prompt must name the four required sections so produced drafts are not thin."""
+        content = self._BLOCKER_RESOLVER_PATH.read_text()
+        for label in ("Context", "Scope", "TDD approach", "Verify"):
+            assert label in content, (
+                f"blocker-resolver.md must name '{label}' as a required section of suggested_approach."
+            )
+
+
+@pytest.mark.unit
+class TestTaskFactoryTodoRowRefusal:
+    """ADR-08 slice H: task-factory must warn about thin-approach and TODO-row refusal."""
+
+    _TASK_FACTORY_PATH = AGENTS_DIR / "task-factory.md"
+
+    def test_prompt_mentions_todo_row_refusal(self) -> None:
+        """The prompt must explain that literal 'TODO -- describe change' rows cause refusal."""
+        content = self._TASK_FACTORY_PATH.read_text()
+        assert "TODO -- describe change" in content, (
+            "task-factory.md must warn that a literal 'TODO -- describe change' Changes Manifest row "
+            "will be refused by materialise-proposal so drafts never enter the backlog half-written."
+        )
+
+    def test_prompt_mentions_thin_approach_refusal(self) -> None:
+        """The prompt must explain that a too-short suggested_approach causes refusal."""
+        content = self._TASK_FACTORY_PATH.read_text().lower()
+        assert "thin" in content or "too short" in content or "too terse" in content, (
+            "task-factory.md must explain that thin/short suggested_approach values "
+            "cause materialise-proposal to refuse."
+        )
+
+
+@pytest.mark.unit
+class TestExecutorPreFlightAndAmendmentScope:
+    """ADR-08 slice I: executor must have pre-flight reset + amendment-scope discipline."""
+
+    _EXECUTOR_PATH = AGENTS_DIR / "executor.md"
+
+    def test_executor_has_preflight_reset_section(self) -> None:
+        """Executor must contain a pre-flight reset step so target-repo pollution is cleaned."""
+        content = self._EXECUTOR_PATH.read_text().lower()
+        assert "pre-flight" in content, (
+            "executor.md must contain a 'pre-flight' step that cleans target-repo state "
+            "before TDD RED to avoid contaminating the next task's scope."
+        )
+        assert "target-repo state" in content or "working tree" in content, (
+            "executor.md pre-flight step must reference the target-repo working-tree cleanup."
+        )
+
+    def test_executor_preflight_references_git_status(self) -> None:
+        """The pre-flight step must name the command the executor runs to detect pollution."""
+        content = self._EXECUTOR_PATH.read_text()
+        assert "git" in content.lower() and "status" in content.lower(), (
+            "executor.md pre-flight step must name a git command (status/restore/etc.) "
+            "so the agent can execute the cleanup concretely."
+        )
+
+    def test_executor_forbids_unrelated_files_in_amendment(self) -> None:
+        """Amendment-scope tightening must forbid pulling unrelated dirty files into an amendment."""
+        content = self._EXECUTOR_PATH.read_text().lower()
+        assert "amendment" in content, "executor.md must reference amendments."
+        # The key rule: do not include pre-existing pollution in an amendment request.
+        assert "pre-existing" in content or "unrelated" in content, (
+            "executor.md amendment section must explicitly forbid including pre-existing / unrelated "
+            "dirty files in an amendment request."
+        )
+
+
+@pytest.mark.unit
+class TestBlockerResolverAffectedTaskIdsInstruction:
+    """ADR-10 regression pin: blocker-resolver + executor prompts document `affected_task_ids`."""
+
+    _BLOCKER_RESOLVER_PATH = AGENTS_DIR / "blocker-resolver.md"
+    _EXECUTOR_PATH = AGENTS_DIR / "executor.md"
+
+    def test_blocker_resolver_documents_affected_task_ids(self) -> None:
+        content = self._BLOCKER_RESOLVER_PATH.read_text()
+        assert "affected_task_ids" in content, (
+            "blocker-resolver.md must document the affected_task_ids field so agents know when to populate it."
+        )
+
+    def test_blocker_resolver_describes_evidence_rubric(self) -> None:
+        """The prompt must tell the agent what evidence qualifies a peer for the field."""
+        content = self._BLOCKER_RESOLVER_PATH.read_text().lower()
+        # Evidence rubric keywords -- at least one of these three must appear near
+        # the affected_task_ids discussion so the agent doesn't speculate.
+        assert "evidence" in content, "blocker-resolver.md must require evidence before populating affected_task_ids"
+        assert "same failing test" in content or "same production file" in content, (
+            "blocker-resolver.md must list concrete shared-blocker evidence examples"
+        )
+
+    def test_blocker_resolver_forbids_self_reference(self) -> None:
+        """The prompt must warn against listing source_task_id itself in affected_task_ids."""
+        content = self._BLOCKER_RESOLVER_PATH.read_text()
+        assert "source_task_id" in content and "affected_task_ids" in content
+        # Look for the "do not list source" directive somewhere in the same file.
+        lowered = content.lower()
+        assert "do not list" in lowered or "must not appear" in lowered or "do not speculate" in lowered, (
+            "blocker-resolver.md must instruct the agent not to list source_task_id or speculate"
+        )
+
+    def test_executor_cross_references_affected_task_ids(self) -> None:
+        content = self._EXECUTOR_PATH.read_text()
+        assert "affected_task_ids" in content, (
+            "executor.md validation-gate section must reference affected_task_ids so "
+            "validation-gate-emitted proposals populate it when applicable."
+        )
+
+
+ALL_REVIEW_JUDGE_PATHS = [
+    REVIEW_TEAM_DIR / "code-reviewer.md",
+    REVIEW_TEAM_DIR / "test-reviewer.md",
+    REVIEW_TEAM_DIR / "doc-reviewer.md",
+    REVIEW_TEAM_DIR / "changes-manifest.md",
+    AGENTS_DIR / "security-reviewer.md",
+]
+
+
+@pytest.mark.unit
+class TestReviewJudgesUseGetDiffForScope:
+    """ADR-12: all five review judges must use `devbench get-diff` for scope
+    and carry the scope-contract line that pins the anti-pattern.
+
+    These tests are regression pins -- they exist so that a future prompt
+    edit that reintroduces `git diff origin/main` or drops the
+    ADR-12 contract line will fail CI before merging.
+    """
+
+    @pytest.mark.parametrize("judge_path", ALL_REVIEW_JUDGE_PATHS, ids=lambda p: p.name)
+    def test_every_review_judge_invokes_devbench_get_diff_at_prompt_top(self, judge_path: Path) -> None:
+        """Each of the 5 judges must invoke `uv run devbench get-diff $ARGUMENTS`
+        before the main body of instructions. Salience at the top is what
+        makes the scope contract stick; placing it lower risks the judge
+        reading half the rubric before seeing the scope constraint."""
+        content = judge_path.read_text(encoding="utf-8")
+        invocation = "`uv run devbench get-diff $ARGUMENTS`"
+        assert invocation in content, (
+            f"{judge_path.name} must invoke `uv run devbench get-diff $ARGUMENTS` "
+            "as the authoritative scope source per ADR-12."
+        )
+        body_markers = ["You are a strict", "You are the "]
+        body_positions = [content.find(m) for m in body_markers if m in content]
+        assert body_positions, f"{judge_path.name} does not contain a 'You are...' body marker to anchor on."
+        body_start = min(body_positions)
+        invocation_pos = content.find(invocation)
+        assert invocation_pos < body_start, (
+            f"{judge_path.name} places `devbench get-diff` at offset {invocation_pos} "
+            f"but the instruction body starts at offset {body_start}; "
+            "the get-diff invocation MUST appear before the instruction body."
+        )
+
+    @pytest.mark.parametrize("judge_path", ALL_REVIEW_JUDGE_PATHS, ids=lambda p: p.name)
+    def test_no_review_judge_contains_git_diff_origin_main_antipattern(self, judge_path: Path) -> None:
+        """ADR-12 anti-pattern: a judge prompt must never instruct the agent to
+        compute its own `git diff origin/main` or `git diff main...HEAD` scope.
+        Those views double-count prior tasks on single-branch + defer_pr mode."""
+        content = judge_path.read_text(encoding="utf-8")
+        forbidden = [
+            "git diff origin/main",
+            "git diff main...HEAD",
+            "git diff main..HEAD",
+        ]
+        for pattern in forbidden:
+            if pattern in content:
+                idx = content.find(pattern)
+                preamble = content[max(0, idx - 300) : idx]
+                preamble_lower = preamble.lower()
+                assert "Do NOT" in preamble or "do not run" in preamble_lower, (
+                    f"{judge_path.name} contains `{pattern}` outside the ADR-12 anti-pattern warning. "
+                    "This is the exact pattern that caused the 2026-04-20 judge misread."
+                )
+
+    @pytest.mark.parametrize("judge_path", ALL_REVIEW_JUDGE_PATHS, ids=lambda p: p.name)
+    def test_every_review_judge_references_adr_12_scope_contract(self, judge_path: Path) -> None:
+        """Each judge prompt must carry the ADR-12 scope-contract line that
+        names get-diff as authoritative and warns against raw git."""
+        content = judge_path.read_text(encoding="utf-8")
+        assert "Scope contract" in content, f"{judge_path.name} must include a **Scope contract:** line per ADR-12."
+        assert "ADR-12" in content, f"{judge_path.name} must reference ADR-12 so readers can trace the rationale."
+        assert "AUTHORITATIVE" in content, (
+            f"{judge_path.name} must state that `devbench get-diff` is the AUTHORITATIVE scope source."
+        )

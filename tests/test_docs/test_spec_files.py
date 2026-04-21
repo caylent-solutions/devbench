@@ -8,7 +8,6 @@ import pytest
 
 REPO_ROOT = Path(__file__).parent.parent.parent
 SPEC_ATTN = REPO_ROOT / "docs" / "spec-operator-attention-alerts.md"
-ROADMAP = REPO_ROOT / "docs" / "roadmap.md"
 
 
 @pytest.mark.unit
@@ -39,14 +38,6 @@ class TestOperatorAttentionAlertSpec:
         text = SPEC_ATTN.read_text(encoding="utf-8")
         assert "classify_proposed_task" in text
         assert "classify_blocked_task" in text
-
-    def test_roadmap_links_to_spec_file(self) -> None:
-        """roadmap.md carries a bullet pointing at the spec file so it does not get lost."""
-        text = ROADMAP.read_text(encoding="utf-8")
-        assert "spec-operator-attention-alerts.md" in text, (
-            "docs/roadmap.md must link to the spec file so a reader searching "
-            "the roadmap discovers the future-work design."
-        )
 
     def test_adr_10_links_to_spec_file(self) -> None:
         """ADR-10 mentions the spec in its Downstream observability subsection."""

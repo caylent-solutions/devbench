@@ -556,12 +556,11 @@ Configuration is under `stop_hook:` in the YAML, with env var overrides `JUDGE_S
 
 ## 10. Current gaps (known limitations)
 
-Pulled from the in-queue items in [roadmap.md](roadmap.md) and the architecture audit:
+Current gaps are tracked as GitHub issues on [caylent-solutions/devbench](https://github.com/caylent-solutions/devbench/issues) under the `enhancement` and `tech-debt` labels. Representative examples from the architecture audit:
 
-- **Configuration completeness**: Not all model selection / timeout values are YAML-configurable yet (E210). Some values still require env-var overrides.
-- **Misleading class name**: `GitOpsJudge` should be `GitOpsService` -- it isn't actually a judge in the LLM-judge sense (E214). Pure rename, no behavior change.
-- **Branch uniqueness**: `validate-backlog` doesn't catch branch-name collisions across work units (E219). Manual editing of the Branch field in two units to the same value will not error.
-- **Work-unit scaffolding**: No CLI command to scaffold a new epic / feature / story / task from a template (E223). Authors copy-paste from `docs/example-work-unit-template.md` today.
+- **Misleading class name**: `GitOpsJudge` should be `GitOpsService` -- it isn't actually a judge in the LLM-judge sense. Pure rename, no behavior change.
+- **Branch uniqueness**: `validate-backlog` doesn't catch branch-name collisions across work units. Manual editing of the Branch field in two units to the same value will not error.
+- **Work-unit scaffolding**: No CLI command to scaffold a new epic / feature / story / task from a template. Authors copy-paste from `docs/example-work-unit-template.md` today.
 - **`hold` status not implemented**: The `hold` status (for paused-by-human work) is planned but not implemented (E222). This blocks E215 and E220.
 - **No `status --detail` flag**: Backlog status output is summary-only; no per-unit drill-down (E220, blocked on E222).
 - **Dependency integrity gaps**: `_deps_satisfied` only checks task-to-task dependencies, not task-to-epic / feature / story (E215, blocked on E222).
@@ -621,4 +620,3 @@ If you find a new issue, file it on the ROADMAP rather than this section.
 - [plugin-architecture.md](plugin-architecture.md) -- Plugin / agent / hook implementation details
 - [llm-authentication.md](llm-authentication.md) -- How devbench authenticates with the Claude API and Bedrock
 - [adr/01-claude-agent-sdk-with-plugins.md](adr/01-claude-agent-sdk-with-plugins.md) -- The decision record behind the SDK + plugins architecture
-- [roadmap.md](roadmap.md) -- In-queue, blocked, and technical-debt items

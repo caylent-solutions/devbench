@@ -1,4 +1,4 @@
-"""Structural pins for root-level spec / future-work files (ADR-10 slice H)."""
+"""Structural pins for spec / future-work files under docs/ (ADR-10 slice H)."""
 
 from __future__ import annotations
 
@@ -7,17 +7,17 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).parent.parent.parent
-SPEC_ATTN = REPO_ROOT / "SPEC-OPERATOR-ATTENTION-ALERTS.md"
-ROADMAP = REPO_ROOT / "ROADMAP.md"
+SPEC_ATTN = REPO_ROOT / "docs" / "spec-operator-attention-alerts.md"
+ROADMAP = REPO_ROOT / "docs" / "roadmap.md"
 
 
 @pytest.mark.unit
 class TestOperatorAttentionAlertSpec:
-    """ADR-10 slice H: the spec file exists at the repo root and carries the expected structure."""
+    """ADR-10 slice H: the spec file exists under docs/ and carries the expected structure."""
 
-    def test_operator_attention_alert_spec_exists_at_repo_root(self) -> None:
+    def test_operator_attention_alert_spec_exists_under_docs(self) -> None:
         assert SPEC_ATTN.is_file(), (
-            "SPEC-OPERATOR-ATTENTION-ALERTS.md must exist at the repo root -- ROADMAP and ADR-10 both link to it."
+            "docs/spec-operator-attention-alerts.md must exist -- roadmap.md and ADR-10 both link to it."
         )
 
     def test_spec_file_lists_three_design_options(self) -> None:
@@ -41,16 +41,17 @@ class TestOperatorAttentionAlertSpec:
         assert "classify_blocked_task" in text
 
     def test_roadmap_links_to_spec_file(self) -> None:
-        """ROADMAP.md carries a bullet pointing at the spec file so it does not get lost."""
+        """roadmap.md carries a bullet pointing at the spec file so it does not get lost."""
         text = ROADMAP.read_text(encoding="utf-8")
-        assert "SPEC-OPERATOR-ATTENTION-ALERTS.md" in text, (
-            "ROADMAP.md must link to the spec file so a reader searching the roadmap discovers the future-work design."
+        assert "spec-operator-attention-alerts.md" in text, (
+            "docs/roadmap.md must link to the spec file so a reader searching "
+            "the roadmap discovers the future-work design."
         )
 
     def test_adr_10_links_to_spec_file(self) -> None:
         """ADR-10 mentions the spec in its Downstream observability subsection."""
         adr_10 = REPO_ROOT / "docs" / "adr" / "10-multi-target-proposal-wiring.md"
         text = adr_10.read_text(encoding="utf-8")
-        assert "SPEC-OPERATOR-ATTENTION-ALERTS.md" in text, (
+        assert "spec-operator-attention-alerts.md" in text, (
             "ADR-10 must cross-reference the spec file so the design context is discoverable."
         )

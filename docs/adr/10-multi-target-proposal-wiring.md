@@ -64,7 +64,7 @@ The ADR-07 cascade itself is unchanged: it already iterates per-marker correctly
 
 The multi-target wiring naturally pairs with a blocked-count split in `devbench status` and `devbench report` (shipped in the same PR): blocked tasks with active markers render under a `(auto-clearing)` header because they are waiting for the cascade; blocked tasks without markers or with stale markers render under a `(needs-operator-attention)` header because the operator has to make a decision. The split lets humans scan only the attention group.
 
-The blocked-split UX is the current state; operator alerting of attention-class blocks and proposed drafts is scoped for a follow-up and tracked in [SPEC-OPERATOR-ATTENTION-ALERTS.md](../../SPEC-OPERATOR-ATTENTION-ALERTS.md).
+The blocked-split UX is the current state; operator alerting of attention-class blocks and proposed drafts is scoped for a follow-up and tracked in [spec-operator-attention-alerts.md](../spec-operator-attention-alerts.md).
 
 ## Alternatives considered and rejected
 
@@ -102,4 +102,4 @@ The blocked-split UX is the current state; operator alerting of attention-class 
 - `docs/architecture.md` (task-factory capability bullet).
 - `docs/faq.md` (sibling-task-did-not-unblock Q&A).
 - [ADR-07](07-auto-requeue-on-proposal-completion.md), [ADR-08](08-proposal-lifecycle-observability.md), [ADR-09](09-idempotent-materialise-proposal.md) -- cross-references note that this ADR does not change their bodies.
-- `SPEC-OPERATOR-ATTENTION-ALERTS.md` -- scoped follow-up.
+- `docs/spec-operator-attention-alerts.md` -- scoped follow-up.

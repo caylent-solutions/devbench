@@ -1,7 +1,7 @@
 # SPEC: Operator-attention alerting surface
 
 > **Status:** Future work. Design sketch only; no implementation.
-> Tracked in [ROADMAP.md](ROADMAP.md). Referenced from [ADR-10](docs/adr/10-multi-target-proposal-wiring.md).
+> Tracked in [roadmap.md](roadmap.md). Referenced from [ADR-10](adr/10-multi-target-proposal-wiring.md).
 
 This document captures the design context for a future devbench feature that proactively notifies a human when a decision-requiring item exists. It ships as a spec so the reasoning and trade-offs are preserved when an implementer eventually picks it up. Nothing in this file is a decision; every option enumerated below is still open.
 
@@ -10,7 +10,7 @@ This document captures the design context for a future devbench feature that pro
 Devbench today surfaces two classes of items that require a human decision:
 
 1. **Proposed drafts** -- work units at `## Status: proposed` that the operator must `promote-proposal` or `reject-proposal`. Task-factory materialises these from proposal JSONs; the orchestrator's `devbench next` intentionally skips them (they are inert by design).
-2. **Blocked tasks classified as `NEEDS_OPERATOR_ATTENTION`** -- tasks in `## Status: blocked` whose `[BLOCKED_PENDING_PROPOSAL]` markers are absent, incomplete, or already terminal. See [ADR-10 slice G](docs/adr/10-multi-target-proposal-wiring.md) for the `classify_blocked_task` contract.
+2. **Blocked tasks classified as `NEEDS_OPERATOR_ATTENTION`** -- tasks in `## Status: blocked` whose `[BLOCKED_PENDING_PROPOSAL]` markers are absent, incomplete, or already terminal. See [ADR-10 slice G](adr/10-multi-target-proposal-wiring.md) for the `classify_blocked_task` contract.
 
 The operator discovers both of these today by polling: running `devbench status`, `devbench report`, and `devbench list-proposals` on some cadence the operator chooses. A long-running orchestrate session can accumulate hours of latency before the operator glances at the terminal and realises something is waiting. The polling works, but there is no active signal telling the operator when it is worth looking.
 
@@ -59,7 +59,7 @@ The orchestrate SKILL's step-0 tick writes one line per attention item at the en
 
 ### Option C -- `devbench watch` panel extension
 
-Adds a new "Attention needed (N)" panel to the existing `devbench watch` dashboard (see [docs/watch-activity.md](docs/watch-activity.md)). The panel lists every attention item; when N is zero, the panel renders a short green "Nothing needs your attention" line.
+Adds a new "Attention needed (N)" panel to the existing `devbench watch` dashboard (see [watch-activity.md](watch-activity.md)). The panel lists every attention item; when N is zero, the panel renders a short green "Nothing needs your attention" line.
 
 **Pros.**
 - Zero new commands.

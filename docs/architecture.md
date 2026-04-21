@@ -556,7 +556,7 @@ Configuration is under `stop_hook:` in the YAML, with env var overrides `JUDGE_S
 
 ## 10. Current gaps (known limitations)
 
-Pulled from the in-queue items in [ROADMAP.md](../ROADMAP.md) and the architecture audit:
+Pulled from the in-queue items in [roadmap.md](roadmap.md) and the architecture audit:
 
 - **Configuration completeness**: Not all model selection / timeout values are YAML-configurable yet (E210). Some values still require env-var overrides.
 - **Misleading class name**: `GitOpsJudge` should be `GitOpsService` -- it isn't actually a judge in the LLM-judge sense (E214). Pure rename, no behavior change.
@@ -621,4 +621,4 @@ If you find a new issue, file it on the ROADMAP rather than this section.
 - [plugin-architecture.md](plugin-architecture.md) -- Plugin / agent / hook implementation details
 - [llm-authentication.md](llm-authentication.md) -- How devbench authenticates with the Claude API and Bedrock
 - [adr/01-claude-agent-sdk-with-plugins.md](adr/01-claude-agent-sdk-with-plugins.md) -- The decision record behind the SDK + plugins architecture
-- [ROADMAP.md](../ROADMAP.md) -- In-queue, blocked, and technical-debt items
+- [roadmap.md](roadmap.md) -- In-queue, blocked, and technical-debt items

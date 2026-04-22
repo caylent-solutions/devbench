@@ -86,7 +86,7 @@ uv run devbench hook-tail [<path>] [--tz <zone>] [--no-follow] [--from-start]
 Read-only pretty-tail of the plugin hook event stream (`hook-logs.jsonl`). One-line colourised summary per PreToolUse / PostToolUse / SubagentStart / SubagentStop / Stop event. Complements `watch`: where `watch` shows current state, `hook-tail` shows events as they happen.
 
 - `<path>` defaults to `$JUDGE_WORKSPACE_ROOT/hook-logs.jsonl`.
-- `--tz <zone>` overrides the display timezone (any IANA zone, for example `America/Denver`). Internal storage stays in UTC.
+- `--tz <zone>` overrides the display timezone (any IANA zone, for example `America/Denver`). When `--tz` is absent, `hook-tail` falls back to the top-level `display_timezone:` yaml key (or `JUDGE_DISPLAY_TIMEZONE` env), then to OS local. Internal storage stays in UTC.
 - `--no-follow` exits after emitting existing events instead of tailing.
 - `--from-start` emits every event from the beginning of the file before entering follow mode.
 

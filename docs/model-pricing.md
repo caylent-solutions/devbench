@@ -168,16 +168,60 @@ These reflect current **Opus 4.7** pricing and Anthropic's published cache/data-
 
 ### Other settings under `report:`
 
-The `report:` section also accepts a `display_timezone` field (IANA zone name) to control which timezone the report renders timestamps in:
+The `report:` section also accepts a `display_timezone` field (IANA zone name) to control which timezone the report renders timestamps in. **Prefer the top-level `display_timezone:` key** (see [Display timezone](#display-timezone) below) for consistency with `devbench hook-tail` and other timestamp-rendering commands. The report-specific `report.display_timezone:` is retained as a higher-priority override for the report command only.
 
 ```yaml
 report:
   token_cost_per_million_input: 5.0
   token_cost_per_million_output: 25.0
-  display_timezone: America/Denver   # optional; defaults to system local TZ
+  display_timezone: America/Denver   # optional report-specific override; defaults to top-level display_timezone, then system local TZ
 ```
 
-When unset (or set to a name that isn't a valid IANA zone), the report falls back to the host's system local timezone. Override per-invocation via `JUDGE_REPORT_TIMEZONE=<zone>`. This setting is useful when running devbench inside a devcontainer or VM whose system clock is UTC but you want to read timestamps in your actual location's TZ.
+When unset (or set to a name that isn't a valid IANA zone), the report falls back to the top-level `display_timezone`, then to the host's system local timezone. Override per-invocation via `JUDGE_REPORT_TIMEZONE=<zone>`.
+
+---
+
+## Discount / correction factor off list pricing
+
+If your organisation negotiated a flat contract reduction on token pricing (AWS EDP, Azure EA, Anthropic enterprise, etc.), set `report.token_cost_discount` to the **fraction reduced from list price**. Every per-call calculated cost and every ETA-projected total-cost value in `devbench report` is reduced by that fraction before display, so the dollar figures match what finance reconciles.
+
+The value is a discount (reduction), sometimes also called a correction factor. Semantics: `final_cost = raw_list_cost x (1 - token_cost_discount)`. Specify the **discount itself**, not the pay-rate. If you only know the fraction you pay, convert first: `discount = 1 - pay_rate`.
+
+| Discount                    | Fraction paid     | Percent off list       |
+|-----------------------------|-------------------|------------------------|
+| `0.0` (default)             | `1.0`             | 0% (pay full list)     |
+| `0.25`                      | `0.75`            | 25%                    |
+| `0.40363636364`             | `0.59636363636`   | 40.3636364%            |
+| `0.5`                       | `0.5`             | 50%                    |
+| `1.0`                       | `0.0`             | 100% (free, rare)      |
+
+```yaml
+report:
+  # 40.3636364% off list  (equivalently: pay 59.6363636% of list)
+  token_cost_discount: 0.40363636364
+```
+
+Override via env: `JUDGE_REPORT_TOKEN_COST_DISCOUNT=0.40363636364`. Default: `0.0`.
+
+Applies uniformly to input, output, cache reads, and cache writes (5-min and 1-hr). Cache multipliers stay as pure ratios; the discount is applied at the base input/output rate before cache multipliers evaluate.
+
+---
+
+## Display timezone
+
+The top-level `display_timezone:` yaml key applies to **every devbench command that renders timestamps** -- `devbench report`, `devbench hook-tail`, `devbench watch`, and any future command. When unset, each command defaults to the host's OS local timezone.
+
+```yaml
+# Top level (preferred): applies to every timestamp-rendering command.
+display_timezone: America/New_York
+```
+
+Override per-invocation via the `JUDGE_DISPLAY_TIMEZONE` env var. Per-command overrides still apply on top of this global:
+
+- `devbench report` reads `report.display_timezone` (yaml) or `JUDGE_REPORT_TIMEZONE` (env) first, then falls back to `display_timezone` / `JUDGE_DISPLAY_TIMEZONE`.
+- `devbench hook-tail` reads the CLI `--tz <zone>` flag first, then falls back to `display_timezone` / `JUDGE_DISPLAY_TIMEZONE`.
+
+Resolution order (per command): CLI flag or command-specific override > `JUDGE_DISPLAY_TIMEZONE` env > top-level `display_timezone` yaml > OS local.
 
 ---
 

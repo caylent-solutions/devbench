@@ -1201,8 +1201,13 @@ def cmd_hook_tail(*argv: str) -> int:
         print(f"ERROR: unexpected positional argument: {arg}", file=sys.stderr)
         return 2
 
+    # Precedence: CLI --tz > JUDGE_DISPLAY_TIMEZONE env > yaml display_timezone
+    # > OS local. DISPLAY_TIMEZONE encodes (env > yaml); resolve_timezone
+    # itself falls back to the OS zone when its argument is None/empty.
+    from devbench.config import DISPLAY_TIMEZONE
+
     try:
-        tz = resolve_timezone(tz_name)
+        tz = resolve_timezone(tz_name or DISPLAY_TIMEZONE)
     except InvalidTimezoneError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         print("Provide an IANA zoneinfo name (e.g. America/New_York, UTC).", file=sys.stderr)

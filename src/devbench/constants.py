@@ -216,6 +216,12 @@ DEFAULT_STOP_HOOK_STALE_TASK_MINUTES: int = 120
 DEFAULT_TOKEN_COST_PER_M_INPUT: float = 5.0
 DEFAULT_TOKEN_COST_PER_M_OUTPUT: float = 25.0
 
+# Token-cost discount (contract / correction factor off list price). See
+# ``devbench.config.TOKEN_COST_DISCOUNT`` and ``docs/model-pricing.md``.
+# final_cost = raw_list_cost * (1 - token_cost_discount). Default 0.0 =
+# no discount (pay full list), preserving pre-feature behaviour.
+DEFAULT_TOKEN_COST_DISCOUNT: float = 0.0
+
 # Em-dash (U+2014). Prohibited in work-unit markdown files by the
 # validate-backlog Check 10 (manager.py). Any CLI writer that accepts
 # free-form agent text must reject em-dash at the input boundary so the

@@ -49,6 +49,7 @@ from devbench.constants import (
     DEFAULT_STOP_HOOK_STALE_TASK_MINUTES,
     DEFAULT_STOP_HOOK_WINDOW_SECONDS,
     DEFAULT_TEST_TIMEOUT,
+    DEFAULT_TOKEN_COST_DISCOUNT,
     DEFAULT_TOKEN_COST_PER_M_INPUT,
     DEFAULT_TOKEN_COST_PER_M_OUTPUT,
 )
@@ -223,11 +224,26 @@ TOKEN_COST_PER_M_INPUT: float = _resolve_float(
 TOKEN_COST_PER_M_OUTPUT: float = _resolve_float(
     None, RUNTIME_CONFIG.report.token_cost_per_million_output, DEFAULT_TOKEN_COST_PER_M_OUTPUT
 )
+# Contract discount off list-price token cost. Fraction in the inclusive
+# range zero to one. Default is zero meaning no discount. See
+# docs/model-pricing.md for the full semantic. Resolution precedence is
+# env var, then YAML, then constant default.
+TOKEN_COST_DISCOUNT: float = _resolve_float(
+    "JUDGE_REPORT_TOKEN_COST_DISCOUNT",
+    RUNTIME_CONFIG.report.token_cost_discount,
+    DEFAULT_TOKEN_COST_DISCOUNT,
+)
 # IANA timezone name for displaying timestamps in `devbench report`.
 # None means "use the host's system local timezone." Resolution: env > YAML > None.
 REPORT_DISPLAY_TIMEZONE: str | None = _resolve_optional_str(
     "JUDGE_REPORT_TIMEZONE", RUNTIME_CONFIG.report.display_timezone
 )
+# Global display timezone applied by every devbench command that renders
+# timestamps (report, hook-tail, watch, any future command). IANA name.
+# None means "use the OS local timezone". Resolution: env > YAML > None.
+# Per-command surfaces may still override with their own CLI flag or
+# command-specific env var (e.g. hook-tail --tz or JUDGE_REPORT_TIMEZONE).
+DISPLAY_TIMEZONE: str | None = _resolve_optional_str("JUDGE_DISPLAY_TIMEZONE", RUNTIME_CONFIG.display_timezone)
 # Cost-calculation multipliers for `devbench report`. Defaults match Anthropic's
 # published pricing structure (see constants.py for source).
 REPORT_CACHE_READ_MULTIPLIER: float = _resolve_float(

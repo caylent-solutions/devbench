@@ -55,11 +55,13 @@ from devbench.backlog.work_unit import WorkUnitStatus, WorkUnitType
 from devbench.config import (
     BACKLOG_INDEX,
     BACKLOG_ROOT,
+    DISPLAY_TIMEZONE,
     RECENT_PACE_TASKS,
     REPORT_CACHE_READ_MULTIPLIER,
     REPORT_CACHE_WRITE_1HR_MULTIPLIER,
     REPORT_CACHE_WRITE_5MIN_MULTIPLIER,
     REPORT_DISPLAY_TIMEZONE,
+    TOKEN_COST_DISCOUNT,
     TOKEN_COST_PER_M_INPUT,
     TOKEN_COST_PER_M_OUTPUT,
 )
@@ -146,6 +148,10 @@ class WindowStats:
     # for projections so the rate metric reflects current orchestrator pace
     # rather than being anchored by historical completions.
     recent_pace_minutes: float | None = None
+    # Wall-clock completion moment = now() + est_hours. None when est_hours is
+    # zero / unknown (no pace data yet). Stored in UTC; the renderer converts
+    # to the resolved display timezone.
+    est_completion_at: datetime | None = None
 
     @property
     def total_tokens(self) -> int:
@@ -513,10 +519,16 @@ def _compute_window_stats(
     transcript_dir = _discover_transcript_dir(hook_log_path)
     totals_transcript = _parse_transcript_metrics(transcript_dir, window_start)
     totals = _combine_totals(totals_hook, totals_transcript)
+    # Apply the configured token-cost discount (contract rate / correction
+    # factor off list) to the base input/output rates. final = list * (1 - d).
+    # Cache multipliers stay as pure ratios; the discounted base propagates
+    # into every component cost AND the ETA projection (est_total_cost is
+    # derived from cost.total_cost), so one multiplication covers both.
+    rate_factor = 1.0 - TOKEN_COST_DISCOUNT
     cost = _compute_cost(
         totals,
-        TOKEN_COST_PER_M_INPUT,
-        TOKEN_COST_PER_M_OUTPUT,
+        TOKEN_COST_PER_M_INPUT * rate_factor,
+        TOKEN_COST_PER_M_OUTPUT * rate_factor,
         REPORT_CACHE_READ_MULTIPLIER,
         REPORT_CACHE_WRITE_5MIN_MULTIPLIER,
         REPORT_CACHE_WRITE_1HR_MULTIPLIER,
@@ -540,6 +552,11 @@ def _compute_window_stats(
     api_hours = totals.total_duration_ms / MS_PER_SECOND / SECONDS_PER_HOUR
     api_efficiency = (api_hours / window_hours * PERCENT_MULTIPLIER) if window_hours > 0 else None
 
+    # Wall-clock completion moment. None when est_hours is zero/unknown
+    # (no pace data yet, or no remaining active tasks). Stored in UTC;
+    # the renderer converts to the resolved display timezone.
+    est_completion_at = datetime.now(UTC) + timedelta(hours=est_hours) if est_hours > 0 else None
+
     return WindowStats(
         window_start=window_start,
         window_hours=window_hours,
@@ -555,6 +572,7 @@ def _compute_window_stats(
         api_efficiency=api_efficiency,
         pace_sample_count=pace_sample_count,
         recent_pace_minutes=recent_pace_minutes,
+        est_completion_at=est_completion_at,
     )
 
 
@@ -798,8 +816,12 @@ def _short_window_label(label: str, start: datetime, display_tz: tzinfo | None) 
     return f"{label} {converted.strftime('%m-%d %H:%M')}"
 
 
-def _stats_to_value_list(stats: WindowStats) -> list[str]:
-    """Return the per-row value list for a single window, in display order matching METRIC_LABELS."""
+def _stats_to_value_list(stats: WindowStats, display_tz: tzinfo | None = None) -> list[str]:
+    """Return the per-row value list for a single window, in display order matching METRIC_LABELS.
+
+    ``display_tz`` is used to render the estimated-completion datetime in the
+    operator's configured timezone. When ``None``, the OS local zone applies.
+    """
     # API utilization > 100% means API time exceeds wall time -- concurrent
     # subagent calls (legitimate parallelism) or two orchestrators writing to
     # the same hook log. The raw percentage reads as broken; surface the
@@ -828,6 +850,15 @@ def _stats_to_value_list(stats: WindowStats) -> list[str]:
     # when fewer than RECENT_PACE_TASKS completions exist.
     recent_pace_display = f"{stats.recent_pace_minutes:.1f} min" if stats.recent_pace_minutes is not None else "n/a"
     est_hours_display = f"~{stats.est_hours:.1f} h" if stats.est_hours else "n/a"
+    # Wall-clock completion datetime rendered in the resolved display TZ.
+    # Format: "Thu Apr 24 2026 14:23 EDT". "n/a" when est_hours is zero.
+    if stats.est_completion_at is None:
+        est_completion_display = "n/a"
+    else:
+        local_completion = (
+            stats.est_completion_at.astimezone(display_tz) if display_tz else stats.est_completion_at.astimezone()
+        )
+        est_completion_display = local_completion.strftime("%a %b %d %Y %H:%M %Z")
     if stats.input_share is None:
         input_share = "n/a"
     else:
@@ -840,6 +871,7 @@ def _stats_to_value_list(stats: WindowStats) -> list[str]:
         avg_min_display,
         recent_pace_display,
         est_hours_display,
+        est_completion_display,
         f"{stats.api_hours:.1f} h",
         api_eff,
         _format_int(stats.total_tokens),
@@ -863,6 +895,7 @@ _METRIC_LABELS: list[str] = [
     "Average time per task",
     f"Recent pace (last {RECENT_PACE_TASKS} tasks)",
     "Est. time to complete remaining",
+    "Est. completion date/time",
     "API processing time",
     "API utilization",
     "Tokens consumed",
@@ -887,6 +920,7 @@ _SPANNING_METRIC_LABELS: frozenset[str] = frozenset(
     {
         f"Recent pace (last {RECENT_PACE_TASKS} tasks)",
         "Est. time to complete remaining",
+        "Est. completion date/time",
     }
 )
 
@@ -906,9 +940,9 @@ def _merge_spanning_values(metric: str, values: list[str]) -> list[str] | str:
     return values
 
 
-def _stats_to_rows_single(stats: WindowStats) -> list[tuple[str, str]]:
+def _stats_to_rows_single(stats: WindowStats, display_tz: tzinfo | None = None) -> list[tuple[str, str]]:
     """Convert one WindowStats into (metric, value) rows for the single-column table."""
-    values = _stats_to_value_list(stats)
+    values = _stats_to_value_list(stats, display_tz)
     return list(zip(_METRIC_LABELS, values, strict=True))
 
 
@@ -1085,6 +1119,7 @@ _SECTION_THROUGHPUT: frozenset[str] = frozenset(
         "Average time per task",
         f"Recent pace (last {RECENT_PACE_TASKS} tasks)",
         "Est. time to complete remaining",
+        "Est. completion date/time",
     }
 )
 
@@ -1303,7 +1338,11 @@ def generate_report(
     all_timestamps: list[datetime] = [_parse_ts(m.group(1)) for m in _LOG_LINE_RE.finditer(log_text)]
     log_start_for_window, window_end, log_started = _resolve_window_endpoints(all_timestamps)
 
-    display_tz = _resolve_display_timezone(REPORT_DISPLAY_TIMEZONE)
+    # Precedence: report-specific (env JUDGE_REPORT_TIMEZONE > yaml
+    # report.display_timezone) > top-level (env JUDGE_DISPLAY_TIMEZONE >
+    # yaml display_timezone) > OS local. REPORT_DISPLAY_TIMEZONE already
+    # encodes the first pair; DISPLAY_TIMEZONE the second.
+    display_tz = _resolve_display_timezone(REPORT_DISPLAY_TIMEZONE or DISPLAY_TIMEZONE)
 
     # Compute lifetime (since-log-started) stats once. Used to enrich the top
     # box with cost / token / cache-hit summary so the most relevant numbers
@@ -1331,7 +1370,7 @@ def generate_report(
         lines.extend(
             _render_table(
                 _format_window_title("Window", since, log_started, display_tz),
-                _stats_to_rows_single(single_stats),
+                _stats_to_rows_single(single_stats, display_tz),
             )
         )
         # Backward-compat label so callers grepping for "Tasks in this session" still find it.
@@ -1365,7 +1404,7 @@ def generate_report(
 
         column_labels = [_short_window_label(w.label, w.start, display_tz) for w in windows]
         n_cols = len(column_labels)
-        value_columns = [_stats_to_value_list(s) for s in all_window_stats]
+        value_columns = [_stats_to_value_list(s, display_tz) for s in all_window_stats]
         # Transpose per-window stats into (metric, values) rows and group by
         # section label. Spanning metrics (Recent pace / Est. time) still
         # collapse into a single cell when every column agrees.

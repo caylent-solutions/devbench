@@ -85,7 +85,12 @@ The raw log always stores UTC (the hook-logger writes timestamps with a `Z`
 suffix). `hook-tail` converts at display time.
 
 - **Default:** OS local timezone, resolved via `datetime.now().astimezone()`.
-- **Override:** `--tz <iana-name>` -- any IANA zoneinfo name works, e.g.
+- **Workspace-level override:** set `display_timezone:` at the top level of
+  `backlog/config/devbench.yaml` (IANA name), or export
+  `JUDGE_DISPLAY_TIMEZONE=<iana-name>`. Applies to every timestamp-rendering
+  command (`report`, `hook-tail`, `watch`, future commands).
+- **Per-invocation override:** `--tz <iana-name>` on the `hook-tail` command
+  wins over both of the above. Any IANA zoneinfo name works, e.g.
   `America/Los_Angeles`, `Europe/London`, `Asia/Tokyo`, `UTC`.
 - **Invalid zone:** exits 2 with a stderr message naming the offending zone.
 

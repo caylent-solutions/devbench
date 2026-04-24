@@ -92,6 +92,55 @@ Read-only pretty-tail of the plugin hook event stream (`hook-logs.jsonl`). One-l
 
 See [hook-activity.md](hook-activity.md) for the event glyphs and the full column legend.
 
+### `watchdog`
+
+```
+uv run devbench watchdog [--idle-minutes N] [--flag-file PATH] [--log-file PATH] [--print-if-stuck]
+```
+
+Single-shot poll that detects a stuck `/devbench:orchestrate` loop and writes a marker file the operator can surface in their shell prompt. Exits 0 always -- it is a checker, not a daemon.
+
+A run is considered stuck when **both** conditions hold:
+
+1. `BACKLOG.md` contains at least one row with `Status: in-progress`.
+2. The most recent dated line in `src/devbench/logs/orchestrator.log` is older than `--idle-minutes` (default 5).
+
+On stuck detection the marker file is written with:
+
+```json
+{
+  "ts": "2026-04-22T21:00:00Z",
+  "task_id": "E1-F2-S26-T3",
+  "task_file_path": "backlog/E1/E1-F2/E1-F2-S26/E1-F2-S26-T3.md",
+  "orchestrator_idle_seconds": 600,
+  "last_orchestrator_log_ts": "2026-04-22T20:08:01Z",
+  "idle_threshold_seconds": 300,
+  "stale_task_minutes_threshold": 120
+}
+```
+
+Flags:
+
+- `--idle-minutes N` -- override the idle threshold (default 5; minimum 1).
+- `--flag-file PATH` -- override the marker path (default `$JUDGE_WORKSPACE_ROOT/.devbench/needs-restart.flag`).
+- `--log-file PATH` -- override the orchestrator log location (default is the devbench repo's `src/devbench/logs/orchestrator.log` relative to the installed package).
+- `--print-if-stuck` -- print a one-line `[devbench watchdog] STUCK: <id> (idle Ns, threshold Mm)` status to stdout on detection. Silent when healthy so it pipes cleanly in `PROMPT_COMMAND`.
+
+Typical operator integrations:
+
+```bash
+# Shell prompt nag (add to ~/.bashrc / ~/.zshrc):
+PROMPT_COMMAND="uv run devbench watchdog --print-if-stuck; $PROMPT_COMMAND"
+
+# Terminal watcher in a second pane:
+watch -n 60 'uv run devbench watchdog --print-if-stuck'
+
+# Cron-style polling (no follow loop -- one-shot):
+*/5 * * * * cd /path/to/workspace && uv run devbench watchdog
+```
+
+The watchdog never attempts to restart orchestration itself. Restarts remain under operator control because they may overlap with manual edits and affect billing.
+
 ### `list-proposals`
 
 ```
@@ -168,7 +217,7 @@ Run the orchestrate SKILL non-interactively via the Agent SDK. Invoked by `make 
 
 ## Orchestration and reporting
 
-See the [report](#report), [watch](#watch), and [hook-tail](#hook-tail) entries under Backlog read.
+See the [report](#report), [watch](#watch), [hook-tail](#hook-tail), and [watchdog](#watchdog) entries under Backlog read.
 
 The main entry point for running the orchestrator is `make start-interactive` (interactive Claude session) or `make start` (background). See [README Interactive Mode](../README.md#interactive-mode).
 

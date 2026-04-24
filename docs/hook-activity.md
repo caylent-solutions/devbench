@@ -163,3 +163,4 @@ The two answer different questions: "what is the orchestrator doing
 - Tests: `tests/unit/test_hook_tail.py`, `tests/test_integration/test_hook_tail_lifecycle.py`, `tests/test_cli.py::TestCmdHookTail`.
 - Complementary commands: [`devbench watch`](watch-activity.md), [`devbench report`](architecture.md).
 - Hook-logger that writes the stream: `plugin/devbench/scripts/hook-logger.sh`.
+- Stop-hook block diagnostics: `<workspace>/.devbench/stop-hook-diag/<ts>-<task-id>.json` -- one file per `continue-orchestration.sh` block event, capturing the exact JSON payload emitted to Claude Code plus circuit-breaker counters. Read these after a hang to confirm the hook's block response was well-formed.

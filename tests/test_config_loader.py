@@ -1428,3 +1428,147 @@ class TestTaskFactoryConfig:
         )
         with pytest.raises(ValueError, match="schema validation"):
             load_runtime_config(cfg, {})
+
+
+@pytest.mark.unit
+class TestReportConfigTokenCostDiscount:
+    """F1: ``report.token_cost_discount`` -- contract discount off list price."""
+
+    @staticmethod
+    def _write(path: Path, content: str) -> Path:
+        path.write_text(textwrap.dedent(content))
+        return path
+
+    def test_default_is_none_when_key_absent(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.report.token_cost_discount is None
+
+    def test_parsed_when_key_present(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            report:
+              token_cost_discount: 0.40363636364
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.report.token_cost_discount == 0.40363636364
+
+    def test_boundary_zero_accepted(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            report:
+              token_cost_discount: 0.0
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.report.token_cost_discount == 0.0
+
+    def test_boundary_one_accepted(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            report:
+              token_cost_discount: 1.0
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.report.token_cost_discount == 1.0
+
+    def test_negative_value_rejected_by_schema(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            report:
+              token_cost_discount: -0.1
+            """,
+        )
+        with pytest.raises(ValueError, match="schema validation"):
+            load_runtime_config(cfg, {})
+
+    def test_above_one_rejected_by_schema(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            report:
+              token_cost_discount: 1.5
+            """,
+        )
+        with pytest.raises(ValueError, match="schema validation"):
+            load_runtime_config(cfg, {})
+
+
+@pytest.mark.unit
+class TestDisplayTimezoneTopLevel:
+    """F2-A: top-level ``display_timezone`` yaml key (shared by every timestamp-rendering command)."""
+
+    @staticmethod
+    def _write(path: Path, content: str) -> Path:
+        path.write_text(textwrap.dedent(content))
+        return path
+
+    def test_default_is_none_when_key_absent(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.display_timezone is None
+
+    def test_parsed_when_present_top_level(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            display_timezone: America/New_York
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.display_timezone == "America/New_York"
+
+    def test_independent_of_report_display_timezone(self, tmp_path: Path) -> None:
+        """Top-level and report-level are independent: both can be set, neither overrides the other at load time."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            display_timezone: America/Chicago
+            report:
+              display_timezone: Europe/London
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.display_timezone == "America/Chicago"
+        assert rt.report.display_timezone == "Europe/London"

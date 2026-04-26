@@ -99,3 +99,24 @@ repos:
 # Story/Feature/Epic rolls to done once every child is Done or Declined.
 # Declined tasks are excluded from tasks_remaining and from projection ETAs,
 # and surface in a dedicated `Declined (N):` panel in `devbench report`.
+
+# display_timezone: IANA timezone name (e.g. "America/New_York", "Europe/London")
+# applied by every devbench command that renders timestamps -- devbench report,
+# devbench hook-tail, devbench watch, and any future command. When unset, each
+# command defaults to the OS local timezone. Override per-invocation via the
+# JUDGE_DISPLAY_TIMEZONE env var. Per-command overrides (report.display_timezone,
+# JUDGE_REPORT_TIMEZONE, hook-tail --tz) still take precedence.
+#
+# display_timezone: America/New_York
+
+# report: contains report-specific settings. Most operators don't need to set
+# these explicitly -- the code defaults match Opus 4.7 list pricing. Set them
+# only when running against a different model or when your contract has a
+# different rate structure. See devbench docs/model-pricing.md for the full
+# semantic and the worked-examples table.
+#
+# report:
+#   # Contract discount (correction factor) off list-price token cost. Fraction
+#   # in [0.0, 1.0]. final_cost = raw_list_cost * (1 - token_cost_discount).
+#   # Default 0.0 = no discount (pay full list). E.g. 0.25 = 25% off list.
+#   token_cost_discount: 0.0

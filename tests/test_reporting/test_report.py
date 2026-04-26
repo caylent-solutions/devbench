@@ -1693,3 +1693,254 @@ class TestSpanningRows:
                 f"Row '{row_label}' expected '{expected_substr}' exactly once in Window stats half, "
                 f"got {occurrences}: {right_half!r}"
             )
+
+
+def _small_hook_log() -> str:
+    """Minimal hook-log entries with usage tokens -- same shape as existing TestTokenCostReport fixtures."""
+    return (
+        '{"timestamp":"2026-03-05T10:04:00Z","event":"PostToolUse","input":{"tool_response":'
+        '{"usage":{"input_tokens":50000,"output_tokens":10000}}}}\n'
+        '{"timestamp":"2026-03-05T10:05:00Z","event":"PostToolUse","input":{"tool_response":'
+        '{"usage":{"input_tokens":30000,"output_tokens":5000}}}}\n'
+    )
+
+
+def _small_orchestrator_log() -> str:
+    return _make_log(
+        [
+            "2026-03-05T10:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
+            "2026-03-05T10:05:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'",
+        ]
+    )
+
+
+@pytest.mark.unit
+class TestTokenCostDiscount:
+    """F1-B: discount scales every cost component + ETA uniformly."""
+
+    def _build_workspace(self, tmp_path: Path) -> Path:
+        log_file = tmp_path / "test.log"
+        log_file.write_text(_small_orchestrator_log())
+        (tmp_path / "hook-logs.jsonl").write_text(_small_hook_log())
+        return log_file
+
+    def _get_total_cost(self, report_text: str) -> float:
+        """Pull the 'Estimated cost so far' dollar value from a rendered report."""
+        import re
+
+        m = re.search(r"Estimated cost so far\b.*?\$(\d+\.\d+)", report_text, re.DOTALL)
+        assert m is not None, f"could not find cost line in:\n{report_text}"
+        return float(m.group(1))
+
+    def test_discount_zero_is_behaviour_preserving(self, tmp_path: Path) -> None:
+        log_file = self._build_workspace(tmp_path)
+        with (
+            patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.reporting.report.TOKEN_COST_DISCOUNT", 0.0),
+        ):
+            baseline = self._get_total_cost(generate_report(log_path=log_file))
+        # With discount 0.0, cost equals the un-discounted baseline.
+        assert baseline > 0.0
+
+    def test_discount_half_halves_cost(self, tmp_path: Path) -> None:
+        log_file = self._build_workspace(tmp_path)
+        with (
+            patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.reporting.report.TOKEN_COST_DISCOUNT", 0.0),
+        ):
+            baseline = self._get_total_cost(generate_report(log_path=log_file))
+        with (
+            patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.reporting.report.TOKEN_COST_DISCOUNT", 0.5),
+        ):
+            discounted = self._get_total_cost(generate_report(log_path=log_file))
+        assert abs(discounted - baseline * 0.5) < 0.01
+
+    def test_discount_custom_fraction_applied(self, tmp_path: Path) -> None:
+        """0.40363636364 discount means final cost = baseline x (1 - 0.40363636364) = baseline x 0.59636363636."""
+        log_file = self._build_workspace(tmp_path)
+        with (
+            patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.reporting.report.TOKEN_COST_DISCOUNT", 0.0),
+        ):
+            baseline = self._get_total_cost(generate_report(log_path=log_file))
+        with (
+            patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.reporting.report.TOKEN_COST_DISCOUNT", 0.40363636364),
+        ):
+            discounted = self._get_total_cost(generate_report(log_path=log_file))
+        expected = baseline * 0.59636363636
+        assert abs(discounted - expected) < 0.01, (
+            f"expected {expected} (baseline={baseline} * 0.59636363636), got {discounted}"
+        )
+
+    def test_discount_full_yields_zero_cost(self, tmp_path: Path) -> None:
+        log_file = self._build_workspace(tmp_path)
+        with (
+            patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.reporting.report.TOKEN_COST_DISCOUNT", 1.0),
+        ):
+            free_cost = self._get_total_cost(generate_report(log_path=log_file))
+        assert free_cost == 0.0
+
+
+@pytest.mark.unit
+class TestEstCompletionDatetime:
+    """F2-B: Est. completion date/time row renders wall-clock completion in the resolved TZ."""
+
+    def test_completion_none_when_est_hours_zero(self) -> None:
+        """WindowStats with est_hours=0 => est_completion_at is None."""
+        from devbench.reporting.report import CostBreakdown, HookLogTotals
+
+        stats = WindowStats(
+            window_start=datetime(2026, 3, 5, 10, tzinfo=UTC),
+            window_hours=1.0,
+            tasks_in_window=0,
+            avg_minutes=0.0,
+            est_hours=0.0,
+            totals=HookLogTotals(),
+            cost=CostBreakdown(0, 0, 0, 0, 0, 0),
+            cache_hit_rate=None,
+            tokens_per_task=0.0,
+            est_total_cost=0.0,
+            api_hours=0.0,
+            api_efficiency=None,
+        )
+        assert stats.est_completion_at is None
+
+    def test_completion_computed_as_now_plus_est_hours(self, tmp_path: Path) -> None:
+        """Generated report's est_completion_at is approximately now() + est_hours."""
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    "2026-03-05T10:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                    "2026-03-05T10:05:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'",
+                    "2026-03-05T10:05:00Z [judges.cli] INFO Set E0-F1-S1-T2 to 'in-progress'",
+                ]
+            )
+        )
+        # BacklogParser is patched to return one in-progress task, so tasks_active=1,
+        # pace data exists (1 completion), est_hours will be non-zero.
+        from devbench.backlog.work_unit import WorkUnit
+
+        mock_units = [
+            WorkUnit(
+                id="E0-F1-S1-T2",
+                title="T2",
+                status=WorkUnitStatus.IN_PROGRESS,
+                unit_type=WorkUnitType.TASK,
+                file_path=tmp_path / "e.md",
+                repo="org/repo",
+                dependencies=[],
+            ),
+        ]
+        with (
+            patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.reporting.report.BacklogParser") as mock_cls,
+        ):
+            mock_cls.return_value.parse_index.return_value = mock_units
+            report = generate_report(log_path=log_file)
+        # The row must be present in the rendered report.
+        assert "Est. completion date/time" in report
+
+    def test_completion_renders_na_when_no_pace_data(self, tmp_path: Path) -> None:
+        """Report with no completed tasks yet -> completion row shows n/a."""
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    "2026-03-05T10:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                ]
+            )
+        )
+        with patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
+            report = generate_report(log_path=log_file)
+        # "Est. completion date/time" row exists and renders as n/a (no pace data).
+        lines = [ln for ln in report.splitlines() if "Est. completion date/time" in ln]
+        assert lines, f"Est. completion row missing in report:\n{report}"
+        assert "n/a" in lines[0]
+
+    def test_completion_renders_in_configured_display_tz(self) -> None:
+        """With display_tz=America/New_York passed, completion row shows EST or EDT abbrev.
+
+        Tests the renderer directly with a crafted WindowStats to isolate the
+        TZ-conversion logic from the full pace-data pipeline.
+        """
+        from zoneinfo import ZoneInfo
+
+        from devbench.reporting.report import CostBreakdown, HookLogTotals, _stats_to_value_list
+
+        anchored = datetime(2026, 3, 5, 10, tzinfo=UTC) + timedelta(hours=2.5)
+        stats = WindowStats(
+            window_start=datetime(2026, 3, 5, 10, tzinfo=UTC),
+            window_hours=1.0,
+            tasks_in_window=1,
+            avg_minutes=5.0,
+            est_hours=2.5,
+            totals=HookLogTotals(),
+            cost=CostBreakdown(0, 0, 0, 0, 0, 0),
+            cache_hit_rate=None,
+            tokens_per_task=0.0,
+            est_total_cost=0.0,
+            api_hours=0.0,
+            api_efficiency=None,
+            est_completion_at=anchored,
+        )
+        values = _stats_to_value_list(stats, display_tz=ZoneInfo("America/New_York"))
+        # Index 5 = Est. completion date/time (per _METRIC_LABELS order).
+        completion_cell = values[5]
+        # March 5 in NY is EST (winter).
+        assert "EST" in completion_cell, f"expected EST in {completion_cell!r}"
+
+    def test_completion_row_lives_in_throughput_section(self) -> None:
+        """The Est. completion date/time row belongs under THROUGHPUT, right below
+        Est. time to complete remaining. Regression pin: earlier the row was only
+        listed in _METRIC_LABELS + _SPANNING_METRIC_LABELS but missing from
+        _SECTION_THROUGHPUT, so it fell through to the default Tokens bucket and
+        rendered mid-table instead of next to its sibling."""
+        from devbench.reporting.report import _section_for_metric
+
+        assert _section_for_metric("Est. completion date/time") == "Throughput"
+        # Pin the sibling so this test catches any future rename that splits the pair.
+        assert _section_for_metric("Est. time to complete remaining") == "Throughput"
+
+
+@pytest.mark.unit
+class TestDisplayTimezoneFallbackChain:
+    """F2-A: report TZ precedence REPORT_DISPLAY_TIMEZONE > DISPLAY_TIMEZONE > OS local.
+
+    The chain is implemented at ``reporting/report.py`` line ~1313 as
+    ``_resolve_display_timezone(REPORT_DISPLAY_TIMEZONE or DISPLAY_TIMEZONE)``.
+    These tests pin the three branches directly.
+    """
+
+    def test_report_tz_takes_precedence_over_global(self) -> None:
+        """``"UTC" or "America/New_York"`` resolves to ``"UTC"`` -- report-specific wins."""
+        from zoneinfo import ZoneInfo
+
+        from devbench.reporting.report import _resolve_display_timezone
+
+        report_tz = "UTC"
+        global_tz = "America/New_York"
+        resolved = _resolve_display_timezone(report_tz or global_tz)
+        assert resolved == ZoneInfo("UTC")
+
+    def test_global_tz_used_when_report_tz_unset(self) -> None:
+        """``None or "America/New_York"`` resolves to ``"America/New_York"`` -- top-level wins."""
+        from zoneinfo import ZoneInfo
+
+        from devbench.reporting.report import _resolve_display_timezone
+
+        report_tz = None
+        global_tz = "America/New_York"
+        resolved = _resolve_display_timezone(report_tz or global_tz)
+        assert resolved == ZoneInfo("America/New_York")
+
+    def test_both_unset_yields_none_for_os_local_fallback(self) -> None:
+        """``None or None`` is None; caller uses OS local."""
+        from devbench.reporting.report import _resolve_display_timezone
+
+        report_tz = None
+        global_tz = None
+        assert _resolve_display_timezone(report_tz or global_tz) is None

@@ -59,6 +59,7 @@ import shutil
 import subprocess
 import sys
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -1201,8 +1202,13 @@ def cmd_hook_tail(*argv: str) -> int:
         print(f"ERROR: unexpected positional argument: {arg}", file=sys.stderr)
         return 2
 
+    # Precedence: CLI --tz > JUDGE_DISPLAY_TIMEZONE env > yaml display_timezone
+    # > OS local. DISPLAY_TIMEZONE encodes (env > yaml); resolve_timezone
+    # itself falls back to the OS zone when its argument is None/empty.
+    from devbench.config import DISPLAY_TIMEZONE
+
     try:
-        tz = resolve_timezone(tz_name)
+        tz = resolve_timezone(tz_name or DISPLAY_TIMEZONE)
     except InvalidTimezoneError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         print("Provide an IANA zoneinfo name (e.g. America/New_York, UTC).", file=sys.stderr)
@@ -1224,6 +1230,110 @@ def cmd_hook_tail(*argv: str) -> int:
         ),
         sys.stdout,
     )
+
+
+@dataclass(frozen=True)
+class _WatchdogArgs:
+    idle_minutes: int = 5
+    flag_file: str = ""
+    log_file: str = ""
+    print_if_stuck: bool = False
+
+
+def _parse_watchdog_args(argv: tuple[str, ...]) -> _WatchdogArgs | int:
+    """Parse watchdog flags; return a populated args struct, or exit code on error."""
+    idle_minutes = 5
+    flag_file = ""
+    log_file = ""
+    print_if_stuck = False
+    args = [a for a in argv if a]
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--idle-minutes":
+            if i + 1 >= len(args) or not args[i + 1]:
+                print("ERROR: --idle-minutes requires a value", file=sys.stderr)
+                return 2
+            try:
+                idle_minutes = int(args[i + 1])
+            except ValueError:
+                print(f"ERROR: --idle-minutes must be an integer, got: {args[i + 1]}", file=sys.stderr)
+                return 2
+            if idle_minutes < 1:
+                print("ERROR: --idle-minutes must be >= 1", file=sys.stderr)
+                return 2
+            i += 2
+        elif arg in ("--flag-file", "--log-file"):
+            if i + 1 >= len(args) or not args[i + 1]:
+                print(f"ERROR: {arg} requires a value", file=sys.stderr)
+                return 2
+            if arg == "--flag-file":
+                flag_file = args[i + 1]
+            else:
+                log_file = args[i + 1]
+            i += 2
+        elif arg == "--print-if-stuck":
+            print_if_stuck = True
+            i += 1
+        else:
+            print(f"ERROR: unknown flag: {arg}", file=sys.stderr)
+            return 2
+    return _WatchdogArgs(
+        idle_minutes=idle_minutes,
+        flag_file=flag_file,
+        log_file=log_file,
+        print_if_stuck=print_if_stuck,
+    )
+
+
+def cmd_watchdog(*argv: str) -> int:
+    """Poll for a stuck orchestrate loop and write a marker file when detected.
+
+    Usage::
+
+        watchdog [--idle-minutes N] [--flag-file PATH] [--log-file PATH]
+                 [--print-if-stuck]
+
+    Detects a hang when BACKLOG.md has an in-progress task AND the
+    orchestrator log has been silent longer than ``--idle-minutes``
+    (default 5). Writes ``<workspace>/.devbench/needs-restart.flag`` with
+    the stuck task ID, idle duration, and threshold metadata.
+
+    Exits 0 always. With ``--print-if-stuck`` prints a one-line status to
+    stdout when stuck (suitable for PROMPT_COMMAND integration); silent
+    when healthy so it pipes cleanly in shell prompts.
+    """
+    from datetime import UTC, datetime
+
+    from devbench.config import STOP_HOOK_STALE_TASK_MINUTES
+    from devbench.watchdog import detect_stuck, write_flag_file
+
+    parsed = _parse_watchdog_args(argv)
+    if isinstance(parsed, int):
+        return parsed
+
+    log_file = Path(parsed.log_file) if parsed.log_file else Path(__file__).parent / "logs" / "orchestrator.log"
+    flag_file = Path(parsed.flag_file) if parsed.flag_file else WORKSPACE_ROOT / ".devbench" / "needs-restart.flag"
+
+    result = detect_stuck(
+        backlog_index=WORKSPACE_ROOT / "BACKLOG.md",
+        log_file=log_file,
+        now=datetime.now(UTC),
+        idle_threshold_seconds=parsed.idle_minutes * 60,
+        stale_task_minutes=STOP_HOOK_STALE_TASK_MINUTES,
+    )
+
+    if result.stuck is None:
+        return 0
+
+    write_flag_file(flag_file, result.stuck, datetime.now(UTC))
+    if parsed.print_if_stuck:
+        print(
+            f"[devbench watchdog] STUCK: {result.stuck.task_id} "
+            f"(idle {result.stuck.idle_seconds}s, threshold {parsed.idle_minutes}m). "
+            f"Flag: {flag_file}"
+        )
+    return 0
 
 
 def cmd_start() -> int:
@@ -2049,6 +2159,14 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
         0,
         "Pretty-tail $WORKSPACE_ROOT/hook-logs.jsonl: hook-tail [<path>] [--tz <zone>] [--no-follow] [--from-start]",
     ),
+    "watchdog": (
+        cmd_watchdog,
+        0,
+        (
+            "Detect stuck orchestrate loops and write a restart marker: "
+            "watchdog [--idle-minutes N] [--flag-file PATH] [--log-file PATH] [--print-if-stuck]"
+        ),
+    ),
     # Plugin agent bridge commands -- used by devbench plugin agents
     "read-unit": (cmd_read_unit, 1, "Work unit content + repo path as JSON: read-unit [--strip-comments] <id>"),
     "get-diff": (cmd_get_diff, 1, "Return combined git diff for work unit's repo: get-diff <id>"),
@@ -2115,7 +2233,7 @@ _HELP_FLAGS: frozenset[str] = frozenset({"--help", "-h"})
 # list instead of the dispatcher's fixed-arity slice. Additions here are
 # deliberate -- the slice is a guardrail against typos for fixed-arity
 # commands, so variadic opt-in should be narrow.
-_VARIADIC_COMMANDS: frozenset[str] = frozenset({"hook-tail"})
+_VARIADIC_COMMANDS: frozenset[str] = frozenset({"hook-tail", "watchdog"})
 
 
 def _print_usage() -> None:

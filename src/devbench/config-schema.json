@@ -67,6 +67,10 @@
       },
       "description": "List of GitHub organisations permitted for operations."
     },
+    "display_timezone": {
+      "type": ["string", "null"],
+      "description": "IANA timezone name (e.g. 'America/New_York', 'Europe/London') applied by every devbench command that renders timestamps -- `devbench report`, `devbench hook-tail`, `devbench watch`, and any future command. When unset, each command defaults to the OS local timezone. Override per-invocation via the JUDGE_DISPLAY_TIMEZONE env var. Report-specific `report.display_timezone` / JUDGE_REPORT_TIMEZONE take precedence over this top-level setting for the report command only."
+    },
     "timeouts": {
       "type": "object",
       "description": "Timeout values in seconds.",
@@ -229,6 +233,12 @@
           "type": "integer",
           "minimum": 1,
           "description": "Number of most-recently-completed tasks averaged for the 'Recent pace' projection in `devbench report`. Defaults to 10. Lower for more responsiveness, higher for more stability. Override via JUDGE_REPORT_RECENT_PACE_TASKS env var."
+        },
+        "token_cost_discount": {
+          "type": "number",
+          "minimum": 0.0,
+          "maximum": 1.0,
+          "description": "Contract discount (correction factor) off list-price token cost, as a fraction in [0.0, 1.0]. final_cost = raw_list_cost * (1 - token_cost_discount). Default 0.0 (no discount, pay full list). Applies uniformly to every per-call cost and to every ETA projection; cache multipliers stay as pure ratios applied to the discounted base rate. Override via JUDGE_REPORT_TOKEN_COST_DISCOUNT env var. See docs/model-pricing.md."
         }
       }
     },

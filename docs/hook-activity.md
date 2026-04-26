@@ -85,7 +85,12 @@ The raw log always stores UTC (the hook-logger writes timestamps with a `Z`
 suffix). `hook-tail` converts at display time.
 
 - **Default:** OS local timezone, resolved via `datetime.now().astimezone()`.
-- **Override:** `--tz <iana-name>` -- any IANA zoneinfo name works, e.g.
+- **Workspace-level override:** set `display_timezone:` at the top level of
+  `backlog/config/devbench.yaml` (IANA name), or export
+  `JUDGE_DISPLAY_TIMEZONE=<iana-name>`. Applies to every timestamp-rendering
+  command (`report`, `hook-tail`, `watch`, future commands).
+- **Per-invocation override:** `--tz <iana-name>` on the `hook-tail` command
+  wins over both of the above. Any IANA zoneinfo name works, e.g.
   `America/Los_Angeles`, `Europe/London`, `Asia/Tokyo`, `UTC`.
 - **Invalid zone:** exits 2 with a stderr message naming the offending zone.
 
@@ -158,3 +163,4 @@ The two answer different questions: "what is the orchestrator doing
 - Tests: `tests/unit/test_hook_tail.py`, `tests/test_integration/test_hook_tail_lifecycle.py`, `tests/test_cli.py::TestCmdHookTail`.
 - Complementary commands: [`devbench watch`](watch-activity.md), [`devbench report`](architecture.md).
 - Hook-logger that writes the stream: `plugin/devbench/scripts/hook-logger.sh`.
+- Stop-hook block diagnostics: `<workspace>/.devbench/stop-hook-diag/<ts>-<task-id>.json` -- one file per `continue-orchestration.sh` block event, capturing the exact JSON payload emitted to Claude Code plus circuit-breaker counters. Read these after a hang to confirm the hook's block response was well-formed.

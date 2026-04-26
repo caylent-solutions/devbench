@@ -7,6 +7,8 @@ Process the backlog using the steps below, repeating until all work units are do
 
 **CRITICAL: This is an autonomous loop. Never stop to ask the user if you should proceed. Never ask "Should I continue?" After completing a work unit, immediately return to step 1 and process the next one. The only valid exit conditions are ALL_DONE or NO_ACTIONABLE from step 2. If the context was compacted, re-read this instruction and continue the loop.**
 
+**CRITICAL (back-to-back tool calls): After every Agent tool result, your very next tool use MUST be either another Agent call (step 4 / 5 / 6 / 7) or a `uv run devbench ...` Bash call (steps 0 / 1 / 2 / 8 / 9). Ending your turn before emitting that next tool call is a loop-exit bug -- the orchestrate loop depends on back-to-back tool calls within a single turn, and the stop-hook's `decision: block` recovery is not 100% reliable. Do NOT summarise or narrate between tool calls; emit the next tool call immediately.**
+
 ## Loop
 
 0. `uv run devbench sweep-proposals` -- best-effort materialise every proposal JSON that still has un-materialised tasks. No-ops when nothing is pending; soft-fails (logs and continues) when a proposal is still blocked by the "skip when prior unresolved" safety guard. Runs at every loop iteration so stale JSONs never accumulate invisibly. Expected output pattern: `sweep-proposals: materialised <source-id>: N task(s)` / `sweep-proposals: skipped <source-id>: <reason>` / `sweep-proposals: no-op <source-id>`.
@@ -65,9 +67,9 @@ Process the backlog using the steps below, repeating until all work units are do
    - If result is REVIEW_PASS: go to step 7.
 
 6. On REVIEW_FAIL:
-   - Retry `devbench:executor` with the unit ID (executor reads prior Comments for context).
-   - Return to step 5 -- invoke `review-supervisor` again. Do NOT invoke security-reviewer here.
-   - After `max_executor_retries` consecutive failures, log a blocker comment and return to step 2.
+   a. **Immediately** invoke the `devbench:executor` Agent with the unit ID. Do NOT summarise, do NOT explain, do NOT log a comment first -- the Agent tool call is the very next tool use after the REVIEW_FAIL result. Natural turn-end before this Agent call is the loop-exit bug described in the top-level CRITICAL directive.
+   b. When executor returns, Return to step 5 -- immediately re-invoke `review-supervisor`. Do NOT invoke security-reviewer here.
+   c. After `max_executor_retries` consecutive failures, the next tool calls (in this order, same turn) are mandatory and explicit: (1) `uv run devbench log-comment agent/orchestrator <id> "[BLOCKED] ..."` naming the failing checks, (2) `uv run devbench next`. The `devbench next` call is the only authorised loop-continuation signal -- treat its output exactly like step 2 (ALL_DONE / NO_ACTIONABLE / JSON).
 
 7. On review team REVIEW_PASS:
    - Invoke `devbench:security-reviewer` with the unit ID.

@@ -185,6 +185,11 @@ class ReportConfig:
         recent_pace_tasks: Number of most recently completed tasks to average
             for the "Recent pace" projection. ``None`` falls back to
             ``DEFAULT_RECENT_PACE_TASKS``.
+        token_cost_discount: Contract discount (correction factor) off
+            list-price token cost, as a fraction in ``[0.0, 1.0]``.
+            ``final_cost = raw_list_cost * (1 - token_cost_discount)``.
+            ``None`` falls back to ``DEFAULT_TOKEN_COST_DISCOUNT`` (``0.0``,
+            pay full list).
     """
 
     token_cost_per_million_input: float = DEFAULT_TOKEN_COST_PER_M_INPUT
@@ -195,6 +200,7 @@ class ReportConfig:
     cache_write_1hr_multiplier: float | None = None
     data_residency_multiplier: float | None = None
     recent_pace_tasks: int | None = None
+    token_cost_discount: float | None = None
 
 
 @dataclass(frozen=True)
@@ -302,6 +308,11 @@ class RuntimeConfig:
         merge_strategy: Default PR merge strategy for all repos.
         max_executor_retries: Maximum executor retry attempts per work unit
             when judge reviews fail.
+        display_timezone: IANA timezone name applied by every devbench
+            command that renders timestamps (report, hook-tail, watch).
+            ``None`` means OS local timezone. Per-command overrides
+            (env vars, CLI flags, or the legacy ``report.display_timezone``)
+            take precedence over this top-level setting.
     """
 
     repos: dict[str, RepoConfig] = field(default_factory=dict)
@@ -319,6 +330,7 @@ class RuntimeConfig:
     bedrock_region: str | None = None
     merge_strategy: str | None = None
     max_executor_retries: int | None = None
+    display_timezone: str | None = None
 
 
 def resolve_config_path(
@@ -525,6 +537,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
             float(report_raw["data_residency_multiplier"]) if "data_residency_multiplier" in report_raw else None
         ),
         recent_pace_tasks=(int(report_raw["recent_pace_tasks"]) if "recent_pace_tasks" in report_raw else None),
+        token_cost_discount=(float(report_raw["token_cost_discount"]) if "token_cost_discount" in report_raw else None),
     )
 
     # Populate ManifestAmendment config from YAML manifest_amendment block.
@@ -590,6 +603,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         bedrock_region=raw.get("bedrock_region") or None,
         merge_strategy=raw.get("merge_strategy") or None,
         max_executor_retries=raw.get("max_executor_retries") or None,
+        display_timezone=raw.get("display_timezone") or None,
     )
 
 

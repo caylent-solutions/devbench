@@ -174,13 +174,46 @@ if command -v uv >/dev/null 2>&1; then
     uv run devbench log "Stop hook blocked (${NEW_COUNT}/${MAX_BLOCKS}): ${TASK_ID} in-progress, last action: ${LAST_ACTION}" 2>/dev/null || true
 fi
 
-# --- Block stop with context ---
+# --- Build block response JSON ---
 
-cat <<HOOKEOF
-{
-    "decision": "block",
-    "reason": "Orchestration loop active. Task ${TASK_ID} is in-progress (file: ${FILE_PATH}). Last action: ${LAST_ACTION}. ${NEXT_STEP} Circuit breaker: ${NEW_COUNT}/${MAX_BLOCKS} blocks in ${ELAPSED}s window.${STALE_WARNING} Never stop between tasks."
+REASON_TEXT="Orchestration loop active. Task ${TASK_ID} is in-progress (file: ${FILE_PATH}). Last action: ${LAST_ACTION}. ${NEXT_STEP} Circuit breaker: ${NEW_COUNT}/${MAX_BLOCKS} blocks in ${ELAPSED}s window.${STALE_WARNING} Never stop between tasks."
+
+BLOCK_JSON=$(python3 -c '
+import json, sys
+print(json.dumps({"decision": "block", "reason": sys.argv[1]}))
+' "$REASON_TEXT" 2>/dev/null || printf '{"decision":"block","reason":%s}' "\"(reason serialisation failed)\"")
+
+# --- Diagnostic capture ---
+# Records exactly what the hook emitted plus surrounding context, so a future
+# hang can be post-mortemed from evidence rather than speculation. One file
+# per invocation under <workspace>/.devbench/stop-hook-diag/.
+
+DIAG_DIR="${WORKSPACE_ROOT}/.devbench/stop-hook-diag"
+DIAG_FILE="${DIAG_DIR}/$(date -u +%Y%m%dT%H%M%SZ)-${TASK_ID:-no-task}.json"
+mkdir -p "$DIAG_DIR" 2>/dev/null || true
+python3 -c '
+import json, os, sys
+payload = {
+    "ts": sys.argv[1],
+    "task_id": sys.argv[2],
+    "file_path": sys.argv[3],
+    "last_action": sys.argv[4],
+    "block_count": int(sys.argv[5]),
+    "max_blocks": int(sys.argv[6]),
+    "window_seconds": int(sys.argv[7]),
+    "elapsed_seconds": int(sys.argv[8]),
+    "stale_warning": sys.argv[9],
+    "next_step": sys.argv[10],
+    "emitted_stdout": json.loads(sys.argv[11]),
 }
-HOOKEOF
+with open(sys.argv[12], "w") as f:
+    json.dump(payload, f, indent=2)
+' "$(date -u +%FT%TZ)" "${TASK_ID}" "${FILE_PATH}" "${LAST_ACTION}" \
+   "${NEW_COUNT}" "${MAX_BLOCKS}" "${WINDOW_SECONDS}" "${ELAPSED}" \
+   "${STALE_WARNING}" "${NEXT_STEP}" "${BLOCK_JSON}" "${DIAG_FILE}" 2>/dev/null || true
+
+# --- Emit block response to stdout ---
+
+printf '%s\n' "$BLOCK_JSON"
 
 exit 0

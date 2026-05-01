@@ -138,6 +138,40 @@ class LimitConfig:
     llm_evidence_truncation: int | None = None
     llm_file_context: int | None = None
     llm_file_preview_chars: int | None = None
+    ci_failure_log_bytes: int | None = None
+
+
+@dataclass
+class PrReviewResolutionConfig:
+    """PR review-comment polling configuration (issue #116).
+
+    Defaults to disabled. Operators turn it on per-backlog when target
+    repos have asynchronous review bots (Copilot, Q-Dev, internal
+    review services) whose comments arrive on a separate timeline from
+    the formal CI status checks.
+
+    Attributes:
+        enabled: Top-level toggle. When ``False`` (default), the entire
+            phase is a no-op and ``cmd_git_ops`` proceeds straight from
+            CI-pass to merge.
+        agents: GitHub login allowlist whose unresolved review comments
+            block the merge until resolved. Empty by default.
+        decision_blocks: When ``True`` (default), reviewDecision ==
+            CHANGES_REQUESTED hard-blocks the merge regardless of the
+            bot allowlist.
+        settle_seconds: Total settle-window length in seconds.
+        poll_interval: Per-poll cadence in seconds inside the settle
+            window.
+
+    All fields default to ``None`` when not specified in YAML;
+    ``config.py`` substitutes the constants.py defaults.
+    """
+
+    enabled: bool | None = None
+    agents: list[str] = field(default_factory=list)
+    decision_blocks: bool | None = None
+    settle_seconds: int | None = None
+    poll_interval: int | None = None
 
 
 @dataclass
@@ -158,11 +192,62 @@ class GitOpsConfig:
             ``git-ops-finalize`` to push and create the PR after all work
             units are complete.  Only meaningful when ``single_branch``
             is set.  Defaults to ``False``.
+        pause_before_merge: Issue #101 -- when ``True``, ``cmd_git_ops``
+            pushes the PR + waits for green CI, then transitions the
+            work unit to ``in-review`` instead of merging. The
+            orchestrator's loop reconciles ``in-review`` tasks via
+            ``cmd_check_merge`` on the next iteration. Mutually
+            exclusive with ``defer_pr: true`` and ``single_branch: <name>``
+            (validated at config load).
+        inline_orphan_cleanup: When ``True`` (the default), ``cmd_git_ops``
+            runs ``cleanup_tracked_orphans`` inline as a chore commit
+            before the task's commit when build/state orphan paths are
+            detected. ``None`` falls through to the constant default.
+        ci_failure_retry: Issue #115 -- when ``True`` (the default),
+            ``cmd_git_ops`` returns rc=2 on CI failure to trigger an
+            executor retry with the failing-job log as feedback. ``None``
+            falls through to the constant default.
+        orphan_patterns: Operator override of the built-in orphan-pattern
+            fnmatch list. Empty list (default) means use the built-in
+            list; non-empty REPLACES it.
+        pr_review_resolution: Nested config for the PR review-comment
+            polling phase (issue #116).
     """
 
     update_submodule: bool = False
     single_branch: str | None = None
     defer_pr: bool = False
+    pause_before_merge: bool | None = None
+    inline_orphan_cleanup: bool | None = None
+    ci_failure_retry: bool | None = None
+    orphan_patterns: list[str] = field(default_factory=list)
+    pr_review_resolution: PrReviewResolutionConfig = field(default_factory=PrReviewResolutionConfig)
+
+
+@dataclass
+class DebugConfig:
+    """Diagnostic-tuning knobs.
+
+    Set these only when investigating an orchestrator-cadence problem.
+    Production workspaces leave this section absent.
+
+    Attributes:
+        check_registration_retries: Issue #114 -- number of times
+            ``wait_for_checks`` retries ``gh pr checks`` when "no checks
+            reported" contradicts the local workflow-file glob.
+        check_registration_delay_seconds: Sleep between check-registration
+            retries, in seconds.
+        blocked_recovery_window_seconds: Recency cap for the
+            AWAITING_AUTO_RECOVERY signal in the 3-state blocked-task
+            classifier.
+
+    All fields default to ``None`` when not specified in YAML;
+    ``config.py`` substitutes the constants.py defaults.
+    """
+
+    check_registration_retries: int | None = None
+    check_registration_delay_seconds: int | None = None
+    blocked_recovery_window_seconds: int | None = None
 
 
 @dataclass
@@ -344,6 +429,7 @@ class RuntimeConfig:
     stop_hook: StopHookConfig = field(default_factory=StopHookConfig)
     manifest_amendment: AmendmentConfig = field(default_factory=AmendmentConfig)
     task_factory: TaskFactoryConfig = field(default_factory=TaskFactoryConfig)
+    debug: DebugConfig = field(default_factory=DebugConfig)
     allowed_orgs: list[str] = field(default_factory=list)
     judge_model: str | None = None
     executor_model: str | None = None
@@ -545,18 +631,58 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         llm_evidence_truncation=limits_raw.get("llm_evidence_truncation"),
         llm_file_context=limits_raw.get("llm_file_context"),
         llm_file_preview_chars=limits_raw.get("llm_file_preview_chars"),
+        ci_failure_log_bytes=limits_raw.get("ci_failure_log_bytes"),
     )
 
     # Populate GitOpsConfig from YAML git_ops block (absent keys yield defaults).
     git_ops_raw = raw.get("git_ops") or {}
     single_branch_raw = git_ops_raw.get("single_branch") or None
     defer_pr = bool(git_ops_raw.get("defer_pr", False))
+    pause_before_merge_raw = git_ops_raw.get("pause_before_merge")
+    pause_before_merge = bool(pause_before_merge_raw) if pause_before_merge_raw is not None else None
     if defer_pr and not single_branch_raw:
         raise ValueError(f"Config file '{path}': git_ops.defer_pr requires git_ops.single_branch to be set.")
+    if pause_before_merge and defer_pr:
+        raise ValueError(
+            f"Config file '{path}': git_ops.pause_before_merge: true is incompatible with "
+            "git_ops.defer_pr: true. defer_pr defers PR creation; pause_before_merge pauses "
+            "after PR creation. They are mutually exclusive."
+        )
+    if pause_before_merge and single_branch_raw:
+        raise ValueError(
+            f"Config file '{path}': git_ops.pause_before_merge: true is incompatible with "
+            f"git_ops.single_branch: {single_branch_raw!r}. Single-branch mode puts every "
+            "work unit's commits on one branch; there is no per-unit branch to create a PR from."
+        )
+    pr_resolution_raw = git_ops_raw.get("pr_review_resolution") or {}
+    pr_resolution_enabled_raw = pr_resolution_raw.get("enabled")
+    pr_resolution_decision_raw = pr_resolution_raw.get("decision_blocks")
+    pr_review_resolution = PrReviewResolutionConfig(
+        enabled=bool(pr_resolution_enabled_raw) if pr_resolution_enabled_raw is not None else None,
+        agents=list(pr_resolution_raw.get("agents") or []),
+        decision_blocks=bool(pr_resolution_decision_raw) if pr_resolution_decision_raw is not None else None,
+        settle_seconds=pr_resolution_raw.get("settle_seconds"),
+        poll_interval=pr_resolution_raw.get("poll_interval"),
+    )
+    inline_cleanup_raw = git_ops_raw.get("inline_orphan_cleanup")
+    ci_failure_retry_raw = git_ops_raw.get("ci_failure_retry")
     git_ops = GitOpsConfig(
         update_submodule=bool(git_ops_raw.get("update_submodule", False)),
         single_branch=single_branch_raw,
         defer_pr=defer_pr,
+        pause_before_merge=pause_before_merge,
+        inline_orphan_cleanup=bool(inline_cleanup_raw) if inline_cleanup_raw is not None else None,
+        ci_failure_retry=bool(ci_failure_retry_raw) if ci_failure_retry_raw is not None else None,
+        orphan_patterns=list(git_ops_raw.get("orphan_patterns") or []),
+        pr_review_resolution=pr_review_resolution,
+    )
+
+    # Populate DebugConfig from YAML debug block (absent keys yield None).
+    debug_raw = raw.get("debug") or {}
+    debug = DebugConfig(
+        check_registration_retries=debug_raw.get("check_registration_retries"),
+        check_registration_delay_seconds=debug_raw.get("check_registration_delay_seconds"),
+        blocked_recovery_window_seconds=debug_raw.get("blocked_recovery_window_seconds"),
     )
 
     # Populate ReportConfig from YAML report block.
@@ -641,6 +767,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         stop_hook=stop_hook,
         manifest_amendment=manifest_amendment,
         task_factory=task_factory,
+        debug=debug,
         allowed_orgs=allowed_orgs,
         judge_model=raw.get("judge_model") or None,
         executor_model=raw.get("executor_model") or None,

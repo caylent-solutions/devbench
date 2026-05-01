@@ -1632,3 +1632,213 @@ class TestRepoConfigRuntimeFields:
         assert rt.repos["org/repo"].resolved_checkout_path is None
         # validated_repo remains populated even without workspace_root.
         assert rt.repos["org/repo"].validated_repo == "org/repo"
+
+
+@pytest.mark.unit
+class TestVNextCanonicalConfig:
+    """v-next release: every PR-119 toggle is now a YAML field; CI retry default-on; debug section."""
+
+    def _write(self, path: Path, content: str) -> Path:
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    def test_inline_orphan_cleanup_parses_from_yaml(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            git_ops:
+              inline_orphan_cleanup: false
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.git_ops.inline_orphan_cleanup is False
+
+    def test_ci_failure_retry_parses_from_yaml(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            git_ops:
+              ci_failure_retry: false
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.git_ops.ci_failure_retry is False
+
+    def test_pause_before_merge_parses_from_yaml(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            git_ops:
+              pause_before_merge: true
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.git_ops.pause_before_merge is True
+
+    def test_pause_before_merge_incompatible_with_defer_pr(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            git_ops:
+              single_branch: my-branch
+              defer_pr: true
+              pause_before_merge: true
+            """,
+        )
+        with pytest.raises(ValueError, match=r"incompatible with .*defer_pr"):
+            load_runtime_config(cfg, {})
+
+    def test_pause_before_merge_incompatible_with_single_branch(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            git_ops:
+              single_branch: my-branch
+              pause_before_merge: true
+            """,
+        )
+        with pytest.raises(ValueError, match=r"incompatible with .*single_branch"):
+            load_runtime_config(cfg, {})
+
+    def test_orphan_patterns_parse_from_yaml(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            git_ops:
+              orphan_patterns:
+                - "**/.coverage*"
+                - "**/__pycache__/**"
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.git_ops.orphan_patterns == ["**/.coverage*", "**/__pycache__/**"]
+
+    def test_pr_review_resolution_parses_full_block(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            git_ops:
+              pr_review_resolution:
+                enabled: true
+                agents: ["github-copilot[bot]", "amazon-q-developer[bot]"]
+                decision_blocks: false
+                settle_seconds: 90
+                poll_interval: 10
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.git_ops.pr_review_resolution.enabled is True
+        assert rt.git_ops.pr_review_resolution.agents == [
+            "github-copilot[bot]",
+            "amazon-q-developer[bot]",
+        ]
+        assert rt.git_ops.pr_review_resolution.decision_blocks is False
+        assert rt.git_ops.pr_review_resolution.settle_seconds == 90
+        assert rt.git_ops.pr_review_resolution.poll_interval == 10
+
+    def test_pr_review_resolution_absent_yields_none_defaults(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.git_ops.pr_review_resolution.enabled is None
+        assert rt.git_ops.pr_review_resolution.agents == []
+
+    def test_ci_failure_log_bytes_parses_from_yaml(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            limits:
+              ci_failure_log_bytes: 65536
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.limits.ci_failure_log_bytes == 65536
+
+    def test_debug_section_parses_full_block(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            debug:
+              check_registration_retries: 20
+              check_registration_delay_seconds: 10
+              blocked_recovery_window_seconds: 3600
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.debug.check_registration_retries == 20
+        assert rt.debug.check_registration_delay_seconds == 10
+        assert rt.debug.blocked_recovery_window_seconds == 3600
+
+    def test_debug_section_absent_yields_none_defaults(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.debug.check_registration_retries is None
+        assert rt.debug.blocked_recovery_window_seconds is None
+
+    def test_schema_rejects_unknown_git_ops_key(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            git_ops:
+              not_a_real_field: true
+            """,
+        )
+        with pytest.raises(ValueError, match="schema validation"):
+            load_runtime_config(cfg, {})
+
+    def test_schema_rejects_non_boolean_pause_before_merge(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            git_ops:
+              pause_before_merge: "yes"
+            """,
+        )
+        with pytest.raises(ValueError, match="schema validation"):
+            load_runtime_config(cfg, {})
+
+    def test_schema_rejects_unknown_debug_key(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            debug:
+              not_a_real_debug_field: 99
+            """,
+        )
+        with pytest.raises(ValueError, match="schema validation"):
+            load_runtime_config(cfg, {})

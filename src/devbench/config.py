@@ -49,6 +49,7 @@ from devbench.constants import (
     DEFAULT_MAX_RETRY_ATTEMPTS,
     DEFAULT_ORCHESTRATOR_POLL_INTERVAL,
     DEFAULT_OUTPUT_TRUNCATION_LIMIT,
+    DEFAULT_PAUSE_BEFORE_MERGE,
     DEFAULT_PR_REVIEW_AGENTS,
     DEFAULT_PR_REVIEW_DECISION_BLOCKS,
     DEFAULT_PR_REVIEW_POLL_INTERVAL,
@@ -113,10 +114,47 @@ def _env_truthy(env_var: str) -> bool:
     """Return True iff the given environment variable is set to a truthy string.
 
     Truthy strings are ``1``, ``true``, ``yes`` (case-insensitive). Empty or
-    unset returns False. Used for opt-out flags whose env var represents the
-    *negative* of the resolved boolean (e.g. ``DEVBENCH_DISABLE_*``).
+    unset returns False. Used for one-shot opt-out flags whose env var
+    represents the *negative* of the resolved boolean (no longer used by
+    devbench's config-resolution layer, kept for tests and operational
+    overrides).
     """
     return os.environ.get(env_var, "").strip().lower() in ("1", "true", "yes")
+
+
+def _resolve_bool(env_var: str, yaml_value: bool | None, default: bool) -> bool:
+    """Resolve a boolean config value with env > YAML > default precedence.
+
+    Recognised env values (case-insensitive):
+      truthy: ``1``, ``true``, ``yes``, ``on``
+      falsy:  ``0``, ``false``, ``no``, ``off``
+
+    Empty / unset env value falls through to the YAML value (when not None)
+    or the default. Any other env value raises ``ValueError`` so
+    misconfigurations fail fast at process start.
+
+    Args:
+        env_var: name of the environment variable to consult.
+        yaml_value: parsed YAML value, or ``None`` when the field is absent.
+        default: constant default to return when both env and YAML are
+            absent.
+
+    Returns:
+        Resolved boolean.
+
+    Raises:
+        ValueError: when the env var is set to an unparseable value.
+    """
+    raw = os.environ.get(env_var, "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    if raw:
+        raise ValueError(f"{env_var} must be one of 1/0/true/false/yes/no/on/off (case-insensitive); got {raw!r}")
+    if yaml_value is not None:
+        return yaml_value
+    return default
 
 
 def _resolve_str_tuple(env_var: str, default: tuple[str, ...]) -> tuple[str, ...]:
@@ -219,58 +257,83 @@ GITHUB_CHECK_TIMEOUT_SECONDS: int = _resolve_int(
 # `gh pr checks` up to CHECK_REGISTRATION_RETRIES times when the local
 # `<repo>/.github/workflows/*.y[a]ml` glob proves CI exists but `gh`
 # returns "no checks reported" (Actions has not yet enqueued the run).
-# Both knobs override via env vars; the YAML layer does not own them
-# because the issue is repo-state-dependent and operators tune them
-# at runtime if their CI cadence is unusual.
+# Lives under the YAML `debug:` section because operators only tune
+# these when investigating an unusual orchestrator cadence; everyday
+# workspaces leave them at the constant default.
 CHECK_REGISTRATION_RETRIES: int = _resolve_int(
-    "JUDGE_CHECK_REGISTRATION_RETRIES", None, DEFAULT_CHECK_REGISTRATION_RETRIES
+    "JUDGE_CHECK_REGISTRATION_RETRIES",
+    RUNTIME_CONFIG.debug.check_registration_retries,
+    DEFAULT_CHECK_REGISTRATION_RETRIES,
 )
 CHECK_REGISTRATION_DELAY_SECONDS: int = _resolve_int(
-    "JUDGE_CHECK_REGISTRATION_DELAY_SECONDS", None, DEFAULT_CHECK_REGISTRATION_DELAY_SECONDS
+    "JUDGE_CHECK_REGISTRATION_DELAY_SECONDS",
+    RUNTIME_CONFIG.debug.check_registration_delay_seconds,
+    DEFAULT_CHECK_REGISTRATION_DELAY_SECONDS,
 )
-# Part-1: recency cap for the AWAITING_AUTO_RECOVERY audit-comment
-# heuristic in the 3-state blocked-task classifier. Operators tune
-# via JUDGE_BLOCKED_RECOVERY_WINDOW_SECONDS when their orchestrator
-# iteration cadence is slower than the default 30-minute window.
+# Recency cap for the AWAITING_AUTO_RECOVERY audit-comment heuristic in
+# the 3-state blocked-task classifier. Lives under YAML `debug:` for
+# the same reason as the registration knobs above.
 BLOCKED_RECOVERY_WINDOW_SECONDS: int = _resolve_int(
-    "JUDGE_BLOCKED_RECOVERY_WINDOW_SECONDS", None, DEFAULT_BLOCKED_RECOVERY_WINDOW_SECONDS
+    "JUDGE_BLOCKED_RECOVERY_WINDOW_SECONDS",
+    RUNTIME_CONFIG.debug.blocked_recovery_window_seconds,
+    DEFAULT_BLOCKED_RECOVERY_WINDOW_SECONDS,
 )
-# Phase 1: inline orphan-cleanup default. ``True`` makes ``cmd_git_ops`` run
-# the cleanup as a chore commit during git-ops; ``False`` falls back to the
-# legacy proposal-task path (with cross-task de-duplication). Operators set
-# ``DEVBENCH_DISABLE_INLINE_ORPHAN_CLEANUP=1`` to opt out.
-INLINE_ORPHAN_CLEANUP_ENABLED: bool = DEFAULT_INLINE_ORPHAN_CLEANUP_ENABLED and not _env_truthy(
-    "DEVBENCH_DISABLE_INLINE_ORPHAN_CLEANUP"
+# Phase 1: inline orphan-cleanup. Default-on; YAML
+# `git_ops.inline_orphan_cleanup: false` or env
+# `JUDGE_INLINE_ORPHAN_CLEANUP=0` (or `false` / `no` / `off`) opts out.
+INLINE_ORPHAN_CLEANUP_ENABLED: bool = _resolve_bool(
+    "JUDGE_INLINE_ORPHAN_CLEANUP",
+    RUNTIME_CONFIG.git_ops.inline_orphan_cleanup,
+    DEFAULT_INLINE_ORPHAN_CLEANUP_ENABLED,
 )
-# Phase 2 (#115): CI-failure feedback log byte cap. Caps the size of the
-# trimmed failing-job log written to ``.devbench/ci-failures/<id>-<n>.log``
-# so the executor's feedback payload stays bounded.
-CI_FAILURE_LOG_BYTES: int = _resolve_int("JUDGE_CI_FAILURE_LOG_BYTES", None, DEFAULT_CI_FAILURE_LOG_BYTES)
-# Phase 2 (#115): opt-in toggle for the CI-failure executor retry path.
-# When False, ``cmd_git_ops`` returns rc=1 BLOCKED on CI failure (legacy
-# behaviour). When True, it returns rc=2 to signal the orchestrator to
-# re-invoke the executor with the failing job log as feedback, bounded by
-# ``MAX_RETRY_ATTEMPTS``.
-CI_FAILURE_RETRY_ENABLED: bool = DEFAULT_CI_FAILURE_RETRY_ENABLED or _env_truthy("JUDGE_CI_FAILURE_RETRY_ENABLED")
-# Phase 3 (#116): PR review-comment polling controls. ``PR_REVIEW_AGENTS``
-# empty + ``PR_REVIEW_DECISION_BLOCKS`` False makes the entire phase a no-op;
-# the merge proceeds immediately after CI passes. Tune both for repos that
-# wire up Copilot / Q-Dev / internal review bots.
-PR_REVIEW_SETTLE_SECONDS: int = _resolve_int("JUDGE_PR_REVIEW_SETTLE_SECONDS", None, DEFAULT_PR_REVIEW_SETTLE_SECONDS)
-PR_REVIEW_POLL_INTERVAL: int = _resolve_int("JUDGE_PR_REVIEW_POLL_INTERVAL", None, DEFAULT_PR_REVIEW_POLL_INTERVAL)
-PR_REVIEW_DECISION_BLOCKS: bool = (
-    DEFAULT_PR_REVIEW_DECISION_BLOCKS
-    if not os.environ.get("JUDGE_PR_REVIEW_DECISION_BLOCKS", "").strip()
-    else _env_truthy("JUDGE_PR_REVIEW_DECISION_BLOCKS")
+# Phase 2 (#115): CI-failure feedback log byte cap.
+CI_FAILURE_LOG_BYTES: int = _resolve_int(
+    "JUDGE_CI_FAILURE_LOG_BYTES",
+    RUNTIME_CONFIG.limits.ci_failure_log_bytes,
+    DEFAULT_CI_FAILURE_LOG_BYTES,
 )
-PR_REVIEW_AGENTS: tuple[str, ...] = _resolve_str_tuple("JUDGE_PR_REVIEW_AGENTS", DEFAULT_PR_REVIEW_AGENTS)
-# Phase 3 (#116): top-level toggle for the PR review-comment polling path.
-# When False (default), the phase is a no-op regardless of agents/decision
-# settings -- preserves legacy merge cadence. Operators set
-# ``JUDGE_PR_REVIEW_RESOLUTION_ENABLED=1`` to opt in and additionally set
-# ``JUDGE_PR_REVIEW_AGENTS`` for bot-comment polling.
-PR_REVIEW_RESOLUTION_ENABLED: bool = DEFAULT_PR_REVIEW_RESOLUTION_ENABLED or _env_truthy(
-    "JUDGE_PR_REVIEW_RESOLUTION_ENABLED"
+# Phase 2 (#115): CI-failure executor retry. Default-on (FLIPPED in the
+# v-next release); YAML `git_ops.ci_failure_retry: false` or env
+# `JUDGE_CI_FAILURE_RETRY_ENABLED=0` opts out.
+CI_FAILURE_RETRY_ENABLED: bool = _resolve_bool(
+    "JUDGE_CI_FAILURE_RETRY_ENABLED",
+    RUNTIME_CONFIG.git_ops.ci_failure_retry,
+    DEFAULT_CI_FAILURE_RETRY_ENABLED,
+)
+# Phase 3 (#116): PR review-comment polling. Default-off; YAML
+# `git_ops.pr_review_resolution.enabled: true` + `agents: [...]` opts in.
+PR_REVIEW_SETTLE_SECONDS: int = _resolve_int(
+    "JUDGE_PR_REVIEW_SETTLE_SECONDS",
+    RUNTIME_CONFIG.git_ops.pr_review_resolution.settle_seconds,
+    DEFAULT_PR_REVIEW_SETTLE_SECONDS,
+)
+PR_REVIEW_POLL_INTERVAL: int = _resolve_int(
+    "JUDGE_PR_REVIEW_POLL_INTERVAL",
+    RUNTIME_CONFIG.git_ops.pr_review_resolution.poll_interval,
+    DEFAULT_PR_REVIEW_POLL_INTERVAL,
+)
+PR_REVIEW_DECISION_BLOCKS: bool = _resolve_bool(
+    "JUDGE_PR_REVIEW_DECISION_BLOCKS",
+    RUNTIME_CONFIG.git_ops.pr_review_resolution.decision_blocks,
+    DEFAULT_PR_REVIEW_DECISION_BLOCKS,
+)
+PR_REVIEW_AGENTS: tuple[str, ...] = _resolve_str_tuple(
+    "JUDGE_PR_REVIEW_AGENTS",
+    tuple(RUNTIME_CONFIG.git_ops.pr_review_resolution.agents) or DEFAULT_PR_REVIEW_AGENTS,
+)
+PR_REVIEW_RESOLUTION_ENABLED: bool = _resolve_bool(
+    "JUDGE_PR_REVIEW_RESOLUTION_ENABLED",
+    RUNTIME_CONFIG.git_ops.pr_review_resolution.enabled,
+    DEFAULT_PR_REVIEW_RESOLUTION_ENABLED,
+)
+# Issue #101: pause-before-merge. Default-off; YAML
+# `git_ops.pause_before_merge: true` or env `JUDGE_PAUSE_BEFORE_MERGE=1`
+# opts in. Mutually exclusive with `defer_pr` and `single_branch`
+# (validated at YAML load).
+PAUSE_BEFORE_MERGE: bool = _resolve_bool(
+    "JUDGE_PAUSE_BEFORE_MERGE",
+    RUNTIME_CONFIG.git_ops.pause_before_merge,
+    DEFAULT_PAUSE_BEFORE_MERGE,
 )
 _claude_model = os.environ.get("JUDGE_CLAUDE_MODEL", "")
 if not _claude_model:

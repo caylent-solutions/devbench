@@ -823,9 +823,13 @@ class TestCmdGitOpsChecksGate:
 
     def test_cmd_git_ops_returns_error_when_checks_fail(self, tmp_path: Path) -> None:
         """
-        Given: wait_for_checks returns False (checks failed)
+        Given: wait_for_checks returns False (checks failed) and the
+            CI-failure executor retry path is opted out via YAML
+            (``git_ops.ci_failure_retry: false``)
         When: cmd_git_ops is called
-        Then: returns 1 and merge_pr is never called (AC-4)
+        Then: returns 1 and merge_pr is never called (AC-4 -- legacy
+            BLOCKED path; see TestCiFailureRetry for the rc=2 default
+            behaviour after the v-next flip).
         """
         unit = self._make_unit()
         mock_parser = MagicMock()
@@ -840,6 +844,7 @@ class TestCmdGitOpsChecksGate:
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
             patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
+            patch("devbench.config.CI_FAILURE_RETRY_ENABLED", False),
         ):
             result = cli.cmd_git_ops("E202-F1-S1-T2")
 

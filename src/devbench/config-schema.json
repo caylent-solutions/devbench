@@ -143,6 +143,57 @@
         "defer_pr": {
           "type": "boolean",
           "description": "When true, git-ops commits locally only (no push, no PR, no merge). Use git-ops-finalize to push and create the PR after all work units are complete. Only meaningful when single_branch is set."
+        },
+        "pause_before_merge": {
+          "type": "boolean",
+          "description": "When true, cmd_git_ops pushes the PR and waits for green CI then transitions the work unit to in-review instead of merging; the orchestrator's loop reconciles in-review tasks via cmd_check_merge on the next iteration. Issue #101. Default false. Mutually exclusive with defer_pr: true and single_branch: <name> (validated at config load)."
+        },
+        "inline_orphan_cleanup": {
+          "type": "boolean",
+          "description": "When true (the default), cmd_git_ops runs cleanup_tracked_orphans inline as a devbench-authored chore commit before the task's commit when build/state orphan paths are detected. When false, falls back to the legacy proposal-task path. Phase 1 of the orphan-cascade fix. Override via JUDGE_INLINE_ORPHAN_CLEANUP."
+        },
+        "ci_failure_retry": {
+          "type": "boolean",
+          "description": "When true (the default), cmd_git_ops returns rc=2 on CI failure to trigger an executor retry with the failing-job log as feedback. When false, returns rc=1 BLOCKED on the first CI failure (legacy behaviour). Issue #115. Override via JUDGE_CI_FAILURE_RETRY_ENABLED."
+        },
+        "orphan_patterns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Operator override of the built-in orphan-pattern fnmatch list (terraform state, terragrunt cache, Python pycache, coverage, etc.). When non-empty, REPLACES the built-in list entirely. Override via DEVBENCH_ORPHAN_IGNORE_PATTERNS. Default: [] (use the built-in list)."
+        },
+        "pr_review_resolution": {
+          "type": "object",
+          "description": "PR review-comment polling settings (issue #116). Disabled by default. When enabled, cmd_git_ops polls gh pr view for asynchronous bot review feedback (Copilot, Q-Dev, internal review bots) before merging.",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Top-level toggle. When false (default), the entire phase is a no-op. Override via JUDGE_PR_REVIEW_RESOLUTION_ENABLED."
+            },
+            "agents": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Comma-separated allowlist of GitHub login names whose unresolved review comments block the merge. Empty default; populate when review bots are configured on the target repo. Override via JUDGE_PR_REVIEW_AGENTS."
+            },
+            "decision_blocks": {
+              "type": "boolean",
+              "description": "When true (default), reviewDecision == CHANGES_REQUESTED hard-blocks the merge regardless of bot allowlist. Override via JUDGE_PR_REVIEW_DECISION_BLOCKS."
+            },
+            "settle_seconds": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Total settle-window length in seconds for the PR review poll loop. Default 60. Override via JUDGE_PR_REVIEW_SETTLE_SECONDS."
+            },
+            "poll_interval": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Per-poll cadence in seconds inside the settle window. Default 5. Override via JUDGE_PR_REVIEW_POLL_INTERVAL."
+            }
+          }
         }
       }
     },
@@ -197,6 +248,33 @@
           "type": "integer",
           "minimum": 1,
           "description": "Character limit for per-file LLM preview."
+        },
+        "ci_failure_log_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Byte cap for the trimmed failing-job log written to .devbench/ci-failures/<id>-<n>.log when ci_failure_retry is enabled. Default 32768. Override via JUDGE_CI_FAILURE_LOG_BYTES."
+        }
+      }
+    },
+    "debug": {
+      "type": "object",
+      "description": "Diagnostic-tuning knobs. Set these only when investigating a specific orchestrator-cadence problem; production workspaces leave this section absent.",
+      "additionalProperties": false,
+      "properties": {
+        "check_registration_retries": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Number of times wait_for_checks retries gh pr checks when 'no checks reported' contradicts the local workflow-file glob (issue #114 race-defence). Default 12. Override via JUDGE_CHECK_REGISTRATION_RETRIES."
+        },
+        "check_registration_delay_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Sleep between check-registration retries, in seconds. Default 5. Override via JUDGE_CHECK_REGISTRATION_DELAY_SECONDS."
+        },
+        "blocked_recovery_window_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Recency cap for the AWAITING_AUTO_RECOVERY signal in the 3-state blocked-task classifier. Tasks whose most recent [BLOCKED] audit-comment timestamp is older than this window fall through to NEEDS_OPERATOR_ATTENTION. Default 1800. Override via JUDGE_BLOCKED_RECOVERY_WINDOW_SECONDS."
         }
       }
     },

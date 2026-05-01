@@ -285,19 +285,27 @@ DEVBENCH_INLINE_CLEANUP_COMMIT_MESSAGE: str = (
 # entire executor context window. Override via ``JUDGE_CI_FAILURE_LOG_BYTES``
 # when a backlog's CI legitimately produces longer relevant tails.
 DEFAULT_CI_FAILURE_LOG_BYTES: int = 32768
-# Issue #115: opt-in toggle for the CI-failure executor retry path. Default
-# False to preserve backward-compatible rc=1 BLOCKED behaviour for existing
-# operators. Set ``JUDGE_CI_FAILURE_RETRY_ENABLED=1`` to enable -- ``cmd_git_ops``
-# will then return rc=2 on CI failure (signalling executor retry) until the
-# shared retry budget (``MAX_RETRY_ATTEMPTS``) is exhausted, at which point
-# rc=1 BLOCKED applies. The retry budget is shared with the existing
-# review-judge retry budget so total per-task work stays bounded.
-DEFAULT_CI_FAILURE_RETRY_ENABLED: bool = False
+# Issue #115: CI-failure executor retry path. Default ``True`` so every
+# backlog benefits without per-shell setup; set
+# ``JUDGE_CI_FAILURE_RETRY_ENABLED=0`` (or ``false`` / ``no`` / ``off``) or
+# ``git_ops.ci_failure_retry: false`` in YAML to opt out. ``cmd_git_ops``
+# returns rc=2 on CI failure (signalling executor retry) until the shared
+# retry budget (``MAX_RETRY_ATTEMPTS``) is exhausted, at which point rc=1
+# BLOCKED applies. The retry budget is shared with the existing review-judge
+# retry budget so total per-task work stays bounded.
+DEFAULT_CI_FAILURE_RETRY_ENABLED: bool = True
 # Issue #116: opt-in toggle for the PR review-comment polling path. Default
 # False; both this AND a non-empty ``JUDGE_PR_REVIEW_AGENTS`` (or
 # ``JUDGE_PR_REVIEW_DECISION_BLOCKS=1``) are required for the phase to
 # activate. Allows the phase to ship without changing default merge cadence.
 DEFAULT_PR_REVIEW_RESOLUTION_ENABLED: bool = False
+# Issue #101: pause-before-merge mode. Default False so existing single-PR
+# and multi-PR flows are unchanged. When True, ``cmd_git_ops`` pushes the PR
+# and waits for green CI then transitions to ``in-review`` instead of
+# merging; the orchestrator's loop reconciles ``in-review`` tasks via
+# ``cmd_check_merge`` on the next iteration. Mutually exclusive with
+# ``defer_pr: true`` and ``single_branch: <name>`` (validated at config load).
+DEFAULT_PAUSE_BEFORE_MERGE: bool = False
 # Issue #116: PR review-comment poll/settle window. After ``wait_for_checks``
 # returns True, ``cmd_git_ops`` polls ``gh pr view`` for late-arriving
 # REQUEST_CHANGES reviews and bot comments for up to this many seconds before

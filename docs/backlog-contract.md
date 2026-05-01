@@ -89,6 +89,8 @@ ln -s /real/path/to/my-repo $JUDGE_WORKSPACE_ROOT/my-repo
 
 The symlink goes at the sibling path (`<workspace>/my-repo`), NOT inside `backlog/` (`<workspace>/backlog/my-repo`). The loader walks the workspace from `<workspace>/<checkout_directory>`; a symlink at that path is transparent. Putting the symlink under `backlog/` makes `_check_orphans` flag it as an orphaned work-unit file.
 
+Symlinked checkouts are first-class supported across every devbench engine path, including the inline orphan-cleanup chore commit, the manifest-scope assertion, the `cleanup-tracked-orphans` CLI, and `git-ops`'s commit / push / merge sequence. Each helper resolves the path symmetrically with its peers (every helper either passes paths through unmodified or canonicalises them via `Path.resolve()` -- never one of each), so a symlinked layout produces the same on-disk outcome as a non-symlinked layout. If you ever see a `ValueError` mentioning `relative_to` or a "path-mismatch" audit comment, that is a devbench bug: file an issue and include the audit-comment text + the symlink mapping.
+
 ---
 
 ## Config Validation

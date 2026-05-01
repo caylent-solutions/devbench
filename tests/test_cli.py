@@ -6812,6 +6812,62 @@ class TestInlineOrphanCleanup:
         ).stdout
         assert "feature.py" in staged
 
+    @pytest.mark.skipif(
+        __import__("sys").platform == "win32",
+        reason="os.symlink requires elevated privileges on Windows",
+    )
+    def test_inline_cleanup_handles_symlinked_repo_path(self, tmp_repo_dir: Path, tmp_path: Path) -> None:
+        """Issue #125 regression: inline cleanup must work when the caller
+        passes a symlinked path that resolves to the real checkout.
+
+        ``cleanup_tracked_orphans`` calls ``Path.resolve()`` internally so
+        its ``OrphanReport.gitignore_path`` lives in resolved-path space.
+        ``_run_inline_cleanup_steps`` must therefore also resolve the
+        ``repo_path`` it receives before calling
+        ``gitignore_path.relative_to(repo_path)``; otherwise
+        ``Path.relative_to`` (which is not symlink-aware) raises
+        ``ValueError`` and BLOCKS the work unit. This test exercises the
+        documented workspace-layout pattern where target repos sit
+        elsewhere on disk and a symlink under
+        ``JUDGE_WORKSPACE_ROOT/<checkout_directory>`` points at them.
+        """
+        import subprocess
+
+        from devbench.constants import DEVBENCH_INLINE_CLEANUP_COMMIT_MESSAGE
+
+        self._seed_orphan_in_repo(tmp_repo_dir)
+        symlinked_path = tmp_path / "via-symlink"
+        symlinked_path.symlink_to(tmp_repo_dir)
+
+        result = cli._inline_orphan_cleanup_or_refuse(
+            unit_id="E0-F1-S1-T1",
+            repo_path=symlinked_path,
+            detected=[".coverage (1)"],
+        )
+        assert result is False
+
+        # Cleanup commit landed under the canonical chore message.
+        log = subprocess.run(
+            ["git", "-C", str(tmp_repo_dir), "log", "-1", "--format=%s"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert log == DEVBENCH_INLINE_CLEANUP_COMMIT_MESSAGE
+
+        # Orphan untracked.
+        ls = subprocess.run(
+            ["git", "-C", str(tmp_repo_dir), "ls-files"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        assert ".coverage (1)" not in ls
+
+        # .gitignore extended with the devbench-managed block.
+        gitignore = (tmp_repo_dir / ".gitignore").read_text(encoding="utf-8")
+        assert ".coverage*" in gitignore
+
     def test_inline_cleanup_filters_out_staged_only_orphans(self, tmp_repo_dir: Path) -> None:
         """A staged-only orphan (newly added by executor, not yet in HEAD) is
         un-staged + ignored; no cleanup commit is needed because there's

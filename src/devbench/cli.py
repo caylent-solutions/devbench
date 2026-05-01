@@ -1771,11 +1771,23 @@ def _run_inline_cleanup_steps(
 
     Raises :class:`_InlineCleanupError` on any subprocess failure so the
     caller can convert to a single refuse-return.
+
+    Resolves *repo_path* once at the function head so every subsequent
+    operation runs in the same path-space as ``cleanup_tracked_orphans``
+    does internally (it calls ``repo_path.resolve()`` at its own
+    function head). Without this, a symlinked checkout (the documented
+    workspace layout for repos that cannot live next to
+    ``JUDGE_WORKSPACE_ROOT``) produces an ``OrphanReport`` whose
+    ``gitignore_path`` lives in resolved-path space while this caller's
+    ``repo_path`` lives in symlink-path space, and the
+    ``gitignore_path.relative_to(repo_path)`` call below raises
+    ``ValueError``. Issue #125.
     """
     from devbench.constants import DEVBENCH_INLINE_CLEANUP_COMMIT_MESSAGE
     from devbench.git_orphans import cleanup_tracked_orphans
     from devbench.github.git_ops import GitOpsService
 
+    repo_path = repo_path.resolve()
     ops = GitOpsService()
     try:
         _, staged_out, _ = ops._git(["diff", "--cached", "--name-only"], repo_path)

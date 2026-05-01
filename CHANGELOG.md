@@ -107,6 +107,16 @@ since the last release. PR #119 carries every change.
   macOS bash 3.2.57** (issue #120). Replaced `local -n` nameref with
   `${!1}` indirect read + `printf -v "$1"` write (bash 3.0+
   compatible).
+- **Inline orphan cleanup ValueError on symlinked checkouts**
+  (issue #125). `_run_inline_cleanup_steps` now resolves
+  `repo_path` once at the function head so it lives in the same
+  path-space as `cleanup_tracked_orphans`'s internally-resolved
+  `OrphanReport.gitignore_path`. Every workspace following the
+  documented symlinked-checkout layout (`docs/backlog-contract.md`
+  Workspace layout) now runs the inline cleanup correctly. New
+  regression test
+  `tests/test_cli.py::TestInlineOrphanCleanup::test_inline_cleanup_handles_symlinked_repo_path`
+  pins the fix.
 
 ### Renamed / Removed
 

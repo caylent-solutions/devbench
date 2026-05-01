@@ -106,4 +106,5 @@ filterwarnings = [
 markers = [
     "unit: unit tests (run with pytest -m unit)",
     "functional: functional/integration tests (run with pytest -m functional)",
+    "integration: integration tests (run with pytest -m integration)",
 ]

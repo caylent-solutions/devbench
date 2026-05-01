@@ -15,6 +15,14 @@ Process the backlog using the steps below, repeating until all work units are do
 
 1. `uv run devbench validate-backlog` -- abort if the backlog has integrity errors.
 
+1b. **Reconcile in-review tasks (issue #101 pause-before-merge).** When `git_ops.pause_before_merge: true` is set in `backlog/config/devbench.yaml`, work units transition to `in-review` (instead of `done`) once their PR is created and CI passes; the orchestrator's loop reconciles those tasks here at the top of each iteration. Skip this entire step when `pause_before_merge` is unset or `false` (the YAML's absence of the flag is the same as `false`).
+   a. Enumerate every `in-review` work unit. The simplest enumeration is `uv run devbench status --detail` and parse the `In Review (N)` panel; if that panel is empty, skip to step 2.
+   b. For each `in-review` task ID, run `uv run devbench check-merge <id>`. The command queries `gh pr list --head <branch> --json number,state,merged,url` and:
+      - On `merged: true`: promotes the task to `done` via the existing done-gate; logs `[PR_MERGED]` audit comment.
+      - On `state == CLOSED, merged: false`: blocks the task with `[BLOCKED]` audit comment naming the PR.
+      - On `state == OPEN`: no-op; the task stays `in-review` and the loop moves on.
+   c. After processing every in-review task, proceed to step 2. `devbench next` skips `in-review` tasks (they are not actionable for the executor) so the orchestrator naturally picks up the next claimable work unit.
+
 2. `uv run devbench next` -- get the next actionable unit ID.
    - If output is `ALL_DONE`: print a completion summary and exit.
    - If output is `NO_ACTIONABLE`: print a blocked summary and exit.

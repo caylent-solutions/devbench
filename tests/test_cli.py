@@ -7263,3 +7263,177 @@ class TestPrReviewResolution:
         assert rc == 1
         msg = mgr._append_agent_comment.call_args.args[2]
         assert msg.startswith("[PR_BOT_FAIL_BLOCKED] ")
+
+
+class TestPauseBeforeMerge:
+    """Issue #101: pause-before-merge mode lifecycle."""
+
+    def _wu_file(self, tmp_path: Path) -> Path:
+        wu = tmp_path / "E0-F1-S1-T1.md"
+        wu.write_text(
+            "# E0-F1-S1-T1: t\n\n## Status: in-progress\n\n## Description\n\nx\n\n## Comments\n\n",
+            encoding="utf-8",
+        )
+        return wu
+
+    def test_pause_transitions_to_in_review(self, tmp_path: Path) -> None:
+        wu = self._wu_file(tmp_path)
+        mgr = MagicMock()
+        with patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
+            rc = cli._pause_before_merge(
+                unit_id="E0-F1-S1-T1",
+                pr_number=42,
+                pr_url="https://github.com/ex/foo/pull/42",
+                wu_file=wu,
+                mgr=mgr,
+            )
+        assert rc == 0
+        mgr.force_status.assert_called_once()
+        # 4th positional arg of force_status is the new status
+        args = mgr.force_status.call_args.args
+        assert args[3] == "in-review"
+        msg = mgr._append_agent_comment.call_args.args[2]
+        assert "[PR_AWAITING_MERGE]" in msg
+        assert "PR #42" in msg
+
+    def test_pause_skips_audit_when_no_wu_file(self, tmp_path: Path) -> None:
+        mgr = MagicMock()
+        rc = cli._pause_before_merge(
+            unit_id="E0-F1-S1-T1",
+            pr_number=42,
+            pr_url="https://github.com/ex/foo/pull/42",
+            wu_file=None,
+            mgr=mgr,
+        )
+        assert rc == 0
+        mgr.force_status.assert_not_called()
+        mgr._append_agent_comment.assert_not_called()
+
+
+class TestCmdCheckMerge:
+    """Issue #101: cmd_check_merge reconciles in-review work units."""
+
+    def _make_unit(self, repo: str = "caylent-solutions/devbench") -> WorkUnit:
+        return WorkUnit(
+            id="E0-F1-S1-T1",
+            title="t",
+            status=WorkUnitStatus.IN_REVIEW,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T1.md"),
+            repo=repo,
+            branch="backlog/e0-f1-s1-t1",
+            dependencies=[],
+        )
+
+    def test_returns_0_with_done_when_pr_merged(self, tmp_path: Path) -> None:
+        ops = MagicMock()
+        ops._gh.return_value = (0, json.dumps([{"number": 42, "state": "MERGED", "merged": True, "url": "u"}]), "")
+        mgr = MagicMock()
+        wu_file = tmp_path / "E0-F1-S1-T1.md"
+        wu_file.write_text("stub")
+        with (
+            patch("devbench.cli._resolve_git_ops_context", return_value=(self._make_unit(), "ex/foo", tmp_path)),
+            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
+            patch("devbench.cli.BacklogManager", return_value=mgr),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.github.git_ops.GitOpsService", return_value=ops),
+        ):
+            rc = cli.cmd_check_merge("E0-F1-S1-T1")
+        assert rc == 0
+        mgr.mark_done.assert_called_once()
+
+    def test_returns_0_with_blocked_when_pr_closed(self, tmp_path: Path) -> None:
+        ops = MagicMock()
+        ops._gh.return_value = (0, json.dumps([{"number": 42, "state": "CLOSED", "merged": False, "url": "u"}]), "")
+        mgr = MagicMock()
+        wu_file = tmp_path / "E0-F1-S1-T1.md"
+        wu_file.write_text("stub")
+        with (
+            patch("devbench.cli._resolve_git_ops_context", return_value=(self._make_unit(), "ex/foo", tmp_path)),
+            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
+            patch("devbench.cli.BacklogManager", return_value=mgr),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.github.git_ops.GitOpsService", return_value=ops),
+        ):
+            rc = cli.cmd_check_merge("E0-F1-S1-T1")
+        assert rc == 0
+        mgr.mark_blocked.assert_called_once()
+
+    def test_noop_when_pr_still_open(self, tmp_path: Path) -> None:
+        ops = MagicMock()
+        ops._gh.return_value = (0, json.dumps([{"number": 42, "state": "OPEN", "merged": False, "url": "u"}]), "")
+        mgr = MagicMock()
+        with (
+            patch("devbench.cli._resolve_git_ops_context", return_value=(self._make_unit(), "ex/foo", tmp_path)),
+            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli.BacklogManager", return_value=mgr),
+            patch("devbench.github.git_ops.GitOpsService", return_value=ops),
+        ):
+            rc = cli.cmd_check_merge("E0-F1-S1-T1")
+        assert rc == 0
+        mgr.mark_done.assert_not_called()
+        mgr.mark_blocked.assert_not_called()
+
+    def test_returns_0_with_no_pr_found(self, tmp_path: Path) -> None:
+        ops = MagicMock()
+        ops._gh.return_value = (0, "[]", "")
+        with (
+            patch("devbench.cli._resolve_git_ops_context", return_value=(self._make_unit(), "ex/foo", tmp_path)),
+            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli.BacklogManager", return_value=MagicMock()),
+            patch("devbench.github.git_ops.GitOpsService", return_value=ops),
+        ):
+            rc = cli.cmd_check_merge("E0-F1-S1-T1")
+        assert rc == 0
+
+    def test_returns_1_on_gh_failure(self, tmp_path: Path) -> None:
+        ops = MagicMock()
+        ops._gh.return_value = (1, "", "boom")
+        with (
+            patch("devbench.cli._resolve_git_ops_context", return_value=(self._make_unit(), "ex/foo", tmp_path)),
+            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli.BacklogManager", return_value=MagicMock()),
+            patch("devbench.github.git_ops.GitOpsService", return_value=ops),
+        ):
+            rc = cli.cmd_check_merge("E0-F1-S1-T1")
+        assert rc == 1
+
+    def test_returns_1_on_invalid_json(self, tmp_path: Path) -> None:
+        ops = MagicMock()
+        ops._gh.return_value = (0, "{not json", "")
+        with (
+            patch("devbench.cli._resolve_git_ops_context", return_value=(self._make_unit(), "ex/foo", tmp_path)),
+            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli.BacklogManager", return_value=MagicMock()),
+            patch("devbench.github.git_ops.GitOpsService", return_value=ops),
+        ):
+            rc = cli.cmd_check_merge("E0-F1-S1-T1")
+        assert rc == 1
+
+    def test_returns_1_when_done_gate_refuses(self, tmp_path: Path) -> None:
+        """Done-gate refuses merge promotion when judges did not pass -- rc=1."""
+        ops = MagicMock()
+        ops._gh.return_value = (0, json.dumps([{"number": 42, "state": "MERGED", "merged": True, "url": "u"}]), "")
+        mgr = MagicMock()
+        mgr.mark_done.side_effect = RuntimeError("done-gate failure")
+        wu_file = tmp_path / "E0-F1-S1-T1.md"
+        wu_file.write_text("stub")
+        with (
+            patch("devbench.cli._resolve_git_ops_context", return_value=(self._make_unit(), "ex/foo", tmp_path)),
+            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
+            patch("devbench.cli.BacklogManager", return_value=mgr),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.github.git_ops.GitOpsService", return_value=ops),
+        ):
+            rc = cli.cmd_check_merge("E0-F1-S1-T1")
+        assert rc == 1
+
+
+class TestCheckMergeRegistration:
+    """The check-merge command must be registered in the CLI dispatch table."""
+
+    def test_check_merge_in_commands(self) -> None:
+        assert "check-merge" in cli._COMMANDS
+        handler, argc, _help = cli._COMMANDS["check-merge"]
+        assert handler is cli.cmd_check_merge
+        assert argc == 1

@@ -140,8 +140,11 @@ from devbench.constants import (
     FINALIZE_COMMIT_TEMPLATE,
     FINALIZE_PR_TITLE_TEMPLATE,
     KNOWN_JUDGE_NAMES,
+    STATUS_BLOCKED,
+    STATUS_DONE,
     STATUS_IN_PROGRESS,
     STATUS_IN_QUEUE,
+    STATUS_IN_REVIEW,
     STATUS_SEPARATOR_WIDTH,
     VALID_TDD_PHASES,
 )
@@ -2615,6 +2618,47 @@ def cmd_git_ops(unit_id: str) -> int:
     if review_rc != 0:
         return review_rc
 
+    return _dispatch_post_ci_pass(
+        ops=ops,
+        unit_id=unit_id,
+        canonical_repo=canonical_repo,
+        repo_path=repo_path,
+        branch=branch,
+        pr_number=pr_number,
+        pr_url=pr_url,
+        wu_file=wu_file,
+        mgr=mgr,
+    )
+
+
+def _dispatch_post_ci_pass(
+    *,
+    ops: object,
+    unit_id: str,
+    canonical_repo: str,
+    repo_path: Path,
+    branch: str,
+    pr_number: int,
+    pr_url: str,
+    wu_file: Path | None,
+    mgr: object,
+) -> int:
+    """Issue #101 dispatch: pause-before-merge vs merge-now.
+
+    Extracted so :func:`cmd_git_ops` stays under the per-function
+    return-statement budget (PLR0911).
+    """
+    from devbench.config import PAUSE_BEFORE_MERGE
+
+    if PAUSE_BEFORE_MERGE:
+        return _pause_before_merge(
+            unit_id=unit_id,
+            pr_number=pr_number,
+            pr_url=pr_url,
+            wu_file=wu_file,
+            mgr=mgr,
+        )
+
     return _finalize_merge_and_submodule(
         ops=ops,
         unit_id=unit_id,
@@ -2626,6 +2670,181 @@ def cmd_git_ops(unit_id: str) -> int:
         wu_file=wu_file,
         mgr=mgr,
     )
+
+
+def _pause_before_merge(
+    *,
+    unit_id: str,
+    pr_number: int,
+    pr_url: str,
+    wu_file: Path | None,
+    mgr: object,
+) -> int:
+    """Issue #101: transition to in-review, do NOT merge.
+
+    The orchestrator's loop reconciles in-review tasks via
+    :func:`cmd_check_merge` on the next iteration. The PR remains open
+    on GitHub awaiting human review + merge; the orchestrator continues
+    with other actionable work units.
+
+    Returns 0 -- the work unit moved successfully to in-review.
+    """
+    if wu_file is not None:
+        mgr.force_status(  # type: ignore[attr-defined]
+            wu_file,
+            BACKLOG_INDEX,
+            unit_id,
+            STATUS_IN_REVIEW,
+        )
+        mgr._append_agent_comment(  # type: ignore[attr-defined]
+            wu_file,
+            "git_ops",
+            f"[PR_AWAITING_MERGE] PR #{pr_number} open and awaiting human review + merge: {pr_url}",
+        )
+    logger.info(
+        "Pause-before-merge: %s transitioned to in-review (PR #%d %s)",
+        unit_id,
+        pr_number,
+        pr_url,
+    )
+    print(
+        json.dumps(
+            {
+                "unit_id": unit_id,
+                "status": STATUS_IN_REVIEW,
+                "pr_number": pr_number,
+                "pr_url": pr_url,
+                "mode": "pause-before-merge",
+            }
+        )
+    )
+    return 0
+
+
+def _check_merge_fetch_pr_state(
+    ops: object,
+    canonical_repo: str,
+    unit_id: str,
+    branch: str,
+) -> tuple[int, list[dict[str, object]]]:
+    """Query gh for a PR matching *branch*; return (rc, pr_records).
+
+    rc=1 + empty list means the gh call failed; the caller short-circuits
+    with rc=1. rc=0 + empty list means no PR found for the branch (caller
+    treats as still-in-review with `pr_state=no-pr-found`).
+    """
+    rc, stdout, stderr = ops._gh(  # type: ignore[attr-defined]
+        ["pr", "list", "--head", branch, "--state", "all", "--json", "number,state,merged,url"],
+        repo=canonical_repo,
+    )
+    if rc != 0:
+        print(
+            f"ERROR: gh pr list failed for {unit_id} (head={branch}): {stderr.strip()}",
+            file=sys.stderr,
+        )
+        return 1, []
+    try:
+        pr_records = json.loads(stdout) if stdout.strip() else []
+    except json.JSONDecodeError as exc:
+        print(f"ERROR: gh pr list returned invalid JSON for {unit_id}: {exc}", file=sys.stderr)
+        return 1, []
+    if not isinstance(pr_records, list):
+        return 0, []
+    return 0, [r for r in pr_records if isinstance(r, dict)]
+
+
+def _check_merge_handle_merged(
+    *,
+    unit_id: str,
+    pr_number: object,
+    pr_url: str,
+    wu_file: Path | None,
+    mgr: object,
+) -> int:
+    """Promote a merged-PR work unit to done via the done-gate."""
+    if wu_file is not None:
+        try:
+            mgr.mark_done(wu_file, BACKLOG_INDEX, unit_id)  # type: ignore[attr-defined]
+            mgr._append_agent_comment(  # type: ignore[attr-defined]
+                wu_file,
+                "git_ops",
+                f"[PR_MERGED] PR #{pr_number} merged externally; transitioned to done: {pr_url}",
+            )
+        except RuntimeError as exc:
+            print(
+                f"ERROR: cannot mark {unit_id} done after merge -- done-gate refused: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+    print(json.dumps({"unit_id": unit_id, "status": STATUS_DONE, "pr_number": pr_number, "pr_url": pr_url}))
+    return 0
+
+
+def cmd_check_merge(unit_id: str) -> int:
+    """Reconcile a pause-before-merge work unit's PR state.
+
+    Issue #101 reconciliation step. Queries the PR for *unit_id* via
+    ``gh pr list --head <branch> --json number,state,merged``:
+
+    - **merged** -> transition to ``done`` via :meth:`BacklogManager.mark_done`
+      (enforces the done-gate: every required judge must have passed).
+    - **closed without merge** -> transition to ``blocked`` with an audit
+      comment naming the PR.
+    - **still open** -> log + return 0; orchestrator picks it up next loop.
+
+    Returns 0 in every case (the orchestrator's loop reads the JSON
+    output, not rc, to decide what to do next). Returns 1 only on hard
+    failure (cannot resolve work unit, gh API failure that prevents a
+    decision, done-gate refusal).
+    """
+    from devbench.github.git_ops import GitOpsService
+
+    unit, canonical_repo, _repo_path = _resolve_git_ops_context(unit_id)
+    wu_file = _resolve_unit_file(unit)
+    mgr = BacklogManager()
+    ops = GitOpsService()
+
+    branch = unit.branch or f"backlog/{unit_id.lower()}"
+    fetch_rc, pr_records = _check_merge_fetch_pr_state(ops, canonical_repo, unit_id, branch)
+    if fetch_rc != 0:
+        return fetch_rc
+
+    if not pr_records:
+        print(json.dumps({"unit_id": unit_id, "status": STATUS_IN_REVIEW, "pr_state": "no-pr-found"}))
+        return 0
+
+    pr = pr_records[0]
+    pr_number = pr.get("number")
+    pr_state = str(pr.get("state") or "").upper()
+    pr_merged = bool(pr.get("merged"))
+    pr_url = str(pr.get("url") or "")
+
+    if pr_merged:
+        return _check_merge_handle_merged(unit_id=unit_id, pr_number=pr_number, pr_url=pr_url, wu_file=wu_file, mgr=mgr)
+
+    if pr_state == "CLOSED":
+        if wu_file is not None:
+            mgr.mark_blocked(
+                wu_file,
+                BACKLOG_INDEX,
+                unit_id,
+                f"PR #{pr_number} closed without merge: {pr_url}",
+            )
+        print(json.dumps({"unit_id": unit_id, "status": STATUS_BLOCKED, "pr_number": pr_number, "pr_url": pr_url}))
+        return 0
+
+    print(
+        json.dumps(
+            {
+                "unit_id": unit_id,
+                "status": STATUS_IN_REVIEW,
+                "pr_number": pr_number,
+                "pr_state": pr_state,
+                "pr_url": pr_url,
+            }
+        )
+    )
+    return 0
 
 
 def _finalize_merge_and_submodule(
@@ -4093,6 +4312,15 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
     "ensure-branch": (cmd_ensure_branch, 1, "Create or switch to work unit branch: ensure-branch <id>"),
     "git-ops": (cmd_git_ops, 1, "Run git operations for a work unit: git-ops <id>"),
     "git-ops-finalize": (cmd_git_ops_finalize, 1, "Push single branch and create PR: git-ops-finalize <repo>"),
+    "check-merge": (
+        cmd_check_merge,
+        1,
+        (
+            "Reconcile a pause-before-merge work unit's PR state (issue #101). "
+            "Promotes to done on merged, blocks on closed-without-merge, "
+            "no-ops on still-open: check-merge <id>"
+        ),
+    ),
     "cleanup-tracked-orphans": (
         cmd_cleanup_tracked_orphans,
         1,

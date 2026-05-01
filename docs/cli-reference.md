@@ -477,6 +477,23 @@ uv run devbench git-ops-finalize <repo>
 
 Single-branch mode only: push the shared branch and create one PR for every accumulated commit. Use once, after every work unit targeting this repo is done. See [README Single-branch mode](../README.md#single-branch-mode) and [architecture.md §6](architecture.md#6-multi-pr-vs-single-pr-mode).
 
+### `check-merge`
+
+```
+uv run devbench check-merge <id>
+```
+
+Issue #101 reconciliation step for `pause_before_merge: true` workspaces. Queries `gh pr list --head <branch> --json number,state,merged,url` for the PR associated with the work unit's branch and dispatches:
+
+- **PR merged externally**: promote the work unit to `done` via the existing done-gate (every required judge must have passed in the most recent round). Logs `[PR_MERGED]` audit comment.
+- **PR closed without merge**: transition the work unit to `blocked` with a `[BLOCKED]` audit comment naming the PR.
+- **PR still open**: no-op; the orchestrator's loop picks the work unit up again on the next iteration.
+- **No PR found for branch**: prints `{"pr_state": "no-pr-found"}` and returns 0; the orchestrator treats it the same as "still open".
+
+Returns rc=0 in every normal case; rc=1 only on hard failure (gh API failure, malformed JSON, done-gate refusal). Output is a single JSON line so the orchestrator skill's step 1b reconciliation can parse it.
+
+The orchestrator skill (`plugin/devbench/skills/orchestrate/SKILL.md`) calls this command on every `in-review` work unit at the top of each loop iteration when `git_ops.pause_before_merge: true` is set in the YAML. See [`docs/git-ops-modes.md`](git-ops-modes.md) for the full pause-before-merge mode reference and [ADR-13](adr/13-pause-before-merge.md) for the design rationale.
+
 ### `git-ops` orphan-pattern auto-emit (Phase 10 hardening)
 
 When the `git-ops` command refuses a commit because of detected orphan paths, the auto-emitted cleanup proposal claims `.gitignore`. If a pre-existing in-queue / blocked / proposed peer task already lists `.gitignore` in its own `## Changes Manifest`, the auto-emitter now scans the live index and auto-wires `add-dep <peer> <new-cleanup>` for every conflicting peer in the SAME repo. The dep-chain is what the E224 Manifest-Conflict rule already accepts as a valid resolution -- so a backlog that previously halted with `Manifest conflict on '.gitignore' ... claimed by <peer>, <new-cleanup>` now auto-resolves and the orchestrator continues without operator intervention. Tasks already in `done` / `declined` are skipped (they are terminal). The auto-wired peer IDs appear in the stderr message that the auto-emit prints.

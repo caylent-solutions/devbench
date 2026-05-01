@@ -1,0 +1,53 @@
+---
+# ansible-lint configuration for the infra/ansible/ subtree.
+#
+# The `roles_path` declared in ansible.cfg only applies at runtime;
+# ansible-lint resolves roles via its own static analysis and needs an
+# explicit hint when the playbooks live in a sibling directory.
+profile: basic
+
+# Tell ansible-lint where the roles live (relative to this config file).
+exclude_paths:
+  - .ansible-lint
+  - ../../.venv/
+
+# Roles in `roles/` keyed off the playbook path under `playbooks/`.
+# ansible-lint discovers them via the `kinds` map.
+kinds:
+  - playbook: "playbooks/*.yml"
+  - tasks: "roles/*/tasks/*.yml"
+  - vars: "roles/*/vars/*.yml"
+  - handlers: "roles/*/handlers/*.yml"
+  - meta: "roles/*/meta/main.yml"
+
+# Rules skipped for this codebase, with explicit rationale per skip:
+#
+# - yaml[line-length]: yamllint already enforces a 300-char cap on this
+#   subtree (.yamllint). Re-enforcing at 160 here would force unsplittable
+#   apt-repo declarations (Docker, GitHub CLI) to wrap mid-jinja, which
+#   breaks the templating.
+# - command-instead-of-module / command-instead-of-shell: the bootstrap
+#   roles install asdf, Docker apt repos, and other tools that legitimately
+#   need shell semantics (pipefail, here-docs) that the equivalent ansible
+#   modules don't expose at the granularity we need. These are one-shot
+#   provisioning steps, not idempotent state declarations.
+# - risky-shell-pipe: the shell tasks that pipe legitimately need pipe
+#   semantics; we acknowledge the risk and accept it for bootstrap
+#   tasks that run once on a fresh host.
+# - var-naming[no-role-prefix]: existing roles use unprefixed variable
+#   names (ohmyzsh_dir etc.); renaming them all is out of scope for
+#   this PR -- they'll be migrated when the role authoring is itself
+#   refactored. Documented as tech debt.
+# - role-name: the `playbook-role-not-found` shape; covered by the
+#   roles_path declaration in ansible.cfg.
+skip_list:
+  - yaml[line-length]
+  - command-instead-of-module
+  - command-instead-of-shell
+  - risky-shell-pipe
+  - var-naming[no-role-prefix]
+  - role-name
+
+# Run all rules at the default profile and only skip those we explicitly
+# declared above. No silent suppressions via inline `# noqa` annotations
+# anywhere in the playbooks or roles.

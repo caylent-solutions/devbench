@@ -85,7 +85,14 @@ jobs:
       - name: ansible-lint
         run: |
           set -euo pipefail
-          ansible-lint infra/ansible
+          # Run from the ansible subtree so ansible.cfg's `roles_path = roles`
+          # is auto-discovered AND so .ansible-lint sits at the CWD where
+          # ansible-lint searches for it. The ANSIBLE_ROLES_PATH env var is
+          # belt-and-suspenders for ansible-lint's own role-resolution
+          # path, which doesn't always honor ansible.cfg at static-
+          # analysis time.
+          cd infra/ansible
+          ANSIBLE_ROLES_PATH="$(pwd)/roles" ansible-lint .
 
   helper-tests:
     name: devbench-session unit tests

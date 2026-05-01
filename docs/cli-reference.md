@@ -140,7 +140,7 @@ Single-shot poll that detects a stuck `/devbench:orchestrate` loop and writes a 
 A run is considered stuck when **both** conditions hold:
 
 1. `BACKLOG.md` contains at least one row with `Status: in-progress`.
-2. The most recent dated line in `src/devbench/logs/orchestrator.log` is older than `--idle-minutes` (default 5).
+2. The most recent dated line in the orchestrator log is older than `--idle-minutes` (default 5). Path resolution mirrors `devbench report` -- (1) `JUDGE_LOG_FILE`, (2) `log_file:` in `backlog/config/devbench.yaml`, (3) `<JUDGE_WORKSPACE_ROOT>/logs/orchestrator.log`.
 
 On stuck detection the marker file is written with:
 

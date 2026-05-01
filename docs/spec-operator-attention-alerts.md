@@ -1,7 +1,7 @@
 # SPEC: Operator-attention alerting surface
 
 > **Status:** Future work. Design sketch only; no implementation.
-> Tracked in [roadmap.md](roadmap.md). Referenced from [ADR-10](adr/10-multi-target-proposal-wiring.md).
+> Tracked via the [open GitHub issues](https://github.com/caylent-solutions/devbench/issues) labelled `enhancement`. Referenced from [ADR-10](adr/10-multi-target-proposal-wiring.md).
 
 This document captures the design context for a future devbench feature that proactively notifies a human when a decision-requiring item exists. It ships as a spec so the reasoning and trade-offs are preserved when an implementer eventually picks it up. Nothing in this file is a decision; every option enumerated below is still open.
 

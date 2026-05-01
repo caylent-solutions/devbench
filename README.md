@@ -7,7 +7,7 @@ An LLM-as-Judge orchestration system that processes a backlog of work units auto
 DevBench takes a structured backlog of work units (epics, features, stories, tasks) and drives them through a TDD implement / parallel-judge-review / security-review / git-merge pipeline without human intervention between tasks.
 
 - **Autonomous SDLC pipeline.** One operator writes the spec; the orchestrator drives every task from claim to merged PR.
-- **Real LLM review at every gate.** Four review judges (code, test, docs, scope) run in parallel; a security judge runs after they pass. Every verdict is logged as an audit comment on the work unit.
+- **Real LLM review at every gate.** Four review judges (code, test, docs, scope) run in parallel; a security judge runs after they pass. Three additional agents -- `manifest-amender`, `blocker-resolver`, `task-factory` -- handle the executor-driven scope-expansion path (`tdd_green_production_fix` amendments, blocker decomposition, draft work-unit materialisation). Every verdict is logged as an audit comment on the work unit.
 - **Auditable by default.** Every agent action writes a timestamped comment on the work unit file. The orchestrator can resume from any point after a restart because state lives on disk, not in memory.
 
 ### Try it now (5 commands)
@@ -54,21 +54,33 @@ Orchestrator (devbench:orchestrate SKILL / interactive Claude session)
   |
   |-- Step 0: sweep-proposals         -- materialise any pending proposal JSONs
   |-- Pre-flight: validate-backlog    -- abort if index / files are out of sync
-  |-- Parse BACKLOG.md, find next actionable work unit
+  |-- Parse BACKLOG.md, find next actionable work unit (topological-depth order, issue #121)
   |-- Implement work unit via TDD (RED -> GREEN -> REFACTOR)  [executor agent]
+  |     |-- Optional: manifest-amender judges a `tdd_green_production_fix`
+  |     |   amendment when the executor needs to expand the Manifest mid-cycle
   |-- Run repo's task runners (make test, make validate)
   |-- Stage files, submit to judge review  [review-supervisor agent]
   |     |-- code-reviewer       -- SOLID, DRY, fail-fast, security, 12-factor
   |     |-- test-reviewer       -- TDD discipline, test quality, real assertions
   |     |-- doc-reviewer        -- accuracy, completeness, sync with code
   |     |-- changes-manifest    -- actual changes vs declared manifest
-  |     |-- security-reviewer   -- CodeQL, Dependabot, secret-scanning alerts
-  |-- If judges fail: read feedback, fix, resubmit (max retries configurable)
+  |-- If review judges fail: read feedback, fix, resubmit
+  |     |-- Per-judge or global retry budget (issue #122)
   |     |-- Prior feedback is injected into the next review to prevent contradictions
-  |-- Git ops: commit, push, create PR, wait for CI, merge
+  |-- security-reviewer  -- CodeQL, Dependabot, secret-scanning alerts (sequential gate after the 4 review judges pass)
+  |-- Git ops: commit, push, create PR, wait for CI, merge (or pause-before-merge per #101)
+  |     |-- CI failure: rc=2 -> executor retry with the failing-job log (issue #115)
+  |     |-- PR-bot review feedback: rc=3 -> executor retry with structured comment payload (issue #116)
+  |     |-- Build/state orphan in working tree: chore commit before the task commit (inline orphan cleanup)
   |-- Update BACKLOG.md status to Done (parents auto-roll up when children complete)
-  |     |-- Done-gate: mark-done verifies all 4 review judges logged REVIEW_PASS
+  |     |-- Done-gate: mark-done verifies all 4 review judges logged REVIEW_PASS in the most recent round
   |-- Repeat until every actionable unit is done
+
+Recovery cascade (fires when an amendment / executor retry exhausts):
+  manifest-amender REJECT
+    -> blocker-resolver writes a proposal JSON
+    -> task-factory materialises 0..N draft work units
+    -> validate-backlog wires deps so the source task unblocks when drafts complete
 ```
 
 Five judges must pass before a work unit merges. The four review judges are tracked via `[REVIEW_PASS]` comments; the done-gate verifies all four passed in the most recent round. Security runs as a separate sequential gate after the four pass and before the git commit. A security failure writes `[SECURITY_FAIL]` followed by `[REVIEW_REJECTED]`; the `[REVIEW_REJECTED]` resets the done-gate window so the four review judges re-run after the security fix lands.
@@ -100,7 +112,7 @@ When sending file contents to the LLM, large inputs are truncated to fit context
 
 ### Monitoring
 
-- `tail -f src/devbench/logs/orchestrator.log` for the main log.
+- `tail -f $JUDGE_WORKSPACE_ROOT/logs/<session>-orchestrator.log` for the main log (path is declared in `backlog/config/devbench.yaml` under `log_file:`; the legacy `src/devbench/logs/orchestrator.log` path is no longer used).
 - Every work unit `.md` has a `## Comments` section with timestamped entries from every judge and orchestrator action.
 - `uv run devbench watch` prints a one-screen live dashboard (read-only). See [docs/watch-activity.md](docs/watch-activity.md).
 - `uv run devbench hook-tail` pretty-tails the plugin hook event stream in real time (read-only). See [docs/hook-activity.md](docs/hook-activity.md).
@@ -132,8 +144,7 @@ uv run devbench <command> [args]
 make install              # Install runtime and dev dependencies
 make plugin-install       # Register the devbench plugin at user scope
 make start-interactive    # Auth GitHub, launch interactive Claude session
-make start                # Auth GitHub, launch orchestrator in background
-make run-backlog          # Run orchestrator in foreground (assumes GH_TOKEN set)
+make start                # Auth GitHub, launch the orchestrator
 make validate             # Full validation: lint + type check + tests + coverage
 make lint                 # ruff + bandit
 make format               # Auto-format with ruff
@@ -159,8 +170,17 @@ For the full annotated YAML, value-resolution precedence, and every config key, 
 
 - **Single-branch mode** (one shared branch for the whole backlog, one PR at the end instead of one per work unit): set `git_ops.single_branch` and `git_ops.defer_pr` in `devbench.yaml`. See [architecture.md §6](docs/architecture.md#6-multi-pr-vs-single-pr-mode).
 - **Stop-hook circuit breaker** (prevents the orchestrator from stalling after context compaction; auto-allows stop after a configurable burst): tune `stop_hook.max_blocks`, `stop_hook.window_seconds`, `stop_hook.stale_task_minutes` in `devbench.yaml`, or override via `JUDGE_STOP_MAX_BLOCKS`, `JUDGE_STOP_WINDOW_SECONDS`, `JUDGE_STOP_STALE_MINUTES`. See [architecture.md §9 Hooks layer](docs/architecture.md#9-hooks-layer).
+- **Pause-before-merge** (orchestrator pushes the PR + waits for green CI then transitions the task to `in-review` instead of merging; reconciles via `devbench check-merge` on the next loop iteration): set `git_ops.pause_before_merge: true` in `devbench.yaml`, or override via `JUDGE_PAUSE_BEFORE_MERGE`. Cannot be combined with `defer_pr` or `single_branch`. See [docs/git-ops-modes.md](docs/git-ops-modes.md) and [ADR-13](docs/adr/13-pause-before-merge.md).
+- **CI-failure executor retry** (default-on; rc=2 from `git-ops` triggers an executor retry with the failing-job log as feedback under `.devbench/ci-failures/<id>-<n>.log`): toggle via `git_ops.ci_failure_retry` in `devbench.yaml` or `JUDGE_CI_FAILURE_RETRY_ENABLED`.
+- **PR-bot review polling** (between CI-pass and merge, polls for unresolved Copilot / Q-Dev / internal-bot comments and re-invokes the executor with structured feedback): opt in via `git_ops.pr_review_resolution.enabled: true` plus the `agents:` allowlist.
+- **Per-judge executor retry budgets** (different judges can flake at different rates; tune retries per failing judge instead of raising the global cap): set `max_executor_retries_per_judge:` map in `devbench.yaml`. Each entry falls back to `max_executor_retries` when absent.
+- **Manifest amendments** (executors can request a `tdd_green_production_fix` to expand their Changes Manifest mid-cycle when TDD GREEN reveals required production fixes; the manifest-amender judges scope, approach-coherence, and standards): toggle via `manifest_amendment.enabled`. See [docs/manifest-amendments.md](docs/manifest-amendments.md) and [ADR-02](docs/adr/02-manifest-amendment-workflow.md).
+- **Task-factory loop** (after manifest-amendment rejects, blocker-resolver decomposes the rejection and task-factory materialises draft work units the source task can depend on): toggle via `task_factory.enabled` and `task_factory.auto_accept_proposals`. See [docs/task-factory.md](docs/task-factory.md) and [ADR-03](docs/adr/03-task-factory.md).
+- **HOLD lifecycle** (`devbench hold <id>` / `devbench unhold <id>`): tasks deliberately deferred without breaking dep-chain math.
 - **Display timezone** in `devbench report` and `devbench hook-tail`: set `report.display_timezone` (IANA zone name) in `devbench.yaml`, or override per invocation via `JUDGE_REPORT_TIMEZONE`. See [model-pricing.md](docs/model-pricing.md#other-settings-under-report).
 - **Per-model token pricing** (needed when you run anything other than Opus 4.7): drop the matching `report.token_cost_per_million_*` block from [model-pricing.md](docs/model-pricing.md) into `devbench.yaml`.
+- **Cost premium multipliers**: `report.data_residency_multiplier` (default 1.10) and `report.fast_mode_multiplier` (default 6.0) are applied per-call to the residency-flagged / fast-mode token subsets. Composes with cache + base-rate multipliers, applies before the `report.token_cost_discount` (issue #124).
+- **Hook-tail column caps**: tune `hook_tail.agent_width`, `hook_tail.tool_width`, `hook_tail.description_max` (default 120), `hook_tail.stdout_preview_max` in `devbench.yaml`, or override via `JUDGE_HOOK_TAIL_*` env vars (issue #134).
 
 ## Workspace setup
 
@@ -283,7 +303,7 @@ The done-gate found that not all four review judges (`code_review`, `test_review
 
 ### Judge contradicts its previous feedback
 
-This should not happen with the prior-feedback injection. If it does, check the orchestrator log for previous feedback entries (`grep "judge feedback for <unit-id>" src/devbench/logs/orchestrator.log`).
+This should not happen with the prior-feedback injection. If it does, check the orchestrator log for previous feedback entries (`grep "judge feedback for <unit-id>" $JUDGE_WORKSPACE_ROOT/logs/<session>-orchestrator.log`).
 
 ### GitHub token expired
 

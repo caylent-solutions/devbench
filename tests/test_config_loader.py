@@ -9,6 +9,7 @@ from __future__ import annotations
 import textwrap
 from pathlib import Path
 
+import jsonschema
 import pytest
 
 from devbench.config_loader import (
@@ -1895,3 +1896,108 @@ class TestSampleConfigCompleteness:
             "Every schema-known field must appear in the sample-config so the "
             "canonical reference covers every operator-tunable knob."
         )
+
+
+class TestPerJudgeRetriesConfig:
+    """Issue #122 regression: per-judge executor retry budget overrides.
+
+    YAML schema map ``max_executor_retries_per_judge`` lets operators tune
+    per-judge retries (e.g., 5 retries for flakey test_review, 2 for stable
+    doc_review) without raising the global cap. Schema validation rejects
+    unknown judge names; runtime helper revalidates as defense-in-depth.
+    """
+
+    @staticmethod
+    def _write(path: Path, content: str) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    def test_only_global_when_per_judge_absent(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            max_executor_retries: 7
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.max_executor_retries == 7
+        assert result.max_executor_retries_per_judge == {}
+
+    def test_per_judge_override_loaded(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            max_executor_retries: 5
+            max_executor_retries_per_judge:
+              test_review: 20
+              doc_review: 2
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.max_executor_retries == 5
+        assert result.max_executor_retries_per_judge == {"test_review": 20, "doc_review": 2}
+
+    def test_schema_rejects_unknown_judge_name(self, tmp_path: Path) -> None:
+        """JSONSchema additionalProperties: false rejects unknown names; the
+        loader wraps the schema error in ValueError with the original cause."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            max_executor_retries_per_judge:
+              not_a_real_judge: 5
+            """,
+        )
+        with pytest.raises(ValueError, match="failed schema validation") as exc_info:
+            load_runtime_config(cfg, {})
+        assert isinstance(exc_info.value.__cause__, jsonschema.ValidationError)
+
+    def test_schema_rejects_zero_or_negative_retry_value(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            max_executor_retries_per_judge:
+              test_review: 0
+            """,
+        )
+        with pytest.raises(ValueError, match="failed schema validation"):
+            load_runtime_config(cfg, {})
+
+    def test_loader_helper_rejects_non_mapping(self) -> None:
+        from devbench.config_loader import _load_per_judge_retries
+
+        with pytest.raises(ValueError, match="must be a mapping"):
+            _load_per_judge_retries(["not", "a", "dict"])
+
+    def test_loader_helper_returns_empty_dict_when_none(self) -> None:
+        from devbench.config_loader import _load_per_judge_retries
+
+        assert _load_per_judge_retries(None) == {}
+
+    def test_loader_helper_rejects_unknown_judge_at_runtime(self) -> None:
+        """Defense-in-depth: even if the JSONSchema layer is bypassed, the
+        runtime helper rejects unknown judge names with an actionable error."""
+        from devbench.config_loader import _load_per_judge_retries
+
+        with pytest.raises(ValueError, match="unknown judge"):
+            _load_per_judge_retries({"not_a_real_judge": 5})
+
+    def test_loader_helper_rejects_bool_as_int(self) -> None:
+        """Python's bool is a subclass of int; the helper must reject it
+        explicitly so a YAML ``true`` doesn't silently become budget=1."""
+        from devbench.config_loader import _load_per_judge_retries
+
+        with pytest.raises(ValueError, match="positive integer"):
+            _load_per_judge_retries({"test_review": True})

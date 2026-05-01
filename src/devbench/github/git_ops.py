@@ -4,6 +4,7 @@ All methods validate the target repository against the allow-list before
 performing any operation.
 """
 
+import json
 import logging
 import os
 import re
@@ -307,8 +308,40 @@ class GitOpsService:
         self._git(["commit", "-m", message], repo_path)
         self.logger.info("Committed locally to %s on %s (push deferred)", branch, repo)
 
+    def find_open_pr(self, repo: str, branch: str, *, repo_path: Path | None = None) -> str | None:
+        """Return the URL of an open PR on ``branch``, or ``None`` if none exists.
+
+        Issue #129: ``create_pr`` is invoked a second time on a branch when the
+        executor refactors after REVIEW_PASS or when ``pr_review_resolution``
+        pushes a fix commit. Calling ``gh pr create`` twice raises
+        ``RuntimeError`` and surfaces as a hard failure. ``cmd_git_ops`` calls
+        this helper first so a pre-existing open PR is reused instead.
+        """
+        validate_repo(repo)
+        rc, stdout, _ = self._gh(
+            ["pr", "list", "--head", branch, "--state", "open", "--json", "url"],
+            cwd=repo_path,
+            repo=repo,
+        )
+        if rc != 0:
+            return None
+        try:
+            entries = json.loads(stdout) if stdout.strip() else []
+        except json.JSONDecodeError:
+            return None
+        if not entries:
+            return None
+        url = entries[0].get("url")
+        return url if isinstance(url, str) and url else None
+
     def create_pr(self, repo: str, branch: str, title: str, body: str, *, repo_path: Path | None = None) -> str:
         """Create a pull request and return its URL.
+
+        If an open PR already exists on ``branch``, returns that PR's URL
+        instead of failing -- a second git-ops invocation on a branch (after
+        a REFACTOR cycle, a ``pr_review_resolution`` fix push, or a CI-retry
+        replay) must reuse the existing PR rather than treating the duplicate
+        ``gh pr create`` as a fatal error (issue #129).
 
         Args:
             repo: GitHub repository in ``owner/name`` format.
@@ -318,13 +351,24 @@ class GitOpsService:
             repo_path: Local filesystem path to the repository.
 
         Returns:
-            The URL of the newly created pull request.
+            The URL of the (newly-created or pre-existing) pull request.
 
         Raises:
             ValueError: If the repo is not in the allow-list.
-            RuntimeError: If the ``gh`` command fails.
+            RuntimeError: If the ``gh`` command fails AND no pre-existing PR
+                          covers the failure case.
         """
         validate_repo(repo)
+
+        existing_url = self.find_open_pr(repo, branch, repo_path=repo_path)
+        if existing_url:
+            self.logger.info(
+                "Open PR already exists on %s for branch %s; reusing %s",
+                repo,
+                branch,
+                existing_url,
+            )
+            return existing_url
 
         base_branch = get_configured_default_branch(repo, RUNTIME_CONFIG)
         cmd: list[str] = [

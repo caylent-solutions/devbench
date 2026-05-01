@@ -60,7 +60,9 @@ from devbench.config import (
     REPORT_CACHE_READ_MULTIPLIER,
     REPORT_CACHE_WRITE_1HR_MULTIPLIER,
     REPORT_CACHE_WRITE_5MIN_MULTIPLIER,
+    REPORT_DATA_RESIDENCY_MULTIPLIER,
     REPORT_DISPLAY_TIMEZONE,
+    REPORT_FAST_MODE_MULTIPLIER,
     TOKEN_COST_DISCOUNT,
     TOKEN_COST_PER_M_INPUT,
     TOKEN_COST_PER_M_OUTPUT,
@@ -106,8 +108,26 @@ class HookLogTotals:
     cache_write_5m_tokens: int = 0
     cache_write_1h_tokens: int = 0
     entries_with_usage: int = 0
-    entries_us_geo: int = 0  # counted for display; per-call multipliers deferred
+    entries_us_geo: int = 0
     entries_fast_mode: int = 0
+    # Token volumes from entries flagged with ``inference_geo`` (data-residency
+    # premium, issue #124). Tracked separately so ``_compute_cost`` can apply
+    # ``report.data_residency_multiplier`` (default 1.10 from
+    # DEFAULT_DATA_RESIDENCY_MULTIPLIER) only to the residency-restricted
+    # subset of the token volume, not the full aggregate.
+    us_only_input_tokens: int = 0
+    us_only_output_tokens: int = 0
+    us_only_cache_read_tokens: int = 0
+    us_only_cache_write_5m_tokens: int = 0
+    us_only_cache_write_1h_tokens: int = 0
+    # Token volumes from entries with ``usage.speed == 'fast'`` (fast-mode
+    # premium, issue #124). Same per-subset accounting; multiplied by
+    # ``report.fast_mode_multiplier`` (default 6.0).
+    fast_input_tokens: int = 0
+    fast_output_tokens: int = 0
+    fast_cache_read_tokens: int = 0
+    fast_cache_write_5m_tokens: int = 0
+    fast_cache_write_1h_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -241,6 +261,16 @@ def _empty_totals_acc() -> dict[str, int]:
         "entries_with_usage": 0,
         "entries_us_geo": 0,
         "entries_fast_mode": 0,
+        "us_only_input_tokens": 0,
+        "us_only_output_tokens": 0,
+        "us_only_cache_read_tokens": 0,
+        "us_only_cache_write_5m_tokens": 0,
+        "us_only_cache_write_1h_tokens": 0,
+        "fast_input_tokens": 0,
+        "fast_output_tokens": 0,
+        "fast_cache_read_tokens": 0,
+        "fast_cache_write_5m_tokens": 0,
+        "fast_cache_write_1h_tokens": 0,
     }
 
 
@@ -255,22 +285,43 @@ def _extract_usage_totals(usage: object, totals_acc: dict[str, int]) -> bool:
     if not isinstance(usage, dict):
         return False
 
-    totals_acc["input_tokens"] += int(usage.get("input_tokens") or 0)
-    totals_acc["output_tokens"] += int(usage.get("output_tokens") or 0)
-    totals_acc["cache_read_tokens"] += int(usage.get("cache_read_input_tokens") or 0)
-
+    in_t = int(usage.get("input_tokens") or 0)
+    out_t = int(usage.get("output_tokens") or 0)
+    read_t = int(usage.get("cache_read_input_tokens") or 0)
     cc = usage.get("cache_creation")
     if isinstance(cc, dict):
-        totals_acc["cache_write_5m_tokens"] += int(cc.get("ephemeral_5m_input_tokens") or 0)
-        totals_acc["cache_write_1h_tokens"] += int(cc.get("ephemeral_1h_input_tokens") or 0)
+        write_5m_t = int(cc.get("ephemeral_5m_input_tokens") or 0)
+        write_1h_t = int(cc.get("ephemeral_1h_input_tokens") or 0)
     else:
         # Older format / fallback: all cache writes counted as 5-min.
-        totals_acc["cache_write_5m_tokens"] += int(usage.get("cache_creation_input_tokens") or 0)
+        write_5m_t = int(usage.get("cache_creation_input_tokens") or 0)
+        write_1h_t = 0
 
-    if usage.get("inference_geo"):
+    totals_acc["input_tokens"] += in_t
+    totals_acc["output_tokens"] += out_t
+    totals_acc["cache_read_tokens"] += read_t
+    totals_acc["cache_write_5m_tokens"] += write_5m_t
+    totals_acc["cache_write_1h_tokens"] += write_1h_t
+
+    # Per-subset token tallies for the data-residency and fast-mode premium
+    # multipliers (issue #124). Tracked per-call so the multipliers apply
+    # only to the affected token volume, not the full aggregate.
+    is_us_only = bool(usage.get("inference_geo"))
+    is_fast = usage.get("speed") == "fast"
+    if is_us_only:
         totals_acc["entries_us_geo"] += 1
-    if usage.get("speed") == "fast":
+        totals_acc["us_only_input_tokens"] += in_t
+        totals_acc["us_only_output_tokens"] += out_t
+        totals_acc["us_only_cache_read_tokens"] += read_t
+        totals_acc["us_only_cache_write_5m_tokens"] += write_5m_t
+        totals_acc["us_only_cache_write_1h_tokens"] += write_1h_t
+    if is_fast:
         totals_acc["entries_fast_mode"] += 1
+        totals_acc["fast_input_tokens"] += in_t
+        totals_acc["fast_output_tokens"] += out_t
+        totals_acc["fast_cache_read_tokens"] += read_t
+        totals_acc["fast_cache_write_5m_tokens"] += write_5m_t
+        totals_acc["fast_cache_write_1h_tokens"] += write_1h_t
 
     return True
 
@@ -343,6 +394,56 @@ def _parse_transcript_metrics(transcript_dir: Path | None, window_start: datetim
     return HookLogTotals(**totals_acc)
 
 
+_ROLE_ORCHESTRATOR = "orchestrator"
+
+
+def _role_for_entry(entry: dict) -> str:
+    """Return the per-role bucket for one transcript entry (issue #123).
+
+    Each Claude Code transcript message carries an ``attributionAgent`` field
+    naming the active agent (e.g. ``"devbench:executor"``,
+    ``"devbench:code-reviewer"``). Messages emitted by the outer orchestrator
+    loop have no attributionAgent and are bucketed as ``orchestrator``.
+    Subagent attributions are stripped of the ``devbench:`` prefix and
+    normalised to underscores so the buckets match the canonical role names
+    used elsewhere (e.g. ``executor``, ``code_review``).
+    """
+    raw = entry.get("attributionAgent")
+    if not isinstance(raw, str) or not raw:
+        return _ROLE_ORCHESTRATOR
+    # Strip plugin prefix (``devbench:``) and normalise dashes to underscores.
+    # ``code-reviewer`` -> ``code_review`` (matches REVIEW_JUDGE_NAMES).
+    base = raw.split(":", 1)[1] if ":" in raw else raw
+    return base.replace("-reviewer", "_review").replace("-", "_")
+
+
+def _parse_transcript_metrics_by_role(transcript_dir: Path | None, window_start: datetime) -> dict[str, HookLogTotals]:
+    """Like ``_parse_transcript_metrics`` but bucketed per agent role (issue #123).
+
+    Returns a dict mapping role name -> HookLogTotals. The summed totals
+    across all roles equal what ``_parse_transcript_metrics`` returns; the
+    aggregate-row contract is asserted in the regression test.
+    """
+    if transcript_dir is None or not transcript_dir.is_dir():
+        return {}
+
+    by_role: dict[str, dict[str, int]] = {}
+    for transcript_file in sorted(transcript_dir.glob("*.jsonl")):
+        for line in transcript_file.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                entry = _json.loads(line)
+            except _json.JSONDecodeError:
+                continue
+            if not _entry_in_window(entry, window_start):
+                continue
+            role = _role_for_entry(entry)
+            acc = by_role.setdefault(role, _empty_totals_acc())
+            _accumulate_transcript_message(entry.get("message"), acc)
+    return {role: HookLogTotals(**acc) for role, acc in by_role.items()}
+
+
 def _combine_totals(a: HookLogTotals, b: HookLogTotals) -> HookLogTotals:
     """Sum two HookLogTotals field-by-field. Used to merge hook-log + transcript usage."""
     return HookLogTotals(
@@ -355,6 +456,16 @@ def _combine_totals(a: HookLogTotals, b: HookLogTotals) -> HookLogTotals:
         entries_with_usage=a.entries_with_usage + b.entries_with_usage,
         entries_us_geo=a.entries_us_geo + b.entries_us_geo,
         entries_fast_mode=a.entries_fast_mode + b.entries_fast_mode,
+        us_only_input_tokens=a.us_only_input_tokens + b.us_only_input_tokens,
+        us_only_output_tokens=a.us_only_output_tokens + b.us_only_output_tokens,
+        us_only_cache_read_tokens=a.us_only_cache_read_tokens + b.us_only_cache_read_tokens,
+        us_only_cache_write_5m_tokens=a.us_only_cache_write_5m_tokens + b.us_only_cache_write_5m_tokens,
+        us_only_cache_write_1h_tokens=a.us_only_cache_write_1h_tokens + b.us_only_cache_write_1h_tokens,
+        fast_input_tokens=a.fast_input_tokens + b.fast_input_tokens,
+        fast_output_tokens=a.fast_output_tokens + b.fast_output_tokens,
+        fast_cache_read_tokens=a.fast_cache_read_tokens + b.fast_cache_read_tokens,
+        fast_cache_write_5m_tokens=a.fast_cache_write_5m_tokens + b.fast_cache_write_5m_tokens,
+        fast_cache_write_1h_tokens=a.fast_cache_write_1h_tokens + b.fast_cache_write_1h_tokens,
     )
 
 
@@ -417,26 +528,88 @@ def _compute_cost(
     cache_read_mult: float,
     cache_5m_mult: float,
     cache_1h_mult: float,
+    *,
+    data_residency_multiplier: float = 1.0,
+    fast_mode_multiplier: float = 1.0,
 ) -> CostBreakdown:
     """Compute per-token-type cost subtotals and the rolled-up total. Pure function.
 
     Cost is always computed from real per-token-type counts. No blended rate,
     no estimated input/output ratio -- if an LLM call didn't record ``usage``,
     it contributes zero cost (and an audit-visible gap in ``entries_with_usage``).
-    """
-    input_cost = totals.input_tokens * input_rate / TOKENS_PER_MILLION
-    output_cost = totals.output_tokens * output_rate / TOKENS_PER_MILLION
-    cache_read_cost = totals.cache_read_tokens * input_rate * cache_read_mult / TOKENS_PER_MILLION
-    cache_write_5m_cost = totals.cache_write_5m_tokens * input_rate * cache_5m_mult / TOKENS_PER_MILLION
-    cache_write_1h_cost = totals.cache_write_1h_tokens * input_rate * cache_1h_mult / TOKENS_PER_MILLION
 
-    total = input_cost + output_cost + cache_read_cost + cache_write_5m_cost + cache_write_1h_cost
+    Issue #124: ``data_residency_multiplier`` (default 1.0 = no boost) is
+    applied to the residency-flagged subset (``us_only_*_tokens``) AFTER the
+    cache scaling and BEFORE the discount. ``fast_mode_multiplier`` (default
+    1.0 = no boost) is applied identically to the fast-mode subset
+    (``fast_*_tokens``). Each multiplier composes with the cache + base-rate
+    multipliers per AC-FUNC-003. Discount composition is handled by the
+    caller (``apply_discount`` runs on the final total).
+
+    The premium cost contributions are added to the per-token-type buckets
+    (``input_cost`` etc.) so the breakdown row totals still sum to
+    ``total_cost`` for the existing aggregate-row contract.
+    """
+
+    def _bucket_cost(
+        in_t: int, out_t: int, read_t: int, w5_t: int, w1_t: int
+    ) -> tuple[float, float, float, float, float]:
+        return (
+            in_t * input_rate / TOKENS_PER_MILLION,
+            out_t * output_rate / TOKENS_PER_MILLION,
+            read_t * input_rate * cache_read_mult / TOKENS_PER_MILLION,
+            w5_t * input_rate * cache_5m_mult / TOKENS_PER_MILLION,
+            w1_t * input_rate * cache_1h_mult / TOKENS_PER_MILLION,
+        )
+
+    in_c, out_c, read_c, w5_c, w1_c = _bucket_cost(
+        totals.input_tokens,
+        totals.output_tokens,
+        totals.cache_read_tokens,
+        totals.cache_write_5m_tokens,
+        totals.cache_write_1h_tokens,
+    )
+
+    # Residency premium: residency-flagged tokens cost (multiplier - 1) MORE
+    # than the base. Adding to the per-bucket cost preserves the bucket-sum
+    # invariant.
+    if data_residency_multiplier != 1.0:
+        boost = data_residency_multiplier - 1.0
+        ri_c, ro_c, rr_c, rw5_c, rw1_c = _bucket_cost(
+            totals.us_only_input_tokens,
+            totals.us_only_output_tokens,
+            totals.us_only_cache_read_tokens,
+            totals.us_only_cache_write_5m_tokens,
+            totals.us_only_cache_write_1h_tokens,
+        )
+        in_c += ri_c * boost
+        out_c += ro_c * boost
+        read_c += rr_c * boost
+        w5_c += rw5_c * boost
+        w1_c += rw1_c * boost
+
+    if fast_mode_multiplier != 1.0:
+        boost = fast_mode_multiplier - 1.0
+        fi_c, fo_c, fr_c, fw5_c, fw1_c = _bucket_cost(
+            totals.fast_input_tokens,
+            totals.fast_output_tokens,
+            totals.fast_cache_read_tokens,
+            totals.fast_cache_write_5m_tokens,
+            totals.fast_cache_write_1h_tokens,
+        )
+        in_c += fi_c * boost
+        out_c += fo_c * boost
+        read_c += fr_c * boost
+        w5_c += fw5_c * boost
+        w1_c += fw1_c * boost
+
+    total = in_c + out_c + read_c + w5_c + w1_c
     return CostBreakdown(
-        input_cost=input_cost,
-        output_cost=output_cost,
-        cache_read_cost=cache_read_cost,
-        cache_write_5m_cost=cache_write_5m_cost,
-        cache_write_1h_cost=cache_write_1h_cost,
+        input_cost=in_c,
+        output_cost=out_c,
+        cache_read_cost=read_c,
+        cache_write_5m_cost=w5_c,
+        cache_write_1h_cost=w1_c,
         total_cost=total,
     )
 
@@ -533,6 +706,8 @@ def _compute_window_stats(
         REPORT_CACHE_READ_MULTIPLIER,
         REPORT_CACHE_WRITE_5MIN_MULTIPLIER,
         REPORT_CACHE_WRITE_1HR_MULTIPLIER,
+        data_residency_multiplier=REPORT_DATA_RESIDENCY_MULTIPLIER,
+        fast_mode_multiplier=REPORT_FAST_MODE_MULTIPLIER,
     )
 
     # Cache hit rate: cache reads / (cache reads + uncached input). Output and

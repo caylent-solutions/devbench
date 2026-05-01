@@ -28,6 +28,16 @@ merge_strategy: squash
 # retries, CI-failure retries, and PR-bot-feedback retries (see git_ops below).
 max_executor_retries: 10
 
+# Per-judge override of max_executor_retries (issue #122). Each value falls
+# back to max_executor_retries when absent. Useful when one judge is flakey
+# (more retries) and another is stable (fewer retries to fail-fast on real bugs).
+max_executor_retries_per_judge:
+  code_review: 10
+  test_review: 10
+  doc_review: 10
+  changes_manifest: 10
+  security_review: 10
+
 # When true, route LLM calls via AWS Bedrock instead of the Anthropic API.
 use_bedrock: false
 
@@ -152,6 +162,7 @@ report:
   cache_write_5min_multiplier: 1.25
   cache_write_1hr_multiplier: 2.0
   data_residency_multiplier: 1.10
+  fast_mode_multiplier: 6.0
   recent_pace_tasks: 10
   # Report-specific timezone override. Falls back to the top-level
   # display_timezone (and ultimately to OS local).

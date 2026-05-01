@@ -116,5 +116,9 @@ def setup_logging(level: int | None = None) -> Path:
     root_logger.addHandler(file_handler)
 
     _state[0] = True
-    logging.getLogger("judges.log_setup").info("Logging to stderr and %s", log_file)
+    # Demoted to DEBUG (issue #132): every devbench CLI invocation used to
+    # emit this banner on stderr, polluting the output of stream-rendering
+    # commands like `hook-tail` and `get-diff`. Operators who want the banner
+    # back can re-enable it via JUDGE_LOG_LEVEL=DEBUG.
+    logging.getLogger("judges.log_setup").debug("Logging to stderr and %s", log_file)
     return log_file

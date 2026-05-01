@@ -44,6 +44,18 @@
       "minimum": 1,
       "description": "Maximum number of executor retry attempts per work unit when judge reviews fail. Default: 10."
     },
+    "max_executor_retries_per_judge": {
+      "type": "object",
+      "description": "Optional per-judge override of max_executor_retries (issue #122). Keys must be in the canonical judge allowlist (REVIEW_JUDGE_NAMES + SECURITY_JUDGE_NAMES). Each value falls back to max_executor_retries when absent.",
+      "additionalProperties": false,
+      "properties": {
+        "code_review": { "type": "integer", "minimum": 1 },
+        "test_review": { "type": "integer", "minimum": 1 },
+        "doc_review": { "type": "integer", "minimum": 1 },
+        "changes_manifest": { "type": "integer", "minimum": 1 },
+        "security_review": { "type": "integer", "minimum": 1 }
+      }
+    },
     "use_bedrock": {
       "type": "boolean",
       "description": "Whether to route LLM calls through AWS Bedrock."
@@ -309,7 +321,11 @@
         },
         "data_residency_multiplier": {
           "type": "number",
-          "description": "Cost multiplier when usage.inference_geo is set (US-only inference). Defaults to 1.10 (Anthropic's published rate). Counted in v1 but not yet applied per-call."
+          "description": "Cost multiplier applied per-call to usage.inference_geo-flagged tokens (issue #124). Defaults to 1.10 (Anthropic's published rate). Composes with cache + base-rate multipliers and applies before token_cost_discount."
+        },
+        "fast_mode_multiplier": {
+          "type": "number",
+          "description": "Cost multiplier applied per-call to usage.speed=='fast' tokens (issue #124). Defaults to 6.0 (Opus 4.6 fast-mode premium). Composes with cache + base-rate multipliers and applies before token_cost_discount."
         },
         "recent_pace_tasks": {
           "type": "integer",

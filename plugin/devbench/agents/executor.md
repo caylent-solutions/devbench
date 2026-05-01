@@ -387,3 +387,16 @@ When the orchestrator re-invokes you after `git-ops` returned exit code `3`, the
 Read each unresolved comment's `path` + `line` + `body`. Address the specific issue inline (modifying the line clears the inline thread automatically when the next push lands). For free-form review bodies (`unresolved_reviews`), apply the requested change; if the request is out of scope or contradicts the work-unit's spec, log a `log-comment` explaining the disagreement -- the operator can then decide whether to amend the spec or override the bot.
 
 When the executor commits a fix that addresses every entry in the feedback payload, end your turn. The orchestrator re-runs git-ops; the next poll cycle re-checks the PR's review state. Threads that reference unchanged lines may stay unresolved on GitHub even after a valid fix; in that case reply on the thread with a brief explanation so the next poll iteration sees them as RESOLVED.
+
+## REVIEW_PASS verdicts are terminal (issue #128)
+
+You are invoked **only** in three situations:
+
+1. The orchestrator's first executor pass after claiming a task (no prior verdicts to consider).
+2. After a judge returns REVIEW_FAIL (the orchestrator passes the failing verdict's feedback to your next invocation).
+3. After git-ops returns exit code 2 (CI failure) or 3 (PR-bot review feedback) -- both of which name a structured feedback file you read directly.
+
+You are **never** invoked because of the content of a passing verdict. When the orchestrator reports REVIEW_PASS from the review-team or security-reviewer, the work unit has satisfied every acceptance criterion -- there is no actionable signal in the verdict body for you to consume. Informational content in PASS verdicts (MEDIUM-severity notes, refactor suggestions, "consider also..." remarks) is for the operator's PR-description hygiene, not for additional work cycles.
+
+If you find yourself reading a PASS verdict's body looking for things to fix, stop. The skill's step 7 (`SKILL.md`) handles the post-REVIEW_PASS branch and routes directly to security-reviewer (then git-ops on security PASS) without re-invoking you. A regression test pins this rule by-content so a prompt drift cannot silently re-introduce the bug:
+`tests/test_integration/test_executor_review_pass_terminality.py`.

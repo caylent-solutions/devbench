@@ -312,7 +312,7 @@ class BacklogParser:
         return [u for u in units if u.status is WorkUnitStatus.BLOCKED]
 
     def get_parallel_candidates(self, units: list[WorkUnit]) -> list[WorkUnit]:
-        """Return all actionable tasks sorted by ID.
+        """Return all actionable tasks sorted by topological depth.
 
         A task is *actionable* when:
         - Its status is ``IN_QUEUE`` or ``IN_PROGRESS`` (resume interrupted work)
@@ -320,7 +320,18 @@ class BacklogParser:
         - All of its dependencies are satisfied (see :meth:`_deps_satisfied`)
 
         ``IN_PROGRESS`` tasks are returned before ``IN_QUEUE`` tasks so that
-        interrupted work is resumed before new work is started.
+        interrupted work is resumed before new work is started. Within each
+        status group (issue #121), tasks are returned in **topological-depth
+        order**: a task with zero declared dependencies (depth 0) precedes a
+        task with one transitive dependency (depth 1), which precedes a task
+        with two (depth 2), and so on. The lexicographic ``id`` is the stable
+        tiebreaker within a depth band so the order is reproducible.
+
+        Topological depth is computed across the FULL backlog -- not just
+        among candidates -- so the "build-order foundation first" intuition
+        holds even when most ancestors are already ``done``. Self-loops or
+        unresolvable IDs collapse to depth 0 (no penalty); the
+        ``validate-backlog`` integrity rule reports those upstream.
         """
         actionable_statuses = {WorkUnitStatus.IN_QUEUE, WorkUnitStatus.IN_PROGRESS}
         units_by_id = {u.id: u for u in units}
@@ -335,10 +346,37 @@ class BacklogParser:
                 continue
             candidates.append(unit)
 
+        # Compute topological depth across all units. Memoized recursion with
+        # cycle protection; each unit's depth = 0 if it has no resolvable
+        # deps, else 1 + max(depth of its deps).
+        depth_cache: dict[str, int] = {}
+
+        def _depth(unit_id: str, visiting: frozenset[str] = frozenset()) -> int:
+            if unit_id in depth_cache:
+                return depth_cache[unit_id]
+            if unit_id in visiting:
+                # Cycle: refuse to recurse further; depth contribution is 0.
+                return 0
+            unit = units_by_id.get(unit_id)
+            if unit is None or not unit.dependencies:
+                depth_cache[unit_id] = 0
+                return 0
+            next_visiting = visiting | {unit_id}
+            max_dep_depth = 0
+            for dep_id in unit.dependencies:
+                if dep_id == unit_id:
+                    # Self-dep: skip without penalty (validate-backlog reports it).
+                    continue
+                max_dep_depth = max(max_dep_depth, _depth(dep_id, next_visiting))
+            d = max_dep_depth + 1
+            depth_cache[unit_id] = d
+            return d
+
         # IN_PROGRESS first (resume interrupted work), then IN_QUEUE; within
-        # the same status group, sort by ID for deterministic ordering.
+        # the same status group, order by topological depth (shallow first),
+        # then by ID for deterministic ordering.
         status_priority = {WorkUnitStatus.IN_PROGRESS: 0, WorkUnitStatus.IN_QUEUE: 1}
-        candidates.sort(key=lambda u: (status_priority.get(u.status, 2), u.id))
+        candidates.sort(key=lambda u: (status_priority.get(u.status, 2), _depth(u.id), u.id))
         return candidates
 
     # ------------------------------------------------------------------

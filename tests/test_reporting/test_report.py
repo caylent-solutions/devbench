@@ -659,6 +659,75 @@ class TestAccurateCost:
         assert cost.cache_write_1h_cost == 0.0
         assert cost.total_cost == 0.0
 
+    def test_data_residency_multiplier_applies_to_us_only_subset(self) -> None:
+        """Issue #124 AC-FUNC-001: residency multiplier applies ONLY to the
+        residency-flagged subset, not to the full aggregate."""
+        from devbench.reporting.report import HookLogTotals, _compute_cost
+
+        totals = HookLogTotals(
+            input_tokens=2_000_000,
+            output_tokens=0,
+            us_only_input_tokens=1_000_000,  # half of inputs were us-only
+        )
+        cost = _compute_cost(totals, 5.0, 25.0, 0.10, 1.25, 2.0, data_residency_multiplier=1.10)
+        # Base: 2M * 5 / 1M = 10.0. US-only boost: 1M * 5 * 0.10 / 1M = 0.5. Total: 10.5.
+        assert cost.input_cost == pytest.approx(10.5)
+        assert cost.total_cost == pytest.approx(10.5)
+
+    def test_fast_mode_multiplier_applies_to_fast_subset(self) -> None:
+        """Issue #124 AC-FUNC-002: fast-mode multiplier applies ONLY to fast subset."""
+        from devbench.reporting.report import HookLogTotals, _compute_cost
+
+        totals = HookLogTotals(
+            output_tokens=1_000_000,
+            fast_output_tokens=1_000_000,  # all output was fast-mode
+        )
+        cost = _compute_cost(totals, 5.0, 25.0, 0.10, 1.25, 2.0, fast_mode_multiplier=6.0)
+        # Base: 1M * 25 / 1M = 25. Fast boost: 1M * 25 * 5 / 1M = 125. Total: 150.
+        assert cost.output_cost == pytest.approx(150.0)
+        assert cost.total_cost == pytest.approx(150.0)
+
+    def test_multipliers_compose_with_cache_rates(self) -> None:
+        """Issue #124 AC-FUNC-003: residency + fast multipliers compose with
+        cache + base-rate multipliers (apply after cache scaling)."""
+        from devbench.reporting.report import HookLogTotals, _compute_cost
+
+        totals = HookLogTotals(
+            cache_read_tokens=1_000_000,
+            us_only_cache_read_tokens=1_000_000,  # all cache reads were us-only
+            fast_cache_read_tokens=1_000_000,  # AND all were fast-mode
+        )
+        cost = _compute_cost(
+            totals,
+            5.0,
+            25.0,
+            0.10,
+            1.25,
+            2.0,
+            data_residency_multiplier=1.10,
+            fast_mode_multiplier=6.0,
+        )
+        # Base cache_read: 1M * 5 * 0.10 / 1M = 0.50.
+        # Residency boost: 1M * 5 * 0.10 / 1M * (1.10-1) = 0.05.
+        # Fast boost: 1M * 5 * 0.10 / 1M * (6.0-1) = 2.50.
+        # Total cache_read: 0.50 + 0.05 + 2.50 = 3.05.
+        assert cost.cache_read_cost == pytest.approx(3.05)
+        assert cost.total_cost == pytest.approx(3.05)
+
+    def test_default_multipliers_one_means_no_boost(self) -> None:
+        """Default multipliers = 1.0 leave the cost unchanged (backward-compat)."""
+        from devbench.reporting.report import HookLogTotals, _compute_cost
+
+        totals = HookLogTotals(
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            us_only_input_tokens=500_000,
+            fast_output_tokens=500_000,
+        )
+        cost = _compute_cost(totals, 5.0, 25.0, 0.10, 1.25, 2.0)
+        # Base: 1M*5 + 1M*25 = 30. No boost because multipliers default to 1.0.
+        assert cost.total_cost == pytest.approx(30.0)
+
     def test_compute_cost_realistic_high_cache_hit(self) -> None:
         """A heavily-cached call (99% hit rate) costs a small fraction of a naive blended estimate."""
         from devbench.reporting.report import HookLogTotals, _compute_cost
@@ -840,6 +909,66 @@ class TestTranscriptParsing:
         result = _parse_transcript_metrics(None, datetime(2026, 3, 5, 10, 0, 0, tzinfo=UTC))
         assert result.input_tokens == 0
         assert result.output_tokens == 0
+
+    def test_parse_transcript_metrics_by_role_buckets_per_attribution(self, tmp_path: Path) -> None:
+        """Issue #123 regression: per-role accumulator groups messages by
+        ``attributionAgent`` and the summed totals match
+        ``_parse_transcript_metrics``'s aggregate."""
+        from devbench.reporting.report import (
+            _parse_transcript_metrics,
+            _parse_transcript_metrics_by_role,
+        )
+
+        transcript_dir = tmp_path / "transcripts"
+        transcript_dir.mkdir()
+        # Three turns across three roles: orchestrator (no attribution),
+        # executor, and code_review (note the canonical normalisation:
+        # ``devbench:code-reviewer`` -> ``code_review``).
+        (transcript_dir / "session1.jsonl").write_text(
+            '{"timestamp":"2026-03-05T10:01:00Z","message":{"role":"assistant",'
+            '"usage":{"input_tokens":100,"output_tokens":50}}}\n'
+            '{"timestamp":"2026-03-05T10:02:00Z","attributionAgent":"devbench:executor",'
+            '"message":{"role":"assistant","usage":{"input_tokens":200,"output_tokens":75}}}\n'
+            '{"timestamp":"2026-03-05T10:03:00Z","attributionAgent":"devbench:code-reviewer",'
+            '"message":{"role":"assistant","usage":{"input_tokens":40,"output_tokens":10}}}\n'
+        )
+        window_start = datetime(2026, 3, 5, 10, 0, 0, tzinfo=UTC)
+        by_role = _parse_transcript_metrics_by_role(transcript_dir, window_start)
+
+        assert "orchestrator" in by_role
+        assert "executor" in by_role
+        assert "code_review" in by_role  # devbench:code-reviewer -> code_review
+        assert by_role["orchestrator"].input_tokens == 100
+        assert by_role["executor"].input_tokens == 200
+        assert by_role["code_review"].input_tokens == 40
+
+        # Aggregate row contract (AC-FUNC-003): summed totals match the
+        # existing global figure.
+        global_totals = _parse_transcript_metrics(transcript_dir, window_start)
+        assert sum(t.input_tokens for t in by_role.values()) == global_totals.input_tokens
+        assert sum(t.output_tokens for t in by_role.values()) == global_totals.output_tokens
+        assert sum(t.entries_with_usage for t in by_role.values()) == global_totals.entries_with_usage
+
+    def test_parse_transcript_metrics_by_role_handles_missing_dir(self) -> None:
+        from devbench.reporting.report import _parse_transcript_metrics_by_role
+
+        assert _parse_transcript_metrics_by_role(None, datetime(2026, 3, 5, 10, 0, 0, tzinfo=UTC)) == {}
+
+    def test_role_for_entry_strips_devbench_prefix_and_normalises(self) -> None:
+        from devbench.reporting.report import _role_for_entry
+
+        assert _role_for_entry({"attributionAgent": "devbench:executor"}) == "executor"
+        assert _role_for_entry({"attributionAgent": "devbench:code-reviewer"}) == "code_review"
+        assert _role_for_entry({"attributionAgent": "devbench:test-reviewer"}) == "test_review"
+        assert _role_for_entry({"attributionAgent": "devbench:doc-reviewer"}) == "doc_review"
+        assert _role_for_entry({"attributionAgent": "devbench:changes-manifest"}) == "changes_manifest"
+        assert _role_for_entry({"attributionAgent": "devbench:security-reviewer"}) == "security_review"
+        assert _role_for_entry({"attributionAgent": "devbench:blocker-resolver"}) == "blocker_resolver"
+        assert _role_for_entry({"attributionAgent": "devbench:manifest-amender"}) == "manifest_amender"
+        assert _role_for_entry({"attributionAgent": "devbench:task-factory"}) == "task_factory"
+        # Missing or malformed -> orchestrator bucket.
+        assert _role_for_entry({"attributionAgent": None}) == "orchestrator"
+        assert _role_for_entry({}) == "orchestrator"
 
     def test_combine_totals_sums_field_by_field(self) -> None:
         """_combine_totals adds all numeric fields from two HookLogTotals."""

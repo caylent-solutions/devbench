@@ -39,6 +39,7 @@ from devbench.constants import (
     DEFAULT_CI_FAILURE_RETRY_ENABLED,
     DEFAULT_COMMAND_TIMEOUT,
     DEFAULT_DATA_RESIDENCY_MULTIPLIER,
+    DEFAULT_FAST_MODE_MULTIPLIER,
     DEFAULT_GH_API_TIMEOUT,
     DEFAULT_GITHUB_CHECK_TIMEOUT_SECONDS,
     DEFAULT_INLINE_ORPHAN_CLEANUP_ENABLED,
@@ -418,6 +419,11 @@ REPORT_DATA_RESIDENCY_MULTIPLIER: float = _resolve_float(
     "JUDGE_REPORT_DATA_RESIDENCY_MULTIPLIER",
     RUNTIME_CONFIG.report.data_residency_multiplier,
     DEFAULT_DATA_RESIDENCY_MULTIPLIER,
+)
+REPORT_FAST_MODE_MULTIPLIER: float = _resolve_float(
+    "JUDGE_REPORT_FAST_MODE_MULTIPLIER",
+    RUNTIME_CONFIG.report.fast_mode_multiplier,
+    DEFAULT_FAST_MODE_MULTIPLIER,
 )
 # Number of most-recent task completions averaged for the "Recent pace"
 # projection in `devbench report`. Resolution precedence: env > YAML > constant.

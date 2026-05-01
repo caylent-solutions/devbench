@@ -72,12 +72,40 @@ import jsonschema
 import yaml
 
 from devbench.constants import (
+    ALL_REQUIRED_JUDGE_NAMES,
     DEFAULT_STOP_HOOK_MAX_BLOCKS,
     DEFAULT_STOP_HOOK_STALE_TASK_MINUTES,
     DEFAULT_STOP_HOOK_WINDOW_SECONDS,
     DEFAULT_TOKEN_COST_PER_M_INPUT,
     DEFAULT_TOKEN_COST_PER_M_OUTPUT,
 )
+
+
+def _load_per_judge_retries(raw_value: object) -> dict[str, int]:
+    """Validate and return the per-judge retry budget map (issue #122).
+
+    The schema's ``additionalProperties: false`` already rejects unknown
+    judge names at the JSONSchema layer, but we re-validate at runtime to
+    fail fast with a clear actionable error if the schema layer drifts or
+    if a future config flow bypasses validation. Returns an empty dict if
+    the YAML field is absent.
+    """
+    if raw_value is None:
+        return {}
+    if not isinstance(raw_value, dict):
+        raise ValueError(
+            f"max_executor_retries_per_judge must be a mapping (judge_name -> int); got {type(raw_value).__name__}."
+        )
+    result: dict[str, int] = {}
+    for key, value in raw_value.items():
+        if key not in ALL_REQUIRED_JUDGE_NAMES:
+            allowed = ", ".join(sorted(ALL_REQUIRED_JUDGE_NAMES))
+            raise ValueError(f"max_executor_retries_per_judge: unknown judge {key!r}. Allowed names: {allowed}.")
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError(f"max_executor_retries_per_judge[{key!r}] must be a positive integer; got {value!r}.")
+        result[key] = value
+    return result
+
 
 # Relative path from WORKSPACE_ROOT to the default config file location.
 DEFAULT_CONFIG_SUBPATH: str = "backlog/config/devbench.yaml"
@@ -266,7 +294,9 @@ class ReportConfig:
         cache_write_1hr_multiplier: Cost multiplier for 1-hour prompt-cache
             write tokens, relative to the base input rate.
         data_residency_multiplier: Cost multiplier when usage.inference_geo
-            is set (US-only inference).
+            is set (US-only inference). Applied per-call (issue #124).
+        fast_mode_multiplier: Cost multiplier when usage.speed == 'fast'
+            (Opus 4.6 fast-mode premium). Applied per-call (issue #124).
         recent_pace_tasks: Number of most recently completed tasks to average
             for the "Recent pace" projection. ``None`` falls back to
             ``DEFAULT_RECENT_PACE_TASKS``.
@@ -284,6 +314,7 @@ class ReportConfig:
     cache_write_5min_multiplier: float | None = None
     cache_write_1hr_multiplier: float | None = None
     data_residency_multiplier: float | None = None
+    fast_mode_multiplier: float | None = None
     recent_pace_tasks: int | None = None
     token_cost_discount: float | None = None
 
@@ -437,6 +468,7 @@ class RuntimeConfig:
     bedrock_region: str | None = None
     merge_strategy: str | None = None
     max_executor_retries: int | None = None
+    max_executor_retries_per_judge: dict[str, int] = field(default_factory=dict)
     display_timezone: str | None = None
     log_file: str | None = None
 
@@ -707,6 +739,9 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         data_residency_multiplier=(
             float(report_raw["data_residency_multiplier"]) if "data_residency_multiplier" in report_raw else None
         ),
+        fast_mode_multiplier=(
+            float(report_raw["fast_mode_multiplier"]) if "fast_mode_multiplier" in report_raw else None
+        ),
         recent_pace_tasks=(int(report_raw["recent_pace_tasks"]) if "recent_pace_tasks" in report_raw else None),
         token_cost_discount=(float(report_raw["token_cost_discount"]) if "token_cost_discount" in report_raw else None),
     )
@@ -775,6 +810,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         bedrock_region=raw.get("bedrock_region") or None,
         merge_strategy=raw.get("merge_strategy") or None,
         max_executor_retries=raw.get("max_executor_retries") or None,
+        max_executor_retries_per_judge=_load_per_judge_retries(raw.get("max_executor_retries_per_judge")),
         display_timezone=raw.get("display_timezone") or None,
         log_file=raw.get("log_file") or None,
     )

@@ -364,30 +364,43 @@ class TestCreatePr:
         with pytest.raises(ValueError, match="not allowed"):
             judge.create_pr("evil/repo", "branch", "title", "body")
 
+    # _gh is invoked twice now: once for `pr list --head` (find_open_pr) and
+    # once for `pr create`. The list-call returns "[]" (no existing PR) so the
+    # create path runs.
+    _LIST_NO_EXISTING = (0, "[]", "")
+
     def test_returns_pr_url(self, tmp_path: Path) -> None:
         judge = GitOpsService()
         with patch.object(
             judge,
             "_gh",
-            return_value=(0, "https://github.com/org/repo/pull/42\n", ""),
+            side_effect=[
+                self._LIST_NO_EXISTING,
+                (0, "https://github.com/org/repo/pull/42\n", ""),
+            ],
         ):
             url = judge.create_pr("caylent-solutions/git-repo", "branch", "title", "body", repo_path=tmp_path)
         assert url == "https://github.com/org/repo/pull/42"
 
     def test_raises_on_failure(self, tmp_path: Path) -> None:
         judge = GitOpsService()
-        with patch.object(judge, "_gh", return_value=(1, "", "error msg")):
+        with patch.object(judge, "_gh", side_effect=[self._LIST_NO_EXISTING, (1, "", "error msg")]):
             with pytest.raises(RuntimeError, match="Failed to create PR"):
                 judge.create_pr("caylent-solutions/git-repo", "branch", "title", "body", repo_path=tmp_path)
 
     def test_gh_called_with_repo_flag(self, tmp_path: Path) -> None:
         judge = GitOpsService()
-        with patch.object(judge, "_gh", return_value=(0, "https://github.com/org/repo/pull/1\n", "")) as mock_gh:
+        with patch.object(
+            judge,
+            "_gh",
+            side_effect=[self._LIST_NO_EXISTING, (0, "https://github.com/org/repo/pull/1\n", "")],
+        ) as mock_gh:
             judge.create_pr("caylent-solutions/git-repo", "branch", "title", "body", repo_path=tmp_path)
 
-        _, kwargs = mock_gh.call_args
-        assert kwargs.get("cwd") == tmp_path
-        assert kwargs.get("repo") == "caylent-solutions/git-repo"
+        # Inspect the second call (the actual create); list-call kwargs already validated by find_open_pr coverage.
+        _, create_kwargs = mock_gh.call_args_list[1]
+        assert create_kwargs.get("cwd") == tmp_path
+        assert create_kwargs.get("repo") == "caylent-solutions/git-repo"
 
     def test_uses_base_branch_from_yaml_config(self, tmp_path: Path) -> None:
         """create_pr passes --base <branch> when YAML config has a default_branch."""
@@ -397,11 +410,15 @@ class TestCreatePr:
         runtime_config = RuntimeConfig(repos={"caylent-solutions/git-repo": RepoConfig(default_branch="main2")})
         with (
             patch("devbench.github.git_ops.RUNTIME_CONFIG", runtime_config),
-            patch.object(judge, "_gh", return_value=(0, "https://github.com/org/repo/pull/1\n", "")) as mock_gh,
+            patch.object(
+                judge,
+                "_gh",
+                side_effect=[self._LIST_NO_EXISTING, (0, "https://github.com/org/repo/pull/1\n", "")],
+            ) as mock_gh,
         ):
             judge.create_pr("caylent-solutions/git-repo", "feature-branch", "title", "body", repo_path=tmp_path)
 
-        cmd_args, _ = mock_gh.call_args
+        cmd_args, _ = mock_gh.call_args_list[1]
         cmd = cmd_args[0]
         base_idx = cmd.index("--base")
         assert cmd[base_idx + 1] == "main2"
@@ -414,13 +431,94 @@ class TestCreatePr:
         runtime_config = RuntimeConfig(repos={"caylent-solutions/git-repo": RepoConfig(default_branch=None)})
         with (
             patch("devbench.github.git_ops.RUNTIME_CONFIG", runtime_config),
-            patch.object(judge, "_gh", return_value=(0, "https://github.com/org/repo/pull/1\n", "")) as mock_gh,
+            patch.object(
+                judge,
+                "_gh",
+                side_effect=[self._LIST_NO_EXISTING, (0, "https://github.com/org/repo/pull/1\n", "")],
+            ) as mock_gh,
         ):
             judge.create_pr("caylent-solutions/git-repo", "feature-branch", "title", "body", repo_path=tmp_path)
 
-        cmd_args, _ = mock_gh.call_args
+        cmd_args, _ = mock_gh.call_args_list[1]
         cmd = cmd_args[0]
         assert "--base" not in cmd
+
+
+class TestCreatePrExistingPrReuse:
+    """Issue #129 regression: a second git-ops invocation on the same branch
+    must reuse a pre-existing open PR instead of treating the duplicate
+    ``gh pr create`` call as a fatal error.
+
+    Bug: cmd_git_ops calls ``gh pr create`` without first checking whether an
+    open PR already exists for the branch. When the executor pushed a fix
+    commit (REFACTOR after REVIEW_PASS, or a pr_review_resolution bot fix),
+    the second create attempt failed with "a pull request already exists for
+    this branch" and devbench transitioned the task to BLOCKED -- even though
+    the fix commit was already on the PR.
+    """
+
+    def test_find_open_pr_returns_url_when_open_pr_exists(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        with patch.object(
+            judge,
+            "_gh",
+            return_value=(0, '[{"url":"https://github.com/org/repo/pull/20"}]', ""),
+        ) as mock_gh:
+            url = judge.find_open_pr("caylent-solutions/git-repo", "branch", repo_path=tmp_path)
+        assert url == "https://github.com/org/repo/pull/20"
+        cmd_args, _ = mock_gh.call_args
+        assert "pr" in cmd_args[0]
+        assert "list" in cmd_args[0]
+        assert "--head" in cmd_args[0]
+        assert "branch" in cmd_args[0]
+        assert "--state" in cmd_args[0]
+        assert "open" in cmd_args[0]
+
+    def test_find_open_pr_returns_none_when_no_open_pr(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        with patch.object(judge, "_gh", return_value=(0, "[]", "")):
+            url = judge.find_open_pr("caylent-solutions/git-repo", "branch", repo_path=tmp_path)
+        assert url is None
+
+    def test_find_open_pr_returns_none_on_gh_failure(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        with patch.object(judge, "_gh", return_value=(1, "", "gh: not authenticated")):
+            url = judge.find_open_pr("caylent-solutions/git-repo", "branch", repo_path=tmp_path)
+        assert url is None
+
+    def test_find_open_pr_returns_none_on_malformed_json(self, tmp_path: Path) -> None:
+        """Defensive: future gh release that changes output format must not crash devbench."""
+        judge = GitOpsService()
+        with patch.object(judge, "_gh", return_value=(0, "<html>", "")):
+            url = judge.find_open_pr("caylent-solutions/git-repo", "branch", repo_path=tmp_path)
+        assert url is None
+
+    def test_create_pr_reuses_existing_open_pr_url(self, tmp_path: Path) -> None:
+        """Core regression: create_pr returns the existing URL and never invokes
+        ``gh pr create`` when an open PR is already on the branch."""
+        judge = GitOpsService()
+        list_response = (0, '[{"url":"https://github.com/org/repo/pull/20"}]', "")
+        with patch.object(judge, "_gh", side_effect=[list_response]) as mock_gh:
+            url = judge.create_pr("caylent-solutions/git-repo", "feature-branch", "title", "body", repo_path=tmp_path)
+        assert url == "https://github.com/org/repo/pull/20"
+        # Exactly one _gh call (the list call); the create call must not run.
+        assert mock_gh.call_count == 1
+        cmd_args, _ = mock_gh.call_args_list[0]
+        assert "create" not in cmd_args[0]
+
+    def test_create_pr_falls_through_to_create_when_no_existing(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        with patch.object(
+            judge,
+            "_gh",
+            side_effect=[(0, "[]", ""), (0, "https://github.com/org/repo/pull/99\n", "")],
+        ) as mock_gh:
+            url = judge.create_pr("caylent-solutions/git-repo", "feature-branch", "title", "body", repo_path=tmp_path)
+        assert url == "https://github.com/org/repo/pull/99"
+        assert mock_gh.call_count == 2
+        # Second call must be the actual create.
+        create_cmd_args, _ = mock_gh.call_args_list[1]
+        assert create_cmd_args[0][0:2] == ["pr", "create"]
 
 
 class TestMergePr:

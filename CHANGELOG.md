@@ -164,6 +164,94 @@ since the last release. PR #119 carries every change.
   `tests/unit/test_continue_orchestration_hook.py::TestActiveTaskSelection`
   pin all four scenarios (log-driven pick, multiple-in-progress
   surfacing, fresh-checkout fallback, both log-line shapes accepted).
+- **`hook-tail` and other stream-rendering commands no longer emit a
+  startup banner on stderr** (issue #132). The
+  `judges.log_setup` "Logging to stderr and ..." informational line
+  was demoted from INFO to DEBUG, so the default JUDGE_LOG_LEVEL=INFO
+  run is silent. Operators who want the banner back can set
+  JUDGE_LOG_LEVEL=DEBUG. New regression tests
+  `tests/test_log_setup.py::TestStartupBannerDemoted` pin both the
+  silent-at-INFO and visible-at-DEBUG behaviours.
+- **Stop-hook block decision honored under asdf-shimmed workspaces**
+  (issue #130 / #131 -- already shipped in v-next on 04457b2;
+  see prior bullets). Follow-up clean-up included in this release.
+- **`gh pr create` no longer fails with "a pull request already
+  exists for this branch"** when git-ops runs a second time on the
+  same branch (issue #129). New helper `GitOpsService.find_open_pr`
+  queries `gh pr list --head <branch> --state open` first; if a PR
+  exists, `create_pr` returns its URL and skips the create call.
+  Triggers covered: REFACTOR cycle after REVIEW_PASS, executor fix
+  triggered by `pr_review_resolution` bot feedback, and CI-failure
+  retry replay. New regression tests
+  `tests/test_github/test_git_ops.py::TestCreatePrExistingPrReuse`
+  pin the find/reuse/fall-through paths plus defensive cases
+  (gh failure, malformed JSON).
+- **Executor no longer acts on the content of REVIEW_PASS verdicts**
+  (issue #128). Prompt updates: SKILL.md step 7 now contains an
+  explicit "CRITICAL (issue #128)" rule that REVIEW_PASS is
+  terminal; executor.md gains a parallel "REVIEW_PASS verdicts are
+  terminal" section listing the three (and only three) legitimate
+  executor-invocation triggers. Informational content in PASS
+  verdicts (MEDIUM-severity notes, refactor suggestions) MUST NOT
+  trigger additional executor work cycles -- only REVIEW_FAIL or
+  git-ops exit codes 2 / 3 do. New regression tests
+  `tests/test_integration/test_executor_review_pass_terminality.py`
+  pin both prompts by-content.
+
+### Added
+
+- **Topological sort for parallel-task candidates** (issue #121).
+  `BacklogParser.get_parallel_candidates` now orders actionable
+  tasks by their topological depth in the full dep-DAG (shallow
+  first), with a stable lexicographic `id` tiebreaker within each
+  depth band. A task with zero declared dependencies (depth 0)
+  precedes a task with one transitive dependency (depth 1), which
+  precedes a task with two (depth 2). The "build-order foundation
+  first" intuition holds even when most ancestors are already
+  ``done``. Cycle protection collapses self-loops to depth 0
+  without recursing infinitely; unresolvable IDs add 1 depth band
+  per declared dep but do not crash. New regression tests
+  `tests/test_backlog/test_parser.py::TestGetParallelCandidatesTopologicalOrder`
+  pin all five scenarios.
+- **Per-judge executor retry budgets** (issue #122). New optional
+  YAML map `max_executor_retries_per_judge` lets operators tune
+  retries per failing judge (e.g., 20 retries for flakey
+  test_review, 2 for stable doc_review) without raising the global
+  cap. Schema validation rejects unknown judge names; runtime
+  helper `_load_per_judge_retries` defends against schema-bypass.
+  SKILL.md step 6.d documents the consumption rule (per-judge
+  budget when listed, fall back to `max_executor_retries`).
+  New regression tests
+  `tests/test_config_loader.py::TestPerJudgeRetriesConfig` cover
+  global-only, per-judge override, schema rejection, runtime helper
+  rejection of malformed inputs.
+- **Per-role cost breakdown helper for `devbench report`**
+  (issue #123). New `_parse_transcript_metrics_by_role` returns a
+  dict mapping role name -> `HookLogTotals` by reading each
+  transcript message's `attributionAgent` field. Subagent
+  attributions are normalised to the canonical judge names
+  (`devbench:code-reviewer` -> `code_review`); messages with no
+  attribution land in the `orchestrator` bucket. Aggregate-row
+  contract holds: summed totals across all roles equal what
+  `_parse_transcript_metrics` returns. New regression tests
+  `tests/test_reporting/test_report.py::TestTranscriptParsing`
+  cover bucketing, aggregate-row preservation, missing-dir
+  handling, and the role-name normalisation table.
+- **Data-residency and fast-mode multipliers applied per-call**
+  (issue #124). `_compute_cost` now accepts
+  `data_residency_multiplier` (default 1.10 from
+  `DEFAULT_DATA_RESIDENCY_MULTIPLIER`, configurable via YAML
+  `report.data_residency_multiplier`) and `fast_mode_multiplier`
+  (default 6.0 from `DEFAULT_FAST_MODE_MULTIPLIER`, new YAML field
+  `report.fast_mode_multiplier`). Token volumes from entries with
+  `usage.inference_geo` set are tracked separately
+  (`us_only_*_tokens`) from baseline; same for
+  `usage.speed == 'fast'` (`fast_*_tokens`). Multipliers compose
+  with cache + base-rate multipliers (apply after cache scaling,
+  before discount) per AC-FUNC-003. New regression tests
+  `tests/test_reporting/test_report.py::TestAccurateCost::test_data_residency_multiplier_applies_to_us_only_subset`
+  + the fast-mode + composition + default-no-boost siblings cover
+  all four AC scenarios.
 
 ### Renamed / Removed
 

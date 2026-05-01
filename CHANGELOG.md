@@ -117,6 +117,24 @@ since the last release. PR #119 carries every change.
   regression test
   `tests/test_cli.py::TestInlineOrphanCleanup::test_inline_cleanup_handles_symlinked_repo_path`
   pins the fix.
+- **Security reviewer no longer flags findings on files outside the
+  task's staged diff** (issue #126). The
+  `plugin/devbench/agents/security-reviewer.md` prompt now contains an
+  explicit five-rule scope contract that captures the in-scope path
+  set from `devbench get-diff` first, refuses to read out-of-scope
+  files, and drops out-of-scope findings from the verdict. New
+  regression test
+  `tests/test_integration/test_security_review_scope.py` pins the
+  scope-contract text by-content so the rule cannot be silently
+  removed.
+- **Manifest amender no longer rejects amendments on the grounds that
+  requested files are not yet in the Manifest** (issue #127). The
+  `plugin/devbench/agents/manifest-amender.md` SCOPE rule now contains
+  an explicit "Critical (issue #127)" sub-block forbidding the
+  circular rejection -- adding files to the Manifest is the entire
+  purpose of an amendment. New regression test
+  `tests/test_integration/test_manifest_amender_scope.py` pins the
+  protective fragments by-content.
 
 ### Renamed / Removed
 

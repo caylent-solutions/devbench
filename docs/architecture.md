@@ -374,6 +374,10 @@ Four judges in `plugin/devbench/agents/review_team/`:
 
 `security-reviewer.md` runs only after all four review judges PASS. A SECURITY_FAIL writes both `[SECURITY_FAIL]` and `[REVIEW_REJECTED]` comments -- the latter resets the done-gate window, forcing the four review judges to re-run after the security fix lands. Security review is **not** retried; if it fails, the unit goes to blocked.
 
+### Reviewer scope contract
+
+Every reviewer (the four review-tier judges, the security gate, and the manifest amender) evaluates evidence **only** for paths that appear in the active task's `devbench get-diff` output (which mirrors `git diff --cached --name-only` plus the work-unit's per-task scope rules per ADR-12). A finding cited against a file outside that set is a prompt bug, not an operator misconfiguration, and should be filed as a devbench issue. The security-reviewer prompt and the manifest-amender SCOPE rule each carry by-content regression tests (`tests/test_integration/test_security_review_scope.py`, `tests/test_integration/test_manifest_amender_scope.py`) that pin the canonical scope-contract language so a future prompt edit cannot silently re-introduce out-of-scope evaluation. Issues #126 (security-reviewer) and #127 (manifest-amender) document the original regressions.
+
 ### Source of truth
 
 `src/devbench/constants.py` defines:

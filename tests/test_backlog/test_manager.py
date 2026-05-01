@@ -3220,3 +3220,94 @@ class TestRequiredSectionsRowDefensiveSkips:
         rows = [("EX-F1-S1-T1", "in-queue", "")]
         manager._check_required_sections(rows, tmp_path, errors)
         assert errors == []
+
+
+class TestValidateNoPlaceholderManifestRows:
+    """Issue #117: reject TBD placeholder rows in active-Task Manifests."""
+
+    def test_tbd_first_cell_emits_error(self, tmp_path: Path, backlog_dir: Path) -> None:
+        wu = backlog_dir / "EX-F1-S1-T1.md"
+        wu.write_text(
+            "# EX-F1-S1-T1\n\n"
+            "## Status: in-queue\n\n"
+            "## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Type | Reason |\n|----|------|--------|\n| none | | |\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-FUNC-001\n\n"
+            "## Changes Manifest\n\n"
+            "| File | Change |\n|------|--------|\n"
+            "| TBD | Executor agent: replace this row with the actual files |\n\n"
+            "## Definition of Done\n\n- [ ] Done\n",
+            encoding="utf-8",
+        )
+        idx = _ValidateRuleHarness.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        assert any("Changes Manifest still has placeholder row 'TBD'" in e and "EX-F1-S1-T1" in e for e in errors)
+
+    def test_tbd_lowercase_also_caught(self, tmp_path: Path, backlog_dir: Path) -> None:
+        wu = backlog_dir / "EX-F1-S1-T1.md"
+        wu.write_text(
+            "# EX-F1-S1-T1\n\n"
+            "## Status: in-queue\n\n"
+            "## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Type | Reason |\n|----|------|--------|\n| none | | |\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-FUNC-001\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| tbd | placeholder |\n\n"
+            "## Definition of Done\n\n- [ ] Done\n",
+            encoding="utf-8",
+        )
+        idx = _ValidateRuleHarness.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        assert any("placeholder row 'tbd'" in e for e in errors)
+
+    def test_real_manifest_emits_no_error(self, tmp_path: Path, backlog_dir: Path) -> None:
+        _ValidateRuleHarness.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `f.py` | new |\n| `tests/unit/test_f.py` | new |\n",
+        )
+        idx = _ValidateRuleHarness.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        assert not any("placeholder row" in e for e in errors)
+
+    def test_done_status_skips_check(self, tmp_path: Path, backlog_dir: Path) -> None:
+        # Done tasks are terminal; the placeholder rule does not apply.
+        wu = backlog_dir / "EX-F1-S1-T1.md"
+        wu.write_text(
+            "# EX-F1-S1-T1\n\n"
+            "## Status: done\n\n"
+            "## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Type | Reason |\n|----|------|--------|\n| none | | |\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-FUNC-001\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| TBD | placeholder |\n\n"
+            "## Definition of Done\n\n- [ ] Done\n",
+            encoding="utf-8",
+        )
+        idx = _ValidateRuleHarness.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | done | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        assert not any("placeholder row" in e for e in errors)
+
+    def test_empty_file_path_string_is_skipped(self, tmp_path: Path) -> None:
+        """Defensive guard: rows with empty file_path should not crash the rule.
+
+        Production rows always have a file_path; cover the branch directly
+        for 100% coverage. Belongs to TestValidateNoPlaceholderManifestRows
+        but appended at module-tail because the file was reformatted.
+        """
+        manager = BacklogManager()
+        errors: list[str] = []
+        rows = [("EX-F1-S1-T1", "in-queue", "")]
+        manager._check_no_placeholder_manifest_rows(rows, tmp_path, errors)
+        assert errors == []

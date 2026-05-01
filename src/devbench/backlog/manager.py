@@ -246,6 +246,7 @@ class BacklogManager:
         16. Status enum (every parsed ``## Status:`` value matches ``VALID_STATUSES``).
         17. Dependency-ID format (every entry in a ``## Dependencies`` table matches the canonical regex).
         18. Branch uniqueness (no two Tasks derive the same branch name; skipped in single-PR mode).
+        19. No placeholder Manifest rows (no active Task carries a ``TBD`` row in its Changes Manifest).
 
         Args:
             backlog_index: Path to the ``BACKLOG.md`` index file.
@@ -271,6 +272,7 @@ class BacklogManager:
         self._check_status_enum(rows, workspace_root, errors)
         self._check_dep_id_format(rows, workspace_root, errors)
         self._check_branch_uniqueness(rows, workspace_root, errors)
+        self._check_no_placeholder_manifest_rows(rows, workspace_root, errors)
         return errors
 
     def _check_files_and_statuses(
@@ -1556,6 +1558,87 @@ class BacklogManager:
                     f"so each task pushes to a unique branch; see docs/backlog-contract.md "
                     f"'Branch Uniqueness Rule'."
                 )
+
+    # Issue #117: the changes_manifest reviewer was passing work units whose
+    # Manifest still contained the placeholder row authors are supposed to
+    # replace. Catch the placeholder at validate-backlog time so the orchestrator
+    # never even claims the task; the executor cannot build atop a TBD manifest.
+    _PLACEHOLDER_MANIFEST_RE: ClassVar[re.Pattern[str]] = re.compile(r"^TBD\b", re.IGNORECASE)
+    _ACTIVE_TASK_STATUSES_FOR_PLACEHOLDER_CHECK: ClassVar[frozenset[str]] = frozenset(
+        {STATUS_IN_QUEUE, STATUS_IN_PROGRESS, STATUS_BLOCKED}
+    )
+
+    def _check_no_placeholder_manifest_rows(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """Issue #117: reject work units whose Manifest still contains a TBD row.
+
+        The canonical placeholder reads ``TBD | Executor agent: replace
+        this row with the actual files to be created or modified.`` The
+        check fires for every active Task (in-queue / in-progress /
+        blocked); ``in-review`` and terminal statuses are skipped because
+        the executor has either already amended the Manifest or the task
+        is closed.
+
+        Each offending row produces an error naming the task ID and the
+        first cell text so the operator (or the auto-amender) can fix
+        it before any agent claims the unit.
+        """
+        for row_id, status, file_path_str in rows:
+            if not row_id or row_id.startswith("-"):
+                continue
+            if not self._is_task_id(row_id):
+                continue
+            if not file_path_str:
+                continue
+            if status.lower() not in self._ACTIVE_TASK_STATUSES_FOR_PLACEHOLDER_CHECK:
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.is_file():
+                continue
+            content = wu_path.read_text(encoding="utf-8")
+            placeholder_cell = self._first_placeholder_manifest_cell(content)
+            if placeholder_cell:
+                errors.append(
+                    f"{row_id}: Changes Manifest still has placeholder row "
+                    f"{placeholder_cell!r}. Replace with real file entries before "
+                    f"claim; see docs/backlog-contract.md 'No Placeholder Rows Rule'."
+                )
+
+    @classmethod
+    def _first_placeholder_manifest_cell(cls, content: str) -> str:
+        """Return the first ``TBD`` cell in ``## Changes Manifest`` or ``""``.
+
+        Walks the Manifest table once: skips the section heading line,
+        the header row (cells like ``File`` / ``Change``), and any
+        separator row (cells starting with ``-``). The first data row
+        whose cell-1 starts with ``TBD`` (case-insensitive) is returned
+        verbatim; any other row terminates the scan.
+        """
+        in_manifest = False
+        seen_header = False
+        for raw in content.splitlines():
+            stripped = raw.strip()
+            if stripped.startswith("## "):
+                in_manifest = stripped.startswith("## Changes Manifest")
+                seen_header = False
+                continue
+            if not in_manifest or not stripped.startswith("|"):
+                continue
+            cells = [c.strip() for c in stripped.split("|")]
+            cell = cells[1]
+            if not cell or cell.startswith("-"):
+                continue
+            if not seen_header:
+                # First non-separator row is the header; skip it.
+                seen_header = True
+                continue
+            if cls._PLACEHOLDER_MANIFEST_RE.match(cell):
+                return cell
+        return ""
 
     @staticmethod
     def _derive_branch_for_row(unit_id: str, file_path_str: str, workspace_root: Path) -> str:

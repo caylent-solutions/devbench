@@ -2190,3 +2190,254 @@ class TestRejectProposalMarkerStrip:
         source_file.write_text(original)
         _strip_pending_proposal_marker(source_file, "E0-F1-S1-T99")
         assert source_file.read_text() == original
+
+
+class TestClassifyBlockedTaskAwaitingRecovery:
+    """Part-1 (3-state classifier): AWAITING_AUTO_RECOVERY signals.
+
+    No ``[BLOCKED_PENDING_PROPOSAL]`` marker is present, but the
+    orchestrator's loop has left a recovery artefact on disk. The
+    task should classify as ``AWAITING_AUTO_RECOVERY`` -- not
+    ``NEEDS_OPERATOR_ATTENTION`` -- so the operator does not get
+    paged on a transient state devbench will resolve itself.
+    """
+
+    def _workspace_no_marker(self, tmp_path: Path) -> Path:
+        """Source task with no markers; recovery signals supplied by tests."""
+        from datetime import UTC, datetime
+
+        del datetime, UTC
+        backlog_dir = tmp_path / "backlog"
+        story_dir = backlog_dir / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+        source_file = story_dir / "E0-F1-S1-T1.md"
+        source_file.write_text(
+            "# E0-F1-S1-T1: Source\n\n## Status: blocked\n\n"
+            "## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
+            "## Comments\n"
+        )
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|-------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Source | Task | blocked | None | r | `backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n"
+        )
+        return tmp_path
+
+    def test_pending_proposal_json_classifies_recovery(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import (
+            BlockedTaskState,
+            classify_blocked_task,
+        )
+
+        workspace = self._workspace_no_marker(tmp_path)
+        proposals_dir = workspace / ".devbench" / "proposals"
+        proposals_dir.mkdir(parents=True)
+        (proposals_dir / "E0-F1-S1-T1.json").write_text("{}")
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+        )
+        assert state is BlockedTaskState.AWAITING_AUTO_RECOVERY
+
+    def test_rejected_amendment_archive_classifies_recovery(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import (
+            BlockedTaskState,
+            classify_blocked_task,
+        )
+
+        workspace = self._workspace_no_marker(tmp_path)
+        archive_dir = workspace / ".devbench" / "rejected-requests"
+        archive_dir.mkdir(parents=True)
+        (archive_dir / "E0-F1-S1-T1-20260501T120000Z.json").write_text("{}")
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+        )
+        assert state is BlockedTaskState.AWAITING_AUTO_RECOVERY
+
+    def test_recent_recovery_audit_comment_classifies_recovery(self, tmp_path: Path) -> None:
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import (
+            BlockedTaskState,
+            classify_blocked_task,
+        )
+
+        workspace = self._workspace_no_marker(tmp_path)
+        # Append a recent recovery-shaped [BLOCKED] line to the source file.
+        source_file = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
+        now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        ts = now.strftime("%Y-%m-%d %H:%M UTC")
+        source_file.write_text(
+            source_file.read_text()
+            + f"\n[{ts}] [agent/orchestrator] [BLOCKED] amendment-reject for T1 -- emitting fix proposal\n"
+        )
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+            now=now,
+            recovery_window_seconds=300,
+        )
+        assert state is BlockedTaskState.AWAITING_AUTO_RECOVERY
+
+    def test_stale_audit_comment_falls_through_to_attention(self, tmp_path: Path) -> None:
+        from datetime import UTC, datetime, timedelta
+
+        from devbench.backlog.proposal import (
+            BlockedTaskState,
+            classify_blocked_task,
+        )
+
+        workspace = self._workspace_no_marker(tmp_path)
+        source_file = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
+        now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        old_ts = (now - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M UTC")
+        source_file.write_text(
+            source_file.read_text() + f"\n[{old_ts}] [agent/orchestrator] [BLOCKED] amendment-reject (long ago)\n"
+        )
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+            now=now,
+            recovery_window_seconds=300,
+        )
+        assert state is BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+
+    def test_audit_from_non_recovery_agent_falls_through(self, tmp_path: Path) -> None:
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import (
+            BlockedTaskState,
+            classify_blocked_task,
+        )
+
+        workspace = self._workspace_no_marker(tmp_path)
+        source_file = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
+        now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        ts = now.strftime("%Y-%m-%d %H:%M UTC")
+        source_file.write_text(
+            source_file.read_text() + f"\n[{ts}] [agent/some-other-agent] [BLOCKED] amendment-reject\n"
+        )
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+            now=now,
+            recovery_window_seconds=300,
+        )
+        assert state is BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+
+    def test_no_signal_classifies_needs_attention(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import (
+            BlockedTaskState,
+            classify_blocked_task,
+        )
+
+        workspace = self._workspace_no_marker(tmp_path)
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+        )
+        assert state is BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+
+    def test_no_workspace_root_falls_back_to_two_state_behaviour(self, tmp_path: Path) -> None:
+        # Older callers that pass only backlog_root + backlog_index still
+        # get the legacy two-state classification.
+        from devbench.backlog.proposal import (
+            BlockedTaskState,
+            classify_blocked_task,
+        )
+
+        workspace = self._workspace_no_marker(tmp_path)
+        proposals_dir = workspace / ".devbench" / "proposals"
+        proposals_dir.mkdir(parents=True)
+        (proposals_dir / "E0-F1-S1-T1.json").write_text("{}")
+        # Without workspace_root, recovery signals are invisible.
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+        )
+        assert state is BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+
+
+class TestRecoverySignalForTask:
+    """Part-1: ``recovery_signal_for_task`` names the source so the report can annotate."""
+
+    def test_pending_proposal_named(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import recovery_signal_for_task
+
+        proposals_dir = tmp_path / ".devbench" / "proposals"
+        proposals_dir.mkdir(parents=True)
+        (proposals_dir / "E0-T1.json").write_text("{}")
+        signal = recovery_signal_for_task(tmp_path, "E0-T1")
+        assert "pending proposal" in signal
+        assert ".devbench/proposals/E0-T1.json" in signal
+
+    def test_rejected_archive_named(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import recovery_signal_for_task
+
+        archive_dir = tmp_path / ".devbench" / "rejected-requests"
+        archive_dir.mkdir(parents=True)
+        (archive_dir / "E0-T1-20260501T000000Z.json").write_text("{}")
+        signal = recovery_signal_for_task(tmp_path, "E0-T1")
+        assert "rejected-requests" in signal
+
+    def test_audit_comment_when_neither_artefact_present(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import recovery_signal_for_task
+
+        signal = recovery_signal_for_task(tmp_path, "E0-T1")
+        # No artefact on disk, so the function returns the audit-comment
+        # fallback string. The classifier itself is responsible for
+        # deciding whether the audit comment actually qualifies; this
+        # helper just supplies the human-facing label.
+        assert "audit comment" in signal
+
+
+class TestRecentRecoveryAuditCommentEdgeCases:
+    """Direct coverage for ``_recent_recovery_audit_comment`` branches."""
+
+    def test_missing_file_returns_false(self, tmp_path: Path) -> None:
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import _recent_recovery_audit_comment
+
+        assert _recent_recovery_audit_comment(tmp_path / "absent.md", datetime.now(UTC), 300) is False
+
+    def test_blocked_pending_proposal_lines_are_skipped(self, tmp_path: Path) -> None:
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import _recent_recovery_audit_comment
+
+        wu = tmp_path / "wu.md"
+        now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        ts = now.strftime("%Y-%m-%d %H:%M UTC")
+        wu.write_text(f"## Comments\n\n[{ts}] [agent/orchestrator] [BLOCKED_PENDING_PROPOSAL] E0-T9\n")
+        # Only marker-style line; helper must return False (cascade state, not recovery).
+        assert _recent_recovery_audit_comment(wu, now, 300) is False
+
+    def test_malformed_timestamp_is_skipped(self, tmp_path: Path) -> None:
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import _recent_recovery_audit_comment
+
+        wu = tmp_path / "wu.md"
+        # Regex matches the shape but the values are not a valid
+        # calendar date, so strptime raises ValueError. The helper
+        # must continue past it rather than crashing.
+        wu.write_text("## Comments\n\n[9999-99-99 99:99 UTC] [agent/orchestrator] [BLOCKED] amendment-reject\n")
+        assert _recent_recovery_audit_comment(wu, datetime(2026, 5, 1, 12, 0, tzinfo=UTC), 300) is False

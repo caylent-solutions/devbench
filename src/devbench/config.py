@@ -29,9 +29,12 @@ from devbench.constants import (
     BACKLOG_SUBDIR,
     DEFAULT_ALERT_SUMMARY_LIMIT,
     DEFAULT_BEDROCK_REGION,
+    DEFAULT_BLOCKED_RECOVERY_WINDOW_SECONDS,
     DEFAULT_CACHE_READ_MULTIPLIER,
     DEFAULT_CACHE_WRITE_1HR_MULTIPLIER,
     DEFAULT_CACHE_WRITE_5MIN_MULTIPLIER,
+    DEFAULT_CHECK_REGISTRATION_DELAY_SECONDS,
+    DEFAULT_CHECK_REGISTRATION_RETRIES,
     DEFAULT_COMMAND_TIMEOUT,
     DEFAULT_DATA_RESIDENCY_MULTIPLIER,
     DEFAULT_GH_API_TIMEOUT,
@@ -181,6 +184,26 @@ MAX_RETRY_ATTEMPTS: int = _resolve_int(
 )
 GITHUB_CHECK_TIMEOUT_SECONDS: int = _resolve_int(
     "JUDGE_GH_TIMEOUT", RUNTIME_CONFIG.timeouts.github_check, DEFAULT_GITHUB_CHECK_TIMEOUT_SECONDS
+)
+# Issue #114: workflow-registration race defence. The retry loop runs
+# `gh pr checks` up to CHECK_REGISTRATION_RETRIES times when the local
+# `<repo>/.github/workflows/*.y[a]ml` glob proves CI exists but `gh`
+# returns "no checks reported" (Actions has not yet enqueued the run).
+# Both knobs override via env vars; the YAML layer does not own them
+# because the issue is repo-state-dependent and operators tune them
+# at runtime if their CI cadence is unusual.
+CHECK_REGISTRATION_RETRIES: int = _resolve_int(
+    "JUDGE_CHECK_REGISTRATION_RETRIES", None, DEFAULT_CHECK_REGISTRATION_RETRIES
+)
+CHECK_REGISTRATION_DELAY_SECONDS: int = _resolve_int(
+    "JUDGE_CHECK_REGISTRATION_DELAY_SECONDS", None, DEFAULT_CHECK_REGISTRATION_DELAY_SECONDS
+)
+# Part-1: recency cap for the AWAITING_AUTO_RECOVERY audit-comment
+# heuristic in the 3-state blocked-task classifier. Operators tune
+# via JUDGE_BLOCKED_RECOVERY_WINDOW_SECONDS when their orchestrator
+# iteration cadence is slower than the default 30-minute window.
+BLOCKED_RECOVERY_WINDOW_SECONDS: int = _resolve_int(
+    "JUDGE_BLOCKED_RECOVERY_WINDOW_SECONDS", None, DEFAULT_BLOCKED_RECOVERY_WINDOW_SECONDS
 )
 _claude_model = os.environ.get("JUDGE_CLAUDE_MODEL", "")
 if not _claude_model:

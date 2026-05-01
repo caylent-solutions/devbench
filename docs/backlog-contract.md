@@ -40,27 +40,54 @@ backlog/
 Only task files (`*-T[n].md`) are implemented by agents. Epic, feature, and story files track
 rollup status only.
 
-### Keeping the backlog in a separate git repo
+### Workspace layout (what `JUDGE_WORKSPACE_ROOT` points at)
 
-The backlog should live in its own local git repo, separate from the target repositories DevBench
-modifies. This lets you commit backlog progress (status changes, TDD logs, judge comments) without
-mixing them into target repo history.
+`JUDGE_WORKSPACE_ROOT` is the **parent directory** that contains `backlog/`, `BACKLOG.md`, and the target repos as siblings. The loader (`src/devbench/config.py`) resolves:
 
-Set `JUDGE_WORKSPACE_ROOT` to the backlog repo. Create symlinks inside it pointing to target
-repos, and reference them as relative paths in `devbench.yaml`:
+- `<JUDGE_WORKSPACE_ROOT>/BACKLOG.md` -- the master index (mandatory at this exact path).
+- `<JUDGE_WORKSPACE_ROOT>/backlog/config/devbench.yaml` -- the per-workspace config (mandatory).
+- `<JUDGE_WORKSPACE_ROOT>/backlog/<epic>/<feature>/<story>/*.md` -- work-unit specs.
+- `<JUDGE_WORKSPACE_ROOT>/<repo-name>/` -- each target repo, as a sibling of `backlog/`.
 
-```bash
-ln -s /real/path/to/my-repo /path/to/my-backlog/my-repo
+So `JUDGE_WORKSPACE_ROOT` is **not** the backlog repo itself; it is the *parent* directory you place the backlog inside. Pointing it at the backlog repo (so `BACKLOG.md` ends up at `<backlog-repo>/BACKLOG.md` instead of `<workspace>/BACKLOG.md`) produces a chain of `FileNotFoundError` and orphan-detection failures that all trace back to this misalignment.
+
+The recommended layout (used by every backlog in `caylent-telemetry-spec/`):
+
 ```
+<JUDGE_WORKSPACE_ROOT>/
+├── BACKLOG.md                       ← master index
+├── backlog/
+│   ├── config/devbench.yaml         ← per-workspace config
+│   ├── E1/E1-F1/E1-F1-S1/E1-F1-S1-T1.md
+│   └── ...
+├── my-repo/                         ← target repo (sibling of backlog/)
+└── another-repo/                    ← another target repo
+```
+
+`devbench.yaml` references each repo by its sibling directory name:
 
 ```yaml
 repos:
   org/my-repo:
     default_branch: main
-    checkout_directory: my-repo    # relative -- resolves via symlink
+    checkout_directory: my-repo      # relative to JUDGE_WORKSPACE_ROOT
 ```
 
-Symlinks bridge the gap between the backlog repo and target repos outside it.
+The loader populates `RepoConfig.resolved_checkout_path` (E213) at config-load time so every consumer reads `<workspace>/<checkout_directory>` from the dataclass field instead of re-resolving the path inline.
+
+#### Keeping the backlog in its own git repo
+
+The backlog directory (`backlog/` + `BACKLOG.md`) is typically committed to its own git repo so backlog progress (status changes, TDD logs, judge comments) lands separately from target-repo history. Init the backlog repo at `<JUDGE_WORKSPACE_ROOT>/.git` and add the target-repo sibling directories to `<JUDGE_WORKSPACE_ROOT>/.gitignore` so they don't pollute the backlog history.
+
+#### Symlinks (optional, for repos outside the workspace)
+
+When a target repo cannot live as a workspace sibling (a shared workspace under `/workspaces/<workspace>/` with target repos cloned elsewhere on disk), symlink it into place:
+
+```bash
+ln -s /real/path/to/my-repo $JUDGE_WORKSPACE_ROOT/my-repo
+```
+
+The symlink goes at the sibling path (`<workspace>/my-repo`), NOT inside `backlog/` (`<workspace>/backlog/my-repo`). The loader walks the workspace from `<workspace>/<checkout_directory>`; a symlink at that path is transparent. Putting the symlink under `backlog/` makes `_check_orphans` flag it as an orphaned work-unit file.
 
 ---
 
@@ -104,6 +131,16 @@ IDs are case-insensitive in status matching but written in uppercase by conventi
 
 A status is *terminal* when a parent's auto-rollup treats it as complete. `done` and `declined` are terminal; `hold` is **not** -- a held child keeps its parent open. This guarantees that pausing a unit cannot accidentally close out its parent.
 
+#### Blocked-task classification (3-state, Part-1)
+
+A `blocked` work unit is in one of three states. The orchestrator advances tasks through these states in a known order so operators see only what truly needs human action:
+
+1. **`AUTO_CLEARING_VIA_PROPOSAL`** -- the task carries a `[BLOCKED_PENDING_PROPOSAL] <target>` marker chain whose targets all exist in the backlog AND at least one is non-terminal. The ADR-07 auto-requeue cascade fires when every target reaches terminal. Operator does nothing.
+2. **`AWAITING_AUTO_RECOVERY`** -- no marker yet, but devbench's recovery loop has left an artefact on disk: a pending proposal JSON at `<workspace>/.devbench/proposals/<id>.json` (blocker-resolver wrote it; task-factory will materialise + promote on the next sweep), a rejected-amendment archive at `<workspace>/.devbench/rejected-requests/<id>-*.json` (manifest-amender rejected; blocker-resolver runs next), or a recent `[BLOCKED]` audit-comment from a recovery agent (orchestrator / blocker_resolver / manifest_amender) within `JUDGE_BLOCKED_RECOVERY_WINDOW_SECONDS` (default 1800s). Operator does nothing -- the orchestrator's next iteration advances the task.
+3. **`NEEDS_OPERATOR_ATTENTION`** -- everything else: manual blockers (`DO NOT CLAIM` text in the description), unknown marker targets (cascade cannot resolve), every marker terminal (cascade should have fired and didn't), or no marker + no recovery signal at all. Operator must act.
+
+`devbench report` renders the three states as separate panels under each `Blocked tasks (...)` heading. `devbench status` summarises with `Blocked (auto)` / `Blocked (recovery)` / `Blocked (attn)` rows, each padded to the same width so an empty bucket stays visible at zero.
+
 The orchestrator's `next` query and parallel-candidate scan filter to `in-queue` and `in-progress` only, so `hold`, `declined`, and `blocked` units are skipped automatically. Operators move units in and out of `hold` with `devbench hold <id> --reason <text>` and `devbench unhold <id> --reason <text>` (both reasons are required and captured in the work-unit's Comments audit trail).
 
 ### Validate-backlog rule list (E209)
@@ -128,8 +165,15 @@ Every backlog must pass `devbench validate-backlog`. The full rule set is enforc
 16. Status enum (every parsed `## Status:` value is in `VALID_STATUSES`)
 17. Dependency-ID format (every `## Dependencies` row's first cell matches `E[A-Z0-9]+(-F\d+)?(-S\d+)?(-T\d+)?`)
 18. Branch uniqueness (no two Tasks derive the same branch name; skipped under single-PR mode)
+19. No placeholder Manifest rows (no active Task -- `in-queue` / `in-progress` / `blocked` -- carries a `TBD` row in its Changes Manifest; terminal statuses are skipped)
 
-Rules 15-17 were added by E209 to harden the contract; rule 18 was added by E219 to prevent silent branch collisions. Together they catch hand-edited drift that the runtime parser would later silently survive.
+Rules 15-17 were added by E209 to harden the contract; rule 18 was added by E219 to prevent silent branch collisions; rule 19 was added by issue #117 to stop the `changes_manifest` reviewer from passing work units whose authors never replaced the canonical placeholder row. Together they catch hand-edited drift that the runtime parser would later silently survive.
+
+#### No Placeholder Rows Rule (issue #117)
+
+The canonical Changes Manifest placeholder reads `TBD | Executor agent: replace this row with the actual files to be created or modified.`. Authors are expected to overwrite the row with one entry per file the Task will touch. The rule fires when an active Task (`in-queue` / `in-progress` / `blocked`) still carries a row whose first cell starts with `TBD` (case-insensitive). The error message names the Task ID and the offending cell text.
+
+`devbench claim <id>` enforces the same rule at claim time as a fail-fast guard: if the Manifest still has a `TBD` row, the claim refuses and either the manifest-amender (when `manifest_amendment.enabled: true`) or the operator must replace the placeholder before the executor can run.
 
 #### Branch Uniqueness Rule (E219)
 

@@ -64,6 +64,7 @@ from devbench.config import (
     TOKEN_COST_DISCOUNT,
     TOKEN_COST_PER_M_INPUT,
     TOKEN_COST_PER_M_OUTPUT,
+    WORKSPACE_ROOT,
 )
 from devbench.constants import (
     DEFAULT_SESSION_GAP_MINUTES,
@@ -1178,31 +1179,49 @@ def _in_progress_listing(units: list) -> list[str]:
 
 
 def _blocked_listing(units: list) -> list[str]:
-    """ADR-10: render blocked tasks in two panels (auto-clearing + needs-attention).
+    """Part-1: render blocked tasks in three panels.
 
-    The split lets operators scan only the ``(needs operator attention)``
-    panel to find work that requires a decision; the ``(auto-clearing via
-    proposal)`` panel is informational -- the ADR-07 cascade will resolve
-    each of those tasks when its markers reach terminal state.
+    The 3-state classifier sorts each blocked task into one of:
 
-    Each auto-clearing row names the task IDs it is waiting on in square
-    brackets so the operator can trace the chain without opening the
-    work-unit file. Needs-attention rows carry just ID + title; the operator
-    opens the file to read the blocker comment.
+    1. ``Blocked tasks (auto-clearing via proposal)`` -- ADR-07 cascade
+       will resolve when every ``[BLOCKED_PENDING_PROPOSAL]`` marker
+       target reaches terminal. Operator does nothing.
+    2. ``Blocked tasks (auto-recovery in flight)`` -- no marker yet, but
+       devbench's recovery loop has an artefact on disk (pending
+       proposal JSON, rejected-amendment archive, or recent
+       recovery-agent ``[BLOCKED]`` audit comment). The next sweep
+       cycle will advance these into panel 1. Operator does nothing
+       for now.
+    3. ``Blocked tasks (needs operator attention)`` -- the true halt
+       list: manual gates (``DO NOT CLAIM``), unknown marker targets,
+       cascade-stuck states. Operator must act.
 
-    Both panels are omitted when empty, matching the Proposed / Declined /
-    Un-materialised panel discipline.
+    Each row carries a per-state annotation: panel 1 names the task IDs
+    it is waiting on; panel 2 names which recovery signal devbench
+    found on disk; panel 3 carries just ID + title. Empty panels are
+    omitted entirely so the operator's eye lands on the panels that
+    have content.
     """
-    from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+    from devbench.backlog.proposal import (
+        BlockedTaskState,
+        classify_blocked_task,
+        recovery_signal_for_task,
+    )
 
     blocked_tasks = [u for u in units if u.unit_type == WorkUnitType.TASK and u.status == WorkUnitStatus.BLOCKED]
     if not blocked_tasks:
         return []
 
     auto_rows: list[tuple] = []  # (unit, list[str] of marker targets)
+    recovery_rows: list[tuple] = []  # (unit, signal-source string)
     attn_rows: list = []
     for u in blocked_tasks:
-        state = classify_blocked_task(BACKLOG_ROOT, BACKLOG_INDEX, u.id)
+        state = classify_blocked_task(
+            BACKLOG_ROOT,
+            BACKLOG_INDEX,
+            u.id,
+            workspace_root=WORKSPACE_ROOT,
+        )
         if state is BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL:
             # Surface which task(s) this one is waiting on. Reuse the same
             # marker-extract helper the cascade uses so the string is always
@@ -1211,6 +1230,9 @@ def _blocked_listing(units: list) -> list[str]:
 
             waiting_on = sorted(BacklogManager()._extract_pending_proposal_markers(u.file_path))
             auto_rows.append((u, waiting_on))
+        elif state is BlockedTaskState.AWAITING_AUTO_RECOVERY:
+            signal = recovery_signal_for_task(WORKSPACE_ROOT, u.id)
+            recovery_rows.append((u, signal))
         else:
             attn_rows.append(u)
 
@@ -1220,6 +1242,12 @@ def _blocked_listing(units: list) -> list[str]:
         lines.append(f"Blocked tasks (auto-clearing via proposal) ({len(auto_rows)}):")
         for u, waiting_on in auto_rows:
             suffix = f"    [waiting on {', '.join(waiting_on)}]" if waiting_on else ""
+            lines.append(f"  - {u.id}: {u.title}{suffix}")
+    if recovery_rows:
+        lines.append("")
+        lines.append(f"Blocked tasks (auto-recovery in flight) ({len(recovery_rows)}):")
+        for u, signal in recovery_rows:
+            suffix = f"    [recovery: {signal}]" if signal else ""
             lines.append(f"  - {u.id}: {u.title}{suffix}")
     if attn_rows:
         lines.append("")

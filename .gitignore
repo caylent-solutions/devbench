@@ -9,6 +9,12 @@ dist/
 build/
 logs/
 tmp/
+
+# Operator-specific Claude Code state (settings.local.json, commands.local.md, etc.).
+# Per-developer permission grants and local command shortcuts -- never the project's
+# source of truth. Mirrors the .vscode/*.json convention from CLAUDE.md's
+# "Critical Files" rule.
+/.claude/
 # Workspace backlog state lives in /backlog/ when devbench is run against
 # this repo as a workspace. Templates ship with the package itself and
 # MUST stay tracked so `devbench new-task` can render them in any clone

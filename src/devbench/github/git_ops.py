@@ -8,9 +8,12 @@ import logging
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 
 from devbench.config import (
+    CHECK_REGISTRATION_DELAY_SECONDS,
+    CHECK_REGISTRATION_RETRIES,
     GH_API_TIMEOUT,
     GITHUB_CHECK_TIMEOUT_SECONDS,
     MERGE_STRATEGY,
@@ -22,6 +25,24 @@ from devbench.config import (
 from devbench.config_loader import get_configured_default_branch
 from devbench.constants import RAW_RESPONSE_PREVIEW_CHARS
 from devbench.utils.process import run_command
+
+
+def _list_workflow_files(repo_path: Path | None) -> list[Path]:
+    """Return every ``.github/workflows/*.y[a]ml`` file under ``repo_path``.
+
+    Used by :meth:`GitOpsService.wait_for_checks` to disambiguate "repo
+    has no CI" from "Actions has not yet enqueued the workflow" (issue
+    #114). Returns an empty list when ``repo_path`` is ``None`` or the
+    workflows directory is absent. The list lives here so the unit-test
+    layer can monkey-patch the helper without instantiating
+    ``GitOpsService``.
+    """
+    if repo_path is None:
+        return []
+    workflows_dir = repo_path / ".github" / "workflows"
+    if not workflows_dir.is_dir():
+        return []
+    return sorted(p for p in workflows_dir.iterdir() if p.is_file() and p.suffix in {".yml", ".yaml"})
 
 
 class ConflictingPRError(RuntimeError):
@@ -346,18 +367,35 @@ class GitOpsService:
     ) -> bool:
         """Wait for all CI checks on a PR to complete.
 
-        Uses ``gh pr checks --watch`` with a timeout.
+        Uses ``gh pr checks --watch`` with a timeout. When ``gh`` returns
+        ``"no checks reported"``, disambiguates between "repo legitimately
+        has no CI" and "GitHub Actions has not yet enqueued the workflow"
+        (issue #114) by checking the local ``<repo>/.github/workflows/``
+        directory:
+
+        - Zero workflow files -> repo has no CI -> pass.
+        - One or more workflow files -> race condition -> retry up to
+          :data:`CHECK_REGISTRATION_RETRIES` times, sleeping
+          :data:`CHECK_REGISTRATION_DELAY_SECONDS` between attempts.
+          Fail-fast on retry exhaustion (no warn-and-pass: CLAUDE.md
+          forbids fallbacks; if CI cannot be confirmed, refuse the merge).
 
         Args:
             repo: GitHub repository in ``owner/name`` format.
             pr_number: The PR number to watch.
-            timeout: Maximum seconds to wait. Defaults to config value.
-            repo_path: Local filesystem path to the repository.
+            timeout: Maximum seconds to wait per ``gh pr checks`` call.
+                Defaults to config value.
+            repo_path: Local filesystem path to the repository. Required
+                for the workflow-file disambiguation; ``None`` falls
+                back to assuming the repo has no CI (legacy behaviour
+                for callers that have not been migrated to pass it).
 
         Returns:
-            ``True`` if all checks passed, or if the repo has no CI configured
-            (``gh`` exits non-zero with ``"no checks reported"`` in stderr).
-            ``False`` if checks were reported and one or more failed.
+            ``True`` if all checks passed, or if the repo legitimately has
+            no CI configured. ``False`` if checks were reported and one
+            or more failed, OR if the workflow-registration race
+            exhausted its retries (the failure mode is logged with the
+            elapsed wait + workflow files found).
 
         Raises:
             ValueError: If the repo is not in the allow-list.
@@ -366,31 +404,64 @@ class GitOpsService:
 
         effective_timeout = timeout if timeout is not None else GITHUB_CHECK_TIMEOUT_SECONDS
 
-        rc, stdout, stderr = self._gh(
-            ["pr", "checks", str(pr_number), "--watch"],
-            timeout=effective_timeout,
-            cwd=repo_path,
-            repo=repo,
-        )
-
-        if rc != 0:
-            if "no checks reported" in stderr:
+        # Total attempts = retries + 1 (the first call is attempt 0; on
+        # "no checks reported" the loop sleeps and retries up to
+        # CHECK_REGISTRATION_RETRIES additional times). On exhaustion the
+        # post-loop block emits the canonical refuse-to-merge error.
+        workflow_files: list[Path] = []
+        for attempt in range(CHECK_REGISTRATION_RETRIES + 1):
+            rc, stdout, stderr = self._gh(
+                ["pr", "checks", str(pr_number), "--watch"],
+                timeout=effective_timeout,
+                cwd=repo_path,
+                repo=repo,
+            )
+            if rc == 0:
+                self.logger.info("All checks passed for PR #%d on %s", pr_number, repo)
+                return True
+            if "no checks reported" not in stderr:
+                self.logger.warning(
+                    "Checks did not pass for PR #%d on %s: %s",
+                    pr_number,
+                    repo,
+                    stderr.strip(),
+                )
+                return False
+            workflow_files = _list_workflow_files(repo_path)
+            if not workflow_files:
                 self.logger.warning(
                     "No CI checks configured for PR #%d on %s -- treating as pass",
                     pr_number,
                     repo,
                 )
                 return True
-            self.logger.warning(
-                "Checks did not pass for PR #%d on %s: %s",
+            if attempt == CHECK_REGISTRATION_RETRIES:
+                # Final attempt: skip the sleep; fall through to the
+                # retry-exhausted block below.
+                break
+            self.logger.info(
+                "PR #%d on %s: workflow files exist (%d) but `gh pr checks` "
+                "returned 'no checks reported' on attempt %d/%d -- retrying after %ds",
                 pr_number,
                 repo,
-                stderr.strip(),
+                len(workflow_files),
+                attempt + 1,
+                CHECK_REGISTRATION_RETRIES + 1,
+                CHECK_REGISTRATION_DELAY_SECONDS,
             )
-            return False
-
-        self.logger.info("All checks passed for PR #%d on %s", pr_number, repo)
-        return True
+            time.sleep(CHECK_REGISTRATION_DELAY_SECONDS)
+        elapsed = CHECK_REGISTRATION_RETRIES * CHECK_REGISTRATION_DELAY_SECONDS
+        self.logger.warning(
+            "wait_for_checks gave up on PR #%d in %s after %ds: workflow files "
+            "%s exist locally but `gh pr checks` keeps reporting 'no checks "
+            "reported'. Refusing to merge. Investigate the GitHub Actions queue "
+            "or the workflow's `on:` triggers.",
+            pr_number,
+            repo,
+            elapsed,
+            [str(p.relative_to(repo_path)) if repo_path else str(p) for p in workflow_files],
+        )
+        return False
 
     def checkout_default_branch(self, repo: str, repo_path: Path) -> None:
         """Check out the default branch and pull latest changes.

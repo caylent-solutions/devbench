@@ -36,6 +36,7 @@ from devbench.constants import (
     COMMENT_AGENT_TEMPLATE,
     COMMENT_TIMESTAMP_FORMAT,
     COMMENTS_SECTION_HEADER,
+    DEFAULT_BLOCKED_RECOVERY_WINDOW_SECONDS,
     STATUS_DECLINED,
     STATUS_DONE,
     STATUS_IN_QUEUE,
@@ -133,38 +134,148 @@ def classify_proposed_task(backlog_root: Path, workspace_root: Path, suggested_i
 
 
 class BlockedTaskState(Enum):
-    """Lifecycle classifier for ``blocked`` work units (ADR-10 companion to ADR-08).
+    """Lifecycle classifier for ``blocked`` work units (3-state, post Part-1).
 
-    Separates blocked tasks the operator should engage with from blocked
-    tasks the ADR-07 auto-requeue cascade will resolve on its own.
+    Three buckets, ordered by what an operator should do about each:
 
     - ``AUTO_CLEARING_VIA_PROPOSAL`` -- carries at least one
       ``[BLOCKED_PENDING_PROPOSAL]`` marker whose targets all exist in the
-      backlog AND at least one of which is non-terminal. The cascade fires
-      the moment every marker target reaches ``done`` / ``declined``.
-    - ``NEEDS_OPERATOR_ATTENTION`` -- everything else. No markers, OR some
-      marker targets are unknown to the backlog, OR every marker is already
-      terminal (cascade should have fired already and did not -- diagnostic
-      signal worth surfacing).
+      backlog AND at least one of which is non-terminal. The ADR-07
+      cascade fires the moment every marker target reaches ``done`` /
+      ``declined``. Operator does nothing.
+    - ``AWAITING_AUTO_RECOVERY`` -- no marker yet, but at least one
+      recovery signal is present on disk: a pending proposal JSON
+      (blocker-resolver wrote it; task-factory will materialise +
+      promote it), or a rejected-amendment archive (manifest-amender
+      rejected; blocker-resolver runs next), or a recent ``[BLOCKED]``
+      audit comment from one of the recovery agents. The orchestrator's
+      next sweep cycle will advance the task into ``AUTO_CLEARING_VIA_PROPOSAL``
+      (or further). Operator does nothing for now.
+    - ``NEEDS_OPERATOR_ATTENTION`` -- the true halt list: no marker, no
+      recovery signal, OR a marker that points at an unknown ID (cascade
+      cannot resolve), OR every marker is already terminal (cascade
+      should have fired and did not). Manual blockers (``DO NOT CLAIM``)
+      land here.
     """
 
     AUTO_CLEARING_VIA_PROPOSAL = "auto-clearing"
+    AWAITING_AUTO_RECOVERY = "awaiting-recovery"
     NEEDS_OPERATOR_ATTENTION = "needs-attention"
+
+
+# Recovery audit-comment heuristics. Used by ``classify_blocked_task``
+# when no [BLOCKED_PENDING_PROPOSAL] marker is present yet but the
+# orchestrator's loop has logged a recent block from one of the recovery
+# agents -- that is, devbench WILL run blocker-resolver / task-factory
+# on the next iteration. The agent-tag and body-pattern allowlists keep
+# the heuristic narrow so unrelated [BLOCKED] comments do not trigger.
+_RECOVERY_AGENT_TAGS: frozenset[str] = frozenset(
+    {"agent/orchestrator", "agent/blocker_resolver", "agent/manifest_amender"}
+)
+_RECOVERY_BODY_RE: re.Pattern[str] = re.compile(
+    r"amendment-reject|out-of-scope|ALL_REVIEWS_FAILED|REVIEW_REJECTED",
+    re.IGNORECASE,
+)
+_BLOCKED_AUDIT_RE: re.Pattern[str] = re.compile(
+    r"\[(?P<ts>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s+UTC)\]\s+\[(?P<agent>[^\]]+)\]\s+\[BLOCKED\]\s+(?P<body>.+)",
+)
+
+
+def _has_pending_proposal_json(workspace_root: Path, task_id: str) -> bool:
+    """Recovery signal #1: blocker-resolver has already written a proposal.
+
+    True iff ``<workspace>/.devbench/proposals/<task_id>.json`` exists.
+    Task-factory will materialise + promote it on the next sweep cycle.
+    """
+    return proposal_path(workspace_root, task_id).is_file()
+
+
+def _has_rejected_amendment_archive(workspace_root: Path, task_id: str) -> bool:
+    """Recovery signal #2: manifest-amender has archived a rejected amendment.
+
+    True iff any ``<workspace>/.devbench/rejected-requests/<task_id>-*.json``
+    exists. Blocker-resolver reads the archive on its next iteration to
+    decide what fix proposal to emit (see ``REJECTED_REQUESTS_DIR_NAME``
+    in ``amendment.py`` -- the canonical constant kept here as a lazy
+    import to avoid a circular dependency through the manager module).
+    """
+    from devbench.backlog.amendment import REJECTED_REQUESTS_DIR_NAME
+
+    archive_dir = workspace_root / REJECTED_REQUESTS_DIR_NAME
+    if not archive_dir.is_dir():
+        return False
+    pattern = f"{task_id}-*.json"
+    return any(archive_dir.glob(pattern))
+
+
+def _recent_recovery_audit_comment(source_file: Path, now: datetime, window_seconds: int) -> bool:
+    """Recovery signal #3: a recent ``[BLOCKED]`` audit row from a recovery agent.
+
+    Walks the work-unit's Comments section, finds the most recent
+    ``[<ts>] [<agent>] [BLOCKED] <body>`` line, and returns True iff the
+    timestamp is within ``window_seconds`` of ``now`` AND the agent tag
+    is one of the canonical recovery agents AND the body matches the
+    recovery-cause regex (amendment-reject / out-of-scope /
+    ALL_REVIEWS_FAILED / REVIEW_REJECTED). Excludes the
+    ``[BLOCKED_PENDING_PROPOSAL]`` marker rows since those represent
+    cascade state, not pending recovery.
+
+    Returns False on any failure (file missing, malformed timestamp,
+    no Comments section) -- the caller treats that as "no recovery
+    signal" rather than masking it with a synthetic state.
+    """
+    if not source_file.is_file():
+        return False
+    content = source_file.read_text(encoding="utf-8")
+    most_recent: tuple[datetime, str, str] | None = None
+    for line in content.splitlines():
+        if "[BLOCKED_PENDING_PROPOSAL]" in line:
+            continue
+        match = _BLOCKED_AUDIT_RE.search(line)
+        if match is None:
+            continue
+        try:
+            ts = datetime.strptime(match.group("ts"), "%Y-%m-%d %H:%M UTC").replace(tzinfo=UTC)
+        except ValueError:
+            continue
+        if most_recent is None or ts > most_recent[0]:
+            most_recent = (ts, match.group("agent").strip(), match.group("body").strip())
+    if most_recent is None:
+        return False
+    ts, agent, body = most_recent
+    if (now - ts).total_seconds() > window_seconds:
+        return False
+    if agent not in _RECOVERY_AGENT_TAGS:
+        return False
+    return bool(_RECOVERY_BODY_RE.search(body))
 
 
 def classify_blocked_task(
     backlog_root: Path,
     backlog_index: Path,
     task_id: str,
+    *,
+    workspace_root: Path | None = None,
+    now: datetime | None = None,
+    recovery_window_seconds: int | None = None,
 ) -> BlockedTaskState:
-    """Classify ``task_id`` as auto-clearing vs needs-operator-attention.
+    """Classify ``task_id`` into one of the three blocked-task states.
 
     Caller is responsible for having already determined the task is
     currently in ``blocked`` status; this function does not re-check status.
 
-    Reuses :meth:`BacklogManager._extract_pending_proposal_markers` and
-    :meth:`BacklogManager._parse_backlog_rows` so the classification logic
-    stays in lockstep with the ADR-07 cascade's own view of marker state.
+    The classifier returns ``AUTO_CLEARING_VIA_PROPOSAL`` when the
+    standard cascade conditions are met. When no marker is present, it
+    checks three recovery signals (pending proposal JSON, rejected-
+    amendment archive, recent recovery audit comment) and returns
+    ``AWAITING_AUTO_RECOVERY`` if any signal is positive. Everything
+    else falls through to ``NEEDS_OPERATOR_ATTENTION``.
+
+    The optional ``workspace_root`` enables the recovery checks (they
+    read ``.devbench/proposals/`` and ``.devbench/rejected-requests/``).
+    Older callers that only have ``backlog_root`` + ``backlog_index``
+    keep the original two-state behaviour. Production callers always
+    pass ``workspace_root``.
     """
     source_file = _find_source_task_file(backlog_root, backlog_index, task_id)
     if source_file is None:
@@ -172,9 +283,31 @@ def classify_blocked_task(
 
     mgr = BacklogManager()
     marker_ids = mgr._extract_pending_proposal_markers(source_file)
-    if not marker_ids:
-        return BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+    if marker_ids:
+        return _classify_with_markers(mgr, backlog_index, marker_ids)
 
+    return _classify_recovery_or_attention(
+        source_file=source_file,
+        task_id=task_id,
+        workspace_root=workspace_root,
+        now=now,
+        recovery_window_seconds=recovery_window_seconds,
+    )
+
+
+def _classify_with_markers(
+    mgr: BacklogManager,
+    backlog_index: Path,
+    marker_ids: set[str],
+) -> BlockedTaskState:
+    """Resolve AUTO_CLEARING_VIA_PROPOSAL vs NEEDS_OPERATOR_ATTENTION when markers exist.
+
+    Extracted so ``classify_blocked_task`` stays under ruff's PLR0911
+    return-statement ceiling. Returns NEEDS_OPERATOR_ATTENTION when
+    the backlog index is missing, when any marker target is unknown,
+    or when every marker is already terminal (cascade should have
+    fired and did not). Otherwise the cascade is in flight.
+    """
     try:
         rows = mgr._parse_backlog_rows(backlog_index)
     except FileNotFoundError:
@@ -185,20 +318,60 @@ def classify_blocked_task(
     non_terminal_marker_found = False
     for marker in marker_ids:
         if marker not in status_by_id:
-            # Marker points at an ID that is no longer in the backlog -- the
-            # cascade cannot resolve this. Operator attention required.
             return BlockedTaskState.NEEDS_OPERATOR_ATTENTION
         if status_by_id[marker] not in terminal:
             non_terminal_marker_found = True
 
     if not non_terminal_marker_found:
-        # Every marker is already terminal; cascade should have fired. It
-        # did not (otherwise this task would not still be blocked). Flag
-        # for operator review -- something went wrong or this task carries
-        # an extra non-cascade blocker the operator needs to address.
         return BlockedTaskState.NEEDS_OPERATOR_ATTENTION
-
     return BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL
+
+
+def _classify_recovery_or_attention(
+    *,
+    source_file: Path,
+    task_id: str,
+    workspace_root: Path | None,
+    now: datetime | None,
+    recovery_window_seconds: int | None,
+) -> BlockedTaskState:
+    """Resolve AWAITING_AUTO_RECOVERY vs NEEDS_OPERATOR_ATTENTION when no marker exists.
+
+    Older callers that pass no ``workspace_root`` get
+    NEEDS_OPERATOR_ATTENTION immediately (legacy two-state behaviour).
+    The three recovery signals are checked cheapest-first: file-presence
+    > glob-match > timestamp-window read of the source file.
+    """
+    if workspace_root is None:
+        return BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+    if _has_pending_proposal_json(workspace_root, task_id):
+        return BlockedTaskState.AWAITING_AUTO_RECOVERY
+    if _has_rejected_amendment_archive(workspace_root, task_id):
+        return BlockedTaskState.AWAITING_AUTO_RECOVERY
+    effective_now = now if now is not None else datetime.now(UTC)
+    effective_window = (
+        recovery_window_seconds if recovery_window_seconds is not None else DEFAULT_BLOCKED_RECOVERY_WINDOW_SECONDS
+    )
+    if _recent_recovery_audit_comment(source_file, effective_now, effective_window):
+        return BlockedTaskState.AWAITING_AUTO_RECOVERY
+    return BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+
+
+def recovery_signal_for_task(workspace_root: Path, task_id: str) -> str:
+    """Return a one-line annotation naming the recovery signal source.
+
+    Used by the report renderer to annotate ``AWAITING_AUTO_RECOVERY``
+    rows with a ``[recovery: ...]`` suffix so operators see WHY devbench
+    thinks the task will recover. Falls back to the audit-comment label
+    when neither the pending-proposal JSON nor the rejected-amendment
+    archive is present (the classifier already decided this task
+    qualifies; this helper only labels it).
+    """
+    if _has_pending_proposal_json(workspace_root, task_id):
+        return f"pending proposal at .devbench/proposals/{task_id}.json"
+    if _has_rejected_amendment_archive(workspace_root, task_id):
+        return f"rejected-requests archive at .devbench/rejected-requests/{task_id}-*.json"
+    return "recent [BLOCKED] audit comment from a recovery agent"
 
 
 def _read_draft_status(draft_path: Path) -> str:

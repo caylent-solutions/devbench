@@ -117,6 +117,7 @@ from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
 from devbench.config import (
     BACKLOG_INDEX,
     BACKLOG_ROOT,
+    BLOCKED_RECOVERY_WINDOW_SECONDS,
     REPO_LOCAL_PATHS,
     RUNTIME_CONFIG,
     UPDATE_SUBMODULE,
@@ -200,12 +201,13 @@ def cmd_status(*argv: str) -> int:
 
     total = len(units)
     unmaterialised_count = _count_unmaterialised_proposed_tasks()
-    auto_count, attn_count = _count_blocked_split(units)
+    auto_count, recovery_count, attn_count = _count_blocked_split(units)
     print("Backlog Status Summary")
     print("=" * STATUS_SEPARATOR_WIDTH)
     for status_val in DISPLAY_STATUS_VALUES:
         if status_val == "Blocked":
             print(f"  {'Blocked (auto)':<15} {auto_count:>4}")
+            print(f"  {'Blocked (recovery)':<15} {recovery_count:>4}")
             print(f"  {'Blocked (attn)':<15} {attn_count:>4}")
             continue
         count = counts.get(status_val.lower(), 0)
@@ -335,6 +337,12 @@ def cmd_claim(unit_id: str) -> int:
 
     Use after ``devbench next`` to explicitly mark the unit as owned before
     the executor begins work.
+
+    Issue #117: refuses to claim a work unit whose Changes Manifest still
+    contains a ``TBD`` placeholder row. The orchestrator catches this at
+    claim time and either auto-amends (when ``manifest_amendment.enabled:
+    true``) or surfaces the failure to the operator -- either way the
+    placeholder never reaches the executor.
     """
     units = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX).parse_index()
     unit = next((u for u in units if u.id == unit_id), None)
@@ -344,6 +352,19 @@ def cmd_claim(unit_id: str) -> int:
     wu_file = _resolve_unit_file(unit)
     if wu_file is None:
         print(f"ERROR: work unit file not found for '{unit_id}'", file=sys.stderr)
+        return 1
+    # Use a fresh import path so the unit-test layer's
+    # `patch("devbench.cli.BacklogManager", ...)` does not stub out the
+    # placeholder-detection classmethod via attribute lookup on the mock.
+    from devbench.backlog.manager import BacklogManager as _BacklogManager
+
+    placeholder = _BacklogManager._first_placeholder_manifest_cell(wu_file.read_text(encoding="utf-8"))
+    if placeholder:
+        print(
+            f"ERROR: cannot claim {unit_id!r}: Changes Manifest still has placeholder row "
+            f"{placeholder!r}. Replace with real file entries before claim.",
+            file=sys.stderr,
+        )
         return 1
     mgr = BacklogManager()
     mgr.force_status(wu_file, BACKLOG_INDEX, unit_id, STATUS_IN_PROGRESS)
@@ -3000,25 +3021,38 @@ def _count_unmaterialised_proposed_tasks() -> int:
     return count
 
 
-def _count_blocked_split(units: list[WorkUnit]) -> tuple[int, int]:
-    """Return ``(auto_count, attn_count)`` for the blocked-task UX split (ADR-10).
+def _count_blocked_split(units: list[WorkUnit]) -> tuple[int, int, int]:
+    """Return ``(auto_count, recovery_count, attn_count)`` for the 3-state split.
 
     Iterates every blocked work unit and classifies it via
-    :func:`classify_blocked_task`. The two counts always sum to the total
-    number of blocked tasks in ``units`` so the aggregate is recoverable
-    by addition.
+    :func:`classify_blocked_task`. The three counts always sum to the
+    total number of blocked tasks in ``units`` so the aggregate is
+    recoverable by addition. ``recovery_count`` is the new
+    ``AWAITING_AUTO_RECOVERY`` bucket: tasks devbench will resolve on
+    its own via the manifest-amender / blocker-resolver / task-factory
+    loop, but that have not yet reached the
+    ``[BLOCKED_PENDING_PROPOSAL]`` marker state.
     """
     auto = 0
+    recovery = 0
     attn = 0
     for u in units:
         if u.status != WorkUnitStatus.BLOCKED:
             continue
-        state = classify_blocked_task(BACKLOG_ROOT, BACKLOG_INDEX, u.id)
+        state = classify_blocked_task(
+            BACKLOG_ROOT,
+            BACKLOG_INDEX,
+            u.id,
+            workspace_root=WORKSPACE_ROOT,
+            recovery_window_seconds=BLOCKED_RECOVERY_WINDOW_SECONDS,
+        )
         if state is BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL:
             auto += 1
+        elif state is BlockedTaskState.AWAITING_AUTO_RECOVERY:
+            recovery += 1
         else:
             attn += 1
-    return auto, attn
+    return auto, recovery, attn
 
 
 def cmd_promote_proposal(first_arg: str, second_arg: str = "") -> int:

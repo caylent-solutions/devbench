@@ -511,6 +511,71 @@ class TestWaitForChecks:
         _, kwargs = mock_gh.call_args
         assert kwargs.get("repo") == "caylent-solutions/git-repo"
 
+    def test_no_checks_with_workflow_files_retries_then_succeeds(self, tmp_path: Path) -> None:
+        """Issue #114: workflow exists but Actions has not enqueued yet.
+
+        Mock `gh pr checks` to return "no checks reported" the first call,
+        then a clean exit on the second. The retry loop should bridge the
+        gap and return True without merging blind.
+        """
+        from devbench.github import git_ops as git_ops_mod
+
+        judge = GitOpsService()
+        workflows_dir = tmp_path / ".github" / "workflows"
+        workflows_dir.mkdir(parents=True)
+        (workflows_dir / "ci.yml").write_text("on: push\n")
+        responses = [(1, "", "no checks reported"), (0, "All checks passed", "")]
+        with (
+            patch.object(judge, "_gh", side_effect=responses),
+            patch.object(git_ops_mod, "CHECK_REGISTRATION_DELAY_SECONDS", 0),
+        ):
+            assert judge.wait_for_checks("caylent-solutions/git-repo", 42, repo_path=tmp_path) is True
+
+    def test_no_checks_with_workflow_files_retry_exhausted_returns_false(self, tmp_path: Path) -> None:
+        """Issue #114: workflow files exist but every retry returns 'no checks reported'.
+
+        After CHECK_REGISTRATION_RETRIES attempts, refuse the merge --
+        no warn-and-pass fallback (CLAUDE.md no-fallback rule).
+        """
+        from devbench.github import git_ops as git_ops_mod
+
+        judge = GitOpsService()
+        workflows_dir = tmp_path / ".github" / "workflows"
+        workflows_dir.mkdir(parents=True)
+        (workflows_dir / "ci.yml").write_text("on: push\n")
+        with (
+            patch.object(judge, "_gh", return_value=(1, "", "no checks reported")),
+            patch.object(git_ops_mod, "CHECK_REGISTRATION_DELAY_SECONDS", 0),
+            patch.object(git_ops_mod, "CHECK_REGISTRATION_RETRIES", 2),
+        ):
+            assert judge.wait_for_checks("caylent-solutions/git-repo", 42, repo_path=tmp_path) is False
+
+
+class TestListWorkflowFiles:
+    """Phase B3 helper: glob `.github/workflows/*.y[a]ml` under repo_path."""
+
+    def test_returns_empty_when_repo_path_is_none(self) -> None:
+        from devbench.github.git_ops import _list_workflow_files
+
+        assert _list_workflow_files(None) == []
+
+    def test_returns_empty_when_workflows_dir_absent(self, tmp_path: Path) -> None:
+        from devbench.github.git_ops import _list_workflow_files
+
+        assert _list_workflow_files(tmp_path) == []
+
+    def test_returns_yml_and_yaml_files_sorted(self, tmp_path: Path) -> None:
+        from devbench.github.git_ops import _list_workflow_files
+
+        wd = tmp_path / ".github" / "workflows"
+        wd.mkdir(parents=True)
+        (wd / "release.yaml").write_text("")
+        (wd / "ci.yml").write_text("")
+        (wd / "README.md").write_text("not a workflow")
+        result = _list_workflow_files(tmp_path)
+        names = [p.name for p in result]
+        assert names == ["ci.yml", "release.yaml"]
+
 
 class TestUpdateParentSubmoduleRef:
     """Test update_parent_submodule_ref method."""

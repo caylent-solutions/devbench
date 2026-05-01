@@ -1307,7 +1307,12 @@ class TestUnitListings:
         unit_auto = self._mk_unit("E0-F1-S1-T1", "Auto-clearing", WorkUnitStatus.BLOCKED)
         unit_attn = self._mk_unit("E0-F1-S1-T2", "Needs attention", WorkUnitStatus.BLOCKED)
 
-        def fake_classify(backlog_root: Path, backlog_index: Path, task_id: str) -> BlockedTaskState:
+        def fake_classify(
+            backlog_root: Path,
+            backlog_index: Path,
+            task_id: str,
+            **kwargs: object,
+        ) -> BlockedTaskState:
             return {
                 "E0-F1-S1-T1": BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL,
                 "E0-F1-S1-T2": BlockedTaskState.NEEDS_OPERATOR_ATTENTION,

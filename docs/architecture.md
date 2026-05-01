@@ -54,7 +54,7 @@ What devbench does today, grouped by theme:
 - Recursive work-unit hierarchy (Epic → Feature → Story → Task) with automatic status rollup of parents when children complete.
 
 ### Multi-judge review
-- Four review judges (code, test, doc, changes-manifest) run in parallel via `review-supervisor`.
+- Four review judges (code, test, doc, changes-manifest) run in parallel via `review-supervisor`. The supervisor is **read-only**: a PreToolUse hook (`plugin/devbench/scripts/guard-review-supervisor-scope.sh`) blocks any Bash mutation (git commit/push, rm, sed -i, etc.) AND any Agent-tool invocation whose `subagent_type` is outside the canonical review_team allowlist (`devbench:code_review`, `devbench:test_review`, `devbench:doc_review`, `devbench:changes_manifest`). This closes the loophole where the supervisor previously escalated to commit / push / PR-create rights by spawning an executor subagent (issue #118).
 - A separate security judge runs sequentially after the review tier passes.
 - Done-gate enforces all four review judges must REVIEW_PASS before a unit can be marked done.
 - Review failures inject prior feedback into the next executor attempt to prevent loops.
@@ -72,6 +72,7 @@ What devbench does today, grouped by theme:
 - **Single-PR mode**: all work units commit to one shared branch; one PR for the whole batch via `git-ops-finalize`.
 - Per-repo merge strategy override (merge / squash / rebase).
 - Optional submodule pointer updates after PR merges.
+- **Workflow-registration race defence** (issue #114): `wait_for_checks` disambiguates `gh pr checks` returning "no checks reported" by globbing `<repo>/.github/workflows/*.y[a]ml`. Repos with workflow files retry up to `JUDGE_CHECK_REGISTRATION_RETRIES` (default 12) attempts spaced by `JUDGE_CHECK_REGISTRATION_DELAY_SECONDS` (default 5) -- 60s default coverage for the GitHub Actions queue. Repos without workflow files fast-path-pass. On retry exhaustion, devbench refuses the merge (CLAUDE.md no-fallback rule).
 
 ### Multi-repo support
 - One workspace can drive work across multiple target repos.
@@ -237,7 +238,7 @@ stateDiagram-v2
 
 ### The model
 
-The workspace root contains `BACKLOG.md` and the `backlog/` directory with work-unit files and `config/devbench.yaml`. The YAML's `repos:` map declares one or more target repositories that the orchestrator will modify. Each work unit identifies its target via a `repo:` field that matches a key in the map (full `org/repo` or short name).
+The workspace root (`JUDGE_WORKSPACE_ROOT`) is the **parent directory** that contains `BACKLOG.md`, the `backlog/` work-unit subtree, and the target-repo siblings. It is NOT the backlog repo itself -- the loader expects `BACKLOG.md` at `<JUDGE_WORKSPACE_ROOT>/BACKLOG.md` and `backlog/config/devbench.yaml` at `<JUDGE_WORKSPACE_ROOT>/backlog/config/devbench.yaml`. The YAML's `repos:` map declares one or more target repositories that the orchestrator will modify. Each work unit identifies its target via a `repo:` field that matches a key in the map (full `org/repo` or short name).
 
 ```yaml
 # backlog/config/devbench.yaml
@@ -252,21 +253,23 @@ repos:
 merge_strategy: squash         # default for all repos
 ```
 
-`checkout_directory` is **relative** to the workspace root; absolute paths are rejected at config load time.
+`checkout_directory` is **relative** to the workspace root; absolute paths are rejected at config load time. The loader populates `RepoConfig.resolved_checkout_path` with the absolute `<workspace>/<checkout_directory>` path so consumers (`cmd_*` in `cli.py`, `GitOpsService` in `git_ops.py`) read the dataclass field instead of re-resolving inline (E213).
 
 ### Recommended directory layout
 
 ```
 workspace-root/                            <-- JUDGE_WORKSPACE_ROOT
-├── BACKLOG.md
-├── backlog/
+├── BACKLOG.md                             <-- master index (mandatory at this exact path)
+├── backlog/                               <-- work-unit subtree
 │   ├── config/devbench.yaml
 │   └── E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md
-├── repo-a/                                <-- symlink or real clone
-└── repo-b/                                <-- symlink or real clone
+├── repo-a/                                <-- target-repo SIBLING of backlog/, NOT nested under it
+└── repo-b/                                <-- another target repo
 ```
 
-The symlink pattern is preferred when the backlog lives in its own git repo: it lets you commit backlog progress independently of the target repos.
+When the backlog lives in its own git repo (so backlog progress -- status changes, TDD logs, judge comments -- commits separately from target-repo history), init the git repo at `<workspace-root>/.git` and add the target-repo sibling directories to `<workspace-root>/.gitignore` so they don't pollute the backlog history.
+
+Symlinks remain optional for the case where target repos cannot be cloned next to the workspace root (a shared workspace with target repos elsewhere on disk). The symlink goes at the sibling path (`<workspace>/repo-a`), NOT inside `backlog/` -- a symlink under `backlog/` triggers `_check_orphans` because it appears as a non-work-unit file under the work-unit subtree.
 
 ### Single-repo is just one entry
 

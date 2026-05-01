@@ -360,6 +360,44 @@ class TestCmdClaim:
         assert call_args[0][3] == STATUS_IN_PROGRESS
         assert "Claimed E0-F1-S1-T2" in capsys.readouterr().out
 
+    def test_claim_refuses_when_manifest_has_tbd_placeholder(
+        self,
+        backlog_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Issue #117: cmd_claim refuses tasks whose Manifest still carries a TBD row."""
+        wu_file = backlog_dir / "E0-F1-S1-T2.md"
+        wu_file.write_text(
+            "# E0-F1-S1-T2: Test\n\n"
+            "## Status: in-queue\n\n"
+            "## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Type | Reason |\n|----|------|--------|\n| none | | |\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-FUNC-001\n\n"
+            "## Changes Manifest\n\n"
+            "| File | Change |\n|------|--------|\n"
+            "| TBD | Executor agent: replace this row |\n",
+            encoding="utf-8",
+        )
+        unit = WorkUnit(
+            id="E0-F1-S1-T2",
+            title="Test",
+            status=WorkUnitStatus.IN_QUEUE,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T2.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
+        ):
+            rc = cli.cmd_claim("E0-F1-S1-T2")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "placeholder row 'TBD'" in err
+
     def test_claim_returns_nonzero_for_unknown_id(
         self,
         mock_units: list[WorkUnit],
@@ -4163,7 +4201,12 @@ class TestCmdStatusBlockedSplit:
             dependencies=[],
         )
 
-        def fake_classify(backlog_root: Path, backlog_index: Path, task_id: str) -> BlockedTaskState:
+        def fake_classify(
+            backlog_root: Path,
+            backlog_index: Path,
+            task_id: str,
+            **kwargs: object,
+        ) -> BlockedTaskState:
             if task_id == "E0-F1-S1-T1":
                 return BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL
             return BlockedTaskState.NEEDS_OPERATOR_ATTENTION

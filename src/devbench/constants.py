@@ -242,6 +242,25 @@ DEFAULT_GITHUB_CHECK_TIMEOUT_SECONDS: int = 600
 DEFAULT_STOP_HOOK_MAX_BLOCKS: int = 5
 DEFAULT_STOP_HOOK_WINDOW_SECONDS: int = 180
 DEFAULT_STOP_HOOK_STALE_TASK_MINUTES: int = 120
+# Workflow-registration race defence (issue #114). When `gh pr checks`
+# returns "no checks reported" right after a PR is created, devbench
+# cannot tell "repo has no CI configured" apart from "GitHub Actions
+# has not yet enqueued the workflow for this commit". The retry loop
+# (12 retries x 5s = 60s default coverage) handles the race; the
+# zero-workflow-files fast path skips the wait when the repo legitimately
+# has no CI. Both knobs override via JUDGE_CHECK_REGISTRATION_RETRIES /
+# JUDGE_CHECK_REGISTRATION_DELAY_SECONDS env vars.
+DEFAULT_CHECK_REGISTRATION_RETRIES: int = 12
+DEFAULT_CHECK_REGISTRATION_DELAY_SECONDS: int = 5
+# Recency cap for the "recent recovery audit comment" heuristic in the
+# 3-state blocked-task classifier (AWAITING_AUTO_RECOVERY signal #3).
+# Tasks whose most recent [BLOCKED] audit-comment timestamp is older
+# than this window fall through to NEEDS_OPERATOR_ATTENTION, even when
+# the agent-tag and body-pattern would otherwise match. 30 minutes
+# covers the gap between manifest-amender FAIL and blocker-resolver's
+# proposal write under normal orchestrator iteration cadence; tune via
+# JUDGE_BLOCKED_RECOVERY_WINDOW_SECONDS for slower / debugging runs.
+DEFAULT_BLOCKED_RECOVERY_WINDOW_SECONDS: int = 1800
 DEFAULT_TOKEN_COST_PER_M_INPUT: float = 5.0
 DEFAULT_TOKEN_COST_PER_M_OUTPUT: float = 25.0
 

@@ -40,6 +40,37 @@ if [[ "$AGENT_TYPE" != "devbench:review-supervisor" ]]; then
   exit 0
 fi
 
+# Issue #118: the prior Bash-only guard let the supervisor escalate by
+# spawning subagents (executor / git-ops) via the Agent tool. Block any
+# Agent-tool invocation whose subagent_type is not in the canonical
+# review_team allowlist. The override env var still applies operator-wide.
+TOOL_NAME=$(extract_field "$INPUT" "tool_name")
+if [[ "$TOOL_NAME" == "Agent" ]]; then
+  # Claude Code's PreToolUse Agent payload puts subagent_type under
+  # tool_input. Some test fixtures pass it at top-level for convenience;
+  # support both shapes.
+  if command -v jq >/dev/null 2>&1; then
+    SUBAGENT=$(printf '%s' "$INPUT" | jq -r '.tool_input.subagent_type // .subagent_type // ""')
+  else
+    SUBAGENT=$(printf '%s' "$INPUT" | sed -nE 's/.*"subagent_type"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p')
+  fi
+  case "$SUBAGENT" in
+    devbench:code_review|devbench:test_review|devbench:doc_review|devbench:changes_manifest)
+      exit 0
+      ;;
+  esac
+  if [[ "${DEVBENCH_ALLOW_REVIEW_SUPERVISOR_MUTATIONS:-0}" == "1" ]]; then
+    printf 'guard-review-supervisor-scope: ALLOWED via DEVBENCH_ALLOW_REVIEW_SUPERVISOR_MUTATIONS=1 (Agent subagent_type=%s)\n' "$SUBAGENT" >&2
+    exit 0
+  fi
+  {
+    printf 'guard-review-supervisor-scope: BLOCKED -- review-supervisor attempted to spawn subagent_type %s.\n' "$SUBAGENT"
+    printf 'Reason: review-supervisor may only invoke review_team subagents (devbench:code_review, devbench:test_review, devbench:doc_review, devbench:changes_manifest). Spawning any other agent (executor, git-ops, blocker_resolver, etc.) bypasses the documented pipeline (executor -> review-supervisor -> security-reviewer -> git-ops -> mark-done).\n'
+    printf 'Override: only an operator may set DEVBENCH_ALLOW_REVIEW_SUPERVISOR_MUTATIONS=1 in the env to permit a one-off non-review-team subagent.\n'
+  } >&2
+  exit 2
+fi
+
 COMMAND=$(extract_command "$INPUT")
 decode_json_escapes COMMAND
 

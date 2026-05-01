@@ -56,6 +56,12 @@ Pass `--detail` (E220) to additionally render three panels at the bottom of the 
 
 Without `--detail` the panels are omitted (default invocation matches the historical output shape).
 
+The summary's `Blocked` row is split into three lines (Part-1, post-issue-#118):
+
+- `Blocked (auto)` -- ADR-07 cascade-clearing: the task carries a `[BLOCKED_PENDING_PROPOSAL]` marker chain that will resolve when its target tasks reach terminal.
+- `Blocked (recovery)` -- AWAITING_AUTO_RECOVERY: no marker yet, but devbench's recovery loop has an artefact on disk (a pending proposal JSON, a rejected-amendment archive, or a recent recovery-agent `[BLOCKED]` audit comment within `JUDGE_BLOCKED_RECOVERY_WINDOW_SECONDS` -- default 1800s / 30min). The orchestrator's next sweep cycle will advance the task into the auto-clearing bucket. Operator does nothing.
+- `Blocked (attn)` -- the true halt list: manual gates (`DO NOT CLAIM`), unknown marker targets, cascade-stuck states. Operator must act.
+
 ### `next`
 
 ```
@@ -86,6 +92,14 @@ Cost is computed per call, per token type, from real `usage` data. See [model-pr
 When NONE of (1)/(2)/(3) yields a path -- i.e. `JUDGE_LOG_FILE` unset, `log_file:` absent from yaml, AND `JUDGE_WORKSPACE_ROOT` unset -- `devbench report` exits 1 with an actionable error naming all three sources. The previous implementation silently fell back to the devbench source-tree's log (`<devbench>/src/devbench/logs/orchestrator.log`), which let operators read a stale, unrelated log without noticing -- the BACKLOG.md done count and the log-derived throughput count then diverged silently.
 
 **Divergence WARNING:** when `BACKLOG.md` reports a non-zero "Tasks completed" count but the All-time throughput window finds zero `Set <id> to 'done'` events, the report emits a one-line WARNING above the trailing summary. The two counts MUST agree on a healthy backlog (the throughput row narrates the events that produced the backlog state). A divergence almost always means `devbench report` is reading a different log than the orchestrator writes to. The warning names the log file path so the operator can immediately identify the mismatch and either set `JUDGE_LOG_FILE` correctly or invoke `devbench report` from the same env the orchestrator was launched with.
+
+**Blocked-task classification (Part-1, post-issue-#118):** the report renders blocked tasks across three panels, ordered by what the operator should do:
+
+- `Blocked tasks (auto-clearing via proposal)` -- the ADR-07 cascade will fire when every `[BLOCKED_PENDING_PROPOSAL]` marker target reaches terminal. Each row names the IDs the task is waiting on. Operator does nothing.
+- `Blocked tasks (auto-recovery in flight)` -- no marker yet, but devbench's recovery loop has an artefact on disk: a pending proposal JSON, a rejected-amendment archive, or a recent recovery-agent `[BLOCKED]` audit comment within `JUDGE_BLOCKED_RECOVERY_WINDOW_SECONDS` (default 1800s). Each row carries a `[recovery: <signal-source>]` annotation so the operator can see which signal drove the classification. Operator does nothing for now -- the next sweep cycle will advance the task into the auto-clearing bucket.
+- `Blocked tasks (needs operator attention)` -- the true halt list: manual gates (`DO NOT CLAIM`), unknown marker targets, cascade-stuck states. Each row carries just ID + title; the operator opens the work-unit file to read the blocker comment.
+
+Empty panels are omitted entirely. The recency-window override (`JUDGE_BLOCKED_RECOVERY_WINDOW_SECONDS=<seconds>`) lets operators with slower iteration cadences extend the audit-comment window.
 
 ### `watch`
 
@@ -405,6 +419,16 @@ Enforces three deterministic safety rails:
 - **Orphan-pattern:** no staged or already-tracked path may match a build/state ignore pattern (terraform state, terragrunt cache, Python pycache, coverage artefacts, `node_modules`, `.DS_Store`). When detected, git-ops refuses the commit AND auto-emits a cleanup proposal so the cascade self-heals (the source task moves to `blocked-pending-proposal` on a follow-up `cleanup-tracked-orphans` task; the original task auto-clears once the cleanup commits). Override the active pattern list per backlog via `DEVBENCH_ORPHAN_IGNORE_PATTERNS` (comma-separated fnmatch globs).
 
 Each rail exits 1 with a clear diagnostic when violated.
+
+#### Workflow-registration race defence (issue #114)
+
+The `wait_for_checks` step that runs between `gh pr create` and `gh pr merge` no longer treats `gh pr checks --watch` returning `"no checks reported"` as an unconditional pass. The previous behaviour merged before GitHub Actions had a chance to enqueue the workflow when CI was actually configured. The new disambiguation:
+
+- **Repo has no `.github/workflows/*.y[a]ml` files locally**: legitimate "no CI configured" -> pass immediately (legacy fast path).
+- **Repo has at least one workflow file**: race condition. Retry `gh pr checks` up to `JUDGE_CHECK_REGISTRATION_RETRIES` times (default 12), sleeping `JUDGE_CHECK_REGISTRATION_DELAY_SECONDS` between attempts (default 5). 12 * 5 = 60s of default coverage for the GitHub Actions queue.
+- **Retry exhausted**: refuse the merge with an actionable error naming the PR number, the elapsed wait, and the workflow files found. No warn-and-pass fallback.
+
+Operators with unusual CI cadence override the knobs via the env vars above. Defaults live in `src/devbench/constants.py` (`DEFAULT_CHECK_REGISTRATION_RETRIES`, `DEFAULT_CHECK_REGISTRATION_DELAY_SECONDS`).
 
 ### `git-ops-finalize`
 

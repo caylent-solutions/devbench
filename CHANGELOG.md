@@ -135,6 +135,35 @@ since the last release. PR #119 carries every change.
   purpose of an amendment. New regression test
   `tests/test_integration/test_manifest_amender_scope.py` pins the
   protective fragments by-content.
+- **Stop hook block decision no longer dropped when `python3` is
+  asdf-shimmed without a configured version** (issue #130).
+  `plugin/devbench/scripts/continue-orchestration.sh` now uses `jq`
+  for every JSON serialisation (BLOCK_JSON construction, state-file
+  read, diagnostic-capture write); the previous `python3 -c '...'`
+  invocations exited 126 under an asdf shim with no python version,
+  causing the script to fall back to a literal
+  `"(reason serialisation failed)"` reason text and silently skip
+  the diagnostic-capture file. Operators saw exactly one
+  `Stop hook blocked (1/5)` log entry per session followed by an
+  unwanted Claude Code self-termination. New regression tests
+  `tests/unit/test_continue_orchestration_hook.py::TestBlockJsonSerialisationRobustness`
+  pin the new contract: zero `python3` invocations in the script,
+  the BLOCK_JSON reason field is real text under a minimal PATH,
+  and the diagnostic-capture file is written on every block.
+- **Stop hook now reports the active task, not the alphabetically-
+  first stale `in-progress` row** (issue #131).
+  `continue-orchestration.sh` reads `<workspace>/logs/*.log` for the
+  most recent `Branch ready: ... on <task_id>` or
+  `Set <task_id> to 'in-progress'` entry and uses that ID as the
+  active task. When multiple tasks are in-progress simultaneously,
+  the reason text now lists every in-progress ID with the active
+  task named first and the rest enumerated as
+  `(also in-progress: ID2, ID3)`. Falls back to the existing
+  `head -1` BACKLOG row only when no log entry parses (fresh
+  checkout, never-launched workspace). New regression tests
+  `tests/unit/test_continue_orchestration_hook.py::TestActiveTaskSelection`
+  pin all four scenarios (log-driven pick, multiple-in-progress
+  surfacing, fresh-checkout fallback, both log-line shapes accepted).
 
 ### Renamed / Removed
 

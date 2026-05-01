@@ -566,6 +566,8 @@ The circuit breaker prevents tight stop-block loops from running forever; it als
 
 Configuration is under `stop_hook:` in the YAML, with env var overrides `JUDGE_STOP_MAX_BLOCKS`, `JUDGE_STOP_WINDOW_SECONDS`, `JUDGE_STOP_STALE_MINUTES`.
 
+**Implementation invariants (issues #130 + #131)**: every JSON serialisation in the Stop hook chain (BLOCK_JSON, state file, diagnostic capture) must use `jq` -- never `python3` -- because the hook can be invoked with an asdf-shimmed PATH where `python3` exits 126 with no version configured, silently dropping the block decision. Active-task selection reads `<workspace>/logs/*.log` for the most recent `Branch ready: ... on <task_id>` or `Set <task_id> to 'in-progress'` entry rather than `head -1` of BACKLOG.md, so a stale `in-progress` row from a crashed prior session does not mask what the orchestrator is actually running. Both invariants are pinned by-content in `tests/unit/test_continue_orchestration_hook.py::TestBlockJsonSerialisationRobustness` and `::TestActiveTaskSelection`.
+
 ---
 
 ## 10. Current gaps (known limitations)

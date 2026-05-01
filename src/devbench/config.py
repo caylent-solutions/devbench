@@ -42,6 +42,10 @@ from devbench.constants import (
     DEFAULT_FAST_MODE_MULTIPLIER,
     DEFAULT_GH_API_TIMEOUT,
     DEFAULT_GITHUB_CHECK_TIMEOUT_SECONDS,
+    DEFAULT_HOOK_TAIL_AGENT_WIDTH,
+    DEFAULT_HOOK_TAIL_DESCRIPTION_MAX,
+    DEFAULT_HOOK_TAIL_STDOUT_PREVIEW_MAX,
+    DEFAULT_HOOK_TAIL_TOOL_WIDTH,
     DEFAULT_INLINE_ORPHAN_CLEANUP_ENABLED,
     DEFAULT_LLM_EVIDENCE_TRUNCATION,
     DEFAULT_LLM_FILE_CONTEXT_LIMIT,
@@ -431,6 +435,29 @@ RECENT_PACE_TASKS: int = _resolve_int(
     "JUDGE_REPORT_RECENT_PACE_TASKS",
     RUNTIME_CONFIG.report.recent_pace_tasks,
     DEFAULT_RECENT_PACE_TASKS,
+)
+# Hook-tail column caps (issue #134). Resolution precedence: env > YAML >
+# constant. EVENT_WIDTH stays a hook_tail.py-local constant; the four below
+# are the operator-tunable knobs.
+HOOK_TAIL_AGENT_WIDTH: int = _resolve_int(
+    "JUDGE_HOOK_TAIL_AGENT_WIDTH",
+    RUNTIME_CONFIG.hook_tail.agent_width,
+    DEFAULT_HOOK_TAIL_AGENT_WIDTH,
+)
+HOOK_TAIL_TOOL_WIDTH: int = _resolve_int(
+    "JUDGE_HOOK_TAIL_TOOL_WIDTH",
+    RUNTIME_CONFIG.hook_tail.tool_width,
+    DEFAULT_HOOK_TAIL_TOOL_WIDTH,
+)
+HOOK_TAIL_DESCRIPTION_MAX: int = _resolve_int(
+    "JUDGE_HOOK_TAIL_DESCRIPTION_MAX",
+    RUNTIME_CONFIG.hook_tail.description_max,
+    DEFAULT_HOOK_TAIL_DESCRIPTION_MAX,
+)
+HOOK_TAIL_STDOUT_PREVIEW_MAX: int = _resolve_int(
+    "JUDGE_HOOK_TAIL_STDOUT_PREVIEW_MAX",
+    RUNTIME_CONFIG.hook_tail.stdout_preview_max,
+    DEFAULT_HOOK_TAIL_STDOUT_PREVIEW_MAX,
 )
 STOP_HOOK_MAX_BLOCKS: int = _resolve_int(
     "JUDGE_STOP_MAX_BLOCKS", RUNTIME_CONFIG.stop_hook.max_blocks, DEFAULT_STOP_HOOK_MAX_BLOCKS

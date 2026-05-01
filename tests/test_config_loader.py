@@ -2001,3 +2001,104 @@ class TestPerJudgeRetriesConfig:
 
         with pytest.raises(ValueError, match="positive integer"):
             _load_per_judge_retries({"test_review": True})
+
+
+class TestHookTailConfig:
+    """Issue #134 regression: ``hook_tail:`` YAML block loads into
+    ``RuntimeConfig.hook_tail`` with env > YAML > default precedence
+    plumbed through ``config.py``.
+
+    Mirrors the existing ``TestPerJudgeRetriesConfig`` pattern (env >
+    YAML > default + schema rejection of non-positive caps +
+    additionalProperties strictness for unknown keys).
+    """
+
+    @staticmethod
+    def _write(path: Path, content: str) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    def test_absent_block_yields_all_none(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.hook_tail.agent_width is None
+        assert result.hook_tail.tool_width is None
+        assert result.hook_tail.description_max is None
+        assert result.hook_tail.stdout_preview_max is None
+
+    def test_full_override_loaded(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            hook_tail:
+              agent_width: 16
+              tool_width: 12
+              description_max: 200
+              stdout_preview_max: 100
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.hook_tail.agent_width == 16
+        assert result.hook_tail.tool_width == 12
+        assert result.hook_tail.description_max == 200
+        assert result.hook_tail.stdout_preview_max == 100
+
+    def test_partial_override_leaves_others_none(self, tmp_path: Path) -> None:
+        """An operator who only wants to bump description_max should not
+        have to redeclare the other three -- they stay None and config.py
+        falls back to the constants."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            hook_tail:
+              description_max: 200
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.hook_tail.agent_width is None
+        assert result.hook_tail.tool_width is None
+        assert result.hook_tail.description_max == 200
+        assert result.hook_tail.stdout_preview_max is None
+
+    def test_schema_rejects_zero_or_negative(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            hook_tail:
+              description_max: 0
+            """,
+        )
+        with pytest.raises(ValueError, match="failed schema validation"):
+            load_runtime_config(cfg, {})
+
+    def test_schema_rejects_unknown_keys(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            hook_tail:
+              not_a_real_key: 1
+            """,
+        )
+        with pytest.raises(ValueError, match="failed schema validation") as exc_info:
+            load_runtime_config(cfg, {})
+        assert isinstance(exc_info.value.__cause__, jsonschema.ValidationError)

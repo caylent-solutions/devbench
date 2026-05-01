@@ -381,6 +381,33 @@ class StopHookConfig:
 
 
 @dataclass
+class HookTailConfig:
+    """``devbench hook-tail`` column-cap settings (issue #134).
+
+    Each field is ``None`` when absent from YAML; ``config.py`` resolves
+    env > YAML > default for the four module-level ``HOOK_TAIL_*``
+    constants. ``EVENT_WIDTH`` is intrinsic to the arrow format and stays
+    a hook_tail.py-local constant; only the four below are operator-
+    tunable.
+
+    Attributes:
+        agent_width: Column width for the agent name (default 12).
+        tool_width: Column width for the tool name (default 8).
+        description_max: Max chars for the description column (default
+            120; bumped from 100 in the release that introduces this
+            block so multi-word agent descriptions are less likely to
+            truncate mid-clause).
+        stdout_preview_max: Max chars for the result-preview column
+            after ``|`` (default 80).
+    """
+
+    agent_width: int | None = None
+    tool_width: int | None = None
+    description_max: int | None = None
+    stdout_preview_max: int | None = None
+
+
+@dataclass
 class RepoConfig:
     """Per-repository configuration.
 
@@ -458,6 +485,7 @@ class RuntimeConfig:
     git_ops: GitOpsConfig = field(default_factory=GitOpsConfig)
     report: ReportConfig = field(default_factory=ReportConfig)
     stop_hook: StopHookConfig = field(default_factory=StopHookConfig)
+    hook_tail: HookTailConfig = field(default_factory=HookTailConfig)
     manifest_amendment: AmendmentConfig = field(default_factory=AmendmentConfig)
     task_factory: TaskFactoryConfig = field(default_factory=TaskFactoryConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
@@ -793,6 +821,20 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         ),
     )
 
+    # Populate HookTailConfig from YAML hook_tail block (issue #134).
+    # JSONSchema enforces minimum:1 + additionalProperties:false at parse
+    # time; absent fields stay None so config.py applies the env > default
+    # fallback chain.
+    hook_tail_raw = raw.get("hook_tail") or {}
+    hook_tail = HookTailConfig(
+        agent_width=(int(hook_tail_raw["agent_width"]) if "agent_width" in hook_tail_raw else None),
+        tool_width=(int(hook_tail_raw["tool_width"]) if "tool_width" in hook_tail_raw else None),
+        description_max=(int(hook_tail_raw["description_max"]) if "description_max" in hook_tail_raw else None),
+        stdout_preview_max=(
+            int(hook_tail_raw["stdout_preview_max"]) if "stdout_preview_max" in hook_tail_raw else None
+        ),
+    )
+
     return RuntimeConfig(
         repos=repos,
         timeouts=timeouts,
@@ -800,6 +842,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         git_ops=git_ops,
         report=report,
         stop_hook=stop_hook,
+        hook_tail=hook_tail,
         manifest_amendment=manifest_amendment,
         task_factory=task_factory,
         debug=debug,

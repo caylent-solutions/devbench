@@ -127,6 +127,19 @@ since the last release. PR #119 carries every change.
   `tests/test_integration/test_security_review_scope.py` pins the
   scope-contract text by-content so the rule cannot be silently
   removed.
+- **`devbench hook-tail` description column no longer wraps onto a
+  timestamp-less continuation line** (issue #133). The `_description`
+  helper now collapses every run of whitespace -- including embedded
+  `\n` / `\r\n` / `\t` and runs of spaces -- to a single space then
+  strips. The previous implementation passed the raw agent-supplied
+  string through verbatim, so a multi-line description (e.g.
+  `"# Check ...\n# The actual command..."`) broke the per-event
+  single-line invariant. New regression tests
+  `tests/unit/test_hook_tail.py::TestDescriptionNormalisation` pin
+  the contract: single-line stays unchanged; `\n` / `\r\n` / `\t` /
+  runs-of-spaces collapse; every fallback branch (description /
+  command / file_path / JSON) collapses; `format_entry()` output
+  contains zero `\n` regardless of input.
 - **Manifest amender no longer rejects amendments on the grounds that
   requested files are not yet in the Manifest** (issue #127). The
   `plugin/devbench/agents/manifest-amender.md` SCOPE rule now contains
@@ -237,6 +250,21 @@ since the last release. PR #119 carries every change.
   `tests/test_reporting/test_report.py::TestTranscriptParsing`
   cover bucketing, aggregate-row preservation, missing-dir
   handling, and the role-name normalisation table.
+- **`hook_tail` column caps configurable** (issue #134). Four
+  module-level constants in `src/devbench/hook_tail.py`
+  (`AGENT_WIDTH`, `TOOL_WIDTH`, `DESCRIPTION_MAX`,
+  `STDOUT_PREVIEW_MAX`) are now resolved env > YAML > default at
+  module import. New top-level `hook_tail:` block in
+  `backlog/config/devbench.yaml`; new `JUDGE_HOOK_TAIL_*` env-var
+  overrides. **Default `DESCRIPTION_MAX` bumped from 100 to 120** so
+  multi-word agent descriptions are less likely to truncate
+  mid-clause; other three defaults unchanged (12 / 8 / 80).
+  `EVENT_WIDTH` stays a `hook_tail.py`-local constant -- the arrow
+  column is intrinsic to the format. New regression tests
+  `tests/unit/test_hook_tail.py::TestHookTailColumnConfig`
+  + `tests/test_config_loader.py::TestHookTailConfig` cover global-
+  only / full-override / partial-override / schema rejection of
+  non-positive caps and unknown keys.
 - **Data-residency and fast-mode multipliers applied per-call**
   (issue #124). `_compute_cost` now accepts
   `data_residency_multiplier` (default 1.10 from

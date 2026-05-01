@@ -146,6 +146,19 @@ stop_hook:
   stale_task_minutes: 120
 
 # ---------------------------------------------------------------------------
+# devbench hook-tail column caps (issue #134)
+# ---------------------------------------------------------------------------
+hook_tail:
+  # Column width for the agent name.
+  agent_width: 12
+  # Column width for the tool name.
+  tool_width: 8
+  # Max chars for the description column (bumped from 100 in v-next).
+  description_max: 120
+  # Max chars for the result-preview column after the pipe.
+  stdout_preview_max: 80
+
+# ---------------------------------------------------------------------------
 # Report / cost estimation
 # ---------------------------------------------------------------------------
 report:

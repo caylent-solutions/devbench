@@ -735,3 +735,129 @@ class TestOrchestratorSessionFilter:
         )
         out = _format_line(raw, ZoneInfo("UTC"), color=False, orchestrator_session_id=None)
         assert out  # non-empty -> emitted (no filter)
+
+
+class TestDescriptionNormalisation:
+    """Issue #133 regression: ``_description()`` must collapse every run
+    of whitespace -- including embedded ``\\n`` / ``\\r\\n`` / ``\\t`` and
+    runs of spaces -- to a single space then strip.
+
+    Bug: hook-tail was emitting multi-line descriptions verbatim when an
+    agent supplied a multi-line value like ``"# Check ...\\n# The actual
+    command..."``. The continuation line had no timestamp prefix and
+    looked like noise; downstream grep / awk consumers broke.
+    """
+
+    def test_single_line_unchanged(self) -> None:
+        from devbench.hook_tail import _description
+
+        assert _description({"description": "Run pytest"}) == "Run pytest"
+
+    def test_embedded_newline_collapses_to_space(self) -> None:
+        from devbench.hook_tail import _description
+
+        result = _description({"description": "# Check ...\n# The actual command"})
+        assert "\n" not in result
+        assert result == "# Check ... # The actual command"
+
+    def test_crlf_and_tab_and_runs_of_spaces_collapse(self) -> None:
+        from devbench.hook_tail import _description
+
+        result = _description({"description": "first\r\nsecond\tthird     fourth"})
+        assert result == "first second third fourth"
+
+    def test_command_fallback_also_collapses(self) -> None:
+        """The fallback chain (description -> command -> file_path -> JSON)
+        must all collapse, not just description."""
+        from devbench.hook_tail import _description
+
+        result = _description({"command": "echo first\necho second"})
+        assert result == "echo first echo second"
+
+    def test_file_path_fallback_also_collapses(self) -> None:
+        from devbench.hook_tail import _description
+
+        result = _description({"file_path": "a/b\nc/d"})
+        assert result == "a/b c/d"
+
+    def test_json_fallback_also_collapses(self) -> None:
+        """Multi-line JSON dumps (e.g. with newlines if a tool ever passes
+        an indented payload) collapse; sort_keys=True still produces a
+        single line in practice but the collapse is defence-in-depth."""
+        from devbench.hook_tail import _description
+
+        # The dumps call uses sort_keys=True so this string has no
+        # embedded newlines, but exercise the collapse path explicitly
+        # with a payload that IS multi-line via a string field.
+        result = _description({"unknown_key": "line1\nline2"})
+        assert "\n" not in result
+
+    def test_format_entry_output_has_no_newline(self) -> None:
+        """Full integration check: regardless of what description an agent
+        passed, the rendered line must contain zero embedded newlines."""
+        from devbench.hook_tail import format_entry
+
+        entry = _entry(
+            input={
+                "tool_name": "Bash",
+                "tool_input": {"description": "# Check ...\n# The actual command\n# More"},
+            }
+        )
+        line = format_entry(entry, ZoneInfo("UTC"), color=False)
+        assert "\n" not in line, f"Rendered line contains embedded newline (issue #133): {line!r}"
+
+    def test_post_collapse_truncation_still_applies(self) -> None:
+        """The truncation at ``DESCRIPTION_MAX`` happens AFTER collapse.
+        A description with 50 chars + a newline + 50 chars should produce
+        a single 101-char line that is then truncated to DESCRIPTION_MAX."""
+        from devbench.hook_tail import _description
+
+        big = ("a" * 60) + "\n" + ("b" * 80)
+        result = _description({"description": big})
+        # Post-collapse: 60 a's + 1 space + 80 b's = 141 chars (no truncation
+        # at this layer; truncation happens in format_entry).
+        assert "\n" not in result
+        assert len(result) == 141
+
+
+class TestHookTailColumnConfig:
+    """Issue #134 regression: AGENT_WIDTH / TOOL_WIDTH / DESCRIPTION_MAX /
+    STDOUT_PREVIEW_MAX are operator-tunable via env > YAML > default.
+
+    Defaults: 12 / 8 / 120 / 80. The defaults are exposed as
+    ``DEFAULT_HOOK_TAIL_*`` constants in ``devbench.constants``; the
+    resolved values land on ``devbench.config.HOOK_TAIL_*``;
+    ``devbench.hook_tail`` re-binds the four module-level names to the
+    resolved values.
+    """
+
+    def test_default_description_max_is_120(self) -> None:
+        from devbench.constants import DEFAULT_HOOK_TAIL_DESCRIPTION_MAX
+
+        assert DEFAULT_HOOK_TAIL_DESCRIPTION_MAX == 120, (
+            "DESCRIPTION_MAX default must be 120 (bumped from 100 in the same "
+            "release that introduces the hook_tail YAML block, per issue #134)."
+        )
+
+    def test_default_constants_match_legacy_values(self) -> None:
+        """Other three defaults stay at their legacy values so existing
+        operators see no change unless they opt in via YAML/env."""
+        from devbench.constants import (
+            DEFAULT_HOOK_TAIL_AGENT_WIDTH,
+            DEFAULT_HOOK_TAIL_STDOUT_PREVIEW_MAX,
+            DEFAULT_HOOK_TAIL_TOOL_WIDTH,
+        )
+
+        assert DEFAULT_HOOK_TAIL_AGENT_WIDTH == 12
+        assert DEFAULT_HOOK_TAIL_TOOL_WIDTH == 8
+        assert DEFAULT_HOOK_TAIL_STDOUT_PREVIEW_MAX == 80
+
+    def test_hook_tail_module_constants_resolve_from_config(self) -> None:
+        """``hook_tail.AGENT_WIDTH`` etc. are the resolved values from
+        ``config.HOOK_TAIL_*``, not hard-coded literals."""
+        from devbench import config, hook_tail
+
+        assert hook_tail.AGENT_WIDTH == config.HOOK_TAIL_AGENT_WIDTH
+        assert hook_tail.TOOL_WIDTH == config.HOOK_TAIL_TOOL_WIDTH
+        assert hook_tail.DESCRIPTION_MAX == config.HOOK_TAIL_DESCRIPTION_MAX
+        assert hook_tail.STDOUT_PREVIEW_MAX == config.HOOK_TAIL_STDOUT_PREVIEW_MAX

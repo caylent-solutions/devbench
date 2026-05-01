@@ -242,6 +242,13 @@ DEFAULT_GITHUB_CHECK_TIMEOUT_SECONDS: int = 600
 DEFAULT_STOP_HOOK_MAX_BLOCKS: int = 5
 DEFAULT_STOP_HOOK_WINDOW_SECONDS: int = 180
 DEFAULT_STOP_HOOK_STALE_TASK_MINUTES: int = 120
+# Hook-tail column caps (issue #134). Operator-tunable via env vars
+# (JUDGE_HOOK_TAIL_*) or YAML (`hook_tail.*` block). DESCRIPTION_MAX bumped
+# from 100 -> 120 in the same release that introduces the configurability.
+DEFAULT_HOOK_TAIL_AGENT_WIDTH: int = 12
+DEFAULT_HOOK_TAIL_TOOL_WIDTH: int = 8
+DEFAULT_HOOK_TAIL_DESCRIPTION_MAX: int = 120
+DEFAULT_HOOK_TAIL_STDOUT_PREVIEW_MAX: int = 80
 # Workflow-registration race defence (issue #114). When `gh pr checks`
 # returns "no checks reported" right after a PR is created, devbench
 # cannot tell "repo has no CI configured" apart from "GitHub Actions

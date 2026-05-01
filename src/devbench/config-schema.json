@@ -231,6 +231,33 @@
         }
       }
     },
+    "hook_tail": {
+      "type": "object",
+      "description": "devbench hook-tail column-cap settings (issue #134). EVENT_WIDTH stays a hook_tail.py-local constant; the four below are the operator-tunable knobs.",
+      "additionalProperties": false,
+      "properties": {
+        "agent_width": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Column width for the agent name. Default: 12."
+        },
+        "tool_width": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Column width for the tool name. Default: 8."
+        },
+        "description_max": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Max chars for the description column. Default: 120 (bumped from 100 in the release that introduces this block)."
+        },
+        "stdout_preview_max": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Max chars for the result-preview column after the pipe. Default: 80."
+        }
+      }
+    },
     "limits": {
       "type": "object",
       "description": "Threshold and limit values.",

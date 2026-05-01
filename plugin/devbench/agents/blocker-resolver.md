@@ -194,3 +194,47 @@ The verdict word is chosen by the following decision tree:
 - If resolution is neither possible nor escalation-worthy (very rare; usually means the resolver cannot classify) → `blocked`.
 
 `escalated` is forbidden when a rejected-requests archive exists -- the correct action in that case is `proposed`. Detailed resolution strategies go in your response text.
+
+---
+
+## Test-validates-source proposals (post-Backlog-A addendum)
+
+When the proposed task you're authoring is a TEST that validates the source task's output (rather than a fix the source must wait on), set the `source_dep_direction` field in the proposal JSON to `"test_validates_source"`. `promote-proposal` honors this flag and wires the dep direction so the test runs AFTER the source, not before.
+
+### When to set the flag
+
+Set `source_dep_direction: "test_validates_source"` when the proposed task matches all of:
+
+- Title starts with "Add tests/", "Verify", "Validate", "Assert", or similar verb.
+- `files_to_own` are all `tests/**` paths (no production source).
+- ACs assert observable state of an artifact owned by the source task (not modify that artifact).
+
+When ANY of those is false, omit the flag (default behavior: source.depends_on(new), the new task is a blocking fix).
+
+### JSON shape
+
+```json
+{
+  "source_task_id": "E0-F1-S1-T8",
+  "source_dep_direction": "test_validates_source",
+  "generated_at": "...",
+  "rejection_reason": "...",
+  "proposed_tasks": [
+    {
+      "suggested_id": "E0-F1-S1-T9",
+      "title": "Add AC-FIX-008 and no-build-system assertions to test_pyproject_toml.py",
+      "files_to_own": ["tests/unit/test_pyproject_toml.py"],
+      "linked_scenarios": ["AC-FIX-008"],
+      "suggested_acs": ["..."],
+      "suggested_approach": "..."
+    }
+  ],
+  "affected_task_ids": []
+}
+```
+
+### Why this matters
+
+In Backlog A's first run, two circular-dep cycles (T8↔T9 on pyproject.toml; T1↔T3 on monorepo-check action.yaml) were created because the default promote-proposal wiring assumed source-depends-on-new. Both required manual reversal (`devbench add-dep <new> <source>` plus removing the auto-wired source-side dep). Setting `source_dep_direction: "test_validates_source"` on the proposal JSON makes the wiring correct from the start.
+
+See [`docs/task-factory.md`](../../../docs/task-factory.md#when-to-use---no-dep-on-source-post-backlog-a-lesson) for the full pattern and worked example.

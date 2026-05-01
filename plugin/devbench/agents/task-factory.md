@@ -71,3 +71,13 @@ uv run devbench log-verdict task_factory $ARGUMENTS <pass|fail> "<one-line summa
   "error": "<stderr message if fail, else null>"
 }
 ```
+
+---
+
+## Honoring `source_dep_direction` (post-Backlog-A addendum)
+
+When materialising a proposal whose JSON includes `"source_dep_direction": "test_validates_source"`, the task-factory agent's `promote-proposal` invocation MUST pass `--no-dep-on-source` AND additionally invoke `devbench add-dep <new-id> <source-id>` to wire the reverse dep (test waits on source). This produces the correct dep direction for test-validates-source patterns and prevents the circular cycles observed in Backlog A.
+
+When the flag is absent (default), the existing behavior (source.depends_on(new)) is preserved -- backward-compatible with existing proposals from blocker-resolver flows.
+
+See [`blocker-resolver.md`](blocker-resolver.md#test-validates-source-proposals-post-backlog-a-addendum) for the heuristic that determines when the proposal author sets the flag.

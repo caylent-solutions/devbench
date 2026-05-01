@@ -187,6 +187,26 @@ SECURITY_JUDGE_NAMES: frozenset[str] = frozenset({"security_review"})
 
 ALL_REQUIRED_JUDGE_NAMES: frozenset[str] = REVIEW_JUDGE_NAMES | SECURITY_JUDGE_NAMES
 
+# Workflow agents that legitimately write audit-only verdicts via
+# ``log-verdict``. They are NOT counted by the done-gate's
+# ``_last_round_all_passed`` (only ``ALL_REQUIRED_JUDGE_NAMES`` is); the
+# entries land in the work-unit Comments section as audit metadata.
+# Mirrored in ``plugin/devbench/scripts/guard-verdict-format.sh``'s
+# ``KNOWN_JUDGES`` array; both lists must stay in sync.
+WORKFLOW_AGENT_JUDGE_NAMES: frozenset[str] = frozenset(
+    {
+        "executor",
+        "blocker_resolver",
+        "manifest_amender",
+        "task_factory",
+    }
+)
+
+# Full allowlist consumed by ``cmd_log_verdict``. Strictly broader than
+# ``ALL_REQUIRED_JUDGE_NAMES`` -- the canonical 5 reviewers satisfy the
+# done-gate; the workflow-agent names are audit-only.
+KNOWN_JUDGE_NAMES: frozenset[str] = ALL_REQUIRED_JUDGE_NAMES | WORKFLOW_AGENT_JUDGE_NAMES
+
 # ---------------------------------------------------------------------------
 # Non-verdict agent comment format template
 # ---------------------------------------------------------------------------

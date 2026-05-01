@@ -93,12 +93,12 @@ quote-style = "double"
 indent-style = "space"
 
 [tool.mypy]
-mypy_path = ["src", "tests"]
+mypy_path = ["src", "tests", "tools"]
 explicit_package_bases = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src", "tests"]
+pythonpath = ["src", "tests", "tools"]
 python_classes = ["Test*"]
 filterwarnings = [
     "ignore::pytest.PytestCollectionWarning",

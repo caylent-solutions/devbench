@@ -6,8 +6,16 @@ stderr, not stdout, so commands like ``devbench report`` and ``devbench
 get-diff`` can be piped or redirected without log lines polluting the data
 stream.
 
-The log file path is configurable via the ``JUDGE_LOG_FILE`` environment
-variable. Defaults to ``judges/logs/orchestrator.log``.
+The log file path resolves with this precedence (matches
+``cli._resolve_log_file_path`` so the orchestrator-as-writer and the
+report-as-reader cannot diverge):
+
+1. ``JUDGE_LOG_FILE`` environment variable.
+2. ``log_file`` field in ``backlog/config/devbench.yaml`` (resolved
+   relative to ``JUDGE_WORKSPACE_ROOT``).
+3. ``<JUDGE_WORKSPACE_ROOT>/logs/orchestrator.log`` convention.
+4. ``<devbench source tree>/logs/orchestrator.log`` legacy fallback for
+   invocations outside any workspace (test fixtures, local dev).
 """
 
 import logging
@@ -29,6 +37,40 @@ _DEFAULT_LOG_FILE = str(_DEFAULT_LOG_DIR / DEFAULT_LOG_FILENAME)
 _state = [False]
 
 
+def _resolve_log_file() -> Path:
+    """Compute the log path using the same chain as ``cli._resolve_log_file_path``.
+
+    Single source of truth so the writer (this function, called by
+    ``setup_logging``) and the reader (``cmd_report``) cannot disagree.
+    Imports ``RUNTIME_CONFIG`` lazily to avoid a circular import: this
+    module is imported by ``config.py`` indirectly through ``cli.py``.
+    The lazy import absorbs ``ImportError`` / ``RuntimeError`` so the
+    logger keeps working even when the config layer is unavailable
+    (test fixtures, ``--help`` paths, very early bootstrap).
+    """
+    explicit = os.environ.get("JUDGE_LOG_FILE", "").strip()
+    if explicit:
+        return Path(explicit)
+    workspace = os.environ.get("JUDGE_WORKSPACE_ROOT", "").strip()
+    configured = ""
+    try:
+        from devbench.config import RUNTIME_CONFIG
+
+        configured = (RUNTIME_CONFIG.log_file or "").strip()
+    except (ImportError, RuntimeError, AttributeError):
+        configured = ""
+    if configured:
+        configured_path = Path(configured)
+        if configured_path.is_absolute():
+            return configured_path
+        if workspace:
+            return Path(workspace) / configured_path
+        return configured_path
+    if workspace:
+        return Path(workspace) / DEFAULT_LOG_SUBDIR / DEFAULT_LOG_FILENAME
+    return Path(_DEFAULT_LOG_FILE)
+
+
 def setup_logging(level: int | None = None) -> Path:
     """Configure logging with stdout and file handlers.
 
@@ -43,13 +85,13 @@ def setup_logging(level: int | None = None) -> Path:
     Safe to call multiple times -- only configures on the first call.
     """
     if _state[0]:
-        return Path(os.environ.get("JUDGE_LOG_FILE", _DEFAULT_LOG_FILE))
+        return _resolve_log_file()
 
     if level is None:
         env_level = os.environ.get("JUDGE_LOG_LEVEL", DEFAULT_LOG_LEVEL).upper()
         level = getattr(logging, env_level, logging.INFO)
 
-    log_file = Path(os.environ.get("JUDGE_LOG_FILE", _DEFAULT_LOG_FILE))
+    log_file = _resolve_log_file()
     log_file.parent.mkdir(parents=True, exist_ok=True)
 
     root_logger = logging.getLogger()

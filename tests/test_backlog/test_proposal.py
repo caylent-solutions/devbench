@@ -178,6 +178,46 @@ class TestProposalDataclass:
         with pytest.raises(ValueError, match="missing required field"):
             Proposal.from_dict(payload)
 
+    def test_source_dep_direction_default_is_empty(self) -> None:
+        # Default Proposal omits the field; to_dict + from_dict roundtrip
+        # must preserve the empty string and not surface as a schema change.
+        proposal = _sample_proposal()
+        assert proposal.source_dep_direction == ""
+        payload = proposal.to_dict()
+        assert payload["source_dep_direction"] == ""
+        restored = Proposal.from_dict(payload)
+        assert restored.source_dep_direction == ""
+
+    def test_source_dep_direction_test_validates_source_roundtrips(self) -> None:
+        # The only non-default value the schema accepts is the explicit
+        # string "test_validates_source"; cmd_promote_proposal reads this
+        # to auto-apply --no-dep-on-source.
+        proposal = Proposal(
+            source_task_id="E0-F1-S1-T1",
+            generated_at="2026-04-18T03:25:00Z",
+            rejection_reason="r",
+            proposed_tasks=[],
+            source_dep_direction="test_validates_source",
+        )
+        restored = Proposal.from_dict(proposal.to_dict())
+        assert restored.source_dep_direction == "test_validates_source"
+
+    def test_source_dep_direction_rejects_unknown_value(self) -> None:
+        # Any string outside the {"", "test_validates_source"} allowlist
+        # must raise ValueError so typos surface at promotion time.
+        payload = _sample_proposal().to_dict()
+        payload["source_dep_direction"] = "source_validates_test"
+        with pytest.raises(ValueError, match="must be empty or 'test_validates_source'"):
+            Proposal.from_dict(payload)
+
+    def test_source_dep_direction_missing_in_json_defaults_to_empty(self) -> None:
+        # Older proposal JSON files written before the field existed must
+        # continue to load as "" (no behavior change).
+        payload = _sample_proposal().to_dict()
+        del payload["source_dep_direction"]
+        restored = Proposal.from_dict(payload)
+        assert restored.source_dep_direction == ""
+
 
 # ---------------------------------------------------------------------------
 # Path / lock helpers

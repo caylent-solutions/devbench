@@ -1430,6 +1430,30 @@ def generate_report(
             ("Cost", sections_by_label["Cost"]),
         ]
         lines.extend(_render_grouped_progress_table("Metric", column_labels, sections))
+        # Divergence warning: the BACKLOG STATE row "Tasks completed"
+        # counts ``Status: done`` rows in BACKLOG.md while the THROUGHPUT
+        # row "Tasks completed in window" counts ``Set <id> to 'done'``
+        # log lines parsed from ``log_path``. The two MUST agree for a
+        # healthy backlog. When backlog state shows completions but the
+        # All-time throughput window (which spans the entire log) shows
+        # zero, the operator is reading a different log than the one
+        # the orchestrator writes to -- typically because
+        # ``JUDGE_LOG_FILE`` was unset in the shell that ran
+        # ``devbench report`` and the default fell back to the devbench
+        # source-tree log. Surface the discrepancy as a one-line
+        # warning so the user does not silently misread the table.
+        all_time_stats = all_window_stats[0]
+        if backlog.tasks_done > 0 and all_time_stats.tasks_in_window == 0:
+            lines.append("")
+            lines.append(
+                f"WARNING: BACKLOG.md reports {backlog.tasks_done} done task(s) but the All-time "
+                f"throughput window in {log_path} found 0. The throughput row counts "
+                "'Set <id> to \\'done\\'' log lines; the backlog row counts the actual "
+                "'Status: done' work-unit files. A non-trivial mismatch usually means "
+                "'devbench report' is reading a different log than the orchestrator writes to. "
+                "Set JUDGE_LOG_FILE in this shell to the orchestrator's log path, or invoke "
+                "'devbench report' from the same env the orchestrator was launched with."
+            )
         # Use the All-time stats for the trailing prose projection -- they're the
         # most stable sample. Narrower windows can have zero completed tasks
         # (e.g. just after a restart) which would project meaningless numbers.

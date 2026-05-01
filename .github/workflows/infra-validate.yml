@@ -1,0 +1,113 @@
+name: infra-validate
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'infra/**'
+      - '.github/workflows/infra-validate.yml'
+  pull_request:
+    paths:
+      - 'infra/**'
+      - '.github/workflows/infra-validate.yml'
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  terraform:
+    name: terraform fmt + validate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.3"
+
+      - name: terraform fmt -check
+        run: |
+          set -euo pipefail
+          terraform fmt -check -recursive infra/terraform
+
+      - name: terraform init + validate (network module)
+        working-directory: infra/terraform/modules/network
+        run: |
+          set -euo pipefail
+          terraform init -backend=false
+          terraform validate
+
+      - name: terraform init + validate (ec2-dev-instance module)
+        working-directory: infra/terraform/modules/ec2-dev-instance
+        run: |
+          set -euo pipefail
+          terraform init -backend=false
+          terraform validate
+
+      - name: terraform init + validate (state-bucket module)
+        working-directory: infra/terraform/modules/state-bucket
+        run: |
+          set -euo pipefail
+          terraform init -backend=false
+          terraform validate
+
+  tflint:
+    name: tflint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: terraform-linters/setup-tflint@v4
+      - name: tflint --recursive
+        run: |
+          set -euo pipefail
+          tflint --init
+          tflint --recursive --chdir=infra/terraform
+
+  ansible-lint:
+    name: ansible-lint + yamllint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install linters
+        run: |
+          set -euo pipefail
+          pip install ansible ansible-lint yamllint
+      - name: yamllint
+        run: |
+          set -euo pipefail
+          yamllint -s -c infra/ansible/.yamllint infra/ansible
+      - name: ansible-lint
+        run: |
+          set -euo pipefail
+          ansible-lint infra/ansible
+
+  helper-tests:
+    name: devbench-session unit tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install uv
+        run: |
+          set -euo pipefail
+          pip install uv
+      - name: uv sync
+        run: |
+          set -euo pipefail
+          uv sync --all-extras
+      - name: pytest
+        run: |
+          set -euo pipefail
+          uv run pytest tests/unit/test_devbench_session.py -v
+      - name: bandit
+        run: |
+          set -euo pipefail
+          uv run bandit -ll tools/devbench_session.py

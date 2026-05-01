@@ -1,0 +1,63 @@
+---
+- name: Add HashiCorp apt key
+  ansible.builtin.shell:
+    cmd: |
+      curl -fsSL https://apt.releases.hashicorp.com/gpg | gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+    creates: /usr/share/keyrings/hashicorp-archive-keyring.gpg
+
+- name: Add HashiCorp apt repo
+  ansible.builtin.apt_repository:
+    repo: "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com {{ ansible_distribution_release }} main"
+    state: present
+    filename: hashicorp
+
+- name: Install Terraform
+  ansible.builtin.apt:
+    name: terraform
+    state: present
+    update_cache: true
+
+- name: Resolve terragrunt version (default; overridable via -e tg_version=...)
+  ansible.builtin.set_fact:
+    tg_pinned_version: "{{ tg_version | default('v1.0.3') }}"
+
+- name: Install Terragrunt (pinned release tarball)
+  ansible.builtin.shell:
+    cmd: |
+      set -e
+      ARCH=$(dpkg --print-architecture)
+      case "$ARCH" in arm64) TG_ARCH=arm64 ;; amd64) TG_ARCH=amd64 ;; *) echo "Unsupported arch: $ARCH"; exit 1 ;; esac
+      curl -fsSL "https://github.com/gruntwork-io/terragrunt/releases/download/{{ tg_pinned_version }}/terragrunt_linux_${TG_ARCH}" -o /usr/local/bin/terragrunt
+      chmod 755 /usr/local/bin/terragrunt
+    creates: /usr/local/bin/terragrunt
+
+- name: Install AWS CLI v2 (ARM64)
+  ansible.builtin.shell:
+    cmd: |
+      set -e
+      ARCH=$(uname -m)
+      case "$ARCH" in aarch64) AWS_ARCH=aarch64 ;; x86_64) AWS_ARCH=x86_64 ;; *) echo "Unsupported arch: $ARCH"; exit 1 ;; esac
+      curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${AWS_ARCH}.zip" -o /tmp/awscliv2.zip
+      unzip -q -o /tmp/awscliv2.zip -d /tmp
+      /tmp/aws/install --update
+      rm -rf /tmp/aws /tmp/awscliv2.zip
+    creates: /usr/local/bin/aws
+
+- name: Install GitHub CLI
+  block:
+    - name: Add GitHub CLI key
+      ansible.builtin.shell:
+        cmd: |
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+        creates: /usr/share/keyrings/githubcli-archive-keyring.gpg
+    - name: Add GitHub CLI apt repo
+      ansible.builtin.apt_repository:
+        repo: "deb [arch={{ ansible_architecture | replace('aarch64', 'arm64') | replace('x86_64', 'amd64') }} signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main"
+        state: present
+        filename: github-cli
+    - name: Install gh
+      ansible.builtin.apt:
+        name: gh
+        state: present
+        update_cache: true

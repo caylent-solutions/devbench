@@ -362,3 +362,50 @@ not
 
 Run before starting the orchestrator. The orchestrate skill runs it automatically at startup and
 aborts if any error is found.
+
+---
+
+## Manifest Conflict Rule (post-Backlog-A addendum)
+
+No two in-queue Tasks MAY list the same file path in their `## Changes Manifest` tables. Each file path in the workspace MUST have a single owning Task. If two Tasks legitimately need to modify the same file at different points in time, express the order via `## Dependencies` so they execute sequentially against the same path; the LATER Task's Manifest declares the file even if the EARLIER Task created it (the later Task's edit IS the change git records when its branch is staged).
+
+### Why
+
+When two in-queue Tasks both claim the same file, the orchestrator's `next` command can claim them in either order. The first Task creates / modifies the file; the second Task tries to do the same and either (a) collides with the first Task's commit, or (b) writes a conflicting version that triggers a code-review failure. In production at `caylent-telemetry-spec/`, two file-ownership conflicts were observed:
+
+- `.github/actions/monorepo-check/action.yaml` -- claimed by both `E0-F2-S1-T1` (skeleton) and `E5-F1-S1-T2` (full implementation).
+- `.github/workflows/on-pr.yaml` -- claimed by both `E0-F2-S1-T2` (stub) and `E5-F2-S1-T1` (full).
+
+The fix in both cases was to add a `## Dependencies` entry: the full-implementation Task waits on the skeleton Task. The full-implementation Task's Manifest still lists the file (because the full-impl IS its change to git), but the structural ordering prevents collision.
+
+### Validation
+
+`devbench validate-backlog` SHOULD reject any backlog state where two in-queue Tasks list the same file path with no explicit dependency between them. (This rule is part of the post-Backlog-A Tier 3 tooling proposal; until it lands, authors are responsible for self-checking via grep across `## Changes Manifest` blocks.)
+
+The companion rule for cross-cutting infrastructure (e.g., `pyproject.toml` is owned by one Task that authors all build/lint/test config edits in one coordinated commit) is documented in [`source-test-atomicity.md`](source-test-atomicity.md).
+
+---
+
+## Orphan-Pattern Rule (git-ops self-defense)
+
+`git-ops` refuses any commit whose staged or already-tracked paths match a build/state ignore pattern (terraform state, `.terragrunt-cache/`, terraform provider binaries, Python `__pycache__/` and `*.pyc`, `.coverage*`, `node_modules/`, `.DS_Store`). The active pattern list is the union of [`git_orphans._DEFAULT_ORPHAN_PATTERNS`](../src/devbench/git_orphans.py) and any `DEVBENCH_ORPHAN_IGNORE_PATTERNS` env-var override (comma-separated fnmatch globs replacing the default).
+
+### Why
+
+Build / state artefacts have no place in version control. Terraform state files in particular contain real AWS account IDs, role ARNs, and resource attributes that trip security review on every subsequent diff. Provider binaries (~600 MB each) bloat the repo and slow every clone. Python pycache and coverage data leak host-specific paths and Python-version-specific bytecode, breaking dev/prod parity.
+
+In production at `caylent-telemetry/`, two work-unit commits (`E1-F1-S1-T5`, `E1-F1-S1-T6`) accidentally staged 13 such files (totalling ~656 MB after the `terraform-provider-aws` binary). Every later Task's security-review then failed against HEAD, forming a cascade that could not self-resolve.
+
+### Behaviour
+
+When the rule fires, `git-ops` does NOT silently skip the commit -- it:
+
+1. Refuses with a non-zero exit and a stderr message naming a sample of the offending paths.
+2. Auto-emits a follow-up cleanup task (a Proposal whose executor runs `devbench cleanup-tracked-orphans <repo>` to untrack each match and append the canonical block to the repo's root `.gitignore`).
+3. Wires the source task as a `BLOCKED_PENDING_PROPOSAL` dependent of the cleanup task so the orchestrator's existing cascade picks the cleanup up next iteration. The source task auto-clears once the cleanup commits.
+
+The cleanup is forward-only (`git rm --cached` + `.gitignore`), preserving every file on disk and NOT rewriting git history. Operators may also run `cleanup-tracked-orphans` directly to drain a polluted state in one shot before launching the orchestrator. See [cli-reference.md](cli-reference.md#cleanup-tracked-orphans) for the operator-facing surface.
+
+### Override
+
+For backlogs that legitimately need to track one of the default-blocked shapes (e.g., a fixture repo that ships a sample `.tfstate`), set `DEVBENCH_ORPHAN_IGNORE_PATTERNS` to the narrowed list before invoking the orchestrator. The override REPLACES the default list entirely; include every pattern you still want to enforce.

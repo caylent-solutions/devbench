@@ -262,6 +262,7 @@ class Proposal:
     rejection_reason: str
     proposed_tasks: list[ProposedTask]
     affected_task_ids: list[str] = field(default_factory=list)
+    source_dep_direction: str = ""
 
     def to_dict(self) -> dict:
         """JSON-serialisable form used for on-disk storage."""
@@ -271,6 +272,7 @@ class Proposal:
             "rejection_reason": self.rejection_reason,
             "proposed_tasks": [asdict(t) for t in self.proposed_tasks],
             "affected_task_ids": list(self.affected_task_ids),
+            "source_dep_direction": self.source_dep_direction,
         }
 
     @classmethod
@@ -312,6 +314,15 @@ class Proposal:
 
         source_id = str(data["source_task_id"]).strip()
         affected = _parse_affected_task_ids(data.get("affected_task_ids", []), source_id)
+        # source_dep_direction is optional; "" preserves default behavior
+        # (source.depends_on(new)). "test_validates_source" inverts the
+        # auto-wired dep so the test waits on the source. See
+        # docs/task-factory.md "When to use --no-dep-on-source".
+        source_dep_direction = str(data.get("source_dep_direction", "")).strip()
+        if source_dep_direction not in ("", "test_validates_source"):
+            raise ValueError(
+                f"Proposal.source_dep_direction must be empty or 'test_validates_source'; got {source_dep_direction!r}"
+            )
 
         return cls(
             source_task_id=source_id,
@@ -319,6 +330,7 @@ class Proposal:
             rejection_reason=str(data["rejection_reason"]),
             proposed_tasks=tasks,
             affected_task_ids=affected,
+            source_dep_direction=source_dep_direction,
         )
 
 

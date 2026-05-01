@@ -2500,3 +2500,460 @@ class TestCheckDependenciesCellCountMismatch:
         # The malformed row is silently skipped; valid rows still produce no
         # errors because their deps resolve.
         assert errors == []
+
+
+# ---------------------------------------------------------------------------
+# Post-Backlog-A Tier 3 rules: tests for _check_manifest_conflicts,
+# _check_language_ac_alignment, and _check_source_test_pairs. Each rule is
+# tested in isolation using the existing backlog_dir fixture. The helper
+# methods (_classify_manifest_tier, _is_production_source,
+# _is_real_manifest_path, _matching_test_basenames) are tested directly via
+# unit-style assertions on the BacklogManager class.
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyManifestTier:
+    """Direct tests for the language-tier classifier helper."""
+
+    def test_pure_python_returns_python(self) -> None:
+        assert BacklogManager._classify_manifest_tier(["src/foo.py", "tests/test_foo.py"]) == "Python"
+
+    def test_pure_hcl_returns_hcl(self) -> None:
+        assert BacklogManager._classify_manifest_tier(["infra/main.tf", "infra/vars.tfvars"]) == "HCL"
+
+    def test_pure_yaml_returns_yaml(self) -> None:
+        assert BacklogManager._classify_manifest_tier(["infra/properties/common.yaml"]) == "YAML"
+
+    def test_python_plus_yaml_returns_python(self) -> None:
+        # Python is dominant per docs/acceptance-criteria-canonical.md
+        assert BacklogManager._classify_manifest_tier(["src/foo.py", "config.yaml"]) == "Python"
+
+    def test_yaml_plus_json_returns_mixed(self) -> None:
+        assert BacklogManager._classify_manifest_tier(["a.yaml", "b.json"]) == "Mixed"
+
+    def test_empty_returns_empty_string(self) -> None:
+        assert BacklogManager._classify_manifest_tier([]) == ""
+
+
+class TestIsProductionSource:
+    """Direct tests for the source-vs-test classifier helper."""
+
+    def test_src_python_is_source(self) -> None:
+        assert BacklogManager._is_production_source("src/foo/bar.py") is True
+
+    def test_infra_scripts_python_is_source(self) -> None:
+        assert BacklogManager._is_production_source("infra/scripts/migrate.py") is True
+
+    def test_services_src_nested_is_source(self) -> None:
+        assert BacklogManager._is_production_source("services/api/src/handler.py") is True
+
+    def test_test_path_is_not_source(self) -> None:
+        assert BacklogManager._is_production_source("tests/unit/test_foo.py") is False
+
+    def test_nested_test_path_is_not_source(self) -> None:
+        assert BacklogManager._is_production_source("services/api/tests/unit/test_foo.py") is False
+
+    def test_init_py_is_not_source(self) -> None:
+        assert BacklogManager._is_production_source("src/foo/__init__.py") is False
+
+    def test_yaml_is_not_python_source(self) -> None:
+        assert BacklogManager._is_production_source("config.yaml") is False
+
+    def test_top_level_python_outside_src_is_not_source(self) -> None:
+        # Random top-level .py is not classified as production source
+        assert BacklogManager._is_production_source("setup.py") is False
+
+
+class TestIsRealManifestPath:
+    """Direct tests for the placeholder-string filter."""
+
+    def test_real_path_passes(self) -> None:
+        assert BacklogManager._is_real_manifest_path("src/foo.py") is True
+
+    def test_none_placeholder_filtered(self) -> None:
+        assert BacklogManager._is_real_manifest_path("(none)") is False
+
+    def test_no_file_changes_placeholder_filtered(self) -> None:
+        assert BacklogManager._is_real_manifest_path("(no file changes; verification-only)") is False
+
+    def test_empty_string_filtered(self) -> None:
+        assert BacklogManager._is_real_manifest_path("") is False
+
+
+class TestSourceStemForPairMatch:
+    """Direct tests for the source-stem helper used in pair matching."""
+
+    def test_simple_module_returns_basename_stem(self) -> None:
+        assert BacklogManager._source_stem_for_pair_match("src/foo.py") == "foo"
+
+    def test_nested_module_uses_basename_only(self) -> None:
+        assert BacklogManager._source_stem_for_pair_match("services/api/src/handler.py") == "handler"
+
+    def test_init_py_returns_empty(self) -> None:
+        assert BacklogManager._source_stem_for_pair_match("src/foo/__init__.py") == ""
+
+    def test_non_python_returns_empty(self) -> None:
+        assert BacklogManager._source_stem_for_pair_match("infra/main.tf") == ""
+
+
+class TestTestFilenamePairsWithStem:
+    """Direct tests for the test-file pair predicate used by the rule."""
+
+    def test_exact_test_prefix_match(self) -> None:
+        assert BacklogManager._test_filename_pairs_with_stem("tests/unit/test_event.py", "event")
+
+    def test_namespaced_test_prefix_match(self) -> None:
+        # Project convention: `test_telemetry_<basename>.py` for
+        # `<basename>.py` -- the stem appears as a substring of the
+        # underscore-tokenised inner test name.
+        assert BacklogManager._test_filename_pairs_with_stem("tests/unit/test_telemetry_event.py", "event")
+
+    def test_suffix_test_form_match(self) -> None:
+        # Some projects use `<basename>_test.py` instead of `test_<basename>.py`.
+        assert BacklogManager._test_filename_pairs_with_stem("tests/unit/event_test.py", "event")
+
+    def test_unrelated_test_does_not_match(self) -> None:
+        assert not BacklogManager._test_filename_pairs_with_stem("tests/unit/test_handler.py", "models")
+
+    def test_non_test_filename_rejected(self) -> None:
+        # Source files that are not in a test_*.py / *_test.py shape do not
+        # satisfy the pair predicate, even if their basename contains the stem.
+        assert not BacklogManager._test_filename_pairs_with_stem("src/event.py", "event")
+
+    def test_init_py_rejected(self) -> None:
+        assert not BacklogManager._test_filename_pairs_with_stem("tests/__init__.py", "event")
+
+
+class TestExtractDepIdsEdgeCases:
+    """Cover the degenerate-row branches in `_extract_dep_ids`."""
+
+    def test_empty_token_between_commas_is_skipped(self) -> None:
+        # Cell value "E1-F1-S1-T1, , E2-F1-S1-T1" includes an empty
+        # token after the first comma; the loop must skip it without
+        # adding anything for that slot.
+        content = "## Dependencies\n| E1-F1-S1-T1, , E2-F1-S1-T1 |\n"
+        deps = BacklogManager._extract_dep_ids(content)
+        assert deps == {"E1-F1-S1-T1", "E2-F1-S1-T1"}
+
+
+class TestTasksFormDepChainEdgeCases:
+    """Cover the trivial-input early return in `_tasks_form_dep_chain`."""
+
+    def test_single_id_is_trivially_a_chain(self) -> None:
+        assert BacklogManager._tasks_form_dep_chain(["E1-F1-S1-T1"], {}) is True
+
+    def test_empty_id_list_is_trivially_a_chain(self) -> None:
+        assert BacklogManager._tasks_form_dep_chain([], {}) is True
+
+
+class TestSourceTestPairsDefensiveStemGuard:
+    """Cover the `if not source_stem: continue` guard in `_check_source_test_pairs`.
+
+    Today's `_PYTHON_EXTS = (".py",)` makes the guard unreachable through
+    `_is_production_source`'s public contract -- any path that passes the
+    production-source filter has a non-empty stem. The guard exists to
+    keep the rule safe if `_PYTHON_EXTS` is expanded to include a
+    non-`.py` extension (where `_source_stem_for_pair_match` would
+    legitimately return ""). Patch `_source_stem_for_pair_match` to
+    simulate that future-state and confirm the rule swallows the entry
+    without raising or emitting an error.
+    """
+
+    def test_empty_stem_is_swallowed_without_emitting_error(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        wu_path = tmp_path / "wu.md"
+        wu_path.write_text(
+            "# Title\n\n## Changes Manifest\n\n| File | Action |\n|------|--------|\n| src/devbench/foo.py | new |\n",
+            encoding="utf-8",
+        )
+        rows = [("E1-F1-S1-T1", "in-queue", str(wu_path))]
+        errors: list[str] = []
+        monkeypatch.setattr(BacklogManager, "_source_stem_for_pair_match", staticmethod(lambda _p: ""))
+        manager = BacklogManager()
+        manager._check_source_test_pairs(rows, tmp_path, errors)
+        assert errors == []
+
+
+class _ValidateRuleHarness:
+    """Reusable harness for the new validate-rule tests.
+
+    Builds a minimal BACKLOG.md + work-unit files in a tmp_path. Each test
+    crafts the specific Manifest content under test, then runs validate()
+    and asserts on the relevant error subset.
+    """
+
+    INDEX_HEADER: str = (
+        "# Backlog\n\n"
+        "## Status Summary\n\n"
+        "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
+        "|------|-------|------|-------------|----------|---------|\n"
+        "\n"
+        "## Full Work Unit Index\n\n"
+        "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+        "|-----|-------|------|--------|-------------|------|-----------|\n"
+    )
+
+    @staticmethod
+    def make_index(tmp_path: Path, rows: str) -> Path:
+        idx = tmp_path / "BACKLOG.md"
+        idx.write_text(_ValidateRuleHarness.INDEX_HEADER + rows, encoding="utf-8")
+        return idx
+
+    @staticmethod
+    def make_task(
+        backlog_dir: Path,
+        unit_id: str,
+        repo: str,
+        manifest_rows: str,
+        ac_block: str = "- [ ] AC-TEST-001",
+        deps_rows: str = "| none | | |",
+        status: str = "in-queue",
+    ) -> Path:
+        wu = backlog_dir / f"{unit_id}.md"
+        wu.write_text(
+            f"# {unit_id}\n\n"
+            f"## Status: {status}\n\n"
+            f"## Target Repository\n\n"
+            f"- **Repo:** `{repo}`\n\n"
+            f"## Description\n\nTest task.\n\n"
+            f"## Dependencies\n\n"
+            f"| ID | Title | Status |\n"
+            f"|----|-------|--------|\n"
+            f"{deps_rows}\n\n"
+            f"## Acceptance Criteria\n\n{ac_block}\n\n"
+            f"## Changes Manifest\n\n"
+            f"| File | Change |\n"
+            f"|------|--------|\n"
+            f"{manifest_rows}\n"
+            f"## Definition of Done\n\n- [ ] Done\n",
+            encoding="utf-8",
+        )
+        return wu
+
+
+class TestValidateManifestConflicts:
+    """Tests for _check_manifest_conflicts (Manifest Conflict Rule)."""
+
+    H = _ValidateRuleHarness
+
+    def test_two_in_queue_tasks_same_path_same_repo_no_dep_emits_error(self, tmp_path: Path, backlog_dir: Path) -> None:
+        repo = "ex/foo"
+        self.H.make_task(backlog_dir, "EX-F1-S1-T1", repo, "| `shared.yaml` | new |\n")
+        self.H.make_task(backlog_dir, "EX-F1-S1-T2", repo, "| `shared.yaml` | edit |\n")
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n"
+            f"| EX-F1-S1-T2 | T2 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T2.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        conflict = [e for e in errors if "Manifest conflict" in e and "shared.yaml" in e]
+        assert len(conflict) == 1
+        assert "EX-F1-S1-T1" in conflict[0]
+        assert "EX-F1-S1-T2" in conflict[0]
+        assert "docs/backlog-contract.md" in conflict[0]
+
+    def test_two_tasks_different_repos_same_path_no_error(self, tmp_path: Path, backlog_dir: Path) -> None:
+        # The conflict check is scoped by (repo, path); two different repos
+        # legitimately can list the same path.
+        self.H.make_task(backlog_dir, "EX-F1-S1-T1", "ex/repo-a", "| `shared.yaml` | new |\n")
+        self.H.make_task(backlog_dir, "EX-F2-S1-T1", "ex/repo-b", "| `shared.yaml` | new |\n")
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/repo-a | `backlog/EX-F1-S1-T1.md` |\n"
+            "| EX-F2-S1-T1 | T1 | Task | in-queue | none | ex/repo-b | `backlog/EX-F2-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        assert not any("Manifest conflict" in e for e in errors)
+
+    def test_two_tasks_with_explicit_dep_no_error(self, tmp_path: Path, backlog_dir: Path) -> None:
+        # When the later Task lists the earlier in its Dependencies, the
+        # ownership conflict resolves into a sequential ordering. Use the
+        # production-shape E\d+ IDs so the dep-extraction regex matches.
+        repo = "ex/foo"
+        self.H.make_task(backlog_dir, "E9-F1-S1-T1", repo, "| `shared.yaml` | new |\n")
+        self.H.make_task(
+            backlog_dir,
+            "E9-F1-S1-T2",
+            repo,
+            "| `shared.yaml` | edit |\n",
+            deps_rows="| E9-F1-S1-T1 | dep | proposed |",
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| E9-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/E9-F1-S1-T1.md` |\n"
+            f"| E9-F1-S1-T2 | T2 | Task | in-queue | E9-F1-S1-T1 | {repo} | `backlog/E9-F1-S1-T2.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        assert not any("Manifest conflict" in e for e in errors)
+
+    def test_placeholder_strings_filtered(self, tmp_path: Path, backlog_dir: Path) -> None:
+        # "(none)" / "(no file changes; ...)" placeholders must NOT trigger conflicts.
+        self.H.make_task(backlog_dir, "EX-F1-S1-T1", "ex/foo", "| `(none)` | n/a |\n")
+        self.H.make_task(backlog_dir, "EX-F2-S1-T1", "ex/foo", "| `(none)` | n/a |\n")
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n"
+            "| EX-F2-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F2-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        assert not any("Manifest conflict" in e for e in errors)
+
+
+class TestValidateLanguageAcAlignment:
+    """Tests for _check_language_ac_alignment (canonical-AC Applicability)."""
+
+    H = _ValidateRuleHarness
+
+    AC_BLOCK_PYTHON_TIER_NO_NA: str = (
+        "- [ ] AC-FINAL-001 Every AC-TEST and AC-CYCLE passes.\n"
+        "- [ ] AC-FINAL-002 `ruff check src tests` exits zero.\n"
+        "- [ ] AC-FINAL-005 `pytest tests/unit -v` exits zero.\n"
+        "- [ ] AC-FINAL-014 Coverage 100%.\n"
+    )
+
+    AC_BLOCK_PYTHON_TIER_WITH_NA: str = (
+        "- [ ] AC-FINAL-001 Every AC-TEST and AC-CYCLE passes.\n"
+        "- [ ] AC-FINAL-002 `ruff check src tests` exits zero -- N/A for HCL Tasks (no Python source authored)\n"
+        "- [ ] AC-FINAL-005 `pytest tests/unit -v` exits zero -- N/A for HCL Tasks (no Python source authored)\n"
+        "- [ ] AC-FINAL-014 Coverage 100% -- N/A for HCL Tasks (no Python source authored)\n"
+    )
+
+    def test_hcl_only_task_without_na_suffix_emits_warnings(self, tmp_path: Path, backlog_dir: Path) -> None:
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `infra/main.tf` | new |\n",
+            ac_block=self.AC_BLOCK_PYTHON_TIER_NO_NA,
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        ac_errors = [e for e in errors if "EX-F1-S1-T1" in e and "requires the N/A suffix" in e]
+        # AC-FINAL-002, 005, 014 each expected to fire (3 errors)
+        assert len(ac_errors) == 3
+        assert any("AC-FINAL-002" in e for e in ac_errors)
+        assert any("AC-FINAL-005" in e for e in ac_errors)
+        assert any("AC-FINAL-014" in e for e in ac_errors)
+        assert all("HCL" in e for e in ac_errors)
+
+    def test_hcl_task_with_na_suffix_no_warnings(self, tmp_path: Path, backlog_dir: Path) -> None:
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `infra/main.tf` | new |\n",
+            ac_block=self.AC_BLOCK_PYTHON_TIER_WITH_NA,
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        assert not any("requires the N/A suffix" in e for e in errors)
+
+    def test_python_task_without_na_suffix_no_warnings(self, tmp_path: Path, backlog_dir: Path) -> None:
+        # Python-tier task should NOT have the N/A suffix; rule must skip.
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n",
+            ac_block=self.AC_BLOCK_PYTHON_TIER_NO_NA,
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        assert not any("requires the N/A suffix" in e for e in errors)
+
+
+class TestValidateSourceTestPairs:
+    """Tests for _check_source_test_pairs (source-test atomicity)."""
+
+    H = _ValidateRuleHarness
+
+    def test_python_source_without_test_pair_emits_error(self, tmp_path: Path, backlog_dir: Path) -> None:
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `infra/scripts/migrate.py` | new |\n",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        pair_errors = [e for e in errors if "EX-F1-S1-T1" in e and "no matching test in the same Manifest" in e]
+        assert len(pair_errors) == 1
+        assert "infra/scripts/migrate.py" in pair_errors[0]
+        assert "'migrate'" in pair_errors[0]
+        assert "docs/source-test-atomicity.md" in pair_errors[0]
+
+    def test_python_source_with_test_pair_no_error(self, tmp_path: Path, backlog_dir: Path) -> None:
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `infra/scripts/migrate.py` | new |\n| `tests/unit/test_migrate.py` | new |\n",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        assert not any("no matching test in the same Manifest" in e for e in errors)
+
+    def test_namespaced_test_filename_satisfies_pair(self, tmp_path: Path, backlog_dir: Path) -> None:
+        # Project convention: tests live under tests/unit/ named like
+        # test_<feature>_<basename>.py. The rule accepts these as valid
+        # pairs because the source basename appears in the test filename.
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `src/kanon_cli/telemetry/event.py` | new |\n| `tests/unit/test_telemetry_event.py` | new |\n",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        assert not any("no matching test in the same Manifest" in e for e in errors)
+
+    def test_init_py_does_not_require_test_pair(self, tmp_path: Path, backlog_dir: Path) -> None:
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `src/pkg/__init__.py` | new |\n",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        assert not any("no matching test in the same Manifest" in e for e in errors)
+
+    def test_test_path_under_services_satisfies_pair(self, tmp_path: Path, backlog_dir: Path) -> None:
+        # The rule accepts any test path ending in /test_<basename>; the
+        # services/<name>/tests/... convention is honored.
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `services/api/src/handler.py` | new |\n| `services/api/tests/unit/test_handler.py` | new |\n",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        assert not any("no matching test in the same Manifest" in e for e in errors)

@@ -97,6 +97,7 @@ from devbench.backlog.manager import BacklogManager
 from devbench.backlog.parser import BacklogParser
 from devbench.backlog.proposal import (
     BlockedTaskState,
+    Proposal,
     ProposalError,
     ProposalTaskState,
     add_dep,
@@ -121,8 +122,9 @@ from devbench.config import (
     resolve_repo,
     validate_repo,
 )
-from devbench.config_loader import get_configured_default_branch
+from devbench.config_loader import RepoConfig, get_configured_default_branch
 from devbench.constants import (
+    ALL_REQUIRED_JUDGE_NAMES,
     COMMENT_AGENT_TEMPLATE,
     COMMENT_ENTRY_TEMPLATE,
     COMMENT_TIMESTAMP_FORMAT,
@@ -134,6 +136,7 @@ from devbench.constants import (
     EM_DASH,
     FINALIZE_COMMIT_TEMPLATE,
     FINALIZE_PR_TITLE_TEMPLATE,
+    KNOWN_JUDGE_NAMES,
     STATUS_IN_PROGRESS,
     STATUS_SEPARATOR_WIDTH,
     VALID_TDD_PHASES,
@@ -393,18 +396,226 @@ def cmd_validate_backlog() -> int:
     return 1
 
 
+def _check_repo_symlink(repo_name: str, symlink_path: Path) -> tuple[bool, str | None]:
+    """Return ``(symlink_ok, error_or_None)`` for the configured symlink path."""
+    if symlink_path.exists():
+        return True, None
+    return False, (
+        f"{repo_name}: symlink missing at {symlink_path} -- run "
+        "06-multi-repo-symlinks.md procedure or create it manually"
+    )
+
+
+def _check_repo_origin(repo_name: str, target: Path, timeout: int) -> tuple[bool, str | None]:
+    """Return ``(origin_ok, error_or_None)`` after 'git remote get-url origin'."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(target), "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"{repo_name}: 'git remote get-url origin' timed out after {timeout}s"
+    if result.returncode != 0:
+        return False, (
+            f"{repo_name}: clone at {target} has no 'origin' remote configured (stderr: {result.stderr.strip()})"
+        )
+    return True, None
+
+
+def _check_repo_default_branch(repo_name: str, configured_default: str | None, timeout: int) -> str | None:
+    """Return an error string when the remote default_branch disagrees with config, else None."""
+    if not configured_default:
+        return None
+    try:
+        api_result = subprocess.run(
+            ["gh", "api", f"repos/{repo_name}", "--jq", ".default_branch"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return f"{repo_name}: 'gh api repos/{repo_name}' timed out after {timeout}s"
+    if api_result.returncode != 0:
+        return (
+            f"{repo_name}: 'gh api repos/{repo_name}' failed -- check gh auth status "
+            f"(stderr: {api_result.stderr.strip()})"
+        )
+    remote_default = api_result.stdout.strip()
+    if remote_default == configured_default:
+        return None
+    return (
+        f"{repo_name}: default_branch mismatch -- devbench.yaml says "
+        f"{configured_default!r} but remote default is {remote_default!r}. "
+        f"Run 'gh repo edit {repo_name} --default-branch {configured_default}' "
+        "or update devbench.yaml to match the remote."
+    )
+
+
+def _check_repo_open_prs(repo_name: str, single_branch: str, timeout: int) -> str | None:
+    """Return an error string when an open PR already targets *single_branch*, else None."""
+    try:
+        pr_result = subprocess.run(
+            [
+                "gh",
+                "pr",
+                "list",
+                "--repo",
+                repo_name,
+                "--head",
+                single_branch,
+                "--state",
+                "open",
+                "--json",
+                "number,title",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return f"{repo_name}: 'gh pr list' for {single_branch} timed out after {timeout}s"
+    if pr_result.returncode != 0 or pr_result.stdout.strip() in ("[]", ""):
+        return None
+    return (
+        f"{repo_name}: open PR(s) already exist on branch {single_branch!r}: "
+        f"{pr_result.stdout.strip()} -- close or merge before launching to "
+        "avoid conflicting feat-branch creation"
+    )
+
+
+def _check_repo_preflight(repo_name: str, repo_cfg: RepoConfig, single_branch: str | None, timeout: int) -> list[str]:
+    """Run all pre-flight checks for a single repo and return its error list.
+
+    Extracted from :func:`cmd_check` to keep the dispatcher under the
+    project's branch-count budget. Each helper above owns one rail of
+    the gate and returns its own error string (or ``None``) so the
+    aggregation here is a flat list-extend.
+    """
+    checkout_subdir = repo_cfg.checkout_directory or repo_name.split("/", 1)[-1]
+    symlink_path = WORKSPACE_ROOT / checkout_subdir
+    symlink_ok, symlink_err = _check_repo_symlink(repo_name, symlink_path)
+    if not symlink_ok:
+        return [symlink_err] if symlink_err is not None else []
+    target = symlink_path.resolve()
+    origin_ok, origin_err = _check_repo_origin(repo_name, target, timeout)
+    if not origin_ok:
+        return [origin_err] if origin_err is not None else []
+    errors: list[str] = []
+    branch_err = _check_repo_default_branch(repo_name, repo_cfg.default_branch, timeout)
+    if branch_err:
+        errors.append(branch_err)
+    if single_branch:
+        pr_err = _check_repo_open_prs(repo_name, single_branch, timeout)
+        if pr_err:
+            errors.append(pr_err)
+    return errors
+
+
+def cmd_check() -> int:
+    """Pre-flight verifier for orchestrator launch readiness.
+
+    For every repo in ``backlog/config/devbench.yaml``'s ``repos:`` map, verify:
+
+    1. Symlink exists at ``$JUDGE_WORKSPACE_ROOT/<checkout_directory>``.
+    2. The symlink target (the local clone) has an ``origin`` remote configured.
+    3. The remote's ``default_branch`` matches ``devbench.yaml``'s
+       ``default_branch`` (or both fall back to ``origin/HEAD``).
+    4. No open PR already targets the configured ``single_branch``
+       (when ``git_ops.single_branch`` is set).
+
+    Exits 0 if every check passes; 1 with actionable per-repo error messages
+    otherwise. ``DEVBENCH_CHECK_GH_API_TIMEOUT`` (seconds, default 30) bounds
+    each ``gh api`` call.
+    """
+    import os
+
+    from devbench.config_loader import load_runtime_config, resolve_config_path
+
+    timeout = int(os.environ.get("DEVBENCH_CHECK_GH_API_TIMEOUT", "30"))
+    cfg_path = resolve_config_path(None, os.environ, WORKSPACE_ROOT)
+    if cfg_path is None or not cfg_path.exists():
+        print(
+            "ERROR: devbench.yaml not found; set JUDGE_CONFIG_PATH or place at backlog/config/devbench.yaml",
+            file=sys.stderr,
+        )
+        return 1
+    cfg = load_runtime_config(cfg_path, os.environ)
+
+    single_branch = cfg.git_ops.single_branch if cfg.git_ops else None
+    errors: list[str] = []
+    for repo_name, repo_cfg in cfg.repos.items():
+        errors.extend(_check_repo_preflight(repo_name, repo_cfg, single_branch, timeout))
+
+    if not errors:
+        print(f"Pre-flight check passed for {len(cfg.repos)} target repo(s).")
+        return 0
+    print(f"Pre-flight check FAILED ({len(errors)} error(s)):")
+    for error in errors:
+        print(f"  ERROR: {error}")
+    return 1
+
+
+def _resolve_log_file_path() -> Path:
+    """Resolve the orchestrator log file path. Fail-fast on missing inputs.
+
+    Resolution precedence (first match wins; no implicit fallbacks):
+
+    1. ``JUDGE_LOG_FILE`` environment variable set to an explicit path.
+       Per-invocation override; used in tests and ad-hoc overrides.
+    2. ``RUNTIME_CONFIG.log_file`` from ``backlog/config/devbench.yaml``.
+       Single source of truth: when the operator sets it once in YAML,
+       every devbench invocation against this workspace -- the
+       orchestrator's ``setup_logging`` writer and ``cmd_report``'s
+       reader alike -- picks up the same path. The value is treated as
+       workspace-root-relative when not absolute.
+    3. ``<JUDGE_WORKSPACE_ROOT>/<DEFAULT_LOG_SUBDIR>/<DEFAULT_LOG_FILENAME>``
+       convention. Fires when neither (1) nor (2) is set but the
+       workspace root is known.
+
+    When NONE of the three resolves, raises :class:`SystemExit` with an
+    actionable error naming all three input shapes. The previous
+    implementation silently fell back to the devbench source-tree's
+    log path -- letting operators read a stale, unrelated log without
+    noticing -- which CLAUDE.md "Fail-fast" forbids.
+    """
+    explicit = os.environ.get("JUDGE_LOG_FILE", "").strip()
+    if explicit:
+        return Path(explicit)
+    workspace = os.environ.get("JUDGE_WORKSPACE_ROOT", "").strip()
+    configured = (RUNTIME_CONFIG.log_file or "").strip()
+    if configured:
+        configured_path = Path(configured)
+        if configured_path.is_absolute():
+            return configured_path
+        if workspace:
+            return Path(workspace) / configured_path
+        return configured_path
+    if workspace:
+        return Path(workspace) / DEFAULT_LOG_SUBDIR / DEFAULT_LOG_FILENAME
+    canonical = f"<root>/{DEFAULT_LOG_SUBDIR}/{DEFAULT_LOG_FILENAME}"
+    print(
+        "ERROR: cannot resolve orchestrator log file. Set one of:\n"
+        "  - JUDGE_LOG_FILE=<absolute-path-to-orchestrator.log>\n"
+        "  - 'log_file: <workspace-relative-path>' in backlog/config/devbench.yaml\n"
+        f"  - JUDGE_WORKSPACE_ROOT=<workspace-root>  (log resolves to {canonical})\n"
+        "and re-run.",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+
 def cmd_report(since: str = "", watch_interval: int = 0) -> int:
     """Print a formatted progress report with velocity and completion stats."""
     from datetime import datetime
 
     from devbench.reporting.report import generate_report
 
-    log_file = Path(
-        os.environ.get(
-            "JUDGE_LOG_FILE",
-            str(Path(__file__).resolve().parent / DEFAULT_LOG_SUBDIR / DEFAULT_LOG_FILENAME),
-        )
-    )
+    log_file = _resolve_log_file_path()
 
     since_dt = None
     if since:
@@ -707,6 +918,33 @@ def cmd_log_verdict(judge_name: str, unit_id: str, verdict: str, feedback: str =
         print(f"ERROR: verdict must be 'pass' or 'fail', got '{verdict}'", file=sys.stderr)
         return 1
 
+    # Judge-name allowlist (single source of truth in
+    # ``devbench.constants.KNOWN_JUDGE_NAMES``). The set is intentionally
+    # broader than ``ALL_REQUIRED_JUDGE_NAMES``: only the canonical 5
+    # reviewer names satisfy the done-gate's
+    # ``_last_round_all_passed`` check, but workflow agents
+    # (``task_factory``, ``blocker_resolver``, ``manifest_amender``,
+    # ``executor``) legitimately write audit-only verdicts that are
+    # visible in the Comments section but do not count toward the gate.
+    # Refusing typos here prevents the malformed
+    # ``log-verdict <agent> <id> pass <message>`` shape from landing in
+    # the audit trail with a junk judge field that confuses reviewers
+    # and the done-gate's bookkeeping.
+    judge_clean = judge_name.strip()
+    if judge_clean not in KNOWN_JUDGE_NAMES:
+        valid = ", ".join(sorted(KNOWN_JUDGE_NAMES))
+        canonical_list = ", ".join(sorted(ALL_REQUIRED_JUDGE_NAMES))
+        print(
+            f"ERROR: judge name {judge_name!r} is not on the allowlist; "
+            f"valid choices are: {valid}. Use the underscored form "
+            "(e.g. 'code_review', not 'code-reviewer'). Only the 5 "
+            f"canonical reviewers satisfy the done-gate ({canonical_list}); "
+            "the remaining names write audit-only verdicts. Non-canonical "
+            "agents writing free-form narration must use 'log-comment'.",
+            file=sys.stderr,
+        )
+        return 1
+
     rc = _reject_em_dash("feedback", feedback)
     if rc is not None:
         return rc
@@ -917,6 +1155,16 @@ def _git_ops_deferred(unit_id: str, unit: WorkUnit, canonical_repo: str, repo_pa
     # its own assert_on_branch as a final fail-fast guard.
     ops.ensure_branch(canonical_repo, repo_path, branch)
 
+    # Orphan-pattern check: refuse to commit when any staged path matches
+    # a build/state pattern (terraform state, terragrunt cache, Python
+    # pycache, etc.). This guards against the class of pollution that
+    # bypasses the manifest-scope assertion when an agent's Manifest
+    # accidentally lists such a path or when files slip through unstaged
+    # paths. On detection, auto-emit a cleanup proposal so the cascade
+    # self-heals; the original task moves to blocked-pending-proposal.
+    if _emit_orphan_cleanup_proposal_if_needed(unit_id, unit, repo_path):
+        return 1
+
     # Manifest-scope check: every staged path must be in the work unit's
     # Changes Manifest. Catches the TRACE_FILE / dst/ / fixture-pollution
     # class of bug deterministically before commit. Skipped only when the
@@ -932,6 +1180,271 @@ def _git_ops_deferred(unit_id: str, unit: WorkUnit, canonical_repo: str, repo_pa
         mgr._append_agent_comment(wu_file, "git_ops", f"[COMMIT_DEFERRED] {commit_message}")
     print(json.dumps({"unit_id": unit_id, "mode": "deferred", "branch": branch}))
     return 0
+
+
+def _orphan_paths_for_repo(unit_id: str, repo_path: Path) -> list[str] | None:
+    """Return the union of staged + tracked orphan paths for *repo_path*.
+
+    Returns ``None`` when the gate is skipped (non-git checkout or git
+    subprocess failure); the caller treats that as "no detection, no
+    refusal". Returns ``[]`` when the repo is clean. Returns the sorted
+    list of orphan paths otherwise. Extracted from
+    :func:`_emit_orphan_cleanup_proposal_if_needed` to keep that
+    function under the project's branch / return budget.
+    """
+    from devbench.git_orphans import detect_staged_orphans, detect_tracked_orphans
+
+    if not (repo_path / ".git").exists():
+        return None
+    try:
+        staged = detect_staged_orphans(repo_path)
+        tracked = detect_tracked_orphans(repo_path)
+    except subprocess.CalledProcessError as exc:
+        logger.warning(
+            "git-ops orphan-detect skipped for %s -- subprocess failed: %s",
+            unit_id,
+            exc,
+        )
+        return None
+    return sorted(set(staged) | set(tracked))
+
+
+def _emit_orphan_cleanup_proposal_if_needed(unit_id: str, unit: WorkUnit, repo_path: Path) -> bool:
+    """Self-defending git-ops gate: refuse pollution, auto-emit a cleanup proposal.
+
+    Detects staged paths matching standard build/state ignore patterns
+    (terraform state, terragrunt cache, Python pycache, coverage, etc.)
+    OR pre-existing tracked paths matching the same shapes. On any
+    detection, writes a proposal authorising a follow-up cleanup task
+    in the same Story, materialises and promotes it (auto-wiring the
+    current task as a dependent), and returns ``True`` so the caller
+    refuses the commit.
+
+    Returns ``False`` (continue with commit) when no orphans are
+    detected. Idempotent: a proposal already-on-disk for *unit_id*
+    short-circuits without rewriting it.
+
+    The cleanup task's executor runs ``devbench cleanup-tracked-orphans
+    <repo>`` to untrack the offending paths and write the
+    devbench-managed ``.gitignore`` block.
+    """
+    from devbench.backlog.proposal import (
+        Proposal,
+        ProposalError,
+        ProposedTask,
+        allocate_next_ids,
+        materialise_proposal,
+        promote_proposal,
+        proposal_path,
+        write_proposal,
+    )
+
+    detected = _orphan_paths_for_repo(unit_id, repo_path)
+    if detected is None or not detected:
+        return False
+
+    proposal_file = proposal_path(WORKSPACE_ROOT, unit_id)
+    if proposal_file.exists():
+        logger.info(
+            "git-ops: orphans detected for %s; proposal already exists at %s -- refusing commit",
+            unit_id,
+            proposal_file,
+        )
+        print(
+            f"ERROR: git-ops refused -- {len(detected)} build/state artifact(s) "
+            f"would pollute the commit (e.g. {detected[0]!r}). "
+            f"Cleanup proposal already pending at {proposal_file}; "
+            f"the cascade will handle it on the next iteration.",
+            file=sys.stderr,
+        )
+        return True
+
+    story_id = "-".join(unit_id.split("-")[:3])
+    try:
+        new_id = allocate_next_ids(WORKSPACE_ROOT, BACKLOG_ROOT, story_id, 1)[0]
+    except ProposalError as exc:
+        print(f"ERROR: git-ops refused (cannot allocate cleanup-task ID): {exc}", file=sys.stderr)
+        return True
+
+    repo_label = unit.repo or str(repo_path.name)
+    sample = ", ".join(detected[:5])
+    if len(detected) > 5:
+        sample += f", and {len(detected) - 5} more"
+    proposal = Proposal(
+        source_task_id=unit_id,
+        generated_at=datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        rejection_reason=(
+            f"git-ops refused: {len(detected)} build/state artifact path(s) "
+            f"would be committed ({sample}). These match standard "
+            "ignore-worthy patterns (terraform state, terragrunt cache, "
+            "Python pycache, coverage, etc.) and must be untracked + "
+            "added to .gitignore before any work-unit commit can land."
+        ),
+        proposed_tasks=[
+            ProposedTask(
+                suggested_id=new_id,
+                title=f"Untrack build/state orphans in {repo_label} and write managed .gitignore",
+                files_to_own=[".gitignore"],
+                linked_scenarios=["git-ops orphan-pattern guard"],
+                suggested_acs=[
+                    f"AC-FUNC-001: 'devbench cleanup-tracked-orphans {repo_label}' exits 0 "
+                    "and removes every detected orphan from the index "
+                    "(verified by re-running with --dry-run; detected_count is 0).",
+                    "AC-FUNC-002: The repo's root .gitignore contains the "
+                    "devbench-managed block "
+                    f"({DEVBENCH_GITIGNORE_HEADER_LITERAL!r}) covering "
+                    "terraform state, terragrunt cache, Python pycache, "
+                    "coverage, node_modules, and .DS_Store.",
+                    "AC-FUNC-003: 'git ls-files' in the repo returns zero "
+                    "matches for the standard orphan patterns after cleanup.",
+                    "AC-FINAL-009: 'devbench validate-backlog' exits 0.",
+                    "AC-FINAL-011: No bypass annotations introduced.",
+                    "AC-FINAL-012: No em-dash characters introduced.",
+                    "AC-FINAL-015: Changes Manifest matches git diff exactly "
+                    "(.gitignore + the unstaged --cached file removals).",
+                ],
+                suggested_approach=(
+                    f"Context: {len(detected)} build/state artifact paths "
+                    f"are tracked or staged in {repo_label} and would pollute "
+                    f"any commit through devbench's git-ops. Detected sample: {sample}. "
+                    "Scope: edit .gitignore at the repo root and run "
+                    f"'devbench cleanup-tracked-orphans {repo_label}'. "
+                    "Out of scope: any file outside the repo's tracked-orphan set; "
+                    "no spec changes; no history rewrite (the cleanup is "
+                    "forward-only via 'git rm --cached', preserving files on disk). "
+                    "Approach: 1. RED -- author tests/integration/"
+                    "test_orphan_cleanup.py asserting "
+                    "'devbench cleanup-tracked-orphans <repo> --dry-run' "
+                    "returns detected_count == 0 (the test fails initially "
+                    "because orphans are present). 2. GREEN -- run "
+                    f"'devbench cleanup-tracked-orphans {repo_label}', "
+                    "which untracks every match and writes the .gitignore "
+                    "block; rerun the dry-run; assertion passes. "
+                    "3. REFACTOR -- verify .gitignore lines are deduped and "
+                    "the devbench-managed header appears once."
+                ),
+            )
+        ],
+    )
+
+    try:
+        write_proposal(WORKSPACE_ROOT, proposal)
+        materialised_files = materialise_proposal(
+            workspace_root=WORKSPACE_ROOT,
+            backlog_root=BACKLOG_ROOT,
+            backlog_index=BACKLOG_INDEX,
+            proposal=proposal,
+            repo=unit.repo,
+        )
+        promote_proposal(
+            workspace_root=WORKSPACE_ROOT,
+            backlog_root=BACKLOG_ROOT,
+            backlog_index=BACKLOG_INDEX,
+            task_id=new_id,
+            dep_on_source=True,
+        )
+    except ProposalError as exc:
+        print(
+            f"ERROR: git-ops refused (orphans detected) and proposal emission failed: {exc}",
+            file=sys.stderr,
+        )
+        return True
+
+    logger.info(
+        "git-ops: refused commit for %s due to %d orphan path(s); auto-emitted cleanup proposal %s",
+        unit_id,
+        len(detected),
+        new_id,
+    )
+    print(
+        f"ERROR: git-ops refused -- {len(detected)} build/state artifact path(s) "
+        f"would pollute the commit (sample: {sample}). "
+        f"Auto-emitted cleanup proposal {new_id} (in-queue); "
+        f"{unit_id} is now blocked-pending-proposal and will auto-clear when the cleanup commits. "
+        f"Materialised: {[str(p) for p in materialised_files]}.",
+        file=sys.stderr,
+    )
+    return True
+
+
+# Mirror of git_orphans.DEVBENCH_GITIGNORE_HEADER for lazy-imported docstring contexts.
+DEVBENCH_GITIGNORE_HEADER_LITERAL: str = "# devbench-managed: tracked-orphan cleanup defaults"
+
+
+def cmd_cleanup_tracked_orphans(repo_or_path: str, dry_run_flag: str = "") -> int:
+    """Untrack build/state artifacts that should be gitignored.
+
+    Usage::
+
+        cleanup-tracked-orphans <org/repo|repo-path> [--dry-run]
+
+    Walks ``git ls-files`` in the target repo, identifies entries
+    matching standard ignore patterns (terraform state, terragrunt
+    cache, Python pycache, coverage, node_modules, .DS_Store), runs
+    ``git rm --cached`` on each (preserving them on disk), and writes a
+    devbench-managed block to the repo's root ``.gitignore`` so future
+    commits cannot reintroduce the pattern.
+
+    Pure Python implementation: invokes git via subprocess directly so
+    the PreToolUse ``guard-destructive-git`` hook (which scopes only to
+    Bash agent-tool calls) does not interfere.
+
+    Override the default pattern list via
+    ``DEVBENCH_ORPHAN_IGNORE_PATTERNS`` (comma-separated fnmatch globs)
+    when a backlog needs different shapes.
+
+    The repo argument accepts either an ``org/repo`` form (resolved
+    against ``devbench.yaml``'s ``repos:`` map for its
+    ``checkout_directory``) or a direct filesystem path to a git repo.
+    """
+    from devbench.git_orphans import cleanup_tracked_orphans
+
+    dry_run = dry_run_flag == "--dry-run"
+    repo_path = _resolve_orphan_repo_path(repo_or_path)
+    if repo_path is None:
+        print(
+            f"ERROR: cannot resolve repo path for {repo_or_path!r}; "
+            "expected either an 'org/repo' key from devbench.yaml or a "
+            "filesystem path to a git repo.",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        report = cleanup_tracked_orphans(repo_path, dry_run=dry_run)
+    except FileNotFoundError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    print(
+        json.dumps(
+            {
+                "repo": str(report.repo_path),
+                "detected_count": len(report.detected),
+                "removed_count": len(report.removed),
+                "detected": report.detected,
+                "removed": report.removed,
+                "gitignore_path": str(report.gitignore_path),
+                "gitignore_updated": report.gitignore_updated,
+                "dry_run": report.dry_run,
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def _resolve_orphan_repo_path(arg: str) -> Path | None:
+    """Resolve an ``org/repo`` key or filesystem path to a git repo root.
+
+    Returns ``None`` when the argument resolves to neither.
+    """
+    direct = Path(arg)
+    if direct.is_dir() and (direct / ".git").exists():
+        return direct
+    if "/" in arg:
+        repo_path = REPO_LOCAL_PATHS.get(arg)
+        if repo_path is not None and (repo_path / ".git").exists():
+            return repo_path
+    return None
 
 
 def cmd_git_ops(unit_id: str) -> int:
@@ -974,6 +1487,11 @@ def cmd_git_ops(unit_id: str) -> int:
 
     from devbench.backlog.manifest import assert_staged_matches_manifest, parse_manifest
     from devbench.github.git_ops import ConflictingPRError
+
+    # Orphan-pattern check (see _git_ops_deferred for rationale): refuse
+    # the commit on detection, auto-emit cleanup proposal, return non-zero.
+    if _emit_orphan_cleanup_proposal_if_needed(unit_id, unit, repo_path):
+        return 1
 
     # Manifest-scope check: every staged path must be in the work unit's
     # Changes Manifest. Catches scope-violation pollution deterministically
@@ -1660,9 +2178,8 @@ class _ProposalInputError(ValueError):
     """Raised when stdin-provided proposal JSON is unusable."""
 
 
-def _read_proposal_from_stdin(source_task_id: str) -> "Proposal":  # type: ignore[name-defined]  # noqa: F821
+def _read_proposal_from_stdin(source_task_id: str) -> Proposal:
     """Read stdin and build a :class:`Proposal`, raising ``_ProposalInputError`` on failures."""
-    from devbench.backlog.proposal import Proposal
 
     try:
         raw = sys.stdin.read()
@@ -1686,15 +2203,124 @@ def _read_proposal_from_stdin(source_task_id: str) -> "Proposal":  # type: ignor
 
 
 def cmd_write_proposal(source_task_id: str) -> int:
-    """Persist a blocker-resolver proposal JSON read from stdin."""
+    """Persist a blocker-resolver proposal JSON read from stdin.
+
+    When ``task_factory.auto_accept_proposals`` is ``true`` in the active
+    config, this command also materialises every proposed task and
+    promotes it -- so the cascade is actionable in the same call rather
+    than waiting for the next ``sweep-proposals`` cycle. This closes a
+    timing window in which a proposal written mid-iteration could sit
+    orphaned for up to one full orchestrator cycle (the source task
+    reads as "needs operator attention" until the cascade-classifier
+    sees the wired ``[proposed]`` Dependencies row).
+
+    When the auto-accept flag is ``false`` the behaviour is unchanged:
+    the JSON is written and the operator promotes manually.
+    """
     try:
         proposal = _read_proposal_from_stdin(source_task_id)
         written = write_proposal(WORKSPACE_ROOT, proposal)
     except (_ProposalInputError, ProposalError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-    print(json.dumps({"source_task_id": source_task_id, "proposal_path": str(written)}))
+
+    auto_cascade = _maybe_auto_cascade_proposal(source_task_id, proposal)
+    output: dict[str, object] = {
+        "source_task_id": source_task_id,
+        "proposal_path": str(written),
+    }
+    output.update(auto_cascade)
+    print(json.dumps(output))
     return 0
+
+
+def _maybe_auto_cascade_proposal(source_task_id: str, proposal: Proposal) -> dict[str, object]:
+    """Materialise + promote every proposed task when auto-accept is on.
+
+    Returns a result dict suitable for embedding in the
+    ``write-proposal`` JSON output. Entries:
+
+    - ``auto_cascade``: ``"applied"`` | ``"disabled"`` | ``"failed"``
+    - ``materialised``: list of draft Path strings (when applied)
+    - ``promoted``: list of task ids successfully promoted (when applied)
+    - ``error``: present only when ``auto_cascade == "failed"``
+
+    Soft failure: any error during the cascade is logged + reported in
+    the returned dict but does NOT propagate as a non-zero exit. The
+    JSON is already on disk; the next ``sweep-proposals`` cycle will
+    retry the cascade.
+    """
+    if not RUNTIME_CONFIG.task_factory.auto_accept_proposals:
+        return {"auto_cascade": "disabled"}
+
+    audit_suffix = "(auto-accepted via task_factory.auto_accept_proposals=true at write-proposal time)"
+
+    try:
+        parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+        units = parser.parse_index()
+    except (FileNotFoundError, ValueError) as exc:
+        logger.warning(
+            "write-proposal auto-cascade aborted for %s -- cannot read backlog index: %s",
+            source_task_id,
+            exc,
+        )
+        return {"auto_cascade": "failed", "error": str(exc)}
+    source_unit = next((u for u in units if u.id == source_task_id), None)
+    if source_unit is None:
+        logger.warning(
+            "write-proposal auto-cascade aborted for %s -- source not in backlog index",
+            source_task_id,
+        )
+        return {"auto_cascade": "failed", "error": "source not found in backlog index"}
+
+    try:
+        materialised = materialise_proposal(
+            workspace_root=WORKSPACE_ROOT,
+            backlog_root=BACKLOG_ROOT,
+            backlog_index=BACKLOG_INDEX,
+            proposal=proposal,
+            repo=source_unit.repo,
+        )
+    except ProposalError as exc:
+        logger.warning(
+            "write-proposal auto-cascade materialise failed for %s: %s",
+            source_task_id,
+            exc,
+        )
+        return {"auto_cascade": "failed", "error": str(exc)}
+
+    promoted: list[str] = []
+    for task in proposal.proposed_tasks:
+        state = classify_proposed_task(BACKLOG_ROOT, WORKSPACE_ROOT, task.suggested_id)
+        if state is not ProposalTaskState.PROPOSED:
+            continue
+        try:
+            promote_proposal(
+                workspace_root=WORKSPACE_ROOT,
+                backlog_root=BACKLOG_ROOT,
+                backlog_index=BACKLOG_INDEX,
+                task_id=task.suggested_id,
+                audit_suffix=audit_suffix,
+            )
+            promoted.append(task.suggested_id)
+        except ProposalError as exc:
+            logger.warning(
+                "write-proposal auto-cascade promote failed for %s: %s",
+                task.suggested_id,
+                exc,
+            )
+
+    logger.info(
+        "write-proposal auto-cascade applied for %s: materialised=%d promoted=%d",
+        source_task_id,
+        len(materialised),
+        len(promoted),
+    )
+    return {
+        "auto_cascade": "applied",
+        "materialised": [str(p) for p in materialised],
+        "promoted": promoted,
+    }
 
 
 def cmd_list_proposals() -> int:
@@ -1798,6 +2424,29 @@ def cmd_promote_proposal(first_arg: str, second_arg: str = "") -> int:
         print("ERROR: promote-proposal requires a task id", file=sys.stderr)
         return 1
 
+    # Heuristic: warn (or honor proposal flag) when the new task looks like a
+    # test that validates the source task's output. In that pattern, the
+    # default dep direction (source.depends_on(new)) creates a circular
+    # cycle. See docs/task-factory.md "When to use --no-dep-on-source".
+    if dep_on_source:
+        proposal_hint = _detect_test_validates_source(task_id)
+        if proposal_hint == "flag":
+            print(
+                f"NOTE: proposal source_dep_direction='test_validates_source' on "
+                f"{task_id}; auto-applying --no-dep-on-source.",
+                file=sys.stderr,
+            )
+            dep_on_source = False
+        elif proposal_hint == "heuristic":
+            print(
+                f"WARNING: {task_id} looks like a test-validates-source task "
+                f"(title or files_to_own match the heuristic). The default dep "
+                f"direction (source.depends_on(new)) may create a cycle. Re-run "
+                f"with --no-dep-on-source if appropriate; see "
+                f"docs/task-factory.md 'When to use --no-dep-on-source'.",
+                file=sys.stderr,
+            )
+
     try:
         result = promote_proposal(
             workspace_root=WORKSPACE_ROOT,
@@ -1842,6 +2491,56 @@ def _run_promote_all(source_task_id: str) -> int:
         logger.info("Promoted %s", path.stem)
     print(json.dumps({"source_task_id": source_task_id, "promoted_count": len(promoted)}))
     return 0
+
+
+_TEST_VALIDATES_SOURCE_TITLE_PREFIXES: tuple[str, ...] = (
+    "Add tests/",
+    "Add unit tests",
+    "Add integration tests",
+    "Verify ",
+    "Validate ",
+    "Assert ",
+)
+
+
+def _detect_test_validates_source(task_id: str) -> str:
+    """Classify a proposed task's relationship to its source.
+
+    Returns ``"flag"`` when the proposal JSON declares
+    ``source_dep_direction == "test_validates_source"``; ``"heuristic"`` when
+    the proposed task's title or files_to_own match the test-validates-source
+    heuristic but the flag is not set; ``""`` otherwise.
+
+    Reads the proposal JSON files under ``$WORKSPACE_ROOT/.devbench/proposals/``
+    and matches by ``ProposedTask.suggested_id``. Returns ``""`` on any I/O or
+    parse error so the warning is best-effort and never blocks promotion.
+    """
+    proposals_dir = WORKSPACE_ROOT / ".devbench" / "proposals"
+    if not proposals_dir.is_dir():
+        return ""
+    try:
+        for path in proposals_dir.glob("*.json"):
+            try:
+                with path.open() as fh:
+                    data = json.load(fh)
+            except (OSError, json.JSONDecodeError):
+                continue
+            for entry in data.get("proposed_tasks", []):
+                if not isinstance(entry, dict):
+                    continue
+                if str(entry.get("suggested_id", "")).strip() != task_id:
+                    continue
+                if str(data.get("source_dep_direction", "")).strip() == "test_validates_source":
+                    return "flag"
+                title = str(entry.get("title", "")).strip()
+                files = entry.get("files_to_own") or []
+                if any(title.startswith(p) for p in _TEST_VALIDATES_SOURCE_TITLE_PREFIXES):
+                    return "heuristic"
+                if files and all(str(f).startswith("tests/") or "/tests/" in str(f) for f in files):
+                    return "heuristic"
+    except OSError:
+        return ""
+    return ""
 
 
 def cmd_add_dep(*argv: str) -> int:
@@ -2139,9 +2838,27 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
         "Mark a work unit Declined (won't ever be done) with a reason: decline <id> --reason <message>",
     ),
     "validate-backlog": (cmd_validate_backlog, 0, "Validate backlog integrity"),
+    "check": (
+        cmd_check,
+        0,
+        (
+            "Pre-flight: verify symlinks, origin remotes, default_branch "
+            "parity, and no conflicting open PRs across all target repos "
+            "in devbench.yaml"
+        ),
+    ),
     "ensure-branch": (cmd_ensure_branch, 1, "Create or switch to work unit branch: ensure-branch <id>"),
     "git-ops": (cmd_git_ops, 1, "Run git operations for a work unit: git-ops <id>"),
     "git-ops-finalize": (cmd_git_ops_finalize, 1, "Push single branch and create PR: git-ops-finalize <repo>"),
+    "cleanup-tracked-orphans": (
+        cmd_cleanup_tracked_orphans,
+        1,
+        (
+            "Untrack build/state artifacts (terraform state, pycache, "
+            "coverage, etc.) and write managed .gitignore: "
+            "cleanup-tracked-orphans <org/repo|path> [--dry-run]"
+        ),
+    ),
     "log": (cmd_log, 1, "Log a message: log <message>"),
     "report": (
         cmd_report,
@@ -2233,7 +2950,13 @@ _HELP_FLAGS: frozenset[str] = frozenset({"--help", "-h"})
 # list instead of the dispatcher's fixed-arity slice. Additions here are
 # deliberate -- the slice is a guardrail against typos for fixed-arity
 # commands, so variadic opt-in should be narrow.
-_VARIADIC_COMMANDS: frozenset[str] = frozenset({"hook-tail", "watchdog"})
+#
+# add-dep is variadic because its `--reason "<multi token message>"` flag
+# value is dropped by the fixed-arity slice (slice keeps only positional
+# count + 1 trailing arg, so `--reason` survives but the value after it
+# does not). _parse_add_dep_argv handles flags itself; opting into
+# variadic dispatch lets the value through.
+_VARIADIC_COMMANDS: frozenset[str] = frozenset({"hook-tail", "watchdog", "add-dep"})
 
 
 def _print_usage() -> None:

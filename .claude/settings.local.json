@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(JUDGE_WORKSPACE_ROOT=/workspaces/rpm-migration/kanon-migration-backlog JUDGE_CLAUDE_MODEL=claude-opus-4-7 uv run devbench status)",
+      "Read(//workspaces/rpm-migration/kanon-migration-backlog/.devbench/amendments/**)",
+      "Read(//workspaces/rpm-migration/kanon-migration-backlog/.devbench/rejected-requests/**)",
+      "Read(//workspaces/rpm-migration/kanon-migration-backlog/.devbench/**)"
+    ]
+  }
+}

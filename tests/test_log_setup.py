@@ -86,6 +86,12 @@ class TestSetupLogging:
         assert "Hello from test" in content
 
     def test_uses_default_path_when_env_not_set(self, tmp_path: Path) -> None:
+        # The fallback chain is now: JUDGE_LOG_FILE > YAML log_file >
+        # JUDGE_WORKSPACE_ROOT/logs/orchestrator.log > source-tree
+        # _DEFAULT_LOG_FILE. To exercise the source-tree default this
+        # test must unset BOTH JUDGE_LOG_FILE and JUDGE_WORKSPACE_ROOT
+        # AND ensure the YAML config layer cannot resolve a log_file
+        # (the conftest fixture's test_devbench.yaml has none).
         log_setup_mod._state[0] = False
         default_log = tmp_path / "logs" / "orchestrator.log"
         with patch.object(log_setup_mod, "_DEFAULT_LOG_FILE", str(default_log)):
@@ -93,6 +99,7 @@ class TestSetupLogging:
                 import os
 
                 os.environ.pop("JUDGE_LOG_FILE", None)
+                os.environ.pop("JUDGE_WORKSPACE_ROOT", None)
                 result = log_setup_mod.setup_logging()
 
         assert "orchestrator.log" in str(result)

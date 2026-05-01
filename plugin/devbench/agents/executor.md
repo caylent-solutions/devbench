@@ -50,6 +50,18 @@ Only after the tree is clean with respect to YOUR Changes Manifest may you proce
 
 Why this matters: prior tasks that block sometimes leave their staged work on disk. If you inherit those files into your commit, the result is a polluted commit that breaks make validate for every subsequent task. Resetting up front is the cheapest defence.
 
+#### Forbidden unstaging commands
+
+When unstaging files, ALWAYS use `git restore --staged <path>` (or `git restore --staged --worktree <path>` to also revert worktree changes). The following commands are FORBIDDEN for the executor under any circumstance:
+
+- `git rm --cached <path>` -- destructive: drops the index entry on tracked files, which on the next commit deletes the file from the repo. Even on never-committed files it conflates "remove from index" with "unstage", which is the wrong intent. Use `git restore --staged <path>` instead.
+- `git reset --hard` and `git reset --hard <ref>` -- discards uncommitted work in the worktree, including files authored by other tasks running in parallel.
+- `git checkout -- <path>` and `git checkout .` -- destructive (overwrites worktree from index without confirmation); replaced by `git restore <path>` in modern git, which is the only acceptable form.
+- `git clean -f`, `git clean -fd`, `git clean -fdx` -- deletes untracked files unconditionally, including files authored by other tasks staged for upcoming work.
+- `git restore --staged :/` or any pattern that unstages files outside YOUR Changes Manifest in bulk -- per the Git Safety Protocol in CLAUDE.md, only enumerated paths from your own Manifest may be unstaged. Iterate path-by-path.
+
+If pre-existing index entries from a prior blocked task pollute your staging area, the only correct response is to call `git restore --staged --worktree <path>` for each path enumerated in `git diff --cached --name-only` that does NOT appear in your `## Changes Manifest`. Never use a bulk-removal command, never use `--cached`, never use `--hard`. If the unstage list is large (more than ~10 files), this signals the prior task's git-ops never ran -- escalate via `log-comment` rather than power through with destructive commands.
+
 ### Main sequence
 
 1. Read the work unit content completely before starting any work.
@@ -141,6 +153,7 @@ Why this matters: prior tasks that block sometimes leave their staged work on di
     - [ ] All new/modified tests have meaningful assertions that can actually fail
     - [ ] No bypass annotations staged: nosec, noqa, type: ignore, nolint, eslint-disable
     - [ ] `git status --short` (in repo_path) shows only files listed in the Changes Manifest
+    - [ ] No edits made to ANY `backlog/**/*.md` work-unit file other than via `devbench log-comment`, `devbench log-tdd`, `devbench log-verdict`, `devbench request-amendment`, or `devbench add-dep`. Direct file edits to OTHER tasks' work-unit `.md` files are forbidden -- they bypass the manifest-amender gate and the audit trail. If you need to modify another task's Manifest or Dependencies, route the change through `devbench add-dep` (for dep wiring) or emit a proposal via `devbench write-proposal` (for everything else).
     If any item is not satisfied, resolve it before proceeding to step 8.
 8. Log completion in the work unit Comments section.
 
@@ -339,3 +352,13 @@ If you cannot complete the work unit (blocked, dependency missing, standards vio
 ```
 uv run devbench log-comment executor $ARGUMENTS "fail: <reason for failure>"
 ```
+
+---
+
+## Source-test atomicity in amendments (post-Backlog-A addendum)
+
+When you (the executor) request a manifest amendment to add infrastructure files (e.g., `pyproject.toml`, `__init__.py`, configuration YAML), include the matching test files in the SAME amendment request whenever the infrastructure files are Python source under a production-source path. `AC-FINAL-014` requires 100% coverage of new Python source files; if you author the source without authoring the test in the same Task's Manifest, AC-FINAL-014 fails and a follow-up proposal task gets generated to add the test -- which is the same TDD cycle, just split across Tasks for no benefit.
+
+Concretely: if your amendment is adding `infra/scripts/<name>.py` to a Manifest, also add `services/shared/tests/unit/test_<name>.py` (or the project-equivalent test path) to the same amendment. The manifest-amender will accept both as a coherent atomic addition and AC-FINAL-014 can satisfy in one cycle.
+
+The full rule and examples are in [`docs/source-test-atomicity.md`](../../../docs/source-test-atomicity.md).

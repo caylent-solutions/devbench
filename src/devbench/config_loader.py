@@ -313,6 +313,16 @@ class RuntimeConfig:
             ``None`` means OS local timezone. Per-command overrides
             (env vars, CLI flags, or the legacy ``report.display_timezone``)
             take precedence over this top-level setting.
+        log_file: Workspace-relative path to the orchestrator's
+            structured log file. ``setup_logging`` (the writer) and
+            ``cmd_report`` (the reader) both consult this single source
+            of truth so they cannot diverge by accident; in earlier
+            versions the two were both env-var-driven and could be
+            split silently when an operator set ``JUDGE_LOG_FILE`` to
+            different values in different shells. ``None`` (the
+            default) means callers must supply ``JUDGE_LOG_FILE``
+            explicitly or rely on the workspace-local convention
+            ``logs/orchestrator.log``.
     """
 
     repos: dict[str, RepoConfig] = field(default_factory=dict)
@@ -331,6 +341,7 @@ class RuntimeConfig:
     merge_strategy: str | None = None
     max_executor_retries: int | None = None
     display_timezone: str | None = None
+    log_file: str | None = None
 
 
 def resolve_config_path(
@@ -604,6 +615,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         merge_strategy=raw.get("merge_strategy") or None,
         max_executor_retries=raw.get("max_executor_retries") or None,
         display_timezone=raw.get("display_timezone") or None,
+        log_file=raw.get("log_file") or None,
     )
 
 

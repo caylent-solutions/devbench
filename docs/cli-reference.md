@@ -69,6 +69,16 @@ Print the progress report with velocity, token consumption, and estimated cost. 
 
 Cost is computed per call, per token type, from real `usage` data. See [model-pricing.md](model-pricing.md) for the cost formula, per-model rates, and cache-multiplier env vars.
 
+**Log-file resolution (fail-fast, no fallbacks):** `devbench report` reads its log file in this order. The same chain is used by the orchestrator's `setup_logging` writer, so both reader and writer always resolve to the same path:
+
+1. `JUDGE_LOG_FILE` environment variable -- explicit override; the caller takes responsibility. Wins over everything below; useful for ad-hoc redirects and tests.
+2. `log_file:` in the workspace's `backlog/config/devbench.yaml` (top-level field) -- the **single source of truth** for ordinary launches. Resolved relative to `JUDGE_WORKSPACE_ROOT` when not absolute. Both the orchestrator (writer) and `devbench report` / `devbench hook-tail` (readers) consult this field, so coordinating shell envs across panes is no longer required.
+3. `<JUDGE_WORKSPACE_ROOT>/logs/orchestrator.log` -- the canonical per-workspace default applied when neither (1) nor (2) is set.
+
+When NONE of (1)/(2)/(3) yields a path -- i.e. `JUDGE_LOG_FILE` unset, `log_file:` absent from yaml, AND `JUDGE_WORKSPACE_ROOT` unset -- `devbench report` exits 1 with an actionable error naming all three sources. The previous implementation silently fell back to the devbench source-tree's log (`<devbench>/src/devbench/logs/orchestrator.log`), which let operators read a stale, unrelated log without noticing -- the BACKLOG.md done count and the log-derived throughput count then diverged silently.
+
+**Divergence WARNING:** when `BACKLOG.md` reports a non-zero "Tasks completed" count but the All-time throughput window finds zero `Set <id> to 'done'` events, the report emits a one-line WARNING above the trailing summary. The two counts MUST agree on a healthy backlog (the throughput row narrates the events that produced the backlog state). A divergence almost always means `devbench report` is reading a different log than the orchestrator writes to. The warning names the log file path so the operator can immediately identify the mismatch and either set `JUDGE_LOG_FILE` correctly or invoke `devbench report` from the same env the orchestrator was launched with.
+
 ### `watch`
 
 ```
@@ -123,7 +133,7 @@ Flags:
 
 - `--idle-minutes N` -- override the idle threshold (default 5; minimum 1).
 - `--flag-file PATH` -- override the marker path (default `$JUDGE_WORKSPACE_ROOT/.devbench/needs-restart.flag`).
-- `--log-file PATH` -- override the orchestrator log location (default is the devbench repo's `src/devbench/logs/orchestrator.log` relative to the installed package).
+- `--log-file PATH` -- override the orchestrator log location. Default is the devbench repo's `src/devbench/logs/orchestrator.log` relative to the installed package; pass an explicit path (or set `JUDGE_LOG_FILE` and read `$JUDGE_LOG_FILE`) to point watchdog at the same workspace-local log the orchestrator wrote to. `cmd_watchdog` does NOT consult the `log_file:` yaml field today; pass `--log-file` (or wrap with the env) to keep the writer/reader in sync.
 - `--print-if-stuck` -- print a one-line `[devbench watchdog] STUCK: <id> (idle Ns, threshold Mm)` status to stdout on detection. Silent when healthy so it pipes cleanly in `PROMPT_COMMAND`.
 
 Typical operator integrations:
@@ -157,7 +167,21 @@ uv run devbench validate-backlog
 
 Integrity check across the full backlog: file existence, status sync between BACKLOG.md and work-unit files, orphaned files, invalid dependency references, Status Summary table count accuracy, content-rule violations, and Changes Manifest path-prefix violations (reject any manifest entry that begins with a `<checkout_directory>/` prefix; see [backlog-contract.md](backlog-contract.md) for the path-prefix rule). Exits 1 and prints every finding when any violation is found.
 
+Additional rules enforced as part of the Backlog A lessons-learned tooling (see [backlog-author-discovery.md](backlog-author-discovery.md) and [source-test-atomicity.md](source-test-atomicity.md)):
+
+- **Manifest Conflict Rule**: two in-queue tasks targeting the same `(repo, file)` ownership without an explicit dependency ordering between them are rejected. Wire a dependency via `devbench add-dep <later> <earlier>` or reassign ownership.
+- **Language-AC Alignment Rule**: AC-FINAL Python-tooling lines (002-005, 008, 014) on non-Python tasks (HCL/YAML/JSON-only Manifests) must end with the `-- N/A for <tier> Tasks (no Python source authored)` suffix.
+- **Source-Test Atomicity Rule**: every production Python source file in a Manifest (under `src/`, `infra/scripts/`, or `services/<name>/src/`) must have a matching `test_<basename>.py` entry in the SAME Manifest. Splitting source/test across sibling tasks blocks AC-FINAL-014 coverage at task close.
+
 Invoked automatically at orchestrator startup; operators should run it after hand-edits.
+
+### `check`
+
+```
+uv run devbench check
+```
+
+Pre-flight verifier for orchestrator launch readiness. For every repo in `backlog/config/devbench.yaml`'s `repos:` map, confirms (1) symlink at `$JUDGE_WORKSPACE_ROOT/<checkout_directory>` exists, (2) the local clone has an `origin` remote, (3) the remote's `default_branch` matches `devbench.yaml` (when set), and (4) no open PR already targets `git_ops.single_branch` (when single-branch mode is on). Exits 0 when every repo passes; exits 1 with one actionable error per failure otherwise. The `gh api` / `gh pr list` calls use the timeout in `DEVBENCH_CHECK_GH_API_TIMEOUT` (seconds, default `30`).
 
 ### `read-unit`
 
@@ -256,7 +280,7 @@ Run the test suite in the work unit's target repo. Uses the repo's `make test` t
 uv run devbench log <message>
 ```
 
-Append a free-form message to the orchestrator log (`src/devbench/logs/orchestrator.log`). Not audited to the work-unit file. Useful for emitting narrative breadcrumbs from agents.
+Append a free-form message to the orchestrator log. The destination path is resolved via `setup_logging` (`JUDGE_LOG_FILE` > `log_file:` in `backlog/config/devbench.yaml` > `<JUDGE_WORKSPACE_ROOT>/logs/orchestrator.log` > source-tree default), so `devbench log` and `devbench report` always agree on the file. Not audited to the work-unit file. Useful for emitting narrative breadcrumbs from agents.
 
 ### `log-verdict`
 
@@ -264,7 +288,19 @@ Append a free-form message to the orchestrator log (`src/devbench/logs/orchestra
 uv run devbench log-verdict <judge> <id> <pass|fail> [feedback]
 ```
 
-Record a judge verdict as an audit comment on the work-unit file. Writes `[REVIEW_PASS]` or `[REVIEW_FAIL]` (or `[SECURITY_FAIL]` for `security_review`). `<judge>` must be one of the canonical underscored names: `code_review`, `test_review`, `doc_review`, `changes_manifest`, `security_review`. Feedback is mandatory when the verdict is `fail`; rejected by the `guard-verdict-format.sh` hook otherwise.
+Record a judge verdict as an audit comment on the work-unit file. Writes `[REVIEW_PASS]` or `[REVIEW_FAIL]` (or `[SECURITY_FAIL]` for `security_review`). Feedback is mandatory when the verdict is `fail`; rejected by the `guard-verdict-format.sh` hook otherwise.
+
+`<judge>` must be one of the names in the allowlist defined by `devbench.constants.KNOWN_JUDGE_NAMES`. The allowlist is split into two tiers:
+
+- **Canonical reviewers (5)** -- `code_review`, `test_review`, `doc_review`, `changes_manifest`, `security_review`. Only these names satisfy the done-gate's `BacklogManager._last_round_all_passed` check. They are written by `review-supervisor` and `security-reviewer`.
+- **Audit-only workflow agents (4)** -- `executor`, `blocker_resolver`, `manifest_amender`, `task_factory`. Their verdicts land in the work-unit Comments section as audit metadata but do NOT count toward the done-gate. Workflow agents use these to record progress (for example, the executor logging `executor` verdicts during AC enforcement, or task-factory recording `task_factory` after a successful materialise).
+
+Two enforcement layers prevent malformed audit rows:
+
+1. **CLI layer** (`cmd_log_verdict`): refuses any `<judge>` outside `KNOWN_JUDGE_NAMES` with a clear error naming the valid choices. Catches typos like `judge` (literal) or hyphenated forms like `code-reviewer`.
+2. **Hook layer** (`guard-verdict-format.sh`, PreToolUse): mirrors the same allowlist, plus an additional **executor scope** rule -- when the calling agent's `agent_type == "devbench:executor"` AND the judge is one of the canonical 5 reviewers, the hook blocks. The executor is an authoring agent, not a reviewer; the audit-only `executor` judge name remains allowed (records progress without satisfying the gate). Other agents (review-supervisor, security-reviewer, main session) can still write canonical reviewer verdicts.
+
+Override env var: none -- this is a security/correctness gate, not a tunable. If a legitimate use case needs to write a verdict outside the allowlist, extend `KNOWN_JUDGE_NAMES` in `src/devbench/constants.py` AND update `KNOWN_JUDGES` in `plugin/devbench/scripts/guard-verdict-format.sh` (the two lists must stay in sync).
 
 ### `log-comment`
 
@@ -302,11 +338,12 @@ uv run devbench git-ops <id>
 
 Commit, push, create PR, wait for CI, merge. The full git-ops sequence runs after every review judge passes and before `mark-done`. In single-branch + `defer_pr: true` mode, commits locally only (no push, no PR); the shared branch is pushed by `git-ops-finalize` after every unit is done.
 
-Enforces two deterministic safety rails:
-- Staged files must exactly match the work unit's Changes Manifest (AC-FINAL-015).
-- HEAD must be on the expected branch (prevents orphan-branch commits).
+Enforces three deterministic safety rails:
+- **Manifest-scope:** staged files must exactly match the work unit's Changes Manifest (AC-FINAL-015).
+- **Branch-anchor:** HEAD must be on the expected branch (prevents orphan-branch commits).
+- **Orphan-pattern:** no staged or already-tracked path may match a build/state ignore pattern (terraform state, terragrunt cache, Python pycache, coverage artefacts, `node_modules`, `.DS_Store`). When detected, git-ops refuses the commit AND auto-emits a cleanup proposal so the cascade self-heals (the source task moves to `blocked-pending-proposal` on a follow-up `cleanup-tracked-orphans` task; the original task auto-clears once the cleanup commits). Override the active pattern list per backlog via `DEVBENCH_ORPHAN_IGNORE_PATTERNS` (comma-separated fnmatch globs).
 
-Both rails exit 1 with a clear diagnostic when violated.
+Each rail exits 1 with a clear diagnostic when violated.
 
 ### `git-ops-finalize`
 
@@ -315,6 +352,27 @@ uv run devbench git-ops-finalize <repo>
 ```
 
 Single-branch mode only: push the shared branch and create one PR for every accumulated commit. Use once, after every work unit targeting this repo is done. See [README Single-branch mode](../README.md#single-branch-mode) and [architecture.md §6](architecture.md#6-multi-pr-vs-single-pr-mode).
+
+### `cleanup-tracked-orphans`
+
+```
+uv run devbench cleanup-tracked-orphans <org/repo|repo-path> [--dry-run]
+```
+
+Untrack build/state artefacts (terraform state, `.terragrunt-cache/`, terraform provider binaries, Python `__pycache__/` and `*.pyc`, `.coverage*`, `node_modules/`, `.DS_Store`) and write a devbench-managed block to the repo's root `.gitignore` so future commits cannot reintroduce the same shapes.
+
+The argument accepts either an `org/repo` key from `devbench.yaml`'s `repos:` map (resolved via that repo's `checkout_directory`) or a direct filesystem path to a git repo.
+
+Behaviour:
+
+- Walks `git ls-files` and matches each tracked entry against the active orphan pattern list.
+- Runs `git rm --cached --quiet` on every match (preserves the file on disk; subsequent commit removes the tracked entry going forward; existing history is NOT rewritten).
+- Appends the canonical `.gitignore` block under the `# devbench-managed: tracked-orphan cleanup defaults` header. Idempotent: re-running on a repo that already contains the header is a no-op.
+- Writes JSON to stdout summarising `detected_count`, `removed_count`, `gitignore_updated`, and the paths involved.
+
+Override the default patterns per backlog via `DEVBENCH_ORPHAN_IGNORE_PATTERNS` (comma-separated fnmatch globs replacing the built-in list). Use `--dry-run` to preview without modifying state.
+
+Self-resolving integration: `git-ops` invokes the same detection before every commit. When orphans are present, git-ops refuses the commit and auto-emits a `cleanup-tracked-orphans`-running follow-up task; the orchestrator's existing cascade picks it up the next iteration. Operators can also run this command directly to clear a polluted history-going-forward in one shot.
 
 ---
 
@@ -376,6 +434,27 @@ EOF
 
 Persist a proposal JSON to `<workspace>/.devbench/proposals/<source-id>.json`. Payload is JSON on stdin. Written either by `blocker-resolver` (amendment-rejected path) or by the executor directly (validation-gate escalation path).
 
+**Auto-cascade when `auto_accept_proposals: true`:** with the flag set in `devbench.yaml`'s `task_factory:` section, `write-proposal` ALSO calls `materialise-proposal` and `promote-proposal` synchronously inside the same Python invocation. The cascade is therefore actionable the moment the JSON lands — the source task's `## Dependencies` table is wired with a `proposed`-status row immediately, the cascade-classifier moves it into the `auto-clearing via proposal` bucket, and the orchestrator's next iteration claims the materialised draft.
+
+This closes a timing window in which a resolver-written proposal could sit orphaned for up to one full orchestrator iteration (between the resolver's `write-proposal` call and the next `sweep-proposals` cycle) — long enough for the source task to read as "needs operator attention" even though the auto-resolution path was already on disk.
+
+The auto-cascade is best-effort: any `ProposalError` during materialise or promote is logged and reported in the output JSON's `auto_cascade` / `error` fields but does NOT propagate as a non-zero exit. The JSON is already on disk; the next `sweep-proposals` cycle retries the cascade.
+
+Output shape:
+
+```json
+{
+  "source_task_id": "E0-F1-S1-T1",
+  "proposal_path": "/.../E0-F1-S1-T1.json",
+  "auto_cascade": "applied" | "disabled" | "failed",
+  "materialised": ["/.../E0-F1-S1-T9.md"],   // when applied
+  "promoted":     ["E0-F1-S1-T9"],            // when applied
+  "error": "..."                              // when failed
+}
+```
+
+When `auto_accept_proposals: false` the behaviour is unchanged from prior versions: the JSON is written and the operator promotes manually via `promote-proposal`.
+
 ### `materialise-proposal`
 
 ```
@@ -420,6 +499,7 @@ Flip a proposed draft from `proposed` to `in-queue` and wire it as a dependency 
 
 - `--no-dep-on-source` skips the Dependencies-table row on the SOURCE task only; every entry in `affected_task_ids` still gets its marker + row. Use the flag when the promoted draft is independent of its source task, not to suppress peer-task wiring.
 - `--all-from <source-task-id>` promotes every task in that source's proposal in one call.
+- When the proposal JSON sets `source_dep_direction: "test_validates_source"`, the command auto-applies `--no-dep-on-source` and emits a `NOTE:` to stderr. When the heuristic (proposal's `title` starts with `Add tests/`, `Add unit tests`, `Add integration tests`, `Verify`, `Validate`, `Assert`; or every entry in `files_to_own` is under `tests/`) matches WITHOUT the explicit flag, the command emits a `WARNING:` and keeps the default direction; re-run with `--no-dep-on-source` if the warning's recommendation applies. See [task-factory.md](task-factory.md) "When to use --no-dep-on-source".
 
 Fail-fast: if any target in `[source_task_id] + affected_task_ids` is missing from the backlog index, the call raises `ProposalError` BEFORE writing anything, so a missing peer never leaves the source half-wired.
 

@@ -1,0 +1,10 @@
+---
+- name: Install kanon-cli via pipx
+  ansible.builtin.shell:
+    cmd: pipx install kanon-cli
+    creates: "/home/{{ linux_user }}/.local/bin/kanon"
+  become: true
+  become_user: "{{ linux_user }}"
+  environment:
+    PIPX_HOME: "/home/{{ linux_user }}/.local/pipx"
+    PIPX_BIN_DIR: "/home/{{ linux_user }}/.local/bin"

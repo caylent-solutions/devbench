@@ -1,0 +1,16 @@
+---
+plugin: aws_ec2
+regions:
+  - "{{ lookup('env', 'AWS_REGION') | default('us-east-1', true) }}"
+filters:
+  tag:Project: devbench-remote
+  instance-state-name:
+    - running
+keyed_groups:
+  - prefix: owner
+    key: tags.Owner
+hostnames:
+  - tag:Name
+compose:
+  ansible_host: instance_id
+strict_permissions: false

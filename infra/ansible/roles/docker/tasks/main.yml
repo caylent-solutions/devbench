@@ -1,0 +1,78 @@
+---
+# Rootless Docker CE for the linux user. Headless, open-source, no sudo required
+# at runtime.
+- name: Install Docker CE prerequisites
+  ansible.builtin.apt:
+    name:
+      - uidmap
+      - dbus-user-session
+      - fuse-overlayfs
+      - slirp4netns
+      - iptables
+    state: present
+
+- name: Add Docker GPG key
+  ansible.builtin.shell:
+    cmd: |
+      install -m 0755 -d /etc/apt/keyrings
+      curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+      chmod a+r /etc/apt/keyrings/docker.asc
+    creates: /etc/apt/keyrings/docker.asc
+
+- name: Add Docker apt repo
+  ansible.builtin.apt_repository:
+    repo: "deb [arch={{ ansible_architecture | replace('aarch64', 'arm64') | replace('x86_64', 'amd64') }} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+    state: present
+    filename: docker
+
+- name: Install Docker engine + rootless extras
+  ansible.builtin.apt:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-ce-rootless-extras
+      - docker-buildx-plugin
+      - docker-compose-plugin
+    state: present
+    update_cache: true
+
+- name: Inspect system-wide docker.service state (avoid silent failures)
+  ansible.builtin.command:
+    cmd: systemctl list-unit-files docker.service --no-legend
+  register: docker_unit_state
+  changed_when: false
+  check_mode: false
+
+- name: Disable + stop the system-wide docker daemon (we use rootless per user)
+  ansible.builtin.systemd:
+    name: docker
+    enabled: false
+    state: stopped
+  when: docker_unit_state.stdout | trim | length > 0
+
+- name: Enable lingering for the linux user (so user systemd survives logout)
+  ansible.builtin.command:
+    cmd: "loginctl enable-linger {{ linux_user }}"
+  changed_when: false
+
+- name: Install rootless docker for the linux user
+  ansible.builtin.shell:
+    cmd: |
+      set -e
+      export XDG_RUNTIME_DIR=/run/user/$(id -u {{ linux_user }})
+      mkdir -p "$XDG_RUNTIME_DIR"
+      chown {{ linux_user }}:{{ linux_user }} "$XDG_RUNTIME_DIR"
+      sudo -u {{ linux_user }} XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+        DBUS_SESSION_BUS_ADDRESS=unix:path="$XDG_RUNTIME_DIR/bus" \
+        dockerd-rootless-setuptool.sh install --skip-iptables
+    creates: "/home/{{ linux_user }}/.config/systemd/user/docker.service"
+
+- name: Persist DOCKER_HOST in the linux user's zshrc
+  ansible.builtin.lineinfile:
+    path: "/home/{{ linux_user }}/.zshrc"
+    line: "export DOCKER_HOST=unix:///run/user/$(id -u)/docker.sock"
+    create: true
+    owner: "{{ linux_user }}"
+    group: "{{ linux_user }}"
+    mode: "0644"

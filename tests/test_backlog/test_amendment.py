@@ -103,7 +103,7 @@ def _sample_request_dict(task_id: str = "EX-F1-S1-T1") -> dict[str, Any]:
         "reason": "tdd_green_production_fix",
         "justification": "Test required production fix to handle BOM.",
         "files_to_add": [
-            {"path": "src/example/parser.py", "change": "use utf-8-sig codec"},
+            {"path": "src/example/example.py", "change": "use utf-8-sig codec"},
         ],
         "linked_acs": ["AC-TEST-001"],
     }
@@ -151,7 +151,7 @@ class TestAmendmentRequestRoundTrip:
         assert req.task_id == "EX-F1-S1-T1"
         assert req.reason == "tdd_green_production_fix"
         assert len(req.files_to_add) == 1
-        assert req.files_to_add[0].path == "src/example/parser.py"
+        assert req.files_to_add[0].path == "src/example/example.py"
         assert req.linked_acs == ["AC-TEST-001"]
 
     def test_round_trip_via_dict(self) -> None:
@@ -317,7 +317,7 @@ class TestApplyAmendment:
         rows = parse_manifest(updated)
         assert len(rows) == 2
         assert rows[0].file == "tests/test_example.py"
-        assert rows[1].file == "src/example/parser.py"
+        assert rows[1].file == "src/example/example.py"
 
         # Audit comment written
         assert AMENDMENT_APPLIED_ACTION in updated

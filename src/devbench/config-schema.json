@@ -71,6 +71,10 @@
       "type": ["string", "null"],
       "description": "IANA timezone name (e.g. 'America/New_York', 'Europe/London') applied by every devbench command that renders timestamps -- `devbench report`, `devbench hook-tail`, `devbench watch`, and any future command. When unset, each command defaults to the OS local timezone. Override per-invocation via the JUDGE_DISPLAY_TIMEZONE env var. Report-specific `report.display_timezone` / JUDGE_REPORT_TIMEZONE take precedence over this top-level setting for the report command only."
     },
+    "log_file": {
+      "type": ["string", "null"],
+      "description": "Workspace-relative path to the orchestrator's structured log file (for example 'logs/backlog-a-orchestrator.log'). When set, both `setup_logging` (the writer) and `cmd_report` (the reader) consult this single source of truth so the orchestrator and the report cannot read/write different files by accident. Per-invocation override via the JUDGE_LOG_FILE env var still takes precedence (useful for tests)."
+    },
     "timeouts": {
       "type": "object",
       "description": "Timeout values in seconds.",

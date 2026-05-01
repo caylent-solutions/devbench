@@ -1,0 +1,139 @@
+---
+# Git auth chain (priority order):
+#   1. PRIMARY: Git Credential Manager (GCM) -- OAuth via system browser.
+#   2. FALLBACK 1: GitHub PAT fetched from AWS Secrets Manager and loaded into
+#      `gh auth login --with-token`. The credential helper chain falls through
+#      to `!gh auth git-credential` automatically.
+#   3. FALLBACK 2: SSH private key fetched from AWS Secrets Manager and written
+#      to ~/.ssh/github_ed25519 (host stanza already wired in ~/.ssh/config).
+#
+# Secrets are pulled by the EC2 itself using its IAM instance-profile role.
+# Neither the token nor the key transits the operator's machine on every run --
+# they are uploaded once via `make ec2-secrets-sync` and rotated independently.
+
+- name: Detect host architecture for GCM deb
+  ansible.builtin.set_fact:
+    gcm_arch: >-
+      {{ 'arm64' if ansible_architecture == 'aarch64' else 'x64' }}
+
+- name: Install Git Credential Manager (GCM)
+  ansible.builtin.shell:
+    cmd: |
+      set -e
+      LATEST=$(curl -s https://api.github.com/repos/git-ecosystem/git-credential-manager/releases/latest \
+        | grep '"tag_name":' | head -1 | cut -d'"' -f4 | sed 's/^v//')
+      curl -fsSL "https://github.com/git-ecosystem/git-credential-manager/releases/download/v${LATEST}/gcm-linux-{{ gcm_arch }}-${LATEST}.deb" \
+        -o /tmp/gcm.deb
+      dpkg -i /tmp/gcm.deb || apt-get install -f -y
+      rm -f /tmp/gcm.deb
+    creates: /usr/local/bin/git-credential-manager
+
+- name: Fetch GitHub PAT from AWS Secrets Manager
+  ansible.builtin.shell:
+    cmd: |
+      aws secretsmanager get-secret-value \
+        --region '{{ aws_region }}' \
+        --secret-id '{{ github_token_secret_name }}' \
+        --query SecretString --output text
+    executable: /bin/bash
+  register: github_token_result
+  changed_when: false
+  no_log: true
+
+- name: Fetch GitHub SSH private key from AWS Secrets Manager
+  ansible.builtin.shell:
+    cmd: |
+      aws secretsmanager get-secret-value \
+        --region '{{ aws_region }}' \
+        --secret-id '{{ github_ssh_key_secret_name }}' \
+        --query SecretString --output text
+    executable: /bin/bash
+  register: github_ssh_key_result
+  changed_when: false
+  no_log: true
+
+- name: Configure git for the linux user (OAuth -> token -> ssh)
+  become: true
+  become_user: "{{ linux_user }}"
+  block:
+    - name: Set core git identity
+      ansible.builtin.shell:
+        cmd: |
+          git config --global user.email "{{ owner_email }}"
+          git config --global user.name "{{ owner_email }}"
+          git config --global init.defaultBranch main
+          git config --global pull.rebase false
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Wire credential helper chain (GCM primary, gh fallback, store final)
+      ansible.builtin.shell:
+        cmd: |
+          # Reset the helper list so re-runs are idempotent (no duplicates).
+          git config --global --unset-all credential.https://github.com.helper 2>/dev/null || true
+          git config --global credential.https://github.com.helper ""
+          git config --global --add credential.https://github.com.helper "manager"
+          git config --global --add credential.https://github.com.helper "!gh auth git-credential"
+          git config --global --add credential.https://github.com.helper "store"
+          git config --global credential.credentialStore plaintext
+          git config --global credential.guiPrompt false
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Persist token to ~/.git-credentials (non-interactive HTTPS fallback)
+      ansible.builtin.copy:
+        dest: "/home/{{ linux_user }}/.git-credentials"
+        content: "https://x-access-token:{{ github_token_result.stdout }}@github.com\n"
+        owner: "{{ linux_user }}"
+        group: "{{ linux_user }}"
+        mode: "0600"
+      no_log: true
+
+    - name: Persist GH_TOKEN in the linux user's shell rc files (fallback 1)
+      ansible.builtin.blockinfile:
+        path: "/home/{{ linux_user }}/{{ item }}"
+        create: true
+        owner: "{{ linux_user }}"
+        group: "{{ linux_user }}"
+        mode: "0640"
+        marker: "# {mark} devbench-remote GH_TOKEN (managed)"
+        block: |
+          export GH_TOKEN='{{ github_token_result.stdout }}'
+          export GITHUB_TOKEN="$GH_TOKEN"
+      loop:
+        - .bashrc
+        - .zshrc
+      no_log: true
+
+    - name: Install GitHub SSH private key (fallback 2)
+      ansible.builtin.copy:
+        dest: "/home/{{ linux_user }}/.ssh/github_ed25519"
+        content: "{{ github_ssh_key_result.stdout }}\n"
+        owner: "{{ linux_user }}"
+        group: "{{ linux_user }}"
+        mode: "0600"
+      no_log: true
+
+    - name: Derive and install matching SSH public key
+      ansible.builtin.shell:
+        cmd: |
+          ssh-keygen -y -f /home/{{ linux_user }}/.ssh/github_ed25519 \
+            > /home/{{ linux_user }}/.ssh/github_ed25519.pub
+          chmod 0644 /home/{{ linux_user }}/.ssh/github_ed25519.pub
+        executable: /bin/bash
+        creates: "/home/{{ linux_user }}/.ssh/github_ed25519.pub"
+
+    - name: Add github.com SSH stanza to ~/.ssh/config
+      ansible.builtin.blockinfile:
+        path: "/home/{{ linux_user }}/.ssh/config"
+        create: true
+        owner: "{{ linux_user }}"
+        group: "{{ linux_user }}"
+        mode: "0600"
+        marker: "# {mark} devbench-remote github ssh fallback"
+        block: |
+          Host github.com
+              HostName github.com
+              User git
+              IdentityFile ~/.ssh/github_ed25519
+              IdentitiesOnly yes

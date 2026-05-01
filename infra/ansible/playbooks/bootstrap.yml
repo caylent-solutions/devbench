@@ -1,0 +1,51 @@
+---
+# Devbench-remote bootstrap playbook. Pushed onto the EC2 by `make ec2-bootstrap`
+# (SSH-over-SSM scp + ansible-playbook --connection=local) and rerun on demand via
+# `make ec2-refresh`. Idempotent throughout.
+- name: Devbench remote workstation bootstrap
+  hosts: localhost
+  connection: local
+  become: true
+  gather_facts: true
+
+  vars:
+    linux_user: "{{ linux_user | mandatory }}"
+    owner_email: "{{ owner_email | default('unknown@example.com') }}"
+    aws_region: "{{ aws_region | mandatory }}"
+    github_token_secret_name: "{{ github_token_secret_name | mandatory }}"
+    github_ssh_key_secret_name: "{{ github_ssh_key_secret_name | mandatory }}"
+
+  pre_tasks:
+    - name: Validate required vars are set
+      ansible.builtin.assert:
+        that:
+          - linux_user | length > 0
+          - aws_region | length > 0
+          - github_token_secret_name | length > 0
+          - github_ssh_key_secret_name | length > 0
+        fail_msg: "Missing required extra-vars; pass linux_user, aws_region, github_token_secret_name, github_ssh_key_secret_name."
+
+    - name: Refresh apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+  roles:
+    - role: base
+    - role: languages
+    - role: infra-tools
+    - role: docker
+    - role: git-auth
+    - role: claude-cli
+    - role: kanon-cli
+    - role: workspace
+    - role: devbench-sessions
+
+  post_tasks:
+    - name: Mark bootstrap complete
+      ansible.builtin.copy:
+        dest: /var/log/devbench-ansible.done
+        content: "linux_user={{ linux_user }} owner_email={{ owner_email }} ts={{ ansible_date_time.iso8601 }}\n"
+        owner: root
+        group: root
+        mode: "0644"

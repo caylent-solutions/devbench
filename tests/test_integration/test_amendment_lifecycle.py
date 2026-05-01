@@ -92,7 +92,7 @@ def _valid_payload() -> dict[str, Any]:
         "reason": "tdd_green_production_fix",
         "justification": "AC-TEST-001 needs a production fix.",
         "files_to_add": [
-            {"path": "src/example/parser.py", "change": "minimum fix for AC-TEST-001"},
+            {"path": "src/example/example.py", "change": "minimum fix for AC-TEST-001"},
         ],
         "linked_acs": ["AC-TEST-001"],
     }
@@ -131,7 +131,7 @@ class TestAmendmentLifecycleHappyPath:
         wu_content = (workspace / "backlog" / f"{task_id}.md").read_text(encoding="utf-8")
         rows = parse_manifest(wu_content)
         assert len(rows) == 2
-        assert rows[1].file == "src/example/parser.py"
+        assert rows[1].file == "src/example/example.py"
         assert AMENDMENT_APPLIED_ACTION in wu_content
         assert not request_path(workspace, task_id).exists()
 

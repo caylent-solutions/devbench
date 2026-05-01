@@ -79,7 +79,7 @@ What devbench does today, grouped by theme:
 - Symlink pattern lets the backlog repo and target repos live independently on disk.
 
 ### Reporting & observability
-- `devbench report` shows tasks completed, velocity, tokens consumed, estimated cost, and projection to completion.
+- `devbench report` shows tasks completed, velocity, tokens consumed, estimated cost, and projection to completion. Reader and writer (`setup_logging`) share a single fail-fast resolver chain (`JUDGE_LOG_FILE` env > `log_file:` in `backlog/config/devbench.yaml` > `<JUDGE_WORKSPACE_ROOT>/logs/orchestrator.log`); when none yields a path, `cmd_report` exits 1 with an actionable error rather than reading a stale source-tree log. A divergence WARNING fires when `BACKLOG.md` reports completed tasks but the resolved log file's all-time window contains zero `Set <id> to 'done'` events -- a deterministic signal that reader and writer are pointed at different files.
 - Renders **two windows by default**: an **All-time** table (full orchestrator log) and a **Current run** table (most recent contiguous block of orchestration events; boundary detected as a >10-minute gap between consecutive `Set X to ...` log lines, configurable via `DEFAULT_CURRENT_RUN_GAP_MINUTES`). Pass `--since <ISO-8601>` for a single custom-window view. Display timestamps render in the resolved timezone: top-level `display_timezone:` yaml or `JUDGE_DISPLAY_TIMEZONE` env applies to every timestamp-rendering command (report, hook-tail, watch); `report.display_timezone` / `JUDGE_REPORT_TIMEZONE` still takes higher precedence for the report command specifically. When no config is set, the host's system local timezone is used. Internal computation stays in UTC.
 - `--watch N` flag refreshes the report every N seconds (replaces the external `watch` command pattern).
 - `devbench watch` prints a one-screen live dashboard of the currently-active orchestration (mode, active task, phase, latest agent thinking, recent tool calls, repo state, pending amendment). Read-only. Also supports `--watch N` for live refresh. See [watch-activity.md](watch-activity.md) and [ADR-04](adr/04-watch-dashboard.md).
@@ -453,6 +453,10 @@ repos:
 # Top-level: defaults for all repos
 merge_strategy: squash
 max_executor_retries: 10           # max retries before marking blocked
+log_file: logs/orchestrator.log    # optional: shared log path for setup_logging
+                                   #   writer + report/hook-tail readers.
+                                   #   Resolved relative to JUDGE_WORKSPACE_ROOT
+                                   #   when not absolute. JUDGE_LOG_FILE env wins.
 allowed_orgs:                      # optional: restrict to specific GH orgs
   - caylent-solutions
 judge_model: claude-sonnet-4-6     # optional: model for review judges

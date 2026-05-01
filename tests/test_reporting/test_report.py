@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -1944,3 +1945,108 @@ class TestDisplayTimezoneFallbackChain:
         report_tz = None
         global_tz = None
         assert _resolve_display_timezone(report_tz or global_tz) is None
+
+
+# ---------------------------------------------------------------------------
+# Divergence warning -- BACKLOG STATE done count vs THROUGHPUT log-derived count
+# ---------------------------------------------------------------------------
+
+
+class TestThroughputDivergenceWarning:
+    """The report emits a one-line WARNING when the BACKLOG.md done count
+    is non-zero but the All-time throughput window finds zero
+    ``Set <id> to 'done'`` events. This is the deterministic signal that
+    the reader is looking at a different log than the orchestrator
+    writes to (typically because ``JUDGE_LOG_FILE`` was unset).
+    """
+
+    @staticmethod
+    def _patch_backlog_with_done_tasks(backlog_total: int = 5, backlog_done: int = 3) -> Any:
+        from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
+
+        units: list[WorkUnit] = []
+        for i in range(backlog_done):
+            units.append(
+                WorkUnit(
+                    id=f"E0-F1-S1-T{i + 1}",
+                    title=f"done-{i + 1}",
+                    status=WorkUnitStatus.DONE,
+                    unit_type=WorkUnitType.TASK,
+                    file_path=Path(f"backlog/E0-F1-S1-T{i + 1}.md"),
+                    repo="org/repo",
+                    dependencies=[],
+                )
+            )
+        for i in range(backlog_total - backlog_done):
+            units.append(
+                WorkUnit(
+                    id=f"E0-F1-S1-T{backlog_done + i + 1}",
+                    title=f"in-queue-{i + 1}",
+                    status=WorkUnitStatus.IN_QUEUE,
+                    unit_type=WorkUnitType.TASK,
+                    file_path=Path(f"backlog/E0-F1-S1-T{backlog_done + i + 1}.md"),
+                    repo="org/repo",
+                    dependencies=[],
+                )
+            )
+        return units
+
+    def test_warning_fires_when_backlog_done_but_log_throughput_zero(self, tmp_path: Path) -> None:
+        # Empty log => throughput finds 0 events. Backlog says 3 done.
+        # Warning must fire; reader is on the wrong log.
+        log_file = tmp_path / "wrong.log"
+        log_file.write_text(_make_log(["2026-03-05T10:00:00Z [unrelated] INFO some entry"]))
+        units = self._patch_backlog_with_done_tasks(backlog_total=5, backlog_done=3)
+        with patch("devbench.reporting.report.BacklogParser") as mock_cls:
+            mock_cls.return_value.parse_index.return_value = units
+            report = generate_report(log_path=log_file)
+        assert "WARNING" in report
+        assert "BACKLOG.md reports 3 done task(s)" in report
+        assert "All-time throughput window" in report
+        assert "JUDGE_LOG_FILE" in report
+        assert "0" in report  # the throughput count
+
+    def test_warning_silent_when_log_matches_backlog(self, tmp_path: Path) -> None:
+        # Log contains the canonical Set...to 'done' line for every backlog
+        # done task. Throughput count matches backlog count => no warning.
+        log_file = tmp_path / "right.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    "2026-03-05T10:00:00Z [c] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                    "2026-03-05T10:05:00Z [c] INFO Set E0-F1-S1-T1 to 'done'",
+                    "2026-03-05T10:10:00Z [c] INFO Set E0-F1-S1-T2 to 'in-progress'",
+                    "2026-03-05T10:15:00Z [c] INFO Set E0-F1-S1-T2 to 'done'",
+                    "2026-03-05T10:20:00Z [c] INFO Set E0-F1-S1-T3 to 'in-progress'",
+                    "2026-03-05T10:25:00Z [c] INFO Set E0-F1-S1-T3 to 'done'",
+                ]
+            )
+        )
+        units = self._patch_backlog_with_done_tasks(backlog_total=5, backlog_done=3)
+        with patch("devbench.reporting.report.BacklogParser") as mock_cls:
+            mock_cls.return_value.parse_index.return_value = units
+            report = generate_report(log_path=log_file)
+        assert "WARNING: BACKLOG.md reports" not in report
+
+    def test_warning_silent_when_backlog_has_no_done_tasks(self, tmp_path: Path) -> None:
+        # Edge case: brand-new backlog, zero done tasks. Throughput is
+        # also 0; the divergence WARNING must NOT fire (both counts agree).
+        log_file = tmp_path / "fresh.log"
+        log_file.write_text(_make_log(["2026-03-05T10:00:00Z [c] INFO startup"]))
+        units = self._patch_backlog_with_done_tasks(backlog_total=5, backlog_done=0)
+        with patch("devbench.reporting.report.BacklogParser") as mock_cls:
+            mock_cls.return_value.parse_index.return_value = units
+            report = generate_report(log_path=log_file)
+        assert "WARNING: BACKLOG.md reports" not in report
+
+    def test_warning_message_includes_log_path(self, tmp_path: Path) -> None:
+        # The error message must name the log file path so the operator
+        # can immediately identify which file got read; this is the
+        # actionable signal that lets them set JUDGE_LOG_FILE correctly.
+        log_file = tmp_path / "specific-name.log"
+        log_file.write_text("")
+        units = self._patch_backlog_with_done_tasks(backlog_total=2, backlog_done=1)
+        with patch("devbench.reporting.report.BacklogParser") as mock_cls:
+            mock_cls.return_value.parse_index.return_value = units
+            report = generate_report(log_path=log_file)
+        assert str(log_file) in report

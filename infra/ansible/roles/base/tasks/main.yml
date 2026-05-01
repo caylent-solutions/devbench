@@ -1,0 +1,37 @@
+---
+- name: Install base apt packages
+  ansible.builtin.apt:
+    name:
+      - vim
+      - nmap
+      - git
+      - screen
+      - curl
+      - ca-certificates
+      - gnupg
+      - lsb-release
+      - zsh
+      - build-essential
+      - jq
+      - unzip
+    state: present
+    update_cache: true
+
+- name: Set zsh as default shell for the linux user
+  ansible.builtin.user:
+    name: "{{ linux_user }}"
+    shell: /usr/bin/zsh
+
+- name: Check if oh-my-zsh is already installed
+  ansible.builtin.stat:
+    path: "/home/{{ linux_user }}/.oh-my-zsh"
+  register: ohmyzsh_dir
+
+- name: Install oh-my-zsh for the linux user
+  ansible.builtin.shell:
+    cmd: |
+      sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
+    creates: "/home/{{ linux_user }}/.oh-my-zsh"
+  become: true
+  become_user: "{{ linux_user }}"
+  when: not ohmyzsh_dir.stat.exists

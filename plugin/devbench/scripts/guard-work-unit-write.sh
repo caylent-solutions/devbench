@@ -19,12 +19,13 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=_hook_lib.sh
+. "$SCRIPT_DIR/_hook_lib.sh"
+
 INPUT=$(cat)
-FILE_PATH=$(printf '%s' "$INPUT" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-print(d.get('tool_input', {}).get('file_path', ''))
-" 2>/dev/null || true)
+FILE_PATH=$(extract_file_path "$INPUT")
+decode_json_escapes FILE_PATH
 
 if [[ -z "$FILE_PATH" ]]; then
   exit 0

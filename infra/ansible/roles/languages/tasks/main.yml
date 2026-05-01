@@ -1,0 +1,47 @@
+---
+# Python LTS, Node LTS, Go, uv, pipx, pip
+- name: Install Python LTS toolchain
+  ansible.builtin.apt:
+    name:
+      - python3
+      - python3-pip
+      - python3-venv
+    state: present
+
+- name: Install pipx via apt
+  ansible.builtin.apt:
+    name: pipx
+    state: present
+
+- name: Ensure pipx PATH is configured for the linux user
+  ansible.builtin.shell:
+    cmd: pipx ensurepath
+  become: true
+  become_user: "{{ linux_user }}"
+  changed_when: false
+
+- name: Install uv (official installer, into the linux user's home)
+  ansible.builtin.shell:
+    cmd: |
+      curl -LsSf https://astral.sh/uv/install.sh | sh
+    creates: "/home/{{ linux_user }}/.local/bin/uv"
+  become: true
+  become_user: "{{ linux_user }}"
+
+- name: Install Node.js LTS via NodeSource
+  block:
+    - name: Add NodeSource apt key
+      ansible.builtin.shell:
+        cmd: |
+          curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
+        creates: /etc/apt/sources.list.d/nodesource.list
+    - name: Install Node.js
+      ansible.builtin.apt:
+        name: nodejs
+        state: present
+        update_cache: true
+
+- name: Install Go via apt
+  ansible.builtin.apt:
+    name: golang-go
+    state: present

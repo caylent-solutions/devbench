@@ -34,6 +34,7 @@ import logging
 import re
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import ClassVar
 
 from devbench.constants import (
     ALL_REQUIRED_JUDGE_NAMES,
@@ -212,6 +213,9 @@ class BacklogManager:
         self._check_status_summary(backlog_index, rows, errors)
         self._check_task_content(rows, workspace_root, errors)
         self._check_manifest_path_prefixes(rows, workspace_root, errors)
+        self._check_manifest_conflicts(rows, workspace_root, errors)
+        self._check_language_ac_alignment(rows, workspace_root, errors)
+        self._check_source_test_pairs(rows, workspace_root, errors)
         return errors
 
     def _check_files_and_statuses(
@@ -1030,6 +1034,357 @@ class BacklogManager:
                         f"Paths must be repo-relative (drop the prefix); "
                         f"see docs/backlog-contract.md."
                     )
+
+    # Language tier classification used by the source-test pair and
+    # language-AC-alignment rules. Mirrors docs/acceptance-criteria-canonical.md
+    # tier table. Production-source globs identify paths whose Python files
+    # require a sibling test entry in the same Manifest per
+    # docs/source-test-atomicity.md; the test-path globs are the matching
+    # locations the rule searches for that sibling.
+    _PYTHON_EXTS: ClassVar[tuple[str, ...]] = (".py",)
+    _NON_PY_EXTS_TO_TIER: ClassVar[dict[str, str]] = {
+        ".hcl": "HCL",
+        ".tf": "HCL",
+        ".tfvars": "HCL",
+        ".yaml": "YAML",
+        ".yml": "YAML",
+        ".json": "JSON",
+        ".xml": "XML",
+        ".toml": "TOML",
+        ".md": "Markdown",
+    }
+    _PROD_SRC_PATTERNS: ClassVar[tuple[str, ...]] = (
+        "src/",
+        "infra/scripts/",
+    )
+    _PROD_SRC_NESTED_PATTERNS: ClassVar[tuple[str, ...]] = ("/src/",)
+    _AC_FINAL_LANGUAGE_TIER_IDS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "AC-FINAL-002",
+            "AC-FINAL-003",
+            "AC-FINAL-004",
+            "AC-FINAL-005",
+            "AC-FINAL-006",
+            "AC-FINAL-008",
+            "AC-FINAL-014",
+        }
+    )
+
+    @classmethod
+    def _classify_manifest_tier(cls, paths: list[str]) -> str:
+        """Return the language tier for a Manifest's file paths.
+
+        Returns ``"Python"`` if any path ends in ``.py``; otherwise the
+        single non-Python tier matching all paths; otherwise ``"Mixed"``.
+        Returns ``""`` if the path list is empty.
+        """
+        if not paths:
+            return ""
+        py_paths = [p for p in paths if any(p.lower().endswith(ext) for ext in cls._PYTHON_EXTS)]
+        if py_paths:
+            return "Python"
+        tiers = set()
+        for p in paths:
+            lower = p.lower()
+            for ext, tier in cls._NON_PY_EXTS_TO_TIER.items():
+                if lower.endswith(ext):
+                    tiers.add(tier)
+                    break
+        if len(tiers) == 1:
+            return tiers.pop()
+        if len(tiers) > 1:
+            return "Mixed"
+        return ""
+
+    @classmethod
+    def _is_production_source(cls, path: str) -> bool:
+        """Return True if the path looks like production Python source.
+
+        Used by the source-test pair rule to distinguish source files (which
+        require a matching test entry) from one-off scripts in
+        configuration-only directories. Test files themselves (paths under
+        any ``tests/`` segment) are excluded -- they are not production source
+        even when their extension is ``.py``.
+        """
+        if not any(path.lower().endswith(ext) for ext in cls._PYTHON_EXTS):
+            return False
+        # Exclude test files
+        if path.startswith("tests/") or "/tests/" in path:
+            return False
+        # Exclude package marker files
+        from pathlib import PurePosixPath
+
+        if PurePosixPath(path).name == "__init__.py":
+            return False
+        return any(path.startswith(p) for p in cls._PROD_SRC_PATTERNS) or any(
+            seg in path for seg in cls._PROD_SRC_NESTED_PATTERNS
+        )
+
+    @staticmethod
+    def _is_real_manifest_path(path: str) -> bool:
+        """Return True if the Manifest entry is a real file path.
+
+        Filters out placeholder strings like ``(none)``, ``(no file changes;
+        ...)``, etc. that documentation-only or verification-only tasks use to
+        indicate an empty Manifest.
+        """
+        if not path:
+            return False
+        stripped = path.strip()
+        return not (stripped.startswith("(") and stripped.endswith(")"))
+
+    def _check_manifest_conflicts(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """Check 12: no two in-queue tasks in the SAME REPO own the same Manifest path.
+
+        Per docs/backlog-contract.md "Manifest Conflict Rule": two in-queue
+        tasks claiming ownership of the same path collide at git-ops time.
+        Tasks with explicit Dependencies between them are exempt because the
+        ordering resolves the conflict. The check is scoped by ``(repo, path)``
+        because two tasks targeting different repos can legitimately list the
+        same path (e.g., ``.devcontainer/devcontainer.json`` exists in both
+        caylent-telemetry and the kanon repo's per-repo edits).
+        """
+        from devbench.backlog.manifest import ManifestParseError, parse_manifest
+
+        # Map: (repo, path) -> list of (task_id, status)
+        ownership: dict[tuple[str, str], list[tuple[str, str]]] = {}
+        deps_by_task: dict[str, set[str]] = {}
+
+        for row_id, status, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not file_path_str or not self._is_task_id(row_id):
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.exists():
+                continue
+            content = wu_path.read_text(encoding="utf-8")
+            repo = self._extract_repo(content) or ""
+            try:
+                manifest_rows = parse_manifest(content)
+            except ManifestParseError:
+                # Other validate rules (TestValidateContent) emit the missing
+                # Manifest error; conflict detection treats unparseable
+                # Manifests as having zero entries to avoid duplicate noise.
+                manifest_rows = []
+            for manifest_row in manifest_rows:
+                if not self._is_real_manifest_path(manifest_row.file):
+                    continue
+                ownership.setdefault((repo, manifest_row.file), []).append((row_id, status))
+            deps_by_task[row_id] = self._extract_dep_ids(content)
+
+        for (repo, path), owners in ownership.items():
+            if len(owners) < 2:
+                continue
+            # Filter to tasks not in done/declined/in-progress -- those are not
+            # in flight any more or are actively being executed; the conflict
+            # rule targets in-queue/proposed/blocked overlap.
+            relevant = [(tid, st) for tid, st in owners if st in ("in-queue", "proposed", "blocked")]
+            if len(relevant) < 2:
+                continue
+            # Check whether every pair has an explicit dep relationship.
+            ids = [tid for tid, _ in relevant]
+            if self._tasks_form_dep_chain(ids, deps_by_task):
+                continue
+            errors.append(
+                f"Manifest conflict on {path!r} in repo {repo or '(unknown)'}: "
+                f"claimed by {', '.join(sorted(ids))}. Wire an explicit dependency "
+                f"between them via 'devbench add-dep <later> <earlier>' or "
+                f"reassign ownership; see docs/backlog-contract.md "
+                f"'Manifest Conflict Rule'."
+            )
+
+    @staticmethod
+    def _extract_dep_ids(content: str) -> set[str]:
+        """Return the set of task IDs in a work-unit's ## Dependencies table."""
+        deps: set[str] = set()
+        in_deps = False
+        for line in content.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("## "):
+                in_deps = stripped.startswith("## Dependencies")
+                continue
+            if not in_deps:
+                continue
+            if not stripped.startswith("|"):
+                continue
+            # `startswith("|")` guarantees at least 2 cells after split.
+            cells = [c.strip() for c in stripped.split("|")]
+            cell = cells[1]
+            if not cell or cell.lower() == "id" or cell.startswith("-"):
+                continue
+            if cell in DEPENDENCY_NONE_VALUES:
+                continue
+            # Cell may contain a comma-separated dep list
+            for raw in cell.split(","):
+                token = raw.strip()
+                # Allow IDs with ":" suffix variants; keep core ID
+                if not token:
+                    continue
+                # Validate against task-id shape
+                if re.fullmatch(r"E\d+(-F\d+)?(-S\d+)?(-T\d+)?", token):
+                    deps.add(token)
+        return deps
+
+    @staticmethod
+    def _tasks_form_dep_chain(ids: list[str], deps: dict[str, set[str]]) -> bool:
+        """Return True if every id in ``ids`` is reachable from every other via the dep graph.
+
+        A dep chain (any ordering that resolves ownership conflicts) requires
+        the ids to be totally ordered by the deps relation; a simpler
+        sufficient check is that every pair has at least one direction of dep
+        between them. Implements the simpler check.
+        """
+        if len(ids) < 2:
+            return True
+        for i, a in enumerate(ids):
+            for b in ids[i + 1 :]:
+                if b not in deps.get(a, set()) and a not in deps.get(b, set()):
+                    return False
+        return True
+
+    def _check_language_ac_alignment(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """Check 13: AC-FINAL Python-tooling lines must carry the N/A suffix on non-Python tasks.
+
+        Per docs/acceptance-criteria-canonical.md, AC-FINAL-002..005, 008,
+        and 014 apply only to Python tasks. Non-Python tasks must append
+        ``-- N/A for <tier> Tasks (no <language> source authored)`` so
+        reviewers do not enforce inapplicable checks.
+        """
+        from devbench.backlog.manifest import ManifestParseError, parse_manifest
+
+        for row_id, _, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not file_path_str or not self._is_task_id(row_id):
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.exists():
+                continue
+            content = wu_path.read_text(encoding="utf-8")
+            try:
+                paths = [m.file for m in parse_manifest(content)]
+            except ManifestParseError:
+                continue
+            tier = self._classify_manifest_tier(paths)
+            if tier in ("", "Python", "Mixed"):
+                # Mixed tasks have at least one .py file -> Python ACs apply
+                # to that subset; do not emit warnings.
+                continue
+
+            # Walk AC-FINAL lines; for each Python-tier AC ID, require the
+            # N/A suffix unless the line is missing entirely (handled by
+            # other rules).
+            for line in content.splitlines():
+                stripped = line.strip()
+                if not stripped.startswith("- ["):
+                    continue
+                m = re.match(r"^- \[[ x]\] (AC-FINAL-\d{3})\b", stripped)
+                if not m:
+                    continue
+                ac_id = m.group(1)
+                if ac_id not in self._AC_FINAL_LANGUAGE_TIER_IDS:
+                    continue
+                if "-- N/A" in stripped:
+                    continue
+                errors.append(
+                    f"{row_id}: {ac_id} requires the N/A suffix on "
+                    f"{tier}-tier task (no Python source in Manifest). "
+                    f"Append '-- N/A for {tier} Tasks (no Python source authored)' "
+                    f"per docs/acceptance-criteria-canonical.md."
+                )
+
+    def _check_source_test_pairs(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """Check 14: every production-source .py file in a Manifest needs a matching test entry.
+
+        Per docs/source-test-atomicity.md, splitting source and test across
+        sibling tasks causes AC-FINAL-014 (100% coverage) to fail in the
+        source-authoring task. The rule ensures the test pair is in the
+        same Manifest.
+        """
+        from devbench.backlog.manifest import ManifestParseError, parse_manifest
+
+        for row_id, _, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not file_path_str or not self._is_task_id(row_id):
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.exists():
+                continue
+            content = wu_path.read_text(encoding="utf-8")
+            try:
+                paths = [m.file for m in parse_manifest(content)]
+            except ManifestParseError:
+                continue
+            for source_path in paths:
+                if not self._is_production_source(source_path):
+                    continue
+                source_stem = self._source_stem_for_pair_match(source_path)
+                if not source_stem:
+                    continue
+                # A test pair is any `test_*.py` (or `*_test.py`) entry in the
+                # SAME Manifest whose basename contains the source stem as a
+                # substring. This accepts project naming conventions such as
+                # `test_telemetry_event.py` for `event.py`, while still
+                # catching the split-Manifest anti-pattern (where the test
+                # file lives in a sibling task's Manifest entirely).
+                has_pair = any(self._test_filename_pairs_with_stem(p, source_stem) for p in paths)
+                if not has_pair:
+                    errors.append(
+                        f"{row_id}: production source {source_path!r} has no "
+                        f"matching test in the same Manifest "
+                        f"(expected a test_*.py whose basename contains "
+                        f"{source_stem!r}, e.g., tests/unit/test_{source_stem}.py). "
+                        f"Add the test entry per docs/source-test-atomicity.md."
+                    )
+
+    @staticmethod
+    def _source_stem_for_pair_match(source_path: str) -> str:
+        """Return the basename stem (without ``.py``) for source-test pairing.
+
+        Returns ``""`` for ``__init__.py`` and non-Python paths so callers
+        can skip the pairing check on packaging-only entries.
+        """
+        base = source_path.rsplit("/", 1)[-1]
+        if base == "__init__.py" or not base.endswith(".py"):
+            return ""
+        return base[:-3]
+
+    @staticmethod
+    def _test_filename_pairs_with_stem(path: str, source_stem: str) -> bool:
+        """Return True if ``path`` is a test file whose basename references ``source_stem``.
+
+        Accepts both ``test_<...>.py`` and ``<...>_test.py`` patterns and
+        requires ``source_stem`` to appear as a substring of the basename
+        (minus extension and any ``test_`` / ``_test`` framing).
+        """
+        base = path.rsplit("/", 1)[-1]
+        if not base.endswith(".py") or base == "__init__.py":
+            return False
+        stem = base[:-3]
+        if stem.startswith("test_"):
+            inner = stem[len("test_") :]
+        elif stem.endswith("_test"):
+            inner = stem[: -len("_test")]
+        else:
+            return False
+        return source_stem in inner.split("_") or source_stem in inner
 
     @staticmethod
     def _extract_repo(content: str) -> str | None:

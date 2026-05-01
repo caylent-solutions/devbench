@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from devbench import cli
+from devbench.backlog.proposal import Proposal
 from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
 from devbench.constants import BACKLOG_SUBDIR
 
@@ -5156,3 +5157,807 @@ class TestCmdHookTail:
         captured = capsys.readouterr()
         assert "unknown timezone" in captured.err
         assert "Not/AZone" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# Tier 3: test-validates-source heuristic + cmd_promote_proposal warnings
+# ---------------------------------------------------------------------------
+
+
+class TestDetectTestValidatesSource:
+    """Unit tests for cli._detect_test_validates_source."""
+
+    @staticmethod
+    def _write_proposal(
+        proposals_dir: Path,
+        source_id: str,
+        proposed_id: str,
+        title: str = "Implement feature",
+        files: list[str] | None = None,
+        source_dep_direction: str = "",
+    ) -> None:
+        proposals_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "source_task_id": source_id,
+            "generated_at": "2026-04-30T00:00:00Z",
+            "rejection_reason": "x",
+            "source_dep_direction": source_dep_direction,
+            "proposed_tasks": [
+                {
+                    "suggested_id": proposed_id,
+                    "title": title,
+                    "files_to_own": files or ["src/foo.py"],
+                    "linked_scenarios": [],
+                    "suggested_acs": [],
+                    "suggested_approach": "",
+                }
+            ],
+        }
+        (proposals_dir / f"{source_id}.json").write_text(json.dumps(payload))
+
+    def test_returns_empty_when_proposals_dir_missing(self, tmp_path: Path) -> None:
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            assert cli._detect_test_validates_source("E0-F1-S1-T9") == ""
+
+    def test_returns_flag_when_explicit_source_dep_direction(self, tmp_path: Path) -> None:
+        proposals = tmp_path / ".devbench" / "proposals"
+        self._write_proposal(
+            proposals,
+            "E0-F1-S1-T1",
+            "E0-F1-S1-T9",
+            title="Implement feature",
+            source_dep_direction="test_validates_source",
+        )
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            assert cli._detect_test_validates_source("E0-F1-S1-T9") == "flag"
+
+    def test_returns_heuristic_when_title_starts_with_add_tests(self, tmp_path: Path) -> None:
+        proposals = tmp_path / ".devbench" / "proposals"
+        self._write_proposal(
+            proposals,
+            "E0-F1-S1-T1",
+            "E0-F1-S1-T9",
+            title="Add tests/unit/test_foo.py to validate T1's foo.py",
+        )
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            assert cli._detect_test_validates_source("E0-F1-S1-T9") == "heuristic"
+
+    def test_returns_heuristic_when_title_starts_with_verify(self, tmp_path: Path) -> None:
+        proposals = tmp_path / ".devbench" / "proposals"
+        self._write_proposal(
+            proposals,
+            "E0-F1-S1-T1",
+            "E0-F1-S1-T9",
+            title="Verify pyproject.toml lists ruff",
+        )
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            assert cli._detect_test_validates_source("E0-F1-S1-T9") == "heuristic"
+
+    def test_returns_heuristic_when_files_all_under_tests(self, tmp_path: Path) -> None:
+        proposals = tmp_path / ".devbench" / "proposals"
+        self._write_proposal(
+            proposals,
+            "E0-F1-S1-T1",
+            "E0-F1-S1-T9",
+            title="Implement coverage",
+            files=["tests/unit/test_a.py", "tests/integration/test_b.py"],
+        )
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            assert cli._detect_test_validates_source("E0-F1-S1-T9") == "heuristic"
+
+    def test_returns_empty_when_no_match(self, tmp_path: Path) -> None:
+        proposals = tmp_path / ".devbench" / "proposals"
+        self._write_proposal(
+            proposals,
+            "E0-F1-S1-T1",
+            "E0-F1-S1-T9",
+            title="Implement merge_properties.py",
+            files=["infra/scripts/merge_properties.py"],
+        )
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            assert cli._detect_test_validates_source("E0-F1-S1-T9") == ""
+
+    def test_returns_empty_when_id_not_in_any_proposal(self, tmp_path: Path) -> None:
+        proposals = tmp_path / ".devbench" / "proposals"
+        self._write_proposal(
+            proposals,
+            "E0-F1-S1-T1",
+            "E0-F1-S1-T9",
+            title="Add tests/foo",
+        )
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            assert cli._detect_test_validates_source("E0-F1-S1-T7") == ""
+
+    def test_malformed_json_is_skipped(self, tmp_path: Path) -> None:
+        proposals = tmp_path / ".devbench" / "proposals"
+        proposals.mkdir(parents=True)
+        (proposals / "broken.json").write_text("{not valid json")
+        # And one valid file alongside it so we exercise the continue path.
+        self._write_proposal(
+            proposals,
+            "E0-F1-S1-T1",
+            "E0-F1-S1-T9",
+            title="Add tests/unit/test_x.py",
+        )
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            assert cli._detect_test_validates_source("E0-F1-S1-T9") == "heuristic"
+
+
+class TestCmdPromoteProposalTestValidatesSource:
+    """cmd_promote_proposal honors / warns on the test-validates-source heuristic."""
+
+    def test_flag_auto_applies_no_dep_on_source(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        from devbench.backlog.proposal import PromoteResult
+
+        proposals = tmp_path / ".devbench" / "proposals"
+        TestDetectTestValidatesSource._write_proposal(
+            proposals,
+            "E0-F1-S1-T1",
+            "E0-F1-S1-T9",
+            source_dep_direction="test_validates_source",
+        )
+        captured: dict[str, Any] = {}
+
+        def fake_promote(**kwargs: Any) -> PromoteResult:
+            captured.update(kwargs)
+            return PromoteResult(draft_path=tmp_path / "x.md", wired_targets=[])
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.promote_proposal", side_effect=fake_promote),
+        ):
+            rc = cli.cmd_promote_proposal("E0-F1-S1-T9")
+        assert rc == 0
+        assert captured.get("dep_on_source") is False
+        err = capsys.readouterr().err
+        assert "auto-applying --no-dep-on-source" in err
+
+    def test_heuristic_emits_warning_but_keeps_default_dep_on_source(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from devbench.backlog.proposal import PromoteResult
+
+        proposals = tmp_path / ".devbench" / "proposals"
+        TestDetectTestValidatesSource._write_proposal(
+            proposals,
+            "E0-F1-S1-T1",
+            "E0-F1-S1-T9",
+            title="Add tests/unit/test_foo.py",
+        )
+        captured: dict[str, Any] = {}
+
+        def fake_promote(**kwargs: Any) -> PromoteResult:
+            captured.update(kwargs)
+            return PromoteResult(draft_path=tmp_path / "x.md", wired_targets=[])
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.promote_proposal", side_effect=fake_promote),
+        ):
+            rc = cli.cmd_promote_proposal("E0-F1-S1-T9")
+        assert rc == 0
+        # Heuristic does NOT auto-flip; just warns.
+        assert captured.get("dep_on_source") is True
+        err = capsys.readouterr().err
+        assert "looks like a test-validates-source task" in err
+
+    def test_no_warning_when_no_dep_on_source_already_set(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from devbench.backlog.proposal import PromoteResult
+
+        proposals = tmp_path / ".devbench" / "proposals"
+        TestDetectTestValidatesSource._write_proposal(
+            proposals,
+            "E0-F1-S1-T1",
+            "E0-F1-S1-T9",
+            title="Add tests/unit/test_foo.py",
+        )
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch(
+                "devbench.cli.promote_proposal",
+                return_value=PromoteResult(draft_path=tmp_path / "x.md", wired_targets=[]),
+            ),
+        ):
+            rc = cli.cmd_promote_proposal("--no-dep-on-source", "E0-F1-S1-T9")
+        assert rc == 0
+        # When the operator passes --no-dep-on-source explicitly, no
+        # warning is needed (the heuristic check is gated on dep_on_source).
+        err = capsys.readouterr().err
+        assert "looks like a test-validates-source task" not in err
+        assert "auto-applying --no-dep-on-source" not in err
+
+
+# ---------------------------------------------------------------------------
+# Tier 3: cmd_check pre-flight verifier
+# ---------------------------------------------------------------------------
+
+
+class TestCmdCheck:
+    """devbench check: pre-flight readiness check across all repos in devbench.yaml."""
+
+    @staticmethod
+    def _write_min_yaml(tmp_path: Path, repos_block: str, single_branch: str = "") -> Path:
+        # Schema-conformant minimal config (matches tests/fixtures/test_devbench.yaml).
+        cfg_dir = tmp_path / "backlog" / "config"
+        cfg_dir.mkdir(parents=True)
+        cfg_path = cfg_dir / "devbench.yaml"
+        ops_block = (
+            f"git_ops:\n  single_branch: {single_branch}\n  defer_pr: true\n"
+            if single_branch
+            else "git_ops:\n  defer_pr: false\n"
+        )
+        cfg_path.write_text(
+            f"judge_model: test-judge-model\nexecutor_model: test-executor-model\nrepos:\n{repos_block}{ops_block}"
+        )
+        return cfg_path
+
+    def test_returns_1_when_yaml_missing(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Point JUDGE_CONFIG_PATH at a nonexistent file so resolve_config_path
+        # does not fall back to the suite-wide test fixture YAML.
+        monkeypatch.setenv("JUDGE_CONFIG_PATH", str(tmp_path / "no-such.yaml"))
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_check()
+        assert rc == 1
+        assert "devbench.yaml not found" in capsys.readouterr().err
+
+    def test_returns_1_when_symlink_missing(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        cfg = self._write_min_yaml(
+            tmp_path,
+            "  org/repo-a:\n    checkout_directory: repo-a\n    default_branch: main\n",
+        )
+        monkeypatch.setenv("JUDGE_CONFIG_PATH", str(cfg))
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_check()
+        assert rc == 1
+        out = capsys.readouterr().out
+        assert "symlink missing" in out
+        assert "repo-a" in out
+
+    def test_returns_0_when_all_checks_pass(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Set up a fake clone with origin remote configured (via mocked subprocess).
+        clone = tmp_path / "clone-a"
+        clone.mkdir()
+        (tmp_path / "repo-a").symlink_to(clone)
+        cfg = self._write_min_yaml(
+            tmp_path,
+            "  org/repo-a:\n    checkout_directory: repo-a\n    default_branch: main\n",
+            single_branch="feat/x",
+        )
+        monkeypatch.setenv("JUDGE_CONFIG_PATH", str(cfg))
+
+        def fake_run(args: list[str], **_: Any) -> Any:
+            mock = MagicMock()
+            if args[:3] == ["git", "-C", str(clone)]:
+                mock.returncode = 0
+                mock.stdout = "git@github.com:org/repo-a.git\n"
+            elif args[:2] == ["gh", "api"]:
+                mock.returncode = 0
+                mock.stdout = "main\n"
+            elif args[:3] == ["gh", "pr", "list"]:
+                mock.returncode = 0
+                mock.stdout = "[]"
+            else:
+                mock.returncode = 0
+                mock.stdout = ""
+            mock.stderr = ""
+            return mock
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.subprocess.run", side_effect=fake_run),
+        ):
+            rc = cli.cmd_check()
+        assert rc == 0
+        assert "Pre-flight check passed" in capsys.readouterr().out
+
+    def test_flags_default_branch_mismatch(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        clone = tmp_path / "clone-a"
+        clone.mkdir()
+        (tmp_path / "repo-a").symlink_to(clone)
+        cfg = self._write_min_yaml(
+            tmp_path,
+            "  org/repo-a:\n    checkout_directory: repo-a\n    default_branch: main2\n",
+        )
+        monkeypatch.setenv("JUDGE_CONFIG_PATH", str(cfg))
+
+        def fake_run(args: list[str], **_: Any) -> Any:
+            mock = MagicMock()
+            mock.stderr = ""
+            if args[:3] == ["git", "-C", str(clone)]:
+                mock.returncode = 0
+                mock.stdout = "git@github.com:org/repo-a.git\n"
+            elif args[:2] == ["gh", "api"]:
+                mock.returncode = 0
+                mock.stdout = "main\n"
+            else:
+                mock.returncode = 0
+                mock.stdout = ""
+            return mock
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.subprocess.run", side_effect=fake_run),
+        ):
+            rc = cli.cmd_check()
+        assert rc == 1
+        out = capsys.readouterr().out
+        assert "default_branch mismatch" in out
+        assert "'main2'" in out and "'main'" in out
+
+    def test_flags_open_pr_on_single_branch(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        clone = tmp_path / "clone-a"
+        clone.mkdir()
+        (tmp_path / "repo-a").symlink_to(clone)
+        cfg = self._write_min_yaml(
+            tmp_path,
+            "  org/repo-a:\n    checkout_directory: repo-a\n    default_branch: main\n",
+            single_branch="feat/x",
+        )
+        monkeypatch.setenv("JUDGE_CONFIG_PATH", str(cfg))
+
+        def fake_run(args: list[str], **_: Any) -> Any:
+            mock = MagicMock()
+            mock.stderr = ""
+            if args[:3] == ["git", "-C", str(clone)]:
+                mock.returncode = 0
+                mock.stdout = "git@github.com:org/repo-a.git\n"
+            elif args[:2] == ["gh", "api"]:
+                mock.returncode = 0
+                mock.stdout = "main\n"
+            elif args[:3] == ["gh", "pr", "list"]:
+                mock.returncode = 0
+                mock.stdout = '[{"number":42,"title":"existing"}]'
+            else:
+                mock.returncode = 0
+                mock.stdout = ""
+            return mock
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.subprocess.run", side_effect=fake_run),
+        ):
+            rc = cli.cmd_check()
+        assert rc == 1
+        out = capsys.readouterr().out
+        assert "open PR(s) already exist on branch" in out
+
+
+# ---------------------------------------------------------------------------
+# Tier 3: variadic dispatch lets `add-dep --reason "<multi token>"` survive
+# ---------------------------------------------------------------------------
+
+
+class TestAddDepVariadicDispatch:
+    """The dispatcher must NOT truncate add-dep's --reason value."""
+
+    def test_main_passes_full_reason_through_to_cmd_add_dep(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: dict[str, Any] = {}
+
+        def fake_add_dep(*argv: str) -> int:
+            captured["argv"] = argv
+            return 0
+
+        monkeypatch.setattr(cli, "cmd_add_dep", fake_add_dep)
+        # Re-register the patched function in the dispatch table so main() sees it.
+        original = cli._COMMANDS["add-dep"]
+        monkeypatch.setitem(cli._COMMANDS, "add-dep", (fake_add_dep, original[1], original[2]))
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "devbench",
+                "add-dep",
+                "E0-F1-S1-T1",
+                "E0-F1-S1-T2",
+                "--reason",
+                "this is a multi token reason value",
+            ],
+        )
+        rc = cli.main()
+        assert rc == 0
+        # All five trailing tokens must reach cmd_add_dep, including the
+        # full multi-token --reason value (no slicing by MAX_ARGS).
+        assert captured["argv"] == (
+            "E0-F1-S1-T1",
+            "E0-F1-S1-T2",
+            "--reason",
+            "this is a multi token reason value",
+        )
+
+
+# ---------------------------------------------------------------------------
+# write-proposal auto-cascade (closes the resolver-write -> next-sweep gap)
+# ---------------------------------------------------------------------------
+
+
+def _runtime_config_with_auto_accept(value: bool) -> Any:
+    """Build a RuntimeConfig clone whose ``task_factory.auto_accept_proposals`` is *value*.
+
+    ``RuntimeConfig`` and ``TaskFactoryConfig`` are frozen dataclasses, so
+    mutation via setattr fails with ``FrozenInstanceError``. The
+    canonical replacement pattern is ``dataclasses.replace`` for the
+    nested config, then ``dataclasses.replace`` for the parent so the
+    one runtime field of interest is swapped without touching the
+    other config sections.
+    """
+    import dataclasses
+
+    base = cli.RUNTIME_CONFIG
+    new_tf = dataclasses.replace(base.task_factory, auto_accept_proposals=value)
+    return dataclasses.replace(base, task_factory=new_tf)
+
+
+class TestCmdWriteProposalAutoCascade:
+    """When ``task_factory.auto_accept_proposals`` is true, ``write-proposal``
+    must materialise + promote every proposed task in the same Python
+    invocation so the cascade is actionable immediately rather than waiting
+    for the next ``sweep-proposals`` cycle.
+    """
+
+    @staticmethod
+    def _sample_proposal_dict(source_task_id: str = "E0-F1-S1-T1") -> dict[str, Any]:
+        return {
+            "source_task_id": source_task_id,
+            "generated_at": "2026-05-01T03:00:00Z",
+            "rejection_reason": "x",
+            "proposed_tasks": [
+                {
+                    "suggested_id": "E0-F1-S1-T9",
+                    "title": "Follow-up fix",
+                    "files_to_own": ["src/foo.py"],
+                    "linked_scenarios": [],
+                    "suggested_acs": [
+                        "AC-FUNC-001 fix the issue",
+                    ],
+                    "suggested_approach": (
+                        "Context: the source task hit X and produced finding Y. "
+                        "Scope: src/foo.py only. "
+                        "TDD approach: 1. RED write a failing test for the missing behaviour. "
+                        "2. GREEN add the implementation in src/foo.py. "
+                        "3. REFACTOR clean up duplication if any. "
+                        "Verify: pytest exits zero and lint is clean."
+                    ),
+                }
+            ],
+            "affected_task_ids": [],
+        }
+
+    def _patch_cli_workspace(
+        self, monkeypatch: pytest.MonkeyPatch, workspace: Path, backlog_root: Path, backlog_index: Path
+    ) -> None:
+        monkeypatch.setattr(cli, "WORKSPACE_ROOT", workspace)
+        monkeypatch.setattr(cli, "BACKLOG_ROOT", backlog_root)
+        monkeypatch.setattr(cli, "BACKLOG_INDEX", backlog_index)
+
+    def test_disabled_when_auto_accept_false(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    ) -> None:
+        # When the config flag is false the function returns the
+        # "disabled" sentinel and never calls materialise/promote.
+        monkeypatch.setattr(cli, "RUNTIME_CONFIG", _runtime_config_with_auto_accept(False))
+        proposal = Proposal.from_dict(self._sample_proposal_dict())
+        result = cli._maybe_auto_cascade_proposal("E0-F1-S1-T1", proposal)
+        assert result == {"auto_cascade": "disabled"}
+
+    def test_failed_when_source_task_missing_from_index(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        # When auto-accept is on but the source task is not in the
+        # backlog index (caller passed a typo'd id), the cascade reports
+        # "failed" with a clear error and does not raise.
+        monkeypatch.setattr(cli, "RUNTIME_CONFIG", _runtime_config_with_auto_accept(True))
+        backlog = tmp_path / "BACKLOG.md"
+        backlog.write_text(
+            "# Backlog\n\n"
+            "## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
+            "|------|-------|------|-------------|----------|---------|\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n",
+            encoding="utf-8",
+        )
+        self._patch_cli_workspace(monkeypatch, tmp_path, tmp_path / "backlog", backlog)
+        proposal = Proposal.from_dict(self._sample_proposal_dict("E0-NOPE-T0"))
+        result = cli._maybe_auto_cascade_proposal("E0-NOPE-T0", proposal)
+        assert result["auto_cascade"] == "failed"
+        # Either "no work-unit rows" (parser rejection on empty index)
+        # or "not found" (index parses but source task absent) is an
+        # acceptable failure shape; both prove the cascade aborted
+        # cleanly without raising.
+        err_value = result["error"]
+        assert isinstance(err_value, str)
+        err = err_value.lower()
+        assert "not found" in err or "no work-unit rows" in err
+
+    def test_applied_when_auto_accept_true(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    ) -> None:
+        # End-to-end: with auto-accept on and a real source-task in the
+        # index, the helper calls materialise + promote and returns
+        # "applied" with the materialised path list and promoted ids.
+        monkeypatch.setattr(cli, "RUNTIME_CONFIG", _runtime_config_with_auto_accept(True))
+        # Build a minimum BACKLOG with one source task at E0-F1-S1-T1
+        # (currently blocked, since auto-accept emit happens when the
+        # source is failing) plus the directory structure
+        # ``materialise_proposal`` expects.
+        backlog_root = tmp_path / "backlog"
+        story_dir = backlog_root / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+        (story_dir / "E0-F1-S1-T1.md").write_text(
+            "# E0-F1-S1-T1: Source\n\n"
+            "## Status: blocked\n\n"
+            "## Target Repository\n\n- **Repo:** `org/repo`\n\n"
+            "## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-FUNC-001\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `src/foo.py` | edit |\n\n"
+            "## Definition of Done\n\n- [ ] done\n",
+            encoding="utf-8",
+        )
+        backlog = tmp_path / "BACKLOG.md"
+        backlog.write_text(
+            "# Backlog\n\n"
+            "## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
+            "|------|-------|------|-------------|----------|---------|\n"
+            "| E0 | x | 0 | 0 | 0 | 1 |\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Source | Task | blocked | None | org/repo | "
+            "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n",
+            encoding="utf-8",
+        )
+        self._patch_cli_workspace(monkeypatch, tmp_path, backlog_root, backlog)
+
+        proposal = Proposal.from_dict(self._sample_proposal_dict("E0-F1-S1-T1"))
+        # Persist the proposal JSON so the cascade has something to work on.
+        proposals_dir = tmp_path / ".devbench" / "proposals"
+        proposals_dir.mkdir(parents=True)
+        (proposals_dir / "E0-F1-S1-T1.json").write_text(json.dumps(proposal.to_dict()))
+
+        result = cli._maybe_auto_cascade_proposal("E0-F1-S1-T1", proposal)
+        assert result["auto_cascade"] == "applied"
+        materialised = result["materialised"]
+        assert isinstance(materialised, list) and materialised  # at least one path
+        promoted = result["promoted"]
+        assert isinstance(promoted, list)
+        assert "E0-F1-S1-T9" in promoted
+        # The promoted task's file now exists with status in-queue.
+        promoted_file = story_dir / "E0-F1-S1-T9.md"
+        assert promoted_file.exists()
+        promoted_content = promoted_file.read_text(encoding="utf-8")
+        assert "## Status: in-queue" in promoted_content
+
+
+# ---------------------------------------------------------------------------
+# log-verdict judge-name allowlist (rejects malformed audit-row writes)
+# ---------------------------------------------------------------------------
+
+
+class TestCmdLogVerdictAllowlist:
+    """``cmd_log_verdict`` rejects judge names outside the canonical allowlist.
+
+    Empirically observed in production: an executor agent ran
+    ``log-verdict judge <id> pass`` (literal string ``"judge"`` instead
+    of a canonical reviewer name). The malformed entry landed in the
+    work-unit Comments section but was silently invisible to
+    ``BacklogManager._last_round_all_passed`` (which only counts
+    entries whose judge name is in ``ALL_REQUIRED_JUDGE_NAMES``).
+    Refusing typos at the CLI layer prevents pollution + masks.
+    """
+
+    @pytest.mark.parametrize(
+        "bad_name",
+        [
+            "judge",  # literal typo seen in production
+            "code-reviewer",  # hyphenated form (canonical is underscored)
+            "Code_Review",  # casing (canonical is lowercase)
+            "auditor",  # role that does not exist
+            "",  # empty
+        ],
+    )
+    def test_rejects_non_allowlist_judge(self, bad_name: str, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_log_verdict(bad_name, "E0-F1-S1-T1", "pass", "smoke")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "not on the allowlist" in err
+        # Error message names every valid choice so the agent can self-correct.
+        for canonical in ("code_review", "test_review", "doc_review"):
+            assert canonical in err
+
+    @pytest.mark.parametrize(
+        "good_name",
+        [
+            "code_review",
+            "test_review",
+            "doc_review",
+            "changes_manifest",
+            "security_review",
+            "executor",  # audit-only workflow agent
+            "blocker_resolver",  # audit-only workflow agent
+            "manifest_amender",
+            "task_factory",
+        ],
+    )
+    def test_accepts_allowlist_judges(self, good_name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        # Build a minimal workspace so the verdict-write reaches its
+        # successful return path. Failure here would surface as a
+        # non-zero rc with stderr; we assert rc==0 to prove the
+        # allowlist gate did not trip.
+        backlog_root = tmp_path / "backlog"
+        story_dir = backlog_root / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+        (story_dir / "E0-F1-S1-T1.md").write_text(
+            "# E0-F1-S1-T1: Source\n\n## Status: in-progress\n\n## Description\n\nx\n\n## Comments\n\n",
+            encoding="utf-8",
+        )
+        backlog = tmp_path / "BACKLOG.md"
+        backlog.write_text(
+            "# Backlog\n\n"
+            "## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
+            "|------|-------|------|-------------|----------|---------|\n"
+            "| E0 | x | 0 | 1 | 0 | 0 |\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Source | Task | in-progress | None | org/repo | "
+            "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(cli, "WORKSPACE_ROOT", tmp_path)
+        monkeypatch.setattr(cli, "BACKLOG_ROOT", backlog_root)
+        monkeypatch.setattr(cli, "BACKLOG_INDEX", backlog)
+
+        rc = cli.cmd_log_verdict(good_name, "E0-F1-S1-T1", "pass", "looks good")
+        assert rc == 0
+
+
+# ---------------------------------------------------------------------------
+# log-file path resolution: fail-fast when neither JUDGE_LOG_FILE nor
+# JUDGE_WORKSPACE_ROOT is set; canonical workspace-local path otherwise
+# ---------------------------------------------------------------------------
+
+
+class TestResolveLogFilePath:
+    """``_resolve_log_file_path`` is the single source of truth for which
+    log file ``devbench report`` reads. Removing the silent source-tree
+    fallback prevents the BACKLOG-vs-throughput divergence reported by
+    operators (they ran ``devbench report`` from a sub-shell that
+    inherited ``JUDGE_WORKSPACE_ROOT`` but not ``JUDGE_LOG_FILE`` and got
+    an unrelated dev-tree log instead of their workspace's log).
+    """
+
+    def test_explicit_judge_log_file_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("JUDGE_LOG_FILE", "/tmp/my-explicit.log")
+        monkeypatch.setenv("JUDGE_WORKSPACE_ROOT", "/tmp/some-workspace")
+        # JUDGE_LOG_FILE is the explicit override and MUST win even when
+        # JUDGE_WORKSPACE_ROOT is also set.
+        assert cli._resolve_log_file_path() == Path("/tmp/my-explicit.log")
+
+    def test_workspace_root_derives_canonical_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
+        monkeypatch.setenv("JUDGE_WORKSPACE_ROOT", "/tmp/my-workspace")
+        # Default path is <workspace>/<DEFAULT_LOG_SUBDIR>/<DEFAULT_LOG_FILENAME>.
+        # Operators running ``devbench report`` from any shell with
+        # JUDGE_WORKSPACE_ROOT inherited get the same log the
+        # orchestrator writes to.
+        from devbench.constants import DEFAULT_LOG_FILENAME, DEFAULT_LOG_SUBDIR
+
+        expected = Path("/tmp/my-workspace") / DEFAULT_LOG_SUBDIR / DEFAULT_LOG_FILENAME
+        assert cli._resolve_log_file_path() == expected
+
+    def test_empty_judge_log_file_falls_through_to_workspace_root(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Empty / whitespace-only JUDGE_LOG_FILE behaves as unset
+        # (avoids "" being treated as a valid path).
+        monkeypatch.setenv("JUDGE_LOG_FILE", "   ")
+        monkeypatch.setenv("JUDGE_WORKSPACE_ROOT", "/tmp/ws")
+        from devbench.constants import DEFAULT_LOG_FILENAME, DEFAULT_LOG_SUBDIR
+
+        expected = Path("/tmp/ws") / DEFAULT_LOG_SUBDIR / DEFAULT_LOG_FILENAME
+        assert cli._resolve_log_file_path() == expected
+
+    def test_neither_set_fails_fast(self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+        # Per CLAUDE.md "Fail-fast": no fallbacks. When neither env var
+        # is set the helper exits 1 with an actionable error rather
+        # than silently falling back to the devbench source tree's log.
+        monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
+        monkeypatch.delenv("JUDGE_WORKSPACE_ROOT", raising=False)
+        with pytest.raises(SystemExit) as excinfo:
+            cli._resolve_log_file_path()
+        assert excinfo.value.code == 1
+        err = capsys.readouterr().err
+        # Error names BOTH env vars and the canonical workspace-local
+        # path so the operator can self-correct from either direction.
+        assert "JUDGE_LOG_FILE" in err
+        assert "JUDGE_WORKSPACE_ROOT" in err
+
+
+# ---------------------------------------------------------------------------
+# log_file YAML config (Option 2): YAML drives both writer and reader
+# ---------------------------------------------------------------------------
+
+
+class TestResolveLogFileYamlConfig:
+    """``RUNTIME_CONFIG.log_file`` (from devbench.yaml) drives the resolver
+    when ``JUDGE_LOG_FILE`` env var is not set. This is the canonical
+    single source of truth for the orchestrator's log path; the
+    orchestrator-as-writer (``setup_logging``) and the report-as-reader
+    (``cmd_report``) both consult it so they cannot diverge.
+    """
+
+    def _runtime_config_with_log_file(self, value: str | None) -> Any:
+        import dataclasses
+
+        return dataclasses.replace(cli.RUNTIME_CONFIG, log_file=value)
+
+    def test_yaml_log_file_workspace_relative(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
+        monkeypatch.setenv("JUDGE_WORKSPACE_ROOT", "/tmp/ws")
+        monkeypatch.setattr(cli, "RUNTIME_CONFIG", self._runtime_config_with_log_file("logs/orch.log"))
+        # YAML log_file is workspace-relative when not absolute; the
+        # resolver joins it with JUDGE_WORKSPACE_ROOT.
+        assert cli._resolve_log_file_path() == Path("/tmp/ws/logs/orch.log")
+
+    def test_yaml_log_file_absolute_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
+        monkeypatch.setenv("JUDGE_WORKSPACE_ROOT", "/tmp/ws")
+        monkeypatch.setattr(cli, "RUNTIME_CONFIG", self._runtime_config_with_log_file("/var/log/d.log"))
+        # An absolute YAML path is used as-is, ignoring the workspace
+        # root (operator deliberately put the log outside the workspace).
+        assert cli._resolve_log_file_path() == Path("/var/log/d.log")
+
+    def test_explicit_judge_log_file_still_wins_over_yaml(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("JUDGE_LOG_FILE", "/tmp/explicit.log")
+        monkeypatch.setenv("JUDGE_WORKSPACE_ROOT", "/tmp/ws")
+        monkeypatch.setattr(cli, "RUNTIME_CONFIG", self._runtime_config_with_log_file("logs/orch.log"))
+        # Per-invocation env override beats both YAML config and the
+        # workspace-local convention; this matches how ``cmd_check`` and
+        # the test fixtures set the path explicitly.
+        assert cli._resolve_log_file_path() == Path("/tmp/explicit.log")
+
+    def test_yaml_unset_falls_through_to_workspace_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
+        monkeypatch.setenv("JUDGE_WORKSPACE_ROOT", "/tmp/ws")
+        monkeypatch.setattr(cli, "RUNTIME_CONFIG", self._runtime_config_with_log_file(None))
+        from devbench.constants import DEFAULT_LOG_FILENAME, DEFAULT_LOG_SUBDIR
+
+        # When neither JUDGE_LOG_FILE nor YAML log_file is set, the
+        # resolver falls back to the workspace-local convention.
+        assert cli._resolve_log_file_path() == (Path("/tmp/ws") / DEFAULT_LOG_SUBDIR / DEFAULT_LOG_FILENAME)
+
+    def test_yaml_with_no_workspace_treats_relative_as_cwd_relative(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Edge case: YAML has a relative log_file but JUDGE_WORKSPACE_ROOT
+        # is unset (very rare; only happens in test fixtures). The
+        # resolver returns the path as-is so callers can decide what
+        # to anchor it against.
+        monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
+        monkeypatch.delenv("JUDGE_WORKSPACE_ROOT", raising=False)
+        monkeypatch.setattr(cli, "RUNTIME_CONFIG", self._runtime_config_with_log_file("logs/orch.log"))
+        assert cli._resolve_log_file_path() == Path("logs/orch.log")

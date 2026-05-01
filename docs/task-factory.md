@@ -293,3 +293,42 @@ See [ADR-09](adr/09-idempotent-materialise-proposal.md) for the rationale and re
 - Orchestrator: `plugin/devbench/skills/orchestrate/SKILL.md` (step 4c).
 - Tests: `tests/test_backlog/test_proposal.py`, `tests/test_integration/test_task_factory_lifecycle.py`.
 - ADR: [ADR-03: Task factory](adr/03-task-factory.md).
+
+---
+
+## When to use `--no-dep-on-source` (post-Backlog-A lesson)
+
+`devbench promote-proposal <new-id>` defaults to wiring the source Task as a dependent on the new Task (i.e., `source.depends_on(new)`). This default fits the BLOCKER-resolver flow: when a Task hits a runtime block, the proposed new Task is the unconditional fix that must run first; the source then retries.
+
+The default is WRONG when the proposed new Task is a TEST that validates the source Task's output. In that pattern, the source must run first (to produce the artifact), then the test verifies it. Wiring `source.depends_on(test)` creates a circular structural dependency: the source waits on the test, the test waits on the source's artifact to assert against.
+
+### Pattern: test-validates-source
+
+Symptoms:
+
+- Proposed Task title starts with "Add tests/", "Verify", "Validate", "Assert", or similar.
+- Proposed Task's `files_to_own` are all `tests/**` paths.
+- Proposed Task's ACs assert observable state of an artifact owned by the source Task.
+
+Action: pass `--no-dep-on-source` to `promote-proposal` AND wire the reverse dep:
+
+```bash
+devbench promote-proposal <new-test-id> --no-dep-on-source
+devbench add-dep <new-test-id> <source-id>
+```
+
+Now the source runs first; the test runs after; no cycle.
+
+### Worked example
+
+Observed in production at `caylent-telemetry-spec/`: T8 owned `pyproject.toml` (build-backend + bandit config); T9 was proposed to add tests asserting `[tool.bandit].exclude_dirs` exists in pyproject.toml. Default `promote-proposal` wired `T8.depends_on(T9)`, which created a cycle (T9's test needed T8's edit; T8 was waiting on T9). Fix applied: removed T8's dep on T9; added T9's dep on T8 via `devbench add-dep E0-F1-S1-T9 E0-F1-S1-T8`. T8 ran first, applied the pyproject change; T9 ran after, asserted the change.
+
+### Heuristic for `blocker-resolver` (proposal author)
+
+When authoring a proposal where the new Task is test-validates-source, set a flag in the proposal JSON:
+
+```json
+"source_dep_direction": "test_validates_source"
+```
+
+`promote-proposal` honors the flag if present (auto-applies `--no-dep-on-source` and wires the reverse dep). When the flag is absent, the default direction is preserved (backward compatible). See [`plugin/devbench/agents/blocker-resolver.md`](../plugin/devbench/agents/blocker-resolver.md) for when the agent should set this flag.

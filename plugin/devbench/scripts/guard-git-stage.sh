@@ -25,13 +25,13 @@
 
 set -euo pipefail
 
-INPUT=$(cat)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=_hook_lib.sh
+. "$SCRIPT_DIR/_hook_lib.sh"
 
-COMMAND=$(printf '%s' "$INPUT" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-print(d.get('tool_input', {}).get('command', ''))
-" 2>/dev/null || true)
+INPUT=$(cat)
+COMMAND=$(extract_command "$INPUT")
+decode_json_escapes COMMAND
 
 # No command to inspect -- allow.
 if [[ -z "$COMMAND" ]]; then
@@ -78,34 +78,28 @@ if printf '%s' "$COMMAND" | grep -qE 'git[[:space:]]+add[[:space:]]+(-A\b|--all\
   exit 0
 fi
 
-# Extract the manifest file list from the work unit. The ## Changes Manifest
-# table uses `| path | change |` rows; paths are fenced with backticks.
-MANIFEST_FILES=$(python3 -c "
-import re, sys
-from pathlib import Path
-try:
-    content = Path(sys.argv[1]).read_text(encoding='utf-8')
-except OSError:
-    sys.exit(0)
-m = re.search(r'^##\s+Changes Manifest\s*\n(.*?)(?=^##\s|\Z)', content, flags=re.MULTILINE | re.DOTALL)
-if not m:
-    sys.exit(0)
-for raw in m.group(1).splitlines():
-    line = raw.strip()
-    if not line.startswith('|'):
-        continue
-    cells = [c.strip() for c in line.strip('|').split('|')]
-    # Skip header + separator rows.
-    if len(cells) < 2:
-        continue
-    if cells[0].lower() == 'file':
-        continue
-    if all(set(c.strip(':')) <= set('-') and c.strip(':') for c in cells):
-        continue
-    path = cells[0].strip('\`').strip()
-    if path:
-        print(path)
-" "${CURRENT_WORK_UNIT_FILE}" 2>/dev/null || true)
+# Extract the manifest file list from the work unit. The
+# ``## Changes Manifest`` table uses ``| path | change |`` rows; paths
+# are fenced with backticks. awk is universally available and works
+# reliably under any PATH (asdf shims have caused python3 to silently
+# return empty in the hook host environment, defeating the guard).
+MANIFEST_FILES=$(awk '
+  /^##[[:space:]]+Changes Manifest[[:space:]]*$/ { in_section = 1; next }
+  in_section && /^##[[:space:]]/ { in_section = 0 }
+  !in_section { next }
+  # Skip table header and separator rows.
+  $0 ~ /^\|[[:space:]]*[Ff]ile[[:space:]]*\|/ { next }
+  $0 ~ /^\|[[:space:]]*-+/ { next }
+  /^\|/ {
+    # First cell is between the leading "|" and the next "|".
+    line = $0
+    sub(/^\|[[:space:]]*/, "", line)
+    sub(/[[:space:]]*\|.*$/, "", line)
+    # Strip surrounding backticks.
+    gsub(/^`|`$/, "", line)
+    if (length(line) > 0) print line
+  }
+' "${CURRENT_WORK_UNIT_FILE}" 2>/dev/null || true)
 
 # If the manifest couldn't be parsed, allow (fail-open on parse failure;
 # the commit-time assertion will catch scope violations regardless).
@@ -113,25 +107,29 @@ if [[ -z "$MANIFEST_FILES" ]]; then
   exit 0
 fi
 
-# Extract the paths the command is trying to add.
-TARGET_PATHS=$(printf '%s' "$COMMAND" | python3 -c "
-import shlex, sys
-try:
-    tokens = shlex.split(sys.stdin.read())
-except ValueError:
-    sys.exit(0)
-# Find 'git add' then emit every subsequent non-flag token.
-try:
-    i = tokens.index('add')
-except ValueError:
-    sys.exit(0)
-for t in tokens[i+1:]:
-    if t == '--':
-        continue
-    if t.startswith('-'):
-        continue
-    print(t)
-" 2>/dev/null || true)
+# Extract the paths the command is trying to add.  Pure-bash word
+# splitting -- the previous shlex-based extractor failed silently when
+# python3 could not be resolved (asdf shim PATH miss), allowing every
+# git-add to skip the manifest-scope check.
+read -ra ADD_TOKENS <<< "$COMMAND"
+ADD_IDX=-1
+for i in "${!ADD_TOKENS[@]}"; do
+  if [[ "${ADD_TOKENS[$i]}" == "add" ]]; then
+    ADD_IDX=$i
+    break
+  fi
+done
+TARGET_PATHS=""
+if (( ADD_IDX >= 0 )); then
+  for (( i = ADD_IDX + 1; i < ${#ADD_TOKENS[@]}; i++ )); do
+    tok="${ADD_TOKENS[$i]}"
+    # Skip ``--`` argument terminator and any flags.
+    if [[ "$tok" == "--" || "$tok" == -* ]]; then
+      continue
+    fi
+    TARGET_PATHS+="${tok}"$'\n'
+  done
+fi
 
 if [[ -z "$TARGET_PATHS" ]]; then
   exit 0

@@ -1842,3 +1842,56 @@ class TestVNextCanonicalConfig:
         )
         with pytest.raises(ValueError, match="schema validation"):
             load_runtime_config(cfg, {})
+
+
+@pytest.mark.unit
+class TestSampleConfigCompleteness:
+    """Verify ``sample-config.yaml`` documents every YAML field defined in the schema."""
+
+    def test_sample_config_exists(self) -> None:
+        """The sample-config.yaml file must exist at the repo root."""
+        assert (Path(__file__).parent.parent / "sample-config.yaml").is_file()
+
+    def test_sample_config_loads_cleanly(self, tmp_path: Path) -> None:
+        """Parsing the sample-config.yaml must not raise.
+
+        The fixture is the canonical reference -- if it fails schema
+        validation or any of the loader's cross-field checks, operators
+        copying it as a starting point would hit the same failure.
+        """
+        sample_path = Path(__file__).parent.parent / "sample-config.yaml"
+        rt = load_runtime_config(sample_path, {})
+        # Sanity: the v-next defaults that operators rely on are present.
+        assert rt.git_ops.inline_orphan_cleanup is True
+        assert rt.git_ops.ci_failure_retry is True
+        assert rt.git_ops.pause_before_merge is False
+
+    def test_sample_config_documents_every_top_level_schema_property(self) -> None:
+        """Every top-level property in config-schema.json appears in sample-config.yaml.
+
+        Walks the schema's `properties:` map and asserts each name appears
+        somewhere in the sample (commented-out lines count -- the goal is
+        documentation completeness, not active configuration). When a new
+        schema field is added, the operator is forced to also update the
+        sample so the canonical reference stays in sync.
+        """
+        import json as _json
+        import re as _re
+
+        schema_path = Path(__file__).parent.parent / "src" / "devbench" / "config-schema.json"
+        with schema_path.open(encoding="utf-8") as fh:
+            schema = _json.load(fh)
+        sample_path = Path(__file__).parent.parent / "sample-config.yaml"
+        sample_text = sample_path.read_text(encoding="utf-8")
+        # Strip comment markers so commented-out fields still count as documented.
+        decommented = _re.sub(r"^\s*#\s?", "", sample_text, flags=_re.MULTILINE)
+        missing = [
+            field_name
+            for field_name in schema.get("properties", {})
+            if not _re.search(rf"^{_re.escape(field_name)}:", decommented, _re.MULTILINE)
+        ]
+        assert not missing, (
+            f"sample-config.yaml is missing top-level schema field(s): {missing}. "
+            "Every schema-known field must appear in the sample-config so the "
+            "canonical reference covers every operator-tunable knob."
+        )

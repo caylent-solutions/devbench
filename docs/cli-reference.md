@@ -428,14 +428,16 @@ The orchestrator skill ([`plugin/devbench/skills/orchestrate/SKILL.md`](../plugi
 |----|---------|
 | 0 | PR merged (or commit landed locally in deferred mode). |
 | 1 | Hard failure -- block the task with a `[BLOCKED]` audit comment. |
-| 2 | CI failed; executor retry budget not exhausted. Audit comment `[CI_FAIL]` names the trimmed log under `.devbench/ci-failures/<id>-<n>.log`. Re-invoke the executor with `ci-fail` feedback, then re-run git-ops. (Issue #115; opt-in via `JUDGE_CI_FAILURE_RETRY_ENABLED=1`.) |
-| 3 | PR has unresolved review feedback; executor retry budget not exhausted. Audit comment `[PR_BOT_FAIL]` names the JSON feedback file under `.devbench/pr-bot-feedback/<id>-<n>.json`. Re-invoke the executor with `pr-bot` feedback, then re-run git-ops. (Issue #116; opt-in via `JUDGE_PR_REVIEW_RESOLUTION_ENABLED=1`.) |
+| 2 | CI failed; executor retry budget not exhausted. Audit comment `[CI_FAIL]` names the trimmed log under `.devbench/ci-failures/<id>-<n>.log`. Re-invoke the executor with `ci-fail` feedback, then re-run git-ops. (Issue #115; **default on**. Disable via `git_ops.ci_failure_retry: false` in `devbench.yaml` or env `JUDGE_CI_FAILURE_RETRY_ENABLED=0`.) |
+| 3 | PR has unresolved review feedback; executor retry budget not exhausted. Audit comment `[PR_BOT_FAIL]` names the JSON feedback file under `.devbench/pr-bot-feedback/<id>-<n>.json`. Re-invoke the executor with `pr-bot` feedback, then re-run git-ops. (Issue #116; opt-in. Enable via `git_ops.pr_review_resolution.enabled: true` in `devbench.yaml` or env `JUDGE_PR_REVIEW_RESOLUTION_ENABLED=1`.) |
 
 The retry budget for rc=2 / rc=3 is shared with the existing review-judge retry budget (`MAX_RETRY_ATTEMPTS`); when exhausted, git-ops returns rc=1 instead of 2/3 and writes a `[CI_FAIL_BLOCKED]` / `[PR_BOT_FAIL_BLOCKED]` marker so the operator sees the full failure surface.
 
-#### CI-failure retry (issue #115, opt-in)
+Every toggle below resolves with **env > YAML > default** precedence. Boolean env values are case-insensitive: truthy = `1`/`true`/`yes`/`on`; falsy = `0`/`false`/`no`/`off`. Any other value fails fast at process start with a `ValueError`.
 
-Set `JUDGE_CI_FAILURE_RETRY_ENABLED=1` to enable. When `wait_for_checks` reports CI failure:
+#### CI-failure retry (issue #115, default on)
+
+Default-on as of v-next; opt out via `git_ops.ci_failure_retry: false` in `devbench.yaml` (or env `JUDGE_CI_FAILURE_RETRY_ENABLED=0`). When `wait_for_checks` reports CI failure:
 
 1. `gh pr checks --json name,state,link` identifies the failing run.
 2. `gh run view <run-id> --log-failed` fetches the log; the trailing `JUDGE_CI_FAILURE_LOG_BYTES` bytes (default 32 KiB) are saved to `.devbench/ci-failures/<task-id>-<attempt>.log`.
@@ -443,6 +445,9 @@ Set `JUDGE_CI_FAILURE_RETRY_ENABLED=1` to enable. When `wait_for_checks` reports
 4. After `MAX_RETRY_ATTEMPTS` retries the path transitions to `[CI_FAIL_BLOCKED]` + rc=1.
 
 #### PR review-comment polling (issue #116, opt-in)
+
+Configure via YAML `git_ops.pr_review_resolution:` block (every sub-field
+overridable via the env vars below). Or stay env-only:
 
 Set `JUDGE_PR_REVIEW_RESOLUTION_ENABLED=1` AND configure at least one signal (a non-empty `JUDGE_PR_REVIEW_AGENTS` allowlist or `JUDGE_PR_REVIEW_DECISION_BLOCKS=1`) to enable. After `wait_for_checks` returns True, git-ops polls `gh pr view --json reviewDecision,reviews` and `gh api repos/<repo>/pulls/<n>/comments` for up to `JUDGE_PR_REVIEW_SETTLE_SECONDS` seconds (default 60), polling every `JUDGE_PR_REVIEW_POLL_INTERVAL` seconds (default 5). The poll exits early on the first signal; otherwise the merge proceeds. Knobs:
 

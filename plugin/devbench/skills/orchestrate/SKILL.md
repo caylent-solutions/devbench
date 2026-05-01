@@ -78,6 +78,12 @@ Process the backlog using the steps below, repeating until all work units are do
 
 8. `uv run devbench git-ops <id>` -- In standard mode: commit, push, create PR, wait for CI, merge. In single-branch mode (when `git_ops.defer_pr: true` in devbench.yaml): commit locally only (no push, no PR, no merge). The branch is shared across all work units.
 
+   **Exit code contract**:
+   - `0`: PR merged (or commit landed locally in deferred mode). Continue to step 9.
+   - `1`: hard failure that requires operator attention. Block the task, log a `[BLOCKED]` audit comment with the exact failure surface, return to step 2.
+   - `2` (issue #115, opt-in via `JUDGE_CI_FAILURE_RETRY_ENABLED=1`): CI failed but the executor retry budget is not exhausted. The work-unit gained a `[CI_FAIL]` audit comment naming the trimmed log path under `.devbench/ci-failures/<id>-<n>.log`. Re-invoke `devbench:executor` with a `ci-fail` feedback payload pointing at that log, then return to step 8 (git-ops will push the executor's fix and re-wait for CI). The retry budget is shared with the existing review-judge retry budget (`MAX_RETRY_ATTEMPTS`); when exhausted, git-ops returns `1` instead of `2`.
+   - `3` (issue #116, opt-in via `JUDGE_PR_REVIEW_RESOLUTION_ENABLED=1`): the PR has unresolved review feedback (`reviewDecision == CHANGES_REQUESTED`, or unresolved comments authored by an agent in `JUDGE_PR_REVIEW_AGENTS`). The work-unit gained a `[PR_BOT_FAIL]` audit comment naming the JSON feedback file under `.devbench/pr-bot-feedback/<id>-<n>.json`. Re-invoke `devbench:executor` with a `pr-bot` feedback payload pointing at that file, then return to step 8. Same shared retry budget; exhaustion -> `1`.
+
 9. `uv run devbench mark-done <id>` -- mark the unit done (enforces done-gate).
 
 10. Return to step 1.

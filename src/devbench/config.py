@@ -35,10 +35,13 @@ from devbench.constants import (
     DEFAULT_CACHE_WRITE_5MIN_MULTIPLIER,
     DEFAULT_CHECK_REGISTRATION_DELAY_SECONDS,
     DEFAULT_CHECK_REGISTRATION_RETRIES,
+    DEFAULT_CI_FAILURE_LOG_BYTES,
+    DEFAULT_CI_FAILURE_RETRY_ENABLED,
     DEFAULT_COMMAND_TIMEOUT,
     DEFAULT_DATA_RESIDENCY_MULTIPLIER,
     DEFAULT_GH_API_TIMEOUT,
     DEFAULT_GITHUB_CHECK_TIMEOUT_SECONDS,
+    DEFAULT_INLINE_ORPHAN_CLEANUP_ENABLED,
     DEFAULT_LLM_EVIDENCE_TRUNCATION,
     DEFAULT_LLM_FILE_CONTEXT_LIMIT,
     DEFAULT_LLM_FILE_PREVIEW_CHARS,
@@ -46,6 +49,11 @@ from devbench.constants import (
     DEFAULT_MAX_RETRY_ATTEMPTS,
     DEFAULT_ORCHESTRATOR_POLL_INTERVAL,
     DEFAULT_OUTPUT_TRUNCATION_LIMIT,
+    DEFAULT_PR_REVIEW_AGENTS,
+    DEFAULT_PR_REVIEW_DECISION_BLOCKS,
+    DEFAULT_PR_REVIEW_POLL_INTERVAL,
+    DEFAULT_PR_REVIEW_RESOLUTION_ENABLED,
+    DEFAULT_PR_REVIEW_SETTLE_SECONDS,
     DEFAULT_RECENT_PACE_TASKS,
     DEFAULT_SECURITY_FETCH_TIMEOUT,
     DEFAULT_STOP_HOOK_MAX_BLOCKS,
@@ -99,6 +107,28 @@ def _resolve_optional_str(env_var: str, yaml_value: str | None) -> str | None:
     if yaml_value:
         return yaml_value
     return None
+
+
+def _env_truthy(env_var: str) -> bool:
+    """Return True iff the given environment variable is set to a truthy string.
+
+    Truthy strings are ``1``, ``true``, ``yes`` (case-insensitive). Empty or
+    unset returns False. Used for opt-out flags whose env var represents the
+    *negative* of the resolved boolean (e.g. ``DEVBENCH_DISABLE_*``).
+    """
+    return os.environ.get(env_var, "").strip().lower() in ("1", "true", "yes")
+
+
+def _resolve_str_tuple(env_var: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    """Resolve a tuple of strings from a comma-separated env var.
+
+    Empty / unset returns *default*. Whitespace around each item is stripped;
+    empty items are dropped.
+    """
+    raw = os.environ.get(env_var, "").strip()
+    if not raw:
+        return default
+    return tuple(item.strip() for item in raw.split(",") if item.strip())
 
 
 def _resolve_float(env_var: str | None, yaml_value: float | None, default: float) -> float:
@@ -204,6 +234,43 @@ CHECK_REGISTRATION_DELAY_SECONDS: int = _resolve_int(
 # iteration cadence is slower than the default 30-minute window.
 BLOCKED_RECOVERY_WINDOW_SECONDS: int = _resolve_int(
     "JUDGE_BLOCKED_RECOVERY_WINDOW_SECONDS", None, DEFAULT_BLOCKED_RECOVERY_WINDOW_SECONDS
+)
+# Phase 1: inline orphan-cleanup default. ``True`` makes ``cmd_git_ops`` run
+# the cleanup as a chore commit during git-ops; ``False`` falls back to the
+# legacy proposal-task path (with cross-task de-duplication). Operators set
+# ``DEVBENCH_DISABLE_INLINE_ORPHAN_CLEANUP=1`` to opt out.
+INLINE_ORPHAN_CLEANUP_ENABLED: bool = DEFAULT_INLINE_ORPHAN_CLEANUP_ENABLED and not _env_truthy(
+    "DEVBENCH_DISABLE_INLINE_ORPHAN_CLEANUP"
+)
+# Phase 2 (#115): CI-failure feedback log byte cap. Caps the size of the
+# trimmed failing-job log written to ``.devbench/ci-failures/<id>-<n>.log``
+# so the executor's feedback payload stays bounded.
+CI_FAILURE_LOG_BYTES: int = _resolve_int("JUDGE_CI_FAILURE_LOG_BYTES", None, DEFAULT_CI_FAILURE_LOG_BYTES)
+# Phase 2 (#115): opt-in toggle for the CI-failure executor retry path.
+# When False, ``cmd_git_ops`` returns rc=1 BLOCKED on CI failure (legacy
+# behaviour). When True, it returns rc=2 to signal the orchestrator to
+# re-invoke the executor with the failing job log as feedback, bounded by
+# ``MAX_RETRY_ATTEMPTS``.
+CI_FAILURE_RETRY_ENABLED: bool = DEFAULT_CI_FAILURE_RETRY_ENABLED or _env_truthy("JUDGE_CI_FAILURE_RETRY_ENABLED")
+# Phase 3 (#116): PR review-comment polling controls. ``PR_REVIEW_AGENTS``
+# empty + ``PR_REVIEW_DECISION_BLOCKS`` False makes the entire phase a no-op;
+# the merge proceeds immediately after CI passes. Tune both for repos that
+# wire up Copilot / Q-Dev / internal review bots.
+PR_REVIEW_SETTLE_SECONDS: int = _resolve_int("JUDGE_PR_REVIEW_SETTLE_SECONDS", None, DEFAULT_PR_REVIEW_SETTLE_SECONDS)
+PR_REVIEW_POLL_INTERVAL: int = _resolve_int("JUDGE_PR_REVIEW_POLL_INTERVAL", None, DEFAULT_PR_REVIEW_POLL_INTERVAL)
+PR_REVIEW_DECISION_BLOCKS: bool = (
+    DEFAULT_PR_REVIEW_DECISION_BLOCKS
+    if not os.environ.get("JUDGE_PR_REVIEW_DECISION_BLOCKS", "").strip()
+    else _env_truthy("JUDGE_PR_REVIEW_DECISION_BLOCKS")
+)
+PR_REVIEW_AGENTS: tuple[str, ...] = _resolve_str_tuple("JUDGE_PR_REVIEW_AGENTS", DEFAULT_PR_REVIEW_AGENTS)
+# Phase 3 (#116): top-level toggle for the PR review-comment polling path.
+# When False (default), the phase is a no-op regardless of agents/decision
+# settings -- preserves legacy merge cadence. Operators set
+# ``JUDGE_PR_REVIEW_RESOLUTION_ENABLED=1`` to opt in and additionally set
+# ``JUDGE_PR_REVIEW_AGENTS`` for bot-comment polling.
+PR_REVIEW_RESOLUTION_ENABLED: bool = DEFAULT_PR_REVIEW_RESOLUTION_ENABLED or _env_truthy(
+    "JUDGE_PR_REVIEW_RESOLUTION_ENABLED"
 )
 _claude_model = os.environ.get("JUDGE_CLAUDE_MODEL", "")
 if not _claude_model:

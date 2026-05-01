@@ -1717,23 +1717,192 @@ def _orphan_paths_for_repo(unit_id: str, repo_path: Path) -> list[str] | None:
 
 
 def _emit_orphan_cleanup_proposal_if_needed(unit_id: str, unit: WorkUnit, repo_path: Path) -> bool:
-    """Self-defending git-ops gate: refuse pollution, auto-emit a cleanup proposal.
+    """Self-defending git-ops gate: refuse pollution, recover the cleanup inline.
 
-    Detects staged paths matching standard build/state ignore patterns
-    (terraform state, terragrunt cache, Python pycache, coverage, etc.)
-    OR pre-existing tracked paths matching the same shapes. On any
-    detection, writes a proposal authorising a follow-up cleanup task
-    in the same Story, materialises and promotes it (auto-wiring the
-    current task as a dependent), and returns ``True`` so the caller
-    refuses the commit.
+    Two modes (Phase 1 of the orphan-cascade fix):
 
-    Returns ``False`` (continue with commit) when no orphans are
-    detected. Idempotent: a proposal already-on-disk for *unit_id*
-    short-circuits without rewriting it.
+    1. **Inline-cleanup mode (default)**: when ``INLINE_ORPHAN_CLEANUP_ENABLED``
+       is True, run ``cleanup_tracked_orphans`` programmatically and commit the
+       result as a devbench-authored chore commit on the task's branch, then
+       return ``False`` so the caller continues with the original task's
+       commit. No backlog proposal is emitted; the cleanup is not a work unit.
+       This collapses the cascade where multiple parents emitted duplicate
+       cleanup proposals and those proposals themselves got blocked by the
+       manifest amender on predecessor staging.
 
-    The cleanup task's executor runs ``devbench cleanup-tracked-orphans
-    <repo>`` to untrack the offending paths and write the
-    devbench-managed ``.gitignore`` block.
+    2. **Legacy proposal mode**: when the operator sets
+       ``DEVBENCH_DISABLE_INLINE_ORPHAN_CLEANUP=1`` (audit-driven backlogs that
+       require a work unit per cleanup), the original behaviour applies:
+       allocate a cleanup task ID, materialise the proposal, auto-wire the
+       parent as ``BLOCKED_PENDING_PROPOSAL``. Cross-task de-duplication is
+       added so two parents detecting the same orphan set wire to the SAME
+       cleanup task instead of emitting duplicates.
+
+    Returns ``False`` (continue with commit) when no orphans are detected
+    OR when inline cleanup succeeds. Returns ``True`` (refuse) only on
+    legacy-mode emit or hard failure of the inline path.
+    """
+    from devbench.config import INLINE_ORPHAN_CLEANUP_ENABLED
+
+    detected = _orphan_paths_for_repo(unit_id, repo_path)
+    if detected is None or not detected:
+        return False
+
+    if INLINE_ORPHAN_CLEANUP_ENABLED:
+        return _inline_orphan_cleanup_or_refuse(unit_id, repo_path, detected)
+
+    return _legacy_emit_orphan_cleanup_proposal(unit_id, unit, repo_path, detected)
+
+
+class _InlineCleanupError(RuntimeError):
+    """Raised when an inline orphan-cleanup step fails; caught at the
+    function boundary so :func:`_inline_orphan_cleanup_or_refuse` has a
+    single failure-return path (PLR0911 conformance)."""
+
+
+def _run_inline_cleanup_steps(
+    repo_path: Path,
+    detected: list[str],
+) -> tuple[bool, object]:
+    """Inner steps for inline orphan cleanup. Returns (cleanup_committed, report).
+
+    Raises :class:`_InlineCleanupError` on any subprocess failure so the
+    caller can convert to a single refuse-return.
+    """
+    from devbench.constants import DEVBENCH_INLINE_CLEANUP_COMMIT_MESSAGE
+    from devbench.git_orphans import cleanup_tracked_orphans
+    from devbench.github.git_ops import GitOpsService
+
+    ops = GitOpsService()
+    try:
+        _, staged_out, _ = ops._git(["diff", "--cached", "--name-only"], repo_path)
+    except RuntimeError as exc:
+        raise _InlineCleanupError(f"could not read pre-cleanup staged paths: {exc}") from exc
+    pre_cleanup_staged = [line.strip() for line in staged_out.splitlines() if line.strip()]
+    orphan_set = set(detected)
+    paths_to_restore = [p for p in pre_cleanup_staged if p not in orphan_set]
+
+    try:
+        ops._git(["reset", "HEAD", "--"], repo_path)
+    except RuntimeError as exc:
+        raise _InlineCleanupError(f"git reset HEAD failed: {exc}") from exc
+
+    try:
+        report = cleanup_tracked_orphans(repo_path)
+    except (FileNotFoundError, subprocess.CalledProcessError, RuntimeError) as exc:
+        raise _InlineCleanupError(f"cleanup_tracked_orphans failed: {exc}") from exc
+
+    cleanup_committed = False
+    if report.gitignore_updated:
+        try:
+            ops._git(
+                ["add", "--", str(report.gitignore_path.relative_to(repo_path))],
+                repo_path,
+            )
+        except RuntimeError as exc:
+            raise _InlineCleanupError(f"could not stage .gitignore: {exc}") from exc
+
+    if report.removed or report.gitignore_updated:
+        try:
+            ops._git(
+                ["commit", "-m", DEVBENCH_INLINE_CLEANUP_COMMIT_MESSAGE],
+                repo_path,
+            )
+            cleanup_committed = True
+        except RuntimeError as exc:
+            raise _InlineCleanupError(f"cleanup commit failed: {exc}") from exc
+
+    if paths_to_restore:
+        try:
+            ops._git(["add", "-A", "--", *paths_to_restore], repo_path)
+        except RuntimeError as exc:
+            raise _InlineCleanupError(f"could not re-stage executor paths after cleanup: {exc}") from exc
+
+    return cleanup_committed, report
+
+
+def _inline_orphan_cleanup_or_refuse(
+    unit_id: str,
+    repo_path: Path,
+    detected: list[str],
+) -> bool:
+    """Run ``cleanup_tracked_orphans`` inline, commit it, preserve executor staging.
+
+    Procedure (Phase 1, approach 7):
+
+    1. Capture the executor's pre-cleanup staged paths via
+       ``git diff --cached --name-only``.
+    2. Filter out detected orphans (so we don't re-stage them after cleanup).
+    3. Reset the index to HEAD via ``git reset HEAD --``.
+    4. Run ``cleanup_tracked_orphans(repo_path)`` -- ``git rm --cached`` each
+       tracked orphan and write/extend the devbench-managed ``.gitignore``.
+    5. Stage ``.gitignore`` (the rm operations already staged the deletions).
+    6. Commit with the canonical chore message.
+    7. Re-stage the executor's filtered staging set so the downstream
+       ``assert_staged_matches_manifest`` runs against the executor's intent
+       (minus orphans).
+
+    Returns ``False`` on success (caller continues with the task commit) or
+    ``True`` on hard failure (caller refuses the task commit).
+    """
+    try:
+        cleanup_committed, report = _run_inline_cleanup_steps(repo_path, detected)
+    except _InlineCleanupError as exc:
+        logger.warning("inline orphan cleanup refused commit for %s: %s", unit_id, exc)
+        sample = ", ".join(detected[:5])
+        if len(detected) > 5:
+            sample += f", and {len(detected) - 5} more"
+        print(
+            f"ERROR: git-ops refused -- inline orphan cleanup failed for {unit_id} "
+            f"({len(detected)} detected, sample: {sample}). Reason: {exc}. "
+            "Run 'devbench cleanup-tracked-orphans <repo>' manually, commit "
+            "the result, then re-invoke git-ops to resume.",
+            file=sys.stderr,
+        )
+        return True
+
+    if cleanup_committed:
+        logger.info(
+            "git-ops: inline-cleaned %d orphan(s) for %s (%d removed, gitignore %s)",
+            len(detected),
+            unit_id,
+            len(report.removed),  # type: ignore[attr-defined]
+            "updated" if report.gitignore_updated else "unchanged",  # type: ignore[attr-defined]
+        )
+        sample = ", ".join(detected[:5])
+        if len(detected) > 5:
+            sample += f", and {len(detected) - 5} more"
+        print(
+            f"git-ops: inline-cleaned {len(detected)} orphan path(s) "
+            f"(sample: {sample}); cleanup chore commit landed; "
+            "continuing with task commit.",
+            file=sys.stderr,
+        )
+    else:
+        logger.info(
+            "git-ops: orphan-cleanup no-op for %s (detected %d but cleanup yielded "
+            "no commit -- staged-only orphans now ignored via existing .gitignore); "
+            "continuing with task commit",
+            unit_id,
+            len(detected),
+        )
+    return False
+
+
+def _legacy_emit_orphan_cleanup_proposal(
+    unit_id: str,
+    unit: WorkUnit,
+    repo_path: Path,
+    detected: list[str],
+) -> bool:
+    """Legacy proposal-emit path (gated behind ``DEVBENCH_DISABLE_INLINE_ORPHAN_CLEANUP=1``).
+
+    Adds cross-task de-duplication that the original implementation lacked:
+    if any pending proposal under ``<workspace>/.devbench/proposals/*.json``
+    already targets ``.gitignore`` with an orphan-cleanup rejection_reason
+    overlapping the current detection set, this function reuses that proposal
+    (auto-wires the current parent as ``BLOCKED_PENDING_PROPOSAL`` against
+    the existing cleanup task) instead of allocating a new one.
     """
     from devbench.backlog.proposal import (
         Proposal,
@@ -1745,10 +1914,6 @@ def _emit_orphan_cleanup_proposal_if_needed(unit_id: str, unit: WorkUnit, repo_p
         proposal_path,
         write_proposal,
     )
-
-    detected = _orphan_paths_for_repo(unit_id, repo_path)
-    if detected is None or not detected:
-        return False
 
     proposal_file = proposal_path(WORKSPACE_ROOT, unit_id)
     if proposal_file.exists():
@@ -1762,6 +1927,30 @@ def _emit_orphan_cleanup_proposal_if_needed(unit_id: str, unit: WorkUnit, repo_p
             f"would pollute the commit (e.g. {detected[0]!r}). "
             f"Cleanup proposal already pending at {proposal_file}; "
             f"the cascade will handle it on the next iteration.",
+            file=sys.stderr,
+        )
+        return True
+
+    existing_cleanup = _find_existing_cleanup_proposal(detected)
+    if existing_cleanup is not None:
+        wired = _wire_orphan_cleanup_dep_chain(
+            new_id=existing_cleanup,
+            files_to_own=[".gitignore"],
+            unit_repo=unit.repo or "",
+        )
+        logger.info(
+            "git-ops: orphan detection for %s reuses existing cleanup task %s "
+            "(de-duplication; wired %d peer claimants)",
+            unit_id,
+            existing_cleanup,
+            len(wired),
+        )
+        sample = ", ".join(detected[:5])
+        print(
+            f"ERROR: git-ops refused -- {len(detected)} build/state artifact path(s) "
+            f"would pollute the commit (sample: {sample}). "
+            f"Existing cleanup task {existing_cleanup} already covers this orphan set; "
+            f"{unit_id} wired as dependent (no duplicate emit).",
             file=sys.stderr,
         )
         return True
@@ -1883,6 +2072,308 @@ def _emit_orphan_cleanup_proposal_if_needed(unit_id: str, unit: WorkUnit, repo_p
         file=sys.stderr,
     )
     return True
+
+
+def _find_existing_cleanup_proposal(detected: list[str]) -> str | None:
+    """Return the suggested_id of any pending orphan-cleanup proposal, else None.
+
+    Cross-task de-duplication for the legacy proposal flow (Phase 1 secondary
+    fix). Scans ``<workspace>/.devbench/proposals/*.json`` and returns the
+    first proposal whose ``proposed_tasks[].files_to_own`` includes
+    ``.gitignore`` -- the canonical signature of an orphan-cleanup proposal
+    emitted by :func:`_legacy_emit_orphan_cleanup_proposal`. Since
+    ``cleanup_tracked_orphans`` cleans by pattern (not by specific path list),
+    any in-flight cleanup proposal resolves any orphan that matches the same
+    pattern set, so wiring the current parent to that existing task is
+    sufficient -- no need to compare detected-path sets.
+
+    The ``detected`` argument is reserved for future overlap-set narrowing
+    when the pattern list is operator-overridable per task; today every
+    cleanup proposal targets the same global pattern set so any match is a
+    valid de-duplication target.
+    """
+    del detected  # reserved for future per-task pattern subsetting
+    proposals_dir = WORKSPACE_ROOT / ".devbench" / "proposals"
+    if not proposals_dir.is_dir():
+        return None
+    for proposal_json in sorted(proposals_dir.glob("*.json")):
+        try:
+            payload = json.loads(proposal_json.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        for proposed in payload.get("proposed_tasks") or []:
+            files_to_own = proposed.get("files_to_own") or []
+            if ".gitignore" in files_to_own:
+                suggested_id = proposed.get("suggested_id")
+                if isinstance(suggested_id, str) and suggested_id:
+                    return suggested_id
+    return None
+
+
+def _count_ci_fail_attempts(wu_file: Path | None) -> int:
+    """Return the number of ``[CI_FAIL]`` audit entries in *wu_file*.
+
+    Used by :func:`_handle_ci_failure` to decide whether to keep retrying
+    (rc=2) or transition to BLOCKED (rc=1) based on the shared retry budget
+    (``MAX_RETRY_ATTEMPTS``). Returns 0 when *wu_file* is None or unreadable.
+    """
+    if wu_file is None or not wu_file.is_file():
+        return 0
+    try:
+        content = wu_file.read_text(encoding="utf-8")
+    except OSError:
+        return 0
+    return content.count("[CI_FAIL]")
+
+
+def _emit_ci_failure_feedback(
+    ops: object,
+    unit_id: str,
+    canonical_repo: str,
+    pr_number: int,
+    repo_path: Path,
+    attempt: int,
+) -> tuple[Path | None, str]:
+    """Fetch the failing run log, write it to disk, return (path, summary).
+
+    Returns ``(None, generic_summary)`` when the run-id or log fetch fails;
+    the caller still emits a feedback comment so the executor knows a CI
+    failure occurred even when the log details were unavailable.
+    """
+    from devbench.config import CI_FAILURE_LOG_BYTES
+
+    summary_default = f"CI checks failed for PR #{pr_number} on {canonical_repo}; attempt {attempt}; log unavailable."
+
+    run_id = ops.get_latest_failing_run_id(  # type: ignore[attr-defined]
+        canonical_repo, pr_number, repo_path=repo_path
+    )
+    if run_id is None:
+        return None, summary_default
+
+    log_text = ops.fetch_run_log(  # type: ignore[attr-defined]
+        canonical_repo, run_id, CI_FAILURE_LOG_BYTES, repo_path=repo_path
+    )
+    if not log_text.strip():
+        return None, summary_default
+
+    log_dir = WORKSPACE_ROOT / ".devbench" / "ci-failures"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"{unit_id}-{attempt}.log"
+    log_path.write_text(log_text, encoding="utf-8")
+    summary = (
+        f"CI checks failed for PR #{pr_number} on {canonical_repo} "
+        f"(run #{run_id}, attempt {attempt}); trimmed log saved to {log_path}."
+    )
+    return log_path, summary
+
+
+def _handle_ci_failure(
+    *,
+    ops: object,
+    unit_id: str,
+    canonical_repo: str,
+    pr_number: int,
+    repo_path: Path,
+    wu_file: Path | None,
+    mgr: object,
+) -> int:
+    """Issue #115 dispatch: CI failure -> rc=2 retry signal or rc=1 BLOCKED.
+
+    When ``CI_FAILURE_RETRY_ENABLED`` is False, returns rc=1 with the
+    legacy error message (backward compatible). When True, fetches the
+    failing run log, writes it under ``.devbench/ci-failures/``, appends a
+    ``[CI_FAIL]`` audit comment, and returns rc=2 if the per-task attempt
+    count is below ``MAX_RETRY_ATTEMPTS`` -- otherwise rc=1 with the
+    exhaustion error.
+    """
+    from devbench.config import CI_FAILURE_RETRY_ENABLED, MAX_RETRY_ATTEMPTS
+
+    if not CI_FAILURE_RETRY_ENABLED:
+        print(f"ERROR: CI checks failed for PR #{pr_number} on {canonical_repo}", file=sys.stderr)
+        return 1
+
+    attempts_so_far = _count_ci_fail_attempts(wu_file)
+    next_attempt = attempts_so_far + 1
+    log_path, summary = _emit_ci_failure_feedback(
+        ops=ops,
+        unit_id=unit_id,
+        canonical_repo=canonical_repo,
+        pr_number=pr_number,
+        repo_path=repo_path,
+        attempt=next_attempt,
+    )
+
+    if wu_file is not None:
+        marker = "[CI_FAIL_BLOCKED]" if next_attempt >= MAX_RETRY_ATTEMPTS else "[CI_FAIL]"
+        message = f"{marker} {summary}"
+        mgr._append_agent_comment(wu_file, "git_ops", message)  # type: ignore[attr-defined]
+
+    if next_attempt >= MAX_RETRY_ATTEMPTS:
+        print(
+            f"ERROR: CI checks failed for PR #{pr_number} on {canonical_repo} "
+            f"after {next_attempt} executor retry/retries (budget exhausted at "
+            f"MAX_RETRY_ATTEMPTS={MAX_RETRY_ATTEMPTS}). {summary}. "
+            "Task BLOCKED; operator review required.",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(
+        json.dumps(
+            {
+                "unit_id": unit_id,
+                "ci_retry": True,
+                "attempt": next_attempt,
+                "max_attempts": MAX_RETRY_ATTEMPTS,
+                "log_path": str(log_path) if log_path is not None else None,
+                "pr_number": pr_number,
+            }
+        )
+    )
+    return 2
+
+
+def _handle_pr_review_resolution(
+    *,
+    ops: object,
+    unit_id: str,
+    canonical_repo: str,
+    pr_number: int,
+    repo_path: Path,
+    wu_file: Path | None,
+    mgr: object,
+) -> int:
+    """Issue #116 dispatch: poll PR review state before merge.
+
+    Returns 0 when the merge may proceed (no unresolved bot comments / review
+    decisions, or the phase is disabled). Returns 3 when the executor must
+    be re-invoked to address the unresolved review feedback. Returns 1 when
+    the retry budget is exhausted -> BLOCKED.
+
+    No-op fast path: when ``PR_REVIEW_RESOLUTION_ENABLED`` is False (default)
+    OR both ``PR_REVIEW_AGENTS`` is empty and ``PR_REVIEW_DECISION_BLOCKS`` is
+    False, the phase is disabled and returns 0 immediately.
+    """
+    from devbench.config import (
+        MAX_RETRY_ATTEMPTS,
+        PR_REVIEW_AGENTS,
+        PR_REVIEW_DECISION_BLOCKS,
+        PR_REVIEW_POLL_INTERVAL,
+        PR_REVIEW_RESOLUTION_ENABLED,
+        PR_REVIEW_SETTLE_SECONDS,
+    )
+
+    if not PR_REVIEW_RESOLUTION_ENABLED:
+        return 0
+    if not PR_REVIEW_AGENTS and not PR_REVIEW_DECISION_BLOCKS:
+        return 0
+
+    resolution = ops.poll_pr_review_resolution(  # type: ignore[attr-defined]
+        canonical_repo,
+        pr_number,
+        repo_path=repo_path,
+        agents=PR_REVIEW_AGENTS,
+        decision_blocks=PR_REVIEW_DECISION_BLOCKS,
+        settle_seconds=PR_REVIEW_SETTLE_SECONDS,
+        poll_interval=PR_REVIEW_POLL_INTERVAL,
+    )
+    if resolution.resolved:
+        return 0
+
+    attempts_so_far = _count_pr_bot_retry_attempts(wu_file)
+    next_attempt = attempts_so_far + 1
+    feedback_path = _emit_pr_bot_feedback(unit_id, pr_number, resolution, next_attempt)
+
+    if wu_file is not None:
+        marker = "[PR_BOT_FAIL_BLOCKED]" if next_attempt >= MAX_RETRY_ATTEMPTS else "[PR_BOT_FAIL]"
+        summary = (
+            f"PR #{pr_number} has unresolved review feedback (attempt {next_attempt}); "
+            f"reviewDecision={resolution.review_decision!r}, "
+            f"unresolved_bot_comments={len(resolution.unresolved_comments)}, "
+            f"unresolved_reviews={len(resolution.unresolved_reviews)}; "
+            f"feedback payload at {feedback_path}."
+        )
+        mgr._append_agent_comment(wu_file, "git_ops", f"{marker} {summary}")  # type: ignore[attr-defined]
+
+    if next_attempt >= MAX_RETRY_ATTEMPTS:
+        print(
+            f"ERROR: PR #{pr_number} on {canonical_repo} has unresolved review "
+            f"feedback after {next_attempt} executor retry/retries "
+            f"(budget exhausted at MAX_RETRY_ATTEMPTS={MAX_RETRY_ATTEMPTS}). "
+            f"Feedback payload at {feedback_path}. Task BLOCKED; operator review required.",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(
+        json.dumps(
+            {
+                "unit_id": unit_id,
+                "pr_bot_retry": True,
+                "attempt": next_attempt,
+                "max_attempts": MAX_RETRY_ATTEMPTS,
+                "feedback_path": str(feedback_path),
+                "pr_number": pr_number,
+                "review_decision": resolution.review_decision,
+            }
+        )
+    )
+    return 3
+
+
+def _count_pr_bot_retry_attempts(wu_file: Path | None) -> int:
+    """Return the number of ``[PR_BOT_FAIL]`` audit entries in *wu_file*."""
+    if wu_file is None or not wu_file.is_file():
+        return 0
+    try:
+        content = wu_file.read_text(encoding="utf-8")
+    except OSError:
+        return 0
+    return content.count("[PR_BOT_FAIL]")
+
+
+def _emit_pr_bot_feedback(
+    unit_id: str,
+    pr_number: int,
+    resolution: object,
+    attempt: int,
+) -> Path:
+    """Write the ``pr-bot`` feedback payload to ``.devbench/pr-bot-feedback/``.
+
+    The payload is a JSON document the executor can read to understand which
+    review threads need addressing. Format mirrors the ``review-fail`` shape
+    used elsewhere in the orchestrator.
+    """
+    feedback_dir = WORKSPACE_ROOT / ".devbench" / "pr-bot-feedback"
+    feedback_dir.mkdir(parents=True, exist_ok=True)
+    feedback_path = feedback_dir / f"{unit_id}-{attempt}.json"
+    payload = {
+        "unit_id": unit_id,
+        "pr_number": pr_number,
+        "attempt": attempt,
+        "review_decision": getattr(resolution, "review_decision", None),
+        "unresolved_reviews": [
+            {
+                "reviewer": r.get("reviewer", ""),
+                "state": r.get("state", ""),
+                "body": r.get("body", ""),
+                "submitted_at": r.get("submitted_at", ""),
+            }
+            for r in getattr(resolution, "unresolved_reviews", [])
+        ],
+        "unresolved_comments": [
+            {
+                "author": c.get("author", ""),
+                "path": c.get("path", ""),
+                "line": c.get("line", 0),
+                "body": c.get("body", ""),
+                "created_at": c.get("created_at", ""),
+            }
+            for c in getattr(resolution, "unresolved_comments", [])
+        ],
+    }
+    feedback_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return feedback_path
 
 
 def _wire_orphan_cleanup_dep_chain(
@@ -2067,7 +2558,6 @@ def cmd_git_ops(unit_id: str) -> int:
     mgr = BacklogManager()
 
     from devbench.backlog.manifest import assert_staged_matches_manifest, parse_manifest
-    from devbench.github.git_ops import ConflictingPRError
 
     # Orphan-pattern check (see _git_ops_deferred for rationale): refuse
     # the commit on detection, auto-emit cleanup proposal, return non-zero.
@@ -2099,20 +2589,76 @@ def cmd_git_ops(unit_id: str) -> int:
 
     checks_passed = ops.wait_for_checks(canonical_repo, pr_number, repo_path=repo_path)
     if not checks_passed:
-        print(f"ERROR: CI checks failed for PR #{pr_number} on {canonical_repo}", file=sys.stderr)
-        return 1
+        return _handle_ci_failure(
+            ops=ops,
+            unit_id=unit_id,
+            canonical_repo=canonical_repo,
+            pr_number=pr_number,
+            repo_path=repo_path,
+            wu_file=wu_file,
+            mgr=mgr,
+        )
+
+    # Issue #116: PR review-comment polling phase. Returns non-zero rc=3 when
+    # an agent in the configured allowlist requests changes; the executor retry
+    # loop handles re-invocation. No-op (immediate merge) when the phase is
+    # disabled OR no signals are configured.
+    review_rc = _handle_pr_review_resolution(
+        ops=ops,
+        unit_id=unit_id,
+        canonical_repo=canonical_repo,
+        pr_number=pr_number,
+        repo_path=repo_path,
+        wu_file=wu_file,
+        mgr=mgr,
+    )
+    if review_rc != 0:
+        return review_rc
+
+    return _finalize_merge_and_submodule(
+        ops=ops,
+        unit_id=unit_id,
+        canonical_repo=canonical_repo,
+        repo_path=repo_path,
+        branch=branch,
+        pr_number=pr_number,
+        pr_url=pr_url,
+        wu_file=wu_file,
+        mgr=mgr,
+    )
+
+
+def _finalize_merge_and_submodule(
+    *,
+    ops: object,
+    unit_id: str,
+    canonical_repo: str,
+    repo_path: Path,
+    branch: str,
+    pr_number: int,
+    pr_url: str,
+    wu_file: Path | None,
+    mgr: object,
+) -> int:
+    """Merge the PR (with one CONFLICTING-state retry) and update the parent submodule.
+
+    Extracted from :func:`cmd_git_ops` so the parent function stays under
+    the project's per-function return-statement budget (PLR0911).
+    Returns 0 on success or 1 when the merge retry path itself fails.
+    """
+    from devbench.github.git_ops import ConflictingPRError
 
     try:
-        ops.merge_pr(canonical_repo, pr_number, repo_path=repo_path)
+        ops.merge_pr(canonical_repo, pr_number, repo_path=repo_path)  # type: ignore[attr-defined]
     except ConflictingPRError:
         logger.warning(
             "PR #%d on %s is CONFLICTING -- rebasing and retrying merge once",
             pr_number,
             canonical_repo,
         )
-        ops.rebase_and_force_push(canonical_repo, repo_path, branch)
+        ops.rebase_and_force_push(canonical_repo, repo_path, branch)  # type: ignore[attr-defined]
         try:
-            ops.merge_pr(canonical_repo, pr_number, repo_path=repo_path)
+            ops.merge_pr(canonical_repo, pr_number, repo_path=repo_path)  # type: ignore[attr-defined]
         except Exception as retry_exc:
             print(
                 f"ERROR: Merge retry failed for PR #{pr_number} on {canonical_repo}: {retry_exc}",
@@ -2121,15 +2667,15 @@ def cmd_git_ops(unit_id: str) -> int:
             return 1
 
     if wu_file is not None:
-        mgr._append_agent_comment(wu_file, "git_ops", f"[PR_MERGED] {pr_url}")
+        mgr._append_agent_comment(wu_file, "git_ops", f"[PR_MERGED] {pr_url}")  # type: ignore[attr-defined]
 
     logger.info("Merged PR #%d for %s", pr_number, unit_id)
 
-    ops.checkout_default_branch(canonical_repo, repo_path)
+    ops.checkout_default_branch(canonical_repo, repo_path)  # type: ignore[attr-defined]
     logger.info("Checked out default branch after merge for %s", unit_id)
 
     if UPDATE_SUBMODULE:
-        ops.update_parent_submodule_ref(
+        ops.update_parent_submodule_ref(  # type: ignore[attr-defined]
             canonical_repo,
             repo_path,
             f"chore: update {repo_path.name} submodule after {unit_id}",

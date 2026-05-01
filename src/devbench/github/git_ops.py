@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from devbench.config import (
@@ -47,6 +48,40 @@ def _list_workflow_files(repo_path: Path | None) -> list[Path]:
 
 class ConflictingPRError(RuntimeError):
     """Raised when a pull request is in CONFLICTING merge state."""
+
+
+@dataclass(frozen=True)
+class ReviewResolution:
+    """Outcome of polling a PR's review state for asynchronous bot feedback.
+
+    Used by :meth:`GitOpsService.poll_pr_review_resolution` (issue #116) to
+    decide whether ``cmd_git_ops`` should merge immediately or hand control
+    back to the orchestrator's executor-retry loop.
+
+    Attributes:
+        resolved: True iff the merge may proceed -- no blocking review
+            decision and no unresolved comments authored by an agent in
+            the configured allowlist.
+        review_decision: The PR's ``reviewDecision`` field as returned by
+            ``gh pr view --json``. One of ``APPROVED``,
+            ``CHANGES_REQUESTED``, ``REVIEW_REQUIRED``, ``COMMENTED``, or
+            empty when no decision has been recorded.
+        unresolved_reviews: List of structured review records (one per
+            REQUEST_CHANGES review). Each entry is a dict with keys
+            ``reviewer``, ``state``, ``body``, ``submitted_at``.
+        unresolved_comments: List of structured comment records (one per
+            unresolved inline / review comment authored by an allowlisted
+            bot). Each entry is a dict with keys ``author``, ``path``,
+            ``line``, ``body``, ``created_at``.
+        elapsed_seconds: How long the poll loop ran before exit. Useful
+            for telemetry / debugging.
+    """
+
+    resolved: bool
+    review_decision: str = ""
+    unresolved_reviews: list[dict[str, str | int]] = field(default_factory=list)
+    unresolved_comments: list[dict[str, str | int]] = field(default_factory=list)
+    elapsed_seconds: float = 0.0
 
 
 # Allowlist pattern for git branch names: starts with alphanumeric, allows
@@ -462,6 +497,253 @@ class GitOpsService:
             [str(p.relative_to(repo_path)) if repo_path else str(p) for p in workflow_files],
         )
         return False
+
+    def get_latest_failing_run_id(
+        self,
+        repo: str,
+        pr_number: int,
+        *,
+        repo_path: Path | None = None,
+    ) -> str | None:
+        """Return the run ID of the most recent failing CI run for *pr_number*.
+
+        Walks ``gh pr checks <num> --json name,state,link`` looking for the
+        first FAILURE / TIMED_OUT / CANCELLED check, then extracts the run
+        ID from its check-runs URL. Returns ``None`` when:
+
+        - No failing check is reported (caller should treat as "no run to
+          fetch" and skip the log fetch step entirely).
+        - ``gh`` exits non-zero or returns a JSON shape we cannot parse.
+
+        Used by :func:`devbench.cli._emit_ci_failure_feedback` (issue #115).
+        """
+        validate_repo(repo)
+        rc, stdout, _ = self._gh(
+            ["pr", "checks", str(pr_number), "--json", "name,state,link"],
+            cwd=repo_path,
+            repo=repo,
+        )
+        if rc != 0 or not stdout.strip():
+            return None
+        try:
+            import json as _json
+
+            checks = _json.loads(stdout)
+        except _json.JSONDecodeError:
+            return None
+        failing_states = {"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED"}
+        for check in checks if isinstance(checks, list) else []:
+            if not isinstance(check, dict):
+                continue
+            if check.get("state") in failing_states:
+                link = check.get("link") or ""
+                # ``link`` shape: https://github.com/<org>/<repo>/actions/runs/<id>/job/<job-id>
+                # Extract the run ID -- the segment after ``runs/``.
+                match = re.search(r"/actions/runs/(\d+)", str(link))
+                if match:
+                    return match.group(1)
+        return None
+
+    def fetch_run_log(
+        self,
+        repo: str,
+        run_id: str,
+        max_bytes: int,
+        *,
+        repo_path: Path | None = None,
+    ) -> str:
+        """Return the trimmed log for a failing GitHub Actions run.
+
+        Calls ``gh run view <run_id> --log-failed`` and trims the result to
+        the trailing ``max_bytes`` so the feedback payload stays bounded.
+        The trimmed-from-tail bias is intentional: failing log lines are
+        almost always at the end (test failures, lint findings, build
+        errors). Returns the empty string on subprocess failure -- the
+        caller falls back to a generic feedback message.
+        """
+        validate_repo(repo)
+        rc, stdout, _ = self._gh(
+            ["run", "view", str(run_id), "--log-failed"],
+            cwd=repo_path,
+            repo=repo,
+        )
+        if rc != 0:
+            return ""
+        if max_bytes <= 0 or len(stdout) <= max_bytes:
+            return stdout
+        # Tail-bias trim: keep the last ``max_bytes`` of the log.
+        return stdout[-max_bytes:]
+
+    def poll_pr_review_resolution(
+        self,
+        repo: str,
+        pr_number: int,
+        *,
+        repo_path: Path | None = None,
+        agents: tuple[str, ...] | list[str] = (),
+        decision_blocks: bool = True,
+        settle_seconds: int = 60,
+        poll_interval: int = 5,
+    ) -> ReviewResolution:
+        """Poll for asynchronous PR review feedback before merging (issue #116).
+
+        Calls ``gh pr view`` and ``gh api`` repeatedly within ``settle_seconds``,
+        exiting early as soon as a blocking signal appears. A blocking signal
+        is either:
+
+        - ``reviewDecision == "CHANGES_REQUESTED"`` (when *decision_blocks* is True), or
+        - one or more unresolved comments / reviews authored by a login in *agents*.
+
+        Returns a ``ReviewResolution`` describing what was found. When the
+        settle window elapses with no signal, returns ``resolved=True``.
+        """
+        validate_repo(repo)
+        agents_set = {a.strip() for a in agents if a.strip()}
+        deadline = time.monotonic() + max(0, int(settle_seconds))
+        elapsed = 0.0
+        review_decision = ""
+        unresolved_reviews: list[dict[str, str | int]] = []
+        unresolved_comments: list[dict[str, str | int]] = []
+        while True:
+            review_decision, reviews, comments = self._fetch_pr_review_state(repo, pr_number, repo_path=repo_path)
+            unresolved_reviews = self._select_unresolved_reviews(reviews, agents_set, decision_blocks, review_decision)
+            unresolved_comments = self._select_unresolved_bot_comments(comments, agents_set)
+            blocking_decision = decision_blocks and review_decision == "CHANGES_REQUESTED"
+            if blocking_decision or unresolved_reviews or unresolved_comments:
+                elapsed = max(0.0, time.monotonic() - (deadline - max(0, int(settle_seconds))))
+                return ReviewResolution(
+                    resolved=False,
+                    review_decision=review_decision,
+                    unresolved_reviews=unresolved_reviews,
+                    unresolved_comments=unresolved_comments,
+                    elapsed_seconds=elapsed,
+                )
+            now = time.monotonic()
+            if now >= deadline:
+                elapsed = max(0.0, now - (deadline - max(0, int(settle_seconds))))
+                return ReviewResolution(
+                    resolved=True,
+                    review_decision=review_decision,
+                    unresolved_reviews=[],
+                    unresolved_comments=[],
+                    elapsed_seconds=elapsed,
+                )
+            time.sleep(max(1, int(poll_interval)))
+
+    def _fetch_pr_review_state(
+        self,
+        repo: str,
+        pr_number: int,
+        *,
+        repo_path: Path | None,
+    ) -> tuple[str, list[dict[str, object]], list[dict[str, object]]]:
+        """Return ``(review_decision, reviews_list, comments_list)`` for a PR.
+
+        Uses ``gh pr view --json reviewDecision,reviews`` for the decision +
+        review list, then ``gh api repos/<repo>/pulls/<n>/comments`` for
+        inline comments. Both calls degrade to empty results on subprocess
+        failure so the caller can keep polling without raising.
+        """
+        import json as _json
+
+        rc, stdout, _ = self._gh(
+            ["pr", "view", str(pr_number), "--json", "reviewDecision,reviews"],
+            cwd=repo_path,
+            repo=repo,
+        )
+        review_decision = ""
+        reviews: list[dict[str, object]] = []
+        if rc == 0 and stdout.strip():
+            try:
+                payload = _json.loads(stdout)
+                review_decision = str(payload.get("reviewDecision") or "")
+                raw_reviews = payload.get("reviews") or []
+                if isinstance(raw_reviews, list):
+                    reviews = [r for r in raw_reviews if isinstance(r, dict)]
+            except _json.JSONDecodeError:
+                pass
+
+        rc, stdout, _ = self._gh(
+            ["api", f"repos/{repo}/pulls/{pr_number}/comments"],
+            cwd=repo_path,
+            repo=None,
+        )
+        comments: list[dict[str, object]] = []
+        if rc == 0 and stdout.strip():
+            try:
+                raw_comments = _json.loads(stdout)
+                if isinstance(raw_comments, list):
+                    comments = [c for c in raw_comments if isinstance(c, dict)]
+            except _json.JSONDecodeError:
+                pass
+
+        return review_decision, reviews, comments
+
+    @staticmethod
+    def _select_unresolved_reviews(
+        reviews: list[dict[str, object]],
+        agents: set[str],
+        decision_blocks: bool,
+        review_decision: str,
+    ) -> list[dict[str, str | int]]:
+        """Select REQUEST_CHANGES reviews that should block merge.
+
+        When *decision_blocks* is False, only reviews authored by an agent
+        in *agents* are returned. When True, every REQUEST_CHANGES review
+        is returned (since the decision itself blocks merge).
+        """
+        result: list[dict[str, str | int]] = []
+        for review in reviews:
+            state = str(review.get("state") or "")
+            if state != "CHANGES_REQUESTED":
+                continue
+            author = ""
+            author_field = review.get("author")
+            if isinstance(author_field, dict):
+                author = str(author_field.get("login") or "")
+            if not decision_blocks and review_decision != "CHANGES_REQUESTED" and author not in agents:
+                continue
+            result.append(
+                {
+                    "reviewer": author,
+                    "state": state,
+                    "body": str(review.get("body") or ""),
+                    "submitted_at": str(review.get("submittedAt") or ""),
+                }
+            )
+        return result
+
+    @staticmethod
+    def _select_unresolved_bot_comments(
+        comments: list[dict[str, object]],
+        agents: set[str],
+    ) -> list[dict[str, str | int]]:
+        """Select inline comments authored by an agent in *agents*.
+
+        Empty *agents* yields the empty list (phase no-op).
+        """
+        if not agents:
+            return []
+        result: list[dict[str, str | int]] = []
+        for comment in comments:
+            user = comment.get("user")
+            login = ""
+            if isinstance(user, dict):
+                login = str(user.get("login") or "")
+            if login not in agents:
+                continue
+            line_value = comment.get("line")
+            line_int = int(line_value) if isinstance(line_value, int) else 0
+            result.append(
+                {
+                    "author": login,
+                    "path": str(comment.get("path") or ""),
+                    "line": line_int,
+                    "body": str(comment.get("body") or ""),
+                    "created_at": str(comment.get("created_at") or ""),
+                }
+            )
+        return result
 
     def checkout_default_branch(self, repo: str, repo_path: Path) -> None:
         """Check out the default branch and pull latest changes.

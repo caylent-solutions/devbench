@@ -1048,3 +1048,245 @@ class TestGetDefaultBranch:
         with patch("devbench.github.git_ops.run_command", return_value=(0, "", "")):
             with pytest.raises(RuntimeError, match="Cannot determine default branch"):
                 judge._get_default_branch(tmp_path)
+
+
+class TestGetLatestFailingRunId:
+    """Issue #115: extract failing-run ID from gh pr checks JSON."""
+
+    def test_returns_run_id_when_failure_present(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        gh_json = (
+            '[{"name":"build","state":"SUCCESS","link":""},'
+            '{"name":"lint","state":"FAILURE","link":"https://github.com/caylent-solutions/git-repo/actions/runs/12345/job/9"}]'
+        )
+        with patch.object(judge, "_gh", return_value=(0, gh_json, "")):
+            assert judge.get_latest_failing_run_id("caylent-solutions/git-repo", 7, repo_path=tmp_path) == "12345"
+
+    def test_returns_none_when_all_passing(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        with patch.object(judge, "_gh", return_value=(0, '[{"name":"x","state":"SUCCESS","link":""}]', "")):
+            assert judge.get_latest_failing_run_id("caylent-solutions/git-repo", 7, repo_path=tmp_path) is None
+
+    def test_returns_none_on_subprocess_failure(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        with patch.object(judge, "_gh", return_value=(1, "", "boom")):
+            assert judge.get_latest_failing_run_id("caylent-solutions/git-repo", 7, repo_path=tmp_path) is None
+
+    def test_returns_none_on_invalid_json(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        with patch.object(judge, "_gh", return_value=(0, "{not json", "")):
+            assert judge.get_latest_failing_run_id("caylent-solutions/git-repo", 7, repo_path=tmp_path) is None
+
+    def test_returns_none_when_failure_has_no_run_id(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        gh_json = '[{"name":"x","state":"FAILURE","link":""}]'
+        with patch.object(judge, "_gh", return_value=(0, gh_json, "")):
+            assert judge.get_latest_failing_run_id("caylent-solutions/git-repo", 7, repo_path=tmp_path) is None
+
+    def test_skips_non_dict_entries_in_array(self, tmp_path: Path) -> None:
+        # Defensive: gh API response may include non-dict entries (e.g. nulls).
+        judge = GitOpsService()
+        gh_json = (
+            '[null, "string", {"name":"lint","state":"FAILURE","link":"https://github.com/x/y/actions/runs/77/job/9"}]'
+        )
+        with patch.object(judge, "_gh", return_value=(0, gh_json, "")):
+            assert judge.get_latest_failing_run_id("caylent-solutions/git-repo", 7, repo_path=tmp_path) == "77"
+
+
+class TestFetchRunLog:
+    """Issue #115: fetch and trim a failing run's log."""
+
+    def test_returns_full_log_when_under_cap(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        with patch.object(judge, "_gh", return_value=(0, "short log\n", "")):
+            assert judge.fetch_run_log("caylent-solutions/git-repo", "1", 1024, repo_path=tmp_path) == "short log\n"
+
+    def test_trims_to_tail_when_over_cap(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        body = "head" + ("X" * 200) + "tailtail"
+        with patch.object(judge, "_gh", return_value=(0, body, "")):
+            trimmed = judge.fetch_run_log("caylent-solutions/git-repo", "1", 8, repo_path=tmp_path)
+        assert trimmed == "tailtail"
+
+    def test_returns_empty_on_subprocess_failure(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        with patch.object(judge, "_gh", return_value=(2, "", "boom")):
+            assert judge.fetch_run_log("caylent-solutions/git-repo", "1", 1024, repo_path=tmp_path) == ""
+
+    def test_max_bytes_zero_returns_full(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        with patch.object(judge, "_gh", return_value=(0, "abc", "")):
+            assert judge.fetch_run_log("caylent-solutions/git-repo", "1", 0, repo_path=tmp_path) == "abc"
+
+
+class TestPollPrReviewResolution:
+    """Issue #116: poll PR review state for asynchronous bot feedback."""
+
+    @staticmethod
+    def _gh_view_pr(decision: str = "", reviews: list | None = None) -> str:
+        import json as _json
+
+        return _json.dumps({"reviewDecision": decision, "reviews": reviews or []})
+
+    @staticmethod
+    def _gh_comments(comments: list | None = None) -> str:
+        import json as _json
+
+        return _json.dumps(comments or [])
+
+    @staticmethod
+    def _patch_gh(judge: GitOpsService, view_payload: str, comments_payload: str):
+        def fake_gh(args, *_a, **_kw):
+            if args and args[0] == "pr":
+                return (0, view_payload, "")
+            if args and args[0] == "api":
+                return (0, comments_payload, "")
+            return (1, "", "unexpected")
+
+        return patch.object(judge, "_gh", side_effect=fake_gh)
+
+    def test_resolves_when_no_signals(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        with self._patch_gh(judge, self._gh_view_pr(decision="APPROVED"), self._gh_comments()):
+            with patch("devbench.github.git_ops.time.sleep"):
+                resolution = judge.poll_pr_review_resolution(
+                    "caylent-solutions/git-repo",
+                    7,
+                    repo_path=tmp_path,
+                    agents=("bot",),
+                    decision_blocks=True,
+                    settle_seconds=0,
+                    poll_interval=0,
+                )
+        assert resolution.resolved is True
+        assert resolution.review_decision == "APPROVED"
+
+    def test_blocks_on_changes_requested_review_decision(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        view = self._gh_view_pr(
+            decision="CHANGES_REQUESTED",
+            reviews=[{"state": "CHANGES_REQUESTED", "author": {"login": "human"}, "body": "fix x"}],
+        )
+        with self._patch_gh(judge, view, self._gh_comments()):
+            with patch("devbench.github.git_ops.time.sleep"):
+                resolution = judge.poll_pr_review_resolution(
+                    "caylent-solutions/git-repo",
+                    7,
+                    repo_path=tmp_path,
+                    agents=(),
+                    decision_blocks=True,
+                    settle_seconds=0,
+                    poll_interval=0,
+                )
+        assert resolution.resolved is False
+        assert resolution.review_decision == "CHANGES_REQUESTED"
+        assert len(resolution.unresolved_reviews) == 1
+
+    def test_blocks_on_bot_comment_in_allowlist(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        comments = [
+            {"user": {"login": "github-copilot[bot]"}, "path": "src/x.py", "line": 12, "body": "use snake_case"},
+            {"user": {"login": "human-bystander"}, "path": "src/x.py", "line": 13, "body": "nit"},
+        ]
+        with self._patch_gh(judge, self._gh_view_pr(decision="REVIEW_REQUIRED"), self._gh_comments(comments)):
+            with patch("devbench.github.git_ops.time.sleep"):
+                resolution = judge.poll_pr_review_resolution(
+                    "caylent-solutions/git-repo",
+                    7,
+                    repo_path=tmp_path,
+                    agents=("github-copilot[bot]",),
+                    decision_blocks=False,
+                    settle_seconds=0,
+                    poll_interval=0,
+                )
+        assert resolution.resolved is False
+        assert len(resolution.unresolved_comments) == 1
+        assert resolution.unresolved_comments[0]["author"] == "github-copilot[bot]"
+
+    def test_ignores_non_changes_requested_reviews(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        view = self._gh_view_pr(
+            decision="REVIEW_REQUIRED",
+            reviews=[{"state": "COMMENTED", "author": {"login": "h"}, "body": "lgtm-ish"}],
+        )
+        with self._patch_gh(judge, view, self._gh_comments()):
+            with patch("devbench.github.git_ops.time.sleep"):
+                resolution = judge.poll_pr_review_resolution(
+                    "caylent-solutions/git-repo",
+                    7,
+                    repo_path=tmp_path,
+                    agents=(),
+                    decision_blocks=True,
+                    settle_seconds=0,
+                    poll_interval=0,
+                )
+        assert resolution.resolved is True
+
+    def test_handles_invalid_json_as_empty(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        with self._patch_gh(judge, "{not json", "{not json"):
+            with patch("devbench.github.git_ops.time.sleep"):
+                resolution = judge.poll_pr_review_resolution(
+                    "caylent-solutions/git-repo",
+                    7,
+                    repo_path=tmp_path,
+                    agents=("bot",),
+                    decision_blocks=True,
+                    settle_seconds=0,
+                    poll_interval=0,
+                )
+        assert resolution.resolved is True
+
+    def test_polls_multiple_times_within_settle_window(self, tmp_path: Path) -> None:
+        """The settle loop sleeps + retries when no signal appears; poll runs at
+        least twice when settle_seconds > 0."""
+        judge = GitOpsService()
+        with self._patch_gh(judge, self._gh_view_pr(decision="REVIEW_REQUIRED"), self._gh_comments()):
+            sleep_calls: list[int] = []
+
+            def fake_sleep(secs: int) -> None:
+                # Append once, then bump time forward by raising a sentinel
+                # via monotonic-shift is awkward; instead patch monotonic to
+                # advance past the deadline after the first sleep.
+                sleep_calls.append(secs)
+
+            monotonic_calls = iter([0.0, 0.0, 100.0, 100.0, 100.0])
+            with (
+                patch("devbench.github.git_ops.time.sleep", side_effect=fake_sleep),
+                patch("devbench.github.git_ops.time.monotonic", side_effect=lambda: next(monotonic_calls)),
+            ):
+                resolution = judge.poll_pr_review_resolution(
+                    "caylent-solutions/git-repo",
+                    7,
+                    repo_path=tmp_path,
+                    agents=(),
+                    decision_blocks=True,
+                    settle_seconds=10,
+                    poll_interval=2,
+                )
+        # The loop slept at least once before the deadline elapsed.
+        assert sleep_calls
+        assert resolution.resolved is True
+
+    def test_skips_review_whose_author_not_in_allowlist(self, tmp_path: Path) -> None:
+        """When decision_blocks=False and the PR's reviewDecision is not
+        CHANGES_REQUESTED, a CHANGES_REQUESTED review by a non-allowlisted
+        author is skipped so the merge is not blocked."""
+        judge = GitOpsService()
+        view = self._gh_view_pr(
+            decision="REVIEW_REQUIRED",
+            reviews=[{"state": "CHANGES_REQUESTED", "author": {"login": "random-human"}, "body": "drive-by"}],
+        )
+        with self._patch_gh(judge, view, self._gh_comments()):
+            with patch("devbench.github.git_ops.time.sleep"):
+                resolution = judge.poll_pr_review_resolution(
+                    "caylent-solutions/git-repo",
+                    7,
+                    repo_path=tmp_path,
+                    agents=("github-copilot[bot]",),
+                    decision_blocks=False,
+                    settle_seconds=0,
+                    poll_interval=0,
+                )
+        assert resolution.resolved is True
+        assert resolution.unresolved_reviews == []

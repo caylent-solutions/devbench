@@ -362,3 +362,28 @@ When you (the executor) request a manifest amendment to add infrastructure files
 Concretely: if your amendment is adding `infra/scripts/<name>.py` to a Manifest, also add `services/shared/tests/unit/test_<name>.py` (or the project-equivalent test path) to the same amendment. The manifest-amender will accept both as a coherent atomic addition and AC-FINAL-014 can satisfy in one cycle.
 
 The full rule and examples are in [`docs/source-test-atomicity.md`](../../../docs/source-test-atomicity.md).
+
+## CI-failure feedback (issue #115)
+
+When the orchestrator re-invokes you after `git-ops` returned exit code `2`, the work-unit's most recent `[CI_FAIL]` audit comment names a trimmed-log file under `.devbench/ci-failures/<task-id>-<attempt>.log`. Read that file, identify the failing CI step (typically a lint / format / type / test failure the local executor's cached venv missed), produce the minimal fix, stage + log a TDD entry, and end your turn -- the orchestrator re-runs git-ops so the fix is pushed and CI re-checks.
+
+If you cannot determine a fix from the log (the failure is environmental, intermittent, or the log was unavailable), log the situation via `log-comment` and end your turn -- the orchestrator's retry budget will eventually exhaust and the operator will see the BLOCKED audit comment with the full failure surface.
+
+## PR review-comment feedback (issue #116)
+
+When the orchestrator re-invokes you after `git-ops` returned exit code `3`, the work-unit's most recent `[PR_BOT_FAIL]` audit comment names a JSON feedback file under `.devbench/pr-bot-feedback/<task-id>-<attempt>.json`. The payload has the shape:
+
+```
+{
+  "unit_id": "...",
+  "pr_number": 42,
+  "attempt": 1,
+  "review_decision": "CHANGES_REQUESTED" | "REVIEW_REQUIRED" | "...",
+  "unresolved_reviews": [{"reviewer": "...", "state": "...", "body": "...", "submitted_at": "..."}],
+  "unresolved_comments": [{"author": "...", "path": "...", "line": 12, "body": "...", "created_at": "..."}]
+}
+```
+
+Read each unresolved comment's `path` + `line` + `body`. Address the specific issue inline (modifying the line clears the inline thread automatically when the next push lands). For free-form review bodies (`unresolved_reviews`), apply the requested change; if the request is out of scope or contradicts the work-unit's spec, log a `log-comment` explaining the disagreement -- the operator can then decide whether to amend the spec or override the bot.
+
+When the executor commits a fix that addresses every entry in the feedback payload, end your turn. The orchestrator re-runs git-ops; the next poll cycle re-checks the PR's review state. Threads that reference unchanged lines may stay unresolved on GitHub even after a valid fix; in that case reply on the thread with a brief explanation so the next poll iteration sees them as RESOLVED.

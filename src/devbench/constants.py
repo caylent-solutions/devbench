@@ -261,6 +261,68 @@ DEFAULT_CHECK_REGISTRATION_DELAY_SECONDS: int = 5
 # proposal write under normal orchestrator iteration cadence; tune via
 # JUDGE_BLOCKED_RECOVERY_WINDOW_SECONDS for slower / debugging runs.
 DEFAULT_BLOCKED_RECOVERY_WINDOW_SECONDS: int = 1800
+# When ``True``, ``cmd_git_ops`` runs ``cleanup_tracked_orphans`` inline as a
+# devbench-authored chore commit instead of emitting a backlog cleanup task.
+# Eliminates the orphan-cleanup-cascade pathology where multiple parent tasks
+# emit duplicate cleanup proposals, the cleanup tasks themselves get blocked by
+# the manifest amender on predecessor staging, and the orchestrator loops
+# without converging. Operators can fall back to the legacy proposal flow via
+# ``DEVBENCH_DISABLE_INLINE_ORPHAN_CLEANUP=1`` when an audit work-unit is
+# required for compliance reporting; the legacy path still runs but with
+# cross-task de-duplication so duplicate proposals cannot land.
+DEFAULT_INLINE_ORPHAN_CLEANUP_ENABLED: bool = True
+# Canonical commit message used by the inline orphan-cleanup path. Stable
+# string so post-merge audit tooling can grep for the chore commits without
+# parsing free-form prose. Keep in sync with the documented contract in
+# ``docs/backlog-contract.md``'s orphan-cleanup section.
+DEVBENCH_INLINE_CLEANUP_COMMIT_MESSAGE: str = (
+    "chore(cleanup): untrack devbench-managed orphan paths and update .gitignore"
+)
+# Issue #115: CI-failure feedback log byte cap. ``cmd_git_ops`` writes the
+# trimmed failing-job log to ``<workspace>/.devbench/ci-failures/<id>-<n>.log``
+# so the executor retry loop has a stable filesystem path to read; the cap
+# keeps the feedback payload bounded so a runaway-log job cannot consume the
+# entire executor context window. Override via ``JUDGE_CI_FAILURE_LOG_BYTES``
+# when a backlog's CI legitimately produces longer relevant tails.
+DEFAULT_CI_FAILURE_LOG_BYTES: int = 32768
+# Issue #115: opt-in toggle for the CI-failure executor retry path. Default
+# False to preserve backward-compatible rc=1 BLOCKED behaviour for existing
+# operators. Set ``JUDGE_CI_FAILURE_RETRY_ENABLED=1`` to enable -- ``cmd_git_ops``
+# will then return rc=2 on CI failure (signalling executor retry) until the
+# shared retry budget (``MAX_RETRY_ATTEMPTS``) is exhausted, at which point
+# rc=1 BLOCKED applies. The retry budget is shared with the existing
+# review-judge retry budget so total per-task work stays bounded.
+DEFAULT_CI_FAILURE_RETRY_ENABLED: bool = False
+# Issue #116: opt-in toggle for the PR review-comment polling path. Default
+# False; both this AND a non-empty ``JUDGE_PR_REVIEW_AGENTS`` (or
+# ``JUDGE_PR_REVIEW_DECISION_BLOCKS=1``) are required for the phase to
+# activate. Allows the phase to ship without changing default merge cadence.
+DEFAULT_PR_REVIEW_RESOLUTION_ENABLED: bool = False
+# Issue #116: PR review-comment poll/settle window. After ``wait_for_checks``
+# returns True, ``cmd_git_ops`` polls ``gh pr view`` for late-arriving
+# REQUEST_CHANGES reviews and bot comments for up to this many seconds before
+# merging. Event-driven loop (poll + condition), not a blanket sleep -- the
+# helper exits early on the first signal. Override via
+# ``JUDGE_PR_REVIEW_SETTLE_SECONDS``.
+DEFAULT_PR_REVIEW_SETTLE_SECONDS: int = 60
+# Issue #116: poll cadence inside the settle window. Smaller values reduce
+# observed latency at the cost of more ``gh`` API calls; the default 5 s
+# matches the ``CHECK_REGISTRATION_DELAY_SECONDS`` cadence already used by
+# ``wait_for_checks`` so operators see one consistent rhythm. Override via
+# ``JUDGE_PR_REVIEW_POLL_INTERVAL``.
+DEFAULT_PR_REVIEW_POLL_INTERVAL: int = 5
+# Issue #116: when ``True`` (the default), a PR with ``reviewDecision ==
+# CHANGES_REQUESTED`` blocks the merge regardless of the bot allowlist. When
+# ``False``, only allowlisted bot comments block the merge. Repos without
+# review bots leave both signals empty and the entire phase is a no-op
+# (zero regression for existing behaviour). Override via
+# ``JUDGE_PR_REVIEW_DECISION_BLOCKS``.
+DEFAULT_PR_REVIEW_DECISION_BLOCKS: bool = True
+# Issue #116: comma-separated allowlist of GitHub login names whose review
+# comments block the merge until resolved. Empty default means the phase is
+# a no-op for repos without review bots. Override via
+# ``JUDGE_PR_REVIEW_AGENTS`` (e.g. ``github-copilot[bot],amazon-q-developer[bot]``).
+DEFAULT_PR_REVIEW_AGENTS: tuple[str, ...] = ()
 DEFAULT_TOKEN_COST_PER_M_INPUT: float = 5.0
 DEFAULT_TOKEN_COST_PER_M_OUTPUT: float = 25.0
 

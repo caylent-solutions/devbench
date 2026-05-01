@@ -6710,3 +6710,551 @@ class TestResolveLogFileYamlConfig:
         monkeypatch.delenv("JUDGE_WORKSPACE_ROOT", raising=False)
         monkeypatch.setattr(cli, "RUNTIME_CONFIG", self._runtime_config_with_log_file("logs/orch.log"))
         assert cli._resolve_log_file_path() == Path("logs/orch.log")
+
+
+class TestInlineOrphanCleanup:
+    """Phase 1: ``cmd_git_ops`` runs the orphan cleanup inline as a chore commit.
+
+    Eliminates the cascade pathology where multiple parents each emitted a
+    duplicate cleanup proposal and those proposals themselves got blocked by
+    the manifest amender on predecessor staging. The cleanup is no longer a
+    backlog work unit -- it is a maintenance commit the engine makes on its
+    own when it detects build/state artifact paths that would otherwise
+    pollute the task's commit.
+    """
+
+    def _make_unit(self, repo: str = "caylent-solutions/git-repo") -> WorkUnit:
+        return WorkUnit(
+            id="E0-F1-S1-T1",
+            title="Sample task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T1.md"),
+            repo=repo,
+            dependencies=[],
+        )
+
+    def _seed_orphan_in_repo(self, repo_dir: Path) -> Path:
+        """Add a tracked orphan path (``.coverage (1)``) on top of the
+        ``tmp_repo_dir`` fixture's initial commit.
+
+        Mirrors the real-world failure shape from the user's halt log
+        (the leftover pytest-cov race file).
+        """
+        import subprocess
+
+        orphan = repo_dir / ".coverage (1)"
+        orphan.write_text("ignored coverage data\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "add", "--", ".coverage (1)"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "commit", "-m", "leak orphan"],
+            check=True,
+        )
+        return orphan
+
+    def test_inline_cleanup_lands_chore_commit_and_continues(self, tmp_repo_dir: Path) -> None:
+        from devbench.constants import DEVBENCH_INLINE_CLEANUP_COMMIT_MESSAGE
+
+        self._seed_orphan_in_repo(tmp_repo_dir)
+        # Stage an executor file alongside the orphan situation so we can
+        # verify the executor's staging survives the cleanup pass.
+        import subprocess
+
+        (tmp_repo_dir / "feature.py").write_text("print('hi')\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(tmp_repo_dir), "add", "--", "feature.py"],
+            check=True,
+        )
+
+        result = cli._inline_orphan_cleanup_or_refuse(
+            unit_id="E0-F1-S1-T1",
+            repo_path=tmp_repo_dir,
+            detected=[".coverage (1)"],
+        )
+        assert result is False  # caller continues with task commit
+
+        # Cleanup commit landed with the canonical chore message.
+        log = subprocess.run(
+            ["git", "-C", str(tmp_repo_dir), "log", "-1", "--format=%s"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert log == DEVBENCH_INLINE_CLEANUP_COMMIT_MESSAGE
+
+        # Orphan is no longer tracked.
+        ls = subprocess.run(
+            ["git", "-C", str(tmp_repo_dir), "ls-files"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        assert ".coverage (1)" not in ls
+
+        # ``.gitignore`` was written with the devbench-managed block.
+        gitignore = (tmp_repo_dir / ".gitignore").read_text(encoding="utf-8")
+        assert ".coverage*" in gitignore
+
+        # Executor's staging (feature.py) was preserved.
+        staged = subprocess.run(
+            ["git", "-C", str(tmp_repo_dir), "diff", "--cached", "--name-only"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        assert "feature.py" in staged
+
+    def test_inline_cleanup_filters_out_staged_only_orphans(self, tmp_repo_dir: Path) -> None:
+        """A staged-only orphan (newly added by executor, not yet in HEAD) is
+        un-staged + ignored; no cleanup commit is needed because there's
+        nothing to ``rm --cached``.
+
+        The follow-up ``commit_and_push`` would then skip the orphan because
+        the just-written .gitignore block matches the pattern.
+        """
+        import subprocess
+
+        # Stage a brand-new orphan-pattern file that's not yet tracked.
+        (tmp_repo_dir / ".coverage").write_text("data\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(tmp_repo_dir), "add", "-f", "--", ".coverage"],
+            check=True,
+        )
+
+        result = cli._inline_orphan_cleanup_or_refuse(
+            unit_id="E0-F1-S1-T1",
+            repo_path=tmp_repo_dir,
+            detected=[".coverage"],
+        )
+        assert result is False
+
+        # Orphan is no longer staged.
+        staged = subprocess.run(
+            ["git", "-C", str(tmp_repo_dir), "diff", "--cached", "--name-only"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        assert ".coverage" not in staged
+
+    def test_inline_cleanup_refuses_on_subprocess_failure(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """When the cleanup primitive raises, the helper returns True so
+        the caller refuses the parent commit -- and prints an actionable
+        error mentioning the manual recovery command.
+        """
+        # Pass a non-git-repo path so cleanup_tracked_orphans raises.
+        result = cli._inline_orphan_cleanup_or_refuse(
+            unit_id="E0-F1-S1-T1",
+            repo_path=tmp_path,
+            detected=[".coverage"],
+        )
+        assert result is True
+        err = capsys.readouterr().err
+        assert "git-ops refused" in err
+        assert "cleanup-tracked-orphans" in err  # operator-recovery hint
+
+
+class TestEmitOrphanCleanupDispatch:
+    """``_emit_orphan_cleanup_proposal_if_needed`` dispatches inline vs legacy."""
+
+    def _unit(self) -> WorkUnit:
+        return WorkUnit(
+            id="E0-F1-S1-T1",
+            title="Sample",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T1.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+
+    def test_no_orphans_returns_false_without_dispatch(self, tmp_path: Path) -> None:
+        with (
+            patch("devbench.cli._orphan_paths_for_repo", return_value=[]),
+            patch("devbench.cli._inline_orphan_cleanup_or_refuse") as inline,
+            patch("devbench.cli._legacy_emit_orphan_cleanup_proposal") as legacy,
+        ):
+            assert cli._emit_orphan_cleanup_proposal_if_needed("E0-F1-S1-T1", self._unit(), tmp_path) is False
+        inline.assert_not_called()
+        legacy.assert_not_called()
+
+    def test_skipped_gate_returns_false(self, tmp_path: Path) -> None:
+        # _orphan_paths_for_repo returns None when the gate is skipped
+        # (non-git checkout). Caller continues without refusal.
+        with patch("devbench.cli._orphan_paths_for_repo", return_value=None):
+            assert cli._emit_orphan_cleanup_proposal_if_needed("E0-F1-S1-T1", self._unit(), tmp_path) is False
+
+    def test_dispatches_to_inline_when_enabled(self, tmp_path: Path) -> None:
+        with (
+            patch("devbench.cli._orphan_paths_for_repo", return_value=[".coverage"]),
+            patch("devbench.cli.INLINE_ORPHAN_CLEANUP_ENABLED", True, create=True),
+            patch("devbench.cli._inline_orphan_cleanup_or_refuse", return_value=False) as inline,
+            patch("devbench.cli._legacy_emit_orphan_cleanup_proposal") as legacy,
+        ):
+            # The function imports INLINE_ORPHAN_CLEANUP_ENABLED at call time;
+            # patch the import target directly via the module-level constant.
+            import devbench.config as cfg
+
+            cfg.INLINE_ORPHAN_CLEANUP_ENABLED = True
+            try:
+                assert cli._emit_orphan_cleanup_proposal_if_needed("E0-F1-S1-T1", self._unit(), tmp_path) is False
+            finally:
+                cfg.INLINE_ORPHAN_CLEANUP_ENABLED = True
+        inline.assert_called_once()
+        legacy.assert_not_called()
+
+    def test_dispatches_to_legacy_when_disabled(self, tmp_path: Path) -> None:
+        import devbench.config as cfg
+
+        original = cfg.INLINE_ORPHAN_CLEANUP_ENABLED
+        cfg.INLINE_ORPHAN_CLEANUP_ENABLED = False
+        try:
+            with (
+                patch("devbench.cli._orphan_paths_for_repo", return_value=[".coverage"]),
+                patch("devbench.cli._inline_orphan_cleanup_or_refuse") as inline,
+                patch("devbench.cli._legacy_emit_orphan_cleanup_proposal", return_value=True) as legacy,
+            ):
+                assert cli._emit_orphan_cleanup_proposal_if_needed("E0-F1-S1-T1", self._unit(), tmp_path) is True
+            inline.assert_not_called()
+            legacy.assert_called_once()
+        finally:
+            cfg.INLINE_ORPHAN_CLEANUP_ENABLED = original
+
+
+class TestFindExistingCleanupProposal:
+    """Phase 1 secondary fix: cross-task de-duplication for the legacy proposal flow."""
+
+    def test_returns_none_when_proposals_dir_absent(self, tmp_path: Path) -> None:
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            assert cli._find_existing_cleanup_proposal([".coverage"]) is None
+
+    def test_returns_none_when_no_cleanup_proposal_present(self, tmp_path: Path) -> None:
+        proposals = tmp_path / ".devbench" / "proposals"
+        proposals.mkdir(parents=True)
+        # Some other proposal (not an orphan-cleanup -- claims a different file).
+        (proposals / "E0-F1-S1-T2.json").write_text(
+            json.dumps(
+                {
+                    "source_task_id": "E0-F1-S1-T2",
+                    "proposed_tasks": [
+                        {"suggested_id": "E0-F1-S1-T9", "files_to_own": ["src/feature.py"]},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            assert cli._find_existing_cleanup_proposal([".coverage"]) is None
+
+    def test_returns_existing_cleanup_id_when_found(self, tmp_path: Path) -> None:
+        proposals = tmp_path / ".devbench" / "proposals"
+        proposals.mkdir(parents=True)
+        (proposals / "E0-F1-S1-T2.json").write_text(
+            json.dumps(
+                {
+                    "source_task_id": "E0-F1-S1-T2",
+                    "proposed_tasks": [
+                        {"suggested_id": "E0-F1-S1-T7", "files_to_own": [".gitignore"]},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            assert cli._find_existing_cleanup_proposal([".coverage"]) == "E0-F1-S1-T7"
+
+    def test_skips_malformed_proposal_json(self, tmp_path: Path) -> None:
+        proposals = tmp_path / ".devbench" / "proposals"
+        proposals.mkdir(parents=True)
+        (proposals / "broken.json").write_text("{not valid json", encoding="utf-8")
+        (proposals / "E0-F1-S1-T2.json").write_text(
+            json.dumps(
+                {
+                    "proposed_tasks": [
+                        {"suggested_id": "E0-F1-S1-T7", "files_to_own": [".gitignore"]},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            # Malformed file is silently skipped; the valid one still wins.
+            assert cli._find_existing_cleanup_proposal([".coverage"]) == "E0-F1-S1-T7"
+
+
+class TestCiFailureRetry:
+    """Issue #115: CI-failure executor retry instead of immediate BLOCKED."""
+
+    def _make_wu_file(self, tmp_path: Path, comments: list[str] | None = None) -> Path:
+        body = "# E0-F1-S1-T1: sample\n\n## Status: in-progress\n\n## Description\n\nx\n\n## Comments\n\n"
+        for c in comments or []:
+            body += f"[2026-05-01 00:00 UTC] [agent/git_ops] {c}\n"
+        wu = tmp_path / "E0-F1-S1-T1.md"
+        wu.write_text(body, encoding="utf-8")
+        return wu
+
+    def test_count_ci_fail_attempts_zero_when_no_entries(self, tmp_path: Path) -> None:
+        wu = self._make_wu_file(tmp_path, comments=["[PR_CREATED] https://example/x"])
+        assert cli._count_ci_fail_attempts(wu) == 0
+
+    def test_count_ci_fail_attempts_returns_count(self, tmp_path: Path) -> None:
+        wu = self._make_wu_file(tmp_path, comments=["[CI_FAIL] one", "[CI_FAIL] two"])
+        assert cli._count_ci_fail_attempts(wu) == 2
+
+    def test_count_ci_fail_attempts_zero_when_file_missing(self, tmp_path: Path) -> None:
+        assert cli._count_ci_fail_attempts(tmp_path / "missing.md") == 0
+        assert cli._count_ci_fail_attempts(None) == 0
+
+    def test_handle_ci_failure_legacy_when_disabled(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        wu = self._make_wu_file(tmp_path)
+        mgr = MagicMock()
+        with patch("devbench.config.CI_FAILURE_RETRY_ENABLED", False):
+            rc = cli._handle_ci_failure(
+                ops=MagicMock(),
+                unit_id="E0-F1-S1-T1",
+                canonical_repo="ex/foo",
+                pr_number=42,
+                repo_path=tmp_path,
+                wu_file=wu,
+                mgr=mgr,
+            )
+        assert rc == 1
+        assert "CI checks failed for PR #42" in capsys.readouterr().err
+        mgr._append_agent_comment.assert_not_called()
+
+    def test_handle_ci_failure_returns_2_under_budget(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        wu = self._make_wu_file(tmp_path)
+        mgr = MagicMock()
+        ops = MagicMock()
+        ops.get_latest_failing_run_id.return_value = "999"
+        ops.fetch_run_log.return_value = "ruff E501 line too long\n"
+        with (
+            patch("devbench.config.CI_FAILURE_RETRY_ENABLED", True),
+            patch("devbench.config.MAX_RETRY_ATTEMPTS", 3),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli._handle_ci_failure(
+                ops=ops,
+                unit_id="E0-F1-S1-T1",
+                canonical_repo="ex/foo",
+                pr_number=42,
+                repo_path=tmp_path,
+                wu_file=wu,
+                mgr=mgr,
+            )
+        assert rc == 2
+        # log file written under workspace
+        log_files = sorted((tmp_path / ".devbench" / "ci-failures").glob("E0-F1-S1-T1-*.log"))
+        assert len(log_files) == 1
+        assert "ruff E501" in log_files[0].read_text(encoding="utf-8")
+        # audit comment written with [CI_FAIL] (not _BLOCKED)
+        msg = mgr._append_agent_comment.call_args.args[2]
+        assert msg.startswith("[CI_FAIL] ")
+
+    def test_handle_ci_failure_returns_1_when_budget_exhausted(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # Pre-seed two prior CI_FAIL entries so this is attempt 3 -- exhausted.
+        wu = self._make_wu_file(tmp_path, comments=["[CI_FAIL] r1", "[CI_FAIL] r2"])
+        mgr = MagicMock()
+        ops = MagicMock()
+        ops.get_latest_failing_run_id.return_value = None  # log unavailable
+        with (
+            patch("devbench.config.CI_FAILURE_RETRY_ENABLED", True),
+            patch("devbench.config.MAX_RETRY_ATTEMPTS", 3),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli._handle_ci_failure(
+                ops=ops,
+                unit_id="E0-F1-S1-T1",
+                canonical_repo="ex/foo",
+                pr_number=42,
+                repo_path=tmp_path,
+                wu_file=wu,
+                mgr=mgr,
+            )
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "budget exhausted" in err
+        assert "MAX_RETRY_ATTEMPTS=3" in err
+        # exhaustion uses [CI_FAIL_BLOCKED] marker
+        msg = mgr._append_agent_comment.call_args.args[2]
+        assert msg.startswith("[CI_FAIL_BLOCKED] ")
+
+    def test_handle_ci_failure_skips_audit_when_no_wu_file(self, tmp_path: Path) -> None:
+        ops = MagicMock()
+        ops.get_latest_failing_run_id.return_value = "1"
+        ops.fetch_run_log.return_value = "log\n"
+        mgr = MagicMock()
+        with (
+            patch("devbench.config.CI_FAILURE_RETRY_ENABLED", True),
+            patch("devbench.config.MAX_RETRY_ATTEMPTS", 3),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli._handle_ci_failure(
+                ops=ops,
+                unit_id="E0-F1-S1-T1",
+                canonical_repo="ex/foo",
+                pr_number=42,
+                repo_path=tmp_path,
+                wu_file=None,
+                mgr=mgr,
+            )
+        assert rc == 2
+        mgr._append_agent_comment.assert_not_called()
+
+
+class TestPrReviewResolution:
+    """Issue #116: poll PR review state before merging."""
+
+    def _resolution(
+        self,
+        resolved: bool = False,
+        decision: str = "CHANGES_REQUESTED",
+        reviews: list[dict[str, str | int]] | None = None,
+        comments: list[dict[str, str | int]] | None = None,
+    ) -> object:
+        from devbench.github.git_ops import ReviewResolution
+
+        return ReviewResolution(
+            resolved=resolved,
+            review_decision=decision,
+            unresolved_reviews=reviews or [],
+            unresolved_comments=comments or [],
+            elapsed_seconds=0.0,
+        )
+
+    def _wu_file(self, tmp_path: Path, retries: int = 0) -> Path:
+        comments = "\n".join(f"[2026-05-01 00:0{i} UTC] [agent/git_ops] [PR_BOT_FAIL] r{i}" for i in range(retries))
+        body = f"# E0-F1-S1-T1: t\n\n## Status: in-progress\n\n## Description\n\nx\n\n## Comments\n\n{comments}\n"
+        wu = tmp_path / "wu.md"
+        wu.write_text(body, encoding="utf-8")
+        return wu
+
+    def test_returns_0_when_phase_disabled(self, tmp_path: Path) -> None:
+        ops = MagicMock()
+        with patch("devbench.config.PR_REVIEW_RESOLUTION_ENABLED", False):
+            rc = cli._handle_pr_review_resolution(
+                ops=ops,
+                unit_id="E0-F1-S1-T1",
+                canonical_repo="ex/foo",
+                pr_number=42,
+                repo_path=tmp_path,
+                wu_file=self._wu_file(tmp_path),
+                mgr=MagicMock(),
+            )
+        assert rc == 0
+        ops.poll_pr_review_resolution.assert_not_called()
+
+    def test_returns_0_when_no_signals_configured(self, tmp_path: Path) -> None:
+        ops = MagicMock()
+        with (
+            patch("devbench.config.PR_REVIEW_RESOLUTION_ENABLED", True),
+            patch("devbench.config.PR_REVIEW_AGENTS", ()),
+            patch("devbench.config.PR_REVIEW_DECISION_BLOCKS", False),
+        ):
+            rc = cli._handle_pr_review_resolution(
+                ops=ops,
+                unit_id="E0-F1-S1-T1",
+                canonical_repo="ex/foo",
+                pr_number=42,
+                repo_path=tmp_path,
+                wu_file=self._wu_file(tmp_path),
+                mgr=MagicMock(),
+            )
+        assert rc == 0
+        ops.poll_pr_review_resolution.assert_not_called()
+
+    def test_returns_0_when_resolved(self, tmp_path: Path) -> None:
+        ops = MagicMock()
+        ops.poll_pr_review_resolution.return_value = self._resolution(resolved=True, decision="APPROVED")
+        with (
+            patch("devbench.config.PR_REVIEW_RESOLUTION_ENABLED", True),
+            patch("devbench.config.PR_REVIEW_AGENTS", ()),
+            patch("devbench.config.PR_REVIEW_DECISION_BLOCKS", True),
+        ):
+            rc = cli._handle_pr_review_resolution(
+                ops=ops,
+                unit_id="E0-F1-S1-T1",
+                canonical_repo="ex/foo",
+                pr_number=42,
+                repo_path=tmp_path,
+                wu_file=self._wu_file(tmp_path),
+                mgr=MagicMock(),
+            )
+        assert rc == 0
+
+    def test_returns_3_when_unresolved_under_budget(self, tmp_path: Path) -> None:
+        ops = MagicMock()
+        ops.poll_pr_review_resolution.return_value = self._resolution(
+            reviews=[{"reviewer": "github-copilot[bot]", "state": "CHANGES_REQUESTED", "body": "fix this"}],
+        )
+        mgr = MagicMock()
+        with (
+            patch("devbench.config.PR_REVIEW_RESOLUTION_ENABLED", True),
+            patch("devbench.config.PR_REVIEW_AGENTS", ("github-copilot[bot]",)),
+            patch("devbench.config.PR_REVIEW_DECISION_BLOCKS", True),
+            patch("devbench.config.MAX_RETRY_ATTEMPTS", 3),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli._handle_pr_review_resolution(
+                ops=ops,
+                unit_id="E0-F1-S1-T1",
+                canonical_repo="ex/foo",
+                pr_number=42,
+                repo_path=tmp_path,
+                wu_file=self._wu_file(tmp_path),
+                mgr=mgr,
+            )
+        assert rc == 3
+        feedback = sorted((tmp_path / ".devbench" / "pr-bot-feedback").glob("*.json"))
+        assert len(feedback) == 1
+        payload = json.loads(feedback[0].read_text(encoding="utf-8"))
+        assert payload["pr_number"] == 42
+        assert payload["unresolved_reviews"][0]["reviewer"] == "github-copilot[bot]"
+        msg = mgr._append_agent_comment.call_args.args[2]
+        assert msg.startswith("[PR_BOT_FAIL] ")
+
+    def test_returns_1_when_budget_exhausted(self, tmp_path: Path) -> None:
+        ops = MagicMock()
+        ops.poll_pr_review_resolution.return_value = self._resolution(
+            reviews=[{"reviewer": "bot", "state": "CHANGES_REQUESTED", "body": "x"}],
+        )
+        mgr = MagicMock()
+        # Pre-seed MAX-1 PR_BOT_FAIL retries so the next failure exhausts budget.
+        wu = self._wu_file(tmp_path, retries=2)
+        with (
+            patch("devbench.config.PR_REVIEW_RESOLUTION_ENABLED", True),
+            patch("devbench.config.PR_REVIEW_AGENTS", ("bot",)),
+            patch("devbench.config.PR_REVIEW_DECISION_BLOCKS", True),
+            patch("devbench.config.MAX_RETRY_ATTEMPTS", 3),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli._handle_pr_review_resolution(
+                ops=ops,
+                unit_id="E0-F1-S1-T1",
+                canonical_repo="ex/foo",
+                pr_number=42,
+                repo_path=tmp_path,
+                wu_file=wu,
+                mgr=mgr,
+            )
+        assert rc == 1
+        msg = mgr._append_agent_comment.call_args.args[2]
+        assert msg.startswith("[PR_BOT_FAIL_BLOCKED] ")

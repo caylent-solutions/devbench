@@ -416,9 +416,43 @@ Commit, push, create PR, wait for CI, merge. The full git-ops sequence runs afte
 Enforces three deterministic safety rails:
 - **Manifest-scope:** staged files must exactly match the work unit's Changes Manifest (AC-FINAL-015).
 - **Branch-anchor:** HEAD must be on the expected branch (prevents orphan-branch commits).
-- **Orphan-pattern:** no staged or already-tracked path may match a build/state ignore pattern (terraform state, terragrunt cache, Python pycache, coverage artefacts, `node_modules`, `.DS_Store`). When detected, git-ops refuses the commit AND auto-emits a cleanup proposal so the cascade self-heals (the source task moves to `blocked-pending-proposal` on a follow-up `cleanup-tracked-orphans` task; the original task auto-clears once the cleanup commits). Override the active pattern list per backlog via `DEVBENCH_ORPHAN_IGNORE_PATTERNS` (comma-separated fnmatch globs).
+- **Orphan-pattern:** no staged or already-tracked path may match a build/state ignore pattern (terraform state, terragrunt cache, Python pycache, coverage artefacts, `node_modules`, `.DS_Store`). The default behaviour (Phase 1 of the orphan-cascade fix) is **inline cleanup**: git-ops runs `cleanup_tracked_orphans` programmatically, commits the result as a devbench-authored chore commit (canonical message `chore(cleanup): untrack devbench-managed orphan paths and update .gitignore`), then continues with the original task's commit on the same invocation. Two commits land on the task's branch; the executor's staging is preserved (filtered to exclude orphan paths). When the operator sets `DEVBENCH_DISABLE_INLINE_ORPHAN_CLEANUP=1`, git-ops falls back to the legacy proposal flow (cleanup-as-task) with cross-task de-duplication so two parents detecting the same orphan set wire to the SAME cleanup task. Override the active pattern list per backlog via `DEVBENCH_ORPHAN_IGNORE_PATTERNS` (comma-separated fnmatch globs).
 
 Each rail exits 1 with a clear diagnostic when violated.
+
+#### Exit code contract
+
+The orchestrator skill ([`plugin/devbench/skills/orchestrate/SKILL.md`](../plugin/devbench/skills/orchestrate/SKILL.md) step 8) handles each non-zero exit code distinctly:
+
+| rc | Meaning |
+|----|---------|
+| 0 | PR merged (or commit landed locally in deferred mode). |
+| 1 | Hard failure -- block the task with a `[BLOCKED]` audit comment. |
+| 2 | CI failed; executor retry budget not exhausted. Audit comment `[CI_FAIL]` names the trimmed log under `.devbench/ci-failures/<id>-<n>.log`. Re-invoke the executor with `ci-fail` feedback, then re-run git-ops. (Issue #115; opt-in via `JUDGE_CI_FAILURE_RETRY_ENABLED=1`.) |
+| 3 | PR has unresolved review feedback; executor retry budget not exhausted. Audit comment `[PR_BOT_FAIL]` names the JSON feedback file under `.devbench/pr-bot-feedback/<id>-<n>.json`. Re-invoke the executor with `pr-bot` feedback, then re-run git-ops. (Issue #116; opt-in via `JUDGE_PR_REVIEW_RESOLUTION_ENABLED=1`.) |
+
+The retry budget for rc=2 / rc=3 is shared with the existing review-judge retry budget (`MAX_RETRY_ATTEMPTS`); when exhausted, git-ops returns rc=1 instead of 2/3 and writes a `[CI_FAIL_BLOCKED]` / `[PR_BOT_FAIL_BLOCKED]` marker so the operator sees the full failure surface.
+
+#### CI-failure retry (issue #115, opt-in)
+
+Set `JUDGE_CI_FAILURE_RETRY_ENABLED=1` to enable. When `wait_for_checks` reports CI failure:
+
+1. `gh pr checks --json name,state,link` identifies the failing run.
+2. `gh run view <run-id> --log-failed` fetches the log; the trailing `JUDGE_CI_FAILURE_LOG_BYTES` bytes (default 32 KiB) are saved to `.devbench/ci-failures/<task-id>-<attempt>.log`.
+3. A `[CI_FAIL]` audit comment names the log path; rc=2 signals the orchestrator to re-invoke the executor.
+4. After `MAX_RETRY_ATTEMPTS` retries the path transitions to `[CI_FAIL_BLOCKED]` + rc=1.
+
+#### PR review-comment polling (issue #116, opt-in)
+
+Set `JUDGE_PR_REVIEW_RESOLUTION_ENABLED=1` AND configure at least one signal (a non-empty `JUDGE_PR_REVIEW_AGENTS` allowlist or `JUDGE_PR_REVIEW_DECISION_BLOCKS=1`) to enable. After `wait_for_checks` returns True, git-ops polls `gh pr view --json reviewDecision,reviews` and `gh api repos/<repo>/pulls/<n>/comments` for up to `JUDGE_PR_REVIEW_SETTLE_SECONDS` seconds (default 60), polling every `JUDGE_PR_REVIEW_POLL_INTERVAL` seconds (default 5). The poll exits early on the first signal; otherwise the merge proceeds. Knobs:
+
+| env var | default | purpose |
+|---------|---------|---------|
+| `JUDGE_PR_REVIEW_RESOLUTION_ENABLED` | unset (off) | top-level toggle |
+| `JUDGE_PR_REVIEW_AGENTS` | empty | comma-separated bot login allowlist (e.g. `github-copilot[bot],amazon-q-developer[bot]`) whose unresolved comments block merge |
+| `JUDGE_PR_REVIEW_DECISION_BLOCKS` | True | whether `reviewDecision == CHANGES_REQUESTED` blocks merge |
+| `JUDGE_PR_REVIEW_SETTLE_SECONDS` | 60 | total poll budget |
+| `JUDGE_PR_REVIEW_POLL_INTERVAL` | 5 | per-poll cadence |
 
 #### Workflow-registration race defence (issue #114)
 

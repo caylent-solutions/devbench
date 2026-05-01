@@ -484,15 +484,28 @@ Build / state artefacts have no place in version control. Terraform state files 
 
 In production at `caylent-telemetry/`, two work-unit commits (`E1-F1-S1-T5`, `E1-F1-S1-T6`) accidentally staged 13 such files (totalling ~656 MB after the `terraform-provider-aws` binary). Every later Task's security-review then failed against HEAD, forming a cascade that could not self-resolve.
 
-### Behaviour
+### Behaviour (default: inline cleanup commit -- Phase 1 of the orphan-cascade fix)
 
-When the rule fires, `git-ops` does NOT silently skip the commit -- it:
+When the rule fires, `git-ops` runs the cleanup **inline** as a devbench-authored chore commit:
 
-1. Refuses with a non-zero exit and a stderr message naming a sample of the offending paths.
-2. Auto-emits a follow-up cleanup task (a Proposal whose executor runs `devbench cleanup-tracked-orphans <repo>` to untrack each match and append the canonical block to the repo's root `.gitignore`).
-3. Wires the source task as a `BLOCKED_PENDING_PROPOSAL` dependent of the cleanup task so the orchestrator's existing cascade picks the cleanup up next iteration. The source task auto-clears once the cleanup commits.
+1. Captures the executor's pre-cleanup staged paths via `git diff --cached --name-only`.
+2. Resets the index to HEAD (`git reset HEAD --`) so the cleanup commit is purely cleanup-only.
+3. Runs `cleanup_tracked_orphans(repo_path)` -- `git rm --cached` for each tracked orphan plus `.gitignore` extension under the canonical `# devbench-managed: tracked-orphan cleanup defaults` header.
+4. Stages `.gitignore` and commits with the canonical message `chore(cleanup): untrack devbench-managed orphan paths and update .gitignore`.
+5. Re-stages the executor's filtered paths (orphans excluded) so the downstream `assert_staged_matches_manifest` runs against the executor's intent without orphan pollution.
+6. Continues with the original task's commit. Two commits land on the task's branch.
 
-The cleanup is forward-only (`git rm --cached` + `.gitignore`), preserving every file on disk and NOT rewriting git history. Operators may also run `cleanup-tracked-orphans` directly to drain a polluted state in one shot before launching the orchestrator. See [cli-reference.md](cli-reference.md#cleanup-tracked-orphans) for the operator-facing surface.
+The cleanup is forward-only (`git rm --cached` + `.gitignore`), preserving every file on disk and NOT rewriting git history. Critically, the cleanup is **not a backlog work unit**: there is no executor invocation, no judge review, no manifest amendment, no proposal materialisation. This collapses the cascade pathology where multiple parents each emitted duplicate cleanup proposals and those proposals themselves got blocked by the manifest amender on predecessor staging.
+
+### Legacy proposal mode (opt-out via `DEVBENCH_DISABLE_INLINE_ORPHAN_CLEANUP=1`)
+
+For backlogs that require a backlog work unit per cleanup (audit / compliance reporting), operators set `DEVBENCH_DISABLE_INLINE_ORPHAN_CLEANUP=1`. In that mode, `git-ops` falls back to the legacy proposal flow:
+
+1. Refuses the commit with a non-zero exit and a stderr message naming a sample of the offending paths.
+2. Cross-task de-duplication: scans `<workspace>/.devbench/proposals/*.json` for any pending proposal whose `proposed_tasks[].files_to_own` contains `.gitignore`. If found, wires the current source task as a `BLOCKED_PENDING_PROPOSAL` dependent of the **existing** cleanup task instead of allocating a duplicate.
+3. Otherwise, allocates a new cleanup-task ID, materialises the proposal, auto-wires the parent + any peer claimants of `.gitignore` via `add-dep`.
+
+Operators may also run `cleanup-tracked-orphans` directly to drain a polluted state in one shot before launching the orchestrator. See [cli-reference.md](cli-reference.md#cleanup-tracked-orphans) for the operator-facing surface.
 
 ### Override
 

@@ -566,14 +566,18 @@ Configuration is under `stop_hook:` in the YAML, with env var overrides `JUDGE_S
 
 ## 10. Current gaps (known limitations)
 
-Current gaps are tracked as GitHub issues on [caylent-solutions/devbench](https://github.com/caylent-solutions/devbench/issues) under the `enhancement` and `tech-debt` labels. Representative examples from the architecture audit:
+Current gaps are tracked as GitHub issues on [caylent-solutions/devbench](https://github.com/caylent-solutions/devbench/issues) under the `enhancement` and `tech-debt` labels.
 
-- **Branch uniqueness**: `validate-backlog` doesn't catch branch-name collisions across work units. Manual editing of the Branch field in two units to the same value will not error.
-- **Work-unit scaffolding**: No CLI command to scaffold a new epic / feature / story / task from a template. Authors copy-paste from `docs/example-work-unit-template.md` today.
-- **`hold` status not implemented**: The `hold` status (for paused-by-human work) is planned but not implemented (E222). This blocks E215 and E220.
-- **No `status --detail` flag**: Backlog status output is summary-only; no per-unit drill-down (E220, blocked on E222).
-- **Dependency integrity gaps**: `_deps_satisfied` only checks task-to-task dependencies, not task-to-epic / feature / story (E215, blocked on E222).
-- **`blocker-resolver` agent not invoked**: The agent file at `plugin/devbench/agents/blocker-resolver.md` exists but the orchestrate skill does not currently call it. Blocked work units stay blocked until human intervention.
+**Resolved in the v-next release (this branch)**:
+- ✅ Branch uniqueness: `_check_branch_uniqueness` rule in `validate-backlog` (E219, issue #108).
+- ✅ Work-unit scaffolding: `devbench new-task` + `backlog/templates/{epic,feature,story,task}.md` (E223, issue #110).
+- ✅ `hold` status: `STATUS_HOLD`, `cmd_hold`, `cmd_unhold` (E222, issue #104).
+- ✅ `status --detail` flag: three-panel output (E220, issue #109).
+- ✅ Dependency integrity: recursive `_deps_satisfied` walk + `cmd_sync_blocked` (E215, issue #107).
+- ✅ `blocker-resolver` agent invocation: orchestrator calls it on amendment-reject; `task-factory` materialises the proposal.
+
+**Remaining gaps (open issues)**:
+
 - **No topological sort for parallel candidates**: `get_parallel_candidates` returns units in linear order rather than running a topological sort over the dep graph. This affects ordering when many parallel candidates exist.
 - **Per-judge retry limits don't exist**: `max_executor_retries` is global; you can't configure "retry the executor 5 times if test-reviewer fails but only 2 times if doc-reviewer fails."
 - **Cost report doesn't split by role**: Aggregate cost only; no per-agent (executor vs judge) cost breakdown.

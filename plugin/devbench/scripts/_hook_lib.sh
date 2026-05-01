@@ -66,11 +66,19 @@ extract_tool_response_field() {
 }
 
 decode_json_escapes() {
-  # Shell-bound in-place decoder.  Pass the variable NAME, not its
-  # value; uses bash's nameref so the caller's variable is mutated.
-  local -n __ref="$1"
-  __ref=${__ref//\\\"/\"}
-  __ref=${__ref//\\\\/\\}
-  __ref=${__ref//\\n/$'\n'}
-  __ref=${__ref//\\t/$'\t'}
+  # Shell-bound in-place decoder. Pass the variable NAME, not its
+  # value; the function reads + writes the caller's variable.
+  #
+  # Issue #120: the previous implementation used `local -n` (bash 4.3+
+  # nameref). macOS ships bash 3.2.57 by default and every PreToolUse
+  # hook that sourced this lib failed on stock-macOS with
+  # `local: -n: invalid option`. The replacement uses `${!1}` indirect
+  # read + `printf -v "$1"` write, which work identically in bash 3.0+
+  # and produce byte-equivalent output.
+  local __value="${!1}"
+  __value=${__value//\\\"/\"}
+  __value=${__value//\\\\/\\}
+  __value=${__value//\\n/$'\n'}
+  __value=${__value//\\t/$'\t'}
+  printf -v "$1" '%s' "$__value"
 }

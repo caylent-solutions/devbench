@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from pathlib import Path
+from types import ModuleType
 
 # Set required env vars before any devbench modules are imported.
 # config.py raises RuntimeError at import time if these are unset.
@@ -17,50 +19,11 @@ os.environ.setdefault(
     str(Path(__file__).parent / "fixtures" / "test_devbench.yaml"),
 )
 import pytest
+from fixtures.data import WORK_UNIT_MARKDOWN_TEMPLATE as _WORK_UNIT_TEMPLATE
 
 from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
 
 _WORKSPACE_ROOT = os.environ.get("JUDGE_WORKSPACE_ROOT", "/tmp/test-workspace")
-
-# ---------------------------------------------------------------------------
-# Work-unit markdown template
-# ---------------------------------------------------------------------------
-
-_WORK_UNIT_TEMPLATE = """\
-# {unit_id}: {title}
-
-## Status: {status}
-
-## Description
-
-{description}
-
-## Target Repository
-
-- **Repo:** `{repo}`
-- **Local path:** `{workspace_root}/{repo_short}`
-- **Branch:** `backlog/{unit_id_lower}`
-
-## Dependencies
-
-| ID | Title | Status |
-|----|-------|--------|
-{dep_rows}
-
-## Acceptance Criteria
-
-- [ ] AC-FUNC-001 Implement the primary feature
-- [ ] AC-TEST-001 All tests pass
-- [ ] AC-DOC-001 Update `README.md` with new feature documentation
-
-## Changes Manifest
-
-- `src/main.py`
-- `tests/test_main.py`
-- `README.md`
-
-## Comments
-"""
 
 
 @pytest.fixture
@@ -225,3 +188,51 @@ def backlog_dir(tmp_path: Path) -> Path:
     d = tmp_path / BACKLOG_SUBDIR
     d.mkdir()
     return d
+
+
+@pytest.fixture
+def fresh_config(monkeypatch: pytest.MonkeyPatch) -> Iterator[ModuleType]:
+    """Yield a freshly-imported ``devbench.config`` module under monkeypatched env.
+
+    TD-10: collapses the ad-hoc ``importlib.reload(config)`` pattern in
+    ``tests/test_config.py``. Each test that wants a fresh config calls
+    this fixture, applies whatever env-var overrides via the supplied
+    ``monkeypatch``, and gets a re-imported config module that picks
+    up the new env values. On teardown the module is reloaded once
+    more under the test runner's normal env so subsequent tests see
+    the baseline state.
+    """
+    import importlib
+
+    from devbench import config as _config
+
+    importlib.reload(_config)
+    try:
+        yield _config
+    finally:
+        importlib.reload(_config)
+
+
+# ---------------------------------------------------------------------------
+# TD-8: every collected test gets a marker.
+#
+# The pyproject's ``[tool.pytest.ini_options].markers`` registry defines
+# ``unit`` and ``functional``. Files under ``tests/test_integration/``
+# default to ``functional``; everything else defaults to ``unit``. Tests
+# that already declare a marker explicitly (via ``@pytest.mark.<name>``
+# at function/class level OR ``pytestmark`` at module level) keep that
+# marker -- the hook is purely additive.
+# ---------------------------------------------------------------------------
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Apply default ``unit`` / ``functional`` markers based on path."""
+    for item in items:
+        existing = {mark.name for mark in item.iter_markers()}
+        if "unit" in existing or "functional" in existing:
+            continue
+        location = str(getattr(item, "fspath", "")) or str(item.nodeid)
+        if "/test_integration/" in location:
+            item.add_marker(pytest.mark.functional)
+        else:
+            item.add_marker(pytest.mark.unit)

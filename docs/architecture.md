@@ -584,7 +584,7 @@ All items the documentation audit raised have been resolved in this PR:
 - ✅ Stale Opus 4.1 token cost defaults -- updated to current Opus 4.7 rates.
 - ✅ Confusing `tasks_in_session` semantics -- `devbench report` now renders **two** windows by default: All-time (full log) and Current run (most recent contiguous block of orchestration events, boundary at a >10-minute gap). See [Hooks layer](#9-hooks-layer) and the [report capability](#2-capabilities) entry for usage.
 
-If you find a new issue, file it on the ROADMAP rather than this section.
+If you find a new issue, open a GitHub issue (or PR with the fix) rather than amending this section -- this list is a snapshot of resolutions, not a live tracker.
 
 ---
 

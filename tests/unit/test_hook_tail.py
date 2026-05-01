@@ -685,3 +685,53 @@ class TestEdgeCases:
             io.StringIO(),
         )
         assert rc == 0
+
+
+class TestOrchestratorSessionFilter:
+    """Phase 11 (E230): hook-tail filters by ``orchestrator_session`` field."""
+
+    def test_matching_session_passes_through(self) -> None:
+        from devbench.hook_tail import _format_line
+
+        raw = (
+            '{"timestamp": "2026-05-01T04:00:00Z", "event": "PreToolUse", '
+            '"orchestrator_session": "session-abc", '
+            '"input": {"tool_name": "Bash", "tool_input": {"command": "echo hi", "description": "say hi"}}}'
+        )
+        out = _format_line(raw, ZoneInfo("UTC"), color=False, orchestrator_session_id="session-abc")
+        assert out  # non-empty -> emitted
+
+    def test_mismatched_session_is_suppressed(self) -> None:
+        from devbench.hook_tail import _format_line
+
+        raw = (
+            '{"timestamp": "2026-05-01T04:00:00Z", "event": "PreToolUse", '
+            '"orchestrator_session": "other-session", '
+            '"input": {"tool_name": "Bash", "tool_input": {"command": "echo hi", "description": "say hi"}}}'
+        )
+        out = _format_line(raw, ZoneInfo("UTC"), color=False, orchestrator_session_id="session-abc")
+        assert out == ""
+
+    def test_legacy_log_lacking_session_field_passes_through(self) -> None:
+        # Pre-Phase-11 entries have no orchestrator_session field; the
+        # filter must not silently drop them so historical events stay
+        # visible after the migration.
+        from devbench.hook_tail import _format_line
+
+        raw = (
+            '{"timestamp": "2026-05-01T04:00:00Z", "event": "PreToolUse", '
+            '"input": {"tool_name": "Bash", "tool_input": {"command": "echo hi", "description": "say hi"}}}'
+        )
+        out = _format_line(raw, ZoneInfo("UTC"), color=False, orchestrator_session_id="session-abc")
+        assert out  # non-empty -> emitted
+
+    def test_no_filter_when_id_is_none(self) -> None:
+        from devbench.hook_tail import _format_line
+
+        raw = (
+            '{"timestamp": "2026-05-01T04:00:00Z", "event": "PreToolUse", '
+            '"orchestrator_session": "anything", '
+            '"input": {"tool_name": "Bash", "tool_input": {"command": "echo hi", "description": "say hi"}}}'
+        )
+        out = _format_line(raw, ZoneInfo("UTC"), color=False, orchestrator_session_id=None)
+        assert out  # non-empty -> emitted (no filter)

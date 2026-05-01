@@ -266,14 +266,25 @@ class FollowOptions:
     no_follow: bool = False
     color: bool = True
     poll_seconds: float = POLL_SECONDS_DEFAULT
+    # Phase 11 (E230): when set, hook-tail emits ONLY events whose
+    # ``orchestrator_session`` field equals this value. Enables the
+    # orchestrator pane to filter out tool calls fired by side-pane
+    # Claude sessions sharing the same JUDGE_WORKSPACE_ROOT.
+    orchestrator_session_id: str | None = None
 
 
-def _format_line(raw_line: str, tz, *, color: bool) -> str:
+def _format_line(raw_line: str, tz, *, color: bool, orchestrator_session_id: str | None = None) -> str:
     """Parse ``raw_line`` as JSON and format it.
 
     A line that is not valid JSON becomes a sentinel row showing its first
     ``DESCRIPTION_MAX`` characters so the operator can see the bad input
     without having to grep the raw log.
+
+    When *orchestrator_session_id* is provided, lines whose
+    ``orchestrator_session`` field does not match are silently
+    suppressed (returns ``""``). Lines from older log formats lack
+    the field; they are passed through unchanged so historical events
+    remain visible.
     """
     stripped = raw_line.rstrip("\n")
     if not stripped.strip():
@@ -284,6 +295,10 @@ def _format_line(raw_line: str, tz, *, color: bool) -> str:
         prefix = f"{_MISSING_TIMESTAMP} !? bad-json  "
         body = stripped[:DESCRIPTION_MAX]
         return _color(f"{prefix}{body}", _ANSI_GRAY, enabled=color)
+    if orchestrator_session_id is not None:
+        recorded = entry.get("orchestrator_session")
+        if isinstance(recorded, str) and recorded and recorded != orchestrator_session_id:
+            return ""
     return format_entry(entry, tz, color=color)
 
 
@@ -342,7 +357,12 @@ def _follow_loop(path: Path, options: FollowOptions, output: TextIO) -> int:
         while True:
             line = handle.readline()
             if line:
-                formatted = _format_line(line, options.tz, color=options.color)
+                formatted = _format_line(
+                    line,
+                    options.tz,
+                    color=options.color,
+                    orchestrator_session_id=options.orchestrator_session_id,
+                )
                 if formatted:
                     output.write(formatted + "\n")
                     output.flush()

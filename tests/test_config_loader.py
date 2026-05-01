@@ -1572,3 +1572,63 @@ class TestDisplayTimezoneTopLevel:
         rt = load_runtime_config(cfg, {})
         assert rt.display_timezone == "America/Chicago"
         assert rt.report.display_timezone == "Europe/London"
+
+
+class TestRepoConfigRuntimeFields:
+    """E213: RepoConfig is populated with validated_repo + resolved_checkout_path at load time."""
+
+    @staticmethod
+    def _write(path: Path, content: str) -> Path:
+        path.write_text(textwrap.dedent(content))
+        return path
+
+    def test_validated_repo_set_to_yaml_key(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.repos["org/repo"].validated_repo == "org/repo"
+
+    def test_resolved_checkout_path_uses_explicit_directory(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+                checkout_directory: my-checkout
+            """,
+        )
+        rt = load_runtime_config(cfg, {"JUDGE_WORKSPACE_ROOT": str(tmp_path)})
+        assert rt.repos["org/repo"].resolved_checkout_path == tmp_path / "my-checkout"
+
+    def test_resolved_checkout_path_falls_back_to_short_name(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            """,
+        )
+        rt = load_runtime_config(cfg, {"JUDGE_WORKSPACE_ROOT": str(tmp_path)})
+        assert rt.repos["org/repo"].resolved_checkout_path == tmp_path / "repo"
+
+    def test_resolved_checkout_path_none_when_workspace_unset(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.repos["org/repo"].resolved_checkout_path is None
+        # validated_repo remains populated even without workspace_root.
+        assert rt.repos["org/repo"].validated_repo == "org/repo"

@@ -46,7 +46,15 @@ Non-mutating commands for inspecting backlog state.
 uv run devbench status
 ```
 
-Print a summary of the backlog grouped by status. Output includes counts per lifecycle value (in-queue, in-progress, in-review, done, blocked, proposed, declined) plus an always-rendered `Un-materialised` count of proposal JSONs pending materialisation. Also lists active and blocked work units by ID. No arguments.
+Print a summary of the backlog grouped by status. Output includes counts per lifecycle value (in-queue, in-progress, in-review, done, blocked, proposed, declined, hold) plus an always-rendered `Un-materialised` count of proposal JSONs pending materialisation. Also lists active and blocked work units by ID.
+
+Pass `--detail` (E220) to additionally render three panels at the bottom of the output:
+
+- **In-queue tasks (with dep status):** every Task currently in `in-queue`, marked `[ready]` if every dependency is terminal or `[waiting]` with the offending blocker ID otherwise.
+- **Blocked tasks (with markers / blockers):** every Task currently in `blocked`, with the first `[BLOCKED_PENDING_PROPOSAL] <id>` marker found in its Comments and the first non-terminal dep ID; either may be empty when the block is from a different cause (manual block, review fail).
+- **Held tasks (with most recent [HOLD] reason):** every Task currently on `hold`, with the latest `[HOLD] <reason>` line from its Comments.
+
+Without `--detail` the panels are omitted (default invocation matches the historical output shape).
 
 ### `next`
 
@@ -91,6 +99,7 @@ Read-only one-screen live dashboard of the currently-active orchestration: mode,
 
 ```
 uv run devbench hook-tail [<path>] [--tz <zone>] [--no-follow] [--from-start]
+                          [--orchestrator-only | --orchestrator-session <id>]
 ```
 
 Read-only pretty-tail of the plugin hook event stream (`hook-logs.jsonl`). One-line colourised summary per PreToolUse / PostToolUse / SubagentStart / SubagentStop / Stop event. Complements `watch`: where `watch` shows current state, `hook-tail` shows events as they happen.
@@ -99,6 +108,10 @@ Read-only pretty-tail of the plugin hook event stream (`hook-logs.jsonl`). One-l
 - `--tz <zone>` overrides the display timezone (any IANA zone, for example `America/Denver`). When `--tz` is absent, `hook-tail` falls back to the top-level `display_timezone:` yaml key (or `JUDGE_DISPLAY_TIMEZONE` env), then to OS local. Internal storage stays in UTC.
 - `--no-follow` exits after emitting existing events instead of tailing.
 - `--from-start` emits every event from the beginning of the file before entering follow mode.
+- `--orchestrator-only` (Phase 11 / E230) filters the stream to events whose `orchestrator_session` field equals `$JUDGE_ORCHESTRATOR_SESSION_ID`. When the env var is unset the command exits 2 with an actionable error -- pass `--orchestrator-session <id>` instead to supply the value explicitly.
+- `--orchestrator-session <id>` filters by an explicit session id (audit / replay use case). Pre-Phase-11 log entries that lack the field are passed through unfiltered so historical events stay visible.
+
+The launch command in `caylent-telemetry-spec/devbench-launch-commands.txt` sets `JUDGE_ORCHESTRATOR_SESSION_ID` on both the orchestrator pane (so the plugin's `hook-logger.sh` stamps every event) and the hook-tail pane (so the filter has a value to match). Side-pane Claude sessions started ad-hoc inherit the workspace root but NOT the session id, so their tool calls land in the log with an empty `orchestrator_session` and are dropped by the filter -- a `tail -f hook-logs.jsonl` would still see them, but the pretty-printed orchestrator pane stays clean.
 
 See [hook-activity.md](hook-activity.md) for the event glyphs and the full column legend.
 
@@ -211,7 +224,7 @@ Set the work unit's status to `in-progress`. Fails if the unit is already in a t
 uv run devbench set-status <id> <status>
 ```
 
-Force any status on a work unit. Skips the done-gate and other workflow checks. Used for recovery (unblock a stuck unit, resurrect a declined unit) and for orchestrator-internal lifecycle transitions. Accepted values: `in-queue`, `in-progress`, `in-review`, `done`, `blocked`, `proposed`, `declined`.
+Force any status on a work unit. Skips the done-gate and other workflow checks. Used for recovery (unblock a stuck unit, resurrect a declined unit) and for orchestrator-internal lifecycle transitions. Accepted values: `in-queue`, `in-progress`, `in-review`, `done`, `blocked`, `proposed`, `declined`, `hold`.
 
 ### `mark-done`
 
@@ -228,6 +241,54 @@ uv run devbench decline <id> --reason "<message>"
 ```
 
 Mark a work unit `declined`: it will never be done. Used when the operator decides the unit's scope is being removed, the functionality is being deleted instead, or a different task delivered the same outcome. Declined children count as terminal-complete for parent rollup. See [ADR-05](adr/05-declined-status.md).
+
+### `hold`
+
+```
+uv run devbench hold <id> --reason "<message>"
+```
+
+Mark a work unit `hold`: it is intentionally deferred (under debate, awaiting external decision, scope being re-discussed). Held units are skipped by the orchestrator's `next`/parallel-candidate scan until an operator runs `unhold`. Unlike `declined`, `hold` is **not** terminal -- a held child keeps its parent open and uncounted toward auto-rollup. The `--reason` is REQUIRED so the deferral leaves an audit trail in the work-unit's Comments section (`[HOLD] <reason>`); em-dashes in the reason text are rejected at the input boundary. Multi-token reasons survive the dispatcher (the command is registered as variadic) so `--reason "needs product input on scope"` works without quoting tricks.
+
+### `unhold`
+
+```
+uv run devbench unhold <id> --reason "<message>"
+```
+
+Return a held work unit to `in-queue`. Refuses any unit whose current status is anything other than `hold` (fail-fast keeps the lifecycle linear -- use `set-status` for ad-hoc transitions). The `--reason` is REQUIRED and captured as `[UNHOLD] <reason>` in the Comments section, so a hold-then-unhold round-trip is fully reconstructible from the audit trail.
+
+### `new-task`
+
+```
+uv run devbench new-task --id <ID> --title "<TITLE>" --target <PATH>
+                         [--repo <ORG/REPO>]
+                         [--description <TEXT>]
+                         [--source-file <PATH>]
+                         [--test-file <PATH>]
+                         [--ac-func <TEXT>]
+```
+
+Scaffold a new work-unit `.md` file from the canonical template. Required flags: `--id`, `--title`, `--target`. The template kind is derived from the ID's last segment: `T` -> task, `S` -> story, `F` -> feature, `E` -> epic; an unrecognised shape exits 1 with an actionable error. The command refuses to overwrite an existing `--target` and refuses a `--target` whose parent directory is missing -- create the directory first or pick a different path.
+
+Optional flags fill `{{TOKEN}}` placeholders in the template. Tokens with no flag get a deterministic default (e.g. `--source-file` -> `src/<repo-name>/<id-lower>.py`, `--test-file` -> `tests/unit/test_<source-stem>.py`, `--ac-func` -> `"TBD: describe the functional outcome."`). The `--repo` flag also drives the `## Target Repository` section's `**Repo:**` line.
+
+Templates ship under `backlog/templates/{epic,feature,story,task}.md` in the devbench repo and cross-link to `docs/acceptance-criteria-canonical.md` and `docs/source-test-atomicity.md` for authoring rules.
+
+### `sync-blocked`
+
+```
+uv run devbench sync-blocked
+```
+
+Reconcile every task's status against current dependency satisfaction. Walks the parsed index and:
+
+- Flips `in-queue` Tasks whose dependencies are NOT satisfied to `blocked` (with a `[BLOCKED] sync-blocked: dependency '<id>' not yet terminal` audit comment naming the first offending dep).
+- Flips `blocked` Tasks whose dependencies are now satisfied (every dep -- including epic / feature / story-level deps that recurse into descendants -- is `done` or `declined`) back to `in-queue` (with a `[UNBLOCKED] sync-blocked: dependencies now terminal` audit comment).
+
+Tasks carrying an open `[BLOCKED_PENDING_PROPOSAL] <id>` marker are left alone -- the ADR-07 cascade owns that path. Tasks whose status is anything other than `in-queue` or `blocked` (e.g. `in-progress`, `in-review`, `done`, `declined`, `hold`, `proposed`) are also untouched. Output is a JSON envelope of the form `{"flipped_to_blocked": [...], "flipped_to_in_queue": [...]}` for scripting.
+
+Useful as a pre-flight sweep before `devbench next` (after manual edits to the backlog) and for triage when a backlog has drifted out of sync. Combine with `validate-backlog` for a complete consistency check.
 
 ### `start`
 
@@ -352,6 +413,10 @@ uv run devbench git-ops-finalize <repo>
 ```
 
 Single-branch mode only: push the shared branch and create one PR for every accumulated commit. Use once, after every work unit targeting this repo is done. See [README Single-branch mode](../README.md#single-branch-mode) and [architecture.md §6](architecture.md#6-multi-pr-vs-single-pr-mode).
+
+### `git-ops` orphan-pattern auto-emit (Phase 10 hardening)
+
+When the `git-ops` command refuses a commit because of detected orphan paths, the auto-emitted cleanup proposal claims `.gitignore`. If a pre-existing in-queue / blocked / proposed peer task already lists `.gitignore` in its own `## Changes Manifest`, the auto-emitter now scans the live index and auto-wires `add-dep <peer> <new-cleanup>` for every conflicting peer in the SAME repo. The dep-chain is what the E224 Manifest-Conflict rule already accepts as a valid resolution -- so a backlog that previously halted with `Manifest conflict on '.gitignore' ... claimed by <peer>, <new-cleanup>` now auto-resolves and the orchestrator continues without operator intervention. Tasks already in `done` / `declined` are skipped (they are terminal). The auto-wired peer IDs appear in the stderr message that the auto-emit prints.
 
 ### `cleanup-tracked-orphans`
 

@@ -91,13 +91,57 @@ IDs are case-insensitive in status matching but written in uppercase by conventi
 
 ## Status Values
 
-| Status | Meaning | Written as |
-|--------|---------|-----------|
-| In Queue | Ready to be picked up | `in-queue` |
-| In Progress | Agent is implementing | `in-progress` |
-| In Review | Staged, awaiting judge review | `in-review` |
-| Done | Merged and closed | `done` |
-| Blocked | Max retries exhausted or dependency blocked | `blocked` |
+| Status | Meaning | Written as | Terminal? |
+|--------|---------|-----------|-----------|
+| In Queue | Ready to be picked up | `in-queue` | no |
+| In Progress | Agent is implementing | `in-progress` | no |
+| In Review | Staged, awaiting judge review | `in-review` | no |
+| Done | Merged and closed | `done` | yes |
+| Blocked | Max retries exhausted or dependency blocked | `blocked` | no |
+| Proposed | Auto-emitted draft awaiting human promote / reject | `proposed` | no |
+| Declined | Will never be done; final operator decision | `declined` | yes |
+| Hold | Deferred / under debate; orchestrator skips it until `unhold` | `hold` | no |
+
+A status is *terminal* when a parent's auto-rollup treats it as complete. `done` and `declined` are terminal; `hold` is **not** -- a held child keeps its parent open. This guarantees that pausing a unit cannot accidentally close out its parent.
+
+The orchestrator's `next` query and parallel-candidate scan filter to `in-queue` and `in-progress` only, so `hold`, `declined`, and `blocked` units are skipped automatically. Operators move units in and out of `hold` with `devbench hold <id> --reason <text>` and `devbench unhold <id> --reason <text>` (both reasons are required and captured in the work-unit's Comments audit trail).
+
+### Validate-backlog rule list (E209)
+
+Every backlog must pass `devbench validate-backlog`. The full rule set is enforced by `BacklogManager.validate()`:
+
+1. Index row → file existence
+2. Index status mirrors work-unit Status
+3. No orphan work-unit files
+4. Every dep ID is a known work-unit ID
+5. Status Summary table counts match the index
+6. Tasks have non-empty `## Description`
+7. Tasks have at least one `AC-` row in `## Acceptance Criteria`
+8. Tasks have at least one row in `## Changes Manifest`
+9. Tasks have a `## Definition of Done` section
+10. No em-dash characters (U+2014) anywhere in work-unit content
+11. Manifest paths do not start with a `checkout_directory` prefix
+12. Manifest path conflicts (no two in-queue Tasks claim the same file)
+13. Language-AC alignment (non-Python tasks must mark Python ACs N/A)
+14. Source-test atomicity (every prod source has a paired test in the same Manifest)
+15. Required sections (`## Status:`, `## Dependencies`, `## Changes Manifest`) on every Task
+16. Status enum (every parsed `## Status:` value is in `VALID_STATUSES`)
+17. Dependency-ID format (every `## Dependencies` row's first cell matches `E[A-Z0-9]+(-F\d+)?(-S\d+)?(-T\d+)?`)
+18. Branch uniqueness (no two Tasks derive the same branch name; skipped under single-PR mode)
+
+Rules 15-17 were added by E209 to harden the contract; rule 18 was added by E219 to prevent silent branch collisions. Together they catch hand-edited drift that the runtime parser would later silently survive.
+
+#### Branch Uniqueness Rule (E219)
+
+Each Task pushes to a branch derived either from an explicit `- **Branch:** \`<name>\`` line in its work-unit file or from the canonical `backlog/<unit-id-lowercase>` template. Two Tasks resolving to the same branch would collide on push, breaking auto-merge and producing false review failures. `validate-backlog` reports the collision with both Task IDs so authors can rename one.
+
+The rule is skipped entirely when `git_ops.single_branch` is set in `devbench.yaml` -- under single-PR mode every task legitimately shares the configured branch.
+
+### Dependency satisfaction (E215)
+
+A Task's dependency is satisfied when the dep is in a terminal state (`done` or `declined`). Dependencies on non-task units (Epics, Features, Stories) are evaluated by walking every descendant TASK whose ID begins with `<dep_id>-`: every descendant must be terminal for the dep to count as satisfied. An Epic / Feature / Story with no Task descendants is vacuously satisfied. Unknown dep IDs (typos, drift) are also vacuously satisfied so the orchestrator's actionability scan does not deadlock; `validate-backlog` reports unknown deps as integrity errors so the typo cannot hide.
+
+`devbench sync-blocked` is the operator-facing tool for reconciling status against this rule -- run it after manual edits or to triage a drifted backlog. The orchestrator's `next` query enforces the same rule automatically.
 
 Status is stored in the **work unit file** (the `## Status:` line). `BACKLOG.md` is a derived index that mirrors the work-unit files; the work-unit file is the source of truth. `validate-backlog` reports mirror drift between the two as an error so it can be reconciled -- it does not auto-correct.
 

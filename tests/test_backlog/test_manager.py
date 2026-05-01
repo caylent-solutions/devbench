@@ -237,6 +237,48 @@ class TestMarkBlocked:
                 break
 
 
+class TestMarkHeldAndUnheld:
+    """E222: mark_held and unmark_held lifecycle methods."""
+
+    def test_mark_held_updates_both_files_and_writes_audit(
+        self,
+        tmp_work_unit_file: Path,
+        backlog_index_titlecase: Path,
+    ) -> None:
+        manager = BacklogManager()
+        manager.mark_held(tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1", "awaiting product input")
+
+        wu_content = tmp_work_unit_file.read_text()
+        assert "## Status: hold" in wu_content
+        assert "[HOLD]" in wu_content
+        assert "awaiting product input" in wu_content
+
+        index_content = backlog_index_titlecase.read_text()
+        for line in index_content.splitlines():
+            if "E0-F1-S1-T1" in line:
+                assert "hold" in line
+                break
+        else:
+            pytest.fail("E0-F1-S1-T1 row not found in BACKLOG.md after mark_held")
+
+    def test_unmark_held_returns_unit_to_in_queue_with_audit(
+        self,
+        tmp_work_unit_file: Path,
+        backlog_index_titlecase: Path,
+    ) -> None:
+        manager = BacklogManager()
+        manager.mark_held(tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1", "deferred")
+        manager.unmark_held(tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1", "input received")
+
+        wu_content = tmp_work_unit_file.read_text()
+        assert "## Status: in-queue" in wu_content
+        # Both audit markers must be present so the lifecycle is reconstructible.
+        assert "[HOLD]" in wu_content
+        assert "[UNHOLD]" in wu_content
+        assert "deferred" in wu_content
+        assert "input received" in wu_content
+
+
 class TestRollupParentStatus:
     """Test that marking the last child Done rolls up to parent."""
 
@@ -2957,3 +2999,224 @@ class TestValidateSourceTestPairs:
         )
         errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
         assert not any("no matching test in the same Manifest" in e for e in errors)
+
+
+class TestValidateRequiredSections:
+    """E209: every Task work-unit must declare Status, Dependencies, and Changes Manifest."""
+
+    def test_missing_dependencies_section_emits_error(self, tmp_path: Path, backlog_dir: Path) -> None:
+        wu = backlog_dir / "EX-F1-S1-T1.md"
+        wu.write_text(
+            "# EX-F1-S1-T1\n\n"
+            "## Status: in-queue\n\n"
+            "## Description\n\nTask body.\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-FUNC-001\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `f.py` | New |\n",
+            encoding="utf-8",
+        )
+        idx = _ValidateRuleHarness.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        assert any("missing required section '## Dependencies'" in e and "EX-F1-S1-T1" in e for e in errors)
+
+    def test_complete_task_emits_no_required_section_error(self, tmp_path: Path, backlog_dir: Path) -> None:
+        _ValidateRuleHarness.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `f.py` | new |\n| `tests/unit/test_f.py` | new |\n",
+        )
+        idx = _ValidateRuleHarness.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        assert not any("missing required section" in e for e in errors)
+
+
+class TestValidateStatusEnum:
+    """E209: every parsed ``## Status:`` value must be in VALID_STATUSES."""
+
+    def test_unknown_status_emits_error(self, tmp_path: Path, backlog_dir: Path) -> None:
+        wu = backlog_dir / "EX-F1-S1-T1.md"
+        wu.write_text(
+            "# EX-F1-S1-T1\n\n"
+            "## Status: pending-review\n\n"
+            "## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Type | Reason |\n|----|------|--------|\n| none | | |\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-FUNC-001\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `f.py` | New |\n\n"
+            "## Definition of Done\n\n- [ ] Done\n",
+            encoding="utf-8",
+        )
+        idx = _ValidateRuleHarness.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        assert any("invalid '## Status:' value 'pending-review'" in e and "EX-F1-S1-T1" in e for e in errors)
+
+    def test_hold_status_is_accepted(self, tmp_path: Path, backlog_dir: Path) -> None:
+        _ValidateRuleHarness.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `f.py` | new |\n| `tests/unit/test_f.py` | new |\n",
+            status="hold",
+        )
+        idx = _ValidateRuleHarness.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | hold | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        assert not any("invalid '## Status:'" in e for e in errors)
+
+
+class TestValidateDepIdFormat:
+    """E209: dep-row IDs in '## Dependencies' must match the canonical regex."""
+
+    def test_malformed_dep_id_emits_error(self, tmp_path: Path, backlog_dir: Path) -> None:
+        wu = backlog_dir / "EX-F1-S1-T1.md"
+        wu.write_text(
+            "# EX-F1-S1-T1\n\n"
+            "## Status: in-queue\n\n"
+            "## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Type | Reason |\n|----|------|--------|\n| TASK-123 | Task | dep |\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-FUNC-001\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `f.py` | New |\n\n"
+            "## Definition of Done\n\n- [ ] Done\n",
+            encoding="utf-8",
+        )
+        idx = _ValidateRuleHarness.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | TASK-123 | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        assert any("dependency ID 'TASK-123' does not match" in e and "EX-F1-S1-T1" in e for e in errors)
+
+    def test_canonical_dep_id_accepted(self, tmp_path: Path, backlog_dir: Path) -> None:
+        _ValidateRuleHarness.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `f1.py` | new |\n| `tests/unit/test_f1.py` | new |\n",
+        )
+        wu = backlog_dir / "EX-F1-S1-T2.md"
+        wu.write_text(
+            "# EX-F1-S1-T2\n\n"
+            "## Status: in-queue\n\n"
+            "## Description\n\nx\n\n"
+            "## Dependencies\n\n"
+            "| ID | Type | Reason |\n|----|------|--------|\n"
+            "| EX-F1-S1-T1 | Task | dep |\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-FUNC-001\n\n"
+            "## Changes Manifest\n\n"
+            "| File | Change |\n|------|--------|\n"
+            "| `f2.py` | New |\n| `tests/unit/test_f2.py` | new |\n\n"
+            "## Definition of Done\n\n- [ ] Done\n",
+            encoding="utf-8",
+        )
+        idx = _ValidateRuleHarness.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n"
+            "| EX-F1-S1-T2 | T2 | Task | in-queue | EX-F1-S1-T1 | ex/foo | `backlog/EX-F1-S1-T2.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        assert not any("does not match the" in e for e in errors)
+
+
+class TestValidateBranchUniqueness:
+    """E219: no two Tasks may derive the same branch name."""
+
+    def test_collision_emits_error(self, tmp_path: Path, backlog_dir: Path) -> None:
+        # Both tasks override the branch to the same explicit name.
+        for unit_id in ("EX-F1-S1-T1", "EX-F1-S1-T2"):
+            wu = backlog_dir / f"{unit_id}.md"
+            wu.write_text(
+                f"# {unit_id}\n\n"
+                "## Status: in-queue\n\n"
+                "- **Branch:** `feat/shared`\n\n"
+                "## Description\n\nx\n\n"
+                "## Dependencies\n\n| ID | Type | Reason |\n|----|------|--------|\n| none | | |\n\n"
+                "## Acceptance Criteria\n\n- [ ] AC-FUNC-001\n\n"
+                "## Changes Manifest\n\n| File | Change |\n|------|--------|\n"
+                f"| `{unit_id}.py` | new |\n| `tests/unit/test_{unit_id.lower()}.py` | new |\n\n"
+                "## Definition of Done\n\n- [ ] Done\n",
+                encoding="utf-8",
+            )
+        idx = _ValidateRuleHarness.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n"
+            "| EX-F1-S1-T2 | T2 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T2.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        assert any(
+            "Branch collision on 'feat/shared'" in e and "EX-F1-S1-T1" in e and "EX-F1-S1-T2" in e for e in errors
+        )
+
+    def test_canonical_branches_unique_no_error(self, tmp_path: Path, backlog_dir: Path) -> None:
+        for unit_id in ("EX-F1-S1-T1", "EX-F1-S1-T2"):
+            _ValidateRuleHarness.make_task(
+                backlog_dir,
+                unit_id,
+                "ex/foo",
+                f"| `{unit_id}.py` | new |\n| `tests/unit/test_{unit_id.lower()}.py` | new |\n",
+            )
+        idx = _ValidateRuleHarness.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n"
+            "| EX-F1-S1-T2 | T2 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T2.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        assert not any("Branch collision" in e for e in errors)
+
+    def test_single_branch_mode_skips_check(self, tmp_path: Path, backlog_dir: Path) -> None:
+        # Both tasks override to the same branch; under single-PR mode
+        # this is legitimate (the configured single_branch is shared).
+        for unit_id in ("EX-F1-S1-T1", "EX-F1-S1-T2"):
+            wu = backlog_dir / f"{unit_id}.md"
+            wu.write_text(
+                f"# {unit_id}\n\n"
+                "## Status: in-queue\n\n"
+                "- **Branch:** `feat/single-pr`\n\n"
+                "## Description\n\nx\n\n"
+                "## Dependencies\n\n| ID | Type | Reason |\n|----|------|--------|\n| none | | |\n\n"
+                "## Acceptance Criteria\n\n- [ ] AC-FUNC-001\n\n"
+                "## Changes Manifest\n\n| File | Change |\n|------|--------|\n"
+                f"| `{unit_id}.py` | new |\n| `tests/unit/test_{unit_id.lower()}.py` | new |\n\n"
+                "## Definition of Done\n\n- [ ] Done\n",
+                encoding="utf-8",
+            )
+        idx = _ValidateRuleHarness.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n"
+            "| EX-F1-S1-T2 | T2 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T2.md` |\n",
+        )
+        # Patch the runtime config so single_branch is set; the rule
+        # must short-circuit and emit no collision error.
+        from unittest.mock import patch as _patch
+
+        from devbench.config_loader import GitOpsConfig, RuntimeConfig
+
+        runtime = RuntimeConfig(git_ops=GitOpsConfig(single_branch="feat/single-pr"))
+        with _patch("devbench.config.RUNTIME_CONFIG", runtime):
+            errors = BacklogManager().validate(idx, tmp_path)
+        assert not any("Branch collision" in e for e in errors)
+
+
+class TestRequiredSectionsRowDefensiveSkips:
+    """Cover the empty-file-path-string defensive skip in `_check_required_sections`.
+
+    `_parse_backlog_rows` never returns rows with empty file_path strings
+    today, but the rule is hardened against that future-state to avoid
+    a crash when reading a directory path. Hit the branch directly via
+    a hand-crafted row tuple."""
+
+    def test_empty_file_path_string_is_skipped(self, tmp_path: Path) -> None:
+        manager = BacklogManager()
+        errors: list[str] = []
+        rows = [("EX-F1-S1-T1", "in-queue", "")]
+        manager._check_required_sections(rows, tmp_path, errors)
+        assert errors == []

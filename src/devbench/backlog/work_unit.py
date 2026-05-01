@@ -24,6 +24,7 @@ class WorkUnitStatus(Enum):
     BLOCKED = "Blocked"
     PROPOSED = "Proposed"
     DECLINED = "Declined"
+    HOLD = "Hold"
 
 
 class WorkUnitType(Enum):

@@ -70,11 +70,12 @@ DISPLAY_STATUS_VALUES: list[str] = [
     "Blocked",
     "Proposed",
     "Declined",
+    "Hold",
 ]
 
 # Backlog manager recognized status labels (title-case, as in markdown tables)
 TABLE_STATUS_VALUES: frozenset[str] = frozenset(
-    {"In Queue", "In Progress", "In Review", "Done", "Blocked", "Proposed", "Declined"}
+    {"In Queue", "In Progress", "In Review", "Done", "Blocked", "Proposed", "Declined", "Hold"}
 )
 
 # ---------------------------------------------------------------------------
@@ -136,6 +137,13 @@ STATUS_DONE: str = "done"
 STATUS_BLOCKED: str = "blocked"
 STATUS_PROPOSED: str = "proposed"
 STATUS_DECLINED: str = "declined"
+# Held units are deliberately deferred (under debate, awaiting external
+# decision). The orchestrator's next-query and parallel-candidate scan
+# both skip held units the same way they skip declined ones, but unlike
+# declined a held unit is non-terminal -- parent rollups do NOT count
+# held children as complete; an operator must explicitly unhold to
+# return the unit to the in-queue lifecycle.
+STATUS_HOLD: str = "hold"
 
 # Ordered mapping from any accepted input form to the canonical write form.
 # Used by BacklogManager._set_status() for validation and normalisation.
@@ -147,6 +155,7 @@ VALID_STATUSES: dict[str, str] = {
     STATUS_BLOCKED: STATUS_BLOCKED,
     STATUS_PROPOSED: STATUS_PROPOSED,
     STATUS_DECLINED: STATUS_DECLINED,
+    STATUS_HOLD: STATUS_HOLD,
 }
 
 # ---------------------------------------------------------------------------

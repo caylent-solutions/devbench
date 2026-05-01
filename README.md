@@ -42,6 +42,7 @@ Pick the doc closest to your role.
 - [Configuration](#configuration)
 - [Workspace setup](#workspace-setup)
 - [Interactive mode](#interactive-mode)
+- [Remote EC2 dev environments](#remote-ec2-dev-environments)
 - [Troubleshooting](#troubleshooting)
 
 ## How it works
@@ -261,6 +262,10 @@ make start-interactive
 ```
 
 Both start modes authenticate with GitHub (or skip when `GH_TOKEN` is set), grant required scopes (repo, workflow, read:org, admin:repo_hook, security_events), and launch the orchestrator.
+
+## Remote EC2 dev environments
+
+For unattended runs, multi-operator workflows, or multiple parallel orchestrate sessions per operator, run the orchestrator on a remote EC2 dev box instead of in your local devcontainer. The provisioning stack (Terraform + Terragrunt + Ansible + a per-user multi-session launcher) is documented end-to-end in [`docs/remote-ec2-setup.md`](docs/remote-ec2-setup.md). It covers prerequisites, shared-infra provisioning, per-user instance stamping, Ansible bootstrap, the `devbench-session` launcher, environment configuration (including the E230 `JUDGE_ORCHESTRATOR_SESSION_ID` filter), and refresh / teardown workflows.
 
 ## Troubleshooting
 

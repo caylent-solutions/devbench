@@ -118,6 +118,122 @@ class TestCmdStatus:
         assert "1 blocked" in capsys.readouterr().out
 
 
+class TestCmdStatusDetail:
+    """E220: ``devbench status --detail`` renders in-queue / blocked / held panels."""
+
+    def _build_backlog(self, tmp_path: Path) -> Path:
+        wu_dir = tmp_path / "backlog"
+        wu_dir.mkdir(exist_ok=True)
+        # T1 in-queue ready (no deps); T2 in-queue waiting on T1; T3 blocked
+        # with an open proposal marker; T4 held with a [HOLD] reason.
+        rows = [
+            ("E0-F1-S1-T1", "Task", "in-queue", "None", "E0-F1-S1-T1", ""),
+            ("E0-F1-S1-T2", "Task", "in-queue", "E0-F1-S1-T1", "E0-F1-S1-T2", ""),
+            (
+                "E0-F1-S1-T3",
+                "Task",
+                "blocked",
+                "None",
+                "E0-F1-S1-T3",
+                "## Comments\n\n[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T9\n",
+            ),
+            (
+                "E0-F1-S1-T4",
+                "Task",
+                "hold",
+                "None",
+                "E0-F1-S1-T4",
+                "## Comments\n\n[HOLD] awaiting product input\n",
+            ),
+        ]
+        index_lines = [
+            "# Backlog\n",
+            "## Full Work Unit Index\n",
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |",
+            "|----|-------|------|--------|--------------|------|-----------|",
+        ]
+        for unit_id, unit_type, status, deps, basename, comments in rows:
+            file_path = f"backlog/{basename}.md"
+            index_lines.append(
+                f"| {unit_id} | {unit_id} | {unit_type} | {status} | {deps} | "
+                f"caylent-solutions/test-repo | `{file_path}` |"
+            )
+            wu_body = f"# {unit_id}: Test\n\n## Status: {status}\n\n## Description\n\nx\n"
+            if deps and deps != "None":
+                dep_rows = "\n".join(f"| {d.strip()} | Task | dep |" for d in deps.split(","))
+                wu_body += f"\n## Dependencies\n\n| ID | Type | Reason |\n|----|------|--------|\n{dep_rows}\n"
+            if comments:
+                wu_body += f"\n{comments}"
+            (wu_dir / f"{basename}.md").write_text(wu_body)
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text("\n".join(index_lines) + "\n")
+        return index_path
+
+    def test_detail_renders_three_panels(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        index_path = self._build_backlog(tmp_path)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_status("--detail")
+        assert rc == 0
+        out = capsys.readouterr().out
+        # In-queue panel: T1 ready, T2 waiting on T1
+        assert "In-queue tasks" in out
+        assert "[ready]" in out
+        assert "E0-F1-S1-T1" in out
+        assert "[waiting]" in out
+        assert "blocker: E0-F1-S1-T1" in out
+        # Blocked panel: T3 with pending proposal marker
+        assert "Blocked tasks" in out
+        assert "pending proposal E0-F1-S1-T9" in out
+        # Held panel: T4 with HOLD reason
+        assert "Held tasks" in out
+        assert "awaiting product input" in out
+
+    def test_default_invocation_omits_detail_panels(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        index_path = self._build_backlog(tmp_path)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_status()
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "Backlog Status Summary" in out
+        assert "In-queue tasks" not in out
+        assert "Held tasks" not in out
+
+    def test_unknown_positional_arg_rejected(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        rc = cli.cmd_status("garbage")
+        assert rc == 1
+        assert "no positional args" in capsys.readouterr().err
+
+    def test_status_is_variadic(self) -> None:
+        assert "status" in cli._VARIADIC_COMMANDS
+
+
+class TestLatestHoldReason:
+    """Cover the helper that extracts the most recent [HOLD] line from Comments."""
+
+    def test_returns_last_match_when_multiple(self) -> None:
+        content = "## Comments\n\n[HOLD] first reason\n[UNHOLD] back to queue\n[HOLD] second reason\n"
+        assert cli._latest_hold_reason(content) == "second reason"
+
+    def test_returns_empty_when_no_hold_line(self) -> None:
+        content = "## Comments\n\n[BLOCKED] dep not met\n"
+        assert cli._latest_hold_reason(content) == ""
+
+
 class TestCmdNext:
     """Test cmd_next command."""
 
@@ -132,7 +248,14 @@ class TestCmdNext:
         assert result == 0
         output = capsys.readouterr().out.strip()
         data = json.loads(output)
+        # TD-12: assert the full envelope shape, not just one field, so a
+        # regression in any envelope key (renamed, dropped, mistyped) is
+        # caught here rather than at a downstream parser.
         assert data["id"] == "E0-F1-S1-T2"
+        assert data["title"] == "Second Task"
+        assert data["repo"] == "caylent-solutions/git-repo"
+        assert data["file_path"] == str(Path("backlog/E0-F1-S1-T2.md"))
+        assert data["dependencies"] == ["E0-F1-S1-T1"]
 
     def test_prints_all_done_when_complete(self, capsys: pytest.CaptureFixture) -> None:
         done_unit = WorkUnit(
@@ -5115,6 +5238,571 @@ class TestCmdDecline:
         assert "decline" in cli._COMMANDS
 
 
+class TestCmdHold:
+    """E222: ``devbench hold <id> --reason <text>`` command."""
+
+    def _make_minimal_unit(self, tmp_path: Path, unit_id: str = "EX-F1-S1-T1") -> tuple[Path, Path]:
+        backlog_md = tmp_path / "BACKLOG.md"
+        backlog_md.write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            f"| {unit_id} | Test | Task | in-queue | None | caylent-solutions/git-repo | `backlog/{unit_id}.md` |\n"
+        )
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir(exist_ok=True)
+        wu_file = backlog_dir / f"{unit_id}.md"
+        wu_file.write_text(f"# {unit_id}: Test\n\n## Status: in-queue\n\n## Description\n\nx\n")
+        return backlog_md, wu_file
+
+    def test_happy_path_flips_status_and_audits(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        backlog_md, wu_file = self._make_minimal_unit(tmp_path)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_hold("EX-F1-S1-T1", "--reason", "awaiting upstream decision")
+        assert rc == 0
+        content = wu_file.read_text()
+        assert "## Status: hold" in content
+        assert "[HOLD]" in content
+        assert "awaiting upstream decision" in content
+        out = json.loads(capsys.readouterr().out.strip())
+        assert out == {
+            "task_id": "EX-F1-S1-T1",
+            "status": "hold",
+            "reason": "awaiting upstream decision",
+        }
+
+    def test_missing_reason_rejected(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_hold("EX-F1-S1-T1")
+        assert rc == 1
+        assert "requires" in capsys.readouterr().err
+
+    def test_reason_without_value_rejected(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_hold("EX-F1-S1-T1", "--reason")
+        assert rc == 1
+        assert "requires a value" in capsys.readouterr().err
+
+    def test_em_dash_in_reason_blocked(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        backlog_md, _ = self._make_minimal_unit(tmp_path)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+        ):
+            rc = cli.cmd_hold("EX-F1-S1-T1", "--reason", "bad—reason")
+        assert rc == 1
+        assert "em-dash" in capsys.readouterr().err
+
+    def test_unknown_unit_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        backlog_md, _ = self._make_minimal_unit(tmp_path)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+        ):
+            rc = cli.cmd_hold("NO-SUCH-ID", "--reason", "n/a")
+        assert rc == 1
+        assert "not found" in capsys.readouterr().err
+
+    def test_registered_in_commands(self) -> None:
+        assert "hold" in cli._COMMANDS
+
+    def test_is_variadic_so_multi_token_reason_reaches_handler(self) -> None:
+        assert "hold" in cli._VARIADIC_COMMANDS
+
+
+class TestCmdUnhold:
+    """E222: ``devbench unhold <id> --reason <text>`` returns held units to in-queue."""
+
+    def _make_held_unit(self, tmp_path: Path, unit_id: str = "EX-F1-S1-T1") -> tuple[Path, Path]:
+        backlog_md = tmp_path / "BACKLOG.md"
+        backlog_md.write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            f"| {unit_id} | Test | Task | hold | None | caylent-solutions/git-repo | `backlog/{unit_id}.md` |\n"
+        )
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir(exist_ok=True)
+        wu_file = backlog_dir / f"{unit_id}.md"
+        wu_file.write_text(f"# {unit_id}: Test\n\n## Status: hold\n\n## Description\n\nx\n")
+        return backlog_md, wu_file
+
+    def test_happy_path_returns_held_unit_to_in_queue(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        backlog_md, wu_file = self._make_held_unit(tmp_path)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_unhold("EX-F1-S1-T1", "--reason", "blocker resolved")
+        assert rc == 0
+        content = wu_file.read_text()
+        assert "## Status: in-queue" in content
+        assert "[UNHOLD]" in content
+        assert "blocker resolved" in content
+        out = json.loads(capsys.readouterr().out.strip())
+        assert out == {
+            "task_id": "EX-F1-S1-T1",
+            "status": "in-queue",
+            "reason": "blocker resolved",
+        }
+
+    def test_refuses_unit_not_currently_held(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # Build an in-queue unit (not held) and assert unhold refuses it.
+        backlog_md = tmp_path / "BACKLOG.md"
+        backlog_md.write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| EX-F1-S1-T1 | Test | Task | in-queue | None | caylent-solutions/git-repo | `backlog/EX-F1-S1-T1.md` |\n"
+        )
+        wu_dir = tmp_path / "backlog"
+        wu_dir.mkdir(exist_ok=True)
+        (wu_dir / "EX-F1-S1-T1.md").write_text("# EX-F1-S1-T1: Test\n\n## Status: in-queue\n\n## Description\n\nx\n")
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", wu_dir),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+        ):
+            rc = cli.cmd_unhold("EX-F1-S1-T1", "--reason", "n/a")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "expected 'Hold'" in err
+
+    def test_missing_reason_rejected(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_unhold("EX-F1-S1-T1")
+        assert rc == 1
+        assert "requires" in capsys.readouterr().err
+
+    def test_unknown_unit_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        backlog_md, _ = self._make_held_unit(tmp_path)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+        ):
+            rc = cli.cmd_unhold("NO-SUCH-ID", "--reason", "n/a")
+        assert rc == 1
+        assert "not found" in capsys.readouterr().err
+
+    def test_registered_in_commands(self) -> None:
+        assert "unhold" in cli._COMMANDS
+
+    def test_is_variadic(self) -> None:
+        assert "unhold" in cli._VARIADIC_COMMANDS
+
+
+class TestWireOrphanCleanupDepChain:
+    """Phase 10: orphan-cleanup auto-emission resolves Manifest collisions via auto-wired deps."""
+
+    def _build_minimal_backlog(
+        self,
+        tmp_path: Path,
+        peer_status: str = "in-queue",
+        cleanup_id: str = "E0-F1-S1-T9",
+        peer_id: str = "E0-F1-S1-T2",
+        repo: str = "ex/foo",
+    ) -> Path:
+        """Render a backlog where ``peer_id`` already claims `.gitignore`.
+
+        ``cleanup_id`` represents the just-emitted cleanup task; the
+        helper assumes it has been materialised on disk separately
+        (the test populates a stub work-unit so ``add_dep``'s
+        index-presence check passes).
+        """
+        wu_dir = tmp_path / "backlog"
+        wu_dir.mkdir(exist_ok=True)
+        # Peer task: claims .gitignore in its manifest.
+        (wu_dir / f"{peer_id}.md").write_text(
+            f"# {peer_id}: peer\n\n"
+            f"## Status: {peer_status}\n\n"
+            "## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Type | Reason |\n|----|------|--------|\n| none | | |\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-FUNC-001\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n"
+            "| `.gitignore` | edit |\n| `peer.py` | new |\n\n"
+            "## Definition of Done\n\n- [ ] Done\n",
+            encoding="utf-8",
+        )
+        # Cleanup task: claims .gitignore (the auto-emitted target).
+        (wu_dir / f"{cleanup_id}.md").write_text(
+            f"# {cleanup_id}: cleanup\n\n"
+            "## Status: in-queue\n\n"
+            "## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Type | Reason |\n|----|------|--------|\n| none | | |\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-FUNC-001\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n"
+            "| `.gitignore` | edit |\n\n"
+            "## Definition of Done\n\n- [ ] Done\n",
+            encoding="utf-8",
+        )
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            f"| {peer_id} | peer | Task | {peer_status} | none | {repo} | `backlog/{peer_id}.md` |\n"
+            f"| {cleanup_id} | cleanup | Task | in-queue | none | {repo} | `backlog/{cleanup_id}.md` |\n",
+            encoding="utf-8",
+        )
+        return index_path
+
+    def test_wires_dep_when_peer_claims_same_path(self, tmp_path: Path) -> None:
+        index_path = self._build_minimal_backlog(tmp_path)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            wired = cli._wire_orphan_cleanup_dep_chain(
+                new_id="E0-F1-S1-T9",
+                files_to_own=[".gitignore"],
+                unit_repo="ex/foo",
+            )
+        assert wired == ["E0-F1-S1-T2"]
+        peer_content = (tmp_path / "backlog" / "E0-F1-S1-T2.md").read_text()
+        # The dep row was added to the peer's Dependencies table.
+        assert "E0-F1-S1-T9" in peer_content
+
+    def test_no_collision_returns_empty(self, tmp_path: Path) -> None:
+        # Build a backlog where the only peer task claims a different path.
+        wu_dir = tmp_path / "backlog"
+        wu_dir.mkdir(exist_ok=True)
+        (wu_dir / "E0-F1-S1-T2.md").write_text(
+            "# E0-F1-S1-T2: peer\n\n## Status: in-queue\n\n## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Type | Reason |\n|----|------|--------|\n| none | | |\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-FUNC-001\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `peer.py` | new |\n\n"
+            "## Definition of Done\n\n- [ ] Done\n",
+            encoding="utf-8",
+        )
+        (wu_dir / "E0-F1-S1-T9.md").write_text(
+            "# E0-F1-S1-T9: cleanup\n\n## Status: in-queue\n\n## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Type | Reason |\n|----|------|--------|\n| none | | |\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-FUNC-001\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `.gitignore` | edit |\n\n"
+            "## Definition of Done\n\n- [ ] Done\n",
+            encoding="utf-8",
+        )
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T2 | peer | Task | in-queue | none | ex/foo | `backlog/E0-F1-S1-T2.md` |\n"
+            "| E0-F1-S1-T9 | cleanup | Task | in-queue | none | ex/foo | `backlog/E0-F1-S1-T9.md` |\n",
+            encoding="utf-8",
+        )
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            wired = cli._wire_orphan_cleanup_dep_chain(
+                new_id="E0-F1-S1-T9",
+                files_to_own=[".gitignore"],
+                unit_repo="ex/foo",
+            )
+        assert wired == []
+
+    def test_skips_done_and_declined_peers(self, tmp_path: Path) -> None:
+        # Done peers cannot be wired (add_dep refuses terminal blockers anyway).
+        index_path = self._build_minimal_backlog(tmp_path, peer_status="done")
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            wired = cli._wire_orphan_cleanup_dep_chain(
+                new_id="E0-F1-S1-T9",
+                files_to_own=[".gitignore"],
+                unit_repo="ex/foo",
+            )
+        assert wired == []
+
+
+class TestCmdNewTask:
+    """E223: ``devbench new-task`` scaffolds a work-unit file from a template."""
+
+    def test_renders_task_template_with_substitutions(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        target = tmp_path / "E0-F1-S1-T1.md"
+        rc = cli.cmd_new_task(
+            "--id",
+            "E0-F1-S1-T1",
+            "--title",
+            "Implement foo",
+            "--target",
+            str(target),
+            "--repo",
+            "ex/foo",
+            "--description",
+            "Foo capability.",
+            "--source-file",
+            "src/foo/handler.py",
+            "--test-file",
+            "tests/unit/test_handler.py",
+            "--ac-func",
+            "the function returns the right answer",
+        )
+        assert rc == 0
+        out = json.loads(capsys.readouterr().out.strip())
+        assert out == {"id": "E0-F1-S1-T1", "kind": "task", "target": str(target)}
+        rendered = target.read_text()
+        assert "# E0-F1-S1-T1: Implement foo" in rendered
+        assert "## Status: in-queue" in rendered
+        assert "Foo capability." in rendered
+        assert "src/foo/handler.py" in rendered
+        assert "tests/unit/test_handler.py" in rendered
+        assert "the function returns the right answer" in rendered
+        assert "backlog/e0-f1-s1-t1" in rendered
+
+    def test_collision_with_existing_target_refused(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        target = tmp_path / "exists.md"
+        target.write_text("already there")
+        rc = cli.cmd_new_task(
+            "--id",
+            "E0-F1-S1-T1",
+            "--title",
+            "x",
+            "--target",
+            str(target),
+        )
+        assert rc == 1
+        assert "already exists" in capsys.readouterr().err
+
+    def test_missing_parent_dir_refused(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        target = tmp_path / "no-such-dir" / "wu.md"
+        rc = cli.cmd_new_task(
+            "--id",
+            "E0-F1-S1-T1",
+            "--title",
+            "x",
+            "--target",
+            str(target),
+        )
+        assert rc == 1
+        assert "does not exist" in capsys.readouterr().err
+
+    def test_missing_required_flag_refused(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        rc = cli.cmd_new_task("--id", "E0-F1-S1-T1", "--title", "x")
+        assert rc == 1
+        assert "--target is required" in capsys.readouterr().err
+
+    def test_unknown_flag_refused(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        rc = cli.cmd_new_task("--bogus", "x")
+        assert rc == 1
+        assert "unknown flag" in capsys.readouterr().err
+
+    def test_template_kind_inferred_from_id(self, tmp_path: Path) -> None:
+        target = tmp_path / "E0-F1-S1.md"
+        rc = cli.cmd_new_task(
+            "--id",
+            "E0-F1-S1",
+            "--title",
+            "Story title",
+            "--target",
+            str(target),
+        )
+        assert rc == 0
+        assert "# E0-F1-S1: Story title" in target.read_text()
+
+    def test_invalid_id_shape_refused(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        target = tmp_path / "wu.md"
+        rc = cli.cmd_new_task(
+            "--id",
+            "Q-NOT-VALID",
+            "--title",
+            "x",
+            "--target",
+            str(target),
+        )
+        assert rc == 1
+        assert "cannot derive template kind" in capsys.readouterr().err
+
+    def test_flag_without_value_refused(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        rc = cli.cmd_new_task("--id")
+        assert rc == 1
+        assert "--id requires a value" in capsys.readouterr().err
+
+    def test_registered_in_commands(self) -> None:
+        assert "new-task" in cli._COMMANDS
+
+    def test_is_variadic(self) -> None:
+        assert "new-task" in cli._VARIADIC_COMMANDS
+
+
+class TestCmdSyncBlocked:
+    """E215: ``devbench sync-blocked`` reconciles task status against dep satisfaction."""
+
+    def _build_backlog(
+        self,
+        tmp_path: Path,
+        rows: list[tuple[str, str, str, str, str]],
+    ) -> Path:
+        index_lines = [
+            "# Backlog\n",
+            "## Full Work Unit Index\n",
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |",
+            "|----|-------|------|--------|--------------|------|-----------|",
+        ]
+        wu_dir = tmp_path / "backlog"
+        wu_dir.mkdir(exist_ok=True)
+        for unit_id, unit_type, status, deps, basename in rows:
+            file_path = f"backlog/{basename}.md"
+            index_lines.append(
+                f"| {unit_id} | {unit_id} | {unit_type} | {status} | {deps} | "
+                f"caylent-solutions/test-repo | `{file_path}` |"
+            )
+            wu_file = wu_dir / f"{basename}.md"
+            wu_body = f"# {unit_id}: Test\n\n## Status: {status}\n\n## Description\n\nx\n"
+            if deps and deps != "None":
+                dep_rows = "\n".join(f"| {d.strip()} | Task | dep |" for d in deps.split(","))
+                wu_body += f"\n## Dependencies\n\n| ID | Type | Reason |\n|----|------|--------|\n{dep_rows}\n"
+            wu_file.write_text(wu_body)
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text("\n".join(index_lines) + "\n")
+        return index_path
+
+    def test_in_queue_with_unsatisfied_dep_flips_to_blocked(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        index_path = self._build_backlog(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Task", "in-queue", "None", "E0-F1-S1-T1"),
+                ("E0-F1-S1-T2", "Task", "in-queue", "E0-F1-S1-T1", "E0-F1-S1-T2"),
+            ],
+        )
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_sync_blocked()
+        assert rc == 0
+        envelope = json.loads(capsys.readouterr().out.strip())
+        assert envelope["flipped_to_blocked"] == ["E0-F1-S1-T2"]
+        assert envelope["flipped_to_in_queue"] == []
+        t2 = (tmp_path / "backlog" / "E0-F1-S1-T2.md").read_text()
+        assert "## Status: blocked" in t2
+        assert "[BLOCKED]" in t2
+        assert "E0-F1-S1-T1" in t2
+
+    def test_blocked_with_satisfied_deps_flips_to_in_queue(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        index_path = self._build_backlog(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Task", "done", "None", "E0-F1-S1-T1"),
+                ("E0-F1-S1-T2", "Task", "blocked", "E0-F1-S1-T1", "E0-F1-S1-T2"),
+            ],
+        )
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_sync_blocked()
+        assert rc == 0
+        envelope = json.loads(capsys.readouterr().out.strip())
+        assert envelope["flipped_to_blocked"] == []
+        assert envelope["flipped_to_in_queue"] == ["E0-F1-S1-T2"]
+        t2 = (tmp_path / "backlog" / "E0-F1-S1-T2.md").read_text()
+        assert "## Status: in-queue" in t2
+        assert "[UNBLOCKED]" in t2
+
+    def test_blocked_with_open_proposal_marker_is_skipped(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        index_path = self._build_backlog(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Task", "done", "None", "E0-F1-S1-T1"),
+                ("E0-F1-S1-T2", "Task", "blocked", "E0-F1-S1-T1", "E0-F1-S1-T2"),
+            ],
+        )
+        t2_path = tmp_path / "backlog" / "E0-F1-S1-T2.md"
+        t2_path.write_text(t2_path.read_text() + "\n## Comments\n\n[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T9\n")
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_sync_blocked()
+        assert rc == 0
+        envelope = json.loads(capsys.readouterr().out.strip())
+        assert envelope["flipped_to_in_queue"] == []
+        assert "## Status: blocked" in t2_path.read_text()
+
+    def test_story_level_dep_recursion(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        index_path = self._build_backlog(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1", "Story", "in-queue", "None", "E0-F1-S1"),
+                ("E0-F1-S1-T1", "Task", "in-queue", "None", "E0-F1-S1-T1"),
+                ("E0-F1-S2-T1", "Task", "in-queue", "E0-F1-S1", "E0-F1-S2-T1"),
+            ],
+        )
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_sync_blocked()
+        assert rc == 0
+        envelope = json.loads(capsys.readouterr().out.strip())
+        assert "E0-F1-S2-T1" in envelope["flipped_to_blocked"]
+        assert "E0-F1-S1-T1" not in envelope["flipped_to_blocked"]
+
+    def test_registered_in_commands(self) -> None:
+        assert "sync-blocked" in cli._COMMANDS
+
+
 class TestCmdHookTail:
     """``devbench hook-tail`` argument parsing and dispatcher registration.
 
@@ -5157,6 +5845,24 @@ class TestCmdHookTail:
         captured = capsys.readouterr()
         assert "unknown timezone" in captured.err
         assert "Not/AZone" in captured.err
+
+    def test_orchestrator_only_without_env_returns_2(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        monkeypatch.delenv("JUDGE_ORCHESTRATOR_SESSION_ID", raising=False)
+        rc = cli.cmd_hook_tail("--orchestrator-only", "--no-follow")
+        assert rc == 2
+        assert "JUDGE_ORCHESTRATOR_SESSION_ID" in capsys.readouterr().err
+
+    def test_orchestrator_session_missing_value_returns_2(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        rc = cli.cmd_hook_tail("--orchestrator-session")
+        assert rc == 2
+        assert "--orchestrator-session requires a value" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------

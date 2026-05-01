@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
+from typing import ClassVar
 
 from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
 from devbench.config import BACKLOG_INDEX, BACKLOG_ROOT
@@ -25,6 +26,7 @@ from devbench.constants import (
     STATUS_BLOCKED,
     STATUS_DECLINED,
     STATUS_DONE,
+    STATUS_HOLD,
     STATUS_IN_PROGRESS,
     STATUS_IN_QUEUE,
     STATUS_IN_REVIEW,
@@ -44,6 +46,7 @@ _RAW_STATUS_TO_ENUM: dict[str, WorkUnitStatus] = {
     STATUS_BLOCKED: WorkUnitStatus.BLOCKED,
     STATUS_PROPOSED: WorkUnitStatus.PROPOSED,
     STATUS_DECLINED: WorkUnitStatus.DECLINED,
+    STATUS_HOLD: WorkUnitStatus.HOLD,
 }
 
 # Pattern to determine work-unit type from the last segment of a compound ID.
@@ -314,18 +317,13 @@ class BacklogParser:
         A task is *actionable* when:
         - Its status is ``IN_QUEUE`` or ``IN_PROGRESS`` (resume interrupted work)
         - Its type is ``TASK``
-        - All of its *task-level* dependencies have status ``DONE``
+        - All of its dependencies are satisfied (see :meth:`_deps_satisfied`)
 
         ``IN_PROGRESS`` tasks are returned before ``IN_QUEUE`` tasks so that
         interrupted work is resumed before new work is started.
-
-        Dependencies on non-task units (Stories, Features, Epics) are treated
-        as structural parent relationships and are always considered satisfied.
-        Only task-to-task dependencies are blocking.
         """
         actionable_statuses = {WorkUnitStatus.IN_QUEUE, WorkUnitStatus.IN_PROGRESS}
-        done_ids = self._done_ids(units)
-        task_ids = self._task_ids(units)
+        units_by_id = {u.id: u for u in units}
         candidates: list[WorkUnit] = []
 
         for unit in units:
@@ -333,7 +331,7 @@ class BacklogParser:
                 continue
             if unit.unit_type is not WorkUnitType.TASK:
                 continue
-            if not self._deps_satisfied(unit, done_ids, task_ids):
+            if not self._deps_satisfied(unit, units_by_id):
                 continue
             candidates.append(unit)
 
@@ -347,25 +345,59 @@ class BacklogParser:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _done_ids(units: list[WorkUnit]) -> frozenset[str]:
-        """Collect IDs of all units with status ``DONE``."""
-        return frozenset(u.id for u in units if u.status is WorkUnitStatus.DONE)
+    # Statuses that satisfy a dependency: ``done`` (intentional completion) and
+    # ``declined`` (intentional non-completion). Mirrors
+    # ``BacklogManager._TERMINAL_CHILD_STATUSES`` so the orchestrator's
+    # actionability scan and the rollup logic agree on what "finished" means.
+    _DEP_TERMINAL_STATUSES: ClassVar[frozenset[WorkUnitStatus]] = frozenset(
+        {WorkUnitStatus.DONE, WorkUnitStatus.DECLINED}
+    )
 
-    @staticmethod
-    def _task_ids(units: list[WorkUnit]) -> frozenset[str]:
-        """Collect IDs of all units whose type is ``TASK``."""
-        return frozenset(u.id for u in units if u.unit_type is WorkUnitType.TASK)
+    @classmethod
+    def _deps_satisfied(cls, unit: WorkUnit, units_by_id: dict[str, WorkUnit]) -> bool:
+        """Return ``True`` if every dependency of ``unit`` is satisfied.
 
-    @staticmethod
-    def _deps_satisfied(unit: WorkUnit, done_ids: frozenset[str], task_ids: frozenset[str]) -> bool:
-        """Return ``True`` if all blocking dependencies are satisfied.
+        Dependency types and their satisfaction rules:
 
-        Only dependencies that refer to other *tasks* are blocking.
-        Dependencies on stories, features, or epics are structural
-        parent relationships and are always considered satisfied.
+        - **Task dep** (``T`` segment): satisfied when the dep task's status
+          is ``done`` or ``declined``.
+        - **Epic / Feature / Story dep** (no ``T`` segment): satisfied when
+          EVERY descendant task whose ID starts with ``<dep_id>-`` is in a
+          terminal state. An epic/feature/story with no task descendants is
+          vacuously satisfied -- there is nothing to wait on.
+        - **Unknown dep ID** (not in ``units_by_id``): treated as satisfied
+          so the orchestrator does not deadlock on a typo'd ID;
+          ``validate-backlog`` reports unknown deps as integrity errors so
+          the typo cannot hide indefinitely.
+
+        This replaces the prior task-only check that silently returned
+        ``True`` for every story/feature/epic dep -- a deadlock-hiding
+        gap that let parallel-candidate scans hand out tasks whose
+        parent-level prerequisites had not yet completed.
         """
-        return all(dep not in task_ids or dep in done_ids for dep in unit.dependencies)
+        for dep_id in unit.dependencies:
+            dep_unit = units_by_id.get(dep_id)
+            if dep_unit is None:
+                # Unknown ID: treat as satisfied; validate-backlog reports
+                # the integrity error so the typo cannot hide.
+                continue
+            if dep_unit.unit_type is WorkUnitType.TASK:
+                if dep_unit.status not in cls._DEP_TERMINAL_STATUSES:
+                    return False
+                continue
+            # Non-task dep: every descendant TASK must be terminal. Walk
+            # the units list rather than recursing through the hierarchy
+            # -- IDs are flat-prefixed so a starts-with comparison covers
+            # every descendant level (Feature -> Story -> Task).
+            descendants = [
+                u
+                for u in units_by_id.values()
+                if u.id != dep_id and u.id.startswith(dep_id + "-") and u.unit_type is WorkUnitType.TASK
+            ]
+            for descendant in descendants:
+                if descendant.status not in cls._DEP_TERMINAL_STATUSES:
+                    return False
+        return True
 
     @staticmethod
     def _parse_dependency_table(content: str) -> list[str]:

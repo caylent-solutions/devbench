@@ -29,13 +29,25 @@ class TestWorkUnitStatusEnum:
 
     def test_all_statuses_present(self) -> None:
         names = {s.name for s in WorkUnitStatus}
-        assert names == {"IN_QUEUE", "IN_PROGRESS", "IN_REVIEW", "DONE", "BLOCKED", "PROPOSED", "DECLINED"}
+        assert names == {
+            "IN_QUEUE",
+            "IN_PROGRESS",
+            "IN_REVIEW",
+            "DONE",
+            "BLOCKED",
+            "PROPOSED",
+            "DECLINED",
+            "HOLD",
+        }
 
     def test_proposed_value(self) -> None:
         assert WorkUnitStatus.PROPOSED.value == "Proposed"
 
     def test_declined_value(self) -> None:
         assert WorkUnitStatus.DECLINED.value == "Declined"
+
+    def test_hold_value(self) -> None:
+        assert WorkUnitStatus.HOLD.value == "Hold"
 
 
 class TestWorkUnitTypeEnum:
@@ -204,57 +216,41 @@ class TestLogComment:
 
 
 class TestTypePredicates:
-    """Test is_task, is_story, is_feature, is_epic."""
+    """Test is_task, is_story, is_feature, is_epic.
 
-    def test_is_task_returns_true_for_task(self) -> None:
+    TD-11 collapsed four nearly-identical per-type tests into a single
+    parametrized case. Each row asserts that the matching predicate
+    returns ``True`` and every other predicate returns ``False``.
+    """
+
+    @pytest.mark.parametrize(
+        ("unit_type", "expected_predicate"),
+        [
+            (WorkUnitType.TASK, "is_task"),
+            (WorkUnitType.STORY, "is_story"),
+            (WorkUnitType.FEATURE, "is_feature"),
+            (WorkUnitType.EPIC, "is_epic"),
+        ],
+    )
+    def test_predicates_are_mutually_exclusive(
+        self,
+        unit_type: WorkUnitType,
+        expected_predicate: str,
+    ) -> None:
         wu = WorkUnit(
-            id="T1",
-            title="t",
+            id=unit_type.value[0],
+            title="x",
             status=WorkUnitStatus.IN_QUEUE,
-            unit_type=WorkUnitType.TASK,
+            unit_type=unit_type,
             file_path=Path("/dev/null"),
             repo="r",
         )
-        assert wu.is_task() is True
-        assert wu.is_story() is False
-        assert wu.is_feature() is False
-        assert wu.is_epic() is False
-
-    def test_is_story_returns_true_for_story(self) -> None:
-        wu = WorkUnit(
-            id="S1",
-            title="s",
-            status=WorkUnitStatus.IN_QUEUE,
-            unit_type=WorkUnitType.STORY,
-            file_path=Path("/dev/null"),
-            repo="r",
-        )
-        assert wu.is_story() is True
-        assert wu.is_task() is False
-
-    def test_is_feature_returns_true_for_feature(self) -> None:
-        wu = WorkUnit(
-            id="F1",
-            title="f",
-            status=WorkUnitStatus.IN_QUEUE,
-            unit_type=WorkUnitType.FEATURE,
-            file_path=Path("/dev/null"),
-            repo="r",
-        )
-        assert wu.is_feature() is True
-        assert wu.is_task() is False
-
-    def test_is_epic_returns_true_for_epic(self) -> None:
-        wu = WorkUnit(
-            id="E0",
-            title="e",
-            status=WorkUnitStatus.IN_QUEUE,
-            unit_type=WorkUnitType.EPIC,
-            file_path=Path("/dev/null"),
-            repo="r",
-        )
-        assert wu.is_epic() is True
-        assert wu.is_task() is False
+        all_predicates = {"is_task", "is_story", "is_feature", "is_epic"}
+        assert getattr(wu, expected_predicate)() is True
+        for other in all_predicates - {expected_predicate}:
+            assert getattr(wu, other)() is False, (
+                f"{other}() returned True when {expected_predicate}() was expected to be the sole match"
+            )
 
 
 class TestParseId:

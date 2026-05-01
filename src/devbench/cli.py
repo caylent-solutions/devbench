@@ -20,6 +20,8 @@ Commands::
     set-status <id> <s>     Force any status (no gate -- use for recovery/lifecycle transitions)
     mark-done <id>          Mark unit as Done (enforces done-gate: all judges must have passed)
     decline <id> --reason M Mark unit Declined (won't ever be done); captures the rationale
+    hold <id> --reason M    Mark unit Hold (deferred / under debate); orchestrator skips it
+    unhold <id> --reason M  Return a held unit to in-queue and capture why it was released
     validate-backlog        Check backlog integrity (file existence, status sync, orphans, deps, summary)
     ensure-branch <id>      Create or switch to work unit branch before executor runs
     git-ops <id>            Run git operations for a work unit (commit-only when defer_pr is set)
@@ -111,7 +113,7 @@ from devbench.backlog.proposal import (
     reject_proposal,
     write_proposal,
 )
-from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus
+from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
 from devbench.config import (
     BACKLOG_INDEX,
     BACKLOG_ROOT,
@@ -138,6 +140,7 @@ from devbench.constants import (
     FINALIZE_PR_TITLE_TEMPLATE,
     KNOWN_JUDGE_NAMES,
     STATUS_IN_PROGRESS,
+    STATUS_IN_QUEUE,
     STATUS_SEPARATOR_WIDTH,
     VALID_TDD_PHASES,
 )
@@ -147,8 +150,46 @@ from devbench.utils.process import run_command
 logger = logging.getLogger("devbench.cli")
 
 
-def cmd_status() -> int:
-    """Print backlog summary grouped by status."""
+def _parse_status_argv(argv: tuple[str, ...]) -> tuple[bool, int]:
+    """Return ``(detail, exit_code)``.
+
+    ``exit_code`` is ``0`` on success and non-zero when an unknown
+    positional argument was supplied (the error message is written to
+    stderr inline). Extracted from ``cmd_status`` so the dispatch body
+    stays under PLR0912's branch ceiling.
+    """
+    detail = False
+    extra_positional: list[str] = []
+    for arg in argv:
+        if arg == "--detail":
+            detail = True
+            continue
+        if not arg:
+            continue
+        extra_positional.append(arg)
+    if extra_positional:
+        print(
+            f"ERROR: cmd_status takes no positional args (got {extra_positional!r})",
+            file=sys.stderr,
+        )
+        return False, 1
+    return detail, 0
+
+
+def cmd_status(*argv: str) -> int:
+    """Print backlog summary grouped by status.
+
+    With ``--detail`` (E220), additionally render three sections:
+    in-queue (every actionable Task with the IDs of its still-open
+    dependencies), blocked (every Blocked Task with the dep IDs that
+    are still non-terminal and any ``[BLOCKED_PENDING_PROPOSAL]``
+    markers found in its Comments), and held (every Hold Task with
+    the most recent ``[HOLD]`` reason from its Comments).
+    """
+    detail, parse_rc = _parse_status_argv(argv)
+    if parse_rc != 0:
+        return parse_rc
+
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     units = parser.parse_index()
 
@@ -158,21 +199,12 @@ def cmd_status() -> int:
         counts[key] = counts.get(key, 0) + 1
 
     total = len(units)
-    # Count un-materialised proposed tasks -- proposal JSONs on disk whose
-    # suggested_id values have no backlog row yet. These sit outside the
-    # parser's view (which only sees BACKLOG.md rows) and would otherwise
-    # be invisible until the operator explicitly ran ``list-proposals``.
     unmaterialised_count = _count_unmaterialised_proposed_tasks()
-    # Split the `Blocked` count into auto-clearing (has markers the ADR-07
-    # cascade will resolve) vs needs-operator-attention (needs a human).
-    # See ADR-10 and BlockedTaskState for the classification contract.
     auto_count, attn_count = _count_blocked_split(units)
     print("Backlog Status Summary")
     print("=" * STATUS_SEPARATOR_WIDTH)
     for status_val in DISPLAY_STATUS_VALUES:
         if status_val == "Blocked":
-            # Replace the single Blocked line with a two-line split. Both
-            # rows always render, so a regression to zero stays visible.
             print(f"  {'Blocked (auto)':<15} {auto_count:>4}")
             print(f"  {'Blocked (attn)':<15} {attn_count:>4}")
             continue
@@ -196,7 +228,77 @@ def cmd_status() -> int:
         blocked = parser.get_blocked_units(units)
         print(f"\nNo actionable units. {len(blocked)} blocked.")
 
+    if detail:
+        _print_status_detail(units)
+
     return 0
+
+
+def _print_status_detail(units: list[WorkUnit]) -> None:
+    """Render the ``--detail`` panels: in-queue, blocked, held.
+
+    Pulled out of ``cmd_status`` so the command body stays under
+    PLR0912's branch ceiling and so the panel rendering can be
+    unit-tested directly without spinning up a real backlog.
+    """
+    units_by_id = {u.id: u for u in units}
+    in_queue_tasks = sorted(
+        (u for u in units if u.unit_type is WorkUnitType.TASK and u.status is WorkUnitStatus.IN_QUEUE),
+        key=lambda u: u.id,
+    )
+    if in_queue_tasks:
+        print("\nIn-queue tasks (with dep status):")
+        for u in in_queue_tasks:
+            unsatisfied = _first_unsatisfied_dep(u, units_by_id)
+            if unsatisfied:
+                print(f"  [waiting] {u.id} -- {u.title}  (blocker: {unsatisfied})")
+            else:
+                print(f"  [ready]   {u.id} -- {u.title}")
+
+    blocked_tasks = sorted(
+        (u for u in units if u.unit_type is WorkUnitType.TASK and u.status is WorkUnitStatus.BLOCKED),
+        key=lambda u: u.id,
+    )
+    if blocked_tasks:
+        print("\nBlocked tasks (with markers / blockers):")
+        for u in blocked_tasks:
+            wu_file = _resolve_unit_file(u)
+            content = wu_file.read_text(encoding="utf-8") if wu_file is not None else ""
+            markers = _BLOCKED_PENDING_PROPOSAL_OPEN_RE.findall(content)
+            unsatisfied = _first_unsatisfied_dep(u, units_by_id)
+            note_parts: list[str] = []
+            if markers:
+                note_parts.append(f"pending proposal {markers[0]}")
+            if unsatisfied:
+                note_parts.append(f"blocker {unsatisfied}")
+            note = ", ".join(note_parts) if note_parts else "no open marker / blocker found"
+            print(f"  {u.id} -- {u.title}  ({note})")
+
+    held_tasks = sorted(
+        (u for u in units if u.unit_type is WorkUnitType.TASK and u.status is WorkUnitStatus.HOLD),
+        key=lambda u: u.id,
+    )
+    if held_tasks:
+        print("\nHeld tasks (with most recent [HOLD] reason):")
+        for u in held_tasks:
+            wu_file = _resolve_unit_file(u)
+            reason = _latest_hold_reason(wu_file.read_text(encoding="utf-8")) if wu_file is not None else ""
+            reason_note = f"reason: {reason}" if reason else "reason not found in Comments"
+            print(f"  {u.id} -- {u.title}  ({reason_note})")
+
+
+_HOLD_COMMENT_RE: re.Pattern[str] = re.compile(r"\[HOLD\]\s+(.+?)(?:\n|$)")
+
+
+def _latest_hold_reason(content: str) -> str:
+    """Return the most recent ``[HOLD] <reason>`` text from a work-unit file.
+
+    Used by ``status --detail`` to render the held-tasks panel. Walks
+    Comments-style audit lines and returns the last match, since the
+    audit log appends in chronological order.
+    """
+    matches = _HOLD_COMMENT_RE.findall(content)
+    return matches[-1].strip() if matches else ""
 
 
 def cmd_next() -> int:
@@ -369,6 +471,390 @@ def cmd_decline(*argv: str) -> int:
     BacklogManager().mark_declined(wu_file, BACKLOG_INDEX, task_id, reason)
     logger.info("Declined %s: %s", task_id, reason)
     print(json.dumps({"task_id": task_id, "status": "declined", "reason": reason}))
+    return 0
+
+
+_TEMPLATE_KIND_BY_ID_SHAPE: dict[str, str] = {
+    "T": "task",
+    "S": "story",
+    "F": "feature",
+    "E": "epic",
+}
+
+
+def cmd_new_task(*argv: str) -> int:
+    """Scaffold a new work-unit ``.md`` file from a canonical template.
+
+    Usage::
+
+        new-task --id <ID> --title "<TITLE>" --target <PATH>
+                 [--repo <ORG/REPO>] [--description <TEXT>]
+                 [--source-file <PATH>] [--test-file <PATH>]
+                 [--ac-func <TEXT>]
+
+    Required flags:
+      ``--id``: canonical work-unit ID (e.g. ``E0-F1-S1-T1``). The ID's
+        last segment determines which template is rendered: ``T`` -> task,
+        ``S`` -> story, ``F`` -> feature, ``E`` -> epic.
+      ``--title``: human-readable title.
+      ``--target``: absolute path where the new ``.md`` file will be
+        written. Fails fast if the file already exists or the parent
+        directory is missing.
+
+    Optional flags substitute the matching ``{{TOKEN}}`` placeholders
+    in the template; tokens with no matching flag are filled with a
+    sensible default (e.g. ``--ac-func`` -> ``"TBD"``,
+    ``--source-file`` -> ``src/<repo-name>/<id-lower>.py``).
+    """
+    parsed = _parse_new_task_argv(argv)
+    if isinstance(parsed, int):
+        return parsed
+    fields = parsed
+
+    target = Path(fields["target"])
+    if target.exists():
+        print(f"ERROR: target {str(target)!r} already exists; refusing to overwrite", file=sys.stderr)
+        return 1
+    if not target.parent.is_dir():
+        print(
+            f"ERROR: parent directory {str(target.parent)!r} does not exist; create it first",
+            file=sys.stderr,
+        )
+        return 1
+
+    kind = _template_kind_for_id(fields["id"])
+    if kind is None:
+        print(
+            f"ERROR: cannot derive template kind from id {fields['id']!r}; "
+            f"expected last segment to start with T/S/F/E.",
+            file=sys.stderr,
+        )
+        return 1
+    template_path = _devbench_root() / "backlog" / "templates" / f"{kind}.md"
+    if not template_path.is_file():
+        print(f"ERROR: template not found at {str(template_path)!r}", file=sys.stderr)
+        return 1
+    template = template_path.read_text(encoding="utf-8")
+    rendered = _render_new_task_template(template, fields)
+    target.write_text(rendered, encoding="utf-8")
+    print(json.dumps({"id": fields["id"], "kind": kind, "target": str(target)}))
+    logger.info("Scaffolded %s %s at %s", kind, fields["id"], target)
+    return 0
+
+
+def _parse_new_task_argv(argv: tuple[str, ...] | list[str]) -> dict[str, str] | int:
+    """Parse ``new-task`` argv into a flat ``{flag: value}`` dict.
+
+    Returns the populated dict when every required flag is set, or an
+    integer non-zero exit code when parsing failed (the error message
+    is already on stderr).
+    """
+    flag_map = {
+        "--id": "id",
+        "--title": "title",
+        "--target": "target",
+        "--repo": "repo",
+        "--description": "description",
+        "--source-file": "source_file",
+        "--test-file": "test_file",
+        "--ac-func": "ac_func",
+    }
+    fields: dict[str, str] = {}
+    args = list(argv)
+    i = 0
+    while i < len(args):
+        flag = args[i]
+        key = flag_map.get(flag)
+        if key is None:
+            print(f"ERROR: unknown flag {flag!r}", file=sys.stderr)
+            return 1
+        if i + 1 >= len(args) or not args[i + 1]:
+            print(f"ERROR: {flag} requires a value", file=sys.stderr)
+            return 1
+        fields[key] = args[i + 1]
+        i += 2
+    for required in ("id", "title", "target"):
+        if required not in fields:
+            print(f"ERROR: --{required.replace('_', '-')} is required", file=sys.stderr)
+            return 1
+    return fields
+
+
+def _render_new_task_template(template: str, fields: dict[str, str]) -> str:
+    """Substitute ``{{TOKEN}}`` placeholders in ``template`` from ``fields``.
+
+    Tokens with no explicit value get a deterministic default so the
+    rendered file is immediately validate-backlog-clean (no empty
+    sections, no TBD-without-context).
+    """
+    unit_id = fields["id"]
+    repo = fields.get("repo", "org/repo")
+    short_repo = repo.split("/", maxsplit=1)[-1]
+    source_default = f"src/{short_repo}/{unit_id.lower()}.py"
+    source_file = fields.get("source_file", source_default)
+    base = Path(source_file).stem
+    test_default = f"tests/unit/test_{base}.py"
+    substitutions = {
+        "{{ID}}": unit_id,
+        "{{ID_LOWER}}": unit_id.lower(),
+        "{{TITLE}}": fields["title"],
+        "{{REPO}}": repo,
+        "{{DESCRIPTION}}": fields.get("description", "TBD: describe the work this unit captures."),
+        "{{SOURCE_FILE}}": source_file,
+        "{{TEST_FILE}}": fields.get("test_file", test_default),
+        "{{AC_FUNC}}": fields.get("ac_func", "TBD: describe the functional outcome."),
+    }
+    rendered = template
+    for token, value in substitutions.items():
+        rendered = rendered.replace(token, value)
+    return rendered
+
+
+def _template_kind_for_id(unit_id: str) -> str | None:
+    """Return the template kind ('task'/'story'/'feature'/'epic') for ``unit_id``."""
+    parts = unit_id.split("-")
+    if not parts:
+        return None
+    last = parts[-1]
+    if not last:
+        return None
+    return _TEMPLATE_KIND_BY_ID_SHAPE.get(last[0].upper())
+
+
+def _devbench_root() -> Path:
+    """Return the absolute path to the devbench package root.
+
+    The templates ship inside the package at
+    ``<devbench>/backlog/templates/``; resolving via ``__file__`` makes
+    the helper portable across editable installs and copies.
+    """
+    return Path(__file__).resolve().parent.parent.parent
+
+
+def cmd_sync_blocked() -> int:
+    """Reconcile every task's status against current dependency satisfaction.
+
+    Walks the parsed index and for every TASK whose dependencies are
+    NOT satisfied (per :meth:`BacklogParser._deps_satisfied` -- includes
+    epic / feature / story-level deps after E215, recursing into
+    descendants):
+
+    - ``in-queue`` -> ``blocked`` with a ``[BLOCKED] dep <id> not yet terminal``
+      audit entry.
+
+    Conversely, for every ``blocked`` TASK whose dependencies are now
+    satisfied AND that has NO ``[BLOCKED_PENDING_PROPOSAL]`` marker
+    pointing at a still-open proposal:
+
+    - ``blocked`` -> ``in-queue`` with a ``[UNBLOCKED] deps satisfied``
+      audit entry.
+
+    Tasks whose status is anything else (``in-progress``, ``in-review``,
+    ``done``, ``declined``, ``hold``, ``proposed``) are left untouched.
+    The ADR-07 cascade still owns the proposal-marker pathway -- this
+    command exists for the orchestrator's pre-flight sweep and for
+    operator triage when a backlog has drifted out of sync after manual
+    edits.
+
+    Returns 0 always; output is a JSON envelope listing every flip.
+    """
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    units_by_id = {u.id: u for u in units}
+    manager = BacklogManager()
+    flipped_to_blocked: list[str] = []
+    flipped_to_in_queue: list[str] = []
+
+    for unit in units:
+        if unit.unit_type is not WorkUnitType.TASK:
+            continue
+        deps_ok = parser._deps_satisfied(unit, units_by_id)
+        if unit.status is WorkUnitStatus.IN_QUEUE and not deps_ok:
+            wu_file = _resolve_unit_file(unit)
+            if wu_file is None:
+                continue
+            unsatisfied = _first_unsatisfied_dep(unit, units_by_id)
+            reason = (
+                f"sync-blocked: dependency {unsatisfied!r} not yet terminal"
+                if unsatisfied
+                else "sync-blocked: dependency not yet terminal"
+            )
+            manager.mark_blocked(wu_file, BACKLOG_INDEX, unit.id, reason)
+            flipped_to_blocked.append(unit.id)
+            continue
+        if unit.status is WorkUnitStatus.BLOCKED and deps_ok:
+            wu_file = _resolve_unit_file(unit)
+            if wu_file is None:
+                continue
+            content = wu_file.read_text(encoding="utf-8")
+            if _BLOCKED_PENDING_PROPOSAL_OPEN_RE.search(content):
+                # An open proposal-pending marker signals that a
+                # human-promoted draft is still resolving; the ADR-07
+                # cascade owns that re-queue path and we must not race
+                # it from here.
+                continue
+            manager.force_status(wu_file, BACKLOG_INDEX, unit.id, STATUS_IN_QUEUE)
+            manager._append_comment(wu_file, "UNBLOCKED", "sync-blocked: dependencies now terminal")
+            flipped_to_in_queue.append(unit.id)
+
+    output = {
+        "flipped_to_blocked": flipped_to_blocked,
+        "flipped_to_in_queue": flipped_to_in_queue,
+    }
+    print(json.dumps(output))
+    logger.info(
+        "sync-blocked: %d -> blocked, %d -> in-queue",
+        len(flipped_to_blocked),
+        len(flipped_to_in_queue),
+    )
+    return 0
+
+
+def _first_unsatisfied_dep(unit: WorkUnit, units_by_id: dict[str, WorkUnit]) -> str:
+    """Return the first dep ID in ``unit.dependencies`` that is NOT terminal.
+
+    ``BacklogParser._deps_satisfied`` returns a single boolean over the
+    whole dep list; this helper exposes which dep failed first so the
+    blocked-comment audit message names the offending ID. Returns ``""``
+    when every dep is satisfied.
+    """
+    terminal = {WorkUnitStatus.DONE, WorkUnitStatus.DECLINED}
+    for dep_id in unit.dependencies:
+        dep = units_by_id.get(dep_id)
+        if dep is None:
+            # Unknown dep -- treat as satisfied (validate-backlog reports it).
+            continue
+        if dep.unit_type is WorkUnitType.TASK:
+            if dep.status not in terminal:
+                return dep_id
+            continue
+        # Non-task dep: scan descendant tasks.
+        for descendant in units_by_id.values():
+            if (
+                descendant.id != dep_id
+                and descendant.id.startswith(dep_id + "-")
+                and descendant.unit_type is WorkUnitType.TASK
+                and descendant.status not in terminal
+            ):
+                return dep_id
+    return ""
+
+
+_BLOCKED_PENDING_PROPOSAL_OPEN_RE: re.Pattern[str] = re.compile(r"\[BLOCKED_PENDING_PROPOSAL\]\s+(\S+)")
+
+
+def _parse_id_and_reason(argv: tuple[str, ...] | list[str], command_name: str) -> tuple[str, str] | int:
+    """Parse a ``<id> --reason <message>`` argument tuple shared by hold/unhold/decline.
+
+    Returns a ``(task_id, reason)`` tuple on success or an integer
+    non-zero exit code on parse error (with the error message already
+    written to stderr). Em-dashes in the reason text are rejected at
+    the boundary (CLAUDE.md backlog hygiene rule).
+    """
+    task_id = ""
+    reason = ""
+    args = list(argv)
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if not arg:
+            i += 1
+            continue
+        if arg == "--reason":
+            if i + 1 >= len(args) or not args[i + 1]:
+                print("ERROR: --reason requires a value", file=sys.stderr)
+                return 1
+            reason = args[i + 1]
+            i += 2
+            continue
+        if not task_id:
+            task_id = arg
+        i += 1
+    if not task_id or not reason:
+        print(f"ERROR: {command_name} requires <id> --reason <message>", file=sys.stderr)
+        return 1
+    em_dash_rc = _reject_em_dash("reason", reason)
+    if em_dash_rc is not None:
+        return em_dash_rc
+    return task_id, reason
+
+
+def cmd_hold(*argv: str) -> int:
+    """Mark a work unit as ``hold`` (deferred / under debate).
+
+    Usage::
+
+        hold <id> --reason "<message>"
+
+    ``hold`` is a deferred-decision lifecycle status: the unit stops
+    being considered actionable by the orchestrator's ``next`` query
+    until an operator runs ``unhold`` to return it to ``in-queue``.
+    Unlike ``declined``, ``hold`` is **not** terminal -- a held child
+    does NOT count toward a parent's auto-rollup to ``done``. The
+    ``--reason`` is REQUIRED so the deferral leaves an audit trail;
+    em-dashes are rejected at the input boundary for backlog hygiene.
+    """
+    parsed = _parse_id_and_reason(argv, "hold")
+    if isinstance(parsed, int):
+        return parsed
+    task_id, reason = parsed
+
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    target = _find_unit(units, task_id)
+    if target is None:
+        print(f"ERROR: Work unit '{task_id}' not found", file=sys.stderr)
+        return 1
+    wu_file = _resolve_unit_file(target)
+    if wu_file is None:
+        print(f"ERROR: Work unit file not found for '{task_id}'", file=sys.stderr)
+        return 1
+
+    BacklogManager().mark_held(wu_file, BACKLOG_INDEX, task_id, reason)
+    logger.info("Held %s: %s", task_id, reason)
+    print(json.dumps({"task_id": task_id, "status": "hold", "reason": reason}))
+    return 0
+
+
+def cmd_unhold(*argv: str) -> int:
+    """Return a held work unit to ``in-queue`` with a captured rationale.
+
+    Usage::
+
+        unhold <id> --reason "<message>"
+
+    The unit's status flips from ``hold`` back to ``in-queue`` so the
+    orchestrator's ``next``/parallel-candidate scan picks it up again.
+    The ``--reason`` is REQUIRED so the release leaves an audit trail;
+    em-dashes are rejected at the input boundary. ``unhold`` refuses
+    units whose current status is anything other than ``hold`` --
+    fail-fast keeps the lifecycle linear.
+    """
+    parsed = _parse_id_and_reason(argv, "unhold")
+    if isinstance(parsed, int):
+        return parsed
+    task_id, reason = parsed
+
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    target = _find_unit(units, task_id)
+    if target is None:
+        print(f"ERROR: Work unit '{task_id}' not found", file=sys.stderr)
+        return 1
+    if target.status is not WorkUnitStatus.HOLD:
+        print(
+            f"ERROR: cannot unhold {task_id!r}: current status is {target.status.value!r}, expected 'Hold'",
+            file=sys.stderr,
+        )
+        return 1
+    wu_file = _resolve_unit_file(target)
+    if wu_file is None:
+        print(f"ERROR: Work unit file not found for '{task_id}'", file=sys.stderr)
+        return 1
+
+    BacklogManager().unmark_held(wu_file, BACKLOG_INDEX, task_id, reason)
+    logger.info("Unheld %s: %s", task_id, reason)
+    print(json.dumps({"task_id": task_id, "status": "in-queue", "reason": reason}))
     return 0
 
 
@@ -1343,6 +1829,11 @@ def _emit_orphan_cleanup_proposal_if_needed(unit_id: str, unit: WorkUnit, repo_p
             task_id=new_id,
             dep_on_source=True,
         )
+        wired_claimants = _wire_orphan_cleanup_dep_chain(
+            new_id=new_id,
+            files_to_own=[".gitignore"],
+            unit_repo=unit.repo,
+        )
     except ProposalError as exc:
         print(
             f"ERROR: git-ops refused (orphans detected) and proposal emission failed: {exc}",
@@ -1356,15 +1847,84 @@ def _emit_orphan_cleanup_proposal_if_needed(unit_id: str, unit: WorkUnit, repo_p
         len(detected),
         new_id,
     )
+    extra = (
+        f" Auto-wired dep-chain: {sorted(wired_claimants)} now depend on {new_id} "
+        "to land first (resolves Manifest Conflict on '.gitignore')."
+        if wired_claimants
+        else ""
+    )
     print(
         f"ERROR: git-ops refused -- {len(detected)} build/state artifact path(s) "
         f"would pollute the commit (sample: {sample}). "
         f"Auto-emitted cleanup proposal {new_id} (in-queue); "
-        f"{unit_id} is now blocked-pending-proposal and will auto-clear when the cleanup commits. "
+        f"{unit_id} is now blocked-pending-proposal and will auto-clear when the cleanup commits.{extra} "
         f"Materialised: {[str(p) for p in materialised_files]}.",
         file=sys.stderr,
     )
     return True
+
+
+def _wire_orphan_cleanup_dep_chain(
+    new_id: str,
+    files_to_own: list[str],
+    unit_repo: str,
+) -> list[str]:
+    """Auto-wire ``add-dep`` rows so the new cleanup task does not collide on Manifest paths.
+
+    Phase 10 fix: when ``_emit_orphan_cleanup_proposal_if_needed``
+    auto-emits a cleanup proposal claiming ``.gitignore`` (or any other
+    files declared in ``files_to_own``), an in-queue / blocked /
+    proposed peer task that already claims the same path triggers the
+    E224 Manifest-Conflict rule and halts the orchestrator. Resolve
+    the collision by adding a ``Dependencies`` row on each pre-existing
+    claimant pointing at the new cleanup task -- that forms a dep-chain
+    which the Manifest-Conflict rule already accepts as a valid
+    resolution.
+
+    Returns the list of claimant IDs that received an auto-wired dep
+    (sorted by ID for stable output). Empty list when no collision was
+    detected. ``ProposalError`` from any underlying call propagates so
+    the caller can surface it via the existing error path.
+    """
+    from devbench.backlog import manifest as manifest_mod
+    from devbench.backlog.parser import BacklogParser
+
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    open_statuses = {WorkUnitStatus.IN_QUEUE, WorkUnitStatus.BLOCKED, WorkUnitStatus.PROPOSED}
+    target_paths = set(files_to_own)
+    wired: set[str] = set()
+    for peer in units:
+        if peer.id == new_id:
+            continue
+        if peer.status not in open_statuses:
+            continue
+        if peer.repo and unit_repo and peer.repo != unit_repo:
+            continue
+        wu_path = _resolve_unit_file(peer)
+        if wu_path is None or not wu_path.is_file():
+            continue
+        try:
+            entries = manifest_mod.parse_manifest(wu_path.read_text(encoding="utf-8"))
+        except manifest_mod.ManifestParseError:
+            continue
+        peer_paths = {entry.file for entry in entries}
+        if not peer_paths & target_paths:
+            continue
+        # Add the dep on the EXISTING claimant -- it depends on the
+        # cleanup landing first, so the cleanup commits its
+        # devbench-managed block before the peer rebases on top.
+        from devbench.backlog.proposal import add_dep
+
+        add_dep(
+            backlog_root=BACKLOG_ROOT,
+            backlog_index=BACKLOG_INDEX,
+            blocked_task_id=peer.id,
+            blocker_task_id=new_id,
+            reason="auto-wired by orphan-cleanup auto-emit; both manifests claim a shared path",
+        )
+        wired.add(peer.id)
+    return sorted(wired)
 
 
 # Mirror of git_orphans.DEVBENCH_GITIGNORE_HEADER for lazy-imported docstring contexts.
@@ -1663,31 +2223,24 @@ def cmd_watch(watch_interval: int = 0) -> int:
         return 0
 
 
-def cmd_hook_tail(*argv: str) -> int:
-    """Pretty-tail the plugin's hook-logs.jsonl stream.
+@dataclass(frozen=True)
+class _HookTailArgs:
+    tz_name: str | None = None
+    no_follow: bool = False
+    from_start: bool = False
+    path_override: str = ""
+    orchestrator_session_id: str | None = None
+    orchestrator_only: bool = False
 
-    Usage::
 
-        hook-tail [<path>] [--tz <zoneinfo-name>] [--no-follow] [--from-start]
-
-    Defaults ``<path>`` to ``$JUDGE_WORKSPACE_ROOT/hook-logs.jsonl`` (the same
-    location ``devbench watch`` reads from). Renders timestamps in the OS
-    local timezone; ``--tz`` overrides with any IANA zoneinfo name. Disables
-    ANSI color when ``NO_COLOR`` is set or stdout is not a TTY.
-    """
-    from devbench.hook_tail import (
-        FollowOptions,
-        InvalidTimezoneError,
-        follow,
-        render_header,
-        resolve_timezone,
-        should_use_color,
-    )
-
+def _parse_hook_tail_argv(argv: tuple[str, ...] | list[str]) -> _HookTailArgs | int:
+    """Parse ``hook-tail`` argv. Returns the args bundle or a non-zero exit code."""
     tz_name: str | None = None
     no_follow = False
     from_start = False
     path_override = ""
+    orchestrator_session_id: str | None = None
+    orchestrator_only = False
     args = list(argv)
     i = 0
     while i < len(args):
@@ -1710,6 +2263,17 @@ def cmd_hook_tail(*argv: str) -> int:
             from_start = True
             i += 1
             continue
+        if arg == "--orchestrator-only":
+            orchestrator_only = True
+            i += 1
+            continue
+        if arg == "--orchestrator-session":
+            if i + 1 >= len(args) or not args[i + 1]:
+                print("ERROR: --orchestrator-session requires a value", file=sys.stderr)
+                return 2
+            orchestrator_session_id = args[i + 1]
+            i += 2
+            continue
         if arg.startswith("--"):
             print(f"ERROR: unknown flag: {arg}", file=sys.stderr)
             return 2
@@ -1719,6 +2283,67 @@ def cmd_hook_tail(*argv: str) -> int:
             continue
         print(f"ERROR: unexpected positional argument: {arg}", file=sys.stderr)
         return 2
+    return _HookTailArgs(
+        tz_name=tz_name,
+        no_follow=no_follow,
+        from_start=from_start,
+        path_override=path_override,
+        orchestrator_session_id=orchestrator_session_id,
+        orchestrator_only=orchestrator_only,
+    )
+
+
+def cmd_hook_tail(*argv: str) -> int:
+    """Pretty-tail the plugin's hook-logs.jsonl stream.
+
+    Usage::
+
+        hook-tail [<path>] [--tz <zoneinfo-name>] [--no-follow] [--from-start]
+                  [--orchestrator-only | --orchestrator-session <id>]
+
+    Defaults ``<path>`` to ``$JUDGE_WORKSPACE_ROOT/hook-logs.jsonl`` (the same
+    location ``devbench watch`` reads from). Renders timestamps in the OS
+    local timezone; ``--tz`` overrides with any IANA zoneinfo name. Disables
+    ANSI color when ``NO_COLOR`` is set or stdout is not a TTY.
+
+    Phase 11 (E230) session filter:
+      ``--orchestrator-only`` filters the stream to events whose
+      ``orchestrator_session`` field equals
+      ``$JUDGE_ORCHESTRATOR_SESSION_ID`` (set by the launch command on
+      the orchestrator's pane). Events from side-pane Claude sessions
+      are silently suppressed. ``--orchestrator-session <id>`` provides
+      the same filter with an explicit value (useful for ad-hoc
+      audits). Older log entries that pre-date the session field are
+      passed through unfiltered.
+    """
+    from devbench.hook_tail import (
+        FollowOptions,
+        InvalidTimezoneError,
+        follow,
+        render_header,
+        resolve_timezone,
+        should_use_color,
+    )
+
+    parsed = _parse_hook_tail_argv(argv)
+    if isinstance(parsed, int):
+        return parsed
+    tz_name = parsed.tz_name
+    no_follow = parsed.no_follow
+    from_start = parsed.from_start
+    path_override = parsed.path_override
+    orchestrator_session_id = parsed.orchestrator_session_id
+
+    if parsed.orchestrator_only and orchestrator_session_id is None:
+        env_session = os.environ.get("JUDGE_ORCHESTRATOR_SESSION_ID", "").strip()
+        if not env_session:
+            print(
+                "ERROR: --orchestrator-only requires JUDGE_ORCHESTRATOR_SESSION_ID env "
+                "to be set, OR pass --orchestrator-session <id> explicitly.",
+                file=sys.stderr,
+            )
+            return 2
+        orchestrator_session_id = env_session
 
     # Precedence: CLI --tz > JUDGE_DISPLAY_TIMEZONE env > yaml display_timezone
     # > OS local. DISPLAY_TIMEZONE encodes (env > yaml); resolve_timezone
@@ -1745,6 +2370,7 @@ def cmd_hook_tail(*argv: str) -> int:
             from_start=from_start,
             no_follow=no_follow,
             color=color,
+            orchestrator_session_id=orchestrator_session_id,
         ),
         sys.stdout,
     )
@@ -2837,6 +3463,43 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
         2,
         "Mark a work unit Declined (won't ever be done) with a reason: decline <id> --reason <message>",
     ),
+    "hold": (
+        cmd_hold,
+        2,
+        (
+            "Mark a work unit Hold (deferred / under debate) with a reason: "
+            "hold <id> --reason <message>. Orchestrator skips held units."
+        ),
+    ),
+    "unhold": (
+        cmd_unhold,
+        2,
+        (
+            "Return a held work unit to in-queue with a reason: "
+            "unhold <id> --reason <message>. Refuses units not currently on hold."
+        ),
+    ),
+    "sync-blocked": (
+        cmd_sync_blocked,
+        0,
+        (
+            "Reconcile every task's status against current dep satisfaction: "
+            "in-queue with unsatisfied deps -> blocked; blocked with all deps "
+            "now terminal -> in-queue (skipping units with open "
+            "[BLOCKED_PENDING_PROPOSAL] markers, which the ADR-07 cascade owns)."
+        ),
+    ),
+    "new-task": (
+        cmd_new_task,
+        0,
+        (
+            "Scaffold a new work-unit .md file from the canonical template: "
+            'new-task --id <ID> --title "<TITLE>" --target <PATH> '
+            "[--repo <ORG/REPO>] [--description <TEXT>] [--source-file <PATH>] "
+            "[--test-file <PATH>] [--ac-func <TEXT>]. Template kind is "
+            "derived from the ID's last segment (T/S/F/E)."
+        ),
+    ),
     "validate-backlog": (cmd_validate_backlog, 0, "Validate backlog integrity"),
     "check": (
         cmd_check,
@@ -2956,7 +3619,9 @@ _HELP_FLAGS: frozenset[str] = frozenset({"--help", "-h"})
 # count + 1 trailing arg, so `--reason` survives but the value after it
 # does not). _parse_add_dep_argv handles flags itself; opting into
 # variadic dispatch lets the value through.
-_VARIADIC_COMMANDS: frozenset[str] = frozenset({"hook-tail", "watchdog", "add-dep"})
+_VARIADIC_COMMANDS: frozenset[str] = frozenset(
+    {"hook-tail", "watchdog", "add-dep", "decline", "hold", "unhold", "status", "new-task"}
+)
 
 
 def _print_usage() -> None:

@@ -51,6 +51,7 @@ from devbench.constants import (
     STATUS_BLOCKED,
     STATUS_DECLINED,
     STATUS_DONE,
+    STATUS_HOLD,
     STATUS_IN_PROGRESS,
     STATUS_IN_QUEUE,
     STATUS_LINE_RE,
@@ -180,6 +181,49 @@ class BacklogManager:
         self._set_status(work_unit_path, backlog_index, unit_id, STATUS_DECLINED)
         self._append_comment(work_unit_path, "DECLINED", reason)
 
+    def mark_held(self, work_unit_path: Path, backlog_index: Path, unit_id: str, reason: str) -> None:
+        """Mark a work unit as ``hold`` in both files and append an audit comment.
+
+        ``hold`` is a deferred-decision status: the unit is intentionally
+        skipped by the orchestrator's ``next``/parallel-candidate scan
+        (``BacklogParser.get_parallel_candidates`` filters to
+        ``IN_QUEUE``/``IN_PROGRESS`` only) until an operator runs
+        ``unmark_held`` to return it to ``in-queue``. Unlike ``declined``,
+        ``hold`` is **not** terminal -- a held child does NOT count toward
+        a parent's auto-rollup to ``done``; the parent stays open while
+        any descendant is on hold.
+
+        Args:
+            work_unit_path: Path to the work-unit ``.md`` file.
+            backlog_index: Path to the ``BACKLOG.md`` file.
+            unit_id: The work-unit identifier.
+            reason: Human-readable rationale for the deferral. Captured in
+                the Comments audit trail alongside a ``[HOLD]`` marker.
+
+        Raises:
+            FileNotFoundError: If either file does not exist.
+            ValueError: If the status line or unit row is not found.
+        """
+        self._set_status(work_unit_path, backlog_index, unit_id, STATUS_HOLD)
+        self._append_comment(work_unit_path, "HOLD", reason)
+
+    def unmark_held(self, work_unit_path: Path, backlog_index: Path, unit_id: str, reason: str) -> None:
+        """Return a held work unit to ``in-queue`` and append an audit comment.
+
+        Args:
+            work_unit_path: Path to the work-unit ``.md`` file.
+            backlog_index: Path to the ``BACKLOG.md`` file.
+            unit_id: The work-unit identifier.
+            reason: Human-readable rationale for the release. Captured in
+                the Comments audit trail alongside a ``[UNHOLD]`` marker.
+
+        Raises:
+            FileNotFoundError: If either file does not exist.
+            ValueError: If the status line or unit row is not found.
+        """
+        self._set_status(work_unit_path, backlog_index, unit_id, STATUS_IN_QUEUE)
+        self._append_comment(work_unit_path, "UNHOLD", reason)
+
     def validate(self, backlog_index: Path, workspace_root: Path) -> list[str]:
         """Check backlog integrity and return a list of error messages.
 
@@ -195,6 +239,13 @@ class BacklogManager:
         9. Task files have ## Definition of Done section.
         10. No em-dash character (U+2014) in work unit files.
         11. Changes Manifest paths do not start with a ``checkout_directory`` prefix.
+        12. Manifest path conflicts (no two in-queue Tasks claim the same file).
+        13. Language-AC alignment (non-Python tasks must mark Python ACs N/A).
+        14. Source-test atomicity (every prod source has a paired test in the same Manifest).
+        15. Required sections (Status, Dependencies, Changes Manifest) on every Task.
+        16. Status enum (every parsed ``## Status:`` value matches ``VALID_STATUSES``).
+        17. Dependency-ID format (every entry in a ``## Dependencies`` table matches the canonical regex).
+        18. Branch uniqueness (no two Tasks derive the same branch name; skipped in single-PR mode).
 
         Args:
             backlog_index: Path to the ``BACKLOG.md`` index file.
@@ -216,6 +267,10 @@ class BacklogManager:
         self._check_manifest_conflicts(rows, workspace_root, errors)
         self._check_language_ac_alignment(rows, workspace_root, errors)
         self._check_source_test_pairs(rows, workspace_root, errors)
+        self._check_required_sections(rows, workspace_root, errors)
+        self._check_status_enum(rows, workspace_root, errors)
+        self._check_dep_id_format(rows, workspace_root, errors)
+        self._check_branch_uniqueness(rows, workspace_root, errors)
         return errors
 
     def _check_files_and_statuses(
@@ -1353,6 +1408,204 @@ class BacklogManager:
                         f"{source_stem!r}, e.g., tests/unit/test_{source_stem}.py). "
                         f"Add the test entry per docs/source-test-atomicity.md."
                     )
+
+    # ------------------------------------------------------------------
+    # E209: Backlog-Contract Alignment hardening rules
+    # ------------------------------------------------------------------
+
+    _REQUIRED_TASK_SECTIONS: ClassVar[tuple[str, ...]] = ("Status", "Dependencies", "Changes Manifest")
+    # Accepts the canonical Epic shape ``E\d+`` plus the test-harness
+    # convention ``EX``. Anything else (a free-text dep, a typo) fails
+    # the rule. Mirrors the ``EPIC_ID_RE`` shape in constants.py while
+    # adding the optional Feature/Story/Task suffixes.
+    _DEP_ID_PATTERN: ClassVar[re.Pattern[str]] = re.compile(r"^E[A-Z0-9]+(-F\d+)?(-S\d+)?(-T\d+)?$")
+
+    def _check_required_sections(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """Check 15: every Task work-unit file declares Status, Dependencies, and Changes Manifest.
+
+        Epic, Feature, and Story rows are exempt (their bodies are
+        scaffolding -- a Manifest does not apply). Tasks that miss any
+        required section receive an explicit error naming the section,
+        so authors know exactly what to add.
+        """
+        for row_id, _, file_path_str in rows:
+            if not row_id or row_id.startswith("-"):
+                continue
+            if not self._is_task_id(row_id):
+                continue
+            if not file_path_str:
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.is_file():
+                continue
+            content = wu_path.read_text(encoding="utf-8")
+            sections = self._extract_sections(content)
+            for required in self._REQUIRED_TASK_SECTIONS:
+                if required not in sections:
+                    errors.append(
+                        f"{row_id}: missing required section '## {required}'. "
+                        f"Add the section per docs/backlog-contract.md."
+                    )
+
+    def _check_status_enum(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """Check 16: every parsed ``## Status:`` value is in ``VALID_STATUSES``.
+
+        The CLI's ``set-status`` and ``mark-*`` helpers reject invalid
+        values at write time, but a hand-edited file can drift; this
+        check catches the drift at validate-backlog time so the
+        orchestrator never sees a bad status mid-run.
+        """
+        for row_id, _, file_path_str in rows:
+            if not row_id or row_id.startswith("-"):
+                continue
+            if not file_path_str:
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.is_file():
+                continue
+            content = wu_path.read_text(encoding="utf-8")
+            match = STATUS_LINE_RE.search(content)
+            if match is None:
+                # Missing status line is reported by _check_files_and_statuses;
+                # don't double-report here.
+                continue
+            raw_status = match.group(2).strip().lower()
+            if raw_status not in VALID_STATUSES:
+                errors.append(
+                    f"{row_id}: invalid '## Status:' value {raw_status!r}. Allowed values: {sorted(VALID_STATUSES)}."
+                )
+
+    def _check_dep_id_format(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """Check 17: every ``## Dependencies`` row's first cell is a valid task-ID shape.
+
+        ``DEPENDENCY_NONE_VALUES`` cells (``None`` / ``-``) are skipped.
+        Header rows (``ID``, separator dashes) are skipped. Anything
+        else must match the canonical ID regex
+        ``E\\d+(-F\\d+)?(-S\\d+)?(-T\\d+)?``; mismatches produce an
+        explicit error with the offending row text so authors can fix
+        the typo.
+        """
+        for row_id, _, file_path_str in rows:
+            if not row_id or row_id.startswith("-"):
+                continue
+            if not file_path_str:
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.is_file():
+                continue
+            content = wu_path.read_text(encoding="utf-8")
+            for dep_id in self._iter_dep_ids(content):
+                if not self._DEP_ID_PATTERN.match(dep_id):
+                    errors.append(
+                        f"{row_id}: dependency ID {dep_id!r} does not match the "
+                        f"canonical task-ID regex E<n>[-F<n>][-S<n>][-T<n>]. "
+                        f"Fix the row in '## Dependencies' or remove it."
+                    )
+
+    def _check_branch_uniqueness(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """Check 18 (E219): no two Tasks derive the same branch name.
+
+        Each Task's branch is either an explicit ``- **Branch:**
+        `backlog/<id>``` line in the work-unit file or the canonical
+        ``backlog/<id-lowercase>`` derivation. A collision means two
+        Tasks would push to the same branch, breaking auto-merge and
+        producing false review failures.
+
+        Skipped entirely when single-PR mode is active (the
+        ``git_ops.single_branch`` yaml field is set), since every task
+        legitimately shares the configured branch.
+        """
+        from devbench.config import RUNTIME_CONFIG
+
+        single_branch = getattr(RUNTIME_CONFIG.git_ops, "single_branch", None)
+        if single_branch:
+            return
+        branches: dict[str, list[str]] = {}
+        for row_id, _, file_path_str in rows:
+            if not row_id or row_id.startswith("-"):
+                continue
+            if not self._is_task_id(row_id):
+                continue
+            branch = self._derive_branch_for_row(row_id, file_path_str, workspace_root)
+            branches.setdefault(branch, []).append(row_id)
+        for branch, ids in sorted(branches.items()):
+            if len(ids) > 1:
+                errors.append(
+                    f"Branch collision on {branch!r}: claimed by {sorted(ids)}. "
+                    f"Rename one of the work units (or its explicit '**Branch:**' override) "
+                    f"so each task pushes to a unique branch; see docs/backlog-contract.md "
+                    f"'Branch Uniqueness Rule'."
+                )
+
+    @staticmethod
+    def _derive_branch_for_row(unit_id: str, file_path_str: str, workspace_root: Path) -> str:
+        """Resolve the branch name a Task row would push to.
+
+        Mirrors ``BacklogParser._parse_branch``: prefer an explicit
+        ``- **Branch:** \\`<name>\\``` line in the work-unit file; fall
+        back to the canonical lowercase-ID template when the explicit
+        line is absent or unreadable.
+        """
+        if file_path_str:
+            wu_path = workspace_root / file_path_str
+            if wu_path.is_file():
+                content = wu_path.read_text(encoding="utf-8")
+                explicit = re.search(r"-\s+\*?\*?Branch:?\*?\*?\s*`([^`]+)`", content)
+                if explicit:
+                    return explicit.group(1).strip()
+        return f"backlog/{unit_id.lower()}"
+
+    @classmethod
+    def _iter_dep_ids(cls, content: str) -> list[str]:
+        """Yield every dep-ID candidate in a work-unit's ``## Dependencies`` table.
+
+        Returns the list of cell-1 strings (after stripping). Header
+        rows, separator rows, and ``DEPENDENCY_NONE_VALUES`` cells are
+        excluded. Comma-separated tokens within a single cell are
+        split so ``| E1, E2 |`` yields two candidates. Mirrors the
+        parsing rules used by the runtime ``_extract_dep_ids`` helper
+        but exposed for the format-check rule.
+        """
+        deps: list[str] = []
+        in_deps = False
+        for raw in content.splitlines():
+            stripped = raw.strip()
+            if stripped.startswith("## "):
+                in_deps = stripped.startswith("## Dependencies")
+                continue
+            if not in_deps or not stripped.startswith("|"):
+                continue
+            cells = [c.strip() for c in stripped.split("|")]
+            cell = cells[1]
+            if not cell or cell.lower() == "id" or cell.startswith("-"):
+                continue
+            if cell in DEPENDENCY_NONE_VALUES:
+                continue
+            for raw_token in cell.split(","):
+                token = raw_token.strip()
+                if token:
+                    deps.append(token)
+        return deps
 
     @staticmethod
     def _source_stem_for_pair_match(source_path: str) -> str:

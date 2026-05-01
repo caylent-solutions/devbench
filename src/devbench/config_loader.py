@@ -277,11 +277,22 @@ class RepoConfig:
             the ``/`` in ``org/repo``).
         merge_strategy: Per-repo PR merge strategy override.  When ``None``,
             the top-level ``RuntimeConfig.merge_strategy`` is used.
+        resolved_checkout_path: Absolute filesystem path to the repo
+            checkout, populated by ``load_runtime_config``. Equal to
+            ``<JUDGE_WORKSPACE_ROOT>/<checkout_directory or repo_short_name>``
+            after resolution. Consumers MUST read this field instead of
+            re-resolving the path inline (E213).
+        validated_repo: Canonical ``org/repo`` form for this entry,
+            populated by ``load_runtime_config`` from the YAML repos map
+            key. Stored verbatim so consumers do not re-validate the
+            shape per-call.
     """
 
     default_branch: str | None = None
     checkout_directory: str | None = None
     merge_strategy: str | None = None
+    resolved_checkout_path: Path | None = None
+    validated_repo: str | None = None
 
 
 @dataclass
@@ -413,19 +424,35 @@ def _parse_repo_config(path: Path, repo_name: str, repo_data: object) -> RepoCon
     )
 
 
-def _parse_repos(path: Path, repos_raw: dict, allowed_orgs: list[str]) -> dict[str, RepoConfig]:
+def _parse_repos(
+    path: Path,
+    repos_raw: dict,
+    allowed_orgs: list[str],
+    workspace_root: Path | None = None,
+) -> dict[str, RepoConfig]:
     """Build the repos mapping from the raw YAML ``repos`` block.
 
     When *allowed_orgs* is non-empty, every repo key's organisation component
     must appear in *allowed_orgs*.
 
+    When *workspace_root* is provided (the normal case from
+    ``load_runtime_config``), each ``RepoConfig.resolved_checkout_path``
+    is populated to ``<workspace_root>/<checkout_directory or repo_short_name>``
+    so consumers do not re-resolve the path inline (E213). When it is
+    ``None`` the field stays ``None`` -- callers that operate without a
+    workspace root (some tests) must tolerate that absence.
+
     Args:
         path: Config file path (used in error messages).
         repos_raw: Raw ``repos`` dict from YAML (already schema-validated).
         allowed_orgs: Permitted GitHub organisations.  Empty list means any org.
+        workspace_root: Absolute path to ``JUDGE_WORKSPACE_ROOT`` for
+            populating ``resolved_checkout_path``.
 
     Returns:
-        Mapping of ``org/repo`` → ``RepoConfig``.
+        Mapping of ``org/repo`` → ``RepoConfig`` with ``validated_repo``
+        and (when *workspace_root* is set) ``resolved_checkout_path``
+        populated.
 
     Raises:
         ValueError: If a repo key's org is not in *allowed_orgs*.
@@ -440,7 +467,12 @@ def _parse_repos(path: Path, repos_raw: dict, allowed_orgs: list[str]) -> dict[s
                     f"Config file '{path}': repo '{repo_name}' belongs to org '{org}', "
                     f"which is not in allowed_orgs: {allowed_orgs}."
                 )
-        repos[repo_name] = _parse_repo_config(path, repo_name, repo_data)
+        cfg = _parse_repo_config(path, repo_name, repo_data)
+        cfg.validated_repo = repo_name
+        if workspace_root is not None:
+            checkout_dir = cfg.checkout_directory or repo_name.split("/", maxsplit=1)[-1]
+            cfg.resolved_checkout_path = workspace_root / checkout_dir
+        repos[repo_name] = cfg
     return repos
 
 
@@ -487,7 +519,9 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         raise ValueError(f"Config file '{path}' failed schema validation: {exc.message}") from exc
 
     allowed_orgs: list[str] = raw.get("allowed_orgs") or []
-    repos = _parse_repos(path, raw.get("repos") or {}, allowed_orgs)
+    workspace_root_raw = _env.get("JUDGE_WORKSPACE_ROOT", "")
+    workspace_root = Path(workspace_root_raw) if workspace_root_raw else None
+    repos = _parse_repos(path, raw.get("repos") or {}, allowed_orgs, workspace_root)
 
     # Populate TimeoutConfig from YAML timeouts block (absent keys yield None).
     timeouts_raw = raw.get("timeouts") or {}
@@ -623,8 +657,9 @@ def get_repo_local_path(repo: str, runtime_config: RuntimeConfig, workspace_root
     """Return the local filesystem path for *repo*.
 
     Resolution order:
-    1. ``repos.<repo>.checkout_directory`` resolved relative to *workspace_root*.
-    2. ``workspace_root / <repo-short-name>`` (the part after the ``/`` in ``org/repo``).
+    1. ``RepoConfig.resolved_checkout_path`` populated by the loader (E213).
+    2. ``repos.<repo>.checkout_directory`` resolved relative to *workspace_root*.
+    3. ``workspace_root / <repo-short-name>`` (the part after the ``/`` in ``org/repo``).
 
     Pure function -- no subprocess calls, no I/O.
 
@@ -637,6 +672,8 @@ def get_repo_local_path(repo: str, runtime_config: RuntimeConfig, workspace_root
         Absolute path to the local checkout directory.
     """
     repo_config = runtime_config.repos.get(repo)
+    if repo_config and repo_config.resolved_checkout_path is not None:
+        return repo_config.resolved_checkout_path
     if repo_config and repo_config.checkout_directory:
         return workspace_root / repo_config.checkout_directory
     short_name = repo.split("/", maxsplit=1)[1] if "/" in repo else repo

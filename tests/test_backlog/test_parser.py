@@ -13,11 +13,20 @@ from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
 class TestParseIndex:
     """Test parse_index returns WorkUnit list from BACKLOG.md."""
 
-    def test_parse_index_from_actual_backlog(self) -> None:
-        """Parse the real BACKLOG.md file and verify results."""
+    def test_parse_index_from_actual_backlog(self, tmp_path: Path) -> None:
+        """Parse the workspace BACKLOG.md file and verify results.
+
+        Reads ``JUDGE_WORKSPACE_ROOT`` from the environment when set
+        (so CI runs against the live backlog), otherwise falls back to
+        the pytest-supplied ``tmp_path`` -- never to a hardcoded
+        ``/tmp/test-workspace`` (TD-6). When neither location holds a
+        BACKLOG.md, the test is skipped because there is nothing to
+        parse.
+        """
         import os
 
-        workspace = Path(os.environ.get("JUDGE_WORKSPACE_ROOT", "/tmp/test-workspace"))
+        env_workspace = os.environ.get("JUDGE_WORKSPACE_ROOT")
+        workspace = Path(env_workspace) if env_workspace else tmp_path
         actual_backlog = workspace / "BACKLOG.md"
         if not actual_backlog.is_file():
             pytest.skip("Actual BACKLOG.md not found")
@@ -669,3 +678,130 @@ class TestParseWorkUnitFileEdgeCases:
         parser = BacklogParser(backlog_root=tmp_path, backlog_index=tmp_path / "B.md")
         with pytest.raises(ValueError, match="No '## Status:' line found"):
             parser.parse_work_unit_file(wu_file)
+
+
+class TestDepsSatisfiedHierarchical:
+    """E215: ``_deps_satisfied`` recurses into descendants for non-task deps."""
+
+    @staticmethod
+    def _wu(unit_id: str, status: WorkUnitStatus, unit_type: WorkUnitType, deps: list[str] | None = None) -> WorkUnit:
+        return WorkUnit(
+            id=unit_id,
+            title=unit_id,
+            status=status,
+            unit_type=unit_type,
+            file_path=Path(f"/dev/null/{unit_id}.md"),
+            repo="test/repo",
+            dependencies=deps or [],
+        )
+
+    def test_task_dep_unsatisfied_when_blocker_in_queue(self) -> None:
+        units = [
+            self._wu("E0-F1-S1-T1", WorkUnitStatus.IN_QUEUE, WorkUnitType.TASK),
+            self._wu("E0-F1-S1-T2", WorkUnitStatus.IN_QUEUE, WorkUnitType.TASK, deps=["E0-F1-S1-T1"]),
+        ]
+        units_by_id = {u.id: u for u in units}
+        assert BacklogParser._deps_satisfied(units[1], units_by_id) is False
+
+    def test_task_dep_satisfied_when_blocker_done(self) -> None:
+        units = [
+            self._wu("E0-F1-S1-T1", WorkUnitStatus.DONE, WorkUnitType.TASK),
+            self._wu("E0-F1-S1-T2", WorkUnitStatus.IN_QUEUE, WorkUnitType.TASK, deps=["E0-F1-S1-T1"]),
+        ]
+        units_by_id = {u.id: u for u in units}
+        assert BacklogParser._deps_satisfied(units[1], units_by_id) is True
+
+    def test_task_dep_satisfied_when_blocker_declined(self) -> None:
+        units = [
+            self._wu("E0-F1-S1-T1", WorkUnitStatus.DECLINED, WorkUnitType.TASK),
+            self._wu("E0-F1-S1-T2", WorkUnitStatus.IN_QUEUE, WorkUnitType.TASK, deps=["E0-F1-S1-T1"]),
+        ]
+        units_by_id = {u.id: u for u in units}
+        assert BacklogParser._deps_satisfied(units[1], units_by_id) is True
+
+    def test_story_dep_unsatisfied_when_descendant_task_in_queue(self) -> None:
+        # E0-F1-S2-T1 depends on the entire E0-F1-S1 story; one of S1's
+        # children is still in-queue, so the dep MUST NOT be satisfied.
+        units = [
+            self._wu("E0-F1-S1", WorkUnitStatus.IN_QUEUE, WorkUnitType.STORY),
+            self._wu("E0-F1-S1-T1", WorkUnitStatus.DONE, WorkUnitType.TASK),
+            self._wu("E0-F1-S1-T2", WorkUnitStatus.IN_QUEUE, WorkUnitType.TASK),
+            self._wu(
+                "E0-F1-S2-T1",
+                WorkUnitStatus.IN_QUEUE,
+                WorkUnitType.TASK,
+                deps=["E0-F1-S1"],
+            ),
+        ]
+        units_by_id = {u.id: u for u in units}
+        assert BacklogParser._deps_satisfied(units[3], units_by_id) is False
+
+    def test_story_dep_satisfied_when_all_descendant_tasks_terminal(self) -> None:
+        units = [
+            self._wu("E0-F1-S1", WorkUnitStatus.DONE, WorkUnitType.STORY),
+            self._wu("E0-F1-S1-T1", WorkUnitStatus.DONE, WorkUnitType.TASK),
+            self._wu("E0-F1-S1-T2", WorkUnitStatus.DECLINED, WorkUnitType.TASK),
+            self._wu(
+                "E0-F1-S2-T1",
+                WorkUnitStatus.IN_QUEUE,
+                WorkUnitType.TASK,
+                deps=["E0-F1-S1"],
+            ),
+        ]
+        units_by_id = {u.id: u for u in units}
+        assert BacklogParser._deps_satisfied(units[3], units_by_id) is True
+
+    def test_feature_dep_walks_two_hierarchy_levels(self) -> None:
+        # A dep on E0-F1 must require every descendant TASK across every
+        # Story under F1 to be terminal. Mix DONE + DECLINED + one IN_QUEUE
+        # to prove the in-queue child blocks satisfaction.
+        units = [
+            self._wu("E0-F1", WorkUnitStatus.IN_QUEUE, WorkUnitType.FEATURE),
+            self._wu("E0-F1-S1", WorkUnitStatus.IN_QUEUE, WorkUnitType.STORY),
+            self._wu("E0-F1-S1-T1", WorkUnitStatus.DONE, WorkUnitType.TASK),
+            self._wu("E0-F1-S2", WorkUnitStatus.IN_QUEUE, WorkUnitType.STORY),
+            self._wu("E0-F1-S2-T1", WorkUnitStatus.IN_QUEUE, WorkUnitType.TASK),
+            self._wu("E0-F2-S1-T1", WorkUnitStatus.IN_QUEUE, WorkUnitType.TASK, deps=["E0-F1"]),
+        ]
+        units_by_id = {u.id: u for u in units}
+        assert BacklogParser._deps_satisfied(units[5], units_by_id) is False
+
+    def test_epic_dep_with_no_descendants_is_vacuously_satisfied(self) -> None:
+        # If a dep names an epic that has zero TASK descendants in the
+        # parsed index, the dep is treated as satisfied -- there's
+        # nothing to wait on. validate-backlog separately reports any
+        # epic with no children, so this can never silently hide work.
+        units = [
+            self._wu("E9", WorkUnitStatus.IN_QUEUE, WorkUnitType.EPIC),
+            self._wu("E0-F1-S1-T1", WorkUnitStatus.IN_QUEUE, WorkUnitType.TASK, deps=["E9"]),
+        ]
+        units_by_id = {u.id: u for u in units}
+        assert BacklogParser._deps_satisfied(units[1], units_by_id) is True
+
+    def test_unknown_dep_id_treated_as_satisfied(self) -> None:
+        # validate-backlog reports unknown IDs separately. The parser's
+        # actionability scan must not deadlock on a typo'd ID.
+        units = [
+            self._wu("E0-F1-S1-T1", WorkUnitStatus.IN_QUEUE, WorkUnitType.TASK, deps=["E9-F9-S9-T9"]),
+        ]
+        units_by_id = {u.id: u for u in units}
+        assert BacklogParser._deps_satisfied(units[0], units_by_id) is True
+
+    def test_get_parallel_candidates_excludes_unit_with_unsatisfied_story_dep(self) -> None:
+        # End-to-end: a unit with a Story-level dep should NOT appear in
+        # get_parallel_candidates while any descendant task is in-queue.
+        units = [
+            self._wu("E0-F1-S1-T1", WorkUnitStatus.IN_QUEUE, WorkUnitType.TASK),
+            self._wu(
+                "E0-F1-S2-T1",
+                WorkUnitStatus.IN_QUEUE,
+                WorkUnitType.TASK,
+                deps=["E0-F1-S1"],
+            ),
+            self._wu("E0-F1-S1", WorkUnitStatus.IN_QUEUE, WorkUnitType.STORY),
+        ]
+        parser = BacklogParser(backlog_root=Path("/tmp"), backlog_index=Path("/tmp/BACKLOG.md"))
+        candidates = parser.get_parallel_candidates(units)
+        candidate_ids = {u.id for u in candidates}
+        assert "E0-F1-S1-T1" in candidate_ids
+        assert "E0-F1-S2-T1" not in candidate_ids

@@ -9,7 +9,13 @@ dist/
 build/
 logs/
 tmp/
-/backlog/
+# Workspace backlog state lives in /backlog/ when devbench is run against
+# this repo as a workspace. Templates ship with the package itself and
+# MUST stay tracked so `devbench new-task` can render them in any clone
+# (CI included). Use `/backlog/*` + a negation so the directory is not
+# wholesale-ignored, which would block the negation per gitignore rules.
+/backlog/*
+!/backlog/templates/
 /BACKLOG.md
 
 # Environment files

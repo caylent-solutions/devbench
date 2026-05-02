@@ -8,13 +8,20 @@ DevBench takes a structured backlog of work units (epics, features, stories, tas
 
 - **Autonomous SDLC pipeline.** One operator writes the spec; the orchestrator drives every task from claim to merged PR.
 - **Real LLM review at every gate.** Every verdict is logged as an audit comment on the work unit.
-  - **Four review judges run in parallel** (code, test, docs, scope).
-  - **One security judge runs after they pass** (CodeQL, Dependabot, secret-scanning).
-  - **Three scope-expansion agents** handle the executor-driven recovery path:
-    - `manifest-amender` -- judges `tdd_green_production_fix` amendments mid-cycle.
-    - `blocker-resolver` -- decomposes amendment rejections into proposal JSONs.
-    - `task-factory` -- materialises draft work units the source task can depend on.
 - **Auditable by default.** Every agent action writes a timestamped comment on the work unit file. The orchestrator can resume from any point after a restart because state lives on disk, not in memory.
+
+The judge / agent layer:
+
+| # | Role | Agent | Runs when |
+|---|------|-------|-----------|
+| 1 | Review (parallel) | `code-reviewer` | After every executor pass: SOLID, DRY, fail-fast, security, 12-factor. |
+| 2 | Review (parallel) | `test-reviewer` | TDD discipline, real assertions, repo task-runner output. |
+| 3 | Review (parallel) | `doc-reviewer` | Accuracy, completeness, in-sync with code. |
+| 4 | Review (parallel) | `changes-manifest` | Actual changes vs declared Manifest. |
+| 5 | Security gate (sequential) | `security-reviewer` | After all four review judges PASS; CodeQL / Dependabot / secret-scanning alerts. |
+| 6 | Scope expansion | `manifest-amender` | Judges a `tdd_green_production_fix` amendment when the executor expands its Manifest mid-cycle. |
+| 7 | Recovery cascade | `blocker-resolver` | After an amendment reject; decomposes the rejection into a proposal JSON. |
+| 8 | Recovery cascade | `task-factory` | Materialises 0..N draft work units the source task depends on. |
 
 ### Try it now (5 commands)
 

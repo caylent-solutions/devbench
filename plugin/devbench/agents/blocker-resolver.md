@@ -102,6 +102,13 @@ Pick the next sequential IDs within the same Story (e.g. if `E0-F9-S2-T5.md` is 
 
 Every field is load-bearing. In particular, `suggested_approach` MUST be a rich, multi-sentence narrative -- it flows verbatim into the draft's ## Description section and downstream executors work from it. A thin one-line RED/GREEN blurb will be rejected by `materialise-proposal` with a `suggested_approach too terse` error, and the operator will have to re-run you with tighter inputs. Produce the four-section structure below.
 
+> **Changes Manifest path rules (validate-backlog rules 10 and 11):**
+> Every path in `files_to_own` MUST be repo-relative (e.g. `src/foo.py`, `tests/test_foo.py`).
+> Paths prefixed with the checkout_directory (e.g. `kanon/src/foo.py` when `kanon` is the
+> checkout_directory) are rejected by `write-proposal` with a rule-11 error and halt the
+> orchestrator. Paths containing an em-dash (U+2014) are rejected with a rule-10 error.
+> Always use `--` (double hyphen) where an em-dash would appear.
+
 `suggested_approach` MUST contain at least the following four labelled sections, concatenated into one string:
 
 1. **Context** (1-3 sentences): which source task prompted this follow-up, which production file is affected, what the bug or gap is, and why the follow-up is necessary.

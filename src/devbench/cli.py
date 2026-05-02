@@ -120,7 +120,12 @@ from devbench.backlog.proposal import (
     reject_proposal,
     write_proposal,
 )
-from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
+from devbench.backlog.work_unit import (
+    WorkUnit,
+    WorkUnitStatus,
+    WorkUnitType,
+    validate_manifest_paths,
+)
 from devbench.config import (
     BACKLOG_INDEX,
     BACKLOG_ROOT,
@@ -136,6 +141,7 @@ from devbench.config import (
 from devbench.config_loader import RepoConfig, get_configured_default_branch
 from devbench.constants import (
     ALL_REQUIRED_JUDGE_NAMES,
+    BACKLOG_LOCAL_PATH_RE,
     COMMENT_AGENT_TEMPLATE,
     COMMENT_ENTRY_TEMPLATE,
     COMMENT_TIMESTAMP_FORMAT,
@@ -465,7 +471,86 @@ def cmd_set_status(unit_id: str, new_status: str) -> int:
     mgr.force_status(wu_file, BACKLOG_INDEX, unit_id, new_status)
 
     logger.info("Set %s to %s", unit_id, new_status)
+
+    if new_status.lower() == "blocked":
+        rc = _clean_target_repo_on_block(wu_file)
+        if rc != 0:
+            print(f"WARNING: target repo cleanup failed for '{unit_id}' (exit {rc})", file=sys.stderr)
+
     print(f"Set {unit_id} to {new_status}")
+    return 0
+
+
+def _clean_target_repo_on_block(wu_file: Path) -> int:
+    """Reset and clean the target repo's working tree when a task transitions to blocked.
+
+    Reads the ``Local path:`` field from the work-unit file and runs
+    ``git reset --hard HEAD`` and ``git clean -fd`` against that directory.
+    Both commands are run with ``check=False``; returns 1 if either fails.
+
+    If ``Local path:`` is absent from the file (e.g. validation gates with no
+    local path), logs a warning and returns 0 as a defensive skip -- this is
+    NOT a fallback; the task is already blocked, so failing here would obscure
+    the real status transition.
+
+    Args:
+        wu_file: Path to the work-unit ``.md`` file.
+
+    Returns:
+        0 on success or when ``Local path:`` is absent; 1 if a git command
+        errors.
+    """
+    try:
+        content = wu_file.read_text()
+    except OSError as exc:
+        logger.warning("_clean_target_repo_on_block: cannot read '%s': %s", wu_file, exc)
+        return 1
+
+    match = BACKLOG_LOCAL_PATH_RE.search(content)
+    if not match:
+        logger.warning(
+            "_clean_target_repo_on_block: 'Local path:' not found in '%s'; skipping repo cleanup",
+            wu_file,
+        )
+        return 0
+
+    local_path = match.group(1).strip()
+    if not Path(local_path).exists():
+        logger.warning(
+            "_clean_target_repo_on_block: local path '%s' does not exist; skipping repo cleanup",
+            local_path,
+        )
+        return 0
+
+    reset_result = subprocess.run(
+        ["git", "-C", local_path, "reset", "--hard", "HEAD"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if reset_result.returncode != 0:
+        logger.warning(
+            "_clean_target_repo_on_block: git reset failed for '%s': %s",
+            local_path,
+            reset_result.stderr.strip(),
+        )
+        return 1
+
+    clean_result = subprocess.run(
+        ["git", "-C", local_path, "clean", "-fd"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if clean_result.returncode != 0:
+        logger.warning(
+            "_clean_target_repo_on_block: git clean failed for '%s': %s",
+            local_path,
+            clean_result.stderr.strip(),
+        )
+        return 1
+
+    logger.info("_clean_target_repo_on_block: cleaned target repo at '%s'", local_path)
     return 0
 
 
@@ -3978,8 +4063,17 @@ def cmd_write_proposal(source_task_id: str) -> int:
         match = find_matching_pending_proposal(WORKSPACE_ROOT, proposal.fix_signature)
         if match is not None and match.source_task_id != source_task_id:
             return _wire_recovery_reuse(source_task_id, proposal, match)
+        # Validate manifest paths before persisting -- rejects em-dash and
+        # checkout_directory-prefixed paths that would fail validate-backlog
+        # downstream and halt the orchestrator.
+        checkout_directories = [rc.checkout_directory for rc in RUNTIME_CONFIG.repos.values() if rc.checkout_directory]
+        all_files_to_own: list[str] = [path for task in proposal.proposed_tasks for path in task.files_to_own]
+        validate_manifest_paths(all_files_to_own, checkout_directories)
         written = write_proposal(WORKSPACE_ROOT, proposal)
     except (_ProposalInputError, ProposalError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 

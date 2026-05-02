@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
+from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType, validate_manifest_paths
 
 
 class TestWorkUnitStatusEnum:
@@ -300,3 +300,31 @@ class TestParseId:
         )
         with pytest.raises(ValueError, match="Invalid work-unit ID"):
             wu.parse_id()
+
+
+class TestValidateManifestPaths:
+    """Tests for validate_manifest_paths rule-10 and rule-11 enforcement."""
+
+    def test_rejects_path_prefixed_with_checkout_directory(self) -> None:
+        """Rule 11: a path starting with a known checkout_directory is rejected."""
+        with pytest.raises(ValueError, match="rule 11"):
+            validate_manifest_paths(["kanon/src/foo.py"], ["kanon"])
+
+    def test_accepts_repo_relative_path(self) -> None:
+        """A plain repo-relative path is accepted regardless of checkout_directories."""
+        validate_manifest_paths(["src/foo.py"], ["kanon"])
+
+    def test_rejects_path_containing_em_dash(self) -> None:
+        """Rule 10: a path containing U+2014 is rejected."""
+        with pytest.raises(ValueError, match="rule 10"):
+            validate_manifest_paths(["src/foo—bar.py"], [])
+
+    def test_accepts_empty_path_list(self) -> None:
+        """An empty path list passes without error."""
+        validate_manifest_paths([], ["kanon", "devbench"])
+
+    def test_error_message_names_first_offending_path(self) -> None:
+        """The error message must include the offending path."""
+        offending = "kanon/src/bad.py"
+        with pytest.raises(ValueError, match=offending):
+            validate_manifest_paths([offending], ["kanon"])

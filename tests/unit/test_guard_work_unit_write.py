@@ -12,13 +12,20 @@ import pytest
 SCRIPT_PATH = Path(__file__).parent.parent.parent / "plugin" / "devbench" / "scripts" / "guard-work-unit-write.sh"
 
 
-def _run_hook(payload: dict) -> subprocess.CompletedProcess:
+def _run_hook(
+    payload: dict,
+    extra_env: dict | None = None,
+) -> subprocess.CompletedProcess:
     """Invoke the hook script with the given JSON payload on stdin."""
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
     return subprocess.run(
         ["bash", str(SCRIPT_PATH)],
         input=json.dumps(payload),
         capture_output=True,
         text=True,
+        env=env,
     )
 
 
@@ -146,3 +153,63 @@ class TestGuardWorkUnitWriteHook:
         payload = _make_write_payload("backlog/config/AGENT-INSTRUCTIONS.md")
         result = _run_hook(payload)
         assert result.returncode == 0
+
+
+@pytest.mark.unit
+class TestGuardWorkUnitWriteContentValidation:
+    """Tests for rule-10 (em-dash) and rule-11 (checkout_directory prefix) content checks."""
+
+    def test_em_dash_in_content_rejected_with_exit_2(self) -> None:
+        """Rule 10: content containing U+2014 is rejected with exit 2."""
+        content = "## Changes Manifest\n| `src/foo—bar.py` | fix |\n"
+        payload = {
+            "tool_name": "Write",
+            "tool_input": {
+                "file_path": "backlog/E1-F1-S1-T1.md",
+                "content": content,
+            },
+        }
+        result = _run_hook(payload)
+        assert result.returncode == 2, (
+            f"Expected exit 2 for em-dash content, got {result.returncode}. stderr: {result.stderr}"
+        )
+        assert "rule 10" in result.stderr
+
+    def test_checkout_directory_prefix_in_manifest_row_rejected(self, tmp_path: Path) -> None:
+        """Rule 11: a Changes Manifest row prefixed with checkout_directory is rejected."""
+        yaml_content = "repos:\n  org/kanon:\n    checkout_directory: kanon\n"
+        config_dir = tmp_path / "backlog" / "config"
+        config_dir.mkdir(parents=True)
+        (config_dir / "devbench.yaml").write_text(yaml_content)
+
+        content = "## Changes Manifest\n| `kanon/src/foo.py` | add feature |\n"
+        payload = {
+            "tool_name": "Write",
+            "tool_input": {
+                "file_path": "backlog/E1-F1-S1-T2.md",
+                "content": content,
+            },
+        }
+        result = _run_hook(payload, extra_env={"JUDGE_WORKSPACE_ROOT": str(tmp_path)})
+        assert result.returncode == 2, (
+            f"Expected exit 2 for checkout_directory prefix content, got {result.returncode}. stderr: {result.stderr}"
+        )
+        assert "rule 11" in result.stderr
+
+    def test_valid_content_and_manifest_paths_pass(self) -> None:
+        """Content with no em-dashes and repo-relative paths exits 0 (path-based block still applies)."""
+        content = "## Changes Manifest\n| `src/foo.py` | add feature |\n"
+        payload = {
+            "tool_name": "Write",
+            "tool_input": {
+                "file_path": "backlog/E1-F1-S1-T3.md",
+                "content": content,
+            },
+        }
+        # This should still exit 2 due to the path-based block (work unit .md),
+        # but the content checks must NOT fire before the path block.
+        result = _run_hook(payload)
+        assert result.returncode == 2
+        assert "rule 10" not in result.stderr
+        assert "rule 11" not in result.stderr
+        assert "guard-work-unit-write" in result.stderr

@@ -210,6 +210,7 @@ Git Operations:
 - Stage all changed files with `git add` (in the repo_path directory) before logging completion -- this is required for judge evidence to be complete.
 - The orchestrate skill handles all git operations beyond staging: branch, commit, push, PR, merge.
 - NEVER modify `BACKLOG.md` or any file under `backlog/` -- these are operational tracking artifacts managed by the orchestrate skill.
+- When a task transitions to `blocked` via `set-status <id> blocked`, the orchestrator automatically runs `git reset --hard HEAD && git clean -fd` against the target repo. Do NOT additionally call `git reset` or `git clean` manually after setting blocked status -- doing so would double-reset and could discard legitimate staged work from other tasks.
 
 Prohibited Patterns:
 - No time.sleep() or time-based delays -- use readiness detection.

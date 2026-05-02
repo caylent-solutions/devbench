@@ -2844,6 +2844,114 @@ class TestValidateManifestConflicts:
         assert not any("Manifest conflict" in e for e in errors)
 
 
+class TestValidateManifestConflictsTransitiveChain:
+    """Issue #145 regression: a clean N-1 dep chain among N claimants of the
+    same Manifest path satisfies the Manifest Conflict Rule. Pairs do NOT
+    need direct dep edges -- transitive reachability is sufficient.
+    """
+
+    H = _ValidateRuleHarness
+    REPO = "ex/foo"
+
+    def _seed_chain(
+        self,
+        tmp_path: Path,
+        backlog_dir: Path,
+        edges: dict[str, list[str]],
+        ids: list[str],
+    ) -> list[str]:
+        """Seed a backlog where every id in ``ids`` claims pyproject.toml,
+        with the provided dep edges (mapping blocked_id -> [blocker_ids]).
+        Returns the validate() error list.
+        """
+        for tid in ids:
+            blockers = edges.get(tid, [])
+            deps_rows = "\n".join(f"| {bid} | dep | proposed |" for bid in blockers) if blockers else "| none | | |"
+            self.H.make_task(
+                backlog_dir,
+                tid,
+                self.REPO,
+                "| `pyproject.toml` | edit |\n",
+                deps_rows=deps_rows,
+            )
+        rows = "".join(
+            f"| {tid} | T | Task | in-queue | "
+            f"{','.join(edges.get(tid, [])) or 'none'} | "
+            f"{self.REPO} | `backlog/{tid}.md` |\n"
+            for tid in ids
+        )
+        self.H.make_index(tmp_path, rows)
+        return BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+
+    def test_clean_n_minus_1_chain_accepted(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """5 claimants wired as A <- B <- C <- D <- E (only N-1 = 4 edges).
+        Pre-#145 this failed because (A, C), (A, D), (A, E), (B, D), (B, E),
+        (C, E) lacked direct edges; transitive reachability accepts.
+        """
+        ids = ["E1-F1-S1-T1", "E1-F1-S1-T2", "E1-F1-S1-T3", "E1-F1-S1-T4", "E1-F1-S1-T5"]
+        edges = {
+            ids[1]: [ids[0]],
+            ids[2]: [ids[1]],
+            ids[3]: [ids[2]],
+            ids[4]: [ids[3]],
+        }
+        errors = self._seed_chain(tmp_path, backlog_dir, edges, ids)
+        assert not any("Manifest conflict" in e and "pyproject.toml" in e for e in errors), errors
+
+    def test_chain_with_shortcuts_accepted(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """Chain backbone A <- B <- C <- D <- E plus extra shortcut edges
+        (D <- A, C <- A). Denser than minimum; every pair still comparable
+        via the chain backbone.
+        """
+        ids = ["E2-F1-S1-T1", "E2-F1-S1-T2", "E2-F1-S1-T3", "E2-F1-S1-T4", "E2-F1-S1-T5"]
+        edges = {
+            ids[1]: [ids[0]],
+            ids[2]: [ids[1], ids[0]],  # shortcut: T3 also directly deps on T1
+            ids[3]: [ids[2], ids[0]],  # shortcut: T4 also directly deps on T1
+            ids[4]: [ids[3]],
+        }
+        errors = self._seed_chain(tmp_path, backlog_dir, edges, ids)
+        assert not any("Manifest conflict" in e and "pyproject.toml" in e for e in errors), errors
+
+    def test_partial_chain_rejected(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """3 claimants, only A <- B wired; C is isolated -> rejected."""
+        ids = ["E3-F1-S1-T1", "E3-F1-S1-T2", "E3-F1-S1-T3"]
+        edges = {ids[1]: [ids[0]]}
+        errors = self._seed_chain(tmp_path, backlog_dir, edges, ids)
+        conflict = [e for e in errors if "Manifest conflict" in e and "pyproject.toml" in e]
+        assert len(conflict) == 1
+        for tid in ids:
+            assert tid in conflict[0]
+
+    def test_unrelated_claimants_rejected(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """3 claimants, zero edges -> rejected."""
+        ids = ["E4-F1-S1-T1", "E4-F1-S1-T2", "E4-F1-S1-T3"]
+        errors = self._seed_chain(tmp_path, backlog_dir, {}, ids)
+        conflict = [e for e in errors if "Manifest conflict" in e and "pyproject.toml" in e]
+        assert len(conflict) == 1
+
+    def test_full_pairwise_still_accepted(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """Backwards compat: backlogs that already wire N*(N-1)/2 direct
+        edges keep passing.
+        """
+        ids = ["E5-F1-S1-T1", "E5-F1-S1-T2", "E5-F1-S1-T3", "E5-F1-S1-T4"]
+        edges = {ids[i]: ids[:i] for i in range(1, len(ids))}
+        errors = self._seed_chain(tmp_path, backlog_dir, edges, ids)
+        assert not any("Manifest conflict" in e and "pyproject.toml" in e for e in errors), errors
+
+    def test_error_message_suggests_chain(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """Conflict error message includes a suggested N-1 chain in
+        lexical-sort order (operator hint).
+        """
+        ids = ["E6-F1-S1-T1", "E6-F1-S1-T2", "E6-F1-S1-T3"]
+        errors = self._seed_chain(tmp_path, backlog_dir, {}, ids)
+        conflict = next(e for e in errors if "Manifest conflict" in e and "pyproject.toml" in e)
+        assert "Wire a serial dep chain:" in conflict
+        assert "uv run devbench add-dep E6-F1-S1-T2 E6-F1-S1-T1" in conflict
+        assert "uv run devbench add-dep E6-F1-S1-T3 E6-F1-S1-T2" in conflict
+        assert "or any other DAG that totally orders the set" in conflict
+
+
 class TestValidateLanguageAcAlignment:
     """Tests for _check_language_ac_alignment (canonical-AC Applicability)."""
 

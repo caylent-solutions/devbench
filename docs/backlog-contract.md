@@ -472,6 +472,8 @@ The fix in both cases was to add a `## Dependencies` entry: the full-implementat
 
 `devbench validate-backlog` SHOULD reject any backlog state where two in-queue Tasks list the same file path with no explicit dependency between them. (This rule is part of the post-Backlog-A Tier 3 tooling proposal; until it lands, authors are responsible for self-checking via grep across `## Changes Manifest` blocks.)
 
+For N claimants of the same path, the validator accepts **any DAG that totally orders the set via transitive reachability** (issue #145). A clean N-1 edge chain (`A <- B <- C <- D <- E`) is sufficient -- the validator no longer requires the full `N*(N-1)/2` direct pairwise edges. When the rule fires, the error message prints a suggested chain in lexical-sort order as an operator hint; operators may pick any other ordering that resolves their natural execution order.
+
 The companion rule for cross-cutting infrastructure (e.g., `pyproject.toml` is owned by one Task that authors all build/lint/test config edits in one coordinated commit) is documented in [`source-test-atomicity.md`](source-test-atomicity.md).
 
 ---

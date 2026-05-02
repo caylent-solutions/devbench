@@ -1669,14 +1669,16 @@ def generate_report(
     if since is None:
         lines.append("\n" + _windows_explanation())
         # B9: per-unit listings at the very end so the user can act on each.
-        # Proposed + Declined panels render FIRST (before In Progress / Blocked)
-        # because they represent human-decision state: drafts awaiting review
-        # and tasks that have been taken off the table. Both are omitted when
-        # their respective status has zero tasks.
+        # Order surfaces the most operationally-actionable panels first
+        # (In Progress, then Blocked) and pushes long-tail / decision-only
+        # state (Proposed, Unmaterialised Proposals, Declined) to the edges.
+        # Declined renders LAST since it represents tasks already taken off
+        # the table -- useful as historical reference but not actionable.
+        # Each panel is omitted when its respective status has zero tasks.
         lines.extend(_proposed_listing(units))
         lines.extend(_unmaterialised_proposals_listing())
-        lines.extend(_declined_listing(units))
         lines.extend(_in_progress_listing(units))
         lines.extend(_blocked_listing(units))
+        lines.extend(_declined_listing(units))
 
     return "\n".join(lines)

@@ -32,14 +32,14 @@ The judge / agent layer:
 
 | # | Role | Agent | Runs when |
 |---|------|-------|-----------|
-| 1 | Review (parallel) | `code-reviewer` | After every executor pass: SOLID, DRY, fail-fast, security, 12-factor. |
-| 2 | Review (parallel) | `test-reviewer` | TDD discipline, real assertions, repo task-runner output. |
-| 3 | Review (parallel) | `doc-reviewer` | Accuracy, completeness, in-sync with code. |
-| 4 | Review (parallel) | `changes-manifest` | Actual changes vs declared Manifest. |
-| 5 | Security gate (sequential) | `security-reviewer` | After all four review judges PASS; CodeQL / Dependabot / secret-scanning alerts. |
-| 6 | Scope expansion | `manifest-amender` | Judges a `tdd_green_production_fix` amendment when the executor expands its Manifest mid-cycle. |
-| 7 | Recovery cascade | `blocker-resolver` | After an amendment reject; decomposes the rejection into a proposal JSON. |
-| 8 | Recovery cascade | `task-factory` | Materialises 0..N draft work units the source task depends on. |
+| 1 | Review | `code-reviewer` | SOLID / DRY / fail-fast / 12-factor |
+| 2 | Review | `test-reviewer` | TDD discipline + repo task-runner output |
+| 3 | Review | `doc-reviewer` | Accuracy + sync with code |
+| 4 | Review | `changes-manifest` | Actual diff vs declared Manifest |
+| 5 | Security | `security-reviewer` | CodeQL / Dependabot / secret-scanning |
+| 6 | Amender | `manifest-amender` | Judges `tdd_green_production_fix` amendments |
+| 7 | Recovery | `blocker-resolver` | Decomposes amendment rejects into proposals |
+| 8 | Recovery | `task-factory` | Materialises draft work units from proposals |
 
 ### Try it now (5 commands)
 

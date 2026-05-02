@@ -76,6 +76,15 @@ since the last release. PR #119 carries every change.
 
 ### Changed
 
+- **Transitive dep chains accepted by Manifest Conflict validator**
+  (issue #145). Previously the validator required `N*(N-1)/2` direct
+  dep edges between N claimants of the same Manifest path; now any DAG
+  that totally orders the set via transitive reachability is accepted,
+  so a clean N-1 edge chain is sufficient. Operator overhead drops
+  from quadratic to linear in claimant count. The conflict error
+  message prints a suggested chain in lexical-sort order as an
+  operator hint. Pinned by
+  `tests/test_backlog/test_manager.py::TestValidateManifestConflictsTransitiveChain`.
 - **CI-failure retry default flipped to ON** (issue #115). Default
   behaviour is rc=2 + executor retry; opt out via
   `git_ops.ci_failure_retry: false` in `devbench.yaml` or

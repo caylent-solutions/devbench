@@ -30,8 +30,10 @@ both the work-unit file and BACKLOG.md atomically.  After each write,
 the ``## Status Summary`` table in sync.
 """
 
+import itertools
 import logging
 import re
+from collections import deque
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import ClassVar
@@ -1244,16 +1246,21 @@ class BacklogManager:
             relevant = [(tid, st) for tid, st in owners if st in ("in-queue", "proposed", "blocked")]
             if len(relevant) < 2:
                 continue
-            # Check whether every pair has an explicit dep relationship.
+            # Check whether every pair is comparable via the transitive
+            # dep graph (any DAG that totally orders the set is sufficient).
             ids = [tid for tid, _ in relevant]
             if self._tasks_form_dep_chain(ids, deps_by_task):
                 continue
+            sorted_ids = sorted(ids)
+            chain_hint = "\n".join(
+                f"    uv run devbench add-dep {later} {earlier}" for earlier, later in itertools.pairwise(sorted_ids)
+            )
             errors.append(
                 f"Manifest conflict on {path!r} in repo {repo or '(unknown)'}: "
-                f"claimed by {', '.join(sorted(ids))}. Wire an explicit dependency "
-                f"between them via 'devbench add-dep <later> <earlier>' or "
-                f"reassign ownership; see docs/backlog-contract.md "
-                f"'Manifest Conflict Rule'."
+                f"claimed by {', '.join(sorted_ids)}. Wire a serial dep chain:\n"
+                f"{chain_hint}\n"
+                f"  -- or any other DAG that totally orders the set. See "
+                f"docs/backlog-contract.md 'Manifest Conflict Rule'."
             )
 
     @staticmethod
@@ -1290,18 +1297,36 @@ class BacklogManager:
 
     @staticmethod
     def _tasks_form_dep_chain(ids: list[str], deps: dict[str, set[str]]) -> bool:
-        """Return True if every id in ``ids`` is reachable from every other via the dep graph.
+        """Return True iff every id in ``ids`` is comparable via transitive reachability.
 
-        A dep chain (any ordering that resolves ownership conflicts) requires
-        the ids to be totally ordered by the deps relation; a simpler
-        sufficient check is that every pair has at least one direction of dep
-        between them. Implements the simpler check.
+        Two task ids are *comparable* when one is reachable from the other by
+        following dep edges. A dep chain that resolves ownership conflicts
+        requires the conflict set to be totally ordered: every pair of
+        claimants must be comparable in at least one direction. This is the
+        canonical contract -- any DAG that totally orders the set (a clean
+        N-1 chain, a branching DAG that merges, full N*(N-1)/2 pairwise
+        edges) is accepted (issue #145).
         """
         if len(ids) < 2:
             return True
+        id_set = set(ids)
+
+        def reachable(start: str) -> set[str]:
+            seen: set[str] = set()
+            queue: deque[str] = deque([start])
+            while queue:
+                node = queue.popleft()
+                for child in deps.get(node, set()):
+                    if child not in id_set or child in seen:
+                        continue
+                    seen.add(child)
+                    queue.append(child)
+            return seen
+
+        reach = {tid: reachable(tid) for tid in ids}
         for i, a in enumerate(ids):
             for b in ids[i + 1 :]:
-                if b not in deps.get(a, set()) and a not in deps.get(b, set()):
+                if b not in reach[a] and a not in reach[b]:
                     return False
         return True
 

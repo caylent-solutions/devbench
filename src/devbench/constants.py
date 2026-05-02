@@ -249,6 +249,14 @@ DEFAULT_HOOK_TAIL_AGENT_WIDTH: int = 12
 DEFAULT_HOOK_TAIL_TOOL_WIDTH: int = 8
 DEFAULT_HOOK_TAIL_DESCRIPTION_MAX: int = 120
 DEFAULT_HOOK_TAIL_STDOUT_PREVIEW_MAX: int = 80
+# Recovery-cascade depth cap (issue #144). Operator-tunable via
+# `orchestrate.max_cascade_depth` YAML or
+# `JUDGE_ORCHESTRATE_MAX_CASCADE_DEPTH` env var. When a proposal would
+# land at depth >= this cap, the source task transitions to
+# NEEDS_OPERATOR_ATTENTION instead of materialising another recovery
+# layer. Default empirically matches the longest healthy cascade
+# observed in production sessions.
+DEFAULT_MAX_CASCADE_DEPTH: int = 3
 # Workflow-registration race defence (issue #114). When `gh pr checks`
 # returns "no checks reported" right after a PR is created, devbench
 # cannot tell "repo has no CI configured" apart from "GitHub Actions

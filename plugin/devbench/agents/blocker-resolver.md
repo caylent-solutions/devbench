@@ -238,3 +238,13 @@ When ANY of those is false, omit the flag (default behavior: source.depends_on(n
 In Backlog A's first run, two circular-dep cycles (T8↔T9 on pyproject.toml; T1↔T3 on monorepo-check action.yaml) were created because the default promote-proposal wiring assumed source-depends-on-new. Both required manual reversal (`devbench add-dep <new> <source>` plus removing the auto-wired source-side dep). Setting `source_dep_direction: "test_validates_source"` on the proposal JSON makes the wiring correct from the start.
 
 See [`docs/task-factory.md`](../../../docs/task-factory.md#when-to-use---no-dep-on-source-post-backlog-a-lesson) for the full pattern and worked example.
+
+## Dedup contract (issue #141)
+
+Before emitting a fresh proposal via `uv run devbench write-proposal`, the CLI computes a stable `fix_signature` hash over `(target_repo, sorted(files_to_own), normalised_intent_phrase)` for the proposal you would write, and scans `.devbench/proposals/*.json` for an existing pending recovery task whose signature matches.
+
+**On match (the dedup path):** `write-proposal` does NOT write a duplicate JSON. Instead it auto-wires the new source task as an additional dep edge on the existing recovery task (via `cmd_add_dep`) and returns a JSON envelope containing `"recovery_reused": true` + `"reused_from_task_id": "<existing-recovery-id>"`. Your verdict for that invocation is `pass` with the audit message `[RECOVERY_REUSED] reusing existing recovery task <id> for fix_signature <hash>`. STOP after logging the verdict; do NOT emit additional proposal-related tool calls.
+
+**On no match (the emit path):** behaviour is unchanged. The CLI stamps the signature into the proposal JSON before writing.
+
+This rule is regression-tested in `tests/test_integration/test_blocker_resolver_dedup.py`.

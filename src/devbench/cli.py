@@ -99,12 +99,19 @@ from devbench.backlog.manager import BacklogManager
 from devbench.backlog.parser import BacklogParser
 from devbench.backlog.proposal import (
     BlockedTaskState,
+    CascadeDepthError,
     Proposal,
     ProposalError,
+    ProposalMatch,
     ProposalTaskState,
+    _compute_fix_signature,
+    _extract_intent_phrase,
     add_dep,
     classify_blocked_task,
     classify_proposed_task,
+    detect_placeholder_descriptions,
+    enforce_cascade_depth,
+    find_matching_pending_proposal,
     list_proposals,
     materialise_proposal,
     promote_all_from_source,
@@ -118,6 +125,7 @@ from devbench.config import (
     BACKLOG_INDEX,
     BACKLOG_ROOT,
     BLOCKED_RECOVERY_WINDOW_SECONDS,
+    MAX_CASCADE_DEPTH,
     REPO_LOCAL_PATHS,
     RUNTIME_CONFIG,
     UPDATE_SUBMODULE,
@@ -3533,6 +3541,30 @@ def cmd_sweep_proposals() -> int:
     return 0
 
 
+def _enforce_materialise_lifecycle_gates(source_task_id: str, proposal: Proposal) -> int:
+    """Issues #143 + #144: gate ``cmd_materialise_proposal`` on placeholder
+    rows + cascade-depth cap. Returns 0 to proceed, 1 to abort with the
+    error already printed to stderr."""
+    placeholder_issues = detect_placeholder_descriptions(proposal)
+    if placeholder_issues:
+        print(
+            "ERROR: proposal carries placeholder description(s); fill in concrete "
+            "approach text before materialising:\n  - " + "\n  - ".join(placeholder_issues),
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        enforce_cascade_depth({"cascade_depth": proposal.cascade_depth}, MAX_CASCADE_DEPTH)
+    except CascadeDepthError as exc:
+        print(
+            f"ERROR: cascade-depth limit reached for {source_task_id}: {exc}\n"
+            f"Source task escalated to NEEDS_OPERATOR_ATTENTION (no draft materialised).",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
 def cmd_materialise_proposal(source_task_id: str) -> int:
     """Materialise a pending proposal into draft work-unit files.
 
@@ -3546,6 +3578,10 @@ def cmd_materialise_proposal(source_task_id: str) -> int:
     except ProposalError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
+
+    gate_rc = _enforce_materialise_lifecycle_gates(source_task_id, proposal)
+    if gate_rc != 0:
+        return gate_rc
 
     # Resolve the target repo from the source task so every draft row uses
     # the same repo string that the orchestrator will execute against.
@@ -3629,20 +3665,34 @@ def _read_proposal_from_stdin(source_task_id: str) -> Proposal:
 def cmd_write_proposal(source_task_id: str) -> int:
     """Persist a blocker-resolver proposal JSON read from stdin.
 
+    Dedup contract (issue #141): before writing, computes a stable
+    ``fix_signature`` over (target_repo, sorted(files_to_own),
+    normalised intent_phrase). If a pending proposal on disk already
+    carries the same signature, this command WIRES THE NEW SOURCE TASK
+    AS AN ADDITIONAL DEP on the existing recovery task instead of
+    emitting a duplicate proposal. The audit comment ``[RECOVERY_REUSED]``
+    on the new source task names the existing recovery task ID. The
+    return-code envelope's ``recovery_reused`` field tells the caller
+    which path fired.
+
     When ``task_factory.auto_accept_proposals`` is ``true`` in the active
-    config, this command also materialises every proposed task and
-    promotes it -- so the cascade is actionable in the same call rather
-    than waiting for the next ``sweep-proposals`` cycle. This closes a
-    timing window in which a proposal written mid-iteration could sit
-    orphaned for up to one full orchestrator cycle (the source task
-    reads as "needs operator attention" until the cascade-classifier
-    sees the wired ``[proposed]`` Dependencies row).
+    config and the dedup path did NOT fire, this command also
+    materialises every proposed task and promotes it -- so the cascade
+    is actionable in the same call.
 
     When the auto-accept flag is ``false`` the behaviour is unchanged:
     the JSON is written and the operator promotes manually.
     """
     try:
         proposal = _read_proposal_from_stdin(source_task_id)
+        # Compute the dedup signature even when the agent did not stamp it.
+        proposal = _stamp_fix_signature(proposal)
+        # Issue #141: scan for an existing recovery task whose fix
+        # signature matches. If found, wire the new source task as an
+        # additional dep edge instead of writing a duplicate proposal.
+        match = find_matching_pending_proposal(WORKSPACE_ROOT, proposal.fix_signature)
+        if match is not None and match.source_task_id != source_task_id:
+            return _wire_recovery_reuse(source_task_id, proposal, match)
         written = write_proposal(WORKSPACE_ROOT, proposal)
     except (_ProposalInputError, ProposalError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
@@ -3652,8 +3702,92 @@ def cmd_write_proposal(source_task_id: str) -> int:
     output: dict[str, object] = {
         "source_task_id": source_task_id,
         "proposal_path": str(written),
+        "fix_signature": proposal.fix_signature,
+        "cascade_depth": proposal.cascade_depth,
+        "recovery_reused": False,
     }
     output.update(auto_cascade)
+    print(json.dumps(output))
+    return 0
+
+
+def _stamp_fix_signature(proposal: Proposal) -> Proposal:
+    """Return a copy of ``proposal`` with ``fix_signature`` populated.
+
+    No-op when the proposal already carries a non-empty signature
+    (operator-edited proposals keep their original signature so dedup
+    matching stays stable across hand edits).
+
+    Signature inputs:
+      - ``target_repo``: read from the source task's BACKLOG row when
+        available; falls back to "" when the source isn't in the index
+        yet (sufficient for the early-emission case).
+      - ``files_to_own``: flattened sorted across every proposed task.
+      - ``intent_phrase``: derived from the FIRST proposed task's
+        ``suggested_approach`` via the regex normaliser.
+    """
+    if proposal.fix_signature:
+        return proposal
+    target_repo = _resolve_source_repo(proposal.source_task_id)
+    files: list[str] = []
+    for task in proposal.proposed_tasks:
+        files.extend(task.files_to_own)
+    intent = ""
+    if proposal.proposed_tasks:
+        intent = _extract_intent_phrase(proposal.proposed_tasks[0].suggested_approach)
+    signature = _compute_fix_signature(target_repo, files, intent)
+    from dataclasses import replace as _replace
+
+    return _replace(proposal, fix_signature=signature)
+
+
+def _resolve_source_repo(source_task_id: str) -> str:
+    """Best-effort repo lookup for a source task id; returns "" when not found."""
+    try:
+        parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+        units = parser.parse_index()
+    except (FileNotFoundError, ValueError):
+        return ""
+    for unit in units:
+        if unit.id == source_task_id:
+            return unit.repo or ""
+    return ""
+
+
+def _wire_recovery_reuse(
+    source_task_id: str,
+    proposal: Proposal,
+    match: ProposalMatch,
+) -> int:
+    """Issue #141: instead of writing a duplicate proposal, wire the
+    new source task as an additional dep on the existing recovery task,
+    log a ``[RECOVERY_REUSED]`` audit, and emit the JSON envelope.
+    """
+    audit_msg = (
+        f"[RECOVERY_REUSED] reusing existing recovery task {match.source_task_id} for "
+        f"fix_signature {match.fix_signature[:16]} (full proposal at {match.proposal_path})"
+    )
+    try:
+        add_dep(
+            backlog_root=BACKLOG_ROOT,
+            backlog_index=BACKLOG_INDEX,
+            blocked_task_id=source_task_id,
+            blocker_task_id=match.source_task_id,
+            reason=audit_msg,
+        )
+    except (FileNotFoundError, ProposalError) as exc:
+        # Failure to wire dep falls back to the emit path so the
+        # operator is not silently left in a half-state. Surface as
+        # error; caller (the orchestrator) can choose to retry.
+        print(f"ERROR: recovery-reuse dep wiring failed: {exc}", file=sys.stderr)
+        return 1
+    output = {
+        "source_task_id": source_task_id,
+        "recovery_reused": True,
+        "reused_from_task_id": match.source_task_id,
+        "reused_proposal_path": str(match.proposal_path),
+        "fix_signature": proposal.fix_signature,
+    }
     print(json.dumps(output))
     return 0
 

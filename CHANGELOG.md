@@ -73,6 +73,34 @@ since the last release. PR #119 carries every change.
 - **`_resolve_bool` helper**: env-var boolean parser with strict
   truthy / falsy validation. Misconfigurations fail fast at process
   start with a `ValueError`.
+- **Recovery-proposal dedup** (issue #141). `cmd_write_proposal`
+  computes a stable `fix_signature` over `(target_repo,
+  sorted(files_to_own), normalised intent_phrase)` and scans pending
+  proposals for a match. On hit, the new source task is auto-wired
+  to the existing recovery via `add-dep` and the duplicate JSON is
+  not written; on miss, the signature is stamped into the proposal
+  before persisting. Pinned by `tests/test_backlog/test_proposal_dedup.py`
+  and `tests/test_backlog/test_proposal_scanner.py`.
+- **Manifest-amender auto-dep** (issue #142). When the conflict task
+  is in a terminal state (`done` / `declined`), the amender now
+  auto-invokes `uv run devbench add-dep <source-task-id>
+  <conflict-task-id>` and emits `[CONFLICT_AUTODEP]` instead of
+  recommending the operator wire it. Failure surfaces as
+  `[CONFLICT_AUTODEP_FAILED]`. Pinned by
+  `tests/test_integration/test_manifest_amender_pre_conflict.py`.
+- **Materialise-time placeholder rejection** (issue #143).
+  `cmd_materialise_proposal` rejects proposals whose
+  `proposed_tasks[*].suggested_approach` is empty, whitespace-only,
+  TODO, or TBD before any draft reaches the operator. Pinned by
+  `tests/test_backlog/test_proposal_lifecycle_hardening.py` +
+  `tests/test_cli.py::TestCmdMaterialiseProposalLifecycleGates`.
+- **Bounded recovery-cascade depth** (issue #144). Proposals carry a
+  `cascade_depth` field (`parent_depth + 1`); the new
+  `orchestrate.max_cascade_depth` YAML knob (default 3, env override
+  `JUDGE_ORCHESTRATE_MAX_CASCADE_DEPTH`) caps recursion. At cap, the
+  source task transitions to `NEEDS_OPERATOR_ATTENTION` rather than
+  materialising a deeper draft. Pinned by
+  `tests/test_backlog/test_proposal_lifecycle_hardening.py::TestEnforceCascadeDepth`.
 
 ### Changed
 

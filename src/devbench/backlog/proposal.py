@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
 import json
 import logging
 import re
@@ -436,6 +437,17 @@ class Proposal:
     proposed_tasks: list[ProposedTask]
     affected_task_ids: list[str] = field(default_factory=list)
     source_dep_direction: str = ""
+    # Issue #141: stable hash over (target_repo, sorted(files_to_own),
+    # normalised intent_phrase) -- empty string for proposals authored
+    # before the dedup feature shipped. Set by cmd_write_proposal at
+    # emission time so the next blocker-resolver invocation finds a
+    # match cheaply.
+    fix_signature: str = ""
+    # Issue #144: depth in the recovery cascade. Depth 0 = first-class
+    # recovery (the source task is a "real" backlog task that surfaced a
+    # blocker). Depth N+1 = parent's depth + 1. Configurable cap via
+    # `orchestrate.max_cascade_depth` YAML field.
+    cascade_depth: int = 0
 
     def to_dict(self) -> dict:
         """JSON-serialisable form used for on-disk storage."""
@@ -446,6 +458,8 @@ class Proposal:
             "proposed_tasks": [asdict(t) for t in self.proposed_tasks],
             "affected_task_ids": list(self.affected_task_ids),
             "source_dep_direction": self.source_dep_direction,
+            "fix_signature": self.fix_signature,
+            "cascade_depth": self.cascade_depth,
         }
 
     @classmethod
@@ -497,6 +511,19 @@ class Proposal:
                 f"Proposal.source_dep_direction must be empty or 'test_validates_source'; got {source_dep_direction!r}"
             )
 
+        # Issue #141 / #144: optional fix_signature + cascade_depth. Absent
+        # in proposals authored before these features shipped (forward-compat).
+        fix_signature = str(data.get("fix_signature", "") or "")
+        cascade_depth_raw = data.get("cascade_depth", 0)
+        try:
+            cascade_depth = int(cascade_depth_raw or 0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Proposal.cascade_depth must be a non-negative integer; got {cascade_depth_raw!r}"
+            ) from exc
+        if cascade_depth < 0:
+            raise ValueError(f"Proposal.cascade_depth must be >= 0; got {cascade_depth}")
+
         return cls(
             source_task_id=source_id,
             generated_at=str(data["generated_at"]),
@@ -504,6 +531,8 @@ class Proposal:
             proposed_tasks=tasks,
             affected_task_ids=affected,
             source_dep_direction=source_dep_direction,
+            fix_signature=fix_signature,
+            cascade_depth=cascade_depth,
         )
 
 
@@ -538,6 +567,231 @@ def _parse_affected_task_ids(raw: object, source_id: str) -> list[str]:
 
 class ProposalError(RuntimeError):
     """Raised when a proposal cannot be processed."""
+
+
+class CascadeDepthError(RuntimeError):
+    """Raised when a proposal would exceed ``orchestrate.max_cascade_depth``.
+
+    Issue #144. Caught by ``cmd_materialise_proposal`` to escalate the
+    source task to ``NEEDS_OPERATOR_ATTENTION`` instead of materialising
+    another recovery layer. Living-on-its-own exception class so callers
+    can ``except CascadeDepthError`` without coupling to the broader
+    ``ProposalError`` family.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Dedup-signature helpers (issue #141)
+# ---------------------------------------------------------------------------
+
+# Verbs that signal "fix the spec / Manifest / placeholder" so the intent
+# phrase normalises to a stable key. Order matters: longer matches first
+# so "drop-row" beats "drop". Each entry maps a regex pattern (matched
+# against lower-cased Approach text) -> normalised intent token.
+_INTENT_VERB_PATTERNS: tuple[tuple[str, str], ...] = (
+    (r"\bremove\s+the\s+\S+\s+row\b", "remove-row"),
+    (r"\bdelete\s+the\s+\S+\s+entry\b", "delete-entry"),
+    (r"\bdrop\s+the\s+conflicting\s+manifest\s+row\b", "drop-conflict-row"),
+    (r"\bcorrect\s+the\s+manifest\s+table\b", "correct-manifest"),
+    (r"\bfix\s+the\s+changes\s+manifest\b", "fix-manifest"),
+    (r"\buntrack\s+\S+", "untrack"),
+    (r"\badd\s+\S+\s+to\s+\.gitignore\b", "gitignore-add"),
+    (r"\bregister\s+\S+\s+marker\b", "register-marker"),
+    (r"\bfix\s+\S+\s+placeholder\b", "fix-placeholder"),
+    (r"\bremove\s+\S+", "remove"),
+    (r"\bdelete\s+\S+", "delete"),
+    (r"\bfix\s+\S+", "fix"),
+    (r"\badd\s+\S+", "add"),
+)
+
+
+def _extract_intent_phrase(approach_text: str) -> str:
+    """Return a normalised verb-noun token for the proposal's Approach text.
+
+    Pure regex; no LLM. Used as part of the dedup ``fix_signature`` so
+    two recovery proposals with the same target_repo + files_to_own +
+    semantic intent collapse to the same signature.
+
+    Falls back to ``"generic"`` when no verb pattern matches; that keeps
+    the signature stable for proposals whose Approach is too vague to
+    classify rather than producing an unhashable ``None``.
+    """
+    if not approach_text:
+        return "generic"
+    text = approach_text.lower()
+    for pattern, token in _INTENT_VERB_PATTERNS:
+        if re.search(pattern, text):
+            return token
+    return "generic"
+
+
+def _compute_fix_signature(target_repo: str, files_to_own: list[str], intent_phrase: str) -> str:
+    """Compute the dedup signature (issue #141).
+
+    SHA-256 over the canonical tuple
+    ``(target_repo, sorted(files_to_own), intent_phrase)``. Returns the
+    full 64-char hex digest; callers truncate to the first 16 chars when
+    rendering for human display, but the full digest is stored on disk
+    so collision risk is operationally negligible.
+
+    Pure function: deterministic, no I/O, no clock or random source.
+    """
+    canonical = json.dumps(
+        {
+            "target_repo": target_repo,
+            "files_to_own": sorted(files_to_own),
+            "intent_phrase": intent_phrase,
+        },
+        sort_keys=True,
+        ensure_ascii=True,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class ProposalMatch:
+    """Result of ``find_matching_pending_proposal``.
+
+    Attributes:
+        proposal_path: Absolute path to the matching proposal JSON on disk.
+        source_task_id: The source-task ID associated with the existing
+            proposal (the task that already has its dep edge wired by
+            promote-proposal). Callers add their new source task as an
+            additional dep edge pointing at this ID.
+        fix_signature: The matching signature (echo of the query).
+    """
+
+    proposal_path: Path
+    source_task_id: str
+    fix_signature: str
+
+
+def find_matching_pending_proposal(workspace_root: Path, signature: str) -> ProposalMatch | None:
+    """Scan ``.devbench/proposals/*.json`` for a proposal whose
+    ``fix_signature`` matches ``signature``. Returns the first match (or
+    None when no match exists).
+
+    Issue #141: this is the generalisation of the orphan-cleanup reuse
+    pattern at ``cli.py:1918-1957``. The orphan path scans for an
+    overlapping detection set; this generalised path scans for a stable
+    structural hash. Both share the same operator-visible outcome:
+    instead of emitting a duplicate recovery task, the new source task
+    gets a dep edge wired pointing at the existing recovery.
+
+    Pure read; never mutates disk. Stale proposals on disk whose source
+    task is in a terminal state (``done`` / ``declined``) are skipped --
+    determined by re-reading the source task's `## Status:` line. Empty
+    or invalid signatures (the empty string) never match.
+    """
+    if not signature:
+        return None
+    proposals_dir = workspace_root / ".devbench" / "proposals"
+    if not proposals_dir.is_dir():
+        return None
+    for proposal_file in sorted(proposals_dir.glob("*.json")):
+        try:
+            payload = json.loads(proposal_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        candidate_sig = payload.get("fix_signature", "")
+        if candidate_sig != signature:
+            continue
+        source_id = str(payload.get("source_task_id", "")).strip()
+        if not source_id:
+            continue
+        # Skip if the existing source task is in a terminal state -- the
+        # proposal is stale (operator declined; or the proposal was
+        # never promoted and the source task moved on).
+        if _source_task_in_terminal_state(workspace_root, source_id):
+            continue
+        return ProposalMatch(
+            proposal_path=proposal_file.resolve(),
+            source_task_id=source_id,
+            fix_signature=signature,
+        )
+    return None
+
+
+def _source_task_in_terminal_state(workspace_root: Path, source_task_id: str) -> bool:
+    """Return True iff ``<workspace>/backlog/.../<source_task_id>.md``
+    has ``## Status: done`` or ``## Status: declined``. Best-effort -- on
+    any read error, returns False so the dedup scanner does not skip a
+    legitimately-pending proposal."""
+    backlog_root = workspace_root / "backlog"
+    if not backlog_root.is_dir():
+        return False
+    for candidate in backlog_root.rglob(f"{source_task_id}.md"):
+        try:
+            text = candidate.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            stripped = line.strip().lower()
+            if stripped.startswith("## status:"):
+                status = stripped.split(":", 1)[1].strip()
+                return status in {"done", "declined"}
+        return False
+    return False
+
+
+def enforce_cascade_depth(proposal_payload: dict, max_depth: int) -> None:
+    """Issue #144: raise ``CascadeDepthError`` when the proposal's
+    ``cascade_depth`` is at or above ``max_depth``.
+
+    Pure validator; called by ``cmd_materialise_proposal`` before writing
+    a draft. ``max_depth`` is resolved env > YAML > default
+    (``DEFAULT_MAX_CASCADE_DEPTH``) by the caller; this helper assumes
+    ``max_depth >= 1`` (schema enforces).
+    """
+    raw_depth = proposal_payload.get("cascade_depth", 0)
+    try:
+        depth = int(raw_depth or 0)
+    except (TypeError, ValueError) as exc:
+        raise CascadeDepthError(f"proposal cascade_depth must be an integer; got {raw_depth!r}") from exc
+    if depth >= max_depth:
+        raise CascadeDepthError(
+            f"proposal cascade_depth={depth} reached or exceeded "
+            f"orchestrate.max_cascade_depth={max_depth}; escalating to "
+            "operator attention instead of materialising another recovery layer"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TODO/TBD placeholder rejection (issue #143)
+# ---------------------------------------------------------------------------
+
+_PLACEHOLDER_PATTERNS: tuple[str, ...] = ("todo", "tbd")
+
+
+def detect_placeholder_descriptions(proposal: Proposal) -> list[str]:
+    """Return a list of human-readable error fragments for every
+    proposed-task description that is empty / TODO / TBD / whitespace.
+
+    Issue #143: ``cmd_materialise_proposal`` calls this BEFORE writing a
+    draft. Empty list = clean to materialise. Non-empty list = reject
+    with the joined messages.
+
+    The check inspects ``ProposedTask.suggested_approach`` (the
+    "description" surface in our schema -- the Approach text becomes the
+    work-unit's description). It does NOT re-check Manifest rows here;
+    those are auto-generated from ``files_to_own`` at materialisation
+    time, and the existing ``validate-backlog`` rule (issue #117)
+    already catches the "TODO -- describe change" pattern in the
+    rendered Manifest table on the next sweep.
+    """
+    issues: list[str] = []
+    for task in proposal.proposed_tasks:
+        approach = task.suggested_approach.strip()
+        if not approach:
+            issues.append(f"task {task.suggested_id}: suggested_approach is empty / whitespace-only")
+            continue
+        lowered = approach.lower()
+        if any(lowered == p or lowered.startswith(p + " ") for p in _PLACEHOLDER_PATTERNS):
+            issues.append(
+                f"task {task.suggested_id}: suggested_approach is a placeholder ({approach[:60]!r}); "
+                "fill in a concrete description before promoting"
+            )
+    return issues
 
 
 # ---------------------------------------------------------------------------

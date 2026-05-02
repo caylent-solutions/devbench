@@ -408,6 +408,23 @@ class HookTailConfig:
 
 
 @dataclass
+class OrchestrateConfig:
+    """Orchestrator runtime tuning (issue #144).
+
+    ``max_cascade_depth`` caps the depth of recovery-of-a-recovery
+    chains. When a proposal would land at depth >= this cap, the source
+    task transitions to ``NEEDS_OPERATOR_ATTENTION`` instead of
+    materialising another recovery layer.
+
+    Field is ``None`` when absent from YAML; ``config.py`` resolves
+    env > YAML > default for the module-level ``MAX_CASCADE_DEPTH``
+    constant.
+    """
+
+    max_cascade_depth: int | None = None
+
+
+@dataclass
 class RepoConfig:
     """Per-repository configuration.
 
@@ -486,6 +503,7 @@ class RuntimeConfig:
     report: ReportConfig = field(default_factory=ReportConfig)
     stop_hook: StopHookConfig = field(default_factory=StopHookConfig)
     hook_tail: HookTailConfig = field(default_factory=HookTailConfig)
+    orchestrate: OrchestrateConfig = field(default_factory=OrchestrateConfig)
     manifest_amendment: AmendmentConfig = field(default_factory=AmendmentConfig)
     task_factory: TaskFactoryConfig = field(default_factory=TaskFactoryConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
@@ -835,6 +853,16 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         ),
     )
 
+    # Populate OrchestrateConfig from YAML orchestrate block (issue #144).
+    # Schema enforces minimum:1; absent field stays None so config.py
+    # applies the env > default fallback chain.
+    orchestrate_raw = raw.get("orchestrate") or {}
+    orchestrate = OrchestrateConfig(
+        max_cascade_depth=(
+            int(orchestrate_raw["max_cascade_depth"]) if "max_cascade_depth" in orchestrate_raw else None
+        ),
+    )
+
     return RuntimeConfig(
         repos=repos,
         timeouts=timeouts,
@@ -843,6 +871,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         report=report,
         stop_hook=stop_hook,
         hook_tail=hook_tail,
+        orchestrate=orchestrate,
         manifest_amendment=manifest_amendment,
         task_factory=task_factory,
         debug=debug,

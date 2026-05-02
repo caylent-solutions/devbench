@@ -4356,6 +4356,16 @@ class TestCmdRejectProposalUnmaterialised:
         err = capsys.readouterr().err
         assert "source-task-id" in err
 
+    def test_is_variadic_so_multi_flag_invocation_reaches_handler(self) -> None:
+        """Regression: ``reject-proposal --unmaterialised <id> --reason <text>``
+        passes 4 args + 1 task-id; without variadic dispatch the top-level
+        slicer keeps only ``min_args + 1`` args and the ``--reason`` value
+        is dropped before _parse_reject_proposal_argv runs, producing a
+        spurious ``--reason requires a value`` error. Pin the variadic
+        membership so this regression cannot return.
+        """
+        assert "reject-proposal" in cli._VARIADIC_COMMANDS
+
 
 class TestCmdSweepProposals:
     """ADR-08 slice J: ``devbench sweep-proposals`` best-effort materialises un-materialised JSONs."""

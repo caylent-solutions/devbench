@@ -4672,7 +4672,17 @@ _HELP_FLAGS: frozenset[str] = frozenset({"--help", "-h"})
 # does not). _parse_add_dep_argv handles flags itself; opting into
 # variadic dispatch lets the value through.
 _VARIADIC_COMMANDS: frozenset[str] = frozenset(
-    {"hook-tail", "watchdog", "add-dep", "decline", "hold", "unhold", "status", "new-task"}
+    {
+        "hook-tail",
+        "watchdog",
+        "add-dep",
+        "decline",
+        "hold",
+        "unhold",
+        "status",
+        "new-task",
+        "reject-proposal",
+    }
 )
 
 

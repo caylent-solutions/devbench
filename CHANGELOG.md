@@ -113,6 +113,24 @@ since the last release. PR #119 carries every change.
   their target-repo files. Logged as
   `[RECOVERY_SKIPPED_BACKLOG_REPO_FILES]`. Pinned by
   `tests/test_cli.py::TestCmdWriteProposalBacklogRepoSkip`.
+- **`devbench reconcile-cascade` CLI command** (issue #150). Walks every
+  blocked task, evaluates marker target states + regular dep states, and
+  flips eligible tasks (markers all terminal AND deps satisfied) to
+  in-queue with a `[CASCADE_RECONCILED]` audit comment. Returns a JSON
+  envelope listing flips + skips with reasons. Operator-friendly
+  recovery for blocked tasks the cascade missed (process crash, missing
+  declared dep, etc.). Pinned by
+  `tests/test_cli.py::TestCmdReconcileCascade`.
+- **Manifest-amender rejection feedback persistence** (issue #154). Each
+  `reject_amendment` call writes a structured JSON to
+  `<workspace>/.devbench/amender-rejections/<task-id>-<n>.json` with
+  `task_id`, `attempt`, `reason_category` (`SCOPE` /
+  `APPROACH_AUTH` / `JUSTIFICATION_COHERENCE` / `PRE_FILTER` /
+  `OTHER`), `reason_text`, and the original request payload. The
+  blocker-resolver / executor-feedback collector ingests these on
+  retry. Bounded by `MAX_RETRY_ATTEMPTS`; over-cap records still
+  written but stamped `capped: true`. Pinned by
+  `tests/test_backlog/test_amendment.py::TestAmenderRejectionPersistsFeedbackJson`.
 
 ### Changed
 
@@ -149,9 +167,68 @@ since the last release. PR #119 carries every change.
   a YAML equivalent. Operators set workspace-stable behaviour in
   `backlog/config/devbench.yaml`; env vars remain available as
   per-launch overrides.
+- **Auto-requeue cascade fires on every terminal transition** (issue
+  #147). `BacklogManager._set_status` now invokes
+  `_auto_requeue_marker_dependents` whenever the target status is
+  terminal (`done` OR `declined`), not just `done`. Idempotent: a
+  per-instance guard tracks `(backlog_index, unit_id)` pairs so a
+  redundant `_set_status` call does not double-fire the scan.
+  `[CASCADE_RESOLVED]` is now appended alongside `[AUTO_UNBLOCKED]`
+  on every cascade-driven re-queue so the audit-supersession panel
+  filter (#153) can hide stale `[BLOCKED]` rows.
+- **`cmd_sweep_proposals` auto-promotes pre-existing proposed drafts**
+  (issue #155). When `task_factory.auto_accept_proposals: true`, the
+  sweep now runs a second pass over the full backlog index and
+  promotes every `proposed` task whose proposal JSON has been deleted.
+  Closes the gap where drafts authored under the toggle but
+  materialised before it was flipped on were marooned in `proposed`
+  state forever. Pinned by
+  `tests/test_cli.py::TestCmdSweepProposalsAutoPromotesPreExisting`.
 
 ### Fixed
 
+- **`sync-blocked` evaluates `[BLOCKED_PENDING_PROPOSAL]` marker target
+  status** (issue #148). The legacy
+  `_BLOCKED_PENDING_PROPOSAL_OPEN_RE` regex flagged every marker as
+  "open" -- including markers whose target had already completed. The
+  new `_has_open_proposal_marker(content, units_by_id)` helper resolves
+  each marker target via the parsed index and returns `True` only when
+  at least one target is non-terminal (anything other than `done` /
+  `declined`). Unknown target IDs (rejected drafts whose backlog row
+  was removed) stay conservative. Pinned by
+  `tests/test_cli.py::TestSyncBlockedEvaluatesMarkerTargetState`.
+- **`classify_blocked_task` considers regular task-level deps** (issue
+  #149). When markers are closed/absent AND the task's declared
+  regular dependencies are still in flight, the result is now
+  `AWAITING_AUTO_RECOVERY` instead of incorrectly escalating to
+  `NEEDS_OPERATOR_ATTENTION`. The orchestrator's next sweep cycle
+  picks the task back up automatically; no operator action required.
+  Pinned by
+  `tests/test_backlog/test_proposal_lifecycle_hardening.py::TestClassifyBlockedConsidersRegularDeps`.
+- **N-node dependency cycle detection in `validate-backlog`** (issue
+  #151). New `BacklogManager._check_dep_cycles` runs DFS-with-
+  recursion-stack over the dependency graph derived from the Full
+  Work Unit Index. Catches 4-node, 5-node, and arbitrary-N cycles
+  that the prior shallow check missed. Reports each cycle once,
+  rotated to start at its lexicographically smallest ID. Pinned by
+  `tests/test_backlog/test_manager.py::TestValidateDepCycle4Node`.
+- **`_VARIADIC_COMMANDS` registration is auto-discovered**  (issue
+  #152). New
+  `tests/test_cli.py::TestVariadicCommandsCoverage` walks `_COMMANDS`,
+  inspects each handler's source for `--reason` / `--reasoning` /
+  `--message` flag-with-value patterns, and asserts every match is
+  registered in `_VARIADIC_COMMANDS`. Adds the same dispatcher
+  guard as a self-test so a future flag-bearing command cannot ship
+  without correct registration.
+- **Status panel filters stale `[BLOCKED]` audits superseded by
+  `[UNBLOCKED]` / `[CASCADE_RESOLVED]`** (issue #153). The
+  append-only Comments history in the file is unchanged; only the
+  `status --detail` panel renderer hides rows that have been
+  succeeded by a later positive transition. The cascade re-queue
+  audit now reads `[AUTO_UNBLOCKED] [CASCADE_RESOLVED] ...` and
+  sync-blocked writes `[UNBLOCKED] deps satisfied ...`. Pinned by
+  `tests/test_cli.py::TestStatusPanelFiltersStaleBlockedAudits` and
+  `tests/test_backlog/test_manager.py::TestSetStatusWritesUnblockedAudit`.
 - **`_hook_lib.sh::decode_json_escapes` bash 4.3+ nameref breaks on
   macOS bash 3.2.57** (issue #120). Replaced `local -n` nameref with
   `${!1}` indirect read + `printf -v "$1"` write (bash 3.0+

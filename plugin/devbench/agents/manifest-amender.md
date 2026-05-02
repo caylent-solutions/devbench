@@ -111,9 +111,26 @@ else
   echo "ARCHIVE_MISSING -- reject-amendment returned 0 but the archive did not land on disk; re-run step 3"
   exit 1
 fi
+# 5. VERIFY the structured rejection-feedback JSON exists. Issue #154: every
+#    rejection also writes ``.devbench/amender-rejections/<task-id>-<n>.json``
+#    so the executor-feedback collector can ingest the rejection on retry.
+#    The blocker-resolver reads the most-recent file to decide what fix
+#    proposal to emit. A missing feedback JSON means the next executor
+#    invocation will not see the rejection rationale.
+if ls "$JUDGE_WORKSPACE_ROOT/.devbench/amender-rejections/$ARGUMENTS-"*.json >/dev/null 2>&1; then
+  echo "FEEDBACK_OK -- amender-rejections/$ARGUMENTS-*.json present"
+else
+  echo "FEEDBACK_MISSING -- reject-amendment returned 0 but the feedback JSON did not land; re-run step 3"
+  exit 1
+fi
 ```
 
 The `|| true` on the three git commands is intentional: a file can be tracked-and-modified, tracked-and-restored-to-head, or untracked-and-new, and the trio collectively handles all cases without failing the pipeline. Every OTHER step is strict -- any non-zero exit aborts the verdict.
+
+**Rejection-reason category tokens (issue #154).** When you write the rejection reason in step 3, surface one of the canonical category tokens inline so the feedback collector can route the retry: `SCOPE` / `APPROACH_AUTH` / `JUSTIFICATION_COHERENCE` / `PRE_FILTER`. Reasons that do not name a category fall back to `OTHER`. Example:
+- `"SCOPE: amendment lists files outside the linked AC's blast radius"`
+- `"APPROACH_AUTH: task Approach forbids production-code changes; bug should be escalated via write-proposal"`
+- `"JUSTIFICATION_COHERENCE: justification claims BOM fix but diff rewrites auth middleware"`
 
 **Step C.** Log the final verdict AFTER the verification in Step B reports `ARCHIVE_OK` (for reject) or after `apply-amendment` exits 0 (for apply):
 ```

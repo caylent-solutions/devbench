@@ -13,7 +13,11 @@ Process the backlog using the steps below, repeating until all work units are do
 
 ## Loop
 
-0. `uv run devbench sweep-proposals` -- best-effort materialise every proposal JSON that still has un-materialised tasks. No-ops when nothing is pending; soft-fails (logs and continues) when a proposal is still blocked by the "skip when prior unresolved" safety guard. Runs at every loop iteration so stale JSONs never accumulate invisibly. Expected output pattern: `sweep-proposals: materialised <source-id>: N task(s)` / `sweep-proposals: skipped <source-id>: <reason>` / `sweep-proposals: no-op <source-id>`.
+0. `uv run devbench sweep-proposals` -- best-effort materialise every proposal JSON that still has un-materialised tasks. No-ops when nothing is pending; soft-fails (logs and continues) when a proposal is still blocked by the "skip when prior unresolved" safety guard. Runs at every loop iteration so stale JSONs never accumulate invisibly. Expected output pattern: `sweep-proposals: materialised <source-id>: N task(s)` / `sweep-proposals: skipped <source-id>: <reason>` / `sweep-proposals: no-op <source-id>` / `sweep-proposals: orphan auto-promoted N pre-existing proposed draft(s)`.
+
+   When `task_factory.auto_accept_proposals: true` (issue #155): the sweep also runs a second pass over the full backlog index and auto-promotes every pre-existing `proposed` draft whose proposal JSON has been deleted. Closes the gap where drafts authored under the toggle but materialised before it was flipped on were marooned in `proposed` state forever.
+
+0b. `uv run devbench reconcile-cascade` (issue #150) -- operator-driven recovery for blocked tasks the auto-requeue cascade missed (process crash mid-write, missing declared dep, etc.). Walks every blocked task, evaluates marker target states + regular dep states, and flips eligible ones (markers all terminal AND deps satisfied) to `in-queue` with a `[CASCADE_RECONCILED]` audit comment. Returns a JSON envelope listing flips + skips. Optional in the loop -- run when `devbench next` returns `NO_ACTIONABLE` and the operator suspects orphaned blocks.
 
 1. `uv run devbench validate-backlog` -- abort if the backlog has integrity errors.
 

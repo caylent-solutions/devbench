@@ -53,11 +53,29 @@ logger = logging.getLogger(__name__)
 
 AMENDMENT_DIR_NAME = ".devbench/amendments"
 REJECTED_REQUESTS_DIR_NAME = ".devbench/rejected-requests"
+# Issue #154: per-task feedback log written on every manifest-amender
+# rejection. The directory mirrors the ``ci-failures`` / ``rejected-requests``
+# pattern so the executor-feedback collector can ingest them via a single
+# glob. One file per attempt: ``<task-id>-<n>.json``.
+AMENDER_REJECTIONS_DIR_NAME = ".devbench/amender-rejections"
 ALLOWED_AMENDMENT_REASONS: frozenset[str] = frozenset({"tdd_green_production_fix"})
 AMENDMENT_APPLIED_ACTION = "AMENDMENT_APPLIED"
 AMENDMENT_REJECTED_ACTION = "AMENDMENT_REJECTED"
 AMENDER_AGENT_ID = "agent/manifest-amender"
 COMMENTS_SECTION_HEADER = "## Comments"
+
+# Issue #154: canonical taxonomy of amender-rejection categories. The
+# blocker-resolver / executor-feedback consumer keys retry decisions off
+# these values, so the literal strings are part of the contract.
+AMENDER_REJECTION_CATEGORIES: frozenset[str] = frozenset(
+    {
+        "SCOPE",
+        "APPROACH_AUTH",
+        "JUSTIFICATION_COHERENCE",
+        "PRE_FILTER",
+        "OTHER",
+    }
+)
 
 
 class AmendmentError(RuntimeError):
@@ -298,7 +316,80 @@ def reject_amendment(
     mgr.mark_blocked(wu_file, backlog_index, task_id, rejection_reason)
 
     archive_rejected_request(workspace_root, task_id)
+    # Issue #154: persist the rejection feedback so the executor-feedback
+    # collector / blocker-resolver can ingest it on the next retry. The
+    # JSON is bounded to ``MAX_RETRY_ATTEMPTS`` files per task -- once the
+    # budget is exhausted the executor will not be re-invoked anyway, so
+    # the cap is an upper bound, never a silently dropped record.
+    persist_rejection_feedback(
+        workspace_root=workspace_root,
+        task_id=task_id,
+        rejection_reason=rejection_reason,
+        request=request,
+    )
     logger.info("Amendment rejected for %s: %s", task_id, rejection_reason)
+
+
+def persist_rejection_feedback(
+    *,
+    workspace_root: Path,
+    task_id: str,
+    rejection_reason: str,
+    request: AmendmentRequest,
+) -> Path:
+    """Write a structured rejection-feedback JSON to ``amender-rejections/``.
+
+    Issue #154: provides the executor-feedback collector with a canonical
+    record of every manifest-amender rejection. The ``attempt`` field is
+    derived from the count of existing files for the task ID so the
+    sequence is monotonically increasing and inspectable.
+
+    Capped at ``MAX_RETRY_ATTEMPTS`` to mirror the CI-failure feedback
+    cap (see ``_handle_ci_failure``); once the cap is reached the executor
+    is no longer invoked, so further writes would be wasted. Returns the
+    path to the JSON written; raises ``AmendmentError`` only when the
+    workspace directory cannot be created.
+    """
+    from devbench.config import MAX_RETRY_ATTEMPTS
+
+    archive_dir = workspace_root / AMENDER_REJECTIONS_DIR_NAME
+    archive_dir.mkdir(parents=True, exist_ok=True)
+
+    existing = sorted(archive_dir.glob(f"{task_id}-*.json"))
+    attempt = len(existing) + 1
+    # Cap exceeded: still write but stamp ``capped: true`` so consumers
+    # can detect the budget exhaustion case rather than silently dropping
+    # the record.
+    capped = attempt > MAX_RETRY_ATTEMPTS
+
+    payload: dict[str, Any] = {
+        "task_id": task_id,
+        "attempt": attempt,
+        "reason_category": _categorise_rejection_reason(rejection_reason),
+        "reason_text": rejection_reason,
+        "request": request.to_dict(),
+        "capped": capped,
+        "recorded_at": datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    target = archive_dir / f"{task_id}-{attempt}.json"
+    target.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return target
+
+
+def _categorise_rejection_reason(rejection_reason: str) -> str:
+    """Classify a rejection reason string into one of ``AMENDER_REJECTION_CATEGORIES``.
+
+    Heuristic substring matching: the manifest-amender prompt instructs
+    the LLM judge to surface canonical category tokens (``SCOPE`` /
+    ``APPROACH_AUTH`` / ``JUSTIFICATION_COHERENCE`` / ``PRE_FILTER``)
+    inline in the rejection reason. Unmatched reasons fall back to
+    ``OTHER`` so consumers always see a known token.
+    """
+    haystack = rejection_reason.upper()
+    for category in ("SCOPE", "APPROACH_AUTH", "JUSTIFICATION_COHERENCE", "PRE_FILTER"):
+        if category in haystack:
+            return category
+    return "OTHER"
 
 
 # ---------------------------------------------------------------------------

@@ -87,6 +87,26 @@ Every amendment action leaves a timestamped entry in the work-unit `## Comments`
 
 The amender also logs a final `REVIEW_PASS` or `REVIEW_FAIL` verdict via `log-verdict manifest_amender` so the done-gate and review history are coherent.
 
+### Rejection feedback persistence (issue #154)
+
+Every rejection also writes a structured feedback JSON to `<workspace>/.devbench/amender-rejections/<task-id>-<n>.json` so the executor-feedback collector can ingest the rejection on the next retry. Schema:
+
+```json
+{
+  "task_id": "EX-F1-S1-T1",
+  "attempt": 1,
+  "reason_category": "SCOPE",
+  "reason_text": "amendment is out of scope for this task",
+  "request": { /* original AmendmentRequest dict */ },
+  "capped": false,
+  "recorded_at": "2026-05-02T12:34:56Z"
+}
+```
+
+`reason_category` is one of `SCOPE` / `APPROACH_AUTH` / `JUSTIFICATION_COHERENCE` / `PRE_FILTER` / `OTHER`. Rejection reasons that include any of the canonical category tokens are auto-classified by substring match; everything else falls back to `OTHER`. The amender prompt instructs the LLM to surface the canonical token inline so consumers always see a known category.
+
+The directory layout mirrors `<workspace>/.devbench/ci-failures/` (used by `_handle_ci_failure`) and `<workspace>/.devbench/pr-bot-feedback/` (used by `_handle_pr_review_resolution`). The blocker-resolver / executor-feedback consumer reads all three paths via the same retry pipeline so every kind of late-stage rejection feeds the next executor invocation. The per-task attempt counter is bounded by `MAX_RETRY_ATTEMPTS`; once the cap is exceeded the file is still written but stamped `"capped": true` so consumers can detect budget exhaustion rather than silently dropping the record.
+
 ## What the amendment workflow does NOT do
 
 - **It does not weaken `AC-FINAL-015`.** The Changes Manifest mismatch rule still fires; amendments are the only path to a manifest change, and every amendment is audited.

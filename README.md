@@ -230,10 +230,13 @@ The backlog (`BACKLOG.md`, `backlog/`, specs) should live in a dedicated local g
   target-repo/             <-- the repo devbench modifies (separate git repo)
 ```
 
-Set `JUDGE_WORKSPACE_ROOT` to the backlog repo. Create symlinks inside it pointing to your target repos, and reference them as relative paths in `backlog/config/devbench.yaml`:
+Set `JUDGE_WORKSPACE_ROOT` to the backlog repo. The repo named in `checkout_directory` must be reachable at `<JUDGE_WORKSPACE_ROOT>/<checkout_directory>`. Two layouts are supported:
+
+**Default (sibling directory)** -- clone the target repo *inside* the backlog repo, alongside `backlog/`:
 
 ```bash
-ln -s /workspaces/my-project/target-repo /workspaces/my-project/my-backlog/target-repo
+cd /workspaces/my-project/my-backlog
+git clone https://github.com/org/target-repo.git
 ```
 
 ```yaml
@@ -241,12 +244,27 @@ ln -s /workspaces/my-project/target-repo /workspaces/my-project/my-backlog/targe
 repos:
   org/target-repo:
     default_branch: main
+    checkout_directory: target-repo    # real directory under the backlog repo
+```
+
+Add `target-repo/` to `<JUDGE_WORKSPACE_ROOT>/.gitignore` so the target-repo working tree doesn't pollute backlog history.
+
+**Alternative (symlink, for shared / pre-cloned repos)** -- clone the target repo elsewhere and symlink it into the backlog repo. Useful when one target repo serves multiple backlogs or already lives outside the workspace:
+
+```bash
+ln -s /workspaces/my-project/target-repo /workspaces/my-project/my-backlog/target-repo
+```
+
+```yaml
+repos:
+  org/target-repo:
+    default_branch: main
     checkout_directory: target-repo    # relative; resolves via the symlink
 ```
 
-`checkout_directory` must be a relative path (absolute paths and `..` traversal are rejected). Symlinks bridge the backlog repo and the target repos cleanly.
+The choice is purely an operator filesystem decision -- there is no YAML field that toggles symlink-awareness. `checkout_directory` always names a path under the backlog repo; whether that path is a real directory or a symlink is transparent to devbench. `checkout_directory` must be a relative path (absolute paths and `..` traversal are rejected). See [`docs/backlog-contract.md` § "Workspace layout"](docs/backlog-contract.md#workspace-layout-what-judge_workspace_root-points-at) for the full contract.
 
-For multiple target repos, create one symlink per repo:
+For multiple target repos, repeat either pattern per repo:
 
 ```bash
 ln -s /workspaces/my-project/repo-a /workspaces/my-project/my-backlog/repo-a

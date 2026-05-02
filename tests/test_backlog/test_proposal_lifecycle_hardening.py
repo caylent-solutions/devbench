@@ -142,3 +142,33 @@ class TestEnforceCascadeDepth:
         restored = Proposal.from_dict(legacy_payload)
         assert restored.cascade_depth == 0
         assert restored.fix_signature == ""
+
+    def test_proposal_cascade_depth_invalid_type_rejected(self) -> None:
+        """Issue #144 parser: non-int cascade_depth values raise ValueError
+        with a clear message naming the bad input.
+        """
+        import pytest
+
+        bad_payload = {
+            "source_task_id": "E0-F1-S1-T1",
+            "generated_at": "2026-05-01T00:00:00Z",
+            "rejection_reason": "fixture",
+            "proposed_tasks": [],
+            "cascade_depth": "not-an-int",
+        }
+        with pytest.raises(ValueError, match="cascade_depth must be a non-negative integer"):
+            Proposal.from_dict(bad_payload)
+
+    def test_proposal_cascade_depth_negative_rejected(self) -> None:
+        """Issue #144 parser: negative cascade_depth raises ValueError."""
+        import pytest
+
+        bad_payload = {
+            "source_task_id": "E0-F1-S1-T1",
+            "generated_at": "2026-05-01T00:00:00Z",
+            "rejection_reason": "fixture",
+            "proposed_tasks": [],
+            "cascade_depth": -1,
+        }
+        with pytest.raises(ValueError, match="cascade_depth must be >= 0"):
+            Proposal.from_dict(bad_payload)

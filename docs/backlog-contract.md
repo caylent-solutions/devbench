@@ -81,6 +81,8 @@ The backlog directory (`backlog/` + `BACKLOG.md`) is typically committed to its 
 
 #### Symlinks (optional, for repos outside the workspace)
 
+The choice between a real directory and a symlink at `<workspace>/<repo-name>` is purely a filesystem operator decision -- there is no YAML field that toggles symlink-awareness. devbench opens whatever exists at the path `checkout_directory` names; the kernel resolves any symlinks transparently, and every devbench engine path treats the two layouts identically.
+
 When a target repo cannot live as a workspace sibling (a shared workspace under `/workspaces/<workspace>/` with target repos cloned elsewhere on disk), symlink it into place:
 
 ```bash

@@ -129,3 +129,150 @@ class TestFindMatchingPendingProposal:
         result = find_matching_pending_proposal(tmp_path, sig)
         assert result is not None
         assert result.fix_signature == sig
+
+    def test_proposal_with_empty_source_task_id_skipped(self, tmp_path: Path) -> None:
+        """A malformed proposal whose source_task_id is empty string must be
+        skipped by the scanner (would otherwise crash _source_task_in_terminal_state).
+        Filename sorts BEFORE the good proposal so the bad-record code path
+        is actually exercised (sorted glob order matters)."""
+        proposals_dir = tmp_path / ".devbench" / "proposals"
+        proposals_dir.mkdir(parents=True)
+        sig = "valid-sig"
+        # Bad proposal with empty source_task_id.
+        bad_path = proposals_dir / "AAA-broken.json"
+        bad_path.write_text(
+            json.dumps(
+                {
+                    "source_task_id": "",
+                    "generated_at": "2026-05-02T00:00:00Z",
+                    "rejection_reason": "fixture",
+                    "proposed_tasks": [],
+                    "fix_signature": sig,
+                }
+            ),
+            encoding="utf-8",
+        )
+        # Good proposal with the same signature should be returned instead.
+        _seed_source_task(tmp_path, "E0-F1-S1-T1", status="in-queue")
+        _seed_proposal(tmp_path, "E0-F1-S1-T1", sig)
+
+        result = find_matching_pending_proposal(tmp_path, sig)
+        assert result is not None
+        assert result.source_task_id == "E0-F1-S1-T1"
+
+    def test_no_backlog_dir_treated_as_non_terminal(self, tmp_path: Path) -> None:
+        """When the workspace has no `backlog/` directory at all,
+        ``_source_task_in_terminal_state`` returns False so the scanner
+        treats the proposal as still in flight (best-effort fallback)."""
+        sig = "no-backlog-sig"
+        proposals_dir = tmp_path / ".devbench" / "proposals"
+        proposals_dir.mkdir(parents=True)
+        proposal = proposals_dir / "E0-F1-S1-T1.json"
+        proposal.write_text(
+            json.dumps(
+                {
+                    "source_task_id": "E0-F1-S1-T1",
+                    "generated_at": "2026-05-02T00:00:00Z",
+                    "rejection_reason": "fixture",
+                    "proposed_tasks": [],
+                    "fix_signature": sig,
+                }
+            ),
+            encoding="utf-8",
+        )
+        # No backlog/ dir -- terminal-state check returns False, scanner
+        # treats the proposal as a legitimate match.
+        result = find_matching_pending_proposal(tmp_path, sig)
+        assert result is not None
+        assert result.source_task_id == "E0-F1-S1-T1"
+
+    def test_source_task_with_no_status_line_treated_as_non_terminal(self, tmp_path: Path) -> None:
+        """A source-task markdown that lacks a `## Status:` line returns
+        False from terminal-state check (defensive fallback)."""
+        sig = "no-status-sig"
+        proposals_dir = tmp_path / ".devbench" / "proposals"
+        proposals_dir.mkdir(parents=True)
+        (proposals_dir / "E0-F1-S1-T1.json").write_text(
+            json.dumps(
+                {
+                    "source_task_id": "E0-F1-S1-T1",
+                    "generated_at": "2026-05-02T00:00:00Z",
+                    "rejection_reason": "fixture",
+                    "proposed_tasks": [],
+                    "fix_signature": sig,
+                }
+            ),
+            encoding="utf-8",
+        )
+        backlog = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        backlog.mkdir(parents=True)
+        # Markdown without `## Status:` line.
+        (backlog / "E0-F1-S1-T1.md").write_text("# E0-F1-S1-T1: fixture\n\nNo status line here.\n", encoding="utf-8")
+
+        result = find_matching_pending_proposal(tmp_path, sig)
+        assert result is not None
+        assert result.source_task_id == "E0-F1-S1-T1"
+
+    def test_malformed_json_sorts_first_skipped(self, tmp_path: Path) -> None:
+        """Pin lines 694-695: when the malformed JSON file sorts BEFORE
+        the good proposal in glob order, the json.JSONDecodeError branch
+        must trigger (the existing test_malformed_json_skipped happens
+        to read the good proposal first because it sorts earlier)."""
+        proposals_dir = tmp_path / ".devbench" / "proposals"
+        proposals_dir.mkdir(parents=True)
+        # Use a filename that sorts BEFORE any proposal id starting with E.
+        (proposals_dir / "AAA-malformed.json").write_text("{this is not valid json", encoding="utf-8")
+        sig = "valid-sig"
+        _seed_source_task(tmp_path, "E0-F1-S1-T1", status="in-queue")
+        _seed_proposal(tmp_path, "E0-F1-S1-T1", sig)
+
+        result = find_matching_pending_proposal(tmp_path, sig)
+        assert result is not None
+        assert result.source_task_id == "E0-F1-S1-T1"
+
+    def test_source_task_unreadable_treated_as_non_terminal(self, tmp_path: Path) -> None:
+        """Pin lines 726-727: OSError reading the source-task markdown is
+        swallowed, so the scanner falls through to "not terminal" and the
+        proposal is still treated as a legitimate match. Achieved by
+        making the source-task markdown unreadable (chmod 000).
+        """
+        sig = "unreadable-sig"
+        _seed_source_task(tmp_path, "E0-F1-S1-T1", status="in-queue")
+        _seed_proposal(tmp_path, "E0-F1-S1-T1", sig)
+        md_path = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
+        original_mode = md_path.stat().st_mode
+        try:
+            md_path.chmod(0o000)
+            result = find_matching_pending_proposal(tmp_path, sig)
+            assert result is not None
+            assert result.source_task_id == "E0-F1-S1-T1"
+        finally:
+            md_path.chmod(original_mode)
+
+    def test_backlog_dir_exists_but_source_task_not_found(self, tmp_path: Path) -> None:
+        """Pin line 734: backlog dir is present but doesn't contain a file
+        named ``<source_task_id>.md`` -- the rglob loop completes with
+        zero matches and the helper returns False (non-terminal)."""
+        sig = "missing-md-sig"
+        proposals_dir = tmp_path / ".devbench" / "proposals"
+        proposals_dir.mkdir(parents=True)
+        (proposals_dir / "E0-F1-S1-T1.json").write_text(
+            json.dumps(
+                {
+                    "source_task_id": "E0-F1-S1-T1",
+                    "generated_at": "2026-05-02T00:00:00Z",
+                    "rejection_reason": "fixture",
+                    "proposed_tasks": [],
+                    "fix_signature": sig,
+                }
+            ),
+            encoding="utf-8",
+        )
+        # Backlog dir exists with unrelated content but no E0-F1-S1-T1.md.
+        backlog = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        backlog.mkdir(parents=True)
+        (backlog / "OTHER-T1.md").write_text("# OTHER-T1\n\n## Status: in-queue\n", encoding="utf-8")
+
+        result = find_matching_pending_proposal(tmp_path, sig)
+        assert result is not None
+        assert result.source_task_id == "E0-F1-S1-T1"

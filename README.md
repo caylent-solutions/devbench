@@ -7,7 +7,13 @@ An LLM-as-Judge orchestration system that processes a backlog of work units auto
 DevBench takes a structured backlog of work units (epics, features, stories, tasks) and drives them through a TDD implement / parallel-judge-review / security-review / git-merge pipeline without human intervention between tasks.
 
 - **Autonomous SDLC pipeline.** One operator writes the spec; the orchestrator drives every task from claim to merged PR.
-- **Real LLM review at every gate.** Four review judges (code, test, docs, scope) run in parallel; a security judge runs after they pass. Three additional agents -- `manifest-amender`, `blocker-resolver`, `task-factory` -- handle the executor-driven scope-expansion path (`tdd_green_production_fix` amendments, blocker decomposition, draft work-unit materialisation). Every verdict is logged as an audit comment on the work unit.
+- **Real LLM review at every gate.** Every verdict is logged as an audit comment on the work unit.
+  - **Four review judges run in parallel** (code, test, docs, scope).
+  - **One security judge runs after they pass** (CodeQL, Dependabot, secret-scanning).
+  - **Three scope-expansion agents** handle the executor-driven recovery path:
+    - `manifest-amender` -- judges `tdd_green_production_fix` amendments mid-cycle.
+    - `blocker-resolver` -- decomposes amendment rejections into proposal JSONs.
+    - `task-factory` -- materialises draft work units the source task can depend on.
 - **Auditable by default.** Every agent action writes a timestamped comment on the work unit file. The orchestrator can resume from any point after a restart because state lives on disk, not in memory.
 
 ### Try it now (5 commands)

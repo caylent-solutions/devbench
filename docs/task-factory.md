@@ -388,3 +388,41 @@ rejection emits a structured error naming the offending tasks so the
 operator (or the upstream `blocker-resolver` invocation) can supply a
 real Approach before retrying. Concrete approach text -- even a single
 sentence -- passes the gate.
+
+## Backlog-repo recovery skip (issue #146)
+
+`cmd_write_proposal` (the persistence step that `blocker-resolver` invokes
+to write a proposal JSON to disk) inspects each proposed task's
+`files_to_own` against the workspace's configured target repos
+(`RepoConfig.checkout_directory`). The first path segment of each file
+is matched against the directory name of every configured repo. Files
+whose first segment matches no configured repo are *backlog-repo files*
+-- they live alongside `BACKLOG.md` in the backlog/workspace repo (e.g.
+`spec/observability.md`, `docs/architecture.md`, `backlog/E1/.../T1.md`).
+
+The backlog repo is not a "target repo" in devbench's model. Edits to
+backlog-repo files are operator bookkeeping commits, not work-unit
+deliverables; git-ops cannot run against them because they have no
+configured target repo and no `RepoConfig` entry. The recovery cascade
+therefore has no valid completion path for proposed tasks whose
+`files_to_own` are entirely backlog-repo files.
+
+The filter implements three branches:
+
+1. **All target-repo files** -- proposed task is preserved as-is.
+2. **All backlog-repo files** -- proposed task is dropped from the
+   proposal; a `[RECOVERY_SKIPPED_BACKLOG_REPO_FILES]` audit names
+   the dropped files. If every proposed task is skipped, no proposal
+   JSON is written and the envelope reports `recovery_skipped: true`.
+3. **Mixed (some target, some backlog)** -- proposed task is kept but
+   `files_to_own` is pruned to the target-repo subset; the backlog
+   files are dropped. Operator commits the backlog edits by hand under
+   the backlog-repo bookkeeping flow.
+
+This filter prevents the class of bugs where `manifest-amender`
+correctly rejects an amendment because the file lives in the backlog
+repo, then `blocker-resolver` materialises a recovery task whose Target
+Repository inherits the source's repo, and every review judge passes
+but git-ops blocks because the file isn't in the target repo. Live
+example: E3-F3-S2-T2 in `caylent-telemetry-spec` (declined manually
+before this filter shipped).

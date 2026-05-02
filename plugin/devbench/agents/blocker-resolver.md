@@ -248,3 +248,16 @@ Before emitting a fresh proposal via `uv run devbench write-proposal`, the CLI c
 **On no match (the emit path):** behaviour is unchanged. The CLI stamps the signature into the proposal JSON before writing.
 
 This rule is regression-tested in `tests/test_integration/test_blocker_resolver_dedup.py`.
+
+## Backlog-repo recovery skip (issue #146)
+
+When you author a proposal whose `proposed_tasks[*].files_to_own` would point at files in the backlog/workspace repo (e.g. `spec/*.md`, `docs/*.md`, `BACKLOG.md`, `backlog/**/*.md`), the CLI now drops those entries automatically. Backlog-repo files are operator bookkeeping commits, not work-unit deliverables; the recovery cascade has no valid endpoint for them.
+
+The CLI's behaviour:
+- Proposed tasks whose every file is backlog-repo -> dropped, `[RECOVERY_SKIPPED_BACKLOG_REPO_FILES]` audit logged.
+- Proposed tasks with mixed backlog + target-repo files -> kept, with `files_to_own` pruned to the target-repo subset only.
+- When all proposed tasks are skipped -> no JSON written, envelope reports `"recovery_skipped": true`, source task escalates to operator attention for a manual bookkeeping commit.
+
+Your verdict on the all-skipped case is `pass` with the audit `[RECOVERY_SKIPPED_BACKLOG_REPO_FILES] all proposed tasks owned only backlog-repo files; operator commits bookkeeping by hand.` STOP after logging the verdict.
+
+This rule is regression-tested in `tests/test_cli.py::TestCmdWriteProposalBacklogRepoSkip`.

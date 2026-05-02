@@ -6413,7 +6413,10 @@ class TestCmdWriteProposalDedup:
         # Compute the signature the way cmd_write_proposal will compute it
         # (target_repo "" because we have no BACKLOG.md index file in this
         # tmp_path; that matches the legacy fallback path the test exercises).
-        files = ["pyproject.toml"]
+        # Use a target-repo-prefixed path so the issue #146 backlog-repo
+        # filter doesn't drop the proposed task before dedup runs (the
+        # dedup contract is what this test pins, not the filter).
+        files = ["git-repo/pyproject.toml"]
         intent = _extract_intent_phrase("Remove the pyproject.toml row from T1")
         signature = _compute_fix_signature("", files, intent)
 
@@ -6470,6 +6473,193 @@ class TestCmdWriteProposalDedup:
         assert envelope["reused_from_task_id"] == "E0-F1-S1-T1"
         # No duplicate proposal JSON written.
         assert not (tmp_path / ".devbench" / "proposals" / "E0-F1-S1-T7.json").exists()
+
+
+class TestCmdWriteProposalBacklogRepoSkip:
+    """Issue #146: ``cmd_write_proposal`` must drop proposed-task entries
+    whose ``files_to_own`` all live in the backlog repo (i.e., NOT in any
+    configured target repo). The backlog repo isn't a target repo; the
+    recovery cascade has no valid completion path for backlog-repo edits.
+    """
+
+    def _payload(
+        self,
+        source_id: str,
+        proposed: list[dict],
+    ) -> str:
+        return json.dumps(
+            {
+                "source_task_id": source_id,
+                "generated_at": "2026-05-02T00:00:00Z",
+                "rejection_reason": "fixture",
+                "proposed_tasks": proposed,
+            }
+        )
+
+    def _mk_runtime_config(self) -> MagicMock:
+        """Build a RUNTIME_CONFIG mock with two target repos configured
+        (``caylent-telemetry`` and ``kanon``). Files outside these
+        directories are treated as backlog-repo bookkeeping."""
+        cfg = MagicMock()
+        repo_a = MagicMock()
+        repo_a.checkout_directory = "caylent-telemetry"
+        repo_a.validated_repo = "caylent-solutions/caylent-telemetry"
+        repo_b = MagicMock()
+        repo_b.checkout_directory = "kanon"
+        repo_b.validated_repo = "caylent-solutions/kanon"
+        cfg.repos = {
+            "caylent-solutions/caylent-telemetry": repo_a,
+            "caylent-solutions/kanon": repo_b,
+        }
+        cfg.task_factory.auto_accept_proposals = False
+        cfg.task_factory.enabled = True
+        return cfg
+
+    def test_target_repo_files_emit_proposal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Proposed task whose files all live in a configured target repo
+        is NOT skipped: proposal is written and recovery_skipped is False."""
+        import io
+
+        payload = self._payload(
+            "E0-F1-S1-T1",
+            [
+                {
+                    "suggested_id": "E0-F1-S1-T2",
+                    "title": "Fix X",
+                    "files_to_own": ["caylent-telemetry/src/foo.py"],
+                    "linked_scenarios": [],
+                    "suggested_acs": [],
+                    "suggested_approach": "Add the foo helper",
+                }
+            ],
+        )
+        monkeypatch.setattr("sys.stdin", io.StringIO(payload))
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.RUNTIME_CONFIG", self._mk_runtime_config()),
+        ):
+            rc = cli.cmd_write_proposal("E0-F1-S1-T1")
+        assert rc == 0
+        envelope = json.loads(capsys.readouterr().out)
+        assert envelope.get("recovery_skipped") is not True
+        assert envelope.get("proposal_path") is not None
+        assert (tmp_path / ".devbench" / "proposals" / "E0-F1-S1-T1.json").exists()
+
+    def test_all_backlog_repo_files_skipped_no_proposal_written(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Proposed task whose only file is in the backlog repo (e.g.,
+        spec/observability.md) -> entry dropped, no proposal JSON
+        written, envelope reports recovery_skipped: True."""
+        import io
+
+        payload = self._payload(
+            "E3-F3-S2-T1",
+            [
+                {
+                    "suggested_id": "E3-F3-S2-T2",
+                    "title": "Sync spec doc",
+                    "files_to_own": ["spec/observability.md"],
+                    "linked_scenarios": [],
+                    "suggested_acs": [],
+                    "suggested_approach": "Sync the spec doc with the dashboard",
+                }
+            ],
+        )
+        monkeypatch.setattr("sys.stdin", io.StringIO(payload))
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.RUNTIME_CONFIG", self._mk_runtime_config()),
+        ):
+            rc = cli.cmd_write_proposal("E3-F3-S2-T1")
+        assert rc == 0
+        envelope = json.loads(capsys.readouterr().out)
+        assert envelope["recovery_skipped"] is True
+        assert envelope["proposal_path"] is None
+        assert not (tmp_path / ".devbench" / "proposals" / "E3-F3-S2-T1.json").exists()
+
+    def test_mixed_files_partial_keep(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Proposed task whose files span backlog + target repos -> entry
+        kept with target-repo files only; backlog files pruned. Proposal
+        is written."""
+        import io
+
+        payload = self._payload(
+            "E0-F1-S1-T1",
+            [
+                {
+                    "suggested_id": "E0-F1-S1-T2",
+                    "title": "Fix X with mixed files",
+                    "files_to_own": [
+                        "caylent-telemetry/src/foo.py",  # target repo
+                        "spec/architecture.md",  # backlog repo (pruned)
+                    ],
+                    "linked_scenarios": [],
+                    "suggested_acs": [],
+                    "suggested_approach": "Add the foo helper",
+                }
+            ],
+        )
+        monkeypatch.setattr("sys.stdin", io.StringIO(payload))
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.RUNTIME_CONFIG", self._mk_runtime_config()),
+        ):
+            rc = cli.cmd_write_proposal("E0-F1-S1-T1")
+        assert rc == 0
+        envelope = json.loads(capsys.readouterr().out)
+        assert envelope.get("recovery_skipped") is not True
+        assert envelope["proposal_path"] is not None
+        # Verify the persisted proposal carries only the target-repo file.
+        persisted = json.loads((tmp_path / ".devbench" / "proposals" / "E0-F1-S1-T1.json").read_text(encoding="utf-8"))
+        assert persisted["proposed_tasks"][0]["files_to_own"] == ["caylent-telemetry/src/foo.py"]
+
+    def test_empty_files_to_own_preserved(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Empty files_to_own = research / validation-gate task; NOT
+        treated as backlog-only. Entry preserved as-is."""
+        import io
+
+        payload = self._payload(
+            "E0-F1-S1-T1",
+            [
+                {
+                    "suggested_id": "E0-F1-S1-T2",
+                    "title": "Investigate X",
+                    "files_to_own": [],
+                    "linked_scenarios": [],
+                    "suggested_acs": [],
+                    "suggested_approach": "Investigate without authoring code",
+                }
+            ],
+        )
+        monkeypatch.setattr("sys.stdin", io.StringIO(payload))
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.RUNTIME_CONFIG", self._mk_runtime_config()),
+        ):
+            rc = cli.cmd_write_proposal("E0-F1-S1-T1")
+        assert rc == 0
+        envelope = json.loads(capsys.readouterr().out)
+        assert envelope.get("recovery_skipped") is not True
+
+    def test_helper_classifies_paths_correctly(self) -> None:
+        """Spot-check ``_file_lives_in_a_target_repo`` against canonical
+        examples (target-repo paths return True; backlog-repo paths
+        return False)."""
+        with patch("devbench.cli.RUNTIME_CONFIG", self._mk_runtime_config()):
+            assert cli._file_lives_in_a_target_repo("caylent-telemetry/src/foo.py")
+            assert cli._file_lives_in_a_target_repo("kanon/something.py")
+            assert not cli._file_lives_in_a_target_repo("spec/observability.md")
+            assert not cli._file_lives_in_a_target_repo("BACKLOG.md")
+            assert not cli._file_lives_in_a_target_repo("backlog/E1/E1-F1/E1-F1.md")
+            assert not cli._file_lives_in_a_target_repo("docs/architecture.md")
+            assert not cli._file_lives_in_a_target_repo("")
 
 
 class TestCmdMaterialiseProposalLifecycleGates:

@@ -4232,6 +4232,123 @@ class TestCmdStatusBlockedSplit:
         assert re.search(r"Blocked \(auto\)\s+1\b", out), out
         assert re.search(r"Blocked \(attn\)\s+1\b", out), out
 
+    def test_status_detail_renders_three_blocked_bucket_sections(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Issue #149 follow-up: the ``--detail`` panel splits the blocked
+        list into three bucket sections (auto-clearing, awaiting-recovery,
+        needs-attention). Empty buckets are omitted from the output.
+        """
+        from devbench.backlog.proposal import BlockedTaskState
+        from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
+
+        unit_auto = WorkUnit(
+            id="E0-F1-S1-T1",
+            title="Auto",
+            status=WorkUnitStatus.BLOCKED,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("/fake/auto.md"),
+            repo="r",
+            dependencies=[],
+        )
+        unit_recovery = WorkUnit(
+            id="E0-F1-S1-T2",
+            title="Recovery",
+            status=WorkUnitStatus.BLOCKED,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("/fake/recovery.md"),
+            repo="r",
+            dependencies=[],
+        )
+        unit_attn = WorkUnit(
+            id="E0-F1-S1-T3",
+            title="Attn",
+            status=WorkUnitStatus.BLOCKED,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("/fake/attn.md"),
+            repo="r",
+            dependencies=[],
+        )
+
+        def fake_classify(
+            backlog_root: Path,
+            backlog_index: Path,
+            task_id: str,
+            **kwargs: object,
+        ) -> BlockedTaskState:
+            return {
+                "E0-F1-S1-T1": BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL,
+                "E0-F1-S1-T2": BlockedTaskState.AWAITING_AUTO_RECOVERY,
+                "E0-F1-S1-T3": BlockedTaskState.NEEDS_OPERATOR_ATTENTION,
+            }[task_id]
+
+        parser = MagicMock()
+        parser.parse_index.return_value = [unit_auto, unit_recovery, unit_attn]
+        parser.get_parallel_candidates.return_value = []
+        parser.get_blocked_units.return_value = [unit_auto, unit_recovery, unit_attn]
+        parser.all_done.return_value = False
+        with (
+            patch("devbench.cli.BacklogParser", return_value=parser),
+            patch("devbench.cli._count_unmaterialised_proposed_tasks", return_value=0),
+            patch("devbench.cli.classify_blocked_task", side_effect=fake_classify),
+            patch("devbench.cli._resolve_unit_file", return_value=None),
+        ):
+            rc = cli.cmd_status("--detail")
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "Blocked tasks (auto-clearing via proposal) (1):" in out
+        assert "Blocked tasks (awaiting auto-recovery) (1):" in out
+        assert "Blocked tasks (needs operator attention) (1):" in out
+        # Each task appears exactly under its own bucket header.
+        auto_pos = out.index("Blocked tasks (auto-clearing via proposal)")
+        recovery_pos = out.index("Blocked tasks (awaiting auto-recovery)")
+        attn_pos = out.index("Blocked tasks (needs operator attention)")
+        assert auto_pos < recovery_pos < attn_pos, "buckets must render in classifier order"
+        assert out.index("E0-F1-S1-T1") < recovery_pos
+        assert recovery_pos < out.index("E0-F1-S1-T2") < attn_pos
+        assert attn_pos < out.index("E0-F1-S1-T3")
+
+    def test_status_detail_omits_empty_buckets(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """When a bucket has zero tasks, its section header is omitted."""
+        from devbench.backlog.proposal import BlockedTaskState
+        from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
+
+        unit_only_auto = WorkUnit(
+            id="E0-F1-S1-T1",
+            title="Auto-only",
+            status=WorkUnitStatus.BLOCKED,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("/fake/auto.md"),
+            repo="r",
+            dependencies=[],
+        )
+        parser = MagicMock()
+        parser.parse_index.return_value = [unit_only_auto]
+        parser.get_parallel_candidates.return_value = []
+        parser.get_blocked_units.return_value = [unit_only_auto]
+        parser.all_done.return_value = False
+        with (
+            patch("devbench.cli.BacklogParser", return_value=parser),
+            patch("devbench.cli._count_unmaterialised_proposed_tasks", return_value=0),
+            patch(
+                "devbench.cli.classify_blocked_task",
+                return_value=BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL,
+            ),
+            patch("devbench.cli._resolve_unit_file", return_value=None),
+        ):
+            rc = cli.cmd_status("--detail")
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "Blocked tasks (auto-clearing via proposal) (1):" in out
+        assert "Blocked tasks (awaiting auto-recovery)" not in out
+        assert "Blocked tasks (needs operator attention)" not in out
+
 
 class TestCmdListProposalsStateLabels:
     """ADR-08 slice D: each listing line has a ``[state]`` label prefix."""

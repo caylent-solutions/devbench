@@ -247,6 +247,71 @@ def cmd_status(*argv: str) -> int:
     return 0
 
 
+def _print_blocked_panel_by_bucket(
+    blocked_tasks: list[WorkUnit],
+    units_by_id: dict[str, WorkUnit],
+) -> None:
+    """Issue #149 follow-up: split the ``--detail`` blocked panel by
+    classifier bucket so operators see at a glance which tasks need
+    attention vs which will auto-clear. Three sections matching the
+    summary-table buckets: AUTO_CLEARING_VIA_PROPOSAL /
+    AWAITING_AUTO_RECOVERY / NEEDS_OPERATOR_ATTENTION.
+    """
+    buckets: dict[BlockedTaskState, list[WorkUnit]] = {
+        BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL: [],
+        BlockedTaskState.AWAITING_AUTO_RECOVERY: [],
+        BlockedTaskState.NEEDS_OPERATOR_ATTENTION: [],
+    }
+    for u in blocked_tasks:
+        state = classify_blocked_task(
+            backlog_root=BACKLOG_ROOT,
+            backlog_index=BACKLOG_INDEX,
+            task_id=u.id,
+            workspace_root=WORKSPACE_ROOT,
+        )
+        buckets[state].append(u)
+    bucket_headers = [
+        (BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL, "Blocked tasks (auto-clearing via proposal)"),
+        (BlockedTaskState.AWAITING_AUTO_RECOVERY, "Blocked tasks (awaiting auto-recovery)"),
+        (BlockedTaskState.NEEDS_OPERATOR_ATTENTION, "Blocked tasks (needs operator attention)"),
+    ]
+    for state, header in bucket_headers:
+        tasks = buckets[state]
+        if not tasks:
+            continue
+        print(f"\n{header} ({len(tasks)}):")
+        for u in tasks:
+            _print_blocked_row(u, units_by_id)
+
+
+def _print_blocked_row(u: WorkUnit, units_by_id: dict[str, WorkUnit]) -> None:
+    """Render a single row in the blocked-tasks panel: ``id -- title (note)``
+    plus any unsuperseded ``[BLOCKED]`` audit lines beneath it."""
+    wu_file = _resolve_unit_file(u)
+    content = wu_file.read_text(encoding="utf-8") if wu_file is not None else ""
+    # Issue #148: walk the markers and surface only non-terminal targets.
+    markers = [
+        marker
+        for marker in _BLOCKED_PENDING_PROPOSAL_MARKER_RE.findall(content)
+        if (target := units_by_id.get(marker)) is None
+        or target.status not in {WorkUnitStatus.DONE, WorkUnitStatus.DECLINED}
+    ]
+    unsatisfied = _first_unsatisfied_dep(u, units_by_id)
+    note_parts: list[str] = []
+    if markers:
+        note_parts.append(f"pending proposal {markers[0]}")
+    if unsatisfied:
+        note_parts.append(f"blocker {unsatisfied}")
+    note = ", ".join(note_parts) if note_parts else "no open marker / blocker found"
+    print(f"  {u.id} -- {u.title}  ({note})")
+    # Issue #153: surface most-recent unsuperseded ``[BLOCKED]`` audit so
+    # the operator sees WHY the task is blocked. Audits superseded by a
+    # later ``[UNBLOCKED]`` / ``[CASCADE_RESOLVED]`` are filtered out
+    # (the file stays append-only; only the rendered panel hides stale rows).
+    for audit in _unsuperseded_blocked_audits(content):
+        print(f"      {audit}")
+
+
 def _print_status_detail(units: list[WorkUnit]) -> None:
     """Render the ``--detail`` panels: in-queue, blocked, held.
 
@@ -273,32 +338,7 @@ def _print_status_detail(units: list[WorkUnit]) -> None:
         key=lambda u: u.id,
     )
     if blocked_tasks:
-        print("\nBlocked tasks (with markers / blockers):")
-        for u in blocked_tasks:
-            wu_file = _resolve_unit_file(u)
-            content = wu_file.read_text(encoding="utf-8") if wu_file is not None else ""
-            # Issue #148: walk the markers and surface only non-terminal targets.
-            markers = [
-                marker
-                for marker in _BLOCKED_PENDING_PROPOSAL_MARKER_RE.findall(content)
-                if (target := units_by_id.get(marker)) is None
-                or target.status not in {WorkUnitStatus.DONE, WorkUnitStatus.DECLINED}
-            ]
-            unsatisfied = _first_unsatisfied_dep(u, units_by_id)
-            note_parts: list[str] = []
-            if markers:
-                note_parts.append(f"pending proposal {markers[0]}")
-            if unsatisfied:
-                note_parts.append(f"blocker {unsatisfied}")
-            note = ", ".join(note_parts) if note_parts else "no open marker / blocker found"
-            print(f"  {u.id} -- {u.title}  ({note})")
-            # Issue #153: surface most-recent unsuperseded ``[BLOCKED]`` audit
-            # so the operator sees WHY the task is blocked. Audits superseded
-            # by a later ``[UNBLOCKED]`` or ``[CASCADE_RESOLVED]`` are filtered
-            # out (the file is append-only; only the rendered panel hides
-            # stale rows).
-            for audit in _unsuperseded_blocked_audits(content):
-                print(f"      {audit}")
+        _print_blocked_panel_by_bucket(blocked_tasks, units_by_id)
 
     held_tasks = sorted(
         (u for u in units if u.unit_type is WorkUnitType.TASK and u.status is WorkUnitStatus.HOLD),

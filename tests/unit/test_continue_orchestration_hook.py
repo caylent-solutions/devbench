@@ -471,3 +471,57 @@ class TestActiveTaskSelection:
         active_idx = output["reason"].find("E3-F2-S3-T2")
         stale_idx = output["reason"].find("E1-F2-S1-T4")
         assert active_idx >= 0 and active_idx < stale_idx
+
+
+class TestStopHookEnvelopeShape:
+    """Issue #139 regression: emit BOTH the legacy ``decision``/``reason``
+    envelope AND the modern ``hookSpecificOutput`` envelope so the block
+    decision is honoured across Claude Code 2.x dispatcher versions.
+
+    Bug context: the orchestrator self-terminated 2026-05-02T00:19:21
+    despite ``continue-orchestration.sh`` emitting well-formed
+    ``{"decision":"block","reason":"..."}`` JSON. One hypothesis: Claude
+    Code 2.1.x prefers (or requires) the ``hookSpecificOutput`` envelope
+    introduced for the Stop event family. Shipping both shapes in the
+    same JSON object is forward-compatible across versions and
+    eliminates the schema-drift root cause from the candidate list.
+    """
+
+    def setup_method(self) -> None:
+        _cleanup_state_file()
+
+    def teardown_method(self) -> None:
+        _cleanup_state_file()
+
+    def test_block_json_has_both_legacy_and_modern_envelope(self, tmp_path: Path) -> None:
+        backlog = tmp_path / "BACKLOG.md"
+        backlog.write_text("| E2-F3-S2-T4 | example | Task | in-progress | none | repo | `backlog/t.md` |\n")
+        result = _run_hook(str(tmp_path))
+        output = json.loads(result.stdout)
+        # Legacy shape (existing).
+        assert output["decision"] == "block"
+        assert output.get("reason")
+        # Modern shape (issue #139).
+        assert "hookSpecificOutput" in output, (
+            "BLOCK_JSON must include the hookSpecificOutput envelope so Claude "
+            "Code 2.x honours the block decision regardless of which schema "
+            "version the dispatcher prefers."
+        )
+        hso = output["hookSpecificOutput"]
+        assert hso["hookEventName"] == "Stop"
+        assert hso["additionalContext"], (
+            "hookSpecificOutput.additionalContext must be non-empty so the "
+            "operator-visible reason text reaches the next agent turn."
+        )
+
+    def test_legacy_reason_matches_modern_additional_context(self, tmp_path: Path) -> None:
+        """The two envelopes must carry the same human-readable reason so an
+        operator scanning either shape sees identical context."""
+        backlog = tmp_path / "BACKLOG.md"
+        backlog.write_text("| E2-F3-S2-T4 | example | Task | in-progress | none | repo | `backlog/t.md` |\n")
+        result = _run_hook(str(tmp_path))
+        output = json.loads(result.stdout)
+        assert output["reason"] == output["hookSpecificOutput"]["additionalContext"], (
+            "Legacy 'reason' field and modern 'hookSpecificOutput.additionalContext' "
+            "must carry the same text so the two envelopes are interchangeable."
+        )

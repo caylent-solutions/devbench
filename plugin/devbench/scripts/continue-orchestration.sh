@@ -223,7 +223,14 @@ fi
 
 REASON_TEXT="Orchestration loop active. Task ${TASK_ID} is in-progress (file: ${FILE_PATH}). Last action: ${LAST_ACTION}.${EXTRA_IDS_SUFFIX} ${NEXT_STEP} Circuit breaker: ${NEW_COUNT}/${MAX_BLOCKS} blocks in ${ELAPSED}s window.${STALE_WARNING} Never stop between tasks."
 
-BLOCK_JSON=$(jq -nc --arg reason "$REASON_TEXT" '{decision:"block",reason:$reason}')
+BLOCK_JSON=$(jq -nc --arg reason "$REASON_TEXT" '{
+    decision: "block",
+    reason: $reason,
+    hookSpecificOutput: {
+        hookEventName: "Stop",
+        additionalContext: $reason
+    }
+}')
 
 # --- Diagnostic capture ---
 # Records exactly what the hook emitted plus surrounding context, so a future

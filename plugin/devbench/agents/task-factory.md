@@ -52,6 +52,16 @@ This is a contract failure of the upstream `blocker-resolver` agent, NOT somethi
 
 The Changes Manifest rows are auto-generated from `files_to_own`. A row that would literally read `TODO -- describe change` indicates `files_to_own` was populated but with no accompanying change description. `materialise-proposal` does not currently reject on this pattern alone (the row is a placeholder the operator can edit), but if you see it on multiple consecutive materialisations it signals the same blocker-resolver prompt drift as the thin-approach case. Log it in your verdict summary so the operator can correlate.
 
+### CRITICAL: spec-correction recovery tasks must list ONLY the work-unit markdown file they edit (issue #136)
+
+When the materialised draft's job is to remove (or modify) rows in another work-unit's Changes Manifest table, the draft's OWN Changes Manifest contains a single row pointing at `backlog/<path>/<source-task>.md` -- the markdown document being edited.
+
+The draft MUST NOT list the source files referenced inside that table (e.g. `pyproject.toml`, `Makefile`). The recovery task is editing a markdown document, not those source files. Listing them re-introduces the very Manifest Conflict the recovery task was created to resolve, which surfaces during the next `validate-backlog` run as a `[BACKLOG_VALIDATION]` audit comment and blocks the source task again.
+
+Self-correcting heuristic: if the draft's Description / Approach uses verbs like "remove the X row", "delete the Y entry", "drop the conflicting manifest row", "correct the manifest table", or "fix the Changes Manifest in <task>.md" -- the draft is editing the markdown document. Its Changes Manifest is markdown-only.
+
+This rule is regression-tested in `tests/test_integration/test_task_factory_spec_correction_scope.py`.
+
 ## Phase 2 -- Verdict
 
 ```

@@ -127,6 +127,59 @@ since the last release. PR #119 carries every change.
   `tests/test_integration/test_security_review_scope.py` pins the
   scope-contract text by-content so the rule cannot be silently
   removed.
+- **Stop-hook block decision now honoured across Claude Code 2.x
+  (3-layer defence)** (issues #138, #139, #140). Three independent
+  root-cause hypotheses each addressed in the same commit so the
+  orchestrator self-termination class is closed regardless of which
+  hypothesis was actually live:
+  - `plugin/devbench/hooks/hooks.json` -- `hook-logger.sh` removed
+    from the Stop event hook list (#138). The Stop event now has
+    exactly one registered hook (`continue-orchestration.sh`),
+    eliminating the empty-stdout-vote-vs-block-decision dispatcher
+    ambiguity. Stop events are still logged because
+    `continue-orchestration.sh` calls `uv run devbench log` directly.
+  - `plugin/devbench/scripts/continue-orchestration.sh` -- BLOCK_JSON
+    now emits both the legacy `{"decision":"block","reason":"..."}`
+    shape AND the modern `{"hookSpecificOutput":{"hookEventName":"Stop","additionalContext":"..."}}`
+    shape (#139). Forward-compat across Claude Code 2.x.
+  - `plugin/devbench/skills/orchestrate/SKILL.md` -- new CRITICAL
+    rule forbids ending a turn with prose narration of the next step
+    (#140). Every turn MUST end with EITHER a tool call OR a
+    `uv run devbench next` invocation; the recap-prose pattern
+    ("Next: re-invoke executor") is forbidden because Claude Code
+    interprets a turn-end-without-tool-call as agent-done before the
+    Stop hook's block can re-prompt the model.
+  Regression tests:
+  `tests/unit/test_hooks_json_registration.py::TestStopEventSingleHookRegistration`,
+  `tests/unit/test_continue_orchestration_hook.py::TestStopHookEnvelopeShape`,
+  `tests/test_integration/test_orchestrate_skill_no_recap_anti_pattern.py`.
+- **Recovery cascade no longer re-introduces Manifest Conflicts**
+  (issue #136). `plugin/devbench/agents/task-factory.md` adds an
+  explicit rule that spec-correction recovery tasks list ONLY the
+  work-unit markdown file in their Changes Manifest -- never the
+  source files referenced inside that markdown's Manifest table.
+  Listing source files in a recovery task's Manifest re-introduced
+  the very Manifest Conflict the recovery task was created to
+  resolve. Live evidence: 2026-05-02 caylent-telemetry-spec
+  E2-F3-S2-T5 was materialised to remove `pyproject.toml` +
+  `Makefile` rows from E2-F3-S2-T1's Manifest table; the factory
+  populated T5's own Manifest with those source files; the next
+  validate-backlog reported the same Manifest Conflict on
+  pyproject.toml (5 claimants including T5) and Makefile (T1 + T5).
+  New regression test
+  `tests/test_integration/test_task_factory_spec_correction_scope.py`
+  pins the rule by-content.
+- **manifest-amender now rejects amendments that would create a
+  Manifest Conflict** (issue #137). New pre-filter rule scans every
+  other work-unit's Manifest before approving an amendment that adds
+  a file. If the file is already claimed: REJECT (or, when the
+  conflict task is in a terminal state and the new row is `Modify`,
+  ALLOW with a `[CONFLICT_AUTODEP]` audit comment recommending the
+  operator add a dep edge). Prevents new conflicts from being
+  authored in the first place, making the recovery cascade the
+  exception rather than the norm. New regression test
+  `tests/test_integration/test_manifest_amender_pre_conflict.py`
+  pins the rule by-content.
 - **`devbench hook-tail` description column no longer wraps onto a
   timestamp-less continuation line** (issue #133). The `_description`
   helper now collapses every run of whitespace -- including embedded

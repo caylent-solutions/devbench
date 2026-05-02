@@ -332,3 +332,9 @@ When authoring a proposal where the new Task is test-validates-source, set a fla
 ```
 
 `promote-proposal` honors the flag if present (auto-applies `--no-dep-on-source` and wires the reverse dep). When the flag is absent, the default direction is preserved (backward compatible). See [`plugin/devbench/agents/blocker-resolver.md`](../plugin/devbench/agents/blocker-resolver.md) for when the agent should set this flag.
+
+## Spec-correction recovery tasks (issue #136)
+
+When task-factory materialises a draft whose job is to remove or modify rows in another work-unit's Changes Manifest table, the draft's OWN Changes Manifest contains a **single row pointing at the work-unit markdown file being edited** -- e.g. `backlog/E2/E2-F3/E2-F3-S2/E2-F3-S2-T1.md`. Source files referenced inside that markdown's Manifest table (e.g. `pyproject.toml`, `Makefile`) are NOT listed in the draft's Manifest. Listing them re-introduces the very Manifest Conflict the recovery task was created to resolve.
+
+The agent prompt (`plugin/devbench/agents/task-factory.md`) carries the rule + a self-correcting heuristic gated on Description / Approach verbs ("remove the row", "drop the entry", "correct the manifest table"). Regression coverage: `tests/test_integration/test_task_factory_spec_correction_scope.py`.

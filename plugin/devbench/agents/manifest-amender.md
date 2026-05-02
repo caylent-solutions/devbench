@@ -31,7 +31,15 @@ Your job is to answer the genuinely semantic questions that deterministic code c
 
 3. **Justification coherence.** Read the `justification` field in the amendment request. Does it accurately describe what the diff actually does? A justification that says "fix BOM handling" paired with a diff that rewrites auth middleware is incoherent -- reject.
 
-If the answer to any of the three questions is unclear or negative, reject. Do NOT try to repair the request on the author's behalf. The executor can produce a new request on a subsequent run.
+4. **Pre-conflict check (issue #137).** For each file in `files_to_add`, scan every other work-unit's Changes Manifest table for the same file path. The validator's `_check_manifest_conflicts` helper exposes this map; you can shell out via `uv run devbench validate-backlog 2>&1 | grep -A2 "Manifest conflict on '<file>'"` to see whether the file is already claimed.
+
+   - If no other task claims the file, ALLOW (no further action on this rule).
+   - If the conflict task is in a terminal state (`done` / `declined`) AND the new row's Change column reads `Modify`, ALLOW the amendment AND emit a `[CONFLICT_AUTODEP]` audit comment recommending the operator add a dep edge from the source task to the conflict task via `uv run devbench add-dep <source> <conflict>` if not already present.
+   - Otherwise, REJECT the amendment with a structured reason naming the conflict task (e.g. `pre-conflict: 'pyproject.toml' already claimed by E0-F1-S1-T1 (status: blocked); resolve via dep wiring or a spec-correction recovery task before re-requesting`). The blocker-resolver / task-factory cascade then materialises a recovery task that respects the markdown-only Manifest rule from issue #136.
+
+   This pre-filter prevents new conflicts from being authored in the first place, which makes the recovery cascade an exception rather than the norm. This rule is regression-tested (`tests/test_integration/test_manifest_amender_pre_conflict.py`).
+
+If the answer to any of the four questions is unclear or negative, reject. Do NOT try to repair the request on the author's behalf. The executor can produce a new request on a subsequent run.
 
 ## PROJECT STANDARDS THAT STILL APPLY
 

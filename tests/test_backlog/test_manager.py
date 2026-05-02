@@ -1168,6 +1168,214 @@ class TestValidateManifestPathPrefix:
 
 
 # ---------------------------------------------------------------------------
+# validate() --fix mode (auto-correct rule-10 and rule-11 violations)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestValidateFix:
+    """Tests for BacklogManager.validate(fix=True) auto-correction mode.
+
+    Four contract pins:
+    1. fix=True strips checkout_directory prefix from manifest paths (rule-11).
+    2. fix=True replaces em-dash characters with '--' (rule-10).
+    3. fix=True appends an audit comment with a timestamp to the corrected file.
+    4. fix=False (default) leaves the file unchanged (read-only).
+    """
+
+    _INDEX_HEADER = (
+        "# Backlog\n\n"
+        "## Status Summary\n\n"
+        "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
+        "|------|-------|------|-------------|----------|---------|\n"
+        "\n"
+        "## Full Work Unit Index\n\n"
+        "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+        "|-----|-------|------|--------|-------------|------|-----------|\n"
+    )
+
+    def _make_index(self, tmp_path: Path, rows: str) -> Path:
+        idx = tmp_path / "BACKLOG.md"
+        idx.write_text(self._INDEX_HEADER + rows, encoding="utf-8")
+        return idx
+
+    def _make_task(
+        self,
+        backlog_dir: Path,
+        unit_id: str,
+        repo: str,
+        manifest_rows: str,
+        description: str = "Test task.",
+    ) -> Path:
+        wu = backlog_dir / f"{unit_id}.md"
+        wu.write_text(
+            f"# {unit_id}\n\n"
+            f"## Status: in-queue\n\n"
+            f"## Target Repository\n\n"
+            f"- **Repo:** `{repo}`\n\n"
+            f"## Description\n\n{description}\n\n"
+            f"## Acceptance Criteria\n\n- [ ] AC-TEST-001\n\n"
+            f"## Changes Manifest\n\n"
+            f"| File | Change |\n"
+            f"|------|--------|\n"
+            f"{manifest_rows}\n"
+            f"## Definition of Done\n\n- [ ] Done\n\n"
+            f"## Comments\n",
+            encoding="utf-8",
+        )
+        return wu
+
+    def test_fix_strips_checkout_directory_prefix_from_manifest_paths(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """fix=True removes the checkout_directory prefix from manifest paths (rule-11)."""
+        wu = self._make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "example-org/example-repo",
+            "| `example-repo/src/foo.py` | update |\n",
+        )
+        self._make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | Task | Task | in-queue | none | example-org/example-repo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        rt_cfg = RuntimeConfig(repos={"example-org/example-repo": RepoConfig(checkout_directory="example-repo")})
+        idx = tmp_path / "BACKLOG.md"
+        with patch("devbench.config.RUNTIME_CONFIG", rt_cfg):
+            errors = BacklogManager().validate(idx, tmp_path, fix=True)
+
+        prefix_errors = [e for e in errors if "Changes Manifest path" in e and "begins with" in e]
+        assert prefix_errors == [], f"Expected no prefix errors after fix, got: {prefix_errors}"
+
+        content = wu.read_text(encoding="utf-8")
+        assert "`example-repo/src/foo.py`" not in content
+        assert "`src/foo.py`" in content
+
+    def test_fix_replaces_em_dash_characters(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """fix=True replaces U+2014 em-dash characters with '--' (rule-10)."""
+        wu = self._make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "example-org/example-repo",
+            "| `src/foo.py` | update |\n",
+            description="Do something — with em-dash.",
+        )
+        self._make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | Task | Task | in-queue | none | example-org/example-repo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        idx = tmp_path / "BACKLOG.md"
+        errors = BacklogManager().validate(idx, tmp_path, fix=True)
+
+        em_errors = [e for e in errors if "em-dash" in e.lower()]
+        assert em_errors == [], f"Expected no em-dash errors after fix, got: {em_errors}"
+
+        content = wu.read_text(encoding="utf-8")
+        assert "—" not in content, "U+2014 em-dash must be replaced after fix"
+        assert "Do something -- with em-dash." in content
+
+    def test_fix_appends_audit_comment_with_timestamp(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """fix=True appends a [VALIDATE_FIX] audit comment with a timestamp."""
+        wu = self._make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "example-org/example-repo",
+            "| `src/foo.py` | update |\n",
+            description="Fix — this em-dash.",
+        )
+        self._make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | Task | Task | in-queue | none | example-org/example-repo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        idx = tmp_path / "BACKLOG.md"
+        BacklogManager().validate(idx, tmp_path, fix=True)
+
+        content = wu.read_text(encoding="utf-8")
+        assert "[VALIDATE_FIX]" in content, "Audit comment must be appended after fix"
+        assert "rule-10" in content, "Audit comment must name the corrected rule"
+        import re
+
+        assert re.search(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC", content), (
+            "Audit comment must include a timestamp in YYYY-MM-DD HH:MM UTC format"
+        )
+
+    def test_validate_without_fix_is_read_only(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """fix=False (default) does not modify work-unit files -- validate remains read-only."""
+        wu = self._make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "example-org/example-repo",
+            "| `src/foo.py` | update |\n",
+            description="Keep — the em-dash.",
+        )
+        original_content = wu.read_text(encoding="utf-8")
+        self._make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | Task | Task | in-queue | none | example-org/example-repo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        idx = tmp_path / "BACKLOG.md"
+        errors = BacklogManager().validate(idx, tmp_path)
+
+        assert any("em-dash" in e.lower() for e in errors), "em-dash violation must be reported without --fix"
+
+        assert wu.read_text(encoding="utf-8") == original_content, (
+            "validate() without fix=True must not modify any work-unit files"
+        )
+
+    def test_fix_skips_missing_work_unit_file(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """fix=True silently skips rows whose work-unit files do not exist on disk."""
+        self._make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | Task | Task | in-queue | none | example-org/example-repo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        idx = tmp_path / "BACKLOG.md"
+        errors = BacklogManager().validate(idx, tmp_path, fix=True)
+        assert any("missing" in e.lower() for e in errors), "Missing file must still be reported even when fix=True"
+
+    def test_fix_append_fix_audit_no_op_when_no_audit_lines(self) -> None:
+        """_append_fix_audit returns content unchanged when audit_lines is empty."""
+        content = "# Task\n\n## Status: in-queue\n"
+        result = BacklogManager._append_fix_audit(content, "2026-01-01 00:00 UTC", [])
+        assert result == content
+
+    def test_fix_append_fix_audit_creates_comments_section_if_absent(self) -> None:
+        """_append_fix_audit creates '## Comments' section when it is not already present."""
+        content = "# Task\n\n## Status: in-queue\n"
+        result = BacklogManager._append_fix_audit(content, "2026-01-01 00:00 UTC", ["[VALIDATE_FIX] rule-10"])
+        assert "## Comments" in result
+        assert "[VALIDATE_FIX] rule-10" in result
+
+    def test_fix_manifest_prefixes_no_op_when_checkout_dir_unset(self) -> None:
+        """_fix_manifest_prefixes returns unchanged content when checkout_directory is None."""
+        content = "## Target Repository\n\n- **Repo:** `org/repo`\n"
+        rt_cfg = RuntimeConfig(repos={"org/repo": RepoConfig(checkout_directory=None)})
+        with patch("devbench.config.RUNTIME_CONFIG", rt_cfg):
+            result, count = BacklogManager._fix_manifest_prefixes(content, [])
+        assert result == content
+        assert count == 0
+
+    def test_fix_manifest_prefixes_no_op_when_no_prefix_match(self) -> None:
+        """_fix_manifest_prefixes returns unchanged content when no manifest paths carry the prefix."""
+        content = (
+            "## Target Repository\n\n- **Repo:** `org/repo`\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|---|---|\n| `src/foo.py` | update |\n"
+        )
+        rt_cfg = RuntimeConfig(repos={"org/repo": RepoConfig(checkout_directory="repo")})
+        with patch("devbench.config.RUNTIME_CONFIG", rt_cfg):
+            result, count = BacklogManager._fix_manifest_prefixes(content, [])
+        assert result == content
+        assert count == 0
+
+    def test_fix_manifest_prefixes_no_op_when_parse_raises(self) -> None:
+        """_fix_manifest_prefixes returns unchanged content when parse_manifest raises
+        (e.g. the Changes Manifest section is absent from the file)."""
+        content = "## Target Repository\n\n- **Repo:** `org/repo`\n\n## Description\n\nno manifest here\n"
+        rt_cfg = RuntimeConfig(repos={"org/repo": RepoConfig(checkout_directory="repo")})
+        with patch("devbench.config.RUNTIME_CONFIG", rt_cfg):
+            result, count = BacklogManager._fix_manifest_prefixes(content, [])
+        assert result == content
+        assert count == 0
+
+
+# ---------------------------------------------------------------------------
 # E4-F1-S1-T1: Rename BacklogManagerJudge -> BacklogManager
 # ---------------------------------------------------------------------------
 

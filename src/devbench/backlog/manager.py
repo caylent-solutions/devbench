@@ -100,6 +100,8 @@ class BacklogManager:
         # the scan. The set is per-instance so independent ``BacklogManager``
         # constructions get their own guard (tests share no state).
         self._cascade_fired_for: set[tuple[str, str]] = set()
+        # Populated by ``validate(fix=True)``: ``(fix_count, files_fixed)``.
+        self._fix_summary: tuple[int, int] = (0, 0)
 
     def force_status(
         self,
@@ -232,7 +234,7 @@ class BacklogManager:
         self._set_status(work_unit_path, backlog_index, unit_id, STATUS_IN_QUEUE)
         self._append_comment(work_unit_path, "UNHOLD", reason)
 
-    def validate(self, backlog_index: Path, workspace_root: Path) -> list[str]:
+    def validate(self, backlog_index: Path, workspace_root: Path, fix: bool = False) -> list[str]:
         """Check backlog integrity and return a list of error messages.
 
         Checks performed:
@@ -259,9 +261,15 @@ class BacklogManager:
         Args:
             backlog_index: Path to the ``BACKLOG.md`` index file.
             workspace_root: Workspace root containing BACKLOG.md and the backlog/ subdirectory.
+            fix: When ``True``, auto-correct rule-10 (em-dash) and rule-11
+                (checkout_directory prefix) violations in-place and append an
+                audit comment to each corrected file's ``## Comments`` section.
+                Violations that were corrected are NOT included in the returned
+                error list. Without ``fix``, the method is read-only.
 
         Returns:
-            A list of error strings. Empty list means the backlog is valid.
+            A list of error strings. Empty list means the backlog is valid (or
+            all fixable violations were corrected when ``fix=True``).
         """
         rows = self._parse_backlog_rows(backlog_index)
         known_ids = {row_id for row_id, _, _ in rows if row_id and not row_id.startswith("-")}
@@ -272,6 +280,10 @@ class BacklogManager:
         self._check_dependencies(backlog_index, known_ids, errors)
         self._check_dep_cycles(backlog_index, errors)
         self._check_status_summary(backlog_index, rows, errors)
+        if fix:
+            fix_count, fix_files = self._apply_fixes(rows, workspace_root)
+            self._fix_summary = (fix_count, fix_files)
+            rows = self._parse_backlog_rows(backlog_index)
         self._check_task_content(rows, workspace_root, errors)
         self._check_manifest_path_prefixes(rows, workspace_root, errors)
         self._check_manifest_conflicts(rows, workspace_root, errors)
@@ -283,6 +295,132 @@ class BacklogManager:
         self._check_branch_uniqueness(rows, workspace_root, errors)
         self._check_no_placeholder_manifest_rows(rows, workspace_root, errors)
         return errors
+
+    def _apply_fixes(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+    ) -> tuple[int, int]:
+        """Auto-correct rule-10 (em-dash) and rule-11 (checkout_directory prefix) violations.
+
+        For each task work unit:
+        - Rule 10: replace every U+2014 character with ``--``.
+        - Rule 11: strip the ``checkout_directory/`` prefix from Changes Manifest
+          paths that carry it.
+
+        After correcting a violation, appends an audit comment to the work
+        unit's ``## Comments`` section:
+        ``[VALIDATE_FIX] auto-corrected <rule>: <before> -> <after>``
+
+        Args:
+            rows: Parsed backlog rows as returned by ``_parse_backlog_rows``.
+            workspace_root: Workspace root used to resolve work-unit file paths.
+
+        Returns:
+            ``(fix_count, files_fixed)`` -- total individual corrections applied
+            and the count of distinct files that were modified.
+        """
+        timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+        fix_count = 0
+        files_fixed: set[Path] = set()
+
+        for row_id, _, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not file_path_str or not self._is_task_id(row_id):
+                continue
+
+            wu_path = workspace_root / file_path_str
+            if not wu_path.exists():
+                continue
+
+            content = wu_path.read_text(encoding="utf-8")
+            original = content
+            audit_lines: list[str] = []
+
+            content, r10_count = self._fix_em_dash(content, audit_lines)
+            fix_count += r10_count
+
+            content, r11_count = self._fix_manifest_prefixes(content, audit_lines)
+            fix_count += r11_count
+
+            if content != original or audit_lines:
+                content = self._append_fix_audit(content, timestamp, audit_lines)
+                wu_path.write_text(content, encoding="utf-8")
+                files_fixed.add(wu_path)
+
+        return fix_count, len(files_fixed)
+
+    @staticmethod
+    def _fix_em_dash(content: str, audit_lines: list[str]) -> tuple[str, int]:
+        """Replace all U+2014 em-dash characters with '--'.
+
+        Returns the (possibly modified) content and the count of replacements.
+        Appends an audit line to ``audit_lines`` when at least one replacement is made.
+        """
+        if EM_DASH not in content:
+            return content, 0
+        count = content.count(EM_DASH)
+        content = content.replace(EM_DASH, "--")
+        audit_lines.append(
+            f"[VALIDATE_FIX] auto-corrected rule-10: replaced {count} em-dash character(s) (U+2014) with '--'"
+        )
+        return content, count
+
+    @staticmethod
+    def _fix_manifest_prefixes(content: str, audit_lines: list[str]) -> tuple[str, int]:
+        """Strip checkout_directory prefix from Changes Manifest path cells.
+
+        Returns the (possibly modified) content and the count of path corrections.
+        Appends audit lines to ``audit_lines`` for each corrected path.
+        """
+        from devbench.backlog.manifest import parse_manifest
+        from devbench.config import RUNTIME_CONFIG
+
+        repo = BacklogManager._extract_repo(content)
+        if repo is None or repo not in RUNTIME_CONFIG.repos:
+            return content, 0
+        checkout_dir = RUNTIME_CONFIG.repos[repo].checkout_directory
+        if not checkout_dir:
+            return content, 0
+
+        prefix = f"{checkout_dir.rstrip('/')}/"
+        try:
+            manifest_rows = parse_manifest(content)
+        except Exception:
+            return content, 0
+
+        fix_count = 0
+        for mrow in manifest_rows:
+            if not mrow.file.startswith(prefix):
+                continue
+            stripped = mrow.file[len(prefix) :]
+            old_cell = f"`{mrow.file}`"
+            new_cell = f"`{stripped}`"
+            if old_cell in content:
+                content = content.replace(old_cell, new_cell, 1)
+                audit_lines.append(
+                    f"[VALIDATE_FIX] auto-corrected rule-11: "
+                    f"stripped checkout_directory prefix from "
+                    f"'{mrow.file}' -> '{stripped}'"
+                )
+                fix_count += 1
+
+        return content, fix_count
+
+    @staticmethod
+    def _append_fix_audit(content: str, timestamp: str, audit_lines: list[str]) -> str:
+        """Append the VALIDATE_FIX audit block to the work-unit file content.
+
+        If the file already has a ``## Comments`` section, appends after the last
+        line; otherwise creates the section first.
+        """
+        if not audit_lines:
+            return content
+        audit_block = "\n".join(f"[{timestamp}] [validate_fix] {line}" for line in audit_lines)
+        if COMMENTS_SECTION_HEADER in content:
+            return content.rstrip("\n") + "\n\n" + audit_block + "\n"
+        return content.rstrip("\n") + "\n\n" + COMMENTS_SECTION_HEADER + "\n\n" + audit_block + "\n"
 
     def _check_files_and_statuses(
         self,

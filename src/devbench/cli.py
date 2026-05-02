@@ -22,7 +22,7 @@ Commands::
     decline <id> --reason M Mark unit Declined (won't ever be done); captures the rationale
     hold <id> --reason M    Mark unit Hold (deferred / under debate); orchestrator skips it
     unhold <id> --reason M  Return a held unit to in-queue and capture why it was released
-    validate-backlog        Check backlog integrity (file existence, status sync, orphans, deps, summary)
+    validate-backlog [--fix] Check backlog integrity; --fix auto-corrects rule-10/11 violations
     ensure-branch <id>      Create or switch to work unit branch before executor runs
     git-ops <id>            Run git operations for a work unit (commit-only when defer_pr is set)
     git-ops-finalize <repo> Push single branch and create PR (after all deferred commits)
@@ -124,7 +124,6 @@ from devbench.backlog.work_unit import (
     WorkUnit,
     WorkUnitStatus,
     WorkUnitType,
-    validate_manifest_paths,
 )
 from devbench.config import (
     BACKLOG_INDEX,
@@ -1172,7 +1171,7 @@ def cmd_unhold(*argv: str) -> int:
     return 0
 
 
-def cmd_validate_backlog() -> int:
+def cmd_validate_backlog(*argv: str) -> int:
     """Validate backlog integrity and print any inconsistencies.
 
     Checks:
@@ -1182,11 +1181,20 @@ def cmd_validate_backlog() -> int:
     - All dependency IDs reference real work unit IDs.
     - Status Summary table exists and counts match the Full Work Unit Index.
 
-    Exits 0 if the backlog is consistent; 1 with actionable error messages
-    if any inconsistencies are found.
+    Optional flag:
+    - ``--fix``: Auto-correct rule-10 (em-dash) and rule-11 (checkout_directory
+      prefix) violations in place and append an audit comment to each corrected
+      file's ``## Comments`` section. Prints a summary of corrections made.
+
+    Exits 0 if the backlog is consistent (or all violations were fixed); 1 with
+    actionable error messages if any inconsistencies remain.
     """
+    fix = "--fix" in argv
     mgr = BacklogManager()
-    errors = mgr.validate(BACKLOG_INDEX, BACKLOG_INDEX.parent)
+    errors = mgr.validate(BACKLOG_INDEX, BACKLOG_INDEX.parent, fix=fix)
+    if fix:
+        fix_count, files_fixed = mgr._fix_summary
+        print(f"Fixed {fix_count} violation(s) across {files_fixed} file(s).")
     if not errors:
         print("Backlog integrity check passed.")
         return 0
@@ -4063,17 +4071,12 @@ def cmd_write_proposal(source_task_id: str) -> int:
         match = find_matching_pending_proposal(WORKSPACE_ROOT, proposal.fix_signature)
         if match is not None and match.source_task_id != source_task_id:
             return _wire_recovery_reuse(source_task_id, proposal, match)
-        # Validate manifest paths before persisting -- rejects em-dash and
-        # checkout_directory-prefixed paths that would fail validate-backlog
-        # downstream and halt the orchestrator.
-        checkout_directories = [rc.checkout_directory for rc in RUNTIME_CONFIG.repos.values() if rc.checkout_directory]
-        all_files_to_own: list[str] = [path for task in proposal.proposed_tasks for path in task.files_to_own]
-        validate_manifest_paths(all_files_to_own, checkout_directories)
+        # Manifest-path correctness (no em-dash, no checkout_directory prefix)
+        # is enforced by guard-work-unit-write.sh at the .md write step;
+        # proposal-JSON payloads here legitimately use checkout_directory-
+        # prefixed paths to flag target-repo ownership (Issue #146).
         written = write_proposal(WORKSPACE_ROOT, proposal)
     except (_ProposalInputError, ProposalError) as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 1
-    except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
@@ -4902,7 +4905,7 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
             "derived from the ID's last segment (T/S/F/E)."
         ),
     ),
-    "validate-backlog": (cmd_validate_backlog, 0, "Validate backlog integrity"),
+    "validate-backlog": (cmd_validate_backlog, 0, "Validate backlog integrity [--fix: auto-correct rule-10/11]"),
     "check": (
         cmd_check,
         0,
@@ -5041,6 +5044,7 @@ _VARIADIC_COMMANDS: frozenset[str] = frozenset(
         "status",
         "new-task",
         "reject-proposal",
+        "validate-backlog",
     }
 )
 

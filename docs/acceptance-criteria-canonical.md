@@ -83,6 +83,35 @@ A Task whose Changes Manifest contains only `*.py` files has tier `Python`. Ever
 
 A Task with both `*.py` source and `*.yaml` config in its Manifest has tier `Mixed (Python+YAML)`. The Python-tier ACs apply to the `.py` portion of the Manifest; the YAML files do not block AC-FINAL-005 etc. Authors do NOT append the N/A suffix in Mixed Tasks because at least one Python file is in scope.
 
+## Vendored code carve-out (AC-FINAL-004, AC-FINAL-008)
+
+When a task's source repo contains a vendored third-party tree (code
+the team did not author and does not own -- e.g. AOSP-derived
+`src/kanon_cli/repo/` in caylent-solutions/kanon), the mypy and
+bandit gates MUST scope to non-vendored code only.
+
+Acceptable AC wording:
+
+> AC-FINAL-004: mypy passes 100% on all owned code. Vendored trees
+> excluded via `[mypy-<vendored.module>.*] ignore_errors = True` in
+> the project's mypy config; the carve-out path and rationale are
+> documented in the repo's CLAUDE.md.
+
+> AC-FINAL-008: bandit passes 100% on all owned code. Vendored
+> trees excluded via `bandit -x <path>` or the bandit config's
+> `exclude_dirs` list; the carve-out path and rationale are
+> documented in the repo's CLAUDE.md.
+
+Vendored carve-outs are NOT bypass annotations (no `# noqa`,
+`# nosec`); they are scope demarcations between owned and
+unowned code at the build-config layer. They require:
+- The carved-out path is committed in version control (we own
+  the relationship to the upstream).
+- The rationale is documented in repo's CLAUDE.md (so a future
+  reviewer understands why those files are excluded).
+- A separate work-item exists in the backlog (or an upstream
+  PR is open) tracking eventual remediation if appropriate.
+
 ## Authority and lifecycle
 
 - This document is the SOURCE OF TRUTH for the AC-FINAL set. If a backlog generator emits AC-FINAL ACs that diverge from the text in the table above, the divergence is a defect in the generator.

@@ -35,6 +35,23 @@ Do NOT treat unstaged or untracked files as evidence that the committed branch i
 4. The scope of changes is proportional to the work unit's requirements -- no over-engineering.
 5. No unrelated changes bundled into this work unit (scope creep).
 
+## COMMIT-ATTRIBUTION CHECK
+Run the following command to enumerate every file that appears in any commit on this task's branch (relative to origin/main):
+```
+git log --name-only --pretty=format: origin/main..HEAD
+```
+For every file path returned, verify it appears in the task's Changes Manifest. If a file appears in a commit but NOT in the manifest, FAIL with the message:
+"Commit <sha> contains <path> which is not in the task's Changes Manifest. The file may have been bundled into the wrong task's commit (e.g. via `git commit --amend` on a sibling task's commit)."
+
+To obtain the commit SHA for a bundled file:
+```
+git log --oneline --all -- <path>
+```
+
+This check catches the scenario where the executor accidentally amended a sibling task's commit and bundled a sibling's file under this task's commit -- previously this surfaced only as a deadlocked manifest-mismatch on the bundled-into task.
+
+Note: use the output of `devbench get-diff` (the scope contract source) as the primary manifest comparison, and use the git log command above as a SECOND assertion over the commit history.
+
 ## CRITICAL FILE CHANGES
 6. Dependency manifests (build.gradle, pom.xml, package.json, requirements.txt, lock files) modified only with justification.
 7. CI/CD workflow files (.github/workflows/*.yml) modified only with justification.

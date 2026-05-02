@@ -338,3 +338,53 @@ When authoring a proposal where the new Task is test-validates-source, set a fla
 When task-factory materialises a draft whose job is to remove or modify rows in another work-unit's Changes Manifest table, the draft's OWN Changes Manifest contains a **single row pointing at the work-unit markdown file being edited** -- e.g. `backlog/E2/E2-F3/E2-F3-S2/E2-F3-S2-T1.md`. Source files referenced inside that markdown's Manifest table (e.g. `pyproject.toml`, `Makefile`) are NOT listed in the draft's Manifest. Listing them re-introduces the very Manifest Conflict the recovery task was created to resolve.
 
 The agent prompt (`plugin/devbench/agents/task-factory.md`) carries the rule + a self-correcting heuristic gated on Description / Approach verbs ("remove the row", "drop the entry", "correct the manifest table"). Regression coverage: `tests/test_integration/test_task_factory_spec_correction_scope.py`.
+
+## Recovery-proposal dedup (issue #141)
+
+When `blocker-resolver` would emit a recovery proposal,
+`cmd_write_proposal` first computes a stable `fix_signature` -- a
+SHA-256 hash over `(target_repo, sorted(files_to_own), normalised
+intent_phrase)`. The intent phrase is extracted from the proposal's
+Approach text via a regex table mapping verb patterns ("remove the
+row", "untrack", "register marker", ...) to canonical tokens
+(`remove-row`, `untrack`, `register-marker`, ...).
+
+Before writing the JSON, `find_matching_pending_proposal` scans
+`.devbench/proposals/*.json` for a non-terminal source task whose
+proposal carries the same signature. On hit, `cmd_write_proposal`
+calls `add-dep` to wire the new source task as an additional
+dependency of the existing recovery task and emits a
+`[RECOVERY_REUSED]` audit comment instead of writing a duplicate
+JSON. On miss, the signature is stamped into the proposal JSON
+before persistence so the next blocker that matches the same shape
+hits the reuse path.
+
+The dedup helpers live in
+[`src/devbench/backlog/proposal.py`](../src/devbench/backlog/proposal.py).
+Regression coverage:
+[`tests/test_backlog/test_proposal_dedup.py`](../tests/test_backlog/test_proposal_dedup.py)
+and
+[`tests/test_backlog/test_proposal_scanner.py`](../tests/test_backlog/test_proposal_scanner.py).
+
+## Cascade-depth limit (issue #144)
+
+Recovery cascades (a proposal whose source task is itself the
+materialisation of an earlier proposal) carry a `cascade_depth`
+field equal to `parent_depth + 1`. The
+`orchestrate.max_cascade_depth` YAML knob (default `3`, env override
+`JUDGE_ORCHESTRATE_MAX_CASCADE_DEPTH`) caps recursion. When
+`cmd_materialise_proposal` sees a proposal at the cap, it transitions
+the source task to `NEEDS_OPERATOR_ATTENTION` instead of authoring
+another draft. Default of 3 reflects observed cascade lengths in
+production backlogs; raise per-workspace via YAML if your operator
+loop genuinely needs deeper chains.
+
+## Materialise-time placeholder rejection (issue #143)
+
+`cmd_materialise_proposal` scans every proposal's
+`proposed_tasks[*].suggested_approach` and rejects the materialisation
+when any value is empty, whitespace-only, `TODO`, or `TBD`. The
+rejection emits a structured error naming the offending tasks so the
+operator (or the upstream `blocker-resolver` invocation) can supply a
+real Approach before retrying. Concrete approach text -- even a single
+sentence -- passes the gate.

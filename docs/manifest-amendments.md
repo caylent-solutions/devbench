@@ -117,7 +117,7 @@ The amender also logs a final `REVIEW_PASS` or `REVIEW_FAIL` verdict via `log-ve
 Before approving an amendment that adds a file to a work-unit's Changes Manifest, the manifest-amender scans every other work-unit's Manifest table for the same file path. The validator's `_check_manifest_conflicts` helper exposes this map (operationally: `uv run devbench validate-backlog 2>&1 | grep "Manifest conflict on '<file>'"`).
 
 - **No conflict**: ALLOW.
-- **Conflict task in terminal state (`done` / `declined`) AND new row is `Modify`**: ALLOW + emit `[CONFLICT_AUTODEP]` audit comment recommending the operator add a dep edge via `uv run devbench add-dep <source> <conflict>`.
+- **Conflict task in terminal state (`done` / `declined`) AND new row is `Modify`**: ALLOW + auto-wire the dep edge by invoking `uv run devbench add-dep <source-task-id> <conflict-task-id>` (issue #142) before emitting the `apply` verdict; then log `[CONFLICT_AUTODEP]` naming the wired pair. If the `add-dep` invocation fails, emit `[CONFLICT_AUTODEP_FAILED]` with the underlying error -- the amendment still applies, but the operator is paged to wire the dep manually.
 - **Otherwise**: REJECT with a structured reason naming the conflict task. The blocker-resolver / task-factory cascade then materialises a recovery task whose own Manifest is markdown-only per issue #136.
 
 This pre-filter prevents new conflicts from being authored in the first place, which makes the recovery cascade an exception rather than the norm. Regression coverage: `tests/test_integration/test_manifest_amender_pre_conflict.py`.

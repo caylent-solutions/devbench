@@ -5027,7 +5027,9 @@ class TestCmdMaterialiseProposal:
                     files_to_own=[],
                     linked_scenarios=[],
                     suggested_acs=[],
-                    suggested_approach="",
+                    # Concrete approach text so the issue #143 placeholder check
+                    # does not fire before the source-task lookup runs.
+                    suggested_approach="Author the foo helper that the source task references",
                 )
             ],
         )
@@ -6365,6 +6367,187 @@ def _runtime_config_with_auto_accept(value: bool) -> Any:
     base = cli.RUNTIME_CONFIG
     new_tf = dataclasses.replace(base.task_factory, auto_accept_proposals=value)
     return dataclasses.replace(base, task_factory=new_tf)
+
+
+class TestCmdWriteProposalDedup:
+    """Issue #141: ``cmd_write_proposal`` must auto-wire a dep edge to an
+    existing recovery task instead of writing a duplicate proposal when
+    the would-be proposal's ``fix_signature`` matches an existing pending
+    proposal on disk."""
+
+    def _seed_existing_recovery(self, tmp_path: Path, source_id: str, signature: str) -> Path:
+        """Drop a pending proposal JSON + a minimal source-task markdown +
+        BACKLOG.md row so add_dep can find and modify the source task."""
+        proposals_dir = tmp_path / ".devbench" / "proposals"
+        proposals_dir.mkdir(parents=True, exist_ok=True)
+        path = proposals_dir / f"{source_id}.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "source_task_id": source_id,
+                    "generated_at": "2026-05-02T00:00:00Z",
+                    "rejection_reason": "fixture",
+                    "proposed_tasks": [],
+                    "fix_signature": signature,
+                }
+            ),
+            encoding="utf-8",
+        )
+        backlog_dir = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        backlog_dir.mkdir(parents=True, exist_ok=True)
+        (backlog_dir / f"{source_id}.md").write_text(
+            f"# {source_id}: existing recovery\n\n## Status: in-queue\n", encoding="utf-8"
+        )
+        return path
+
+    def test_dedup_reuses_existing_proposal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Two source tasks with the same fix signature -> second invocation
+        emits ``recovery_reused: true`` instead of writing a duplicate
+        proposal JSON."""
+        import io
+
+        from devbench.backlog.proposal import _compute_fix_signature, _extract_intent_phrase
+
+        # Compute the signature the way cmd_write_proposal will compute it
+        # (target_repo "" because we have no BACKLOG.md index file in this
+        # tmp_path; that matches the legacy fallback path the test exercises).
+        files = ["pyproject.toml"]
+        intent = _extract_intent_phrase("Remove the pyproject.toml row from T1")
+        signature = _compute_fix_signature("", files, intent)
+
+        # Seed the EXISTING recovery: source_id=E0-F1-S1-T1 carries the signature.
+        self._seed_existing_recovery(tmp_path, "E0-F1-S1-T1", signature)
+        # Add a target source-task markdown that the new write-proposal
+        # invocation will be associated with (so add_dep can write its
+        # dep-table row).
+        backlog_dir = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        new_source_md = (
+            "# E0-F1-S1-T7: new source\n\n## Status: blocked\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n"
+        )
+        (backlog_dir / "E0-F1-S1-T7.md").write_text(new_source_md, encoding="utf-8")
+        # Minimal BACKLOG.md so BacklogParser does not crash; both rows present.
+        t1_path = "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md`"
+        t7_path = "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T7.md`"
+        (tmp_path / "BACKLOG.md").write_text(
+            "# Backlog\n\n## Tasks\n\n"
+            "| ID | Title | Type | Status | Deps | Repo | File |\n"
+            "|----|-------|------|--------|------|------|------|\n"
+            f"| E0-F1-S1-T1 | existing recovery | Task | in-queue | none | r | {t1_path} |\n"
+            f"| E0-F1-S1-T7 | new source | Task | blocked | none | r | {t7_path} |\n",
+            encoding="utf-8",
+        )
+
+        # Submit a new proposal whose fix signature will match.
+        new_payload = {
+            "source_task_id": "E0-F1-S1-T7",
+            "generated_at": "2026-05-02T00:01:00Z",
+            "rejection_reason": "duplicate fix",
+            "proposed_tasks": [
+                {
+                    "suggested_id": "E0-F1-S1-T8",
+                    "title": "Remove the pyproject.toml row from T7",
+                    "files_to_own": files,
+                    "linked_scenarios": [],
+                    "suggested_acs": [],
+                    "suggested_approach": "Remove the pyproject.toml row from T1",
+                }
+            ],
+        }
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(new_payload)))
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+        ):
+            rc = cli.cmd_write_proposal("E0-F1-S1-T7")
+        assert rc == 0
+        out = capsys.readouterr().out
+        envelope = json.loads(out)
+        assert envelope["recovery_reused"] is True
+        assert envelope["reused_from_task_id"] == "E0-F1-S1-T1"
+        # No duplicate proposal JSON written.
+        assert not (tmp_path / ".devbench" / "proposals" / "E0-F1-S1-T7.json").exists()
+
+
+class TestCmdMaterialiseProposalLifecycleGates:
+    """Issues #143 + #144: TODO/TBD placeholder reject + cascade-depth limit
+    in ``cmd_materialise_proposal``."""
+
+    def _seed_proposal(
+        self,
+        tmp_path: Path,
+        source_id: str,
+        approach: str = "concrete",
+        cascade_depth: int = 0,
+    ) -> Path:
+        from devbench.backlog.proposal import Proposal, ProposedTask, write_proposal
+
+        proposal = Proposal(
+            source_task_id=source_id,
+            generated_at="2026-05-02T00:00:00Z",
+            rejection_reason="fixture",
+            proposed_tasks=[
+                ProposedTask(
+                    suggested_id="E0-F1-S1-T2",
+                    title="t",
+                    files_to_own=[],
+                    linked_scenarios=[],
+                    suggested_acs=[],
+                    suggested_approach=approach,
+                )
+            ],
+            cascade_depth=cascade_depth,
+        )
+        return write_proposal(tmp_path, proposal)
+
+    def test_todo_placeholder_rejected(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        self._seed_proposal(tmp_path, "E0-F1-S1-T1", approach="TODO -- describe change")
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+        ):
+            rc = cli.cmd_materialise_proposal("E0-F1-S1-T1")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "placeholder description" in err
+        assert "E0-F1-S1-T2" in err
+
+    def test_cascade_depth_at_cap_rejected(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        self._seed_proposal(tmp_path, "E0-F1-S1-T1", approach="concrete approach", cascade_depth=3)
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli.MAX_CASCADE_DEPTH", 3),
+        ):
+            rc = cli.cmd_materialise_proposal("E0-F1-S1-T1")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "cascade-depth limit reached" in err
+        assert "NEEDS_OPERATOR_ATTENTION" in err
+
+    def test_cascade_depth_below_cap_passes_through_to_source_lookup(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Depth < cap + concrete approach -> proceeds past gates and hits
+        the source-task-not-in-backlog error (same baseline behaviour as
+        before this commit)."""
+        self._seed_proposal(tmp_path, "E0-F1-S1-T1", approach="concrete approach", cascade_depth=1)
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli.MAX_CASCADE_DEPTH", 3),
+        ):
+            rc = cli.cmd_materialise_proposal("E0-F1-S1-T1")
+        assert rc == 1
+        # Past the dedup gates -> hits the source-task-lookup error.
+        err = capsys.readouterr().err
+        assert "not found" in err
 
 
 class TestCmdWriteProposalAutoCascade:

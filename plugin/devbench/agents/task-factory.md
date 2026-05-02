@@ -91,3 +91,17 @@ When materialising a proposal whose JSON includes `"source_dep_direction": "test
 When the flag is absent (default), the existing behavior (source.depends_on(new)) is preserved -- backward-compatible with existing proposals from blocker-resolver flows.
 
 See [`blocker-resolver.md`](blocker-resolver.md#test-validates-source-proposals-post-backlog-a-addendum) for the heuristic that determines when the proposal author sets the flag.
+
+## Cascade-depth limit (issue #144)
+
+`cmd_materialise_proposal` enforces `orchestrate.max_cascade_depth` (YAML; default 3, env override `JUDGE_ORCHESTRATE_MAX_CASCADE_DEPTH`) before writing a draft. When a proposal carries `cascade_depth >= max_cascade_depth`, the CLI exits with rc=1 and an error message naming the limit; the source task transitions to `NEEDS_OPERATOR_ATTENTION` (the depth cap prevents recovery-of-a-recovery-of-a-recovery loops from spawning unbounded drafts). Your verdict in that case is `fail` with audit message naming the depth + the cap. The operator can either raise the cap in YAML or hand-resolve the deepest layer.
+
+`cascade_depth` is set automatically by the CLI when materialising: `parent_depth + 1` where `parent_depth` is the depth of the proposal that drove the source task into recovery. First-class recovery (the source task is a real backlog task) starts at depth 0; the first auto-emitted recovery sits at depth 1; the recovery-of-that at depth 2; etc.
+
+Regression-tested in `tests/test_integration/test_cascade_depth_limit.py`.
+
+## Materialise-time placeholder rejection (issue #143)
+
+Before writing any draft, `cmd_materialise_proposal` scans `proposed_tasks[*].suggested_approach` for empty / TODO / TBD placeholder values and rejects the materialisation if any entry is a placeholder. This pushes the existing `validate-backlog` rule (issue #117) earlier in the lifecycle so drafts never reach the operator carrying placeholder rows. Your verdict in that case is `fail` with audit message naming the offending task IDs. The operator (or upstream blocker-resolver) fills in concrete approach text before the next materialisation attempt.
+
+Regression-tested in `tests/test_integration/test_task_factory_todo_reject.py` (integration) and `tests/test_backlog/test_proposal_lifecycle_hardening.py` (unit).

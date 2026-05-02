@@ -159,6 +159,16 @@ hook_tail:
   stdout_preview_max: 80
 
 # ---------------------------------------------------------------------------
+# Orchestrator runtime tuning (issue #144)
+# ---------------------------------------------------------------------------
+orchestrate:
+  # Cap on recovery-of-a-recovery cascade depth. When a proposal would land
+  # at depth >= this cap, the source task transitions to
+  # NEEDS_OPERATOR_ATTENTION instead of materialising another recovery
+  # layer. Override via JUDGE_ORCHESTRATE_MAX_CASCADE_DEPTH env var.
+  max_cascade_depth: 3
+
+# ---------------------------------------------------------------------------
 # Report / cost estimation
 # ---------------------------------------------------------------------------
 report:

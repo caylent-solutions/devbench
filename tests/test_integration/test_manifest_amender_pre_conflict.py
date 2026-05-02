@@ -50,9 +50,11 @@ class TestManifestAmenderPreConflict:
         [
             # The check itself.
             "scan every other work-unit's Changes Manifest table for the same file path",
-            # The terminal-status allow path with the dep recommendation.
+            # The terminal-status allow path. Issue #142 changed the wording
+            # from "recommend dep edge" to "auto-wire the dep"; the
+            # [CONFLICT_AUTODEP] audit shape is preserved.
             "If the conflict task is in a terminal state (`done` / `declined`)",
-            "ALLOW the amendment AND emit a `[CONFLICT_AUTODEP]`",
+            "[CONFLICT_AUTODEP]",
             # The default reject path.
             "REJECT the amendment with a structured reason naming the conflict task",
             # Why: prevents the cascade-then-recover loop.

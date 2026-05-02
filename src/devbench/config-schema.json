@@ -258,6 +258,18 @@
         }
       }
     },
+    "orchestrate": {
+      "type": "object",
+      "description": "Orchestrator runtime tuning (issue #144).",
+      "additionalProperties": false,
+      "properties": {
+        "max_cascade_depth": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Cap on recovery-of-a-recovery cascade depth. When a proposal would land at depth >= this cap, the source task transitions to NEEDS_OPERATOR_ATTENTION instead of materialising another recovery layer. Default: 3."
+        }
+      }
+    },
     "limits": {
       "type": "object",
       "description": "Threshold and limit values.",

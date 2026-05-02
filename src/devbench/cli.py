@@ -3685,6 +3685,35 @@ def cmd_write_proposal(source_task_id: str) -> int:
     """
     try:
         proposal = _read_proposal_from_stdin(source_task_id)
+        # Issue #146: drop proposed-task entries whose files all live in
+        # the backlog repo (not in any configured target repo). The
+        # recovery cascade has no valid endpoint for backlog-repo edits;
+        # they're operator bookkeeping commits, not work-unit deliverables.
+        proposal, skipped_entries = _filter_backlog_repo_proposed_tasks(proposal)
+        for skipped_id, skipped_files in skipped_entries:
+            audit = (
+                f"[RECOVERY_SKIPPED_BACKLOG_REPO_FILES] source_task={source_task_id} "
+                f"proposed_task={skipped_id} files={','.join(skipped_files)}: "
+                f"all files live in the backlog repo (not in any configured target repo); "
+                f"commit as backlog-repo bookkeeping by hand; no work-unit recovery created."
+            )
+            logger.info("write-proposal: %s", audit)
+        if not proposal.proposed_tasks:
+            # Every proposed task was backlog-repo only -- nothing to write.
+            # Source task escalates: operator must commit the backlog-repo
+            # bookkeeping by hand and decide whether the source task can
+            # otherwise proceed.
+            print(
+                json.dumps(
+                    {
+                        "source_task_id": source_task_id,
+                        "proposal_path": None,
+                        "recovery_skipped": True,
+                        "reason": "all proposed tasks owned only backlog-repo files",
+                    }
+                )
+            )
+            return 0
         # Compute the dedup signature even when the agent did not stamp it.
         proposal = _stamp_fix_signature(proposal)
         # Issue #141: scan for an existing recovery task whose fix
@@ -3752,6 +3781,75 @@ def _resolve_source_repo(source_task_id: str) -> str:
         if unit.id == source_task_id:
             return unit.repo or ""
     return ""
+
+
+def _file_lives_in_a_target_repo(file_path: str) -> bool:
+    """Return True iff ``file_path`` (workspace-relative) lives inside one
+    of the configured target repos (issue #146).
+
+    A workspace-relative path is "in a target repo" when its first path
+    segment matches the ``checkout_directory`` of any
+    ``RUNTIME_CONFIG.repos[*]`` entry. Files outside every configured
+    target repo (e.g. ``spec/observability.md``, ``BACKLOG.md``,
+    ``backlog/**/*.md``, ``docs/*.md``) are backlog-repo bookkeeping
+    edits, not work-unit deliverables, and the recovery cascade has no
+    valid completion path for them.
+    """
+    if not file_path:
+        return False
+    if not RUNTIME_CONFIG.repos:
+        # No target repos configured -- the filter has no basis for
+        # classification; treat every file as in-scope (conservative).
+        return True
+    first_segment = file_path.split("/", 1)[0]
+    for repo_cfg in RUNTIME_CONFIG.repos.values():
+        checkout = repo_cfg.checkout_directory or (
+            repo_cfg.validated_repo.split("/", 1)[1] if repo_cfg.validated_repo else None
+        )
+        if checkout and first_segment == checkout:
+            return True
+    return False
+
+
+def _filter_backlog_repo_proposed_tasks(proposal: Proposal) -> tuple[Proposal, list[tuple[str, list[str]]]]:
+    """Issue #146: drop proposed-task entries whose every file lives in
+    the backlog repo (i.e., NOT in any configured target repo).
+
+    Returns a (filtered_proposal, skipped) tuple. ``skipped`` is a list
+    of (suggested_id, files) for the dropped entries; the caller logs
+    ``[RECOVERY_SKIPPED_BACKLOG_REPO_FILES]`` audits naming each set.
+    For mixed entries (some files in target repos, some in backlog
+    repo), the entry is RETAINED with only the target-repo files (the
+    backlog-repo files are pruned) and a ``[RECOVERY_PARTIAL_BACKLOG_REPO_SKIP]``
+    audit is logged separately by the caller.
+    """
+    from dataclasses import replace as _replace
+
+    kept: list = []
+    skipped: list[tuple[str, list[str]]] = []
+    mutated = False
+    for task in proposal.proposed_tasks:
+        if not task.files_to_own:
+            # Empty files_to_own = research / validation-gate task; not
+            # backlog-only by intent. Preserve as-is.
+            kept.append(task)
+            continue
+        target_repo_files = [f for f in task.files_to_own if _file_lives_in_a_target_repo(f)]
+        backlog_files = [f for f in task.files_to_own if not _file_lives_in_a_target_repo(f)]
+        if not target_repo_files:
+            # Entirely backlog-repo work -- drop the entry.
+            skipped.append((task.suggested_id, backlog_files))
+            mutated = True
+            continue
+        if backlog_files:
+            # Mixed -- prune the backlog files; keep target-repo files.
+            kept.append(_replace(task, files_to_own=target_repo_files))
+            mutated = True
+        else:
+            kept.append(task)
+    if not mutated:
+        return proposal, skipped
+    return _replace(proposal, proposed_tasks=kept), skipped
 
 
 def _wire_recovery_reuse(

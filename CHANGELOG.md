@@ -101,6 +101,18 @@ since the last release. PR #119 carries every change.
   source task transitions to `NEEDS_OPERATOR_ATTENTION` rather than
   materialising a deeper draft. Pinned by
   `tests/test_backlog/test_proposal_lifecycle_hardening.py::TestEnforceCascadeDepth`.
+- **Backlog-repo recovery skip** (issue #146). `cmd_write_proposal`
+  drops proposed-task entries whose `files_to_own` all live in the
+  backlog repo (i.e., not in any configured target repo's
+  `checkout_directory`). Backlog-repo edits (e.g. `spec/*.md`,
+  `BACKLOG.md`, `backlog/**/*.md`, `docs/*.md`) are operator
+  bookkeeping commits, not work-unit deliverables; the recovery
+  cascade has no valid completion path for them. When every proposed
+  task is skipped, the JSON envelope reports `recovery_skipped:
+  true` and no proposal JSON is written. Mixed entries are pruned to
+  their target-repo files. Logged as
+  `[RECOVERY_SKIPPED_BACKLOG_REPO_FILES]`. Pinned by
+  `tests/test_cli.py::TestCmdWriteProposalBacklogRepoSkip`.
 
 ### Changed
 

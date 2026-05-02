@@ -4,7 +4,25 @@ An LLM-as-Judge orchestration system that processes a backlog of work units auto
 
 ## 60-second overview
 
-DevBench takes a structured backlog of work units (epics, features, stories, tasks) and drives them through a TDD implement / parallel-judge-review / security-review / git-merge pipeline without human intervention between tasks.
+DevBench drives a structured backlog from claim to merged PR without human intervention between tasks.
+
+**Input** -- a four-level work-unit hierarchy on disk:
+
+| Level | Work unit |
+|-------|-----------|
+| 1 | Epic |
+| 2 | Feature |
+| 3 | Story |
+| 4 | Task (the only level the orchestrator claims directly) |
+
+**Pipeline** -- each task moves through four sequential stages:
+
+| Stage | What runs |
+|-------|-----------|
+| 1 | TDD implement (RED -> GREEN -> REFACTOR) by the executor agent. |
+| 2 | Parallel judge review -- four review judges run concurrently. |
+| 3 | Security review -- one judge runs sequentially after stage 2 passes. |
+| 4 | Git ops -- commit, push, create PR, wait for CI, merge. |
 
 - **Autonomous SDLC pipeline.** One operator writes the spec; the orchestrator drives every task from claim to merged PR.
 - **Real LLM review at every gate.** Every verdict is logged as an audit comment on the work unit.

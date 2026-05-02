@@ -2161,3 +2161,111 @@ class TestThroughputDivergenceWarning:
             mock_cls.return_value.parse_index.return_value = units
             report = generate_report(log_path=log_file)
         assert str(log_file) in report
+
+
+@pytest.mark.unit
+class TestReportRowColors:
+    """Tests for ANSI colour wrapping on selected report rows.
+
+    Coloured rows:
+      - 'Tasks completed', 'Tasks completed in window',
+        'Work units done (...)', 'Stories / Features / Epics auto-rolled to done'
+        -> green (\\033[32m)
+      - 'Tasks blocked' -> light red (\\033[91m)
+      - 'Estimated cost so far' -> magenta (\\033[35m)
+
+    Colour is suppressed when stdout is not a TTY (default for pytest)
+    and when NO_COLOR is set.
+    """
+
+    def _seed_report(self, tmp_path: Path) -> str:
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    "2026-03-05T10:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                    "2026-03-05T10:05:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'",
+                ]
+            )
+        )
+        with patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
+            return generate_report(log_path=log_file)
+
+    def test_no_color_when_not_tty(self, tmp_path: Path) -> None:
+        # Pytest captures stdout so isatty() is False -- no escape codes anywhere.
+        report = self._seed_report(tmp_path)
+        assert "\033[" not in report
+
+    def test_no_color_when_no_color_env_set(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("NO_COLOR", "1")
+        with patch("devbench.reporting.report._should_use_color", return_value=False):
+            report = self._seed_report(tmp_path)
+        assert "\033[" not in report
+
+    def test_green_wraps_tasks_completed_row(self, tmp_path: Path) -> None:
+        with patch("devbench.reporting.report._should_use_color", return_value=True):
+            report = self._seed_report(tmp_path)
+        green_lines = [line for line in report.splitlines() if "\033[32m" in line and "Tasks completed" in line]
+        assert green_lines, "Expected at least one green-wrapped row containing 'Tasks completed'"
+        for line in green_lines:
+            assert line.endswith("\033[0m"), f"Coloured line missing reset code: {line!r}"
+
+    def test_light_red_wraps_tasks_blocked_row(self, tmp_path: Path) -> None:
+        with patch("devbench.reporting.report._should_use_color", return_value=True):
+            report = self._seed_report(tmp_path)
+        red_lines = [line for line in report.splitlines() if "\033[91m" in line and "Tasks blocked" in line]
+        assert red_lines, "Expected a light-red-wrapped row containing 'Tasks blocked'"
+        for line in red_lines:
+            assert line.endswith("\033[0m")
+
+    def test_magenta_wraps_estimated_cost_so_far(self, tmp_path: Path) -> None:
+        # Cost row only renders when there's token data; seed a hook log.
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    "2026-03-05T10:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                    "2026-03-05T10:05:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'",
+                ]
+            )
+        )
+        hook_log = tmp_path / "hook-logs.jsonl"
+        hook_log.write_text(
+            '{"timestamp":"2026-03-05T10:04:00Z","event":"PostToolUse","input":{"tool_response":'
+            '{"usage":{"input_tokens":50000}}}}\n'
+        )
+        with (
+            patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.reporting.report._should_use_color", return_value=True),
+        ):
+            report = generate_report(log_path=log_file)
+        magenta_lines = [line for line in report.splitlines() if "\033[35m" in line and "Estimated cost so far" in line]
+        assert magenta_lines, "Expected a magenta-wrapped row containing 'Estimated cost so far'"
+        for line in magenta_lines:
+            assert line.endswith("\033[0m")
+
+    def test_estimated_total_cost_row_is_not_coloured(self, tmp_path: Path) -> None:
+        # User explicitly asked only 'Estimated cost so far' to be magenta;
+        # 'Estimated total cost at completion' must remain plain.
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    "2026-03-05T10:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                    "2026-03-05T10:05:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'",
+                ]
+            )
+        )
+        hook_log = tmp_path / "hook-logs.jsonl"
+        hook_log.write_text(
+            '{"timestamp":"2026-03-05T10:04:00Z","event":"PostToolUse","input":{"tool_response":'
+            '{"usage":{"input_tokens":50000}}}}\n'
+        )
+        with (
+            patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.reporting.report._should_use_color", return_value=True),
+        ):
+            report = generate_report(log_path=log_file)
+        for line in report.splitlines():
+            if "Estimated total cost at completion" in line:
+                assert "\033[" not in line, f"'Estimated total cost at completion' must not be coloured: {line!r}"

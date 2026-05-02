@@ -43,7 +43,9 @@ from __future__ import annotations
 
 import json as _json
 import logging
+import os
 import re
+import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, tzinfo
 from itertools import pairwise
@@ -777,6 +779,50 @@ def _format_local_timestamp(dt: datetime, display_tz: tzinfo | None = None) -> s
     return converted.strftime("%Y-%m-%d %H:%M %Z")
 
 
+# ANSI color codes. Applied AFTER alignment so escape bytes never count
+# toward the visible-width math the table renderers do via len().
+_COLOR_GREEN = "\033[32m"
+_COLOR_RED_LIGHT = "\033[91m"
+_COLOR_MAGENTA = "\033[35m"
+_COLOR_RESET = "\033[0m"
+
+# Map metric labels to ANSI color codes. The renderers wrap the entire
+# row line (borders included) so the colour visually pops while the
+# alignment stays exact.
+_ROW_COLORS: dict[str, str] = {
+    "Tasks completed": _COLOR_GREEN,
+    "Tasks completed in window": _COLOR_GREEN,
+    "Work units done (tasks + auto-rolled stories/features/epics)": _COLOR_GREEN,
+    "Stories / Features / Epics auto-rolled to done": _COLOR_GREEN,
+    "Tasks blocked": _COLOR_RED_LIGHT,
+    "Estimated cost so far": _COLOR_MAGENTA,
+}
+
+
+def _should_use_color() -> bool:
+    """Return True when ANSI colour should be emitted.
+
+    Honours the de-facto NO_COLOR convention (https://no-color.org/) and
+    only emits colour when stdout is a TTY -- pipes / log files stay
+    plain text.
+    """
+    if os.environ.get("NO_COLOR"):
+        return False
+    return sys.stdout.isatty()
+
+
+def _colorize_row(line: str, metric: str) -> str:
+    """Wrap ``line`` with the ANSI colour for ``metric`` when colour is on.
+
+    Returns the line unchanged when the metric has no colour mapping or
+    the runtime environment is not TTY-friendly.
+    """
+    color = _ROW_COLORS.get(metric)
+    if color is None or not _should_use_color():
+        return line
+    return f"{color}{line}{_COLOR_RESET}"
+
+
 def _render_table(title: str, rows: list[tuple[str, str]], value_w: int = 18) -> list[str]:
     """Render a single bordered two-column table (metric | value).
 
@@ -795,7 +841,8 @@ def _render_table(title: str, rows: list[tuple[str, str]], value_w: int = 18) ->
     for i, (metric, value) in enumerate(rows):
         if i > 0:
             lines.append(border_mid)
-        lines.append(f"\u2502 {metric:<{metric_w}} \u2502 {value:>{value_w}} \u2502")
+        row_line = f"\u2502 {metric:<{metric_w}} \u2502 {value:>{value_w}} \u2502"
+        lines.append(_colorize_row(row_line, metric))
     lines.append(border_bot)
     return lines
 
@@ -863,10 +910,11 @@ def _render_multi_column_table(
             # bottom borders of this row still show the regular ┬/┴ junctions
             # so the column boundaries stay visually consistent throughout the
             # table; only the content row's internal │ separators are merged.
-            lines.append(f"\u2502 {metric:<{metric_w}} \u2502 {values:>{spanning_w}} \u2502")
+            row_line = f"\u2502 {metric:<{metric_w}} \u2502 {values:>{spanning_w}} \u2502"
         else:
             cells = [f" {metric:<{metric_w}} "] + [f" {v:>{value_w}} " for v in values]
-            lines.append("\u2502" + "\u2502".join(cells) + "\u2502")
+            row_line = "\u2502" + "\u2502".join(cells) + "\u2502"
+        lines.append(_colorize_row(row_line, metric))
     lines.append(border_bot)
     return lines
 
@@ -941,10 +989,11 @@ def _render_grouped_progress_table(
         lines.append(f"\u2502 {section_label.upper():<{section_w}} \u2502")
         for metric, values in rows:
             if isinstance(values, str):
-                lines.append(f"\u2502 {metric:<{metric_w}} \u2502 {values:>{spanning_w}} \u2502")
+                row_line = f"\u2502 {metric:<{metric_w}} \u2502 {values:>{spanning_w}} \u2502"
             else:
                 cells = [f" {metric:<{metric_w}} "] + [f" {v:>{value_w}} " for v in values]
-                lines.append("\u2502" + "\u2502".join(cells) + "\u2502")
+                row_line = "\u2502" + "\u2502".join(cells) + "\u2502"
+            lines.append(_colorize_row(row_line, metric))
     lines.append(border_bot)
     return lines
 

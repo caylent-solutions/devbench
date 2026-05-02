@@ -198,28 +198,6 @@ class TestTokenCostReport:
         assert "Tokens consumed" in report
         assert "$0.00" in report
 
-    def test_report_cost_footer_mentions_override(self, tmp_path: Path) -> None:
-        log_file = tmp_path / "test.log"
-        log_file.write_text(
-            _make_log(
-                [
-                    "2026-03-05T10:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
-                    "2026-03-05T10:05:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'",
-                ]
-            )
-        )
-        hook_log = tmp_path / "hook-logs.jsonl"
-        hook_log.write_text(
-            '{"timestamp":"2026-03-05T10:04:00Z","event":"PostToolUse","input":{"tool_response":'
-            '{"usage":{"input_tokens":100000}}}}\n'
-        )
-        from unittest.mock import patch
-
-        with patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
-            report = generate_report(log_path=log_file)
-
-        assert "Override per-rate in devbench.yaml under report:" in report
-
 
 class TestEpicsDoneReport:
     """Test report with epics that are done (covers line 92/97: epics list comprehension)."""
@@ -2135,10 +2113,9 @@ class TestThroughputDivergenceWarning:
             mock_cls.return_value.parse_index.return_value = units
             report = generate_report(log_path=log_file)
         assert "WARNING" in report
-        assert "BACKLOG.md reports 3 done task(s)" in report
-        assert "All-time throughput window" in report
+        assert "BACKLOG.md shows 3 done" in report
         assert "JUDGE_LOG_FILE" in report
-        assert "0" in report  # the throughput count
+        assert "shows 0" in report  # the throughput count
 
     def test_warning_silent_when_log_matches_backlog(self, tmp_path: Path) -> None:
         # Log contains the canonical Set...to 'done' line for every backlog

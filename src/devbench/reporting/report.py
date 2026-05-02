@@ -1176,25 +1176,6 @@ def _summary_line(stats: WindowStats, tasks_active: int, tasks_blocked: int) -> 
     )
 
 
-def _cost_basis_line() -> str:
-    return (
-        f"Token cost uses Anthropic's per-token-type pricing: input @ ${TOKEN_COST_PER_M_INPUT:.0f}/M, "
-        f"output @ ${TOKEN_COST_PER_M_OUTPUT:.0f}/M, cache reads @ {REPORT_CACHE_READ_MULTIPLIER:.0%} of input, "
-        f"5-min cache writes @ {REPORT_CACHE_WRITE_5MIN_MULTIPLIER:.0%}, "
-        f"1-hr cache writes @ {REPORT_CACHE_WRITE_1HR_MULTIPLIER:.0%}. "
-        f"Override per-rate in devbench.yaml under report:."
-    )
-
-
-def _windows_explanation() -> str:
-    return (
-        f"Windows: 'All-time' covers the full orchestrator log; 'Session' is the most recent "
-        f"contiguous block of orchestration log entries (boundary = a gap of more than "
-        f"{DEFAULT_SESSION_GAP_MINUTES} minutes). 'This run' (watch mode only) is since "
-        f"the watch loop started. Pass --since <ISO-8601> for a custom window."
-    )
-
-
 @dataclass(frozen=True)
 class _BacklogTotals:
     tasks_total: int
@@ -1649,13 +1630,8 @@ def generate_report(
         if backlog.tasks_done > 0 and all_time_stats.tasks_in_window == 0:
             lines.append("")
             lines.append(
-                f"WARNING: BACKLOG.md reports {backlog.tasks_done} done task(s) but the All-time "
-                f"throughput window in {log_path} found 0. The throughput row counts "
-                "'Set <id> to \\'done\\'' log lines; the backlog row counts the actual "
-                "'Status: done' work-unit files. A non-trivial mismatch usually means "
-                "'devbench report' is reading a different log than the orchestrator writes to. "
-                "Set JUDGE_LOG_FILE in this shell to the orchestrator's log path, or invoke "
-                "'devbench report' from the same env the orchestrator was launched with."
+                f"WARNING: BACKLOG.md shows {backlog.tasks_done} done but log {log_path} shows 0 "
+                "-- check JUDGE_LOG_FILE points at the orchestrator's log."
             )
         # Use the All-time stats for the trailing prose projection -- they're the
         # most stable sample. Narrower windows can have zero completed tasks
@@ -1664,10 +1640,7 @@ def generate_report(
 
     lines.append("")
     lines.append(_summary_line(summary_stats, backlog.tasks_active, backlog.tasks_blocked))
-    if summary_stats.cost.total_cost:
-        lines.append(_cost_basis_line())
     if since is None:
-        lines.append("\n" + _windows_explanation())
         # B9: per-unit listings at the very end so the user can act on each.
         # Order surfaces the most operationally-actionable panels first
         # (In Progress, then Blocked) and pushes long-tail / decision-only

@@ -7876,3 +7876,387 @@ class TestCheckMergeRegistration:
         handler, argc, _help = cli._COMMANDS["check-merge"]
         assert handler is cli.cmd_check_merge
         assert argc == 1
+
+
+# ---------------------------------------------------------------------------
+# Issue #148 / #150 / #152 / #153 / #155 cascade-reliability fixes.
+# Helpers below reuse the lightweight backlog scaffolding pattern from
+# ``TestCmdSyncBlocked`` -- duplicated locally so each test class stays
+# self-contained and a fixture rename never silently breaks one of these.
+# ---------------------------------------------------------------------------
+
+
+def _cascade_build_backlog(
+    tmp_path: Path,
+    rows: list[tuple[str, str, str, str, str, str]],
+) -> Path:
+    """Materialise BACKLOG.md + per-row work-unit files.
+
+    Each row is ``(id, type, status, deps, basename, comments)`` where
+    ``comments`` is appended verbatim to the work-unit Markdown (used to
+    inject ``[BLOCKED_PENDING_PROPOSAL]`` markers + audit lines).
+    """
+    index_lines = [
+        "# Backlog\n",
+        "## Full Work Unit Index\n",
+        "| ID | Title | Type | Status | Dependencies | Repo | File Path |",
+        "|----|-------|------|--------|--------------|------|-----------|",
+    ]
+    wu_dir = tmp_path / "backlog"
+    wu_dir.mkdir(exist_ok=True)
+    for unit_id, unit_type, status, deps, basename, comments in rows:
+        file_path = f"backlog/{basename}.md"
+        index_lines.append(
+            f"| {unit_id} | {unit_id} | {unit_type} | {status} | {deps} | caylent-solutions/test-repo | `{file_path}` |"
+        )
+        wu_body = f"# {unit_id}: Test\n\n## Status: {status}\n\n## Description\n\nx\n"
+        if deps and deps != "None":
+            dep_rows = "\n".join(f"| {d.strip()} | Task | dep |" for d in deps.split(","))
+            wu_body += f"\n## Dependencies\n\n| ID | Type | Reason |\n|----|------|--------|\n{dep_rows}\n"
+        if comments:
+            wu_body += f"\n{comments}"
+        (wu_dir / f"{basename}.md").write_text(wu_body)
+    index_path = tmp_path / "BACKLOG.md"
+    index_path.write_text("\n".join(index_lines) + "\n")
+    return index_path
+
+
+class TestSyncBlockedEvaluatesMarkerTargetState:
+    """Issue #148: ``cmd_sync_blocked`` checks each ``[BLOCKED_PENDING_PROPOSAL]``
+    marker's target status. Stale markers (target already terminal) no longer
+    block the re-queue; only at-least-one non-terminal target keeps the task
+    pinned.
+    """
+
+    def test_marker_target_terminal_allows_requeue(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # T2 carries a marker pointing at T9 which is already done;
+        # sync-blocked must NOT skip on the marker any more.
+        marker_comments = "## Comments\n\n[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T9\n"
+        index = _cascade_build_backlog(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Task", "done", "None", "E0-F1-S1-T1", ""),
+                ("E0-F1-S1-T9", "Task", "done", "None", "E0-F1-S1-T9", ""),
+                ("E0-F1-S1-T2", "Task", "blocked", "E0-F1-S1-T1", "E0-F1-S1-T2", marker_comments),
+            ],
+        )
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_sync_blocked()
+        assert rc == 0
+        envelope = json.loads(capsys.readouterr().out.strip())
+        assert "E0-F1-S1-T2" in envelope["flipped_to_in_queue"]
+        t2 = (tmp_path / "backlog" / "E0-F1-S1-T2.md").read_text()
+        assert "## Status: in-queue" in t2
+        assert "[UNBLOCKED] deps satisfied" in t2
+
+    def test_marker_target_open_skips_requeue(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        marker_comments = "## Comments\n\n[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T9\n"
+        index = _cascade_build_backlog(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Task", "done", "None", "E0-F1-S1-T1", ""),
+                ("E0-F1-S1-T9", "Task", "in-queue", "None", "E0-F1-S1-T9", ""),
+                ("E0-F1-S1-T2", "Task", "blocked", "E0-F1-S1-T1", "E0-F1-S1-T2", marker_comments),
+            ],
+        )
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_sync_blocked()
+        assert rc == 0
+        envelope = json.loads(capsys.readouterr().out.strip())
+        assert "E0-F1-S1-T2" not in envelope["flipped_to_in_queue"]
+        assert "## Status: blocked" in (tmp_path / "backlog" / "E0-F1-S1-T2.md").read_text()
+
+    def test_marker_unknown_id_keeps_task_blocked(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Unknown marker target IDs must remain conservative (treat as open)."""
+        marker_comments = "## Comments\n\n[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T999\n"
+        index = _cascade_build_backlog(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Task", "done", "None", "E0-F1-S1-T1", ""),
+                ("E0-F1-S1-T2", "Task", "blocked", "E0-F1-S1-T1", "E0-F1-S1-T2", marker_comments),
+            ],
+        )
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_sync_blocked()
+        assert rc == 0
+        envelope = json.loads(capsys.readouterr().out.strip())
+        assert "E0-F1-S1-T2" not in envelope["flipped_to_in_queue"]
+
+
+class TestCmdReconcileCascade:
+    """Issue #150: ``devbench reconcile-cascade`` walks every blocked task,
+    flips the eligible ones (markers all terminal AND deps satisfied), and
+    emits ``[CASCADE_RECONCILED]`` audits + a JSON envelope of flips/skips.
+    """
+
+    def test_eligible_task_is_flipped(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        marker = "## Comments\n\n[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T9\n"
+        index = _cascade_build_backlog(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Task", "done", "None", "E0-F1-S1-T1", ""),
+                ("E0-F1-S1-T9", "Task", "done", "None", "E0-F1-S1-T9", ""),
+                ("E0-F1-S1-T2", "Task", "blocked", "E0-F1-S1-T1", "E0-F1-S1-T2", marker),
+            ],
+        )
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_reconcile_cascade()
+        assert rc == 0
+        envelope = json.loads(capsys.readouterr().out.strip())
+        flipped_ids = [item["unit_id"] for item in envelope["flipped"]]
+        assert "E0-F1-S1-T2" in flipped_ids
+        t2 = (tmp_path / "backlog" / "E0-F1-S1-T2.md").read_text()
+        assert "## Status: in-queue" in t2
+        assert "[CASCADE_RECONCILED]" in t2
+
+    def test_open_marker_keeps_task_blocked(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        marker = "## Comments\n\n[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T9\n"
+        index = _cascade_build_backlog(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T9", "Task", "in-progress", "None", "E0-F1-S1-T9", ""),
+                ("E0-F1-S1-T2", "Task", "blocked", "None", "E0-F1-S1-T2", marker),
+            ],
+        )
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_reconcile_cascade()
+        assert rc == 0
+        envelope = json.loads(capsys.readouterr().out.strip())
+        assert envelope["flipped"] == []
+        skips = [item["unit_id"] for item in envelope["skipped"]]
+        assert "E0-F1-S1-T2" in skips
+
+    def test_unsatisfied_regular_dep_keeps_task_blocked(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        index = _cascade_build_backlog(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Task", "in-progress", "None", "E0-F1-S1-T1", ""),
+                ("E0-F1-S1-T2", "Task", "blocked", "E0-F1-S1-T1", "E0-F1-S1-T2", ""),
+            ],
+        )
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_reconcile_cascade()
+        assert rc == 0
+        envelope = json.loads(capsys.readouterr().out.strip())
+        skip_reasons = {item["unit_id"]: item["reason"] for item in envelope["skipped"]}
+        assert "E0-F1-S1-T2" in skip_reasons
+        assert "regular dep" in skip_reasons["E0-F1-S1-T2"]
+
+    def test_registered_in_commands(self) -> None:
+        assert "reconcile-cascade" in cli._COMMANDS
+        handler, argc, _help = cli._COMMANDS["reconcile-cascade"]
+        assert handler is cli.cmd_reconcile_cascade
+        assert argc == 0
+
+
+class TestVariadicCommandsCoverage:
+    """Issue #152: every command whose body parses a ``--<flag> <value>`` pair
+    must be registered in ``_VARIADIC_COMMANDS``. Auto-discover via the
+    registry so adding a new flag-bearing command without registering it
+    fails this test.
+    """
+
+    # Flag tokens that ALWAYS take a value (not boolean toggles). A command's
+    # body that contains ``arg == "--reason"`` (and similar) MUST opt into
+    # variadic dispatch -- the fixed-arity slice would otherwise drop the
+    # value when it follows positional args.
+    FLAG_TOKENS_NEEDING_VARIADIC: ClassVar[tuple[str, ...]] = (
+        '"--reason"',
+        '"--reasoning"',
+        '"--message"',
+    )
+
+    def test_every_flag_with_value_command_is_variadic(self) -> None:
+        import inspect
+
+        offenders: list[str] = []
+        for name, (handler, _argc, _desc) in cli._COMMANDS.items():
+            try:
+                source = inspect.getsource(handler)
+            except (OSError, TypeError):
+                continue
+            if not any(token in source for token in self.FLAG_TOKENS_NEEDING_VARIADIC):
+                continue
+            if name in cli._VARIADIC_COMMANDS:
+                continue
+            offenders.append(name)
+        assert not offenders, (
+            "These commands consume a flag-with-value pair but are NOT registered in "
+            f"_VARIADIC_COMMANDS: {offenders}. The fixed-arity dispatcher slice will "
+            "drop the value, causing silent failures."
+        )
+
+    def test_variadic_set_is_subset_of_commands(self) -> None:
+        """Sanity: every variadic name must reference a real command."""
+        unknown = cli._VARIADIC_COMMANDS - cli._COMMANDS.keys()
+        assert not unknown, f"unknown variadic entries: {unknown}"
+
+
+class TestStatusPanelFiltersStaleBlockedAudits:
+    """Issue #153: ``status --detail`` panel renderer hides ``[BLOCKED]``
+    audit rows that have been superseded by a later ``[UNBLOCKED]`` /
+    ``[CASCADE_RESOLVED]`` line. The audit history in the file is
+    append-only; only the rendered panel filters.
+    """
+
+    def test_unblocked_supersedes_blocked(self) -> None:
+        content = (
+            "## Comments\n\n"
+            "[2026-04-01 10:00 UTC] [agent/x] [BLOCKED] dep T9 not yet terminal\n"
+            "[2026-04-01 11:00 UTC] [agent/x] [UNBLOCKED] deps satisfied\n"
+        )
+        assert cli._unsuperseded_blocked_audits(content) == []
+
+    def test_cascade_resolved_supersedes_blocked(self) -> None:
+        content = (
+            "## Comments\n\n"
+            "[2026-04-01 10:00 UTC] [agent/x] [BLOCKED] waiting on cascade\n"
+            "[2026-04-01 11:00 UTC] [agent/x] [CASCADE_RESOLVED] markers terminal\n"
+        )
+        assert cli._unsuperseded_blocked_audits(content) == []
+
+    def test_blocked_without_supersession_is_kept(self) -> None:
+        content = "## Comments\n\n[2026-04-01 10:00 UTC] [agent/x] [BLOCKED] dep T9 not yet terminal\n"
+        kept = cli._unsuperseded_blocked_audits(content)
+        assert len(kept) == 1
+        assert "[BLOCKED]" in kept[0]
+
+    def test_blocked_pending_proposal_marker_not_treated_as_blocked_audit(self) -> None:
+        """The cascade marker line must not be confused with a plain ``[BLOCKED]`` audit."""
+        content = "## Comments\n\n[2026-04-01 10:00 UTC] [agent/task_factory] [BLOCKED_PENDING_PROPOSAL] T9\n"
+        assert cli._unsuperseded_blocked_audits(content) == []
+
+
+class TestCmdSweepProposalsAutoPromotesPreExisting:
+    """Issue #155: ``cmd_sweep_proposals`` also picks up pre-existing
+    ``proposed`` drafts whose proposal JSON has already been deleted.
+    """
+
+    def test_orphan_proposed_draft_is_auto_promoted(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from devbench.config_loader import RuntimeConfig, TaskFactoryConfig
+
+        # No proposal JSON on disk; the orphan-promote pass should still
+        # surface the proposed draft and flip it to in-queue.
+        index = _cascade_build_backlog(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Task", "in-queue", "None", "E0-F1-S1-T1", ""),
+                ("E0-F1-S1-T2", "Task", "proposed", "None", "E0-F1-S1-T2", ""),
+            ],
+        )
+        # The promoter resolves the draft via _find_draft_file which expects
+        # the layout backlog/E0/E0-F1/E0-F1-S1/<id>.md. Replicate that here
+        # so the auto-promote actually finds the draft.
+        story_dir = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+        (story_dir / "E0-F1-S1-T2.md").write_text("# E0-F1-S1-T2: Test\n\n## Status: proposed\n\n## Description\n\nx\n")
+        # Re-point the BACKLOG.md row to the nested location.
+        idx_text = index.read_text()
+        index.write_text(
+            idx_text.replace(
+                "`backlog/E0-F1-S1-T2.md`",
+                "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T2.md`",
+            )
+        )
+
+        runtime_with_auto_accept = RuntimeConfig(task_factory=TaskFactoryConfig(auto_accept_proposals=True))
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.RUNTIME_CONFIG", runtime_with_auto_accept),
+        ):
+            rc = cli.cmd_sweep_proposals()
+        assert rc == 0
+        # No proposal JSON existed -> the materialise loop is a no-op, so
+        # only the orphan promote pass touches T2.
+        out = capsys.readouterr().out
+        assert "orphan auto-promoted 1" in out
+        # T2 transitioned to in-queue via promote_proposal.
+        t2_md = (story_dir / "E0-F1-S1-T2.md").read_text()
+        assert "## Status: in-queue" in t2_md
+
+    def test_orphan_promote_skipped_when_toggle_off(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from devbench.config_loader import RuntimeConfig, TaskFactoryConfig
+
+        index = _cascade_build_backlog(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Task", "in-queue", "None", "E0-F1-S1-T1", ""),
+                ("E0-F1-S1-T2", "Task", "proposed", "None", "E0-F1-S1-T2", ""),
+            ],
+        )
+        story_dir = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+        (story_dir / "E0-F1-S1-T2.md").write_text("# E0-F1-S1-T2: Test\n\n## Status: proposed\n\n## Description\n\nx\n")
+        idx_text = index.read_text()
+        index.write_text(
+            idx_text.replace(
+                "`backlog/E0-F1-S1-T2.md`",
+                "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T2.md`",
+            )
+        )
+        runtime_no_auto = RuntimeConfig(task_factory=TaskFactoryConfig(auto_accept_proposals=False))
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.RUNTIME_CONFIG", runtime_no_auto),
+        ):
+            rc = cli.cmd_sweep_proposals()
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "orphan auto-promoted" not in out
+        assert "## Status: proposed" in (story_dir / "E0-F1-S1-T2.md").read_text()

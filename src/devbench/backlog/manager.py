@@ -94,6 +94,12 @@ class BacklogManager:
                 ``logging.getLogger("devbench.backlog_manager")`` when omitted.
         """
         self.logger = logger or logging.getLogger("devbench.backlog_manager")
+        # Idempotency guard for the auto-requeue cascade (issue #147). A
+        # ``(backlog_index, unit_id)`` pair is added when the cascade runs;
+        # subsequent ``_set_status`` calls for the same terminal target skip
+        # the scan. The set is per-instance so independent ``BacklogManager``
+        # constructions get their own guard (tests share no state).
+        self._cascade_fired_for: set[tuple[str, str]] = set()
 
     def force_status(
         self,
@@ -264,6 +270,7 @@ class BacklogManager:
         indexed_files = self._check_files_and_statuses(rows, workspace_root, errors)
         self._check_orphans(workspace_root, indexed_files, errors)
         self._check_dependencies(backlog_index, known_ids, errors)
+        self._check_dep_cycles(backlog_index, errors)
         self._check_status_summary(backlog_index, rows, errors)
         self._check_task_content(rows, workspace_root, errors)
         self._check_manifest_path_prefixes(rows, workspace_root, errors)
@@ -349,6 +356,99 @@ class BacklogManager:
                 if dep_id and dep_id.lower() not in DEPENDENCY_NONE_VALUES and dep_id not in known_ids:
                     errors.append(f"{row_id}: dependency '{dep_id}' not found in backlog index")
 
+    def _check_dep_cycles(self, backlog_index: Path, errors: list[str]) -> None:
+        """Issue #151: detect dependency cycles via DFS-with-recursion-stack.
+
+        Walks the dep graph derived from the Full Work Unit Index. A cycle
+        exists when, during DFS, we encounter a node that is currently in
+        the recursion stack (the "gray" set). Self-edges and chains of any
+        length (4-node, N-node) are detected because the recursion-stack
+        membership check is the unique cycle witness.
+
+        Reports one error per cycle, naming the participating node IDs in
+        traversal order so the operator can spot the offending chain. Cycle
+        reporting is normalised: each cycle is rotated to start at its
+        lexicographically smallest ID and reported once even when the DFS
+        encounters it from multiple roots.
+        """
+        graph = self._build_dependency_graph(backlog_index)
+        if not graph:
+            return
+
+        # DFS color tracking: 0 = white (unvisited), 1 = gray (on the
+        # recursion stack -- a back-edge to a gray node is the cycle
+        # witness), 2 = black (fully processed). ``stack`` records the
+        # current DFS chain so we can extract the cycle nodes when a
+        # back-edge fires.
+        color: dict[str, int] = dict.fromkeys(graph, 0)
+        stack: list[str] = []
+        reported: set[tuple[str, ...]] = set()
+
+        def visit(node: str) -> None:
+            color[node] = 1
+            stack.append(node)
+            for nxt in graph.get(node, ()):
+                if nxt not in color:
+                    # Dependency on a non-indexed ID -- already reported by
+                    # _check_dependencies; skip without traversal.
+                    continue
+                if color[nxt] == 1:
+                    # Cycle: rotate so the lexicographically smallest node
+                    # starts the chain, then dedupe.
+                    cycle_start = stack.index(nxt)
+                    cycle = tuple(stack[cycle_start:])
+                    rotation = cycle.index(min(cycle))
+                    normalised = cycle[rotation:] + cycle[:rotation]
+                    if normalised not in reported:
+                        reported.add(normalised)
+                        chain = " -> ".join([*normalised, normalised[0]])
+                        errors.append(f"dependency cycle detected: {chain}")
+                    continue
+                if color[nxt] == 0:
+                    visit(nxt)
+            stack.pop()
+            color[node] = 2
+
+        for node in sorted(graph):
+            if color.get(node) == 0:
+                visit(node)
+
+    def _build_dependency_graph(self, backlog_index: Path) -> dict[str, list[str]]:
+        """Parse the Full Work Unit Index into a ``{id: [dep_id, ...]}`` map.
+
+        Mirrors the parsing scope used by :meth:`_check_dependencies`. Only
+        rows inside the ``## Full Work Unit Index`` section are considered;
+        Status Summary rows have the same cell count and would otherwise
+        pollute the graph.
+        """
+        graph: dict[str, list[str]] = {}
+        if not backlog_index.exists():
+            return graph
+        content = backlog_index.read_text(encoding="utf-8")
+        in_full_index = False
+        for line in content.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("## "):
+                in_full_index = "Full Work Unit Index" in stripped
+                continue
+            if not in_full_index or not stripped.startswith("|"):
+                continue
+            cells = [c.strip() for c in line.split("|")]
+            if len(cells) != BACKLOG_INDEX_CELL_COUNT:
+                continue
+            row_id = cells[1]
+            if not row_id or row_id.lower() == "id" or row_id.startswith("-"):
+                continue
+            dep_cell = cells[5]
+            deps: list[str] = []
+            for raw_dep in dep_cell.split(","):
+                dep_id = raw_dep.strip()
+                if not dep_id or dep_id.lower() in DEPENDENCY_NONE_VALUES:
+                    continue
+                deps.append(dep_id)
+            graph[row_id] = deps
+        return graph
+
     def log_to_traceability_matrix(self, matrix_path: Path, spec_ref: str, test_ref: str) -> None:
         """Append an entry to the traceability matrix.
 
@@ -403,12 +503,24 @@ class BacklogManager:
             canonical,
         )
 
-        if canonical == STATUS_DONE:
-            # Auto-requeue reverse-dependents first so the rollup check that
-            # follows sees any freshly-unblocked children as non-terminal and
-            # correctly declines to promote the parent to done.
-            self._auto_requeue_marker_dependents(backlog_index, unit_id)
-            self._rollup_parent_status(backlog_index, unit_id)
+        if canonical in _TERMINAL_CHILD_STATUSES:
+            # Issue #147: every terminal transition (``done`` AND ``declined``)
+            # fires the auto-requeue cascade. Previously only ``mark_done``
+            # routed through here; ``mark_declined`` / ``force_status declined``
+            # silently skipped the scan, leaving downstream blocked tasks
+            # marooned. The idempotency guard prevents a redundant scan when
+            # the same target is set to the same terminal status twice in
+            # one process lifetime (e.g. via repeated ``set-status`` calls).
+            cascade_key = (str(backlog_index), unit_id)
+            if cascade_key not in self._cascade_fired_for:
+                self._cascade_fired_for.add(cascade_key)
+                # Auto-requeue reverse-dependents first so the rollup check
+                # that follows sees any freshly-unblocked children as
+                # non-terminal and correctly declines to promote the parent
+                # to done.
+                self._auto_requeue_marker_dependents(backlog_index, unit_id)
+            if canonical == STATUS_DONE:
+                self._rollup_parent_status(backlog_index, unit_id)
 
     def _last_round_all_passed(self, work_unit_path: Path) -> bool:
         """Check whether the most recent review round had all required judges pass.
@@ -574,10 +686,14 @@ class BacklogManager:
                 sorted_markers,
             )
             self.force_status(candidate_file, backlog_index, row_id, STATUS_IN_QUEUE)
+            # Issue #153: emit ``[CASCADE_RESOLVED]`` so the status-detail
+            # panel renderer can supersede the earlier ``[BLOCKED]`` audit
+            # row. ``[AUTO_UNBLOCKED]`` is retained alongside for backward
+            # compatibility with operator tooling that already greps for it.
             self._append_agent_comment(
                 candidate_file,
                 "backlog_manager",
-                f"[AUTO_UNBLOCKED] promoted proposals {sorted_markers} are terminal; re-queuing",
+                f"[AUTO_UNBLOCKED] [CASCADE_RESOLVED] promoted proposals {sorted_markers} are terminal; re-queuing",
             )
 
     @staticmethod

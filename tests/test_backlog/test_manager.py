@@ -3419,3 +3419,235 @@ class TestValidateNoPlaceholderManifestRows:
         rows = [("EX-F1-S1-T1", "in-queue", "")]
         manager._check_no_placeholder_manifest_rows(rows, tmp_path, errors)
         assert errors == []
+
+
+class TestAutoRequeueOnDeclineTransition:
+    """Issue #147: ``_set_status`` fires the auto-requeue cascade for every
+    terminal transition (``done`` AND ``declined``), not just ``mark_done``.
+
+    Each test wires a blocked source whose ``[BLOCKED_PENDING_PROPOSAL]``
+    marker references a single dep, drives the dep into the terminal status
+    under test through the corresponding public API, and asserts the source
+    flipped to ``in-queue`` with the cascade audit comment.
+    """
+
+    def _build(self, tmp_path: Path, dep_status: str) -> tuple[Path, Path]:
+        markers = "[2026-04-19 14:00 UTC] [agent/task_factory] [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2\n"
+        src_file = _unit_body(
+            "E0-F1-S1-T1",
+            "blocked",
+            deps=["E0-F1-S1-T2"],
+            comments=markers,
+        )
+        dep_file = _unit_body("E0-F1-S1-T2", dep_status)
+        index = _write_workspace(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Source", "blocked"),
+                ("E0-F1-S1-T2", "Dep", dep_status),
+            ],
+            files={"E0-F1-S1-T1": src_file, "E0-F1-S1-T2": dep_file},
+        )
+        dep_path = tmp_path / "backlog" / "E0-F1-S1-T2.md"
+        return index, dep_path
+
+    def test_mark_declined_cascades_requeue(self, tmp_path: Path) -> None:
+        """``mark_declined`` is a terminal transition and must fire the cascade."""
+        index, dep_path = self._build(tmp_path, "in-queue")
+        BacklogManager().mark_declined(dep_path, index, "E0-F1-S1-T2", "scope changed")
+
+        src = (tmp_path / "backlog" / "E0-F1-S1-T1.md").read_text()
+        assert "## Status: in-queue" in src
+        assert "[CASCADE_RESOLVED]" in src
+
+    def test_set_status_to_declined_cascades(self, tmp_path: Path) -> None:
+        """``force_status -> declined`` exercises the same code path as decline."""
+        index, dep_path = self._build(tmp_path, "in-queue")
+        BacklogManager().force_status(dep_path, index, "E0-F1-S1-T2", "declined")
+
+        src = (tmp_path / "backlog" / "E0-F1-S1-T1.md").read_text()
+        assert "## Status: in-queue" in src
+        assert "[CASCADE_RESOLVED]" in src
+
+    def test_force_status_to_done_cascades(self, tmp_path: Path) -> None:
+        """``force_status -> done`` (legacy path) must continue to cascade."""
+        index, dep_path = self._build(tmp_path, "in-queue")
+        BacklogManager().force_status(dep_path, index, "E0-F1-S1-T2", "done")
+
+        src = (tmp_path / "backlog" / "E0-F1-S1-T1.md").read_text()
+        assert "## Status: in-queue" in src
+        assert "[CASCADE_RESOLVED]" in src
+
+    def test_cascade_idempotent_under_repeat_set_status(self, tmp_path: Path) -> None:
+        """A second ``_set_status`` call to the same terminal target does NOT
+        re-run the cascade. The audit comment count stays at 1."""
+        index, dep_path = self._build(tmp_path, "in-queue")
+        mgr = BacklogManager()
+        mgr.force_status(dep_path, index, "E0-F1-S1-T2", "declined")
+        # First fire updated T1 to in-queue. Calling _set_status again with
+        # the same terminal status must be a no-op cascade-wise even though
+        # the rest of the writes happen.
+        mgr._set_status(dep_path, index, "E0-F1-S1-T2", "declined")
+
+        src = (tmp_path / "backlog" / "E0-F1-S1-T1.md").read_text()
+        assert src.count("[CASCADE_RESOLVED]") == 1
+
+    def test_non_terminal_transition_does_not_cascade(self, tmp_path: Path) -> None:
+        """A transition to ``in-progress`` must not fire the cascade."""
+        index, dep_path = self._build(tmp_path, "in-queue")
+        BacklogManager().force_status(dep_path, index, "E0-F1-S1-T2", "in-progress")
+
+        src = (tmp_path / "backlog" / "E0-F1-S1-T1.md").read_text()
+        # T1 stays blocked; cascade did not run.
+        assert "## Status: blocked" in src
+        assert "[CASCADE_RESOLVED]" not in src
+
+
+class TestSetStatusWritesUnblockedAudit:
+    """Issue #153: when the cascade flips ``blocked -> in-queue`` it writes
+    a ``[CASCADE_RESOLVED]`` audit; sync-blocked separately writes
+    ``[UNBLOCKED] deps satisfied``. Both markers feed the panel renderer
+    supersession filter.
+    """
+
+    def test_cascade_audit_uses_cascade_resolved_tag(self, tmp_path: Path) -> None:
+        markers = "[2026-04-19 14:00 UTC] [agent/task_factory] [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2\n"
+        src_file = _unit_body(
+            "E0-F1-S1-T1",
+            "blocked",
+            deps=["E0-F1-S1-T2"],
+            comments=markers,
+        )
+        dep_file = _unit_body("E0-F1-S1-T2", "done")
+        index = _write_workspace(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Source", "blocked"),
+                ("E0-F1-S1-T2", "Dep", "done"),
+            ],
+            files={"E0-F1-S1-T1": src_file, "E0-F1-S1-T2": dep_file},
+        )
+        BacklogManager()._auto_requeue_marker_dependents(index, "E0-F1-S1-T2")
+
+        src = (tmp_path / "backlog" / "E0-F1-S1-T1.md").read_text()
+        assert "[CASCADE_RESOLVED]" in src
+        assert "[AUTO_UNBLOCKED]" in src  # backward-compatibility tag
+
+
+class TestValidateDepCycle4Node:
+    """Issue #151: validate-backlog rejects N-node dependency cycles via
+    DFS-with-recursion-stack. The 4-node case T1->T2->T3->T4->T1 is the
+    canonical regression: a naive 'has any dep' check would miss it.
+    """
+
+    def _index_with_deps(self, tmp_path: Path, dep_map: dict[str, str]) -> Path:
+        """Build a minimal BACKLOG.md whose Full Index lists the given dep map."""
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        rows = []
+        for unit_id, deps in dep_map.items():
+            rows.append(f"| {unit_id} | T | Task | in-queue | {deps} | example/repo | `backlog/{unit_id}.md` |")
+            (backlog_dir / f"{unit_id}.md").write_text(
+                f"# {unit_id}\n\n## Status: in-queue\n",
+                encoding="utf-8",
+            )
+        index = tmp_path / "BACKLOG.md"
+        index.write_text(
+            "# Backlog\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|-----------|\n" + "\n".join(rows) + "\n",
+            encoding="utf-8",
+        )
+        return index
+
+    def test_4_node_cycle_rejected(self, tmp_path: Path) -> None:
+        index = self._index_with_deps(
+            tmp_path,
+            {
+                "E0-F1-S1-T1": "E0-F1-S1-T4",
+                "E0-F1-S1-T2": "E0-F1-S1-T1",
+                "E0-F1-S1-T3": "E0-F1-S1-T2",
+                "E0-F1-S1-T4": "E0-F1-S1-T3",
+            },
+        )
+        errors: list[str] = []
+        BacklogManager()._check_dep_cycles(index, errors)
+        assert any("cycle" in e for e in errors)
+
+    def test_5_node_cycle_rejected(self, tmp_path: Path) -> None:
+        index = self._index_with_deps(
+            tmp_path,
+            {
+                "E0-F1-S1-T1": "E0-F1-S1-T5",
+                "E0-F1-S1-T2": "E0-F1-S1-T1",
+                "E0-F1-S1-T3": "E0-F1-S1-T2",
+                "E0-F1-S1-T4": "E0-F1-S1-T3",
+                "E0-F1-S1-T5": "E0-F1-S1-T4",
+            },
+        )
+        errors: list[str] = []
+        BacklogManager()._check_dep_cycles(index, errors)
+        assert any("cycle" in e for e in errors)
+
+    def test_4_node_dag_accepted(self, tmp_path: Path) -> None:
+        """T4->T3->T2->T1 (no back edge) must NOT trigger a cycle error."""
+        index = self._index_with_deps(
+            tmp_path,
+            {
+                "E0-F1-S1-T1": "None",
+                "E0-F1-S1-T2": "E0-F1-S1-T1",
+                "E0-F1-S1-T3": "E0-F1-S1-T2",
+                "E0-F1-S1-T4": "E0-F1-S1-T3",
+            },
+        )
+        errors: list[str] = []
+        BacklogManager()._check_dep_cycles(index, errors)
+        assert errors == []
+
+    def test_self_dep_reported(self, tmp_path: Path) -> None:
+        """A 1-node cycle (self-dep) is also caught."""
+        index = self._index_with_deps(tmp_path, {"E0-F1-S1-T1": "E0-F1-S1-T1"})
+        errors: list[str] = []
+        BacklogManager()._check_dep_cycles(index, errors)
+        assert any("cycle" in e for e in errors)
+
+    def test_disjoint_cycle_reported_once(self, tmp_path: Path) -> None:
+        """Two disjoint cycles each report exactly once (no duplicate from re-traversal)."""
+        index = self._index_with_deps(
+            tmp_path,
+            {
+                "E0-F1-S1-T1": "E0-F1-S1-T2",
+                "E0-F1-S1-T2": "E0-F1-S1-T1",
+                "E0-F1-S1-T3": "E0-F1-S1-T4",
+                "E0-F1-S1-T4": "E0-F1-S1-T3",
+            },
+        )
+        errors: list[str] = []
+        BacklogManager()._check_dep_cycles(index, errors)
+        cycle_errors = [e for e in errors if "cycle" in e]
+        assert len(cycle_errors) == 2
+
+    def test_missing_index_no_crash(self, tmp_path: Path) -> None:
+        """The cycle check on a missing BACKLOG.md returns silently."""
+        errors: list[str] = []
+        BacklogManager()._check_dep_cycles(tmp_path / "missing.md", errors)
+        assert errors == []
+
+    def test_summary_row_skipped_when_cell_count_mismatches(self, tmp_path: Path) -> None:
+        """Status Summary rows have a different cell count and must NOT be
+        confused with Full Index rows when building the dependency graph.
+        """
+        index = tmp_path / "BACKLOG.md"
+        index.write_text(
+            "# Backlog\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|-----------|\n"
+            "| short | row | with | wrong-cell-count |\n"
+            "| E0-F1-S1-T1 | T | Task | in-queue | None | r | `backlog/E0-F1-S1-T1.md` |\n",
+            encoding="utf-8",
+        )
+        graph = BacklogManager()._build_dependency_graph(index)
+        assert "E0-F1-S1-T1" in graph
+        assert "short" not in graph

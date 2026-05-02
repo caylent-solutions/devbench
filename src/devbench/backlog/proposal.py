@@ -284,8 +284,23 @@ def classify_blocked_task(
 
     mgr = BacklogManager()
     marker_ids = mgr._extract_pending_proposal_markers(source_file)
+
+    # Issue #149: when markers are absent OR every marker is already terminal
+    # (i.e. the cascade has nothing left to do), regular task-level
+    # dependencies still in flight should keep the task in
+    # AWAITING_AUTO_RECOVERY rather than escalating to NEEDS_OPERATOR_ATTENTION.
+    # Only when the markers are closed AND the regular deps are satisfied
+    # do we surface the task to the operator-attention pile.
+    deps_unsatisfied = _regular_deps_unsatisfied(backlog_root, backlog_index, task_id)
+
     if marker_ids:
-        return _classify_with_markers(mgr, backlog_index, marker_ids)
+        marker_state = _classify_with_markers(mgr, backlog_index, marker_ids)
+        if marker_state is BlockedTaskState.NEEDS_OPERATOR_ATTENTION and deps_unsatisfied:
+            return BlockedTaskState.AWAITING_AUTO_RECOVERY
+        return marker_state
+
+    if deps_unsatisfied:
+        return BlockedTaskState.AWAITING_AUTO_RECOVERY
 
     return _classify_recovery_or_attention(
         source_file=source_file,
@@ -294,6 +309,28 @@ def classify_blocked_task(
         now=now,
         recovery_window_seconds=recovery_window_seconds,
     )
+
+
+def _regular_deps_unsatisfied(backlog_root: Path, backlog_index: Path, task_id: str) -> bool:
+    """Return ``True`` iff ``task_id``'s declared dependencies are NOT all terminal.
+
+    Issue #149: ``classify_blocked_task`` consults this to keep tasks whose
+    regular task-level deps are still running in ``AWAITING_AUTO_RECOVERY``
+    rather than incorrectly promoting them to the operator-attention pile.
+    Falls back to ``False`` (deps satisfied) when the parser cannot load
+    the index -- the broken-index case is reported by validate-backlog and
+    must not generate spurious operator alerts here.
+    """
+    try:
+        parser = BacklogParser(backlog_root=backlog_root, backlog_index=backlog_index)
+        units = parser.parse_index()
+    except (FileNotFoundError, ValueError):
+        return False
+    units_by_id = {u.id: u for u in units}
+    target = units_by_id.get(task_id)
+    if target is None:
+        return False
+    return not BacklogParser._deps_satisfied(target, units_by_id)
 
 
 def _classify_with_markers(

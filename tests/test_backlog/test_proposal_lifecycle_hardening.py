@@ -172,3 +172,142 @@ class TestEnforceCascadeDepth:
         }
         with pytest.raises(ValueError, match="cascade_depth must be >= 0"):
             Proposal.from_dict(bad_payload)
+
+
+class TestClassifyBlockedConsidersRegularDeps:
+    """Issue #149: ``classify_blocked_task`` considers the source task's
+    declared regular dependencies. When the markers are closed/absent AND
+    the regular deps are still in flight (non-terminal), the result must be
+    ``AWAITING_AUTO_RECOVERY`` rather than ``NEEDS_OPERATOR_ATTENTION`` --
+    the cascade owner / orchestrator will requeue the task on the next
+    sweep, no operator action is required.
+    """
+
+    def _build(
+        self,
+        tmp_path,
+        *,
+        regular_deps: list[tuple[str, str]],
+        markers: list[tuple[str, str]],
+    ):
+        """Materialise a workspace where the blocked source task carries the
+        given regular deps + marker entries.
+
+        ``regular_deps`` is a list of ``(dep_id, dep_status)`` tuples that
+        end up as Dependencies-table rows on the source task and as backlog
+        rows. ``markers`` is the same format but the IDs become
+        ``[BLOCKED_PENDING_PROPOSAL]`` markers in Comments.
+        """
+        from pathlib import Path
+
+        backlog_dir: Path = tmp_path / "backlog"
+        story_dir = backlog_dir / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+
+        dep_rows = (
+            "\n".join(f"| {dep_id} | T | {status} |" for dep_id, status in regular_deps)
+            if regular_deps
+            else "| none | | |"
+        )
+        comments = "## Comments\n\n" + "\n".join(
+            f"[2026-04-20 00:00 UTC] [agent/task_factory] [BLOCKED_PENDING_PROPOSAL] {mid}" for mid, _ in markers
+        )
+        source = story_dir / "E0-F1-S1-T1.md"
+        source.write_text(
+            "# E0-F1-S1-T1: Source\n\n## Status: blocked\n\n"
+            "## Description\n\nx\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-1 fixture\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `x.py` | y |\n\n"
+            "## Definition of Done\n\n- [ ] done\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n"
+            f"{dep_rows}\n\n"
+            f"{comments}\n",
+            encoding="utf-8",
+        )
+
+        rows = ["| E0-F1-S1-T1 | Source | Task | blocked | None | r | `backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |"]
+        for dep_id, status in (*regular_deps, *markers):
+            (story_dir / f"{dep_id}.md").write_text(f"# {dep_id}: Marker\n\n## Status: {status}\n", encoding="utf-8")
+            rows.append(f"| {dep_id} | X | Task | {status} | None | r | `backlog/E0/E0-F1/E0-F1-S1/{dep_id}.md` |")
+
+        (tmp_path / "BACKLOG.md").write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n" + "\n".join(rows) + "\n",
+            encoding="utf-8",
+        )
+        return tmp_path
+
+    def test_markers_absent_and_deps_unsatisfied_is_awaiting_recovery(self, tmp_path) -> None:
+        """Case 1: no markers, regular dep still in-progress -> AWAITING."""
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        ws = self._build(
+            tmp_path,
+            regular_deps=[("E0-F1-S1-T2", "in-progress")],
+            markers=[],
+        )
+        state = classify_blocked_task(ws / "backlog", ws / "BACKLOG.md", "E0-F1-S1-T1")
+        assert state is BlockedTaskState.AWAITING_AUTO_RECOVERY
+
+    def test_markers_absent_and_deps_satisfied_is_needs_attention(self, tmp_path) -> None:
+        """Case 2: no markers, all deps terminal -> NEEDS_OPERATOR_ATTENTION."""
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        ws = self._build(
+            tmp_path,
+            regular_deps=[("E0-F1-S1-T2", "done")],
+            markers=[],
+        )
+        state = classify_blocked_task(ws / "backlog", ws / "BACKLOG.md", "E0-F1-S1-T1")
+        assert state is BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+
+    def test_markers_all_terminal_and_deps_unsatisfied_is_awaiting_recovery(self, tmp_path) -> None:
+        """Case 3: all markers terminal but a regular dep in-progress -> AWAITING.
+
+        This is the gap #149 closes: the prior code returned NEEDS_ATTENTION
+        the moment the marker pile was clean, even when the orchestrator
+        was actively waiting on a separate regular dep.
+        """
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        ws = self._build(
+            tmp_path,
+            regular_deps=[("E0-F1-S1-T9", "in-progress")],
+            markers=[("E0-F1-S1-T2", "done")],
+        )
+        state = classify_blocked_task(ws / "backlog", ws / "BACKLOG.md", "E0-F1-S1-T1")
+        assert state is BlockedTaskState.AWAITING_AUTO_RECOVERY
+
+    def test_markers_open_keeps_auto_clearing_regardless_of_deps(self, tmp_path) -> None:
+        """Case 4: any open marker -> AUTO_CLEARING_VIA_PROPOSAL (unchanged)."""
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        ws = self._build(
+            tmp_path,
+            regular_deps=[("E0-F1-S1-T9", "done")],
+            markers=[("E0-F1-S1-T2", "in-queue")],
+        )
+        state = classify_blocked_task(ws / "backlog", ws / "BACKLOG.md", "E0-F1-S1-T1")
+        assert state is BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL
+
+    def test_regular_deps_helper_returns_false_for_unknown_task(self, tmp_path) -> None:
+        """``_regular_deps_unsatisfied`` returns False when the task ID is
+        absent from the parsed index. Builds a real index with one task so
+        the parser succeeds and the ``target is None`` branch is hit.
+        """
+        from devbench.backlog.proposal import _regular_deps_unsatisfied
+
+        ws = self._build(
+            tmp_path,
+            regular_deps=[("E0-F1-S1-T2", "done")],
+            markers=[],
+        )
+        # Query an ID that is NOT in the parsed index.
+        assert _regular_deps_unsatisfied(ws / "backlog", ws / "BACKLOG.md", "E0-F1-S1-T999") is False
+
+    def test_regular_deps_helper_returns_false_when_index_missing(self, tmp_path) -> None:
+        """Missing BACKLOG.md is also treated as deps-satisfied (no false alarm)."""
+        from devbench.backlog.proposal import _regular_deps_unsatisfied
+
+        assert _regular_deps_unsatisfied(tmp_path / "backlog", tmp_path / "missing.md", "E0-F1-S1-T1") is False

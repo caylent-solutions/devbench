@@ -277,7 +277,13 @@ def _print_status_detail(units: list[WorkUnit]) -> None:
         for u in blocked_tasks:
             wu_file = _resolve_unit_file(u)
             content = wu_file.read_text(encoding="utf-8") if wu_file is not None else ""
-            markers = _BLOCKED_PENDING_PROPOSAL_OPEN_RE.findall(content)
+            # Issue #148: walk the markers and surface only non-terminal targets.
+            markers = [
+                marker
+                for marker in _BLOCKED_PENDING_PROPOSAL_MARKER_RE.findall(content)
+                if (target := units_by_id.get(marker)) is None
+                or target.status not in {WorkUnitStatus.DONE, WorkUnitStatus.DECLINED}
+            ]
             unsatisfied = _first_unsatisfied_dep(u, units_by_id)
             note_parts: list[str] = []
             if markers:
@@ -286,6 +292,13 @@ def _print_status_detail(units: list[WorkUnit]) -> None:
                 note_parts.append(f"blocker {unsatisfied}")
             note = ", ".join(note_parts) if note_parts else "no open marker / blocker found"
             print(f"  {u.id} -- {u.title}  ({note})")
+            # Issue #153: surface most-recent unsuperseded ``[BLOCKED]`` audit
+            # so the operator sees WHY the task is blocked. Audits superseded
+            # by a later ``[UNBLOCKED]`` or ``[CASCADE_RESOLVED]`` are filtered
+            # out (the file is append-only; only the rendered panel hides
+            # stale rows).
+            for audit in _unsuperseded_blocked_audits(content):
+                print(f"      {audit}")
 
     held_tasks = sorted(
         (u for u in units if u.unit_type is WorkUnitType.TASK and u.status is WorkUnitStatus.HOLD),
@@ -719,14 +732,16 @@ def cmd_sync_blocked() -> int:
             if wu_file is None:
                 continue
             content = wu_file.read_text(encoding="utf-8")
-            if _BLOCKED_PENDING_PROPOSAL_OPEN_RE.search(content):
-                # An open proposal-pending marker signals that a
-                # human-promoted draft is still resolving; the ADR-07
-                # cascade owns that re-queue path and we must not race
-                # it from here.
+            if _has_open_proposal_marker(content, units_by_id):
+                # Issue #148: only skip when at least one marker target is
+                # still non-terminal. Stale markers pointing at finished
+                # tasks no longer represent active cascade work and must
+                # not pin this task in the blocked panel forever.
                 continue
             manager.force_status(wu_file, BACKLOG_INDEX, unit.id, STATUS_IN_QUEUE)
-            manager._append_comment(wu_file, "UNBLOCKED", "sync-blocked: dependencies now terminal")
+            # Issue #153: ``[UNBLOCKED] deps satisfied`` is the canonical
+            # supersession marker for the panel renderer.
+            manager._append_comment(wu_file, "UNBLOCKED", "deps satisfied; sync-blocked dependencies now terminal")
             flipped_to_in_queue.append(unit.id)
 
     output = {
@@ -739,6 +754,88 @@ def cmd_sync_blocked() -> int:
         len(flipped_to_blocked),
         len(flipped_to_in_queue),
     )
+    return 0
+
+
+def cmd_reconcile_cascade() -> int:
+    """Reconcile every blocked task against marker target + regular dep state.
+
+    Issue #150: the recovery cascade can lose track of blocked tasks when a
+    promoted proposal completes and the auto-requeue trigger never fires
+    (process crash mid-write, missing dependency declaration, etc.). This
+    command walks every blocked task and:
+
+    - Evaluates each ``[BLOCKED_PENDING_PROPOSAL]`` marker target's status
+      via the loaded backlog index.
+    - Evaluates the task's regular dependencies via
+      ``BacklogParser._deps_satisfied``.
+    - Flips a candidate to ``in-queue`` ONLY when every marker target is
+      terminal AND every regular dep is satisfied.
+
+    Each flip writes a ``[CASCADE_RECONCILED]`` audit comment naming the
+    closed marker IDs so the operator can trace why the task moved.
+    Tasks left blocked are reported with the reason (open marker, unknown
+    marker target, unsatisfied dep) so the operator can decide what to do.
+
+    Returns 0 always; output is a JSON envelope listing flips + skips.
+    """
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    units_by_id = {u.id: u for u in units}
+    manager = BacklogManager()
+
+    flipped: list[dict[str, str | list[str]]] = []
+    skipped: list[dict[str, str]] = []
+
+    terminal_statuses = {WorkUnitStatus.DONE, WorkUnitStatus.DECLINED}
+
+    for unit in units:
+        if unit.unit_type is not WorkUnitType.TASK:
+            continue
+        if unit.status is not WorkUnitStatus.BLOCKED:
+            continue
+
+        wu_file = _resolve_unit_file(unit)
+        if wu_file is None:
+            skipped.append({"unit_id": unit.id, "reason": "work-unit file missing"})
+            continue
+
+        content = wu_file.read_text(encoding="utf-8")
+        marker_ids = sorted(set(_BLOCKED_PENDING_PROPOSAL_MARKER_RE.findall(content)))
+
+        # Marker evaluation: every target must be terminal AND known.
+        unresolved_marker = ""
+        for marker in marker_ids:
+            target = units_by_id.get(marker)
+            if target is None:
+                unresolved_marker = f"unknown marker target {marker}"
+                break
+            if target.status not in terminal_statuses:
+                unresolved_marker = f"open marker {marker} ({target.status.value})"
+                break
+        if unresolved_marker:
+            skipped.append({"unit_id": unit.id, "reason": unresolved_marker})
+            continue
+
+        # Regular-dep evaluation.
+        if not BacklogParser._deps_satisfied(unit, units_by_id):
+            unsatisfied = _first_unsatisfied_dep(unit, units_by_id)
+            reason = f"regular dep not yet terminal: {unsatisfied}" if unsatisfied else "regular deps unsatisfied"
+            skipped.append({"unit_id": unit.id, "reason": reason})
+            continue
+
+        manager.force_status(wu_file, BACKLOG_INDEX, unit.id, STATUS_IN_QUEUE)
+        message = (
+            f"[CASCADE_RECONCILED] markers {marker_ids} terminal and regular deps satisfied; re-queuing"
+            if marker_ids
+            else "[CASCADE_RECONCILED] regular deps satisfied; re-queuing"
+        )
+        manager._append_agent_comment(wu_file, "backlog_manager", message)
+        flipped.append({"unit_id": unit.id, "closed_markers": marker_ids})
+
+    output = {"flipped": flipped, "skipped": skipped}
+    print(json.dumps(output))
+    logger.info("reconcile-cascade: %d flipped, %d skipped", len(flipped), len(skipped))
     return 0
 
 
@@ -772,7 +869,67 @@ def _first_unsatisfied_dep(unit: WorkUnit, units_by_id: dict[str, WorkUnit]) -> 
     return ""
 
 
-_BLOCKED_PENDING_PROPOSAL_OPEN_RE: re.Pattern[str] = re.compile(r"\[BLOCKED_PENDING_PROPOSAL\]\s+(\S+)")
+_BLOCKED_PENDING_PROPOSAL_MARKER_RE: re.Pattern[str] = re.compile(r"\[BLOCKED_PENDING_PROPOSAL\]\s+(\S+)")
+
+# Captures the audit-comment classifier tag (``[BLOCKED]`` / ``[UNBLOCKED]`` /
+# ``[CASCADE_RESOLVED]``). Used by ``_unsuperseded_blocked_audits`` to walk
+# the Comments section in chronological order and drop ``[BLOCKED]`` rows
+# that have been superseded by a later positive transition.
+_BLOCKED_AUDIT_LINE_RE: re.Pattern[str] = re.compile(r"\[(?P<tag>BLOCKED|UNBLOCKED|CASCADE_RESOLVED)\](?P<rest>[^\n]*)")
+
+
+def _unsuperseded_blocked_audits(content: str) -> list[str]:
+    """Return ``[BLOCKED]`` audit text lines that have NOT been superseded
+    by a later ``[UNBLOCKED]`` or ``[CASCADE_RESOLVED]`` row.
+
+    Issue #153: the audit history in the file stays append-only -- only the
+    rendered status panel hides stale ``[BLOCKED]`` rows when a positive
+    transition has subsequently fired. Walks the file linearly so the
+    chronological ordering of the Comments section drives supersession
+    (a ``[BLOCKED]`` followed by ``[UNBLOCKED]`` is stale; a ``[BLOCKED]``
+    followed by another ``[BLOCKED]`` is the live cause).
+
+    Excludes ``[BLOCKED_PENDING_PROPOSAL]`` marker rows so cascade markers
+    are NOT mistaken for plain ``[BLOCKED]`` audit lines.
+    """
+    pending_audits: list[str] = []
+    for line in content.splitlines():
+        if "[BLOCKED_PENDING_PROPOSAL]" in line:
+            continue
+        match = _BLOCKED_AUDIT_LINE_RE.search(line)
+        if match is None:
+            continue
+        tag = match.group("tag")
+        if tag == "BLOCKED":
+            pending_audits.append(line.strip())
+        else:
+            # UNBLOCKED / CASCADE_RESOLVED supersedes every prior BLOCKED.
+            pending_audits = []
+    return pending_audits
+
+
+def _has_open_proposal_marker(content: str, units_by_id: dict[str, WorkUnit]) -> bool:
+    """Return ``True`` iff ``content`` carries at least one ``[BLOCKED_PENDING_PROPOSAL]``
+    marker whose target task is still non-terminal.
+
+    Issue #148: the prior ``_BLOCKED_PENDING_PROPOSAL_OPEN_RE`` regex flagged
+    every marker as "open" -- including markers whose target had already
+    completed. That left blocked tasks marooned because the sync-blocked
+    sweep treated stale markers as live cascade activity and refused to
+    re-queue. The walker resolves each marker target via ``units_by_id`` and
+    returns ``True`` only when at least one target is in a non-terminal
+    status (anything other than ``done`` / ``declined``). Unknown target
+    IDs (rejected drafts whose backlog row was removed) count as
+    non-terminal so the cascade owner stays in charge of clearing them.
+    """
+    terminal = {WorkUnitStatus.DONE, WorkUnitStatus.DECLINED}
+    for marker in _BLOCKED_PENDING_PROPOSAL_MARKER_RE.findall(content):
+        target = units_by_id.get(marker)
+        if target is None:
+            return True
+        if target.status not in terminal:
+            return True
+    return False
 
 
 def _parse_id_and_reason(argv: tuple[str, ...] | list[str], command_name: str) -> tuple[str, str] | int:
@@ -3437,7 +3594,13 @@ def cmd_sweep_proposals() -> int:
     promote-proposal / reject-proposal.
     """
     proposals = list_proposals(WORKSPACE_ROOT)
-    if not proposals:
+    auto_accept = RUNTIME_CONFIG.task_factory.auto_accept_proposals
+
+    # Issue #155: when no proposal JSONs AND auto-accept is off, fast-exit
+    # before parsing the backlog so the legacy "nothing to do" message is
+    # preserved. When auto-accept is on we still need to load the index so
+    # the orphan auto-promote pass below can run.
+    if not proposals and not auto_accept:
         print("sweep-proposals: nothing to do (no proposal JSONs on disk)")
         return 0
 
@@ -3450,95 +3613,148 @@ def cmd_sweep_proposals() -> int:
         print(f"ERROR: cannot read backlog index: {exc}", file=sys.stderr)
         return 1
     unit_by_id = {u.id: u for u in units}
-
-    auto_accept = RUNTIME_CONFIG.task_factory.auto_accept_proposals
     # ADR-11 audit suffix written on every auto-promoted draft's Comments
     # so a reviewer can tell at a glance that no human pressed the button.
     auto_audit_suffix = "(auto-accepted via task_factory.auto_accept_proposals=true)"
 
     touched = 0
     for proposal in proposals:
-        # Pre-classify so we can (a) take a fast-path no-op when every task
-        # is already resolved, without even touching the backlog parser,
-        # and (b) report "N new, M skipped" accurately.
-        # materialise_proposal itself is idempotent and classify-aware
-        # (ADR-09), so calling it unconditionally is safe.
-        pre_states = {
-            task.suggested_id: classify_proposed_task(BACKLOG_ROOT, WORKSPACE_ROOT, task.suggested_id)
-            for task in proposal.proposed_tasks
-        }
-        unmaterialised_before = sum(1 for state in pre_states.values() if state is ProposalTaskState.UNMATERIALISED)
-        proposed_before = sum(1 for state in pre_states.values() if state is ProposalTaskState.PROPOSED)
-        needs_materialise = unmaterialised_before > 0
-        needs_auto_promote = auto_accept and (unmaterialised_before > 0 or proposed_before > 0)
+        touched += _sweep_one_proposal(
+            proposal=proposal,
+            unit_by_id=unit_by_id,
+            auto_accept=auto_accept,
+            auto_audit_suffix=auto_audit_suffix,
+        )
 
-        if not needs_materialise and not needs_auto_promote:
-            # Every task in this proposal is already resolved (promoted,
-            # done, declined, or rejected). Nothing for the sweep to do.
-            print(f"sweep-proposals: no-op {proposal.source_task_id}")
-            continue
-
-        source_unit = unit_by_id.get(proposal.source_task_id)
-        if source_unit is None:
-            print(
-                f"sweep-proposals: skipped {proposal.source_task_id}: source not found in backlog index",
-                file=sys.stderr,
-            )
-            continue
-
-        drafts: list[Path] = []
-        if needs_materialise:
-            try:
-                drafts = materialise_proposal(
-                    workspace_root=WORKSPACE_ROOT,
-                    backlog_root=BACKLOG_ROOT,
-                    backlog_index=BACKLOG_INDEX,
-                    proposal=proposal,
-                    repo=source_unit.repo,
-                )
-            except ProposalError as exc:
-                # Soft failure: safety guard (unresolved prior proposed tasks),
-                # thin-approach refusal, etc. Log and continue.
-                print(f"sweep-proposals: skipped {proposal.source_task_id}: {exc}")
-                continue
-
-        # ADR-11 auto-accept: once materialise has run (or when the flag was
-        # flipped on after earlier drafts already materialised), promote every
-        # task currently in PROPOSED state. promote_proposal is idempotent --
-        # a task in any other state is skipped by the per-task classify guard
-        # below, so re-running the sweep causes no duplicate marker writes.
-        auto_promoted = 0
-        if auto_accept:
-            for task in proposal.proposed_tasks:
-                state = classify_proposed_task(BACKLOG_ROOT, WORKSPACE_ROOT, task.suggested_id)
-                if state is not ProposalTaskState.PROPOSED:
-                    continue
-                try:
-                    promote_proposal(
-                        workspace_root=WORKSPACE_ROOT,
-                        backlog_root=BACKLOG_ROOT,
-                        backlog_index=BACKLOG_INDEX,
-                        task_id=task.suggested_id,
-                        audit_suffix=auto_audit_suffix,
-                    )
-                    auto_promoted += 1
-                except ProposalError as exc:
-                    # Soft failure per draft; other drafts in the same
-                    # proposal still get a promote attempt.
-                    print(
-                        f"sweep-proposals: auto-promote failed for {task.suggested_id}: {exc}",
-                        file=sys.stderr,
-                    )
-
-        skipped_count = len(proposal.proposed_tasks) - len(drafts)
-        touched += len(drafts)
-        line = f"sweep-proposals: materialised {proposal.source_task_id}: {len(drafts)} new, {skipped_count} skipped"
-        if auto_accept:
-            line += f" (auto-promoted: {auto_promoted})"
-        print(line)
+    # Issue #155: extend the auto-promote pass to also pick up pre-existing
+    # ``proposed`` drafts whose proposal JSON no longer exists (operator
+    # deleted it, or sweep skipped it earlier). The first pass above only
+    # iterates over JSONs on disk; this second pass walks the full backlog
+    # index and promotes any ``proposed`` task whose source carries the
+    # auto-accept toggle.
+    if auto_accept:
+        orphan_promoted = _auto_promote_orphan_proposed_drafts(units, auto_audit_suffix)
+        if orphan_promoted:
+            print(f"sweep-proposals: orphan auto-promoted {orphan_promoted} pre-existing proposed draft(s)")
 
     logger.info("sweep-proposals touched %d draft(s) across %d proposal(s)", touched, len(proposals))
     return 0
+
+
+def _sweep_one_proposal(
+    *,
+    proposal: Proposal,
+    unit_by_id: dict[str, WorkUnit],
+    auto_accept: bool,
+    auto_audit_suffix: str,
+) -> int:
+    """Materialise + (optionally) auto-promote a single proposal JSON.
+
+    Extracted from ``cmd_sweep_proposals`` so the dispatcher body stays
+    under ruff's PLR0912 branch ceiling. Returns the number of new drafts
+    created on this call (used to drive the ``touched`` counter).
+    """
+    pre_states = {
+        task.suggested_id: classify_proposed_task(BACKLOG_ROOT, WORKSPACE_ROOT, task.suggested_id)
+        for task in proposal.proposed_tasks
+    }
+    unmaterialised_before = sum(1 for state in pre_states.values() if state is ProposalTaskState.UNMATERIALISED)
+    proposed_before = sum(1 for state in pre_states.values() if state is ProposalTaskState.PROPOSED)
+    needs_materialise = unmaterialised_before > 0
+    needs_auto_promote = auto_accept and (unmaterialised_before > 0 or proposed_before > 0)
+
+    if not needs_materialise and not needs_auto_promote:
+        print(f"sweep-proposals: no-op {proposal.source_task_id}")
+        return 0
+
+    source_unit = unit_by_id.get(proposal.source_task_id)
+    if source_unit is None:
+        print(
+            f"sweep-proposals: skipped {proposal.source_task_id}: source not found in backlog index",
+            file=sys.stderr,
+        )
+        return 0
+
+    drafts: list[Path] = []
+    if needs_materialise:
+        try:
+            drafts = materialise_proposal(
+                workspace_root=WORKSPACE_ROOT,
+                backlog_root=BACKLOG_ROOT,
+                backlog_index=BACKLOG_INDEX,
+                proposal=proposal,
+                repo=source_unit.repo,
+            )
+        except ProposalError as exc:
+            print(f"sweep-proposals: skipped {proposal.source_task_id}: {exc}")
+            return 0
+
+    auto_promoted = 0
+    if auto_accept:
+        for task in proposal.proposed_tasks:
+            state = classify_proposed_task(BACKLOG_ROOT, WORKSPACE_ROOT, task.suggested_id)
+            if state is not ProposalTaskState.PROPOSED:
+                continue
+            try:
+                promote_proposal(
+                    workspace_root=WORKSPACE_ROOT,
+                    backlog_root=BACKLOG_ROOT,
+                    backlog_index=BACKLOG_INDEX,
+                    task_id=task.suggested_id,
+                    audit_suffix=auto_audit_suffix,
+                )
+                auto_promoted += 1
+            except ProposalError as exc:
+                print(
+                    f"sweep-proposals: auto-promote failed for {task.suggested_id}: {exc}",
+                    file=sys.stderr,
+                )
+
+    skipped_count = len(proposal.proposed_tasks) - len(drafts)
+    line = f"sweep-proposals: materialised {proposal.source_task_id}: {len(drafts)} new, {skipped_count} skipped"
+    if auto_accept:
+        line += f" (auto-promoted: {auto_promoted})"
+    print(line)
+    return len(drafts)
+
+
+def _auto_promote_orphan_proposed_drafts(units: list[WorkUnit], audit_suffix: str) -> int:
+    """Promote every ``proposed`` task whose source has ``auto_accept_proposals``.
+
+    Issue #155: ``cmd_sweep_proposals`` historically only promoted drafts
+    referenced by a live proposal JSON. Drafts whose JSON has been deleted
+    (e.g. archived after a partial sweep) were marooned in the ``proposed``
+    state forever. This helper closes the gap by walking the full backlog
+    index and promoting every ``proposed`` task. Idempotent: per-draft
+    classify guard inside ``promote_proposal`` is the source of truth, so
+    re-runs cause no duplicate marker writes.
+
+    Returns the count of drafts successfully promoted.
+    """
+    promoted = 0
+    for unit in units:
+        if unit.unit_type is not WorkUnitType.TASK:
+            continue
+        if unit.status is not WorkUnitStatus.PROPOSED:
+            continue
+        state = classify_proposed_task(BACKLOG_ROOT, WORKSPACE_ROOT, unit.id)
+        if state is not ProposalTaskState.PROPOSED:
+            continue
+        try:
+            promote_proposal(
+                workspace_root=WORKSPACE_ROOT,
+                backlog_root=BACKLOG_ROOT,
+                backlog_index=BACKLOG_INDEX,
+                task_id=unit.id,
+                audit_suffix=audit_suffix,
+            )
+            promoted += 1
+        except ProposalError as exc:
+            print(
+                f"sweep-proposals: orphan auto-promote failed for {unit.id}: {exc}",
+                file=sys.stderr,
+            )
+    return promoted
 
 
 def _enforce_materialise_lifecycle_gates(source_task_id: str, proposal: Proposal) -> int:
@@ -4530,6 +4746,15 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
             "in-queue with unsatisfied deps -> blocked; blocked with all deps "
             "now terminal -> in-queue (skipping units with open "
             "[BLOCKED_PENDING_PROPOSAL] markers, which the ADR-07 cascade owns)."
+        ),
+    ),
+    "reconcile-cascade": (
+        cmd_reconcile_cascade,
+        0,
+        (
+            "Walk every blocked task; flip eligible ones (markers all terminal "
+            "AND regular deps satisfied) to in-queue with a [CASCADE_RECONCILED] "
+            "audit. Returns JSON envelope of flips + skips."
         ),
     ),
     "new-task": (

@@ -174,6 +174,19 @@ orchestrate:
 report:
   # Defaults match Opus 4.7 list pricing. Set explicitly only when running a
   # different model or when your contract has a different rate structure.
+  #
+  # Calibration guidance:
+  # The reported cost should equal actual API billing within ~1%. If reported
+  # cost drifts from actual (e.g., model swap, 1M-context premium tier, or
+  # non-list contract pricing), derive a correction factor from a recent run:
+  #     correction = actual_billing / reported_cost
+  # Multiply BOTH per-million rates below by that factor; the input/output
+  # ratio is preserved and the cache-read / cache-write / data-residency
+  # multipliers below compose correctly on top of the corrected base rate.
+  #
+  # NOTE: `token_cost_discount` (below) only DECREASES reported cost, so it is
+  # the wrong knob for under-reporting. Always correct upward via the per-
+  # million rates above.
   token_cost_per_million_input: 5.0
   token_cost_per_million_output: 25.0
   # Contract discount off list price as a fraction in [0.0, 1.0].

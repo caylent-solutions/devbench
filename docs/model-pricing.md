@@ -52,6 +52,32 @@ Cache-write tokens are read from the nested `usage.cache_creation.ephemeral_5m_i
 
 ---
 
+## Calibrating cost rates against actual billing
+
+The reported cost should equal actual API billing within ~1%. If the report drifts from the actual invoice (model swap, 1M-context premium tier, contract pricing, region surcharge, or any other rate variant), recalibrate by deriving a correction factor from a recent run:
+
+```
+correction_factor = actual_billing / reported_cost
+```
+
+Multiply BOTH `report.token_cost_per_million_input` and `report.token_cost_per_million_output` in `backlog/config/devbench.yaml` by the correction factor. The input/output ratio is preserved, and the cache-read / cache-write / data-residency / fast-mode multipliers compose correctly on top of the corrected base rate.
+
+**Worked example.** A live workspace running Opus 4.7 with 1M-context observed actual API spend of `$83.66` against `devbench report` reading `$39.57` for the same window:
+
+```
+correction_factor = 83.66 / 39.57 = 2.114
+new input rate    = 5.0  * 2.114 = 10.57
+new output rate   = 25.0 * 2.114 = 52.86
+```
+
+Edit and re-run `devbench report` once on the same log window; the new value should match actual within rounding.
+
+**Why not use `token_cost_discount`?** The discount field is constrained to `[0.0, 1.0]` and only DECREASES reported cost (`final = list * (1 - discount)`). It cannot fix under-reporting. Always correct upward via the per-million rates. If your contract has a real discount on top of list, set `token_cost_discount` to the contract value AND ensure the per-million rates already match list price for your model.
+
+**When to recalibrate.** Re-derive the factor whenever any of these change: `JUDGE_CLAUDE_MODEL`, the workspace's context-tier (200k vs 1M), the orchestrator's cache-hit profile (since reported cost depends on the cache-write-rate-vs-cache-read mix), Anthropic's published list pricing, or your contract terms.
+
+---
+
 ## Standard pricing (per 1M tokens, USD)
 
 | Model            | Input | Output | Cache read | 5-min cache write | 1-hr cache write |

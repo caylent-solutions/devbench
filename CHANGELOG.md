@@ -134,6 +134,17 @@ since the last release. PR #119 carries every change.
 
 ### Changed
 
+- **Cost-rate calibration guidance** added to `sample-config.yaml`
+  `report:` block + new "Calibrating cost rates against actual billing"
+  section in `docs/model-pricing.md`. Operators with non-default model /
+  context-tier / contract-pricing combinations now have a documented
+  worked example for deriving `token_cost_per_million_input` /
+  `_output` from actual API billing
+  (`correction_factor = actual_billing / reported_cost`; multiply both
+  rates). The `token_cost_discount` field is documented as wrong-
+  direction for under-reporting (it only decreases reported cost, so
+  cannot fix cases where reported is below actual). No behaviour
+  change in the cost-computation code.
 - **Transitive dep chains accepted by Manifest Conflict validator**
   (issue #145). Previously the validator required `N*(N-1)/2` direct
   dep edges between N claimants of the same Manifest path; now any DAG

@@ -24,6 +24,15 @@
 
 set -euo pipefail
 
+# Prefer system /usr/bin python3 over asdf shims. asdf shims fail with exit 126
+# when the caller's cwd does not declare a `python` entry in `.tool-versions`,
+# which is true for every test fixture using a tmp_path workspace and for any
+# operator running this hook from a directory without an asdf python pin. The
+# old behaviour silently swallowed the asdf exit, leaving CONTENT empty and
+# bypassing rules 10 + 11 -- a real-bug source. Fix: prepend /usr/bin so the
+# system python3 (always present on Linux dev containers / CI) wins resolution.
+PATH="/usr/bin:$PATH"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=_hook_lib.sh
 . "$SCRIPT_DIR/_hook_lib.sh"

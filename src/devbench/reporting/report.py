@@ -65,6 +65,7 @@ from devbench.config import (
     REPORT_DATA_RESIDENCY_MULTIPLIER,
     REPORT_DISPLAY_TIMEZONE,
     REPORT_FAST_MODE_MULTIPLIER,
+    STOP_HOOK_WINDOW_SECONDS,
     TOKEN_COST_DISCOUNT,
     TOKEN_COST_PER_M_INPUT,
     TOKEN_COST_PER_M_OUTPUT,
@@ -793,6 +794,7 @@ def _format_local_timestamp(dt: datetime, display_tz: tzinfo | None = None) -> s
 # toward the visible-width math the table renderers do via len().
 _COLOR_GREEN = "\033[32m"
 _COLOR_RED_LIGHT = "\033[91m"
+_COLOR_YELLOW = "\033[33m"
 _COLOR_MAGENTA = "\033[35m"
 _COLOR_RESET = "\033[0m"
 
@@ -829,6 +831,118 @@ def _colorize_row(line: str, metric: str) -> str:
     """
     color = _ROW_COLORS.get(metric)
     if color is None or not _should_use_color():
+        return line
+    return f"{color}{line}{_COLOR_RESET}"
+
+
+def _format_duration(seconds: float) -> str:
+    """Render a wall-clock duration in human-friendly form (issue #158).
+
+    Output forms: ``42s``, ``23m``, ``1h 47m``, ``2d 3h``. Negative
+    inputs collapse to ``0s`` so a clock-skew artefact never raises.
+    """
+    s = max(0, int(seconds))
+    if s < 60:
+        return f"{s}s"
+    minutes = s // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    rem_min = minutes % 60
+    if hours < 24:
+        return f"{hours}h {rem_min}m"
+    days = hours // 24
+    rem_hours = hours % 24
+    return f"{days}d {rem_hours}h"
+
+
+_LIVENESS_TAIL_BYTES = 4096
+
+
+def _read_last_log_timestamp(log_path: Path) -> datetime | None:
+    """Tail-read the last parseable log timestamp without loading the whole file.
+
+    Reads at most the trailing ``_LIVENESS_TAIL_BYTES`` of ``log_path`` and
+    returns the parsed timestamp of the last log line in that window.
+    Returns ``None`` when the file is missing, empty, or contains no
+    parseable log line in the tail window.
+    """
+    if not log_path.is_file():
+        return None
+    try:
+        size = log_path.stat().st_size
+    except OSError:
+        return None
+    if size == 0:
+        return None
+    try:
+        with log_path.open("rb") as f:
+            if size > _LIVENESS_TAIL_BYTES:
+                f.seek(-_LIVENESS_TAIL_BYTES, os.SEEK_END)
+            tail = f.read()
+    except OSError:
+        return None
+    text = tail.decode("utf-8", errors="replace")
+    matches = list(_LOG_LINE_RE.finditer(text))
+    if not matches:
+        return None
+    return _parse_ts(matches[-1].group(1))
+
+
+def _orchestrator_liveness_banner(
+    log_path: Path,
+    session_id: str | None,
+    threshold_seconds: int,
+    *,
+    display_tz: tzinfo | None = None,
+    now: datetime | None = None,
+) -> str:
+    """Render a one-line orchestrator-alive status banner (issue #161).
+
+    Three states derived from log-activity recency:
+      * **ALIVE** (green) -- last log line within ``threshold_seconds``.
+      * **STOPPED** (red) -- last log line older than ``threshold_seconds``.
+        Banner includes the elapsed-since duration and last-seen timestamp.
+      * **STARTING** (yellow) -- log file missing or empty.
+
+    Boundary: a delta exactly equal to ``threshold_seconds`` is ALIVE; one
+    second past is STOPPED. ANSI colour is emitted only when stdout is a
+    TTY and ``NO_COLOR`` is unset (mirrors ``_should_use_color``); pipes
+    and CI redirects receive plain text.
+
+    The threshold is sourced by callers from ``stop_hook.window_seconds``
+    so the banner stays aligned with the operator's already-tuned
+    circuit-breaker quiet window.
+
+    Args:
+        log_path: Path to the structured orchestrator log.
+        session_id: Optional ``JUDGE_ORCHESTRATOR_SESSION_ID`` value. When
+            empty/None, the banner suppresses the trailing
+            ``-- session ...`` suffix.
+        threshold_seconds: Quiet-window cap. ``stop_hook.window_seconds``.
+        display_tz: Display-timezone for the STOPPED-state last-seen
+            timestamp. ``None`` falls back to system local.
+        now: Override for the current wall-clock (test injection point).
+    """
+    current = now if now is not None else datetime.now(UTC)
+    last_ts = _read_last_log_timestamp(log_path)
+    suffix = f" -- session {session_id}" if session_id else ""
+
+    if last_ts is None:
+        body = "[ORCHESTRATOR STARTING] log file empty; no activity recorded yet"
+        color = _COLOR_YELLOW
+    else:
+        delta = max(0.0, (current - last_ts).total_seconds())
+        if delta <= threshold_seconds:
+            body = f"[ORCHESTRATOR ALIVE] last activity {_format_duration(delta)} ago"
+            color = _COLOR_GREEN
+        else:
+            seen = _format_local_timestamp(last_ts, display_tz)
+            body = f"[ORCHESTRATOR STOPPED] no activity for {_format_duration(delta)} (last seen {seen})"
+            color = _COLOR_RED_LIGHT
+
+    line = body + suffix
+    if not _should_use_color():
         return line
     return f"{color}{line}{_COLOR_RESET}"
 
@@ -1656,6 +1770,20 @@ def generate_report(
     units = parser.parse_index()
     backlog = _backlog_totals_from_units(units)
 
+    # Operator-alive banner (issue #161). Prepended to every render so
+    # ``devbench report --watch N`` shows liveness state on every tick.
+    # Threshold reuses ``stop_hook.window_seconds`` -- the same quiet
+    # window the circuit-breaker tolerates -- so the banner stays aligned
+    # with the operator's already-tuned cadence.
+    session_id = os.environ.get("JUDGE_ORCHESTRATOR_SESSION_ID", "").strip() or None
+    banner_display_tz = _resolve_display_timezone(REPORT_DISPLAY_TIMEZONE or DISPLAY_TIMEZONE)
+    banner_line = _orchestrator_liveness_banner(
+        log_path=log_path,
+        session_id=session_id,
+        threshold_seconds=STOP_HOOK_WINDOW_SECONDS,
+        display_tz=banner_display_tz,
+    )
+
     log_text = log_path.read_text(encoding="utf-8") if log_path.is_file() else ""
 
     done_times: dict[str, datetime] = {}
@@ -1692,7 +1820,7 @@ def generate_report(
         else None
     )
 
-    lines: list[str] = []
+    lines: list[str] = [banner_line, ""]
 
     if since is not None:
         # Single-window mode (legacy API for callers passing --since explicitly).

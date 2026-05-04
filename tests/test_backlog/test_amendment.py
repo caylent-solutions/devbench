@@ -573,17 +573,16 @@ class TestAppendAuditComment:
 
 
 class TestAmenderRejectionPersistsFeedbackJson:
-    """Issue #154: every ``reject_amendment`` call writes a structured
-    feedback JSON to ``.devbench/amender-rejections/<task-id>-<n>.json``.
-
-    The blocker-resolver / executor-feedback collector reads these on
-    retry to decide what fix proposal to emit; the schema is part of the
-    contract, so the test pins the field set + the category-detection
-    heuristic.
+    """Issue #154 + #156: every ``reject_amendment`` call writes a
+    structured feedback JSON. As of #156 the path is shared with the
+    other review judges at
+    ``.devbench/review-failures/<task-id>-manifest_amender-<n>.json``;
+    the legacy ``.devbench/amender-rejections/`` directory remains as a
+    forward-compat read path tested separately below.
     """
 
     def test_rejection_writes_structured_json(self, tmp_workspace: Path) -> None:
-        from devbench.backlog.amendment import AMENDER_REJECTIONS_DIR_NAME
+        from devbench.backlog.amendment import REVIEW_FAILURES_DIR_NAME
 
         task_id = "EX-F1-S1-T1"
         write_request(tmp_workspace, _sample_request(task_id))
@@ -594,47 +593,45 @@ class TestAmenderRejectionPersistsFeedbackJson:
             "SCOPE: amendment is out of scope for this task",
         )
 
-        archive_dir = tmp_workspace / AMENDER_REJECTIONS_DIR_NAME
+        archive_dir = tmp_workspace / REVIEW_FAILURES_DIR_NAME
         assert archive_dir.is_dir()
-        json_files = sorted(archive_dir.glob(f"{task_id}-*.json"))
+        json_files = sorted(archive_dir.glob(f"{task_id}-manifest_amender-*.json"))
         assert len(json_files) == 1
         payload = json.loads(json_files[0].read_text(encoding="utf-8"))
         assert payload["task_id"] == task_id
         assert payload["attempt"] == 1
+        assert payload["schema_version"] == 1
+        assert payload["judge"] == "manifest_amender"
+        assert payload["categories"][0]["code"] == "SCOPE"
+        # Legacy fields preserved for downstream consumers still keyed off them.
         assert payload["reason_category"] == "SCOPE"
         assert "out of scope" in payload["reason_text"]
         assert payload["capped"] is False
-        # Original request payload preserved for executor consumption.
         assert payload["request"]["task_id"] == task_id
 
     def test_attempt_counter_increments(self, tmp_workspace: Path) -> None:
         """A second rejection on the same task lands at attempt=2."""
-        from devbench.backlog.amendment import AMENDER_REJECTIONS_DIR_NAME
+        from devbench.backlog.amendment import REVIEW_FAILURES_DIR_NAME
 
         task_id = "EX-F1-S1-T1"
         write_request(tmp_workspace, _sample_request(task_id))
         reject_amendment(tmp_workspace, tmp_workspace / "BACKLOG.md", task_id, "SCOPE one")
 
-        # Re-write a request and reject again.
-        # Need to flip the task back to in-progress so the second reject
-        # finds a pending request to delete; the helper just re-stages the
-        # JSON, the status of the task is irrelevant for the persistence path.
         write_request(tmp_workspace, _sample_request(task_id))
         reject_amendment(tmp_workspace, tmp_workspace / "BACKLOG.md", task_id, "APPROACH_AUTH two")
 
-        archive_dir = tmp_workspace / AMENDER_REJECTIONS_DIR_NAME
-        json_files = sorted(archive_dir.glob(f"{task_id}-*.json"))
+        archive_dir = tmp_workspace / REVIEW_FAILURES_DIR_NAME
+        json_files = sorted(archive_dir.glob(f"{task_id}-manifest_amender-*.json"))
         assert len(json_files) == 2
         payloads = [json.loads(p.read_text()) for p in json_files]
         attempts = sorted(p["attempt"] for p in payloads)
         assert attempts == [1, 2]
-        # Categories preserved per-attempt.
         cats = {p["attempt"]: p["reason_category"] for p in payloads}
         assert cats == {1: "SCOPE", 2: "APPROACH_AUTH"}
 
     def test_unmatched_reason_falls_back_to_other(self, tmp_workspace: Path) -> None:
         """Reasons missing the canonical tokens default to ``OTHER``."""
-        from devbench.backlog.amendment import AMENDER_REJECTIONS_DIR_NAME
+        from devbench.backlog.amendment import REVIEW_FAILURES_DIR_NAME
 
         task_id = "EX-F1-S1-T1"
         write_request(tmp_workspace, _sample_request(task_id))
@@ -644,9 +641,10 @@ class TestAmenderRejectionPersistsFeedbackJson:
             task_id,
             "the amendment looks fine but we cannot accept it right now",
         )
-        archive_dir = tmp_workspace / AMENDER_REJECTIONS_DIR_NAME
-        payload = json.loads(next(archive_dir.glob(f"{task_id}-*.json")).read_text())
+        archive_dir = tmp_workspace / REVIEW_FAILURES_DIR_NAME
+        payload = json.loads(next(archive_dir.glob(f"{task_id}-manifest_amender-*.json")).read_text())
         assert payload["reason_category"] == "OTHER"
+        assert payload["categories"][0]["code"] == "OTHER"
 
     def test_capped_flag_set_when_attempt_exceeds_max(
         self,
@@ -656,12 +654,13 @@ class TestAmenderRejectionPersistsFeedbackJson:
         """Once the per-task attempt count exceeds ``MAX_RETRY_ATTEMPTS`` the
         feedback record is still written but stamped ``capped: True``."""
         from devbench.backlog import amendment as amendment_mod
-        from devbench.backlog.amendment import AMENDER_REJECTIONS_DIR_NAME, persist_rejection_feedback
+        from devbench.backlog.amendment import (
+            AMENDER_REJECTIONS_DIR_NAME,
+            REVIEW_FAILURES_DIR_NAME,
+            persist_rejection_feedback,
+        )
 
-        # Force the cap down to 1 so a second rejection trips capped=True.
         monkeypatch.setattr("devbench.config.MAX_RETRY_ATTEMPTS", 1)
-        # ``persist_rejection_feedback`` imports MAX_RETRY_ATTEMPTS lazily from
-        # devbench.config so the monkeypatch above is sufficient.
 
         task_id = "EX-F1-S1-T1"
         request = _sample_request(task_id)
@@ -671,7 +670,6 @@ class TestAmenderRejectionPersistsFeedbackJson:
             rejection_reason="SCOPE first",
             request=request,
         )
-        # The second call lands at attempt=2 which is > 1.
         result_path = persist_rejection_feedback(
             workspace_root=tmp_workspace,
             task_id=task_id,
@@ -681,6 +679,54 @@ class TestAmenderRejectionPersistsFeedbackJson:
         payload = json.loads(result_path.read_text())
         assert payload["attempt"] == 2
         assert payload["capped"] is True
-        # Mark the module reference used so the import isn't flagged unused.
-        assert isinstance(amendment_mod.AMENDER_REJECTIONS_DIR_NAME, str)
+        assert isinstance(amendment_mod.REVIEW_FAILURES_DIR_NAME, str)
+        # Both directory constants stay exported -- legacy is forward-compat read-only.
+        assert REVIEW_FAILURES_DIR_NAME == ".devbench/review-failures"
         assert AMENDER_REJECTIONS_DIR_NAME == ".devbench/amender-rejections"
+
+    def test_review_failures_path_returned_by_reader(self, tmp_workspace: Path) -> None:
+        """A JSON written via ``persist_rejection_feedback`` (new path) must
+        be returned by ``read_review_failure_files``."""
+        from devbench.backlog.amendment import read_review_failure_files
+
+        task_id = "EX-F1-S1-T1"
+        write_request(tmp_workspace, _sample_request(task_id))
+        reject_amendment(tmp_workspace, tmp_workspace / "BACKLOG.md", task_id, "SCOPE")
+        paths = read_review_failure_files(tmp_workspace, task_id)
+        assert any("review-failures" in str(p) for p in paths)
+        assert all(task_id in p.name for p in paths)
+
+    def test_legacy_amender_rejections_path_still_readable(
+        self,
+        tmp_workspace: Path,
+    ) -> None:
+        """Forward-compat: a JSON written under the legacy
+        ``.devbench/amender-rejections/`` directory must still be returned by
+        ``read_review_failure_files`` so prior runs are not orphaned."""
+        from devbench.backlog.amendment import (
+            AMENDER_REJECTIONS_DIR_NAME,
+            read_review_failure_files,
+        )
+
+        task_id = "EX-F1-S1-T1"
+        legacy_dir = tmp_workspace / AMENDER_REJECTIONS_DIR_NAME
+        legacy_dir.mkdir(parents=True)
+        legacy_file = legacy_dir / f"{task_id}-1.json"
+        legacy_file.write_text(
+            json.dumps(
+                {
+                    "task_id": task_id,
+                    "attempt": 1,
+                    "reason_category": "SCOPE",
+                    "reason_text": "legacy reason",
+                    "request": _sample_request_dict(task_id),
+                    "capped": False,
+                    "recorded_at": "2026-04-30T00:00:00Z",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        paths = read_review_failure_files(tmp_workspace, task_id)
+        assert legacy_file in paths

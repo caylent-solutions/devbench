@@ -111,14 +111,17 @@ else
   echo "ARCHIVE_MISSING -- reject-amendment returned 0 but the archive did not land on disk; re-run step 3"
   exit 1
 fi
-# 5. VERIFY the structured rejection-feedback JSON exists. Issue #154: every
-#    rejection also writes ``.devbench/amender-rejections/<task-id>-<n>.json``
+# 5. VERIFY the structured rejection-feedback JSON exists. Issue #154 + #156:
+#    every rejection writes ``.devbench/review-failures/<task-id>-manifest_amender-<n>.json``
 #    so the executor-feedback collector can ingest the rejection on retry.
 #    The blocker-resolver reads the most-recent file to decide what fix
 #    proposal to emit. A missing feedback JSON means the next executor
-#    invocation will not see the rejection rationale.
-if ls "$JUDGE_WORKSPACE_ROOT/.devbench/amender-rejections/$ARGUMENTS-"*.json >/dev/null 2>&1; then
-  echo "FEEDBACK_OK -- amender-rejections/$ARGUMENTS-*.json present"
+#    invocation will not see the rejection rationale. The legacy
+#    ``.devbench/amender-rejections/<task-id>-<n>.json`` location is also
+#    accepted for forward compatibility with archived runs.
+if ls "$JUDGE_WORKSPACE_ROOT/.devbench/review-failures/$ARGUMENTS-manifest_amender-"*.json >/dev/null 2>&1 \
+  || ls "$JUDGE_WORKSPACE_ROOT/.devbench/amender-rejections/$ARGUMENTS-"*.json >/dev/null 2>&1; then
+  echo "FEEDBACK_OK -- review-failures/$ARGUMENTS-manifest_amender-*.json present"
 else
   echo "FEEDBACK_MISSING -- reject-amendment returned 0 but the feedback JSON did not land; re-run step 3"
   exit 1
@@ -126,6 +129,8 @@ fi
 ```
 
 The `|| true` on the three git commands is intentional: a file can be tracked-and-modified, tracked-and-restored-to-head, or untracked-and-new, and the trio collectively handles all cases without failing the pipeline. Every OTHER step is strict -- any non-zero exit aborts the verdict.
+
+**Verdict-emission contract (issue #156).** The amender-rejection JSON written by `reject-amendment` already follows the schema-v1 review-failures shape (judge=`manifest_amender`), so no separate `log-rejection-feedback` invocation is required. The category code surfaced in the rejection reason flows into `categories[0].code` via the legacy heuristic; valid codes are `SCOPE` / `APPROACH_AUTH` / `JUSTIFICATION_COHERENCE` / `PRE_FILTER` / `OTHER`. See `docs/review-feedback-vocabulary.md` for the full registry.
 
 **Rejection-reason category tokens (issue #154).** When you write the rejection reason in step 3, surface one of the canonical category tokens inline so the feedback collector can route the retry: `SCOPE` / `APPROACH_AUTH` / `JUSTIFICATION_COHERENCE` / `PRE_FILTER`. Reasons that do not name a category fall back to `OTHER`. Example:
 - `"SCOPE: amendment lists files outside the linked AC's blast radius"`

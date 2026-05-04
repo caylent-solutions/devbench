@@ -53,11 +53,15 @@ logger = logging.getLogger(__name__)
 
 AMENDMENT_DIR_NAME = ".devbench/amendments"
 REJECTED_REQUESTS_DIR_NAME = ".devbench/rejected-requests"
-# Issue #154: per-task feedback log written on every manifest-amender
-# rejection. The directory mirrors the ``ci-failures`` / ``rejected-requests``
-# pattern so the executor-feedback collector can ingest them via a single
-# glob. One file per attempt: ``<task-id>-<n>.json``.
+# Issue #154 (v1, deprecated): per-task feedback log written on every
+# manifest-amender rejection at ``.devbench/amender-rejections/<task-id>-<n>.json``.
+# Issue #156 (v2, current): unified path for every review judge AND the
+# amender at ``.devbench/review-failures/<task-id>-<judge>-<n>.json``. The
+# legacy directory name is preserved as a forward-compat read path -- the
+# executor-feedback collector still reads it -- but new writes always go to
+# REVIEW_FAILURES_DIR_NAME.
 AMENDER_REJECTIONS_DIR_NAME = ".devbench/amender-rejections"
+REVIEW_FAILURES_DIR_NAME = ".devbench/review-failures"
 ALLOWED_AMENDMENT_REASONS: frozenset[str] = frozenset({"tdd_green_production_fix"})
 AMENDMENT_APPLIED_ACTION = "AMENDMENT_APPLIED"
 AMENDMENT_REJECTED_ACTION = "AMENDMENT_REJECTED"
@@ -337,43 +341,93 @@ def persist_rejection_feedback(
     rejection_reason: str,
     request: AmendmentRequest,
 ) -> Path:
-    """Write a structured rejection-feedback JSON to ``amender-rejections/``.
+    """Write a structured rejection-feedback JSON.
 
-    Issue #154: provides the executor-feedback collector with a canonical
-    record of every manifest-amender rejection. The ``attempt`` field is
-    derived from the count of existing files for the task ID so the
-    sequence is monotonically increasing and inspectable.
+    Issue #154 (original) wrote to ``.devbench/amender-rejections/<task-id>-<n>.json``
+    with an ad-hoc payload shape. Issue #156 unifies the path with every
+    other review-judge rejection: the JSON now lands at
+    ``.devbench/review-failures/<task-id>-manifest_amender-<n>.json`` and
+    follows the schema-v1 ``review-feedback-schema.json`` shape.
+
+    The legacy ``amender-rejections`` directory is preserved on read by
+    ``read_review_failure_files`` (forward compatibility for archived
+    runs) but new writes always go to the unified path.
 
     Capped at ``MAX_RETRY_ATTEMPTS`` to mirror the CI-failure feedback
-    cap (see ``_handle_ci_failure``); once the cap is reached the executor
-    is no longer invoked, so further writes would be wasted. Returns the
-    path to the JSON written; raises ``AmendmentError`` only when the
-    workspace directory cannot be created.
+    cap. Returns the path to the JSON written.
     """
     from devbench.config import MAX_RETRY_ATTEMPTS
 
-    archive_dir = workspace_root / AMENDER_REJECTIONS_DIR_NAME
+    archive_dir = workspace_root / REVIEW_FAILURES_DIR_NAME
     archive_dir.mkdir(parents=True, exist_ok=True)
 
-    existing = sorted(archive_dir.glob(f"{task_id}-*.json"))
+    judge = "manifest_amender"
+    existing = sorted(archive_dir.glob(f"{task_id}-{judge}-*.json"))
     attempt = len(existing) + 1
-    # Cap exceeded: still write but stamp ``capped: true`` so consumers
-    # can detect the budget exhaustion case rather than silently dropping
-    # the record.
     capped = attempt > MAX_RETRY_ATTEMPTS
 
+    category_code = _categorise_rejection_reason(rejection_reason)
+    rejected_at = datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     payload: dict[str, Any] = {
+        "schema_version": 1,
         "task_id": task_id,
+        "judge": judge,
         "attempt": attempt,
-        "reason_category": _categorise_rejection_reason(rejection_reason),
+        "rejected_at": rejected_at,
+        "categories": [
+            {
+                "code": category_code,
+                "severity": "fail",
+                "summary": rejection_reason,
+                "remediation": (
+                    "Address the manifest-amender finding and re-stage; or surface a"
+                    " dependent task via [NEEDS_DEP] when the fix belongs upstream."
+                ),
+                "files": [f.path for f in request.files_to_add],
+            }
+        ],
+        "raw_verdict_text": rejection_reason,
+        "capped": capped,
+        # Preserve original-shape fields that downstream consumers (and tests
+        # written for issue #154) still inspect alongside the new schema.
+        "reason_category": category_code,
         "reason_text": rejection_reason,
         "request": request.to_dict(),
-        "capped": capped,
-        "recorded_at": datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "recorded_at": rejected_at,
     }
-    target = archive_dir / f"{task_id}-{attempt}.json"
+    target = archive_dir / f"{task_id}-{judge}-{attempt}.json"
     target.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return target
+
+
+def read_review_failure_files(workspace_root: Path, task_id: str) -> list[Path]:
+    """Return every review-failure JSON file for ``task_id`` (new + legacy paths).
+
+    Issue #156: the executor-feedback collector and the done-gate both
+    walk this list. New writes go to ``.devbench/review-failures/`` as
+    ``<task-id>-<judge>-<n>.json``. Legacy manifest-amender writes
+    archived under ``.devbench/amender-rejections/<task-id>-<n>.json``
+    are still read so prior runs are not orphaned.
+
+    Returns a deduplicated list sorted by mtime (oldest first); duplicate
+    matches between the two paths are unlikely in practice but the
+    deduplication guards against file replication during migration.
+    """
+    seen: set[Path] = set()
+    paths: list[Path] = []
+    new_dir = workspace_root / REVIEW_FAILURES_DIR_NAME
+    if new_dir.is_dir():
+        for path in sorted(new_dir.glob(f"{task_id}-*.json")):
+            if path not in seen:
+                paths.append(path)
+                seen.add(path)
+    legacy_dir = workspace_root / AMENDER_REJECTIONS_DIR_NAME
+    if legacy_dir.is_dir():
+        for path in sorted(legacy_dir.glob(f"{task_id}-*.json")):
+            if path not in seen:
+                paths.append(path)
+                seen.add(path)
+    return paths
 
 
 def _categorise_rejection_reason(rejection_reason: str) -> str:

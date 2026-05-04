@@ -389,6 +389,41 @@ Read each unresolved comment's `path` + `line` + `body`. Address the specific is
 
 When the executor commits a fix that addresses every entry in the feedback payload, end your turn. The orchestrator re-runs git-ops; the next poll cycle re-checks the PR's review state. Threads that reference unchanged lines may stay unresolved on GitHub even after a valid fix; in that case reply on the thread with a brief explanation so the next poll iteration sees them as RESOLVED.
 
+## Review-judge rejection feedback (issue #156)
+
+When the orchestrator re-invokes you after one or more review judges returned `REVIEW_FAIL`, every failing judge has persisted a structured JSON to `<workspace>/.devbench/review-failures/<task-id>-<judge>-<attempt>.json` alongside the `[REVIEW_FAIL]` audit comment. The payload conforms to `src/devbench/backlog/review-feedback-schema.json` (schema_version 1). Shape:
+
+```
+{
+  "schema_version": 1,
+  "task_id": "<id>",
+  "judge": "code_review" | "test_review" | "doc_review" | "changes_manifest" | "security_review" | "manifest_amender",
+  "attempt": <int>,
+  "rejected_at": "<ISO 8601 UTC>",
+  "categories": [
+    {
+      "code": "<vocabulary code>",
+      "severity": "fail" | "warn",
+      "summary": "<one-line>",
+      "remediation": "<actionable fix>",
+      "files": ["<path>", ...]
+    },
+    ...
+  ],
+  "raw_verdict_text": "<verdict body>",
+  "capped": false
+}
+```
+
+Files are ordered by judge severity (security > code > test > changes_manifest > doc > manifest_amender) then by attempt descending. The full per-judge vocabulary lives in `docs/review-feedback-vocabulary.md`.
+
+**Resolution protocol.** For every category surfaced, do EXACTLY ONE of:
+
+1. **Fix it locally.** Modify the named files per the `remediation` field, re-stage, and ensure the next review iteration no longer flags the category. The orchestrator's done-gate logs `[REJECTION_FEEDBACK_RESOLVED] <judge>:<code>` when it confirms the category is cleared in the new diff.
+2. **Escalate via dependency.** If the fix belongs upstream (a different task owns the affected files / approach), log `[NEEDS_DEP] <judge>:<code>` via `uv run devbench log-comment executor <task-id> "[NEEDS_DEP] <judge>:<code> <reason>"` AND wire the dep via `uv run devbench add-dep <this-task> <upstream-task> --reason "<msg>"`. The done-gate accepts the audit row as resolution.
+
+The done-gate refuses `mark-done` until every prior `<task-id>-<judge>-*.json` rejection is cleared via one of the two paths. A `[REJECTION_FEEDBACK_OUTSTANDING]` audit naming the unresolved `<judge>:<code>` pairs is logged on every refusal.
+
 ## REVIEW_PASS verdicts are terminal (issue #128)
 
 You are invoked **only** in three situations:

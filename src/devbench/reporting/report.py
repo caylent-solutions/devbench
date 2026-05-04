@@ -175,6 +175,11 @@ class WindowStats:
     # zero / unknown (no pace data yet). Stored in UTC; the renderer converts
     # to the resolved display timezone.
     est_completion_at: datetime | None = None
+    # Issue #157: ETA breakdown so the renderer can print
+    # ``~5.4 h (active 4 + blocked-recovery 60 + blocked-auto 27 at 5.6 min/task)``.
+    eta_active: int = 0
+    eta_blocked_recovery: int = 0
+    eta_blocked_auto: int = 0
 
     @property
     def total_tokens(self) -> int:
@@ -650,13 +655,19 @@ def _compute_window_stats(
     done_times: dict[str, datetime],
     progress_times: dict[str, datetime],
     tasks_active: int,
+    tasks_blocked_recovery: int = 0,
+    tasks_blocked_auto: int = 0,
 ) -> WindowStats:
     """Compute all time-windowed statistics for a single window.
 
-    ``tasks_active`` is the count of non-Done tasks that the orchestrator can
-    still finish on its own (in-queue / in-progress / in-review). Blocked
-    tasks are excluded -- they need external action and have unbounded ETA, so
-    rolling them into the projection multiplier produces misleading numbers.
+    Issue #157: the ETA denominator now includes blocked tasks that
+    devbench will recover on its own -- ``tasks_blocked_recovery``
+    (AWAITING_AUTO_RECOVERY) and ``tasks_blocked_auto``
+    (AUTO_CLEARING_VIA_PROPOSAL) -- in addition to ``tasks_active``.
+    The operator-attention bucket stays excluded since those represent
+    genuine halts with unbounded ETA. When the recent-pace window has
+    fewer than ``MIN_PACE_SAMPLES`` completed tasks the pace fallback
+    path is taken; ``est_hours`` reads zero (renderer shows "n/a").
     """
     window_hours = (window_end - window_start).total_seconds() / SECONDS_PER_HOUR
 
@@ -671,20 +682,13 @@ def _compute_window_stats(
             if dur > 0:
                 task_durations.append(dur)
     pace_sample_count = len(task_durations)
-    # B3: pace from too-few samples is fragile -- display as n/a rather than
-    # projecting from a single completion. The sample count is preserved on
-    # WindowStats so the renderer can append "(N=X samples)".
     avg_minutes = sum(task_durations) / pace_sample_count if pace_sample_count >= MIN_PACE_SAMPLES else 0.0
 
-    # B4: rolling Recent pace from the last N completed tasks (log-wide,
-    # regardless of window). Used for projections so the rate metric reflects
-    # current orchestrator pace and stops drifting after dozens of completions.
     recent_pace_minutes: float | None = _recent_pace_minutes(done_times, progress_times, RECENT_PACE_TASKS)
 
-    # Use recent pace for projections when available; otherwise fall back to
-    # the window's avg_minutes (which is itself n/a for too-few samples per B3).
     pace_for_projection = recent_pace_minutes if recent_pace_minutes is not None else avg_minutes
-    est_hours = (tasks_active * pace_for_projection) / SECONDS_PER_MINUTE if pace_for_projection else 0.0
+    eta_task_count = tasks_active + tasks_blocked_recovery + tasks_blocked_auto
+    est_hours = (eta_task_count * pace_for_projection) / SECONDS_PER_MINUTE if pace_for_projection else 0.0
 
     # Combine usage from two sources, both filtered by window_start:
     #   1. hook-logs.jsonl: subagent (Agent tool) invocations -- captures executor / judge / etc costs
@@ -725,7 +729,10 @@ def _compute_window_stats(
         + totals.cache_write_1h_tokens
     )
     tokens_per_task = total_tokens_window / tasks_in_window if tasks_in_window else 0.0
-    est_total_cost = cost.total_cost + (cost.total_cost / tasks_in_window * tasks_active if tasks_in_window else 0.0)
+    # Issue #157: cost projection uses the same denominator as ETA (active +
+    # auto-recovery buckets) so the cost forecast scales with the same task
+    # set the ETA forecast does.
+    est_total_cost = cost.total_cost + (cost.total_cost / tasks_in_window * eta_task_count if tasks_in_window else 0.0)
 
     api_hours = totals.total_duration_ms / MS_PER_SECOND / SECONDS_PER_HOUR
     api_efficiency = (api_hours / window_hours * PERCENT_MULTIPLIER) if window_hours > 0 else None
@@ -751,6 +758,9 @@ def _compute_window_stats(
         pace_sample_count=pace_sample_count,
         recent_pace_minutes=recent_pace_minutes,
         est_completion_at=est_completion_at,
+        eta_active=tasks_active,
+        eta_blocked_recovery=tasks_blocked_recovery,
+        eta_blocked_auto=tasks_blocked_auto,
     )
 
 
@@ -1041,6 +1051,27 @@ def _short_window_label(label: str, start: datetime, display_tz: tzinfo | None) 
     return f"{label} {converted.strftime('%m-%d %H:%M')}"
 
 
+def _format_est_hours_display(stats: WindowStats) -> str:
+    """Render the ``Est. time to complete remaining`` cell (#157).
+
+    When recent-pace data is available, attaches the ETA breakdown
+    suffix so the operator can verify which task buckets contributed
+    to the multiplier and at what pace. Falls back to a bare hours
+    figure when recent pace is unknown but est_hours was computable
+    from the window's avg_minutes; falls back to ``n/a`` otherwise.
+    """
+    if stats.est_hours and stats.recent_pace_minutes is not None:
+        return (
+            f"~{stats.est_hours:.1f} h (active {stats.eta_active}"
+            f" + blocked-recovery {stats.eta_blocked_recovery}"
+            f" + blocked-auto {stats.eta_blocked_auto}"
+            f" at {stats.recent_pace_minutes:.1f} min/task)"
+        )
+    if stats.est_hours:
+        return f"~{stats.est_hours:.1f} h"
+    return "n/a"
+
+
 def _stats_to_value_list(stats: WindowStats, display_tz: tzinfo | None = None) -> list[str]:
     """Return the per-row value list for a single window, in display order matching METRIC_LABELS.
 
@@ -1074,7 +1105,7 @@ def _stats_to_value_list(stats: WindowStats, display_tz: tzinfo | None = None) -
     # Recent pace is log-wide; same value across all window columns. None
     # when fewer than RECENT_PACE_TASKS completions exist.
     recent_pace_display = f"{stats.recent_pace_minutes:.1f} min" if stats.recent_pace_minutes is not None else "n/a"
-    est_hours_display = f"~{stats.est_hours:.1f} h" if stats.est_hours else "n/a"
+    est_hours_display = _format_est_hours_display(stats)
     # Wall-clock completion datetime rendered in the resolved display TZ.
     # Format: "Thu Apr 24 2026 14:23 EDT". "n/a" when est_hours is zero.
     if stats.est_completion_at is None:
@@ -1193,16 +1224,17 @@ def _resolve_window_endpoints(log_timestamps: list[datetime]) -> tuple[datetime,
 def _summary_line(stats: WindowStats, tasks_active: int, tasks_blocked: int) -> str:
     """Trailing one-line completion projection.
 
-    Projects against ``tasks_active`` (in-queue / in-progress / in-review) only;
-    blocked tasks need external action and are reported separately so the user
-    knows why the projection is lower than naive ``tasks_remaining * pace``.
-
-    The pace prefers ``recent_pace_minutes`` (rolling average of the last N
-    completions) when available -- that metric reflects current orchestrator
-    rate. Falls back to All-time ``avg_minutes`` otherwise.
+    Issue #157: ETA denominator now also includes blocked tasks devbench
+    will recover on its own (``stats.eta_blocked_recovery`` +
+    ``stats.eta_blocked_auto``). Only the operator-attention bucket is
+    excluded (genuine halt -> unbounded ETA). The pace prefers
+    ``recent_pace_minutes`` when available; falls back to
+    ``avg_minutes`` otherwise.
     """
-    blocked_note = f" -- {tasks_blocked} blocked excluded" if tasks_blocked else ""
-    if tasks_active == 0:
+    eta_total = tasks_active + stats.eta_blocked_recovery + stats.eta_blocked_auto
+    attn_blocked = max(0, tasks_blocked - stats.eta_blocked_recovery - stats.eta_blocked_auto)
+    blocked_note = f" -- {attn_blocked} blocked excluded" if attn_blocked else ""
+    if eta_total == 0:
         if tasks_blocked:
             return (
                 f"0 active tasks. {tasks_blocked} blocked task(s) remaining -- "
@@ -1215,12 +1247,10 @@ def _summary_line(stats: WindowStats, tasks_active: int, tasks_blocked: int) -> 
         else ("All-time", stats.avg_minutes)
     )
     if not pace_minutes:
-        return (
-            f"{tasks_active} active task(s) remaining{blocked_note}. (Not enough completed tasks for a pace estimate.)"
-        )
+        return f"{eta_total} active task(s) remaining{blocked_note}. (Not enough completed tasks for a pace estimate.)"
     return (
         f"At the {pace_label} pace of ~{pace_minutes:.1f} minutes per task, "
-        f"the remaining {tasks_active} active task(s){blocked_note} should take roughly "
+        f"the remaining {eta_total} active task(s){blocked_note} should take roughly "
         f"{stats.est_hours:.1f} more hours of continuous execution."
     )
 
@@ -1242,6 +1272,12 @@ class _BacklogTotals:
     tasks_in_review: int  # non-Done tasks with status == IN_REVIEW (subset of tasks_active)
     tasks_proposed: int  # task-factory-generated drafts awaiting human review
     tasks_declined: int  # explicitly declined work (won't ever be done)
+    # Issue #157: blocked tasks split by their recovery classifier so the
+    # ETA projection can include recovery+auto buckets while excluding the
+    # genuine-halt operator-attention bucket.
+    tasks_blocked_recovery: int = 0  # AWAITING_AUTO_RECOVERY
+    tasks_blocked_auto: int = 0  # AUTO_CLEARING_VIA_PROPOSAL
+    tasks_blocked_attn: int = 0  # NEEDS_OPERATOR_ATTENTION
 
 
 def _backlog_totals_from_units(units: list) -> _BacklogTotals:
@@ -1256,11 +1292,35 @@ def _backlog_totals_from_units(units: list) -> _BacklogTotals:
     tasks_in_review = [t for t in tasks if t.status == WorkUnitStatus.IN_REVIEW]
     tasks_proposed = [t for t in tasks if t.status == WorkUnitStatus.PROPOSED]
     tasks_declined = [t for t in tasks if t.status == WorkUnitStatus.DECLINED]
-    # Proposed tasks are inert drafts awaiting human review; Declined tasks
-    # are deliberate "won't ever be done" decisions. Neither counts against
-    # tasks_remaining or tasks_active -- the orchestrator will never execute
-    # either, so they must not distort pace / ETA projections.
     tasks_remaining = len(tasks) - len(tasks_done) - len(tasks_proposed) - len(tasks_declined)
+
+    # Issue #157: classify blocked tasks so the ETA projection can include
+    # the auto-clearing + awaiting-recovery buckets (devbench will resolve
+    # them on its own) while excluding the operator-attention bucket
+    # (genuine halt -> unbounded ETA).
+    blocked_recovery = 0
+    blocked_auto = 0
+    blocked_attn = 0
+    if tasks_blocked:
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        for u in tasks_blocked:
+            try:
+                state = classify_blocked_task(
+                    BACKLOG_ROOT,
+                    BACKLOG_INDEX,
+                    u.id,
+                    workspace_root=WORKSPACE_ROOT,
+                )
+            except (FileNotFoundError, ValueError, OSError):
+                state = BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+            if state is BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL:
+                blocked_auto += 1
+            elif state is BlockedTaskState.AWAITING_AUTO_RECOVERY:
+                blocked_recovery += 1
+            else:
+                blocked_attn += 1
+
     return _BacklogTotals(
         tasks_total=len(tasks),
         tasks_done=len(tasks_done),
@@ -1277,6 +1337,9 @@ def _backlog_totals_from_units(units: list) -> _BacklogTotals:
         tasks_in_review=len(tasks_in_review),
         tasks_proposed=len(tasks_proposed),
         tasks_declined=len(tasks_declined),
+        tasks_blocked_recovery=blocked_recovery,
+        tasks_blocked_auto=blocked_auto,
+        tasks_blocked_attn=blocked_attn,
     )
 
 
@@ -1378,9 +1441,19 @@ def _unit_status_listing(units: list, status: WorkUnitStatus, header: str) -> li
     return lines
 
 
-def _in_progress_listing(units: list) -> list[str]:
-    """B9: list every in-progress task so the user sees which one is active."""
-    return _unit_status_listing(units, WorkUnitStatus.IN_PROGRESS, "In-progress tasks")
+def _in_progress_listing(units: list, log_path: Path | None = None) -> list[str]:
+    """B9: list every in-progress task; suffix each row with attempt duration (#158)."""
+    matches = [u for u in units if u.unit_type == WorkUnitType.TASK and u.status == WorkUnitStatus.IN_PROGRESS]
+    if not matches:
+        return []
+    from devbench.cli import _in_progress_attempt_duration
+
+    lines = ["", "In-progress tasks:"]
+    for u in matches:
+        duration = _in_progress_attempt_duration(u.id, log_path)
+        suffix = f" (in-progress for {duration})" if duration is not None else " (in-progress, timer unavailable)"
+        lines.append(f"  - {u.id}: {u.title}{suffix}")
+    return lines
 
 
 def _blocked_listing(units: list) -> list[str]:
@@ -1582,7 +1655,14 @@ def generate_report(
     # are visible at a glance without scanning across the wider window-stats table.
     lifetime_stats: WindowStats | None = (
         _compute_window_stats(
-            log_path, log_start_for_window, window_end, done_times, progress_times, backlog.tasks_active
+            log_path,
+            log_start_for_window,
+            window_end,
+            done_times,
+            progress_times,
+            backlog.tasks_active,
+            backlog.tasks_blocked_recovery,
+            backlog.tasks_blocked_auto,
         )
         if log_started is not None
         else None
@@ -1596,7 +1676,14 @@ def generate_report(
         # box the way older callers / tests expect it.
         backlog_state_block = _render_table("Backlog state", _backlog_state_rows(backlog))
         single_stats = _compute_window_stats(
-            log_path, since, window_end, done_times, progress_times, backlog.tasks_active
+            log_path,
+            since,
+            window_end,
+            done_times,
+            progress_times,
+            backlog.tasks_active,
+            backlog.tasks_blocked_recovery,
+            backlog.tasks_blocked_auto,
         )
         lines.extend(backlog_state_block)
         lines.append("")
@@ -1631,7 +1718,14 @@ def generate_report(
             else:
                 all_window_stats.append(
                     _compute_window_stats(
-                        log_path, w.start, window_end, done_times, progress_times, backlog.tasks_active
+                        log_path,
+                        w.start,
+                        window_end,
+                        done_times,
+                        progress_times,
+                        backlog.tasks_active,
+                        backlog.tasks_blocked_recovery,
+                        backlog.tasks_blocked_auto,
                     )
                 )
 
@@ -1699,7 +1793,7 @@ def generate_report(
         # Each panel is omitted when its respective status has zero tasks.
         lines.extend(_proposed_listing(units))
         lines.extend(_unmaterialised_proposals_listing())
-        lines.extend(_in_progress_listing(units))
+        lines.extend(_in_progress_listing(units, log_path))
         lines.extend(_blocked_listing(units))
         lines.extend(_declined_listing(units))
 

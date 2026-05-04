@@ -64,6 +64,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 # Resolved once at import time so each watch tick doesn't re-PATH-search.
 # Used by `cmd_report --watch` to clear both the viewport AND the scrollback
@@ -89,9 +90,11 @@ def _pre_parse_config(argv: list[str]) -> None:
 _pre_parse_config(sys.argv)
 
 from devbench.backlog.amendment import (
+    REVIEW_FAILURES_DIR_NAME,
     AmendmentError,
     AmendmentRequest,
     apply_amendment,
+    read_review_failure_files,
     reject_amendment,
     write_request,
 )
@@ -119,6 +122,10 @@ from devbench.backlog.proposal import (
     read_proposal,
     reject_proposal,
     write_proposal,
+)
+from devbench.backlog.review_feedback_vocabulary import (
+    JUDGE_CATEGORIES,
+    JUDGE_SEVERITY_ORDER,
 )
 from devbench.backlog.work_unit import (
     WorkUnit,
@@ -235,7 +242,13 @@ def cmd_status(*argv: str) -> int:
     if active:
         print("\nActive work units:")
         for u in active:
-            print(f"  [{u.status.value}] {u.id} -- {u.title}")
+            line = f"  [{u.status.value}] {u.id} -- {u.title}"
+            if u.status is WorkUnitStatus.IN_PROGRESS:
+                duration = _in_progress_attempt_duration(u.id)
+                line += (
+                    f" (in-progress for {duration})" if duration is not None else " (in-progress, timer unavailable)"
+                )
+            print(line)
 
     actionable = parser.get_parallel_candidates(units)
     if actionable:
@@ -344,6 +357,7 @@ def _print_status_detail(units: list[WorkUnit]) -> None:
     )
     if blocked_tasks:
         _print_blocked_panel_by_bucket(blocked_tasks, units_by_id)
+        _print_blocked_rejection_categories(blocked_tasks)
 
     held_tasks = sorted(
         (u for u in units if u.unit_type is WorkUnitType.TASK and u.status is WorkUnitStatus.HOLD),
@@ -358,7 +372,146 @@ def _print_status_detail(units: list[WorkUnit]) -> None:
             print(f"  {u.id} -- {u.title}  ({reason_note})")
 
 
+def _print_blocked_rejection_categories(blocked_tasks: list[WorkUnit]) -> None:
+    """Issue #156: surface pending review-judge category counts under blocked panels.
+
+    For every blocked task with at least one outstanding rejection
+    category, emit a row of the form::
+
+        E0-F1-S1-T3 (3 unresolved categories: code_review:HARDCODED_URL, ...)
+
+    Tasks with no outstanding categories are omitted entirely.
+    """
+    rows: list[tuple[str, list[tuple[str, str]]]] = []
+    for u in blocked_tasks:
+        wu_file = _resolve_unit_file(u)
+        outstanding = _outstanding_rejection_categories(u.id, wu_file)
+        if outstanding:
+            rows.append((u.id, outstanding))
+    if not rows:
+        return
+    print("\nReview-judge rejections (unresolved categories):")
+    for unit_id, cats in rows:
+        joined = ", ".join(f"{judge}:{code}" for judge, code in cats)
+        print(f"  {unit_id} ({len(cats)} unresolved categories: {joined})")
+
+
 _HOLD_COMMENT_RE: re.Pattern[str] = re.compile(r"\[HOLD\]\s+(.+?)(?:\n|$)")
+
+# Issue #158: regex matching the structured-log line:
+#   2026-05-02T12:34:56Z [logger] LEVEL ... Set <id> to 'in-progress'
+_LOG_PROGRESS_RE: re.Pattern[str] = re.compile(
+    r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})Z .* Set (\S+) to 'in-progress'",
+    re.MULTILINE,
+)
+# Fallback: agent-comment audit row of the form
+#   [2026-05-02 12:34 UTC] [agent/orchestrator] Set <id> to 'in-progress'
+_AUDIT_PROGRESS_RE: re.Pattern[str] = re.compile(
+    r"\[(?P<ts>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s+UTC\][^\n]*?Set\s+(?P<id>\S+)\s+to\s+'in-progress'",
+)
+
+
+def _format_duration(seconds: float) -> str:
+    """Render a wall-clock duration in human-friendly form (issue #158).
+
+    Output forms: ``42s``, ``23m``, ``1h 47m``, ``2d 3h``. Negative
+    inputs collapse to ``0s`` -- never raise from a clock-skew artefact.
+    """
+    s = max(0, int(seconds))
+    if s < 60:
+        return f"{s}s"
+    minutes = s // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    rem_min = minutes % 60
+    if hours < 24:
+        return f"{hours}h {rem_min}m"
+    days = hours // 24
+    rem_hours = hours % 24
+    return f"{days}d {rem_hours}h"
+
+
+def _latest_log_in_progress_ts(task_id: str, log_path: Path | None) -> datetime | None:
+    """Return the most recent ``Set <task_id> to 'in-progress'`` timestamp from the log."""
+    candidate = log_path
+    if candidate is None:
+        env_log = os.environ.get("JUDGE_LOG_FILE", "")
+        candidate = Path(env_log) if env_log else None
+    if candidate is None or not candidate.is_file():
+        return None
+    try:
+        content = candidate.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    latest: datetime | None = None
+    for match in _LOG_PROGRESS_RE.finditer(content):
+        if match.group(2) != task_id:
+            continue
+        try:
+            ts = datetime.strptime(match.group(1), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=UTC)
+        except ValueError:
+            continue
+        if latest is None or ts > latest:
+            latest = ts
+    return latest
+
+
+def _latest_audit_in_progress_ts(task_id: str) -> datetime | None:
+    """Return the most recent in-progress audit-comment timestamp for the task."""
+    wu_file = _resolve_unit_file_by_id(task_id)
+    if wu_file is None or not wu_file.is_file():
+        return None
+    try:
+        wu_content = wu_file.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    latest: datetime | None = None
+    for match in _AUDIT_PROGRESS_RE.finditer(wu_content):
+        if match.group("id") != task_id:
+            continue
+        try:
+            ts = datetime.strptime(match.group("ts"), "%Y-%m-%d %H:%M").replace(tzinfo=UTC)
+        except ValueError:
+            continue
+        if latest is None or ts > latest:
+            latest = ts
+    return latest
+
+
+def _in_progress_attempt_duration(task_id: str, log_path: Path | None = None) -> str | None:
+    """Return the humanized in-progress duration for ``task_id`` or ``None``.
+
+    Issue #158. Reads the most recent ``Set <task_id> to 'in-progress'``
+    transition timestamp from the structured log first; falls back to
+    the work-unit file's audit-comment timestamp; returns ``None``
+    when neither yields a parseable timestamp. Multiple in-progress
+    transitions (blocked-then-resumed) resolve to the most recent one.
+    """
+    transition = _latest_log_in_progress_ts(task_id, log_path) or _latest_audit_in_progress_ts(task_id)
+    if transition is None:
+        return None
+    elapsed = (datetime.now(UTC) - transition).total_seconds()
+    return _format_duration(elapsed)
+
+
+def _resolve_unit_file_by_id(task_id: str) -> Path | None:
+    """Look up a work-unit file path by ID.
+
+    Best-effort -- swallows parse errors and returns ``None`` when the
+    backlog cannot be read. Used by the in-progress duration helper so
+    a transient parse failure surfaces as ``timer unavailable`` rather
+    than crashing ``status`` / ``report``.
+    """
+    try:
+        parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+        units = parser.parse_index()
+    except (FileNotFoundError, ValueError, OSError):
+        return None
+    for u in units:
+        if u.id == task_id:
+            return _resolve_unit_file(u)
+    return None
 
 
 def _latest_hold_reason(content: str) -> str:
@@ -571,6 +724,28 @@ def cmd_mark_done(unit_id: str) -> int:
     wu_file = _resolve_unit_file(target)
     if wu_file is None:
         print(f"ERROR: Work unit file not found for '{unit_id}'", file=sys.stderr)
+        return 1
+
+    # Issue #156: prior review-judge rejections must be either resolved
+    # ([REJECTION_FEEDBACK_RESOLVED] audit logged) or escalated via
+    # [NEEDS_DEP] before the task can transition to done. Otherwise the
+    # done-gate refuses with a clear actionable error and emits a
+    # [REJECTION_FEEDBACK_OUTSTANDING] audit so subsequent runs can see why.
+    outstanding = _outstanding_rejection_categories(unit_id, wu_file)
+    if outstanding:
+        mgr_audit = BacklogManager()
+        joined = ", ".join(f"{j}:{c}" for j, c in outstanding)
+        mgr_audit._append_agent_comment(
+            wu_file,
+            "orchestrator",
+            f"[REJECTION_FEEDBACK_OUTSTANDING] {joined}",
+        )
+        print(
+            f"ERROR: Cannot mark {unit_id} done: unresolved review-judge categories: {joined}. "
+            "Address each in the diff and log [REJECTION_FEEDBACK_RESOLVED] <judge>:<code>, "
+            "or escalate via [NEEDS_DEP] <judge>:<code>.",
+            file=sys.stderr,
+        )
         return 1
 
     mgr = BacklogManager()
@@ -3702,6 +3877,241 @@ def cmd_reject_amendment(unit_id: str, rejection_reason: str) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Issue #156: review-judge structured rejection-feedback persistence
+# ---------------------------------------------------------------------------
+
+
+def _validate_rejection_feedback_payload(judge: str, payload: object) -> dict[str, Any]:
+    """Layer-1 schema check for the ``log-rejection-feedback`` JSON body.
+
+    Returns the validated dict. Raises ``ValueError`` with an actionable
+    message on any violation: bad type, missing field, unknown category
+    code for *judge*, severity outside ``{fail, warn}``, etc.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError(f"payload must be a JSON object, got {type(payload).__name__}")
+    required = {"categories", "raw_verdict_text"}
+    missing = [k for k in required if k not in payload]
+    if missing:
+        raise ValueError(f"missing required field(s): {', '.join(sorted(missing))}")
+    raw_categories = payload.get("categories")
+    if not isinstance(raw_categories, list) or not raw_categories:
+        raise ValueError("categories must be a non-empty list")
+    allowed_codes = JUDGE_CATEGORIES.get(judge, frozenset())
+    for idx, entry in enumerate(raw_categories):
+        if not isinstance(entry, dict):
+            raise ValueError(f"categories[{idx}] must be an object")
+        for key in ("code", "severity", "summary", "remediation", "files"):
+            if key not in entry:
+                raise ValueError(f"categories[{idx}] missing field {key!r}")
+        code = entry["code"]
+        if not isinstance(code, str) or code not in allowed_codes:
+            raise ValueError(f"categories[{idx}].code={code!r} is not in {judge}'s vocabulary {sorted(allowed_codes)}")
+        severity = entry["severity"]
+        if severity not in ("fail", "warn"):
+            raise ValueError(f"categories[{idx}].severity={severity!r} must be 'fail' or 'warn'")
+        files = entry["files"]
+        if not isinstance(files, list) or any(not isinstance(f, str) for f in files):
+            raise ValueError(f"categories[{idx}].files must be a list of strings")
+    if not isinstance(payload["raw_verdict_text"], str):
+        raise ValueError("raw_verdict_text must be a string")
+    return payload
+
+
+def _parse_log_rejection_feedback_argv(argv: tuple[str, ...]) -> tuple[str, str, str]:
+    """Return ``(judge, task_id, raw_json)``. Raises ``ValueError`` on bad usage."""
+    judge = ""
+    task_id = ""
+    raw_json = ""
+    args = list(argv)
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if not arg:
+            i += 1
+            continue
+        if arg == "--json":
+            if i + 1 >= len(args):
+                raise ValueError("--json requires a value")
+            raw_json = args[i + 1]
+            i += 2
+            continue
+        if arg.startswith("--"):
+            raise ValueError(f"unknown flag: {arg}")
+        if not judge:
+            judge = arg
+        elif not task_id:
+            task_id = arg
+        i += 1
+    if not judge or not task_id or not raw_json:
+        raise ValueError("usage: log-rejection-feedback <judge> <task-id> --json '<payload>'")
+    return judge, task_id, raw_json
+
+
+def cmd_log_rejection_feedback(*argv: str) -> int:
+    """Persist a structured review-judge rejection JSON.
+
+    Issue #156. Usage::
+
+        log-rejection-feedback <judge> <task-id> --json '<payload>'
+
+    Validates the payload against the controlled vocabulary for the
+    judge and the field-level schema, then writes to
+    ``<workspace>/.devbench/review-failures/<task-id>-<judge>-<n>.json``.
+    Records over the ``MAX_RETRY_ATTEMPTS`` cap are still written but
+    stamped ``capped: true`` for visibility.
+    """
+    from devbench.config import MAX_RETRY_ATTEMPTS
+
+    try:
+        judge, task_id, raw_json = _parse_log_rejection_feedback_argv(argv)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    if judge not in JUDGE_CATEGORIES:
+        print(
+            f"ERROR: unknown judge {judge!r}; expected one of {sorted(JUDGE_CATEGORIES)}",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        payload = json.loads(raw_json)
+    except json.JSONDecodeError as exc:
+        print(f"ERROR: --json value is not valid JSON: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        validated = _validate_rejection_feedback_payload(judge, payload)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    archive_dir = WORKSPACE_ROOT / REVIEW_FAILURES_DIR_NAME
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    existing = sorted(archive_dir.glob(f"{task_id}-{judge}-*.json"))
+    attempt = len(existing) + 1
+    capped = attempt > MAX_RETRY_ATTEMPTS
+    rejected_at = datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    record: dict[str, Any] = {
+        "schema_version": 1,
+        "task_id": task_id,
+        "judge": judge,
+        "attempt": attempt,
+        "rejected_at": rejected_at,
+        "categories": list(validated["categories"]),
+        "raw_verdict_text": validated["raw_verdict_text"],
+        "capped": capped,
+    }
+    target = archive_dir / f"{task_id}-{judge}-{attempt}.json"
+    target.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    print(json.dumps({"task_id": task_id, "judge": judge, "attempt": attempt, "path": str(target)}))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Issue #156: executor-feedback collector for review-judge rejections
+# ---------------------------------------------------------------------------
+
+
+def _collect_review_judge_feedback(task_id: str) -> list[dict[str, Any]]:
+    """Return the executor-injected ``review-judge-fail`` payload list for ``task_id``.
+
+    Walks ``.devbench/review-failures/`` (and the legacy
+    ``amender-rejections/`` directory) for every JSON matching the task,
+    parses it, and returns one dict per rejection ordered by judge
+    severity (security > code > test > changes_manifest > doc >
+    manifest_amender) and then by attempt number descending. The list is
+    truncated to ``MAX_RETRY_ATTEMPTS`` rounds so the executor never
+    receives more context than the retry budget can act on.
+    """
+    from devbench.config import MAX_RETRY_ATTEMPTS
+
+    payloads: list[dict[str, Any]] = []
+    for path in read_review_failure_files(WORKSPACE_ROOT, task_id):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        # Synthesize a v1-shaped record for legacy amender-rejections
+        # entries that pre-date schema_version: 1.
+        if "schema_version" not in data and "reason_category" in data:
+            data = {
+                "schema_version": 1,
+                "task_id": data.get("task_id", task_id),
+                "judge": "manifest_amender",
+                "attempt": data.get("attempt", 0),
+                "rejected_at": data.get("recorded_at", ""),
+                "categories": [
+                    {
+                        "code": data.get("reason_category", "OTHER"),
+                        "severity": "fail",
+                        "summary": data.get("reason_text", ""),
+                        "remediation": "",
+                        "files": [],
+                    }
+                ],
+                "raw_verdict_text": data.get("reason_text", ""),
+                "capped": data.get("capped", False),
+                "_source_path": str(path),
+            }
+        else:
+            data["_source_path"] = str(path)
+        payloads.append(data)
+
+    payloads.sort(
+        key=lambda p: (
+            -JUDGE_SEVERITY_ORDER.get(str(p.get("judge", "")), 0),
+            -int(p.get("attempt", 0) or 0),
+        )
+    )
+    return payloads[:MAX_RETRY_ATTEMPTS]
+
+
+# ---------------------------------------------------------------------------
+# Issue #156: done-gate hook for review-judge rejection resolution
+# ---------------------------------------------------------------------------
+
+
+def _outstanding_rejection_categories(task_id: str, wu_file: Path | None) -> list[tuple[str, str]]:
+    """Return ``[(judge, code), ...]`` for unresolved review-judge rejections.
+
+    A rejection is considered resolved when the work-unit file shows
+    EITHER a matching ``[REJECTION_FEEDBACK_RESOLVED] <judge>:<code>``
+    audit row OR a matching ``[NEEDS_DEP] <judge>:<code>`` audit row.
+    Otherwise the (judge, code) pair is returned for the done-gate to
+    refuse the transition.
+    """
+    rejections = _collect_review_judge_feedback(task_id)
+    if not rejections or wu_file is None or not wu_file.is_file():
+        return [
+            (str(r.get("judge", "")), str(cat.get("code", "")))
+            for r in rejections
+            for cat in (r.get("categories") or [])
+            if isinstance(cat, dict)
+        ]
+    content = wu_file.read_text(encoding="utf-8")
+    outstanding: list[tuple[str, str]] = []
+    for r in rejections:
+        judge = str(r.get("judge", ""))
+        for cat in r.get("categories") or []:
+            if not isinstance(cat, dict):
+                continue
+            code = str(cat.get("code", ""))
+            resolved_marker = f"[REJECTION_FEEDBACK_RESOLVED] {judge}:{code}"
+            needs_dep_marker = f"[NEEDS_DEP] {judge}:{code}"
+            if resolved_marker in content or needs_dep_marker in content:
+                continue
+            outstanding.append((judge, code))
+    return outstanding
+
+
 def cmd_sweep_proposals() -> int:
     """Best-effort materialisation of every un-materialised proposal JSON.
 
@@ -4983,6 +5393,11 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
         2,
         "Reject amendment and block the task: reject-amendment <id> <reason>",
     ),
+    "log-rejection-feedback": (
+        cmd_log_rejection_feedback,
+        3,
+        "Persist review-judge rejection JSON: log-rejection-feedback <judge> <id> --json '<payload>'",
+    ),
     "list-proposals": (
         cmd_list_proposals,
         0,
@@ -5045,6 +5460,7 @@ _VARIADIC_COMMANDS: frozenset[str] = frozenset(
         "new-task",
         "reject-proposal",
         "validate-backlog",
+        "log-rejection-feedback",
     }
 )
 

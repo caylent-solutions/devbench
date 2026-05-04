@@ -134,6 +134,12 @@ uv run devbench log-verdict test_review $ARGUMENTS <pass|fail> "<one-line summar
 ```
 On FAIL: most critical finding. On PASS: which criteria groups were verified.
 
+c. **Verdict-emission contract (issue #156, FAIL only):** in addition to `log-verdict`, persist a structured rejection JSON via:
+```
+uv run devbench log-rejection-feedback test_review $ARGUMENTS --json '<payload>'
+```
+Payload shape: `{"categories": [{"code": "<CODE>", "severity": "fail"|"warn", "summary": "<one-line>", "remediation": "<actionable fix>", "files": ["<path>"]}, ...], "raw_verdict_text": "<full verdict body>"}`. Every `code` MUST come from the controlled vocabulary for `test_review`: `GIT_COMPLETENESS`, `STUB_TEST`, `COVERAGE_REGRESSION`, `TDD_CYCLE_MISSING`, `DRY_VIOLATION`. See `docs/review-feedback-vocabulary.md` for per-code remediation guidance.
+
 **Phase 2 -- JSON response envelope (last thing output in your response text):**
 
 ```json

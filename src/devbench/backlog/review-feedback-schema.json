@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://devbench.local/schemas/review-feedback-schema.json",
+  "title": "Review-judge rejection feedback",
+  "description": "Issue #156: structured payload written by every review-judge / manifest-amender rejection. Persisted under <workspace>/.devbench/review-failures/<task-id>-<judge>-<n>.json. Consumed by the executor-feedback collector on retry, by the done-gate enforcement, and by the status / report panels.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "task_id",
+    "judge",
+    "attempt",
+    "rejected_at",
+    "categories",
+    "raw_verdict_text"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Forward-compat marker; bumped when the schema gains an incompatible field."
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "judge": {
+      "type": "string",
+      "enum": [
+        "code_review",
+        "test_review",
+        "doc_review",
+        "changes_manifest",
+        "security_review",
+        "manifest_amender"
+      ]
+    },
+    "attempt": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "rejected_at": {
+      "type": "string",
+      "description": "ISO 8601 UTC timestamp, e.g. 2026-05-02T14:30:00Z."
+    },
+    "categories": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["code", "severity", "summary", "remediation", "files"],
+        "additionalProperties": false,
+        "properties": {
+          "code": {"type": "string", "minLength": 1},
+          "severity": {"type": "string", "enum": ["fail", "warn"]},
+          "summary": {"type": "string"},
+          "remediation": {"type": "string"},
+          "files": {
+            "type": "array",
+            "items": {"type": "string"}
+          }
+        }
+      }
+    },
+    "raw_verdict_text": {
+      "type": "string",
+      "description": "Original verdict body for fallback comprehension when categories alone are insufficient."
+    },
+    "capped": {
+      "type": "boolean",
+      "description": "True when the attempt count exceeded MAX_RETRY_ATTEMPTS; the record is still written for visibility."
+    }
+  }
+}

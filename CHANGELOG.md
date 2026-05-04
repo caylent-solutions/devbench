@@ -153,6 +153,21 @@ since the last release. PR #119 carries every change.
   neither the structured log nor the work-unit audit comments yield
   a parseable timestamp the row reads `(in-progress, timer
   unavailable)` -- never silently omitted.
+- **Orchestrator-alive status banner at top of `devbench report`**
+  (issue #161). One-line banner derived from log-activity recency:
+  `[ORCHESTRATOR ALIVE]` (green) when the last log line is within
+  `stop_hook.window_seconds`, `[ORCHESTRATOR STOPPED]` (red) when
+  past that window (with elapsed-since duration + last-seen
+  timestamp), `[ORCHESTRATOR STARTING]` (yellow) when the log file
+  is missing or empty. Includes the `JUDGE_ORCHESTRATOR_SESSION_ID`
+  suffix when set so multi-session operators can tell which session
+  the report monitors. ANSI colour only when stdout is a TTY; pipes
+  / CI redirects receive plain text. Refreshes on every
+  `--watch N` tick. Threshold reuses `stop_hook.window_seconds`
+  rather than introducing a redundant config knob, which guarantees
+  the banner stays aligned with the operator's already-tuned
+  circuit-breaker quiet window (e.g., a 180s window tolerates a
+  3-minute terraform-apply quiet stretch without flashing STOPPED).
 
 ### Fixed
 

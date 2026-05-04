@@ -169,7 +169,15 @@ from devbench.constants import (
     VALID_TDD_PHASES,
 )
 from devbench.log_setup import setup_logging
+
+# Re-export from reporting so existing ``cli._format_duration`` callers and tests
+# resolve unchanged after the function moved to report.py for the issue #161
+# orchestrator-alive banner. Single source of truth lives in report.py because
+# the banner is implemented there and reporting must not depend on cli.py.
+from devbench.reporting.report import _format_duration
 from devbench.utils.process import run_command
+
+__all__ = ["_format_duration"]
 
 logger = logging.getLogger("devbench.cli")
 
@@ -409,27 +417,6 @@ _LOG_PROGRESS_RE: re.Pattern[str] = re.compile(
 _AUDIT_PROGRESS_RE: re.Pattern[str] = re.compile(
     r"\[(?P<ts>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s+UTC\][^\n]*?Set\s+(?P<id>\S+)\s+to\s+'in-progress'",
 )
-
-
-def _format_duration(seconds: float) -> str:
-    """Render a wall-clock duration in human-friendly form (issue #158).
-
-    Output forms: ``42s``, ``23m``, ``1h 47m``, ``2d 3h``. Negative
-    inputs collapse to ``0s`` -- never raise from a clock-skew artefact.
-    """
-    s = max(0, int(seconds))
-    if s < 60:
-        return f"{s}s"
-    minutes = s // 60
-    if minutes < 60:
-        return f"{minutes}m"
-    hours = minutes // 60
-    rem_min = minutes % 60
-    if hours < 24:
-        return f"{hours}h {rem_min}m"
-    days = hours // 24
-    rem_hours = hours % 24
-    return f"{days}d {rem_hours}h"
 
 
 def _latest_log_in_progress_ts(task_id: str, log_path: Path | None) -> datetime | None:

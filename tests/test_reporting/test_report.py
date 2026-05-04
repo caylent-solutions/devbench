@@ -2484,3 +2484,172 @@ class TestReportInProgressDurationSuffix:
         with patch("devbench.cli._in_progress_attempt_duration", return_value="23m"):
             lines = _in_progress_listing([unit])
         assert "(in-progress for 23m)" in lines[2]
+
+
+class TestOrchestratorAliveBanner:
+    """Tests for the orchestrator-alive status banner (issue #161).
+
+    The banner is rendered at the very top of every ``devbench report``
+    invocation and surfaces three liveness states derived from log-activity
+    recency: ALIVE (green) / STOPPED (red) / STARTING (yellow). The threshold
+    is sourced from ``stop_hook.window_seconds`` so the banner stays aligned
+    with the operator's circuit-breaker quiet window.
+    """
+
+    @staticmethod
+    def _write_log(log_path: Path, last_ts_iso: str) -> None:
+        log_path.write_text(
+            f"2026-03-05T09:00:00Z [devbench.orch] INFO Started\n{last_ts_iso} [devbench.orch] INFO Tick\n"
+        )
+
+    def test_alive_state_green_when_recent_activity(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import _orchestrator_liveness_banner
+
+        log = tmp_path / "orch.log"
+        self._write_log(log, "2026-03-05T10:00:00Z")
+        now = datetime(2026, 3, 5, 10, 0, 30, tzinfo=UTC)
+        with patch("devbench.reporting.report._should_use_color", return_value=True):
+            banner = _orchestrator_liveness_banner(log, "sess-A", 180, now=now)
+        assert banner.startswith("\033[32m")
+        assert "[ORCHESTRATOR ALIVE]" in banner
+        assert "30s ago" in banner
+        assert "session sess-A" in banner
+        assert banner.endswith("\033[0m")
+
+    def test_stopped_state_red_when_quiet_past_threshold(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import _orchestrator_liveness_banner
+
+        log = tmp_path / "orch.log"
+        self._write_log(log, "2026-03-05T10:00:00Z")
+        now = datetime(2026, 3, 5, 10, 10, 0, tzinfo=UTC)
+        with patch("devbench.reporting.report._should_use_color", return_value=True):
+            banner = _orchestrator_liveness_banner(log, "sess-A", 180, now=now)
+        assert banner.startswith("\033[91m")
+        assert "[ORCHESTRATOR STOPPED]" in banner
+        assert "no activity for 10m" in banner
+        assert "last seen" in banner
+        assert "session sess-A" in banner
+        assert banner.endswith("\033[0m")
+
+    def test_starting_state_yellow_when_log_missing(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import _orchestrator_liveness_banner
+
+        missing = tmp_path / "no-such.log"
+        with patch("devbench.reporting.report._should_use_color", return_value=True):
+            banner = _orchestrator_liveness_banner(missing, "sess-A", 180)
+        assert banner.startswith("\033[33m")
+        assert "[ORCHESTRATOR STARTING]" in banner
+        assert "log file empty" in banner
+        assert banner.endswith("\033[0m")
+
+    def test_starting_state_when_log_empty(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import _orchestrator_liveness_banner
+
+        log = tmp_path / "orch.log"
+        log.write_text("")
+        with patch("devbench.reporting.report._should_use_color", return_value=True):
+            banner = _orchestrator_liveness_banner(log, "sess-A", 180)
+        assert "[ORCHESTRATOR STARTING]" in banner
+
+    def test_no_color_when_not_tty(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import _orchestrator_liveness_banner
+
+        log = tmp_path / "orch.log"
+        self._write_log(log, "2026-03-05T10:00:00Z")
+        now = datetime(2026, 3, 5, 10, 0, 30, tzinfo=UTC)
+        with patch("devbench.reporting.report._should_use_color", return_value=False):
+            banner = _orchestrator_liveness_banner(log, "sess-A", 180, now=now)
+        assert "\033[" not in banner
+        assert "[ORCHESTRATOR ALIVE]" in banner
+
+    def test_boundary_at_threshold_is_alive(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import _orchestrator_liveness_banner
+
+        log = tmp_path / "orch.log"
+        self._write_log(log, "2026-03-05T10:00:00Z")
+        # Exactly at threshold (180s) -> ALIVE.
+        at_threshold = datetime(2026, 3, 5, 10, 3, 0, tzinfo=UTC)
+        banner_at = _orchestrator_liveness_banner(log, "sess-A", 180, now=at_threshold)
+        assert "[ORCHESTRATOR ALIVE]" in banner_at
+        # One second past threshold -> STOPPED.
+        past_threshold = datetime(2026, 3, 5, 10, 3, 1, tzinfo=UTC)
+        banner_past = _orchestrator_liveness_banner(log, "sess-A", 180, now=past_threshold)
+        assert "[ORCHESTRATOR STOPPED]" in banner_past
+
+    def test_no_session_id_suppresses_session_suffix(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import _orchestrator_liveness_banner
+
+        log = tmp_path / "orch.log"
+        self._write_log(log, "2026-03-05T10:00:00Z")
+        now = datetime(2026, 3, 5, 10, 0, 10, tzinfo=UTC)
+        for empty in (None, ""):
+            banner = _orchestrator_liveness_banner(log, empty, 180, now=now)
+            assert "-- session" not in banner, f"empty session_id={empty!r} leaked suffix: {banner!r}"
+
+    def test_threshold_sourced_from_stop_hook_window_seconds(self, tmp_path: Path) -> None:
+        """``generate_report`` must read STOP_HOOK_WINDOW_SECONDS, not a literal."""
+        from devbench.reporting import report as report_mod
+
+        log_file = tmp_path / "orch.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    "2026-03-05T10:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                    "2026-03-05T10:05:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'",
+                ]
+            )
+        )
+        captured: dict[str, int] = {}
+
+        def _capture(*, log_path: Path, session_id: str | None, threshold_seconds: int, **_: Any) -> str:
+            captured["threshold"] = threshold_seconds
+            return "[ORCHESTRATOR ALIVE] capture-stub"
+
+        with (
+            patch("devbench.reporting.report.STOP_HOOK_WINDOW_SECONDS", 999),
+            patch("devbench.reporting.report._orchestrator_liveness_banner", side_effect=_capture),
+            patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+        ):
+            report_mod.generate_report(log_path=log_file)
+        assert captured["threshold"] == 999
+
+    def test_banner_prepended_as_first_line_of_report(self, tmp_path: Path) -> None:
+        log_file = tmp_path / "orch.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    "2026-03-05T10:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                    "2026-03-05T10:05:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'",
+                ]
+            )
+        )
+        with (
+            patch(
+                "devbench.reporting.report._orchestrator_liveness_banner",
+                return_value="[ORCHESTRATOR FIXTURE] banner-line",
+            ),
+            patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+        ):
+            output = generate_report(log_path=log_file)
+        first_nonempty = next(line for line in output.splitlines() if line.strip())
+        assert first_nonempty == "[ORCHESTRATOR FIXTURE] banner-line"
+
+    def test_banner_refreshes_under_watch_when_log_advances(self, tmp_path: Path) -> None:
+        """Two successive renders against an advancing log must produce different banners."""
+        from devbench.reporting.report import _orchestrator_liveness_banner
+
+        log = tmp_path / "orch.log"
+        self._write_log(log, "2026-03-05T10:00:00Z")
+        # First tick: 30s ago -> ALIVE 30s.
+        now1 = datetime(2026, 3, 5, 10, 0, 30, tzinfo=UTC)
+        banner1 = _orchestrator_liveness_banner(log, "sess-A", 180, now=now1)
+        # Log advances; orchestrator wrote another line.
+        log.write_text(
+            "2026-03-05T09:00:00Z [devbench.orch] INFO Started\n"
+            "2026-03-05T10:00:00Z [devbench.orch] INFO Tick\n"
+            "2026-03-05T10:00:30Z [devbench.orch] INFO Tick\n"
+        )
+        banner2 = _orchestrator_liveness_banner(log, "sess-A", 180, now=now1)
+        assert "30s ago" in banner1
+        assert "0s ago" in banner2
+        assert banner1 != banner2

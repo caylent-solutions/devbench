@@ -142,6 +142,11 @@ git_ops:
 # ---------------------------------------------------------------------------
 stop_hook:
   max_blocks: 5
+  # Quiet-window cap for the circuit breaker. Doubles as the threshold
+  # for `devbench report`'s orchestrator-alive banner (issue #161): a
+  # log line within this many seconds renders the banner green ALIVE,
+  # past it renders red STOPPED. Tune this once for your workload's
+  # quiet-window tolerance and the banner stays aligned automatically.
   window_seconds: 180
   stale_task_minutes: 120
 

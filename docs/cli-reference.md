@@ -105,6 +105,20 @@ Empty panels are omitted entirely. The recency-window override (`JUDGE_BLOCKED_R
 
 **In-progress duration (issue #158):** the `In-progress tasks:` panel suffixes every row with a humanized attempt duration (`23m`, `1h 47m`, `2d 3h`). Multiple in-progress transitions for the same task (blocked-then-resumed) resolve to the most recent one. When neither the structured log nor the work-unit's audit comments yield a parseable timestamp the row renders `(in-progress, timer unavailable)` -- never silently omitted. The same suffix appears on `devbench status` and `devbench status --detail` Active rows.
 
+**Orchestrator-alive banner (issue #161):** the very first line of `devbench report` is a one-line liveness banner derived from log-activity recency. Three states:
+
+- `[ORCHESTRATOR ALIVE]` (green) -- last log line is within `stop_hook.window_seconds`. Suffix names the elapsed-since duration (`last activity 12s ago`).
+- `[ORCHESTRATOR STOPPED]` (red) -- last log line older than `stop_hook.window_seconds`. Suffix names elapsed-since plus the last-seen UTC timestamp so the operator can see when the loop went quiet (`no activity for 14m (last seen 2026-05-04 13:21 UTC)`).
+- `[ORCHESTRATOR STARTING]` (yellow) -- log file missing or empty. The orchestrator is starting up or no events have been written yet.
+
+Every banner ends with the active session id when `JUDGE_ORCHESTRATOR_SESSION_ID` is set (`-- session backlog-a-orchestrator`); the suffix is suppressed when the env var is unset so multi-session operators never see a `-- session None` artefact.
+
+ANSI colour is emitted only when stdout is a TTY and `NO_COLOR` is unset (mirrors the existing colour rules elsewhere in the report). When piped to `cat`, redirected to a file, or running in CI, the banner renders as plain text.
+
+Refreshes on every `--watch N` tick alongside the rest of the table -- no separate clear sequence, so no flicker.
+
+The threshold reuses the existing `stop_hook.window_seconds` knob (default 180s). This intentionally couples the banner's idea of "orchestrator quiet" with the circuit-breaker's, so an operator who tuned the stop-hook window to tolerate long terraform-apply / smoke-test stretches will not see the banner flash STOPPED during those quiet windows. There is no separate liveness-threshold env var or YAML field; if a future use case needs banner cadence to differ from circuit-breaker cadence, file an issue to decouple them.
+
 ### `watch`
 
 ```

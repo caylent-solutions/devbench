@@ -1288,6 +1288,111 @@ class TestActiveVsBlockedRemaining:
         # est_hours uses recent pace x tasks_active: 50 x 2 / 60 = 1.667h
         assert stats.est_hours == pytest.approx(50.0 * 2 / 60.0)
 
+    def test_recent_per_task_cost_returns_none_with_fewer_than_n_completions(self, tmp_path: Path) -> None:
+        """Issue #164: helper returns None when log has fewer than RECENT_PACE_TASKS completions."""
+        from devbench.config import RECENT_PACE_TASKS
+        from devbench.reporting.report import _recent_per_task_cost
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text("ignored\n")
+        # Only 2 completions; RECENT_PACE_TASKS is 5 by default.
+        done = {f"E0-F1-S1-T{i}": datetime(2026, 4, 15, 10 + i, tzinfo=UTC) for i in range(2)}
+        prog = {f"E0-F1-S1-T{i}": datetime(2026, 4, 15, 9 + i, tzinfo=UTC) for i in range(2)}
+        result = _recent_per_task_cost(log_file, done, prog, RECENT_PACE_TASKS)
+        assert result is None
+
+    def test_recent_per_task_cost_falls_back_to_window_avg_when_helper_returns_none(self, tmp_path: Path) -> None:
+        """Issue #164 fallback contract: when ``recent_per_task_cost`` is
+        None, ``_compute_window_stats`` falls back to the per-window
+        average (cost.total_cost / tasks_in_window). When ``recent_per_task_cost``
+        IS provided it overrides the per-window denominator."""
+        from devbench.reporting.report import _compute_window_stats
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text("")  # empty log -> all costs are zero
+        done = {"E0-F1-S1-T1": datetime(2026, 4, 15, 11, tzinfo=UTC)}
+        prog = {"E0-F1-S1-T1": datetime(2026, 4, 15, 10, tzinfo=UTC)}
+
+        # No recent_per_task_cost supplied -> fallback path; with empty
+        # log every cost is zero so est_total_cost should also be zero.
+        stats_fallback = _compute_window_stats(
+            log_file,
+            datetime(2026, 4, 15, 10, tzinfo=UTC),
+            datetime(2026, 4, 15, 12, tzinfo=UTC),
+            done,
+            prog,
+            tasks_active=10,
+        )
+        assert stats_fallback.est_total_cost == pytest.approx(0.0)
+
+        # With recent_per_task_cost=$50, projection = 0 + 50 * 10 = 500
+        stats_global = _compute_window_stats(
+            log_file,
+            datetime(2026, 4, 15, 10, tzinfo=UTC),
+            datetime(2026, 4, 15, 12, tzinfo=UTC),
+            done,
+            prog,
+            tasks_active=10,
+            recent_per_task_cost=50.0,
+        )
+        assert stats_global.est_total_cost == pytest.approx(500.0)
+
+    def test_lifetime_total_cost_overrides_per_window_additive_base(self, tmp_path: Path) -> None:
+        """Spanning-row contract: when ``lifetime_total_cost`` is supplied,
+        ``est_total_cost`` uses it as the additive base instead of the
+        per-window ``cost.total_cost``. This is what makes every column
+        produce the same projection so ``_merge_spanning_values`` collapses
+        the row. Default-None preserves the legacy per-window formula for
+        direct test callers.
+        """
+        from devbench.reporting.report import _compute_window_stats
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text("")
+        done = {"E0-F1-S1-T1": datetime(2026, 4, 15, 11, tzinfo=UTC)}
+        prog = {"E0-F1-S1-T1": datetime(2026, 4, 15, 10, tzinfo=UTC)}
+
+        # No lifetime_total_cost: legacy formula (cost.total_cost is 0 from
+        # empty log), projection = 0 + 50 * 10 = 500.
+        stats_legacy = _compute_window_stats(
+            log_file,
+            datetime(2026, 4, 15, 10, tzinfo=UTC),
+            datetime(2026, 4, 15, 12, tzinfo=UTC),
+            done,
+            prog,
+            tasks_active=10,
+            recent_per_task_cost=50.0,
+        )
+        assert stats_legacy.est_total_cost == pytest.approx(500.0)
+
+        # With lifetime_total_cost=$1000 (the All-time cost passed in by
+        # generate_report), projection = 1000 + 50 * 10 = 1500. This is
+        # the same number every column produces because it is computed
+        # from a single global pair (lifetime cost, recent rate).
+        stats_lifetime = _compute_window_stats(
+            log_file,
+            datetime(2026, 4, 15, 10, tzinfo=UTC),
+            datetime(2026, 4, 15, 12, tzinfo=UTC),
+            done,
+            prog,
+            tasks_active=10,
+            recent_per_task_cost=50.0,
+            lifetime_total_cost=1000.0,
+        )
+        assert stats_lifetime.est_total_cost == pytest.approx(1500.0)
+
+    def test_estimated_total_cost_at_completion_is_a_spanning_metric(self) -> None:
+        """Issue #164: ``Estimated total cost at completion`` renders as a
+        single value spanning every column instead of one per-window number."""
+        from devbench.reporting.report import _SPANNING_METRIC_LABELS, _merge_spanning_values
+
+        assert "Estimated total cost at completion" in _SPANNING_METRIC_LABELS
+        # When every column carries the same value, _merge_spanning_values
+        # collapses to a single string.
+        result = _merge_spanning_values("Estimated total cost at completion", ["~$500.00"] * 3)
+        assert isinstance(result, str)
+        assert result == "~$500.00"
+
     def test_summary_line_uses_recent_pace_when_available(self) -> None:
         """B4 prose: trailing summary cites Recent pace, not All-time, when set."""
         from devbench.reporting.report import CostBreakdown, HookLogTotals, WindowStats, _summary_line
@@ -1441,8 +1546,10 @@ class TestUnitListings:
         assert "Blocked tasks (needs operator attention) (1):" in lines
         # Auto-clearing row names the waiting-on target.
         assert any("E0-F1-S1-T1" in line and "waiting on" in line for line in lines)
-        # Attn row is plain.
-        assert any(line == "  - E0-F1-S1-T2: Needs attention" for line in lines)
+        # Issue #168 (3-panel surfacing): every panel-3 row carries a
+        # sub-case annotation. Synthetic fixtures whose work-unit files
+        # do not exist on disk get the fallback ``[needs review]``.
+        assert any(line.startswith("  - E0-F1-S1-T2: Needs attention") and "[needs review]" in line for line in lines)
 
     def test_blocked_listing_present_when_task_blocked(self) -> None:
         """ADR-10: without markers every blocked task renders under the 'needs attention' panel."""
@@ -1457,10 +1564,53 @@ class TestUnitListings:
         # Fake units have no work-unit file on disk; classifier returns
         # NEEDS_OPERATOR_ATTENTION, so only the attn panel renders.
         assert "Blocked tasks (needs operator attention) (2):" in lines
-        assert "  - E0-F2-S1-T3: Disable pager" in lines
-        assert "  - E0-F5-S2-T2: Pipeline tests" in lines
+        # Issue #168 (3-panel surfacing): rows now carry a sub-case
+        # annotation. Synthetic fixtures get ``[needs review]``.
+        assert any(line.startswith("  - E0-F2-S1-T3: Disable pager") and "[needs review]" in line for line in lines)
+        assert any(line.startswith("  - E0-F5-S2-T2: Pipeline tests") and "[needs review]" in line for line in lines)
         # Auto panel NOT rendered because no auto-clearing tasks in fixture.
         assert not any("auto-clearing" in line for line in lines)
+
+    def test_blocked_listing_renders_hold_unit_in_panel_3_with_hold_annotation(self) -> None:
+        """Issue #168: HOLD work units surface in panel 3 with [HOLD] annotation."""
+        from devbench.backlog.work_unit import WorkUnitStatus
+        from devbench.reporting.report import _blocked_listing
+
+        units = [self._mk_unit("E0-F5-S1-T1", "kanon-main2-sync-blocker", WorkUnitStatus.HOLD)]
+        lines = _blocked_listing(units)
+        # Panel 3 header rendered with count 1.
+        assert "Blocked tasks (needs operator attention) (1):" in lines
+        # Row carries the [HOLD] annotation; HOLD unit leads the panel.
+        assert any(line.startswith("  - E0-F5-S1-T1: kanon-main2-sync-blocker") and "[HOLD]" in line for line in lines)
+
+    def test_blocked_listing_sorts_panel_3_with_hold_units_first(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Issue #168: HOLD units cluster at the top of panel 3 ahead of any
+        BLOCKED tasks waiting on them, in deterministic ID order."""
+        from devbench.backlog.proposal import BlockedTaskState
+        from devbench.backlog.work_unit import WorkUnitStatus
+        from devbench.reporting import report as report_mod
+
+        hold_unit = self._mk_unit("E0-F5-S1-T1", "kanon-main2-sync", WorkUnitStatus.HOLD)
+        dep_unit = self._mk_unit("E4-F2-S4-T1", "TDD telemetry", WorkUnitStatus.BLOCKED)
+
+        monkeypatch.setattr(
+            "devbench.backlog.proposal.classify_blocked_task",
+            lambda *a, **kw: BlockedTaskState.NEEDS_OPERATOR_ATTENTION,
+        )
+        monkeypatch.setattr(
+            "devbench.backlog.proposal.panel3_annotation",
+            lambda *a, **kw: (1, "E0-F5-S1-T1", "[HOLD: E0-F5-S1-T1]"),
+        )
+
+        lines = report_mod._blocked_listing([dep_unit, hold_unit])
+        # Locate the panel-3 rows.
+        panel3_idx = lines.index("Blocked tasks (needs operator attention) (2):")
+        rows = [line for line in lines[panel3_idx + 1 :] if line.startswith("  - ")]
+        # HOLD unit (group 0) precedes the BLOCKED-on-HOLD dependent (group 1).
+        assert rows[0].startswith("  - E0-F5-S1-T1")
+        assert "[HOLD]" in rows[0]
+        assert rows[1].startswith("  - E4-F2-S4-T1")
+        assert "[HOLD: E0-F5-S1-T1]" in rows[1]
 
     def test_listings_empty_when_no_matching_tasks(self) -> None:
         from devbench.backlog.work_unit import WorkUnitStatus
@@ -1857,6 +2007,98 @@ class TestSpanningRows:
                 f"Row '{row_label}' expected '{expected_substr}' exactly once in Window stats half, "
                 f"got {occurrences}: {right_half!r}"
             )
+
+    def test_report_end_to_end_spans_estimated_total_cost_at_completion(self, tmp_path: Path) -> None:
+        """Spanning-row regression: ``Estimated total cost at completion`` must
+        render as a single spanning value across All-time / Session columns
+        even when the cost-so-far differs between windows. Pre-fix the row
+        diverged because the additive base ``cost.total_cost`` was per-window;
+        with the global lifetime additive base every column produces the same
+        projection and the spanning collapse fires.
+        """
+        from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
+
+        # Build 10 completed tasks split across an explicit session boundary so
+        # the All-time and Session windows carry different ``cost.total_cost``
+        # values. The session start line ([ORCHESTRATOR STARTING]) splits the
+        # log into pre- and post-session task batches; combined with hook-log
+        # usage spanning both halves, the All-time cost > Session cost.
+        log_lines = []
+        # First 5 completions BEFORE session boundary.
+        for i in range(5):
+            start = f"2026-03-05T08:{i * 5:02d}:00Z"
+            done = f"2026-03-05T08:{i * 5 + 4:02d}:30Z"
+            log_lines.append(f"{start} [judges.cli] INFO Set E0-F1-S1-T{i + 1} to 'in-progress'")
+            log_lines.append(f"{done} [judges.cli] INFO Set E0-F1-S1-T{i + 1} to 'done'")
+        # Session-start marker between the two batches.
+        log_lines.append("2026-03-05T10:00:00Z [judges.cli] INFO [ORCHESTRATOR STARTING]")
+        # Next 5 completions AFTER the session boundary.
+        for i in range(5, 10):
+            start = f"2026-03-05T10:{(i - 5) * 5:02d}:00Z"
+            done = f"2026-03-05T10:{(i - 5) * 5 + 4:02d}:30Z"
+            log_lines.append(f"{start} [judges.cli] INFO Set E0-F1-S1-T{i + 1} to 'in-progress'")
+            log_lines.append(f"{done} [judges.cli] INFO Set E0-F1-S1-T{i + 1} to 'done'")
+        # _hook_log_path resolves hook-logs.jsonl relative to log_path.parent.parent
+        # so put the orchestrator log under a logs/ subdir and the hook log
+        # alongside it at tmp_path/hook-logs.jsonl.
+        logs_dir = tmp_path / "logs"
+        logs_dir.mkdir()
+        log_file = logs_dir / "orchestrator.log"
+        log_file.write_text(_make_log(log_lines))
+
+        # Hook-log usage spans both halves so per-window cost.total_cost
+        # actually differs (All-time covers all 4 entries; Session covers
+        # only the post-10:00 entries).
+        hook_log = tmp_path / "hook-logs.jsonl"
+        hook_log.write_text(
+            '{"timestamp":"2026-03-05T08:04:00Z","event":"PostToolUse","input":{"tool_response":'
+            '{"usage":{"input_tokens":1000000,"output_tokens":250000}}}}\n'
+            '{"timestamp":"2026-03-05T08:14:00Z","event":"PostToolUse","input":{"tool_response":'
+            '{"usage":{"input_tokens":1000000,"output_tokens":250000}}}}\n'
+            '{"timestamp":"2026-03-05T10:04:00Z","event":"PostToolUse","input":{"tool_response":'
+            '{"usage":{"input_tokens":1000000,"output_tokens":250000}}}}\n'
+            '{"timestamp":"2026-03-05T10:14:00Z","event":"PostToolUse","input":{"tool_response":'
+            '{"usage":{"input_tokens":1000000,"output_tokens":250000}}}}\n'
+        )
+
+        fake_units = [
+            WorkUnit(
+                id=f"E0-F1-S1-T{i + 1}",
+                title=f"done-{i}",
+                status=WorkUnitStatus.DONE,
+                unit_type=WorkUnitType.TASK,
+                file_path=Path(f"backlog/done-{i}.md"),
+                repo="caylent-solutions/git-repo",
+                dependencies=[],
+            )
+            for i in range(10)
+        ]
+        fake_units.append(
+            WorkUnit(
+                id="E0-F1-S2-T1",
+                title="active-task",
+                status=WorkUnitStatus.IN_PROGRESS,
+                unit_type=WorkUnitType.TASK,
+                file_path=Path("backlog/active.md"),
+                repo="caylent-solutions/git-repo",
+                dependencies=[],
+            )
+        )
+
+        with patch("devbench.reporting.report.BacklogParser") as mock_cls:
+            mock_cls.return_value.parse_index.return_value = fake_units
+            report = generate_report(log_path=log_file)
+
+        row_line = next((ln for ln in report.splitlines() if "Estimated total cost at completion" in ln), None)
+        assert row_line is not None, "Row 'Estimated total cost at completion' not found"
+        right_half = row_line.split("    ", 1)[-1]
+        # Spanning collapse: exactly ONE dollar value in the windowed half.
+        # Pre-fix this was 2-3 different values per column.
+        dollar_count = right_half.count("$")
+        assert dollar_count == 1, (
+            f"Estimated total cost at completion must span (one $ value); got {dollar_count} in row half: "
+            f"{right_half!r}"
+        )
 
 
 def _small_hook_log() -> str:

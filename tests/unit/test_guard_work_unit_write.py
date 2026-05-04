@@ -213,3 +213,125 @@ class TestGuardWorkUnitWriteContentValidation:
         assert "rule 10" not in result.stderr
         assert "rule 11" not in result.stderr
         assert "guard-work-unit-write" in result.stderr
+
+
+@pytest.mark.unit
+class TestGuardWorkUnitWriteOrchestratorBypass:
+    """Issue #160: JUDGE_AGENT_ROLE=orchestrator allows corrective edits
+    on backlog/**/*.md while content rules (rule 10 + rule 11) still fire.
+    Executor-role and missing-role still BLOCK (preserves the original
+    safety guarantee)."""
+
+    def test_orchestrator_role_allows_clean_content(self) -> None:
+        """ALLOW: clean content + orchestrator role -> exit 0 (no block)."""
+        content = "## Changes Manifest\n| `src/foo.py` | add feature |\n"
+        payload = {
+            "tool_name": "Write",
+            "tool_input": {
+                "file_path": "backlog/E1-F1-S1-T1.md",
+                "content": content,
+            },
+        }
+        result = _run_hook(payload, extra_env={"JUDGE_AGENT_ROLE": "orchestrator"})
+        assert result.returncode == 0, (
+            f"Expected exit 0 for orchestrator-role + clean content, got {result.returncode}. stderr: {result.stderr}"
+        )
+
+    def test_orchestrator_role_still_enforces_rule_10(self) -> None:
+        """Content rule 10 (em-dash) MUST fire even when role=orchestrator.
+        The role bypass only affects the final block-or-allow gate; content
+        rules run first and BLOCK regardless of role."""
+        content = "## Changes Manifest\n| `src/foo—bar.py` | fix |\n"
+        payload = {
+            "tool_name": "Write",
+            "tool_input": {
+                "file_path": "backlog/E1-F1-S1-T2.md",
+                "content": content,
+            },
+        }
+        result = _run_hook(payload, extra_env={"JUDGE_AGENT_ROLE": "orchestrator"})
+        assert result.returncode == 2, (
+            f"Expected exit 2 (rule 10 fires) even for orchestrator-role, "
+            f"got {result.returncode}. stderr: {result.stderr}"
+        )
+        assert "rule 10" in result.stderr
+
+    def test_orchestrator_role_still_enforces_rule_11(self, tmp_path: Path) -> None:
+        """Content rule 11 (checkout_directory prefix) MUST fire even when role=orchestrator."""
+        yaml_content = "repos:\n  org/kanon:\n    checkout_directory: kanon\n"
+        config_dir = tmp_path / "backlog" / "config"
+        config_dir.mkdir(parents=True)
+        (config_dir / "devbench.yaml").write_text(yaml_content)
+
+        content = "## Changes Manifest\n| `kanon/src/foo.py` | add feature |\n"
+        payload = {
+            "tool_name": "Write",
+            "tool_input": {
+                "file_path": "backlog/E1-F1-S1-T3.md",
+                "content": content,
+            },
+        }
+        result = _run_hook(
+            payload,
+            extra_env={
+                "JUDGE_AGENT_ROLE": "orchestrator",
+                "JUDGE_WORKSPACE_ROOT": str(tmp_path),
+            },
+        )
+        assert result.returncode == 2, (
+            f"Expected exit 2 (rule 11 fires) even for orchestrator-role, "
+            f"got {result.returncode}. stderr: {result.stderr}"
+        )
+        assert "rule 11" in result.stderr
+
+    def test_executor_role_still_blocks(self) -> None:
+        """BLOCK: executor role on a backlog/**/*.md write is rejected with exit 2."""
+        content = "## Changes Manifest\n| `src/foo.py` | add feature |\n"
+        payload = {
+            "tool_name": "Write",
+            "tool_input": {
+                "file_path": "backlog/E1-F1-S1-T4.md",
+                "content": content,
+            },
+        }
+        result = _run_hook(payload, extra_env={"JUDGE_AGENT_ROLE": "executor"})
+        assert result.returncode == 2
+        assert "guard-work-unit-write" in result.stderr
+
+    def test_missing_role_defaults_to_block(self) -> None:
+        """BLOCK: missing JUDGE_AGENT_ROLE defaults to executor-tier behaviour
+        (preserves the original safety guarantee for legacy callers)."""
+        content = "## Changes Manifest\n| `src/foo.py` | add feature |\n"
+        payload = {
+            "tool_name": "Write",
+            "tool_input": {
+                "file_path": "backlog/E1-F1-S1-T5.md",
+                "content": content,
+            },
+        }
+        # Strip any inherited JUDGE_AGENT_ROLE the dev shell might be carrying.
+        env = os.environ.copy()
+        env.pop("JUDGE_AGENT_ROLE", None)
+        result = subprocess.run(
+            ["bash", str(SCRIPT_PATH)],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        assert result.returncode == 2
+        assert "guard-work-unit-write" in result.stderr
+
+    def test_unknown_role_defaults_to_block(self) -> None:
+        """BLOCK: an unrecognised JUDGE_AGENT_ROLE value defaults to BLOCK."""
+        content = "## Changes Manifest\n| `src/foo.py` | add feature |\n"
+        payload = {
+            "tool_name": "Write",
+            "tool_input": {
+                "file_path": "backlog/E1-F1-S1-T6.md",
+                "content": content,
+            },
+        }
+        result = _run_hook(payload, extra_env={"JUDGE_AGENT_ROLE": "rogue-agent-007"})
+        assert result.returncode == 2
+        assert "guard-work-unit-write" in result.stderr

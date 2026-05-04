@@ -2,6 +2,8 @@
 
 An LLM-as-Judge orchestration system that processes a backlog of work units autonomously. Development agents write code; judge agents review it. All review decisions come from Claude LLM evaluation; there are no hard-coded pass/fail rules.
 
+> **Upgrading from a previous version?** See [docs/upgrade-guide.md](docs/upgrade-guide.md) for the migration walkthrough. The TL;DR is `pip install -U devbench && devbench upgrade` (idempotent; safe to re-run).
+
 ## 60-second overview
 
 DevBench drives a structured backlog from claim to merged PR without human intervention between tasks.

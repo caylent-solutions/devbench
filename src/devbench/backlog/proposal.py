@@ -40,6 +40,7 @@ from devbench.constants import (
     DEFAULT_BLOCKED_RECOVERY_WINDOW_SECONDS,
     STATUS_DECLINED,
     STATUS_DONE,
+    STATUS_HOLD,
     STATUS_IN_QUEUE,
     STATUS_PROPOSED,
 )
@@ -343,6 +344,8 @@ def _classify_with_markers(
     Extracted so ``classify_blocked_task`` stays under ruff's PLR0911
     return-statement ceiling. Returns NEEDS_OPERATOR_ATTENTION when
     the backlog index is missing, when any marker target is unknown,
+    when any marker target is in HOLD (operator-held; cascade cannot
+    fire while the target is non-terminal and HOLD is non-terminal),
     or when every marker is already terminal (cascade should have
     fired and did not). Otherwise the cascade is in flight.
     """
@@ -357,12 +360,98 @@ def _classify_with_markers(
     for marker in marker_ids:
         if marker not in status_by_id:
             return BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+        # Issue #168 (3-panel surfacing): a HOLD marker target means the
+        # operator placed the dep on hold deliberately. The cascade cannot
+        # fire (HOLD is non-terminal) and no automation will clear it.
+        # Surface to operator-attention so the report reflects reality.
+        if status_by_id[marker] == STATUS_HOLD:
+            return BlockedTaskState.NEEDS_OPERATOR_ATTENTION
         if status_by_id[marker] not in terminal:
             non_terminal_marker_found = True
 
     if not non_terminal_marker_found:
         return BlockedTaskState.NEEDS_OPERATOR_ATTENTION
     return BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL
+
+
+def panel3_annotation(
+    backlog_root: Path,
+    backlog_index: Path,
+    task_id: str,
+) -> tuple[int, str | None, str]:
+    """Return (group_rank, hold_target_id, annotation) for a panel-3 row.
+
+    Used by the reporter to render BLOCKED tasks routed to
+    ``NEEDS_OPERATOR_ATTENTION`` with a sub-case-specific annotation
+    AND a sort key that clusters rows by cause.
+
+    Group ranks (lower sorts first):
+
+    - 1 -- BLOCKED waiting on a HOLD unit (annotation ``[HOLD: <id>]``)
+    - 2 -- no marker present (annotation ``[no marker]``)
+    - 3 -- marker target unknown to backlog index (annotation
+      ``[marker target unknown: <id>]``)
+    - 4 -- marker targets all terminal; cascade should have fired
+      (annotation ``[marker targets all terminal]``)
+    - 5 -- fallback when none of the above match (annotation
+      ``[needs review]``)
+
+    Group rank 0 is reserved for HOLD work units themselves (the
+    reporter inserts those directly without calling this helper).
+
+    Pure read; never mutates the backlog.
+    """
+    return _panel3_annotation_impl(backlog_root, backlog_index, task_id)
+
+
+def _panel3_annotation_impl(
+    backlog_root: Path,
+    backlog_index: Path,
+    task_id: str,
+) -> tuple[int, str | None, str]:
+    """Implementation split out so ``panel3_annotation`` keeps its public
+    signature stable while the branch logic stays under ruff's PLR0911
+    return-statement ceiling.
+    """
+    source_file = _find_source_task_file(backlog_root, backlog_index, task_id)
+    if source_file is None:
+        return (5, None, "[needs review]")
+
+    mgr = BacklogManager()
+    marker_ids = mgr._extract_pending_proposal_markers(source_file)
+    if not marker_ids:
+        return (2, None, "[no marker]")
+
+    try:
+        rows = mgr._parse_backlog_rows(backlog_index)
+    except FileNotFoundError:
+        return (5, None, "[needs review]")
+    status_by_id = {row_id: status for row_id, status, _ in rows if row_id}
+
+    sorted_markers = sorted(marker_ids)
+    return _panel3_classify_markers(sorted_markers, status_by_id)
+
+
+def _panel3_classify_markers(
+    sorted_markers: list[str],
+    status_by_id: dict[str, str],
+) -> tuple[int, str | None, str]:
+    """Classify a sorted marker-id list against the backlog index into
+    one of the panel-3 sub-cases. Returns ``(group_rank, hold_target_id,
+    annotation)``."""
+    hold_match = next((m for m in sorted_markers if status_by_id.get(m) == STATUS_HOLD), None)
+    if hold_match is not None:
+        return (1, hold_match, f"[HOLD: {hold_match}]")
+
+    unknown_match = next((m for m in sorted_markers if m not in status_by_id), None)
+    if unknown_match is not None:
+        return (3, None, f"[marker target unknown: {unknown_match}]")
+
+    terminal = {STATUS_DONE, STATUS_DECLINED}
+    if all(status_by_id[m] in terminal for m in sorted_markers):
+        return (4, None, "[marker targets all terminal]")
+
+    return (5, None, "[needs review]")
 
 
 def _classify_recovery_or_attention(

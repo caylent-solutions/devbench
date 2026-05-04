@@ -73,13 +73,16 @@ Print the next actionable work unit as JSON. Returns `ALL_DONE` when every unit 
 ### `report`
 
 ```
-uv run devbench report [--watch N] [--since <ISO-8601>]
+uv run devbench report [--once|--no-stream] [--since <ISO-8601>] [--watch N]
 ```
 
 Print the progress report with velocity, token consumption, and estimated cost. Default layout renders two side-by-side tables: **All-time** (full log) and **Current run** (most recent contiguous block of orchestration events, boundary detected as a gap over 10 minutes between consecutive `Set X to ...` log lines).
 
-- `--watch N` refreshes every N seconds (Ctrl+C to exit). Adds a **This run** column tracking activity since the watch loop started.
-- `--since <ISO-8601>` renders a single custom-window table instead of the dual layout.
+**Issue #163: streaming default on TTY.** `devbench report` (no flags) opens an always-on streaming view that polls cache stats every ~100ms and re-renders the report whenever any source file advances. The screen never goes blank between refreshes -- the new frame is rendered to memory first, then emitted with the clear sequence in a single buffered write so the terminal flips OLD frame -> NEW frame in one redraw cycle. Ctrl+C exits cleanly. A `[refresh] cold X.Xs / warm Y.YYs / last refresh Z.ZZs` footer at the bottom of every frame exposes the loop's pace.
+
+- `--once` (alias `--no-stream`) -- forces the legacy one-shot snapshot, suitable for scripts and CI consumers that pipe the output. Auto-engaged when stdout is not a TTY (pipe / file redirect / CI).
+- `--since <ISO-8601>` -- renders a single custom-window table and exits one-shot. A frozen-window snapshot doesn't benefit from streaming.
+- `--watch N` -- *deprecated.* Kept for backward compatibility; emits a one-line deprecation notice and falls through to the streaming loop. The integer interval is ignored (cadence is data-driven).
 
 Cost is computed per call, per token type, from real `usage` data. See [model-pricing.md](model-pricing.md) for the cost formula, per-model rates, and cache-multiplier env vars.
 
@@ -219,6 +222,50 @@ Additional rules enforced as part of the Backlog A lessons-learned tooling (see 
 - **Source-Test Atomicity Rule**: every production Python source file in a Manifest (under `src/`, `infra/scripts/`, or `services/<name>/src/`) must have a matching `test_<basename>.py` entry in the SAME Manifest. Splitting source/test across sibling tasks blocks AC-FINAL-014 coverage at task close.
 
 Invoked automatically at orchestrator startup; operators should run it after hand-edits.
+
+### `upgrade`
+
+```
+uv run devbench upgrade [--migrate-log-shards]
+```
+
+Idempotent migration to the latest devbench layout. Detects workspace state and runs the safe migrations automatically; default-deny on the destructive Phase 3 sharded-log migration (only runs with `--migrate-log-shards`). Self-tests via `BacklogParser.parse_index()` at the end so the operator sees pass/fail before walking away.
+
+The full migration story is in [docs/upgrade-guide.md](upgrade-guide.md). Per-phase commands (`rebuild-window-stats`, `migrate-log-shards`, `write-snapshot`, `archive-session`) are documented below for fine-grained control; `upgrade` orchestrates them.
+
+Issue #162; ADR-22.
+
+### `write-snapshot`
+
+```
+uv run devbench write-snapshot
+```
+
+Render the report once and persist it to `<workspace>/.devbench/report-snapshot.json`. Used by the orchestrate skill at the end of every loop iteration so subsequent `devbench report --once` calls serve from the snapshot in single-digit milliseconds. Idempotent. ADR-20.
+
+### `rebuild-window-stats`
+
+```
+uv run devbench rebuild-window-stats
+```
+
+Walks the orchestrator log and rebuilds every per-task aggregate JSON under `<workspace>/.devbench/window-stats/`. Idempotent; safe to run at any cadence. Used by `devbench upgrade` after a version pull and by operators after manually deleting `.devbench/window-stats/`. ADR-17.
+
+### `archive-session`
+
+```
+uv run devbench archive-session <session-id> [--log-path <path>]
+```
+
+Convert an ended session's JSONL log to a Parquet cold archive at `<workspace>/logs/legacy/<session-id>.parquet`. **Opt-in** via `pip install devbench[archive]`; raises `ArchiveDependencyMissing` with the install command when `pyarrow` isn't installed. Per-session; operator-driven. ADR-21.
+
+### `migrate-log-shards`
+
+```
+uv run devbench migrate-log-shards --migrate-log-shards
+```
+
+**DESTRUCTIVE** (per CLAUDE.md execute-with-care; refuses to run without the `--migrate-log-shards` flag). Partitions `logs/orchestrator.log` into `logs/<YYYY-MM>/<task>.jsonl` shards and archives the original to `logs/legacy/orchestrator.log` for one release cycle. Reversible: restore via `mv logs/legacy/orchestrator.log logs/orchestrator.log && rm -rf logs/<YYYY-MM>/`. ADR-18.
 
 ### `check`
 

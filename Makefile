@@ -85,9 +85,9 @@ test-unit:
 test-coverage:
 	uv run pytest tests/ --cov=devbench --cov-report=term-missing --cov-fail-under=90
 
-## test-coverage-new: Enforce 100% line coverage on modules introduced or hardened by the manifest-amendment, task-factory, watch, git-ops-assertion, hook-tail, and auto-requeue features
+## test-coverage-new: Enforce 100% line coverage on modules introduced or hardened by the manifest-amendment, task-factory, watch, git-ops-assertion, hook-tail, auto-requeue, and report-perf-roadmap (issue #162) features
 test-coverage-new:
-	uv run pytest tests/ --cov=devbench.backlog.manifest --cov=devbench.backlog.amendment --cov=devbench.backlog.proposal --cov=devbench.backlog.manager --cov=devbench.activity --cov=devbench.github.git_ops --cov=devbench.hook_tail --cov-report=term-missing --cov-fail-under=100
+	uv run pytest tests/ --cov=devbench.backlog.manifest --cov=devbench.backlog.amendment --cov=devbench.backlog.proposal --cov=devbench.backlog.manager --cov=devbench.activity --cov=devbench.github.git_ops --cov=devbench.hook_tail --cov=devbench.reporting.snapshot --cov=devbench.reporting.window_stats --cov=devbench.reporting.archive --cov=devbench.reporting.sharded_log --cov-report=term-missing --cov-fail-under=100
 
 ## test: Run all tests
 test: test-unit

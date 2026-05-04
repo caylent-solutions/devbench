@@ -102,6 +102,8 @@ Process the backlog using the steps below, repeating until all work units are do
 
 9. `uv run devbench mark-done <id>` -- mark the unit done (enforces done-gate).
 
+   Then `uv run devbench write-snapshot` to persist a fresh `devbench report` snapshot to `<workspace>/.devbench/report-snapshot.json`. Issue #162 Phase 6 (ADR-20). Subsequent `devbench report --once` invocations serve from the snapshot in single-digit milliseconds when the orchestrator log is unchanged; the snapshot is self-healing (deletion is always safe; the next iteration writes a fresh one) and idempotent (no work-unit mutations).
+
 10. Return to step 1.
 
 11. When all work units are done and `defer_pr` mode is active, run `uv run devbench git-ops-finalize <repo>` to push the single branch and create the PR.

@@ -261,6 +261,28 @@ For full pricing details, multipliers, and platform-specific rates (Bedrock, Ver
 
 ---
 
+## How `Estimated total cost at completion` is computed (issue #164)
+
+The number is a **global** measure -- one finishing point for the backlog -- and renders as a single value spanning every column of the cost section, not one number per window.
+
+Formula:
+
+```
+est_total_cost = cost.total_cost + recent_per_task_cost * eta_task_count
+```
+
+Where:
+
+- `cost.total_cost` is the cumulative spend in the report window (per-window).
+- `recent_per_task_cost` is the **global** average cost across the most-recent `RECENT_PACE_TASKS` (default 5) completions log-wide. Computed once per report invocation by walking the umbrella interval `[earliest_progress_of_recent_N, now]`, summing hook + transcript token costs across that interval, and dividing by N.
+- `eta_task_count` is the same denominator the time-projection uses (active + auto-recovery + auto-clearing buckets).
+
+When the log has fewer than `RECENT_PACE_TASKS` completions, `recent_per_task_cost` is `None` and the calculation falls back to the per-window average (`cost.total_cost / tasks_in_window`), matching the existing `recent_pace_minutes` fallback contract. When there are zero completions log-wide the projection equals the cumulative spend (no synthetic projection from no data).
+
+Why the global rate. Earlier behaviour divided `cost.total_cost / tasks_in_window` (where `tasks_in_window` is the per-window completion count). Narrower windows had fewer completions, so the per-task cost spiked, so the projection inflated; on the same physical workspace the All-time / Session / This-run columns produced wildly different completion costs -- e.g. `~$13k` / `~$42k` / `~$8`. Using a single global rate produces one number that matches the operator's mental model: completion is a single global event with a single cost.
+
+---
+
 ## Bedrock and other platforms
 
 Pricing on AWS Bedrock, Google Vertex AI, and Microsoft Foundry is set by the platform vendor, not Anthropic. The standard Anthropic rates above are a reasonable starting estimate but verify against your platform's pricing page:

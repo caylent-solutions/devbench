@@ -65,6 +65,29 @@ extract_tool_response_field() {
   printf '%s' "$payload" | sed -nE "s/.*\"tool_response\"[^}]*\"$field\"[[:space:]]*:[[:space:]]*\"?([^,\"}]*)\"?.*/\1/p"
 }
 
+_resolve_caller_role() {
+  # Issue #160: PreToolUse hooks need to distinguish executor-tier callers
+  # (whose Edit / Write tool calls targeting backlog/**/*.md should be
+  # blocked, the original intent of guard-work-unit-write.sh) from
+  # orchestrator-tier callers (whose corrective edits on work-unit files
+  # are legitimate -- e.g., post-process strip of a blocker-resolver
+  # rule-11 violation per issue #159).
+  #
+  # The role indicator is the JUDGE_AGENT_ROLE env var. The orchestrator
+  # subprocess sets ``JUDGE_AGENT_ROLE=orchestrator`` before invoking
+  # any Claude tool; executors inherit no such env var so the variable
+  # is empty when the hook fires for an executor.
+  #
+  # Defaults to BLOCK on missing / unknown values so legacy callers that
+  # haven't been updated continue to be safely rejected (preserve the
+  # original intent of the hook).
+  case "${JUDGE_AGENT_ROLE:-}" in
+    orchestrator) printf 'orchestrator' ;;
+    executor)     printf 'executor' ;;
+    *)            printf '' ;;
+  esac
+}
+
 decode_json_escapes() {
   # Shell-bound in-place decoder. Pass the variable NAME, not its
   # value; the function reads + writes the caller's variable.

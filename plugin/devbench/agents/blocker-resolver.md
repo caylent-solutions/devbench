@@ -104,10 +104,17 @@ Every field is load-bearing. In particular, `suggested_approach` MUST be a rich,
 
 > **Changes Manifest path rules (validate-backlog rules 10 and 11):**
 > Every path in `files_to_own` MUST be repo-relative (e.g. `src/foo.py`, `tests/test_foo.py`).
-> Paths prefixed with the checkout_directory (e.g. `kanon/src/foo.py` when `kanon` is the
-> checkout_directory) are rejected by `write-proposal` with a rule-11 error and halt the
-> orchestrator. Paths containing an em-dash (U+2014) are rejected with a rule-10 error.
+> Paths containing an em-dash (U+2014) are rejected with a rule-10 error.
 > Always use `--` (double hyphen) where an em-dash would appear.
+>
+> **Issue #159 safety net:** if you accidentally emit a path prefixed with a configured
+> `checkout_directory` (e.g. `kanon/src/foo.py` when `kanon` is the kanon repo's
+> `checkout_directory`), `write-proposal` strips the prefix automatically before persisting
+> the JSON so rule-11 always passes. Treat the strip as a safety net only -- the agent
+> SHOULD still emit repo-relative paths from the start, because (a) the strip rejects paths
+> that match multiple configured checkout_directories with a structured error, and (b) repo-
+> relative paths make the proposal JSON readable to a human reviewer without having to know
+> the workspace's checkout-directory layout.
 
 `suggested_approach` MUST contain at least the following four labelled sections, concatenated into one string:
 

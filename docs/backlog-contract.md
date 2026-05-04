@@ -456,6 +456,8 @@ not
 ```
 `validate-backlog` surfaces this at authoring / startup time so it never reaches git-ops.
 
+**Issue #159 -- proposal-write enforcement.** Rule 11 has historically been enforced at the validator (this section) and at the `guard-work-unit-write.sh` PreToolUse hook. The third tier -- `cmd_write_proposal` -- now strips matching `<checkout_directory>/` prefixes from every `proposed_tasks[*].files_to_own` entry before persisting the JSON. The strip runs after the issue #146 backlog-repo filter so target-repo classification still fires on the prefixed form. Paths that match multiple configured `checkout_directories` are rejected with a structured error rather than silently picking one interpretation. blocker-resolver and any other agent that calls `devbench write-proposal` no longer needs to hand-strip prefixes; the strip is the safety net that makes rule 11 enforcement cover all three write tiers.
+
 Run before starting the orchestrator. The orchestrate skill runs it automatically at startup and
 aborts if any error is found.
 

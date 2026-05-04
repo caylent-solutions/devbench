@@ -3267,80 +3267,85 @@ class TestCmdReport:
         assert result == 0
         assert "one-shot report" in capsys.readouterr().out
 
-    def test_cmd_report_watch_mode_interrupted(self) -> None:
-        """cmd_report with watch_interval > 0 loops until KeyboardInterrupt (lines 296-306)."""
-        call_count = 0
+    def test_cmd_report_watch_falls_through_to_streaming_with_deprecation(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Issue #163: ``--watch N`` is deprecated. The interval value is
+        ignored; the call falls through to the streaming loop and emits
+        a deprecation notice."""
+        import warnings
 
-        def fake_generate_report(**kwargs: object) -> str:
-            nonlocal call_count
-            call_count += 1
-            return f"report iteration {call_count}"
-
-        def fake_sleep(seconds: float) -> None:
-            raise KeyboardInterrupt
+        def fake_stream_report(*args: object, **kwargs: object) -> int:
+            # Stand-in for the streaming loop: returns immediately.
+            return 0
 
         with (
-            patch("devbench.reporting.report.generate_report", side_effect=fake_generate_report),
-            patch("time.sleep", side_effect=fake_sleep),
+            patch("sys.stdout.isatty", return_value=True),
+            patch("devbench.reporting.report.generate_report", return_value="frame"),
+            patch("devbench.reporting.streaming.stream_report", side_effect=fake_stream_report),
+            warnings.catch_warnings(record=True) as caught,
         ):
+            warnings.simplefilter("always")
             result = cli.cmd_report(watch_interval=5)
 
         assert result == 0
-        assert call_count == 1
+        # Deprecation warning fired for --watch.
+        assert any(issubclass(w.category, DeprecationWarning) and "--watch" in str(w.message) for w in caught)
 
-    def test_cmd_report_watch_invokes_clear_command_each_tick(self) -> None:
-        """Each watch tick must clear the terminal viewport AND scrollback.
+    def test_cmd_report_streams_on_tty_by_default(self) -> None:
+        """Issue #163: the default report invocation on a TTY uses the streaming loop."""
+        called_with: dict[str, object] = {}
 
-        When the OS provides a `clear` (or `cls`) binary, we delegate to it via
-        subprocess -- terminfo handles the right sequence per terminal, including
-        the scrollback erase that bare `\\033[H\\033[2J` does not perform on
-        all terminals (notably VS Code's xterm.js where the prior `\\033[3J`
-        approach was unreliable).
-        """
-
-        def fake_sleep(seconds: float) -> None:
-            raise KeyboardInterrupt
-
-        captured_clear_calls: list[list[str]] = []
-
-        def fake_run(cmd: list[str], **kwargs: object) -> object:
-            captured_clear_calls.append(cmd)
-
-            class _Done:
-                returncode = 0
-
-            return _Done()
+        def fake_stream_report(log_path: object, render_fn: object, **kwargs: object) -> int:
+            called_with["log_path"] = log_path
+            called_with["render_fn"] = render_fn
+            return 0
 
         with (
-            patch("devbench.reporting.report.generate_report", return_value="frame"),
-            patch("time.sleep", side_effect=fake_sleep),
-            patch("devbench.cli._TERMINAL_CLEAR_CMD", "/usr/bin/clear"),
-            patch("devbench.cli.subprocess.run", side_effect=fake_run),
+            patch("sys.stdout.isatty", return_value=True),
+            patch("devbench.reporting.streaming.stream_report", side_effect=fake_stream_report),
         ):
-            result = cli.cmd_report(watch_interval=1)
+            result = cli.cmd_report()
 
         assert result == 0
-        # First tick must have called subprocess.run with the resolved clear path.
-        assert captured_clear_calls
-        assert captured_clear_calls[0] == ["/usr/bin/clear"]
+        assert "log_path" in called_with
+        assert callable(called_with["render_fn"])
 
-    def test_cmd_report_watch_falls_back_to_ris_when_no_clear_binary(self, capsys: pytest.CaptureFixture[str]) -> None:
-        """When no `clear`/`cls` binary is on PATH, fall back to VT100 RIS."""
-
-        def fake_sleep(seconds: float) -> None:
-            raise KeyboardInterrupt
-
+    def test_cmd_report_once_flag_forces_one_shot(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Issue #163: ``--once`` (passed via main()'s flag-extraction) forces
+        the legacy one-shot snapshot regardless of TTY status."""
         with (
-            patch("devbench.reporting.report.generate_report", return_value="frame"),
-            patch("time.sleep", side_effect=fake_sleep),
-            patch("devbench.cli._TERMINAL_CLEAR_CMD", None),
+            patch("sys.stdout.isatty", return_value=True),
+            patch("devbench.reporting.report.generate_report", return_value="one-shot text"),
         ):
-            result = cli.cmd_report(watch_interval=1)
+            result = cli.cmd_report(once=True)
 
-        out = capsys.readouterr().out
         assert result == 0
-        # Full reset escape (RIS) emitted on stdout.
-        assert "\033c" in out
+        assert "one-shot text" in capsys.readouterr().out
+
+    def test_cmd_report_non_tty_forces_one_shot(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Issue #163: piping / redirecting stdout (non-TTY) forces one-shot
+        rendering so script / CI consumers see the snapshot and exit."""
+        with (
+            patch("sys.stdout.isatty", return_value=False),
+            patch("devbench.reporting.report.generate_report", return_value="piped"),
+        ):
+            result = cli.cmd_report()
+
+        assert result == 0
+        assert "piped" in capsys.readouterr().out
+
+    def test_cmd_report_since_forces_one_shot(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Issue #163: ``--since <ISO-8601>`` keeps one-shot semantics --
+        a frozen-window snapshot doesn't benefit from continuous refresh."""
+        with (
+            patch("sys.stdout.isatty", return_value=True),
+            patch("devbench.reporting.report.generate_report", return_value="since-snapshot"),
+        ):
+            result = cli.cmd_report(since="2026-05-01T00:00:00Z")
+
+        assert result == 0
+        assert "since-snapshot" in capsys.readouterr().out
 
 
 class TestMainWatchFlagParsing:
@@ -3355,7 +3360,7 @@ class TestMainWatchFlagParsing:
             result = cli.main()
 
         assert result == 0
-        mock_report.assert_called_once_with(since="", watch_interval=10)
+        mock_report.assert_called_once_with(since="", watch_interval=10, once=False)
 
     def test_short_watch_flag_extracted(self) -> None:
         """-w <N> is equivalent to --watch <N>."""
@@ -3366,7 +3371,7 @@ class TestMainWatchFlagParsing:
             result = cli.main()
 
         assert result == 0
-        mock_report.assert_called_once_with(since="", watch_interval=3)
+        mock_report.assert_called_once_with(since="", watch_interval=3, once=False)
 
     def test_watch_flag_with_since_arg(self) -> None:
         """--watch is separated from the since timestamp argument (lines 996-998)."""
@@ -3377,7 +3382,29 @@ class TestMainWatchFlagParsing:
             result = cli.main()
 
         assert result == 0
-        mock_report.assert_called_once_with(since="2025-01-15T10:30:00Z", watch_interval=5)
+        mock_report.assert_called_once_with(since="2025-01-15T10:30:00Z", watch_interval=5, once=False)
+
+    def test_once_flag_extracted_from_args(self) -> None:
+        """Issue #163: --once is extracted by main() and forwarded to cmd_report."""
+        with (
+            patch("sys.argv", ["devbench", "report", "--once"]),
+            patch("devbench.cli.cmd_report", return_value=0) as mock_report,
+        ):
+            result = cli.main()
+
+        assert result == 0
+        mock_report.assert_called_once_with(since="", watch_interval=0, once=True)
+
+    def test_no_stream_alias_extracted(self) -> None:
+        """Issue #163: --no-stream is an accepted alias for --once."""
+        with (
+            patch("sys.argv", ["devbench", "report", "--no-stream"]),
+            patch("devbench.cli.cmd_report", return_value=0) as mock_report,
+        ):
+            result = cli.main()
+
+        assert result == 0
+        mock_report.assert_called_once_with(since="", watch_interval=0, once=True)
 
     def test_report_without_watch_dispatches_normally(self) -> None:
         """report without --watch goes through normal dispatch (line 1002)."""
@@ -6743,8 +6770,13 @@ class TestCmdWriteProposalBacklogRepoSkip:
         assert envelope.get("recovery_skipped") is not True
         assert envelope["proposal_path"] is not None
         # Verify the persisted proposal carries only the target-repo file.
+        # Issue #159 (prefix strip): the persisted path is repo-relative
+        # (``src/foo.py``) rather than the prefixed form the agent emitted
+        # (``caylent-telemetry/src/foo.py``). The strip runs after the
+        # backlog-repo filter, so the target-repo classification still fires
+        # on the prefixed form before the persistence step normalises it.
         persisted = json.loads((tmp_path / ".devbench" / "proposals" / "E0-F1-S1-T1.json").read_text(encoding="utf-8"))
-        assert persisted["proposed_tasks"][0]["files_to_own"] == ["caylent-telemetry/src/foo.py"]
+        assert persisted["proposed_tasks"][0]["files_to_own"] == ["src/foo.py"]
 
     def test_empty_files_to_own_preserved(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
@@ -6788,6 +6820,153 @@ class TestCmdWriteProposalBacklogRepoSkip:
             assert not cli._file_lives_in_a_target_repo("backlog/E1/E1-F1/E1-F1.md")
             assert not cli._file_lives_in_a_target_repo("docs/architecture.md")
             assert not cli._file_lives_in_a_target_repo("")
+
+
+class TestCmdWriteProposalCheckoutPrefixStrip:
+    """Issue #159: ``cmd_write_proposal`` must strip ``<checkout_directory>/``
+    prefixes from every ``proposed_tasks[*].files_to_own`` entry so the
+    persisted JSON carries repo-relative paths only. Recurring failure mode
+    (verified against the live caylent-telemetry-spec workspace): blocker-
+    resolver agents emit paths like ``kanon/src/foo.py`` when ``kanon`` is
+    configured as the target repo's checkout_directory; without the strip,
+    every materialised work unit fails validate-backlog rule 11."""
+
+    def _payload(self, source_id: str, files: list[str]) -> str:
+        return json.dumps(
+            {
+                "source_task_id": source_id,
+                "generated_at": "2026-05-04T00:00:00Z",
+                "rejection_reason": "fixture",
+                "proposed_tasks": [
+                    {
+                        "suggested_id": "E0-F1-S1-T2",
+                        "title": "Strip me",
+                        "files_to_own": files,
+                        "linked_scenarios": [],
+                        "suggested_acs": [],
+                        "suggested_approach": "Add the foo helper",
+                    }
+                ],
+            }
+        )
+
+    def _mk_runtime_config(self) -> MagicMock:
+        cfg = MagicMock()
+        repo_a = MagicMock()
+        repo_a.checkout_directory = "caylent-telemetry"
+        repo_a.validated_repo = "caylent-solutions/caylent-telemetry"
+        repo_b = MagicMock()
+        repo_b.checkout_directory = "kanon"
+        repo_b.validated_repo = "caylent-solutions/kanon"
+        cfg.repos = {
+            "caylent-solutions/caylent-telemetry": repo_a,
+            "caylent-solutions/kanon": repo_b,
+        }
+        cfg.task_factory.auto_accept_proposals = False
+        cfg.task_factory.enabled = True
+        return cfg
+
+    def test_kanon_prefix_stripped_to_repo_relative(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``kanon/src/foo.py`` -> ``src/foo.py`` in the persisted JSON."""
+        import io
+
+        monkeypatch.setattr(
+            "sys.stdin",
+            io.StringIO(
+                self._payload(
+                    "E0-F1-S1-T1",
+                    [
+                        "kanon/src/kanon_cli/core/xml_validator.py",
+                        "kanon/tests/unit/test_xml_validator.py",
+                    ],
+                )
+            ),
+        )
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.RUNTIME_CONFIG", self._mk_runtime_config()),
+        ):
+            rc = cli.cmd_write_proposal("E0-F1-S1-T1")
+        assert rc == 0
+        persisted = json.loads((tmp_path / ".devbench" / "proposals" / "E0-F1-S1-T1.json").read_text())
+        files = persisted["proposed_tasks"][0]["files_to_own"]
+        assert "src/kanon_cli/core/xml_validator.py" in files
+        assert "tests/unit/test_xml_validator.py" in files
+        # Original prefixed forms must NOT survive.
+        assert not any(f.startswith("kanon/") for f in files)
+
+    def test_repo_relative_paths_pass_through_unchanged(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Already-correct paths are not mutated by the strip pass."""
+        import io
+
+        monkeypatch.setattr(
+            "sys.stdin",
+            io.StringIO(
+                self._payload(
+                    "E0-F1-S1-T1",
+                    [
+                        "caylent-telemetry/src/foo.py",
+                    ],
+                )
+            ),
+        )
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.RUNTIME_CONFIG", self._mk_runtime_config()),
+        ):
+            rc = cli.cmd_write_proposal("E0-F1-S1-T1")
+        assert rc == 0
+        persisted = json.loads((tmp_path / ".devbench" / "proposals" / "E0-F1-S1-T1.json").read_text())
+        files = persisted["proposed_tasks"][0]["files_to_own"]
+        # caylent-telemetry IS one of the configured checkout dirs ->
+        # gets stripped to repo-relative form just like kanon does.
+        assert "src/foo.py" in files
+
+    def test_ambiguous_path_matches_multiple_checkouts_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Per #159 AC: a path matching multiple configured checkout
+        directories is ambiguous and the proposal is rejected with a
+        structured error rather than silently picking one."""
+        import io
+
+        cfg = MagicMock()
+        # Two repos whose checkout_directories share a common prefix; a
+        # single path could plausibly belong to either. Configure them
+        # so that ``foo`` is BOTH a checkout_directory AND a prefix of
+        # another checkout_directory.
+        repo_a = MagicMock()
+        repo_a.checkout_directory = "foo"
+        repo_a.validated_repo = "caylent-solutions/foo"
+        repo_b = MagicMock()
+        repo_b.checkout_directory = "foo"
+        repo_b.validated_repo = "caylent-solutions/foo-copy"
+        cfg.repos = {
+            "caylent-solutions/foo": repo_a,
+            "caylent-solutions/foo-copy": repo_b,
+        }
+        cfg.task_factory.auto_accept_proposals = False
+        cfg.task_factory.enabled = True
+
+        # Use a payload whose path duplicates the prefix to exercise
+        # the multi-match branch. Since both repos resolve to the same
+        # checkout_directory ("foo"), the deduped sorted list still has
+        # ONE entry; we need actually-different prefixes that BOTH
+        # match. Use a set with ``foo`` and ``foo/bar`` as configured
+        # checkout dirs and a path ``foo/bar/baz.py`` that matches both.
+        repo_b.checkout_directory = "foo/bar"
+        monkeypatch.setattr(
+            "sys.stdin",
+            io.StringIO(self._payload("E0-F1-S1-T1", ["foo/bar/baz.py"])),
+        )
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.RUNTIME_CONFIG", cfg),
+        ):
+            rc = cli.cmd_write_proposal("E0-F1-S1-T1")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "ambiguous" in err.lower()
 
 
 class TestCmdMaterialiseProposalLifecycleGates:
@@ -8976,3 +9155,496 @@ class TestInProgressAttemptDurationLatestAttemptOnly:
         with patch("devbench.cli._resolve_unit_file_by_id", return_value=wu):
             result = cli._in_progress_attempt_duration("E0-F1-S1-T1", log_path=tmp_path / "missing.log")
         assert result is None
+
+
+class TestCmdWriteSnapshot:
+    """Issue #162 Phase 6 (ADR-20): write a fresh report snapshot."""
+
+    def test_writes_snapshot_to_canonical_path(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        log = tmp_path / "logs" / "orchestrator.log"
+        log.parent.mkdir(parents=True)
+        log.write_text("seed\n")
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._resolve_log_file_path", return_value=log),
+            patch("devbench.reporting.report.generate_report", return_value="REPORT"),
+        ):
+            rc = cli.cmd_write_snapshot()
+
+        assert rc == 0
+        snapshot_file = tmp_path / ".devbench" / "report-snapshot.json"
+        assert snapshot_file.is_file()
+        payload = json.loads(snapshot_file.read_text())
+        assert payload["report_text"] == "REPORT"
+
+    def test_rejects_extra_args(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_write_snapshot("unexpected")
+        assert rc == 1
+        assert "no arguments" in capsys.readouterr().err
+
+
+class TestCmdRebuildWindowStats:
+    """Issue #162 Phase 2 (ADR-17): rebuild per-task aggregates from log."""
+
+    def test_rebuilds_aggregates(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        log = tmp_path / "logs" / "orchestrator.log"
+        log.parent.mkdir(parents=True)
+        log.write_text(
+            "2026-05-04T10:00:00Z [agent] INFO Set E0-F1-S1-T1 to 'in-progress' in both files\n"
+            "2026-05-04T11:00:00Z [agent] INFO Set E0-F1-S1-T1 to 'done' in both files\n"
+        )
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._resolve_log_file_path", return_value=log),
+        ):
+            rc = cli.cmd_rebuild_window_stats()
+
+        assert rc == 0
+        agg = tmp_path / ".devbench" / "window-stats" / "E0-F1-S1-T1.json"
+        assert agg.is_file()
+        out = capsys.readouterr().out
+        assert "wrote 1 per-task aggregate" in out
+
+    def test_rejects_extra_args(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_rebuild_window_stats("oops")
+        assert rc == 1
+        assert "no arguments" in capsys.readouterr().err
+
+
+class TestCmdArchiveSession:
+    """Issue #162 Phase 7 (ADR-21): archive a session to Parquet."""
+
+    def test_writes_archive(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        log = tmp_path / "logs" / "orchestrator.log"
+        log.parent.mkdir(parents=True)
+        log.write_text('{"event": "x"}\n')
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._resolve_log_file_path", return_value=log),
+        ):
+            rc = cli.cmd_archive_session("session-abc")
+
+        assert rc == 0
+        archive = tmp_path / "logs" / "legacy" / "session-abc.parquet"
+        assert archive.is_file()
+        assert "session-abc" in capsys.readouterr().out
+
+    def test_requires_session_id(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_archive_session()
+        assert rc == 1
+        assert "exactly one positional" in capsys.readouterr().err
+
+    def test_rejects_extra_positional(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_archive_session("a", "b")
+        assert rc == 1
+        assert "exactly one positional" in capsys.readouterr().err
+
+    def test_log_path_override(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        custom_log = tmp_path / "custom" / "log"
+        custom_log.parent.mkdir(parents=True)
+        custom_log.write_text('{"event": "y"}\n')
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._resolve_log_file_path", return_value=tmp_path / "default.log"),
+        ):
+            rc = cli.cmd_archive_session("s1", "--log-path", str(custom_log))
+
+        assert rc == 0
+        assert (tmp_path / "logs" / "legacy" / "s1.parquet").is_file()
+
+    def test_rejects_log_path_without_value(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_archive_session("session-id", "--log-path")
+        assert rc == 1
+        assert "--log-path requires a value" in capsys.readouterr().err
+
+    def test_propagates_archive_dependency_missing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        log = tmp_path / "log"
+        log.write_text('{"event": "x"}\n')
+
+        from devbench.reporting.archive import ArchiveDependencyMissingError
+
+        def _raise(*args: object, **kwargs: object) -> object:
+            raise ArchiveDependencyMissingError("archive operations")
+
+        monkeypatch.setattr("devbench.cli.WORKSPACE_ROOT", tmp_path)
+        monkeypatch.setattr("devbench.cli._resolve_log_file_path", lambda: log)
+        monkeypatch.setattr("devbench.reporting.archive.archive_session", _raise)
+
+        rc = cli.cmd_archive_session("s1")
+        assert rc == 1
+        assert "pip install devbench[archive]" in capsys.readouterr().err
+
+    def test_propagates_file_not_found(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._resolve_log_file_path", return_value=tmp_path / "nope.log"),
+        ):
+            rc = cli.cmd_archive_session("s1")
+        assert rc == 1
+        assert "not found" in capsys.readouterr().err
+
+
+class TestCmdMigrateLogShards:
+    """Issue #162 Phase 3 (ADR-18): destructive sharded-log migration."""
+
+    def test_refuses_without_flag(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        log = tmp_path / "logs" / "orchestrator.log"
+        log.parent.mkdir(parents=True)
+        log.write_text("2026-05-04T10:00:00Z [agent] INFO Set E0-F1-S1-T1 to 'done' in both files\n")
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._resolve_log_file_path", return_value=log),
+        ):
+            rc = cli.cmd_migrate_log_shards()
+        assert rc == 0
+        assert log.is_file()  # source untouched
+        assert "refusing to run" in capsys.readouterr().out
+
+    def test_runs_with_flag(self, tmp_path: Path) -> None:
+        log = tmp_path / "logs" / "orchestrator.log"
+        log.parent.mkdir(parents=True)
+        log.write_text("2026-05-04T10:00:00Z [agent] INFO Set E0-F1-S1-T1 to 'done' in both files\n")
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._resolve_log_file_path", return_value=log),
+        ):
+            rc = cli.cmd_migrate_log_shards("--migrate-log-shards")
+        assert rc == 0
+        assert not log.exists()
+        assert (tmp_path / "logs" / "legacy" / "orchestrator.log").is_file()
+        assert (tmp_path / "logs" / "2026-05" / "E0-F1-S1-T1.jsonl").is_file()
+
+    def test_rejects_extra_positional(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_migrate_log_shards("--migrate-log-shards", "extra")
+        assert rc == 1
+        assert "no positional" in capsys.readouterr().err
+
+    def test_handles_missing_log_with_flag(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._resolve_log_file_path", return_value=tmp_path / "nope.log"),
+        ):
+            rc = cli.cmd_migrate_log_shards("--migrate-log-shards")
+        assert rc == 1
+        assert "not found" in capsys.readouterr().err
+
+
+class TestCmdUpgrade:
+    """Issue #162 unified upgrade command (ADR-22)."""
+
+    def _seed_minimal_workspace(self, tmp_path: Path) -> Path:
+        log = tmp_path / "logs" / "orchestrator.log"
+        log.parent.mkdir(parents=True)
+        log.write_text(
+            "2026-05-04T10:00:00Z [agent] INFO Set E0-F1-S1-T1 to 'in-progress' in both files\n"
+            "2026-05-04T10:30:00Z [agent] INFO Set E0-F1-S1-T1 to 'done' in both files\n"
+        )
+        backlog_dir = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        backlog_dir.mkdir(parents=True)
+        (backlog_dir / "E0-F1-S1-T1.md").write_text(
+            "# E0-F1-S1-T1: Test\n\n## Status: done\n\n"
+            "## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n"
+        )
+        (tmp_path / "BACKLOG.md").write_text(
+            "# Backlog\n\n## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
+            "|------|-------|------|-------------|----------|---------|\n"
+            "| E0 | x | 1 | 0 | 0 | 0 |\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Test | Task | done | None | r | "
+            "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n"
+        )
+        return log
+
+    def test_default_skips_destructive(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        log = self._seed_minimal_workspace(tmp_path)
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli._resolve_log_file_path", return_value=log),
+        ):
+            rc = cli.cmd_upgrade()
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "Phase 1+4" in out
+        assert "Phase 2" in out
+        assert "Phase 3" in out
+        assert "Phase 6" in out
+        assert "Phase 7" in out
+        assert "Self-tests" in out
+        assert "Pass --migrate-log-shards" in out
+        assert log.is_file()  # Phase 3 didn't run
+        assert (tmp_path / ".devbench" / "window-stats" / "E0-F1-S1-T1.json").is_file()
+        assert "passes" in out
+        # Issue #168: report self-test reports non-zero indexed events
+        # (the seeded log has two state transitions => 2 events).
+        assert "report self-test" in out
+        assert "2 log event(s) indexed" in out
+
+    def test_report_self_test_warns_on_empty_log(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """Issue #168: when the orch-log set is empty (would have caught the
+        live regression I hit pre-#168), the self-test surfaces a structured
+        warning naming the rollback procedure."""
+        # Seed a workspace with a valid backlog but NO log content.
+        backlog_dir = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        backlog_dir.mkdir(parents=True)
+        (backlog_dir / "E0-F1-S1-T1.md").write_text(
+            "# E0-F1-S1-T1: Test\n\n## Status: in-queue\n\n"
+            "## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n"
+        )
+        (tmp_path / "BACKLOG.md").write_text(
+            "# Backlog\n\n## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
+            "|------|-------|------|-------------|----------|---------|\n"
+            "| E0 | x | 0 | 0 | 1 | 0 |\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Test | Task | in-queue | None | r | "
+            "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n"
+        )
+        empty_log_dir = tmp_path / "logs"
+        empty_log_dir.mkdir()
+        empty_log = empty_log_dir / "orchestrator.log"
+        empty_log.write_text("")  # empty log + no shards => 0 events expected
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli._resolve_log_file_path", return_value=empty_log),
+        ):
+            rc = cli.cmd_upgrade()
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "report self-test: 0 log events indexed" in out
+        # Rollback hint surfaces.
+        assert "Roll back via:" in out
+        assert "mv logs/legacy/orchestrator.log" in out
+
+    def test_report_self_test_passes_with_sharded_layout(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Issue #168 positive path: post-migration workspace (sharded
+        tree present, live log empty) -- reader integration finds events
+        in the shards and the self-test passes. This is the test that
+        would have FAILED pre-#168 because event_index wouldn't have
+        consumed the shard."""
+        # Backlog setup.
+        backlog_dir = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        backlog_dir.mkdir(parents=True)
+        (backlog_dir / "E0-F1-S1-T1.md").write_text(
+            "# E0-F1-S1-T1: Test\n\n## Status: done\n\n"
+            "## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n"
+        )
+        (tmp_path / "BACKLOG.md").write_text(
+            "# Backlog\n\n## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
+            "|------|-------|------|-------------|----------|---------|\n"
+            "| E0 | x | 1 | 0 | 0 | 0 |\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Test | Task | done | None | r | "
+            "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n"
+        )
+        # Sharded tree with one shard.
+        shard = tmp_path / "logs" / "2026-05" / "E0-F1-S1-T1.jsonl"
+        shard.parent.mkdir(parents=True)
+        shard.write_text(
+            "2026-05-04T10:00:00Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'in-progress'\n"
+            "2026-05-04T11:00:00Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'done'\n"
+        )
+        # Empty live log.
+        live_log = tmp_path / "logs" / "orchestrator.log"
+        live_log.write_text("")
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli._resolve_log_file_path", return_value=live_log),
+        ):
+            rc = cli.cmd_upgrade()
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        # Self-test sees the 2 events from the shard.
+        assert "report self-test: 2 log event(s) indexed" in out
+
+    def test_rerun_idempotent(self, tmp_path: Path) -> None:
+        log = self._seed_minimal_workspace(tmp_path)
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli._resolve_log_file_path", return_value=log),
+        ):
+            assert cli.cmd_upgrade() == 0
+            assert cli.cmd_upgrade() == 0
+
+    def test_destructive_flag_runs_phase_3(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        log = self._seed_minimal_workspace(tmp_path)
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli._resolve_log_file_path", return_value=log),
+        ):
+            rc = cli.cmd_upgrade("--migrate-log-shards")
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "migrated" in out
+        assert not log.exists()
+        assert (tmp_path / "logs" / "legacy" / "orchestrator.log").is_file()
+        assert (tmp_path / "logs" / "2026-05" / "E0-F1-S1-T1.jsonl").is_file()
+
+    def test_rejects_extra_positional(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_upgrade("--migrate-log-shards", "extra")
+        assert rc == 1
+        assert "no positional" in capsys.readouterr().err
+
+    def test_self_test_failure_when_backlog_missing(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        log = tmp_path / "logs" / "orchestrator.log"
+        log.parent.mkdir(parents=True)
+        log.write_text("seed\n")
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli._resolve_log_file_path", return_value=log),
+        ):
+            rc = cli.cmd_upgrade()
+        assert rc == 0  # migrations succeeded; self-test failure surfaces but doesn't fail rc
+        assert "parser-load failed" in capsys.readouterr().out
+
+    def test_phase_3_with_flag_handles_missing_log(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        backlog_dir = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        backlog_dir.mkdir(parents=True)
+        (backlog_dir / "E0-F1-S1-T1.md").write_text(
+            "# E0-F1-S1-T1: Test\n\n## Status: in-queue\n\n"
+            "## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n"
+        )
+        (tmp_path / "BACKLOG.md").write_text(
+            "# Backlog\n\n## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
+            "|------|-------|------|-------------|----------|---------|\n"
+            "| E0 | x | 0 | 0 | 1 | 0 |\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Test | Task | in-queue | None | r | "
+            "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n"
+        )
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli._resolve_log_file_path", return_value=tmp_path / "nope.log"),
+        ):
+            rc = cli.cmd_upgrade("--migrate-log-shards")
+        assert rc == 0
+        assert "nothing to migrate" in capsys.readouterr().out
+
+    def test_cache_present_message(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        log = self._seed_minimal_workspace(tmp_path)
+        cache_dir = tmp_path / ".devbench" / "report-cache"
+        cache_dir.mkdir(parents=True)
+        (cache_dir / "events.sqlite").write_bytes(b"sqlite-fixture")
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli._resolve_log_file_path", return_value=log),
+        ):
+            cli.cmd_upgrade()
+        assert "cache present" in capsys.readouterr().out
+
+    def test_snapshot_present_message(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        log = self._seed_minimal_workspace(tmp_path)
+        snapshot_dir = tmp_path / ".devbench"
+        snapshot_dir.mkdir()
+        (snapshot_dir / "report-snapshot.json").write_text("{}")
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli._resolve_log_file_path", return_value=log),
+        ):
+            cli.cmd_upgrade()
+        assert "snapshot present" in capsys.readouterr().out
+
+    def test_log_absent_phase_2_message(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        backlog_dir = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        backlog_dir.mkdir(parents=True)
+        (backlog_dir / "E0-F1-S1-T1.md").write_text(
+            "# E0-F1-S1-T1: Test\n\n## Status: in-queue\n\n"
+            "## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n"
+        )
+        (tmp_path / "BACKLOG.md").write_text(
+            "# Backlog\n\n## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
+            "|------|-------|------|-------------|----------|---------|\n"
+            "| E0 | x | 0 | 0 | 1 | 0 |\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Test | Task | in-queue | None | r | "
+            "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n"
+        )
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli._resolve_log_file_path", return_value=tmp_path / "nope.log"),
+        ):
+            cli.cmd_upgrade()
+        assert "orchestrator log absent" in capsys.readouterr().out
+
+    def test_pyarrow_absent_phase_7_message(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        log = self._seed_minimal_workspace(tmp_path)
+
+        def _no_pyarrow(name: str) -> object | None:
+            if name == "pyarrow":
+                return None
+            import importlib.util as _real
+
+            return _real.find_spec(name)
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli._resolve_log_file_path", return_value=log),
+            patch("importlib.util.find_spec", side_effect=_no_pyarrow),
+        ):
+            cli.cmd_upgrade()
+        out = capsys.readouterr().out
+        assert "pyarrow not installed" in out
+        assert "pip install devbench[archive]" in out
+
+    def test_pyarrow_present_phase_7_message(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        log = self._seed_minimal_workspace(tmp_path)
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli._resolve_log_file_path", return_value=log),
+        ):
+            cli.cmd_upgrade()
+        assert "Phase 7 (Parquet archive, opt-in)" in capsys.readouterr().out

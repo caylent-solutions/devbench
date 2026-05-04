@@ -159,12 +159,24 @@ Once the operator flips the manual blocker to `done`, every dependent that has o
 
 ## What `devbench report` shows
 
-A manual blocker appears in two places in `devbench report`:
+A manual blocker appears in panel 3 of the report ("Blocked tasks (needs operator attention)"):
 
-1. Under "Blocked tasks (needs operator attention)" -- because its own status is `blocked` with no dep that could clear it. This is the normal place an operator sees the gate they need to flip.
-2. Each dependent Task lists the manual blocker in its waiting line (e.g., `[waiting on E0-F<N>-S1-T1]`).
+1. The blocker work unit itself appears as a row.
+2. Every dependent Task appears under the same panel with an inline annotation that names the blocker.
 
-The 2-bucket split (auto-clearing vs needs-attention) lets operators quickly see which blocks they need to act on (the manual ones) versus which ones the orchestrator's task-factory will clear on its own (proposal-promote chain).
+Panel 3 is sorted deterministically by sub-case so the operator's eye lands on related items together: HOLD work units lead, then BLOCKED tasks waiting on each HOLD unit cluster directly underneath, then residual no-marker / unknown-target / all-marker-targets-terminal cases follow.
+
+Inline annotation vocabulary:
+
+- `[HOLD]` -- the row itself is a HOLD unit (operator put it there with `devbench hold`; cleared via `devbench unhold`).
+- `[HOLD: <id>]` -- the row is a BLOCKED task whose `[BLOCKED_PENDING_PROPOSAL]` marker target is in HOLD; it cannot clear until the operator unhols the target.
+- `[no marker]` -- BLOCKED with no marker and no recovery signal; operator must investigate.
+- `[marker target unknown: <id>]` -- the marker points at an ID with no backlog row; cascade cannot resolve.
+- `[marker targets all terminal]` -- every marker target reached `done` / `declined` but the cascade did not fire.
+
+`HOLD` (status, not `blocked`) is the modern preferred mechanism for an intentional gate: it makes the operator intent explicit (set via `devbench hold`, cleared via `devbench unhold`), and the report surfaces it with `[HOLD]` rather than the diagnostic `[no marker]` / `[needs review]` annotation that BLOCKED-with-no-marker carries. The legacy "blocked + DO NOT CLAIM" pattern still works and is still surfaced under panel 3 (with `[no marker]` annotation) for backwards compatibility with existing manual blockers.
+
+The 3-bucket split (auto-clearing via proposal / auto-recovery in flight / needs operator attention) lets operators quickly see which blocks they need to act on (panel 3) versus which ones the orchestrator's task-factory will clear on its own (panels 1 and 2).
 
 ## Anti-patterns
 

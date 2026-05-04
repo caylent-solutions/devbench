@@ -641,6 +641,22 @@ class BacklogManager:
             canonical,
         )
 
+        # Issue #162 Phase 2 (ADR-17): every task-state transition lands
+        # in a per-task aggregate JSON at
+        # ``<workspace>/.devbench/window-stats/<task-id>.json`` so the
+        # reporter can read aggregates instead of re-scanning the log.
+        # Single hook point: every public transition method routes
+        # through ``_set_status``, so this one call covers all of them.
+        # Stories / Features / Epics are skipped (their state is auto-
+        # rolled from children; window-stats only tracks tasks).
+        if "-T" in unit_id:
+            from datetime import UTC, datetime
+
+            from devbench.reporting.window_stats import update_aggregate
+
+            workspace_root = backlog_index.parent
+            update_aggregate(workspace_root, unit_id, canonical, datetime.now(UTC))
+
         if canonical in _TERMINAL_CHILD_STATUSES:
             # Issue #147: every terminal transition (``done`` AND ``declined``)
             # fires the auto-requeue cascade. Previously only ``mark_done``

@@ -82,6 +82,7 @@ from devbench.constants import (
     SIDE_BY_SIDE_GAP_CHARS,
     TOKENS_PER_MILLION,
 )
+from devbench.reporting.event_index import EventIndex
 
 _log = logging.getLogger("devbench.reporting.report")
 
@@ -234,6 +235,13 @@ def _find_current_session_start(
     ``gap_minutes`` between consecutive non-noise entries marks the start of
     the current session. If no gap exceeds the threshold, the session start
     is the earliest non-noise entry.
+
+    Issue #162: an indexed equivalent
+    (``_find_current_session_start_from_index``) is preferred by
+    ``generate_report``; this string-input form is kept because the
+    existing test suite calls it directly with crafted log payloads
+    and because the parity tests use both forms to assert that the
+    indexed path produces the same boundary as the parser path.
     """
     events: list[datetime] = []
     for m in _LOG_LINE_RE.finditer(log_text):
@@ -242,9 +250,45 @@ def _find_current_session_start(
             continue
         events.append(_parse_ts(m.group(1)))
 
+    return _walk_for_session_boundary(events, gap_minutes)
+
+
+def _find_current_session_start_from_index(
+    event_index: EventIndex,
+    log_path: Path,
+    gap_minutes: int = DEFAULT_SESSION_GAP_MINUTES,
+    *,
+    workspace_root: Path | None = None,
+) -> datetime | None:
+    """Indexed equivalent of ``_find_current_session_start`` (issue #162 Phase 1+4).
+
+    Same gap-walking logic; the difference is that the timestamps come
+    from indexed SQL queries instead of a regex full-scan of the whole
+    log file. The boundary semantics are identical -- the parity test
+    ``TestParityAgainstParserPath::test_session_boundary_matches_parser``
+    pins this.
+
+    Issue #168: when ``workspace_root`` is provided, the timestamps are
+    pulled from the union of orch-log shards + live log so post-Phase-3-
+    migration workspaces detect the session boundary across the merged
+    history. When ``workspace_root`` is None (legacy callers / tests),
+    the single-file query path runs unchanged.
+    """
+    if workspace_root is not None:
+        events = event_index.non_noise_log_timestamps_for_workspace(workspace_root, log_path, LOG_NOISE_LOGGER_NAME)
+    else:
+        events = event_index.non_noise_log_timestamps(log_path, LOG_NOISE_LOGGER_NAME)
+    return _walk_for_session_boundary(events, gap_minutes)
+
+
+def _walk_for_session_boundary(events: list[datetime], gap_minutes: int) -> datetime | None:
+    """Run the gap-walk used by both the parser and indexed session detectors.
+
+    Centralised so the two callers cannot drift; the gap rule and the
+    "no events -> None" semantic live in exactly one place.
+    """
     if not events:
         return None
-
     threshold = timedelta(minutes=gap_minutes)
     session_start = events[0]
     for prev, curr in pairwise(events):
@@ -340,6 +384,21 @@ def _hook_log_path(log_path: Path) -> Path:
     if candidate.is_file():
         return candidate
     return BACKLOG_INDEX.parent / "hook-logs.jsonl"
+
+
+def _resolve_transcript_dir(event_index: EventIndex, hook_log_path: Path) -> Path | None:
+    """Issue #162 Phase 1+4: resolve transcript dir via the cache, falling back to file scan.
+
+    The hook-log cache stores ``transcript_path`` for every entry that
+    carries one, so the resolver becomes a single SELECT instead of a
+    re-read of the hook log every invocation. The fallback path
+    triggers only when the cache is empty (first run on this workspace);
+    after that one-time scan the index serves the answer.
+    """
+    cached = event_index.first_hook_transcript_path(hook_log_path)
+    if cached:
+        return Path(cached).parent
+    return _discover_transcript_dir(hook_log_path)
 
 
 def _discover_transcript_dir(hook_log_path: Path) -> Path | None:
@@ -649,6 +708,73 @@ def _recent_pace_minutes(
     return sum(durations) / len(durations)
 
 
+def _recent_per_task_cost(
+    log_path: Path,
+    done_times: dict[str, datetime],
+    progress_times: dict[str, datetime],
+    n: int,
+    *,
+    event_index: EventIndex | None = None,
+) -> float | None:
+    """Cost per task averaged over the most-recent ``n`` task completions, log-wide.
+
+    Issue #164: the legacy cost-projection denominator was the per-window
+    completion count, which produced different "Estimated total cost at
+    completion" numbers per column for the same physical workspace. The
+    correct denominator is a global rate -- the same approach the existing
+    ``_recent_pace_minutes`` already uses for the time projection.
+
+    Implementation: take the most-recent ``n`` task completions log-wide
+    (where each must have both a ``progress`` and a ``done`` timestamp),
+    determine the umbrella interval ``[earliest_progress, now]``, sum the
+    hook + transcript token costs across that interval, and divide by
+    ``n``. The umbrella interval is intentionally open-ended on the upper
+    side because the underlying ``aggregate_*_window`` helpers only take
+    a ``window_start`` parameter; the slight overcount of any cost that
+    falls AFTER the latest done timestamp is tolerable because (a) the
+    orchestrator is between tasks at that moment and (b) the cost still
+    belongs to the orchestrate session under measurement.
+
+    Returns None when fewer than ``n`` task completions have valid
+    progress + done pairs (callers fall back to the per-window average,
+    matching the existing ``recent_pace_minutes`` fallback contract).
+    """
+    task_done = [(tid, ts) for tid, ts in done_times.items() if "-T" in tid and tid in progress_times]
+    if len(task_done) < n:
+        return None
+    task_done.sort(key=lambda kv: kv[1], reverse=True)
+    recent_n = task_done[:n]
+    earliest_progress = min(progress_times[tid] for tid, _ in recent_n)
+
+    hook_log_path = _hook_log_path(log_path)
+    if event_index is not None:
+        transcript_dir_indexed = _resolve_transcript_dir(event_index, hook_log_path)
+        totals_hook = HookLogTotals(**event_index.aggregate_hook_window(hook_log_path, earliest_progress))
+        totals_transcript = HookLogTotals(
+            **event_index.aggregate_transcript_window(transcript_dir_indexed, earliest_progress)
+        )
+    else:
+        totals_hook = _parse_hook_log_metrics(log_path, earliest_progress)
+        transcript_dir = _discover_transcript_dir(hook_log_path)
+        totals_transcript = _parse_transcript_metrics(transcript_dir, earliest_progress)
+    totals = _combine_totals(totals_hook, totals_transcript)
+
+    rate_factor = 1.0 - TOKEN_COST_DISCOUNT
+    cost = _compute_cost(
+        totals,
+        TOKEN_COST_PER_M_INPUT * rate_factor,
+        TOKEN_COST_PER_M_OUTPUT * rate_factor,
+        REPORT_CACHE_READ_MULTIPLIER,
+        REPORT_CACHE_WRITE_5MIN_MULTIPLIER,
+        REPORT_CACHE_WRITE_1HR_MULTIPLIER,
+        data_residency_multiplier=REPORT_DATA_RESIDENCY_MULTIPLIER,
+        fast_mode_multiplier=REPORT_FAST_MODE_MULTIPLIER,
+    )
+    if n <= 0:
+        return None
+    return cost.total_cost / n
+
+
 def _compute_window_stats(
     log_path: Path,
     window_start: datetime,
@@ -658,6 +784,10 @@ def _compute_window_stats(
     tasks_active: int,
     tasks_blocked_recovery: int = 0,
     tasks_blocked_auto: int = 0,
+    *,
+    event_index: EventIndex | None = None,
+    recent_per_task_cost: float | None = None,
+    lifetime_total_cost: float | None = None,
 ) -> WindowStats:
     """Compute all time-windowed statistics for a single window.
 
@@ -669,6 +799,15 @@ def _compute_window_stats(
     genuine halts with unbounded ETA. When the recent-pace window has
     fewer than ``MIN_PACE_SAMPLES`` completed tasks the pace fallback
     path is taken; ``est_hours`` reads zero (renderer shows "n/a").
+
+    Issue #162 Phase 1+4: when ``event_index`` is supplied, hook-log
+    and transcript aggregations are served by indexed SQL range scans
+    instead of full-file re-parses. When ``event_index`` is ``None``
+    the legacy parser path runs unchanged so direct callers (the
+    existing test suite, ad-hoc invocations) keep their previous
+    behaviour. Both paths produce identical output for the same input
+    -- the parity is asserted by the regression tests in
+    ``test_event_index.py::TestParityAgainstParserPath``.
     """
     window_hours = (window_end - window_start).total_seconds() / SECONDS_PER_HOUR
 
@@ -695,10 +834,20 @@ def _compute_window_stats(
     #   1. hook-logs.jsonl: subagent (Agent tool) invocations -- captures executor / judge / etc costs
     #   2. Claude Code transcripts: per-turn outer-session reasoning -- captures what the orchestrate
     #      skill itself spends between Agent calls. Without these, cost can be off by 10-20x.
+    # Issue #162: when ``event_index`` is supplied the totals come from
+    # indexed SQL range-scans of the persistent cache (~ms cost). When
+    # ``event_index`` is None the legacy full-file parsers run.
     hook_log_path = _hook_log_path(log_path)
-    totals_hook = _parse_hook_log_metrics(log_path, window_start)
-    transcript_dir = _discover_transcript_dir(hook_log_path)
-    totals_transcript = _parse_transcript_metrics(transcript_dir, window_start)
+    if event_index is not None:
+        transcript_dir_indexed = _resolve_transcript_dir(event_index, hook_log_path)
+        totals_hook = HookLogTotals(**event_index.aggregate_hook_window(hook_log_path, window_start))
+        totals_transcript = HookLogTotals(
+            **event_index.aggregate_transcript_window(transcript_dir_indexed, window_start)
+        )
+    else:
+        totals_hook = _parse_hook_log_metrics(log_path, window_start)
+        transcript_dir = _discover_transcript_dir(hook_log_path)
+        totals_transcript = _parse_transcript_metrics(transcript_dir, window_start)
     totals = _combine_totals(totals_hook, totals_transcript)
     # Apply the configured token-cost discount (contract rate / correction
     # factor off list) to the base input/output rates. final = list * (1 - d).
@@ -730,10 +879,39 @@ def _compute_window_stats(
         + totals.cache_write_1h_tokens
     )
     tokens_per_task = total_tokens_window / tasks_in_window if tasks_in_window else 0.0
-    # Issue #157: cost projection uses the same denominator as ETA (active +
-    # auto-recovery buckets) so the cost forecast scales with the same task
-    # set the ETA forecast does.
-    est_total_cost = cost.total_cost + (cost.total_cost / tasks_in_window * eta_task_count if tasks_in_window else 0.0)
+    # Issue #164: cost projection now uses a GLOBAL recent-pace per-task
+    # rate (computed once log-wide by ``_recent_per_task_cost`` and passed
+    # in by the caller) instead of the window-specific ``tasks_in_window``
+    # denominator. The window-specific denominator was producing wildly
+    # different "Estimated total cost at completion" numbers per column
+    # (e.g. $13k all-time vs $42k session vs $8 this-run) for the same
+    # physical workspace; completion is one global event, not three.
+    # Fallback chain: recent-pace global rate (most accurate) ->
+    # window's own per-task average (legacy behaviour, matches the
+    # per-pace-minutes fallback path) -> zero (no data).
+    #
+    # Spanning-row follow-up: the multiplier above is global, but the
+    # ADDITIVE base ``cost.total_cost`` is window-scoped, so per-column
+    # est_total_cost values still diverged by exactly the cost-so-far
+    # delta between windows (All-time spend > Session spend > This-run
+    # spend). The render-side ``_merge_spanning_values`` collapse only
+    # fires when every column produces an identical string, so the row
+    # never collapsed in practice. Threading ``lifetime_total_cost``
+    # (the All-time cost.total_cost, computed once by ``generate_report``
+    # before any narrower window) gives every column the same additive
+    # base; the projection becomes a single global number, the spanning
+    # collapse fires, and the report expresses the underlying truth:
+    # one global completion, one cost. ``lifetime_total_cost=None``
+    # preserves the legacy formula for direct test callers that exercise
+    # ``_compute_window_stats`` in isolation.
+    if recent_per_task_cost is not None:
+        per_task_cost = recent_per_task_cost
+    elif tasks_in_window:
+        per_task_cost = cost.total_cost / tasks_in_window
+    else:
+        per_task_cost = 0.0
+    additive_base = lifetime_total_cost if lifetime_total_cost is not None else cost.total_cost
+    est_total_cost = additive_base + per_task_cost * eta_task_count
 
     api_hours = totals.total_duration_ms / MS_PER_SECOND / SECONDS_PER_HOUR
     api_efficiency = (api_hours / window_hours * PERCENT_MULTIPLIER) if window_hours > 0 else None
@@ -1315,6 +1493,12 @@ _SPANNING_METRIC_LABELS: frozenset[str] = frozenset(
         f"Recent pace (last {RECENT_PACE_TASKS} tasks)",
         "Est. time to complete remaining",
         "Est. completion date/time",
+        # Issue #164: total-cost-at-completion is a global measure (one
+        # finishing point for the backlog). The narrower-window numbers
+        # were rendered as different per-column projections that couldn't
+        # all be right at once. Spanning the row makes the report express
+        # the underlying truth: one global completion, one cost projection.
+        "Estimated total cost at completion",
     }
 )
 
@@ -1621,17 +1805,41 @@ def _blocked_listing(units: list) -> list[str]:
     from devbench.backlog.proposal import (
         BlockedTaskState,
         classify_blocked_task,
+        panel3_annotation,
         recovery_signal_for_task,
     )
 
-    blocked_tasks = [u for u in units if u.unit_type == WorkUnitType.TASK and u.status == WorkUnitStatus.BLOCKED]
-    if not blocked_tasks:
+    # Issue #168 (3-panel surfacing): admit BOTH BLOCKED and HOLD task
+    # units. HOLD bypasses the classifier and goes directly into
+    # ``attn_rows`` because it represents a deliberate operator pause
+    # that no automation will clear -- the same operator-must-act class
+    # as the residual NEEDS_OPERATOR_ATTENTION sub-cases.
+    eligible = [
+        u
+        for u in units
+        if u.unit_type == WorkUnitType.TASK and u.status in (WorkUnitStatus.BLOCKED, WorkUnitStatus.HOLD)
+    ]
+    if not eligible:
         return []
 
     auto_rows: list[tuple] = []  # (unit, list[str] of marker targets)
     recovery_rows: list[tuple] = []  # (unit, signal-source string)
-    attn_rows: list = []
-    for u in blocked_tasks:
+    # Each attn row carries (group_rank, hold_target_or_empty, unit, annotation)
+    # so the renderer can sort by (group_rank, hold_target, unit_id) for
+    # deterministic output that clusters HOLD-related rows under the
+    # HOLD unit they wait on.
+    # Each tuple: (group_rank, hold_target_or_empty, unit, annotation).
+    # ``unit`` is a ``WorkUnit``; mypy's view of the iterator above is
+    # already a WorkUnit so we annotate concretely here so downstream
+    # ``.id`` / ``.title`` accesses type-check cleanly.
+    from devbench.backlog.work_unit import WorkUnit
+
+    attn_rows: list[tuple[int, str, WorkUnit, str]] = []
+    for u in eligible:
+        if u.status is WorkUnitStatus.HOLD:
+            # group_rank 0 -- HOLD units lead panel 3.
+            attn_rows.append((0, "", u, "[HOLD]"))
+            continue
         state = classify_blocked_task(
             BACKLOG_ROOT,
             BACKLOG_INDEX,
@@ -1650,7 +1858,18 @@ def _blocked_listing(units: list) -> list[str]:
             signal = recovery_signal_for_task(WORKSPACE_ROOT, u.id)
             recovery_rows.append((u, signal))
         else:
-            attn_rows.append(u)
+            group_rank, hold_target, annotation = panel3_annotation(
+                BACKLOG_ROOT,
+                BACKLOG_INDEX,
+                u.id,
+            )
+            attn_rows.append((group_rank, hold_target or "", u, annotation))
+
+    # Stable sort by (group_rank, hold_target_id, unit_id) so the panel-3
+    # rows cluster by cause: HOLD units lead, then the BLOCKED tasks
+    # waiting on each HOLD unit (grouped by the HOLD target id), then
+    # the residual no-marker / unknown-target / all-terminal cases.
+    attn_rows.sort(key=lambda r: (r[0], r[1], r[2].id))
 
     lines: list[str] = []
     if auto_rows:
@@ -1668,8 +1887,8 @@ def _blocked_listing(units: list) -> list[str]:
     if attn_rows:
         lines.append("")
         lines.append(f"Blocked tasks (needs operator attention) ({len(attn_rows)}):")
-        for u in attn_rows:
-            lines.append(f"  - {u.id}: {u.title}")
+        for _group_rank, _hold_target, u, annotation in attn_rows:
+            lines.append(f"  - {u.id}: {u.title}    {annotation}")
     return lines
 
 
@@ -1766,15 +1985,17 @@ def generate_report(
     Returns:
         Formatted report string ready for terminal output.
     """
-    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
-    units = parser.parse_index()
-    backlog = _backlog_totals_from_units(units)
-
     # Operator-alive banner (issue #161). Prepended to every render so
     # ``devbench report --watch N`` shows liveness state on every tick.
     # Threshold reuses ``stop_hook.window_seconds`` -- the same quiet
     # window the circuit-breaker tolerates -- so the banner stays aligned
     # with the operator's already-tuned cadence.
+    #
+    # The banner is computed BEFORE the snapshot short-circuit (issue
+    # #162 Phase 6) because the banner uses ``datetime.now()`` to
+    # express "last activity Ns ago" -- if we cached it inside the
+    # snapshot the elapsed-since string would freeze and a stalled
+    # orchestrator would still appear ALIVE on every watch tick.
     session_id = os.environ.get("JUDGE_ORCHESTRATOR_SESSION_ID", "").strip() or None
     banner_display_tz = _resolve_display_timezone(REPORT_DISPLAY_TIMEZONE or DISPLAY_TIMEZONE)
     banner_line = _orchestrator_liveness_banner(
@@ -1784,16 +2005,53 @@ def generate_report(
         display_tz=banner_display_tz,
     )
 
-    log_text = log_path.read_text(encoding="utf-8") if log_path.is_file() else ""
+    # Issue #162 Phase 6 (rendered-body snapshot) is deferred.
+    # A snapshot keyed on log mtime + size is fast but unsafe:
+    # cost-rate config (``TOKEN_COST_DISCOUNT``,
+    # ``TOKEN_COST_PER_M_INPUT/OUTPUT``, the cache + residency + fast-
+    # mode multipliers, the display timezone, ``RECENT_PACE_TASKS``)
+    # can change between invocations without the log advancing, and a
+    # snapshot keyed only on the log would silently return numbers
+    # computed against the old config. Per CLAUDE.md fail-fast: better
+    # to recompute and stay correct than cache and risk wrong cost
+    # output. Phases 1+4 alone already serve the report from indexed
+    # range scans, which is the dominant cost on the live workspace
+    # (196 MB hook log + 200+ MB transcripts) -- the marginal saving
+    # from Phase 6 over Phases 1+4 is small. The schema row
+    # ``report_snapshot`` is left in place for a future invocation-
+    # safe snapshot design (one that hashes the full config + BACKLOG
+    # mtime tree into the cache key).
+    event_index = EventIndex.open(WORKSPACE_ROOT)
 
-    done_times: dict[str, datetime] = {}
-    for m in _DONE_RE.finditer(log_text):
-        done_times[m.group(2)] = _parse_ts(m.group(1))
-    progress_times: dict[str, datetime] = {}
-    for m in _PROGRESS_RE.finditer(log_text):
-        progress_times[m.group(2)] = _parse_ts(m.group(1))
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    backlog = _backlog_totals_from_units(units)
 
-    all_timestamps: list[datetime] = [_parse_ts(m.group(1)) for m in _LOG_LINE_RE.finditer(log_text)]
+    # Issue #162 Phase 1+4 cache: refresh the persistent SQLite index
+    # against the orchestrator log + hook log + transcripts (each call
+    # is a mtime+size check + delta-only re-parse on append, full
+    # re-parse on rotation/truncation), then read aggregated views via
+    # indexed queries instead of full-file regex scans. The legacy
+    # text-parser path below is preserved as a fallback for callers
+    # that pass ``event_index=None`` to ``_compute_window_stats``
+    # directly (mostly the existing test suite, which tests the parser
+    # building blocks individually).
+    # Issue #168: route the orch-log refresh + queries through the
+    # workspace-aware variants so events from sharded shards (post
+    # Phase-3 migration) merge with the live flat log. When the
+    # workspace has no sharded layout, the workspace-aware path
+    # behaves identically to the legacy single-file path.
+    event_index.refresh_orch_log_sources(WORKSPACE_ROOT, log_path)
+    hook_log_path = _hook_log_path(log_path)
+    event_index.refresh_hook_log(hook_log_path)
+    transcript_dir = _resolve_transcript_dir(event_index, hook_log_path)
+    event_index.refresh_transcripts(transcript_dir)
+
+    done_times: dict[str, datetime] = event_index.task_transition_times_for_workspace(WORKSPACE_ROOT, log_path, "done")
+    progress_times: dict[str, datetime] = event_index.task_transition_times_for_workspace(
+        WORKSPACE_ROOT, log_path, "in-progress"
+    )
+    all_timestamps: list[datetime] = event_index.all_log_timestamps_for_workspace(WORKSPACE_ROOT, log_path)
     log_start_for_window, window_end, log_started = _resolve_window_endpoints(all_timestamps)
 
     # Precedence: report-specific (env JUDGE_REPORT_TIMEZONE > yaml
@@ -1801,6 +2059,20 @@ def generate_report(
     # yaml display_timezone) > OS local. REPORT_DISPLAY_TIMEZONE already
     # encodes the first pair; DISPLAY_TIMEZONE the second.
     display_tz = _resolve_display_timezone(REPORT_DISPLAY_TIMEZONE or DISPLAY_TIMEZONE)
+
+    # Issue #164: compute the global recent-pace per-task cost ONCE (it's
+    # log-wide, not window-specific) and reuse across every window's
+    # ``_compute_window_stats`` call. This is what makes the
+    # "Estimated total cost at completion" number consistent across the
+    # All-time / Session / This-run columns -- one global rate produces
+    # one global completion cost regardless of window.
+    recent_per_task_cost = _recent_per_task_cost(
+        log_path,
+        done_times,
+        progress_times,
+        RECENT_PACE_TASKS,
+        event_index=event_index,
+    )
 
     # Compute lifetime (since-log-started) stats once. Used to enrich the top
     # box with cost / token / cache-hit summary so the most relevant numbers
@@ -1815,12 +2087,21 @@ def generate_report(
             backlog.tasks_active,
             backlog.tasks_blocked_recovery,
             backlog.tasks_blocked_auto,
+            event_index=event_index,
+            recent_per_task_cost=recent_per_task_cost,
         )
         if log_started is not None
         else None
     )
 
     lines: list[str] = [banner_line, ""]
+
+    # Spanning-row follow-up: thread the All-time cost (already paid in
+    # lifetime_stats above) as the additive base for every narrower
+    # window's est_total_cost. When lifetime_stats is None (no log
+    # started yet), fall through with None and the legacy per-window
+    # additive base applies -- there is nothing to collapse against.
+    lifetime_total_cost = lifetime_stats.cost.total_cost if lifetime_stats is not None else None
 
     if since is not None:
         # Single-window mode (legacy API for callers passing --since explicitly).
@@ -1836,6 +2117,9 @@ def generate_report(
             backlog.tasks_active,
             backlog.tasks_blocked_recovery,
             backlog.tasks_blocked_auto,
+            event_index=event_index,
+            recent_per_task_cost=recent_per_task_cost,
+            lifetime_total_cost=lifetime_total_cost,
         )
         lines.extend(backlog_state_block)
         lines.append("")
@@ -1857,7 +2141,7 @@ def generate_report(
         windows: list[WindowSpec] = [
             WindowSpec(label="All-time", start=log_start_for_window, is_log_started=True),
         ]
-        detected_session = _find_current_session_start(log_text)
+        detected_session = _find_current_session_start_from_index(event_index, log_path, workspace_root=WORKSPACE_ROOT)
         session_start = detected_session if detected_session is not None else log_start_for_window
         windows.append(WindowSpec(label="Session", start=session_start, is_log_started=False))
         if report_started_at is not None:
@@ -1878,6 +2162,9 @@ def generate_report(
                         backlog.tasks_active,
                         backlog.tasks_blocked_recovery,
                         backlog.tasks_blocked_auto,
+                        event_index=event_index,
+                        recent_per_task_cost=recent_per_task_cost,
+                        lifetime_total_cost=lifetime_total_cost,
                     )
                 )
 

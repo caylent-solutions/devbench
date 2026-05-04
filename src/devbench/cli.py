@@ -1579,8 +1579,18 @@ def _resolve_log_file_path() -> Path:
     raise SystemExit(1)
 
 
-def cmd_report(since: str = "", watch_interval: int = 0) -> int:
-    """Print a formatted progress report with velocity and completion stats."""
+def cmd_report(since: str = "", watch_interval: int = 0, once: bool = False) -> int:
+    """Print a formatted progress report with velocity and completion stats.
+
+    Issue #163: streams continuously by default when stdout is a TTY.
+    Pass ``once=True`` (or pipe / redirect stdout) to get the legacy
+    one-shot behaviour suitable for scripts and CI consumers.
+
+    The legacy ``--watch N`` flag is preserved for backward compatibility
+    but emits a deprecation notice and falls through to the streaming
+    loop (the integer interval is ignored; cadence is data-driven).
+    """
+    import warnings as _warnings
     from datetime import datetime
 
     from devbench.reporting.report import generate_report
@@ -1591,33 +1601,383 @@ def cmd_report(since: str = "", watch_interval: int = 0) -> int:
     if since:
         since_dt = datetime.strptime(since, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
 
-    if watch_interval > 0:
-        import time
+    # Issue #163 streaming-default contract:
+    # - --since is always one-shot (a frozen-window snapshot doesn't
+    #   benefit from continuous refresh).
+    # - --once forces one-shot (script / CI consumer escape hatch).
+    # - stdout-not-a-TTY forces one-shot (piping / redirecting).
+    # - --watch N is deprecated but still works; falls through to
+    #   streaming mode with a warning.
+    # - default on TTY -> streaming.
+    is_tty = sys.stdout.isatty()
+    force_once = once or (since_dt is not None) or not is_tty
 
-        # Capture watch loop start once so the "This run" column tracks activity
-        # since the user kicked off `devbench report --watch`, not since each tick.
-        report_started_at = datetime.now(UTC)
-        try:
-            while True:
-                # Delegate to the OS clear binary when available (`clear` /
-                # `cls`); it uses terminfo and reliably wipes scrollback on
-                # xterm.js (VS Code), iTerm, GNOME Terminal, Windows Terminal.
-                # Fallback: VT100 full reset (\033c) which works on every
-                # ANSI terminal but is more disruptive. The prior \033[3J
-                # escape didn't reliably clear scrollback in all terminals.
-                if _TERMINAL_CLEAR_CMD:
-                    subprocess.run([_TERMINAL_CLEAR_CMD], check=False)
-                else:
-                    print("\033c", end="", flush=True)
-                report = generate_report(log_path=log_file, since=since_dt, report_started_at=report_started_at)
-                print(report)
-                time.sleep(watch_interval)
-        except KeyboardInterrupt:
-            return 0
-    else:
+    if force_once:
+        # Issue #162 Phase 6: serve from the materialised snapshot when
+        # fresh (orchestrator log unchanged since the snapshot was
+        # written). Skips log parsing + per-window aggregation; falls
+        # back to live ``generate_report`` when the snapshot is stale,
+        # missing, or invalidated by a schema-version mismatch. The
+        # ``--since`` path always recomputes because a frozen-window
+        # snapshot is never the right answer for a custom-window query.
+        if since_dt is None:
+            from devbench.reporting.snapshot import read_snapshot
+
+            cached = read_snapshot(WORKSPACE_ROOT, log_file)
+            if cached is not None:
+                print(cached.report_text)
+                return 0
         report = generate_report(log_path=log_file, since=since_dt)
         print(report)
         return 0
+
+    if watch_interval > 0:
+        _warnings.warn(
+            "--watch is deprecated; streaming is now the default; the interval value is ignored",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
+    # Streaming mode. Build a closure over the constant inputs so the
+    # streaming loop's render_fn signature matches what
+    # devbench.reporting.streaming.stream_report expects (log_path
+    # keyword argument; everything else closed over).
+    from devbench.reporting.streaming import stream_report
+
+    report_started_at = datetime.now(UTC)
+
+    def _render(*, log_path: Path) -> str:
+        return generate_report(
+            log_path=log_path,
+            since=since_dt,
+            report_started_at=report_started_at,
+        )
+
+    return stream_report(log_file, _render)
+
+
+def cmd_upgrade(*argv: str) -> int:
+    """Idempotent migration to the latest devbench layout.
+
+    Issue #162 unified upgrade command (ADR-22). Detects workspace
+    state and runs the safe migrations automatically. Default-deny on
+    the Phase 3 destructive migration: only runs with
+    ``--migrate-log-shards``. Self-tests at the end via the
+    BacklogParser load so the operator sees pass/fail.
+
+    Re-running is a no-op (every step is idempotent).
+    """
+    args = list(argv)
+    confirm_log_migration = "--migrate-log-shards" in args
+    if confirm_log_migration:
+        args.remove("--migrate-log-shards")
+    if args:
+        print(
+            f"ERROR: upgrade takes no positional arguments; got {args!r}",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(f"[upgrade] workspace: {WORKSPACE_ROOT}")
+    print()
+
+    log_path = _resolve_log_file_path()
+
+    _upgrade_report_cache_phase()
+    _upgrade_window_stats_phase(log_path)
+    rc = _upgrade_sharded_log_phase(log_path, confirm_log_migration)
+    if rc != 0:
+        return rc
+    _upgrade_snapshot_phase()
+    _upgrade_archive_phase()
+    _upgrade_self_tests_phase()
+
+    print()
+    print("Done. Migrations complete; run `devbench report` to verify.")
+    return 0
+
+
+def _upgrade_report_cache_phase() -> None:
+    """Phase 1+4: SQLite cache. Self-healing; no operator action."""
+    print("Phase 1+4 (incremental cache + SQLite index):")
+    cache_path = WORKSPACE_ROOT / ".devbench" / "report-cache" / "events.sqlite"
+    if cache_path.is_file():
+        print(f"  cache present at {cache_path.relative_to(WORKSPACE_ROOT)}; reads serve from cache")
+    else:
+        print("  cache absent -> first `devbench report` will build from logs/orchestrator.log")
+    print("  no operator action needed")
+    print()
+
+
+def _upgrade_window_stats_phase(log_path: Path) -> None:
+    """Phase 2: window-stats aggregates. Idempotent rebuild."""
+    print("Phase 2 (window indices):")
+    if log_path.is_file():
+        from devbench.reporting.window_stats import rebuild_from_log
+
+        count = rebuild_from_log(WORKSPACE_ROOT, log_path)
+        print(f"  rebuilt {count} task aggregate(s) under .devbench/window-stats/")
+    else:
+        print("  orchestrator log absent -> nothing to aggregate yet")
+    print()
+
+
+def _upgrade_sharded_log_phase(log_path: Path, confirmed: bool) -> int:
+    """Phase 3: destructive log shard migration. Default-deny."""
+    print("Phase 3 (sharded event store):")
+    if not confirmed:
+        print("  ! DESTRUCTIVE: rewrites logs/orchestrator.log into logs/<YYYY-MM>/<task>.jsonl")
+        print("  ! original archived to logs/legacy/orchestrator.log (kept one release cycle)")
+        print("  Pass --migrate-log-shards to proceed. Skipping for now.")
+        print()
+        return 0
+    if not log_path.is_file():
+        print("  orchestrator log absent -> nothing to migrate")
+        print()
+        return 0
+    from devbench.reporting.sharded_log import migrate_flat_to_sharded
+
+    try:
+        result = migrate_flat_to_sharded(WORKSPACE_ROOT, log_path)
+    except FileNotFoundError as exc:
+        print(f"  ERROR: {exc}")
+        return 1
+    print(
+        f"  migrated {result['lines_processed']} lines into "
+        f"{result['shards_written']} task shard(s) + "
+        f"{result['meta_shards_written']} meta shard(s)"
+    )
+    print("  original archived to logs/legacy/orchestrator.log")
+    print()
+    return 0
+
+
+def _upgrade_snapshot_phase() -> None:
+    """Phase 6: snapshot. Self-healing on next iteration."""
+    print("Phase 6 (materialised snapshots):")
+    snapshot_file = WORKSPACE_ROOT / ".devbench" / "report-snapshot.json"
+    if snapshot_file.is_file():
+        print(f"  snapshot present at {snapshot_file.relative_to(WORKSPACE_ROOT)}")
+    else:
+        print("  snapshot absent -> next orchestrate iteration will write it")
+    print("  no operator action needed")
+    print()
+
+
+def _upgrade_archive_phase() -> None:
+    """Phase 7: Parquet archive. Opt-in dep check only."""
+    print("Phase 7 (Parquet archive, opt-in):")
+    import importlib.util
+
+    if importlib.util.find_spec("pyarrow") is not None:
+        print("  pyarrow installed; archive ended sessions via `devbench archive-session <id>`")
+    else:
+        print("  pyarrow not installed (skipped)")
+        print("  to enable: pip install devbench[archive], then `devbench archive-session <id>`")
+    print()
+
+
+def _upgrade_self_tests_phase() -> None:
+    """Self-tests: parser load + report log-event coverage.
+
+    Issue #168: the report-event self-test was added after a live
+    regression where the Phase 3 migration archived the source log
+    and `devbench report` returned an empty view because the reader
+    didn't yet consume the sharded tree. The check runs an indexed
+    refresh against the workspace's full orch-log set and asserts at
+    least one event was indexed; surfaces a structured warning when
+    the set is empty so future operators see the failure mode
+    immediately.
+
+    Both tests are non-fatal -- a failure prints a structured warning
+    but does not change the upgrade exit code. The migrations
+    themselves succeeded; the self-test is a defensive observability
+    layer, not a gate.
+    """
+    print("Self-tests:")
+    from devbench.backlog.parser import BacklogParser
+    from devbench.reporting.event_index import EventIndex
+
+    try:
+        parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+        parser.parse_index()
+        print("  ✓ devbench validate-backlog (parser load) passes")
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"  ! parser-load failed: {exc}")
+        print("    re-run after fixing the backlog state, or check JUDGE_WORKSPACE_ROOT")
+
+    log_path = _resolve_log_file_path()
+    try:
+        idx = EventIndex.open(WORKSPACE_ROOT)
+    except (OSError, RuntimeError) as exc:
+        print(f"  ! report self-test skipped (cache unavailable): {exc}")
+        return
+    try:
+        idx.refresh_orch_log_sources(WORKSPACE_ROOT, log_path)
+        all_ts = idx.all_log_timestamps_for_workspace(WORKSPACE_ROOT, log_path)
+    finally:
+        idx.close()
+    if all_ts:
+        print(f"  ✓ report self-test: {len(all_ts)} log event(s) indexed across the workspace's orch-log set")
+    else:
+        print("  ! report self-test: 0 log events indexed.")
+        print("    No data in either logs/orchestrator.log or any sharded shard.")
+        print("    If you just ran --migrate-log-shards and see this, file an issue: the")
+        print("    reader integration may have regressed. Roll back via:")
+        print("      mv logs/legacy/orchestrator.log logs/orchestrator.log && rm -rf logs/<YYYY-MM>/")
+
+
+def cmd_migrate_log_shards(*argv: str) -> int:
+    """Partition ``logs/orchestrator.log`` into a sharded tree.
+
+    Issue #162 Phase 3 (ADR-18). DESTRUCTIVE: rewrites the flat log
+    into ``logs/<YYYY-MM>/<task>.jsonl`` shards and archives the
+    original to ``logs/legacy/orchestrator.log`` for one release
+    cycle. Refuses to run unless ``--migrate-log-shards`` is passed
+    (CLAUDE.md execute-with-care default-deny). Reversible: restore
+    by deleting ``logs/<YYYY-MM>/`` and renaming the legacy log back.
+
+    The orchestrator continues writing to a fresh
+    ``logs/orchestrator.log`` after migration; readers merge the
+    sharded tree (historical) with the live flat log (recent).
+    """
+    args = list(argv)
+    confirmed = "--migrate-log-shards" in args
+    if confirmed:
+        args.remove("--migrate-log-shards")
+    if args:
+        print(
+            f"ERROR: migrate-log-shards takes no positional arguments; got {args!r}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if not confirmed:
+        print(
+            "migrate-log-shards: refusing to run without --migrate-log-shards.\n"
+            "  This rewrites your orchestrator log into logs/<YYYY-MM>/<task>.jsonl\n"
+            "  shards and archives the original to logs/legacy/orchestrator.log.\n"
+            "  Pass --migrate-log-shards to proceed."
+        )
+        return 0
+
+    from devbench.reporting.sharded_log import migrate_flat_to_sharded
+
+    log_path = _resolve_log_file_path()
+    try:
+        result = migrate_flat_to_sharded(WORKSPACE_ROOT, log_path)
+    except FileNotFoundError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    print(
+        f"migrate-log-shards: processed {result['lines_processed']} lines into "
+        f"{result['shards_written']} task shard(s) + "
+        f"{result['meta_shards_written']} meta shard(s); "
+        f"original archived to logs/legacy/orchestrator.log"
+    )
+    return 0
+
+
+def cmd_archive_session(*argv: str) -> int:
+    """Convert an ended session's JSONL log to a Parquet cold archive.
+
+    Issue #162 Phase 7 (ADR-21). Opt-in via ``pip install devbench[archive]``;
+    raises a structured error if ``pyarrow`` isn't installed.
+
+    Usage: ``devbench archive-session <session-id> [--log-path <path>]``.
+    Default ``--log-path`` is the workspace's standard orchestrator log;
+    pass an explicit path when archiving a sibling log file (rare).
+    """
+    from devbench.reporting.archive import (
+        ArchiveDependencyMissingError,
+        archive_session,
+    )
+
+    args = list(argv)
+    log_path_override: Path | None = None
+    if "--log-path" in args:
+        idx = args.index("--log-path")
+        if idx + 1 >= len(args):
+            print("ERROR: --log-path requires a value", file=sys.stderr)
+            return 1
+        log_path_override = Path(args[idx + 1])
+        del args[idx : idx + 2]
+    if len(args) != 1:
+        print(
+            "ERROR: archive-session takes exactly one positional argument: <session-id>",
+            file=sys.stderr,
+        )
+        return 1
+    session_id = args[0]
+    log_path = log_path_override if log_path_override is not None else _resolve_log_file_path()
+
+    try:
+        out_path = archive_session(WORKSPACE_ROOT, session_id, log_path)
+    except ArchiveDependencyMissingError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    except FileNotFoundError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"archive-session: wrote {out_path}")
+    return 0
+
+
+def cmd_rebuild_window_stats(*argv: str) -> int:
+    """Walk the orchestrator log and rebuild every per-task aggregate JSON.
+
+    Issue #162 Phase 2 (ADR-17). Idempotent; safe to run at any cadence.
+    Used by ``devbench upgrade`` after a version pull, by operators
+    after manually deleting ``.devbench/window-stats/``, and as a
+    correctness guarantee when an in-flight orchestrator restarts on
+    a workspace that didn't have the per-transition hook installed
+    when the first transitions happened.
+    """
+    if argv:
+        print(
+            f"ERROR: cmd_rebuild_window_stats takes no arguments; got {argv!r}",
+            file=sys.stderr,
+        )
+        return 1
+    from devbench.reporting.window_stats import rebuild_from_log
+
+    log_file = _resolve_log_file_path()
+    count = rebuild_from_log(WORKSPACE_ROOT, log_file)
+    print(f"rebuild-window-stats: wrote {count} per-task aggregate file(s) under .devbench/window-stats/")
+    return 0
+
+
+def cmd_write_snapshot(*argv: str) -> int:
+    """Render the report once and persist it to ``<workspace>/.devbench/report-snapshot.json``.
+
+    Issue #162 Phase 6 (ADR-20). Invoked by the orchestrate skill at the
+    end of every loop iteration so subsequent ``devbench report --once``
+    calls can serve from the snapshot in single-digit milliseconds
+    instead of re-parsing the orchestrator log + recomputing every
+    per-window aggregate. Idempotent; safe to invoke at any cadence.
+
+    Pure write -- never mutates the backlog or the orchestrator log.
+    Snapshot deletion is always safe; the next ``devbench report`` call
+    rebuilds via the live aggregation path.
+    """
+    if argv:
+        # No flags currently. Reject extras early so a future ``--force``
+        # flag etc. doesn't silently absorb garbage from an upgraded
+        # caller that uses a flag this version doesn't know.
+        print(
+            f"ERROR: cmd_write_snapshot takes no arguments; got {argv!r}",
+            file=sys.stderr,
+        )
+        return 1
+    from devbench.reporting.report import generate_report
+    from devbench.reporting.snapshot import write_snapshot
+
+    log_file = _resolve_log_file_path()
+    report = generate_report(log_path=log_file)
+    write_snapshot(WORKSPACE_ROOT, report, log_file)
+    return 0
 
 
 def cmd_log(message: str) -> int:
@@ -4435,6 +4795,11 @@ def cmd_write_proposal(source_task_id: str) -> int:
         # the backlog repo (not in any configured target repo). The
         # recovery cascade has no valid endpoint for backlog-repo edits;
         # they're operator bookkeeping commits, not work-unit deliverables.
+        # NOTE: this filter runs BEFORE the prefix strip below because the
+        # filter classifies paths by their first segment matching a
+        # configured `checkout_directory`; stripping the prefix first
+        # would erase that signal and misclassify target-repo paths as
+        # backlog-repo paths.
         proposal, skipped_entries = _filter_backlog_repo_proposed_tasks(proposal)
         for skipped_id, skipped_files in skipped_entries:
             audit = (
@@ -4460,6 +4825,17 @@ def cmd_write_proposal(source_task_id: str) -> int:
                 )
             )
             return 0
+        # Issue #159: blocker-resolver agents sometimes prefix paths with
+        # the target repo's `checkout_directory` (e.g. `kanon/src/foo.py`
+        # when `kanon` is configured as the checkout directory). Strip
+        # the prefix so the persisted JSON carries repo-relative paths
+        # only, matching the manifest-path convention enforced by
+        # validate-backlog rule 11 + guard-work-unit-write.sh. Paths that
+        # match multiple configured `checkout_directories` are ambiguous
+        # and reject the whole proposal. Strip runs AFTER the backlog-
+        # repo filter so the filter can still classify by first-segment
+        # match with the unstripped paths.
+        proposal = _strip_checkout_directory_prefix(proposal)
         # Compute the dedup signature even when the agent did not stamp it.
         proposal = _stamp_fix_signature(proposal)
         # Issue #141: scan for an existing recovery task whose fix
@@ -4468,10 +4844,6 @@ def cmd_write_proposal(source_task_id: str) -> int:
         match = find_matching_pending_proposal(WORKSPACE_ROOT, proposal.fix_signature)
         if match is not None and match.source_task_id != source_task_id:
             return _wire_recovery_reuse(source_task_id, proposal, match)
-        # Manifest-path correctness (no em-dash, no checkout_directory prefix)
-        # is enforced by guard-work-unit-write.sh at the .md write step;
-        # proposal-JSON payloads here legitimately use checkout_directory-
-        # prefixed paths to flag target-repo ownership (Issue #146).
         written = write_proposal(WORKSPACE_ROOT, proposal)
     except (_ProposalInputError, ProposalError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
@@ -4559,6 +4931,68 @@ def _file_lives_in_a_target_repo(file_path: str) -> bool:
         if checkout and first_segment == checkout:
             return True
     return False
+
+
+def _strip_checkout_directory_prefix(proposal: Proposal) -> Proposal:
+    """Issue #159: strip ``<checkout_directory>/`` prefixes from every
+    ``proposed_tasks[*].files_to_own`` entry.
+
+    blocker-resolver agents occasionally emit paths prefixed with the
+    target repo's ``checkout_directory`` (e.g. ``kanon/src/foo.py`` when
+    ``kanon`` is configured as the kanon repo's ``checkout_directory``).
+    Persisted as-is, those paths fail validate-backlog rule 11 on every
+    iteration and require operator hand-fix via ``sed``. The strip here
+    makes the agent's output canonical regardless of whether it
+    remembered to stay repo-relative.
+
+    Raises ``ProposalError`` when a single path matches multiple
+    configured ``checkout_directories`` (rare; only when checkout
+    directories share a common ancestor segment). Operator must fix the
+    ambiguous path by hand rather than have devbench silently pick one
+    interpretation.
+    """
+    from dataclasses import replace as _replace
+
+    if not RUNTIME_CONFIG.repos:
+        return proposal
+
+    # Enumerate every configured checkout_directory (deterministic order
+    # so the multi-match error message is reproducible).
+    checkout_dirs: list[str] = sorted(
+        {
+            (
+                repo_cfg.checkout_directory
+                or (repo_cfg.validated_repo.split("/", 1)[1] if repo_cfg.validated_repo else "")
+            )
+            for repo_cfg in RUNTIME_CONFIG.repos.values()
+        }
+    )
+    checkout_dirs = [d for d in checkout_dirs if d]
+    if not checkout_dirs:
+        return proposal
+
+    new_tasks: list = []
+    for task in proposal.proposed_tasks:
+        new_files: list[str] = []
+        for raw in task.files_to_own:
+            matches = [d for d in checkout_dirs if raw == d or raw.startswith(d + "/")]
+            if len(matches) > 1:
+                raise ProposalError(
+                    f"proposed_tasks[{task.suggested_id}].files_to_own contains an ambiguous path "
+                    f"{raw!r}: matches multiple configured checkout_directories "
+                    f"({', '.join(matches)}); fix the proposal so the path is unambiguous."
+                )
+            if len(matches) == 1:
+                prefix = matches[0]
+                if raw == prefix:
+                    # Path IS the checkout directory itself (no file
+                    # selected). Skip; the agent must name a real file.
+                    continue
+                new_files.append(raw[len(prefix) + 1 :])
+            else:
+                new_files.append(raw)
+        new_tasks.append(_replace(task, files_to_own=new_files))
+    return _replace(proposal, proposed_tasks=new_tasks)
 
 
 def _filter_backlog_repo_proposed_tasks(proposal: Proposal) -> tuple[Proposal, list[tuple[str, list[str]]]]:
@@ -5337,7 +5771,41 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
     "report": (
         cmd_report,
         0,
-        "Progress report, renders All-time + Current run windows by default: report [--watch N] [since-timestamp]",
+        ("Progress report; streams on TTY by default: report [--once|--no-stream] [--since <ISO-8601>] [--watch N]"),
+    ),
+    "write-snapshot": (
+        cmd_write_snapshot,
+        0,
+        "Issue #162 Phase 6: render the report once and persist it to .devbench/report-snapshot.json",
+    ),
+    "rebuild-window-stats": (
+        cmd_rebuild_window_stats,
+        0,
+        (
+            "Issue #162 Phase 2: rebuild every .devbench/window-stats/"
+            "<task>.json aggregate from the orchestrator log (idempotent)"
+        ),
+    ),
+    "archive-session": (
+        cmd_archive_session,
+        1,
+        (
+            "Issue #162 Phase 7: archive a session's JSONL log to "
+            "logs/legacy/<session>.parquet (requires `pip install devbench[archive]`)"
+        ),
+    ),
+    "migrate-log-shards": (
+        cmd_migrate_log_shards,
+        0,
+        (
+            "Issue #162 Phase 3 (DESTRUCTIVE; requires --migrate-log-shards): "
+            "partition logs/orchestrator.log into logs/<YYYY-MM>/<task>.jsonl shards"
+        ),
+    ),
+    "upgrade": (
+        cmd_upgrade,
+        0,
+        "Idempotent migration to the latest devbench layout: upgrade [--migrate-log-shards]",
     ),
     "start": (cmd_start, 0, "Run orchestrate skill via Agent SDK (non-interactive)"),
     "watch": (
@@ -5448,6 +5916,16 @@ _VARIADIC_COMMANDS: frozenset[str] = frozenset(
         "reject-proposal",
         "validate-backlog",
         "log-rejection-feedback",
+        # Issue #162 Phase 6: pre-render the report into a snapshot file.
+        "write-snapshot",
+        # Issue #162 Phase 2: rebuild per-task window-stats aggregates from the log.
+        "rebuild-window-stats",
+        # Issue #162 Phase 7: archive an ended session's log to Parquet (opt-in dep).
+        "archive-session",
+        # Issue #162 Phase 3: destructive migration to a sharded event-store layout.
+        "migrate-log-shards",
+        # Issue #162 unified upgrade command (orchestrates all migrations).
+        "upgrade",
     }
 )
 
@@ -5477,11 +5955,29 @@ def _extract_watch_flag(raw_args: list[str]) -> tuple[int, list[str]]:
     return interval, filtered
 
 
-def _dispatch_watch_commands(command: str, watch_interval: int, args: list[str]) -> int | None:
+def _extract_once_flag(raw_args: list[str]) -> tuple[bool, list[str]]:
+    """Return ``(once, remaining_args)`` after stripping ``--once`` / ``--no-stream``.
+
+    Issue #163: ``--once`` (or its alias ``--no-stream``) forces the legacy
+    one-shot snapshot behaviour, suitable for CI / scripted consumers
+    that expect the report to print and exit. The default on a TTY is
+    streaming.
+    """
+    filtered: list[str] = []
+    once = False
+    for arg in raw_args:
+        if arg in ("--once", "--no-stream"):
+            once = True
+            continue
+        filtered.append(arg)
+    return once, filtered
+
+
+def _dispatch_watch_commands(command: str, watch_interval: int, args: list[str], once: bool = False) -> int | None:
     """Dispatch commands that take ``--watch N``. Return ``None`` if not handled."""
-    if command == "report" and watch_interval > 0:
+    if command == "report" and (watch_interval > 0 or once):
         since_arg = args[0] if args else ""
-        return cmd_report(since=since_arg, watch_interval=watch_interval)
+        return cmd_report(since=since_arg, watch_interval=watch_interval, once=once)
     if command == "watch" and watch_interval > 0:
         return cmd_watch(watch_interval=watch_interval)
     return None
@@ -5517,11 +6013,19 @@ def main() -> int:
     else:
         watch_interval, args = 0, sys.argv[2:]
 
+    # Issue #163: ``devbench report`` accepts ``--once`` / ``--no-stream``
+    # to force one-shot snapshot rendering even on a TTY. Strip the flag
+    # before the args reach the command function so the positional
+    # ``since`` slot stays well-defined.
+    once = False
+    if command == "report":
+        once, args = _extract_once_flag(args)
+
     if len(args) < min_args:
         print(f"Command '{command}' requires at least {min_args} argument(s)", file=sys.stderr)
         return 1
 
-    watch_rc = _dispatch_watch_commands(command, watch_interval, args)
+    watch_rc = _dispatch_watch_commands(command, watch_interval, args, once=once)
     if watch_rc is not None:
         return watch_rc
 

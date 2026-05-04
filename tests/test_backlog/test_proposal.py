@@ -1679,6 +1679,171 @@ class TestClassifyBlockedTask:
         state = classify_blocked_task(backlog_dir, tmp_path / "BACKLOG.md", "E0-F1-S1-T1")
         assert state is BlockedTaskState.NEEDS_OPERATOR_ATTENTION
 
+    def test_task_with_hold_marker_target_is_needs_attention(self, tmp_path: Path) -> None:
+        """Issue #168 (3-panel surfacing): HOLD-target marker -> NEEDS_OPERATOR_ATTENTION.
+
+        HOLD is non-terminal so the cascade cannot fire; HOLD will not
+        clear without operator action so AUTO_CLEARING_VIA_PROPOSAL is
+        a misclassification. Surface to panel 3.
+        """
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        workspace = self._workspace_with_markers(tmp_path, [("E0-F1-S1-T2", "hold")])
+        state = classify_blocked_task(workspace / "backlog", workspace / "BACKLOG.md", "E0-F1-S1-T1")
+        assert state is BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+
+    def test_task_with_hold_target_among_active_targets_is_needs_attention(self, tmp_path: Path) -> None:
+        """HOLD precedence: any HOLD target wins over in-queue / in-progress siblings.
+
+        Even though one of the marker targets is in-queue (would normally
+        return AUTO_CLEARING_VIA_PROPOSAL), the presence of a HOLD target
+        forces NEEDS_OPERATOR_ATTENTION because the cascade is gated on
+        every target reaching terminal and HOLD is non-terminal.
+        """
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        workspace = self._workspace_with_markers(tmp_path, [("E0-F1-S1-T2", "in-queue"), ("E0-F1-S1-T3", "hold")])
+        state = classify_blocked_task(workspace / "backlog", workspace / "BACKLOG.md", "E0-F1-S1-T1")
+        assert state is BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+
+
+class TestPanel3Annotation:
+    """Issue #168 (3-panel surfacing): panel3_annotation routing + sort key."""
+
+    def _workspace_with_markers(self, tmp_path: Path, marker_target_status_pairs: list[tuple[str, str]]) -> Path:
+        return TestClassifyBlockedTask()._workspace_with_markers(tmp_path, marker_target_status_pairs)
+
+    def test_hold_marker_target_returns_group_1_with_hold_annotation(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import panel3_annotation
+
+        workspace = self._workspace_with_markers(tmp_path, [("E0-F1-S1-T2", "hold")])
+        group_rank, hold_target, annotation = panel3_annotation(
+            workspace / "backlog", workspace / "BACKLOG.md", "E0-F1-S1-T1"
+        )
+        assert group_rank == 1
+        assert hold_target == "E0-F1-S1-T2"
+        assert annotation == "[HOLD: E0-F1-S1-T2]"
+
+    def test_no_marker_returns_group_2_with_no_marker_annotation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from devbench.backlog import proposal as proposal_mod
+        from devbench.backlog.proposal import panel3_annotation
+
+        source = tmp_path / "fake.md"
+        source.write_text("# fake\n\n## Status: blocked\n")
+        monkeypatch.setattr(proposal_mod, "_find_source_task_file", lambda *a, **kw: source)
+
+        class _NoMarkers:
+            def _extract_pending_proposal_markers(self, _p):
+                return set()
+
+            def _parse_backlog_rows(self, _path):
+                return []
+
+        monkeypatch.setattr(proposal_mod, "BacklogManager", _NoMarkers)
+        group_rank, hold_target, annotation = panel3_annotation(
+            tmp_path / "backlog", tmp_path / "BACKLOG.md", "E0-F1-S1-T1"
+        )
+        assert group_rank == 2
+        assert hold_target is None
+        assert annotation == "[no marker]"
+
+    def test_unknown_target_returns_group_3(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import panel3_annotation
+
+        # Build a workspace whose source carries a marker pointing at an ID
+        # with NO backlog row.
+        backlog_dir = tmp_path / "backlog"
+        story_dir = backlog_dir / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+        (story_dir / "E0-F1-S1-T1.md").write_text(
+            "# E0-F1-S1-T1: Source\n\n## Status: blocked\n\n"
+            "## Comments\n\n"
+            "[2026-04-20 00:00 UTC] [agent/task_factory] [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T99\n"
+        )
+        (tmp_path / "BACKLOG.md").write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Source | Task | blocked | None | r | `backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n"
+        )
+        group_rank, hold_target, annotation = panel3_annotation(backlog_dir, tmp_path / "BACKLOG.md", "E0-F1-S1-T1")
+        assert group_rank == 3
+        assert hold_target is None
+        assert "E0-F1-S1-T99" in annotation
+        assert annotation.startswith("[marker target unknown")
+
+    def test_all_targets_terminal_returns_group_4(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import panel3_annotation
+
+        workspace = self._workspace_with_markers(tmp_path, [("E0-F1-S1-T2", "done"), ("E0-F1-S1-T3", "declined")])
+        group_rank, hold_target, annotation = panel3_annotation(
+            workspace / "backlog", workspace / "BACKLOG.md", "E0-F1-S1-T1"
+        )
+        assert group_rank == 4
+        assert hold_target is None
+        assert annotation == "[marker targets all terminal]"
+
+    def test_missing_source_task_returns_group_5_fallback(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import panel3_annotation
+
+        # No backlog tree at all -- _find_source_task_file returns None.
+        group_rank, hold_target, annotation = panel3_annotation(
+            tmp_path / "backlog", tmp_path / "BACKLOG.md", "E0-F1-S1-T99"
+        )
+        assert group_rank == 5
+        assert hold_target is None
+        assert annotation == "[needs review]"
+
+    def test_classify_markers_falls_back_when_no_subcase_matches(self) -> None:
+        """``_panel3_classify_markers`` returns the (5, None, ``[needs review]``)
+        fallback when the marker set doesn't match any specific sub-case --
+        no HOLD target, no unknown target, and not all terminal. Defensive
+        fallback for callers who reach panel3_annotation via a path other
+        than the standard classifier."""
+        from devbench.backlog.proposal import _panel3_classify_markers
+
+        # Two markers, both in-progress (non-terminal, known, non-HOLD).
+        # The real classifier would have returned AUTO_CLEARING_VIA_PROPOSAL
+        # for this state; this direct test pins the fallback exists.
+        result = _panel3_classify_markers(
+            ["E0-F1-S1-T2", "E0-F1-S1-T3"],
+            {"E0-F1-S1-T2": "in-progress", "E0-F1-S1-T3": "in-progress"},
+        )
+        assert result == (5, None, "[needs review]")
+
+    def test_missing_backlog_index_returns_group_5_fallback(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When _parse_backlog_rows raises FileNotFoundError, fall back to group 5."""
+        from devbench.backlog import proposal as proposal_mod
+        from devbench.backlog.proposal import panel3_annotation
+
+        backlog_dir = tmp_path / "backlog"
+        story_dir = backlog_dir / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+        source = story_dir / "E0-F1-S1-T1.md"
+        source.write_text(
+            "# E0-F1-S1-T1: Source\n\n## Status: blocked\n\n"
+            "## Comments\n\n"
+            "[2026-04-20 00:00 UTC] [agent/task_factory] [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2\n"
+        )
+        monkeypatch.setattr(proposal_mod, "_find_source_task_file", lambda *a, **kw: source)
+
+        class _Exploding:
+            def _extract_pending_proposal_markers(self, _p):
+                return {"E0-F1-S1-T2"}
+
+            def _parse_backlog_rows(self, _path):
+                raise FileNotFoundError("forced")
+
+        monkeypatch.setattr(proposal_mod, "BacklogManager", _Exploding)
+        group_rank, hold_target, annotation = panel3_annotation(backlog_dir, tmp_path / "BACKLOG.md", "E0-F1-S1-T1")
+        assert group_rank == 5
+        assert hold_target is None
+        assert annotation == "[needs review]"
+
 
 class TestAddDepBlockedMissing:
     def test_add_dep_raises_when_blocked_task_missing_from_backlog(self, tmp_path: Path) -> None:

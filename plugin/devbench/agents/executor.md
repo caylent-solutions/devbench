@@ -10,6 +10,8 @@ tools: Bash, Read, Write, Edit, Glob, Grep
 Work unit and repo context:
 !`uv run devbench read-unit $ARGUMENTS`
 
+> **Issue #160 reminder.** Executor-tier writes to `backlog/**/*.md` are BLOCKED by `guard-work-unit-write.sh`. Work-unit files are managed exclusively by the orchestrate skill and the devbench CLI. The orchestrator-tier bypass introduced by ADR-15 (`JUDGE_AGENT_ROLE=orchestrator`) does NOT extend to executor agents -- the executor subprocess inherits no role indicator and the hook defaults to BLOCK on missing role.
+
 ---
 
 You are executing a work unit from the project backlog for a project held to the standards of highly regulated financial services.

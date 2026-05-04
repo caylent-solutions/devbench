@@ -1744,6 +1744,53 @@ class TestSpanningRows:
         assert pace_line.count("\u2502") == 3, f"Expected 3 │ in spanning row, got: {pace_line!r}"
         assert pace_line.count("31.4 min") == 1
 
+    def test_multi_column_table_widens_columns_for_long_spanning_value(self) -> None:
+        """Regression: a spanning value wider than the default column width must
+        force the value columns to widen so the table border stays aligned. Before
+        the fix, a long ETA breakdown busted the right border.
+        """
+        from devbench.reporting.report import _render_multi_column_table
+
+        long_eta = "~41.9 h (active 4 + blocked-recovery 60 + blocked-auto 27 at 27.6 min/task)"
+        lines = _render_multi_column_table(
+            "Window stats",
+            ["All-time 05-02 18:37", "Session 05-04 09:21"],
+            [
+                ("Time span", ["38.8 h", "0.1 h"]),
+                ("Est. time to complete remaining", long_eta),
+            ],
+        )
+        widths = {len(ln) for ln in lines}
+        assert len(widths) == 1, f"Table lines must all be the same width; got widths {sorted(widths)}: {lines!r}"
+        eta_line = next(ln for ln in lines if "Est. time" in ln)
+        assert long_eta in eta_line
+
+    def test_grouped_progress_table_widens_columns_for_long_spanning_value(self) -> None:
+        """Regression: same fix applied to the grouped progress renderer used by
+        the live ``devbench report`` panel."""
+        from devbench.reporting.report import _render_grouped_progress_table
+
+        long_eta = "~41.9 h (active 4 + blocked-recovery 60 + blocked-auto 27 at 27.6 min/task)"
+        lines = _render_grouped_progress_table(
+            "Metric",
+            ["All-time 05-02 18:37", "Session 05-04 09:21"],
+            [
+                (
+                    "THROUGHPUT",
+                    [
+                        ("Time span", ["38.8 h", "0.1 h"]),
+                        ("Est. time to complete remaining", long_eta),
+                    ],
+                ),
+            ],
+        )
+        widths = {len(ln) for ln in lines}
+        assert len(widths) == 1, (
+            f"Grouped table lines must all be the same width; got widths {sorted(widths)}: {lines!r}"
+        )
+        eta_line = next(ln for ln in lines if "Est. time" in ln)
+        assert long_eta in eta_line
+
     def test_report_end_to_end_spans_recent_pace_and_est_time(self, tmp_path: Path) -> None:
         """In the rendered report, Recent pace and Est. time rows are single spanning cells
         -- the underlying value appears exactly once on the row even with multiple window columns."""

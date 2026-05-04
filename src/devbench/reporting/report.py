@@ -880,14 +880,26 @@ def _render_multi_column_table(
     metric_w = max(metric_w, len(title))
 
     # Value column width = max of: default minimum, label width, max cell width.
-    # Spanning rows (value is str) are accounted for separately below so a very
-    # long spanning value doesn't distort the per-column width.
+    # Spanning rows (value is str) span all n_cols value columns, so they
+    # contribute a derived minimum value_w too -- otherwise a wider-than-default
+    # spanning value (e.g. an ETA breakdown like "~41.9 h (active 4 + blocked-
+    # recovery 60 + blocked-auto 27 at 27.6 min/task)") busts the table layout.
     def _cells_of(v: list[str] | str) -> list[str]:
         return v if isinstance(v, list) else []
 
     max_cell = max((max((len(v) for v in _cells_of(vals)), default=0) for _, vals in rows), default=0)
     max_label = max((len(label) for label in column_labels), default=0)
-    value_w = max(value_w, max_cell, max_label)
+    # Reverse-derive the minimum value_w from the spanning-cell width formula
+    # (spanning_w computed below) so a spanning value never exceeds the joined
+    # span. Ceiling division of (max_spanning + 3 - 3 * n_cols) by n_cols.
+    max_spanning = max(
+        (len(vals) for _, vals in rows if isinstance(vals, str)),
+        default=0,
+    )
+    spanning_min_value_w = (
+        (max_spanning + 3 - 3 * n_cols + n_cols - 1) // n_cols if max_spanning > 0 and n_cols > 0 else 0
+    )
+    value_w = max(value_w, max_cell, max_label, spanning_min_value_w)
 
     # Width a spanning cell occupies (covers all n_cols value columns plus the
     # n_cols-1 internal "│" separators that would otherwise split them).
@@ -958,7 +970,19 @@ def _render_grouped_progress_table(
 
     max_cell = max((max((len(v) for v in _cells_of(vals)), default=0) for _, vals in all_rows), default=0)
     max_label = max((len(label) for label in column_labels), default=0)
-    value_w = max(value_w, max_cell, max_label)
+    # Spanning rows (value is str) cover all n_cols value columns plus their
+    # internal separators. Without measuring them, a wide spanning value (e.g.
+    # the ETA breakdown "~41.9 h (active 4 + blocked-recovery 60 + ...)" busts
+    # the table layout. Reverse-derive the minimum value_w from the spanning
+    # formula below so the joined span fits the longest observed string.
+    max_spanning = max(
+        (len(vals) for _, section_rows in sections for _, vals in section_rows if isinstance(vals, str)),
+        default=0,
+    )
+    spanning_min_value_w = (
+        (max_spanning + 3 - 3 * n_cols + n_cols - 1) // n_cols if max_spanning > 0 and n_cols > 0 else 0
+    )
+    value_w = max(value_w, max_cell, max_label, spanning_min_value_w)
 
     # Width a spanning cell occupies across all n_cols value columns (plus
     # the n_cols-1 internal separators). Used for both the section-header row

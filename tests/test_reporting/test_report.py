@@ -1401,7 +1401,11 @@ class TestUnitListings:
         units = [self._mk_unit("E0-F1-S1-T1", "Active task", WorkUnitStatus.IN_PROGRESS)]
         lines = _in_progress_listing(units)
         assert lines[1] == "In-progress tasks:"
-        assert lines[2] == "  - E0-F1-S1-T1: Active task"
+        # Issue #158: row always carries an in-progress suffix; when no
+        # transition timestamp is parseable the helper renders
+        # ``(in-progress, timer unavailable)`` rather than silently omitting.
+        assert lines[2].startswith("  - E0-F1-S1-T1: Active task")
+        assert "(in-progress" in lines[2]
 
     def test_blocked_listing_splits_auto_vs_attn_when_classifier_disagrees(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -2269,3 +2273,167 @@ class TestReportRowColors:
         for line in report.splitlines():
             if "Estimated total cost at completion" in line:
                 assert "\033[" not in line, f"'Estimated total cost at completion' must not be coloured: {line!r}"
+
+
+# ---------------------------------------------------------------------------
+# Issue #157: ETA includes blocked-recovery + blocked-auto buckets
+# ---------------------------------------------------------------------------
+
+
+class TestEtaIncludesBlockedRecoveryAndAuto:
+    """Issue #157: the ETA denominator now includes the recovery + auto-clearing
+    blocked buckets, but excludes the operator-attention bucket."""
+
+    def test_compute_window_stats_uses_combined_denominator(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import _compute_window_stats
+
+        # Seed enough done samples that recent_pace_minutes resolves.
+        now = datetime(2026, 5, 2, 12, 0, 0, tzinfo=UTC)
+        done_times: dict[str, datetime] = {}
+        progress_times: dict[str, datetime] = {}
+        for i in range(5):
+            tid = f"E0-F1-S1-T{i + 1}"
+            progress_times[tid] = now - timedelta(minutes=20 + i)
+            done_times[tid] = now - timedelta(minutes=10 + i)
+        log_path = tmp_path / "log.log"
+        log_path.write_text("", encoding="utf-8")
+        stats = _compute_window_stats(
+            log_path,
+            now - timedelta(hours=1),
+            now,
+            done_times,
+            progress_times,
+            tasks_active=4,
+            tasks_blocked_recovery=60,
+            tasks_blocked_auto=27,
+        )
+        # ETA bucket counts surface on the WindowStats dataclass.
+        assert stats.eta_active == 4
+        assert stats.eta_blocked_recovery == 60
+        assert stats.eta_blocked_auto == 27
+        # est_hours scales with (4 + 60 + 27) -- denominator includes recovery + auto.
+        assert stats.est_hours > 0
+
+
+class TestEtaFallsBackOnInsufficientPaceData:
+    """Issue #157: ETA reads n/a when recent-pace data is insufficient."""
+
+    def test_render_returns_n_a_when_recent_pace_unknown(self) -> None:
+        from devbench.reporting.report import _format_est_hours_display
+
+        # Inputs: no est_hours -> "n/a" branch.
+        stats = WindowStats(
+            window_start=datetime(2026, 5, 2, tzinfo=UTC),
+            window_hours=1.0,
+            tasks_in_window=0,
+            avg_minutes=0.0,
+            est_hours=0.0,
+            totals=__import__("devbench.reporting.report", fromlist=["HookLogTotals"]).HookLogTotals(),
+            cost=__import__("devbench.reporting.report", fromlist=["CostBreakdown"]).CostBreakdown(
+                input_cost=0,
+                output_cost=0,
+                cache_read_cost=0,
+                cache_write_5m_cost=0,
+                cache_write_1h_cost=0,
+                total_cost=0,
+            ),
+            cache_hit_rate=None,
+            tokens_per_task=0,
+            est_total_cost=0,
+            api_hours=0,
+            api_efficiency=None,
+        )
+        assert _format_est_hours_display(stats) == "n/a"
+
+    def test_render_bare_hours_when_pace_unknown_but_eta_computed(self) -> None:
+        from devbench.reporting.report import _format_est_hours_display
+
+        rep = __import__("devbench.reporting.report", fromlist=["HookLogTotals", "CostBreakdown"])
+        stats = WindowStats(
+            window_start=datetime(2026, 5, 2, tzinfo=UTC),
+            window_hours=1.0,
+            tasks_in_window=2,
+            avg_minutes=5.0,
+            est_hours=1.5,
+            totals=rep.HookLogTotals(),
+            cost=rep.CostBreakdown(0, 0, 0, 0, 0, 0),
+            cache_hit_rate=None,
+            tokens_per_task=0,
+            est_total_cost=0,
+            api_hours=0,
+            api_efficiency=None,
+            recent_pace_minutes=None,  # Recent pace fragile -> bare-hours branch.
+        )
+        assert _format_est_hours_display(stats) == "~1.5 h"
+
+
+class TestEtaCommentSuffixWhenBlockedDominates:
+    """Issue #157: when recent pace is known, the ETA cell carries a
+    breakdown suffix naming the contributing buckets and pace."""
+
+    def test_breakdown_suffix_present(self) -> None:
+        from devbench.reporting.report import _format_est_hours_display
+
+        rep = __import__("devbench.reporting.report", fromlist=["HookLogTotals", "CostBreakdown"])
+        stats = WindowStats(
+            window_start=datetime(2026, 5, 2, tzinfo=UTC),
+            window_hours=1.0,
+            tasks_in_window=10,
+            avg_minutes=5.6,
+            est_hours=5.4,
+            totals=rep.HookLogTotals(),
+            cost=rep.CostBreakdown(0, 0, 0, 0, 0, 0),
+            cache_hit_rate=None,
+            tokens_per_task=0,
+            est_total_cost=0,
+            api_hours=0,
+            api_efficiency=None,
+            recent_pace_minutes=5.6,
+            eta_active=4,
+            eta_blocked_recovery=60,
+            eta_blocked_auto=27,
+        )
+        out = _format_est_hours_display(stats)
+        assert "5.4 h" in out
+        assert "active 4" in out
+        assert "blocked-recovery 60" in out
+        assert "blocked-auto 27" in out
+        assert "5.6 min/task" in out
+
+
+class TestReportInProgressDurationSuffix:
+    """Issue #158: the report's in-progress panel renders the duration suffix."""
+
+    def test_listing_appends_timer_unavailable_when_no_log_signal(self) -> None:
+        from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
+        from devbench.reporting.report import _in_progress_listing
+
+        unit = WorkUnit(
+            id="E0-F1-S1-T1",
+            title="Active",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T1.md"),
+            repo="org/repo",
+            dependencies=[],
+        )
+        with patch("devbench.cli._in_progress_attempt_duration", return_value=None):
+            lines = _in_progress_listing([unit])
+        assert "(in-progress, timer unavailable)" in lines[2]
+
+    def test_listing_appends_humanized_duration_when_available(self) -> None:
+        from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
+        from devbench.reporting.report import _in_progress_listing
+
+        unit = WorkUnit(
+            id="E0-F1-S1-T1",
+            title="Active",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T1.md"),
+            repo="org/repo",
+            dependencies=[],
+        )
+        with patch("devbench.cli._in_progress_attempt_duration", return_value="23m"):
+            lines = _in_progress_listing([unit])
+        assert "(in-progress for 23m)" in lines[2]

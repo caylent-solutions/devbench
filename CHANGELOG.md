@@ -131,6 +131,42 @@ since the last release. PR #119 carries every change.
   retry. Bounded by `MAX_RETRY_ATTEMPTS`; over-cap records still
   written but stamped `capped: true`. Pinned by
   `tests/test_backlog/test_amendment.py::TestAmenderRejectionPersistsFeedbackJson`.
+- **Review-judge structured rejection feedback** (issue #156). New
+  `devbench log-rejection-feedback <judge> <id> --json '<payload>'`
+  CLI primitive validates the payload against
+  `src/devbench/backlog/review-feedback-schema.json` (schema_version 1)
+  + the per-judge controlled vocabulary in
+  `src/devbench/backlog/review_feedback_vocabulary.py`, and persists
+  to `.devbench/review-failures/<task-id>-<judge>-<n>.json`. The
+  manifest-amender path migrates to the same shared directory; the
+  legacy `.devbench/amender-rejections/` location remains as a
+  forward-compat read path. The done-gate refuses
+  `mark-done` until every prior rejection category is cleared via a
+  `[REJECTION_FEEDBACK_RESOLVED] <judge>:<code>` audit OR escalated
+  via `[NEEDS_DEP] <judge>:<code>`. `devbench status --detail`
+  surfaces unresolved counts per blocked task. New per-judge
+  vocabulary documented in `docs/review-feedback-vocabulary.md`.
+- **In-progress attempt duration** (issue #158). `devbench status`,
+  `devbench status --detail`, and `devbench report`'s in-progress
+  panel now suffix every in-progress row with
+  `(in-progress for 23m)` / `(in-progress for 1h 47m)` etc. When
+  neither the structured log nor the work-unit audit comments yield
+  a parseable timestamp the row reads `(in-progress, timer
+  unavailable)` -- never silently omitted.
+
+### Fixed
+
+- **ETA formula now includes auto-recovering blocked tasks**
+  (issue #157). `devbench report`'s `Est. time to complete remaining`
+  multiplier was `tasks_active * recent_pace_minutes`; it now reads
+  `(tasks_active + tasks_blocked_recovery + tasks_blocked_auto) *
+  recent_pace_minutes`, since both blocked buckets resolve on devbench's
+  own. The `Needs operator attention` bucket stays excluded (genuine
+  halt -> unbounded ETA). The cell carries a comment-suffix
+  (`~5.4 h (active 4 + blocked-recovery 60 + blocked-auto 27 at 5.6
+  min/task)`) showing the breakdown. The cost projection uses the same
+  denominator. ETA still falls back to `n/a` when fewer than the
+  required pace samples have completed in the recent window.
 
 ### Changed
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar
 from unittest.mock import MagicMock, patch
@@ -8377,3 +8378,601 @@ class TestCmdSweepProposalsAutoPromotesPreExisting:
         out = capsys.readouterr().out
         assert "orphan auto-promoted" not in out
         assert "## Status: proposed" in (story_dir / "E0-F1-S1-T2.md").read_text()
+
+
+# ---------------------------------------------------------------------------
+# Issue #156: cmd_log_rejection_feedback schema + injection + done-gate
+# ---------------------------------------------------------------------------
+
+
+class TestCmdLogRejectionFeedbackSchema:
+    """Issue #156: schema validation + persistence happy path."""
+
+    def _payload(self, code: str = "HARDCODED_URL") -> dict[str, object]:
+        return {
+            "categories": [
+                {
+                    "code": code,
+                    "severity": "fail",
+                    "summary": "Hardcoded URL",
+                    "remediation": "Read from env var",
+                    "files": ["src/devbench/cli.py"],
+                }
+            ],
+            "raw_verdict_text": "Found hardcoded URL in cli.py:42",
+        }
+
+    def test_valid_payload_persists(self, tmp_path: Path) -> None:
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_log_rejection_feedback("code_review", "E0-F1-S1-T1", "--json", json.dumps(self._payload()))
+        assert rc == 0
+        archive_dir = tmp_path / ".devbench" / "review-failures"
+        files = list(archive_dir.glob("E0-F1-S1-T1-code_review-*.json"))
+        assert len(files) == 1
+        data = json.loads(files[0].read_text(encoding="utf-8"))
+        assert data["schema_version"] == 1
+        assert data["judge"] == "code_review"
+        assert data["task_id"] == "E0-F1-S1-T1"
+        assert data["attempt"] == 1
+        assert data["categories"][0]["code"] == "HARDCODED_URL"
+        assert data["capped"] is False
+
+    def test_attempt_increments_on_repeat(self, tmp_path: Path) -> None:
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            cli.cmd_log_rejection_feedback("code_review", "E0-F1-S1-T1", "--json", json.dumps(self._payload()))
+            rc = cli.cmd_log_rejection_feedback(
+                "code_review",
+                "E0-F1-S1-T1",
+                "--json",
+                json.dumps(self._payload(code="SCOPE_VIOLATION")),
+            )
+        assert rc == 0
+        files = sorted((tmp_path / ".devbench" / "review-failures").glob("*.json"))
+        assert len(files) == 2
+        attempts = sorted(json.loads(p.read_text())["attempt"] for p in files)
+        assert attempts == [1, 2]
+
+    def test_bad_json_rejected(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_log_rejection_feedback("code_review", "E0-F1-S1-T1", "--json", "not-json")
+        assert rc == 1
+        assert "not valid JSON" in capsys.readouterr().err
+
+    def test_bad_category_code_rejected(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        bad = self._payload(code="NOT_A_REAL_CODE")
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_log_rejection_feedback("code_review", "E0-F1-S1-T1", "--json", json.dumps(bad))
+        assert rc == 1
+        assert "vocabulary" in capsys.readouterr().err
+
+    def test_unknown_judge_rejected(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_log_rejection_feedback(
+                "totally_unknown",
+                "E0-F1-S1-T1",
+                "--json",
+                json.dumps(self._payload()),
+            )
+        assert rc == 1
+        assert "unknown judge" in capsys.readouterr().err
+
+    def test_missing_required_field_rejected(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_log_rejection_feedback(
+                "code_review",
+                "E0-F1-S1-T1",
+                "--json",
+                json.dumps({"raw_verdict_text": "x"}),
+            )
+        assert rc == 1
+        assert "missing required field" in capsys.readouterr().err
+
+    def test_bad_argv_rejected(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_log_rejection_feedback("code_review")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "log-rejection-feedback" in err
+
+    def test_unknown_flag_rejected(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_log_rejection_feedback("code_review", "E0", "--bogus", "value")
+        assert rc == 1
+        assert "unknown flag" in capsys.readouterr().err
+
+    def test_severity_must_be_fail_or_warn(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        bad = {
+            "categories": [
+                {
+                    "code": "HARDCODED_URL",
+                    "severity": "info",
+                    "summary": "x",
+                    "remediation": "y",
+                    "files": [],
+                }
+            ],
+            "raw_verdict_text": "x",
+        }
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_log_rejection_feedback("code_review", "E0", "--json", json.dumps(bad))
+        assert rc == 1
+        assert "severity" in capsys.readouterr().err
+
+    def test_capped_when_exceeds_max_retry_attempts(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr("devbench.config.MAX_RETRY_ATTEMPTS", 1)
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            cli.cmd_log_rejection_feedback("code_review", "E0-F1-S1-T1", "--json", json.dumps(self._payload()))
+            cli.cmd_log_rejection_feedback("code_review", "E0-F1-S1-T1", "--json", json.dumps(self._payload()))
+        files = sorted((tmp_path / ".devbench" / "review-failures").glob("*.json"))
+        cap_flags = [json.loads(p.read_text())["capped"] for p in files]
+        assert cap_flags == [False, True]
+
+
+class TestRejectionFeedbackInjection:
+    """Issue #156: ``_collect_review_judge_feedback`` ordering + cap."""
+
+    def _seed(self, workspace: Path, judge: str, task_id: str, attempt: int, code: str) -> None:
+        archive_dir = workspace / ".devbench" / "review-failures"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        path = archive_dir / f"{task_id}-{judge}-{attempt}.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "task_id": task_id,
+                    "judge": judge,
+                    "attempt": attempt,
+                    "rejected_at": "2026-05-02T00:00:00Z",
+                    "categories": [
+                        {
+                            "code": code,
+                            "severity": "fail",
+                            "summary": "x",
+                            "remediation": "y",
+                            "files": [],
+                        }
+                    ],
+                    "raw_verdict_text": "x",
+                    "capped": False,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    def test_orders_by_severity_then_attempt(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Cap above the seed count so nothing is truncated.
+        monkeypatch.setattr("devbench.config.MAX_RETRY_ATTEMPTS", 10)
+        task_id = "E0-F1-S1-T1"
+        # Seed three rejections across two judges, lower-severity first.
+        self._seed(tmp_path, "doc_review", task_id, 1, "README_SYNC")
+        self._seed(tmp_path, "code_review", task_id, 1, "HARDCODED_URL")
+        self._seed(tmp_path, "code_review", task_id, 2, "SCOPE_VIOLATION")
+
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            payloads = cli._collect_review_judge_feedback(task_id)
+
+        # security>code>test>changes_manifest>doc; within judge, higher attempt first.
+        order = [(p["judge"], p["attempt"]) for p in payloads]
+        assert order == [
+            ("code_review", 2),
+            ("code_review", 1),
+            ("doc_review", 1),
+        ]
+
+    def test_cap_truncates_to_max_retry_attempts(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr("devbench.config.MAX_RETRY_ATTEMPTS", 2)
+        task_id = "E0-F1-S1-T1"
+        self._seed(tmp_path, "code_review", task_id, 1, "HARDCODED_URL")
+        self._seed(tmp_path, "code_review", task_id, 2, "SCOPE_VIOLATION")
+        self._seed(tmp_path, "doc_review", task_id, 1, "README_SYNC")
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            payloads = cli._collect_review_judge_feedback(task_id)
+        assert len(payloads) == 2
+        # Highest-severity / latest-attempt entries survive the cap.
+        assert all(p["judge"] == "code_review" for p in payloads)
+
+    def test_legacy_amender_rejections_synthesized(self, tmp_path: Path) -> None:
+        """Legacy ``amender-rejections/`` entries get a v1-shaped record."""
+        archive_dir = tmp_path / ".devbench" / "amender-rejections"
+        archive_dir.mkdir(parents=True)
+        (archive_dir / "E0-F1-S1-T1-1.json").write_text(
+            json.dumps(
+                {
+                    "task_id": "E0-F1-S1-T1",
+                    "attempt": 1,
+                    "reason_category": "SCOPE",
+                    "reason_text": "old reason",
+                    "request": {},
+                    "capped": False,
+                    "recorded_at": "2026-04-30T00:00:00Z",
+                }
+            ),
+            encoding="utf-8",
+        )
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            payloads = cli._collect_review_judge_feedback("E0-F1-S1-T1")
+        assert len(payloads) == 1
+        assert payloads[0]["judge"] == "manifest_amender"
+        assert payloads[0]["categories"][0]["code"] == "SCOPE"
+
+    def test_skips_unparseable_files(self, tmp_path: Path) -> None:
+        archive_dir = tmp_path / ".devbench" / "review-failures"
+        archive_dir.mkdir(parents=True)
+        (archive_dir / "E0-F1-S1-T1-code_review-1.json").write_text("not json", encoding="utf-8")
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            payloads = cli._collect_review_judge_feedback("E0-F1-S1-T1")
+        assert payloads == []
+
+    def test_skips_non_dict_payload(self, tmp_path: Path) -> None:
+        archive_dir = tmp_path / ".devbench" / "review-failures"
+        archive_dir.mkdir(parents=True)
+        (archive_dir / "E0-F1-S1-T1-code_review-1.json").write_text("[]", encoding="utf-8")
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            payloads = cli._collect_review_judge_feedback("E0-F1-S1-T1")
+        assert payloads == []
+
+
+class TestDoneGateRejectionFeedbackEnforcement:
+    """Issue #156: done-gate refuses transition when rejection unresolved."""
+
+    def _seed_rejection(self, workspace: Path, task_id: str) -> None:
+        archive = workspace / ".devbench" / "review-failures"
+        archive.mkdir(parents=True, exist_ok=True)
+        (archive / f"{task_id}-code_review-1.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "task_id": task_id,
+                    "judge": "code_review",
+                    "attempt": 1,
+                    "rejected_at": "2026-05-02T00:00:00Z",
+                    "categories": [
+                        {
+                            "code": "HARDCODED_URL",
+                            "severity": "fail",
+                            "summary": "x",
+                            "remediation": "y",
+                            "files": [],
+                        }
+                    ],
+                    "raw_verdict_text": "x",
+                    "capped": False,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def test_blocks_when_unresolved(
+        self,
+        tmp_path: Path,
+        backlog_dir: Path,
+        mock_units: list[WorkUnit],
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        wu_file = backlog_dir / "E0-F1-S1-T2.md"
+        wu_file.write_text("# Task\n## Status: in-review\n\n## Comments\n", encoding="utf-8")
+        self._seed_rejection(tmp_path, "E0-F1-S1-T2")
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_mark_done("E0-F1-S1-T2")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "REJECTION_FEEDBACK_OUTSTANDING" in wu_file.read_text() or "unresolved" in err
+        assert "code_review:HARDCODED_URL" in err
+
+    def test_allows_when_resolved_marker_present(
+        self,
+        tmp_path: Path,
+        backlog_dir: Path,
+        mock_units: list[WorkUnit],
+    ) -> None:
+        wu_file = backlog_dir / "E0-F1-S1-T2.md"
+        wu_file.write_text(
+            "# Task\n## Status: in-review\n\n## Comments\n"
+            "[2026-05-02 12:00 UTC] [agent/orchestrator] [REJECTION_FEEDBACK_RESOLVED] code_review:HARDCODED_URL\n",
+            encoding="utf-8",
+        )
+        self._seed_rejection(tmp_path, "E0-F1-S1-T2")
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+        mock_mgr = MagicMock()
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_mark_done("E0-F1-S1-T2")
+        assert rc == 0
+        mock_mgr.mark_done.assert_called_once()
+
+    def test_allows_when_needs_dep_marker_present(
+        self,
+        tmp_path: Path,
+        backlog_dir: Path,
+        mock_units: list[WorkUnit],
+    ) -> None:
+        wu_file = backlog_dir / "E0-F1-S1-T2.md"
+        wu_file.write_text(
+            "# Task\n## Status: in-review\n\n## Comments\n"
+            "[2026-05-02 12:00 UTC] [agent/executor] [NEEDS_DEP] code_review:HARDCODED_URL\n",
+            encoding="utf-8",
+        )
+        self._seed_rejection(tmp_path, "E0-F1-S1-T2")
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+        mock_mgr = MagicMock()
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_mark_done("E0-F1-S1-T2")
+        assert rc == 0
+        mock_mgr.mark_done.assert_called_once()
+
+
+class TestStatusPanelRejectionCategoryCounts:
+    """Issue #156: --detail blocked panel shows pending categories per task."""
+
+    def test_panel_shown_when_blocked_with_unresolved_categories(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        wu = backlog_dir / "E0-F1-S1-T1.md"
+        wu.write_text(
+            "# E0-F1-S1-T1: T1\n\n## Status: blocked\n\n"
+            "## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-FUNC-001 x\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `f.py` | New |\n\n"
+            "## Definition of Done\n\n- [ ] x\n\n## Comments\n",
+            encoding="utf-8",
+        )
+        index = tmp_path / "BACKLOG.md"
+        index.write_text(
+            "# Backlog\n\n"
+            "## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
+            "|------|-------|------|-------------|----------|---------|\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | T1 | Task | blocked | none | org/repo | `backlog/E0-F1-S1-T1.md` |\n",
+            encoding="utf-8",
+        )
+        archive = tmp_path / ".devbench" / "review-failures"
+        archive.mkdir(parents=True)
+        (archive / "E0-F1-S1-T1-code_review-1.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "task_id": "E0-F1-S1-T1",
+                    "judge": "code_review",
+                    "attempt": 1,
+                    "rejected_at": "2026-05-02T00:00:00Z",
+                    "categories": [
+                        {
+                            "code": "HARDCODED_URL",
+                            "severity": "fail",
+                            "summary": "x",
+                            "remediation": "y",
+                            "files": [],
+                        }
+                    ],
+                    "raw_verdict_text": "x",
+                    "capped": False,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.BACKLOG_INDEX", index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_status("--detail")
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "Review-judge rejections (unresolved categories):" in out
+        assert "code_review:HARDCODED_URL" in out
+
+    def test_panel_omitted_when_no_unresolved(self, capsys: pytest.CaptureFixture[str]) -> None:
+        cli._print_blocked_rejection_categories([])
+        assert capsys.readouterr().out == ""
+
+
+class TestInProgressAttemptDurationRender:
+    """Issue #158: cmd_status renders ``(in-progress for ...)`` suffix."""
+
+    def test_status_renders_duration_when_log_has_transition(
+        self,
+        tmp_path: Path,
+        backlog_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        log_path = tmp_path / "orchestrator.log"
+        log_path.write_text(
+            "2026-05-02T12:00:00Z [devbench.cli] INFO Set E0-F1-S1-T2 to 'in-progress'\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("JUDGE_LOG_FILE", str(log_path))
+        # Freeze time so the duration output is deterministic.
+        fake_now = datetime(2026, 5, 2, 12, 23, 0, tzinfo=UTC)
+
+        class _FrozenDT(datetime):
+            @classmethod
+            def now(cls, tz: object = None) -> _FrozenDT:
+                return _FrozenDT.fromtimestamp(fake_now.timestamp(), tz=UTC)  # type: ignore[arg-type]
+
+        monkeypatch.setattr("devbench.cli.datetime", _FrozenDT)
+
+        in_prog_unit = WorkUnit(
+            id="E0-F1-S1-T2",
+            title="Active",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T2.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [in_prog_unit]
+        mock_parser.get_parallel_candidates.return_value = []
+        mock_parser.all_done.return_value = False
+        mock_parser.get_blocked_units.return_value = []
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            rc = cli.cmd_status()
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "(in-progress for 23m)" in out
+
+
+class TestInProgressAttemptDurationFallback:
+    """Issue #158: when neither log nor audit yields a parseable timestamp,
+    the helper returns ``None`` and the renderer prints the
+    ``timer unavailable`` placeholder."""
+
+    def test_returns_none_with_no_signals(self, tmp_path: Path) -> None:
+        # Force log_path to a non-existent file AND ensure backlog parse fails fast.
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+        ):
+            result = cli._in_progress_attempt_duration("E0-F1-S1-T2", log_path=tmp_path / "missing.log")
+        assert result is None
+
+    def test_falls_back_to_audit_when_log_missing(
+        self,
+        tmp_path: Path,
+        backlog_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Stub _resolve_unit_file_by_id directly so we don't have to materialise a
+        # full backlog -- the fallback path is the only behaviour under test here.
+        wu = backlog_dir / "E0-F1-S1-T2.md"
+        wu.write_text(
+            "## Comments\n[2026-05-02 11:30 UTC] [agent/orchestrator] Set E0-F1-S1-T2 to 'in-progress'\n",
+            encoding="utf-8",
+        )
+        fake_now = datetime(2026, 5, 2, 12, 0, 0, tzinfo=UTC)
+
+        class _FrozenDT(datetime):
+            @classmethod
+            def now(cls, tz: object = None) -> _FrozenDT:
+                return _FrozenDT.fromtimestamp(fake_now.timestamp(), tz=UTC)  # type: ignore[arg-type]
+
+        monkeypatch.setattr("devbench.cli.datetime", _FrozenDT)
+        with patch("devbench.cli._resolve_unit_file_by_id", return_value=wu):
+            result = cli._in_progress_attempt_duration("E0-F1-S1-T2", log_path=tmp_path / "missing.log")
+        assert result == "30m"
+
+
+class TestInProgressAttemptDurationLatestAttemptOnly:
+    """Issue #158: multiple in-progress transitions resolve to the most recent one."""
+
+    def test_picks_most_recent_log_transition(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        log_path = tmp_path / "orchestrator.log"
+        log_path.write_text(
+            "2026-05-02T08:00:00Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'in-progress'\n"
+            "2026-05-02T09:00:00Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'blocked'\n"
+            "2026-05-02T11:30:00Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'in-progress'\n",
+            encoding="utf-8",
+        )
+        fake_now = datetime(2026, 5, 2, 12, 0, 0, tzinfo=UTC)
+
+        class _FrozenDT(datetime):
+            @classmethod
+            def now(cls, tz: object = None) -> _FrozenDT:
+                return _FrozenDT.fromtimestamp(fake_now.timestamp(), tz=UTC)  # type: ignore[arg-type]
+
+        monkeypatch.setattr("devbench.cli.datetime", _FrozenDT)
+        result = cli._in_progress_attempt_duration("E0-F1-S1-T1", log_path=log_path)
+        # 4h vs 30m vs 4h+30m: most recent wins -> 30m.
+        assert result == "30m"
+
+    def test_format_duration_thresholds(self) -> None:
+        assert cli._format_duration(0) == "0s"
+        assert cli._format_duration(-5) == "0s"
+        assert cli._format_duration(42) == "42s"
+        assert cli._format_duration(60) == "1m"
+        assert cli._format_duration(23 * 60) == "23m"
+        assert cli._format_duration(60 * 60 + 47 * 60) == "1h 47m"
+        assert cli._format_duration(2 * 86400 + 3 * 3600) == "2d 3h"
+
+    def test_log_with_invalid_timestamp_skipped(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        log_path = tmp_path / "orchestrator.log"
+        log_path.write_text(
+            "9999-99-99T99:99:99Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'in-progress'\n",
+            encoding="utf-8",
+        )
+        result = cli._in_progress_attempt_duration("E0-F1-S1-T1", log_path=log_path)
+        # Only the bogus timestamp -> nothing parses -> None.
+        assert result is None
+
+    def test_audit_with_invalid_timestamp_skipped(
+        self,
+        tmp_path: Path,
+        backlog_dir: Path,
+    ) -> None:
+        wu = backlog_dir / "E0-F1-S1-T1.md"
+        wu.write_text(
+            "## Comments\n[9999-99-99 99:99 UTC] [agent/orchestrator] Set E0-F1-S1-T1 to 'in-progress'\n",
+            encoding="utf-8",
+        )
+        with patch("devbench.cli._resolve_unit_file_by_id", return_value=wu):
+            result = cli._in_progress_attempt_duration("E0-F1-S1-T1", log_path=tmp_path / "missing.log")
+        assert result is None

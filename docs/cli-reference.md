@@ -101,6 +101,10 @@ When NONE of (1)/(2)/(3) yields a path -- i.e. `JUDGE_LOG_FILE` unset, `log_file
 
 Empty panels are omitted entirely. The recency-window override (`JUDGE_BLOCKED_RECOVERY_WINDOW_SECONDS=<seconds>`) lets operators with slower iteration cadences extend the audit-comment window.
 
+**ETA formula (issue #157):** the `Est. time to complete remaining` cell now multiplies the recent-pace minutes by `tasks_active + tasks_blocked_recovery + tasks_blocked_auto`. Both blocked buckets resolve on devbench's own (proposal cascade or auto-recovery loop), so excluding them produced an unrealistically optimistic ETA. The `needs operator attention` bucket stays excluded -- those are genuine halts with unbounded ETA. The cell carries a comment-suffix naming the bucket counts and pace, e.g. `~5.4 h (active 4 + blocked-recovery 60 + blocked-auto 27 at 5.6 min/task)`. The cost projection uses the same denominator. ETA falls back to `n/a` when fewer than the required pace samples have completed in the recent window (the metric is fragile and a single completion would project meaningless numbers).
+
+**In-progress duration (issue #158):** the `In-progress tasks:` panel suffixes every row with a humanized attempt duration (`23m`, `1h 47m`, `2d 3h`). Multiple in-progress transitions for the same task (blocked-then-resumed) resolve to the most recent one. When neither the structured log nor the work-unit's audit comments yield a parseable timestamp the row renders `(in-progress, timer unavailable)` -- never silently omitted. The same suffix appears on `devbench status` and `devbench status --detail` Active rows.
+
 ### `watch`
 
 ```
@@ -554,7 +558,15 @@ Atomically update the Changes Manifest after the `manifest-amender` judge approv
 uv run devbench reject-amendment <id> <reason>
 ```
 
-Reject the pending amendment, archive the request to `<workspace>/.devbench/rejected-requests/<id>-<timestamp>.json`, and write a `[AMENDMENT_REJECTED]` audit comment. The task is typically marked `blocked` and may trigger the task-factory flow (see below) if `blocker-resolver` emits a proposal.
+Reject the pending amendment, archive the request to `<workspace>/.devbench/rejected-requests/<id>-<timestamp>.json`, write a `[AMENDMENT_REJECTED]` audit comment, AND persist a structured rejection-feedback JSON to `<workspace>/.devbench/review-failures/<id>-manifest_amender-<n>.json` (issue #156, schema v1). The task is typically marked `blocked` and may trigger the task-factory flow (see below) if `blocker-resolver` emits a proposal. Legacy archives under `.devbench/amender-rejections/` are still readable for forward compatibility.
+
+### `log-rejection-feedback`
+
+```
+uv run devbench log-rejection-feedback <judge> <task-id> --json '<payload>'
+```
+
+Persist a structured review-judge rejection JSON. `<judge>` is one of `code_review` / `test_review` / `doc_review` / `changes_manifest` / `security_review` / `manifest_amender`. `<payload>` must validate against `src/devbench/backlog/review-feedback-schema.json` -- in particular every `categories[*].code` must appear in the judge's controlled vocabulary (see `docs/review-feedback-vocabulary.md`). The JSON lands under `<workspace>/.devbench/review-failures/<task-id>-<judge>-<n>.json` and is consumed by the executor-feedback collector on retry and by the done-gate to refuse `mark-done` until each category is cleared via `[REJECTION_FEEDBACK_RESOLVED] <judge>:<code>` or escalated via `[NEEDS_DEP] <judge>:<code>`. Records over `MAX_RETRY_ATTEMPTS` are still written but stamped `capped: true`.
 
 ---
 

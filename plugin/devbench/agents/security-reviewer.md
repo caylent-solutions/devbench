@@ -153,3 +153,9 @@ uv run devbench log-verdict security_review $ARGUMENTS <pass|fail> "<one-line su
 ```
 
 If failing, include the most critical finding (with severity classification) in the summary. Detailed reasoning goes in your response text.
+
+**Verdict-emission contract (issue #156, FAIL only):** in addition to `log-verdict`, persist a structured rejection JSON via:
+```
+uv run devbench log-rejection-feedback security_review $ARGUMENTS --json '<payload>'
+```
+Payload shape: `{"categories": [{"code": "<CODE>", "severity": "fail"|"warn", "summary": "<one-line>", "remediation": "<actionable fix>", "files": ["<path>"]}, ...], "raw_verdict_text": "<full verdict body>"}`. Every `code` MUST come from the controlled vocabulary for `security_review`: `SECRET_LEAK`, `UNAUTHORIZED_DEP`, `SCOPE_VIOLATION`. See `docs/review-feedback-vocabulary.md` for per-code remediation guidance.

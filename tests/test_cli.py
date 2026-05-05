@@ -6652,14 +6652,21 @@ class TestCmdWriteProposalDedup:
         from devbench.backlog.proposal import _compute_fix_signature, _extract_intent_phrase
 
         # Compute the signature the way cmd_write_proposal will compute it
-        # (target_repo "" because we have no BACKLOG.md index file in this
-        # tmp_path; that matches the legacy fallback path the test exercises).
-        # Use a target-repo-prefixed path so the issue #146 backlog-repo
-        # filter doesn't drop the proposed task before dedup runs (the
-        # dedup contract is what this test pins, not the filter).
-        files = ["git-repo/pyproject.toml"]
+        # (target_repo "" because BacklogParser does not accept the bare
+        # "r" repo column the BACKLOG.md fixture uses; ``_resolve_source_repo``
+        # falls back to "" via its except-ValueError branch).
+        # Production strips the configured ``checkout_directory`` prefix
+        # before computing the signature (issue #159), so we seed with
+        # the STRIPPED form (``pyproject.toml``). The unstripped path
+        # stays in the new payload's ``files_to_own`` below so the
+        # issue #146 backlog-repo filter still treats the file as
+        # in-scope (the file's first segment ``git-repo`` matches the
+        # configured checkout_directory of caylent-solutions/git-repo
+        # in the test fixture).
+        files_unstripped = ["git-repo/pyproject.toml"]
+        files_stripped = ["pyproject.toml"]
         intent = _extract_intent_phrase("Remove the pyproject.toml row from T1")
-        signature = _compute_fix_signature("", files, intent)
+        signature = _compute_fix_signature("", files_stripped, intent)
 
         # Seed the EXISTING recovery: source_id=E0-F1-S1-T1 carries the signature.
         self._seed_existing_recovery(tmp_path, "E0-F1-S1-T1", signature)
@@ -6693,7 +6700,7 @@ class TestCmdWriteProposalDedup:
                 {
                     "suggested_id": "E0-F1-S1-T8",
                     "title": "Remove the pyproject.toml row from T7",
-                    "files_to_own": files,
+                    "files_to_own": files_unstripped,
                     "linked_scenarios": [],
                     "suggested_acs": [],
                     "suggested_approach": "Remove the pyproject.toml row from T1",

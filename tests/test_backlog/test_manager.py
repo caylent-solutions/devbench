@@ -3965,6 +3965,164 @@ class TestValidateNoOrphanPathTokens:
         errors = self._validate(tmp_path, rt_off)
         assert self._orphan_errors(errors, "EX-F1-S1-T1") == []
 
+    # ---------------------------------------------------------------------
+    # Coverage corner cases (low-traffic branches in the orphan-check helpers)
+    # ---------------------------------------------------------------------
+
+    def test_path_shaped_via_manifest_dir_prefix_match(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """``_is_path_shaped`` final ``return`` branch: a token that has
+        no known extension and no built-in directory prefix, but whose
+        first segment matches a directory observed in the Task's parsed
+        Manifest, must be treated as path-shaped and trigger the rule
+        when it isn't itself in the Manifest.
+        """
+        repo = "ex/foo"
+        # Manifest entry under ``custom/`` -- not in _ORPHAN_KNOWN_PREFIXES
+        # (which has src/, tests/, infra/, docs/, backlog/, config/) and
+        # not carrying a known extension. The orphan token uses the same
+        # ``custom/`` dir prefix but names a file that isn't in the
+        # manifest, so the manifest-dir-prefix branch fires.
+        self._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `custom/real_data` | new |\n",
+            "- [ ] AC-FUNC-001: `custom/imaginary_data` is created.",
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = self._validate(tmp_path, self._runtime_with_rule_on(repo, None))
+        orphans = self._orphan_errors(errors, "EX-F1-S1-T1")
+        assert len(orphans) == 1
+        assert "custom/imaginary_data" in orphans[0]
+
+    def test_dot_slash_prefix_normalised_to_match(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """``_normalise_orphan_path`` ``./`` strip branch: an AC token
+        written as ``./src/real.py`` must normalise to ``src/real.py``
+        and match a Manifest entry of ``src/real.py``.
+        """
+        repo = "ex/foo"
+        self._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `src/real.py` | new |\n| `tests/unit/test_real.py` | new |\n",
+            "- [ ] AC-FUNC-001: `./src/real.py` exposes the new API.",
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = self._validate(tmp_path, self._runtime_with_rule_on(repo, None))
+        # The ``./`` prefix is stripped before matching so the token is
+        # recognised as in-Manifest -- no orphan error should fire.
+        assert self._orphan_errors(errors, "EX-F1-S1-T1") == []
+
+    def test_missing_work_unit_file_is_skipped_silently(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """``_check_no_orphan_path_tokens`` skips Tasks whose work-unit
+        file does not exist on disk. The BACKLOG.md row points at a path
+        that was never written -- the rule must short-circuit at the
+        ``not wu_path.is_file()`` guard rather than crash.
+        """
+        repo = "ex/foo"
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        # Note: NO write of backlog/EX-F1-S1-T1.md -- the row is a stale
+        # pointer (the kind of state that arises mid-rename or mid-
+        # refactor). Validation must remain silent on this Task for the
+        # orphan rule (other rules may flag elsewhere).
+        errors = self._validate(tmp_path, self._runtime_with_rule_on(repo, None))
+        assert self._orphan_errors(errors, "EX-F1-S1-T1") == []
+
+    def test_malformed_manifest_skipped_silently(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """``_check_one_task_orphan_paths`` swallows ``ManifestParseError``
+        and returns early -- another rule already reports the malformed
+        manifest, so this rule must not double-report.
+        """
+        repo = "ex/foo"
+        # Hand-write a work-unit whose Changes Manifest has a pipe-
+        # prefixed row with the wrong column count, which ``parse_manifest``
+        # rejects with ManifestParseError (see manifest.py:201). The
+        # well-formed header + separator above the bad row keep the
+        # parser past the section-detect step so it reaches the body
+        # walk and raises on the malformed data row.
+        wu = backlog_dir / "EX-F1-S1-T1.md"
+        wu.write_text(
+            "# EX-F1-S1-T1\n\n"
+            "## Status: in-queue\n\n"
+            "## Target Repository\n\n"
+            f"- **Repo:** `{repo}`\n\n"
+            "## Description\n\nTest task.\n\n"
+            "## Dependencies\n\n"
+            "| ID | Title | Status |\n"
+            "|----|-------|--------|\n"
+            "| none | | |\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-FUNC-001: `src/foo.py` exists.\n\n"
+            "## Changes Manifest\n\n"
+            "| File | Change |\n"
+            "|------|--------|\n"
+            "| `src/foo.py` | new | extra-column |\n"  # 3 cells, parser rejects
+            "\n"
+            "## Definition of Done\n\n- [ ] Done\n",
+            encoding="utf-8",
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = self._validate(tmp_path, self._runtime_with_rule_on(repo, None))
+        # Manifest parse failure is reported by another rule; the orphan
+        # rule must produce ZERO orphan-prefixed errors for this Task.
+        assert self._orphan_errors(errors, "EX-F1-S1-T1") == []
+
+    def test_missing_definition_of_done_section_is_skipped(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """``_check_one_task_orphan_paths`` skips a section whose extracted
+        body is empty (the inner ``if not body: continue`` branch). When
+        a Task work-unit lacks the ``## Definition of Done`` heading
+        entirely, ``sections.get("Definition of Done", "")`` returns ``""``
+        and the per-section walk must short-circuit cleanly.
+        """
+        repo = "ex/foo"
+        # Hand-build a work-unit that has Acceptance Criteria but does
+        # NOT have a Definition of Done header at all. Other validation
+        # rules may complain about the missing section; this test only
+        # asserts that the orphan-path rule does not raise on it.
+        wu = backlog_dir / "EX-F1-S1-T1.md"
+        wu.write_text(
+            "# EX-F1-S1-T1\n\n"
+            "## Status: in-queue\n\n"
+            "## Target Repository\n\n"
+            f"- **Repo:** `{repo}`\n\n"
+            "## Description\n\nTest task.\n\n"
+            "## Dependencies\n\n"
+            "| ID | Title | Status |\n"
+            "|----|-------|--------|\n"
+            "| none | | |\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-FUNC-001: behaviour check.\n\n"
+            "## Changes Manifest\n\n"
+            "| File | Change |\n"
+            "|------|--------|\n"
+            "| `src/foo.py` | new |\n"
+            "| `tests/unit/test_foo.py` | new |\n",
+            # Note: NO ``## Definition of Done`` section follows.
+            encoding="utf-8",
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = self._validate(tmp_path, self._runtime_with_rule_on(repo, None))
+        # The orphan rule must produce ZERO orphan-prefixed errors --
+        # the missing DoD section is silently skipped at the empty-body
+        # guard. A separate required-sections rule may emit its own
+        # error for the same Task, but that error does not start with
+        # the orphan-rule prefix.
+        assert self._orphan_errors(errors, "EX-F1-S1-T1") == []
+
 
 class TestAutoRequeueOnDeclineTransition:
     """Issue #147: ``_set_status`` fires the auto-requeue cascade for every

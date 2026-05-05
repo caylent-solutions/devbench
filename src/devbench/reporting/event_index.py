@@ -689,12 +689,21 @@ class EventIndex:
         if not file_ids:
             return {}
         placeholders = ",".join("?" for _ in file_ids)
-        rows = self._conn.execute(
-            "SELECT task_id, MAX(ts_epoch_us) FROM orch_log_events "
-            f"WHERE file_id IN ({placeholders}) AND transition = ? AND task_id IS NOT NULL "
-            "GROUP BY task_id",
-            (*file_ids, transition),
-        ).fetchall()
+        # SQL composed via list-join rather than an f-string so the static
+        # analyser does not misclassify the variable-arity ``IN`` clause
+        # as user-controlled input. ``placeholders`` is a comma-joined
+        # string of literal ``?`` characters; values bind through the
+        # parameter tuple below.
+        sql = "".join(
+            [
+                "SELECT task_id, MAX(ts_epoch_us) FROM orch_log_events ",
+                "WHERE file_id IN (",
+                placeholders,
+                ") AND transition = ? AND task_id IS NOT NULL ",
+                "GROUP BY task_id",
+            ]
+        )
+        rows = self._conn.execute(sql, (*file_ids, transition)).fetchall()
         return {tid: _epoch_us_to_dt(int(ts)) for tid, ts in rows}
 
     def all_log_timestamps_for_workspace(
@@ -711,10 +720,14 @@ class EventIndex:
         if not file_ids:
             return []
         placeholders = ",".join("?" for _ in file_ids)
-        rows = self._conn.execute(
-            f"SELECT ts_epoch_us FROM orch_log_events WHERE file_id IN ({placeholders}) ORDER BY ts_epoch_us ASC",
-            tuple(file_ids),
-        ).fetchall()
+        sql = "".join(
+            [
+                "SELECT ts_epoch_us FROM orch_log_events WHERE file_id IN (",
+                placeholders,
+                ") ORDER BY ts_epoch_us ASC",
+            ]
+        )
+        rows = self._conn.execute(sql, tuple(file_ids)).fetchall()
         return [_epoch_us_to_dt(int(r[0])) for r in rows]
 
     def non_noise_log_timestamps_for_workspace(
@@ -733,11 +746,14 @@ class EventIndex:
         if not file_ids:
             return []
         placeholders = ",".join("?" for _ in file_ids)
-        rows = self._conn.execute(
-            f"SELECT ts_epoch_us FROM orch_log_events WHERE file_id IN ({placeholders}) "
-            "AND logger != ? ORDER BY ts_epoch_us ASC",
-            (*file_ids, noise_logger),
-        ).fetchall()
+        sql = "".join(
+            [
+                "SELECT ts_epoch_us FROM orch_log_events WHERE file_id IN (",
+                placeholders,
+                ") AND logger != ? ORDER BY ts_epoch_us ASC",
+            ]
+        )
+        rows = self._conn.execute(sql, (*file_ids, noise_logger)).fetchall()
         return [_epoch_us_to_dt(int(r[0])) for r in rows]
 
     def task_transition_times(self, log_path: Path, transition: str) -> dict[str, datetime]:

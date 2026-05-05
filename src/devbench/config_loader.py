@@ -240,6 +240,14 @@ class GitOpsConfig:
             list; non-empty REPLACES it.
         pr_review_resolution: Nested config for the PR review-comment
             polling phase (issue #116).
+        local_only: When ``True``, the target repo(s) are treated as
+            local-only -- they have no ``origin`` git remote, are never
+            pushed, never produce PRs, and never run CI. ``ensure_branch``
+            creates the work-unit branch off the local default branch
+            (no ``git fetch origin``). Requires ``defer_pr: true``,
+            forbids ``pause_before_merge: true``, and requires every
+            entry in ``repos:`` to set an explicit ``default_branch:``
+            (no ``origin/HEAD`` fallback). Defaults to ``False``.
     """
 
     update_submodule: bool = False
@@ -250,6 +258,7 @@ class GitOpsConfig:
     ci_failure_retry: bool | None = None
     orphan_patterns: list[str] = field(default_factory=list)
     pr_review_resolution: PrReviewResolutionConfig = field(default_factory=PrReviewResolutionConfig)
+    local_only: bool = False
 
 
 @dataclass
@@ -317,6 +326,29 @@ class ReportConfig:
     fast_mode_multiplier: float | None = None
     recent_pace_tasks: int | None = None
     token_cost_discount: float | None = None
+
+
+@dataclass(frozen=True)
+class ValidateConfig:
+    """Per-backlog opt-in toggles for additional ``validate-backlog`` rules.
+
+    Existing rules (1-19) run unconditionally. Rules added here are gated so
+    pre-existing backlogs see no behaviour change until they explicitly opt
+    in. See ``docs/backlog-contract.md`` for the full rule list.
+
+    Attributes:
+        check_orphan_path_tokens: Rule 20. When ``True``, validate-backlog
+            scans every Task's ``## Acceptance Criteria`` and
+            ``## Definition of Done`` sections for backtick-quoted
+            path-shaped tokens, and emits an integrity error for any token
+            that does not appear in the Task's ``## Changes Manifest``
+            (after path normalisation). A token followed by ``(ref)`` is
+            treated as a declared read-only reference and skipped. Catches
+            spec drift where AC/DoD prose restates a path that disagrees
+            with the Manifest. Default ``False`` (opt-in).
+    """
+
+    check_orphan_path_tokens: bool = False
 
 
 @dataclass(frozen=True)
@@ -506,6 +538,7 @@ class RuntimeConfig:
     orchestrate: OrchestrateConfig = field(default_factory=OrchestrateConfig)
     manifest_amendment: AmendmentConfig = field(default_factory=AmendmentConfig)
     task_factory: TaskFactoryConfig = field(default_factory=TaskFactoryConfig)
+    validate: ValidateConfig = field(default_factory=ValidateConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
     allowed_orgs: list[str] = field(default_factory=list)
     judge_model: str | None = None
@@ -744,6 +777,19 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
     )
     inline_cleanup_raw = git_ops_raw.get("inline_orphan_cleanup")
     ci_failure_retry_raw = git_ops_raw.get("ci_failure_retry")
+    local_only = bool(git_ops_raw.get("local_only", False))
+    if local_only and not defer_pr:
+        raise ValueError(
+            f"Config file '{path}': git_ops.local_only: true requires git_ops.defer_pr: true. "
+            "Local-only repos have no remote to push to; PR creation is meaningless. "
+            "Set git_ops.defer_pr: true (and git_ops.single_branch: <name>) alongside local_only."
+        )
+    if local_only and pause_before_merge:
+        raise ValueError(
+            f"Config file '{path}': git_ops.local_only: true is incompatible with "
+            "git_ops.pause_before_merge: true. Local-only mode never creates PRs; "
+            "there is nothing to pause before merging."
+        )
     git_ops = GitOpsConfig(
         update_submodule=bool(git_ops_raw.get("update_submodule", False)),
         single_branch=single_branch_raw,
@@ -753,7 +799,17 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         ci_failure_retry=bool(ci_failure_retry_raw) if ci_failure_retry_raw is not None else None,
         orphan_patterns=list(git_ops_raw.get("orphan_patterns") or []),
         pr_review_resolution=pr_review_resolution,
+        local_only=local_only,
     )
+    if local_only:
+        missing_default_branch = [repo_name for repo_name, repo_cfg in repos.items() if not repo_cfg.default_branch]
+        if missing_default_branch:
+            raise ValueError(
+                f"Config file '{path}': git_ops.local_only: true requires every entry in "
+                f"repos: to set an explicit default_branch:. Missing on: "
+                f"{', '.join(sorted(missing_default_branch))}. There is no origin to fall "
+                "back to in local-only mode."
+            )
 
     # Populate DebugConfig from YAML debug block (absent keys yield None).
     debug_raw = raw.get("debug") or {}
@@ -825,6 +881,16 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
             "Task-factory runs from the amendment-reject path; it has nothing to do when amendments are off."
         )
 
+    # Populate ValidateConfig from YAML validate block. All toggles default
+    # to False so existing backlogs see no behaviour change.
+    validate_raw = raw.get("validate") or {}
+    default_validate = ValidateConfig()
+    validate_cfg = ValidateConfig(
+        check_orphan_path_tokens=bool(
+            validate_raw.get("check_orphan_path_tokens", default_validate.check_orphan_path_tokens)
+        ),
+    )
+
     # Populate StopHookConfig from YAML stop_hook block.
     stop_hook_raw = raw.get("stop_hook") or {}
     stop_hook = StopHookConfig(
@@ -874,6 +940,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         orchestrate=orchestrate,
         manifest_amendment=manifest_amendment,
         task_factory=task_factory,
+        validate=validate_cfg,
         debug=debug,
         allowed_orgs=allowed_orgs,
         judge_model=raw.get("judge_model") or None,

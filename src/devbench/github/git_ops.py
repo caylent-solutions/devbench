@@ -99,6 +99,25 @@ class GitOpsService:
         self.name = "git_ops"
         self.logger = logging.getLogger(f"devbench.{self.name}")
 
+    @staticmethod
+    def _refuse_if_local_only(operation: str) -> None:
+        """Raise RuntimeError when ``git_ops.local_only`` is true.
+
+        Defense-in-depth guard for methods that touch the git ``origin``
+        remote (push, fetch from origin, force-push).  Local-only mode
+        should never reach these paths -- ``cli._git_ops_deferred`` routes
+        every commit through :meth:`commit_local`, finalize/tag/rebase are
+        not called when ``defer_pr: true`` -- so this guard exists to
+        protect against future refactors that silently re-enter a remote
+        path.
+        """
+        if RUNTIME_CONFIG.git_ops.local_only:
+            raise RuntimeError(
+                f"{operation} is not available when git_ops.local_only is true. "
+                "Local-only repos have no origin remote; remote-touching git "
+                "operations must be skipped via the deferred / commit_local path."
+            )
+
     def assert_on_branch(self, repo_path: Path, expected_branch: str) -> None:
         """Verify the working tree is checked out to ``expected_branch``.
 
@@ -134,6 +153,12 @@ class GitOpsService:
 
         A non-zero exit from ``git status --porcelain`` is a genuine git error
         and raises ``RuntimeError`` immediately (never silently treated as clean).
+
+        When ``git_ops.local_only`` is true (config flag), case 3 skips the
+        ``git fetch origin`` step entirely and creates the branch directly off
+        the local default branch (``refs/heads/<default_branch>``). The repo
+        has no origin remote in this mode; the YAML-configured
+        ``default_branch`` is mandatory.
 
         Args:
             repo: GitHub repository in ``owner/name`` format.
@@ -173,6 +198,9 @@ class GitOpsService:
 
         if branch_exists:
             self._git(["checkout", branch], repo_path)
+        elif RUNTIME_CONFIG.git_ops.local_only:
+            default_branch = self._get_default_branch(repo_path, repo=repo)
+            self._git(["checkout", "-b", branch, f"refs/heads/{default_branch}"], repo_path)
         else:
             self._git(["fetch", "origin"], repo_path)
             default_branch = self._get_default_branch(repo_path, repo=repo)
@@ -231,8 +259,10 @@ class GitOpsService:
         Raises:
             ValueError: If the repo is not in the allow-list, or the branch name
                 does not match the allowed format.
-            RuntimeError: If any git command fails.
+            RuntimeError: If any git command fails, or if ``git_ops.local_only``
+                is true (use :meth:`commit_local` for local-only repos).
         """
+        self._refuse_if_local_only("commit_and_push")
         validate_repo(repo)
         if not _BRANCH_RE.match(branch):
             raise ValueError(
@@ -428,8 +458,10 @@ class GitOpsService:
 
         Raises:
             ValueError: If the repo is not in the allow-list.
-            RuntimeError: If any git command fails.
+            RuntimeError: If any git command fails, or if ``git_ops.local_only``
+                is true (tags require an origin remote to push to).
         """
+        self._refuse_if_local_only("create_tag")
         validate_repo(repo)
 
         self._git(["tag", "-a", tag, "-m", message], repo_path)
@@ -801,9 +833,11 @@ class GitOpsService:
             repo_path: Local filesystem path to the repository.
 
         Raises:
-            RuntimeError: If any git command fails or the default branch
-                cannot be determined.
+            RuntimeError: If any git command fails, the default branch cannot
+                be determined, or ``git_ops.local_only`` is true (no origin
+                to pull from).
         """
+        self._refuse_if_local_only("checkout_default_branch")
         default_branch = self._get_default_branch(repo_path, repo=repo)
         self._git(["checkout", default_branch], repo_path)
         self._git(["pull", "origin", default_branch], repo_path)
@@ -825,8 +859,10 @@ class GitOpsService:
             branch: Branch name to force-push after rebasing.
 
         Raises:
-            RuntimeError: If any git command fails.
+            RuntimeError: If any git command fails, or if ``git_ops.local_only``
+                is true (no origin to fetch/push).
         """
+        self._refuse_if_local_only("rebase_and_force_push")
         default_branch = self._get_default_branch(repo_path, repo=repo)
         self._git(["fetch", "origin"], repo_path)
         self._git(["rebase", f"origin/{default_branch}"], repo_path)
@@ -877,14 +913,27 @@ class GitOpsService:
         1. YAML ``repos.<repo>.default_branch`` when *repo* is provided and configured.
         2. ``git rev-parse --abbrev-ref origin/HEAD`` fallback.
 
+        When ``git_ops.local_only`` is true, only step 1 is honored. The
+        ``origin/HEAD`` fallback is unavailable (no remote) and raises with
+        a clear "default_branch is required for local-only repos" message.
+
         Raises:
             RuntimeError: If no YAML branch is configured and the git fallback
-                cannot determine the default branch.
+                cannot determine the default branch (or the fallback is
+                disabled in local-only mode).
         """
         if repo:
             configured = get_configured_default_branch(repo, RUNTIME_CONFIG)
             if configured:
                 return configured
+
+        if RUNTIME_CONFIG.git_ops.local_only:
+            raise RuntimeError(
+                f"Cannot determine default branch in {repo_path}: git_ops.local_only "
+                f"is true but repo {repo!r} has no default_branch configured in "
+                "devbench.yaml. Set repos.<repo>.default_branch explicitly; the "
+                "origin/HEAD fallback is unavailable in local-only mode."
+            )
 
         rc, stdout, _ = run_command(
             ["git", "rev-parse", "--abbrev-ref", "origin/HEAD"],

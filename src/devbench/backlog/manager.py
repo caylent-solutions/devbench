@@ -257,6 +257,10 @@ class BacklogManager:
         17. Dependency-ID format (every entry in a ``## Dependencies`` table matches the canonical regex).
         18. Branch uniqueness (no two Tasks derive the same branch name; skipped in single-PR mode).
         19. No placeholder Manifest rows (no active Task carries a ``TBD`` row in its Changes Manifest).
+        20. No orphan path tokens in AC / DoD (gated by ``validate.check_orphan_path_tokens``):
+            backtick-quoted path-shaped tokens in ``## Acceptance Criteria`` and
+            ``## Definition of Done`` must appear in the Task's Changes Manifest after
+            normalisation, OR be marked read-only via a trailing ``(ref)`` suffix.
 
         Args:
             backlog_index: Path to the ``BACKLOG.md`` index file.
@@ -294,6 +298,7 @@ class BacklogManager:
         self._check_dep_id_format(rows, workspace_root, errors)
         self._check_branch_uniqueness(rows, workspace_root, errors)
         self._check_no_placeholder_manifest_rows(rows, workspace_root, errors)
+        self._check_no_orphan_path_tokens(rows, workspace_root, errors)
         return errors
 
     def _apply_fixes(
@@ -1934,6 +1939,198 @@ class BacklogManager:
             if cls._PLACEHOLDER_MANIFEST_RE.match(cell):
                 return cell
         return ""
+
+    # Rule 20: orphan path tokens in AC / DoD. The Manifest is the single
+    # source of truth for files a Task produces; AC / DoD that restate
+    # paths is redundancy that drifts. The check is gated by
+    # ``RUNTIME_CONFIG.validate.check_orphan_path_tokens`` so existing
+    # backlogs see no behaviour change until they opt in.
+    #
+    # Token regex: a single-backtick group whose body has no whitespace.
+    # The optional second group captures a trailing `` (ref)`` marker --
+    # an inline escape hatch declaring the token a read-only reference
+    # (e.g. an external config file the Task reads but does not modify).
+    _ORPHAN_TOKEN_RE: ClassVar[re.Pattern[str]] = re.compile(r"`([^`\s]+)`(\s*\(ref\))?")
+    _ORPHAN_PATH_EXTS: ClassVar[tuple[str, ...]] = (
+        ".md",
+        ".py",
+        ".ts",
+        ".tsx",
+        ".js",
+        ".jsx",
+        ".go",
+        ".java",
+        ".kt",
+        ".rb",
+        ".rs",
+        ".swift",
+        ".cpp",
+        ".c",
+        ".h",
+        ".hpp",
+        ".yaml",
+        ".yml",
+        ".toml",
+        ".json",
+        ".xml",
+        ".tf",
+        ".tfvars",
+        ".hcl",
+        ".sh",
+        ".dockerfile",
+        ".html",
+        ".css",
+        ".scss",
+        ".sql",
+    )
+    _ORPHAN_KNOWN_PREFIXES: ClassVar[tuple[str, ...]] = (
+        "src/",
+        "tests/",
+        "test/",
+        "infra/",
+        "docs/",
+        "backlog/",
+        "config/",
+    )
+
+    @classmethod
+    def _is_path_shaped(cls, token: str, manifest_dir_prefixes: set[str]) -> bool:
+        """Return ``True`` if ``token`` looks like a single-file path reference.
+
+        Excludes shell flags, key=value forms, glob patterns, URL-scheme
+        tokens, and tokens with no path-like marker. Includes tokens
+        ending in a known extension, starting with a built-in directory
+        prefix, or starting with a directory prefix observed anywhere in
+        the Task's parsed Manifest. Uses no domain knowledge -- the
+        prefix and extension lists are static.
+        """
+        if not token or token.startswith("-") or "=" in token or "*" in token or "://" in token:
+            return False
+        lower = token.lower()
+        if any(lower.endswith(ext) for ext in cls._ORPHAN_PATH_EXTS):
+            return True
+        if any(token.startswith(p) for p in cls._ORPHAN_KNOWN_PREFIXES):
+            return True
+        return any(token.startswith(prefix) for prefix in manifest_dir_prefixes)
+
+    @staticmethod
+    def _normalise_orphan_path(token: str, checkout_dir: str | None) -> str:
+        """Strip leading ``./``, optional ``checkout_dir/`` prefix, and trailing ``/``.
+
+        Mirrors the normalisation rule 11 applies to Manifest paths so
+        AC / DoD tokens authored with the prefix still match Manifest
+        entries that the prefix-rule fixer stripped.
+        """
+        s = token
+        if s.startswith("./"):
+            s = s[2:]
+        if checkout_dir:
+            prefix = checkout_dir.rstrip("/") + "/"
+            if s.startswith(prefix):
+                s = s[len(prefix) :]
+        return s.rstrip("/")
+
+    @classmethod
+    def _iter_orphan_candidates(cls, section_body: str) -> "list[tuple[str, bool]]":
+        """Yield ``(token, has_ref_marker)`` for every backtick-quoted no-whitespace token.
+
+        Does not filter for path-shape -- the caller decides which tokens
+        are path-shaped relative to the Task's Manifest. The boolean is
+        ``True`` when the token is immediately followed by ``(ref)``,
+        signalling the inline read-only escape hatch.
+        """
+        out: list[tuple[str, bool]] = []
+        for match in cls._ORPHAN_TOKEN_RE.finditer(section_body):
+            token = match.group(1)
+            has_ref = match.group(2) is not None
+            out.append((token, has_ref))
+        return out
+
+    def _check_no_orphan_path_tokens(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """Rule 20: AC / DoD must not name paths that are absent from the Changes Manifest.
+
+        For every Task work-unit (Stories/Features/Epics short-circuit;
+        they have no Manifest), extract the ``## Acceptance Criteria``
+        and ``## Definition of Done`` section bodies and walk every
+        backtick-quoted no-whitespace token. If a token is path-shaped
+        (per ``_is_path_shaped``) and is not present in the Task's
+        parsed Manifest after normalisation -- and is not declared
+        read-only via the inline ``(ref)`` marker -- emit an integrity
+        error.
+
+        Gated by ``RUNTIME_CONFIG.validate.check_orphan_path_tokens``;
+        returns immediately when the flag is ``False`` (the default),
+        so this rule is invisible to backlogs that have not opted in.
+        """
+        from devbench.config import RUNTIME_CONFIG
+
+        if not getattr(RUNTIME_CONFIG.validate, "check_orphan_path_tokens", False):
+            return
+
+        for row_id, _, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not file_path_str or not self._is_task_id(row_id):
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.is_file():
+                continue
+            self._check_one_task_orphan_paths(row_id, wu_path, errors)
+
+    def _check_one_task_orphan_paths(
+        self,
+        row_id: str,
+        wu_path: Path,
+        errors: list[str],
+    ) -> None:
+        """Per-task body for ``_check_no_orphan_path_tokens``."""
+        from devbench.backlog.manifest import ManifestParseError, parse_manifest
+        from devbench.config import RUNTIME_CONFIG
+
+        content = wu_path.read_text(encoding="utf-8")
+        try:
+            manifest_rows = parse_manifest(content)
+        except ManifestParseError:
+            # Already reported by other rules; skip this task quietly.
+            return
+
+        repo = self._extract_repo(content)
+        checkout_dir: str | None = None
+        if repo is not None and repo in RUNTIME_CONFIG.repos:
+            checkout_dir = RUNTIME_CONFIG.repos[repo].checkout_directory
+
+        manifest_paths = {
+            self._normalise_orphan_path(r.file, checkout_dir)
+            for r in manifest_rows
+            if self._is_real_manifest_path(r.file)
+        }
+        manifest_dir_prefixes = {p.split("/", 1)[0] + "/" for p in manifest_paths if "/" in p}
+
+        sections = self._extract_sections(content)
+        for section_name in ("Acceptance Criteria", "Definition of Done"):
+            body = sections.get(section_name, "")
+            if not body:
+                continue
+            for token, has_ref in self._iter_orphan_candidates(body):
+                if has_ref or not self._is_path_shaped(token, manifest_dir_prefixes):
+                    continue
+                normalised = self._normalise_orphan_path(token, checkout_dir)
+                if normalised in manifest_paths:
+                    continue
+                errors.append(
+                    f"{row_id}: orphan path {token!r} in '## {section_name}' "
+                    f"not in Changes Manifest. Either add the path to the "
+                    f"Manifest, rewrite the AC/DoD line behaviourally "
+                    f"(reference the Manifest symbolically), or suffix the "
+                    f"token with ' (ref)' to declare it a read-only "
+                    f"reference. See docs/backlog-contract.md "
+                    f"'No Orphan Path Tokens Rule'."
+                )
 
     @staticmethod
     def _derive_branch_for_row(unit_id: str, file_path_str: str, workspace_root: Path) -> str:

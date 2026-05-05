@@ -311,20 +311,20 @@ When a CLI command receives a repo argument (or reads the `repo:` field of a wor
 
 ## 6. Multi-PR vs single-PR mode
 
-DevBench supports two git workflow patterns. Both share the same review pipeline; they differ in when commits are pushed and PRs are created.
+DevBench supports several git workflow patterns. They share the same review pipeline; they differ in when commits are pushed and PRs are created. See [`docs/git-ops-modes.md`](git-ops-modes.md) for the full mode table including pause-before-merge.
 
 ### Side-by-side comparison
 
-| Aspect | Multi-PR (default) | Single-PR (single-branch + defer_pr) |
-| --- | --- | --- |
-| Branch per work unit | `backlog/<id>` (one branch each) | one shared branch from `git_ops.single_branch` |
-| Commit cadence | Per work unit | Per work unit |
-| Push cadence | Per work unit, immediately after commit | Deferred until `git-ops-finalize` |
-| PR creation | After each unit's review passes | Once via `git-ops-finalize` after all units done |
-| CI checks | One CI run per PR | One CI run on the whole batch |
-| Merge | Auto-merge each PR after CI passes | Auto-merge the single PR after CI passes |
-| Submodule pointer updates | Per-unit (if `update_submodule: true`) | Not supported |
-| Best for | Independent work units that can ship separately | Related changes that must ship together |
+| Aspect | Multi-PR (default) | Single-PR (single-branch + defer_pr) | Local-only (`local_only: true`) |
+| --- | --- | --- | --- |
+| Branch per work unit | `backlog/<id>` (one branch each) | one shared branch from `git_ops.single_branch` | one shared branch from `git_ops.single_branch` |
+| Commit cadence | Per work unit | Per work unit | Per work unit |
+| Push cadence | Per work unit, immediately after commit | Deferred until `git-ops-finalize` | Never (no remote) |
+| PR creation | After each unit's review passes | Once via `git-ops-finalize` after all units done | Never |
+| CI checks | One CI run per PR | One CI run on the whole batch | None |
+| Merge | Auto-merge each PR after CI passes | Auto-merge the single PR after CI passes | N/A -- local commit history is the deliverable |
+| Submodule pointer updates | Per-unit (if `update_submodule: true`) | Not supported | Not supported |
+| Best for | Independent work units that can ship separately | Related changes that must ship together | Operational work (AWS teardowns, audits, evidence capture) -- see [`operational-work.md`](operational-work.md) |
 
 ### Multi-PR (default)
 

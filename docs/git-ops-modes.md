@@ -1,6 +1,6 @@
 # Git-ops execution modes
 
-DevBench's `cmd_git_ops` supports three mutually-exclusive execution
+DevBench's `cmd_git_ops` supports four mutually-exclusive execution
 modes. Pick the mode that matches the operator's review posture and
 PR-granularity needs.
 
@@ -15,12 +15,19 @@ specifically about the per-task git workflow after reviews pass.
 | Multi-PR (default) | _none_ | Yes | Yes (on green CI) | You trust judges + CI to gate; no human review needed per PR. |
 | Single-branch + defer-PR | `git_ops.single_branch: <branch>` + `git_ops.defer_pr: true` | No (one batch PR) | Yes (via `git-ops-finalize`) | You want one PR for the whole batch (e.g., dependent tasks must land atomically). |
 | Pause-before-merge (#101) | `git_ops.pause_before_merge: true` | Yes | No -- waits for human merge | You want per-task granularity AND per-PR human gating without blocking the orchestrator. |
+| Local-only | `git_ops.single_branch: <branch>` + `git_ops.defer_pr: true` + `git_ops.local_only: true` | No (no PR ever) | N/A (no remote) | Operational workflows -- AWS teardowns, evidence capture, scheduled audits -- where devbench drives work but the target "repo" has no GitHub remote and never pushes. See [`operational-work.md`](operational-work.md). |
 
-The schema rejects the two illegal combinations at config load:
+The schema rejects the illegal combinations at config load:
 
 - `pause_before_merge: true` + `defer_pr: true` -- mutually exclusive.
 - `pause_before_merge: true` + `single_branch: <name>` -- mutually
   exclusive (single-branch has no per-unit branch to PR from).
+- `local_only: true` without `defer_pr: true` -- a local-only repo has
+  no remote to push to; PR creation is meaningless.
+- `local_only: true` + `pause_before_merge: true` -- there is no PR to
+  pause before merging.
+- `local_only: true` + any `repos:` entry without an explicit
+  `default_branch:` -- there is no `origin/HEAD` to fall back to.
 
 ## Decision tree
 
@@ -124,10 +131,66 @@ Use when:
 
 Both layers compose with the standard env > YAML > default precedence.
 
+## Local-only mode
+
+When the target "repo" has no `origin` remote configured -- typically
+because it is a sibling checkout used to capture per-task operational
+evidence (AWS teardown logs, audit artefacts, scheduled-job output)
+rather than to host application source code -- set:
+
+```yaml
+git_ops:
+  single_branch: feat/<workspace-name>
+  defer_pr: true
+  local_only: true
+repos:
+  org/repo:
+    default_branch: main   # required: no origin/HEAD fallback exists
+    checkout_directory: <local-folder>
+```
+
+What changes vs. single-branch + defer-PR mode:
+
+- `ensure-branch` does **not** call `git fetch origin`. The work-unit
+  branch is created off the **local** default branch
+  (`refs/heads/<default_branch>`).
+- `git-ops` commits locally only -- no push, no PR, no CI wait, no
+  `git-ops-finalize` step.
+- `commit_and_push`, `create_tag`, `checkout_default_branch`, and
+  `rebase_and_force_push` are guarded -- calling any of them under
+  `local_only: true` raises a clear `RuntimeError`. Defense-in-depth
+  against future refactors.
+- The pre-flight `devbench check` inverts its origin assertion: it
+  REQUIRES the absence of an `origin` remote and flags any target repo
+  that has one as misconfigured.
+
+When to choose this mode:
+
+- The work is operational, not application-code authoring -- AWS
+  resource teardowns, evidence-capture audits, scheduled
+  administrative ops.
+- The output is a per-task artefact file committed to a local
+  history; nobody reviews PRs because there are none.
+- See [`operational-work.md`](operational-work.md) for an end-to-end
+  walkthrough of structuring such a backlog.
+
+### Configuration overrides
+
+| Layer | Knob |
+|-------|------|
+| YAML | `git_ops.local_only: bool` |
+
+There is no environment-variable override for `local_only`; the flag
+declares an intent about the workspace's target repo, not a per-run
+behavior.
+
 ## See also
 
 - [ADR-13](adr/13-pause-before-merge.md) -- pause-before-merge design
   decision + consequences.
+- [`operational-work.md`](operational-work.md) -- end-to-end pattern for
+  using devbench to drive non-code operational work under
+  `local_only: true`.
 - [`plugin/devbench/skills/orchestrate/SKILL.md`](../plugin/devbench/skills/orchestrate/SKILL.md) -- step 1b reconciliation
   loop and step 8 mode dispatch.
 - [`docs/cli-reference.md`](cli-reference.md) -- the `git-ops` and

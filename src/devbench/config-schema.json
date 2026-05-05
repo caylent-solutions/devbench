@@ -175,6 +175,10 @@
           },
           "description": "Operator override of the built-in orphan-pattern fnmatch list (terraform state, terragrunt cache, Python pycache, coverage, etc.). When non-empty, REPLACES the built-in list entirely. Override via DEVBENCH_ORPHAN_IGNORE_PATTERNS. Default: [] (use the built-in list)."
         },
+        "local_only": {
+          "type": "boolean",
+          "description": "When true, the target repo(s) are treated as local-only -- no origin git remote, never pushed, no PRs, no CI. ensure_branch creates the work-unit branch off the local default branch (no 'git fetch origin'). Requires defer_pr: true, forbids pause_before_merge: true, and requires every entry in repos: to set an explicit default_branch:. Used for operational workflows (AWS teardowns, evidence capture, audits) where devbench drives work but does not edit application code. Default: false."
+        },
         "pr_review_resolution": {
           "type": "object",
           "description": "PR review-comment polling settings (issue #116). Disabled by default. When enabled, cmd_git_ops polls gh pr view for asynchronous bot review feedback (Copilot, Q-Dev, internal review bots) before merging.",
@@ -415,6 +419,17 @@
         "auto_accept_proposals": {
           "type": "boolean",
           "description": "When true, devbench auto-promotes every task-factory-produced draft at sweep time instead of leaving it at status `proposed` for operator review. Default false. ADR-11."
+        }
+      }
+    },
+    "validate": {
+      "type": "object",
+      "description": "Opt-in toggles for additional validate-backlog rules. Existing rules (1-19) run unconditionally; rules listed here are gated to keep pre-existing backlogs green during rollout.",
+      "additionalProperties": false,
+      "properties": {
+        "check_orphan_path_tokens": {
+          "type": "boolean",
+          "description": "Rule 20: cross-check Acceptance Criteria and Definition of Done sections of every Task against the Changes Manifest. Backtick-quoted path-shaped tokens that do not appear in the Manifest (and are not declared read-only via a trailing `(ref)` marker) emit an integrity error. Catches spec drift where AC/DoD prose restates a path that disagrees with the Manifest. Default false (opt-in). See docs/backlog-contract.md."
         }
       }
     }

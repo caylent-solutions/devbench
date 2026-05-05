@@ -356,6 +356,106 @@ class TestEnsureBranch:
                 judge.ensure_branch("caylent-solutions/git-repo", tmp_path, "feature/x")
 
 
+class TestLocalOnlyMode:
+    """Tests for git_ops.local_only=true behavior."""
+
+    def test_ensure_branch_skips_fetch_and_uses_local_default_when_local_only(self, tmp_path: Path) -> None:
+        """
+        Given: git_ops.local_only=true, branch absent, clean tree
+        When: ensure_branch is called
+        Then: NO 'fetch origin' is run, and 'checkout -b <branch> refs/heads/<default>' is used
+              (the local default ref, not origin/<default>).
+        """
+        judge = GitOpsService()
+        git_calls: list[list[str]] = []
+
+        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
+            git_calls.append(args)
+            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, "main", "")
+            return (0, "", "")
+
+        run_command_responses = iter([(0, "", ""), (1, "", "")])
+
+        with (
+            patch.object(judge, "_git", side_effect=stub),
+            patch.object(judge, "_get_default_branch", return_value="main"),
+            patch("devbench.github.git_ops.run_command", side_effect=run_command_responses),
+            patch("devbench.github.git_ops.RUNTIME_CONFIG") as mock_cfg,
+        ):
+            mock_cfg.git_ops.local_only = True
+            judge.ensure_branch("caylent-solutions/git-repo", tmp_path, "new-branch")
+
+        assert ["fetch", "origin"] not in git_calls, (
+            "ensure_branch must NOT call 'git fetch origin' under local_only=true"
+        )
+        assert ["checkout", "-b", "new-branch", "refs/heads/main"] in git_calls
+        # Sanity: the origin-based form must NOT be used.
+        assert ["checkout", "-b", "new-branch", "origin/main"] not in git_calls
+
+    def test_ensure_branch_noop_when_already_on_branch_local_only(self, tmp_path: Path) -> None:
+        """ensure_branch is still a no-op when HEAD is already on the target branch under local_only."""
+        judge = GitOpsService()
+        git_calls: list[list[str]] = []
+
+        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
+            git_calls.append(args)
+            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, "feature/x", "")
+            return (0, "", "")
+
+        with (
+            patch.object(judge, "_git", side_effect=stub),
+            patch("devbench.github.git_ops.RUNTIME_CONFIG") as mock_cfg,
+        ):
+            mock_cfg.git_ops.local_only = True
+            judge.ensure_branch("caylent-solutions/git-repo", tmp_path, "feature/x")
+
+        # Only the rev-parse call; no fetch, no checkout.
+        assert git_calls == [["rev-parse", "--abbrev-ref", "HEAD"]]
+
+    def test_commit_and_push_raises_when_local_only(self, tmp_path: Path) -> None:
+        """commit_and_push must refuse to run under local_only=true (operators should use commit_local)."""
+        judge = GitOpsService()
+        with patch("devbench.github.git_ops.RUNTIME_CONFIG") as mock_cfg:
+            mock_cfg.git_ops.local_only = True
+            with pytest.raises(RuntimeError, match=r"commit_and_push is not available .*local_only"):
+                judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "feature/x", "msg")
+
+    def test_create_tag_raises_when_local_only(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        with patch("devbench.github.git_ops.RUNTIME_CONFIG") as mock_cfg:
+            mock_cfg.git_ops.local_only = True
+            with pytest.raises(RuntimeError, match=r"create_tag is not available .*local_only"):
+                judge.create_tag("caylent-solutions/git-repo", tmp_path, "v1.0", "msg")
+
+    def test_checkout_default_branch_raises_when_local_only(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        with patch("devbench.github.git_ops.RUNTIME_CONFIG") as mock_cfg:
+            mock_cfg.git_ops.local_only = True
+            with pytest.raises(RuntimeError, match=r"checkout_default_branch is not available .*local_only"):
+                judge.checkout_default_branch("caylent-solutions/git-repo", tmp_path)
+
+    def test_rebase_and_force_push_raises_when_local_only(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        with patch("devbench.github.git_ops.RUNTIME_CONFIG") as mock_cfg:
+            mock_cfg.git_ops.local_only = True
+            with pytest.raises(RuntimeError, match=r"rebase_and_force_push is not available .*local_only"):
+                judge.rebase_and_force_push("caylent-solutions/git-repo", tmp_path, "feature/x")
+
+    def test_get_default_branch_refuses_origin_head_fallback_when_local_only(self, tmp_path: Path) -> None:
+        """When local_only is true and no YAML default_branch is configured, fail fast
+        instead of falling back to 'git rev-parse origin/HEAD'."""
+        judge = GitOpsService()
+        with (
+            patch("devbench.github.git_ops.RUNTIME_CONFIG") as mock_cfg,
+            patch("devbench.github.git_ops.get_configured_default_branch", return_value=""),
+        ):
+            mock_cfg.git_ops.local_only = True
+            with pytest.raises(RuntimeError, match=r"local_only is true but repo .* has no default_branch"):
+                judge._get_default_branch(tmp_path, repo="caylent-solutions/git-repo")
+
+
 class TestCreatePr:
     """Test create_pr method."""
 

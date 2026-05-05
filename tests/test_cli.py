@@ -6459,6 +6459,92 @@ class TestCmdCheck:
         out = capsys.readouterr().out
         assert "open PR(s) already exist on branch" in out
 
+    @staticmethod
+    def _write_local_only_yaml(tmp_path: Path) -> Path:
+        cfg_dir = tmp_path / "backlog" / "config"
+        cfg_dir.mkdir(parents=True)
+        cfg_path = cfg_dir / "devbench.yaml"
+        cfg_path.write_text(
+            "judge_model: test-judge-model\n"
+            "executor_model: test-executor-model\n"
+            "repos:\n"
+            "  org/repo-a:\n"
+            "    checkout_directory: repo-a\n"
+            "    default_branch: main\n"
+            "git_ops:\n"
+            "  single_branch: feat/x\n"
+            "  defer_pr: true\n"
+            "  local_only: true\n"
+        )
+        return cfg_path
+
+    def test_passes_when_local_only_repo_has_no_origin(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Under git_ops.local_only: true, a target repo with NO origin remote passes pre-flight."""
+        clone = tmp_path / "clone-a"
+        clone.mkdir()
+        (tmp_path / "repo-a").symlink_to(clone)
+        cfg = self._write_local_only_yaml(tmp_path)
+        monkeypatch.setenv("JUDGE_CONFIG_PATH", str(cfg))
+
+        def fake_run(args: list[str], **_: Any) -> Any:
+            mock = MagicMock()
+            mock.stderr = ""
+            mock.stdout = ""
+            if args[:3] == ["git", "-C", str(clone)]:
+                # No origin remote -> rc=2 (the real git failure mode)
+                mock.returncode = 2
+                mock.stderr = "error: No such remote 'origin'"
+            else:
+                mock.returncode = 0
+            return mock
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.subprocess.run", side_effect=fake_run),
+        ):
+            rc = cli.cmd_check()
+        assert rc == 0
+        assert "Pre-flight check passed" in capsys.readouterr().out
+
+    def test_flags_local_only_repo_with_origin(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Under git_ops.local_only: true, a target repo that DOES have an origin remote is flagged."""
+        clone = tmp_path / "clone-a"
+        clone.mkdir()
+        (tmp_path / "repo-a").symlink_to(clone)
+        cfg = self._write_local_only_yaml(tmp_path)
+        monkeypatch.setenv("JUDGE_CONFIG_PATH", str(cfg))
+
+        def fake_run(args: list[str], **_: Any) -> Any:
+            mock = MagicMock()
+            mock.stderr = ""
+            if args[:3] == ["git", "-C", str(clone)]:
+                mock.returncode = 0
+                mock.stdout = "git@github.com:org/repo-a.git\n"
+            else:
+                mock.returncode = 0
+                mock.stdout = ""
+            return mock
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.subprocess.run", side_effect=fake_run),
+        ):
+            rc = cli.cmd_check()
+        assert rc == 1
+        out = capsys.readouterr().out
+        assert "git_ops.local_only is true" in out
+        assert "has an 'origin' remote" in out
+
 
 # ---------------------------------------------------------------------------
 # Tier 3: variadic dispatch lets `add-dep --reason "<multi token>"` survive

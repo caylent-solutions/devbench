@@ -8,7 +8,7 @@ from unittest.mock import patch
 import pytest
 
 from devbench.backlog.manager import BacklogManager
-from devbench.config_loader import RepoConfig, RuntimeConfig
+from devbench.config_loader import RepoConfig, RuntimeConfig, ValidateConfig
 from devbench.constants import ALL_REQUIRED_JUDGE_NAMES, REVIEW_JUDGE_NAMES, SECURITY_JUDGE_NAMES, VALID_STATUSES
 
 
@@ -3627,6 +3627,343 @@ class TestValidateNoPlaceholderManifestRows:
         rows = [("EX-F1-S1-T1", "in-queue", "")]
         manager._check_no_placeholder_manifest_rows(rows, tmp_path, errors)
         assert errors == []
+
+
+class TestValidateNoOrphanPathTokens:
+    """Rule 20: backtick-quoted path-shaped tokens in AC / DoD must appear in
+    the Task's Changes Manifest after normalisation, OR be marked read-only
+    via a trailing ``(ref)`` suffix. Gated by
+    ``RUNTIME_CONFIG.validate.check_orphan_path_tokens``; default OFF so
+    pre-existing backlogs are unaffected.
+    """
+
+    H = _ValidateRuleHarness
+
+    @staticmethod
+    def _runtime_with_rule_on(repo: str, checkout_directory: str | None) -> RuntimeConfig:
+        return RuntimeConfig(
+            repos={repo: RepoConfig(checkout_directory=checkout_directory)},
+            validate=ValidateConfig(check_orphan_path_tokens=True),
+        )
+
+    @staticmethod
+    def _make_task_with_sections(
+        backlog_dir: Path,
+        unit_id: str,
+        repo: str,
+        manifest_rows: str,
+        ac_block: str,
+        dod_block: str = "- [ ] Done",
+        description: str = "Test task.",
+    ) -> Path:
+        wu = backlog_dir / f"{unit_id}.md"
+        wu.write_text(
+            f"# {unit_id}\n\n"
+            f"## Status: in-queue\n\n"
+            f"## Target Repository\n\n"
+            f"- **Repo:** `{repo}`\n\n"
+            f"## Description\n\n{description}\n\n"
+            f"## Dependencies\n\n"
+            f"| ID | Title | Status |\n"
+            f"|----|-------|--------|\n"
+            f"| none | | |\n\n"
+            f"## Acceptance Criteria\n\n{ac_block}\n\n"
+            f"## Changes Manifest\n\n"
+            f"| File | Change |\n"
+            f"|------|--------|\n"
+            f"{manifest_rows}\n"
+            f"## Definition of Done\n\n{dod_block}\n",
+            encoding="utf-8",
+        )
+        return wu
+
+    def _validate(self, tmp_path: Path, runtime_config: RuntimeConfig) -> list[str]:
+        with patch("devbench.config.RUNTIME_CONFIG", runtime_config):
+            return BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+
+    def _orphan_errors(self, errors: list[str], unit_id: str) -> list[str]:
+        return [e for e in errors if e.startswith(f"{unit_id}: orphan path ")]
+
+    # ---------------------------------------------------------------------
+    # Must-fire cases
+    # ---------------------------------------------------------------------
+
+    def test_orphan_path_in_ac_fires(self, tmp_path: Path, backlog_dir: Path) -> None:
+        repo = "ex/foo"
+        self._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `src/real.py` | new |\n| `tests/unit/test_real.py` | new |\n",
+            "- [ ] AC-FUNC-001: `src/imaginary.py` is created.",
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = self._validate(tmp_path, self._runtime_with_rule_on(repo, None))
+        orphans = self._orphan_errors(errors, "EX-F1-S1-T1")
+        assert len(orphans) == 1
+        assert "src/imaginary.py" in orphans[0]
+        assert "Acceptance Criteria" in orphans[0]
+
+    def test_orphan_path_in_dod_fires(self, tmp_path: Path, backlog_dir: Path) -> None:
+        repo = "ex/foo"
+        self._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `src/real.py` | new |\n| `tests/unit/test_real.py` | new |\n",
+            "- [ ] AC-FUNC-001: behavioural check.",
+            dod_block="- [ ] Entry committed to `docs/release-notes.md`.",
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = self._validate(tmp_path, self._runtime_with_rule_on(repo, None))
+        orphans = self._orphan_errors(errors, "EX-F1-S1-T1")
+        assert len(orphans) == 1
+        assert "docs/release-notes.md" in orphans[0]
+        assert "Definition of Done" in orphans[0]
+
+    def test_task_id_placeholder_does_not_match_resolved_manifest(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """The original caylent-telemetry-teardown bug: AC says <TASK-ID>, manifest has resolved ID."""
+        repo = "ex/foo"
+        self._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `destroy-log/EX-F1-S1-T1.md` | new |\n",
+            "- [ ] AC-DOC-001: `destroy-log/<TASK-ID>.md` is created.",
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = self._validate(tmp_path, self._runtime_with_rule_on(repo, None))
+        orphans = self._orphan_errors(errors, "EX-F1-S1-T1")
+        assert len(orphans) == 1
+        assert "destroy-log/<TASK-ID>.md" in orphans[0]
+
+    def test_case_mismatch_fires(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """Linux paths are case-sensitive; ``Foo.py`` is not the same as ``foo.py``."""
+        repo = "ex/foo"
+        self._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n",
+            "- [ ] AC-FUNC-001: `src/Foo.py` is created.",
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = self._validate(tmp_path, self._runtime_with_rule_on(repo, None))
+        assert any("src/Foo.py" in e for e in self._orphan_errors(errors, "EX-F1-S1-T1"))
+
+    # ---------------------------------------------------------------------
+    # Must-NOT-fire cases
+    # ---------------------------------------------------------------------
+
+    def test_path_matching_manifest_passes(self, tmp_path: Path, backlog_dir: Path) -> None:
+        repo = "ex/foo"
+        self._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n",
+            "- [ ] AC-FUNC-001: `src/foo.py` is created.",
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = self._validate(tmp_path, self._runtime_with_rule_on(repo, None))
+        assert self._orphan_errors(errors, "EX-F1-S1-T1") == []
+
+    def test_checkout_directory_prefix_normalises(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """AC writes ``<checkout_dir>/path`` while manifest holds ``path`` (post-rule-11 strip)."""
+        repo = "ex/foo"
+        self._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n",
+            "- [ ] AC-FUNC-001: `my-repo/src/foo.py` is created.",
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = self._validate(tmp_path, self._runtime_with_rule_on(repo, "my-repo"))
+        assert self._orphan_errors(errors, "EX-F1-S1-T1") == []
+
+    def test_canonical_pytest_command_passes(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """AC-FINAL-005 / 006 / 007 use multi-token backtick blocks; rule must not fire."""
+        repo = "ex/foo"
+        ac = (
+            "- [ ] AC-FUNC-001: feature is delivered.\n"
+            "- [ ] AC-FINAL-005: `pytest tests/unit -v` exits zero.\n"
+            "- [ ] AC-FINAL-006: `pytest tests/integration -v` exits zero.\n"
+            "- [ ] AC-FINAL-007: `pytest tests/functional -v` exits zero.\n"
+        )
+        self._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n",
+            ac,
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = self._validate(tmp_path, self._runtime_with_rule_on(repo, None))
+        assert self._orphan_errors(errors, "EX-F1-S1-T1") == []
+
+    def test_url_token_passes(self, tmp_path: Path, backlog_dir: Path) -> None:
+        repo = "ex/foo"
+        self._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n",
+            "- [ ] AC-FUNC-001: response payload references `https://api.example.com/v1/foo`.",
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = self._validate(tmp_path, self._runtime_with_rule_on(repo, None))
+        assert self._orphan_errors(errors, "EX-F1-S1-T1") == []
+
+    def test_shell_flag_token_passes(self, tmp_path: Path, backlog_dir: Path) -> None:
+        repo = "ex/foo"
+        self._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n",
+            "- [ ] AC-FUNC-001: command runs with `--cov=src`.",
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = self._validate(tmp_path, self._runtime_with_rule_on(repo, None))
+        assert self._orphan_errors(errors, "EX-F1-S1-T1") == []
+
+    def test_glob_token_passes(self, tmp_path: Path, backlog_dir: Path) -> None:
+        repo = "ex/foo"
+        self._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n",
+            "- [ ] AC-FUNC-001: every `*.py` file in the manifest is created.",
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = self._validate(tmp_path, self._runtime_with_rule_on(repo, None))
+        assert self._orphan_errors(errors, "EX-F1-S1-T1") == []
+
+    def test_trailing_slash_normalised(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """AC writes ``foo/`` while manifest holds ``foo`` -- normalised, the strings match."""
+        repo = "ex/foo"
+        # Use a path-shaped token without an extension so the manifest-prefix
+        # match path drives the assertion (extension would short-circuit).
+        self._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n",
+            "- [ ] AC-FUNC-001: contents at `src/foo.py/` are correct.",
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = self._validate(tmp_path, self._runtime_with_rule_on(repo, None))
+        assert self._orphan_errors(errors, "EX-F1-S1-T1") == []
+
+    def test_path_in_description_section_does_not_fire(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """Description / Approach prose is out of scope; only AC + DoD are checked."""
+        repo = "ex/foo"
+        self._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n",
+            "- [ ] AC-FUNC-001: behavioural.",
+            description=(
+                "### Approach\n\nThe task reads `src/legacy/auth.py` (a path that does not appear in the manifest)."
+            ),
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = self._validate(tmp_path, self._runtime_with_rule_on(repo, None))
+        assert self._orphan_errors(errors, "EX-F1-S1-T1") == []
+
+    def test_inline_ref_marker_passes(self, tmp_path: Path, backlog_dir: Path) -> None:
+        repo = "ex/foo"
+        self._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n",
+            "- [ ] AC-FUNC-001: behaviour matches the format described in `src/legacy/auth.py` (ref).",
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = self._validate(tmp_path, self._runtime_with_rule_on(repo, None))
+        assert self._orphan_errors(errors, "EX-F1-S1-T1") == []
+
+    def test_story_unit_short_circuits(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """Stories have no Manifest; the rule must not fire on Story IDs."""
+        repo = "ex/foo"
+        story = backlog_dir / "EX-F1-S1.md"
+        story.write_text(
+            "# EX-F1-S1\n\n"
+            "## Status: in-queue\n\n"
+            "## Description\n\nA story spec mentions `src/anywhere.py` in prose.\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n",
+            encoding="utf-8",
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1 | S1 | Story | in-queue | none | {repo} | `backlog/EX-F1-S1.md` |\n",
+        )
+        errors = self._validate(tmp_path, self._runtime_with_rule_on(repo, None))
+        assert self._orphan_errors(errors, "EX-F1-S1") == []
+
+    def test_flag_off_does_nothing(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """With the rule disabled, even a clear orphan path is silent."""
+        repo = "ex/foo"
+        self._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n",
+            "- [ ] AC-FUNC-001: `src/imaginary.py` is created.",
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        rt_off = RuntimeConfig(
+            repos={repo: RepoConfig(checkout_directory=None)},
+            validate=ValidateConfig(check_orphan_path_tokens=False),
+        )
+        errors = self._validate(tmp_path, rt_off)
+        assert self._orphan_errors(errors, "EX-F1-S1-T1") == []
 
 
 class TestAutoRequeueOnDeclineTransition:

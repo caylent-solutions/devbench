@@ -228,6 +228,21 @@ task_factory:
   auto_accept_proposals: false
 
 # ---------------------------------------------------------------------------
+# Opt-in validate-backlog rules. Existing rules (1-19) run unconditionally;
+# rules listed here are gated to keep pre-existing backlogs green during
+# rollout. Flip a toggle to true after auditing your backlog's AC / DoD
+# prose for compatibility with the rule.
+# ---------------------------------------------------------------------------
+validate:
+  # Rule 20 (issue / spec-coherence): cross-check every Task's Acceptance
+  # Criteria and Definition of Done sections against the Changes Manifest.
+  # Backtick-quoted path-shaped tokens that are not present in the Manifest
+  # (after path normalisation) emit a validate-backlog error. Use the
+  # inline "(ref)" suffix to declare a token a read-only reference and
+  # exempt it from the check. See docs/backlog-contract.md.
+  check_orphan_path_tokens: false
+
+# ---------------------------------------------------------------------------
 # Diagnostic-tuning knobs (set only when investigating a specific cadence
 # problem; production workspaces leave this section absent).
 # ---------------------------------------------------------------------------

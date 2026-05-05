@@ -101,6 +101,9 @@ Validation of `backlog/config/devbench.yaml` happens at config load time (before
 
 - `checkout_directory` must be **relative** to `JUDGE_WORKSPACE_ROOT`. Absolute paths and `..` traversal are rejected -- the loader raises `ValueError` immediately.
 - `git_ops.defer_pr: true` requires `git_ops.single_branch` to be set. Misconfigured combinations raise `ValueError`.
+- `git_ops.local_only: true` requires `git_ops.defer_pr: true` (a local-only repo has no remote to push to, so PR creation is meaningless).
+- `git_ops.local_only: true` is incompatible with `git_ops.pause_before_merge: true` (there is no PR to pause before merging).
+- `git_ops.local_only: true` requires every entry in `repos:` to set an explicit `default_branch:` (no `origin/HEAD` fallback exists when the repo has no remote).
 - The full YAML is JSON-Schema validated (`additionalProperties: false`), so typos in keys produce a clear schema error rather than being silently ignored.
 
 For the full annotated YAML and value-resolution precedence (env var → YAML → constant default), see the [Configuration model](architecture.md#8-configuration-model) section of the architecture doc.
@@ -174,14 +177,42 @@ Every backlog must pass `devbench validate-backlog`. The full rule set is enforc
 17. Dependency-ID format (every `## Dependencies` row's first cell matches `E[A-Z0-9]+(-F\d+)?(-S\d+)?(-T\d+)?`)
 18. Branch uniqueness (no two Tasks derive the same branch name; skipped under single-PR mode)
 19. No placeholder Manifest rows (no active Task -- `in-queue` / `in-progress` / `blocked` -- carries a `TBD` row in its Changes Manifest; terminal statuses are skipped)
+20. No orphan path tokens in AC / DoD (gated by `validate.check_orphan_path_tokens` -- default off; opt in per workspace)
 
-Rules 15-17 were added by E209 to harden the contract; rule 18 was added by E219 to prevent silent branch collisions; rule 19 was added by issue #117 to stop the `changes_manifest` reviewer from passing work units whose authors never replaced the canonical placeholder row. Together they catch hand-edited drift that the runtime parser would later silently survive.
+Rules 15-17 were added by E209 to harden the contract; rule 18 was added by E219 to prevent silent branch collisions; rule 19 was added by issue #117 to stop the `changes_manifest` reviewer from passing work units whose authors never replaced the canonical placeholder row. Rule 20 was added after a teardown backlog burned an executor cycle on a spec where AC / DoD prose restated a path that disagreed with the Changes Manifest; it gates on a per-workspace toggle so existing backlogs see no behaviour change until they opt in. Together they catch hand-edited drift that the runtime parser would later silently survive.
 
 #### No Placeholder Rows Rule (issue #117)
 
 The canonical Changes Manifest placeholder reads `TBD | Executor agent: replace this row with the actual files to be created or modified.`. Authors are expected to overwrite the row with one entry per file the Task will touch. The rule fires when an active Task (`in-queue` / `in-progress` / `blocked`) still carries a row whose first cell starts with `TBD` (case-insensitive). The error message names the Task ID and the offending cell text.
 
 `devbench claim <id>` enforces the same rule at claim time as a fail-fast guard: if the Manifest still has a `TBD` row, the claim refuses and either the manifest-amender (when `manifest_amendment.enabled: true`) or the operator must replace the placeholder before the executor can run.
+
+#### No Orphan Path Tokens Rule (rule 20, opt-in)
+
+Acceptance Criteria and Definition of Done items describe **behaviour**, not artifacts. The Changes Manifest is devbench's single source of truth for the file set a Task produces; restating those paths in AC / DoD prose is duplication that drifts. When the prose disagrees with the Manifest, two reviewers can both honestly read the same diff and reach opposite verdicts.
+
+To prevent this class of drift, AC and DoD lines should reference the Manifest symbolically rather than naming paths. Examples:
+
+- "All entries in the Changes Manifest are created with the required content."
+- "Manifest files committed on the work-unit branch."
+- "Per-task evidence file from the Changes Manifest is created with task ID, timestamp, AWS response, and operator."
+
+When a path **must** appear in AC or DoD prose -- typically because the Task reads an external configuration file or contract that is not part of the diff -- mark it as a read-only reference by suffixing the inline backtick token with `(ref)`:
+
+```markdown
+- [ ] AC-FUNC-001: behaviour matches the schema in `src/legacy/auth-contract.yaml` (ref).
+```
+
+The validator strips `(ref)`-marked tokens from the orphan-path scan. A token without `(ref)` that matches no Manifest entry (after path normalisation) is reported as an integrity error.
+
+The rule is gated by `validate.check_orphan_path_tokens` in `backlog/config/devbench.yaml`. Set the toggle to `true` to opt in:
+
+```yaml
+validate:
+  check_orphan_path_tokens: true
+```
+
+Path normalisation strips the configured `checkout_directory` prefix, leading `./`, and trailing `/` before comparing AC / DoD tokens to Manifest entries (the same shape rule 11 enforces on Manifest paths). Path-shape detection requires either a recognised file extension OR a directory prefix that is either built-in (`src/`, `tests/`, `infra/`, `docs/`, `backlog/`, `config/`) or observed in the same Task's Manifest. URLs (`http://...`, `s3://...`), shell flags (`--cov=src`), key=value forms, and glob patterns (`*.py`) are exempt by construction.
 
 #### Branch Uniqueness Rule (E219)
 

@@ -275,6 +275,8 @@ uv run devbench check
 
 Pre-flight verifier for orchestrator launch readiness. For every repo in `backlog/config/devbench.yaml`'s `repos:` map, confirms (1) symlink at `$JUDGE_WORKSPACE_ROOT/<checkout_directory>` exists, (2) the local clone has an `origin` remote, (3) the remote's `default_branch` matches `devbench.yaml` (when set), and (4) no open PR already targets `git_ops.single_branch` (when single-branch mode is on). Exits 0 when every repo passes; exits 1 with one actionable error per failure otherwise. The `gh api` / `gh pr list` calls use the timeout in `DEVBENCH_CHECK_GH_API_TIMEOUT` (seconds, default `30`).
 
+Under `git_ops.local_only: true`, the origin check inverts: the local clone MUST NOT have an `origin` remote (presence is a misconfiguration). Checks (3) and (4) are skipped because there is no remote to query through `gh`.
+
 ### `read-unit`
 
 ```
@@ -470,13 +472,15 @@ uv run devbench ensure-branch <id>
 
 Create or switch to the work-unit branch before the executor runs. Branch name resolves from the work-unit file's `- **Branch:** ...` field; defaults to `backlog/<id-lower>`. In single-branch mode, switches to the configured `single_branch` instead. Handles dirty trees via stash-pop.
 
+Under `git_ops.local_only: true`, branch creation skips `git fetch origin` entirely and creates the new branch off the **local** default ref (`refs/heads/<default_branch>`). The YAML-configured `default_branch` is mandatory in this mode; there is no `origin/HEAD` fallback.
+
 ### `git-ops`
 
 ```
 uv run devbench git-ops <id>
 ```
 
-Commit, push, create PR, wait for CI, merge. The full git-ops sequence runs after every review judge passes and before `mark-done`. In single-branch + `defer_pr: true` mode, commits locally only (no push, no PR); the shared branch is pushed by `git-ops-finalize` after every unit is done.
+Commit, push, create PR, wait for CI, merge. The full git-ops sequence runs after every review judge passes and before `mark-done`. In single-branch + `defer_pr: true` mode, commits locally only (no push, no PR); the shared branch is pushed by `git-ops-finalize` after every unit is done. Under `git_ops.local_only: true` (which requires `defer_pr: true`), git-ops also commits locally only -- and `git-ops-finalize` is **never** run, since there is no remote to push to.
 
 Enforces three deterministic safety rails:
 - **Manifest-scope:** staged files must exactly match the work unit's Changes Manifest (AC-FINAL-015).
@@ -541,6 +545,8 @@ uv run devbench git-ops-finalize <repo>
 ```
 
 Single-branch mode only: push the shared branch and create one PR for every accumulated commit. Use once, after every work unit targeting this repo is done. See [README Single-branch mode](../README.md#single-branch-mode) and [architecture.md §6](architecture.md#6-multi-pr-vs-single-pr-mode).
+
+Not applicable under `git_ops.local_only: true` -- the target repo has no remote to push to. The local single branch is the deliverable; running `git-ops-finalize` against a local-only workspace is an error.
 
 ### `check-merge`
 

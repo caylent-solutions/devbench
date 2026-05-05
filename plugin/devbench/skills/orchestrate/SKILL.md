@@ -37,7 +37,9 @@ Process the backlog using the steps below, repeating until all work units are do
 
 3. `uv run devbench ensure-branch <id>` -- create or switch to the work unit's
    feature branch before the executor stages any files. Stashes and pops if the
-   working tree is dirty.
+   working tree is dirty. Under `git_ops.local_only: true` the new branch is
+   created off the local default ref (`refs/heads/<default_branch>`) with no
+   `git fetch origin` -- the target repo has no remote in this mode.
 
 3b. Git state check -- determine if implementation and review work are already complete:
     a. Run `uv run devbench read-unit <id>` to get `repo_path` and the work unit `content`.
@@ -92,7 +94,7 @@ Process the backlog using the steps below, repeating until all work units are do
    - If security PASS: proceed immediately to step 8. Do NOT re-run review-supervisor. Do NOT re-invoke executor based on the security_review verdict body's informational content.
    - If security FAIL: log a blocker comment and return to step 2.
 
-8. `uv run devbench git-ops <id>` -- In standard mode: commit, push, create PR, wait for CI, merge. In single-branch mode (when `git_ops.defer_pr: true` in devbench.yaml): commit locally only (no push, no PR, no merge). The branch is shared across all work units.
+8. `uv run devbench git-ops <id>` -- In standard mode: commit, push, create PR, wait for CI, merge. In single-branch mode (when `git_ops.defer_pr: true` in devbench.yaml): commit locally only (no push, no PR, no merge). The branch is shared across all work units. In local-only mode (`git_ops.local_only: true`, which requires `defer_pr: true`): identical to single-branch + defer-PR (commit locally only) but the target repo has no remote -- there is no CI, no PR, and step 11 (`git-ops-finalize`) is skipped permanently.
 
    **Exit code contract**:
    - `0`: PR merged (or commit landed locally in deferred mode). Continue to step 9.
@@ -106,7 +108,7 @@ Process the backlog using the steps below, repeating until all work units are do
 
 10. Return to step 1.
 
-11. When all work units are done and `defer_pr` mode is active, run `uv run devbench git-ops-finalize <repo>` to push the single branch and create the PR.
+11. When all work units are done and `defer_pr` mode is active, run `uv run devbench git-ops-finalize <repo>` to push the single branch and create the PR. **Skip this step entirely under `git_ops.local_only: true`** -- the target repo has no remote, so there is nothing to push and no PR to create. The local single branch is itself the deliverable.
 
 ## Standards
 

@@ -12,6 +12,19 @@ since the last release. PR #119 carries every change.
 
 ### Added
 
+- **`git_ops.local_only` mode**. New config flag for target repos that
+  have no `origin` git remote -- typical for operational workflows
+  (AWS teardowns, evidence capture, audits) where devbench drives the
+  work but no application code is being authored. When `local_only:
+  true`, `ensure-branch` skips `git fetch origin` and creates the
+  work-unit branch off the local default ref; `git-ops` commits
+  locally only; remote-touching helpers (`commit_and_push`,
+  `create_tag`, `checkout_default_branch`, `rebase_and_force_push`)
+  are guarded with a clear `RuntimeError`; the `devbench check`
+  pre-flight inverts its origin assertion (a present remote is now
+  the error). Requires `defer_pr: true` and an explicit
+  `default_branch:` per repo. See `docs/operational-work.md` and
+  `docs/git-ops-modes.md`.
 - **HOLD lifecycle status** (E222, issue #104). New `WorkUnitStatus.HOLD`
   + `devbench hold <id>` / `devbench unhold <id>` CLI for tasks
   deliberately deferred without breaking dep-chain math.

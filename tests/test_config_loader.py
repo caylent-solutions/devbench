@@ -1711,6 +1711,91 @@ class TestVNextCanonicalConfig:
         with pytest.raises(ValueError, match=r"incompatible with .*single_branch"):
             load_runtime_config(cfg, {})
 
+    def test_local_only_defaults_to_false(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            git_ops:
+              update_submodule: false
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.git_ops.local_only is False
+
+    def test_local_only_parses_true_with_required_companions(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            git_ops:
+              single_branch: my-branch
+              defer_pr: true
+              local_only: true
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.git_ops.local_only is True
+        assert rt.git_ops.defer_pr is True
+        assert rt.git_ops.single_branch == "my-branch"
+
+    def test_local_only_requires_defer_pr(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            git_ops:
+              single_branch: my-branch
+              local_only: true
+            """,
+        )
+        with pytest.raises(ValueError, match=r"local_only: true requires .*defer_pr: true"):
+            load_runtime_config(cfg, {})
+
+    def test_local_only_incompatible_with_pause_before_merge(self, tmp_path: Path) -> None:
+        # pause_before_merge: true is itself mutually exclusive with defer_pr: true,
+        # so the only way to combine local_only + pause_before_merge is without defer_pr
+        # -- which trips the local_only-requires-defer_pr check first. The schema
+        # validator reaches the pause_before_merge incompatibility branch only when
+        # defer_pr is also present, which the existing pause-vs-defer rule already
+        # rejects. We assert the intent: local_only + pause_before_merge can never
+        # coexist successfully, regardless of which validator fires first.
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            git_ops:
+              single_branch: my-branch
+              defer_pr: true
+              pause_before_merge: true
+              local_only: true
+            """,
+        )
+        with pytest.raises(ValueError):
+            load_runtime_config(cfg, {})
+
+    def test_local_only_requires_default_branch_on_every_repo(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            git_ops:
+              single_branch: my-branch
+              defer_pr: true
+              local_only: true
+            """,
+        )
+        with pytest.raises(ValueError, match=r"requires every entry in repos: to set an explicit default_branch"):
+            load_runtime_config(cfg, {})
+
     def test_orphan_patterns_parse_from_yaml(self, tmp_path: Path) -> None:
         cfg = self._write(
             tmp_path / "cfg.yaml",

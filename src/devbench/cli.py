@@ -1376,8 +1376,23 @@ def _check_repo_symlink(repo_name: str, symlink_path: Path) -> tuple[bool, str |
     )
 
 
-def _check_repo_origin(repo_name: str, target: Path, timeout: int) -> tuple[bool, str | None]:
-    """Return ``(origin_ok, error_or_None)`` after 'git remote get-url origin'."""
+def _check_repo_origin(repo_name: str, target: Path, timeout: int, local_only: bool = False) -> tuple[bool, str | None]:
+    """Return ``(origin_ok, error_or_None)`` after 'git remote get-url origin'.
+
+    Default mode (``local_only=False``): the repo MUST have an ``origin``
+    remote configured; absence is an error. Behavior unchanged from the
+    pre-local-only world.
+
+    Local-only mode (``local_only=True``): the repo MUST NOT have an
+    ``origin`` remote; presence is an error. Catches misconfiguration
+    where the operator declared ``git_ops.local_only: true`` but the
+    target checkout still tracks a remote.
+
+    The boolean component of the tuple uses "ok" semantics in both modes:
+    ``True`` means the check passed and the caller may proceed; ``False``
+    means the check failed and the error string in the second slot
+    describes the fix.
+    """
     try:
         result = subprocess.run(
             ["git", "-C", str(target), "remote", "get-url", "origin"],
@@ -1388,7 +1403,16 @@ def _check_repo_origin(repo_name: str, target: Path, timeout: int) -> tuple[bool
         )
     except subprocess.TimeoutExpired:
         return False, f"{repo_name}: 'git remote get-url origin' timed out after {timeout}s"
-    if result.returncode != 0:
+    has_origin = result.returncode == 0
+    if local_only:
+        if has_origin:
+            return False, (
+                f"{repo_name}: git_ops.local_only is true but clone at {target} has an "
+                f"'origin' remote configured ({result.stdout.strip()}). Either unset the "
+                "remote (git remote remove origin) or set git_ops.local_only: false."
+            )
+        return True, None
+    if not has_origin:
         return False, (
             f"{repo_name}: clone at {target} has no 'origin' remote configured (stderr: {result.stderr.strip()})"
         )
@@ -1458,13 +1482,23 @@ def _check_repo_open_prs(repo_name: str, single_branch: str, timeout: int) -> st
     )
 
 
-def _check_repo_preflight(repo_name: str, repo_cfg: RepoConfig, single_branch: str | None, timeout: int) -> list[str]:
+def _check_repo_preflight(
+    repo_name: str,
+    repo_cfg: RepoConfig,
+    single_branch: str | None,
+    timeout: int,
+    local_only: bool = False,
+) -> list[str]:
     """Run all pre-flight checks for a single repo and return its error list.
 
     Extracted from :func:`cmd_check` to keep the dispatcher under the
     project's branch-count budget. Each helper above owns one rail of
     the gate and returns its own error string (or ``None``) so the
     aggregation here is a flat list-extend.
+
+    When ``local_only`` is true, the origin check is inverted (a present
+    remote is the error) and the GitHub-API default-branch + open-PR
+    checks are skipped because no remote exists to talk to GitHub through.
     """
     checkout_subdir = repo_cfg.checkout_directory or repo_name.split("/", 1)[-1]
     symlink_path = WORKSPACE_ROOT / checkout_subdir
@@ -1472,9 +1506,11 @@ def _check_repo_preflight(repo_name: str, repo_cfg: RepoConfig, single_branch: s
     if not symlink_ok:
         return [symlink_err] if symlink_err is not None else []
     target = symlink_path.resolve()
-    origin_ok, origin_err = _check_repo_origin(repo_name, target, timeout)
+    origin_ok, origin_err = _check_repo_origin(repo_name, target, timeout, local_only=local_only)
     if not origin_ok:
         return [origin_err] if origin_err is not None else []
+    if local_only:
+        return []
     errors: list[str] = []
     branch_err = _check_repo_default_branch(repo_name, repo_cfg.default_branch, timeout)
     if branch_err:
@@ -1492,11 +1528,19 @@ def cmd_check() -> int:
     For every repo in ``backlog/config/devbench.yaml``'s ``repos:`` map, verify:
 
     1. Symlink exists at ``$JUDGE_WORKSPACE_ROOT/<checkout_directory>``.
-    2. The symlink target (the local clone) has an ``origin`` remote configured.
+    2. Origin-remote check (mode-dependent):
+
+       - Default mode: the symlink target (the local clone) MUST have an
+         ``origin`` remote configured.
+       - ``git_ops.local_only: true``: the symlink target MUST NOT have an
+         ``origin`` remote configured (presence is misconfiguration).
+
     3. The remote's ``default_branch`` matches ``devbench.yaml``'s
        ``default_branch`` (or both fall back to ``origin/HEAD``).
+       Skipped under ``git_ops.local_only: true`` (no remote to query).
     4. No open PR already targets the configured ``single_branch``
-       (when ``git_ops.single_branch`` is set).
+       (when ``git_ops.single_branch`` is set). Skipped under
+       ``git_ops.local_only: true``.
 
     Exits 0 if every check passes; 1 with actionable per-repo error messages
     otherwise. ``DEVBENCH_CHECK_GH_API_TIMEOUT`` (seconds, default 30) bounds
@@ -1517,9 +1561,10 @@ def cmd_check() -> int:
     cfg = load_runtime_config(cfg_path, os.environ)
 
     single_branch = cfg.git_ops.single_branch if cfg.git_ops else None
+    local_only = cfg.git_ops.local_only if cfg.git_ops else False
     errors: list[str] = []
     for repo_name, repo_cfg in cfg.repos.items():
-        errors.extend(_check_repo_preflight(repo_name, repo_cfg, single_branch, timeout))
+        errors.extend(_check_repo_preflight(repo_name, repo_cfg, single_branch, timeout, local_only=local_only))
 
     if not errors:
         print(f"Pre-flight check passed for {len(cfg.repos)} target repo(s).")

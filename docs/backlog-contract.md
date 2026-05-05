@@ -40,27 +40,58 @@ backlog/
 Only task files (`*-T[n].md`) are implemented by agents. Epic, feature, and story files track
 rollup status only.
 
-### Keeping the backlog in a separate git repo
+### Workspace layout (what `JUDGE_WORKSPACE_ROOT` points at)
 
-The backlog should live in its own local git repo, separate from the target repositories DevBench
-modifies. This lets you commit backlog progress (status changes, TDD logs, judge comments) without
-mixing them into target repo history.
+`JUDGE_WORKSPACE_ROOT` is the **parent directory** that contains `backlog/`, `BACKLOG.md`, and the target repos as siblings. The loader (`src/devbench/config.py`) resolves:
 
-Set `JUDGE_WORKSPACE_ROOT` to the backlog repo. Create symlinks inside it pointing to target
-repos, and reference them as relative paths in `devbench.yaml`:
+- `<JUDGE_WORKSPACE_ROOT>/BACKLOG.md` -- the master index (mandatory at this exact path).
+- `<JUDGE_WORKSPACE_ROOT>/backlog/config/devbench.yaml` -- the per-workspace config (mandatory).
+- `<JUDGE_WORKSPACE_ROOT>/backlog/<epic>/<feature>/<story>/*.md` -- work-unit specs.
+- `<JUDGE_WORKSPACE_ROOT>/<repo-name>/` -- each target repo, as a sibling of `backlog/`.
 
-```bash
-ln -s /real/path/to/my-repo /path/to/my-backlog/my-repo
+So `JUDGE_WORKSPACE_ROOT` is **not** the backlog repo itself; it is the *parent* directory you place the backlog inside. Pointing it at the backlog repo (so `BACKLOG.md` ends up at `<backlog-repo>/BACKLOG.md` instead of `<workspace>/BACKLOG.md`) produces a chain of `FileNotFoundError` and orphan-detection failures that all trace back to this misalignment.
+
+The recommended layout (used by every backlog in `caylent-telemetry-spec/`):
+
 ```
+<JUDGE_WORKSPACE_ROOT>/
+├── BACKLOG.md                       ← master index
+├── backlog/
+│   ├── config/devbench.yaml         ← per-workspace config
+│   ├── E1/E1-F1/E1-F1-S1/E1-F1-S1-T1.md
+│   └── ...
+├── my-repo/                         ← target repo (sibling of backlog/)
+└── another-repo/                    ← another target repo
+```
+
+`devbench.yaml` references each repo by its sibling directory name:
 
 ```yaml
 repos:
   org/my-repo:
     default_branch: main
-    checkout_directory: my-repo    # relative -- resolves via symlink
+    checkout_directory: my-repo      # relative to JUDGE_WORKSPACE_ROOT
 ```
 
-Symlinks bridge the gap between the backlog repo and target repos outside it.
+The loader populates `RepoConfig.resolved_checkout_path` (E213) at config-load time so every consumer reads `<workspace>/<checkout_directory>` from the dataclass field instead of re-resolving the path inline.
+
+#### Keeping the backlog in its own git repo
+
+The backlog directory (`backlog/` + `BACKLOG.md`) is typically committed to its own git repo so backlog progress (status changes, TDD logs, judge comments) lands separately from target-repo history. Init the backlog repo at `<JUDGE_WORKSPACE_ROOT>/.git` and add the target-repo sibling directories to `<JUDGE_WORKSPACE_ROOT>/.gitignore` so they don't pollute the backlog history.
+
+#### Symlinks (optional, for repos outside the workspace)
+
+The choice between a real directory and a symlink at `<workspace>/<repo-name>` is purely a filesystem operator decision -- there is no YAML field that toggles symlink-awareness. devbench opens whatever exists at the path `checkout_directory` names; the kernel resolves any symlinks transparently, and every devbench engine path treats the two layouts identically.
+
+When a target repo cannot live as a workspace sibling (a shared workspace under `/workspaces/<workspace>/` with target repos cloned elsewhere on disk), symlink it into place:
+
+```bash
+ln -s /real/path/to/my-repo $JUDGE_WORKSPACE_ROOT/my-repo
+```
+
+The symlink goes at the sibling path (`<workspace>/my-repo`), NOT inside `backlog/` (`<workspace>/backlog/my-repo`). The loader walks the workspace from `<workspace>/<checkout_directory>`; a symlink at that path is transparent. Putting the symlink under `backlog/` makes `_check_orphans` flag it as an orphaned work-unit file.
+
+Symlinked checkouts are first-class supported across every devbench engine path, including the inline orphan-cleanup chore commit, the manifest-scope assertion, the `cleanup-tracked-orphans` CLI, and `git-ops`'s commit / push / merge sequence. Each helper resolves the path symmetrically with its peers (every helper either passes paths through unmodified or canonicalises them via `Path.resolve()` -- never one of each), so a symlinked layout produces the same on-disk outcome as a non-symlinked layout. If you ever see a `ValueError` mentioning `relative_to` or a "path-mismatch" audit comment, that is a devbench bug: file an issue and include the audit-comment text + the symlink mapping.
 
 ---
 
@@ -70,6 +101,9 @@ Validation of `backlog/config/devbench.yaml` happens at config load time (before
 
 - `checkout_directory` must be **relative** to `JUDGE_WORKSPACE_ROOT`. Absolute paths and `..` traversal are rejected -- the loader raises `ValueError` immediately.
 - `git_ops.defer_pr: true` requires `git_ops.single_branch` to be set. Misconfigured combinations raise `ValueError`.
+- `git_ops.local_only: true` requires `git_ops.defer_pr: true` (a local-only repo has no remote to push to, so PR creation is meaningless).
+- `git_ops.local_only: true` is incompatible with `git_ops.pause_before_merge: true` (there is no PR to pause before merging).
+- `git_ops.local_only: true` requires every entry in `repos:` to set an explicit `default_branch:` (no `origin/HEAD` fallback exists when the repo has no remote).
 - The full YAML is JSON-Schema validated (`additionalProperties: false`), so typos in keys produce a clear schema error rather than being silently ignored.
 
 For the full annotated YAML and value-resolution precedence (env var → YAML → constant default), see the [Configuration model](architecture.md#8-configuration-model) section of the architecture doc.
@@ -91,13 +125,106 @@ IDs are case-insensitive in status matching but written in uppercase by conventi
 
 ## Status Values
 
-| Status | Meaning | Written as |
-|--------|---------|-----------|
-| In Queue | Ready to be picked up | `in-queue` |
-| In Progress | Agent is implementing | `in-progress` |
-| In Review | Staged, awaiting judge review | `in-review` |
-| Done | Merged and closed | `done` |
-| Blocked | Max retries exhausted or dependency blocked | `blocked` |
+| Status | Meaning | Written as | Terminal? |
+|--------|---------|-----------|-----------|
+| In Queue | Ready to be picked up | `in-queue` | no |
+| In Progress | Agent is implementing | `in-progress` | no |
+| In Review | Staged, awaiting judge review | `in-review` | no |
+| Done | Merged and closed | `done` | yes |
+| Blocked | Max retries exhausted or dependency blocked | `blocked` | no |
+| Proposed | Auto-emitted draft awaiting human promote / reject | `proposed` | no |
+| Declined | Will never be done; final operator decision | `declined` | yes |
+| Hold | Deferred / under debate; orchestrator skips it until `unhold` | `hold` | no |
+
+A status is *terminal* when a parent's auto-rollup treats it as complete. `done` and `declined` are terminal; `hold` is **not** -- a held child keeps its parent open. This guarantees that pausing a unit cannot accidentally close out its parent.
+
+#### Blocked-task classification (3-state, Part-1)
+
+A `blocked` work unit is in one of three states. The orchestrator advances tasks through these states in a known order so operators see only what truly needs human action:
+
+1. **`AUTO_CLEARING_VIA_PROPOSAL`** -- the task carries a `[BLOCKED_PENDING_PROPOSAL] <target>` marker chain whose targets all exist in the backlog AND at least one is non-terminal. The auto-requeue cascade fires when every target reaches terminal. Operator does nothing.
+2. **`AWAITING_AUTO_RECOVERY`** -- one of: (a) the task has a pending proposal JSON at `<workspace>/.devbench/proposals/<id>.json` (blocker-resolver wrote it; task-factory will materialise + promote on the next sweep); (b) a rejected-amendment archive at `<workspace>/.devbench/rejected-requests/<id>-*.json` (manifest-amender rejected; blocker-resolver runs next); (c) a recent `[BLOCKED]` audit-comment from a recovery agent (orchestrator / blocker_resolver / manifest_amender) within `JUDGE_BLOCKED_RECOVERY_WINDOW_SECONDS` (default 1800s); OR (d, issue #149) the task's regular task-level dependencies are still in flight (non-terminal) regardless of marker state. Operator does nothing -- the orchestrator's next iteration advances the task.
+3. **`NEEDS_OPERATOR_ATTENTION`** -- everything else: manual blockers (`DO NOT CLAIM` text in the description), unknown marker targets (cascade cannot resolve), every marker terminal AND every regular dep terminal (cascade should have fired and didn't), or no marker + no recovery signal at all. Operator must act.
+
+**Cascade-on-every-terminal-transition** (issue #147). The auto-requeue cascade fires from `BacklogManager._set_status` whenever the transition target is terminal (`done` OR `declined`). Previously only `mark_done` invoked the cascade, leaving downstream blocked tasks marooned when a dep was declined or force-set to a terminal status. The trigger is centralised in `_set_status` so every public API (`mark_done`, `mark_declined`, `force_status`, `set-status`) routes through the same code path, and a per-instance `(backlog_index, unit_id)` guard prevents redundant double-fires when the same target is reset to the same terminal status twice.
+
+**Audit-supersession in `status --detail`** (issue #153). The work-unit Comments section is append-only -- every `[BLOCKED]` / `[UNBLOCKED]` / `[CASCADE_RESOLVED]` audit row stays in the file forever. The status-detail panel renderer hides `[BLOCKED]` rows that have been superseded by a later positive transition (`[UNBLOCKED]` from sync-blocked / `[CASCADE_RESOLVED]` from the auto-requeue cascade), so the operator only sees the live blocking cause. The cascade re-queue audit reads `[AUTO_UNBLOCKED] [CASCADE_RESOLVED] ...` so legacy operator tooling that greps for `[AUTO_UNBLOCKED]` continues to work.
+
+`devbench report` renders the three states as separate panels under each `Blocked tasks (...)` heading. `devbench status` summarises with `Blocked (auto)` / `Blocked (recovery)` / `Blocked (attn)` rows, each padded to the same width so an empty bucket stays visible at zero.
+
+The orchestrator's `next` query and parallel-candidate scan filter to `in-queue` and `in-progress` only, so `hold`, `declined`, and `blocked` units are skipped automatically. Operators move units in and out of `hold` with `devbench hold <id> --reason <text>` and `devbench unhold <id> --reason <text>` (both reasons are required and captured in the work-unit's Comments audit trail).
+
+### Validate-backlog rule list (E209)
+
+Every backlog must pass `devbench validate-backlog`. The full rule set is enforced by `BacklogManager.validate()`:
+
+1. Index row → file existence
+2. Index status mirrors work-unit Status
+3. No orphan work-unit files
+4. Every dep ID is a known work-unit ID
+5. Status Summary table counts match the index
+6. Tasks have non-empty `## Description`
+7. Tasks have at least one `AC-` row in `## Acceptance Criteria`
+8. Tasks have at least one row in `## Changes Manifest`
+9. Tasks have a `## Definition of Done` section
+10. No em-dash characters (U+2014) anywhere in work-unit content
+11. Manifest paths do not start with a `checkout_directory` prefix
+12. Manifest path conflicts (no two in-queue Tasks claim the same file)
+13. Language-AC alignment (non-Python tasks must mark Python ACs N/A)
+14. Source-test atomicity (every prod source has a paired test in the same Manifest)
+15. Required sections (`## Status:`, `## Dependencies`, `## Changes Manifest`) on every Task
+16. Status enum (every parsed `## Status:` value is in `VALID_STATUSES`)
+17. Dependency-ID format (every `## Dependencies` row's first cell matches `E[A-Z0-9]+(-F\d+)?(-S\d+)?(-T\d+)?`)
+18. Branch uniqueness (no two Tasks derive the same branch name; skipped under single-PR mode)
+19. No placeholder Manifest rows (no active Task -- `in-queue` / `in-progress` / `blocked` -- carries a `TBD` row in its Changes Manifest; terminal statuses are skipped)
+20. No orphan path tokens in AC / DoD (gated by `validate.check_orphan_path_tokens` -- default off; opt in per workspace)
+
+Rules 15-17 were added by E209 to harden the contract; rule 18 was added by E219 to prevent silent branch collisions; rule 19 was added by issue #117 to stop the `changes_manifest` reviewer from passing work units whose authors never replaced the canonical placeholder row. Rule 20 was added after a teardown backlog burned an executor cycle on a spec where AC / DoD prose restated a path that disagreed with the Changes Manifest; it gates on a per-workspace toggle so existing backlogs see no behaviour change until they opt in. Together they catch hand-edited drift that the runtime parser would later silently survive.
+
+#### No Placeholder Rows Rule (issue #117)
+
+The canonical Changes Manifest placeholder reads `TBD | Executor agent: replace this row with the actual files to be created or modified.`. Authors are expected to overwrite the row with one entry per file the Task will touch. The rule fires when an active Task (`in-queue` / `in-progress` / `blocked`) still carries a row whose first cell starts with `TBD` (case-insensitive). The error message names the Task ID and the offending cell text.
+
+`devbench claim <id>` enforces the same rule at claim time as a fail-fast guard: if the Manifest still has a `TBD` row, the claim refuses and either the manifest-amender (when `manifest_amendment.enabled: true`) or the operator must replace the placeholder before the executor can run.
+
+#### No Orphan Path Tokens Rule (rule 20, opt-in)
+
+Acceptance Criteria and Definition of Done items describe **behaviour**, not artifacts. The Changes Manifest is devbench's single source of truth for the file set a Task produces; restating those paths in AC / DoD prose is duplication that drifts. When the prose disagrees with the Manifest, two reviewers can both honestly read the same diff and reach opposite verdicts.
+
+To prevent this class of drift, AC and DoD lines should reference the Manifest symbolically rather than naming paths. Examples:
+
+- "All entries in the Changes Manifest are created with the required content."
+- "Manifest files committed on the work-unit branch."
+- "Per-task evidence file from the Changes Manifest is created with task ID, timestamp, AWS response, and operator."
+
+When a path **must** appear in AC or DoD prose -- typically because the Task reads an external configuration file or contract that is not part of the diff -- mark it as a read-only reference by suffixing the inline backtick token with `(ref)`:
+
+```markdown
+- [ ] AC-FUNC-001: behaviour matches the schema in `src/legacy/auth-contract.yaml` (ref).
+```
+
+The validator strips `(ref)`-marked tokens from the orphan-path scan. A token without `(ref)` that matches no Manifest entry (after path normalisation) is reported as an integrity error.
+
+The rule is gated by `validate.check_orphan_path_tokens` in `backlog/config/devbench.yaml`. Set the toggle to `true` to opt in:
+
+```yaml
+validate:
+  check_orphan_path_tokens: true
+```
+
+Path normalisation strips the configured `checkout_directory` prefix, leading `./`, and trailing `/` before comparing AC / DoD tokens to Manifest entries (the same shape rule 11 enforces on Manifest paths). Path-shape detection requires either a recognised file extension OR a directory prefix that is either built-in (`src/`, `tests/`, `infra/`, `docs/`, `backlog/`, `config/`) or observed in the same Task's Manifest. URLs (`http://...`, `s3://...`), shell flags (`--cov=src`), key=value forms, and glob patterns (`*.py`) are exempt by construction.
+
+#### Branch Uniqueness Rule (E219)
+
+Each Task pushes to a branch derived either from an explicit `- **Branch:** \`<name>\`` line in its work-unit file or from the canonical `backlog/<unit-id-lowercase>` template. Two Tasks resolving to the same branch would collide on push, breaking auto-merge and producing false review failures. `validate-backlog` reports the collision with both Task IDs so authors can rename one.
+
+The rule is skipped entirely when `git_ops.single_branch` is set in `devbench.yaml` -- under single-PR mode every task legitimately shares the configured branch.
+
+### Dependency satisfaction (E215)
+
+A Task's dependency is satisfied when the dep is in a terminal state (`done` or `declined`). Dependencies on non-task units (Epics, Features, Stories) are evaluated by walking every descendant TASK whose ID begins with `<dep_id>-`: every descendant must be terminal for the dep to count as satisfied. An Epic / Feature / Story with no Task descendants is vacuously satisfied. Unknown dep IDs (typos, drift) are also vacuously satisfied so the orchestrator's actionability scan does not deadlock; `validate-backlog` reports unknown deps as integrity errors so the typo cannot hide.
+
+`devbench sync-blocked` is the operator-facing tool for reconciling status against this rule -- run it after manual edits or to triage a drifted backlog. The orchestrator's `next` query enforces the same rule automatically.
 
 Status is stored in the **work unit file** (the `## Status:` line). `BACKLOG.md` is a derived index that mirrors the work-unit files; the work-unit file is the source of truth. `validate-backlog` reports mirror drift between the two as an error so it can be reconciled -- it does not auto-correct.
 
@@ -360,5 +487,69 @@ not
 ```
 `validate-backlog` surfaces this at authoring / startup time so it never reaches git-ops.
 
+**Issue #159 -- proposal-write enforcement.** Rule 11 has historically been enforced at the validator (this section) and at the `guard-work-unit-write.sh` PreToolUse hook. The third tier -- `cmd_write_proposal` -- now strips matching `<checkout_directory>/` prefixes from every `proposed_tasks[*].files_to_own` entry before persisting the JSON. The strip runs after the issue #146 backlog-repo filter so target-repo classification still fires on the prefixed form. Paths that match multiple configured `checkout_directories` are rejected with a structured error rather than silently picking one interpretation. blocker-resolver and any other agent that calls `devbench write-proposal` no longer needs to hand-strip prefixes; the strip is the safety net that makes rule 11 enforcement cover all three write tiers.
+
 Run before starting the orchestrator. The orchestrate skill runs it automatically at startup and
 aborts if any error is found.
+
+---
+
+## Manifest Conflict Rule (post-Backlog-A addendum)
+
+No two in-queue Tasks MAY list the same file path in their `## Changes Manifest` tables. Each file path in the workspace MUST have a single owning Task. If two Tasks legitimately need to modify the same file at different points in time, express the order via `## Dependencies` so they execute sequentially against the same path; the LATER Task's Manifest declares the file even if the EARLIER Task created it (the later Task's edit IS the change git records when its branch is staged).
+
+### Why
+
+When two in-queue Tasks both claim the same file, the orchestrator's `next` command can claim them in either order. The first Task creates / modifies the file; the second Task tries to do the same and either (a) collides with the first Task's commit, or (b) writes a conflicting version that triggers a code-review failure. In production at `caylent-telemetry-spec/`, two file-ownership conflicts were observed:
+
+- `.github/actions/monorepo-check/action.yaml` -- claimed by both `E0-F2-S1-T1` (skeleton) and `E5-F1-S1-T2` (full implementation).
+- `.github/workflows/on-pr.yaml` -- claimed by both `E0-F2-S1-T2` (stub) and `E5-F2-S1-T1` (full).
+
+The fix in both cases was to add a `## Dependencies` entry: the full-implementation Task waits on the skeleton Task. The full-implementation Task's Manifest still lists the file (because the full-impl IS its change to git), but the structural ordering prevents collision.
+
+### Validation
+
+`devbench validate-backlog` SHOULD reject any backlog state where two in-queue Tasks list the same file path with no explicit dependency between them. (This rule is part of the post-Backlog-A Tier 3 tooling proposal; until it lands, authors are responsible for self-checking via grep across `## Changes Manifest` blocks.)
+
+For N claimants of the same path, the validator accepts **any DAG that totally orders the set via transitive reachability** (issue #145). A clean N-1 edge chain (`A <- B <- C <- D <- E`) is sufficient -- the validator no longer requires the full `N*(N-1)/2` direct pairwise edges. When the rule fires, the error message prints a suggested chain in lexical-sort order as an operator hint; operators may pick any other ordering that resolves their natural execution order.
+
+The companion rule for cross-cutting infrastructure (e.g., `pyproject.toml` is owned by one Task that authors all build/lint/test config edits in one coordinated commit) is documented in [`source-test-atomicity.md`](source-test-atomicity.md).
+
+---
+
+## Orphan-Pattern Rule (git-ops self-defense)
+
+`git-ops` refuses any commit whose staged or already-tracked paths match a build/state ignore pattern (terraform state, `.terragrunt-cache/`, terraform provider binaries, Python `__pycache__/` and `*.pyc`, `.coverage*`, `node_modules/`, `.DS_Store`). The active pattern list is the union of [`git_orphans._DEFAULT_ORPHAN_PATTERNS`](../src/devbench/git_orphans.py) and any `DEVBENCH_ORPHAN_IGNORE_PATTERNS` env-var override (comma-separated fnmatch globs replacing the default).
+
+### Why
+
+Build / state artefacts have no place in version control. Terraform state files in particular contain real AWS account IDs, role ARNs, and resource attributes that trip security review on every subsequent diff. Provider binaries (~600 MB each) bloat the repo and slow every clone. Python pycache and coverage data leak host-specific paths and Python-version-specific bytecode, breaking dev/prod parity.
+
+In production at `caylent-telemetry/`, two work-unit commits (`E1-F1-S1-T5`, `E1-F1-S1-T6`) accidentally staged 13 such files (totalling ~656 MB after the `terraform-provider-aws` binary). Every later Task's security-review then failed against HEAD, forming a cascade that could not self-resolve.
+
+### Behaviour (default: inline cleanup commit -- Phase 1 of the orphan-cascade fix)
+
+When the rule fires, `git-ops` runs the cleanup **inline** as a devbench-authored chore commit:
+
+1. Captures the executor's pre-cleanup staged paths via `git diff --cached --name-only`.
+2. Resets the index to HEAD (`git reset HEAD --`) so the cleanup commit is purely cleanup-only.
+3. Runs `cleanup_tracked_orphans(repo_path)` -- `git rm --cached` for each tracked orphan plus `.gitignore` extension under the canonical `# devbench-managed: tracked-orphan cleanup defaults` header.
+4. Stages `.gitignore` and commits with the canonical message `chore(cleanup): untrack devbench-managed orphan paths and update .gitignore`.
+5. Re-stages the executor's filtered paths (orphans excluded) so the downstream `assert_staged_matches_manifest` runs against the executor's intent without orphan pollution.
+6. Continues with the original task's commit. Two commits land on the task's branch.
+
+The cleanup is forward-only (`git rm --cached` + `.gitignore`), preserving every file on disk and NOT rewriting git history. Critically, the cleanup is **not a backlog work unit**: there is no executor invocation, no judge review, no manifest amendment, no proposal materialisation. This collapses the cascade pathology where multiple parents each emitted duplicate cleanup proposals and those proposals themselves got blocked by the manifest amender on predecessor staging.
+
+### Legacy proposal mode (opt-out via `DEVBENCH_DISABLE_INLINE_ORPHAN_CLEANUP=1`)
+
+For backlogs that require a backlog work unit per cleanup (audit / compliance reporting), operators set `DEVBENCH_DISABLE_INLINE_ORPHAN_CLEANUP=1`. In that mode, `git-ops` falls back to the legacy proposal flow:
+
+1. Refuses the commit with a non-zero exit and a stderr message naming a sample of the offending paths.
+2. Cross-task de-duplication: scans `<workspace>/.devbench/proposals/*.json` for any pending proposal whose `proposed_tasks[].files_to_own` contains `.gitignore`. If found, wires the current source task as a `BLOCKED_PENDING_PROPOSAL` dependent of the **existing** cleanup task instead of allocating a duplicate.
+3. Otherwise, allocates a new cleanup-task ID, materialises the proposal, auto-wires the parent + any peer claimants of `.gitignore` via `add-dep`.
+
+Operators may also run `cleanup-tracked-orphans` directly to drain a polluted state in one shot before launching the orchestrator. See [cli-reference.md](cli-reference.md#cleanup-tracked-orphans) for the operator-facing surface.
+
+### Override
+
+For backlogs that legitimately need to track one of the default-blocked shapes (e.g., a fixture repo that ships a sample `.tfstate`), set `DEVBENCH_ORPHAN_IGNORE_PATTERNS` to the narrowed list before invoking the orchestrator. The override REPLACES the default list entirely; include every pattern you still want to enforce.

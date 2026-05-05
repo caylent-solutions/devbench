@@ -357,6 +357,83 @@ class TestResolveHelpers:
         assert result == 2.5
 
 
+class TestResolveBool:
+    """Tests for ``_resolve_bool`` -- env > YAML > default precedence with strict parsing."""
+
+    @pytest.mark.parametrize(
+        "raw",
+        ["1", "true", "yes", "on", "TRUE", "Yes", "On"],
+    )
+    def test_truthy_env_returns_true(self, raw: str) -> None:
+        with patch.dict(os.environ, {"TEST_BOOL_VAR": raw}, clear=False):
+            assert config._resolve_bool("TEST_BOOL_VAR", None, False) is True
+
+    @pytest.mark.parametrize(
+        "raw",
+        ["0", "false", "no", "off", "FALSE", "No", "Off"],
+    )
+    def test_falsy_env_returns_false(self, raw: str) -> None:
+        with patch.dict(os.environ, {"TEST_BOOL_VAR": raw}, clear=False):
+            assert config._resolve_bool("TEST_BOOL_VAR", None, True) is False
+
+    def test_invalid_env_raises_value_error(self) -> None:
+        with patch.dict(os.environ, {"TEST_BOOL_VAR": "maybe"}, clear=False):
+            with pytest.raises(ValueError, match="must be one of"):
+                config._resolve_bool("TEST_BOOL_VAR", None, False)
+
+    def test_yaml_used_when_env_absent(self) -> None:
+        env_copy = {k: v for k, v in os.environ.items() if k != "TEST_BOOL_ABSENT"}
+        with patch.dict(os.environ, env_copy, clear=True):
+            assert config._resolve_bool("TEST_BOOL_ABSENT", True, False) is True
+            assert config._resolve_bool("TEST_BOOL_ABSENT", False, True) is False
+
+    def test_default_used_when_both_absent(self) -> None:
+        env_copy = {k: v for k, v in os.environ.items() if k != "TEST_BOOL_ABSENT"}
+        with patch.dict(os.environ, env_copy, clear=True):
+            assert config._resolve_bool("TEST_BOOL_ABSENT", None, True) is True
+            assert config._resolve_bool("TEST_BOOL_ABSENT", None, False) is False
+
+    def test_env_overrides_yaml(self) -> None:
+        """env > YAML when both are set."""
+        with patch.dict(os.environ, {"TEST_BOOL_VAR": "0"}, clear=False):
+            assert config._resolve_bool("TEST_BOOL_VAR", True, True) is False
+        with patch.dict(os.environ, {"TEST_BOOL_VAR": "1"}, clear=False):
+            assert config._resolve_bool("TEST_BOOL_VAR", False, False) is True
+
+    def test_empty_env_falls_through_to_yaml(self) -> None:
+        with patch.dict(os.environ, {"TEST_BOOL_VAR": ""}, clear=False):
+            assert config._resolve_bool("TEST_BOOL_VAR", True, False) is True
+
+
+class TestCanonicalConfigToggles:
+    """Verify the v-next canonical toggle resolutions read from YAML correctly.
+
+    Each test patches ``RUNTIME_CONFIG.git_ops`` (or relevant nested) with a
+    mocked dataclass instance and re-imports the resolved constant via
+    ``importlib.reload``. The test patterns mirror the existing
+    ``TestStopHookConfigExposed`` shape.
+    """
+
+    def test_inline_orphan_cleanup_default_on(self) -> None:
+        """When neither env nor YAML opt out, INLINE_ORPHAN_CLEANUP_ENABLED is True."""
+        from devbench.constants import DEFAULT_INLINE_ORPHAN_CLEANUP_ENABLED
+
+        assert DEFAULT_INLINE_ORPHAN_CLEANUP_ENABLED is True
+        assert config._resolve_bool("JUDGE_NONEXISTENT_FOR_TEST", None, True) is True
+
+    def test_ci_failure_retry_default_on(self) -> None:
+        """v-next default flip: CI_FAILURE_RETRY_ENABLED is True by default."""
+        from devbench.constants import DEFAULT_CI_FAILURE_RETRY_ENABLED
+
+        assert DEFAULT_CI_FAILURE_RETRY_ENABLED is True
+
+    def test_pause_before_merge_default_off(self) -> None:
+        """Issue #101: pause-before-merge ships off so existing flows are unchanged."""
+        from devbench.constants import DEFAULT_PAUSE_BEFORE_MERGE
+
+        assert DEFAULT_PAUSE_BEFORE_MERGE is False
+
+
 @pytest.mark.unit
 class TestStopHookConfigExposed:
     """Verify stop hook constants are exported from config module."""

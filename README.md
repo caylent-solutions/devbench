@@ -2,13 +2,46 @@
 
 An LLM-as-Judge orchestration system that processes a backlog of work units autonomously. Development agents write code; judge agents review it. All review decisions come from Claude LLM evaluation; there are no hard-coded pass/fail rules.
 
+> **Upgrading from a previous version?** See [docs/upgrade-guide.md](docs/upgrade-guide.md) for the migration walkthrough. The TL;DR is `pip install -U devbench && devbench upgrade` (idempotent; safe to re-run).
+
 ## 60-second overview
 
-DevBench takes a structured backlog of work units (epics, features, stories, tasks) and drives them through a TDD implement / parallel-judge-review / security-review / git-merge pipeline without human intervention between tasks.
+DevBench drives a structured backlog from claim to merged PR without human intervention between tasks.
+
+**Input** -- a four-level work-unit hierarchy on disk:
+
+| Level | Work unit |
+|-------|-----------|
+| 1 | Epic |
+| 2 | Feature |
+| 3 | Story |
+| 4 | Task (the only level the orchestrator claims directly) |
+
+**Pipeline** -- each task moves through four sequential stages:
+
+| Stage | What runs |
+|-------|-----------|
+| 1 | TDD implement (RED -> GREEN -> REFACTOR) by the executor agent. |
+| 2 | Parallel judge review -- four review judges run concurrently. |
+| 3 | Security review -- one judge runs sequentially after stage 2 passes. |
+| 4 | Git ops -- commit, push, create PR, wait for CI, merge. |
 
 - **Autonomous SDLC pipeline.** One operator writes the spec; the orchestrator drives every task from claim to merged PR.
-- **Real LLM review at every gate.** Four review judges (code, test, docs, scope) run in parallel; a security judge runs after they pass. Every verdict is logged as an audit comment on the work unit.
+- **Real LLM review at every gate.** Every verdict is logged as an audit comment on the work unit.
 - **Auditable by default.** Every agent action writes a timestamped comment on the work unit file. The orchestrator can resume from any point after a restart because state lives on disk, not in memory.
+
+The judge / agent layer:
+
+| # | Role | Agent | Runs when |
+|---|------|-------|-----------|
+| 1 | Review | `code-reviewer` | SOLID / DRY / fail-fast / 12-factor |
+| 2 | Review | `test-reviewer` | TDD discipline + repo task-runner output |
+| 3 | Review | `doc-reviewer` | Accuracy + sync with code |
+| 4 | Review | `changes-manifest` | Actual diff vs declared Manifest |
+| 5 | Security | `security-reviewer` | CodeQL / Dependabot / secret-scanning |
+| 6 | Amender | `manifest-amender` | Judges `tdd_green_production_fix` amendments |
+| 7 | Recovery | `blocker-resolver` | Decomposes amendment rejects into proposals |
+| 8 | Recovery | `task-factory` | Materialises draft work units from proposals |
 
 ### Try it now (5 commands)
 
@@ -42,6 +75,7 @@ Pick the doc closest to your role.
 - [Configuration](#configuration)
 - [Workspace setup](#workspace-setup)
 - [Interactive mode](#interactive-mode)
+- [Remote EC2 dev environments](#remote-ec2-dev-environments)
 - [Troubleshooting](#troubleshooting)
 
 ## How it works
@@ -53,21 +87,33 @@ Orchestrator (devbench:orchestrate SKILL / interactive Claude session)
   |
   |-- Step 0: sweep-proposals         -- materialise any pending proposal JSONs
   |-- Pre-flight: validate-backlog    -- abort if index / files are out of sync
-  |-- Parse BACKLOG.md, find next actionable work unit
+  |-- Parse BACKLOG.md, find next actionable work unit (topological-depth order, issue #121)
   |-- Implement work unit via TDD (RED -> GREEN -> REFACTOR)  [executor agent]
+  |     |-- Optional: manifest-amender judges a `tdd_green_production_fix`
+  |     |   amendment when the executor needs to expand the Manifest mid-cycle
   |-- Run repo's task runners (make test, make validate)
   |-- Stage files, submit to judge review  [review-supervisor agent]
   |     |-- code-reviewer       -- SOLID, DRY, fail-fast, security, 12-factor
   |     |-- test-reviewer       -- TDD discipline, test quality, real assertions
   |     |-- doc-reviewer        -- accuracy, completeness, sync with code
   |     |-- changes-manifest    -- actual changes vs declared manifest
-  |     |-- security-reviewer   -- CodeQL, Dependabot, secret-scanning alerts
-  |-- If judges fail: read feedback, fix, resubmit (max retries configurable)
+  |-- If review judges fail: read feedback, fix, resubmit
+  |     |-- Per-judge or global retry budget (issue #122)
   |     |-- Prior feedback is injected into the next review to prevent contradictions
-  |-- Git ops: commit, push, create PR, wait for CI, merge
+  |-- security-reviewer  -- CodeQL, Dependabot, secret-scanning alerts (sequential gate after the 4 review judges pass)
+  |-- Git ops: commit, push, create PR, wait for CI, merge (or pause-before-merge per #101)
+  |     |-- CI failure: rc=2 -> executor retry with the failing-job log (issue #115)
+  |     |-- PR-bot review feedback: rc=3 -> executor retry with structured comment payload (issue #116)
+  |     |-- Build/state orphan in working tree: chore commit before the task commit (inline orphan cleanup)
   |-- Update BACKLOG.md status to Done (parents auto-roll up when children complete)
-  |     |-- Done-gate: mark-done verifies all 4 review judges logged REVIEW_PASS
+  |     |-- Done-gate: mark-done verifies all 4 review judges logged REVIEW_PASS in the most recent round
   |-- Repeat until every actionable unit is done
+
+Recovery cascade (fires when an amendment / executor retry exhausts):
+  manifest-amender REJECT
+    -> blocker-resolver writes a proposal JSON
+    -> task-factory materialises 0..N draft work units
+    -> validate-backlog wires deps so the source task unblocks when drafts complete
 ```
 
 Five judges must pass before a work unit merges. The four review judges are tracked via `[REVIEW_PASS]` comments; the done-gate verifies all four passed in the most recent round. Security runs as a separate sequential gate after the four pass and before the git commit. A security failure writes `[SECURITY_FAIL]` followed by `[REVIEW_REJECTED]`; the `[REVIEW_REJECTED]` resets the done-gate window so the four review judges re-run after the security fix lands.
@@ -99,7 +145,7 @@ When sending file contents to the LLM, large inputs are truncated to fit context
 
 ### Monitoring
 
-- `tail -f src/devbench/logs/orchestrator.log` for the main log.
+- `tail -f $JUDGE_WORKSPACE_ROOT/logs/<session>-orchestrator.log` for the main log (path is declared in `backlog/config/devbench.yaml` under `log_file:`; the legacy `src/devbench/logs/orchestrator.log` path is no longer used).
 - Every work unit `.md` has a `## Comments` section with timestamped entries from every judge and orchestrator action.
 - `uv run devbench watch` prints a one-screen live dashboard (read-only). See [docs/watch-activity.md](docs/watch-activity.md).
 - `uv run devbench hook-tail` pretty-tails the plugin hook event stream in real time (read-only). See [docs/hook-activity.md](docs/hook-activity.md).
@@ -131,8 +177,7 @@ uv run devbench <command> [args]
 make install              # Install runtime and dev dependencies
 make plugin-install       # Register the devbench plugin at user scope
 make start-interactive    # Auth GitHub, launch interactive Claude session
-make start                # Auth GitHub, launch orchestrator in background
-make run-backlog          # Run orchestrator in foreground (assumes GH_TOKEN set)
+make start                # Auth GitHub, launch the orchestrator
 make validate             # Full validation: lint + type check + tests + coverage
 make lint                 # ruff + bandit
 make format               # Auto-format with ruff
@@ -157,9 +202,19 @@ For the full annotated YAML, value-resolution precedence, and every config key, 
 ### Common tuning
 
 - **Single-branch mode** (one shared branch for the whole backlog, one PR at the end instead of one per work unit): set `git_ops.single_branch` and `git_ops.defer_pr` in `devbench.yaml`. See [architecture.md §6](docs/architecture.md#6-multi-pr-vs-single-pr-mode).
+- **Local-only mode** (drive operational work -- AWS teardowns, evidence capture, audits -- against a sibling checkout that has no GitHub remote, never pushes, never produces a PR): set `git_ops.local_only: true` (alongside `git_ops.single_branch` + `git_ops.defer_pr: true`) in `devbench.yaml`. See [docs/operational-work.md](docs/operational-work.md) for the end-to-end pattern and [docs/git-ops-modes.md](docs/git-ops-modes.md) for the mode comparison.
 - **Stop-hook circuit breaker** (prevents the orchestrator from stalling after context compaction; auto-allows stop after a configurable burst): tune `stop_hook.max_blocks`, `stop_hook.window_seconds`, `stop_hook.stale_task_minutes` in `devbench.yaml`, or override via `JUDGE_STOP_MAX_BLOCKS`, `JUDGE_STOP_WINDOW_SECONDS`, `JUDGE_STOP_STALE_MINUTES`. See [architecture.md §9 Hooks layer](docs/architecture.md#9-hooks-layer).
+- **Pause-before-merge** (orchestrator pushes the PR + waits for green CI then transitions the task to `in-review` instead of merging; reconciles via `devbench check-merge` on the next loop iteration): set `git_ops.pause_before_merge: true` in `devbench.yaml`, or override via `JUDGE_PAUSE_BEFORE_MERGE`. Cannot be combined with `defer_pr` or `single_branch`. See [docs/git-ops-modes.md](docs/git-ops-modes.md) and [ADR-13](docs/adr/13-pause-before-merge.md).
+- **CI-failure executor retry** (default-on; rc=2 from `git-ops` triggers an executor retry with the failing-job log as feedback under `.devbench/ci-failures/<id>-<n>.log`): toggle via `git_ops.ci_failure_retry` in `devbench.yaml` or `JUDGE_CI_FAILURE_RETRY_ENABLED`.
+- **PR-bot review polling** (between CI-pass and merge, polls for unresolved Copilot / Q-Dev / internal-bot comments and re-invokes the executor with structured feedback): opt in via `git_ops.pr_review_resolution.enabled: true` plus the `agents:` allowlist.
+- **Per-judge executor retry budgets** (different judges can flake at different rates; tune retries per failing judge instead of raising the global cap): set `max_executor_retries_per_judge:` map in `devbench.yaml`. Each entry falls back to `max_executor_retries` when absent.
+- **Manifest amendments** (executors can request a `tdd_green_production_fix` to expand their Changes Manifest mid-cycle when TDD GREEN reveals required production fixes; the manifest-amender judges scope, approach-coherence, and standards): toggle via `manifest_amendment.enabled`. See [docs/manifest-amendments.md](docs/manifest-amendments.md) and [ADR-02](docs/adr/02-manifest-amendment-workflow.md).
+- **Task-factory loop** (after manifest-amendment rejects, blocker-resolver decomposes the rejection and task-factory materialises draft work units the source task can depend on): toggle via `task_factory.enabled` and `task_factory.auto_accept_proposals`. See [docs/task-factory.md](docs/task-factory.md) and [ADR-03](docs/adr/03-task-factory.md).
+- **HOLD lifecycle** (`devbench hold <id>` / `devbench unhold <id>`): tasks deliberately deferred without breaking dep-chain math.
 - **Display timezone** in `devbench report` and `devbench hook-tail`: set `report.display_timezone` (IANA zone name) in `devbench.yaml`, or override per invocation via `JUDGE_REPORT_TIMEZONE`. See [model-pricing.md](docs/model-pricing.md#other-settings-under-report).
 - **Per-model token pricing** (needed when you run anything other than Opus 4.7): drop the matching `report.token_cost_per_million_*` block from [model-pricing.md](docs/model-pricing.md) into `devbench.yaml`.
+- **Cost premium multipliers**: `report.data_residency_multiplier` (default 1.10) and `report.fast_mode_multiplier` (default 6.0) are applied per-call to the residency-flagged / fast-mode token subsets. Composes with cache + base-rate multipliers, applies before the `report.token_cost_discount` (issue #124).
+- **Hook-tail column caps**: tune `hook_tail.agent_width`, `hook_tail.tool_width`, `hook_tail.description_max` (default 120), `hook_tail.stdout_preview_max` in `devbench.yaml`, or override via `JUDGE_HOOK_TAIL_*` env vars (issue #134).
 
 ## Workspace setup
 
@@ -178,10 +233,13 @@ The backlog (`BACKLOG.md`, `backlog/`, specs) should live in a dedicated local g
   target-repo/             <-- the repo devbench modifies (separate git repo)
 ```
 
-Set `JUDGE_WORKSPACE_ROOT` to the backlog repo. Create symlinks inside it pointing to your target repos, and reference them as relative paths in `backlog/config/devbench.yaml`:
+Set `JUDGE_WORKSPACE_ROOT` to the backlog repo. The repo named in `checkout_directory` must be reachable at `<JUDGE_WORKSPACE_ROOT>/<checkout_directory>`. Two layouts are supported:
+
+**Default (sibling directory)** -- clone the target repo *inside* the backlog repo, alongside `backlog/`:
 
 ```bash
-ln -s /workspaces/my-project/target-repo /workspaces/my-project/my-backlog/target-repo
+cd /workspaces/my-project/my-backlog
+git clone https://github.com/org/target-repo.git
 ```
 
 ```yaml
@@ -189,12 +247,27 @@ ln -s /workspaces/my-project/target-repo /workspaces/my-project/my-backlog/targe
 repos:
   org/target-repo:
     default_branch: main
+    checkout_directory: target-repo    # real directory under the backlog repo
+```
+
+Add `target-repo/` to `<JUDGE_WORKSPACE_ROOT>/.gitignore` so the target-repo working tree doesn't pollute backlog history.
+
+**Alternative (symlink, for shared / pre-cloned repos)** -- clone the target repo elsewhere and symlink it into the backlog repo. Useful when one target repo serves multiple backlogs or already lives outside the workspace:
+
+```bash
+ln -s /workspaces/my-project/target-repo /workspaces/my-project/my-backlog/target-repo
+```
+
+```yaml
+repos:
+  org/target-repo:
+    default_branch: main
     checkout_directory: target-repo    # relative; resolves via the symlink
 ```
 
-`checkout_directory` must be a relative path (absolute paths and `..` traversal are rejected). Symlinks bridge the backlog repo and the target repos cleanly.
+The choice is purely an operator filesystem decision -- there is no YAML field that toggles symlink-awareness. `checkout_directory` always names a path under the backlog repo; whether that path is a real directory or a symlink is transparent to devbench. `checkout_directory` must be a relative path (absolute paths and `..` traversal are rejected). See [`docs/backlog-contract.md` § "Workspace layout"](docs/backlog-contract.md#workspace-layout-what-judge_workspace_root-points-at) for the full contract.
 
-For multiple target repos, create one symlink per repo:
+For multiple target repos, repeat either pattern per repo:
 
 ```bash
 ln -s /workspaces/my-project/repo-a /workspaces/my-project/my-backlog/repo-a
@@ -262,6 +335,10 @@ make start-interactive
 
 Both start modes authenticate with GitHub (or skip when `GH_TOKEN` is set), grant required scopes (repo, workflow, read:org, admin:repo_hook, security_events), and launch the orchestrator.
 
+## Remote EC2 dev environments
+
+For unattended runs, multi-operator workflows, or multiple parallel orchestrate sessions per operator, run the orchestrator on a remote EC2 dev box instead of in your local devcontainer. The provisioning stack (Terraform + Terragrunt + Ansible + a per-user multi-session launcher) is documented end-to-end in [`docs/remote-ec2-setup.md`](docs/remote-ec2-setup.md). It covers prerequisites, shared-infra provisioning, per-user instance stamping, Ansible bootstrap, the `devbench-session` launcher, environment configuration (including the E230 `JUDGE_ORCHESTRATOR_SESSION_ID` filter), and refresh / teardown workflows.
+
 ## Troubleshooting
 
 ### Backlog is out of sync with work unit files
@@ -278,7 +355,7 @@ The done-gate found that not all four review judges (`code_review`, `test_review
 
 ### Judge contradicts its previous feedback
 
-This should not happen with the prior-feedback injection. If it does, check the orchestrator log for previous feedback entries (`grep "judge feedback for <unit-id>" src/devbench/logs/orchestrator.log`).
+This should not happen with the prior-feedback injection. If it does, check the orchestrator log for previous feedback entries (`grep "judge feedback for <unit-id>" $JUDGE_WORKSPACE_ROOT/logs/<session>-orchestrator.log`).
 
 ### GitHub token expired
 

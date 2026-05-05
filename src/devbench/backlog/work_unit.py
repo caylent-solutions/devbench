@@ -11,7 +11,41 @@ from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 
-from devbench.constants import COMMENT_ENTRY_TEMPLATE, COMMENTS_SECTION_HEADER, STATUS_LINE_RE
+from devbench.constants import COMMENT_ENTRY_TEMPLATE, COMMENTS_SECTION_HEADER, EM_DASH, STATUS_LINE_RE
+
+
+def validate_manifest_paths(paths: list[str], checkout_directories: list[str]) -> None:
+    """Validate Changes Manifest file paths against backlog hygiene rules.
+
+    Raises ``ValueError`` with an actionable message if any path:
+    - Starts with ``<checkout_dir>/`` (validate-backlog rule 11: paths must be
+      repo-relative, not prefixed with the checkout directory).
+    - Contains an em-dash U+2014 (validate-backlog rule 10).
+
+    Args:
+        paths: List of file paths from the Changes Manifest ``files_to_own`` field.
+        checkout_directories: List of checkout directory names from the devbench
+            config (e.g. ``["kanon", "devbench"]``).
+
+    Raises:
+        ValueError: If any path violates rule 10 or rule 11, with an actionable
+            message naming the first offending path.
+    """
+    for path in paths:
+        if EM_DASH in path:
+            raise ValueError(
+                f"Changes Manifest path contains em-dash (U+2014) -- "
+                f"validate-backlog rule 10 will reject this file. "
+                f"Offending path: '{path}'. Use '--' (double hyphen) instead."
+            )
+        for checkout_dir in checkout_directories:
+            prefix = f"{checkout_dir}/"
+            if path.startswith(prefix):
+                raise ValueError(
+                    f"Changes Manifest path is prefixed with checkout_directory '{checkout_dir}/' -- "
+                    f"validate-backlog rule 11 requires repo-relative paths. "
+                    f"Offending path: '{path}'. Remove the '{prefix}' prefix."
+                )
 
 
 class WorkUnitStatus(Enum):
@@ -24,6 +58,7 @@ class WorkUnitStatus(Enum):
     BLOCKED = "Blocked"
     PROPOSED = "Proposed"
     DECLINED = "Declined"
+    HOLD = "Hold"
 
 
 class WorkUnitType(Enum):

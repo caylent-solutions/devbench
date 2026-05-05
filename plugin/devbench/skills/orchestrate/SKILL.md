@@ -9,11 +9,25 @@ Process the backlog using the steps below, repeating until all work units are do
 
 **CRITICAL (back-to-back tool calls): After every Agent tool result, your very next tool use MUST be either another Agent call (step 4 / 5 / 6 / 7) or a `uv run devbench ...` Bash call (steps 0 / 1 / 2 / 8 / 9). Ending your turn before emitting that next tool call is a loop-exit bug -- the orchestrate loop depends on back-to-back tool calls within a single turn, and the stop-hook's `decision: block` recovery is not 100% reliable. Do NOT summarise or narrate between tool calls; emit the next tool call immediately.**
 
+**CRITICAL (no recap at end of turn -- issue #140): Every turn MUST end with EITHER (a) a tool call (the next concrete action), OR (b) a `uv run devbench next` invocation that returns ALL_DONE / NO_ACTIONABLE / a JSON dispatch. The recap-prose pattern -- ending the turn with sentences like "Next: re-invoke executor" or "Next: log T4 verdicts and re-invoke executor" or any other natural-language description of the planned next step -- is FORBIDDEN. Claude Code interprets a turn-end-without-tool-call as "agent done" and fires the Stop event; the Stop hook's block decision arrives after the turn has already wound down and the orchestrator effectively terminates. If you find yourself about to emit a recap describing the next action, STOP, delete the recap, and emit the actual tool call instead. This rule is regression-tested in `tests/test_integration/test_orchestrate_skill_no_recap_anti_pattern.py`.**
+
 ## Loop
 
-0. `uv run devbench sweep-proposals` -- best-effort materialise every proposal JSON that still has un-materialised tasks. No-ops when nothing is pending; soft-fails (logs and continues) when a proposal is still blocked by the "skip when prior unresolved" safety guard. Runs at every loop iteration so stale JSONs never accumulate invisibly. Expected output pattern: `sweep-proposals: materialised <source-id>: N task(s)` / `sweep-proposals: skipped <source-id>: <reason>` / `sweep-proposals: no-op <source-id>`.
+0. `uv run devbench sweep-proposals` -- best-effort materialise every proposal JSON that still has un-materialised tasks. No-ops when nothing is pending; soft-fails (logs and continues) when a proposal is still blocked by the "skip when prior unresolved" safety guard. Runs at every loop iteration so stale JSONs never accumulate invisibly. Expected output pattern: `sweep-proposals: materialised <source-id>: N task(s)` / `sweep-proposals: skipped <source-id>: <reason>` / `sweep-proposals: no-op <source-id>` / `sweep-proposals: orphan auto-promoted N pre-existing proposed draft(s)`.
+
+   When `task_factory.auto_accept_proposals: true` (issue #155): the sweep also runs a second pass over the full backlog index and auto-promotes every pre-existing `proposed` draft whose proposal JSON has been deleted. Closes the gap where drafts authored under the toggle but materialised before it was flipped on were marooned in `proposed` state forever.
+
+0b. `uv run devbench reconcile-cascade` (issue #150) -- operator-driven recovery for blocked tasks the auto-requeue cascade missed (process crash mid-write, missing declared dep, etc.). Walks every blocked task, evaluates marker target states + regular dep states, and flips eligible ones (markers all terminal AND deps satisfied) to `in-queue` with a `[CASCADE_RECONCILED]` audit comment. Returns a JSON envelope listing flips + skips. Optional in the loop -- run when `devbench next` returns `NO_ACTIONABLE` and the operator suspects orphaned blocks.
 
 1. `uv run devbench validate-backlog` -- abort if the backlog has integrity errors.
+
+1b. **Reconcile in-review tasks (issue #101 pause-before-merge).** When `git_ops.pause_before_merge: true` is set in `backlog/config/devbench.yaml`, work units transition to `in-review` (instead of `done`) once their PR is created and CI passes; the orchestrator's loop reconciles those tasks here at the top of each iteration. Skip this entire step when `pause_before_merge` is unset or `false` (the YAML's absence of the flag is the same as `false`).
+   a. Enumerate every `in-review` work unit. The simplest enumeration is `uv run devbench status --detail` and parse the `In Review (N)` panel; if that panel is empty, skip to step 2.
+   b. For each `in-review` task ID, run `uv run devbench check-merge <id>`. The command queries `gh pr list --head <branch> --json number,state,merged,url` and:
+      - On `merged: true`: promotes the task to `done` via the existing done-gate; logs `[PR_MERGED]` audit comment.
+      - On `state == CLOSED, merged: false`: blocks the task with `[BLOCKED]` audit comment naming the PR.
+      - On `state == OPEN`: no-op; the task stays `in-review` and the loop moves on.
+   c. After processing every in-review task, proceed to step 2. `devbench next` skips `in-review` tasks (they are not actionable for the executor) so the orchestrator naturally picks up the next claimable work unit.
 
 2. `uv run devbench next` -- get the next actionable unit ID.
    - If output is `ALL_DONE`: print a completion summary and exit.
@@ -23,7 +37,9 @@ Process the backlog using the steps below, repeating until all work units are do
 
 3. `uv run devbench ensure-branch <id>` -- create or switch to the work unit's
    feature branch before the executor stages any files. Stashes and pops if the
-   working tree is dirty.
+   working tree is dirty. Under `git_ops.local_only: true` the new branch is
+   created off the local default ref (`refs/heads/<default_branch>`) with no
+   `git fetch origin` -- the target repo has no remote in this mode.
 
 3b. Git state check -- determine if implementation and review work are already complete:
     a. Run `uv run devbench read-unit <id>` to get `repo_path` and the work unit `content`.
@@ -70,19 +86,29 @@ Process the backlog using the steps below, repeating until all work units are do
    a. **Immediately** invoke the `devbench:executor` Agent with the unit ID. Do NOT summarise, do NOT explain, do NOT log a comment first -- the Agent tool call is the very next tool use after the REVIEW_FAIL result. Natural turn-end before this Agent call is the loop-exit bug described in the top-level CRITICAL directive.
    b. When executor returns, Return to step 5 -- immediately re-invoke `review-supervisor`. Do NOT invoke security-reviewer here.
    c. After `max_executor_retries` consecutive failures, the next tool calls (in this order, same turn) are mandatory and explicit: (1) `uv run devbench log-comment agent/orchestrator <id> "[BLOCKED] ..."` naming the failing checks, (2) `uv run devbench next`. The `devbench next` call is the only authorised loop-continuation signal -- treat its output exactly like step 2 (ALL_DONE / NO_ACTIONABLE / JSON).
+   d. **Per-judge retry budgets (issue #122)**: when `max_executor_retries_per_judge` is set in `backlog/config/devbench.yaml`, the budget for the cycle is the value for the failing judge if listed (e.g., `max_executor_retries_per_judge.test_review`); otherwise fall back to the global `max_executor_retries`. Different judges can fail in different cycles -- count failures **per judge** in the per-task counter and trip the BLOCKED transition the moment ANY single judge's per-judge budget is exhausted. Read both fields once at the start of the work-unit cycle: `uv run devbench config-resolve max_executor_retries max_executor_retries_per_judge` returns the resolved values. Schema validation rejects unknown judge names; an unknown name is a config bug not a runtime concern.
 
 7. On review team REVIEW_PASS:
+   - **CRITICAL (issue #128)**: REVIEW_PASS is a terminal signal. After ALL judges return REVIEW_PASS, branch SOLELY on pass-vs-fail -- do NOT inspect verdict bodies, summary text, findings, or comments looking for improvement opportunities. Informational content in PASS verdicts (MEDIUM severity notes, refactor suggestions, "consider also..." remarks) MUST NOT trigger additional executor work cycles. The executor is invoked only when a judge returns REVIEW_FAIL (step 6). Surfacing informational PASS-verdict content in the PR description or a comment is fine; re-running the executor against PASS-verdict content is a violation of this rule and will be regression-tested in `tests/test_integration/test_executor_review_pass_terminality.py`.
    - Invoke `devbench:security-reviewer` with the unit ID.
-   - If security PASS: proceed immediately to step 8. Do NOT re-run review-supervisor.
+   - If security PASS: proceed immediately to step 8. Do NOT re-run review-supervisor. Do NOT re-invoke executor based on the security_review verdict body's informational content.
    - If security FAIL: log a blocker comment and return to step 2.
 
-8. `uv run devbench git-ops <id>` -- In standard mode: commit, push, create PR, wait for CI, merge. In single-branch mode (when `git_ops.defer_pr: true` in devbench.yaml): commit locally only (no push, no PR, no merge). The branch is shared across all work units.
+8. `uv run devbench git-ops <id>` -- In standard mode: commit, push, create PR, wait for CI, merge. In single-branch mode (when `git_ops.defer_pr: true` in devbench.yaml): commit locally only (no push, no PR, no merge). The branch is shared across all work units. In local-only mode (`git_ops.local_only: true`, which requires `defer_pr: true`): identical to single-branch + defer-PR (commit locally only) but the target repo has no remote -- there is no CI, no PR, and step 11 (`git-ops-finalize`) is skipped permanently.
+
+   **Exit code contract**:
+   - `0`: PR merged (or commit landed locally in deferred mode). Continue to step 9.
+   - `1`: hard failure that requires operator attention. Block the task, log a `[BLOCKED]` audit comment with the exact failure surface, return to step 2.
+   - `2` (issue #115, **default on** as of v-next; disable via `git_ops.ci_failure_retry: false` in `devbench.yaml` or `JUDGE_CI_FAILURE_RETRY_ENABLED=0`): CI failed but the executor retry budget is not exhausted. The work-unit gained a `[CI_FAIL]` audit comment naming the trimmed log path under `.devbench/ci-failures/<id>-<n>.log`. Re-invoke `devbench:executor` with a `ci-fail` feedback payload pointing at that log, then return to step 8 (git-ops will push the executor's fix and re-wait for CI). The retry budget is shared with the existing review-judge retry budget (`MAX_RETRY_ATTEMPTS`); when exhausted, git-ops returns `1` instead of `2`.
+   - `3` (issue #116, opt-in via `git_ops.pr_review_resolution.enabled: true` in `devbench.yaml` or `JUDGE_PR_REVIEW_RESOLUTION_ENABLED=1`): the PR has unresolved review feedback (`reviewDecision == CHANGES_REQUESTED`, or unresolved comments authored by an agent in the configured allowlist). The work-unit gained a `[PR_BOT_FAIL]` audit comment naming the JSON feedback file under `.devbench/pr-bot-feedback/<id>-<n>.json`. Re-invoke `devbench:executor` with a `pr-bot` feedback payload pointing at that file, then return to step 8. Same shared retry budget; exhaustion -> `1`.
 
 9. `uv run devbench mark-done <id>` -- mark the unit done (enforces done-gate).
 
+   Then `uv run devbench write-snapshot` to persist a fresh `devbench report` snapshot to `<workspace>/.devbench/report-snapshot.json`. Issue #162 Phase 6 (ADR-20). Subsequent `devbench report --once` invocations serve from the snapshot in single-digit milliseconds when the orchestrator log is unchanged; the snapshot is self-healing (deletion is always safe; the next iteration writes a fresh one) and idempotent (no work-unit mutations).
+
 10. Return to step 1.
 
-11. When all work units are done and `defer_pr` mode is active, run `uv run devbench git-ops-finalize <repo>` to push the single branch and create the PR.
+11. When all work units are done and `defer_pr` mode is active, run `uv run devbench git-ops-finalize <repo>` to push the single branch and create the PR. **Skip this step entirely under `git_ops.local_only: true`** -- the target repo has no remote, so there is nothing to push and no PR to create. The local single branch is itself the deliverable.
 
 ## Standards
 

@@ -293,3 +293,136 @@ See [ADR-09](adr/09-idempotent-materialise-proposal.md) for the rationale and re
 - Orchestrator: `plugin/devbench/skills/orchestrate/SKILL.md` (step 4c).
 - Tests: `tests/test_backlog/test_proposal.py`, `tests/test_integration/test_task_factory_lifecycle.py`.
 - ADR: [ADR-03: Task factory](adr/03-task-factory.md).
+
+---
+
+## When to use `--no-dep-on-source` (post-Backlog-A lesson)
+
+`devbench promote-proposal <new-id>` defaults to wiring the source Task as a dependent on the new Task (i.e., `source.depends_on(new)`). This default fits the BLOCKER-resolver flow: when a Task hits a runtime block, the proposed new Task is the unconditional fix that must run first; the source then retries.
+
+The default is WRONG when the proposed new Task is a TEST that validates the source Task's output. In that pattern, the source must run first (to produce the artifact), then the test verifies it. Wiring `source.depends_on(test)` creates a circular structural dependency: the source waits on the test, the test waits on the source's artifact to assert against.
+
+### Pattern: test-validates-source
+
+Symptoms:
+
+- Proposed Task title starts with "Add tests/", "Verify", "Validate", "Assert", or similar.
+- Proposed Task's `files_to_own` are all `tests/**` paths.
+- Proposed Task's ACs assert observable state of an artifact owned by the source Task.
+
+Action: pass `--no-dep-on-source` to `promote-proposal` AND wire the reverse dep:
+
+```bash
+devbench promote-proposal <new-test-id> --no-dep-on-source
+devbench add-dep <new-test-id> <source-id>
+```
+
+Now the source runs first; the test runs after; no cycle.
+
+### Worked example
+
+Observed in production at `caylent-telemetry-spec/`: T8 owned `pyproject.toml` (build-backend + bandit config); T9 was proposed to add tests asserting `[tool.bandit].exclude_dirs` exists in pyproject.toml. Default `promote-proposal` wired `T8.depends_on(T9)`, which created a cycle (T9's test needed T8's edit; T8 was waiting on T9). Fix applied: removed T8's dep on T9; added T9's dep on T8 via `devbench add-dep E0-F1-S1-T9 E0-F1-S1-T8`. T8 ran first, applied the pyproject change; T9 ran after, asserted the change.
+
+### Heuristic for `blocker-resolver` (proposal author)
+
+When authoring a proposal where the new Task is test-validates-source, set a flag in the proposal JSON:
+
+```json
+"source_dep_direction": "test_validates_source"
+```
+
+`promote-proposal` honors the flag if present (auto-applies `--no-dep-on-source` and wires the reverse dep). When the flag is absent, the default direction is preserved (backward compatible). See [`plugin/devbench/agents/blocker-resolver.md`](../plugin/devbench/agents/blocker-resolver.md) for when the agent should set this flag.
+
+## Spec-correction recovery tasks (issue #136)
+
+When task-factory materialises a draft whose job is to remove or modify rows in another work-unit's Changes Manifest table, the draft's OWN Changes Manifest contains a **single row pointing at the work-unit markdown file being edited** -- e.g. `backlog/E2/E2-F3/E2-F3-S2/E2-F3-S2-T1.md`. Source files referenced inside that markdown's Manifest table (e.g. `pyproject.toml`, `Makefile`) are NOT listed in the draft's Manifest. Listing them re-introduces the very Manifest Conflict the recovery task was created to resolve.
+
+The agent prompt (`plugin/devbench/agents/task-factory.md`) carries the rule + a self-correcting heuristic gated on Description / Approach verbs ("remove the row", "drop the entry", "correct the manifest table"). Regression coverage: `tests/test_integration/test_task_factory_spec_correction_scope.py`.
+
+## Recovery-proposal dedup (issue #141)
+
+When `blocker-resolver` would emit a recovery proposal,
+`cmd_write_proposal` first computes a stable `fix_signature` -- a
+SHA-256 hash over `(target_repo, sorted(files_to_own), normalised
+intent_phrase)`. The intent phrase is extracted from the proposal's
+Approach text via a regex table mapping verb patterns ("remove the
+row", "untrack", "register marker", ...) to canonical tokens
+(`remove-row`, `untrack`, `register-marker`, ...).
+
+Before writing the JSON, `find_matching_pending_proposal` scans
+`.devbench/proposals/*.json` for a non-terminal source task whose
+proposal carries the same signature. On hit, `cmd_write_proposal`
+calls `add-dep` to wire the new source task as an additional
+dependency of the existing recovery task and emits a
+`[RECOVERY_REUSED]` audit comment instead of writing a duplicate
+JSON. On miss, the signature is stamped into the proposal JSON
+before persistence so the next blocker that matches the same shape
+hits the reuse path.
+
+The dedup helpers live in
+[`src/devbench/backlog/proposal.py`](../src/devbench/backlog/proposal.py).
+Regression coverage:
+[`tests/test_backlog/test_proposal_dedup.py`](../tests/test_backlog/test_proposal_dedup.py)
+and
+[`tests/test_backlog/test_proposal_scanner.py`](../tests/test_backlog/test_proposal_scanner.py).
+
+## Cascade-depth limit (issue #144)
+
+Recovery cascades (a proposal whose source task is itself the
+materialisation of an earlier proposal) carry a `cascade_depth`
+field equal to `parent_depth + 1`. The
+`orchestrate.max_cascade_depth` YAML knob (default `3`, env override
+`JUDGE_ORCHESTRATE_MAX_CASCADE_DEPTH`) caps recursion. When
+`cmd_materialise_proposal` sees a proposal at the cap, it transitions
+the source task to `NEEDS_OPERATOR_ATTENTION` instead of authoring
+another draft. Default of 3 reflects observed cascade lengths in
+production backlogs; raise per-workspace via YAML if your operator
+loop genuinely needs deeper chains.
+
+## Materialise-time placeholder rejection (issue #143)
+
+`cmd_materialise_proposal` scans every proposal's
+`proposed_tasks[*].suggested_approach` and rejects the materialisation
+when any value is empty, whitespace-only, `TODO`, or `TBD`. The
+rejection emits a structured error naming the offending tasks so the
+operator (or the upstream `blocker-resolver` invocation) can supply a
+real Approach before retrying. Concrete approach text -- even a single
+sentence -- passes the gate.
+
+## Backlog-repo recovery skip (issue #146)
+
+`cmd_write_proposal` (the persistence step that `blocker-resolver` invokes
+to write a proposal JSON to disk) inspects each proposed task's
+`files_to_own` against the workspace's configured target repos
+(`RepoConfig.checkout_directory`). The first path segment of each file
+is matched against the directory name of every configured repo. Files
+whose first segment matches no configured repo are *backlog-repo files*
+-- they live alongside `BACKLOG.md` in the backlog/workspace repo (e.g.
+`spec/observability.md`, `docs/architecture.md`, `backlog/E1/.../T1.md`).
+
+The backlog repo is not a "target repo" in devbench's model. Edits to
+backlog-repo files are operator bookkeeping commits, not work-unit
+deliverables; git-ops cannot run against them because they have no
+configured target repo and no `RepoConfig` entry. The recovery cascade
+therefore has no valid completion path for proposed tasks whose
+`files_to_own` are entirely backlog-repo files.
+
+The filter implements three branches:
+
+1. **All target-repo files** -- proposed task is preserved as-is.
+2. **All backlog-repo files** -- proposed task is dropped from the
+   proposal; a `[RECOVERY_SKIPPED_BACKLOG_REPO_FILES]` audit names
+   the dropped files. If every proposed task is skipped, no proposal
+   JSON is written and the envelope reports `recovery_skipped: true`.
+3. **Mixed (some target, some backlog)** -- proposed task is kept but
+   `files_to_own` is pruned to the target-repo subset; the backlog
+   files are dropped. Operator commits the backlog edits by hand under
+   the backlog-repo bookkeeping flow.
+
+This filter prevents the class of bugs where `manifest-amender`
+correctly rejects an amendment because the file lives in the backlog
+repo, then `blocker-resolver` materialises a recovery task whose Target
+Repository inherits the source's repo, and every review judge passes
+but git-ops blocks because the file isn't in the target repo. Live
+example: E3-F3-S2-T2 in `caylent-telemetry-spec` (declined manually
+before this filter shipped).

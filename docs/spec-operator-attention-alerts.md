@@ -1,7 +1,7 @@
 # SPEC: Operator-attention alerting surface
 
 > **Status:** Future work. Design sketch only; no implementation.
-> Tracked in [roadmap.md](roadmap.md). Referenced from [ADR-10](adr/10-multi-target-proposal-wiring.md).
+> Tracked via the [open GitHub issues](https://github.com/caylent-solutions/devbench/issues) labelled `enhancement`. Referenced from [ADR-10](adr/10-multi-target-proposal-wiring.md).
 
 This document captures the design context for a future devbench feature that proactively notifies a human when a decision-requiring item exists. It ships as a spec so the reasoning and trade-offs are preserved when an implementer eventually picks it up. Nothing in this file is a decision; every option enumerated below is still open.
 
@@ -81,7 +81,7 @@ Every item needing attention is treated as equal priority. There is intentionall
 Whatever surface lands, the existing surfaces stay:
 
 - `devbench status` keeps its `Blocked (auto)` + `Blocked (attn)` rows and the always-visible `Un-materialised` row.
-- `devbench report` keeps its two blocked panels and the pending-materialisation panel.
+- `devbench report` keeps its three blocked panels (auto-clearing via proposal, auto-recovery in flight, needs operator attention) and the pending-materialisation panel. Issue #168 (3-panel surfacing) extended panel 3 to also include HOLD work units and BLOCKED tasks whose marker target is in HOLD; both classes are operator-must-act and route into the existing panel with sub-case-specific inline annotations (`[HOLD]`, `[HOLD: <id>]`, `[no marker]`, `[marker target unknown: <id>]`, `[marker targets all terminal]`).
 - `devbench list-proposals` keeps its per-task `[state]` labels.
 
 The attention-alert surface is ADDITIVE. Removing it does not lose operator-visible information; it only removes the proactive signal.

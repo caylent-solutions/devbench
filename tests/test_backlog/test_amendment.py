@@ -103,7 +103,7 @@ def _sample_request_dict(task_id: str = "EX-F1-S1-T1") -> dict[str, Any]:
         "reason": "tdd_green_production_fix",
         "justification": "Test required production fix to handle BOM.",
         "files_to_add": [
-            {"path": "src/example/parser.py", "change": "use utf-8-sig codec"},
+            {"path": "src/example/example.py", "change": "use utf-8-sig codec"},
         ],
         "linked_acs": ["AC-TEST-001"],
     }
@@ -151,7 +151,7 @@ class TestAmendmentRequestRoundTrip:
         assert req.task_id == "EX-F1-S1-T1"
         assert req.reason == "tdd_green_production_fix"
         assert len(req.files_to_add) == 1
-        assert req.files_to_add[0].path == "src/example/parser.py"
+        assert req.files_to_add[0].path == "src/example/example.py"
         assert req.linked_acs == ["AC-TEST-001"]
 
     def test_round_trip_via_dict(self) -> None:
@@ -317,7 +317,7 @@ class TestApplyAmendment:
         rows = parse_manifest(updated)
         assert len(rows) == 2
         assert rows[0].file == "tests/test_example.py"
-        assert rows[1].file == "src/example/parser.py"
+        assert rows[1].file == "src/example/example.py"
 
         # Audit comment written
         assert AMENDMENT_APPLIED_ACTION in updated
@@ -570,3 +570,163 @@ class TestAppendAuditComment:
         out = _append_audit_comment(content, entry)
         assert "## Comments" in out
         assert "[new] line" in out
+
+
+class TestAmenderRejectionPersistsFeedbackJson:
+    """Issue #154 + #156: every ``reject_amendment`` call writes a
+    structured feedback JSON. As of #156 the path is shared with the
+    other review judges at
+    ``.devbench/review-failures/<task-id>-manifest_amender-<n>.json``;
+    the legacy ``.devbench/amender-rejections/`` directory remains as a
+    forward-compat read path tested separately below.
+    """
+
+    def test_rejection_writes_structured_json(self, tmp_workspace: Path) -> None:
+        from devbench.backlog.amendment import REVIEW_FAILURES_DIR_NAME
+
+        task_id = "EX-F1-S1-T1"
+        write_request(tmp_workspace, _sample_request(task_id))
+        reject_amendment(
+            tmp_workspace,
+            tmp_workspace / "BACKLOG.md",
+            task_id,
+            "SCOPE: amendment is out of scope for this task",
+        )
+
+        archive_dir = tmp_workspace / REVIEW_FAILURES_DIR_NAME
+        assert archive_dir.is_dir()
+        json_files = sorted(archive_dir.glob(f"{task_id}-manifest_amender-*.json"))
+        assert len(json_files) == 1
+        payload = json.loads(json_files[0].read_text(encoding="utf-8"))
+        assert payload["task_id"] == task_id
+        assert payload["attempt"] == 1
+        assert payload["schema_version"] == 1
+        assert payload["judge"] == "manifest_amender"
+        assert payload["categories"][0]["code"] == "SCOPE"
+        # Legacy fields preserved for downstream consumers still keyed off them.
+        assert payload["reason_category"] == "SCOPE"
+        assert "out of scope" in payload["reason_text"]
+        assert payload["capped"] is False
+        assert payload["request"]["task_id"] == task_id
+
+    def test_attempt_counter_increments(self, tmp_workspace: Path) -> None:
+        """A second rejection on the same task lands at attempt=2."""
+        from devbench.backlog.amendment import REVIEW_FAILURES_DIR_NAME
+
+        task_id = "EX-F1-S1-T1"
+        write_request(tmp_workspace, _sample_request(task_id))
+        reject_amendment(tmp_workspace, tmp_workspace / "BACKLOG.md", task_id, "SCOPE one")
+
+        write_request(tmp_workspace, _sample_request(task_id))
+        reject_amendment(tmp_workspace, tmp_workspace / "BACKLOG.md", task_id, "APPROACH_AUTH two")
+
+        archive_dir = tmp_workspace / REVIEW_FAILURES_DIR_NAME
+        json_files = sorted(archive_dir.glob(f"{task_id}-manifest_amender-*.json"))
+        assert len(json_files) == 2
+        payloads = [json.loads(p.read_text()) for p in json_files]
+        attempts = sorted(p["attempt"] for p in payloads)
+        assert attempts == [1, 2]
+        cats = {p["attempt"]: p["reason_category"] for p in payloads}
+        assert cats == {1: "SCOPE", 2: "APPROACH_AUTH"}
+
+    def test_unmatched_reason_falls_back_to_other(self, tmp_workspace: Path) -> None:
+        """Reasons missing the canonical tokens default to ``OTHER``."""
+        from devbench.backlog.amendment import REVIEW_FAILURES_DIR_NAME
+
+        task_id = "EX-F1-S1-T1"
+        write_request(tmp_workspace, _sample_request(task_id))
+        reject_amendment(
+            tmp_workspace,
+            tmp_workspace / "BACKLOG.md",
+            task_id,
+            "the amendment looks fine but we cannot accept it right now",
+        )
+        archive_dir = tmp_workspace / REVIEW_FAILURES_DIR_NAME
+        payload = json.loads(next(archive_dir.glob(f"{task_id}-manifest_amender-*.json")).read_text())
+        assert payload["reason_category"] == "OTHER"
+        assert payload["categories"][0]["code"] == "OTHER"
+
+    def test_capped_flag_set_when_attempt_exceeds_max(
+        self,
+        tmp_workspace: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Once the per-task attempt count exceeds ``MAX_RETRY_ATTEMPTS`` the
+        feedback record is still written but stamped ``capped: True``."""
+        from devbench.backlog import amendment as amendment_mod
+        from devbench.backlog.amendment import (
+            AMENDER_REJECTIONS_DIR_NAME,
+            REVIEW_FAILURES_DIR_NAME,
+            persist_rejection_feedback,
+        )
+
+        monkeypatch.setattr("devbench.config.MAX_RETRY_ATTEMPTS", 1)
+
+        task_id = "EX-F1-S1-T1"
+        request = _sample_request(task_id)
+        persist_rejection_feedback(
+            workspace_root=tmp_workspace,
+            task_id=task_id,
+            rejection_reason="SCOPE first",
+            request=request,
+        )
+        result_path = persist_rejection_feedback(
+            workspace_root=tmp_workspace,
+            task_id=task_id,
+            rejection_reason="SCOPE second",
+            request=request,
+        )
+        payload = json.loads(result_path.read_text())
+        assert payload["attempt"] == 2
+        assert payload["capped"] is True
+        assert isinstance(amendment_mod.REVIEW_FAILURES_DIR_NAME, str)
+        # Both directory constants stay exported -- legacy is forward-compat read-only.
+        assert REVIEW_FAILURES_DIR_NAME == ".devbench/review-failures"
+        assert AMENDER_REJECTIONS_DIR_NAME == ".devbench/amender-rejections"
+
+    def test_review_failures_path_returned_by_reader(self, tmp_workspace: Path) -> None:
+        """A JSON written via ``persist_rejection_feedback`` (new path) must
+        be returned by ``read_review_failure_files``."""
+        from devbench.backlog.amendment import read_review_failure_files
+
+        task_id = "EX-F1-S1-T1"
+        write_request(tmp_workspace, _sample_request(task_id))
+        reject_amendment(tmp_workspace, tmp_workspace / "BACKLOG.md", task_id, "SCOPE")
+        paths = read_review_failure_files(tmp_workspace, task_id)
+        assert any("review-failures" in str(p) for p in paths)
+        assert all(task_id in p.name for p in paths)
+
+    def test_legacy_amender_rejections_path_still_readable(
+        self,
+        tmp_workspace: Path,
+    ) -> None:
+        """Forward-compat: a JSON written under the legacy
+        ``.devbench/amender-rejections/`` directory must still be returned by
+        ``read_review_failure_files`` so prior runs are not orphaned."""
+        from devbench.backlog.amendment import (
+            AMENDER_REJECTIONS_DIR_NAME,
+            read_review_failure_files,
+        )
+
+        task_id = "EX-F1-S1-T1"
+        legacy_dir = tmp_workspace / AMENDER_REJECTIONS_DIR_NAME
+        legacy_dir.mkdir(parents=True)
+        legacy_file = legacy_dir / f"{task_id}-1.json"
+        legacy_file.write_text(
+            json.dumps(
+                {
+                    "task_id": task_id,
+                    "attempt": 1,
+                    "reason_category": "SCOPE",
+                    "reason_text": "legacy reason",
+                    "request": _sample_request_dict(task_id),
+                    "capped": False,
+                    "recorded_at": "2026-04-30T00:00:00Z",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        paths = read_review_failure_files(tmp_workspace, task_id)
+        assert legacy_file in paths

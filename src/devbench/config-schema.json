@@ -44,6 +44,18 @@
       "minimum": 1,
       "description": "Maximum number of executor retry attempts per work unit when judge reviews fail. Default: 10."
     },
+    "max_executor_retries_per_judge": {
+      "type": "object",
+      "description": "Optional per-judge override of max_executor_retries (issue #122). Keys must be in the canonical judge allowlist (REVIEW_JUDGE_NAMES + SECURITY_JUDGE_NAMES). Each value falls back to max_executor_retries when absent.",
+      "additionalProperties": false,
+      "properties": {
+        "code_review": { "type": "integer", "minimum": 1 },
+        "test_review": { "type": "integer", "minimum": 1 },
+        "doc_review": { "type": "integer", "minimum": 1 },
+        "changes_manifest": { "type": "integer", "minimum": 1 },
+        "security_review": { "type": "integer", "minimum": 1 }
+      }
+    },
     "use_bedrock": {
       "type": "boolean",
       "description": "Whether to route LLM calls through AWS Bedrock."
@@ -70,6 +82,10 @@
     "display_timezone": {
       "type": ["string", "null"],
       "description": "IANA timezone name (e.g. 'America/New_York', 'Europe/London') applied by every devbench command that renders timestamps -- `devbench report`, `devbench hook-tail`, `devbench watch`, and any future command. When unset, each command defaults to the OS local timezone. Override per-invocation via the JUDGE_DISPLAY_TIMEZONE env var. Report-specific `report.display_timezone` / JUDGE_REPORT_TIMEZONE take precedence over this top-level setting for the report command only."
+    },
+    "log_file": {
+      "type": ["string", "null"],
+      "description": "Workspace-relative path to the orchestrator's structured log file (for example 'logs/backlog-a-orchestrator.log'). When set, both `setup_logging` (the writer) and `cmd_report` (the reader) consult this single source of truth so the orchestrator and the report cannot read/write different files by accident. Per-invocation override via the JUDGE_LOG_FILE env var still takes precedence (useful for tests)."
     },
     "timeouts": {
       "type": "object",
@@ -139,6 +155,61 @@
         "defer_pr": {
           "type": "boolean",
           "description": "When true, git-ops commits locally only (no push, no PR, no merge). Use git-ops-finalize to push and create the PR after all work units are complete. Only meaningful when single_branch is set."
+        },
+        "pause_before_merge": {
+          "type": "boolean",
+          "description": "When true, cmd_git_ops pushes the PR and waits for green CI then transitions the work unit to in-review instead of merging; the orchestrator's loop reconciles in-review tasks via cmd_check_merge on the next iteration. Issue #101. Default false. Mutually exclusive with defer_pr: true and single_branch: <name> (validated at config load)."
+        },
+        "inline_orphan_cleanup": {
+          "type": "boolean",
+          "description": "When true (the default), cmd_git_ops runs cleanup_tracked_orphans inline as a devbench-authored chore commit before the task's commit when build/state orphan paths are detected. When false, falls back to the legacy proposal-task path. Phase 1 of the orphan-cascade fix. Override via JUDGE_INLINE_ORPHAN_CLEANUP."
+        },
+        "ci_failure_retry": {
+          "type": "boolean",
+          "description": "When true (the default), cmd_git_ops returns rc=2 on CI failure to trigger an executor retry with the failing-job log as feedback. When false, returns rc=1 BLOCKED on the first CI failure (legacy behaviour). Issue #115. Override via JUDGE_CI_FAILURE_RETRY_ENABLED."
+        },
+        "orphan_patterns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Operator override of the built-in orphan-pattern fnmatch list (terraform state, terragrunt cache, Python pycache, coverage, etc.). When non-empty, REPLACES the built-in list entirely. Override via DEVBENCH_ORPHAN_IGNORE_PATTERNS. Default: [] (use the built-in list)."
+        },
+        "local_only": {
+          "type": "boolean",
+          "description": "When true, the target repo(s) are treated as local-only -- no origin git remote, never pushed, no PRs, no CI. ensure_branch creates the work-unit branch off the local default branch (no 'git fetch origin'). Requires defer_pr: true, forbids pause_before_merge: true, and requires every entry in repos: to set an explicit default_branch:. Used for operational workflows (AWS teardowns, evidence capture, audits) where devbench drives work but does not edit application code. Default: false."
+        },
+        "pr_review_resolution": {
+          "type": "object",
+          "description": "PR review-comment polling settings (issue #116). Disabled by default. When enabled, cmd_git_ops polls gh pr view for asynchronous bot review feedback (Copilot, Q-Dev, internal review bots) before merging.",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Top-level toggle. When false (default), the entire phase is a no-op. Override via JUDGE_PR_REVIEW_RESOLUTION_ENABLED."
+            },
+            "agents": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Comma-separated allowlist of GitHub login names whose unresolved review comments block the merge. Empty default; populate when review bots are configured on the target repo. Override via JUDGE_PR_REVIEW_AGENTS."
+            },
+            "decision_blocks": {
+              "type": "boolean",
+              "description": "When true (default), reviewDecision == CHANGES_REQUESTED hard-blocks the merge regardless of bot allowlist. Override via JUDGE_PR_REVIEW_DECISION_BLOCKS."
+            },
+            "settle_seconds": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Total settle-window length in seconds for the PR review poll loop. Default 60. Override via JUDGE_PR_REVIEW_SETTLE_SECONDS."
+            },
+            "poll_interval": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Per-poll cadence in seconds inside the settle window. Default 5. Override via JUDGE_PR_REVIEW_POLL_INTERVAL."
+            }
+          }
         }
       }
     },
@@ -161,6 +232,45 @@
           "type": "integer",
           "minimum": 1,
           "description": "Minutes before an in-progress task is considered stale. Hook warns instead of blindly blocking. Default: 120."
+        }
+      }
+    },
+    "hook_tail": {
+      "type": "object",
+      "description": "devbench hook-tail column-cap settings (issue #134). EVENT_WIDTH stays a hook_tail.py-local constant; the four below are the operator-tunable knobs.",
+      "additionalProperties": false,
+      "properties": {
+        "agent_width": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Column width for the agent name. Default: 12."
+        },
+        "tool_width": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Column width for the tool name. Default: 8."
+        },
+        "description_max": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Max chars for the description column. Default: 120 (bumped from 100 in the release that introduces this block)."
+        },
+        "stdout_preview_max": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Max chars for the result-preview column after the pipe. Default: 80."
+        }
+      }
+    },
+    "orchestrate": {
+      "type": "object",
+      "description": "Orchestrator runtime tuning (issue #144).",
+      "additionalProperties": false,
+      "properties": {
+        "max_cascade_depth": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Cap on recovery-of-a-recovery cascade depth. When a proposal would land at depth >= this cap, the source task transitions to NEEDS_OPERATOR_ATTENTION instead of materialising another recovery layer. Default: 3."
         }
       }
     },
@@ -193,6 +303,33 @@
           "type": "integer",
           "minimum": 1,
           "description": "Character limit for per-file LLM preview."
+        },
+        "ci_failure_log_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Byte cap for the trimmed failing-job log written to .devbench/ci-failures/<id>-<n>.log when ci_failure_retry is enabled. Default 32768. Override via JUDGE_CI_FAILURE_LOG_BYTES."
+        }
+      }
+    },
+    "debug": {
+      "type": "object",
+      "description": "Diagnostic-tuning knobs. Set these only when investigating a specific orchestrator-cadence problem; production workspaces leave this section absent.",
+      "additionalProperties": false,
+      "properties": {
+        "check_registration_retries": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Number of times wait_for_checks retries gh pr checks when 'no checks reported' contradicts the local workflow-file glob (issue #114 race-defence). Default 12. Override via JUDGE_CHECK_REGISTRATION_RETRIES."
+        },
+        "check_registration_delay_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Sleep between check-registration retries, in seconds. Default 5. Override via JUDGE_CHECK_REGISTRATION_DELAY_SECONDS."
+        },
+        "blocked_recovery_window_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Recency cap for the AWAITING_AUTO_RECOVERY signal in the 3-state blocked-task classifier. Tasks whose most recent [BLOCKED] audit-comment timestamp is older than this window fall through to NEEDS_OPERATOR_ATTENTION. Default 1800. Override via JUDGE_BLOCKED_RECOVERY_WINDOW_SECONDS."
         }
       }
     },
@@ -227,7 +364,11 @@
         },
         "data_residency_multiplier": {
           "type": "number",
-          "description": "Cost multiplier when usage.inference_geo is set (US-only inference). Defaults to 1.10 (Anthropic's published rate). Counted in v1 but not yet applied per-call."
+          "description": "Cost multiplier applied per-call to usage.inference_geo-flagged tokens (issue #124). Defaults to 1.10 (Anthropic's published rate). Composes with cache + base-rate multipliers and applies before token_cost_discount."
+        },
+        "fast_mode_multiplier": {
+          "type": "number",
+          "description": "Cost multiplier applied per-call to usage.speed=='fast' tokens (issue #124). Defaults to 6.0 (Opus 4.6 fast-mode premium). Composes with cache + base-rate multipliers and applies before token_cost_discount."
         },
         "recent_pace_tasks": {
           "type": "integer",
@@ -278,6 +419,17 @@
         "auto_accept_proposals": {
           "type": "boolean",
           "description": "When true, devbench auto-promotes every task-factory-produced draft at sweep time instead of leaving it at status `proposed` for operator review. Default false. ADR-11."
+        }
+      }
+    },
+    "validate": {
+      "type": "object",
+      "description": "Opt-in toggles for additional validate-backlog rules. Existing rules (1-19) run unconditionally; rules listed here are gated to keep pre-existing backlogs green during rollout.",
+      "additionalProperties": false,
+      "properties": {
+        "check_orphan_path_tokens": {
+          "type": "boolean",
+          "description": "Rule 20: cross-check Acceptance Criteria and Definition of Done sections of every Task against the Changes Manifest. Backtick-quoted path-shaped tokens that do not appear in the Manifest (and are not declared read-only via a trailing `(ref)` marker) emit an integrity error. Catches spec drift where AC/DoD prose restates a path that disagrees with the Manifest. Default false (opt-in). See docs/backlog-contract.md."
         }
       }
     }

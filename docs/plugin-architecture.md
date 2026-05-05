@@ -50,6 +50,14 @@ plugin/devbench/
     ├── guard-verdict-format.sh  ← validates log-verdict argument format
     ├── guard-git-stage.sh       ← blocks `git commit` with nothing staged AND `git add <path>` when path is outside the work unit's Changes Manifest
     ├── guard-work-unit-write.sh ← blocks Write/Edit to work unit .md files
+    ├── guard-destructive-git.sh ← blocks direct destructive git operations from non-git-ops agents
+    ├── guard-review-supervisor-scope.sh
+    │                            ← enforces read-only scope on the review-supervisor agent.
+    │                              Blocks Bash mutations (git commit/push, rm, sed -i, > redirection, etc.)
+    │                              AND blocks Agent-tool spawn of any subagent_type outside the
+    │                              review_team allowlist (devbench:code_review, test_review, doc_review,
+    │                              changes_manifest). Issue #118 -- closes the loophole where the
+    │                              supervisor escalated to repo-mutation rights via subagent spawn.
     └── assert-tests-pass.sh     ← enforces test suite passes after Bash
 ```
 

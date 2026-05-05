@@ -1,0 +1,25 @@
+---
+# Re-runnable playbook for already-provisioned instances. Same role chain as
+# bootstrap but skips one-time tasks via tags so it converges quickly.
+- name: Devbench remote workstation refresh
+  hosts: localhost
+  connection: local
+  become: true
+  gather_facts: true
+
+  vars:
+    linux_user: "{{ linux_user | mandatory }}"
+
+  roles:
+    - role: base
+    - role: languages
+    - role: infra-tools
+    - role: docker
+    - role: git-auth
+    - role: claude-cli
+    - role: kanon-cli
+    - role: workspace
+    - role: devbench-sessions
+
+  tags:
+    - refresh

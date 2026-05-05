@@ -72,12 +72,40 @@ import jsonschema
 import yaml
 
 from devbench.constants import (
+    ALL_REQUIRED_JUDGE_NAMES,
     DEFAULT_STOP_HOOK_MAX_BLOCKS,
     DEFAULT_STOP_HOOK_STALE_TASK_MINUTES,
     DEFAULT_STOP_HOOK_WINDOW_SECONDS,
     DEFAULT_TOKEN_COST_PER_M_INPUT,
     DEFAULT_TOKEN_COST_PER_M_OUTPUT,
 )
+
+
+def _load_per_judge_retries(raw_value: object) -> dict[str, int]:
+    """Validate and return the per-judge retry budget map (issue #122).
+
+    The schema's ``additionalProperties: false`` already rejects unknown
+    judge names at the JSONSchema layer, but we re-validate at runtime to
+    fail fast with a clear actionable error if the schema layer drifts or
+    if a future config flow bypasses validation. Returns an empty dict if
+    the YAML field is absent.
+    """
+    if raw_value is None:
+        return {}
+    if not isinstance(raw_value, dict):
+        raise ValueError(
+            f"max_executor_retries_per_judge must be a mapping (judge_name -> int); got {type(raw_value).__name__}."
+        )
+    result: dict[str, int] = {}
+    for key, value in raw_value.items():
+        if key not in ALL_REQUIRED_JUDGE_NAMES:
+            allowed = ", ".join(sorted(ALL_REQUIRED_JUDGE_NAMES))
+            raise ValueError(f"max_executor_retries_per_judge: unknown judge {key!r}. Allowed names: {allowed}.")
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError(f"max_executor_retries_per_judge[{key!r}] must be a positive integer; got {value!r}.")
+        result[key] = value
+    return result
+
 
 # Relative path from WORKSPACE_ROOT to the default config file location.
 DEFAULT_CONFIG_SUBPATH: str = "backlog/config/devbench.yaml"
@@ -138,6 +166,40 @@ class LimitConfig:
     llm_evidence_truncation: int | None = None
     llm_file_context: int | None = None
     llm_file_preview_chars: int | None = None
+    ci_failure_log_bytes: int | None = None
+
+
+@dataclass
+class PrReviewResolutionConfig:
+    """PR review-comment polling configuration (issue #116).
+
+    Defaults to disabled. Operators turn it on per-backlog when target
+    repos have asynchronous review bots (Copilot, Q-Dev, internal
+    review services) whose comments arrive on a separate timeline from
+    the formal CI status checks.
+
+    Attributes:
+        enabled: Top-level toggle. When ``False`` (default), the entire
+            phase is a no-op and ``cmd_git_ops`` proceeds straight from
+            CI-pass to merge.
+        agents: GitHub login allowlist whose unresolved review comments
+            block the merge until resolved. Empty by default.
+        decision_blocks: When ``True`` (default), reviewDecision ==
+            CHANGES_REQUESTED hard-blocks the merge regardless of the
+            bot allowlist.
+        settle_seconds: Total settle-window length in seconds.
+        poll_interval: Per-poll cadence in seconds inside the settle
+            window.
+
+    All fields default to ``None`` when not specified in YAML;
+    ``config.py`` substitutes the constants.py defaults.
+    """
+
+    enabled: bool | None = None
+    agents: list[str] = field(default_factory=list)
+    decision_blocks: bool | None = None
+    settle_seconds: int | None = None
+    poll_interval: int | None = None
 
 
 @dataclass
@@ -158,11 +220,71 @@ class GitOpsConfig:
             ``git-ops-finalize`` to push and create the PR after all work
             units are complete.  Only meaningful when ``single_branch``
             is set.  Defaults to ``False``.
+        pause_before_merge: Issue #101 -- when ``True``, ``cmd_git_ops``
+            pushes the PR + waits for green CI, then transitions the
+            work unit to ``in-review`` instead of merging. The
+            orchestrator's loop reconciles ``in-review`` tasks via
+            ``cmd_check_merge`` on the next iteration. Mutually
+            exclusive with ``defer_pr: true`` and ``single_branch: <name>``
+            (validated at config load).
+        inline_orphan_cleanup: When ``True`` (the default), ``cmd_git_ops``
+            runs ``cleanup_tracked_orphans`` inline as a chore commit
+            before the task's commit when build/state orphan paths are
+            detected. ``None`` falls through to the constant default.
+        ci_failure_retry: Issue #115 -- when ``True`` (the default),
+            ``cmd_git_ops`` returns rc=2 on CI failure to trigger an
+            executor retry with the failing-job log as feedback. ``None``
+            falls through to the constant default.
+        orphan_patterns: Operator override of the built-in orphan-pattern
+            fnmatch list. Empty list (default) means use the built-in
+            list; non-empty REPLACES it.
+        pr_review_resolution: Nested config for the PR review-comment
+            polling phase (issue #116).
+        local_only: When ``True``, the target repo(s) are treated as
+            local-only -- they have no ``origin`` git remote, are never
+            pushed, never produce PRs, and never run CI. ``ensure_branch``
+            creates the work-unit branch off the local default branch
+            (no ``git fetch origin``). Requires ``defer_pr: true``,
+            forbids ``pause_before_merge: true``, and requires every
+            entry in ``repos:`` to set an explicit ``default_branch:``
+            (no ``origin/HEAD`` fallback). Defaults to ``False``.
     """
 
     update_submodule: bool = False
     single_branch: str | None = None
     defer_pr: bool = False
+    pause_before_merge: bool | None = None
+    inline_orphan_cleanup: bool | None = None
+    ci_failure_retry: bool | None = None
+    orphan_patterns: list[str] = field(default_factory=list)
+    pr_review_resolution: PrReviewResolutionConfig = field(default_factory=PrReviewResolutionConfig)
+    local_only: bool = False
+
+
+@dataclass
+class DebugConfig:
+    """Diagnostic-tuning knobs.
+
+    Set these only when investigating an orchestrator-cadence problem.
+    Production workspaces leave this section absent.
+
+    Attributes:
+        check_registration_retries: Issue #114 -- number of times
+            ``wait_for_checks`` retries ``gh pr checks`` when "no checks
+            reported" contradicts the local workflow-file glob.
+        check_registration_delay_seconds: Sleep between check-registration
+            retries, in seconds.
+        blocked_recovery_window_seconds: Recency cap for the
+            AWAITING_AUTO_RECOVERY signal in the 3-state blocked-task
+            classifier.
+
+    All fields default to ``None`` when not specified in YAML;
+    ``config.py`` substitutes the constants.py defaults.
+    """
+
+    check_registration_retries: int | None = None
+    check_registration_delay_seconds: int | None = None
+    blocked_recovery_window_seconds: int | None = None
 
 
 @dataclass
@@ -181,7 +303,9 @@ class ReportConfig:
         cache_write_1hr_multiplier: Cost multiplier for 1-hour prompt-cache
             write tokens, relative to the base input rate.
         data_residency_multiplier: Cost multiplier when usage.inference_geo
-            is set (US-only inference).
+            is set (US-only inference). Applied per-call (issue #124).
+        fast_mode_multiplier: Cost multiplier when usage.speed == 'fast'
+            (Opus 4.6 fast-mode premium). Applied per-call (issue #124).
         recent_pace_tasks: Number of most recently completed tasks to average
             for the "Recent pace" projection. ``None`` falls back to
             ``DEFAULT_RECENT_PACE_TASKS``.
@@ -199,8 +323,32 @@ class ReportConfig:
     cache_write_5min_multiplier: float | None = None
     cache_write_1hr_multiplier: float | None = None
     data_residency_multiplier: float | None = None
+    fast_mode_multiplier: float | None = None
     recent_pace_tasks: int | None = None
     token_cost_discount: float | None = None
+
+
+@dataclass(frozen=True)
+class ValidateConfig:
+    """Per-backlog opt-in toggles for additional ``validate-backlog`` rules.
+
+    Existing rules (1-19) run unconditionally. Rules added here are gated so
+    pre-existing backlogs see no behaviour change until they explicitly opt
+    in. See ``docs/backlog-contract.md`` for the full rule list.
+
+    Attributes:
+        check_orphan_path_tokens: Rule 20. When ``True``, validate-backlog
+            scans every Task's ``## Acceptance Criteria`` and
+            ``## Definition of Done`` sections for backtick-quoted
+            path-shaped tokens, and emits an integrity error for any token
+            that does not appear in the Task's ``## Changes Manifest``
+            (after path normalisation). A token followed by ``(ref)`` is
+            treated as a declared read-only reference and skipped. Catches
+            spec drift where AC/DoD prose restates a path that disagrees
+            with the Manifest. Default ``False`` (opt-in).
+    """
+
+    check_orphan_path_tokens: bool = False
 
 
 @dataclass(frozen=True)
@@ -265,6 +413,50 @@ class StopHookConfig:
 
 
 @dataclass
+class HookTailConfig:
+    """``devbench hook-tail`` column-cap settings (issue #134).
+
+    Each field is ``None`` when absent from YAML; ``config.py`` resolves
+    env > YAML > default for the four module-level ``HOOK_TAIL_*``
+    constants. ``EVENT_WIDTH`` is intrinsic to the arrow format and stays
+    a hook_tail.py-local constant; only the four below are operator-
+    tunable.
+
+    Attributes:
+        agent_width: Column width for the agent name (default 12).
+        tool_width: Column width for the tool name (default 8).
+        description_max: Max chars for the description column (default
+            120; bumped from 100 in the release that introduces this
+            block so multi-word agent descriptions are less likely to
+            truncate mid-clause).
+        stdout_preview_max: Max chars for the result-preview column
+            after ``|`` (default 80).
+    """
+
+    agent_width: int | None = None
+    tool_width: int | None = None
+    description_max: int | None = None
+    stdout_preview_max: int | None = None
+
+
+@dataclass
+class OrchestrateConfig:
+    """Orchestrator runtime tuning (issue #144).
+
+    ``max_cascade_depth`` caps the depth of recovery-of-a-recovery
+    chains. When a proposal would land at depth >= this cap, the source
+    task transitions to ``NEEDS_OPERATOR_ATTENTION`` instead of
+    materialising another recovery layer.
+
+    Field is ``None`` when absent from YAML; ``config.py`` resolves
+    env > YAML > default for the module-level ``MAX_CASCADE_DEPTH``
+    constant.
+    """
+
+    max_cascade_depth: int | None = None
+
+
+@dataclass
 class RepoConfig:
     """Per-repository configuration.
 
@@ -277,11 +469,22 @@ class RepoConfig:
             the ``/`` in ``org/repo``).
         merge_strategy: Per-repo PR merge strategy override.  When ``None``,
             the top-level ``RuntimeConfig.merge_strategy`` is used.
+        resolved_checkout_path: Absolute filesystem path to the repo
+            checkout, populated by ``load_runtime_config``. Equal to
+            ``<JUDGE_WORKSPACE_ROOT>/<checkout_directory or repo_short_name>``
+            after resolution. Consumers MUST read this field instead of
+            re-resolving the path inline (E213).
+        validated_repo: Canonical ``org/repo`` form for this entry,
+            populated by ``load_runtime_config`` from the YAML repos map
+            key. Stored verbatim so consumers do not re-validate the
+            shape per-call.
     """
 
     default_branch: str | None = None
     checkout_directory: str | None = None
     merge_strategy: str | None = None
+    resolved_checkout_path: Path | None = None
+    validated_repo: str | None = None
 
 
 @dataclass
@@ -313,6 +516,16 @@ class RuntimeConfig:
             ``None`` means OS local timezone. Per-command overrides
             (env vars, CLI flags, or the legacy ``report.display_timezone``)
             take precedence over this top-level setting.
+        log_file: Workspace-relative path to the orchestrator's
+            structured log file. ``setup_logging`` (the writer) and
+            ``cmd_report`` (the reader) both consult this single source
+            of truth so they cannot diverge by accident; in earlier
+            versions the two were both env-var-driven and could be
+            split silently when an operator set ``JUDGE_LOG_FILE`` to
+            different values in different shells. ``None`` (the
+            default) means callers must supply ``JUDGE_LOG_FILE``
+            explicitly or rely on the workspace-local convention
+            ``logs/orchestrator.log``.
     """
 
     repos: dict[str, RepoConfig] = field(default_factory=dict)
@@ -321,8 +534,12 @@ class RuntimeConfig:
     git_ops: GitOpsConfig = field(default_factory=GitOpsConfig)
     report: ReportConfig = field(default_factory=ReportConfig)
     stop_hook: StopHookConfig = field(default_factory=StopHookConfig)
+    hook_tail: HookTailConfig = field(default_factory=HookTailConfig)
+    orchestrate: OrchestrateConfig = field(default_factory=OrchestrateConfig)
     manifest_amendment: AmendmentConfig = field(default_factory=AmendmentConfig)
     task_factory: TaskFactoryConfig = field(default_factory=TaskFactoryConfig)
+    validate: ValidateConfig = field(default_factory=ValidateConfig)
+    debug: DebugConfig = field(default_factory=DebugConfig)
     allowed_orgs: list[str] = field(default_factory=list)
     judge_model: str | None = None
     executor_model: str | None = None
@@ -330,7 +547,9 @@ class RuntimeConfig:
     bedrock_region: str | None = None
     merge_strategy: str | None = None
     max_executor_retries: int | None = None
+    max_executor_retries_per_judge: dict[str, int] = field(default_factory=dict)
     display_timezone: str | None = None
+    log_file: str | None = None
 
 
 def resolve_config_path(
@@ -402,19 +621,35 @@ def _parse_repo_config(path: Path, repo_name: str, repo_data: object) -> RepoCon
     )
 
 
-def _parse_repos(path: Path, repos_raw: dict, allowed_orgs: list[str]) -> dict[str, RepoConfig]:
+def _parse_repos(
+    path: Path,
+    repos_raw: dict,
+    allowed_orgs: list[str],
+    workspace_root: Path | None = None,
+) -> dict[str, RepoConfig]:
     """Build the repos mapping from the raw YAML ``repos`` block.
 
     When *allowed_orgs* is non-empty, every repo key's organisation component
     must appear in *allowed_orgs*.
 
+    When *workspace_root* is provided (the normal case from
+    ``load_runtime_config``), each ``RepoConfig.resolved_checkout_path``
+    is populated to ``<workspace_root>/<checkout_directory or repo_short_name>``
+    so consumers do not re-resolve the path inline (E213). When it is
+    ``None`` the field stays ``None`` -- callers that operate without a
+    workspace root (some tests) must tolerate that absence.
+
     Args:
         path: Config file path (used in error messages).
         repos_raw: Raw ``repos`` dict from YAML (already schema-validated).
         allowed_orgs: Permitted GitHub organisations.  Empty list means any org.
+        workspace_root: Absolute path to ``JUDGE_WORKSPACE_ROOT`` for
+            populating ``resolved_checkout_path``.
 
     Returns:
-        Mapping of ``org/repo`` → ``RepoConfig``.
+        Mapping of ``org/repo`` → ``RepoConfig`` with ``validated_repo``
+        and (when *workspace_root* is set) ``resolved_checkout_path``
+        populated.
 
     Raises:
         ValueError: If a repo key's org is not in *allowed_orgs*.
@@ -429,7 +664,12 @@ def _parse_repos(path: Path, repos_raw: dict, allowed_orgs: list[str]) -> dict[s
                     f"Config file '{path}': repo '{repo_name}' belongs to org '{org}', "
                     f"which is not in allowed_orgs: {allowed_orgs}."
                 )
-        repos[repo_name] = _parse_repo_config(path, repo_name, repo_data)
+        cfg = _parse_repo_config(path, repo_name, repo_data)
+        cfg.validated_repo = repo_name
+        if workspace_root is not None:
+            checkout_dir = cfg.checkout_directory or repo_name.split("/", maxsplit=1)[-1]
+            cfg.resolved_checkout_path = workspace_root / checkout_dir
+        repos[repo_name] = cfg
     return repos
 
 
@@ -476,7 +716,9 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         raise ValueError(f"Config file '{path}' failed schema validation: {exc.message}") from exc
 
     allowed_orgs: list[str] = raw.get("allowed_orgs") or []
-    repos = _parse_repos(path, raw.get("repos") or {}, allowed_orgs)
+    workspace_root_raw = _env.get("JUDGE_WORKSPACE_ROOT", "")
+    workspace_root = Path(workspace_root_raw) if workspace_root_raw else None
+    repos = _parse_repos(path, raw.get("repos") or {}, allowed_orgs, workspace_root)
 
     # Populate TimeoutConfig from YAML timeouts block (absent keys yield None).
     timeouts_raw = raw.get("timeouts") or {}
@@ -500,18 +742,81 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         llm_evidence_truncation=limits_raw.get("llm_evidence_truncation"),
         llm_file_context=limits_raw.get("llm_file_context"),
         llm_file_preview_chars=limits_raw.get("llm_file_preview_chars"),
+        ci_failure_log_bytes=limits_raw.get("ci_failure_log_bytes"),
     )
 
     # Populate GitOpsConfig from YAML git_ops block (absent keys yield defaults).
     git_ops_raw = raw.get("git_ops") or {}
     single_branch_raw = git_ops_raw.get("single_branch") or None
     defer_pr = bool(git_ops_raw.get("defer_pr", False))
+    pause_before_merge_raw = git_ops_raw.get("pause_before_merge")
+    pause_before_merge = bool(pause_before_merge_raw) if pause_before_merge_raw is not None else None
     if defer_pr and not single_branch_raw:
         raise ValueError(f"Config file '{path}': git_ops.defer_pr requires git_ops.single_branch to be set.")
+    if pause_before_merge and defer_pr:
+        raise ValueError(
+            f"Config file '{path}': git_ops.pause_before_merge: true is incompatible with "
+            "git_ops.defer_pr: true. defer_pr defers PR creation; pause_before_merge pauses "
+            "after PR creation. They are mutually exclusive."
+        )
+    if pause_before_merge and single_branch_raw:
+        raise ValueError(
+            f"Config file '{path}': git_ops.pause_before_merge: true is incompatible with "
+            f"git_ops.single_branch: {single_branch_raw!r}. Single-branch mode puts every "
+            "work unit's commits on one branch; there is no per-unit branch to create a PR from."
+        )
+    pr_resolution_raw = git_ops_raw.get("pr_review_resolution") or {}
+    pr_resolution_enabled_raw = pr_resolution_raw.get("enabled")
+    pr_resolution_decision_raw = pr_resolution_raw.get("decision_blocks")
+    pr_review_resolution = PrReviewResolutionConfig(
+        enabled=bool(pr_resolution_enabled_raw) if pr_resolution_enabled_raw is not None else None,
+        agents=list(pr_resolution_raw.get("agents") or []),
+        decision_blocks=bool(pr_resolution_decision_raw) if pr_resolution_decision_raw is not None else None,
+        settle_seconds=pr_resolution_raw.get("settle_seconds"),
+        poll_interval=pr_resolution_raw.get("poll_interval"),
+    )
+    inline_cleanup_raw = git_ops_raw.get("inline_orphan_cleanup")
+    ci_failure_retry_raw = git_ops_raw.get("ci_failure_retry")
+    local_only = bool(git_ops_raw.get("local_only", False))
+    if local_only and not defer_pr:
+        raise ValueError(
+            f"Config file '{path}': git_ops.local_only: true requires git_ops.defer_pr: true. "
+            "Local-only repos have no remote to push to; PR creation is meaningless. "
+            "Set git_ops.defer_pr: true (and git_ops.single_branch: <name>) alongside local_only."
+        )
+    if local_only and pause_before_merge:
+        raise ValueError(
+            f"Config file '{path}': git_ops.local_only: true is incompatible with "
+            "git_ops.pause_before_merge: true. Local-only mode never creates PRs; "
+            "there is nothing to pause before merging."
+        )
     git_ops = GitOpsConfig(
         update_submodule=bool(git_ops_raw.get("update_submodule", False)),
         single_branch=single_branch_raw,
         defer_pr=defer_pr,
+        pause_before_merge=pause_before_merge,
+        inline_orphan_cleanup=bool(inline_cleanup_raw) if inline_cleanup_raw is not None else None,
+        ci_failure_retry=bool(ci_failure_retry_raw) if ci_failure_retry_raw is not None else None,
+        orphan_patterns=list(git_ops_raw.get("orphan_patterns") or []),
+        pr_review_resolution=pr_review_resolution,
+        local_only=local_only,
+    )
+    if local_only:
+        missing_default_branch = [repo_name for repo_name, repo_cfg in repos.items() if not repo_cfg.default_branch]
+        if missing_default_branch:
+            raise ValueError(
+                f"Config file '{path}': git_ops.local_only: true requires every entry in "
+                f"repos: to set an explicit default_branch:. Missing on: "
+                f"{', '.join(sorted(missing_default_branch))}. There is no origin to fall "
+                "back to in local-only mode."
+            )
+
+    # Populate DebugConfig from YAML debug block (absent keys yield None).
+    debug_raw = raw.get("debug") or {}
+    debug = DebugConfig(
+        check_registration_retries=debug_raw.get("check_registration_retries"),
+        check_registration_delay_seconds=debug_raw.get("check_registration_delay_seconds"),
+        blocked_recovery_window_seconds=debug_raw.get("blocked_recovery_window_seconds"),
     )
 
     # Populate ReportConfig from YAML report block.
@@ -535,6 +840,9 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         ),
         data_residency_multiplier=(
             float(report_raw["data_residency_multiplier"]) if "data_residency_multiplier" in report_raw else None
+        ),
+        fast_mode_multiplier=(
+            float(report_raw["fast_mode_multiplier"]) if "fast_mode_multiplier" in report_raw else None
         ),
         recent_pace_tasks=(int(report_raw["recent_pace_tasks"]) if "recent_pace_tasks" in report_raw else None),
         token_cost_discount=(float(report_raw["token_cost_discount"]) if "token_cost_discount" in report_raw else None),
@@ -573,6 +881,16 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
             "Task-factory runs from the amendment-reject path; it has nothing to do when amendments are off."
         )
 
+    # Populate ValidateConfig from YAML validate block. All toggles default
+    # to False so existing backlogs see no behaviour change.
+    validate_raw = raw.get("validate") or {}
+    default_validate = ValidateConfig()
+    validate_cfg = ValidateConfig(
+        check_orphan_path_tokens=bool(
+            validate_raw.get("check_orphan_path_tokens", default_validate.check_orphan_path_tokens)
+        ),
+    )
+
     # Populate StopHookConfig from YAML stop_hook block.
     stop_hook_raw = raw.get("stop_hook") or {}
     stop_hook = StopHookConfig(
@@ -587,6 +905,30 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         ),
     )
 
+    # Populate HookTailConfig from YAML hook_tail block (issue #134).
+    # JSONSchema enforces minimum:1 + additionalProperties:false at parse
+    # time; absent fields stay None so config.py applies the env > default
+    # fallback chain.
+    hook_tail_raw = raw.get("hook_tail") or {}
+    hook_tail = HookTailConfig(
+        agent_width=(int(hook_tail_raw["agent_width"]) if "agent_width" in hook_tail_raw else None),
+        tool_width=(int(hook_tail_raw["tool_width"]) if "tool_width" in hook_tail_raw else None),
+        description_max=(int(hook_tail_raw["description_max"]) if "description_max" in hook_tail_raw else None),
+        stdout_preview_max=(
+            int(hook_tail_raw["stdout_preview_max"]) if "stdout_preview_max" in hook_tail_raw else None
+        ),
+    )
+
+    # Populate OrchestrateConfig from YAML orchestrate block (issue #144).
+    # Schema enforces minimum:1; absent field stays None so config.py
+    # applies the env > default fallback chain.
+    orchestrate_raw = raw.get("orchestrate") or {}
+    orchestrate = OrchestrateConfig(
+        max_cascade_depth=(
+            int(orchestrate_raw["max_cascade_depth"]) if "max_cascade_depth" in orchestrate_raw else None
+        ),
+    )
+
     return RuntimeConfig(
         repos=repos,
         timeouts=timeouts,
@@ -594,8 +936,12 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         git_ops=git_ops,
         report=report,
         stop_hook=stop_hook,
+        hook_tail=hook_tail,
+        orchestrate=orchestrate,
         manifest_amendment=manifest_amendment,
         task_factory=task_factory,
+        validate=validate_cfg,
+        debug=debug,
         allowed_orgs=allowed_orgs,
         judge_model=raw.get("judge_model") or None,
         executor_model=raw.get("executor_model") or None,
@@ -603,7 +949,9 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         bedrock_region=raw.get("bedrock_region") or None,
         merge_strategy=raw.get("merge_strategy") or None,
         max_executor_retries=raw.get("max_executor_retries") or None,
+        max_executor_retries_per_judge=_load_per_judge_retries(raw.get("max_executor_retries_per_judge")),
         display_timezone=raw.get("display_timezone") or None,
+        log_file=raw.get("log_file") or None,
     )
 
 
@@ -611,8 +959,9 @@ def get_repo_local_path(repo: str, runtime_config: RuntimeConfig, workspace_root
     """Return the local filesystem path for *repo*.
 
     Resolution order:
-    1. ``repos.<repo>.checkout_directory`` resolved relative to *workspace_root*.
-    2. ``workspace_root / <repo-short-name>`` (the part after the ``/`` in ``org/repo``).
+    1. ``RepoConfig.resolved_checkout_path`` populated by the loader (E213).
+    2. ``repos.<repo>.checkout_directory`` resolved relative to *workspace_root*.
+    3. ``workspace_root / <repo-short-name>`` (the part after the ``/`` in ``org/repo``).
 
     Pure function -- no subprocess calls, no I/O.
 
@@ -625,6 +974,8 @@ def get_repo_local_path(repo: str, runtime_config: RuntimeConfig, workspace_root
         Absolute path to the local checkout directory.
     """
     repo_config = runtime_config.repos.get(repo)
+    if repo_config and repo_config.resolved_checkout_path is not None:
+        return repo_config.resolved_checkout_path
     if repo_config and repo_config.checkout_directory:
         return workspace_root / repo_config.checkout_directory
     short_name = repo.split("/", maxsplit=1)[1] if "/" in repo else repo

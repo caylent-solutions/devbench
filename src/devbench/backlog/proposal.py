@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
 import json
 import logging
 import re
@@ -36,8 +37,10 @@ from devbench.constants import (
     COMMENT_AGENT_TEMPLATE,
     COMMENT_TIMESTAMP_FORMAT,
     COMMENTS_SECTION_HEADER,
+    DEFAULT_BLOCKED_RECOVERY_WINDOW_SECONDS,
     STATUS_DECLINED,
     STATUS_DONE,
+    STATUS_HOLD,
     STATUS_IN_QUEUE,
     STATUS_PROPOSED,
 )
@@ -133,38 +136,148 @@ def classify_proposed_task(backlog_root: Path, workspace_root: Path, suggested_i
 
 
 class BlockedTaskState(Enum):
-    """Lifecycle classifier for ``blocked`` work units (ADR-10 companion to ADR-08).
+    """Lifecycle classifier for ``blocked`` work units (3-state, post Part-1).
 
-    Separates blocked tasks the operator should engage with from blocked
-    tasks the ADR-07 auto-requeue cascade will resolve on its own.
+    Three buckets, ordered by what an operator should do about each:
 
     - ``AUTO_CLEARING_VIA_PROPOSAL`` -- carries at least one
       ``[BLOCKED_PENDING_PROPOSAL]`` marker whose targets all exist in the
-      backlog AND at least one of which is non-terminal. The cascade fires
-      the moment every marker target reaches ``done`` / ``declined``.
-    - ``NEEDS_OPERATOR_ATTENTION`` -- everything else. No markers, OR some
-      marker targets are unknown to the backlog, OR every marker is already
-      terminal (cascade should have fired already and did not -- diagnostic
-      signal worth surfacing).
+      backlog AND at least one of which is non-terminal. The ADR-07
+      cascade fires the moment every marker target reaches ``done`` /
+      ``declined``. Operator does nothing.
+    - ``AWAITING_AUTO_RECOVERY`` -- no marker yet, but at least one
+      recovery signal is present on disk: a pending proposal JSON
+      (blocker-resolver wrote it; task-factory will materialise +
+      promote it), or a rejected-amendment archive (manifest-amender
+      rejected; blocker-resolver runs next), or a recent ``[BLOCKED]``
+      audit comment from one of the recovery agents. The orchestrator's
+      next sweep cycle will advance the task into ``AUTO_CLEARING_VIA_PROPOSAL``
+      (or further). Operator does nothing for now.
+    - ``NEEDS_OPERATOR_ATTENTION`` -- the true halt list: no marker, no
+      recovery signal, OR a marker that points at an unknown ID (cascade
+      cannot resolve), OR every marker is already terminal (cascade
+      should have fired and did not). Manual blockers (``DO NOT CLAIM``)
+      land here.
     """
 
     AUTO_CLEARING_VIA_PROPOSAL = "auto-clearing"
+    AWAITING_AUTO_RECOVERY = "awaiting-recovery"
     NEEDS_OPERATOR_ATTENTION = "needs-attention"
+
+
+# Recovery audit-comment heuristics. Used by ``classify_blocked_task``
+# when no [BLOCKED_PENDING_PROPOSAL] marker is present yet but the
+# orchestrator's loop has logged a recent block from one of the recovery
+# agents -- that is, devbench WILL run blocker-resolver / task-factory
+# on the next iteration. The agent-tag and body-pattern allowlists keep
+# the heuristic narrow so unrelated [BLOCKED] comments do not trigger.
+_RECOVERY_AGENT_TAGS: frozenset[str] = frozenset(
+    {"agent/orchestrator", "agent/blocker_resolver", "agent/manifest_amender"}
+)
+_RECOVERY_BODY_RE: re.Pattern[str] = re.compile(
+    r"amendment-reject|out-of-scope|ALL_REVIEWS_FAILED|REVIEW_REJECTED",
+    re.IGNORECASE,
+)
+_BLOCKED_AUDIT_RE: re.Pattern[str] = re.compile(
+    r"\[(?P<ts>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s+UTC)\]\s+\[(?P<agent>[^\]]+)\]\s+\[BLOCKED\]\s+(?P<body>.+)",
+)
+
+
+def _has_pending_proposal_json(workspace_root: Path, task_id: str) -> bool:
+    """Recovery signal #1: blocker-resolver has already written a proposal.
+
+    True iff ``<workspace>/.devbench/proposals/<task_id>.json`` exists.
+    Task-factory will materialise + promote it on the next sweep cycle.
+    """
+    return proposal_path(workspace_root, task_id).is_file()
+
+
+def _has_rejected_amendment_archive(workspace_root: Path, task_id: str) -> bool:
+    """Recovery signal #2: manifest-amender has archived a rejected amendment.
+
+    True iff any ``<workspace>/.devbench/rejected-requests/<task_id>-*.json``
+    exists. Blocker-resolver reads the archive on its next iteration to
+    decide what fix proposal to emit (see ``REJECTED_REQUESTS_DIR_NAME``
+    in ``amendment.py`` -- the canonical constant kept here as a lazy
+    import to avoid a circular dependency through the manager module).
+    """
+    from devbench.backlog.amendment import REJECTED_REQUESTS_DIR_NAME
+
+    archive_dir = workspace_root / REJECTED_REQUESTS_DIR_NAME
+    if not archive_dir.is_dir():
+        return False
+    pattern = f"{task_id}-*.json"
+    return any(archive_dir.glob(pattern))
+
+
+def _recent_recovery_audit_comment(source_file: Path, now: datetime, window_seconds: int) -> bool:
+    """Recovery signal #3: a recent ``[BLOCKED]`` audit row from a recovery agent.
+
+    Walks the work-unit's Comments section, finds the most recent
+    ``[<ts>] [<agent>] [BLOCKED] <body>`` line, and returns True iff the
+    timestamp is within ``window_seconds`` of ``now`` AND the agent tag
+    is one of the canonical recovery agents AND the body matches the
+    recovery-cause regex (amendment-reject / out-of-scope /
+    ALL_REVIEWS_FAILED / REVIEW_REJECTED). Excludes the
+    ``[BLOCKED_PENDING_PROPOSAL]`` marker rows since those represent
+    cascade state, not pending recovery.
+
+    Returns False on any failure (file missing, malformed timestamp,
+    no Comments section) -- the caller treats that as "no recovery
+    signal" rather than masking it with a synthetic state.
+    """
+    if not source_file.is_file():
+        return False
+    content = source_file.read_text(encoding="utf-8")
+    most_recent: tuple[datetime, str, str] | None = None
+    for line in content.splitlines():
+        if "[BLOCKED_PENDING_PROPOSAL]" in line:
+            continue
+        match = _BLOCKED_AUDIT_RE.search(line)
+        if match is None:
+            continue
+        try:
+            ts = datetime.strptime(match.group("ts"), "%Y-%m-%d %H:%M UTC").replace(tzinfo=UTC)
+        except ValueError:
+            continue
+        if most_recent is None or ts > most_recent[0]:
+            most_recent = (ts, match.group("agent").strip(), match.group("body").strip())
+    if most_recent is None:
+        return False
+    ts, agent, body = most_recent
+    if (now - ts).total_seconds() > window_seconds:
+        return False
+    if agent not in _RECOVERY_AGENT_TAGS:
+        return False
+    return bool(_RECOVERY_BODY_RE.search(body))
 
 
 def classify_blocked_task(
     backlog_root: Path,
     backlog_index: Path,
     task_id: str,
+    *,
+    workspace_root: Path | None = None,
+    now: datetime | None = None,
+    recovery_window_seconds: int | None = None,
 ) -> BlockedTaskState:
-    """Classify ``task_id`` as auto-clearing vs needs-operator-attention.
+    """Classify ``task_id`` into one of the three blocked-task states.
 
     Caller is responsible for having already determined the task is
     currently in ``blocked`` status; this function does not re-check status.
 
-    Reuses :meth:`BacklogManager._extract_pending_proposal_markers` and
-    :meth:`BacklogManager._parse_backlog_rows` so the classification logic
-    stays in lockstep with the ADR-07 cascade's own view of marker state.
+    The classifier returns ``AUTO_CLEARING_VIA_PROPOSAL`` when the
+    standard cascade conditions are met. When no marker is present, it
+    checks three recovery signals (pending proposal JSON, rejected-
+    amendment archive, recent recovery audit comment) and returns
+    ``AWAITING_AUTO_RECOVERY`` if any signal is positive. Everything
+    else falls through to ``NEEDS_OPERATOR_ATTENTION``.
+
+    The optional ``workspace_root`` enables the recovery checks (they
+    read ``.devbench/proposals/`` and ``.devbench/rejected-requests/``).
+    Older callers that only have ``backlog_root`` + ``backlog_index``
+    keep the original two-state behaviour. Production callers always
+    pass ``workspace_root``.
     """
     source_file = _find_source_task_file(backlog_root, backlog_index, task_id)
     if source_file is None:
@@ -172,9 +285,70 @@ def classify_blocked_task(
 
     mgr = BacklogManager()
     marker_ids = mgr._extract_pending_proposal_markers(source_file)
-    if not marker_ids:
-        return BlockedTaskState.NEEDS_OPERATOR_ATTENTION
 
+    # Issue #149: when markers are absent OR every marker is already terminal
+    # (i.e. the cascade has nothing left to do), regular task-level
+    # dependencies still in flight should keep the task in
+    # AWAITING_AUTO_RECOVERY rather than escalating to NEEDS_OPERATOR_ATTENTION.
+    # Only when the markers are closed AND the regular deps are satisfied
+    # do we surface the task to the operator-attention pile.
+    deps_unsatisfied = _regular_deps_unsatisfied(backlog_root, backlog_index, task_id)
+
+    if marker_ids:
+        marker_state = _classify_with_markers(mgr, backlog_index, marker_ids)
+        if marker_state is BlockedTaskState.NEEDS_OPERATOR_ATTENTION and deps_unsatisfied:
+            return BlockedTaskState.AWAITING_AUTO_RECOVERY
+        return marker_state
+
+    if deps_unsatisfied:
+        return BlockedTaskState.AWAITING_AUTO_RECOVERY
+
+    return _classify_recovery_or_attention(
+        source_file=source_file,
+        task_id=task_id,
+        workspace_root=workspace_root,
+        now=now,
+        recovery_window_seconds=recovery_window_seconds,
+    )
+
+
+def _regular_deps_unsatisfied(backlog_root: Path, backlog_index: Path, task_id: str) -> bool:
+    """Return ``True`` iff ``task_id``'s declared dependencies are NOT all terminal.
+
+    Issue #149: ``classify_blocked_task`` consults this to keep tasks whose
+    regular task-level deps are still running in ``AWAITING_AUTO_RECOVERY``
+    rather than incorrectly promoting them to the operator-attention pile.
+    Falls back to ``False`` (deps satisfied) when the parser cannot load
+    the index -- the broken-index case is reported by validate-backlog and
+    must not generate spurious operator alerts here.
+    """
+    try:
+        parser = BacklogParser(backlog_root=backlog_root, backlog_index=backlog_index)
+        units = parser.parse_index()
+    except (FileNotFoundError, ValueError):
+        return False
+    units_by_id = {u.id: u for u in units}
+    target = units_by_id.get(task_id)
+    if target is None:
+        return False
+    return not BacklogParser._deps_satisfied(target, units_by_id)
+
+
+def _classify_with_markers(
+    mgr: BacklogManager,
+    backlog_index: Path,
+    marker_ids: set[str],
+) -> BlockedTaskState:
+    """Resolve AUTO_CLEARING_VIA_PROPOSAL vs NEEDS_OPERATOR_ATTENTION when markers exist.
+
+    Extracted so ``classify_blocked_task`` stays under ruff's PLR0911
+    return-statement ceiling. Returns NEEDS_OPERATOR_ATTENTION when
+    the backlog index is missing, when any marker target is unknown,
+    when any marker target is in HOLD (operator-held; cascade cannot
+    fire while the target is non-terminal and HOLD is non-terminal),
+    or when every marker is already terminal (cascade should have
+    fired and did not). Otherwise the cascade is in flight.
+    """
     try:
         rows = mgr._parse_backlog_rows(backlog_index)
     except FileNotFoundError:
@@ -185,20 +359,146 @@ def classify_blocked_task(
     non_terminal_marker_found = False
     for marker in marker_ids:
         if marker not in status_by_id:
-            # Marker points at an ID that is no longer in the backlog -- the
-            # cascade cannot resolve this. Operator attention required.
+            return BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+        # Issue #168 (3-panel surfacing): a HOLD marker target means the
+        # operator placed the dep on hold deliberately. The cascade cannot
+        # fire (HOLD is non-terminal) and no automation will clear it.
+        # Surface to operator-attention so the report reflects reality.
+        if status_by_id[marker] == STATUS_HOLD:
             return BlockedTaskState.NEEDS_OPERATOR_ATTENTION
         if status_by_id[marker] not in terminal:
             non_terminal_marker_found = True
 
     if not non_terminal_marker_found:
-        # Every marker is already terminal; cascade should have fired. It
-        # did not (otherwise this task would not still be blocked). Flag
-        # for operator review -- something went wrong or this task carries
-        # an extra non-cascade blocker the operator needs to address.
         return BlockedTaskState.NEEDS_OPERATOR_ATTENTION
-
     return BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL
+
+
+def panel3_annotation(
+    backlog_root: Path,
+    backlog_index: Path,
+    task_id: str,
+) -> tuple[int, str | None, str]:
+    """Return (group_rank, hold_target_id, annotation) for a panel-3 row.
+
+    Used by the reporter to render BLOCKED tasks routed to
+    ``NEEDS_OPERATOR_ATTENTION`` with a sub-case-specific annotation
+    AND a sort key that clusters rows by cause.
+
+    Group ranks (lower sorts first):
+
+    - 1 -- BLOCKED waiting on a HOLD unit (annotation ``[HOLD: <id>]``)
+    - 2 -- no marker present (annotation ``[no marker]``)
+    - 3 -- marker target unknown to backlog index (annotation
+      ``[marker target unknown: <id>]``)
+    - 4 -- marker targets all terminal; cascade should have fired
+      (annotation ``[marker targets all terminal]``)
+    - 5 -- fallback when none of the above match (annotation
+      ``[needs review]``)
+
+    Group rank 0 is reserved for HOLD work units themselves (the
+    reporter inserts those directly without calling this helper).
+
+    Pure read; never mutates the backlog.
+    """
+    return _panel3_annotation_impl(backlog_root, backlog_index, task_id)
+
+
+def _panel3_annotation_impl(
+    backlog_root: Path,
+    backlog_index: Path,
+    task_id: str,
+) -> tuple[int, str | None, str]:
+    """Implementation split out so ``panel3_annotation`` keeps its public
+    signature stable while the branch logic stays under ruff's PLR0911
+    return-statement ceiling.
+    """
+    source_file = _find_source_task_file(backlog_root, backlog_index, task_id)
+    if source_file is None:
+        return (5, None, "[needs review]")
+
+    mgr = BacklogManager()
+    marker_ids = mgr._extract_pending_proposal_markers(source_file)
+    if not marker_ids:
+        return (2, None, "[no marker]")
+
+    try:
+        rows = mgr._parse_backlog_rows(backlog_index)
+    except FileNotFoundError:
+        return (5, None, "[needs review]")
+    status_by_id = {row_id: status for row_id, status, _ in rows if row_id}
+
+    sorted_markers = sorted(marker_ids)
+    return _panel3_classify_markers(sorted_markers, status_by_id)
+
+
+def _panel3_classify_markers(
+    sorted_markers: list[str],
+    status_by_id: dict[str, str],
+) -> tuple[int, str | None, str]:
+    """Classify a sorted marker-id list against the backlog index into
+    one of the panel-3 sub-cases. Returns ``(group_rank, hold_target_id,
+    annotation)``."""
+    hold_match = next((m for m in sorted_markers if status_by_id.get(m) == STATUS_HOLD), None)
+    if hold_match is not None:
+        return (1, hold_match, f"[HOLD: {hold_match}]")
+
+    unknown_match = next((m for m in sorted_markers if m not in status_by_id), None)
+    if unknown_match is not None:
+        return (3, None, f"[marker target unknown: {unknown_match}]")
+
+    terminal = {STATUS_DONE, STATUS_DECLINED}
+    if all(status_by_id[m] in terminal for m in sorted_markers):
+        return (4, None, "[marker targets all terminal]")
+
+    return (5, None, "[needs review]")
+
+
+def _classify_recovery_or_attention(
+    *,
+    source_file: Path,
+    task_id: str,
+    workspace_root: Path | None,
+    now: datetime | None,
+    recovery_window_seconds: int | None,
+) -> BlockedTaskState:
+    """Resolve AWAITING_AUTO_RECOVERY vs NEEDS_OPERATOR_ATTENTION when no marker exists.
+
+    Older callers that pass no ``workspace_root`` get
+    NEEDS_OPERATOR_ATTENTION immediately (legacy two-state behaviour).
+    The three recovery signals are checked cheapest-first: file-presence
+    > glob-match > timestamp-window read of the source file.
+    """
+    if workspace_root is None:
+        return BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+    if _has_pending_proposal_json(workspace_root, task_id):
+        return BlockedTaskState.AWAITING_AUTO_RECOVERY
+    if _has_rejected_amendment_archive(workspace_root, task_id):
+        return BlockedTaskState.AWAITING_AUTO_RECOVERY
+    effective_now = now if now is not None else datetime.now(UTC)
+    effective_window = (
+        recovery_window_seconds if recovery_window_seconds is not None else DEFAULT_BLOCKED_RECOVERY_WINDOW_SECONDS
+    )
+    if _recent_recovery_audit_comment(source_file, effective_now, effective_window):
+        return BlockedTaskState.AWAITING_AUTO_RECOVERY
+    return BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+
+
+def recovery_signal_for_task(workspace_root: Path, task_id: str) -> str:
+    """Return a one-line annotation naming the recovery signal source.
+
+    Used by the report renderer to annotate ``AWAITING_AUTO_RECOVERY``
+    rows with a ``[recovery: ...]`` suffix so operators see WHY devbench
+    thinks the task will recover. Falls back to the audit-comment label
+    when neither the pending-proposal JSON nor the rejected-amendment
+    archive is present (the classifier already decided this task
+    qualifies; this helper only labels it).
+    """
+    if _has_pending_proposal_json(workspace_root, task_id):
+        return f"pending proposal at .devbench/proposals/{task_id}.json"
+    if _has_rejected_amendment_archive(workspace_root, task_id):
+        return f"rejected-requests archive at .devbench/rejected-requests/{task_id}-*.json"
+    return "recent [BLOCKED] audit comment from a recovery agent"
 
 
 def _read_draft_status(draft_path: Path) -> str:
@@ -262,6 +562,18 @@ class Proposal:
     rejection_reason: str
     proposed_tasks: list[ProposedTask]
     affected_task_ids: list[str] = field(default_factory=list)
+    source_dep_direction: str = ""
+    # Issue #141: stable hash over (target_repo, sorted(files_to_own),
+    # normalised intent_phrase) -- empty string for proposals authored
+    # before the dedup feature shipped. Set by cmd_write_proposal at
+    # emission time so the next blocker-resolver invocation finds a
+    # match cheaply.
+    fix_signature: str = ""
+    # Issue #144: depth in the recovery cascade. Depth 0 = first-class
+    # recovery (the source task is a "real" backlog task that surfaced a
+    # blocker). Depth N+1 = parent's depth + 1. Configurable cap via
+    # `orchestrate.max_cascade_depth` YAML field.
+    cascade_depth: int = 0
 
     def to_dict(self) -> dict:
         """JSON-serialisable form used for on-disk storage."""
@@ -271,6 +583,9 @@ class Proposal:
             "rejection_reason": self.rejection_reason,
             "proposed_tasks": [asdict(t) for t in self.proposed_tasks],
             "affected_task_ids": list(self.affected_task_ids),
+            "source_dep_direction": self.source_dep_direction,
+            "fix_signature": self.fix_signature,
+            "cascade_depth": self.cascade_depth,
         }
 
     @classmethod
@@ -312,6 +627,28 @@ class Proposal:
 
         source_id = str(data["source_task_id"]).strip()
         affected = _parse_affected_task_ids(data.get("affected_task_ids", []), source_id)
+        # source_dep_direction is optional; "" preserves default behavior
+        # (source.depends_on(new)). "test_validates_source" inverts the
+        # auto-wired dep so the test waits on the source. See
+        # docs/task-factory.md "When to use --no-dep-on-source".
+        source_dep_direction = str(data.get("source_dep_direction", "")).strip()
+        if source_dep_direction not in ("", "test_validates_source"):
+            raise ValueError(
+                f"Proposal.source_dep_direction must be empty or 'test_validates_source'; got {source_dep_direction!r}"
+            )
+
+        # Issue #141 / #144: optional fix_signature + cascade_depth. Absent
+        # in proposals authored before these features shipped (forward-compat).
+        fix_signature = str(data.get("fix_signature", "") or "")
+        cascade_depth_raw = data.get("cascade_depth", 0)
+        try:
+            cascade_depth = int(cascade_depth_raw or 0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Proposal.cascade_depth must be a non-negative integer; got {cascade_depth_raw!r}"
+            ) from exc
+        if cascade_depth < 0:
+            raise ValueError(f"Proposal.cascade_depth must be >= 0; got {cascade_depth}")
 
         return cls(
             source_task_id=source_id,
@@ -319,6 +656,9 @@ class Proposal:
             rejection_reason=str(data["rejection_reason"]),
             proposed_tasks=tasks,
             affected_task_ids=affected,
+            source_dep_direction=source_dep_direction,
+            fix_signature=fix_signature,
+            cascade_depth=cascade_depth,
         )
 
 
@@ -353,6 +693,231 @@ def _parse_affected_task_ids(raw: object, source_id: str) -> list[str]:
 
 class ProposalError(RuntimeError):
     """Raised when a proposal cannot be processed."""
+
+
+class CascadeDepthError(RuntimeError):
+    """Raised when a proposal would exceed ``orchestrate.max_cascade_depth``.
+
+    Issue #144. Caught by ``cmd_materialise_proposal`` to escalate the
+    source task to ``NEEDS_OPERATOR_ATTENTION`` instead of materialising
+    another recovery layer. Living-on-its-own exception class so callers
+    can ``except CascadeDepthError`` without coupling to the broader
+    ``ProposalError`` family.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Dedup-signature helpers (issue #141)
+# ---------------------------------------------------------------------------
+
+# Verbs that signal "fix the spec / Manifest / placeholder" so the intent
+# phrase normalises to a stable key. Order matters: longer matches first
+# so "drop-row" beats "drop". Each entry maps a regex pattern (matched
+# against lower-cased Approach text) -> normalised intent token.
+_INTENT_VERB_PATTERNS: tuple[tuple[str, str], ...] = (
+    (r"\bremove\s+the\s+\S+\s+row\b", "remove-row"),
+    (r"\bdelete\s+the\s+\S+\s+entry\b", "delete-entry"),
+    (r"\bdrop\s+the\s+conflicting\s+manifest\s+row\b", "drop-conflict-row"),
+    (r"\bcorrect\s+the\s+manifest\s+table\b", "correct-manifest"),
+    (r"\bfix\s+the\s+changes\s+manifest\b", "fix-manifest"),
+    (r"\buntrack\s+\S+", "untrack"),
+    (r"\badd\s+\S+\s+to\s+\.gitignore\b", "gitignore-add"),
+    (r"\bregister\s+\S+\s+marker\b", "register-marker"),
+    (r"\bfix\s+\S+\s+placeholder\b", "fix-placeholder"),
+    (r"\bremove\s+\S+", "remove"),
+    (r"\bdelete\s+\S+", "delete"),
+    (r"\bfix\s+\S+", "fix"),
+    (r"\badd\s+\S+", "add"),
+)
+
+
+def _extract_intent_phrase(approach_text: str) -> str:
+    """Return a normalised verb-noun token for the proposal's Approach text.
+
+    Pure regex; no LLM. Used as part of the dedup ``fix_signature`` so
+    two recovery proposals with the same target_repo + files_to_own +
+    semantic intent collapse to the same signature.
+
+    Falls back to ``"generic"`` when no verb pattern matches; that keeps
+    the signature stable for proposals whose Approach is too vague to
+    classify rather than producing an unhashable ``None``.
+    """
+    if not approach_text:
+        return "generic"
+    text = approach_text.lower()
+    for pattern, token in _INTENT_VERB_PATTERNS:
+        if re.search(pattern, text):
+            return token
+    return "generic"
+
+
+def _compute_fix_signature(target_repo: str, files_to_own: list[str], intent_phrase: str) -> str:
+    """Compute the dedup signature (issue #141).
+
+    SHA-256 over the canonical tuple
+    ``(target_repo, sorted(files_to_own), intent_phrase)``. Returns the
+    full 64-char hex digest; callers truncate to the first 16 chars when
+    rendering for human display, but the full digest is stored on disk
+    so collision risk is operationally negligible.
+
+    Pure function: deterministic, no I/O, no clock or random source.
+    """
+    canonical = json.dumps(
+        {
+            "target_repo": target_repo,
+            "files_to_own": sorted(files_to_own),
+            "intent_phrase": intent_phrase,
+        },
+        sort_keys=True,
+        ensure_ascii=True,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class ProposalMatch:
+    """Result of ``find_matching_pending_proposal``.
+
+    Attributes:
+        proposal_path: Absolute path to the matching proposal JSON on disk.
+        source_task_id: The source-task ID associated with the existing
+            proposal (the task that already has its dep edge wired by
+            promote-proposal). Callers add their new source task as an
+            additional dep edge pointing at this ID.
+        fix_signature: The matching signature (echo of the query).
+    """
+
+    proposal_path: Path
+    source_task_id: str
+    fix_signature: str
+
+
+def find_matching_pending_proposal(workspace_root: Path, signature: str) -> ProposalMatch | None:
+    """Scan ``.devbench/proposals/*.json`` for a proposal whose
+    ``fix_signature`` matches ``signature``. Returns the first match (or
+    None when no match exists).
+
+    Issue #141: this is the generalisation of the orphan-cleanup reuse
+    pattern at ``cli.py:1918-1957``. The orphan path scans for an
+    overlapping detection set; this generalised path scans for a stable
+    structural hash. Both share the same operator-visible outcome:
+    instead of emitting a duplicate recovery task, the new source task
+    gets a dep edge wired pointing at the existing recovery.
+
+    Pure read; never mutates disk. Stale proposals on disk whose source
+    task is in a terminal state (``done`` / ``declined``) are skipped --
+    determined by re-reading the source task's `## Status:` line. Empty
+    or invalid signatures (the empty string) never match.
+    """
+    if not signature:
+        return None
+    proposals_dir = workspace_root / ".devbench" / "proposals"
+    if not proposals_dir.is_dir():
+        return None
+    for proposal_file in sorted(proposals_dir.glob("*.json")):
+        try:
+            payload = json.loads(proposal_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        candidate_sig = payload.get("fix_signature", "")
+        if candidate_sig != signature:
+            continue
+        source_id = str(payload.get("source_task_id", "")).strip()
+        if not source_id:
+            continue
+        # Skip if the existing source task is in a terminal state -- the
+        # proposal is stale (operator declined; or the proposal was
+        # never promoted and the source task moved on).
+        if _source_task_in_terminal_state(workspace_root, source_id):
+            continue
+        return ProposalMatch(
+            proposal_path=proposal_file.resolve(),
+            source_task_id=source_id,
+            fix_signature=signature,
+        )
+    return None
+
+
+def _source_task_in_terminal_state(workspace_root: Path, source_task_id: str) -> bool:
+    """Return True iff ``<workspace>/backlog/.../<source_task_id>.md``
+    has ``## Status: done`` or ``## Status: declined``. Best-effort -- on
+    any read error, returns False so the dedup scanner does not skip a
+    legitimately-pending proposal."""
+    backlog_root = workspace_root / "backlog"
+    if not backlog_root.is_dir():
+        return False
+    for candidate in backlog_root.rglob(f"{source_task_id}.md"):
+        try:
+            text = candidate.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            stripped = line.strip().lower()
+            if stripped.startswith("## status:"):
+                status = stripped.split(":", 1)[1].strip()
+                return status in {"done", "declined"}
+        return False
+    return False
+
+
+def enforce_cascade_depth(proposal_payload: dict, max_depth: int) -> None:
+    """Issue #144: raise ``CascadeDepthError`` when the proposal's
+    ``cascade_depth`` is at or above ``max_depth``.
+
+    Pure validator; called by ``cmd_materialise_proposal`` before writing
+    a draft. ``max_depth`` is resolved env > YAML > default
+    (``DEFAULT_MAX_CASCADE_DEPTH``) by the caller; this helper assumes
+    ``max_depth >= 1`` (schema enforces).
+    """
+    raw_depth = proposal_payload.get("cascade_depth", 0)
+    try:
+        depth = int(raw_depth or 0)
+    except (TypeError, ValueError) as exc:
+        raise CascadeDepthError(f"proposal cascade_depth must be an integer; got {raw_depth!r}") from exc
+    if depth >= max_depth:
+        raise CascadeDepthError(
+            f"proposal cascade_depth={depth} reached or exceeded "
+            f"orchestrate.max_cascade_depth={max_depth}; escalating to "
+            "operator attention instead of materialising another recovery layer"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TODO/TBD placeholder rejection (issue #143)
+# ---------------------------------------------------------------------------
+
+_PLACEHOLDER_PATTERNS: tuple[str, ...] = ("todo", "tbd")
+
+
+def detect_placeholder_descriptions(proposal: Proposal) -> list[str]:
+    """Return a list of human-readable error fragments for every
+    proposed-task description that is empty / TODO / TBD / whitespace.
+
+    Issue #143: ``cmd_materialise_proposal`` calls this BEFORE writing a
+    draft. Empty list = clean to materialise. Non-empty list = reject
+    with the joined messages.
+
+    The check inspects ``ProposedTask.suggested_approach`` (the
+    "description" surface in our schema -- the Approach text becomes the
+    work-unit's description). It does NOT re-check Manifest rows here;
+    those are auto-generated from ``files_to_own`` at materialisation
+    time, and the existing ``validate-backlog`` rule (issue #117)
+    already catches the "TODO -- describe change" pattern in the
+    rendered Manifest table on the next sweep.
+    """
+    issues: list[str] = []
+    for task in proposal.proposed_tasks:
+        approach = task.suggested_approach.strip()
+        if not approach:
+            issues.append(f"task {task.suggested_id}: suggested_approach is empty / whitespace-only")
+            continue
+        lowered = approach.lower()
+        if any(lowered == p or lowered.startswith(p + " ") for p in _PLACEHOLDER_PATTERNS):
+            issues.append(
+                f"task {task.suggested_id}: suggested_approach is a placeholder ({approach[:60]!r}); "
+                "fill in a concrete description before promoting"
+            )
+    return issues
 
 
 # ---------------------------------------------------------------------------

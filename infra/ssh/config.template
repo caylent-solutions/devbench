@@ -1,0 +1,22 @@
+# Devbench-remote SSH-over-SSM config snippet.
+#
+# Copy this stanza into your local ~/.ssh/config (replace the User if needed).
+# After `aws sso login --profile <your-profile>`, you can run
+# `ssh i-1234567890abcdef0` and it tunnels via SSM with no public ingress.
+#
+# AWS_PROFILE is honoured by the aws-cli ProxyCommand; export the right
+# profile before running ssh.
+
+Host i-* mi-*
+    # The user is overridden per-target (e.g. <linux-user>@i-xxx); the line below is just a fallback.
+    User ubuntu
+    # Set DEVBENCH_SSH_KEY in your shell to point at the private key matching your
+    # AWS console-managed key pair, then pass `-i "$DEVBENCH_SSH_KEY"` on the ssh
+    # CLI -- or symlink ~/.ssh/devbench_remote -> the right file and uncomment:
+    # IdentityFile ~/.ssh/devbench_remote
+    # IdentitiesOnly yes
+    ProxyCommand sh -c "aws ssm start-session --target %h --document-name AWS-StartSSHSession --parameters portNumber=%p"
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    ServerAliveInterval 60
+    ServerAliveCountMax 3

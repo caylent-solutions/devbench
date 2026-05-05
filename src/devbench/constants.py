@@ -70,11 +70,12 @@ DISPLAY_STATUS_VALUES: list[str] = [
     "Blocked",
     "Proposed",
     "Declined",
+    "Hold",
 ]
 
 # Backlog manager recognized status labels (title-case, as in markdown tables)
 TABLE_STATUS_VALUES: frozenset[str] = frozenset(
-    {"In Queue", "In Progress", "In Review", "Done", "Blocked", "Proposed", "Declined"}
+    {"In Queue", "In Progress", "In Review", "Done", "Blocked", "Proposed", "Declined", "Hold"}
 )
 
 # ---------------------------------------------------------------------------
@@ -136,6 +137,13 @@ STATUS_DONE: str = "done"
 STATUS_BLOCKED: str = "blocked"
 STATUS_PROPOSED: str = "proposed"
 STATUS_DECLINED: str = "declined"
+# Held units are deliberately deferred (under debate, awaiting external
+# decision). The orchestrator's next-query and parallel-candidate scan
+# both skip held units the same way they skip declined ones, but unlike
+# declined a held unit is non-terminal -- parent rollups do NOT count
+# held children as complete; an operator must explicitly unhold to
+# return the unit to the in-queue lifecycle.
+STATUS_HOLD: str = "hold"
 
 # Ordered mapping from any accepted input form to the canonical write form.
 # Used by BacklogManager._set_status() for validation and normalisation.
@@ -147,6 +155,7 @@ VALID_STATUSES: dict[str, str] = {
     STATUS_BLOCKED: STATUS_BLOCKED,
     STATUS_PROPOSED: STATUS_PROPOSED,
     STATUS_DECLINED: STATUS_DECLINED,
+    STATUS_HOLD: STATUS_HOLD,
 }
 
 # ---------------------------------------------------------------------------
@@ -187,6 +196,26 @@ SECURITY_JUDGE_NAMES: frozenset[str] = frozenset({"security_review"})
 
 ALL_REQUIRED_JUDGE_NAMES: frozenset[str] = REVIEW_JUDGE_NAMES | SECURITY_JUDGE_NAMES
 
+# Workflow agents that legitimately write audit-only verdicts via
+# ``log-verdict``. They are NOT counted by the done-gate's
+# ``_last_round_all_passed`` (only ``ALL_REQUIRED_JUDGE_NAMES`` is); the
+# entries land in the work-unit Comments section as audit metadata.
+# Mirrored in ``plugin/devbench/scripts/guard-verdict-format.sh``'s
+# ``KNOWN_JUDGES`` array; both lists must stay in sync.
+WORKFLOW_AGENT_JUDGE_NAMES: frozenset[str] = frozenset(
+    {
+        "executor",
+        "blocker_resolver",
+        "manifest_amender",
+        "task_factory",
+    }
+)
+
+# Full allowlist consumed by ``cmd_log_verdict``. Strictly broader than
+# ``ALL_REQUIRED_JUDGE_NAMES`` -- the canonical 5 reviewers satisfy the
+# done-gate; the workflow-agent names are audit-only.
+KNOWN_JUDGE_NAMES: frozenset[str] = ALL_REQUIRED_JUDGE_NAMES | WORKFLOW_AGENT_JUDGE_NAMES
+
 # ---------------------------------------------------------------------------
 # Non-verdict agent comment format template
 # ---------------------------------------------------------------------------
@@ -213,6 +242,110 @@ DEFAULT_GITHUB_CHECK_TIMEOUT_SECONDS: int = 600
 DEFAULT_STOP_HOOK_MAX_BLOCKS: int = 5
 DEFAULT_STOP_HOOK_WINDOW_SECONDS: int = 180
 DEFAULT_STOP_HOOK_STALE_TASK_MINUTES: int = 120
+# Hook-tail column caps (issue #134). Operator-tunable via env vars
+# (JUDGE_HOOK_TAIL_*) or YAML (`hook_tail.*` block). DESCRIPTION_MAX bumped
+# from 100 -> 120 in the same release that introduces the configurability.
+DEFAULT_HOOK_TAIL_AGENT_WIDTH: int = 12
+DEFAULT_HOOK_TAIL_TOOL_WIDTH: int = 8
+DEFAULT_HOOK_TAIL_DESCRIPTION_MAX: int = 120
+DEFAULT_HOOK_TAIL_STDOUT_PREVIEW_MAX: int = 80
+# Recovery-cascade depth cap (issue #144). Operator-tunable via
+# `orchestrate.max_cascade_depth` YAML or
+# `JUDGE_ORCHESTRATE_MAX_CASCADE_DEPTH` env var. When a proposal would
+# land at depth >= this cap, the source task transitions to
+# NEEDS_OPERATOR_ATTENTION instead of materialising another recovery
+# layer. Default empirically matches the longest healthy cascade
+# observed in production sessions.
+DEFAULT_MAX_CASCADE_DEPTH: int = 3
+# Workflow-registration race defence (issue #114). When `gh pr checks`
+# returns "no checks reported" right after a PR is created, devbench
+# cannot tell "repo has no CI configured" apart from "GitHub Actions
+# has not yet enqueued the workflow for this commit". The retry loop
+# (12 retries x 5s = 60s default coverage) handles the race; the
+# zero-workflow-files fast path skips the wait when the repo legitimately
+# has no CI. Both knobs override via JUDGE_CHECK_REGISTRATION_RETRIES /
+# JUDGE_CHECK_REGISTRATION_DELAY_SECONDS env vars.
+DEFAULT_CHECK_REGISTRATION_RETRIES: int = 12
+DEFAULT_CHECK_REGISTRATION_DELAY_SECONDS: int = 5
+# Recency cap for the "recent recovery audit comment" heuristic in the
+# 3-state blocked-task classifier (AWAITING_AUTO_RECOVERY signal #3).
+# Tasks whose most recent [BLOCKED] audit-comment timestamp is older
+# than this window fall through to NEEDS_OPERATOR_ATTENTION, even when
+# the agent-tag and body-pattern would otherwise match. 30 minutes
+# covers the gap between manifest-amender FAIL and blocker-resolver's
+# proposal write under normal orchestrator iteration cadence; tune via
+# JUDGE_BLOCKED_RECOVERY_WINDOW_SECONDS for slower / debugging runs.
+DEFAULT_BLOCKED_RECOVERY_WINDOW_SECONDS: int = 1800
+# When ``True``, ``cmd_git_ops`` runs ``cleanup_tracked_orphans`` inline as a
+# devbench-authored chore commit instead of emitting a backlog cleanup task.
+# Eliminates the orphan-cleanup-cascade pathology where multiple parent tasks
+# emit duplicate cleanup proposals, the cleanup tasks themselves get blocked by
+# the manifest amender on predecessor staging, and the orchestrator loops
+# without converging. Operators can fall back to the legacy proposal flow via
+# ``DEVBENCH_DISABLE_INLINE_ORPHAN_CLEANUP=1`` when an audit work-unit is
+# required for compliance reporting; the legacy path still runs but with
+# cross-task de-duplication so duplicate proposals cannot land.
+DEFAULT_INLINE_ORPHAN_CLEANUP_ENABLED: bool = True
+# Canonical commit message used by the inline orphan-cleanup path. Stable
+# string so post-merge audit tooling can grep for the chore commits without
+# parsing free-form prose. Keep in sync with the documented contract in
+# ``docs/backlog-contract.md``'s orphan-cleanup section.
+DEVBENCH_INLINE_CLEANUP_COMMIT_MESSAGE: str = (
+    "chore(cleanup): untrack devbench-managed orphan paths and update .gitignore"
+)
+# Issue #115: CI-failure feedback log byte cap. ``cmd_git_ops`` writes the
+# trimmed failing-job log to ``<workspace>/.devbench/ci-failures/<id>-<n>.log``
+# so the executor retry loop has a stable filesystem path to read; the cap
+# keeps the feedback payload bounded so a runaway-log job cannot consume the
+# entire executor context window. Override via ``JUDGE_CI_FAILURE_LOG_BYTES``
+# when a backlog's CI legitimately produces longer relevant tails.
+DEFAULT_CI_FAILURE_LOG_BYTES: int = 32768
+# Issue #115: CI-failure executor retry path. Default ``True`` so every
+# backlog benefits without per-shell setup; set
+# ``JUDGE_CI_FAILURE_RETRY_ENABLED=0`` (or ``false`` / ``no`` / ``off``) or
+# ``git_ops.ci_failure_retry: false`` in YAML to opt out. ``cmd_git_ops``
+# returns rc=2 on CI failure (signalling executor retry) until the shared
+# retry budget (``MAX_RETRY_ATTEMPTS``) is exhausted, at which point rc=1
+# BLOCKED applies. The retry budget is shared with the existing review-judge
+# retry budget so total per-task work stays bounded.
+DEFAULT_CI_FAILURE_RETRY_ENABLED: bool = True
+# Issue #116: opt-in toggle for the PR review-comment polling path. Default
+# False; both this AND a non-empty ``JUDGE_PR_REVIEW_AGENTS`` (or
+# ``JUDGE_PR_REVIEW_DECISION_BLOCKS=1``) are required for the phase to
+# activate. Allows the phase to ship without changing default merge cadence.
+DEFAULT_PR_REVIEW_RESOLUTION_ENABLED: bool = False
+# Issue #101: pause-before-merge mode. Default False so existing single-PR
+# and multi-PR flows are unchanged. When True, ``cmd_git_ops`` pushes the PR
+# and waits for green CI then transitions to ``in-review`` instead of
+# merging; the orchestrator's loop reconciles ``in-review`` tasks via
+# ``cmd_check_merge`` on the next iteration. Mutually exclusive with
+# ``defer_pr: true`` and ``single_branch: <name>`` (validated at config load).
+DEFAULT_PAUSE_BEFORE_MERGE: bool = False
+# Issue #116: PR review-comment poll/settle window. After ``wait_for_checks``
+# returns True, ``cmd_git_ops`` polls ``gh pr view`` for late-arriving
+# REQUEST_CHANGES reviews and bot comments for up to this many seconds before
+# merging. Event-driven loop (poll + condition), not a blanket sleep -- the
+# helper exits early on the first signal. Override via
+# ``JUDGE_PR_REVIEW_SETTLE_SECONDS``.
+DEFAULT_PR_REVIEW_SETTLE_SECONDS: int = 60
+# Issue #116: poll cadence inside the settle window. Smaller values reduce
+# observed latency at the cost of more ``gh`` API calls; the default 5 s
+# matches the ``CHECK_REGISTRATION_DELAY_SECONDS`` cadence already used by
+# ``wait_for_checks`` so operators see one consistent rhythm. Override via
+# ``JUDGE_PR_REVIEW_POLL_INTERVAL``.
+DEFAULT_PR_REVIEW_POLL_INTERVAL: int = 5
+# Issue #116: when ``True`` (the default), a PR with ``reviewDecision ==
+# CHANGES_REQUESTED`` blocks the merge regardless of the bot allowlist. When
+# ``False``, only allowlisted bot comments block the merge. Repos without
+# review bots leave both signals empty and the entire phase is a no-op
+# (zero regression for existing behaviour). Override via
+# ``JUDGE_PR_REVIEW_DECISION_BLOCKS``.
+DEFAULT_PR_REVIEW_DECISION_BLOCKS: bool = True
+# Issue #116: comma-separated allowlist of GitHub login names whose review
+# comments block the merge until resolved. Empty default means the phase is
+# a no-op for repos without review bots. Override via
+# ``JUDGE_PR_REVIEW_AGENTS`` (e.g. ``github-copilot[bot],amazon-q-developer[bot]``).
+DEFAULT_PR_REVIEW_AGENTS: tuple[str, ...] = ()
 DEFAULT_TOKEN_COST_PER_M_INPUT: float = 5.0
 DEFAULT_TOKEN_COST_PER_M_OUTPUT: float = 25.0
 

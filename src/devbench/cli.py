@@ -20,7 +20,9 @@ Commands::
     set-status <id> <s>     Force any status (no gate -- use for recovery/lifecycle transitions)
     mark-done <id>          Mark unit as Done (enforces done-gate: all judges must have passed)
     decline <id> --reason M Mark unit Declined (won't ever be done); captures the rationale
-    validate-backlog        Check backlog integrity (file existence, status sync, orphans, deps, summary)
+    hold <id> --reason M    Mark unit Hold (deferred / under debate); orchestrator skips it
+    unhold <id> --reason M  Return a held unit to in-queue and capture why it was released
+    validate-backlog [--fix] Check backlog integrity; --fix auto-corrects rule-10/11 violations
     ensure-branch <id>      Create or switch to work unit branch before executor runs
     git-ops <id>            Run git operations for a work unit (commit-only when defer_pr is set)
     git-ops-finalize <repo> Push single branch and create PR (after all deferred commits)
@@ -62,6 +64,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 # Resolved once at import time so each watch tick doesn't re-PATH-search.
 # Used by `cmd_report --watch` to clear both the viewport AND the scrollback
@@ -87,9 +90,11 @@ def _pre_parse_config(argv: list[str]) -> None:
 _pre_parse_config(sys.argv)
 
 from devbench.backlog.amendment import (
+    REVIEW_FAILURES_DIR_NAME,
     AmendmentError,
     AmendmentRequest,
     apply_amendment,
+    read_review_failure_files,
     reject_amendment,
     write_request,
 )
@@ -97,11 +102,19 @@ from devbench.backlog.manager import BacklogManager
 from devbench.backlog.parser import BacklogParser
 from devbench.backlog.proposal import (
     BlockedTaskState,
+    CascadeDepthError,
+    Proposal,
     ProposalError,
+    ProposalMatch,
     ProposalTaskState,
+    _compute_fix_signature,
+    _extract_intent_phrase,
     add_dep,
     classify_blocked_task,
     classify_proposed_task,
+    detect_placeholder_descriptions,
+    enforce_cascade_depth,
+    find_matching_pending_proposal,
     list_proposals,
     materialise_proposal,
     promote_all_from_source,
@@ -110,10 +123,20 @@ from devbench.backlog.proposal import (
     reject_proposal,
     write_proposal,
 )
-from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus
+from devbench.backlog.review_feedback_vocabulary import (
+    JUDGE_CATEGORIES,
+    JUDGE_SEVERITY_ORDER,
+)
+from devbench.backlog.work_unit import (
+    WorkUnit,
+    WorkUnitStatus,
+    WorkUnitType,
+)
 from devbench.config import (
     BACKLOG_INDEX,
     BACKLOG_ROOT,
+    BLOCKED_RECOVERY_WINDOW_SECONDS,
+    MAX_CASCADE_DEPTH,
     REPO_LOCAL_PATHS,
     RUNTIME_CONFIG,
     UPDATE_SUBMODULE,
@@ -121,8 +144,10 @@ from devbench.config import (
     resolve_repo,
     validate_repo,
 )
-from devbench.config_loader import get_configured_default_branch
+from devbench.config_loader import RepoConfig, get_configured_default_branch
 from devbench.constants import (
+    ALL_REQUIRED_JUDGE_NAMES,
+    BACKLOG_LOCAL_PATH_RE,
     COMMENT_AGENT_TEMPLATE,
     COMMENT_ENTRY_TEMPLATE,
     COMMENT_TIMESTAMP_FORMAT,
@@ -134,18 +159,69 @@ from devbench.constants import (
     EM_DASH,
     FINALIZE_COMMIT_TEMPLATE,
     FINALIZE_PR_TITLE_TEMPLATE,
+    KNOWN_JUDGE_NAMES,
+    STATUS_BLOCKED,
+    STATUS_DONE,
     STATUS_IN_PROGRESS,
+    STATUS_IN_QUEUE,
+    STATUS_IN_REVIEW,
     STATUS_SEPARATOR_WIDTH,
     VALID_TDD_PHASES,
 )
 from devbench.log_setup import setup_logging
+
+# Re-export from reporting so existing ``cli._format_duration`` callers and tests
+# resolve unchanged after the function moved to report.py for the issue #161
+# orchestrator-alive banner. Single source of truth lives in report.py because
+# the banner is implemented there and reporting must not depend on cli.py.
+from devbench.reporting.report import _format_duration
 from devbench.utils.process import run_command
+
+__all__ = ["_format_duration"]
 
 logger = logging.getLogger("devbench.cli")
 
 
-def cmd_status() -> int:
-    """Print backlog summary grouped by status."""
+def _parse_status_argv(argv: tuple[str, ...]) -> tuple[bool, int]:
+    """Return ``(detail, exit_code)``.
+
+    ``exit_code`` is ``0`` on success and non-zero when an unknown
+    positional argument was supplied (the error message is written to
+    stderr inline). Extracted from ``cmd_status`` so the dispatch body
+    stays under PLR0912's branch ceiling.
+    """
+    detail = False
+    extra_positional: list[str] = []
+    for arg in argv:
+        if arg == "--detail":
+            detail = True
+            continue
+        if not arg:
+            continue
+        extra_positional.append(arg)
+    if extra_positional:
+        print(
+            f"ERROR: cmd_status takes no positional args (got {extra_positional!r})",
+            file=sys.stderr,
+        )
+        return False, 1
+    return detail, 0
+
+
+def cmd_status(*argv: str) -> int:
+    """Print backlog summary grouped by status.
+
+    With ``--detail`` (E220), additionally render three sections:
+    in-queue (every actionable Task with the IDs of its still-open
+    dependencies), blocked (every Blocked Task with the dep IDs that
+    are still non-terminal and any ``[BLOCKED_PENDING_PROPOSAL]``
+    markers found in its Comments), and held (every Hold Task with
+    the most recent ``[HOLD]`` reason from its Comments).
+    """
+    detail, parse_rc = _parse_status_argv(argv)
+    if parse_rc != 0:
+        return parse_rc
+
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     units = parser.parse_index()
 
@@ -155,22 +231,14 @@ def cmd_status() -> int:
         counts[key] = counts.get(key, 0) + 1
 
     total = len(units)
-    # Count un-materialised proposed tasks -- proposal JSONs on disk whose
-    # suggested_id values have no backlog row yet. These sit outside the
-    # parser's view (which only sees BACKLOG.md rows) and would otherwise
-    # be invisible until the operator explicitly ran ``list-proposals``.
     unmaterialised_count = _count_unmaterialised_proposed_tasks()
-    # Split the `Blocked` count into auto-clearing (has markers the ADR-07
-    # cascade will resolve) vs needs-operator-attention (needs a human).
-    # See ADR-10 and BlockedTaskState for the classification contract.
-    auto_count, attn_count = _count_blocked_split(units)
+    auto_count, recovery_count, attn_count = _count_blocked_split(units)
     print("Backlog Status Summary")
     print("=" * STATUS_SEPARATOR_WIDTH)
     for status_val in DISPLAY_STATUS_VALUES:
         if status_val == "Blocked":
-            # Replace the single Blocked line with a two-line split. Both
-            # rows always render, so a regression to zero stays visible.
             print(f"  {'Blocked (auto)':<15} {auto_count:>4}")
+            print(f"  {'Blocked (recovery)':<15} {recovery_count:>4}")
             print(f"  {'Blocked (attn)':<15} {attn_count:>4}")
             continue
         count = counts.get(status_val.lower(), 0)
@@ -182,7 +250,13 @@ def cmd_status() -> int:
     if active:
         print("\nActive work units:")
         for u in active:
-            print(f"  [{u.status.value}] {u.id} -- {u.title}")
+            line = f"  [{u.status.value}] {u.id} -- {u.title}"
+            if u.status is WorkUnitStatus.IN_PROGRESS:
+                duration = _in_progress_attempt_duration(u.id)
+                line += (
+                    f" (in-progress for {duration})" if duration is not None else " (in-progress, timer unavailable)"
+                )
+            print(line)
 
     actionable = parser.get_parallel_candidates(units)
     if actionable:
@@ -193,7 +267,249 @@ def cmd_status() -> int:
         blocked = parser.get_blocked_units(units)
         print(f"\nNo actionable units. {len(blocked)} blocked.")
 
+    if detail:
+        _print_status_detail(units)
+
     return 0
+
+
+def _print_blocked_panel_by_bucket(
+    blocked_tasks: list[WorkUnit],
+    units_by_id: dict[str, WorkUnit],
+) -> None:
+    """Issue #149 follow-up: split the ``--detail`` blocked panel by
+    classifier bucket so operators see at a glance which tasks need
+    attention vs which will auto-clear. Three sections matching the
+    summary-table buckets: AUTO_CLEARING_VIA_PROPOSAL /
+    AWAITING_AUTO_RECOVERY / NEEDS_OPERATOR_ATTENTION.
+    """
+    buckets: dict[BlockedTaskState, list[WorkUnit]] = {
+        BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL: [],
+        BlockedTaskState.AWAITING_AUTO_RECOVERY: [],
+        BlockedTaskState.NEEDS_OPERATOR_ATTENTION: [],
+    }
+    for u in blocked_tasks:
+        state = classify_blocked_task(
+            backlog_root=BACKLOG_ROOT,
+            backlog_index=BACKLOG_INDEX,
+            task_id=u.id,
+            workspace_root=WORKSPACE_ROOT,
+        )
+        buckets[state].append(u)
+    bucket_headers = [
+        (BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL, "Blocked tasks (auto-clearing via proposal)"),
+        (BlockedTaskState.AWAITING_AUTO_RECOVERY, "Blocked tasks (awaiting auto-recovery)"),
+        (BlockedTaskState.NEEDS_OPERATOR_ATTENTION, "Blocked tasks (needs operator attention)"),
+    ]
+    for state, header in bucket_headers:
+        tasks = buckets[state]
+        if not tasks:
+            continue
+        print(f"\n{header} ({len(tasks)}):")
+        for u in tasks:
+            _print_blocked_row(u, units_by_id)
+
+
+def _print_blocked_row(u: WorkUnit, units_by_id: dict[str, WorkUnit]) -> None:
+    """Render a single row in the blocked-tasks panel: ``id -- title (note)``
+    plus any unsuperseded ``[BLOCKED]`` audit lines beneath it."""
+    wu_file = _resolve_unit_file(u)
+    content = wu_file.read_text(encoding="utf-8") if wu_file is not None else ""
+    # Issue #148: walk the markers and surface only non-terminal targets.
+    markers = [
+        marker
+        for marker in _BLOCKED_PENDING_PROPOSAL_MARKER_RE.findall(content)
+        if (target := units_by_id.get(marker)) is None
+        or target.status not in {WorkUnitStatus.DONE, WorkUnitStatus.DECLINED}
+    ]
+    unsatisfied = _first_unsatisfied_dep(u, units_by_id)
+    note_parts: list[str] = []
+    if markers:
+        note_parts.append(f"pending proposal {markers[0]}")
+    if unsatisfied:
+        note_parts.append(f"blocker {unsatisfied}")
+    note = ", ".join(note_parts) if note_parts else "no open marker / blocker found"
+    print(f"  {u.id} -- {u.title}  ({note})")
+    # Issue #153: surface most-recent unsuperseded ``[BLOCKED]`` audit so
+    # the operator sees WHY the task is blocked. Audits superseded by a
+    # later ``[UNBLOCKED]`` / ``[CASCADE_RESOLVED]`` are filtered out
+    # (the file stays append-only; only the rendered panel hides stale rows).
+    for audit in _unsuperseded_blocked_audits(content):
+        print(f"      {audit}")
+
+
+def _print_status_detail(units: list[WorkUnit]) -> None:
+    """Render the ``--detail`` panels: in-queue, blocked, held.
+
+    Pulled out of ``cmd_status`` so the command body stays under
+    PLR0912's branch ceiling and so the panel rendering can be
+    unit-tested directly without spinning up a real backlog.
+    """
+    units_by_id = {u.id: u for u in units}
+    in_queue_tasks = sorted(
+        (u for u in units if u.unit_type is WorkUnitType.TASK and u.status is WorkUnitStatus.IN_QUEUE),
+        key=lambda u: u.id,
+    )
+    if in_queue_tasks:
+        print("\nIn-queue tasks (with dep status):")
+        for u in in_queue_tasks:
+            unsatisfied = _first_unsatisfied_dep(u, units_by_id)
+            if unsatisfied:
+                print(f"  [waiting] {u.id} -- {u.title}  (blocker: {unsatisfied})")
+            else:
+                print(f"  [ready]   {u.id} -- {u.title}")
+
+    blocked_tasks = sorted(
+        (u for u in units if u.unit_type is WorkUnitType.TASK and u.status is WorkUnitStatus.BLOCKED),
+        key=lambda u: u.id,
+    )
+    if blocked_tasks:
+        _print_blocked_panel_by_bucket(blocked_tasks, units_by_id)
+        _print_blocked_rejection_categories(blocked_tasks)
+
+    held_tasks = sorted(
+        (u for u in units if u.unit_type is WorkUnitType.TASK and u.status is WorkUnitStatus.HOLD),
+        key=lambda u: u.id,
+    )
+    if held_tasks:
+        print("\nHeld tasks (with most recent [HOLD] reason):")
+        for u in held_tasks:
+            wu_file = _resolve_unit_file(u)
+            reason = _latest_hold_reason(wu_file.read_text(encoding="utf-8")) if wu_file is not None else ""
+            reason_note = f"reason: {reason}" if reason else "reason not found in Comments"
+            print(f"  {u.id} -- {u.title}  ({reason_note})")
+
+
+def _print_blocked_rejection_categories(blocked_tasks: list[WorkUnit]) -> None:
+    """Issue #156: surface pending review-judge category counts under blocked panels.
+
+    For every blocked task with at least one outstanding rejection
+    category, emit a row of the form::
+
+        E0-F1-S1-T3 (3 unresolved categories: code_review:HARDCODED_URL, ...)
+
+    Tasks with no outstanding categories are omitted entirely.
+    """
+    rows: list[tuple[str, list[tuple[str, str]]]] = []
+    for u in blocked_tasks:
+        wu_file = _resolve_unit_file(u)
+        outstanding = _outstanding_rejection_categories(u.id, wu_file)
+        if outstanding:
+            rows.append((u.id, outstanding))
+    if not rows:
+        return
+    print("\nReview-judge rejections (unresolved categories):")
+    for unit_id, cats in rows:
+        joined = ", ".join(f"{judge}:{code}" for judge, code in cats)
+        print(f"  {unit_id} ({len(cats)} unresolved categories: {joined})")
+
+
+_HOLD_COMMENT_RE: re.Pattern[str] = re.compile(r"\[HOLD\]\s+(.+?)(?:\n|$)")
+
+# Issue #158: regex matching the structured-log line:
+#   2026-05-02T12:34:56Z [logger] LEVEL ... Set <id> to 'in-progress'
+_LOG_PROGRESS_RE: re.Pattern[str] = re.compile(
+    r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})Z .* Set (\S+) to 'in-progress'",
+    re.MULTILINE,
+)
+# Fallback: agent-comment audit row of the form
+#   [2026-05-02 12:34 UTC] [agent/orchestrator] Set <id> to 'in-progress'
+_AUDIT_PROGRESS_RE: re.Pattern[str] = re.compile(
+    r"\[(?P<ts>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s+UTC\][^\n]*?Set\s+(?P<id>\S+)\s+to\s+'in-progress'",
+)
+
+
+def _latest_log_in_progress_ts(task_id: str, log_path: Path | None) -> datetime | None:
+    """Return the most recent ``Set <task_id> to 'in-progress'`` timestamp from the log."""
+    candidate = log_path
+    if candidate is None:
+        env_log = os.environ.get("JUDGE_LOG_FILE", "")
+        candidate = Path(env_log) if env_log else None
+    if candidate is None or not candidate.is_file():
+        return None
+    try:
+        content = candidate.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    latest: datetime | None = None
+    for match in _LOG_PROGRESS_RE.finditer(content):
+        if match.group(2) != task_id:
+            continue
+        try:
+            ts = datetime.strptime(match.group(1), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=UTC)
+        except ValueError:
+            continue
+        if latest is None or ts > latest:
+            latest = ts
+    return latest
+
+
+def _latest_audit_in_progress_ts(task_id: str) -> datetime | None:
+    """Return the most recent in-progress audit-comment timestamp for the task."""
+    wu_file = _resolve_unit_file_by_id(task_id)
+    if wu_file is None or not wu_file.is_file():
+        return None
+    try:
+        wu_content = wu_file.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    latest: datetime | None = None
+    for match in _AUDIT_PROGRESS_RE.finditer(wu_content):
+        if match.group("id") != task_id:
+            continue
+        try:
+            ts = datetime.strptime(match.group("ts"), "%Y-%m-%d %H:%M").replace(tzinfo=UTC)
+        except ValueError:
+            continue
+        if latest is None or ts > latest:
+            latest = ts
+    return latest
+
+
+def _in_progress_attempt_duration(task_id: str, log_path: Path | None = None) -> str | None:
+    """Return the humanized in-progress duration for ``task_id`` or ``None``.
+
+    Issue #158. Reads the most recent ``Set <task_id> to 'in-progress'``
+    transition timestamp from the structured log first; falls back to
+    the work-unit file's audit-comment timestamp; returns ``None``
+    when neither yields a parseable timestamp. Multiple in-progress
+    transitions (blocked-then-resumed) resolve to the most recent one.
+    """
+    transition = _latest_log_in_progress_ts(task_id, log_path) or _latest_audit_in_progress_ts(task_id)
+    if transition is None:
+        return None
+    elapsed = (datetime.now(UTC) - transition).total_seconds()
+    return _format_duration(elapsed)
+
+
+def _resolve_unit_file_by_id(task_id: str) -> Path | None:
+    """Look up a work-unit file path by ID.
+
+    Best-effort -- swallows parse errors and returns ``None`` when the
+    backlog cannot be read. Used by the in-progress duration helper so
+    a transient parse failure surfaces as ``timer unavailable`` rather
+    than crashing ``status`` / ``report``.
+    """
+    try:
+        parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+        units = parser.parse_index()
+    except (FileNotFoundError, ValueError, OSError):
+        return None
+    for u in units:
+        if u.id == task_id:
+            return _resolve_unit_file(u)
+    return None
+
+
+def _latest_hold_reason(content: str) -> str:
+    """Return the most recent ``[HOLD] <reason>`` text from a work-unit file.
+
+    Used by ``status --detail`` to render the held-tasks panel. Walks
+    Comments-style audit lines and returns the last match, since the
+    audit log appends in chronological order.
+    """
+    matches = _HOLD_COMMENT_RE.findall(content)
+    return matches[-1].strip() if matches else ""
 
 
 def cmd_next() -> int:
@@ -230,6 +546,12 @@ def cmd_claim(unit_id: str) -> int:
 
     Use after ``devbench next`` to explicitly mark the unit as owned before
     the executor begins work.
+
+    Issue #117: refuses to claim a work unit whose Changes Manifest still
+    contains a ``TBD`` placeholder row. The orchestrator catches this at
+    claim time and either auto-amends (when ``manifest_amendment.enabled:
+    true``) or surfaces the failure to the operator -- either way the
+    placeholder never reaches the executor.
     """
     units = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX).parse_index()
     unit = next((u for u in units if u.id == unit_id), None)
@@ -239,6 +561,19 @@ def cmd_claim(unit_id: str) -> int:
     wu_file = _resolve_unit_file(unit)
     if wu_file is None:
         print(f"ERROR: work unit file not found for '{unit_id}'", file=sys.stderr)
+        return 1
+    # Use a fresh import path so the unit-test layer's
+    # `patch("devbench.cli.BacklogManager", ...)` does not stub out the
+    # placeholder-detection classmethod via attribute lookup on the mock.
+    from devbench.backlog.manager import BacklogManager as _BacklogManager
+
+    placeholder = _BacklogManager._first_placeholder_manifest_cell(wu_file.read_text(encoding="utf-8"))
+    if placeholder:
+        print(
+            f"ERROR: cannot claim {unit_id!r}: Changes Manifest still has placeholder row "
+            f"{placeholder!r}. Replace with real file entries before claim.",
+            file=sys.stderr,
+        )
         return 1
     mgr = BacklogManager()
     mgr.force_status(wu_file, BACKLOG_INDEX, unit_id, STATUS_IN_PROGRESS)
@@ -275,7 +610,86 @@ def cmd_set_status(unit_id: str, new_status: str) -> int:
     mgr.force_status(wu_file, BACKLOG_INDEX, unit_id, new_status)
 
     logger.info("Set %s to %s", unit_id, new_status)
+
+    if new_status.lower() == "blocked":
+        rc = _clean_target_repo_on_block(wu_file)
+        if rc != 0:
+            print(f"WARNING: target repo cleanup failed for '{unit_id}' (exit {rc})", file=sys.stderr)
+
     print(f"Set {unit_id} to {new_status}")
+    return 0
+
+
+def _clean_target_repo_on_block(wu_file: Path) -> int:
+    """Reset and clean the target repo's working tree when a task transitions to blocked.
+
+    Reads the ``Local path:`` field from the work-unit file and runs
+    ``git reset --hard HEAD`` and ``git clean -fd`` against that directory.
+    Both commands are run with ``check=False``; returns 1 if either fails.
+
+    If ``Local path:`` is absent from the file (e.g. validation gates with no
+    local path), logs a warning and returns 0 as a defensive skip -- this is
+    NOT a fallback; the task is already blocked, so failing here would obscure
+    the real status transition.
+
+    Args:
+        wu_file: Path to the work-unit ``.md`` file.
+
+    Returns:
+        0 on success or when ``Local path:`` is absent; 1 if a git command
+        errors.
+    """
+    try:
+        content = wu_file.read_text()
+    except OSError as exc:
+        logger.warning("_clean_target_repo_on_block: cannot read '%s': %s", wu_file, exc)
+        return 1
+
+    match = BACKLOG_LOCAL_PATH_RE.search(content)
+    if not match:
+        logger.warning(
+            "_clean_target_repo_on_block: 'Local path:' not found in '%s'; skipping repo cleanup",
+            wu_file,
+        )
+        return 0
+
+    local_path = match.group(1).strip()
+    if not Path(local_path).exists():
+        logger.warning(
+            "_clean_target_repo_on_block: local path '%s' does not exist; skipping repo cleanup",
+            local_path,
+        )
+        return 0
+
+    reset_result = subprocess.run(
+        ["git", "-C", local_path, "reset", "--hard", "HEAD"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if reset_result.returncode != 0:
+        logger.warning(
+            "_clean_target_repo_on_block: git reset failed for '%s': %s",
+            local_path,
+            reset_result.stderr.strip(),
+        )
+        return 1
+
+    clean_result = subprocess.run(
+        ["git", "-C", local_path, "clean", "-fd"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if clean_result.returncode != 0:
+        logger.warning(
+            "_clean_target_repo_on_block: git clean failed for '%s': %s",
+            local_path,
+            clean_result.stderr.strip(),
+        )
+        return 1
+
+    logger.info("_clean_target_repo_on_block: cleaned target repo at '%s'", local_path)
     return 0
 
 
@@ -297,6 +711,28 @@ def cmd_mark_done(unit_id: str) -> int:
     wu_file = _resolve_unit_file(target)
     if wu_file is None:
         print(f"ERROR: Work unit file not found for '{unit_id}'", file=sys.stderr)
+        return 1
+
+    # Issue #156: prior review-judge rejections must be either resolved
+    # ([REJECTION_FEEDBACK_RESOLVED] audit logged) or escalated via
+    # [NEEDS_DEP] before the task can transition to done. Otherwise the
+    # done-gate refuses with a clear actionable error and emits a
+    # [REJECTION_FEEDBACK_OUTSTANDING] audit so subsequent runs can see why.
+    outstanding = _outstanding_rejection_categories(unit_id, wu_file)
+    if outstanding:
+        mgr_audit = BacklogManager()
+        joined = ", ".join(f"{j}:{c}" for j, c in outstanding)
+        mgr_audit._append_agent_comment(
+            wu_file,
+            "orchestrator",
+            f"[REJECTION_FEEDBACK_OUTSTANDING] {joined}",
+        )
+        print(
+            f"ERROR: Cannot mark {unit_id} done: unresolved review-judge categories: {joined}. "
+            "Address each in the diff and log [REJECTION_FEEDBACK_RESOLVED] <judge>:<code>, "
+            "or escalate via [NEEDS_DEP] <judge>:<code>.",
+            file=sys.stderr,
+        )
         return 1
 
     mgr = BacklogManager()
@@ -369,7 +805,535 @@ def cmd_decline(*argv: str) -> int:
     return 0
 
 
-def cmd_validate_backlog() -> int:
+_TEMPLATE_KIND_BY_ID_SHAPE: dict[str, str] = {
+    "T": "task",
+    "S": "story",
+    "F": "feature",
+    "E": "epic",
+}
+
+
+def cmd_new_task(*argv: str) -> int:
+    """Scaffold a new work-unit ``.md`` file from a canonical template.
+
+    Usage::
+
+        new-task --id <ID> --title "<TITLE>" --target <PATH>
+                 [--repo <ORG/REPO>] [--description <TEXT>]
+                 [--source-file <PATH>] [--test-file <PATH>]
+                 [--ac-func <TEXT>]
+
+    Required flags:
+      ``--id``: canonical work-unit ID (e.g. ``E0-F1-S1-T1``). The ID's
+        last segment determines which template is rendered: ``T`` -> task,
+        ``S`` -> story, ``F`` -> feature, ``E`` -> epic.
+      ``--title``: human-readable title.
+      ``--target``: absolute path where the new ``.md`` file will be
+        written. Fails fast if the file already exists or the parent
+        directory is missing.
+
+    Optional flags substitute the matching ``{{TOKEN}}`` placeholders
+    in the template; tokens with no matching flag are filled with a
+    sensible default (e.g. ``--ac-func`` -> ``"TBD"``,
+    ``--source-file`` -> ``src/<repo-name>/<id-lower>.py``).
+    """
+    parsed = _parse_new_task_argv(argv)
+    if isinstance(parsed, int):
+        return parsed
+    fields = parsed
+
+    target = Path(fields["target"])
+    if target.exists():
+        print(f"ERROR: target {str(target)!r} already exists; refusing to overwrite", file=sys.stderr)
+        return 1
+    if not target.parent.is_dir():
+        print(
+            f"ERROR: parent directory {str(target.parent)!r} does not exist; create it first",
+            file=sys.stderr,
+        )
+        return 1
+
+    kind = _template_kind_for_id(fields["id"])
+    if kind is None:
+        print(
+            f"ERROR: cannot derive template kind from id {fields['id']!r}; "
+            f"expected last segment to start with T/S/F/E.",
+            file=sys.stderr,
+        )
+        return 1
+    template_path = _devbench_root() / "backlog" / "templates" / f"{kind}.md"
+    if not template_path.is_file():
+        print(f"ERROR: template not found at {str(template_path)!r}", file=sys.stderr)
+        return 1
+    template = template_path.read_text(encoding="utf-8")
+    rendered = _render_new_task_template(template, fields)
+    target.write_text(rendered, encoding="utf-8")
+    print(json.dumps({"id": fields["id"], "kind": kind, "target": str(target)}))
+    logger.info("Scaffolded %s %s at %s", kind, fields["id"], target)
+    return 0
+
+
+def _parse_new_task_argv(argv: tuple[str, ...] | list[str]) -> dict[str, str] | int:
+    """Parse ``new-task`` argv into a flat ``{flag: value}`` dict.
+
+    Returns the populated dict when every required flag is set, or an
+    integer non-zero exit code when parsing failed (the error message
+    is already on stderr).
+    """
+    flag_map = {
+        "--id": "id",
+        "--title": "title",
+        "--target": "target",
+        "--repo": "repo",
+        "--description": "description",
+        "--source-file": "source_file",
+        "--test-file": "test_file",
+        "--ac-func": "ac_func",
+    }
+    fields: dict[str, str] = {}
+    args = list(argv)
+    i = 0
+    while i < len(args):
+        flag = args[i]
+        key = flag_map.get(flag)
+        if key is None:
+            print(f"ERROR: unknown flag {flag!r}", file=sys.stderr)
+            return 1
+        if i + 1 >= len(args) or not args[i + 1]:
+            print(f"ERROR: {flag} requires a value", file=sys.stderr)
+            return 1
+        fields[key] = args[i + 1]
+        i += 2
+    for required in ("id", "title", "target"):
+        if required not in fields:
+            print(f"ERROR: --{required.replace('_', '-')} is required", file=sys.stderr)
+            return 1
+    return fields
+
+
+def _render_new_task_template(template: str, fields: dict[str, str]) -> str:
+    """Substitute ``{{TOKEN}}`` placeholders in ``template`` from ``fields``.
+
+    Tokens with no explicit value get a deterministic default so the
+    rendered file is immediately validate-backlog-clean (no empty
+    sections, no TBD-without-context).
+    """
+    unit_id = fields["id"]
+    repo = fields.get("repo", "org/repo")
+    short_repo = repo.split("/", maxsplit=1)[-1]
+    source_default = f"src/{short_repo}/{unit_id.lower()}.py"
+    source_file = fields.get("source_file", source_default)
+    base = Path(source_file).stem
+    test_default = f"tests/unit/test_{base}.py"
+    substitutions = {
+        "{{ID}}": unit_id,
+        "{{ID_LOWER}}": unit_id.lower(),
+        "{{TITLE}}": fields["title"],
+        "{{REPO}}": repo,
+        "{{DESCRIPTION}}": fields.get("description", "TBD: describe the work this unit captures."),
+        "{{SOURCE_FILE}}": source_file,
+        "{{TEST_FILE}}": fields.get("test_file", test_default),
+        "{{AC_FUNC}}": fields.get("ac_func", "TBD: describe the functional outcome."),
+    }
+    rendered = template
+    for token, value in substitutions.items():
+        rendered = rendered.replace(token, value)
+    return rendered
+
+
+def _template_kind_for_id(unit_id: str) -> str | None:
+    """Return the template kind ('task'/'story'/'feature'/'epic') for ``unit_id``."""
+    parts = unit_id.split("-")
+    if not parts:
+        return None
+    last = parts[-1]
+    if not last:
+        return None
+    return _TEMPLATE_KIND_BY_ID_SHAPE.get(last[0].upper())
+
+
+def _devbench_root() -> Path:
+    """Return the absolute path to the devbench package root.
+
+    The templates ship inside the package at
+    ``<devbench>/backlog/templates/``; resolving via ``__file__`` makes
+    the helper portable across editable installs and copies.
+    """
+    return Path(__file__).resolve().parent.parent.parent
+
+
+def cmd_sync_blocked() -> int:
+    """Reconcile every task's status against current dependency satisfaction.
+
+    Walks the parsed index and for every TASK whose dependencies are
+    NOT satisfied (per :meth:`BacklogParser._deps_satisfied` -- includes
+    epic / feature / story-level deps after E215, recursing into
+    descendants):
+
+    - ``in-queue`` -> ``blocked`` with a ``[BLOCKED] dep <id> not yet terminal``
+      audit entry.
+
+    Conversely, for every ``blocked`` TASK whose dependencies are now
+    satisfied AND that has NO ``[BLOCKED_PENDING_PROPOSAL]`` marker
+    pointing at a still-open proposal:
+
+    - ``blocked`` -> ``in-queue`` with a ``[UNBLOCKED] deps satisfied``
+      audit entry.
+
+    Tasks whose status is anything else (``in-progress``, ``in-review``,
+    ``done``, ``declined``, ``hold``, ``proposed``) are left untouched.
+    The ADR-07 cascade still owns the proposal-marker pathway -- this
+    command exists for the orchestrator's pre-flight sweep and for
+    operator triage when a backlog has drifted out of sync after manual
+    edits.
+
+    Returns 0 always; output is a JSON envelope listing every flip.
+    """
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    units_by_id = {u.id: u for u in units}
+    manager = BacklogManager()
+    flipped_to_blocked: list[str] = []
+    flipped_to_in_queue: list[str] = []
+
+    for unit in units:
+        if unit.unit_type is not WorkUnitType.TASK:
+            continue
+        deps_ok = parser._deps_satisfied(unit, units_by_id)
+        if unit.status is WorkUnitStatus.IN_QUEUE and not deps_ok:
+            wu_file = _resolve_unit_file(unit)
+            if wu_file is None:
+                continue
+            unsatisfied = _first_unsatisfied_dep(unit, units_by_id)
+            reason = (
+                f"sync-blocked: dependency {unsatisfied!r} not yet terminal"
+                if unsatisfied
+                else "sync-blocked: dependency not yet terminal"
+            )
+            manager.mark_blocked(wu_file, BACKLOG_INDEX, unit.id, reason)
+            flipped_to_blocked.append(unit.id)
+            continue
+        if unit.status is WorkUnitStatus.BLOCKED and deps_ok:
+            wu_file = _resolve_unit_file(unit)
+            if wu_file is None:
+                continue
+            content = wu_file.read_text(encoding="utf-8")
+            if _has_open_proposal_marker(content, units_by_id):
+                # Issue #148: only skip when at least one marker target is
+                # still non-terminal. Stale markers pointing at finished
+                # tasks no longer represent active cascade work and must
+                # not pin this task in the blocked panel forever.
+                continue
+            manager.force_status(wu_file, BACKLOG_INDEX, unit.id, STATUS_IN_QUEUE)
+            # Issue #153: ``[UNBLOCKED] deps satisfied`` is the canonical
+            # supersession marker for the panel renderer.
+            manager._append_comment(wu_file, "UNBLOCKED", "deps satisfied; sync-blocked dependencies now terminal")
+            flipped_to_in_queue.append(unit.id)
+
+    output = {
+        "flipped_to_blocked": flipped_to_blocked,
+        "flipped_to_in_queue": flipped_to_in_queue,
+    }
+    print(json.dumps(output))
+    logger.info(
+        "sync-blocked: %d -> blocked, %d -> in-queue",
+        len(flipped_to_blocked),
+        len(flipped_to_in_queue),
+    )
+    return 0
+
+
+def cmd_reconcile_cascade() -> int:
+    """Reconcile every blocked task against marker target + regular dep state.
+
+    Issue #150: the recovery cascade can lose track of blocked tasks when a
+    promoted proposal completes and the auto-requeue trigger never fires
+    (process crash mid-write, missing dependency declaration, etc.). This
+    command walks every blocked task and:
+
+    - Evaluates each ``[BLOCKED_PENDING_PROPOSAL]`` marker target's status
+      via the loaded backlog index.
+    - Evaluates the task's regular dependencies via
+      ``BacklogParser._deps_satisfied``.
+    - Flips a candidate to ``in-queue`` ONLY when every marker target is
+      terminal AND every regular dep is satisfied.
+
+    Each flip writes a ``[CASCADE_RECONCILED]`` audit comment naming the
+    closed marker IDs so the operator can trace why the task moved.
+    Tasks left blocked are reported with the reason (open marker, unknown
+    marker target, unsatisfied dep) so the operator can decide what to do.
+
+    Returns 0 always; output is a JSON envelope listing flips + skips.
+    """
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    units_by_id = {u.id: u for u in units}
+    manager = BacklogManager()
+
+    flipped: list[dict[str, str | list[str]]] = []
+    skipped: list[dict[str, str]] = []
+
+    terminal_statuses = {WorkUnitStatus.DONE, WorkUnitStatus.DECLINED}
+
+    for unit in units:
+        if unit.unit_type is not WorkUnitType.TASK:
+            continue
+        if unit.status is not WorkUnitStatus.BLOCKED:
+            continue
+
+        wu_file = _resolve_unit_file(unit)
+        if wu_file is None:
+            skipped.append({"unit_id": unit.id, "reason": "work-unit file missing"})
+            continue
+
+        content = wu_file.read_text(encoding="utf-8")
+        marker_ids = sorted(set(_BLOCKED_PENDING_PROPOSAL_MARKER_RE.findall(content)))
+
+        # Marker evaluation: every target must be terminal AND known.
+        unresolved_marker = ""
+        for marker in marker_ids:
+            target = units_by_id.get(marker)
+            if target is None:
+                unresolved_marker = f"unknown marker target {marker}"
+                break
+            if target.status not in terminal_statuses:
+                unresolved_marker = f"open marker {marker} ({target.status.value})"
+                break
+        if unresolved_marker:
+            skipped.append({"unit_id": unit.id, "reason": unresolved_marker})
+            continue
+
+        # Regular-dep evaluation.
+        if not BacklogParser._deps_satisfied(unit, units_by_id):
+            unsatisfied = _first_unsatisfied_dep(unit, units_by_id)
+            reason = f"regular dep not yet terminal: {unsatisfied}" if unsatisfied else "regular deps unsatisfied"
+            skipped.append({"unit_id": unit.id, "reason": reason})
+            continue
+
+        manager.force_status(wu_file, BACKLOG_INDEX, unit.id, STATUS_IN_QUEUE)
+        message = (
+            f"[CASCADE_RECONCILED] markers {marker_ids} terminal and regular deps satisfied; re-queuing"
+            if marker_ids
+            else "[CASCADE_RECONCILED] regular deps satisfied; re-queuing"
+        )
+        manager._append_agent_comment(wu_file, "backlog_manager", message)
+        flipped.append({"unit_id": unit.id, "closed_markers": marker_ids})
+
+    output = {"flipped": flipped, "skipped": skipped}
+    print(json.dumps(output))
+    logger.info("reconcile-cascade: %d flipped, %d skipped", len(flipped), len(skipped))
+    return 0
+
+
+def _first_unsatisfied_dep(unit: WorkUnit, units_by_id: dict[str, WorkUnit]) -> str:
+    """Return the first dep ID in ``unit.dependencies`` that is NOT terminal.
+
+    ``BacklogParser._deps_satisfied`` returns a single boolean over the
+    whole dep list; this helper exposes which dep failed first so the
+    blocked-comment audit message names the offending ID. Returns ``""``
+    when every dep is satisfied.
+    """
+    terminal = {WorkUnitStatus.DONE, WorkUnitStatus.DECLINED}
+    for dep_id in unit.dependencies:
+        dep = units_by_id.get(dep_id)
+        if dep is None:
+            # Unknown dep -- treat as satisfied (validate-backlog reports it).
+            continue
+        if dep.unit_type is WorkUnitType.TASK:
+            if dep.status not in terminal:
+                return dep_id
+            continue
+        # Non-task dep: scan descendant tasks.
+        for descendant in units_by_id.values():
+            if (
+                descendant.id != dep_id
+                and descendant.id.startswith(dep_id + "-")
+                and descendant.unit_type is WorkUnitType.TASK
+                and descendant.status not in terminal
+            ):
+                return dep_id
+    return ""
+
+
+_BLOCKED_PENDING_PROPOSAL_MARKER_RE: re.Pattern[str] = re.compile(r"\[BLOCKED_PENDING_PROPOSAL\]\s+(\S+)")
+
+# Captures the audit-comment classifier tag (``[BLOCKED]`` / ``[UNBLOCKED]`` /
+# ``[CASCADE_RESOLVED]``). Used by ``_unsuperseded_blocked_audits`` to walk
+# the Comments section in chronological order and drop ``[BLOCKED]`` rows
+# that have been superseded by a later positive transition.
+_BLOCKED_AUDIT_LINE_RE: re.Pattern[str] = re.compile(r"\[(?P<tag>BLOCKED|UNBLOCKED|CASCADE_RESOLVED)\](?P<rest>[^\n]*)")
+
+
+def _unsuperseded_blocked_audits(content: str) -> list[str]:
+    """Return ``[BLOCKED]`` audit text lines that have NOT been superseded
+    by a later ``[UNBLOCKED]`` or ``[CASCADE_RESOLVED]`` row.
+
+    Issue #153: the audit history in the file stays append-only -- only the
+    rendered status panel hides stale ``[BLOCKED]`` rows when a positive
+    transition has subsequently fired. Walks the file linearly so the
+    chronological ordering of the Comments section drives supersession
+    (a ``[BLOCKED]`` followed by ``[UNBLOCKED]`` is stale; a ``[BLOCKED]``
+    followed by another ``[BLOCKED]`` is the live cause).
+
+    Excludes ``[BLOCKED_PENDING_PROPOSAL]`` marker rows so cascade markers
+    are NOT mistaken for plain ``[BLOCKED]`` audit lines.
+    """
+    pending_audits: list[str] = []
+    for line in content.splitlines():
+        if "[BLOCKED_PENDING_PROPOSAL]" in line:
+            continue
+        match = _BLOCKED_AUDIT_LINE_RE.search(line)
+        if match is None:
+            continue
+        tag = match.group("tag")
+        if tag == "BLOCKED":
+            pending_audits.append(line.strip())
+        else:
+            # UNBLOCKED / CASCADE_RESOLVED supersedes every prior BLOCKED.
+            pending_audits = []
+    return pending_audits
+
+
+def _has_open_proposal_marker(content: str, units_by_id: dict[str, WorkUnit]) -> bool:
+    """Return ``True`` iff ``content`` carries at least one ``[BLOCKED_PENDING_PROPOSAL]``
+    marker whose target task is still non-terminal.
+
+    Issue #148: the prior ``_BLOCKED_PENDING_PROPOSAL_OPEN_RE`` regex flagged
+    every marker as "open" -- including markers whose target had already
+    completed. That left blocked tasks marooned because the sync-blocked
+    sweep treated stale markers as live cascade activity and refused to
+    re-queue. The walker resolves each marker target via ``units_by_id`` and
+    returns ``True`` only when at least one target is in a non-terminal
+    status (anything other than ``done`` / ``declined``). Unknown target
+    IDs (rejected drafts whose backlog row was removed) count as
+    non-terminal so the cascade owner stays in charge of clearing them.
+    """
+    terminal = {WorkUnitStatus.DONE, WorkUnitStatus.DECLINED}
+    for marker in _BLOCKED_PENDING_PROPOSAL_MARKER_RE.findall(content):
+        target = units_by_id.get(marker)
+        if target is None:
+            return True
+        if target.status not in terminal:
+            return True
+    return False
+
+
+def _parse_id_and_reason(argv: tuple[str, ...] | list[str], command_name: str) -> tuple[str, str] | int:
+    """Parse a ``<id> --reason <message>`` argument tuple shared by hold/unhold/decline.
+
+    Returns a ``(task_id, reason)`` tuple on success or an integer
+    non-zero exit code on parse error (with the error message already
+    written to stderr). Em-dashes in the reason text are rejected at
+    the boundary (CLAUDE.md backlog hygiene rule).
+    """
+    task_id = ""
+    reason = ""
+    args = list(argv)
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if not arg:
+            i += 1
+            continue
+        if arg == "--reason":
+            if i + 1 >= len(args) or not args[i + 1]:
+                print("ERROR: --reason requires a value", file=sys.stderr)
+                return 1
+            reason = args[i + 1]
+            i += 2
+            continue
+        if not task_id:
+            task_id = arg
+        i += 1
+    if not task_id or not reason:
+        print(f"ERROR: {command_name} requires <id> --reason <message>", file=sys.stderr)
+        return 1
+    em_dash_rc = _reject_em_dash("reason", reason)
+    if em_dash_rc is not None:
+        return em_dash_rc
+    return task_id, reason
+
+
+def cmd_hold(*argv: str) -> int:
+    """Mark a work unit as ``hold`` (deferred / under debate).
+
+    Usage::
+
+        hold <id> --reason "<message>"
+
+    ``hold`` is a deferred-decision lifecycle status: the unit stops
+    being considered actionable by the orchestrator's ``next`` query
+    until an operator runs ``unhold`` to return it to ``in-queue``.
+    Unlike ``declined``, ``hold`` is **not** terminal -- a held child
+    does NOT count toward a parent's auto-rollup to ``done``. The
+    ``--reason`` is REQUIRED so the deferral leaves an audit trail;
+    em-dashes are rejected at the input boundary for backlog hygiene.
+    """
+    parsed = _parse_id_and_reason(argv, "hold")
+    if isinstance(parsed, int):
+        return parsed
+    task_id, reason = parsed
+
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    target = _find_unit(units, task_id)
+    if target is None:
+        print(f"ERROR: Work unit '{task_id}' not found", file=sys.stderr)
+        return 1
+    wu_file = _resolve_unit_file(target)
+    if wu_file is None:
+        print(f"ERROR: Work unit file not found for '{task_id}'", file=sys.stderr)
+        return 1
+
+    BacklogManager().mark_held(wu_file, BACKLOG_INDEX, task_id, reason)
+    logger.info("Held %s: %s", task_id, reason)
+    print(json.dumps({"task_id": task_id, "status": "hold", "reason": reason}))
+    return 0
+
+
+def cmd_unhold(*argv: str) -> int:
+    """Return a held work unit to ``in-queue`` with a captured rationale.
+
+    Usage::
+
+        unhold <id> --reason "<message>"
+
+    The unit's status flips from ``hold`` back to ``in-queue`` so the
+    orchestrator's ``next``/parallel-candidate scan picks it up again.
+    The ``--reason`` is REQUIRED so the release leaves an audit trail;
+    em-dashes are rejected at the input boundary. ``unhold`` refuses
+    units whose current status is anything other than ``hold`` --
+    fail-fast keeps the lifecycle linear.
+    """
+    parsed = _parse_id_and_reason(argv, "unhold")
+    if isinstance(parsed, int):
+        return parsed
+    task_id, reason = parsed
+
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    target = _find_unit(units, task_id)
+    if target is None:
+        print(f"ERROR: Work unit '{task_id}' not found", file=sys.stderr)
+        return 1
+    if target.status is not WorkUnitStatus.HOLD:
+        print(
+            f"ERROR: cannot unhold {task_id!r}: current status is {target.status.value!r}, expected 'Hold'",
+            file=sys.stderr,
+        )
+        return 1
+    wu_file = _resolve_unit_file(target)
+    if wu_file is None:
+        print(f"ERROR: Work unit file not found for '{task_id}'", file=sys.stderr)
+        return 1
+
+    BacklogManager().unmark_held(wu_file, BACKLOG_INDEX, task_id, reason)
+    logger.info("Unheld %s: %s", task_id, reason)
+    print(json.dumps({"task_id": task_id, "status": "in-queue", "reason": reason}))
+    return 0
+
+
+def cmd_validate_backlog(*argv: str) -> int:
     """Validate backlog integrity and print any inconsistencies.
 
     Checks:
@@ -379,11 +1343,20 @@ def cmd_validate_backlog() -> int:
     - All dependency IDs reference real work unit IDs.
     - Status Summary table exists and counts match the Full Work Unit Index.
 
-    Exits 0 if the backlog is consistent; 1 with actionable error messages
-    if any inconsistencies are found.
+    Optional flag:
+    - ``--fix``: Auto-correct rule-10 (em-dash) and rule-11 (checkout_directory
+      prefix) violations in place and append an audit comment to each corrected
+      file's ``## Comments`` section. Prints a summary of corrections made.
+
+    Exits 0 if the backlog is consistent (or all violations were fixed); 1 with
+    actionable error messages if any inconsistencies remain.
     """
+    fix = "--fix" in argv
     mgr = BacklogManager()
-    errors = mgr.validate(BACKLOG_INDEX, BACKLOG_INDEX.parent)
+    errors = mgr.validate(BACKLOG_INDEX, BACKLOG_INDEX.parent, fix=fix)
+    if fix:
+        fix_count, files_fixed = mgr._fix_summary
+        print(f"Fixed {fix_count} violation(s) across {files_fixed} file(s).")
     if not errors:
         print("Backlog integrity check passed.")
         return 0
@@ -393,50 +1366,663 @@ def cmd_validate_backlog() -> int:
     return 1
 
 
-def cmd_report(since: str = "", watch_interval: int = 0) -> int:
-    """Print a formatted progress report with velocity and completion stats."""
+def _check_repo_symlink(repo_name: str, symlink_path: Path) -> tuple[bool, str | None]:
+    """Return ``(symlink_ok, error_or_None)`` for the configured symlink path."""
+    if symlink_path.exists():
+        return True, None
+    return False, (
+        f"{repo_name}: symlink missing at {symlink_path} -- run "
+        "06-multi-repo-symlinks.md procedure or create it manually"
+    )
+
+
+def _check_repo_origin(repo_name: str, target: Path, timeout: int, local_only: bool = False) -> tuple[bool, str | None]:
+    """Return ``(origin_ok, error_or_None)`` after 'git remote get-url origin'.
+
+    Default mode (``local_only=False``): the repo MUST have an ``origin``
+    remote configured; absence is an error. Behavior unchanged from the
+    pre-local-only world.
+
+    Local-only mode (``local_only=True``): the repo MUST NOT have an
+    ``origin`` remote; presence is an error. Catches misconfiguration
+    where the operator declared ``git_ops.local_only: true`` but the
+    target checkout still tracks a remote.
+
+    The boolean component of the tuple uses "ok" semantics in both modes:
+    ``True`` means the check passed and the caller may proceed; ``False``
+    means the check failed and the error string in the second slot
+    describes the fix.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(target), "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"{repo_name}: 'git remote get-url origin' timed out after {timeout}s"
+    has_origin = result.returncode == 0
+    if local_only:
+        if has_origin:
+            return False, (
+                f"{repo_name}: git_ops.local_only is true but clone at {target} has an "
+                f"'origin' remote configured ({result.stdout.strip()}). Either unset the "
+                "remote (git remote remove origin) or set git_ops.local_only: false."
+            )
+        return True, None
+    if not has_origin:
+        return False, (
+            f"{repo_name}: clone at {target} has no 'origin' remote configured (stderr: {result.stderr.strip()})"
+        )
+    return True, None
+
+
+def _check_repo_default_branch(repo_name: str, configured_default: str | None, timeout: int) -> str | None:
+    """Return an error string when the remote default_branch disagrees with config, else None."""
+    if not configured_default:
+        return None
+    try:
+        api_result = subprocess.run(
+            ["gh", "api", f"repos/{repo_name}", "--jq", ".default_branch"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return f"{repo_name}: 'gh api repos/{repo_name}' timed out after {timeout}s"
+    if api_result.returncode != 0:
+        return (
+            f"{repo_name}: 'gh api repos/{repo_name}' failed -- check gh auth status "
+            f"(stderr: {api_result.stderr.strip()})"
+        )
+    remote_default = api_result.stdout.strip()
+    if remote_default == configured_default:
+        return None
+    return (
+        f"{repo_name}: default_branch mismatch -- devbench.yaml says "
+        f"{configured_default!r} but remote default is {remote_default!r}. "
+        f"Run 'gh repo edit {repo_name} --default-branch {configured_default}' "
+        "or update devbench.yaml to match the remote."
+    )
+
+
+def _check_repo_open_prs(repo_name: str, single_branch: str, timeout: int) -> str | None:
+    """Return an error string when an open PR already targets *single_branch*, else None."""
+    try:
+        pr_result = subprocess.run(
+            [
+                "gh",
+                "pr",
+                "list",
+                "--repo",
+                repo_name,
+                "--head",
+                single_branch,
+                "--state",
+                "open",
+                "--json",
+                "number,title",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return f"{repo_name}: 'gh pr list' for {single_branch} timed out after {timeout}s"
+    if pr_result.returncode != 0 or pr_result.stdout.strip() in ("[]", ""):
+        return None
+    return (
+        f"{repo_name}: open PR(s) already exist on branch {single_branch!r}: "
+        f"{pr_result.stdout.strip()} -- close or merge before launching to "
+        "avoid conflicting feat-branch creation"
+    )
+
+
+def _check_repo_preflight(
+    repo_name: str,
+    repo_cfg: RepoConfig,
+    single_branch: str | None,
+    timeout: int,
+    local_only: bool = False,
+) -> list[str]:
+    """Run all pre-flight checks for a single repo and return its error list.
+
+    Extracted from :func:`cmd_check` to keep the dispatcher under the
+    project's branch-count budget. Each helper above owns one rail of
+    the gate and returns its own error string (or ``None``) so the
+    aggregation here is a flat list-extend.
+
+    When ``local_only`` is true, the origin check is inverted (a present
+    remote is the error) and the GitHub-API default-branch + open-PR
+    checks are skipped because no remote exists to talk to GitHub through.
+    """
+    checkout_subdir = repo_cfg.checkout_directory or repo_name.split("/", 1)[-1]
+    symlink_path = WORKSPACE_ROOT / checkout_subdir
+    symlink_ok, symlink_err = _check_repo_symlink(repo_name, symlink_path)
+    if not symlink_ok:
+        return [symlink_err] if symlink_err is not None else []
+    target = symlink_path.resolve()
+    origin_ok, origin_err = _check_repo_origin(repo_name, target, timeout, local_only=local_only)
+    if not origin_ok:
+        return [origin_err] if origin_err is not None else []
+    if local_only:
+        return []
+    errors: list[str] = []
+    branch_err = _check_repo_default_branch(repo_name, repo_cfg.default_branch, timeout)
+    if branch_err:
+        errors.append(branch_err)
+    if single_branch:
+        pr_err = _check_repo_open_prs(repo_name, single_branch, timeout)
+        if pr_err:
+            errors.append(pr_err)
+    return errors
+
+
+def cmd_check() -> int:
+    """Pre-flight verifier for orchestrator launch readiness.
+
+    For every repo in ``backlog/config/devbench.yaml``'s ``repos:`` map, verify:
+
+    1. Symlink exists at ``$JUDGE_WORKSPACE_ROOT/<checkout_directory>``.
+    2. Origin-remote check (mode-dependent):
+
+       - Default mode: the symlink target (the local clone) MUST have an
+         ``origin`` remote configured.
+       - ``git_ops.local_only: true``: the symlink target MUST NOT have an
+         ``origin`` remote configured (presence is misconfiguration).
+
+    3. The remote's ``default_branch`` matches ``devbench.yaml``'s
+       ``default_branch`` (or both fall back to ``origin/HEAD``).
+       Skipped under ``git_ops.local_only: true`` (no remote to query).
+    4. No open PR already targets the configured ``single_branch``
+       (when ``git_ops.single_branch`` is set). Skipped under
+       ``git_ops.local_only: true``.
+
+    Exits 0 if every check passes; 1 with actionable per-repo error messages
+    otherwise. ``DEVBENCH_CHECK_GH_API_TIMEOUT`` (seconds, default 30) bounds
+    each ``gh api`` call.
+    """
+    import os
+
+    from devbench.config_loader import load_runtime_config, resolve_config_path
+
+    timeout = int(os.environ.get("DEVBENCH_CHECK_GH_API_TIMEOUT", "30"))
+    cfg_path = resolve_config_path(None, os.environ, WORKSPACE_ROOT)
+    if cfg_path is None or not cfg_path.exists():
+        print(
+            "ERROR: devbench.yaml not found; set JUDGE_CONFIG_PATH or place at backlog/config/devbench.yaml",
+            file=sys.stderr,
+        )
+        return 1
+    cfg = load_runtime_config(cfg_path, os.environ)
+
+    single_branch = cfg.git_ops.single_branch if cfg.git_ops else None
+    local_only = cfg.git_ops.local_only if cfg.git_ops else False
+    errors: list[str] = []
+    for repo_name, repo_cfg in cfg.repos.items():
+        errors.extend(_check_repo_preflight(repo_name, repo_cfg, single_branch, timeout, local_only=local_only))
+
+    if not errors:
+        print(f"Pre-flight check passed for {len(cfg.repos)} target repo(s).")
+        return 0
+    print(f"Pre-flight check FAILED ({len(errors)} error(s)):")
+    for error in errors:
+        print(f"  ERROR: {error}")
+    return 1
+
+
+def _resolve_log_file_path() -> Path:
+    """Resolve the orchestrator log file path. Fail-fast on missing inputs.
+
+    Resolution precedence (first match wins; no implicit fallbacks):
+
+    1. ``JUDGE_LOG_FILE`` environment variable set to an explicit path.
+       Per-invocation override; used in tests and ad-hoc overrides.
+    2. ``RUNTIME_CONFIG.log_file`` from ``backlog/config/devbench.yaml``.
+       Single source of truth: when the operator sets it once in YAML,
+       every devbench invocation against this workspace -- the
+       orchestrator's ``setup_logging`` writer and ``cmd_report``'s
+       reader alike -- picks up the same path. The value is treated as
+       workspace-root-relative when not absolute.
+    3. ``<JUDGE_WORKSPACE_ROOT>/<DEFAULT_LOG_SUBDIR>/<DEFAULT_LOG_FILENAME>``
+       convention. Fires when neither (1) nor (2) is set but the
+       workspace root is known.
+
+    When NONE of the three resolves, raises :class:`SystemExit` with an
+    actionable error naming all three input shapes. The previous
+    implementation silently fell back to the devbench source-tree's
+    log path -- letting operators read a stale, unrelated log without
+    noticing -- which CLAUDE.md "Fail-fast" forbids.
+    """
+    explicit = os.environ.get("JUDGE_LOG_FILE", "").strip()
+    if explicit:
+        return Path(explicit)
+    workspace = os.environ.get("JUDGE_WORKSPACE_ROOT", "").strip()
+    configured = (RUNTIME_CONFIG.log_file or "").strip()
+    if configured:
+        configured_path = Path(configured)
+        if configured_path.is_absolute():
+            return configured_path
+        if workspace:
+            return Path(workspace) / configured_path
+        return configured_path
+    if workspace:
+        return Path(workspace) / DEFAULT_LOG_SUBDIR / DEFAULT_LOG_FILENAME
+    canonical = f"<root>/{DEFAULT_LOG_SUBDIR}/{DEFAULT_LOG_FILENAME}"
+    print(
+        "ERROR: cannot resolve orchestrator log file. Set one of:\n"
+        "  - JUDGE_LOG_FILE=<absolute-path-to-orchestrator.log>\n"
+        "  - 'log_file: <workspace-relative-path>' in backlog/config/devbench.yaml\n"
+        f"  - JUDGE_WORKSPACE_ROOT=<workspace-root>  (log resolves to {canonical})\n"
+        "and re-run.",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+
+def cmd_report(since: str = "", watch_interval: int = 0, once: bool = False) -> int:
+    """Print a formatted progress report with velocity and completion stats.
+
+    Issue #163: streams continuously by default when stdout is a TTY.
+    Pass ``once=True`` (or pipe / redirect stdout) to get the legacy
+    one-shot behaviour suitable for scripts and CI consumers.
+
+    The legacy ``--watch N`` flag is preserved for backward compatibility
+    but emits a deprecation notice and falls through to the streaming
+    loop (the integer interval is ignored; cadence is data-driven).
+    """
+    import warnings as _warnings
     from datetime import datetime
 
     from devbench.reporting.report import generate_report
 
-    log_file = Path(
-        os.environ.get(
-            "JUDGE_LOG_FILE",
-            str(Path(__file__).resolve().parent / DEFAULT_LOG_SUBDIR / DEFAULT_LOG_FILENAME),
-        )
-    )
+    log_file = _resolve_log_file_path()
 
     since_dt = None
     if since:
         since_dt = datetime.strptime(since, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
 
-    if watch_interval > 0:
-        import time
+    # Issue #163 streaming-default contract:
+    # - --since is always one-shot (a frozen-window snapshot doesn't
+    #   benefit from continuous refresh).
+    # - --once forces one-shot (script / CI consumer escape hatch).
+    # - stdout-not-a-TTY forces one-shot (piping / redirecting).
+    # - --watch N is deprecated but still works; falls through to
+    #   streaming mode with a warning.
+    # - default on TTY -> streaming.
+    is_tty = sys.stdout.isatty()
+    force_once = once or (since_dt is not None) or not is_tty
 
-        # Capture watch loop start once so the "This run" column tracks activity
-        # since the user kicked off `devbench report --watch`, not since each tick.
-        report_started_at = datetime.now(UTC)
-        try:
-            while True:
-                # Delegate to the OS clear binary when available (`clear` /
-                # `cls`); it uses terminfo and reliably wipes scrollback on
-                # xterm.js (VS Code), iTerm, GNOME Terminal, Windows Terminal.
-                # Fallback: VT100 full reset (\033c) which works on every
-                # ANSI terminal but is more disruptive. The prior \033[3J
-                # escape didn't reliably clear scrollback in all terminals.
-                if _TERMINAL_CLEAR_CMD:
-                    subprocess.run([_TERMINAL_CLEAR_CMD], check=False)
-                else:
-                    print("\033c", end="", flush=True)
-                report = generate_report(log_path=log_file, since=since_dt, report_started_at=report_started_at)
-                print(report)
-                time.sleep(watch_interval)
-        except KeyboardInterrupt:
-            return 0
-    else:
+    if force_once:
+        # Issue #162 Phase 6: serve from the materialised snapshot when
+        # fresh (orchestrator log unchanged since the snapshot was
+        # written). Skips log parsing + per-window aggregation; falls
+        # back to live ``generate_report`` when the snapshot is stale,
+        # missing, or invalidated by a schema-version mismatch. The
+        # ``--since`` path always recomputes because a frozen-window
+        # snapshot is never the right answer for a custom-window query.
+        if since_dt is None:
+            from devbench.reporting.snapshot import read_snapshot
+
+            cached = read_snapshot(WORKSPACE_ROOT, log_file)
+            if cached is not None:
+                print(cached.report_text)
+                return 0
         report = generate_report(log_path=log_file, since=since_dt)
         print(report)
         return 0
+
+    if watch_interval > 0:
+        _warnings.warn(
+            "--watch is deprecated; streaming is now the default; the interval value is ignored",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
+    # Streaming mode. Build a closure over the constant inputs so the
+    # streaming loop's render_fn signature matches what
+    # devbench.reporting.streaming.stream_report expects (log_path
+    # keyword argument; everything else closed over).
+    from devbench.reporting.streaming import stream_report
+
+    report_started_at = datetime.now(UTC)
+
+    def _render(*, log_path: Path) -> str:
+        return generate_report(
+            log_path=log_path,
+            since=since_dt,
+            report_started_at=report_started_at,
+        )
+
+    return stream_report(log_file, _render)
+
+
+def cmd_upgrade(*argv: str) -> int:
+    """Idempotent migration to the latest devbench layout.
+
+    Issue #162 unified upgrade command (ADR-22). Detects workspace
+    state and runs the safe migrations automatically. Default-deny on
+    the Phase 3 destructive migration: only runs with
+    ``--migrate-log-shards``. Self-tests at the end via the
+    BacklogParser load so the operator sees pass/fail.
+
+    Re-running is a no-op (every step is idempotent).
+    """
+    args = list(argv)
+    confirm_log_migration = "--migrate-log-shards" in args
+    if confirm_log_migration:
+        args.remove("--migrate-log-shards")
+    if args:
+        print(
+            f"ERROR: upgrade takes no positional arguments; got {args!r}",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(f"[upgrade] workspace: {WORKSPACE_ROOT}")
+    print()
+
+    log_path = _resolve_log_file_path()
+
+    _upgrade_report_cache_phase()
+    _upgrade_window_stats_phase(log_path)
+    rc = _upgrade_sharded_log_phase(log_path, confirm_log_migration)
+    if rc != 0:
+        return rc
+    _upgrade_snapshot_phase()
+    _upgrade_archive_phase()
+    _upgrade_self_tests_phase()
+
+    print()
+    print("Done. Migrations complete; run `devbench report` to verify.")
+    return 0
+
+
+def _upgrade_report_cache_phase() -> None:
+    """Phase 1+4: SQLite cache. Self-healing; no operator action."""
+    print("Phase 1+4 (incremental cache + SQLite index):")
+    cache_path = WORKSPACE_ROOT / ".devbench" / "report-cache" / "events.sqlite"
+    if cache_path.is_file():
+        print(f"  cache present at {cache_path.relative_to(WORKSPACE_ROOT)}; reads serve from cache")
+    else:
+        print("  cache absent -> first `devbench report` will build from logs/orchestrator.log")
+    print("  no operator action needed")
+    print()
+
+
+def _upgrade_window_stats_phase(log_path: Path) -> None:
+    """Phase 2: window-stats aggregates. Idempotent rebuild."""
+    print("Phase 2 (window indices):")
+    if log_path.is_file():
+        from devbench.reporting.window_stats import rebuild_from_log
+
+        count = rebuild_from_log(WORKSPACE_ROOT, log_path)
+        print(f"  rebuilt {count} task aggregate(s) under .devbench/window-stats/")
+    else:
+        print("  orchestrator log absent -> nothing to aggregate yet")
+    print()
+
+
+def _upgrade_sharded_log_phase(log_path: Path, confirmed: bool) -> int:
+    """Phase 3: destructive log shard migration. Default-deny."""
+    print("Phase 3 (sharded event store):")
+    if not confirmed:
+        print("  ! DESTRUCTIVE: rewrites logs/orchestrator.log into logs/<YYYY-MM>/<task>.jsonl")
+        print("  ! original archived to logs/legacy/orchestrator.log (kept one release cycle)")
+        print("  Pass --migrate-log-shards to proceed. Skipping for now.")
+        print()
+        return 0
+    if not log_path.is_file():
+        print("  orchestrator log absent -> nothing to migrate")
+        print()
+        return 0
+    from devbench.reporting.sharded_log import migrate_flat_to_sharded
+
+    try:
+        result = migrate_flat_to_sharded(WORKSPACE_ROOT, log_path)
+    except FileNotFoundError as exc:
+        print(f"  ERROR: {exc}")
+        return 1
+    print(
+        f"  migrated {result['lines_processed']} lines into "
+        f"{result['shards_written']} task shard(s) + "
+        f"{result['meta_shards_written']} meta shard(s)"
+    )
+    print("  original archived to logs/legacy/orchestrator.log")
+    print()
+    return 0
+
+
+def _upgrade_snapshot_phase() -> None:
+    """Phase 6: snapshot. Self-healing on next iteration."""
+    print("Phase 6 (materialised snapshots):")
+    snapshot_file = WORKSPACE_ROOT / ".devbench" / "report-snapshot.json"
+    if snapshot_file.is_file():
+        print(f"  snapshot present at {snapshot_file.relative_to(WORKSPACE_ROOT)}")
+    else:
+        print("  snapshot absent -> next orchestrate iteration will write it")
+    print("  no operator action needed")
+    print()
+
+
+def _upgrade_archive_phase() -> None:
+    """Phase 7: Parquet archive. Opt-in dep check only."""
+    print("Phase 7 (Parquet archive, opt-in):")
+    import importlib.util
+
+    if importlib.util.find_spec("pyarrow") is not None:
+        print("  pyarrow installed; archive ended sessions via `devbench archive-session <id>`")
+    else:
+        print("  pyarrow not installed (skipped)")
+        print("  to enable: pip install devbench[archive], then `devbench archive-session <id>`")
+    print()
+
+
+def _upgrade_self_tests_phase() -> None:
+    """Self-tests: parser load + report log-event coverage.
+
+    Issue #168: the report-event self-test was added after a live
+    regression where the Phase 3 migration archived the source log
+    and `devbench report` returned an empty view because the reader
+    didn't yet consume the sharded tree. The check runs an indexed
+    refresh against the workspace's full orch-log set and asserts at
+    least one event was indexed; surfaces a structured warning when
+    the set is empty so future operators see the failure mode
+    immediately.
+
+    Both tests are non-fatal -- a failure prints a structured warning
+    but does not change the upgrade exit code. The migrations
+    themselves succeeded; the self-test is a defensive observability
+    layer, not a gate.
+    """
+    print("Self-tests:")
+    from devbench.backlog.parser import BacklogParser
+    from devbench.reporting.event_index import EventIndex
+
+    try:
+        parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+        parser.parse_index()
+        print("  ✓ devbench validate-backlog (parser load) passes")
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"  ! parser-load failed: {exc}")
+        print("    re-run after fixing the backlog state, or check JUDGE_WORKSPACE_ROOT")
+
+    log_path = _resolve_log_file_path()
+    try:
+        idx = EventIndex.open(WORKSPACE_ROOT)
+    except (OSError, RuntimeError) as exc:
+        print(f"  ! report self-test skipped (cache unavailable): {exc}")
+        return
+    try:
+        idx.refresh_orch_log_sources(WORKSPACE_ROOT, log_path)
+        all_ts = idx.all_log_timestamps_for_workspace(WORKSPACE_ROOT, log_path)
+    finally:
+        idx.close()
+    if all_ts:
+        print(f"  ✓ report self-test: {len(all_ts)} log event(s) indexed across the workspace's orch-log set")
+    else:
+        print("  ! report self-test: 0 log events indexed.")
+        print("    No data in either logs/orchestrator.log or any sharded shard.")
+        print("    If you just ran --migrate-log-shards and see this, file an issue: the")
+        print("    reader integration may have regressed. Roll back via:")
+        print("      mv logs/legacy/orchestrator.log logs/orchestrator.log && rm -rf logs/<YYYY-MM>/")
+
+
+def cmd_migrate_log_shards(*argv: str) -> int:
+    """Partition ``logs/orchestrator.log`` into a sharded tree.
+
+    Issue #162 Phase 3 (ADR-18). DESTRUCTIVE: rewrites the flat log
+    into ``logs/<YYYY-MM>/<task>.jsonl`` shards and archives the
+    original to ``logs/legacy/orchestrator.log`` for one release
+    cycle. Refuses to run unless ``--migrate-log-shards`` is passed
+    (CLAUDE.md execute-with-care default-deny). Reversible: restore
+    by deleting ``logs/<YYYY-MM>/`` and renaming the legacy log back.
+
+    The orchestrator continues writing to a fresh
+    ``logs/orchestrator.log`` after migration; readers merge the
+    sharded tree (historical) with the live flat log (recent).
+    """
+    args = list(argv)
+    confirmed = "--migrate-log-shards" in args
+    if confirmed:
+        args.remove("--migrate-log-shards")
+    if args:
+        print(
+            f"ERROR: migrate-log-shards takes no positional arguments; got {args!r}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if not confirmed:
+        print(
+            "migrate-log-shards: refusing to run without --migrate-log-shards.\n"
+            "  This rewrites your orchestrator log into logs/<YYYY-MM>/<task>.jsonl\n"
+            "  shards and archives the original to logs/legacy/orchestrator.log.\n"
+            "  Pass --migrate-log-shards to proceed."
+        )
+        return 0
+
+    from devbench.reporting.sharded_log import migrate_flat_to_sharded
+
+    log_path = _resolve_log_file_path()
+    try:
+        result = migrate_flat_to_sharded(WORKSPACE_ROOT, log_path)
+    except FileNotFoundError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    print(
+        f"migrate-log-shards: processed {result['lines_processed']} lines into "
+        f"{result['shards_written']} task shard(s) + "
+        f"{result['meta_shards_written']} meta shard(s); "
+        f"original archived to logs/legacy/orchestrator.log"
+    )
+    return 0
+
+
+def cmd_archive_session(*argv: str) -> int:
+    """Convert an ended session's JSONL log to a Parquet cold archive.
+
+    Issue #162 Phase 7 (ADR-21). Opt-in via ``pip install devbench[archive]``;
+    raises a structured error if ``pyarrow`` isn't installed.
+
+    Usage: ``devbench archive-session <session-id> [--log-path <path>]``.
+    Default ``--log-path`` is the workspace's standard orchestrator log;
+    pass an explicit path when archiving a sibling log file (rare).
+    """
+    from devbench.reporting.archive import (
+        ArchiveDependencyMissingError,
+        archive_session,
+    )
+
+    args = list(argv)
+    log_path_override: Path | None = None
+    if "--log-path" in args:
+        idx = args.index("--log-path")
+        if idx + 1 >= len(args):
+            print("ERROR: --log-path requires a value", file=sys.stderr)
+            return 1
+        log_path_override = Path(args[idx + 1])
+        del args[idx : idx + 2]
+    if len(args) != 1:
+        print(
+            "ERROR: archive-session takes exactly one positional argument: <session-id>",
+            file=sys.stderr,
+        )
+        return 1
+    session_id = args[0]
+    log_path = log_path_override if log_path_override is not None else _resolve_log_file_path()
+
+    try:
+        out_path = archive_session(WORKSPACE_ROOT, session_id, log_path)
+    except ArchiveDependencyMissingError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    except FileNotFoundError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"archive-session: wrote {out_path}")
+    return 0
+
+
+def cmd_rebuild_window_stats(*argv: str) -> int:
+    """Walk the orchestrator log and rebuild every per-task aggregate JSON.
+
+    Issue #162 Phase 2 (ADR-17). Idempotent; safe to run at any cadence.
+    Used by ``devbench upgrade`` after a version pull, by operators
+    after manually deleting ``.devbench/window-stats/``, and as a
+    correctness guarantee when an in-flight orchestrator restarts on
+    a workspace that didn't have the per-transition hook installed
+    when the first transitions happened.
+    """
+    if argv:
+        print(
+            f"ERROR: cmd_rebuild_window_stats takes no arguments; got {argv!r}",
+            file=sys.stderr,
+        )
+        return 1
+    from devbench.reporting.window_stats import rebuild_from_log
+
+    log_file = _resolve_log_file_path()
+    count = rebuild_from_log(WORKSPACE_ROOT, log_file)
+    print(f"rebuild-window-stats: wrote {count} per-task aggregate file(s) under .devbench/window-stats/")
+    return 0
+
+
+def cmd_write_snapshot(*argv: str) -> int:
+    """Render the report once and persist it to ``<workspace>/.devbench/report-snapshot.json``.
+
+    Issue #162 Phase 6 (ADR-20). Invoked by the orchestrate skill at the
+    end of every loop iteration so subsequent ``devbench report --once``
+    calls can serve from the snapshot in single-digit milliseconds
+    instead of re-parsing the orchestrator log + recomputing every
+    per-window aggregate. Idempotent; safe to invoke at any cadence.
+
+    Pure write -- never mutates the backlog or the orchestrator log.
+    Snapshot deletion is always safe; the next ``devbench report`` call
+    rebuilds via the live aggregation path.
+    """
+    if argv:
+        # No flags currently. Reject extras early so a future ``--force``
+        # flag etc. doesn't silently absorb garbage from an upgraded
+        # caller that uses a flag this version doesn't know.
+        print(
+            f"ERROR: cmd_write_snapshot takes no arguments; got {argv!r}",
+            file=sys.stderr,
+        )
+        return 1
+    from devbench.reporting.report import generate_report
+    from devbench.reporting.snapshot import write_snapshot
+
+    log_file = _resolve_log_file_path()
+    report = generate_report(log_path=log_file)
+    write_snapshot(WORKSPACE_ROOT, report, log_file)
+    return 0
 
 
 def cmd_log(message: str) -> int:
@@ -707,6 +2293,33 @@ def cmd_log_verdict(judge_name: str, unit_id: str, verdict: str, feedback: str =
         print(f"ERROR: verdict must be 'pass' or 'fail', got '{verdict}'", file=sys.stderr)
         return 1
 
+    # Judge-name allowlist (single source of truth in
+    # ``devbench.constants.KNOWN_JUDGE_NAMES``). The set is intentionally
+    # broader than ``ALL_REQUIRED_JUDGE_NAMES``: only the canonical 5
+    # reviewer names satisfy the done-gate's
+    # ``_last_round_all_passed`` check, but workflow agents
+    # (``task_factory``, ``blocker_resolver``, ``manifest_amender``,
+    # ``executor``) legitimately write audit-only verdicts that are
+    # visible in the Comments section but do not count toward the gate.
+    # Refusing typos here prevents the malformed
+    # ``log-verdict <agent> <id> pass <message>`` shape from landing in
+    # the audit trail with a junk judge field that confuses reviewers
+    # and the done-gate's bookkeeping.
+    judge_clean = judge_name.strip()
+    if judge_clean not in KNOWN_JUDGE_NAMES:
+        valid = ", ".join(sorted(KNOWN_JUDGE_NAMES))
+        canonical_list = ", ".join(sorted(ALL_REQUIRED_JUDGE_NAMES))
+        print(
+            f"ERROR: judge name {judge_name!r} is not on the allowlist; "
+            f"valid choices are: {valid}. Use the underscored form "
+            "(e.g. 'code_review', not 'code-reviewer'). Only the 5 "
+            f"canonical reviewers satisfy the done-gate ({canonical_list}); "
+            "the remaining names write audit-only verdicts. Non-canonical "
+            "agents writing free-form narration must use 'log-comment'.",
+            file=sys.stderr,
+        )
+        return 1
+
     rc = _reject_em_dash("feedback", feedback)
     if rc is not None:
         return rc
@@ -917,6 +2530,16 @@ def _git_ops_deferred(unit_id: str, unit: WorkUnit, canonical_repo: str, repo_pa
     # its own assert_on_branch as a final fail-fast guard.
     ops.ensure_branch(canonical_repo, repo_path, branch)
 
+    # Orphan-pattern check: refuse to commit when any staged path matches
+    # a build/state pattern (terraform state, terragrunt cache, Python
+    # pycache, etc.). This guards against the class of pollution that
+    # bypasses the manifest-scope assertion when an agent's Manifest
+    # accidentally lists such a path or when files slip through unstaged
+    # paths. On detection, auto-emit a cleanup proposal so the cascade
+    # self-heals; the original task moves to blocked-pending-proposal.
+    if _emit_orphan_cleanup_proposal_if_needed(unit_id, unit, repo_path):
+        return 1
+
     # Manifest-scope check: every staged path must be in the work unit's
     # Changes Manifest. Catches the TRACE_FILE / dst/ / fixture-pollution
     # class of bug deterministically before commit. Skipped only when the
@@ -932,6 +2555,848 @@ def _git_ops_deferred(unit_id: str, unit: WorkUnit, canonical_repo: str, repo_pa
         mgr._append_agent_comment(wu_file, "git_ops", f"[COMMIT_DEFERRED] {commit_message}")
     print(json.dumps({"unit_id": unit_id, "mode": "deferred", "branch": branch}))
     return 0
+
+
+def _orphan_paths_for_repo(unit_id: str, repo_path: Path) -> list[str] | None:
+    """Return the union of staged + tracked orphan paths for *repo_path*.
+
+    Returns ``None`` when the gate is skipped (non-git checkout or git
+    subprocess failure); the caller treats that as "no detection, no
+    refusal". Returns ``[]`` when the repo is clean. Returns the sorted
+    list of orphan paths otherwise. Extracted from
+    :func:`_emit_orphan_cleanup_proposal_if_needed` to keep that
+    function under the project's branch / return budget.
+    """
+    from devbench.git_orphans import detect_staged_orphans, detect_tracked_orphans
+
+    if not (repo_path / ".git").exists():
+        return None
+    try:
+        staged = detect_staged_orphans(repo_path)
+        tracked = detect_tracked_orphans(repo_path)
+    except subprocess.CalledProcessError as exc:
+        logger.warning(
+            "git-ops orphan-detect skipped for %s -- subprocess failed: %s",
+            unit_id,
+            exc,
+        )
+        return None
+    return sorted(set(staged) | set(tracked))
+
+
+def _emit_orphan_cleanup_proposal_if_needed(unit_id: str, unit: WorkUnit, repo_path: Path) -> bool:
+    """Self-defending git-ops gate: refuse pollution, recover the cleanup inline.
+
+    Two modes (Phase 1 of the orphan-cascade fix):
+
+    1. **Inline-cleanup mode (default)**: when ``INLINE_ORPHAN_CLEANUP_ENABLED``
+       is True, run ``cleanup_tracked_orphans`` programmatically and commit the
+       result as a devbench-authored chore commit on the task's branch, then
+       return ``False`` so the caller continues with the original task's
+       commit. No backlog proposal is emitted; the cleanup is not a work unit.
+       This collapses the cascade where multiple parents emitted duplicate
+       cleanup proposals and those proposals themselves got blocked by the
+       manifest amender on predecessor staging.
+
+    2. **Legacy proposal mode**: when the operator sets
+       ``DEVBENCH_DISABLE_INLINE_ORPHAN_CLEANUP=1`` (audit-driven backlogs that
+       require a work unit per cleanup), the original behaviour applies:
+       allocate a cleanup task ID, materialise the proposal, auto-wire the
+       parent as ``BLOCKED_PENDING_PROPOSAL``. Cross-task de-duplication is
+       added so two parents detecting the same orphan set wire to the SAME
+       cleanup task instead of emitting duplicates.
+
+    Returns ``False`` (continue with commit) when no orphans are detected
+    OR when inline cleanup succeeds. Returns ``True`` (refuse) only on
+    legacy-mode emit or hard failure of the inline path.
+    """
+    from devbench.config import INLINE_ORPHAN_CLEANUP_ENABLED
+
+    detected = _orphan_paths_for_repo(unit_id, repo_path)
+    if detected is None or not detected:
+        return False
+
+    if INLINE_ORPHAN_CLEANUP_ENABLED:
+        return _inline_orphan_cleanup_or_refuse(unit_id, repo_path, detected)
+
+    return _legacy_emit_orphan_cleanup_proposal(unit_id, unit, repo_path, detected)
+
+
+class _InlineCleanupError(RuntimeError):
+    """Raised when an inline orphan-cleanup step fails; caught at the
+    function boundary so :func:`_inline_orphan_cleanup_or_refuse` has a
+    single failure-return path (PLR0911 conformance)."""
+
+
+def _run_inline_cleanup_steps(
+    repo_path: Path,
+    detected: list[str],
+) -> tuple[bool, object]:
+    """Inner steps for inline orphan cleanup. Returns (cleanup_committed, report).
+
+    Raises :class:`_InlineCleanupError` on any subprocess failure so the
+    caller can convert to a single refuse-return.
+
+    Resolves *repo_path* once at the function head so every subsequent
+    operation runs in the same path-space as ``cleanup_tracked_orphans``
+    does internally (it calls ``repo_path.resolve()`` at its own
+    function head). Without this, a symlinked checkout (the documented
+    workspace layout for repos that cannot live next to
+    ``JUDGE_WORKSPACE_ROOT``) produces an ``OrphanReport`` whose
+    ``gitignore_path`` lives in resolved-path space while this caller's
+    ``repo_path`` lives in symlink-path space, and the
+    ``gitignore_path.relative_to(repo_path)`` call below raises
+    ``ValueError``. Issue #125.
+    """
+    from devbench.constants import DEVBENCH_INLINE_CLEANUP_COMMIT_MESSAGE
+    from devbench.git_orphans import cleanup_tracked_orphans
+    from devbench.github.git_ops import GitOpsService
+
+    repo_path = repo_path.resolve()
+    ops = GitOpsService()
+    try:
+        _, staged_out, _ = ops._git(["diff", "--cached", "--name-only"], repo_path)
+    except RuntimeError as exc:
+        raise _InlineCleanupError(f"could not read pre-cleanup staged paths: {exc}") from exc
+    pre_cleanup_staged = [line.strip() for line in staged_out.splitlines() if line.strip()]
+    orphan_set = set(detected)
+    paths_to_restore = [p for p in pre_cleanup_staged if p not in orphan_set]
+
+    try:
+        ops._git(["reset", "HEAD", "--"], repo_path)
+    except RuntimeError as exc:
+        raise _InlineCleanupError(f"git reset HEAD failed: {exc}") from exc
+
+    try:
+        report = cleanup_tracked_orphans(repo_path)
+    except (FileNotFoundError, subprocess.CalledProcessError, RuntimeError) as exc:
+        raise _InlineCleanupError(f"cleanup_tracked_orphans failed: {exc}") from exc
+
+    cleanup_committed = False
+    if report.gitignore_updated:
+        try:
+            ops._git(
+                ["add", "--", str(report.gitignore_path.relative_to(repo_path))],
+                repo_path,
+            )
+        except RuntimeError as exc:
+            raise _InlineCleanupError(f"could not stage .gitignore: {exc}") from exc
+
+    if report.removed or report.gitignore_updated:
+        try:
+            ops._git(
+                ["commit", "-m", DEVBENCH_INLINE_CLEANUP_COMMIT_MESSAGE],
+                repo_path,
+            )
+            cleanup_committed = True
+        except RuntimeError as exc:
+            raise _InlineCleanupError(f"cleanup commit failed: {exc}") from exc
+
+    if paths_to_restore:
+        try:
+            ops._git(["add", "-A", "--", *paths_to_restore], repo_path)
+        except RuntimeError as exc:
+            raise _InlineCleanupError(f"could not re-stage executor paths after cleanup: {exc}") from exc
+
+    return cleanup_committed, report
+
+
+def _inline_orphan_cleanup_or_refuse(
+    unit_id: str,
+    repo_path: Path,
+    detected: list[str],
+) -> bool:
+    """Run ``cleanup_tracked_orphans`` inline, commit it, preserve executor staging.
+
+    Procedure (Phase 1, approach 7):
+
+    1. Capture the executor's pre-cleanup staged paths via
+       ``git diff --cached --name-only``.
+    2. Filter out detected orphans (so we don't re-stage them after cleanup).
+    3. Reset the index to HEAD via ``git reset HEAD --``.
+    4. Run ``cleanup_tracked_orphans(repo_path)`` -- ``git rm --cached`` each
+       tracked orphan and write/extend the devbench-managed ``.gitignore``.
+    5. Stage ``.gitignore`` (the rm operations already staged the deletions).
+    6. Commit with the canonical chore message.
+    7. Re-stage the executor's filtered staging set so the downstream
+       ``assert_staged_matches_manifest`` runs against the executor's intent
+       (minus orphans).
+
+    Returns ``False`` on success (caller continues with the task commit) or
+    ``True`` on hard failure (caller refuses the task commit).
+    """
+    try:
+        cleanup_committed, report = _run_inline_cleanup_steps(repo_path, detected)
+    except _InlineCleanupError as exc:
+        logger.warning("inline orphan cleanup refused commit for %s: %s", unit_id, exc)
+        sample = ", ".join(detected[:5])
+        if len(detected) > 5:
+            sample += f", and {len(detected) - 5} more"
+        print(
+            f"ERROR: git-ops refused -- inline orphan cleanup failed for {unit_id} "
+            f"({len(detected)} detected, sample: {sample}). Reason: {exc}. "
+            "Run 'devbench cleanup-tracked-orphans <repo>' manually, commit "
+            "the result, then re-invoke git-ops to resume.",
+            file=sys.stderr,
+        )
+        return True
+
+    if cleanup_committed:
+        logger.info(
+            "git-ops: inline-cleaned %d orphan(s) for %s (%d removed, gitignore %s)",
+            len(detected),
+            unit_id,
+            len(report.removed),  # type: ignore[attr-defined]
+            "updated" if report.gitignore_updated else "unchanged",  # type: ignore[attr-defined]
+        )
+        sample = ", ".join(detected[:5])
+        if len(detected) > 5:
+            sample += f", and {len(detected) - 5} more"
+        print(
+            f"git-ops: inline-cleaned {len(detected)} orphan path(s) "
+            f"(sample: {sample}); cleanup chore commit landed; "
+            "continuing with task commit.",
+            file=sys.stderr,
+        )
+    else:
+        logger.info(
+            "git-ops: orphan-cleanup no-op for %s (detected %d but cleanup yielded "
+            "no commit -- staged-only orphans now ignored via existing .gitignore); "
+            "continuing with task commit",
+            unit_id,
+            len(detected),
+        )
+    return False
+
+
+def _legacy_emit_orphan_cleanup_proposal(
+    unit_id: str,
+    unit: WorkUnit,
+    repo_path: Path,
+    detected: list[str],
+) -> bool:
+    """Legacy proposal-emit path (gated behind ``DEVBENCH_DISABLE_INLINE_ORPHAN_CLEANUP=1``).
+
+    Adds cross-task de-duplication that the original implementation lacked:
+    if any pending proposal under ``<workspace>/.devbench/proposals/*.json``
+    already targets ``.gitignore`` with an orphan-cleanup rejection_reason
+    overlapping the current detection set, this function reuses that proposal
+    (auto-wires the current parent as ``BLOCKED_PENDING_PROPOSAL`` against
+    the existing cleanup task) instead of allocating a new one.
+    """
+    from devbench.backlog.proposal import (
+        Proposal,
+        ProposalError,
+        ProposedTask,
+        allocate_next_ids,
+        materialise_proposal,
+        promote_proposal,
+        proposal_path,
+        write_proposal,
+    )
+
+    proposal_file = proposal_path(WORKSPACE_ROOT, unit_id)
+    if proposal_file.exists():
+        logger.info(
+            "git-ops: orphans detected for %s; proposal already exists at %s -- refusing commit",
+            unit_id,
+            proposal_file,
+        )
+        print(
+            f"ERROR: git-ops refused -- {len(detected)} build/state artifact(s) "
+            f"would pollute the commit (e.g. {detected[0]!r}). "
+            f"Cleanup proposal already pending at {proposal_file}; "
+            f"the cascade will handle it on the next iteration.",
+            file=sys.stderr,
+        )
+        return True
+
+    existing_cleanup = _find_existing_cleanup_proposal(detected)
+    if existing_cleanup is not None:
+        wired = _wire_orphan_cleanup_dep_chain(
+            new_id=existing_cleanup,
+            files_to_own=[".gitignore"],
+            unit_repo=unit.repo or "",
+        )
+        logger.info(
+            "git-ops: orphan detection for %s reuses existing cleanup task %s "
+            "(de-duplication; wired %d peer claimants)",
+            unit_id,
+            existing_cleanup,
+            len(wired),
+        )
+        sample = ", ".join(detected[:5])
+        print(
+            f"ERROR: git-ops refused -- {len(detected)} build/state artifact path(s) "
+            f"would pollute the commit (sample: {sample}). "
+            f"Existing cleanup task {existing_cleanup} already covers this orphan set; "
+            f"{unit_id} wired as dependent (no duplicate emit).",
+            file=sys.stderr,
+        )
+        return True
+
+    story_id = "-".join(unit_id.split("-")[:3])
+    try:
+        new_id = allocate_next_ids(WORKSPACE_ROOT, BACKLOG_ROOT, story_id, 1)[0]
+    except ProposalError as exc:
+        print(f"ERROR: git-ops refused (cannot allocate cleanup-task ID): {exc}", file=sys.stderr)
+        return True
+
+    repo_label = unit.repo or str(repo_path.name)
+    sample = ", ".join(detected[:5])
+    if len(detected) > 5:
+        sample += f", and {len(detected) - 5} more"
+    proposal = Proposal(
+        source_task_id=unit_id,
+        generated_at=datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        rejection_reason=(
+            f"git-ops refused: {len(detected)} build/state artifact path(s) "
+            f"would be committed ({sample}). These match standard "
+            "ignore-worthy patterns (terraform state, terragrunt cache, "
+            "Python pycache, coverage, etc.) and must be untracked + "
+            "added to .gitignore before any work-unit commit can land."
+        ),
+        proposed_tasks=[
+            ProposedTask(
+                suggested_id=new_id,
+                title=f"Untrack build/state orphans in {repo_label} and write managed .gitignore",
+                files_to_own=[".gitignore"],
+                linked_scenarios=["git-ops orphan-pattern guard"],
+                suggested_acs=[
+                    f"AC-FUNC-001: 'devbench cleanup-tracked-orphans {repo_label}' exits 0 "
+                    "and removes every detected orphan from the index "
+                    "(verified by re-running with --dry-run; detected_count is 0).",
+                    "AC-FUNC-002: The repo's root .gitignore contains the "
+                    "devbench-managed block "
+                    f"({DEVBENCH_GITIGNORE_HEADER_LITERAL!r}) covering "
+                    "terraform state, terragrunt cache, Python pycache, "
+                    "coverage, node_modules, and .DS_Store.",
+                    "AC-FUNC-003: 'git ls-files' in the repo returns zero "
+                    "matches for the standard orphan patterns after cleanup.",
+                    "AC-FINAL-009: 'devbench validate-backlog' exits 0.",
+                    "AC-FINAL-011: No bypass annotations introduced.",
+                    "AC-FINAL-012: No em-dash characters introduced.",
+                    "AC-FINAL-015: Changes Manifest matches git diff exactly "
+                    "(.gitignore + the unstaged --cached file removals).",
+                ],
+                suggested_approach=(
+                    f"Context: {len(detected)} build/state artifact paths "
+                    f"are tracked or staged in {repo_label} and would pollute "
+                    f"any commit through devbench's git-ops. Detected sample: {sample}. "
+                    "Scope: edit .gitignore at the repo root and run "
+                    f"'devbench cleanup-tracked-orphans {repo_label}'. "
+                    "Out of scope: any file outside the repo's tracked-orphan set; "
+                    "no spec changes; no history rewrite (the cleanup is "
+                    "forward-only via 'git rm --cached', preserving files on disk). "
+                    "Approach: 1. RED -- author tests/integration/"
+                    "test_orphan_cleanup.py asserting "
+                    "'devbench cleanup-tracked-orphans <repo> --dry-run' "
+                    "returns detected_count == 0 (the test fails initially "
+                    "because orphans are present). 2. GREEN -- run "
+                    f"'devbench cleanup-tracked-orphans {repo_label}', "
+                    "which untracks every match and writes the .gitignore "
+                    "block; rerun the dry-run; assertion passes. "
+                    "3. REFACTOR -- verify .gitignore lines are deduped and "
+                    "the devbench-managed header appears once."
+                ),
+            )
+        ],
+    )
+
+    try:
+        write_proposal(WORKSPACE_ROOT, proposal)
+        materialised_files = materialise_proposal(
+            workspace_root=WORKSPACE_ROOT,
+            backlog_root=BACKLOG_ROOT,
+            backlog_index=BACKLOG_INDEX,
+            proposal=proposal,
+            repo=unit.repo,
+        )
+        promote_proposal(
+            workspace_root=WORKSPACE_ROOT,
+            backlog_root=BACKLOG_ROOT,
+            backlog_index=BACKLOG_INDEX,
+            task_id=new_id,
+            dep_on_source=True,
+        )
+        wired_claimants = _wire_orphan_cleanup_dep_chain(
+            new_id=new_id,
+            files_to_own=[".gitignore"],
+            unit_repo=unit.repo,
+        )
+    except ProposalError as exc:
+        print(
+            f"ERROR: git-ops refused (orphans detected) and proposal emission failed: {exc}",
+            file=sys.stderr,
+        )
+        return True
+
+    logger.info(
+        "git-ops: refused commit for %s due to %d orphan path(s); auto-emitted cleanup proposal %s",
+        unit_id,
+        len(detected),
+        new_id,
+    )
+    extra = (
+        f" Auto-wired dep-chain: {sorted(wired_claimants)} now depend on {new_id} "
+        "to land first (resolves Manifest Conflict on '.gitignore')."
+        if wired_claimants
+        else ""
+    )
+    print(
+        f"ERROR: git-ops refused -- {len(detected)} build/state artifact path(s) "
+        f"would pollute the commit (sample: {sample}). "
+        f"Auto-emitted cleanup proposal {new_id} (in-queue); "
+        f"{unit_id} is now blocked-pending-proposal and will auto-clear when the cleanup commits.{extra} "
+        f"Materialised: {[str(p) for p in materialised_files]}.",
+        file=sys.stderr,
+    )
+    return True
+
+
+def _find_existing_cleanup_proposal(detected: list[str]) -> str | None:
+    """Return the suggested_id of any pending orphan-cleanup proposal, else None.
+
+    Cross-task de-duplication for the legacy proposal flow (Phase 1 secondary
+    fix). Scans ``<workspace>/.devbench/proposals/*.json`` and returns the
+    first proposal whose ``proposed_tasks[].files_to_own`` includes
+    ``.gitignore`` -- the canonical signature of an orphan-cleanup proposal
+    emitted by :func:`_legacy_emit_orphan_cleanup_proposal`. Since
+    ``cleanup_tracked_orphans`` cleans by pattern (not by specific path list),
+    any in-flight cleanup proposal resolves any orphan that matches the same
+    pattern set, so wiring the current parent to that existing task is
+    sufficient -- no need to compare detected-path sets.
+
+    The ``detected`` argument is reserved for future overlap-set narrowing
+    when the pattern list is operator-overridable per task; today every
+    cleanup proposal targets the same global pattern set so any match is a
+    valid de-duplication target.
+    """
+    del detected  # reserved for future per-task pattern subsetting
+    proposals_dir = WORKSPACE_ROOT / ".devbench" / "proposals"
+    if not proposals_dir.is_dir():
+        return None
+    for proposal_json in sorted(proposals_dir.glob("*.json")):
+        try:
+            payload = json.loads(proposal_json.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        for proposed in payload.get("proposed_tasks") or []:
+            files_to_own = proposed.get("files_to_own") or []
+            if ".gitignore" in files_to_own:
+                suggested_id = proposed.get("suggested_id")
+                if isinstance(suggested_id, str) and suggested_id:
+                    return suggested_id
+    return None
+
+
+def _count_ci_fail_attempts(wu_file: Path | None) -> int:
+    """Return the number of ``[CI_FAIL]`` audit entries in *wu_file*.
+
+    Used by :func:`_handle_ci_failure` to decide whether to keep retrying
+    (rc=2) or transition to BLOCKED (rc=1) based on the shared retry budget
+    (``MAX_RETRY_ATTEMPTS``). Returns 0 when *wu_file* is None or unreadable.
+    """
+    if wu_file is None or not wu_file.is_file():
+        return 0
+    try:
+        content = wu_file.read_text(encoding="utf-8")
+    except OSError:
+        return 0
+    return content.count("[CI_FAIL]")
+
+
+def _emit_ci_failure_feedback(
+    ops: object,
+    unit_id: str,
+    canonical_repo: str,
+    pr_number: int,
+    repo_path: Path,
+    attempt: int,
+) -> tuple[Path | None, str]:
+    """Fetch the failing run log, write it to disk, return (path, summary).
+
+    Returns ``(None, generic_summary)`` when the run-id or log fetch fails;
+    the caller still emits a feedback comment so the executor knows a CI
+    failure occurred even when the log details were unavailable.
+    """
+    from devbench.config import CI_FAILURE_LOG_BYTES
+
+    summary_default = f"CI checks failed for PR #{pr_number} on {canonical_repo}; attempt {attempt}; log unavailable."
+
+    run_id = ops.get_latest_failing_run_id(  # type: ignore[attr-defined]
+        canonical_repo, pr_number, repo_path=repo_path
+    )
+    if run_id is None:
+        return None, summary_default
+
+    log_text = ops.fetch_run_log(  # type: ignore[attr-defined]
+        canonical_repo, run_id, CI_FAILURE_LOG_BYTES, repo_path=repo_path
+    )
+    if not log_text.strip():
+        return None, summary_default
+
+    log_dir = WORKSPACE_ROOT / ".devbench" / "ci-failures"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"{unit_id}-{attempt}.log"
+    log_path.write_text(log_text, encoding="utf-8")
+    summary = (
+        f"CI checks failed for PR #{pr_number} on {canonical_repo} "
+        f"(run #{run_id}, attempt {attempt}); trimmed log saved to {log_path}."
+    )
+    return log_path, summary
+
+
+def _handle_ci_failure(
+    *,
+    ops: object,
+    unit_id: str,
+    canonical_repo: str,
+    pr_number: int,
+    repo_path: Path,
+    wu_file: Path | None,
+    mgr: object,
+) -> int:
+    """Issue #115 dispatch: CI failure -> rc=2 retry signal or rc=1 BLOCKED.
+
+    When ``CI_FAILURE_RETRY_ENABLED`` is False, returns rc=1 with the
+    legacy error message (backward compatible). When True, fetches the
+    failing run log, writes it under ``.devbench/ci-failures/``, appends a
+    ``[CI_FAIL]`` audit comment, and returns rc=2 if the per-task attempt
+    count is below ``MAX_RETRY_ATTEMPTS`` -- otherwise rc=1 with the
+    exhaustion error.
+    """
+    from devbench.config import CI_FAILURE_RETRY_ENABLED, MAX_RETRY_ATTEMPTS
+
+    if not CI_FAILURE_RETRY_ENABLED:
+        print(f"ERROR: CI checks failed for PR #{pr_number} on {canonical_repo}", file=sys.stderr)
+        return 1
+
+    attempts_so_far = _count_ci_fail_attempts(wu_file)
+    next_attempt = attempts_so_far + 1
+    log_path, summary = _emit_ci_failure_feedback(
+        ops=ops,
+        unit_id=unit_id,
+        canonical_repo=canonical_repo,
+        pr_number=pr_number,
+        repo_path=repo_path,
+        attempt=next_attempt,
+    )
+
+    if wu_file is not None:
+        marker = "[CI_FAIL_BLOCKED]" if next_attempt >= MAX_RETRY_ATTEMPTS else "[CI_FAIL]"
+        message = f"{marker} {summary}"
+        mgr._append_agent_comment(wu_file, "git_ops", message)  # type: ignore[attr-defined]
+
+    if next_attempt >= MAX_RETRY_ATTEMPTS:
+        print(
+            f"ERROR: CI checks failed for PR #{pr_number} on {canonical_repo} "
+            f"after {next_attempt} executor retry/retries (budget exhausted at "
+            f"MAX_RETRY_ATTEMPTS={MAX_RETRY_ATTEMPTS}). {summary}. "
+            "Task BLOCKED; operator review required.",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(
+        json.dumps(
+            {
+                "unit_id": unit_id,
+                "ci_retry": True,
+                "attempt": next_attempt,
+                "max_attempts": MAX_RETRY_ATTEMPTS,
+                "log_path": str(log_path) if log_path is not None else None,
+                "pr_number": pr_number,
+            }
+        )
+    )
+    return 2
+
+
+def _handle_pr_review_resolution(
+    *,
+    ops: object,
+    unit_id: str,
+    canonical_repo: str,
+    pr_number: int,
+    repo_path: Path,
+    wu_file: Path | None,
+    mgr: object,
+) -> int:
+    """Issue #116 dispatch: poll PR review state before merge.
+
+    Returns 0 when the merge may proceed (no unresolved bot comments / review
+    decisions, or the phase is disabled). Returns 3 when the executor must
+    be re-invoked to address the unresolved review feedback. Returns 1 when
+    the retry budget is exhausted -> BLOCKED.
+
+    No-op fast path: when ``PR_REVIEW_RESOLUTION_ENABLED`` is False (default)
+    OR both ``PR_REVIEW_AGENTS`` is empty and ``PR_REVIEW_DECISION_BLOCKS`` is
+    False, the phase is disabled and returns 0 immediately.
+    """
+    from devbench.config import (
+        MAX_RETRY_ATTEMPTS,
+        PR_REVIEW_AGENTS,
+        PR_REVIEW_DECISION_BLOCKS,
+        PR_REVIEW_POLL_INTERVAL,
+        PR_REVIEW_RESOLUTION_ENABLED,
+        PR_REVIEW_SETTLE_SECONDS,
+    )
+
+    if not PR_REVIEW_RESOLUTION_ENABLED:
+        return 0
+    if not PR_REVIEW_AGENTS and not PR_REVIEW_DECISION_BLOCKS:
+        return 0
+
+    resolution = ops.poll_pr_review_resolution(  # type: ignore[attr-defined]
+        canonical_repo,
+        pr_number,
+        repo_path=repo_path,
+        agents=PR_REVIEW_AGENTS,
+        decision_blocks=PR_REVIEW_DECISION_BLOCKS,
+        settle_seconds=PR_REVIEW_SETTLE_SECONDS,
+        poll_interval=PR_REVIEW_POLL_INTERVAL,
+    )
+    if resolution.resolved:
+        return 0
+
+    attempts_so_far = _count_pr_bot_retry_attempts(wu_file)
+    next_attempt = attempts_so_far + 1
+    feedback_path = _emit_pr_bot_feedback(unit_id, pr_number, resolution, next_attempt)
+
+    if wu_file is not None:
+        marker = "[PR_BOT_FAIL_BLOCKED]" if next_attempt >= MAX_RETRY_ATTEMPTS else "[PR_BOT_FAIL]"
+        summary = (
+            f"PR #{pr_number} has unresolved review feedback (attempt {next_attempt}); "
+            f"reviewDecision={resolution.review_decision!r}, "
+            f"unresolved_bot_comments={len(resolution.unresolved_comments)}, "
+            f"unresolved_reviews={len(resolution.unresolved_reviews)}; "
+            f"feedback payload at {feedback_path}."
+        )
+        mgr._append_agent_comment(wu_file, "git_ops", f"{marker} {summary}")  # type: ignore[attr-defined]
+
+    if next_attempt >= MAX_RETRY_ATTEMPTS:
+        print(
+            f"ERROR: PR #{pr_number} on {canonical_repo} has unresolved review "
+            f"feedback after {next_attempt} executor retry/retries "
+            f"(budget exhausted at MAX_RETRY_ATTEMPTS={MAX_RETRY_ATTEMPTS}). "
+            f"Feedback payload at {feedback_path}. Task BLOCKED; operator review required.",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(
+        json.dumps(
+            {
+                "unit_id": unit_id,
+                "pr_bot_retry": True,
+                "attempt": next_attempt,
+                "max_attempts": MAX_RETRY_ATTEMPTS,
+                "feedback_path": str(feedback_path),
+                "pr_number": pr_number,
+                "review_decision": resolution.review_decision,
+            }
+        )
+    )
+    return 3
+
+
+def _count_pr_bot_retry_attempts(wu_file: Path | None) -> int:
+    """Return the number of ``[PR_BOT_FAIL]`` audit entries in *wu_file*."""
+    if wu_file is None or not wu_file.is_file():
+        return 0
+    try:
+        content = wu_file.read_text(encoding="utf-8")
+    except OSError:
+        return 0
+    return content.count("[PR_BOT_FAIL]")
+
+
+def _emit_pr_bot_feedback(
+    unit_id: str,
+    pr_number: int,
+    resolution: object,
+    attempt: int,
+) -> Path:
+    """Write the ``pr-bot`` feedback payload to ``.devbench/pr-bot-feedback/``.
+
+    The payload is a JSON document the executor can read to understand which
+    review threads need addressing. Format mirrors the ``review-fail`` shape
+    used elsewhere in the orchestrator.
+    """
+    feedback_dir = WORKSPACE_ROOT / ".devbench" / "pr-bot-feedback"
+    feedback_dir.mkdir(parents=True, exist_ok=True)
+    feedback_path = feedback_dir / f"{unit_id}-{attempt}.json"
+    payload = {
+        "unit_id": unit_id,
+        "pr_number": pr_number,
+        "attempt": attempt,
+        "review_decision": getattr(resolution, "review_decision", None),
+        "unresolved_reviews": [
+            {
+                "reviewer": r.get("reviewer", ""),
+                "state": r.get("state", ""),
+                "body": r.get("body", ""),
+                "submitted_at": r.get("submitted_at", ""),
+            }
+            for r in getattr(resolution, "unresolved_reviews", [])
+        ],
+        "unresolved_comments": [
+            {
+                "author": c.get("author", ""),
+                "path": c.get("path", ""),
+                "line": c.get("line", 0),
+                "body": c.get("body", ""),
+                "created_at": c.get("created_at", ""),
+            }
+            for c in getattr(resolution, "unresolved_comments", [])
+        ],
+    }
+    feedback_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return feedback_path
+
+
+def _wire_orphan_cleanup_dep_chain(
+    new_id: str,
+    files_to_own: list[str],
+    unit_repo: str,
+) -> list[str]:
+    """Auto-wire ``add-dep`` rows so the new cleanup task does not collide on Manifest paths.
+
+    Phase 10 fix: when ``_emit_orphan_cleanup_proposal_if_needed``
+    auto-emits a cleanup proposal claiming ``.gitignore`` (or any other
+    files declared in ``files_to_own``), an in-queue / blocked /
+    proposed peer task that already claims the same path triggers the
+    E224 Manifest-Conflict rule and halts the orchestrator. Resolve
+    the collision by adding a ``Dependencies`` row on each pre-existing
+    claimant pointing at the new cleanup task -- that forms a dep-chain
+    which the Manifest-Conflict rule already accepts as a valid
+    resolution.
+
+    Returns the list of claimant IDs that received an auto-wired dep
+    (sorted by ID for stable output). Empty list when no collision was
+    detected. ``ProposalError`` from any underlying call propagates so
+    the caller can surface it via the existing error path.
+    """
+    from devbench.backlog import manifest as manifest_mod
+    from devbench.backlog.parser import BacklogParser
+
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    open_statuses = {WorkUnitStatus.IN_QUEUE, WorkUnitStatus.BLOCKED, WorkUnitStatus.PROPOSED}
+    target_paths = set(files_to_own)
+    wired: set[str] = set()
+    for peer in units:
+        if peer.id == new_id:
+            continue
+        if peer.status not in open_statuses:
+            continue
+        if peer.repo and unit_repo and peer.repo != unit_repo:
+            continue
+        wu_path = _resolve_unit_file(peer)
+        if wu_path is None or not wu_path.is_file():
+            continue
+        try:
+            entries = manifest_mod.parse_manifest(wu_path.read_text(encoding="utf-8"))
+        except manifest_mod.ManifestParseError:
+            continue
+        peer_paths = {entry.file for entry in entries}
+        if not peer_paths & target_paths:
+            continue
+        # Add the dep on the EXISTING claimant -- it depends on the
+        # cleanup landing first, so the cleanup commits its
+        # devbench-managed block before the peer rebases on top.
+        from devbench.backlog.proposal import add_dep
+
+        add_dep(
+            backlog_root=BACKLOG_ROOT,
+            backlog_index=BACKLOG_INDEX,
+            blocked_task_id=peer.id,
+            blocker_task_id=new_id,
+            reason="auto-wired by orphan-cleanup auto-emit; both manifests claim a shared path",
+        )
+        wired.add(peer.id)
+    return sorted(wired)
+
+
+# Mirror of git_orphans.DEVBENCH_GITIGNORE_HEADER for lazy-imported docstring contexts.
+DEVBENCH_GITIGNORE_HEADER_LITERAL: str = "# devbench-managed: tracked-orphan cleanup defaults"
+
+
+def cmd_cleanup_tracked_orphans(repo_or_path: str, dry_run_flag: str = "") -> int:
+    """Untrack build/state artifacts that should be gitignored.
+
+    Usage::
+
+        cleanup-tracked-orphans <org/repo|repo-path> [--dry-run]
+
+    Walks ``git ls-files`` in the target repo, identifies entries
+    matching standard ignore patterns (terraform state, terragrunt
+    cache, Python pycache, coverage, node_modules, .DS_Store), runs
+    ``git rm --cached`` on each (preserving them on disk), and writes a
+    devbench-managed block to the repo's root ``.gitignore`` so future
+    commits cannot reintroduce the pattern.
+
+    Pure Python implementation: invokes git via subprocess directly so
+    the PreToolUse ``guard-destructive-git`` hook (which scopes only to
+    Bash agent-tool calls) does not interfere.
+
+    Override the default pattern list via
+    ``DEVBENCH_ORPHAN_IGNORE_PATTERNS`` (comma-separated fnmatch globs)
+    when a backlog needs different shapes.
+
+    The repo argument accepts either an ``org/repo`` form (resolved
+    against ``devbench.yaml``'s ``repos:`` map for its
+    ``checkout_directory``) or a direct filesystem path to a git repo.
+    """
+    from devbench.git_orphans import cleanup_tracked_orphans
+
+    dry_run = dry_run_flag == "--dry-run"
+    repo_path = _resolve_orphan_repo_path(repo_or_path)
+    if repo_path is None:
+        print(
+            f"ERROR: cannot resolve repo path for {repo_or_path!r}; "
+            "expected either an 'org/repo' key from devbench.yaml or a "
+            "filesystem path to a git repo.",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        report = cleanup_tracked_orphans(repo_path, dry_run=dry_run)
+    except FileNotFoundError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    print(
+        json.dumps(
+            {
+                "repo": str(report.repo_path),
+                "detected_count": len(report.detected),
+                "removed_count": len(report.removed),
+                "detected": report.detected,
+                "removed": report.removed,
+                "gitignore_path": str(report.gitignore_path),
+                "gitignore_updated": report.gitignore_updated,
+                "dry_run": report.dry_run,
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def _resolve_orphan_repo_path(arg: str) -> Path | None:
+    """Resolve an ``org/repo`` key or filesystem path to a git repo root.
+
+    Returns ``None`` when the argument resolves to neither.
+    """
+    direct = Path(arg)
+    if direct.is_dir() and (direct / ".git").exists():
+        return direct
+    if "/" in arg:
+        repo_path = REPO_LOCAL_PATHS.get(arg)
+        if repo_path is not None and (repo_path / ".git").exists():
+            return repo_path
+    return None
 
 
 def cmd_git_ops(unit_id: str) -> int:
@@ -973,7 +3438,11 @@ def cmd_git_ops(unit_id: str) -> int:
     mgr = BacklogManager()
 
     from devbench.backlog.manifest import assert_staged_matches_manifest, parse_manifest
-    from devbench.github.git_ops import ConflictingPRError
+
+    # Orphan-pattern check (see _git_ops_deferred for rationale): refuse
+    # the commit on detection, auto-emit cleanup proposal, return non-zero.
+    if _emit_orphan_cleanup_proposal_if_needed(unit_id, unit, repo_path):
+        return 1
 
     # Manifest-scope check: every staged path must be in the work unit's
     # Changes Manifest. Catches scope-violation pollution deterministically
@@ -1000,20 +3469,292 @@ def cmd_git_ops(unit_id: str) -> int:
 
     checks_passed = ops.wait_for_checks(canonical_repo, pr_number, repo_path=repo_path)
     if not checks_passed:
-        print(f"ERROR: CI checks failed for PR #{pr_number} on {canonical_repo}", file=sys.stderr)
-        return 1
+        return _handle_ci_failure(
+            ops=ops,
+            unit_id=unit_id,
+            canonical_repo=canonical_repo,
+            pr_number=pr_number,
+            repo_path=repo_path,
+            wu_file=wu_file,
+            mgr=mgr,
+        )
+
+    # Issue #116: PR review-comment polling phase. Returns non-zero rc=3 when
+    # an agent in the configured allowlist requests changes; the executor retry
+    # loop handles re-invocation. No-op (immediate merge) when the phase is
+    # disabled OR no signals are configured.
+    review_rc = _handle_pr_review_resolution(
+        ops=ops,
+        unit_id=unit_id,
+        canonical_repo=canonical_repo,
+        pr_number=pr_number,
+        repo_path=repo_path,
+        wu_file=wu_file,
+        mgr=mgr,
+    )
+    if review_rc != 0:
+        return review_rc
+
+    return _dispatch_post_ci_pass(
+        ops=ops,
+        unit_id=unit_id,
+        canonical_repo=canonical_repo,
+        repo_path=repo_path,
+        branch=branch,
+        pr_number=pr_number,
+        pr_url=pr_url,
+        wu_file=wu_file,
+        mgr=mgr,
+    )
+
+
+def _dispatch_post_ci_pass(
+    *,
+    ops: object,
+    unit_id: str,
+    canonical_repo: str,
+    repo_path: Path,
+    branch: str,
+    pr_number: int,
+    pr_url: str,
+    wu_file: Path | None,
+    mgr: object,
+) -> int:
+    """Issue #101 dispatch: pause-before-merge vs merge-now.
+
+    Extracted so :func:`cmd_git_ops` stays under the per-function
+    return-statement budget (PLR0911).
+    """
+    from devbench.config import PAUSE_BEFORE_MERGE
+
+    if PAUSE_BEFORE_MERGE:
+        return _pause_before_merge(
+            unit_id=unit_id,
+            pr_number=pr_number,
+            pr_url=pr_url,
+            wu_file=wu_file,
+            mgr=mgr,
+        )
+
+    return _finalize_merge_and_submodule(
+        ops=ops,
+        unit_id=unit_id,
+        canonical_repo=canonical_repo,
+        repo_path=repo_path,
+        branch=branch,
+        pr_number=pr_number,
+        pr_url=pr_url,
+        wu_file=wu_file,
+        mgr=mgr,
+    )
+
+
+def _pause_before_merge(
+    *,
+    unit_id: str,
+    pr_number: int,
+    pr_url: str,
+    wu_file: Path | None,
+    mgr: object,
+) -> int:
+    """Issue #101: transition to in-review, do NOT merge.
+
+    The orchestrator's loop reconciles in-review tasks via
+    :func:`cmd_check_merge` on the next iteration. The PR remains open
+    on GitHub awaiting human review + merge; the orchestrator continues
+    with other actionable work units.
+
+    Returns 0 -- the work unit moved successfully to in-review.
+    """
+    if wu_file is not None:
+        mgr.force_status(  # type: ignore[attr-defined]
+            wu_file,
+            BACKLOG_INDEX,
+            unit_id,
+            STATUS_IN_REVIEW,
+        )
+        mgr._append_agent_comment(  # type: ignore[attr-defined]
+            wu_file,
+            "git_ops",
+            f"[PR_AWAITING_MERGE] PR #{pr_number} open and awaiting human review + merge: {pr_url}",
+        )
+    logger.info(
+        "Pause-before-merge: %s transitioned to in-review (PR #%d %s)",
+        unit_id,
+        pr_number,
+        pr_url,
+    )
+    print(
+        json.dumps(
+            {
+                "unit_id": unit_id,
+                "status": STATUS_IN_REVIEW,
+                "pr_number": pr_number,
+                "pr_url": pr_url,
+                "mode": "pause-before-merge",
+            }
+        )
+    )
+    return 0
+
+
+def _check_merge_fetch_pr_state(
+    ops: object,
+    canonical_repo: str,
+    unit_id: str,
+    branch: str,
+) -> tuple[int, list[dict[str, object]]]:
+    """Query gh for a PR matching *branch*; return (rc, pr_records).
+
+    rc=1 + empty list means the gh call failed; the caller short-circuits
+    with rc=1. rc=0 + empty list means no PR found for the branch (caller
+    treats as still-in-review with `pr_state=no-pr-found`).
+    """
+    rc, stdout, stderr = ops._gh(  # type: ignore[attr-defined]
+        ["pr", "list", "--head", branch, "--state", "all", "--json", "number,state,merged,url"],
+        repo=canonical_repo,
+    )
+    if rc != 0:
+        print(
+            f"ERROR: gh pr list failed for {unit_id} (head={branch}): {stderr.strip()}",
+            file=sys.stderr,
+        )
+        return 1, []
+    try:
+        pr_records = json.loads(stdout) if stdout.strip() else []
+    except json.JSONDecodeError as exc:
+        print(f"ERROR: gh pr list returned invalid JSON for {unit_id}: {exc}", file=sys.stderr)
+        return 1, []
+    if not isinstance(pr_records, list):
+        return 0, []
+    return 0, [r for r in pr_records if isinstance(r, dict)]
+
+
+def _check_merge_handle_merged(
+    *,
+    unit_id: str,
+    pr_number: object,
+    pr_url: str,
+    wu_file: Path | None,
+    mgr: object,
+) -> int:
+    """Promote a merged-PR work unit to done via the done-gate."""
+    if wu_file is not None:
+        try:
+            mgr.mark_done(wu_file, BACKLOG_INDEX, unit_id)  # type: ignore[attr-defined]
+            mgr._append_agent_comment(  # type: ignore[attr-defined]
+                wu_file,
+                "git_ops",
+                f"[PR_MERGED] PR #{pr_number} merged externally; transitioned to done: {pr_url}",
+            )
+        except RuntimeError as exc:
+            print(
+                f"ERROR: cannot mark {unit_id} done after merge -- done-gate refused: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+    print(json.dumps({"unit_id": unit_id, "status": STATUS_DONE, "pr_number": pr_number, "pr_url": pr_url}))
+    return 0
+
+
+def cmd_check_merge(unit_id: str) -> int:
+    """Reconcile a pause-before-merge work unit's PR state.
+
+    Issue #101 reconciliation step. Queries the PR for *unit_id* via
+    ``gh pr list --head <branch> --json number,state,merged``:
+
+    - **merged** -> transition to ``done`` via :meth:`BacklogManager.mark_done`
+      (enforces the done-gate: every required judge must have passed).
+    - **closed without merge** -> transition to ``blocked`` with an audit
+      comment naming the PR.
+    - **still open** -> log + return 0; orchestrator picks it up next loop.
+
+    Returns 0 in every case (the orchestrator's loop reads the JSON
+    output, not rc, to decide what to do next). Returns 1 only on hard
+    failure (cannot resolve work unit, gh API failure that prevents a
+    decision, done-gate refusal).
+    """
+    from devbench.github.git_ops import GitOpsService
+
+    unit, canonical_repo, _repo_path = _resolve_git_ops_context(unit_id)
+    wu_file = _resolve_unit_file(unit)
+    mgr = BacklogManager()
+    ops = GitOpsService()
+
+    branch = unit.branch or f"backlog/{unit_id.lower()}"
+    fetch_rc, pr_records = _check_merge_fetch_pr_state(ops, canonical_repo, unit_id, branch)
+    if fetch_rc != 0:
+        return fetch_rc
+
+    if not pr_records:
+        print(json.dumps({"unit_id": unit_id, "status": STATUS_IN_REVIEW, "pr_state": "no-pr-found"}))
+        return 0
+
+    pr = pr_records[0]
+    pr_number = pr.get("number")
+    pr_state = str(pr.get("state") or "").upper()
+    pr_merged = bool(pr.get("merged"))
+    pr_url = str(pr.get("url") or "")
+
+    if pr_merged:
+        return _check_merge_handle_merged(unit_id=unit_id, pr_number=pr_number, pr_url=pr_url, wu_file=wu_file, mgr=mgr)
+
+    if pr_state == "CLOSED":
+        if wu_file is not None:
+            mgr.mark_blocked(
+                wu_file,
+                BACKLOG_INDEX,
+                unit_id,
+                f"PR #{pr_number} closed without merge: {pr_url}",
+            )
+        print(json.dumps({"unit_id": unit_id, "status": STATUS_BLOCKED, "pr_number": pr_number, "pr_url": pr_url}))
+        return 0
+
+    print(
+        json.dumps(
+            {
+                "unit_id": unit_id,
+                "status": STATUS_IN_REVIEW,
+                "pr_number": pr_number,
+                "pr_state": pr_state,
+                "pr_url": pr_url,
+            }
+        )
+    )
+    return 0
+
+
+def _finalize_merge_and_submodule(
+    *,
+    ops: object,
+    unit_id: str,
+    canonical_repo: str,
+    repo_path: Path,
+    branch: str,
+    pr_number: int,
+    pr_url: str,
+    wu_file: Path | None,
+    mgr: object,
+) -> int:
+    """Merge the PR (with one CONFLICTING-state retry) and update the parent submodule.
+
+    Extracted from :func:`cmd_git_ops` so the parent function stays under
+    the project's per-function return-statement budget (PLR0911).
+    Returns 0 on success or 1 when the merge retry path itself fails.
+    """
+    from devbench.github.git_ops import ConflictingPRError
 
     try:
-        ops.merge_pr(canonical_repo, pr_number, repo_path=repo_path)
+        ops.merge_pr(canonical_repo, pr_number, repo_path=repo_path)  # type: ignore[attr-defined]
     except ConflictingPRError:
         logger.warning(
             "PR #%d on %s is CONFLICTING -- rebasing and retrying merge once",
             pr_number,
             canonical_repo,
         )
-        ops.rebase_and_force_push(canonical_repo, repo_path, branch)
+        ops.rebase_and_force_push(canonical_repo, repo_path, branch)  # type: ignore[attr-defined]
         try:
-            ops.merge_pr(canonical_repo, pr_number, repo_path=repo_path)
+            ops.merge_pr(canonical_repo, pr_number, repo_path=repo_path)  # type: ignore[attr-defined]
         except Exception as retry_exc:
             print(
                 f"ERROR: Merge retry failed for PR #{pr_number} on {canonical_repo}: {retry_exc}",
@@ -1022,15 +3763,15 @@ def cmd_git_ops(unit_id: str) -> int:
             return 1
 
     if wu_file is not None:
-        mgr._append_agent_comment(wu_file, "git_ops", f"[PR_MERGED] {pr_url}")
+        mgr._append_agent_comment(wu_file, "git_ops", f"[PR_MERGED] {pr_url}")  # type: ignore[attr-defined]
 
     logger.info("Merged PR #%d for %s", pr_number, unit_id)
 
-    ops.checkout_default_branch(canonical_repo, repo_path)
+    ops.checkout_default_branch(canonical_repo, repo_path)  # type: ignore[attr-defined]
     logger.info("Checked out default branch after merge for %s", unit_id)
 
     if UPDATE_SUBMODULE:
-        ops.update_parent_submodule_ref(
+        ops.update_parent_submodule_ref(  # type: ignore[attr-defined]
             canonical_repo,
             repo_path,
             f"chore: update {repo_path.name} submodule after {unit_id}",
@@ -1145,31 +3886,24 @@ def cmd_watch(watch_interval: int = 0) -> int:
         return 0
 
 
-def cmd_hook_tail(*argv: str) -> int:
-    """Pretty-tail the plugin's hook-logs.jsonl stream.
+@dataclass(frozen=True)
+class _HookTailArgs:
+    tz_name: str | None = None
+    no_follow: bool = False
+    from_start: bool = False
+    path_override: str = ""
+    orchestrator_session_id: str | None = None
+    orchestrator_only: bool = False
 
-    Usage::
 
-        hook-tail [<path>] [--tz <zoneinfo-name>] [--no-follow] [--from-start]
-
-    Defaults ``<path>`` to ``$JUDGE_WORKSPACE_ROOT/hook-logs.jsonl`` (the same
-    location ``devbench watch`` reads from). Renders timestamps in the OS
-    local timezone; ``--tz`` overrides with any IANA zoneinfo name. Disables
-    ANSI color when ``NO_COLOR`` is set or stdout is not a TTY.
-    """
-    from devbench.hook_tail import (
-        FollowOptions,
-        InvalidTimezoneError,
-        follow,
-        render_header,
-        resolve_timezone,
-        should_use_color,
-    )
-
+def _parse_hook_tail_argv(argv: tuple[str, ...] | list[str]) -> _HookTailArgs | int:
+    """Parse ``hook-tail`` argv. Returns the args bundle or a non-zero exit code."""
     tz_name: str | None = None
     no_follow = False
     from_start = False
     path_override = ""
+    orchestrator_session_id: str | None = None
+    orchestrator_only = False
     args = list(argv)
     i = 0
     while i < len(args):
@@ -1192,6 +3926,17 @@ def cmd_hook_tail(*argv: str) -> int:
             from_start = True
             i += 1
             continue
+        if arg == "--orchestrator-only":
+            orchestrator_only = True
+            i += 1
+            continue
+        if arg == "--orchestrator-session":
+            if i + 1 >= len(args) or not args[i + 1]:
+                print("ERROR: --orchestrator-session requires a value", file=sys.stderr)
+                return 2
+            orchestrator_session_id = args[i + 1]
+            i += 2
+            continue
         if arg.startswith("--"):
             print(f"ERROR: unknown flag: {arg}", file=sys.stderr)
             return 2
@@ -1201,6 +3946,67 @@ def cmd_hook_tail(*argv: str) -> int:
             continue
         print(f"ERROR: unexpected positional argument: {arg}", file=sys.stderr)
         return 2
+    return _HookTailArgs(
+        tz_name=tz_name,
+        no_follow=no_follow,
+        from_start=from_start,
+        path_override=path_override,
+        orchestrator_session_id=orchestrator_session_id,
+        orchestrator_only=orchestrator_only,
+    )
+
+
+def cmd_hook_tail(*argv: str) -> int:
+    """Pretty-tail the plugin's hook-logs.jsonl stream.
+
+    Usage::
+
+        hook-tail [<path>] [--tz <zoneinfo-name>] [--no-follow] [--from-start]
+                  [--orchestrator-only | --orchestrator-session <id>]
+
+    Defaults ``<path>`` to ``$JUDGE_WORKSPACE_ROOT/hook-logs.jsonl`` (the same
+    location ``devbench watch`` reads from). Renders timestamps in the OS
+    local timezone; ``--tz`` overrides with any IANA zoneinfo name. Disables
+    ANSI color when ``NO_COLOR`` is set or stdout is not a TTY.
+
+    Phase 11 (E230) session filter:
+      ``--orchestrator-only`` filters the stream to events whose
+      ``orchestrator_session`` field equals
+      ``$JUDGE_ORCHESTRATOR_SESSION_ID`` (set by the launch command on
+      the orchestrator's pane). Events from side-pane Claude sessions
+      are silently suppressed. ``--orchestrator-session <id>`` provides
+      the same filter with an explicit value (useful for ad-hoc
+      audits). Older log entries that pre-date the session field are
+      passed through unfiltered.
+    """
+    from devbench.hook_tail import (
+        FollowOptions,
+        InvalidTimezoneError,
+        follow,
+        render_header,
+        resolve_timezone,
+        should_use_color,
+    )
+
+    parsed = _parse_hook_tail_argv(argv)
+    if isinstance(parsed, int):
+        return parsed
+    tz_name = parsed.tz_name
+    no_follow = parsed.no_follow
+    from_start = parsed.from_start
+    path_override = parsed.path_override
+    orchestrator_session_id = parsed.orchestrator_session_id
+
+    if parsed.orchestrator_only and orchestrator_session_id is None:
+        env_session = os.environ.get("JUDGE_ORCHESTRATOR_SESSION_ID", "").strip()
+        if not env_session:
+            print(
+                "ERROR: --orchestrator-only requires JUDGE_ORCHESTRATOR_SESSION_ID env "
+                "to be set, OR pass --orchestrator-session <id> explicitly.",
+                file=sys.stderr,
+            )
+            return 2
+        orchestrator_session_id = env_session
 
     # Precedence: CLI --tz > JUDGE_DISPLAY_TIMEZONE env > yaml display_timezone
     # > OS local. DISPLAY_TIMEZONE encodes (env > yaml); resolve_timezone
@@ -1227,6 +4033,7 @@ def cmd_hook_tail(*argv: str) -> int:
             from_start=from_start,
             no_follow=no_follow,
             color=color,
+            orchestrator_session_id=orchestrator_session_id,
         ),
         sys.stdout,
     )
@@ -1462,6 +4269,241 @@ def cmd_reject_amendment(unit_id: str, rejection_reason: str) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Issue #156: review-judge structured rejection-feedback persistence
+# ---------------------------------------------------------------------------
+
+
+def _validate_rejection_feedback_payload(judge: str, payload: object) -> dict[str, Any]:
+    """Layer-1 schema check for the ``log-rejection-feedback`` JSON body.
+
+    Returns the validated dict. Raises ``ValueError`` with an actionable
+    message on any violation: bad type, missing field, unknown category
+    code for *judge*, severity outside ``{fail, warn}``, etc.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError(f"payload must be a JSON object, got {type(payload).__name__}")
+    required = {"categories", "raw_verdict_text"}
+    missing = [k for k in required if k not in payload]
+    if missing:
+        raise ValueError(f"missing required field(s): {', '.join(sorted(missing))}")
+    raw_categories = payload.get("categories")
+    if not isinstance(raw_categories, list) or not raw_categories:
+        raise ValueError("categories must be a non-empty list")
+    allowed_codes = JUDGE_CATEGORIES.get(judge, frozenset())
+    for idx, entry in enumerate(raw_categories):
+        if not isinstance(entry, dict):
+            raise ValueError(f"categories[{idx}] must be an object")
+        for key in ("code", "severity", "summary", "remediation", "files"):
+            if key not in entry:
+                raise ValueError(f"categories[{idx}] missing field {key!r}")
+        code = entry["code"]
+        if not isinstance(code, str) or code not in allowed_codes:
+            raise ValueError(f"categories[{idx}].code={code!r} is not in {judge}'s vocabulary {sorted(allowed_codes)}")
+        severity = entry["severity"]
+        if severity not in ("fail", "warn"):
+            raise ValueError(f"categories[{idx}].severity={severity!r} must be 'fail' or 'warn'")
+        files = entry["files"]
+        if not isinstance(files, list) or any(not isinstance(f, str) for f in files):
+            raise ValueError(f"categories[{idx}].files must be a list of strings")
+    if not isinstance(payload["raw_verdict_text"], str):
+        raise ValueError("raw_verdict_text must be a string")
+    return payload
+
+
+def _parse_log_rejection_feedback_argv(argv: tuple[str, ...]) -> tuple[str, str, str]:
+    """Return ``(judge, task_id, raw_json)``. Raises ``ValueError`` on bad usage."""
+    judge = ""
+    task_id = ""
+    raw_json = ""
+    args = list(argv)
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if not arg:
+            i += 1
+            continue
+        if arg == "--json":
+            if i + 1 >= len(args):
+                raise ValueError("--json requires a value")
+            raw_json = args[i + 1]
+            i += 2
+            continue
+        if arg.startswith("--"):
+            raise ValueError(f"unknown flag: {arg}")
+        if not judge:
+            judge = arg
+        elif not task_id:
+            task_id = arg
+        i += 1
+    if not judge or not task_id or not raw_json:
+        raise ValueError("usage: log-rejection-feedback <judge> <task-id> --json '<payload>'")
+    return judge, task_id, raw_json
+
+
+def cmd_log_rejection_feedback(*argv: str) -> int:
+    """Persist a structured review-judge rejection JSON.
+
+    Issue #156. Usage::
+
+        log-rejection-feedback <judge> <task-id> --json '<payload>'
+
+    Validates the payload against the controlled vocabulary for the
+    judge and the field-level schema, then writes to
+    ``<workspace>/.devbench/review-failures/<task-id>-<judge>-<n>.json``.
+    Records over the ``MAX_RETRY_ATTEMPTS`` cap are still written but
+    stamped ``capped: true`` for visibility.
+    """
+    from devbench.config import MAX_RETRY_ATTEMPTS
+
+    try:
+        judge, task_id, raw_json = _parse_log_rejection_feedback_argv(argv)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    if judge not in JUDGE_CATEGORIES:
+        print(
+            f"ERROR: unknown judge {judge!r}; expected one of {sorted(JUDGE_CATEGORIES)}",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        payload = json.loads(raw_json)
+    except json.JSONDecodeError as exc:
+        print(f"ERROR: --json value is not valid JSON: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        validated = _validate_rejection_feedback_payload(judge, payload)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    archive_dir = WORKSPACE_ROOT / REVIEW_FAILURES_DIR_NAME
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    existing = sorted(archive_dir.glob(f"{task_id}-{judge}-*.json"))
+    attempt = len(existing) + 1
+    capped = attempt > MAX_RETRY_ATTEMPTS
+    rejected_at = datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    record: dict[str, Any] = {
+        "schema_version": 1,
+        "task_id": task_id,
+        "judge": judge,
+        "attempt": attempt,
+        "rejected_at": rejected_at,
+        "categories": list(validated["categories"]),
+        "raw_verdict_text": validated["raw_verdict_text"],
+        "capped": capped,
+    }
+    target = archive_dir / f"{task_id}-{judge}-{attempt}.json"
+    target.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    print(json.dumps({"task_id": task_id, "judge": judge, "attempt": attempt, "path": str(target)}))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Issue #156: executor-feedback collector for review-judge rejections
+# ---------------------------------------------------------------------------
+
+
+def _collect_review_judge_feedback(task_id: str) -> list[dict[str, Any]]:
+    """Return the executor-injected ``review-judge-fail`` payload list for ``task_id``.
+
+    Walks ``.devbench/review-failures/`` (and the legacy
+    ``amender-rejections/`` directory) for every JSON matching the task,
+    parses it, and returns one dict per rejection ordered by judge
+    severity (security > code > test > changes_manifest > doc >
+    manifest_amender) and then by attempt number descending. The list is
+    truncated to ``MAX_RETRY_ATTEMPTS`` rounds so the executor never
+    receives more context than the retry budget can act on.
+    """
+    from devbench.config import MAX_RETRY_ATTEMPTS
+
+    payloads: list[dict[str, Any]] = []
+    for path in read_review_failure_files(WORKSPACE_ROOT, task_id):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        # Synthesize a v1-shaped record for legacy amender-rejections
+        # entries that pre-date schema_version: 1.
+        if "schema_version" not in data and "reason_category" in data:
+            data = {
+                "schema_version": 1,
+                "task_id": data.get("task_id", task_id),
+                "judge": "manifest_amender",
+                "attempt": data.get("attempt", 0),
+                "rejected_at": data.get("recorded_at", ""),
+                "categories": [
+                    {
+                        "code": data.get("reason_category", "OTHER"),
+                        "severity": "fail",
+                        "summary": data.get("reason_text", ""),
+                        "remediation": "",
+                        "files": [],
+                    }
+                ],
+                "raw_verdict_text": data.get("reason_text", ""),
+                "capped": data.get("capped", False),
+                "_source_path": str(path),
+            }
+        else:
+            data["_source_path"] = str(path)
+        payloads.append(data)
+
+    payloads.sort(
+        key=lambda p: (
+            -JUDGE_SEVERITY_ORDER.get(str(p.get("judge", "")), 0),
+            -int(p.get("attempt", 0) or 0),
+        )
+    )
+    return payloads[:MAX_RETRY_ATTEMPTS]
+
+
+# ---------------------------------------------------------------------------
+# Issue #156: done-gate hook for review-judge rejection resolution
+# ---------------------------------------------------------------------------
+
+
+def _outstanding_rejection_categories(task_id: str, wu_file: Path | None) -> list[tuple[str, str]]:
+    """Return ``[(judge, code), ...]`` for unresolved review-judge rejections.
+
+    A rejection is considered resolved when the work-unit file shows
+    EITHER a matching ``[REJECTION_FEEDBACK_RESOLVED] <judge>:<code>``
+    audit row OR a matching ``[NEEDS_DEP] <judge>:<code>`` audit row.
+    Otherwise the (judge, code) pair is returned for the done-gate to
+    refuse the transition.
+    """
+    rejections = _collect_review_judge_feedback(task_id)
+    if not rejections or wu_file is None or not wu_file.is_file():
+        return [
+            (str(r.get("judge", "")), str(cat.get("code", "")))
+            for r in rejections
+            for cat in (r.get("categories") or [])
+            if isinstance(cat, dict)
+        ]
+    content = wu_file.read_text(encoding="utf-8")
+    outstanding: list[tuple[str, str]] = []
+    for r in rejections:
+        judge = str(r.get("judge", ""))
+        for cat in r.get("categories") or []:
+            if not isinstance(cat, dict):
+                continue
+            code = str(cat.get("code", ""))
+            resolved_marker = f"[REJECTION_FEEDBACK_RESOLVED] {judge}:{code}"
+            needs_dep_marker = f"[NEEDS_DEP] {judge}:{code}"
+            if resolved_marker in content or needs_dep_marker in content:
+                continue
+            outstanding.append((judge, code))
+    return outstanding
+
+
 def cmd_sweep_proposals() -> int:
     """Best-effort materialisation of every un-materialised proposal JSON.
 
@@ -1487,7 +4529,13 @@ def cmd_sweep_proposals() -> int:
     promote-proposal / reject-proposal.
     """
     proposals = list_proposals(WORKSPACE_ROOT)
-    if not proposals:
+    auto_accept = RUNTIME_CONFIG.task_factory.auto_accept_proposals
+
+    # Issue #155: when no proposal JSONs AND auto-accept is off, fast-exit
+    # before parsing the backlog so the legacy "nothing to do" message is
+    # preserved. When auto-accept is on we still need to load the index so
+    # the orphan auto-promote pass below can run.
+    if not proposals and not auto_accept:
         print("sweep-proposals: nothing to do (no proposal JSONs on disk)")
         return 0
 
@@ -1500,94 +4548,171 @@ def cmd_sweep_proposals() -> int:
         print(f"ERROR: cannot read backlog index: {exc}", file=sys.stderr)
         return 1
     unit_by_id = {u.id: u for u in units}
-
-    auto_accept = RUNTIME_CONFIG.task_factory.auto_accept_proposals
     # ADR-11 audit suffix written on every auto-promoted draft's Comments
     # so a reviewer can tell at a glance that no human pressed the button.
     auto_audit_suffix = "(auto-accepted via task_factory.auto_accept_proposals=true)"
 
     touched = 0
     for proposal in proposals:
-        # Pre-classify so we can (a) take a fast-path no-op when every task
-        # is already resolved, without even touching the backlog parser,
-        # and (b) report "N new, M skipped" accurately.
-        # materialise_proposal itself is idempotent and classify-aware
-        # (ADR-09), so calling it unconditionally is safe.
-        pre_states = {
-            task.suggested_id: classify_proposed_task(BACKLOG_ROOT, WORKSPACE_ROOT, task.suggested_id)
-            for task in proposal.proposed_tasks
-        }
-        unmaterialised_before = sum(1 for state in pre_states.values() if state is ProposalTaskState.UNMATERIALISED)
-        proposed_before = sum(1 for state in pre_states.values() if state is ProposalTaskState.PROPOSED)
-        needs_materialise = unmaterialised_before > 0
-        needs_auto_promote = auto_accept and (unmaterialised_before > 0 or proposed_before > 0)
+        touched += _sweep_one_proposal(
+            proposal=proposal,
+            unit_by_id=unit_by_id,
+            auto_accept=auto_accept,
+            auto_audit_suffix=auto_audit_suffix,
+        )
 
-        if not needs_materialise and not needs_auto_promote:
-            # Every task in this proposal is already resolved (promoted,
-            # done, declined, or rejected). Nothing for the sweep to do.
-            print(f"sweep-proposals: no-op {proposal.source_task_id}")
-            continue
+    # Issue #155: extend the auto-promote pass to also pick up pre-existing
+    # ``proposed`` drafts whose proposal JSON no longer exists (operator
+    # deleted it, or sweep skipped it earlier). The first pass above only
+    # iterates over JSONs on disk; this second pass walks the full backlog
+    # index and promotes any ``proposed`` task whose source carries the
+    # auto-accept toggle.
+    if auto_accept:
+        orphan_promoted = _auto_promote_orphan_proposed_drafts(units, auto_audit_suffix)
+        if orphan_promoted:
+            print(f"sweep-proposals: orphan auto-promoted {orphan_promoted} pre-existing proposed draft(s)")
 
-        source_unit = unit_by_id.get(proposal.source_task_id)
-        if source_unit is None:
-            print(
-                f"sweep-proposals: skipped {proposal.source_task_id}: source not found in backlog index",
-                file=sys.stderr,
+    logger.info("sweep-proposals touched %d draft(s) across %d proposal(s)", touched, len(proposals))
+    return 0
+
+
+def _sweep_one_proposal(
+    *,
+    proposal: Proposal,
+    unit_by_id: dict[str, WorkUnit],
+    auto_accept: bool,
+    auto_audit_suffix: str,
+) -> int:
+    """Materialise + (optionally) auto-promote a single proposal JSON.
+
+    Extracted from ``cmd_sweep_proposals`` so the dispatcher body stays
+    under ruff's PLR0912 branch ceiling. Returns the number of new drafts
+    created on this call (used to drive the ``touched`` counter).
+    """
+    pre_states = {
+        task.suggested_id: classify_proposed_task(BACKLOG_ROOT, WORKSPACE_ROOT, task.suggested_id)
+        for task in proposal.proposed_tasks
+    }
+    unmaterialised_before = sum(1 for state in pre_states.values() if state is ProposalTaskState.UNMATERIALISED)
+    proposed_before = sum(1 for state in pre_states.values() if state is ProposalTaskState.PROPOSED)
+    needs_materialise = unmaterialised_before > 0
+    needs_auto_promote = auto_accept and (unmaterialised_before > 0 or proposed_before > 0)
+
+    if not needs_materialise and not needs_auto_promote:
+        print(f"sweep-proposals: no-op {proposal.source_task_id}")
+        return 0
+
+    source_unit = unit_by_id.get(proposal.source_task_id)
+    if source_unit is None:
+        print(
+            f"sweep-proposals: skipped {proposal.source_task_id}: source not found in backlog index",
+            file=sys.stderr,
+        )
+        return 0
+
+    drafts: list[Path] = []
+    if needs_materialise:
+        try:
+            drafts = materialise_proposal(
+                workspace_root=WORKSPACE_ROOT,
+                backlog_root=BACKLOG_ROOT,
+                backlog_index=BACKLOG_INDEX,
+                proposal=proposal,
+                repo=source_unit.repo,
             )
-            continue
+        except ProposalError as exc:
+            print(f"sweep-proposals: skipped {proposal.source_task_id}: {exc}")
+            return 0
 
-        drafts: list[Path] = []
-        if needs_materialise:
+    auto_promoted = 0
+    if auto_accept:
+        for task in proposal.proposed_tasks:
+            state = classify_proposed_task(BACKLOG_ROOT, WORKSPACE_ROOT, task.suggested_id)
+            if state is not ProposalTaskState.PROPOSED:
+                continue
             try:
-                drafts = materialise_proposal(
+                promote_proposal(
                     workspace_root=WORKSPACE_ROOT,
                     backlog_root=BACKLOG_ROOT,
                     backlog_index=BACKLOG_INDEX,
-                    proposal=proposal,
-                    repo=source_unit.repo,
+                    task_id=task.suggested_id,
+                    audit_suffix=auto_audit_suffix,
                 )
+                auto_promoted += 1
             except ProposalError as exc:
-                # Soft failure: safety guard (unresolved prior proposed tasks),
-                # thin-approach refusal, etc. Log and continue.
-                print(f"sweep-proposals: skipped {proposal.source_task_id}: {exc}")
-                continue
+                print(
+                    f"sweep-proposals: auto-promote failed for {task.suggested_id}: {exc}",
+                    file=sys.stderr,
+                )
 
-        # ADR-11 auto-accept: once materialise has run (or when the flag was
-        # flipped on after earlier drafts already materialised), promote every
-        # task currently in PROPOSED state. promote_proposal is idempotent --
-        # a task in any other state is skipped by the per-task classify guard
-        # below, so re-running the sweep causes no duplicate marker writes.
-        auto_promoted = 0
-        if auto_accept:
-            for task in proposal.proposed_tasks:
-                state = classify_proposed_task(BACKLOG_ROOT, WORKSPACE_ROOT, task.suggested_id)
-                if state is not ProposalTaskState.PROPOSED:
-                    continue
-                try:
-                    promote_proposal(
-                        workspace_root=WORKSPACE_ROOT,
-                        backlog_root=BACKLOG_ROOT,
-                        backlog_index=BACKLOG_INDEX,
-                        task_id=task.suggested_id,
-                        audit_suffix=auto_audit_suffix,
-                    )
-                    auto_promoted += 1
-                except ProposalError as exc:
-                    # Soft failure per draft; other drafts in the same
-                    # proposal still get a promote attempt.
-                    print(
-                        f"sweep-proposals: auto-promote failed for {task.suggested_id}: {exc}",
-                        file=sys.stderr,
-                    )
+    skipped_count = len(proposal.proposed_tasks) - len(drafts)
+    line = f"sweep-proposals: materialised {proposal.source_task_id}: {len(drafts)} new, {skipped_count} skipped"
+    if auto_accept:
+        line += f" (auto-promoted: {auto_promoted})"
+    print(line)
+    return len(drafts)
 
-        skipped_count = len(proposal.proposed_tasks) - len(drafts)
-        touched += len(drafts)
-        line = f"sweep-proposals: materialised {proposal.source_task_id}: {len(drafts)} new, {skipped_count} skipped"
-        if auto_accept:
-            line += f" (auto-promoted: {auto_promoted})"
-        print(line)
 
-    logger.info("sweep-proposals touched %d draft(s) across %d proposal(s)", touched, len(proposals))
+def _auto_promote_orphan_proposed_drafts(units: list[WorkUnit], audit_suffix: str) -> int:
+    """Promote every ``proposed`` task whose source has ``auto_accept_proposals``.
+
+    Issue #155: ``cmd_sweep_proposals`` historically only promoted drafts
+    referenced by a live proposal JSON. Drafts whose JSON has been deleted
+    (e.g. archived after a partial sweep) were marooned in the ``proposed``
+    state forever. This helper closes the gap by walking the full backlog
+    index and promoting every ``proposed`` task. Idempotent: per-draft
+    classify guard inside ``promote_proposal`` is the source of truth, so
+    re-runs cause no duplicate marker writes.
+
+    Returns the count of drafts successfully promoted.
+    """
+    promoted = 0
+    for unit in units:
+        if unit.unit_type is not WorkUnitType.TASK:
+            continue
+        if unit.status is not WorkUnitStatus.PROPOSED:
+            continue
+        state = classify_proposed_task(BACKLOG_ROOT, WORKSPACE_ROOT, unit.id)
+        if state is not ProposalTaskState.PROPOSED:
+            continue
+        try:
+            promote_proposal(
+                workspace_root=WORKSPACE_ROOT,
+                backlog_root=BACKLOG_ROOT,
+                backlog_index=BACKLOG_INDEX,
+                task_id=unit.id,
+                audit_suffix=audit_suffix,
+            )
+            promoted += 1
+        except ProposalError as exc:
+            print(
+                f"sweep-proposals: orphan auto-promote failed for {unit.id}: {exc}",
+                file=sys.stderr,
+            )
+    return promoted
+
+
+def _enforce_materialise_lifecycle_gates(source_task_id: str, proposal: Proposal) -> int:
+    """Issues #143 + #144: gate ``cmd_materialise_proposal`` on placeholder
+    rows + cascade-depth cap. Returns 0 to proceed, 1 to abort with the
+    error already printed to stderr."""
+    placeholder_issues = detect_placeholder_descriptions(proposal)
+    if placeholder_issues:
+        print(
+            "ERROR: proposal carries placeholder description(s); fill in concrete "
+            "approach text before materialising:\n  - " + "\n  - ".join(placeholder_issues),
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        enforce_cascade_depth({"cascade_depth": proposal.cascade_depth}, MAX_CASCADE_DEPTH)
+    except CascadeDepthError as exc:
+        print(
+            f"ERROR: cascade-depth limit reached for {source_task_id}: {exc}\n"
+            f"Source task escalated to NEEDS_OPERATOR_ATTENTION (no draft materialised).",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
@@ -1604,6 +4729,10 @@ def cmd_materialise_proposal(source_task_id: str) -> int:
     except ProposalError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
+
+    gate_rc = _enforce_materialise_lifecycle_gates(source_task_id, proposal)
+    if gate_rc != 0:
+        return gate_rc
 
     # Resolve the target repo from the source task so every draft row uses
     # the same repo string that the orchestrator will execute against.
@@ -1660,9 +4789,8 @@ class _ProposalInputError(ValueError):
     """Raised when stdin-provided proposal JSON is unusable."""
 
 
-def _read_proposal_from_stdin(source_task_id: str) -> "Proposal":  # type: ignore[name-defined]  # noqa: F821
+def _read_proposal_from_stdin(source_task_id: str) -> Proposal:
     """Read stdin and build a :class:`Proposal`, raising ``_ProposalInputError`` on failures."""
-    from devbench.backlog.proposal import Proposal
 
     try:
         raw = sys.stdin.read()
@@ -1686,15 +4814,398 @@ def _read_proposal_from_stdin(source_task_id: str) -> "Proposal":  # type: ignor
 
 
 def cmd_write_proposal(source_task_id: str) -> int:
-    """Persist a blocker-resolver proposal JSON read from stdin."""
+    """Persist a blocker-resolver proposal JSON read from stdin.
+
+    Dedup contract (issue #141): before writing, computes a stable
+    ``fix_signature`` over (target_repo, sorted(files_to_own),
+    normalised intent_phrase). If a pending proposal on disk already
+    carries the same signature, this command WIRES THE NEW SOURCE TASK
+    AS AN ADDITIONAL DEP on the existing recovery task instead of
+    emitting a duplicate proposal. The audit comment ``[RECOVERY_REUSED]``
+    on the new source task names the existing recovery task ID. The
+    return-code envelope's ``recovery_reused`` field tells the caller
+    which path fired.
+
+    When ``task_factory.auto_accept_proposals`` is ``true`` in the active
+    config and the dedup path did NOT fire, this command also
+    materialises every proposed task and promotes it -- so the cascade
+    is actionable in the same call.
+
+    When the auto-accept flag is ``false`` the behaviour is unchanged:
+    the JSON is written and the operator promotes manually.
+    """
     try:
         proposal = _read_proposal_from_stdin(source_task_id)
+        # Issue #146: drop proposed-task entries whose files all live in
+        # the backlog repo (not in any configured target repo). The
+        # recovery cascade has no valid endpoint for backlog-repo edits;
+        # they're operator bookkeeping commits, not work-unit deliverables.
+        # NOTE: this filter runs BEFORE the prefix strip below because the
+        # filter classifies paths by their first segment matching a
+        # configured `checkout_directory`; stripping the prefix first
+        # would erase that signal and misclassify target-repo paths as
+        # backlog-repo paths.
+        proposal, skipped_entries = _filter_backlog_repo_proposed_tasks(proposal)
+        for skipped_id, skipped_files in skipped_entries:
+            audit = (
+                f"[RECOVERY_SKIPPED_BACKLOG_REPO_FILES] source_task={source_task_id} "
+                f"proposed_task={skipped_id} files={','.join(skipped_files)}: "
+                f"all files live in the backlog repo (not in any configured target repo); "
+                f"commit as backlog-repo bookkeeping by hand; no work-unit recovery created."
+            )
+            logger.info("write-proposal: %s", audit)
+        if not proposal.proposed_tasks:
+            # Every proposed task was backlog-repo only -- nothing to write.
+            # Source task escalates: operator must commit the backlog-repo
+            # bookkeeping by hand and decide whether the source task can
+            # otherwise proceed.
+            print(
+                json.dumps(
+                    {
+                        "source_task_id": source_task_id,
+                        "proposal_path": None,
+                        "recovery_skipped": True,
+                        "reason": "all proposed tasks owned only backlog-repo files",
+                    }
+                )
+            )
+            return 0
+        # Issue #159: blocker-resolver agents sometimes prefix paths with
+        # the target repo's `checkout_directory` (e.g. `kanon/src/foo.py`
+        # when `kanon` is configured as the checkout directory). Strip
+        # the prefix so the persisted JSON carries repo-relative paths
+        # only, matching the manifest-path convention enforced by
+        # validate-backlog rule 11 + guard-work-unit-write.sh. Paths that
+        # match multiple configured `checkout_directories` are ambiguous
+        # and reject the whole proposal. Strip runs AFTER the backlog-
+        # repo filter so the filter can still classify by first-segment
+        # match with the unstripped paths.
+        proposal = _strip_checkout_directory_prefix(proposal)
+        # Compute the dedup signature even when the agent did not stamp it.
+        proposal = _stamp_fix_signature(proposal)
+        # Issue #141: scan for an existing recovery task whose fix
+        # signature matches. If found, wire the new source task as an
+        # additional dep edge instead of writing a duplicate proposal.
+        match = find_matching_pending_proposal(WORKSPACE_ROOT, proposal.fix_signature)
+        if match is not None and match.source_task_id != source_task_id:
+            return _wire_recovery_reuse(source_task_id, proposal, match)
         written = write_proposal(WORKSPACE_ROOT, proposal)
     except (_ProposalInputError, ProposalError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-    print(json.dumps({"source_task_id": source_task_id, "proposal_path": str(written)}))
+
+    auto_cascade = _maybe_auto_cascade_proposal(source_task_id, proposal)
+    output: dict[str, object] = {
+        "source_task_id": source_task_id,
+        "proposal_path": str(written),
+        "fix_signature": proposal.fix_signature,
+        "cascade_depth": proposal.cascade_depth,
+        "recovery_reused": False,
+    }
+    output.update(auto_cascade)
+    print(json.dumps(output))
     return 0
+
+
+def _stamp_fix_signature(proposal: Proposal) -> Proposal:
+    """Return a copy of ``proposal`` with ``fix_signature`` populated.
+
+    No-op when the proposal already carries a non-empty signature
+    (operator-edited proposals keep their original signature so dedup
+    matching stays stable across hand edits).
+
+    Signature inputs:
+      - ``target_repo``: read from the source task's BACKLOG row when
+        available; falls back to "" when the source isn't in the index
+        yet (sufficient for the early-emission case).
+      - ``files_to_own``: flattened sorted across every proposed task.
+      - ``intent_phrase``: derived from the FIRST proposed task's
+        ``suggested_approach`` via the regex normaliser.
+    """
+    if proposal.fix_signature:
+        return proposal
+    target_repo = _resolve_source_repo(proposal.source_task_id)
+    files: list[str] = []
+    for task in proposal.proposed_tasks:
+        files.extend(task.files_to_own)
+    intent = ""
+    if proposal.proposed_tasks:
+        intent = _extract_intent_phrase(proposal.proposed_tasks[0].suggested_approach)
+    signature = _compute_fix_signature(target_repo, files, intent)
+    from dataclasses import replace as _replace
+
+    return _replace(proposal, fix_signature=signature)
+
+
+def _resolve_source_repo(source_task_id: str) -> str:
+    """Best-effort repo lookup for a source task id; returns "" when not found."""
+    try:
+        parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+        units = parser.parse_index()
+    except (FileNotFoundError, ValueError):
+        return ""
+    for unit in units:
+        if unit.id == source_task_id:
+            return unit.repo or ""
+    return ""
+
+
+def _file_lives_in_a_target_repo(file_path: str) -> bool:
+    """Return True iff ``file_path`` (workspace-relative) lives inside one
+    of the configured target repos (issue #146).
+
+    A workspace-relative path is "in a target repo" when its first path
+    segment matches the ``checkout_directory`` of any
+    ``RUNTIME_CONFIG.repos[*]`` entry. Files outside every configured
+    target repo (e.g. ``spec/observability.md``, ``BACKLOG.md``,
+    ``backlog/**/*.md``, ``docs/*.md``) are backlog-repo bookkeeping
+    edits, not work-unit deliverables, and the recovery cascade has no
+    valid completion path for them.
+    """
+    if not file_path:
+        return False
+    if not RUNTIME_CONFIG.repos:
+        # No target repos configured -- the filter has no basis for
+        # classification; treat every file as in-scope (conservative).
+        return True
+    first_segment = file_path.split("/", 1)[0]
+    for repo_cfg in RUNTIME_CONFIG.repos.values():
+        checkout = repo_cfg.checkout_directory or (
+            repo_cfg.validated_repo.split("/", 1)[1] if repo_cfg.validated_repo else None
+        )
+        if checkout and first_segment == checkout:
+            return True
+    return False
+
+
+def _strip_checkout_directory_prefix(proposal: Proposal) -> Proposal:
+    """Issue #159: strip ``<checkout_directory>/`` prefixes from every
+    ``proposed_tasks[*].files_to_own`` entry.
+
+    blocker-resolver agents occasionally emit paths prefixed with the
+    target repo's ``checkout_directory`` (e.g. ``kanon/src/foo.py`` when
+    ``kanon`` is configured as the kanon repo's ``checkout_directory``).
+    Persisted as-is, those paths fail validate-backlog rule 11 on every
+    iteration and require operator hand-fix via ``sed``. The strip here
+    makes the agent's output canonical regardless of whether it
+    remembered to stay repo-relative.
+
+    Raises ``ProposalError`` when a single path matches multiple
+    configured ``checkout_directories`` (rare; only when checkout
+    directories share a common ancestor segment). Operator must fix the
+    ambiguous path by hand rather than have devbench silently pick one
+    interpretation.
+    """
+    from dataclasses import replace as _replace
+
+    if not RUNTIME_CONFIG.repos:
+        return proposal
+
+    # Enumerate every configured checkout_directory (deterministic order
+    # so the multi-match error message is reproducible).
+    checkout_dirs: list[str] = sorted(
+        {
+            (
+                repo_cfg.checkout_directory
+                or (repo_cfg.validated_repo.split("/", 1)[1] if repo_cfg.validated_repo else "")
+            )
+            for repo_cfg in RUNTIME_CONFIG.repos.values()
+        }
+    )
+    checkout_dirs = [d for d in checkout_dirs if d]
+    if not checkout_dirs:
+        return proposal
+
+    new_tasks: list = []
+    for task in proposal.proposed_tasks:
+        new_files: list[str] = []
+        for raw in task.files_to_own:
+            matches = [d for d in checkout_dirs if raw == d or raw.startswith(d + "/")]
+            if len(matches) > 1:
+                raise ProposalError(
+                    f"proposed_tasks[{task.suggested_id}].files_to_own contains an ambiguous path "
+                    f"{raw!r}: matches multiple configured checkout_directories "
+                    f"({', '.join(matches)}); fix the proposal so the path is unambiguous."
+                )
+            if len(matches) == 1:
+                prefix = matches[0]
+                if raw == prefix:
+                    # Path IS the checkout directory itself (no file
+                    # selected). Skip; the agent must name a real file.
+                    continue
+                new_files.append(raw[len(prefix) + 1 :])
+            else:
+                new_files.append(raw)
+        new_tasks.append(_replace(task, files_to_own=new_files))
+    return _replace(proposal, proposed_tasks=new_tasks)
+
+
+def _filter_backlog_repo_proposed_tasks(proposal: Proposal) -> tuple[Proposal, list[tuple[str, list[str]]]]:
+    """Issue #146: drop proposed-task entries whose every file lives in
+    the backlog repo (i.e., NOT in any configured target repo).
+
+    Returns a (filtered_proposal, skipped) tuple. ``skipped`` is a list
+    of (suggested_id, files) for the dropped entries; the caller logs
+    ``[RECOVERY_SKIPPED_BACKLOG_REPO_FILES]`` audits naming each set.
+    For mixed entries (some files in target repos, some in backlog
+    repo), the entry is RETAINED with only the target-repo files (the
+    backlog-repo files are pruned) and a ``[RECOVERY_PARTIAL_BACKLOG_REPO_SKIP]``
+    audit is logged separately by the caller.
+    """
+    from dataclasses import replace as _replace
+
+    kept: list = []
+    skipped: list[tuple[str, list[str]]] = []
+    mutated = False
+    for task in proposal.proposed_tasks:
+        if not task.files_to_own:
+            # Empty files_to_own = research / validation-gate task; not
+            # backlog-only by intent. Preserve as-is.
+            kept.append(task)
+            continue
+        target_repo_files = [f for f in task.files_to_own if _file_lives_in_a_target_repo(f)]
+        backlog_files = [f for f in task.files_to_own if not _file_lives_in_a_target_repo(f)]
+        if not target_repo_files:
+            # Entirely backlog-repo work -- drop the entry.
+            skipped.append((task.suggested_id, backlog_files))
+            mutated = True
+            continue
+        if backlog_files:
+            # Mixed -- prune the backlog files; keep target-repo files.
+            kept.append(_replace(task, files_to_own=target_repo_files))
+            mutated = True
+        else:
+            kept.append(task)
+    if not mutated:
+        return proposal, skipped
+    return _replace(proposal, proposed_tasks=kept), skipped
+
+
+def _wire_recovery_reuse(
+    source_task_id: str,
+    proposal: Proposal,
+    match: ProposalMatch,
+) -> int:
+    """Issue #141: instead of writing a duplicate proposal, wire the
+    new source task as an additional dep on the existing recovery task,
+    log a ``[RECOVERY_REUSED]`` audit, and emit the JSON envelope.
+    """
+    audit_msg = (
+        f"[RECOVERY_REUSED] reusing existing recovery task {match.source_task_id} for "
+        f"fix_signature {match.fix_signature[:16]} (full proposal at {match.proposal_path})"
+    )
+    try:
+        add_dep(
+            backlog_root=BACKLOG_ROOT,
+            backlog_index=BACKLOG_INDEX,
+            blocked_task_id=source_task_id,
+            blocker_task_id=match.source_task_id,
+            reason=audit_msg,
+        )
+    except (FileNotFoundError, ProposalError) as exc:
+        # Failure to wire dep falls back to the emit path so the
+        # operator is not silently left in a half-state. Surface as
+        # error; caller (the orchestrator) can choose to retry.
+        print(f"ERROR: recovery-reuse dep wiring failed: {exc}", file=sys.stderr)
+        return 1
+    output = {
+        "source_task_id": source_task_id,
+        "recovery_reused": True,
+        "reused_from_task_id": match.source_task_id,
+        "reused_proposal_path": str(match.proposal_path),
+        "fix_signature": proposal.fix_signature,
+    }
+    print(json.dumps(output))
+    return 0
+
+
+def _maybe_auto_cascade_proposal(source_task_id: str, proposal: Proposal) -> dict[str, object]:
+    """Materialise + promote every proposed task when auto-accept is on.
+
+    Returns a result dict suitable for embedding in the
+    ``write-proposal`` JSON output. Entries:
+
+    - ``auto_cascade``: ``"applied"`` | ``"disabled"`` | ``"failed"``
+    - ``materialised``: list of draft Path strings (when applied)
+    - ``promoted``: list of task ids successfully promoted (when applied)
+    - ``error``: present only when ``auto_cascade == "failed"``
+
+    Soft failure: any error during the cascade is logged + reported in
+    the returned dict but does NOT propagate as a non-zero exit. The
+    JSON is already on disk; the next ``sweep-proposals`` cycle will
+    retry the cascade.
+    """
+    if not RUNTIME_CONFIG.task_factory.auto_accept_proposals:
+        return {"auto_cascade": "disabled"}
+
+    audit_suffix = "(auto-accepted via task_factory.auto_accept_proposals=true at write-proposal time)"
+
+    try:
+        parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+        units = parser.parse_index()
+    except (FileNotFoundError, ValueError) as exc:
+        logger.warning(
+            "write-proposal auto-cascade aborted for %s -- cannot read backlog index: %s",
+            source_task_id,
+            exc,
+        )
+        return {"auto_cascade": "failed", "error": str(exc)}
+    source_unit = next((u for u in units if u.id == source_task_id), None)
+    if source_unit is None:
+        logger.warning(
+            "write-proposal auto-cascade aborted for %s -- source not in backlog index",
+            source_task_id,
+        )
+        return {"auto_cascade": "failed", "error": "source not found in backlog index"}
+
+    try:
+        materialised = materialise_proposal(
+            workspace_root=WORKSPACE_ROOT,
+            backlog_root=BACKLOG_ROOT,
+            backlog_index=BACKLOG_INDEX,
+            proposal=proposal,
+            repo=source_unit.repo,
+        )
+    except ProposalError as exc:
+        logger.warning(
+            "write-proposal auto-cascade materialise failed for %s: %s",
+            source_task_id,
+            exc,
+        )
+        return {"auto_cascade": "failed", "error": str(exc)}
+
+    promoted: list[str] = []
+    for task in proposal.proposed_tasks:
+        state = classify_proposed_task(BACKLOG_ROOT, WORKSPACE_ROOT, task.suggested_id)
+        if state is not ProposalTaskState.PROPOSED:
+            continue
+        try:
+            promote_proposal(
+                workspace_root=WORKSPACE_ROOT,
+                backlog_root=BACKLOG_ROOT,
+                backlog_index=BACKLOG_INDEX,
+                task_id=task.suggested_id,
+                audit_suffix=audit_suffix,
+            )
+            promoted.append(task.suggested_id)
+        except ProposalError as exc:
+            logger.warning(
+                "write-proposal auto-cascade promote failed for %s: %s",
+                task.suggested_id,
+                exc,
+            )
+
+    logger.info(
+        "write-proposal auto-cascade applied for %s: materialised=%d promoted=%d",
+        source_task_id,
+        len(materialised),
+        len(promoted),
+    )
+    return {
+        "auto_cascade": "applied",
+        "materialised": [str(p) for p in materialised],
+        "promoted": promoted,
+    }
 
 
 def cmd_list_proposals() -> int:
@@ -1748,25 +5259,38 @@ def _count_unmaterialised_proposed_tasks() -> int:
     return count
 
 
-def _count_blocked_split(units: list[WorkUnit]) -> tuple[int, int]:
-    """Return ``(auto_count, attn_count)`` for the blocked-task UX split (ADR-10).
+def _count_blocked_split(units: list[WorkUnit]) -> tuple[int, int, int]:
+    """Return ``(auto_count, recovery_count, attn_count)`` for the 3-state split.
 
     Iterates every blocked work unit and classifies it via
-    :func:`classify_blocked_task`. The two counts always sum to the total
-    number of blocked tasks in ``units`` so the aggregate is recoverable
-    by addition.
+    :func:`classify_blocked_task`. The three counts always sum to the
+    total number of blocked tasks in ``units`` so the aggregate is
+    recoverable by addition. ``recovery_count`` is the new
+    ``AWAITING_AUTO_RECOVERY`` bucket: tasks devbench will resolve on
+    its own via the manifest-amender / blocker-resolver / task-factory
+    loop, but that have not yet reached the
+    ``[BLOCKED_PENDING_PROPOSAL]`` marker state.
     """
     auto = 0
+    recovery = 0
     attn = 0
     for u in units:
         if u.status != WorkUnitStatus.BLOCKED:
             continue
-        state = classify_blocked_task(BACKLOG_ROOT, BACKLOG_INDEX, u.id)
+        state = classify_blocked_task(
+            BACKLOG_ROOT,
+            BACKLOG_INDEX,
+            u.id,
+            workspace_root=WORKSPACE_ROOT,
+            recovery_window_seconds=BLOCKED_RECOVERY_WINDOW_SECONDS,
+        )
         if state is BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL:
             auto += 1
+        elif state is BlockedTaskState.AWAITING_AUTO_RECOVERY:
+            recovery += 1
         else:
             attn += 1
-    return auto, attn
+    return auto, recovery, attn
 
 
 def cmd_promote_proposal(first_arg: str, second_arg: str = "") -> int:
@@ -1797,6 +5321,29 @@ def cmd_promote_proposal(first_arg: str, second_arg: str = "") -> int:
     if not task_id:
         print("ERROR: promote-proposal requires a task id", file=sys.stderr)
         return 1
+
+    # Heuristic: warn (or honor proposal flag) when the new task looks like a
+    # test that validates the source task's output. In that pattern, the
+    # default dep direction (source.depends_on(new)) creates a circular
+    # cycle. See docs/task-factory.md "When to use --no-dep-on-source".
+    if dep_on_source:
+        proposal_hint = _detect_test_validates_source(task_id)
+        if proposal_hint == "flag":
+            print(
+                f"NOTE: proposal source_dep_direction='test_validates_source' on "
+                f"{task_id}; auto-applying --no-dep-on-source.",
+                file=sys.stderr,
+            )
+            dep_on_source = False
+        elif proposal_hint == "heuristic":
+            print(
+                f"WARNING: {task_id} looks like a test-validates-source task "
+                f"(title or files_to_own match the heuristic). The default dep "
+                f"direction (source.depends_on(new)) may create a cycle. Re-run "
+                f"with --no-dep-on-source if appropriate; see "
+                f"docs/task-factory.md 'When to use --no-dep-on-source'.",
+                file=sys.stderr,
+            )
 
     try:
         result = promote_proposal(
@@ -1842,6 +5389,56 @@ def _run_promote_all(source_task_id: str) -> int:
         logger.info("Promoted %s", path.stem)
     print(json.dumps({"source_task_id": source_task_id, "promoted_count": len(promoted)}))
     return 0
+
+
+_TEST_VALIDATES_SOURCE_TITLE_PREFIXES: tuple[str, ...] = (
+    "Add tests/",
+    "Add unit tests",
+    "Add integration tests",
+    "Verify ",
+    "Validate ",
+    "Assert ",
+)
+
+
+def _detect_test_validates_source(task_id: str) -> str:
+    """Classify a proposed task's relationship to its source.
+
+    Returns ``"flag"`` when the proposal JSON declares
+    ``source_dep_direction == "test_validates_source"``; ``"heuristic"`` when
+    the proposed task's title or files_to_own match the test-validates-source
+    heuristic but the flag is not set; ``""`` otherwise.
+
+    Reads the proposal JSON files under ``$WORKSPACE_ROOT/.devbench/proposals/``
+    and matches by ``ProposedTask.suggested_id``. Returns ``""`` on any I/O or
+    parse error so the warning is best-effort and never blocks promotion.
+    """
+    proposals_dir = WORKSPACE_ROOT / ".devbench" / "proposals"
+    if not proposals_dir.is_dir():
+        return ""
+    try:
+        for path in proposals_dir.glob("*.json"):
+            try:
+                with path.open() as fh:
+                    data = json.load(fh)
+            except (OSError, json.JSONDecodeError):
+                continue
+            for entry in data.get("proposed_tasks", []):
+                if not isinstance(entry, dict):
+                    continue
+                if str(entry.get("suggested_id", "")).strip() != task_id:
+                    continue
+                if str(data.get("source_dep_direction", "")).strip() == "test_validates_source":
+                    return "flag"
+                title = str(entry.get("title", "")).strip()
+                files = entry.get("files_to_own") or []
+                if any(title.startswith(p) for p in _TEST_VALIDATES_SOURCE_TITLE_PREFIXES):
+                    return "heuristic"
+                if files and all(str(f).startswith("tests/") or "/tests/" in str(f) for f in files):
+                    return "heuristic"
+    except OSError:
+        return ""
+    return ""
 
 
 def cmd_add_dep(*argv: str) -> int:
@@ -2138,15 +5735,122 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
         2,
         "Mark a work unit Declined (won't ever be done) with a reason: decline <id> --reason <message>",
     ),
-    "validate-backlog": (cmd_validate_backlog, 0, "Validate backlog integrity"),
+    "hold": (
+        cmd_hold,
+        2,
+        (
+            "Mark a work unit Hold (deferred / under debate) with a reason: "
+            "hold <id> --reason <message>. Orchestrator skips held units."
+        ),
+    ),
+    "unhold": (
+        cmd_unhold,
+        2,
+        (
+            "Return a held work unit to in-queue with a reason: "
+            "unhold <id> --reason <message>. Refuses units not currently on hold."
+        ),
+    ),
+    "sync-blocked": (
+        cmd_sync_blocked,
+        0,
+        (
+            "Reconcile every task's status against current dep satisfaction: "
+            "in-queue with unsatisfied deps -> blocked; blocked with all deps "
+            "now terminal -> in-queue (skipping units with open "
+            "[BLOCKED_PENDING_PROPOSAL] markers, which the ADR-07 cascade owns)."
+        ),
+    ),
+    "reconcile-cascade": (
+        cmd_reconcile_cascade,
+        0,
+        (
+            "Walk every blocked task; flip eligible ones (markers all terminal "
+            "AND regular deps satisfied) to in-queue with a [CASCADE_RECONCILED] "
+            "audit. Returns JSON envelope of flips + skips."
+        ),
+    ),
+    "new-task": (
+        cmd_new_task,
+        0,
+        (
+            "Scaffold a new work-unit .md file from the canonical template: "
+            'new-task --id <ID> --title "<TITLE>" --target <PATH> '
+            "[--repo <ORG/REPO>] [--description <TEXT>] [--source-file <PATH>] "
+            "[--test-file <PATH>] [--ac-func <TEXT>]. Template kind is "
+            "derived from the ID's last segment (T/S/F/E)."
+        ),
+    ),
+    "validate-backlog": (cmd_validate_backlog, 0, "Validate backlog integrity [--fix: auto-correct rule-10/11]"),
+    "check": (
+        cmd_check,
+        0,
+        (
+            "Pre-flight: verify symlinks, origin remotes, default_branch "
+            "parity, and no conflicting open PRs across all target repos "
+            "in devbench.yaml"
+        ),
+    ),
     "ensure-branch": (cmd_ensure_branch, 1, "Create or switch to work unit branch: ensure-branch <id>"),
     "git-ops": (cmd_git_ops, 1, "Run git operations for a work unit: git-ops <id>"),
     "git-ops-finalize": (cmd_git_ops_finalize, 1, "Push single branch and create PR: git-ops-finalize <repo>"),
+    "check-merge": (
+        cmd_check_merge,
+        1,
+        (
+            "Reconcile a pause-before-merge work unit's PR state (issue #101). "
+            "Promotes to done on merged, blocks on closed-without-merge, "
+            "no-ops on still-open: check-merge <id>"
+        ),
+    ),
+    "cleanup-tracked-orphans": (
+        cmd_cleanup_tracked_orphans,
+        1,
+        (
+            "Untrack build/state artifacts (terraform state, pycache, "
+            "coverage, etc.) and write managed .gitignore: "
+            "cleanup-tracked-orphans <org/repo|path> [--dry-run]"
+        ),
+    ),
     "log": (cmd_log, 1, "Log a message: log <message>"),
     "report": (
         cmd_report,
         0,
-        "Progress report, renders All-time + Current run windows by default: report [--watch N] [since-timestamp]",
+        ("Progress report; streams on TTY by default: report [--once|--no-stream] [--since <ISO-8601>] [--watch N]"),
+    ),
+    "write-snapshot": (
+        cmd_write_snapshot,
+        0,
+        "Issue #162 Phase 6: render the report once and persist it to .devbench/report-snapshot.json",
+    ),
+    "rebuild-window-stats": (
+        cmd_rebuild_window_stats,
+        0,
+        (
+            "Issue #162 Phase 2: rebuild every .devbench/window-stats/"
+            "<task>.json aggregate from the orchestrator log (idempotent)"
+        ),
+    ),
+    "archive-session": (
+        cmd_archive_session,
+        1,
+        (
+            "Issue #162 Phase 7: archive a session's JSONL log to "
+            "logs/legacy/<session>.parquet (requires `pip install devbench[archive]`)"
+        ),
+    ),
+    "migrate-log-shards": (
+        cmd_migrate_log_shards,
+        0,
+        (
+            "Issue #162 Phase 3 (DESTRUCTIVE; requires --migrate-log-shards): "
+            "partition logs/orchestrator.log into logs/<YYYY-MM>/<task>.jsonl shards"
+        ),
+    ),
+    "upgrade": (
+        cmd_upgrade,
+        0,
+        "Idempotent migration to the latest devbench layout: upgrade [--migrate-log-shards]",
     ),
     "start": (cmd_start, 0, "Run orchestrate skill via Agent SDK (non-interactive)"),
     "watch": (
@@ -2188,6 +5892,11 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
         cmd_reject_amendment,
         2,
         "Reject amendment and block the task: reject-amendment <id> <reason>",
+    ),
+    "log-rejection-feedback": (
+        cmd_log_rejection_feedback,
+        3,
+        "Persist review-judge rejection JSON: log-rejection-feedback <judge> <id> --json '<payload>'",
     ),
     "list-proposals": (
         cmd_list_proposals,
@@ -2233,7 +5942,37 @@ _HELP_FLAGS: frozenset[str] = frozenset({"--help", "-h"})
 # list instead of the dispatcher's fixed-arity slice. Additions here are
 # deliberate -- the slice is a guardrail against typos for fixed-arity
 # commands, so variadic opt-in should be narrow.
-_VARIADIC_COMMANDS: frozenset[str] = frozenset({"hook-tail", "watchdog"})
+#
+# add-dep is variadic because its `--reason "<multi token message>"` flag
+# value is dropped by the fixed-arity slice (slice keeps only positional
+# count + 1 trailing arg, so `--reason` survives but the value after it
+# does not). _parse_add_dep_argv handles flags itself; opting into
+# variadic dispatch lets the value through.
+_VARIADIC_COMMANDS: frozenset[str] = frozenset(
+    {
+        "hook-tail",
+        "watchdog",
+        "add-dep",
+        "decline",
+        "hold",
+        "unhold",
+        "status",
+        "new-task",
+        "reject-proposal",
+        "validate-backlog",
+        "log-rejection-feedback",
+        # Issue #162 Phase 6: pre-render the report into a snapshot file.
+        "write-snapshot",
+        # Issue #162 Phase 2: rebuild per-task window-stats aggregates from the log.
+        "rebuild-window-stats",
+        # Issue #162 Phase 7: archive an ended session's log to Parquet (opt-in dep).
+        "archive-session",
+        # Issue #162 Phase 3: destructive migration to a sharded event-store layout.
+        "migrate-log-shards",
+        # Issue #162 unified upgrade command (orchestrates all migrations).
+        "upgrade",
+    }
+)
 
 
 def _print_usage() -> None:
@@ -2261,11 +6000,29 @@ def _extract_watch_flag(raw_args: list[str]) -> tuple[int, list[str]]:
     return interval, filtered
 
 
-def _dispatch_watch_commands(command: str, watch_interval: int, args: list[str]) -> int | None:
+def _extract_once_flag(raw_args: list[str]) -> tuple[bool, list[str]]:
+    """Return ``(once, remaining_args)`` after stripping ``--once`` / ``--no-stream``.
+
+    Issue #163: ``--once`` (or its alias ``--no-stream``) forces the legacy
+    one-shot snapshot behaviour, suitable for CI / scripted consumers
+    that expect the report to print and exit. The default on a TTY is
+    streaming.
+    """
+    filtered: list[str] = []
+    once = False
+    for arg in raw_args:
+        if arg in ("--once", "--no-stream"):
+            once = True
+            continue
+        filtered.append(arg)
+    return once, filtered
+
+
+def _dispatch_watch_commands(command: str, watch_interval: int, args: list[str], once: bool = False) -> int | None:
     """Dispatch commands that take ``--watch N``. Return ``None`` if not handled."""
-    if command == "report" and watch_interval > 0:
+    if command == "report" and (watch_interval > 0 or once):
         since_arg = args[0] if args else ""
-        return cmd_report(since=since_arg, watch_interval=watch_interval)
+        return cmd_report(since=since_arg, watch_interval=watch_interval, once=once)
     if command == "watch" and watch_interval > 0:
         return cmd_watch(watch_interval=watch_interval)
     return None
@@ -2301,11 +6058,19 @@ def main() -> int:
     else:
         watch_interval, args = 0, sys.argv[2:]
 
+    # Issue #163: ``devbench report`` accepts ``--once`` / ``--no-stream``
+    # to force one-shot snapshot rendering even on a TTY. Strip the flag
+    # before the args reach the command function so the positional
+    # ``since`` slot stays well-defined.
+    once = False
+    if command == "report":
+        once, args = _extract_once_flag(args)
+
     if len(args) < min_args:
         print(f"Command '{command}' requires at least {min_args} argument(s)", file=sys.stderr)
         return 1
 
-    watch_rc = _dispatch_watch_commands(command, watch_interval, args)
+    watch_rc = _dispatch_watch_commands(command, watch_interval, args, once=once)
     if watch_rc is not None:
         return watch_rc
 

@@ -1,0 +1,8 @@
+---
+- name: Create /home/<user>/workspace
+  ansible.builtin.file:
+    path: "/home/{{ linux_user }}/workspace"
+    state: directory
+    owner: "{{ linux_user }}"
+    group: "{{ linux_user }}"
+    mode: "0755"

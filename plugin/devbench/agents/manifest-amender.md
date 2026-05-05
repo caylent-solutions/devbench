@@ -27,9 +27,19 @@ Your job is to answer the genuinely semantic questions that deterministic code c
 
 2. **Scope minimality.** For each file in `files_to_add`, look at that file's diff. Is the diff the minimum needed to make the linked ACs pass, or does it sprawl into unrelated work? Changes that touch code outside the linked ACs, introduce new features, refactor beyond the requirement, or add "while we're here" improvements are out of scope -- reject.
 
+   **Critical (issue #127):** "the requested file is not in the current Changes Manifest" is **never** a SCOPE-failure reason. Adding files to the Manifest is the entire purpose of an amendment; deterministic pre-filter rule 5 has already confirmed every requested file is present in the staged diff, and the Layer-3 post-check after `apply-amendment` will verify AC-FINAL-015 (Manifest matches staged exactly) once the new rows are appended. SCOPE evaluates whether each requested *diff* is minimal and Approach-coherent, not whether each requested file pre-existed in the Manifest. If you find yourself writing "the requested files are not in the Changes Manifest" as a SCOPE-FAIL justification, stop and re-evaluate against the Approach + diff text instead. This rule is regression-tested (`tests/test_integration/test_manifest_amender_scope.py`).
+
 3. **Justification coherence.** Read the `justification` field in the amendment request. Does it accurately describe what the diff actually does? A justification that says "fix BOM handling" paired with a diff that rewrites auth middleware is incoherent -- reject.
 
-If the answer to any of the three questions is unclear or negative, reject. Do NOT try to repair the request on the author's behalf. The executor can produce a new request on a subsequent run.
+4. **Pre-conflict check (issue #137).** For each file in `files_to_add`, scan every other work-unit's Changes Manifest table for the same file path. The validator's `_check_manifest_conflicts` helper exposes this map; you can shell out via `uv run devbench validate-backlog 2>&1 | grep -A2 "Manifest conflict on '<file>'"` to see whether the file is already claimed.
+
+   - If no other task claims the file, ALLOW (no further action on this rule).
+   - If the conflict task is in a terminal state (`done` / `declined`) AND the new row's Change column reads `Modify`, ALLOW the amendment AND auto-wire the dep (issue #142): invoke `uv run devbench add-dep <source-task-id> <conflict-task-id>` from your shell session before emitting the `apply` verdict, then emit `[CONFLICT_AUTODEP]` audit naming the wired dep. The auto-wire makes the recovery cascade an exception rather than the norm for the common case (file claimed by an already-`done` task). If `add-dep` fails (rare; usually a backlog parse error), surface as `[CONFLICT_AUTODEP_FAILED] <error>` and fall back to recommending the operator hand-wire. Regression-tested in `tests/test_integration/test_manifest_amender_auto_dep.py`.
+   - Otherwise, REJECT the amendment with a structured reason naming the conflict task (e.g. `pre-conflict: 'pyproject.toml' already claimed by E0-F1-S1-T1 (status: blocked); resolve via dep wiring or a spec-correction recovery task before re-requesting`). The blocker-resolver / task-factory cascade then materialises a recovery task that respects the markdown-only Manifest rule from issue #136.
+
+   This pre-filter prevents new conflicts from being authored in the first place, which makes the recovery cascade an exception rather than the norm. This rule is regression-tested (`tests/test_integration/test_manifest_amender_pre_conflict.py`).
+
+If the answer to any of the four questions is unclear or negative, reject. Do NOT try to repair the request on the author's behalf. The executor can produce a new request on a subsequent run.
 
 ## PROJECT STANDARDS THAT STILL APPLY
 
@@ -101,9 +111,31 @@ else
   echo "ARCHIVE_MISSING -- reject-amendment returned 0 but the archive did not land on disk; re-run step 3"
   exit 1
 fi
+# 5. VERIFY the structured rejection-feedback JSON exists. Issue #154 + #156:
+#    every rejection writes ``.devbench/review-failures/<task-id>-manifest_amender-<n>.json``
+#    so the executor-feedback collector can ingest the rejection on retry.
+#    The blocker-resolver reads the most-recent file to decide what fix
+#    proposal to emit. A missing feedback JSON means the next executor
+#    invocation will not see the rejection rationale. The legacy
+#    ``.devbench/amender-rejections/<task-id>-<n>.json`` location is also
+#    accepted for forward compatibility with archived runs.
+if ls "$JUDGE_WORKSPACE_ROOT/.devbench/review-failures/$ARGUMENTS-manifest_amender-"*.json >/dev/null 2>&1 \
+  || ls "$JUDGE_WORKSPACE_ROOT/.devbench/amender-rejections/$ARGUMENTS-"*.json >/dev/null 2>&1; then
+  echo "FEEDBACK_OK -- review-failures/$ARGUMENTS-manifest_amender-*.json present"
+else
+  echo "FEEDBACK_MISSING -- reject-amendment returned 0 but the feedback JSON did not land; re-run step 3"
+  exit 1
+fi
 ```
 
 The `|| true` on the three git commands is intentional: a file can be tracked-and-modified, tracked-and-restored-to-head, or untracked-and-new, and the trio collectively handles all cases without failing the pipeline. Every OTHER step is strict -- any non-zero exit aborts the verdict.
+
+**Verdict-emission contract (issue #156).** The amender-rejection JSON written by `reject-amendment` already follows the schema-v1 review-failures shape (judge=`manifest_amender`), so no separate `log-rejection-feedback` invocation is required. The category code surfaced in the rejection reason flows into `categories[0].code` via the legacy heuristic; valid codes are `SCOPE` / `APPROACH_AUTH` / `JUSTIFICATION_COHERENCE` / `PRE_FILTER` / `OTHER`. See `docs/review-feedback-vocabulary.md` for the full registry.
+
+**Rejection-reason category tokens (issue #154).** When you write the rejection reason in step 3, surface one of the canonical category tokens inline so the feedback collector can route the retry: `SCOPE` / `APPROACH_AUTH` / `JUSTIFICATION_COHERENCE` / `PRE_FILTER`. Reasons that do not name a category fall back to `OTHER`. Example:
+- `"SCOPE: amendment lists files outside the linked AC's blast radius"`
+- `"APPROACH_AUTH: task Approach forbids production-code changes; bug should be escalated via write-proposal"`
+- `"JUSTIFICATION_COHERENCE: justification claims BOM fix but diff rewrites auth middleware"`
 
 **Step C.** Log the final verdict AFTER the verification in Step B reports `ARCHIVE_OK` (for reject) or after `apply-amendment` exits 0 (for apply):
 ```

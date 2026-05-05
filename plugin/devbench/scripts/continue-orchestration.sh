@@ -53,19 +53,57 @@ STALE_MINUTES=$(_read_yaml_int "stale_task_minutes" "120" "JUDGE_STOP_STALE_MINU
 
 # --- Check for in-progress task ---
 
-IN_PROGRESS_LINE=$(grep "| in-progress |" "$BACKLOG_INDEX" 2>/dev/null | head -1 || true)
+IN_PROGRESS_ROWS=$(grep "| in-progress |" "$BACKLOG_INDEX" 2>/dev/null || true)
 
-if [ -z "$IN_PROGRESS_LINE" ]; then
+if [ -z "$IN_PROGRESS_ROWS" ]; then
     # No in-progress tasks -- allow stop, clean up state file.
     rm -f "$STATE_FILE"
     exit 0
 fi
 
-# Extract task ID (first pipe-delimited field after leading pipe).
-TASK_ID=$(echo "$IN_PROGRESS_LINE" | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}')
+# Active-task selection (issue #131): the BACKLOG.md "first in-progress row"
+# heuristic returns whichever ID is alphabetically first, not the task the
+# orchestrator most recently claimed. Prefer the most recent claim entry from
+# the orchestrator log; fall back to head -1 when no log entry is parseable
+# (fresh checkout, never-launched workspace).
+_active_task_id_from_logs() {
+    local logs_dir="${WORKSPACE_ROOT}/logs"
+    [ -d "$logs_dir" ] || return 1
+    # Most recent "Branch ready: <branch> on <task_id>" or
+    # "Set <task_id> to 'in-progress'" entry across any orchestrator log.
+    local last_entry
+    last_entry=$(grep -hE "Branch ready:.* on [A-Z0-9-]+|Set [A-Z0-9-]+ to 'in-progress'" "$logs_dir"/*.log 2>/dev/null | tail -1 || true)
+    [ -n "$last_entry" ] || return 1
+    if [[ "$last_entry" =~ Branch\ ready:.*on\ ([A-Z0-9-]+) ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    if [[ "$last_entry" =~ Set\ ([A-Z0-9-]+)\ to ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    return 1
+}
+
+# Build the alphabetically-ordered list of in-progress task IDs (for use in
+# the reason text when more than one task is in-progress).
+ALL_IN_PROGRESS_IDS=$(printf '%s\n' "$IN_PROGRESS_ROWS" | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/, "", $2); if ($2 != "") print $2}')
+
+ACTIVE_TASK_ID=$(_active_task_id_from_logs || true)
+if [ -n "$ACTIVE_TASK_ID" ] && printf '%s\n' "$ALL_IN_PROGRESS_IDS" | grep -qx "$ACTIVE_TASK_ID"; then
+    TASK_ID="$ACTIVE_TASK_ID"
+else
+    # Fallback: first row in BACKLOG.md.
+    TASK_ID=$(printf '%s\n' "$ALL_IN_PROGRESS_IDS" | head -1)
+fi
+
+IN_PROGRESS_LINE=$(printf '%s\n' "$IN_PROGRESS_ROWS" | awk -F'|' -v tid="$TASK_ID" '{gsub(/^[ \t]+|[ \t]+$/, "", $2); if ($2 == tid) {print; exit}}')
 
 # Extract file path (last backtick-wrapped field).
 FILE_PATH=$(echo "$IN_PROGRESS_LINE" | grep -oP '`[^`]+`' | tail -1 | tr -d '`')
+
+# When multiple tasks share in-progress, list them all (active named first).
+OTHER_IN_PROGRESS=$(printf '%s\n' "$ALL_IN_PROGRESS_IDS" | grep -vx "$TASK_ID" | paste -sd, - || true)
 
 # --- Detect blocked transitional state ---
 # BACKLOG.md says in-progress but the actual work unit file may say blocked.
@@ -90,8 +128,11 @@ BLOCK_COUNT=0
 FIRST_BLOCK_TS="$NOW"
 
 if [ -f "$STATE_FILE" ]; then
-    BLOCK_COUNT=$(python3 -c "import json; d=json.load(open('$STATE_FILE')); print(d.get('count',0))" 2>/dev/null || echo 0)
-    FIRST_BLOCK_TS=$(python3 -c "import json; d=json.load(open('$STATE_FILE')); print(d.get('first_block_ts',$NOW))" 2>/dev/null || echo "$NOW")
+    # Use jq (not python3): the hook may run with an asdf-shimmed PATH where
+    # python3 is unconfigured; jq is a hard dependency of devbench and the
+    # rest of the hook chain so its presence is invariant.
+    BLOCK_COUNT=$(jq -r '.count // 0' "$STATE_FILE" 2>/dev/null || echo 0)
+    FIRST_BLOCK_TS=$(jq -r --argjson fallback "$NOW" '.first_block_ts // $fallback' "$STATE_FILE" 2>/dev/null || echo "$NOW")
 fi
 
 ELAPSED=$((NOW - FIRST_BLOCK_TS))
@@ -170,18 +211,26 @@ echo "{\"count\": ${NEW_COUNT}, \"first_block_ts\": ${FIRST_BLOCK_TS}}" > "$STAT
 
 # --- Log block to orchestrator log ---
 
+EXTRA_IDS_SUFFIX=""
+if [ -n "$OTHER_IN_PROGRESS" ]; then
+    EXTRA_IDS_SUFFIX=" (also in-progress: ${OTHER_IN_PROGRESS})"
+fi
 if command -v uv >/dev/null 2>&1; then
-    uv run devbench log "Stop hook blocked (${NEW_COUNT}/${MAX_BLOCKS}): ${TASK_ID} in-progress, last action: ${LAST_ACTION}" 2>/dev/null || true
+    uv run devbench log "Stop hook blocked (${NEW_COUNT}/${MAX_BLOCKS}): ${TASK_ID} in-progress, last action: ${LAST_ACTION}${EXTRA_IDS_SUFFIX}" 2>/dev/null || true
 fi
 
 # --- Build block response JSON ---
 
-REASON_TEXT="Orchestration loop active. Task ${TASK_ID} is in-progress (file: ${FILE_PATH}). Last action: ${LAST_ACTION}. ${NEXT_STEP} Circuit breaker: ${NEW_COUNT}/${MAX_BLOCKS} blocks in ${ELAPSED}s window.${STALE_WARNING} Never stop between tasks."
+REASON_TEXT="Orchestration loop active. Task ${TASK_ID} is in-progress (file: ${FILE_PATH}). Last action: ${LAST_ACTION}.${EXTRA_IDS_SUFFIX} ${NEXT_STEP} Circuit breaker: ${NEW_COUNT}/${MAX_BLOCKS} blocks in ${ELAPSED}s window.${STALE_WARNING} Never stop between tasks."
 
-BLOCK_JSON=$(python3 -c '
-import json, sys
-print(json.dumps({"decision": "block", "reason": sys.argv[1]}))
-' "$REASON_TEXT" 2>/dev/null || printf '{"decision":"block","reason":%s}' "\"(reason serialisation failed)\"")
+BLOCK_JSON=$(jq -nc --arg reason "$REASON_TEXT" '{
+    decision: "block",
+    reason: $reason,
+    hookSpecificOutput: {
+        hookEventName: "Stop",
+        additionalContext: $reason
+    }
+}')
 
 # --- Diagnostic capture ---
 # Records exactly what the hook emitted plus surrounding context, so a future
@@ -191,26 +240,24 @@ print(json.dumps({"decision": "block", "reason": sys.argv[1]}))
 DIAG_DIR="${WORKSPACE_ROOT}/.devbench/stop-hook-diag"
 DIAG_FILE="${DIAG_DIR}/$(date -u +%Y%m%dT%H%M%SZ)-${TASK_ID:-no-task}.json"
 mkdir -p "$DIAG_DIR" 2>/dev/null || true
-python3 -c '
-import json, os, sys
-payload = {
-    "ts": sys.argv[1],
-    "task_id": sys.argv[2],
-    "file_path": sys.argv[3],
-    "last_action": sys.argv[4],
-    "block_count": int(sys.argv[5]),
-    "max_blocks": int(sys.argv[6]),
-    "window_seconds": int(sys.argv[7]),
-    "elapsed_seconds": int(sys.argv[8]),
-    "stale_warning": sys.argv[9],
-    "next_step": sys.argv[10],
-    "emitted_stdout": json.loads(sys.argv[11]),
-}
-with open(sys.argv[12], "w") as f:
-    json.dump(payload, f, indent=2)
-' "$(date -u +%FT%TZ)" "${TASK_ID}" "${FILE_PATH}" "${LAST_ACTION}" \
-   "${NEW_COUNT}" "${MAX_BLOCKS}" "${WINDOW_SECONDS}" "${ELAPSED}" \
-   "${STALE_WARNING}" "${NEXT_STEP}" "${BLOCK_JSON}" "${DIAG_FILE}" 2>/dev/null || true
+# jq instead of python3: the hook may run with an asdf-shimmed PATH where
+# python3 is unconfigured. Falling back silently to no-diag-file (as the
+# previous python3 block did) hid the very root cause this hook is meant
+# to surface.
+jq -n \
+    --arg ts "$(date -u +%FT%TZ)" \
+    --arg task_id "${TASK_ID:-}" \
+    --arg file_path "${FILE_PATH:-}" \
+    --arg last_action "${LAST_ACTION:-}" \
+    --argjson block_count "${NEW_COUNT}" \
+    --argjson max_blocks "${MAX_BLOCKS}" \
+    --argjson window_seconds "${WINDOW_SECONDS}" \
+    --argjson elapsed_seconds "${ELAPSED}" \
+    --arg stale_warning "${STALE_WARNING}" \
+    --arg next_step "${NEXT_STEP}" \
+    --argjson emitted_stdout "${BLOCK_JSON}" \
+    '{ts:$ts, task_id:$task_id, file_path:$file_path, last_action:$last_action, block_count:$block_count, max_blocks:$max_blocks, window_seconds:$window_seconds, elapsed_seconds:$elapsed_seconds, stale_warning:$stale_warning, next_step:$next_step, emitted_stdout:$emitted_stdout}' \
+    > "$DIAG_FILE" 2>/dev/null || true
 
 # --- Emit block response to stdout ---
 

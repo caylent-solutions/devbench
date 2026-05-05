@@ -356,6 +356,106 @@ class TestEnsureBranch:
                 judge.ensure_branch("caylent-solutions/git-repo", tmp_path, "feature/x")
 
 
+class TestLocalOnlyMode:
+    """Tests for git_ops.local_only=true behavior."""
+
+    def test_ensure_branch_skips_fetch_and_uses_local_default_when_local_only(self, tmp_path: Path) -> None:
+        """
+        Given: git_ops.local_only=true, branch absent, clean tree
+        When: ensure_branch is called
+        Then: NO 'fetch origin' is run, and 'checkout -b <branch> refs/heads/<default>' is used
+              (the local default ref, not origin/<default>).
+        """
+        judge = GitOpsService()
+        git_calls: list[list[str]] = []
+
+        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
+            git_calls.append(args)
+            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, "main", "")
+            return (0, "", "")
+
+        run_command_responses = iter([(0, "", ""), (1, "", "")])
+
+        with (
+            patch.object(judge, "_git", side_effect=stub),
+            patch.object(judge, "_get_default_branch", return_value="main"),
+            patch("devbench.github.git_ops.run_command", side_effect=run_command_responses),
+            patch("devbench.github.git_ops.RUNTIME_CONFIG") as mock_cfg,
+        ):
+            mock_cfg.git_ops.local_only = True
+            judge.ensure_branch("caylent-solutions/git-repo", tmp_path, "new-branch")
+
+        assert ["fetch", "origin"] not in git_calls, (
+            "ensure_branch must NOT call 'git fetch origin' under local_only=true"
+        )
+        assert ["checkout", "-b", "new-branch", "refs/heads/main"] in git_calls
+        # Sanity: the origin-based form must NOT be used.
+        assert ["checkout", "-b", "new-branch", "origin/main"] not in git_calls
+
+    def test_ensure_branch_noop_when_already_on_branch_local_only(self, tmp_path: Path) -> None:
+        """ensure_branch is still a no-op when HEAD is already on the target branch under local_only."""
+        judge = GitOpsService()
+        git_calls: list[list[str]] = []
+
+        def stub(args: list[str], _path: Path) -> tuple[int, str, str]:
+            git_calls.append(args)
+            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return (0, "feature/x", "")
+            return (0, "", "")
+
+        with (
+            patch.object(judge, "_git", side_effect=stub),
+            patch("devbench.github.git_ops.RUNTIME_CONFIG") as mock_cfg,
+        ):
+            mock_cfg.git_ops.local_only = True
+            judge.ensure_branch("caylent-solutions/git-repo", tmp_path, "feature/x")
+
+        # Only the rev-parse call; no fetch, no checkout.
+        assert git_calls == [["rev-parse", "--abbrev-ref", "HEAD"]]
+
+    def test_commit_and_push_raises_when_local_only(self, tmp_path: Path) -> None:
+        """commit_and_push must refuse to run under local_only=true (operators should use commit_local)."""
+        judge = GitOpsService()
+        with patch("devbench.github.git_ops.RUNTIME_CONFIG") as mock_cfg:
+            mock_cfg.git_ops.local_only = True
+            with pytest.raises(RuntimeError, match=r"commit_and_push is not available .*local_only"):
+                judge.commit_and_push("caylent-solutions/git-repo", tmp_path, "feature/x", "msg")
+
+    def test_create_tag_raises_when_local_only(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        with patch("devbench.github.git_ops.RUNTIME_CONFIG") as mock_cfg:
+            mock_cfg.git_ops.local_only = True
+            with pytest.raises(RuntimeError, match=r"create_tag is not available .*local_only"):
+                judge.create_tag("caylent-solutions/git-repo", tmp_path, "v1.0", "msg")
+
+    def test_checkout_default_branch_raises_when_local_only(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        with patch("devbench.github.git_ops.RUNTIME_CONFIG") as mock_cfg:
+            mock_cfg.git_ops.local_only = True
+            with pytest.raises(RuntimeError, match=r"checkout_default_branch is not available .*local_only"):
+                judge.checkout_default_branch("caylent-solutions/git-repo", tmp_path)
+
+    def test_rebase_and_force_push_raises_when_local_only(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        with patch("devbench.github.git_ops.RUNTIME_CONFIG") as mock_cfg:
+            mock_cfg.git_ops.local_only = True
+            with pytest.raises(RuntimeError, match=r"rebase_and_force_push is not available .*local_only"):
+                judge.rebase_and_force_push("caylent-solutions/git-repo", tmp_path, "feature/x")
+
+    def test_get_default_branch_refuses_origin_head_fallback_when_local_only(self, tmp_path: Path) -> None:
+        """When local_only is true and no YAML default_branch is configured, fail fast
+        instead of falling back to 'git rev-parse origin/HEAD'."""
+        judge = GitOpsService()
+        with (
+            patch("devbench.github.git_ops.RUNTIME_CONFIG") as mock_cfg,
+            patch("devbench.github.git_ops.get_configured_default_branch", return_value=""),
+        ):
+            mock_cfg.git_ops.local_only = True
+            with pytest.raises(RuntimeError, match=r"local_only is true but repo .* has no default_branch"):
+                judge._get_default_branch(tmp_path, repo="caylent-solutions/git-repo")
+
+
 class TestCreatePr:
     """Test create_pr method."""
 
@@ -364,30 +464,43 @@ class TestCreatePr:
         with pytest.raises(ValueError, match="not allowed"):
             judge.create_pr("evil/repo", "branch", "title", "body")
 
+    # _gh is invoked twice now: once for `pr list --head` (find_open_pr) and
+    # once for `pr create`. The list-call returns "[]" (no existing PR) so the
+    # create path runs.
+    _LIST_NO_EXISTING = (0, "[]", "")
+
     def test_returns_pr_url(self, tmp_path: Path) -> None:
         judge = GitOpsService()
         with patch.object(
             judge,
             "_gh",
-            return_value=(0, "https://github.com/org/repo/pull/42\n", ""),
+            side_effect=[
+                self._LIST_NO_EXISTING,
+                (0, "https://github.com/org/repo/pull/42\n", ""),
+            ],
         ):
             url = judge.create_pr("caylent-solutions/git-repo", "branch", "title", "body", repo_path=tmp_path)
         assert url == "https://github.com/org/repo/pull/42"
 
     def test_raises_on_failure(self, tmp_path: Path) -> None:
         judge = GitOpsService()
-        with patch.object(judge, "_gh", return_value=(1, "", "error msg")):
+        with patch.object(judge, "_gh", side_effect=[self._LIST_NO_EXISTING, (1, "", "error msg")]):
             with pytest.raises(RuntimeError, match="Failed to create PR"):
                 judge.create_pr("caylent-solutions/git-repo", "branch", "title", "body", repo_path=tmp_path)
 
     def test_gh_called_with_repo_flag(self, tmp_path: Path) -> None:
         judge = GitOpsService()
-        with patch.object(judge, "_gh", return_value=(0, "https://github.com/org/repo/pull/1\n", "")) as mock_gh:
+        with patch.object(
+            judge,
+            "_gh",
+            side_effect=[self._LIST_NO_EXISTING, (0, "https://github.com/org/repo/pull/1\n", "")],
+        ) as mock_gh:
             judge.create_pr("caylent-solutions/git-repo", "branch", "title", "body", repo_path=tmp_path)
 
-        _, kwargs = mock_gh.call_args
-        assert kwargs.get("cwd") == tmp_path
-        assert kwargs.get("repo") == "caylent-solutions/git-repo"
+        # Inspect the second call (the actual create); list-call kwargs already validated by find_open_pr coverage.
+        _, create_kwargs = mock_gh.call_args_list[1]
+        assert create_kwargs.get("cwd") == tmp_path
+        assert create_kwargs.get("repo") == "caylent-solutions/git-repo"
 
     def test_uses_base_branch_from_yaml_config(self, tmp_path: Path) -> None:
         """create_pr passes --base <branch> when YAML config has a default_branch."""
@@ -397,11 +510,15 @@ class TestCreatePr:
         runtime_config = RuntimeConfig(repos={"caylent-solutions/git-repo": RepoConfig(default_branch="main2")})
         with (
             patch("devbench.github.git_ops.RUNTIME_CONFIG", runtime_config),
-            patch.object(judge, "_gh", return_value=(0, "https://github.com/org/repo/pull/1\n", "")) as mock_gh,
+            patch.object(
+                judge,
+                "_gh",
+                side_effect=[self._LIST_NO_EXISTING, (0, "https://github.com/org/repo/pull/1\n", "")],
+            ) as mock_gh,
         ):
             judge.create_pr("caylent-solutions/git-repo", "feature-branch", "title", "body", repo_path=tmp_path)
 
-        cmd_args, _ = mock_gh.call_args
+        cmd_args, _ = mock_gh.call_args_list[1]
         cmd = cmd_args[0]
         base_idx = cmd.index("--base")
         assert cmd[base_idx + 1] == "main2"
@@ -414,13 +531,94 @@ class TestCreatePr:
         runtime_config = RuntimeConfig(repos={"caylent-solutions/git-repo": RepoConfig(default_branch=None)})
         with (
             patch("devbench.github.git_ops.RUNTIME_CONFIG", runtime_config),
-            patch.object(judge, "_gh", return_value=(0, "https://github.com/org/repo/pull/1\n", "")) as mock_gh,
+            patch.object(
+                judge,
+                "_gh",
+                side_effect=[self._LIST_NO_EXISTING, (0, "https://github.com/org/repo/pull/1\n", "")],
+            ) as mock_gh,
         ):
             judge.create_pr("caylent-solutions/git-repo", "feature-branch", "title", "body", repo_path=tmp_path)
 
-        cmd_args, _ = mock_gh.call_args
+        cmd_args, _ = mock_gh.call_args_list[1]
         cmd = cmd_args[0]
         assert "--base" not in cmd
+
+
+class TestCreatePrExistingPrReuse:
+    """Issue #129 regression: a second git-ops invocation on the same branch
+    must reuse a pre-existing open PR instead of treating the duplicate
+    ``gh pr create`` call as a fatal error.
+
+    Bug: cmd_git_ops calls ``gh pr create`` without first checking whether an
+    open PR already exists for the branch. When the executor pushed a fix
+    commit (REFACTOR after REVIEW_PASS, or a pr_review_resolution bot fix),
+    the second create attempt failed with "a pull request already exists for
+    this branch" and devbench transitioned the task to BLOCKED -- even though
+    the fix commit was already on the PR.
+    """
+
+    def test_find_open_pr_returns_url_when_open_pr_exists(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        with patch.object(
+            judge,
+            "_gh",
+            return_value=(0, '[{"url":"https://github.com/org/repo/pull/20"}]', ""),
+        ) as mock_gh:
+            url = judge.find_open_pr("caylent-solutions/git-repo", "branch", repo_path=tmp_path)
+        assert url == "https://github.com/org/repo/pull/20"
+        cmd_args, _ = mock_gh.call_args
+        assert "pr" in cmd_args[0]
+        assert "list" in cmd_args[0]
+        assert "--head" in cmd_args[0]
+        assert "branch" in cmd_args[0]
+        assert "--state" in cmd_args[0]
+        assert "open" in cmd_args[0]
+
+    def test_find_open_pr_returns_none_when_no_open_pr(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        with patch.object(judge, "_gh", return_value=(0, "[]", "")):
+            url = judge.find_open_pr("caylent-solutions/git-repo", "branch", repo_path=tmp_path)
+        assert url is None
+
+    def test_find_open_pr_returns_none_on_gh_failure(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        with patch.object(judge, "_gh", return_value=(1, "", "gh: not authenticated")):
+            url = judge.find_open_pr("caylent-solutions/git-repo", "branch", repo_path=tmp_path)
+        assert url is None
+
+    def test_find_open_pr_returns_none_on_malformed_json(self, tmp_path: Path) -> None:
+        """Defensive: future gh release that changes output format must not crash devbench."""
+        judge = GitOpsService()
+        with patch.object(judge, "_gh", return_value=(0, "<html>", "")):
+            url = judge.find_open_pr("caylent-solutions/git-repo", "branch", repo_path=tmp_path)
+        assert url is None
+
+    def test_create_pr_reuses_existing_open_pr_url(self, tmp_path: Path) -> None:
+        """Core regression: create_pr returns the existing URL and never invokes
+        ``gh pr create`` when an open PR is already on the branch."""
+        judge = GitOpsService()
+        list_response = (0, '[{"url":"https://github.com/org/repo/pull/20"}]', "")
+        with patch.object(judge, "_gh", side_effect=[list_response]) as mock_gh:
+            url = judge.create_pr("caylent-solutions/git-repo", "feature-branch", "title", "body", repo_path=tmp_path)
+        assert url == "https://github.com/org/repo/pull/20"
+        # Exactly one _gh call (the list call); the create call must not run.
+        assert mock_gh.call_count == 1
+        cmd_args, _ = mock_gh.call_args_list[0]
+        assert "create" not in cmd_args[0]
+
+    def test_create_pr_falls_through_to_create_when_no_existing(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        with patch.object(
+            judge,
+            "_gh",
+            side_effect=[(0, "[]", ""), (0, "https://github.com/org/repo/pull/99\n", "")],
+        ) as mock_gh:
+            url = judge.create_pr("caylent-solutions/git-repo", "feature-branch", "title", "body", repo_path=tmp_path)
+        assert url == "https://github.com/org/repo/pull/99"
+        assert mock_gh.call_count == 2
+        # Second call must be the actual create.
+        create_cmd_args, _ = mock_gh.call_args_list[1]
+        assert create_cmd_args[0][0:2] == ["pr", "create"]
 
 
 class TestMergePr:
@@ -510,6 +708,71 @@ class TestWaitForChecks:
 
         _, kwargs = mock_gh.call_args
         assert kwargs.get("repo") == "caylent-solutions/git-repo"
+
+    def test_no_checks_with_workflow_files_retries_then_succeeds(self, tmp_path: Path) -> None:
+        """Issue #114: workflow exists but Actions has not enqueued yet.
+
+        Mock `gh pr checks` to return "no checks reported" the first call,
+        then a clean exit on the second. The retry loop should bridge the
+        gap and return True without merging blind.
+        """
+        from devbench.github import git_ops as git_ops_mod
+
+        judge = GitOpsService()
+        workflows_dir = tmp_path / ".github" / "workflows"
+        workflows_dir.mkdir(parents=True)
+        (workflows_dir / "ci.yml").write_text("on: push\n")
+        responses = [(1, "", "no checks reported"), (0, "All checks passed", "")]
+        with (
+            patch.object(judge, "_gh", side_effect=responses),
+            patch.object(git_ops_mod, "CHECK_REGISTRATION_DELAY_SECONDS", 0),
+        ):
+            assert judge.wait_for_checks("caylent-solutions/git-repo", 42, repo_path=tmp_path) is True
+
+    def test_no_checks_with_workflow_files_retry_exhausted_returns_false(self, tmp_path: Path) -> None:
+        """Issue #114: workflow files exist but every retry returns 'no checks reported'.
+
+        After CHECK_REGISTRATION_RETRIES attempts, refuse the merge --
+        no warn-and-pass fallback (CLAUDE.md no-fallback rule).
+        """
+        from devbench.github import git_ops as git_ops_mod
+
+        judge = GitOpsService()
+        workflows_dir = tmp_path / ".github" / "workflows"
+        workflows_dir.mkdir(parents=True)
+        (workflows_dir / "ci.yml").write_text("on: push\n")
+        with (
+            patch.object(judge, "_gh", return_value=(1, "", "no checks reported")),
+            patch.object(git_ops_mod, "CHECK_REGISTRATION_DELAY_SECONDS", 0),
+            patch.object(git_ops_mod, "CHECK_REGISTRATION_RETRIES", 2),
+        ):
+            assert judge.wait_for_checks("caylent-solutions/git-repo", 42, repo_path=tmp_path) is False
+
+
+class TestListWorkflowFiles:
+    """Phase B3 helper: glob `.github/workflows/*.y[a]ml` under repo_path."""
+
+    def test_returns_empty_when_repo_path_is_none(self) -> None:
+        from devbench.github.git_ops import _list_workflow_files
+
+        assert _list_workflow_files(None) == []
+
+    def test_returns_empty_when_workflows_dir_absent(self, tmp_path: Path) -> None:
+        from devbench.github.git_ops import _list_workflow_files
+
+        assert _list_workflow_files(tmp_path) == []
+
+    def test_returns_yml_and_yaml_files_sorted(self, tmp_path: Path) -> None:
+        from devbench.github.git_ops import _list_workflow_files
+
+        wd = tmp_path / ".github" / "workflows"
+        wd.mkdir(parents=True)
+        (wd / "release.yaml").write_text("")
+        (wd / "ci.yml").write_text("")
+        (wd / "README.md").write_text("not a workflow")
+        result = _list_workflow_files(tmp_path)
+        names = [p.name for p in result]
+        assert names == ["ci.yml", "release.yaml"]
 
 
 class TestUpdateParentSubmoduleRef:
@@ -983,3 +1246,245 @@ class TestGetDefaultBranch:
         with patch("devbench.github.git_ops.run_command", return_value=(0, "", "")):
             with pytest.raises(RuntimeError, match="Cannot determine default branch"):
                 judge._get_default_branch(tmp_path)
+
+
+class TestGetLatestFailingRunId:
+    """Issue #115: extract failing-run ID from gh pr checks JSON."""
+
+    def test_returns_run_id_when_failure_present(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        gh_json = (
+            '[{"name":"build","state":"SUCCESS","link":""},'
+            '{"name":"lint","state":"FAILURE","link":"https://github.com/caylent-solutions/git-repo/actions/runs/12345/job/9"}]'
+        )
+        with patch.object(judge, "_gh", return_value=(0, gh_json, "")):
+            assert judge.get_latest_failing_run_id("caylent-solutions/git-repo", 7, repo_path=tmp_path) == "12345"
+
+    def test_returns_none_when_all_passing(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        with patch.object(judge, "_gh", return_value=(0, '[{"name":"x","state":"SUCCESS","link":""}]', "")):
+            assert judge.get_latest_failing_run_id("caylent-solutions/git-repo", 7, repo_path=tmp_path) is None
+
+    def test_returns_none_on_subprocess_failure(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        with patch.object(judge, "_gh", return_value=(1, "", "boom")):
+            assert judge.get_latest_failing_run_id("caylent-solutions/git-repo", 7, repo_path=tmp_path) is None
+
+    def test_returns_none_on_invalid_json(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        with patch.object(judge, "_gh", return_value=(0, "{not json", "")):
+            assert judge.get_latest_failing_run_id("caylent-solutions/git-repo", 7, repo_path=tmp_path) is None
+
+    def test_returns_none_when_failure_has_no_run_id(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        gh_json = '[{"name":"x","state":"FAILURE","link":""}]'
+        with patch.object(judge, "_gh", return_value=(0, gh_json, "")):
+            assert judge.get_latest_failing_run_id("caylent-solutions/git-repo", 7, repo_path=tmp_path) is None
+
+    def test_skips_non_dict_entries_in_array(self, tmp_path: Path) -> None:
+        # Defensive: gh API response may include non-dict entries (e.g. nulls).
+        judge = GitOpsService()
+        gh_json = (
+            '[null, "string", {"name":"lint","state":"FAILURE","link":"https://github.com/x/y/actions/runs/77/job/9"}]'
+        )
+        with patch.object(judge, "_gh", return_value=(0, gh_json, "")):
+            assert judge.get_latest_failing_run_id("caylent-solutions/git-repo", 7, repo_path=tmp_path) == "77"
+
+
+class TestFetchRunLog:
+    """Issue #115: fetch and trim a failing run's log."""
+
+    def test_returns_full_log_when_under_cap(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        with patch.object(judge, "_gh", return_value=(0, "short log\n", "")):
+            assert judge.fetch_run_log("caylent-solutions/git-repo", "1", 1024, repo_path=tmp_path) == "short log\n"
+
+    def test_trims_to_tail_when_over_cap(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        body = "head" + ("X" * 200) + "tailtail"
+        with patch.object(judge, "_gh", return_value=(0, body, "")):
+            trimmed = judge.fetch_run_log("caylent-solutions/git-repo", "1", 8, repo_path=tmp_path)
+        assert trimmed == "tailtail"
+
+    def test_returns_empty_on_subprocess_failure(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        with patch.object(judge, "_gh", return_value=(2, "", "boom")):
+            assert judge.fetch_run_log("caylent-solutions/git-repo", "1", 1024, repo_path=tmp_path) == ""
+
+    def test_max_bytes_zero_returns_full(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        with patch.object(judge, "_gh", return_value=(0, "abc", "")):
+            assert judge.fetch_run_log("caylent-solutions/git-repo", "1", 0, repo_path=tmp_path) == "abc"
+
+
+class TestPollPrReviewResolution:
+    """Issue #116: poll PR review state for asynchronous bot feedback."""
+
+    @staticmethod
+    def _gh_view_pr(decision: str = "", reviews: list | None = None) -> str:
+        import json as _json
+
+        return _json.dumps({"reviewDecision": decision, "reviews": reviews or []})
+
+    @staticmethod
+    def _gh_comments(comments: list | None = None) -> str:
+        import json as _json
+
+        return _json.dumps(comments or [])
+
+    @staticmethod
+    def _patch_gh(judge: GitOpsService, view_payload: str, comments_payload: str):
+        def fake_gh(args, *_a, **_kw):
+            if args and args[0] == "pr":
+                return (0, view_payload, "")
+            if args and args[0] == "api":
+                return (0, comments_payload, "")
+            return (1, "", "unexpected")
+
+        return patch.object(judge, "_gh", side_effect=fake_gh)
+
+    def test_resolves_when_no_signals(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        with self._patch_gh(judge, self._gh_view_pr(decision="APPROVED"), self._gh_comments()):
+            with patch("devbench.github.git_ops.time.sleep"):
+                resolution = judge.poll_pr_review_resolution(
+                    "caylent-solutions/git-repo",
+                    7,
+                    repo_path=tmp_path,
+                    agents=("bot",),
+                    decision_blocks=True,
+                    settle_seconds=0,
+                    poll_interval=0,
+                )
+        assert resolution.resolved is True
+        assert resolution.review_decision == "APPROVED"
+
+    def test_blocks_on_changes_requested_review_decision(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        view = self._gh_view_pr(
+            decision="CHANGES_REQUESTED",
+            reviews=[{"state": "CHANGES_REQUESTED", "author": {"login": "human"}, "body": "fix x"}],
+        )
+        with self._patch_gh(judge, view, self._gh_comments()):
+            with patch("devbench.github.git_ops.time.sleep"):
+                resolution = judge.poll_pr_review_resolution(
+                    "caylent-solutions/git-repo",
+                    7,
+                    repo_path=tmp_path,
+                    agents=(),
+                    decision_blocks=True,
+                    settle_seconds=0,
+                    poll_interval=0,
+                )
+        assert resolution.resolved is False
+        assert resolution.review_decision == "CHANGES_REQUESTED"
+        assert len(resolution.unresolved_reviews) == 1
+
+    def test_blocks_on_bot_comment_in_allowlist(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        comments = [
+            {"user": {"login": "github-copilot[bot]"}, "path": "src/x.py", "line": 12, "body": "use snake_case"},
+            {"user": {"login": "human-bystander"}, "path": "src/x.py", "line": 13, "body": "nit"},
+        ]
+        with self._patch_gh(judge, self._gh_view_pr(decision="REVIEW_REQUIRED"), self._gh_comments(comments)):
+            with patch("devbench.github.git_ops.time.sleep"):
+                resolution = judge.poll_pr_review_resolution(
+                    "caylent-solutions/git-repo",
+                    7,
+                    repo_path=tmp_path,
+                    agents=("github-copilot[bot]",),
+                    decision_blocks=False,
+                    settle_seconds=0,
+                    poll_interval=0,
+                )
+        assert resolution.resolved is False
+        assert len(resolution.unresolved_comments) == 1
+        assert resolution.unresolved_comments[0]["author"] == "github-copilot[bot]"
+
+    def test_ignores_non_changes_requested_reviews(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        view = self._gh_view_pr(
+            decision="REVIEW_REQUIRED",
+            reviews=[{"state": "COMMENTED", "author": {"login": "h"}, "body": "lgtm-ish"}],
+        )
+        with self._patch_gh(judge, view, self._gh_comments()):
+            with patch("devbench.github.git_ops.time.sleep"):
+                resolution = judge.poll_pr_review_resolution(
+                    "caylent-solutions/git-repo",
+                    7,
+                    repo_path=tmp_path,
+                    agents=(),
+                    decision_blocks=True,
+                    settle_seconds=0,
+                    poll_interval=0,
+                )
+        assert resolution.resolved is True
+
+    def test_handles_invalid_json_as_empty(self, tmp_path: Path) -> None:
+        judge = GitOpsService()
+        with self._patch_gh(judge, "{not json", "{not json"):
+            with patch("devbench.github.git_ops.time.sleep"):
+                resolution = judge.poll_pr_review_resolution(
+                    "caylent-solutions/git-repo",
+                    7,
+                    repo_path=tmp_path,
+                    agents=("bot",),
+                    decision_blocks=True,
+                    settle_seconds=0,
+                    poll_interval=0,
+                )
+        assert resolution.resolved is True
+
+    def test_polls_multiple_times_within_settle_window(self, tmp_path: Path) -> None:
+        """The settle loop sleeps + retries when no signal appears; poll runs at
+        least twice when settle_seconds > 0."""
+        judge = GitOpsService()
+        with self._patch_gh(judge, self._gh_view_pr(decision="REVIEW_REQUIRED"), self._gh_comments()):
+            sleep_calls: list[int] = []
+
+            def fake_sleep(secs: int) -> None:
+                # Append once, then bump time forward by raising a sentinel
+                # via monotonic-shift is awkward; instead patch monotonic to
+                # advance past the deadline after the first sleep.
+                sleep_calls.append(secs)
+
+            monotonic_calls = iter([0.0, 0.0, 100.0, 100.0, 100.0])
+            with (
+                patch("devbench.github.git_ops.time.sleep", side_effect=fake_sleep),
+                patch("devbench.github.git_ops.time.monotonic", side_effect=lambda: next(monotonic_calls)),
+            ):
+                resolution = judge.poll_pr_review_resolution(
+                    "caylent-solutions/git-repo",
+                    7,
+                    repo_path=tmp_path,
+                    agents=(),
+                    decision_blocks=True,
+                    settle_seconds=10,
+                    poll_interval=2,
+                )
+        # The loop slept at least once before the deadline elapsed.
+        assert sleep_calls
+        assert resolution.resolved is True
+
+    def test_skips_review_whose_author_not_in_allowlist(self, tmp_path: Path) -> None:
+        """When decision_blocks=False and the PR's reviewDecision is not
+        CHANGES_REQUESTED, a CHANGES_REQUESTED review by a non-allowlisted
+        author is skipped so the merge is not blocked."""
+        judge = GitOpsService()
+        view = self._gh_view_pr(
+            decision="REVIEW_REQUIRED",
+            reviews=[{"state": "CHANGES_REQUESTED", "author": {"login": "random-human"}, "body": "drive-by"}],
+        )
+        with self._patch_gh(judge, view, self._gh_comments()):
+            with patch("devbench.github.git_ops.time.sleep"):
+                resolution = judge.poll_pr_review_resolution(
+                    "caylent-solutions/git-repo",
+                    7,
+                    repo_path=tmp_path,
+                    agents=("github-copilot[bot]",),
+                    decision_blocks=False,
+                    settle_seconds=0,
+                    poll_interval=0,
+                )
+        assert resolution.resolved is True
+        assert resolution.unresolved_reviews == []

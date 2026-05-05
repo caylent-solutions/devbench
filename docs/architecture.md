@@ -54,7 +54,7 @@ What devbench does today, grouped by theme:
 - Recursive work-unit hierarchy (Epic → Feature → Story → Task) with automatic status rollup of parents when children complete.
 
 ### Multi-judge review
-- Four review judges (code, test, doc, changes-manifest) run in parallel via `review-supervisor`.
+- Four review judges (code, test, doc, changes-manifest) run in parallel via `review-supervisor`. The supervisor is **read-only**: a PreToolUse hook (`plugin/devbench/scripts/guard-review-supervisor-scope.sh`) blocks any Bash mutation (git commit/push, rm, sed -i, etc.) AND any Agent-tool invocation whose `subagent_type` is outside the canonical review_team allowlist (`devbench:code_review`, `devbench:test_review`, `devbench:doc_review`, `devbench:changes_manifest`). This closes the loophole where the supervisor previously escalated to commit / push / PR-create rights by spawning an executor subagent (issue #118).
 - A separate security judge runs sequentially after the review tier passes.
 - Done-gate enforces all four review judges must REVIEW_PASS before a unit can be marked done.
 - Review failures inject prior feedback into the next executor attempt to prevent loops.
@@ -72,6 +72,10 @@ What devbench does today, grouped by theme:
 - **Single-PR mode**: all work units commit to one shared branch; one PR for the whole batch via `git-ops-finalize`.
 - Per-repo merge strategy override (merge / squash / rebase).
 - Optional submodule pointer updates after PR merges.
+- **Workflow-registration race defence** (issue #114): `wait_for_checks` disambiguates `gh pr checks` returning "no checks reported" by globbing `<repo>/.github/workflows/*.y[a]ml`. Repos with workflow files retry up to `JUDGE_CHECK_REGISTRATION_RETRIES` (default 12) attempts spaced by `JUDGE_CHECK_REGISTRATION_DELAY_SECONDS` (default 5) -- 60s default coverage for the GitHub Actions queue. Repos without workflow files fast-path-pass. On retry exhaustion, devbench refuses the merge (CLAUDE.md no-fallback rule).
+- **Inline orphan-cleanup commit** (Phase 1 of the orphan-cascade fix): when `git-ops` detects build / state artefact paths that would otherwise pollute the task's commit, it runs the cleanup as a devbench-authored chore commit on the same branch BEFORE the task's own commit. Two commits land per `git-ops` invocation: `chore(cleanup): untrack devbench-managed orphan paths and update .gitignore` (canonical message) followed by the task commit. The cleanup is no longer a backlog work unit; it is a maintenance commit the engine makes on its own. Eliminates the pathological cascade where multiple parents emitted duplicate cleanup proposals and those proposals themselves got blocked by the manifest amender on predecessor staging. Operators set `DEVBENCH_DISABLE_INLINE_ORPHAN_CLEANUP=1` to fall back to the legacy proposal flow with cross-task de-duplication. See [`backlog-contract.md` Orphan-Pattern Rule](backlog-contract.md#orphan-pattern-rule-git-ops-self-defense) for the full contract.
+- **CI-failure executor retry** (issue #115, **default on** as of v-next; opt out via `git_ops.ci_failure_retry: false` in `devbench.yaml` or env `JUDGE_CI_FAILURE_RETRY_ENABLED=0`): when `wait_for_checks` returns False, `cmd_git_ops` writes the trimmed failing-job log to `.devbench/ci-failures/<task-id>-<attempt>.log`, appends a `[CI_FAIL]` audit comment, and returns rc=2 to signal the orchestrator to re-invoke the executor with a `ci-fail` feedback payload. After `MAX_RETRY_ATTEMPTS` retries the path transitions to rc=1 + `[CI_FAIL_BLOCKED]`. The retry budget is shared with the existing review-judge retry budget so total per-task work is bounded.
+- **PR review-comment polling** (issue #116, opt-in via `git_ops.pr_review_resolution.enabled: true` in `devbench.yaml` or env `JUDGE_PR_REVIEW_RESOLUTION_ENABLED=1`): between `wait_for_checks` returning True and `merge_pr`, `cmd_git_ops` polls `gh pr view --json reviewDecision,reviews` and `gh api repos/<repo>/pulls/<n>/comments` for up to `JUDGE_PR_REVIEW_SETTLE_SECONDS` (default 60) seconds, exiting early on the first signal. A blocking signal is `reviewDecision == CHANGES_REQUESTED` (when `decision_blocks: true`, the default once the phase is enabled) or any unresolved comment authored by a login in the configured `agents:` allowlist. On signal, returns rc=3 + writes a `pr-bot` JSON feedback payload under `.devbench/pr-bot-feedback/<task-id>-<attempt>.json` so the executor can address each thread; same shared retry budget as #115.
 
 ### Multi-repo support
 - One workspace can drive work across multiple target repos.
@@ -79,7 +83,7 @@ What devbench does today, grouped by theme:
 - Symlink pattern lets the backlog repo and target repos live independently on disk.
 
 ### Reporting & observability
-- `devbench report` shows tasks completed, velocity, tokens consumed, estimated cost, and projection to completion.
+- `devbench report` shows tasks completed, velocity, tokens consumed, estimated cost, and projection to completion. Reader and writer (`setup_logging`) share a single fail-fast resolver chain (`JUDGE_LOG_FILE` env > `log_file:` in `backlog/config/devbench.yaml` > `<JUDGE_WORKSPACE_ROOT>/logs/orchestrator.log`); when none yields a path, `cmd_report` exits 1 with an actionable error rather than reading a stale source-tree log. A divergence WARNING fires when `BACKLOG.md` reports completed tasks but the resolved log file's all-time window contains zero `Set <id> to 'done'` events -- a deterministic signal that reader and writer are pointed at different files.
 - Renders **two windows by default**: an **All-time** table (full orchestrator log) and a **Current run** table (most recent contiguous block of orchestration events; boundary detected as a >10-minute gap between consecutive `Set X to ...` log lines, configurable via `DEFAULT_CURRENT_RUN_GAP_MINUTES`). Pass `--since <ISO-8601>` for a single custom-window view. Display timestamps render in the resolved timezone: top-level `display_timezone:` yaml or `JUDGE_DISPLAY_TIMEZONE` env applies to every timestamp-rendering command (report, hook-tail, watch); `report.display_timezone` / `JUDGE_REPORT_TIMEZONE` still takes higher precedence for the report command specifically. When no config is set, the host's system local timezone is used. Internal computation stays in UTC.
 - `--watch N` flag refreshes the report every N seconds (replaces the external `watch` command pattern).
 - `devbench watch` prints a one-screen live dashboard of the currently-active orchestration (mode, active task, phase, latest agent thinking, recent tool calls, repo state, pending amendment). Read-only. Also supports `--watch N` for live refresh. See [watch-activity.md](watch-activity.md) and [ADR-04](adr/04-watch-dashboard.md).
@@ -88,7 +92,25 @@ What devbench does today, grouped by theme:
 - **Multi-target proposal wiring (ADR-10)**: the proposal JSON carries an optional `affected_task_ids: list[str]` field. When an operator runs `promote-proposal`, the `[BLOCKED_PENDING_PROPOSAL]` marker + Dependencies row is written on `[source_task_id] + affected_task_ids`, so a single fix can unblock multiple sibling tasks via the ADR-07 cascade. The `devbench add-dep <blocked-id> <blocker-id>` CLI covers post-promote corrections + hand-authored cross-task dep wiring. See [ADR-10: Multi-target proposal wiring](adr/10-multi-target-proposal-wiring.md).
 - **Declined status**: `devbench decline <id> --reason "<msg>"` marks a work unit terminal-closed when the operator decides it will never be done (spec rewritten, scope removed, etc.). Declined children roll up as terminal-complete. Declined tasks are excluded from `tasks_remaining` and projection ETAs but are visible in a `Declined (N):` panel in `devbench report`. See [ADR-05](adr/05-declined-status.md).
 - **Git-ops safety rails (universal)**: every commit path asserts HEAD is on the expected branch before committing (rejects orphan-branch commits) and every staged file is in the work unit's Changes Manifest (rejects scope-violation pollution). Both are deterministic fail-fast checks, no LLM involved. See `GitOpsService.assert_on_branch` and `devbench.backlog.manifest.assert_staged_matches_manifest`.
-- **Auto-requeue cascade (universal)**: when a task transitions to `done`, `BacklogManager._auto_requeue_marker_dependents` scans for `blocked` tasks carrying `[BLOCKED_PENDING_PROPOSAL]` markers (written by `promote-proposal` at wiring time) and auto-flips them to `in-queue` once every marker ID is terminal. Symmetric sideways complement to the upward parent-rollup cascade. See [ADR-07](adr/07-auto-requeue-on-proposal-completion.md). Per-draft `reject-proposal` strips the rejected draft's marker from the source before re-invoking the cascade, so a reject-then-unblock chain is automatic. See [ADR-08](adr/08-proposal-lifecycle-observability.md).
+- **Auto-requeue cascade (universal)**: when a task transitions to a terminal status (`done` OR `declined` -- broadened in issue #147), `BacklogManager._set_status` invokes `_auto_requeue_marker_dependents` which scans for `blocked` tasks carrying `[BLOCKED_PENDING_PROPOSAL]` markers (written by `promote-proposal` at wiring time) and auto-flips them to `in-queue` once every marker ID is terminal. Symmetric sideways complement to the upward parent-rollup cascade. The transition trigger is centralised in `_set_status` so every public API (`mark_done`, `mark_declined`, `force_status`, `set-status`) fires the cascade, not just `mark_done`. Idempotent: a per-instance `(backlog_index, unit_id)` guard prevents redundant re-scans. The cascade audit comment reads `[AUTO_UNBLOCKED] [CASCADE_RESOLVED] ...` so the status-detail panel filter (issue #153) can supersede the earlier `[BLOCKED]` row. See [ADR-07](adr/07-auto-requeue-on-proposal-completion.md). Per-draft `reject-proposal` strips the rejected draft's marker from the source before re-invoking the cascade, so a reject-then-unblock chain is automatic. See [ADR-08](adr/08-proposal-lifecycle-observability.md). Operator-driven recovery for cascade-missed cases (process crash mid-write, missing declared dep) lives in `devbench reconcile-cascade` (issue #150) -- it walks every blocked task, evaluates marker target + regular dep state, flips eligible ones to `in-queue` with a `[CASCADE_RECONCILED]` audit, and emits a JSON envelope of flips + skips.
+- **Recovery-cascade hardening (universal)**: four lifecycle gates make the recovery cascade idempotent and bounded.
+  (1) `cmd_write_proposal` computes a stable `fix_signature` (SHA-256 over `(target_repo, sorted(files_to_own), normalised intent_phrase)`) and reuses any non-terminal pending proposal carrying the same signature -- the new source task is auto-wired via `add-dep` and a `[RECOVERY_REUSED]` audit comment is logged instead of writing a duplicate JSON (issue #141).
+  (2) `manifest-amender` auto-invokes `add-dep` on terminal-state Manifest conflicts and emits `[CONFLICT_AUTODEP]` rather than recommending the operator wire it (issue #142).
+  (3) `cmd_materialise_proposal` rejects proposals whose `proposed_tasks[*].suggested_approach` is empty / TODO / TBD before any draft reaches the operator (issue #143).
+  (4) Proposals carry a `cascade_depth` field; the new `orchestrate.max_cascade_depth` knob (default `3`, env override `JUDGE_ORCHESTRATE_MAX_CASCADE_DEPTH`) caps recursion, and at the cap the source task escalates to `NEEDS_OPERATOR_ATTENTION` (issue #144).
+  See [task-factory.md](task-factory.md) and [manifest-amendments.md](manifest-amendments.md).
+- **Manifest-amender feedback-injection protocol (universal, issue #154 + #156)**: every `manifest-amender` rejection persists a structured JSON to `<workspace>/.devbench/review-failures/<task-id>-manifest_amender-<n>.json` (schema-v1 shape, see `src/devbench/backlog/review-feedback-schema.json`). The legacy `.devbench/amender-rejections/<task-id>-<n>.json` location remains as a forward-compat read path; new writes always go to the unified directory. Bounded by `MAX_RETRY_ATTEMPTS`; over-cap records still written but stamped `capped: true`. The blocker-resolver reads the archive on its next iteration to decide what fix proposal to emit. See [manifest-amendments.md](manifest-amendments.md) for the full feedback-flow contract.
+- **Review-judge structured feedback contract (universal, issue #156)**: every review judge (`code_review` / `test_review` / `doc_review` / `changes_manifest` / `security_review`) emits both a `[REVIEW_FAIL]` audit row AND a structured JSON via `uv run devbench log-rejection-feedback <judge> <task-id> --json '<payload>'`. The payload validates against `review-feedback-schema.json` and the per-judge controlled vocabulary in `src/devbench/backlog/review_feedback_vocabulary.py`. Persisted to `<workspace>/.devbench/review-failures/<task-id>-<judge>-<n>.json`. The executor-feedback collector ingests these on retry, ordered by judge severity (security > code > test > changes_manifest > doc > manifest_amender) then by attempt number descending, capped at `MAX_RETRY_ATTEMPTS` rounds. The done-gate refuses `mark-done` until every category is cleared via a matching `[REJECTION_FEEDBACK_RESOLVED] <judge>:<code>` audit OR escalated via `[NEEDS_DEP] <judge>:<code>` (followed by a `devbench add-dep` wire). See [review-feedback-vocabulary.md](review-feedback-vocabulary.md) for the full per-judge category list and resolution protocol.
+- **ETA + cost projection (issue #157)**: `devbench report`'s `Est. time to complete remaining` cell scales with `(tasks_active + tasks_blocked_recovery + tasks_blocked_auto) * recent_pace_minutes`. The auto-clearing and awaiting-recovery blocked buckets resolve on devbench's own (cascade or recovery loop), so excluding them produced a misleadingly low ETA. The `needs operator attention` bucket stays excluded -- those are genuine halts. The cost projection uses the same denominator. The cell carries a comment-suffix naming each contributing bucket count and the pace; falls back to `n/a` when fewer than `MIN_PACE_SAMPLES` completions exist in the recent window.
+- **In-progress attempt duration (issue #158)**: `devbench status`, `devbench status --detail`, and `devbench report`'s in-progress panel suffix every in-progress row with a humanized attempt duration (`23m`, `1h 47m`, `2d 3h`). The helper reads the most recent `Set <id> to 'in-progress'` transition from the structured log first, then falls back to the work-unit's audit-comment timestamps; multiple transitions resolve to the most recent one. When neither yields a parseable timestamp the row reads `(in-progress, timer unavailable)` -- the row is never silently omitted.
+- **Orchestrator-alive banner (issue #161)**: the very first line of `devbench report` is a one-line liveness banner derived from log-activity recency (`[ORCHESTRATOR ALIVE]` green / `[ORCHESTRATOR STOPPED]` red / `[ORCHESTRATOR STARTING]` yellow). Threshold reuses the existing `stop_hook.window_seconds` knob (default 180s) instead of introducing a redundant config field, which guarantees the banner stays aligned with the operator's already-tuned circuit-breaker quiet window. The banner includes the active session id when `JUDGE_ORCHESTRATOR_SESSION_ID` is set so multi-session operators can tell which session the report monitors. ANSI colour only when stdout is a TTY; pipes / CI redirects render plain text. Refreshes on every `--watch N` tick alongside the rest of the table -- no separate clear sequence, so no flicker. Implemented as a pure helper `_orchestrator_liveness_banner` in `src/devbench/reporting/report.py` that tail-reads the last 4KB of the log file (cheap regardless of log size), parses the most recent ISO-8601 timestamp, and computes `datetime.now(UTC) - timestamp` against the threshold.
+- **Reporting cache + persistence layer (issue #162)**: every `devbench report` invocation reads from a layered persistence stack that turns a multi-second log re-parse into a sub-millisecond cache + snapshot read. New artefacts:
+  - `<workspace>/.devbench/report-cache/events.sqlite` -- mtime+size+offset-keyed incremental SQLite cache + indexed event store. Self-healing; absent on first read = cold rebuild from `logs/orchestrator.log`. Phase 1+4. ADRs 16, 19.
+  - `<workspace>/.devbench/window-stats/<task-id>.json` -- per-task aggregate JSONs written by `BacklogManager._set_status` on every state transition. Reporter reads aggregates O(task_count) instead of re-aggregating O(log_size). Self-healing fallback when missing. Phase 2. ADR-17.
+  - `<workspace>/.devbench/report-snapshot.json` -- pre-rendered report cached after every orchestrate iteration (orchestrate skill step 9 invokes `devbench write-snapshot`). `devbench report --once` reads from this when the orchestrator log's `(mtime_ns, size)` freshness key matches. Phase 6. ADR-20.
+  - `<workspace>/logs/<YYYY-MM>/<task-id>.jsonl` (+ `orchestrator-meta.jsonl`) -- optional sharded layout. Operators run `devbench migrate-log-shards --migrate-log-shards` once to partition accumulated history; the live writer continues writing flat. Reversible via `mv logs/legacy/orchestrator.log logs/orchestrator.log && rm -rf logs/<YYYY-MM>/`. Phase 3. ADR-18.
+  - `<workspace>/logs/legacy/<session-id>.parquet` -- optional Parquet cold archive for ended sessions. Opt-in via `pip install devbench[archive]`. Phase 7. ADR-21.
+  - All migrations orchestrated via the unified `devbench upgrade [--migrate-log-shards]` command. Idempotent; default-deny on the destructive Phase 3 step. ADR-22. Operator-facing walkthrough at [docs/upgrade-guide.md](upgrade-guide.md).
 - **Proposal-lifecycle observability (universal)**: un-materialised proposal JSONs (drafts not yet written) are surfaced in `devbench status` (persistent `Un-materialised` count row), `devbench report` (a `Proposal JSONs pending materialisation` panel), and `devbench list-proposals` (per-entry `[state]` labels: `[unmaterialised]` / `[proposed]` / `[promoted]` / `[done]` / `[declined]` / `[rejected]`). Un-materialised JSONs can be discarded via `reject-proposal --unmaterialised <source-id>`. See [ADR-08](adr/08-proposal-lifecycle-observability.md).
 - **Orchestration hygiene (universal)**: each orchestrate loop iteration begins with `uv run devbench sweep-proposals` (best-effort materialise any pending un-materialised JSONs) and the executor prompt's pre-flight step 0 (restore / delete any target-repo working-tree pollution not in the current task's Changes Manifest). The review-supervisor prompt uses the five canonical underscored judge names (`code_review`, `test_review`, `doc_review`, `changes_manifest`, `security_review`) that the done-gate parser expects, pinned by a regression test. Together these close the observed gaps that left tasks blocked or reviewed against polluted trees. See [ADR-08](adr/08-proposal-lifecycle-observability.md).
 - **Loop-control isolation (universal)**: the orchestrator's loop is driven exclusively by `uv run devbench next` return values and the stop-hook circuit breaker exit code -- never by subagent prose. The `guard-comment-format.sh` PreToolUse hook rejects `uv run devbench log-comment` calls whose message body contains control-language imperatives (`halt orchestration`, `stop the loop`, `operator action required`, etc.). Together with the SKILL halt-discipline rule and the executor prompt's `COMMENT LANGUAGE DISCIPLINE` section, the hook forms a three-layer defense against prompt-injection of halt directives from downstream agents.
@@ -237,7 +259,7 @@ stateDiagram-v2
 
 ### The model
 
-The workspace root contains `BACKLOG.md` and the `backlog/` directory with work-unit files and `config/devbench.yaml`. The YAML's `repos:` map declares one or more target repositories that the orchestrator will modify. Each work unit identifies its target via a `repo:` field that matches a key in the map (full `org/repo` or short name).
+The workspace root (`JUDGE_WORKSPACE_ROOT`) is the **parent directory** that contains `BACKLOG.md`, the `backlog/` work-unit subtree, and the target-repo siblings. It is NOT the backlog repo itself -- the loader expects `BACKLOG.md` at `<JUDGE_WORKSPACE_ROOT>/BACKLOG.md` and `backlog/config/devbench.yaml` at `<JUDGE_WORKSPACE_ROOT>/backlog/config/devbench.yaml`. The YAML's `repos:` map declares one or more target repositories that the orchestrator will modify. Each work unit identifies its target via a `repo:` field that matches a key in the map (full `org/repo` or short name).
 
 ```yaml
 # backlog/config/devbench.yaml
@@ -252,21 +274,23 @@ repos:
 merge_strategy: squash         # default for all repos
 ```
 
-`checkout_directory` is **relative** to the workspace root; absolute paths are rejected at config load time.
+`checkout_directory` is **relative** to the workspace root; absolute paths are rejected at config load time. The loader populates `RepoConfig.resolved_checkout_path` with the absolute `<workspace>/<checkout_directory>` path so consumers (`cmd_*` in `cli.py`, `GitOpsService` in `git_ops.py`) read the dataclass field instead of re-resolving inline (E213).
 
 ### Recommended directory layout
 
 ```
 workspace-root/                            <-- JUDGE_WORKSPACE_ROOT
-├── BACKLOG.md
-├── backlog/
+├── BACKLOG.md                             <-- master index (mandatory at this exact path)
+├── backlog/                               <-- work-unit subtree
 │   ├── config/devbench.yaml
 │   └── E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md
-├── repo-a/                                <-- symlink or real clone
-└── repo-b/                                <-- symlink or real clone
+├── repo-a/                                <-- target-repo SIBLING of backlog/, NOT nested under it
+└── repo-b/                                <-- another target repo
 ```
 
-The symlink pattern is preferred when the backlog lives in its own git repo: it lets you commit backlog progress independently of the target repos.
+When the backlog lives in its own git repo (so backlog progress -- status changes, TDD logs, judge comments -- commits separately from target-repo history), init the git repo at `<workspace-root>/.git` and add the target-repo sibling directories to `<workspace-root>/.gitignore` so they don't pollute the backlog history.
+
+Symlinks remain optional for the case where target repos cannot be cloned next to the workspace root (a shared workspace with target repos elsewhere on disk). The symlink goes at the sibling path (`<workspace>/repo-a`), NOT inside `backlog/` -- a symlink under `backlog/` triggers `_check_orphans` because it appears as a non-work-unit file under the work-unit subtree.
 
 ### Single-repo is just one entry
 
@@ -287,20 +311,20 @@ When a CLI command receives a repo argument (or reads the `repo:` field of a wor
 
 ## 6. Multi-PR vs single-PR mode
 
-DevBench supports two git workflow patterns. Both share the same review pipeline; they differ in when commits are pushed and PRs are created.
+DevBench supports several git workflow patterns. They share the same review pipeline; they differ in when commits are pushed and PRs are created. See [`docs/git-ops-modes.md`](git-ops-modes.md) for the full mode table including pause-before-merge.
 
 ### Side-by-side comparison
 
-| Aspect | Multi-PR (default) | Single-PR (single-branch + defer_pr) |
-| --- | --- | --- |
-| Branch per work unit | `backlog/<id>` (one branch each) | one shared branch from `git_ops.single_branch` |
-| Commit cadence | Per work unit | Per work unit |
-| Push cadence | Per work unit, immediately after commit | Deferred until `git-ops-finalize` |
-| PR creation | After each unit's review passes | Once via `git-ops-finalize` after all units done |
-| CI checks | One CI run per PR | One CI run on the whole batch |
-| Merge | Auto-merge each PR after CI passes | Auto-merge the single PR after CI passes |
-| Submodule pointer updates | Per-unit (if `update_submodule: true`) | Not supported |
-| Best for | Independent work units that can ship separately | Related changes that must ship together |
+| Aspect | Multi-PR (default) | Single-PR (single-branch + defer_pr) | Local-only (`local_only: true`) |
+| --- | --- | --- | --- |
+| Branch per work unit | `backlog/<id>` (one branch each) | one shared branch from `git_ops.single_branch` | one shared branch from `git_ops.single_branch` |
+| Commit cadence | Per work unit | Per work unit | Per work unit |
+| Push cadence | Per work unit, immediately after commit | Deferred until `git-ops-finalize` | Never (no remote) |
+| PR creation | After each unit's review passes | Once via `git-ops-finalize` after all units done | Never |
+| CI checks | One CI run per PR | One CI run on the whole batch | None |
+| Merge | Auto-merge each PR after CI passes | Auto-merge the single PR after CI passes | N/A -- local commit history is the deliverable |
+| Submodule pointer updates | Per-unit (if `update_submodule: true`) | Not supported | Not supported |
+| Best for | Independent work units that can ship separately | Related changes that must ship together | Operational work (AWS teardowns, audits, evidence capture) -- see [`operational-work.md`](operational-work.md) |
 
 ### Multi-PR (default)
 
@@ -367,6 +391,10 @@ Four judges in `plugin/devbench/agents/review_team/`:
 ### Tier 2 -- Security gate (sequential, separate)
 
 `security-reviewer.md` runs only after all four review judges PASS. A SECURITY_FAIL writes both `[SECURITY_FAIL]` and `[REVIEW_REJECTED]` comments -- the latter resets the done-gate window, forcing the four review judges to re-run after the security fix lands. Security review is **not** retried; if it fails, the unit goes to blocked.
+
+### Reviewer scope contract
+
+Every reviewer (the four review-tier judges, the security gate, and the manifest amender) evaluates evidence **only** for paths that appear in the active task's `devbench get-diff` output (which mirrors `git diff --cached --name-only` plus the work-unit's per-task scope rules per ADR-12). A finding cited against a file outside that set is a prompt bug, not an operator misconfiguration, and should be filed as a devbench issue. The security-reviewer prompt and the manifest-amender SCOPE rule each carry by-content regression tests (`tests/test_integration/test_security_review_scope.py`, `tests/test_integration/test_manifest_amender_scope.py`) that pin the canonical scope-contract language so a future prompt edit cannot silently re-introduce out-of-scope evaluation. Issues #126 (security-reviewer) and #127 (manifest-amender) document the original regressions.
 
 ### Source of truth
 
@@ -453,6 +481,10 @@ repos:
 # Top-level: defaults for all repos
 merge_strategy: squash
 max_executor_retries: 10           # max retries before marking blocked
+log_file: logs/orchestrator.log    # optional: shared log path for setup_logging
+                                   #   writer + report/hook-tail readers.
+                                   #   Resolved relative to JUDGE_WORKSPACE_ROOT
+                                   #   when not absolute. JUDGE_LOG_FILE env wins.
 allowed_orgs:                      # optional: restrict to specific GH orgs
   - caylent-solutions
 judge_model: claude-sonnet-4-6     # optional: model for review judges
@@ -531,6 +563,20 @@ DevBench registers hooks for Claude Code events via `plugin/devbench/hooks/hooks
 
 `${CLAUDE_PLUGIN_ROOT}` in the hooks.json command strings is interpolated by Claude Code at runtime to the absolute path of the loaded plugin directory (the value passed to `--plugin-dir`).
 
+### Caller-role indicator: `JUDGE_AGENT_ROLE` (issue #160, ADR-15)
+
+`guard-work-unit-write.sh` distinguishes between executor-tier and orchestrator-tier callers via the `JUDGE_AGENT_ROLE` environment variable:
+
+| `JUDGE_AGENT_ROLE` value | Behaviour on a `backlog/**/*.md` Edit / Write |
+| --- | --- |
+| `orchestrator` | ALLOW after content rules (rule 10 em-dash, rule 11 checkout_directory prefix) pass. The orchestrator agent itself is the legitimate caller for corrective edits to work-unit content (e.g., post-process strip of a blocker-resolver-emitted rule-11 violation per issue #159). |
+| `executor` | BLOCK. Executor agents must not modify work-unit files directly; that's the orchestrate skill's job. |
+| missing / unrecognised | BLOCK. Default-deny. Preserves the original safety guarantee for any legacy caller that hasn't been updated to set the indicator. |
+
+Implementation: `_resolve_caller_role` in `plugin/devbench/scripts/_hook_lib.sh` reads the env var and returns one of the three normalized values. The orchestrator subprocess sets `JUDGE_AGENT_ROLE=orchestrator` in its env before invoking any Claude tool; executor subprocesses inherit no such env var.
+
+Content rules (rule 10 em-dash, rule 11 checkout_directory prefix) ALWAYS fire regardless of role -- the role bypass affects only the final block-or-allow gate. An orchestrator-tier write that violates rule 10 or rule 11 is still rejected with exit 2 + a structured error message.
+
 ### The Stop hook circuit breaker (the headline reliability feature)
 
 Why it exists: After Claude Code compacts its context (which it does automatically when context fills up), the resulting conversation can lose the orchestrate skill instructions. Without intervention, Claude would correctly conclude the conversation is over and stop -- leaving an in-progress task hanging.
@@ -552,18 +598,24 @@ The circuit breaker prevents tight stop-block loops from running forever; it als
 
 Configuration is under `stop_hook:` in the YAML, with env var overrides `JUDGE_STOP_MAX_BLOCKS`, `JUDGE_STOP_WINDOW_SECONDS`, `JUDGE_STOP_STALE_MINUTES`.
 
+**Implementation invariants (issues #130 + #131)**: every JSON serialisation in the Stop hook chain (BLOCK_JSON, state file, diagnostic capture) must use `jq` -- never `python3` -- because the hook can be invoked with an asdf-shimmed PATH where `python3` exits 126 with no version configured, silently dropping the block decision. Active-task selection reads `<workspace>/logs/*.log` for the most recent `Branch ready: ... on <task_id>` or `Set <task_id> to 'in-progress'` entry rather than `head -1` of BACKLOG.md, so a stale `in-progress` row from a crashed prior session does not mask what the orchestrator is actually running. Both invariants are pinned by-content in `tests/unit/test_continue_orchestration_hook.py::TestBlockJsonSerialisationRobustness` and `::TestActiveTaskSelection`.
+
 ---
 
 ## 10. Current gaps (known limitations)
 
-Current gaps are tracked as GitHub issues on [caylent-solutions/devbench](https://github.com/caylent-solutions/devbench/issues) under the `enhancement` and `tech-debt` labels. Representative examples from the architecture audit:
+Current gaps are tracked as GitHub issues on [caylent-solutions/devbench](https://github.com/caylent-solutions/devbench/issues) under the `enhancement` and `tech-debt` labels.
 
-- **Branch uniqueness**: `validate-backlog` doesn't catch branch-name collisions across work units. Manual editing of the Branch field in two units to the same value will not error.
-- **Work-unit scaffolding**: No CLI command to scaffold a new epic / feature / story / task from a template. Authors copy-paste from `docs/example-work-unit-template.md` today.
-- **`hold` status not implemented**: The `hold` status (for paused-by-human work) is planned but not implemented (E222). This blocks E215 and E220.
-- **No `status --detail` flag**: Backlog status output is summary-only; no per-unit drill-down (E220, blocked on E222).
-- **Dependency integrity gaps**: `_deps_satisfied` only checks task-to-task dependencies, not task-to-epic / feature / story (E215, blocked on E222).
-- **`blocker-resolver` agent not invoked**: The agent file at `plugin/devbench/agents/blocker-resolver.md` exists but the orchestrate skill does not currently call it. Blocked work units stay blocked until human intervention.
+**Resolved in the v-next release (this branch)**:
+- ✅ Branch uniqueness: `_check_branch_uniqueness` rule in `validate-backlog` (E219, issue #108).
+- ✅ Work-unit scaffolding: `devbench new-task` + `backlog/templates/{epic,feature,story,task}.md` (E223, issue #110).
+- ✅ `hold` status: `STATUS_HOLD`, `cmd_hold`, `cmd_unhold` (E222, issue #104).
+- ✅ `status --detail` flag: three-panel output (E220, issue #109).
+- ✅ Dependency integrity: recursive `_deps_satisfied` walk + `cmd_sync_blocked` (E215, issue #107).
+- ✅ `blocker-resolver` agent invocation: orchestrator calls it on amendment-reject; `task-factory` materialises the proposal.
+
+**Remaining gaps (open issues)**:
+
 - **No topological sort for parallel candidates**: `get_parallel_candidates` returns units in linear order rather than running a topological sort over the dep graph. This affects ordering when many parallel candidates exist.
 - **Per-judge retry limits don't exist**: `max_executor_retries` is global; you can't configure "retry the executor 5 times if test-reviewer fails but only 2 times if doc-reviewer fails."
 - **Cost report doesn't split by role**: Aggregate cost only; no per-agent (executor vs judge) cost breakdown.
@@ -580,7 +632,7 @@ All items the documentation audit raised have been resolved in this PR:
 - ✅ Stale Opus 4.1 token cost defaults -- updated to current Opus 4.7 rates.
 - ✅ Confusing `tasks_in_session` semantics -- `devbench report` now renders **two** windows by default: All-time (full log) and Current run (most recent contiguous block of orchestration events, boundary at a >10-minute gap). See [Hooks layer](#9-hooks-layer) and the [report capability](#2-capabilities) entry for usage.
 
-If you find a new issue, file it on the ROADMAP rather than this section.
+If you find a new issue, open a GitHub issue (or PR with the fix) rather than amending this section -- this list is a snapshot of resolutions, not a live tracker.
 
 ---
 

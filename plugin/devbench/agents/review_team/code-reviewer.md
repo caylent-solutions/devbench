@@ -126,6 +126,12 @@ uv run devbench log-verdict code_review $ARGUMENTS <pass|fail> "<one-line summar
 ```
 On FAIL: most critical finding. On PASS: which criteria groups were verified.
 
+c. **Verdict-emission contract (issue #156, FAIL only):** in addition to `log-verdict`, persist a structured rejection JSON via:
+```
+uv run devbench log-rejection-feedback code_review $ARGUMENTS --json '<payload>'
+```
+Payload shape: `{"categories": [{"code": "<CODE>", "severity": "fail"|"warn", "summary": "<one-line>", "remediation": "<actionable fix>", "files": ["<path>"]}, ...], "raw_verdict_text": "<full verdict body>"}`. Every `code` MUST come from the controlled vocabulary for `code_review`: `MAKE_VALIDATE_FAILURE`, `HARDCODED_URL`, `MISSING_AC_EVIDENCE`, `SOLID_VIOLATION`, `SECURITY_BYPASS_ANNOTATION`, `SCOPE_VIOLATION`, `MANIFEST_TODO_UNFILLED`, `AGENT_LOG_CONTRADICTS_DIFF`. The executor reads the persisted JSON on retry; the done-gate refuses `mark-done` until every category is cleared via `[REJECTION_FEEDBACK_RESOLVED] code_review:<CODE>` OR escalated via `[NEEDS_DEP] code_review:<CODE>`. See `docs/review-feedback-vocabulary.md` for the per-code remediation guide.
+
 **Phase 2 -- JSON response envelope (last thing output in your response text):**
 
 ```json

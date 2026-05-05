@@ -30,10 +30,13 @@ both the work-unit file and BACKLOG.md atomically.  After each write,
 the ``## Status Summary`` table in sync.
 """
 
+import itertools
 import logging
 import re
+from collections import deque
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import ClassVar
 
 from devbench.constants import (
     ALL_REQUIRED_JUDGE_NAMES,
@@ -50,6 +53,7 @@ from devbench.constants import (
     STATUS_BLOCKED,
     STATUS_DECLINED,
     STATUS_DONE,
+    STATUS_HOLD,
     STATUS_IN_PROGRESS,
     STATUS_IN_QUEUE,
     STATUS_LINE_RE,
@@ -90,6 +94,14 @@ class BacklogManager:
                 ``logging.getLogger("devbench.backlog_manager")`` when omitted.
         """
         self.logger = logger or logging.getLogger("devbench.backlog_manager")
+        # Idempotency guard for the auto-requeue cascade (issue #147). A
+        # ``(backlog_index, unit_id)`` pair is added when the cascade runs;
+        # subsequent ``_set_status`` calls for the same terminal target skip
+        # the scan. The set is per-instance so independent ``BacklogManager``
+        # constructions get their own guard (tests share no state).
+        self._cascade_fired_for: set[tuple[str, str]] = set()
+        # Populated by ``validate(fix=True)``: ``(fix_count, files_fixed)``.
+        self._fix_summary: tuple[int, int] = (0, 0)
 
     def force_status(
         self,
@@ -179,7 +191,50 @@ class BacklogManager:
         self._set_status(work_unit_path, backlog_index, unit_id, STATUS_DECLINED)
         self._append_comment(work_unit_path, "DECLINED", reason)
 
-    def validate(self, backlog_index: Path, workspace_root: Path) -> list[str]:
+    def mark_held(self, work_unit_path: Path, backlog_index: Path, unit_id: str, reason: str) -> None:
+        """Mark a work unit as ``hold`` in both files and append an audit comment.
+
+        ``hold`` is a deferred-decision status: the unit is intentionally
+        skipped by the orchestrator's ``next``/parallel-candidate scan
+        (``BacklogParser.get_parallel_candidates`` filters to
+        ``IN_QUEUE``/``IN_PROGRESS`` only) until an operator runs
+        ``unmark_held`` to return it to ``in-queue``. Unlike ``declined``,
+        ``hold`` is **not** terminal -- a held child does NOT count toward
+        a parent's auto-rollup to ``done``; the parent stays open while
+        any descendant is on hold.
+
+        Args:
+            work_unit_path: Path to the work-unit ``.md`` file.
+            backlog_index: Path to the ``BACKLOG.md`` file.
+            unit_id: The work-unit identifier.
+            reason: Human-readable rationale for the deferral. Captured in
+                the Comments audit trail alongside a ``[HOLD]`` marker.
+
+        Raises:
+            FileNotFoundError: If either file does not exist.
+            ValueError: If the status line or unit row is not found.
+        """
+        self._set_status(work_unit_path, backlog_index, unit_id, STATUS_HOLD)
+        self._append_comment(work_unit_path, "HOLD", reason)
+
+    def unmark_held(self, work_unit_path: Path, backlog_index: Path, unit_id: str, reason: str) -> None:
+        """Return a held work unit to ``in-queue`` and append an audit comment.
+
+        Args:
+            work_unit_path: Path to the work-unit ``.md`` file.
+            backlog_index: Path to the ``BACKLOG.md`` file.
+            unit_id: The work-unit identifier.
+            reason: Human-readable rationale for the release. Captured in
+                the Comments audit trail alongside a ``[UNHOLD]`` marker.
+
+        Raises:
+            FileNotFoundError: If either file does not exist.
+            ValueError: If the status line or unit row is not found.
+        """
+        self._set_status(work_unit_path, backlog_index, unit_id, STATUS_IN_QUEUE)
+        self._append_comment(work_unit_path, "UNHOLD", reason)
+
+    def validate(self, backlog_index: Path, workspace_root: Path, fix: bool = False) -> list[str]:
         """Check backlog integrity and return a list of error messages.
 
         Checks performed:
@@ -194,13 +249,31 @@ class BacklogManager:
         9. Task files have ## Definition of Done section.
         10. No em-dash character (U+2014) in work unit files.
         11. Changes Manifest paths do not start with a ``checkout_directory`` prefix.
+        12. Manifest path conflicts (no two in-queue Tasks claim the same file).
+        13. Language-AC alignment (non-Python tasks must mark Python ACs N/A).
+        14. Source-test atomicity (every prod source has a paired test in the same Manifest).
+        15. Required sections (Status, Dependencies, Changes Manifest) on every Task.
+        16. Status enum (every parsed ``## Status:`` value matches ``VALID_STATUSES``).
+        17. Dependency-ID format (every entry in a ``## Dependencies`` table matches the canonical regex).
+        18. Branch uniqueness (no two Tasks derive the same branch name; skipped in single-PR mode).
+        19. No placeholder Manifest rows (no active Task carries a ``TBD`` row in its Changes Manifest).
+        20. No orphan path tokens in AC / DoD (gated by ``validate.check_orphan_path_tokens``):
+            backtick-quoted path-shaped tokens in ``## Acceptance Criteria`` and
+            ``## Definition of Done`` must appear in the Task's Changes Manifest after
+            normalisation, OR be marked read-only via a trailing ``(ref)`` suffix.
 
         Args:
             backlog_index: Path to the ``BACKLOG.md`` index file.
             workspace_root: Workspace root containing BACKLOG.md and the backlog/ subdirectory.
+            fix: When ``True``, auto-correct rule-10 (em-dash) and rule-11
+                (checkout_directory prefix) violations in-place and append an
+                audit comment to each corrected file's ``## Comments`` section.
+                Violations that were corrected are NOT included in the returned
+                error list. Without ``fix``, the method is read-only.
 
         Returns:
-            A list of error strings. Empty list means the backlog is valid.
+            A list of error strings. Empty list means the backlog is valid (or
+            all fixable violations were corrected when ``fix=True``).
         """
         rows = self._parse_backlog_rows(backlog_index)
         known_ids = {row_id for row_id, _, _ in rows if row_id and not row_id.startswith("-")}
@@ -209,10 +282,150 @@ class BacklogManager:
         indexed_files = self._check_files_and_statuses(rows, workspace_root, errors)
         self._check_orphans(workspace_root, indexed_files, errors)
         self._check_dependencies(backlog_index, known_ids, errors)
+        self._check_dep_cycles(backlog_index, errors)
         self._check_status_summary(backlog_index, rows, errors)
+        if fix:
+            fix_count, fix_files = self._apply_fixes(rows, workspace_root)
+            self._fix_summary = (fix_count, fix_files)
+            rows = self._parse_backlog_rows(backlog_index)
         self._check_task_content(rows, workspace_root, errors)
         self._check_manifest_path_prefixes(rows, workspace_root, errors)
+        self._check_manifest_conflicts(rows, workspace_root, errors)
+        self._check_language_ac_alignment(rows, workspace_root, errors)
+        self._check_source_test_pairs(rows, workspace_root, errors)
+        self._check_required_sections(rows, workspace_root, errors)
+        self._check_status_enum(rows, workspace_root, errors)
+        self._check_dep_id_format(rows, workspace_root, errors)
+        self._check_branch_uniqueness(rows, workspace_root, errors)
+        self._check_no_placeholder_manifest_rows(rows, workspace_root, errors)
+        self._check_no_orphan_path_tokens(rows, workspace_root, errors)
         return errors
+
+    def _apply_fixes(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+    ) -> tuple[int, int]:
+        """Auto-correct rule-10 (em-dash) and rule-11 (checkout_directory prefix) violations.
+
+        For each task work unit:
+        - Rule 10: replace every U+2014 character with ``--``.
+        - Rule 11: strip the ``checkout_directory/`` prefix from Changes Manifest
+          paths that carry it.
+
+        After correcting a violation, appends an audit comment to the work
+        unit's ``## Comments`` section:
+        ``[VALIDATE_FIX] auto-corrected <rule>: <before> -> <after>``
+
+        Args:
+            rows: Parsed backlog rows as returned by ``_parse_backlog_rows``.
+            workspace_root: Workspace root used to resolve work-unit file paths.
+
+        Returns:
+            ``(fix_count, files_fixed)`` -- total individual corrections applied
+            and the count of distinct files that were modified.
+        """
+        timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+        fix_count = 0
+        files_fixed: set[Path] = set()
+
+        for row_id, _, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not file_path_str or not self._is_task_id(row_id):
+                continue
+
+            wu_path = workspace_root / file_path_str
+            if not wu_path.exists():
+                continue
+
+            content = wu_path.read_text(encoding="utf-8")
+            original = content
+            audit_lines: list[str] = []
+
+            content, r10_count = self._fix_em_dash(content, audit_lines)
+            fix_count += r10_count
+
+            content, r11_count = self._fix_manifest_prefixes(content, audit_lines)
+            fix_count += r11_count
+
+            if content != original or audit_lines:
+                content = self._append_fix_audit(content, timestamp, audit_lines)
+                wu_path.write_text(content, encoding="utf-8")
+                files_fixed.add(wu_path)
+
+        return fix_count, len(files_fixed)
+
+    @staticmethod
+    def _fix_em_dash(content: str, audit_lines: list[str]) -> tuple[str, int]:
+        """Replace all U+2014 em-dash characters with '--'.
+
+        Returns the (possibly modified) content and the count of replacements.
+        Appends an audit line to ``audit_lines`` when at least one replacement is made.
+        """
+        if EM_DASH not in content:
+            return content, 0
+        count = content.count(EM_DASH)
+        content = content.replace(EM_DASH, "--")
+        audit_lines.append(
+            f"[VALIDATE_FIX] auto-corrected rule-10: replaced {count} em-dash character(s) (U+2014) with '--'"
+        )
+        return content, count
+
+    @staticmethod
+    def _fix_manifest_prefixes(content: str, audit_lines: list[str]) -> tuple[str, int]:
+        """Strip checkout_directory prefix from Changes Manifest path cells.
+
+        Returns the (possibly modified) content and the count of path corrections.
+        Appends audit lines to ``audit_lines`` for each corrected path.
+        """
+        from devbench.backlog.manifest import parse_manifest
+        from devbench.config import RUNTIME_CONFIG
+
+        repo = BacklogManager._extract_repo(content)
+        if repo is None or repo not in RUNTIME_CONFIG.repos:
+            return content, 0
+        checkout_dir = RUNTIME_CONFIG.repos[repo].checkout_directory
+        if not checkout_dir:
+            return content, 0
+
+        prefix = f"{checkout_dir.rstrip('/')}/"
+        try:
+            manifest_rows = parse_manifest(content)
+        except Exception:
+            return content, 0
+
+        fix_count = 0
+        for mrow in manifest_rows:
+            if not mrow.file.startswith(prefix):
+                continue
+            stripped = mrow.file[len(prefix) :]
+            old_cell = f"`{mrow.file}`"
+            new_cell = f"`{stripped}`"
+            if old_cell in content:
+                content = content.replace(old_cell, new_cell, 1)
+                audit_lines.append(
+                    f"[VALIDATE_FIX] auto-corrected rule-11: "
+                    f"stripped checkout_directory prefix from "
+                    f"'{mrow.file}' -> '{stripped}'"
+                )
+                fix_count += 1
+
+        return content, fix_count
+
+    @staticmethod
+    def _append_fix_audit(content: str, timestamp: str, audit_lines: list[str]) -> str:
+        """Append the VALIDATE_FIX audit block to the work-unit file content.
+
+        If the file already has a ``## Comments`` section, appends after the last
+        line; otherwise creates the section first.
+        """
+        if not audit_lines:
+            return content
+        audit_block = "\n".join(f"[{timestamp}] [validate_fix] {line}" for line in audit_lines)
+        if COMMENTS_SECTION_HEADER in content:
+            return content.rstrip("\n") + "\n\n" + audit_block + "\n"
+        return content.rstrip("\n") + "\n\n" + COMMENTS_SECTION_HEADER + "\n\n" + audit_block + "\n"
 
     def _check_files_and_statuses(
         self,
@@ -286,6 +499,99 @@ class BacklogManager:
                 if dep_id and dep_id.lower() not in DEPENDENCY_NONE_VALUES and dep_id not in known_ids:
                     errors.append(f"{row_id}: dependency '{dep_id}' not found in backlog index")
 
+    def _check_dep_cycles(self, backlog_index: Path, errors: list[str]) -> None:
+        """Issue #151: detect dependency cycles via DFS-with-recursion-stack.
+
+        Walks the dep graph derived from the Full Work Unit Index. A cycle
+        exists when, during DFS, we encounter a node that is currently in
+        the recursion stack (the "gray" set). Self-edges and chains of any
+        length (4-node, N-node) are detected because the recursion-stack
+        membership check is the unique cycle witness.
+
+        Reports one error per cycle, naming the participating node IDs in
+        traversal order so the operator can spot the offending chain. Cycle
+        reporting is normalised: each cycle is rotated to start at its
+        lexicographically smallest ID and reported once even when the DFS
+        encounters it from multiple roots.
+        """
+        graph = self._build_dependency_graph(backlog_index)
+        if not graph:
+            return
+
+        # DFS color tracking: 0 = white (unvisited), 1 = gray (on the
+        # recursion stack -- a back-edge to a gray node is the cycle
+        # witness), 2 = black (fully processed). ``stack`` records the
+        # current DFS chain so we can extract the cycle nodes when a
+        # back-edge fires.
+        color: dict[str, int] = dict.fromkeys(graph, 0)
+        stack: list[str] = []
+        reported: set[tuple[str, ...]] = set()
+
+        def visit(node: str) -> None:
+            color[node] = 1
+            stack.append(node)
+            for nxt in graph.get(node, ()):
+                if nxt not in color:
+                    # Dependency on a non-indexed ID -- already reported by
+                    # _check_dependencies; skip without traversal.
+                    continue
+                if color[nxt] == 1:
+                    # Cycle: rotate so the lexicographically smallest node
+                    # starts the chain, then dedupe.
+                    cycle_start = stack.index(nxt)
+                    cycle = tuple(stack[cycle_start:])
+                    rotation = cycle.index(min(cycle))
+                    normalised = cycle[rotation:] + cycle[:rotation]
+                    if normalised not in reported:
+                        reported.add(normalised)
+                        chain = " -> ".join([*normalised, normalised[0]])
+                        errors.append(f"dependency cycle detected: {chain}")
+                    continue
+                if color[nxt] == 0:
+                    visit(nxt)
+            stack.pop()
+            color[node] = 2
+
+        for node in sorted(graph):
+            if color.get(node) == 0:
+                visit(node)
+
+    def _build_dependency_graph(self, backlog_index: Path) -> dict[str, list[str]]:
+        """Parse the Full Work Unit Index into a ``{id: [dep_id, ...]}`` map.
+
+        Mirrors the parsing scope used by :meth:`_check_dependencies`. Only
+        rows inside the ``## Full Work Unit Index`` section are considered;
+        Status Summary rows have the same cell count and would otherwise
+        pollute the graph.
+        """
+        graph: dict[str, list[str]] = {}
+        if not backlog_index.exists():
+            return graph
+        content = backlog_index.read_text(encoding="utf-8")
+        in_full_index = False
+        for line in content.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("## "):
+                in_full_index = "Full Work Unit Index" in stripped
+                continue
+            if not in_full_index or not stripped.startswith("|"):
+                continue
+            cells = [c.strip() for c in line.split("|")]
+            if len(cells) != BACKLOG_INDEX_CELL_COUNT:
+                continue
+            row_id = cells[1]
+            if not row_id or row_id.lower() == "id" or row_id.startswith("-"):
+                continue
+            dep_cell = cells[5]
+            deps: list[str] = []
+            for raw_dep in dep_cell.split(","):
+                dep_id = raw_dep.strip()
+                if not dep_id or dep_id.lower() in DEPENDENCY_NONE_VALUES:
+                    continue
+                deps.append(dep_id)
+            graph[row_id] = deps
+        return graph
+
     def log_to_traceability_matrix(self, matrix_path: Path, spec_ref: str, test_ref: str) -> None:
         """Append an entry to the traceability matrix.
 
@@ -340,12 +646,40 @@ class BacklogManager:
             canonical,
         )
 
-        if canonical == STATUS_DONE:
-            # Auto-requeue reverse-dependents first so the rollup check that
-            # follows sees any freshly-unblocked children as non-terminal and
-            # correctly declines to promote the parent to done.
-            self._auto_requeue_marker_dependents(backlog_index, unit_id)
-            self._rollup_parent_status(backlog_index, unit_id)
+        # Issue #162 Phase 2 (ADR-17): every task-state transition lands
+        # in a per-task aggregate JSON at
+        # ``<workspace>/.devbench/window-stats/<task-id>.json`` so the
+        # reporter can read aggregates instead of re-scanning the log.
+        # Single hook point: every public transition method routes
+        # through ``_set_status``, so this one call covers all of them.
+        # Stories / Features / Epics are skipped (their state is auto-
+        # rolled from children; window-stats only tracks tasks).
+        if "-T" in unit_id:
+            from datetime import UTC, datetime
+
+            from devbench.reporting.window_stats import update_aggregate
+
+            workspace_root = backlog_index.parent
+            update_aggregate(workspace_root, unit_id, canonical, datetime.now(UTC))
+
+        if canonical in _TERMINAL_CHILD_STATUSES:
+            # Issue #147: every terminal transition (``done`` AND ``declined``)
+            # fires the auto-requeue cascade. Previously only ``mark_done``
+            # routed through here; ``mark_declined`` / ``force_status declined``
+            # silently skipped the scan, leaving downstream blocked tasks
+            # marooned. The idempotency guard prevents a redundant scan when
+            # the same target is set to the same terminal status twice in
+            # one process lifetime (e.g. via repeated ``set-status`` calls).
+            cascade_key = (str(backlog_index), unit_id)
+            if cascade_key not in self._cascade_fired_for:
+                self._cascade_fired_for.add(cascade_key)
+                # Auto-requeue reverse-dependents first so the rollup check
+                # that follows sees any freshly-unblocked children as
+                # non-terminal and correctly declines to promote the parent
+                # to done.
+                self._auto_requeue_marker_dependents(backlog_index, unit_id)
+            if canonical == STATUS_DONE:
+                self._rollup_parent_status(backlog_index, unit_id)
 
     def _last_round_all_passed(self, work_unit_path: Path) -> bool:
         """Check whether the most recent review round had all required judges pass.
@@ -511,10 +845,14 @@ class BacklogManager:
                 sorted_markers,
             )
             self.force_status(candidate_file, backlog_index, row_id, STATUS_IN_QUEUE)
+            # Issue #153: emit ``[CASCADE_RESOLVED]`` so the status-detail
+            # panel renderer can supersede the earlier ``[BLOCKED]`` audit
+            # row. ``[AUTO_UNBLOCKED]`` is retained alongside for backward
+            # compatibility with operator tooling that already greps for it.
             self._append_agent_comment(
                 candidate_file,
                 "backlog_manager",
-                f"[AUTO_UNBLOCKED] promoted proposals {sorted_markers} are terminal; re-queuing",
+                f"[AUTO_UNBLOCKED] [CASCADE_RESOLVED] promoted proposals {sorted_markers} are terminal; re-queuing",
             )
 
     @staticmethod
@@ -1030,6 +1368,851 @@ class BacklogManager:
                         f"Paths must be repo-relative (drop the prefix); "
                         f"see docs/backlog-contract.md."
                     )
+
+    # Language tier classification used by the source-test pair and
+    # language-AC-alignment rules. Mirrors docs/acceptance-criteria-canonical.md
+    # tier table. Production-source globs identify paths whose Python files
+    # require a sibling test entry in the same Manifest per
+    # docs/source-test-atomicity.md; the test-path globs are the matching
+    # locations the rule searches for that sibling.
+    _PYTHON_EXTS: ClassVar[tuple[str, ...]] = (".py",)
+    _NON_PY_EXTS_TO_TIER: ClassVar[dict[str, str]] = {
+        ".hcl": "HCL",
+        ".tf": "HCL",
+        ".tfvars": "HCL",
+        ".yaml": "YAML",
+        ".yml": "YAML",
+        ".json": "JSON",
+        ".xml": "XML",
+        ".toml": "TOML",
+        ".md": "Markdown",
+    }
+    _PROD_SRC_PATTERNS: ClassVar[tuple[str, ...]] = (
+        "src/",
+        "infra/scripts/",
+    )
+    _PROD_SRC_NESTED_PATTERNS: ClassVar[tuple[str, ...]] = ("/src/",)
+    _AC_FINAL_LANGUAGE_TIER_IDS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "AC-FINAL-002",
+            "AC-FINAL-003",
+            "AC-FINAL-004",
+            "AC-FINAL-005",
+            "AC-FINAL-006",
+            "AC-FINAL-008",
+            "AC-FINAL-014",
+        }
+    )
+
+    @classmethod
+    def _classify_manifest_tier(cls, paths: list[str]) -> str:
+        """Return the language tier for a Manifest's file paths.
+
+        Returns ``"Python"`` if any path ends in ``.py``; otherwise the
+        single non-Python tier matching all paths; otherwise ``"Mixed"``.
+        Returns ``""`` if the path list is empty.
+        """
+        if not paths:
+            return ""
+        py_paths = [p for p in paths if any(p.lower().endswith(ext) for ext in cls._PYTHON_EXTS)]
+        if py_paths:
+            return "Python"
+        tiers = set()
+        for p in paths:
+            lower = p.lower()
+            for ext, tier in cls._NON_PY_EXTS_TO_TIER.items():
+                if lower.endswith(ext):
+                    tiers.add(tier)
+                    break
+        if len(tiers) == 1:
+            return tiers.pop()
+        if len(tiers) > 1:
+            return "Mixed"
+        return ""
+
+    @classmethod
+    def _is_production_source(cls, path: str) -> bool:
+        """Return True if the path looks like production Python source.
+
+        Used by the source-test pair rule to distinguish source files (which
+        require a matching test entry) from one-off scripts in
+        configuration-only directories. Test files themselves (paths under
+        any ``tests/`` segment) are excluded -- they are not production source
+        even when their extension is ``.py``.
+        """
+        if not any(path.lower().endswith(ext) for ext in cls._PYTHON_EXTS):
+            return False
+        # Exclude test files
+        if path.startswith("tests/") or "/tests/" in path:
+            return False
+        # Exclude package marker files
+        from pathlib import PurePosixPath
+
+        if PurePosixPath(path).name == "__init__.py":
+            return False
+        return any(path.startswith(p) for p in cls._PROD_SRC_PATTERNS) or any(
+            seg in path for seg in cls._PROD_SRC_NESTED_PATTERNS
+        )
+
+    @staticmethod
+    def _is_real_manifest_path(path: str) -> bool:
+        """Return True if the Manifest entry is a real file path.
+
+        Filters out placeholder strings like ``(none)``, ``(no file changes;
+        ...)``, etc. that documentation-only or verification-only tasks use to
+        indicate an empty Manifest.
+        """
+        if not path:
+            return False
+        stripped = path.strip()
+        return not (stripped.startswith("(") and stripped.endswith(")"))
+
+    def _check_manifest_conflicts(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """Check 12: no two in-queue tasks in the SAME REPO own the same Manifest path.
+
+        Per docs/backlog-contract.md "Manifest Conflict Rule": two in-queue
+        tasks claiming ownership of the same path collide at git-ops time.
+        Tasks with explicit Dependencies between them are exempt because the
+        ordering resolves the conflict. The check is scoped by ``(repo, path)``
+        because two tasks targeting different repos can legitimately list the
+        same path (e.g., ``.devcontainer/devcontainer.json`` exists in both
+        caylent-telemetry and the kanon repo's per-repo edits).
+        """
+        from devbench.backlog.manifest import ManifestParseError, parse_manifest
+
+        # Map: (repo, path) -> list of (task_id, status)
+        ownership: dict[tuple[str, str], list[tuple[str, str]]] = {}
+        deps_by_task: dict[str, set[str]] = {}
+
+        for row_id, status, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not file_path_str or not self._is_task_id(row_id):
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.exists():
+                continue
+            content = wu_path.read_text(encoding="utf-8")
+            repo = self._extract_repo(content) or ""
+            try:
+                manifest_rows = parse_manifest(content)
+            except ManifestParseError:
+                # Other validate rules (TestValidateContent) emit the missing
+                # Manifest error; conflict detection treats unparseable
+                # Manifests as having zero entries to avoid duplicate noise.
+                manifest_rows = []
+            for manifest_row in manifest_rows:
+                if not self._is_real_manifest_path(manifest_row.file):
+                    continue
+                ownership.setdefault((repo, manifest_row.file), []).append((row_id, status))
+            deps_by_task[row_id] = self._extract_dep_ids(content)
+
+        for (repo, path), owners in ownership.items():
+            if len(owners) < 2:
+                continue
+            # Filter to tasks not in done/declined/in-progress -- those are not
+            # in flight any more or are actively being executed; the conflict
+            # rule targets in-queue/proposed/blocked overlap.
+            relevant = [(tid, st) for tid, st in owners if st in ("in-queue", "proposed", "blocked")]
+            if len(relevant) < 2:
+                continue
+            # Check whether every pair is comparable via the transitive
+            # dep graph (any DAG that totally orders the set is sufficient).
+            ids = [tid for tid, _ in relevant]
+            if self._tasks_form_dep_chain(ids, deps_by_task):
+                continue
+            sorted_ids = sorted(ids)
+            chain_hint = "\n".join(
+                f"    uv run devbench add-dep {later} {earlier}" for earlier, later in itertools.pairwise(sorted_ids)
+            )
+            errors.append(
+                f"Manifest conflict on {path!r} in repo {repo or '(unknown)'}: "
+                f"claimed by {', '.join(sorted_ids)}. Wire a serial dep chain:\n"
+                f"{chain_hint}\n"
+                f"  -- or any other DAG that totally orders the set. See "
+                f"docs/backlog-contract.md 'Manifest Conflict Rule'."
+            )
+
+    @staticmethod
+    def _extract_dep_ids(content: str) -> set[str]:
+        """Return the set of task IDs in a work-unit's ## Dependencies table."""
+        deps: set[str] = set()
+        in_deps = False
+        for line in content.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("## "):
+                in_deps = stripped.startswith("## Dependencies")
+                continue
+            if not in_deps:
+                continue
+            if not stripped.startswith("|"):
+                continue
+            # `startswith("|")` guarantees at least 2 cells after split.
+            cells = [c.strip() for c in stripped.split("|")]
+            cell = cells[1]
+            if not cell or cell.lower() == "id" or cell.startswith("-"):
+                continue
+            if cell in DEPENDENCY_NONE_VALUES:
+                continue
+            # Cell may contain a comma-separated dep list
+            for raw in cell.split(","):
+                token = raw.strip()
+                # Allow IDs with ":" suffix variants; keep core ID
+                if not token:
+                    continue
+                # Validate against task-id shape
+                if re.fullmatch(r"E\d+(-F\d+)?(-S\d+)?(-T\d+)?", token):
+                    deps.add(token)
+        return deps
+
+    @staticmethod
+    def _tasks_form_dep_chain(ids: list[str], deps: dict[str, set[str]]) -> bool:
+        """Return True iff every id in ``ids`` is comparable via transitive reachability.
+
+        Two task ids are *comparable* when one is reachable from the other by
+        following dep edges. A dep chain that resolves ownership conflicts
+        requires the conflict set to be totally ordered: every pair of
+        claimants must be comparable in at least one direction. This is the
+        canonical contract -- any DAG that totally orders the set (a clean
+        N-1 chain, a branching DAG that merges, full N*(N-1)/2 pairwise
+        edges) is accepted (issue #145).
+        """
+        if len(ids) < 2:
+            return True
+        id_set = set(ids)
+
+        def reachable(start: str) -> set[str]:
+            seen: set[str] = set()
+            queue: deque[str] = deque([start])
+            while queue:
+                node = queue.popleft()
+                for child in deps.get(node, set()):
+                    if child not in id_set or child in seen:
+                        continue
+                    seen.add(child)
+                    queue.append(child)
+            return seen
+
+        reach = {tid: reachable(tid) for tid in ids}
+        for i, a in enumerate(ids):
+            for b in ids[i + 1 :]:
+                if b not in reach[a] and a not in reach[b]:
+                    return False
+        return True
+
+    def _check_language_ac_alignment(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """Check 13: AC-FINAL Python-tooling lines must carry the N/A suffix on non-Python tasks.
+
+        Per docs/acceptance-criteria-canonical.md, AC-FINAL-002..005, 008,
+        and 014 apply only to Python tasks. Non-Python tasks must append
+        ``-- N/A for <tier> Tasks (no <language> source authored)`` so
+        reviewers do not enforce inapplicable checks.
+        """
+        from devbench.backlog.manifest import ManifestParseError, parse_manifest
+
+        for row_id, _, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not file_path_str or not self._is_task_id(row_id):
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.exists():
+                continue
+            content = wu_path.read_text(encoding="utf-8")
+            try:
+                paths = [m.file for m in parse_manifest(content)]
+            except ManifestParseError:
+                continue
+            tier = self._classify_manifest_tier(paths)
+            if tier in ("", "Python", "Mixed"):
+                # Mixed tasks have at least one .py file -> Python ACs apply
+                # to that subset; do not emit warnings.
+                continue
+
+            # Walk AC-FINAL lines; for each Python-tier AC ID, require the
+            # N/A suffix unless the line is missing entirely (handled by
+            # other rules).
+            for line in content.splitlines():
+                stripped = line.strip()
+                if not stripped.startswith("- ["):
+                    continue
+                m = re.match(r"^- \[[ x]\] (AC-FINAL-\d{3})\b", stripped)
+                if not m:
+                    continue
+                ac_id = m.group(1)
+                if ac_id not in self._AC_FINAL_LANGUAGE_TIER_IDS:
+                    continue
+                if "-- N/A" in stripped:
+                    continue
+                errors.append(
+                    f"{row_id}: {ac_id} requires the N/A suffix on "
+                    f"{tier}-tier task (no Python source in Manifest). "
+                    f"Append '-- N/A for {tier} Tasks (no Python source authored)' "
+                    f"per docs/acceptance-criteria-canonical.md."
+                )
+
+    def _check_source_test_pairs(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """Check 14: every production-source .py file in a Manifest needs a matching test entry.
+
+        Per docs/source-test-atomicity.md, splitting source and test across
+        sibling tasks causes AC-FINAL-014 (100% coverage) to fail in the
+        source-authoring task. The rule ensures the test pair is in the
+        same Manifest.
+        """
+        from devbench.backlog.manifest import ManifestParseError, parse_manifest
+
+        for row_id, _, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not file_path_str or not self._is_task_id(row_id):
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.exists():
+                continue
+            content = wu_path.read_text(encoding="utf-8")
+            try:
+                paths = [m.file for m in parse_manifest(content)]
+            except ManifestParseError:
+                continue
+            for source_path in paths:
+                if not self._is_production_source(source_path):
+                    continue
+                source_stem = self._source_stem_for_pair_match(source_path)
+                if not source_stem:
+                    continue
+                # A test pair is any `test_*.py` (or `*_test.py`) entry in the
+                # SAME Manifest whose basename contains the source stem as a
+                # substring. This accepts project naming conventions such as
+                # `test_telemetry_event.py` for `event.py`, while still
+                # catching the split-Manifest anti-pattern (where the test
+                # file lives in a sibling task's Manifest entirely).
+                has_pair = any(self._test_filename_pairs_with_stem(p, source_stem) for p in paths)
+                if not has_pair:
+                    errors.append(
+                        f"{row_id}: production source {source_path!r} has no "
+                        f"matching test in the same Manifest "
+                        f"(expected a test_*.py whose basename contains "
+                        f"{source_stem!r}, e.g., tests/unit/test_{source_stem}.py). "
+                        f"Add the test entry per docs/source-test-atomicity.md."
+                    )
+
+    # ------------------------------------------------------------------
+    # E209: Backlog-Contract Alignment hardening rules
+    # ------------------------------------------------------------------
+
+    _REQUIRED_TASK_SECTIONS: ClassVar[tuple[str, ...]] = ("Status", "Dependencies", "Changes Manifest")
+    # Accepts the canonical Epic shape ``E\d+`` plus the test-harness
+    # convention ``EX``. Anything else (a free-text dep, a typo) fails
+    # the rule. Mirrors the ``EPIC_ID_RE`` shape in constants.py while
+    # adding the optional Feature/Story/Task suffixes.
+    _DEP_ID_PATTERN: ClassVar[re.Pattern[str]] = re.compile(r"^E[A-Z0-9]+(-F\d+)?(-S\d+)?(-T\d+)?$")
+
+    def _check_required_sections(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """Check 15: every Task work-unit file declares Status, Dependencies, and Changes Manifest.
+
+        Epic, Feature, and Story rows are exempt (their bodies are
+        scaffolding -- a Manifest does not apply). Tasks that miss any
+        required section receive an explicit error naming the section,
+        so authors know exactly what to add.
+        """
+        for row_id, _, file_path_str in rows:
+            if not row_id or row_id.startswith("-"):
+                continue
+            if not self._is_task_id(row_id):
+                continue
+            if not file_path_str:
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.is_file():
+                continue
+            content = wu_path.read_text(encoding="utf-8")
+            sections = self._extract_sections(content)
+            for required in self._REQUIRED_TASK_SECTIONS:
+                if required not in sections:
+                    errors.append(
+                        f"{row_id}: missing required section '## {required}'. "
+                        f"Add the section per docs/backlog-contract.md."
+                    )
+
+    def _check_status_enum(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """Check 16: every parsed ``## Status:`` value is in ``VALID_STATUSES``.
+
+        The CLI's ``set-status`` and ``mark-*`` helpers reject invalid
+        values at write time, but a hand-edited file can drift; this
+        check catches the drift at validate-backlog time so the
+        orchestrator never sees a bad status mid-run.
+        """
+        for row_id, _, file_path_str in rows:
+            if not row_id or row_id.startswith("-"):
+                continue
+            if not file_path_str:
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.is_file():
+                continue
+            content = wu_path.read_text(encoding="utf-8")
+            match = STATUS_LINE_RE.search(content)
+            if match is None:
+                # Missing status line is reported by _check_files_and_statuses;
+                # don't double-report here.
+                continue
+            raw_status = match.group(2).strip().lower()
+            if raw_status not in VALID_STATUSES:
+                errors.append(
+                    f"{row_id}: invalid '## Status:' value {raw_status!r}. Allowed values: {sorted(VALID_STATUSES)}."
+                )
+
+    def _check_dep_id_format(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """Check 17: every ``## Dependencies`` row's first cell is a valid task-ID shape.
+
+        ``DEPENDENCY_NONE_VALUES`` cells (``None`` / ``-``) are skipped.
+        Header rows (``ID``, separator dashes) are skipped. Anything
+        else must match the canonical ID regex
+        ``E\\d+(-F\\d+)?(-S\\d+)?(-T\\d+)?``; mismatches produce an
+        explicit error with the offending row text so authors can fix
+        the typo.
+        """
+        for row_id, _, file_path_str in rows:
+            if not row_id or row_id.startswith("-"):
+                continue
+            if not file_path_str:
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.is_file():
+                continue
+            content = wu_path.read_text(encoding="utf-8")
+            for dep_id in self._iter_dep_ids(content):
+                if not self._DEP_ID_PATTERN.match(dep_id):
+                    errors.append(
+                        f"{row_id}: dependency ID {dep_id!r} does not match the "
+                        f"canonical task-ID regex E<n>[-F<n>][-S<n>][-T<n>]. "
+                        f"Fix the row in '## Dependencies' or remove it."
+                    )
+
+    def _check_branch_uniqueness(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """Check 18 (E219): no two Tasks derive the same branch name.
+
+        Each Task's branch is either an explicit ``- **Branch:**
+        `backlog/<id>``` line in the work-unit file or the canonical
+        ``backlog/<id-lowercase>`` derivation. A collision means two
+        Tasks would push to the same branch, breaking auto-merge and
+        producing false review failures.
+
+        Skipped entirely when single-PR mode is active (the
+        ``git_ops.single_branch`` yaml field is set), since every task
+        legitimately shares the configured branch.
+        """
+        from devbench.config import RUNTIME_CONFIG
+
+        single_branch = getattr(RUNTIME_CONFIG.git_ops, "single_branch", None)
+        if single_branch:
+            return
+        branches: dict[str, list[str]] = {}
+        for row_id, _, file_path_str in rows:
+            if not row_id or row_id.startswith("-"):
+                continue
+            if not self._is_task_id(row_id):
+                continue
+            branch = self._derive_branch_for_row(row_id, file_path_str, workspace_root)
+            branches.setdefault(branch, []).append(row_id)
+        for branch, ids in sorted(branches.items()):
+            if len(ids) > 1:
+                errors.append(
+                    f"Branch collision on {branch!r}: claimed by {sorted(ids)}. "
+                    f"Rename one of the work units (or its explicit '**Branch:**' override) "
+                    f"so each task pushes to a unique branch; see docs/backlog-contract.md "
+                    f"'Branch Uniqueness Rule'."
+                )
+
+    # Issue #117: the changes_manifest reviewer was passing work units whose
+    # Manifest still contained the placeholder row authors are supposed to
+    # replace. Catch the placeholder at validate-backlog time so the orchestrator
+    # never even claims the task; the executor cannot build atop a TBD manifest.
+    _PLACEHOLDER_MANIFEST_RE: ClassVar[re.Pattern[str]] = re.compile(r"^TBD\b", re.IGNORECASE)
+    _ACTIVE_TASK_STATUSES_FOR_PLACEHOLDER_CHECK: ClassVar[frozenset[str]] = frozenset(
+        {STATUS_IN_QUEUE, STATUS_IN_PROGRESS, STATUS_BLOCKED}
+    )
+
+    def _check_no_placeholder_manifest_rows(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """Issue #117: reject work units whose Manifest still contains a TBD row.
+
+        The canonical placeholder reads ``TBD | Executor agent: replace
+        this row with the actual files to be created or modified.`` The
+        check fires for every active Task (in-queue / in-progress /
+        blocked); ``in-review`` and terminal statuses are skipped because
+        the executor has either already amended the Manifest or the task
+        is closed.
+
+        Each offending row produces an error naming the task ID and the
+        first cell text so the operator (or the auto-amender) can fix
+        it before any agent claims the unit.
+        """
+        for row_id, status, file_path_str in rows:
+            if not row_id or row_id.startswith("-"):
+                continue
+            if not self._is_task_id(row_id):
+                continue
+            if not file_path_str:
+                continue
+            if status.lower() not in self._ACTIVE_TASK_STATUSES_FOR_PLACEHOLDER_CHECK:
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.is_file():
+                continue
+            content = wu_path.read_text(encoding="utf-8")
+            placeholder_cell = self._first_placeholder_manifest_cell(content)
+            if placeholder_cell:
+                errors.append(
+                    f"{row_id}: Changes Manifest still has placeholder row "
+                    f"{placeholder_cell!r}. Replace with real file entries before "
+                    f"claim; see docs/backlog-contract.md 'No Placeholder Rows Rule'."
+                )
+
+    @classmethod
+    def _first_placeholder_manifest_cell(cls, content: str) -> str:
+        """Return the first ``TBD`` cell in ``## Changes Manifest`` or ``""``.
+
+        Walks the Manifest table once: skips the section heading line,
+        the header row (cells like ``File`` / ``Change``), and any
+        separator row (cells starting with ``-``). The first data row
+        whose cell-1 starts with ``TBD`` (case-insensitive) is returned
+        verbatim; any other row terminates the scan.
+        """
+        in_manifest = False
+        seen_header = False
+        for raw in content.splitlines():
+            stripped = raw.strip()
+            if stripped.startswith("## "):
+                in_manifest = stripped.startswith("## Changes Manifest")
+                seen_header = False
+                continue
+            if not in_manifest or not stripped.startswith("|"):
+                continue
+            cells = [c.strip() for c in stripped.split("|")]
+            cell = cells[1]
+            if not cell or cell.startswith("-"):
+                continue
+            if not seen_header:
+                # First non-separator row is the header; skip it.
+                seen_header = True
+                continue
+            if cls._PLACEHOLDER_MANIFEST_RE.match(cell):
+                return cell
+        return ""
+
+    # Rule 20: orphan path tokens in AC / DoD. The Manifest is the single
+    # source of truth for files a Task produces; AC / DoD that restate
+    # paths is redundancy that drifts. The check is gated by
+    # ``RUNTIME_CONFIG.validate.check_orphan_path_tokens`` so existing
+    # backlogs see no behaviour change until they opt in.
+    #
+    # Token regex: a single-backtick group whose body has no whitespace.
+    # The optional second group captures a trailing `` (ref)`` marker --
+    # an inline escape hatch declaring the token a read-only reference
+    # (e.g. an external config file the Task reads but does not modify).
+    _ORPHAN_TOKEN_RE: ClassVar[re.Pattern[str]] = re.compile(r"`([^`\s]+)`(\s*\(ref\))?")
+    _ORPHAN_PATH_EXTS: ClassVar[tuple[str, ...]] = (
+        ".md",
+        ".py",
+        ".ts",
+        ".tsx",
+        ".js",
+        ".jsx",
+        ".go",
+        ".java",
+        ".kt",
+        ".rb",
+        ".rs",
+        ".swift",
+        ".cpp",
+        ".c",
+        ".h",
+        ".hpp",
+        ".yaml",
+        ".yml",
+        ".toml",
+        ".json",
+        ".xml",
+        ".tf",
+        ".tfvars",
+        ".hcl",
+        ".sh",
+        ".dockerfile",
+        ".html",
+        ".css",
+        ".scss",
+        ".sql",
+    )
+    _ORPHAN_KNOWN_PREFIXES: ClassVar[tuple[str, ...]] = (
+        "src/",
+        "tests/",
+        "test/",
+        "infra/",
+        "docs/",
+        "backlog/",
+        "config/",
+    )
+
+    @classmethod
+    def _is_path_shaped(cls, token: str, manifest_dir_prefixes: set[str]) -> bool:
+        """Return ``True`` if ``token`` looks like a single-file path reference.
+
+        Excludes shell flags, key=value forms, glob patterns, URL-scheme
+        tokens, and tokens with no path-like marker. Includes tokens
+        ending in a known extension, starting with a built-in directory
+        prefix, or starting with a directory prefix observed anywhere in
+        the Task's parsed Manifest. Uses no domain knowledge -- the
+        prefix and extension lists are static.
+        """
+        if not token or token.startswith("-") or "=" in token or "*" in token or "://" in token:
+            return False
+        lower = token.lower()
+        if any(lower.endswith(ext) for ext in cls._ORPHAN_PATH_EXTS):
+            return True
+        if any(token.startswith(p) for p in cls._ORPHAN_KNOWN_PREFIXES):
+            return True
+        return any(token.startswith(prefix) for prefix in manifest_dir_prefixes)
+
+    @staticmethod
+    def _normalise_orphan_path(token: str, checkout_dir: str | None) -> str:
+        """Strip leading ``./``, optional ``checkout_dir/`` prefix, and trailing ``/``.
+
+        Mirrors the normalisation rule 11 applies to Manifest paths so
+        AC / DoD tokens authored with the prefix still match Manifest
+        entries that the prefix-rule fixer stripped.
+        """
+        s = token
+        if s.startswith("./"):
+            s = s[2:]
+        if checkout_dir:
+            prefix = checkout_dir.rstrip("/") + "/"
+            if s.startswith(prefix):
+                s = s[len(prefix) :]
+        return s.rstrip("/")
+
+    @classmethod
+    def _iter_orphan_candidates(cls, section_body: str) -> "list[tuple[str, bool]]":
+        """Yield ``(token, has_ref_marker)`` for every backtick-quoted no-whitespace token.
+
+        Does not filter for path-shape -- the caller decides which tokens
+        are path-shaped relative to the Task's Manifest. The boolean is
+        ``True`` when the token is immediately followed by ``(ref)``,
+        signalling the inline read-only escape hatch.
+        """
+        out: list[tuple[str, bool]] = []
+        for match in cls._ORPHAN_TOKEN_RE.finditer(section_body):
+            token = match.group(1)
+            has_ref = match.group(2) is not None
+            out.append((token, has_ref))
+        return out
+
+    def _check_no_orphan_path_tokens(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """Rule 20: AC / DoD must not name paths that are absent from the Changes Manifest.
+
+        For every Task work-unit (Stories/Features/Epics short-circuit;
+        they have no Manifest), extract the ``## Acceptance Criteria``
+        and ``## Definition of Done`` section bodies and walk every
+        backtick-quoted no-whitespace token. If a token is path-shaped
+        (per ``_is_path_shaped``) and is not present in the Task's
+        parsed Manifest after normalisation -- and is not declared
+        read-only via the inline ``(ref)`` marker -- emit an integrity
+        error.
+
+        Gated by ``RUNTIME_CONFIG.validate.check_orphan_path_tokens``;
+        returns immediately when the flag is ``False`` (the default),
+        so this rule is invisible to backlogs that have not opted in.
+        """
+        from devbench.config import RUNTIME_CONFIG
+
+        if not getattr(RUNTIME_CONFIG.validate, "check_orphan_path_tokens", False):
+            return
+
+        for row_id, _, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not file_path_str or not self._is_task_id(row_id):
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.is_file():
+                continue
+            self._check_one_task_orphan_paths(row_id, wu_path, errors)
+
+    def _check_one_task_orphan_paths(
+        self,
+        row_id: str,
+        wu_path: Path,
+        errors: list[str],
+    ) -> None:
+        """Per-task body for ``_check_no_orphan_path_tokens``."""
+        from devbench.backlog.manifest import ManifestParseError, parse_manifest
+        from devbench.config import RUNTIME_CONFIG
+
+        content = wu_path.read_text(encoding="utf-8")
+        try:
+            manifest_rows = parse_manifest(content)
+        except ManifestParseError:
+            # Already reported by other rules; skip this task quietly.
+            return
+
+        repo = self._extract_repo(content)
+        checkout_dir: str | None = None
+        if repo is not None and repo in RUNTIME_CONFIG.repos:
+            checkout_dir = RUNTIME_CONFIG.repos[repo].checkout_directory
+
+        manifest_paths = {
+            self._normalise_orphan_path(r.file, checkout_dir)
+            for r in manifest_rows
+            if self._is_real_manifest_path(r.file)
+        }
+        manifest_dir_prefixes = {p.split("/", 1)[0] + "/" for p in manifest_paths if "/" in p}
+
+        sections = self._extract_sections(content)
+        for section_name in ("Acceptance Criteria", "Definition of Done"):
+            body = sections.get(section_name, "")
+            if not body:
+                continue
+            for token, has_ref in self._iter_orphan_candidates(body):
+                if has_ref or not self._is_path_shaped(token, manifest_dir_prefixes):
+                    continue
+                normalised = self._normalise_orphan_path(token, checkout_dir)
+                if normalised in manifest_paths:
+                    continue
+                errors.append(
+                    f"{row_id}: orphan path {token!r} in '## {section_name}' "
+                    f"not in Changes Manifest. Either add the path to the "
+                    f"Manifest, rewrite the AC/DoD line behaviourally "
+                    f"(reference the Manifest symbolically), or suffix the "
+                    f"token with ' (ref)' to declare it a read-only "
+                    f"reference. See docs/backlog-contract.md "
+                    f"'No Orphan Path Tokens Rule'."
+                )
+
+    @staticmethod
+    def _derive_branch_for_row(unit_id: str, file_path_str: str, workspace_root: Path) -> str:
+        """Resolve the branch name a Task row would push to.
+
+        Mirrors ``BacklogParser._parse_branch``: prefer an explicit
+        ``- **Branch:** \\`<name>\\``` line in the work-unit file; fall
+        back to the canonical lowercase-ID template when the explicit
+        line is absent or unreadable.
+        """
+        if file_path_str:
+            wu_path = workspace_root / file_path_str
+            if wu_path.is_file():
+                content = wu_path.read_text(encoding="utf-8")
+                explicit = re.search(r"-\s+\*?\*?Branch:?\*?\*?\s*`([^`]+)`", content)
+                if explicit:
+                    return explicit.group(1).strip()
+        return f"backlog/{unit_id.lower()}"
+
+    @classmethod
+    def _iter_dep_ids(cls, content: str) -> list[str]:
+        """Yield every dep-ID candidate in a work-unit's ``## Dependencies`` table.
+
+        Returns the list of cell-1 strings (after stripping). Header
+        rows, separator rows, and ``DEPENDENCY_NONE_VALUES`` cells are
+        excluded. Comma-separated tokens within a single cell are
+        split so ``| E1, E2 |`` yields two candidates. Mirrors the
+        parsing rules used by the runtime ``_extract_dep_ids`` helper
+        but exposed for the format-check rule.
+        """
+        deps: list[str] = []
+        in_deps = False
+        for raw in content.splitlines():
+            stripped = raw.strip()
+            if stripped.startswith("## "):
+                in_deps = stripped.startswith("## Dependencies")
+                continue
+            if not in_deps or not stripped.startswith("|"):
+                continue
+            cells = [c.strip() for c in stripped.split("|")]
+            cell = cells[1]
+            if not cell or cell.lower() == "id" or cell.startswith("-"):
+                continue
+            if cell in DEPENDENCY_NONE_VALUES:
+                continue
+            for raw_token in cell.split(","):
+                token = raw_token.strip()
+                if token:
+                    deps.append(token)
+        return deps
+
+    @staticmethod
+    def _source_stem_for_pair_match(source_path: str) -> str:
+        """Return the basename stem (without ``.py``) for source-test pairing.
+
+        Returns ``""`` for ``__init__.py`` and non-Python paths so callers
+        can skip the pairing check on packaging-only entries.
+        """
+        base = source_path.rsplit("/", 1)[-1]
+        if base == "__init__.py" or not base.endswith(".py"):
+            return ""
+        return base[:-3]
+
+    @staticmethod
+    def _test_filename_pairs_with_stem(path: str, source_stem: str) -> bool:
+        """Return True if ``path`` is a test file whose basename references ``source_stem``.
+
+        Accepts both ``test_<...>.py`` and ``<...>_test.py`` patterns and
+        requires ``source_stem`` to appear as a substring of the basename
+        (minus extension and any ``test_`` / ``_test`` framing).
+        """
+        base = path.rsplit("/", 1)[-1]
+        if not base.endswith(".py") or base == "__init__.py":
+            return False
+        stem = base[:-3]
+        if stem.startswith("test_"):
+            inner = stem[len("test_") :]
+        elif stem.endswith("_test"):
+            inner = stem[: -len("_test")]
+        else:
+            return False
+        return source_stem in inner.split("_") or source_stem in inner
 
     @staticmethod
     def _extract_repo(content: str) -> str | None:

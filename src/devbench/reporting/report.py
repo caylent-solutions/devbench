@@ -43,7 +43,9 @@ from __future__ import annotations
 
 import json as _json
 import logging
+import os
 import re
+import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, tzinfo
 from itertools import pairwise
@@ -60,10 +62,14 @@ from devbench.config import (
     REPORT_CACHE_READ_MULTIPLIER,
     REPORT_CACHE_WRITE_1HR_MULTIPLIER,
     REPORT_CACHE_WRITE_5MIN_MULTIPLIER,
+    REPORT_DATA_RESIDENCY_MULTIPLIER,
     REPORT_DISPLAY_TIMEZONE,
+    REPORT_FAST_MODE_MULTIPLIER,
+    STOP_HOOK_WINDOW_SECONDS,
     TOKEN_COST_DISCOUNT,
     TOKEN_COST_PER_M_INPUT,
     TOKEN_COST_PER_M_OUTPUT,
+    WORKSPACE_ROOT,
 )
 from devbench.constants import (
     DEFAULT_SESSION_GAP_MINUTES,
@@ -76,6 +82,7 @@ from devbench.constants import (
     SIDE_BY_SIDE_GAP_CHARS,
     TOKENS_PER_MILLION,
 )
+from devbench.reporting.event_index import EventIndex
 
 _log = logging.getLogger("devbench.reporting.report")
 
@@ -105,8 +112,26 @@ class HookLogTotals:
     cache_write_5m_tokens: int = 0
     cache_write_1h_tokens: int = 0
     entries_with_usage: int = 0
-    entries_us_geo: int = 0  # counted for display; per-call multipliers deferred
+    entries_us_geo: int = 0
     entries_fast_mode: int = 0
+    # Token volumes from entries flagged with ``inference_geo`` (data-residency
+    # premium, issue #124). Tracked separately so ``_compute_cost`` can apply
+    # ``report.data_residency_multiplier`` (default 1.10 from
+    # DEFAULT_DATA_RESIDENCY_MULTIPLIER) only to the residency-restricted
+    # subset of the token volume, not the full aggregate.
+    us_only_input_tokens: int = 0
+    us_only_output_tokens: int = 0
+    us_only_cache_read_tokens: int = 0
+    us_only_cache_write_5m_tokens: int = 0
+    us_only_cache_write_1h_tokens: int = 0
+    # Token volumes from entries with ``usage.speed == 'fast'`` (fast-mode
+    # premium, issue #124). Same per-subset accounting; multiplied by
+    # ``report.fast_mode_multiplier`` (default 6.0).
+    fast_input_tokens: int = 0
+    fast_output_tokens: int = 0
+    fast_cache_read_tokens: int = 0
+    fast_cache_write_5m_tokens: int = 0
+    fast_cache_write_1h_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -152,6 +177,11 @@ class WindowStats:
     # zero / unknown (no pace data yet). Stored in UTC; the renderer converts
     # to the resolved display timezone.
     est_completion_at: datetime | None = None
+    # Issue #157: ETA breakdown so the renderer can print
+    # ``~5.4 h (active 4 + blocked-recovery 60 + blocked-auto 27 at 5.6 min/task)``.
+    eta_active: int = 0
+    eta_blocked_recovery: int = 0
+    eta_blocked_auto: int = 0
 
     @property
     def total_tokens(self) -> int:
@@ -205,6 +235,13 @@ def _find_current_session_start(
     ``gap_minutes`` between consecutive non-noise entries marks the start of
     the current session. If no gap exceeds the threshold, the session start
     is the earliest non-noise entry.
+
+    Issue #162: an indexed equivalent
+    (``_find_current_session_start_from_index``) is preferred by
+    ``generate_report``; this string-input form is kept because the
+    existing test suite calls it directly with crafted log payloads
+    and because the parity tests use both forms to assert that the
+    indexed path produces the same boundary as the parser path.
     """
     events: list[datetime] = []
     for m in _LOG_LINE_RE.finditer(log_text):
@@ -213,9 +250,45 @@ def _find_current_session_start(
             continue
         events.append(_parse_ts(m.group(1)))
 
+    return _walk_for_session_boundary(events, gap_minutes)
+
+
+def _find_current_session_start_from_index(
+    event_index: EventIndex,
+    log_path: Path,
+    gap_minutes: int = DEFAULT_SESSION_GAP_MINUTES,
+    *,
+    workspace_root: Path | None = None,
+) -> datetime | None:
+    """Indexed equivalent of ``_find_current_session_start`` (issue #162 Phase 1+4).
+
+    Same gap-walking logic; the difference is that the timestamps come
+    from indexed SQL queries instead of a regex full-scan of the whole
+    log file. The boundary semantics are identical -- the parity test
+    ``TestParityAgainstParserPath::test_session_boundary_matches_parser``
+    pins this.
+
+    Issue #168: when ``workspace_root`` is provided, the timestamps are
+    pulled from the union of orch-log shards + live log so post-Phase-3-
+    migration workspaces detect the session boundary across the merged
+    history. When ``workspace_root`` is None (legacy callers / tests),
+    the single-file query path runs unchanged.
+    """
+    if workspace_root is not None:
+        events = event_index.non_noise_log_timestamps_for_workspace(workspace_root, log_path, LOG_NOISE_LOGGER_NAME)
+    else:
+        events = event_index.non_noise_log_timestamps(log_path, LOG_NOISE_LOGGER_NAME)
+    return _walk_for_session_boundary(events, gap_minutes)
+
+
+def _walk_for_session_boundary(events: list[datetime], gap_minutes: int) -> datetime | None:
+    """Run the gap-walk used by both the parser and indexed session detectors.
+
+    Centralised so the two callers cannot drift; the gap rule and the
+    "no events -> None" semantic live in exactly one place.
+    """
     if not events:
         return None
-
     threshold = timedelta(minutes=gap_minutes)
     session_start = events[0]
     for prev, curr in pairwise(events):
@@ -240,6 +313,16 @@ def _empty_totals_acc() -> dict[str, int]:
         "entries_with_usage": 0,
         "entries_us_geo": 0,
         "entries_fast_mode": 0,
+        "us_only_input_tokens": 0,
+        "us_only_output_tokens": 0,
+        "us_only_cache_read_tokens": 0,
+        "us_only_cache_write_5m_tokens": 0,
+        "us_only_cache_write_1h_tokens": 0,
+        "fast_input_tokens": 0,
+        "fast_output_tokens": 0,
+        "fast_cache_read_tokens": 0,
+        "fast_cache_write_5m_tokens": 0,
+        "fast_cache_write_1h_tokens": 0,
     }
 
 
@@ -254,22 +337,43 @@ def _extract_usage_totals(usage: object, totals_acc: dict[str, int]) -> bool:
     if not isinstance(usage, dict):
         return False
 
-    totals_acc["input_tokens"] += int(usage.get("input_tokens") or 0)
-    totals_acc["output_tokens"] += int(usage.get("output_tokens") or 0)
-    totals_acc["cache_read_tokens"] += int(usage.get("cache_read_input_tokens") or 0)
-
+    in_t = int(usage.get("input_tokens") or 0)
+    out_t = int(usage.get("output_tokens") or 0)
+    read_t = int(usage.get("cache_read_input_tokens") or 0)
     cc = usage.get("cache_creation")
     if isinstance(cc, dict):
-        totals_acc["cache_write_5m_tokens"] += int(cc.get("ephemeral_5m_input_tokens") or 0)
-        totals_acc["cache_write_1h_tokens"] += int(cc.get("ephemeral_1h_input_tokens") or 0)
+        write_5m_t = int(cc.get("ephemeral_5m_input_tokens") or 0)
+        write_1h_t = int(cc.get("ephemeral_1h_input_tokens") or 0)
     else:
         # Older format / fallback: all cache writes counted as 5-min.
-        totals_acc["cache_write_5m_tokens"] += int(usage.get("cache_creation_input_tokens") or 0)
+        write_5m_t = int(usage.get("cache_creation_input_tokens") or 0)
+        write_1h_t = 0
 
-    if usage.get("inference_geo"):
+    totals_acc["input_tokens"] += in_t
+    totals_acc["output_tokens"] += out_t
+    totals_acc["cache_read_tokens"] += read_t
+    totals_acc["cache_write_5m_tokens"] += write_5m_t
+    totals_acc["cache_write_1h_tokens"] += write_1h_t
+
+    # Per-subset token tallies for the data-residency and fast-mode premium
+    # multipliers (issue #124). Tracked per-call so the multipliers apply
+    # only to the affected token volume, not the full aggregate.
+    is_us_only = bool(usage.get("inference_geo"))
+    is_fast = usage.get("speed") == "fast"
+    if is_us_only:
         totals_acc["entries_us_geo"] += 1
-    if usage.get("speed") == "fast":
+        totals_acc["us_only_input_tokens"] += in_t
+        totals_acc["us_only_output_tokens"] += out_t
+        totals_acc["us_only_cache_read_tokens"] += read_t
+        totals_acc["us_only_cache_write_5m_tokens"] += write_5m_t
+        totals_acc["us_only_cache_write_1h_tokens"] += write_1h_t
+    if is_fast:
         totals_acc["entries_fast_mode"] += 1
+        totals_acc["fast_input_tokens"] += in_t
+        totals_acc["fast_output_tokens"] += out_t
+        totals_acc["fast_cache_read_tokens"] += read_t
+        totals_acc["fast_cache_write_5m_tokens"] += write_5m_t
+        totals_acc["fast_cache_write_1h_tokens"] += write_1h_t
 
     return True
 
@@ -280,6 +384,21 @@ def _hook_log_path(log_path: Path) -> Path:
     if candidate.is_file():
         return candidate
     return BACKLOG_INDEX.parent / "hook-logs.jsonl"
+
+
+def _resolve_transcript_dir(event_index: EventIndex, hook_log_path: Path) -> Path | None:
+    """Issue #162 Phase 1+4: resolve transcript dir via the cache, falling back to file scan.
+
+    The hook-log cache stores ``transcript_path`` for every entry that
+    carries one, so the resolver becomes a single SELECT instead of a
+    re-read of the hook log every invocation. The fallback path
+    triggers only when the cache is empty (first run on this workspace);
+    after that one-time scan the index serves the answer.
+    """
+    cached = event_index.first_hook_transcript_path(hook_log_path)
+    if cached:
+        return Path(cached).parent
+    return _discover_transcript_dir(hook_log_path)
 
 
 def _discover_transcript_dir(hook_log_path: Path) -> Path | None:
@@ -304,10 +423,27 @@ def _discover_transcript_dir(hook_log_path: Path) -> Path | None:
     return None
 
 
-def _accumulate_transcript_message(message: object, totals_acc: dict[str, int]) -> None:
-    """Fold one transcript message's usage into the totals accumulator."""
+def _accumulate_transcript_message(
+    message: object, totals_acc: dict[str, int], seen_ids: set[str] | None = None
+) -> None:
+    """Fold one transcript message's usage into the totals accumulator.
+
+    When ``seen_ids`` is supplied, messages whose ``id`` has already been
+    accumulated are skipped. This is the dedup gate for issue #169: Claude
+    Code copies prior assistant messages (with their ``usage`` blocks) into
+    resumed/forked session transcripts, so summing every ``*.jsonl`` in a
+    transcript directory double-counts every message that crossed a resume.
+    Messages without a stable ``id`` still accumulate -- the dedup is opt-in
+    on the presence of the id rather than enforced absence.
+    """
     if not isinstance(message, dict):
         return
+    if seen_ids is not None:
+        msg_id = message.get("id")
+        if isinstance(msg_id, str) and msg_id:
+            if msg_id in seen_ids:
+                return
+            seen_ids.add(msg_id)
     usage = message.get("usage")
     if _extract_usage_totals(usage, totals_acc):
         totals_acc["entries_with_usage"] += 1
@@ -322,11 +458,17 @@ def _parse_transcript_metrics(transcript_dir: Path | None, window_start: datetim
     ``window_start``. This captures the OUTER orchestrator session's per-turn
     LLM cost, which hook-logs.jsonl misses (hook-logs only captures Agent
     subagent invocations).
+
+    Issue #169: dedups by ``message.id`` across all files in the directory.
+    Resumed Claude Code sessions copy prior assistant messages forward, so
+    the same logical message appears in N files; without dedup that's N-fold
+    over-count of token usage and cost.
     """
     totals_acc: dict[str, int] = _empty_totals_acc()
     if transcript_dir is None or not transcript_dir.is_dir():
         return HookLogTotals(**totals_acc)
 
+    seen_ids: set[str] = set()
     for transcript_file in sorted(transcript_dir.glob("*.jsonl")):
         for line in transcript_file.read_text(encoding="utf-8").splitlines():
             if not line.strip():
@@ -337,9 +479,64 @@ def _parse_transcript_metrics(transcript_dir: Path | None, window_start: datetim
                 continue
             if not _entry_in_window(entry, window_start):
                 continue
-            _accumulate_transcript_message(entry.get("message"), totals_acc)
+            _accumulate_transcript_message(entry.get("message"), totals_acc, seen_ids)
 
     return HookLogTotals(**totals_acc)
+
+
+_ROLE_ORCHESTRATOR = "orchestrator"
+
+
+def _role_for_entry(entry: dict) -> str:
+    """Return the per-role bucket for one transcript entry (issue #123).
+
+    Each Claude Code transcript message carries an ``attributionAgent`` field
+    naming the active agent (e.g. ``"devbench:executor"``,
+    ``"devbench:code-reviewer"``). Messages emitted by the outer orchestrator
+    loop have no attributionAgent and are bucketed as ``orchestrator``.
+    Subagent attributions are stripped of the ``devbench:`` prefix and
+    normalised to underscores so the buckets match the canonical role names
+    used elsewhere (e.g. ``executor``, ``code_review``).
+    """
+    raw = entry.get("attributionAgent")
+    if not isinstance(raw, str) or not raw:
+        return _ROLE_ORCHESTRATOR
+    # Strip plugin prefix (``devbench:``) and normalise dashes to underscores.
+    # ``code-reviewer`` -> ``code_review`` (matches REVIEW_JUDGE_NAMES).
+    base = raw.split(":", 1)[1] if ":" in raw else raw
+    return base.replace("-reviewer", "_review").replace("-", "_")
+
+
+def _parse_transcript_metrics_by_role(transcript_dir: Path | None, window_start: datetime) -> dict[str, HookLogTotals]:
+    """Like ``_parse_transcript_metrics`` but bucketed per agent role (issue #123).
+
+    Returns a dict mapping role name -> HookLogTotals. The summed totals
+    across all roles equal what ``_parse_transcript_metrics`` returns; the
+    aggregate-row contract is asserted in the regression test.
+
+    Issue #169: dedups by ``message.id`` across all files in the directory.
+    The dedup set is shared across roles so the per-role buckets sum to the
+    same deduped aggregate that ``_parse_transcript_metrics`` returns.
+    """
+    if transcript_dir is None or not transcript_dir.is_dir():
+        return {}
+
+    seen_ids: set[str] = set()
+    by_role: dict[str, dict[str, int]] = {}
+    for transcript_file in sorted(transcript_dir.glob("*.jsonl")):
+        for line in transcript_file.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                entry = _json.loads(line)
+            except _json.JSONDecodeError:
+                continue
+            if not _entry_in_window(entry, window_start):
+                continue
+            role = _role_for_entry(entry)
+            acc = by_role.setdefault(role, _empty_totals_acc())
+            _accumulate_transcript_message(entry.get("message"), acc, seen_ids)
+    return {role: HookLogTotals(**acc) for role, acc in by_role.items()}
 
 
 def _combine_totals(a: HookLogTotals, b: HookLogTotals) -> HookLogTotals:
@@ -354,6 +551,16 @@ def _combine_totals(a: HookLogTotals, b: HookLogTotals) -> HookLogTotals:
         entries_with_usage=a.entries_with_usage + b.entries_with_usage,
         entries_us_geo=a.entries_us_geo + b.entries_us_geo,
         entries_fast_mode=a.entries_fast_mode + b.entries_fast_mode,
+        us_only_input_tokens=a.us_only_input_tokens + b.us_only_input_tokens,
+        us_only_output_tokens=a.us_only_output_tokens + b.us_only_output_tokens,
+        us_only_cache_read_tokens=a.us_only_cache_read_tokens + b.us_only_cache_read_tokens,
+        us_only_cache_write_5m_tokens=a.us_only_cache_write_5m_tokens + b.us_only_cache_write_5m_tokens,
+        us_only_cache_write_1h_tokens=a.us_only_cache_write_1h_tokens + b.us_only_cache_write_1h_tokens,
+        fast_input_tokens=a.fast_input_tokens + b.fast_input_tokens,
+        fast_output_tokens=a.fast_output_tokens + b.fast_output_tokens,
+        fast_cache_read_tokens=a.fast_cache_read_tokens + b.fast_cache_read_tokens,
+        fast_cache_write_5m_tokens=a.fast_cache_write_5m_tokens + b.fast_cache_write_5m_tokens,
+        fast_cache_write_1h_tokens=a.fast_cache_write_1h_tokens + b.fast_cache_write_1h_tokens,
     )
 
 
@@ -416,26 +623,88 @@ def _compute_cost(
     cache_read_mult: float,
     cache_5m_mult: float,
     cache_1h_mult: float,
+    *,
+    data_residency_multiplier: float = 1.0,
+    fast_mode_multiplier: float = 1.0,
 ) -> CostBreakdown:
     """Compute per-token-type cost subtotals and the rolled-up total. Pure function.
 
     Cost is always computed from real per-token-type counts. No blended rate,
     no estimated input/output ratio -- if an LLM call didn't record ``usage``,
     it contributes zero cost (and an audit-visible gap in ``entries_with_usage``).
-    """
-    input_cost = totals.input_tokens * input_rate / TOKENS_PER_MILLION
-    output_cost = totals.output_tokens * output_rate / TOKENS_PER_MILLION
-    cache_read_cost = totals.cache_read_tokens * input_rate * cache_read_mult / TOKENS_PER_MILLION
-    cache_write_5m_cost = totals.cache_write_5m_tokens * input_rate * cache_5m_mult / TOKENS_PER_MILLION
-    cache_write_1h_cost = totals.cache_write_1h_tokens * input_rate * cache_1h_mult / TOKENS_PER_MILLION
 
-    total = input_cost + output_cost + cache_read_cost + cache_write_5m_cost + cache_write_1h_cost
+    Issue #124: ``data_residency_multiplier`` (default 1.0 = no boost) is
+    applied to the residency-flagged subset (``us_only_*_tokens``) AFTER the
+    cache scaling and BEFORE the discount. ``fast_mode_multiplier`` (default
+    1.0 = no boost) is applied identically to the fast-mode subset
+    (``fast_*_tokens``). Each multiplier composes with the cache + base-rate
+    multipliers per AC-FUNC-003. Discount composition is handled by the
+    caller (``apply_discount`` runs on the final total).
+
+    The premium cost contributions are added to the per-token-type buckets
+    (``input_cost`` etc.) so the breakdown row totals still sum to
+    ``total_cost`` for the existing aggregate-row contract.
+    """
+
+    def _bucket_cost(
+        in_t: int, out_t: int, read_t: int, w5_t: int, w1_t: int
+    ) -> tuple[float, float, float, float, float]:
+        return (
+            in_t * input_rate / TOKENS_PER_MILLION,
+            out_t * output_rate / TOKENS_PER_MILLION,
+            read_t * input_rate * cache_read_mult / TOKENS_PER_MILLION,
+            w5_t * input_rate * cache_5m_mult / TOKENS_PER_MILLION,
+            w1_t * input_rate * cache_1h_mult / TOKENS_PER_MILLION,
+        )
+
+    in_c, out_c, read_c, w5_c, w1_c = _bucket_cost(
+        totals.input_tokens,
+        totals.output_tokens,
+        totals.cache_read_tokens,
+        totals.cache_write_5m_tokens,
+        totals.cache_write_1h_tokens,
+    )
+
+    # Residency premium: residency-flagged tokens cost (multiplier - 1) MORE
+    # than the base. Adding to the per-bucket cost preserves the bucket-sum
+    # invariant.
+    if data_residency_multiplier != 1.0:
+        boost = data_residency_multiplier - 1.0
+        ri_c, ro_c, rr_c, rw5_c, rw1_c = _bucket_cost(
+            totals.us_only_input_tokens,
+            totals.us_only_output_tokens,
+            totals.us_only_cache_read_tokens,
+            totals.us_only_cache_write_5m_tokens,
+            totals.us_only_cache_write_1h_tokens,
+        )
+        in_c += ri_c * boost
+        out_c += ro_c * boost
+        read_c += rr_c * boost
+        w5_c += rw5_c * boost
+        w1_c += rw1_c * boost
+
+    if fast_mode_multiplier != 1.0:
+        boost = fast_mode_multiplier - 1.0
+        fi_c, fo_c, fr_c, fw5_c, fw1_c = _bucket_cost(
+            totals.fast_input_tokens,
+            totals.fast_output_tokens,
+            totals.fast_cache_read_tokens,
+            totals.fast_cache_write_5m_tokens,
+            totals.fast_cache_write_1h_tokens,
+        )
+        in_c += fi_c * boost
+        out_c += fo_c * boost
+        read_c += fr_c * boost
+        w5_c += fw5_c * boost
+        w1_c += fw1_c * boost
+
+    total = in_c + out_c + read_c + w5_c + w1_c
     return CostBreakdown(
-        input_cost=input_cost,
-        output_cost=output_cost,
-        cache_read_cost=cache_read_cost,
-        cache_write_5m_cost=cache_write_5m_cost,
-        cache_write_1h_cost=cache_write_1h_cost,
+        input_cost=in_c,
+        output_cost=out_c,
+        cache_read_cost=read_c,
+        cache_write_5m_cost=w5_c,
+        cache_write_1h_cost=w1_c,
         total_cost=total,
     )
 
@@ -467,6 +736,73 @@ def _recent_pace_minutes(
     return sum(durations) / len(durations)
 
 
+def _recent_per_task_cost(
+    log_path: Path,
+    done_times: dict[str, datetime],
+    progress_times: dict[str, datetime],
+    n: int,
+    *,
+    event_index: EventIndex | None = None,
+) -> float | None:
+    """Cost per task averaged over the most-recent ``n`` task completions, log-wide.
+
+    Issue #164: the legacy cost-projection denominator was the per-window
+    completion count, which produced different "Estimated total cost at
+    completion" numbers per column for the same physical workspace. The
+    correct denominator is a global rate -- the same approach the existing
+    ``_recent_pace_minutes`` already uses for the time projection.
+
+    Implementation: take the most-recent ``n`` task completions log-wide
+    (where each must have both a ``progress`` and a ``done`` timestamp),
+    determine the umbrella interval ``[earliest_progress, now]``, sum the
+    hook + transcript token costs across that interval, and divide by
+    ``n``. The umbrella interval is intentionally open-ended on the upper
+    side because the underlying ``aggregate_*_window`` helpers only take
+    a ``window_start`` parameter; the slight overcount of any cost that
+    falls AFTER the latest done timestamp is tolerable because (a) the
+    orchestrator is between tasks at that moment and (b) the cost still
+    belongs to the orchestrate session under measurement.
+
+    Returns None when fewer than ``n`` task completions have valid
+    progress + done pairs (callers fall back to the per-window average,
+    matching the existing ``recent_pace_minutes`` fallback contract).
+    """
+    task_done = [(tid, ts) for tid, ts in done_times.items() if "-T" in tid and tid in progress_times]
+    if len(task_done) < n:
+        return None
+    task_done.sort(key=lambda kv: kv[1], reverse=True)
+    recent_n = task_done[:n]
+    earliest_progress = min(progress_times[tid] for tid, _ in recent_n)
+
+    hook_log_path = _hook_log_path(log_path)
+    if event_index is not None:
+        transcript_dir_indexed = _resolve_transcript_dir(event_index, hook_log_path)
+        totals_hook = HookLogTotals(**event_index.aggregate_hook_window(hook_log_path, earliest_progress))
+        totals_transcript = HookLogTotals(
+            **event_index.aggregate_transcript_window(transcript_dir_indexed, earliest_progress)
+        )
+    else:
+        totals_hook = _parse_hook_log_metrics(log_path, earliest_progress)
+        transcript_dir = _discover_transcript_dir(hook_log_path)
+        totals_transcript = _parse_transcript_metrics(transcript_dir, earliest_progress)
+    totals = _combine_totals(totals_hook, totals_transcript)
+
+    rate_factor = 1.0 - TOKEN_COST_DISCOUNT
+    cost = _compute_cost(
+        totals,
+        TOKEN_COST_PER_M_INPUT * rate_factor,
+        TOKEN_COST_PER_M_OUTPUT * rate_factor,
+        REPORT_CACHE_READ_MULTIPLIER,
+        REPORT_CACHE_WRITE_5MIN_MULTIPLIER,
+        REPORT_CACHE_WRITE_1HR_MULTIPLIER,
+        data_residency_multiplier=REPORT_DATA_RESIDENCY_MULTIPLIER,
+        fast_mode_multiplier=REPORT_FAST_MODE_MULTIPLIER,
+    )
+    if n <= 0:
+        return None
+    return cost.total_cost / n
+
+
 def _compute_window_stats(
     log_path: Path,
     window_start: datetime,
@@ -474,13 +810,32 @@ def _compute_window_stats(
     done_times: dict[str, datetime],
     progress_times: dict[str, datetime],
     tasks_active: int,
+    tasks_blocked_recovery: int = 0,
+    tasks_blocked_auto: int = 0,
+    *,
+    event_index: EventIndex | None = None,
+    recent_per_task_cost: float | None = None,
+    lifetime_total_cost: float | None = None,
 ) -> WindowStats:
     """Compute all time-windowed statistics for a single window.
 
-    ``tasks_active`` is the count of non-Done tasks that the orchestrator can
-    still finish on its own (in-queue / in-progress / in-review). Blocked
-    tasks are excluded -- they need external action and have unbounded ETA, so
-    rolling them into the projection multiplier produces misleading numbers.
+    Issue #157: the ETA denominator now includes blocked tasks that
+    devbench will recover on its own -- ``tasks_blocked_recovery``
+    (AWAITING_AUTO_RECOVERY) and ``tasks_blocked_auto``
+    (AUTO_CLEARING_VIA_PROPOSAL) -- in addition to ``tasks_active``.
+    The operator-attention bucket stays excluded since those represent
+    genuine halts with unbounded ETA. When the recent-pace window has
+    fewer than ``MIN_PACE_SAMPLES`` completed tasks the pace fallback
+    path is taken; ``est_hours`` reads zero (renderer shows "n/a").
+
+    Issue #162 Phase 1+4: when ``event_index`` is supplied, hook-log
+    and transcript aggregations are served by indexed SQL range scans
+    instead of full-file re-parses. When ``event_index`` is ``None``
+    the legacy parser path runs unchanged so direct callers (the
+    existing test suite, ad-hoc invocations) keep their previous
+    behaviour. Both paths produce identical output for the same input
+    -- the parity is asserted by the regression tests in
+    ``test_event_index.py::TestParityAgainstParserPath``.
     """
     window_hours = (window_end - window_start).total_seconds() / SECONDS_PER_HOUR
 
@@ -495,29 +850,32 @@ def _compute_window_stats(
             if dur > 0:
                 task_durations.append(dur)
     pace_sample_count = len(task_durations)
-    # B3: pace from too-few samples is fragile -- display as n/a rather than
-    # projecting from a single completion. The sample count is preserved on
-    # WindowStats so the renderer can append "(N=X samples)".
     avg_minutes = sum(task_durations) / pace_sample_count if pace_sample_count >= MIN_PACE_SAMPLES else 0.0
 
-    # B4: rolling Recent pace from the last N completed tasks (log-wide,
-    # regardless of window). Used for projections so the rate metric reflects
-    # current orchestrator pace and stops drifting after dozens of completions.
     recent_pace_minutes: float | None = _recent_pace_minutes(done_times, progress_times, RECENT_PACE_TASKS)
 
-    # Use recent pace for projections when available; otherwise fall back to
-    # the window's avg_minutes (which is itself n/a for too-few samples per B3).
     pace_for_projection = recent_pace_minutes if recent_pace_minutes is not None else avg_minutes
-    est_hours = (tasks_active * pace_for_projection) / SECONDS_PER_MINUTE if pace_for_projection else 0.0
+    eta_task_count = tasks_active + tasks_blocked_recovery + tasks_blocked_auto
+    est_hours = (eta_task_count * pace_for_projection) / SECONDS_PER_MINUTE if pace_for_projection else 0.0
 
     # Combine usage from two sources, both filtered by window_start:
     #   1. hook-logs.jsonl: subagent (Agent tool) invocations -- captures executor / judge / etc costs
     #   2. Claude Code transcripts: per-turn outer-session reasoning -- captures what the orchestrate
     #      skill itself spends between Agent calls. Without these, cost can be off by 10-20x.
+    # Issue #162: when ``event_index`` is supplied the totals come from
+    # indexed SQL range-scans of the persistent cache (~ms cost). When
+    # ``event_index`` is None the legacy full-file parsers run.
     hook_log_path = _hook_log_path(log_path)
-    totals_hook = _parse_hook_log_metrics(log_path, window_start)
-    transcript_dir = _discover_transcript_dir(hook_log_path)
-    totals_transcript = _parse_transcript_metrics(transcript_dir, window_start)
+    if event_index is not None:
+        transcript_dir_indexed = _resolve_transcript_dir(event_index, hook_log_path)
+        totals_hook = HookLogTotals(**event_index.aggregate_hook_window(hook_log_path, window_start))
+        totals_transcript = HookLogTotals(
+            **event_index.aggregate_transcript_window(transcript_dir_indexed, window_start)
+        )
+    else:
+        totals_hook = _parse_hook_log_metrics(log_path, window_start)
+        transcript_dir = _discover_transcript_dir(hook_log_path)
+        totals_transcript = _parse_transcript_metrics(transcript_dir, window_start)
     totals = _combine_totals(totals_hook, totals_transcript)
     # Apply the configured token-cost discount (contract rate / correction
     # factor off list) to the base input/output rates. final = list * (1 - d).
@@ -532,6 +890,8 @@ def _compute_window_stats(
         REPORT_CACHE_READ_MULTIPLIER,
         REPORT_CACHE_WRITE_5MIN_MULTIPLIER,
         REPORT_CACHE_WRITE_1HR_MULTIPLIER,
+        data_residency_multiplier=REPORT_DATA_RESIDENCY_MULTIPLIER,
+        fast_mode_multiplier=REPORT_FAST_MODE_MULTIPLIER,
     )
 
     # Cache hit rate: cache reads / (cache reads + uncached input). Output and
@@ -547,7 +907,39 @@ def _compute_window_stats(
         + totals.cache_write_1h_tokens
     )
     tokens_per_task = total_tokens_window / tasks_in_window if tasks_in_window else 0.0
-    est_total_cost = cost.total_cost + (cost.total_cost / tasks_in_window * tasks_active if tasks_in_window else 0.0)
+    # Issue #164: cost projection now uses a GLOBAL recent-pace per-task
+    # rate (computed once log-wide by ``_recent_per_task_cost`` and passed
+    # in by the caller) instead of the window-specific ``tasks_in_window``
+    # denominator. The window-specific denominator was producing wildly
+    # different "Estimated total cost at completion" numbers per column
+    # (e.g. $13k all-time vs $42k session vs $8 this-run) for the same
+    # physical workspace; completion is one global event, not three.
+    # Fallback chain: recent-pace global rate (most accurate) ->
+    # window's own per-task average (legacy behaviour, matches the
+    # per-pace-minutes fallback path) -> zero (no data).
+    #
+    # Spanning-row follow-up: the multiplier above is global, but the
+    # ADDITIVE base ``cost.total_cost`` is window-scoped, so per-column
+    # est_total_cost values still diverged by exactly the cost-so-far
+    # delta between windows (All-time spend > Session spend > This-run
+    # spend). The render-side ``_merge_spanning_values`` collapse only
+    # fires when every column produces an identical string, so the row
+    # never collapsed in practice. Threading ``lifetime_total_cost``
+    # (the All-time cost.total_cost, computed once by ``generate_report``
+    # before any narrower window) gives every column the same additive
+    # base; the projection becomes a single global number, the spanning
+    # collapse fires, and the report expresses the underlying truth:
+    # one global completion, one cost. ``lifetime_total_cost=None``
+    # preserves the legacy formula for direct test callers that exercise
+    # ``_compute_window_stats`` in isolation.
+    if recent_per_task_cost is not None:
+        per_task_cost = recent_per_task_cost
+    elif tasks_in_window:
+        per_task_cost = cost.total_cost / tasks_in_window
+    else:
+        per_task_cost = 0.0
+    additive_base = lifetime_total_cost if lifetime_total_cost is not None else cost.total_cost
+    est_total_cost = additive_base + per_task_cost * eta_task_count
 
     api_hours = totals.total_duration_ms / MS_PER_SECOND / SECONDS_PER_HOUR
     api_efficiency = (api_hours / window_hours * PERCENT_MULTIPLIER) if window_hours > 0 else None
@@ -573,6 +965,9 @@ def _compute_window_stats(
         pace_sample_count=pace_sample_count,
         recent_pace_minutes=recent_pace_minutes,
         est_completion_at=est_completion_at,
+        eta_active=tasks_active,
+        eta_blocked_recovery=tasks_blocked_recovery,
+        eta_blocked_auto=tasks_blocked_auto,
     )
 
 
@@ -601,6 +996,163 @@ def _format_local_timestamp(dt: datetime, display_tz: tzinfo | None = None) -> s
     return converted.strftime("%Y-%m-%d %H:%M %Z")
 
 
+# ANSI color codes. Applied AFTER alignment so escape bytes never count
+# toward the visible-width math the table renderers do via len().
+_COLOR_GREEN = "\033[32m"
+_COLOR_RED_LIGHT = "\033[91m"
+_COLOR_YELLOW = "\033[33m"
+_COLOR_MAGENTA = "\033[35m"
+_COLOR_RESET = "\033[0m"
+
+# Map metric labels to ANSI color codes. The renderers wrap the entire
+# row line (borders included) so the colour visually pops while the
+# alignment stays exact.
+_ROW_COLORS: dict[str, str] = {
+    "Tasks completed": _COLOR_GREEN,
+    "Tasks completed in window": _COLOR_GREEN,
+    "Work units done (tasks + auto-rolled stories/features/epics)": _COLOR_GREEN,
+    "Stories / Features / Epics auto-rolled to done": _COLOR_GREEN,
+    "Tasks blocked": _COLOR_RED_LIGHT,
+    "Estimated cost so far": _COLOR_MAGENTA,
+}
+
+
+def _should_use_color() -> bool:
+    """Return True when ANSI colour should be emitted.
+
+    Honours the de-facto NO_COLOR convention (https://no-color.org/) and
+    only emits colour when stdout is a TTY -- pipes / log files stay
+    plain text.
+    """
+    if os.environ.get("NO_COLOR"):
+        return False
+    return sys.stdout.isatty()
+
+
+def _colorize_row(line: str, metric: str) -> str:
+    """Wrap ``line`` with the ANSI colour for ``metric`` when colour is on.
+
+    Returns the line unchanged when the metric has no colour mapping or
+    the runtime environment is not TTY-friendly.
+    """
+    color = _ROW_COLORS.get(metric)
+    if color is None or not _should_use_color():
+        return line
+    return f"{color}{line}{_COLOR_RESET}"
+
+
+def _format_duration(seconds: float) -> str:
+    """Render a wall-clock duration in human-friendly form (issue #158).
+
+    Output forms: ``42s``, ``23m``, ``1h 47m``, ``2d 3h``. Negative
+    inputs collapse to ``0s`` so a clock-skew artefact never raises.
+    """
+    s = max(0, int(seconds))
+    if s < 60:
+        return f"{s}s"
+    minutes = s // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    rem_min = minutes % 60
+    if hours < 24:
+        return f"{hours}h {rem_min}m"
+    days = hours // 24
+    rem_hours = hours % 24
+    return f"{days}d {rem_hours}h"
+
+
+_LIVENESS_TAIL_BYTES = 4096
+
+
+def _read_last_log_timestamp(log_path: Path) -> datetime | None:
+    """Tail-read the last parseable log timestamp without loading the whole file.
+
+    Reads at most the trailing ``_LIVENESS_TAIL_BYTES`` of ``log_path`` and
+    returns the parsed timestamp of the last log line in that window.
+    Returns ``None`` when the file is missing, empty, or contains no
+    parseable log line in the tail window.
+    """
+    if not log_path.is_file():
+        return None
+    try:
+        size = log_path.stat().st_size
+    except OSError:
+        return None
+    if size == 0:
+        return None
+    try:
+        with log_path.open("rb") as f:
+            if size > _LIVENESS_TAIL_BYTES:
+                f.seek(-_LIVENESS_TAIL_BYTES, os.SEEK_END)
+            tail = f.read()
+    except OSError:
+        return None
+    text = tail.decode("utf-8", errors="replace")
+    matches = list(_LOG_LINE_RE.finditer(text))
+    if not matches:
+        return None
+    return _parse_ts(matches[-1].group(1))
+
+
+def _orchestrator_liveness_banner(
+    log_path: Path,
+    session_id: str | None,
+    threshold_seconds: int,
+    *,
+    display_tz: tzinfo | None = None,
+    now: datetime | None = None,
+) -> str:
+    """Render a one-line orchestrator-alive status banner (issue #161).
+
+    Three states derived from log-activity recency:
+      * **ALIVE** (green) -- last log line within ``threshold_seconds``.
+      * **STOPPED** (red) -- last log line older than ``threshold_seconds``.
+        Banner includes the elapsed-since duration and last-seen timestamp.
+      * **STARTING** (yellow) -- log file missing or empty.
+
+    Boundary: a delta exactly equal to ``threshold_seconds`` is ALIVE; one
+    second past is STOPPED. ANSI colour is emitted only when stdout is a
+    TTY and ``NO_COLOR`` is unset (mirrors ``_should_use_color``); pipes
+    and CI redirects receive plain text.
+
+    The threshold is sourced by callers from ``stop_hook.window_seconds``
+    so the banner stays aligned with the operator's already-tuned
+    circuit-breaker quiet window.
+
+    Args:
+        log_path: Path to the structured orchestrator log.
+        session_id: Optional ``JUDGE_ORCHESTRATOR_SESSION_ID`` value. When
+            empty/None, the banner suppresses the trailing
+            ``-- session ...`` suffix.
+        threshold_seconds: Quiet-window cap. ``stop_hook.window_seconds``.
+        display_tz: Display-timezone for the STOPPED-state last-seen
+            timestamp. ``None`` falls back to system local.
+        now: Override for the current wall-clock (test injection point).
+    """
+    current = now if now is not None else datetime.now(UTC)
+    last_ts = _read_last_log_timestamp(log_path)
+    suffix = f" -- session {session_id}" if session_id else ""
+
+    if last_ts is None:
+        body = "[ORCHESTRATOR STARTING] log file empty; no activity recorded yet"
+        color = _COLOR_YELLOW
+    else:
+        delta = max(0.0, (current - last_ts).total_seconds())
+        if delta <= threshold_seconds:
+            body = f"[ORCHESTRATOR ALIVE] last activity {_format_duration(delta)} ago"
+            color = _COLOR_GREEN
+        else:
+            seen = _format_local_timestamp(last_ts, display_tz)
+            body = f"[ORCHESTRATOR STOPPED] no activity for {_format_duration(delta)} (last seen {seen})"
+            color = _COLOR_RED_LIGHT
+
+    line = body + suffix
+    if not _should_use_color():
+        return line
+    return f"{color}{line}{_COLOR_RESET}"
+
+
 def _render_table(title: str, rows: list[tuple[str, str]], value_w: int = 18) -> list[str]:
     """Render a single bordered two-column table (metric | value).
 
@@ -619,7 +1171,8 @@ def _render_table(title: str, rows: list[tuple[str, str]], value_w: int = 18) ->
     for i, (metric, value) in enumerate(rows):
         if i > 0:
             lines.append(border_mid)
-        lines.append(f"\u2502 {metric:<{metric_w}} \u2502 {value:>{value_w}} \u2502")
+        row_line = f"\u2502 {metric:<{metric_w}} \u2502 {value:>{value_w}} \u2502"
+        lines.append(_colorize_row(row_line, metric))
     lines.append(border_bot)
     return lines
 
@@ -647,14 +1200,26 @@ def _render_multi_column_table(
     metric_w = max(metric_w, len(title))
 
     # Value column width = max of: default minimum, label width, max cell width.
-    # Spanning rows (value is str) are accounted for separately below so a very
-    # long spanning value doesn't distort the per-column width.
+    # Spanning rows (value is str) span all n_cols value columns, so they
+    # contribute a derived minimum value_w too -- otherwise a wider-than-default
+    # spanning value (e.g. an ETA breakdown like "~41.9 h (active 4 + blocked-
+    # recovery 60 + blocked-auto 27 at 27.6 min/task)") busts the table layout.
     def _cells_of(v: list[str] | str) -> list[str]:
         return v if isinstance(v, list) else []
 
     max_cell = max((max((len(v) for v in _cells_of(vals)), default=0) for _, vals in rows), default=0)
     max_label = max((len(label) for label in column_labels), default=0)
-    value_w = max(value_w, max_cell, max_label)
+    # Reverse-derive the minimum value_w from the spanning-cell width formula
+    # (spanning_w computed below) so a spanning value never exceeds the joined
+    # span. Ceiling division of (max_spanning + 3 - 3 * n_cols) by n_cols.
+    max_spanning = max(
+        (len(vals) for _, vals in rows if isinstance(vals, str)),
+        default=0,
+    )
+    spanning_min_value_w = (
+        (max_spanning + 3 - 3 * n_cols + n_cols - 1) // n_cols if max_spanning > 0 and n_cols > 0 else 0
+    )
+    value_w = max(value_w, max_cell, max_label, spanning_min_value_w)
 
     # Width a spanning cell occupies (covers all n_cols value columns plus the
     # n_cols-1 internal "│" separators that would otherwise split them).
@@ -687,10 +1252,11 @@ def _render_multi_column_table(
             # bottom borders of this row still show the regular ┬/┴ junctions
             # so the column boundaries stay visually consistent throughout the
             # table; only the content row's internal │ separators are merged.
-            lines.append(f"\u2502 {metric:<{metric_w}} \u2502 {values:>{spanning_w}} \u2502")
+            row_line = f"\u2502 {metric:<{metric_w}} \u2502 {values:>{spanning_w}} \u2502"
         else:
             cells = [f" {metric:<{metric_w}} "] + [f" {v:>{value_w}} " for v in values]
-            lines.append("\u2502" + "\u2502".join(cells) + "\u2502")
+            row_line = "\u2502" + "\u2502".join(cells) + "\u2502"
+        lines.append(_colorize_row(row_line, metric))
     lines.append(border_bot)
     return lines
 
@@ -724,7 +1290,19 @@ def _render_grouped_progress_table(
 
     max_cell = max((max((len(v) for v in _cells_of(vals)), default=0) for _, vals in all_rows), default=0)
     max_label = max((len(label) for label in column_labels), default=0)
-    value_w = max(value_w, max_cell, max_label)
+    # Spanning rows (value is str) cover all n_cols value columns plus their
+    # internal separators. Without measuring them, a wide spanning value (e.g.
+    # the ETA breakdown "~41.9 h (active 4 + blocked-recovery 60 + ...)" busts
+    # the table layout. Reverse-derive the minimum value_w from the spanning
+    # formula below so the joined span fits the longest observed string.
+    max_spanning = max(
+        (len(vals) for _, section_rows in sections for _, vals in section_rows if isinstance(vals, str)),
+        default=0,
+    )
+    spanning_min_value_w = (
+        (max_spanning + 3 - 3 * n_cols + n_cols - 1) // n_cols if max_spanning > 0 and n_cols > 0 else 0
+    )
+    value_w = max(value_w, max_cell, max_label, spanning_min_value_w)
 
     # Width a spanning cell occupies across all n_cols value columns (plus
     # the n_cols-1 internal separators). Used for both the section-header row
@@ -765,10 +1343,11 @@ def _render_grouped_progress_table(
         lines.append(f"\u2502 {section_label.upper():<{section_w}} \u2502")
         for metric, values in rows:
             if isinstance(values, str):
-                lines.append(f"\u2502 {metric:<{metric_w}} \u2502 {values:>{spanning_w}} \u2502")
+                row_line = f"\u2502 {metric:<{metric_w}} \u2502 {values:>{spanning_w}} \u2502"
             else:
                 cells = [f" {metric:<{metric_w}} "] + [f" {v:>{value_w}} " for v in values]
-                lines.append("\u2502" + "\u2502".join(cells) + "\u2502")
+                row_line = "\u2502" + "\u2502".join(cells) + "\u2502"
+            lines.append(_colorize_row(row_line, metric))
     lines.append(border_bot)
     return lines
 
@@ -816,6 +1395,27 @@ def _short_window_label(label: str, start: datetime, display_tz: tzinfo | None) 
     return f"{label} {converted.strftime('%m-%d %H:%M')}"
 
 
+def _format_est_hours_display(stats: WindowStats) -> str:
+    """Render the ``Est. time to complete remaining`` cell (#157).
+
+    When recent-pace data is available, attaches the ETA breakdown
+    suffix so the operator can verify which task buckets contributed
+    to the multiplier and at what pace. Falls back to a bare hours
+    figure when recent pace is unknown but est_hours was computable
+    from the window's avg_minutes; falls back to ``n/a`` otherwise.
+    """
+    if stats.est_hours and stats.recent_pace_minutes is not None:
+        return (
+            f"~{stats.est_hours:.1f} h (active {stats.eta_active}"
+            f" + blocked-recovery {stats.eta_blocked_recovery}"
+            f" + blocked-auto {stats.eta_blocked_auto}"
+            f" at {stats.recent_pace_minutes:.1f} min/task)"
+        )
+    if stats.est_hours:
+        return f"~{stats.est_hours:.1f} h"
+    return "n/a"
+
+
 def _stats_to_value_list(stats: WindowStats, display_tz: tzinfo | None = None) -> list[str]:
     """Return the per-row value list for a single window, in display order matching METRIC_LABELS.
 
@@ -849,7 +1449,7 @@ def _stats_to_value_list(stats: WindowStats, display_tz: tzinfo | None = None) -
     # Recent pace is log-wide; same value across all window columns. None
     # when fewer than RECENT_PACE_TASKS completions exist.
     recent_pace_display = f"{stats.recent_pace_minutes:.1f} min" if stats.recent_pace_minutes is not None else "n/a"
-    est_hours_display = f"~{stats.est_hours:.1f} h" if stats.est_hours else "n/a"
+    est_hours_display = _format_est_hours_display(stats)
     # Wall-clock completion datetime rendered in the resolved display TZ.
     # Format: "Thu Apr 24 2026 14:23 EDT". "n/a" when est_hours is zero.
     if stats.est_completion_at is None:
@@ -921,6 +1521,12 @@ _SPANNING_METRIC_LABELS: frozenset[str] = frozenset(
         f"Recent pace (last {RECENT_PACE_TASKS} tasks)",
         "Est. time to complete remaining",
         "Est. completion date/time",
+        # Issue #164: total-cost-at-completion is a global measure (one
+        # finishing point for the backlog). The narrower-window numbers
+        # were rendered as different per-column projections that couldn't
+        # all be right at once. Spanning the row makes the report express
+        # the underlying truth: one global completion, one cost projection.
+        "Estimated total cost at completion",
     }
 )
 
@@ -968,16 +1574,17 @@ def _resolve_window_endpoints(log_timestamps: list[datetime]) -> tuple[datetime,
 def _summary_line(stats: WindowStats, tasks_active: int, tasks_blocked: int) -> str:
     """Trailing one-line completion projection.
 
-    Projects against ``tasks_active`` (in-queue / in-progress / in-review) only;
-    blocked tasks need external action and are reported separately so the user
-    knows why the projection is lower than naive ``tasks_remaining * pace``.
-
-    The pace prefers ``recent_pace_minutes`` (rolling average of the last N
-    completions) when available -- that metric reflects current orchestrator
-    rate. Falls back to All-time ``avg_minutes`` otherwise.
+    Issue #157: ETA denominator now also includes blocked tasks devbench
+    will recover on its own (``stats.eta_blocked_recovery`` +
+    ``stats.eta_blocked_auto``). Only the operator-attention bucket is
+    excluded (genuine halt -> unbounded ETA). The pace prefers
+    ``recent_pace_minutes`` when available; falls back to
+    ``avg_minutes`` otherwise.
     """
-    blocked_note = f" -- {tasks_blocked} blocked excluded" if tasks_blocked else ""
-    if tasks_active == 0:
+    eta_total = tasks_active + stats.eta_blocked_recovery + stats.eta_blocked_auto
+    attn_blocked = max(0, tasks_blocked - stats.eta_blocked_recovery - stats.eta_blocked_auto)
+    blocked_note = f" -- {attn_blocked} blocked excluded" if attn_blocked else ""
+    if eta_total == 0:
         if tasks_blocked:
             return (
                 f"0 active tasks. {tasks_blocked} blocked task(s) remaining -- "
@@ -990,32 +1597,11 @@ def _summary_line(stats: WindowStats, tasks_active: int, tasks_blocked: int) -> 
         else ("All-time", stats.avg_minutes)
     )
     if not pace_minutes:
-        return (
-            f"{tasks_active} active task(s) remaining{blocked_note}. (Not enough completed tasks for a pace estimate.)"
-        )
+        return f"{eta_total} active task(s) remaining{blocked_note}. (Not enough completed tasks for a pace estimate.)"
     return (
         f"At the {pace_label} pace of ~{pace_minutes:.1f} minutes per task, "
-        f"the remaining {tasks_active} active task(s){blocked_note} should take roughly "
+        f"the remaining {eta_total} active task(s){blocked_note} should take roughly "
         f"{stats.est_hours:.1f} more hours of continuous execution."
-    )
-
-
-def _cost_basis_line() -> str:
-    return (
-        f"Token cost uses Anthropic's per-token-type pricing: input @ ${TOKEN_COST_PER_M_INPUT:.0f}/M, "
-        f"output @ ${TOKEN_COST_PER_M_OUTPUT:.0f}/M, cache reads @ {REPORT_CACHE_READ_MULTIPLIER:.0%} of input, "
-        f"5-min cache writes @ {REPORT_CACHE_WRITE_5MIN_MULTIPLIER:.0%}, "
-        f"1-hr cache writes @ {REPORT_CACHE_WRITE_1HR_MULTIPLIER:.0%}. "
-        f"Override per-rate in devbench.yaml under report:."
-    )
-
-
-def _windows_explanation() -> str:
-    return (
-        f"Windows: 'All-time' covers the full orchestrator log; 'Session' is the most recent "
-        f"contiguous block of orchestration log entries (boundary = a gap of more than "
-        f"{DEFAULT_SESSION_GAP_MINUTES} minutes). 'This run' (watch mode only) is since "
-        f"the watch loop started. Pass --since <ISO-8601> for a custom window."
     )
 
 
@@ -1036,6 +1622,12 @@ class _BacklogTotals:
     tasks_in_review: int  # non-Done tasks with status == IN_REVIEW (subset of tasks_active)
     tasks_proposed: int  # task-factory-generated drafts awaiting human review
     tasks_declined: int  # explicitly declined work (won't ever be done)
+    # Issue #157: blocked tasks split by their recovery classifier so the
+    # ETA projection can include recovery+auto buckets while excluding the
+    # genuine-halt operator-attention bucket.
+    tasks_blocked_recovery: int = 0  # AWAITING_AUTO_RECOVERY
+    tasks_blocked_auto: int = 0  # AUTO_CLEARING_VIA_PROPOSAL
+    tasks_blocked_attn: int = 0  # NEEDS_OPERATOR_ATTENTION
 
 
 def _backlog_totals_from_units(units: list) -> _BacklogTotals:
@@ -1050,11 +1642,35 @@ def _backlog_totals_from_units(units: list) -> _BacklogTotals:
     tasks_in_review = [t for t in tasks if t.status == WorkUnitStatus.IN_REVIEW]
     tasks_proposed = [t for t in tasks if t.status == WorkUnitStatus.PROPOSED]
     tasks_declined = [t for t in tasks if t.status == WorkUnitStatus.DECLINED]
-    # Proposed tasks are inert drafts awaiting human review; Declined tasks
-    # are deliberate "won't ever be done" decisions. Neither counts against
-    # tasks_remaining or tasks_active -- the orchestrator will never execute
-    # either, so they must not distort pace / ETA projections.
     tasks_remaining = len(tasks) - len(tasks_done) - len(tasks_proposed) - len(tasks_declined)
+
+    # Issue #157: classify blocked tasks so the ETA projection can include
+    # the auto-clearing + awaiting-recovery buckets (devbench will resolve
+    # them on its own) while excluding the operator-attention bucket
+    # (genuine halt -> unbounded ETA).
+    blocked_recovery = 0
+    blocked_auto = 0
+    blocked_attn = 0
+    if tasks_blocked:
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        for u in tasks_blocked:
+            try:
+                state = classify_blocked_task(
+                    BACKLOG_ROOT,
+                    BACKLOG_INDEX,
+                    u.id,
+                    workspace_root=WORKSPACE_ROOT,
+                )
+            except (FileNotFoundError, ValueError, OSError):
+                state = BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+            if state is BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL:
+                blocked_auto += 1
+            elif state is BlockedTaskState.AWAITING_AUTO_RECOVERY:
+                blocked_recovery += 1
+            else:
+                blocked_attn += 1
+
     return _BacklogTotals(
         tasks_total=len(tasks),
         tasks_done=len(tasks_done),
@@ -1071,6 +1687,9 @@ def _backlog_totals_from_units(units: list) -> _BacklogTotals:
         tasks_in_review=len(tasks_in_review),
         tasks_proposed=len(tasks_proposed),
         tasks_declined=len(tasks_declined),
+        tasks_blocked_recovery=blocked_recovery,
+        tasks_blocked_auto=blocked_auto,
+        tasks_blocked_attn=blocked_attn,
     )
 
 
@@ -1172,37 +1791,89 @@ def _unit_status_listing(units: list, status: WorkUnitStatus, header: str) -> li
     return lines
 
 
-def _in_progress_listing(units: list) -> list[str]:
-    """B9: list every in-progress task so the user sees which one is active."""
-    return _unit_status_listing(units, WorkUnitStatus.IN_PROGRESS, "In-progress tasks")
+def _in_progress_listing(units: list, log_path: Path | None = None) -> list[str]:
+    """B9: list every in-progress task; suffix each row with attempt duration (#158)."""
+    matches = [u for u in units if u.unit_type == WorkUnitType.TASK and u.status == WorkUnitStatus.IN_PROGRESS]
+    if not matches:
+        return []
+    from devbench.cli import _in_progress_attempt_duration
+
+    lines = ["", "In-progress tasks:"]
+    for u in matches:
+        duration = _in_progress_attempt_duration(u.id, log_path)
+        suffix = f" (in-progress for {duration})" if duration is not None else " (in-progress, timer unavailable)"
+        lines.append(f"  - {u.id}: {u.title}{suffix}")
+    return lines
 
 
 def _blocked_listing(units: list) -> list[str]:
-    """ADR-10: render blocked tasks in two panels (auto-clearing + needs-attention).
+    """Part-1: render blocked tasks in three panels.
 
-    The split lets operators scan only the ``(needs operator attention)``
-    panel to find work that requires a decision; the ``(auto-clearing via
-    proposal)`` panel is informational -- the ADR-07 cascade will resolve
-    each of those tasks when its markers reach terminal state.
+    The 3-state classifier sorts each blocked task into one of:
 
-    Each auto-clearing row names the task IDs it is waiting on in square
-    brackets so the operator can trace the chain without opening the
-    work-unit file. Needs-attention rows carry just ID + title; the operator
-    opens the file to read the blocker comment.
+    1. ``Blocked tasks (auto-clearing via proposal)`` -- ADR-07 cascade
+       will resolve when every ``[BLOCKED_PENDING_PROPOSAL]`` marker
+       target reaches terminal. Operator does nothing.
+    2. ``Blocked tasks (auto-recovery in flight)`` -- no marker yet, but
+       devbench's recovery loop has an artefact on disk (pending
+       proposal JSON, rejected-amendment archive, or recent
+       recovery-agent ``[BLOCKED]`` audit comment). The next sweep
+       cycle will advance these into panel 1. Operator does nothing
+       for now.
+    3. ``Blocked tasks (needs operator attention)`` -- the true halt
+       list: manual gates (``DO NOT CLAIM``), unknown marker targets,
+       cascade-stuck states. Operator must act.
 
-    Both panels are omitted when empty, matching the Proposed / Declined /
-    Un-materialised panel discipline.
+    Each row carries a per-state annotation: panel 1 names the task IDs
+    it is waiting on; panel 2 names which recovery signal devbench
+    found on disk; panel 3 carries just ID + title. Empty panels are
+    omitted entirely so the operator's eye lands on the panels that
+    have content.
     """
-    from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+    from devbench.backlog.proposal import (
+        BlockedTaskState,
+        classify_blocked_task,
+        panel3_annotation,
+        recovery_signal_for_task,
+    )
 
-    blocked_tasks = [u for u in units if u.unit_type == WorkUnitType.TASK and u.status == WorkUnitStatus.BLOCKED]
-    if not blocked_tasks:
+    # Issue #168 (3-panel surfacing): admit BOTH BLOCKED and HOLD task
+    # units. HOLD bypasses the classifier and goes directly into
+    # ``attn_rows`` because it represents a deliberate operator pause
+    # that no automation will clear -- the same operator-must-act class
+    # as the residual NEEDS_OPERATOR_ATTENTION sub-cases.
+    eligible = [
+        u
+        for u in units
+        if u.unit_type == WorkUnitType.TASK and u.status in (WorkUnitStatus.BLOCKED, WorkUnitStatus.HOLD)
+    ]
+    if not eligible:
         return []
 
     auto_rows: list[tuple] = []  # (unit, list[str] of marker targets)
-    attn_rows: list = []
-    for u in blocked_tasks:
-        state = classify_blocked_task(BACKLOG_ROOT, BACKLOG_INDEX, u.id)
+    recovery_rows: list[tuple] = []  # (unit, signal-source string)
+    # Each attn row carries (group_rank, hold_target_or_empty, unit, annotation)
+    # so the renderer can sort by (group_rank, hold_target, unit_id) for
+    # deterministic output that clusters HOLD-related rows under the
+    # HOLD unit they wait on.
+    # Each tuple: (group_rank, hold_target_or_empty, unit, annotation).
+    # ``unit`` is a ``WorkUnit``; mypy's view of the iterator above is
+    # already a WorkUnit so we annotate concretely here so downstream
+    # ``.id`` / ``.title`` accesses type-check cleanly.
+    from devbench.backlog.work_unit import WorkUnit
+
+    attn_rows: list[tuple[int, str, WorkUnit, str]] = []
+    for u in eligible:
+        if u.status is WorkUnitStatus.HOLD:
+            # group_rank 0 -- HOLD units lead panel 3.
+            attn_rows.append((0, "", u, "[HOLD]"))
+            continue
+        state = classify_blocked_task(
+            BACKLOG_ROOT,
+            BACKLOG_INDEX,
+            u.id,
+            workspace_root=WORKSPACE_ROOT,
+        )
         if state is BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL:
             # Surface which task(s) this one is waiting on. Reuse the same
             # marker-extract helper the cascade uses so the string is always
@@ -1211,8 +1882,22 @@ def _blocked_listing(units: list) -> list[str]:
 
             waiting_on = sorted(BacklogManager()._extract_pending_proposal_markers(u.file_path))
             auto_rows.append((u, waiting_on))
+        elif state is BlockedTaskState.AWAITING_AUTO_RECOVERY:
+            signal = recovery_signal_for_task(WORKSPACE_ROOT, u.id)
+            recovery_rows.append((u, signal))
         else:
-            attn_rows.append(u)
+            group_rank, hold_target, annotation = panel3_annotation(
+                BACKLOG_ROOT,
+                BACKLOG_INDEX,
+                u.id,
+            )
+            attn_rows.append((group_rank, hold_target or "", u, annotation))
+
+    # Stable sort by (group_rank, hold_target_id, unit_id) so the panel-3
+    # rows cluster by cause: HOLD units lead, then the BLOCKED tasks
+    # waiting on each HOLD unit (grouped by the HOLD target id), then
+    # the residual no-marker / unknown-target / all-terminal cases.
+    attn_rows.sort(key=lambda r: (r[0], r[1], r[2].id))
 
     lines: list[str] = []
     if auto_rows:
@@ -1221,11 +1906,17 @@ def _blocked_listing(units: list) -> list[str]:
         for u, waiting_on in auto_rows:
             suffix = f"    [waiting on {', '.join(waiting_on)}]" if waiting_on else ""
             lines.append(f"  - {u.id}: {u.title}{suffix}")
+    if recovery_rows:
+        lines.append("")
+        lines.append(f"Blocked tasks (auto-recovery in flight) ({len(recovery_rows)}):")
+        for u, signal in recovery_rows:
+            suffix = f"    [recovery: {signal}]" if signal else ""
+            lines.append(f"  - {u.id}: {u.title}{suffix}")
     if attn_rows:
         lines.append("")
         lines.append(f"Blocked tasks (needs operator attention) ({len(attn_rows)}):")
-        for u in attn_rows:
-            lines.append(f"  - {u.id}: {u.title}")
+        for _group_rank, _hold_target, u, annotation in attn_rows:
+            lines.append(f"  - {u.id}: {u.title}    {annotation}")
     return lines
 
 
@@ -1322,20 +2013,73 @@ def generate_report(
     Returns:
         Formatted report string ready for terminal output.
     """
+    # Operator-alive banner (issue #161). Prepended to every render so
+    # ``devbench report --watch N`` shows liveness state on every tick.
+    # Threshold reuses ``stop_hook.window_seconds`` -- the same quiet
+    # window the circuit-breaker tolerates -- so the banner stays aligned
+    # with the operator's already-tuned cadence.
+    #
+    # The banner is computed BEFORE the snapshot short-circuit (issue
+    # #162 Phase 6) because the banner uses ``datetime.now()`` to
+    # express "last activity Ns ago" -- if we cached it inside the
+    # snapshot the elapsed-since string would freeze and a stalled
+    # orchestrator would still appear ALIVE on every watch tick.
+    session_id = os.environ.get("JUDGE_ORCHESTRATOR_SESSION_ID", "").strip() or None
+    banner_display_tz = _resolve_display_timezone(REPORT_DISPLAY_TIMEZONE or DISPLAY_TIMEZONE)
+    banner_line = _orchestrator_liveness_banner(
+        log_path=log_path,
+        session_id=session_id,
+        threshold_seconds=STOP_HOOK_WINDOW_SECONDS,
+        display_tz=banner_display_tz,
+    )
+
+    # Issue #162 Phase 6 (rendered-body snapshot) is deferred.
+    # A snapshot keyed on log mtime + size is fast but unsafe:
+    # cost-rate config (``TOKEN_COST_DISCOUNT``,
+    # ``TOKEN_COST_PER_M_INPUT/OUTPUT``, the cache + residency + fast-
+    # mode multipliers, the display timezone, ``RECENT_PACE_TASKS``)
+    # can change between invocations without the log advancing, and a
+    # snapshot keyed only on the log would silently return numbers
+    # computed against the old config. Per CLAUDE.md fail-fast: better
+    # to recompute and stay correct than cache and risk wrong cost
+    # output. Phases 1+4 alone already serve the report from indexed
+    # range scans, which is the dominant cost on the live workspace
+    # (196 MB hook log + 200+ MB transcripts) -- the marginal saving
+    # from Phase 6 over Phases 1+4 is small. The schema row
+    # ``report_snapshot`` is left in place for a future invocation-
+    # safe snapshot design (one that hashes the full config + BACKLOG
+    # mtime tree into the cache key).
+    event_index = EventIndex.open(WORKSPACE_ROOT)
+
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     units = parser.parse_index()
     backlog = _backlog_totals_from_units(units)
 
-    log_text = log_path.read_text(encoding="utf-8") if log_path.is_file() else ""
+    # Issue #162 Phase 1+4 cache: refresh the persistent SQLite index
+    # against the orchestrator log + hook log + transcripts (each call
+    # is a mtime+size check + delta-only re-parse on append, full
+    # re-parse on rotation/truncation), then read aggregated views via
+    # indexed queries instead of full-file regex scans. The legacy
+    # text-parser path below is preserved as a fallback for callers
+    # that pass ``event_index=None`` to ``_compute_window_stats``
+    # directly (mostly the existing test suite, which tests the parser
+    # building blocks individually).
+    # Issue #168: route the orch-log refresh + queries through the
+    # workspace-aware variants so events from sharded shards (post
+    # Phase-3 migration) merge with the live flat log. When the
+    # workspace has no sharded layout, the workspace-aware path
+    # behaves identically to the legacy single-file path.
+    event_index.refresh_orch_log_sources(WORKSPACE_ROOT, log_path)
+    hook_log_path = _hook_log_path(log_path)
+    event_index.refresh_hook_log(hook_log_path)
+    transcript_dir = _resolve_transcript_dir(event_index, hook_log_path)
+    event_index.refresh_transcripts(transcript_dir)
 
-    done_times: dict[str, datetime] = {}
-    for m in _DONE_RE.finditer(log_text):
-        done_times[m.group(2)] = _parse_ts(m.group(1))
-    progress_times: dict[str, datetime] = {}
-    for m in _PROGRESS_RE.finditer(log_text):
-        progress_times[m.group(2)] = _parse_ts(m.group(1))
-
-    all_timestamps: list[datetime] = [_parse_ts(m.group(1)) for m in _LOG_LINE_RE.finditer(log_text)]
+    done_times: dict[str, datetime] = event_index.task_transition_times_for_workspace(WORKSPACE_ROOT, log_path, "done")
+    progress_times: dict[str, datetime] = event_index.task_transition_times_for_workspace(
+        WORKSPACE_ROOT, log_path, "in-progress"
+    )
+    all_timestamps: list[datetime] = event_index.all_log_timestamps_for_workspace(WORKSPACE_ROOT, log_path)
     log_start_for_window, window_end, log_started = _resolve_window_endpoints(all_timestamps)
 
     # Precedence: report-specific (env JUDGE_REPORT_TIMEZONE > yaml
@@ -1344,18 +2088,48 @@ def generate_report(
     # encodes the first pair; DISPLAY_TIMEZONE the second.
     display_tz = _resolve_display_timezone(REPORT_DISPLAY_TIMEZONE or DISPLAY_TIMEZONE)
 
+    # Issue #164: compute the global recent-pace per-task cost ONCE (it's
+    # log-wide, not window-specific) and reuse across every window's
+    # ``_compute_window_stats`` call. This is what makes the
+    # "Estimated total cost at completion" number consistent across the
+    # All-time / Session / This-run columns -- one global rate produces
+    # one global completion cost regardless of window.
+    recent_per_task_cost = _recent_per_task_cost(
+        log_path,
+        done_times,
+        progress_times,
+        RECENT_PACE_TASKS,
+        event_index=event_index,
+    )
+
     # Compute lifetime (since-log-started) stats once. Used to enrich the top
     # box with cost / token / cache-hit summary so the most relevant numbers
     # are visible at a glance without scanning across the wider window-stats table.
     lifetime_stats: WindowStats | None = (
         _compute_window_stats(
-            log_path, log_start_for_window, window_end, done_times, progress_times, backlog.tasks_active
+            log_path,
+            log_start_for_window,
+            window_end,
+            done_times,
+            progress_times,
+            backlog.tasks_active,
+            backlog.tasks_blocked_recovery,
+            backlog.tasks_blocked_auto,
+            event_index=event_index,
+            recent_per_task_cost=recent_per_task_cost,
         )
         if log_started is not None
         else None
     )
 
-    lines: list[str] = []
+    lines: list[str] = [banner_line, ""]
+
+    # Spanning-row follow-up: thread the All-time cost (already paid in
+    # lifetime_stats above) as the additive base for every narrower
+    # window's est_total_cost. When lifetime_stats is None (no log
+    # started yet), fall through with None and the legacy per-window
+    # additive base applies -- there is nothing to collapse against.
+    lifetime_total_cost = lifetime_stats.cost.total_cost if lifetime_stats is not None else None
 
     if since is not None:
         # Single-window mode (legacy API for callers passing --since explicitly).
@@ -1363,7 +2137,17 @@ def generate_report(
         # box the way older callers / tests expect it.
         backlog_state_block = _render_table("Backlog state", _backlog_state_rows(backlog))
         single_stats = _compute_window_stats(
-            log_path, since, window_end, done_times, progress_times, backlog.tasks_active
+            log_path,
+            since,
+            window_end,
+            done_times,
+            progress_times,
+            backlog.tasks_active,
+            backlog.tasks_blocked_recovery,
+            backlog.tasks_blocked_auto,
+            event_index=event_index,
+            recent_per_task_cost=recent_per_task_cost,
+            lifetime_total_cost=lifetime_total_cost,
         )
         lines.extend(backlog_state_block)
         lines.append("")
@@ -1385,7 +2169,7 @@ def generate_report(
         windows: list[WindowSpec] = [
             WindowSpec(label="All-time", start=log_start_for_window, is_log_started=True),
         ]
-        detected_session = _find_current_session_start(log_text)
+        detected_session = _find_current_session_start_from_index(event_index, log_path, workspace_root=WORKSPACE_ROOT)
         session_start = detected_session if detected_session is not None else log_start_for_window
         windows.append(WindowSpec(label="Session", start=session_start, is_log_started=False))
         if report_started_at is not None:
@@ -1398,7 +2182,17 @@ def generate_report(
             else:
                 all_window_stats.append(
                     _compute_window_stats(
-                        log_path, w.start, window_end, done_times, progress_times, backlog.tasks_active
+                        log_path,
+                        w.start,
+                        window_end,
+                        done_times,
+                        progress_times,
+                        backlog.tasks_active,
+                        backlog.tasks_blocked_recovery,
+                        backlog.tasks_blocked_auto,
+                        event_index=event_index,
+                        recent_per_task_cost=recent_per_task_cost,
+                        lifetime_total_cost=lifetime_total_cost,
                     )
                 )
 
@@ -1430,6 +2224,25 @@ def generate_report(
             ("Cost", sections_by_label["Cost"]),
         ]
         lines.extend(_render_grouped_progress_table("Metric", column_labels, sections))
+        # Divergence warning: the BACKLOG STATE row "Tasks completed"
+        # counts ``Status: done`` rows in BACKLOG.md while the THROUGHPUT
+        # row "Tasks completed in window" counts ``Set <id> to 'done'``
+        # log lines parsed from ``log_path``. The two MUST agree for a
+        # healthy backlog. When backlog state shows completions but the
+        # All-time throughput window (which spans the entire log) shows
+        # zero, the operator is reading a different log than the one
+        # the orchestrator writes to -- typically because
+        # ``JUDGE_LOG_FILE`` was unset in the shell that ran
+        # ``devbench report`` and the default fell back to the devbench
+        # source-tree log. Surface the discrepancy as a one-line
+        # warning so the user does not silently misread the table.
+        all_time_stats = all_window_stats[0]
+        if backlog.tasks_done > 0 and all_time_stats.tasks_in_window == 0:
+            lines.append("")
+            lines.append(
+                f"WARNING: BACKLOG.md shows {backlog.tasks_done} done but log {log_path} shows 0 "
+                "-- check JUDGE_LOG_FILE points at the orchestrator's log."
+            )
         # Use the All-time stats for the trailing prose projection -- they're the
         # most stable sample. Narrower windows can have zero completed tasks
         # (e.g. just after a restart) which would project meaningless numbers.
@@ -1437,19 +2250,18 @@ def generate_report(
 
     lines.append("")
     lines.append(_summary_line(summary_stats, backlog.tasks_active, backlog.tasks_blocked))
-    if summary_stats.cost.total_cost:
-        lines.append(_cost_basis_line())
     if since is None:
-        lines.append("\n" + _windows_explanation())
         # B9: per-unit listings at the very end so the user can act on each.
-        # Proposed + Declined panels render FIRST (before In Progress / Blocked)
-        # because they represent human-decision state: drafts awaiting review
-        # and tasks that have been taken off the table. Both are omitted when
-        # their respective status has zero tasks.
+        # Order surfaces the most operationally-actionable panels first
+        # (In Progress, then Blocked) and pushes long-tail / decision-only
+        # state (Proposed, Unmaterialised Proposals, Declined) to the edges.
+        # Declined renders LAST since it represents tasks already taken off
+        # the table -- useful as historical reference but not actionable.
+        # Each panel is omitted when its respective status has zero tasks.
         lines.extend(_proposed_listing(units))
         lines.extend(_unmaterialised_proposals_listing())
-        lines.extend(_declined_listing(units))
-        lines.extend(_in_progress_listing(units))
+        lines.extend(_in_progress_listing(units, log_path))
         lines.extend(_blocked_listing(units))
+        lines.extend(_declined_listing(units))
 
     return "\n".join(lines)

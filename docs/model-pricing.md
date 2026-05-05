@@ -52,6 +52,32 @@ Cache-write tokens are read from the nested `usage.cache_creation.ephemeral_5m_i
 
 ---
 
+## Calibrating cost rates against actual billing
+
+The reported cost should equal actual API billing within ~1%. If the report drifts from the actual invoice (model swap, 1M-context premium tier, contract pricing, region surcharge, or any other rate variant), recalibrate by deriving a correction factor from a recent run:
+
+```
+correction_factor = actual_billing / reported_cost
+```
+
+Multiply BOTH `report.token_cost_per_million_input` and `report.token_cost_per_million_output` in `backlog/config/devbench.yaml` by the correction factor. The input/output ratio is preserved, and the cache-read / cache-write / data-residency / fast-mode multipliers compose correctly on top of the corrected base rate.
+
+**Worked example.** A live workspace running Opus 4.7 with 1M-context observed actual API spend of `$83.66` against `devbench report` reading `$39.57` for the same window:
+
+```
+correction_factor = 83.66 / 39.57 = 2.114
+new input rate    = 5.0  * 2.114 = 10.57
+new output rate   = 25.0 * 2.114 = 52.86
+```
+
+Edit and re-run `devbench report` once on the same log window; the new value should match actual within rounding.
+
+**Why not use `token_cost_discount`?** The discount field is constrained to `[0.0, 1.0]` and only DECREASES reported cost (`final = list * (1 - discount)`). It cannot fix under-reporting. Always correct upward via the per-million rates. If your contract has a real discount on top of list, set `token_cost_discount` to the contract value AND ensure the per-million rates already match list price for your model.
+
+**When to recalibrate.** Re-derive the factor whenever any of these change: `JUDGE_CLAUDE_MODEL`, the workspace's context-tier (200k vs 1M), the orchestrator's cache-hit profile (since reported cost depends on the cache-write-rate-vs-cache-read mix), Anthropic's published list pricing, or your contract terms.
+
+---
+
 ## Standard pricing (per 1M tokens, USD)
 
 | Model            | Input | Output | Cache read | 5-min cache write | 1-hr cache write |
@@ -232,6 +258,28 @@ Claude Opus 4.7, Opus 4.6, and Sonnet 4.6 support a **1M-token context window** 
 The **Batch API** offers 50% off input and output for asynchronous workloads (devbench does not currently use the Batch API; the orchestrator runs interactive sessions).
 
 For full pricing details, multipliers, and platform-specific rates (Bedrock, Vertex AI, Foundry), see <https://platform.claude.com/docs/en/about-claude/pricing>.
+
+---
+
+## How `Estimated total cost at completion` is computed (issue #164)
+
+The number is a **global** measure -- one finishing point for the backlog -- and renders as a single value spanning every column of the cost section, not one number per window.
+
+Formula:
+
+```
+est_total_cost = cost.total_cost + recent_per_task_cost * eta_task_count
+```
+
+Where:
+
+- `cost.total_cost` is the cumulative spend in the report window (per-window).
+- `recent_per_task_cost` is the **global** average cost across the most-recent `RECENT_PACE_TASKS` (default 5) completions log-wide. Computed once per report invocation by walking the umbrella interval `[earliest_progress_of_recent_N, now]`, summing hook + transcript token costs across that interval, and dividing by N.
+- `eta_task_count` is the same denominator the time-projection uses (active + auto-recovery + auto-clearing buckets).
+
+When the log has fewer than `RECENT_PACE_TASKS` completions, `recent_per_task_cost` is `None` and the calculation falls back to the per-window average (`cost.total_cost / tasks_in_window`), matching the existing `recent_pace_minutes` fallback contract. When there are zero completions log-wide the projection equals the cumulative spend (no synthetic projection from no data).
+
+Why the global rate. Earlier behaviour divided `cost.total_cost / tasks_in_window` (where `tasks_in_window` is the per-window completion count). Narrower windows had fewer completions, so the per-task cost spiked, so the projection inflated; on the same physical workspace the All-time / Session / This-run columns produced wildly different completion costs -- e.g. `~$13k` / `~$42k` / `~$8`. Using a single global rate produces one number that matches the operator's mental model: completion is a single global event with a single cost.
 
 ---
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 import textwrap
 from pathlib import Path
 
+import jsonschema
 import pytest
 
 from devbench.config_loader import (
@@ -1572,3 +1573,617 @@ class TestDisplayTimezoneTopLevel:
         rt = load_runtime_config(cfg, {})
         assert rt.display_timezone == "America/Chicago"
         assert rt.report.display_timezone == "Europe/London"
+
+
+class TestRepoConfigRuntimeFields:
+    """E213: RepoConfig is populated with validated_repo + resolved_checkout_path at load time."""
+
+    @staticmethod
+    def _write(path: Path, content: str) -> Path:
+        path.write_text(textwrap.dedent(content))
+        return path
+
+    def test_validated_repo_set_to_yaml_key(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.repos["org/repo"].validated_repo == "org/repo"
+
+    def test_resolved_checkout_path_uses_explicit_directory(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+                checkout_directory: my-checkout
+            """,
+        )
+        rt = load_runtime_config(cfg, {"JUDGE_WORKSPACE_ROOT": str(tmp_path)})
+        assert rt.repos["org/repo"].resolved_checkout_path == tmp_path / "my-checkout"
+
+    def test_resolved_checkout_path_falls_back_to_short_name(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            """,
+        )
+        rt = load_runtime_config(cfg, {"JUDGE_WORKSPACE_ROOT": str(tmp_path)})
+        assert rt.repos["org/repo"].resolved_checkout_path == tmp_path / "repo"
+
+    def test_resolved_checkout_path_none_when_workspace_unset(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.repos["org/repo"].resolved_checkout_path is None
+        # validated_repo remains populated even without workspace_root.
+        assert rt.repos["org/repo"].validated_repo == "org/repo"
+
+
+@pytest.mark.unit
+class TestVNextCanonicalConfig:
+    """v-next release: every PR-119 toggle is now a YAML field; CI retry default-on; debug section."""
+
+    def _write(self, path: Path, content: str) -> Path:
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    def test_inline_orphan_cleanup_parses_from_yaml(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            git_ops:
+              inline_orphan_cleanup: false
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.git_ops.inline_orphan_cleanup is False
+
+    def test_ci_failure_retry_parses_from_yaml(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            git_ops:
+              ci_failure_retry: false
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.git_ops.ci_failure_retry is False
+
+    def test_pause_before_merge_parses_from_yaml(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            git_ops:
+              pause_before_merge: true
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.git_ops.pause_before_merge is True
+
+    def test_pause_before_merge_incompatible_with_defer_pr(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            git_ops:
+              single_branch: my-branch
+              defer_pr: true
+              pause_before_merge: true
+            """,
+        )
+        with pytest.raises(ValueError, match=r"incompatible with .*defer_pr"):
+            load_runtime_config(cfg, {})
+
+    def test_pause_before_merge_incompatible_with_single_branch(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            git_ops:
+              single_branch: my-branch
+              pause_before_merge: true
+            """,
+        )
+        with pytest.raises(ValueError, match=r"incompatible with .*single_branch"):
+            load_runtime_config(cfg, {})
+
+    def test_local_only_defaults_to_false(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            git_ops:
+              update_submodule: false
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.git_ops.local_only is False
+
+    def test_local_only_parses_true_with_required_companions(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            git_ops:
+              single_branch: my-branch
+              defer_pr: true
+              local_only: true
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.git_ops.local_only is True
+        assert rt.git_ops.defer_pr is True
+        assert rt.git_ops.single_branch == "my-branch"
+
+    def test_local_only_requires_defer_pr(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            git_ops:
+              single_branch: my-branch
+              local_only: true
+            """,
+        )
+        with pytest.raises(ValueError, match=r"local_only: true requires .*defer_pr: true"):
+            load_runtime_config(cfg, {})
+
+    def test_local_only_incompatible_with_pause_before_merge(self, tmp_path: Path) -> None:
+        # pause_before_merge: true is itself mutually exclusive with defer_pr: true,
+        # so the only way to combine local_only + pause_before_merge is without defer_pr
+        # -- which trips the local_only-requires-defer_pr check first. The schema
+        # validator reaches the pause_before_merge incompatibility branch only when
+        # defer_pr is also present, which the existing pause-vs-defer rule already
+        # rejects. We assert the intent: local_only + pause_before_merge can never
+        # coexist successfully, regardless of which validator fires first.
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            git_ops:
+              single_branch: my-branch
+              defer_pr: true
+              pause_before_merge: true
+              local_only: true
+            """,
+        )
+        with pytest.raises(ValueError):
+            load_runtime_config(cfg, {})
+
+    def test_local_only_requires_default_branch_on_every_repo(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            git_ops:
+              single_branch: my-branch
+              defer_pr: true
+              local_only: true
+            """,
+        )
+        with pytest.raises(ValueError, match=r"requires every entry in repos: to set an explicit default_branch"):
+            load_runtime_config(cfg, {})
+
+    def test_orphan_patterns_parse_from_yaml(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            git_ops:
+              orphan_patterns:
+                - "**/.coverage*"
+                - "**/__pycache__/**"
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.git_ops.orphan_patterns == ["**/.coverage*", "**/__pycache__/**"]
+
+    def test_pr_review_resolution_parses_full_block(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            git_ops:
+              pr_review_resolution:
+                enabled: true
+                agents: ["github-copilot[bot]", "amazon-q-developer[bot]"]
+                decision_blocks: false
+                settle_seconds: 90
+                poll_interval: 10
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.git_ops.pr_review_resolution.enabled is True
+        assert rt.git_ops.pr_review_resolution.agents == [
+            "github-copilot[bot]",
+            "amazon-q-developer[bot]",
+        ]
+        assert rt.git_ops.pr_review_resolution.decision_blocks is False
+        assert rt.git_ops.pr_review_resolution.settle_seconds == 90
+        assert rt.git_ops.pr_review_resolution.poll_interval == 10
+
+    def test_pr_review_resolution_absent_yields_none_defaults(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.git_ops.pr_review_resolution.enabled is None
+        assert rt.git_ops.pr_review_resolution.agents == []
+
+    def test_ci_failure_log_bytes_parses_from_yaml(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            limits:
+              ci_failure_log_bytes: 65536
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.limits.ci_failure_log_bytes == 65536
+
+    def test_debug_section_parses_full_block(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            debug:
+              check_registration_retries: 20
+              check_registration_delay_seconds: 10
+              blocked_recovery_window_seconds: 3600
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.debug.check_registration_retries == 20
+        assert rt.debug.check_registration_delay_seconds == 10
+        assert rt.debug.blocked_recovery_window_seconds == 3600
+
+    def test_debug_section_absent_yields_none_defaults(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.debug.check_registration_retries is None
+        assert rt.debug.blocked_recovery_window_seconds is None
+
+    def test_schema_rejects_unknown_git_ops_key(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            git_ops:
+              not_a_real_field: true
+            """,
+        )
+        with pytest.raises(ValueError, match="schema validation"):
+            load_runtime_config(cfg, {})
+
+    def test_schema_rejects_non_boolean_pause_before_merge(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            git_ops:
+              pause_before_merge: "yes"
+            """,
+        )
+        with pytest.raises(ValueError, match="schema validation"):
+            load_runtime_config(cfg, {})
+
+    def test_schema_rejects_unknown_debug_key(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            debug:
+              not_a_real_debug_field: 99
+            """,
+        )
+        with pytest.raises(ValueError, match="schema validation"):
+            load_runtime_config(cfg, {})
+
+
+@pytest.mark.unit
+class TestSampleConfigCompleteness:
+    """Verify ``sample-config.yaml`` documents every YAML field defined in the schema."""
+
+    def test_sample_config_exists(self) -> None:
+        """The sample-config.yaml file must exist at the repo root."""
+        assert (Path(__file__).parent.parent / "sample-config.yaml").is_file()
+
+    def test_sample_config_loads_cleanly(self, tmp_path: Path) -> None:
+        """Parsing the sample-config.yaml must not raise.
+
+        The fixture is the canonical reference -- if it fails schema
+        validation or any of the loader's cross-field checks, operators
+        copying it as a starting point would hit the same failure.
+        """
+        sample_path = Path(__file__).parent.parent / "sample-config.yaml"
+        rt = load_runtime_config(sample_path, {})
+        # Sanity: the v-next defaults that operators rely on are present.
+        assert rt.git_ops.inline_orphan_cleanup is True
+        assert rt.git_ops.ci_failure_retry is True
+        assert rt.git_ops.pause_before_merge is False
+
+    def test_sample_config_documents_every_top_level_schema_property(self) -> None:
+        """Every top-level property in config-schema.json appears in sample-config.yaml.
+
+        Walks the schema's `properties:` map and asserts each name appears
+        somewhere in the sample (commented-out lines count -- the goal is
+        documentation completeness, not active configuration). When a new
+        schema field is added, the operator is forced to also update the
+        sample so the canonical reference stays in sync.
+        """
+        import json as _json
+        import re as _re
+
+        schema_path = Path(__file__).parent.parent / "src" / "devbench" / "config-schema.json"
+        with schema_path.open(encoding="utf-8") as fh:
+            schema = _json.load(fh)
+        sample_path = Path(__file__).parent.parent / "sample-config.yaml"
+        sample_text = sample_path.read_text(encoding="utf-8")
+        # Strip comment markers so commented-out fields still count as documented.
+        decommented = _re.sub(r"^\s*#\s?", "", sample_text, flags=_re.MULTILINE)
+        missing = [
+            field_name
+            for field_name in schema.get("properties", {})
+            if not _re.search(rf"^{_re.escape(field_name)}:", decommented, _re.MULTILINE)
+        ]
+        assert not missing, (
+            f"sample-config.yaml is missing top-level schema field(s): {missing}. "
+            "Every schema-known field must appear in the sample-config so the "
+            "canonical reference covers every operator-tunable knob."
+        )
+
+
+class TestPerJudgeRetriesConfig:
+    """Issue #122 regression: per-judge executor retry budget overrides.
+
+    YAML schema map ``max_executor_retries_per_judge`` lets operators tune
+    per-judge retries (e.g., 5 retries for flakey test_review, 2 for stable
+    doc_review) without raising the global cap. Schema validation rejects
+    unknown judge names; runtime helper revalidates as defense-in-depth.
+    """
+
+    @staticmethod
+    def _write(path: Path, content: str) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    def test_only_global_when_per_judge_absent(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            max_executor_retries: 7
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.max_executor_retries == 7
+        assert result.max_executor_retries_per_judge == {}
+
+    def test_per_judge_override_loaded(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            max_executor_retries: 5
+            max_executor_retries_per_judge:
+              test_review: 20
+              doc_review: 2
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.max_executor_retries == 5
+        assert result.max_executor_retries_per_judge == {"test_review": 20, "doc_review": 2}
+
+    def test_schema_rejects_unknown_judge_name(self, tmp_path: Path) -> None:
+        """JSONSchema additionalProperties: false rejects unknown names; the
+        loader wraps the schema error in ValueError with the original cause."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            max_executor_retries_per_judge:
+              not_a_real_judge: 5
+            """,
+        )
+        with pytest.raises(ValueError, match="failed schema validation") as exc_info:
+            load_runtime_config(cfg, {})
+        assert isinstance(exc_info.value.__cause__, jsonschema.ValidationError)
+
+    def test_schema_rejects_zero_or_negative_retry_value(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            max_executor_retries_per_judge:
+              test_review: 0
+            """,
+        )
+        with pytest.raises(ValueError, match="failed schema validation"):
+            load_runtime_config(cfg, {})
+
+    def test_loader_helper_rejects_non_mapping(self) -> None:
+        from devbench.config_loader import _load_per_judge_retries
+
+        with pytest.raises(ValueError, match="must be a mapping"):
+            _load_per_judge_retries(["not", "a", "dict"])
+
+    def test_loader_helper_returns_empty_dict_when_none(self) -> None:
+        from devbench.config_loader import _load_per_judge_retries
+
+        assert _load_per_judge_retries(None) == {}
+
+    def test_loader_helper_rejects_unknown_judge_at_runtime(self) -> None:
+        """Defense-in-depth: even if the JSONSchema layer is bypassed, the
+        runtime helper rejects unknown judge names with an actionable error."""
+        from devbench.config_loader import _load_per_judge_retries
+
+        with pytest.raises(ValueError, match="unknown judge"):
+            _load_per_judge_retries({"not_a_real_judge": 5})
+
+    def test_loader_helper_rejects_bool_as_int(self) -> None:
+        """Python's bool is a subclass of int; the helper must reject it
+        explicitly so a YAML ``true`` doesn't silently become budget=1."""
+        from devbench.config_loader import _load_per_judge_retries
+
+        with pytest.raises(ValueError, match="positive integer"):
+            _load_per_judge_retries({"test_review": True})
+
+
+class TestHookTailConfig:
+    """Issue #134 regression: ``hook_tail:`` YAML block loads into
+    ``RuntimeConfig.hook_tail`` with env > YAML > default precedence
+    plumbed through ``config.py``.
+
+    Mirrors the existing ``TestPerJudgeRetriesConfig`` pattern (env >
+    YAML > default + schema rejection of non-positive caps +
+    additionalProperties strictness for unknown keys).
+    """
+
+    @staticmethod
+    def _write(path: Path, content: str) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    def test_absent_block_yields_all_none(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.hook_tail.agent_width is None
+        assert result.hook_tail.tool_width is None
+        assert result.hook_tail.description_max is None
+        assert result.hook_tail.stdout_preview_max is None
+
+    def test_full_override_loaded(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            hook_tail:
+              agent_width: 16
+              tool_width: 12
+              description_max: 200
+              stdout_preview_max: 100
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.hook_tail.agent_width == 16
+        assert result.hook_tail.tool_width == 12
+        assert result.hook_tail.description_max == 200
+        assert result.hook_tail.stdout_preview_max == 100
+
+    def test_partial_override_leaves_others_none(self, tmp_path: Path) -> None:
+        """An operator who only wants to bump description_max should not
+        have to redeclare the other three -- they stay None and config.py
+        falls back to the constants."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            hook_tail:
+              description_max: 200
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.hook_tail.agent_width is None
+        assert result.hook_tail.tool_width is None
+        assert result.hook_tail.description_max == 200
+        assert result.hook_tail.stdout_preview_max is None
+
+    def test_schema_rejects_zero_or_negative(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            hook_tail:
+              description_max: 0
+            """,
+        )
+        with pytest.raises(ValueError, match="failed schema validation"):
+            load_runtime_config(cfg, {})
+
+    def test_schema_rejects_unknown_keys(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            hook_tail:
+              not_a_real_key: 1
+            """,
+        )
+        with pytest.raises(ValueError, match="failed schema validation") as exc_info:
+            load_runtime_config(cfg, {})
+        assert isinstance(exc_info.value.__cause__, jsonschema.ValidationError)

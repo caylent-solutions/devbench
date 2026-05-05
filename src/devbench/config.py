@@ -29,20 +29,38 @@ from devbench.constants import (
     BACKLOG_SUBDIR,
     DEFAULT_ALERT_SUMMARY_LIMIT,
     DEFAULT_BEDROCK_REGION,
+    DEFAULT_BLOCKED_RECOVERY_WINDOW_SECONDS,
     DEFAULT_CACHE_READ_MULTIPLIER,
     DEFAULT_CACHE_WRITE_1HR_MULTIPLIER,
     DEFAULT_CACHE_WRITE_5MIN_MULTIPLIER,
+    DEFAULT_CHECK_REGISTRATION_DELAY_SECONDS,
+    DEFAULT_CHECK_REGISTRATION_RETRIES,
+    DEFAULT_CI_FAILURE_LOG_BYTES,
+    DEFAULT_CI_FAILURE_RETRY_ENABLED,
     DEFAULT_COMMAND_TIMEOUT,
     DEFAULT_DATA_RESIDENCY_MULTIPLIER,
+    DEFAULT_FAST_MODE_MULTIPLIER,
     DEFAULT_GH_API_TIMEOUT,
     DEFAULT_GITHUB_CHECK_TIMEOUT_SECONDS,
+    DEFAULT_HOOK_TAIL_AGENT_WIDTH,
+    DEFAULT_HOOK_TAIL_DESCRIPTION_MAX,
+    DEFAULT_HOOK_TAIL_STDOUT_PREVIEW_MAX,
+    DEFAULT_HOOK_TAIL_TOOL_WIDTH,
+    DEFAULT_INLINE_ORPHAN_CLEANUP_ENABLED,
     DEFAULT_LLM_EVIDENCE_TRUNCATION,
     DEFAULT_LLM_FILE_CONTEXT_LIMIT,
     DEFAULT_LLM_FILE_PREVIEW_CHARS,
     DEFAULT_LLM_TIMEOUT,
+    DEFAULT_MAX_CASCADE_DEPTH,
     DEFAULT_MAX_RETRY_ATTEMPTS,
     DEFAULT_ORCHESTRATOR_POLL_INTERVAL,
     DEFAULT_OUTPUT_TRUNCATION_LIMIT,
+    DEFAULT_PAUSE_BEFORE_MERGE,
+    DEFAULT_PR_REVIEW_AGENTS,
+    DEFAULT_PR_REVIEW_DECISION_BLOCKS,
+    DEFAULT_PR_REVIEW_POLL_INTERVAL,
+    DEFAULT_PR_REVIEW_RESOLUTION_ENABLED,
+    DEFAULT_PR_REVIEW_SETTLE_SECONDS,
     DEFAULT_RECENT_PACE_TASKS,
     DEFAULT_SECURITY_FETCH_TIMEOUT,
     DEFAULT_STOP_HOOK_MAX_BLOCKS,
@@ -96,6 +114,65 @@ def _resolve_optional_str(env_var: str, yaml_value: str | None) -> str | None:
     if yaml_value:
         return yaml_value
     return None
+
+
+def _env_truthy(env_var: str) -> bool:
+    """Return True iff the given environment variable is set to a truthy string.
+
+    Truthy strings are ``1``, ``true``, ``yes`` (case-insensitive). Empty or
+    unset returns False. Used for one-shot opt-out flags whose env var
+    represents the *negative* of the resolved boolean (no longer used by
+    devbench's config-resolution layer, kept for tests and operational
+    overrides).
+    """
+    return os.environ.get(env_var, "").strip().lower() in ("1", "true", "yes")
+
+
+def _resolve_bool(env_var: str, yaml_value: bool | None, default: bool) -> bool:
+    """Resolve a boolean config value with env > YAML > default precedence.
+
+    Recognised env values (case-insensitive):
+      truthy: ``1``, ``true``, ``yes``, ``on``
+      falsy:  ``0``, ``false``, ``no``, ``off``
+
+    Empty / unset env value falls through to the YAML value (when not None)
+    or the default. Any other env value raises ``ValueError`` so
+    misconfigurations fail fast at process start.
+
+    Args:
+        env_var: name of the environment variable to consult.
+        yaml_value: parsed YAML value, or ``None`` when the field is absent.
+        default: constant default to return when both env and YAML are
+            absent.
+
+    Returns:
+        Resolved boolean.
+
+    Raises:
+        ValueError: when the env var is set to an unparseable value.
+    """
+    raw = os.environ.get(env_var, "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    if raw:
+        raise ValueError(f"{env_var} must be one of 1/0/true/false/yes/no/on/off (case-insensitive); got {raw!r}")
+    if yaml_value is not None:
+        return yaml_value
+    return default
+
+
+def _resolve_str_tuple(env_var: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    """Resolve a tuple of strings from a comma-separated env var.
+
+    Empty / unset returns *default*. Whitespace around each item is stripped;
+    empty items are dropped.
+    """
+    raw = os.environ.get(env_var, "").strip()
+    if not raw:
+        return default
+    return tuple(item.strip() for item in raw.split(",") if item.strip())
 
 
 def _resolve_float(env_var: str | None, yaml_value: float | None, default: float) -> float:
@@ -182,6 +259,88 @@ MAX_RETRY_ATTEMPTS: int = _resolve_int(
 GITHUB_CHECK_TIMEOUT_SECONDS: int = _resolve_int(
     "JUDGE_GH_TIMEOUT", RUNTIME_CONFIG.timeouts.github_check, DEFAULT_GITHUB_CHECK_TIMEOUT_SECONDS
 )
+# Issue #114: workflow-registration race defence. The retry loop runs
+# `gh pr checks` up to CHECK_REGISTRATION_RETRIES times when the local
+# `<repo>/.github/workflows/*.y[a]ml` glob proves CI exists but `gh`
+# returns "no checks reported" (Actions has not yet enqueued the run).
+# Lives under the YAML `debug:` section because operators only tune
+# these when investigating an unusual orchestrator cadence; everyday
+# workspaces leave them at the constant default.
+CHECK_REGISTRATION_RETRIES: int = _resolve_int(
+    "JUDGE_CHECK_REGISTRATION_RETRIES",
+    RUNTIME_CONFIG.debug.check_registration_retries,
+    DEFAULT_CHECK_REGISTRATION_RETRIES,
+)
+CHECK_REGISTRATION_DELAY_SECONDS: int = _resolve_int(
+    "JUDGE_CHECK_REGISTRATION_DELAY_SECONDS",
+    RUNTIME_CONFIG.debug.check_registration_delay_seconds,
+    DEFAULT_CHECK_REGISTRATION_DELAY_SECONDS,
+)
+# Recency cap for the AWAITING_AUTO_RECOVERY audit-comment heuristic in
+# the 3-state blocked-task classifier. Lives under YAML `debug:` for
+# the same reason as the registration knobs above.
+BLOCKED_RECOVERY_WINDOW_SECONDS: int = _resolve_int(
+    "JUDGE_BLOCKED_RECOVERY_WINDOW_SECONDS",
+    RUNTIME_CONFIG.debug.blocked_recovery_window_seconds,
+    DEFAULT_BLOCKED_RECOVERY_WINDOW_SECONDS,
+)
+# Phase 1: inline orphan-cleanup. Default-on; YAML
+# `git_ops.inline_orphan_cleanup: false` or env
+# `JUDGE_INLINE_ORPHAN_CLEANUP=0` (or `false` / `no` / `off`) opts out.
+INLINE_ORPHAN_CLEANUP_ENABLED: bool = _resolve_bool(
+    "JUDGE_INLINE_ORPHAN_CLEANUP",
+    RUNTIME_CONFIG.git_ops.inline_orphan_cleanup,
+    DEFAULT_INLINE_ORPHAN_CLEANUP_ENABLED,
+)
+# Phase 2 (#115): CI-failure feedback log byte cap.
+CI_FAILURE_LOG_BYTES: int = _resolve_int(
+    "JUDGE_CI_FAILURE_LOG_BYTES",
+    RUNTIME_CONFIG.limits.ci_failure_log_bytes,
+    DEFAULT_CI_FAILURE_LOG_BYTES,
+)
+# Phase 2 (#115): CI-failure executor retry. Default-on (FLIPPED in the
+# v-next release); YAML `git_ops.ci_failure_retry: false` or env
+# `JUDGE_CI_FAILURE_RETRY_ENABLED=0` opts out.
+CI_FAILURE_RETRY_ENABLED: bool = _resolve_bool(
+    "JUDGE_CI_FAILURE_RETRY_ENABLED",
+    RUNTIME_CONFIG.git_ops.ci_failure_retry,
+    DEFAULT_CI_FAILURE_RETRY_ENABLED,
+)
+# Phase 3 (#116): PR review-comment polling. Default-off; YAML
+# `git_ops.pr_review_resolution.enabled: true` + `agents: [...]` opts in.
+PR_REVIEW_SETTLE_SECONDS: int = _resolve_int(
+    "JUDGE_PR_REVIEW_SETTLE_SECONDS",
+    RUNTIME_CONFIG.git_ops.pr_review_resolution.settle_seconds,
+    DEFAULT_PR_REVIEW_SETTLE_SECONDS,
+)
+PR_REVIEW_POLL_INTERVAL: int = _resolve_int(
+    "JUDGE_PR_REVIEW_POLL_INTERVAL",
+    RUNTIME_CONFIG.git_ops.pr_review_resolution.poll_interval,
+    DEFAULT_PR_REVIEW_POLL_INTERVAL,
+)
+PR_REVIEW_DECISION_BLOCKS: bool = _resolve_bool(
+    "JUDGE_PR_REVIEW_DECISION_BLOCKS",
+    RUNTIME_CONFIG.git_ops.pr_review_resolution.decision_blocks,
+    DEFAULT_PR_REVIEW_DECISION_BLOCKS,
+)
+PR_REVIEW_AGENTS: tuple[str, ...] = _resolve_str_tuple(
+    "JUDGE_PR_REVIEW_AGENTS",
+    tuple(RUNTIME_CONFIG.git_ops.pr_review_resolution.agents) or DEFAULT_PR_REVIEW_AGENTS,
+)
+PR_REVIEW_RESOLUTION_ENABLED: bool = _resolve_bool(
+    "JUDGE_PR_REVIEW_RESOLUTION_ENABLED",
+    RUNTIME_CONFIG.git_ops.pr_review_resolution.enabled,
+    DEFAULT_PR_REVIEW_RESOLUTION_ENABLED,
+)
+# Issue #101: pause-before-merge. Default-off; YAML
+# `git_ops.pause_before_merge: true` or env `JUDGE_PAUSE_BEFORE_MERGE=1`
+# opts in. Mutually exclusive with `defer_pr` and `single_branch`
+# (validated at YAML load).
+PAUSE_BEFORE_MERGE: bool = _resolve_bool(
+    "JUDGE_PAUSE_BEFORE_MERGE",
+    RUNTIME_CONFIG.git_ops.pause_before_merge,
+    DEFAULT_PAUSE_BEFORE_MERGE,
+)
 _claude_model = os.environ.get("JUDGE_CLAUDE_MODEL", "")
 if not _claude_model:
     raise RuntimeError(
@@ -266,12 +425,46 @@ REPORT_DATA_RESIDENCY_MULTIPLIER: float = _resolve_float(
     RUNTIME_CONFIG.report.data_residency_multiplier,
     DEFAULT_DATA_RESIDENCY_MULTIPLIER,
 )
+REPORT_FAST_MODE_MULTIPLIER: float = _resolve_float(
+    "JUDGE_REPORT_FAST_MODE_MULTIPLIER",
+    RUNTIME_CONFIG.report.fast_mode_multiplier,
+    DEFAULT_FAST_MODE_MULTIPLIER,
+)
 # Number of most-recent task completions averaged for the "Recent pace"
 # projection in `devbench report`. Resolution precedence: env > YAML > constant.
 RECENT_PACE_TASKS: int = _resolve_int(
     "JUDGE_REPORT_RECENT_PACE_TASKS",
     RUNTIME_CONFIG.report.recent_pace_tasks,
     DEFAULT_RECENT_PACE_TASKS,
+)
+# Hook-tail column caps (issue #134). Resolution precedence: env > YAML >
+# constant. EVENT_WIDTH stays a hook_tail.py-local constant; the four below
+# are the operator-tunable knobs.
+HOOK_TAIL_AGENT_WIDTH: int = _resolve_int(
+    "JUDGE_HOOK_TAIL_AGENT_WIDTH",
+    RUNTIME_CONFIG.hook_tail.agent_width,
+    DEFAULT_HOOK_TAIL_AGENT_WIDTH,
+)
+HOOK_TAIL_TOOL_WIDTH: int = _resolve_int(
+    "JUDGE_HOOK_TAIL_TOOL_WIDTH",
+    RUNTIME_CONFIG.hook_tail.tool_width,
+    DEFAULT_HOOK_TAIL_TOOL_WIDTH,
+)
+HOOK_TAIL_DESCRIPTION_MAX: int = _resolve_int(
+    "JUDGE_HOOK_TAIL_DESCRIPTION_MAX",
+    RUNTIME_CONFIG.hook_tail.description_max,
+    DEFAULT_HOOK_TAIL_DESCRIPTION_MAX,
+)
+HOOK_TAIL_STDOUT_PREVIEW_MAX: int = _resolve_int(
+    "JUDGE_HOOK_TAIL_STDOUT_PREVIEW_MAX",
+    RUNTIME_CONFIG.hook_tail.stdout_preview_max,
+    DEFAULT_HOOK_TAIL_STDOUT_PREVIEW_MAX,
+)
+# Recovery-cascade depth cap (issue #144). env > YAML > default.
+MAX_CASCADE_DEPTH: int = _resolve_int(
+    "JUDGE_ORCHESTRATE_MAX_CASCADE_DEPTH",
+    RUNTIME_CONFIG.orchestrate.max_cascade_depth,
+    DEFAULT_MAX_CASCADE_DEPTH,
 )
 STOP_HOOK_MAX_BLOCKS: int = _resolve_int(
     "JUDGE_STOP_MAX_BLOCKS", RUNTIME_CONFIG.stop_hook.max_blocks, DEFAULT_STOP_HOOK_MAX_BLOCKS

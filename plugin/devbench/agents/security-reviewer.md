@@ -14,7 +14,37 @@ Work unit and repo context:
 Git diff (authoritative work-unit scope per ADR-12):
 !`uv run devbench get-diff $ARGUMENTS`
 
-**Scope contract:** `devbench get-diff` is the AUTHORITATIVE source of "what changed in this work unit". Do NOT run `git diff origin/main`, `git diff main...HEAD`, or any other raw-git command to compute scope; in single-branch + defer_pr mode those views include accumulated work from prior tasks (ADR-12) and produce false positives.
+**Scope contract (issue #126 -- enforced):** `devbench get-diff` is the
+AUTHORITATIVE source of "what changed in this work unit", which means
+the **only** files you may evaluate are paths that appear in that diff
+output. Specifically:
+
+1. **Capture the in-scope path set first.** Before reading any file
+   for security analysis, record the list of paths that appear in the
+   `get-diff` output above. That list is your in-scope set.
+2. **Do NOT read files outside the in-scope set.** Other files in the
+   working tree may carry hardcoded secrets, account IDs, or other
+   patterns that would normally be findings; if they are not in the
+   in-scope set they belong to a different work unit (or to the
+   pre-existing baseline) and are out of scope for this review.
+3. **Do NOT run `git diff origin/main`, `git diff main...HEAD`, or any
+   other raw-git command to compute scope** -- in single-branch +
+   defer_pr mode those views include accumulated work from prior tasks
+   (ADR-12) and produce false positives.
+4. **Every finding's verdict body must cite an in-scope path.** When
+   rendering your verdict, drop (do not include) any finding whose
+   cited path is outside the in-scope set. If after dropping
+   out-of-scope findings the remaining set has zero CRITICAL/HIGH
+   findings, the verdict is PASS even if you noticed bad patterns in
+   other files.
+5. **If your in-scope set is empty** (the diff is empty), return PASS
+   with the one-line summary "no in-scope changes". Do not search the
+   working tree for content to evaluate.
+
+This rule is regression-tested
+(`tests/test_integration/test_security_review_scope.py`); a verdict
+that cites an out-of-scope path is a bug to be filed against this
+prompt, not the operator's filesystem.
 
 ---
 
@@ -123,3 +153,9 @@ uv run devbench log-verdict security_review $ARGUMENTS <pass|fail> "<one-line su
 ```
 
 If failing, include the most critical finding (with severity classification) in the summary. Detailed reasoning goes in your response text.
+
+**Verdict-emission contract (issue #156, FAIL only):** in addition to `log-verdict`, persist a structured rejection JSON via:
+```
+uv run devbench log-rejection-feedback security_review $ARGUMENTS --json '<payload>'
+```
+Payload shape: `{"categories": [{"code": "<CODE>", "severity": "fail"|"warn", "summary": "<one-line>", "remediation": "<actionable fix>", "files": ["<path>"]}, ...], "raw_verdict_text": "<full verdict body>"}`. Every `code` MUST come from the controlled vocabulary for `security_review`: `SECRET_LEAK`, `UNAUTHORIZED_DEP`, `SCOPE_VIOLATION`. See `docs/review-feedback-vocabulary.md` for per-code remediation guidance.

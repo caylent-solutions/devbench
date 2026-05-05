@@ -87,6 +87,26 @@ Every amendment action leaves a timestamped entry in the work-unit `## Comments`
 
 The amender also logs a final `REVIEW_PASS` or `REVIEW_FAIL` verdict via `log-verdict manifest_amender` so the done-gate and review history are coherent.
 
+### Rejection feedback persistence (issue #154)
+
+Every rejection also writes a structured feedback JSON to `<workspace>/.devbench/amender-rejections/<task-id>-<n>.json` so the executor-feedback collector can ingest the rejection on the next retry. Schema:
+
+```json
+{
+  "task_id": "EX-F1-S1-T1",
+  "attempt": 1,
+  "reason_category": "SCOPE",
+  "reason_text": "amendment is out of scope for this task",
+  "request": { /* original AmendmentRequest dict */ },
+  "capped": false,
+  "recorded_at": "2026-05-02T12:34:56Z"
+}
+```
+
+`reason_category` is one of `SCOPE` / `APPROACH_AUTH` / `JUSTIFICATION_COHERENCE` / `PRE_FILTER` / `OTHER`. Rejection reasons that include any of the canonical category tokens are auto-classified by substring match; everything else falls back to `OTHER`. The amender prompt instructs the LLM to surface the canonical token inline so consumers always see a known category.
+
+The directory layout mirrors `<workspace>/.devbench/ci-failures/` (used by `_handle_ci_failure`) and `<workspace>/.devbench/pr-bot-feedback/` (used by `_handle_pr_review_resolution`). The blocker-resolver / executor-feedback consumer reads all three paths via the same retry pipeline so every kind of late-stage rejection feeds the next executor invocation. The per-task attempt counter is bounded by `MAX_RETRY_ATTEMPTS`; once the cap is exceeded the file is still written but stamped `"capped": true` so consumers can detect budget exhaustion rather than silently dropping the record.
+
 ## What the amendment workflow does NOT do
 
 - **It does not weaken `AC-FINAL-015`.** The Changes Manifest mismatch rule still fires; amendments are the only path to a manifest change, and every amendment is audited.
@@ -111,3 +131,13 @@ The amender also logs a final `REVIEW_PASS` or `REVIEW_FAIL` verdict via `log-ve
 - `plugin/devbench/agents/manifest-amender.md` -- Layer 2 judge prompt.
 - `plugin/devbench/skills/orchestrate/SKILL.md` -- step 4b of the main loop.
 - `tests/test_backlog/test_manifest.py`, `tests/test_backlog/test_amendment.py`, `tests/test_backlog/test_amendment_prefilter.py`, `tests/test_integration/test_amendment_lifecycle.py` -- unit + integration coverage.
+
+## Pre-conflict check (issue #137)
+
+Before approving an amendment that adds a file to a work-unit's Changes Manifest, the manifest-amender scans every other work-unit's Manifest table for the same file path. The validator's `_check_manifest_conflicts` helper exposes this map (operationally: `uv run devbench validate-backlog 2>&1 | grep "Manifest conflict on '<file>'"`).
+
+- **No conflict**: ALLOW.
+- **Conflict task in terminal state (`done` / `declined`) AND new row is `Modify`**: ALLOW + auto-wire the dep edge by invoking `uv run devbench add-dep <source-task-id> <conflict-task-id>` (issue #142) before emitting the `apply` verdict; then log `[CONFLICT_AUTODEP]` naming the wired pair. If the `add-dep` invocation fails, emit `[CONFLICT_AUTODEP_FAILED]` with the underlying error -- the amendment still applies, but the operator is paged to wire the dep manually.
+- **Otherwise**: REJECT with a structured reason naming the conflict task. The blocker-resolver / task-factory cascade then materialises a recovery task whose own Manifest is markdown-only per issue #136.
+
+This pre-filter prevents new conflicts from being authored in the first place, which makes the recovery cascade an exception rather than the norm. Regression coverage: `tests/test_integration/test_manifest_amender_pre_conflict.py`.

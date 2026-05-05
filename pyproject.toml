@@ -15,6 +15,13 @@ dependencies = [
     "jsonschema>=4.0.0",
 ]
 
+# Issue #162 Phase 7 (ADR-21): opt-in Parquet cold archive. The mainline
+# install picks up zero new mandatory deps; operators who want to
+# archive ended sessions for long-term retention install the [archive]
+# extra.
+[project.optional-dependencies]
+archive = ["pyarrow>=15.0.0"]
+
 [project.scripts]
 devbench = "devbench.cli:main"
 
@@ -31,6 +38,12 @@ dev = [
     "mypy>=1.15.0",
     "types-pyyaml>=6.0.12.20250915",
     "types-jsonschema>=4.23.0.20241208",
+    # Issue #162 Phase 7: tests exercise the [archive] extra's
+    # round-trip behaviour. Mainline `pip install devbench` does NOT
+    # carry pyarrow; only `pip install devbench[archive]` does. The
+    # dev-group install pulls it in so the test suite can pin the
+    # parity contract without operators paying the install cost.
+    "pyarrow>=15.0.0",
 ]
 
 [tool.ruff]
@@ -72,6 +85,7 @@ ignore = [
     "S105",    # Possible hardcoded password — Verdict.PASS is not a password
     "PLW1510", # subprocess.run without check — we check returncode manually
     "S108",    # Insecure temp file — /tmp path is configurable via env var
+    "S608",    # SQL injection via string-based query — variable-length IN(?,?,?) clauses build a placeholder-only sub-string from ",".join("?" for _) — no user input ever flows into the SQL string; values pass through the params argument as bound parameters, which is the standard Python sqlite3 idiom (issue #168)
     "ARG002",  # unused method args — abstract base class requires signature conformance
     "PLR2004", # magic values — thresholds are self-documenting in context
     "PLR0915", # too many statements — orchestrator process_work_unit is a state machine
@@ -93,12 +107,12 @@ quote-style = "double"
 indent-style = "space"
 
 [tool.mypy]
-mypy_path = ["src", "tests"]
+mypy_path = ["src", "tests", "tools"]
 explicit_package_bases = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src", "tests"]
+pythonpath = ["src", "tests", "tools"]
 python_classes = ["Test*"]
 filterwarnings = [
     "ignore::pytest.PytestCollectionWarning",
@@ -106,4 +120,5 @@ filterwarnings = [
 markers = [
     "unit: unit tests (run with pytest -m unit)",
     "functional: functional/integration tests (run with pytest -m functional)",
+    "integration: integration tests (run with pytest -m integration)",
 ]

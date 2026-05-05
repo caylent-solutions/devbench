@@ -1,0 +1,19 @@
+---
+# yamllint configuration for the Ansible playbooks and roles under
+# infra/ansible/. The default line-length cap of 80 chars is too tight
+# for idiomatic Ansible (URLs, apt-repo declarations with jinja-shaped
+# arch substitutions, package lists, multi-argument shell commands).
+# Cap is lifted to 300 to cover the longest legitimate line in the
+# tree (a Docker apt-repo declaration with conditional arch and
+# signed-by, ~230 chars). All rules stay non-fatal so the CI job
+# (`yamllint -s -c .yamllint infra/ansible`) never trips on cosmetic
+# wrapping; real YAML errors still fail the job because they
+# emit `error` level regardless.
+extends: default
+
+rules:
+  line-length:
+    max: 300
+    level: warning
+  truthy:
+    allowed-values: ["true", "false", "yes", "no"]

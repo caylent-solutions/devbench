@@ -17,21 +17,24 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=_hook_lib.sh
+. "$SCRIPT_DIR/_hook_lib.sh"
+
 INPUT=$(cat)
+COMMAND=$(extract_command "$INPUT")
+decode_json_escapes COMMAND
 
-COMMAND=$(printf '%s' "$INPUT" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-print(d.get('tool_input', {}).get('command', ''))
-" 2>/dev/null || true)
-
-EXIT_CODE=$(printf '%s' "$INPUT" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-result = d.get('tool_result', {})
-code = result.get('exit_code', 0)
-print(int(code))
-" 2>/dev/null || true)
+# Tool result lives at ``.tool_result.exit_code`` (the test fixtures
+# and the original implementation use ``tool_result``; some Claude
+# Code versions also surface ``tool_response`` -- accept either by
+# falling through). Use jq when available; sed fallback only extracts
+# the integer no matter which key wraps it.
+if command -v jq >/dev/null 2>&1; then
+  EXIT_CODE=$(printf '%s' "$INPUT" | jq -r '(.tool_result.exit_code // .tool_response.exit_code) // empty' 2>/dev/null || true)
+else
+  EXIT_CODE=$(printf '%s' "$INPUT" | sed -nE 's/.*"exit_code"[[:space:]]*:[[:space:]]*([0-9-]+).*/\1/p' | head -1)
+fi
 
 # No command to inspect -- allow.
 if [[ -z "$COMMAND" ]]; then

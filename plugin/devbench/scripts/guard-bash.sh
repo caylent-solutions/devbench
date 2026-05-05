@@ -9,8 +9,13 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=_hook_lib.sh
+. "$SCRIPT_DIR/_hook_lib.sh"
+
 INPUT=$(cat)
-COMMAND=$(printf '%s' "$INPUT" | python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('tool_input', {}).get('command', ''))" 2>/dev/null || true)
+COMMAND=$(extract_command "$INPUT")
+decode_json_escapes COMMAND
 
 if [[ -z "$COMMAND" ]]; then
   exit 0

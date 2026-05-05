@@ -42,13 +42,13 @@ FORBIDDEN_PHRASES=(
 
 EXPECTED_ORDER="log-comment <agent> <unit-id> <message>"
 
-INPUT=$(cat)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=_hook_lib.sh
+. "$SCRIPT_DIR/_hook_lib.sh"
 
-COMMAND=$(printf '%s' "$INPUT" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-print(d.get('tool_input', {}).get('command', ''))
-" 2>/dev/null || true)
+INPUT=$(cat)
+COMMAND=$(extract_command "$INPUT")
+decode_json_escapes COMMAND
 
 # No command to inspect -- allow.
 if [[ -z "$COMMAND" ]]; then
@@ -60,60 +60,59 @@ if ! printf '%s' "$COMMAND" | grep -qE '(^|[[:space:]])uv[[:space:]]+run[[:space
   exit 0
 fi
 
-# Parse arguments from the command string using Python's shlex for safe
-# shell-word splitting -- no eval, no user-controlled string execution.
-#
-# The Python block writes 5 lines to stdout:
-#   line 1: "HELP" if --help/-h appears after log-comment, else empty
-#   line 2: number of positional args (after truncation at shell meta-tokens)
-#   line 3..5: agent, unit_id, message (empty if missing; message joins remaining args)
-#
-# Shell meta-tokens end positional parsing so `log-comment 2>&1 | tail`
-# yields 0 args instead of treating '2>&1' as the agent.
-PARSE_OUT=$(printf '%s' "$COMMAND" | python3 -c "
-import sys, shlex
-META = {'|', '||', '&&', ';', '&', '<', '<<', '>', '>>', '2>', '1>', '2>&1', '>&', '&>'}
-HELP_FLAGS = {'--help', '-h'}
-try:
-    tokens = shlex.split(sys.stdin.read())
-except ValueError:
-    print(''); print('0'); print(''); print(''); print('')
-    sys.exit(0)
-try:
-    idx = next(i for i, t in enumerate(tokens) if t == 'log-comment')
-except StopIteration:
-    print(''); print('0'); print(''); print(''); print('')
-    sys.exit(0)
-tail = tokens[idx + 1:]
-# Truncate at the first shell meta-token (redirection / pipe / chain separator).
-args = []
-for t in tail:
-    if t in META:
-        break
-    args.append(t)
-help_seen = 'HELP' if any(a in HELP_FLAGS for a in args) else ''
-print(help_seen)
-print(len(args))
-print(args[0] if len(args) > 0 else '')
-print(args[1] if len(args) > 1 else '')
-# Message: join the remaining tokens with single spaces. log-comment's CLI
-# accepts the message as either one quoted arg or multiple words; either way
-# the joined string is what the user / agent sees.
-print(' '.join(args[2:]) if len(args) > 2 else '')
-" 2>/dev/null || printf '\n0\n\n\n\n')
+# Parse arguments using pure-bash word splitting. The previous
+# implementation used ``python3 -c shlex.split`` which silently
+# returned no tokens whenever asdf shims could not resolve python3 in
+# the hook's cwd; the legitimate log-comment calls then tripped the
+# "missing required argument" branch and got blocked. Pure bash keeps
+# the splitting in-shell and works everywhere.
+META_TOKENS=(\| \|\| \&\& \; \& \< \<\< \> \>\> 2\> 1\> 2\>\&1 \>\& \&\>)
+HELP_FLAGS=(--help -h)
+read -ra TOKENS <<< "$COMMAND"
 
-# Use mapfile so individual field reads cannot trip `set -e` when Python's
-# trailing empty lines are stripped by command substitution. Pad to 5 entries
-# so every later reference is safe.
-mapfile -t PARSE_LINES <<< "$PARSE_OUT"
-while (( ${#PARSE_LINES[@]} < 5 )); do
-  PARSE_LINES+=("")
+LV_IDX=-1
+for i in "${!TOKENS[@]}"; do
+  if [[ "${TOKENS[$i]}" == "log-comment" ]]; then
+    LV_IDX=$i
+    break
+  fi
 done
-HELP_SEEN="${PARSE_LINES[0]}"
-ARG_COUNT="${PARSE_LINES[1]:-0}"
-AGENT="${PARSE_LINES[2]}"
-UNIT_ID="${PARSE_LINES[3]}"
-MESSAGE="${PARSE_LINES[4]}"
+
+if (( LV_IDX < 0 )); then
+  exit 0
+fi
+
+ARGS=()
+HELP_SEEN=""
+for (( i = LV_IDX + 1; i < ${#TOKENS[@]}; i++ )); do
+  tok="${TOKENS[$i]}"
+  is_meta=0
+  for m in "${META_TOKENS[@]}"; do
+    if [[ "$tok" == "$m" ]]; then is_meta=1; break; fi
+  done
+  if (( is_meta == 1 )); then break; fi
+  is_help=0
+  for h in "${HELP_FLAGS[@]}"; do
+    if [[ "$tok" == "$h" ]]; then is_help=1; break; fi
+  done
+  if (( is_help == 1 )); then HELP_SEEN="HELP"; fi
+  ARGS+=("$tok")
+done
+
+ARG_COUNT="${#ARGS[@]}"
+AGENT="${ARGS[0]:-}"
+UNIT_ID="${ARGS[1]:-}"
+if (( ARG_COUNT > 2 )); then
+  MESSAGE="${ARGS[*]:2}"
+else
+  MESSAGE=""
+fi
+# Strip a single surrounding pair of quotes if the message was authored
+# as one quoted shell word; bash's IFS-split keeps the quote characters.
+MESSAGE="${MESSAGE#\'}"
+MESSAGE="${MESSAGE%\'}"
+MESSAGE="${MESSAGE#\"}"
+MESSAGE="${MESSAGE%\"}"
 
 # --- Passthrough: --help / -h lets the CLI print usage without hook interference ---
 if [[ "$HELP_SEEN" == "HELP" ]]; then

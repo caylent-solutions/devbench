@@ -8,7 +8,7 @@ from unittest.mock import patch
 import pytest
 
 from devbench.backlog.manager import BacklogManager
-from devbench.config_loader import RepoConfig, RuntimeConfig
+from devbench.config_loader import RepoConfig, RuntimeConfig, ValidateConfig
 from devbench.constants import ALL_REQUIRED_JUDGE_NAMES, REVIEW_JUDGE_NAMES, SECURITY_JUDGE_NAMES, VALID_STATUSES
 
 
@@ -235,6 +235,48 @@ class TestMarkBlocked:
             if "E0-F1-S1-T1" in line:
                 assert "blocked" in line
                 break
+
+
+class TestMarkHeldAndUnheld:
+    """E222: mark_held and unmark_held lifecycle methods."""
+
+    def test_mark_held_updates_both_files_and_writes_audit(
+        self,
+        tmp_work_unit_file: Path,
+        backlog_index_titlecase: Path,
+    ) -> None:
+        manager = BacklogManager()
+        manager.mark_held(tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1", "awaiting product input")
+
+        wu_content = tmp_work_unit_file.read_text()
+        assert "## Status: hold" in wu_content
+        assert "[HOLD]" in wu_content
+        assert "awaiting product input" in wu_content
+
+        index_content = backlog_index_titlecase.read_text()
+        for line in index_content.splitlines():
+            if "E0-F1-S1-T1" in line:
+                assert "hold" in line
+                break
+        else:
+            pytest.fail("E0-F1-S1-T1 row not found in BACKLOG.md after mark_held")
+
+    def test_unmark_held_returns_unit_to_in_queue_with_audit(
+        self,
+        tmp_work_unit_file: Path,
+        backlog_index_titlecase: Path,
+    ) -> None:
+        manager = BacklogManager()
+        manager.mark_held(tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1", "deferred")
+        manager.unmark_held(tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1", "input received")
+
+        wu_content = tmp_work_unit_file.read_text()
+        assert "## Status: in-queue" in wu_content
+        # Both audit markers must be present so the lifecycle is reconstructible.
+        assert "[HOLD]" in wu_content
+        assert "[UNHOLD]" in wu_content
+        assert "deferred" in wu_content
+        assert "input received" in wu_content
 
 
 class TestRollupParentStatus:
@@ -1123,6 +1165,214 @@ class TestValidateManifestPathPrefix:
         assert "EX-F1-S1-T2" in prefix_errors[0]
         assert "EX-F1-S1-T1" not in prefix_errors[0]
         assert "EX-F1-S1-T3" not in prefix_errors[0]
+
+
+# ---------------------------------------------------------------------------
+# validate() --fix mode (auto-correct rule-10 and rule-11 violations)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestValidateFix:
+    """Tests for BacklogManager.validate(fix=True) auto-correction mode.
+
+    Four contract pins:
+    1. fix=True strips checkout_directory prefix from manifest paths (rule-11).
+    2. fix=True replaces em-dash characters with '--' (rule-10).
+    3. fix=True appends an audit comment with a timestamp to the corrected file.
+    4. fix=False (default) leaves the file unchanged (read-only).
+    """
+
+    _INDEX_HEADER = (
+        "# Backlog\n\n"
+        "## Status Summary\n\n"
+        "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
+        "|------|-------|------|-------------|----------|---------|\n"
+        "\n"
+        "## Full Work Unit Index\n\n"
+        "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+        "|-----|-------|------|--------|-------------|------|-----------|\n"
+    )
+
+    def _make_index(self, tmp_path: Path, rows: str) -> Path:
+        idx = tmp_path / "BACKLOG.md"
+        idx.write_text(self._INDEX_HEADER + rows, encoding="utf-8")
+        return idx
+
+    def _make_task(
+        self,
+        backlog_dir: Path,
+        unit_id: str,
+        repo: str,
+        manifest_rows: str,
+        description: str = "Test task.",
+    ) -> Path:
+        wu = backlog_dir / f"{unit_id}.md"
+        wu.write_text(
+            f"# {unit_id}\n\n"
+            f"## Status: in-queue\n\n"
+            f"## Target Repository\n\n"
+            f"- **Repo:** `{repo}`\n\n"
+            f"## Description\n\n{description}\n\n"
+            f"## Acceptance Criteria\n\n- [ ] AC-TEST-001\n\n"
+            f"## Changes Manifest\n\n"
+            f"| File | Change |\n"
+            f"|------|--------|\n"
+            f"{manifest_rows}\n"
+            f"## Definition of Done\n\n- [ ] Done\n\n"
+            f"## Comments\n",
+            encoding="utf-8",
+        )
+        return wu
+
+    def test_fix_strips_checkout_directory_prefix_from_manifest_paths(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """fix=True removes the checkout_directory prefix from manifest paths (rule-11)."""
+        wu = self._make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "example-org/example-repo",
+            "| `example-repo/src/foo.py` | update |\n",
+        )
+        self._make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | Task | Task | in-queue | none | example-org/example-repo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        rt_cfg = RuntimeConfig(repos={"example-org/example-repo": RepoConfig(checkout_directory="example-repo")})
+        idx = tmp_path / "BACKLOG.md"
+        with patch("devbench.config.RUNTIME_CONFIG", rt_cfg):
+            errors = BacklogManager().validate(idx, tmp_path, fix=True)
+
+        prefix_errors = [e for e in errors if "Changes Manifest path" in e and "begins with" in e]
+        assert prefix_errors == [], f"Expected no prefix errors after fix, got: {prefix_errors}"
+
+        content = wu.read_text(encoding="utf-8")
+        assert "`example-repo/src/foo.py`" not in content
+        assert "`src/foo.py`" in content
+
+    def test_fix_replaces_em_dash_characters(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """fix=True replaces U+2014 em-dash characters with '--' (rule-10)."""
+        wu = self._make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "example-org/example-repo",
+            "| `src/foo.py` | update |\n",
+            description="Do something — with em-dash.",
+        )
+        self._make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | Task | Task | in-queue | none | example-org/example-repo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        idx = tmp_path / "BACKLOG.md"
+        errors = BacklogManager().validate(idx, tmp_path, fix=True)
+
+        em_errors = [e for e in errors if "em-dash" in e.lower()]
+        assert em_errors == [], f"Expected no em-dash errors after fix, got: {em_errors}"
+
+        content = wu.read_text(encoding="utf-8")
+        assert "—" not in content, "U+2014 em-dash must be replaced after fix"
+        assert "Do something -- with em-dash." in content
+
+    def test_fix_appends_audit_comment_with_timestamp(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """fix=True appends a [VALIDATE_FIX] audit comment with a timestamp."""
+        wu = self._make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "example-org/example-repo",
+            "| `src/foo.py` | update |\n",
+            description="Fix — this em-dash.",
+        )
+        self._make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | Task | Task | in-queue | none | example-org/example-repo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        idx = tmp_path / "BACKLOG.md"
+        BacklogManager().validate(idx, tmp_path, fix=True)
+
+        content = wu.read_text(encoding="utf-8")
+        assert "[VALIDATE_FIX]" in content, "Audit comment must be appended after fix"
+        assert "rule-10" in content, "Audit comment must name the corrected rule"
+        import re
+
+        assert re.search(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC", content), (
+            "Audit comment must include a timestamp in YYYY-MM-DD HH:MM UTC format"
+        )
+
+    def test_validate_without_fix_is_read_only(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """fix=False (default) does not modify work-unit files -- validate remains read-only."""
+        wu = self._make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "example-org/example-repo",
+            "| `src/foo.py` | update |\n",
+            description="Keep — the em-dash.",
+        )
+        original_content = wu.read_text(encoding="utf-8")
+        self._make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | Task | Task | in-queue | none | example-org/example-repo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        idx = tmp_path / "BACKLOG.md"
+        errors = BacklogManager().validate(idx, tmp_path)
+
+        assert any("em-dash" in e.lower() for e in errors), "em-dash violation must be reported without --fix"
+
+        assert wu.read_text(encoding="utf-8") == original_content, (
+            "validate() without fix=True must not modify any work-unit files"
+        )
+
+    def test_fix_skips_missing_work_unit_file(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """fix=True silently skips rows whose work-unit files do not exist on disk."""
+        self._make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | Task | Task | in-queue | none | example-org/example-repo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        idx = tmp_path / "BACKLOG.md"
+        errors = BacklogManager().validate(idx, tmp_path, fix=True)
+        assert any("missing" in e.lower() for e in errors), "Missing file must still be reported even when fix=True"
+
+    def test_fix_append_fix_audit_no_op_when_no_audit_lines(self) -> None:
+        """_append_fix_audit returns content unchanged when audit_lines is empty."""
+        content = "# Task\n\n## Status: in-queue\n"
+        result = BacklogManager._append_fix_audit(content, "2026-01-01 00:00 UTC", [])
+        assert result == content
+
+    def test_fix_append_fix_audit_creates_comments_section_if_absent(self) -> None:
+        """_append_fix_audit creates '## Comments' section when it is not already present."""
+        content = "# Task\n\n## Status: in-queue\n"
+        result = BacklogManager._append_fix_audit(content, "2026-01-01 00:00 UTC", ["[VALIDATE_FIX] rule-10"])
+        assert "## Comments" in result
+        assert "[VALIDATE_FIX] rule-10" in result
+
+    def test_fix_manifest_prefixes_no_op_when_checkout_dir_unset(self) -> None:
+        """_fix_manifest_prefixes returns unchanged content when checkout_directory is None."""
+        content = "## Target Repository\n\n- **Repo:** `org/repo`\n"
+        rt_cfg = RuntimeConfig(repos={"org/repo": RepoConfig(checkout_directory=None)})
+        with patch("devbench.config.RUNTIME_CONFIG", rt_cfg):
+            result, count = BacklogManager._fix_manifest_prefixes(content, [])
+        assert result == content
+        assert count == 0
+
+    def test_fix_manifest_prefixes_no_op_when_no_prefix_match(self) -> None:
+        """_fix_manifest_prefixes returns unchanged content when no manifest paths carry the prefix."""
+        content = (
+            "## Target Repository\n\n- **Repo:** `org/repo`\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|---|---|\n| `src/foo.py` | update |\n"
+        )
+        rt_cfg = RuntimeConfig(repos={"org/repo": RepoConfig(checkout_directory="repo")})
+        with patch("devbench.config.RUNTIME_CONFIG", rt_cfg):
+            result, count = BacklogManager._fix_manifest_prefixes(content, [])
+        assert result == content
+        assert count == 0
+
+    def test_fix_manifest_prefixes_no_op_when_parse_raises(self) -> None:
+        """_fix_manifest_prefixes returns unchanged content when parse_manifest raises
+        (e.g. the Changes Manifest section is absent from the file)."""
+        content = "## Target Repository\n\n- **Repo:** `org/repo`\n\n## Description\n\nno manifest here\n"
+        rt_cfg = RuntimeConfig(repos={"org/repo": RepoConfig(checkout_directory="repo")})
+        with patch("devbench.config.RUNTIME_CONFIG", rt_cfg):
+            result, count = BacklogManager._fix_manifest_prefixes(content, [])
+        assert result == content
+        assert count == 0
 
 
 # ---------------------------------------------------------------------------
@@ -2500,3 +2750,1607 @@ class TestCheckDependenciesCellCountMismatch:
         # The malformed row is silently skipped; valid rows still produce no
         # errors because their deps resolve.
         assert errors == []
+
+
+# ---------------------------------------------------------------------------
+# Post-Backlog-A Tier 3 rules: tests for _check_manifest_conflicts,
+# _check_language_ac_alignment, and _check_source_test_pairs. Each rule is
+# tested in isolation using the existing backlog_dir fixture. The helper
+# methods (_classify_manifest_tier, _is_production_source,
+# _is_real_manifest_path, _matching_test_basenames) are tested directly via
+# unit-style assertions on the BacklogManager class.
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyManifestTier:
+    """Direct tests for the language-tier classifier helper."""
+
+    def test_pure_python_returns_python(self) -> None:
+        assert BacklogManager._classify_manifest_tier(["src/foo.py", "tests/test_foo.py"]) == "Python"
+
+    def test_pure_hcl_returns_hcl(self) -> None:
+        assert BacklogManager._classify_manifest_tier(["infra/main.tf", "infra/vars.tfvars"]) == "HCL"
+
+    def test_pure_yaml_returns_yaml(self) -> None:
+        assert BacklogManager._classify_manifest_tier(["infra/properties/common.yaml"]) == "YAML"
+
+    def test_python_plus_yaml_returns_python(self) -> None:
+        # Python is dominant per docs/acceptance-criteria-canonical.md
+        assert BacklogManager._classify_manifest_tier(["src/foo.py", "config.yaml"]) == "Python"
+
+    def test_yaml_plus_json_returns_mixed(self) -> None:
+        assert BacklogManager._classify_manifest_tier(["a.yaml", "b.json"]) == "Mixed"
+
+    def test_empty_returns_empty_string(self) -> None:
+        assert BacklogManager._classify_manifest_tier([]) == ""
+
+
+class TestIsProductionSource:
+    """Direct tests for the source-vs-test classifier helper."""
+
+    def test_src_python_is_source(self) -> None:
+        assert BacklogManager._is_production_source("src/foo/bar.py") is True
+
+    def test_infra_scripts_python_is_source(self) -> None:
+        assert BacklogManager._is_production_source("infra/scripts/migrate.py") is True
+
+    def test_services_src_nested_is_source(self) -> None:
+        assert BacklogManager._is_production_source("services/api/src/handler.py") is True
+
+    def test_test_path_is_not_source(self) -> None:
+        assert BacklogManager._is_production_source("tests/unit/test_foo.py") is False
+
+    def test_nested_test_path_is_not_source(self) -> None:
+        assert BacklogManager._is_production_source("services/api/tests/unit/test_foo.py") is False
+
+    def test_init_py_is_not_source(self) -> None:
+        assert BacklogManager._is_production_source("src/foo/__init__.py") is False
+
+    def test_yaml_is_not_python_source(self) -> None:
+        assert BacklogManager._is_production_source("config.yaml") is False
+
+    def test_top_level_python_outside_src_is_not_source(self) -> None:
+        # Random top-level .py is not classified as production source
+        assert BacklogManager._is_production_source("setup.py") is False
+
+
+class TestIsRealManifestPath:
+    """Direct tests for the placeholder-string filter."""
+
+    def test_real_path_passes(self) -> None:
+        assert BacklogManager._is_real_manifest_path("src/foo.py") is True
+
+    def test_none_placeholder_filtered(self) -> None:
+        assert BacklogManager._is_real_manifest_path("(none)") is False
+
+    def test_no_file_changes_placeholder_filtered(self) -> None:
+        assert BacklogManager._is_real_manifest_path("(no file changes; verification-only)") is False
+
+    def test_empty_string_filtered(self) -> None:
+        assert BacklogManager._is_real_manifest_path("") is False
+
+
+class TestSourceStemForPairMatch:
+    """Direct tests for the source-stem helper used in pair matching."""
+
+    def test_simple_module_returns_basename_stem(self) -> None:
+        assert BacklogManager._source_stem_for_pair_match("src/foo.py") == "foo"
+
+    def test_nested_module_uses_basename_only(self) -> None:
+        assert BacklogManager._source_stem_for_pair_match("services/api/src/handler.py") == "handler"
+
+    def test_init_py_returns_empty(self) -> None:
+        assert BacklogManager._source_stem_for_pair_match("src/foo/__init__.py") == ""
+
+    def test_non_python_returns_empty(self) -> None:
+        assert BacklogManager._source_stem_for_pair_match("infra/main.tf") == ""
+
+
+class TestTestFilenamePairsWithStem:
+    """Direct tests for the test-file pair predicate used by the rule."""
+
+    def test_exact_test_prefix_match(self) -> None:
+        assert BacklogManager._test_filename_pairs_with_stem("tests/unit/test_event.py", "event")
+
+    def test_namespaced_test_prefix_match(self) -> None:
+        # Project convention: `test_telemetry_<basename>.py` for
+        # `<basename>.py` -- the stem appears as a substring of the
+        # underscore-tokenised inner test name.
+        assert BacklogManager._test_filename_pairs_with_stem("tests/unit/test_telemetry_event.py", "event")
+
+    def test_suffix_test_form_match(self) -> None:
+        # Some projects use `<basename>_test.py` instead of `test_<basename>.py`.
+        assert BacklogManager._test_filename_pairs_with_stem("tests/unit/event_test.py", "event")
+
+    def test_unrelated_test_does_not_match(self) -> None:
+        assert not BacklogManager._test_filename_pairs_with_stem("tests/unit/test_handler.py", "models")
+
+    def test_non_test_filename_rejected(self) -> None:
+        # Source files that are not in a test_*.py / *_test.py shape do not
+        # satisfy the pair predicate, even if their basename contains the stem.
+        assert not BacklogManager._test_filename_pairs_with_stem("src/event.py", "event")
+
+    def test_init_py_rejected(self) -> None:
+        assert not BacklogManager._test_filename_pairs_with_stem("tests/__init__.py", "event")
+
+
+class TestExtractDepIdsEdgeCases:
+    """Cover the degenerate-row branches in `_extract_dep_ids`."""
+
+    def test_empty_token_between_commas_is_skipped(self) -> None:
+        # Cell value "E1-F1-S1-T1, , E2-F1-S1-T1" includes an empty
+        # token after the first comma; the loop must skip it without
+        # adding anything for that slot.
+        content = "## Dependencies\n| E1-F1-S1-T1, , E2-F1-S1-T1 |\n"
+        deps = BacklogManager._extract_dep_ids(content)
+        assert deps == {"E1-F1-S1-T1", "E2-F1-S1-T1"}
+
+
+class TestTasksFormDepChainEdgeCases:
+    """Cover the trivial-input early return in `_tasks_form_dep_chain`."""
+
+    def test_single_id_is_trivially_a_chain(self) -> None:
+        assert BacklogManager._tasks_form_dep_chain(["E1-F1-S1-T1"], {}) is True
+
+    def test_empty_id_list_is_trivially_a_chain(self) -> None:
+        assert BacklogManager._tasks_form_dep_chain([], {}) is True
+
+
+class TestSourceTestPairsDefensiveStemGuard:
+    """Cover the `if not source_stem: continue` guard in `_check_source_test_pairs`.
+
+    Today's `_PYTHON_EXTS = (".py",)` makes the guard unreachable through
+    `_is_production_source`'s public contract -- any path that passes the
+    production-source filter has a non-empty stem. The guard exists to
+    keep the rule safe if `_PYTHON_EXTS` is expanded to include a
+    non-`.py` extension (where `_source_stem_for_pair_match` would
+    legitimately return ""). Patch `_source_stem_for_pair_match` to
+    simulate that future-state and confirm the rule swallows the entry
+    without raising or emitting an error.
+    """
+
+    def test_empty_stem_is_swallowed_without_emitting_error(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        wu_path = tmp_path / "wu.md"
+        wu_path.write_text(
+            "# Title\n\n## Changes Manifest\n\n| File | Action |\n|------|--------|\n| src/devbench/foo.py | new |\n",
+            encoding="utf-8",
+        )
+        rows = [("E1-F1-S1-T1", "in-queue", str(wu_path))]
+        errors: list[str] = []
+        monkeypatch.setattr(BacklogManager, "_source_stem_for_pair_match", staticmethod(lambda _p: ""))
+        manager = BacklogManager()
+        manager._check_source_test_pairs(rows, tmp_path, errors)
+        assert errors == []
+
+
+class _ValidateRuleHarness:
+    """Reusable harness for the new validate-rule tests.
+
+    Builds a minimal BACKLOG.md + work-unit files in a tmp_path. Each test
+    crafts the specific Manifest content under test, then runs validate()
+    and asserts on the relevant error subset.
+    """
+
+    INDEX_HEADER: str = (
+        "# Backlog\n\n"
+        "## Status Summary\n\n"
+        "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
+        "|------|-------|------|-------------|----------|---------|\n"
+        "\n"
+        "## Full Work Unit Index\n\n"
+        "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+        "|-----|-------|------|--------|-------------|------|-----------|\n"
+    )
+
+    @staticmethod
+    def make_index(tmp_path: Path, rows: str) -> Path:
+        idx = tmp_path / "BACKLOG.md"
+        idx.write_text(_ValidateRuleHarness.INDEX_HEADER + rows, encoding="utf-8")
+        return idx
+
+    @staticmethod
+    def make_task(
+        backlog_dir: Path,
+        unit_id: str,
+        repo: str,
+        manifest_rows: str,
+        ac_block: str = "- [ ] AC-TEST-001",
+        deps_rows: str = "| none | | |",
+        status: str = "in-queue",
+    ) -> Path:
+        wu = backlog_dir / f"{unit_id}.md"
+        wu.write_text(
+            f"# {unit_id}\n\n"
+            f"## Status: {status}\n\n"
+            f"## Target Repository\n\n"
+            f"- **Repo:** `{repo}`\n\n"
+            f"## Description\n\nTest task.\n\n"
+            f"## Dependencies\n\n"
+            f"| ID | Title | Status |\n"
+            f"|----|-------|--------|\n"
+            f"{deps_rows}\n\n"
+            f"## Acceptance Criteria\n\n{ac_block}\n\n"
+            f"## Changes Manifest\n\n"
+            f"| File | Change |\n"
+            f"|------|--------|\n"
+            f"{manifest_rows}\n"
+            f"## Definition of Done\n\n- [ ] Done\n",
+            encoding="utf-8",
+        )
+        return wu
+
+
+class TestValidateManifestConflicts:
+    """Tests for _check_manifest_conflicts (Manifest Conflict Rule)."""
+
+    H = _ValidateRuleHarness
+
+    def test_two_in_queue_tasks_same_path_same_repo_no_dep_emits_error(self, tmp_path: Path, backlog_dir: Path) -> None:
+        repo = "ex/foo"
+        self.H.make_task(backlog_dir, "EX-F1-S1-T1", repo, "| `shared.yaml` | new |\n")
+        self.H.make_task(backlog_dir, "EX-F1-S1-T2", repo, "| `shared.yaml` | edit |\n")
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n"
+            f"| EX-F1-S1-T2 | T2 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T2.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        conflict = [e for e in errors if "Manifest conflict" in e and "shared.yaml" in e]
+        assert len(conflict) == 1
+        assert "EX-F1-S1-T1" in conflict[0]
+        assert "EX-F1-S1-T2" in conflict[0]
+        assert "docs/backlog-contract.md" in conflict[0]
+
+    def test_two_tasks_different_repos_same_path_no_error(self, tmp_path: Path, backlog_dir: Path) -> None:
+        # The conflict check is scoped by (repo, path); two different repos
+        # legitimately can list the same path.
+        self.H.make_task(backlog_dir, "EX-F1-S1-T1", "ex/repo-a", "| `shared.yaml` | new |\n")
+        self.H.make_task(backlog_dir, "EX-F2-S1-T1", "ex/repo-b", "| `shared.yaml` | new |\n")
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/repo-a | `backlog/EX-F1-S1-T1.md` |\n"
+            "| EX-F2-S1-T1 | T1 | Task | in-queue | none | ex/repo-b | `backlog/EX-F2-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        assert not any("Manifest conflict" in e for e in errors)
+
+    def test_two_tasks_with_explicit_dep_no_error(self, tmp_path: Path, backlog_dir: Path) -> None:
+        # When the later Task lists the earlier in its Dependencies, the
+        # ownership conflict resolves into a sequential ordering. Use the
+        # production-shape E\d+ IDs so the dep-extraction regex matches.
+        repo = "ex/foo"
+        self.H.make_task(backlog_dir, "E9-F1-S1-T1", repo, "| `shared.yaml` | new |\n")
+        self.H.make_task(
+            backlog_dir,
+            "E9-F1-S1-T2",
+            repo,
+            "| `shared.yaml` | edit |\n",
+            deps_rows="| E9-F1-S1-T1 | dep | proposed |",
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| E9-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/E9-F1-S1-T1.md` |\n"
+            f"| E9-F1-S1-T2 | T2 | Task | in-queue | E9-F1-S1-T1 | {repo} | `backlog/E9-F1-S1-T2.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        assert not any("Manifest conflict" in e for e in errors)
+
+    def test_placeholder_strings_filtered(self, tmp_path: Path, backlog_dir: Path) -> None:
+        # "(none)" / "(no file changes; ...)" placeholders must NOT trigger conflicts.
+        self.H.make_task(backlog_dir, "EX-F1-S1-T1", "ex/foo", "| `(none)` | n/a |\n")
+        self.H.make_task(backlog_dir, "EX-F2-S1-T1", "ex/foo", "| `(none)` | n/a |\n")
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n"
+            "| EX-F2-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F2-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        assert not any("Manifest conflict" in e for e in errors)
+
+
+class TestValidateManifestConflictsTransitiveChain:
+    """Issue #145 regression: a clean N-1 dep chain among N claimants of the
+    same Manifest path satisfies the Manifest Conflict Rule. Pairs do NOT
+    need direct dep edges -- transitive reachability is sufficient.
+    """
+
+    H = _ValidateRuleHarness
+    REPO = "ex/foo"
+
+    def _seed_chain(
+        self,
+        tmp_path: Path,
+        backlog_dir: Path,
+        edges: dict[str, list[str]],
+        ids: list[str],
+    ) -> list[str]:
+        """Seed a backlog where every id in ``ids`` claims pyproject.toml,
+        with the provided dep edges (mapping blocked_id -> [blocker_ids]).
+        Returns the validate() error list.
+        """
+        for tid in ids:
+            blockers = edges.get(tid, [])
+            deps_rows = "\n".join(f"| {bid} | dep | proposed |" for bid in blockers) if blockers else "| none | | |"
+            self.H.make_task(
+                backlog_dir,
+                tid,
+                self.REPO,
+                "| `pyproject.toml` | edit |\n",
+                deps_rows=deps_rows,
+            )
+        rows = "".join(
+            f"| {tid} | T | Task | in-queue | "
+            f"{','.join(edges.get(tid, [])) or 'none'} | "
+            f"{self.REPO} | `backlog/{tid}.md` |\n"
+            for tid in ids
+        )
+        self.H.make_index(tmp_path, rows)
+        return BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+
+    def test_clean_n_minus_1_chain_accepted(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """5 claimants wired as A <- B <- C <- D <- E (only N-1 = 4 edges).
+        Pre-#145 this failed because (A, C), (A, D), (A, E), (B, D), (B, E),
+        (C, E) lacked direct edges; transitive reachability accepts.
+        """
+        ids = ["E1-F1-S1-T1", "E1-F1-S1-T2", "E1-F1-S1-T3", "E1-F1-S1-T4", "E1-F1-S1-T5"]
+        edges = {
+            ids[1]: [ids[0]],
+            ids[2]: [ids[1]],
+            ids[3]: [ids[2]],
+            ids[4]: [ids[3]],
+        }
+        errors = self._seed_chain(tmp_path, backlog_dir, edges, ids)
+        assert not any("Manifest conflict" in e and "pyproject.toml" in e for e in errors), errors
+
+    def test_chain_with_shortcuts_accepted(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """Chain backbone A <- B <- C <- D <- E plus extra shortcut edges
+        (D <- A, C <- A). Denser than minimum; every pair still comparable
+        via the chain backbone.
+        """
+        ids = ["E2-F1-S1-T1", "E2-F1-S1-T2", "E2-F1-S1-T3", "E2-F1-S1-T4", "E2-F1-S1-T5"]
+        edges = {
+            ids[1]: [ids[0]],
+            ids[2]: [ids[1], ids[0]],  # shortcut: T3 also directly deps on T1
+            ids[3]: [ids[2], ids[0]],  # shortcut: T4 also directly deps on T1
+            ids[4]: [ids[3]],
+        }
+        errors = self._seed_chain(tmp_path, backlog_dir, edges, ids)
+        assert not any("Manifest conflict" in e and "pyproject.toml" in e for e in errors), errors
+
+    def test_partial_chain_rejected(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """3 claimants, only A <- B wired; C is isolated -> rejected."""
+        ids = ["E3-F1-S1-T1", "E3-F1-S1-T2", "E3-F1-S1-T3"]
+        edges = {ids[1]: [ids[0]]}
+        errors = self._seed_chain(tmp_path, backlog_dir, edges, ids)
+        conflict = [e for e in errors if "Manifest conflict" in e and "pyproject.toml" in e]
+        assert len(conflict) == 1
+        for tid in ids:
+            assert tid in conflict[0]
+
+    def test_unrelated_claimants_rejected(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """3 claimants, zero edges -> rejected."""
+        ids = ["E4-F1-S1-T1", "E4-F1-S1-T2", "E4-F1-S1-T3"]
+        errors = self._seed_chain(tmp_path, backlog_dir, {}, ids)
+        conflict = [e for e in errors if "Manifest conflict" in e and "pyproject.toml" in e]
+        assert len(conflict) == 1
+
+    def test_full_pairwise_still_accepted(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """Backwards compat: backlogs that already wire N*(N-1)/2 direct
+        edges keep passing.
+        """
+        ids = ["E5-F1-S1-T1", "E5-F1-S1-T2", "E5-F1-S1-T3", "E5-F1-S1-T4"]
+        edges = {ids[i]: ids[:i] for i in range(1, len(ids))}
+        errors = self._seed_chain(tmp_path, backlog_dir, edges, ids)
+        assert not any("Manifest conflict" in e and "pyproject.toml" in e for e in errors), errors
+
+    def test_error_message_suggests_chain(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """Conflict error message includes a suggested N-1 chain in
+        lexical-sort order (operator hint).
+        """
+        ids = ["E6-F1-S1-T1", "E6-F1-S1-T2", "E6-F1-S1-T3"]
+        errors = self._seed_chain(tmp_path, backlog_dir, {}, ids)
+        conflict = next(e for e in errors if "Manifest conflict" in e and "pyproject.toml" in e)
+        assert "Wire a serial dep chain:" in conflict
+        assert "uv run devbench add-dep E6-F1-S1-T2 E6-F1-S1-T1" in conflict
+        assert "uv run devbench add-dep E6-F1-S1-T3 E6-F1-S1-T2" in conflict
+        assert "or any other DAG that totally orders the set" in conflict
+
+
+class TestValidateLanguageAcAlignment:
+    """Tests for _check_language_ac_alignment (canonical-AC Applicability)."""
+
+    H = _ValidateRuleHarness
+
+    AC_BLOCK_PYTHON_TIER_NO_NA: str = (
+        "- [ ] AC-FINAL-001 Every AC-TEST and AC-CYCLE passes.\n"
+        "- [ ] AC-FINAL-002 `ruff check src tests` exits zero.\n"
+        "- [ ] AC-FINAL-005 `pytest tests/unit -v` exits zero.\n"
+        "- [ ] AC-FINAL-014 Coverage 100%.\n"
+    )
+
+    AC_BLOCK_PYTHON_TIER_WITH_NA: str = (
+        "- [ ] AC-FINAL-001 Every AC-TEST and AC-CYCLE passes.\n"
+        "- [ ] AC-FINAL-002 `ruff check src tests` exits zero -- N/A for HCL Tasks (no Python source authored)\n"
+        "- [ ] AC-FINAL-005 `pytest tests/unit -v` exits zero -- N/A for HCL Tasks (no Python source authored)\n"
+        "- [ ] AC-FINAL-014 Coverage 100% -- N/A for HCL Tasks (no Python source authored)\n"
+    )
+
+    def test_hcl_only_task_without_na_suffix_emits_warnings(self, tmp_path: Path, backlog_dir: Path) -> None:
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `infra/main.tf` | new |\n",
+            ac_block=self.AC_BLOCK_PYTHON_TIER_NO_NA,
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        ac_errors = [e for e in errors if "EX-F1-S1-T1" in e and "requires the N/A suffix" in e]
+        # AC-FINAL-002, 005, 014 each expected to fire (3 errors)
+        assert len(ac_errors) == 3
+        assert any("AC-FINAL-002" in e for e in ac_errors)
+        assert any("AC-FINAL-005" in e for e in ac_errors)
+        assert any("AC-FINAL-014" in e for e in ac_errors)
+        assert all("HCL" in e for e in ac_errors)
+
+    def test_hcl_task_with_na_suffix_no_warnings(self, tmp_path: Path, backlog_dir: Path) -> None:
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `infra/main.tf` | new |\n",
+            ac_block=self.AC_BLOCK_PYTHON_TIER_WITH_NA,
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        assert not any("requires the N/A suffix" in e for e in errors)
+
+    def test_python_task_without_na_suffix_no_warnings(self, tmp_path: Path, backlog_dir: Path) -> None:
+        # Python-tier task should NOT have the N/A suffix; rule must skip.
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n",
+            ac_block=self.AC_BLOCK_PYTHON_TIER_NO_NA,
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        assert not any("requires the N/A suffix" in e for e in errors)
+
+
+class TestValidateSourceTestPairs:
+    """Tests for _check_source_test_pairs (source-test atomicity)."""
+
+    H = _ValidateRuleHarness
+
+    def test_python_source_without_test_pair_emits_error(self, tmp_path: Path, backlog_dir: Path) -> None:
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `infra/scripts/migrate.py` | new |\n",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        pair_errors = [e for e in errors if "EX-F1-S1-T1" in e and "no matching test in the same Manifest" in e]
+        assert len(pair_errors) == 1
+        assert "infra/scripts/migrate.py" in pair_errors[0]
+        assert "'migrate'" in pair_errors[0]
+        assert "docs/source-test-atomicity.md" in pair_errors[0]
+
+    def test_python_source_with_test_pair_no_error(self, tmp_path: Path, backlog_dir: Path) -> None:
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `infra/scripts/migrate.py` | new |\n| `tests/unit/test_migrate.py` | new |\n",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        assert not any("no matching test in the same Manifest" in e for e in errors)
+
+    def test_namespaced_test_filename_satisfies_pair(self, tmp_path: Path, backlog_dir: Path) -> None:
+        # Project convention: tests live under tests/unit/ named like
+        # test_<feature>_<basename>.py. The rule accepts these as valid
+        # pairs because the source basename appears in the test filename.
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `src/kanon_cli/telemetry/event.py` | new |\n| `tests/unit/test_telemetry_event.py` | new |\n",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        assert not any("no matching test in the same Manifest" in e for e in errors)
+
+    def test_init_py_does_not_require_test_pair(self, tmp_path: Path, backlog_dir: Path) -> None:
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `src/pkg/__init__.py` | new |\n",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        assert not any("no matching test in the same Manifest" in e for e in errors)
+
+    def test_test_path_under_services_satisfies_pair(self, tmp_path: Path, backlog_dir: Path) -> None:
+        # The rule accepts any test path ending in /test_<basename>; the
+        # services/<name>/tests/... convention is honored.
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `services/api/src/handler.py` | new |\n| `services/api/tests/unit/test_handler.py` | new |\n",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        assert not any("no matching test in the same Manifest" in e for e in errors)
+
+
+class TestValidateRequiredSections:
+    """E209: every Task work-unit must declare Status, Dependencies, and Changes Manifest."""
+
+    def test_missing_dependencies_section_emits_error(self, tmp_path: Path, backlog_dir: Path) -> None:
+        wu = backlog_dir / "EX-F1-S1-T1.md"
+        wu.write_text(
+            "# EX-F1-S1-T1\n\n"
+            "## Status: in-queue\n\n"
+            "## Description\n\nTask body.\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-FUNC-001\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `f.py` | New |\n",
+            encoding="utf-8",
+        )
+        idx = _ValidateRuleHarness.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        assert any("missing required section '## Dependencies'" in e and "EX-F1-S1-T1" in e for e in errors)
+
+    def test_complete_task_emits_no_required_section_error(self, tmp_path: Path, backlog_dir: Path) -> None:
+        _ValidateRuleHarness.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `f.py` | new |\n| `tests/unit/test_f.py` | new |\n",
+        )
+        idx = _ValidateRuleHarness.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        assert not any("missing required section" in e for e in errors)
+
+
+class TestValidateStatusEnum:
+    """E209: every parsed ``## Status:`` value must be in VALID_STATUSES."""
+
+    def test_unknown_status_emits_error(self, tmp_path: Path, backlog_dir: Path) -> None:
+        wu = backlog_dir / "EX-F1-S1-T1.md"
+        wu.write_text(
+            "# EX-F1-S1-T1\n\n"
+            "## Status: pending-review\n\n"
+            "## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Type | Reason |\n|----|------|--------|\n| none | | |\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-FUNC-001\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `f.py` | New |\n\n"
+            "## Definition of Done\n\n- [ ] Done\n",
+            encoding="utf-8",
+        )
+        idx = _ValidateRuleHarness.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        assert any("invalid '## Status:' value 'pending-review'" in e and "EX-F1-S1-T1" in e for e in errors)
+
+    def test_hold_status_is_accepted(self, tmp_path: Path, backlog_dir: Path) -> None:
+        _ValidateRuleHarness.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `f.py` | new |\n| `tests/unit/test_f.py` | new |\n",
+            status="hold",
+        )
+        idx = _ValidateRuleHarness.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | hold | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        assert not any("invalid '## Status:'" in e for e in errors)
+
+
+class TestValidateDepIdFormat:
+    """E209: dep-row IDs in '## Dependencies' must match the canonical regex."""
+
+    def test_malformed_dep_id_emits_error(self, tmp_path: Path, backlog_dir: Path) -> None:
+        wu = backlog_dir / "EX-F1-S1-T1.md"
+        wu.write_text(
+            "# EX-F1-S1-T1\n\n"
+            "## Status: in-queue\n\n"
+            "## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Type | Reason |\n|----|------|--------|\n| TASK-123 | Task | dep |\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-FUNC-001\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `f.py` | New |\n\n"
+            "## Definition of Done\n\n- [ ] Done\n",
+            encoding="utf-8",
+        )
+        idx = _ValidateRuleHarness.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | TASK-123 | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        assert any("dependency ID 'TASK-123' does not match" in e and "EX-F1-S1-T1" in e for e in errors)
+
+    def test_canonical_dep_id_accepted(self, tmp_path: Path, backlog_dir: Path) -> None:
+        _ValidateRuleHarness.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `f1.py` | new |\n| `tests/unit/test_f1.py` | new |\n",
+        )
+        wu = backlog_dir / "EX-F1-S1-T2.md"
+        wu.write_text(
+            "# EX-F1-S1-T2\n\n"
+            "## Status: in-queue\n\n"
+            "## Description\n\nx\n\n"
+            "## Dependencies\n\n"
+            "| ID | Type | Reason |\n|----|------|--------|\n"
+            "| EX-F1-S1-T1 | Task | dep |\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-FUNC-001\n\n"
+            "## Changes Manifest\n\n"
+            "| File | Change |\n|------|--------|\n"
+            "| `f2.py` | New |\n| `tests/unit/test_f2.py` | new |\n\n"
+            "## Definition of Done\n\n- [ ] Done\n",
+            encoding="utf-8",
+        )
+        idx = _ValidateRuleHarness.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n"
+            "| EX-F1-S1-T2 | T2 | Task | in-queue | EX-F1-S1-T1 | ex/foo | `backlog/EX-F1-S1-T2.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        assert not any("does not match the" in e for e in errors)
+
+
+class TestValidateBranchUniqueness:
+    """E219: no two Tasks may derive the same branch name."""
+
+    def test_collision_emits_error(self, tmp_path: Path, backlog_dir: Path) -> None:
+        # Both tasks override the branch to the same explicit name.
+        for unit_id in ("EX-F1-S1-T1", "EX-F1-S1-T2"):
+            wu = backlog_dir / f"{unit_id}.md"
+            wu.write_text(
+                f"# {unit_id}\n\n"
+                "## Status: in-queue\n\n"
+                "- **Branch:** `feat/shared`\n\n"
+                "## Description\n\nx\n\n"
+                "## Dependencies\n\n| ID | Type | Reason |\n|----|------|--------|\n| none | | |\n\n"
+                "## Acceptance Criteria\n\n- [ ] AC-FUNC-001\n\n"
+                "## Changes Manifest\n\n| File | Change |\n|------|--------|\n"
+                f"| `{unit_id}.py` | new |\n| `tests/unit/test_{unit_id.lower()}.py` | new |\n\n"
+                "## Definition of Done\n\n- [ ] Done\n",
+                encoding="utf-8",
+            )
+        idx = _ValidateRuleHarness.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n"
+            "| EX-F1-S1-T2 | T2 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T2.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        assert any(
+            "Branch collision on 'feat/shared'" in e and "EX-F1-S1-T1" in e and "EX-F1-S1-T2" in e for e in errors
+        )
+
+    def test_canonical_branches_unique_no_error(self, tmp_path: Path, backlog_dir: Path) -> None:
+        for unit_id in ("EX-F1-S1-T1", "EX-F1-S1-T2"):
+            _ValidateRuleHarness.make_task(
+                backlog_dir,
+                unit_id,
+                "ex/foo",
+                f"| `{unit_id}.py` | new |\n| `tests/unit/test_{unit_id.lower()}.py` | new |\n",
+            )
+        idx = _ValidateRuleHarness.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n"
+            "| EX-F1-S1-T2 | T2 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T2.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        assert not any("Branch collision" in e for e in errors)
+
+    def test_single_branch_mode_skips_check(self, tmp_path: Path, backlog_dir: Path) -> None:
+        # Both tasks override to the same branch; under single-PR mode
+        # this is legitimate (the configured single_branch is shared).
+        for unit_id in ("EX-F1-S1-T1", "EX-F1-S1-T2"):
+            wu = backlog_dir / f"{unit_id}.md"
+            wu.write_text(
+                f"# {unit_id}\n\n"
+                "## Status: in-queue\n\n"
+                "- **Branch:** `feat/single-pr`\n\n"
+                "## Description\n\nx\n\n"
+                "## Dependencies\n\n| ID | Type | Reason |\n|----|------|--------|\n| none | | |\n\n"
+                "## Acceptance Criteria\n\n- [ ] AC-FUNC-001\n\n"
+                "## Changes Manifest\n\n| File | Change |\n|------|--------|\n"
+                f"| `{unit_id}.py` | new |\n| `tests/unit/test_{unit_id.lower()}.py` | new |\n\n"
+                "## Definition of Done\n\n- [ ] Done\n",
+                encoding="utf-8",
+            )
+        idx = _ValidateRuleHarness.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n"
+            "| EX-F1-S1-T2 | T2 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T2.md` |\n",
+        )
+        # Patch the runtime config so single_branch is set; the rule
+        # must short-circuit and emit no collision error.
+        from unittest.mock import patch as _patch
+
+        from devbench.config_loader import GitOpsConfig, RuntimeConfig
+
+        runtime = RuntimeConfig(git_ops=GitOpsConfig(single_branch="feat/single-pr"))
+        with _patch("devbench.config.RUNTIME_CONFIG", runtime):
+            errors = BacklogManager().validate(idx, tmp_path)
+        assert not any("Branch collision" in e for e in errors)
+
+
+class TestRequiredSectionsRowDefensiveSkips:
+    """Cover the empty-file-path-string defensive skip in `_check_required_sections`.
+
+    `_parse_backlog_rows` never returns rows with empty file_path strings
+    today, but the rule is hardened against that future-state to avoid
+    a crash when reading a directory path. Hit the branch directly via
+    a hand-crafted row tuple."""
+
+    def test_empty_file_path_string_is_skipped(self, tmp_path: Path) -> None:
+        manager = BacklogManager()
+        errors: list[str] = []
+        rows = [("EX-F1-S1-T1", "in-queue", "")]
+        manager._check_required_sections(rows, tmp_path, errors)
+        assert errors == []
+
+
+class TestValidateNoPlaceholderManifestRows:
+    """Issue #117: reject TBD placeholder rows in active-Task Manifests."""
+
+    def test_tbd_first_cell_emits_error(self, tmp_path: Path, backlog_dir: Path) -> None:
+        wu = backlog_dir / "EX-F1-S1-T1.md"
+        wu.write_text(
+            "# EX-F1-S1-T1\n\n"
+            "## Status: in-queue\n\n"
+            "## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Type | Reason |\n|----|------|--------|\n| none | | |\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-FUNC-001\n\n"
+            "## Changes Manifest\n\n"
+            "| File | Change |\n|------|--------|\n"
+            "| TBD | Executor agent: replace this row with the actual files |\n\n"
+            "## Definition of Done\n\n- [ ] Done\n",
+            encoding="utf-8",
+        )
+        idx = _ValidateRuleHarness.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        assert any("Changes Manifest still has placeholder row 'TBD'" in e and "EX-F1-S1-T1" in e for e in errors)
+
+    def test_tbd_lowercase_also_caught(self, tmp_path: Path, backlog_dir: Path) -> None:
+        wu = backlog_dir / "EX-F1-S1-T1.md"
+        wu.write_text(
+            "# EX-F1-S1-T1\n\n"
+            "## Status: in-queue\n\n"
+            "## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Type | Reason |\n|----|------|--------|\n| none | | |\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-FUNC-001\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| tbd | placeholder |\n\n"
+            "## Definition of Done\n\n- [ ] Done\n",
+            encoding="utf-8",
+        )
+        idx = _ValidateRuleHarness.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        assert any("placeholder row 'tbd'" in e for e in errors)
+
+    def test_real_manifest_emits_no_error(self, tmp_path: Path, backlog_dir: Path) -> None:
+        _ValidateRuleHarness.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `f.py` | new |\n| `tests/unit/test_f.py` | new |\n",
+        )
+        idx = _ValidateRuleHarness.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        assert not any("placeholder row" in e for e in errors)
+
+    def test_done_status_skips_check(self, tmp_path: Path, backlog_dir: Path) -> None:
+        # Done tasks are terminal; the placeholder rule does not apply.
+        wu = backlog_dir / "EX-F1-S1-T1.md"
+        wu.write_text(
+            "# EX-F1-S1-T1\n\n"
+            "## Status: done\n\n"
+            "## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Type | Reason |\n|----|------|--------|\n| none | | |\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-FUNC-001\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| TBD | placeholder |\n\n"
+            "## Definition of Done\n\n- [ ] Done\n",
+            encoding="utf-8",
+        )
+        idx = _ValidateRuleHarness.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | done | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        assert not any("placeholder row" in e for e in errors)
+
+    def test_empty_file_path_string_is_skipped(self, tmp_path: Path) -> None:
+        """Defensive guard: rows with empty file_path should not crash the rule.
+
+        Production rows always have a file_path; cover the branch directly
+        for 100% coverage. Belongs to TestValidateNoPlaceholderManifestRows
+        but appended at module-tail because the file was reformatted.
+        """
+        manager = BacklogManager()
+        errors: list[str] = []
+        rows = [("EX-F1-S1-T1", "in-queue", "")]
+        manager._check_no_placeholder_manifest_rows(rows, tmp_path, errors)
+        assert errors == []
+
+
+class TestValidateNoOrphanPathTokens:
+    """Rule 20: backtick-quoted path-shaped tokens in AC / DoD must appear in
+    the Task's Changes Manifest after normalisation, OR be marked read-only
+    via a trailing ``(ref)`` suffix. Gated by
+    ``RUNTIME_CONFIG.validate.check_orphan_path_tokens``; default OFF so
+    pre-existing backlogs are unaffected.
+    """
+
+    H = _ValidateRuleHarness
+
+    @staticmethod
+    def _runtime_with_rule_on(repo: str, checkout_directory: str | None) -> RuntimeConfig:
+        return RuntimeConfig(
+            repos={repo: RepoConfig(checkout_directory=checkout_directory)},
+            validate=ValidateConfig(check_orphan_path_tokens=True),
+        )
+
+    @staticmethod
+    def _make_task_with_sections(
+        backlog_dir: Path,
+        unit_id: str,
+        repo: str,
+        manifest_rows: str,
+        ac_block: str,
+        dod_block: str = "- [ ] Done",
+        description: str = "Test task.",
+    ) -> Path:
+        wu = backlog_dir / f"{unit_id}.md"
+        wu.write_text(
+            f"# {unit_id}\n\n"
+            f"## Status: in-queue\n\n"
+            f"## Target Repository\n\n"
+            f"- **Repo:** `{repo}`\n\n"
+            f"## Description\n\n{description}\n\n"
+            f"## Dependencies\n\n"
+            f"| ID | Title | Status |\n"
+            f"|----|-------|--------|\n"
+            f"| none | | |\n\n"
+            f"## Acceptance Criteria\n\n{ac_block}\n\n"
+            f"## Changes Manifest\n\n"
+            f"| File | Change |\n"
+            f"|------|--------|\n"
+            f"{manifest_rows}\n"
+            f"## Definition of Done\n\n{dod_block}\n",
+            encoding="utf-8",
+        )
+        return wu
+
+    def _validate(self, tmp_path: Path, runtime_config: RuntimeConfig) -> list[str]:
+        with patch("devbench.config.RUNTIME_CONFIG", runtime_config):
+            return BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+
+    def _orphan_errors(self, errors: list[str], unit_id: str) -> list[str]:
+        return [e for e in errors if e.startswith(f"{unit_id}: orphan path ")]
+
+    # ---------------------------------------------------------------------
+    # Must-fire cases
+    # ---------------------------------------------------------------------
+
+    def test_orphan_path_in_ac_fires(self, tmp_path: Path, backlog_dir: Path) -> None:
+        repo = "ex/foo"
+        self._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `src/real.py` | new |\n| `tests/unit/test_real.py` | new |\n",
+            "- [ ] AC-FUNC-001: `src/imaginary.py` is created.",
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = self._validate(tmp_path, self._runtime_with_rule_on(repo, None))
+        orphans = self._orphan_errors(errors, "EX-F1-S1-T1")
+        assert len(orphans) == 1
+        assert "src/imaginary.py" in orphans[0]
+        assert "Acceptance Criteria" in orphans[0]
+
+    def test_orphan_path_in_dod_fires(self, tmp_path: Path, backlog_dir: Path) -> None:
+        repo = "ex/foo"
+        self._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `src/real.py` | new |\n| `tests/unit/test_real.py` | new |\n",
+            "- [ ] AC-FUNC-001: behavioural check.",
+            dod_block="- [ ] Entry committed to `docs/release-notes.md`.",
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = self._validate(tmp_path, self._runtime_with_rule_on(repo, None))
+        orphans = self._orphan_errors(errors, "EX-F1-S1-T1")
+        assert len(orphans) == 1
+        assert "docs/release-notes.md" in orphans[0]
+        assert "Definition of Done" in orphans[0]
+
+    def test_task_id_placeholder_does_not_match_resolved_manifest(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """The original caylent-telemetry-teardown bug: AC says <TASK-ID>, manifest has resolved ID."""
+        repo = "ex/foo"
+        self._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `destroy-log/EX-F1-S1-T1.md` | new |\n",
+            "- [ ] AC-DOC-001: `destroy-log/<TASK-ID>.md` is created.",
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = self._validate(tmp_path, self._runtime_with_rule_on(repo, None))
+        orphans = self._orphan_errors(errors, "EX-F1-S1-T1")
+        assert len(orphans) == 1
+        assert "destroy-log/<TASK-ID>.md" in orphans[0]
+
+    def test_case_mismatch_fires(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """Linux paths are case-sensitive; ``Foo.py`` is not the same as ``foo.py``."""
+        repo = "ex/foo"
+        self._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n",
+            "- [ ] AC-FUNC-001: `src/Foo.py` is created.",
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = self._validate(tmp_path, self._runtime_with_rule_on(repo, None))
+        assert any("src/Foo.py" in e for e in self._orphan_errors(errors, "EX-F1-S1-T1"))
+
+    # ---------------------------------------------------------------------
+    # Must-NOT-fire cases
+    # ---------------------------------------------------------------------
+
+    def test_path_matching_manifest_passes(self, tmp_path: Path, backlog_dir: Path) -> None:
+        repo = "ex/foo"
+        self._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n",
+            "- [ ] AC-FUNC-001: `src/foo.py` is created.",
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = self._validate(tmp_path, self._runtime_with_rule_on(repo, None))
+        assert self._orphan_errors(errors, "EX-F1-S1-T1") == []
+
+    def test_checkout_directory_prefix_normalises(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """AC writes ``<checkout_dir>/path`` while manifest holds ``path`` (post-rule-11 strip)."""
+        repo = "ex/foo"
+        self._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n",
+            "- [ ] AC-FUNC-001: `my-repo/src/foo.py` is created.",
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = self._validate(tmp_path, self._runtime_with_rule_on(repo, "my-repo"))
+        assert self._orphan_errors(errors, "EX-F1-S1-T1") == []
+
+    def test_canonical_pytest_command_passes(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """AC-FINAL-005 / 006 / 007 use multi-token backtick blocks; rule must not fire."""
+        repo = "ex/foo"
+        ac = (
+            "- [ ] AC-FUNC-001: feature is delivered.\n"
+            "- [ ] AC-FINAL-005: `pytest tests/unit -v` exits zero.\n"
+            "- [ ] AC-FINAL-006: `pytest tests/integration -v` exits zero.\n"
+            "- [ ] AC-FINAL-007: `pytest tests/functional -v` exits zero.\n"
+        )
+        self._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n",
+            ac,
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = self._validate(tmp_path, self._runtime_with_rule_on(repo, None))
+        assert self._orphan_errors(errors, "EX-F1-S1-T1") == []
+
+    def test_url_token_passes(self, tmp_path: Path, backlog_dir: Path) -> None:
+        repo = "ex/foo"
+        self._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n",
+            "- [ ] AC-FUNC-001: response payload references `https://api.example.com/v1/foo`.",
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = self._validate(tmp_path, self._runtime_with_rule_on(repo, None))
+        assert self._orphan_errors(errors, "EX-F1-S1-T1") == []
+
+    def test_shell_flag_token_passes(self, tmp_path: Path, backlog_dir: Path) -> None:
+        repo = "ex/foo"
+        self._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n",
+            "- [ ] AC-FUNC-001: command runs with `--cov=src`.",
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = self._validate(tmp_path, self._runtime_with_rule_on(repo, None))
+        assert self._orphan_errors(errors, "EX-F1-S1-T1") == []
+
+    def test_glob_token_passes(self, tmp_path: Path, backlog_dir: Path) -> None:
+        repo = "ex/foo"
+        self._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n",
+            "- [ ] AC-FUNC-001: every `*.py` file in the manifest is created.",
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = self._validate(tmp_path, self._runtime_with_rule_on(repo, None))
+        assert self._orphan_errors(errors, "EX-F1-S1-T1") == []
+
+    def test_trailing_slash_normalised(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """AC writes ``foo/`` while manifest holds ``foo`` -- normalised, the strings match."""
+        repo = "ex/foo"
+        # Use a path-shaped token without an extension so the manifest-prefix
+        # match path drives the assertion (extension would short-circuit).
+        self._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n",
+            "- [ ] AC-FUNC-001: contents at `src/foo.py/` are correct.",
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = self._validate(tmp_path, self._runtime_with_rule_on(repo, None))
+        assert self._orphan_errors(errors, "EX-F1-S1-T1") == []
+
+    def test_path_in_description_section_does_not_fire(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """Description / Approach prose is out of scope; only AC + DoD are checked."""
+        repo = "ex/foo"
+        self._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n",
+            "- [ ] AC-FUNC-001: behavioural.",
+            description=(
+                "### Approach\n\nThe task reads `src/legacy/auth.py` (a path that does not appear in the manifest)."
+            ),
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = self._validate(tmp_path, self._runtime_with_rule_on(repo, None))
+        assert self._orphan_errors(errors, "EX-F1-S1-T1") == []
+
+    def test_inline_ref_marker_passes(self, tmp_path: Path, backlog_dir: Path) -> None:
+        repo = "ex/foo"
+        self._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n",
+            "- [ ] AC-FUNC-001: behaviour matches the format described in `src/legacy/auth.py` (ref).",
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = self._validate(tmp_path, self._runtime_with_rule_on(repo, None))
+        assert self._orphan_errors(errors, "EX-F1-S1-T1") == []
+
+    def test_story_unit_short_circuits(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """Stories have no Manifest; the rule must not fire on Story IDs."""
+        repo = "ex/foo"
+        story = backlog_dir / "EX-F1-S1.md"
+        story.write_text(
+            "# EX-F1-S1\n\n"
+            "## Status: in-queue\n\n"
+            "## Description\n\nA story spec mentions `src/anywhere.py` in prose.\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n",
+            encoding="utf-8",
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1 | S1 | Story | in-queue | none | {repo} | `backlog/EX-F1-S1.md` |\n",
+        )
+        errors = self._validate(tmp_path, self._runtime_with_rule_on(repo, None))
+        assert self._orphan_errors(errors, "EX-F1-S1") == []
+
+    def test_flag_off_does_nothing(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """With the rule disabled, even a clear orphan path is silent."""
+        repo = "ex/foo"
+        self._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `src/foo.py` | new |\n| `tests/unit/test_foo.py` | new |\n",
+            "- [ ] AC-FUNC-001: `src/imaginary.py` is created.",
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        rt_off = RuntimeConfig(
+            repos={repo: RepoConfig(checkout_directory=None)},
+            validate=ValidateConfig(check_orphan_path_tokens=False),
+        )
+        errors = self._validate(tmp_path, rt_off)
+        assert self._orphan_errors(errors, "EX-F1-S1-T1") == []
+
+    # ---------------------------------------------------------------------
+    # Coverage corner cases (low-traffic branches in the orphan-check helpers)
+    # ---------------------------------------------------------------------
+
+    def test_path_shaped_via_manifest_dir_prefix_match(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """``_is_path_shaped`` final ``return`` branch: a token that has
+        no known extension and no built-in directory prefix, but whose
+        first segment matches a directory observed in the Task's parsed
+        Manifest, must be treated as path-shaped and trigger the rule
+        when it isn't itself in the Manifest.
+        """
+        repo = "ex/foo"
+        # Manifest entry under ``custom/`` -- not in _ORPHAN_KNOWN_PREFIXES
+        # (which has src/, tests/, infra/, docs/, backlog/, config/) and
+        # not carrying a known extension. The orphan token uses the same
+        # ``custom/`` dir prefix but names a file that isn't in the
+        # manifest, so the manifest-dir-prefix branch fires.
+        self._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `custom/real_data` | new |\n",
+            "- [ ] AC-FUNC-001: `custom/imaginary_data` is created.",
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = self._validate(tmp_path, self._runtime_with_rule_on(repo, None))
+        orphans = self._orphan_errors(errors, "EX-F1-S1-T1")
+        assert len(orphans) == 1
+        assert "custom/imaginary_data" in orphans[0]
+
+    def test_dot_slash_prefix_normalised_to_match(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """``_normalise_orphan_path`` ``./`` strip branch: an AC token
+        written as ``./src/real.py`` must normalise to ``src/real.py``
+        and match a Manifest entry of ``src/real.py``.
+        """
+        repo = "ex/foo"
+        self._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `src/real.py` | new |\n| `tests/unit/test_real.py` | new |\n",
+            "- [ ] AC-FUNC-001: `./src/real.py` exposes the new API.",
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = self._validate(tmp_path, self._runtime_with_rule_on(repo, None))
+        # The ``./`` prefix is stripped before matching so the token is
+        # recognised as in-Manifest -- no orphan error should fire.
+        assert self._orphan_errors(errors, "EX-F1-S1-T1") == []
+
+    def test_missing_work_unit_file_is_skipped_silently(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """``_check_no_orphan_path_tokens`` skips Tasks whose work-unit
+        file does not exist on disk. The BACKLOG.md row points at a path
+        that was never written -- the rule must short-circuit at the
+        ``not wu_path.is_file()`` guard rather than crash.
+        """
+        repo = "ex/foo"
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        # Note: NO write of backlog/EX-F1-S1-T1.md -- the row is a stale
+        # pointer (the kind of state that arises mid-rename or mid-
+        # refactor). Validation must remain silent on this Task for the
+        # orphan rule (other rules may flag elsewhere).
+        errors = self._validate(tmp_path, self._runtime_with_rule_on(repo, None))
+        assert self._orphan_errors(errors, "EX-F1-S1-T1") == []
+
+    def test_malformed_manifest_skipped_silently(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """``_check_one_task_orphan_paths`` swallows ``ManifestParseError``
+        and returns early -- another rule already reports the malformed
+        manifest, so this rule must not double-report.
+        """
+        repo = "ex/foo"
+        # Hand-write a work-unit whose Changes Manifest has a pipe-
+        # prefixed row with the wrong column count, which ``parse_manifest``
+        # rejects with ManifestParseError (see manifest.py:201). The
+        # well-formed header + separator above the bad row keep the
+        # parser past the section-detect step so it reaches the body
+        # walk and raises on the malformed data row.
+        wu = backlog_dir / "EX-F1-S1-T1.md"
+        wu.write_text(
+            "# EX-F1-S1-T1\n\n"
+            "## Status: in-queue\n\n"
+            "## Target Repository\n\n"
+            f"- **Repo:** `{repo}`\n\n"
+            "## Description\n\nTest task.\n\n"
+            "## Dependencies\n\n"
+            "| ID | Title | Status |\n"
+            "|----|-------|--------|\n"
+            "| none | | |\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-FUNC-001: `src/foo.py` exists.\n\n"
+            "## Changes Manifest\n\n"
+            "| File | Change |\n"
+            "|------|--------|\n"
+            "| `src/foo.py` | new | extra-column |\n"  # 3 cells, parser rejects
+            "\n"
+            "## Definition of Done\n\n- [ ] Done\n",
+            encoding="utf-8",
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = self._validate(tmp_path, self._runtime_with_rule_on(repo, None))
+        # Manifest parse failure is reported by another rule; the orphan
+        # rule must produce ZERO orphan-prefixed errors for this Task.
+        assert self._orphan_errors(errors, "EX-F1-S1-T1") == []
+
+    def test_missing_definition_of_done_section_is_skipped(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """``_check_one_task_orphan_paths`` skips a section whose extracted
+        body is empty (the inner ``if not body: continue`` branch). When
+        a Task work-unit lacks the ``## Definition of Done`` heading
+        entirely, ``sections.get("Definition of Done", "")`` returns ``""``
+        and the per-section walk must short-circuit cleanly.
+        """
+        repo = "ex/foo"
+        # Hand-build a work-unit that has Acceptance Criteria but does
+        # NOT have a Definition of Done header at all. Other validation
+        # rules may complain about the missing section; this test only
+        # asserts that the orphan-path rule does not raise on it.
+        wu = backlog_dir / "EX-F1-S1-T1.md"
+        wu.write_text(
+            "# EX-F1-S1-T1\n\n"
+            "## Status: in-queue\n\n"
+            "## Target Repository\n\n"
+            f"- **Repo:** `{repo}`\n\n"
+            "## Description\n\nTest task.\n\n"
+            "## Dependencies\n\n"
+            "| ID | Title | Status |\n"
+            "|----|-------|--------|\n"
+            "| none | | |\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-FUNC-001: behaviour check.\n\n"
+            "## Changes Manifest\n\n"
+            "| File | Change |\n"
+            "|------|--------|\n"
+            "| `src/foo.py` | new |\n"
+            "| `tests/unit/test_foo.py` | new |\n",
+            # Note: NO ``## Definition of Done`` section follows.
+            encoding="utf-8",
+        )
+        self.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = self._validate(tmp_path, self._runtime_with_rule_on(repo, None))
+        # The orphan rule must produce ZERO orphan-prefixed errors --
+        # the missing DoD section is silently skipped at the empty-body
+        # guard. A separate required-sections rule may emit its own
+        # error for the same Task, but that error does not start with
+        # the orphan-rule prefix.
+        assert self._orphan_errors(errors, "EX-F1-S1-T1") == []
+
+
+class TestAutoRequeueOnDeclineTransition:
+    """Issue #147: ``_set_status`` fires the auto-requeue cascade for every
+    terminal transition (``done`` AND ``declined``), not just ``mark_done``.
+
+    Each test wires a blocked source whose ``[BLOCKED_PENDING_PROPOSAL]``
+    marker references a single dep, drives the dep into the terminal status
+    under test through the corresponding public API, and asserts the source
+    flipped to ``in-queue`` with the cascade audit comment.
+    """
+
+    def _build(self, tmp_path: Path, dep_status: str) -> tuple[Path, Path]:
+        markers = "[2026-04-19 14:00 UTC] [agent/task_factory] [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2\n"
+        src_file = _unit_body(
+            "E0-F1-S1-T1",
+            "blocked",
+            deps=["E0-F1-S1-T2"],
+            comments=markers,
+        )
+        dep_file = _unit_body("E0-F1-S1-T2", dep_status)
+        index = _write_workspace(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Source", "blocked"),
+                ("E0-F1-S1-T2", "Dep", dep_status),
+            ],
+            files={"E0-F1-S1-T1": src_file, "E0-F1-S1-T2": dep_file},
+        )
+        dep_path = tmp_path / "backlog" / "E0-F1-S1-T2.md"
+        return index, dep_path
+
+    def test_mark_declined_cascades_requeue(self, tmp_path: Path) -> None:
+        """``mark_declined`` is a terminal transition and must fire the cascade."""
+        index, dep_path = self._build(tmp_path, "in-queue")
+        BacklogManager().mark_declined(dep_path, index, "E0-F1-S1-T2", "scope changed")
+
+        src = (tmp_path / "backlog" / "E0-F1-S1-T1.md").read_text()
+        assert "## Status: in-queue" in src
+        assert "[CASCADE_RESOLVED]" in src
+
+    def test_set_status_to_declined_cascades(self, tmp_path: Path) -> None:
+        """``force_status -> declined`` exercises the same code path as decline."""
+        index, dep_path = self._build(tmp_path, "in-queue")
+        BacklogManager().force_status(dep_path, index, "E0-F1-S1-T2", "declined")
+
+        src = (tmp_path / "backlog" / "E0-F1-S1-T1.md").read_text()
+        assert "## Status: in-queue" in src
+        assert "[CASCADE_RESOLVED]" in src
+
+    def test_force_status_to_done_cascades(self, tmp_path: Path) -> None:
+        """``force_status -> done`` (legacy path) must continue to cascade."""
+        index, dep_path = self._build(tmp_path, "in-queue")
+        BacklogManager().force_status(dep_path, index, "E0-F1-S1-T2", "done")
+
+        src = (tmp_path / "backlog" / "E0-F1-S1-T1.md").read_text()
+        assert "## Status: in-queue" in src
+        assert "[CASCADE_RESOLVED]" in src
+
+    def test_cascade_idempotent_under_repeat_set_status(self, tmp_path: Path) -> None:
+        """A second ``_set_status`` call to the same terminal target does NOT
+        re-run the cascade. The audit comment count stays at 1."""
+        index, dep_path = self._build(tmp_path, "in-queue")
+        mgr = BacklogManager()
+        mgr.force_status(dep_path, index, "E0-F1-S1-T2", "declined")
+        # First fire updated T1 to in-queue. Calling _set_status again with
+        # the same terminal status must be a no-op cascade-wise even though
+        # the rest of the writes happen.
+        mgr._set_status(dep_path, index, "E0-F1-S1-T2", "declined")
+
+        src = (tmp_path / "backlog" / "E0-F1-S1-T1.md").read_text()
+        assert src.count("[CASCADE_RESOLVED]") == 1
+
+    def test_non_terminal_transition_does_not_cascade(self, tmp_path: Path) -> None:
+        """A transition to ``in-progress`` must not fire the cascade."""
+        index, dep_path = self._build(tmp_path, "in-queue")
+        BacklogManager().force_status(dep_path, index, "E0-F1-S1-T2", "in-progress")
+
+        src = (tmp_path / "backlog" / "E0-F1-S1-T1.md").read_text()
+        # T1 stays blocked; cascade did not run.
+        assert "## Status: blocked" in src
+        assert "[CASCADE_RESOLVED]" not in src
+
+
+class TestSetStatusWritesUnblockedAudit:
+    """Issue #153: when the cascade flips ``blocked -> in-queue`` it writes
+    a ``[CASCADE_RESOLVED]`` audit; sync-blocked separately writes
+    ``[UNBLOCKED] deps satisfied``. Both markers feed the panel renderer
+    supersession filter.
+    """
+
+    def test_cascade_audit_uses_cascade_resolved_tag(self, tmp_path: Path) -> None:
+        markers = "[2026-04-19 14:00 UTC] [agent/task_factory] [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2\n"
+        src_file = _unit_body(
+            "E0-F1-S1-T1",
+            "blocked",
+            deps=["E0-F1-S1-T2"],
+            comments=markers,
+        )
+        dep_file = _unit_body("E0-F1-S1-T2", "done")
+        index = _write_workspace(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Source", "blocked"),
+                ("E0-F1-S1-T2", "Dep", "done"),
+            ],
+            files={"E0-F1-S1-T1": src_file, "E0-F1-S1-T2": dep_file},
+        )
+        BacklogManager()._auto_requeue_marker_dependents(index, "E0-F1-S1-T2")
+
+        src = (tmp_path / "backlog" / "E0-F1-S1-T1.md").read_text()
+        assert "[CASCADE_RESOLVED]" in src
+        assert "[AUTO_UNBLOCKED]" in src  # backward-compatibility tag
+
+
+class TestValidateDepCycle4Node:
+    """Issue #151: validate-backlog rejects N-node dependency cycles via
+    DFS-with-recursion-stack. The 4-node case T1->T2->T3->T4->T1 is the
+    canonical regression: a naive 'has any dep' check would miss it.
+    """
+
+    def _index_with_deps(self, tmp_path: Path, dep_map: dict[str, str]) -> Path:
+        """Build a minimal BACKLOG.md whose Full Index lists the given dep map."""
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        rows = []
+        for unit_id, deps in dep_map.items():
+            rows.append(f"| {unit_id} | T | Task | in-queue | {deps} | example/repo | `backlog/{unit_id}.md` |")
+            (backlog_dir / f"{unit_id}.md").write_text(
+                f"# {unit_id}\n\n## Status: in-queue\n",
+                encoding="utf-8",
+            )
+        index = tmp_path / "BACKLOG.md"
+        index.write_text(
+            "# Backlog\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|-----------|\n" + "\n".join(rows) + "\n",
+            encoding="utf-8",
+        )
+        return index
+
+    def test_4_node_cycle_rejected(self, tmp_path: Path) -> None:
+        index = self._index_with_deps(
+            tmp_path,
+            {
+                "E0-F1-S1-T1": "E0-F1-S1-T4",
+                "E0-F1-S1-T2": "E0-F1-S1-T1",
+                "E0-F1-S1-T3": "E0-F1-S1-T2",
+                "E0-F1-S1-T4": "E0-F1-S1-T3",
+            },
+        )
+        errors: list[str] = []
+        BacklogManager()._check_dep_cycles(index, errors)
+        assert any("cycle" in e for e in errors)
+
+    def test_5_node_cycle_rejected(self, tmp_path: Path) -> None:
+        index = self._index_with_deps(
+            tmp_path,
+            {
+                "E0-F1-S1-T1": "E0-F1-S1-T5",
+                "E0-F1-S1-T2": "E0-F1-S1-T1",
+                "E0-F1-S1-T3": "E0-F1-S1-T2",
+                "E0-F1-S1-T4": "E0-F1-S1-T3",
+                "E0-F1-S1-T5": "E0-F1-S1-T4",
+            },
+        )
+        errors: list[str] = []
+        BacklogManager()._check_dep_cycles(index, errors)
+        assert any("cycle" in e for e in errors)
+
+    def test_4_node_dag_accepted(self, tmp_path: Path) -> None:
+        """T4->T3->T2->T1 (no back edge) must NOT trigger a cycle error."""
+        index = self._index_with_deps(
+            tmp_path,
+            {
+                "E0-F1-S1-T1": "None",
+                "E0-F1-S1-T2": "E0-F1-S1-T1",
+                "E0-F1-S1-T3": "E0-F1-S1-T2",
+                "E0-F1-S1-T4": "E0-F1-S1-T3",
+            },
+        )
+        errors: list[str] = []
+        BacklogManager()._check_dep_cycles(index, errors)
+        assert errors == []
+
+    def test_self_dep_reported(self, tmp_path: Path) -> None:
+        """A 1-node cycle (self-dep) is also caught."""
+        index = self._index_with_deps(tmp_path, {"E0-F1-S1-T1": "E0-F1-S1-T1"})
+        errors: list[str] = []
+        BacklogManager()._check_dep_cycles(index, errors)
+        assert any("cycle" in e for e in errors)
+
+    def test_disjoint_cycle_reported_once(self, tmp_path: Path) -> None:
+        """Two disjoint cycles each report exactly once (no duplicate from re-traversal)."""
+        index = self._index_with_deps(
+            tmp_path,
+            {
+                "E0-F1-S1-T1": "E0-F1-S1-T2",
+                "E0-F1-S1-T2": "E0-F1-S1-T1",
+                "E0-F1-S1-T3": "E0-F1-S1-T4",
+                "E0-F1-S1-T4": "E0-F1-S1-T3",
+            },
+        )
+        errors: list[str] = []
+        BacklogManager()._check_dep_cycles(index, errors)
+        cycle_errors = [e for e in errors if "cycle" in e]
+        assert len(cycle_errors) == 2
+
+    def test_missing_index_no_crash(self, tmp_path: Path) -> None:
+        """The cycle check on a missing BACKLOG.md returns silently."""
+        errors: list[str] = []
+        BacklogManager()._check_dep_cycles(tmp_path / "missing.md", errors)
+        assert errors == []
+
+    def test_summary_row_skipped_when_cell_count_mismatches(self, tmp_path: Path) -> None:
+        """Status Summary rows have a different cell count and must NOT be
+        confused with Full Index rows when building the dependency graph.
+        """
+        index = tmp_path / "BACKLOG.md"
+        index.write_text(
+            "# Backlog\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|-----------|\n"
+            "| short | row | with | wrong-cell-count |\n"
+            "| E0-F1-S1-T1 | T | Task | in-queue | None | r | `backlog/E0-F1-S1-T1.md` |\n",
+            encoding="utf-8",
+        )
+        graph = BacklogManager()._build_dependency_graph(index)
+        assert "E0-F1-S1-T1" in graph
+        assert "short" not in graph

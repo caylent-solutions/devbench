@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -196,28 +198,6 @@ class TestTokenCostReport:
 
         assert "Tokens consumed" in report
         assert "$0.00" in report
-
-    def test_report_cost_footer_mentions_override(self, tmp_path: Path) -> None:
-        log_file = tmp_path / "test.log"
-        log_file.write_text(
-            _make_log(
-                [
-                    "2026-03-05T10:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
-                    "2026-03-05T10:05:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'",
-                ]
-            )
-        )
-        hook_log = tmp_path / "hook-logs.jsonl"
-        hook_log.write_text(
-            '{"timestamp":"2026-03-05T10:04:00Z","event":"PostToolUse","input":{"tool_response":'
-            '{"usage":{"input_tokens":100000}}}}\n'
-        )
-        from unittest.mock import patch
-
-        with patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
-            report = generate_report(log_path=log_file)
-
-        assert "Override per-rate in devbench.yaml under report:" in report
 
 
 class TestEpicsDoneReport:
@@ -658,6 +638,75 @@ class TestAccurateCost:
         assert cost.cache_write_1h_cost == 0.0
         assert cost.total_cost == 0.0
 
+    def test_data_residency_multiplier_applies_to_us_only_subset(self) -> None:
+        """Issue #124 AC-FUNC-001: residency multiplier applies ONLY to the
+        residency-flagged subset, not to the full aggregate."""
+        from devbench.reporting.report import HookLogTotals, _compute_cost
+
+        totals = HookLogTotals(
+            input_tokens=2_000_000,
+            output_tokens=0,
+            us_only_input_tokens=1_000_000,  # half of inputs were us-only
+        )
+        cost = _compute_cost(totals, 5.0, 25.0, 0.10, 1.25, 2.0, data_residency_multiplier=1.10)
+        # Base: 2M * 5 / 1M = 10.0. US-only boost: 1M * 5 * 0.10 / 1M = 0.5. Total: 10.5.
+        assert cost.input_cost == pytest.approx(10.5)
+        assert cost.total_cost == pytest.approx(10.5)
+
+    def test_fast_mode_multiplier_applies_to_fast_subset(self) -> None:
+        """Issue #124 AC-FUNC-002: fast-mode multiplier applies ONLY to fast subset."""
+        from devbench.reporting.report import HookLogTotals, _compute_cost
+
+        totals = HookLogTotals(
+            output_tokens=1_000_000,
+            fast_output_tokens=1_000_000,  # all output was fast-mode
+        )
+        cost = _compute_cost(totals, 5.0, 25.0, 0.10, 1.25, 2.0, fast_mode_multiplier=6.0)
+        # Base: 1M * 25 / 1M = 25. Fast boost: 1M * 25 * 5 / 1M = 125. Total: 150.
+        assert cost.output_cost == pytest.approx(150.0)
+        assert cost.total_cost == pytest.approx(150.0)
+
+    def test_multipliers_compose_with_cache_rates(self) -> None:
+        """Issue #124 AC-FUNC-003: residency + fast multipliers compose with
+        cache + base-rate multipliers (apply after cache scaling)."""
+        from devbench.reporting.report import HookLogTotals, _compute_cost
+
+        totals = HookLogTotals(
+            cache_read_tokens=1_000_000,
+            us_only_cache_read_tokens=1_000_000,  # all cache reads were us-only
+            fast_cache_read_tokens=1_000_000,  # AND all were fast-mode
+        )
+        cost = _compute_cost(
+            totals,
+            5.0,
+            25.0,
+            0.10,
+            1.25,
+            2.0,
+            data_residency_multiplier=1.10,
+            fast_mode_multiplier=6.0,
+        )
+        # Base cache_read: 1M * 5 * 0.10 / 1M = 0.50.
+        # Residency boost: 1M * 5 * 0.10 / 1M * (1.10-1) = 0.05.
+        # Fast boost: 1M * 5 * 0.10 / 1M * (6.0-1) = 2.50.
+        # Total cache_read: 0.50 + 0.05 + 2.50 = 3.05.
+        assert cost.cache_read_cost == pytest.approx(3.05)
+        assert cost.total_cost == pytest.approx(3.05)
+
+    def test_default_multipliers_one_means_no_boost(self) -> None:
+        """Default multipliers = 1.0 leave the cost unchanged (backward-compat)."""
+        from devbench.reporting.report import HookLogTotals, _compute_cost
+
+        totals = HookLogTotals(
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            us_only_input_tokens=500_000,
+            fast_output_tokens=500_000,
+        )
+        cost = _compute_cost(totals, 5.0, 25.0, 0.10, 1.25, 2.0)
+        # Base: 1M*5 + 1M*25 = 30. No boost because multipliers default to 1.0.
+        assert cost.total_cost == pytest.approx(30.0)
+
     def test_compute_cost_realistic_high_cache_hit(self) -> None:
         """A heavily-cached call (99% hit rate) costs a small fraction of a naive blended estimate."""
         from devbench.reporting.report import HookLogTotals, _compute_cost
@@ -840,6 +889,66 @@ class TestTranscriptParsing:
         assert result.input_tokens == 0
         assert result.output_tokens == 0
 
+    def test_parse_transcript_metrics_by_role_buckets_per_attribution(self, tmp_path: Path) -> None:
+        """Issue #123 regression: per-role accumulator groups messages by
+        ``attributionAgent`` and the summed totals match
+        ``_parse_transcript_metrics``'s aggregate."""
+        from devbench.reporting.report import (
+            _parse_transcript_metrics,
+            _parse_transcript_metrics_by_role,
+        )
+
+        transcript_dir = tmp_path / "transcripts"
+        transcript_dir.mkdir()
+        # Three turns across three roles: orchestrator (no attribution),
+        # executor, and code_review (note the canonical normalisation:
+        # ``devbench:code-reviewer`` -> ``code_review``).
+        (transcript_dir / "session1.jsonl").write_text(
+            '{"timestamp":"2026-03-05T10:01:00Z","message":{"role":"assistant",'
+            '"usage":{"input_tokens":100,"output_tokens":50}}}\n'
+            '{"timestamp":"2026-03-05T10:02:00Z","attributionAgent":"devbench:executor",'
+            '"message":{"role":"assistant","usage":{"input_tokens":200,"output_tokens":75}}}\n'
+            '{"timestamp":"2026-03-05T10:03:00Z","attributionAgent":"devbench:code-reviewer",'
+            '"message":{"role":"assistant","usage":{"input_tokens":40,"output_tokens":10}}}\n'
+        )
+        window_start = datetime(2026, 3, 5, 10, 0, 0, tzinfo=UTC)
+        by_role = _parse_transcript_metrics_by_role(transcript_dir, window_start)
+
+        assert "orchestrator" in by_role
+        assert "executor" in by_role
+        assert "code_review" in by_role  # devbench:code-reviewer -> code_review
+        assert by_role["orchestrator"].input_tokens == 100
+        assert by_role["executor"].input_tokens == 200
+        assert by_role["code_review"].input_tokens == 40
+
+        # Aggregate row contract (AC-FUNC-003): summed totals match the
+        # existing global figure.
+        global_totals = _parse_transcript_metrics(transcript_dir, window_start)
+        assert sum(t.input_tokens for t in by_role.values()) == global_totals.input_tokens
+        assert sum(t.output_tokens for t in by_role.values()) == global_totals.output_tokens
+        assert sum(t.entries_with_usage for t in by_role.values()) == global_totals.entries_with_usage
+
+    def test_parse_transcript_metrics_by_role_handles_missing_dir(self) -> None:
+        from devbench.reporting.report import _parse_transcript_metrics_by_role
+
+        assert _parse_transcript_metrics_by_role(None, datetime(2026, 3, 5, 10, 0, 0, tzinfo=UTC)) == {}
+
+    def test_role_for_entry_strips_devbench_prefix_and_normalises(self) -> None:
+        from devbench.reporting.report import _role_for_entry
+
+        assert _role_for_entry({"attributionAgent": "devbench:executor"}) == "executor"
+        assert _role_for_entry({"attributionAgent": "devbench:code-reviewer"}) == "code_review"
+        assert _role_for_entry({"attributionAgent": "devbench:test-reviewer"}) == "test_review"
+        assert _role_for_entry({"attributionAgent": "devbench:doc-reviewer"}) == "doc_review"
+        assert _role_for_entry({"attributionAgent": "devbench:changes-manifest"}) == "changes_manifest"
+        assert _role_for_entry({"attributionAgent": "devbench:security-reviewer"}) == "security_review"
+        assert _role_for_entry({"attributionAgent": "devbench:blocker-resolver"}) == "blocker_resolver"
+        assert _role_for_entry({"attributionAgent": "devbench:manifest-amender"}) == "manifest_amender"
+        assert _role_for_entry({"attributionAgent": "devbench:task-factory"}) == "task_factory"
+        # Missing or malformed -> orchestrator bucket.
+        assert _role_for_entry({"attributionAgent": None}) == "orchestrator"
+        assert _role_for_entry({}) == "orchestrator"
+
     def test_combine_totals_sums_field_by_field(self) -> None:
         """_combine_totals adds all numeric fields from two HookLogTotals."""
         from devbench.reporting.report import HookLogTotals, _combine_totals
@@ -851,6 +960,90 @@ class TestTranscriptParsing:
         assert c.output_tokens == 35
         assert c.cache_read_tokens == 150
         assert c.entries_with_usage == 5
+
+
+class TestTranscriptResumedSessionDedup:
+    """Issue #169: resumed Claude Code sessions copy prior assistant messages
+    forward into new transcript files; the parser path must dedup by
+    ``message.id`` so the same logical message is counted once even when it
+    appears in N files. Entries without a stable ``message.id`` continue to
+    accumulate (defensive guard for older transcripts).
+    """
+
+    @staticmethod
+    def _msg_line(ts: str, msg_id: str | None, in_tokens: int, out_tokens: int, role: str = "assistant") -> str:
+        message: dict = {"role": role, "usage": {"input_tokens": in_tokens, "output_tokens": out_tokens}}
+        if msg_id is not None:
+            message["id"] = msg_id
+        return json.dumps({"timestamp": ts, "message": message}) + "\n"
+
+    def test_duplicate_message_ids_across_files_are_counted_once(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import _parse_transcript_metrics
+
+        transcript_dir = tmp_path / "transcripts"
+        transcript_dir.mkdir()
+        # File A: m1, m2, m3 (10/5, 20/7, 30/9 = 60/21 total)
+        (transcript_dir / "a.jsonl").write_text(
+            self._msg_line("2026-03-05T10:01:00Z", "m1", 10, 5)
+            + self._msg_line("2026-03-05T10:02:00Z", "m2", 20, 7)
+            + self._msg_line("2026-03-05T10:03:00Z", "m3", 30, 9)
+        )
+        # File B: m2, m3 carried forward from A + new m4.
+        # If naive sum: m2+m3 are counted twice. Deduped: counted once.
+        (transcript_dir / "b.jsonl").write_text(
+            self._msg_line("2026-03-05T10:02:00Z", "m2", 20, 7)
+            + self._msg_line("2026-03-05T10:03:00Z", "m3", 30, 9)
+            + self._msg_line("2026-03-05T10:04:00Z", "m4", 40, 11)
+        )
+        result = _parse_transcript_metrics(transcript_dir, datetime(2026, 3, 5, 10, 0, 0, tzinfo=UTC))
+        # Deduped: m1+m2+m3+m4 = 100 input / 32 output / 4 entries
+        assert result.input_tokens == 100
+        assert result.output_tokens == 32
+        assert result.entries_with_usage == 4
+
+    def test_entries_without_message_id_still_count(self, tmp_path: Path) -> None:
+        """Defensive: pre-id transcripts and any future schema variant must keep accumulating."""
+        from devbench.reporting.report import _parse_transcript_metrics
+
+        transcript_dir = tmp_path / "transcripts"
+        transcript_dir.mkdir()
+        (transcript_dir / "a.jsonl").write_text(
+            self._msg_line("2026-03-05T10:01:00Z", None, 10, 5) + self._msg_line("2026-03-05T10:02:00Z", None, 20, 7)
+        )
+        result = _parse_transcript_metrics(transcript_dir, datetime(2026, 3, 5, 10, 0, 0, tzinfo=UTC))
+        # Both entries count -- dedup is opt-in on a stable id, not a bar against missing ones.
+        assert result.input_tokens == 30
+        assert result.output_tokens == 12
+        assert result.entries_with_usage == 2
+
+    def test_role_buckets_share_dedup_set(self, tmp_path: Path) -> None:
+        """Per-role aggregator must dedup against the SAME set as the global path so
+        the per-role totals sum to the deduped aggregate."""
+        from devbench.reporting.report import (
+            _parse_transcript_metrics,
+            _parse_transcript_metrics_by_role,
+        )
+
+        transcript_dir = tmp_path / "transcripts"
+        transcript_dir.mkdir()
+        # Same dup pattern as the basic test; orchestrator role implied (no attributionAgent).
+        (transcript_dir / "a.jsonl").write_text(
+            self._msg_line("2026-03-05T10:01:00Z", "m1", 10, 5) + self._msg_line("2026-03-05T10:02:00Z", "m2", 20, 7)
+        )
+        (transcript_dir / "b.jsonl").write_text(
+            self._msg_line("2026-03-05T10:02:00Z", "m2", 20, 7) + self._msg_line("2026-03-05T10:03:00Z", "m3", 30, 9)
+        )
+        window_start = datetime(2026, 3, 5, 10, 0, 0, tzinfo=UTC)
+        global_totals = _parse_transcript_metrics(transcript_dir, window_start)
+        by_role = _parse_transcript_metrics_by_role(transcript_dir, window_start)
+        # Both deduped to m1+m2+m3 = 60 input / 21 output / 3 entries
+        assert global_totals.input_tokens == 60
+        assert global_totals.output_tokens == 21
+        assert global_totals.entries_with_usage == 3
+        # Per-role sum equals the global dedupped figure (aggregate-row contract).
+        assert sum(t.input_tokens for t in by_role.values()) == global_totals.input_tokens
+        assert sum(t.output_tokens for t in by_role.values()) == global_totals.output_tokens
+        assert sum(t.entries_with_usage for t in by_role.values()) == global_totals.entries_with_usage
 
 
 class TestBedrockConfig:
@@ -1180,6 +1373,111 @@ class TestActiveVsBlockedRemaining:
         # est_hours uses recent pace x tasks_active: 50 x 2 / 60 = 1.667h
         assert stats.est_hours == pytest.approx(50.0 * 2 / 60.0)
 
+    def test_recent_per_task_cost_returns_none_with_fewer_than_n_completions(self, tmp_path: Path) -> None:
+        """Issue #164: helper returns None when log has fewer than RECENT_PACE_TASKS completions."""
+        from devbench.config import RECENT_PACE_TASKS
+        from devbench.reporting.report import _recent_per_task_cost
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text("ignored\n")
+        # Only 2 completions; RECENT_PACE_TASKS is 5 by default.
+        done = {f"E0-F1-S1-T{i}": datetime(2026, 4, 15, 10 + i, tzinfo=UTC) for i in range(2)}
+        prog = {f"E0-F1-S1-T{i}": datetime(2026, 4, 15, 9 + i, tzinfo=UTC) for i in range(2)}
+        result = _recent_per_task_cost(log_file, done, prog, RECENT_PACE_TASKS)
+        assert result is None
+
+    def test_recent_per_task_cost_falls_back_to_window_avg_when_helper_returns_none(self, tmp_path: Path) -> None:
+        """Issue #164 fallback contract: when ``recent_per_task_cost`` is
+        None, ``_compute_window_stats`` falls back to the per-window
+        average (cost.total_cost / tasks_in_window). When ``recent_per_task_cost``
+        IS provided it overrides the per-window denominator."""
+        from devbench.reporting.report import _compute_window_stats
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text("")  # empty log -> all costs are zero
+        done = {"E0-F1-S1-T1": datetime(2026, 4, 15, 11, tzinfo=UTC)}
+        prog = {"E0-F1-S1-T1": datetime(2026, 4, 15, 10, tzinfo=UTC)}
+
+        # No recent_per_task_cost supplied -> fallback path; with empty
+        # log every cost is zero so est_total_cost should also be zero.
+        stats_fallback = _compute_window_stats(
+            log_file,
+            datetime(2026, 4, 15, 10, tzinfo=UTC),
+            datetime(2026, 4, 15, 12, tzinfo=UTC),
+            done,
+            prog,
+            tasks_active=10,
+        )
+        assert stats_fallback.est_total_cost == pytest.approx(0.0)
+
+        # With recent_per_task_cost=$50, projection = 0 + 50 * 10 = 500
+        stats_global = _compute_window_stats(
+            log_file,
+            datetime(2026, 4, 15, 10, tzinfo=UTC),
+            datetime(2026, 4, 15, 12, tzinfo=UTC),
+            done,
+            prog,
+            tasks_active=10,
+            recent_per_task_cost=50.0,
+        )
+        assert stats_global.est_total_cost == pytest.approx(500.0)
+
+    def test_lifetime_total_cost_overrides_per_window_additive_base(self, tmp_path: Path) -> None:
+        """Spanning-row contract: when ``lifetime_total_cost`` is supplied,
+        ``est_total_cost`` uses it as the additive base instead of the
+        per-window ``cost.total_cost``. This is what makes every column
+        produce the same projection so ``_merge_spanning_values`` collapses
+        the row. Default-None preserves the legacy per-window formula for
+        direct test callers.
+        """
+        from devbench.reporting.report import _compute_window_stats
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text("")
+        done = {"E0-F1-S1-T1": datetime(2026, 4, 15, 11, tzinfo=UTC)}
+        prog = {"E0-F1-S1-T1": datetime(2026, 4, 15, 10, tzinfo=UTC)}
+
+        # No lifetime_total_cost: legacy formula (cost.total_cost is 0 from
+        # empty log), projection = 0 + 50 * 10 = 500.
+        stats_legacy = _compute_window_stats(
+            log_file,
+            datetime(2026, 4, 15, 10, tzinfo=UTC),
+            datetime(2026, 4, 15, 12, tzinfo=UTC),
+            done,
+            prog,
+            tasks_active=10,
+            recent_per_task_cost=50.0,
+        )
+        assert stats_legacy.est_total_cost == pytest.approx(500.0)
+
+        # With lifetime_total_cost=$1000 (the All-time cost passed in by
+        # generate_report), projection = 1000 + 50 * 10 = 1500. This is
+        # the same number every column produces because it is computed
+        # from a single global pair (lifetime cost, recent rate).
+        stats_lifetime = _compute_window_stats(
+            log_file,
+            datetime(2026, 4, 15, 10, tzinfo=UTC),
+            datetime(2026, 4, 15, 12, tzinfo=UTC),
+            done,
+            prog,
+            tasks_active=10,
+            recent_per_task_cost=50.0,
+            lifetime_total_cost=1000.0,
+        )
+        assert stats_lifetime.est_total_cost == pytest.approx(1500.0)
+
+    def test_estimated_total_cost_at_completion_is_a_spanning_metric(self) -> None:
+        """Issue #164: ``Estimated total cost at completion`` renders as a
+        single value spanning every column instead of one per-window number."""
+        from devbench.reporting.report import _SPANNING_METRIC_LABELS, _merge_spanning_values
+
+        assert "Estimated total cost at completion" in _SPANNING_METRIC_LABELS
+        # When every column carries the same value, _merge_spanning_values
+        # collapses to a single string.
+        result = _merge_spanning_values("Estimated total cost at completion", ["~$500.00"] * 3)
+        assert isinstance(result, str)
+        assert result == "~$500.00"
+
     def test_summary_line_uses_recent_pace_when_available(self) -> None:
         """B4 prose: trailing summary cites Recent pace, not All-time, when set."""
         from devbench.reporting.report import CostBreakdown, HookLogTotals, WindowStats, _summary_line
@@ -1293,7 +1591,11 @@ class TestUnitListings:
         units = [self._mk_unit("E0-F1-S1-T1", "Active task", WorkUnitStatus.IN_PROGRESS)]
         lines = _in_progress_listing(units)
         assert lines[1] == "In-progress tasks:"
-        assert lines[2] == "  - E0-F1-S1-T1: Active task"
+        # Issue #158: row always carries an in-progress suffix; when no
+        # transition timestamp is parseable the helper renders
+        # ``(in-progress, timer unavailable)`` rather than silently omitting.
+        assert lines[2].startswith("  - E0-F1-S1-T1: Active task")
+        assert "(in-progress" in lines[2]
 
     def test_blocked_listing_splits_auto_vs_attn_when_classifier_disagrees(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1306,7 +1608,12 @@ class TestUnitListings:
         unit_auto = self._mk_unit("E0-F1-S1-T1", "Auto-clearing", WorkUnitStatus.BLOCKED)
         unit_attn = self._mk_unit("E0-F1-S1-T2", "Needs attention", WorkUnitStatus.BLOCKED)
 
-        def fake_classify(backlog_root: Path, backlog_index: Path, task_id: str) -> BlockedTaskState:
+        def fake_classify(
+            backlog_root: Path,
+            backlog_index: Path,
+            task_id: str,
+            **kwargs: object,
+        ) -> BlockedTaskState:
             return {
                 "E0-F1-S1-T1": BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL,
                 "E0-F1-S1-T2": BlockedTaskState.NEEDS_OPERATOR_ATTENTION,
@@ -1324,8 +1631,10 @@ class TestUnitListings:
         assert "Blocked tasks (needs operator attention) (1):" in lines
         # Auto-clearing row names the waiting-on target.
         assert any("E0-F1-S1-T1" in line and "waiting on" in line for line in lines)
-        # Attn row is plain.
-        assert any(line == "  - E0-F1-S1-T2: Needs attention" for line in lines)
+        # Issue #168 (3-panel surfacing): every panel-3 row carries a
+        # sub-case annotation. Synthetic fixtures whose work-unit files
+        # do not exist on disk get the fallback ``[needs review]``.
+        assert any(line.startswith("  - E0-F1-S1-T2: Needs attention") and "[needs review]" in line for line in lines)
 
     def test_blocked_listing_present_when_task_blocked(self) -> None:
         """ADR-10: without markers every blocked task renders under the 'needs attention' panel."""
@@ -1340,10 +1649,53 @@ class TestUnitListings:
         # Fake units have no work-unit file on disk; classifier returns
         # NEEDS_OPERATOR_ATTENTION, so only the attn panel renders.
         assert "Blocked tasks (needs operator attention) (2):" in lines
-        assert "  - E0-F2-S1-T3: Disable pager" in lines
-        assert "  - E0-F5-S2-T2: Pipeline tests" in lines
+        # Issue #168 (3-panel surfacing): rows now carry a sub-case
+        # annotation. Synthetic fixtures get ``[needs review]``.
+        assert any(line.startswith("  - E0-F2-S1-T3: Disable pager") and "[needs review]" in line for line in lines)
+        assert any(line.startswith("  - E0-F5-S2-T2: Pipeline tests") and "[needs review]" in line for line in lines)
         # Auto panel NOT rendered because no auto-clearing tasks in fixture.
         assert not any("auto-clearing" in line for line in lines)
+
+    def test_blocked_listing_renders_hold_unit_in_panel_3_with_hold_annotation(self) -> None:
+        """Issue #168: HOLD work units surface in panel 3 with [HOLD] annotation."""
+        from devbench.backlog.work_unit import WorkUnitStatus
+        from devbench.reporting.report import _blocked_listing
+
+        units = [self._mk_unit("E0-F5-S1-T1", "kanon-main2-sync-blocker", WorkUnitStatus.HOLD)]
+        lines = _blocked_listing(units)
+        # Panel 3 header rendered with count 1.
+        assert "Blocked tasks (needs operator attention) (1):" in lines
+        # Row carries the [HOLD] annotation; HOLD unit leads the panel.
+        assert any(line.startswith("  - E0-F5-S1-T1: kanon-main2-sync-blocker") and "[HOLD]" in line for line in lines)
+
+    def test_blocked_listing_sorts_panel_3_with_hold_units_first(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Issue #168: HOLD units cluster at the top of panel 3 ahead of any
+        BLOCKED tasks waiting on them, in deterministic ID order."""
+        from devbench.backlog.proposal import BlockedTaskState
+        from devbench.backlog.work_unit import WorkUnitStatus
+        from devbench.reporting import report as report_mod
+
+        hold_unit = self._mk_unit("E0-F5-S1-T1", "kanon-main2-sync", WorkUnitStatus.HOLD)
+        dep_unit = self._mk_unit("E4-F2-S4-T1", "TDD telemetry", WorkUnitStatus.BLOCKED)
+
+        monkeypatch.setattr(
+            "devbench.backlog.proposal.classify_blocked_task",
+            lambda *a, **kw: BlockedTaskState.NEEDS_OPERATOR_ATTENTION,
+        )
+        monkeypatch.setattr(
+            "devbench.backlog.proposal.panel3_annotation",
+            lambda *a, **kw: (1, "E0-F5-S1-T1", "[HOLD: E0-F5-S1-T1]"),
+        )
+
+        lines = report_mod._blocked_listing([dep_unit, hold_unit])
+        # Locate the panel-3 rows.
+        panel3_idx = lines.index("Blocked tasks (needs operator attention) (2):")
+        rows = [line for line in lines[panel3_idx + 1 :] if line.startswith("  - ")]
+        # HOLD unit (group 0) precedes the BLOCKED-on-HOLD dependent (group 1).
+        assert rows[0].startswith("  - E0-F5-S1-T1")
+        assert "[HOLD]" in rows[0]
+        assert rows[1].startswith("  - E4-F2-S4-T1")
+        assert "[HOLD: E0-F5-S1-T1]" in rows[1]
 
     def test_listings_empty_when_no_matching_tasks(self) -> None:
         from devbench.backlog.work_unit import WorkUnitStatus
@@ -1627,6 +1979,53 @@ class TestSpanningRows:
         assert pace_line.count("\u2502") == 3, f"Expected 3 │ in spanning row, got: {pace_line!r}"
         assert pace_line.count("31.4 min") == 1
 
+    def test_multi_column_table_widens_columns_for_long_spanning_value(self) -> None:
+        """Regression: a spanning value wider than the default column width must
+        force the value columns to widen so the table border stays aligned. Before
+        the fix, a long ETA breakdown busted the right border.
+        """
+        from devbench.reporting.report import _render_multi_column_table
+
+        long_eta = "~41.9 h (active 4 + blocked-recovery 60 + blocked-auto 27 at 27.6 min/task)"
+        lines = _render_multi_column_table(
+            "Window stats",
+            ["All-time 05-02 18:37", "Session 05-04 09:21"],
+            [
+                ("Time span", ["38.8 h", "0.1 h"]),
+                ("Est. time to complete remaining", long_eta),
+            ],
+        )
+        widths = {len(ln) for ln in lines}
+        assert len(widths) == 1, f"Table lines must all be the same width; got widths {sorted(widths)}: {lines!r}"
+        eta_line = next(ln for ln in lines if "Est. time" in ln)
+        assert long_eta in eta_line
+
+    def test_grouped_progress_table_widens_columns_for_long_spanning_value(self) -> None:
+        """Regression: same fix applied to the grouped progress renderer used by
+        the live ``devbench report`` panel."""
+        from devbench.reporting.report import _render_grouped_progress_table
+
+        long_eta = "~41.9 h (active 4 + blocked-recovery 60 + blocked-auto 27 at 27.6 min/task)"
+        lines = _render_grouped_progress_table(
+            "Metric",
+            ["All-time 05-02 18:37", "Session 05-04 09:21"],
+            [
+                (
+                    "THROUGHPUT",
+                    [
+                        ("Time span", ["38.8 h", "0.1 h"]),
+                        ("Est. time to complete remaining", long_eta),
+                    ],
+                ),
+            ],
+        )
+        widths = {len(ln) for ln in lines}
+        assert len(widths) == 1, (
+            f"Grouped table lines must all be the same width; got widths {sorted(widths)}: {lines!r}"
+        )
+        eta_line = next(ln for ln in lines if "Est. time" in ln)
+        assert long_eta in eta_line
+
     def test_report_end_to_end_spans_recent_pace_and_est_time(self, tmp_path: Path) -> None:
         """In the rendered report, Recent pace and Est. time rows are single spanning cells
         -- the underlying value appears exactly once on the row even with multiple window columns."""
@@ -1693,6 +2092,98 @@ class TestSpanningRows:
                 f"Row '{row_label}' expected '{expected_substr}' exactly once in Window stats half, "
                 f"got {occurrences}: {right_half!r}"
             )
+
+    def test_report_end_to_end_spans_estimated_total_cost_at_completion(self, tmp_path: Path) -> None:
+        """Spanning-row regression: ``Estimated total cost at completion`` must
+        render as a single spanning value across All-time / Session columns
+        even when the cost-so-far differs between windows. Pre-fix the row
+        diverged because the additive base ``cost.total_cost`` was per-window;
+        with the global lifetime additive base every column produces the same
+        projection and the spanning collapse fires.
+        """
+        from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
+
+        # Build 10 completed tasks split across an explicit session boundary so
+        # the All-time and Session windows carry different ``cost.total_cost``
+        # values. The session start line ([ORCHESTRATOR STARTING]) splits the
+        # log into pre- and post-session task batches; combined with hook-log
+        # usage spanning both halves, the All-time cost > Session cost.
+        log_lines = []
+        # First 5 completions BEFORE session boundary.
+        for i in range(5):
+            start = f"2026-03-05T08:{i * 5:02d}:00Z"
+            done = f"2026-03-05T08:{i * 5 + 4:02d}:30Z"
+            log_lines.append(f"{start} [judges.cli] INFO Set E0-F1-S1-T{i + 1} to 'in-progress'")
+            log_lines.append(f"{done} [judges.cli] INFO Set E0-F1-S1-T{i + 1} to 'done'")
+        # Session-start marker between the two batches.
+        log_lines.append("2026-03-05T10:00:00Z [judges.cli] INFO [ORCHESTRATOR STARTING]")
+        # Next 5 completions AFTER the session boundary.
+        for i in range(5, 10):
+            start = f"2026-03-05T10:{(i - 5) * 5:02d}:00Z"
+            done = f"2026-03-05T10:{(i - 5) * 5 + 4:02d}:30Z"
+            log_lines.append(f"{start} [judges.cli] INFO Set E0-F1-S1-T{i + 1} to 'in-progress'")
+            log_lines.append(f"{done} [judges.cli] INFO Set E0-F1-S1-T{i + 1} to 'done'")
+        # _hook_log_path resolves hook-logs.jsonl relative to log_path.parent.parent
+        # so put the orchestrator log under a logs/ subdir and the hook log
+        # alongside it at tmp_path/hook-logs.jsonl.
+        logs_dir = tmp_path / "logs"
+        logs_dir.mkdir()
+        log_file = logs_dir / "orchestrator.log"
+        log_file.write_text(_make_log(log_lines))
+
+        # Hook-log usage spans both halves so per-window cost.total_cost
+        # actually differs (All-time covers all 4 entries; Session covers
+        # only the post-10:00 entries).
+        hook_log = tmp_path / "hook-logs.jsonl"
+        hook_log.write_text(
+            '{"timestamp":"2026-03-05T08:04:00Z","event":"PostToolUse","input":{"tool_response":'
+            '{"usage":{"input_tokens":1000000,"output_tokens":250000}}}}\n'
+            '{"timestamp":"2026-03-05T08:14:00Z","event":"PostToolUse","input":{"tool_response":'
+            '{"usage":{"input_tokens":1000000,"output_tokens":250000}}}}\n'
+            '{"timestamp":"2026-03-05T10:04:00Z","event":"PostToolUse","input":{"tool_response":'
+            '{"usage":{"input_tokens":1000000,"output_tokens":250000}}}}\n'
+            '{"timestamp":"2026-03-05T10:14:00Z","event":"PostToolUse","input":{"tool_response":'
+            '{"usage":{"input_tokens":1000000,"output_tokens":250000}}}}\n'
+        )
+
+        fake_units = [
+            WorkUnit(
+                id=f"E0-F1-S1-T{i + 1}",
+                title=f"done-{i}",
+                status=WorkUnitStatus.DONE,
+                unit_type=WorkUnitType.TASK,
+                file_path=Path(f"backlog/done-{i}.md"),
+                repo="caylent-solutions/git-repo",
+                dependencies=[],
+            )
+            for i in range(10)
+        ]
+        fake_units.append(
+            WorkUnit(
+                id="E0-F1-S2-T1",
+                title="active-task",
+                status=WorkUnitStatus.IN_PROGRESS,
+                unit_type=WorkUnitType.TASK,
+                file_path=Path("backlog/active.md"),
+                repo="caylent-solutions/git-repo",
+                dependencies=[],
+            )
+        )
+
+        with patch("devbench.reporting.report.BacklogParser") as mock_cls:
+            mock_cls.return_value.parse_index.return_value = fake_units
+            report = generate_report(log_path=log_file)
+
+        row_line = next((ln for ln in report.splitlines() if "Estimated total cost at completion" in ln), None)
+        assert row_line is not None, "Row 'Estimated total cost at completion' not found"
+        right_half = row_line.split("    ", 1)[-1]
+        # Spanning collapse: exactly ONE dollar value in the windowed half.
+        # Pre-fix this was 2-3 different values per column.
+        dollar_count = right_half.count("$")
+        assert dollar_count == 1, (
+            f"Estimated total cost at completion must span (one $ value); got {dollar_count} in row half: "
+            f"{right_half!r}"
+        )
 
 
 def _small_hook_log() -> str:
@@ -1944,3 +2435,548 @@ class TestDisplayTimezoneFallbackChain:
         report_tz = None
         global_tz = None
         assert _resolve_display_timezone(report_tz or global_tz) is None
+
+
+# ---------------------------------------------------------------------------
+# Divergence warning -- BACKLOG STATE done count vs THROUGHPUT log-derived count
+# ---------------------------------------------------------------------------
+
+
+class TestThroughputDivergenceWarning:
+    """The report emits a one-line WARNING when the BACKLOG.md done count
+    is non-zero but the All-time throughput window finds zero
+    ``Set <id> to 'done'`` events. This is the deterministic signal that
+    the reader is looking at a different log than the orchestrator
+    writes to (typically because ``JUDGE_LOG_FILE`` was unset).
+    """
+
+    @staticmethod
+    def _patch_backlog_with_done_tasks(backlog_total: int = 5, backlog_done: int = 3) -> Any:
+        from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
+
+        units: list[WorkUnit] = []
+        for i in range(backlog_done):
+            units.append(
+                WorkUnit(
+                    id=f"E0-F1-S1-T{i + 1}",
+                    title=f"done-{i + 1}",
+                    status=WorkUnitStatus.DONE,
+                    unit_type=WorkUnitType.TASK,
+                    file_path=Path(f"backlog/E0-F1-S1-T{i + 1}.md"),
+                    repo="org/repo",
+                    dependencies=[],
+                )
+            )
+        for i in range(backlog_total - backlog_done):
+            units.append(
+                WorkUnit(
+                    id=f"E0-F1-S1-T{backlog_done + i + 1}",
+                    title=f"in-queue-{i + 1}",
+                    status=WorkUnitStatus.IN_QUEUE,
+                    unit_type=WorkUnitType.TASK,
+                    file_path=Path(f"backlog/E0-F1-S1-T{backlog_done + i + 1}.md"),
+                    repo="org/repo",
+                    dependencies=[],
+                )
+            )
+        return units
+
+    def test_warning_fires_when_backlog_done_but_log_throughput_zero(self, tmp_path: Path) -> None:
+        # Empty log => throughput finds 0 events. Backlog says 3 done.
+        # Warning must fire; reader is on the wrong log.
+        log_file = tmp_path / "wrong.log"
+        log_file.write_text(_make_log(["2026-03-05T10:00:00Z [unrelated] INFO some entry"]))
+        units = self._patch_backlog_with_done_tasks(backlog_total=5, backlog_done=3)
+        with patch("devbench.reporting.report.BacklogParser") as mock_cls:
+            mock_cls.return_value.parse_index.return_value = units
+            report = generate_report(log_path=log_file)
+        assert "WARNING" in report
+        assert "BACKLOG.md shows 3 done" in report
+        assert "JUDGE_LOG_FILE" in report
+        assert "shows 0" in report  # the throughput count
+
+    def test_warning_silent_when_log_matches_backlog(self, tmp_path: Path) -> None:
+        # Log contains the canonical Set...to 'done' line for every backlog
+        # done task. Throughput count matches backlog count => no warning.
+        log_file = tmp_path / "right.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    "2026-03-05T10:00:00Z [c] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                    "2026-03-05T10:05:00Z [c] INFO Set E0-F1-S1-T1 to 'done'",
+                    "2026-03-05T10:10:00Z [c] INFO Set E0-F1-S1-T2 to 'in-progress'",
+                    "2026-03-05T10:15:00Z [c] INFO Set E0-F1-S1-T2 to 'done'",
+                    "2026-03-05T10:20:00Z [c] INFO Set E0-F1-S1-T3 to 'in-progress'",
+                    "2026-03-05T10:25:00Z [c] INFO Set E0-F1-S1-T3 to 'done'",
+                ]
+            )
+        )
+        units = self._patch_backlog_with_done_tasks(backlog_total=5, backlog_done=3)
+        with patch("devbench.reporting.report.BacklogParser") as mock_cls:
+            mock_cls.return_value.parse_index.return_value = units
+            report = generate_report(log_path=log_file)
+        assert "WARNING: BACKLOG.md reports" not in report
+
+    def test_warning_silent_when_backlog_has_no_done_tasks(self, tmp_path: Path) -> None:
+        # Edge case: brand-new backlog, zero done tasks. Throughput is
+        # also 0; the divergence WARNING must NOT fire (both counts agree).
+        log_file = tmp_path / "fresh.log"
+        log_file.write_text(_make_log(["2026-03-05T10:00:00Z [c] INFO startup"]))
+        units = self._patch_backlog_with_done_tasks(backlog_total=5, backlog_done=0)
+        with patch("devbench.reporting.report.BacklogParser") as mock_cls:
+            mock_cls.return_value.parse_index.return_value = units
+            report = generate_report(log_path=log_file)
+        assert "WARNING: BACKLOG.md reports" not in report
+
+    def test_warning_message_includes_log_path(self, tmp_path: Path) -> None:
+        # The error message must name the log file path so the operator
+        # can immediately identify which file got read; this is the
+        # actionable signal that lets them set JUDGE_LOG_FILE correctly.
+        log_file = tmp_path / "specific-name.log"
+        log_file.write_text("")
+        units = self._patch_backlog_with_done_tasks(backlog_total=2, backlog_done=1)
+        with patch("devbench.reporting.report.BacklogParser") as mock_cls:
+            mock_cls.return_value.parse_index.return_value = units
+            report = generate_report(log_path=log_file)
+        assert str(log_file) in report
+
+
+@pytest.mark.unit
+class TestReportRowColors:
+    """Tests for ANSI colour wrapping on selected report rows.
+
+    Coloured rows:
+      - 'Tasks completed', 'Tasks completed in window',
+        'Work units done (...)', 'Stories / Features / Epics auto-rolled to done'
+        -> green (\\033[32m)
+      - 'Tasks blocked' -> light red (\\033[91m)
+      - 'Estimated cost so far' -> magenta (\\033[35m)
+
+    Colour is suppressed when stdout is not a TTY (default for pytest)
+    and when NO_COLOR is set.
+    """
+
+    def _seed_report(self, tmp_path: Path) -> str:
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    "2026-03-05T10:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                    "2026-03-05T10:05:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'",
+                ]
+            )
+        )
+        with patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
+            return generate_report(log_path=log_file)
+
+    def test_no_color_when_not_tty(self, tmp_path: Path) -> None:
+        # Pytest captures stdout so isatty() is False -- no escape codes anywhere.
+        report = self._seed_report(tmp_path)
+        assert "\033[" not in report
+
+    def test_no_color_when_no_color_env_set(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("NO_COLOR", "1")
+        with patch("devbench.reporting.report._should_use_color", return_value=False):
+            report = self._seed_report(tmp_path)
+        assert "\033[" not in report
+
+    def test_green_wraps_tasks_completed_row(self, tmp_path: Path) -> None:
+        with patch("devbench.reporting.report._should_use_color", return_value=True):
+            report = self._seed_report(tmp_path)
+        green_lines = [line for line in report.splitlines() if "\033[32m" in line and "Tasks completed" in line]
+        assert green_lines, "Expected at least one green-wrapped row containing 'Tasks completed'"
+        for line in green_lines:
+            assert line.endswith("\033[0m"), f"Coloured line missing reset code: {line!r}"
+
+    def test_light_red_wraps_tasks_blocked_row(self, tmp_path: Path) -> None:
+        with patch("devbench.reporting.report._should_use_color", return_value=True):
+            report = self._seed_report(tmp_path)
+        red_lines = [line for line in report.splitlines() if "\033[91m" in line and "Tasks blocked" in line]
+        assert red_lines, "Expected a light-red-wrapped row containing 'Tasks blocked'"
+        for line in red_lines:
+            assert line.endswith("\033[0m")
+
+    def test_magenta_wraps_estimated_cost_so_far(self, tmp_path: Path) -> None:
+        # Cost row only renders when there's token data; seed a hook log.
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    "2026-03-05T10:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                    "2026-03-05T10:05:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'",
+                ]
+            )
+        )
+        hook_log = tmp_path / "hook-logs.jsonl"
+        hook_log.write_text(
+            '{"timestamp":"2026-03-05T10:04:00Z","event":"PostToolUse","input":{"tool_response":'
+            '{"usage":{"input_tokens":50000}}}}\n'
+        )
+        with (
+            patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.reporting.report._should_use_color", return_value=True),
+        ):
+            report = generate_report(log_path=log_file)
+        magenta_lines = [line for line in report.splitlines() if "\033[35m" in line and "Estimated cost so far" in line]
+        assert magenta_lines, "Expected a magenta-wrapped row containing 'Estimated cost so far'"
+        for line in magenta_lines:
+            assert line.endswith("\033[0m")
+
+    def test_estimated_total_cost_row_is_not_coloured(self, tmp_path: Path) -> None:
+        # User explicitly asked only 'Estimated cost so far' to be magenta;
+        # 'Estimated total cost at completion' must remain plain.
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    "2026-03-05T10:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                    "2026-03-05T10:05:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'",
+                ]
+            )
+        )
+        hook_log = tmp_path / "hook-logs.jsonl"
+        hook_log.write_text(
+            '{"timestamp":"2026-03-05T10:04:00Z","event":"PostToolUse","input":{"tool_response":'
+            '{"usage":{"input_tokens":50000}}}}\n'
+        )
+        with (
+            patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.reporting.report._should_use_color", return_value=True),
+        ):
+            report = generate_report(log_path=log_file)
+        for line in report.splitlines():
+            if "Estimated total cost at completion" in line:
+                assert "\033[" not in line, f"'Estimated total cost at completion' must not be coloured: {line!r}"
+
+
+# ---------------------------------------------------------------------------
+# Issue #157: ETA includes blocked-recovery + blocked-auto buckets
+# ---------------------------------------------------------------------------
+
+
+class TestEtaIncludesBlockedRecoveryAndAuto:
+    """Issue #157: the ETA denominator now includes the recovery + auto-clearing
+    blocked buckets, but excludes the operator-attention bucket."""
+
+    def test_compute_window_stats_uses_combined_denominator(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import _compute_window_stats
+
+        # Seed enough done samples that recent_pace_minutes resolves.
+        now = datetime(2026, 5, 2, 12, 0, 0, tzinfo=UTC)
+        done_times: dict[str, datetime] = {}
+        progress_times: dict[str, datetime] = {}
+        for i in range(5):
+            tid = f"E0-F1-S1-T{i + 1}"
+            progress_times[tid] = now - timedelta(minutes=20 + i)
+            done_times[tid] = now - timedelta(minutes=10 + i)
+        log_path = tmp_path / "log.log"
+        log_path.write_text("", encoding="utf-8")
+        stats = _compute_window_stats(
+            log_path,
+            now - timedelta(hours=1),
+            now,
+            done_times,
+            progress_times,
+            tasks_active=4,
+            tasks_blocked_recovery=60,
+            tasks_blocked_auto=27,
+        )
+        # ETA bucket counts surface on the WindowStats dataclass.
+        assert stats.eta_active == 4
+        assert stats.eta_blocked_recovery == 60
+        assert stats.eta_blocked_auto == 27
+        # est_hours scales with (4 + 60 + 27) -- denominator includes recovery + auto.
+        assert stats.est_hours > 0
+
+
+class TestEtaFallsBackOnInsufficientPaceData:
+    """Issue #157: ETA reads n/a when recent-pace data is insufficient."""
+
+    def test_render_returns_n_a_when_recent_pace_unknown(self) -> None:
+        from devbench.reporting.report import _format_est_hours_display
+
+        # Inputs: no est_hours -> "n/a" branch.
+        stats = WindowStats(
+            window_start=datetime(2026, 5, 2, tzinfo=UTC),
+            window_hours=1.0,
+            tasks_in_window=0,
+            avg_minutes=0.0,
+            est_hours=0.0,
+            totals=__import__("devbench.reporting.report", fromlist=["HookLogTotals"]).HookLogTotals(),
+            cost=__import__("devbench.reporting.report", fromlist=["CostBreakdown"]).CostBreakdown(
+                input_cost=0,
+                output_cost=0,
+                cache_read_cost=0,
+                cache_write_5m_cost=0,
+                cache_write_1h_cost=0,
+                total_cost=0,
+            ),
+            cache_hit_rate=None,
+            tokens_per_task=0,
+            est_total_cost=0,
+            api_hours=0,
+            api_efficiency=None,
+        )
+        assert _format_est_hours_display(stats) == "n/a"
+
+    def test_render_bare_hours_when_pace_unknown_but_eta_computed(self) -> None:
+        from devbench.reporting.report import _format_est_hours_display
+
+        rep = __import__("devbench.reporting.report", fromlist=["HookLogTotals", "CostBreakdown"])
+        stats = WindowStats(
+            window_start=datetime(2026, 5, 2, tzinfo=UTC),
+            window_hours=1.0,
+            tasks_in_window=2,
+            avg_minutes=5.0,
+            est_hours=1.5,
+            totals=rep.HookLogTotals(),
+            cost=rep.CostBreakdown(0, 0, 0, 0, 0, 0),
+            cache_hit_rate=None,
+            tokens_per_task=0,
+            est_total_cost=0,
+            api_hours=0,
+            api_efficiency=None,
+            recent_pace_minutes=None,  # Recent pace fragile -> bare-hours branch.
+        )
+        assert _format_est_hours_display(stats) == "~1.5 h"
+
+
+class TestEtaCommentSuffixWhenBlockedDominates:
+    """Issue #157: when recent pace is known, the ETA cell carries a
+    breakdown suffix naming the contributing buckets and pace."""
+
+    def test_breakdown_suffix_present(self) -> None:
+        from devbench.reporting.report import _format_est_hours_display
+
+        rep = __import__("devbench.reporting.report", fromlist=["HookLogTotals", "CostBreakdown"])
+        stats = WindowStats(
+            window_start=datetime(2026, 5, 2, tzinfo=UTC),
+            window_hours=1.0,
+            tasks_in_window=10,
+            avg_minutes=5.6,
+            est_hours=5.4,
+            totals=rep.HookLogTotals(),
+            cost=rep.CostBreakdown(0, 0, 0, 0, 0, 0),
+            cache_hit_rate=None,
+            tokens_per_task=0,
+            est_total_cost=0,
+            api_hours=0,
+            api_efficiency=None,
+            recent_pace_minutes=5.6,
+            eta_active=4,
+            eta_blocked_recovery=60,
+            eta_blocked_auto=27,
+        )
+        out = _format_est_hours_display(stats)
+        assert "5.4 h" in out
+        assert "active 4" in out
+        assert "blocked-recovery 60" in out
+        assert "blocked-auto 27" in out
+        assert "5.6 min/task" in out
+
+
+class TestReportInProgressDurationSuffix:
+    """Issue #158: the report's in-progress panel renders the duration suffix."""
+
+    def test_listing_appends_timer_unavailable_when_no_log_signal(self) -> None:
+        from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
+        from devbench.reporting.report import _in_progress_listing
+
+        unit = WorkUnit(
+            id="E0-F1-S1-T1",
+            title="Active",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T1.md"),
+            repo="org/repo",
+            dependencies=[],
+        )
+        with patch("devbench.cli._in_progress_attempt_duration", return_value=None):
+            lines = _in_progress_listing([unit])
+        assert "(in-progress, timer unavailable)" in lines[2]
+
+    def test_listing_appends_humanized_duration_when_available(self) -> None:
+        from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
+        from devbench.reporting.report import _in_progress_listing
+
+        unit = WorkUnit(
+            id="E0-F1-S1-T1",
+            title="Active",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T1.md"),
+            repo="org/repo",
+            dependencies=[],
+        )
+        with patch("devbench.cli._in_progress_attempt_duration", return_value="23m"):
+            lines = _in_progress_listing([unit])
+        assert "(in-progress for 23m)" in lines[2]
+
+
+class TestOrchestratorAliveBanner:
+    """Tests for the orchestrator-alive status banner (issue #161).
+
+    The banner is rendered at the very top of every ``devbench report``
+    invocation and surfaces three liveness states derived from log-activity
+    recency: ALIVE (green) / STOPPED (red) / STARTING (yellow). The threshold
+    is sourced from ``stop_hook.window_seconds`` so the banner stays aligned
+    with the operator's circuit-breaker quiet window.
+    """
+
+    @staticmethod
+    def _write_log(log_path: Path, last_ts_iso: str) -> None:
+        log_path.write_text(
+            f"2026-03-05T09:00:00Z [devbench.orch] INFO Started\n{last_ts_iso} [devbench.orch] INFO Tick\n"
+        )
+
+    def test_alive_state_green_when_recent_activity(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import _orchestrator_liveness_banner
+
+        log = tmp_path / "orch.log"
+        self._write_log(log, "2026-03-05T10:00:00Z")
+        now = datetime(2026, 3, 5, 10, 0, 30, tzinfo=UTC)
+        with patch("devbench.reporting.report._should_use_color", return_value=True):
+            banner = _orchestrator_liveness_banner(log, "sess-A", 180, now=now)
+        assert banner.startswith("\033[32m")
+        assert "[ORCHESTRATOR ALIVE]" in banner
+        assert "30s ago" in banner
+        assert "session sess-A" in banner
+        assert banner.endswith("\033[0m")
+
+    def test_stopped_state_red_when_quiet_past_threshold(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import _orchestrator_liveness_banner
+
+        log = tmp_path / "orch.log"
+        self._write_log(log, "2026-03-05T10:00:00Z")
+        now = datetime(2026, 3, 5, 10, 10, 0, tzinfo=UTC)
+        with patch("devbench.reporting.report._should_use_color", return_value=True):
+            banner = _orchestrator_liveness_banner(log, "sess-A", 180, now=now)
+        assert banner.startswith("\033[91m")
+        assert "[ORCHESTRATOR STOPPED]" in banner
+        assert "no activity for 10m" in banner
+        assert "last seen" in banner
+        assert "session sess-A" in banner
+        assert banner.endswith("\033[0m")
+
+    def test_starting_state_yellow_when_log_missing(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import _orchestrator_liveness_banner
+
+        missing = tmp_path / "no-such.log"
+        with patch("devbench.reporting.report._should_use_color", return_value=True):
+            banner = _orchestrator_liveness_banner(missing, "sess-A", 180)
+        assert banner.startswith("\033[33m")
+        assert "[ORCHESTRATOR STARTING]" in banner
+        assert "log file empty" in banner
+        assert banner.endswith("\033[0m")
+
+    def test_starting_state_when_log_empty(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import _orchestrator_liveness_banner
+
+        log = tmp_path / "orch.log"
+        log.write_text("")
+        with patch("devbench.reporting.report._should_use_color", return_value=True):
+            banner = _orchestrator_liveness_banner(log, "sess-A", 180)
+        assert "[ORCHESTRATOR STARTING]" in banner
+
+    def test_no_color_when_not_tty(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import _orchestrator_liveness_banner
+
+        log = tmp_path / "orch.log"
+        self._write_log(log, "2026-03-05T10:00:00Z")
+        now = datetime(2026, 3, 5, 10, 0, 30, tzinfo=UTC)
+        with patch("devbench.reporting.report._should_use_color", return_value=False):
+            banner = _orchestrator_liveness_banner(log, "sess-A", 180, now=now)
+        assert "\033[" not in banner
+        assert "[ORCHESTRATOR ALIVE]" in banner
+
+    def test_boundary_at_threshold_is_alive(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import _orchestrator_liveness_banner
+
+        log = tmp_path / "orch.log"
+        self._write_log(log, "2026-03-05T10:00:00Z")
+        # Exactly at threshold (180s) -> ALIVE.
+        at_threshold = datetime(2026, 3, 5, 10, 3, 0, tzinfo=UTC)
+        banner_at = _orchestrator_liveness_banner(log, "sess-A", 180, now=at_threshold)
+        assert "[ORCHESTRATOR ALIVE]" in banner_at
+        # One second past threshold -> STOPPED.
+        past_threshold = datetime(2026, 3, 5, 10, 3, 1, tzinfo=UTC)
+        banner_past = _orchestrator_liveness_banner(log, "sess-A", 180, now=past_threshold)
+        assert "[ORCHESTRATOR STOPPED]" in banner_past
+
+    def test_no_session_id_suppresses_session_suffix(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import _orchestrator_liveness_banner
+
+        log = tmp_path / "orch.log"
+        self._write_log(log, "2026-03-05T10:00:00Z")
+        now = datetime(2026, 3, 5, 10, 0, 10, tzinfo=UTC)
+        for empty in (None, ""):
+            banner = _orchestrator_liveness_banner(log, empty, 180, now=now)
+            assert "-- session" not in banner, f"empty session_id={empty!r} leaked suffix: {banner!r}"
+
+    def test_threshold_sourced_from_stop_hook_window_seconds(self, tmp_path: Path) -> None:
+        """``generate_report`` must read STOP_HOOK_WINDOW_SECONDS, not a literal."""
+        from devbench.reporting import report as report_mod
+
+        log_file = tmp_path / "orch.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    "2026-03-05T10:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                    "2026-03-05T10:05:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'",
+                ]
+            )
+        )
+        captured: dict[str, int] = {}
+
+        def _capture(*, log_path: Path, session_id: str | None, threshold_seconds: int, **_: Any) -> str:
+            captured["threshold"] = threshold_seconds
+            return "[ORCHESTRATOR ALIVE] capture-stub"
+
+        with (
+            patch("devbench.reporting.report.STOP_HOOK_WINDOW_SECONDS", 999),
+            patch("devbench.reporting.report._orchestrator_liveness_banner", side_effect=_capture),
+            patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+        ):
+            report_mod.generate_report(log_path=log_file)
+        assert captured["threshold"] == 999
+
+    def test_banner_prepended_as_first_line_of_report(self, tmp_path: Path) -> None:
+        log_file = tmp_path / "orch.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    "2026-03-05T10:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                    "2026-03-05T10:05:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'",
+                ]
+            )
+        )
+        with (
+            patch(
+                "devbench.reporting.report._orchestrator_liveness_banner",
+                return_value="[ORCHESTRATOR FIXTURE] banner-line",
+            ),
+            patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+        ):
+            output = generate_report(log_path=log_file)
+        first_nonempty = next(line for line in output.splitlines() if line.strip())
+        assert first_nonempty == "[ORCHESTRATOR FIXTURE] banner-line"
+
+    def test_banner_refreshes_under_watch_when_log_advances(self, tmp_path: Path) -> None:
+        """Two successive renders against an advancing log must produce different banners."""
+        from devbench.reporting.report import _orchestrator_liveness_banner
+
+        log = tmp_path / "orch.log"
+        self._write_log(log, "2026-03-05T10:00:00Z")
+        # First tick: 30s ago -> ALIVE 30s.
+        now1 = datetime(2026, 3, 5, 10, 0, 30, tzinfo=UTC)
+        banner1 = _orchestrator_liveness_banner(log, "sess-A", 180, now=now1)
+        # Log advances; orchestrator wrote another line.
+        log.write_text(
+            "2026-03-05T09:00:00Z [devbench.orch] INFO Started\n"
+            "2026-03-05T10:00:00Z [devbench.orch] INFO Tick\n"
+            "2026-03-05T10:00:30Z [devbench.orch] INFO Tick\n"
+        )
+        banner2 = _orchestrator_liveness_banner(log, "sess-A", 180, now=now1)
+        assert "30s ago" in banner1
+        assert "0s ago" in banner2
+        assert banner1 != banner2

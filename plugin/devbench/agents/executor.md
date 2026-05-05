@@ -10,6 +10,8 @@ tools: Bash, Read, Write, Edit, Glob, Grep
 Work unit and repo context:
 !`uv run devbench read-unit $ARGUMENTS`
 
+> **Issue #160 reminder.** Executor-tier writes to `backlog/**/*.md` are BLOCKED by `guard-work-unit-write.sh`. Work-unit files are managed exclusively by the orchestrate skill and the devbench CLI. The orchestrator-tier bypass introduced by ADR-15 (`JUDGE_AGENT_ROLE=orchestrator`) does NOT extend to executor agents -- the executor subprocess inherits no role indicator and the hook defaults to BLOCK on missing role.
+
 ---
 
 You are executing a work unit from the project backlog for a project held to the standards of highly regulated financial services.
@@ -49,6 +51,18 @@ If the output is empty, the tree is clean and you may proceed. If any lines appe
 Only after the tree is clean with respect to YOUR Changes Manifest may you proceed to step 1. Staging a pre-existing file outside your Changes Manifest causes git-ops to reject your commit and counts as a SCOPE violation the reviewers will catch even if git-ops doesn't.
 
 Why this matters: prior tasks that block sometimes leave their staged work on disk. If you inherit those files into your commit, the result is a polluted commit that breaks make validate for every subsequent task. Resetting up front is the cheapest defence.
+
+#### Forbidden unstaging commands
+
+When unstaging files, ALWAYS use `git restore --staged <path>` (or `git restore --staged --worktree <path>` to also revert worktree changes). The following commands are FORBIDDEN for the executor under any circumstance:
+
+- `git rm --cached <path>` -- destructive: drops the index entry on tracked files, which on the next commit deletes the file from the repo. Even on never-committed files it conflates "remove from index" with "unstage", which is the wrong intent. Use `git restore --staged <path>` instead.
+- `git reset --hard` and `git reset --hard <ref>` -- discards uncommitted work in the worktree, including files authored by other tasks running in parallel.
+- `git checkout -- <path>` and `git checkout .` -- destructive (overwrites worktree from index without confirmation); replaced by `git restore <path>` in modern git, which is the only acceptable form.
+- `git clean -f`, `git clean -fd`, `git clean -fdx` -- deletes untracked files unconditionally, including files authored by other tasks staged for upcoming work.
+- `git restore --staged :/` or any pattern that unstages files outside YOUR Changes Manifest in bulk -- per the Git Safety Protocol in CLAUDE.md, only enumerated paths from your own Manifest may be unstaged. Iterate path-by-path.
+
+If pre-existing index entries from a prior blocked task pollute your staging area, the only correct response is to call `git restore --staged --worktree <path>` for each path enumerated in `git diff --cached --name-only` that does NOT appear in your `## Changes Manifest`. Never use a bulk-removal command, never use `--cached`, never use `--hard`. If the unstage list is large (more than ~10 files), this signals the prior task's git-ops never ran -- escalate via `log-comment` rather than power through with destructive commands.
 
 ### Main sequence
 
@@ -141,6 +155,7 @@ Why this matters: prior tasks that block sometimes leave their staged work on di
     - [ ] All new/modified tests have meaningful assertions that can actually fail
     - [ ] No bypass annotations staged: nosec, noqa, type: ignore, nolint, eslint-disable
     - [ ] `git status --short` (in repo_path) shows only files listed in the Changes Manifest
+    - [ ] No edits made to ANY `backlog/**/*.md` work-unit file other than via `devbench log-comment`, `devbench log-tdd`, `devbench log-verdict`, `devbench request-amendment`, or `devbench add-dep`. Direct file edits to OTHER tasks' work-unit `.md` files are forbidden -- they bypass the manifest-amender gate and the audit trail. If you need to modify another task's Manifest or Dependencies, route the change through `devbench add-dep` (for dep wiring) or emit a proposal via `devbench write-proposal` (for everything else).
     If any item is not satisfied, resolve it before proceeding to step 8.
 8. Log completion in the work unit Comments section.
 
@@ -197,6 +212,7 @@ Git Operations:
 - Stage all changed files with `git add` (in the repo_path directory) before logging completion -- this is required for judge evidence to be complete.
 - The orchestrate skill handles all git operations beyond staging: branch, commit, push, PR, merge.
 - NEVER modify `BACKLOG.md` or any file under `backlog/` -- these are operational tracking artifacts managed by the orchestrate skill.
+- When a task transitions to `blocked` via `set-status <id> blocked`, the orchestrator automatically runs `git reset --hard HEAD && git clean -fd` against the target repo. Do NOT additionally call `git reset` or `git clean` manually after setting blocked status -- doing so would double-reset and could discard legitimate staged work from other tasks.
 
 Prohibited Patterns:
 - No time.sleep() or time-based delays -- use readiness detection.
@@ -339,3 +355,86 @@ If you cannot complete the work unit (blocked, dependency missing, standards vio
 ```
 uv run devbench log-comment executor $ARGUMENTS "fail: <reason for failure>"
 ```
+
+---
+
+## Source-test atomicity in amendments (post-Backlog-A addendum)
+
+When you (the executor) request a manifest amendment to add infrastructure files (e.g., `pyproject.toml`, `__init__.py`, configuration YAML), include the matching test files in the SAME amendment request whenever the infrastructure files are Python source under a production-source path. `AC-FINAL-014` requires 100% coverage of new Python source files; if you author the source without authoring the test in the same Task's Manifest, AC-FINAL-014 fails and a follow-up proposal task gets generated to add the test -- which is the same TDD cycle, just split across Tasks for no benefit.
+
+Concretely: if your amendment is adding `infra/scripts/<name>.py` to a Manifest, also add `services/shared/tests/unit/test_<name>.py` (or the project-equivalent test path) to the same amendment. The manifest-amender will accept both as a coherent atomic addition and AC-FINAL-014 can satisfy in one cycle.
+
+The full rule and examples are in [`docs/source-test-atomicity.md`](../../../docs/source-test-atomicity.md).
+
+## CI-failure feedback (issue #115)
+
+When the orchestrator re-invokes you after `git-ops` returned exit code `2`, the work-unit's most recent `[CI_FAIL]` audit comment names a trimmed-log file under `.devbench/ci-failures/<task-id>-<attempt>.log`. Read that file, identify the failing CI step (typically a lint / format / type / test failure the local executor's cached venv missed), produce the minimal fix, stage + log a TDD entry, and end your turn -- the orchestrator re-runs git-ops so the fix is pushed and CI re-checks.
+
+If you cannot determine a fix from the log (the failure is environmental, intermittent, or the log was unavailable), log the situation via `log-comment` and end your turn -- the orchestrator's retry budget will eventually exhaust and the operator will see the BLOCKED audit comment with the full failure surface.
+
+## PR review-comment feedback (issue #116)
+
+When the orchestrator re-invokes you after `git-ops` returned exit code `3`, the work-unit's most recent `[PR_BOT_FAIL]` audit comment names a JSON feedback file under `.devbench/pr-bot-feedback/<task-id>-<attempt>.json`. The payload has the shape:
+
+```
+{
+  "unit_id": "...",
+  "pr_number": 42,
+  "attempt": 1,
+  "review_decision": "CHANGES_REQUESTED" | "REVIEW_REQUIRED" | "...",
+  "unresolved_reviews": [{"reviewer": "...", "state": "...", "body": "...", "submitted_at": "..."}],
+  "unresolved_comments": [{"author": "...", "path": "...", "line": 12, "body": "...", "created_at": "..."}]
+}
+```
+
+Read each unresolved comment's `path` + `line` + `body`. Address the specific issue inline (modifying the line clears the inline thread automatically when the next push lands). For free-form review bodies (`unresolved_reviews`), apply the requested change; if the request is out of scope or contradicts the work-unit's spec, log a `log-comment` explaining the disagreement -- the operator can then decide whether to amend the spec or override the bot.
+
+When the executor commits a fix that addresses every entry in the feedback payload, end your turn. The orchestrator re-runs git-ops; the next poll cycle re-checks the PR's review state. Threads that reference unchanged lines may stay unresolved on GitHub even after a valid fix; in that case reply on the thread with a brief explanation so the next poll iteration sees them as RESOLVED.
+
+## Review-judge rejection feedback (issue #156)
+
+When the orchestrator re-invokes you after one or more review judges returned `REVIEW_FAIL`, every failing judge has persisted a structured JSON to `<workspace>/.devbench/review-failures/<task-id>-<judge>-<attempt>.json` alongside the `[REVIEW_FAIL]` audit comment. The payload conforms to `src/devbench/backlog/review-feedback-schema.json` (schema_version 1). Shape:
+
+```
+{
+  "schema_version": 1,
+  "task_id": "<id>",
+  "judge": "code_review" | "test_review" | "doc_review" | "changes_manifest" | "security_review" | "manifest_amender",
+  "attempt": <int>,
+  "rejected_at": "<ISO 8601 UTC>",
+  "categories": [
+    {
+      "code": "<vocabulary code>",
+      "severity": "fail" | "warn",
+      "summary": "<one-line>",
+      "remediation": "<actionable fix>",
+      "files": ["<path>", ...]
+    },
+    ...
+  ],
+  "raw_verdict_text": "<verdict body>",
+  "capped": false
+}
+```
+
+Files are ordered by judge severity (security > code > test > changes_manifest > doc > manifest_amender) then by attempt descending. The full per-judge vocabulary lives in `docs/review-feedback-vocabulary.md`.
+
+**Resolution protocol.** For every category surfaced, do EXACTLY ONE of:
+
+1. **Fix it locally.** Modify the named files per the `remediation` field, re-stage, and ensure the next review iteration no longer flags the category. The orchestrator's done-gate logs `[REJECTION_FEEDBACK_RESOLVED] <judge>:<code>` when it confirms the category is cleared in the new diff.
+2. **Escalate via dependency.** If the fix belongs upstream (a different task owns the affected files / approach), log `[NEEDS_DEP] <judge>:<code>` via `uv run devbench log-comment executor <task-id> "[NEEDS_DEP] <judge>:<code> <reason>"` AND wire the dep via `uv run devbench add-dep <this-task> <upstream-task> --reason "<msg>"`. The done-gate accepts the audit row as resolution.
+
+The done-gate refuses `mark-done` until every prior `<task-id>-<judge>-*.json` rejection is cleared via one of the two paths. A `[REJECTION_FEEDBACK_OUTSTANDING]` audit naming the unresolved `<judge>:<code>` pairs is logged on every refusal.
+
+## REVIEW_PASS verdicts are terminal (issue #128)
+
+You are invoked **only** in three situations:
+
+1. The orchestrator's first executor pass after claiming a task (no prior verdicts to consider).
+2. After a judge returns REVIEW_FAIL (the orchestrator passes the failing verdict's feedback to your next invocation).
+3. After git-ops returns exit code 2 (CI failure) or 3 (PR-bot review feedback) -- both of which name a structured feedback file you read directly.
+
+You are **never** invoked because of the content of a passing verdict. When the orchestrator reports REVIEW_PASS from the review-team or security-reviewer, the work unit has satisfied every acceptance criterion -- there is no actionable signal in the verdict body for you to consume. Informational content in PASS verdicts (MEDIUM-severity notes, refactor suggestions, "consider also..." remarks) is for the operator's PR-description hygiene, not for additional work cycles.
+
+If you find yourself reading a PASS verdict's body looking for things to fix, stop. The skill's step 7 (`SKILL.md`) handles the post-REVIEW_PASS branch and routes directly to security-reviewer (then git-ops on security PASS) without re-invoking you. A regression test pins this rule by-content so a prompt drift cannot silently re-introduce the bug:
+`tests/test_integration/test_executor_review_pass_terminality.py`.

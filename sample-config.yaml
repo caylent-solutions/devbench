@@ -1,122 +1,257 @@
-# DevBench runtime configuration -- sample / starting point
+# DevBench runtime configuration -- comprehensive reference.
 #
-# Copy this file to your workspace: cp sample-config.yaml backlog/config/devbench.yaml
+# Copy this file to `<workspace>/backlog/config/devbench.yaml` as a starting
+# point. Every YAML field defined in `src/devbench/config-schema.json` is
+# represented below at its default value. Delete sections you do not need.
 #
-# Precedence: environment variables > this file > code defaults
-#
-# Config file path resolution order:
-#   1. --config <path>          CLI argument
-#   2. JUDGE_CONFIG_PATH        environment variable
-#   3. backlog/config/devbench.yaml  (default, relative to JUDGE_WORKSPACE_ROOT)
-#
-# repos: defines allowed repositories and optional per-repo settings.
-# At least one entry is required. Keys must be in "org/repo" format.
-#
-# Per-repo fields:
-#   default_branch      (optional) -- branch used for git diff and PR --base.
-#                                    Omit to fall back to origin/HEAD.
-#   checkout_directory  (optional) -- relative path from JUDGE_WORKSPACE_ROOT to
-#                                    the local checkout. Must be relative (no leading
-#                                    / or .. traversal). Omit to use the repo short
-#                                    name (e.g. "devbench" for "caylent-solutions/devbench").
+# Precedence: env var > this YAML > code default. Schema validation runs at
+# load time; any unknown key fails with a clear error.
 
+# ---------------------------------------------------------------------------
+# Required: at least one repo
+# ---------------------------------------------------------------------------
 repos:
   caylent-solutions/devbench:
     default_branch: main
     checkout_directory: devbench
+    # Per-repo merge_strategy override; falls back to the top-level merge_strategy.
+    # merge_strategy: squash
 
-# git_ops: controls git workflow behaviour after PR merge.
-#
-# update_submodule  (optional, default false) -- set true only when target repos
-#                   are git submodules of a parent workspace repo.  When true,
-#                   cmd_git_ops will stage and commit the updated submodule
-#                   pointer in the parent repo after each PR merge.
-#
-# git_ops:
-#   update_submodule: false
-
-# manifest_amendment: opt-in Changes Manifest amendment workflow.
-#
-# When enabled, executors that discover a required production fix during
-# TDD GREEN can request an amendment to the work unit's Changes Manifest.
-# A dedicated judge reviews the request, and on approval the manifest is
-# updated atomically with a Layer 3 deterministic post-check. When
-# disabled (the default), executors that hit an undeclared production fix
-# escalate for human review instead of staging the file.
-#
-# enabled                   (optional, default false) -- set true to opt the
-#                           backlog into the amendment workflow.
-# allowed_reasons           (optional) -- list of amendment reasons accepted
-#                           by this backlog. Default: ["tdd_green_production_fix"].
-# max_requests_per_execution (optional, default 1) -- upper bound on
-#                           amendments applied to one task during one
-#                           executor run.
-#
-# manifest_amendment:
-#   enabled: false
-#   allowed_reasons:
-#     - tdd_green_production_fix
-#   max_requests_per_execution: 1
-
-# task_factory: opt-in task-factory loop.
-#
-# When enabled (and manifest_amendment is also enabled), a legitimate
-# amendment rejection triggers blocker-resolver -> task-factory, which
-# drafts one or more new work units with status `proposed` covering
-# the out-of-scope production fixes the amender surfaced. The operator
-# reviews, edits, and promotes each draft via `devbench promote-proposal`
-# or rejects it via `devbench reject-proposal`.
-#
-# enabled                  (optional, default false) -- requires manifest_amendment.enabled: true.
-# auto_accept_proposals    (optional, default false) -- when true, devbench
-#                          sweep-proposals auto-promotes every produced draft
-#                          at the next orchestrate loop tick instead of
-#                          leaving it at `proposed` for human review. Every
-#                          auto-promoted draft's [PROPOSAL_PROMOTED] comment
-#                          carries the `(auto-accepted via ...)` suffix so
-#                          the audit trail reflects the tool, not a human.
-#                          See docs/adr/11-auto-accept-proposals.md.
-#
-# task_factory:
-#   enabled: false
-#   auto_accept_proposals: false
-
-# Work-unit lifecycle statuses
 # ---------------------------------------------------------------------------
-# The `## Status:` line in every work-unit .md accepts these values:
-#   in-queue      actionable, orchestrator will claim this
-#   in-progress   orchestrator has claimed the unit
-#   in-review     executor done; judges running
-#   done          completed and shipped
-#   blocked       waiting on external resolution (dependency, human, infra)
-#   proposed      task-factory draft awaiting human promotion (inert)
-#   declined      operator decided this work will never be done (terminal)
-#
-# The `declined` status is universal (not opt-in). Mark work declined with:
-#   uv run devbench decline <id> --reason "<message>"
-#
-# Declined children count as "terminal-complete" for parent rollup: a
-# Story/Feature/Epic rolls to done once every child is Done or Declined.
-# Declined tasks are excluded from tasks_remaining and from projection ETAs,
-# and surface in a dedicated `Declined (N):` panel in `devbench report`.
+# Top-level identity / runtime knobs
+# ---------------------------------------------------------------------------
 
-# display_timezone: IANA timezone name (e.g. "America/New_York", "Europe/London")
-# applied by every devbench command that renders timestamps -- devbench report,
-# devbench hook-tail, devbench watch, and any future command. When unset, each
-# command defaults to the OS local timezone. Override per-invocation via the
-# JUDGE_DISPLAY_TIMEZONE env var. Per-command overrides (report.display_timezone,
-# JUDGE_REPORT_TIMEZONE, hook-tail --tz) still take precedence.
-#
+# Default merge strategy for every repo unless overridden per-repo above.
+merge_strategy: squash
+
+# Maximum executor retries per work unit -- shared budget across review-judge
+# retries, CI-failure retries, and PR-bot-feedback retries (see git_ops below).
+max_executor_retries: 10
+
+# Per-judge override of max_executor_retries (issue #122). Each value falls
+# back to max_executor_retries when absent. Useful when one judge is flakey
+# (more retries) and another is stable (fewer retries to fail-fast on real bugs).
+max_executor_retries_per_judge:
+  code_review: 10
+  test_review: 10
+  doc_review: 10
+  changes_manifest: 10
+  security_review: 10
+
+# When true, route LLM calls via AWS Bedrock instead of the Anthropic API.
+use_bedrock: false
+
+# AWS region for Bedrock when use_bedrock: true.
+bedrock_region: us-east-1
+
+# Per-role model selection. Each falls back to JUDGE_CLAUDE_MODEL when unset.
+# judge_model: us.anthropic.claude-sonnet-4-6-v1
+# executor_model: us.anthropic.claude-opus-4-7-v1
+
+# Hard allowlist of GitHub orgs devbench may operate against. Empty means
+# every org listed in repos: above is permitted; otherwise restrict here.
+allowed_orgs: []
+
+# IANA timezone applied to every timestamp-rendering command (report,
+# hook-tail, watch). Unset = OS local timezone.
 # display_timezone: America/New_York
 
-# report: contains report-specific settings. Most operators don't need to set
-# these explicitly -- the code defaults match Opus 4.7 list pricing. Set them
-# only when running against a different model or when your contract has a
-# different rate structure. See devbench docs/model-pricing.md for the full
-# semantic and the worked-examples table.
-#
-# report:
-#   # Contract discount (correction factor) off list-price token cost. Fraction
-#   # in [0.0, 1.0]. final_cost = raw_list_cost * (1 - token_cost_discount).
-#   # Default 0.0 = no discount (pay full list). E.g. 0.25 = 25% off list.
-#   token_cost_discount: 0.0
+# Workspace-relative path to the orchestrator's structured log file. Both
+# the writer (setup_logging) and the readers (report, hook-tail) consult
+# this single source of truth so they cannot diverge.
+log_file: logs/orchestrator.log
+
+# ---------------------------------------------------------------------------
+# Timeouts (seconds)
+# ---------------------------------------------------------------------------
+timeouts:
+  gh_api: 30
+  test: 300
+  security_fetch: 120
+  llm: 300
+  command: 120
+  executor: 600
+  executor_max_turns: 100
+  orchestrator_poll_interval: 10
+  github_check: 600
+
+# ---------------------------------------------------------------------------
+# Limits / thresholds
+# ---------------------------------------------------------------------------
+limits:
+  alert_summary: 10
+  output_truncation: 2000
+  llm_evidence_truncation: 15000
+  llm_file_context: 5
+  llm_file_preview_chars: 3000
+  # Issue #115: byte cap for the trimmed failing-job log written to
+  # `<workspace>/.devbench/ci-failures/<id>-<n>.log`. Caps executor feedback
+  # payload size. Operators bump this when CI logs legitimately need a
+  # longer relevant tail (rare).
+  ci_failure_log_bytes: 32768
+
+# ---------------------------------------------------------------------------
+# Git operations
+# ---------------------------------------------------------------------------
+git_ops:
+  # Set true only when target repos are git submodules of a parent workspace
+  # repo. When true, the parent repo's submodule pointer is updated after
+  # each PR merge.
+  update_submodule: false
+  # Single-branch mode: every work unit commits to this branch (see defer_pr
+  # below). Unset = standard multi-PR mode (one branch per work unit).
+  # single_branch: feat/my-batch-branch
+  # Defer-PR mode: commits stay local until `devbench git-ops-finalize` runs.
+  # Requires single_branch to be set.
+  defer_pr: false
+  # Issue #101: when true, cmd_git_ops pushes the PR + waits for green CI,
+  # then transitions the work unit to in-review instead of merging. The
+  # orchestrator's loop reconciles in-review tasks via cmd_check_merge.
+  # Mutually exclusive with defer_pr and single_branch (validated at load).
+  pause_before_merge: false
+  # Phase 1 of the orphan-cascade fix. When true (the default), git-ops
+  # runs cleanup_tracked_orphans inline as a chore commit before the task's
+  # commit when build/state orphan paths are detected.
+  inline_orphan_cleanup: true
+  # Issue #115: when true (the default after the v-next flip), CI failure
+  # returns rc=2 to trigger an executor retry with the failing-job log as
+  # feedback. Set to false for the legacy rc=1 BLOCKED behaviour.
+  ci_failure_retry: true
+  # Operator override of the built-in orphan-pattern fnmatch list. Empty =
+  # use the built-in list (terraform state, terragrunt cache, Python
+  # pycache, coverage, etc.). Non-empty REPLACES the built-in entirely.
+  orphan_patterns: []
+  # Issue #116: opt-in PR review-comment polling. When enabled, cmd_git_ops
+  # polls `gh pr view` between CI-pass and merge for asynchronous review
+  # bot comments (Copilot, Q-Dev, internal review services).
+  pr_review_resolution:
+    enabled: false
+    # Comma-separated logins whose unresolved comments block the merge.
+    # Example: ["github-copilot[bot]", "amazon-q-developer[bot]"]
+    agents: []
+    # When true, reviewDecision == CHANGES_REQUESTED hard-blocks merge
+    # regardless of bot allowlist.
+    decision_blocks: true
+    # Total settle-window length, seconds.
+    settle_seconds: 60
+    # Per-poll cadence inside the settle window, seconds.
+    poll_interval: 5
+
+# ---------------------------------------------------------------------------
+# Stop-hook circuit breaker
+# ---------------------------------------------------------------------------
+stop_hook:
+  max_blocks: 5
+  # Quiet-window cap for the circuit breaker. Doubles as the threshold
+  # for `devbench report`'s orchestrator-alive banner (issue #161): a
+  # log line within this many seconds renders the banner green ALIVE,
+  # past it renders red STOPPED. Tune this once for your workload's
+  # quiet-window tolerance and the banner stays aligned automatically.
+  window_seconds: 180
+  stale_task_minutes: 120
+
+# ---------------------------------------------------------------------------
+# devbench hook-tail column caps (issue #134)
+# ---------------------------------------------------------------------------
+hook_tail:
+  # Column width for the agent name.
+  agent_width: 12
+  # Column width for the tool name.
+  tool_width: 8
+  # Max chars for the description column (bumped from 100 in v-next).
+  description_max: 120
+  # Max chars for the result-preview column after the pipe.
+  stdout_preview_max: 80
+
+# ---------------------------------------------------------------------------
+# Orchestrator runtime tuning (issue #144)
+# ---------------------------------------------------------------------------
+orchestrate:
+  # Cap on recovery-of-a-recovery cascade depth. When a proposal would land
+  # at depth >= this cap, the source task transitions to
+  # NEEDS_OPERATOR_ATTENTION instead of materialising another recovery
+  # layer. Override via JUDGE_ORCHESTRATE_MAX_CASCADE_DEPTH env var.
+  max_cascade_depth: 3
+
+# ---------------------------------------------------------------------------
+# Report / cost estimation
+# ---------------------------------------------------------------------------
+report:
+  # Defaults match Opus 4.7 list pricing. Set explicitly only when running a
+  # different model or when your contract has a different rate structure.
+  #
+  # Calibration guidance:
+  # The reported cost should equal actual API billing within ~1%. If reported
+  # cost drifts from actual (e.g., model swap, 1M-context premium tier, or
+  # non-list contract pricing), derive a correction factor from a recent run:
+  #     correction = actual_billing / reported_cost
+  # Multiply BOTH per-million rates below by that factor; the input/output
+  # ratio is preserved and the cache-read / cache-write / data-residency
+  # multipliers below compose correctly on top of the corrected base rate.
+  #
+  # NOTE: `token_cost_discount` (below) only DECREASES reported cost, so it is
+  # the wrong knob for under-reporting. Always correct upward via the per-
+  # million rates above.
+  token_cost_per_million_input: 5.0
+  token_cost_per_million_output: 25.0
+  # Contract discount off list price as a fraction in [0.0, 1.0].
+  # final_cost = raw_list_cost * (1 - token_cost_discount). 0.0 = full list.
+  token_cost_discount: 0.0
+  # Anthropic's published cache pricing -- override only on platforms with
+  # different cache pricing (some Bedrock configurations).
+  cache_read_multiplier: 0.10
+  cache_write_5min_multiplier: 1.25
+  cache_write_1hr_multiplier: 2.0
+  data_residency_multiplier: 1.10
+  fast_mode_multiplier: 6.0
+  recent_pace_tasks: 10
+  # Report-specific timezone override. Falls back to the top-level
+  # display_timezone (and ultimately to OS local).
+  # display_timezone: America/New_York
+
+# ---------------------------------------------------------------------------
+# Manifest amendment workflow (opt-in)
+# ---------------------------------------------------------------------------
+manifest_amendment:
+  enabled: false
+  allowed_reasons:
+    - tdd_green_production_fix
+  max_requests_per_execution: 1
+
+# ---------------------------------------------------------------------------
+# Task factory loop (requires manifest_amendment.enabled: true)
+# ---------------------------------------------------------------------------
+task_factory:
+  enabled: false
+  # When true, sweep-proposals auto-promotes every produced draft at the
+  # next loop tick. Default false preserves "human reviews every proposal".
+  auto_accept_proposals: false
+
+# ---------------------------------------------------------------------------
+# Opt-in validate-backlog rules. Existing rules (1-19) run unconditionally;
+# rules listed here are gated to keep pre-existing backlogs green during
+# rollout. Flip a toggle to true after auditing your backlog's AC / DoD
+# prose for compatibility with the rule.
+# ---------------------------------------------------------------------------
+validate:
+  # Rule 20 (issue / spec-coherence): cross-check every Task's Acceptance
+  # Criteria and Definition of Done sections against the Changes Manifest.
+  # Backtick-quoted path-shaped tokens that are not present in the Manifest
+  # (after path normalisation) emit a validate-backlog error. Use the
+  # inline "(ref)" suffix to declare a token a read-only reference and
+  # exempt it from the check. See docs/backlog-contract.md.
+  check_orphan_path_tokens: false
+
+# ---------------------------------------------------------------------------
+# Diagnostic-tuning knobs (set only when investigating a specific cadence
+# problem; production workspaces leave this section absent).
+# ---------------------------------------------------------------------------
+# debug:
+#   # Issue #114: number of times wait_for_checks retries gh pr checks when
+#   # 'no checks reported' contradicts the local workflow-file glob.
+#   check_registration_retries: 12
+#   check_registration_delay_seconds: 5
+#   # 3-state classifier: recency cap (seconds) for AWAITING_AUTO_RECOVERY
+#   # signal. Tasks whose most recent [BLOCKED] audit-comment is older than
+#   # this fall through to NEEDS_OPERATOR_ATTENTION.
+#   blocked_recovery_window_seconds: 1800

@@ -1,0 +1,16 @@
+---
+- name: Ensure ~/.local/bin exists
+  ansible.builtin.file:
+    path: "/home/{{ linux_user }}/.local/bin"
+    state: directory
+    owner: "{{ linux_user }}"
+    group: "{{ linux_user }}"
+    mode: "0755"
+
+- name: Install devbench-session helper
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../../../tools/devbench_session.py"
+    dest: "/home/{{ linux_user }}/.local/bin/devbench-session"
+    owner: "{{ linux_user }}"
+    group: "{{ linux_user }}"
+    mode: "0755"

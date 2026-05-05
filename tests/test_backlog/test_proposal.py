@@ -178,6 +178,46 @@ class TestProposalDataclass:
         with pytest.raises(ValueError, match="missing required field"):
             Proposal.from_dict(payload)
 
+    def test_source_dep_direction_default_is_empty(self) -> None:
+        # Default Proposal omits the field; to_dict + from_dict roundtrip
+        # must preserve the empty string and not surface as a schema change.
+        proposal = _sample_proposal()
+        assert proposal.source_dep_direction == ""
+        payload = proposal.to_dict()
+        assert payload["source_dep_direction"] == ""
+        restored = Proposal.from_dict(payload)
+        assert restored.source_dep_direction == ""
+
+    def test_source_dep_direction_test_validates_source_roundtrips(self) -> None:
+        # The only non-default value the schema accepts is the explicit
+        # string "test_validates_source"; cmd_promote_proposal reads this
+        # to auto-apply --no-dep-on-source.
+        proposal = Proposal(
+            source_task_id="E0-F1-S1-T1",
+            generated_at="2026-04-18T03:25:00Z",
+            rejection_reason="r",
+            proposed_tasks=[],
+            source_dep_direction="test_validates_source",
+        )
+        restored = Proposal.from_dict(proposal.to_dict())
+        assert restored.source_dep_direction == "test_validates_source"
+
+    def test_source_dep_direction_rejects_unknown_value(self) -> None:
+        # Any string outside the {"", "test_validates_source"} allowlist
+        # must raise ValueError so typos surface at promotion time.
+        payload = _sample_proposal().to_dict()
+        payload["source_dep_direction"] = "source_validates_test"
+        with pytest.raises(ValueError, match="must be empty or 'test_validates_source'"):
+            Proposal.from_dict(payload)
+
+    def test_source_dep_direction_missing_in_json_defaults_to_empty(self) -> None:
+        # Older proposal JSON files written before the field existed must
+        # continue to load as "" (no behavior change).
+        payload = _sample_proposal().to_dict()
+        del payload["source_dep_direction"]
+        restored = Proposal.from_dict(payload)
+        assert restored.source_dep_direction == ""
+
 
 # ---------------------------------------------------------------------------
 # Path / lock helpers
@@ -1639,6 +1679,171 @@ class TestClassifyBlockedTask:
         state = classify_blocked_task(backlog_dir, tmp_path / "BACKLOG.md", "E0-F1-S1-T1")
         assert state is BlockedTaskState.NEEDS_OPERATOR_ATTENTION
 
+    def test_task_with_hold_marker_target_is_needs_attention(self, tmp_path: Path) -> None:
+        """Issue #168 (3-panel surfacing): HOLD-target marker -> NEEDS_OPERATOR_ATTENTION.
+
+        HOLD is non-terminal so the cascade cannot fire; HOLD will not
+        clear without operator action so AUTO_CLEARING_VIA_PROPOSAL is
+        a misclassification. Surface to panel 3.
+        """
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        workspace = self._workspace_with_markers(tmp_path, [("E0-F1-S1-T2", "hold")])
+        state = classify_blocked_task(workspace / "backlog", workspace / "BACKLOG.md", "E0-F1-S1-T1")
+        assert state is BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+
+    def test_task_with_hold_target_among_active_targets_is_needs_attention(self, tmp_path: Path) -> None:
+        """HOLD precedence: any HOLD target wins over in-queue / in-progress siblings.
+
+        Even though one of the marker targets is in-queue (would normally
+        return AUTO_CLEARING_VIA_PROPOSAL), the presence of a HOLD target
+        forces NEEDS_OPERATOR_ATTENTION because the cascade is gated on
+        every target reaching terminal and HOLD is non-terminal.
+        """
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        workspace = self._workspace_with_markers(tmp_path, [("E0-F1-S1-T2", "in-queue"), ("E0-F1-S1-T3", "hold")])
+        state = classify_blocked_task(workspace / "backlog", workspace / "BACKLOG.md", "E0-F1-S1-T1")
+        assert state is BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+
+
+class TestPanel3Annotation:
+    """Issue #168 (3-panel surfacing): panel3_annotation routing + sort key."""
+
+    def _workspace_with_markers(self, tmp_path: Path, marker_target_status_pairs: list[tuple[str, str]]) -> Path:
+        return TestClassifyBlockedTask()._workspace_with_markers(tmp_path, marker_target_status_pairs)
+
+    def test_hold_marker_target_returns_group_1_with_hold_annotation(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import panel3_annotation
+
+        workspace = self._workspace_with_markers(tmp_path, [("E0-F1-S1-T2", "hold")])
+        group_rank, hold_target, annotation = panel3_annotation(
+            workspace / "backlog", workspace / "BACKLOG.md", "E0-F1-S1-T1"
+        )
+        assert group_rank == 1
+        assert hold_target == "E0-F1-S1-T2"
+        assert annotation == "[HOLD: E0-F1-S1-T2]"
+
+    def test_no_marker_returns_group_2_with_no_marker_annotation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from devbench.backlog import proposal as proposal_mod
+        from devbench.backlog.proposal import panel3_annotation
+
+        source = tmp_path / "fake.md"
+        source.write_text("# fake\n\n## Status: blocked\n")
+        monkeypatch.setattr(proposal_mod, "_find_source_task_file", lambda *a, **kw: source)
+
+        class _NoMarkers:
+            def _extract_pending_proposal_markers(self, _p):
+                return set()
+
+            def _parse_backlog_rows(self, _path):
+                return []
+
+        monkeypatch.setattr(proposal_mod, "BacklogManager", _NoMarkers)
+        group_rank, hold_target, annotation = panel3_annotation(
+            tmp_path / "backlog", tmp_path / "BACKLOG.md", "E0-F1-S1-T1"
+        )
+        assert group_rank == 2
+        assert hold_target is None
+        assert annotation == "[no marker]"
+
+    def test_unknown_target_returns_group_3(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import panel3_annotation
+
+        # Build a workspace whose source carries a marker pointing at an ID
+        # with NO backlog row.
+        backlog_dir = tmp_path / "backlog"
+        story_dir = backlog_dir / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+        (story_dir / "E0-F1-S1-T1.md").write_text(
+            "# E0-F1-S1-T1: Source\n\n## Status: blocked\n\n"
+            "## Comments\n\n"
+            "[2026-04-20 00:00 UTC] [agent/task_factory] [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T99\n"
+        )
+        (tmp_path / "BACKLOG.md").write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Source | Task | blocked | None | r | `backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n"
+        )
+        group_rank, hold_target, annotation = panel3_annotation(backlog_dir, tmp_path / "BACKLOG.md", "E0-F1-S1-T1")
+        assert group_rank == 3
+        assert hold_target is None
+        assert "E0-F1-S1-T99" in annotation
+        assert annotation.startswith("[marker target unknown")
+
+    def test_all_targets_terminal_returns_group_4(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import panel3_annotation
+
+        workspace = self._workspace_with_markers(tmp_path, [("E0-F1-S1-T2", "done"), ("E0-F1-S1-T3", "declined")])
+        group_rank, hold_target, annotation = panel3_annotation(
+            workspace / "backlog", workspace / "BACKLOG.md", "E0-F1-S1-T1"
+        )
+        assert group_rank == 4
+        assert hold_target is None
+        assert annotation == "[marker targets all terminal]"
+
+    def test_missing_source_task_returns_group_5_fallback(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import panel3_annotation
+
+        # No backlog tree at all -- _find_source_task_file returns None.
+        group_rank, hold_target, annotation = panel3_annotation(
+            tmp_path / "backlog", tmp_path / "BACKLOG.md", "E0-F1-S1-T99"
+        )
+        assert group_rank == 5
+        assert hold_target is None
+        assert annotation == "[needs review]"
+
+    def test_classify_markers_falls_back_when_no_subcase_matches(self) -> None:
+        """``_panel3_classify_markers`` returns the (5, None, ``[needs review]``)
+        fallback when the marker set doesn't match any specific sub-case --
+        no HOLD target, no unknown target, and not all terminal. Defensive
+        fallback for callers who reach panel3_annotation via a path other
+        than the standard classifier."""
+        from devbench.backlog.proposal import _panel3_classify_markers
+
+        # Two markers, both in-progress (non-terminal, known, non-HOLD).
+        # The real classifier would have returned AUTO_CLEARING_VIA_PROPOSAL
+        # for this state; this direct test pins the fallback exists.
+        result = _panel3_classify_markers(
+            ["E0-F1-S1-T2", "E0-F1-S1-T3"],
+            {"E0-F1-S1-T2": "in-progress", "E0-F1-S1-T3": "in-progress"},
+        )
+        assert result == (5, None, "[needs review]")
+
+    def test_missing_backlog_index_returns_group_5_fallback(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When _parse_backlog_rows raises FileNotFoundError, fall back to group 5."""
+        from devbench.backlog import proposal as proposal_mod
+        from devbench.backlog.proposal import panel3_annotation
+
+        backlog_dir = tmp_path / "backlog"
+        story_dir = backlog_dir / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+        source = story_dir / "E0-F1-S1-T1.md"
+        source.write_text(
+            "# E0-F1-S1-T1: Source\n\n## Status: blocked\n\n"
+            "## Comments\n\n"
+            "[2026-04-20 00:00 UTC] [agent/task_factory] [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2\n"
+        )
+        monkeypatch.setattr(proposal_mod, "_find_source_task_file", lambda *a, **kw: source)
+
+        class _Exploding:
+            def _extract_pending_proposal_markers(self, _p):
+                return {"E0-F1-S1-T2"}
+
+            def _parse_backlog_rows(self, _path):
+                raise FileNotFoundError("forced")
+
+        monkeypatch.setattr(proposal_mod, "BacklogManager", _Exploding)
+        group_rank, hold_target, annotation = panel3_annotation(backlog_dir, tmp_path / "BACKLOG.md", "E0-F1-S1-T1")
+        assert group_rank == 5
+        assert hold_target is None
+        assert annotation == "[needs review]"
+
 
 class TestAddDepBlockedMissing:
     def test_add_dep_raises_when_blocked_task_missing_from_backlog(self, tmp_path: Path) -> None:
@@ -2150,3 +2355,254 @@ class TestRejectProposalMarkerStrip:
         source_file.write_text(original)
         _strip_pending_proposal_marker(source_file, "E0-F1-S1-T99")
         assert source_file.read_text() == original
+
+
+class TestClassifyBlockedTaskAwaitingRecovery:
+    """Part-1 (3-state classifier): AWAITING_AUTO_RECOVERY signals.
+
+    No ``[BLOCKED_PENDING_PROPOSAL]`` marker is present, but the
+    orchestrator's loop has left a recovery artefact on disk. The
+    task should classify as ``AWAITING_AUTO_RECOVERY`` -- not
+    ``NEEDS_OPERATOR_ATTENTION`` -- so the operator does not get
+    paged on a transient state devbench will resolve itself.
+    """
+
+    def _workspace_no_marker(self, tmp_path: Path) -> Path:
+        """Source task with no markers; recovery signals supplied by tests."""
+        from datetime import UTC, datetime
+
+        del datetime, UTC
+        backlog_dir = tmp_path / "backlog"
+        story_dir = backlog_dir / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+        source_file = story_dir / "E0-F1-S1-T1.md"
+        source_file.write_text(
+            "# E0-F1-S1-T1: Source\n\n## Status: blocked\n\n"
+            "## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
+            "## Comments\n"
+        )
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|-------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Source | Task | blocked | None | r | `backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n"
+        )
+        return tmp_path
+
+    def test_pending_proposal_json_classifies_recovery(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import (
+            BlockedTaskState,
+            classify_blocked_task,
+        )
+
+        workspace = self._workspace_no_marker(tmp_path)
+        proposals_dir = workspace / ".devbench" / "proposals"
+        proposals_dir.mkdir(parents=True)
+        (proposals_dir / "E0-F1-S1-T1.json").write_text("{}")
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+        )
+        assert state is BlockedTaskState.AWAITING_AUTO_RECOVERY
+
+    def test_rejected_amendment_archive_classifies_recovery(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import (
+            BlockedTaskState,
+            classify_blocked_task,
+        )
+
+        workspace = self._workspace_no_marker(tmp_path)
+        archive_dir = workspace / ".devbench" / "rejected-requests"
+        archive_dir.mkdir(parents=True)
+        (archive_dir / "E0-F1-S1-T1-20260501T120000Z.json").write_text("{}")
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+        )
+        assert state is BlockedTaskState.AWAITING_AUTO_RECOVERY
+
+    def test_recent_recovery_audit_comment_classifies_recovery(self, tmp_path: Path) -> None:
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import (
+            BlockedTaskState,
+            classify_blocked_task,
+        )
+
+        workspace = self._workspace_no_marker(tmp_path)
+        # Append a recent recovery-shaped [BLOCKED] line to the source file.
+        source_file = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
+        now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        ts = now.strftime("%Y-%m-%d %H:%M UTC")
+        source_file.write_text(
+            source_file.read_text()
+            + f"\n[{ts}] [agent/orchestrator] [BLOCKED] amendment-reject for T1 -- emitting fix proposal\n"
+        )
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+            now=now,
+            recovery_window_seconds=300,
+        )
+        assert state is BlockedTaskState.AWAITING_AUTO_RECOVERY
+
+    def test_stale_audit_comment_falls_through_to_attention(self, tmp_path: Path) -> None:
+        from datetime import UTC, datetime, timedelta
+
+        from devbench.backlog.proposal import (
+            BlockedTaskState,
+            classify_blocked_task,
+        )
+
+        workspace = self._workspace_no_marker(tmp_path)
+        source_file = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
+        now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        old_ts = (now - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M UTC")
+        source_file.write_text(
+            source_file.read_text() + f"\n[{old_ts}] [agent/orchestrator] [BLOCKED] amendment-reject (long ago)\n"
+        )
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+            now=now,
+            recovery_window_seconds=300,
+        )
+        assert state is BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+
+    def test_audit_from_non_recovery_agent_falls_through(self, tmp_path: Path) -> None:
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import (
+            BlockedTaskState,
+            classify_blocked_task,
+        )
+
+        workspace = self._workspace_no_marker(tmp_path)
+        source_file = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
+        now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        ts = now.strftime("%Y-%m-%d %H:%M UTC")
+        source_file.write_text(
+            source_file.read_text() + f"\n[{ts}] [agent/some-other-agent] [BLOCKED] amendment-reject\n"
+        )
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+            now=now,
+            recovery_window_seconds=300,
+        )
+        assert state is BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+
+    def test_no_signal_classifies_needs_attention(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import (
+            BlockedTaskState,
+            classify_blocked_task,
+        )
+
+        workspace = self._workspace_no_marker(tmp_path)
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+        )
+        assert state is BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+
+    def test_no_workspace_root_falls_back_to_two_state_behaviour(self, tmp_path: Path) -> None:
+        # Older callers that pass only backlog_root + backlog_index still
+        # get the legacy two-state classification.
+        from devbench.backlog.proposal import (
+            BlockedTaskState,
+            classify_blocked_task,
+        )
+
+        workspace = self._workspace_no_marker(tmp_path)
+        proposals_dir = workspace / ".devbench" / "proposals"
+        proposals_dir.mkdir(parents=True)
+        (proposals_dir / "E0-F1-S1-T1.json").write_text("{}")
+        # Without workspace_root, recovery signals are invisible.
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+        )
+        assert state is BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+
+
+class TestRecoverySignalForTask:
+    """Part-1: ``recovery_signal_for_task`` names the source so the report can annotate."""
+
+    def test_pending_proposal_named(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import recovery_signal_for_task
+
+        proposals_dir = tmp_path / ".devbench" / "proposals"
+        proposals_dir.mkdir(parents=True)
+        (proposals_dir / "E0-T1.json").write_text("{}")
+        signal = recovery_signal_for_task(tmp_path, "E0-T1")
+        assert "pending proposal" in signal
+        assert ".devbench/proposals/E0-T1.json" in signal
+
+    def test_rejected_archive_named(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import recovery_signal_for_task
+
+        archive_dir = tmp_path / ".devbench" / "rejected-requests"
+        archive_dir.mkdir(parents=True)
+        (archive_dir / "E0-T1-20260501T000000Z.json").write_text("{}")
+        signal = recovery_signal_for_task(tmp_path, "E0-T1")
+        assert "rejected-requests" in signal
+
+    def test_audit_comment_when_neither_artefact_present(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import recovery_signal_for_task
+
+        signal = recovery_signal_for_task(tmp_path, "E0-T1")
+        # No artefact on disk, so the function returns the audit-comment
+        # fallback string. The classifier itself is responsible for
+        # deciding whether the audit comment actually qualifies; this
+        # helper just supplies the human-facing label.
+        assert "audit comment" in signal
+
+
+class TestRecentRecoveryAuditCommentEdgeCases:
+    """Direct coverage for ``_recent_recovery_audit_comment`` branches."""
+
+    def test_missing_file_returns_false(self, tmp_path: Path) -> None:
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import _recent_recovery_audit_comment
+
+        assert _recent_recovery_audit_comment(tmp_path / "absent.md", datetime.now(UTC), 300) is False
+
+    def test_blocked_pending_proposal_lines_are_skipped(self, tmp_path: Path) -> None:
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import _recent_recovery_audit_comment
+
+        wu = tmp_path / "wu.md"
+        now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        ts = now.strftime("%Y-%m-%d %H:%M UTC")
+        wu.write_text(f"## Comments\n\n[{ts}] [agent/orchestrator] [BLOCKED_PENDING_PROPOSAL] E0-T9\n")
+        # Only marker-style line; helper must return False (cascade state, not recovery).
+        assert _recent_recovery_audit_comment(wu, now, 300) is False
+
+    def test_malformed_timestamp_is_skipped(self, tmp_path: Path) -> None:
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import _recent_recovery_audit_comment
+
+        wu = tmp_path / "wu.md"
+        # Regex matches the shape but the values are not a valid
+        # calendar date, so strptime raises ValueError. The helper
+        # must continue past it rather than crashing.
+        wu.write_text("## Comments\n\n[9999-99-99 99:99 UTC] [agent/orchestrator] [BLOCKED] amendment-reject\n")
+        assert _recent_recovery_audit_comment(wu, datetime(2026, 5, 1, 12, 0, tzinfo=UTC), 300) is False

@@ -33,15 +33,30 @@ KNOWN_JUDGES=(
   "task_factory"
 )
 
+# Canonical reviewer judges -- only these 5 names satisfy the done-gate
+# in BacklogManager._last_round_all_passed. Mirrors REVIEW_JUDGE_NAMES |
+# SECURITY_JUDGE_NAMES in src/devbench/constants.py. Used to scope the
+# executor restriction below (the executor is an authoring agent, not a
+# reviewer; it must not write canonical reviewer verdicts).
+CANONICAL_REVIEWER_JUDGES=(
+  "code_review"
+  "test_review"
+  "doc_review"
+  "changes_manifest"
+  "security_review"
+)
+
 EXPECTED_ORDER="log-verdict <judge> <unit-id> <verdict> [feedback]"
 
-INPUT=$(cat)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=_hook_lib.sh
+. "$SCRIPT_DIR/_hook_lib.sh"
 
-COMMAND=$(printf '%s' "$INPUT" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-print(d.get('tool_input', {}).get('command', ''))
-" 2>/dev/null || true)
+INPUT=$(cat)
+COMMAND=$(extract_command "$INPUT")
+decode_json_escapes COMMAND
+
+AGENT_TYPE=$(extract_field "$INPUT" "agent_type")
 
 # No command to inspect -- allow.
 if [[ -z "$COMMAND" ]]; then
@@ -53,59 +68,75 @@ if ! printf '%s' "$COMMAND" | grep -qE '(^|[[:space:]])uv[[:space:]]+run[[:space
   exit 0
 fi
 
-# Parse arguments from the command string using Python's shlex for safe
-# shell-word splitting -- no eval, no user-controlled string execution.
-#
-# The Python block writes 5 lines to stdout:
-#   line 1: "HELP" if --help/-h appears after log-verdict, else empty
-#   line 2: number of positional args (after truncation at shell meta-tokens)
-#   line 3..6: judge, unit_id, verdict, feedback (empty if missing)
-#
-# Shell meta-tokens end positional parsing so `log-verdict 2>&1 | tail`
-# yields 0 args instead of treating '2>&1' as the judge.
-PARSE_OUT=$(printf '%s' "$COMMAND" | python3 -c "
-import sys, shlex
-META = {'|', '||', '&&', ';', '&', '<', '<<', '>', '>>', '2>', '1>', '2>&1', '>&', '&>'}
-HELP_FLAGS = {'--help', '-h'}
-try:
-    tokens = shlex.split(sys.stdin.read())
-except ValueError:
-    print(''); print('0'); print(''); print(''); print(''); print('')
-    sys.exit(0)
-try:
-    idx = next(i for i, t in enumerate(tokens) if t == 'log-verdict')
-except StopIteration:
-    print(''); print('0'); print(''); print(''); print(''); print('')
-    sys.exit(0)
-tail = tokens[idx + 1:]
-# Truncate at the first shell meta-token (redirection / pipe / chain separator).
-args = []
-for t in tail:
-    if t in META:
-        break
-    args.append(t)
-help_seen = 'HELP' if any(a in HELP_FLAGS for a in args) else ''
-print(help_seen)
-print(len(args))
-print(args[0] if len(args) > 0 else '')
-print(args[1] if len(args) > 1 else '')
-print(args[2] if len(args) > 2 else '')
-print(' '.join(args[3:]) if len(args) > 3 else '')
-" 2>/dev/null || printf '\n0\n\n\n\n\n')
+# Parse arguments from the command string using pure-bash word
+# splitting. Earlier versions used ``python3 -c shlex.split`` which
+# silently returned no tokens whenever asdf shims could not resolve
+# python3 in the hook's cwd; the legitimate review-team verdicts then
+# tripped the "missing required argument" branch and got blocked.
+# Using ``read -ra`` keeps the splitting in-shell, which is sufficient
+# because the hook only needs to find positional words; quote-aware
+# parsing was overkill (verdicts are simple identifiers, not free-form
+# shell). Single-quote-wrapped feedback is collapsed by the shell's
+# IFS split into multiple bash words, so we re-join words 4..N back
+# into FEEDBACK after stripping the surrounding quote characters.
+META_TOKENS=(\| \|\| \&\& \; \& \< \<\< \> \>\> 2\> 1\> 2\>\&1 \>\& \&\>)
+HELP_FLAGS=(--help -h)
 
-# Use mapfile so individual field reads cannot trip `set -e` when Python's
-# trailing empty lines are stripped by command substitution. Pad to 6 entries
-# so every later reference is safe.
-mapfile -t PARSE_LINES <<< "$PARSE_OUT"
-while (( ${#PARSE_LINES[@]} < 6 )); do
-  PARSE_LINES+=("")
+# Tokenise COMMAND into an array via the shell's word-splitting on
+# whitespace. Single-quoted strings stay together because bash-array
+# parsing treats them as a single field when piped through eval-safe
+# patterns; we use ``read -ra`` here to avoid eval entirely.
+read -ra TOKENS <<< "$COMMAND"
+
+# Find the position of the "log-verdict" subcommand.
+LV_IDX=-1
+for i in "${!TOKENS[@]}"; do
+  if [[ "${TOKENS[$i]}" == "log-verdict" ]]; then
+    LV_IDX=$i
+    break
+  fi
 done
-HELP_SEEN="${PARSE_LINES[0]}"
-ARG_COUNT="${PARSE_LINES[1]:-0}"
-JUDGE="${PARSE_LINES[2]}"
-UNIT_ID="${PARSE_LINES[3]}"
-VERDICT="${PARSE_LINES[4]}"
-FEEDBACK="${PARSE_LINES[5]}"
+
+if (( LV_IDX < 0 )); then
+  # No log-verdict invocation found (handled by the earlier intercept
+  # check, but defensive against future hook chain reordering).
+  exit 0
+fi
+
+# Collect positional args after log-verdict, stopping at shell meta-tokens.
+ARGS=()
+HELP_SEEN=""
+for (( i = LV_IDX + 1; i < ${#TOKENS[@]}; i++ )); do
+  tok="${TOKENS[$i]}"
+  is_meta=0
+  for m in "${META_TOKENS[@]}"; do
+    if [[ "$tok" == "$m" ]]; then is_meta=1; break; fi
+  done
+  if (( is_meta == 1 )); then break; fi
+  is_help=0
+  for h in "${HELP_FLAGS[@]}"; do
+    if [[ "$tok" == "$h" ]]; then is_help=1; break; fi
+  done
+  if (( is_help == 1 )); then HELP_SEEN="HELP"; fi
+  ARGS+=("$tok")
+done
+
+ARG_COUNT="${#ARGS[@]}"
+JUDGE="${ARGS[0]:-}"
+UNIT_ID="${ARGS[1]:-}"
+VERDICT="${ARGS[2]:-}"
+# Re-join the remaining tokens for FEEDBACK; strip a surrounding pair
+# of single or double quotes if the operator wrapped the feedback so
+# the bash-word splitter treated the quotes as part of the word.
+if (( ARG_COUNT > 3 )); then
+  FEEDBACK="${ARGS[*]:3}"
+else
+  FEEDBACK=""
+fi
+FEEDBACK="${FEEDBACK#\'}"
+FEEDBACK="${FEEDBACK%\'}"
+FEEDBACK="${FEEDBACK#\"}"
+FEEDBACK="${FEEDBACK%\"}"
 
 # --- Passthrough: --help / -h lets the CLI print usage without hook interference ---
 if [[ "$HELP_SEEN" == "HELP" ]]; then
@@ -160,6 +191,28 @@ if [[ "$VERDICT_LOWER" == "fail" && -z "${FEEDBACK// /}" ]]; then
   echo "Expected positional order: ${EXPECTED_ORDER}" >&2
   echo "Fix: provide a non-empty feedback message as the final argument to log-verdict." >&2
   exit 2
+fi
+
+# --- Scope: executor must not write canonical reviewer verdicts ---
+# The executor is an authoring agent, not a reviewer. Review-team
+# verdicts (code_review, test_review, doc_review, changes_manifest,
+# security_review) are written by review-supervisor and
+# security-reviewer; the executor self-attesting them confuses the
+# audit trail and risks racing the actual reviewers' verdicts in the
+# done-gate's "most recent round" bookkeeping. The audit-only
+# ``executor`` judge name remains allowed (logs progress + signals
+# completion) -- the restriction is specifically about the executor
+# claiming to BE a reviewer.
+if [[ "$AGENT_TYPE" == "devbench:executor" ]]; then
+  for canonical in "${CANONICAL_REVIEWER_JUDGES[@]}"; do
+    if [[ "$JUDGE" == "$canonical" ]]; then
+      echo "guard-verdict-format: BLOCKED -- the executor agent must not write canonical reviewer verdicts." >&2
+      echo "Judge attempted: '${JUDGE}' (one of the 5 canonical reviewer judges)." >&2
+      echo "Reason: review-team verdicts belong to review-supervisor / security-reviewer." >&2
+      echo "Fix: write a 'log-comment' for narrative status, or a 'log-verdict executor <id> <pass|fail> <feedback>' for audit-only progress (the 'executor' judge is on the allowlist but does NOT satisfy the done-gate)." >&2
+      exit 2
+    fi
+  done
 fi
 
 exit 0

@@ -41,6 +41,7 @@ def _make_work_unit(backlog_dir: Path, manifest_path: str) -> Path:
         "## Target Repository\n\n"
         "- **Repo:** `example-org/example-repo`\n\n"
         "## Description\n\nFunctional-test task.\n\n"
+        "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
         "## Acceptance Criteria\n\n- [ ] AC-TEST-001\n\n"
         "## Changes Manifest\n\n"
         "| File | Change |\n"

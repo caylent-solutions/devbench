@@ -142,7 +142,7 @@ Branch name is resolved once at parse time. See the canonical rules in the [back
 
 ## Mode-Specific Details
 
-### Automated mode (`make start` / `make run-backlog`)
+### Automated mode (`make start`)
 
 ```text
 uv run devbench start

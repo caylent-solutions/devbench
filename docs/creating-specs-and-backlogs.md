@@ -433,3 +433,43 @@ Key metrics:
 - [ ] Dependencies form a valid DAG (no cycles, all IDs exist)
 - [ ] Status Summary uses per-epic format with correct counts
 - [ ] `devbench validate-backlog` passes with zero errors
+
+---
+
+## Post-Backlog-A lessons-learned addenda
+
+These sections were added based on operational lessons from Backlog A's first orchestration run. They are normative for new agentic backlog authoring; the original Phases 1-7 above are still authoritative for content not contradicted here.
+
+### Phase 0 -- Discovery (required, before Phase 1)
+
+Before authoring any spec, run the discovery checklist in [`backlog-author-discovery.md`](backlog-author-discovery.md). Inspect existing AWS Route53 zones, GitHub repos in the target org, AWS account topology, branch protection state, AWS Secrets Manager paths in scope, and DNS state. Record results in a `## Discovery` section of the spec. The spec MUST anchor decisions on observed state, not assumed state. Skipping discovery has produced full-spec rebrands mid-orchestration.
+
+### Phase 0a -- Scaffolding work-unit files (E223)
+
+For each new Epic / Feature / Story / Task scaffold its `.md` file via `devbench new-task --id <ID> --title "<TITLE>" --target <PATH>` rather than copying an existing file. The command renders the canonical template (`backlog/templates/{epic,feature,story,task}.md`) with placeholder substitutions and writes the file fail-fast: refuses overwrites, refuses missing parent directories, and infers the template kind from the ID's last segment (`T`/`S`/`F`/`E`). Optional flags (`--repo`, `--description`, `--source-file`, `--test-file`, `--ac-func`) populate the template's per-unit tokens; tokens with no flag get a deterministic default. The rendered file is immediately `validate-backlog`-clean -- it ships with all required sections (Status, Dependencies, Changes Manifest, etc.) so authors can flesh out content without fighting the contract.
+
+### Phase 3 addendum -- Source/test atomicity
+
+Per [`source-test-atomicity.md`](source-test-atomicity.md), every Python source file authored by a Task MUST have its matching test file in the SAME Task's `## Changes Manifest`. The historical "Test task (RED) + Implementation task (GREEN) pair" pattern documented above is OBSOLETE for Python work because devbench's `AC-FINAL-014` (100% coverage) cannot be satisfied during the source-authoring Task if its test is owned by a sibling Task. The split pattern remains acceptable only for RED-only TDD demonstrations where the Task explicitly intends to land a failing test as the artifact.
+
+### Phase 3 addendum -- AC-FINAL canonical set + language tiering
+
+Per [`acceptance-criteria-canonical.md`](acceptance-criteria-canonical.md), every Task's `## Acceptance Criteria` SHOULD include the canonical AC-FINAL-001..015 set. Each AC has explicit Applicability tags; for Tasks whose Manifest tier (Python / HCL / YAML / JSON / XML / TOML / Markdown / Mixed) does not match an AC's applicability, the author MUST append the verbatim suffix `-- N/A for <tier> Tasks (no <language> source authored)`. Failing to mark inapplicable ACs produces cascading proposal Tasks at orchestration time.
+
+### Phase 3 addendum -- Manual external blockers
+
+Per [`manual-blockers.md`](manual-blockers.md), dependencies that devbench cannot satisfy itself (cross-backlog handoffs, external-team work, human-only verification gates) are represented as `Status: blocked` Tasks anchored in `E0` with `DO NOT CLAIM` text in the description. Wire dependent Tasks via `devbench add-dep <dependent> <blocker>`. Do NOT rely on prose-level "Backlog A starts after Backlog B" commitments: the orchestrator does not read prose, it reads the `## Dependencies` table.
+
+### Phase 3 addendum -- Cross-backlog dependencies
+
+Per [`cross-backlog-dependencies.md`](cross-backlog-dependencies.md), if this backlog consumes outputs produced by a different backlog, anchor a manual blocker in this backlog's E0 and wire every dependent Task to it. Cross-backlog deps in `## Dependencies` rows referencing task IDs from another backlog's `BACKLOG.md` will fail `validate-backlog` (the IDs are unresolvable).
+
+### Phase 8 -- Pre-flight checklist (required, before launching the orchestrator)
+
+Before invoking `devbench orchestrate` for the first time on a backlog, run this triplet:
+
+1. `devbench validate-backlog` exits 0.
+2. (When the `devbench check` Tier 3 tooling lands) `devbench check` exits 0 -- verifies symlinks, origin remotes, `default_branch` parity between `devbench.yaml` and remote, and absence of conflicting open PRs against `single_branch`.
+3. `git status` in every target repo shows the workspace clean (no stale uncommitted edits that would conflict with `feat/<branch>` ensure-branch).
+
+If any of (1)/(2)/(3) fails, halt and surface to the operator before launching. Empty target repos (no `main` commit) and `default_branch` mismatches between `devbench.yaml` and remote are the most common pre-flight failures observed.

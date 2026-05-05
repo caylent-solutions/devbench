@@ -351,3 +351,100 @@ class TestGetSecurityReport:
 
         assert report.secret_scanning_enabled is True
         assert any(f.source == "secret-scanning" for f in report.findings)
+
+
+class TestValidateGhKwargs:
+    """TD-4: ``_validate_gh_kwargs`` rejects suspicious keys/values before subprocess invocation."""
+
+    def test_valid_identifier_key_accepted(self) -> None:
+        from devbench.github.security import _validate_gh_kwargs
+
+        _validate_gh_kwargs({"state": "configured"})
+
+    def test_bracketed_key_accepted(self) -> None:
+        # The Secret Scanning PATCH calls use security_and_analysis[...] syntax.
+        from devbench.github.security import _validate_gh_kwargs
+
+        _validate_gh_kwargs({"security_and_analysis[secret_scanning][status]": "enabled"})
+
+    def test_invalid_key_rejected(self) -> None:
+        from devbench.github.security import _validate_gh_kwargs
+
+        with pytest.raises(ValueError, match="not a valid identifier"):
+            _validate_gh_kwargs({"bad key": "value"})
+
+    def test_non_str_value_rejected(self) -> None:
+        from typing import Any, cast
+
+        from devbench.github.security import _validate_gh_kwargs
+
+        # The runtime contract is "values must be str"; the cast is a
+        # test-only escape hatch that proves the runtime check fires
+        # without leaving a `# type: ignore` annotation in the source.
+        bad_input = cast(dict[str, str], {"key": cast(Any, 42)})
+        with pytest.raises(ValueError, match="must be str"):
+            _validate_gh_kwargs(bad_input)
+
+    def test_newline_in_value_rejected(self) -> None:
+        from devbench.github.security import _validate_gh_kwargs
+
+        with pytest.raises(ValueError, match="forbidden token"):
+            _validate_gh_kwargs({"key": "value\nwith newline"})
+
+    def test_shell_substitution_rejected(self) -> None:
+        from devbench.github.security import _validate_gh_kwargs
+
+        with pytest.raises(ValueError, match="forbidden token"):
+            _validate_gh_kwargs({"key": "value$(rm -rf /)"})
+
+
+class TestSecurityFetchErrorWrapping:
+    """TD-2: malformed JSON from gh api wraps the exception in a generic SecurityFetchError."""
+
+    def test_malformed_json_raises_generic_error(self) -> None:
+        from devbench.github.security import _fetch_alerts
+
+        with patch("devbench.github.security._gh_api", return_value=(0, "not-json")):
+            with pytest.raises(Exception) as exc_info:
+                _fetch_alerts("code-scanning", "repos/x/code-scanning/alerts", "x/repo")
+        msg = str(exc_info.value)
+        assert "code-scanning" in msg
+        assert "x/repo" in msg
+        # The original cause must be preserved for DEBUG-level diagnostics.
+        assert exc_info.value.__cause__ is not None
+
+    def test_non_array_response_raises(self) -> None:
+        from devbench.github.security import _fetch_alerts
+
+        with patch("devbench.github.security._gh_api", return_value=(0, "{}")):
+            with pytest.raises(Exception, match="not a JSON array"):
+                _fetch_alerts("dependabot", "repos/x/dependabot/alerts", "x/repo")
+
+    def test_non_zero_response_returns_none(self) -> None:
+        from devbench.github.security import _fetch_alerts
+
+        with patch("devbench.github.security._gh_api", return_value=(1, "")):
+            assert _fetch_alerts("dependabot", "repos/x/dependabot/alerts", "x/repo") is None
+
+
+class TestSetCategoryEnabledFlag:
+    """TD-1: explicit if/elif ladder for the per-category enabled flag."""
+
+    def test_unknown_category_raises(self) -> None:
+        from devbench.github.security import SecurityReport, _set_category_enabled_flag
+
+        report = SecurityReport(repo="x/y")
+        with pytest.raises(Exception, match="Unknown alert category"):
+            _set_category_enabled_flag(report, "not-a-real-category")
+
+    def test_each_known_category_sets_correct_flag(self) -> None:
+        from devbench.github.security import SecurityReport, _set_category_enabled_flag
+
+        for category, attr in (
+            ("code-scanning", "codeql_enabled"),
+            ("dependabot", "dependabot_enabled"),
+            ("secret-scanning", "secret_scanning_enabled"),
+        ):
+            report = SecurityReport(repo="x/y")
+            _set_category_enabled_flag(report, category)
+            assert getattr(report, attr) is True

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar
 from unittest.mock import MagicMock, patch
@@ -11,6 +12,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from devbench import cli
+from devbench.backlog.proposal import Proposal
 from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
 from devbench.constants import BACKLOG_SUBDIR
 
@@ -117,6 +119,122 @@ class TestCmdStatus:
         assert "1 blocked" in capsys.readouterr().out
 
 
+class TestCmdStatusDetail:
+    """E220: ``devbench status --detail`` renders in-queue / blocked / held panels."""
+
+    def _build_backlog(self, tmp_path: Path) -> Path:
+        wu_dir = tmp_path / "backlog"
+        wu_dir.mkdir(exist_ok=True)
+        # T1 in-queue ready (no deps); T2 in-queue waiting on T1; T3 blocked
+        # with an open proposal marker; T4 held with a [HOLD] reason.
+        rows = [
+            ("E0-F1-S1-T1", "Task", "in-queue", "None", "E0-F1-S1-T1", ""),
+            ("E0-F1-S1-T2", "Task", "in-queue", "E0-F1-S1-T1", "E0-F1-S1-T2", ""),
+            (
+                "E0-F1-S1-T3",
+                "Task",
+                "blocked",
+                "None",
+                "E0-F1-S1-T3",
+                "## Comments\n\n[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T9\n",
+            ),
+            (
+                "E0-F1-S1-T4",
+                "Task",
+                "hold",
+                "None",
+                "E0-F1-S1-T4",
+                "## Comments\n\n[HOLD] awaiting product input\n",
+            ),
+        ]
+        index_lines = [
+            "# Backlog\n",
+            "## Full Work Unit Index\n",
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |",
+            "|----|-------|------|--------|--------------|------|-----------|",
+        ]
+        for unit_id, unit_type, status, deps, basename, comments in rows:
+            file_path = f"backlog/{basename}.md"
+            index_lines.append(
+                f"| {unit_id} | {unit_id} | {unit_type} | {status} | {deps} | "
+                f"caylent-solutions/test-repo | `{file_path}` |"
+            )
+            wu_body = f"# {unit_id}: Test\n\n## Status: {status}\n\n## Description\n\nx\n"
+            if deps and deps != "None":
+                dep_rows = "\n".join(f"| {d.strip()} | Task | dep |" for d in deps.split(","))
+                wu_body += f"\n## Dependencies\n\n| ID | Type | Reason |\n|----|------|--------|\n{dep_rows}\n"
+            if comments:
+                wu_body += f"\n{comments}"
+            (wu_dir / f"{basename}.md").write_text(wu_body)
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text("\n".join(index_lines) + "\n")
+        return index_path
+
+    def test_detail_renders_three_panels(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        index_path = self._build_backlog(tmp_path)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_status("--detail")
+        assert rc == 0
+        out = capsys.readouterr().out
+        # In-queue panel: T1 ready, T2 waiting on T1
+        assert "In-queue tasks" in out
+        assert "[ready]" in out
+        assert "E0-F1-S1-T1" in out
+        assert "[waiting]" in out
+        assert "blocker: E0-F1-S1-T1" in out
+        # Blocked panel: T3 with pending proposal marker
+        assert "Blocked tasks" in out
+        assert "pending proposal E0-F1-S1-T9" in out
+        # Held panel: T4 with HOLD reason
+        assert "Held tasks" in out
+        assert "awaiting product input" in out
+
+    def test_default_invocation_omits_detail_panels(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        index_path = self._build_backlog(tmp_path)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_status()
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "Backlog Status Summary" in out
+        assert "In-queue tasks" not in out
+        assert "Held tasks" not in out
+
+    def test_unknown_positional_arg_rejected(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        rc = cli.cmd_status("garbage")
+        assert rc == 1
+        assert "no positional args" in capsys.readouterr().err
+
+    def test_status_is_variadic(self) -> None:
+        assert "status" in cli._VARIADIC_COMMANDS
+
+
+class TestLatestHoldReason:
+    """Cover the helper that extracts the most recent [HOLD] line from Comments."""
+
+    def test_returns_last_match_when_multiple(self) -> None:
+        content = "## Comments\n\n[HOLD] first reason\n[UNHOLD] back to queue\n[HOLD] second reason\n"
+        assert cli._latest_hold_reason(content) == "second reason"
+
+    def test_returns_empty_when_no_hold_line(self) -> None:
+        content = "## Comments\n\n[BLOCKED] dep not met\n"
+        assert cli._latest_hold_reason(content) == ""
+
+
 class TestCmdNext:
     """Test cmd_next command."""
 
@@ -131,7 +249,14 @@ class TestCmdNext:
         assert result == 0
         output = capsys.readouterr().out.strip()
         data = json.loads(output)
+        # TD-12: assert the full envelope shape, not just one field, so a
+        # regression in any envelope key (renamed, dropped, mistyped) is
+        # caught here rather than at a downstream parser.
         assert data["id"] == "E0-F1-S1-T2"
+        assert data["title"] == "Second Task"
+        assert data["repo"] == "caylent-solutions/git-repo"
+        assert data["file_path"] == str(Path("backlog/E0-F1-S1-T2.md"))
+        assert data["dependencies"] == ["E0-F1-S1-T1"]
 
     def test_prints_all_done_when_complete(self, capsys: pytest.CaptureFixture) -> None:
         done_unit = WorkUnit(
@@ -235,6 +360,44 @@ class TestCmdClaim:
 
         assert call_args[0][3] == STATUS_IN_PROGRESS
         assert "Claimed E0-F1-S1-T2" in capsys.readouterr().out
+
+    def test_claim_refuses_when_manifest_has_tbd_placeholder(
+        self,
+        backlog_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Issue #117: cmd_claim refuses tasks whose Manifest still carries a TBD row."""
+        wu_file = backlog_dir / "E0-F1-S1-T2.md"
+        wu_file.write_text(
+            "# E0-F1-S1-T2: Test\n\n"
+            "## Status: in-queue\n\n"
+            "## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Type | Reason |\n|----|------|--------|\n| none | | |\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-FUNC-001\n\n"
+            "## Changes Manifest\n\n"
+            "| File | Change |\n|------|--------|\n"
+            "| TBD | Executor agent: replace this row |\n",
+            encoding="utf-8",
+        )
+        unit = WorkUnit(
+            id="E0-F1-S1-T2",
+            title="Test",
+            status=WorkUnitStatus.IN_QUEUE,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T2.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
+        ):
+            rc = cli.cmd_claim("E0-F1-S1-T2")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "placeholder row 'TBD'" in err
 
     def test_claim_returns_nonzero_for_unknown_id(
         self,
@@ -661,9 +824,13 @@ class TestCmdGitOpsChecksGate:
 
     def test_cmd_git_ops_returns_error_when_checks_fail(self, tmp_path: Path) -> None:
         """
-        Given: wait_for_checks returns False (checks failed)
+        Given: wait_for_checks returns False (checks failed) and the
+            CI-failure executor retry path is opted out via YAML
+            (``git_ops.ci_failure_retry: false``)
         When: cmd_git_ops is called
-        Then: returns 1 and merge_pr is never called (AC-4)
+        Then: returns 1 and merge_pr is never called (AC-4 -- legacy
+            BLOCKED path; see TestCiFailureRetry for the rc=2 default
+            behaviour after the v-next flip).
         """
         unit = self._make_unit()
         mock_parser = MagicMock()
@@ -678,6 +845,7 @@ class TestCmdGitOpsChecksGate:
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
             patch("devbench.cli.UPDATE_SUBMODULE", False),
             patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
+            patch("devbench.config.CI_FAILURE_RETRY_ENABLED", False),
         ):
             result = cli.cmd_git_ops("E202-F1-S1-T2")
 
@@ -3099,80 +3267,85 @@ class TestCmdReport:
         assert result == 0
         assert "one-shot report" in capsys.readouterr().out
 
-    def test_cmd_report_watch_mode_interrupted(self) -> None:
-        """cmd_report with watch_interval > 0 loops until KeyboardInterrupt (lines 296-306)."""
-        call_count = 0
+    def test_cmd_report_watch_falls_through_to_streaming_with_deprecation(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Issue #163: ``--watch N`` is deprecated. The interval value is
+        ignored; the call falls through to the streaming loop and emits
+        a deprecation notice."""
+        import warnings
 
-        def fake_generate_report(**kwargs: object) -> str:
-            nonlocal call_count
-            call_count += 1
-            return f"report iteration {call_count}"
-
-        def fake_sleep(seconds: float) -> None:
-            raise KeyboardInterrupt
+        def fake_stream_report(*args: object, **kwargs: object) -> int:
+            # Stand-in for the streaming loop: returns immediately.
+            return 0
 
         with (
-            patch("devbench.reporting.report.generate_report", side_effect=fake_generate_report),
-            patch("time.sleep", side_effect=fake_sleep),
+            patch("sys.stdout.isatty", return_value=True),
+            patch("devbench.reporting.report.generate_report", return_value="frame"),
+            patch("devbench.reporting.streaming.stream_report", side_effect=fake_stream_report),
+            warnings.catch_warnings(record=True) as caught,
         ):
+            warnings.simplefilter("always")
             result = cli.cmd_report(watch_interval=5)
 
         assert result == 0
-        assert call_count == 1
+        # Deprecation warning fired for --watch.
+        assert any(issubclass(w.category, DeprecationWarning) and "--watch" in str(w.message) for w in caught)
 
-    def test_cmd_report_watch_invokes_clear_command_each_tick(self) -> None:
-        """Each watch tick must clear the terminal viewport AND scrollback.
+    def test_cmd_report_streams_on_tty_by_default(self) -> None:
+        """Issue #163: the default report invocation on a TTY uses the streaming loop."""
+        called_with: dict[str, object] = {}
 
-        When the OS provides a `clear` (or `cls`) binary, we delegate to it via
-        subprocess -- terminfo handles the right sequence per terminal, including
-        the scrollback erase that bare `\\033[H\\033[2J` does not perform on
-        all terminals (notably VS Code's xterm.js where the prior `\\033[3J`
-        approach was unreliable).
-        """
-
-        def fake_sleep(seconds: float) -> None:
-            raise KeyboardInterrupt
-
-        captured_clear_calls: list[list[str]] = []
-
-        def fake_run(cmd: list[str], **kwargs: object) -> object:
-            captured_clear_calls.append(cmd)
-
-            class _Done:
-                returncode = 0
-
-            return _Done()
+        def fake_stream_report(log_path: object, render_fn: object, **kwargs: object) -> int:
+            called_with["log_path"] = log_path
+            called_with["render_fn"] = render_fn
+            return 0
 
         with (
-            patch("devbench.reporting.report.generate_report", return_value="frame"),
-            patch("time.sleep", side_effect=fake_sleep),
-            patch("devbench.cli._TERMINAL_CLEAR_CMD", "/usr/bin/clear"),
-            patch("devbench.cli.subprocess.run", side_effect=fake_run),
+            patch("sys.stdout.isatty", return_value=True),
+            patch("devbench.reporting.streaming.stream_report", side_effect=fake_stream_report),
         ):
-            result = cli.cmd_report(watch_interval=1)
+            result = cli.cmd_report()
 
         assert result == 0
-        # First tick must have called subprocess.run with the resolved clear path.
-        assert captured_clear_calls
-        assert captured_clear_calls[0] == ["/usr/bin/clear"]
+        assert "log_path" in called_with
+        assert callable(called_with["render_fn"])
 
-    def test_cmd_report_watch_falls_back_to_ris_when_no_clear_binary(self, capsys: pytest.CaptureFixture[str]) -> None:
-        """When no `clear`/`cls` binary is on PATH, fall back to VT100 RIS."""
-
-        def fake_sleep(seconds: float) -> None:
-            raise KeyboardInterrupt
-
+    def test_cmd_report_once_flag_forces_one_shot(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Issue #163: ``--once`` (passed via main()'s flag-extraction) forces
+        the legacy one-shot snapshot regardless of TTY status."""
         with (
-            patch("devbench.reporting.report.generate_report", return_value="frame"),
-            patch("time.sleep", side_effect=fake_sleep),
-            patch("devbench.cli._TERMINAL_CLEAR_CMD", None),
+            patch("sys.stdout.isatty", return_value=True),
+            patch("devbench.reporting.report.generate_report", return_value="one-shot text"),
         ):
-            result = cli.cmd_report(watch_interval=1)
+            result = cli.cmd_report(once=True)
 
-        out = capsys.readouterr().out
         assert result == 0
-        # Full reset escape (RIS) emitted on stdout.
-        assert "\033c" in out
+        assert "one-shot text" in capsys.readouterr().out
+
+    def test_cmd_report_non_tty_forces_one_shot(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Issue #163: piping / redirecting stdout (non-TTY) forces one-shot
+        rendering so script / CI consumers see the snapshot and exit."""
+        with (
+            patch("sys.stdout.isatty", return_value=False),
+            patch("devbench.reporting.report.generate_report", return_value="piped"),
+        ):
+            result = cli.cmd_report()
+
+        assert result == 0
+        assert "piped" in capsys.readouterr().out
+
+    def test_cmd_report_since_forces_one_shot(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Issue #163: ``--since <ISO-8601>`` keeps one-shot semantics --
+        a frozen-window snapshot doesn't benefit from continuous refresh."""
+        with (
+            patch("sys.stdout.isatty", return_value=True),
+            patch("devbench.reporting.report.generate_report", return_value="since-snapshot"),
+        ):
+            result = cli.cmd_report(since="2026-05-01T00:00:00Z")
+
+        assert result == 0
+        assert "since-snapshot" in capsys.readouterr().out
 
 
 class TestMainWatchFlagParsing:
@@ -3187,7 +3360,7 @@ class TestMainWatchFlagParsing:
             result = cli.main()
 
         assert result == 0
-        mock_report.assert_called_once_with(since="", watch_interval=10)
+        mock_report.assert_called_once_with(since="", watch_interval=10, once=False)
 
     def test_short_watch_flag_extracted(self) -> None:
         """-w <N> is equivalent to --watch <N>."""
@@ -3198,7 +3371,7 @@ class TestMainWatchFlagParsing:
             result = cli.main()
 
         assert result == 0
-        mock_report.assert_called_once_with(since="", watch_interval=3)
+        mock_report.assert_called_once_with(since="", watch_interval=3, once=False)
 
     def test_watch_flag_with_since_arg(self) -> None:
         """--watch is separated from the since timestamp argument (lines 996-998)."""
@@ -3209,7 +3382,29 @@ class TestMainWatchFlagParsing:
             result = cli.main()
 
         assert result == 0
-        mock_report.assert_called_once_with(since="2025-01-15T10:30:00Z", watch_interval=5)
+        mock_report.assert_called_once_with(since="2025-01-15T10:30:00Z", watch_interval=5, once=False)
+
+    def test_once_flag_extracted_from_args(self) -> None:
+        """Issue #163: --once is extracted by main() and forwarded to cmd_report."""
+        with (
+            patch("sys.argv", ["devbench", "report", "--once"]),
+            patch("devbench.cli.cmd_report", return_value=0) as mock_report,
+        ):
+            result = cli.main()
+
+        assert result == 0
+        mock_report.assert_called_once_with(since="", watch_interval=0, once=True)
+
+    def test_no_stream_alias_extracted(self) -> None:
+        """Issue #163: --no-stream is an accepted alias for --once."""
+        with (
+            patch("sys.argv", ["devbench", "report", "--no-stream"]),
+            patch("devbench.cli.cmd_report", return_value=0) as mock_report,
+        ):
+            result = cli.main()
+
+        assert result == 0
+        mock_report.assert_called_once_with(since="", watch_interval=0, once=True)
 
     def test_report_without_watch_dispatches_normally(self) -> None:
         """report without --watch goes through normal dispatch (line 1002)."""
@@ -4039,7 +4234,12 @@ class TestCmdStatusBlockedSplit:
             dependencies=[],
         )
 
-        def fake_classify(backlog_root: Path, backlog_index: Path, task_id: str) -> BlockedTaskState:
+        def fake_classify(
+            backlog_root: Path,
+            backlog_index: Path,
+            task_id: str,
+            **kwargs: object,
+        ) -> BlockedTaskState:
             if task_id == "E0-F1-S1-T1":
                 return BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL
             return BlockedTaskState.NEEDS_OPERATOR_ATTENTION
@@ -4059,6 +4259,123 @@ class TestCmdStatusBlockedSplit:
         out = capsys.readouterr().out
         assert re.search(r"Blocked \(auto\)\s+1\b", out), out
         assert re.search(r"Blocked \(attn\)\s+1\b", out), out
+
+    def test_status_detail_renders_three_blocked_bucket_sections(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Issue #149 follow-up: the ``--detail`` panel splits the blocked
+        list into three bucket sections (auto-clearing, awaiting-recovery,
+        needs-attention). Empty buckets are omitted from the output.
+        """
+        from devbench.backlog.proposal import BlockedTaskState
+        from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
+
+        unit_auto = WorkUnit(
+            id="E0-F1-S1-T1",
+            title="Auto",
+            status=WorkUnitStatus.BLOCKED,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("/fake/auto.md"),
+            repo="r",
+            dependencies=[],
+        )
+        unit_recovery = WorkUnit(
+            id="E0-F1-S1-T2",
+            title="Recovery",
+            status=WorkUnitStatus.BLOCKED,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("/fake/recovery.md"),
+            repo="r",
+            dependencies=[],
+        )
+        unit_attn = WorkUnit(
+            id="E0-F1-S1-T3",
+            title="Attn",
+            status=WorkUnitStatus.BLOCKED,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("/fake/attn.md"),
+            repo="r",
+            dependencies=[],
+        )
+
+        def fake_classify(
+            backlog_root: Path,
+            backlog_index: Path,
+            task_id: str,
+            **kwargs: object,
+        ) -> BlockedTaskState:
+            return {
+                "E0-F1-S1-T1": BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL,
+                "E0-F1-S1-T2": BlockedTaskState.AWAITING_AUTO_RECOVERY,
+                "E0-F1-S1-T3": BlockedTaskState.NEEDS_OPERATOR_ATTENTION,
+            }[task_id]
+
+        parser = MagicMock()
+        parser.parse_index.return_value = [unit_auto, unit_recovery, unit_attn]
+        parser.get_parallel_candidates.return_value = []
+        parser.get_blocked_units.return_value = [unit_auto, unit_recovery, unit_attn]
+        parser.all_done.return_value = False
+        with (
+            patch("devbench.cli.BacklogParser", return_value=parser),
+            patch("devbench.cli._count_unmaterialised_proposed_tasks", return_value=0),
+            patch("devbench.cli.classify_blocked_task", side_effect=fake_classify),
+            patch("devbench.cli._resolve_unit_file", return_value=None),
+        ):
+            rc = cli.cmd_status("--detail")
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "Blocked tasks (auto-clearing via proposal) (1):" in out
+        assert "Blocked tasks (awaiting auto-recovery) (1):" in out
+        assert "Blocked tasks (needs operator attention) (1):" in out
+        # Each task appears exactly under its own bucket header.
+        auto_pos = out.index("Blocked tasks (auto-clearing via proposal)")
+        recovery_pos = out.index("Blocked tasks (awaiting auto-recovery)")
+        attn_pos = out.index("Blocked tasks (needs operator attention)")
+        assert auto_pos < recovery_pos < attn_pos, "buckets must render in classifier order"
+        assert out.index("E0-F1-S1-T1") < recovery_pos
+        assert recovery_pos < out.index("E0-F1-S1-T2") < attn_pos
+        assert attn_pos < out.index("E0-F1-S1-T3")
+
+    def test_status_detail_omits_empty_buckets(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """When a bucket has zero tasks, its section header is omitted."""
+        from devbench.backlog.proposal import BlockedTaskState
+        from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
+
+        unit_only_auto = WorkUnit(
+            id="E0-F1-S1-T1",
+            title="Auto-only",
+            status=WorkUnitStatus.BLOCKED,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("/fake/auto.md"),
+            repo="r",
+            dependencies=[],
+        )
+        parser = MagicMock()
+        parser.parse_index.return_value = [unit_only_auto]
+        parser.get_parallel_candidates.return_value = []
+        parser.get_blocked_units.return_value = [unit_only_auto]
+        parser.all_done.return_value = False
+        with (
+            patch("devbench.cli.BacklogParser", return_value=parser),
+            patch("devbench.cli._count_unmaterialised_proposed_tasks", return_value=0),
+            patch(
+                "devbench.cli.classify_blocked_task",
+                return_value=BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL,
+            ),
+            patch("devbench.cli._resolve_unit_file", return_value=None),
+        ):
+            rc = cli.cmd_status("--detail")
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "Blocked tasks (auto-clearing via proposal) (1):" in out
+        assert "Blocked tasks (awaiting auto-recovery)" not in out
+        assert "Blocked tasks (needs operator attention)" not in out
 
 
 class TestCmdListProposalsStateLabels:
@@ -4183,6 +4500,16 @@ class TestCmdRejectProposalUnmaterialised:
         assert rc == 1
         err = capsys.readouterr().err
         assert "source-task-id" in err
+
+    def test_is_variadic_so_multi_flag_invocation_reaches_handler(self) -> None:
+        """Regression: ``reject-proposal --unmaterialised <id> --reason <text>``
+        passes 4 args + 1 task-id; without variadic dispatch the top-level
+        slicer keeps only ``min_args + 1`` args and the ``--reason`` value
+        is dropped before _parse_reject_proposal_argv runs, producing a
+        spurious ``--reason requires a value`` error. Pin the variadic
+        membership so this regression cannot return.
+        """
+        assert "reject-proposal" in cli._VARIADIC_COMMANDS
 
 
 class TestCmdSweepProposals:
@@ -4855,7 +5182,9 @@ class TestCmdMaterialiseProposal:
                     files_to_own=[],
                     linked_scenarios=[],
                     suggested_acs=[],
-                    suggested_approach="",
+                    # Concrete approach text so the issue #143 placeholder check
+                    # does not fire before the source-task lookup runs.
+                    suggested_approach="Author the foo helper that the source task references",
                 )
             ],
         )
@@ -5114,6 +5443,571 @@ class TestCmdDecline:
         assert "decline" in cli._COMMANDS
 
 
+class TestCmdHold:
+    """E222: ``devbench hold <id> --reason <text>`` command."""
+
+    def _make_minimal_unit(self, tmp_path: Path, unit_id: str = "EX-F1-S1-T1") -> tuple[Path, Path]:
+        backlog_md = tmp_path / "BACKLOG.md"
+        backlog_md.write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            f"| {unit_id} | Test | Task | in-queue | None | caylent-solutions/git-repo | `backlog/{unit_id}.md` |\n"
+        )
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir(exist_ok=True)
+        wu_file = backlog_dir / f"{unit_id}.md"
+        wu_file.write_text(f"# {unit_id}: Test\n\n## Status: in-queue\n\n## Description\n\nx\n")
+        return backlog_md, wu_file
+
+    def test_happy_path_flips_status_and_audits(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        backlog_md, wu_file = self._make_minimal_unit(tmp_path)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_hold("EX-F1-S1-T1", "--reason", "awaiting upstream decision")
+        assert rc == 0
+        content = wu_file.read_text()
+        assert "## Status: hold" in content
+        assert "[HOLD]" in content
+        assert "awaiting upstream decision" in content
+        out = json.loads(capsys.readouterr().out.strip())
+        assert out == {
+            "task_id": "EX-F1-S1-T1",
+            "status": "hold",
+            "reason": "awaiting upstream decision",
+        }
+
+    def test_missing_reason_rejected(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_hold("EX-F1-S1-T1")
+        assert rc == 1
+        assert "requires" in capsys.readouterr().err
+
+    def test_reason_without_value_rejected(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_hold("EX-F1-S1-T1", "--reason")
+        assert rc == 1
+        assert "requires a value" in capsys.readouterr().err
+
+    def test_em_dash_in_reason_blocked(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        backlog_md, _ = self._make_minimal_unit(tmp_path)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+        ):
+            rc = cli.cmd_hold("EX-F1-S1-T1", "--reason", "bad—reason")
+        assert rc == 1
+        assert "em-dash" in capsys.readouterr().err
+
+    def test_unknown_unit_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        backlog_md, _ = self._make_minimal_unit(tmp_path)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+        ):
+            rc = cli.cmd_hold("NO-SUCH-ID", "--reason", "n/a")
+        assert rc == 1
+        assert "not found" in capsys.readouterr().err
+
+    def test_registered_in_commands(self) -> None:
+        assert "hold" in cli._COMMANDS
+
+    def test_is_variadic_so_multi_token_reason_reaches_handler(self) -> None:
+        assert "hold" in cli._VARIADIC_COMMANDS
+
+
+class TestCmdUnhold:
+    """E222: ``devbench unhold <id> --reason <text>`` returns held units to in-queue."""
+
+    def _make_held_unit(self, tmp_path: Path, unit_id: str = "EX-F1-S1-T1") -> tuple[Path, Path]:
+        backlog_md = tmp_path / "BACKLOG.md"
+        backlog_md.write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            f"| {unit_id} | Test | Task | hold | None | caylent-solutions/git-repo | `backlog/{unit_id}.md` |\n"
+        )
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir(exist_ok=True)
+        wu_file = backlog_dir / f"{unit_id}.md"
+        wu_file.write_text(f"# {unit_id}: Test\n\n## Status: hold\n\n## Description\n\nx\n")
+        return backlog_md, wu_file
+
+    def test_happy_path_returns_held_unit_to_in_queue(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        backlog_md, wu_file = self._make_held_unit(tmp_path)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_unhold("EX-F1-S1-T1", "--reason", "blocker resolved")
+        assert rc == 0
+        content = wu_file.read_text()
+        assert "## Status: in-queue" in content
+        assert "[UNHOLD]" in content
+        assert "blocker resolved" in content
+        out = json.loads(capsys.readouterr().out.strip())
+        assert out == {
+            "task_id": "EX-F1-S1-T1",
+            "status": "in-queue",
+            "reason": "blocker resolved",
+        }
+
+    def test_refuses_unit_not_currently_held(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # Build an in-queue unit (not held) and assert unhold refuses it.
+        backlog_md = tmp_path / "BACKLOG.md"
+        backlog_md.write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| EX-F1-S1-T1 | Test | Task | in-queue | None | caylent-solutions/git-repo | `backlog/EX-F1-S1-T1.md` |\n"
+        )
+        wu_dir = tmp_path / "backlog"
+        wu_dir.mkdir(exist_ok=True)
+        (wu_dir / "EX-F1-S1-T1.md").write_text("# EX-F1-S1-T1: Test\n\n## Status: in-queue\n\n## Description\n\nx\n")
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", wu_dir),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+        ):
+            rc = cli.cmd_unhold("EX-F1-S1-T1", "--reason", "n/a")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "expected 'Hold'" in err
+
+    def test_missing_reason_rejected(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_unhold("EX-F1-S1-T1")
+        assert rc == 1
+        assert "requires" in capsys.readouterr().err
+
+    def test_unknown_unit_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        backlog_md, _ = self._make_held_unit(tmp_path)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+        ):
+            rc = cli.cmd_unhold("NO-SUCH-ID", "--reason", "n/a")
+        assert rc == 1
+        assert "not found" in capsys.readouterr().err
+
+    def test_registered_in_commands(self) -> None:
+        assert "unhold" in cli._COMMANDS
+
+    def test_is_variadic(self) -> None:
+        assert "unhold" in cli._VARIADIC_COMMANDS
+
+
+class TestWireOrphanCleanupDepChain:
+    """Phase 10: orphan-cleanup auto-emission resolves Manifest collisions via auto-wired deps."""
+
+    def _build_minimal_backlog(
+        self,
+        tmp_path: Path,
+        peer_status: str = "in-queue",
+        cleanup_id: str = "E0-F1-S1-T9",
+        peer_id: str = "E0-F1-S1-T2",
+        repo: str = "ex/foo",
+    ) -> Path:
+        """Render a backlog where ``peer_id`` already claims `.gitignore`.
+
+        ``cleanup_id`` represents the just-emitted cleanup task; the
+        helper assumes it has been materialised on disk separately
+        (the test populates a stub work-unit so ``add_dep``'s
+        index-presence check passes).
+        """
+        wu_dir = tmp_path / "backlog"
+        wu_dir.mkdir(exist_ok=True)
+        # Peer task: claims .gitignore in its manifest.
+        (wu_dir / f"{peer_id}.md").write_text(
+            f"# {peer_id}: peer\n\n"
+            f"## Status: {peer_status}\n\n"
+            "## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Type | Reason |\n|----|------|--------|\n| none | | |\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-FUNC-001\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n"
+            "| `.gitignore` | edit |\n| `peer.py` | new |\n\n"
+            "## Definition of Done\n\n- [ ] Done\n",
+            encoding="utf-8",
+        )
+        # Cleanup task: claims .gitignore (the auto-emitted target).
+        (wu_dir / f"{cleanup_id}.md").write_text(
+            f"# {cleanup_id}: cleanup\n\n"
+            "## Status: in-queue\n\n"
+            "## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Type | Reason |\n|----|------|--------|\n| none | | |\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-FUNC-001\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n"
+            "| `.gitignore` | edit |\n\n"
+            "## Definition of Done\n\n- [ ] Done\n",
+            encoding="utf-8",
+        )
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            f"| {peer_id} | peer | Task | {peer_status} | none | {repo} | `backlog/{peer_id}.md` |\n"
+            f"| {cleanup_id} | cleanup | Task | in-queue | none | {repo} | `backlog/{cleanup_id}.md` |\n",
+            encoding="utf-8",
+        )
+        return index_path
+
+    def test_wires_dep_when_peer_claims_same_path(self, tmp_path: Path) -> None:
+        index_path = self._build_minimal_backlog(tmp_path)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            wired = cli._wire_orphan_cleanup_dep_chain(
+                new_id="E0-F1-S1-T9",
+                files_to_own=[".gitignore"],
+                unit_repo="ex/foo",
+            )
+        assert wired == ["E0-F1-S1-T2"]
+        peer_content = (tmp_path / "backlog" / "E0-F1-S1-T2.md").read_text()
+        # The dep row was added to the peer's Dependencies table.
+        assert "E0-F1-S1-T9" in peer_content
+
+    def test_no_collision_returns_empty(self, tmp_path: Path) -> None:
+        # Build a backlog where the only peer task claims a different path.
+        wu_dir = tmp_path / "backlog"
+        wu_dir.mkdir(exist_ok=True)
+        (wu_dir / "E0-F1-S1-T2.md").write_text(
+            "# E0-F1-S1-T2: peer\n\n## Status: in-queue\n\n## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Type | Reason |\n|----|------|--------|\n| none | | |\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-FUNC-001\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `peer.py` | new |\n\n"
+            "## Definition of Done\n\n- [ ] Done\n",
+            encoding="utf-8",
+        )
+        (wu_dir / "E0-F1-S1-T9.md").write_text(
+            "# E0-F1-S1-T9: cleanup\n\n## Status: in-queue\n\n## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Type | Reason |\n|----|------|--------|\n| none | | |\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-FUNC-001\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `.gitignore` | edit |\n\n"
+            "## Definition of Done\n\n- [ ] Done\n",
+            encoding="utf-8",
+        )
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T2 | peer | Task | in-queue | none | ex/foo | `backlog/E0-F1-S1-T2.md` |\n"
+            "| E0-F1-S1-T9 | cleanup | Task | in-queue | none | ex/foo | `backlog/E0-F1-S1-T9.md` |\n",
+            encoding="utf-8",
+        )
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            wired = cli._wire_orphan_cleanup_dep_chain(
+                new_id="E0-F1-S1-T9",
+                files_to_own=[".gitignore"],
+                unit_repo="ex/foo",
+            )
+        assert wired == []
+
+    def test_skips_done_and_declined_peers(self, tmp_path: Path) -> None:
+        # Done peers cannot be wired (add_dep refuses terminal blockers anyway).
+        index_path = self._build_minimal_backlog(tmp_path, peer_status="done")
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            wired = cli._wire_orphan_cleanup_dep_chain(
+                new_id="E0-F1-S1-T9",
+                files_to_own=[".gitignore"],
+                unit_repo="ex/foo",
+            )
+        assert wired == []
+
+
+class TestCmdNewTask:
+    """E223: ``devbench new-task`` scaffolds a work-unit file from a template."""
+
+    def test_renders_task_template_with_substitutions(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        target = tmp_path / "E0-F1-S1-T1.md"
+        rc = cli.cmd_new_task(
+            "--id",
+            "E0-F1-S1-T1",
+            "--title",
+            "Implement foo",
+            "--target",
+            str(target),
+            "--repo",
+            "ex/foo",
+            "--description",
+            "Foo capability.",
+            "--source-file",
+            "src/foo/handler.py",
+            "--test-file",
+            "tests/unit/test_handler.py",
+            "--ac-func",
+            "the function returns the right answer",
+        )
+        assert rc == 0
+        out = json.loads(capsys.readouterr().out.strip())
+        assert out == {"id": "E0-F1-S1-T1", "kind": "task", "target": str(target)}
+        rendered = target.read_text()
+        assert "# E0-F1-S1-T1: Implement foo" in rendered
+        assert "## Status: in-queue" in rendered
+        assert "Foo capability." in rendered
+        assert "src/foo/handler.py" in rendered
+        assert "tests/unit/test_handler.py" in rendered
+        assert "the function returns the right answer" in rendered
+        assert "backlog/e0-f1-s1-t1" in rendered
+
+    def test_collision_with_existing_target_refused(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        target = tmp_path / "exists.md"
+        target.write_text("already there")
+        rc = cli.cmd_new_task(
+            "--id",
+            "E0-F1-S1-T1",
+            "--title",
+            "x",
+            "--target",
+            str(target),
+        )
+        assert rc == 1
+        assert "already exists" in capsys.readouterr().err
+
+    def test_missing_parent_dir_refused(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        target = tmp_path / "no-such-dir" / "wu.md"
+        rc = cli.cmd_new_task(
+            "--id",
+            "E0-F1-S1-T1",
+            "--title",
+            "x",
+            "--target",
+            str(target),
+        )
+        assert rc == 1
+        assert "does not exist" in capsys.readouterr().err
+
+    def test_missing_required_flag_refused(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        rc = cli.cmd_new_task("--id", "E0-F1-S1-T1", "--title", "x")
+        assert rc == 1
+        assert "--target is required" in capsys.readouterr().err
+
+    def test_unknown_flag_refused(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        rc = cli.cmd_new_task("--bogus", "x")
+        assert rc == 1
+        assert "unknown flag" in capsys.readouterr().err
+
+    def test_template_kind_inferred_from_id(self, tmp_path: Path) -> None:
+        target = tmp_path / "E0-F1-S1.md"
+        rc = cli.cmd_new_task(
+            "--id",
+            "E0-F1-S1",
+            "--title",
+            "Story title",
+            "--target",
+            str(target),
+        )
+        assert rc == 0
+        assert "# E0-F1-S1: Story title" in target.read_text()
+
+    def test_invalid_id_shape_refused(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        target = tmp_path / "wu.md"
+        rc = cli.cmd_new_task(
+            "--id",
+            "Q-NOT-VALID",
+            "--title",
+            "x",
+            "--target",
+            str(target),
+        )
+        assert rc == 1
+        assert "cannot derive template kind" in capsys.readouterr().err
+
+    def test_flag_without_value_refused(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        rc = cli.cmd_new_task("--id")
+        assert rc == 1
+        assert "--id requires a value" in capsys.readouterr().err
+
+    def test_registered_in_commands(self) -> None:
+        assert "new-task" in cli._COMMANDS
+
+    def test_is_variadic(self) -> None:
+        assert "new-task" in cli._VARIADIC_COMMANDS
+
+
+class TestCmdSyncBlocked:
+    """E215: ``devbench sync-blocked`` reconciles task status against dep satisfaction."""
+
+    def _build_backlog(
+        self,
+        tmp_path: Path,
+        rows: list[tuple[str, str, str, str, str]],
+    ) -> Path:
+        index_lines = [
+            "# Backlog\n",
+            "## Full Work Unit Index\n",
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |",
+            "|----|-------|------|--------|--------------|------|-----------|",
+        ]
+        wu_dir = tmp_path / "backlog"
+        wu_dir.mkdir(exist_ok=True)
+        for unit_id, unit_type, status, deps, basename in rows:
+            file_path = f"backlog/{basename}.md"
+            index_lines.append(
+                f"| {unit_id} | {unit_id} | {unit_type} | {status} | {deps} | "
+                f"caylent-solutions/test-repo | `{file_path}` |"
+            )
+            wu_file = wu_dir / f"{basename}.md"
+            wu_body = f"# {unit_id}: Test\n\n## Status: {status}\n\n## Description\n\nx\n"
+            if deps and deps != "None":
+                dep_rows = "\n".join(f"| {d.strip()} | Task | dep |" for d in deps.split(","))
+                wu_body += f"\n## Dependencies\n\n| ID | Type | Reason |\n|----|------|--------|\n{dep_rows}\n"
+            wu_file.write_text(wu_body)
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text("\n".join(index_lines) + "\n")
+        return index_path
+
+    def test_in_queue_with_unsatisfied_dep_flips_to_blocked(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        index_path = self._build_backlog(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Task", "in-queue", "None", "E0-F1-S1-T1"),
+                ("E0-F1-S1-T2", "Task", "in-queue", "E0-F1-S1-T1", "E0-F1-S1-T2"),
+            ],
+        )
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_sync_blocked()
+        assert rc == 0
+        envelope = json.loads(capsys.readouterr().out.strip())
+        assert envelope["flipped_to_blocked"] == ["E0-F1-S1-T2"]
+        assert envelope["flipped_to_in_queue"] == []
+        t2 = (tmp_path / "backlog" / "E0-F1-S1-T2.md").read_text()
+        assert "## Status: blocked" in t2
+        assert "[BLOCKED]" in t2
+        assert "E0-F1-S1-T1" in t2
+
+    def test_blocked_with_satisfied_deps_flips_to_in_queue(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        index_path = self._build_backlog(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Task", "done", "None", "E0-F1-S1-T1"),
+                ("E0-F1-S1-T2", "Task", "blocked", "E0-F1-S1-T1", "E0-F1-S1-T2"),
+            ],
+        )
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_sync_blocked()
+        assert rc == 0
+        envelope = json.loads(capsys.readouterr().out.strip())
+        assert envelope["flipped_to_blocked"] == []
+        assert envelope["flipped_to_in_queue"] == ["E0-F1-S1-T2"]
+        t2 = (tmp_path / "backlog" / "E0-F1-S1-T2.md").read_text()
+        assert "## Status: in-queue" in t2
+        assert "[UNBLOCKED]" in t2
+
+    def test_blocked_with_open_proposal_marker_is_skipped(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        index_path = self._build_backlog(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Task", "done", "None", "E0-F1-S1-T1"),
+                ("E0-F1-S1-T2", "Task", "blocked", "E0-F1-S1-T1", "E0-F1-S1-T2"),
+            ],
+        )
+        t2_path = tmp_path / "backlog" / "E0-F1-S1-T2.md"
+        t2_path.write_text(t2_path.read_text() + "\n## Comments\n\n[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T9\n")
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_sync_blocked()
+        assert rc == 0
+        envelope = json.loads(capsys.readouterr().out.strip())
+        assert envelope["flipped_to_in_queue"] == []
+        assert "## Status: blocked" in t2_path.read_text()
+
+    def test_story_level_dep_recursion(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        index_path = self._build_backlog(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1", "Story", "in-queue", "None", "E0-F1-S1"),
+                ("E0-F1-S1-T1", "Task", "in-queue", "None", "E0-F1-S1-T1"),
+                ("E0-F1-S2-T1", "Task", "in-queue", "E0-F1-S1", "E0-F1-S2-T1"),
+            ],
+        )
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_sync_blocked()
+        assert rc == 0
+        envelope = json.loads(capsys.readouterr().out.strip())
+        assert "E0-F1-S2-T1" in envelope["flipped_to_blocked"]
+        assert "E0-F1-S1-T1" not in envelope["flipped_to_blocked"]
+
+    def test_registered_in_commands(self) -> None:
+        assert "sync-blocked" in cli._COMMANDS
+
+
 class TestCmdHookTail:
     """``devbench hook-tail`` argument parsing and dispatcher registration.
 
@@ -5156,3 +6050,3694 @@ class TestCmdHookTail:
         captured = capsys.readouterr()
         assert "unknown timezone" in captured.err
         assert "Not/AZone" in captured.err
+
+    def test_orchestrator_only_without_env_returns_2(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        monkeypatch.delenv("JUDGE_ORCHESTRATOR_SESSION_ID", raising=False)
+        rc = cli.cmd_hook_tail("--orchestrator-only", "--no-follow")
+        assert rc == 2
+        assert "JUDGE_ORCHESTRATOR_SESSION_ID" in capsys.readouterr().err
+
+    def test_orchestrator_session_missing_value_returns_2(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        rc = cli.cmd_hook_tail("--orchestrator-session")
+        assert rc == 2
+        assert "--orchestrator-session requires a value" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# Tier 3: test-validates-source heuristic + cmd_promote_proposal warnings
+# ---------------------------------------------------------------------------
+
+
+class TestDetectTestValidatesSource:
+    """Unit tests for cli._detect_test_validates_source."""
+
+    @staticmethod
+    def _write_proposal(
+        proposals_dir: Path,
+        source_id: str,
+        proposed_id: str,
+        title: str = "Implement feature",
+        files: list[str] | None = None,
+        source_dep_direction: str = "",
+    ) -> None:
+        proposals_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "source_task_id": source_id,
+            "generated_at": "2026-04-30T00:00:00Z",
+            "rejection_reason": "x",
+            "source_dep_direction": source_dep_direction,
+            "proposed_tasks": [
+                {
+                    "suggested_id": proposed_id,
+                    "title": title,
+                    "files_to_own": files or ["src/foo.py"],
+                    "linked_scenarios": [],
+                    "suggested_acs": [],
+                    "suggested_approach": "",
+                }
+            ],
+        }
+        (proposals_dir / f"{source_id}.json").write_text(json.dumps(payload))
+
+    def test_returns_empty_when_proposals_dir_missing(self, tmp_path: Path) -> None:
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            assert cli._detect_test_validates_source("E0-F1-S1-T9") == ""
+
+    def test_returns_flag_when_explicit_source_dep_direction(self, tmp_path: Path) -> None:
+        proposals = tmp_path / ".devbench" / "proposals"
+        self._write_proposal(
+            proposals,
+            "E0-F1-S1-T1",
+            "E0-F1-S1-T9",
+            title="Implement feature",
+            source_dep_direction="test_validates_source",
+        )
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            assert cli._detect_test_validates_source("E0-F1-S1-T9") == "flag"
+
+    def test_returns_heuristic_when_title_starts_with_add_tests(self, tmp_path: Path) -> None:
+        proposals = tmp_path / ".devbench" / "proposals"
+        self._write_proposal(
+            proposals,
+            "E0-F1-S1-T1",
+            "E0-F1-S1-T9",
+            title="Add tests/unit/test_foo.py to validate T1's foo.py",
+        )
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            assert cli._detect_test_validates_source("E0-F1-S1-T9") == "heuristic"
+
+    def test_returns_heuristic_when_title_starts_with_verify(self, tmp_path: Path) -> None:
+        proposals = tmp_path / ".devbench" / "proposals"
+        self._write_proposal(
+            proposals,
+            "E0-F1-S1-T1",
+            "E0-F1-S1-T9",
+            title="Verify pyproject.toml lists ruff",
+        )
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            assert cli._detect_test_validates_source("E0-F1-S1-T9") == "heuristic"
+
+    def test_returns_heuristic_when_files_all_under_tests(self, tmp_path: Path) -> None:
+        proposals = tmp_path / ".devbench" / "proposals"
+        self._write_proposal(
+            proposals,
+            "E0-F1-S1-T1",
+            "E0-F1-S1-T9",
+            title="Implement coverage",
+            files=["tests/unit/test_a.py", "tests/integration/test_b.py"],
+        )
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            assert cli._detect_test_validates_source("E0-F1-S1-T9") == "heuristic"
+
+    def test_returns_empty_when_no_match(self, tmp_path: Path) -> None:
+        proposals = tmp_path / ".devbench" / "proposals"
+        self._write_proposal(
+            proposals,
+            "E0-F1-S1-T1",
+            "E0-F1-S1-T9",
+            title="Implement merge_properties.py",
+            files=["infra/scripts/merge_properties.py"],
+        )
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            assert cli._detect_test_validates_source("E0-F1-S1-T9") == ""
+
+    def test_returns_empty_when_id_not_in_any_proposal(self, tmp_path: Path) -> None:
+        proposals = tmp_path / ".devbench" / "proposals"
+        self._write_proposal(
+            proposals,
+            "E0-F1-S1-T1",
+            "E0-F1-S1-T9",
+            title="Add tests/foo",
+        )
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            assert cli._detect_test_validates_source("E0-F1-S1-T7") == ""
+
+    def test_malformed_json_is_skipped(self, tmp_path: Path) -> None:
+        proposals = tmp_path / ".devbench" / "proposals"
+        proposals.mkdir(parents=True)
+        (proposals / "broken.json").write_text("{not valid json")
+        # And one valid file alongside it so we exercise the continue path.
+        self._write_proposal(
+            proposals,
+            "E0-F1-S1-T1",
+            "E0-F1-S1-T9",
+            title="Add tests/unit/test_x.py",
+        )
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            assert cli._detect_test_validates_source("E0-F1-S1-T9") == "heuristic"
+
+
+class TestCmdPromoteProposalTestValidatesSource:
+    """cmd_promote_proposal honors / warns on the test-validates-source heuristic."""
+
+    def test_flag_auto_applies_no_dep_on_source(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        from devbench.backlog.proposal import PromoteResult
+
+        proposals = tmp_path / ".devbench" / "proposals"
+        TestDetectTestValidatesSource._write_proposal(
+            proposals,
+            "E0-F1-S1-T1",
+            "E0-F1-S1-T9",
+            source_dep_direction="test_validates_source",
+        )
+        captured: dict[str, Any] = {}
+
+        def fake_promote(**kwargs: Any) -> PromoteResult:
+            captured.update(kwargs)
+            return PromoteResult(draft_path=tmp_path / "x.md", wired_targets=[])
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.promote_proposal", side_effect=fake_promote),
+        ):
+            rc = cli.cmd_promote_proposal("E0-F1-S1-T9")
+        assert rc == 0
+        assert captured.get("dep_on_source") is False
+        err = capsys.readouterr().err
+        assert "auto-applying --no-dep-on-source" in err
+
+    def test_heuristic_emits_warning_but_keeps_default_dep_on_source(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from devbench.backlog.proposal import PromoteResult
+
+        proposals = tmp_path / ".devbench" / "proposals"
+        TestDetectTestValidatesSource._write_proposal(
+            proposals,
+            "E0-F1-S1-T1",
+            "E0-F1-S1-T9",
+            title="Add tests/unit/test_foo.py",
+        )
+        captured: dict[str, Any] = {}
+
+        def fake_promote(**kwargs: Any) -> PromoteResult:
+            captured.update(kwargs)
+            return PromoteResult(draft_path=tmp_path / "x.md", wired_targets=[])
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.promote_proposal", side_effect=fake_promote),
+        ):
+            rc = cli.cmd_promote_proposal("E0-F1-S1-T9")
+        assert rc == 0
+        # Heuristic does NOT auto-flip; just warns.
+        assert captured.get("dep_on_source") is True
+        err = capsys.readouterr().err
+        assert "looks like a test-validates-source task" in err
+
+    def test_no_warning_when_no_dep_on_source_already_set(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from devbench.backlog.proposal import PromoteResult
+
+        proposals = tmp_path / ".devbench" / "proposals"
+        TestDetectTestValidatesSource._write_proposal(
+            proposals,
+            "E0-F1-S1-T1",
+            "E0-F1-S1-T9",
+            title="Add tests/unit/test_foo.py",
+        )
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch(
+                "devbench.cli.promote_proposal",
+                return_value=PromoteResult(draft_path=tmp_path / "x.md", wired_targets=[]),
+            ),
+        ):
+            rc = cli.cmd_promote_proposal("--no-dep-on-source", "E0-F1-S1-T9")
+        assert rc == 0
+        # When the operator passes --no-dep-on-source explicitly, no
+        # warning is needed (the heuristic check is gated on dep_on_source).
+        err = capsys.readouterr().err
+        assert "looks like a test-validates-source task" not in err
+        assert "auto-applying --no-dep-on-source" not in err
+
+
+# ---------------------------------------------------------------------------
+# Tier 3: cmd_check pre-flight verifier
+# ---------------------------------------------------------------------------
+
+
+class TestCmdCheck:
+    """devbench check: pre-flight readiness check across all repos in devbench.yaml."""
+
+    @staticmethod
+    def _write_min_yaml(tmp_path: Path, repos_block: str, single_branch: str = "") -> Path:
+        # Schema-conformant minimal config (matches tests/fixtures/test_devbench.yaml).
+        cfg_dir = tmp_path / "backlog" / "config"
+        cfg_dir.mkdir(parents=True)
+        cfg_path = cfg_dir / "devbench.yaml"
+        ops_block = (
+            f"git_ops:\n  single_branch: {single_branch}\n  defer_pr: true\n"
+            if single_branch
+            else "git_ops:\n  defer_pr: false\n"
+        )
+        cfg_path.write_text(
+            f"judge_model: test-judge-model\nexecutor_model: test-executor-model\nrepos:\n{repos_block}{ops_block}"
+        )
+        return cfg_path
+
+    def test_returns_1_when_yaml_missing(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Point JUDGE_CONFIG_PATH at a nonexistent file so resolve_config_path
+        # does not fall back to the suite-wide test fixture YAML.
+        monkeypatch.setenv("JUDGE_CONFIG_PATH", str(tmp_path / "no-such.yaml"))
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_check()
+        assert rc == 1
+        assert "devbench.yaml not found" in capsys.readouterr().err
+
+    def test_returns_1_when_symlink_missing(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        cfg = self._write_min_yaml(
+            tmp_path,
+            "  org/repo-a:\n    checkout_directory: repo-a\n    default_branch: main\n",
+        )
+        monkeypatch.setenv("JUDGE_CONFIG_PATH", str(cfg))
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_check()
+        assert rc == 1
+        out = capsys.readouterr().out
+        assert "symlink missing" in out
+        assert "repo-a" in out
+
+    def test_returns_0_when_all_checks_pass(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Set up a fake clone with origin remote configured (via mocked subprocess).
+        clone = tmp_path / "clone-a"
+        clone.mkdir()
+        (tmp_path / "repo-a").symlink_to(clone)
+        cfg = self._write_min_yaml(
+            tmp_path,
+            "  org/repo-a:\n    checkout_directory: repo-a\n    default_branch: main\n",
+            single_branch="feat/x",
+        )
+        monkeypatch.setenv("JUDGE_CONFIG_PATH", str(cfg))
+
+        def fake_run(args: list[str], **_: Any) -> Any:
+            mock = MagicMock()
+            if args[:3] == ["git", "-C", str(clone)]:
+                mock.returncode = 0
+                mock.stdout = "git@github.com:org/repo-a.git\n"
+            elif args[:2] == ["gh", "api"]:
+                mock.returncode = 0
+                mock.stdout = "main\n"
+            elif args[:3] == ["gh", "pr", "list"]:
+                mock.returncode = 0
+                mock.stdout = "[]"
+            else:
+                mock.returncode = 0
+                mock.stdout = ""
+            mock.stderr = ""
+            return mock
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.subprocess.run", side_effect=fake_run),
+        ):
+            rc = cli.cmd_check()
+        assert rc == 0
+        assert "Pre-flight check passed" in capsys.readouterr().out
+
+    def test_flags_default_branch_mismatch(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        clone = tmp_path / "clone-a"
+        clone.mkdir()
+        (tmp_path / "repo-a").symlink_to(clone)
+        cfg = self._write_min_yaml(
+            tmp_path,
+            "  org/repo-a:\n    checkout_directory: repo-a\n    default_branch: main2\n",
+        )
+        monkeypatch.setenv("JUDGE_CONFIG_PATH", str(cfg))
+
+        def fake_run(args: list[str], **_: Any) -> Any:
+            mock = MagicMock()
+            mock.stderr = ""
+            if args[:3] == ["git", "-C", str(clone)]:
+                mock.returncode = 0
+                mock.stdout = "git@github.com:org/repo-a.git\n"
+            elif args[:2] == ["gh", "api"]:
+                mock.returncode = 0
+                mock.stdout = "main\n"
+            else:
+                mock.returncode = 0
+                mock.stdout = ""
+            return mock
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.subprocess.run", side_effect=fake_run),
+        ):
+            rc = cli.cmd_check()
+        assert rc == 1
+        out = capsys.readouterr().out
+        assert "default_branch mismatch" in out
+        assert "'main2'" in out and "'main'" in out
+
+    def test_flags_open_pr_on_single_branch(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        clone = tmp_path / "clone-a"
+        clone.mkdir()
+        (tmp_path / "repo-a").symlink_to(clone)
+        cfg = self._write_min_yaml(
+            tmp_path,
+            "  org/repo-a:\n    checkout_directory: repo-a\n    default_branch: main\n",
+            single_branch="feat/x",
+        )
+        monkeypatch.setenv("JUDGE_CONFIG_PATH", str(cfg))
+
+        def fake_run(args: list[str], **_: Any) -> Any:
+            mock = MagicMock()
+            mock.stderr = ""
+            if args[:3] == ["git", "-C", str(clone)]:
+                mock.returncode = 0
+                mock.stdout = "git@github.com:org/repo-a.git\n"
+            elif args[:2] == ["gh", "api"]:
+                mock.returncode = 0
+                mock.stdout = "main\n"
+            elif args[:3] == ["gh", "pr", "list"]:
+                mock.returncode = 0
+                mock.stdout = '[{"number":42,"title":"existing"}]'
+            else:
+                mock.returncode = 0
+                mock.stdout = ""
+            return mock
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.subprocess.run", side_effect=fake_run),
+        ):
+            rc = cli.cmd_check()
+        assert rc == 1
+        out = capsys.readouterr().out
+        assert "open PR(s) already exist on branch" in out
+
+    @staticmethod
+    def _write_local_only_yaml(tmp_path: Path) -> Path:
+        cfg_dir = tmp_path / "backlog" / "config"
+        cfg_dir.mkdir(parents=True)
+        cfg_path = cfg_dir / "devbench.yaml"
+        cfg_path.write_text(
+            "judge_model: test-judge-model\n"
+            "executor_model: test-executor-model\n"
+            "repos:\n"
+            "  org/repo-a:\n"
+            "    checkout_directory: repo-a\n"
+            "    default_branch: main\n"
+            "git_ops:\n"
+            "  single_branch: feat/x\n"
+            "  defer_pr: true\n"
+            "  local_only: true\n"
+        )
+        return cfg_path
+
+    def test_passes_when_local_only_repo_has_no_origin(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Under git_ops.local_only: true, a target repo with NO origin remote passes pre-flight."""
+        clone = tmp_path / "clone-a"
+        clone.mkdir()
+        (tmp_path / "repo-a").symlink_to(clone)
+        cfg = self._write_local_only_yaml(tmp_path)
+        monkeypatch.setenv("JUDGE_CONFIG_PATH", str(cfg))
+
+        def fake_run(args: list[str], **_: Any) -> Any:
+            mock = MagicMock()
+            mock.stderr = ""
+            mock.stdout = ""
+            if args[:3] == ["git", "-C", str(clone)]:
+                # No origin remote -> rc=2 (the real git failure mode)
+                mock.returncode = 2
+                mock.stderr = "error: No such remote 'origin'"
+            else:
+                mock.returncode = 0
+            return mock
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.subprocess.run", side_effect=fake_run),
+        ):
+            rc = cli.cmd_check()
+        assert rc == 0
+        assert "Pre-flight check passed" in capsys.readouterr().out
+
+    def test_flags_local_only_repo_with_origin(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Under git_ops.local_only: true, a target repo that DOES have an origin remote is flagged."""
+        clone = tmp_path / "clone-a"
+        clone.mkdir()
+        (tmp_path / "repo-a").symlink_to(clone)
+        cfg = self._write_local_only_yaml(tmp_path)
+        monkeypatch.setenv("JUDGE_CONFIG_PATH", str(cfg))
+
+        def fake_run(args: list[str], **_: Any) -> Any:
+            mock = MagicMock()
+            mock.stderr = ""
+            if args[:3] == ["git", "-C", str(clone)]:
+                mock.returncode = 0
+                mock.stdout = "git@github.com:org/repo-a.git\n"
+            else:
+                mock.returncode = 0
+                mock.stdout = ""
+            return mock
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.subprocess.run", side_effect=fake_run),
+        ):
+            rc = cli.cmd_check()
+        assert rc == 1
+        out = capsys.readouterr().out
+        assert "git_ops.local_only is true" in out
+        assert "has an 'origin' remote" in out
+
+
+# ---------------------------------------------------------------------------
+# Tier 3: variadic dispatch lets `add-dep --reason "<multi token>"` survive
+# ---------------------------------------------------------------------------
+
+
+class TestAddDepVariadicDispatch:
+    """The dispatcher must NOT truncate add-dep's --reason value."""
+
+    def test_main_passes_full_reason_through_to_cmd_add_dep(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: dict[str, Any] = {}
+
+        def fake_add_dep(*argv: str) -> int:
+            captured["argv"] = argv
+            return 0
+
+        monkeypatch.setattr(cli, "cmd_add_dep", fake_add_dep)
+        # Re-register the patched function in the dispatch table so main() sees it.
+        original = cli._COMMANDS["add-dep"]
+        monkeypatch.setitem(cli._COMMANDS, "add-dep", (fake_add_dep, original[1], original[2]))
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "devbench",
+                "add-dep",
+                "E0-F1-S1-T1",
+                "E0-F1-S1-T2",
+                "--reason",
+                "this is a multi token reason value",
+            ],
+        )
+        rc = cli.main()
+        assert rc == 0
+        # All five trailing tokens must reach cmd_add_dep, including the
+        # full multi-token --reason value (no slicing by MAX_ARGS).
+        assert captured["argv"] == (
+            "E0-F1-S1-T1",
+            "E0-F1-S1-T2",
+            "--reason",
+            "this is a multi token reason value",
+        )
+
+
+# ---------------------------------------------------------------------------
+# write-proposal auto-cascade (closes the resolver-write -> next-sweep gap)
+# ---------------------------------------------------------------------------
+
+
+def _runtime_config_with_auto_accept(value: bool) -> Any:
+    """Build a RuntimeConfig clone whose ``task_factory.auto_accept_proposals`` is *value*.
+
+    ``RuntimeConfig`` and ``TaskFactoryConfig`` are frozen dataclasses, so
+    mutation via setattr fails with ``FrozenInstanceError``. The
+    canonical replacement pattern is ``dataclasses.replace`` for the
+    nested config, then ``dataclasses.replace`` for the parent so the
+    one runtime field of interest is swapped without touching the
+    other config sections.
+    """
+    import dataclasses
+
+    base = cli.RUNTIME_CONFIG
+    new_tf = dataclasses.replace(base.task_factory, auto_accept_proposals=value)
+    return dataclasses.replace(base, task_factory=new_tf)
+
+
+class TestCmdWriteProposalDedup:
+    """Issue #141: ``cmd_write_proposal`` must auto-wire a dep edge to an
+    existing recovery task instead of writing a duplicate proposal when
+    the would-be proposal's ``fix_signature`` matches an existing pending
+    proposal on disk."""
+
+    def _seed_existing_recovery(self, tmp_path: Path, source_id: str, signature: str) -> Path:
+        """Drop a pending proposal JSON + a minimal source-task markdown +
+        BACKLOG.md row so add_dep can find and modify the source task."""
+        proposals_dir = tmp_path / ".devbench" / "proposals"
+        proposals_dir.mkdir(parents=True, exist_ok=True)
+        path = proposals_dir / f"{source_id}.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "source_task_id": source_id,
+                    "generated_at": "2026-05-02T00:00:00Z",
+                    "rejection_reason": "fixture",
+                    "proposed_tasks": [],
+                    "fix_signature": signature,
+                }
+            ),
+            encoding="utf-8",
+        )
+        backlog_dir = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        backlog_dir.mkdir(parents=True, exist_ok=True)
+        (backlog_dir / f"{source_id}.md").write_text(
+            f"# {source_id}: existing recovery\n\n## Status: in-queue\n", encoding="utf-8"
+        )
+        return path
+
+    def test_dedup_reuses_existing_proposal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Two source tasks with the same fix signature -> second invocation
+        emits ``recovery_reused: true`` instead of writing a duplicate
+        proposal JSON."""
+        import io
+
+        from devbench.backlog.proposal import _compute_fix_signature, _extract_intent_phrase
+
+        # Compute the signature the way cmd_write_proposal will compute it
+        # (target_repo "" because BacklogParser does not accept the bare
+        # "r" repo column the BACKLOG.md fixture uses; ``_resolve_source_repo``
+        # falls back to "" via its except-ValueError branch).
+        # Production strips the configured ``checkout_directory`` prefix
+        # before computing the signature (issue #159), so we seed with
+        # the STRIPPED form (``pyproject.toml``). The unstripped path
+        # stays in the new payload's ``files_to_own`` below so the
+        # issue #146 backlog-repo filter still treats the file as
+        # in-scope (the file's first segment ``git-repo`` matches the
+        # configured checkout_directory of caylent-solutions/git-repo
+        # in the test fixture).
+        files_unstripped = ["git-repo/pyproject.toml"]
+        files_stripped = ["pyproject.toml"]
+        intent = _extract_intent_phrase("Remove the pyproject.toml row from T1")
+        signature = _compute_fix_signature("", files_stripped, intent)
+
+        # Seed the EXISTING recovery: source_id=E0-F1-S1-T1 carries the signature.
+        self._seed_existing_recovery(tmp_path, "E0-F1-S1-T1", signature)
+        # Add a target source-task markdown that the new write-proposal
+        # invocation will be associated with (so add_dep can write its
+        # dep-table row).
+        backlog_dir = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        new_source_md = (
+            "# E0-F1-S1-T7: new source\n\n## Status: blocked\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n"
+        )
+        (backlog_dir / "E0-F1-S1-T7.md").write_text(new_source_md, encoding="utf-8")
+        # Minimal BACKLOG.md so BacklogParser does not crash; both rows present.
+        t1_path = "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md`"
+        t7_path = "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T7.md`"
+        (tmp_path / "BACKLOG.md").write_text(
+            "# Backlog\n\n## Tasks\n\n"
+            "| ID | Title | Type | Status | Deps | Repo | File |\n"
+            "|----|-------|------|--------|------|------|------|\n"
+            f"| E0-F1-S1-T1 | existing recovery | Task | in-queue | none | r | {t1_path} |\n"
+            f"| E0-F1-S1-T7 | new source | Task | blocked | none | r | {t7_path} |\n",
+            encoding="utf-8",
+        )
+
+        # Submit a new proposal whose fix signature will match.
+        new_payload = {
+            "source_task_id": "E0-F1-S1-T7",
+            "generated_at": "2026-05-02T00:01:00Z",
+            "rejection_reason": "duplicate fix",
+            "proposed_tasks": [
+                {
+                    "suggested_id": "E0-F1-S1-T8",
+                    "title": "Remove the pyproject.toml row from T7",
+                    "files_to_own": files_unstripped,
+                    "linked_scenarios": [],
+                    "suggested_acs": [],
+                    "suggested_approach": "Remove the pyproject.toml row from T1",
+                }
+            ],
+        }
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(new_payload)))
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+        ):
+            rc = cli.cmd_write_proposal("E0-F1-S1-T7")
+        assert rc == 0
+        out = capsys.readouterr().out
+        envelope = json.loads(out)
+        assert envelope["recovery_reused"] is True
+        assert envelope["reused_from_task_id"] == "E0-F1-S1-T1"
+        # No duplicate proposal JSON written.
+        assert not (tmp_path / ".devbench" / "proposals" / "E0-F1-S1-T7.json").exists()
+
+
+class TestCmdWriteProposalBacklogRepoSkip:
+    """Issue #146: ``cmd_write_proposal`` must drop proposed-task entries
+    whose ``files_to_own`` all live in the backlog repo (i.e., NOT in any
+    configured target repo). The backlog repo isn't a target repo; the
+    recovery cascade has no valid completion path for backlog-repo edits.
+    """
+
+    def _payload(
+        self,
+        source_id: str,
+        proposed: list[dict],
+    ) -> str:
+        return json.dumps(
+            {
+                "source_task_id": source_id,
+                "generated_at": "2026-05-02T00:00:00Z",
+                "rejection_reason": "fixture",
+                "proposed_tasks": proposed,
+            }
+        )
+
+    def _mk_runtime_config(self) -> MagicMock:
+        """Build a RUNTIME_CONFIG mock with two target repos configured
+        (``caylent-telemetry`` and ``kanon``). Files outside these
+        directories are treated as backlog-repo bookkeeping."""
+        cfg = MagicMock()
+        repo_a = MagicMock()
+        repo_a.checkout_directory = "caylent-telemetry"
+        repo_a.validated_repo = "caylent-solutions/caylent-telemetry"
+        repo_b = MagicMock()
+        repo_b.checkout_directory = "kanon"
+        repo_b.validated_repo = "caylent-solutions/kanon"
+        cfg.repos = {
+            "caylent-solutions/caylent-telemetry": repo_a,
+            "caylent-solutions/kanon": repo_b,
+        }
+        cfg.task_factory.auto_accept_proposals = False
+        cfg.task_factory.enabled = True
+        return cfg
+
+    def test_target_repo_files_emit_proposal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Proposed task whose files all live in a configured target repo
+        is NOT skipped: proposal is written and recovery_skipped is False."""
+        import io
+
+        payload = self._payload(
+            "E0-F1-S1-T1",
+            [
+                {
+                    "suggested_id": "E0-F1-S1-T2",
+                    "title": "Fix X",
+                    "files_to_own": ["caylent-telemetry/src/foo.py"],
+                    "linked_scenarios": [],
+                    "suggested_acs": [],
+                    "suggested_approach": "Add the foo helper",
+                }
+            ],
+        )
+        monkeypatch.setattr("sys.stdin", io.StringIO(payload))
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.RUNTIME_CONFIG", self._mk_runtime_config()),
+        ):
+            rc = cli.cmd_write_proposal("E0-F1-S1-T1")
+        assert rc == 0
+        envelope = json.loads(capsys.readouterr().out)
+        assert envelope.get("recovery_skipped") is not True
+        assert envelope.get("proposal_path") is not None
+        assert (tmp_path / ".devbench" / "proposals" / "E0-F1-S1-T1.json").exists()
+
+    def test_all_backlog_repo_files_skipped_no_proposal_written(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Proposed task whose only file is in the backlog repo (e.g.,
+        spec/observability.md) -> entry dropped, no proposal JSON
+        written, envelope reports recovery_skipped: True."""
+        import io
+
+        payload = self._payload(
+            "E3-F3-S2-T1",
+            [
+                {
+                    "suggested_id": "E3-F3-S2-T2",
+                    "title": "Sync spec doc",
+                    "files_to_own": ["spec/observability.md"],
+                    "linked_scenarios": [],
+                    "suggested_acs": [],
+                    "suggested_approach": "Sync the spec doc with the dashboard",
+                }
+            ],
+        )
+        monkeypatch.setattr("sys.stdin", io.StringIO(payload))
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.RUNTIME_CONFIG", self._mk_runtime_config()),
+        ):
+            rc = cli.cmd_write_proposal("E3-F3-S2-T1")
+        assert rc == 0
+        envelope = json.loads(capsys.readouterr().out)
+        assert envelope["recovery_skipped"] is True
+        assert envelope["proposal_path"] is None
+        assert not (tmp_path / ".devbench" / "proposals" / "E3-F3-S2-T1.json").exists()
+
+    def test_mixed_files_partial_keep(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Proposed task whose files span backlog + target repos -> entry
+        kept with target-repo files only; backlog files pruned. Proposal
+        is written."""
+        import io
+
+        payload = self._payload(
+            "E0-F1-S1-T1",
+            [
+                {
+                    "suggested_id": "E0-F1-S1-T2",
+                    "title": "Fix X with mixed files",
+                    "files_to_own": [
+                        "caylent-telemetry/src/foo.py",  # target repo
+                        "spec/architecture.md",  # backlog repo (pruned)
+                    ],
+                    "linked_scenarios": [],
+                    "suggested_acs": [],
+                    "suggested_approach": "Add the foo helper",
+                }
+            ],
+        )
+        monkeypatch.setattr("sys.stdin", io.StringIO(payload))
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.RUNTIME_CONFIG", self._mk_runtime_config()),
+        ):
+            rc = cli.cmd_write_proposal("E0-F1-S1-T1")
+        assert rc == 0
+        envelope = json.loads(capsys.readouterr().out)
+        assert envelope.get("recovery_skipped") is not True
+        assert envelope["proposal_path"] is not None
+        # Verify the persisted proposal carries only the target-repo file.
+        # Issue #159 (prefix strip): the persisted path is repo-relative
+        # (``src/foo.py``) rather than the prefixed form the agent emitted
+        # (``caylent-telemetry/src/foo.py``). The strip runs after the
+        # backlog-repo filter, so the target-repo classification still fires
+        # on the prefixed form before the persistence step normalises it.
+        persisted = json.loads((tmp_path / ".devbench" / "proposals" / "E0-F1-S1-T1.json").read_text(encoding="utf-8"))
+        assert persisted["proposed_tasks"][0]["files_to_own"] == ["src/foo.py"]
+
+    def test_empty_files_to_own_preserved(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Empty files_to_own = research / validation-gate task; NOT
+        treated as backlog-only. Entry preserved as-is."""
+        import io
+
+        payload = self._payload(
+            "E0-F1-S1-T1",
+            [
+                {
+                    "suggested_id": "E0-F1-S1-T2",
+                    "title": "Investigate X",
+                    "files_to_own": [],
+                    "linked_scenarios": [],
+                    "suggested_acs": [],
+                    "suggested_approach": "Investigate without authoring code",
+                }
+            ],
+        )
+        monkeypatch.setattr("sys.stdin", io.StringIO(payload))
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.RUNTIME_CONFIG", self._mk_runtime_config()),
+        ):
+            rc = cli.cmd_write_proposal("E0-F1-S1-T1")
+        assert rc == 0
+        envelope = json.loads(capsys.readouterr().out)
+        assert envelope.get("recovery_skipped") is not True
+
+    def test_helper_classifies_paths_correctly(self) -> None:
+        """Spot-check ``_file_lives_in_a_target_repo`` against canonical
+        examples (target-repo paths return True; backlog-repo paths
+        return False)."""
+        with patch("devbench.cli.RUNTIME_CONFIG", self._mk_runtime_config()):
+            assert cli._file_lives_in_a_target_repo("caylent-telemetry/src/foo.py")
+            assert cli._file_lives_in_a_target_repo("kanon/something.py")
+            assert not cli._file_lives_in_a_target_repo("spec/observability.md")
+            assert not cli._file_lives_in_a_target_repo("BACKLOG.md")
+            assert not cli._file_lives_in_a_target_repo("backlog/E1/E1-F1/E1-F1.md")
+            assert not cli._file_lives_in_a_target_repo("docs/architecture.md")
+            assert not cli._file_lives_in_a_target_repo("")
+
+
+class TestCmdWriteProposalCheckoutPrefixStrip:
+    """Issue #159: ``cmd_write_proposal`` must strip ``<checkout_directory>/``
+    prefixes from every ``proposed_tasks[*].files_to_own`` entry so the
+    persisted JSON carries repo-relative paths only. Recurring failure mode
+    (verified against the live caylent-telemetry-spec workspace): blocker-
+    resolver agents emit paths like ``kanon/src/foo.py`` when ``kanon`` is
+    configured as the target repo's checkout_directory; without the strip,
+    every materialised work unit fails validate-backlog rule 11."""
+
+    def _payload(self, source_id: str, files: list[str]) -> str:
+        return json.dumps(
+            {
+                "source_task_id": source_id,
+                "generated_at": "2026-05-04T00:00:00Z",
+                "rejection_reason": "fixture",
+                "proposed_tasks": [
+                    {
+                        "suggested_id": "E0-F1-S1-T2",
+                        "title": "Strip me",
+                        "files_to_own": files,
+                        "linked_scenarios": [],
+                        "suggested_acs": [],
+                        "suggested_approach": "Add the foo helper",
+                    }
+                ],
+            }
+        )
+
+    def _mk_runtime_config(self) -> MagicMock:
+        cfg = MagicMock()
+        repo_a = MagicMock()
+        repo_a.checkout_directory = "caylent-telemetry"
+        repo_a.validated_repo = "caylent-solutions/caylent-telemetry"
+        repo_b = MagicMock()
+        repo_b.checkout_directory = "kanon"
+        repo_b.validated_repo = "caylent-solutions/kanon"
+        cfg.repos = {
+            "caylent-solutions/caylent-telemetry": repo_a,
+            "caylent-solutions/kanon": repo_b,
+        }
+        cfg.task_factory.auto_accept_proposals = False
+        cfg.task_factory.enabled = True
+        return cfg
+
+    def test_kanon_prefix_stripped_to_repo_relative(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``kanon/src/foo.py`` -> ``src/foo.py`` in the persisted JSON."""
+        import io
+
+        monkeypatch.setattr(
+            "sys.stdin",
+            io.StringIO(
+                self._payload(
+                    "E0-F1-S1-T1",
+                    [
+                        "kanon/src/kanon_cli/core/xml_validator.py",
+                        "kanon/tests/unit/test_xml_validator.py",
+                    ],
+                )
+            ),
+        )
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.RUNTIME_CONFIG", self._mk_runtime_config()),
+        ):
+            rc = cli.cmd_write_proposal("E0-F1-S1-T1")
+        assert rc == 0
+        persisted = json.loads((tmp_path / ".devbench" / "proposals" / "E0-F1-S1-T1.json").read_text())
+        files = persisted["proposed_tasks"][0]["files_to_own"]
+        assert "src/kanon_cli/core/xml_validator.py" in files
+        assert "tests/unit/test_xml_validator.py" in files
+        # Original prefixed forms must NOT survive.
+        assert not any(f.startswith("kanon/") for f in files)
+
+    def test_repo_relative_paths_pass_through_unchanged(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Already-correct paths are not mutated by the strip pass."""
+        import io
+
+        monkeypatch.setattr(
+            "sys.stdin",
+            io.StringIO(
+                self._payload(
+                    "E0-F1-S1-T1",
+                    [
+                        "caylent-telemetry/src/foo.py",
+                    ],
+                )
+            ),
+        )
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.RUNTIME_CONFIG", self._mk_runtime_config()),
+        ):
+            rc = cli.cmd_write_proposal("E0-F1-S1-T1")
+        assert rc == 0
+        persisted = json.loads((tmp_path / ".devbench" / "proposals" / "E0-F1-S1-T1.json").read_text())
+        files = persisted["proposed_tasks"][0]["files_to_own"]
+        # caylent-telemetry IS one of the configured checkout dirs ->
+        # gets stripped to repo-relative form just like kanon does.
+        assert "src/foo.py" in files
+
+    def test_ambiguous_path_matches_multiple_checkouts_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Per #159 AC: a path matching multiple configured checkout
+        directories is ambiguous and the proposal is rejected with a
+        structured error rather than silently picking one."""
+        import io
+
+        cfg = MagicMock()
+        # Two repos whose checkout_directories share a common prefix; a
+        # single path could plausibly belong to either. Configure them
+        # so that ``foo`` is BOTH a checkout_directory AND a prefix of
+        # another checkout_directory.
+        repo_a = MagicMock()
+        repo_a.checkout_directory = "foo"
+        repo_a.validated_repo = "caylent-solutions/foo"
+        repo_b = MagicMock()
+        repo_b.checkout_directory = "foo"
+        repo_b.validated_repo = "caylent-solutions/foo-copy"
+        cfg.repos = {
+            "caylent-solutions/foo": repo_a,
+            "caylent-solutions/foo-copy": repo_b,
+        }
+        cfg.task_factory.auto_accept_proposals = False
+        cfg.task_factory.enabled = True
+
+        # Use a payload whose path duplicates the prefix to exercise
+        # the multi-match branch. Since both repos resolve to the same
+        # checkout_directory ("foo"), the deduped sorted list still has
+        # ONE entry; we need actually-different prefixes that BOTH
+        # match. Use a set with ``foo`` and ``foo/bar`` as configured
+        # checkout dirs and a path ``foo/bar/baz.py`` that matches both.
+        repo_b.checkout_directory = "foo/bar"
+        monkeypatch.setattr(
+            "sys.stdin",
+            io.StringIO(self._payload("E0-F1-S1-T1", ["foo/bar/baz.py"])),
+        )
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.RUNTIME_CONFIG", cfg),
+        ):
+            rc = cli.cmd_write_proposal("E0-F1-S1-T1")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "ambiguous" in err.lower()
+
+
+class TestCmdMaterialiseProposalLifecycleGates:
+    """Issues #143 + #144: TODO/TBD placeholder reject + cascade-depth limit
+    in ``cmd_materialise_proposal``."""
+
+    def _seed_proposal(
+        self,
+        tmp_path: Path,
+        source_id: str,
+        approach: str = "concrete",
+        cascade_depth: int = 0,
+    ) -> Path:
+        from devbench.backlog.proposal import Proposal, ProposedTask, write_proposal
+
+        proposal = Proposal(
+            source_task_id=source_id,
+            generated_at="2026-05-02T00:00:00Z",
+            rejection_reason="fixture",
+            proposed_tasks=[
+                ProposedTask(
+                    suggested_id="E0-F1-S1-T2",
+                    title="t",
+                    files_to_own=[],
+                    linked_scenarios=[],
+                    suggested_acs=[],
+                    suggested_approach=approach,
+                )
+            ],
+            cascade_depth=cascade_depth,
+        )
+        return write_proposal(tmp_path, proposal)
+
+    def test_todo_placeholder_rejected(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        self._seed_proposal(tmp_path, "E0-F1-S1-T1", approach="TODO -- describe change")
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+        ):
+            rc = cli.cmd_materialise_proposal("E0-F1-S1-T1")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "placeholder description" in err
+        assert "E0-F1-S1-T2" in err
+
+    def test_cascade_depth_at_cap_rejected(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        self._seed_proposal(tmp_path, "E0-F1-S1-T1", approach="concrete approach", cascade_depth=3)
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli.MAX_CASCADE_DEPTH", 3),
+        ):
+            rc = cli.cmd_materialise_proposal("E0-F1-S1-T1")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "cascade-depth limit reached" in err
+        assert "NEEDS_OPERATOR_ATTENTION" in err
+
+    def test_cascade_depth_below_cap_passes_through_to_source_lookup(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Depth < cap + concrete approach -> proceeds past gates and hits
+        the source-task-not-in-backlog error (same baseline behaviour as
+        before this commit)."""
+        self._seed_proposal(tmp_path, "E0-F1-S1-T1", approach="concrete approach", cascade_depth=1)
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli.MAX_CASCADE_DEPTH", 3),
+        ):
+            rc = cli.cmd_materialise_proposal("E0-F1-S1-T1")
+        assert rc == 1
+        # Past the dedup gates -> hits the source-task-lookup error.
+        err = capsys.readouterr().err
+        assert "not found" in err
+
+
+class TestCmdWriteProposalAutoCascade:
+    """When ``task_factory.auto_accept_proposals`` is true, ``write-proposal``
+    must materialise + promote every proposed task in the same Python
+    invocation so the cascade is actionable immediately rather than waiting
+    for the next ``sweep-proposals`` cycle.
+    """
+
+    @staticmethod
+    def _sample_proposal_dict(source_task_id: str = "E0-F1-S1-T1") -> dict[str, Any]:
+        return {
+            "source_task_id": source_task_id,
+            "generated_at": "2026-05-01T03:00:00Z",
+            "rejection_reason": "x",
+            "proposed_tasks": [
+                {
+                    "suggested_id": "E0-F1-S1-T9",
+                    "title": "Follow-up fix",
+                    "files_to_own": ["src/foo.py"],
+                    "linked_scenarios": [],
+                    "suggested_acs": [
+                        "AC-FUNC-001 fix the issue",
+                    ],
+                    "suggested_approach": (
+                        "Context: the source task hit X and produced finding Y. "
+                        "Scope: src/foo.py only. "
+                        "TDD approach: 1. RED write a failing test for the missing behaviour. "
+                        "2. GREEN add the implementation in src/foo.py. "
+                        "3. REFACTOR clean up duplication if any. "
+                        "Verify: pytest exits zero and lint is clean."
+                    ),
+                }
+            ],
+            "affected_task_ids": [],
+        }
+
+    def _patch_cli_workspace(
+        self, monkeypatch: pytest.MonkeyPatch, workspace: Path, backlog_root: Path, backlog_index: Path
+    ) -> None:
+        monkeypatch.setattr(cli, "WORKSPACE_ROOT", workspace)
+        monkeypatch.setattr(cli, "BACKLOG_ROOT", backlog_root)
+        monkeypatch.setattr(cli, "BACKLOG_INDEX", backlog_index)
+
+    def test_disabled_when_auto_accept_false(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    ) -> None:
+        # When the config flag is false the function returns the
+        # "disabled" sentinel and never calls materialise/promote.
+        monkeypatch.setattr(cli, "RUNTIME_CONFIG", _runtime_config_with_auto_accept(False))
+        proposal = Proposal.from_dict(self._sample_proposal_dict())
+        result = cli._maybe_auto_cascade_proposal("E0-F1-S1-T1", proposal)
+        assert result == {"auto_cascade": "disabled"}
+
+    def test_failed_when_source_task_missing_from_index(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        # When auto-accept is on but the source task is not in the
+        # backlog index (caller passed a typo'd id), the cascade reports
+        # "failed" with a clear error and does not raise.
+        monkeypatch.setattr(cli, "RUNTIME_CONFIG", _runtime_config_with_auto_accept(True))
+        backlog = tmp_path / "BACKLOG.md"
+        backlog.write_text(
+            "# Backlog\n\n"
+            "## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
+            "|------|-------|------|-------------|----------|---------|\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n",
+            encoding="utf-8",
+        )
+        self._patch_cli_workspace(monkeypatch, tmp_path, tmp_path / "backlog", backlog)
+        proposal = Proposal.from_dict(self._sample_proposal_dict("E0-NOPE-T0"))
+        result = cli._maybe_auto_cascade_proposal("E0-NOPE-T0", proposal)
+        assert result["auto_cascade"] == "failed"
+        # Either "no work-unit rows" (parser rejection on empty index)
+        # or "not found" (index parses but source task absent) is an
+        # acceptable failure shape; both prove the cascade aborted
+        # cleanly without raising.
+        err_value = result["error"]
+        assert isinstance(err_value, str)
+        err = err_value.lower()
+        assert "not found" in err or "no work-unit rows" in err
+
+    def test_applied_when_auto_accept_true(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    ) -> None:
+        # End-to-end: with auto-accept on and a real source-task in the
+        # index, the helper calls materialise + promote and returns
+        # "applied" with the materialised path list and promoted ids.
+        monkeypatch.setattr(cli, "RUNTIME_CONFIG", _runtime_config_with_auto_accept(True))
+        # Build a minimum BACKLOG with one source task at E0-F1-S1-T1
+        # (currently blocked, since auto-accept emit happens when the
+        # source is failing) plus the directory structure
+        # ``materialise_proposal`` expects.
+        backlog_root = tmp_path / "backlog"
+        story_dir = backlog_root / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+        (story_dir / "E0-F1-S1-T1.md").write_text(
+            "# E0-F1-S1-T1: Source\n\n"
+            "## Status: blocked\n\n"
+            "## Target Repository\n\n- **Repo:** `org/repo`\n\n"
+            "## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-FUNC-001\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `src/foo.py` | edit |\n\n"
+            "## Definition of Done\n\n- [ ] done\n",
+            encoding="utf-8",
+        )
+        backlog = tmp_path / "BACKLOG.md"
+        backlog.write_text(
+            "# Backlog\n\n"
+            "## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
+            "|------|-------|------|-------------|----------|---------|\n"
+            "| E0 | x | 0 | 0 | 0 | 1 |\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Source | Task | blocked | None | org/repo | "
+            "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n",
+            encoding="utf-8",
+        )
+        self._patch_cli_workspace(monkeypatch, tmp_path, backlog_root, backlog)
+
+        proposal = Proposal.from_dict(self._sample_proposal_dict("E0-F1-S1-T1"))
+        # Persist the proposal JSON so the cascade has something to work on.
+        proposals_dir = tmp_path / ".devbench" / "proposals"
+        proposals_dir.mkdir(parents=True)
+        (proposals_dir / "E0-F1-S1-T1.json").write_text(json.dumps(proposal.to_dict()))
+
+        result = cli._maybe_auto_cascade_proposal("E0-F1-S1-T1", proposal)
+        assert result["auto_cascade"] == "applied"
+        materialised = result["materialised"]
+        assert isinstance(materialised, list) and materialised  # at least one path
+        promoted = result["promoted"]
+        assert isinstance(promoted, list)
+        assert "E0-F1-S1-T9" in promoted
+        # The promoted task's file now exists with status in-queue.
+        promoted_file = story_dir / "E0-F1-S1-T9.md"
+        assert promoted_file.exists()
+        promoted_content = promoted_file.read_text(encoding="utf-8")
+        assert "## Status: in-queue" in promoted_content
+
+
+# ---------------------------------------------------------------------------
+# log-verdict judge-name allowlist (rejects malformed audit-row writes)
+# ---------------------------------------------------------------------------
+
+
+class TestCmdLogVerdictAllowlist:
+    """``cmd_log_verdict`` rejects judge names outside the canonical allowlist.
+
+    Empirically observed in production: an executor agent ran
+    ``log-verdict judge <id> pass`` (literal string ``"judge"`` instead
+    of a canonical reviewer name). The malformed entry landed in the
+    work-unit Comments section but was silently invisible to
+    ``BacklogManager._last_round_all_passed`` (which only counts
+    entries whose judge name is in ``ALL_REQUIRED_JUDGE_NAMES``).
+    Refusing typos at the CLI layer prevents pollution + masks.
+    """
+
+    @pytest.mark.parametrize(
+        "bad_name",
+        [
+            "judge",  # literal typo seen in production
+            "code-reviewer",  # hyphenated form (canonical is underscored)
+            "Code_Review",  # casing (canonical is lowercase)
+            "auditor",  # role that does not exist
+            "",  # empty
+        ],
+    )
+    def test_rejects_non_allowlist_judge(self, bad_name: str, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_log_verdict(bad_name, "E0-F1-S1-T1", "pass", "smoke")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "not on the allowlist" in err
+        # Error message names every valid choice so the agent can self-correct.
+        for canonical in ("code_review", "test_review", "doc_review"):
+            assert canonical in err
+
+    @pytest.mark.parametrize(
+        "good_name",
+        [
+            "code_review",
+            "test_review",
+            "doc_review",
+            "changes_manifest",
+            "security_review",
+            "executor",  # audit-only workflow agent
+            "blocker_resolver",  # audit-only workflow agent
+            "manifest_amender",
+            "task_factory",
+        ],
+    )
+    def test_accepts_allowlist_judges(self, good_name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        # Build a minimal workspace so the verdict-write reaches its
+        # successful return path. Failure here would surface as a
+        # non-zero rc with stderr; we assert rc==0 to prove the
+        # allowlist gate did not trip.
+        backlog_root = tmp_path / "backlog"
+        story_dir = backlog_root / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+        (story_dir / "E0-F1-S1-T1.md").write_text(
+            "# E0-F1-S1-T1: Source\n\n## Status: in-progress\n\n## Description\n\nx\n\n## Comments\n\n",
+            encoding="utf-8",
+        )
+        backlog = tmp_path / "BACKLOG.md"
+        backlog.write_text(
+            "# Backlog\n\n"
+            "## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
+            "|------|-------|------|-------------|----------|---------|\n"
+            "| E0 | x | 0 | 1 | 0 | 0 |\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Source | Task | in-progress | None | org/repo | "
+            "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(cli, "WORKSPACE_ROOT", tmp_path)
+        monkeypatch.setattr(cli, "BACKLOG_ROOT", backlog_root)
+        monkeypatch.setattr(cli, "BACKLOG_INDEX", backlog)
+
+        rc = cli.cmd_log_verdict(good_name, "E0-F1-S1-T1", "pass", "looks good")
+        assert rc == 0
+
+
+# ---------------------------------------------------------------------------
+# log-file path resolution: fail-fast when neither JUDGE_LOG_FILE nor
+# JUDGE_WORKSPACE_ROOT is set; canonical workspace-local path otherwise
+# ---------------------------------------------------------------------------
+
+
+class TestResolveLogFilePath:
+    """``_resolve_log_file_path`` is the single source of truth for which
+    log file ``devbench report`` reads. Removing the silent source-tree
+    fallback prevents the BACKLOG-vs-throughput divergence reported by
+    operators (they ran ``devbench report`` from a sub-shell that
+    inherited ``JUDGE_WORKSPACE_ROOT`` but not ``JUDGE_LOG_FILE`` and got
+    an unrelated dev-tree log instead of their workspace's log).
+    """
+
+    def test_explicit_judge_log_file_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("JUDGE_LOG_FILE", "/tmp/my-explicit.log")
+        monkeypatch.setenv("JUDGE_WORKSPACE_ROOT", "/tmp/some-workspace")
+        # JUDGE_LOG_FILE is the explicit override and MUST win even when
+        # JUDGE_WORKSPACE_ROOT is also set.
+        assert cli._resolve_log_file_path() == Path("/tmp/my-explicit.log")
+
+    def test_workspace_root_derives_canonical_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
+        monkeypatch.setenv("JUDGE_WORKSPACE_ROOT", "/tmp/my-workspace")
+        # Default path is <workspace>/<DEFAULT_LOG_SUBDIR>/<DEFAULT_LOG_FILENAME>.
+        # Operators running ``devbench report`` from any shell with
+        # JUDGE_WORKSPACE_ROOT inherited get the same log the
+        # orchestrator writes to.
+        from devbench.constants import DEFAULT_LOG_FILENAME, DEFAULT_LOG_SUBDIR
+
+        expected = Path("/tmp/my-workspace") / DEFAULT_LOG_SUBDIR / DEFAULT_LOG_FILENAME
+        assert cli._resolve_log_file_path() == expected
+
+    def test_empty_judge_log_file_falls_through_to_workspace_root(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Empty / whitespace-only JUDGE_LOG_FILE behaves as unset
+        # (avoids "" being treated as a valid path).
+        monkeypatch.setenv("JUDGE_LOG_FILE", "   ")
+        monkeypatch.setenv("JUDGE_WORKSPACE_ROOT", "/tmp/ws")
+        from devbench.constants import DEFAULT_LOG_FILENAME, DEFAULT_LOG_SUBDIR
+
+        expected = Path("/tmp/ws") / DEFAULT_LOG_SUBDIR / DEFAULT_LOG_FILENAME
+        assert cli._resolve_log_file_path() == expected
+
+    def test_neither_set_fails_fast(self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+        # Per CLAUDE.md "Fail-fast": no fallbacks. When neither env var
+        # is set the helper exits 1 with an actionable error rather
+        # than silently falling back to the devbench source tree's log.
+        monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
+        monkeypatch.delenv("JUDGE_WORKSPACE_ROOT", raising=False)
+        with pytest.raises(SystemExit) as excinfo:
+            cli._resolve_log_file_path()
+        assert excinfo.value.code == 1
+        err = capsys.readouterr().err
+        # Error names BOTH env vars and the canonical workspace-local
+        # path so the operator can self-correct from either direction.
+        assert "JUDGE_LOG_FILE" in err
+        assert "JUDGE_WORKSPACE_ROOT" in err
+
+
+# ---------------------------------------------------------------------------
+# log_file YAML config (Option 2): YAML drives both writer and reader
+# ---------------------------------------------------------------------------
+
+
+class TestResolveLogFileYamlConfig:
+    """``RUNTIME_CONFIG.log_file`` (from devbench.yaml) drives the resolver
+    when ``JUDGE_LOG_FILE`` env var is not set. This is the canonical
+    single source of truth for the orchestrator's log path; the
+    orchestrator-as-writer (``setup_logging``) and the report-as-reader
+    (``cmd_report``) both consult it so they cannot diverge.
+    """
+
+    def _runtime_config_with_log_file(self, value: str | None) -> Any:
+        import dataclasses
+
+        return dataclasses.replace(cli.RUNTIME_CONFIG, log_file=value)
+
+    def test_yaml_log_file_workspace_relative(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
+        monkeypatch.setenv("JUDGE_WORKSPACE_ROOT", "/tmp/ws")
+        monkeypatch.setattr(cli, "RUNTIME_CONFIG", self._runtime_config_with_log_file("logs/orch.log"))
+        # YAML log_file is workspace-relative when not absolute; the
+        # resolver joins it with JUDGE_WORKSPACE_ROOT.
+        assert cli._resolve_log_file_path() == Path("/tmp/ws/logs/orch.log")
+
+    def test_yaml_log_file_absolute_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
+        monkeypatch.setenv("JUDGE_WORKSPACE_ROOT", "/tmp/ws")
+        monkeypatch.setattr(cli, "RUNTIME_CONFIG", self._runtime_config_with_log_file("/var/log/d.log"))
+        # An absolute YAML path is used as-is, ignoring the workspace
+        # root (operator deliberately put the log outside the workspace).
+        assert cli._resolve_log_file_path() == Path("/var/log/d.log")
+
+    def test_explicit_judge_log_file_still_wins_over_yaml(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("JUDGE_LOG_FILE", "/tmp/explicit.log")
+        monkeypatch.setenv("JUDGE_WORKSPACE_ROOT", "/tmp/ws")
+        monkeypatch.setattr(cli, "RUNTIME_CONFIG", self._runtime_config_with_log_file("logs/orch.log"))
+        # Per-invocation env override beats both YAML config and the
+        # workspace-local convention; this matches how ``cmd_check`` and
+        # the test fixtures set the path explicitly.
+        assert cli._resolve_log_file_path() == Path("/tmp/explicit.log")
+
+    def test_yaml_unset_falls_through_to_workspace_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
+        monkeypatch.setenv("JUDGE_WORKSPACE_ROOT", "/tmp/ws")
+        monkeypatch.setattr(cli, "RUNTIME_CONFIG", self._runtime_config_with_log_file(None))
+        from devbench.constants import DEFAULT_LOG_FILENAME, DEFAULT_LOG_SUBDIR
+
+        # When neither JUDGE_LOG_FILE nor YAML log_file is set, the
+        # resolver falls back to the workspace-local convention.
+        assert cli._resolve_log_file_path() == (Path("/tmp/ws") / DEFAULT_LOG_SUBDIR / DEFAULT_LOG_FILENAME)
+
+    def test_yaml_with_no_workspace_treats_relative_as_cwd_relative(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Edge case: YAML has a relative log_file but JUDGE_WORKSPACE_ROOT
+        # is unset (very rare; only happens in test fixtures). The
+        # resolver returns the path as-is so callers can decide what
+        # to anchor it against.
+        monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
+        monkeypatch.delenv("JUDGE_WORKSPACE_ROOT", raising=False)
+        monkeypatch.setattr(cli, "RUNTIME_CONFIG", self._runtime_config_with_log_file("logs/orch.log"))
+        assert cli._resolve_log_file_path() == Path("logs/orch.log")
+
+
+class TestInlineOrphanCleanup:
+    """Phase 1: ``cmd_git_ops`` runs the orphan cleanup inline as a chore commit.
+
+    Eliminates the cascade pathology where multiple parents each emitted a
+    duplicate cleanup proposal and those proposals themselves got blocked by
+    the manifest amender on predecessor staging. The cleanup is no longer a
+    backlog work unit -- it is a maintenance commit the engine makes on its
+    own when it detects build/state artifact paths that would otherwise
+    pollute the task's commit.
+    """
+
+    def _make_unit(self, repo: str = "caylent-solutions/git-repo") -> WorkUnit:
+        return WorkUnit(
+            id="E0-F1-S1-T1",
+            title="Sample task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T1.md"),
+            repo=repo,
+            dependencies=[],
+        )
+
+    def _seed_orphan_in_repo(self, repo_dir: Path) -> Path:
+        """Add a tracked orphan path (``.coverage (1)``) on top of the
+        ``tmp_repo_dir`` fixture's initial commit.
+
+        Mirrors the real-world failure shape from the user's halt log
+        (the leftover pytest-cov race file).
+        """
+        import subprocess
+
+        orphan = repo_dir / ".coverage (1)"
+        orphan.write_text("ignored coverage data\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "add", "--", ".coverage (1)"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "commit", "-m", "leak orphan"],
+            check=True,
+        )
+        return orphan
+
+    def test_inline_cleanup_lands_chore_commit_and_continues(self, tmp_repo_dir: Path) -> None:
+        from devbench.constants import DEVBENCH_INLINE_CLEANUP_COMMIT_MESSAGE
+
+        self._seed_orphan_in_repo(tmp_repo_dir)
+        # Stage an executor file alongside the orphan situation so we can
+        # verify the executor's staging survives the cleanup pass.
+        import subprocess
+
+        (tmp_repo_dir / "feature.py").write_text("print('hi')\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(tmp_repo_dir), "add", "--", "feature.py"],
+            check=True,
+        )
+
+        result = cli._inline_orphan_cleanup_or_refuse(
+            unit_id="E0-F1-S1-T1",
+            repo_path=tmp_repo_dir,
+            detected=[".coverage (1)"],
+        )
+        assert result is False  # caller continues with task commit
+
+        # Cleanup commit landed with the canonical chore message.
+        log = subprocess.run(
+            ["git", "-C", str(tmp_repo_dir), "log", "-1", "--format=%s"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert log == DEVBENCH_INLINE_CLEANUP_COMMIT_MESSAGE
+
+        # Orphan is no longer tracked.
+        ls = subprocess.run(
+            ["git", "-C", str(tmp_repo_dir), "ls-files"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        assert ".coverage (1)" not in ls
+
+        # ``.gitignore`` was written with the devbench-managed block.
+        gitignore = (tmp_repo_dir / ".gitignore").read_text(encoding="utf-8")
+        assert ".coverage*" in gitignore
+
+        # Executor's staging (feature.py) was preserved.
+        staged = subprocess.run(
+            ["git", "-C", str(tmp_repo_dir), "diff", "--cached", "--name-only"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        assert "feature.py" in staged
+
+    @pytest.mark.skipif(
+        __import__("sys").platform == "win32",
+        reason="os.symlink requires elevated privileges on Windows",
+    )
+    def test_inline_cleanup_handles_symlinked_repo_path(self, tmp_repo_dir: Path, tmp_path: Path) -> None:
+        """Issue #125 regression: inline cleanup must work when the caller
+        passes a symlinked path that resolves to the real checkout.
+
+        ``cleanup_tracked_orphans`` calls ``Path.resolve()`` internally so
+        its ``OrphanReport.gitignore_path`` lives in resolved-path space.
+        ``_run_inline_cleanup_steps`` must therefore also resolve the
+        ``repo_path`` it receives before calling
+        ``gitignore_path.relative_to(repo_path)``; otherwise
+        ``Path.relative_to`` (which is not symlink-aware) raises
+        ``ValueError`` and BLOCKS the work unit. This test exercises the
+        documented workspace-layout pattern where target repos sit
+        elsewhere on disk and a symlink under
+        ``JUDGE_WORKSPACE_ROOT/<checkout_directory>`` points at them.
+        """
+        import subprocess
+
+        from devbench.constants import DEVBENCH_INLINE_CLEANUP_COMMIT_MESSAGE
+
+        self._seed_orphan_in_repo(tmp_repo_dir)
+        symlinked_path = tmp_path / "via-symlink"
+        symlinked_path.symlink_to(tmp_repo_dir)
+
+        result = cli._inline_orphan_cleanup_or_refuse(
+            unit_id="E0-F1-S1-T1",
+            repo_path=symlinked_path,
+            detected=[".coverage (1)"],
+        )
+        assert result is False
+
+        # Cleanup commit landed under the canonical chore message.
+        log = subprocess.run(
+            ["git", "-C", str(tmp_repo_dir), "log", "-1", "--format=%s"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert log == DEVBENCH_INLINE_CLEANUP_COMMIT_MESSAGE
+
+        # Orphan untracked.
+        ls = subprocess.run(
+            ["git", "-C", str(tmp_repo_dir), "ls-files"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        assert ".coverage (1)" not in ls
+
+        # .gitignore extended with the devbench-managed block.
+        gitignore = (tmp_repo_dir / ".gitignore").read_text(encoding="utf-8")
+        assert ".coverage*" in gitignore
+
+    def test_inline_cleanup_filters_out_staged_only_orphans(self, tmp_repo_dir: Path) -> None:
+        """A staged-only orphan (newly added by executor, not yet in HEAD) is
+        un-staged + ignored; no cleanup commit is needed because there's
+        nothing to ``rm --cached``.
+
+        The follow-up ``commit_and_push`` would then skip the orphan because
+        the just-written .gitignore block matches the pattern.
+        """
+        import subprocess
+
+        # Stage a brand-new orphan-pattern file that's not yet tracked.
+        (tmp_repo_dir / ".coverage").write_text("data\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(tmp_repo_dir), "add", "-f", "--", ".coverage"],
+            check=True,
+        )
+
+        result = cli._inline_orphan_cleanup_or_refuse(
+            unit_id="E0-F1-S1-T1",
+            repo_path=tmp_repo_dir,
+            detected=[".coverage"],
+        )
+        assert result is False
+
+        # Orphan is no longer staged.
+        staged = subprocess.run(
+            ["git", "-C", str(tmp_repo_dir), "diff", "--cached", "--name-only"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        assert ".coverage" not in staged
+
+    def test_inline_cleanup_refuses_on_subprocess_failure(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """When the cleanup primitive raises, the helper returns True so
+        the caller refuses the parent commit -- and prints an actionable
+        error mentioning the manual recovery command.
+        """
+        # Pass a non-git-repo path so cleanup_tracked_orphans raises.
+        result = cli._inline_orphan_cleanup_or_refuse(
+            unit_id="E0-F1-S1-T1",
+            repo_path=tmp_path,
+            detected=[".coverage"],
+        )
+        assert result is True
+        err = capsys.readouterr().err
+        assert "git-ops refused" in err
+        assert "cleanup-tracked-orphans" in err  # operator-recovery hint
+
+
+class TestEmitOrphanCleanupDispatch:
+    """``_emit_orphan_cleanup_proposal_if_needed`` dispatches inline vs legacy."""
+
+    def _unit(self) -> WorkUnit:
+        return WorkUnit(
+            id="E0-F1-S1-T1",
+            title="Sample",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T1.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+
+    def test_no_orphans_returns_false_without_dispatch(self, tmp_path: Path) -> None:
+        with (
+            patch("devbench.cli._orphan_paths_for_repo", return_value=[]),
+            patch("devbench.cli._inline_orphan_cleanup_or_refuse") as inline,
+            patch("devbench.cli._legacy_emit_orphan_cleanup_proposal") as legacy,
+        ):
+            assert cli._emit_orphan_cleanup_proposal_if_needed("E0-F1-S1-T1", self._unit(), tmp_path) is False
+        inline.assert_not_called()
+        legacy.assert_not_called()
+
+    def test_skipped_gate_returns_false(self, tmp_path: Path) -> None:
+        # _orphan_paths_for_repo returns None when the gate is skipped
+        # (non-git checkout). Caller continues without refusal.
+        with patch("devbench.cli._orphan_paths_for_repo", return_value=None):
+            assert cli._emit_orphan_cleanup_proposal_if_needed("E0-F1-S1-T1", self._unit(), tmp_path) is False
+
+    def test_dispatches_to_inline_when_enabled(self, tmp_path: Path) -> None:
+        with (
+            patch("devbench.cli._orphan_paths_for_repo", return_value=[".coverage"]),
+            patch("devbench.cli.INLINE_ORPHAN_CLEANUP_ENABLED", True, create=True),
+            patch("devbench.cli._inline_orphan_cleanup_or_refuse", return_value=False) as inline,
+            patch("devbench.cli._legacy_emit_orphan_cleanup_proposal") as legacy,
+        ):
+            # The function imports INLINE_ORPHAN_CLEANUP_ENABLED at call time;
+            # patch the import target directly via the module-level constant.
+            import devbench.config as cfg
+
+            cfg.INLINE_ORPHAN_CLEANUP_ENABLED = True
+            try:
+                assert cli._emit_orphan_cleanup_proposal_if_needed("E0-F1-S1-T1", self._unit(), tmp_path) is False
+            finally:
+                cfg.INLINE_ORPHAN_CLEANUP_ENABLED = True
+        inline.assert_called_once()
+        legacy.assert_not_called()
+
+    def test_dispatches_to_legacy_when_disabled(self, tmp_path: Path) -> None:
+        import devbench.config as cfg
+
+        original = cfg.INLINE_ORPHAN_CLEANUP_ENABLED
+        cfg.INLINE_ORPHAN_CLEANUP_ENABLED = False
+        try:
+            with (
+                patch("devbench.cli._orphan_paths_for_repo", return_value=[".coverage"]),
+                patch("devbench.cli._inline_orphan_cleanup_or_refuse") as inline,
+                patch("devbench.cli._legacy_emit_orphan_cleanup_proposal", return_value=True) as legacy,
+            ):
+                assert cli._emit_orphan_cleanup_proposal_if_needed("E0-F1-S1-T1", self._unit(), tmp_path) is True
+            inline.assert_not_called()
+            legacy.assert_called_once()
+        finally:
+            cfg.INLINE_ORPHAN_CLEANUP_ENABLED = original
+
+
+class TestFindExistingCleanupProposal:
+    """Phase 1 secondary fix: cross-task de-duplication for the legacy proposal flow."""
+
+    def test_returns_none_when_proposals_dir_absent(self, tmp_path: Path) -> None:
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            assert cli._find_existing_cleanup_proposal([".coverage"]) is None
+
+    def test_returns_none_when_no_cleanup_proposal_present(self, tmp_path: Path) -> None:
+        proposals = tmp_path / ".devbench" / "proposals"
+        proposals.mkdir(parents=True)
+        # Some other proposal (not an orphan-cleanup -- claims a different file).
+        (proposals / "E0-F1-S1-T2.json").write_text(
+            json.dumps(
+                {
+                    "source_task_id": "E0-F1-S1-T2",
+                    "proposed_tasks": [
+                        {"suggested_id": "E0-F1-S1-T9", "files_to_own": ["src/feature.py"]},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            assert cli._find_existing_cleanup_proposal([".coverage"]) is None
+
+    def test_returns_existing_cleanup_id_when_found(self, tmp_path: Path) -> None:
+        proposals = tmp_path / ".devbench" / "proposals"
+        proposals.mkdir(parents=True)
+        (proposals / "E0-F1-S1-T2.json").write_text(
+            json.dumps(
+                {
+                    "source_task_id": "E0-F1-S1-T2",
+                    "proposed_tasks": [
+                        {"suggested_id": "E0-F1-S1-T7", "files_to_own": [".gitignore"]},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            assert cli._find_existing_cleanup_proposal([".coverage"]) == "E0-F1-S1-T7"
+
+    def test_skips_malformed_proposal_json(self, tmp_path: Path) -> None:
+        proposals = tmp_path / ".devbench" / "proposals"
+        proposals.mkdir(parents=True)
+        (proposals / "broken.json").write_text("{not valid json", encoding="utf-8")
+        (proposals / "E0-F1-S1-T2.json").write_text(
+            json.dumps(
+                {
+                    "proposed_tasks": [
+                        {"suggested_id": "E0-F1-S1-T7", "files_to_own": [".gitignore"]},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            # Malformed file is silently skipped; the valid one still wins.
+            assert cli._find_existing_cleanup_proposal([".coverage"]) == "E0-F1-S1-T7"
+
+
+class TestCiFailureRetry:
+    """Issue #115: CI-failure executor retry instead of immediate BLOCKED."""
+
+    def _make_wu_file(self, tmp_path: Path, comments: list[str] | None = None) -> Path:
+        body = "# E0-F1-S1-T1: sample\n\n## Status: in-progress\n\n## Description\n\nx\n\n## Comments\n\n"
+        for c in comments or []:
+            body += f"[2026-05-01 00:00 UTC] [agent/git_ops] {c}\n"
+        wu = tmp_path / "E0-F1-S1-T1.md"
+        wu.write_text(body, encoding="utf-8")
+        return wu
+
+    def test_count_ci_fail_attempts_zero_when_no_entries(self, tmp_path: Path) -> None:
+        wu = self._make_wu_file(tmp_path, comments=["[PR_CREATED] https://example/x"])
+        assert cli._count_ci_fail_attempts(wu) == 0
+
+    def test_count_ci_fail_attempts_returns_count(self, tmp_path: Path) -> None:
+        wu = self._make_wu_file(tmp_path, comments=["[CI_FAIL] one", "[CI_FAIL] two"])
+        assert cli._count_ci_fail_attempts(wu) == 2
+
+    def test_count_ci_fail_attempts_zero_when_file_missing(self, tmp_path: Path) -> None:
+        assert cli._count_ci_fail_attempts(tmp_path / "missing.md") == 0
+        assert cli._count_ci_fail_attempts(None) == 0
+
+    def test_handle_ci_failure_legacy_when_disabled(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        wu = self._make_wu_file(tmp_path)
+        mgr = MagicMock()
+        with patch("devbench.config.CI_FAILURE_RETRY_ENABLED", False):
+            rc = cli._handle_ci_failure(
+                ops=MagicMock(),
+                unit_id="E0-F1-S1-T1",
+                canonical_repo="ex/foo",
+                pr_number=42,
+                repo_path=tmp_path,
+                wu_file=wu,
+                mgr=mgr,
+            )
+        assert rc == 1
+        assert "CI checks failed for PR #42" in capsys.readouterr().err
+        mgr._append_agent_comment.assert_not_called()
+
+    def test_handle_ci_failure_returns_2_under_budget(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        wu = self._make_wu_file(tmp_path)
+        mgr = MagicMock()
+        ops = MagicMock()
+        ops.get_latest_failing_run_id.return_value = "999"
+        ops.fetch_run_log.return_value = "ruff E501 line too long\n"
+        with (
+            patch("devbench.config.CI_FAILURE_RETRY_ENABLED", True),
+            patch("devbench.config.MAX_RETRY_ATTEMPTS", 3),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli._handle_ci_failure(
+                ops=ops,
+                unit_id="E0-F1-S1-T1",
+                canonical_repo="ex/foo",
+                pr_number=42,
+                repo_path=tmp_path,
+                wu_file=wu,
+                mgr=mgr,
+            )
+        assert rc == 2
+        # log file written under workspace
+        log_files = sorted((tmp_path / ".devbench" / "ci-failures").glob("E0-F1-S1-T1-*.log"))
+        assert len(log_files) == 1
+        assert "ruff E501" in log_files[0].read_text(encoding="utf-8")
+        # audit comment written with [CI_FAIL] (not _BLOCKED)
+        msg = mgr._append_agent_comment.call_args.args[2]
+        assert msg.startswith("[CI_FAIL] ")
+
+    def test_handle_ci_failure_returns_1_when_budget_exhausted(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # Pre-seed two prior CI_FAIL entries so this is attempt 3 -- exhausted.
+        wu = self._make_wu_file(tmp_path, comments=["[CI_FAIL] r1", "[CI_FAIL] r2"])
+        mgr = MagicMock()
+        ops = MagicMock()
+        ops.get_latest_failing_run_id.return_value = None  # log unavailable
+        with (
+            patch("devbench.config.CI_FAILURE_RETRY_ENABLED", True),
+            patch("devbench.config.MAX_RETRY_ATTEMPTS", 3),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli._handle_ci_failure(
+                ops=ops,
+                unit_id="E0-F1-S1-T1",
+                canonical_repo="ex/foo",
+                pr_number=42,
+                repo_path=tmp_path,
+                wu_file=wu,
+                mgr=mgr,
+            )
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "budget exhausted" in err
+        assert "MAX_RETRY_ATTEMPTS=3" in err
+        # exhaustion uses [CI_FAIL_BLOCKED] marker
+        msg = mgr._append_agent_comment.call_args.args[2]
+        assert msg.startswith("[CI_FAIL_BLOCKED] ")
+
+    def test_handle_ci_failure_skips_audit_when_no_wu_file(self, tmp_path: Path) -> None:
+        ops = MagicMock()
+        ops.get_latest_failing_run_id.return_value = "1"
+        ops.fetch_run_log.return_value = "log\n"
+        mgr = MagicMock()
+        with (
+            patch("devbench.config.CI_FAILURE_RETRY_ENABLED", True),
+            patch("devbench.config.MAX_RETRY_ATTEMPTS", 3),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli._handle_ci_failure(
+                ops=ops,
+                unit_id="E0-F1-S1-T1",
+                canonical_repo="ex/foo",
+                pr_number=42,
+                repo_path=tmp_path,
+                wu_file=None,
+                mgr=mgr,
+            )
+        assert rc == 2
+        mgr._append_agent_comment.assert_not_called()
+
+
+class TestPrReviewResolution:
+    """Issue #116: poll PR review state before merging."""
+
+    def _resolution(
+        self,
+        resolved: bool = False,
+        decision: str = "CHANGES_REQUESTED",
+        reviews: list[dict[str, str | int]] | None = None,
+        comments: list[dict[str, str | int]] | None = None,
+    ) -> object:
+        from devbench.github.git_ops import ReviewResolution
+
+        return ReviewResolution(
+            resolved=resolved,
+            review_decision=decision,
+            unresolved_reviews=reviews or [],
+            unresolved_comments=comments or [],
+            elapsed_seconds=0.0,
+        )
+
+    def _wu_file(self, tmp_path: Path, retries: int = 0) -> Path:
+        comments = "\n".join(f"[2026-05-01 00:0{i} UTC] [agent/git_ops] [PR_BOT_FAIL] r{i}" for i in range(retries))
+        body = f"# E0-F1-S1-T1: t\n\n## Status: in-progress\n\n## Description\n\nx\n\n## Comments\n\n{comments}\n"
+        wu = tmp_path / "wu.md"
+        wu.write_text(body, encoding="utf-8")
+        return wu
+
+    def test_returns_0_when_phase_disabled(self, tmp_path: Path) -> None:
+        ops = MagicMock()
+        with patch("devbench.config.PR_REVIEW_RESOLUTION_ENABLED", False):
+            rc = cli._handle_pr_review_resolution(
+                ops=ops,
+                unit_id="E0-F1-S1-T1",
+                canonical_repo="ex/foo",
+                pr_number=42,
+                repo_path=tmp_path,
+                wu_file=self._wu_file(tmp_path),
+                mgr=MagicMock(),
+            )
+        assert rc == 0
+        ops.poll_pr_review_resolution.assert_not_called()
+
+    def test_returns_0_when_no_signals_configured(self, tmp_path: Path) -> None:
+        ops = MagicMock()
+        with (
+            patch("devbench.config.PR_REVIEW_RESOLUTION_ENABLED", True),
+            patch("devbench.config.PR_REVIEW_AGENTS", ()),
+            patch("devbench.config.PR_REVIEW_DECISION_BLOCKS", False),
+        ):
+            rc = cli._handle_pr_review_resolution(
+                ops=ops,
+                unit_id="E0-F1-S1-T1",
+                canonical_repo="ex/foo",
+                pr_number=42,
+                repo_path=tmp_path,
+                wu_file=self._wu_file(tmp_path),
+                mgr=MagicMock(),
+            )
+        assert rc == 0
+        ops.poll_pr_review_resolution.assert_not_called()
+
+    def test_returns_0_when_resolved(self, tmp_path: Path) -> None:
+        ops = MagicMock()
+        ops.poll_pr_review_resolution.return_value = self._resolution(resolved=True, decision="APPROVED")
+        with (
+            patch("devbench.config.PR_REVIEW_RESOLUTION_ENABLED", True),
+            patch("devbench.config.PR_REVIEW_AGENTS", ()),
+            patch("devbench.config.PR_REVIEW_DECISION_BLOCKS", True),
+        ):
+            rc = cli._handle_pr_review_resolution(
+                ops=ops,
+                unit_id="E0-F1-S1-T1",
+                canonical_repo="ex/foo",
+                pr_number=42,
+                repo_path=tmp_path,
+                wu_file=self._wu_file(tmp_path),
+                mgr=MagicMock(),
+            )
+        assert rc == 0
+
+    def test_returns_3_when_unresolved_under_budget(self, tmp_path: Path) -> None:
+        ops = MagicMock()
+        ops.poll_pr_review_resolution.return_value = self._resolution(
+            reviews=[{"reviewer": "github-copilot[bot]", "state": "CHANGES_REQUESTED", "body": "fix this"}],
+        )
+        mgr = MagicMock()
+        with (
+            patch("devbench.config.PR_REVIEW_RESOLUTION_ENABLED", True),
+            patch("devbench.config.PR_REVIEW_AGENTS", ("github-copilot[bot]",)),
+            patch("devbench.config.PR_REVIEW_DECISION_BLOCKS", True),
+            patch("devbench.config.MAX_RETRY_ATTEMPTS", 3),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli._handle_pr_review_resolution(
+                ops=ops,
+                unit_id="E0-F1-S1-T1",
+                canonical_repo="ex/foo",
+                pr_number=42,
+                repo_path=tmp_path,
+                wu_file=self._wu_file(tmp_path),
+                mgr=mgr,
+            )
+        assert rc == 3
+        feedback = sorted((tmp_path / ".devbench" / "pr-bot-feedback").glob("*.json"))
+        assert len(feedback) == 1
+        payload = json.loads(feedback[0].read_text(encoding="utf-8"))
+        assert payload["pr_number"] == 42
+        assert payload["unresolved_reviews"][0]["reviewer"] == "github-copilot[bot]"
+        msg = mgr._append_agent_comment.call_args.args[2]
+        assert msg.startswith("[PR_BOT_FAIL] ")
+
+    def test_returns_1_when_budget_exhausted(self, tmp_path: Path) -> None:
+        ops = MagicMock()
+        ops.poll_pr_review_resolution.return_value = self._resolution(
+            reviews=[{"reviewer": "bot", "state": "CHANGES_REQUESTED", "body": "x"}],
+        )
+        mgr = MagicMock()
+        # Pre-seed MAX-1 PR_BOT_FAIL retries so the next failure exhausts budget.
+        wu = self._wu_file(tmp_path, retries=2)
+        with (
+            patch("devbench.config.PR_REVIEW_RESOLUTION_ENABLED", True),
+            patch("devbench.config.PR_REVIEW_AGENTS", ("bot",)),
+            patch("devbench.config.PR_REVIEW_DECISION_BLOCKS", True),
+            patch("devbench.config.MAX_RETRY_ATTEMPTS", 3),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli._handle_pr_review_resolution(
+                ops=ops,
+                unit_id="E0-F1-S1-T1",
+                canonical_repo="ex/foo",
+                pr_number=42,
+                repo_path=tmp_path,
+                wu_file=wu,
+                mgr=mgr,
+            )
+        assert rc == 1
+        msg = mgr._append_agent_comment.call_args.args[2]
+        assert msg.startswith("[PR_BOT_FAIL_BLOCKED] ")
+
+
+class TestPauseBeforeMerge:
+    """Issue #101: pause-before-merge mode lifecycle."""
+
+    def _wu_file(self, tmp_path: Path) -> Path:
+        wu = tmp_path / "E0-F1-S1-T1.md"
+        wu.write_text(
+            "# E0-F1-S1-T1: t\n\n## Status: in-progress\n\n## Description\n\nx\n\n## Comments\n\n",
+            encoding="utf-8",
+        )
+        return wu
+
+    def test_pause_transitions_to_in_review(self, tmp_path: Path) -> None:
+        wu = self._wu_file(tmp_path)
+        mgr = MagicMock()
+        with patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
+            rc = cli._pause_before_merge(
+                unit_id="E0-F1-S1-T1",
+                pr_number=42,
+                pr_url="https://github.com/ex/foo/pull/42",
+                wu_file=wu,
+                mgr=mgr,
+            )
+        assert rc == 0
+        mgr.force_status.assert_called_once()
+        # 4th positional arg of force_status is the new status
+        args = mgr.force_status.call_args.args
+        assert args[3] == "in-review"
+        msg = mgr._append_agent_comment.call_args.args[2]
+        assert "[PR_AWAITING_MERGE]" in msg
+        assert "PR #42" in msg
+
+    def test_pause_skips_audit_when_no_wu_file(self, tmp_path: Path) -> None:
+        mgr = MagicMock()
+        rc = cli._pause_before_merge(
+            unit_id="E0-F1-S1-T1",
+            pr_number=42,
+            pr_url="https://github.com/ex/foo/pull/42",
+            wu_file=None,
+            mgr=mgr,
+        )
+        assert rc == 0
+        mgr.force_status.assert_not_called()
+        mgr._append_agent_comment.assert_not_called()
+
+
+class TestCmdCheckMerge:
+    """Issue #101: cmd_check_merge reconciles in-review work units."""
+
+    def _make_unit(self, repo: str = "caylent-solutions/devbench") -> WorkUnit:
+        return WorkUnit(
+            id="E0-F1-S1-T1",
+            title="t",
+            status=WorkUnitStatus.IN_REVIEW,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T1.md"),
+            repo=repo,
+            branch="backlog/e0-f1-s1-t1",
+            dependencies=[],
+        )
+
+    def test_returns_0_with_done_when_pr_merged(self, tmp_path: Path) -> None:
+        ops = MagicMock()
+        ops._gh.return_value = (0, json.dumps([{"number": 42, "state": "MERGED", "merged": True, "url": "u"}]), "")
+        mgr = MagicMock()
+        wu_file = tmp_path / "E0-F1-S1-T1.md"
+        wu_file.write_text("stub")
+        with (
+            patch("devbench.cli._resolve_git_ops_context", return_value=(self._make_unit(), "ex/foo", tmp_path)),
+            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
+            patch("devbench.cli.BacklogManager", return_value=mgr),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.github.git_ops.GitOpsService", return_value=ops),
+        ):
+            rc = cli.cmd_check_merge("E0-F1-S1-T1")
+        assert rc == 0
+        mgr.mark_done.assert_called_once()
+
+    def test_returns_0_with_blocked_when_pr_closed(self, tmp_path: Path) -> None:
+        ops = MagicMock()
+        ops._gh.return_value = (0, json.dumps([{"number": 42, "state": "CLOSED", "merged": False, "url": "u"}]), "")
+        mgr = MagicMock()
+        wu_file = tmp_path / "E0-F1-S1-T1.md"
+        wu_file.write_text("stub")
+        with (
+            patch("devbench.cli._resolve_git_ops_context", return_value=(self._make_unit(), "ex/foo", tmp_path)),
+            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
+            patch("devbench.cli.BacklogManager", return_value=mgr),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.github.git_ops.GitOpsService", return_value=ops),
+        ):
+            rc = cli.cmd_check_merge("E0-F1-S1-T1")
+        assert rc == 0
+        mgr.mark_blocked.assert_called_once()
+
+    def test_noop_when_pr_still_open(self, tmp_path: Path) -> None:
+        ops = MagicMock()
+        ops._gh.return_value = (0, json.dumps([{"number": 42, "state": "OPEN", "merged": False, "url": "u"}]), "")
+        mgr = MagicMock()
+        with (
+            patch("devbench.cli._resolve_git_ops_context", return_value=(self._make_unit(), "ex/foo", tmp_path)),
+            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli.BacklogManager", return_value=mgr),
+            patch("devbench.github.git_ops.GitOpsService", return_value=ops),
+        ):
+            rc = cli.cmd_check_merge("E0-F1-S1-T1")
+        assert rc == 0
+        mgr.mark_done.assert_not_called()
+        mgr.mark_blocked.assert_not_called()
+
+    def test_returns_0_with_no_pr_found(self, tmp_path: Path) -> None:
+        ops = MagicMock()
+        ops._gh.return_value = (0, "[]", "")
+        with (
+            patch("devbench.cli._resolve_git_ops_context", return_value=(self._make_unit(), "ex/foo", tmp_path)),
+            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli.BacklogManager", return_value=MagicMock()),
+            patch("devbench.github.git_ops.GitOpsService", return_value=ops),
+        ):
+            rc = cli.cmd_check_merge("E0-F1-S1-T1")
+        assert rc == 0
+
+    def test_returns_1_on_gh_failure(self, tmp_path: Path) -> None:
+        ops = MagicMock()
+        ops._gh.return_value = (1, "", "boom")
+        with (
+            patch("devbench.cli._resolve_git_ops_context", return_value=(self._make_unit(), "ex/foo", tmp_path)),
+            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli.BacklogManager", return_value=MagicMock()),
+            patch("devbench.github.git_ops.GitOpsService", return_value=ops),
+        ):
+            rc = cli.cmd_check_merge("E0-F1-S1-T1")
+        assert rc == 1
+
+    def test_returns_1_on_invalid_json(self, tmp_path: Path) -> None:
+        ops = MagicMock()
+        ops._gh.return_value = (0, "{not json", "")
+        with (
+            patch("devbench.cli._resolve_git_ops_context", return_value=(self._make_unit(), "ex/foo", tmp_path)),
+            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli.BacklogManager", return_value=MagicMock()),
+            patch("devbench.github.git_ops.GitOpsService", return_value=ops),
+        ):
+            rc = cli.cmd_check_merge("E0-F1-S1-T1")
+        assert rc == 1
+
+    def test_returns_1_when_done_gate_refuses(self, tmp_path: Path) -> None:
+        """Done-gate refuses merge promotion when judges did not pass -- rc=1."""
+        ops = MagicMock()
+        ops._gh.return_value = (0, json.dumps([{"number": 42, "state": "MERGED", "merged": True, "url": "u"}]), "")
+        mgr = MagicMock()
+        mgr.mark_done.side_effect = RuntimeError("done-gate failure")
+        wu_file = tmp_path / "E0-F1-S1-T1.md"
+        wu_file.write_text("stub")
+        with (
+            patch("devbench.cli._resolve_git_ops_context", return_value=(self._make_unit(), "ex/foo", tmp_path)),
+            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
+            patch("devbench.cli.BacklogManager", return_value=mgr),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.github.git_ops.GitOpsService", return_value=ops),
+        ):
+            rc = cli.cmd_check_merge("E0-F1-S1-T1")
+        assert rc == 1
+
+
+class TestCheckMergeRegistration:
+    """The check-merge command must be registered in the CLI dispatch table."""
+
+    def test_check_merge_in_commands(self) -> None:
+        assert "check-merge" in cli._COMMANDS
+        handler, argc, _help = cli._COMMANDS["check-merge"]
+        assert handler is cli.cmd_check_merge
+        assert argc == 1
+
+
+# ---------------------------------------------------------------------------
+# Issue #148 / #150 / #152 / #153 / #155 cascade-reliability fixes.
+# Helpers below reuse the lightweight backlog scaffolding pattern from
+# ``TestCmdSyncBlocked`` -- duplicated locally so each test class stays
+# self-contained and a fixture rename never silently breaks one of these.
+# ---------------------------------------------------------------------------
+
+
+def _cascade_build_backlog(
+    tmp_path: Path,
+    rows: list[tuple[str, str, str, str, str, str]],
+) -> Path:
+    """Materialise BACKLOG.md + per-row work-unit files.
+
+    Each row is ``(id, type, status, deps, basename, comments)`` where
+    ``comments`` is appended verbatim to the work-unit Markdown (used to
+    inject ``[BLOCKED_PENDING_PROPOSAL]`` markers + audit lines).
+    """
+    index_lines = [
+        "# Backlog\n",
+        "## Full Work Unit Index\n",
+        "| ID | Title | Type | Status | Dependencies | Repo | File Path |",
+        "|----|-------|------|--------|--------------|------|-----------|",
+    ]
+    wu_dir = tmp_path / "backlog"
+    wu_dir.mkdir(exist_ok=True)
+    for unit_id, unit_type, status, deps, basename, comments in rows:
+        file_path = f"backlog/{basename}.md"
+        index_lines.append(
+            f"| {unit_id} | {unit_id} | {unit_type} | {status} | {deps} | caylent-solutions/test-repo | `{file_path}` |"
+        )
+        wu_body = f"# {unit_id}: Test\n\n## Status: {status}\n\n## Description\n\nx\n"
+        if deps and deps != "None":
+            dep_rows = "\n".join(f"| {d.strip()} | Task | dep |" for d in deps.split(","))
+            wu_body += f"\n## Dependencies\n\n| ID | Type | Reason |\n|----|------|--------|\n{dep_rows}\n"
+        if comments:
+            wu_body += f"\n{comments}"
+        (wu_dir / f"{basename}.md").write_text(wu_body)
+    index_path = tmp_path / "BACKLOG.md"
+    index_path.write_text("\n".join(index_lines) + "\n")
+    return index_path
+
+
+class TestSyncBlockedEvaluatesMarkerTargetState:
+    """Issue #148: ``cmd_sync_blocked`` checks each ``[BLOCKED_PENDING_PROPOSAL]``
+    marker's target status. Stale markers (target already terminal) no longer
+    block the re-queue; only at-least-one non-terminal target keeps the task
+    pinned.
+    """
+
+    def test_marker_target_terminal_allows_requeue(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # T2 carries a marker pointing at T9 which is already done;
+        # sync-blocked must NOT skip on the marker any more.
+        marker_comments = "## Comments\n\n[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T9\n"
+        index = _cascade_build_backlog(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Task", "done", "None", "E0-F1-S1-T1", ""),
+                ("E0-F1-S1-T9", "Task", "done", "None", "E0-F1-S1-T9", ""),
+                ("E0-F1-S1-T2", "Task", "blocked", "E0-F1-S1-T1", "E0-F1-S1-T2", marker_comments),
+            ],
+        )
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_sync_blocked()
+        assert rc == 0
+        envelope = json.loads(capsys.readouterr().out.strip())
+        assert "E0-F1-S1-T2" in envelope["flipped_to_in_queue"]
+        t2 = (tmp_path / "backlog" / "E0-F1-S1-T2.md").read_text()
+        assert "## Status: in-queue" in t2
+        assert "[UNBLOCKED] deps satisfied" in t2
+
+    def test_marker_target_open_skips_requeue(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        marker_comments = "## Comments\n\n[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T9\n"
+        index = _cascade_build_backlog(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Task", "done", "None", "E0-F1-S1-T1", ""),
+                ("E0-F1-S1-T9", "Task", "in-queue", "None", "E0-F1-S1-T9", ""),
+                ("E0-F1-S1-T2", "Task", "blocked", "E0-F1-S1-T1", "E0-F1-S1-T2", marker_comments),
+            ],
+        )
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_sync_blocked()
+        assert rc == 0
+        envelope = json.loads(capsys.readouterr().out.strip())
+        assert "E0-F1-S1-T2" not in envelope["flipped_to_in_queue"]
+        assert "## Status: blocked" in (tmp_path / "backlog" / "E0-F1-S1-T2.md").read_text()
+
+    def test_marker_unknown_id_keeps_task_blocked(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Unknown marker target IDs must remain conservative (treat as open)."""
+        marker_comments = "## Comments\n\n[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T999\n"
+        index = _cascade_build_backlog(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Task", "done", "None", "E0-F1-S1-T1", ""),
+                ("E0-F1-S1-T2", "Task", "blocked", "E0-F1-S1-T1", "E0-F1-S1-T2", marker_comments),
+            ],
+        )
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_sync_blocked()
+        assert rc == 0
+        envelope = json.loads(capsys.readouterr().out.strip())
+        assert "E0-F1-S1-T2" not in envelope["flipped_to_in_queue"]
+
+
+class TestCmdReconcileCascade:
+    """Issue #150: ``devbench reconcile-cascade`` walks every blocked task,
+    flips the eligible ones (markers all terminal AND deps satisfied), and
+    emits ``[CASCADE_RECONCILED]`` audits + a JSON envelope of flips/skips.
+    """
+
+    def test_eligible_task_is_flipped(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        marker = "## Comments\n\n[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T9\n"
+        index = _cascade_build_backlog(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Task", "done", "None", "E0-F1-S1-T1", ""),
+                ("E0-F1-S1-T9", "Task", "done", "None", "E0-F1-S1-T9", ""),
+                ("E0-F1-S1-T2", "Task", "blocked", "E0-F1-S1-T1", "E0-F1-S1-T2", marker),
+            ],
+        )
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_reconcile_cascade()
+        assert rc == 0
+        envelope = json.loads(capsys.readouterr().out.strip())
+        flipped_ids = [item["unit_id"] for item in envelope["flipped"]]
+        assert "E0-F1-S1-T2" in flipped_ids
+        t2 = (tmp_path / "backlog" / "E0-F1-S1-T2.md").read_text()
+        assert "## Status: in-queue" in t2
+        assert "[CASCADE_RECONCILED]" in t2
+
+    def test_open_marker_keeps_task_blocked(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        marker = "## Comments\n\n[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T9\n"
+        index = _cascade_build_backlog(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T9", "Task", "in-progress", "None", "E0-F1-S1-T9", ""),
+                ("E0-F1-S1-T2", "Task", "blocked", "None", "E0-F1-S1-T2", marker),
+            ],
+        )
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_reconcile_cascade()
+        assert rc == 0
+        envelope = json.loads(capsys.readouterr().out.strip())
+        assert envelope["flipped"] == []
+        skips = [item["unit_id"] for item in envelope["skipped"]]
+        assert "E0-F1-S1-T2" in skips
+
+    def test_unsatisfied_regular_dep_keeps_task_blocked(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        index = _cascade_build_backlog(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Task", "in-progress", "None", "E0-F1-S1-T1", ""),
+                ("E0-F1-S1-T2", "Task", "blocked", "E0-F1-S1-T1", "E0-F1-S1-T2", ""),
+            ],
+        )
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_reconcile_cascade()
+        assert rc == 0
+        envelope = json.loads(capsys.readouterr().out.strip())
+        skip_reasons = {item["unit_id"]: item["reason"] for item in envelope["skipped"]}
+        assert "E0-F1-S1-T2" in skip_reasons
+        assert "regular dep" in skip_reasons["E0-F1-S1-T2"]
+
+    def test_registered_in_commands(self) -> None:
+        assert "reconcile-cascade" in cli._COMMANDS
+        handler, argc, _help = cli._COMMANDS["reconcile-cascade"]
+        assert handler is cli.cmd_reconcile_cascade
+        assert argc == 0
+
+
+class TestVariadicCommandsCoverage:
+    """Issue #152: every command whose body parses a ``--<flag> <value>`` pair
+    must be registered in ``_VARIADIC_COMMANDS``. Auto-discover via the
+    registry so adding a new flag-bearing command without registering it
+    fails this test.
+    """
+
+    # Flag tokens that ALWAYS take a value (not boolean toggles). A command's
+    # body that contains ``arg == "--reason"`` (and similar) MUST opt into
+    # variadic dispatch -- the fixed-arity slice would otherwise drop the
+    # value when it follows positional args.
+    FLAG_TOKENS_NEEDING_VARIADIC: ClassVar[tuple[str, ...]] = (
+        '"--reason"',
+        '"--reasoning"',
+        '"--message"',
+    )
+
+    def test_every_flag_with_value_command_is_variadic(self) -> None:
+        import inspect
+
+        offenders: list[str] = []
+        for name, (handler, _argc, _desc) in cli._COMMANDS.items():
+            try:
+                source = inspect.getsource(handler)
+            except (OSError, TypeError):
+                continue
+            if not any(token in source for token in self.FLAG_TOKENS_NEEDING_VARIADIC):
+                continue
+            if name in cli._VARIADIC_COMMANDS:
+                continue
+            offenders.append(name)
+        assert not offenders, (
+            "These commands consume a flag-with-value pair but are NOT registered in "
+            f"_VARIADIC_COMMANDS: {offenders}. The fixed-arity dispatcher slice will "
+            "drop the value, causing silent failures."
+        )
+
+    def test_variadic_set_is_subset_of_commands(self) -> None:
+        """Sanity: every variadic name must reference a real command."""
+        unknown = cli._VARIADIC_COMMANDS - cli._COMMANDS.keys()
+        assert not unknown, f"unknown variadic entries: {unknown}"
+
+
+class TestStatusPanelFiltersStaleBlockedAudits:
+    """Issue #153: ``status --detail`` panel renderer hides ``[BLOCKED]``
+    audit rows that have been superseded by a later ``[UNBLOCKED]`` /
+    ``[CASCADE_RESOLVED]`` line. The audit history in the file is
+    append-only; only the rendered panel filters.
+    """
+
+    def test_unblocked_supersedes_blocked(self) -> None:
+        content = (
+            "## Comments\n\n"
+            "[2026-04-01 10:00 UTC] [agent/x] [BLOCKED] dep T9 not yet terminal\n"
+            "[2026-04-01 11:00 UTC] [agent/x] [UNBLOCKED] deps satisfied\n"
+        )
+        assert cli._unsuperseded_blocked_audits(content) == []
+
+    def test_cascade_resolved_supersedes_blocked(self) -> None:
+        content = (
+            "## Comments\n\n"
+            "[2026-04-01 10:00 UTC] [agent/x] [BLOCKED] waiting on cascade\n"
+            "[2026-04-01 11:00 UTC] [agent/x] [CASCADE_RESOLVED] markers terminal\n"
+        )
+        assert cli._unsuperseded_blocked_audits(content) == []
+
+    def test_blocked_without_supersession_is_kept(self) -> None:
+        content = "## Comments\n\n[2026-04-01 10:00 UTC] [agent/x] [BLOCKED] dep T9 not yet terminal\n"
+        kept = cli._unsuperseded_blocked_audits(content)
+        assert len(kept) == 1
+        assert "[BLOCKED]" in kept[0]
+
+    def test_blocked_pending_proposal_marker_not_treated_as_blocked_audit(self) -> None:
+        """The cascade marker line must not be confused with a plain ``[BLOCKED]`` audit."""
+        content = "## Comments\n\n[2026-04-01 10:00 UTC] [agent/task_factory] [BLOCKED_PENDING_PROPOSAL] T9\n"
+        assert cli._unsuperseded_blocked_audits(content) == []
+
+
+class TestCmdSweepProposalsAutoPromotesPreExisting:
+    """Issue #155: ``cmd_sweep_proposals`` also picks up pre-existing
+    ``proposed`` drafts whose proposal JSON has already been deleted.
+    """
+
+    def test_orphan_proposed_draft_is_auto_promoted(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from devbench.config_loader import RuntimeConfig, TaskFactoryConfig
+
+        # No proposal JSON on disk; the orphan-promote pass should still
+        # surface the proposed draft and flip it to in-queue.
+        index = _cascade_build_backlog(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Task", "in-queue", "None", "E0-F1-S1-T1", ""),
+                ("E0-F1-S1-T2", "Task", "proposed", "None", "E0-F1-S1-T2", ""),
+            ],
+        )
+        # The promoter resolves the draft via _find_draft_file which expects
+        # the layout backlog/E0/E0-F1/E0-F1-S1/<id>.md. Replicate that here
+        # so the auto-promote actually finds the draft.
+        story_dir = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+        (story_dir / "E0-F1-S1-T2.md").write_text("# E0-F1-S1-T2: Test\n\n## Status: proposed\n\n## Description\n\nx\n")
+        # Re-point the BACKLOG.md row to the nested location.
+        idx_text = index.read_text()
+        index.write_text(
+            idx_text.replace(
+                "`backlog/E0-F1-S1-T2.md`",
+                "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T2.md`",
+            )
+        )
+
+        runtime_with_auto_accept = RuntimeConfig(task_factory=TaskFactoryConfig(auto_accept_proposals=True))
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.RUNTIME_CONFIG", runtime_with_auto_accept),
+        ):
+            rc = cli.cmd_sweep_proposals()
+        assert rc == 0
+        # No proposal JSON existed -> the materialise loop is a no-op, so
+        # only the orphan promote pass touches T2.
+        out = capsys.readouterr().out
+        assert "orphan auto-promoted 1" in out
+        # T2 transitioned to in-queue via promote_proposal.
+        t2_md = (story_dir / "E0-F1-S1-T2.md").read_text()
+        assert "## Status: in-queue" in t2_md
+
+    def test_orphan_promote_skipped_when_toggle_off(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from devbench.config_loader import RuntimeConfig, TaskFactoryConfig
+
+        index = _cascade_build_backlog(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Task", "in-queue", "None", "E0-F1-S1-T1", ""),
+                ("E0-F1-S1-T2", "Task", "proposed", "None", "E0-F1-S1-T2", ""),
+            ],
+        )
+        story_dir = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+        (story_dir / "E0-F1-S1-T2.md").write_text("# E0-F1-S1-T2: Test\n\n## Status: proposed\n\n## Description\n\nx\n")
+        idx_text = index.read_text()
+        index.write_text(
+            idx_text.replace(
+                "`backlog/E0-F1-S1-T2.md`",
+                "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T2.md`",
+            )
+        )
+        runtime_no_auto = RuntimeConfig(task_factory=TaskFactoryConfig(auto_accept_proposals=False))
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.RUNTIME_CONFIG", runtime_no_auto),
+        ):
+            rc = cli.cmd_sweep_proposals()
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "orphan auto-promoted" not in out
+        assert "## Status: proposed" in (story_dir / "E0-F1-S1-T2.md").read_text()
+
+
+# ---------------------------------------------------------------------------
+# Issue #156: cmd_log_rejection_feedback schema + injection + done-gate
+# ---------------------------------------------------------------------------
+
+
+class TestCmdLogRejectionFeedbackSchema:
+    """Issue #156: schema validation + persistence happy path."""
+
+    def _payload(self, code: str = "HARDCODED_URL") -> dict[str, object]:
+        return {
+            "categories": [
+                {
+                    "code": code,
+                    "severity": "fail",
+                    "summary": "Hardcoded URL",
+                    "remediation": "Read from env var",
+                    "files": ["src/devbench/cli.py"],
+                }
+            ],
+            "raw_verdict_text": "Found hardcoded URL in cli.py:42",
+        }
+
+    def test_valid_payload_persists(self, tmp_path: Path) -> None:
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_log_rejection_feedback("code_review", "E0-F1-S1-T1", "--json", json.dumps(self._payload()))
+        assert rc == 0
+        archive_dir = tmp_path / ".devbench" / "review-failures"
+        files = list(archive_dir.glob("E0-F1-S1-T1-code_review-*.json"))
+        assert len(files) == 1
+        data = json.loads(files[0].read_text(encoding="utf-8"))
+        assert data["schema_version"] == 1
+        assert data["judge"] == "code_review"
+        assert data["task_id"] == "E0-F1-S1-T1"
+        assert data["attempt"] == 1
+        assert data["categories"][0]["code"] == "HARDCODED_URL"
+        assert data["capped"] is False
+
+    def test_attempt_increments_on_repeat(self, tmp_path: Path) -> None:
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            cli.cmd_log_rejection_feedback("code_review", "E0-F1-S1-T1", "--json", json.dumps(self._payload()))
+            rc = cli.cmd_log_rejection_feedback(
+                "code_review",
+                "E0-F1-S1-T1",
+                "--json",
+                json.dumps(self._payload(code="SCOPE_VIOLATION")),
+            )
+        assert rc == 0
+        files = sorted((tmp_path / ".devbench" / "review-failures").glob("*.json"))
+        assert len(files) == 2
+        attempts = sorted(json.loads(p.read_text())["attempt"] for p in files)
+        assert attempts == [1, 2]
+
+    def test_bad_json_rejected(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_log_rejection_feedback("code_review", "E0-F1-S1-T1", "--json", "not-json")
+        assert rc == 1
+        assert "not valid JSON" in capsys.readouterr().err
+
+    def test_bad_category_code_rejected(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        bad = self._payload(code="NOT_A_REAL_CODE")
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_log_rejection_feedback("code_review", "E0-F1-S1-T1", "--json", json.dumps(bad))
+        assert rc == 1
+        assert "vocabulary" in capsys.readouterr().err
+
+    def test_unknown_judge_rejected(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_log_rejection_feedback(
+                "totally_unknown",
+                "E0-F1-S1-T1",
+                "--json",
+                json.dumps(self._payload()),
+            )
+        assert rc == 1
+        assert "unknown judge" in capsys.readouterr().err
+
+    def test_missing_required_field_rejected(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_log_rejection_feedback(
+                "code_review",
+                "E0-F1-S1-T1",
+                "--json",
+                json.dumps({"raw_verdict_text": "x"}),
+            )
+        assert rc == 1
+        assert "missing required field" in capsys.readouterr().err
+
+    def test_bad_argv_rejected(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_log_rejection_feedback("code_review")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "log-rejection-feedback" in err
+
+    def test_unknown_flag_rejected(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_log_rejection_feedback("code_review", "E0", "--bogus", "value")
+        assert rc == 1
+        assert "unknown flag" in capsys.readouterr().err
+
+    def test_severity_must_be_fail_or_warn(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        bad = {
+            "categories": [
+                {
+                    "code": "HARDCODED_URL",
+                    "severity": "info",
+                    "summary": "x",
+                    "remediation": "y",
+                    "files": [],
+                }
+            ],
+            "raw_verdict_text": "x",
+        }
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_log_rejection_feedback("code_review", "E0", "--json", json.dumps(bad))
+        assert rc == 1
+        assert "severity" in capsys.readouterr().err
+
+    def test_capped_when_exceeds_max_retry_attempts(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr("devbench.config.MAX_RETRY_ATTEMPTS", 1)
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            cli.cmd_log_rejection_feedback("code_review", "E0-F1-S1-T1", "--json", json.dumps(self._payload()))
+            cli.cmd_log_rejection_feedback("code_review", "E0-F1-S1-T1", "--json", json.dumps(self._payload()))
+        files = sorted((tmp_path / ".devbench" / "review-failures").glob("*.json"))
+        cap_flags = [json.loads(p.read_text())["capped"] for p in files]
+        assert cap_flags == [False, True]
+
+
+class TestRejectionFeedbackInjection:
+    """Issue #156: ``_collect_review_judge_feedback`` ordering + cap."""
+
+    def _seed(self, workspace: Path, judge: str, task_id: str, attempt: int, code: str) -> None:
+        archive_dir = workspace / ".devbench" / "review-failures"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        path = archive_dir / f"{task_id}-{judge}-{attempt}.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "task_id": task_id,
+                    "judge": judge,
+                    "attempt": attempt,
+                    "rejected_at": "2026-05-02T00:00:00Z",
+                    "categories": [
+                        {
+                            "code": code,
+                            "severity": "fail",
+                            "summary": "x",
+                            "remediation": "y",
+                            "files": [],
+                        }
+                    ],
+                    "raw_verdict_text": "x",
+                    "capped": False,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    def test_orders_by_severity_then_attempt(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Cap above the seed count so nothing is truncated.
+        monkeypatch.setattr("devbench.config.MAX_RETRY_ATTEMPTS", 10)
+        task_id = "E0-F1-S1-T1"
+        # Seed three rejections across two judges, lower-severity first.
+        self._seed(tmp_path, "doc_review", task_id, 1, "README_SYNC")
+        self._seed(tmp_path, "code_review", task_id, 1, "HARDCODED_URL")
+        self._seed(tmp_path, "code_review", task_id, 2, "SCOPE_VIOLATION")
+
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            payloads = cli._collect_review_judge_feedback(task_id)
+
+        # security>code>test>changes_manifest>doc; within judge, higher attempt first.
+        order = [(p["judge"], p["attempt"]) for p in payloads]
+        assert order == [
+            ("code_review", 2),
+            ("code_review", 1),
+            ("doc_review", 1),
+        ]
+
+    def test_cap_truncates_to_max_retry_attempts(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr("devbench.config.MAX_RETRY_ATTEMPTS", 2)
+        task_id = "E0-F1-S1-T1"
+        self._seed(tmp_path, "code_review", task_id, 1, "HARDCODED_URL")
+        self._seed(tmp_path, "code_review", task_id, 2, "SCOPE_VIOLATION")
+        self._seed(tmp_path, "doc_review", task_id, 1, "README_SYNC")
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            payloads = cli._collect_review_judge_feedback(task_id)
+        assert len(payloads) == 2
+        # Highest-severity / latest-attempt entries survive the cap.
+        assert all(p["judge"] == "code_review" for p in payloads)
+
+    def test_legacy_amender_rejections_synthesized(self, tmp_path: Path) -> None:
+        """Legacy ``amender-rejections/`` entries get a v1-shaped record."""
+        archive_dir = tmp_path / ".devbench" / "amender-rejections"
+        archive_dir.mkdir(parents=True)
+        (archive_dir / "E0-F1-S1-T1-1.json").write_text(
+            json.dumps(
+                {
+                    "task_id": "E0-F1-S1-T1",
+                    "attempt": 1,
+                    "reason_category": "SCOPE",
+                    "reason_text": "old reason",
+                    "request": {},
+                    "capped": False,
+                    "recorded_at": "2026-04-30T00:00:00Z",
+                }
+            ),
+            encoding="utf-8",
+        )
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            payloads = cli._collect_review_judge_feedback("E0-F1-S1-T1")
+        assert len(payloads) == 1
+        assert payloads[0]["judge"] == "manifest_amender"
+        assert payloads[0]["categories"][0]["code"] == "SCOPE"
+
+    def test_skips_unparseable_files(self, tmp_path: Path) -> None:
+        archive_dir = tmp_path / ".devbench" / "review-failures"
+        archive_dir.mkdir(parents=True)
+        (archive_dir / "E0-F1-S1-T1-code_review-1.json").write_text("not json", encoding="utf-8")
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            payloads = cli._collect_review_judge_feedback("E0-F1-S1-T1")
+        assert payloads == []
+
+    def test_skips_non_dict_payload(self, tmp_path: Path) -> None:
+        archive_dir = tmp_path / ".devbench" / "review-failures"
+        archive_dir.mkdir(parents=True)
+        (archive_dir / "E0-F1-S1-T1-code_review-1.json").write_text("[]", encoding="utf-8")
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            payloads = cli._collect_review_judge_feedback("E0-F1-S1-T1")
+        assert payloads == []
+
+
+class TestDoneGateRejectionFeedbackEnforcement:
+    """Issue #156: done-gate refuses transition when rejection unresolved."""
+
+    def _seed_rejection(self, workspace: Path, task_id: str) -> None:
+        archive = workspace / ".devbench" / "review-failures"
+        archive.mkdir(parents=True, exist_ok=True)
+        (archive / f"{task_id}-code_review-1.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "task_id": task_id,
+                    "judge": "code_review",
+                    "attempt": 1,
+                    "rejected_at": "2026-05-02T00:00:00Z",
+                    "categories": [
+                        {
+                            "code": "HARDCODED_URL",
+                            "severity": "fail",
+                            "summary": "x",
+                            "remediation": "y",
+                            "files": [],
+                        }
+                    ],
+                    "raw_verdict_text": "x",
+                    "capped": False,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def test_blocks_when_unresolved(
+        self,
+        tmp_path: Path,
+        backlog_dir: Path,
+        mock_units: list[WorkUnit],
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        wu_file = backlog_dir / "E0-F1-S1-T2.md"
+        wu_file.write_text("# Task\n## Status: in-review\n\n## Comments\n", encoding="utf-8")
+        self._seed_rejection(tmp_path, "E0-F1-S1-T2")
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_mark_done("E0-F1-S1-T2")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "REJECTION_FEEDBACK_OUTSTANDING" in wu_file.read_text() or "unresolved" in err
+        assert "code_review:HARDCODED_URL" in err
+
+    def test_allows_when_resolved_marker_present(
+        self,
+        tmp_path: Path,
+        backlog_dir: Path,
+        mock_units: list[WorkUnit],
+    ) -> None:
+        wu_file = backlog_dir / "E0-F1-S1-T2.md"
+        wu_file.write_text(
+            "# Task\n## Status: in-review\n\n## Comments\n"
+            "[2026-05-02 12:00 UTC] [agent/orchestrator] [REJECTION_FEEDBACK_RESOLVED] code_review:HARDCODED_URL\n",
+            encoding="utf-8",
+        )
+        self._seed_rejection(tmp_path, "E0-F1-S1-T2")
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+        mock_mgr = MagicMock()
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_mark_done("E0-F1-S1-T2")
+        assert rc == 0
+        mock_mgr.mark_done.assert_called_once()
+
+    def test_allows_when_needs_dep_marker_present(
+        self,
+        tmp_path: Path,
+        backlog_dir: Path,
+        mock_units: list[WorkUnit],
+    ) -> None:
+        wu_file = backlog_dir / "E0-F1-S1-T2.md"
+        wu_file.write_text(
+            "# Task\n## Status: in-review\n\n## Comments\n"
+            "[2026-05-02 12:00 UTC] [agent/executor] [NEEDS_DEP] code_review:HARDCODED_URL\n",
+            encoding="utf-8",
+        )
+        self._seed_rejection(tmp_path, "E0-F1-S1-T2")
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+        mock_mgr = MagicMock()
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_mark_done("E0-F1-S1-T2")
+        assert rc == 0
+        mock_mgr.mark_done.assert_called_once()
+
+
+class TestStatusPanelRejectionCategoryCounts:
+    """Issue #156: --detail blocked panel shows pending categories per task."""
+
+    def test_panel_shown_when_blocked_with_unresolved_categories(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        wu = backlog_dir / "E0-F1-S1-T1.md"
+        wu.write_text(
+            "# E0-F1-S1-T1: T1\n\n## Status: blocked\n\n"
+            "## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-FUNC-001 x\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `f.py` | New |\n\n"
+            "## Definition of Done\n\n- [ ] x\n\n## Comments\n",
+            encoding="utf-8",
+        )
+        index = tmp_path / "BACKLOG.md"
+        index.write_text(
+            "# Backlog\n\n"
+            "## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
+            "|------|-------|------|-------------|----------|---------|\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | T1 | Task | blocked | none | org/repo | `backlog/E0-F1-S1-T1.md` |\n",
+            encoding="utf-8",
+        )
+        archive = tmp_path / ".devbench" / "review-failures"
+        archive.mkdir(parents=True)
+        (archive / "E0-F1-S1-T1-code_review-1.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "task_id": "E0-F1-S1-T1",
+                    "judge": "code_review",
+                    "attempt": 1,
+                    "rejected_at": "2026-05-02T00:00:00Z",
+                    "categories": [
+                        {
+                            "code": "HARDCODED_URL",
+                            "severity": "fail",
+                            "summary": "x",
+                            "remediation": "y",
+                            "files": [],
+                        }
+                    ],
+                    "raw_verdict_text": "x",
+                    "capped": False,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.BACKLOG_INDEX", index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_status("--detail")
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "Review-judge rejections (unresolved categories):" in out
+        assert "code_review:HARDCODED_URL" in out
+
+    def test_panel_omitted_when_no_unresolved(self, capsys: pytest.CaptureFixture[str]) -> None:
+        cli._print_blocked_rejection_categories([])
+        assert capsys.readouterr().out == ""
+
+
+class TestInProgressAttemptDurationRender:
+    """Issue #158: cmd_status renders ``(in-progress for ...)`` suffix."""
+
+    def test_status_renders_duration_when_log_has_transition(
+        self,
+        tmp_path: Path,
+        backlog_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        log_path = tmp_path / "orchestrator.log"
+        log_path.write_text(
+            "2026-05-02T12:00:00Z [devbench.cli] INFO Set E0-F1-S1-T2 to 'in-progress'\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("JUDGE_LOG_FILE", str(log_path))
+        # Freeze time so the duration output is deterministic.
+        fake_now = datetime(2026, 5, 2, 12, 23, 0, tzinfo=UTC)
+
+        class _FrozenDT(datetime):
+            @classmethod
+            def now(cls, tz: object = None) -> _FrozenDT:
+                return _FrozenDT.fromtimestamp(fake_now.timestamp(), tz=UTC)  # type: ignore[arg-type]
+
+        monkeypatch.setattr("devbench.cli.datetime", _FrozenDT)
+
+        in_prog_unit = WorkUnit(
+            id="E0-F1-S1-T2",
+            title="Active",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T2.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [in_prog_unit]
+        mock_parser.get_parallel_candidates.return_value = []
+        mock_parser.all_done.return_value = False
+        mock_parser.get_blocked_units.return_value = []
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            rc = cli.cmd_status()
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "(in-progress for 23m)" in out
+
+
+class TestInProgressAttemptDurationFallback:
+    """Issue #158: when neither log nor audit yields a parseable timestamp,
+    the helper returns ``None`` and the renderer prints the
+    ``timer unavailable`` placeholder."""
+
+    def test_returns_none_with_no_signals(self, tmp_path: Path) -> None:
+        # Force log_path to a non-existent file AND ensure backlog parse fails fast.
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+        ):
+            result = cli._in_progress_attempt_duration("E0-F1-S1-T2", log_path=tmp_path / "missing.log")
+        assert result is None
+
+    def test_falls_back_to_audit_when_log_missing(
+        self,
+        tmp_path: Path,
+        backlog_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Stub _resolve_unit_file_by_id directly so we don't have to materialise a
+        # full backlog -- the fallback path is the only behaviour under test here.
+        wu = backlog_dir / "E0-F1-S1-T2.md"
+        wu.write_text(
+            "## Comments\n[2026-05-02 11:30 UTC] [agent/orchestrator] Set E0-F1-S1-T2 to 'in-progress'\n",
+            encoding="utf-8",
+        )
+        fake_now = datetime(2026, 5, 2, 12, 0, 0, tzinfo=UTC)
+
+        class _FrozenDT(datetime):
+            @classmethod
+            def now(cls, tz: object = None) -> _FrozenDT:
+                return _FrozenDT.fromtimestamp(fake_now.timestamp(), tz=UTC)  # type: ignore[arg-type]
+
+        monkeypatch.setattr("devbench.cli.datetime", _FrozenDT)
+        with patch("devbench.cli._resolve_unit_file_by_id", return_value=wu):
+            result = cli._in_progress_attempt_duration("E0-F1-S1-T2", log_path=tmp_path / "missing.log")
+        assert result == "30m"
+
+
+class TestInProgressAttemptDurationLatestAttemptOnly:
+    """Issue #158: multiple in-progress transitions resolve to the most recent one."""
+
+    def test_picks_most_recent_log_transition(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        log_path = tmp_path / "orchestrator.log"
+        log_path.write_text(
+            "2026-05-02T08:00:00Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'in-progress'\n"
+            "2026-05-02T09:00:00Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'blocked'\n"
+            "2026-05-02T11:30:00Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'in-progress'\n",
+            encoding="utf-8",
+        )
+        fake_now = datetime(2026, 5, 2, 12, 0, 0, tzinfo=UTC)
+
+        class _FrozenDT(datetime):
+            @classmethod
+            def now(cls, tz: object = None) -> _FrozenDT:
+                return _FrozenDT.fromtimestamp(fake_now.timestamp(), tz=UTC)  # type: ignore[arg-type]
+
+        monkeypatch.setattr("devbench.cli.datetime", _FrozenDT)
+        result = cli._in_progress_attempt_duration("E0-F1-S1-T1", log_path=log_path)
+        # 4h vs 30m vs 4h+30m: most recent wins -> 30m.
+        assert result == "30m"
+
+    def test_format_duration_thresholds(self) -> None:
+        assert cli._format_duration(0) == "0s"
+        assert cli._format_duration(-5) == "0s"
+        assert cli._format_duration(42) == "42s"
+        assert cli._format_duration(60) == "1m"
+        assert cli._format_duration(23 * 60) == "23m"
+        assert cli._format_duration(60 * 60 + 47 * 60) == "1h 47m"
+        assert cli._format_duration(2 * 86400 + 3 * 3600) == "2d 3h"
+
+    def test_log_with_invalid_timestamp_skipped(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        log_path = tmp_path / "orchestrator.log"
+        log_path.write_text(
+            "9999-99-99T99:99:99Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'in-progress'\n",
+            encoding="utf-8",
+        )
+        result = cli._in_progress_attempt_duration("E0-F1-S1-T1", log_path=log_path)
+        # Only the bogus timestamp -> nothing parses -> None.
+        assert result is None
+
+    def test_audit_with_invalid_timestamp_skipped(
+        self,
+        tmp_path: Path,
+        backlog_dir: Path,
+    ) -> None:
+        wu = backlog_dir / "E0-F1-S1-T1.md"
+        wu.write_text(
+            "## Comments\n[9999-99-99 99:99 UTC] [agent/orchestrator] Set E0-F1-S1-T1 to 'in-progress'\n",
+            encoding="utf-8",
+        )
+        with patch("devbench.cli._resolve_unit_file_by_id", return_value=wu):
+            result = cli._in_progress_attempt_duration("E0-F1-S1-T1", log_path=tmp_path / "missing.log")
+        assert result is None
+
+
+class TestCmdWriteSnapshot:
+    """Issue #162 Phase 6 (ADR-20): write a fresh report snapshot."""
+
+    def test_writes_snapshot_to_canonical_path(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        log = tmp_path / "logs" / "orchestrator.log"
+        log.parent.mkdir(parents=True)
+        log.write_text("seed\n")
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._resolve_log_file_path", return_value=log),
+            patch("devbench.reporting.report.generate_report", return_value="REPORT"),
+        ):
+            rc = cli.cmd_write_snapshot()
+
+        assert rc == 0
+        snapshot_file = tmp_path / ".devbench" / "report-snapshot.json"
+        assert snapshot_file.is_file()
+        payload = json.loads(snapshot_file.read_text())
+        assert payload["report_text"] == "REPORT"
+
+    def test_rejects_extra_args(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_write_snapshot("unexpected")
+        assert rc == 1
+        assert "no arguments" in capsys.readouterr().err
+
+
+class TestCmdRebuildWindowStats:
+    """Issue #162 Phase 2 (ADR-17): rebuild per-task aggregates from log."""
+
+    def test_rebuilds_aggregates(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        log = tmp_path / "logs" / "orchestrator.log"
+        log.parent.mkdir(parents=True)
+        log.write_text(
+            "2026-05-04T10:00:00Z [agent] INFO Set E0-F1-S1-T1 to 'in-progress' in both files\n"
+            "2026-05-04T11:00:00Z [agent] INFO Set E0-F1-S1-T1 to 'done' in both files\n"
+        )
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._resolve_log_file_path", return_value=log),
+        ):
+            rc = cli.cmd_rebuild_window_stats()
+
+        assert rc == 0
+        agg = tmp_path / ".devbench" / "window-stats" / "E0-F1-S1-T1.json"
+        assert agg.is_file()
+        out = capsys.readouterr().out
+        assert "wrote 1 per-task aggregate" in out
+
+    def test_rejects_extra_args(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_rebuild_window_stats("oops")
+        assert rc == 1
+        assert "no arguments" in capsys.readouterr().err
+
+
+class TestCmdArchiveSession:
+    """Issue #162 Phase 7 (ADR-21): archive a session to Parquet."""
+
+    def test_writes_archive(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        log = tmp_path / "logs" / "orchestrator.log"
+        log.parent.mkdir(parents=True)
+        log.write_text('{"event": "x"}\n')
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._resolve_log_file_path", return_value=log),
+        ):
+            rc = cli.cmd_archive_session("session-abc")
+
+        assert rc == 0
+        archive = tmp_path / "logs" / "legacy" / "session-abc.parquet"
+        assert archive.is_file()
+        assert "session-abc" in capsys.readouterr().out
+
+    def test_requires_session_id(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_archive_session()
+        assert rc == 1
+        assert "exactly one positional" in capsys.readouterr().err
+
+    def test_rejects_extra_positional(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_archive_session("a", "b")
+        assert rc == 1
+        assert "exactly one positional" in capsys.readouterr().err
+
+    def test_log_path_override(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        custom_log = tmp_path / "custom" / "log"
+        custom_log.parent.mkdir(parents=True)
+        custom_log.write_text('{"event": "y"}\n')
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._resolve_log_file_path", return_value=tmp_path / "default.log"),
+        ):
+            rc = cli.cmd_archive_session("s1", "--log-path", str(custom_log))
+
+        assert rc == 0
+        assert (tmp_path / "logs" / "legacy" / "s1.parquet").is_file()
+
+    def test_rejects_log_path_without_value(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_archive_session("session-id", "--log-path")
+        assert rc == 1
+        assert "--log-path requires a value" in capsys.readouterr().err
+
+    def test_propagates_archive_dependency_missing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        log = tmp_path / "log"
+        log.write_text('{"event": "x"}\n')
+
+        from devbench.reporting.archive import ArchiveDependencyMissingError
+
+        def _raise(*args: object, **kwargs: object) -> object:
+            raise ArchiveDependencyMissingError("archive operations")
+
+        monkeypatch.setattr("devbench.cli.WORKSPACE_ROOT", tmp_path)
+        monkeypatch.setattr("devbench.cli._resolve_log_file_path", lambda: log)
+        monkeypatch.setattr("devbench.reporting.archive.archive_session", _raise)
+
+        rc = cli.cmd_archive_session("s1")
+        assert rc == 1
+        assert "pip install devbench[archive]" in capsys.readouterr().err
+
+    def test_propagates_file_not_found(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._resolve_log_file_path", return_value=tmp_path / "nope.log"),
+        ):
+            rc = cli.cmd_archive_session("s1")
+        assert rc == 1
+        assert "not found" in capsys.readouterr().err
+
+
+class TestCmdMigrateLogShards:
+    """Issue #162 Phase 3 (ADR-18): destructive sharded-log migration."""
+
+    def test_refuses_without_flag(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        log = tmp_path / "logs" / "orchestrator.log"
+        log.parent.mkdir(parents=True)
+        log.write_text("2026-05-04T10:00:00Z [agent] INFO Set E0-F1-S1-T1 to 'done' in both files\n")
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._resolve_log_file_path", return_value=log),
+        ):
+            rc = cli.cmd_migrate_log_shards()
+        assert rc == 0
+        assert log.is_file()  # source untouched
+        assert "refusing to run" in capsys.readouterr().out
+
+    def test_runs_with_flag(self, tmp_path: Path) -> None:
+        log = tmp_path / "logs" / "orchestrator.log"
+        log.parent.mkdir(parents=True)
+        log.write_text("2026-05-04T10:00:00Z [agent] INFO Set E0-F1-S1-T1 to 'done' in both files\n")
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._resolve_log_file_path", return_value=log),
+        ):
+            rc = cli.cmd_migrate_log_shards("--migrate-log-shards")
+        assert rc == 0
+        assert not log.exists()
+        assert (tmp_path / "logs" / "legacy" / "orchestrator.log").is_file()
+        assert (tmp_path / "logs" / "2026-05" / "E0-F1-S1-T1.jsonl").is_file()
+
+    def test_rejects_extra_positional(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_migrate_log_shards("--migrate-log-shards", "extra")
+        assert rc == 1
+        assert "no positional" in capsys.readouterr().err
+
+    def test_handles_missing_log_with_flag(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._resolve_log_file_path", return_value=tmp_path / "nope.log"),
+        ):
+            rc = cli.cmd_migrate_log_shards("--migrate-log-shards")
+        assert rc == 1
+        assert "not found" in capsys.readouterr().err
+
+
+class TestCmdUpgrade:
+    """Issue #162 unified upgrade command (ADR-22)."""
+
+    def _seed_minimal_workspace(self, tmp_path: Path) -> Path:
+        log = tmp_path / "logs" / "orchestrator.log"
+        log.parent.mkdir(parents=True)
+        log.write_text(
+            "2026-05-04T10:00:00Z [agent] INFO Set E0-F1-S1-T1 to 'in-progress' in both files\n"
+            "2026-05-04T10:30:00Z [agent] INFO Set E0-F1-S1-T1 to 'done' in both files\n"
+        )
+        backlog_dir = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        backlog_dir.mkdir(parents=True)
+        (backlog_dir / "E0-F1-S1-T1.md").write_text(
+            "# E0-F1-S1-T1: Test\n\n## Status: done\n\n"
+            "## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n"
+        )
+        (tmp_path / "BACKLOG.md").write_text(
+            "# Backlog\n\n## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
+            "|------|-------|------|-------------|----------|---------|\n"
+            "| E0 | x | 1 | 0 | 0 | 0 |\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Test | Task | done | None | r | "
+            "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n"
+        )
+        return log
+
+    def test_default_skips_destructive(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        log = self._seed_minimal_workspace(tmp_path)
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli._resolve_log_file_path", return_value=log),
+        ):
+            rc = cli.cmd_upgrade()
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "Phase 1+4" in out
+        assert "Phase 2" in out
+        assert "Phase 3" in out
+        assert "Phase 6" in out
+        assert "Phase 7" in out
+        assert "Self-tests" in out
+        assert "Pass --migrate-log-shards" in out
+        assert log.is_file()  # Phase 3 didn't run
+        assert (tmp_path / ".devbench" / "window-stats" / "E0-F1-S1-T1.json").is_file()
+        assert "passes" in out
+        # Issue #168: report self-test reports non-zero indexed events
+        # (the seeded log has two state transitions => 2 events).
+        assert "report self-test" in out
+        assert "2 log event(s) indexed" in out
+
+    def test_report_self_test_warns_on_empty_log(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """Issue #168: when the orch-log set is empty (would have caught the
+        live regression I hit pre-#168), the self-test surfaces a structured
+        warning naming the rollback procedure."""
+        # Seed a workspace with a valid backlog but NO log content.
+        backlog_dir = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        backlog_dir.mkdir(parents=True)
+        (backlog_dir / "E0-F1-S1-T1.md").write_text(
+            "# E0-F1-S1-T1: Test\n\n## Status: in-queue\n\n"
+            "## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n"
+        )
+        (tmp_path / "BACKLOG.md").write_text(
+            "# Backlog\n\n## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
+            "|------|-------|------|-------------|----------|---------|\n"
+            "| E0 | x | 0 | 0 | 1 | 0 |\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Test | Task | in-queue | None | r | "
+            "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n"
+        )
+        empty_log_dir = tmp_path / "logs"
+        empty_log_dir.mkdir()
+        empty_log = empty_log_dir / "orchestrator.log"
+        empty_log.write_text("")  # empty log + no shards => 0 events expected
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli._resolve_log_file_path", return_value=empty_log),
+        ):
+            rc = cli.cmd_upgrade()
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "report self-test: 0 log events indexed" in out
+        # Rollback hint surfaces.
+        assert "Roll back via:" in out
+        assert "mv logs/legacy/orchestrator.log" in out
+
+    def test_report_self_test_passes_with_sharded_layout(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Issue #168 positive path: post-migration workspace (sharded
+        tree present, live log empty) -- reader integration finds events
+        in the shards and the self-test passes. This is the test that
+        would have FAILED pre-#168 because event_index wouldn't have
+        consumed the shard."""
+        # Backlog setup.
+        backlog_dir = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        backlog_dir.mkdir(parents=True)
+        (backlog_dir / "E0-F1-S1-T1.md").write_text(
+            "# E0-F1-S1-T1: Test\n\n## Status: done\n\n"
+            "## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n"
+        )
+        (tmp_path / "BACKLOG.md").write_text(
+            "# Backlog\n\n## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
+            "|------|-------|------|-------------|----------|---------|\n"
+            "| E0 | x | 1 | 0 | 0 | 0 |\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Test | Task | done | None | r | "
+            "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n"
+        )
+        # Sharded tree with one shard.
+        shard = tmp_path / "logs" / "2026-05" / "E0-F1-S1-T1.jsonl"
+        shard.parent.mkdir(parents=True)
+        shard.write_text(
+            "2026-05-04T10:00:00Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'in-progress'\n"
+            "2026-05-04T11:00:00Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'done'\n"
+        )
+        # Empty live log.
+        live_log = tmp_path / "logs" / "orchestrator.log"
+        live_log.write_text("")
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli._resolve_log_file_path", return_value=live_log),
+        ):
+            rc = cli.cmd_upgrade()
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        # Self-test sees the 2 events from the shard.
+        assert "report self-test: 2 log event(s) indexed" in out
+
+    def test_rerun_idempotent(self, tmp_path: Path) -> None:
+        log = self._seed_minimal_workspace(tmp_path)
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli._resolve_log_file_path", return_value=log),
+        ):
+            assert cli.cmd_upgrade() == 0
+            assert cli.cmd_upgrade() == 0
+
+    def test_destructive_flag_runs_phase_3(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        log = self._seed_minimal_workspace(tmp_path)
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli._resolve_log_file_path", return_value=log),
+        ):
+            rc = cli.cmd_upgrade("--migrate-log-shards")
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "migrated" in out
+        assert not log.exists()
+        assert (tmp_path / "logs" / "legacy" / "orchestrator.log").is_file()
+        assert (tmp_path / "logs" / "2026-05" / "E0-F1-S1-T1.jsonl").is_file()
+
+    def test_rejects_extra_positional(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_upgrade("--migrate-log-shards", "extra")
+        assert rc == 1
+        assert "no positional" in capsys.readouterr().err
+
+    def test_self_test_failure_when_backlog_missing(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        log = tmp_path / "logs" / "orchestrator.log"
+        log.parent.mkdir(parents=True)
+        log.write_text("seed\n")
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli._resolve_log_file_path", return_value=log),
+        ):
+            rc = cli.cmd_upgrade()
+        assert rc == 0  # migrations succeeded; self-test failure surfaces but doesn't fail rc
+        assert "parser-load failed" in capsys.readouterr().out
+
+    def test_phase_3_with_flag_handles_missing_log(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        backlog_dir = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        backlog_dir.mkdir(parents=True)
+        (backlog_dir / "E0-F1-S1-T1.md").write_text(
+            "# E0-F1-S1-T1: Test\n\n## Status: in-queue\n\n"
+            "## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n"
+        )
+        (tmp_path / "BACKLOG.md").write_text(
+            "# Backlog\n\n## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
+            "|------|-------|------|-------------|----------|---------|\n"
+            "| E0 | x | 0 | 0 | 1 | 0 |\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Test | Task | in-queue | None | r | "
+            "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n"
+        )
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli._resolve_log_file_path", return_value=tmp_path / "nope.log"),
+        ):
+            rc = cli.cmd_upgrade("--migrate-log-shards")
+        assert rc == 0
+        assert "nothing to migrate" in capsys.readouterr().out
+
+    def test_cache_present_message(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        log = self._seed_minimal_workspace(tmp_path)
+        cache_dir = tmp_path / ".devbench" / "report-cache"
+        cache_dir.mkdir(parents=True)
+        (cache_dir / "events.sqlite").write_bytes(b"sqlite-fixture")
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli._resolve_log_file_path", return_value=log),
+        ):
+            cli.cmd_upgrade()
+        assert "cache present" in capsys.readouterr().out
+
+    def test_snapshot_present_message(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        log = self._seed_minimal_workspace(tmp_path)
+        snapshot_dir = tmp_path / ".devbench"
+        snapshot_dir.mkdir()
+        (snapshot_dir / "report-snapshot.json").write_text("{}")
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli._resolve_log_file_path", return_value=log),
+        ):
+            cli.cmd_upgrade()
+        assert "snapshot present" in capsys.readouterr().out
+
+    def test_log_absent_phase_2_message(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        backlog_dir = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        backlog_dir.mkdir(parents=True)
+        (backlog_dir / "E0-F1-S1-T1.md").write_text(
+            "# E0-F1-S1-T1: Test\n\n## Status: in-queue\n\n"
+            "## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n"
+        )
+        (tmp_path / "BACKLOG.md").write_text(
+            "# Backlog\n\n## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
+            "|------|-------|------|-------------|----------|---------|\n"
+            "| E0 | x | 0 | 0 | 1 | 0 |\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Test | Task | in-queue | None | r | "
+            "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n"
+        )
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli._resolve_log_file_path", return_value=tmp_path / "nope.log"),
+        ):
+            cli.cmd_upgrade()
+        assert "orchestrator log absent" in capsys.readouterr().out
+
+    def test_pyarrow_absent_phase_7_message(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        log = self._seed_minimal_workspace(tmp_path)
+
+        def _no_pyarrow(name: str) -> object | None:
+            if name == "pyarrow":
+                return None
+            import importlib.util as _real
+
+            return _real.find_spec(name)
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli._resolve_log_file_path", return_value=log),
+            patch("importlib.util.find_spec", side_effect=_no_pyarrow),
+        ):
+            cli.cmd_upgrade()
+        out = capsys.readouterr().out
+        assert "pyarrow not installed" in out
+        assert "pip install devbench[archive]" in out
+
+    def test_pyarrow_present_phase_7_message(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        log = self._seed_minimal_workspace(tmp_path)
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch("devbench.cli._resolve_log_file_path", return_value=log),
+        ):
+            cli.cmd_upgrade()
+        assert "Phase 7 (Parquet archive, opt-in)" in capsys.readouterr().out

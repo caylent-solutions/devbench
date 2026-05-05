@@ -9,7 +9,19 @@ dist/
 build/
 logs/
 tmp/
-/backlog/
+
+# Operator-specific Claude Code state (settings.local.json, commands.local.md, etc.).
+# Per-developer permission grants and local command shortcuts -- never the project's
+# source of truth. Mirrors the .vscode/*.json convention from CLAUDE.md's
+# "Critical Files" rule.
+/.claude/
+# Workspace backlog state lives in /backlog/ when devbench is run against
+# this repo as a workspace. Templates ship with the package itself and
+# MUST stay tracked so `devbench new-task` can render them in any clone
+# (CI included). Use `/backlog/*` + a negation so the directory is not
+# wholesale-ignored, which would block the negation per gitignore rules.
+/backlog/*
+!/backlog/templates/
 /BACKLOG.md
 
 # Environment files
@@ -30,3 +42,31 @@ tmp/
 # Trace output occasionally produced by kanon's repo_trace module when a test
 # writes to cwd instead of a tmp dir. Never valuable in this repo.
 TRACE_FILE
+
+# -----------------------------------------------------------------------------
+# Per-user remote-EC2 infra (Terraform / Terragrunt / Ansible). Operator-specific
+# Terragrunt leaves and any local Terraform state must NEVER be committed.
+# Only _template/ and shared singleton configs (network/) are tracked.
+# -----------------------------------------------------------------------------
+infra/terragrunt/instances/*
+!infra/terragrunt/instances/_template/
+!infra/terragrunt/instances/.gitkeep
+
+# Terraform / Terragrunt local cache + state spillage.
+**/.terraform/
+**/.terragrunt-cache/
+**/terraform.tfstate
+**/terraform.tfstate.backup
+**/.terraform.lock.hcl
+**/crash.log
+**/crash.*.log
+
+# Generated provider stubs Terragrunt drops alongside leaves.
+infra/terragrunt/**/backend.tf
+infra/terragrunt/**/provider.tf
+infra/terragrunt/**/ami_lookup.tf
+
+# Browser/OS-renamed download duplicates -- never canonical. Caught and
+# surfaced by `make lint-no-duplicates` if one slips through.
+* (1).*
+* (1)

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -29,6 +30,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import TextIO
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from devbench.config import (
+    HOOK_TAIL_AGENT_WIDTH,
+    HOOK_TAIL_DESCRIPTION_MAX,
+    HOOK_TAIL_STDOUT_PREVIEW_MAX,
+    HOOK_TAIL_TOOL_WIDTH,
+)
 
 # ---------------------------------------------------------------------------
 # Formatting constants. Single source of truth; tests import from here so
@@ -49,12 +57,19 @@ EVENT_LABELS: dict[str, str] = {
     "Notification": "No",
 }
 
-AGENT_WIDTH = 12
-TOOL_WIDTH = 8
+# Column-width / truncation caps. Resolved env > YAML > default at module
+# import time via devbench.config (issue #134); operators tune these in
+# `backlog/config/devbench.yaml` under `hook_tail:`. Defaults: 12 / 8 / 120 /
+# 80. EVENT_WIDTH stays a plain constant -- the arrow column is intrinsic to
+# the format (`->`, `<-`, `+s`, `-s`, `!!`, `U>`, `Cp`, `P?`, `No`) and 2
+# chars is the only sensible width.
+AGENT_WIDTH = HOOK_TAIL_AGENT_WIDTH
+TOOL_WIDTH = HOOK_TAIL_TOOL_WIDTH
+DESCRIPTION_MAX = HOOK_TAIL_DESCRIPTION_MAX
+STDOUT_PREVIEW_MAX = HOOK_TAIL_STDOUT_PREVIEW_MAX
 EVENT_WIDTH = 2
-DESCRIPTION_MAX = 100
-STDOUT_PREVIEW_MAX = 80
 POLL_SECONDS_DEFAULT = 0.25
+_WHITESPACE_RUN_RE = re.compile(r"\s+")
 
 # ANSI SGR color codes. Named so call sites stay readable.
 _ANSI_RESET = "\033[0m"
@@ -175,16 +190,24 @@ def _description(tool_input) -> str:
     Matches the bash script's jq expression exactly. Returns empty string
     when no usable field is present so the row still renders without a
     dangling description column.
+
+    Issue #133: every run of whitespace in the resolved string -- including
+    embedded ``\\n`` / ``\\r\\n`` / ``\\t`` and runs of spaces -- is
+    collapsed to a single space then stripped. The previous implementation
+    passed the raw string through verbatim, which caused per-event lines
+    to break onto a continuation line with no timestamp prefix when an
+    agent supplied a multi-line description (e.g.
+    ``"# Check ...\\n# The actual command..."``).
     """
     if isinstance(tool_input, dict):
         for key in ("description", "command", "file_path"):
             value = tool_input.get(key)
             if value:
-                return str(value)
-        return json.dumps(tool_input, sort_keys=True)
+                return _WHITESPACE_RUN_RE.sub(" ", str(value)).strip()
+        return _WHITESPACE_RUN_RE.sub(" ", json.dumps(tool_input, sort_keys=True)).strip()
     if tool_input is None:
         return ""
-    return str(tool_input)
+    return _WHITESPACE_RUN_RE.sub(" ", str(tool_input)).strip()
 
 
 def _stdout_preview(tool_response) -> str:
@@ -266,14 +289,25 @@ class FollowOptions:
     no_follow: bool = False
     color: bool = True
     poll_seconds: float = POLL_SECONDS_DEFAULT
+    # Phase 11 (E230): when set, hook-tail emits ONLY events whose
+    # ``orchestrator_session`` field equals this value. Enables the
+    # orchestrator pane to filter out tool calls fired by side-pane
+    # Claude sessions sharing the same JUDGE_WORKSPACE_ROOT.
+    orchestrator_session_id: str | None = None
 
 
-def _format_line(raw_line: str, tz, *, color: bool) -> str:
+def _format_line(raw_line: str, tz, *, color: bool, orchestrator_session_id: str | None = None) -> str:
     """Parse ``raw_line`` as JSON and format it.
 
     A line that is not valid JSON becomes a sentinel row showing its first
     ``DESCRIPTION_MAX`` characters so the operator can see the bad input
     without having to grep the raw log.
+
+    When *orchestrator_session_id* is provided, lines whose
+    ``orchestrator_session`` field does not match are silently
+    suppressed (returns ``""``). Lines from older log formats lack
+    the field; they are passed through unchanged so historical events
+    remain visible.
     """
     stripped = raw_line.rstrip("\n")
     if not stripped.strip():
@@ -284,6 +318,10 @@ def _format_line(raw_line: str, tz, *, color: bool) -> str:
         prefix = f"{_MISSING_TIMESTAMP} !? bad-json  "
         body = stripped[:DESCRIPTION_MAX]
         return _color(f"{prefix}{body}", _ANSI_GRAY, enabled=color)
+    if orchestrator_session_id is not None:
+        recorded = entry.get("orchestrator_session")
+        if isinstance(recorded, str) and recorded and recorded != orchestrator_session_id:
+            return ""
     return format_entry(entry, tz, color=color)
 
 
@@ -342,7 +380,12 @@ def _follow_loop(path: Path, options: FollowOptions, output: TextIO) -> int:
         while True:
             line = handle.readline()
             if line:
-                formatted = _format_line(line, options.tz, color=options.color)
+                formatted = _format_line(
+                    line,
+                    options.tz,
+                    color=options.color,
+                    orchestrator_session_id=options.orchestrator_session_id,
+                )
                 if formatted:
                     output.write(formatted + "\n")
                     output.flush()

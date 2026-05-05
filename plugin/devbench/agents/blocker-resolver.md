@@ -102,6 +102,20 @@ Pick the next sequential IDs within the same Story (e.g. if `E0-F9-S2-T5.md` is 
 
 Every field is load-bearing. In particular, `suggested_approach` MUST be a rich, multi-sentence narrative -- it flows verbatim into the draft's ## Description section and downstream executors work from it. A thin one-line RED/GREEN blurb will be rejected by `materialise-proposal` with a `suggested_approach too terse` error, and the operator will have to re-run you with tighter inputs. Produce the four-section structure below.
 
+> **Changes Manifest path rules (validate-backlog rules 10 and 11):**
+> Every path in `files_to_own` MUST be repo-relative (e.g. `src/foo.py`, `tests/test_foo.py`).
+> Paths containing an em-dash (U+2014) are rejected with a rule-10 error.
+> Always use `--` (double hyphen) where an em-dash would appear.
+>
+> **Issue #159 safety net:** if you accidentally emit a path prefixed with a configured
+> `checkout_directory` (e.g. `kanon/src/foo.py` when `kanon` is the kanon repo's
+> `checkout_directory`), `write-proposal` strips the prefix automatically before persisting
+> the JSON so rule-11 always passes. Treat the strip as a safety net only -- the agent
+> SHOULD still emit repo-relative paths from the start, because (a) the strip rejects paths
+> that match multiple configured checkout_directories with a structured error, and (b) repo-
+> relative paths make the proposal JSON readable to a human reviewer without having to know
+> the workspace's checkout-directory layout.
+
 `suggested_approach` MUST contain at least the following four labelled sections, concatenated into one string:
 
 1. **Context** (1-3 sentences): which source task prompted this follow-up, which production file is affected, what the bug or gap is, and why the follow-up is necessary.
@@ -194,3 +208,70 @@ The verdict word is chosen by the following decision tree:
 - If resolution is neither possible nor escalation-worthy (very rare; usually means the resolver cannot classify) → `blocked`.
 
 `escalated` is forbidden when a rejected-requests archive exists -- the correct action in that case is `proposed`. Detailed resolution strategies go in your response text.
+
+---
+
+## Test-validates-source proposals (post-Backlog-A addendum)
+
+When the proposed task you're authoring is a TEST that validates the source task's output (rather than a fix the source must wait on), set the `source_dep_direction` field in the proposal JSON to `"test_validates_source"`. `promote-proposal` honors this flag and wires the dep direction so the test runs AFTER the source, not before.
+
+### When to set the flag
+
+Set `source_dep_direction: "test_validates_source"` when the proposed task matches all of:
+
+- Title starts with "Add tests/", "Verify", "Validate", "Assert", or similar verb.
+- `files_to_own` are all `tests/**` paths (no production source).
+- ACs assert observable state of an artifact owned by the source task (not modify that artifact).
+
+When ANY of those is false, omit the flag (default behavior: source.depends_on(new), the new task is a blocking fix).
+
+### JSON shape
+
+```json
+{
+  "source_task_id": "E0-F1-S1-T8",
+  "source_dep_direction": "test_validates_source",
+  "generated_at": "...",
+  "rejection_reason": "...",
+  "proposed_tasks": [
+    {
+      "suggested_id": "E0-F1-S1-T9",
+      "title": "Add AC-FIX-008 and no-build-system assertions to test_pyproject_toml.py",
+      "files_to_own": ["tests/unit/test_pyproject_toml.py"],
+      "linked_scenarios": ["AC-FIX-008"],
+      "suggested_acs": ["..."],
+      "suggested_approach": "..."
+    }
+  ],
+  "affected_task_ids": []
+}
+```
+
+### Why this matters
+
+In Backlog A's first run, two circular-dep cycles (T8↔T9 on pyproject.toml; T1↔T3 on monorepo-check action.yaml) were created because the default promote-proposal wiring assumed source-depends-on-new. Both required manual reversal (`devbench add-dep <new> <source>` plus removing the auto-wired source-side dep). Setting `source_dep_direction: "test_validates_source"` on the proposal JSON makes the wiring correct from the start.
+
+See [`docs/task-factory.md`](../../../docs/task-factory.md#when-to-use---no-dep-on-source-post-backlog-a-lesson) for the full pattern and worked example.
+
+## Dedup contract (issue #141)
+
+Before emitting a fresh proposal via `uv run devbench write-proposal`, the CLI computes a stable `fix_signature` hash over `(target_repo, sorted(files_to_own), normalised_intent_phrase)` for the proposal you would write, and scans `.devbench/proposals/*.json` for an existing pending recovery task whose signature matches.
+
+**On match (the dedup path):** `write-proposal` does NOT write a duplicate JSON. Instead it auto-wires the new source task as an additional dep edge on the existing recovery task (via `cmd_add_dep`) and returns a JSON envelope containing `"recovery_reused": true` + `"reused_from_task_id": "<existing-recovery-id>"`. Your verdict for that invocation is `pass` with the audit message `[RECOVERY_REUSED] reusing existing recovery task <id> for fix_signature <hash>`. STOP after logging the verdict; do NOT emit additional proposal-related tool calls.
+
+**On no match (the emit path):** behaviour is unchanged. The CLI stamps the signature into the proposal JSON before writing.
+
+This rule is regression-tested in `tests/test_integration/test_blocker_resolver_dedup.py`.
+
+## Backlog-repo recovery skip (issue #146)
+
+When you author a proposal whose `proposed_tasks[*].files_to_own` would point at files in the backlog/workspace repo (e.g. `spec/*.md`, `docs/*.md`, `BACKLOG.md`, `backlog/**/*.md`), the CLI now drops those entries automatically. Backlog-repo files are operator bookkeeping commits, not work-unit deliverables; the recovery cascade has no valid endpoint for them.
+
+The CLI's behaviour:
+- Proposed tasks whose every file is backlog-repo -> dropped, `[RECOVERY_SKIPPED_BACKLOG_REPO_FILES]` audit logged.
+- Proposed tasks with mixed backlog + target-repo files -> kept, with `files_to_own` pruned to the target-repo subset only.
+- When all proposed tasks are skipped -> no JSON written, envelope reports `"recovery_skipped": true`, source task escalates to operator attention for a manual bookkeeping commit.
+
+Your verdict on the all-skipped case is `pass` with the audit `[RECOVERY_SKIPPED_BACKLOG_REPO_FILES] all proposed tasks owned only backlog-repo files; operator commits bookkeeping by hand.` STOP after logging the verdict.
+
+This rule is regression-tested in `tests/test_cli.py::TestCmdWriteProposalBacklogRepoSkip`.

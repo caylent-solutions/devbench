@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -959,6 +960,90 @@ class TestTranscriptParsing:
         assert c.output_tokens == 35
         assert c.cache_read_tokens == 150
         assert c.entries_with_usage == 5
+
+
+class TestTranscriptResumedSessionDedup:
+    """Issue #169: resumed Claude Code sessions copy prior assistant messages
+    forward into new transcript files; the parser path must dedup by
+    ``message.id`` so the same logical message is counted once even when it
+    appears in N files. Entries without a stable ``message.id`` continue to
+    accumulate (defensive guard for older transcripts).
+    """
+
+    @staticmethod
+    def _msg_line(ts: str, msg_id: str | None, in_tokens: int, out_tokens: int, role: str = "assistant") -> str:
+        message: dict = {"role": role, "usage": {"input_tokens": in_tokens, "output_tokens": out_tokens}}
+        if msg_id is not None:
+            message["id"] = msg_id
+        return json.dumps({"timestamp": ts, "message": message}) + "\n"
+
+    def test_duplicate_message_ids_across_files_are_counted_once(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import _parse_transcript_metrics
+
+        transcript_dir = tmp_path / "transcripts"
+        transcript_dir.mkdir()
+        # File A: m1, m2, m3 (10/5, 20/7, 30/9 = 60/21 total)
+        (transcript_dir / "a.jsonl").write_text(
+            self._msg_line("2026-03-05T10:01:00Z", "m1", 10, 5)
+            + self._msg_line("2026-03-05T10:02:00Z", "m2", 20, 7)
+            + self._msg_line("2026-03-05T10:03:00Z", "m3", 30, 9)
+        )
+        # File B: m2, m3 carried forward from A + new m4.
+        # If naive sum: m2+m3 are counted twice. Deduped: counted once.
+        (transcript_dir / "b.jsonl").write_text(
+            self._msg_line("2026-03-05T10:02:00Z", "m2", 20, 7)
+            + self._msg_line("2026-03-05T10:03:00Z", "m3", 30, 9)
+            + self._msg_line("2026-03-05T10:04:00Z", "m4", 40, 11)
+        )
+        result = _parse_transcript_metrics(transcript_dir, datetime(2026, 3, 5, 10, 0, 0, tzinfo=UTC))
+        # Deduped: m1+m2+m3+m4 = 100 input / 32 output / 4 entries
+        assert result.input_tokens == 100
+        assert result.output_tokens == 32
+        assert result.entries_with_usage == 4
+
+    def test_entries_without_message_id_still_count(self, tmp_path: Path) -> None:
+        """Defensive: pre-id transcripts and any future schema variant must keep accumulating."""
+        from devbench.reporting.report import _parse_transcript_metrics
+
+        transcript_dir = tmp_path / "transcripts"
+        transcript_dir.mkdir()
+        (transcript_dir / "a.jsonl").write_text(
+            self._msg_line("2026-03-05T10:01:00Z", None, 10, 5) + self._msg_line("2026-03-05T10:02:00Z", None, 20, 7)
+        )
+        result = _parse_transcript_metrics(transcript_dir, datetime(2026, 3, 5, 10, 0, 0, tzinfo=UTC))
+        # Both entries count -- dedup is opt-in on a stable id, not a bar against missing ones.
+        assert result.input_tokens == 30
+        assert result.output_tokens == 12
+        assert result.entries_with_usage == 2
+
+    def test_role_buckets_share_dedup_set(self, tmp_path: Path) -> None:
+        """Per-role aggregator must dedup against the SAME set as the global path so
+        the per-role totals sum to the deduped aggregate."""
+        from devbench.reporting.report import (
+            _parse_transcript_metrics,
+            _parse_transcript_metrics_by_role,
+        )
+
+        transcript_dir = tmp_path / "transcripts"
+        transcript_dir.mkdir()
+        # Same dup pattern as the basic test; orchestrator role implied (no attributionAgent).
+        (transcript_dir / "a.jsonl").write_text(
+            self._msg_line("2026-03-05T10:01:00Z", "m1", 10, 5) + self._msg_line("2026-03-05T10:02:00Z", "m2", 20, 7)
+        )
+        (transcript_dir / "b.jsonl").write_text(
+            self._msg_line("2026-03-05T10:02:00Z", "m2", 20, 7) + self._msg_line("2026-03-05T10:03:00Z", "m3", 30, 9)
+        )
+        window_start = datetime(2026, 3, 5, 10, 0, 0, tzinfo=UTC)
+        global_totals = _parse_transcript_metrics(transcript_dir, window_start)
+        by_role = _parse_transcript_metrics_by_role(transcript_dir, window_start)
+        # Both deduped to m1+m2+m3 = 60 input / 21 output / 3 entries
+        assert global_totals.input_tokens == 60
+        assert global_totals.output_tokens == 21
+        assert global_totals.entries_with_usage == 3
+        # Per-role sum equals the global dedupped figure (aggregate-row contract).
+        assert sum(t.input_tokens for t in by_role.values()) == global_totals.input_tokens
+        assert sum(t.output_tokens for t in by_role.values()) == global_totals.output_tokens
+        assert sum(t.entries_with_usage for t in by_role.values()) == global_totals.entries_with_usage
 
 
 class TestBedrockConfig:

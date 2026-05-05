@@ -423,10 +423,27 @@ def _discover_transcript_dir(hook_log_path: Path) -> Path | None:
     return None
 
 
-def _accumulate_transcript_message(message: object, totals_acc: dict[str, int]) -> None:
-    """Fold one transcript message's usage into the totals accumulator."""
+def _accumulate_transcript_message(
+    message: object, totals_acc: dict[str, int], seen_ids: set[str] | None = None
+) -> None:
+    """Fold one transcript message's usage into the totals accumulator.
+
+    When ``seen_ids`` is supplied, messages whose ``id`` has already been
+    accumulated are skipped. This is the dedup gate for issue #169: Claude
+    Code copies prior assistant messages (with their ``usage`` blocks) into
+    resumed/forked session transcripts, so summing every ``*.jsonl`` in a
+    transcript directory double-counts every message that crossed a resume.
+    Messages without a stable ``id`` still accumulate -- the dedup is opt-in
+    on the presence of the id rather than enforced absence.
+    """
     if not isinstance(message, dict):
         return
+    if seen_ids is not None:
+        msg_id = message.get("id")
+        if isinstance(msg_id, str) and msg_id:
+            if msg_id in seen_ids:
+                return
+            seen_ids.add(msg_id)
     usage = message.get("usage")
     if _extract_usage_totals(usage, totals_acc):
         totals_acc["entries_with_usage"] += 1
@@ -441,11 +458,17 @@ def _parse_transcript_metrics(transcript_dir: Path | None, window_start: datetim
     ``window_start``. This captures the OUTER orchestrator session's per-turn
     LLM cost, which hook-logs.jsonl misses (hook-logs only captures Agent
     subagent invocations).
+
+    Issue #169: dedups by ``message.id`` across all files in the directory.
+    Resumed Claude Code sessions copy prior assistant messages forward, so
+    the same logical message appears in N files; without dedup that's N-fold
+    over-count of token usage and cost.
     """
     totals_acc: dict[str, int] = _empty_totals_acc()
     if transcript_dir is None or not transcript_dir.is_dir():
         return HookLogTotals(**totals_acc)
 
+    seen_ids: set[str] = set()
     for transcript_file in sorted(transcript_dir.glob("*.jsonl")):
         for line in transcript_file.read_text(encoding="utf-8").splitlines():
             if not line.strip():
@@ -456,7 +479,7 @@ def _parse_transcript_metrics(transcript_dir: Path | None, window_start: datetim
                 continue
             if not _entry_in_window(entry, window_start):
                 continue
-            _accumulate_transcript_message(entry.get("message"), totals_acc)
+            _accumulate_transcript_message(entry.get("message"), totals_acc, seen_ids)
 
     return HookLogTotals(**totals_acc)
 
@@ -490,10 +513,15 @@ def _parse_transcript_metrics_by_role(transcript_dir: Path | None, window_start:
     Returns a dict mapping role name -> HookLogTotals. The summed totals
     across all roles equal what ``_parse_transcript_metrics`` returns; the
     aggregate-row contract is asserted in the regression test.
+
+    Issue #169: dedups by ``message.id`` across all files in the directory.
+    The dedup set is shared across roles so the per-role buckets sum to the
+    same deduped aggregate that ``_parse_transcript_metrics`` returns.
     """
     if transcript_dir is None or not transcript_dir.is_dir():
         return {}
 
+    seen_ids: set[str] = set()
     by_role: dict[str, dict[str, int]] = {}
     for transcript_file in sorted(transcript_dir.glob("*.jsonl")):
         for line in transcript_file.read_text(encoding="utf-8").splitlines():
@@ -507,7 +535,7 @@ def _parse_transcript_metrics_by_role(transcript_dir: Path | None, window_start:
                 continue
             role = _role_for_entry(entry)
             acc = by_role.setdefault(role, _empty_totals_acc())
-            _accumulate_transcript_message(entry.get("message"), acc)
+            _accumulate_transcript_message(entry.get("message"), acc, seen_ids)
     return {role: HookLogTotals(**acc) for role, acc in by_role.items()}
 
 

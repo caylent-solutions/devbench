@@ -397,6 +397,105 @@ class TestTranscriptAggregation:
             idx.close()
 
 
+class TestTranscriptResumedSessionDedupIndexed:
+    """Issue #169: the indexed path must dedup carried-forward messages by
+    ``message.id`` so the cross-file aggregate matches the parser path's
+    deduped figure. Implemented as a partial UNIQUE index +
+    ``INSERT OR IGNORE`` at ingest time so the aggregate query stays simple.
+    """
+
+    @staticmethod
+    def _msg_entry(ts: str, msg_id: str | None, in_tokens: int, out_tokens: int) -> dict:
+        message: dict = {"role": "assistant", "usage": {"input_tokens": in_tokens, "output_tokens": out_tokens}}
+        if msg_id is not None:
+            message["id"] = msg_id
+        return {"timestamp": ts, "message": message}
+
+    def test_duplicate_message_ids_across_files_are_counted_once(self, workspace: Path) -> None:
+        tdir = workspace / "transcripts"
+        tdir.mkdir()
+        # File A: m1, m2, m3. File B: m2 + m3 carried-forward + new m4.
+        _write_jsonl(
+            tdir / "a.jsonl",
+            [
+                self._msg_entry("2026-05-04T10:01:00.000000+00:00", "m1", 10, 5),
+                self._msg_entry("2026-05-04T10:02:00.000000+00:00", "m2", 20, 7),
+                self._msg_entry("2026-05-04T10:03:00.000000+00:00", "m3", 30, 9),
+            ],
+        )
+        _write_jsonl(
+            tdir / "b.jsonl",
+            [
+                self._msg_entry("2026-05-04T10:02:00.000000+00:00", "m2", 20, 7),
+                self._msg_entry("2026-05-04T10:03:00.000000+00:00", "m3", 30, 9),
+                self._msg_entry("2026-05-04T10:04:00.000000+00:00", "m4", 40, 11),
+            ],
+        )
+        idx = EventIndex.open(workspace)
+        try:
+            idx.refresh_transcripts(tdir)
+            agg = idx.aggregate_transcript_window(tdir, datetime(2026, 5, 4, 9, 0, tzinfo=UTC))
+            # Deduped: m1+m2+m3+m4 = 100 input / 32 output / 4 entries
+            assert agg["input_tokens"] == 100
+            assert agg["output_tokens"] == 32
+            assert agg["entries_with_usage"] == 4
+        finally:
+            idx.close()
+
+    def test_entries_without_message_id_still_count(self, workspace: Path) -> None:
+        """Partial unique index excludes NULL ``message_id`` so id-less rows still accumulate."""
+        tdir = workspace / "transcripts"
+        tdir.mkdir()
+        _write_jsonl(
+            tdir / "a.jsonl",
+            [
+                self._msg_entry("2026-05-04T10:01:00.000000+00:00", None, 10, 5),
+                self._msg_entry("2026-05-04T10:02:00.000000+00:00", None, 20, 7),
+            ],
+        )
+        idx = EventIndex.open(workspace)
+        try:
+            idx.refresh_transcripts(tdir)
+            agg = idx.aggregate_transcript_window(tdir, datetime(2026, 5, 4, 9, 0, tzinfo=UTC))
+            assert agg["input_tokens"] == 30
+            assert agg["output_tokens"] == 12
+            assert agg["entries_with_usage"] == 2
+        finally:
+            idx.close()
+
+    def test_indexed_dedup_matches_parser_dedup(self, workspace: Path) -> None:
+        """Parity: indexed and parser paths both report the same deduped totals."""
+        from devbench.reporting.report import _parse_transcript_metrics
+
+        tdir = workspace / "transcripts"
+        tdir.mkdir()
+        _write_jsonl(
+            tdir / "a.jsonl",
+            [
+                self._msg_entry("2026-05-04T10:01:00.000000+00:00", "m1", 10, 5),
+                self._msg_entry("2026-05-04T10:02:00.000000+00:00", "m2", 20, 7),
+            ],
+        )
+        _write_jsonl(
+            tdir / "b.jsonl",
+            [
+                self._msg_entry("2026-05-04T10:02:00.000000+00:00", "m2", 20, 7),  # dup of A's m2
+                self._msg_entry("2026-05-04T10:03:00.000000+00:00", "m3", 30, 9),
+            ],
+        )
+        window_start = datetime(2026, 5, 4, 9, 0, tzinfo=UTC)
+        idx = EventIndex.open(workspace)
+        try:
+            idx.refresh_transcripts(tdir)
+            indexed = idx.aggregate_transcript_window(tdir, window_start)
+        finally:
+            idx.close()
+        parsed = _parse_transcript_metrics(tdir, window_start)
+        assert indexed["input_tokens"] == parsed.input_tokens
+        assert indexed["output_tokens"] == parsed.output_tokens
+        assert indexed["entries_with_usage"] == parsed.entries_with_usage
+
+
 class TestDiscoverTranscriptDirCacheHit:
     """``first_hook_transcript_path`` returns the earliest cached path; legacy fallback when empty."""
 

@@ -71,7 +71,17 @@ _log = logging.getLogger("devbench.reporting.event_index")
 # every window aggregate (fail-soft so a malformed entry doesn't drop
 # the cost data attached to it). The query ``WHERE ts_epoch_us IS NULL
 # OR ts_epoch_us >= ?`` mirrors that semantic.
-_SCHEMA_VERSION = 2
+#
+# Version 3 (issue #169): ``transcript_entries`` gains a ``message_id``
+# column with a partial UNIQUE index (``WHERE message_id IS NOT NULL``).
+# Resumed Claude Code sessions copy prior assistant messages forward
+# into new transcript files, so the same logical message can appear in
+# multiple ``*.jsonl`` files. The unique index lets ``INSERT OR IGNORE``
+# discard the duplicate at ingest time so the aggregate ``SUM`` stays
+# correct without a query-side ``DISTINCT``. Entries without a stable
+# ``message.id`` continue to insert -- the partial predicate excludes
+# NULLs from the uniqueness check.
+_SCHEMA_VERSION = 3
 
 
 _KIND_ORCH_LOG = "orchestrator_log"
@@ -151,12 +161,19 @@ CREATE TABLE IF NOT EXISTS transcript_entries (
     is_us_only INTEGER NOT NULL DEFAULT 0,
     is_fast INTEGER NOT NULL DEFAULT 0,
     has_usage INTEGER NOT NULL DEFAULT 0,
+    message_id TEXT,  -- issue #169: assistant message id for cross-file dedup; NULL allowed
     PRIMARY KEY (file_id, line_offset),
     FOREIGN KEY (file_id) REFERENCES source_files(file_id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_transcript_entries_ts ON transcript_entries(ts_epoch_us);
 CREATE INDEX IF NOT EXISTS idx_transcript_entries_role_ts
     ON transcript_entries(role, ts_epoch_us);
+-- Issue #169: cross-file dedup. Resumed sessions copy prior assistant
+-- messages into new files; the partial unique index lets
+-- ``INSERT OR IGNORE`` reject the second insert of the same message_id
+-- while still allowing rows whose message_id is NULL.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_transcript_entries_msgid
+    ON transcript_entries(message_id) WHERE message_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS report_snapshot (
     snapshot_id INTEGER PRIMARY KEY CHECK (snapshot_id = 1),
@@ -567,6 +584,12 @@ class EventIndex:
             if not tokens.has_usage:
                 continue
             role = _role_from_attribution(entry.get("attributionAgent"))
+            # Issue #169: capture message.id so the partial unique index
+            # can dedup carried-forward messages across resumed-session
+            # transcript files. Non-string ids fall through as NULL,
+            # which the partial predicate excludes from uniqueness.
+            raw_id = message.get("id")
+            message_id = raw_id if isinstance(raw_id, str) and raw_id else None
             rows.append(
                 (
                     file_id,
@@ -581,15 +604,21 @@ class EventIndex:
                     tokens.is_us_only,
                     tokens.is_fast,
                     tokens.has_usage,
+                    message_id,
                 )
             )
         if rows:
+            # OR IGNORE (was OR REPLACE) so a duplicate ``message_id``
+            # from a resumed session leaves the original row in place
+            # rather than swapping in the carried-forward copy. The
+            # carried copy carries identical usage data, so first-write
+            # wins is deterministic.
             self._conn.executemany(
-                "INSERT OR REPLACE INTO transcript_entries "
+                "INSERT OR IGNORE INTO transcript_entries "
                 "(file_id, line_offset, ts_epoch_us, role, input_tokens, output_tokens, "
                 "cache_read_tokens, cache_write_5m_tokens, cache_write_1h_tokens, "
-                "is_us_only, is_fast, has_usage) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "is_us_only, is_fast, has_usage, message_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 rows,
             )
         self._update_file_row(file_id, mtime_ns, size_bytes, new_parsed_offset)

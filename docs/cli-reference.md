@@ -241,7 +241,7 @@ Issue #162; ADR-22.
 uv run devbench write-snapshot
 ```
 
-Render the report once and persist it to `<workspace>/.devbench/report-snapshot.json`. Used by the orchestrate skill at the end of every loop iteration so subsequent `devbench report --once` calls serve from the snapshot in single-digit milliseconds. Idempotent. ADR-20.
+Render the report once and persist it to `<workspace>/.devbench/report-snapshot.json`. Used by the orchestrate skill at the end of every loop iteration so subsequent `devbench report --once` calls serve from the snapshot quickly (file read + print only, skipping log parse and aggregation). Idempotent. ADR-20.
 
 ### `rebuild-window-stats`
 
@@ -544,7 +544,7 @@ Operators with unusual CI cadence override the knobs via the env vars above. Def
 uv run devbench git-ops-finalize <repo>
 ```
 
-Single-branch mode only: push the shared branch and create one PR for every accumulated commit. Use once, after every work unit targeting this repo is done. See [README Single-branch mode](../README.md#single-branch-mode) and [architecture.md §6](architecture.md#6-multi-pr-vs-single-pr-mode).
+Single-branch mode only: push the shared branch and create one PR for every accumulated commit. Use once, after every work unit targeting this repo is done. See [architecture.md §6](architecture.md#6-multi-pr-vs-single-pr-mode) for the full single-branch mode reference.
 
 Not applicable under `git_ops.local_only: true` -- the target repo has no remote to push to. The local single branch is the deliverable; running `git-ops-finalize` against a local-only workspace is an error.
 
@@ -658,9 +658,9 @@ EOF
 
 Persist a proposal JSON to `<workspace>/.devbench/proposals/<source-id>.json`. Payload is JSON on stdin. Written either by `blocker-resolver` (amendment-rejected path) or by the executor directly (validation-gate escalation path).
 
-**Auto-cascade when `auto_accept_proposals: true`:** with the flag set in `devbench.yaml`'s `task_factory:` section, `write-proposal` ALSO calls `materialise-proposal` and `promote-proposal` synchronously inside the same Python invocation. The cascade is therefore actionable the moment the JSON lands — the source task's `## Dependencies` table is wired with a `proposed`-status row immediately, the cascade-classifier moves it into the `auto-clearing via proposal` bucket, and the orchestrator's next iteration claims the materialised draft.
+**Auto-cascade when `auto_accept_proposals: true`:** with the flag set in `devbench.yaml`'s `task_factory:` section, `write-proposal` ALSO calls `materialise-proposal` and `promote-proposal` synchronously inside the same Python invocation. The cascade is therefore actionable the moment the JSON lands -- the source task's `## Dependencies` table is wired with a `proposed`-status row immediately, the cascade-classifier moves it into the `auto-clearing via proposal` bucket, and the orchestrator's next iteration claims the materialised draft.
 
-This closes a timing window in which a resolver-written proposal could sit orphaned for up to one full orchestrator iteration (between the resolver's `write-proposal` call and the next `sweep-proposals` cycle) — long enough for the source task to read as "needs operator attention" even though the auto-resolution path was already on disk.
+This closes a timing window in which a resolver-written proposal could sit orphaned for up to one full orchestrator iteration (between the resolver's `write-proposal` call and the next `sweep-proposals` cycle) -- long enough for the source task to read as "needs operator attention" even though the auto-resolution path was already on disk.
 
 The auto-cascade is best-effort: any `ProposalError` during materialise or promote is logged and reported in the output JSON's `auto_cascade` / `error` fields but does NOT propagate as a non-zero exit. The JSON is already on disk; the next `sweep-proposals` cycle retries the cascade.
 

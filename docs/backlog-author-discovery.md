@@ -120,7 +120,7 @@ for r in <list of repos>; do
 done
 ```
 
-Record: which repos are cloned locally, what branch each is on, what its origin URL is. The spec MUST not assume a clone exists if it does not; symlink-based workspace patterns (e.g., `human-prerequisites/06-multi-repo-symlinks.md`) MUST be referenced for any not-yet-cloned repo.
+Record: which repos are cloned locally, what branch each is on, what its origin URL is. The spec MUST not assume a clone exists if it does not; any not-yet-cloned repo MUST be explicitly called out so the operator can clone it before the orchestrator launches.
 
 ### 9. devbench `default_branch` alignment
 

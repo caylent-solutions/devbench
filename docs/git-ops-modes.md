@@ -13,7 +13,7 @@ specifically about the per-task git workflow after reviews pass.
 | Mode | YAML knobs | Per-task PR? | Auto-merge? | Use when... |
 |------|------------|--------------|-------------|-------------|
 | Multi-PR (default) | _none_ | Yes | Yes (on green CI) | You trust judges + CI to gate; no human review needed per PR. |
-| Single-branch + defer-PR | `git_ops.single_branch: <branch>` + `git_ops.defer_pr: true` | No (one batch PR) | Yes (via `git-ops-finalize`) | You want one PR for the whole batch (e.g., dependent tasks must land atomically). |
+| Single-branch + defer-PR | `git_ops.single_branch: <branch>` + `git_ops.defer_pr: true` | No (one batch PR) | No (CI watched after finalize; PR left open for human merge; E9 adds opt-in `auto_merge`) | You want one PR for the whole batch (e.g., dependent tasks must land atomically). |
 | Pause-before-merge (#101) | `git_ops.pause_before_merge: true` | Yes | No -- waits for human merge | You want per-task granularity AND per-PR human gating without blocking the orchestrator. |
 | Local-only | `git_ops.single_branch: <branch>` + `git_ops.defer_pr: true` + `git_ops.local_only: true` | No (no PR ever) | N/A (no remote) | Operational workflows -- AWS teardowns, evidence capture, scheduled audits -- where devbench drives work but the target "repo" has no GitHub remote and never pushes. See [`operational-work.md`](operational-work.md). |
 
@@ -83,6 +83,39 @@ Use when:
 - One review for the whole epic / feature is more efficient than per-task
   review.
 - Per-PR review noise is not worth the bookkeeping cost.
+
+### Post-finalize CI watching and failure resolution
+
+After `git-ops-finalize` creates the batch PR it calls
+`GitOpsService.wait_for_checks_and_classify(pr_url, repo_path)`, which
+wraps `gh pr checks --watch` and classifies the outcome into one of four
+`CIResult` values:
+
+- `CIResult.GREEN` -- every check passed. `git-ops-finalize` logs
+  `[CI_GREEN]` and returns rc=0. **The PR is left open for human merge;
+  single-PR mode never auto-merges.** The opt-in `auto_merge` toggle is
+  introduced by E9 and is not present in this release.
+
+- `CIResult.FAILED_KNOWN_TASK(task_id)` -- the failing job's log
+  contains exactly one `[E<n>-...-T<n>]` commit marker that traces the
+  failure to a single task. `git-ops-finalize` writes a recovery-proposal
+  JSON at `<workspace>/.devbench/proposals/<task_id>.json`, transitions
+  the named task to `blocked` with a `[CI_FAILED_BATCH_PR] <log_path>`
+  audit comment, and returns rc=2. Cascade-cap interaction: if the
+  offending task is already at cascade depth N-1 (controlled by
+  `orchestrate.max_cascade_depth`), the recovery proposal is skipped and
+  the task transitions to `OPERATOR_ACTION_REQUIRED` instead, accompanied
+  by a `[CI_FAILED_CASCADE_CAPPED]` audit comment.
+
+- `CIResult.FAILED_UNKNOWN` -- a failure is detected but cannot be
+  attributed to a single task (no marker present, multiple distinct
+  markers found, or the job log was unreachable). `git-ops-finalize`
+  transitions the most-recent in-review/done task to `blocked` with the
+  same `[CI_FAILED_BATCH_PR]` audit comment shape and returns rc=2.
+
+- `CIResult.TIMEOUT` -- `gh pr checks --watch` exceeded the configured
+  timeout. `git-ops-finalize` logs `[CI_WATCH_TIMEOUT]` and returns rc=2
+  without changing any task statuses; the operator decides the next step.
 
 ## Pause-before-merge mode (#101)
 

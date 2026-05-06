@@ -30,7 +30,7 @@ The collector and renderer live in `src/devbench/activity.py` as pure, independe
 
 **Positive.**
 
-- One command replaces a four-source stitch-together. Operators can answer the three active questions in under 10 seconds.
+- One command replaces a four-source stitch-together. Operators can answer the three active questions from a single terminal invocation.
 - Strictly read-only: every subprocess call is a fixed `git` argv with a bounded timeout; every file is opened in read mode; no hook signalling. Concurrent-safe with live orchestrations.
 - 100% coverage enforced on `devbench.activity` by extending `test-coverage-new`; every parser and the renderer have unit tests, plus an end-to-end fixture test that subprocess-invokes the CLI.
 - The renderer is a pure function of an `ActivitySnapshot`, so new display fields are added by (a) extending the dataclass, (b) adding a parser, (c) adding a renderer panel -- all three are trivially testable.
@@ -47,7 +47,7 @@ The collector and renderer live in `src/devbench/activity.py` as pure, independe
 - **A shell script that tails four log files.** Rejected: the parsing is non-trivial (transcript JSON, hook JSONL, orchestrator log format), the parsers would drift from Python's `devbench.reporting.report._discover_transcript_dir`, and the test story for bash is weaker. A Python module is DRY with the report module and unit-testable.
 - **Embed in `devbench report`**. Rejected: `report` is about history and economics; `watch` is about *now*. Mixing them confuses the reader and bloats both code paths. Two small commands beat one large one.
 - **Push-based updates (tail files with inotify)**. Rejected for v1: polling at 3--5s is plenty for the "is it alive" question, and inotify adds a runtime dependency that does not pull its weight for a local-only developer tool.
-- **Parse and render full JSONL transcripts**. Rejected: the compact text/tool-use extraction is 95% of the signal at 5% of the screen real-estate. Operators who want raw JSONL have `tail -f` and their editor.
+- **Parse and render full JSONL transcripts**. Rejected: the compact text/tool-use extraction captures the most actionable signal at a fraction of the screen real-estate. Operators who want raw JSONL have `tail -f` and their editor.
 
 ## Related files
 

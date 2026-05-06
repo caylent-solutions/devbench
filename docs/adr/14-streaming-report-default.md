@@ -93,7 +93,7 @@ frames fails CI.
 ## Consequences
 
 - The streaming default is the new everyday experience.
-- New module `devbench.reporting.streaming` (~200 lines) holding
+- New module `devbench.reporting.streaming` holding
   `_LatencyTracker`, `_stat_sources`, `_stdin_keypress_pending`,
   `_clear_and_write`, `stream_report`. Stdlib only -- no new
   mandatory dependencies.

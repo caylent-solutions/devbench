@@ -43,17 +43,9 @@ The judge / agent layer:
 | 7 | Recovery | `blocker-resolver` | Decomposes amendment rejects into proposals |
 | 8 | Recovery | `task-factory` | Materialises draft work units from proposals |
 
-### Try it now (5 commands)
+## Try it now
 
-```bash
-git clone <this-repo> && cd devbench
-make install
-make plugin-install
-export JUDGE_WORKSPACE_ROOT=/path/to/your-backlog JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1
-uv run devbench status
-```
-
-If `devbench status` prints a backlog summary, you are ready to launch an orchestration session (see [Interactive Mode](#interactive-mode)). If it fails, see [Troubleshooting](#troubleshooting) or the full install walkthrough in [Workspace Setup](#workspace-setup).
+Going from a clean machine to a running orchestrator takes ten numbered steps. The walkthrough lives in [docs/zero-to-ready.md](docs/zero-to-ready.md) -- prerequisites verification, clone + install, Claude / Bedrock auth, workspace-root setup, YAML config, minimum-viable backlog, validation, and launch. Every command in that guide has been end-to-end execution-validated against the SHA stamped at the bottom of the doc.
 
 ### Where to go next
 

@@ -138,19 +138,7 @@ IDs are case-insensitive in status matching but written in uppercase by conventi
 
 A status is *terminal* when a parent's auto-rollup treats it as complete. `done` and `declined` are terminal; `hold` is **not** -- a held child keeps its parent open. This guarantees that pausing a unit cannot accidentally close out its parent.
 
-#### Blocked-task classification (3-state, Part-1)
-
-A `blocked` work unit is in one of three states. The orchestrator advances tasks through these states in a known order so operators see only what truly needs human action:
-
-1. **`AUTO_CLEARING_VIA_PROPOSAL`** -- the task carries a `[BLOCKED_PENDING_PROPOSAL] <target>` marker chain whose targets all exist in the backlog AND at least one is non-terminal. The auto-requeue cascade fires when every target reaches terminal. Operator does nothing.
-2. **`AWAITING_AUTO_RECOVERY`** -- one of: (a) the task has a pending proposal JSON at `<workspace>/.devbench/proposals/<id>.json` (blocker-resolver wrote it; task-factory will materialise + promote on the next sweep); (b) a rejected-amendment archive at `<workspace>/.devbench/rejected-requests/<id>-*.json` (manifest-amender rejected; blocker-resolver runs next); (c) a recent `[BLOCKED]` audit-comment from a recovery agent (orchestrator / blocker_resolver / manifest_amender) within `JUDGE_BLOCKED_RECOVERY_WINDOW_SECONDS` (default 1800s); OR (d, issue #149) the task's regular task-level dependencies are still in flight (non-terminal) regardless of marker state. Operator does nothing -- the orchestrator's next iteration advances the task.
-3. **`NEEDS_OPERATOR_ATTENTION`** -- everything else: manual blockers (`DO NOT CLAIM` text in the description), unknown marker targets (cascade cannot resolve), every marker terminal AND every regular dep terminal (cascade should have fired and didn't), or no marker + no recovery signal at all. Operator must act.
-
-**Cascade-on-every-terminal-transition** (issue #147). The auto-requeue cascade fires from `BacklogManager._set_status` whenever the transition target is terminal (`done` OR `declined`). Previously only `mark_done` invoked the cascade, leaving downstream blocked tasks marooned when a dep was declined or force-set to a terminal status. The trigger is centralised in `_set_status` so every public API (`mark_done`, `mark_declined`, `force_status`, `set-status`) routes through the same code path, and a per-instance `(backlog_index, unit_id)` guard prevents redundant double-fires when the same target is reset to the same terminal status twice.
-
-**Audit-supersession in `status --detail`** (issue #153). The work-unit Comments section is append-only -- every `[BLOCKED]` / `[UNBLOCKED]` / `[CASCADE_RESOLVED]` audit row stays in the file forever. The status-detail panel renderer hides `[BLOCKED]` rows that have been superseded by a later positive transition (`[UNBLOCKED]` from sync-blocked / `[CASCADE_RESOLVED]` from the auto-requeue cascade), so the operator only sees the live blocking cause. The cascade re-queue audit reads `[AUTO_UNBLOCKED] [CASCADE_RESOLVED] ...` so legacy operator tooling that greps for `[AUTO_UNBLOCKED]` continues to work.
-
-`devbench report` renders the three states as separate panels under each `Blocked tasks (...)` heading. `devbench status` summarises with `Blocked (auto)` / `Blocked (recovery)` / `Blocked (attn)` rows, each padded to the same width so an empty bucket stays visible at zero.
+Every blocked work unit is routed into one of six classes by the classifier in `src/devbench/backlog/proposal.py`; see [block-types.md](block-types.md) for the operator-facing reference.
 
 The orchestrator's `next` query and parallel-candidate scan filter to `in-queue` and `in-progress` only, so `hold`, `declined`, and `blocked` units are skipped automatically. Operators move units in and out of `hold` with `devbench hold <id> --reason <text>` and `devbench unhold <id> --reason <text>` (both reasons are required and captured in the work-unit's Comments audit trail).
 

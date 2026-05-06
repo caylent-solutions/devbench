@@ -79,9 +79,9 @@ inherit no such env var.
   pins all six scenarios: orchestrator+clean->ALLOW,
   orchestrator+rule-10->BLOCK, orchestrator+rule-11->BLOCK,
   executor->BLOCK, missing-role->BLOCK, unknown-role->BLOCK.
-- Documentation under `docs/architecture.md` (Hooks layer) and
-  `docs/hook-activity.md` names the env-var indicator and the
-  expected calling convention.
+- Documentation under `docs/architecture.md` (Hooks layer, section
+  "Caller-role indicator: `JUDGE_AGENT_ROLE`") names the env-var
+  indicator and the expected calling convention.
 
 ## References
 

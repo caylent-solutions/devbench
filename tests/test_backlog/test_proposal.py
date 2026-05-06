@@ -1545,7 +1545,7 @@ class TestClassifyProposedTask:
 
 
 class TestClassifyBlockedTask:
-    """ADR-10: classify_blocked_task distinguishes auto-clearing from needs-attention."""
+    """ADR-10: classify_blocked_task returns one of the six blocked-task states."""
 
     def _workspace_with_markers(self, tmp_path: Path, marker_target_status_pairs: list[tuple[str, str]]) -> Path:
         """Build a workspace where E0-F1-S1-T1 carries markers for each (id, status) pair.
@@ -1600,15 +1600,15 @@ class TestClassifyBlockedTask:
         state = classify_blocked_task(workspace / "backlog", workspace / "BACKLOG.md", "E0-F1-S1-T1")
         assert state is BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL
 
-    def test_task_with_all_terminal_markers_is_needs_attention(self, tmp_path: Path) -> None:
+    def test_task_with_all_terminal_markers_is_operator_action_required(self, tmp_path: Path) -> None:
         """Cascade should already have fired; the task is still blocked = diagnostic signal."""
         from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
 
         workspace = self._workspace_with_markers(tmp_path, [("E0-F1-S1-T2", "done"), ("E0-F1-S1-T3", "declined")])
         state = classify_blocked_task(workspace / "backlog", workspace / "BACKLOG.md", "E0-F1-S1-T1")
-        assert state is BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+        assert state is BlockedTaskState.OPERATOR_ACTION_REQUIRED
 
-    def test_task_with_unknown_marker_id_is_needs_attention(self, tmp_path: Path) -> None:
+    def test_task_with_unknown_marker_id_is_operator_action_required(self, tmp_path: Path) -> None:
         from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
 
         workspace = self._workspace_with_markers(tmp_path, [("E0-F1-S1-T2", "in-queue")])
@@ -1619,9 +1619,11 @@ class TestClassifyBlockedTask:
             + "\n[2026-04-20 00:00 UTC] [agent/task_factory] [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T99\n"
         )
         state = classify_blocked_task(workspace / "backlog", workspace / "BACKLOG.md", "E0-F1-S1-T1")
-        assert state is BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+        assert state is BlockedTaskState.OPERATOR_ACTION_REQUIRED
 
-    def test_task_with_no_markers_is_needs_attention(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_task_with_no_markers_is_operator_action_required(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Reach the empty-markers branch without depending on BacklogParser internals."""
         from devbench.backlog import proposal as proposal_mod
         from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
@@ -1639,9 +1641,9 @@ class TestClassifyBlockedTask:
 
         monkeypatch.setattr(proposal_mod, "BacklogManager", _NoMarkers)
         state = classify_blocked_task(tmp_path / "backlog", tmp_path / "BACKLOG.md", "E0-F1-S1-T1")
-        assert state is BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+        assert state is BlockedTaskState.OPERATOR_ACTION_REQUIRED
 
-    def test_task_not_in_backlog_is_needs_attention(self, tmp_path: Path) -> None:
+    def test_task_not_in_backlog_is_operator_action_required(self, tmp_path: Path) -> None:
         from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
 
         (tmp_path / "BACKLOG.md").write_text(
@@ -1650,10 +1652,12 @@ class TestClassifyBlockedTask:
             "|----|-------|------|--------|--------------|------|-----------|\n"
         )
         state = classify_blocked_task(tmp_path / "backlog", tmp_path / "BACKLOG.md", "E0-F1-S1-T99")
-        assert state is BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+        assert state is BlockedTaskState.OPERATOR_ACTION_REQUIRED
 
-    def test_missing_backlog_index_is_needs_attention(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """ADR-10: if _parse_backlog_rows raises FileNotFoundError, classifier defaults to needs-attention."""
+    def test_missing_backlog_index_is_operator_action_required(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ADR-10: if _parse_backlog_rows raises FileNotFoundError, classifier defaults to operator-action-required."""
         from devbench.backlog import proposal as proposal_mod
         from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
 
@@ -1677,172 +1681,35 @@ class TestClassifyBlockedTask:
 
         monkeypatch.setattr(proposal_mod, "BacklogManager", _Exploding)
         state = classify_blocked_task(backlog_dir, tmp_path / "BACKLOG.md", "E0-F1-S1-T1")
-        assert state is BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+        assert state is BlockedTaskState.OPERATOR_ACTION_REQUIRED
 
-    def test_task_with_hold_marker_target_is_needs_attention(self, tmp_path: Path) -> None:
-        """Issue #168 (3-panel surfacing): HOLD-target marker -> NEEDS_OPERATOR_ATTENTION.
+    def test_task_with_hold_marker_target_is_blocked_on_held(self, tmp_path: Path) -> None:
+        """HOLD-target marker -> BLOCKED_ON_HELD (not OPERATOR_ACTION_REQUIRED).
 
         HOLD is non-terminal so the cascade cannot fire; HOLD will not
         clear without operator action so AUTO_CLEARING_VIA_PROPOSAL is
-        a misclassification. Surface to panel 3.
+        a misclassification. The 6-state classifier surfaces this as
+        BLOCKED_ON_HELD so operators see the dependency is on a held unit.
         """
         from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
 
         workspace = self._workspace_with_markers(tmp_path, [("E0-F1-S1-T2", "hold")])
         state = classify_blocked_task(workspace / "backlog", workspace / "BACKLOG.md", "E0-F1-S1-T1")
-        assert state is BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+        assert state is BlockedTaskState.BLOCKED_ON_HELD
 
-    def test_task_with_hold_target_among_active_targets_is_needs_attention(self, tmp_path: Path) -> None:
+    def test_task_with_hold_target_among_active_targets_is_blocked_on_held(self, tmp_path: Path) -> None:
         """HOLD precedence: any HOLD target wins over in-queue / in-progress siblings.
 
         Even though one of the marker targets is in-queue (would normally
         return AUTO_CLEARING_VIA_PROPOSAL), the presence of a HOLD target
-        forces NEEDS_OPERATOR_ATTENTION because the cascade is gated on
-        every target reaching terminal and HOLD is non-terminal.
+        forces BLOCKED_ON_HELD because the cascade is gated on every
+        target reaching terminal and HOLD is non-terminal.
         """
         from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
 
         workspace = self._workspace_with_markers(tmp_path, [("E0-F1-S1-T2", "in-queue"), ("E0-F1-S1-T3", "hold")])
         state = classify_blocked_task(workspace / "backlog", workspace / "BACKLOG.md", "E0-F1-S1-T1")
-        assert state is BlockedTaskState.NEEDS_OPERATOR_ATTENTION
-
-
-class TestPanel3Annotation:
-    """Issue #168 (3-panel surfacing): panel3_annotation routing + sort key."""
-
-    def _workspace_with_markers(self, tmp_path: Path, marker_target_status_pairs: list[tuple[str, str]]) -> Path:
-        return TestClassifyBlockedTask()._workspace_with_markers(tmp_path, marker_target_status_pairs)
-
-    def test_hold_marker_target_returns_group_1_with_hold_annotation(self, tmp_path: Path) -> None:
-        from devbench.backlog.proposal import panel3_annotation
-
-        workspace = self._workspace_with_markers(tmp_path, [("E0-F1-S1-T2", "hold")])
-        group_rank, hold_target, annotation = panel3_annotation(
-            workspace / "backlog", workspace / "BACKLOG.md", "E0-F1-S1-T1"
-        )
-        assert group_rank == 1
-        assert hold_target == "E0-F1-S1-T2"
-        assert annotation == "[HOLD: E0-F1-S1-T2]"
-
-    def test_no_marker_returns_group_2_with_no_marker_annotation(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        from devbench.backlog import proposal as proposal_mod
-        from devbench.backlog.proposal import panel3_annotation
-
-        source = tmp_path / "fake.md"
-        source.write_text("# fake\n\n## Status: blocked\n")
-        monkeypatch.setattr(proposal_mod, "_find_source_task_file", lambda *a, **kw: source)
-
-        class _NoMarkers:
-            def _extract_pending_proposal_markers(self, _p):
-                return set()
-
-            def _parse_backlog_rows(self, _path):
-                return []
-
-        monkeypatch.setattr(proposal_mod, "BacklogManager", _NoMarkers)
-        group_rank, hold_target, annotation = panel3_annotation(
-            tmp_path / "backlog", tmp_path / "BACKLOG.md", "E0-F1-S1-T1"
-        )
-        assert group_rank == 2
-        assert hold_target is None
-        assert annotation == "[no marker]"
-
-    def test_unknown_target_returns_group_3(self, tmp_path: Path) -> None:
-        from devbench.backlog.proposal import panel3_annotation
-
-        # Build a workspace whose source carries a marker pointing at an ID
-        # with NO backlog row.
-        backlog_dir = tmp_path / "backlog"
-        story_dir = backlog_dir / "E0" / "E0-F1" / "E0-F1-S1"
-        story_dir.mkdir(parents=True)
-        (story_dir / "E0-F1-S1-T1.md").write_text(
-            "# E0-F1-S1-T1: Source\n\n## Status: blocked\n\n"
-            "## Comments\n\n"
-            "[2026-04-20 00:00 UTC] [agent/task_factory] [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T99\n"
-        )
-        (tmp_path / "BACKLOG.md").write_text(
-            "# Backlog\n\n## Full Work Unit Index\n\n"
-            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
-            "|----|-------|------|--------|--------------|------|-----------|\n"
-            "| E0-F1-S1-T1 | Source | Task | blocked | None | r | `backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n"
-        )
-        group_rank, hold_target, annotation = panel3_annotation(backlog_dir, tmp_path / "BACKLOG.md", "E0-F1-S1-T1")
-        assert group_rank == 3
-        assert hold_target is None
-        assert "E0-F1-S1-T99" in annotation
-        assert annotation.startswith("[marker target unknown")
-
-    def test_all_targets_terminal_returns_group_4(self, tmp_path: Path) -> None:
-        from devbench.backlog.proposal import panel3_annotation
-
-        workspace = self._workspace_with_markers(tmp_path, [("E0-F1-S1-T2", "done"), ("E0-F1-S1-T3", "declined")])
-        group_rank, hold_target, annotation = panel3_annotation(
-            workspace / "backlog", workspace / "BACKLOG.md", "E0-F1-S1-T1"
-        )
-        assert group_rank == 4
-        assert hold_target is None
-        assert annotation == "[marker targets all terminal]"
-
-    def test_missing_source_task_returns_group_5_fallback(self, tmp_path: Path) -> None:
-        from devbench.backlog.proposal import panel3_annotation
-
-        # No backlog tree at all -- _find_source_task_file returns None.
-        group_rank, hold_target, annotation = panel3_annotation(
-            tmp_path / "backlog", tmp_path / "BACKLOG.md", "E0-F1-S1-T99"
-        )
-        assert group_rank == 5
-        assert hold_target is None
-        assert annotation == "[needs review]"
-
-    def test_classify_markers_falls_back_when_no_subcase_matches(self) -> None:
-        """``_panel3_classify_markers`` returns the (5, None, ``[needs review]``)
-        fallback when the marker set doesn't match any specific sub-case --
-        no HOLD target, no unknown target, and not all terminal. Defensive
-        fallback for callers who reach panel3_annotation via a path other
-        than the standard classifier."""
-        from devbench.backlog.proposal import _panel3_classify_markers
-
-        # Two markers, both in-progress (non-terminal, known, non-HOLD).
-        # The real classifier would have returned AUTO_CLEARING_VIA_PROPOSAL
-        # for this state; this direct test pins the fallback exists.
-        result = _panel3_classify_markers(
-            ["E0-F1-S1-T2", "E0-F1-S1-T3"],
-            {"E0-F1-S1-T2": "in-progress", "E0-F1-S1-T3": "in-progress"},
-        )
-        assert result == (5, None, "[needs review]")
-
-    def test_missing_backlog_index_returns_group_5_fallback(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """When _parse_backlog_rows raises FileNotFoundError, fall back to group 5."""
-        from devbench.backlog import proposal as proposal_mod
-        from devbench.backlog.proposal import panel3_annotation
-
-        backlog_dir = tmp_path / "backlog"
-        story_dir = backlog_dir / "E0" / "E0-F1" / "E0-F1-S1"
-        story_dir.mkdir(parents=True)
-        source = story_dir / "E0-F1-S1-T1.md"
-        source.write_text(
-            "# E0-F1-S1-T1: Source\n\n## Status: blocked\n\n"
-            "## Comments\n\n"
-            "[2026-04-20 00:00 UTC] [agent/task_factory] [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2\n"
-        )
-        monkeypatch.setattr(proposal_mod, "_find_source_task_file", lambda *a, **kw: source)
-
-        class _Exploding:
-            def _extract_pending_proposal_markers(self, _p):
-                return {"E0-F1-S1-T2"}
-
-            def _parse_backlog_rows(self, _path):
-                raise FileNotFoundError("forced")
-
-        monkeypatch.setattr(proposal_mod, "BacklogManager", _Exploding)
-        group_rank, hold_target, annotation = panel3_annotation(backlog_dir, tmp_path / "BACKLOG.md", "E0-F1-S1-T1")
-        assert group_rank == 5
-        assert hold_target is None
-        assert annotation == "[needs review]"
+        assert state is BlockedTaskState.BLOCKED_ON_HELD
 
 
 class TestAddDepBlockedMissing:
@@ -2358,12 +2225,12 @@ class TestRejectProposalMarkerStrip:
 
 
 class TestClassifyBlockedTaskAwaitingRecovery:
-    """Part-1 (3-state classifier): AWAITING_AUTO_RECOVERY signals.
+    """6-state classifier: AWAITING_AMENDMENT_RECOVERY signals.
 
     No ``[BLOCKED_PENDING_PROPOSAL]`` marker is present, but the
     orchestrator's loop has left a recovery artefact on disk. The
-    task should classify as ``AWAITING_AUTO_RECOVERY`` -- not
-    ``NEEDS_OPERATOR_ATTENTION`` -- so the operator does not get
+    task should classify as ``AWAITING_AMENDMENT_RECOVERY`` -- not
+    ``OPERATOR_ACTION_REQUIRED`` -- so the operator does not get
     paged on a transient state devbench will resolve itself.
     """
 
@@ -2407,7 +2274,7 @@ class TestClassifyBlockedTaskAwaitingRecovery:
             "E0-F1-S1-T1",
             workspace_root=workspace,
         )
-        assert state is BlockedTaskState.AWAITING_AUTO_RECOVERY
+        assert state is BlockedTaskState.AWAITING_AMENDMENT_RECOVERY
 
     def test_rejected_amendment_archive_classifies_recovery(self, tmp_path: Path) -> None:
         from devbench.backlog.proposal import (
@@ -2425,7 +2292,7 @@ class TestClassifyBlockedTaskAwaitingRecovery:
             "E0-F1-S1-T1",
             workspace_root=workspace,
         )
-        assert state is BlockedTaskState.AWAITING_AUTO_RECOVERY
+        assert state is BlockedTaskState.AWAITING_AMENDMENT_RECOVERY
 
     def test_recent_recovery_audit_comment_classifies_recovery(self, tmp_path: Path) -> None:
         from datetime import UTC, datetime
@@ -2452,9 +2319,9 @@ class TestClassifyBlockedTaskAwaitingRecovery:
             now=now,
             recovery_window_seconds=300,
         )
-        assert state is BlockedTaskState.AWAITING_AUTO_RECOVERY
+        assert state is BlockedTaskState.AWAITING_AMENDMENT_RECOVERY
 
-    def test_stale_audit_comment_falls_through_to_attention(self, tmp_path: Path) -> None:
+    def test_stale_audit_comment_falls_through_to_operator_action_required(self, tmp_path: Path) -> None:
         from datetime import UTC, datetime, timedelta
 
         from devbench.backlog.proposal import (
@@ -2477,9 +2344,9 @@ class TestClassifyBlockedTaskAwaitingRecovery:
             now=now,
             recovery_window_seconds=300,
         )
-        assert state is BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+        assert state is BlockedTaskState.OPERATOR_ACTION_REQUIRED
 
-    def test_audit_from_non_recovery_agent_falls_through(self, tmp_path: Path) -> None:
+    def test_audit_from_non_recovery_agent_falls_through_to_operator_action_required(self, tmp_path: Path) -> None:
         from datetime import UTC, datetime
 
         from devbench.backlog.proposal import (
@@ -2502,9 +2369,9 @@ class TestClassifyBlockedTaskAwaitingRecovery:
             now=now,
             recovery_window_seconds=300,
         )
-        assert state is BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+        assert state is BlockedTaskState.OPERATOR_ACTION_REQUIRED
 
-    def test_no_signal_classifies_needs_attention(self, tmp_path: Path) -> None:
+    def test_no_signal_classifies_operator_action_required(self, tmp_path: Path) -> None:
         from devbench.backlog.proposal import (
             BlockedTaskState,
             classify_blocked_task,
@@ -2517,11 +2384,11 @@ class TestClassifyBlockedTaskAwaitingRecovery:
             "E0-F1-S1-T1",
             workspace_root=workspace,
         )
-        assert state is BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+        assert state is BlockedTaskState.OPERATOR_ACTION_REQUIRED
 
-    def test_no_workspace_root_falls_back_to_two_state_behaviour(self, tmp_path: Path) -> None:
+    def test_no_workspace_root_falls_back_to_operator_action_required(self, tmp_path: Path) -> None:
         # Older callers that pass only backlog_root + backlog_index still
-        # get the legacy two-state classification.
+        # get operator-action-required (formerly the two-state fallback).
         from devbench.backlog.proposal import (
             BlockedTaskState,
             classify_blocked_task,
@@ -2537,11 +2404,11 @@ class TestClassifyBlockedTaskAwaitingRecovery:
             workspace / "BACKLOG.md",
             "E0-F1-S1-T1",
         )
-        assert state is BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+        assert state is BlockedTaskState.OPERATOR_ACTION_REQUIRED
 
 
 class TestRecoverySignalForTask:
-    """Part-1: ``recovery_signal_for_task`` names the source so the report can annotate."""
+    """``recovery_signal_for_task`` names the AWAITING_AMENDMENT_RECOVERY signal source for the report renderer."""
 
     def test_pending_proposal_named(self, tmp_path: Path) -> None:
         from devbench.backlog.proposal import recovery_signal_for_task
@@ -2606,3 +2473,382 @@ class TestRecentRecoveryAuditCommentEdgeCases:
         # must continue past it rather than crashing.
         wu.write_text("## Comments\n\n[9999-99-99 99:99 UTC] [agent/orchestrator] [BLOCKED] amendment-reject\n")
         assert _recent_recovery_audit_comment(wu, datetime(2026, 5, 1, 12, 0, tzinfo=UTC), 300) is False
+
+
+# ---------------------------------------------------------------------------
+# E2-F1-S1-T1: 6-state BlockedTaskState classifier tests
+# ---------------------------------------------------------------------------
+
+
+class TestBlockedTaskStateSixValues:
+    """AC-FUNC-001: BlockedTaskState must have exactly 6 canonical values."""
+
+    def test_has_exactly_six_values(self) -> None:
+        from devbench.backlog.proposal import BlockedTaskState
+
+        names = {s.name for s in BlockedTaskState}
+        assert names == {
+            "AUTO_CLEARING_VIA_PROPOSAL",
+            "AWAITING_AMENDMENT_RECOVERY",
+            "AWAITING_DEPENDENCY",
+            "HELD",
+            "BLOCKED_ON_HELD",
+            "OPERATOR_ACTION_REQUIRED",
+        }
+
+    def test_old_values_removed(self) -> None:
+        from devbench.backlog.proposal import BlockedTaskState
+
+        names = {s.name for s in BlockedTaskState}
+        assert "AWAITING_AUTO_RECOVERY" not in names
+        assert "NEEDS_OPERATOR_ATTENTION" not in names
+
+
+class TestClassifyBlockedTaskHeld:
+    """AC-FUNC-004: HELD state for a unit whose own status is HOLD."""
+
+    def _workspace_hold_task(self, tmp_path: Path) -> Path:
+        """Build a minimal workspace where E0-F1-S1-T1 has status HOLD."""
+        backlog_dir = tmp_path / "backlog"
+        story_dir = backlog_dir / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+        (story_dir / "E0-F1-S1-T1.md").write_text(
+            "# E0-F1-S1-T1: Source\n\n## Status: hold\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
+            "## Comments\n"
+        )
+        (tmp_path / "BACKLOG.md").write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Source | Task | hold | None | r | `backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n"
+        )
+        return tmp_path
+
+    def test_task_with_hold_status_returns_held(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        workspace = self._workspace_hold_task(tmp_path)
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+        )
+        assert state is BlockedTaskState.HELD
+
+
+class TestClassifyBlockedTaskBlockedOnHeld:
+    """AC-FUNC-005: BLOCKED_ON_HELD state when a marker target is in HOLD."""
+
+    def _workspace_blocked_on_hold(self, tmp_path: Path) -> Path:
+        """Build a workspace where E0-F1-S1-T1 is blocked with a marker pointing to a HOLD target."""
+        backlog_dir = tmp_path / "backlog"
+        story_dir = backlog_dir / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+        (story_dir / "E0-F1-S1-T1.md").write_text(
+            "# E0-F1-S1-T1: Source\n\n## Status: blocked\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
+            "## Comments\n\n"
+            "[2026-04-20 00:00 UTC] [agent/task_factory] [PROPOSAL_PROMOTED] E0-F1-S1-T2 "
+            "promoted and wired as dependency. [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2\n"
+        )
+        (story_dir / "E0-F1-S1-T2.md").write_text("# E0-F1-S1-T2: Fix\n\n## Status: hold\n")
+        (tmp_path / "BACKLOG.md").write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Source | Task | blocked | None | r | `backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n"
+            "| E0-F1-S1-T2 | Fix | Task | hold | None | r | `backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T2.md` |\n"
+        )
+        return tmp_path
+
+    def test_blocked_with_hold_marker_returns_blocked_on_held(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        workspace = self._workspace_blocked_on_hold(tmp_path)
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+        )
+        assert state is BlockedTaskState.BLOCKED_ON_HELD
+
+
+class TestClassifyBlockedTaskAwaitingDependency:
+    """AC-FUNC-003: AWAITING_DEPENDENCY when Dependencies-table row points at non-terminal task."""
+
+    def _workspace_with_dep(self, tmp_path: Path, dep_status: str) -> Path:
+        """Build workspace where E0-F1-S1-T1 has a regular dependency on E0-F1-S1-T2 (no marker)."""
+        backlog_dir = tmp_path / "backlog"
+        story_dir = backlog_dir / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+        (story_dir / "E0-F1-S1-T1.md").write_text(
+            "# E0-F1-S1-T1: Source\n\n## Status: blocked\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n"
+            f"| E0-F1-S1-T2 | Fix | {dep_status} |\n\n"
+            "## Comments\n"
+        )
+        (story_dir / "E0-F1-S1-T2.md").write_text(f"# E0-F1-S1-T2: Fix\n\n## Status: {dep_status}\n")
+        (tmp_path / "BACKLOG.md").write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Source | Task | blocked | E0-F1-S1-T2 | r | `backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n"
+            f"| E0-F1-S1-T2 | Fix | Task | {dep_status} | None | r | `backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T2.md` |\n"
+        )
+        return tmp_path
+
+    def test_non_terminal_dep_returns_awaiting_dependency(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        workspace = self._workspace_with_dep(tmp_path, "in-queue")
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+        )
+        assert state is BlockedTaskState.AWAITING_DEPENDENCY
+
+    def test_non_terminal_dep_in_progress_returns_awaiting_dependency(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        workspace = self._workspace_with_dep(tmp_path, "in-progress")
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+        )
+        assert state is BlockedTaskState.AWAITING_DEPENDENCY
+
+
+class TestClassifyBlockedTaskAwaitingAmendmentRecovery:
+    """AC-FUNC-002: AWAITING_AMENDMENT_RECOVERY for sync-blocked comments from backlog_manager."""
+
+    def _workspace_no_marker_no_dep(self, tmp_path: Path) -> Path:
+        """Build workspace with E0-F1-S1-T1 blocked, no markers, no regular deps."""
+        backlog_dir = tmp_path / "backlog"
+        story_dir = backlog_dir / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+        (story_dir / "E0-F1-S1-T1.md").write_text(
+            "# E0-F1-S1-T1: Source\n\n## Status: blocked\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
+            "## Comments\n"
+        )
+        (tmp_path / "BACKLOG.md").write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Source | Task | blocked | None | r | `backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n"
+        )
+        return tmp_path
+
+    def test_sync_blocked_comment_from_backlog_manager_returns_amendment_recovery(self, tmp_path: Path) -> None:
+        """AC-FUNC-002 regression test: backlog_manager sync-blocked comment must classify
+        as AWAITING_AMENDMENT_RECOVERY, not OPERATOR_ACTION_REQUIRED."""
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        workspace = self._workspace_no_marker_no_dep(tmp_path)
+        source_file = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
+        now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        ts = now.strftime("%Y-%m-%d %H:%M UTC")
+        source_file.write_text(
+            source_file.read_text()
+            + f"\n[{ts}] [agent/backlog_manager] [BLOCKED] sync-blocked: dependency 'E0-F1-S1-T2' not yet terminal\n"
+        )
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+            now=now,
+            recovery_window_seconds=300,
+        )
+        assert state is BlockedTaskState.AWAITING_AMENDMENT_RECOVERY
+
+    def test_dep_not_yet_terminal_pattern_matches_amendment_recovery(self, tmp_path: Path) -> None:
+        """dep .* not yet terminal also matches the AWAITING_AMENDMENT_RECOVERY path."""
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        workspace = self._workspace_no_marker_no_dep(tmp_path)
+        source_file = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
+        now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        ts = now.strftime("%Y-%m-%d %H:%M UTC")
+        source_file.write_text(
+            source_file.read_text() + f"\n[{ts}] [agent/backlog_manager] [BLOCKED] dep E0-F1-S1-T2 not yet terminal\n"
+        )
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+            now=now,
+            recovery_window_seconds=300,
+        )
+        assert state is BlockedTaskState.AWAITING_AMENDMENT_RECOVERY
+
+    def test_pending_proposal_json_returns_amendment_recovery(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        workspace = self._workspace_no_marker_no_dep(tmp_path)
+        proposals_dir = workspace / ".devbench" / "proposals"
+        proposals_dir.mkdir(parents=True)
+        (proposals_dir / "E0-F1-S1-T1.json").write_text("{}")
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+        )
+        assert state is BlockedTaskState.AWAITING_AMENDMENT_RECOVERY
+
+    def test_rejected_amendment_archive_returns_amendment_recovery(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        workspace = self._workspace_no_marker_no_dep(tmp_path)
+        archive_dir = workspace / ".devbench" / "rejected-requests"
+        archive_dir.mkdir(parents=True)
+        (archive_dir / "E0-F1-S1-T1-20260501T120000Z.json").write_text("{}")
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+        )
+        assert state is BlockedTaskState.AWAITING_AMENDMENT_RECOVERY
+
+    def test_no_signal_returns_operator_action_required(self, tmp_path: Path) -> None:
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        workspace = self._workspace_no_marker_no_dep(tmp_path)
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+        )
+        assert state is BlockedTaskState.OPERATOR_ACTION_REQUIRED
+
+
+class TestPanelSymbolsRemoved:
+    """AC-FUNC-006: panel3_annotation and _panel3_classify_markers must not exist."""
+
+    def test_panel3_annotation_not_importable(self) -> None:
+        import importlib
+
+        mod = importlib.import_module("devbench.backlog.proposal")
+        assert not hasattr(mod, "panel3_annotation"), "panel3_annotation must be removed from proposal.py"
+
+    def test_panel3_classify_markers_not_importable(self) -> None:
+        import importlib
+
+        mod = importlib.import_module("devbench.backlog.proposal")
+        assert not hasattr(mod, "_panel3_classify_markers"), "_panel3_classify_markers must be removed from proposal.py"
+
+
+class TestClassifyBlockedTaskEndToEnd:
+    """AC-CYCLE-001: end-to-end exercise of the new 6-state classifier."""
+
+    def test_all_six_states_reachable_via_classify_blocked_task(self, tmp_path: Path) -> None:
+        """Build one fixture per state and verify the observed outcome matches the spec.
+
+        Exercises the full call path through classify_blocked_task for each
+        of the six canonical states in the order the spec defines them:
+        HELD -> BLOCKED_ON_HELD -> AUTO_CLEARING_VIA_PROPOSAL ->
+        AWAITING_DEPENDENCY -> AWAITING_AMENDMENT_RECOVERY ->
+        OPERATOR_ACTION_REQUIRED.
+        """
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        backlog_dir = tmp_path / "backlog"
+        story_dir = backlog_dir / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+
+        # Task T10: HOLD status -> HELD
+        (story_dir / "E0-F1-S1-T10.md").write_text(
+            "# E0-F1-S1-T10: Hold Task\n\n## Status: hold\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n"
+        )
+        # Task T11: blocked, marker pointing at T10 (HOLD) -> BLOCKED_ON_HELD
+        (story_dir / "E0-F1-S1-T11.md").write_text(
+            "# E0-F1-S1-T11: Blocked On Hold\n\n## Status: blocked\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
+            "## Comments\n\n"
+            "[2026-04-20 00:00 UTC] [agent/task_factory] [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T10\n"
+        )
+        # Task T12: blocked, marker pointing at in-queue target -> AUTO_CLEARING_VIA_PROPOSAL
+        (story_dir / "E0-F1-S1-T12.md").write_text(
+            "# E0-F1-S1-T12: Auto Clearing\n\n## Status: blocked\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
+            "## Comments\n\n"
+            "[2026-04-20 00:00 UTC] [agent/task_factory] [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T13\n"
+        )
+        (story_dir / "E0-F1-S1-T13.md").write_text("# E0-F1-S1-T13: In Queue\n\n## Status: in-queue\n")
+        # Task T14: blocked, regular dep row pointing at in-queue T15, no marker
+        (story_dir / "E0-F1-S1-T14.md").write_text(
+            "# E0-F1-S1-T14: Awaiting Dep\n\n## Status: blocked\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n"
+            "| E0-F1-S1-T15 | Dep | in-queue |\n\n"
+            "## Comments\n"
+        )
+        (story_dir / "E0-F1-S1-T15.md").write_text("# E0-F1-S1-T15: Dep\n\n## Status: in-queue\n")
+        # Task T16: blocked, no marker, no dep, recent recovery comment
+        now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        ts = now.strftime("%Y-%m-%d %H:%M UTC")
+        (story_dir / "E0-F1-S1-T16.md").write_text(
+            "# E0-F1-S1-T16: Awaiting Amendment\n\n## Status: blocked\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
+            f"## Comments\n\n[{ts}] [agent/backlog_manager] [BLOCKED] "
+            "dependency 'E0-F1-S1-T15' not yet terminal\n"
+        )
+        # Task T17: blocked, no marker, no dep, no recovery signal
+        (story_dir / "E0-F1-S1-T17.md").write_text(
+            "# E0-F1-S1-T17: Operator Required\n\n## Status: blocked\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
+            "## Comments\n"
+        )
+
+        _bp = "backlog/E0/E0-F1/E0-F1-S1"
+        rows = [
+            f"| E0-F1-S1-T10 | Hold | Task | hold | None | r | `{_bp}/E0-F1-S1-T10.md` |",
+            f"| E0-F1-S1-T11 | BlockedOnHold | Task | blocked | None | r | `{_bp}/E0-F1-S1-T11.md` |",
+            f"| E0-F1-S1-T12 | AutoClearing | Task | blocked | None | r | `{_bp}/E0-F1-S1-T12.md` |",
+            f"| E0-F1-S1-T13 | InQueue | Task | in-queue | None | r | `{_bp}/E0-F1-S1-T13.md` |",
+            f"| E0-F1-S1-T14 | AwaitingDep | Task | blocked | E0-F1-S1-T15 | r | `{_bp}/E0-F1-S1-T14.md` |",
+            f"| E0-F1-S1-T15 | Dep | Task | in-queue | None | r | `{_bp}/E0-F1-S1-T15.md` |",
+            f"| E0-F1-S1-T16 | AwaitingAmendment | Task | blocked | None | r | `{_bp}/E0-F1-S1-T16.md` |",
+            f"| E0-F1-S1-T17 | Operator | Task | blocked | None | r | `{_bp}/E0-F1-S1-T17.md` |",
+        ]
+        (tmp_path / "BACKLOG.md").write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n" + "\n".join(rows) + "\n"
+        )
+
+        cases: list[tuple[str, BlockedTaskState]] = [
+            ("E0-F1-S1-T10", BlockedTaskState.HELD),
+            ("E0-F1-S1-T11", BlockedTaskState.BLOCKED_ON_HELD),
+            ("E0-F1-S1-T12", BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL),
+            ("E0-F1-S1-T14", BlockedTaskState.AWAITING_DEPENDENCY),
+            ("E0-F1-S1-T16", BlockedTaskState.AWAITING_AMENDMENT_RECOVERY),
+            ("E0-F1-S1-T17", BlockedTaskState.OPERATOR_ACTION_REQUIRED),
+        ]
+        for task_id, expected in cases:
+            state = classify_blocked_task(
+                backlog_dir,
+                tmp_path / "BACKLOG.md",
+                task_id,
+                workspace_root=tmp_path,
+                now=now,
+                recovery_window_seconds=300,
+            )
+            assert state is expected, f"{task_id}: expected {expected.name}, got {state.name}"

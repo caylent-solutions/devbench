@@ -277,17 +277,12 @@ def _print_blocked_panel_by_bucket(
     blocked_tasks: list[WorkUnit],
     units_by_id: dict[str, WorkUnit],
 ) -> None:
-    """Issue #149 follow-up: split the ``--detail`` blocked panel by
-    classifier bucket so operators see at a glance which tasks need
-    attention vs which will auto-clear. Three sections matching the
-    summary-table buckets: AUTO_CLEARING_VIA_PROPOSAL /
-    AWAITING_AUTO_RECOVERY / NEEDS_OPERATOR_ATTENTION.
+    """Split the ``--detail`` blocked panel by classifier bucket.
+
+    Up to six separate panel headers are rendered, one per non-empty
+    ``BlockedTaskState`` bucket.  Empty buckets are silently omitted.
     """
-    buckets: dict[BlockedTaskState, list[WorkUnit]] = {
-        BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL: [],
-        BlockedTaskState.AWAITING_AUTO_RECOVERY: [],
-        BlockedTaskState.NEEDS_OPERATOR_ATTENTION: [],
-    }
+    buckets: dict[BlockedTaskState, list[WorkUnit]] = {s: [] for s in BlockedTaskState}
     for u in blocked_tasks:
         state = classify_blocked_task(
             backlog_root=BACKLOG_ROOT,
@@ -298,8 +293,11 @@ def _print_blocked_panel_by_bucket(
         buckets[state].append(u)
     bucket_headers = [
         (BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL, "Blocked tasks (auto-clearing via proposal)"),
-        (BlockedTaskState.AWAITING_AUTO_RECOVERY, "Blocked tasks (awaiting auto-recovery)"),
-        (BlockedTaskState.NEEDS_OPERATOR_ATTENTION, "Blocked tasks (needs operator attention)"),
+        (BlockedTaskState.AWAITING_DEPENDENCY, "Blocked tasks (awaiting dependency)"),
+        (BlockedTaskState.AWAITING_AMENDMENT_RECOVERY, "Blocked tasks (awaiting amendment recovery)"),
+        (BlockedTaskState.HELD, "Held tasks"),
+        (BlockedTaskState.BLOCKED_ON_HELD, "Blocked tasks (blocked on held)"),
+        (BlockedTaskState.OPERATOR_ACTION_REQUIRED, "Blocked tasks (operator action required)"),
     ]
     for state, header in bucket_headers:
         tasks = buckets[state]
@@ -4709,7 +4707,7 @@ def _enforce_materialise_lifecycle_gates(source_task_id: str, proposal: Proposal
     except CascadeDepthError as exc:
         print(
             f"ERROR: cascade-depth limit reached for {source_task_id}: {exc}\n"
-            f"Source task escalated to NEEDS_OPERATOR_ATTENTION (no draft materialised).",
+            f"Source task escalated to OPERATOR_ACTION_REQUIRED (no draft materialised).",
             file=sys.stderr,
         )
         return 1
@@ -5260,16 +5258,21 @@ def _count_unmaterialised_proposed_tasks() -> int:
 
 
 def _count_blocked_split(units: list[WorkUnit]) -> tuple[int, int, int]:
-    """Return ``(auto_count, recovery_count, attn_count)`` for the 3-state split.
+    """Return ``(auto_count, recovery_count, attn_count)`` for the 6-state split.
 
     Iterates every blocked work unit and classifies it via
-    :func:`classify_blocked_task`. The three counts always sum to the
-    total number of blocked tasks in ``units`` so the aggregate is
-    recoverable by addition. ``recovery_count`` is the new
-    ``AWAITING_AUTO_RECOVERY`` bucket: tasks devbench will resolve on
-    its own via the manifest-amender / blocker-resolver / task-factory
-    loop, but that have not yet reached the
-    ``[BLOCKED_PENDING_PROPOSAL]`` marker state.
+    :func:`classify_blocked_task`. The three display counts always sum to
+    the total number of blocked tasks in ``units`` so the aggregate is
+    recoverable by addition.
+
+    Only BLOCKED-status tasks are iterated; HOLD-status tasks are excluded by
+    the ``u.status != WorkUnitStatus.BLOCKED`` guard, so the HELD state is
+    unreachable through this function.
+
+    Display grouping:
+    - ``auto_count`` -- AUTO_CLEARING_VIA_PROPOSAL
+    - ``recovery_count`` -- AWAITING_DEPENDENCY + AWAITING_AMENDMENT_RECOVERY
+    - ``attn_count`` -- BLOCKED_ON_HELD + OPERATOR_ACTION_REQUIRED
     """
     auto = 0
     recovery = 0
@@ -5286,7 +5289,7 @@ def _count_blocked_split(units: list[WorkUnit]) -> tuple[int, int, int]:
         )
         if state is BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL:
             auto += 1
-        elif state is BlockedTaskState.AWAITING_AUTO_RECOVERY:
+        elif state in (BlockedTaskState.AWAITING_DEPENDENCY, BlockedTaskState.AWAITING_AMENDMENT_RECOVERY):
             recovery += 1
         else:
             attn += 1

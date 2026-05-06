@@ -821,7 +821,7 @@ def _compute_window_stats(
 
     Issue #157: the ETA denominator now includes blocked tasks that
     devbench will recover on its own -- ``tasks_blocked_recovery``
-    (AWAITING_AUTO_RECOVERY) and ``tasks_blocked_auto``
+    (AWAITING_AMENDMENT_RECOVERY + AWAITING_DEPENDENCY) and ``tasks_blocked_auto``
     (AUTO_CLEARING_VIA_PROPOSAL) -- in addition to ``tasks_active``.
     The operator-attention bucket stays excluded since those represent
     genuine halts with unbounded ETA. When the recent-pace window has
@@ -1625,9 +1625,11 @@ class _BacklogTotals:
     # Issue #157: blocked tasks split by their recovery classifier so the
     # ETA projection can include recovery+auto buckets while excluding the
     # genuine-halt operator-attention bucket.
-    tasks_blocked_recovery: int = 0  # AWAITING_AUTO_RECOVERY
+    tasks_blocked_recovery: int = 0  # AWAITING_AMENDMENT_RECOVERY + AWAITING_DEPENDENCY
     tasks_blocked_auto: int = 0  # AUTO_CLEARING_VIA_PROPOSAL
-    tasks_blocked_attn: int = 0  # NEEDS_OPERATOR_ATTENTION
+    # BLOCKED_ON_HELD + OPERATOR_ACTION_REQUIRED
+    # (HELD excluded: only BLOCKED-status tasks are classified)
+    tasks_blocked_attn: int = 0
 
 
 def _backlog_totals_from_units(units: list) -> _BacklogTotals:
@@ -1645,7 +1647,7 @@ def _backlog_totals_from_units(units: list) -> _BacklogTotals:
     tasks_remaining = len(tasks) - len(tasks_done) - len(tasks_proposed) - len(tasks_declined)
 
     # Issue #157: classify blocked tasks so the ETA projection can include
-    # the auto-clearing + awaiting-recovery buckets (devbench will resolve
+    # the auto-clearing + recovery buckets (AWAITING_AMENDMENT_RECOVERY + AWAITING_DEPENDENCY) (devbench will resolve
     # them on its own) while excluding the operator-attention bucket
     # (genuine halt -> unbounded ETA).
     blocked_recovery = 0
@@ -1663,10 +1665,13 @@ def _backlog_totals_from_units(units: list) -> _BacklogTotals:
                     workspace_root=WORKSPACE_ROOT,
                 )
             except (FileNotFoundError, ValueError, OSError):
-                state = BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+                state = BlockedTaskState.OPERATOR_ACTION_REQUIRED
             if state is BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL:
                 blocked_auto += 1
-            elif state is BlockedTaskState.AWAITING_AUTO_RECOVERY:
+            elif state in (
+                BlockedTaskState.AWAITING_AMENDMENT_RECOVERY,
+                BlockedTaskState.AWAITING_DEPENDENCY,
+            ):
                 blocked_recovery += 1
             else:
                 blocked_attn += 1
@@ -1807,41 +1812,44 @@ def _in_progress_listing(units: list, log_path: Path | None = None) -> list[str]
 
 
 def _blocked_listing(units: list) -> list[str]:
-    """Part-1: render blocked tasks in three panels.
+    """Render blocked tasks grouped into up to three display panels using the 6-state classifier.
 
-    The 3-state classifier sorts each blocked task into one of:
+    The 6-state classifier sorts each blocked task into one of:
 
     1. ``Blocked tasks (auto-clearing via proposal)`` -- ADR-07 cascade
        will resolve when every ``[BLOCKED_PENDING_PROPOSAL]`` marker
        target reaches terminal. Operator does nothing.
-    2. ``Blocked tasks (auto-recovery in flight)`` -- no marker yet, but
+    2. ``Blocked tasks (recovery in flight)`` -- no marker yet, but
        devbench's recovery loop has an artefact on disk (pending
        proposal JSON, rejected-amendment archive, or recent
-       recovery-agent ``[BLOCKED]`` audit comment). The next sweep
-       cycle will advance these into panel 1. Operator does nothing
-       for now.
-    3. ``Blocked tasks (needs operator attention)`` -- the true halt
-       list: manual gates (``DO NOT CLAIM``), unknown marker targets,
-       cascade-stuck states. Operator must act.
+       recovery-agent ``[BLOCKED]`` audit comment), OR the task is
+       waiting on a dependency that is not yet terminal. The next sweep
+       cycle will advance these. Operator does nothing for now.
+    3. ``Blocked tasks (operator action required)`` -- the true halt
+       list: HOLD tasks, tasks blocked on a held task, manual gates,
+       unknown marker targets, cascade-stuck states. Operator must act.
 
     Each row carries a per-state annotation: panel 1 names the task IDs
-    it is waiting on; panel 2 names which recovery signal devbench
-    found on disk; panel 3 carries just ID + title. Empty panels are
-    omitted entirely so the operator's eye lands on the panels that
-    have content.
+    it is waiting on; panel 2 carries one of two sub-case strings --
+    AWAITING_AMENDMENT_RECOVERY tasks show the recovery signal found on
+    disk (pending proposal JSON, rejected-amendment archive, or recent
+    recovery-agent audit comment), while AWAITING_DEPENDENCY tasks show
+    the hardcoded string ``"dependency not yet terminal"`` (no disk
+    access); panel 3 appends an annotation from the classifier
+    (e.g., ``[HOLD]``, ``[blocked-on-held]``, ``[operator action
+    required]``). Empty panels are omitted entirely so the operator's
+    eye lands on the panels that have content.
     """
     from devbench.backlog.proposal import (
         BlockedTaskState,
         classify_blocked_task,
-        panel3_annotation,
         recovery_signal_for_task,
     )
 
-    # Issue #168 (3-panel surfacing): admit BOTH BLOCKED and HOLD task
-    # units. HOLD bypasses the classifier and goes directly into
-    # ``attn_rows`` because it represents a deliberate operator pause
-    # that no automation will clear -- the same operator-must-act class
-    # as the residual NEEDS_OPERATOR_ATTENTION sub-cases.
+    # Admit BOTH BLOCKED and HOLD task units. The 6-state classifier returns
+    # HELD for HOLD-status tasks, BLOCKED_ON_HELD when the marker target is
+    # held, so both status values feed through the same classify_blocked_task
+    # path for consistent treatment.
     eligible = [
         u
         for u in units
@@ -1852,22 +1860,27 @@ def _blocked_listing(units: list) -> list[str]:
 
     auto_rows: list[tuple] = []  # (unit, list[str] of marker targets)
     recovery_rows: list[tuple] = []  # (unit, signal-source string)
-    # Each attn row carries (group_rank, hold_target_or_empty, unit, annotation)
-    # so the renderer can sort by (group_rank, hold_target, unit_id) for
-    # deterministic output that clusters HOLD-related rows under the
-    # HOLD unit they wait on.
-    # Each tuple: (group_rank, hold_target_or_empty, unit, annotation).
-    # ``unit`` is a ``WorkUnit``; mypy's view of the iterator above is
-    # already a WorkUnit so we annotate concretely here so downstream
-    # ``.id`` / ``.title`` accesses type-check cleanly.
+    # Each attn row carries (state_rank, unit_id, unit, annotation) for
+    # deterministic sorting that clusters by cause.
     from devbench.backlog.work_unit import WorkUnit
 
     attn_rows: list[tuple[int, str, WorkUnit, str]] = []
-    for u in eligible:
+
+    # State -> (display group, sort rank within attn).
+    attn_rank: dict[BlockedTaskState, tuple[int, str]] = {
+        BlockedTaskState.HELD: (0, "[HOLD]"),
+        BlockedTaskState.BLOCKED_ON_HELD: (1, "[blocked-on-held]"),
+        BlockedTaskState.OPERATOR_ACTION_REQUIRED: (2, "[operator action required]"),
+    }
+
+    def _route_unit(u) -> None:
+        """Classify one unit and append it to the appropriate bucket."""
+        # Short-circuit for HOLD-status units: the report layer already knows
+        # the unit's status from the parsed WorkUnit object, so we can classify
+        # without calling the filesystem-backed classify_blocked_task helper.
         if u.status is WorkUnitStatus.HOLD:
-            # group_rank 0 -- HOLD units lead panel 3.
-            attn_rows.append((0, "", u, "[HOLD]"))
-            continue
+            attn_rows.append((0, u.id, u, "[HOLD]"))
+            return
         state = classify_blocked_task(
             BACKLOG_ROOT,
             BACKLOG_INDEX,
@@ -1875,29 +1888,24 @@ def _blocked_listing(units: list) -> list[str]:
             workspace_root=WORKSPACE_ROOT,
         )
         if state is BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL:
-            # Surface which task(s) this one is waiting on. Reuse the same
-            # marker-extract helper the cascade uses so the string is always
-            # accurate.
             from devbench.backlog.manager import BacklogManager
 
             waiting_on = sorted(BacklogManager()._extract_pending_proposal_markers(u.file_path))
             auto_rows.append((u, waiting_on))
-        elif state is BlockedTaskState.AWAITING_AUTO_RECOVERY:
-            signal = recovery_signal_for_task(WORKSPACE_ROOT, u.id)
+        elif state in (BlockedTaskState.AWAITING_AMENDMENT_RECOVERY, BlockedTaskState.AWAITING_DEPENDENCY):
+            if state is BlockedTaskState.AWAITING_AMENDMENT_RECOVERY:
+                signal = recovery_signal_for_task(WORKSPACE_ROOT, u.id)
+            else:
+                signal = "dependency not yet terminal"
             recovery_rows.append((u, signal))
         else:
-            group_rank, hold_target, annotation = panel3_annotation(
-                BACKLOG_ROOT,
-                BACKLOG_INDEX,
-                u.id,
-            )
-            attn_rows.append((group_rank, hold_target or "", u, annotation))
+            rank, annotation = attn_rank.get(state, (3, "[needs review]"))
+            attn_rows.append((rank, u.id, u, annotation))
 
-    # Stable sort by (group_rank, hold_target_id, unit_id) so the panel-3
-    # rows cluster by cause: HOLD units lead, then the BLOCKED tasks
-    # waiting on each HOLD unit (grouped by the HOLD target id), then
-    # the residual no-marker / unknown-target / all-terminal cases.
-    attn_rows.sort(key=lambda r: (r[0], r[1], r[2].id))
+    for u in eligible:
+        _route_unit(u)
+
+    attn_rows.sort(key=lambda r: (r[0], r[1]))
 
     lines: list[str] = []
     if auto_rows:
@@ -1908,14 +1916,14 @@ def _blocked_listing(units: list) -> list[str]:
             lines.append(f"  - {u.id}: {u.title}{suffix}")
     if recovery_rows:
         lines.append("")
-        lines.append(f"Blocked tasks (auto-recovery in flight) ({len(recovery_rows)}):")
+        lines.append(f"Blocked tasks (recovery in flight) ({len(recovery_rows)}):")
         for u, signal in recovery_rows:
             suffix = f"    [recovery: {signal}]" if signal else ""
             lines.append(f"  - {u.id}: {u.title}{suffix}")
     if attn_rows:
         lines.append("")
-        lines.append(f"Blocked tasks (needs operator attention) ({len(attn_rows)}):")
-        for _group_rank, _hold_target, u, annotation in attn_rows:
+        lines.append(f"Blocked tasks (operator action required) ({len(attn_rows)}):")
+        for _rank, _uid, u, annotation in attn_rows:
             lines.append(f"  - {u.id}: {u.title}    {annotation}")
     return lines
 

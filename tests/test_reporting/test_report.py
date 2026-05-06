@@ -1616,7 +1616,7 @@ class TestUnitListings:
         ) -> BlockedTaskState:
             return {
                 "E0-F1-S1-T1": BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL,
-                "E0-F1-S1-T2": BlockedTaskState.NEEDS_OPERATOR_ATTENTION,
+                "E0-F1-S1-T2": BlockedTaskState.OPERATOR_ACTION_REQUIRED,
             }[task_id]
 
         class _FakeMgr:
@@ -1628,16 +1628,17 @@ class TestUnitListings:
 
         lines = report_mod._blocked_listing([unit_auto, unit_attn])
         assert "Blocked tasks (auto-clearing via proposal) (1):" in lines
-        assert "Blocked tasks (needs operator attention) (1):" in lines
+        assert "Blocked tasks (operator action required) (1):" in lines
         # Auto-clearing row names the waiting-on target.
         assert any("E0-F1-S1-T1" in line and "waiting on" in line for line in lines)
-        # Issue #168 (3-panel surfacing): every panel-3 row carries a
-        # sub-case annotation. Synthetic fixtures whose work-unit files
-        # do not exist on disk get the fallback ``[needs review]``.
-        assert any(line.startswith("  - E0-F1-S1-T2: Needs attention") and "[needs review]" in line for line in lines)
+        # Every attn-panel row carries an annotation from _ATTN_RANK.
+        assert any(
+            line.startswith("  - E0-F1-S1-T2: Needs attention") and "[operator action required]" in line
+            for line in lines
+        )
 
     def test_blocked_listing_present_when_task_blocked(self) -> None:
-        """ADR-10: without markers every blocked task renders under the 'needs attention' panel."""
+        """Without markers every blocked task renders under the 'operator action required' panel."""
         from devbench.backlog.work_unit import WorkUnitStatus
         from devbench.reporting.report import _blocked_listing
 
@@ -1647,30 +1648,33 @@ class TestUnitListings:
         ]
         lines = _blocked_listing(units)
         # Fake units have no work-unit file on disk; classifier returns
-        # NEEDS_OPERATOR_ATTENTION, so only the attn panel renders.
-        assert "Blocked tasks (needs operator attention) (2):" in lines
-        # Issue #168 (3-panel surfacing): rows now carry a sub-case
-        # annotation. Synthetic fixtures get ``[needs review]``.
-        assert any(line.startswith("  - E0-F2-S1-T3: Disable pager") and "[needs review]" in line for line in lines)
-        assert any(line.startswith("  - E0-F5-S2-T2: Pipeline tests") and "[needs review]" in line for line in lines)
+        # OPERATOR_ACTION_REQUIRED, so only the attn panel renders.
+        assert "Blocked tasks (operator action required) (2):" in lines
+        # Each attn row carries the OPERATOR_ACTION_REQUIRED annotation.
+        assert any(
+            line.startswith("  - E0-F2-S1-T3: Disable pager") and "[operator action required]" in line for line in lines
+        )
+        assert any(
+            line.startswith("  - E0-F5-S2-T2: Pipeline tests") and "[operator action required]" in line
+            for line in lines
+        )
         # Auto panel NOT rendered because no auto-clearing tasks in fixture.
         assert not any("auto-clearing" in line for line in lines)
 
     def test_blocked_listing_renders_hold_unit_in_panel_3_with_hold_annotation(self) -> None:
-        """Issue #168: HOLD work units surface in panel 3 with [HOLD] annotation."""
+        """HOLD work units surface in the operator-action-required panel with [HOLD] annotation."""
         from devbench.backlog.work_unit import WorkUnitStatus
         from devbench.reporting.report import _blocked_listing
 
         units = [self._mk_unit("E0-F5-S1-T1", "kanon-main2-sync-blocker", WorkUnitStatus.HOLD)]
         lines = _blocked_listing(units)
-        # Panel 3 header rendered with count 1.
-        assert "Blocked tasks (needs operator attention) (1):" in lines
-        # Row carries the [HOLD] annotation; HOLD unit leads the panel.
+        # Attn panel rendered with count 1.
+        assert "Blocked tasks (operator action required) (1):" in lines
+        # Row carries the [HOLD] annotation; HELD unit leads the panel.
         assert any(line.startswith("  - E0-F5-S1-T1: kanon-main2-sync-blocker") and "[HOLD]" in line for line in lines)
 
     def test_blocked_listing_sorts_panel_3_with_hold_units_first(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Issue #168: HOLD units cluster at the top of panel 3 ahead of any
-        BLOCKED tasks waiting on them, in deterministic ID order."""
+        """HELD units cluster at rank 0 in the attn panel ahead of BLOCKED_ON_HELD dependents."""
         from devbench.backlog.proposal import BlockedTaskState
         from devbench.backlog.work_unit import WorkUnitStatus
         from devbench.reporting import report as report_mod
@@ -1678,24 +1682,25 @@ class TestUnitListings:
         hold_unit = self._mk_unit("E0-F5-S1-T1", "kanon-main2-sync", WorkUnitStatus.HOLD)
         dep_unit = self._mk_unit("E4-F2-S4-T1", "TDD telemetry", WorkUnitStatus.BLOCKED)
 
+        def fake_classify(backlog_root, backlog_index, task_id, **kwargs):
+            if task_id == "E0-F5-S1-T1":
+                return BlockedTaskState.HELD
+            return BlockedTaskState.BLOCKED_ON_HELD
+
         monkeypatch.setattr(
             "devbench.backlog.proposal.classify_blocked_task",
-            lambda *a, **kw: BlockedTaskState.NEEDS_OPERATOR_ATTENTION,
-        )
-        monkeypatch.setattr(
-            "devbench.backlog.proposal.panel3_annotation",
-            lambda *a, **kw: (1, "E0-F5-S1-T1", "[HOLD: E0-F5-S1-T1]"),
+            fake_classify,
         )
 
         lines = report_mod._blocked_listing([dep_unit, hold_unit])
-        # Locate the panel-3 rows.
-        panel3_idx = lines.index("Blocked tasks (needs operator attention) (2):")
-        rows = [line for line in lines[panel3_idx + 1 :] if line.startswith("  - ")]
-        # HOLD unit (group 0) precedes the BLOCKED-on-HOLD dependent (group 1).
+        # Locate the attn panel rows.
+        panel_idx = lines.index("Blocked tasks (operator action required) (2):")
+        rows = [line for line in lines[panel_idx + 1 :] if line.startswith("  - ")]
+        # HELD unit (rank 0) precedes the BLOCKED_ON_HELD dependent (rank 1).
         assert rows[0].startswith("  - E0-F5-S1-T1")
         assert "[HOLD]" in rows[0]
         assert rows[1].startswith("  - E4-F2-S4-T1")
-        assert "[HOLD: E0-F5-S1-T1]" in rows[1]
+        assert "[blocked-on-held]" in rows[1]
 
     def test_listings_empty_when_no_matching_tasks(self) -> None:
         from devbench.backlog.work_unit import WorkUnitStatus

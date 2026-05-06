@@ -4242,7 +4242,7 @@ class TestCmdStatusBlockedSplit:
         ) -> BlockedTaskState:
             if task_id == "E0-F1-S1-T1":
                 return BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL
-            return BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+            return BlockedTaskState.OPERATOR_ACTION_REQUIRED
 
         parser = MagicMock()
         parser.parse_index.return_value = [unit_a, unit_b]
@@ -4265,9 +4265,9 @@ class TestCmdStatusBlockedSplit:
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        """Issue #149 follow-up: the ``--detail`` panel splits the blocked
-        list into three bucket sections (auto-clearing, awaiting-recovery,
-        needs-attention). Empty buckets are omitted from the output.
+        """Issue #149 follow-up: the ``--detail`` panel renders up to six separate blocked-task panels, one per non-empty BlockedTaskState bucket.
+
+        Empty buckets are omitted from the output.
         """
         from devbench.backlog.proposal import BlockedTaskState
         from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
@@ -4308,8 +4308,8 @@ class TestCmdStatusBlockedSplit:
         ) -> BlockedTaskState:
             return {
                 "E0-F1-S1-T1": BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL,
-                "E0-F1-S1-T2": BlockedTaskState.AWAITING_AUTO_RECOVERY,
-                "E0-F1-S1-T3": BlockedTaskState.NEEDS_OPERATOR_ATTENTION,
+                "E0-F1-S1-T2": BlockedTaskState.AWAITING_AMENDMENT_RECOVERY,
+                "E0-F1-S1-T3": BlockedTaskState.OPERATOR_ACTION_REQUIRED,
             }[task_id]
 
         parser = MagicMock()
@@ -4327,12 +4327,12 @@ class TestCmdStatusBlockedSplit:
         assert rc == 0
         out = capsys.readouterr().out
         assert "Blocked tasks (auto-clearing via proposal) (1):" in out
-        assert "Blocked tasks (awaiting auto-recovery) (1):" in out
-        assert "Blocked tasks (needs operator attention) (1):" in out
+        assert "Blocked tasks (awaiting amendment recovery) (1):" in out
+        assert "Blocked tasks (operator action required) (1):" in out
         # Each task appears exactly under its own bucket header.
         auto_pos = out.index("Blocked tasks (auto-clearing via proposal)")
-        recovery_pos = out.index("Blocked tasks (awaiting auto-recovery)")
-        attn_pos = out.index("Blocked tasks (needs operator attention)")
+        recovery_pos = out.index("Blocked tasks (awaiting amendment recovery)")
+        attn_pos = out.index("Blocked tasks (operator action required)")
         assert auto_pos < recovery_pos < attn_pos, "buckets must render in classifier order"
         assert out.index("E0-F1-S1-T1") < recovery_pos
         assert recovery_pos < out.index("E0-F1-S1-T2") < attn_pos
@@ -4374,8 +4374,8 @@ class TestCmdStatusBlockedSplit:
         assert rc == 0
         out = capsys.readouterr().out
         assert "Blocked tasks (auto-clearing via proposal) (1):" in out
-        assert "Blocked tasks (awaiting auto-recovery)" not in out
-        assert "Blocked tasks (needs operator attention)" not in out
+        assert "Blocked tasks (awaiting amendment recovery)" not in out
+        assert "Blocked tasks (operator action required)" not in out
 
 
 class TestCmdListProposalsStateLabels:
@@ -7118,7 +7118,7 @@ class TestCmdMaterialiseProposalLifecycleGates:
         assert rc == 1
         err = capsys.readouterr().err
         assert "cascade-depth limit reached" in err
-        assert "NEEDS_OPERATOR_ATTENTION" in err
+        assert "OPERATOR_ACTION_REQUIRED" in err
 
     def test_cascade_depth_below_cap_passes_through_to_source_lookup(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]

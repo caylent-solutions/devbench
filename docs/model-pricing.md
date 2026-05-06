@@ -54,7 +54,7 @@ Cache-write tokens are read from the nested `usage.cache_creation.ephemeral_5m_i
 
 ## Calibrating cost rates against actual billing
 
-The reported cost should equal actual API billing within ~1%. If the report drifts from the actual invoice (model swap, 1M-context premium tier, contract pricing, region surcharge, or any other rate variant), recalibrate by deriving a correction factor from a recent run:
+The reported cost should closely match actual API billing when the configured rates match your model and platform. If the report drifts noticeably from the actual invoice (model swap, 1M-context premium tier, contract pricing, region surcharge, or any other rate variant), recalibrate by deriving a correction factor from a recent run:
 
 ```
 correction_factor = actual_billing / reported_cost
@@ -94,7 +94,7 @@ Edit and re-run `devbench report` once on the same log window; the new value sho
 | Claude Haiku 3.5  | $0.80 | $4    | $0.08      | $1                | $1.60            |
 | Claude Haiku 3    | $0.25 | $1.25 | $0.03      | $0.30             | $0.50            |
 
-> Opus 4.7 introduced a new tokenizer that may use up to ~35% more tokens for the same fixed text compared to earlier models -- factor this into cost projections when migrating between Opus generations.
+> Opus 4.7 introduced a new tokenizer that may use significantly more tokens for the same fixed text compared to earlier models -- factor this into cost projections when migrating between Opus generations.
 
 The cache columns are derived from the input rate via the standard Anthropic multipliers (0.10x for reads, 1.25x for 5-min writes, 2.0x for 1-hr writes) and are applied automatically by `devbench report` -- you do not need to set them unless your deployment platform uses different multipliers.
 
@@ -146,7 +146,7 @@ report:
 
 ### Mixed-model setups
 
-If your orchestrator uses different models for different roles (for example, Opus for executor and Sonnet for judges via `executor_model` / `judge_model` in `devbench.yaml`), pick the rate of the model that consumes the most tokens -- usually the executor -- for the most accurate single-figure estimate. There is no per-role cost split in `devbench report` yet (see [Current gaps](architecture.md#section-10--current-gaps-known-limitations) in the architecture doc).
+If your orchestrator uses different models for different roles (for example, Opus for executor and Sonnet for judges via `executor_model` / `judge_model` in `devbench.yaml`), pick the rate of the model that consumes the most tokens -- usually the executor -- for the most accurate single-figure estimate. There is no per-role cost split in `devbench report` yet (see [Current gaps](architecture.md#10-current-gaps-known-limitations) in the architecture doc).
 
 ---
 
@@ -274,7 +274,7 @@ est_total_cost = cost.total_cost + recent_per_task_cost * eta_task_count
 Where:
 
 - `cost.total_cost` is the cumulative spend in the report window (per-window).
-- `recent_per_task_cost` is the **global** average cost across the most-recent `RECENT_PACE_TASKS` (default 5) completions log-wide. Computed once per report invocation by walking the umbrella interval `[earliest_progress_of_recent_N, now]`, summing hook + transcript token costs across that interval, and dividing by N.
+- `recent_per_task_cost` is the **global** average cost across the most-recent `RECENT_PACE_TASKS` (default 10) completions log-wide. Computed once per report invocation by walking the umbrella interval `[earliest_progress_of_recent_N, now]`, summing hook + transcript token costs across that interval, and dividing by N.
 - `eta_task_count` is the same denominator the time-projection uses (active + auto-recovery + auto-clearing buckets).
 
 When the log has fewer than `RECENT_PACE_TASKS` completions, `recent_per_task_cost` is `None` and the calculation falls back to the per-window average (`cost.total_cost / tasks_in_window`), matching the existing `recent_pace_minutes` fallback contract. When there are zero completions log-wide the projection equals the cumulative spend (no synthetic projection from no data).

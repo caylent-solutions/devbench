@@ -120,6 +120,50 @@ wraps `gh pr checks --watch` and classifies the outcome into one of four
   timeout. `git-ops-finalize` logs `[CI_WATCH_TIMEOUT]` and returns rc=2
   without changing any task statuses; the operator decides the next step.
 
+### Auto-finalize and auto-merge toggles
+
+Two optional boolean knobs control whether the orchestrate skill invokes
+`git-ops-finalize` automatically and whether it merges the batch PR after
+CI turns green.
+
+| `auto_finalize` | `auto_merge` | Behaviour |
+|-----------------|--------------|-----------|
+| `false` (default) | `false` (default) | Manual flow preserved: operator runs `devbench git-ops-finalize` by hand; merge is a human decision. |
+| `true` | `false` | Orchestrate skill invokes `git-ops-finalize` once every actionable unit reaches a terminal state. PR is created and CI is watched (see [Post-finalize CI watching](#post-finalize-ci-watching-and-failure-resolution)); **not merged** -- merging stays a human decision. |
+| `true` | `true` | Same as above; after the CI watcher reports GREEN, the skill invokes `gh pr merge` using the top-level `merge_strategy` config. Emits `[BATCH_PR_MERGED] <pr_url>` on the orchestrator log. |
+| `false` | `true` | **Rejected at config-load time.** `auto_merge: true` requires `auto_finalize: true`. |
+
+Re-entry guards prevent duplicate operations: a marker file at
+`<workspace>/.devbench/auto-finalize-fired-<repo>.marker` is written
+after a successful finalize; `<workspace>/.devbench/auto-merge-fired-<repo>.marker`
+is written after a successful merge. Subsequent orchestrate iterations
+short-circuit when the marker is present.
+
+#### Schema-validation rules
+
+The schema rejects the following combinations at config-load time:
+
+- `auto_finalize: true` without `defer_pr: true` -- `auto_finalize` is
+  meaningful only in single-PR mode. Validator emits a clear error.
+- `auto_finalize: true` + `pause_before_merge: true` -- already mutually
+  exclusive via `defer_pr`; the validator enforces this directly.
+- `auto_finalize: true` + `local_only: true` -- rejected at config-load
+  time; local-only repos have no remote to push to, so git-ops-finalize
+  cannot create a PR.
+- `auto_merge: true` without `auto_finalize: true` -- rejected; the
+  combination is meaningless (no PR would be created to merge).
+- `auto_merge: true` + `local_only: true` -- rejected; no remote means
+  no PR means nothing to merge.
+
+#### Dependency on the CI watcher (E7)
+
+`auto_merge: true` depends on the CI watcher reporting GREEN before the
+merge fires. See [Post-finalize CI watching and failure resolution](#post-finalize-ci-watching-and-failure-resolution)
+for the four `CIResult` values and how each affects the merge decision.
+When the CI watcher is absent (E7 not yet deployed), `auto_merge: true`
+short-circuits with a `[AUTO_MERGE_SKIPPED] no_ci_watcher` audit row and
+the operator must merge manually.
+
 ## Pause-before-merge mode (#101)
 
 ```yaml

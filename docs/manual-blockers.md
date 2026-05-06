@@ -11,6 +11,8 @@ Manual blockers are the canonical pattern for representing dependencies that dev
 - External-team handoffs (DNS delegations, vendor onboarding, MDM rollouts).
 - Human approval gates (compliance review, security sign-off) that produce no devbench-trackable artifact.
 
+This document covers the manual-blocker (`DO NOT CLAIM`) operator pattern. For the full taxonomy of every blocked-task class, see [block-types.md](block-types.md).
+
 ## When to use a manual blocker vs a regular dependency
 
 | Situation | Pattern |

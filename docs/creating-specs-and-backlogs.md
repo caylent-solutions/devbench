@@ -466,10 +466,10 @@ Per [`cross-backlog-dependencies.md`](cross-backlog-dependencies.md), if this ba
 
 ### Phase 8 -- Pre-flight checklist (required, before launching the orchestrator)
 
-Before invoking `devbench orchestrate` for the first time on a backlog, run this triplet:
+Before invoking `devbench start` for the first time on a backlog, run this triplet:
 
 1. `devbench validate-backlog` exits 0.
-2. (When the `devbench check` Tier 3 tooling lands) `devbench check` exits 0 -- verifies symlinks, origin remotes, `default_branch` parity between `devbench.yaml` and remote, and absence of conflicting open PRs against `single_branch`.
+2. `devbench check` exits 0 -- verifies symlinks, origin remotes, `default_branch` parity between `devbench.yaml` and remote, and absence of conflicting open PRs against `single_branch`.
 3. `git status` in every target repo shows the workspace clean (no stale uncommitted edits that would conflict with `feat/<branch>` ensure-branch).
 
 If any of (1)/(2)/(3) fails, halt and surface to the operator before launching. Empty target repos (no `main` commit) and `default_branch` mismatches between `devbench.yaml` and remote are the most common pre-flight failures observed.

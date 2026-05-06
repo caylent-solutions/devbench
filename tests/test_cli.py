@@ -4182,9 +4182,9 @@ class TestCmdStatusUnmaterialisedLine:
 
 
 class TestCmdStatusBlockedSplit:
-    """ADR-10: status emits Blocked (auto) + Blocked (attn) rows always."""
+    """ADR-10: status emits six Blocked (...) rows always (one per BlockedTaskState)."""
 
-    def test_status_emits_both_blocked_rows_even_at_zero(
+    def test_status_emits_six_blocked_rows_even_at_zero(
         self,
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
@@ -4201,8 +4201,12 @@ class TestCmdStatusBlockedSplit:
             rc = cli.cmd_status()
         assert rc == 0
         out = capsys.readouterr().out
-        assert re.search(r"Blocked \(auto\)\s+0\b", out), out
-        assert re.search(r"Blocked \(attn\)\s+0\b", out), out
+        assert re.search(r"Blocked \(auto-clearing\)\s+0\b", out), out
+        assert re.search(r"Blocked \(amendment-recovery\)\s+0\b", out), out
+        assert re.search(r"Blocked \(dependency\)\s+0\b", out), out
+        assert re.search(r"Blocked \(held\)\s+0\b", out), out
+        assert re.search(r"Blocked \(blocked-on-held\)\s+0\b", out), out
+        assert re.search(r"Blocked \(operator-required\)\s+0\b", out), out
         # The bare "Blocked" row must NOT appear (it was replaced by the split).
         # Match the exact formatted row the pre-split code used to emit.
         assert not re.search(r"^\s*Blocked\s+\d+\s*$", out, flags=re.MULTILINE), out
@@ -4257,15 +4261,16 @@ class TestCmdStatusBlockedSplit:
             rc = cli.cmd_status()
         assert rc == 0
         out = capsys.readouterr().out
-        assert re.search(r"Blocked \(auto\)\s+1\b", out), out
-        assert re.search(r"Blocked \(attn\)\s+1\b", out), out
+        assert re.search(r"Blocked \(auto-clearing\)\s+1\b", out), out
+        assert re.search(r"Blocked \(operator-required\)\s+1\b", out), out
 
     def test_status_detail_renders_three_blocked_bucket_sections(
         self,
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        """Issue #149 follow-up: the ``--detail`` panel renders up to six separate blocked-task panels, one per non-empty BlockedTaskState bucket.
+        """Issue #149 follow-up: the ``--detail`` panel renders up to six separate blocked-task panels,
+        one per non-empty BlockedTaskState bucket.
 
         Empty buckets are omitted from the output.
         """
@@ -9741,3 +9746,158 @@ class TestCmdUpgrade:
         ):
             cli.cmd_upgrade()
         assert "Phase 7 (Parquet archive, opt-in)" in capsys.readouterr().out
+
+
+class TestCmdStatusSixBucketCounts:
+    """E2-F2-S2-T1: cmd_status prints six Blocked count rows and six detail panels."""
+
+    _CANONICAL_COUNT_LABELS: ClassVar[list[str]] = [
+        "Blocked (auto-clearing)",
+        "Blocked (amendment-recovery)",
+        "Blocked (dependency)",
+        "Blocked (held)",
+        "Blocked (blocked-on-held)",
+        "Blocked (operator-required)",
+    ]
+
+    _CANONICAL_PANEL_HEADERS: ClassVar[list[str]] = [
+        "Blocked tasks (auto-clearing via proposal)",
+        "Blocked tasks (awaiting amendment recovery)",
+        "Blocked tasks (awaiting dependency)",
+        "Held tasks",
+        "Blocked tasks (blocked on held)",
+        "Blocked tasks (operator action required)",
+    ]
+
+    def _make_blocked_unit(self, unit_id: str, title: str) -> WorkUnit:
+        return WorkUnit(
+            id=unit_id,
+            title=title,
+            status=WorkUnitStatus.BLOCKED,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path(f"/fake/{unit_id}.md"),
+            repo="r",
+            dependencies=[],
+        )
+
+    def _make_six_unit_fixture(
+        self,
+    ) -> tuple[list[WorkUnit], Any]:
+        """Return (units, classify_side_effect) covering one task per BlockedTaskState."""
+        from devbench.backlog.proposal import BlockedTaskState
+
+        units = [
+            self._make_blocked_unit("E9-F1-S1-T1", "Auto"),
+            self._make_blocked_unit("E9-F1-S1-T2", "AmendmentRecovery"),
+            self._make_blocked_unit("E9-F1-S1-T3", "Dependency"),
+            self._make_blocked_unit("E9-F1-S1-T4", "Held"),
+            self._make_blocked_unit("E9-F1-S1-T5", "BlockedOnHeld"),
+            self._make_blocked_unit("E9-F1-S1-T6", "Operator"),
+        ]
+
+        state_map = {
+            "E9-F1-S1-T1": BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL,
+            "E9-F1-S1-T2": BlockedTaskState.AWAITING_AMENDMENT_RECOVERY,
+            "E9-F1-S1-T3": BlockedTaskState.AWAITING_DEPENDENCY,
+            "E9-F1-S1-T4": BlockedTaskState.HELD,
+            "E9-F1-S1-T5": BlockedTaskState.BLOCKED_ON_HELD,
+            "E9-F1-S1-T6": BlockedTaskState.OPERATOR_ACTION_REQUIRED,
+        }
+
+        def fake_classify(
+            backlog_root: Path,
+            backlog_index: Path,
+            task_id: str,
+            **kwargs: object,
+        ) -> BlockedTaskState:
+            return state_map[task_id]
+
+        return units, fake_classify
+
+    def test_six_count_rows_present_in_canonical_order(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Six Blocked (...) count rows appear in canonical spec order, summing to total blocked."""
+        units, fake_classify = self._make_six_unit_fixture()
+
+        parser = MagicMock()
+        parser.parse_index.return_value = units
+        parser.get_parallel_candidates.return_value = []
+        parser.get_blocked_units.return_value = units
+        parser.all_done.return_value = False
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=parser),
+            patch("devbench.cli._count_unmaterialised_proposed_tasks", return_value=0),
+            patch("devbench.cli.classify_blocked_task", side_effect=fake_classify),
+        ):
+            rc = cli.cmd_status()
+        assert rc == 0
+        out = capsys.readouterr().out
+
+        # Each label present with count 1.
+        for label in self._CANONICAL_COUNT_LABELS:
+            assert re.search(rf"{re.escape(label)}\s+1\b", out), f"missing row {label!r}\n{out}"
+
+        # Labels appear in canonical order.
+        positions = [out.index(label) for label in self._CANONICAL_COUNT_LABELS]
+        assert positions == sorted(positions), f"count rows not in canonical order\n{out}"
+
+        # Old three-bucket rows must NOT appear.
+        assert "Blocked (auto)" not in out, out
+        assert "Blocked (recovery)" not in out, out
+        assert "Blocked (attn)" not in out, out
+
+    def test_six_count_rows_all_zero_when_no_blocked(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """All six rows still print (at zero) even when no blocked tasks exist."""
+        parser = MagicMock()
+        parser.parse_index.return_value = []
+        parser.get_parallel_candidates.return_value = []
+        parser.get_blocked_units.return_value = []
+        parser.all_done.return_value = False
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=parser),
+            patch("devbench.cli._count_unmaterialised_proposed_tasks", return_value=0),
+        ):
+            rc = cli.cmd_status()
+        assert rc == 0
+        out = capsys.readouterr().out
+
+        for label in self._CANONICAL_COUNT_LABELS:
+            assert re.search(rf"{re.escape(label)}\s+0\b", out), f"missing zero row {label!r}\n{out}"
+
+    def test_six_detail_panels_in_canonical_order(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """--detail renders six panel headers in canonical spec order."""
+        units, fake_classify = self._make_six_unit_fixture()
+
+        parser = MagicMock()
+        parser.parse_index.return_value = units
+        parser.get_parallel_candidates.return_value = []
+        parser.get_blocked_units.return_value = units
+        parser.all_done.return_value = False
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=parser),
+            patch("devbench.cli._count_unmaterialised_proposed_tasks", return_value=0),
+            patch("devbench.cli.classify_blocked_task", side_effect=fake_classify),
+            patch("devbench.cli._resolve_unit_file", return_value=None),
+        ):
+            rc = cli.cmd_status("--detail")
+        assert rc == 0
+        out = capsys.readouterr().out
+
+        # All six panel headers present.
+        for header in self._CANONICAL_PANEL_HEADERS:
+            assert header in out, f"missing panel header {header!r}\n{out}"
+
+        # Panel headers appear in canonical order.
+        positions = [out.index(header) for header in self._CANONICAL_PANEL_HEADERS]
+        assert positions == sorted(positions), f"panels not in canonical order\n{out}"

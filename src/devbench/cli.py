@@ -211,11 +211,11 @@ def _parse_status_argv(argv: tuple[str, ...]) -> tuple[bool, int]:
 def cmd_status(*argv: str) -> int:
     """Print backlog summary grouped by status.
 
-    With ``--detail`` (E220), additionally render three sections:
-    in-queue (every actionable Task with the IDs of its still-open
-    dependencies), blocked (every Blocked Task with the dep IDs that
-    are still non-terminal and any ``[BLOCKED_PENDING_PROPOSAL]``
-    markers found in its Comments), and held (every Hold Task with
+    With ``--detail`` (E220), additionally render per-state sections: in-queue
+    (every actionable Task with the IDs of its still-open dependencies), six
+    blocked-task sections (one per :class:`~devbench.backlog.proposal.BlockedTaskState`
+    in canonical order: auto-clearing, amendment-recovery, dependency, held,
+    blocked-on-held, operator-required), and held (every Hold Task with
     the most recent ``[HOLD]`` reason from its Comments).
     """
     detail, parse_rc = _parse_status_argv(argv)
@@ -232,14 +232,21 @@ def cmd_status(*argv: str) -> int:
 
     total = len(units)
     unmaterialised_count = _count_unmaterialised_proposed_tasks()
-    auto_count, recovery_count, attn_count = _count_blocked_split(units)
+    blocked_counts = _count_blocked_split(units)
     print("Backlog Status Summary")
     print("=" * STATUS_SEPARATOR_WIDTH)
+    blocked_rows: list[tuple[str, BlockedTaskState]] = [
+        ("Blocked (auto-clearing)", BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL),
+        ("Blocked (amendment-recovery)", BlockedTaskState.AWAITING_AMENDMENT_RECOVERY),
+        ("Blocked (dependency)", BlockedTaskState.AWAITING_DEPENDENCY),
+        ("Blocked (held)", BlockedTaskState.HELD),
+        ("Blocked (blocked-on-held)", BlockedTaskState.BLOCKED_ON_HELD),
+        ("Blocked (operator-required)", BlockedTaskState.OPERATOR_ACTION_REQUIRED),
+    ]
     for status_val in DISPLAY_STATUS_VALUES:
         if status_val == "Blocked":
-            print(f"  {'Blocked (auto)':<15} {auto_count:>4}")
-            print(f"  {'Blocked (recovery)':<15} {recovery_count:>4}")
-            print(f"  {'Blocked (attn)':<15} {attn_count:>4}")
+            for label, state in blocked_rows:
+                print(f"  {label:<28} {blocked_counts[state]:>4}")
             continue
         count = counts.get(status_val.lower(), 0)
         print(f"  {status_val:<15} {count:>4}")
@@ -293,8 +300,8 @@ def _print_blocked_panel_by_bucket(
         buckets[state].append(u)
     bucket_headers = [
         (BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL, "Blocked tasks (auto-clearing via proposal)"),
-        (BlockedTaskState.AWAITING_DEPENDENCY, "Blocked tasks (awaiting dependency)"),
         (BlockedTaskState.AWAITING_AMENDMENT_RECOVERY, "Blocked tasks (awaiting amendment recovery)"),
+        (BlockedTaskState.AWAITING_DEPENDENCY, "Blocked tasks (awaiting dependency)"),
         (BlockedTaskState.HELD, "Held tasks"),
         (BlockedTaskState.BLOCKED_ON_HELD, "Blocked tasks (blocked on held)"),
         (BlockedTaskState.OPERATOR_ACTION_REQUIRED, "Blocked tasks (operator action required)"),
@@ -5257,26 +5264,19 @@ def _count_unmaterialised_proposed_tasks() -> int:
     return count
 
 
-def _count_blocked_split(units: list[WorkUnit]) -> tuple[int, int, int]:
-    """Return ``(auto_count, recovery_count, attn_count)`` for the 6-state split.
+def _count_blocked_split(units: list[WorkUnit]) -> dict[BlockedTaskState, int]:
+    """Return a per-bucket count for each of the six :class:`BlockedTaskState` values.
 
     Iterates every blocked work unit and classifies it via
-    :func:`classify_blocked_task`. The three display counts always sum to
-    the total number of blocked tasks in ``units`` so the aggregate is
-    recoverable by addition.
+    :func:`classify_blocked_task`. The six counts always sum to the total
+    number of blocked tasks in ``units`` so the aggregate is recoverable by
+    addition.
 
     Only BLOCKED-status tasks are iterated; HOLD-status tasks are excluded by
-    the ``u.status != WorkUnitStatus.BLOCKED`` guard, so the HELD state is
-    unreachable through this function.
-
-    Display grouping:
-    - ``auto_count`` -- AUTO_CLEARING_VIA_PROPOSAL
-    - ``recovery_count`` -- AWAITING_DEPENDENCY + AWAITING_AMENDMENT_RECOVERY
-    - ``attn_count`` -- BLOCKED_ON_HELD + OPERATOR_ACTION_REQUIRED
+    the ``u.status != WorkUnitStatus.BLOCKED`` guard.  The HELD bucket therefore
+    remains zero unless the classifier promotes a blocked task to that state.
     """
-    auto = 0
-    recovery = 0
-    attn = 0
+    result: dict[BlockedTaskState, int] = dict.fromkeys(BlockedTaskState, 0)
     for u in units:
         if u.status != WorkUnitStatus.BLOCKED:
             continue
@@ -5287,13 +5287,8 @@ def _count_blocked_split(units: list[WorkUnit]) -> tuple[int, int, int]:
             workspace_root=WORKSPACE_ROOT,
             recovery_window_seconds=BLOCKED_RECOVERY_WINDOW_SECONDS,
         )
-        if state is BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL:
-            auto += 1
-        elif state in (BlockedTaskState.AWAITING_DEPENDENCY, BlockedTaskState.AWAITING_AMENDMENT_RECOVERY):
-            recovery += 1
-        else:
-            attn += 1
-    return auto, recovery, attn
+        result[state] += 1
+    return result
 
 
 def cmd_promote_proposal(first_arg: str, second_arg: str = "") -> int:

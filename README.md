@@ -302,6 +302,36 @@ cd /path/to/devbench && watch -n 30 \
 
 In the interactive session, set the model with `/model` if needed, then ask: `Run the devbench:orchestrate skill to process the backlog`.
 
+### Starting devbench without make
+
+The `make start-interactive` and `make start` targets are thin wrappers. If you need to invoke the underlying commands directly (for example, in CI scripts or remote shells where `make` is unavailable), use these equivalents.
+
+**Interactive with `--dangerously-skip-permissions` (default `make start-interactive`)**
+
+```bash
+JUDGE_WORKSPACE_ROOT=/path/to/my-backlog \
+JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+claude --dangerously-skip-permissions --plugin-dir /path/to/devbench/plugin/devbench
+```
+
+**Interactive without `--dangerously-skip-permissions` (equivalent to `JUDGE_SAFE_PERMISSIONS=1 make start-interactive`)**
+
+```bash
+JUDGE_WORKSPACE_ROOT=/path/to/my-backlog \
+JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+claude --plugin-dir /path/to/devbench/plugin/devbench
+```
+
+Setting `JUDGE_SAFE_PERMISSIONS=1` when invoking `make start-interactive` selects the no-flag variant above. This is the safe-mode opt-out for environments that require explicit permission prompts.
+
+**Non-interactive (equivalent to `make start`)**
+
+```bash
+JUDGE_WORKSPACE_ROOT=/path/to/my-backlog \
+JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+uv run python -m devbench.cli start
+```
+
 ## Interactive mode
 
 ```bash

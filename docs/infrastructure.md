@@ -10,7 +10,7 @@ The Make targets (`ec2-secrets-sync`, `ec2-network-apply`, `ec2-init`, `ec2-plan
 
 Provisioning is two-phased on purpose:
 
-1. `ec2-apply` runs Terraform/Terragrunt — instance, IAM (incl. scoped Secrets Manager read), networking, cloud-init. Cloud-init only does the user/apt minimum.
+1. `ec2-apply` runs Terraform/Terragrunt -- instance, IAM (incl. scoped Secrets Manager read), networking, cloud-init. Cloud-init only does the user/apt minimum.
 2. `ec2-bootstrap` then pushes the ansible playbook over SSH-over-SSM and runs it on the box. The `git-auth` role fetches the operator's GitHub PAT and SSH key from AWS Secrets Manager (uploaded once via `ec2-secrets-sync`) so the devbench repo stays private and no credentials transit on every refresh.
 
 The remote workstation provisioning is independent of the orchestrate / report / watch pipeline; you can run the full devbench loop locally without any AWS infrastructure.

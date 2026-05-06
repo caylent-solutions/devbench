@@ -110,6 +110,20 @@ Process the backlog using the steps below, repeating until all work units are do
 
 11. When all work units are done and `defer_pr` mode is active, run `uv run devbench git-ops-finalize <repo>` to push the single branch and create the PR. **Skip this step entirely under `git_ops.local_only: true`** -- the target repo has no remote, so there is nothing to push and no PR to create. The local single branch is itself the deliverable.
 
+11b. **Auto-finalize check** (runs at the top of every iteration, before step 1, when `git_ops.auto_finalize: true` is set in `backlog/config/devbench.yaml`):
+   a. Detect the all-terminal trigger: run `uv run devbench status --json` and check whether every work unit for the target repo is in a terminal state (`done`, `blocked`, `needs_operator_attention`). If any unit is non-terminal, skip the remainder of this step.
+   b. When the trigger fires, check whether the marker file `<workspace>/.devbench/auto-finalize-fired-<repo>.marker` exists. If it exists, the finalize already ran -- skip to avoid duplicates.
+   c. If `git_ops.local_only: true`: emit `[AUTO_FINALIZE_SKIPPED] local_only=true` audit row via `uv run devbench log-comment agent/orchestrator <any-unit-id> "[AUTO_FINALIZE_SKIPPED] local_only=true"` and skip. The config-load validator already rejects `auto_finalize: true` + `local_only: true`, so this branch is purely defensive.
+   d. When the trigger fires and the marker is absent and `local_only` is false: invoke `uv run devbench git-ops-finalize <repo>`. On success, write the marker file (`touch <workspace>/.devbench/auto-finalize-fired-<repo>.marker`) and emit `[BATCH_PR_CREATED] <pr_url>` audit row.
+
+11c. **Auto-merge check** (runs at the top of every iteration, after 11b, when `git_ops.auto_merge: true` is set):
+   a. Verify `git_ops.auto_finalize: true` is also set (required companion -- config-load validation already enforces this, but double-check for safety).
+   b. Check whether the post-E7 CI watcher is available (E7 not yet landed means the watcher command `uv run devbench watch --once <repo>` does not exist or returns a non-zero exit code for "command not found"). If absent: emit `[AUTO_MERGE_SKIPPED] no_ci_watcher` audit row and skip -- do NOT merge.
+   c. When the watcher is present: invoke `uv run devbench watch --once <repo>` to get the current CI status for the deferred branch. If CI is not GREEN, skip until the next iteration.
+   d. When CI is GREEN, check whether the marker file `<workspace>/.devbench/auto-merge-fired-<repo>.marker` exists. If it exists, skip to avoid duplicates.
+   e. If `git_ops.local_only: true`: skip (no PR to merge). The config-load validator already rejects `auto_merge: true` + `local_only: true`, so this branch is purely defensive.
+   f. When CI is GREEN and the marker is absent: invoke `gh pr merge --<merge_strategy>` where `<merge_strategy>` is the resolved `merge_strategy` value (`merge`, `squash`, or `rebase`) from the config. On success, write the marker file and emit `[BATCH_PR_MERGED] <pr_url>` audit row.
+
 ## Standards
 
 - Never modify files under `backlog/` directly -- use `uv run devbench log-verdict` and `mark-done`.

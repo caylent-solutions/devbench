@@ -322,7 +322,7 @@ DevBench supports several git workflow patterns. They share the same review pipe
 | Push cadence | Per work unit, immediately after commit | Deferred until `git-ops-finalize` | Never (no remote) |
 | PR creation | After each unit's review passes | Once via `git-ops-finalize` after all units done | Never |
 | CI checks | One CI run per PR | One CI run on the whole batch | None |
-| Merge | Auto-merge each PR after CI passes | No auto-merge; PR left open for human merge (E9 adds opt-in auto_merge) | N/A -- local commit history is the deliverable |
+| Merge | Auto-merge each PR after CI passes | No auto-merge by default; opt-in via `git_ops.auto_merge: true` (requires `auto_finalize: true`; fires after CI watcher reports GREEN) | N/A -- local commit history is the deliverable |
 | Submodule pointer updates | Per-unit (if `update_submodule: true`) | Not supported | Not supported |
 | Best for | Independent work units that can ship separately | Related changes that must ship together | Operational work (AWS teardowns, audits, evidence capture) -- see [`operational-work.md`](operational-work.md) |
 
@@ -348,7 +348,7 @@ git_ops:
 - Every work unit's `ensure-branch` checks out `feat/embed-repo-tool` instead of `backlog/<id>`.
 - Every work unit's `git-ops` runs `commit_local()` only -- no push, no PR.
 - A `[COMMIT_DEFERRED]` comment is appended to each work unit so the audit trail shows what was committed.
-- After all work units are complete (or any time you want to flush the batch), run `devbench git-ops-finalize <repo>`. This pushes the accumulated commits, creates the single PR, and waits for CI. The PR is left open for human merge; single-PR mode never auto-merges (E9 introduces the opt-in `auto_merge` toggle).
+- After all work units are complete (or any time you want to flush the batch), run `devbench git-ops-finalize <repo>`. This pushes the accumulated commits, creates the single PR, and waits for CI. The PR is left open for human merge by default; set `git_ops.auto_merge: true` (requires `git_ops.auto_finalize: true`) to have the orchestrator invoke `gh pr merge` automatically once the CI watcher reports GREEN.
 
 ### Validation rule
 

@@ -121,6 +121,20 @@ git_ops:
   # use the built-in list (terraform state, terragrunt cache, Python
   # pycache, coverage, etc.). Non-empty REPLACES the built-in entirely.
   orphan_patterns: []
+  # When true, the orchestrate skill automatically invokes
+  # `devbench git-ops-finalize <repo>` once all work units for the repo
+  # are terminal. Requires defer_pr: true. Incompatible with local_only: true.
+  # A marker file at <workspace>/.devbench/auto-finalize-fired-<repo>.marker
+  # prevents duplicate invocations. Default: false.
+  auto_finalize: false
+  # When true, the orchestrate skill automatically invokes
+  # `gh pr merge --<merge_strategy>` once the post-E7 CI watcher reports
+  # GREEN. Requires auto_finalize: true AND defer_pr: true.
+  # Incompatible with local_only: true. When the E7 watcher is absent,
+  # emits [AUTO_MERGE_SKIPPED] no_ci_watcher and skips. A marker file at
+  # <workspace>/.devbench/auto-merge-fired-<repo>.marker prevents duplicates.
+  # Default: false.
+  auto_merge: false
   # Issue #116: opt-in PR review-comment polling. When enabled, cmd_git_ops
   # polls `gh pr view` between CI-pass and merge for asynchronous review
   # bot comments (Copilot, Q-Dev, internal review services).

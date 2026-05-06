@@ -13,7 +13,7 @@ specifically about the per-task git workflow after reviews pass.
 | Mode | YAML knobs | Per-task PR? | Auto-merge? | Use when... |
 |------|------------|--------------|-------------|-------------|
 | Multi-PR (default) | _none_ | Yes | Yes (on green CI) | You trust judges + CI to gate; no human review needed per PR. |
-| Single-branch + defer-PR | `git_ops.single_branch: <branch>` + `git_ops.defer_pr: true` | No (one batch PR) | No (CI watched after finalize; PR left open for human merge; E9 adds opt-in `auto_merge`) | You want one PR for the whole batch (e.g., dependent tasks must land atomically). |
+| Single-branch + defer-PR | `git_ops.single_branch: <branch>` + `git_ops.defer_pr: true` | No (one batch PR) | No by default; opt-in via `git_ops.auto_merge: true` (requires `auto_finalize: true`; CI watcher must report GREEN before merge fires) | You want one PR for the whole batch (e.g., dependent tasks must land atomically). |
 | Pause-before-merge (#101) | `git_ops.pause_before_merge: true` | Yes | No -- waits for human merge | You want per-task granularity AND per-PR human gating without blocking the orchestrator. |
 | Local-only | `git_ops.single_branch: <branch>` + `git_ops.defer_pr: true` + `git_ops.local_only: true` | No (no PR ever) | N/A (no remote) | Operational workflows -- AWS teardowns, evidence capture, scheduled audits -- where devbench drives work but the target "repo" has no GitHub remote and never pushes. See [`operational-work.md`](operational-work.md). |
 
@@ -92,9 +92,11 @@ wraps `gh pr checks --watch` and classifies the outcome into one of four
 `CIResult` values:
 
 - `CIResult.GREEN` -- every check passed. `git-ops-finalize` logs
-  `[CI_GREEN]` and returns rc=0. **The PR is left open for human merge;
-  single-PR mode never auto-merges.** The opt-in `auto_merge` toggle is
-  introduced by E9 and is not present in this release.
+  `[CI_GREEN]` and returns rc=0. **The PR is left open for human merge
+  by default.** When `git_ops.auto_merge: true` is set (requires
+  `git_ops.auto_finalize: true`), the orchestrator's auto-merge check
+  (SKILL.md step 11c) invokes `gh pr merge` automatically once the CI
+  watcher reports GREEN.
 
 - `CIResult.FAILED_KNOWN_TASK(task_id)` -- the failing job's log
   contains exactly one `[E<n>-...-T<n>]` commit marker that traces the

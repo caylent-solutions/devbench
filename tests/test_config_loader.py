@@ -2187,3 +2187,135 @@ class TestHookTailConfig:
         with pytest.raises(ValueError, match="failed schema validation") as exc_info:
             load_runtime_config(cfg, {})
         assert isinstance(exc_info.value.__cause__, jsonschema.ValidationError)
+
+
+# ---------------------------------------------------------------------------
+# auto_finalize + auto_merge toggle tests (AC-FUNC-001..004)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestAutoFinalizeAutoMergeConfig:
+    """Schema and loader tests for git_ops.auto_finalize and git_ops.auto_merge toggles."""
+
+    def _write(self, path: Path, content: str) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    # AC-FUNC-001: both fields default to False when absent
+    def test_auto_finalize_defaults_to_false(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.git_ops.auto_finalize is False
+
+    def test_auto_merge_defaults_to_false(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.git_ops.auto_merge is False
+
+    def test_auto_finalize_true_with_defer_pr_accepted(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            git_ops:
+              single_branch: my-branch
+              defer_pr: true
+              auto_finalize: true
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.git_ops.auto_finalize is True
+        assert rt.git_ops.defer_pr is True
+
+    def test_auto_merge_true_with_auto_finalize_and_defer_pr_accepted(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            git_ops:
+              single_branch: my-branch
+              defer_pr: true
+              auto_finalize: true
+              auto_merge: true
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.git_ops.auto_merge is True
+        assert rt.git_ops.auto_finalize is True
+        assert rt.git_ops.defer_pr is True
+
+    # AC-FUNC-002: auto_finalize: true without defer_pr: true must be rejected
+    def test_auto_finalize_without_defer_pr_raises(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            git_ops:
+              auto_finalize: true
+            """,
+        )
+        with pytest.raises(ValueError, match=r"auto_finalize: true requires .*defer_pr: true"):
+            load_runtime_config(cfg, {})
+
+    # AC-FUNC-003: auto_merge: true without auto_finalize: true must be rejected
+    def test_auto_merge_without_auto_finalize_raises(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            git_ops:
+              single_branch: my-branch
+              defer_pr: true
+              auto_merge: true
+            """,
+        )
+        with pytest.raises(ValueError, match=r"auto_merge: true requires .*auto_finalize: true"):
+            load_runtime_config(cfg, {})
+
+    # AC-FUNC-004: auto_merge: true + local_only: true must be rejected
+    def test_auto_merge_with_local_only_raises(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            git_ops:
+              single_branch: my-branch
+              defer_pr: true
+              local_only: true
+              auto_finalize: true
+              auto_merge: true
+            """,
+        )
+        # The config loader rejects any combination of auto_finalize/auto_merge
+        # with local_only=true because local-only repos have no remote. The
+        # auto_finalize + local_only check fires first (before auto_merge +
+        # local_only), so we match on "local_only: true" which appears in both
+        # error messages.
+        with pytest.raises(ValueError, match=r"local_only: true"):
+            load_runtime_config(cfg, {})

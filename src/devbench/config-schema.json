@@ -179,6 +179,14 @@
           "type": "boolean",
           "description": "When true, the target repo(s) are treated as local-only -- no origin git remote, never pushed, no PRs, no CI. ensure_branch creates the work-unit branch off the local default branch (no 'git fetch origin'). Requires defer_pr: true, forbids pause_before_merge: true, and requires every entry in repos: to set an explicit default_branch:. Used for operational workflows (AWS teardowns, evidence capture, audits) where devbench drives work but does not edit application code. Default: false."
         },
+        "auto_finalize": {
+          "type": "boolean",
+          "description": "When true, the orchestrate skill automatically invokes 'devbench git-ops-finalize <repo>' once all work units for the repo are terminal. Requires defer_pr: true. Incompatible with local_only: true (no remote to push to). A marker file at <workspace>/.devbench/auto-finalize-fired-<repo>.marker prevents duplicate invocations. Default: false."
+        },
+        "auto_merge": {
+          "type": "boolean",
+          "description": "When true, the orchestrate skill automatically invokes 'gh pr merge --<merge_strategy>' once the post-E7 CI watcher reports GREEN. Requires auto_finalize: true AND defer_pr: true. Incompatible with local_only: true. When the E7 watcher is absent, emits [AUTO_MERGE_SKIPPED] no_ci_watcher and skips. A marker file at <workspace>/.devbench/auto-merge-fired-<repo>.marker prevents duplicate invocations. Default: false."
+        },
         "pr_review_resolution": {
           "type": "object",
           "description": "PR review-comment polling settings (issue #116). Disabled by default. When enabled, cmd_git_ops polls gh pr view for asynchronous bot review feedback (Copilot, Q-Dev, internal review bots) before merging.",

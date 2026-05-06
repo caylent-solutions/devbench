@@ -90,7 +90,7 @@ the leading lines to the first real bucket.
 - New CLI command `devbench migrate-log-shards --migrate-log-shards`
   partitions the historical log and archives the original.
 - New module `devbench.reporting.sharded_log` joins the coverage gate
-  at 100% line + branch.
+  at 100% line coverage (see `Makefile:test-coverage-new`).
 - New disk artefacts: `logs/<YYYY-MM>/<task>.jsonl`,
   `logs/<YYYY-MM>/orchestrator-meta.jsonl`,
   `logs/legacy/orchestrator.log`.

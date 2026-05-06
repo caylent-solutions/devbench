@@ -59,7 +59,7 @@ structured I/O. No LLM logic remains in Python.
 | `execution/orchestrator.py` | `plugin/devbench/skills/orchestrate/SKILL.md` |
 | `execution/executor.py` | `plugin/devbench/agents/executor.md` |
 | `orchestrator-prompt.md` | Deleted -- same `SKILL.md` serves both modes |
-| No hooks | `plugin/devbench/hooks/hooks.json` + 7 guard scripts |
+| No hooks | `plugin/devbench/hooks/hooks.json` + 8 guard scripts |
 | One global model config | Per-agent `model:` frontmatter |
 | `devbench review <id>` CLI command | Removed -- agents invoke directly |
 | `devbench execute <id>` CLI command | Removed -- executor agent invoked by orchestrate skill |
@@ -114,7 +114,7 @@ Claude Code reads the `model:` field when invoking the agent and routes the infe
 
 This was not possible when a single global `JUDGE_CLAUDE_MODEL` applied to all roles. With the per-agent model field, the executor can use Opus (long context, complex implementation), the four review judges can use Sonnet or Haiku (shorter, structured evaluation), and the security reviewer can use Sonnet (security reasoning) -- all configured independently and changeable without code changes.
 
-Agent files live at `plugin/devbench/agents/` (top-level agents: executor, review-supervisor, security-reviewer, blocker-resolver) and `plugin/devbench/agents/review_team/` (the four parallel review judges).
+Agent files live at `plugin/devbench/agents/` (top-level agents: executor, review-supervisor, security-reviewer, blocker-resolver, manifest-amender, task-factory) and `plugin/devbench/agents/review_team/` (the four parallel review judges).
 
 ---
 

@@ -2,7 +2,7 @@
 
 An LLM-as-Judge orchestration system that processes a backlog of work units autonomously. Development agents write code; judge agents review it. All review decisions come from Claude LLM evaluation; there are no hard-coded pass/fail rules.
 
-> **Upgrading from a previous version?** See [docs/upgrade-guide.md](docs/upgrade-guide.md) for the migration walkthrough. The TL;DR is `pip install -U devbench && devbench upgrade` (idempotent; safe to re-run).
+> **Upgrading from a previous version?** See [docs/upgrade-guide.md](docs/upgrade-guide.md) for the migration walkthrough. The TL;DR is `git pull && make install && make plugin-install && uv run devbench upgrade` (idempotent; safe to re-run).
 
 ## 60-second overview
 
@@ -176,12 +176,12 @@ uv run devbench <command> [args]
 ```bash
 make install              # Install runtime and dev dependencies
 make plugin-install       # Register the devbench plugin at user scope
-make start-interactive    # Auth GitHub, launch interactive Claude session
-make start                # Auth GitHub, launch the orchestrator
+make start-interactive    # Launch interactive Claude session with devbench plugin
+make start                # Launch the orchestrator via Agent SDK (non-interactive)
 make validate             # Full validation: lint + type check + tests + coverage
-make lint                 # ruff + bandit
+make lint                 # ruff + bandit + no-duplicates guard
 make format               # Auto-format with ruff
-make check                # lint + mypy
+make typecheck            # mypy type checking
 make test                 # All tests (unit + functional)
 make report               # Show backlog progress report
 make report-session       # Show progress since a timestamp (SINCE=<iso-ts>)

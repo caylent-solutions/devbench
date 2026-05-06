@@ -4481,3 +4481,57 @@ class TestValidateDepCycle4Node:
         graph = BacklogManager()._build_dependency_graph(index)
         assert "E0-F1-S1-T1" in graph
         assert "short" not in graph
+
+
+class TestValidateBrokenAndCanonicalBacklogFormat:
+    """Tests for the zero-row integrity check added to BacklogManager.validate().
+
+    AC-FUNC-001: validate() returns the new integrity error when zero work-unit
+    rows are parsed from ## Full Work Unit Index.
+    AC-FUNC-002: the new error is the FIRST entry in the error list (fires before
+    rule-3 orphan checks).
+    AC-FUNC-005/006: broken and canonical fixture workspaces exist on disk.
+    AC-FUNC-007: all three tests pass.
+    """
+
+    _FIXTURES_ROOT = Path(__file__).parent.parent / "fixtures" / "backlog_format"
+
+    def test_validate_rejects_broken_backlog_format(self) -> None:
+        """Broken fixture uses a 4-column table under a non-canonical heading -- validator must reject it.
+
+        The first error must be the zero-row integrity message (AC-FUNC-002).
+        """
+        broken_root = self._FIXTURES_ROOT / "broken"
+        backlog_index = broken_root / "BACKLOG.md"
+
+        manager = BacklogManager()
+        errors = manager.validate(backlog_index, broken_root)
+
+        assert errors, "Expected at least one error from the broken fixture"
+        assert errors[0].startswith("No work-unit rows parsed from"), (
+            f"Expected zero-row error as first entry, got: {errors[0]!r}"
+        )
+        assert "## Full Work Unit Index" in errors[0]
+        assert "7-column" in errors[0] or "7" in errors[0]
+
+    def test_validate_accepts_canonical_backlog_format(self) -> None:
+        """Canonical fixture uses 7-column / ## Full Work Unit Index -- validator must accept it."""
+        canonical_root = self._FIXTURES_ROOT / "canonical"
+        backlog_index = canonical_root / "BACKLOG.md"
+
+        manager = BacklogManager()
+        errors = manager.validate(backlog_index, canonical_root)
+
+        zero_row_errors = [e for e in errors if "No work-unit rows parsed from" in e]
+        assert zero_row_errors == [], f"Canonical fixture must not trigger the zero-row error; got: {zero_row_errors}"
+
+    def test_validate_existing_canonical_fixture_still_passes(self) -> None:
+        """Regression: tests/fixtures/activity/BACKLOG.md must not trigger the zero-row error."""
+        activity_root = Path(__file__).parent.parent / "fixtures" / "activity"
+        backlog_index = activity_root / "BACKLOG.md"
+
+        manager = BacklogManager()
+        errors = manager.validate(backlog_index, activity_root)
+
+        zero_row_errors = [e for e in errors if "No work-unit rows parsed from" in e]
+        assert zero_row_errors == [], f"Activity fixture must not trigger the zero-row error; got: {zero_row_errors}"

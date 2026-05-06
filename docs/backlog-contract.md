@@ -254,14 +254,14 @@ The canonical Status Summary format is **per-epic** -- one row per top-level epi
 Below the Status Summary, one row per work unit:
 
 ```markdown
-## Work Units
+## Full Work Unit Index
 
-| ID | Title | Status | File |
-|----|-------|--------|------|
-| E1-F1-S1-T1 | Add greeting utility | done | backlog/E1-name/E1-F1-name/E1-F1-S1-name/E1-F1-S1-T1-name.md |
+| ID | Title | Type | Status | Dependencies | Repo | File Path |
+|----|-------|------|--------|--------------|------|-----------|
+| E1-F1-S1-T1 | Add greeting utility | Task | done | None | org/my-repo | `backlog/E1-name/E1-F1-name/E1-F1-S1-name/E1-F1-S1-T1-name.md` |
 ```
 
-The `File` column must be a path relative to `JUDGE_WORKSPACE_ROOT`. `validate-backlog` verifies each file exists at that path.
+The `File Path` column must be a path relative to `JUDGE_WORKSPACE_ROOT`. `validate-backlog` verifies each file exists at that path.
 
 ---
 

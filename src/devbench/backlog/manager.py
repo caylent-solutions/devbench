@@ -279,6 +279,7 @@ class BacklogManager:
         known_ids = {row_id for row_id, _, _ in rows if row_id and not row_id.startswith("-")}
 
         errors: list[str] = []
+        self._check_full_index_has_rows(backlog_index, errors)
         indexed_files = self._check_files_and_statuses(rows, workspace_root, errors)
         self._check_orphans(workspace_root, indexed_files, errors)
         self._check_dependencies(backlog_index, known_ids, errors)
@@ -300,6 +301,50 @@ class BacklogManager:
         self._check_no_placeholder_manifest_rows(rows, workspace_root, errors)
         self._check_no_orphan_path_tokens(rows, workspace_root, errors)
         return errors
+
+    @staticmethod
+    def _check_full_index_has_rows(backlog_index: Path, errors: list[str]) -> None:
+        """Rule-0: verify that at least one work-unit row is parsed from '## Full Work Unit Index'.
+
+        A zero-row result means the section is missing or the table uses the
+        wrong format (e.g. a legacy 4-column section under a non-canonical heading). This
+        check fires BEFORE orphan detection (rule 3) so a malformed index does
+        not produce a stale orphan-storm that obscures the root cause.
+
+        Args:
+            backlog_index: Path to the ``BACKLOG.md`` index file.
+            errors: Mutable error list; the new error is prepended when the
+                check fires so it remains the first entry regardless of call
+                order within ``validate()``.
+        """
+        content = backlog_index.read_text(encoding="utf-8")
+        in_full_index = False
+        real_row_count = 0
+        for line in content.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("## "):
+                in_full_index = "Full Work Unit Index" in stripped
+                continue
+            if not in_full_index or not stripped.startswith("|"):
+                continue
+            cells = [c.strip() for c in line.split("|")]
+            if len(cells) != BACKLOG_INDEX_CELL_COUNT:
+                continue
+            row_id = cells[1]
+            if not row_id or row_id.lower() == "id" or row_id.startswith("-"):
+                continue
+            real_row_count += 1
+
+        if real_row_count == 0:
+            errors.insert(
+                0,
+                (
+                    f"No work-unit rows parsed from '{backlog_index}'."
+                    " The '## Full Work Unit Index' section is missing or malformed."
+                    " Expected 7-column rows:"
+                    " | ID | Title | Type | Status | Dependencies | Repo | File Path |"
+                ),
+            )
 
     def _apply_fixes(
         self,

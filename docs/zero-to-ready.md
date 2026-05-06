@@ -163,10 +163,10 @@ cat > BACKLOG.md <<'EOF'
 | Epic | Title | Done | In Progress | In Queue | Blocked | Declined |
 |------|-------|------|-------------|----------|---------|----------|
 
-## Work Units
+## Full Work Unit Index
 
-| ID | Title | Status | File |
-|----|-------|--------|------|
+| ID | Title | Type | Status | Dependencies | Repo | File Path |
+|----|-------|------|--------|--------------|------|-----------|
 EOF
 ```
 
@@ -286,11 +286,11 @@ Also update `BACKLOG.md` to add an index row for the new task:
 |------|-------|------|-------------|----------|---------|----------|
 | E1   | My first epic | 0 | 0 | 1 | 0 | 0 |
 
-## Work Units
+## Full Work Unit Index
 
-| ID | Title | Status | File |
-|----|-------|--------|------|
-| E1-F1-S1-T1 | First task | in-queue | backlog/E1-my-first-epic/E1-F1-initial-feature/E1-F1-S1-first-story/E1-F1-S1-T1.md |
+| ID | Title | Type | Status | Dependencies | Repo | File Path |
+|----|-------|------|--------|--------------|------|-----------|
+| E1-F1-S1-T1 | First task | Task | in-queue | None | org/my-target-repo | `backlog/E1-my-first-epic/E1-F1-initial-feature/E1-F1-S1-first-story/E1-F1-S1-T1.md` |
 ```
 
 ### Importing an existing backlog

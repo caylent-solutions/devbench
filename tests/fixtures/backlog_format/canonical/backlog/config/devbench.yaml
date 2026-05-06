@@ -1,0 +1,4 @@
+repos:
+  org/stub-repo:
+    default_branch: main
+    checkout_directory: stub-repo

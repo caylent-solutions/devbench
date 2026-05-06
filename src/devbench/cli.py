@@ -3788,11 +3788,200 @@ def _finalize_merge_and_submodule(
     return 0
 
 
+def _find_most_recent_active_task(units: list[WorkUnit]) -> WorkUnit | None:
+    """Return the last in-review or done task in *units* (iteration order).
+
+    Used by :func:`_handle_finalize_ci_result` for FAILED_UNKNOWN attribution
+    (blame the most recently promoted task when the failure cannot be pinned to
+    a specific task marker in the CI log).  Returns ``None`` when no
+    in-review / done tasks are present.
+    """
+    candidate = None
+    for unit in units:
+        if unit.status in (WorkUnitStatus.IN_REVIEW, WorkUnitStatus.DONE):
+            candidate = unit
+    return candidate
+
+
+def _finalize_audit_and_block(
+    unit: WorkUnit,
+    task_id: str,
+    marker: str,
+    mgr: BacklogManager,
+) -> None:
+    """Append *marker* as an audit comment and transition *task_id* to blocked.
+
+    No-op when the work-unit file cannot be resolved.  Extracted to reduce
+    branch count in :func:`_handle_finalize_ci_result` (PLR0912 compliance).
+    """
+    wu_file = _resolve_unit_file(unit)
+    if wu_file is not None:
+        mgr._append_agent_comment(wu_file, "git_ops", marker)
+        mgr.force_status(wu_file, BACKLOG_INDEX, task_id, STATUS_BLOCKED)
+
+
+def _finalize_build_recovery_proposal(task_id: str, pr_url: str) -> Proposal:
+    """Construct a recovery :class:`Proposal` for *task_id* blamed on *pr_url*.
+
+    Separated from :func:`_handle_finalize_ci_result` so the branch count
+    stays within PLR0912's limit.
+    """
+    import datetime
+
+    from devbench.backlog.proposal import ProposedTask
+
+    generated_at = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return Proposal(
+        source_task_id=task_id,
+        generated_at=generated_at,
+        rejection_reason=f"CI failure on single-branch PR {pr_url}; attributed to task {task_id}",
+        proposed_tasks=[
+            ProposedTask(
+                suggested_id=f"{task_id}-recovery",
+                title=f"Investigate CI failure attributed to {task_id}",
+                files_to_own=[],
+                linked_scenarios=[],
+                suggested_acs=[
+                    f"AC-001 Identify and fix the CI failure introduced by {task_id}",
+                ],
+                suggested_approach=(
+                    f"RED: reproduce the CI failure logged from PR {pr_url}. "
+                    f"GREEN: apply the minimal fix. REFACTOR: verify the suite stays green."
+                ),
+            )
+        ],
+    )
+
+
+def _handle_finalize_known_task_failure(
+    *,
+    named_task_id: str,
+    named_unit: WorkUnit | None,
+    pr_url: str,
+    mgr: BacklogManager,
+) -> int:
+    """Resolve FAILED_KNOWN_TASK: cascade-cap check, proposal write, and block.
+
+    Returns 2 in all cases (cascade-capped or not).  Separated from
+    :func:`_handle_finalize_ci_result` to reduce its branch count.
+    """
+    # Cascade-depth cap: check if the first-level recovery (depth=1) would
+    # exceed MAX_CASCADE_DEPTH.  With MAX_CASCADE_DEPTH=1, even depth=1
+    # is capped (1 >= 1); with MAX_CASCADE_DEPTH=N, up to N-1 recovery
+    # levels are allowed.
+    try:
+        enforce_cascade_depth({"cascade_depth": 1}, MAX_CASCADE_DEPTH)
+    except CascadeDepthError:
+        if named_unit is not None:
+            _finalize_audit_and_block(
+                named_unit,
+                named_task_id,
+                f"[CI_FAILED_CASCADE_CAPPED] cascade_depth limit reached; {pr_url}",
+                mgr,
+            )
+        logger.error(
+            "cmd_git_ops_finalize: cascade cap reached for %s; no proposal written",
+            named_task_id,
+        )
+        return 2
+
+    proposal = _finalize_build_recovery_proposal(named_task_id, pr_url)
+    try:
+        write_proposal(WORKSPACE_ROOT, proposal)
+    except ProposalError as exc:
+        logger.warning("cmd_git_ops_finalize: could not write proposal for %s: %s", named_task_id, exc)
+
+    if named_unit is not None:
+        _finalize_audit_and_block(named_unit, named_task_id, f"[CI_FAILED_BATCH_PR] {pr_url}", mgr)
+
+    logger.error(
+        "cmd_git_ops_finalize: CI failure attributed to %s; proposal written, task blocked",
+        named_task_id,
+    )
+    return 2
+
+
+def _handle_finalize_ci_result(
+    *,
+    ci_result: object,
+    pr_url: str,
+    mgr: BacklogManager,
+) -> int:
+    """Resolve a CIResult from :func:`cmd_git_ops_finalize` into an exit code.
+
+    Implements the four-branch dispatch described in E7-F2-S1-T1:
+
+    - ``CIResult.GREEN``: log ``[CI_GREEN]`` audit on the most-recent active
+      task; return 0.  The PR remains open for human merge.
+    - ``CIResult.FAILED_KNOWN_TASK(task_id)``: write a recovery-proposal JSON
+      blamed on *task_id*; transition that task to ``blocked`` with a
+      ``[CI_FAILED_BATCH_PR]`` audit comment; return 2.  Respects
+      ``orchestrate.max_cascade_depth`` -- when the depth cap is reached,
+      skip the proposal and log ``[CI_FAILED_CASCADE_CAPPED]`` instead.
+    - ``CIResult.FAILED_UNKNOWN``: transition the most-recent in-review /
+      done task to ``blocked`` with ``[CI_FAILED_BATCH_PR]``; return 2.
+    - ``CIResult.TIMEOUT``: log ``[CI_WATCH_TIMEOUT]`` on the most-recent
+      active task; return 2 without changing any task statuses.
+    """
+    from devbench.github.git_ops import CIResult
+
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    most_recent = _find_most_recent_active_task(units)
+
+    if ci_result is CIResult.GREEN:
+        if most_recent is not None:
+            wu_file = _resolve_unit_file(most_recent)
+            if wu_file is not None:
+                mgr._append_agent_comment(wu_file, "git_ops", f"[CI_GREEN] {pr_url}")
+        logger.info("cmd_git_ops_finalize: CI GREEN for %s", pr_url)
+        return 0
+
+    if ci_result is CIResult.TIMEOUT:
+        if most_recent is not None:
+            wu_file = _resolve_unit_file(most_recent)
+            if wu_file is not None:
+                mgr._append_agent_comment(wu_file, "git_ops", f"[CI_WATCH_TIMEOUT] {pr_url}")
+        logger.warning("cmd_git_ops_finalize: CI watch timed out for %s", pr_url)
+        return 2
+
+    if isinstance(ci_result, CIResult.FAILED_KNOWN_TASK):
+        return _handle_finalize_known_task_failure(
+            named_task_id=ci_result.task_id,
+            named_unit=_find_unit(units, ci_result.task_id),
+            pr_url=pr_url,
+            mgr=mgr,
+        )
+
+    # FAILED_UNKNOWN: block the most-recent active task.
+    if most_recent is not None:
+        _finalize_audit_and_block(
+            most_recent,
+            most_recent.id,
+            f"[CI_FAILED_BATCH_PR] {pr_url} (unknown attribution)",
+            mgr,
+        )
+    logger.error(
+        "cmd_git_ops_finalize: CI failure with unknown attribution; blocked %s",
+        most_recent.id if most_recent else "no task",
+    )
+    return 2
+
+
 def cmd_git_ops_finalize(repo_name: str) -> int:
     """Push the single branch and create a PR after all deferred commits.
 
     Used after all work units are complete in single-branch / defer-PR mode.
     Pushes the accumulated commits to the remote and creates a pull request.
+    After the PR is created, waits for CI checks via
+    :meth:`~devbench.github.git_ops.GitOpsService.wait_for_checks_and_classify`
+    and resolves the four CIResult branches:
+
+    - GREEN: logs ``[CI_GREEN]`` and returns 0.  The PR stays open.
+    - FAILED_KNOWN_TASK: writes a recovery proposal, blocks the named task,
+      returns 2.
+    - FAILED_UNKNOWN: blocks the most-recent in-review / done task, returns 2.
+    - TIMEOUT: logs ``[CI_WATCH_TIMEOUT]`` and returns 2 without status changes.
 
     Arguments:
         repo_name: Repository name (short or fully-qualified).
@@ -3828,6 +4017,7 @@ def cmd_git_ops_finalize(repo_name: str) -> int:
     )
 
     ops = GitOpsService()
+    mgr = BacklogManager()
 
     ops.commit_and_push(canonical_repo, repo_path, branch, FINALIZE_COMMIT_TEMPLATE.format(branch=branch))
     logger.info("Pushed branch %s to %s", branch, canonical_repo)
@@ -3835,8 +4025,13 @@ def cmd_git_ops_finalize(repo_name: str) -> int:
     pr_url = ops.create_pr(canonical_repo, branch, pr_title, pr_body, repo_path=repo_path)
     logger.info("Created PR: %s", pr_url)
 
-    print(json.dumps({"repo": canonical_repo, "branch": branch, "pr_url": pr_url}))
-    return 0
+    ci_result = ops.wait_for_checks_and_classify(pr_url, repo_path)
+
+    return _handle_finalize_ci_result(
+        ci_result=ci_result,
+        pr_url=pr_url,
+        mgr=mgr,
+    )
 
 
 def cmd_watch(watch_interval: int = 0) -> int:

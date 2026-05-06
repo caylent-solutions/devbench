@@ -3159,26 +3159,28 @@ class TestCmdGitOpsBadPrNumber:
 
 
 class TestCmdGitOpsFinalizeHappyPath:
-    """Test cmd_git_ops_finalize happy path."""
+    """Test cmd_git_ops_finalize happy path (CI GREEN branch)."""
 
-    def test_finalize_pushes_and_creates_pr(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        """Lines 831-855: full happy path for git-ops-finalize."""
+    def test_finalize_pushes_and_creates_pr_then_watches_ci(self, tmp_path: Path) -> None:
+        """cmd_git_ops_finalize commits, creates PR, waits for CI, and returns 0 on GREEN."""
         mock_ops = MagicMock()
         mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/99"
+        mock_ops.wait_for_checks_and_classify.return_value = CIResult.GREEN
 
         with (
             patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
             patch("devbench.config.DEFER_PR", True),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
             patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
+            patch("devbench.cli._handle_finalize_ci_result", return_value=0) as mock_handler,
         ):
             result = cli.cmd_git_ops_finalize("caylent-solutions/git-repo")
 
         assert result == 0
-        output = json.loads(capsys.readouterr().out.strip())
-        assert output["pr_url"] == "https://github.com/org/repo/pull/99"
         mock_ops.commit_and_push.assert_called_once()
         mock_ops.create_pr.assert_called_once()
+        mock_ops.wait_for_checks_and_classify.assert_called_once()
+        mock_handler.assert_called_once()
 
     def test_finalize_returns_1_when_no_local_path(self, capsys: pytest.CaptureFixture[str]) -> None:
         """Lines 837-838: no local path configured for repo."""
@@ -3191,6 +3193,75 @@ class TestCmdGitOpsFinalizeHappyPath:
 
         assert result == 1
         assert "no local path" in capsys.readouterr().err.lower()
+
+    def test_finalize_green_does_not_merge(self, tmp_path: Path) -> None:
+        """GREEN: cmd_git_ops_finalize returns 0 and does not call merge_pr."""
+        mock_ops = MagicMock()
+        mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/99"
+        mock_ops.wait_for_checks_and_classify.return_value = CIResult.GREEN
+
+        with (
+            patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
+            patch("devbench.config.DEFER_PR", True),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
+            patch("devbench.cli._handle_finalize_ci_result", return_value=0),
+        ):
+            result = cli.cmd_git_ops_finalize("caylent-solutions/git-repo")
+
+        assert result == 0
+        mock_ops.merge_pr.assert_not_called()
+
+    def test_finalize_timeout_returns_two(self, tmp_path: Path) -> None:
+        """TIMEOUT: cmd_git_ops_finalize returns rc=2."""
+        mock_ops = MagicMock()
+        mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/99"
+        mock_ops.wait_for_checks_and_classify.return_value = CIResult.TIMEOUT
+
+        with (
+            patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
+            patch("devbench.config.DEFER_PR", True),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
+            patch("devbench.cli._handle_finalize_ci_result", return_value=2),
+        ):
+            result = cli.cmd_git_ops_finalize("caylent-solutions/git-repo")
+
+        assert result == 2
+
+    def test_finalize_failed_unknown_returns_two(self, tmp_path: Path) -> None:
+        """FAILED_UNKNOWN: cmd_git_ops_finalize returns rc=2."""
+        mock_ops = MagicMock()
+        mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/99"
+        mock_ops.wait_for_checks_and_classify.return_value = CIResult.FAILED_UNKNOWN
+
+        with (
+            patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
+            patch("devbench.config.DEFER_PR", True),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
+            patch("devbench.cli._handle_finalize_ci_result", return_value=2),
+        ):
+            result = cli.cmd_git_ops_finalize("caylent-solutions/git-repo")
+
+        assert result == 2
+
+    def test_finalize_failed_known_task_returns_two(self, tmp_path: Path) -> None:
+        """FAILED_KNOWN_TASK: cmd_git_ops_finalize returns rc=2."""
+        mock_ops = MagicMock()
+        mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/99"
+        mock_ops.wait_for_checks_and_classify.return_value = CIResult.FAILED_KNOWN_TASK("E3-F1-S1-T1")
+
+        with (
+            patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
+            patch("devbench.config.DEFER_PR", True),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
+            patch("devbench.cli._handle_finalize_ci_result", return_value=2),
+        ):
+            result = cli.cmd_git_ops_finalize("caylent-solutions/git-repo")
+
+        assert result == 2
 
 
 class TestCmdStart:

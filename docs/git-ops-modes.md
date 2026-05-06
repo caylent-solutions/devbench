@@ -104,8 +104,9 @@ wraps `gh pr checks --watch` and classifies the outcome into one of four
   audit comment, and returns rc=2. Cascade-cap interaction: if the
   offending task is already at cascade depth N-1 (controlled by
   `orchestrate.max_cascade_depth`), the recovery proposal is skipped and
-  the task transitions to `OPERATOR_ACTION_REQUIRED` instead, accompanied
-  by a `[CI_FAILED_CASCADE_CAPPED]` audit comment.
+  the task transitions to blocked with a `[CI_FAILED_CASCADE_CAPPED]` audit
+  comment (which the blocked-task classifier resolves to
+  `OPERATOR_ACTION_REQUIRED`).
 
 - `CIResult.FAILED_UNKNOWN` -- a failure is detected but cannot be
   attributed to a single task (no marker present, multiple distinct

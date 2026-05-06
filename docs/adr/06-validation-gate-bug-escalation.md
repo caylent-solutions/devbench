@@ -44,7 +44,7 @@ Scope discipline: the executor prompt makes clear that bug-escalation fires ONLY
 **Negative.**
 
 - Two triggers for the same materialisation path is a small cognitive overhead; the SKILL's step 4a / step 4c parallelism must be read together to understand when task-factory fires.
-- The executor prompt is now longer. The BUG ESCALATION FOR VALIDATION GATES section is ~40 lines; a less-careful executor could skip past the "does this trigger apply?" check. Mitigation: the procedure opens with the trigger conditions and makes the "do NOT stage" instruction explicit.
+- The executor prompt is now longer. The BUG ESCALATION FOR VALIDATION GATES section adds a meaningful block of prose; a less-careful executor could skip past the "does this trigger apply?" check. Mitigation: the procedure opens with the trigger conditions and makes the "do NOT stage" instruction explicit.
 - A misbehaving executor could in principle emit a proposal JSON for a non-validation-gate task. The proposal JSON schema validation (`write-proposal` validates on stdin) and the SKILL's gating on `task_factory.enabled` plus `.devbench/amendments/<id>.json` absence reduce the blast radius, but a malformed escalation is still possible.
 
 ## Alternatives considered

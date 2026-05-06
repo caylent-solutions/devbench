@@ -161,7 +161,7 @@ uv run devbench start
             └── (devbench:blocker-resolver agent file exists but is NOT currently invoked)
 ```
 
-The Agent SDK session runs the orchestrate skill with `--dangerously-skip-permissions` so it can invoke CLI tools and agents without interactive approval prompts.
+The Agent SDK session runs the orchestrate skill with `permission_mode="bypassPermissions"` (set on `ClaudeAgentOptions` in `src/devbench/cli.py`) so it can invoke CLI tools and agents without interactive approval prompts.
 
 ### Interactive mode (`make start-interactive`)
 

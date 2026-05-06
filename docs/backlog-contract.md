@@ -401,6 +401,18 @@ Each auto-rollup writes an audit comment to the parent's Comments section so the
 
 Rollup happens synchronously inside `mark-done`. There is no background process and no race condition.
 
+### Auto-tick of AC / DoD checkboxes on done
+
+Whenever a work unit transitions to `done` (whether via `mark-done`, `force-status done`, or auto-rollup), `BacklogManager._tick_completion_checkboxes()` rewrites every checkbox line inside the `## Acceptance Criteria` and `## Definition of Done` sections of the work-unit file:
+
+- `- [ ] <content>` becomes `- [x] <content> ✅`
+- `- [x] <content>` (ticked but without the green-check emoji) becomes `- [x] <content> ✅`
+- Lines already ending with `✅` are left unchanged (idempotent).
+
+Lines outside the two target sections are never modified. The canonical N/A suffix (e.g. `-- N/A for Markdown Tasks (no Python source authored)`) is preserved verbatim; the green-check appends after the suffix. The file is written back only when at least one line changed, so a second call on an already-ticked file is a true no-op (mtime unchanged).
+
+The green-check character is U+2705 (✅). U+2014 (em-dash) is never written; validate-backlog rule 10 rejects em-dashes in work-unit files and the helper is explicitly tested to produce zero em-dash bytes.
+
 ---
 
 ## Dependency Format

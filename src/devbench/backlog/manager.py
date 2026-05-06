@@ -665,6 +665,65 @@ class BacklogManager:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    # Target section headings whose checkboxes are ticked on done.
+    _TICK_SECTIONS: frozenset[str] = frozenset({"Acceptance Criteria", "Definition of Done"})
+
+    def _tick_completion_checkboxes(self, work_unit_path: Path) -> None:
+        """Rewrite unchecked / legacy-ticked AC and DoD checkboxes to checked + U+2705.
+
+        Walks the work-unit file line by line, tracking the current ``## ``
+        section.  Inside ``## Acceptance Criteria`` and ``## Definition of Done``
+        only, rewrites:
+
+        - ``- [ ] <content>``          -> ``- [x] <content> \u2705``
+        - ``- [x] <content>`` (no emoji) -> ``- [x] <content> \u2705``
+        - Already ``- [x] <content> \u2705`` lines -> no-op.
+
+        Lines outside the two target sections are never modified.  The file is
+        written back **only** when at least one line changed (preserving mtime
+        when the file is already fully ticked).
+
+        Args:
+            work_unit_path: Path to the work-unit ``.md`` file.
+        """
+        green_check = "\u2705"
+        content = work_unit_path.read_text(encoding="utf-8")
+        lines = content.splitlines(keepends=True)
+
+        in_target_section = False
+        new_lines: list[str] = []
+        changed = False
+
+        for line in lines:
+            stripped = line.rstrip("\n")
+            # Track section changes on ``## `` headings
+            if stripped.startswith("## "):
+                section_title = stripped[3:].strip()
+                in_target_section = section_title in self._TICK_SECTIONS
+                new_lines.append(line)
+                continue
+
+            if in_target_section:
+                # Match ``- [ ] ...`` (unchecked)
+                if stripped.startswith("- [ ] "):
+                    body = stripped[6:]
+                    new_line = f"- [x] {body} {green_check}\n"
+                    new_lines.append(new_line)
+                    changed = True
+                    continue
+                # Match ``- [x] ...`` without a trailing green-check (legacy ticked)
+                if stripped.startswith("- [x] ") and not stripped.endswith(green_check):
+                    body = stripped[6:]
+                    new_line = f"- [x] {body} {green_check}\n"
+                    new_lines.append(new_line)
+                    changed = True
+                    continue
+
+            new_lines.append(line)
+
+        if changed:
+            work_unit_path.write_text("".join(new_lines), encoding="utf-8")
+
     def _set_status(
         self,
         work_unit_path: Path,
@@ -690,6 +749,9 @@ class BacklogManager:
             unit_id,
             canonical,
         )
+
+        if canonical == STATUS_DONE:
+            self._tick_completion_checkboxes(work_unit_path)
 
         # Issue #162 Phase 2 (ADR-17): every task-state transition lands
         # in a per-task aggregate JSON at

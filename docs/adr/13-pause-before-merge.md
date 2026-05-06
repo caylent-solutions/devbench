@@ -79,10 +79,10 @@ in-review   --(PR closed without merge)------------------------------> blocked
   `PAUSE_BEFORE_MERGE` config:
   - `False` (default): existing behaviour. Push, wait CI, merge.
   - `True`: push, wait CI, log `[PR_AWAITING_MERGE]` audit comment, set
-    status to `in-review`, return rc=0 with JSON `{"status":
-    "in-review", "pr_number": ..., "pr_url": ..., "mode":
+    status to `in-review`, return rc=0 with JSON `{"unit_id": ...,
+    "status": "in-review", "pr_number": ..., "pr_url": ..., "mode":
     "pause-before-merge"}`.
-- **`cmd_check_merge <id>`** queries `gh pr list --head <branch> --json
+- **`cmd_check_merge <id>`** queries `gh pr list --head <branch> --state all --json
   number,state,merged,url` and dispatches per the rules above. Returns
   rc=0 in every normal case (merged / closed / open / no-pr-found); rc=1
   only on hard failure (gh API failure, malformed JSON, done-gate

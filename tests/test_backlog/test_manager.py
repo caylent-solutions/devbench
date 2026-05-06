@@ -1899,6 +1899,133 @@ class TestAppendTddEntry:
 
         assert "\u2014" not in wu.read_text(encoding="utf-8")
 
+    def test_append_tdd_entry_lands_inside_tdd_cycle_log_when_comments_follows(self, tmp_path: Path) -> None:
+        """AC-FUNC-001/AC-FUNC-003/AC-CYCLE-001: Entries land between TDD Log and Comments.
+
+        Builds a fixture with canonical section order (## TDD Cycle Log then
+        ## Comments), calls _append_tdd_entry three times, and asserts:
+        (a) all three entries appear between ## TDD Cycle Log and ## Comments,
+        (b) ## Comments content is byte-for-byte unchanged,
+        (c) no extra blank lines are introduced between successive entries.
+        """
+        # Canonical order: ## TDD Cycle Log comes before ## Comments.
+        fixture = (
+            "# E6-F1-S1-T1: Section-aware TDD Test\n\n"
+            "## Status: in-progress\n\n"
+            "## TDD Cycle Log\n\n"
+            "<!-- entries go here -->\n\n"
+            "## Comments\n\n"
+            "<!-- comments go here -->\n"
+        )
+        wu = tmp_path / "E6-F1-S1-T1.md"
+        wu.write_text(fixture, encoding="utf-8")
+
+        comments_before = fixture[fixture.find("## Comments") :]
+
+        mgr = BacklogManager()
+        mgr._append_tdd_entry(wu, "RED", "red-marker-abc")
+        mgr._append_tdd_entry(wu, "GREEN", "green-marker-def")
+        mgr._append_tdd_entry(wu, "REFACTOR", "refactor-marker-ghi")
+
+        content = wu.read_text(encoding="utf-8")
+        tdd_start = content.find("## TDD Cycle Log")
+        comments_start = content.find("## Comments")
+        assert tdd_start != -1, "## TDD Cycle Log section must exist"
+        assert comments_start != -1, "## Comments section must exist"
+        assert tdd_start < comments_start, "## TDD Cycle Log must precede ## Comments"
+
+        tdd_section = content[tdd_start:comments_start]
+        assert "red-marker-abc" in tdd_section, f"RED entry not in TDD section: {tdd_section!r}"
+        assert "green-marker-def" in tdd_section, f"GREEN entry not in TDD section: {tdd_section!r}"
+        assert "refactor-marker-ghi" in tdd_section, f"REFACTOR entry not in TDD section: {tdd_section!r}"
+
+        comments_after = content[comments_start:]
+        assert comments_after == comments_before, (
+            f"## Comments section was mutated.\nBefore: {comments_before!r}\nAfter: {comments_after!r}"
+        )
+
+        # No extra blank lines between successive entries: entry lines are separated
+        # by at most one blank line (i.e., no triple-newline runs within the TDD section).
+        assert "\n\n\n" not in tdd_section, f"Extra blank lines found in TDD section: {tdd_section!r}"
+
+    def test_append_tdd_entry_appends_to_eof_when_tdd_log_is_last_section(self, tmp_path: Path) -> None:
+        """AC-FUNC-002: Falls back to EOF append when ## TDD Cycle Log is the last section."""
+        fixture = (
+            "# E6-F1-S1-T1: EOF Fallback Test\n\n"
+            "## Status: in-progress\n\n"
+            "## TDD Cycle Log\n\n"
+            "<!-- no sections after this -->\n"
+        )
+        wu = tmp_path / "E6-F1-S1-T1-eof.md"
+        wu.write_text(fixture, encoding="utf-8")
+
+        mgr = BacklogManager()
+        mgr._append_tdd_entry(wu, "RED", "eof-marker-xyz")
+
+        content = wu.read_text(encoding="utf-8")
+        tdd_start = content.find("## TDD Cycle Log")
+        entry_pos = content.find("eof-marker-xyz")
+        assert entry_pos > tdd_start, "Entry must appear after ## TDD Cycle Log heading"
+        # Must be at or near EOF -- no ## heading appears after the entry.
+        trailing = content[entry_pos:]
+        assert not any(line.startswith("## ") for line in trailing.splitlines()), (
+            f"Unexpected ## heading found after EOF-appended entry: {trailing!r}"
+        )
+
+    def test_append_tdd_entry_validate_backlog_roundtrip_parity(self, tmp_path: Path) -> None:
+        """AC-FUNC-004: validate() returns no errors after N _append_tdd_entry calls."""
+        # Build a minimum-viable backlog workspace that validate() accepts.
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+
+        unit_id = "E0-F1-S1-T1"
+        wu_content = (
+            f"# {unit_id}: Roundtrip Test\n\n"
+            f"## Status: in-progress\n\n"
+            "## Target Repository\n\n- **Repo:** `org/repo`\n\n"
+            "## Description\n\nRoundtrip fixture.\n\n"
+            "## Dependencies\n\n"
+            "| ID | Title | Status |\n"
+            "|----|-------|--------|\n"
+            "| none | | |\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-TEST-001 fixture\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `f.py` | fixture |\n\n"
+            "## Definition of Done\n\n- [ ] All ACs checked\n\n"
+            "## TDD Cycle Log\n\n"
+            "<!-- entries go here -->\n\n"
+            "## Comments\n\n"
+            "<!-- comments go here -->\n"
+        )
+        wu_path = backlog_dir / f"{unit_id}.md"
+        wu_path.write_text(wu_content, encoding="utf-8")
+
+        index_content = (
+            "# Backlog\n\n"
+            "## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked | Declined |\n"
+            "|------|-------|------|-------------|----------|---------|----------|\n"
+            "| E0 | Example | 0 | 1 | 0 | 0 | 0 |\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|-----------|\n"
+            "| E0 | Example | Epic | in-queue | None | org/repo | `backlog/E0.md` |\n"
+            f"| {unit_id} | Roundtrip Test | Task | in-progress | none | org/repo | `backlog/{unit_id}.md` |\n"
+        )
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(index_content, encoding="utf-8")
+
+        # Epic stub required by validate().
+        (backlog_dir / "E0.md").write_text("# E0: Example\n\n## Status: in-queue\n", encoding="utf-8")
+
+        mgr = BacklogManager()
+        # Append three TDD entries -- RED, GREEN, REFACTOR.
+        mgr._append_tdd_entry(wu_path, "RED", "roundtrip-red")
+        mgr._append_tdd_entry(wu_path, "GREEN", "roundtrip-green")
+        mgr._append_tdd_entry(wu_path, "REFACTOR", "No refactor needed.")
+
+        errors = mgr.validate(index_path, tmp_path)
+        assert errors == [], f"validate() reported errors after TDD entries: {errors}"
+
 
 class TestRollupParentStatusEdgeCases:
     """Test edge cases in _rollup_parent_status."""

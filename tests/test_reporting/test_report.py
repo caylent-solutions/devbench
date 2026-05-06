@@ -1567,6 +1567,112 @@ class TestBacklogStatusBreakdown:
         assert (b.tasks_in_progress + b.tasks_in_queue + b.tasks_in_review + b.tasks_blocked) == b.tasks_remaining
 
 
+class TestBacklogTotalsSixBlockedFields:
+    """AC-FUNC-004: the snapshot dataclass exposes 6 per-state count fields."""
+
+    @staticmethod
+    def _mk(uid: str, status) -> object:
+        from devbench.backlog.work_unit import WorkUnit, WorkUnitType
+
+        return WorkUnit(
+            id=uid,
+            title=f"task-{uid}",
+            status=status,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path(f"backlog/{uid}.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+
+    def test_six_count_fields_exist_on_backlog_totals(self) -> None:
+        """AC-FUNC-004: _BacklogTotals has the six per-state blocked count fields."""
+        from devbench.reporting.report import _BacklogTotals
+
+        # Construct a minimal _BacklogTotals instance to confirm the six fields exist.
+        b = _BacklogTotals(
+            tasks_total=6,
+            tasks_done=0,
+            units_total=6,
+            units_done=0,
+            stories_done=0,
+            features_done=0,
+            epics_done=0,
+            tasks_remaining=6,
+            tasks_blocked=6,
+            tasks_active=0,
+            tasks_in_progress=0,
+            tasks_in_queue=0,
+            tasks_in_review=0,
+            tasks_proposed=0,
+            tasks_declined=0,
+            tasks_blocked_auto_clearing=1,
+            tasks_blocked_amendment_recovery=1,
+            tasks_blocked_dependency=1,
+            tasks_blocked_held=1,
+            tasks_blocked_on_held=1,
+            tasks_blocked_operator=1,
+        )
+        assert b.tasks_blocked_auto_clearing == 1
+        assert b.tasks_blocked_amendment_recovery == 1
+        assert b.tasks_blocked_dependency == 1
+        assert b.tasks_blocked_held == 1
+        assert b.tasks_blocked_on_held == 1
+        assert b.tasks_blocked_operator == 1
+        # Sum of all six equals total blocked count.
+        assert (
+            b.tasks_blocked_auto_clearing
+            + b.tasks_blocked_amendment_recovery
+            + b.tasks_blocked_dependency
+            + b.tasks_blocked_held
+            + b.tasks_blocked_on_held
+            + b.tasks_blocked_operator
+        ) == b.tasks_blocked
+
+    def test_backlog_totals_from_units_populates_six_fields(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """AC-FUNC-004: _backlog_totals_from_units populates all 6 blocked count fields."""
+        from devbench.backlog.proposal import BlockedTaskState
+        from devbench.backlog.work_unit import WorkUnitStatus
+        from devbench.reporting.report import _backlog_totals_from_units
+
+        states = [
+            BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL,
+            BlockedTaskState.AWAITING_AMENDMENT_RECOVERY,
+            BlockedTaskState.AWAITING_DEPENDENCY,
+            BlockedTaskState.HELD,
+            BlockedTaskState.BLOCKED_ON_HELD,
+            BlockedTaskState.OPERATOR_ACTION_REQUIRED,
+        ]
+        units = [
+            self._mk(
+                f"E0-F1-S1-T{i + 1}",
+                WorkUnitStatus.BLOCKED if state is not BlockedTaskState.HELD else WorkUnitStatus.HOLD,
+            )
+            for i, state in enumerate(states)
+        ]
+        task_id_to_state = {u.id: s for u, s in zip(units, states, strict=True)}
+
+        def fake_classify(backlog_root, backlog_index, task_id, **kwargs):
+            return task_id_to_state[task_id]
+
+        monkeypatch.setattr("devbench.backlog.proposal.classify_blocked_task", fake_classify)
+
+        b = _backlog_totals_from_units(units)
+        assert b.tasks_blocked_auto_clearing == 1
+        assert b.tasks_blocked_amendment_recovery == 1
+        assert b.tasks_blocked_dependency == 1
+        assert b.tasks_blocked_held == 1
+        assert b.tasks_blocked_on_held == 1
+        assert b.tasks_blocked_operator == 1
+        assert (
+            b.tasks_blocked_auto_clearing
+            + b.tasks_blocked_amendment_recovery
+            + b.tasks_blocked_dependency
+            + b.tasks_blocked_held
+            + b.tasks_blocked_on_held
+            + b.tasks_blocked_operator
+        ) == b.tasks_blocked
+
+
 class TestUnitListings:
     """B9: in-progress and blocked listings appear at the end of the report."""
 
@@ -1661,20 +1767,25 @@ class TestUnitListings:
         # Auto panel NOT rendered because no auto-clearing tasks in fixture.
         assert not any("auto-clearing" in line for line in lines)
 
-    def test_blocked_listing_renders_hold_unit_in_panel_3_with_hold_annotation(self) -> None:
-        """HOLD work units surface in the operator-action-required panel with [HOLD] annotation."""
+    def test_blocked_listing_renders_hold_unit_in_held_panel(self) -> None:
+        """HOLD work units surface in the dedicated held panel with [HOLD] annotation."""
         from devbench.backlog.work_unit import WorkUnitStatus
         from devbench.reporting.report import _blocked_listing
 
         units = [self._mk_unit("E0-F5-S1-T1", "kanon-main2-sync-blocker", WorkUnitStatus.HOLD)]
         lines = _blocked_listing(units)
-        # Attn panel rendered with count 1.
-        assert "Blocked tasks (operator action required) (1):" in lines
-        # Row carries the [HOLD] annotation; HELD unit leads the panel.
+        # Held panel rendered with count 1.
+        assert "Blocked tasks (held) (1):" in lines
+        # Hint line immediately follows the header.
+        held_idx = lines.index("Blocked tasks (held) (1):")
+        assert lines[held_idx + 1] == "On hold by operator; unhold to release."
+        # Row carries the [HOLD] annotation.
         assert any(line.startswith("  - E0-F5-S1-T1: kanon-main2-sync-blocker") and "[HOLD]" in line for line in lines)
+        # Old combined "operator action required" panel does not appear for a pure HOLD fixture.
+        assert not any("operator action required" in line for line in lines)
 
-    def test_blocked_listing_sorts_panel_3_with_hold_units_first(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """HELD units cluster at rank 0 in the attn panel ahead of BLOCKED_ON_HELD dependents."""
+    def test_blocked_listing_held_and_on_held_render_in_separate_panels(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """HELD and BLOCKED_ON_HELD each occupy their own dedicated panel in canonical order."""
         from devbench.backlog.proposal import BlockedTaskState
         from devbench.backlog.work_unit import WorkUnitStatus
         from devbench.reporting import report as report_mod
@@ -1693,14 +1804,15 @@ class TestUnitListings:
         )
 
         lines = report_mod._blocked_listing([dep_unit, hold_unit])
-        # Locate the attn panel rows.
-        panel_idx = lines.index("Blocked tasks (operator action required) (2):")
-        rows = [line for line in lines[panel_idx + 1 :] if line.startswith("  - ")]
-        # HELD unit (rank 0) precedes the BLOCKED_ON_HELD dependent (rank 1).
-        assert rows[0].startswith("  - E0-F5-S1-T1")
-        assert "[HOLD]" in rows[0]
-        assert rows[1].startswith("  - E4-F2-S4-T1")
-        assert "[blocked-on-held]" in rows[1]
+        # Both panels present.
+        assert "Blocked tasks (held) (1):" in lines
+        assert "Blocked tasks (blocked-on-held) (1):" in lines
+        # The held panel precedes the blocked-on-held panel (canonical order).
+        assert lines.index("Blocked tasks (held) (1):") < lines.index("Blocked tasks (blocked-on-held) (1):")
+        # HELD unit in held panel.
+        assert any(line.startswith("  - E0-F5-S1-T1") and "[HOLD]" in line for line in lines)
+        # BLOCKED_ON_HELD unit in its panel.
+        assert any(line.startswith("  - E4-F2-S4-T1") and "[blocked-on-held]" in line for line in lines)
 
     def test_listings_empty_when_no_matching_tasks(self) -> None:
         from devbench.backlog.work_unit import WorkUnitStatus
@@ -1777,6 +1889,93 @@ class TestUnitListings:
         assert totals.tasks_declined == 1
         rows = _backlog_state_rows(totals)
         assert ("Tasks declined", "1") in rows
+
+    def test_blocked_listing_six_panels_canonical_order_and_hints(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """AC-FUNC-001 + AC-FUNC-002 + AC-CYCLE-001: six panels in canonical order with hint lines."""
+        from devbench.backlog.proposal import BlockedTaskState
+        from devbench.backlog.work_unit import WorkUnitStatus
+        from devbench.reporting import report as report_mod
+
+        states = [
+            BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL,
+            BlockedTaskState.AWAITING_AMENDMENT_RECOVERY,
+            BlockedTaskState.AWAITING_DEPENDENCY,
+            BlockedTaskState.HELD,
+            BlockedTaskState.BLOCKED_ON_HELD,
+            BlockedTaskState.OPERATOR_ACTION_REQUIRED,
+        ]
+        units = [
+            self._mk_unit(
+                f"E0-F1-S1-T{i + 1}",
+                f"Task-{state.value}",
+                WorkUnitStatus.BLOCKED if state is not BlockedTaskState.HELD else WorkUnitStatus.HOLD,
+            )
+            for i, state in enumerate(states)
+        ]
+        task_id_to_state = {u.id: s for u, s in zip(units, states, strict=True)}
+
+        def fake_classify(backlog_root, backlog_index, task_id, **kwargs):
+            return task_id_to_state[task_id]
+
+        class _FakeMgr:
+            def _extract_pending_proposal_markers(self, _file_path):
+                return set()
+
+        def fake_recovery_signal(workspace_root, task_id):
+            return "pending-proposal"
+
+        monkeypatch.setattr("devbench.backlog.proposal.classify_blocked_task", fake_classify)
+        monkeypatch.setattr("devbench.backlog.manager.BacklogManager", _FakeMgr)
+        monkeypatch.setattr("devbench.backlog.proposal.recovery_signal_for_task", fake_recovery_signal)
+
+        lines = report_mod._blocked_listing(units)
+
+        # Six panel headers must appear in the canonical order.
+        panel_headers = [line for line in lines if line.startswith("Blocked tasks (")]
+        assert len(panel_headers) == 6, f"Expected 6 panel headers, got {len(panel_headers)}: {panel_headers}"
+
+        expected_order = [
+            "Blocked tasks (auto-clearing via proposal) (1):",
+            "Blocked tasks (awaiting amendment recovery) (1):",
+            "Blocked tasks (awaiting dependency) (1):",
+            "Blocked tasks (held) (1):",
+            "Blocked tasks (blocked-on-held) (1):",
+            "Blocked tasks (operator action required) (1):",
+        ]
+        assert panel_headers == expected_order, f"Panel order mismatch: {panel_headers}"
+
+        # Each header must be immediately followed by its canonical hint line.
+        def _panel_header(name: str) -> str:
+            return f"Blocked tasks ({name}) (1):"
+
+        canonical_hints = [
+            (_panel_header("auto-clearing via proposal"), "Resolves when marker targets reach terminal; no action."),
+            (
+                _panel_header("awaiting amendment recovery"),
+                "Recovery agent in flight; orchestrator's next sweep advances these.",
+            ),
+            (_panel_header("awaiting dependency"), "Resolves when the dependency completes; no action."),
+            (_panel_header("held"), "On hold by operator; unhold to release."),
+            (
+                _panel_header("blocked-on-held"),
+                "Waiting on a held unit; unhold the target or redirect this task.",
+            ),
+            (
+                _panel_header("operator action required"),
+                "No automation path; operator must inspect and resolve manually.",
+            ),
+        ]
+        for header, expected_hint in canonical_hints:
+            header_idx = lines.index(header)
+            # The hint line must appear immediately after the header.
+            actual = lines[header_idx + 1]
+            assert actual == expected_hint, f"After {header!r} expected {expected_hint!r} but got {actual!r}"
+
+    def test_blocked_listing_empty_panels_omitted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """AC-FUNC-003: empty panels are omitted; all-zero state returns empty list."""
+        from devbench.reporting.report import _blocked_listing
+
+        assert _blocked_listing([]) == []
 
     def test_unmaterialised_proposals_listing_empty_when_no_proposals(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

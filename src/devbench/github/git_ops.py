@@ -10,6 +10,7 @@ import os
 import re
 import subprocess
 import time
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -27,6 +28,110 @@ from devbench.config import (
 from devbench.config_loader import get_configured_default_branch
 from devbench.constants import RAW_RESPONSE_PREVIEW_CHARS
 from devbench.utils.process import run_command
+
+# ---------------------------------------------------------------------------
+# CIResult: structured return type for wait_for_checks_and_classify
+# ---------------------------------------------------------------------------
+
+#: Regex that matches the task-ID tag embedded in per-task commit messages,
+#: e.g. ``[E3-F2-S1-T5]``.  Groups: (task_id,).
+_TASK_MARKER_RE = re.compile(r"\[E\d+-F\d+-S\d+-T\d+\]")
+
+#: CI check states that indicate a failing run.
+_FAILING_CHECK_STATES: frozenset[str] = frozenset({"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED"})
+
+
+def _first_failing_job_link(checks: object, failing_states: AbstractSet[str]) -> str:
+    """Return the link URL of the first failing check entry, or the empty string.
+
+    Iterates *checks* (expected to be a ``list[dict]`` decoded from
+    ``gh pr checks --json name,state,link``) and returns the first non-empty
+    ``link`` value whose ``state`` is in *failing_states*.
+    """
+    if not isinstance(checks, list):
+        return ""
+    for check in checks:
+        if not isinstance(check, dict):
+            continue
+        if check.get("state") in failing_states:
+            link = str(check.get("link") or "")
+            if link:
+                return link
+    return ""
+
+
+def _extract_distinct_task_ids(log_text: str) -> list[str]:
+    """Return deduplicated task IDs found in *log_text*, preserving first-seen order.
+
+    Scans for ``[E<n>-F<n>-S<n>-T<n>]`` patterns and strips the brackets
+    from each match before deduplication.
+    """
+    raw_matches = _TASK_MARKER_RE.findall(log_text)
+    seen: set[str] = set()
+    distinct: list[str] = []
+    for m in raw_matches:
+        task_id = m[1:-1]  # strip leading '[' and trailing ']'
+        if task_id not in seen:
+            seen.add(task_id)
+            distinct.append(task_id)
+    return distinct
+
+
+@dataclass(frozen=True)
+class _FailedKnownTask:
+    """Carrier for a single confirmed task-ID attribution.
+
+    Produced when the failing CI job log contains exactly one distinct
+    ``[E<n>-F<n>-S<n>-T<n>]`` marker and the log fetch succeeded.
+    """
+
+    task_id: str
+
+
+class CIResult:
+    """Sentinel base class and namespace for CI classification outcomes.
+
+    Three class-level singleton instances (``CIResult.GREEN``,
+    ``CIResult.FAILED_UNKNOWN``, ``CIResult.TIMEOUT``) are defined as
+    class attributes.  :attr:`FAILED_KNOWN_TASK` is the
+    :class:`_FailedKnownTask` carrier class, which stores the attributed
+    task ID.
+
+    Usage::
+
+        result = svc.wait_for_checks_and_classify(pr_url, repo_path)
+        if result is CIResult.GREEN:
+            ...
+        elif isinstance(result, CIResult.FAILED_KNOWN_TASK):
+            print(result.task_id)
+        elif result is CIResult.FAILED_UNKNOWN:
+            ...
+        elif result is CIResult.TIMEOUT:
+            ...
+    """
+
+    #: The :class:`_FailedKnownTask` carrier class.  Use
+    #: ``isinstance(result, CIResult.FAILED_KNOWN_TASK)`` to test membership
+    #: and ``result.task_id`` to retrieve the attributed ID.
+    FAILED_KNOWN_TASK: type[_FailedKnownTask] = _FailedKnownTask
+
+    #: Singleton sentinel: all CI checks passed (or the repo has no CI).
+    GREEN: "CIResult"
+    #: Singleton sentinel: checks failed but attribution is ambiguous.
+    FAILED_UNKNOWN: "CIResult"
+    #: Singleton sentinel: ``gh pr checks --watch`` exceeded the timeout.
+    TIMEOUT: "CIResult"
+
+
+# Sentinel instances assigned after class definition so that the forward
+# reference ``"CIResult"`` in the ClassVar annotations resolves.
+CIResult.GREEN = CIResult()
+CIResult.FAILED_UNKNOWN = CIResult()
+CIResult.TIMEOUT = CIResult()
+
+
+# Public type alias used in method signatures.
+CIResultType = CIResult | _FailedKnownTask
 
 
 def _list_workflow_files(repo_path: Path | None) -> list[Path]:
@@ -574,6 +679,142 @@ class GitOpsService:
         )
         return False
 
+    def wait_for_checks_and_classify(
+        self,
+        pr_url: str,
+        repo_path: Path,
+        timeout: int | None = None,
+    ) -> CIResultType:
+        """Wait for CI checks and classify the outcome as a :class:`CIResult`.
+
+        Wraps :meth:`wait_for_checks` and, on failure, performs
+        failure-attribution by:
+
+        1. Calling ``gh pr checks --json name,state,link`` to locate the
+           URL of the first failing job.
+        2. Extracting the run ID from the job URL.
+        3. Fetching the run log via ``gh run view <run_id> --log-failed``.
+        4. Scanning the log for ``[E<n>-F<n>-S<n>-T<n>]`` task-ID markers.
+
+        Returns:
+            :attr:`CIResult.GREEN`
+                All checks passed (or the repo has no CI configured).
+            :class:`CIResult.FAILED_KNOWN_TASK` ``(task_id)``
+                The log contains exactly one distinct task-ID marker.
+            :attr:`CIResult.FAILED_UNKNOWN`
+                Checks failed but attribution is ambiguous (no marker,
+                multiple distinct markers, or the log fetch failed).
+            :attr:`CIResult.TIMEOUT`
+                ``gh pr checks --watch`` raised
+                :class:`subprocess.TimeoutExpired`.
+
+        Args:
+            pr_url: Full GitHub PR URL, e.g.
+                ``https://github.com/owner/repo/pull/42``.
+            repo_path: Local filesystem path to the repository.
+            timeout: Maximum seconds to wait per ``gh pr checks`` call.
+                Defaults to the configured value.
+        """
+        # Parse owner/repo and PR number from the URL.
+        # Expected shape: https://github.com/<owner>/<repo>/pull/<number>
+        parts = pr_url.rstrip("/").split("/")
+        pr_number = int(parts[-1])
+        repo = f"{parts[-4]}/{parts[-3]}"
+
+        # Phase 1: wait for checks.
+        try:
+            checks_passed = self.wait_for_checks(repo, pr_number, timeout, repo_path=repo_path)
+        except subprocess.TimeoutExpired:
+            self.logger.warning(
+                "wait_for_checks_and_classify: gh pr checks --watch timed out for %s",
+                pr_url,
+            )
+            return CIResult.TIMEOUT
+
+        if checks_passed:
+            return CIResult.GREEN
+
+        # Phase 2: attribute the failure.
+        return self._classify_ci_failure(repo, pr_number, repo_path)
+
+    def _classify_ci_failure(
+        self,
+        repo: str,
+        pr_number: int,
+        repo_path: Path,
+    ) -> CIResultType:
+        """Perform failure attribution and return the appropriate CIResult.
+
+        Called internally by :meth:`wait_for_checks_and_classify` when
+        :meth:`wait_for_checks` returns False.  Returns
+        :attr:`CIResult.FAILED_KNOWN_TASK` when exactly one distinct task
+        marker is found in the failing job log; :attr:`CIResult.FAILED_UNKNOWN`
+        otherwise.
+        """
+        run_id = self._find_failing_run_id_from_checks(repo, pr_number, repo_path)
+        if run_id is None:
+            return CIResult.FAILED_UNKNOWN
+
+        log_text = self._fetch_failing_run_log(repo, run_id, repo_path)
+        if not log_text:
+            return CIResult.FAILED_UNKNOWN
+
+        distinct_ids = _extract_distinct_task_ids(log_text)
+        if len(distinct_ids) == 1:
+            return CIResult.FAILED_KNOWN_TASK(distinct_ids[0])
+
+        return CIResult.FAILED_UNKNOWN
+
+    def _find_failing_run_id_from_checks(
+        self,
+        repo: str,
+        pr_number: int,
+        repo_path: Path,
+    ) -> str | None:
+        """Return the run ID for the first failing check on *pr_number*.
+
+        Returns ``None`` when no failing check is found, the ``gh`` command
+        fails, the JSON is malformed, or the job link does not contain a run ID.
+        """
+        rc, stdout, _ = self._gh(
+            ["pr", "checks", str(pr_number), "--json", "name,state,link"],
+            cwd=repo_path,
+            repo=repo,
+        )
+        if rc != 0 or not stdout.strip():
+            return None
+        try:
+            checks = json.loads(stdout)
+        except json.JSONDecodeError:
+            return None
+
+        job_link = _first_failing_job_link(checks, _FAILING_CHECK_STATES)
+        if not job_link:
+            return None
+
+        run_match = re.search(r"/actions/runs/(\d+)", job_link)
+        return run_match.group(1) if run_match else None
+
+    def _fetch_failing_run_log(
+        self,
+        repo: str,
+        run_id: str,
+        repo_path: Path,
+    ) -> str:
+        """Fetch the failing run log for *run_id*.
+
+        Returns the log text, or the empty string when the ``gh`` command
+        fails or the response is blank.
+        """
+        rc_log, log_text, _ = self._gh(
+            ["run", "view", run_id, "--log-failed"],
+            cwd=repo_path,
+            repo=repo,
+        )
+        if rc_log != 0 or not log_text.strip():
+            return ""
+        return log_text
+
     def get_latest_failing_run_id(
         self,
         repo: str,
@@ -607,11 +848,10 @@ class GitOpsService:
             checks = _json.loads(stdout)
         except _json.JSONDecodeError:
             return None
-        failing_states = {"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED"}
         for check in checks if isinstance(checks, list) else []:
             if not isinstance(check, dict):
                 continue
-            if check.get("state") in failing_states:
+            if check.get("state") in _FAILING_CHECK_STATES:
                 link = check.get("link") or ""
                 # ``link`` shape: https://github.com/<org>/<repo>/actions/runs/<id>/job/<job-id>
                 # Extract the run ID -- the segment after ``runs/``.

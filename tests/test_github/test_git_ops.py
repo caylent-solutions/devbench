@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from devbench.github.git_ops import ConflictingPRError, GitOpsService
+from devbench.github.git_ops import CIResult, ConflictingPRError, GitOpsService
 
 
 class TestGitOpsInit:
@@ -1488,3 +1489,358 @@ class TestPollPrReviewResolution:
                 )
         assert resolution.resolved is True
         assert resolution.unresolved_reviews == []
+
+
+# ---------------------------------------------------------------------------
+# CIResult and wait_for_checks_and_classify tests (E7-F1-S1-T1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestCIResult:
+    """Test that CIResult enum values exist and behave correctly."""
+
+    def test_green_variant_exists(self) -> None:
+        assert CIResult.GREEN is CIResult.GREEN
+
+    def test_failed_unknown_variant_exists(self) -> None:
+        assert CIResult.FAILED_UNKNOWN is CIResult.FAILED_UNKNOWN
+
+    def test_timeout_variant_exists(self) -> None:
+        assert CIResult.TIMEOUT is CIResult.TIMEOUT
+
+    def test_failed_known_task_carries_task_id(self) -> None:
+        result = CIResult.FAILED_KNOWN_TASK("E1-F1-S1-T1")
+        assert result.task_id == "E1-F1-S1-T1"
+
+    def test_failed_known_task_distinct_ids_are_distinct(self) -> None:
+        r1 = CIResult.FAILED_KNOWN_TASK("E1-F1-S1-T1")
+        r2 = CIResult.FAILED_KNOWN_TASK("E2-F1-S1-T2")
+        assert r1.task_id != r2.task_id
+
+    def test_failed_known_task_equality(self) -> None:
+        r1 = CIResult.FAILED_KNOWN_TASK("E3-F1-S1-T1")
+        r2 = CIResult.FAILED_KNOWN_TASK("E3-F1-S1-T1")
+        assert r1 == r2
+
+    def test_green_is_not_failed_unknown(self) -> None:
+        assert CIResult.GREEN is not CIResult.FAILED_UNKNOWN
+
+    def test_failed_known_task_not_equal_to_non_instance(self) -> None:
+        r = CIResult.FAILED_KNOWN_TASK("E1-F1-S1-T1")
+        assert r.__eq__("not-a-task") is NotImplemented
+
+    def test_failed_known_task_is_hashable(self) -> None:
+        r = CIResult.FAILED_KNOWN_TASK("E1-F1-S1-T1")
+        s: set[object] = {r}
+        assert r in s
+
+
+@pytest.mark.unit
+class TestFirstFailingJobLink:
+    """Unit tests for the _first_failing_job_link module-level helper."""
+
+    def test_returns_empty_when_checks_not_a_list(self) -> None:
+        from devbench.github.git_ops import _first_failing_job_link
+
+        result = _first_failing_job_link({"not": "a list"}, {"FAILURE"})
+        assert result == ""
+
+    def test_skips_non_dict_entries(self) -> None:
+        from devbench.github.git_ops import _first_failing_job_link
+
+        result = _first_failing_job_link(
+            ["not-a-dict", {"state": "FAILURE", "link": "https://example.com"}],
+            {"FAILURE"},
+        )
+        assert result == "https://example.com"
+
+
+@pytest.mark.unit
+class TestWaitForChecksAndClassify:
+    """Golden-fixture tests for GitOpsService.wait_for_checks_and_classify."""
+
+    # ------------------------------------------------------------------
+    # Internal fixture builder
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _one_failing_check_json(run_id: str, state: str = "FAILURE") -> str:
+        """Return JSON for 'gh pr checks --json name,state,link' with one failing entry."""
+        import json as _json
+
+        return _json.dumps(
+            [
+                {
+                    "name": "ci",
+                    "state": state,
+                    "link": f"https://github.com/caylent-solutions/devbench/actions/runs/{run_id}/job/1",
+                }
+            ]
+        )
+
+    @staticmethod
+    def _run_log_with_marker(marker: str) -> str:
+        """Return a fake run log containing a task marker."""
+        return f"step 1: checkout\nstep 2: test run\nFAIL: test_foo failed\n{marker} commit abc123\n"
+
+    def _classify_with_gh_stub(
+        self,
+        judge: GitOpsService,
+        pr_url: str,
+        repo_path: Path,
+        gh_responses: dict[str, tuple[int, str, str]],
+    ) -> object:
+        """Classify pr_url using a stubbed _gh that returns from gh_responses.
+
+        gh_responses maps a discriminating substring of the args string to the
+        (rc, stdout, stderr) tuple to return.  Falls through to (1, '', '') when
+        no key matches.
+        """
+
+        def fake_gh(args: list[str], **kwargs: object) -> tuple[int, str, str]:
+            joined = " ".join(args)
+            for key, response in gh_responses.items():
+                if key in joined:
+                    return response
+            return (1, "", "")
+
+        with (
+            patch.object(judge, "wait_for_checks", return_value=False),
+            patch.object(judge, "_gh", side_effect=fake_gh),
+        ):
+            return judge.wait_for_checks_and_classify(pr_url, repo_path)
+
+    # ------------------------------------------------------------------
+    # AC-FUNC-001: GREEN
+    # ------------------------------------------------------------------
+
+    def test_returns_green_when_all_checks_pass(self, tmp_path: Path) -> None:
+        """wait_for_checks returns True (rc=0) => CIResult.GREEN."""
+        judge = GitOpsService()
+        pr_url = "https://github.com/caylent-solutions/devbench/pull/42"
+        with patch.object(judge, "wait_for_checks", return_value=True):
+            result = judge.wait_for_checks_and_classify(pr_url, tmp_path)
+        assert result is CIResult.GREEN
+
+    def test_returns_green_for_pr_with_no_ci(self, tmp_path: Path) -> None:
+        """No-CI repos: wait_for_checks returns True => CIResult.GREEN."""
+        judge = GitOpsService()
+        pr_url = "https://github.com/caylent-solutions/git-repo/pull/7"
+        with patch.object(judge, "wait_for_checks", return_value=True):
+            result = judge.wait_for_checks_and_classify(pr_url, tmp_path)
+        assert result is CIResult.GREEN
+
+    # ------------------------------------------------------------------
+    # AC-FUNC-004: TIMEOUT
+    # ------------------------------------------------------------------
+
+    def test_returns_timeout_when_gh_pr_checks_watch_times_out(self, tmp_path: Path) -> None:
+        """subprocess.TimeoutExpired during wait_for_checks => CIResult.TIMEOUT."""
+        judge = GitOpsService()
+        pr_url = "https://github.com/caylent-solutions/devbench/pull/99"
+        with patch.object(
+            judge,
+            "wait_for_checks",
+            side_effect=subprocess.TimeoutExpired(cmd="gh pr checks", timeout=300),
+        ):
+            result = judge.wait_for_checks_and_classify(pr_url, tmp_path)
+        assert result is CIResult.TIMEOUT
+
+    # ------------------------------------------------------------------
+    # AC-FUNC-002: FAILED_KNOWN_TASK
+    # ------------------------------------------------------------------
+
+    def test_returns_failed_known_task_single_marker_in_log(self, tmp_path: Path) -> None:
+        """Exactly one task marker in the failing job log => FAILED_KNOWN_TASK."""
+        judge = GitOpsService()
+        pr_url = "https://github.com/caylent-solutions/devbench/pull/10"
+        result = self._classify_with_gh_stub(
+            judge,
+            pr_url,
+            tmp_path,
+            {
+                "--json name,state,link": (0, self._one_failing_check_json("9999"), ""),
+                "run view": (0, self._run_log_with_marker("[E3-F2-S1-T5]"), ""),
+            },
+        )
+        assert isinstance(result, CIResult.FAILED_KNOWN_TASK)
+        assert result.task_id == "E3-F2-S1-T5"
+
+    def test_returns_failed_known_task_marker_at_start_of_line(self, tmp_path: Path) -> None:
+        """Marker at line start (position 0) is matched."""
+        judge = GitOpsService()
+        pr_url = "https://github.com/caylent-solutions/devbench/pull/11"
+        result = self._classify_with_gh_stub(
+            judge,
+            pr_url,
+            tmp_path,
+            {
+                "--json name,state,link": (0, self._one_failing_check_json("1001"), ""),
+                "run view": (0, "[E5-F1-S1-T2] commit abc\nrest of output", ""),
+            },
+        )
+        assert isinstance(result, CIResult.FAILED_KNOWN_TASK)
+        assert result.task_id == "E5-F1-S1-T2"
+
+    def test_returns_failed_known_task_marker_in_middle_of_log(self, tmp_path: Path) -> None:
+        """Marker embedded in middle of log is still matched."""
+        judge = GitOpsService()
+        pr_url = "https://github.com/caylent-solutions/devbench/pull/12"
+        result = self._classify_with_gh_stub(
+            judge,
+            pr_url,
+            tmp_path,
+            {
+                "--json name,state,link": (0, self._one_failing_check_json("2002", "TIMED_OUT"), ""),
+                "run view": (0, "line1\nline2 prefix [E10-F3-S2-T1] commit xyz suffix\nline3", ""),
+            },
+        )
+        assert isinstance(result, CIResult.FAILED_KNOWN_TASK)
+        assert result.task_id == "E10-F3-S2-T1"
+
+    def test_returns_failed_known_task_marker_at_end_of_log(self, tmp_path: Path) -> None:
+        """Marker at last line of log is matched."""
+        judge = GitOpsService()
+        pr_url = "https://github.com/caylent-solutions/devbench/pull/13"
+        result = self._classify_with_gh_stub(
+            judge,
+            pr_url,
+            tmp_path,
+            {
+                "--json name,state,link": (0, self._one_failing_check_json("3003"), ""),
+                "run view": (0, "line1\nline2\nstep result=fail [E7-F1-S1-T1]", ""),
+            },
+        )
+        assert isinstance(result, CIResult.FAILED_KNOWN_TASK)
+        assert result.task_id == "E7-F1-S1-T1"
+
+    # ------------------------------------------------------------------
+    # AC-FUNC-003: FAILED_UNKNOWN sub-cases
+    # ------------------------------------------------------------------
+
+    def test_returns_failed_unknown_when_no_marker_in_log(self, tmp_path: Path) -> None:
+        """No task marker in the log => FAILED_UNKNOWN."""
+        judge = GitOpsService()
+        pr_url = "https://github.com/caylent-solutions/devbench/pull/20"
+        result = self._classify_with_gh_stub(
+            judge,
+            pr_url,
+            tmp_path,
+            {
+                "--json name,state,link": (0, self._one_failing_check_json("5005"), ""),
+                "run view": (0, "step 1: checkout\nstep 2: test run\nFAIL: test_foo failed\nno marker", ""),
+            },
+        )
+        assert result is CIResult.FAILED_UNKNOWN
+
+    def test_returns_failed_unknown_when_multiple_distinct_markers_in_log(self, tmp_path: Path) -> None:
+        """Multiple distinct task markers => FAILED_UNKNOWN (ambiguous attribution)."""
+        judge = GitOpsService()
+        pr_url = "https://github.com/caylent-solutions/devbench/pull/21"
+        result = self._classify_with_gh_stub(
+            judge,
+            pr_url,
+            tmp_path,
+            {
+                "--json name,state,link": (0, self._one_failing_check_json("6006"), ""),
+                "run view": (0, "[E1-F1-S1-T1] commit aaa\n[E2-F1-S1-T2] commit bbb\nFAIL", ""),
+            },
+        )
+        assert result is CIResult.FAILED_UNKNOWN
+
+    def test_returns_failed_unknown_when_log_fetch_fails(self, tmp_path: Path) -> None:
+        """gh run view returns non-zero => FAILED_UNKNOWN."""
+        judge = GitOpsService()
+        pr_url = "https://github.com/caylent-solutions/devbench/pull/22"
+        result = self._classify_with_gh_stub(
+            judge,
+            pr_url,
+            tmp_path,
+            {
+                "--json name,state,link": (0, self._one_failing_check_json("7007"), ""),
+                "run view": (1, "", "error fetching log"),
+            },
+        )
+        assert result is CIResult.FAILED_UNKNOWN
+
+    def test_returns_failed_unknown_when_no_failing_job_link(self, tmp_path: Path) -> None:
+        """No failing check with a link in gh pr checks output => FAILED_UNKNOWN."""
+        import json as _json
+
+        judge = GitOpsService()
+        pr_url = "https://github.com/caylent-solutions/devbench/pull/23"
+        checks_json = _json.dumps([{"name": "ci", "state": "SUCCESS", "link": ""}])
+        result = self._classify_with_gh_stub(
+            judge,
+            pr_url,
+            tmp_path,
+            {"--json name,state,link": (0, checks_json, "")},
+        )
+        assert result is CIResult.FAILED_UNKNOWN
+
+    def test_returns_failed_unknown_when_pr_checks_json_fails(self, tmp_path: Path) -> None:
+        """gh pr checks --json exits non-zero => FAILED_UNKNOWN."""
+        judge = GitOpsService()
+        pr_url = "https://github.com/caylent-solutions/devbench/pull/24"
+        result = self._classify_with_gh_stub(
+            judge,
+            pr_url,
+            tmp_path,
+            {"--json name,state,link": (1, "", "error")},
+        )
+        assert result is CIResult.FAILED_UNKNOWN
+
+    def test_returns_failed_unknown_when_pr_checks_json_is_malformed(self, tmp_path: Path) -> None:
+        """gh pr checks --json returns malformed JSON => FAILED_UNKNOWN."""
+        judge = GitOpsService()
+        pr_url = "https://github.com/caylent-solutions/devbench/pull/25"
+        result = self._classify_with_gh_stub(
+            judge,
+            pr_url,
+            tmp_path,
+            {"--json name,state,link": (0, "not valid json {{{", "")},
+        )
+        assert result is CIResult.FAILED_UNKNOWN
+
+    def test_extracts_repo_and_pr_number_from_url(self, tmp_path: Path) -> None:
+        """Helper correctly parses owner/repo and PR number from the PR URL."""
+        judge = GitOpsService()
+        pr_url = "https://github.com/my-org/my-repo/pull/55"
+
+        calls: list[tuple[str, int]] = []
+
+        def capturing_wait(
+            repo: str,
+            pr_number: int,
+            timeout: int | None = None,
+            *,
+            repo_path: Path | None = None,
+        ) -> bool:
+            calls.append((repo, pr_number))
+            return True
+
+        with (
+            patch.object(judge, "wait_for_checks", side_effect=capturing_wait),
+            patch("devbench.github.git_ops.validate_repo"),
+        ):
+            result = judge.wait_for_checks_and_classify(pr_url, tmp_path)
+
+        assert result is CIResult.GREEN
+        assert calls == [("my-org/my-repo", 55)]
+
+    def test_duplicate_markers_count_as_one(self, tmp_path: Path) -> None:
+        """Same task marker repeated multiple times counts as exactly one distinct marker."""
+        judge = GitOpsService()
+        pr_url = "https://github.com/caylent-solutions/devbench/pull/30"
+        result = self._classify_with_gh_stub(
+            judge,
+            pr_url,
+            tmp_path,
+            {
+                "--json name,state,link": (0, self._one_failing_check_json("8008"), ""),
+                "run view": (0, "[E4-F2-S1-T3] commit aaa\n[E4-F2-S1-T3] commit bbb", ""),
+            },
+        )
+        assert isinstance(result, CIResult.FAILED_KNOWN_TASK)
+        assert result.task_id == "E4-F2-S1-T3"

@@ -3472,8 +3472,10 @@ def cmd_git_ops(unit_id: str) -> int:
         return 1
     pr_number = int(pr_number_str)
 
-    checks_passed = ops.wait_for_checks(canonical_repo, pr_number, repo_path=repo_path)
-    if not checks_passed:
+    from devbench.github.git_ops import CIResult
+
+    ci_result = ops.wait_for_checks_and_classify(pr_url, repo_path)
+    if ci_result is not CIResult.GREEN:
         return _handle_ci_failure(
             ops=ops,
             unit_id=unit_id,

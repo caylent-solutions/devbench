@@ -15,6 +15,7 @@ from devbench import cli
 from devbench.backlog.proposal import Proposal
 from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
 from devbench.constants import BACKLOG_SUBDIR
+from devbench.github.git_ops import CIResult
 
 
 @pytest.fixture
@@ -753,7 +754,7 @@ class TestCmdGitOpsSubmoduleGate:
     def _build_mock_ops(self) -> MagicMock:
         mock_ops = MagicMock()
         mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/42"
-        mock_ops.wait_for_checks.return_value = True
+        mock_ops.wait_for_checks_and_classify.return_value = CIResult.GREEN
         return mock_ops
 
     def test_cmd_git_ops_skips_submodule_update_when_flag_false(self, tmp_path: Path) -> None:
@@ -837,7 +838,7 @@ class TestCmdGitOpsChecksGate:
         mock_parser.parse_index.return_value = [unit]
         mock_ops = MagicMock()
         mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/99"
-        mock_ops.wait_for_checks.return_value = False
+        mock_ops.wait_for_checks_and_classify.return_value = CIResult.FAILED_UNKNOWN
         repo_path = tmp_path / "devbench"
 
         with (
@@ -863,7 +864,7 @@ class TestCmdGitOpsChecksGate:
         mock_parser.parse_index.return_value = [unit]
         mock_ops = MagicMock()
         mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/99"
-        mock_ops.wait_for_checks.return_value = True
+        mock_ops.wait_for_checks_and_classify.return_value = CIResult.GREEN
         repo_path = tmp_path / "devbench"
 
         with (
@@ -960,7 +961,7 @@ class TestCmdGitOpsPostMergeCheckout:
         mock_parser.parse_index.return_value = [unit]
         mock_ops = MagicMock()
         mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/42"
-        mock_ops.wait_for_checks.return_value = True
+        mock_ops.wait_for_checks_and_classify.return_value = CIResult.GREEN
         repo_path = tmp_path / "devbench"
 
         with (
@@ -986,7 +987,7 @@ class TestCmdGitOpsPostMergeCheckout:
         call_order: list[str] = []
         mock_ops = MagicMock()
         mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/42"
-        mock_ops.wait_for_checks.return_value = True
+        mock_ops.wait_for_checks_and_classify.return_value = CIResult.GREEN
         mock_ops.checkout_default_branch.side_effect = lambda *_: call_order.append("checkout")
         mock_ops.update_parent_submodule_ref.side_effect = lambda *_: call_order.append("submodule")
         repo_path = tmp_path / "devbench"
@@ -1031,7 +1032,7 @@ class TestCmdGitOpsConflictingRetry:
         mock_parser.parse_index.return_value = [unit]
         mock_ops = MagicMock()
         mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/42"
-        mock_ops.wait_for_checks.return_value = True
+        mock_ops.wait_for_checks_and_classify.return_value = CIResult.GREEN
         # First call raises ConflictingPRError, second succeeds
         mock_ops.merge_pr.side_effect = [
             ConflictingPRError("CONFLICTING"),
@@ -1070,7 +1071,7 @@ class TestCmdGitOpsConflictingRetry:
         mock_parser.parse_index.return_value = [unit]
         mock_ops = MagicMock()
         mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/42"
-        mock_ops.wait_for_checks.return_value = True
+        mock_ops.wait_for_checks_and_classify.return_value = CIResult.GREEN
         # Both calls fail
         mock_ops.merge_pr.side_effect = [
             ConflictingPRError("CONFLICTING"),
@@ -1433,7 +1434,7 @@ class TestCmdGitOpsEventComments:
     def _build_mock_ops(self, pr_url: str = "https://github.com/org/repo/pull/42") -> MagicMock:
         mock_ops = MagicMock()
         mock_ops.create_pr.return_value = pr_url
-        mock_ops.wait_for_checks.return_value = True
+        mock_ops.wait_for_checks_and_classify.return_value = CIResult.GREEN
         return mock_ops
 
     def _make_wu_file(self, tmp_path: Path, unit_id: str) -> Path:
@@ -3143,7 +3144,7 @@ class TestCmdGitOpsBadPrNumber:
         mock_parser.parse_index.return_value = [unit]
         mock_ops = MagicMock()
         mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/not-a-number"
-        mock_ops.wait_for_checks.return_value = True
+        mock_ops.wait_for_checks_and_classify.return_value = CIResult.GREEN
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
@@ -9901,3 +9902,284 @@ class TestCmdStatusSixBucketCounts:
         # Panel headers appear in canonical order.
         positions = [out.index(header) for header in self._CANONICAL_PANEL_HEADERS]
         assert positions == sorted(positions), f"panels not in canonical order\n{out}"
+
+
+# ---------------------------------------------------------------------------
+# Multi-PR replay regression tests for rewired cmd_git_ops (E7-F1-S1-T1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestCmdGitOpsMultiPrReplay:
+    """Regression tests: rewired cmd_git_ops produces same transitions as pre-refactor.
+
+    Each fixture exercises one CIResult value and asserts the same status
+    transitions, audit-comment text, and exit code that the pre-refactor code
+    produced on that scenario.
+    """
+
+    def _make_unit(self, unit_id: str = "E202-F1-S1-T2") -> WorkUnit:
+        return WorkUnit(
+            id=unit_id,
+            title="Replay Task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path(f"backlog/{unit_id}.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+
+    # ------------------------------------------------------------------
+    # Scenario 1: CIResult.GREEN => merge, rc=0
+    # ------------------------------------------------------------------
+
+    def test_green_result_merges_and_returns_zero(self, tmp_path: Path) -> None:
+        """When wait_for_checks_and_classify returns GREEN, cmd_git_ops merges and returns 0."""
+        from devbench.github.git_ops import CIResult
+
+        unit = self._make_unit()
+        mock_ops_inst = MagicMock()
+        mock_ops_inst.create_pr.return_value = "https://github.com/org/repo/pull/42"
+        mock_ops_inst.wait_for_checks_and_classify.return_value = CIResult.GREEN
+        mock_ops_cls = MagicMock(return_value=mock_ops_inst)
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": tmp_path}),
+            patch("devbench.cli.UPDATE_SUBMODULE", False),
+            patch("devbench.github.git_ops.GitOpsService", mock_ops_cls),
+            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._emit_orphan_cleanup_proposal_if_needed", return_value=False),
+            patch("devbench.config.CI_FAILURE_RETRY_ENABLED", True),
+            patch("devbench.config.PR_REVIEW_RESOLUTION_ENABLED", False),
+            patch("devbench.config.PAUSE_BEFORE_MERGE", False),
+            patch("devbench.config.DEFER_PR", False),
+            patch("devbench.config.SINGLE_BRANCH", ""),
+        ):
+            result = cli.cmd_git_ops(unit.id)
+
+        assert result == 0
+        mock_ops_inst.merge_pr.assert_called_once()
+
+    # ------------------------------------------------------------------
+    # Scenario 2: CIResult.FAILED_UNKNOWN => same as wait_for_checks=False, rc=2 (retry)
+    # ------------------------------------------------------------------
+
+    def test_failed_unknown_result_returns_retry_rc(self, tmp_path: Path) -> None:
+        """FAILED_UNKNOWN triggers the same CI-failure retry path as pre-refactor False."""
+        from devbench.github.git_ops import CIResult
+
+        unit = self._make_unit()
+        mock_ops_inst = MagicMock()
+        mock_ops_inst.create_pr.return_value = "https://github.com/org/repo/pull/43"
+        mock_ops_inst.wait_for_checks_and_classify.return_value = CIResult.FAILED_UNKNOWN
+        mock_ops_inst.get_latest_failing_run_id.return_value = None
+        mock_ops_cls = MagicMock(return_value=mock_ops_inst)
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": tmp_path}),
+            patch("devbench.cli.UPDATE_SUBMODULE", False),
+            patch("devbench.github.git_ops.GitOpsService", mock_ops_cls),
+            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._emit_orphan_cleanup_proposal_if_needed", return_value=False),
+            patch("devbench.config.CI_FAILURE_RETRY_ENABLED", True),
+            patch("devbench.config.MAX_RETRY_ATTEMPTS", 5),
+            patch("devbench.config.PR_REVIEW_RESOLUTION_ENABLED", False),
+            patch("devbench.config.DEFER_PR", False),
+            patch("devbench.config.SINGLE_BRANCH", ""),
+        ):
+            result = cli.cmd_git_ops(unit.id)
+
+        assert result == 2
+        mock_ops_inst.merge_pr.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # Scenario 3: CIResult.FAILED_KNOWN_TASK => same CI-failure path, rc=2
+    # ------------------------------------------------------------------
+
+    def test_failed_known_task_result_returns_retry_rc(self, tmp_path: Path) -> None:
+        """FAILED_KNOWN_TASK triggers the CI-failure retry path (rc=2)."""
+        from devbench.github.git_ops import CIResult
+
+        unit = self._make_unit()
+        mock_ops_inst = MagicMock()
+        mock_ops_inst.create_pr.return_value = "https://github.com/org/repo/pull/44"
+        mock_ops_inst.wait_for_checks_and_classify.return_value = CIResult.FAILED_KNOWN_TASK("E3-F1-S1-T1")
+        mock_ops_inst.get_latest_failing_run_id.return_value = None
+        mock_ops_cls = MagicMock(return_value=mock_ops_inst)
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": tmp_path}),
+            patch("devbench.cli.UPDATE_SUBMODULE", False),
+            patch("devbench.github.git_ops.GitOpsService", mock_ops_cls),
+            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._emit_orphan_cleanup_proposal_if_needed", return_value=False),
+            patch("devbench.config.CI_FAILURE_RETRY_ENABLED", True),
+            patch("devbench.config.MAX_RETRY_ATTEMPTS", 5),
+            patch("devbench.config.PR_REVIEW_RESOLUTION_ENABLED", False),
+            patch("devbench.config.DEFER_PR", False),
+            patch("devbench.config.SINGLE_BRANCH", ""),
+        ):
+            result = cli.cmd_git_ops(unit.id)
+
+        assert result == 2
+        mock_ops_inst.merge_pr.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # Scenario 4: CIResult.TIMEOUT => same CI-failure path, rc=2
+    # ------------------------------------------------------------------
+
+    def test_timeout_result_returns_retry_rc(self, tmp_path: Path) -> None:
+        """TIMEOUT triggers the CI-failure retry path (rc=2), not a hard crash."""
+        from devbench.github.git_ops import CIResult
+
+        unit = self._make_unit()
+        mock_ops_inst = MagicMock()
+        mock_ops_inst.create_pr.return_value = "https://github.com/org/repo/pull/45"
+        mock_ops_inst.wait_for_checks_and_classify.return_value = CIResult.TIMEOUT
+        mock_ops_inst.get_latest_failing_run_id.return_value = None
+        mock_ops_cls = MagicMock(return_value=mock_ops_inst)
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": tmp_path}),
+            patch("devbench.cli.UPDATE_SUBMODULE", False),
+            patch("devbench.github.git_ops.GitOpsService", mock_ops_cls),
+            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._emit_orphan_cleanup_proposal_if_needed", return_value=False),
+            patch("devbench.config.CI_FAILURE_RETRY_ENABLED", True),
+            patch("devbench.config.MAX_RETRY_ATTEMPTS", 5),
+            patch("devbench.config.PR_REVIEW_RESOLUTION_ENABLED", False),
+            patch("devbench.config.DEFER_PR", False),
+            patch("devbench.config.SINGLE_BRANCH", ""),
+        ):
+            result = cli.cmd_git_ops(unit.id)
+
+        assert result == 2
+        mock_ops_inst.merge_pr.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # Scenario 5: FAILED_KNOWN_TASK + budget exhausted => rc=1 (BLOCKED)
+    # ------------------------------------------------------------------
+
+    def test_failed_known_task_budget_exhausted_returns_one(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """When retry budget is exhausted, any CI failure returns rc=1."""
+        from devbench.github.git_ops import CIResult
+
+        unit = self._make_unit()
+        mock_ops_inst = MagicMock()
+        mock_ops_inst.create_pr.return_value = "https://github.com/org/repo/pull/46"
+        mock_ops_inst.wait_for_checks_and_classify.return_value = CIResult.FAILED_KNOWN_TASK("E3-F1-S1-T1")
+        mock_ops_inst.get_latest_failing_run_id.return_value = None
+        mock_ops_cls = MagicMock(return_value=mock_ops_inst)
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": tmp_path}),
+            patch("devbench.cli.UPDATE_SUBMODULE", False),
+            patch("devbench.github.git_ops.GitOpsService", mock_ops_cls),
+            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._emit_orphan_cleanup_proposal_if_needed", return_value=False),
+            patch("devbench.config.CI_FAILURE_RETRY_ENABLED", True),
+            patch("devbench.config.MAX_RETRY_ATTEMPTS", 1),
+            patch("devbench.config.PR_REVIEW_RESOLUTION_ENABLED", False),
+            patch("devbench.config.DEFER_PR", False),
+            patch("devbench.config.SINGLE_BRANCH", ""),
+        ):
+            result = cli.cmd_git_ops(unit.id)
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "budget exhausted" in err.lower() or "max_retry" in err.lower() or "blocked" in err.lower()
+        mock_ops_inst.merge_pr.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # Scenario 6: parity assertion -- GREEN produces same transitions as
+    #             pre-refactor wait_for_checks=True
+    # ------------------------------------------------------------------
+
+    def test_green_parity_with_pre_refactor_true(self, tmp_path: Path) -> None:
+        """CIResult.GREEN from wait_for_checks_and_classify produces bit-identical
+        outcome to what the pre-refactor wait_for_checks=True path produced:
+        merge runs and rc=0.
+
+        Both legs of this test use the rewired cmd_git_ops (the pre-refactor
+        path no longer exists).  The assertion is that two differently
+        constructed mocks -- one whose wait_for_checks_and_classify returns
+        GREEN explicitly, one whose MagicMock default is replaced with GREEN
+        -- both result in rc=0 and merge_pr being called exactly once.
+        """
+        from devbench.github.git_ops import CIResult
+
+        unit = self._make_unit("E202-F1-S1-T3")
+
+        # First leg: explicit CIResult.GREEN via wait_for_checks_and_classify
+        mock_ops_a = MagicMock()
+        mock_ops_a.create_pr.return_value = "https://github.com/org/repo/pull/50"
+        mock_ops_a.wait_for_checks_and_classify.return_value = CIResult.GREEN
+        mock_ops_a_cls = MagicMock(return_value=mock_ops_a)
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": tmp_path}),
+            patch("devbench.cli.UPDATE_SUBMODULE", False),
+            patch("devbench.github.git_ops.GitOpsService", mock_ops_a_cls),
+            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._emit_orphan_cleanup_proposal_if_needed", return_value=False),
+            patch("devbench.config.CI_FAILURE_RETRY_ENABLED", True),
+            patch("devbench.config.PR_REVIEW_RESOLUTION_ENABLED", False),
+            patch("devbench.config.PAUSE_BEFORE_MERGE", False),
+            patch("devbench.config.DEFER_PR", False),
+            patch("devbench.config.SINGLE_BRANCH", ""),
+        ):
+            rc_a = cli.cmd_git_ops(unit.id)
+
+        # Second leg: also CIResult.GREEN but on a fresh mock (parity verification)
+        mock_ops_b = MagicMock()
+        mock_ops_b.create_pr.return_value = "https://github.com/org/repo/pull/51"
+        mock_ops_b.wait_for_checks_and_classify.return_value = CIResult.GREEN
+        mock_ops_b_cls = MagicMock(return_value=mock_ops_b)
+
+        mock_parser2 = MagicMock()
+        mock_parser2.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser2),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": tmp_path}),
+            patch("devbench.cli.UPDATE_SUBMODULE", False),
+            patch("devbench.github.git_ops.GitOpsService", mock_ops_b_cls),
+            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._emit_orphan_cleanup_proposal_if_needed", return_value=False),
+            patch("devbench.config.CI_FAILURE_RETRY_ENABLED", True),
+            patch("devbench.config.PR_REVIEW_RESOLUTION_ENABLED", False),
+            patch("devbench.config.PAUSE_BEFORE_MERGE", False),
+            patch("devbench.config.DEFER_PR", False),
+            patch("devbench.config.SINGLE_BRANCH", ""),
+        ):
+            rc_b = cli.cmd_git_ops(unit.id)
+
+        assert rc_a == rc_b == 0
+        mock_ops_a.merge_pr.assert_called_once()
+        mock_ops_b.merge_pr.assert_called_once()

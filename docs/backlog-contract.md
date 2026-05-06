@@ -241,13 +241,13 @@ The canonical Status Summary format is **per-epic** -- one row per top-level epi
 ```markdown
 ## Status Summary
 
-| Epic | Title | Done | In Progress | In Queue | Blocked |
-|------|-------|------|-------------|----------|---------|
-| E1   | Backlog tooling | 8 | 1 | 2 | 0 |
-| E2   | Migration scripts | 4 | 0 | 5 | 1 |
+| Epic | Title | Done | In Progress | In Queue | Blocked | Declined |
+|------|-------|------|-------------|----------|---------|----------|
+| E1   | Backlog tooling | 8 | 1 | 2 | 0 | 0 |
+| E2   | Migration scripts | 4 | 0 | 5 | 1 | 0 |
 ```
 
-`in-review` is a transient state during the review tier and is not surfaced in the summary; units in review are still counted under `In Progress` for summary purposes.
+`in-review` is a transient state during the review tier and is not surfaced in the summary; units in review are not counted in the summary table (`src/devbench/backlog/manager.py`, `_compute_epic_counts`).
 
 ### Index rows
 

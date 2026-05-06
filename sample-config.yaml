@@ -171,7 +171,7 @@ orchestrate:
   # at depth >= this cap, the source task transitions to
   # NEEDS_OPERATOR_ATTENTION instead of materialising another recovery
   # layer. Override via JUDGE_ORCHESTRATE_MAX_CASCADE_DEPTH env var.
-  max_cascade_depth: 3
+  max_cascade_depth: 2
 
 # ---------------------------------------------------------------------------
 # Report / cost estimation

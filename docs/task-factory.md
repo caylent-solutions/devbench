@@ -371,12 +371,12 @@ and
 Recovery cascades (a proposal whose source task is itself the
 materialisation of an earlier proposal) carry a `cascade_depth`
 field equal to `parent_depth + 1`. The
-`orchestrate.max_cascade_depth` YAML knob (default `3`, env override
+`orchestrate.max_cascade_depth` YAML knob (default `2`, env override
 `JUDGE_ORCHESTRATE_MAX_CASCADE_DEPTH`) caps recursion. When
 `cmd_materialise_proposal` sees a proposal at the cap, it transitions
 the source task to `NEEDS_OPERATOR_ATTENTION` instead of authoring
-another draft. Default of 3 reflects observed cascade lengths in
-production backlogs; raise per-workspace via YAML if your operator
+another draft. Default of 2 reflects the bounded cascade depth needed
+for typical recovery chains; raise per-workspace via YAML if your operator
 loop genuinely needs deeper chains.
 
 ## Materialise-time placeholder rejection (issue #143)

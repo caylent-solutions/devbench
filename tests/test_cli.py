@@ -7184,12 +7184,12 @@ class TestCmdMaterialiseProposalLifecycleGates:
         assert "E0-F1-S1-T2" in err
 
     def test_cascade_depth_at_cap_rejected(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        self._seed_proposal(tmp_path, "E0-F1-S1-T1", approach="concrete approach", cascade_depth=3)
+        self._seed_proposal(tmp_path, "E0-F1-S1-T1", approach="concrete approach", cascade_depth=2)
         with (
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
             patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
             patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
-            patch("devbench.cli.MAX_CASCADE_DEPTH", 3),
+            patch("devbench.cli.MAX_CASCADE_DEPTH", 2),
         ):
             rc = cli.cmd_materialise_proposal("E0-F1-S1-T1")
         assert rc == 1
@@ -7208,7 +7208,7 @@ class TestCmdMaterialiseProposalLifecycleGates:
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
             patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
             patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
-            patch("devbench.cli.MAX_CASCADE_DEPTH", 3),
+            patch("devbench.cli.MAX_CASCADE_DEPTH", 2),
         ):
             rc = cli.cmd_materialise_proposal("E0-F1-S1-T1")
         assert rc == 1

@@ -69,3 +69,12 @@ class TestStatusStringConstants:
         from devbench.backlog.manager import VALID_STATUSES
 
         assert "done" in VALID_STATUSES
+
+
+class TestCascadeDepthConstant:
+    """DEFAULT_MAX_CASCADE_DEPTH equals 2 (issue #E8)."""
+
+    def test_default_max_cascade_depth_equals_2(self) -> None:
+        from devbench.constants import DEFAULT_MAX_CASCADE_DEPTH
+
+        assert DEFAULT_MAX_CASCADE_DEPTH == 2

@@ -9,7 +9,7 @@
 
 Issue #162 Phase 2. The Phase 1+4 cache (ADR-16, ADR-19) makes the
 report fast on warm calls -- the SQLite indexed event store serves
-windowed queries in microseconds, and the parser only reads appended
+windowed queries with low latency, and the parser only reads appended
 log bytes. The remaining cost is the per-window aggregation step that
 walks every task's transition pair to compute durations / token
 totals / cost increments.
@@ -23,7 +23,7 @@ event pairs from the indexed event store.
 ## Decision
 
 Single hook point at `BacklogManager._set_status`
-(`src/devbench/backlog/manager.py:618`). Every public transition
+(`src/devbench/backlog/manager.py:623`). Every public transition
 method in the manager (`mark_done`, `mark_blocked`, `force_status`,
 auto-rollup paths) routes through `_set_status`, so one hook covers
 all entry points. After the existing transition log line, the manager

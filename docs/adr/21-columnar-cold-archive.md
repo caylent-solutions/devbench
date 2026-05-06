@@ -8,7 +8,7 @@
 ## Context
 
 Issue #162 Phase 7. Long-running orchestrations accumulate large flat
-JSONL logs (50+ MB). Operators who want to retain ended sessions for
+JSONL logs. Operators who want to retain ended sessions for
 audit / forensics / cross-session reporting need a denser format
 than the live JSONL the orchestrator appends to.
 
@@ -20,14 +20,15 @@ its hot JSONL file; ended sessions can be archived for cold storage.
 ## Decision
 
 `pyarrow` is the only new dependency. It is **opt-in** -- mainline
-`pip install devbench` carries zero new mandatory dependencies.
-Operators install via:
+installs (`git clone` + `make install`) carry zero new mandatory
+dependencies. Operators enable the feature via:
 
-    pip install devbench[archive]
+    make install
+    pip install -e ".[archive]"
 
 When `pyarrow` is missing, every public function in
 `devbench.reporting.archive` raises a structured
-`ArchiveDependencyMissing` error whose message names the install
+`ArchiveDependencyMissingError` error whose message names the install
 command verbatim. Per CLAUDE.md fail-fast: no silent fallback.
 
 The Parquet schema is intentionally minimal:
@@ -46,7 +47,7 @@ still in the live or rotated log).
 ## Alternatives considered
 
 - **Make `pyarrow` mandatory.** Operators who never archive would pay
-  the install cost (~50 MB) for no benefit. Opt-in is cleaner.
+  a significant install cost for no benefit. Opt-in is cleaner.
 - **Use `gzip`-compressed JSONL.** Lighter dependency footprint
   (stdlib) but loses the columnar query benefit; readers still
   iterate line-by-line.
@@ -63,7 +64,7 @@ still in the live or rotated log).
 - New disk artefact `<workspace>/logs/legacy/<session-id>.parquet`.
   Deletion is always safe -- the source JSONL still holds the events.
 - New module `devbench.reporting.archive` joins the coverage gate at
-  100% line + branch.
+  100% line coverage (`make test-coverage-new`, Makefile line 89).
 - The `[archive]` extra in `pyproject.toml` is the only declarative
   signal an operator needs to opt in. The dev-group install pulls
   pyarrow in so the test suite can pin parity contracts.

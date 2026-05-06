@@ -9,7 +9,11 @@ unexport VIRTUAL_ENV
 help:
 	@echo "DevBench -- Make Targets"
 	@echo ""
-	@grep -E '^## ' $(MAKEFILE_LIST) | sed 's/^## /  /'
+	@grep -E '^## ' $(MAKEFILE_LIST) | sed \
+	  -e 's/^## /  /' \
+	  -e 's/\(start-interactive:.*\)/\1 [JUDGE_WORKSPACE_ROOT, JUDGE_CLAUDE_MODEL, JUDGE_SAFE_PERMISSIONS]/' \
+	  -e 's/\(report-session:.*\)/\1 [SINCE]/' \
+	  -e 's/\(watch-live:.*\)/\1 [INTERVAL]/'
 	@echo ""
 
 ## install: Install runtime and dev dependencies
@@ -116,8 +120,13 @@ start:
 	uv run python -m devbench.cli start
 
 ## start-interactive: Launch interactive Claude session with devbench plugin loaded
+ifeq ($(JUDGE_SAFE_PERMISSIONS),1)
 start-interactive:
 	claude --plugin-dir plugin/devbench
+else
+start-interactive:
+	claude --dangerously-skip-permissions --plugin-dir plugin/devbench
+endif
 
 ## report: Show backlog progress report (full session)
 report:

@@ -3611,7 +3611,7 @@ def _check_merge_fetch_pr_state(
     treats as still-in-review with `pr_state=no-pr-found`).
     """
     rc, stdout, stderr = ops._gh(  # type: ignore[attr-defined]
-        ["pr", "list", "--head", branch, "--state", "all", "--json", "number,state,merged,url"],
+        ["pr", "list", "--head", branch, "--state", "all", "--json", "number,state,mergedAt,url"],
         repo=canonical_repo,
     )
     if rc != 0:
@@ -3661,9 +3661,9 @@ def cmd_check_merge(unit_id: str) -> int:
     """Reconcile a pause-before-merge work unit's PR state.
 
     Issue #101 reconciliation step. Queries the PR for *unit_id* via
-    ``gh pr list --head <branch> --json number,state,merged``:
+    ``gh pr list --head <branch> --json number,state,mergedAt``:
 
-    - **merged** -> transition to ``done`` via :meth:`BacklogManager.mark_done`
+    - **merged** (``mergedAt`` non-null) -> transition to ``done`` via :meth:`BacklogManager.mark_done`
       (enforces the done-gate: every required judge must have passed).
     - **closed without merge** -> transition to ``blocked`` with an audit
       comment naming the PR.
@@ -3693,7 +3693,7 @@ def cmd_check_merge(unit_id: str) -> int:
     pr = pr_records[0]
     pr_number = pr.get("number")
     pr_state = str(pr.get("state") or "").upper()
-    pr_merged = bool(pr.get("merged"))
+    pr_merged = pr.get("mergedAt") is not None
     pr_url = str(pr.get("url") or "")
 
     if pr_merged:

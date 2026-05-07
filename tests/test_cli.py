@@ -8156,7 +8156,7 @@ class TestCmdCheckMerge:
 
     def test_returns_0_with_done_when_pr_merged(self, tmp_path: Path) -> None:
         ops = MagicMock()
-        ops._gh.return_value = (0, json.dumps([{"number": 42, "state": "MERGED", "merged": True, "url": "u"}]), "")
+        ops._gh.return_value = (0, json.dumps([{"number": 42, "state": "MERGED", "mergedAt": "2026-05-07T00:00:00Z", "url": "u"}]), "")
         mgr = MagicMock()
         wu_file = tmp_path / "E0-F1-S1-T1.md"
         wu_file.write_text("stub")
@@ -8173,7 +8173,7 @@ class TestCmdCheckMerge:
 
     def test_returns_0_with_blocked_when_pr_closed(self, tmp_path: Path) -> None:
         ops = MagicMock()
-        ops._gh.return_value = (0, json.dumps([{"number": 42, "state": "CLOSED", "merged": False, "url": "u"}]), "")
+        ops._gh.return_value = (0, json.dumps([{"number": 42, "state": "CLOSED", "mergedAt": None, "url": "u"}]), "")
         mgr = MagicMock()
         wu_file = tmp_path / "E0-F1-S1-T1.md"
         wu_file.write_text("stub")
@@ -8190,7 +8190,7 @@ class TestCmdCheckMerge:
 
     def test_noop_when_pr_still_open(self, tmp_path: Path) -> None:
         ops = MagicMock()
-        ops._gh.return_value = (0, json.dumps([{"number": 42, "state": "OPEN", "merged": False, "url": "u"}]), "")
+        ops._gh.return_value = (0, json.dumps([{"number": 42, "state": "OPEN", "mergedAt": None, "url": "u"}]), "")
         mgr = MagicMock()
         with (
             patch("devbench.cli._resolve_git_ops_context", return_value=(self._make_unit(), "ex/foo", tmp_path)),
@@ -8242,7 +8242,7 @@ class TestCmdCheckMerge:
     def test_returns_1_when_done_gate_refuses(self, tmp_path: Path) -> None:
         """Done-gate refuses merge promotion when judges did not pass -- rc=1."""
         ops = MagicMock()
-        ops._gh.return_value = (0, json.dumps([{"number": 42, "state": "MERGED", "merged": True, "url": "u"}]), "")
+        ops._gh.return_value = (0, json.dumps([{"number": 42, "state": "MERGED", "mergedAt": "2026-05-07T00:00:00Z", "url": "u"}]), "")
         mgr = MagicMock()
         mgr.mark_done.side_effect = RuntimeError("done-gate failure")
         wu_file = tmp_path / "E0-F1-S1-T1.md"

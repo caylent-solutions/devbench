@@ -233,7 +233,7 @@ class TestReleaseSmoke:
         ops = MagicMock()
         ops._gh.return_value = (
             0,
-            json.dumps([{"number": 42, "state": "MERGED", "merged": True, "url": "u"}]),
+            json.dumps([{"number": 42, "state": "MERGED", "mergedAt": "2026-05-07T00:00:00Z", "url": "u"}]),
             "",
         )
         mgr = MagicMock()

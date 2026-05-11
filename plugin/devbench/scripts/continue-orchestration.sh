@@ -100,7 +100,7 @@ fi
 IN_PROGRESS_LINE=$(printf '%s\n' "$IN_PROGRESS_ROWS" | awk -F'|' -v tid="$TASK_ID" '{gsub(/^[ \t]+|[ \t]+$/, "", $2); if ($2 == tid) {print; exit}}')
 
 # Extract file path (last backtick-wrapped field).
-FILE_PATH=$(echo "$IN_PROGRESS_LINE" | grep -oP '`[^`]+`' | tail -1 | tr -d '`')
+FILE_PATH=$(echo "$IN_PROGRESS_LINE" | grep -oE '`[^`]+`' | tail -1 | tr -d '`')
 
 # When multiple tasks share in-progress, list them all (active named first).
 OTHER_IN_PROGRESS=$(printf '%s\n' "$ALL_IN_PROGRESS_IDS" | grep -vx "$TASK_ID" | paste -sd, - || true)
@@ -109,7 +109,7 @@ OTHER_IN_PROGRESS=$(printf '%s\n' "$ALL_IN_PROGRESS_IDS" | grep -vx "$TASK_ID" |
 # BACKLOG.md says in-progress but the actual work unit file may say blocked.
 
 if [ -n "$FILE_PATH" ] && [ -f "${WORKSPACE_ROOT}/${FILE_PATH}" ]; then
-    FILE_STATUS=$(grep -oP '## Status:\s*\K\S+' "${WORKSPACE_ROOT}/${FILE_PATH}" 2>/dev/null || true)
+    FILE_STATUS=$(sed -nE 's/^## Status:[[:space:]]*([^[:space:]]+).*/\1/p' "${WORKSPACE_ROOT}/${FILE_PATH}" 2>/dev/null | head -1 || true)
     if [ "$FILE_STATUS" = "blocked" ]; then
         cat <<HOOKEOF
 {
@@ -163,7 +163,7 @@ LOG_FILE="${WORKSPACE_ROOT}/../devbench/src/devbench/logs/orchestrator.log"
 if [ -f "$LOG_FILE" ] && [ -n "$TASK_ID" ]; then
     LAST_PROGRESS_LINE=$(grep "Set ${TASK_ID} to 'in-progress'" "$LOG_FILE" 2>/dev/null | tail -1 || true)
     if [ -n "$LAST_PROGRESS_LINE" ]; then
-        PROGRESS_TS=$(echo "$LAST_PROGRESS_LINE" | grep -oP '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}' || true)
+        PROGRESS_TS=$(echo "$LAST_PROGRESS_LINE" | grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}' || true)
         if [ -n "$PROGRESS_TS" ]; then
             PROGRESS_EPOCH=$(date -d "${PROGRESS_TS}" +%s 2>/dev/null || echo 0)
             TASK_AGE=$((NOW - PROGRESS_EPOCH))

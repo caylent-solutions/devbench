@@ -2537,6 +2537,24 @@ class TestClassifyBlockedTaskHeld:
         )
         assert state is BlockedTaskState.HELD
 
+    def test_task_status_is_hold_returns_false_when_task_id_not_in_index(self, tmp_path: Path) -> None:
+        """Cover the fall-through `return False` in _task_status_is_hold.
+
+        ``parse_index()`` succeeds and returns one unit (E0-F1-S1-T1);
+        the task_id we ask about (E0-F1-S1-T99) is NOT that unit, so the
+        for-loop exhausts and we hit the final ``return False`` at
+        proposal.py:342.
+        """
+        from devbench.backlog.proposal import _task_status_is_hold
+
+        workspace = self._workspace_hold_task(tmp_path)
+        result = _task_status_is_hold(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T99",
+        )
+        assert result is False
+
 
 class TestClassifyBlockedTaskBlockedOnHeld:
     """AC-FUNC-005: BLOCKED_ON_HELD state when a marker target is in HOLD."""

@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 import pytest
 
-from devbench.backlog.work_unit import WorkUnitStatus, WorkUnitType
+from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
 from devbench.reporting.report import WindowStats, generate_report
 
 
@@ -1571,7 +1571,7 @@ class TestBacklogTotalsSixBlockedFields:
     """AC-FUNC-004: the snapshot dataclass exposes 6 per-state count fields."""
 
     @staticmethod
-    def _mk(uid: str, status) -> object:
+    def _mk(uid: str, status) -> WorkUnit:
         from devbench.backlog.work_unit import WorkUnit, WorkUnitType
 
         return WorkUnit(
@@ -1677,7 +1677,7 @@ class TestUnitListings:
     """B9: in-progress and blocked listings appear at the end of the report."""
 
     @staticmethod
-    def _mk_unit(uid: str, title: str, status, utype=None) -> object:
+    def _mk_unit(uid: str, title: str, status, utype=None) -> WorkUnit:
         from devbench.backlog.work_unit import WorkUnit, WorkUnitType
 
         return WorkUnit(

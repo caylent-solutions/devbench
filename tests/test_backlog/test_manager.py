@@ -4536,6 +4536,27 @@ class TestValidateBrokenAndCanonicalBacklogFormat:
         zero_row_errors = [e for e in errors if "No work-unit rows parsed from" in e]
         assert zero_row_errors == [], f"Activity fixture must not trigger the zero-row error; got: {zero_row_errors}"
 
+    def test_validate_skips_full_index_rows_with_wrong_cell_count(self, tmp_path: Path) -> None:
+        """Cover the cell-count-mismatch continue branch in _check_full_index_has_rows.
+
+        A row inside `## Full Work Unit Index` whose split-by-pipe cell
+        count does not equal BACKLOG_INDEX_CELL_COUNT is skipped (the
+        ``continue`` at manager.py:332). If it is the only row, the
+        zero-row integrity error fires downstream.
+        """
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text(
+            "# Backlog\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E1 | only-four | cells |\n"
+        )
+        manager = BacklogManager()
+        errors = manager.validate(backlog_index, tmp_path)
+        assert errors
+        assert any("No work-unit rows parsed from" in e for e in errors)
+
 
 # ---------------------------------------------------------------------------
 # GREEN_CHECK emoji constant used in tick-checkbox tests (U+2705)

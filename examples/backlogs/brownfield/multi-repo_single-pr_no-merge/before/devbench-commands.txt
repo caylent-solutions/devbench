@@ -1,0 +1,62 @@
+# DevBench commands for the kanon-deps-work backlog
+#
+# Replace `/path/to/devbench` with the absolute path to your DevBench checkout
+# (in this workspace: /workspaces/rpm-migration/devbench).
+# Replace `/path/to/kanon-deps-work` with the absolute path to this workspace
+# (in this workspace: /workspaces/rpm-migration/kanon-deps-work).
+#
+# JUDGE_WORKSPACE_ROOT must point at the directory holding BACKLOG.md (this
+# repo's root). JUDGE_CLAUDE_MODEL pins both judge and executor roles unless
+# overridden in backlog/config/devbench.yaml.
+
+
+# 1. Non-interactive start
+#    Runs the orchestrate skill end-to-end via the Agent SDK. Use this for
+#    CI / overnight runs / unattended execution. The orchestrator will:
+#      a. Claim every in-queue task in dependency order,
+#      b. Author code + tests on a single shared branch
+#         (feat/kanon-deps-work-2026-05),
+#      c. Run review judges + post-checks per work unit,
+#      d. On every-unit-terminal: push the branch, open ONE PR per repo,
+#         watch CI, retry on failure, and auto-merge (squash) on green.
+JUDGE_WORKSPACE_ROOT=/path/to/kanon-deps-work \
+JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+uv run --project /path/to/devbench python -m devbench.cli start
+
+
+# 2. Interactive start
+#    Launches Claude Code with the devbench plugin loaded. Inside the session,
+#    run `/devbench:orchestrate` or ask "Run the devbench:orchestrate skill to
+#    process the backlog". Pause with Escape, resume with `Continue`, redirect
+#    with natural-language instructions. State is saved in BACKLOG.md and the
+#    work-unit files between sessions.
+JUDGE_WORKSPACE_ROOT=/path/to/kanon-deps-work \
+JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+claude --dangerously-skip-permissions \
+  --plugin-dir /path/to/devbench/plugin/devbench
+
+
+# 3. Progress report
+#    Streams a live progress dashboard on TTY (epic-level summary, recent
+#    transitions, judge verdicts, CI status, cost estimate). Use `--once` for
+#    a single snapshot in CI logs.
+JUDGE_WORKSPACE_ROOT=/path/to/kanon-deps-work \
+JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+uv run --project /path/to/devbench devbench report
+
+
+# 4. Hook tail
+#    Pretty-tails the structured hook-event log at
+#    $JUDGE_WORKSPACE_ROOT/hook-logs.jsonl. Each line is one tool call,
+#    judge verdict, or status transition. Useful for live debugging.
+JUDGE_WORKSPACE_ROOT=/path/to/kanon-deps-work \
+JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+uv run --project /path/to/devbench devbench hook-tail
+
+
+# 5. Backlog status
+#    One-shot summary: epic counts, totals, currently-active unit. Suitable
+#    for `watch -n 30 '...'` in a side terminal.
+JUDGE_WORKSPACE_ROOT=/path/to/kanon-deps-work \
+JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+uv run --project /path/to/devbench devbench status

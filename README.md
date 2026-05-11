@@ -66,6 +66,7 @@ Pick the doc closest to your role.
 - [Make targets](#make-targets)
 - [Configuration](#configuration)
 - [Workspace setup](#workspace-setup)
+- [Real-world backlog examples](#real-world-backlog-examples)
 - [Interactive mode](#interactive-mode)
 - [Remote EC2 dev environments](#remote-ec2-dev-environments)
 - [Troubleshooting](#troubleshooting)
@@ -323,6 +324,25 @@ JUDGE_WORKSPACE_ROOT=/path/to/my-backlog \
 JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
 uv run python -m devbench.cli start
 ```
+
+## Real-world backlog examples
+
+Worked examples of real specs promoted into validated DevBench backlogs.
+Each example ships the locked spec, the authored `backlog/` tree, the
+`devbench.yaml` configuration, the operator launch commands, and a
+step-by-step `how-it-was-made.md` describing the authoring journey. Each
+example uses the same **before / after** layout: `before/` is the
+validated, ready-to-run backlog; `after/` (when populated) is the
+post-execution snapshot showing what DevBench actually produced.
+
+| Example | Mode | Repos | Work units | Status |
+|---|---|---|---|---|
+| [`examples/backlogs/brownfield/multi-repo_single-pr_no-merge/`](examples/backlogs/brownfield/multi-repo_single-pr_no-merge/) | `single_branch` + `defer_pr` + `auto_finalize` + `auto_merge` + `ci_failure_retry` (no manual merge step) | 3 (caylent-solutions/kanon, caylent/caylent-private-kanon, caylent/kanon-claude-marketplaces) | 207 across 13 epics + 14 features | `before/` ready; `after/` Coming Soon |
+
+More examples land here as backlogs are authored. Each example targets a
+distinct DevBench mode (single-repo vs multi-repo, paused-merge vs
+auto-merge, greenfield vs brownfield) so operators can pick the closest
+match to their own setup and copy it as a starting point.
 
 ## Interactive mode
 

@@ -133,8 +133,11 @@ When `JUDGE_USE_BEDROCK=1` is set, DevBench uses `anthropic.AnthropicBedrock` in
 JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
 JUDGE_USE_BEDROCK=1 \
 JUDGE_BEDROCK_REGION=us-east-1 \
-make start-interactive
+make start
 ```
+
+(Swap `make start` for `make start-interactive` only if you want the live-observation
+mode -- non-interactive is the recommended default.)
 
 ### Verifying Authentication
 

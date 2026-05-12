@@ -1,6 +1,8 @@
 # Execution Modes
 
-DevBench supports two execution modes. Both follow the same lifecycle and the same ownership rules -- the difference is whether the orchestrate skill runs interactively (human in the loop) or non-interactively (background/unattended).
+DevBench supports two execution modes. Both follow the same lifecycle and the same ownership rules -- the difference is whether the orchestrate skill runs non-interactively (background/unattended, the **recommended default**) or interactively (a live Claude Code session, intended for **observation only**).
+
+**Recommendation:** use non-interactive (`make start`) for production runs. DevBench's review judges + manifest amender + blocker resolver are stable enough that the backlog is the right place to manage the run -- not a live console. **Live observation is fully available in non-interactive mode** via `devbench hook-tail` (every tool call streamed), `devbench report` (live progress dashboard), and `devbench status`, so you do not need interactive mode just to see what's happening. When you do need to change something, stop the run and apply the change through two complementary tools: the **`devbench` CLI** for state transitions and dep wiring (`decline`, `hold`, `unhold`, `add-dep`, `set-status`, `log-comment`, `sync-blocked`, `validate-backlog`), and **Claude** (separate session) for editing the work-unit `.md` content (Approach, Manifest, Acceptance Criteria, or authoring new work units). The CLI never edits prose; Claude does. Live mid-claim intervention typically does more harm than good. See [`zero-to-ready.md`](zero-to-ready.md) Step 10 for the full two-track workflow.
 
 For the wider context (component architecture, judge tier, multi-PR vs single-PR mode), see the [architecture overview](architecture.md). This doc focuses on the per-step lifecycle and ownership rules.
 
@@ -18,13 +20,15 @@ For the wider context (component architecture, judge tier, multi-PR vs single-PR
 
 ## Modes at a Glance
 
-| Aspect | Automated (`make start`) | Interactive (`make start-interactive`) |
+| Aspect | Automated (`make start`) -- **recommended** | Interactive (`make start-interactive`) -- rarely needed |
 | --- | --- | --- |
 | Orchestrator | `uv run devbench start` → Agent SDK `query()` runs orchestrate SKILL.md non-interactively | Claude Code session with orchestrate SKILL.md active |
 | Executor | `devbench:executor` agent (invoked by orchestrate skill) | Same -- orchestrate skill invokes `devbench:executor` agent |
-| Human control | Background -- monitor via log file | Foreground -- pause with Escape, give instructions, resume |
+| Plugin install | **Not required -- and you should NOT install it.** The launcher loads the plugin ad-hoc from the devbench checkout via the Agent SDK | Required only if you want `/devbench:*` skills globally. Comes with a hard trade-off: user-scope install registers hooks that **block every other Claude session on this machine from editing `backlog/**` files** -- breaking the operator workflow of editing work units in a separate Claude session. Prefer `--plugin-dir` per-session so the hooks load only for the observation session and uninstall any global install when not actively observing. |
+| Live observation | **Yes** -- via `devbench hook-tail` (streams every tool call, judge verdict, status transition) + `devbench report` (live dashboard) + `devbench status`. Same firehose interactive mode shows, without opening Claude Code. | Same firehose, rendered inside Claude Code's UI |
+| Human control | Background -- mutate the backlog between runs via the `devbench` CLI + Claude in a separate session (two-track workflow) | Foreground -- you CAN type instructions mid-claim, but **do not** (interjection disturbs the executor's reasoning; corrections belong in the backlog) |
 | Git operations | `devbench:executor` agent via `devbench git-ops` CLI command | Same |
-| Best for | Unattended runs, CI-like pipelines | Active oversight, course correction, debugging |
+| Best for | Production runs, CI-like pipelines, overnight orchestration -- with side-terminal observation via hook-tail + report | A guided walk-through of how one task progresses through the judge cycle (educational); almost never operational |
 
 ---
 

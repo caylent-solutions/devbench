@@ -2,8 +2,6 @@
 
 An LLM-as-Judge orchestration system that processes a backlog of work units autonomously. Development agents write code; judge agents review it. All review decisions come from Claude LLM evaluation; there are no hard-coded pass/fail rules.
 
-> **Upgrading from a previous version?** See [docs/upgrade-guide.md](docs/upgrade-guide.md) for the migration walkthrough. The TL;DR is `git pull && make install && make plugin-install && uv run devbench upgrade` (idempotent; safe to re-run).
-
 ## 60-second overview
 
 DevBench drives a structured backlog from claim to merged PR without human intervention between tasks.
@@ -168,9 +166,14 @@ uv run devbench <command> [args]
 
 ```bash
 make install              # Install runtime and dev dependencies
-make plugin-install       # Register the devbench plugin at user scope
-make start-interactive    # Launch interactive Claude session with devbench plugin
-make start                # Launch the orchestrator via Agent SDK (non-interactive)
+make start                # Launch the orchestrator via Agent SDK (non-interactive, recommended)
+make plugin-install       # !! DEFAULT: DO NOT RUN. Only required for `make start-interactive`.
+                          # NEVER needed for `make start` (the recommended non-interactive default).
+                          # Globally installs Claude Code hooks that block EVERY Claude session
+                          # on this machine from writing to backlog/** files, breaking the
+                          # operator workflow of editing work units in a separate Claude session.
+                          # If you must install (for interactive mode), plan to uninstall after.
+make start-interactive    # Launch interactive Claude session with devbench plugin (observation only)
 make validate             # Full validation: lint + type check + tests + coverage
 make lint                 # ruff + bandit + no-duplicates guard
 make format               # Auto-format with ruff
@@ -346,19 +349,66 @@ match to their own setup and copy it as a starting point.
 
 ## Interactive mode
 
+> **Non-interactive is now the recommended default** (`make start`) -- and in
+> almost every situation it's also the only mode you need. DevBench is stable
+> enough that the backlog itself is the right place to manage a run, not a
+> live console.
+>
+> **You can get live observation in non-interactive mode**, side-by-side in a
+> separate terminal:
+>
+> - `devbench hook-tail` -- pretty-streams every tool call, judge verdict,
+>   and status transition as the orchestrator runs. Same firehose interactive
+>   mode shows, without entering Claude Code.
+> - `devbench report` -- live progress dashboard on TTY (epic counts, recent
+>   transitions, judge pass/fail, CI status, cost). Refreshes continuously.
+> - `devbench status` -- one-shot snapshot; pair with `watch -n 30 '...'`
+>   for a low-frequency monitor.
+>
+> Between those three commands plus `git log` on your backlog repo, you see
+> exactly what the orchestrator is doing in real time -- with no need to
+> open Claude Code at all.
+>
+> **So when is interactive mode actually useful?** Almost never. The only
+> thing it offers over the non-interactive + hook-tail combination is the
+> ability to type natural-language instructions to the orchestrate skill
+> mid-run -- which is exactly the behaviour we recommend AGAINST (live
+> mid-claim interjection disturbs the executor's reasoning; corrections
+> belong in the backlog, not the console).
+>
+> **Plugin install caveat (read before considering interactive).** Interactive
+> mode requires the devbench Claude Code plugin to be loaded. The user-scope
+> install (`make plugin-install`) registers the plugin's hooks **globally on
+> this machine**, which **blocks every other Claude Code session you open
+> from writing to `backlog/**` files** -- breaking the two-track operator
+> workflow below. Prefer the per-session `--plugin-dir` approach
+> (`claude --plugin-dir $DEVBENCH_DIR/plugin/devbench`) so the hooks load
+> only for the observation session, OR uninstall (`claude plugin uninstall
+> devbench --scope user && claude plugin marketplace remove devbench --scope
+> user`) as soon as you're done observing. **For non-interactive runs the
+> plugin is never needed** -- the Agent SDK loads it ad-hoc from the
+> checkout. Skip `make plugin-install` entirely unless you have a specific
+> reason to run interactive.
+>
+> **When you need to change something, stop the run and split the work
+> across two tools:**
+>
+> - **`devbench` CLI** moves state and wires the graph: `decline`, `hold`,
+>   `unhold`, `add-dep`, `set-status`, `log-comment`, `sync-blocked`,
+>   `validate-backlog`. No file edits, just state mutations.
+> - **Claude** (separate session) edits the work-unit `.md` content:
+>   Approach, Manifest, Acceptance Criteria, or authoring a new work unit
+>   entirely. The CLI doesn't edit prose; Claude does.
+>
+> Both tools point at the same workspace. See
+> [`docs/zero-to-ready.md`](docs/zero-to-ready.md) Step 10 for the full
+> two-track operator workflow, and
+> [`examples/backlogs/brownfield/multi-repo_single-pr_no-merge/operator-interventions.md`](examples/backlogs/brownfield/multi-repo_single-pr_no-merge/operator-interventions.md)
+> for a worked example.
+
 ```bash
 make start-interactive
 ```
-
-| Action | How |
-|--------|-----|
-| Pause | Press **Escape** |
-| Give instructions | Type while paused, press Enter |
-| Resume | Type `Continue` |
-| Skip a unit | `Skip E1-F2-S3-T4, it's not needed` |
-| Change priority | `Prioritize E2 work units next` |
-| Check status | `What's the status?` |
-| Stop | **Ctrl+C** (progress saved in BACKLOG.md) |
 
 Restarting picks up where you left off: `done` units are skipped and `in-progress` units are resumed.
 

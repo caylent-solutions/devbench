@@ -78,7 +78,33 @@ will be something like `Installed N packages`.
 
 ---
 
-## Step 3: Install the Claude Code plugin
+## Step 3: Install the Claude Code plugin (SKIP unless you need interactive mode)
+
+> **Default recommendation: do NOT install the plugin.** The non-interactive launcher
+> (`make start` -- the recommended way to run DevBench) loads the plugin ad-hoc from
+> the devbench checkout via the Agent SDK. No global install is needed for any normal
+> use of DevBench.
+>
+> **Why skipping matters:** installing the plugin at user scope registers its hooks
+> **globally on this machine**. Those hooks fire on every Claude Code session you open
+> -- not just orchestrator sessions -- and they intercept Write tool calls to
+> `backlog/**` files. The practical effect: **any Claude session you spin up to edit a
+> work unit, author a new task, fix a Manifest, or apply an operator recovery will be
+> blocked from writing to the backlog.** That breaks the entire two-track operator
+> workflow described in Step 10 (where you stop the orchestrator, then use a separate
+> Claude session + `devbench` CLI to mutate the backlog between runs).
+>
+> **The only reason to install the plugin** is if you specifically want to run
+> `make start-interactive` (the observation-only mode that lets you watch tool calls
+> live). Even then, prefer the per-session `--plugin-dir` approach (see
+> [README Interactive Mode](../README.md#interactive-mode)) so the hooks load only for
+> that specific session and don't poison other Claude work.
+>
+> **If you install it, accept the trade-off:** while installed, you will have a hard
+> time editing the backlog from other Claude sessions. Plan to uninstall (commands
+> below) when you're done observing.
+
+If you've decided you want the global install anyway:
 
 ```bash
 make -C $DEVBENCH_DIR plugin-install && claude plugin list
@@ -98,6 +124,11 @@ profile (`~/.claude/`).
 
 **Verify the plugin is installed:** expected output of `claude plugin list`: a line
 containing `devbench` in the installed list.
+
+**To uninstall later** (e.g., to unblock backlog edits in other Claude sessions):
+
+    claude plugin uninstall devbench --scope user
+    claude plugin marketplace remove devbench --scope user
 
 ---
 
@@ -349,13 +380,108 @@ For the complete rule list (20 rules as of v-next), see
 
 ## Step 10: Launch
 
-Choose interactive or non-interactive mode.
+### Non-interactive mode (recommended)
 
-### Interactive mode (recommended for first-time operators)
+Non-interactive mode runs the orchestrator as a headless Claude Agent SDK process. This
+is the recommended way to run DevBench. The system is stable enough that the backlog
+itself is the right place to manage the run, not a live console session.
 
-Interactive mode opens a Claude Code session with the devbench plugin loaded. You can
-observe every tool call the orchestrator makes in real time and intervene if something
-looks wrong.
+```bash
+JUDGE_WORKSPACE_ROOT=~/my-workspace \
+JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+make -C $DEVBENCH_DIR start
+```
+
+**Without make:** run `uv run --project $DEVBENCH_DIR python -m devbench.cli start` with
+the same environment variables set.
+
+**Why non-interactive is the default:** the orchestrator's lifecycle (claim -> implement
+-> review -> retry -> git-ops -> mark-done) is deterministic and self-correcting. The
+review judges + manifest amender + blocker resolver already catch most issues without
+human input. Live operator interjection during a claim usually disturbs the executor
+mid-turn and produces worse outcomes than letting the cycle complete and then editing
+the backlog afterwards.
+
+**Live observation while non-interactive is running** -- you do NOT need to open
+interactive mode to see what the orchestrator is doing. Open side terminals against
+the same workspace:
+
+```bash
+# Terminal 2: every tool call, judge verdict, status transition streamed live.
+JUDGE_WORKSPACE_ROOT=~/my-workspace \
+JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+uv run --project $DEVBENCH_DIR devbench hook-tail
+
+# Terminal 3: live progress dashboard (epic counts, judges, CI, cost).
+JUDGE_WORKSPACE_ROOT=~/my-workspace \
+JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+uv run --project $DEVBENCH_DIR devbench report
+
+# Terminal 4 (optional): low-frequency status snapshot.
+cd ~/my-workspace && watch -n 60 \
+  'JUDGE_WORKSPACE_ROOT=$PWD JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+   uv run --project $DEVBENCH_DIR devbench status'
+```
+
+Between those plus `git log` on your backlog repo (every status promotion, TDD-cycle
+entry, audit comment lands as a commit-worthy diff), you see exactly what the
+orchestrator is doing. Interactive mode adds almost nothing beyond this except the
+ability to type instructions mid-run -- which is the one thing we recommend against.
+
+### If you need to change something while the run is in flight
+
+Stop the orchestrator (Ctrl+C on the `make start` process), then **manage the change
+through the backlog itself.** Two distinct tools, two distinct responsibilities:
+
+#### `devbench` CLI -- moves state and wires the graph
+
+Use the `devbench` CLI for status transitions, dep wiring, comments, and validation. No
+file edits, just state mutations. From a separate Claude session pointed at your
+workspace:
+
+| You want to... | Use |
+|---|---|
+| Skip a task entirely | `devbench decline <ID> --reason "<message>"` |
+| Pause a task pending more context | `devbench hold <ID> --reason "<message>"` |
+| Resume a held task | `devbench unhold <ID> --reason "<message>"` |
+| Wire an ordering constraint | `devbench add-dep <blocked-id> <blocker-id>` |
+| Record an operator audit note | `devbench log-comment operator <ID> "<message>"` |
+| Re-queue an `amendment-recovery` block after editing the work unit | `devbench set-status <ID> in-queue` |
+| Reconcile dep state after edits | `devbench sync-blocked` |
+| Re-check parser integrity | `devbench validate-backlog` |
+
+#### Claude -- edits the work-unit `.md` content
+
+Use Claude (in a separate session, pointed at your workspace) for any change that
+touches **the content of a work-unit file** or adds a new work unit. The CLI doesn't
+edit prose; Claude does. Typical content edits:
+
+| You want to... | Have Claude do |
+|---|---|
+| Rewrite an Approach to authorise a production fix | Edit the `### Approach` block in the work-unit `.md`; add an explicit operator-authorisation step with scope guardrails |
+| Adjust a Manifest (add / remove files, change scope) | Edit the `## Changes Manifest` table; keep paths repo-relative |
+| Tighten or relax an Acceptance Criterion | Edit the `## Acceptance Criteria` list |
+| Add a brand-new work unit (recovery task, follow-up) | Author a new `*.md` under the right Epic / Feature / Story dir following `docs/example-work-unit-template.md`; then update `BACKLOG.md` |
+| Split a too-large task into two | Edit the original `.md` to narrow scope; author a sibling `.md` for the carved-out work |
+| Fix an em-dash / orphan-path / manifest-conflict that `validate-backlog` flagged | Edit the offending file per the rule; re-run `devbench validate-backlog` |
+
+After any content edit, run `devbench validate-backlog` to confirm the file still
+satisfies the 20 backlog-contract rules, then move state with the `devbench` CLI table
+above. Restart with `make start` once the changes are in place. A worked example of
+this two-track workflow lives in
+[`examples/backlogs/brownfield/multi-repo_single-pr_no-merge/operator-interventions.md`](../examples/backlogs/brownfield/multi-repo_single-pr_no-merge/operator-interventions.md)
+(Intervention 1).
+
+### Interactive mode (rarely needed)
+
+Interactive mode opens a Claude Code session with the devbench plugin loaded so you can
+watch tool calls inside Claude Code's UI. **It offers almost nothing over non-interactive
++ `devbench hook-tail` + `devbench report`** -- both modes give live tool-call visibility.
+The only unique capability of interactive mode is the ability to type natural-language
+instructions to the orchestrate skill mid-run, and that is exactly what we recommend
+AGAINST (mid-claim interjection disturbs the executor's reasoning; corrections belong in
+the backlog via the two-track workflow above). If you still want it (e.g., for a guided
+walk-through of how a single task progresses through judges), here is how:
 
 **With the default `--dangerously-skip-permissions` flag** (the orchestrator needs to read
 and write files without per-tool confirmation):
@@ -367,7 +493,7 @@ make -C $DEVBENCH_DIR start-interactive
 ```
 
 **With `JUDGE_SAFE_PERMISSIONS=1`** (sandboxed: Claude Code asks for confirmation before
-each file operation -- slower but safer for a first run):
+each file operation -- slower but safer if you want to watch each tool call confirm):
 
 ```bash
 JUDGE_WORKSPACE_ROOT=~/my-workspace \
@@ -378,20 +504,6 @@ make -C $DEVBENCH_DIR start-interactive
 
 When `JUDGE_SAFE_PERMISSIONS=1` is set, the Makefile omits
 `--dangerously-skip-permissions`, so Claude Code prompts before every sensitive tool use.
-
-### Non-interactive mode
-
-Non-interactive mode runs the orchestrator as a headless Claude Agent SDK process. Suitable
-for CI or overnight runs.
-
-```bash
-JUDGE_WORKSPACE_ROOT=~/my-workspace \
-JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
-make -C $DEVBENCH_DIR start
-```
-
-**Without make:** run `uv run --project $DEVBENCH_DIR python -m devbench.cli start` with
-the same environment variables set.
 
 **Note on end-to-end validation of Step 10:** the launch commands open a live orchestrator
 session and cannot safely be invoked in an automated validation pass. During execution
@@ -448,9 +560,11 @@ provisioning, sign-off) that has no corresponding task ID. See
 
 ### With-make vs without-make (Steps 2, 3, 10)
 
-`make install`, `make plugin-install`, and `make start-interactive` are convenience
-wrappers. Every step in this guide includes the equivalent bare `uv run` / `claude` form
-under "Without make" so operators on environments without GNU make can proceed.
+`make install`, `make plugin-install`, `make start`, and `make start-interactive` are
+convenience wrappers. Every step in this guide includes the equivalent bare `uv run` /
+`claude` form under "Without make" so operators on environments without GNU make can
+proceed. Note that Step 3 (`make plugin-install`) is skippable for non-interactive
+runs -- only needed for the optional `make start-interactive` observation mode.
 
 ---
 

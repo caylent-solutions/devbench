@@ -377,7 +377,7 @@ Useful as a pre-flight sweep before `devbench next` (after manual edits to the b
 uv run devbench start
 ```
 
-Run the orchestrate SKILL non-interactively via the Agent SDK. Invoked by `make start` (the recommended way to run DevBench). Loads the plugin ad-hoc from the devbench checkout; no global `make plugin-install` required. No arguments.
+Run the orchestrate SKILL non-interactively via the Agent SDK. Invoked by `make start`, the standard way to run DevBench. Loads the plugin ad-hoc from the devbench checkout via the Agent SDK; no global plugin install is needed. No arguments.
 
 ---
 
@@ -385,7 +385,7 @@ Run the orchestrate SKILL non-interactively via the Agent SDK. Invoked by `make 
 
 See the [report](#report), [watch](#watch), [hook-tail](#hook-tail), and [watchdog](#watchdog) entries under Backlog read.
 
-The main entry point for running the orchestrator is `make start` (non-interactive, recommended). Live observation while non-interactive runs is available via `devbench hook-tail` (every tool call streamed), `devbench report` (live progress dashboard), and `devbench status` -- so opening interactive mode just to see what's happening is unnecessary. `make start-interactive` exists for guided walk-throughs but should not be used to intervene mid-claim. Corrections happen between runs through two tools: the `devbench` CLI for state transitions / dep wiring (`set-status`, `decline`, `add-dep`, etc.), and Claude (separate session) for editing the work-unit `.md` content (Approach, Manifest, ACs, new work units). See [README Interactive Mode](../README.md#interactive-mode) and [`zero-to-ready.md`](zero-to-ready.md) Step 10 for the full split.
+The entry point for running the orchestrator is `make start`. Live observation while the orchestrator runs is available via `devbench hook-tail` (every tool call streamed), `devbench report` (live progress dashboard), and `devbench status` -- no Claude Code session needed. Corrections happen between runs through two tools: the `devbench` CLI for state transitions / dep wiring (`set-status`, `decline`, `add-dep`, etc.), and Claude (separate session) for editing the work-unit `.md` content (Approach, Manifest, ACs, new work units). See [`zero-to-ready.md`](zero-to-ready.md) Step 9 for the full split.
 
 ---
 

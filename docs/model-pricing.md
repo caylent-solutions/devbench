@@ -255,7 +255,7 @@ Resolution order (per command): CLI flag or command-specific override > `JUDGE_D
 
 Claude Opus 4.7, Opus 4.6, and Sonnet 4.6 support a **1M-token context window** at the same per-token rate as smaller requests -- there is no long-context premium for these models on the Claude API.
 
-The **Batch API** offers 50% off input and output for asynchronous workloads (devbench does not currently use the Batch API; the orchestrator runs interactive sessions).
+The **Batch API** offers 50% off input and output for asynchronous workloads (devbench does not currently use the Batch API; the orchestrator makes synchronous LLM calls through the Agent SDK).
 
 For full pricing details, multipliers, and platform-specific rates (Bedrock, Vertex AI, Foundry), see <https://platform.claude.com/docs/en/about-claude/pricing>.
 

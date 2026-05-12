@@ -51,7 +51,7 @@ Pick the doc closest to your role.
 
 | You are... | Start here |
 |------------|-----------|
-| **An operator** running devbench against a backlog | [CLI Reference](#cli-reference), [FAQ](docs/faq.md), [Interactive Mode](#interactive-mode), [Troubleshooting](#troubleshooting), live dashboards in [docs/watch-activity.md](docs/watch-activity.md) and [docs/hook-activity.md](docs/hook-activity.md) |
+| **An operator** running devbench against a backlog | [CLI Reference](#cli-reference), [FAQ](docs/faq.md), [Troubleshooting](#troubleshooting), live dashboards in [docs/watch-activity.md](docs/watch-activity.md) and [docs/hook-activity.md](docs/hook-activity.md) |
 | **A developer** extending or modifying devbench | [docs/architecture.md](docs/architecture.md) for the end-to-end model, [docs/plugin-architecture.md](docs/plugin-architecture.md) for agents/hooks/skill, the ADRs under [docs/adr/](docs/adr/) for rationale, [open GitHub issues](https://github.com/caylent-solutions/devbench/issues) for in-queue work and technical debt, [docs/spec-operator-attention-alerts.md](docs/spec-operator-attention-alerts.md) for the attention-alerts future-work design sketch |
 | **Authoring a new backlog** for devbench to execute | [docs/creating-specs-and-backlogs.md](docs/creating-specs-and-backlogs.md), [docs/backlog-contract.md](docs/backlog-contract.md), [docs/example-work-unit-template.md](docs/example-work-unit-template.md), [docs/authoring-manifests.md](docs/authoring-manifests.md) |
 | **A decision-maker** assessing fit | [docs/architecture.md §2 Capabilities](docs/architecture.md#2-capabilities), then skim the ADR list under [docs/adr/](docs/adr/) |
@@ -65,7 +65,6 @@ Pick the doc closest to your role.
 - [Configuration](#configuration)
 - [Workspace setup](#workspace-setup)
 - [Real-world backlog examples](#real-world-backlog-examples)
-- [Interactive mode](#interactive-mode)
 - [Remote EC2 dev environments](#remote-ec2-dev-environments)
 - [Troubleshooting](#troubleshooting)
 
@@ -74,7 +73,7 @@ Pick the doc closest to your role.
 See [docs/execution-modes.md](docs/execution-modes.md) for the full step-by-step lifecycle (claim, implement, review, retry, security, git-ops, mark-done) and ownership rules.
 
 ```
-Orchestrator (devbench:orchestrate SKILL / interactive Claude session)
+Orchestrator (devbench:orchestrate SKILL via Claude Agent SDK)
   |
   |-- Step 0: sweep-proposals         -- materialise any pending proposal JSONs
   |-- Pre-flight: validate-backlog    -- abort if index / files are out of sync
@@ -166,14 +165,7 @@ uv run devbench <command> [args]
 
 ```bash
 make install              # Install runtime and dev dependencies
-make start                # Launch the orchestrator via Agent SDK (non-interactive, recommended)
-make plugin-install       # !! DEFAULT: DO NOT RUN. Only required for `make start-interactive`.
-                          # NEVER needed for `make start` (the recommended non-interactive default).
-                          # Globally installs Claude Code hooks that block EVERY Claude session
-                          # on this machine from writing to backlog/** files, breaking the
-                          # operator workflow of editing work units in a separate Claude session.
-                          # If you must install (for interactive mode), plan to uninstall after.
-make start-interactive    # Launch interactive Claude session with devbench plugin (observation only)
+make start                # Launch the orchestrator via Agent SDK
 make validate             # Full validation: lint + type check + tests + coverage
 make lint                 # ruff + bandit + no-duplicates guard
 make format               # Auto-format with ruff
@@ -283,44 +275,28 @@ repos:
 ### Minimal working-tree launch
 
 ```bash
-# Shell 1: start interactive session
+# Shell 1: start the orchestrator
 cd /path/to/devbench && \
   JUDGE_WORKSPACE_ROOT=/path/to/my-backlog \
   JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
-  claude --plugin-dir plugin/devbench
+  make start
 
-# Shell 2: watch progress
+# Shell 2: live tool-call stream
+cd /path/to/devbench && \
+  JUDGE_WORKSPACE_ROOT=/path/to/my-backlog \
+  JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+  uv run devbench hook-tail
+
+# Shell 3: progress snapshot
 cd /path/to/devbench && watch -n 30 \
   'JUDGE_WORKSPACE_ROOT=/path/to/my-backlog \
    JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
    uv run devbench status'
 ```
 
-In the interactive session, set the model with `/model` if needed, then ask: `Run the devbench:orchestrate skill to process the backlog`.
-
 ### Starting devbench without make
 
-The `make start-interactive` and `make start` targets are thin wrappers. If you need to invoke the underlying commands directly (for example, in CI scripts or remote shells where `make` is unavailable), use these equivalents.
-
-**Interactive with `--dangerously-skip-permissions` (default `make start-interactive`)**
-
-```bash
-JUDGE_WORKSPACE_ROOT=/path/to/my-backlog \
-JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
-claude --dangerously-skip-permissions --plugin-dir /path/to/devbench/plugin/devbench
-```
-
-**Interactive without `--dangerously-skip-permissions` (equivalent to `JUDGE_SAFE_PERMISSIONS=1 make start-interactive`)**
-
-```bash
-JUDGE_WORKSPACE_ROOT=/path/to/my-backlog \
-JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
-claude --plugin-dir /path/to/devbench/plugin/devbench
-```
-
-Setting `JUDGE_SAFE_PERMISSIONS=1` when invoking `make start-interactive` selects the no-flag variant above. This is the safe-mode opt-out for environments that require explicit permission prompts.
-
-**Non-interactive (equivalent to `make start`)**
+`make start` is a thin wrapper. If you need to invoke the underlying command directly (for example, in CI scripts or remote shells where `make` is unavailable):
 
 ```bash
 JUDGE_WORKSPACE_ROOT=/path/to/my-backlog \
@@ -347,70 +323,24 @@ distinct DevBench mode (single-repo vs multi-repo, paused-merge vs
 auto-merge, greenfield vs brownfield) so operators can pick the closest
 match to their own setup and copy it as a starting point.
 
-## Interactive mode
+## Operator workflow: managing a running orchestrator
 
-> **Non-interactive is now the recommended default** (`make start`) -- and in
-> almost every situation it's also the only mode you need. DevBench is stable
-> enough that the backlog itself is the right place to manage a run, not a
-> live console.
->
-> **You can get live observation in non-interactive mode**, side-by-side in a
-> separate terminal:
->
-> - `devbench hook-tail` -- pretty-streams every tool call, judge verdict,
->   and status transition as the orchestrator runs. Same firehose interactive
->   mode shows, without entering Claude Code.
-> - `devbench report` -- live progress dashboard on TTY (epic counts, recent
->   transitions, judge pass/fail, CI status, cost). Refreshes continuously.
-> - `devbench status` -- one-shot snapshot; pair with `watch -n 30 '...'`
->   for a low-frequency monitor.
->
-> Between those three commands plus `git log` on your backlog repo, you see
-> exactly what the orchestrator is doing in real time -- with no need to
-> open Claude Code at all.
->
-> **So when is interactive mode actually useful?** Almost never. The only
-> thing it offers over the non-interactive + hook-tail combination is the
-> ability to type natural-language instructions to the orchestrate skill
-> mid-run -- which is exactly the behaviour we recommend AGAINST (live
-> mid-claim interjection disturbs the executor's reasoning; corrections
-> belong in the backlog, not the console).
->
-> **Plugin install caveat (read before considering interactive).** Interactive
-> mode requires the devbench Claude Code plugin to be loaded. The user-scope
-> install (`make plugin-install`) registers the plugin's hooks **globally on
-> this machine**, which **blocks every other Claude Code session you open
-> from writing to `backlog/**` files** -- breaking the two-track operator
-> workflow below. Prefer the per-session `--plugin-dir` approach
-> (`claude --plugin-dir $DEVBENCH_DIR/plugin/devbench`) so the hooks load
-> only for the observation session, OR uninstall (`claude plugin uninstall
-> devbench --scope user && claude plugin marketplace remove devbench --scope
-> user`) as soon as you're done observing. **For non-interactive runs the
-> plugin is never needed** -- the Agent SDK loads it ad-hoc from the
-> checkout. Skip `make plugin-install` entirely unless you have a specific
-> reason to run interactive.
->
-> **When you need to change something, stop the run and split the work
-> across two tools:**
->
-> - **`devbench` CLI** moves state and wires the graph: `decline`, `hold`,
->   `unhold`, `add-dep`, `set-status`, `log-comment`, `sync-blocked`,
->   `validate-backlog`. No file edits, just state mutations.
-> - **Claude** (separate session) edits the work-unit `.md` content:
->   Approach, Manifest, Acceptance Criteria, or authoring a new work unit
->   entirely. The CLI doesn't edit prose; Claude does.
->
-> Both tools point at the same workspace. See
-> [`docs/zero-to-ready.md`](docs/zero-to-ready.md) Step 10 for the full
-> two-track operator workflow, and
-> [`examples/backlogs/brownfield/multi-repo_single-pr_no-merge/operator-interventions.md`](examples/backlogs/brownfield/multi-repo_single-pr_no-merge/operator-interventions.md)
-> for a worked example.
+DevBench runs the orchestrator headlessly via `make start`. Restarting picks up where you left off: `done` units are skipped and `in-progress` units are resumed.
 
-```bash
-make start-interactive
-```
+**Live observation** (no need to enter Claude Code at all): run these in side terminals against the same workspace.
 
-Restarting picks up where you left off: `done` units are skipped and `in-progress` units are resumed.
+- `devbench hook-tail` -- pretty-streams every tool call, judge verdict, and status transition as the orchestrator runs.
+- `devbench report` -- live progress dashboard on TTY (epic counts, recent transitions, judge pass/fail, CI status, cost). Refreshes continuously.
+- `devbench status` -- one-shot snapshot; pair with `watch -n 30 '...'` for a low-frequency monitor.
+
+Together with `git log` on the backlog repo (every status promotion, TDD-cycle entry, and audit comment lands as a commit-worthy diff), these give you exactly the same visibility a live console session would, without any Claude Code session at all.
+
+**Changing something while the run is in flight.** Stop the orchestrator (Ctrl+C on `make start`) and split the work across two tools:
+
+- **`devbench` CLI** moves state and wires the graph: `decline`, `hold`, `unhold`, `add-dep`, `set-status`, `log-comment`, `sync-blocked`, `validate-backlog`. No file edits, just state mutations.
+- **Claude** (separate session, pointed at the workspace) edits the work-unit `.md` content: Approach, Manifest, Acceptance Criteria, or authoring a new work unit entirely. The CLI doesn't edit prose; Claude does.
+
+Both tools point at the same workspace. See [`docs/zero-to-ready.md`](docs/zero-to-ready.md) Step 9 for the full two-track operator workflow, and [`examples/backlogs/brownfield/multi-repo_single-pr_no-merge/operator-interventions.md`](examples/backlogs/brownfield/multi-repo_single-pr_no-merge/operator-interventions.md) for a worked example.
 
 ### LLM authentication
 
@@ -422,10 +352,10 @@ If `GH_TOKEN` is already set, the start scripts skip the `gh auth` flow:
 
 ```bash
 export GH_TOKEN="ghp_your_token_here"
-make start-interactive
+make start
 ```
 
-Both start modes authenticate with GitHub (or skip when `GH_TOKEN` is set), grant required scopes (repo, workflow, read:org, admin:repo_hook, security_events), and launch the orchestrator.
+`make start` authenticates with GitHub (or skips when `GH_TOKEN` is set), grants required scopes (repo, workflow, read:org, admin:repo_hook, security_events), and launches the orchestrator.
 
 ## Remote EC2 dev environments
 

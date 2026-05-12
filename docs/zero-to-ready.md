@@ -8,14 +8,13 @@ and be one command away from launching the orchestrator for the first time.
 - [Prerequisites](#prerequisites)
 - [Step 1: Clone devbench](#step-1-clone-devbench)
 - [Step 2: Install dependencies](#step-2-install-dependencies)
-- [Step 3: Install the Claude Code plugin](#step-3-install-the-claude-code-plugin)
-- [Step 4: Authenticate Claude / Bedrock](#step-4-authenticate-claude--bedrock)
-- [Step 5: Set up the workspace root](#step-5-set-up-the-workspace-root)
-- [Step 6: Clone the target repo(s)](#step-6-clone-the-target-repos)
-- [Step 7: Author backlog/config/devbench.yaml](#step-7-author-backlogconfigdevbenchyaml)
-- [Step 8: Author or import a backlog](#step-8-author-or-import-a-backlog)
-- [Step 9: Validate](#step-9-validate)
-- [Step 10: Launch](#step-10-launch)
+- [Step 3: Authenticate Claude / Bedrock](#step-3-authenticate-claude--bedrock)
+- [Step 4: Set up the workspace root](#step-4-set-up-the-workspace-root)
+- [Step 5: Clone the target repo(s)](#step-5-clone-the-target-repos)
+- [Step 6: Author backlog/config/devbench.yaml](#step-6-author-backlogconfigdevbenchyaml)
+- [Step 7: Author or import a backlog](#step-7-author-or-import-a-backlog)
+- [Step 8: Validate](#step-8-validate)
+- [Step 9: Launch](#step-9-launch)
 - [Decision points](#decision-points)
 - [Troubleshooting](#troubleshooting)
 - [Cross-references](#cross-references)
@@ -35,7 +34,7 @@ Verify each tool is present before cloning.
 Install missing tools using your OS package manager for git, `curl -LsSf https://astral.sh/uv/install.sh | sh` for uv, and `npm install -g @anthropic-ai/claude-code` for Claude Code.
 
 Also confirm you have a Claude Code subscription (Claude Pro or Enterprise) **or** AWS
-credentials with Bedrock model access enabled. See [Step 4](#step-4-authenticate-claude--bedrock)
+credentials with Bedrock model access enabled. See [Step 3](#step-3-authenticate-claude--bedrock)
 for the trade-offs.
 
 ---
@@ -78,61 +77,7 @@ will be something like `Installed N packages`.
 
 ---
 
-## Step 3: Install the Claude Code plugin (SKIP unless you need interactive mode)
-
-> **Default recommendation: do NOT install the plugin.** The non-interactive launcher
-> (`make start` -- the recommended way to run DevBench) loads the plugin ad-hoc from
-> the devbench checkout via the Agent SDK. No global install is needed for any normal
-> use of DevBench.
->
-> **Why skipping matters:** installing the plugin at user scope registers its hooks
-> **globally on this machine**. Those hooks fire on every Claude Code session you open
-> -- not just orchestrator sessions -- and they intercept Write tool calls to
-> `backlog/**` files. The practical effect: **any Claude session you spin up to edit a
-> work unit, author a new task, fix a Manifest, or apply an operator recovery will be
-> blocked from writing to the backlog.** That breaks the entire two-track operator
-> workflow described in Step 10 (where you stop the orchestrator, then use a separate
-> Claude session + `devbench` CLI to mutate the backlog between runs).
->
-> **The only reason to install the plugin** is if you specifically want to run
-> `make start-interactive` (the observation-only mode that lets you watch tool calls
-> live). Even then, prefer the per-session `--plugin-dir` approach (see
-> [README Interactive Mode](../README.md#interactive-mode)) so the hooks load only for
-> that specific session and don't poison other Claude work.
->
-> **If you install it, accept the trade-off:** while installed, you will have a hard
-> time editing the backlog from other Claude sessions. Plan to uninstall (commands
-> below) when you're done observing.
-
-If you've decided you want the global install anyway:
-
-```bash
-make -C $DEVBENCH_DIR plugin-install && claude plugin list
-```
-
-This registers the devbench marketplace directory and installs the plugin at user scope so
-every `claude` session on this machine can see DevBench's orchestrate skill.
-
-**What is registered:** the `plugin/devbench/` directory in your devbench clone is added to
-Claude Code's marketplace, and the `devbench` plugin entry is installed under your user
-profile (`~/.claude/`).
-
-**Without make:**
-
-    claude plugin marketplace add $DEVBENCH_DIR/plugin --scope user
-    claude plugin install devbench --scope user
-
-**Verify the plugin is installed:** expected output of `claude plugin list`: a line
-containing `devbench` in the installed list.
-
-**To uninstall later** (e.g., to unblock backlog edits in other Claude sessions):
-
-    claude plugin uninstall devbench --scope user
-    claude plugin marketplace remove devbench --scope user
-
----
-
-## Step 4: Authenticate Claude / Bedrock
+## Step 3: Authenticate Claude / Bedrock
 
 DevBench supports two LLM backends. Choose one.
 
@@ -173,7 +118,7 @@ For the full credential-chain resolution order, see
 
 ---
 
-## Step 5: Set up the workspace root
+## Step 4: Set up the workspace root
 
 The workspace root (`JUDGE_WORKSPACE_ROOT`) is the parent directory that contains your
 backlog, your YAML config, and your cloned target repo(s) as siblings. It is **not** the
@@ -210,13 +155,13 @@ The canonical workspace layout at this point (from
   BACKLOG.md
   backlog/
     config/
-      devbench.yaml           <- authored in Step 7
-  my-target-repo/             <- cloned in Step 6
+      devbench.yaml           <- authored in Step 6
+  my-target-repo/             <- cloned in Step 5
 ```
 
 ---
 
-## Step 6: Clone the target repo(s)
+## Step 5: Clone the target repo(s)
 
 Clone each repository you want DevBench to operate on **into the workspace root as a
 sibling of `backlog/`**:
@@ -234,7 +179,7 @@ names.
 
 ---
 
-## Step 7: Author backlog/config/devbench.yaml
+## Step 6: Author backlog/config/devbench.yaml
 
 Copy the reference config from your devbench clone as a starting point:
 
@@ -250,7 +195,7 @@ Open the file and edit the required keys:
 repos:
   your-org/your-repo:
     default_branch: main
-    checkout_directory: my-target-repo   # must match the directory name from Step 6
+    checkout_directory: my-target-repo   # must match the directory name from Step 5
 
 merge_strategy: squash   # or "merge" or "rebase"
 ```
@@ -281,7 +226,7 @@ The full annotated reference with every possible key and its default value is
 
 ---
 
-## Step 8: Author or import a backlog
+## Step 7: Author or import a backlog
 
 ### Minimum-viable backlog (new project)
 
@@ -327,7 +272,7 @@ Also update `BACKLOG.md` to add an index row for the new task:
 ### Importing an existing backlog
 
 If you already have a structured backlog directory, copy the `backlog/` tree and
-`BACKLOG.md` into the workspace root and proceed to Step 9.
+`BACKLOG.md` into the workspace root and proceed to Step 8.
 
 For full backlog-authoring guidance including specs, TDD annotations, lifecycle tests, and
 the Git strategy section, see
@@ -335,7 +280,7 @@ the Git strategy section, see
 
 ---
 
-## Step 9: Validate
+## Step 8: Validate
 
 Run `devbench validate-backlog` from any directory; provide the workspace root and model
 via environment variables:
@@ -378,13 +323,14 @@ For the complete rule list (20 rules as of v-next), see
 
 ---
 
-## Step 10: Launch
+## Step 9: Launch
 
-### Non-interactive mode (recommended)
-
-Non-interactive mode runs the orchestrator as a headless Claude Agent SDK process. This
-is the recommended way to run DevBench. The system is stable enough that the backlog
-itself is the right place to manage the run, not a live console session.
+DevBench runs the orchestrator as a headless Claude Agent SDK process. The
+review judges + manifest amender + blocker resolver are stable enough that
+the backlog itself is the right place to manage the run, not a live console.
+Live operator interjection during a claim usually disturbs the executor
+mid-turn and produces worse outcomes than letting the cycle complete and
+then editing the backlog afterwards.
 
 ```bash
 JUDGE_WORKSPACE_ROOT=~/my-workspace \
@@ -395,15 +341,7 @@ make -C $DEVBENCH_DIR start
 **Without make:** run `uv run --project $DEVBENCH_DIR python -m devbench.cli start` with
 the same environment variables set.
 
-**Why non-interactive is the default:** the orchestrator's lifecycle (claim -> implement
--> review -> retry -> git-ops -> mark-done) is deterministic and self-correcting. The
-review judges + manifest amender + blocker resolver already catch most issues without
-human input. Live operator interjection during a claim usually disturbs the executor
-mid-turn and produces worse outcomes than letting the cycle complete and then editing
-the backlog afterwards.
-
-**Live observation while non-interactive is running** -- you do NOT need to open
-interactive mode to see what the orchestrator is doing. Open side terminals against
+**Live observation while the run is in flight.** Open side terminals against
 the same workspace:
 
 ```bash
@@ -425,8 +363,7 @@ cd ~/my-workspace && watch -n 60 \
 
 Between those plus `git log` on your backlog repo (every status promotion, TDD-cycle
 entry, audit comment lands as a commit-worthy diff), you see exactly what the
-orchestrator is doing. Interactive mode adds almost nothing beyond this except the
-ability to type instructions mid-run -- which is the one thing we recommend against.
+orchestrator is doing.
 
 ### If you need to change something while the run is in flight
 
@@ -472,46 +409,12 @@ this two-track workflow lives in
 [`examples/backlogs/brownfield/multi-repo_single-pr_no-merge/operator-interventions.md`](../examples/backlogs/brownfield/multi-repo_single-pr_no-merge/operator-interventions.md)
 (Intervention 1).
 
-### Interactive mode (rarely needed)
-
-Interactive mode opens a Claude Code session with the devbench plugin loaded so you can
-watch tool calls inside Claude Code's UI. **It offers almost nothing over non-interactive
-+ `devbench hook-tail` + `devbench report`** -- both modes give live tool-call visibility.
-The only unique capability of interactive mode is the ability to type natural-language
-instructions to the orchestrate skill mid-run, and that is exactly what we recommend
-AGAINST (mid-claim interjection disturbs the executor's reasoning; corrections belong in
-the backlog via the two-track workflow above). If you still want it (e.g., for a guided
-walk-through of how a single task progresses through judges), here is how:
-
-**With the default `--dangerously-skip-permissions` flag** (the orchestrator needs to read
-and write files without per-tool confirmation):
-
-```bash
-JUDGE_WORKSPACE_ROOT=~/my-workspace \
-JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
-make -C $DEVBENCH_DIR start-interactive
-```
-
-**With `JUDGE_SAFE_PERMISSIONS=1`** (sandboxed: Claude Code asks for confirmation before
-each file operation -- slower but safer if you want to watch each tool call confirm):
-
-```bash
-JUDGE_WORKSPACE_ROOT=~/my-workspace \
-JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
-JUDGE_SAFE_PERMISSIONS=1 \
-make -C $DEVBENCH_DIR start-interactive
-```
-
-When `JUDGE_SAFE_PERMISSIONS=1` is set, the Makefile omits
-`--dangerously-skip-permissions`, so Claude Code prompts before every sensitive tool use.
-
-**Note on end-to-end validation of Step 10:** the launch commands open a live orchestrator
+**Note on end-to-end validation of Step 9:** `make start` opens a live orchestrator
 session and cannot safely be invoked in an automated validation pass. During execution
-validation, these commands were verified with `--dry-run` (`make -C $DEVBENCH_DIR --dry-run start-interactive`
-and `make -C $DEVBENCH_DIR --dry-run start`) to confirm the Makefile expands to the
-correct `claude` and `uv run python -m devbench.cli start` invocations. The dry-run exit
-code 0 confirms the Makefile targets are well-formed; the actual live invocations are
-operator-initiated.
+validation, the launch command was verified with `make -C $DEVBENCH_DIR --dry-run start`
+to confirm the Makefile expands to the correct `uv run python -m devbench.cli start`
+invocation. The dry-run exit code 0 confirms the Makefile target is well-formed; the
+actual live invocation is operator-initiated.
 
 ---
 
@@ -519,7 +422,7 @@ operator-initiated.
 
 These decisions appear at specific steps. Each is a one-time choice per workspace.
 
-### Bedrock vs Anthropic API (Step 4)
+### Bedrock vs Anthropic API (Step 3)
 
 | | Anthropic API | AWS Bedrock |
 |--|--------------|------------|
@@ -529,7 +432,7 @@ These decisions appear at specific steps. Each is a one-time choice per workspac
 
 Default is Anthropic API. Set `JUDGE_USE_BEDROCK=1` (and `JUDGE_BEDROCK_REGION`) to switch.
 
-### Single-PR vs multi-PR (Step 7)
+### Single-PR vs multi-PR (Step 6)
 
 | Mode | `devbench.yaml` setting | Effect |
 |------|------------------------|--------|
@@ -539,18 +442,18 @@ Default is Anthropic API. Set `JUDGE_USE_BEDROCK=1` (and `JUDGE_BEDROCK_REGION`)
 Single-PR mode requires `git_ops.defer_pr: false` (default) or pairing with
 `git_ops.defer_pr: true` and running `devbench git-ops-finalize` when the batch is ready.
 
-### manifest_amendment.enabled (Step 7)
+### manifest_amendment.enabled (Step 6)
 
 When enabled, the executor can request to add files to its Manifest mid-task (for TDD
 scenarios where a production fix is discovered after the spec was written). Disabled by
 default. Enable only when your backlog's TDD discipline requires it.
 
-### task_factory.enabled (Step 7)
+### task_factory.enabled (Step 6)
 
 When enabled, the orchestrator can auto-generate new backlog tasks from proposals emitted
 by blocked executors. Requires `manifest_amendment.enabled: true`. Disabled by default.
 
-### Manual blockers vs regular deps (Step 8)
+### Manual blockers vs regular deps (Step 7)
 
 Use `## Dependencies` rows (regular deps) when the ordering constraint is purely sequencing
 between two tasks in your backlog. Use a manual blocker (`DO NOT CLAIM` in the task
@@ -558,13 +461,11 @@ description) when a task must wait for a human action (external API access, secr
 provisioning, sign-off) that has no corresponding task ID. See
 [`docs/manual-blockers.md`](manual-blockers.md) (ref) for the format.
 
-### With-make vs without-make (Steps 2, 3, 10)
+### With-make vs without-make (Steps 2 and 9)
 
-`make install`, `make plugin-install`, `make start`, and `make start-interactive` are
-convenience wrappers. Every step in this guide includes the equivalent bare `uv run` /
-`claude` form under "Without make" so operators on environments without GNU make can
-proceed. Note that Step 3 (`make plugin-install`) is skippable for non-interactive
-runs -- only needed for the optional `make start-interactive` observation mode.
+`make install` and `make start` are convenience wrappers. Every step in this guide
+includes the equivalent bare `uv run` form under "Without make" so operators on
+environments without GNU make can proceed.
 
 ---
 
@@ -590,7 +491,7 @@ Or prefix it inline:
 FileNotFoundError: DevBench config file not found at '<JUDGE_WORKSPACE_ROOT>/backlog/config/devbench.yaml'
 ```
 
-The config file was not created (Step 7) or `JUDGE_WORKSPACE_ROOT` is pointing at the
+The config file was not created (Step 6) or `JUDGE_WORKSPACE_ROOT` is pointing at the
 wrong directory. Verify:
 
     ls $JUDGE_WORKSPACE_ROOT/backlog/config/devbench.yaml
@@ -611,18 +512,6 @@ workspace root. Remove the `my-target-repo/` prefix from the offending row:
 # Correct:
 | `src/foo.py` | new file |
 ```
-
-### Plugin not found after `make plugin-install`
-
-If `claude plugin list` does not show `devbench`, try running the install commands
-manually from the devbench clone root:
-
-    claude plugin marketplace add $DEVBENCH_DIR/plugin --scope user
-    claude plugin install devbench --scope user
-
-If the `plugin/` directory is missing, verify you cloned the full devbench repo (not a
-shallow clone with `--depth 1`) and that the clone is at a commit that includes the plugin
-directory.
 
 ---
 

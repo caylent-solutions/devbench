@@ -1,7 +1,16 @@
 # ADR-01: Claude Agent SDK with Plugin-Based Orchestration
 
-**Status:** Accepted  
+**Status:** Accepted -- partially superseded (2026-05-12)
 **Date:** 2026-03-09
+
+> **Superseded in part by removal of interactive mode (2026-05-12).**
+>
+> This ADR's discussion of interactive vs automated modes is historical.
+> Interactive mode (`make start-interactive`) has been removed; only the
+> non-interactive Agent SDK launcher (`devbench start`) remains. The plugin
+> architecture decision documented here is still load-bearing -- `cmd_start`
+> loads the plugin ad-hoc from the local devbench checkout via the Agent SDK
+> -- but the "interactive launcher parity" rationale no longer applies.
 
 ---
 

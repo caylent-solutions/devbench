@@ -3,7 +3,7 @@ SHELL := /bin/bash
 .DEFAULT_GOAL := help
 unexport VIRTUAL_ENV
 
-.PHONY: help install install-hooks plugin-install plugin-uninstall lint lint-ruff lint-bandit format format-check typecheck test test-unit test-coverage validate clean start start-interactive report report-session pre-commit-check pre-push-check watch watch-live
+.PHONY: help install install-hooks lint lint-ruff lint-bandit format format-check typecheck test test-unit test-coverage validate clean start report report-session pre-commit-check pre-push-check watch watch-live
 
 ## help: Show available targets
 help:
@@ -11,7 +11,6 @@ help:
 	@echo ""
 	@grep -E '^## ' $(MAKEFILE_LIST) | sed \
 	  -e 's/^## /  /' \
-	  -e 's/\(start-interactive:.*\)/\1 [JUDGE_WORKSPACE_ROOT, JUDGE_CLAUDE_MODEL, JUDGE_SAFE_PERMISSIONS]/' \
 	  -e 's/\(report-session:.*\)/\1 [SINCE]/' \
 	  -e 's/\(watch-live:.*\)/\1 [INTERVAL]/'
 	@echo ""
@@ -24,16 +23,6 @@ install:
 install-hooks:
 	uv run pre-commit install
 	uv run pre-commit install --hook-type pre-push
-
-## plugin-install: Register devbench marketplace and install plugin (user scope)
-plugin-install:
-	claude plugin marketplace add ./plugin --scope user
-	claude plugin install devbench --scope user
-
-## plugin-uninstall: Uninstall devbench plugin and remove marketplace
-plugin-uninstall:
-	claude plugin uninstall devbench
-	claude plugin marketplace remove devbench
 
 ## lint-ruff: Run ruff linter
 lint-ruff:
@@ -115,18 +104,9 @@ clean:
 	find . -type d -name .ruff_cache -exec rm -rf {} + 2>/dev/null || true
 	find . -type d -name .mypy_cache -exec rm -rf {} + 2>/dev/null || true
 
-## start: Run orchestrate skill non-interactively via Claude Agent SDK
+## start: Run orchestrate skill via Claude Agent SDK
 start:
 	uv run python -m devbench.cli start
-
-## start-interactive: Launch interactive Claude session with devbench plugin loaded
-ifeq ($(JUDGE_SAFE_PERMISSIONS),1)
-start-interactive:
-	claude --plugin-dir plugin/devbench
-else
-start-interactive:
-	claude --dangerously-skip-permissions --plugin-dir plugin/devbench
-endif
 
 ## report: Show backlog progress report (full session)
 report:

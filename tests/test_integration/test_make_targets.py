@@ -1,9 +1,6 @@
 """Integration tests for Makefile target behaviours.
 
 Covers:
-- AC-FUNC-001: start-interactive adds --dangerously-skip-permissions by default
-- AC-FUNC-002: JUDGE_SAFE_PERMISSIONS=1 suppresses --dangerously-skip-permissions
-- AC-FUNC-003: help output includes env-var token for start-interactive
 - AC-FUNC-004: help output includes env-var tokens for report-session and watch-live
 - AC-FUNC-005: make -n start resolves unchanged (uv run python -m devbench.cli start)
 - AC-CYCLE-001: end-to-end invocation via subprocess asserting observed CLI behaviour
@@ -48,33 +45,6 @@ def _make_help() -> str:
 
 
 @pytest.mark.functional
-class TestStartInteractiveFlag:
-    """AC-FUNC-001 / AC-FUNC-002 / AC-CYCLE-001."""
-
-    def test_default_includes_dangerously_skip_permissions(self) -> None:
-        """AC-FUNC-001: make -n start-interactive includes --dangerously-skip-permissions by default."""
-        env = {k: v for k, v in os.environ.items() if k != "JUDGE_SAFE_PERMISSIONS"}
-        output = _make_dry_run("start-interactive", env=env)
-        assert "--dangerously-skip-permissions" in output, (
-            f"Expected '--dangerously-skip-permissions' in make -n start-interactive output, got:\n{output}"
-        )
-
-    def test_safe_permissions_one_omits_flag(self) -> None:
-        """AC-FUNC-002: JUDGE_SAFE_PERMISSIONS=1 suppresses --dangerously-skip-permissions."""
-        output = _make_dry_run("start-interactive", env={"JUDGE_SAFE_PERMISSIONS": "1"})
-        assert "--dangerously-skip-permissions" not in output, (
-            f"Expected '--dangerously-skip-permissions' to be absent when JUDGE_SAFE_PERMISSIONS=1, got:\n{output}"
-        )
-
-    def test_safe_permissions_zero_includes_flag(self) -> None:
-        """AC-FUNC-001 variant: JUDGE_SAFE_PERMISSIONS=0 still includes the flag."""
-        output = _make_dry_run("start-interactive", env={"JUDGE_SAFE_PERMISSIONS": "0"})
-        assert "--dangerously-skip-permissions" in output, (
-            f"Expected '--dangerously-skip-permissions' when JUDGE_SAFE_PERMISSIONS=0, got:\n{output}"
-        )
-
-
-@pytest.mark.functional
 class TestStartUnchanged:
     """AC-FUNC-005."""
 
@@ -91,21 +61,7 @@ class TestStartUnchanged:
 
 @pytest.mark.functional
 class TestHelpEnvVarTokens:
-    """AC-FUNC-003 / AC-FUNC-004."""
-
-    def test_help_start_interactive_lists_env_vars(self) -> None:
-        """AC-FUNC-003: help shows env-var token for start-interactive."""
-        output = _make_help()
-        assert "start-interactive" in output, f"Expected 'start-interactive' in help output:\n{output}"
-        assert "JUDGE_WORKSPACE_ROOT" in output, (
-            f"Expected 'JUDGE_WORKSPACE_ROOT' in help output for start-interactive:\n{output}"
-        )
-        assert "JUDGE_CLAUDE_MODEL" in output, (
-            f"Expected 'JUDGE_CLAUDE_MODEL' in help output for start-interactive:\n{output}"
-        )
-        assert "JUDGE_SAFE_PERMISSIONS" in output, (
-            f"Expected 'JUDGE_SAFE_PERMISSIONS' in help output for start-interactive:\n{output}"
-        )
+    """AC-FUNC-004."""
 
     def test_help_report_session_lists_since(self) -> None:
         """AC-FUNC-004a: help shows [SINCE] token for report-session."""
@@ -118,19 +74,6 @@ class TestHelpEnvVarTokens:
         output = _make_help()
         assert "watch-live" in output, f"Expected 'watch-live' in help output:\n{output}"
         assert "INTERVAL" in output, f"Expected 'INTERVAL' in help output for watch-live:\n{output}"
-
-    def test_help_start_interactive_line_format(self) -> None:
-        """AC-FUNC-003 exact format: start-interactive line ends with env-var bracket token."""
-        output = _make_help()
-        lines = output.splitlines()
-        start_interactive_lines = [ln for ln in lines if "start-interactive" in ln]
-        assert start_interactive_lines, f"No 'start-interactive' line found in help output:\n{output}"
-        # At least one line must contain the full env-var token
-        token = "[JUDGE_WORKSPACE_ROOT, JUDGE_CLAUDE_MODEL, JUDGE_SAFE_PERMISSIONS]"
-        matching = [ln for ln in start_interactive_lines if token in ln]
-        assert matching, f"Expected a line containing '{token}' but start-interactive lines were:\n" + "\n".join(
-            start_interactive_lines
-        )
 
     def test_help_report_session_line_format(self) -> None:
         """AC-FUNC-004a exact format: report-session line ends with [SINCE]."""

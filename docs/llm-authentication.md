@@ -98,11 +98,11 @@ The expected structure is:
 
 #### Token expiration
 
-Claude Code OAuth tokens have an expiration timestamp embedded in `~/.claude/.credentials.json`. When you launch a Claude Code interactive session (`claude` in the terminal), the Claude Code CLI itself manages token refresh as long as the session is active.
+Claude Code OAuth tokens have an expiration timestamp embedded in `~/.claude/.credentials.json`. The Claude Code CLI itself manages token refresh when a `claude` foreground session is active in the terminal.
 
 DevBench's `cmd_start()` (the SDK entry point used by `make start`) does **not** run a background token refresher -- it reads the credential file at startup and trusts that whoever launched the orchestrator has a valid token. If the token expires mid-run, the next LLM call fails with an API error and the orchestrator stops.
 
-To recover: re-authenticate Claude Code (`claude` → complete the browser flow) and restart the orchestrator.
+To recover: re-authenticate Claude Code (`claude` → complete the browser flow, then exit the session) and restart the orchestrator with `make start`.
 
 ## Option 2: AWS Bedrock
 
@@ -135,9 +135,6 @@ JUDGE_USE_BEDROCK=1 \
 JUDGE_BEDROCK_REGION=us-east-1 \
 make start
 ```
-
-(Swap `make start` for `make start-interactive` only if you want the live-observation
-mode -- non-interactive is the recommended default.)
 
 ### Verifying Authentication
 

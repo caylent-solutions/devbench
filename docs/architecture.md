@@ -664,7 +664,7 @@ If you find a new issue, open a GitHub issue (or PR with the fix) rather than am
 
 - [README.md](../README.md) -- Quick start, install, basic usage
 - [model-pricing.md](model-pricing.md) -- Per-model token costs and YAML snippets
-- [execution-modes.md](execution-modes.md) -- Detailed step-by-step lifecycle for both interactive and automated modes
+- [execution-modes.md](execution-modes.md) -- Detailed step-by-step lifecycle of the orchestrate skill
 - [backlog-contract.md](backlog-contract.md) -- Required structure of `BACKLOG.md` and work-unit files
 - [creating-specs-and-backlogs.md](creating-specs-and-backlogs.md) -- How to author a new backlog from a spec
 - [example-work-unit-template.md](example-work-unit-template.md) -- Concrete template to copy when authoring tasks

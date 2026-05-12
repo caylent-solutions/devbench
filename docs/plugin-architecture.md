@@ -11,7 +11,6 @@ This document describes the structure and design of the DevBench Claude Code plu
 - [Model Per Role](#model-per-role)
 - [Hook Safety Model](#hook-safety-model)
 - [Python CLI: Thin Bridge, Not Orchestration](#python-cli-thin-bridge-not-orchestration)
-- [Interactive vs Automated Gap](#interactive-vs-automated-gap)
 - [SDK Bootstrap](#sdk-bootstrap)
 - [Workspace Layout](#workspace-layout)
 - [Unchanged Modules](#unchanged-modules)
@@ -122,7 +121,7 @@ Each agent specifies its own model in the frontmatter:
 
 ## Hook Safety Model
 
-`hooks/hooks.json` registers Claude Code hooks that fire in both interactive and automated sessions. Guard hooks exit with code 2 to block the tool call; stderr is shown to the agent as feedback. Hook command strings use `${CLAUDE_PLUGIN_ROOT}`, which Claude Code interpolates at runtime to the absolute path of the loaded plugin directory (the value passed to `--plugin-dir`).
+`hooks/hooks.json` registers Claude Code hooks that fire in the orchestrate session. Guard hooks exit with code 2 to block the tool call; stderr is shown to the agent as feedback. Hook command strings use `${CLAUDE_PLUGIN_ROOT}`, which Claude Code interpolates at runtime to the absolute path of the loaded plugin directory (the value the Agent SDK passes to `--plugin-dir` when `devbench start` loads the plugin from the local devbench checkout).
 
 The current `hooks.json` registers ten hook event types. Below shows the structure for the events that gate tool calls (PreToolUse and PostToolUse); the catch-all logger entries for the remaining events (`PostToolUseFailure`, `UserPromptSubmit`, `Stop`, `SubagentStart`, `SubagentStop`, `PreCompact`, `PermissionRequest`, `Notification`) follow the same pattern.
 
@@ -220,22 +219,6 @@ Agents never know how repo paths are resolved. Multi-repo routing is invisible t
 | `devbench mark-done <id>` | Done-gate verification + status update |
 | `devbench git-ops <id>` | Deterministic: branch → commit → push → PR → CI wait → merge |
 | `devbench validate-backlog` | Check backlog integrity before each cycle |
-
----
-
-## Interactive vs Automated Gap
-
-With the plugin model, both modes load the same filesystem artifacts. The only difference is the
-session entry point:
-
-| Concern | Interactive | Automated SDK | Gap |
-|---------|-------------|---------------|-----|
-| Plugin loading | `--plugin-dir plugin/devbench` | `plugins=[{"type":"local","path":"plugin/devbench"}]` | One config line (intentional SDK design) |
-| Agent/skill/hook behavior | Loaded from same filesystem artifacts | Same | None |
-| Repo context resolution | `uv run devbench` CLI via env vars | Same | None |
-| Safety hooks | `hooks/hooks.json` fires automatically | Same file fires when plugin loaded | None |
-| CLAUDE.md standards | Loaded via `settingSources` | Loaded via `settingSources` | None |
-| Target repo CLAUDE.md | Executor agent reads it explicitly via `repo_path` | Same | None |
 
 ---
 

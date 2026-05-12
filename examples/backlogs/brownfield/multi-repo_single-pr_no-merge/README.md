@@ -69,7 +69,7 @@ git_ops:
 │   ├── spec/                        # Locked spec the backlog implements
 │   │   └── kanon-list-add-lock-features-spec.md
 │   ├── templates/                   # AC-FINAL + Code Standards block templates
-│   ├── devbench-commands.txt        # 5 launch commands (start / interactive / report / hook-tail / status)
+│   ├── devbench-commands.txt        # 4 launch commands (start / report / hook-tail / status)
 │   ├── kanon/                       # PLACEHOLDER -- real run symlinks to caylent-solutions/kanon
 │   ├── caylent-private-kanon/       # PLACEHOLDER -- real run symlinks to caylent/caylent-private-kanon
 │   └── kanon-claude-marketplaces/   # PLACEHOLDER -- real run symlinks to caylent/kanon-claude-marketplaces

@@ -129,13 +129,13 @@ The orchestrator's log file is resolved by precedence: `JUDGE_LOG_FILE` env var 
 
 Three panes (tmux is the usual harness):
 
-1. **Orchestrator pane** -- the interactive Claude session.
+1. **Orchestrator pane** -- the non-interactive devbench launcher.
    ```bash
    PATH=... JUDGE_CLAUDE_MODEL=claude-opus-4-7 JUDGE_WORKSPACE_ROOT=$JUDGE_WORKSPACE_ROOT \
      JUDGE_ORCHESTRATOR_SESSION_ID=$JUDGE_ORCHESTRATOR_SESSION_ID \
-     claude --plugin-dir /path/to/devbench/plugin/devbench --dangerously-skip-permissions
+     make -C /path/to/devbench start
    ```
-   Inside Claude, run `/devbench:orchestrate` (or the equivalent skill).
+   `make start` launches the orchestrate skill via the Claude Agent SDK headlessly; no Claude Code session needed. The Agent SDK loads the plugin ad-hoc from the devbench checkout.
 2. **Live report pane** -- `uv run --project /path/to/devbench devbench report --watch 120`.
 3. **Hook-tail pane** -- `uv run --project /path/to/devbench devbench hook-tail --orchestrator-only`. The `--orchestrator-only` flag (E230) filters to events stamped with `JUDGE_ORCHESTRATOR_SESSION_ID` so side-pane Claude sessions in the same workspace do not pollute the audit stream.
 

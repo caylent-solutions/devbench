@@ -1,40 +1,34 @@
-# Execution Modes
+# Execution Mode
 
-DevBench supports two execution modes. Both follow the same lifecycle and the same ownership rules -- the difference is whether the orchestrate skill runs non-interactively (background/unattended, the **recommended default**) or interactively (a live Claude Code session, intended for **observation only**).
+DevBench runs orchestrate non-interactively via the Claude Agent SDK. There is exactly one run mode -- `make start` -- which loads the devbench plugin ad-hoc from the checkout and drives the orchestrate skill until every work unit reaches a terminal state.
 
-**Recommendation:** use non-interactive (`make start`) for production runs. DevBench's review judges + manifest amender + blocker resolver are stable enough that the backlog is the right place to manage the run -- not a live console. **Live observation is fully available in non-interactive mode** via `devbench hook-tail` (every tool call streamed), `devbench report` (live progress dashboard), and `devbench status`, so you do not need interactive mode just to see what's happening. When you do need to change something, stop the run and apply the change through two complementary tools: the **`devbench` CLI** for state transitions and dep wiring (`decline`, `hold`, `unhold`, `add-dep`, `set-status`, `log-comment`, `sync-blocked`, `validate-backlog`), and **Claude** (separate session) for editing the work-unit `.md` content (Approach, Manifest, Acceptance Criteria, or authoring new work units). The CLI never edits prose; Claude does. Live mid-claim intervention typically does more harm than good. See [`zero-to-ready.md`](zero-to-ready.md) Step 10 for the full two-track workflow.
+**Live observation** is available alongside the run via:
+- `devbench hook-tail` -- streams every tool call, judge verdict, and status transition.
+- `devbench report` -- live progress dashboard (epic counts, judges, CI, cost).
+- `devbench status` -- one-shot snapshot; pair with `watch -n 30 '...'` for a low-frequency monitor.
+- `git log` on the backlog repo -- every status promotion, TDD-cycle entry, and audit comment is a commit-worthy diff in the working tree.
+
+**Operator corrections** happen between runs via a two-track workflow:
+- The **`devbench` CLI** for state transitions and dep wiring (`decline`, `hold`, `unhold`, `add-dep`, `set-status`, `log-comment`, `sync-blocked`, `validate-backlog`).
+- **Claude** (in a separate session pointed at the workspace) for editing the work-unit `.md` content -- Approach, Manifest, Acceptance Criteria, or authoring new work units.
+
+The CLI never edits prose; Claude does. See [`zero-to-ready.md`](zero-to-ready.md) Step 9 for the full two-track workflow.
 
 For the wider context (component architecture, judge tier, multi-PR vs single-PR mode), see the [architecture overview](architecture.md). This doc focuses on the per-step lifecycle and ownership rules.
 
 ## Table of contents
 
-- [Modes at a Glance](#modes-at-a-glance)
 - [Lifecycle: Step-by-Step](#lifecycle-step-by-step)
 - [Ownership rules](#ownership-rules)
-- [Mode-Specific Details](#mode-specific-details)
+- [Runtime details](#runtime-details)
 - [Status Source of Truth](#status-source-of-truth)
 - [Retry Behaviour](#retry-behaviour)
 - [Stop Hook and Circuit Breaker](#stop-hook-and-circuit-breaker)
-
----
-
-## Modes at a Glance
-
-| Aspect | Automated (`make start`) -- **recommended** | Interactive (`make start-interactive`) -- rarely needed |
-| --- | --- | --- |
-| Orchestrator | `uv run devbench start` → Agent SDK `query()` runs orchestrate SKILL.md non-interactively | Claude Code session with orchestrate SKILL.md active |
-| Executor | `devbench:executor` agent (invoked by orchestrate skill) | Same -- orchestrate skill invokes `devbench:executor` agent |
-| Plugin install | **Not required -- and you should NOT install it.** The launcher loads the plugin ad-hoc from the devbench checkout via the Agent SDK | Required only if you want `/devbench:*` skills globally. Comes with a hard trade-off: user-scope install registers hooks that **block every other Claude session on this machine from editing `backlog/**` files** -- breaking the operator workflow of editing work units in a separate Claude session. Prefer `--plugin-dir` per-session so the hooks load only for the observation session and uninstall any global install when not actively observing. |
-| Live observation | **Yes** -- via `devbench hook-tail` (streams every tool call, judge verdict, status transition) + `devbench report` (live dashboard) + `devbench status`. Same firehose interactive mode shows, without opening Claude Code. | Same firehose, rendered inside Claude Code's UI |
-| Human control | Background -- mutate the backlog between runs via the `devbench` CLI + Claude in a separate session (two-track workflow) | Foreground -- you CAN type instructions mid-claim, but **do not** (interjection disturbs the executor's reasoning; corrections belong in the backlog) |
-| Git operations | `devbench:executor` agent via `devbench git-ops` CLI command | Same |
-| Best for | Production runs, CI-like pipelines, overnight orchestration -- with side-terminal observation via hook-tail + report | A guided walk-through of how one task progresses through the judge cycle (educational); almost never operational |
+- [Why no interactive mode?](#why-no-interactive-mode)
 
 ---
 
 ## Lifecycle: Step-by-Step
-
-Both modes execute the same logical steps in the same order.
 
 ```text
 1. Pre-flight validation
@@ -105,8 +99,6 @@ Both modes execute the same logical steps in the same order.
 
 ## Ownership Rules
 
-These rules apply in **both modes** without exception.
-
 ### Executor owns: implement only
 
 The `devbench:executor` agent is responsible for:
@@ -144,9 +136,7 @@ Branch name is resolved once at parse time. See the canonical rules in the [back
 
 ---
 
-## Mode-Specific Details
-
-### Automated mode (`make start`)
+## Runtime details
 
 ```text
 uv run devbench start
@@ -165,26 +155,7 @@ uv run devbench start
             └── (devbench:blocker-resolver agent file exists but is NOT currently invoked)
 ```
 
-The Agent SDK session runs the orchestrate skill with `permission_mode="bypassPermissions"` (set on `ClaudeAgentOptions` in `src/devbench/cli.py`) so it can invoke CLI tools and agents without interactive approval prompts.
-
-### Interactive mode (`make start-interactive`)
-
-```text
-Claude Code session (with devbench plugin active)
-    │
-    ├── orchestrate SKILL.md active from session start
-    │
-    ├── Claude invokes devbench:executor agent for implementation
-    │
-    ├── Claude invokes devbench:review-supervisor for judge review
-    │       └── review-supervisor runs all 4 judge agents in parallel
-    │
-    ├── Claude invokes devbench:security-reviewer for security gate
-    │
-    └── Claude invokes devbench:executor for git-ops (commit, push, PR, merge)
-```
-
-The human can pause at any time (Escape), give instructions, and resume. The same ownership rules apply -- the executor does not commit until all judges pass.
+The Agent SDK session runs the orchestrate skill with `permission_mode="bypassPermissions"` (set on `ClaudeAgentOptions` in `src/devbench/cli.py`) so it can invoke CLI tools and agents without interactive approval prompts. The plugin is loaded ad-hoc from the local devbench checkout via the Agent SDK's `plugins=[{"type": "local", "path": ...}]` option; no global `claude plugin install` is required or recommended.
 
 ---
 
@@ -246,3 +217,17 @@ All values are configured in `backlog/config/devbench.yaml` under `stop_hook:`, 
 | `max_blocks` | `JUDGE_STOP_MAX_BLOCKS` | 5 | Circuit breaker trips after this many blocks |
 | `window_seconds` | `JUDGE_STOP_WINDOW_SECONDS` | 180 | Counter resets after this period |
 | `stale_task_minutes` | `JUDGE_STOP_STALE_MINUTES` | 120 | Warn about stale tasks older than this |
+
+---
+
+## Why no interactive mode?
+
+DevBench previously shipped a second run mode (`make start-interactive`) that opened Claude Code with the devbench plugin active so an operator could watch tool calls live and type instructions mid-claim. It was removed in 2026-05 for two reasons:
+
+1. **The non-interactive observation stack is already complete.** `devbench hook-tail` streams every tool call, judge verdict, and status transition. `devbench report` is a live dashboard. `devbench status` is a one-shot snapshot. `git log` on the backlog repo shows every status promotion, TDD-cycle entry, and audit comment as a diff in the working tree. Interactive mode added nothing on top of this.
+
+2. **The plugin install required to run interactive mode was a footgun.** Installing the devbench plugin at user scope registers Claude Code hooks **globally on the machine**. Those hooks fire on every Claude session you open -- not just orchestrator sessions -- and block writes to `backlog/**`. The two-track operator workflow above (Claude in a separate session editing work-unit `.md` files) becomes impossible while the plugin is installed. The non-interactive launcher loads the plugin ad-hoc from the local checkout via the Agent SDK, so no global install is needed for normal use.
+
+Mid-claim natural-language interjection was the only feature interactive mode uniquely offered, and it is exactly the operator behaviour we recommend against: interjecting during an executor turn disturbs its reasoning. Corrections belong in the backlog (stop the run, mutate via the two-track workflow, restart), not in the console.
+
+ADR-01 in `docs/adr/01-claude-agent-sdk-with-plugins.md` documents the plugin architecture and historically references both modes; that doc has a Superseded note explaining the interactive launcher rationale no longer applies.

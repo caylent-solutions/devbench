@@ -4,9 +4,9 @@ DevBench's `cmd_git_ops` supports four mutually-exclusive execution
 modes. Pick the mode that matches the operator's review posture and
 PR-granularity needs.
 
-For the orchestrator's interactive vs non-interactive run-time modes,
-see [`docs/execution-modes.md`](execution-modes.md). This doc is
-specifically about the per-task git workflow after reviews pass.
+For the orchestrator's per-step lifecycle, see
+[`docs/execution-modes.md`](execution-modes.md). This doc is specifically
+about the per-task git workflow after reviews pass.
 
 ## At a glance
 

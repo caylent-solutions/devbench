@@ -124,7 +124,7 @@ Each agent specifies its own model in the frontmatter:
 
 `hooks/hooks.json` registers Claude Code hooks that fire in both interactive and automated sessions. Guard hooks exit with code 2 to block the tool call; stderr is shown to the agent as feedback. Hook command strings use `${CLAUDE_PLUGIN_ROOT}`, which Claude Code interpolates at runtime to the absolute path of the loaded plugin directory (the value passed to `--plugin-dir`).
 
-The current `hooks.json` registers nine hook event types. Below shows the structure for the events that gate tool calls (PreToolUse and PostToolUse); the catch-all logger entries for the remaining events (`PostToolUseFailure`, `UserPromptSubmit`, `Stop`, `SubagentStart`, `SubagentStop`, `PreCompact`, `PermissionRequest`, `Notification`) follow the same pattern.
+The current `hooks.json` registers ten hook event types. Below shows the structure for the events that gate tool calls (PreToolUse and PostToolUse); the catch-all logger entries for the remaining events (`PostToolUseFailure`, `UserPromptSubmit`, `Stop`, `SubagentStart`, `SubagentStop`, `PreCompact`, `PermissionRequest`, `Notification`) follow the same pattern.
 
 ```json
 {
@@ -136,7 +136,10 @@ The current `hooks.json` registers nine hook event types. Below shows the struct
           {"type": "command", "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/hook-logger.sh"},
           {"type": "command", "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/guard-bash.sh"},
           {"type": "command", "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/guard-verdict-format.sh"},
-          {"type": "command", "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/guard-git-stage.sh"}
+          {"type": "command", "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/guard-comment-format.sh"},
+          {"type": "command", "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/guard-git-stage.sh"},
+          {"type": "command", "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/guard-destructive-git.sh"},
+          {"type": "command", "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/guard-review-supervisor-scope.sh"}
         ]
       },
       {
@@ -164,7 +167,6 @@ The current `hooks.json` registers nine hook event types. Below shows the struct
     "Stop": [
       {
         "hooks": [
-          {"type": "command", "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/hook-logger.sh"},
           {"type": "command", "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/continue-orchestration.sh"}
         ]
       }
@@ -173,7 +175,7 @@ The current `hooks.json` registers nine hook event types. Below shows the struct
 }
 ```
 
-For the full hook table (all nine event types and their scripts), see [Hooks layer](architecture.md#9-hooks-layer) in the architecture doc.
+For the full hook table (all ten event types and their scripts), see [Hooks layer](architecture.md#9-hooks-layer) in the architecture doc.
 
 ### The Stop hook circuit breaker
 

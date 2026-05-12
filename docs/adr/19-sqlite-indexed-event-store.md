@@ -21,9 +21,9 @@ range-scan over the event store.
 The same SQLite database introduced by ADR-16 carries indexed columns for
 every dimension the reporter queries by:
 
-- `(file_id, ts_epoch_us)` -- session-boundary detection per source file.
-- `(task_id, kind, ts_epoch_us)` -- per-task event lookups.
-- `(kind, ts_epoch_us)` -- cross-source windowed queries (cost-window,
+- `(ts_epoch_us)` -- session-boundary detection per source file.
+- `(task_id, transition, ts_epoch_us)` -- per-task event lookups.
+- `(logger, ts_epoch_us)` -- cross-source windowed queries (cost-window,
   token-window, etc.).
 
 Every JSONL append to the source file results in a corresponding SQLite
@@ -47,8 +47,8 @@ to `_SCHEMA_VERSION` and rebuilds from scratch if they differ.
 
 ## Consequences
 
-- Windowed queries become indexed range scans -- microseconds instead of
-  Python full scans.
+- Windowed queries become indexed range scans -- substantially faster than
+  Python-side full scans over raw JSONL.
 - After this layer lands the reporter is no longer bottlenecked on data
   fetch regardless of backlog size (per #162's "after Phase 4, reporting
   performance stops being a bottleneck" claim).
@@ -56,9 +56,9 @@ to `_SCHEMA_VERSION` and rebuilds from scratch if they differ.
   on next access; SQLite WAL mode makes hard-kill survivable -- last-
   committed transaction stands; in-flight transactions roll back; reboot
   recovery is automatic.
-- New module (`devbench.reporting.event_index`) at 100% line + branch
-  coverage. Existing reporting tests retain full parity vs the legacy
-  parser path.
+- New module (`devbench.reporting.event_index`) is tested in
+  `tests/test_reporting/test_event_index.py`. Existing reporting tests
+  retain full parity vs the legacy parser path.
 
 ## References
 

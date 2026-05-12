@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pytest
 
+from devbench.constants import DEFAULT_MAX_CASCADE_DEPTH
+
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent.parent / "plugin" / "devbench"
 BLOCKER_RESOLVER = PLUGIN_ROOT / "agents" / "blocker-resolver.md"
 MANIFEST_AMENDER = PLUGIN_ROOT / "agents" / "manifest-amender.md"
@@ -113,3 +115,19 @@ class TestTaskFactoryCascadeDepthAndPlaceholderRules:
     )
     def test_each_placeholder_fragment_present(self, task_factory_text: str, fragment: str) -> None:
         assert fragment in task_factory_text
+
+
+@pytest.mark.integration
+class TestCascadeDepthDefaultValue:
+    """Issue #144 (E8): pin the default cascade-depth cap to 2 so a future
+    revert of the E8 change fails CI at this assertion."""
+
+    def test_default_max_cascade_depth_is_2(self) -> None:
+        assert DEFAULT_MAX_CASCADE_DEPTH == 2, (
+            f"DEFAULT_MAX_CASCADE_DEPTH must be 2 (depth-2 escalation cap), got {DEFAULT_MAX_CASCADE_DEPTH}"
+        )
+
+    def test_task_factory_mentions_default_2(self, task_factory_text: str) -> None:
+        assert "default 2" in task_factory_text, (
+            "task-factory.md must document the cascade-depth cap default as 'default 2'"
+        )

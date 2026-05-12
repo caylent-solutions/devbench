@@ -75,9 +75,13 @@ def _make_mock_ops(
     create_pr_url: str = "https://github.com/caylent-solutions/devbench/pull/42",
     wait_for_checks_returns: bool = True,
 ) -> MagicMock:
+    from devbench.github.git_ops import CIResult
+
     ops = MagicMock()
     ops.create_pr.return_value = create_pr_url
-    ops.wait_for_checks.return_value = wait_for_checks_returns
+    ops.wait_for_checks_and_classify.return_value = (
+        CIResult.GREEN if wait_for_checks_returns else CIResult.FAILED_UNKNOWN
+    )
     return ops
 
 

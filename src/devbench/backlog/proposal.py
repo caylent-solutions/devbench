@@ -136,33 +136,44 @@ def classify_proposed_task(backlog_root: Path, workspace_root: Path, suggested_i
 
 
 class BlockedTaskState(Enum):
-    """Lifecycle classifier for ``blocked`` work units (3-state, post Part-1).
+    """Lifecycle classifier for work units that require operator triage (6-state).
 
-    Three buckets, ordered by what an operator should do about each:
+    Six buckets ordered by the classifier's decision priority:
 
+    - ``HELD`` -- the unit's own status is ``hold``; a deliberate operator
+      pause. No automation will clear it. Operator must resume manually.
+    - ``BLOCKED_ON_HELD`` -- the unit is ``blocked`` and carries a
+      ``[BLOCKED_PENDING_PROPOSAL]`` marker whose target is in ``hold``.
+      The ADR-07 cascade cannot fire while the target is non-terminal and
+      ``hold`` is non-terminal. Operator must resume the held target.
     - ``AUTO_CLEARING_VIA_PROPOSAL`` -- carries at least one
       ``[BLOCKED_PENDING_PROPOSAL]`` marker whose targets all exist in the
-      backlog AND at least one of which is non-terminal. The ADR-07
-      cascade fires the moment every marker target reaches ``done`` /
-      ``declined``. Operator does nothing.
-    - ``AWAITING_AUTO_RECOVERY`` -- no marker yet, but at least one
-      recovery signal is present on disk: a pending proposal JSON
-      (blocker-resolver wrote it; task-factory will materialise +
-      promote it), or a rejected-amendment archive (manifest-amender
-      rejected; blocker-resolver runs next), or a recent ``[BLOCKED]``
-      audit comment from one of the recovery agents. The orchestrator's
-      next sweep cycle will advance the task into ``AUTO_CLEARING_VIA_PROPOSAL``
-      (or further). Operator does nothing for now.
-    - ``NEEDS_OPERATOR_ATTENTION`` -- the true halt list: no marker, no
-      recovery signal, OR a marker that points at an unknown ID (cascade
-      cannot resolve), OR every marker is already terminal (cascade
-      should have fired and did not). Manual blockers (``DO NOT CLAIM``)
-      land here.
+      backlog AND at least one of which is non-terminal (and not ``hold``).
+      The ADR-07 cascade fires the moment every marker target reaches
+      ``done`` / ``declined``. Operator does nothing.
+    - ``AWAITING_DEPENDENCY`` -- no marker present, but a regular
+      Dependencies-table row points at a non-terminal task. The orchestrator
+      will unblock this task automatically once the dependency completes.
+      Operator does nothing.
+    - ``AWAITING_AMENDMENT_RECOVERY`` -- no marker, no regular-dep blocker,
+      but at least one recovery signal is present on disk: a pending proposal
+      JSON, a rejected-amendment archive, or a recent ``[BLOCKED]`` audit
+      comment from a recovery agent (``agent/orchestrator``,
+      ``agent/blocker_resolver``, ``agent/manifest_amender``,
+      ``agent/backlog_manager``). The orchestrator's next sweep cycle will
+      advance the task. Operator does nothing for now.
+    - ``OPERATOR_ACTION_REQUIRED`` -- none of the above conditions match:
+      no marker, no pending-dep, no recovery signal. Includes manual gates
+      (``DO NOT CLAIM``), unknown marker targets, and cascade-stuck states.
+      Operator must act.
     """
 
     AUTO_CLEARING_VIA_PROPOSAL = "auto-clearing"
-    AWAITING_AUTO_RECOVERY = "awaiting-recovery"
-    NEEDS_OPERATOR_ATTENTION = "needs-attention"
+    AWAITING_AMENDMENT_RECOVERY = "awaiting-amendment-recovery"
+    AWAITING_DEPENDENCY = "awaiting-dependency"
+    HELD = "held"
+    BLOCKED_ON_HELD = "blocked-on-held"
+    OPERATOR_ACTION_REQUIRED = "operator-action-required"
 
 
 # Recovery audit-comment heuristics. Used by ``classify_blocked_task``
@@ -172,10 +183,11 @@ class BlockedTaskState(Enum):
 # on the next iteration. The agent-tag and body-pattern allowlists keep
 # the heuristic narrow so unrelated [BLOCKED] comments do not trigger.
 _RECOVERY_AGENT_TAGS: frozenset[str] = frozenset(
-    {"agent/orchestrator", "agent/blocker_resolver", "agent/manifest_amender"}
+    {"agent/orchestrator", "agent/blocker_resolver", "agent/manifest_amender", "agent/backlog_manager"}
 )
 _RECOVERY_BODY_RE: re.Pattern[str] = re.compile(
-    r"amendment-reject|out-of-scope|ALL_REVIEWS_FAILED|REVIEW_REJECTED",
+    r"amendment-reject|out-of-scope|ALL_REVIEWS_FAILED|REVIEW_REJECTED"
+    r"|dependency .* not yet terminal|dep .* not yet terminal",
     re.IGNORECASE,
 )
 _BLOCKED_AUDIT_RE: re.Pattern[str] = re.compile(
@@ -261,48 +273,48 @@ def classify_blocked_task(
     now: datetime | None = None,
     recovery_window_seconds: int | None = None,
 ) -> BlockedTaskState:
-    """Classify ``task_id`` into one of the three blocked-task states.
+    """Classify ``task_id`` into one of the six blocked-task states.
 
-    Caller is responsible for having already determined the task is
-    currently in ``blocked`` status; this function does not re-check status.
+    Decision priority (first match wins):
 
-    The classifier returns ``AUTO_CLEARING_VIA_PROPOSAL`` when the
-    standard cascade conditions are met. When no marker is present, it
-    checks three recovery signals (pending proposal JSON, rejected-
-    amendment archive, recent recovery audit comment) and returns
-    ``AWAITING_AUTO_RECOVERY`` if any signal is positive. Everything
-    else falls through to ``NEEDS_OPERATOR_ATTENTION``.
+    1. ``HELD`` -- the task's own status in the backlog index is ``hold``.
+    2. ``BLOCKED_ON_HELD`` -- the task carries a ``[BLOCKED_PENDING_PROPOSAL]``
+       marker whose target is in ``hold``.
+    3. ``AUTO_CLEARING_VIA_PROPOSAL`` -- at least one non-terminal, non-HOLD
+       marker target exists; the ADR-07 cascade is in flight.
+    4. ``AWAITING_DEPENDENCY`` -- no marker present, but a regular
+       Dependencies-table row points at a non-terminal task.
+    5. ``AWAITING_AMENDMENT_RECOVERY`` -- no marker, no pending dep, but at
+       least one recovery signal is on disk (pending proposal JSON,
+       rejected-amendment archive, or a recent ``[BLOCKED]`` audit comment
+       from a recovery agent).
+    6. ``OPERATOR_ACTION_REQUIRED`` -- none of the above; operator must act.
 
-    The optional ``workspace_root`` enables the recovery checks (they
-    read ``.devbench/proposals/`` and ``.devbench/rejected-requests/``).
-    Older callers that only have ``backlog_root`` + ``backlog_index``
-    keep the original two-state behaviour. Production callers always
-    pass ``workspace_root``.
+    The optional ``workspace_root`` enables recovery checks (all three recovery
+    signals under ``AWAITING_AMENDMENT_RECOVERY``). Callers that pass only
+    ``backlog_root`` + ``backlog_index`` skip the recovery-signal checks and
+    fall through directly to ``OPERATOR_ACTION_REQUIRED`` when no marker /
+    dep is present.
     """
+    # Priority 1: HELD -- the task itself is in hold status.
+    if _task_status_is_hold(backlog_root, backlog_index, task_id):
+        return BlockedTaskState.HELD
+
     source_file = _find_source_task_file(backlog_root, backlog_index, task_id)
     if source_file is None:
-        return BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+        return BlockedTaskState.OPERATOR_ACTION_REQUIRED
 
     mgr = BacklogManager()
     marker_ids = mgr._extract_pending_proposal_markers(source_file)
 
-    # Issue #149: when markers are absent OR every marker is already terminal
-    # (i.e. the cascade has nothing left to do), regular task-level
-    # dependencies still in flight should keep the task in
-    # AWAITING_AUTO_RECOVERY rather than escalating to NEEDS_OPERATOR_ATTENTION.
-    # Only when the markers are closed AND the regular deps are satisfied
-    # do we surface the task to the operator-attention pile.
-    deps_unsatisfied = _regular_deps_unsatisfied(backlog_root, backlog_index, task_id)
-
     if marker_ids:
-        marker_state = _classify_with_markers(mgr, backlog_index, marker_ids)
-        if marker_state is BlockedTaskState.NEEDS_OPERATOR_ATTENTION and deps_unsatisfied:
-            return BlockedTaskState.AWAITING_AUTO_RECOVERY
-        return marker_state
+        return _classify_with_markers(mgr, backlog_index, marker_ids)
 
-    if deps_unsatisfied:
-        return BlockedTaskState.AWAITING_AUTO_RECOVERY
+    # Priority 4: AWAITING_DEPENDENCY -- regular deps still in flight, no marker.
+    if _regular_deps_unsatisfied(backlog_root, backlog_index, task_id):
+        return BlockedTaskState.AWAITING_DEPENDENCY
 
+    # Priority 5 / 6: recovery signals or operator attention.
     return _classify_recovery_or_attention(
         source_file=source_file,
         task_id=task_id,
@@ -312,12 +324,31 @@ def classify_blocked_task(
     )
 
 
+def _task_status_is_hold(backlog_root: Path, backlog_index: Path, task_id: str) -> bool:
+    """Return ``True`` iff ``task_id``'s status in the backlog index is ``hold``.
+
+    Used by ``classify_blocked_task`` as the first-priority check for ``HELD``.
+    Falls back to ``False`` on any parse error so a broken index does not mask
+    a genuine blocked state.
+    """
+    try:
+        parser = BacklogParser(backlog_root=backlog_root, backlog_index=backlog_index)
+        units = parser.parse_index()
+    except (FileNotFoundError, ValueError):
+        return False
+    for unit in units:
+        if unit.id == task_id:
+            return unit.status.value.lower() == STATUS_HOLD
+    return False
+
+
 def _regular_deps_unsatisfied(backlog_root: Path, backlog_index: Path, task_id: str) -> bool:
     """Return ``True`` iff ``task_id``'s declared dependencies are NOT all terminal.
 
-    Issue #149: ``classify_blocked_task`` consults this to keep tasks whose
-    regular task-level deps are still running in ``AWAITING_AUTO_RECOVERY``
-    rather than incorrectly promoting them to the operator-attention pile.
+    ``classify_blocked_task`` consults this after the marker check to keep
+    tasks whose regular task-level deps are still running in
+    ``AWAITING_DEPENDENCY`` rather than incorrectly promoting them to the
+    operator-attention pile.
     Falls back to ``False`` (deps satisfied) when the parser cannot load
     the index -- the broken-index case is reported by validate-backlog and
     must not generate spurious operator alerts here.
@@ -339,119 +370,38 @@ def _classify_with_markers(
     backlog_index: Path,
     marker_ids: set[str],
 ) -> BlockedTaskState:
-    """Resolve AUTO_CLEARING_VIA_PROPOSAL vs NEEDS_OPERATOR_ATTENTION when markers exist.
+    """Resolve the marker-present branch into one of three states.
 
-    Extracted so ``classify_blocked_task`` stays under ruff's PLR0911
-    return-statement ceiling. Returns NEEDS_OPERATOR_ATTENTION when
-    the backlog index is missing, when any marker target is unknown,
-    when any marker target is in HOLD (operator-held; cascade cannot
-    fire while the target is non-terminal and HOLD is non-terminal),
-    or when every marker is already terminal (cascade should have
-    fired and did not). Otherwise the cascade is in flight.
+    Priority within markers (first match wins):
+
+    - ``BLOCKED_ON_HELD`` -- any marker target is in ``hold`` status.
+      The cascade cannot fire while the target is non-terminal and HOLD
+      is non-terminal; operator must resume the held target.
+    - ``OPERATOR_ACTION_REQUIRED`` -- backlog index missing, any marker
+      target unknown to the index, or every marker is already terminal
+      (cascade should have fired and did not).
+    - ``AUTO_CLEARING_VIA_PROPOSAL`` -- at least one non-terminal,
+      non-HOLD marker target exists; the ADR-07 cascade is in flight.
     """
     try:
         rows = mgr._parse_backlog_rows(backlog_index)
     except FileNotFoundError:
-        return BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+        return BlockedTaskState.OPERATOR_ACTION_REQUIRED
     status_by_id = {row_id: status for row_id, status, _ in rows if row_id}
 
     terminal = {STATUS_DONE, STATUS_DECLINED}
     non_terminal_marker_found = False
     for marker in marker_ids:
         if marker not in status_by_id:
-            return BlockedTaskState.NEEDS_OPERATOR_ATTENTION
-        # Issue #168 (3-panel surfacing): a HOLD marker target means the
-        # operator placed the dep on hold deliberately. The cascade cannot
-        # fire (HOLD is non-terminal) and no automation will clear it.
-        # Surface to operator-attention so the report reflects reality.
+            return BlockedTaskState.OPERATOR_ACTION_REQUIRED
         if status_by_id[marker] == STATUS_HOLD:
-            return BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+            return BlockedTaskState.BLOCKED_ON_HELD
         if status_by_id[marker] not in terminal:
             non_terminal_marker_found = True
 
     if not non_terminal_marker_found:
-        return BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+        return BlockedTaskState.OPERATOR_ACTION_REQUIRED
     return BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL
-
-
-def panel3_annotation(
-    backlog_root: Path,
-    backlog_index: Path,
-    task_id: str,
-) -> tuple[int, str | None, str]:
-    """Return (group_rank, hold_target_id, annotation) for a panel-3 row.
-
-    Used by the reporter to render BLOCKED tasks routed to
-    ``NEEDS_OPERATOR_ATTENTION`` with a sub-case-specific annotation
-    AND a sort key that clusters rows by cause.
-
-    Group ranks (lower sorts first):
-
-    - 1 -- BLOCKED waiting on a HOLD unit (annotation ``[HOLD: <id>]``)
-    - 2 -- no marker present (annotation ``[no marker]``)
-    - 3 -- marker target unknown to backlog index (annotation
-      ``[marker target unknown: <id>]``)
-    - 4 -- marker targets all terminal; cascade should have fired
-      (annotation ``[marker targets all terminal]``)
-    - 5 -- fallback when none of the above match (annotation
-      ``[needs review]``)
-
-    Group rank 0 is reserved for HOLD work units themselves (the
-    reporter inserts those directly without calling this helper).
-
-    Pure read; never mutates the backlog.
-    """
-    return _panel3_annotation_impl(backlog_root, backlog_index, task_id)
-
-
-def _panel3_annotation_impl(
-    backlog_root: Path,
-    backlog_index: Path,
-    task_id: str,
-) -> tuple[int, str | None, str]:
-    """Implementation split out so ``panel3_annotation`` keeps its public
-    signature stable while the branch logic stays under ruff's PLR0911
-    return-statement ceiling.
-    """
-    source_file = _find_source_task_file(backlog_root, backlog_index, task_id)
-    if source_file is None:
-        return (5, None, "[needs review]")
-
-    mgr = BacklogManager()
-    marker_ids = mgr._extract_pending_proposal_markers(source_file)
-    if not marker_ids:
-        return (2, None, "[no marker]")
-
-    try:
-        rows = mgr._parse_backlog_rows(backlog_index)
-    except FileNotFoundError:
-        return (5, None, "[needs review]")
-    status_by_id = {row_id: status for row_id, status, _ in rows if row_id}
-
-    sorted_markers = sorted(marker_ids)
-    return _panel3_classify_markers(sorted_markers, status_by_id)
-
-
-def _panel3_classify_markers(
-    sorted_markers: list[str],
-    status_by_id: dict[str, str],
-) -> tuple[int, str | None, str]:
-    """Classify a sorted marker-id list against the backlog index into
-    one of the panel-3 sub-cases. Returns ``(group_rank, hold_target_id,
-    annotation)``."""
-    hold_match = next((m for m in sorted_markers if status_by_id.get(m) == STATUS_HOLD), None)
-    if hold_match is not None:
-        return (1, hold_match, f"[HOLD: {hold_match}]")
-
-    unknown_match = next((m for m in sorted_markers if m not in status_by_id), None)
-    if unknown_match is not None:
-        return (3, None, f"[marker target unknown: {unknown_match}]")
-
-    terminal = {STATUS_DONE, STATUS_DECLINED}
-    if all(status_by_id[m] in terminal for m in sorted_markers):
-        return (4, None, "[marker targets all terminal]")
-
-    return (5, None, "[needs review]")
 
 
 def _classify_recovery_or_attention(
@@ -462,37 +412,37 @@ def _classify_recovery_or_attention(
     now: datetime | None,
     recovery_window_seconds: int | None,
 ) -> BlockedTaskState:
-    """Resolve AWAITING_AUTO_RECOVERY vs NEEDS_OPERATOR_ATTENTION when no marker exists.
+    """Resolve AWAITING_AMENDMENT_RECOVERY vs OPERATOR_ACTION_REQUIRED when no marker or dep exists.
 
     Older callers that pass no ``workspace_root`` get
-    NEEDS_OPERATOR_ATTENTION immediately (legacy two-state behaviour).
+    ``OPERATOR_ACTION_REQUIRED`` immediately (legacy two-state behaviour).
     The three recovery signals are checked cheapest-first: file-presence
     > glob-match > timestamp-window read of the source file.
     """
     if workspace_root is None:
-        return BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+        return BlockedTaskState.OPERATOR_ACTION_REQUIRED
     if _has_pending_proposal_json(workspace_root, task_id):
-        return BlockedTaskState.AWAITING_AUTO_RECOVERY
+        return BlockedTaskState.AWAITING_AMENDMENT_RECOVERY
     if _has_rejected_amendment_archive(workspace_root, task_id):
-        return BlockedTaskState.AWAITING_AUTO_RECOVERY
+        return BlockedTaskState.AWAITING_AMENDMENT_RECOVERY
     effective_now = now if now is not None else datetime.now(UTC)
     effective_window = (
         recovery_window_seconds if recovery_window_seconds is not None else DEFAULT_BLOCKED_RECOVERY_WINDOW_SECONDS
     )
     if _recent_recovery_audit_comment(source_file, effective_now, effective_window):
-        return BlockedTaskState.AWAITING_AUTO_RECOVERY
-    return BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+        return BlockedTaskState.AWAITING_AMENDMENT_RECOVERY
+    return BlockedTaskState.OPERATOR_ACTION_REQUIRED
 
 
 def recovery_signal_for_task(workspace_root: Path, task_id: str) -> str:
-    """Return a one-line annotation naming the recovery signal source.
+    """Return a one-line annotation naming the AWAITING_AMENDMENT_RECOVERY signal source.
 
-    Used by the report renderer to annotate ``AWAITING_AUTO_RECOVERY``
+    Used by the report renderer to annotate ``AWAITING_AMENDMENT_RECOVERY``
     rows with a ``[recovery: ...]`` suffix so operators see WHY devbench
     thinks the task will recover. Falls back to the audit-comment label
     when neither the pending-proposal JSON nor the rejected-amendment
     archive is present (the classifier already decided this task
-    qualifies; this helper only labels it).
+    qualifies; this helper only labels the source).
     """
     if _has_pending_proposal_json(workspace_root, task_id):
         return f"pending proposal at .devbench/proposals/{task_id}.json"
@@ -699,7 +649,7 @@ class CascadeDepthError(RuntimeError):
     """Raised when a proposal would exceed ``orchestrate.max_cascade_depth``.
 
     Issue #144. Caught by ``cmd_materialise_proposal`` to escalate the
-    source task to ``NEEDS_OPERATOR_ATTENTION`` instead of materialising
+    source task to ``OPERATOR_ACTION_REQUIRED`` instead of materialising
     another recovery layer. Living-on-its-own exception class so callers
     can ``except CascadeDepthError`` without coupling to the broader
     ``ProposalError`` family.

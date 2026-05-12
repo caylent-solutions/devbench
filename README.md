@@ -2,7 +2,7 @@
 
 An LLM-as-Judge orchestration system that processes a backlog of work units autonomously. Development agents write code; judge agents review it. All review decisions come from Claude LLM evaluation; there are no hard-coded pass/fail rules.
 
-> **Upgrading from a previous version?** See [docs/upgrade-guide.md](docs/upgrade-guide.md) for the migration walkthrough. The TL;DR is `pip install -U devbench && devbench upgrade` (idempotent; safe to re-run).
+> **Upgrading from a previous version?** See [docs/upgrade-guide.md](docs/upgrade-guide.md) for the migration walkthrough. The TL;DR is `git pull && make install && make plugin-install && uv run devbench upgrade` (idempotent; safe to re-run).
 
 ## 60-second overview
 
@@ -43,17 +43,9 @@ The judge / agent layer:
 | 7 | Recovery | `blocker-resolver` | Decomposes amendment rejects into proposals |
 | 8 | Recovery | `task-factory` | Materialises draft work units from proposals |
 
-### Try it now (5 commands)
+## Try it now
 
-```bash
-git clone <this-repo> && cd devbench
-make install
-make plugin-install
-export JUDGE_WORKSPACE_ROOT=/path/to/your-backlog JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1
-uv run devbench status
-```
-
-If `devbench status` prints a backlog summary, you are ready to launch an orchestration session (see [Interactive Mode](#interactive-mode)). If it fails, see [Troubleshooting](#troubleshooting) or the full install walkthrough in [Workspace Setup](#workspace-setup).
+Going from a clean machine to a running orchestrator takes ten numbered steps. The walkthrough lives in [docs/zero-to-ready.md](docs/zero-to-ready.md) -- prerequisites verification, clone + install, Claude / Bedrock auth, workspace-root setup, YAML config, minimum-viable backlog, validation, and launch. Every command in that guide has been end-to-end execution-validated against the SHA stamped at the bottom of the doc.
 
 ### Where to go next
 
@@ -74,6 +66,7 @@ Pick the doc closest to your role.
 - [Make targets](#make-targets)
 - [Configuration](#configuration)
 - [Workspace setup](#workspace-setup)
+- [Real-world backlog examples](#real-world-backlog-examples)
 - [Interactive mode](#interactive-mode)
 - [Remote EC2 dev environments](#remote-ec2-dev-environments)
 - [Troubleshooting](#troubleshooting)
@@ -176,12 +169,12 @@ uv run devbench <command> [args]
 ```bash
 make install              # Install runtime and dev dependencies
 make plugin-install       # Register the devbench plugin at user scope
-make start-interactive    # Auth GitHub, launch interactive Claude session
-make start                # Auth GitHub, launch the orchestrator
+make start-interactive    # Launch interactive Claude session with devbench plugin
+make start                # Launch the orchestrator via Agent SDK (non-interactive)
 make validate             # Full validation: lint + type check + tests + coverage
-make lint                 # ruff + bandit
+make lint                 # ruff + bandit + no-duplicates guard
 make format               # Auto-format with ruff
-make check                # lint + mypy
+make typecheck            # mypy type checking
 make test                 # All tests (unit + functional)
 make report               # Show backlog progress report
 make report-session       # Show progress since a timestamp (SINCE=<iso-ts>)
@@ -301,6 +294,55 @@ cd /path/to/devbench && watch -n 30 \
 ```
 
 In the interactive session, set the model with `/model` if needed, then ask: `Run the devbench:orchestrate skill to process the backlog`.
+
+### Starting devbench without make
+
+The `make start-interactive` and `make start` targets are thin wrappers. If you need to invoke the underlying commands directly (for example, in CI scripts or remote shells where `make` is unavailable), use these equivalents.
+
+**Interactive with `--dangerously-skip-permissions` (default `make start-interactive`)**
+
+```bash
+JUDGE_WORKSPACE_ROOT=/path/to/my-backlog \
+JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+claude --dangerously-skip-permissions --plugin-dir /path/to/devbench/plugin/devbench
+```
+
+**Interactive without `--dangerously-skip-permissions` (equivalent to `JUDGE_SAFE_PERMISSIONS=1 make start-interactive`)**
+
+```bash
+JUDGE_WORKSPACE_ROOT=/path/to/my-backlog \
+JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+claude --plugin-dir /path/to/devbench/plugin/devbench
+```
+
+Setting `JUDGE_SAFE_PERMISSIONS=1` when invoking `make start-interactive` selects the no-flag variant above. This is the safe-mode opt-out for environments that require explicit permission prompts.
+
+**Non-interactive (equivalent to `make start`)**
+
+```bash
+JUDGE_WORKSPACE_ROOT=/path/to/my-backlog \
+JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+uv run python -m devbench.cli start
+```
+
+## Real-world backlog examples
+
+Worked examples of real specs promoted into validated DevBench backlogs.
+Each example ships the locked spec, the authored `backlog/` tree, the
+`devbench.yaml` configuration, the operator launch commands, and a
+step-by-step `how-it-was-made.md` describing the authoring journey. Each
+example uses the same **before / after** layout: `before/` is the
+validated, ready-to-run backlog; `after/` (when populated) is the
+post-execution snapshot showing what DevBench actually produced.
+
+| Example | Mode | Repos | Work units | Status |
+|---|---|---|---|---|
+| [`examples/backlogs/brownfield/multi-repo_single-pr_no-merge/`](examples/backlogs/brownfield/multi-repo_single-pr_no-merge/) | `single_branch` + `defer_pr` + `auto_finalize` + `auto_merge` + `ci_failure_retry` (no manual merge step) | 3 (caylent-solutions/kanon, caylent/caylent-private-kanon, caylent/kanon-claude-marketplaces) | 207 across 13 epics + 14 features | `before/` ready; `after/` Coming Soon |
+
+More examples land here as backlogs are authored. Each example targets a
+distinct DevBench mode (single-repo vs multi-repo, paused-merge vs
+auto-merge, greenfield vs brownfield) so operators can pick the closest
+match to their own setup and copy it as a starting point.
 
 ## Interactive mode
 

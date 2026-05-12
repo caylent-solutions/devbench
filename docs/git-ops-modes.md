@@ -13,7 +13,7 @@ specifically about the per-task git workflow after reviews pass.
 | Mode | YAML knobs | Per-task PR? | Auto-merge? | Use when... |
 |------|------------|--------------|-------------|-------------|
 | Multi-PR (default) | _none_ | Yes | Yes (on green CI) | You trust judges + CI to gate; no human review needed per PR. |
-| Single-branch + defer-PR | `git_ops.single_branch: <branch>` + `git_ops.defer_pr: true` | No (one batch PR) | Yes (via `git-ops-finalize`) | You want one PR for the whole batch (e.g., dependent tasks must land atomically). |
+| Single-branch + defer-PR | `git_ops.single_branch: <branch>` + `git_ops.defer_pr: true` | No (one batch PR) | No by default; opt-in via `git_ops.auto_merge: true` (requires `auto_finalize: true`; CI watcher must report GREEN before merge fires) | You want one PR for the whole batch (e.g., dependent tasks must land atomically). |
 | Pause-before-merge (#101) | `git_ops.pause_before_merge: true` | Yes | No -- waits for human merge | You want per-task granularity AND per-PR human gating without blocking the orchestrator. |
 | Local-only | `git_ops.single_branch: <branch>` + `git_ops.defer_pr: true` + `git_ops.local_only: true` | No (no PR ever) | N/A (no remote) | Operational workflows -- AWS teardowns, evidence capture, scheduled audits -- where devbench drives work but the target "repo" has no GitHub remote and never pushes. See [`operational-work.md`](operational-work.md). |
 
@@ -83,6 +83,86 @@ Use when:
 - One review for the whole epic / feature is more efficient than per-task
   review.
 - Per-PR review noise is not worth the bookkeeping cost.
+
+### Post-finalize CI watching and failure resolution
+
+After `git-ops-finalize` creates the batch PR it calls
+`GitOpsService.wait_for_checks_and_classify(pr_url, repo_path)`, which
+wraps `gh pr checks --watch` and classifies the outcome into one of four
+`CIResult` values:
+
+- `CIResult.GREEN` -- every check passed. `git-ops-finalize` logs
+  `[CI_GREEN]` and returns rc=0. **The PR is left open for human merge
+  by default.** When `git_ops.auto_merge: true` is set (requires
+  `git_ops.auto_finalize: true`), the orchestrator's auto-merge check
+  (SKILL.md step 11c) invokes `gh pr merge` automatically once the CI
+  watcher reports GREEN.
+
+- `CIResult.FAILED_KNOWN_TASK(task_id)` -- the failing job's log
+  contains exactly one `[E<n>-...-T<n>]` commit marker that traces the
+  failure to a single task. `git-ops-finalize` writes a recovery-proposal
+  JSON at `<workspace>/.devbench/proposals/<task_id>.json`, transitions
+  the named task to `blocked` with a `[CI_FAILED_BATCH_PR] <log_path>`
+  audit comment, and returns rc=2. Cascade-cap interaction: if the
+  offending task is already at cascade depth N-1 (controlled by
+  `orchestrate.max_cascade_depth`), the recovery proposal is skipped and
+  the task transitions to blocked with a `[CI_FAILED_CASCADE_CAPPED]` audit
+  comment (which the blocked-task classifier resolves to
+  `OPERATOR_ACTION_REQUIRED`).
+
+- `CIResult.FAILED_UNKNOWN` -- a failure is detected but cannot be
+  attributed to a single task (no marker present, multiple distinct
+  markers found, or the job log was unreachable). `git-ops-finalize`
+  transitions the most-recent in-review/done task to `blocked` with the
+  same `[CI_FAILED_BATCH_PR]` audit comment shape and returns rc=2.
+
+- `CIResult.TIMEOUT` -- `gh pr checks --watch` exceeded the configured
+  timeout. `git-ops-finalize` logs `[CI_WATCH_TIMEOUT]` and returns rc=2
+  without changing any task statuses; the operator decides the next step.
+
+### Auto-finalize and auto-merge toggles
+
+Two optional boolean knobs control whether the orchestrate skill invokes
+`git-ops-finalize` automatically and whether it merges the batch PR after
+CI turns green.
+
+| `auto_finalize` | `auto_merge` | Behaviour |
+|-----------------|--------------|-----------|
+| `false` (default) | `false` (default) | Manual flow preserved: operator runs `devbench git-ops-finalize` by hand; merge is a human decision. |
+| `true` | `false` | Orchestrate skill invokes `git-ops-finalize` once every actionable unit reaches a terminal state. PR is created and CI is watched (see [Post-finalize CI watching](#post-finalize-ci-watching-and-failure-resolution)); **not merged** -- merging stays a human decision. |
+| `true` | `true` | Same as above; after the CI watcher reports GREEN, the skill invokes `gh pr merge` using the top-level `merge_strategy` config. Emits `[BATCH_PR_MERGED] <pr_url>` on the orchestrator log. |
+| `false` | `true` | **Rejected at config-load time.** `auto_merge: true` requires `auto_finalize: true`. |
+
+Re-entry guards prevent duplicate operations: a marker file at
+`<workspace>/.devbench/auto-finalize-fired-<repo>.marker` is written
+after a successful finalize; `<workspace>/.devbench/auto-merge-fired-<repo>.marker`
+is written after a successful merge. Subsequent orchestrate iterations
+short-circuit when the marker is present.
+
+#### Schema-validation rules
+
+The schema rejects the following combinations at config-load time:
+
+- `auto_finalize: true` without `defer_pr: true` -- `auto_finalize` is
+  meaningful only in single-PR mode. Validator emits a clear error.
+- `auto_finalize: true` + `pause_before_merge: true` -- already mutually
+  exclusive via `defer_pr`; the validator enforces this directly.
+- `auto_finalize: true` + `local_only: true` -- rejected at config-load
+  time; local-only repos have no remote to push to, so git-ops-finalize
+  cannot create a PR.
+- `auto_merge: true` without `auto_finalize: true` -- rejected; the
+  combination is meaningless (no PR would be created to merge).
+- `auto_merge: true` + `local_only: true` -- rejected; no remote means
+  no PR means nothing to merge.
+
+#### Dependency on the CI watcher (E7)
+
+`auto_merge: true` depends on the CI watcher reporting GREEN before the
+merge fires. See [Post-finalize CI watching and failure resolution](#post-finalize-ci-watching-and-failure-resolution)
+for the four `CIResult` values and how each affects the merge decision.
+When the CI watcher is absent (E7 not yet deployed), `auto_merge: true`
+short-circuits with a `[AUTO_MERGE_SKIPPED] no_ci_watcher` audit row and
+the operator must merge manually.
 
 ## Pause-before-merge mode (#101)
 

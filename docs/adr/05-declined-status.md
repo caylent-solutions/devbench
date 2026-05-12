@@ -49,7 +49,7 @@ uv run devbench decline <id> --reason "<message>"
 **Negative.**
 
 - The BACKLOG.md Status Summary table grew one column. Consumers that hand-wrote parsers against the old 4-count shape need to accept 5 counts. The code-path parser already handles both.
-- `WorkUnitStatus` now has 7 values. Every touch site (`_RAW_STATUS_TO_ENUM`, `VALID_STATUSES`, `DISPLAY_STATUS_VALUES`, `TABLE_STATUS_VALUES`, tests that assert on the full set) had to be updated -- mechanical change, but non-zero surface area.
+- `WorkUnitStatus` now has 8 values. Every touch site (`_RAW_STATUS_TO_ENUM`, `VALID_STATUSES`, `DISPLAY_STATUS_VALUES`, `TABLE_STATUS_VALUES`, tests that assert on the full set) had to be updated -- mechanical change, but non-zero surface area.
 
 ## Alternatives considered
 

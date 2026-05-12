@@ -9,8 +9,8 @@
 
 `devbench report` historically re-parsed the entire `logs/orchestrator.log`,
 walked every `backlog/**/*.md` file, and recomputed every metric on every
-invocation. On a 50 MB log, mature workspaces saw tens of seconds per render.
-Watch-mode multiplied that cost by every refresh tick.
+invocation. On large mature workspaces the render latency grew noticeably with
+log volume. Watch-mode multiplied that cost by every refresh tick.
 
 The bottleneck was Python-bound parse + aggregation work, not disk I/O. The
 log is append-only by orchestrator contract, so almost every byte we
@@ -48,9 +48,9 @@ lexicographically. Indexed range scans give correct windowed-query semantics.
 - **JSON file per source.** Simpler than SQLite but loses the indexed range
   scan that windowed queries need; would still O(events) on every report
   invocation.
-- **In-memory daemon (RFC #165).** Faster warm path (~2-5 ms vs ~5-15 ms) but
-  pays 500-1000 ms cold-spawn on first call after every reboot or idle-reap;
-  net negative for one-shot invocations on a single-operator workload.
+- **In-memory daemon (RFC #165).** Faster warm path but pays a noticeable
+  cold-spawn penalty on first call after every reboot or idle-reap; net
+  negative for one-shot invocations on a single-operator workload.
   Deferred as RFC.
 - **Distributed sharded backend (RFC #166).** Multi-operator + persistent-
   beyond-workstation; not needed for the current operating model. Deferred
@@ -58,15 +58,15 @@ lexicographically. Indexed range scans give correct windowed-query semantics.
 
 ## Consequences
 
-- Warm `devbench report` runs in single-digit milliseconds against a 50 MB
-  log workspace -- bounded by render code, not data fetch.
+- Warm `devbench report` latency is bounded by render code, not data fetch,
+  even on large log workspaces.
 - Cache rebuilds itself from scratch when the JSONL log is the source of
   truth (cache deletion is harmless and self-healing).
-- A new module (`devbench.reporting.event_index`) joins the coverage gate at
-  100% line + branch.
+- A new module (`devbench.reporting.event_index`) is tested in
+  `tests/test_reporting/test_event_index.py`.
 - The reporter's `_compute_window_stats` and session-boundary detector each
   gain an indexed code path alongside the legacy parser path; parity tests
-  pin the two paths byte-for-byte.
+  assert that the indexed and parser paths produce identical aggregated results.
 
 ## References
 

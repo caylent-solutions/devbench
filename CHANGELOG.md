@@ -109,7 +109,7 @@ since the last release. PR #119 carries every change.
   `tests/test_cli.py::TestCmdMaterialiseProposalLifecycleGates`.
 - **Bounded recovery-cascade depth** (issue #144). Proposals carry a
   `cascade_depth` field (`parent_depth + 1`); the new
-  `orchestrate.max_cascade_depth` YAML knob (default 3, env override
+  `orchestrate.max_cascade_depth` YAML knob (default 2, env override
   `JUDGE_ORCHESTRATE_MAX_CASCADE_DEPTH`) caps recursion. At cap, the
   source task transitions to `NEEDS_OPERATOR_ATTENTION` rather than
   materialising a deeper draft. Pinned by

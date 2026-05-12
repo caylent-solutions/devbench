@@ -1899,6 +1899,133 @@ class TestAppendTddEntry:
 
         assert "\u2014" not in wu.read_text(encoding="utf-8")
 
+    def test_append_tdd_entry_lands_inside_tdd_cycle_log_when_comments_follows(self, tmp_path: Path) -> None:
+        """AC-FUNC-001/AC-FUNC-003/AC-CYCLE-001: Entries land between TDD Log and Comments.
+
+        Builds a fixture with canonical section order (## TDD Cycle Log then
+        ## Comments), calls _append_tdd_entry three times, and asserts:
+        (a) all three entries appear between ## TDD Cycle Log and ## Comments,
+        (b) ## Comments content is byte-for-byte unchanged,
+        (c) no extra blank lines are introduced between successive entries.
+        """
+        # Canonical order: ## TDD Cycle Log comes before ## Comments.
+        fixture = (
+            "# E6-F1-S1-T1: Section-aware TDD Test\n\n"
+            "## Status: in-progress\n\n"
+            "## TDD Cycle Log\n\n"
+            "<!-- entries go here -->\n\n"
+            "## Comments\n\n"
+            "<!-- comments go here -->\n"
+        )
+        wu = tmp_path / "E6-F1-S1-T1.md"
+        wu.write_text(fixture, encoding="utf-8")
+
+        comments_before = fixture[fixture.find("## Comments") :]
+
+        mgr = BacklogManager()
+        mgr._append_tdd_entry(wu, "RED", "red-marker-abc")
+        mgr._append_tdd_entry(wu, "GREEN", "green-marker-def")
+        mgr._append_tdd_entry(wu, "REFACTOR", "refactor-marker-ghi")
+
+        content = wu.read_text(encoding="utf-8")
+        tdd_start = content.find("## TDD Cycle Log")
+        comments_start = content.find("## Comments")
+        assert tdd_start != -1, "## TDD Cycle Log section must exist"
+        assert comments_start != -1, "## Comments section must exist"
+        assert tdd_start < comments_start, "## TDD Cycle Log must precede ## Comments"
+
+        tdd_section = content[tdd_start:comments_start]
+        assert "red-marker-abc" in tdd_section, f"RED entry not in TDD section: {tdd_section!r}"
+        assert "green-marker-def" in tdd_section, f"GREEN entry not in TDD section: {tdd_section!r}"
+        assert "refactor-marker-ghi" in tdd_section, f"REFACTOR entry not in TDD section: {tdd_section!r}"
+
+        comments_after = content[comments_start:]
+        assert comments_after == comments_before, (
+            f"## Comments section was mutated.\nBefore: {comments_before!r}\nAfter: {comments_after!r}"
+        )
+
+        # No extra blank lines between successive entries: entry lines are separated
+        # by at most one blank line (i.e., no triple-newline runs within the TDD section).
+        assert "\n\n\n" not in tdd_section, f"Extra blank lines found in TDD section: {tdd_section!r}"
+
+    def test_append_tdd_entry_appends_to_eof_when_tdd_log_is_last_section(self, tmp_path: Path) -> None:
+        """AC-FUNC-002: Falls back to EOF append when ## TDD Cycle Log is the last section."""
+        fixture = (
+            "# E6-F1-S1-T1: EOF Fallback Test\n\n"
+            "## Status: in-progress\n\n"
+            "## TDD Cycle Log\n\n"
+            "<!-- no sections after this -->\n"
+        )
+        wu = tmp_path / "E6-F1-S1-T1-eof.md"
+        wu.write_text(fixture, encoding="utf-8")
+
+        mgr = BacklogManager()
+        mgr._append_tdd_entry(wu, "RED", "eof-marker-xyz")
+
+        content = wu.read_text(encoding="utf-8")
+        tdd_start = content.find("## TDD Cycle Log")
+        entry_pos = content.find("eof-marker-xyz")
+        assert entry_pos > tdd_start, "Entry must appear after ## TDD Cycle Log heading"
+        # Must be at or near EOF -- no ## heading appears after the entry.
+        trailing = content[entry_pos:]
+        assert not any(line.startswith("## ") for line in trailing.splitlines()), (
+            f"Unexpected ## heading found after EOF-appended entry: {trailing!r}"
+        )
+
+    def test_append_tdd_entry_validate_backlog_roundtrip_parity(self, tmp_path: Path) -> None:
+        """AC-FUNC-004: validate() returns no errors after N _append_tdd_entry calls."""
+        # Build a minimum-viable backlog workspace that validate() accepts.
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+
+        unit_id = "E0-F1-S1-T1"
+        wu_content = (
+            f"# {unit_id}: Roundtrip Test\n\n"
+            f"## Status: in-progress\n\n"
+            "## Target Repository\n\n- **Repo:** `org/repo`\n\n"
+            "## Description\n\nRoundtrip fixture.\n\n"
+            "## Dependencies\n\n"
+            "| ID | Title | Status |\n"
+            "|----|-------|--------|\n"
+            "| none | | |\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-TEST-001 fixture\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `f.py` | fixture |\n\n"
+            "## Definition of Done\n\n- [ ] All ACs checked\n\n"
+            "## TDD Cycle Log\n\n"
+            "<!-- entries go here -->\n\n"
+            "## Comments\n\n"
+            "<!-- comments go here -->\n"
+        )
+        wu_path = backlog_dir / f"{unit_id}.md"
+        wu_path.write_text(wu_content, encoding="utf-8")
+
+        index_content = (
+            "# Backlog\n\n"
+            "## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked | Declined |\n"
+            "|------|-------|------|-------------|----------|---------|----------|\n"
+            "| E0 | Example | 0 | 1 | 0 | 0 | 0 |\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|-----------|\n"
+            "| E0 | Example | Epic | in-queue | None | org/repo | `backlog/E0.md` |\n"
+            f"| {unit_id} | Roundtrip Test | Task | in-progress | none | org/repo | `backlog/{unit_id}.md` |\n"
+        )
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(index_content, encoding="utf-8")
+
+        # Epic stub required by validate().
+        (backlog_dir / "E0.md").write_text("# E0: Example\n\n## Status: in-queue\n", encoding="utf-8")
+
+        mgr = BacklogManager()
+        # Append three TDD entries -- RED, GREEN, REFACTOR.
+        mgr._append_tdd_entry(wu_path, "RED", "roundtrip-red")
+        mgr._append_tdd_entry(wu_path, "GREEN", "roundtrip-green")
+        mgr._append_tdd_entry(wu_path, "REFACTOR", "No refactor needed.")
+
+        errors = mgr.validate(index_path, tmp_path)
+        assert errors == [], f"validate() reported errors after TDD entries: {errors}"
+
 
 class TestRollupParentStatusEdgeCases:
     """Test edge cases in _rollup_parent_status."""
@@ -4354,3 +4481,364 @@ class TestValidateDepCycle4Node:
         graph = BacklogManager()._build_dependency_graph(index)
         assert "E0-F1-S1-T1" in graph
         assert "short" not in graph
+
+
+class TestValidateBrokenAndCanonicalBacklogFormat:
+    """Tests for the zero-row integrity check added to BacklogManager.validate().
+
+    AC-FUNC-001: validate() returns the new integrity error when zero work-unit
+    rows are parsed from ## Full Work Unit Index.
+    AC-FUNC-002: the new error is the FIRST entry in the error list (fires before
+    rule-3 orphan checks).
+    AC-FUNC-005/006: broken and canonical fixture workspaces exist on disk.
+    AC-FUNC-007: all three tests pass.
+    """
+
+    _FIXTURES_ROOT = Path(__file__).parent.parent / "fixtures" / "backlog_format"
+
+    def test_validate_rejects_broken_backlog_format(self) -> None:
+        """Broken fixture uses a 4-column table under a non-canonical heading -- validator must reject it.
+
+        The first error must be the zero-row integrity message (AC-FUNC-002).
+        """
+        broken_root = self._FIXTURES_ROOT / "broken"
+        backlog_index = broken_root / "BACKLOG.md"
+
+        manager = BacklogManager()
+        errors = manager.validate(backlog_index, broken_root)
+
+        assert errors, "Expected at least one error from the broken fixture"
+        assert errors[0].startswith("No work-unit rows parsed from"), (
+            f"Expected zero-row error as first entry, got: {errors[0]!r}"
+        )
+        assert "## Full Work Unit Index" in errors[0]
+        assert "7-column" in errors[0] or "7" in errors[0]
+
+    def test_validate_accepts_canonical_backlog_format(self) -> None:
+        """Canonical fixture uses 7-column / ## Full Work Unit Index -- validator must accept it."""
+        canonical_root = self._FIXTURES_ROOT / "canonical"
+        backlog_index = canonical_root / "BACKLOG.md"
+
+        manager = BacklogManager()
+        errors = manager.validate(backlog_index, canonical_root)
+
+        zero_row_errors = [e for e in errors if "No work-unit rows parsed from" in e]
+        assert zero_row_errors == [], f"Canonical fixture must not trigger the zero-row error; got: {zero_row_errors}"
+
+    def test_validate_existing_canonical_fixture_still_passes(self) -> None:
+        """Regression: tests/fixtures/activity/BACKLOG.md must not trigger the zero-row error."""
+        activity_root = Path(__file__).parent.parent / "fixtures" / "activity"
+        backlog_index = activity_root / "BACKLOG.md"
+
+        manager = BacklogManager()
+        errors = manager.validate(backlog_index, activity_root)
+
+        zero_row_errors = [e for e in errors if "No work-unit rows parsed from" in e]
+        assert zero_row_errors == [], f"Activity fixture must not trigger the zero-row error; got: {zero_row_errors}"
+
+    def test_validate_skips_full_index_rows_with_wrong_cell_count(self, tmp_path: Path) -> None:
+        """Cover the cell-count-mismatch continue branch in _check_full_index_has_rows.
+
+        A row inside `## Full Work Unit Index` whose split-by-pipe cell
+        count does not equal BACKLOG_INDEX_CELL_COUNT is skipped (the
+        ``continue`` at manager.py:332). If it is the only row, the
+        zero-row integrity error fires downstream.
+        """
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text(
+            "# Backlog\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E1 | only-four | cells |\n"
+        )
+        manager = BacklogManager()
+        errors = manager.validate(backlog_index, tmp_path)
+        assert errors
+        assert any("No work-unit rows parsed from" in e for e in errors)
+
+
+# ---------------------------------------------------------------------------
+# GREEN_CHECK emoji constant used in tick-checkbox tests (U+2705)
+# ---------------------------------------------------------------------------
+_GREEN_CHECK = "\u2705"
+_EM_DASH = "\u2014"
+
+
+class TestTickCompletionCheckboxes:
+    """Tests for BacklogManager._tick_completion_checkboxes (AC-FUNC-001 through AC-FUNC-007).
+
+    E12-F1-S1-T1: helper rewrites unchecked / legacy-checked lines in
+    ## Acceptance Criteria and ## Definition of Done sections to
+    ``- [x] <content> \u2705`` (U+2705 green check, NOT U+2014 em-dash).
+    Lines outside those two sections are never modified.
+    """
+
+    # ------------------------------------------------------------------
+    # AC-FUNC-001: basic rewrite under ## Acceptance Criteria
+    # ------------------------------------------------------------------
+
+    def test_tick_completion_checkboxes_basic_ac(self, tmp_path: Path) -> None:
+        """Unchecked AC line is rewritten to checked + green-check (U+2705)."""
+        wu_file = tmp_path / "E0-F1-S1-T1.md"
+        wu_file.write_text(
+            "# E0-F1-S1-T1\n\n## Status: done\n\n## Acceptance Criteria\n\n- [ ] AC-FUNC-001: foo\n\n## Comments\n",
+            encoding="utf-8",
+        )
+
+        BacklogManager()._tick_completion_checkboxes(wu_file)
+
+        result = wu_file.read_text(encoding="utf-8")
+        assert f"- [x] AC-FUNC-001: foo {_GREEN_CHECK}" in result
+
+    # ------------------------------------------------------------------
+    # AC-FUNC-001: basic rewrite under ## Definition of Done
+    # ------------------------------------------------------------------
+
+    def test_tick_completion_checkboxes_basic_dod(self, tmp_path: Path) -> None:
+        """Unchecked DoD line is rewritten to checked + green-check (U+2705)."""
+        wu_file = tmp_path / "E0-F1-S1-T1.md"
+        wu_file.write_text(
+            "# E0-F1-S1-T1\n\n"
+            "## Status: done\n\n"
+            "## Definition of Done\n\n"
+            "- [ ] All acceptance criteria are checked.\n\n"
+            "## Comments\n",
+            encoding="utf-8",
+        )
+
+        BacklogManager()._tick_completion_checkboxes(wu_file)
+
+        result = wu_file.read_text(encoding="utf-8")
+        assert f"- [x] All acceptance criteria are checked. {_GREEN_CHECK}" in result
+
+    # ------------------------------------------------------------------
+    # AC-FUNC-003: N/A suffix preserved verbatim; green-check at end of line
+    # ------------------------------------------------------------------
+
+    def test_tick_completion_checkboxes_preserves_na_suffix(self, tmp_path: Path) -> None:
+        """N/A suffix is preserved verbatim; green-check appends at end of the full line."""
+        wu_file = tmp_path / "E0-F1-S1-T1.md"
+        na_line = "- [ ] AC-FINAL-002: ruff check ... -- N/A for Markdown Tasks (no Python source authored)"
+        wu_file.write_text(
+            f"# E0-F1-S1-T1\n\n## Acceptance Criteria\n\n{na_line}\n\n## Comments\n",
+            encoding="utf-8",
+        )
+
+        BacklogManager()._tick_completion_checkboxes(wu_file)
+
+        result = wu_file.read_text(encoding="utf-8")
+        expected = (
+            f"- [x] AC-FINAL-002: ruff check ... -- N/A for Markdown Tasks (no Python source authored) {_GREEN_CHECK}"
+        )
+        assert expected in result
+
+    # ------------------------------------------------------------------
+    # AC-FUNC-004: idempotency -- second call produces zero file changes
+    # ------------------------------------------------------------------
+
+    def test_tick_completion_checkboxes_idempotent(self, tmp_path: Path) -> None:
+        """Running the helper twice leaves the file unchanged on the second call (mtime stable)."""
+        wu_file = tmp_path / "E0-F1-S1-T1.md"
+        wu_file.write_text(
+            "# E0-F1-S1-T1\n\n"
+            "## Acceptance Criteria\n\n"
+            "- [ ] AC-FUNC-001: foo\n\n"
+            "## Definition of Done\n\n"
+            "- [ ] All ACs checked.\n\n"
+            "## Comments\n",
+            encoding="utf-8",
+        )
+
+        manager = BacklogManager()
+        manager._tick_completion_checkboxes(wu_file)
+        mtime_after_first = wu_file.stat().st_mtime_ns
+
+        manager._tick_completion_checkboxes(wu_file)
+        mtime_after_second = wu_file.stat().st_mtime_ns
+
+        assert mtime_after_first == mtime_after_second, "Second call should be a no-op: file mtime must not change"
+
+    # ------------------------------------------------------------------
+    # AC-FUNC-007: byte-level assertion -- no em-dash (U+2014) in output
+    # ------------------------------------------------------------------
+
+    def test_helper_output_has_no_em_dash(self, tmp_path: Path) -> None:
+        """Helper output contains U+2705 (green check) and zero U+2014 (em-dash)."""
+        wu_file = tmp_path / "E0-F1-S1-T1.md"
+        wu_file.write_text(
+            "# E0-F1-S1-T1\n\n"
+            "## Acceptance Criteria\n\n"
+            "- [ ] AC-FUNC-001: verify something\n\n"
+            "## Definition of Done\n\n"
+            "- [ ] All criteria met.\n",
+            encoding="utf-8",
+        )
+
+        BacklogManager()._tick_completion_checkboxes(wu_file)
+
+        raw = wu_file.read_bytes()
+        assert _GREEN_CHECK.encode("utf-8") in raw, "U+2705 green-check must appear in output"
+        assert _EM_DASH.encode("utf-8") not in raw, "U+2014 em-dash must NOT appear in output"
+
+    # ------------------------------------------------------------------
+    # Lines outside the two target sections must not be modified
+    # ------------------------------------------------------------------
+
+    def test_tick_does_not_modify_lines_outside_target_sections(self, tmp_path: Path) -> None:
+        """Checkboxes outside AC and DoD sections are never touched."""
+        wu_file = tmp_path / "E0-F1-S1-T1.md"
+        wu_file.write_text(
+            "# E0-F1-S1-T1\n\n"
+            "## Description\n\n"
+            "- [ ] some item in description\n\n"
+            "## Approach\n\n"
+            "- [ ] step one\n\n"
+            "## Acceptance Criteria\n\n"
+            "- [ ] AC-FUNC-001: real criterion\n\n"
+            "## Comments\n\n"
+            "- [ ] comment checkbox (should not be touched)\n",
+            encoding="utf-8",
+        )
+
+        BacklogManager()._tick_completion_checkboxes(wu_file)
+
+        result = wu_file.read_text(encoding="utf-8")
+        # The AC line should be ticked
+        assert f"- [x] AC-FUNC-001: real criterion {_GREEN_CHECK}" in result
+        # Lines outside the sections must remain unchanged
+        assert "- [ ] some item in description" in result
+        assert "- [ ] step one" in result
+        assert "- [ ] comment checkbox (should not be touched)" in result
+
+    # ------------------------------------------------------------------
+    # Legacy ticked-but-no-emoji lines get the green-check appended
+    # ------------------------------------------------------------------
+
+    def test_tick_adds_emoji_to_legacy_ticked_line(self, tmp_path: Path) -> None:
+        """A ``- [x] ...`` line without green-check gets the emoji appended."""
+        wu_file = tmp_path / "E0-F1-S1-T1.md"
+        wu_file.write_text(
+            "# E0-F1-S1-T1\n\n## Acceptance Criteria\n\n- [x] AC-FUNC-001: already ticked but no emoji\n",
+            encoding="utf-8",
+        )
+
+        BacklogManager()._tick_completion_checkboxes(wu_file)
+
+        result = wu_file.read_text(encoding="utf-8")
+        assert f"- [x] AC-FUNC-001: already ticked but no emoji {_GREEN_CHECK}" in result
+
+
+class TestSetStatusDoneTicks:
+    """Integration tests: _set_status with STATUS_DONE triggers _tick_completion_checkboxes.
+
+    AC-FUNC-002, AC-CYCLE-001, AC-CYCLE-003.
+    """
+
+    def _make_index(self, tmp_path: Path, unit_id: str, status: str = "in-queue") -> Path:
+        """Create a minimal BACKLOG.md with a single task row."""
+        index = tmp_path / "BACKLOG.md"
+        index.write_text(
+            "# Backlog\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|-----------|\n"
+            f"| {unit_id} | Task | Task | {status} | None | git-repo | `backlog/{unit_id}.md` |\n",
+            encoding="utf-8",
+        )
+        return index
+
+    def _make_work_unit(self, directory: Path, unit_id: str) -> Path:
+        """Create a minimal work-unit file with AC and DoD sections."""
+        wu_file = directory / f"{unit_id}.md"
+        wu_file.write_text(
+            f"# {unit_id}\n\n"
+            "## Status: in-queue\n\n"
+            "## Acceptance Criteria\n\n"
+            "- [ ] AC-FUNC-001: something\n\n"
+            "## Definition of Done\n\n"
+            "- [ ] All ACs checked.\n\n"
+            "## Comments\n",
+            encoding="utf-8",
+        )
+        return wu_file
+
+    def test_set_status_done_ticks_acs_and_dod(self, tmp_path: Path) -> None:
+        """_set_status with STATUS_DONE ticks both AC and DoD checkboxes."""
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        index = self._make_index(tmp_path, "E0-F1-S1-T1", "in-queue")
+        wu_file = self._make_work_unit(backlog_dir, "E0-F1-S1-T1")
+
+        BacklogManager()._set_status(wu_file, index, "E0-F1-S1-T1", "done")
+
+        result = wu_file.read_text(encoding="utf-8")
+        assert f"- [x] AC-FUNC-001: something {_GREEN_CHECK}" in result
+        assert f"- [x] All ACs checked. {_GREEN_CHECK}" in result
+
+    @pytest.mark.parametrize(
+        "non_done_status",
+        ["blocked", "declined", "hold", "in-queue", "in-progress", "in-review"],
+    )
+    def test_set_status_non_done_does_not_tick(self, tmp_path: Path, non_done_status: str) -> None:
+        """Non-DONE transitions leave checkboxes unchanged (AC-FUNC-006, AC-CYCLE-003)."""
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        index = self._make_index(tmp_path, "E0-F1-S1-T1", "in-queue")
+        wu_file = self._make_work_unit(backlog_dir, "E0-F1-S1-T1")
+
+        BacklogManager()._set_status(wu_file, index, "E0-F1-S1-T1", non_done_status)
+
+        result = wu_file.read_text(encoding="utf-8")
+        # Unchecked checkboxes must remain unchecked
+        assert "- [ ] AC-FUNC-001: something" in result
+        assert "- [ ] All ACs checked." in result
+        # No green-check must appear
+        assert _GREEN_CHECK not in result
+
+
+class TestRollupParentTicksCheckboxes:
+    """Rollup-driven done (AC-FUNC-005, AC-CYCLE-002): parent's AC and DoD lines tick on rollup."""
+
+    def test_rollup_parent_ticks_parent_acs_and_dod(self, tmp_path: Path) -> None:
+        """When all children are done, the parent's AC and DoD lines get ticked + green-check."""
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+
+        # Create BACKLOG.md with T1 done and T2 in-queue, plus the story
+        index = tmp_path / "BACKLOG.md"
+        index.write_text(
+            "# Backlog\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Task A | Task | done | None | git-repo | `backlog/E0-F1-S1-T1.md` |\n"
+            "| E0-F1-S1-T2 | Task B | Task | in-queue | None | git-repo | `backlog/E0-F1-S1-T2.md` |\n"
+            "| E0-F1-S1 | Story | Story | in-queue | None | git-repo | `backlog/E0-F1-S1.md` |\n",
+            encoding="utf-8",
+        )
+
+        # T2 work-unit file (we will mark this done)
+        t2_file = backlog_dir / "E0-F1-S1-T2.md"
+        t2_file.write_text("# E0-F1-S1-T2\n\n## Status: in-queue\n", encoding="utf-8")
+
+        # Story file with AC and DoD checkboxes
+        story_file = backlog_dir / "E0-F1-S1.md"
+        story_file.write_text(
+            "# E0-F1-S1\n\n"
+            "## Status: in-queue\n\n"
+            "## Acceptance Criteria\n\n"
+            "- [ ] AC-FUNC-001: story criterion\n\n"
+            "## Definition of Done\n\n"
+            "- [ ] All tasks complete.\n\n"
+            "## Comments\n",
+            encoding="utf-8",
+        )
+
+        # Mark T2 done -- should roll up the story, which should tick story's AC and DoD
+        BacklogManager()._set_status(t2_file, index, "E0-F1-S1-T2", "done")
+
+        story_result = story_file.read_text(encoding="utf-8")
+        assert "## Status: done" in story_result
+        assert f"- [x] AC-FUNC-001: story criterion {_GREEN_CHECK}" in story_result
+        assert f"- [x] All tasks complete. {_GREEN_CHECK}" in story_result

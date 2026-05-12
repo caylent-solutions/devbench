@@ -8,10 +8,10 @@
 ## Context
 
 Issue #162 Phase 6. After the Phase 1+4 cache (ADR-16 / ADR-19) lands,
-`devbench report` already runs in single-digit milliseconds on warm
-calls because the indexed event store serves windowed queries
-in microseconds and the log parser only reads appended bytes. The
-remaining cost is the per-window aggregation pass + render.
+`devbench report` already runs quickly on warm calls because the
+indexed event store serves windowed queries efficiently and the log
+parser only reads appended bytes. The remaining cost is the
+per-window aggregation pass + render.
 
 Phase 6 amortises that cost across every `devbench report` invocation
 by writing a snapshot of the rendered report to disk after every
@@ -46,9 +46,10 @@ stale file.
 
 Streaming-mode interaction. The TTY streaming default (#163, ADR-14)
 does NOT consume the snapshot: streaming polls source-file stats
-every 100 ms and triggers its own render on change. Snapshot reads
-are exclusively for `--once` / non-TTY callers (CI consumers, scripts,
-piped output). Streaming callers benefit from Phase 1+4 cache only.
+every 100 ms (`src/devbench/reporting/streaming.py:45`) and triggers
+its own render on change. Snapshot reads are exclusively for
+`--once` / non-TTY callers (CI consumers, scripts, piped output).
+Streaming callers benefit from Phase 1+4 cache only.
 
 Why text-cache vs data-cache. Caching the rendered text is the
 simplest correct solution and saves the entire aggregate + render
@@ -66,8 +67,8 @@ layer snapshot if a runtime-rendering use case emerges.
   dataclass + a re-render pass that handles renderer-runtime config.
   Substantial code surface; deferred until a real need surfaces.
 - **Always recompute from cache.** What we had before this ADR. The
-  Phase 1+4 cache makes recompute cheap (5-15 ms) but not free.
-  Snapshot reads bring it to 1-3 ms and remove the per-window
+  Phase 1+4 cache makes recompute cheap but not free.
+  Snapshot reads are cheaper still and remove the per-window
   aggregation cost entirely.
 - **Keep the snapshot in memory only.** Loses the cross-invocation
   benefit -- every `devbench report` call from a fresh process
@@ -75,8 +76,8 @@ layer snapshot if a runtime-rendering use case emerges.
 
 ## Consequences
 
-- `devbench report --once` (non-TTY) warm path: file read + print
-  (~1-3 ms), no log parse.
+- `devbench report --once` (non-TTY) warm path: file read + print,
+  no log parse.
 - `<workspace>/.devbench/report-snapshot.json` is a new disk artefact;
   appears in the upgrade-guide table; deletion is always safe.
 - Self-healing: a missing / corrupt / stale-schema snapshot returns
@@ -86,7 +87,7 @@ layer snapshot if a runtime-rendering use case emerges.
   invocation at the end of step 9. Same compute the orchestrator
   already does + a single JSON write.
 - New module (`devbench.reporting.snapshot`) joins the coverage gate
-  at 100% line + branch.
+  at 100% line (`make test-coverage-new`, Makefile:89).
 
 ## References
 

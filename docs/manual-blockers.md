@@ -11,6 +11,8 @@ Manual blockers are the canonical pattern for representing dependencies that dev
 - External-team handoffs (DNS delegations, vendor onboarding, MDM rollouts).
 - Human approval gates (compliance review, security sign-off) that produce no devbench-trackable artifact.
 
+This document covers the manual-blocker (`DO NOT CLAIM`) operator pattern. For the full taxonomy of every blocked-task class, see [block-types.md](block-types.md).
+
 ## When to use a manual blocker vs a regular dependency
 
 | Situation | Pattern |
@@ -162,17 +164,18 @@ Once the operator flips the manual blocker to `done`, every dependent that has o
 A manual blocker appears in panel 3 of the report ("Blocked tasks (needs operator attention)"):
 
 1. The blocker work unit itself appears as a row.
-2. Every dependent Task appears under the same panel with an inline annotation that names the blocker.
+2. Every dependent Task wired via `devbench add-dep` appears under "Blocked tasks (auto-clearing via proposal)" (not panel 3 / "needs operator attention"), because `add-dep` writes a `[BLOCKED_PENDING_PROPOSAL]` marker that the cascade-classifier treats as auto-resolvable (`src/devbench/backlog/proposal.py`, `_append_manual_dep_comment`). The annotation in that panel reads `[waiting on <blocker-id>]`.
 
 Panel 3 is sorted deterministically by sub-case so the operator's eye lands on related items together: HOLD work units lead, then BLOCKED tasks waiting on each HOLD unit cluster directly underneath, then residual no-marker / unknown-target / all-marker-targets-terminal cases follow.
 
 Inline annotation vocabulary:
 
 - `[HOLD]` -- the row itself is a HOLD unit (operator put it there with `devbench hold`; cleared via `devbench unhold`).
-- `[HOLD: <id>]` -- the row is a BLOCKED task whose `[BLOCKED_PENDING_PROPOSAL]` marker target is in HOLD; it cannot clear until the operator unhols the target.
+- `[HOLD: <id>]` -- the row is a BLOCKED task whose `[BLOCKED_PENDING_PROPOSAL]` marker target is in HOLD; it cannot clear until the operator unholds the target.
 - `[no marker]` -- BLOCKED with no marker and no recovery signal; operator must investigate.
 - `[marker target unknown: <id>]` -- the marker points at an ID with no backlog row; cascade cannot resolve.
 - `[marker targets all terminal]` -- every marker target reached `done` / `declined` but the cascade did not fire.
+- `[needs review]` -- fallback annotation when no other sub-case matches; operator must inspect the task manually (`src/devbench/backlog/proposal.py`, `_panel3_annotation_impl`).
 
 `HOLD` (status, not `blocked`) is the modern preferred mechanism for an intentional gate: it makes the operator intent explicit (set via `devbench hold`, cleared via `devbench unhold`), and the report surfaces it with `[HOLD]` rather than the diagnostic `[no marker]` / `[needs review]` annotation that BLOCKED-with-no-marker carries. The legacy "blocked + DO NOT CLAIM" pattern still works and is still surfaced under panel 3 (with `[no marker]` annotation) for backwards compatibility with existing manual blockers.
 

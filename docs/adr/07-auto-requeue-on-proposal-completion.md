@@ -28,7 +28,7 @@ When `promote-proposal` wires a draft as a dependency of the source (the default
 
 One marker comment per promoted draft -- embedded on the same audit line as the existing `[PROPOSAL_PROMOTED]` entry to keep the comment history compact.
 
-`BacklogManager._set_status` -- the workhorse every status write goes through -- fires a new sideways cascade called `_auto_requeue_marker_dependents` immediately before the existing `_rollup_parent_status` call when a task transitions to `done`. The sideways scan:
+`BacklogManager._set_status` -- the workhorse every status write goes through -- fires a new sideways cascade called `_auto_requeue_marker_dependents` when a task transitions to any terminal state (`done` or `declined`). When the new status is `done`, the sideways cascade runs immediately before the existing `_rollup_parent_status` call so newly-unblocked children are visible as non-terminal when the parent is evaluated. The sideways scan:
 
 1. Iterates every backlog row (not just task-factory drafts).
 2. For each `blocked` candidate whose declared dependencies include the just-completed task, extracts all `[BLOCKED_PENDING_PROPOSAL]` markers from its Comments section.
@@ -44,13 +44,13 @@ Blocks without markers are untouched. Blocks whose markers include at least one 
 - Narrow trigger. Only blocks caused by a promoted proposal chain are eligible. Review-fail blocks, git-ops-failure blocks, executor-retry-exhausted blocks, operator-set blocks, and every other non-promotion cause stay `blocked` because they carry no marker.
 - Symmetric to parent rollup. Same reactive shape, same `_set_status` seam, same file-driven discrimination. A maintainer who understands the upward cascade can reason about the sideways cascade without learning new concepts.
 - No new status. `blocked` -> `in-queue` is an existing transition; the cascade just schedules it automatically.
-- No CLI change. `promote-proposal` keeps its existing surface; the marker write is additive. `mark-done` keeps its existing signature; the cascade fires from inside `_set_status` transparently.
+- No CLI change. `promote-proposal` keeps its existing surface; the marker write is additive. `mark-done` and `mark-declined` keep their existing signatures; the cascade fires from inside `_set_status` transparently.
 - Full audit trail. `[PROPOSAL_PROMOTED]`, `[BLOCKED_PENDING_PROPOSAL]`, and `[AUTO_UNBLOCKED]` are all written to the source task's Comments section and visible in `devbench report` output.
 - Conservative on edge cases. Unknown IDs in markers (e.g. drafts later rejected and removed from the index) count as non-terminal, so a stray rejected-proposal marker can never trigger a spurious auto-requeue.
 
 **Negative.**
 
-- The cascade adds one extra backlog-parse per `mark_done` call. Scan is O(rows × blocked × markers) -- at realistic backlog sizes (hundreds of rows, single-digit blocked, single-digit markers per blocked) this is bounded well under a second, but it's not free.
+- The cascade adds one extra backlog-parse per terminal-status write (`mark_done` or `mark_declined`). Scan is O(rows × blocked × markers) -- at realistic backlog sizes (hundreds of rows, single-digit blocked, single-digit markers per blocked) this is bounded well under a second, but it's not free.
 - One more marker convention for contributors to remember. The `[BLOCKED_PENDING_PROPOSAL]` format joins `[PROPOSAL_PROMOTED]`, `[PROPOSAL_REJECTED]`, `[COMMIT_DEFERRED]`, and `[REVIEW_PASS]` in the structured-comment vocabulary.
 - The cascade is invisible when it doesn't fire. A contributor debugging a still-blocked task has to know that the absence of a marker is the reason the scan skipped it -- the debugging narrative lives in the FAQ and task-factory doc, not in the code.
 

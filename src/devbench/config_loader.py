@@ -80,6 +80,15 @@ from devbench.constants import (
     DEFAULT_TOKEN_COST_PER_M_OUTPUT,
 )
 
+# ---------------------------------------------------------------------------
+# Audit-row string constants for auto_finalize / auto_merge skill steps.
+# Pinned here so SKILL.md prose and tests reference the same literals.
+# ---------------------------------------------------------------------------
+AUTO_FINALIZE_SKIPPED_LOCAL_ONLY: str = "[AUTO_FINALIZE_SKIPPED] local_only=true"
+AUTO_MERGE_SKIPPED_NO_CI_WATCHER: str = "[AUTO_MERGE_SKIPPED] no_ci_watcher"
+BATCH_PR_CREATED_AUDIT_PREFIX: str = "[BATCH_PR_CREATED]"
+BATCH_PR_MERGED_AUDIT_PREFIX: str = "[BATCH_PR_MERGED]"
+
 
 def _load_per_judge_retries(raw_value: object) -> dict[str, int]:
     """Validate and return the per-judge retry budget map (issue #122).
@@ -248,6 +257,20 @@ class GitOpsConfig:
             forbids ``pause_before_merge: true``, and requires every
             entry in ``repos:`` to set an explicit ``default_branch:``
             (no ``origin/HEAD`` fallback). Defaults to ``False``.
+        auto_finalize: When ``True``, the orchestrate skill automatically
+            invokes ``devbench git-ops-finalize <repo>`` once all work
+            units for the repo are terminal. Requires ``defer_pr: true``.
+            Incompatible with ``local_only: true``. A marker file at
+            ``<workspace>/.devbench/auto-finalize-fired-<repo>.marker``
+            prevents duplicate invocations. Defaults to ``False``.
+        auto_merge: When ``True``, the orchestrate skill automatically
+            invokes ``gh pr merge --<merge_strategy>`` once the post-E7
+            CI watcher reports GREEN. Requires ``auto_finalize: true``
+            AND ``defer_pr: true``. Incompatible with ``local_only: true``.
+            When the E7 watcher is absent, emits
+            ``[AUTO_MERGE_SKIPPED] no_ci_watcher`` and skips. A marker
+            file at ``<workspace>/.devbench/auto-merge-fired-<repo>.marker``
+            prevents duplicate invocations. Defaults to ``False``.
     """
 
     update_submodule: bool = False
@@ -259,6 +282,8 @@ class GitOpsConfig:
     orphan_patterns: list[str] = field(default_factory=list)
     pr_review_resolution: PrReviewResolutionConfig = field(default_factory=PrReviewResolutionConfig)
     local_only: bool = False
+    auto_finalize: bool = False
+    auto_merge: bool = False
 
 
 @dataclass
@@ -673,6 +698,49 @@ def _parse_repos(
     return repos
 
 
+def _validate_auto_finalize_auto_merge(
+    path: Path,
+    defer_pr: bool,
+    local_only: bool,
+    auto_finalize: bool,
+    auto_merge: bool,
+) -> None:
+    """Validate cross-field constraints for auto_finalize and auto_merge.
+
+    Extracted from ``load_runtime_config`` to keep that function's branch
+    count within ruff's PLR0912 threshold (12).
+
+    Raises:
+        ValueError: On any invalid combination.
+    """
+    if auto_finalize and not defer_pr:
+        raise ValueError(
+            f"Config file '{path}': git_ops.auto_finalize: true requires git_ops.defer_pr: true. "
+            "auto_finalize triggers git-ops-finalize which pushes the deferred single branch; "
+            "without defer_pr there is no deferred branch to finalize."
+        )
+    if auto_finalize and local_only:
+        raise ValueError(
+            f"Config file '{path}': git_ops.auto_finalize: true is incompatible with "
+            "git_ops.local_only: true. Local-only repos have no remote to push to; "
+            "git-ops-finalize cannot create a PR. "
+            "The skill would emit [AUTO_FINALIZE_SKIPPED] local_only=true, "
+            "so setting auto_finalize: true alongside local_only: true is a configuration error."
+        )
+    if auto_merge and not auto_finalize:
+        raise ValueError(
+            f"Config file '{path}': git_ops.auto_merge: true requires git_ops.auto_finalize: true. "
+            "auto_merge merges the PR created by auto_finalize; "
+            "without auto_finalize there is no PR to merge."
+        )
+    if auto_merge and local_only:
+        raise ValueError(
+            f"Config file '{path}': git_ops.auto_merge: true is incompatible with "
+            "git_ops.local_only: true. Local-only repos have no remote or PR; "
+            "there is nothing to merge."
+        )
+
+
 def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
     """Load YAML at *path*, validate against JSON Schema, and return a ``RuntimeConfig``.
 
@@ -790,6 +858,9 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
             "git_ops.pause_before_merge: true. Local-only mode never creates PRs; "
             "there is nothing to pause before merging."
         )
+    auto_finalize = bool(git_ops_raw.get("auto_finalize", False))
+    auto_merge = bool(git_ops_raw.get("auto_merge", False))
+    _validate_auto_finalize_auto_merge(path, defer_pr, local_only, auto_finalize, auto_merge)
     git_ops = GitOpsConfig(
         update_submodule=bool(git_ops_raw.get("update_submodule", False)),
         single_branch=single_branch_raw,
@@ -800,6 +871,8 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         orphan_patterns=list(git_ops_raw.get("orphan_patterns") or []),
         pr_review_resolution=pr_review_resolution,
         local_only=local_only,
+        auto_finalize=auto_finalize,
+        auto_merge=auto_merge,
     )
     if local_only:
         missing_default_branch = [repo_name for repo_name, repo_cfg in repos.items() if not repo_cfg.default_branch]

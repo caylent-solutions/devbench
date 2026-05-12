@@ -55,7 +55,7 @@ Thin-approach refusal and unresolved-prior-proposals guard still run before any 
 ### Tests
 - `tests/test_backlog/test_proposal.py::TestMaterialiseProposalIdempotent` -- five idempotency tests (rejected-archive skip, promoted/done/declined skip parametrised, partial-materialise happy path, double-call no-op, reject-then-remateralise).
 - `tests/test_backlog/test_proposal.py::TestMaterialiseProposal::test_skips_task_when_draft_file_already_exists` -- migrated from the prior raise-on-duplicate test.
-- `tests/test_cli.py::TestCmdSweepProposalsResurrectionGuard` -- end-to-end guard.
+- `tests/test_cli.py::TestCmdSweepAutoAccept::test_rejected_draft_not_recreated_by_sweep` -- end-to-end guard.
 
 ### Docs
 - `docs/adr/09-idempotent-materialise-proposal.md` (this file).

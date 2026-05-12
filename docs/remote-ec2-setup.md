@@ -49,8 +49,7 @@ The state bucket and VPC are stamped out once per AWS account, by an operator wi
 ```bash
 aws sso login --profile devbench-remote
 cd /workspaces/rpm-migration/devbench
-make ec2-init                  # terragrunt init for state-bucket + network
-make ec2-apply MODULE=network  # one-time per account
+make ec2-network-apply         # one-time per account (provisions VPC + security group)
 ```
 
 References:

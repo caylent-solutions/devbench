@@ -94,7 +94,7 @@ See [`blocker-resolver.md`](blocker-resolver.md#test-validates-source-proposals-
 
 ## Cascade-depth limit (issue #144)
 
-`cmd_materialise_proposal` enforces `orchestrate.max_cascade_depth` (YAML; default 3, env override `JUDGE_ORCHESTRATE_MAX_CASCADE_DEPTH`) before writing a draft. When a proposal carries `cascade_depth >= max_cascade_depth`, the CLI exits with rc=1 and an error message naming the limit; the source task transitions to `NEEDS_OPERATOR_ATTENTION` (the depth cap prevents recovery-of-a-recovery-of-a-recovery loops from spawning unbounded drafts). Your verdict in that case is `fail` with audit message naming the depth + the cap. The operator can either raise the cap in YAML or hand-resolve the deepest layer.
+`cmd_materialise_proposal` enforces `orchestrate.max_cascade_depth` (YAML; default 2, env override `JUDGE_ORCHESTRATE_MAX_CASCADE_DEPTH`) before writing a draft. When a proposal carries `cascade_depth >= max_cascade_depth`, the CLI exits with rc=1 and an error message naming the limit; the source task transitions to `NEEDS_OPERATOR_ATTENTION` (the depth cap prevents recovery-of-a-recovery-of-a-recovery loops from spawning unbounded drafts). Your verdict in that case is `fail` with audit message naming the depth + the cap. The operator can either raise the cap in YAML or hand-resolve the deepest layer.
 
 `cascade_depth` is set automatically by the CLI when materialising: `parent_depth + 1` where `parent_depth` is the depth of the proposal that drove the source task into recovery. First-class recovery (the source task is a real backlog task) starts at depth 0; the first auto-emitted recovery sits at depth 1; the recovery-of-that at depth 2; etc.
 

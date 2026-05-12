@@ -154,7 +154,7 @@ See [ADR-10: Multi-target proposal wiring](adr/10-multi-target-proposal-wiring.m
 
 Pre-ADR-09 behaviour: `reject-proposal <draft-id>` archived the draft and removed its BACKLOG.md row, but left the source proposal JSON unchanged. The next `sweep-proposals` call (SKILL step 0) or any manual `materialise-proposal` call walked the JSON's `proposed_tasks[]`, saw no live `.md` for the rejected task, and re-created the draft. Classic case of two layers disagreeing: the classifier (via the rejection archive) knew the task was `REJECTED`, but the materialiser did not ask.
 
-ADR-09 fixed this: `materialise_proposal` now classifies every task before deciding to create a draft and only materialises `UNMATERIALISED` tasks. Rejected drafts stay rejected across any number of sweeps, orchestrator restarts, and replay attempts. If you see a resurrected draft after ADR-09 ships, report it as a regression -- the test pin at `tests/test_cli.py::TestCmdSweepProposalsResurrectionGuard` would have failed.
+ADR-09 fixed this: `materialise_proposal` now classifies every task before deciding to create a draft and only materialises `UNMATERIALISED` tasks. Rejected drafts stay rejected across any number of sweeps, orchestrator restarts, and replay attempts. If you see a resurrected draft after ADR-09 ships, report it as a regression -- the test pin at `tests/test_cli.py::TestCmdSweepAutoAccept::test_rejected_draft_not_recreated_by_sweep` would have failed.
 
 See [ADR-09](adr/09-idempotent-materialise-proposal.md) for the rationale and [docs/task-factory.md](task-factory.md)'s "materialise-proposal is idempotent" section for the full skip contract.
 

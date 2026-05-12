@@ -254,9 +254,9 @@ DEFAULT_HOOK_TAIL_STDOUT_PREVIEW_MAX: int = 80
 # `JUDGE_ORCHESTRATE_MAX_CASCADE_DEPTH` env var. When a proposal would
 # land at depth >= this cap, the source task transitions to
 # NEEDS_OPERATOR_ATTENTION instead of materialising another recovery
-# layer. Default empirically matches the longest healthy cascade
-# observed in production sessions.
-DEFAULT_MAX_CASCADE_DEPTH: int = 3
+# layer. Default of 2 reflects the bounded cascade depth needed for
+# typical recovery chains.
+DEFAULT_MAX_CASCADE_DEPTH: int = 2
 # Workflow-registration race defence (issue #114). When `gh pr checks`
 # returns "no checks reported" right after a PR is created, devbench
 # cannot tell "repo has no CI configured" apart from "GitHub Actions

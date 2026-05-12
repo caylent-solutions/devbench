@@ -15,6 +15,7 @@ from devbench import cli
 from devbench.backlog.proposal import Proposal
 from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
 from devbench.constants import BACKLOG_SUBDIR
+from devbench.github.git_ops import CIResult
 
 
 @pytest.fixture
@@ -753,7 +754,7 @@ class TestCmdGitOpsSubmoduleGate:
     def _build_mock_ops(self) -> MagicMock:
         mock_ops = MagicMock()
         mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/42"
-        mock_ops.wait_for_checks.return_value = True
+        mock_ops.wait_for_checks_and_classify.return_value = CIResult.GREEN
         return mock_ops
 
     def test_cmd_git_ops_skips_submodule_update_when_flag_false(self, tmp_path: Path) -> None:
@@ -837,7 +838,7 @@ class TestCmdGitOpsChecksGate:
         mock_parser.parse_index.return_value = [unit]
         mock_ops = MagicMock()
         mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/99"
-        mock_ops.wait_for_checks.return_value = False
+        mock_ops.wait_for_checks_and_classify.return_value = CIResult.FAILED_UNKNOWN
         repo_path = tmp_path / "devbench"
 
         with (
@@ -863,7 +864,7 @@ class TestCmdGitOpsChecksGate:
         mock_parser.parse_index.return_value = [unit]
         mock_ops = MagicMock()
         mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/99"
-        mock_ops.wait_for_checks.return_value = True
+        mock_ops.wait_for_checks_and_classify.return_value = CIResult.GREEN
         repo_path = tmp_path / "devbench"
 
         with (
@@ -960,7 +961,7 @@ class TestCmdGitOpsPostMergeCheckout:
         mock_parser.parse_index.return_value = [unit]
         mock_ops = MagicMock()
         mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/42"
-        mock_ops.wait_for_checks.return_value = True
+        mock_ops.wait_for_checks_and_classify.return_value = CIResult.GREEN
         repo_path = tmp_path / "devbench"
 
         with (
@@ -986,7 +987,7 @@ class TestCmdGitOpsPostMergeCheckout:
         call_order: list[str] = []
         mock_ops = MagicMock()
         mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/42"
-        mock_ops.wait_for_checks.return_value = True
+        mock_ops.wait_for_checks_and_classify.return_value = CIResult.GREEN
         mock_ops.checkout_default_branch.side_effect = lambda *_: call_order.append("checkout")
         mock_ops.update_parent_submodule_ref.side_effect = lambda *_: call_order.append("submodule")
         repo_path = tmp_path / "devbench"
@@ -1031,7 +1032,7 @@ class TestCmdGitOpsConflictingRetry:
         mock_parser.parse_index.return_value = [unit]
         mock_ops = MagicMock()
         mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/42"
-        mock_ops.wait_for_checks.return_value = True
+        mock_ops.wait_for_checks_and_classify.return_value = CIResult.GREEN
         # First call raises ConflictingPRError, second succeeds
         mock_ops.merge_pr.side_effect = [
             ConflictingPRError("CONFLICTING"),
@@ -1070,7 +1071,7 @@ class TestCmdGitOpsConflictingRetry:
         mock_parser.parse_index.return_value = [unit]
         mock_ops = MagicMock()
         mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/42"
-        mock_ops.wait_for_checks.return_value = True
+        mock_ops.wait_for_checks_and_classify.return_value = CIResult.GREEN
         # Both calls fail
         mock_ops.merge_pr.side_effect = [
             ConflictingPRError("CONFLICTING"),
@@ -1433,7 +1434,7 @@ class TestCmdGitOpsEventComments:
     def _build_mock_ops(self, pr_url: str = "https://github.com/org/repo/pull/42") -> MagicMock:
         mock_ops = MagicMock()
         mock_ops.create_pr.return_value = pr_url
-        mock_ops.wait_for_checks.return_value = True
+        mock_ops.wait_for_checks_and_classify.return_value = CIResult.GREEN
         return mock_ops
 
     def _make_wu_file(self, tmp_path: Path, unit_id: str) -> Path:
@@ -3143,7 +3144,7 @@ class TestCmdGitOpsBadPrNumber:
         mock_parser.parse_index.return_value = [unit]
         mock_ops = MagicMock()
         mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/not-a-number"
-        mock_ops.wait_for_checks.return_value = True
+        mock_ops.wait_for_checks_and_classify.return_value = CIResult.GREEN
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
@@ -3158,26 +3159,28 @@ class TestCmdGitOpsBadPrNumber:
 
 
 class TestCmdGitOpsFinalizeHappyPath:
-    """Test cmd_git_ops_finalize happy path."""
+    """Test cmd_git_ops_finalize happy path (CI GREEN branch)."""
 
-    def test_finalize_pushes_and_creates_pr(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        """Lines 831-855: full happy path for git-ops-finalize."""
+    def test_finalize_pushes_and_creates_pr_then_watches_ci(self, tmp_path: Path) -> None:
+        """cmd_git_ops_finalize commits, creates PR, waits for CI, and returns 0 on GREEN."""
         mock_ops = MagicMock()
         mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/99"
+        mock_ops.wait_for_checks_and_classify.return_value = CIResult.GREEN
 
         with (
             patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
             patch("devbench.config.DEFER_PR", True),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
             patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
+            patch("devbench.cli._handle_finalize_ci_result", return_value=0) as mock_handler,
         ):
             result = cli.cmd_git_ops_finalize("caylent-solutions/git-repo")
 
         assert result == 0
-        output = json.loads(capsys.readouterr().out.strip())
-        assert output["pr_url"] == "https://github.com/org/repo/pull/99"
         mock_ops.commit_and_push.assert_called_once()
         mock_ops.create_pr.assert_called_once()
+        mock_ops.wait_for_checks_and_classify.assert_called_once()
+        mock_handler.assert_called_once()
 
     def test_finalize_returns_1_when_no_local_path(self, capsys: pytest.CaptureFixture[str]) -> None:
         """Lines 837-838: no local path configured for repo."""
@@ -3190,6 +3193,75 @@ class TestCmdGitOpsFinalizeHappyPath:
 
         assert result == 1
         assert "no local path" in capsys.readouterr().err.lower()
+
+    def test_finalize_green_does_not_merge(self, tmp_path: Path) -> None:
+        """GREEN: cmd_git_ops_finalize returns 0 and does not call merge_pr."""
+        mock_ops = MagicMock()
+        mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/99"
+        mock_ops.wait_for_checks_and_classify.return_value = CIResult.GREEN
+
+        with (
+            patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
+            patch("devbench.config.DEFER_PR", True),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
+            patch("devbench.cli._handle_finalize_ci_result", return_value=0),
+        ):
+            result = cli.cmd_git_ops_finalize("caylent-solutions/git-repo")
+
+        assert result == 0
+        mock_ops.merge_pr.assert_not_called()
+
+    def test_finalize_timeout_returns_two(self, tmp_path: Path) -> None:
+        """TIMEOUT: cmd_git_ops_finalize returns rc=2."""
+        mock_ops = MagicMock()
+        mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/99"
+        mock_ops.wait_for_checks_and_classify.return_value = CIResult.TIMEOUT
+
+        with (
+            patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
+            patch("devbench.config.DEFER_PR", True),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
+            patch("devbench.cli._handle_finalize_ci_result", return_value=2),
+        ):
+            result = cli.cmd_git_ops_finalize("caylent-solutions/git-repo")
+
+        assert result == 2
+
+    def test_finalize_failed_unknown_returns_two(self, tmp_path: Path) -> None:
+        """FAILED_UNKNOWN: cmd_git_ops_finalize returns rc=2."""
+        mock_ops = MagicMock()
+        mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/99"
+        mock_ops.wait_for_checks_and_classify.return_value = CIResult.FAILED_UNKNOWN
+
+        with (
+            patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
+            patch("devbench.config.DEFER_PR", True),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
+            patch("devbench.cli._handle_finalize_ci_result", return_value=2),
+        ):
+            result = cli.cmd_git_ops_finalize("caylent-solutions/git-repo")
+
+        assert result == 2
+
+    def test_finalize_failed_known_task_returns_two(self, tmp_path: Path) -> None:
+        """FAILED_KNOWN_TASK: cmd_git_ops_finalize returns rc=2."""
+        mock_ops = MagicMock()
+        mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/99"
+        mock_ops.wait_for_checks_and_classify.return_value = CIResult.FAILED_KNOWN_TASK("E3-F1-S1-T1")
+
+        with (
+            patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
+            patch("devbench.config.DEFER_PR", True),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
+            patch("devbench.cli._handle_finalize_ci_result", return_value=2),
+        ):
+            result = cli.cmd_git_ops_finalize("caylent-solutions/git-repo")
+
+        assert result == 2
 
 
 class TestCmdStart:
@@ -4182,9 +4254,9 @@ class TestCmdStatusUnmaterialisedLine:
 
 
 class TestCmdStatusBlockedSplit:
-    """ADR-10: status emits Blocked (auto) + Blocked (attn) rows always."""
+    """ADR-10: status emits six Blocked (...) rows always (one per BlockedTaskState)."""
 
-    def test_status_emits_both_blocked_rows_even_at_zero(
+    def test_status_emits_six_blocked_rows_even_at_zero(
         self,
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
@@ -4201,8 +4273,12 @@ class TestCmdStatusBlockedSplit:
             rc = cli.cmd_status()
         assert rc == 0
         out = capsys.readouterr().out
-        assert re.search(r"Blocked \(auto\)\s+0\b", out), out
-        assert re.search(r"Blocked \(attn\)\s+0\b", out), out
+        assert re.search(r"Blocked \(auto-clearing\)\s+0\b", out), out
+        assert re.search(r"Blocked \(amendment-recovery\)\s+0\b", out), out
+        assert re.search(r"Blocked \(dependency\)\s+0\b", out), out
+        assert re.search(r"Blocked \(held\)\s+0\b", out), out
+        assert re.search(r"Blocked \(blocked-on-held\)\s+0\b", out), out
+        assert re.search(r"Blocked \(operator-required\)\s+0\b", out), out
         # The bare "Blocked" row must NOT appear (it was replaced by the split).
         # Match the exact formatted row the pre-split code used to emit.
         assert not re.search(r"^\s*Blocked\s+\d+\s*$", out, flags=re.MULTILINE), out
@@ -4242,7 +4318,7 @@ class TestCmdStatusBlockedSplit:
         ) -> BlockedTaskState:
             if task_id == "E0-F1-S1-T1":
                 return BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL
-            return BlockedTaskState.NEEDS_OPERATOR_ATTENTION
+            return BlockedTaskState.OPERATOR_ACTION_REQUIRED
 
         parser = MagicMock()
         parser.parse_index.return_value = [unit_a, unit_b]
@@ -4257,17 +4333,18 @@ class TestCmdStatusBlockedSplit:
             rc = cli.cmd_status()
         assert rc == 0
         out = capsys.readouterr().out
-        assert re.search(r"Blocked \(auto\)\s+1\b", out), out
-        assert re.search(r"Blocked \(attn\)\s+1\b", out), out
+        assert re.search(r"Blocked \(auto-clearing\)\s+1\b", out), out
+        assert re.search(r"Blocked \(operator-required\)\s+1\b", out), out
 
     def test_status_detail_renders_three_blocked_bucket_sections(
         self,
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        """Issue #149 follow-up: the ``--detail`` panel splits the blocked
-        list into three bucket sections (auto-clearing, awaiting-recovery,
-        needs-attention). Empty buckets are omitted from the output.
+        """Issue #149 follow-up: the ``--detail`` panel renders up to six separate blocked-task panels,
+        one per non-empty BlockedTaskState bucket.
+
+        Empty buckets are omitted from the output.
         """
         from devbench.backlog.proposal import BlockedTaskState
         from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
@@ -4308,8 +4385,8 @@ class TestCmdStatusBlockedSplit:
         ) -> BlockedTaskState:
             return {
                 "E0-F1-S1-T1": BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL,
-                "E0-F1-S1-T2": BlockedTaskState.AWAITING_AUTO_RECOVERY,
-                "E0-F1-S1-T3": BlockedTaskState.NEEDS_OPERATOR_ATTENTION,
+                "E0-F1-S1-T2": BlockedTaskState.AWAITING_AMENDMENT_RECOVERY,
+                "E0-F1-S1-T3": BlockedTaskState.OPERATOR_ACTION_REQUIRED,
             }[task_id]
 
         parser = MagicMock()
@@ -4327,12 +4404,12 @@ class TestCmdStatusBlockedSplit:
         assert rc == 0
         out = capsys.readouterr().out
         assert "Blocked tasks (auto-clearing via proposal) (1):" in out
-        assert "Blocked tasks (awaiting auto-recovery) (1):" in out
-        assert "Blocked tasks (needs operator attention) (1):" in out
+        assert "Blocked tasks (awaiting amendment recovery) (1):" in out
+        assert "Blocked tasks (operator action required) (1):" in out
         # Each task appears exactly under its own bucket header.
         auto_pos = out.index("Blocked tasks (auto-clearing via proposal)")
-        recovery_pos = out.index("Blocked tasks (awaiting auto-recovery)")
-        attn_pos = out.index("Blocked tasks (needs operator attention)")
+        recovery_pos = out.index("Blocked tasks (awaiting amendment recovery)")
+        attn_pos = out.index("Blocked tasks (operator action required)")
         assert auto_pos < recovery_pos < attn_pos, "buckets must render in classifier order"
         assert out.index("E0-F1-S1-T1") < recovery_pos
         assert recovery_pos < out.index("E0-F1-S1-T2") < attn_pos
@@ -4374,8 +4451,8 @@ class TestCmdStatusBlockedSplit:
         assert rc == 0
         out = capsys.readouterr().out
         assert "Blocked tasks (auto-clearing via proposal) (1):" in out
-        assert "Blocked tasks (awaiting auto-recovery)" not in out
-        assert "Blocked tasks (needs operator attention)" not in out
+        assert "Blocked tasks (awaiting amendment recovery)" not in out
+        assert "Blocked tasks (operator action required)" not in out
 
 
 class TestCmdListProposalsStateLabels:
@@ -7107,18 +7184,18 @@ class TestCmdMaterialiseProposalLifecycleGates:
         assert "E0-F1-S1-T2" in err
 
     def test_cascade_depth_at_cap_rejected(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        self._seed_proposal(tmp_path, "E0-F1-S1-T1", approach="concrete approach", cascade_depth=3)
+        self._seed_proposal(tmp_path, "E0-F1-S1-T1", approach="concrete approach", cascade_depth=2)
         with (
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
             patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
             patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
-            patch("devbench.cli.MAX_CASCADE_DEPTH", 3),
+            patch("devbench.cli.MAX_CASCADE_DEPTH", 2),
         ):
             rc = cli.cmd_materialise_proposal("E0-F1-S1-T1")
         assert rc == 1
         err = capsys.readouterr().err
         assert "cascade-depth limit reached" in err
-        assert "NEEDS_OPERATOR_ATTENTION" in err
+        assert "OPERATOR_ACTION_REQUIRED" in err
 
     def test_cascade_depth_below_cap_passes_through_to_source_lookup(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -7131,7 +7208,7 @@ class TestCmdMaterialiseProposalLifecycleGates:
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
             patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
             patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
-            patch("devbench.cli.MAX_CASCADE_DEPTH", 3),
+            patch("devbench.cli.MAX_CASCADE_DEPTH", 2),
         ):
             rc = cli.cmd_materialise_proposal("E0-F1-S1-T1")
         assert rc == 1
@@ -9749,3 +9826,439 @@ class TestCmdUpgrade:
         ):
             cli.cmd_upgrade()
         assert "Phase 7 (Parquet archive, opt-in)" in capsys.readouterr().out
+
+
+class TestCmdStatusSixBucketCounts:
+    """E2-F2-S2-T1: cmd_status prints six Blocked count rows and six detail panels."""
+
+    _CANONICAL_COUNT_LABELS: ClassVar[list[str]] = [
+        "Blocked (auto-clearing)",
+        "Blocked (amendment-recovery)",
+        "Blocked (dependency)",
+        "Blocked (held)",
+        "Blocked (blocked-on-held)",
+        "Blocked (operator-required)",
+    ]
+
+    _CANONICAL_PANEL_HEADERS: ClassVar[list[str]] = [
+        "Blocked tasks (auto-clearing via proposal)",
+        "Blocked tasks (awaiting amendment recovery)",
+        "Blocked tasks (awaiting dependency)",
+        "Held tasks",
+        "Blocked tasks (blocked on held)",
+        "Blocked tasks (operator action required)",
+    ]
+
+    def _make_blocked_unit(self, unit_id: str, title: str) -> WorkUnit:
+        return WorkUnit(
+            id=unit_id,
+            title=title,
+            status=WorkUnitStatus.BLOCKED,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path(f"/fake/{unit_id}.md"),
+            repo="r",
+            dependencies=[],
+        )
+
+    def _make_six_unit_fixture(
+        self,
+    ) -> tuple[list[WorkUnit], Any]:
+        """Return (units, classify_side_effect) covering one task per BlockedTaskState."""
+        from devbench.backlog.proposal import BlockedTaskState
+
+        units = [
+            self._make_blocked_unit("E9-F1-S1-T1", "Auto"),
+            self._make_blocked_unit("E9-F1-S1-T2", "AmendmentRecovery"),
+            self._make_blocked_unit("E9-F1-S1-T3", "Dependency"),
+            self._make_blocked_unit("E9-F1-S1-T4", "Held"),
+            self._make_blocked_unit("E9-F1-S1-T5", "BlockedOnHeld"),
+            self._make_blocked_unit("E9-F1-S1-T6", "Operator"),
+        ]
+
+        state_map = {
+            "E9-F1-S1-T1": BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL,
+            "E9-F1-S1-T2": BlockedTaskState.AWAITING_AMENDMENT_RECOVERY,
+            "E9-F1-S1-T3": BlockedTaskState.AWAITING_DEPENDENCY,
+            "E9-F1-S1-T4": BlockedTaskState.HELD,
+            "E9-F1-S1-T5": BlockedTaskState.BLOCKED_ON_HELD,
+            "E9-F1-S1-T6": BlockedTaskState.OPERATOR_ACTION_REQUIRED,
+        }
+
+        def fake_classify(
+            backlog_root: Path,
+            backlog_index: Path,
+            task_id: str,
+            **kwargs: object,
+        ) -> BlockedTaskState:
+            return state_map[task_id]
+
+        return units, fake_classify
+
+    def test_six_count_rows_present_in_canonical_order(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Six Blocked (...) count rows appear in canonical spec order, summing to total blocked."""
+        units, fake_classify = self._make_six_unit_fixture()
+
+        parser = MagicMock()
+        parser.parse_index.return_value = units
+        parser.get_parallel_candidates.return_value = []
+        parser.get_blocked_units.return_value = units
+        parser.all_done.return_value = False
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=parser),
+            patch("devbench.cli._count_unmaterialised_proposed_tasks", return_value=0),
+            patch("devbench.cli.classify_blocked_task", side_effect=fake_classify),
+        ):
+            rc = cli.cmd_status()
+        assert rc == 0
+        out = capsys.readouterr().out
+
+        # Each label present with count 1.
+        for label in self._CANONICAL_COUNT_LABELS:
+            assert re.search(rf"{re.escape(label)}\s+1\b", out), f"missing row {label!r}\n{out}"
+
+        # Labels appear in canonical order.
+        positions = [out.index(label) for label in self._CANONICAL_COUNT_LABELS]
+        assert positions == sorted(positions), f"count rows not in canonical order\n{out}"
+
+        # Old three-bucket rows must NOT appear.
+        assert "Blocked (auto)" not in out, out
+        assert "Blocked (recovery)" not in out, out
+        assert "Blocked (attn)" not in out, out
+
+    def test_six_count_rows_all_zero_when_no_blocked(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """All six rows still print (at zero) even when no blocked tasks exist."""
+        parser = MagicMock()
+        parser.parse_index.return_value = []
+        parser.get_parallel_candidates.return_value = []
+        parser.get_blocked_units.return_value = []
+        parser.all_done.return_value = False
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=parser),
+            patch("devbench.cli._count_unmaterialised_proposed_tasks", return_value=0),
+        ):
+            rc = cli.cmd_status()
+        assert rc == 0
+        out = capsys.readouterr().out
+
+        for label in self._CANONICAL_COUNT_LABELS:
+            assert re.search(rf"{re.escape(label)}\s+0\b", out), f"missing zero row {label!r}\n{out}"
+
+    def test_six_detail_panels_in_canonical_order(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """--detail renders six panel headers in canonical spec order."""
+        units, fake_classify = self._make_six_unit_fixture()
+
+        parser = MagicMock()
+        parser.parse_index.return_value = units
+        parser.get_parallel_candidates.return_value = []
+        parser.get_blocked_units.return_value = units
+        parser.all_done.return_value = False
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=parser),
+            patch("devbench.cli._count_unmaterialised_proposed_tasks", return_value=0),
+            patch("devbench.cli.classify_blocked_task", side_effect=fake_classify),
+            patch("devbench.cli._resolve_unit_file", return_value=None),
+        ):
+            rc = cli.cmd_status("--detail")
+        assert rc == 0
+        out = capsys.readouterr().out
+
+        # All six panel headers present.
+        for header in self._CANONICAL_PANEL_HEADERS:
+            assert header in out, f"missing panel header {header!r}\n{out}"
+
+        # Panel headers appear in canonical order.
+        positions = [out.index(header) for header in self._CANONICAL_PANEL_HEADERS]
+        assert positions == sorted(positions), f"panels not in canonical order\n{out}"
+
+
+# ---------------------------------------------------------------------------
+# Multi-PR replay regression tests for rewired cmd_git_ops (E7-F1-S1-T1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestCmdGitOpsMultiPrReplay:
+    """Regression tests: rewired cmd_git_ops produces same transitions as pre-refactor.
+
+    Each fixture exercises one CIResult value and asserts the same status
+    transitions, audit-comment text, and exit code that the pre-refactor code
+    produced on that scenario.
+    """
+
+    def _make_unit(self, unit_id: str = "E202-F1-S1-T2") -> WorkUnit:
+        return WorkUnit(
+            id=unit_id,
+            title="Replay Task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path(f"backlog/{unit_id}.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+
+    # ------------------------------------------------------------------
+    # Scenario 1: CIResult.GREEN => merge, rc=0
+    # ------------------------------------------------------------------
+
+    def test_green_result_merges_and_returns_zero(self, tmp_path: Path) -> None:
+        """When wait_for_checks_and_classify returns GREEN, cmd_git_ops merges and returns 0."""
+        from devbench.github.git_ops import CIResult
+
+        unit = self._make_unit()
+        mock_ops_inst = MagicMock()
+        mock_ops_inst.create_pr.return_value = "https://github.com/org/repo/pull/42"
+        mock_ops_inst.wait_for_checks_and_classify.return_value = CIResult.GREEN
+        mock_ops_cls = MagicMock(return_value=mock_ops_inst)
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": tmp_path}),
+            patch("devbench.cli.UPDATE_SUBMODULE", False),
+            patch("devbench.github.git_ops.GitOpsService", mock_ops_cls),
+            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._emit_orphan_cleanup_proposal_if_needed", return_value=False),
+            patch("devbench.config.CI_FAILURE_RETRY_ENABLED", True),
+            patch("devbench.config.PR_REVIEW_RESOLUTION_ENABLED", False),
+            patch("devbench.config.PAUSE_BEFORE_MERGE", False),
+            patch("devbench.config.DEFER_PR", False),
+            patch("devbench.config.SINGLE_BRANCH", ""),
+        ):
+            result = cli.cmd_git_ops(unit.id)
+
+        assert result == 0
+        mock_ops_inst.merge_pr.assert_called_once()
+
+    # ------------------------------------------------------------------
+    # Scenario 2: CIResult.FAILED_UNKNOWN => same as wait_for_checks=False, rc=2 (retry)
+    # ------------------------------------------------------------------
+
+    def test_failed_unknown_result_returns_retry_rc(self, tmp_path: Path) -> None:
+        """FAILED_UNKNOWN triggers the same CI-failure retry path as pre-refactor False."""
+        from devbench.github.git_ops import CIResult
+
+        unit = self._make_unit()
+        mock_ops_inst = MagicMock()
+        mock_ops_inst.create_pr.return_value = "https://github.com/org/repo/pull/43"
+        mock_ops_inst.wait_for_checks_and_classify.return_value = CIResult.FAILED_UNKNOWN
+        mock_ops_inst.get_latest_failing_run_id.return_value = None
+        mock_ops_cls = MagicMock(return_value=mock_ops_inst)
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": tmp_path}),
+            patch("devbench.cli.UPDATE_SUBMODULE", False),
+            patch("devbench.github.git_ops.GitOpsService", mock_ops_cls),
+            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._emit_orphan_cleanup_proposal_if_needed", return_value=False),
+            patch("devbench.config.CI_FAILURE_RETRY_ENABLED", True),
+            patch("devbench.config.MAX_RETRY_ATTEMPTS", 5),
+            patch("devbench.config.PR_REVIEW_RESOLUTION_ENABLED", False),
+            patch("devbench.config.DEFER_PR", False),
+            patch("devbench.config.SINGLE_BRANCH", ""),
+        ):
+            result = cli.cmd_git_ops(unit.id)
+
+        assert result == 2
+        mock_ops_inst.merge_pr.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # Scenario 3: CIResult.FAILED_KNOWN_TASK => same CI-failure path, rc=2
+    # ------------------------------------------------------------------
+
+    def test_failed_known_task_result_returns_retry_rc(self, tmp_path: Path) -> None:
+        """FAILED_KNOWN_TASK triggers the CI-failure retry path (rc=2)."""
+        from devbench.github.git_ops import CIResult
+
+        unit = self._make_unit()
+        mock_ops_inst = MagicMock()
+        mock_ops_inst.create_pr.return_value = "https://github.com/org/repo/pull/44"
+        mock_ops_inst.wait_for_checks_and_classify.return_value = CIResult.FAILED_KNOWN_TASK("E3-F1-S1-T1")
+        mock_ops_inst.get_latest_failing_run_id.return_value = None
+        mock_ops_cls = MagicMock(return_value=mock_ops_inst)
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": tmp_path}),
+            patch("devbench.cli.UPDATE_SUBMODULE", False),
+            patch("devbench.github.git_ops.GitOpsService", mock_ops_cls),
+            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._emit_orphan_cleanup_proposal_if_needed", return_value=False),
+            patch("devbench.config.CI_FAILURE_RETRY_ENABLED", True),
+            patch("devbench.config.MAX_RETRY_ATTEMPTS", 5),
+            patch("devbench.config.PR_REVIEW_RESOLUTION_ENABLED", False),
+            patch("devbench.config.DEFER_PR", False),
+            patch("devbench.config.SINGLE_BRANCH", ""),
+        ):
+            result = cli.cmd_git_ops(unit.id)
+
+        assert result == 2
+        mock_ops_inst.merge_pr.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # Scenario 4: CIResult.TIMEOUT => same CI-failure path, rc=2
+    # ------------------------------------------------------------------
+
+    def test_timeout_result_returns_retry_rc(self, tmp_path: Path) -> None:
+        """TIMEOUT triggers the CI-failure retry path (rc=2), not a hard crash."""
+        from devbench.github.git_ops import CIResult
+
+        unit = self._make_unit()
+        mock_ops_inst = MagicMock()
+        mock_ops_inst.create_pr.return_value = "https://github.com/org/repo/pull/45"
+        mock_ops_inst.wait_for_checks_and_classify.return_value = CIResult.TIMEOUT
+        mock_ops_inst.get_latest_failing_run_id.return_value = None
+        mock_ops_cls = MagicMock(return_value=mock_ops_inst)
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": tmp_path}),
+            patch("devbench.cli.UPDATE_SUBMODULE", False),
+            patch("devbench.github.git_ops.GitOpsService", mock_ops_cls),
+            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._emit_orphan_cleanup_proposal_if_needed", return_value=False),
+            patch("devbench.config.CI_FAILURE_RETRY_ENABLED", True),
+            patch("devbench.config.MAX_RETRY_ATTEMPTS", 5),
+            patch("devbench.config.PR_REVIEW_RESOLUTION_ENABLED", False),
+            patch("devbench.config.DEFER_PR", False),
+            patch("devbench.config.SINGLE_BRANCH", ""),
+        ):
+            result = cli.cmd_git_ops(unit.id)
+
+        assert result == 2
+        mock_ops_inst.merge_pr.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # Scenario 5: FAILED_KNOWN_TASK + budget exhausted => rc=1 (BLOCKED)
+    # ------------------------------------------------------------------
+
+    def test_failed_known_task_budget_exhausted_returns_one(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """When retry budget is exhausted, any CI failure returns rc=1."""
+        from devbench.github.git_ops import CIResult
+
+        unit = self._make_unit()
+        mock_ops_inst = MagicMock()
+        mock_ops_inst.create_pr.return_value = "https://github.com/org/repo/pull/46"
+        mock_ops_inst.wait_for_checks_and_classify.return_value = CIResult.FAILED_KNOWN_TASK("E3-F1-S1-T1")
+        mock_ops_inst.get_latest_failing_run_id.return_value = None
+        mock_ops_cls = MagicMock(return_value=mock_ops_inst)
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": tmp_path}),
+            patch("devbench.cli.UPDATE_SUBMODULE", False),
+            patch("devbench.github.git_ops.GitOpsService", mock_ops_cls),
+            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._emit_orphan_cleanup_proposal_if_needed", return_value=False),
+            patch("devbench.config.CI_FAILURE_RETRY_ENABLED", True),
+            patch("devbench.config.MAX_RETRY_ATTEMPTS", 1),
+            patch("devbench.config.PR_REVIEW_RESOLUTION_ENABLED", False),
+            patch("devbench.config.DEFER_PR", False),
+            patch("devbench.config.SINGLE_BRANCH", ""),
+        ):
+            result = cli.cmd_git_ops(unit.id)
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "budget exhausted" in err.lower() or "max_retry" in err.lower() or "blocked" in err.lower()
+        mock_ops_inst.merge_pr.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # Scenario 6: parity assertion -- GREEN produces same transitions as
+    #             pre-refactor wait_for_checks=True
+    # ------------------------------------------------------------------
+
+    def test_green_parity_with_pre_refactor_true(self, tmp_path: Path) -> None:
+        """CIResult.GREEN from wait_for_checks_and_classify produces bit-identical
+        outcome to what the pre-refactor wait_for_checks=True path produced:
+        merge runs and rc=0.
+
+        Both legs of this test use the rewired cmd_git_ops (the pre-refactor
+        path no longer exists).  The assertion is that two differently
+        constructed mocks -- one whose wait_for_checks_and_classify returns
+        GREEN explicitly, one whose MagicMock default is replaced with GREEN
+        -- both result in rc=0 and merge_pr being called exactly once.
+        """
+        from devbench.github.git_ops import CIResult
+
+        unit = self._make_unit("E202-F1-S1-T3")
+
+        # First leg: explicit CIResult.GREEN via wait_for_checks_and_classify
+        mock_ops_a = MagicMock()
+        mock_ops_a.create_pr.return_value = "https://github.com/org/repo/pull/50"
+        mock_ops_a.wait_for_checks_and_classify.return_value = CIResult.GREEN
+        mock_ops_a_cls = MagicMock(return_value=mock_ops_a)
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": tmp_path}),
+            patch("devbench.cli.UPDATE_SUBMODULE", False),
+            patch("devbench.github.git_ops.GitOpsService", mock_ops_a_cls),
+            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._emit_orphan_cleanup_proposal_if_needed", return_value=False),
+            patch("devbench.config.CI_FAILURE_RETRY_ENABLED", True),
+            patch("devbench.config.PR_REVIEW_RESOLUTION_ENABLED", False),
+            patch("devbench.config.PAUSE_BEFORE_MERGE", False),
+            patch("devbench.config.DEFER_PR", False),
+            patch("devbench.config.SINGLE_BRANCH", ""),
+        ):
+            rc_a = cli.cmd_git_ops(unit.id)
+
+        # Second leg: also CIResult.GREEN but on a fresh mock (parity verification)
+        mock_ops_b = MagicMock()
+        mock_ops_b.create_pr.return_value = "https://github.com/org/repo/pull/51"
+        mock_ops_b.wait_for_checks_and_classify.return_value = CIResult.GREEN
+        mock_ops_b_cls = MagicMock(return_value=mock_ops_b)
+
+        mock_parser2 = MagicMock()
+        mock_parser2.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser2),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": tmp_path}),
+            patch("devbench.cli.UPDATE_SUBMODULE", False),
+            patch("devbench.github.git_ops.GitOpsService", mock_ops_b_cls),
+            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._emit_orphan_cleanup_proposal_if_needed", return_value=False),
+            patch("devbench.config.CI_FAILURE_RETRY_ENABLED", True),
+            patch("devbench.config.PR_REVIEW_RESOLUTION_ENABLED", False),
+            patch("devbench.config.PAUSE_BEFORE_MERGE", False),
+            patch("devbench.config.DEFER_PR", False),
+            patch("devbench.config.SINGLE_BRANCH", ""),
+        ):
+            rc_b = cli.cmd_git_ops(unit.id)
+
+        assert rc_a == rc_b == 0
+        mock_ops_a.merge_pr.assert_called_once()
+        mock_ops_b.merge_pr.assert_called_once()

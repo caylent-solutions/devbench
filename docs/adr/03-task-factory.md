@@ -34,7 +34,7 @@ The feature is opt-in per backlog via `task_factory.enabled: true`, which requir
 
 **Positive.**
 
-- The "operator must hand-author N new work units" step drops from an hour to under a minute. Drafts are generated programmatically; the operator reviews and promotes rather than authors.
+- The "operator must hand-author N new work units" step is substantially reduced. Drafts are generated programmatically; the operator reviews and promotes rather than authors.
 - No orchestrator idle time. The amender reject -> blocker-resolver -> task-factory -> orchestrator-continues chain runs without a human in the loop up to the point of promotion. The operator reviews when they choose to.
 - Concurrency-safe ID allocation on day one. `allocate_next_ids` acquires an exclusive POSIX file lock before scanning the Story directory; two parallel factory runs cannot collide.
 - Deterministic state: proposals are persisted on disk (`<workspace>/.devbench/proposals/<source-id>.json`); losing the terminal or stopping the orchestrator mid-flow leaves the workspace recoverable.

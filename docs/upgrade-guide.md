@@ -8,7 +8,8 @@ every new artefact self-builds on first read.
 ## TL;DR
 
 ```bash
-pip install -U devbench
+git pull
+make install
 devbench upgrade
 ```
 
@@ -27,7 +28,7 @@ opt into the destructive step.
 | **2 Window indices** (ADR-17) | `<workspace>/.devbench/window-stats/<task-id>.json` | Aggregates absent until next state transition; reporter falls back to live aggregation when missing. | None (auto on next transition); or `devbench upgrade` runs `rebuild-window-stats` once on accumulated history. |
 | **3 Sharded event store** (ADR-18) | `<workspace>/logs/<YYYY-MM>/<task-id>.jsonl` and `<workspace>/logs/<YYYY-MM>/orchestrator-meta.jsonl` | Sharded tree absent; the orchestrator continues writing to flat `logs/orchestrator.log`. Readers merge sharded shards (when present) with the flat log. | **Optional + DESTRUCTIVE**. Run `devbench upgrade --migrate-log-shards` to partition accumulated history; original archived to `logs/legacy/orchestrator.log`. |
 | **6 Materialised snapshots** (ADR-20) | `<workspace>/.devbench/report-snapshot.json` | Snapshot absent on first read; reporter falls back to live aggregation through the Phase 1+4 cache. | None. Auto-written by orchestrate skill at the end of every iteration after this update lands. |
-| **7 Parquet cold archive (opt-in)** (ADR-21) | `<workspace>/logs/legacy/<session-id>.parquet` | No archives present; archive on demand via `devbench archive-session <session-id>`. | None unless you want long-term cold storage. Install with `pip install devbench[archive]`, then archive ended sessions per-session. |
+| **7 Parquet cold archive (opt-in)** (ADR-21) | `<workspace>/logs/legacy/<session-id>.parquet` | No archives present; archive on demand via `devbench archive-session <session-id>`. | None unless you want long-term cold storage. Install the `archive` extra (`uv sync --extra archive`), then archive ended sessions per-session. |
 
 ## Phase 3 destructive migration walkthrough
 
@@ -40,7 +41,7 @@ closed the reader-path integration; live-verified parity on the
 ### When to run it
 
 You probably don't need to. Phase 4 (SQLite indexed event store, ADR-19)
-already serves windowed queries in microseconds; Phase 3 is value-add
+already serves windowed queries with low latency; Phase 3 is value-add
 only when you have a multi-month log and want a date-partitioned
 on-disk archive for grep / inspection / disk-usage tools.
 
@@ -119,9 +120,9 @@ the orchestrator log.
 
 **"`pyarrow` not found"**: install the archive extra:
 ```bash
-pip install devbench[archive]
+uv sync --extra archive
 ```
-The mainline `pip install devbench` does NOT carry pyarrow; only
+The mainline install does NOT carry pyarrow; only
 operators who archive ended sessions install it.
 
 **"`logs/legacy/orchestrator.log` is taking up disk"**: after one

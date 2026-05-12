@@ -40,7 +40,7 @@ If the operator decides that some proposed drafts should never be promoted, they
 
 1. **Executor runs**, discovers a production bug during TDD, stages the fix, and emits an amendment request.
 2. **Amender rejects** because the fix is outside the source task's scope (diagnosed on Approach authorisation, scope minimality, or justification coherence).
-3. **Amender runs the git cleanup recipe** to revert the staged files (see [docs/manifest-amendments.md](manifest-amendments.md#reject-path-cleanup)) and invokes `uv run devbench reject-amendment`. The request is archived at `<workspace>/.devbench/rejected-requests/<id>-<timestamp>.json`.
+3. **Amender runs the git cleanup recipe** to revert the staged files (see [docs/manifest-amendments.md](manifest-amendments.md#flow)) and invokes `uv run devbench reject-amendment`. The request is archived at `<workspace>/.devbench/rejected-requests/<id>-<timestamp>.json`.
 4. **Orchestrator invokes `devbench:blocker-resolver`**. The agent reads the archived request + rejection rationale and decomposes the out-of-scope fixes into a structured proposal JSON. It calls `uv run devbench write-proposal <id>` with the JSON on stdin; the file lands at `<workspace>/.devbench/proposals/<id>.json`.
 5. **Orchestrator invokes `devbench:task-factory`**. The agent calls `uv run devbench materialise-proposal <id>`, which:
    - Reads the proposal JSON.
@@ -192,7 +192,7 @@ At the top of every orchestrate loop iteration (SKILL step 0, before `validate-b
 
 Output per proposal:
 
-- `sweep-proposals: materialised <source-id>: N task(s)` -- drafts successfully created.
+- `sweep-proposals: materialised <source-id>: N new, M skipped` -- drafts successfully created (N = new drafts, M = already-materialised tasks skipped).
 - `sweep-proposals: skipped <source-id>: <reason>` -- safety guard or thin-approach refusal fired.
 - `sweep-proposals: no-op <source-id>` -- every task already has a draft.
 
@@ -371,12 +371,12 @@ and
 Recovery cascades (a proposal whose source task is itself the
 materialisation of an earlier proposal) carry a `cascade_depth`
 field equal to `parent_depth + 1`. The
-`orchestrate.max_cascade_depth` YAML knob (default `3`, env override
+`orchestrate.max_cascade_depth` YAML knob (default `2`, env override
 `JUDGE_ORCHESTRATE_MAX_CASCADE_DEPTH`) caps recursion. When
 `cmd_materialise_proposal` sees a proposal at the cap, it transitions
 the source task to `NEEDS_OPERATOR_ATTENTION` instead of authoring
-another draft. Default of 3 reflects observed cascade lengths in
-production backlogs; raise per-workspace via YAML if your operator
+another draft. Default of 2 reflects the bounded cascade depth needed
+for typical recovery chains; raise per-workspace via YAML if your operator
 loop genuinely needs deeper chains.
 
 ## Materialise-time placeholder rejection (issue #143)

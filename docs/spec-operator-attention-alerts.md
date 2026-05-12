@@ -10,7 +10,7 @@ This document captures the design context for a future devbench feature that pro
 Devbench today surfaces two classes of items that require a human decision:
 
 1. **Proposed drafts** -- work units at `## Status: proposed` that the operator must `promote-proposal` or `reject-proposal`. Task-factory materialises these from proposal JSONs; the orchestrator's `devbench next` intentionally skips them (they are inert by design).
-2. **Blocked tasks classified as `NEEDS_OPERATOR_ATTENTION`** -- tasks in `## Status: blocked` whose `[BLOCKED_PENDING_PROPOSAL]` markers are absent, incomplete, or already terminal. See [ADR-10 slice G](adr/10-multi-target-proposal-wiring.md) for the `classify_blocked_task` contract.
+2. **Blocked tasks classified as `NEEDS_OPERATOR_ATTENTION`** -- tasks in `## Status: blocked` whose `[BLOCKED_PENDING_PROPOSAL]` markers are absent, incomplete, or already terminal. See `src/devbench/backlog/proposal.py::classify_blocked_task` (line 255 at SHA `005277b`) for the classifier contract; the observability machinery was introduced in [ADR-08](adr/08-proposal-lifecycle-observability.md) (slices G-J).
 
 The operator discovers both of these today by polling: running `devbench status`, `devbench report`, and `devbench list-proposals` on some cadence the operator chooses. A long-running orchestrate session can accumulate hours of latency before the operator glances at the terminal and realises something is waiting. The polling works, but there is no active signal telling the operator when it is worth looking.
 

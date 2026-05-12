@@ -279,6 +279,7 @@ class BacklogManager:
         known_ids = {row_id for row_id, _, _ in rows if row_id and not row_id.startswith("-")}
 
         errors: list[str] = []
+        self._check_full_index_has_rows(backlog_index, errors)
         indexed_files = self._check_files_and_statuses(rows, workspace_root, errors)
         self._check_orphans(workspace_root, indexed_files, errors)
         self._check_dependencies(backlog_index, known_ids, errors)
@@ -300,6 +301,50 @@ class BacklogManager:
         self._check_no_placeholder_manifest_rows(rows, workspace_root, errors)
         self._check_no_orphan_path_tokens(rows, workspace_root, errors)
         return errors
+
+    @staticmethod
+    def _check_full_index_has_rows(backlog_index: Path, errors: list[str]) -> None:
+        """Rule-0: verify that at least one work-unit row is parsed from '## Full Work Unit Index'.
+
+        A zero-row result means the section is missing or the table uses the
+        wrong format (e.g. a legacy 4-column section under a non-canonical heading). This
+        check fires BEFORE orphan detection (rule 3) so a malformed index does
+        not produce a stale orphan-storm that obscures the root cause.
+
+        Args:
+            backlog_index: Path to the ``BACKLOG.md`` index file.
+            errors: Mutable error list; the new error is prepended when the
+                check fires so it remains the first entry regardless of call
+                order within ``validate()``.
+        """
+        content = backlog_index.read_text(encoding="utf-8")
+        in_full_index = False
+        real_row_count = 0
+        for line in content.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("## "):
+                in_full_index = "Full Work Unit Index" in stripped
+                continue
+            if not in_full_index or not stripped.startswith("|"):
+                continue
+            cells = [c.strip() for c in line.split("|")]
+            if len(cells) != BACKLOG_INDEX_CELL_COUNT:
+                continue
+            row_id = cells[1]
+            if not row_id or row_id.lower() == "id" or row_id.startswith("-"):
+                continue
+            real_row_count += 1
+
+        if real_row_count == 0:
+            errors.insert(
+                0,
+                (
+                    f"No work-unit rows parsed from '{backlog_index}'."
+                    " The '## Full Work Unit Index' section is missing or malformed."
+                    " Expected 7-column rows:"
+                    " | ID | Title | Type | Status | Dependencies | Repo | File Path |"
+                ),
+            )
 
     def _apply_fixes(
         self,
@@ -620,6 +665,65 @@ class BacklogManager:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    # Target section headings whose checkboxes are ticked on done.
+    _TICK_SECTIONS: frozenset[str] = frozenset({"Acceptance Criteria", "Definition of Done"})
+
+    def _tick_completion_checkboxes(self, work_unit_path: Path) -> None:
+        """Rewrite unchecked / legacy-ticked AC and DoD checkboxes to checked + U+2705.
+
+        Walks the work-unit file line by line, tracking the current ``## ``
+        section.  Inside ``## Acceptance Criteria`` and ``## Definition of Done``
+        only, rewrites:
+
+        - ``- [ ] <content>``          -> ``- [x] <content> \u2705``
+        - ``- [x] <content>`` (no emoji) -> ``- [x] <content> \u2705``
+        - Already ``- [x] <content> \u2705`` lines -> no-op.
+
+        Lines outside the two target sections are never modified.  The file is
+        written back **only** when at least one line changed (preserving mtime
+        when the file is already fully ticked).
+
+        Args:
+            work_unit_path: Path to the work-unit ``.md`` file.
+        """
+        green_check = "\u2705"
+        content = work_unit_path.read_text(encoding="utf-8")
+        lines = content.splitlines(keepends=True)
+
+        in_target_section = False
+        new_lines: list[str] = []
+        changed = False
+
+        for line in lines:
+            stripped = line.rstrip("\n")
+            # Track section changes on ``## `` headings
+            if stripped.startswith("## "):
+                section_title = stripped[3:].strip()
+                in_target_section = section_title in self._TICK_SECTIONS
+                new_lines.append(line)
+                continue
+
+            if in_target_section:
+                # Match ``- [ ] ...`` (unchecked)
+                if stripped.startswith("- [ ] "):
+                    body = stripped[6:]
+                    new_line = f"- [x] {body} {green_check}\n"
+                    new_lines.append(new_line)
+                    changed = True
+                    continue
+                # Match ``- [x] ...`` without a trailing green-check (legacy ticked)
+                if stripped.startswith("- [x] ") and not stripped.endswith(green_check):
+                    body = stripped[6:]
+                    new_line = f"- [x] {body} {green_check}\n"
+                    new_lines.append(new_line)
+                    changed = True
+                    continue
+
+            new_lines.append(line)
+
+        if changed:
+            work_unit_path.write_text("".join(new_lines), encoding="utf-8")
+
     def _set_status(
         self,
         work_unit_path: Path,
@@ -645,6 +749,9 @@ class BacklogManager:
             unit_id,
             canonical,
         )
+
+        if canonical == STATUS_DONE:
+            self._tick_completion_checkboxes(work_unit_path)
 
         # Issue #162 Phase 2 (ADR-17): every task-state transition lands
         # in a per-task aggregate JSON at
@@ -1046,10 +1153,40 @@ class BacklogManager:
 
         work_unit_path.write_text(content, encoding="utf-8")
 
+    @staticmethod
+    def _find_next_section_index(lines: list[str], start: int) -> int:
+        """Return the line index of the next ``## `` heading after ``start``.
+
+        Scans forward from ``start + 1`` (exclusive of the TDD Cycle Log heading
+        itself) and returns the index of the first line whose first three
+        characters are ``## `` (case-sensitive).  Returns ``-1`` when no such
+        line exists.
+
+        Args:
+            lines: File content split into lines (no trailing newline on each).
+            start: Index of the ``## TDD Cycle Log`` heading line.
+
+        Returns:
+            Index of the next ``## `` heading, or ``-1`` if none found.
+        """
+        for idx in range(start + 1, len(lines)):
+            if lines[idx].startswith("## "):
+                return idx
+        return -1
+
     def _append_tdd_entry(self, work_unit_path: Path, phase: str, message: str) -> None:
         """Append a TDD phase entry to the TDD Cycle Log section of a work-unit file.
 
         Writes: ``- [<PHASE>] <ISO-8601 timestamp> -- <message>``
+
+        The entry is inserted immediately before the next ``## `` heading after
+        ``## TDD Cycle Log``.  When ``## TDD Cycle Log`` is the last section in
+        the file (no following ``## `` heading exists), the entry is appended at
+        EOF -- preserving the original edge-case behaviour.
+
+        Exactly one blank line separates the new entry from the preceding
+        content, and exactly one blank line separates the new entry from the
+        following ``## `` heading (when one exists).
 
         Args:
             work_unit_path: Path to the work-unit ``.md`` file.
@@ -1071,7 +1208,24 @@ class BacklogManager:
                 "The section must already exist in the work unit file (it is defined in the task spec template)."
             )
 
-        content = content.rstrip("\n") + "\n\n" + entry
+        lines = content.splitlines()
+        tdd_heading_idx = next(i for i, line in enumerate(lines) if line == TDD_CYCLE_LOG_SECTION_HEADER)
+        next_section_idx = self._find_next_section_index(lines, tdd_heading_idx)
+
+        if next_section_idx == -1:
+            # ## TDD Cycle Log is the last section -- append to EOF.
+            content = content.rstrip("\n") + "\n\n" + entry
+        else:
+            # Insert before the next ## heading, preserving exactly one blank
+            # line above the entry and exactly one blank line below it.
+            before_next = lines[:next_section_idx]
+            # Strip trailing blank lines from the block before the next heading.
+            while before_next and before_next[-1].strip() == "":
+                before_next.pop()
+            new_lines = before_next + ["", entry.rstrip("\n"), "", lines[next_section_idx]]
+            new_lines.extend(lines[next_section_idx + 1 :])
+            content = "\n".join(new_lines) + "\n"
+
         work_unit_path.write_text(content, encoding="utf-8")
 
     def _update_status_summary(self, backlog_index: Path) -> None:

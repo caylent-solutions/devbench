@@ -138,19 +138,7 @@ IDs are case-insensitive in status matching but written in uppercase by conventi
 
 A status is *terminal* when a parent's auto-rollup treats it as complete. `done` and `declined` are terminal; `hold` is **not** -- a held child keeps its parent open. This guarantees that pausing a unit cannot accidentally close out its parent.
 
-#### Blocked-task classification (3-state, Part-1)
-
-A `blocked` work unit is in one of three states. The orchestrator advances tasks through these states in a known order so operators see only what truly needs human action:
-
-1. **`AUTO_CLEARING_VIA_PROPOSAL`** -- the task carries a `[BLOCKED_PENDING_PROPOSAL] <target>` marker chain whose targets all exist in the backlog AND at least one is non-terminal. The auto-requeue cascade fires when every target reaches terminal. Operator does nothing.
-2. **`AWAITING_AUTO_RECOVERY`** -- one of: (a) the task has a pending proposal JSON at `<workspace>/.devbench/proposals/<id>.json` (blocker-resolver wrote it; task-factory will materialise + promote on the next sweep); (b) a rejected-amendment archive at `<workspace>/.devbench/rejected-requests/<id>-*.json` (manifest-amender rejected; blocker-resolver runs next); (c) a recent `[BLOCKED]` audit-comment from a recovery agent (orchestrator / blocker_resolver / manifest_amender) within `JUDGE_BLOCKED_RECOVERY_WINDOW_SECONDS` (default 1800s); OR (d, issue #149) the task's regular task-level dependencies are still in flight (non-terminal) regardless of marker state. Operator does nothing -- the orchestrator's next iteration advances the task.
-3. **`NEEDS_OPERATOR_ATTENTION`** -- everything else: manual blockers (`DO NOT CLAIM` text in the description), unknown marker targets (cascade cannot resolve), every marker terminal AND every regular dep terminal (cascade should have fired and didn't), or no marker + no recovery signal at all. Operator must act.
-
-**Cascade-on-every-terminal-transition** (issue #147). The auto-requeue cascade fires from `BacklogManager._set_status` whenever the transition target is terminal (`done` OR `declined`). Previously only `mark_done` invoked the cascade, leaving downstream blocked tasks marooned when a dep was declined or force-set to a terminal status. The trigger is centralised in `_set_status` so every public API (`mark_done`, `mark_declined`, `force_status`, `set-status`) routes through the same code path, and a per-instance `(backlog_index, unit_id)` guard prevents redundant double-fires when the same target is reset to the same terminal status twice.
-
-**Audit-supersession in `status --detail`** (issue #153). The work-unit Comments section is append-only -- every `[BLOCKED]` / `[UNBLOCKED]` / `[CASCADE_RESOLVED]` audit row stays in the file forever. The status-detail panel renderer hides `[BLOCKED]` rows that have been superseded by a later positive transition (`[UNBLOCKED]` from sync-blocked / `[CASCADE_RESOLVED]` from the auto-requeue cascade), so the operator only sees the live blocking cause. The cascade re-queue audit reads `[AUTO_UNBLOCKED] [CASCADE_RESOLVED] ...` so legacy operator tooling that greps for `[AUTO_UNBLOCKED]` continues to work.
-
-`devbench report` renders the three states as separate panels under each `Blocked tasks (...)` heading. `devbench status` summarises with `Blocked (auto)` / `Blocked (recovery)` / `Blocked (attn)` rows, each padded to the same width so an empty bucket stays visible at zero.
+Every blocked work unit is routed into one of six classes by the classifier in `src/devbench/backlog/proposal.py`; see [block-types.md](block-types.md) for the operator-facing reference.
 
 The orchestrator's `next` query and parallel-candidate scan filter to `in-queue` and `in-progress` only, so `hold`, `declined`, and `blocked` units are skipped automatically. Operators move units in and out of `hold` with `devbench hold <id> --reason <text>` and `devbench unhold <id> --reason <text>` (both reasons are required and captured in the work-unit's Comments audit trail).
 
@@ -241,27 +229,27 @@ The canonical Status Summary format is **per-epic** -- one row per top-level epi
 ```markdown
 ## Status Summary
 
-| Epic | Title | Done | In Progress | In Queue | Blocked |
-|------|-------|------|-------------|----------|---------|
-| E1   | Backlog tooling | 8 | 1 | 2 | 0 |
-| E2   | Migration scripts | 4 | 0 | 5 | 1 |
+| Epic | Title | Done | In Progress | In Queue | Blocked | Declined |
+|------|-------|------|-------------|----------|---------|----------|
+| E1   | Backlog tooling | 8 | 1 | 2 | 0 | 0 |
+| E2   | Migration scripts | 4 | 0 | 5 | 1 | 0 |
 ```
 
-`in-review` is a transient state during the review tier and is not surfaced in the summary; units in review are still counted under `In Progress` for summary purposes.
+`in-review` is a transient state during the review tier and is not surfaced in the summary; units in review are not counted in the summary table (`src/devbench/backlog/manager.py`, `_compute_epic_counts`).
 
 ### Index rows
 
 Below the Status Summary, one row per work unit:
 
 ```markdown
-## Work Units
+## Full Work Unit Index
 
-| ID | Title | Status | File |
-|----|-------|--------|------|
-| E1-F1-S1-T1 | Add greeting utility | done | backlog/E1-name/E1-F1-name/E1-F1-S1-name/E1-F1-S1-T1-name.md |
+| ID | Title | Type | Status | Dependencies | Repo | File Path |
+|----|-------|------|--------|--------------|------|-----------|
+| E1-F1-S1-T1 | Add greeting utility | Task | done | None | org/my-repo | `backlog/E1-name/E1-F1-name/E1-F1-S1-name/E1-F1-S1-T1-name.md` |
 ```
 
-The `File` column must be a path relative to `JUDGE_WORKSPACE_ROOT`. `validate-backlog` verifies each file exists at that path.
+The `File Path` column must be a path relative to `JUDGE_WORKSPACE_ROOT`. `validate-backlog` verifies each file exists at that path.
 
 ---
 
@@ -412,6 +400,18 @@ Each auto-rollup writes an audit comment to the parent's Comments section so the
 ```
 
 Rollup happens synchronously inside `mark-done`. There is no background process and no race condition.
+
+### Auto-tick of AC / DoD checkboxes on done
+
+Whenever a work unit transitions to `done` (whether via `mark-done`, `force-status done`, or auto-rollup), `BacklogManager._tick_completion_checkboxes()` rewrites every checkbox line inside the `## Acceptance Criteria` and `## Definition of Done` sections of the work-unit file:
+
+- `- [ ] <content>` becomes `- [x] <content> ✅`
+- `- [x] <content>` (ticked but without the green-check emoji) becomes `- [x] <content> ✅`
+- Lines already ending with `✅` are left unchanged (idempotent).
+
+Lines outside the two target sections are never modified. The canonical N/A suffix (e.g. `-- N/A for Markdown Tasks (no Python source authored)`) is preserved verbatim; the green-check appends after the suffix. The file is written back only when at least one line changed, so a second call on an already-ticked file is a true no-op (mtime unchanged).
+
+The green-check character is U+2705 (✅). U+2014 (em-dash) is never written; validate-backlog rule 10 rejects em-dashes in work-unit files and the helper is explicitly tested to produce zero em-dash bytes.
 
 ---
 

@@ -223,18 +223,6 @@ Additional rules enforced as part of the Backlog A lessons-learned tooling (see 
 
 Invoked automatically at orchestrator startup; operators should run it after hand-edits.
 
-### `upgrade`
-
-```
-uv run devbench upgrade [--migrate-log-shards]
-```
-
-Idempotent migration to the latest devbench layout. Detects workspace state and runs the safe migrations automatically; default-deny on the destructive Phase 3 sharded-log migration (only runs with `--migrate-log-shards`). Self-tests via `BacklogParser.parse_index()` at the end so the operator sees pass/fail before walking away.
-
-The full migration story is in [docs/upgrade-guide.md](upgrade-guide.md). Per-phase commands (`rebuild-window-stats`, `migrate-log-shards`, `write-snapshot`, `archive-session`) are documented below for fine-grained control; `upgrade` orchestrates them.
-
-Issue #162; ADR-22.
-
 ### `write-snapshot`
 
 ```
@@ -249,7 +237,7 @@ Render the report once and persist it to `<workspace>/.devbench/report-snapshot.
 uv run devbench rebuild-window-stats
 ```
 
-Walks the orchestrator log and rebuilds every per-task aggregate JSON under `<workspace>/.devbench/window-stats/`. Idempotent; safe to run at any cadence. Used by `devbench upgrade` after a version pull and by operators after manually deleting `.devbench/window-stats/`. ADR-17.
+Walks the orchestrator log and rebuilds every per-task aggregate JSON under `<workspace>/.devbench/window-stats/`. Idempotent; safe to run at any cadence. Use after manually deleting `.devbench/window-stats/` or when window-stats files appear out of sync with the log. ADR-17.
 
 ### `archive-session`
 
@@ -258,14 +246,6 @@ uv run devbench archive-session <session-id> [--log-path <path>]
 ```
 
 Convert an ended session's JSONL log to a Parquet cold archive at `<workspace>/logs/legacy/<session-id>.parquet`. **Opt-in** via `pip install devbench[archive]`; raises `ArchiveDependencyMissing` with the install command when `pyarrow` isn't installed. Per-session; operator-driven. ADR-21.
-
-### `migrate-log-shards`
-
-```
-uv run devbench migrate-log-shards --migrate-log-shards
-```
-
-**DESTRUCTIVE** (per CLAUDE.md execute-with-care; refuses to run without the `--migrate-log-shards` flag). Partitions `logs/orchestrator.log` into `logs/<YYYY-MM>/<task>.jsonl` shards and archives the original to `logs/legacy/orchestrator.log` for one release cycle. Reversible: restore via `mv logs/legacy/orchestrator.log logs/orchestrator.log && rm -rf logs/<YYYY-MM>/`. ADR-18.
 
 ### `check`
 

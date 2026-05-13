@@ -1,7 +1,15 @@
 # ADR-18: Sharded Event Store (Migration-Only, Live Writes Stay Flat)
 
-**Status:** Accepted
+**Status:** Accepted (migration command removed in v1.0 cleanup; see note below)
 **Date:** 2026-05-04
+
+> **Note (2026-05-13, issue #167).** The `devbench migrate-log-shards`
+> command and its `devbench upgrade` integration were removed in the v1.0
+> cleanup. The sharded-event-store layout described here is still the
+> documented optional advanced operator layout, but operators that want to
+> migrate flat history to shards now do so manually (a 30-line script in
+> the spirit of `migrate_flat_to_sharded` is preserved internally for
+> reference). See ADR-22 for the cleanup rationale.
 
 ---
 

@@ -249,6 +249,13 @@ Below the Status Summary, one row per work unit:
 | E1-F1-S1-T1 | Add greeting utility | Task | done | None | org/my-repo | `backlog/E1-name/E1-F1-name/E1-F1-S1-name/E1-F1-S1-T1-name.md` |
 ```
 
+> **Canonical 7-column format -- required exactly.** The header row MUST read
+> `| ID | Title | Type | Status | Dependencies | Repo | File Path |`
+> in that exact order and spelling. Any deviation (renamed columns, reordered
+> columns, extra columns, missing columns, or a separator row with the wrong
+> cell count) is rejected by `validate-backlog` as a Rule-0 error and causes
+> `devbench report` to exit non-zero with a parse-error diagnostic.
+
 The `File Path` column must be a path relative to `JUDGE_WORKSPACE_ROOT`. `validate-backlog` verifies each file exists at that path.
 
 ---

@@ -6991,6 +6991,126 @@ class TestCmdWriteProposalBacklogRepoSkip:
             assert not cli._file_lives_in_a_target_repo("docs/architecture.md")
             assert not cli._file_lives_in_a_target_repo("")
 
+    def test_repo_relative_path_classified_via_source_task(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Issue #180: a repo-relative path like ``src/foo.py`` (no
+        checkout_directory prefix) must classify as target-repo when the
+        source task resolves to a configured repo. blocker-resolver agents
+        running from inside the source's checkout naturally emit paths in
+        this form; the recovery cascade must NOT silently skip them.
+        """
+        import io
+
+        # Build a backlog where E0-F1-S1-T1 targets the kanon repo.
+        backlog_root = tmp_path / "backlog"
+        backlog_root.mkdir(parents=True)
+        wu_dir = backlog_root / "E0-name" / "E0-F1-name" / "E0-F1-S1-name"
+        wu_dir.mkdir(parents=True)
+        wu_path = wu_dir / "E0-F1-S1-T1-name.md"
+        wu_path.write_text(
+            "# E0-F1-S1-T1: Source Task\n\n"
+            "## Status: blocked\n\n"
+            "## Target Repository\n\n"
+            "- **Repo:** `caylent-solutions/kanon`\n\n"
+            "## Description\n\nFixture task.\n\n"
+            "## Changes Manifest\n\n"
+            "| Path | Notes |\n|------|-------|\n| src/foo.py | impl |\n\n"
+            "## Comments\n",
+            encoding="utf-8",
+        )
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text(
+            "# Backlog\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Source Task | Task | blocked | None | caylent-solutions/kanon | "
+            "`backlog/E0-name/E0-F1-name/E0-F1-S1-name/E0-F1-S1-T1-name.md` |\n",
+            encoding="utf-8",
+        )
+
+        payload = self._payload(
+            "E0-F1-S1-T1",
+            [
+                {
+                    "suggested_id": "E0-F1-S1-T2",
+                    "title": "Fix X repo-relative",
+                    # Path is repo-relative (no `kanon/` prefix). Under
+                    # the pre-fix classifier, this would be misread as
+                    # backlog-repo and skipped.
+                    "files_to_own": ["src/bar.py"],
+                    "linked_scenarios": [],
+                    "suggested_acs": [],
+                    "suggested_approach": "Add the bar helper",
+                }
+            ],
+        )
+        monkeypatch.setattr("sys.stdin", io.StringIO(payload))
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_root),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.RUNTIME_CONFIG", self._mk_runtime_config()),
+        ):
+            rc = cli.cmd_write_proposal("E0-F1-S1-T1")
+        assert rc == 0
+        envelope = json.loads(capsys.readouterr().out)
+        assert envelope.get("recovery_skipped") is not True, (
+            f"repo-relative path must NOT trigger backlog-repo skip: {envelope!r}"
+        )
+        assert envelope["proposal_path"] is not None
+        persisted = json.loads((tmp_path / ".devbench" / "proposals" / "E0-F1-S1-T1.json").read_text(encoding="utf-8"))
+        assert persisted["proposed_tasks"][0]["files_to_own"] == ["src/bar.py"]
+
+    def test_helper_with_source_task_treats_repo_relative_as_target(self, tmp_path: Path) -> None:
+        """Direct test for the new ``source_task_id`` parameter behaviour.
+
+        With ``source_task_id`` provided and the source resolving to a
+        configured repo, repo-relative paths classify as target-repo;
+        without it (back-compat), they classify as backlog-repo. Both
+        cases must still treat the unambiguous backlog-only ``BACKLOG.md``
+        as a non-target path (it carries no target-repo prefix and is
+        not a plausible inside-repo path).
+        """
+        backlog_root = tmp_path / "backlog"
+        backlog_root.mkdir(parents=True)
+        wu_dir = backlog_root / "E0-name" / "E0-F1-name" / "E0-F1-S1-name"
+        wu_dir.mkdir(parents=True)
+        wu_path = wu_dir / "E0-F1-S1-T1-name.md"
+        wu_path.write_text(
+            "# E0-F1-S1-T1: Source Task\n\n"
+            "## Status: blocked\n\n"
+            "## Target Repository\n\n"
+            "- **Repo:** `caylent-solutions/kanon`\n\n"
+            "## Description\n\nFixture task.\n\n"
+            "## Changes Manifest\n\n"
+            "| Path | Notes |\n|------|-------|\n| src/foo.py | impl |\n\n"
+            "## Comments\n",
+            encoding="utf-8",
+        )
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text(
+            "# Backlog\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Source Task | Task | blocked | None | caylent-solutions/kanon | "
+            "`backlog/E0-name/E0-F1-name/E0-F1-S1-name/E0-F1-S1-T1-name.md` |\n",
+            encoding="utf-8",
+        )
+        with (
+            patch("devbench.cli.RUNTIME_CONFIG", self._mk_runtime_config()),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_root),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            # With source -> repo-relative path counts as target-repo.
+            assert cli._file_lives_in_a_target_repo("src/foo.py", source_task_id="E0-F1-S1-T1")
+            # With source -> still True for prefixed paths.
+            assert cli._file_lives_in_a_target_repo("kanon/src/foo.py", source_task_id="E0-F1-S1-T1")
+            # Without source (back-compat) -> repo-relative path returns False.
+            assert not cli._file_lives_in_a_target_repo("src/foo.py")
+
 
 class TestCmdWriteProposalCheckoutPrefixStrip:
     """Issue #159: ``cmd_write_proposal`` must strip ``<checkout_directory>/``
@@ -9335,6 +9455,128 @@ class TestInProgressAttemptDurationLatestAttemptOnly:
         assert result is None
 
 
+class TestTryResolveLogFilePath:
+    """Issue #185: ``_try_resolve_log_file_path`` returns ``None`` instead of
+    raising ``SystemExit`` so the status-timer fallback can consult the
+    YAML config without crashing when none of the three resolution
+    inputs is set.
+    """
+
+    def test_returns_none_when_resolve_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
+        monkeypatch.delenv("JUDGE_WORKSPACE_ROOT", raising=False)
+        cfg = MagicMock()
+        cfg.log_file = ""
+        with patch("devbench.cli.RUNTIME_CONFIG", cfg):
+            result = cli._try_resolve_log_file_path()
+        assert result is None
+
+    def test_returns_path_when_yaml_log_file_set(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When ``JUDGE_LOG_FILE`` is unset but YAML config carries a
+        ``log_file``, the wrapper resolves the workspace-relative path."""
+        monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
+        monkeypatch.setenv("JUDGE_WORKSPACE_ROOT", str(tmp_path))
+        cfg = MagicMock()
+        cfg.log_file = "logs/orch.log"
+        with patch("devbench.cli.RUNTIME_CONFIG", cfg):
+            result = cli._try_resolve_log_file_path()
+        assert result == tmp_path / "logs" / "orch.log"
+
+    def test_timer_uses_yaml_config_when_env_unset(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """End-to-end: ``_latest_log_in_progress_ts`` resolves the log via
+        YAML ``log_file`` when ``JUDGE_LOG_FILE`` is unset. Prior to
+        issue #185 the helper bailed out with ``None`` causing
+        ``cmd_status`` to render ``timer unavailable`` even though the
+        log was discoverable."""
+        log_path = tmp_path / "logs" / "orch.log"
+        log_path.parent.mkdir(parents=True)
+        log_path.write_text(
+            "2026-05-02T12:00:00Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'in-progress'\n",
+            encoding="utf-8",
+        )
+        monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
+        monkeypatch.setenv("JUDGE_WORKSPACE_ROOT", str(tmp_path))
+        cfg = MagicMock()
+        cfg.log_file = "logs/orch.log"
+        with patch("devbench.cli.RUNTIME_CONFIG", cfg):
+            ts = cli._latest_log_in_progress_ts("E0-F1-S1-T1", None)
+        assert ts is not None
+        assert ts.year == 2026 and ts.hour == 12 and ts.minute == 0
+
+
+class TestCmdStatusNextActionableFilter:
+    """Issue #185(c): the ``Next actionable`` line excludes IDs already
+    rendered in ``Active work units`` (those are IN_PROGRESS / IN_REVIEW
+    and ``get_parallel_candidates`` includes IN_PROGRESS for resume).
+    Previously the line redundantly echoed the current claim.
+    """
+
+    def test_actionable_filtered_when_same_as_active(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        in_prog = WorkUnit(
+            id="E0-F1-S1-T1",
+            title="Active",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T1.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+        in_queue = WorkUnit(
+            id="E0-F1-S1-T2",
+            title="Next up",
+            status=WorkUnitStatus.IN_QUEUE,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T2.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [in_prog, in_queue]
+        # get_parallel_candidates returns IN_PROGRESS first, then IN_QUEUE.
+        mock_parser.get_parallel_candidates.return_value = [in_prog, in_queue]
+        mock_parser.all_done.return_value = False
+        mock_parser.get_blocked_units.return_value = []
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            rc = cli.cmd_status()
+        assert rc == 0
+        out = capsys.readouterr().out
+        # Active panel still shows the in-progress task ...
+        assert "E0-F1-S1-T1" in out
+        # ... and Next actionable points at the DIFFERENT in-queue task.
+        assert "Next actionable: E0-F1-S1-T2" in out
+
+    def test_no_actionable_message_when_only_active(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """When the only candidate is the in-progress task itself, the
+        ``Next actionable`` line is suppressed (no genuine next task)."""
+        in_prog = WorkUnit(
+            id="E0-F1-S1-T1",
+            title="Active",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T1.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [in_prog]
+        mock_parser.get_parallel_candidates.return_value = [in_prog]
+        mock_parser.all_done.return_value = False
+        mock_parser.get_blocked_units.return_value = []
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            rc = cli.cmd_status()
+        assert rc == 0
+        out = capsys.readouterr().out
+        # No "Next actionable" line; instead the no-actionable branch fires.
+        assert "Next actionable" not in out
+        assert "No actionable units." in out
+
+
 class TestCmdWriteSnapshot:
     """Issue #162 Phase 6 (ADR-20): write a fresh report snapshot."""
 
@@ -9466,366 +9708,6 @@ class TestCmdArchiveSession:
             rc = cli.cmd_archive_session("s1")
         assert rc == 1
         assert "not found" in capsys.readouterr().err
-
-
-class TestCmdMigrateLogShards:
-    """Issue #162 Phase 3 (ADR-18): destructive sharded-log migration."""
-
-    def test_refuses_without_flag(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        log = tmp_path / "logs" / "orchestrator.log"
-        log.parent.mkdir(parents=True)
-        log.write_text("2026-05-04T10:00:00Z [agent] INFO Set E0-F1-S1-T1 to 'done' in both files\n")
-        with (
-            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
-            patch("devbench.cli._resolve_log_file_path", return_value=log),
-        ):
-            rc = cli.cmd_migrate_log_shards()
-        assert rc == 0
-        assert log.is_file()  # source untouched
-        assert "refusing to run" in capsys.readouterr().out
-
-    def test_runs_with_flag(self, tmp_path: Path) -> None:
-        log = tmp_path / "logs" / "orchestrator.log"
-        log.parent.mkdir(parents=True)
-        log.write_text("2026-05-04T10:00:00Z [agent] INFO Set E0-F1-S1-T1 to 'done' in both files\n")
-        with (
-            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
-            patch("devbench.cli._resolve_log_file_path", return_value=log),
-        ):
-            rc = cli.cmd_migrate_log_shards("--migrate-log-shards")
-        assert rc == 0
-        assert not log.exists()
-        assert (tmp_path / "logs" / "legacy" / "orchestrator.log").is_file()
-        assert (tmp_path / "logs" / "2026-05" / "E0-F1-S1-T1.jsonl").is_file()
-
-    def test_rejects_extra_positional(self, capsys: pytest.CaptureFixture[str]) -> None:
-        rc = cli.cmd_migrate_log_shards("--migrate-log-shards", "extra")
-        assert rc == 1
-        assert "no positional" in capsys.readouterr().err
-
-    def test_handles_missing_log_with_flag(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        with (
-            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
-            patch("devbench.cli._resolve_log_file_path", return_value=tmp_path / "nope.log"),
-        ):
-            rc = cli.cmd_migrate_log_shards("--migrate-log-shards")
-        assert rc == 1
-        assert "not found" in capsys.readouterr().err
-
-
-class TestCmdUpgrade:
-    """Issue #162 unified upgrade command (ADR-22)."""
-
-    def _seed_minimal_workspace(self, tmp_path: Path) -> Path:
-        log = tmp_path / "logs" / "orchestrator.log"
-        log.parent.mkdir(parents=True)
-        log.write_text(
-            "2026-05-04T10:00:00Z [agent] INFO Set E0-F1-S1-T1 to 'in-progress' in both files\n"
-            "2026-05-04T10:30:00Z [agent] INFO Set E0-F1-S1-T1 to 'done' in both files\n"
-        )
-        backlog_dir = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
-        backlog_dir.mkdir(parents=True)
-        (backlog_dir / "E0-F1-S1-T1.md").write_text(
-            "# E0-F1-S1-T1: Test\n\n## Status: done\n\n"
-            "## Description\n\nx\n\n"
-            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n"
-        )
-        (tmp_path / "BACKLOG.md").write_text(
-            "# Backlog\n\n## Status Summary\n\n"
-            "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
-            "|------|-------|------|-------------|----------|---------|\n"
-            "| E0 | x | 1 | 0 | 0 | 0 |\n\n"
-            "## Full Work Unit Index\n\n"
-            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
-            "|----|-------|------|--------|--------------|------|-----------|\n"
-            "| E0-F1-S1-T1 | Test | Task | done | None | r | "
-            "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n"
-        )
-        return log
-
-    def test_default_skips_destructive(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        log = self._seed_minimal_workspace(tmp_path)
-        with (
-            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
-            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
-            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
-            patch("devbench.cli._resolve_log_file_path", return_value=log),
-        ):
-            rc = cli.cmd_upgrade()
-        assert rc == 0
-        out = capsys.readouterr().out
-        assert "Phase 1+4" in out
-        assert "Phase 2" in out
-        assert "Phase 3" in out
-        assert "Phase 6" in out
-        assert "Phase 7" in out
-        assert "Self-tests" in out
-        assert "Pass --migrate-log-shards" in out
-        assert log.is_file()  # Phase 3 didn't run
-        assert (tmp_path / ".devbench" / "window-stats" / "E0-F1-S1-T1.json").is_file()
-        assert "passes" in out
-        # Issue #168: report self-test reports non-zero indexed events
-        # (the seeded log has two state transitions => 2 events).
-        assert "report self-test" in out
-        assert "2 log event(s) indexed" in out
-
-    def test_report_self_test_warns_on_empty_log(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        """Issue #168: when the orch-log set is empty (would have caught the
-        live regression I hit pre-#168), the self-test surfaces a structured
-        warning naming the rollback procedure."""
-        # Seed a workspace with a valid backlog but NO log content.
-        backlog_dir = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
-        backlog_dir.mkdir(parents=True)
-        (backlog_dir / "E0-F1-S1-T1.md").write_text(
-            "# E0-F1-S1-T1: Test\n\n## Status: in-queue\n\n"
-            "## Description\n\nx\n\n"
-            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n"
-        )
-        (tmp_path / "BACKLOG.md").write_text(
-            "# Backlog\n\n## Status Summary\n\n"
-            "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
-            "|------|-------|------|-------------|----------|---------|\n"
-            "| E0 | x | 0 | 0 | 1 | 0 |\n\n"
-            "## Full Work Unit Index\n\n"
-            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
-            "|----|-------|------|--------|--------------|------|-----------|\n"
-            "| E0-F1-S1-T1 | Test | Task | in-queue | None | r | "
-            "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n"
-        )
-        empty_log_dir = tmp_path / "logs"
-        empty_log_dir.mkdir()
-        empty_log = empty_log_dir / "orchestrator.log"
-        empty_log.write_text("")  # empty log + no shards => 0 events expected
-
-        with (
-            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
-            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
-            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
-            patch("devbench.cli._resolve_log_file_path", return_value=empty_log),
-        ):
-            rc = cli.cmd_upgrade()
-
-        assert rc == 0
-        out = capsys.readouterr().out
-        assert "report self-test: 0 log events indexed" in out
-        # Rollback hint surfaces.
-        assert "Roll back via:" in out
-        assert "mv logs/legacy/orchestrator.log" in out
-
-    def test_report_self_test_passes_with_sharded_layout(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        """Issue #168 positive path: post-migration workspace (sharded
-        tree present, live log empty) -- reader integration finds events
-        in the shards and the self-test passes. This is the test that
-        would have FAILED pre-#168 because event_index wouldn't have
-        consumed the shard."""
-        # Backlog setup.
-        backlog_dir = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
-        backlog_dir.mkdir(parents=True)
-        (backlog_dir / "E0-F1-S1-T1.md").write_text(
-            "# E0-F1-S1-T1: Test\n\n## Status: done\n\n"
-            "## Description\n\nx\n\n"
-            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n"
-        )
-        (tmp_path / "BACKLOG.md").write_text(
-            "# Backlog\n\n## Status Summary\n\n"
-            "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
-            "|------|-------|------|-------------|----------|---------|\n"
-            "| E0 | x | 1 | 0 | 0 | 0 |\n\n"
-            "## Full Work Unit Index\n\n"
-            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
-            "|----|-------|------|--------|--------------|------|-----------|\n"
-            "| E0-F1-S1-T1 | Test | Task | done | None | r | "
-            "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n"
-        )
-        # Sharded tree with one shard.
-        shard = tmp_path / "logs" / "2026-05" / "E0-F1-S1-T1.jsonl"
-        shard.parent.mkdir(parents=True)
-        shard.write_text(
-            "2026-05-04T10:00:00Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'in-progress'\n"
-            "2026-05-04T11:00:00Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'done'\n"
-        )
-        # Empty live log.
-        live_log = tmp_path / "logs" / "orchestrator.log"
-        live_log.write_text("")
-
-        with (
-            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
-            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
-            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
-            patch("devbench.cli._resolve_log_file_path", return_value=live_log),
-        ):
-            rc = cli.cmd_upgrade()
-
-        assert rc == 0
-        out = capsys.readouterr().out
-        # Self-test sees the 2 events from the shard.
-        assert "report self-test: 2 log event(s) indexed" in out
-
-    def test_rerun_idempotent(self, tmp_path: Path) -> None:
-        log = self._seed_minimal_workspace(tmp_path)
-        with (
-            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
-            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
-            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
-            patch("devbench.cli._resolve_log_file_path", return_value=log),
-        ):
-            assert cli.cmd_upgrade() == 0
-            assert cli.cmd_upgrade() == 0
-
-    def test_destructive_flag_runs_phase_3(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        log = self._seed_minimal_workspace(tmp_path)
-        with (
-            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
-            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
-            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
-            patch("devbench.cli._resolve_log_file_path", return_value=log),
-        ):
-            rc = cli.cmd_upgrade("--migrate-log-shards")
-        assert rc == 0
-        out = capsys.readouterr().out
-        assert "migrated" in out
-        assert not log.exists()
-        assert (tmp_path / "logs" / "legacy" / "orchestrator.log").is_file()
-        assert (tmp_path / "logs" / "2026-05" / "E0-F1-S1-T1.jsonl").is_file()
-
-    def test_rejects_extra_positional(self, capsys: pytest.CaptureFixture[str]) -> None:
-        rc = cli.cmd_upgrade("--migrate-log-shards", "extra")
-        assert rc == 1
-        assert "no positional" in capsys.readouterr().err
-
-    def test_self_test_failure_when_backlog_missing(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        log = tmp_path / "logs" / "orchestrator.log"
-        log.parent.mkdir(parents=True)
-        log.write_text("seed\n")
-        with (
-            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
-            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
-            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
-            patch("devbench.cli._resolve_log_file_path", return_value=log),
-        ):
-            rc = cli.cmd_upgrade()
-        assert rc == 0  # migrations succeeded; self-test failure surfaces but doesn't fail rc
-        assert "parser-load failed" in capsys.readouterr().out
-
-    def test_phase_3_with_flag_handles_missing_log(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        backlog_dir = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
-        backlog_dir.mkdir(parents=True)
-        (backlog_dir / "E0-F1-S1-T1.md").write_text(
-            "# E0-F1-S1-T1: Test\n\n## Status: in-queue\n\n"
-            "## Description\n\nx\n\n"
-            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n"
-        )
-        (tmp_path / "BACKLOG.md").write_text(
-            "# Backlog\n\n## Status Summary\n\n"
-            "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
-            "|------|-------|------|-------------|----------|---------|\n"
-            "| E0 | x | 0 | 0 | 1 | 0 |\n\n"
-            "## Full Work Unit Index\n\n"
-            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
-            "|----|-------|------|--------|--------------|------|-----------|\n"
-            "| E0-F1-S1-T1 | Test | Task | in-queue | None | r | "
-            "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n"
-        )
-        with (
-            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
-            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
-            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
-            patch("devbench.cli._resolve_log_file_path", return_value=tmp_path / "nope.log"),
-        ):
-            rc = cli.cmd_upgrade("--migrate-log-shards")
-        assert rc == 0
-        assert "nothing to migrate" in capsys.readouterr().out
-
-    def test_cache_present_message(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        log = self._seed_minimal_workspace(tmp_path)
-        cache_dir = tmp_path / ".devbench" / "report-cache"
-        cache_dir.mkdir(parents=True)
-        (cache_dir / "events.sqlite").write_bytes(b"sqlite-fixture")
-        with (
-            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
-            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
-            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
-            patch("devbench.cli._resolve_log_file_path", return_value=log),
-        ):
-            cli.cmd_upgrade()
-        assert "cache present" in capsys.readouterr().out
-
-    def test_snapshot_present_message(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        log = self._seed_minimal_workspace(tmp_path)
-        snapshot_dir = tmp_path / ".devbench"
-        snapshot_dir.mkdir()
-        (snapshot_dir / "report-snapshot.json").write_text("{}")
-        with (
-            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
-            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
-            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
-            patch("devbench.cli._resolve_log_file_path", return_value=log),
-        ):
-            cli.cmd_upgrade()
-        assert "snapshot present" in capsys.readouterr().out
-
-    def test_log_absent_phase_2_message(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        backlog_dir = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
-        backlog_dir.mkdir(parents=True)
-        (backlog_dir / "E0-F1-S1-T1.md").write_text(
-            "# E0-F1-S1-T1: Test\n\n## Status: in-queue\n\n"
-            "## Description\n\nx\n\n"
-            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n"
-        )
-        (tmp_path / "BACKLOG.md").write_text(
-            "# Backlog\n\n## Status Summary\n\n"
-            "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
-            "|------|-------|------|-------------|----------|---------|\n"
-            "| E0 | x | 0 | 0 | 1 | 0 |\n\n"
-            "## Full Work Unit Index\n\n"
-            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
-            "|----|-------|------|--------|--------------|------|-----------|\n"
-            "| E0-F1-S1-T1 | Test | Task | in-queue | None | r | "
-            "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n"
-        )
-        with (
-            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
-            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
-            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
-            patch("devbench.cli._resolve_log_file_path", return_value=tmp_path / "nope.log"),
-        ):
-            cli.cmd_upgrade()
-        assert "orchestrator log absent" in capsys.readouterr().out
-
-    def test_pyarrow_absent_phase_7_message(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        log = self._seed_minimal_workspace(tmp_path)
-
-        def _no_pyarrow(name: str) -> object | None:
-            if name == "pyarrow":
-                return None
-            import importlib.util as _real
-
-            return _real.find_spec(name)
-
-        with (
-            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
-            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
-            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
-            patch("devbench.cli._resolve_log_file_path", return_value=log),
-            patch("importlib.util.find_spec", side_effect=_no_pyarrow),
-        ):
-            cli.cmd_upgrade()
-        out = capsys.readouterr().out
-        assert "pyarrow not installed" in out
-        assert "pip install devbench[archive]" in out
-
-    def test_pyarrow_present_phase_7_message(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        log = self._seed_minimal_workspace(tmp_path)
-        with (
-            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
-            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
-            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
-            patch("devbench.cli._resolve_log_file_path", return_value=log),
-        ):
-            cli.cmd_upgrade()
-        assert "Phase 7 (Parquet archive, opt-in)" in capsys.readouterr().out
 
 
 class TestCmdStatusSixBucketCounts:

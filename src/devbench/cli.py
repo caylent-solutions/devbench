@@ -241,6 +241,7 @@ def cmd_status(*argv: str) -> int:
         ("Blocked (dependency)", BlockedTaskState.AWAITING_DEPENDENCY),
         ("Blocked (held)", BlockedTaskState.HELD),
         ("Blocked (blocked-on-held)", BlockedTaskState.BLOCKED_ON_HELD),
+        ("Blocked (runtime-degradation)", BlockedTaskState.RUNTIME_DEGRADATION),
         ("Blocked (operator-required)", BlockedTaskState.OPERATOR_ACTION_REQUIRED),
     ]
     for status_val in DISPLAY_STATUS_VALUES:
@@ -265,7 +266,14 @@ def cmd_status(*argv: str) -> int:
                 )
             print(line)
 
-    actionable = parser.get_parallel_candidates(units)
+    # Issue #185: ``get_parallel_candidates`` includes IN_PROGRESS tasks
+    # (so an interrupted run can resume), but the "Next actionable" line
+    # is meant to point at the next DIFFERENT task to start once the
+    # current claim is done. Exclude any ID already rendered above in
+    # ``Active work units`` so the line is genuinely actionable, not a
+    # redundant echo of the in-progress claim.
+    active_ids = {u.id for u in active}
+    actionable = [u for u in parser.get_parallel_candidates(units) if u.id not in active_ids]
     if actionable:
         print(f"\nNext actionable: {actionable[0].id} -- {actionable[0].title}")
     elif parser.all_done(units):
@@ -304,6 +312,10 @@ def _print_blocked_panel_by_bucket(
         (BlockedTaskState.AWAITING_DEPENDENCY, "Blocked tasks (awaiting dependency)"),
         (BlockedTaskState.HELD, "Held tasks"),
         (BlockedTaskState.BLOCKED_ON_HELD, "Blocked tasks (blocked on held)"),
+        (
+            BlockedTaskState.RUNTIME_DEGRADATION,
+            "Blocked tasks (runtime-degradation -- restart `make start` to recover)",
+        ),
         (BlockedTaskState.OPERATOR_ACTION_REQUIRED, "Blocked tasks (operator action required)"),
     ]
     for state, header in bucket_headers:
@@ -424,12 +436,29 @@ _AUDIT_PROGRESS_RE: re.Pattern[str] = re.compile(
 )
 
 
+def _try_resolve_log_file_path() -> Path | None:
+    """Best-effort log-file resolution that never raises.
+
+    Wraps ``_resolve_log_file_path`` so callers that only need a *hint*
+    of the log location (the status timer; the in-progress duration
+    helper) degrade gracefully to ``None`` instead of propagating
+    ``SystemExit`` when none of ``JUDGE_LOG_FILE`` / YAML ``log_file`` /
+    ``JUDGE_WORKSPACE_ROOT`` is set. Issue #185: ``devbench status``
+    previously printed ``timer unavailable`` whenever ``JUDGE_LOG_FILE``
+    was unset even when the YAML config carried a usable ``log_file``;
+    this wrapper closes that gap.
+    """
+    try:
+        return _resolve_log_file_path()
+    except SystemExit:
+        return None
+
+
 def _latest_log_in_progress_ts(task_id: str, log_path: Path | None) -> datetime | None:
     """Return the most recent ``Set <task_id> to 'in-progress'`` timestamp from the log."""
     candidate = log_path
     if candidate is None:
-        env_log = os.environ.get("JUDGE_LOG_FILE", "")
-        candidate = Path(env_log) if env_log else None
+        candidate = _try_resolve_log_file_path()
     if candidate is None or not candidate.is_file():
         return None
     try:
@@ -1706,229 +1735,6 @@ def cmd_report(since: str = "", watch_interval: int = 0, once: bool = False) -> 
     return stream_report(log_file, _render)
 
 
-def cmd_upgrade(*argv: str) -> int:
-    """Idempotent migration to the latest devbench layout.
-
-    Issue #162 unified upgrade command (ADR-22). Detects workspace
-    state and runs the safe migrations automatically. Default-deny on
-    the Phase 3 destructive migration: only runs with
-    ``--migrate-log-shards``. Self-tests at the end via the
-    BacklogParser load so the operator sees pass/fail.
-
-    Re-running is a no-op (every step is idempotent).
-    """
-    args = list(argv)
-    confirm_log_migration = "--migrate-log-shards" in args
-    if confirm_log_migration:
-        args.remove("--migrate-log-shards")
-    if args:
-        print(
-            f"ERROR: upgrade takes no positional arguments; got {args!r}",
-            file=sys.stderr,
-        )
-        return 1
-
-    print(f"[upgrade] workspace: {WORKSPACE_ROOT}")
-    print()
-
-    log_path = _resolve_log_file_path()
-
-    _upgrade_report_cache_phase()
-    _upgrade_window_stats_phase(log_path)
-    rc = _upgrade_sharded_log_phase(log_path, confirm_log_migration)
-    if rc != 0:
-        return rc
-    _upgrade_snapshot_phase()
-    _upgrade_archive_phase()
-    _upgrade_self_tests_phase()
-
-    print()
-    print("Done. Migrations complete; run `devbench report` to verify.")
-    return 0
-
-
-def _upgrade_report_cache_phase() -> None:
-    """Phase 1+4: SQLite cache. Self-healing; no operator action."""
-    print("Phase 1+4 (incremental cache + SQLite index):")
-    cache_path = WORKSPACE_ROOT / ".devbench" / "report-cache" / "events.sqlite"
-    if cache_path.is_file():
-        print(f"  cache present at {cache_path.relative_to(WORKSPACE_ROOT)}; reads serve from cache")
-    else:
-        print("  cache absent -> first `devbench report` will build from logs/orchestrator.log")
-    print("  no operator action needed")
-    print()
-
-
-def _upgrade_window_stats_phase(log_path: Path) -> None:
-    """Phase 2: window-stats aggregates. Idempotent rebuild."""
-    print("Phase 2 (window indices):")
-    if log_path.is_file():
-        from devbench.reporting.window_stats import rebuild_from_log
-
-        count = rebuild_from_log(WORKSPACE_ROOT, log_path)
-        print(f"  rebuilt {count} task aggregate(s) under .devbench/window-stats/")
-    else:
-        print("  orchestrator log absent -> nothing to aggregate yet")
-    print()
-
-
-def _upgrade_sharded_log_phase(log_path: Path, confirmed: bool) -> int:
-    """Phase 3: destructive log shard migration. Default-deny."""
-    print("Phase 3 (sharded event store):")
-    if not confirmed:
-        print("  ! DESTRUCTIVE: rewrites logs/orchestrator.log into logs/<YYYY-MM>/<task>.jsonl")
-        print("  ! original archived to logs/legacy/orchestrator.log (kept one release cycle)")
-        print("  Pass --migrate-log-shards to proceed. Skipping for now.")
-        print()
-        return 0
-    if not log_path.is_file():
-        print("  orchestrator log absent -> nothing to migrate")
-        print()
-        return 0
-    from devbench.reporting.sharded_log import migrate_flat_to_sharded
-
-    try:
-        result = migrate_flat_to_sharded(WORKSPACE_ROOT, log_path)
-    except FileNotFoundError as exc:
-        print(f"  ERROR: {exc}")
-        return 1
-    print(
-        f"  migrated {result['lines_processed']} lines into "
-        f"{result['shards_written']} task shard(s) + "
-        f"{result['meta_shards_written']} meta shard(s)"
-    )
-    print("  original archived to logs/legacy/orchestrator.log")
-    print()
-    return 0
-
-
-def _upgrade_snapshot_phase() -> None:
-    """Phase 6: snapshot. Self-healing on next iteration."""
-    print("Phase 6 (materialised snapshots):")
-    snapshot_file = WORKSPACE_ROOT / ".devbench" / "report-snapshot.json"
-    if snapshot_file.is_file():
-        print(f"  snapshot present at {snapshot_file.relative_to(WORKSPACE_ROOT)}")
-    else:
-        print("  snapshot absent -> next orchestrate iteration will write it")
-    print("  no operator action needed")
-    print()
-
-
-def _upgrade_archive_phase() -> None:
-    """Phase 7: Parquet archive. Opt-in dep check only."""
-    print("Phase 7 (Parquet archive, opt-in):")
-    import importlib.util
-
-    if importlib.util.find_spec("pyarrow") is not None:
-        print("  pyarrow installed; archive ended sessions via `devbench archive-session <id>`")
-    else:
-        print("  pyarrow not installed (skipped)")
-        print("  to enable: pip install devbench[archive], then `devbench archive-session <id>`")
-    print()
-
-
-def _upgrade_self_tests_phase() -> None:
-    """Self-tests: parser load + report log-event coverage.
-
-    Issue #168: the report-event self-test was added after a live
-    regression where the Phase 3 migration archived the source log
-    and `devbench report` returned an empty view because the reader
-    didn't yet consume the sharded tree. The check runs an indexed
-    refresh against the workspace's full orch-log set and asserts at
-    least one event was indexed; surfaces a structured warning when
-    the set is empty so future operators see the failure mode
-    immediately.
-
-    Both tests are non-fatal -- a failure prints a structured warning
-    but does not change the upgrade exit code. The migrations
-    themselves succeeded; the self-test is a defensive observability
-    layer, not a gate.
-    """
-    print("Self-tests:")
-    from devbench.backlog.parser import BacklogParser
-    from devbench.reporting.event_index import EventIndex
-
-    try:
-        parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
-        parser.parse_index()
-        print("  ✓ devbench validate-backlog (parser load) passes")
-    except (FileNotFoundError, ValueError) as exc:
-        print(f"  ! parser-load failed: {exc}")
-        print("    re-run after fixing the backlog state, or check JUDGE_WORKSPACE_ROOT")
-
-    log_path = _resolve_log_file_path()
-    try:
-        idx = EventIndex.open(WORKSPACE_ROOT)
-    except (OSError, RuntimeError) as exc:
-        print(f"  ! report self-test skipped (cache unavailable): {exc}")
-        return
-    try:
-        idx.refresh_orch_log_sources(WORKSPACE_ROOT, log_path)
-        all_ts = idx.all_log_timestamps_for_workspace(WORKSPACE_ROOT, log_path)
-    finally:
-        idx.close()
-    if all_ts:
-        print(f"  ✓ report self-test: {len(all_ts)} log event(s) indexed across the workspace's orch-log set")
-    else:
-        print("  ! report self-test: 0 log events indexed.")
-        print("    No data in either logs/orchestrator.log or any sharded shard.")
-        print("    If you just ran --migrate-log-shards and see this, file an issue: the")
-        print("    reader integration may have regressed. Roll back via:")
-        print("      mv logs/legacy/orchestrator.log logs/orchestrator.log && rm -rf logs/<YYYY-MM>/")
-
-
-def cmd_migrate_log_shards(*argv: str) -> int:
-    """Partition ``logs/orchestrator.log`` into a sharded tree.
-
-    Issue #162 Phase 3 (ADR-18). DESTRUCTIVE: rewrites the flat log
-    into ``logs/<YYYY-MM>/<task>.jsonl`` shards and archives the
-    original to ``logs/legacy/orchestrator.log`` for one release
-    cycle. Refuses to run unless ``--migrate-log-shards`` is passed
-    (CLAUDE.md execute-with-care default-deny). Reversible: restore
-    by deleting ``logs/<YYYY-MM>/`` and renaming the legacy log back.
-
-    The orchestrator continues writing to a fresh
-    ``logs/orchestrator.log`` after migration; readers merge the
-    sharded tree (historical) with the live flat log (recent).
-    """
-    args = list(argv)
-    confirmed = "--migrate-log-shards" in args
-    if confirmed:
-        args.remove("--migrate-log-shards")
-    if args:
-        print(
-            f"ERROR: migrate-log-shards takes no positional arguments; got {args!r}",
-            file=sys.stderr,
-        )
-        return 1
-
-    if not confirmed:
-        print(
-            "migrate-log-shards: refusing to run without --migrate-log-shards.\n"
-            "  This rewrites your orchestrator log into logs/<YYYY-MM>/<task>.jsonl\n"
-            "  shards and archives the original to logs/legacy/orchestrator.log.\n"
-            "  Pass --migrate-log-shards to proceed."
-        )
-        return 0
-
-    from devbench.reporting.sharded_log import migrate_flat_to_sharded
-
-    log_path = _resolve_log_file_path()
-    try:
-        result = migrate_flat_to_sharded(WORKSPACE_ROOT, log_path)
-    except FileNotFoundError as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 1
-
-    print(
-        f"migrate-log-shards: processed {result['lines_processed']} lines into "
-        f"{result['shards_written']} task shard(s) + "
-        f"{result['meta_shards_written']} meta shard(s); "
-        f"original archived to logs/legacy/orchestrator.log"
-    )
-    return 0
-
-
 def cmd_archive_session(*argv: str) -> int:
     """Convert an ended session's JSONL log to a Parquet cold archive.
 
@@ -1979,11 +1785,10 @@ def cmd_rebuild_window_stats(*argv: str) -> int:
     """Walk the orchestrator log and rebuild every per-task aggregate JSON.
 
     Issue #162 Phase 2 (ADR-17). Idempotent; safe to run at any cadence.
-    Used by ``devbench upgrade`` after a version pull, by operators
-    after manually deleting ``.devbench/window-stats/``, and as a
-    correctness guarantee when an in-flight orchestrator restarts on
-    a workspace that didn't have the per-transition hook installed
-    when the first transitions happened.
+    Used by operators after manually deleting ``.devbench/window-stats/``,
+    and as a correctness guarantee when an in-flight orchestrator restarts
+    on a workspace that didn't have the per-transition hook installed when
+    the first transitions happened.
     """
     if argv:
         print(
@@ -5152,7 +4957,7 @@ def _resolve_source_repo(source_task_id: str) -> str:
     return ""
 
 
-def _file_lives_in_a_target_repo(file_path: str) -> bool:
+def _file_lives_in_a_target_repo(file_path: str, source_task_id: str | None = None) -> bool:
     """Return True iff ``file_path`` (workspace-relative) lives inside one
     of the configured target repos (issue #146).
 
@@ -5163,6 +4968,18 @@ def _file_lives_in_a_target_repo(file_path: str) -> bool:
     ``backlog/**/*.md``, ``docs/*.md``) are backlog-repo bookkeeping
     edits, not work-unit deliverables, and the recovery cascade has no
     valid completion path for them.
+
+    Issue #180: when ``source_task_id`` is provided AND that task resolves
+    to a configured target repo, ``file_path`` is treated as
+    repo-relative INSIDE the source's target repo when its first segment
+    does not match any other configured ``checkout_directory``. This
+    closes the misclassification gap where blocker-resolver agents
+    emit repo-relative paths (e.g. ``src/foo.py``) from inside the
+    source's checkout -- previously such paths were classified as
+    backlog-repo bookkeeping and the recovery cascade was silently
+    skipped. The source's own ``checkout_directory`` is still consulted
+    first so explicitly-prefixed paths (``kanon/src/foo.py``) classify
+    identically.
     """
     if not file_path:
         return False
@@ -5171,11 +4988,23 @@ def _file_lives_in_a_target_repo(file_path: str) -> bool:
         # classification; treat every file as in-scope (conservative).
         return True
     first_segment = file_path.split("/", 1)[0]
+    all_checkouts: set[str] = set()
     for repo_cfg in RUNTIME_CONFIG.repos.values():
         checkout = repo_cfg.checkout_directory or (
             repo_cfg.validated_repo.split("/", 1)[1] if repo_cfg.validated_repo else None
         )
-        if checkout and first_segment == checkout:
+        if checkout:
+            all_checkouts.add(checkout)
+    if first_segment in all_checkouts:
+        return True
+    if source_task_id:
+        target_repo = _resolve_source_repo(source_task_id)
+        if target_repo and target_repo in RUNTIME_CONFIG.repos:
+            # The source task targets a known repo and ``file_path``
+            # carries no target-repo prefix -- assume it is a repo-
+            # relative path inside the source's target repo (blocker-
+            # resolver agents that run from inside the checkout emit
+            # paths in this form). Issue #180.
             return True
     return False
 
@@ -5259,14 +5088,15 @@ def _filter_backlog_repo_proposed_tasks(proposal: Proposal) -> tuple[Proposal, l
     kept: list = []
     skipped: list[tuple[str, list[str]]] = []
     mutated = False
+    source_task_id = proposal.source_task_id
     for task in proposal.proposed_tasks:
         if not task.files_to_own:
             # Empty files_to_own = research / validation-gate task; not
             # backlog-only by intent. Preserve as-is.
             kept.append(task)
             continue
-        target_repo_files = [f for f in task.files_to_own if _file_lives_in_a_target_repo(f)]
-        backlog_files = [f for f in task.files_to_own if not _file_lives_in_a_target_repo(f)]
+        target_repo_files = [f for f in task.files_to_own if _file_lives_in_a_target_repo(f, source_task_id)]
+        backlog_files = [f for f in task.files_to_own if not _file_lives_in_a_target_repo(f, source_task_id)]
         if not target_repo_files:
             # Entirely backlog-repo work -- drop the entry.
             skipped.append((task.suggested_id, backlog_files))
@@ -6034,19 +5864,6 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
             "logs/legacy/<session>.parquet (requires `pip install devbench[archive]`)"
         ),
     ),
-    "migrate-log-shards": (
-        cmd_migrate_log_shards,
-        0,
-        (
-            "Issue #162 Phase 3 (DESTRUCTIVE; requires --migrate-log-shards): "
-            "partition logs/orchestrator.log into logs/<YYYY-MM>/<task>.jsonl shards"
-        ),
-    ),
-    "upgrade": (
-        cmd_upgrade,
-        0,
-        "Idempotent migration to the latest devbench layout: upgrade [--migrate-log-shards]",
-    ),
     "start": (cmd_start, 0, "Run orchestrate skill via Agent SDK (non-interactive)"),
     "watch": (
         cmd_watch,
@@ -6162,10 +5979,6 @@ _VARIADIC_COMMANDS: frozenset[str] = frozenset(
         "rebuild-window-stats",
         # Issue #162 Phase 7: archive an ended session's log to Parquet (opt-in dep).
         "archive-session",
-        # Issue #162 Phase 3: destructive migration to a sharded event-store layout.
-        "migrate-log-shards",
-        # Issue #162 unified upgrade command (orchestrates all migrations).
-        "upgrade",
     }
 )
 

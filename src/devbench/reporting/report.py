@@ -2135,7 +2135,18 @@ def generate_report(
     event_index = EventIndex.open(WORKSPACE_ROOT)
 
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
-    units = parser.parse_index()
+    try:
+        units = parser.parse_index()
+    except (FileNotFoundError, ValueError) as exc:
+        # Issue #174: a malformed or non-canonical BACKLOG.md surfaces here
+        # as a parser-level exception. Fail fast with an actionable
+        # diagnostic naming the file + the parse failure so the operator
+        # can fix the index directly instead of seeing a raw stack trace.
+        sys.stderr.write(
+            f"devbench report: cannot parse '{BACKLOG_INDEX}': {exc}\n"
+            "  Run `devbench validate-backlog` for a full list of issues with the index.\n"
+        )
+        sys.exit(1)
     backlog = _backlog_totals_from_units(units)
 
     # Issue #162 Phase 1+4 cache: refresh the persistent SQLite index

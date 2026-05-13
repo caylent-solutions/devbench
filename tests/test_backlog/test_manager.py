@@ -9,7 +9,13 @@ import pytest
 
 from devbench.backlog.manager import BacklogManager
 from devbench.config_loader import RepoConfig, RuntimeConfig, ValidateConfig
-from devbench.constants import ALL_REQUIRED_JUDGE_NAMES, REVIEW_JUDGE_NAMES, SECURITY_JUDGE_NAMES, VALID_STATUSES
+from devbench.constants import (
+    ALL_REQUIRED_JUDGE_NAMES,
+    BACKLOG_INDEX_CELL_COUNT,
+    REVIEW_JUDGE_NAMES,
+    SECURITY_JUDGE_NAMES,
+    VALID_STATUSES,
+)
 
 
 @pytest.fixture
@@ -4333,6 +4339,61 @@ class TestAutoRequeueOnDeclineTransition:
         assert "[CASCADE_RESOLVED]" not in src
 
 
+class TestSetStatusWritesWuClaimedAudit:
+    """Issue #185(b): every Task transition into ``in-progress`` must
+    append a ``[WU_CLAIMED]`` audit-comment row to the work-unit file so
+    the status-timer fallback can recover the claim timestamp after the
+    orchestrator log has rotated. Stories / Features / Epics are skipped
+    (their status is auto-rolled from children and never user-claimed).
+    """
+
+    def test_in_progress_transition_writes_wu_claimed_audit(self, tmp_path: Path) -> None:
+        wu_body = _unit_body("E0-F1-S1-T1", "in-queue")
+        index = _write_workspace(
+            tmp_path,
+            rows=[("E0-F1-S1-T1", "Task", "in-queue")],
+            files={"E0-F1-S1-T1": wu_body},
+        )
+        wu_path = tmp_path / "backlog" / "E0-F1-S1-T1.md"
+        BacklogManager()._set_status(wu_path, index, "E0-F1-S1-T1", "in-progress")
+        content = wu_path.read_text(encoding="utf-8")
+        # The audit row must include both the [WU_CLAIMED] marker and
+        # the canonical `Set <id> to 'in-progress'` phrase so the audit
+        # regex in cli._latest_audit_in_progress_ts matches.
+        assert "[WU_CLAIMED]" in content
+        assert "Set E0-F1-S1-T1 to 'in-progress'" in content
+        assert "[agent/orchestrator]" in content
+
+    def test_non_in_progress_transition_does_not_write_audit(self, tmp_path: Path) -> None:
+        """A transition to ``blocked`` / ``done`` / ``in-queue`` MUST NOT
+        write a ``[WU_CLAIMED]`` row. Only ``in-progress`` is the claim
+        event we want to record."""
+        wu_body = _unit_body("E0-F1-S1-T1", "in-progress")
+        index = _write_workspace(
+            tmp_path,
+            rows=[("E0-F1-S1-T1", "Task", "in-progress")],
+            files={"E0-F1-S1-T1": wu_body},
+        )
+        wu_path = tmp_path / "backlog" / "E0-F1-S1-T1.md"
+        BacklogManager()._set_status(wu_path, index, "E0-F1-S1-T1", "in-queue")
+        content = wu_path.read_text(encoding="utf-8")
+        assert "[WU_CLAIMED]" not in content
+
+    def test_story_transition_does_not_write_audit(self, tmp_path: Path) -> None:
+        """IDs without ``-T`` (Story / Feature / Epic) are auto-rolled
+        from children; the ``[WU_CLAIMED]`` write is skipped."""
+        wu_body = _unit_body("E0-F1-S1", "in-queue")
+        index = _write_workspace(
+            tmp_path,
+            rows=[("E0-F1-S1", "Story", "in-queue")],
+            files={"E0-F1-S1": wu_body},
+        )
+        wu_path = tmp_path / "backlog" / "E0-F1-S1.md"
+        BacklogManager()._set_status(wu_path, index, "E0-F1-S1", "in-progress")
+        content = wu_path.read_text(encoding="utf-8")
+        assert "[WU_CLAIMED]" not in content
+
+
 class TestSetStatusWritesUnblockedAudit:
     """Issue #153: when the cascade flips ``blocked -> in-queue`` it writes
     a ``[CASCADE_RESOLVED]`` audit; sync-blocked separately writes
@@ -4508,11 +4569,17 @@ class TestValidateBrokenAndCanonicalBacklogFormat:
         errors = manager.validate(backlog_index, broken_root)
 
         assert errors, "Expected at least one error from the broken fixture"
-        assert errors[0].startswith("No work-unit rows parsed from"), (
-            f"Expected zero-row error as first entry, got: {errors[0]!r}"
+        # Issue #174: the broken fixture has no '## Full Work Unit Index'
+        # heading at all, so the "header text row not found" error is the
+        # first (most-actionable) entry; the zero-row error remains below
+        # it for backward-compatibility.
+        assert errors[0].startswith("No '## Full Work Unit Index' header text row found"), (
+            f"Expected missing-header error as first entry, got: {errors[0]!r}"
         )
-        assert "## Full Work Unit Index" in errors[0]
-        assert "7-column" in errors[0] or "7" in errors[0]
+        assert any(e.startswith("No work-unit rows parsed from") for e in errors), (
+            f"Expected zero-row integrity error to also fire, got: {errors!r}"
+        )
+        assert "ID | Title | Type | Status | Dependencies | Repo | File Path" in errors[0]
 
     def test_validate_accepts_canonical_backlog_format(self) -> None:
         """Canonical fixture uses 7-column / ## Full Work Unit Index -- validator must accept it."""
@@ -4556,6 +4623,106 @@ class TestValidateBrokenAndCanonicalBacklogFormat:
         errors = manager.validate(backlog_index, tmp_path)
         assert errors
         assert any("No work-unit rows parsed from" in e for e in errors)
+
+    def test_validate_rejects_reordered_header_columns(self, tmp_path: Path) -> None:
+        """Issue #174: a header with the right columns in the wrong order is rejected.
+
+        The header below swaps Title and Type. ``validate-backlog`` MUST
+        flag this with a column-order error so the operator can fix it
+        before ``devbench report`` crashes on the same file.
+        """
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text(
+            "# Backlog\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Type | Title | Status | Dependencies | Repo | File Path |\n"
+            "|----|------|-------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Task | T | in-queue | None | r | `backlog/E0-F1-S1-T1.md` |\n",
+            encoding="utf-8",
+        )
+        manager = BacklogManager()
+        errors = manager.validate(backlog_index, tmp_path)
+        assert any("does not match the canonical column order/spelling" in e for e in errors), (
+            f"Expected column-order error, got: {errors!r}"
+        )
+
+    def test_validate_rejects_renamed_header_column(self, tmp_path: Path) -> None:
+        """Issue #174: a header where a column name is renamed is rejected.
+
+        Renames ``Dependencies`` -> ``Deps``. validate-backlog MUST reject.
+        """
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text(
+            "# Backlog\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Deps | Repo | File Path |\n"
+            "|----|-------|------|--------|------|------|-----------|\n"
+            "| E0-F1-S1-T1 | T | Task | in-queue | None | r | `backlog/E0-F1-S1-T1.md` |\n",
+            encoding="utf-8",
+        )
+        manager = BacklogManager()
+        errors = manager.validate(backlog_index, tmp_path)
+        assert any("does not match the canonical column order/spelling" in e for e in errors), (
+            f"Expected column-spelling error, got: {errors!r}"
+        )
+
+    def test_validate_rejects_header_with_wrong_cell_count(self, tmp_path: Path) -> None:
+        """Issue #174: a header with fewer/more than 7 columns is rejected with a cell-count error."""
+        backlog_index = tmp_path / "BACKLOG.md"
+        # 6 columns instead of 7 (Repo column dropped)
+        backlog_index.write_text(
+            "# Backlog\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | File Path |\n"
+            "|----|-------|------|--------|--------------|-----------|\n"
+            "| E0-F1-S1-T1 | T | Task | in-queue | None | `backlog/E0-F1-S1-T1.md` |\n",
+            encoding="utf-8",
+        )
+        manager = BacklogManager()
+        errors = manager.validate(backlog_index, tmp_path)
+        assert any("header row" in e and "cells; expected" in e for e in errors), (
+            f"Expected header cell-count error, got: {errors!r}"
+        )
+
+    def test_scan_skips_stray_data_row_with_blank_id(self, tmp_path: Path) -> None:
+        """Coverage for the ``continue`` branch in ``_scan_full_index_rows``
+        when a 9-cell pipe-row follows the header/separator but the ID
+        cell is blank (or contains the literal "id" / a leading "-").
+        Such rows are silently skipped instead of counted as work units.
+        """
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text(
+            "# Backlog\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            # 9-cell row with a blank ID (e.g. accidental separator-style
+            # row left over from a hand edit). Must be skipped.
+            "|  | placeholder | Task | in-queue | None | r | `backlog/x.md` |\n"
+            "| E0-F1-S1-T1 | T | Task | in-queue | None | r | `backlog/E0-F1-S1-T1.md` |\n",
+            encoding="utf-8",
+        )
+        header, separator, count = BacklogManager._scan_full_index_rows(backlog_index)
+        assert header is not None and len(header) == BACKLOG_INDEX_CELL_COUNT
+        assert separator is not None
+        # Only the real row is counted; the blank-ID row was skipped.
+        assert count == 1
+
+    def test_validate_rejects_missing_separator_row(self, tmp_path: Path) -> None:
+        """Issue #174: canonical header followed by data rows without a separator is rejected."""
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text(
+            "# Backlog\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "| E0-F1-S1-T1 | T | Task | in-queue | None | r | `backlog/E0-F1-S1-T1.md` |\n",
+            encoding="utf-8",
+        )
+        manager = BacklogManager()
+        errors = manager.validate(backlog_index, tmp_path)
+        assert any("separator row" in e and "is missing" in e for e in errors), (
+            f"Expected missing-separator error, got: {errors!r}"
+        )
 
 
 # ---------------------------------------------------------------------------

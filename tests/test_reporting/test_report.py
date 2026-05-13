@@ -3184,3 +3184,55 @@ class TestOrchestratorAliveBanner:
         assert "30s ago" in banner1
         assert "0s ago" in banner2
         assert banner1 != banner2
+
+
+class TestGenerateReportBacklogParseFailure:
+    """Issue #174: generate_report must exit non-zero with an actionable diagnostic
+    when ``BacklogParser.parse_index`` raises FileNotFoundError or ValueError --
+    not leak a raw stack trace from a malformed ``BACKLOG.md``.
+    """
+
+    def test_value_error_from_parser_triggers_clean_exit(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A malformed BACKLOG.md (ValueError from parser) -> SystemExit(1) + stderr diagnostic."""
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    "2026-03-05T10:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                ]
+            )
+        )
+        with patch("devbench.reporting.report.BacklogParser") as mock_cls:
+            instance = mock_cls.return_value
+            instance.parse_index.side_effect = ValueError("No work-unit rows found in 'BACKLOG.md'")
+            with pytest.raises(SystemExit) as exc:
+                generate_report(log_path=log_file)
+        assert exc.value.code == 1
+        captured = capsys.readouterr()
+        assert "devbench report: cannot parse" in captured.err
+        assert "No work-unit rows found" in captured.err
+        assert "devbench validate-backlog" in captured.err
+
+    def test_file_not_found_from_parser_triggers_clean_exit(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A missing BACKLOG.md (FileNotFoundError) -> SystemExit(1) + stderr diagnostic."""
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    "2026-03-05T10:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                ]
+            )
+        )
+        with patch("devbench.reporting.report.BacklogParser") as mock_cls:
+            instance = mock_cls.return_value
+            instance.parse_index.side_effect = FileNotFoundError("Backlog index not found at 'BACKLOG.md'")
+            with pytest.raises(SystemExit) as exc:
+                generate_report(log_path=log_file)
+        assert exc.value.code == 1
+        captured = capsys.readouterr()
+        assert "devbench report: cannot parse" in captured.err
+        assert "Backlog index not found" in captured.err

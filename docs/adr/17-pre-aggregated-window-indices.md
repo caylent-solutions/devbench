@@ -1,7 +1,14 @@
 # ADR-17: Pre-Aggregated Per-Task Window Indices
 
-**Status:** Accepted
+**Status:** Accepted (with v1.0 cleanup note below)
 **Date:** 2026-05-04
+
+> **Note (2026-05-13, issue #167).** This ADR references the unified
+> `devbench upgrade` command (ADR-22) as the Phase 2 invocation surface.
+> That command was removed in the v1.0 cleanup. The window-stats architecture
+> described here is unchanged; operators rebuild aggregates manually via
+> `devbench rebuild-window-stats` when needed. See ADR-22 for the cleanup
+> rationale.
 
 ---
 

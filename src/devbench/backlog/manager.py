@@ -302,23 +302,34 @@ class BacklogManager:
         self._check_no_orphan_path_tokens(rows, workspace_root, errors)
         return errors
 
+    _CANONICAL_FULL_INDEX_HEADER_CELLS: tuple[str, ...] = (
+        "",
+        "ID",
+        "Title",
+        "Type",
+        "Status",
+        "Dependencies",
+        "Repo",
+        "File Path",
+        "",
+    )
+
     @staticmethod
-    def _check_full_index_has_rows(backlog_index: Path, errors: list[str]) -> None:
-        """Rule-0: verify that at least one work-unit row is parsed from '## Full Work Unit Index'.
+    def _scan_full_index_rows(
+        backlog_index: Path,
+    ) -> tuple[list[str] | None, list[str] | None, int]:
+        """Return ``(header_text_cells, separator_cells, real_row_count)``.
 
-        A zero-row result means the section is missing or the table uses the
-        wrong format (e.g. a legacy 4-column section under a non-canonical heading). This
-        check fires BEFORE orphan detection (rule 3) so a malformed index does
-        not produce a stale orphan-storm that obscures the root cause.
-
-        Args:
-            backlog_index: Path to the ``BACKLOG.md`` index file.
-            errors: Mutable error list; the new error is prepended when the
-                check fires so it remains the first entry regardless of call
-                order within ``validate()``.
+        First-pass scanner used by ``_check_full_index_has_rows``. The
+        header text row is the first pipe-row inside ``## Full Work Unit
+        Index`` whose second cell is ``id`` (case-insensitive); the
+        separator row is the next pipe-row whose second cell begins
+        with ``-``.
         """
         content = backlog_index.read_text(encoding="utf-8")
         in_full_index = False
+        header_text_cells: list[str] | None = None
+        separator_cells: list[str] | None = None
         real_row_count = 0
         for line in content.splitlines():
             stripped = line.strip()
@@ -328,23 +339,101 @@ class BacklogManager:
             if not in_full_index or not stripped.startswith("|"):
                 continue
             cells = [c.strip() for c in line.split("|")]
+            if header_text_cells is None and len(cells) >= 3 and cells[1].lower() == "id":
+                header_text_cells = cells
+                continue
+            if (
+                header_text_cells is not None
+                and separator_cells is None
+                and len(cells) >= 2
+                and cells[1].startswith("-")
+            ):
+                separator_cells = cells
+                continue
             if len(cells) != BACKLOG_INDEX_CELL_COUNT:
                 continue
             row_id = cells[1]
             if not row_id or row_id.lower() == "id" or row_id.startswith("-"):
                 continue
             real_row_count += 1
+        return header_text_cells, separator_cells, real_row_count
+
+    @staticmethod
+    def _format_header_validation_errors(
+        backlog_index: Path,
+        header_text_cells: list[str] | None,
+        separator_cells: list[str] | None,
+        real_row_count: int,
+    ) -> list[str]:
+        """Convert scan results into the ordered list of prepended errors."""
+        prepended: list[str] = []
+        if header_text_cells is None:
+            prepended.append(
+                f"No '## Full Work Unit Index' header text row found in '{backlog_index}'."
+                " Expected canonical 7-column header:"
+                " | ID | Title | Type | Status | Dependencies | Repo | File Path |"
+            )
+        elif len(header_text_cells) != BACKLOG_INDEX_CELL_COUNT:
+            prepended.append(
+                f"'## Full Work Unit Index' header row in '{backlog_index}' has"
+                f" {len(header_text_cells)} cells; expected {BACKLOG_INDEX_CELL_COUNT}"
+                " (canonical 7-column format:"
+                " | ID | Title | Type | Status | Dependencies | Repo | File Path |)."
+            )
+        elif tuple(header_text_cells) != BacklogManager._CANONICAL_FULL_INDEX_HEADER_CELLS:
+            prepended.append(
+                f"'## Full Work Unit Index' header row in '{backlog_index}' does not match"
+                " the canonical column order/spelling."
+                f" Got: | {' | '.join(header_text_cells[1:-1])} |."
+                " Expected: | ID | Title | Type | Status | Dependencies | Repo | File Path |."
+            )
+
+        if header_text_cells is not None and separator_cells is None:
+            prepended.append(f"'## Full Work Unit Index' separator row (|---|---|...) is missing in '{backlog_index}'.")
+        elif separator_cells is not None and len(separator_cells) != BACKLOG_INDEX_CELL_COUNT:
+            prepended.append(
+                f"'## Full Work Unit Index' separator row in '{backlog_index}' has"
+                f" {len(separator_cells)} cells; expected {BACKLOG_INDEX_CELL_COUNT}."
+            )
 
         if real_row_count == 0:
-            errors.insert(
-                0,
-                (
-                    f"No work-unit rows parsed from '{backlog_index}'."
-                    " The '## Full Work Unit Index' section is missing or malformed."
-                    " Expected 7-column rows:"
-                    " | ID | Title | Type | Status | Dependencies | Repo | File Path |"
-                ),
+            prepended.append(
+                f"No work-unit rows parsed from '{backlog_index}'."
+                " The '## Full Work Unit Index' section is missing or malformed."
+                " Expected 7-column rows:"
+                " | ID | Title | Type | Status | Dependencies | Repo | File Path |"
             )
+        return prepended
+
+    @staticmethod
+    def _check_full_index_has_rows(backlog_index: Path, errors: list[str]) -> None:
+        """Rule-0: verify '## Full Work Unit Index' uses the canonical 7-column header and contains at least one row.
+
+        The header text row MUST read exactly:
+            ``| ID | Title | Type | Status | Dependencies | Repo | File Path |``
+        and the separator row immediately below it MUST have the same
+        number of cells. A zero-row result, an unexpected column order /
+        spelling, or a malformed separator all surface as distinct errors
+        so the operator can fix the root cause directly.
+
+        This check fires BEFORE orphan detection (rule 3) so a malformed
+        index does not produce a stale orphan-storm that obscures the root
+        cause. New errors are prepended so they appear first regardless of
+        call order within ``validate()``.
+
+        Args:
+            backlog_index: Path to the ``BACKLOG.md`` index file.
+            errors: Mutable error list; new errors are prepended.
+        """
+        header_text_cells, separator_cells, real_row_count = BacklogManager._scan_full_index_rows(backlog_index)
+        prepended = BacklogManager._format_header_validation_errors(
+            backlog_index, header_text_cells, separator_cells, real_row_count
+        )
+        # Prepend in reverse so the order in ``errors`` matches the order
+        # we appended (header issue first, separator issue second, row
+        # count third).
+        for msg in reversed(prepended):
+            errors.insert(0, msg)
 
     def _apply_fixes(
         self,
@@ -749,6 +838,22 @@ class BacklogManager:
             unit_id,
             canonical,
         )
+
+        # Issue #185: every transition into ``in-progress`` (claim,
+        # resume after blocker clear, force-status) writes a
+        # ``[WU_CLAIMED]`` audit-comment row carrying the canonical
+        # ``Set <id> to 'in-progress'`` phrase so the status-timer
+        # fallback (`_latest_audit_in_progress_ts`) can recover the
+        # claim timestamp from the work-unit file alone when the
+        # orchestrator log has rotated. Skips Stories / Features /
+        # Epics whose status is auto-rolled from children (no human
+        # ever claims those directly).
+        if canonical == STATUS_IN_PROGRESS and "-T" in unit_id:
+            self._append_agent_comment(
+                work_unit_path,
+                "orchestrator",
+                f"[WU_CLAIMED] Set {unit_id} to 'in-progress'",
+            )
 
         if canonical == STATUS_DONE:
             self._tick_completion_checkboxes(work_unit_path)

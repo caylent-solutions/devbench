@@ -1,7 +1,19 @@
 # ADR-22: Unified `devbench upgrade` Command
 
-**Status:** Accepted
+**Status:** Superseded (2026-05-13)
 **Date:** 2026-05-04
+
+> **Superseded by post-v1.0 cleanup (2026-05-13, issue #167).**
+>
+> The `devbench upgrade` and `devbench migrate-log-shards` commands were
+> deleted as part of the v1.0 release cleanup. Issue #162's migration
+> phases are now historical: every new workspace ships with the post-#162
+> layout from day one; existing workspaces had a one-release window to
+> migrate before v1.0 and any holdouts can pin to a pre-cleanup tag.
+>
+> This ADR is preserved as the historical record of why the unified
+> upgrade command existed; the implementation details below no longer
+> reflect shipped code.
 
 ---
 

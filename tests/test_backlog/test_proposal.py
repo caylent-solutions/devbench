@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -2476,14 +2477,18 @@ class TestRecentRecoveryAuditCommentEdgeCases:
 
 
 # ---------------------------------------------------------------------------
-# E2-F1-S1-T1: 6-state BlockedTaskState classifier tests
+# E2-F1-S1-T1 / issue #183(d): BlockedTaskState classifier tests
 # ---------------------------------------------------------------------------
 
 
-class TestBlockedTaskStateSixValues:
-    """AC-FUNC-001: BlockedTaskState must have exactly 6 canonical values."""
+class TestBlockedTaskStateCanonicalValues:
+    """The classifier enum must carry exactly the documented set of values.
 
-    def test_has_exactly_six_values(self) -> None:
+    Issue #183(d) added ``RUNTIME_DEGRADATION`` to the original 6
+    canonical buckets, so the asserted set is now 7 entries.
+    """
+
+    def test_has_exactly_canonical_values(self) -> None:
         from devbench.backlog.proposal import BlockedTaskState
 
         names = {s.name for s in BlockedTaskState}
@@ -2494,6 +2499,7 @@ class TestBlockedTaskStateSixValues:
             "HELD",
             "BLOCKED_ON_HELD",
             "OPERATOR_ACTION_REQUIRED",
+            "RUNTIME_DEGRADATION",
         }
 
     def test_old_values_removed(self) -> None:
@@ -2502,6 +2508,151 @@ class TestBlockedTaskStateSixValues:
         names = {s.name for s in BlockedTaskState}
         assert "AWAITING_AUTO_RECOVERY" not in names
         assert "NEEDS_OPERATOR_ATTENTION" not in names
+
+
+class TestHasRuntimeDegradationSignal:
+    """Direct unit tests for ``_has_runtime_degradation_signal`` covering
+    the defensive branches the higher-level classifier tests don't reach.
+    """
+
+    def test_returns_false_when_source_file_missing(self, tmp_path: Path) -> None:
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import _has_runtime_degradation_signal
+
+        missing = tmp_path / "nope.md"
+        assert _has_runtime_degradation_signal(missing, datetime(2026, 5, 1, tzinfo=UTC)) is False
+
+    def test_returns_false_on_unreadable_file(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """OSError on read (e.g. permission denied) -> False, not a crash."""
+        from datetime import UTC, datetime
+        from pathlib import Path as _Path
+
+        from devbench.backlog.proposal import _has_runtime_degradation_signal
+
+        source = tmp_path / "wu.md"
+        source.write_text("# wu\n", encoding="utf-8")
+
+        original_read_text = _Path.read_text
+
+        def _raise(self: _Path, *args: Any, **kwargs: Any) -> str:
+            if self == source:
+                raise OSError("permission denied")
+            return original_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(_Path, "read_text", _raise)
+        assert _has_runtime_degradation_signal(source, datetime(2026, 5, 1, tzinfo=UTC)) is False
+
+    def test_skips_audit_with_invalid_timestamp(self, tmp_path: Path) -> None:
+        """A [BLOCKED] audit whose timestamp fails strptime is silently
+        skipped; if nothing else matches the helper returns False.
+        """
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import _has_runtime_degradation_signal
+
+        source = tmp_path / "wu.md"
+        source.write_text(
+            "## Comments\n[9999-99-99 99:99 UTC] [agent/review-supervisor] [BLOCKED] agent-tool-unavailable\n",
+            encoding="utf-8",
+        )
+        assert _has_runtime_degradation_signal(source, datetime(2026, 5, 1, tzinfo=UTC)) is False
+
+
+class TestClassifyBlockedTaskRuntimeDegradation:
+    """Issue #183(d): tasks with a recent agent-tool-unavailable [BLOCKED]
+    audit comment must bucket as ``RUNTIME_DEGRADATION`` so the operator
+    sees that a ``make start`` restart -- not a code fix -- is what
+    recovers the work.
+    """
+
+    def _workspace(self, tmp_path: Path, comments: str) -> Path:
+        backlog_dir = tmp_path / "backlog"
+        story_dir = backlog_dir / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+        source_file = story_dir / "E0-F1-S1-T1.md"
+        source_file.write_text(
+            "# E0-F1-S1-T1: Source\n\n## Status: blocked\n\n"
+            "## Description\n\nfixture\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
+            f"## Comments\n\n{comments}",
+            encoding="utf-8",
+        )
+        (tmp_path / "BACKLOG.md").write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Source | Task | blocked | None | r | "
+            "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n",
+            encoding="utf-8",
+        )
+        return tmp_path
+
+    def test_recent_agent_tool_unavailable_returns_runtime_degradation(self, tmp_path: Path) -> None:
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        ts = (now - timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M UTC")
+        workspace = self._workspace(
+            tmp_path,
+            f"[{ts}] [agent/review-supervisor] [BLOCKED] agent-tool-unavailable: "
+            "orchestrator review-supervisor lost Agent tool access in this session; "
+            "operator restart of `make start` required\n",
+        )
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+            now=now,
+        )
+        assert state is BlockedTaskState.RUNTIME_DEGRADATION
+
+    def test_stale_agent_tool_unavailable_does_not_trigger(self, tmp_path: Path) -> None:
+        """A 25-hour-old payload is past the 24h window: classifier
+        falls through to other buckets (here: OPERATOR_ACTION_REQUIRED)."""
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        now = datetime(2026, 5, 2, 12, 0, tzinfo=UTC)
+        ts = (now - timedelta(hours=25)).strftime("%Y-%m-%d %H:%M UTC")
+        workspace = self._workspace(
+            tmp_path,
+            f"[{ts}] [agent/review-supervisor] [BLOCKED] agent-tool-unavailable: stale alert\n",
+        )
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+            now=now,
+        )
+        assert state is not BlockedTaskState.RUNTIME_DEGRADATION
+
+    def test_unrelated_blocked_audit_does_not_trigger(self, tmp_path: Path) -> None:
+        """A recent [BLOCKED] audit naming an unrelated cause (e.g.
+        amendment-reject) must NOT trigger RUNTIME_DEGRADATION."""
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        ts = (now - timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M UTC")
+        workspace = self._workspace(
+            tmp_path,
+            f"[{ts}] [agent/backlog_manager] [BLOCKED] amendment-reject: scope drift\n",
+        )
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+            now=now,
+        )
+        assert state is not BlockedTaskState.RUNTIME_DEGRADATION
 
 
 class TestClassifyBlockedTaskHeld:
@@ -2641,6 +2792,95 @@ class TestClassifyBlockedTaskAwaitingDependency:
             workspace_root=workspace,
         )
         assert state is BlockedTaskState.AWAITING_DEPENDENCY
+
+    def test_stale_terminal_markers_with_unsatisfied_dep_returns_awaiting_dependency(self, tmp_path: Path) -> None:
+        """Issue #186: a task with stale ``[BLOCKED_PENDING_PROPOSAL]``
+        markers (all targets terminal) AND an unsatisfied regular
+        Dependencies-table row MUST classify as AWAITING_DEPENDENCY.
+
+        Prior to the fix, ``_classify_with_markers`` short-circuited to
+        OPERATOR_ACTION_REQUIRED the moment any marker rows were
+        present, even when the marker rows were stale and the *real*
+        blocker was the regular dep.
+        """
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        # Build the workspace: T1 has a stale marker on terminal T2 AND
+        # a regular dep on still-in-queue T3.
+        backlog_dir = tmp_path / "backlog"
+        story_dir = backlog_dir / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+        source_file = story_dir / "E0-F1-S1-T1.md"
+        source_file.write_text(
+            "# E0-F1-S1-T1: Source\n\n## Status: blocked\n\n"
+            "## Description\n\nfixture\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n"
+            "| E0-F1-S1-T3 | Real blocker | in-queue |\n\n"
+            "## Comments\n\n"
+            "[2026-04-20 00:00 UTC] [agent/task_factory] [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2\n",
+            encoding="utf-8",
+        )
+        (story_dir / "E0-F1-S1-T2.md").write_text("# E0-F1-S1-T2: Stale\n\n## Status: done\n")
+        (story_dir / "E0-F1-S1-T3.md").write_text("# E0-F1-S1-T3: Real blocker\n\n## Status: in-queue\n")
+        (tmp_path / "BACKLOG.md").write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Source | Task | blocked | E0-F1-S1-T3 | r | "
+            "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n"
+            "| E0-F1-S1-T2 | Stale | Task | done | None | r | "
+            "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T2.md` |\n"
+            "| E0-F1-S1-T3 | Real blocker | Task | in-queue | None | r | "
+            "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T3.md` |\n",
+            encoding="utf-8",
+        )
+        state = classify_blocked_task(
+            tmp_path / "backlog",
+            tmp_path / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=tmp_path,
+        )
+        assert state is BlockedTaskState.AWAITING_DEPENDENCY
+
+    def test_stale_terminal_markers_no_dep_no_recovery_remains_operator_required(self, tmp_path: Path) -> None:
+        """Regression guard: when all markers are terminal AND there is no
+        unsatisfied regular dep AND no recovery signal, the classifier
+        must still bucket as OPERATOR_ACTION_REQUIRED (the cascade
+        should have fired and did not -- the operator must intervene).
+        Issue #186 fall-through must NOT swallow this scenario.
+        """
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        backlog_dir = tmp_path / "backlog"
+        story_dir = backlog_dir / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+        source_file = story_dir / "E0-F1-S1-T1.md"
+        source_file.write_text(
+            "# E0-F1-S1-T1: Source\n\n## Status: blocked\n\n"
+            "## Description\n\nfixture\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
+            "## Comments\n\n"
+            "[2026-04-20 00:00 UTC] [agent/task_factory] [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2\n",
+            encoding="utf-8",
+        )
+        (story_dir / "E0-F1-S1-T2.md").write_text("# E0-F1-S1-T2: Stale\n\n## Status: done\n")
+        (tmp_path / "BACKLOG.md").write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Source | Task | blocked | None | r | "
+            "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n"
+            "| E0-F1-S1-T2 | Stale | Task | done | None | r | "
+            "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T2.md` |\n",
+            encoding="utf-8",
+        )
+        state = classify_blocked_task(
+            tmp_path / "backlog",
+            tmp_path / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=tmp_path,
+        )
+        assert state is BlockedTaskState.OPERATOR_ACTION_REQUIRED
 
 
 class TestClassifyBlockedTaskAwaitingAmendmentRecovery:

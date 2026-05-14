@@ -14,6 +14,7 @@ import pytest
 
 from devbench.config_loader import (
     DEFAULT_CONFIG_SUBPATH,
+    BacklogConfig,
     LimitConfig,
     RepoConfig,
     RuntimeConfig,
@@ -23,6 +24,7 @@ from devbench.config_loader import (
     load_runtime_config,
     resolve_config_path,
 )
+from devbench.constants import STATUS_DRAFT, STATUS_IN_QUEUE
 
 # ---------------------------------------------------------------------------
 # resolve_config_path -- AC-2
@@ -2319,3 +2321,186 @@ class TestAutoFinalizeAutoMergeConfig:
         # error messages.
         with pytest.raises(ValueError, match=r"local_only: true"):
             load_runtime_config(cfg, {})
+
+
+# ---------------------------------------------------------------------------
+# BacklogConfig -- AC-189-8, AC-189-9
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestBacklogConfig:
+    """AC-189-8/9: BacklogConfig dataclass parses from YAML backlog: section.
+
+    AC-189-8: backlog.default_status_for_new_work_units is honored.
+    AC-189-9: Default behavior unchanged -- absent config defaults to STATUS_IN_QUEUE.
+    """
+
+    def _write(self, path: Path, content: str) -> Path:
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    def test_backlog_config_default_is_in_queue(self) -> None:
+        """
+        Given: BacklogConfig constructed with no arguments
+        When: default_status_for_new_work_units is accessed
+        Then: it equals STATUS_IN_QUEUE for backwards compatibility (AC-189-9)
+        """
+        cfg = BacklogConfig()
+        assert cfg.default_status_for_new_work_units == STATUS_IN_QUEUE
+
+    def test_backlog_config_accepts_draft(self) -> None:
+        """
+        Given: BacklogConfig constructed with draft status
+        When: default_status_for_new_work_units is accessed
+        Then: it equals STATUS_DRAFT (AC-189-8)
+        """
+        cfg = BacklogConfig(default_status_for_new_work_units=STATUS_DRAFT)
+        assert cfg.default_status_for_new_work_units == STATUS_DRAFT
+
+    def test_backlog_config_accepts_in_queue(self) -> None:
+        """
+        Given: BacklogConfig constructed with in-queue status explicitly
+        When: default_status_for_new_work_units is accessed
+        Then: it equals STATUS_IN_QUEUE
+        """
+        cfg = BacklogConfig(default_status_for_new_work_units=STATUS_IN_QUEUE)
+        assert cfg.default_status_for_new_work_units == STATUS_IN_QUEUE
+
+    def test_runtime_config_has_backlog_field(self) -> None:
+        """
+        Given: RuntimeConfig constructed with no arguments
+        When: the backlog field is accessed
+        Then: a BacklogConfig with default STATUS_IN_QUEUE is returned (AC-189-9)
+        """
+        rt = RuntimeConfig()
+        assert isinstance(rt.backlog, BacklogConfig)
+        assert rt.backlog.default_status_for_new_work_units == STATUS_IN_QUEUE
+
+    def test_absent_backlog_section_defaults_to_in_queue(self, tmp_path: Path) -> None:
+        """
+        Given: a YAML config with no backlog: section
+        When: load_runtime_config is called
+        Then: RuntimeConfig.backlog.default_status_for_new_work_units == STATUS_IN_QUEUE (AC-189-9)
+        """
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.backlog.default_status_for_new_work_units == STATUS_IN_QUEUE
+
+    def test_backlog_section_draft_parses(self, tmp_path: Path) -> None:
+        """
+        Given: a YAML config with backlog.default_status_for_new_work_units: draft
+        When: load_runtime_config is called
+        Then: RuntimeConfig.backlog.default_status_for_new_work_units == STATUS_DRAFT (AC-189-8)
+        """
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            backlog:
+              default_status_for_new_work_units: draft
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.backlog.default_status_for_new_work_units == STATUS_DRAFT
+
+    def test_backlog_section_in_queue_parses(self, tmp_path: Path) -> None:
+        """
+        Given: a YAML config with backlog.default_status_for_new_work_units: in-queue
+        When: load_runtime_config is called
+        Then: RuntimeConfig.backlog.default_status_for_new_work_units == STATUS_IN_QUEUE
+        """
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            backlog:
+              default_status_for_new_work_units: in-queue
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.backlog.default_status_for_new_work_units == STATUS_IN_QUEUE
+
+    def test_invalid_status_raises_value_error(self, tmp_path: Path) -> None:
+        """
+        Given: a YAML config with backlog.default_status_for_new_work_units: proposed
+        When: load_runtime_config is called
+        Then: ValueError is raised (the schema enum catches the invalid value and
+              reports the exact invalid value in the error message)
+        """
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            backlog:
+              default_status_for_new_work_units: proposed
+            """,
+        )
+        with pytest.raises(ValueError, match=r"proposed"):
+            load_runtime_config(cfg, {})
+
+    def test_invalid_status_message_names_valid_values(self, tmp_path: Path) -> None:
+        """
+        Given: an invalid value for default_status_for_new_work_units
+        When: load_runtime_config raises ValueError
+        Then: the error message references the schema-level enum rejection
+              (which lists the valid values 'draft' and 'in-queue')
+        """
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            backlog:
+              default_status_for_new_work_units: in-progress
+            """,
+        )
+        with pytest.raises(ValueError, match=r"draft.*in-queue|in-queue.*draft|is not one of"):
+            load_runtime_config(cfg, {})
+
+    def test_schema_rejects_unknown_backlog_key(self, tmp_path: Path) -> None:
+        """
+        Given: a YAML config with an unknown key in the backlog: section
+        When: load_runtime_config is called
+        Then: ValueError is raised identifying the unknown key (JSON Schema
+              additionalProperties: false)
+        """
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            backlog:
+              unknown_key: foo
+            """,
+        )
+        with pytest.raises(ValueError, match=r"Additional properties are not allowed.*unknown_key"):
+            load_runtime_config(cfg, {})
+
+    def test_parse_backlog_config_raises_on_invalid_status_direct(self, tmp_path: Path) -> None:
+        """
+        Given: _parse_backlog_config is called directly with a dict containing
+               an invalid default_status_for_new_work_units value
+        When: _parse_backlog_config is invoked (bypassing JSON schema validation)
+        Then: ValueError is raised naming the invalid value and the valid options
+
+        This test covers the runtime guard in _parse_backlog_config (lines 533-540)
+        that protects against callers who bypass the schema-validation layer.
+        """
+        from devbench.config_loader import _parse_backlog_config
+
+        fake_path = tmp_path / "cfg.yaml"
+        with pytest.raises(
+            ValueError,
+            match=r"must be one of.*draft.*in-queue|must be one of.*in-queue.*draft",
+        ):
+            _parse_backlog_config(fake_path, {"default_status_for_new_work_units": "proposed"})

@@ -50,6 +50,9 @@ YAML schema::
       llm_file_context: <integer>
       llm_file_preview_chars: <integer>
 
+    backlog:                             # optional -- backlog lifecycle settings (issue #189)
+      default_status_for_new_work_units: in-queue  # 'draft' or 'in-queue' (default 'in-queue')
+
     git_ops:                             # optional -- git workflow settings
       update_submodule: false            # set true only when repos are git submodules of a parent repo
 
@@ -78,7 +81,12 @@ from devbench.constants import (
     DEFAULT_STOP_HOOK_WINDOW_SECONDS,
     DEFAULT_TOKEN_COST_PER_M_INPUT,
     DEFAULT_TOKEN_COST_PER_M_OUTPUT,
+    STATUS_DRAFT,
+    STATUS_IN_QUEUE,
 )
+
+_BACKLOG_DEFAULT_STATUS: str = STATUS_IN_QUEUE
+_VALID_DEFAULT_STATUSES: frozenset[str] = frozenset({STATUS_IN_QUEUE, STATUS_DRAFT})
 
 # ---------------------------------------------------------------------------
 # Audit-row string constants for auto_finalize / auto_merge skill steps.
@@ -481,6 +489,58 @@ class OrchestrateConfig:
     max_cascade_depth: int | None = None
 
 
+@dataclass(frozen=True)
+class BacklogConfig:
+    """Backlog lifecycle settings loaded from the ``backlog:`` YAML section.
+
+    Controls behaviour that applies across all work units in the backlog,
+    such as what lifecycle status new work units receive on creation.
+
+    Attributes:
+        default_status_for_new_work_units: Lifecycle status written into the
+            ``## Status:`` line of every newly created work-unit file.
+            Accepted values: ``STATUS_DRAFT`` (``'draft'``) or
+            ``STATUS_IN_QUEUE`` (``'in-queue'``), imported from
+            ``devbench.constants``. Defaults to ``STATUS_IN_QUEUE`` for
+            backwards compatibility -- existing workspaces without the config
+            key see no behaviour change (AC-189-9). Set to ``STATUS_DRAFT``
+            (``'draft'``) to require explicit human promotion before the
+            orchestrator picks up a new task (AC-189-8).
+    """
+
+    default_status_for_new_work_units: str = _BACKLOG_DEFAULT_STATUS
+
+
+def _parse_backlog_config(path: Path, backlog_raw: dict) -> BacklogConfig:
+    """Parse and validate the ``backlog:`` YAML section into a ``BacklogConfig``.
+
+    Args:
+        path: Config file path (used in error messages).
+        backlog_raw: Raw ``backlog`` dict from YAML (already schema-validated
+            for unknown keys). May be an empty dict when the section is absent.
+
+    Returns:
+        ``BacklogConfig`` populated from *backlog_raw*.
+
+    Raises:
+        ValueError: If ``default_status_for_new_work_units`` is set to a
+            value that is not in ``_VALID_DEFAULT_STATUSES``.
+    """
+    raw_status = backlog_raw.get(
+        "default_status_for_new_work_units",
+        _BACKLOG_DEFAULT_STATUS,
+    )
+    if raw_status not in _VALID_DEFAULT_STATUSES:
+        valid_sorted = ", ".join(sorted(_VALID_DEFAULT_STATUSES))
+        raise ValueError(
+            f"Config file '{path}': backlog.default_status_for_new_work_units "
+            f"must be one of [{valid_sorted}]; got {raw_status!r}. "
+            f"Use {STATUS_DRAFT!r} to require explicit promotion before execution, "
+            f"or {STATUS_IN_QUEUE!r} (the default) for the legacy behaviour."
+        )
+    return BacklogConfig(default_status_for_new_work_units=raw_status)
+
+
 @dataclass
 class RepoConfig:
     """Per-repository configuration.
@@ -528,6 +588,7 @@ class RuntimeConfig:
         git_ops: Git operations workflow settings.
         report: Report and cost estimation settings.
         stop_hook: Stop hook circuit breaker settings.
+        backlog: Backlog lifecycle settings (default status for new WUs).
         allowed_orgs: List of permitted GitHub organisations.
         judge_model: Model identifier used by judge agents.
         executor_model: Model identifier used by the executor agent.
@@ -561,6 +622,7 @@ class RuntimeConfig:
     stop_hook: StopHookConfig = field(default_factory=StopHookConfig)
     hook_tail: HookTailConfig = field(default_factory=HookTailConfig)
     orchestrate: OrchestrateConfig = field(default_factory=OrchestrateConfig)
+    backlog: BacklogConfig = field(default_factory=BacklogConfig)
     manifest_amendment: AmendmentConfig = field(default_factory=AmendmentConfig)
     task_factory: TaskFactoryConfig = field(default_factory=TaskFactoryConfig)
     validate: ValidateConfig = field(default_factory=ValidateConfig)
@@ -1002,6 +1064,14 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         ),
     )
 
+    # Populate BacklogConfig from YAML backlog block (issue #189).
+    # Schema enforces enum on default_status_for_new_work_units and
+    # additionalProperties: false. We re-validate at runtime so that
+    # _parse_backlog_config can emit a clear, actionable error message
+    # that names both the invalid value and the allowed values.
+    backlog_raw = raw.get("backlog") or {}
+    backlog = _parse_backlog_config(path, backlog_raw)
+
     return RuntimeConfig(
         repos=repos,
         timeouts=timeouts,
@@ -1011,6 +1081,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         stop_hook=stop_hook,
         hook_tail=hook_tail,
         orchestrate=orchestrate,
+        backlog=backlog,
         manifest_amendment=manifest_amendment,
         task_factory=task_factory,
         validate=validate_cfg,

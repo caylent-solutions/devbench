@@ -242,6 +242,21 @@ task_factory:
   auto_accept_proposals: false
 
 # ---------------------------------------------------------------------------
+# Backlog lifecycle settings (issue #189)
+# ---------------------------------------------------------------------------
+# backlog:
+#   # Status written into '## Status:' of every newly created work-unit file.
+#   # 'draft'    -- task requires explicit human promotion (git push / status
+#   #               set-status <id> in-queue) before the orchestrator picks
+#   #               it up. Use this when you want a human to review every
+#   #               generated work unit before execution begins.
+#   # 'in-queue' -- legacy behaviour; new tasks are immediately eligible for
+#   #               the next orchestrator sweep. This is the default and
+#   #               preserves backwards compatibility for existing workspaces
+#   #               that do not set this key (AC-189-9).
+#   default_status_for_new_work_units: in-queue
+
+# ---------------------------------------------------------------------------
 # Opt-in validate-backlog rules. Existing rules (1-19) run unconditionally;
 # rules listed here are gated to keep pre-existing backlogs green during
 # rollout. Flip a toggle to true after auditing your backlog's AC / DoD

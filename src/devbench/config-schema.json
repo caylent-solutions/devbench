@@ -415,6 +415,18 @@
         }
       }
     },
+    "backlog": {
+      "type": "object",
+      "description": "Backlog lifecycle settings. Controls how new work units are created and what default status they receive (issue #189).",
+      "additionalProperties": false,
+      "properties": {
+        "default_status_for_new_work_units": {
+          "type": "string",
+          "enum": ["draft", "in-queue"],
+          "description": "Lifecycle status written into the '## Status:' line of every newly created work-unit file. Use 'draft' to require explicit human promotion before the orchestrator picks up the task. Use 'in-queue' (the default) for the legacy behaviour where new tasks are picked up immediately. AC-189-8 and AC-189-9."
+        }
+      }
+    },
     "task_factory": {
       "type": "object",
       "description": "Opt-in configuration for the task-factory loop. When enabled, the orchestrator invokes blocker-resolver + task-factory after an amendment reject to generate new `proposed` work units for the out-of-scope production fixes the amender surfaced. Requires manifest_amendment.enabled: true.",

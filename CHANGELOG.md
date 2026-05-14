@@ -39,6 +39,17 @@ since the last release. PR #119 carries every change.
   enum value placed before `IN_QUEUE` in lifecycle order. Allows work
   units to be authored and held in `draft` state before entering the
   active queue. Full parser and CLI support follows in sibling tasks.
+- **`BacklogConfig` dataclass + `backlog.default_status_for_new_work_units` config key** (E1-F5, issue #189, AC-189-8/9).
+  New `BacklogConfig` frozen dataclass in `config_loader.py` with field
+  `default_status_for_new_work_units` (accepted values: `'draft'` or
+  `'in-queue'`). Parsed from the optional `backlog:` YAML section in
+  `backlog/config/devbench.yaml` by `_parse_backlog_config()` and
+  stored on `RuntimeConfig.backlog`. Defaults to `'in-queue'` when the
+  section is absent, preserving backwards compatibility (AC-189-9).
+  Set to `'draft'` to require explicit human promotion before the
+  orchestrator picks up newly created work units (AC-189-8). Invalid
+  values raise `ValueError` with an actionable error message listing
+  the accepted choices.
 - **HOLD lifecycle status** (E222, issue #104). New `WorkUnitStatus.HOLD`
   + `devbench hold <id>` / `devbench unhold <id>` CLI for tasks
   deliberately deferred without breaking dep-chain math.

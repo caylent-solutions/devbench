@@ -1,5 +1,5 @@
 """Tests for devbench.quota -- exception hierarchy, detect_quota_error,
-and parse_reset_time.
+parse_reset_time, and wait_for_reset.
 
 Covers: QuotaExhaustedError, SubscriptionRateLimitError, SdkCreditExhaustedError,
 ApiBillingError, BedrockThrottleError.  Each exception carries reset_at,
@@ -11,24 +11,31 @@ incoming SDK exceptions / response objects into the structured quota hierarchy.
 Also covers: parse_reset_time(headers) which extracts a UTC datetime from
 Retry-After (integer seconds or HTTP-date) or anthropic-ratelimit-*-reset
 (epoch seconds) headers.
+
+Also covers: wait_for_reset(reset_at, poll_interval, max_wait, probe_fn) which
+sleeps until reset_at then probes quota recovery with exponential backoff.
+Returns True on recovery, False when max_wait is exceeded.
 """
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from devbench.quota import (
     ApiBillingError,
+    BackoffConfig,
     BedrockThrottleError,
     QuotaExhaustedError,
     SdkCreditExhaustedError,
     SubscriptionRateLimitError,
     detect_quota_error,
     parse_reset_time,
+    wait_for_reset,
 )
 
 # ---------------------------------------------------------------------------
@@ -1089,3 +1096,583 @@ class TestParseResetTimeIntegration:
         result = parse_reset_time(headers)
         assert result is not None
         assert result == datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+
+
+# ---------------------------------------------------------------------------
+# BackoffConfig dataclass
+# ---------------------------------------------------------------------------
+
+
+class TestBackoffConfig:
+    """BackoffConfig carries exponential-backoff parameters for wait_for_reset."""
+
+    def test_default_values(self) -> None:
+        cfg = BackoffConfig()
+        assert cfg.initial_seconds == 30.0
+        assert cfg.max_seconds == 600.0
+        assert cfg.multiplier == 2.0
+        assert cfg.jitter == 0.2
+
+    def test_custom_values_stored(self) -> None:
+        cfg = BackoffConfig(initial_seconds=5.0, max_seconds=60.0, multiplier=1.5, jitter=0.1)
+        assert cfg.initial_seconds == 5.0
+        assert cfg.max_seconds == 60.0
+        assert cfg.multiplier == 1.5
+        assert cfg.jitter == 0.1
+
+    def test_zero_jitter_allowed(self) -> None:
+        cfg = BackoffConfig(jitter=0.0)
+        assert cfg.jitter == 0.0
+
+    def test_initial_equals_max_allowed(self) -> None:
+        cfg = BackoffConfig(initial_seconds=30.0, max_seconds=30.0)
+        assert cfg.initial_seconds == cfg.max_seconds
+
+
+# ---------------------------------------------------------------------------
+# wait_for_reset: happy path -- probe succeeds on first attempt
+# ---------------------------------------------------------------------------
+
+
+class TestWaitForResetHappyPath:
+    """AC-193-5: on_exhaustion=wait sleeps until reset, probes, resumes (True)."""
+
+    def test_returns_true_when_probe_succeeds_immediately(self) -> None:
+        """Probe returns True on first call after initial sleep -> wait_for_reset returns True."""
+        reset_at = datetime.now(tz=UTC) + timedelta(seconds=60)
+        probe_fn = MagicMock(return_value=True)
+        sleeps: list[float] = []
+
+        async def _run() -> bool:
+            async def fake_sleep(seconds: float) -> None:
+                sleeps.append(seconds)
+
+            with patch("devbench.quota.asyncio.sleep", side_effect=fake_sleep):
+                return await wait_for_reset(
+                    reset_at=reset_at,
+                    poll_interval=5.0,
+                    max_wait=300.0,
+                    probe_fn=probe_fn,
+                )
+
+        result = asyncio.run(_run())
+        assert result is True
+        probe_fn.assert_called_once()
+
+    def test_initial_sleep_is_time_until_reset_at(self) -> None:
+        """The first sleep duration equals the number of seconds until reset_at."""
+        now = datetime.now(tz=UTC)
+        reset_at = now + timedelta(seconds=90)
+        probe_fn = MagicMock(return_value=True)
+        captured_sleep: list[float] = []
+
+        async def _run() -> bool:
+            async def fake_sleep(seconds: float) -> None:
+                captured_sleep.append(seconds)
+
+            with patch("devbench.quota.asyncio.sleep", side_effect=fake_sleep):
+                return await wait_for_reset(
+                    reset_at=reset_at,
+                    poll_interval=5.0,
+                    max_wait=300.0,
+                    probe_fn=probe_fn,
+                )
+
+        asyncio.run(_run())
+        assert len(captured_sleep) >= 1
+        # First sleep should be approximately 90 seconds (allow 2s tolerance for execution time)
+        assert 88.0 <= captured_sleep[0] <= 92.0
+
+    def test_initial_sleep_clamped_to_zero_when_reset_at_in_past(self) -> None:
+        """When reset_at is in the past, no initial sleep occurs (clamped to 0 or skipped)."""
+        reset_at = datetime.now(tz=UTC) - timedelta(seconds=30)
+        probe_fn = MagicMock(return_value=True)
+        captured_sleep: list[float] = []
+
+        async def _run() -> bool:
+            async def fake_sleep(seconds: float) -> None:
+                captured_sleep.append(seconds)
+
+            with patch("devbench.quota.asyncio.sleep", side_effect=fake_sleep):
+                return await wait_for_reset(
+                    reset_at=reset_at,
+                    poll_interval=5.0,
+                    max_wait=300.0,
+                    probe_fn=probe_fn,
+                )
+
+        result = asyncio.run(_run())
+        assert result is True
+        # Either no initial sleep or sleep with 0
+        assert all(s >= 0.0 for s in captured_sleep)
+        # First sleep (if any) should be ~0 or close to 0 (within 1s of now)
+        if captured_sleep:
+            assert captured_sleep[0] <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# wait_for_reset: probe fails -- exponential backoff retries
+# ---------------------------------------------------------------------------
+
+
+class TestWaitForResetBackoff:
+    """Probe failure triggers exponential backoff; probe eventually succeeds -> True."""
+
+    def test_returns_true_after_backoff_probe_succeeds(self) -> None:
+        """Probe fails once then succeeds; wait_for_reset returns True."""
+        reset_at = datetime.now(tz=UTC) - timedelta(seconds=1)  # already past
+        probe_fn = MagicMock(side_effect=[False, True])
+        captured_sleep: list[float] = []
+
+        async def _run() -> bool:
+            async def fake_sleep(seconds: float) -> None:
+                captured_sleep.append(seconds)
+
+            with patch("devbench.quota.asyncio.sleep", side_effect=fake_sleep):
+                return await wait_for_reset(
+                    reset_at=reset_at,
+                    poll_interval=5.0,
+                    max_wait=300.0,
+                    probe_fn=probe_fn,
+                    backoff_config=BackoffConfig(initial_seconds=5.0, max_seconds=60.0, multiplier=2.0, jitter=0.0),
+                )
+
+        result = asyncio.run(_run())
+        assert result is True
+        assert probe_fn.call_count == 2
+        # A backoff sleep should have occurred between the first failure and second probe
+        assert len(captured_sleep) >= 1
+
+    def test_backoff_sleep_duration_grows_exponentially(self) -> None:
+        """Each retry sleep duration is multiplied by the backoff multiplier."""
+        reset_at = datetime.now(tz=UTC) - timedelta(seconds=1)
+        probe_fn = MagicMock(side_effect=[False, False, False, True])
+        captured_sleep: list[float] = []
+
+        async def _run() -> bool:
+            async def fake_sleep(seconds: float) -> None:
+                captured_sleep.append(seconds)
+
+            with patch("devbench.quota.asyncio.sleep", side_effect=fake_sleep):
+                return await wait_for_reset(
+                    reset_at=reset_at,
+                    poll_interval=10.0,
+                    max_wait=3600.0,
+                    probe_fn=probe_fn,
+                    backoff_config=BackoffConfig(initial_seconds=10.0, max_seconds=1000.0, multiplier=2.0, jitter=0.0),
+                )
+
+        asyncio.run(_run())
+        # Backoff sleeps should be 10, 20, 40 (doubling each time, jitter=0)
+        # The first sleep is the initial reset_at sleep (should be ~0 since reset_at in past)
+        backoff_sleeps = [s for s in captured_sleep if s > 1.0]  # filter out the near-zero initial sleep
+        assert len(backoff_sleeps) >= 2
+        # Each subsequent backoff sleep should be larger than the previous
+        for i in range(1, len(backoff_sleeps)):
+            assert backoff_sleeps[i] > backoff_sleeps[i - 1]
+
+    def test_backoff_sleep_capped_at_max_seconds(self) -> None:
+        """Backoff sleep never exceeds backoff_config.max_seconds."""
+        reset_at = datetime.now(tz=UTC) - timedelta(seconds=1)
+        # Fail 5 times to force multiple doublings, with jitter=0 for determinism
+        probe_fn = MagicMock(side_effect=[False, False, False, False, False, True])
+        captured_sleep: list[float] = []
+
+        async def _run() -> bool:
+            async def fake_sleep(seconds: float) -> None:
+                captured_sleep.append(seconds)
+
+            with patch("devbench.quota.asyncio.sleep", side_effect=fake_sleep):
+                return await wait_for_reset(
+                    reset_at=reset_at,
+                    poll_interval=10.0,
+                    max_wait=100000.0,
+                    probe_fn=probe_fn,
+                    backoff_config=BackoffConfig(initial_seconds=10.0, max_seconds=25.0, multiplier=2.0, jitter=0.0),
+                )
+
+        asyncio.run(_run())
+        # All backoff sleeps must be <= max_seconds
+        for s in captured_sleep:
+            assert s <= 25.0 + 0.001  # allow tiny float rounding
+
+    def test_jitter_applied_to_backoff_sleep(self) -> None:
+        """With jitter > 0, backoff sleep varies from the deterministic value."""
+        reset_at = datetime.now(tz=UTC) - timedelta(seconds=1)
+        # Fail twice to observe two backoff sleeps and check they differ
+        probe_fn = MagicMock(side_effect=[False, False, True])
+        runs: list[list[float]] = []
+
+        for _ in range(10):
+            captured_sleep: list[float] = []
+
+            async def _run(cs: list[float] = captured_sleep) -> bool:
+                async def fake_sleep(seconds: float) -> None:
+                    cs.append(seconds)
+
+                with patch("devbench.quota.asyncio.sleep", side_effect=fake_sleep):
+                    return await wait_for_reset(
+                        reset_at=reset_at,
+                        poll_interval=10.0,
+                        max_wait=3600.0,
+                        probe_fn=probe_fn,
+                        backoff_config=BackoffConfig(
+                            initial_seconds=10.0, max_seconds=1000.0, multiplier=2.0, jitter=0.2
+                        ),
+                    )
+
+            probe_fn.side_effect = [False, False, True]
+            asyncio.run(_run(captured_sleep))
+            runs.append(list(captured_sleep))
+
+        # Collect the first backoff sleep from each run; with jitter they should not all be identical
+        first_backoff_sleeps = [r[1] for r in runs if len(r) > 1]
+        assert len(first_backoff_sleeps) >= 2, (
+            "Expected at least 2 runs to capture a backoff sleep; "
+            f"got {len(first_backoff_sleeps)} from {len(runs)} runs with sleeps: {runs}"
+        )
+        # At least one pair should differ (jitter introduces randomness)
+        # With 10 runs and 20% jitter, the chance all are identical is astronomically small
+        assert len({round(v, 4) for v in first_backoff_sleeps}) > 1
+
+    def test_probe_called_with_no_arguments(self) -> None:
+        """probe_fn is called with no arguments."""
+        reset_at = datetime.now(tz=UTC) - timedelta(seconds=1)
+        probe_fn = MagicMock(return_value=True)
+
+        async def _run() -> bool:
+            async def fake_sleep(_seconds: float) -> None:
+                pass
+
+            with patch("devbench.quota.asyncio.sleep", side_effect=fake_sleep):
+                return await wait_for_reset(
+                    reset_at=reset_at,
+                    poll_interval=5.0,
+                    max_wait=300.0,
+                    probe_fn=probe_fn,
+                )
+
+        asyncio.run(_run())
+        probe_fn.assert_called_with()
+
+
+# ---------------------------------------------------------------------------
+# wait_for_reset: max_wait exceeded -- returns False (AC-193-12)
+# ---------------------------------------------------------------------------
+
+
+class TestWaitForResetMaxWaitExceeded:
+    """AC-193-12: max_wait ceiling is honored; returns False when exceeded."""
+
+    def test_returns_false_when_max_wait_exceeded(self) -> None:
+        """Probe always fails; once accumulated wait exceeds max_wait, return False."""
+        reset_at = datetime.now(tz=UTC) - timedelta(seconds=1)
+        probe_fn = MagicMock(return_value=False)
+        captured_sleep: list[float] = []
+
+        async def _run() -> bool:
+            async def fake_sleep(seconds: float) -> None:
+                captured_sleep.append(seconds)
+
+            with patch("devbench.quota.asyncio.sleep", side_effect=fake_sleep):
+                return await wait_for_reset(
+                    reset_at=reset_at,
+                    poll_interval=5.0,
+                    max_wait=12.0,  # small max so backoff exceeds it quickly
+                    probe_fn=probe_fn,
+                    backoff_config=BackoffConfig(initial_seconds=5.0, max_seconds=60.0, multiplier=2.0, jitter=0.0),
+                )
+
+        result = asyncio.run(_run())
+        assert result is False
+
+    def test_probe_not_called_after_max_wait(self) -> None:
+        """probe_fn call count is bounded; no probes issued after max_wait exceeded."""
+        reset_at = datetime.now(tz=UTC) - timedelta(seconds=1)
+        probe_fn = MagicMock(return_value=False)
+
+        async def _run() -> bool:
+            async def fake_sleep(_seconds: float) -> None:
+                pass
+
+            with patch("devbench.quota.asyncio.sleep", side_effect=fake_sleep):
+                return await wait_for_reset(
+                    reset_at=reset_at,
+                    poll_interval=5.0,
+                    max_wait=10.0,
+                    probe_fn=probe_fn,
+                    backoff_config=BackoffConfig(initial_seconds=5.0, max_seconds=60.0, multiplier=2.0, jitter=0.0),
+                )
+
+        asyncio.run(_run())
+        # With max_wait=10.0, initial_seconds=5.0, multiplier=2.0, jitter=0.0:
+        # - probe called at elapsed=0 (initial sleep=0, past reset_at)
+        # - backoff sleep=5.0, elapsed=5.0 -> probe called
+        # - backoff sleep=10.0, elapsed=15.0 -> exceeds max_wait=10.0, no further probe
+        # Exactly 2 probes are issued before the limit is reached.
+        assert probe_fn.call_count == 2
+
+    def test_max_wait_zero_returns_false_immediately(self) -> None:
+        """max_wait=0 -- any accumulated time exceeds limit; return False without probing."""
+        reset_at = datetime.now(tz=UTC) - timedelta(seconds=1)
+        probe_fn = MagicMock(return_value=True)
+
+        async def _run() -> bool:
+            async def fake_sleep(_seconds: float) -> None:
+                pass
+
+            with patch("devbench.quota.asyncio.sleep", side_effect=fake_sleep):
+                return await wait_for_reset(
+                    reset_at=reset_at,
+                    poll_interval=1.0,
+                    max_wait=0.0,
+                    probe_fn=probe_fn,
+                )
+
+        result = asyncio.run(_run())
+        assert result is False
+        probe_fn.assert_not_called()
+
+    @pytest.mark.parametrize("max_wait", [1.0, 5.0, 30.0, 300.0])
+    def test_max_wait_parametrized_returns_false(self, max_wait: float) -> None:
+        """For various max_wait values, a probe that always fails eventually yields False."""
+        reset_at = datetime.now(tz=UTC) - timedelta(seconds=1)
+        probe_fn = MagicMock(return_value=False)
+
+        async def _run() -> bool:
+            async def fake_sleep(_seconds: float) -> None:
+                pass
+
+            with patch("devbench.quota.asyncio.sleep", side_effect=fake_sleep):
+                return await wait_for_reset(
+                    reset_at=reset_at,
+                    poll_interval=1.0,
+                    max_wait=max_wait,
+                    probe_fn=probe_fn,
+                    backoff_config=BackoffConfig(initial_seconds=1.0, max_seconds=2.0, multiplier=2.0, jitter=0.0),
+                )
+
+        result = asyncio.run(_run())
+        assert result is False
+
+
+# ---------------------------------------------------------------------------
+# wait_for_reset: edge cases
+# ---------------------------------------------------------------------------
+
+
+class TestWaitForResetEdgeCases:
+    """Edge cases: reset_at in future, probe raises, default backoff."""
+
+    def test_reset_at_exactly_now_no_negative_sleep(self) -> None:
+        """reset_at == now: no sleep with negative duration."""
+        reset_at = datetime.now(tz=UTC)
+        probe_fn = MagicMock(return_value=True)
+        captured_sleep: list[float] = []
+
+        async def _run() -> bool:
+            async def fake_sleep(seconds: float) -> None:
+                captured_sleep.append(seconds)
+
+            with patch("devbench.quota.asyncio.sleep", side_effect=fake_sleep):
+                return await wait_for_reset(
+                    reset_at=reset_at,
+                    poll_interval=5.0,
+                    max_wait=300.0,
+                    probe_fn=probe_fn,
+                )
+
+        result = asyncio.run(_run())
+        assert result is True
+        for s in captured_sleep:
+            assert s >= 0.0
+
+    def test_default_backoff_config_used_when_none(self) -> None:
+        """When backoff_config is not provided, sensible defaults are used."""
+        reset_at = datetime.now(tz=UTC) - timedelta(seconds=1)
+        probe_fn = MagicMock(side_effect=[False, True])
+        captured_sleep: list[float] = []
+
+        async def _run() -> bool:
+            async def fake_sleep(seconds: float) -> None:
+                captured_sleep.append(seconds)
+
+            with patch("devbench.quota.asyncio.sleep", side_effect=fake_sleep):
+                return await wait_for_reset(
+                    reset_at=reset_at,
+                    poll_interval=5.0,
+                    max_wait=3600.0,
+                    probe_fn=probe_fn,
+                )
+
+        result = asyncio.run(_run())
+        assert result is True
+        assert probe_fn.call_count == 2
+
+    def test_poll_interval_used_as_initial_backoff_delay(self) -> None:
+        """poll_interval is used as the starting interval for backoff after first probe failure."""
+        reset_at = datetime.now(tz=UTC) - timedelta(seconds=1)
+        probe_fn = MagicMock(side_effect=[False, True])
+        captured_sleep: list[float] = []
+
+        async def _run() -> bool:
+            async def fake_sleep(seconds: float) -> None:
+                captured_sleep.append(seconds)
+
+            with patch("devbench.quota.asyncio.sleep", side_effect=fake_sleep):
+                return await wait_for_reset(
+                    reset_at=reset_at,
+                    poll_interval=7.0,
+                    max_wait=3600.0,
+                    probe_fn=probe_fn,
+                    backoff_config=BackoffConfig(initial_seconds=7.0, max_seconds=600.0, multiplier=2.0, jitter=0.0),
+                )
+
+        asyncio.run(_run())
+        # There should be a backoff sleep of ~7.0 after the first failure
+        backoff_sleeps = [s for s in captured_sleep if s > 1.0]
+        assert any(abs(s - 7.0) < 0.5 for s in backoff_sleeps)
+
+    def test_await_asyncio_sleep_is_used_not_time_sleep(self) -> None:
+        """wait_for_reset uses asyncio.sleep (not time.sleep) -- verified via mock call check."""
+        reset_at = datetime.now(tz=UTC) - timedelta(seconds=1)
+        probe_fn = MagicMock(return_value=True)
+
+        async def _run() -> bool:
+            with patch("devbench.quota.asyncio.sleep", new_callable=AsyncMock) as mock_async_sleep:
+                result = await wait_for_reset(
+                    reset_at=reset_at,
+                    poll_interval=5.0,
+                    max_wait=300.0,
+                    probe_fn=probe_fn,
+                )
+                # asyncio.sleep must have been called at least once (initial sleep for reset_at)
+                assert mock_async_sleep.called
+                return result
+
+        result = asyncio.run(_run())
+        assert result is True
+
+    def test_conflicting_poll_interval_and_backoff_config_raises(self) -> None:
+        """ValueError raised when poll_interval != backoff_config.initial_seconds."""
+        reset_at = datetime.now(tz=UTC) - timedelta(seconds=1)
+        probe_fn = MagicMock(return_value=True)
+
+        async def _run() -> None:
+            await wait_for_reset(
+                reset_at=reset_at,
+                poll_interval=5.0,
+                max_wait=300.0,
+                probe_fn=probe_fn,
+                backoff_config=BackoffConfig(initial_seconds=10.0, max_seconds=60.0, multiplier=2.0, jitter=0.0),
+            )
+
+        with pytest.raises(ValueError, match="Conflicting backoff configuration"):
+            asyncio.run(_run())
+
+    def test_probe_fn_exception_propagates_unchanged(self) -> None:
+        """Any exception raised by probe_fn propagates out of wait_for_reset unchanged."""
+        reset_at = datetime.now(tz=UTC) - timedelta(seconds=1)
+        probe_fn = MagicMock(side_effect=RuntimeError("quota probe failed"))
+
+        async def _run() -> bool:
+            async def fake_sleep(_seconds: float) -> None:
+                pass
+
+            with patch("devbench.quota.asyncio.sleep", side_effect=fake_sleep):
+                return await wait_for_reset(
+                    reset_at=reset_at,
+                    poll_interval=5.0,
+                    max_wait=300.0,
+                    probe_fn=probe_fn,
+                )
+
+        with pytest.raises(RuntimeError, match="quota probe failed"):
+            asyncio.run(_run())
+
+    def test_matching_poll_interval_and_backoff_config_does_not_raise(self) -> None:
+        """No ValueError when poll_interval equals backoff_config.initial_seconds."""
+        reset_at = datetime.now(tz=UTC) - timedelta(seconds=1)
+        probe_fn = MagicMock(return_value=True)
+
+        async def _run() -> bool:
+            async def fake_sleep(_seconds: float) -> None:
+                pass
+
+            with patch("devbench.quota.asyncio.sleep", side_effect=fake_sleep):
+                return await wait_for_reset(
+                    reset_at=reset_at,
+                    poll_interval=10.0,
+                    max_wait=300.0,
+                    probe_fn=probe_fn,
+                    backoff_config=BackoffConfig(initial_seconds=10.0, max_seconds=60.0, multiplier=2.0, jitter=0.0),
+                )
+
+        result = asyncio.run(_run())
+        assert result is True
+
+
+# ---------------------------------------------------------------------------
+# wait_for_reset: integration -- no mocks on async.sleep
+# ---------------------------------------------------------------------------
+
+
+class TestWaitForResetIntegration:
+    """Integration tests: wait_for_reset with real probe functions (no mock on asyncio.sleep).
+
+    These tests use very small durations (0-second sleeps) to run without blocking.
+    They verify the end-to-end logic path against realistic fixture objects.
+    """
+
+    def test_integration_probe_succeeds_immediately(self) -> None:
+        """Real asyncio.sleep(0) + probe that returns True immediately -> True."""
+        reset_at = datetime.now(tz=UTC) - timedelta(seconds=1)
+        probe_fn = MagicMock(return_value=True)
+
+        async def _run() -> bool:
+            return await wait_for_reset(
+                reset_at=reset_at,
+                poll_interval=0.0,
+                max_wait=10.0,
+                probe_fn=probe_fn,
+                backoff_config=BackoffConfig(initial_seconds=0.0, max_seconds=0.01, multiplier=1.0, jitter=0.0),
+            )
+
+        result = asyncio.run(_run())
+        assert result is True
+        probe_fn.assert_called_once()
+
+    def test_integration_probe_fails_then_succeeds(self) -> None:
+        """Real asyncio.sleep(tiny) + probe that fails once then succeeds -> True."""
+        reset_at = datetime.now(tz=UTC) - timedelta(seconds=1)
+        probe_fn = MagicMock(side_effect=[False, True])
+
+        async def _run() -> bool:
+            return await wait_for_reset(
+                reset_at=reset_at,
+                poll_interval=0.001,
+                max_wait=10.0,
+                probe_fn=probe_fn,
+                backoff_config=BackoffConfig(initial_seconds=0.001, max_seconds=0.01, multiplier=1.5, jitter=0.0),
+            )
+
+        result = asyncio.run(_run())
+        assert result is True
+        assert probe_fn.call_count == 2
+
+    def test_integration_max_wait_exceeded(self) -> None:
+        """Real asyncio.sleep(tiny) + probe that always fails -> False when max_wait exceeded."""
+        reset_at = datetime.now(tz=UTC) - timedelta(seconds=1)
+        probe_fn = MagicMock(return_value=False)
+
+        async def _run() -> bool:
+            return await wait_for_reset(
+                reset_at=reset_at,
+                poll_interval=0.01,
+                max_wait=0.05,
+                probe_fn=probe_fn,
+                backoff_config=BackoffConfig(initial_seconds=0.01, max_seconds=0.02, multiplier=1.5, jitter=0.0),
+            )
+
+        result = asyncio.run(_run())
+        assert result is False

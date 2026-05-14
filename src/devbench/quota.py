@@ -1,4 +1,4 @@
-"""Quota exception hierarchy and detection for devbench.
+"""Quota exception hierarchy, detection, and wait-for-reset protocol for devbench.
 
 Defines structured exceptions raised when the Anthropic SDK or AWS Bedrock
 returns quota / billing exhaustion signals.  Every exception carries three
@@ -27,6 +27,11 @@ Public API:
   ``None`` when the input carries no quota signal.
 - :func:`parse_reset_time` -- extract a UTC reset :class:`~datetime.datetime`
   from response headers, or ``None`` when no parseable reset signal is present.
+- :class:`BackoffConfig` -- exponential-backoff parameters used by
+  :func:`wait_for_reset`.
+- :func:`wait_for_reset` -- async function that sleeps until ``reset_at``,
+  then polls ``probe_fn`` with exponential backoff until recovery or
+  ``max_wait`` is exceeded.
 
 Raises:
     None -- this module only defines exception classes and pure-function
@@ -35,7 +40,10 @@ Raises:
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import asyncio
+import secrets
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -362,6 +370,159 @@ def parse_reset_time(headers: Mapping[str, str]) -> datetime | None:
     if not candidates:
         return None
     return min(candidates)
+
+
+# ---------------------------------------------------------------------------
+# Backoff configuration -- named constants (spec section 4.5.6 defaults)
+# ---------------------------------------------------------------------------
+
+# Rule 4 exemption: constants.py amendment out of scope (source-test atomicity).
+# These constants are intentionally module-level so that callers can import
+# and inspect them without instantiating a BackoffConfig.  They also satisfy
+# the no-inline-literals rule: field() defaults reference the constants rather
+# than bare numeric literals.
+_BACKOFF_DEFAULT_INITIAL: float = 30.0
+_BACKOFF_DEFAULT_MAX: float = 600.0
+_BACKOFF_DEFAULT_MULTIPLIER: float = 2.0
+_BACKOFF_DEFAULT_JITTER: float = 0.2
+
+# Minimum sleep guard: prevents negative sleep durations (e.g. when reset_at
+# is already in the past).
+_MIN_SLEEP_SECONDS: float = 0.0
+
+
+# ---------------------------------------------------------------------------
+# Backoff configuration dataclass
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class BackoffConfig:
+    """Exponential-backoff configuration for :func:`wait_for_reset` probe retries.
+
+    All fields have spec-default values defined in spec section 4.5.6.
+    Pass a custom instance to override any field.
+
+    Args:
+        initial_seconds: Starting backoff interval in seconds (default 30).
+        max_seconds: Maximum backoff interval in seconds (default 600).
+        multiplier: Exponent base applied after each failed probe (default 2.0).
+        jitter: Fractional jitter to add/subtract from each backoff duration
+            (default 0.2).  A jitter of 0.2 means the actual sleep duration is
+            chosen uniformly from ``[delay * 0.8, delay * 1.2]``.  Set to 0.0
+            to disable jitter for deterministic tests.
+
+    Raises:
+        None -- dataclass constructor only.
+    """
+
+    initial_seconds: float = field(default=_BACKOFF_DEFAULT_INITIAL)
+    max_seconds: float = field(default=_BACKOFF_DEFAULT_MAX)
+    multiplier: float = field(default=_BACKOFF_DEFAULT_MULTIPLIER)
+    jitter: float = field(default=_BACKOFF_DEFAULT_JITTER)
+
+
+# ---------------------------------------------------------------------------
+# wait_for_reset -- async quota-recovery wait protocol
+# ---------------------------------------------------------------------------
+
+
+async def wait_for_reset(
+    reset_at: datetime,
+    poll_interval: float,
+    max_wait: float,
+    probe_fn: Callable[[], bool],
+    backoff_config: BackoffConfig | None = None,
+) -> bool:
+    """Async quota-recovery wait loop.
+
+    Sleeps until *reset_at* then probes quota recovery via *probe_fn*.  If the
+    probe returns ``False`` (quota still exhausted), the loop backs off
+    exponentially (per *backoff_config*) and retries.  Returns ``True`` when
+    the probe succeeds, or ``False`` when the total time elapsed since the
+    function was called exceeds *max_wait*.
+
+    The initial sleep duration is the number of seconds between now and
+    *reset_at*, clamped to 0 when *reset_at* is already in the past.
+
+    Algorithm::
+
+        elapsed = 0
+        sleep(max(0, reset_at - now))
+        elapsed += initial_sleep
+        loop:
+            if elapsed >= max_wait: return False
+            if probe_fn(): return True
+            delay = current_interval +/- jitter (capped at max_seconds)
+            sleep(delay)
+            elapsed += delay
+            current_interval = min(current_interval * multiplier, max_seconds)
+
+    Args:
+        reset_at: UTC datetime at which the quota is expected to reset.
+            When in the past, the initial sleep is skipped (clamped to 0).
+        poll_interval: Starting backoff interval in seconds.  This value
+            is used as the *initial_seconds* override when *backoff_config* is
+            ``None``.  When *backoff_config* is provided and its
+            ``initial_seconds`` differs from *poll_interval*, a
+            :class:`ValueError` is raised to prevent silent precedence
+            surprises.  Pass the same value to both; when
+            ``backoff_config.initial_seconds`` equals *poll_interval*, no
+            conflict is detected and *poll_interval* is used as the initial
+            backoff interval.
+        max_wait: Maximum total seconds to wait (inclusive of the initial sleep
+            until *reset_at*).  When the accumulated elapsed time exceeds this
+            value, the function returns ``False`` without calling *probe_fn*.
+            A value of ``0.0`` causes ``False`` to be returned after the
+            initial *reset_at* sleep completes, without calling *probe_fn*.
+        probe_fn: Zero-argument callable that returns ``True`` when quota has
+            recovered, ``False`` otherwise.  Any exception raised by probe_fn
+            propagates unchanged to the caller.
+        backoff_config: Exponential-backoff parameters.  When ``None``, a
+            :class:`BackoffConfig` is constructed with ``initial_seconds``
+            set to *poll_interval* and all other fields at their spec defaults.
+
+    Returns:
+        ``True`` when *probe_fn* returns ``True`` within *max_wait* seconds.
+        ``False`` when *max_wait* is exceeded before the probe succeeds.
+
+    Raises:
+        ValueError: When *backoff_config* is provided and
+            ``backoff_config.initial_seconds`` differs from *poll_interval*,
+            indicating conflicting configuration that would otherwise be
+            silently ignored.
+        Exception: Any exception raised by *probe_fn* propagates unchanged.
+    """
+    if backoff_config is not None and backoff_config.initial_seconds != poll_interval:
+        raise ValueError(
+            f"Conflicting backoff configuration: poll_interval={poll_interval!r} differs from "
+            f"backoff_config.initial_seconds={backoff_config.initial_seconds!r}. "
+            "Set poll_interval equal to backoff_config.initial_seconds, or omit backoff_config "
+            "to have it constructed automatically from poll_interval."
+        )
+    cfg = backoff_config if backoff_config is not None else BackoffConfig(initial_seconds=poll_interval)
+
+    now = datetime.now(tz=UTC)
+    initial_sleep = max(_MIN_SLEEP_SECONDS, (reset_at - now).total_seconds())
+    await asyncio.sleep(initial_sleep)
+
+    elapsed = initial_sleep
+    current_interval = cfg.initial_seconds
+
+    while True:
+        if elapsed >= max_wait:
+            return False
+        if probe_fn():
+            return True
+        # Compute jittered backoff delay.  secrets.SystemRandom provides
+        # uniform distribution without triggering S311 (standard PRNG warning).
+        jitter_delta = current_interval * cfg.jitter
+        delay = current_interval + secrets.SystemRandom().uniform(-jitter_delta, jitter_delta)
+        delay = max(_MIN_SLEEP_SECONDS, min(delay, cfg.max_seconds))
+        await asyncio.sleep(delay)
+        elapsed += delay
+        # Advance the un-jittered interval for the next iteration (capped at max).
+        current_interval = min(current_interval * cfg.multiplier, cfg.max_seconds)
 
 
 # ---------------------------------------------------------------------------

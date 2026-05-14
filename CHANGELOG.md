@@ -25,6 +25,10 @@ since the last release. PR #119 carries every change.
   the error). Requires `defer_pr: true` and an explicit
   `default_branch:` per repo. See `docs/operational-work.md` and
   `docs/git-ops-modes.md`.
+- **DRAFT lifecycle status** (E1, issue #189). New `WorkUnitStatus.DRAFT`
+  enum value placed before `IN_QUEUE` in lifecycle order. Allows work
+  units to be authored and held in `draft` state before entering the
+  active queue. Full parser and CLI support follows in sibling tasks.
 - **HOLD lifecycle status** (E222, issue #104). New `WorkUnitStatus.HOLD`
   + `devbench hold <id>` / `devbench unhold <id>` CLI for tasks
   deliberately deferred without breaking dep-chain math.

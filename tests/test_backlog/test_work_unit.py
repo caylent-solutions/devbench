@@ -27,9 +27,20 @@ class TestWorkUnitStatusEnum:
     def test_blocked_value(self) -> None:
         assert WorkUnitStatus.BLOCKED.value == "Blocked"
 
+    def test_draft_value(self) -> None:
+        assert WorkUnitStatus.DRAFT.value == "Draft"
+
+    def test_draft_is_before_in_queue_in_lifecycle_order(self) -> None:
+        """DRAFT must appear before IN_QUEUE so lifecycle reads draft -> in-queue."""
+        members = list(WorkUnitStatus)
+        draft_idx = members.index(WorkUnitStatus.DRAFT)
+        in_queue_idx = members.index(WorkUnitStatus.IN_QUEUE)
+        assert draft_idx < in_queue_idx, f"DRAFT (index {draft_idx}) must precede IN_QUEUE (index {in_queue_idx})"
+
     def test_all_statuses_present(self) -> None:
         names = {s.name for s in WorkUnitStatus}
         assert names == {
+            "DRAFT",
             "IN_QUEUE",
             "IN_PROGRESS",
             "IN_REVIEW",

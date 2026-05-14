@@ -51,6 +51,7 @@ def validate_manifest_paths(paths: list[str], checkout_directories: list[str]) -
 class WorkUnitStatus(Enum):
     """Lifecycle status of a work unit."""
 
+    DRAFT = "Draft"
     IN_QUEUE = "In Queue"
     IN_PROGRESS = "In Progress"
     IN_REVIEW = "In Review"

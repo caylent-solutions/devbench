@@ -12,6 +12,16 @@ since the last release. PR #119 carries every change.
 
 ### Added
 
+- **`ScopeFilter` scope selector module** (issue #190). New
+  `src/devbench/scope.py` dataclass providing a persistent allow/deny
+  scope filter for work-unit execution. Public API: `ScopeFilter`
+  dataclass with `parse(include_str: str, exclude_str: str, backlog_ids: list[str])`,
+  `allows(unit_id: str) -> bool`, `to_file(workspace_root)`,
+  `from_file(workspace_root)`, and `clear(workspace_root)` methods.
+  `InvalidScopeError` raised on malformed scope expressions (e.g.
+  reversed ranges). Scope state is persisted to
+  `<workspace_root>/.devbench/scope.json` so the filter survives
+  orchestrator restarts.
 - **`git_ops.local_only` mode**. New config flag for target repos that
   have no `origin` git remote -- typical for operational workflows
   (AWS teardowns, evidence capture, audits) where devbench drives the

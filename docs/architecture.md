@@ -179,6 +179,7 @@ The CLI is the single entry point that the runtime prompts (skill, agents, hooks
 | Security | `src/devbench/github/security.py` | CodeQL / Dependabot / secret scanning queries |
 | Reporting | `src/devbench/reporting/report.py` | Velocity + token + cost report generator |
 | Logging | `src/devbench/log_setup.py` | Stdout + file logging |
+| Scope filter | `src/devbench/scope.py` | `ScopeFilter` dataclass + `InvalidScopeError`; allow/deny scope filter with `parse`/`allows`/`to_file`/`from_file`/`clear` API; persists to `scope.json` |
 | Plugin: skill | `plugin/devbench/skills/orchestrate/SKILL.md` | The autonomous orchestration loop |
 | Plugin: agents | `plugin/devbench/agents/` | Top-level agents (executor, review-supervisor, security-reviewer, blocker-resolver) |
 | Plugin: judges | `plugin/devbench/agents/review_team/` | Four parallel review judges |

@@ -931,3 +931,56 @@ class TestDepsSatisfiedHierarchical:
         candidate_ids = {u.id for u in candidates}
         assert "E0-F1-S1-T1" in candidate_ids
         assert "E0-F1-S2-T1" not in candidate_ids
+
+
+class TestParseStatusDraft:
+    """Test that the parser recognises 'draft' as a valid work-unit status."""
+
+    @pytest.mark.parametrize(
+        "raw_input",
+        ["draft", "DRAFT", "Draft", "  draft  "],
+    )
+    def test_parse_status_draft_normalised(self, raw_input: str) -> None:
+        """_parse_status accepts 'draft' in any case and with leading/trailing whitespace."""
+        from devbench.backlog.parser import _parse_status
+
+        result = _parse_status(raw_input)
+        assert result is WorkUnitStatus.DRAFT
+
+    def test_draft_key_present_in_raw_status_map(self) -> None:
+        """'draft' must be a key in _RAW_STATUS_TO_ENUM mapping to WorkUnitStatus.DRAFT."""
+        from devbench.backlog.parser import _RAW_STATUS_TO_ENUM
+
+        assert "draft" in _RAW_STATUS_TO_ENUM
+        assert _RAW_STATUS_TO_ENUM["draft"] is WorkUnitStatus.DRAFT
+
+    def test_parse_work_unit_file_draft_status(self, tmp_path: Path) -> None:
+        """parse_work_unit_file returns DRAFT status when the file contains '## Status: draft'."""
+        wu_file = tmp_path / "E0-F1-S1-T1.md"
+        wu_file.write_text("# E0-F1-S1-T1: Draft Task\n\n## Status: draft\n")
+
+        parser = BacklogParser(backlog_root=tmp_path, backlog_index=tmp_path / "B.md")
+        wu = parser.parse_work_unit_file(wu_file)
+
+        assert wu.status is WorkUnitStatus.DRAFT
+
+    def test_parse_index_draft_status(self, tmp_path: Path) -> None:
+        """parse_index parses a BACKLOG.md row with status 'draft' without error."""
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        wu_file = backlog_dir / "E0-F1-S1-T1.md"
+        wu_file.write_text("# E0-F1-S1-T1: Draft Task\n\n## Status: draft\n")
+
+        index = tmp_path / "BACKLOG.md"
+        index.write_text(
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|----------|\n"
+            "| E0-F1-S1-T1 | Draft Task | Task | draft | None | git-repo | `backlog/E0-F1-S1-T1.md` |\n"
+        )
+
+        parser = BacklogParser(backlog_root=backlog_dir, backlog_index=index)
+        units = parser.parse_index()
+
+        assert len(units) == 1
+        assert units[0].status is WorkUnitStatus.DRAFT

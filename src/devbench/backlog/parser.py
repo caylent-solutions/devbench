@@ -39,6 +39,7 @@ from devbench.constants import (
 # title-case values.  This map bridges the two representations.
 # ---------------------------------------------------------------------------
 _RAW_STATUS_TO_ENUM: dict[str, WorkUnitStatus] = {
+    "draft": WorkUnitStatus.DRAFT,  # Temporary literal; replaced by STATUS_DRAFT constant in E1-F1-S1-T3.
     STATUS_IN_QUEUE: WorkUnitStatus.IN_QUEUE,
     STATUS_IN_PROGRESS: WorkUnitStatus.IN_PROGRESS,
     STATUS_IN_REVIEW: WorkUnitStatus.IN_REVIEW,

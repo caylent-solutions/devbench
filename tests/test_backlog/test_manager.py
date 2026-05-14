@@ -14,6 +14,7 @@ from devbench.constants import (
     BACKLOG_INDEX_CELL_COUNT,
     REVIEW_JUDGE_NAMES,
     SECURITY_JUDGE_NAMES,
+    STATUS_DRAFT,
     VALID_STATUSES,
 )
 
@@ -5009,3 +5010,115 @@ class TestRollupParentTicksCheckboxes:
         assert "## Status: done" in story_result
         assert f"- [x] AC-FUNC-001: story criterion {_GREEN_CHECK}" in story_result
         assert f"- [x] All tasks complete. {_GREEN_CHECK}" in story_result
+
+
+class TestSetStatusAcceptsDraft:
+    """AC-189-2: _set_status accepts STATUS_DRAFT as a valid transition target.
+
+    Verifies that draft is present in VALID_STATUSES and that calling
+    _set_status with 'draft' writes the status to both the work-unit file
+    and BACKLOG.md without raising an exception.
+    """
+
+    def _make_index(self, tmp_path: Path, unit_id: str, initial_status: str) -> Path:
+        """Create a minimal BACKLOG.md with a single task row."""
+        index = tmp_path / "BACKLOG.md"
+        index.write_text(
+            "# Backlog\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|-----------|\n"
+            f"| {unit_id} | Task | Task | {initial_status} | None | git-repo |"
+            f" `backlog/{unit_id}.md` |\n",
+            encoding="utf-8",
+        )
+        return index
+
+    def _make_work_unit(self, directory: Path, unit_id: str, initial_status: str) -> Path:
+        """Create a minimal work-unit file with a Status line and Comments section."""
+        wu_file = directory / f"{unit_id}.md"
+        wu_file.write_text(
+            f"# {unit_id}\n\n## Status: {initial_status}\n\n## Comments\n",
+            encoding="utf-8",
+        )
+        return wu_file
+
+    def test_status_draft_present_in_valid_statuses(self) -> None:
+        """STATUS_DRAFT constant is present in VALID_STATUSES lookup (AC-189-2)."""
+        assert STATUS_DRAFT in VALID_STATUSES, f"STATUS_DRAFT ('{STATUS_DRAFT}') must be a key in VALID_STATUSES"
+        assert VALID_STATUSES[STATUS_DRAFT] == STATUS_DRAFT, (
+            "VALID_STATUSES[STATUS_DRAFT] must normalise to STATUS_DRAFT itself"
+        )
+
+    def test_set_status_draft_updates_work_unit_file(self, tmp_path: Path) -> None:
+        """_set_status('draft') writes '## Status: draft' to the work-unit file (AC-189-2)."""
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        index = self._make_index(tmp_path, "E0-F1-S1-T1", "in-queue")
+        wu_file = self._make_work_unit(backlog_dir, "E0-F1-S1-T1", "in-queue")
+
+        BacklogManager()._set_status(wu_file, index, "E0-F1-S1-T1", STATUS_DRAFT)
+
+        wu_text = wu_file.read_text(encoding="utf-8")
+        assert "## Status: draft" in wu_text, (
+            f"Work-unit file must contain '## Status: draft' after transition; got:\n{wu_text}"
+        )
+
+    def test_set_status_draft_updates_backlog_index(self, tmp_path: Path) -> None:
+        """_set_status('draft') updates the BACKLOG.md status cell for the unit (AC-189-2)."""
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        index = self._make_index(tmp_path, "E0-F1-S1-T1", "in-queue")
+        wu_file = self._make_work_unit(backlog_dir, "E0-F1-S1-T1", "in-queue")
+
+        BacklogManager()._set_status(wu_file, index, "E0-F1-S1-T1", STATUS_DRAFT)
+
+        index_text = index.read_text(encoding="utf-8")
+        assert "draft" in index_text, (
+            f"BACKLOG.md must contain 'draft' after _set_status transition; got:\n{index_text}"
+        )
+
+    def test_set_status_draft_does_not_raise(self, tmp_path: Path) -> None:
+        """_set_status('draft') completes without raising ValueError (AC-189-2)."""
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        index = self._make_index(tmp_path, "E0-F1-S1-T1", "in-progress")
+        wu_file = self._make_work_unit(backlog_dir, "E0-F1-S1-T1", "in-progress")
+
+        # Must not raise -- draft is a valid transition target
+        BacklogManager()._set_status(wu_file, index, "E0-F1-S1-T1", STATUS_DRAFT)
+
+    def test_set_status_draft_does_not_write_wu_claimed_audit(self, tmp_path: Path) -> None:
+        """draft transition does not append a [WU_CLAIMED] audit comment (AC-189-2, spec 4.1.2)."""
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        index = self._make_index(tmp_path, "E0-F1-S1-T1", "in-queue")
+        wu_file = self._make_work_unit(backlog_dir, "E0-F1-S1-T1", "in-queue")
+
+        BacklogManager()._set_status(wu_file, index, "E0-F1-S1-T1", STATUS_DRAFT)
+
+        wu_text = wu_file.read_text(encoding="utf-8")
+        assert "[WU_CLAIMED]" not in wu_text, "draft transitions must not produce a [WU_CLAIMED] audit comment"
+
+    def test_set_status_draft_does_not_tick_checkboxes(self, tmp_path: Path) -> None:
+        """draft transition does not tick AC/DoD checkboxes (only 'done' triggers ticking)."""
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        index = self._make_index(tmp_path, "E0-F1-S1-T1", "in-queue")
+        wu_file = backlog_dir / "E0-F1-S1-T1.md"
+        wu_file.write_text(
+            "# E0-F1-S1-T1\n\n"
+            "## Status: in-queue\n\n"
+            "## Acceptance Criteria\n\n"
+            "- [ ] AC-001: some criterion\n\n"
+            "## Definition of Done\n\n"
+            "- [ ] All done.\n\n"
+            "## Comments\n",
+            encoding="utf-8",
+        )
+
+        BacklogManager()._set_status(wu_file, index, "E0-F1-S1-T1", STATUS_DRAFT)
+
+        wu_text = wu_file.read_text(encoding="utf-8")
+        assert "- [ ] AC-001: some criterion" in wu_text, "draft transition must leave AC checkboxes unchecked"
+        assert "- [ ] All done." in wu_text, "draft transition must leave DoD checkboxes unchecked"

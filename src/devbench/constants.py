@@ -144,6 +144,11 @@ STATUS_DECLINED: str = "declined"
 # held children as complete; an operator must explicitly unhold to
 # return the unit to the in-queue lifecycle.
 STATUS_HOLD: str = "hold"
+# Draft units are pre-queue planning artefacts: the spec is authored and
+# reviewed but the unit has not yet been accepted into the execution queue.
+# Unlike declined (terminal) or hold (deferred), draft is a pre-lifecycle
+# state -- the orchestrator's parallel-candidate scan skips draft units.
+STATUS_DRAFT: str = "draft"
 
 # Ordered mapping from any accepted input form to the canonical write form.
 # Used by BacklogManager._set_status() for validation and normalisation.
@@ -156,6 +161,7 @@ VALID_STATUSES: dict[str, str] = {
     STATUS_PROPOSED: STATUS_PROPOSED,
     STATUS_DECLINED: STATUS_DECLINED,
     STATUS_HOLD: STATUS_HOLD,
+    STATUS_DRAFT: STATUS_DRAFT,
 }
 
 # ---------------------------------------------------------------------------

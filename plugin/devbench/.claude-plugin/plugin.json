@@ -1,5 +1,17 @@
 {
   "name": "devbench",
   "description": "Autonomous backlog execution with LLM-as-judge review. Provides agents for code review, test review, documentation review, and orchestration of the full backlog lifecycle.",
-  "version": "0.1.0"
+  "version": "0.2.0",
+  "keywords": [
+    "devbench",
+    "backlog",
+    "orchestration",
+    "llm-as-judge",
+    "code-review",
+    "tdd",
+    "automation"
+  ],
+  "repository": "https://github.com/caylent-solutions/devbench",
+  "license": "MIT",
+  "homepage": "https://github.com/caylent-solutions/devbench"
 }

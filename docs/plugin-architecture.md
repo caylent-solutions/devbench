@@ -25,7 +25,7 @@ All plugin artifacts live under `plugin/devbench/` in the devbench repo:
 ```text
 plugin/devbench/
 ├── .claude-plugin/
-│   └── plugin.json              ← manifest: name, description, version
+│   └── plugin.json              ← manifest: name, description, version, keywords, repository, license, homepage
 ├── agents/
 │   ├── executor.md              ← dev agent: implements work units via TDD
 │   ├── review-supervisor.md     ← discovers and invokes all review_team agents in parallel

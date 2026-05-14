@@ -25,6 +25,8 @@ Public API:
 - :func:`detect_quota_error` -- classify an incoming exception or response
   object into the appropriate ``QuotaExhaustedError`` subclass, or return
   ``None`` when the input carries no quota signal.
+- :func:`parse_reset_time` -- extract a UTC reset :class:`~datetime.datetime`
+  from response headers, or ``None`` when no parseable reset signal is present.
 
 Raises:
     None -- this module only defines exception classes and pure-function
@@ -33,12 +35,23 @@ Raises:
 
 from __future__ import annotations
 
-from datetime import datetime
+from collections.abc import Mapping
+from datetime import UTC, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 # ---------------------------------------------------------------------------
 # Protocol constants -- HTTP status codes and header/error-code identifiers
 # ---------------------------------------------------------------------------
+
+# Private to this module's parse logic; not shared across modules. Rule 4 exemption:
+# amendment to constants.py rejected (source-test atomicity).
+_RETRY_AFTER_HEADER: str = "retry-after"
+_ANTHROPIC_RATELIMIT_RESET_HEADERS: tuple[str, ...] = (
+    "anthropic-ratelimit-requests-reset",
+    "anthropic-ratelimit-tokens-reset",
+    "anthropic-ratelimit-input-tokens-reset",
+)
 
 # HTTP status code for rate-limit responses from the Anthropic API.
 _HTTP_RATE_LIMIT: int = 429
@@ -284,3 +297,113 @@ def detect_quota_error(message_or_exception: object) -> QuotaExhaustedError | No
 
     # Rule 6: no quota signal detected.
     return None
+
+
+def parse_reset_time(headers: Mapping[str, str]) -> datetime | None:
+    """Extract a UTC reset datetime from HTTP response headers.
+
+    Inspects *headers* for known quota-reset signals and returns the earliest
+    parseable :class:`~datetime.datetime` (always timezone-aware UTC), or
+    ``None`` when no parseable reset signal is present.
+
+    Parsing rules (applied in order; all candidates collected, earliest wins):
+
+    1. ``anthropic-ratelimit-requests-reset``,
+       ``anthropic-ratelimit-tokens-reset``, and
+       ``anthropic-ratelimit-input-tokens-reset`` -- each value is interpreted
+       as an integer number of Unix epoch seconds.  Non-numeric values for any
+       individual header are silently skipped; the remaining headers are still
+       considered.
+    2. ``Retry-After`` (case-insensitive) -- the value is tried as:
+
+       a. An integer (seconds from the current wall-clock time).
+          Negative integers are invalid and discarded.
+       b. An HTTP-date string (RFC 1123 / RFC 7231 format, e.g.
+          ``"Thu, 01 Jan 2026 12:00:00 GMT"``).
+
+       If both interpretations fail, ``Retry-After`` contributes no candidate.
+
+    When multiple candidates are found, the earliest datetime is returned so
+    the caller waits only as long as strictly necessary.
+
+    Args:
+        headers: A mapping of HTTP header names to their string values.
+            Header name lookup is case-insensitive.
+
+    Returns:
+        The earliest parseable UTC reset :class:`~datetime.datetime`, or
+        ``None`` when no reset signal is found.
+
+    Raises:
+        None -- all parse errors are silently discarded; unrecognised or
+        malformed header values contribute no candidate.
+    """
+    # Build a case-insensitive view of the headers for uniform lookup.
+    lowered: dict[str, str] = {k.lower(): v for k, v in headers.items()}
+
+    candidates: list[datetime] = []
+
+    # --- Rule 1: anthropic-ratelimit-*-reset (epoch seconds) ---
+    for header_name in _ANTHROPIC_RATELIMIT_RESET_HEADERS:
+        raw = lowered.get(header_name)
+        if raw is None:
+            continue
+        dt = _parse_epoch_seconds(raw)
+        if dt is not None:
+            candidates.append(dt)
+
+    # --- Rule 2: Retry-After (integer seconds or HTTP-date) ---
+    retry_after_raw = lowered.get(_RETRY_AFTER_HEADER)
+    if retry_after_raw is not None:
+        dt = _parse_retry_after(retry_after_raw)
+        if dt is not None:
+            candidates.append(dt)
+
+    if not candidates:
+        return None
+    return min(candidates)
+
+
+# ---------------------------------------------------------------------------
+# Parse helpers (private)
+# ---------------------------------------------------------------------------
+
+
+def _parse_epoch_seconds(value: str) -> datetime | None:
+    """Parse *value* as an integer Unix epoch timestamp and return a UTC datetime.
+
+    Returns ``None`` when *value* is not a valid non-negative integer.
+    """
+    try:
+        epoch = int(value)
+    except ValueError:
+        return None
+    if epoch < 0:
+        return None
+    return datetime.fromtimestamp(epoch, tz=UTC)
+
+
+def _parse_retry_after(value: str) -> datetime | None:
+    """Parse a ``Retry-After`` header *value* and return a UTC datetime.
+
+    Tries integer seconds (delta from now) first, then HTTP-date format.
+    Returns ``None`` when neither interpretation succeeds, or when the
+    integer value is negative.
+    """
+    # Try integer seconds first.
+    try:
+        seconds = int(value)
+    except ValueError:
+        pass
+    else:
+        if seconds < 0:
+            return None
+        return datetime.now(tz=UTC) + timedelta(seconds=seconds)
+
+    # Try HTTP-date (RFC 1123) format.
+    try:
+        parsed = parsedate_to_datetime(value)
+    except (ValueError, TypeError):
+        return None
+    # Normalise to UTC.
+    return parsed.astimezone(UTC)

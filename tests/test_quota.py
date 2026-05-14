@@ -1,4 +1,5 @@
-"""Tests for devbench.quota -- exception hierarchy and detect_quota_error.
+"""Tests for devbench.quota -- exception hierarchy, detect_quota_error,
+and parse_reset_time.
 
 Covers: QuotaExhaustedError, SubscriptionRateLimitError, SdkCreditExhaustedError,
 ApiBillingError, BedrockThrottleError.  Each exception carries reset_at,
@@ -6,11 +7,15 @@ raw_error and source fields.
 
 Also covers: detect_quota_error(message_or_exception) which classifies
 incoming SDK exceptions / response objects into the structured quota hierarchy.
+
+Also covers: parse_reset_time(headers) which extracts a UTC datetime from
+Retry-After (integer seconds or HTTP-date) or anthropic-ratelimit-*-reset
+(epoch seconds) headers.
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -23,6 +28,7 @@ from devbench.quota import (
     SdkCreditExhaustedError,
     SubscriptionRateLimitError,
     detect_quota_error,
+    parse_reset_time,
 )
 
 # ---------------------------------------------------------------------------
@@ -751,3 +757,335 @@ class TestDetectQuotaErrorIntegration:
         result = detect_quota_error(exc)
         assert isinstance(result, expected_cls)
         assert isinstance(result, QuotaExhaustedError)
+
+
+# ---------------------------------------------------------------------------
+# parse_reset_time: Retry-After integer seconds
+# ---------------------------------------------------------------------------
+
+
+class TestParseResetTimeRetryAfterSeconds:
+    """parse_reset_time with Retry-After as an integer (seconds from now)."""
+
+    def test_retry_after_integer_returns_future_datetime(self) -> None:
+        """Retry-After: 60 should return a datetime ~60 seconds in the future."""
+        before = datetime.now(tz=UTC)
+        result = parse_reset_time({"Retry-After": "60"})
+        after = datetime.now(tz=UTC)
+        assert result is not None
+        assert result.tzinfo == UTC
+        # Result should be between before+60 and after+60 (with small tolerance)
+        assert result >= before + timedelta(seconds=59)
+        assert result <= after + timedelta(seconds=61)
+
+    def test_retry_after_zero_returns_datetime_near_now(self) -> None:
+        """Retry-After: 0 should return a datetime at approximately now."""
+        before = datetime.now(tz=UTC)
+        result = parse_reset_time({"Retry-After": "0"})
+        after = datetime.now(tz=UTC)
+        assert result is not None
+        assert result >= before - timedelta(seconds=1)
+        assert result <= after + timedelta(seconds=1)
+
+    def test_retry_after_lowercase_key_returns_datetime(self) -> None:
+        """Retry-after (lowercase) should also be recognized."""
+        result = parse_reset_time({"retry-after": "30"})
+        assert result is not None
+        assert result.tzinfo == UTC
+
+    def test_retry_after_large_value_returns_datetime(self) -> None:
+        """Retry-After: 3600 should return a datetime ~1 hour in the future."""
+        before = datetime.now(tz=UTC)
+        result = parse_reset_time({"Retry-After": "3600"})
+        assert result is not None
+        assert result >= before + timedelta(seconds=3599)
+
+    @pytest.mark.parametrize("key", ["Retry-After", "retry-after", "RETRY-AFTER", "Retry-after"])
+    def test_retry_after_case_insensitive_key(self, key: str) -> None:
+        """Retry-After header key lookup is case-insensitive."""
+        result = parse_reset_time({key: "120"})
+        assert result is not None
+        assert result.tzinfo == UTC
+
+
+# ---------------------------------------------------------------------------
+# parse_reset_time: Retry-After HTTP-date
+# ---------------------------------------------------------------------------
+
+
+class TestParseResetTimeRetryAfterHttpDate:
+    """parse_reset_time with Retry-After as an HTTP-date string."""
+
+    def test_retry_after_rfc1123_date_returns_correct_datetime(self) -> None:
+        """Retry-After: Thu, 01 Jan 2026 12:00:00 GMT -> datetime(2026,1,1,12,0,0,UTC)."""
+        result = parse_reset_time({"Retry-After": "Thu, 01 Jan 2026 12:00:00 GMT"})
+        assert result is not None
+        assert result == datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+
+    def test_retry_after_http_date_is_utc(self) -> None:
+        """HTTP-date parsed from Retry-After has UTC timezone."""
+        result = parse_reset_time({"Retry-After": "Mon, 15 Jun 2026 08:30:00 GMT"})
+        assert result is not None
+        assert result.tzinfo is not None
+        # UTC offset should be zero
+        assert result.utcoffset() == timedelta(0)
+
+    def test_retry_after_http_date_with_various_months(self) -> None:
+        """HTTP-date month names are parsed correctly."""
+        result = parse_reset_time({"Retry-After": "Fri, 01 May 2026 00:00:00 GMT"})
+        assert result is not None
+        assert result.month == 5
+        assert result.day == 1
+        assert result.year == 2026
+
+    def test_retry_after_invalid_date_falls_through_to_none(self) -> None:
+        """An unparseable Retry-After value with no other headers returns None."""
+        result = parse_reset_time({"Retry-After": "not-a-valid-date"})
+        assert result is None
+
+    def test_retry_after_negative_integer_returns_none(self) -> None:
+        """Retry-After: -10 is invalid and should return None."""
+        result = parse_reset_time({"Retry-After": "-10"})
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# parse_reset_time: anthropic-ratelimit-*-reset headers (epoch seconds)
+# ---------------------------------------------------------------------------
+
+
+class TestParseResetTimeAnthropicRateLimitReset:
+    """parse_reset_time with anthropic-ratelimit-*-reset epoch-second headers."""
+
+    def test_requests_reset_epoch_returns_utc_datetime(self) -> None:
+        """anthropic-ratelimit-requests-reset with epoch seconds returns correct UTC datetime."""
+        # 1767268800 == 2026-01-01T12:00:00Z
+        result = parse_reset_time({"anthropic-ratelimit-requests-reset": "1767268800"})
+        assert result is not None
+        assert result == datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+
+    def test_tokens_reset_epoch_returns_utc_datetime(self) -> None:
+        """anthropic-ratelimit-tokens-reset with epoch seconds returns correct UTC datetime."""
+        result = parse_reset_time({"anthropic-ratelimit-tokens-reset": "1767268800"})
+        assert result is not None
+        assert result == datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+
+    def test_input_tokens_reset_epoch_returns_utc_datetime(self) -> None:
+        """anthropic-ratelimit-input-tokens-reset with epoch seconds returns correct UTC datetime."""
+        result = parse_reset_time({"anthropic-ratelimit-input-tokens-reset": "1767268800"})
+        assert result is not None
+        assert result == datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+
+    def test_multiple_ratelimit_headers_returns_earliest(self) -> None:
+        """When multiple anthropic-ratelimit-*-reset headers present, earliest is returned."""
+        # Earlier: 1767268800 (2026-01-01T12:00:00Z)
+        # Later: 1767268900 (2026-01-01T12:01:40Z)
+        result = parse_reset_time(
+            {
+                "anthropic-ratelimit-requests-reset": "1767268900",
+                "anthropic-ratelimit-tokens-reset": "1767268800",
+            }
+        )
+        assert result is not None
+        assert result == datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+
+    def test_ratelimit_reset_result_is_utc(self) -> None:
+        """Reset datetime from anthropic-ratelimit-*-reset is always UTC."""
+        result = parse_reset_time({"anthropic-ratelimit-requests-reset": "1735732800"})
+        assert result is not None
+        assert result.tzinfo == UTC
+
+    def test_ratelimit_reset_invalid_value_falls_through_to_none(self) -> None:
+        """Non-numeric anthropic-ratelimit-*-reset value returns None (no other parseable headers)."""
+        result = parse_reset_time({"anthropic-ratelimit-requests-reset": "not-a-number"})
+        assert result is None
+
+    def test_ratelimit_reset_negative_epoch_returns_none(self) -> None:
+        """anthropic-ratelimit-*-reset with a negative epoch (pre-1970) returns None.
+
+        Negative epoch timestamps are nonsensical quota-reset values and must be
+        rejected so callers never receive a pre-1970 datetime as a reset signal.
+        """
+        result = parse_reset_time({"anthropic-ratelimit-requests-reset": "-1"})
+        assert result is None
+
+    @pytest.mark.parametrize(
+        "header_name",
+        [
+            "anthropic-ratelimit-requests-reset",
+            "anthropic-ratelimit-tokens-reset",
+            "anthropic-ratelimit-input-tokens-reset",
+        ],
+    )
+    def test_each_ratelimit_header_individually(self, header_name: str) -> None:
+        """Each individual anthropic-ratelimit-*-reset header is recognized."""
+        # 1767268800 == 2026-01-01T12:00:00Z
+        result = parse_reset_time({header_name: "1767268800"})
+        assert result is not None
+        assert result == datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+
+
+# ---------------------------------------------------------------------------
+# parse_reset_time: empty / missing headers
+# ---------------------------------------------------------------------------
+
+
+class TestParseResetTimeNoHeaders:
+    """parse_reset_time with no parseable headers returns None."""
+
+    def test_empty_headers_returns_none(self) -> None:
+        result = parse_reset_time({})
+        assert result is None
+
+    def test_unrelated_headers_returns_none(self) -> None:
+        result = parse_reset_time({"Content-Type": "application/json", "X-Request-Id": "abc123"})
+        assert result is None
+
+    def test_none_equivalent_dict_returns_none(self) -> None:
+        """A dict with no quota-related keys returns None."""
+        result = parse_reset_time({"Authorization": "Bearer token"})
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# parse_reset_time: priority -- ratelimit-reset vs Retry-After
+# ---------------------------------------------------------------------------
+
+
+class TestParseResetTimePriority:
+    """When both anthropic-ratelimit-*-reset and Retry-After are present, the
+    earliest datetime wins (so the caller waits only as long as needed)."""
+
+    def test_ratelimit_earlier_than_retry_after_returns_ratelimit(self) -> None:
+        """When ratelimit-reset is earlier than Retry-After, return the ratelimit time."""
+        # ratelimit-reset: 1767268800 (2026-01-01T12:00:00Z) -- earlier than Retry-After of 3600s from now
+        # Retry-After: 3600 seconds from now -- well past 2026-01-01T12:00:00Z while this epoch remains in the past.
+        result = parse_reset_time(
+            {
+                "anthropic-ratelimit-requests-reset": "1767268800",
+                "Retry-After": "3600",
+            }
+        )
+        assert result is not None
+        assert result == datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+
+    def test_retry_after_date_combined_with_ratelimit_reset(self) -> None:
+        """HTTP-date Retry-After and ratelimit-reset: the earlier datetime is returned."""
+        # Both refer to same time; result is that datetime
+        result = parse_reset_time(
+            {
+                "anthropic-ratelimit-tokens-reset": "1767268800",
+                "Retry-After": "Thu, 01 Jan 2026 12:00:00 GMT",
+            }
+        )
+        assert result is not None
+        assert result == datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+
+    def test_all_three_headers_present_returns_earliest(self) -> None:
+        """All three header types present: earliest datetime is returned."""
+        # requests-reset: 1767268900 (2026-01-01T12:01:40Z -- later)
+        # tokens-reset: 1767268800 (2026-01-01T12:00:00Z -- earliest)
+        # Retry-After HTTP-date: 2026-01-01T12:30:00Z (middle)
+        result = parse_reset_time(
+            {
+                "anthropic-ratelimit-requests-reset": "1767268900",
+                "anthropic-ratelimit-tokens-reset": "1767268800",
+                "Retry-After": "Thu, 01 Jan 2026 12:30:00 GMT",
+            }
+        )
+        assert result is not None
+        assert result == datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+
+
+# ---------------------------------------------------------------------------
+# parse_reset_time: integration tests (real header dicts, no mocks)
+# ---------------------------------------------------------------------------
+
+
+class TestParseResetTimeIntegration:
+    """Integration tests: parse_reset_time end-to-end with real header dicts.
+
+    These tests construct real header dictionaries (as would be received from
+    an Anthropic API response) and verify the full parsing path.
+    """
+
+    def test_real_anthropic_429_headers_with_requests_reset(self) -> None:
+        """A realistic Anthropic 429 response header set with requests-reset."""
+        headers = {
+            "content-type": "application/json",
+            "request-id": "req_abc123",
+            "anthropic-ratelimit-requests-limit": "50",
+            "anthropic-ratelimit-requests-remaining": "0",
+            "anthropic-ratelimit-requests-reset": "1767268800",
+            "anthropic-ratelimit-tokens-limit": "40000",
+            "anthropic-ratelimit-tokens-remaining": "0",
+            "anthropic-ratelimit-tokens-reset": "1767268900",
+        }
+        result = parse_reset_time(headers)
+        assert result is not None
+        # requests-reset (1767268800) is earlier than tokens-reset (1767268900)
+        assert result == datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+
+    def test_real_retry_after_seconds_only_headers(self) -> None:
+        """Headers with only Retry-After seconds (no ratelimit-reset headers)."""
+        headers = {
+            "content-type": "application/json",
+            "retry-after": "120",
+            "x-request-id": "req_xyz789",
+        }
+        before = datetime.now(tz=UTC)
+        result = parse_reset_time(headers)
+        after = datetime.now(tz=UTC)
+        assert result is not None
+        assert result >= before + timedelta(seconds=119)
+        assert result <= after + timedelta(seconds=121)
+
+    def test_real_retry_after_http_date_headers(self) -> None:
+        """Headers with Retry-After as an HTTP-date string (as per RFC 7231)."""
+        headers = {
+            "Retry-After": "Wed, 01 Jan 2026 00:00:00 GMT",
+        }
+        result = parse_reset_time(headers)
+        assert result is not None
+        assert result == datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC)
+
+    def test_real_no_reset_headers_returns_none(self) -> None:
+        """Headers with no reset time indicators return None."""
+        headers = {
+            "content-type": "application/json",
+            "x-request-id": "req_abc123",
+            "anthropic-ratelimit-requests-limit": "50",
+            "anthropic-ratelimit-requests-remaining": "5",
+        }
+        result = parse_reset_time(headers)
+        assert result is None
+
+    def test_real_mixed_valid_and_invalid_reset_headers(self) -> None:
+        """When one header is invalid and another is valid, the valid one is used."""
+        headers = {
+            "anthropic-ratelimit-requests-reset": "not-a-number",
+            "anthropic-ratelimit-tokens-reset": "1767268800",
+        }
+        result = parse_reset_time(headers)
+        assert result is not None
+        assert result == datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+
+    def test_parse_reset_time_returns_utc_aware_datetime(self) -> None:
+        """All paths through parse_reset_time return timezone-aware UTC datetimes."""
+        # epoch seconds path
+        result = parse_reset_time({"anthropic-ratelimit-tokens-reset": "1735732800"})
+        assert result is not None
+        assert result.tzinfo is not None
+        assert result.utcoffset() == timedelta(0)
+
+    def test_parse_reset_time_with_combined_http_date_and_epoch(self) -> None:
+        """HTTP-date Retry-After and epoch ratelimit-reset: consistent UTC comparison."""
+        # Retry-After HTTP-date: 2026-01-01T14:00:00Z
+        # ratelimit-reset epoch: 1767268800 = 2026-01-01T12:00:00Z (earlier)
+        headers = {
+            "Retry-After": "Thu, 01 Jan 2026 14:00:00 GMT",
+            "anthropic-ratelimit-requests-reset": "1767268800",
+        }
+        result = parse_reset_time(headers)
+        assert result is not None
+        assert result == datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)

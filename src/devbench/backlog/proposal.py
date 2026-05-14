@@ -174,6 +174,11 @@ class BlockedTaskState(Enum):
     HELD = "held"
     BLOCKED_ON_HELD = "blocked-on-held"
     OPERATOR_ACTION_REQUIRED = "operator-action-required"
+    # Issue #183(d): orchestrator runtime degraded (review-supervisor
+    # lost Agent-tool access). Distinct from OPERATOR_ACTION_REQUIRED
+    # so the operator sees that a ``make start`` restart -- not a code
+    # fix -- is what resolves the task.
+    RUNTIME_DEGRADATION = "runtime-degradation"
 
 
 # Recovery audit-comment heuristics. Used by ``classify_blocked_task``
@@ -193,6 +198,20 @@ _RECOVERY_BODY_RE: re.Pattern[str] = re.compile(
 _BLOCKED_AUDIT_RE: re.Pattern[str] = re.compile(
     r"\[(?P<ts>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s+UTC)\]\s+\[(?P<agent>[^\]]+)\]\s+\[BLOCKED\]\s+(?P<body>.+)",
 )
+# Issue #183(d): structured payloads emitted by review-supervisor's
+# Step 0 self-check when the Agent tool drops out of the session. The
+# orchestrator's runtime is degraded; only an operator-driven
+# ``make start`` restart can recover. Matching the exact phrasing the
+# agent emits keeps the classifier honest -- unrelated [BLOCKED] rows
+# from other agents must not trigger this bucket.
+_RUNTIME_DEGRADATION_BODY_RE: re.Pattern[str] = re.compile(
+    r"agent-tool-unavailable|review-supervisor[^\n]*only\s+Bash",
+    re.IGNORECASE,
+)
+# Window after which a degradation comment is considered stale. 24h
+# matches the default review cycle; a longer-lived degradation marker
+# implies the operator already saw the alert and (perhaps) is debugging.
+_RUNTIME_DEGRADATION_WINDOW_SECONDS: int = 24 * 60 * 60
 
 
 def _has_pending_proposal_json(workspace_root: Path, task_id: str) -> bool:
@@ -220,6 +239,39 @@ def _has_rejected_amendment_archive(workspace_root: Path, task_id: str) -> bool:
         return False
     pattern = f"{task_id}-*.json"
     return any(archive_dir.glob(pattern))
+
+
+def _has_runtime_degradation_signal(source_file: Path, now: datetime) -> bool:
+    """Issue #183(d): True iff the work-unit's Comments section carries a
+    recent ``[BLOCKED]`` audit naming the agent-tool degradation
+    payload that review-supervisor's Step 0 self-check emits.
+
+    "Recent" means within ``_RUNTIME_DEGRADATION_WINDOW_SECONDS`` (24h)
+    of ``now``. A stale payload past the window is treated as already-
+    acknowledged by the operator and does NOT trigger this bucket.
+    """
+    if not source_file.is_file():
+        return False
+    try:
+        content = source_file.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    most_recent_ts: datetime | None = None
+    for line in content.splitlines():
+        match = _BLOCKED_AUDIT_RE.search(line)
+        if match is None:
+            continue
+        if not _RUNTIME_DEGRADATION_BODY_RE.search(match.group("body")):
+            continue
+        try:
+            ts = datetime.strptime(match.group("ts"), "%Y-%m-%d %H:%M UTC").replace(tzinfo=UTC)
+        except ValueError:
+            continue
+        if most_recent_ts is None or ts > most_recent_ts:
+            most_recent_ts = ts
+    if most_recent_ts is None:
+        return False
+    return (now - most_recent_ts).total_seconds() <= _RUNTIME_DEGRADATION_WINDOW_SECONDS
 
 
 def _recent_recovery_audit_comment(source_file: Path, now: datetime, window_seconds: int) -> bool:
@@ -273,10 +325,14 @@ def classify_blocked_task(
     now: datetime | None = None,
     recovery_window_seconds: int | None = None,
 ) -> BlockedTaskState:
-    """Classify ``task_id`` into one of the six blocked-task states.
+    """Classify ``task_id`` into one of the seven blocked-task states.
 
     Decision priority (first match wins):
 
+    0. ``RUNTIME_DEGRADATION`` -- a recent ``[BLOCKED]`` audit comment
+       (within 24h) names ``agent-tool-unavailable`` /
+       ``review-supervisor ... only Bash``. The orchestrator runtime is
+       degraded; only ``make start`` restart recovers (issue #183).
     1. ``HELD`` -- the task's own status in the backlog index is ``hold``.
     2. ``BLOCKED_ON_HELD`` -- the task carries a ``[BLOCKED_PENDING_PROPOSAL]``
        marker whose target is in ``hold``.
@@ -296,11 +352,22 @@ def classify_blocked_task(
     fall through directly to ``OPERATOR_ACTION_REQUIRED`` when no marker /
     dep is present.
     """
+    source_file = _find_source_task_file(backlog_root, backlog_index, task_id)
+
+    # Priority 0: RUNTIME_DEGRADATION -- the orchestrator runtime is
+    # degraded. Checked BEFORE every other bucket so a degraded session
+    # is surfaced even if the task also looks held / blocked-on-held;
+    # only restarting ``make start`` can let the work resume in any case.
+    if source_file is not None and _has_runtime_degradation_signal(
+        source_file,
+        now if now is not None else datetime.now(UTC),
+    ):
+        return BlockedTaskState.RUNTIME_DEGRADATION
+
     # Priority 1: HELD -- the task itself is in hold status.
     if _task_status_is_hold(backlog_root, backlog_index, task_id):
         return BlockedTaskState.HELD
 
-    source_file = _find_source_task_file(backlog_root, backlog_index, task_id)
     if source_file is None:
         return BlockedTaskState.OPERATOR_ACTION_REQUIRED
 
@@ -308,9 +375,18 @@ def classify_blocked_task(
     marker_ids = mgr._extract_pending_proposal_markers(source_file)
 
     if marker_ids:
-        return _classify_with_markers(mgr, backlog_index, marker_ids)
+        marker_result = _classify_with_markers(mgr, backlog_index, marker_ids)
+        if marker_result is not None:
+            return marker_result
+        # Fall through: every marker target is terminal (the cascade
+        # should have fired and did not), so the marker rows are stale.
+        # Consult regular deps + recovery signals before defaulting to
+        # operator attention. Without this fall-through, a task with an
+        # unrelated unsatisfied regular dep gets misclassified as
+        # OPERATOR_ACTION_REQUIRED when it is plainly an
+        # AWAITING_DEPENDENCY situation (issue #186).
 
-    # Priority 4: AWAITING_DEPENDENCY -- regular deps still in flight, no marker.
+    # Priority 4: AWAITING_DEPENDENCY -- regular deps still in flight.
     if _regular_deps_unsatisfied(backlog_root, backlog_index, task_id):
         return BlockedTaskState.AWAITING_DEPENDENCY
 
@@ -369,19 +445,24 @@ def _classify_with_markers(
     mgr: BacklogManager,
     backlog_index: Path,
     marker_ids: set[str],
-) -> BlockedTaskState:
-    """Resolve the marker-present branch into one of three states.
+) -> BlockedTaskState | None:
+    """Resolve the marker-present branch.
 
-    Priority within markers (first match wins):
+    Decisive returns (first match wins):
 
     - ``BLOCKED_ON_HELD`` -- any marker target is in ``hold`` status.
       The cascade cannot fire while the target is non-terminal and HOLD
       is non-terminal; operator must resume the held target.
-    - ``OPERATOR_ACTION_REQUIRED`` -- backlog index missing, any marker
-      target unknown to the index, or every marker is already terminal
-      (cascade should have fired and did not).
+    - ``OPERATOR_ACTION_REQUIRED`` -- backlog index missing or any
+      marker target unknown to the index; the operator must clean up
+      the stray reference before any automation can proceed.
     - ``AUTO_CLEARING_VIA_PROPOSAL`` -- at least one non-terminal,
       non-HOLD marker target exists; the ADR-07 cascade is in flight.
+
+    Returns ``None`` when every marker target is terminal -- the marker
+    rows are stale and the caller should fall through to the regular-dep
+    and recovery-signal checks instead of bouncing the task into the
+    operator-attention bucket (issue #186).
     """
     try:
         rows = mgr._parse_backlog_rows(backlog_index)
@@ -400,7 +481,10 @@ def _classify_with_markers(
             non_terminal_marker_found = True
 
     if not non_terminal_marker_found:
-        return BlockedTaskState.OPERATOR_ACTION_REQUIRED
+        # All markers terminal -- stale cascade signal. Let the caller
+        # consult regular deps + recovery signals before defaulting to
+        # operator attention.
+        return None
     return BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL
 
 

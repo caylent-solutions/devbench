@@ -168,11 +168,9 @@ def update_aggregate(
 def rebuild_from_log(workspace_root: Path, log_path: Path) -> int:
     """Walk the orchestrator log and rebuild every per-task aggregate.
 
-    Idempotent and safe to invoke at any time. Used by:
-
-    - ``devbench rebuild-window-stats`` (operator command after upgrade
-      or after deleting ``.devbench/window-stats/``).
-    - ``devbench upgrade`` (Phase 2 step in the unified migration).
+    Idempotent and safe to invoke at any time. Used by
+    ``devbench rebuild-window-stats`` (operator command after deleting
+    ``.devbench/window-stats/`` or when aggregates drift out of sync).
 
     Returns the number of distinct tasks for which an aggregate was
     written.

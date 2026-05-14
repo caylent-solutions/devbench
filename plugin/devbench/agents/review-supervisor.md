@@ -24,6 +24,27 @@ Your role is **read-only aggregation**. You MUST NOT:
 
 If you observe a problem requiring a state change, escalate via `uv run devbench log-comment review-supervisor <id> ...` and let the executor or operator handle it. The hook's override env var `DEVBENCH_ALLOW_REVIEW_SUPERVISOR_MUTATIONS=1` exists for operator-driven exceptions only; reviewers must never set it themselves.
 
+## Step 0: Self-check Agent tool availability (issue #183)
+
+Before invoking any reviewer, confirm the Agent tool is actually loaded into this session. In long-running orchestrate loops the Agent tool has been observed to silently drop off `review-supervisor`'s tool list, leaving only `Bash` -- every subsequent reviewer dispatch is a no-op and the task appears to stall without an actionable signal in the work-unit file.
+
+The check is structural: if you cannot see the `Agent` tool in your tool list (or any attempt to call `Agent` would fail because the schema is not loaded), the runtime is degraded.
+
+**On detection:**
+
+1. Log a structured `[BLOCKED]` audit comment naming the runtime degradation so `devbench status` can bucket the task as `Blocked (runtime-degradation)`:
+
+   ```bash
+   uv run devbench log-comment review-supervisor $ARGUMENTS \
+     "[BLOCKED] agent-tool-unavailable: orchestrator review-supervisor lost Agent tool access in this session; operator restart of \`make start\` required"
+   ```
+
+2. Exit with `FAIL` so the orchestrate skill captures the blocker rather than treating an empty reviewer list as "all passed."
+
+3. Do NOT attempt to proceed with the four-reviewer dispatch -- the dispatches will be silently dropped and produce a false-positive pass.
+
+If the Agent tool is present, continue to Step 1. The structured payload above is the signal that `classify_blocked_task` priority-0 reads to surface this state distinctly from operator-attention blockers.
+
 ## Step 1: Discover Review Team
 
 List the agents directory to find all team members:

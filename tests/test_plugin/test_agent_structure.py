@@ -76,6 +76,37 @@ class TestReviewSupervisorFrontmatter:
 
 
 @pytest.mark.unit
+class TestReviewSupervisorStep0SelfCheck:
+    """Issue #183(a): review-supervisor.md must instruct the agent to
+    self-check Agent-tool availability before dispatching reviewers,
+    and to emit a structured ``agent-tool-unavailable`` audit comment
+    on failure so ``classify_blocked_task`` priority-0 can bucket the
+    task as ``RUNTIME_DEGRADATION``.
+    """
+
+    _SUPERVISOR_PATH = AGENTS_DIR / "review-supervisor.md"
+
+    def test_supervisor_contains_step_0_self_check(self) -> None:
+        content = self._SUPERVISOR_PATH.read_text()
+        assert "Step 0:" in content, "review-supervisor.md must declare a Step 0 self-check"
+        assert "Agent tool" in content, "Step 0 must describe how to detect missing Agent tool access"
+
+    def test_supervisor_emits_structured_runtime_degradation_payload(self) -> None:
+        """The audit-comment phrasing must match the regex in
+        ``classify_blocked_task`` (``agent-tool-unavailable`` keyword) so
+        the priority-0 check actually fires when the agent emits it.
+        """
+        content = self._SUPERVISOR_PATH.read_text()
+        assert "agent-tool-unavailable" in content, (
+            "review-supervisor.md must emit the canonical 'agent-tool-unavailable' "
+            "payload so classify_blocked_task can detect the degraded runtime"
+        )
+        assert "log-comment review-supervisor" in content, (
+            "review-supervisor.md must instruct logging the failure via log-comment"
+        )
+
+
+@pytest.mark.unit
 class TestSecurityReviewerNotInReviewTeam:
     """AC-7: security-reviewer.md must remain at agents/ root, not inside review_team/."""
 

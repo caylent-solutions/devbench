@@ -262,13 +262,16 @@ class TestClassifyBlockedConsidersRegularDeps:
         state = classify_blocked_task(ws / "backlog", ws / "BACKLOG.md", "E0-F1-S1-T1")
         assert state is BlockedTaskState.OPERATOR_ACTION_REQUIRED
 
-    def test_markers_all_terminal_and_deps_unsatisfied_is_operator_action_required(self, tmp_path) -> None:
-        """Case 3: all markers terminal and a regular dep in-progress -> OPERATOR_ACTION_REQUIRED.
+    def test_markers_all_terminal_and_deps_unsatisfied_is_awaiting_dependency(self, tmp_path) -> None:
+        """Case 3 (issue #186 fix): all markers terminal AND a regular dep
+        still in-progress -> AWAITING_DEPENDENCY.
 
-        In the 6-state classifier, when markers are present the marker branch
-        takes precedence. All-terminal markers indicate the cascade should have
-        fired and did not -- this is a diagnostic signal for OPERATOR_ACTION_REQUIRED
-        regardless of regular dep state.
+        Previously this bucketed as OPERATOR_ACTION_REQUIRED because the
+        marker-present branch returned early. The fix lets
+        ``_classify_with_markers`` return ``None`` when every marker is
+        stale-terminal so the classifier falls through to the regular-dep
+        check and surfaces the real blocker (an unsatisfied dependency,
+        not operator-attention work).
         """
         from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
 
@@ -278,7 +281,7 @@ class TestClassifyBlockedConsidersRegularDeps:
             markers=[("E0-F1-S1-T2", "done")],
         )
         state = classify_blocked_task(ws / "backlog", ws / "BACKLOG.md", "E0-F1-S1-T1")
-        assert state is BlockedTaskState.OPERATOR_ACTION_REQUIRED
+        assert state is BlockedTaskState.AWAITING_DEPENDENCY
 
     def test_markers_open_keeps_auto_clearing_regardless_of_deps(self, tmp_path) -> None:
         """Case 4: any open marker -> AUTO_CLEARING_VIA_PROPOSAL (unchanged)."""

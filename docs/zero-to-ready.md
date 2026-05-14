@@ -633,7 +633,6 @@ directory.
 - [`docs/backlog-contract.md`](backlog-contract.md) (ref) -- validation rule set and workspace layout
 - [`docs/llm-authentication.md`](llm-authentication.md) (ref) -- full Claude / Bedrock auth options
 - [`docs/manual-blockers.md`](manual-blockers.md) (ref) -- manual-blocker format
-- [`docs/upgrade-guide.md`](upgrade-guide.md) (ref) -- migrating an existing workspace to a newer devbench version
 
 ---
 

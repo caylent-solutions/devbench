@@ -1568,7 +1568,12 @@ class TestBacklogStatusBreakdown:
 
 
 class TestBacklogTotalsSixBlockedFields:
-    """AC-FUNC-004: the snapshot dataclass exposes 6 per-state count fields."""
+    """AC-FUNC-004: the snapshot dataclass exposes per-state count fields,
+    one per ``BlockedTaskState`` enum member. Originally six (AC-FUNC-004);
+    grew to seven when ``RUNTIME_DEGRADATION`` was added under issue #183 and
+    the renderer was retrofitted to handle it explicitly rather than letting
+    the ``else`` branch silently route it to operator-required.
+    """
 
     @staticmethod
     def _mk(uid: str, status) -> WorkUnit:
@@ -1628,8 +1633,12 @@ class TestBacklogTotalsSixBlockedFields:
             + b.tasks_blocked_operator
         ) == b.tasks_blocked
 
-    def test_backlog_totals_from_units_populates_six_fields(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """AC-FUNC-004: _backlog_totals_from_units populates all 6 blocked count fields."""
+    def test_backlog_totals_from_units_populates_every_field(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """_backlog_totals_from_units populates every per-state blocked count field.
+
+        Parametrised across every ``BlockedTaskState`` enum member so adding
+        a new member without extending the counter path trips this test.
+        """
         from devbench.backlog.proposal import BlockedTaskState
         from devbench.backlog.work_unit import WorkUnitStatus
         from devbench.reporting.report import _backlog_totals_from_units
@@ -1640,6 +1649,7 @@ class TestBacklogTotalsSixBlockedFields:
             BlockedTaskState.AWAITING_DEPENDENCY,
             BlockedTaskState.HELD,
             BlockedTaskState.BLOCKED_ON_HELD,
+            BlockedTaskState.RUNTIME_DEGRADATION,
             BlockedTaskState.OPERATOR_ACTION_REQUIRED,
         ]
         units = [
@@ -1662,6 +1672,7 @@ class TestBacklogTotalsSixBlockedFields:
         assert b.tasks_blocked_dependency == 1
         assert b.tasks_blocked_held == 1
         assert b.tasks_blocked_on_held == 1
+        assert b.tasks_blocked_runtime_degradation == 1
         assert b.tasks_blocked_operator == 1
         assert (
             b.tasks_blocked_auto_clearing
@@ -1669,8 +1680,42 @@ class TestBacklogTotalsSixBlockedFields:
             + b.tasks_blocked_dependency
             + b.tasks_blocked_held
             + b.tasks_blocked_on_held
+            + b.tasks_blocked_runtime_degradation
             + b.tasks_blocked_operator
         ) == b.tasks_blocked
+
+    def test_unhandled_blocked_state_raises_in_counter_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Adding a new BlockedTaskState without extending the counter path raises.
+
+        Pins CLAUDE.md no-fallback-logic: the renderer's if/elif chain MUST
+        be exhaustive; the else branch raises RuntimeError instead of
+        silently routing the new member to operator-required.
+        """
+        from devbench.backlog.proposal import BlockedTaskState
+        from devbench.backlog.work_unit import WorkUnitStatus
+        from devbench.reporting.report import _backlog_totals_from_units
+
+        unit = self._mk("E0-F1-S1-T1", WorkUnitStatus.BLOCKED)
+
+        class _FakeState:
+            """Stand-in for a hypothetical new BlockedTaskState member."""
+
+            value = "fake-state"
+
+            def __repr__(self) -> str:
+                return "<BlockedTaskState.FAKE_NEW_MEMBER>"
+
+        fake_state = _FakeState()
+
+        def fake_classify(*args, **kwargs):
+            return fake_state
+
+        monkeypatch.setattr("devbench.backlog.proposal.classify_blocked_task", fake_classify)
+        # Tolerate the BlockedTaskState identity-check noise; what we care
+        # about is that the renderer rejects the unhandled enum value.
+        del BlockedTaskState  # only imported for clarity above
+        with pytest.raises(RuntimeError, match="Unhandled BlockedTaskState"):
+            _backlog_totals_from_units([unit])
 
 
 class TestUnitListings:
@@ -1891,7 +1936,13 @@ class TestUnitListings:
         assert ("Tasks declined", "1") in rows
 
     def test_blocked_listing_six_panels_canonical_order_and_hints(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """AC-FUNC-001 + AC-FUNC-002 + AC-CYCLE-001: six panels in canonical order with hint lines."""
+        """AC-FUNC-001 + AC-FUNC-002 + AC-CYCLE-001: every panel in canonical order with hint lines.
+
+        Originally six panels; the runtime-degradation panel was added under
+        issue #183 once `cmd_start` learned to auto-restart on the SDK
+        Agent-tool-unavailable failure mode. Renderer routes one row per
+        every ``BlockedTaskState`` enum member, in canonical display order.
+        """
         from devbench.backlog.proposal import BlockedTaskState
         from devbench.backlog.work_unit import WorkUnitStatus
         from devbench.reporting import report as report_mod
@@ -1902,6 +1953,7 @@ class TestUnitListings:
             BlockedTaskState.AWAITING_DEPENDENCY,
             BlockedTaskState.HELD,
             BlockedTaskState.BLOCKED_ON_HELD,
+            BlockedTaskState.RUNTIME_DEGRADATION,
             BlockedTaskState.OPERATOR_ACTION_REQUIRED,
         ]
         units = [
@@ -1930,9 +1982,9 @@ class TestUnitListings:
 
         lines = report_mod._blocked_listing(units)
 
-        # Six panel headers must appear in the canonical order.
+        # Every panel header must appear, in canonical display order.
         panel_headers = [line for line in lines if line.startswith("Blocked tasks (")]
-        assert len(panel_headers) == 6, f"Expected 6 panel headers, got {len(panel_headers)}: {panel_headers}"
+        assert len(panel_headers) == 7, f"Expected 7 panel headers, got {len(panel_headers)}: {panel_headers}"
 
         expected_order = [
             "Blocked tasks (auto-clearing via proposal) (1):",
@@ -1940,6 +1992,7 @@ class TestUnitListings:
             "Blocked tasks (awaiting dependency) (1):",
             "Blocked tasks (held) (1):",
             "Blocked tasks (blocked-on-held) (1):",
+            "Blocked tasks (runtime-degradation) (1):",
             "Blocked tasks (operator action required) (1):",
         ]
         assert panel_headers == expected_order, f"Panel order mismatch: {panel_headers}"
@@ -1959,6 +2012,10 @@ class TestUnitListings:
             (
                 _panel_header("blocked-on-held"),
                 "Waiting on a held unit; unhold the target or redirect this task.",
+            ),
+            (
+                _panel_header("runtime-degradation"),
+                "SDK lost Agent-tool access mid-session; `make start` auto-restarts to recover.",
             ),
             (
                 _panel_header("operator action required"),

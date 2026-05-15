@@ -1623,12 +1623,13 @@ class _BacklogTotals:
     tasks_proposed: int  # task-factory-generated drafts awaiting human review
     tasks_declined: int  # explicitly declined work (won't ever be done)
     tasks_draft: int = 0  # pre-queue gate; not yet promoted to in-queue
-    # E2-F2-S1: six per-state blocked counts (one per BlockedTaskState).
+    # E2-F2-S1: per-state blocked counts (one per BlockedTaskState).
     tasks_blocked_auto_clearing: int = 0  # AUTO_CLEARING_VIA_PROPOSAL
     tasks_blocked_amendment_recovery: int = 0  # AWAITING_AMENDMENT_RECOVERY
     tasks_blocked_dependency: int = 0  # AWAITING_DEPENDENCY
     tasks_blocked_held: int = 0  # HELD (task's own status is hold)
     tasks_blocked_on_held: int = 0  # BLOCKED_ON_HELD
+    tasks_blocked_runtime_degradation: int = 0  # RUNTIME_DEGRADATION (auto-recovers on orchestrator restart)
     tasks_blocked_operator: int = 0  # OPERATOR_ACTION_REQUIRED
 
     @property
@@ -1676,6 +1677,7 @@ def _backlog_totals_from_units(units: list) -> _BacklogTotals:
     cnt_dependency = 0
     cnt_held = 0
     cnt_on_held = 0
+    cnt_runtime_degradation = 0
     cnt_operator = 0
     if tasks_blocked_and_hold:
         from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
@@ -1704,8 +1706,20 @@ def _backlog_totals_from_units(units: list) -> _BacklogTotals:
                 cnt_held += 1
             elif state is BlockedTaskState.BLOCKED_ON_HELD:
                 cnt_on_held += 1
-            else:
+            elif state is BlockedTaskState.RUNTIME_DEGRADATION:
+                cnt_runtime_degradation += 1
+            elif state is BlockedTaskState.OPERATOR_ACTION_REQUIRED:
                 cnt_operator += 1
+            else:
+                # Every BlockedTaskState enum member must be handled
+                # explicitly above. Hitting this branch means a new
+                # member was added to the enum without updating this
+                # renderer -- fail loud rather than silently routing
+                # to operator-required (CLAUDE.md: no fallback logic).
+                raise RuntimeError(
+                    f"Unhandled BlockedTaskState {state!r} in report counter path; "
+                    "update _BacklogTotals + this if/elif chain."
+                )
 
     return _BacklogTotals(
         tasks_total=len(tasks),
@@ -1729,6 +1743,7 @@ def _backlog_totals_from_units(units: list) -> _BacklogTotals:
         tasks_blocked_dependency=cnt_dependency,
         tasks_blocked_held=cnt_held,
         tasks_blocked_on_held=cnt_on_held,
+        tasks_blocked_runtime_degradation=cnt_runtime_degradation,
         tasks_blocked_operator=cnt_operator,
     )
 
@@ -1854,6 +1869,7 @@ def _classify_blocked_unit_into_buckets(
     dependency_rows: list,
     held_rows: list,
     on_held_rows: list,
+    runtime_degradation_rows: list,
     operator_rows: list,
 ) -> None:
     """Route one blocked/hold task unit into the appropriate display bucket.
@@ -1861,6 +1877,12 @@ def _classify_blocked_unit_into_buckets(
     Separated from ``_blocked_listing`` to keep the outer function's branch
     count within the PLR0912 threshold.  HOLD-status units short-circuit to
     the held bucket without a filesystem read.
+
+    Every ``BlockedTaskState`` enum member is handled explicitly. Adding a
+    new member to the enum without extending this routing function raises
+    ``RuntimeError`` -- CLAUDE.md forbids silent fallbacks for unhandled
+    cases. Tests in ``tests/test_reporting/test_report.py`` parametrise
+    every enum member against this function.
     """
     from devbench.backlog.proposal import (
         BlockedTaskState,
@@ -1891,8 +1913,55 @@ def _classify_blocked_unit_into_buckets(
         held_rows.append(u)
     elif state is BlockedTaskState.BLOCKED_ON_HELD:
         on_held_rows.append(u)
-    else:
+    elif state is BlockedTaskState.RUNTIME_DEGRADATION:
+        runtime_degradation_rows.append(u)
+    elif state is BlockedTaskState.OPERATOR_ACTION_REQUIRED:
         operator_rows.append(u)
+    else:
+        raise RuntimeError(
+            f"Unhandled BlockedTaskState {state!r} in report per-row routing; "
+            "update _classify_blocked_unit_into_buckets + _render_blocked_panels."
+        )
+
+
+def _render_simple_panel(rows: list, title: str, hint: str, row_suffix: str) -> list[str]:
+    """Render one blocked-task panel with a fixed per-row suffix."""
+    if not rows:
+        return []
+    out = ["", f"Blocked tasks ({title}) ({len(rows)}):", hint]
+    for u in rows:
+        out.append(f"  - {u.id}: {u.title}    {row_suffix}")
+    return out
+
+
+def _render_auto_clearing_panel(auto_rows: list) -> list[str]:
+    """Render the AUTO_CLEARING_VIA_PROPOSAL panel; per-row suffix names marker targets."""
+    if not auto_rows:
+        return []
+    out = [
+        "",
+        f"Blocked tasks (auto-clearing via proposal) ({len(auto_rows)}):",
+        "Resolves when marker targets reach terminal; no action.",
+    ]
+    for u, waiting_on in auto_rows:
+        suffix = f"    [waiting on {', '.join(waiting_on)}]" if waiting_on else ""
+        out.append(f"  - {u.id}: {u.title}{suffix}")
+    return out
+
+
+def _render_amendment_recovery_panel(rows: list) -> list[str]:
+    """Render the AWAITING_AMENDMENT_RECOVERY panel; per-row suffix names recovery signal."""
+    if not rows:
+        return []
+    out = [
+        "",
+        f"Blocked tasks (awaiting amendment recovery) ({len(rows)}):",
+        "Recovery agent in flight; orchestrator's next sweep advances these.",
+    ]
+    for u, signal in rows:
+        suffix = f"    [recovery: {signal}]" if signal else ""
+        out.append(f"  - {u.id}: {u.title}{suffix}")
+    return out
 
 
 def _render_blocked_panels(
@@ -1901,73 +1970,78 @@ def _render_blocked_panels(
     dependency_rows: list,
     held_rows: list,
     on_held_rows: list,
+    runtime_degradation_rows: list,
     operator_rows: list,
 ) -> list[str]:
-    """Render the six per-state blocked panels into display lines.
+    """Render every per-state blocked panel into display lines.
 
     Each non-empty panel produces a header, a canonical resolution hint,
     and one row per task unit.  Empty panels are omitted.  Kept separate
     from ``_blocked_listing`` so the branch count of the outer function
     stays within the PLR0912 threshold.
+
+    Display order matches the priority ordering of ``BlockedTaskState``
+    in ``devbench.backlog.proposal``: auto-clearing first (purely
+    cascade-driven), then amendment-recovery (orchestrator-driven), then
+    dependency, then held / blocked-on-held (operator-driven HOLD state),
+    then runtime-degradation (SDK auto-restart), and finally
+    operator-action-required (the residual "needs human").
     """
     lines: list[str] = []
-
-    if auto_rows:
-        lines.append("")
-        lines.append(f"Blocked tasks (auto-clearing via proposal) ({len(auto_rows)}):")
-        lines.append("Resolves when marker targets reach terminal; no action.")
-        for u, waiting_on in auto_rows:
-            suffix = f"    [waiting on {', '.join(waiting_on)}]" if waiting_on else ""
-            lines.append(f"  - {u.id}: {u.title}{suffix}")
-
-    if amendment_recovery_rows:
-        lines.append("")
-        lines.append(f"Blocked tasks (awaiting amendment recovery) ({len(amendment_recovery_rows)}):")
-        lines.append("Recovery agent in flight; orchestrator's next sweep advances these.")
-        for u, signal in amendment_recovery_rows:
-            suffix = f"    [recovery: {signal}]" if signal else ""
-            lines.append(f"  - {u.id}: {u.title}{suffix}")
-
-    if dependency_rows:
-        lines.append("")
-        lines.append(f"Blocked tasks (awaiting dependency) ({len(dependency_rows)}):")
-        lines.append("Resolves when the dependency completes; no action.")
-        for u in dependency_rows:
-            lines.append(f"  - {u.id}: {u.title}    [dependency not yet terminal]")
-
-    if held_rows:
-        lines.append("")
-        lines.append(f"Blocked tasks (held) ({len(held_rows)}):")
-        lines.append("On hold by operator; unhold to release.")
-        for u in held_rows:
-            lines.append(f"  - {u.id}: {u.title}    [HOLD]")
-
-    if on_held_rows:
-        lines.append("")
-        lines.append(f"Blocked tasks (blocked-on-held) ({len(on_held_rows)}):")
-        lines.append("Waiting on a held unit; unhold the target or redirect this task.")
-        for u in on_held_rows:
-            lines.append(f"  - {u.id}: {u.title}    [blocked-on-held]")
-
-    if operator_rows:
-        lines.append("")
-        lines.append(f"Blocked tasks (operator action required) ({len(operator_rows)}):")
-        lines.append("No automation path; operator must inspect and resolve manually.")
-        for u in operator_rows:
-            lines.append(f"  - {u.id}: {u.title}    [operator action required]")
-
+    lines.extend(_render_auto_clearing_panel(auto_rows))
+    lines.extend(_render_amendment_recovery_panel(amendment_recovery_rows))
+    lines.extend(
+        _render_simple_panel(
+            dependency_rows,
+            "awaiting dependency",
+            "Resolves when the dependency completes; no action.",
+            "[dependency not yet terminal]",
+        )
+    )
+    lines.extend(
+        _render_simple_panel(
+            held_rows,
+            "held",
+            "On hold by operator; unhold to release.",
+            "[HOLD]",
+        )
+    )
+    lines.extend(
+        _render_simple_panel(
+            on_held_rows,
+            "blocked-on-held",
+            "Waiting on a held unit; unhold the target or redirect this task.",
+            "[blocked-on-held]",
+        )
+    )
+    lines.extend(
+        _render_simple_panel(
+            runtime_degradation_rows,
+            "runtime-degradation",
+            "SDK lost Agent-tool access mid-session; `make start` auto-restarts to recover.",
+            "[runtime-degradation -- auto-restart pending]",
+        )
+    )
+    lines.extend(
+        _render_simple_panel(
+            operator_rows,
+            "operator action required",
+            "No automation path; operator must inspect and resolve manually.",
+            "[operator action required]",
+        )
+    )
     return lines
 
 
 def _blocked_listing(units: list) -> list[str]:
-    """Render blocked tasks as six panels, one per BlockedTaskState.
+    """Render blocked tasks as one panel per BlockedTaskState.
 
     Each panel header reads ``Blocked tasks (<panel-name>) (<count>):``
     and is immediately followed by the canonical resolution hint for that
     state.  Empty panels are omitted so the operator's eye lands on the
     panels that have content.
 
-    The six panels in canonical order:
+    The panels in canonical display order:
 
     1. ``auto-clearing via proposal`` -- ADR-07 cascade resolves once every
        ``[BLOCKED_PENDING_PROPOSAL]`` marker target reaches terminal.
@@ -1978,7 +2052,12 @@ def _blocked_listing(units: list) -> list[str]:
     4. ``held`` -- the unit's own status is ``hold``; operator must resume.
     5. ``blocked-on-held`` -- a marker target is held; operator must unhold
        or redirect.
-    6. ``operator action required`` -- no automation path; operator must act.
+    6. ``runtime-degradation`` -- the SDK lost Agent-tool access mid-session
+       (issue #183); the orchestrate skill exits NO_ACTIONABLE and ``cmd_start``
+       returns the auto-restart exit code so ``make start``'s wrapping loop
+       respawns the orchestrator with a fresh SDK subprocess. Operator does
+       nothing.
+    7. ``operator action required`` -- no automation path; operator must act.
     """
     # Admit BOTH BLOCKED and HOLD task units.
     eligible = [
@@ -1989,21 +2068,35 @@ def _blocked_listing(units: list) -> list[str]:
     if not eligible:
         return []
 
-    # Six per-state row buckets in canonical display order.
+    # Per-state row buckets in canonical display order.
     auto_rows: list[tuple] = []  # (unit, list[str] of marker targets)
     amendment_recovery_rows: list[tuple] = []  # (unit, signal-source string)
     dependency_rows: list = []
     held_rows: list = []
     on_held_rows: list = []
+    runtime_degradation_rows: list = []
     operator_rows: list = []
 
     for u in eligible:
         _classify_blocked_unit_into_buckets(
-            u, auto_rows, amendment_recovery_rows, dependency_rows, held_rows, on_held_rows, operator_rows
+            u,
+            auto_rows,
+            amendment_recovery_rows,
+            dependency_rows,
+            held_rows,
+            on_held_rows,
+            runtime_degradation_rows,
+            operator_rows,
         )
 
     return _render_blocked_panels(
-        auto_rows, amendment_recovery_rows, dependency_rows, held_rows, on_held_rows, operator_rows
+        auto_rows,
+        amendment_recovery_rows,
+        dependency_rows,
+        held_rows,
+        on_held_rows,
+        runtime_degradation_rows,
+        operator_rows,
     )
 
 

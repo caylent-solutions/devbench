@@ -232,6 +232,29 @@ since the last release. PR #119 carries every change.
 
 ### Fixed
 
+- **`devbench report` now buckets `RUNTIME_DEGRADATION` correctly**
+  (issue #183 follow-up). The classifier `classify_blocked_task` already
+  returned `BlockedTaskState.RUNTIME_DEGRADATION` for tasks whose
+  Comments contained a recent `[BLOCKED] agent-tool-unavailable` audit
+  from review-supervisor's Step 0 self-check, but the report renderer's
+  two routing paths (`_classify_blocked_unit_into_buckets` and
+  `_backlog_totals_from_units`) used an `if/elif/elif/elif/elif/else`
+  chain that enumerated five other buckets and silently funnelled every
+  other state -- including `RUNTIME_DEGRADATION` -- into
+  `operator_rows / cnt_operator`. Result: `devbench report` mis-rendered
+  RUNTIME_DEGRADATION tasks as "operator action required" while
+  `devbench status --detail` (which has its own correct routing in
+  `cli.py:316-327`) rendered them in the right bucket. Both renderer
+  paths now handle every `BlockedTaskState` enum member explicitly and
+  raise `RuntimeError` if a future enum addition is not wired in --
+  per CLAUDE.md no-fallback-logic. The blocked-task display gains a
+  dedicated "Blocked tasks (runtime-degradation)" panel with the
+  resolution hint `"SDK lost Agent-tool access mid-session; `make
+  start` auto-restarts to recover."`. `_BacklogTotals` exposes a new
+  `tasks_blocked_runtime_degradation` field. Pinned by
+  `tests/test_reporting/test_report.py::TestBacklogTotalsSixBlockedFields::test_unhandled_blocked_state_raises_in_counter_path`
+  plus extended canonical-order panel test.
+
 - **Atomic temp-then-rename for every work-unit md write** (commit B of
   the shadow-plugin / WU-write fix pair). Concurrent readers of a WU md
   file could previously observe a heading-less intermediate state during

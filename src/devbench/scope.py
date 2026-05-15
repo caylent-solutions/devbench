@@ -362,6 +362,11 @@ class ScopeFilter:
     def from_file(cls, workspace_root: Path) -> ScopeFilter:
         """Read a ``ScopeFilter`` from ``<workspace_root>/.devbench/scope.json``.
 
+        Validates that ``include``, ``exclude``, and ``expanded_ids`` are all lists
+        (not strings, dicts, or other types) before constructing the instance.
+        A scope.json with wrong field types is corrupt and must be rejected
+        immediately (fail-fast) rather than silently producing a broken filter.
+
         Args:
             workspace_root: Path to the workspace root directory.
 
@@ -372,6 +377,7 @@ class ScopeFilter:
             FileNotFoundError: If ``scope.json`` does not exist.
             json.JSONDecodeError: If the file contains invalid JSON.
             KeyError: If required keys are missing from the JSON payload.
+            TypeError: If ``include``, ``exclude``, or ``expanded_ids`` is not a list.
         """
         scope_path = _scope_file_path(workspace_root)
         if not scope_path.exists():
@@ -379,6 +385,15 @@ class ScopeFilter:
                 f"scope.json not found at '{scope_path}'. Run 'devbench start --include ...' to create one."
             )
         data = json.loads(scope_path.read_text())
+        for field_name in ("include", "exclude", "expanded_ids"):
+            value = data[field_name]
+            if not isinstance(value, list):
+                raise TypeError(
+                    f"scope.json field '{field_name}' must be a list, "
+                    f"got {type(value).__name__!r}. "
+                    f"The file at '{scope_path}' may be corrupt -- "
+                    f"remove it and re-run 'devbench start --include ...' to recreate it."
+                )
         return cls(
             include=data["include"],
             exclude=data["exclude"],

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
 from unittest import mock
 
@@ -634,3 +635,99 @@ def test_integration_parse_write_read_allows(tmp_path: Path, backlog_ids: list[s
     # Cleanup
     ScopeFilter.clear(tmp_path)
     assert not (tmp_path / ".devbench" / "scope.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# AC-190-8 extension: to_file return value, from_file error paths, format checks
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_to_file_returns_scope_json_path(tmp_path: Path, backlog_ids: list[str]) -> None:
+    """to_file returns the Path to the written scope.json file."""
+    sf = ScopeFilter.parse("E1", "", backlog_ids)
+    result = sf.to_file(tmp_path)
+    expected = tmp_path / ".devbench" / "scope.json"
+    assert result == expected
+
+
+@pytest.mark.unit
+def test_to_file_started_at_is_iso8601_utc(tmp_path: Path, backlog_ids: list[str]) -> None:
+    """to_file writes started_at in ISO-8601 UTC format (YYYY-MM-DDTHH:MM:SSZ)."""
+    sf = ScopeFilter.parse("E1", "", backlog_ids)
+    sf.to_file(tmp_path)
+    data = json.loads((tmp_path / ".devbench" / "scope.json").read_text())
+    iso8601_utc_re = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+    assert iso8601_utc_re.match(data["started_at"]), (
+        f"started_at '{data['started_at']}' does not match ISO-8601 UTC format YYYY-MM-DDTHH:MM:SSZ"
+    )
+
+
+@pytest.mark.unit
+def test_from_file_invalid_json_raises(tmp_path: Path) -> None:
+    """from_file raises json.JSONDecodeError when scope.json contains invalid JSON."""
+    scope_dir = tmp_path / ".devbench"
+    scope_dir.mkdir(parents=True)
+    (scope_dir / "scope.json").write_text("{ not valid json }")
+    with pytest.raises(json.JSONDecodeError):
+        ScopeFilter.from_file(tmp_path)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("missing_key", ["include", "exclude", "expanded_ids"])
+def test_from_file_missing_key_raises_with_key_name(tmp_path: Path, missing_key: str) -> None:
+    """from_file raises KeyError naming the missing key for each required field."""
+    scope_dir = tmp_path / ".devbench"
+    scope_dir.mkdir(parents=True)
+    all_keys = {"include": ["E1"], "exclude": [], "expanded_ids": ["E1"]}
+    del all_keys[missing_key]
+    (scope_dir / "scope.json").write_text(json.dumps(all_keys))
+    with pytest.raises(KeyError):
+        ScopeFilter.from_file(tmp_path)
+
+
+@pytest.mark.unit
+def test_to_file_overwrites_existing_scope_json(tmp_path: Path, backlog_ids: list[str]) -> None:
+    """to_file overwrites any pre-existing scope.json atomically (idempotent)."""
+    sf1 = ScopeFilter.parse("E1", "", backlog_ids)
+    sf1.to_file(tmp_path)
+
+    sf2 = ScopeFilter.parse("E2", "", backlog_ids)
+    sf2.to_file(tmp_path)
+
+    loaded = ScopeFilter.from_file(tmp_path)
+    assert loaded.include == ["E2"]
+    assert not loaded.allows("E1-F1-S1-T1")
+    assert loaded.allows("E2-F1-S1-T1")
+
+
+@pytest.mark.unit
+def test_to_file_no_temp_file_left_on_success(tmp_path: Path, backlog_ids: list[str]) -> None:
+    """to_file leaves no .json.tmp artefact after a successful write."""
+    sf = ScopeFilter.parse("E1", "", backlog_ids)
+    sf.to_file(tmp_path)
+    tmp_file = tmp_path / ".devbench" / "scope.json.tmp"
+    assert not tmp_file.exists(), "Stale .json.tmp file found after successful to_file()"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "bad_payload",
+    [
+        {"include": "E1", "exclude": [], "expanded_ids": []},  # include is str not list
+        {"include": [], "exclude": "E2", "expanded_ids": []},  # exclude is str not list
+        {"include": [], "exclude": [], "expanded_ids": "E1-F1-S1-T1"},  # expanded_ids is str not list
+    ],
+)
+def test_from_file_invalid_field_type_raises(tmp_path: Path, bad_payload: dict) -> None:
+    """from_file raises TypeError when a required field has the wrong type.
+
+    The spec schema requires include, exclude, and expanded_ids to be lists.
+    A scope.json with wrong types (e.g. a bare string) must fail fast with
+    a TypeError rather than silently producing a broken ScopeFilter.
+    """
+    scope_dir = tmp_path / ".devbench"
+    scope_dir.mkdir(parents=True)
+    (scope_dir / "scope.json").write_text(json.dumps(bad_payload))
+    with pytest.raises(TypeError):
+        ScopeFilter.from_file(tmp_path)

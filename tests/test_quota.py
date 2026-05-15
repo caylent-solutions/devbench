@@ -1901,6 +1901,56 @@ class TestRecoveryProbeNonQuotaErrors:
 
 
 # ---------------------------------------------------------------------------
+# recovery_probe: input validation (fail-fast on invalid parameters)
+# ---------------------------------------------------------------------------
+
+
+class TestRecoveryProbeInputValidation:
+    """Fail-fast: recovery_probe rejects invalid parameters before making API calls."""
+
+    @pytest.mark.parametrize(
+        "timeout_val",
+        [0.0, -1.0, -0.001],
+        ids=["zero", "negative-one", "small-negative"],
+    )
+    def test_rejects_non_positive_timeout_seconds(self, timeout_val: float) -> None:
+        """timeout_seconds <= 0 raises ValueError before any API call is attempted."""
+        with pytest.raises(ValueError, match="timeout_seconds"):
+            recovery_probe(timeout_seconds=timeout_val, request_size_tokens=1)
+
+    @pytest.mark.parametrize(
+        "token_val",
+        [0, -1, -100],
+        ids=["zero", "negative-one", "large-negative"],
+    )
+    def test_rejects_non_positive_request_size_tokens(self, token_val: int) -> None:
+        """request_size_tokens <= 0 raises ValueError before any API call is attempted."""
+        with pytest.raises(ValueError, match="request_size_tokens"):
+            recovery_probe(timeout_seconds=5.0, request_size_tokens=token_val)
+
+    def test_no_api_call_made_on_invalid_timeout(self) -> None:
+        """When timeout_seconds is invalid, no Anthropic client is constructed."""
+        with patch("devbench.quota.anthropic.Anthropic") as mock_cls:
+            with pytest.raises(ValueError, match="timeout_seconds"):
+                recovery_probe(timeout_seconds=-1.0, request_size_tokens=1)
+        mock_cls.assert_not_called()
+
+    def test_no_api_call_made_on_invalid_request_size(self) -> None:
+        """When request_size_tokens is invalid, no Anthropic client is constructed."""
+        with patch("devbench.quota.anthropic.Anthropic") as mock_cls:
+            with pytest.raises(ValueError, match="request_size_tokens"):
+                recovery_probe(timeout_seconds=5.0, request_size_tokens=0)
+        mock_cls.assert_not_called()
+
+    def test_no_api_key_fetched_on_invalid_params(self) -> None:
+        """When parameters are invalid, get_anthropic_api_key is never called."""
+        with patch("devbench.quota.get_anthropic_api_key") as mock_key:
+            with pytest.raises(ValueError):
+                recovery_probe(timeout_seconds=0.0, request_size_tokens=1)
+        mock_key.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # recovery_probe: API call parameters (model, messages content)
 # ---------------------------------------------------------------------------
 

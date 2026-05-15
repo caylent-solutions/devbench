@@ -600,6 +600,9 @@ def recovery_probe(
         ``False`` when the API signals continued quota exhaustion.
 
     Raises:
+        ValueError: When *timeout_seconds* or *request_size_tokens* is not
+            positive.  Raised before any network I/O or credential lookup
+            (fail-fast).
         RuntimeError: When :func:`~devbench.config.get_anthropic_api_key`
             cannot obtain a valid API key (missing or unreadable credentials
             file, or missing access token).
@@ -609,6 +612,13 @@ def recovery_probe(
         Exception: Any other exception raised by the Anthropic SDK propagates
             unchanged -- caller decides how to handle it.
     """
+    if timeout_seconds <= 0:
+        msg = f"timeout_seconds must be positive, got {timeout_seconds!r}"
+        raise ValueError(msg)
+    if request_size_tokens <= 0:
+        msg = f"request_size_tokens must be positive, got {request_size_tokens!r}"
+        raise ValueError(msg)
+
     api_key = get_anthropic_api_key()
     client = anthropic.Anthropic(
         api_key=api_key,

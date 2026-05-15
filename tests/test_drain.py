@@ -83,6 +83,27 @@ class TestDrainStateConstruction:
         state = DrainState(requested_at=_NOW, requested_by="operator")
         assert isinstance(state.requested_by, str)
 
+    def test_str_contains_requested_by(self) -> None:
+        """__str__ must include the requester so status output is human-readable."""
+        state = DrainState(requested_at=_NOW, requested_by="carol", reason="maintenance")
+        assert "carol" in str(state)
+
+    def test_str_contains_requested_at(self) -> None:
+        """__str__ must include the timestamp."""
+        state = DrainState(requested_at=_NOW, requested_by="carol", reason="maintenance")
+        assert "2026-01-15" in str(state)
+
+    def test_str_contains_reason_when_set(self) -> None:
+        """__str__ includes the reason when it is non-empty."""
+        state = DrainState(requested_at=_NOW, requested_by="carol", reason="planned upgrade")
+        assert "planned upgrade" in str(state)
+
+    def test_str_reason_absent_label_when_empty(self) -> None:
+        """__str__ includes a placeholder when reason is empty."""
+        state = DrainState(requested_at=_NOW, requested_by="carol", reason="")
+        text = str(state)
+        assert "(none)" in text
+
 
 # ---------------------------------------------------------------------------
 # DrainState.to_dict

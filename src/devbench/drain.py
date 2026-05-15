@@ -64,6 +64,18 @@ class DrainState:
             "reason": self.reason,
         }
 
+    def __str__(self) -> str:
+        """Return a human-readable one-line summary suitable for ``devbench drain --status`` output.
+
+        Returns:
+            A string of the form
+            ``"drain pending: requested_by=<user> at=<ISO-8601> reason=<reason-or-none>"``.
+        """
+        reason_part = self.reason if self.reason else "(none)"
+        return (
+            f"drain pending: requested_by={self.requested_by} at={self.requested_at.isoformat()} reason={reason_part}"
+        )
+
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> DrainState:
         """Deserialise from a dict produced by :meth:`to_dict`.

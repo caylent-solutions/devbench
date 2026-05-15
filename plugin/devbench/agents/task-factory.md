@@ -1,7 +1,7 @@
 ---
 name: task-factory
 description: Reads a pending blocker-resolver proposal JSON and materialises each proposed task as a draft work-unit .md file with status `proposed` plus a matching row in BACKLOG.md. Invoke with a source work unit ID (e.g. E0-F1-S1-T1).
-model: sonnet
+model: opus
 tools: Bash
 disallowedTools: Write, Edit, Read, Glob, Grep
 ---

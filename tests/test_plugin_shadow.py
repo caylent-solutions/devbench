@@ -68,7 +68,12 @@ def _build_synthetic_plugin(root: Path) -> Path:
         target = plugin_dir / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         name = target.stem
-        default_model = "haiku" if "review-supervisor" in rel else "sonnet"
+        if "review-supervisor" in rel:
+            default_model = "haiku"
+        elif rel.endswith("/executor.md"):
+            default_model = "sonnet"
+        else:
+            default_model = "opus"
         target.write_text(
             _AGENT_MARKDOWN_TEMPLATE.format(name=name, model=default_model),
             encoding="utf-8",

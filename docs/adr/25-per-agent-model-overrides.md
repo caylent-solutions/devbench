@@ -44,23 +44,41 @@ of the canonical when any per-agent override is configured.
 
 Configuration surface: a new top-level `agents:` block in
 `backlog/config/devbench.yaml`. The example below pins each field to its
-**current frontmatter default** (nine agents on `sonnet`, `review_supervisor`
-on `haiku`) so the block as written is a no-op; flip individual fields when
-quota pressure makes the default untenable for a specific agent:
+**current frontmatter default**. The defaults are tuned by the role each
+agent plays:
+
+* `executor` (writes code under TDD) on `sonnet` -- keeps the happy-path
+  loop fast.
+* The five judges (`code_reviewer`, `test_reviewer`, `doc_reviewer`,
+  `changes_manifest`, `security_reviewer`) on `opus` -- they fire only
+  after the executor finishes a task, and a bad verdict costs more than
+  the inference savings.
+* The three workflow-reasoning agents (`blocker_resolver`,
+  `manifest_amender`, `task_factory`) on `opus` -- judgment-heavy and
+  fire only on unhappy paths, so cost is bounded; a wrong proposal /
+  wrong amendment decision / poor draft creates downstream cascade cost
+  larger than the inference savings.
+* `review_supervisor` on `haiku` -- pure fan-out coordinator that spawns
+  the five judges in parallel and merges their JSON verdicts. Opus here
+  would be waste.
+
+The block as written is a no-op; flip individual fields when quota
+pressure makes the default untenable (e.g., drop the judges to `sonnet`
+when opus quota is exhausted):
 
 ```yaml
 agents:
   executor: sonnet
-  blocker_resolver: sonnet
-  manifest_amender: sonnet
-  security_reviewer: sonnet
-  task_factory: sonnet
+  blocker_resolver: opus
+  manifest_amender: opus
+  security_reviewer: opus
+  task_factory: opus
   review_supervisor: haiku
   review_team:
-    code_reviewer: sonnet
-    test_reviewer: sonnet
-    doc_reviewer: sonnet
-    changes_manifest: sonnet
+    code_reviewer: opus
+    test_reviewer: opus
+    doc_reviewer: opus
+    changes_manifest: opus
 ```
 
 Every field defaults to `null` when absent; a null (or absent) field leaves

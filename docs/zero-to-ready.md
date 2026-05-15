@@ -276,27 +276,35 @@ validate:
   check_orphan_path_tokens: false   # opt-in path-coherence check on AC / DoD prose
 
 agents:                              # ADR-25: per-agent model overrides
-  # Each field below pins the agent to its CURRENT frontmatter default
-  # (nine agents on sonnet, review_supervisor on haiku). Writing the same
-  # value as the frontmatter default is a no-op; flip an individual field
-  # when your per-model quota is uneven (e.g. opus left, sonnet exhausted).
-  # Omit the agents: block entirely (or set a field to null) to use the
-  # frontmatter default. Values must match your auth channel: short names
-  # (opus / sonnet / haiku) or claude-<name>-<digits> when use_bedrock:
-  # false; full Bedrock ARNs when use_bedrock: true. JUDGE_AGENT_MODEL_<NAME>
-  # env vars override this block per-call (env > yaml > frontmatter). See
-  # docs/adr/25-per-agent-model-overrides.md.
+  # Each field below pins the agent to its CURRENT frontmatter default,
+  # which are tuned by the role each agent plays:
+  #   - executor (writes code under TDD): sonnet -- fast happy path.
+  #   - The five judges (code-reviewer, test-reviewer, doc-reviewer,
+  #     changes-manifest, security-reviewer): opus -- bad verdicts cost
+  #     more than inference; judges only fire after executor finishes.
+  #   - blocker-resolver, manifest-amender, task-factory (workflow /
+  #     recovery): opus -- judgment-heavy and fire only on unhappy
+  #     paths, so cost is bounded.
+  #   - review-supervisor: haiku -- pure fan-out coordinator.
+  # Writing the same value as the frontmatter default is a no-op; flip an
+  # individual field when your per-model quota is uneven (e.g. sonnet left,
+  # opus exhausted). Omit the agents: block entirely (or set a field to
+  # null) to use the frontmatter default. Values must match your auth
+  # channel: short names (opus / sonnet / haiku) or claude-<name>-<digits>
+  # when use_bedrock: false; full Bedrock ARNs when use_bedrock: true.
+  # JUDGE_AGENT_MODEL_<NAME> env vars override this block per-call
+  # (env > yaml > frontmatter). See docs/adr/25-per-agent-model-overrides.md.
   executor: sonnet
-  blocker_resolver: sonnet
-  manifest_amender: sonnet
-  security_reviewer: sonnet
-  task_factory: sonnet
+  blocker_resolver: opus
+  manifest_amender: opus
+  security_reviewer: opus
+  task_factory: opus
   review_supervisor: haiku
   review_team:
-    code_reviewer: sonnet
-    test_reviewer: sonnet
-    doc_reviewer: sonnet
-    changes_manifest: sonnet
+    code_reviewer: opus
+    test_reviewer: opus
+    doc_reviewer: opus
+    changes_manifest: opus
 ```
 
 The full annotated reference with every possible key and its default value is

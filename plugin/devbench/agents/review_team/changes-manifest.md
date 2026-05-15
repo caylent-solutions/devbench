@@ -1,7 +1,7 @@
 ---
 name: changes-manifest
 description: Reviews whether actual file changes match the planned Changes Manifest and comply with project scope and standards. Invoke with a work unit ID (e.g. E0-F1-S1-T1).
-model: sonnet
+model: opus
 tools: Bash
 disallowedTools: Write, Edit, Read, Glob, Grep
 ---

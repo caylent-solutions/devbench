@@ -1,7 +1,7 @@
 ---
 name: test-reviewer
 description: Reviews test quality against TDD discipline, real-tests-only, and coverage standards. Invoke with a work unit ID (e.g. E0-F1-S1-T1).
-model: sonnet
+model: opus
 tools: Bash
 disallowedTools: Write, Edit, Read, Glob, Grep
 ---

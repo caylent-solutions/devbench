@@ -144,12 +144,19 @@ class TestNoStaleFlatAgentPaths:
 
 
 @pytest.mark.unit
-class TestReviewTeamModelUpgrade:
-    """AC-11: All four review_team agents must use model: sonnet."""
+class TestReviewTeamModelDefault:
+    """ADR-25: All four review_team agents default to model: opus (judges).
+
+    The four review_team agents are LLM-as-judge agents whose verdicts gate
+    a task's done state. A bad verdict costs more than the inference savings,
+    so the frontmatter pins them to opus; operators with opus quota pressure
+    can drop individual judges to sonnet via the workspace's ``agents:``
+    block (ADR-25).
+    """
 
     @pytest.mark.parametrize("agent_filename", REVIEW_TEAM_AGENTS)
-    def test_review_team_agent_uses_sonnet_model(self, agent_filename: str) -> None:
-        """AC-11: Each review_team agent must declare model: sonnet in frontmatter."""
+    def test_review_team_agent_uses_opus_model(self, agent_filename: str) -> None:
+        """ADR-25: Each review_team agent must declare model: opus in frontmatter."""
         agent_path = REVIEW_TEAM_DIR / agent_filename
         assert agent_path.exists(), f"Agent file not found: {agent_path}"
         content = agent_path.read_text()
@@ -163,8 +170,9 @@ class TestReviewTeamModelUpgrade:
         assert end_idx is not None, f"{agent_filename} frontmatter closing --- not found"
         frontmatter = "\n".join(lines[1:end_idx])
 
-        assert re.search(r"^model:\s*sonnet\s*$", frontmatter, re.MULTILINE), (
-            f"{agent_filename} must declare 'model: sonnet' in frontmatter.\nFound frontmatter:\n{frontmatter}"
+        assert re.search(r"^model:\s*opus\s*$", frontmatter, re.MULTILINE), (
+            f"{agent_filename} must declare 'model: opus' in frontmatter (ADR-25 default).\n"
+            f"Found frontmatter:\n{frontmatter}"
         )
 
 

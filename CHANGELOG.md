@@ -244,6 +244,27 @@ since the last release. PR #119 carries every change.
   denominator. ETA still falls back to `n/a` when fewer than the
   required pace samples have completed in the recent window.
 
+### Changed (model defaults)
+
+- **Per-agent model defaults retuned by role**. The plugin agent
+  `.md` frontmatter `model:` lines were flipped from a uniform
+  `sonnet` to a role-aware split: `executor` stays on `sonnet`
+  (writes code under TDD; fast happy-path); the five judges
+  (`code-reviewer`, `test-reviewer`, `doc-reviewer`, `changes-manifest`,
+  `security-reviewer`) and the three workflow-reasoning agents
+  (`blocker-resolver`, `manifest-amender`, `task-factory`) move to
+  `opus` (a bad verdict / proposal / amendment decision costs more
+  than the inference savings and these agents fire only after a task
+  finishes or on the unhappy paths, so cost is bounded);
+  `review-supervisor` stays on `haiku` (pure fan-out coordinator).
+  All eight upgraded agents pick up the new default automatically;
+  operators with opus-budget pressure can pin individual agents back
+  to `sonnet` via the `agents:` block (ADR-25). `sample-config.yaml`,
+  `docs/zero-to-ready.md`, `docs/cli-reference.md`,
+  `docs/llm-authentication.md`, `docs/adr/25-per-agent-model-overrides.md`,
+  and `tests/test_plugin_shadow.py`'s synthetic fixture updated to
+  reflect the new defaults.
+
 ### Removed
 
 - **Dead `judge_model` / `executor_model` YAML fields** removed from

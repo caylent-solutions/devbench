@@ -183,21 +183,21 @@ Ensure `JUDGE_BEDROCK_REGION` matches the region where you have Bedrock model ac
 
 DevBench's ten work agents (executor, blocker-resolver, manifest-amender, security-reviewer, task-factory, review-supervisor, plus the four review_team judges) each declare a default model in their `.md` frontmatter. Operators whose per-model quota is uneven -- e.g. opus tokens left, sonnet exhausted, or vice versa -- can retarget any subset of agents to a different model without editing the canonical plugin. See [ADR-25](adr/25-per-agent-model-overrides.md) for the architectural details.
 
-Add an `agents:` block to `backlog/config/devbench.yaml`. The shape below pins each agent to its **current frontmatter default** (nine agents on `sonnet`, `review_supervisor` on `haiku`) -- it is a no-op as written; flip individual fields when you need to retarget:
+Add an `agents:` block to `backlog/config/devbench.yaml`. The shape below pins each agent to its **current frontmatter default**: `executor` on `sonnet` (writes code under TDD; fast happy path); the five judges plus the three workflow-reasoning agents (`blocker_resolver`, `manifest_amender`, `task_factory`) on `opus` (judgment work where wrong calls cost more than inference); `review_supervisor` on `haiku` (pure fan-out coordinator). The block as written is a no-op; flip individual fields when you need to retarget (e.g., drop the judges to `sonnet` when opus quota is exhausted):
 
 ```yaml
 agents:
   executor: sonnet
-  blocker_resolver: sonnet
-  manifest_amender: sonnet
-  security_reviewer: sonnet
-  task_factory: sonnet
+  blocker_resolver: opus
+  manifest_amender: opus
+  security_reviewer: opus
+  task_factory: opus
   review_supervisor: haiku
   review_team:
-    code_reviewer: sonnet
-    test_reviewer: sonnet
-    doc_reviewer: sonnet
-    changes_manifest: sonnet
+    code_reviewer: opus
+    test_reviewer: opus
+    doc_reviewer: opus
+    changes_manifest: opus
 ```
 
 Every field defaults to `null` when absent (the agent runs on its frontmatter model). The values must match your authentication channel:

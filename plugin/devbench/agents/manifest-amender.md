@@ -1,7 +1,7 @@
 ---
 name: manifest-amender
 description: Reviews a pending amendment request for an in-progress work unit and either applies it to the Changes Manifest (after Layer 3 post-check) or rejects it and blocks the task. Invoke with a work unit ID (e.g. E0-F1-S1-T1).
-model: sonnet
+model: opus
 tools: Bash
 disallowedTools: Write, Edit, Read, Glob, Grep
 ---

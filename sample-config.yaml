@@ -290,22 +290,35 @@ validate:
 #   docs/adr/25-per-agent-model-overrides.md
 #   docs/llm-authentication.md#per-agent-model-overrides-quota-management
 # ---------------------------------------------------------------------------
-# Each field below is set to the agent's current .md frontmatter default
-# (nine agents on sonnet, review_supervisor on haiku). Uncomment + edit
-# individual fields to retarget; absent fields stay at their frontmatter
-# default. Writing the same value as the frontmatter default is a no-op.
+# Each field below is set to the agent's current .md frontmatter default.
+# The defaults are tuned by the role each agent plays:
+#   - executor (writes code under TDD): sonnet -- keeps the happy-path
+#     loop fast.
+#   - All five judges (code-reviewer, test-reviewer, doc-reviewer,
+#     changes-manifest, security-reviewer): opus -- a bad verdict costs
+#     more than the inference savings; judges fire only after the
+#     executor finishes a task.
+#   - blocker-resolver, manifest-amender, task-factory (workflow /
+#     recovery reasoning): opus -- judgment-heavy and fire only on the
+#     unhappy paths, so cost is bounded.
+#   - review-supervisor: haiku -- pure fan-out coordinator (spawns the
+#     five judges in parallel and merges their JSON verdicts); opus here
+#     would be waste.
+# Uncomment + edit individual fields to retarget; absent fields stay at
+# their frontmatter default. Writing the same value as the frontmatter
+# default is a no-op.
 # agents:
 #   executor: sonnet
-#   blocker_resolver: sonnet
-#   manifest_amender: sonnet
-#   security_reviewer: sonnet
-#   task_factory: sonnet
+#   blocker_resolver: opus
+#   manifest_amender: opus
+#   security_reviewer: opus
+#   task_factory: opus
 #   review_supervisor: haiku
 #   review_team:
-#     code_reviewer: sonnet
-#     test_reviewer: sonnet
-#     doc_reviewer: sonnet
-#     changes_manifest: sonnet
+#     code_reviewer: opus
+#     test_reviewer: opus
+#     doc_reviewer: opus
+#     changes_manifest: opus
 
 # ---------------------------------------------------------------------------
 # Diagnostic-tuning knobs (set only when investigating a specific cadence

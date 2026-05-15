@@ -373,21 +373,21 @@ claude --plugin-dir "$(uv run devbench prepare-plugin-shadow)"
 
 When the workspace has no `agents:` overrides configured, prints the canonical plugin path; otherwise rewrites every overridden agent `.md` and symlinks the rest. Shares its implementation with `start`'s pre-flight so the two modes always produce identical plugin trees.
 
-The YAML schema for the override block is shown below with each field set to the **current frontmatter default** (nine agents on `sonnet`, `review_supervisor` on `haiku`). Setting a field to its frontmatter default value is a no-op; populate the block with these values as a starting point and change individual fields when you need to retarget an agent:
+The YAML schema for the override block is shown below with each field set to the **current frontmatter default**. The defaults are tuned by the role each agent plays: `executor` (writes code under TDD) on `sonnet` for a fast happy path; the five judges (`code-reviewer`, `test-reviewer`, `doc-reviewer`, `changes-manifest`, `security-reviewer`) on `opus` because a bad verdict costs more than the inference savings; `blocker-resolver`, `manifest-amender`, `task-factory` on `opus` because they fire only on unhappy paths and a wrong call spins the recovery cascade; `review-supervisor` on `haiku` because it is a pure fan-out coordinator. Setting a field to its frontmatter default value is a no-op; flip individual fields when you need to retarget an agent (e.g., drop the judges to `sonnet` when opus quota is exhausted):
 
 ```yaml
 agents:
   executor: sonnet
-  blocker_resolver: sonnet
-  manifest_amender: sonnet
-  security_reviewer: sonnet
-  task_factory: sonnet
+  blocker_resolver: opus
+  manifest_amender: opus
+  security_reviewer: opus
+  task_factory: opus
   review_supervisor: haiku
   review_team:
-    code_reviewer: sonnet
-    test_reviewer: sonnet
-    doc_reviewer: sonnet
-    changes_manifest: sonnet
+    code_reviewer: opus
+    test_reviewer: opus
+    doc_reviewer: opus
+    changes_manifest: opus
 ```
 
 Every field defaults to `null` when absent (use the agent's `.md` frontmatter model). When `use_bedrock: true`, every value must be a Bedrock ARN (`us.anthropic.claude-<name>-<ver>-v<N>`); when `false`, values must be a short name (`opus`/`sonnet`/`haiku`) or an Anthropic API id (`claude-opus-4-7`). `JUDGE_AGENT_MODEL_<NAME>` env vars (e.g. `JUDGE_AGENT_MODEL_EXECUTOR=opus`, `JUDGE_AGENT_MODEL_CODE_REVIEWER=opus`) override the YAML on a per-call basis (env > yaml > frontmatter).

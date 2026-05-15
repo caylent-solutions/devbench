@@ -2666,6 +2666,8 @@ class TestRecoveryBodyRegex:
         [
             pytest.param("amendment-reject", id="kebab-case-base"),
             pytest.param("Amendment-reject", id="kebab-case-capitalised"),
+            pytest.param("AMENDMENT-REJECT", id="kebab-case-upper"),
+            pytest.param("amendment-rejected", id="kebab-case-past-tense"),
             pytest.param("amendment reject", id="space-separated"),
             pytest.param("amendment rejected", id="english-past-tense"),
             pytest.param("Amendment rejected", id="english-capitalised-past-tense"),
@@ -2675,14 +2677,20 @@ class TestRecoveryBodyRegex:
                 id="auto-requeue-full-phrase",
             ),
             pytest.param("will auto-requeue when", id="auto-requeue-bare"),
+            pytest.param(
+                "[BLOCKED] will auto-requeue when dep X clears",
+                id="auto-requeue-in-blocked-audit",
+            ),
             pytest.param("out-of-scope", id="out-of-scope"),
             pytest.param("Out-Of-Scope", id="out-of-scope-title-case"),
             pytest.param("ALL_REVIEWS_FAILED", id="all-reviews-failed"),
             pytest.param("REVIEW_REJECTED", id="review-rejected"),
-            pytest.param("dependency E0-T1 not yet terminal", id="dependency-not-terminal"),
+            pytest.param(
+                "dependency E0-T1 not yet terminal",
+                id="dependency-not-terminal",
+            ),
             pytest.param("dep E0-T1 not yet terminal", id="dep-short-form"),
         ],
-        ids=lambda v: "",
     )
     def test_positive_match(self, body: str) -> None:
         from devbench.backlog.proposal import _RECOVERY_BODY_RE
@@ -2693,12 +2701,19 @@ class TestRecoveryBodyRegex:
         "body",
         [
             pytest.param("unrelated [BLOCKED] reason", id="unrelated-blocked"),
+            pytest.param(
+                "not in any recovery scenario",
+                id="no-recovery-keywords",
+            ),
             pytest.param("task is stuck on an unknown issue", id="generic-stuck"),
             pytest.param("amend this code", id="partial-amend-no-match"),
-            pytest.param("rejected by the operator", id="rejected-but-not-amendment"),
+            pytest.param(
+                "rejected by the operator",
+                id="rejected-but-not-amendment",
+            ),
             pytest.param("auto-requeue", id="auto-requeue-without-will-when"),
+            pytest.param("amendment", id="amendment-bare-no-reject"),
         ],
-        ids=lambda v: "",
     )
     def test_negative_no_match(self, body: str) -> None:
         from devbench.backlog.proposal import _RECOVERY_BODY_RE

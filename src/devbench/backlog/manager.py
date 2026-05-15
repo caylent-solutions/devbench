@@ -38,6 +38,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import ClassVar
 
+from devbench.backlog.work_unit import WorkUnitType
 from devbench.constants import (
     ALL_REQUIRED_JUDGE_NAMES,
     BACKLOG_INDEX_CELL_COUNT,
@@ -53,6 +54,7 @@ from devbench.constants import (
     STATUS_BLOCKED,
     STATUS_DECLINED,
     STATUS_DONE,
+    STATUS_DRAFT,
     STATUS_HOLD,
     STATUS_IN_PROGRESS,
     STATUS_IN_QUEUE,
@@ -2025,6 +2027,11 @@ class BacklogManager:
         values at write time, but a hand-edited file can drift; this
         check catches the drift at validate-backlog time so the
         orchestrator never sees a bad status mid-run.
+
+        Additionally enforces that ``draft`` is only permitted for Task-level
+        work units (i.e. IDs containing a ``-T<digits>`` segment).  Epics,
+        Features, and Stories are managed by automatic rollup logic and must
+        never carry a ``draft`` status.
         """
         for row_id, _, file_path_str in rows:
             if not row_id or row_id.startswith("-"):
@@ -2044,6 +2051,13 @@ class BacklogManager:
             if raw_status not in VALID_STATUSES:
                 errors.append(
                     f"{row_id}: invalid '## Status:' value {raw_status!r}. Allowed values: {sorted(VALID_STATUSES)}."
+                )
+                continue
+            if raw_status == STATUS_DRAFT and not self._is_task_id(row_id):
+                unit_type = self._unit_type_label(row_id)
+                errors.append(
+                    f'{row_id}: Status "{STATUS_DRAFT}" is only valid for Task work units;'
+                    f" {row_id} is type {unit_type}."
                 )
 
     def _check_dep_id_format(
@@ -2488,6 +2502,41 @@ class BacklogManager:
         """Return True if the ID represents a task (contains -T followed by digits)."""
         parts = unit_id.split("-")
         return any(p.startswith("T") and p[1:].isdigit() for p in parts)
+
+    @staticmethod
+    def _unit_type_label(unit_id: str) -> str:
+        """Return the hierarchy level label for a work-unit ID.
+
+        Derives the label purely from ID structure:
+        - ``E<n>``               -> ``"Epic"``
+        - ``E<n>-F<n>``          -> ``"Feature"``
+        - ``E<n>-F<n>-S<n>``     -> ``"Story"``
+        - ``E<n>-F<n>-S<n>-T<n>`` -> ``"Task"``
+
+        Args:
+            unit_id: A canonical work-unit identifier such as ``"E1-F2-S3-T4"``.
+
+        Returns:
+            One of ``"Epic"``, ``"Feature"``, ``"Story"``, or ``"Task"``
+            (the corresponding ``WorkUnitType`` enum value).
+
+        Raises:
+            ValueError: If ``unit_id`` does not match any recognised hierarchy
+                shape (E<n>, E<n>-F<n>, E<n>-F<n>-S<n>, or E<n>-F<n>-S<n>-T<n>).
+        """
+        if BacklogManager._is_task_id(unit_id):
+            return WorkUnitType.TASK.value
+        parts = unit_id.split("-")
+        if any(p.startswith("S") and p[1:].isdigit() for p in parts):
+            return WorkUnitType.STORY.value
+        if any(p.startswith("F") and p[1:].isdigit() for p in parts):
+            return WorkUnitType.FEATURE.value
+        if len(parts) == 1 and parts[0].startswith("E"):
+            return WorkUnitType.EPIC.value
+        raise ValueError(
+            f"Unrecognized work-unit ID shape: {unit_id!r}. "
+            "Expected one of: E<n>, E<n>-F<n>, E<n>-F<n>-S<n>, E<n>-F<n>-S<n>-T<n>."
+        )
 
     @staticmethod
     def _extract_sections(content: str) -> dict[str, str]:

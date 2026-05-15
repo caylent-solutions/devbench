@@ -39,6 +39,12 @@ since the last release. PR #119 carries every change.
   enum value placed before `IN_QUEUE` in lifecycle order. Allows work
   units to be authored and held in `draft` state before entering the
   active queue. Full parser and CLI support follows in sibling tasks.
+- **`validate-backlog` enforces Task-only draft status** (E1-F2-S2, issue #189, AC-189-10).
+  `BacklogManager._check_status_enum` now rejects `draft` as a status for
+  Epic, Feature, and Story work units with an explicit error message:
+  `<id>: Status "draft" is only valid for Task work units; <id> is type <Epic|Feature|Story>.`
+  Task-level work units (IDs containing `-T<digits>`) continue to accept `draft`
+  without error (AC-189-2).
 - **`BacklogConfig` dataclass + `backlog.default_status_for_new_work_units` config key** (E1-F5, issue #189, AC-189-8/9).
   New `BacklogConfig` frozen dataclass in `config_loader.py` with field
   `default_status_for_new_work_units` (accepted values: `'draft'` or

@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pytest
 
 from devbench.backlog.manager import BacklogManager
+from devbench.backlog.work_unit import WorkUnitType
 from devbench.config_loader import RepoConfig, RuntimeConfig, ValidateConfig
 from devbench.constants import (
     ALL_REQUIRED_JUDGE_NAMES,
@@ -3523,6 +3524,84 @@ class TestValidateStatusEnum:
         errors = BacklogManager().validate(idx, tmp_path)
         assert not any("invalid '## Status:'" in e for e in errors)
 
+    def test_draft_status_accepted_for_task(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """AC-189-2: draft is a valid status for Task work units."""
+        _ValidateRuleHarness.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `f.py` | new |\n| `tests/unit/test_f.py` | new |\n",
+            status=STATUS_DRAFT,
+        )
+        idx = _ValidateRuleHarness.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | draft | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        assert not any(STATUS_DRAFT in e and "EX-F1-S1-T1" in e for e in errors), (
+            f"Task with draft status should not produce an error; got: {errors}"
+        )
+
+    @pytest.mark.parametrize(
+        "unit_id,unit_type,index_row",
+        [
+            (
+                "EX",
+                WorkUnitType.EPIC.value,
+                "| EX | An Epic | Epic | draft | none | ex/foo | `backlog/EX.md` |\n",
+            ),
+            (
+                "EX-F1",
+                WorkUnitType.FEATURE.value,
+                "| EX-F1 | A Feature | Feature | draft | none | ex/foo | `backlog/EX-F1.md` |\n",
+            ),
+            (
+                "EX-F1-S1",
+                WorkUnitType.STORY.value,
+                "| EX-F1-S1 | A Story | Story | draft | none | ex/foo | `backlog/EX-F1-S1.md` |\n",
+            ),
+        ],
+    )
+    def test_draft_status_rejected_for_non_task(
+        self,
+        tmp_path: Path,
+        backlog_dir: Path,
+        unit_id: str,
+        unit_type: str,
+        index_row: str,
+    ) -> None:
+        """AC-189-10: draft status is rejected for Epic, Feature, and Story work units."""
+        wu = backlog_dir / f"{unit_id}.md"
+        wu.write_text(
+            f"# {unit_id}\n\n## Status: draft\n\n## Description\n\nSummary.\n",
+            encoding="utf-8",
+        )
+        idx = _ValidateRuleHarness.make_index(tmp_path, index_row)
+        errors = BacklogManager().validate(idx, tmp_path)
+        assert any(
+            f'Status "{STATUS_DRAFT}" is only valid for Task work units' in e and unit_id in e and unit_type in e
+            for e in errors
+        ), f"Expected draft-for-non-task error for {unit_id} ({unit_type}); got: {errors}"
+
+    def test_draft_rejected_for_epic_error_message_format(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """AC-189-10: error message for draft Epic names the type explicitly."""
+        wu = backlog_dir / "EX.md"
+        wu.write_text(
+            "# EX\n\n## Status: draft\n\n## Description\n\nEpic summary.\n",
+            encoding="utf-8",
+        )
+        idx = _ValidateRuleHarness.make_index(
+            tmp_path,
+            "| EX | An Epic | Epic | draft | none | ex/foo | `backlog/EX.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        matching = [e for e in errors if "EX" in e and STATUS_DRAFT in e]
+        assert matching, f"Expected at least one error mentioning EX and {STATUS_DRAFT!r}; got: {errors}"
+        expected_msg = (
+            f'EX: Status "{STATUS_DRAFT}" is only valid for Task work units; EX is type {WorkUnitType.EPIC.value}.'
+        )
+        assert any(e == expected_msg for e in matching), f"Error message format mismatch; got: {matching}"
+
 
 class TestValidateDepIdFormat:
     """E209: dep-row IDs in '## Dependencies' must match the canonical regex."""
@@ -5122,3 +5201,35 @@ class TestSetStatusAcceptsDraft:
         wu_text = wu_file.read_text(encoding="utf-8")
         assert "- [ ] AC-001: some criterion" in wu_text, "draft transition must leave AC checkboxes unchecked"
         assert "- [ ] All done." in wu_text, "draft transition must leave DoD checkboxes unchecked"
+
+
+class TestUnitTypeLabel:
+    """Unit tests for BacklogManager._unit_type_label static method."""
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "unit_id,expected_label",
+        [
+            ("EX-F1-S1-T1", WorkUnitType.TASK.value),
+            ("EX-F1-S1", WorkUnitType.STORY.value),
+            ("EX-F1", WorkUnitType.FEATURE.value),
+            ("EX", WorkUnitType.EPIC.value),
+        ],
+    )
+    def test_unit_type_label_returns_correct_label(self, unit_id: str, expected_label: str) -> None:
+        """_unit_type_label derives the hierarchy level from the ID structure."""
+        assert BacklogManager._unit_type_label(unit_id) == expected_label, (
+            f"Expected _unit_type_label({unit_id!r}) == {expected_label!r}"
+        )
+
+    @pytest.mark.unit
+    def test_unit_type_label_task_delegates_to_is_task_id(self) -> None:
+        """_unit_type_label('EX-F1-S1-T1') returns WorkUnitType.TASK.value via _is_task_id delegation."""
+        result = BacklogManager._unit_type_label("EX-F1-S1-T1")
+        assert result == WorkUnitType.TASK.value, f"Expected {WorkUnitType.TASK.value!r}, got {result!r}"
+
+    @pytest.mark.unit
+    def test_unit_type_label_raises_for_unrecognized_id(self) -> None:
+        """_unit_type_label raises ValueError for an ID that does not match any known hierarchy shape."""
+        with pytest.raises(ValueError, match="Unrecognized work-unit ID shape"):
+            BacklogManager._unit_type_label("MALFORMED-X99")

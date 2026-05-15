@@ -3201,3 +3201,174 @@ class TestLoadCheckpointTimezoneNaiveDatetime:
         assert cp is not None
         assert cp.paused_at.tzinfo is not None
         assert cp.paused_at == datetime(2026, 3, 1, 10, 0, 0, tzinfo=UTC)
+
+
+# ---------------------------------------------------------------------------
+# save_checkpoint: input validation -- fail-fast on invalid arguments
+# ---------------------------------------------------------------------------
+
+
+class TestSaveCheckpointInputValidation:
+    """save_checkpoint raises ValueError on invalid inputs before any I/O."""
+
+    _NOW = datetime(2026, 3, 1, 10, 0, 0, tzinfo=UTC)
+
+    @pytest.mark.parametrize("bad_reason", ["", "   "])
+    def test_rejects_empty_reason(self, tmp_path: Path, bad_reason: str) -> None:
+        """save_checkpoint raises ValueError when reason is empty or whitespace-only."""
+        with pytest.raises(ValueError, match="reason"):
+            save_checkpoint(
+                session_dir=tmp_path,
+                paused_at=self._NOW,
+                reset_at=None,
+                reason=bad_reason,
+                raw_error="429",
+                in_flight_wu=None,
+                in_flight_phase=None,
+                completed_judges=[],
+                pending_judges=[],
+                stage_artefacts={},
+            )
+
+    @pytest.mark.parametrize("bad_raw", ["", "   "])
+    def test_rejects_empty_raw_error(self, tmp_path: Path, bad_raw: str) -> None:
+        """save_checkpoint raises ValueError when raw_error is empty or whitespace-only."""
+        with pytest.raises(ValueError, match="raw_error"):
+            save_checkpoint(
+                session_dir=tmp_path,
+                paused_at=self._NOW,
+                reset_at=None,
+                reason="subscription_rate_limit",
+                raw_error=bad_raw,
+                in_flight_wu=None,
+                in_flight_phase=None,
+                completed_judges=[],
+                pending_judges=[],
+                stage_artefacts={},
+            )
+
+    def test_rejects_naive_paused_at(self, tmp_path: Path) -> None:
+        """save_checkpoint raises ValueError when paused_at has no timezone info."""
+        naive_dt = datetime.fromisoformat("2026-03-01T10:00:00")
+        with pytest.raises(ValueError, match="paused_at"):
+            save_checkpoint(
+                session_dir=tmp_path,
+                paused_at=naive_dt,
+                reset_at=None,
+                reason="subscription_rate_limit",
+                raw_error="429",
+                in_flight_wu=None,
+                in_flight_phase=None,
+                completed_judges=[],
+                pending_judges=[],
+                stage_artefacts={},
+            )
+
+    def test_rejects_naive_reset_at(self, tmp_path: Path) -> None:
+        """save_checkpoint raises ValueError when reset_at is provided but has no timezone info."""
+        naive_reset = datetime.fromisoformat("2026-03-01T15:00:00")
+        with pytest.raises(ValueError, match="reset_at"):
+            save_checkpoint(
+                session_dir=tmp_path,
+                paused_at=self._NOW,
+                reset_at=naive_reset,
+                reason="subscription_rate_limit",
+                raw_error="429",
+                in_flight_wu=None,
+                in_flight_phase=None,
+                completed_judges=[],
+                pending_judges=[],
+                stage_artefacts={},
+            )
+
+    def test_no_file_written_on_validation_failure(self, tmp_path: Path) -> None:
+        """When input validation fails, no file or directory is created."""
+        with pytest.raises(ValueError):
+            save_checkpoint(
+                session_dir=tmp_path,
+                paused_at=self._NOW,
+                reset_at=None,
+                reason="",
+                raw_error="429",
+                in_flight_wu=None,
+                in_flight_phase=None,
+                completed_judges=[],
+                pending_judges=[],
+                stage_artefacts={},
+            )
+        assert not (tmp_path / ".devbench").exists()
+
+    def test_accepts_valid_timezone_aware_paused_at(self, tmp_path: Path) -> None:
+        """save_checkpoint succeeds with a valid timezone-aware paused_at."""
+        save_checkpoint(
+            session_dir=tmp_path,
+            paused_at=self._NOW,
+            reset_at=None,
+            reason="subscription_rate_limit",
+            raw_error="429",
+            in_flight_wu=None,
+            in_flight_phase=None,
+            completed_judges=[],
+            pending_judges=[],
+            stage_artefacts={},
+        )
+        assert (tmp_path / ".devbench" / "quota_pause.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# load_checkpoint: type validation for list and dict fields
+# ---------------------------------------------------------------------------
+
+
+class TestLoadCheckpointFieldTypeValidation:
+    """load_checkpoint raises ValueError when list/dict fields have wrong JSON types."""
+
+    def _write_raw(self, tmp_path: Path, data: dict[str, object]) -> None:
+        devbench_dir = tmp_path / ".devbench"
+        devbench_dir.mkdir(parents=True, exist_ok=True)
+        (devbench_dir / "quota_pause.json").write_text(json.dumps(data))
+
+    def _valid_data(self, **overrides: object) -> dict[str, object]:
+        base: dict[str, object] = {
+            "paused_at": "2026-03-01T10:00:00+00:00",
+            "reset_at": None,
+            "reason": "subscription_rate_limit",
+            "raw_error": "429",
+            "in_flight_wu": None,
+            "in_flight_phase": None,
+            "completed_judges": [],
+            "pending_judges": [],
+            "stage_artefacts": {},
+        }
+        base.update(overrides)
+        return base
+
+    def test_raises_when_completed_judges_is_string(self, tmp_path: Path) -> None:
+        """load_checkpoint raises ValueError when completed_judges is a string instead of a list."""
+        self._write_raw(tmp_path, self._valid_data(completed_judges="code_review"))
+        with pytest.raises(ValueError, match="completed_judges"):
+            load_checkpoint(session_dir=tmp_path)
+
+    def test_raises_when_pending_judges_is_string(self, tmp_path: Path) -> None:
+        """load_checkpoint raises ValueError when pending_judges is a string instead of a list."""
+        self._write_raw(tmp_path, self._valid_data(pending_judges="test_review"))
+        with pytest.raises(ValueError, match="pending_judges"):
+            load_checkpoint(session_dir=tmp_path)
+
+    def test_raises_when_stage_artefacts_is_list(self, tmp_path: Path) -> None:
+        """load_checkpoint raises ValueError when stage_artefacts is a list instead of a dict."""
+        self._write_raw(tmp_path, self._valid_data(stage_artefacts=["branch", "main"]))
+        with pytest.raises(ValueError, match="stage_artefacts"):
+            load_checkpoint(session_dir=tmp_path)
+
+    def test_raises_when_reason_is_not_string(self, tmp_path: Path) -> None:
+        """load_checkpoint raises ValueError when reason is an integer instead of a string."""
+        self._write_raw(tmp_path, self._valid_data(reason=429))
+        with pytest.raises(ValueError, match="reason"):
+            load_checkpoint(session_dir=tmp_path)
+
+    def test_raises_when_raw_error_is_not_string(self, tmp_path: Path) -> None:
+        """load_checkpoint raises ValueError when raw_error is a dict instead of a string."""
+        self._write_raw(tmp_path, self._valid_data(raw_error={"error": "quota"}))
+        with pytest.raises(ValueError, match="raw_error"):
+            load_checkpoint(session_dir=tmp_path)

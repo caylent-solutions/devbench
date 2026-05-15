@@ -789,9 +789,31 @@ def save_checkpoint(
         stage_artefacts: Dict of additional artefacts for the resume protocol.
 
     Raises:
+        ValueError: When *reason* or *raw_error* is empty or whitespace-only,
+            or when *paused_at* (or *reset_at*, when provided) lacks timezone
+            info.  Raised before any file I/O (fail-fast).
         OSError: When the directory cannot be created or the file cannot be
             written (e.g. permission denied, disk full).
     """
+    if not reason or not reason.strip():
+        msg = f"reason must be a non-empty string, got {reason!r}"
+        raise ValueError(msg)
+    if not raw_error or not raw_error.strip():
+        msg = f"raw_error must be a non-empty string, got {raw_error!r}"
+        raise ValueError(msg)
+    if paused_at.tzinfo is None:
+        msg = (
+            f"paused_at must be timezone-aware (got naive datetime {paused_at!r}); "
+            "pass a UTC-aware datetime to avoid ambiguous timestamps in quota_pause.json"
+        )
+        raise ValueError(msg)
+    if reset_at is not None and reset_at.tzinfo is None:
+        msg = (
+            f"reset_at must be timezone-aware when provided (got naive datetime {reset_at!r}); "
+            "pass a UTC-aware datetime or None"
+        )
+        raise ValueError(msg)
+
     devbench_dir = session_dir / QUOTA_DEVBENCH_SUBDIR
     devbench_dir.mkdir(parents=True, exist_ok=True)
 
@@ -882,6 +904,17 @@ def load_checkpoint(session_dir: Path) -> QuotaCheckpoint | None:
     reset_at_raw = data.get("reset_at")
     reset_at = _parse_checkpoint_dt(reset_at_raw, "reset_at", target) if reset_at_raw is not None else None
 
+    # Validate string fields.
+    _require_string(data, "reason", target)
+    _require_string(data, "raw_error", target)
+
+    # Validate list fields.
+    _require_list(data, "completed_judges", target)
+    _require_list(data, "pending_judges", target)
+
+    # Validate dict field.
+    _require_dict(data, "stage_artefacts", target)
+
     return QuotaCheckpoint(
         paused_at=paused_at,
         reset_at=reset_at,
@@ -898,6 +931,54 @@ def load_checkpoint(session_dir: Path) -> QuotaCheckpoint | None:
 # ---------------------------------------------------------------------------
 # Checkpoint deserialization helpers (private)
 # ---------------------------------------------------------------------------
+
+
+def _require_string(data: dict[str, object], key: str, path: Path) -> None:
+    """Raise :exc:`ValueError` when *data[key]* is not a string.
+
+    Args:
+        data: The deserialized JSON dict.
+        key: The field name that must be a string.
+        path: The file path, used in the error message.
+
+    Raises:
+        ValueError: When *data[key]* is not a ``str``.
+    """
+    value = data[key]
+    if not isinstance(value, str):
+        raise ValueError(f"quota_pause.json at {path}: field {key!r} must be a string; got {type(value).__name__!r}.")
+
+
+def _require_list(data: dict[str, object], key: str, path: Path) -> None:
+    """Raise :exc:`ValueError` when *data[key]* is not a list.
+
+    Args:
+        data: The deserialized JSON dict.
+        key: The field name that must be a list.
+        path: The file path, used in the error message.
+
+    Raises:
+        ValueError: When *data[key]* is not a ``list``.
+    """
+    value = data[key]
+    if not isinstance(value, list):
+        raise ValueError(f"quota_pause.json at {path}: field {key!r} must be a list; got {type(value).__name__!r}.")
+
+
+def _require_dict(data: dict[str, object], key: str, path: Path) -> None:
+    """Raise :exc:`ValueError` when *data[key]* is not a dict.
+
+    Args:
+        data: The deserialized JSON dict.
+        key: The field name that must be a dict.
+        path: The file path, used in the error message.
+
+    Raises:
+        ValueError: When *data[key]* is not a ``dict``.
+    """
+    value = data[key]
+    if not isinstance(value, dict):
+        raise ValueError(f"quota_pause.json at {path}: field {key!r} must be a dict; got {type(value).__name__!r}.")
 
 
 def _require_key(data: dict[str, object], key: str, path: Path) -> None:

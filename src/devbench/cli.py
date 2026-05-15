@@ -177,6 +177,7 @@ from devbench.plugin_shadow import materialise_shadow_plugin
 # orchestrator-alive banner. Single source of truth lives in report.py because
 # the banner is implemented there and reporting must not depend on cli.py.
 from devbench.reporting.report import _format_duration
+from devbench.scope import _expand_prefix
 from devbench.utils.process import run_command
 
 __all__ = ["_format_duration"]
@@ -1372,20 +1373,74 @@ def cmd_unhold(*argv: str) -> int:
     return 0
 
 
-def cmd_promote(unit_id: str) -> int:
-    """Transition a single work unit from ``draft`` to ``in-queue``.
+def cmd_promote(*argv: str) -> int:
+    """Transition one or more work units from ``draft`` to ``in-queue``.
 
-    Refuses to promote any unit whose current status is not ``draft``
-    (returns rc=1 with a clear error on stderr). On success, appends a
-    ``[PROMOTED] draft -> in-queue`` audit comment via
-    ``BacklogManager._append_agent_comment``.
+    Supported invocations::
+
+        devbench promote <id>
+            Promote a single work unit identified by ``<id>``.
+
+        devbench promote --epic <id>
+            Promote every ``draft``-status descendant of the given epic in one
+            atomic transaction.  Aborts with rc=1 if any descendant is not in
+            ``draft`` status -- no partial writes occur.
+
+        devbench promote --feature <id>
+            Promote every ``draft``-status descendant of the given feature in
+            one atomic transaction.
+
+        devbench promote --story <id>
+            Promote every ``draft``-status descendant of the given story in one
+            atomic transaction.
+
+    For every promoted unit an audit comment ``[PROMOTED] draft -> in-queue``
+    is appended via ``BacklogManager._append_agent_comment``.
+
+    Args:
+        *argv: Parsed CLI tokens -- either ``(<id>,)`` or
+            ``("--epic"|"--feature"|"--story", <scope_id>)``.
+
+    Returns:
+        0 on success, 1 on any error (unit not found, file missing,
+        status is not draft, unknown flag).
+
+    Raises:
+        Nothing -- all errors are reported to stderr and return rc=1.
+    """
+    bulk_flags = frozenset({"--epic", "--feature", "--story"})
+
+    if len(argv) == 1 and argv[0] not in bulk_flags:
+        return _promote_single(argv[0])
+
+    if len(argv) == 2 and argv[0] in bulk_flags:
+        return _promote_bulk(scope_id=argv[1])
+
+    if len(argv) == 1 and argv[0] in bulk_flags:
+        print(
+            f"ERROR: '{argv[0]}' requires a scope ID argument (e.g. promote {argv[0]} E1)",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(
+        "ERROR: promote usage: promote <id>  OR  promote --epic|--feature|--story <id>",
+        file=sys.stderr,
+    )
+    return 1
+
+
+def _promote_single(unit_id: str) -> int:
+    """Promote a single work unit from draft to in-queue.
 
     Args:
         unit_id: The work-unit identifier to promote.
 
     Returns:
-        0 on success, 1 on any error (unit not found, file missing,
-        status is not draft).
+        0 on success, 1 on any error.
+
+    Raises:
+        Nothing -- all errors reported to stderr and return rc=1.
     """
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     units = parser.parse_index()
@@ -1413,6 +1468,71 @@ def cmd_promote(unit_id: str) -> int:
 
     logger.info("Promoted %s from draft to in-queue", unit_id)
     print(f"Promoted {unit_id} from draft to in-queue")
+    return 0
+
+
+def _promote_bulk(scope_id: str) -> int:
+    """Promote every draft descendant of ``scope_id`` in one atomic transaction.
+
+    Enumerates all work units whose IDs are equal to or descended from
+    ``scope_id``.  The transaction aborts with rc=1 (no writes performed) if any
+    discovered descendant is not in ``draft`` status.
+
+    Args:
+        scope_id: The ancestor scope ID (epic, feature, or story prefix).
+
+    Returns:
+        0 when all draft descendants were promoted successfully, 1 on any error.
+
+    Raises:
+        Nothing -- all errors reported to stderr and return rc=1.
+    """
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+
+    all_ids = [u.id for u in units]
+    descendant_ids = _expand_prefix(scope_id, all_ids)
+    descendants = [u for u in units if u.id in descendant_ids]
+
+    draft_units = [u for u in descendants if u.status is WorkUnitStatus.DRAFT]
+    non_draft = [u for u in descendants if u.status is not WorkUnitStatus.DRAFT]
+
+    if non_draft:
+        for u in non_draft:
+            print(
+                f"ERROR: cannot promote {u.id!r}: not in 'draft' status (current: {u.status.value!r})",
+                file=sys.stderr,
+            )
+        print(
+            "ERROR: bulk promote aborted -- all descendants must be in 'draft' status",
+            file=sys.stderr,
+        )
+        return 1
+
+    if not draft_units:
+        print(
+            f"ERROR: no draft descendants found under scope '{scope_id}'",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Validate all files exist before writing anything (fail-fast, no partial writes)
+    resolved: list[tuple[WorkUnit, Path]] = []
+    for u in draft_units:
+        wu_file = _resolve_unit_file(u)
+        if wu_file is None:
+            print(f"ERROR: Work unit file not found for '{u.id}'", file=sys.stderr)
+            return 1
+        resolved.append((u, wu_file))
+
+    mgr = BacklogManager()
+    for u, wu_file in resolved:
+        mgr.force_status(wu_file, BACKLOG_INDEX, u.id, STATUS_IN_QUEUE)
+        mgr._append_agent_comment(wu_file, "orchestrator", "[PROMOTED] draft -> in-queue")
+        logger.info("Promoted %s from draft to in-queue", u.id)
+
+    count = len(resolved)
+    print(f"Promoted {count} unit(s) from draft to in-queue under scope '{scope_id}'")
     return 0
 
 
@@ -5861,7 +5981,14 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
             "unhold <id> --reason <message>. Refuses units not currently on hold."
         ),
     ),
-    "promote": (cmd_promote, 1, "Promote a draft work unit to in-queue: promote <id>"),
+    "promote": (
+        cmd_promote,
+        0,
+        (
+            "Promote draft work unit(s) to in-queue: promote <id>  OR  "
+            "promote --epic|--feature|--story <scope-id>  (bulk, atomic transaction)"
+        ),
+    ),
     "sync-blocked": (
         cmd_sync_blocked,
         0,
@@ -6073,6 +6200,8 @@ _VARIADIC_COMMANDS: frozenset[str] = frozenset(
         "rebuild-window-stats",
         # Issue #162 Phase 7: archive an ended session's log to Parquet (opt-in dep).
         "archive-session",
+        # Issue #189 E1-F4-S1-T2: bulk selectors --epic/--feature/--story
+        "promote",
     }
 )
 

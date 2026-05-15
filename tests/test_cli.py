@@ -5968,6 +5968,431 @@ class TestCmdPromoteIntegration:
         assert "in-queue" in index_content
 
 
+def _build_promote_backlog_fixture(
+    tmp_path: Path,
+    units: list[tuple[str, str]],
+) -> tuple[Path, Path]:
+    """Build a minimal backlog fixture for promote tests.
+
+    Creates a BACKLOG.md index and individual work-unit files under
+    ``tmp_path/backlog/`` from a list of (unit_id, status) pairs.
+
+    Args:
+        tmp_path: Pytest tmp_path fixture (or any writable directory).
+        units: List of (unit_id, status) pairs to materialise.
+
+    Returns:
+        Tuple of (backlog_md path, backlog_dir path).
+    """
+    backlog_dir = tmp_path / "backlog"
+    backlog_dir.mkdir(exist_ok=True)
+    rows = "\n".join(
+        f"| {uid} | Title {uid} | Task | {st} | None | caylent-solutions/git-repo | `backlog/{uid}.md` |"
+        for uid, st in units
+    )
+    backlog_md = tmp_path / "BACKLOG.md"
+    backlog_md.write_text(
+        "# Backlog\n\n## Full Work Unit Index\n\n"
+        "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+        "|----|-------|------|--------|--------------|------|-----------|\n"
+        f"{rows}\n"
+    )
+    for uid, st in units:
+        wu_file = backlog_dir / f"{uid}.md"
+        wu_file.write_text(f"# {uid}: Title {uid}\n\n## Status: {st}\n\n## Description\n\nFixture.\n\n## Comments\n")
+    return backlog_md, backlog_dir
+
+
+class TestCmdPromoteBulk:
+    """E1-F4-S1-T2: ``devbench promote --epic/--feature/--story <id>`` bulk selectors."""
+
+    # ------------------------------------------------------------------
+    # --epic selector
+    # ------------------------------------------------------------------
+
+    def test_epic_promotes_all_draft_descendants(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """--epic E1 promotes all draft-status tasks under E1 in one transaction."""
+        units = [
+            ("E1-F1-S1-T1", "draft"),
+            ("E1-F1-S1-T2", "draft"),
+            ("E1-F2-S1-T1", "draft"),
+            ("E2-F1-S1-T1", "draft"),  # different epic -- must not be promoted
+        ]
+        backlog_md, backlog_dir = _build_promote_backlog_fixture(tmp_path, units)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_promote("--epic", "E1")
+        assert rc == 0
+        # All E1 descendants promoted
+        for uid in ("E1-F1-S1-T1", "E1-F1-S1-T2", "E1-F2-S1-T1"):
+            content = (backlog_dir / f"{uid}.md").read_text()
+            assert "## Status: in-queue" in content, f"{uid} not promoted"
+            assert "[PROMOTED] draft -> in-queue" in content
+        # E2 task must remain draft
+        e2_content = (backlog_dir / "E2-F1-S1-T1.md").read_text()
+        assert "## Status: draft" in e2_content
+
+    def test_epic_no_draft_descendants_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """--epic with no draft descendants reports an error and returns 1."""
+        units = [("E1-F1-S1-T1", "in-queue")]
+        backlog_md, backlog_dir = _build_promote_backlog_fixture(tmp_path, units)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_promote("--epic", "E1")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "not in 'draft'" in err or "no draft" in err.lower()
+
+    def test_epic_unknown_scope_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """--epic with an ID that has no matching descendants returns 1."""
+        units = [("E1-F1-S1-T1", "draft")]
+        backlog_md, backlog_dir = _build_promote_backlog_fixture(tmp_path, units)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_promote("--epic", "E99")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "no draft" in err.lower()
+
+    def test_epic_mixed_statuses_aborts_transaction(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """--epic aborts with rc=1 if any descendant is not in draft status."""
+        units = [
+            ("E1-F1-S1-T1", "draft"),
+            ("E1-F1-S1-T2", "in-queue"),  # non-draft -- should abort
+        ]
+        backlog_md, backlog_dir = _build_promote_backlog_fixture(tmp_path, units)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_promote("--epic", "E1")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "not in 'draft'" in err
+        # No partial promotion -- T1 remains draft
+        t1_content = (backlog_dir / "E1-F1-S1-T1.md").read_text()
+        assert "## Status: draft" in t1_content
+
+    # ------------------------------------------------------------------
+    # --feature selector
+    # ------------------------------------------------------------------
+
+    def test_feature_promotes_all_draft_descendants(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """--feature E1-F2 promotes all draft tasks under E1-F2 only."""
+        units = [
+            ("E1-F1-S1-T1", "draft"),  # different feature -- must not be promoted
+            ("E1-F2-S1-T1", "draft"),
+            ("E1-F2-S1-T2", "draft"),
+        ]
+        backlog_md, backlog_dir = _build_promote_backlog_fixture(tmp_path, units)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_promote("--feature", "E1-F2")
+        assert rc == 0
+        for uid in ("E1-F2-S1-T1", "E1-F2-S1-T2"):
+            content = (backlog_dir / f"{uid}.md").read_text()
+            assert "## Status: in-queue" in content
+        # E1-F1 task must remain draft
+        f1_content = (backlog_dir / "E1-F1-S1-T1.md").read_text()
+        assert "## Status: draft" in f1_content
+
+    def test_feature_aborts_on_non_draft_descendant(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """--feature aborts if any descendant is not draft."""
+        units = [
+            ("E1-F2-S1-T1", "draft"),
+            ("E1-F2-S1-T2", "blocked"),
+        ]
+        backlog_md, backlog_dir = _build_promote_backlog_fixture(tmp_path, units)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_promote("--feature", "E1-F2")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "not in 'draft'" in err
+
+    # ------------------------------------------------------------------
+    # --story selector
+    # ------------------------------------------------------------------
+
+    def test_story_promotes_all_draft_descendants(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """--story E1-F1-S2 promotes all draft tasks under that story only."""
+        units = [
+            ("E1-F1-S1-T1", "draft"),  # sibling story -- must not be promoted
+            ("E1-F1-S2-T1", "draft"),
+            ("E1-F1-S2-T2", "draft"),
+        ]
+        backlog_md, backlog_dir = _build_promote_backlog_fixture(tmp_path, units)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_promote("--story", "E1-F1-S2")
+        assert rc == 0
+        for uid in ("E1-F1-S2-T1", "E1-F1-S2-T2"):
+            content = (backlog_dir / f"{uid}.md").read_text()
+            assert "## Status: in-queue" in content
+        # S1 task stays draft
+        s1_content = (backlog_dir / "E1-F1-S1-T1.md").read_text()
+        assert "## Status: draft" in s1_content
+
+    def test_story_aborts_on_non_draft_descendant(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """--story aborts if any descendant is not draft."""
+        units = [
+            ("E1-F1-S2-T1", "draft"),
+            ("E1-F1-S2-T2", "done"),
+        ]
+        backlog_md, backlog_dir = _build_promote_backlog_fixture(tmp_path, units)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_promote("--story", "E1-F1-S2")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "not in 'draft'" in err
+
+    # ------------------------------------------------------------------
+    # Missing second argument
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize("flag", ["--epic", "--feature", "--story"])
+    def test_missing_scope_id_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str], flag: str) -> None:
+        """Calling promote with a selector flag but no ID returns rc=1."""
+        units: list[tuple[str, str]] = []
+        backlog_md, backlog_dir = _build_promote_backlog_fixture(tmp_path, units)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_promote(flag)
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "requires" in err.lower() or "id" in err.lower()
+
+    # ------------------------------------------------------------------
+    # BACKLOG.md index updated in bulk transaction
+    # ------------------------------------------------------------------
+
+    def test_epic_updates_backlog_index_for_all_promoted(self, tmp_path: Path) -> None:
+        """All promoted units have their BACKLOG.md index row updated."""
+        units = [
+            ("E1-F1-S1-T1", "draft"),
+            ("E1-F1-S1-T2", "draft"),
+        ]
+        backlog_md, backlog_dir = _build_promote_backlog_fixture(tmp_path, units)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_promote("--epic", "E1")
+        assert rc == 0
+        index = backlog_md.read_text()
+        # Both rows updated in index
+        for uid in ("E1-F1-S1-T1", "E1-F1-S1-T2"):
+            assert uid in index
+        # No draft rows remain
+        assert "| draft |" not in index
+
+    # ------------------------------------------------------------------
+    # promote is in _VARIADIC_COMMANDS
+    # ------------------------------------------------------------------
+
+    def test_promote_is_variadic(self) -> None:
+        """'promote' must be in _VARIADIC_COMMANDS so bulk flags are forwarded."""
+        assert "promote" in cli._VARIADIC_COMMANDS
+
+    # ------------------------------------------------------------------
+    # Output messages
+    # ------------------------------------------------------------------
+
+    def test_epic_prints_promoted_count(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """On success, --epic prints a summary line with the count of promoted units."""
+        units = [
+            ("E1-F1-S1-T1", "draft"),
+            ("E1-F1-S1-T2", "draft"),
+        ]
+        backlog_md, backlog_dir = _build_promote_backlog_fixture(tmp_path, units)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            cli.cmd_promote("--epic", "E1")
+        out = capsys.readouterr().out
+        assert "2" in out
+        assert "promoted" in out.lower()
+
+    # ------------------------------------------------------------------
+    # Invalid-usage fallback branch (else clause in cmd_promote)
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ("--epic", "E1", "extra"),  # too many arguments
+            ("--feature", "F1", "spurious"),  # too many arguments with --feature
+            ("--story", "S1", "x", "y"),  # even more args
+        ],
+    )
+    def test_too_many_args_returns_1_with_usage_error(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], argv: tuple[str, ...]
+    ) -> None:
+        """Passing extra positional args after the scope ID prints a usage error and rc=1."""
+        units: list[tuple[str, str]] = [("E1-F1-S1-T1", "draft")]
+        backlog_md, backlog_dir = _build_promote_backlog_fixture(tmp_path, units)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_promote(*argv)
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "usage" in err.lower() or "promote" in err.lower()
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ("--unknown", "E1"),  # unrecognised flag
+            ("--all-epics", "E1"),  # another unrecognised flag
+        ],
+    )
+    def test_unknown_flag_returns_1_with_usage_error(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], argv: tuple[str, ...]
+    ) -> None:
+        """Passing an unknown flag prints a usage error on stderr and returns rc=1."""
+        units: list[tuple[str, str]] = [("E1-F1-S1-T1", "draft")]
+        backlog_md, backlog_dir = _build_promote_backlog_fixture(tmp_path, units)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_promote(*argv)
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "usage" in err.lower() or "promote" in err.lower()
+
+
+class TestCmdPromoteBulkIntegration:
+    """Integration tests: bulk promote against real fixture workspaces."""
+
+    def test_epic_bulk_promote_full_journey(self, tmp_path: Path) -> None:
+        """End-to-end: promote --epic promotes all drafts, updates index, appends audit."""
+        units = [
+            ("E5-F1-S1-T1", "draft"),
+            ("E5-F1-S1-T2", "draft"),
+            ("E5-F2-S1-T1", "draft"),
+        ]
+        backlog_md, backlog_dir = _build_promote_backlog_fixture(tmp_path, units)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_promote("--epic", "E5")
+        assert rc == 0
+        for uid, _ in units:
+            wu = (backlog_dir / f"{uid}.md").read_text()
+            assert "## Status: in-queue" in wu, f"{uid} not transitioned"
+            assert "[PROMOTED] draft -> in-queue" in wu, f"{uid} missing audit"
+        index = backlog_md.read_text()
+        assert "| draft |" not in index
+
+    def test_story_bulk_promote_full_journey(self, tmp_path: Path) -> None:
+        """End-to-end: promote --story promotes only that story's drafts."""
+        units = [
+            ("E5-F1-S1-T1", "draft"),
+            ("E5-F1-S2-T1", "draft"),
+            ("E5-F1-S2-T2", "draft"),
+        ]
+        backlog_md, backlog_dir = _build_promote_backlog_fixture(tmp_path, units)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_promote("--story", "E5-F1-S2")
+        assert rc == 0
+        # S2 tasks promoted
+        for uid in ("E5-F1-S2-T1", "E5-F1-S2-T2"):
+            wu = (backlog_dir / f"{uid}.md").read_text()
+            assert "## Status: in-queue" in wu
+        # S1 task not touched
+        s1 = (backlog_dir / "E5-F1-S1-T1.md").read_text()
+        assert "## Status: draft" in s1
+
+    def test_aborted_transaction_leaves_no_partial_writes(self, tmp_path: Path) -> None:
+        """When abort fires, no unit file is mutated."""
+        units = [
+            ("E5-F1-S1-T1", "draft"),
+            ("E5-F1-S1-T2", "in-progress"),
+        ]
+        backlog_md, backlog_dir = _build_promote_backlog_fixture(tmp_path, units)
+        original_t1 = (backlog_dir / "E5-F1-S1-T1.md").read_text()
+        original_index = backlog_md.read_text()
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_promote("--epic", "E5")
+        assert rc == 1
+        # Files unchanged
+        assert (backlog_dir / "E5-F1-S1-T1.md").read_text() == original_t1
+        assert backlog_md.read_text() == original_index
+
+    def test_file_not_found_returns_1_with_error(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """_promote_bulk returns rc=1 with an error when _resolve_unit_file returns None for a descendant."""
+        units = [
+            ("E5-F1-S1-T1", "draft"),
+            ("E5-F1-S1-T2", "draft"),
+        ]
+        backlog_md, backlog_dir = _build_promote_backlog_fixture(tmp_path, units)
+        # Patch _resolve_unit_file to return None for one specific unit id
+        original_resolve = cli._resolve_unit_file
+
+        def _resolve_returning_none(unit: WorkUnit) -> Path | None:
+            if unit.id == "E5-F1-S1-T2":
+                return None
+            return original_resolve(unit)
+
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._resolve_unit_file", side_effect=_resolve_returning_none),
+        ):
+            rc = cli.cmd_promote("--epic", "E5")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "E5-F1-S1-T2" in err
+        assert "not found" in err.lower()
+        # No partial writes -- T1 file must still be draft
+        t1_content = (backlog_dir / "E5-F1-S1-T1.md").read_text()
+        assert "## Status: draft" in t1_content
+
+
 class TestWireOrphanCleanupDepChain:
     """Phase 10: orphan-cleanup auto-emission resolves Manifest collisions via auto-wired deps."""
 

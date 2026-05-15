@@ -127,3 +127,71 @@ class TestRecoveryProbeConstants:
 
         assert isinstance(RECOVERY_PROBE_MESSAGE_CONTENT, str)
         assert len(RECOVERY_PROBE_MESSAGE_CONTENT) > 0
+
+
+class TestSessionConstants:
+    """AC-T6-2: SESSION_* constants in constants.py have correct types and spec-mandated values (spec 4.4.1)."""
+
+    def test_session_registry_path_is_non_empty_string(self) -> None:
+        """SESSION_REGISTRY_PATH is a non-empty str naming the relative path to the session registry JSON."""
+        from devbench.constants import SESSION_REGISTRY_PATH
+
+        assert isinstance(SESSION_REGISTRY_PATH, str)
+        assert len(SESSION_REGISTRY_PATH) > 0
+
+    def test_session_registry_path_value(self) -> None:
+        """SESSION_REGISTRY_PATH equals the spec-mandated relative path (spec 4.4.1)."""
+        from devbench.constants import SESSION_REGISTRY_PATH
+
+        assert SESSION_REGISTRY_PATH == ".devbench/sessions/registry.json"
+
+    def test_session_backlog_lock_name_is_non_empty_string(self) -> None:
+        """SESSION_BACKLOG_LOCK_NAME is a non-empty str naming the flock file under .devbench/."""
+        from devbench.constants import SESSION_BACKLOG_LOCK_NAME
+
+        assert isinstance(SESSION_BACKLOG_LOCK_NAME, str)
+        assert len(SESSION_BACKLOG_LOCK_NAME) > 0
+
+    def test_session_backlog_lock_name_value(self) -> None:
+        """SESSION_BACKLOG_LOCK_NAME equals 'BACKLOG.lock' (spec 4.4.1: <workspace>/.devbench/BACKLOG.lock)."""
+        from devbench.constants import SESSION_BACKLOG_LOCK_NAME
+
+        assert SESSION_BACKLOG_LOCK_NAME == "BACKLOG.lock"
+
+    def test_session_default_flock_timeout_seconds_is_int(self) -> None:
+        """SESSION_DEFAULT_FLOCK_TIMEOUT_SECONDS is an int representing the default flock timeout."""
+        from devbench.constants import SESSION_DEFAULT_FLOCK_TIMEOUT_SECONDS
+
+        assert isinstance(SESSION_DEFAULT_FLOCK_TIMEOUT_SECONDS, int)
+
+    def test_session_default_flock_timeout_seconds_value(self) -> None:
+        """SESSION_DEFAULT_FLOCK_TIMEOUT_SECONDS equals 30 (spec 4.4.1: Default timeout 30 s)."""
+        from devbench.constants import SESSION_DEFAULT_FLOCK_TIMEOUT_SECONDS
+
+        assert SESSION_DEFAULT_FLOCK_TIMEOUT_SECONDS == 30
+
+    def test_session_pid_filename_is_non_empty_string(self) -> None:
+        """SESSION_PID_FILENAME is a non-empty str naming the PID file within a session state dir."""
+        from devbench.constants import SESSION_PID_FILENAME
+
+        assert isinstance(SESSION_PID_FILENAME, str)
+        assert len(SESSION_PID_FILENAME) > 0
+
+    def test_session_pid_filename_value(self) -> None:
+        """SESSION_PID_FILENAME equals 'pid' (spec 4.4.4: pid -- the orchestrator process's PID)."""
+        from devbench.constants import SESSION_PID_FILENAME
+
+        assert SESSION_PID_FILENAME == "pid"
+
+    def test_session_registry_tmp_suffix_is_non_empty_string(self) -> None:
+        """SESSION_REGISTRY_TMP_SUFFIX is a non-empty str used as the suffix for atomic registry writes."""
+        from devbench.constants import SESSION_REGISTRY_TMP_SUFFIX
+
+        assert isinstance(SESSION_REGISTRY_TMP_SUFFIX, str)
+        assert len(SESSION_REGISTRY_TMP_SUFFIX) > 0
+
+    def test_session_registry_tmp_suffix_value(self) -> None:
+        """SESSION_REGISTRY_TMP_SUFFIX equals '.tmp' (atomic-write convention for registry.json)."""
+        from devbench.constants import SESSION_REGISTRY_TMP_SUFFIX
+
+        assert SESSION_REGISTRY_TMP_SUFFIX == ".tmp"

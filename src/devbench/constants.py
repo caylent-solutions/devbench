@@ -6,6 +6,9 @@ module instead of embedding literals inline.
 
 Operational parameters that vary by environment (timeouts, thresholds, paths)
 live in ``config.py`` with environment-variable overrides.
+
+Session-management constants (SESSION_*) are defined in the session-management
+region below and consumed by ``src/devbench/session.py``.
 """
 
 import re
@@ -554,3 +557,28 @@ ANTHROPIC_AGENT_MODEL_PATTERN: re.Pattern[str] = re.compile(r"^claude-[a-z0-9]+(
 # AWS Bedrock model id pattern (``us.anthropic.claude-opus-4-7-v1``). Accepted
 # only when ``use_bedrock: true``; rejected otherwise.
 BEDROCK_AGENT_MODEL_PATTERN: re.Pattern[str] = re.compile(r"^us\.anthropic\.claude-[a-z0-9-]+-v[0-9]+$")
+
+# ---------------------------------------------------------------------------
+# Session-management constants (spec 4.4.1 named sessions, issue #192)
+# Consumed exclusively by ``src/devbench/session.py``; defined here so no
+# literal values appear inline in that module.
+# ---------------------------------------------------------------------------
+# Workspace-relative path to the session registry JSON file.
+# Full path is ``<workspace_root>/<SESSION_REGISTRY_PATH>``.
+SESSION_REGISTRY_PATH: str = ".devbench/sessions/registry.json"
+
+# Filename of the exclusive flock file created under ``<workspace_root>/.devbench/``.
+# Full path is ``<workspace_root>/.devbench/<SESSION_BACKLOG_LOCK_NAME>``.
+SESSION_BACKLOG_LOCK_NAME: str = "BACKLOG.lock"
+
+# Default timeout in seconds for acquiring the BACKLOG.lock via ``fcntl.flock``.
+# Raises ``TimeoutError`` when the lock cannot be acquired within this window.
+SESSION_DEFAULT_FLOCK_TIMEOUT_SECONDS: int = 30
+
+# Filename of the PID file written inside each session's state directory
+# (``<workspace_root>/.devbench/sessions/<name>/<SESSION_PID_FILENAME>``).
+SESSION_PID_FILENAME: str = "pid"
+
+# Suffix appended to the registry JSON path for the intermediate temp file
+# used during atomic registry writes (write-then-rename pattern).
+SESSION_REGISTRY_TMP_SUFFIX: str = ".tmp"

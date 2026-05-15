@@ -501,7 +501,13 @@ class TestRewriteStatus:
 
 
 class TestMaterialiseProposal:
-    def test_creates_drafts_and_appends_rows(self, tmp_path: Path) -> None:
+    def test_creates_drafts_and_appends_rows(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from devbench.config_loader import BacklogConfig, RuntimeConfig
+
+        fake_config = RuntimeConfig.__new__(RuntimeConfig)
+        object.__setattr__(fake_config, "backlog", BacklogConfig(default_status_for_new_work_units="in-queue"))
+        monkeypatch.setattr(proposal_mod, "_get_runtime_config", lambda: fake_config)
+
         workspace = _build_workspace(tmp_path)
         proposal = _sample_proposal()
         drafts = materialise_proposal(
@@ -514,7 +520,7 @@ class TestMaterialiseProposal:
         assert len(drafts) == 2
         for draft in drafts:
             assert draft.is_file()
-            assert "## Status: proposed" in draft.read_text()
+            assert "## Status: in-queue" in draft.read_text()
         backlog = (workspace / "BACKLOG.md").read_text()
         assert "E0-F1-S1-T2" in backlog
         assert "E0-F1-S1-T3" in backlog
@@ -699,6 +705,171 @@ class TestMaterialiseProposalIdempotent:
         assert result == [], "rejected draft must not be resurrected on re-materialise"
         story_dir = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
         assert not (story_dir / "E0-F1-S1-T2.md").exists()
+
+
+# ---------------------------------------------------------------------------
+# materialise_proposal -- config-driven default status (AC-189-8)
+# ---------------------------------------------------------------------------
+
+
+class TestMaterialiseProposalDefaultStatus:
+    """AC-189-8: materialise_proposal respects backlog.default_status_for_new_work_units."""
+
+    def test_default_status_proposed_when_config_in_queue(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When RUNTIME_CONFIG.backlog.default_status_for_new_work_units == 'in-queue',
+        the draft file must have '## Status: in-queue' and the BACKLOG.md row must
+        carry 'in-queue' (not 'proposed').
+        """
+        from devbench.config_loader import BacklogConfig, RuntimeConfig
+
+        fake_config = RuntimeConfig.__new__(RuntimeConfig)
+        object.__setattr__(fake_config, "backlog", BacklogConfig(default_status_for_new_work_units="in-queue"))
+        monkeypatch.setattr(proposal_mod, "_get_runtime_config", lambda: fake_config)
+
+        workspace = _build_workspace(tmp_path)
+        proposal = _sample_proposal(task_ids=["E0-F1-S1-T2"])
+        drafts = materialise_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            proposal=proposal,
+            repo="caylent-solutions/example",
+        )
+
+        assert len(drafts) == 1
+        draft_text = drafts[0].read_text()
+        assert "## Status: in-queue" in draft_text, "draft must carry in-queue status"
+        backlog_text = (workspace / "BACKLOG.md").read_text()
+        assert "| in-queue |" in backlog_text, "BACKLOG.md row must carry in-queue status in a pipe-delimited cell"
+
+    def test_default_status_draft_when_config_draft(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When RUNTIME_CONFIG.backlog.default_status_for_new_work_units == 'draft',
+        the draft file must have '## Status: draft' and the BACKLOG.md row must
+        carry 'draft'.
+        """
+        from devbench.config_loader import BacklogConfig, RuntimeConfig
+
+        fake_config = RuntimeConfig.__new__(RuntimeConfig)
+        object.__setattr__(fake_config, "backlog", BacklogConfig(default_status_for_new_work_units="draft"))
+        monkeypatch.setattr(proposal_mod, "_get_runtime_config", lambda: fake_config)
+
+        workspace = _build_workspace(tmp_path)
+        proposal = _sample_proposal(task_ids=["E0-F1-S1-T2"])
+        drafts = materialise_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            proposal=proposal,
+            repo="caylent-solutions/example",
+        )
+
+        assert len(drafts) == 1
+        draft_text = drafts[0].read_text()
+        assert "## Status: draft" in draft_text, "draft must carry draft status"
+        backlog_text = (workspace / "BACKLOG.md").read_text()
+        assert "| draft |" in backlog_text, "BACKLOG.md row must carry draft status in a pipe-delimited cell"
+
+    def test_backlog_index_row_status_matches_config(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The BACKLOG.md row's Status cell (column 4) matches the configured default status."""
+        from devbench.config_loader import BacklogConfig, RuntimeConfig
+
+        fake_config = RuntimeConfig.__new__(RuntimeConfig)
+        object.__setattr__(fake_config, "backlog", BacklogConfig(default_status_for_new_work_units="draft"))
+        monkeypatch.setattr(proposal_mod, "_get_runtime_config", lambda: fake_config)
+
+        workspace = _build_workspace(tmp_path)
+        proposal = _sample_proposal(task_ids=["E0-F1-S1-T2"])
+        materialise_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            proposal=proposal,
+            repo="caylent-solutions/example",
+        )
+
+        backlog_text = (workspace / "BACKLOG.md").read_text()
+        # Find the row for E0-F1-S1-T2 and check its Status cell (index 4 in pipe-split).
+        for line in backlog_text.splitlines():
+            if "E0-F1-S1-T2" in line and line.strip().startswith("|"):
+                cells = [c.strip() for c in line.split("|")]
+                if cells[1] == "E0-F1-S1-T2":
+                    assert cells[4] == "draft", f"Expected Status cell to be 'draft', got {cells[4]!r}"
+                    break
+        else:
+            pytest.fail("Row for E0-F1-S1-T2 not found in BACKLOG.md")
+
+    @pytest.mark.parametrize("configured_status", ["in-queue", "draft"])
+    def test_parametrized_status_values_written_correctly(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        configured_status: str,
+    ) -> None:
+        """Both allowed config values produce the correct status in draft and BACKLOG.md."""
+        from devbench.config_loader import BacklogConfig, RuntimeConfig
+
+        fake_config = RuntimeConfig.__new__(RuntimeConfig)
+        object.__setattr__(
+            fake_config,
+            "backlog",
+            BacklogConfig(default_status_for_new_work_units=configured_status),
+        )
+        monkeypatch.setattr(proposal_mod, "_get_runtime_config", lambda: fake_config)
+
+        workspace = _build_workspace(tmp_path)
+        proposal = _sample_proposal(task_ids=["E0-F1-S1-T2"])
+        drafts = materialise_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            proposal=proposal,
+            repo="caylent-solutions/example",
+        )
+
+        assert len(drafts) == 1
+        assert f"## Status: {configured_status}" in drafts[0].read_text()
+        backlog_text = (workspace / "BACKLOG.md").read_text()
+        for line in backlog_text.splitlines():
+            if "E0-F1-S1-T2" in line and line.strip().startswith("|"):
+                cells = [c.strip() for c in line.split("|")]
+                if cells[1] == "E0-F1-S1-T2":
+                    assert cells[4] == configured_status
+                    break
+        else:
+            pytest.fail("Row for E0-F1-S1-T2 not found in BACKLOG.md")
+
+    def test_invalid_default_status_raises_proposal_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When default_status_for_new_work_units has an invalid value, materialise_proposal
+        raises ProposalError with an actionable message before writing any files.
+        """
+        from devbench.config_loader import BacklogConfig, RuntimeConfig
+
+        fake_config = RuntimeConfig.__new__(RuntimeConfig)
+        object.__setattr__(
+            fake_config,
+            "backlog",
+            BacklogConfig(default_status_for_new_work_units="in_queue"),  # underscore -- invalid
+        )
+        monkeypatch.setattr(proposal_mod, "_get_runtime_config", lambda: fake_config)
+
+        workspace = _build_workspace(tmp_path)
+        prop = _sample_proposal(task_ids=["E0-F1-S1-T2"])
+        with pytest.raises(ProposalError, match=r"invalid value.*in_queue"):
+            materialise_proposal(
+                workspace_root=workspace,
+                backlog_root=workspace / "backlog",
+                backlog_index=workspace / "BACKLOG.md",
+                proposal=prop,
+                repo="caylent-solutions/example",
+            )
+        # No draft files should have been written before the error was raised.
+        story_dir = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        draft_file = story_dir / "E0-F1-S1-T2.md"
+        assert not draft_file.exists(), "No draft file should be written when config is invalid"
 
 
 class TestHasUnresolvedProposals:

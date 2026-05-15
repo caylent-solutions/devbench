@@ -7422,9 +7422,26 @@ class TestCmdWriteProposalAutoCascade:
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
     ) -> None:
         # End-to-end: with auto-accept on and a real source-task in the
-        # index, the helper calls materialise + promote and returns
-        # "applied" with the materialised path list and promoted ids.
+        # index, the helper calls materialise and returns "applied" with
+        # the materialised path list.
+        #
+        # Since AC-189-8, materialise_proposal reads
+        # RUNTIME_CONFIG.backlog.default_status_for_new_work_units and
+        # writes that status into the draft directly. When the configured
+        # default is 'in-queue' (the backwards-compatible default),
+        # classify_proposed_task sees the draft as PROMOTED, so the
+        # auto-cascade's promote loop finds nothing to promote and
+        # 'promoted' is empty -- the task is already at its target status.
+        from devbench.backlog import proposal as proposal_mod
+        from devbench.config_loader import BacklogConfig, RuntimeConfig
+
         monkeypatch.setattr(cli, "RUNTIME_CONFIG", _runtime_config_with_auto_accept(True))
+        # Patch proposal_mod's config getter so materialise_proposal writes
+        # 'in-queue' directly into the new draft (the backwards-compatible default).
+        fake_cfg = RuntimeConfig.__new__(RuntimeConfig)
+        object.__setattr__(fake_cfg, "backlog", BacklogConfig(default_status_for_new_work_units="in-queue"))
+        monkeypatch.setattr(proposal_mod, "_get_runtime_config", lambda: fake_cfg)
+
         # Build a minimum BACKLOG with one source task at E0-F1-S1-T1
         # (currently blocked, since auto-accept emit happens when the
         # source is failing) plus the directory structure
@@ -7471,12 +7488,16 @@ class TestCmdWriteProposalAutoCascade:
         assert isinstance(materialised, list) and materialised  # at least one path
         promoted = result["promoted"]
         assert isinstance(promoted, list)
-        assert "E0-F1-S1-T9" in promoted
-        # The promoted task's file now exists with status in-queue.
-        promoted_file = story_dir / "E0-F1-S1-T9.md"
-        assert promoted_file.exists()
-        promoted_content = promoted_file.read_text(encoding="utf-8")
-        assert "## Status: in-queue" in promoted_content
+        # With default_status='in-queue', materialise_proposal writes 'in-queue'
+        # directly into the draft. The auto-cascade promote loop only promotes
+        # tasks in 'proposed' state; tasks already at 'in-queue' are classified
+        # as PROMOTED and need no explicit promotion step.
+        assert promoted == [], "no explicit promotion needed when draft was materialised directly to in-queue"
+        # The materialised task's file exists with the configured status.
+        materialised_file = story_dir / "E0-F1-S1-T9.md"
+        assert materialised_file.exists()
+        materialised_content = materialised_file.read_text(encoding="utf-8")
+        assert "## Status: in-queue" in materialised_content
 
 
 # ---------------------------------------------------------------------------

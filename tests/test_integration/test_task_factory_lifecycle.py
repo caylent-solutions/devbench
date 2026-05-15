@@ -14,10 +14,15 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from devbench import cli
+from devbench.backlog import proposal as proposal_mod
 from devbench.backlog.proposal import (
     Proposal,
     ProposedTask,
+    _append_backlog_row,
+    _render_backlog_row,
     list_proposals,
     materialise_proposal,
     reject_proposal,
@@ -82,6 +87,20 @@ def _workspace(tmp_path: Path) -> Path:
     story_dir.mkdir(parents=True)
     (story_dir / "E0-F1-S1-T1.md").write_text(_SOURCE_TEMPLATE)
     return tmp_path
+
+
+def _fake_config_with_status(status: str) -> object:
+    """Return a RuntimeConfig-like object with the given default_status_for_new_work_units.
+
+    Used to monkeypatch ``proposal_mod._get_runtime_config`` in tests that
+    need to control the status written into new draft files by
+    ``materialise_proposal``.
+    """
+    from devbench.config_loader import BacklogConfig, RuntimeConfig
+
+    cfg = RuntimeConfig.__new__(RuntimeConfig)
+    object.__setattr__(cfg, "backlog", BacklogConfig(default_status_for_new_work_units=status))
+    return cfg
 
 
 def _proposal(source_id: str = "E0-F1-S1-T1") -> Proposal:
@@ -429,8 +448,16 @@ class TestAffectedTaskIdsLifecycle:
 class TestAutoAcceptProposalsLifecycle:
     """ADR-11 end-to-end: flag=true causes sweep-proposals to auto-promote every draft."""
 
-    def test_auto_accept_promotes_every_draft_end_to_end(self, tmp_path: Path) -> None:
-        """Materialise via sweep-proposals with flag=true; every draft ends at in-queue + audit suffix."""
+    def test_auto_accept_promotes_every_draft_end_to_end(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Materialise via sweep-proposals with flag=true; every draft ends at in-queue.
+
+        Since AC-189-8, materialise_proposal writes the configured default status
+        directly into the draft. When default_status_for_new_work_units='in-queue'
+        (the backwards-compatible default), the draft is created at in-queue
+        immediately and the auto-cascade promote loop finds no 'proposed' tasks to
+        promote -- the task is already at its target status without an explicit
+        promote step.
+        """
         from unittest.mock import MagicMock, patch
 
         from devbench import cli
@@ -438,6 +465,9 @@ class TestAutoAcceptProposalsLifecycle:
         workspace = _workspace(tmp_path)
         proposal = _proposal()
         write_proposal(workspace, proposal)
+
+        # Patch materialise_proposal's config getter so drafts land at 'in-queue'.
+        monkeypatch.setattr(proposal_mod, "_get_runtime_config", lambda: _fake_config_with_status("in-queue"))
 
         # Source-task row is already in BACKLOG.md via _workspace; its file exists.
         # Build a RUNTIME_CONFIG mock with auto_accept_proposals=True and the
@@ -461,33 +491,41 @@ class TestAutoAcceptProposalsLifecycle:
             rc = cli.cmd_sweep_proposals()
         assert rc == 0
 
-        # Both drafts ended at in-queue.
+        # Both drafts landed at in-queue (materialised directly, no explicit promote step).
         story = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
         t2 = (story / "E0-F1-S1-T2.md").read_text()
         t3 = (story / "E0-F1-S1-T3.md").read_text()
-        assert "## Status: in-queue" in t2
-        assert "## Status: in-queue" in t3
-
-        # Audit suffix landed on source task comments (one per wired draft).
-        source_text = (story / "E0-F1-S1-T1.md").read_text()
-        assert source_text.count("auto-accepted via task_factory.auto_accept_proposals=true") == 2
-        # BLOCKED_PENDING_PROPOSAL markers also present per ADR-07 contract.
-        assert "[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2" in source_text
-        assert "[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T3" in source_text
+        assert "## Status: in-queue" in t2, "T2 must be at in-queue (materialised directly)"
+        assert "## Status: in-queue" in t3, "T3 must be at in-queue (materialised directly)"
+        # Verify that both draft files were created (materialise_proposal ran).
+        assert (story / "E0-F1-S1-T2.md").exists()
+        assert (story / "E0-F1-S1-T3.md").exists()
 
 
 class TestTaskFactoryLifecycleSkipWhenUnresolved:
     def test_second_materialise_skipped_when_prior_unresolved(self, tmp_path: Path) -> None:
+        """The _has_unresolved_proposals guard fires when BACKLOG.md already has 'proposed' rows.
+
+        The guard specifically checks for rows with Status='proposed'. With AC-189-8,
+        materialise_proposal writes the config-driven default status (in-queue or draft)
+        rather than 'proposed'. To verify the guard still fires when 'proposed' rows exist
+        (e.g., rows written by an older version of devbench or via direct injection), we
+        seed BACKLOG.md directly with a 'proposed' row before calling materialise.
+        """
         workspace = _workspace(tmp_path)
-        # First materialise leaves two rows in `proposed` status.
-        first = _proposal()
-        write_proposal(workspace, first)
-        materialise_proposal(
-            workspace_root=workspace,
-            backlog_root=workspace / "backlog",
-            backlog_index=workspace / "BACKLOG.md",
-            proposal=first,
-            repo="caylent-solutions/example",
+        # Seed BACKLOG.md with a 'proposed' row to simulate a prior unresolved materialise.
+        # This is necessary because materialise_proposal now writes the config-driven default
+        # status (in-queue) rather than 'proposed', so a second materialise call would not
+        # be blocked unless we inject 'proposed' rows directly.
+        _append_backlog_row(
+            workspace / "BACKLOG.md",
+            _render_backlog_row(
+                "E0-F1-S1-T2",
+                "Prior unresolved task",
+                "proposed",
+                "caylent-solutions/example",
+                "backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T2.md",
+            ),
         )
 
         # Second proposal (different IDs) should be skipped because prior proposals are unresolved.

@@ -1,6 +1,6 @@
 # Task Factory (Proposed Work Units)
 
-The task-factory feature automates the "an operator must author new work units" step that follows a legitimate amendment rejection. When the `manifest-amender` correctly rejects an amendment whose changes describe real production fixes that fall outside the source task's scope, the orchestrator invokes the `blocker-resolver` + `task-factory` agents to generate draft work-unit `.md` files with status `proposed`. The human reviews, edits, and promotes each draft; the orchestrator continues on other actionable tasks until promotion.
+The task-factory feature automates the "an operator must author new work units" step that follows a legitimate amendment rejection. When the `manifest-amender` correctly rejects an amendment whose changes describe real production fixes that fall outside the source task's scope, the orchestrator invokes the `blocker-resolver` + `task-factory` agents to generate draft work-unit `.md` files. Each draft's initial status is determined by `backlog.default_status_for_new_work_units` in `backlog/config/devbench.yaml` (`in-queue` by default; `draft` when opted in via AC-189-8). The human reviews, edits, and promotes each draft; the orchestrator continues on other actionable tasks until promotion.
 
 See [ADR-03: Task factory](adr/03-task-factory.md) for the design rationale and alternatives considered.
 
@@ -44,8 +44,8 @@ If the operator decides that some proposed drafts should never be promoted, they
 4. **Orchestrator invokes `devbench:blocker-resolver`**. The agent reads the archived request + rejection rationale and decomposes the out-of-scope fixes into a structured proposal JSON. It calls `uv run devbench write-proposal <id>` with the JSON on stdin; the file lands at `<workspace>/.devbench/proposals/<id>.json`.
 5. **Orchestrator invokes `devbench:task-factory`**. The agent calls `uv run devbench materialise-proposal <id>`, which:
    - Reads the proposal JSON.
-   - Writes one draft `.md` per proposed task under `backlog/<epic>/<feature>/<story>/<task-id>.md`, each with `## Status: proposed` and an auto-generated header marker naming the source task.
-   - Inserts a matching row in `BACKLOG.md` with the same `proposed` status.
+   - Writes one draft `.md` per proposed task under `backlog/<epic>/<feature>/<story>/<task-id>.md`, each with a `## Status:` line set to the value of `backlog.default_status_for_new_work_units` (default `in-queue`; `draft` when opted in via AC-189-8), plus an auto-generated header marker naming the source task.
+   - Inserts a matching row in `BACKLOG.md` carrying the same config-driven default status.
    - Refreshes the Status Summary table.
 6. **Orchestrator returns to step 1** (`devbench next`). Proposed tasks are NOT in the actionable set, so the loop picks another task; the source task stays blocked.
 7. **Operator reviews proposals** at their convenience:
@@ -131,7 +131,7 @@ Trigger 2 follows a shorter flow because the executor itself emits the proposal 
 4. **Executor verifies the file landed.** `test -f $JUDGE_WORKSPACE_ROOT/.devbench/proposals/<source-id>.json` is the load-bearing check; the orchestrate skill branches on it at step 4a.
 5. **Executor logs NEEDS_ESCALATION** naming the proposal path and the proposed task titles. The source task's review pipeline then runs normally at step 5 -- validation-gate escalation does NOT auto-block the source; its own ACs may still pass.
 6. **Orchestrator detects the proposal at step 4a** and invokes `devbench:task-factory` directly, skipping blocker-resolver (the executor's proposal is already authoritative).
-7. **Task-factory materialises the drafts** exactly as it does on the amendment-reject path: one `.md` per proposed task with `## Status: proposed`, one BACKLOG.md row per draft, Status Summary refreshed.
+7. **Task-factory materialises the drafts** exactly as it does on the amendment-reject path: one `.md` per proposed task with `## Status:` set to the config-driven default (see `backlog.default_status_for_new_work_units`; default `in-queue`), one BACKLOG.md row per draft, Status Summary refreshed.
 8. **Operator reviews and promotes** on their own cadence using the same `promote-proposal` / `reject-proposal` / `decline` commands as Trigger 1.
 
 The key behavioural difference from Trigger 1 is that the source validation-gate task can still complete (`done`) if its own acceptance criteria passed -- for example, a gate whose AC is "43/46 scenarios pass with a documented diagnosis of the remaining 3" can ship while the three proposed fix tasks queue up as independent follow-ups. Trigger 1, by contrast, always leaves the source blocked because the amender rejected the in-scope implementation.
@@ -208,7 +208,7 @@ task_factory:
   auto_accept_proposals: true
 ```
 
-When the flag is `true`, `devbench sweep-proposals` calls `promote-proposal` automatically for every draft currently at `## Status: proposed`. Auto-promote runs on the standard SKILL step 0 tick, so no separate command or cron job is required. The flag is workspace-wide -- every proposal produced in this workspace gets auto-accepted, not individual proposals.
+When the flag is `true`, `devbench sweep-proposals` calls `promote-proposal` automatically for every draft currently at `## Status: proposed`. When `backlog.default_status_for_new_work_units` is `in-queue` (the default), new drafts materialise directly at `in-queue` and the promote loop skips them (they are already in the actionable queue). When the value is `draft`, drafts materialise at `draft` status and the auto-accept sweep promotes them to `in-queue`. Auto-promote runs on the standard SKILL step 0 tick, so no separate command or cron job is required. The flag is workspace-wide -- every proposal produced in this workspace gets auto-accepted, not individual proposals.
 
 Behavioural details:
 

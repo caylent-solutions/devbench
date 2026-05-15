@@ -261,6 +261,34 @@ since the last release. PR #119 carries every change.
 
 ### Fixed
 
+- **`devbench report` / `watch` no longer crash on transient WU md
+  `FileNotFoundError`**. The user-reported scenario: `devbench watch`
+  was running against an active orchestrator; one tick caught a WU md
+  in the middle of a non-atomic SDK-driven `Write` / `Edit` tool
+  call, the parser raised `FileNotFoundError`, and the watch session
+  died with the misleading prefix `devbench report: cannot parse
+  '/.../BACKLOG.md': [Errno 2] No such file or directory:
+  '/.../E4-F1-S1-T5.md'` (the prefix named the index but the missing
+  path was a WU md). Two surgical fixes: (1)
+  `BacklogParser.parse_index` (`src/devbench/backlog/parser.py:189-200`)
+  now performs a single-shot synchronous retry on
+  `FileNotFoundError` from `parse_work_unit_file` -- zero sleep, zero
+  temporal logic, just an immediate second attempt that closes the
+  atomic-rename / writer-window race. Persistent FNF still
+  propagates with the original missing path intact, preserving
+  fail-fast. (2) `generate_report`'s exception wrapper
+  (`src/devbench/reporting/report.py:2249-2278`) splits into two
+  branches: `FileNotFoundError` surfaces the actual missing path
+  (`exc.filename` when present, otherwise `str(exc)`) with a hint
+  noting the writer-window race; `ValueError` keeps the original
+  `validate-backlog` hint for genuine index corruption. The fixes
+  benefit every `BacklogParser` caller -- `report`, `watch`,
+  `status`, `cmd_check` -- transparently. Pinned by
+  `tests/test_backlog/test_parser.py::TestParseIndexFNFRetry` (2
+  cases: transient recovers, persistent propagates) plus the new
+  WU-md-path-aware case in
+  `tests/test_reporting/test_report.py::TestGenerateReportBacklogParseFailure::test_file_not_found_naming_wu_md_surfaces_wu_path`.
+
 - **ETA denominator now includes `RUNTIME_DEGRADATION` tasks**
   (issue #183 follow-up, paired with the renderer-bucketing fix above).
   `_compute_window_stats` previously computed

@@ -2251,7 +2251,24 @@ def generate_report(
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     try:
         units = parser.parse_index()
-    except (FileNotFoundError, ValueError) as exc:
+    except FileNotFoundError as exc:
+        # FileNotFoundError can name either BACKLOG.md itself or a WU md
+        # referenced by it. Surface the actual path so the diagnostic
+        # stops blaming the index when the real culprit is a transient
+        # writer-window race on a single WU md (SDK-driven Write/Edit
+        # tools outside BacklogManager can leave a WU md momentarily
+        # unreadable; the parser already does one retry, this prefix
+        # tells the operator what to re-run if even the retry lost).
+        missing = getattr(exc, "filename", None) or str(exc)
+        sys.stderr.write(
+            f"devbench report: cannot read '{missing}' "
+            f"(referenced by '{BACKLOG_INDEX}'): {exc}\n"
+            "  If the missing path is a work-unit md and your orchestrator is\n"
+            "  active, this may be a transient writer-window race; re-run.\n"
+            "  Otherwise run `devbench validate-backlog` for a full index audit.\n"
+        )
+        sys.exit(1)
+    except ValueError as exc:
         # Issue #174: a malformed or non-canonical BACKLOG.md surfaces here
         # as a parser-level exception. Fail fast with an actionable
         # diagnostic naming the file + the parse failure so the operator

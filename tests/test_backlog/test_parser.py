@@ -114,6 +114,77 @@ class TestParseIndex:
         assert any("mismatch" in r.message.lower() for r in caplog.records)
 
 
+class TestParseIndexFNFRetry:
+    """parse_index does a single-shot synchronous retry on FileNotFoundError
+    from parse_work_unit_file to absorb the atomic-rename / writer-window
+    race that SDK-driven Write/Edit tools (outside BacklogManager) create
+    when they overwrite a WU md file. On persistent failure the second
+    attempt re-raises with the original missing path intact."""
+
+    def _build_minimal_backlog(self, tmp_path: Path) -> tuple[BacklogParser, Path]:
+        from unittest.mock import patch  # noqa: F401  # imported for clarity in calling tests
+
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        wu_file = backlog_dir / "E0-F1-S1-T1.md"
+        wu_file.write_text("# E0-F1-S1-T1: Create Makefile\n\n## Status: in-queue\n")
+
+        index = tmp_path / "BACKLOG.md"
+        index.write_text(
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|----------|\n"
+            "| E0-F1-S1-T1 | Create Makefile | Task | in-queue | None | git-repo | `backlog/E0-F1-S1-T1.md` |\n"
+        )
+        return BacklogParser(backlog_root=backlog_dir, backlog_index=index), wu_file
+
+    def test_transient_fnf_recovers_via_single_retry(self, tmp_path: Path) -> None:
+        """First call raises FileNotFoundError (mimicking the writer-window
+        race); second call returns the real WorkUnit; parse_index succeeds."""
+        from unittest.mock import patch
+
+        parser, wu_file = self._build_minimal_backlog(tmp_path)
+        real = parser.parse_work_unit_file  # bind unwrapped reference
+
+        call_count = {"n": 0}
+
+        def flaky(file_path: Path) -> WorkUnit:
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise FileNotFoundError(2, "No such file or directory", str(file_path))
+            return real(file_path)
+
+        with patch.object(parser, "parse_work_unit_file", side_effect=flaky):
+            units = parser.parse_index()
+
+        assert len(units) == 1
+        assert units[0].id == "E0-F1-S1-T1"
+        assert call_count["n"] == 2, "Expected exactly one retry on transient FNF"
+
+    def test_persistent_fnf_propagates_after_retry(self, tmp_path: Path) -> None:
+        """Both calls raise FileNotFoundError -- parse_index re-raises so
+        the operator sees a genuine missing-file diagnostic with the path
+        preserved on the exception."""
+        from unittest.mock import patch
+
+        parser, wu_file = self._build_minimal_backlog(tmp_path)
+        call_count = {"n": 0}
+        fake_path = str(wu_file)
+
+        def always_missing(file_path: Path) -> WorkUnit:
+            call_count["n"] += 1
+            raise FileNotFoundError(2, "No such file or directory", fake_path)
+
+        with (
+            patch.object(parser, "parse_work_unit_file", side_effect=always_missing),
+            pytest.raises(FileNotFoundError) as excinfo,
+        ):
+            parser.parse_index()
+
+        assert call_count["n"] == 2, "Expected exactly one retry before propagating"
+        assert excinfo.value.filename == fake_path
+
+
 class TestParseWorkUnitFile:
     """Test parse_work_unit_file parses a sample .md file correctly."""
 

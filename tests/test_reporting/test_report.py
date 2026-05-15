@@ -3314,7 +3314,10 @@ class TestGenerateReportBacklogParseFailure:
     def test_file_not_found_from_parser_triggers_clean_exit(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """A missing BACKLOG.md (FileNotFoundError) -> SystemExit(1) + stderr diagnostic."""
+        """A FileNotFoundError from the parser -> SystemExit(1) + stderr diagnostic.
+        The new prefix is 'cannot read' (FNF) instead of 'cannot parse' (ValueError),
+        and the writer-window race hint is included so operators of an active
+        orchestrator know to re-run before fixing anything."""
         log_file = tmp_path / "test.log"
         log_file.write_text(
             _make_log(
@@ -3330,8 +3333,37 @@ class TestGenerateReportBacklogParseFailure:
                 generate_report(log_path=log_file)
         assert exc.value.code == 1
         captured = capsys.readouterr()
-        assert "devbench report: cannot parse" in captured.err
+        assert "devbench report: cannot read" in captured.err
         assert "Backlog index not found" in captured.err
+        assert "transient writer-window race" in captured.err
+        assert "validate-backlog" in captured.err
+
+    def test_file_not_found_naming_wu_md_surfaces_wu_path(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """When the FNF.filename is a work-unit md path (not the index), the
+        operator's stderr prefix must name THAT path so the diagnostic stops
+        blaming BACKLOG.md. This is the user-reported watch crash: the path
+        in the error was a WU md but the prefix said 'cannot parse BACKLOG.md'."""
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    "2026-03-05T10:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                ]
+            )
+        )
+        wu_md_path = "/workspaces/x/backlog/E4/F1/S1/E4-F1-S1-T5.md"
+        with patch("devbench.reporting.report.BacklogParser") as mock_cls:
+            instance = mock_cls.return_value
+            instance.parse_index.side_effect = FileNotFoundError(2, "No such file or directory", wu_md_path)
+            with pytest.raises(SystemExit) as exc:
+                generate_report(log_path=log_file)
+        assert exc.value.code == 1
+        captured = capsys.readouterr()
+        assert wu_md_path in captured.err
+        assert "cannot read" in captured.err
+        assert "transient writer-window race" in captured.err
 
 
 class TestBacklogTotalsDraftColumn:

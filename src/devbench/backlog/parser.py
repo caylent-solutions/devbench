@@ -191,7 +191,17 @@ class BacklogParser:
                 raise ValueError(f"Work unit '{raw_id}' has no file path in BACKLOG.md")
 
             file_path = (self._backlog_root.parent / raw_file_path).resolve()
-            unit = self.parse_work_unit_file(file_path)
+            try:
+                unit = self.parse_work_unit_file(file_path)
+            except FileNotFoundError:
+                # Single-shot retry against the atomic-rename / writer-window
+                # race: SDK-driven Write/Edit tools outside BacklogManager
+                # may leave the path momentarily unreadable. The retry is
+                # synchronous (microsecond-scale) and closes the race window
+                # without any sleep / temporal logic. On persistent failure
+                # the second attempt re-raises the original FileNotFoundError
+                # with the missing path intact, preserving fail-fast semantics.
+                unit = self.parse_work_unit_file(file_path)
 
             # Cross-check: warn when BACKLOG.md index disagrees with the work-unit file.
             # The file is the source of truth (parse_work_unit_file already read it),

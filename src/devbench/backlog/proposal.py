@@ -51,6 +51,7 @@ from devbench.constants import (
     STATUS_IN_QUEUE,
     STATUS_PROPOSED,
 )
+from devbench.utils.io import atomic_write_text
 
 logger = logging.getLogger(__name__)
 
@@ -1076,7 +1077,7 @@ def write_proposal(workspace_root: Path, proposal: Proposal) -> Path:
             "Resolve or reject its tasks before generating new proposals."
         )
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(proposal.to_dict(), indent=2) + "\n", encoding="utf-8")
+    atomic_write_text(target, json.dumps(proposal.to_dict(), indent=2) + "\n")
     return target
 
 
@@ -1211,7 +1212,7 @@ def _append_backlog_row(backlog_index: Path, row: str) -> None:
     # Append at EOF (end of index block); after every existing row the
     # Status Summary regeneration will pick this up.
     content = content.rstrip("\n") + "\n" + row
-    backlog_index.write_text(content, encoding="utf-8")
+    atomic_write_text(backlog_index, content)
 
 
 def _remove_backlog_row(backlog_index: Path, task_id: str) -> None:
@@ -1228,7 +1229,7 @@ def _remove_backlog_row(backlog_index: Path, task_id: str) -> None:
         kept.append(line)
     if not removed:
         raise ProposalError(f"Row for {task_id} not found in {backlog_index}")
-    backlog_index.write_text("".join(kept), encoding="utf-8")
+    atomic_write_text(backlog_index, "".join(kept))
 
 
 # ---------------------------------------------------------------------------
@@ -1344,7 +1345,7 @@ def materialise_proposal(
             generated_at=proposal.generated_at,
             status=new_wu_status,
         )
-        target.write_text(content, encoding="utf-8")
+        atomic_write_text(target, content)
         rel_path = target.relative_to(workspace_root).as_posix()
         row = _render_backlog_row(
             task_id=proposed.suggested_id,
@@ -1432,7 +1433,7 @@ def _rewrite_status(md_path: Path, new_status: str) -> None:
     if not _STATUS_LINE_RE.search(content):
         raise ProposalError(f"Draft {md_path} has no '## Status:' line")
     content = _STATUS_LINE_RE.sub(rf"\g<1>{new_status}", content, count=1)
-    md_path.write_text(content, encoding="utf-8")
+    atomic_write_text(md_path, content)
 
 
 def _rewrite_backlog_status(backlog_index: Path, task_id: str, new_status: str) -> None:
@@ -1453,7 +1454,7 @@ def _rewrite_backlog_status(backlog_index: Path, task_id: str, new_status: str) 
             break
     if not updated:
         raise ProposalError(f"Row for {task_id} not found in {backlog_index}")
-    backlog_index.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    atomic_write_text(backlog_index, "\n".join(lines) + "\n")
 
 
 def _append_dependency_to_source(backlog_root: Path, backlog_index: Path, source_task_id: str, new_dep_id: str) -> None:
@@ -1477,7 +1478,7 @@ def _append_dependency_to_source(backlog_root: Path, backlog_index: Path, source
         section = none_row_re.sub(f"| {new_dep_id} | (auto) | proposed |", section, count=1)
     else:
         section = section.rstrip("\n") + f"\n| {new_dep_id} | (auto) | proposed |\n"
-    source_unit.write_text(content[:idx] + section + remainder, encoding="utf-8")
+    atomic_write_text(source_unit, content[:idx] + section + remainder)
 
 
 def _find_source_task_file(backlog_root: Path, backlog_index: Path, task_id: str) -> Path | None:
@@ -1641,7 +1642,7 @@ def _append_promote_comment(
         content = content.rstrip("\n") + "\n\n" + entry
     else:
         content = content.rstrip("\n") + "\n\n" + COMMENTS_SECTION_HEADER + "\n\n" + entry
-    source_file.write_text(content, encoding="utf-8")
+    atomic_write_text(source_file, content)
 
 
 def _append_manual_dep_comment(
@@ -1678,7 +1679,7 @@ def _append_manual_dep_comment(
         content = content.rstrip("\n") + "\n\n" + entry
     else:
         content = content.rstrip("\n") + "\n\n" + COMMENTS_SECTION_HEADER + "\n\n" + entry
-    source_file.write_text(content, encoding="utf-8")
+    atomic_write_text(source_file, content)
 
 
 def _comments_have_marker(source_file: Path, marker_task_id: str) -> bool:
@@ -1957,7 +1958,7 @@ def _reject_unmaterialised_proposal(
             content = content.rstrip("\n") + "\n\n" + entry
         else:
             content = content.rstrip("\n") + "\n\n" + COMMENTS_SECTION_HEADER + "\n\n" + entry
-        source_file.write_text(content, encoding="utf-8")
+        atomic_write_text(source_file, content)
 
     return archive_path
 
@@ -1972,7 +1973,7 @@ def _append_reject_audit_comment(source_file: Path, task_id: str, reason: str) -
         content = content.rstrip("\n") + "\n\n" + entry
     else:
         content = content.rstrip("\n") + "\n\n" + COMMENTS_SECTION_HEADER + "\n\n" + entry
-    source_file.write_text(content, encoding="utf-8")
+    atomic_write_text(source_file, content)
 
 
 # Single-marker regex lifted from manager.py. Duplicated here (as a constant,
@@ -2004,4 +2005,4 @@ def _strip_pending_proposal_marker(source_file: Path, rejected_task_id: str) -> 
     # Collapse runs of 3+ newlines down to 2 (one blank line between paragraphs).
     updated = re.sub(r"\n{3,}", "\n\n", updated)
     if updated != content:
-        source_file.write_text(updated, encoding="utf-8")
+        atomic_write_text(source_file, updated)

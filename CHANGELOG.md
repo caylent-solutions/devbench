@@ -232,6 +232,28 @@ since the last release. PR #119 carries every change.
 
 ### Fixed
 
+- **Atomic temp-then-rename for every work-unit md write** (commit B of
+  the shadow-plugin / WU-write fix pair). Concurrent readers of a WU md
+  file could previously observe a heading-less intermediate state during
+  an in-place rewrite, causing `devbench report` /
+  `devbench validate-backlog` / any external parser consumer to fail
+  with `No top-level heading found in <path>`. Every WU md writer in
+  `devbench.backlog.manager`, `devbench.backlog.proposal`,
+  `devbench.backlog.amendment`, `devbench.backlog.work_unit`, and the
+  WU-touching `cmd_*` entry points in `devbench.cli` now routes through
+  the new shared helper `devbench.utils.io.atomic_write_text`, which
+  writes to `<path>.tmp` then atomically renames over the target via
+  `Path.replace`. A reader observing *path* sees either the prior
+  complete content or the new complete content, never partial. Pinned
+  by `tests/test_utils/test_io.py::TestAtomicWriteTextConcurrentReader`
+  (50 rapid back-and-forth atomic rewrites under a tight-loop reader,
+  zero partial-write observations across thousands of reads).
+  The legacy `_atomic_write` helper inside
+  `devbench.backlog.amendment` is removed in favour of the shared one
+  so there is only ever one source of truth for the atomic-write
+  pattern. `devbench.utils.io` is added to the
+  `Makefile :: test-coverage-new` gate at 100% line + branch.
+
 - **ETA formula now includes auto-recovering blocked tasks**
   (issue #157). `devbench report`'s `Est. time to complete remaining`
   multiplier was `tasks_active * recent_pace_minutes`; it now reads

@@ -182,6 +182,7 @@ from devbench.plugin_shadow import (
 # the banner is implemented there and reporting must not depend on cli.py.
 from devbench.reporting.report import _format_duration
 from devbench.scope import _expand_prefix
+from devbench.utils.io import atomic_write_text
 from devbench.utils.process import run_command
 
 __all__ = ["_format_duration"]
@@ -911,7 +912,7 @@ def cmd_new_task(*argv: str) -> int:
         return 1
     template = template_path.read_text(encoding="utf-8")
     rendered = _render_new_task_template(template, fields)
-    target.write_text(rendered, encoding="utf-8")
+    atomic_write_text(target, rendered)
     print(json.dumps({"id": fields["id"], "kind": kind, "target": str(target)}))
     logger.info("Scaffolded %s %s at %s", kind, fields["id"], target)
     return 0
@@ -2333,7 +2334,7 @@ def cmd_log_verdict(judge_name: str, unit_id: str, verdict: str, feedback: str =
         content = content.rstrip("\n") + "\n\n" + entry
     else:
         content = content.rstrip("\n") + "\n\n" + COMMENTS_SECTION_HEADER + "\n\n" + entry
-    wu_file.write_text(content, encoding="utf-8")
+    atomic_write_text(wu_file, content)
 
     # Log feedback for audit trail.
     if feedback:
@@ -2378,7 +2379,7 @@ def cmd_log_comment(agent_name: str, unit_id: str, message: str) -> int:
         content = content.rstrip("\n") + "\n\n" + entry
     else:
         content = content.rstrip("\n") + "\n\n" + COMMENTS_SECTION_HEADER + "\n\n" + entry
-    wu_file.write_text(content, encoding="utf-8")
+    atomic_write_text(wu_file, content)
 
     logger.info("agent/%s comment for %s: %s", agent_name, unit_id, message)
     print(json.dumps({"unit_id": unit_id, "agent": agent_name}))
@@ -3022,7 +3023,7 @@ def _emit_ci_failure_feedback(
     log_dir = WORKSPACE_ROOT / ".devbench" / "ci-failures"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{unit_id}-{attempt}.log"
-    log_path.write_text(log_text, encoding="utf-8")
+    atomic_write_text(log_path, log_text)
     summary = (
         f"CI checks failed for PR #{pr_number} on {canonical_repo} "
         f"(run #{run_id}, attempt {attempt}); trimmed log saved to {log_path}."
@@ -3235,7 +3236,7 @@ def _emit_pr_bot_feedback(
             for c in getattr(resolution, "unresolved_comments", [])
         ],
     }
-    feedback_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    atomic_write_text(feedback_path, json.dumps(payload, indent=2))
     return feedback_path
 
 
@@ -4625,7 +4626,7 @@ def cmd_log_rejection_feedback(*argv: str) -> int:
         "capped": capped,
     }
     target = archive_dir / f"{task_id}-{judge}-{attempt}.json"
-    target.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    atomic_write_text(target, json.dumps(record, indent=2, sort_keys=True) + "\n")
 
     print(json.dumps({"task_id": task_id, "judge": judge, "attempt": attempt, "path": str(target)}))
     return 0

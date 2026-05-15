@@ -68,6 +68,7 @@ from devbench.constants import (
     TRACEABILITY_MATRIX_HEADER,
     VALID_STATUSES,
 )
+from devbench.utils.io import atomic_write_text
 
 # Terminal statuses for parent-rollup purposes: a child in either state is
 # "finalised" and does not block its parent from rolling to done. Kept at
@@ -487,7 +488,7 @@ class BacklogManager:
 
             if content != original or audit_lines:
                 content = self._append_fix_audit(content, timestamp, audit_lines)
-                wu_path.write_text(content, encoding="utf-8")
+                atomic_write_text(wu_path, content)
                 files_fixed.add(wu_path)
 
         return fix_count, len(files_fixed)
@@ -743,7 +744,7 @@ class BacklogManager:
         if not matrix_path.exists():
             header = TRACEABILITY_MATRIX_HEADER
             matrix_path.parent.mkdir(parents=True, exist_ok=True)
-            matrix_path.write_text(header, encoding="utf-8")
+            atomic_write_text(matrix_path, header)
             self.logger.info("Created traceability matrix at %s", matrix_path)
 
         row = f"| {spec_ref} | {test_ref} | {timestamp} |\n"
@@ -813,7 +814,7 @@ class BacklogManager:
             new_lines.append(line)
 
         if changed:
-            work_unit_path.write_text("".join(new_lines), encoding="utf-8")
+            atomic_write_text(work_unit_path, "".join(new_lines))
 
     def _set_status(
         self,
@@ -955,7 +956,7 @@ class BacklogManager:
             content = content.rstrip("\n") + "\n\n" + rollup_comment
         else:
             content = content.rstrip("\n") + "\n\n" + COMMENTS_SECTION_HEADER + "\n\n" + rollup_comment
-        parent_file.write_text(content, encoding="utf-8")
+        atomic_write_text(parent_file, content)
 
     def _extract_pending_proposal_markers(self, work_unit_path: Path) -> set[str]:
         """Return the set of task IDs flagged by ``[BLOCKED_PENDING_PROPOSAL]`` markers.
@@ -1177,7 +1178,7 @@ class BacklogManager:
             raise ValueError(f"Could not find '## Status: ...' line in {work_unit_path}")
 
         updated = STATUS_LINE_RE.sub(rf"\g<1>{new_status}", content, count=1)
-        work_unit_path.write_text(updated, encoding="utf-8")
+        atomic_write_text(work_unit_path, updated)
 
     def _update_backlog_index(self, backlog_index: Path, unit_id: str, new_status: str) -> None:
         """Update the status column for a work unit in the BACKLOG.md table."""
@@ -1211,7 +1212,7 @@ class BacklogManager:
         if not updated:
             raise ValueError(f"Could not find unit '{unit_id}' with a recognized status in {backlog_index}")
 
-        backlog_index.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        atomic_write_text(backlog_index, "\n".join(lines) + "\n")
         self.logger.info("Updated %s status to '%s' in %s", unit_id, new_status, backlog_index.name)
 
     def _append_comment(self, work_unit_path: Path, action: str, message: str) -> None:
@@ -1232,7 +1233,7 @@ class BacklogManager:
         else:
             content = content.rstrip("\n") + "\n\n" + comments_header + "\n\n" + entry
 
-        work_unit_path.write_text(content, encoding="utf-8")
+        atomic_write_text(work_unit_path, content)
 
     def _append_agent_comment(self, work_unit_path: Path, agent_name: str, message: str) -> None:
         """Append an agent comment using COMMENT_AGENT_TEMPLATE format.
@@ -1258,7 +1259,7 @@ class BacklogManager:
         else:
             content = content.rstrip("\n") + "\n\n" + COMMENTS_SECTION_HEADER + "\n\n" + entry
 
-        work_unit_path.write_text(content, encoding="utf-8")
+        atomic_write_text(work_unit_path, content)
 
     @staticmethod
     def _find_next_section_index(lines: list[str], start: int) -> int:
@@ -1333,7 +1334,7 @@ class BacklogManager:
             new_lines.extend(lines[next_section_idx + 1 :])
             content = "\n".join(new_lines) + "\n"
 
-        work_unit_path.write_text(content, encoding="utf-8")
+        atomic_write_text(work_unit_path, content)
 
     def _update_status_summary(self, backlog_index: Path) -> None:
         """Rewrite the Status Summary table section in BACKLOG.md.
@@ -1368,7 +1369,7 @@ class BacklogManager:
         else:
             content = content.rstrip("\n") + "\n\n" + summary_block
 
-        backlog_index.write_text(content, encoding="utf-8")
+        atomic_write_text(backlog_index, content)
 
     def _parse_epic_titles(self, backlog_index: Path) -> dict[str, str]:
         """Parse epic IDs to their titles from BACKLOG.md table rows.

@@ -1622,6 +1622,7 @@ class _BacklogTotals:
     tasks_in_review: int  # non-Done tasks with status == IN_REVIEW (subset of tasks_active)
     tasks_proposed: int  # task-factory-generated drafts awaiting human review
     tasks_declined: int  # explicitly declined work (won't ever be done)
+    tasks_draft: int = 0  # pre-queue gate; not yet promoted to in-queue
     # E2-F2-S1: six per-state blocked counts (one per BlockedTaskState).
     tasks_blocked_auto_clearing: int = 0  # AUTO_CLEARING_VIA_PROPOSAL
     tasks_blocked_amendment_recovery: int = 0  # AWAITING_AMENDMENT_RECOVERY
@@ -1663,7 +1664,8 @@ def _backlog_totals_from_units(units: list) -> _BacklogTotals:
     tasks_in_review = [t for t in tasks if t.status == WorkUnitStatus.IN_REVIEW]
     tasks_proposed = [t for t in tasks if t.status == WorkUnitStatus.PROPOSED]
     tasks_declined = [t for t in tasks if t.status == WorkUnitStatus.DECLINED]
-    tasks_remaining = len(tasks) - len(tasks_done) - len(tasks_proposed) - len(tasks_declined)
+    tasks_draft = [t for t in tasks if t.status == WorkUnitStatus.DRAFT]
+    tasks_remaining = len(tasks) - len(tasks_done) - len(tasks_proposed) - len(tasks_declined) - len(tasks_draft)
     n_blocked_total = len(tasks_blocked_and_hold)
 
     # E2-F2-S1: classify each blocked/hold task into one of the six
@@ -1721,6 +1723,7 @@ def _backlog_totals_from_units(units: list) -> _BacklogTotals:
         tasks_in_review=len(tasks_in_review),
         tasks_proposed=len(tasks_proposed),
         tasks_declined=len(tasks_declined),
+        tasks_draft=len(tasks_draft),
         tasks_blocked_auto_clearing=cnt_auto_clearing,
         tasks_blocked_amendment_recovery=cnt_amendment_recovery,
         tasks_blocked_dependency=cnt_dependency,
@@ -1749,6 +1752,7 @@ def _backlog_state_rows(b: _BacklogTotals, lifetime: WindowStats | None = None) 
             f"{b.units_done} of {b.units_total} ({total_pct}%)",
         ),
         ("Tasks in-progress", str(b.tasks_in_progress)),
+        ("Tasks draft", str(b.tasks_draft)),
         ("Tasks proposed", str(b.tasks_proposed)),
         ("Tasks declined", str(b.tasks_declined)),
         ("Tasks blocked", str(b.tasks_blocked)),

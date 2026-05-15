@@ -3236,3 +3236,126 @@ class TestGenerateReportBacklogParseFailure:
         captured = capsys.readouterr()
         assert "devbench report: cannot parse" in captured.err
         assert "Backlog index not found" in captured.err
+
+
+class TestBacklogTotalsDraftColumn:
+    """AC-189-7: _BacklogTotals includes tasks_draft and generate_report renders it."""
+
+    @staticmethod
+    def _mk(uid: str, status: WorkUnitStatus) -> WorkUnit:
+        return WorkUnit(
+            id=uid,
+            title=f"task-{uid}",
+            status=status,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path(f"backlog/{uid}.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+
+    def test_backlog_totals_has_tasks_draft_field(self) -> None:
+        """_BacklogTotals exposes a tasks_draft integer field."""
+        from devbench.reporting.report import _BacklogTotals
+
+        b = _BacklogTotals(
+            tasks_total=5,
+            tasks_done=1,
+            units_total=5,
+            units_done=1,
+            stories_done=0,
+            features_done=0,
+            epics_done=0,
+            tasks_remaining=2,
+            tasks_blocked=1,
+            tasks_active=1,
+            tasks_in_progress=0,
+            tasks_in_queue=1,
+            tasks_in_review=0,
+            tasks_proposed=0,
+            tasks_declined=0,
+            tasks_draft=1,
+        )
+        assert b.tasks_draft == 1
+
+    def test_backlog_totals_from_units_counts_draft(self) -> None:
+        """_backlog_totals_from_units populates tasks_draft from DRAFT-status tasks."""
+        from devbench.reporting.report import _backlog_totals_from_units
+
+        units = [
+            self._mk("E0-F1-S1-T1", WorkUnitStatus.DONE),
+            self._mk("E0-F1-S1-T2", WorkUnitStatus.IN_QUEUE),
+            self._mk("E0-F1-S1-T3", WorkUnitStatus.DRAFT),
+            self._mk("E0-F1-S1-T4", WorkUnitStatus.DRAFT),
+        ]
+        b = _backlog_totals_from_units(units)
+        assert b.tasks_draft == 2
+
+    def test_draft_tasks_excluded_from_tasks_remaining(self) -> None:
+        """Draft tasks are excluded from tasks_remaining (like proposed/declined)."""
+        from devbench.reporting.report import _backlog_totals_from_units
+
+        units = [
+            self._mk("E0-F1-S1-T1", WorkUnitStatus.DONE),
+            self._mk("E0-F1-S1-T2", WorkUnitStatus.IN_QUEUE),
+            self._mk("E0-F1-S1-T3", WorkUnitStatus.DRAFT),
+        ]
+        b = _backlog_totals_from_units(units)
+        # tasks_remaining = total(3) - done(1) - proposed(0) - declined(0) - draft(1) = 1
+        assert b.tasks_remaining == 1
+        assert b.tasks_active == 1
+        assert b.tasks_draft == 1
+
+    def test_backlog_state_rows_include_tasks_draft(self) -> None:
+        """_backlog_state_rows includes a 'Tasks draft' row with the draft count."""
+        from devbench.reporting.report import _backlog_state_rows, _backlog_totals_from_units
+
+        units = [
+            self._mk("E0-F1-S1-T1", WorkUnitStatus.DONE),
+            self._mk("E0-F1-S1-T2", WorkUnitStatus.IN_QUEUE),
+            self._mk("E0-F1-S1-T3", WorkUnitStatus.DRAFT),
+            self._mk("E0-F1-S1-T4", WorkUnitStatus.DRAFT),
+        ]
+        b = _backlog_totals_from_units(units)
+        rows = dict(_backlog_state_rows(b))
+        assert "Tasks draft" in rows
+        assert rows["Tasks draft"] == "2"
+
+    def test_draft_zero_still_rendered(self) -> None:
+        """Draft row appears even when count is zero (consistent with other status rows)."""
+        from devbench.reporting.report import _backlog_state_rows, _backlog_totals_from_units
+
+        units = [
+            self._mk("E0-F1-S1-T1", WorkUnitStatus.DONE),
+            self._mk("E0-F1-S1-T2", WorkUnitStatus.IN_QUEUE),
+        ]
+        b = _backlog_totals_from_units(units)
+        rows = dict(_backlog_state_rows(b))
+        assert "Tasks draft" in rows
+        assert rows["Tasks draft"] == "0"
+
+    def test_invariant_all_statuses_sum_to_total(self) -> None:
+        """All per-status fields sum to tasks_total."""
+        from devbench.reporting.report import _backlog_totals_from_units
+
+        units = [
+            self._mk("E0-F1-S1-T1", WorkUnitStatus.DONE),
+            self._mk("E0-F1-S1-T2", WorkUnitStatus.IN_QUEUE),
+            self._mk("E0-F1-S1-T3", WorkUnitStatus.IN_PROGRESS),
+            self._mk("E0-F1-S1-T4", WorkUnitStatus.BLOCKED),
+            self._mk("E0-F1-S1-T5", WorkUnitStatus.IN_REVIEW),
+            self._mk("E0-F1-S1-T6", WorkUnitStatus.PROPOSED),
+            self._mk("E0-F1-S1-T7", WorkUnitStatus.DECLINED),
+            self._mk("E0-F1-S1-T8", WorkUnitStatus.DRAFT),
+        ]
+        b = _backlog_totals_from_units(units)
+        total = (
+            b.tasks_done
+            + b.tasks_in_queue
+            + b.tasks_in_progress
+            + b.tasks_blocked
+            + b.tasks_in_review
+            + b.tasks_proposed
+            + b.tasks_declined
+            + b.tasks_draft
+        )
+        assert total == b.tasks_total

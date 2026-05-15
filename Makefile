@@ -89,9 +89,9 @@ test-unit:
 test-coverage:
 	uv run pytest tests/ --cov=devbench --cov-report=term-missing --cov-fail-under=90
 
-## test-coverage-new: Enforce 100% line coverage on modules introduced or hardened by the manifest-amendment, task-factory, watch, git-ops-assertion, hook-tail, auto-requeue, report-perf-roadmap (issue #162), per-agent-model-overrides (ADR-25), scope-selectors (issue #190), and named-sessions (issue #192) features
+## test-coverage-new: Enforce 100% line coverage on modules introduced or hardened by the manifest-amendment, task-factory, watch, git-ops-assertion, hook-tail, auto-requeue, report-perf-roadmap (issue #162), per-agent-model-overrides (ADR-25), scope-selectors (issue #190), named-sessions (issue #192), and drain (issue #188) features
 test-coverage-new:
-	uv run pytest tests/ --cov=devbench.backlog.manifest --cov=devbench.backlog.amendment --cov=devbench.backlog.proposal --cov=devbench.backlog.manager --cov=devbench.activity --cov=devbench.github.git_ops --cov=devbench.hook_tail --cov=devbench.reporting.snapshot --cov=devbench.reporting.window_stats --cov=devbench.reporting.archive --cov=devbench.reporting.sharded_log --cov=devbench.plugin_shadow --cov=devbench.scope --cov=devbench.session --cov-report=term-missing --cov-fail-under=100
+	uv run pytest tests/ --cov=devbench.backlog.manifest --cov=devbench.backlog.amendment --cov=devbench.backlog.proposal --cov=devbench.backlog.manager --cov=devbench.activity --cov=devbench.github.git_ops --cov=devbench.hook_tail --cov=devbench.reporting.snapshot --cov=devbench.reporting.window_stats --cov=devbench.reporting.archive --cov=devbench.reporting.sharded_log --cov=devbench.plugin_shadow --cov=devbench.scope --cov=devbench.session --cov=devbench.drain --cov-report=term-missing --cov-fail-under=100
 
 ## test: Run all tests
 test: test-unit

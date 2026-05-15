@@ -147,6 +147,51 @@ def test_range_task_level(backlog_ids: list[str]) -> None:
 
 
 @pytest.mark.unit
+def test_range_feature_level_spec_fixture() -> None:
+    """E5-F1-F3 expands to F1, F2, F3 and their descendants -- spec section 4.2.1 example."""
+    ids = [
+        "E5",
+        "E5-F1",
+        "E5-F1-S1",
+        "E5-F1-S1-T1",
+        "E5-F2",
+        "E5-F2-S1",
+        "E5-F2-S1-T1",
+        "E5-F3",
+        "E5-F3-S1",
+        "E5-F3-S1-T1",
+        "E5-F4",
+        "E5-F4-S1",
+        "E5-F4-S1-T1",
+    ]
+    sf = ScopeFilter.parse("E5-F1-F3", "", ids)
+    assert sf.allows("E5-F1-S1-T1"), "F1 descendants must be included"
+    assert sf.allows("E5-F2-S1-T1"), "F2 descendants must be included"
+    assert sf.allows("E5-F3-S1-T1"), "F3 descendants must be included"
+    assert not sf.allows("E5-F4-S1-T1"), "F4 is outside the range and must be excluded"
+
+
+@pytest.mark.unit
+def test_range_task_level_mid_range_spec_fixture() -> None:
+    """E5-F1-S1-T2-T5 expands to T2, T3, T4, T5 (inclusive) -- spec section 4.2.1 example."""
+    ids = [
+        "E5-F1-S1-T1",
+        "E5-F1-S1-T2",
+        "E5-F1-S1-T3",
+        "E5-F1-S1-T4",
+        "E5-F1-S1-T5",
+        "E5-F1-S1-T6",
+    ]
+    sf = ScopeFilter.parse("E5-F1-S1-T2-T5", "", ids)
+    assert not sf.allows("E5-F1-S1-T1"), "T1 is before the range start"
+    assert sf.allows("E5-F1-S1-T2"), "T2 is the range start (inclusive)"
+    assert sf.allows("E5-F1-S1-T3"), "T3 is within the range"
+    assert sf.allows("E5-F1-S1-T4"), "T4 is within the range"
+    assert sf.allows("E5-F1-S1-T5"), "T5 is the range end (inclusive)"
+    assert not sf.allows("E5-F1-S1-T6"), "T6 is after the range end"
+
+
+@pytest.mark.unit
 def test_single_segment_range_same_value_is_single_id(backlog_ids: list[str]) -> None:
     """A range whose two endpoints are identical is treated as a single-ID token."""
     sf = ScopeFilter.parse("E2-E2", "", backlog_ids)
@@ -514,6 +559,53 @@ def test_non_numeric_shared_letter_prefix_treated_as_single_id(backlog_ids: list
     sf = ScopeFilter.parse("E1-E2a", "", backlog_ids)
     # 'E1-E2a' as a prefix matches nothing in backlog_ids
     assert len(sf.expanded_ids) == 0
+
+
+# ---------------------------------------------------------------------------
+# AC-190-5 extension: malformed token syntax raises InvalidScopeError (fail-fast)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "bad_token",
+    [
+        "-E1",
+        "E1-",
+        "-",
+        "E1--E3",
+    ],
+)
+def test_malformed_token_leading_or_trailing_hyphen_raises(bad_token: str, backlog_ids: list[str]) -> None:
+    """Tokens with leading/trailing hyphens or consecutive hyphens are syntactically
+    invalid and must raise InvalidScopeError with an actionable message (fail-fast).
+
+    A leading or trailing hyphen produces an empty segment when split on '-', which
+    is not a valid work-unit ID segment (all valid segments are non-empty alphanumeric).
+    Out-of-range warnings apply only to well-formed tokens that happen to match nothing;
+    they do not apply to structurally malformed input.
+
+    Spec: section 4.2.1, fail-fast principle in Code Standards.
+    """
+    with pytest.raises(InvalidScopeError, match=r"(?i)malformed"):
+        ScopeFilter.parse(bad_token, "", backlog_ids)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "bad_token",
+    [
+        "-E1",
+        "E1-",
+    ],
+)
+def test_malformed_token_in_exclude_str_raises(bad_token: str, backlog_ids: list[str]) -> None:
+    """Malformed tokens in exclude_str also raise InvalidScopeError (fail-fast).
+
+    Spec: section 4.2.1, fail-fast principle in Code Standards.
+    """
+    with pytest.raises(InvalidScopeError, match=r"(?i)malformed"):
+        ScopeFilter.parse("E1", bad_token, backlog_ids)
 
 
 # ---------------------------------------------------------------------------

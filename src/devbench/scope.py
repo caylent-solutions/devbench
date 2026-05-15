@@ -7,7 +7,9 @@ the pre-expanded set of matching work-unit IDs.  Supports O(1) membership checks
 See spec section 4.2.1 and acceptance criteria AC-190-1 through AC-190-9.
 
 Raises:
-    InvalidScopeError: when a range token is reversed (end < start on the final segment).
+    InvalidScopeError: when a range token is reversed (end < start on the final segment),
+        or when a token is structurally malformed (leading, trailing, or consecutive hyphens
+        producing empty segments).
 """
 
 from __future__ import annotations
@@ -31,7 +33,8 @@ _SCOPE_FILENAME = "scope.json"
 class InvalidScopeError(ValueError):
     """Raised when a scope token is syntactically invalid.
 
-    Currently raised for reverse ranges, e.g. ``E3-E1`` or ``E1-F1-S1-T3-T1``.
+    Raised for reverse ranges (e.g. ``E3-E1`` or ``E1-F1-S1-T3-T1``) and
+    structurally malformed tokens (e.g. ``-E1``, ``E1-``, ``E1--E3``).
     The error message includes the offending token and the expected order so the
     caller can surface an actionable diagnostic.
     """
@@ -57,6 +60,29 @@ def _tokenise(raw: str) -> list[str]:
         List of non-empty, whitespace-stripped token strings.
     """
     return [t.strip() for t in raw.split(",") if t.strip()]
+
+
+def _validate_token(token: str) -> None:
+    """Raise ``InvalidScopeError`` if ``token`` is structurally malformed.
+
+    A token is malformed when any hyphen-delimited segment is empty, which
+    happens with leading hyphens (``-E1``), trailing hyphens (``E1-``), or
+    consecutive hyphens (``E1--E3``).  These are syntactic errors, not
+    out-of-range conditions, and must be rejected immediately (fail-fast).
+
+    Args:
+        token: A single, whitespace-stripped scope token.
+
+    Raises:
+        InvalidScopeError: If ``token`` contains an empty segment.
+    """
+    segments = token.split("-")
+    if any(seg == "" for seg in segments):
+        raise InvalidScopeError(
+            f"Malformed scope token '{token}': each hyphen-delimited segment must be"
+            f" non-empty. Leading hyphens, trailing hyphens, and consecutive hyphens"
+            f" are not valid. Example of valid tokens: 'E1', 'E1-F2', 'E1-E3'."
+        )
 
 
 def _expand_token(token: str, backlog_ids: list[str]) -> set[str]:
@@ -85,8 +111,11 @@ def _expand_token(token: str, backlog_ids: list[str]) -> set[str]:
         Set of IDs from ``backlog_ids`` matched by this token.
 
     Raises:
-        InvalidScopeError: If the token is a reversed range (end < start).
+        InvalidScopeError: If the token is a reversed range (end < start) or
+            structurally malformed (empty segment from leading/trailing/consecutive
+            hyphens).
     """
+    _validate_token(token)
     parts = token.split("-")
     # Detect range: last two parts share the same letter prefix (E/F/S/T)
     # but differ in their integer value.
@@ -239,7 +268,8 @@ class ScopeFilter:
             ``allows()`` calls.
 
         Raises:
-            InvalidScopeError: If any range token is reversed.
+            InvalidScopeError: If any token is a reversed range or structurally
+                malformed (empty segment from leading/trailing/consecutive hyphens).
         """
         include_tokens = _tokenise(include_str)
         exclude_tokens = _tokenise(exclude_str)

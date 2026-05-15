@@ -232,6 +232,27 @@ since the last release. PR #119 carries every change.
 
 ### Fixed
 
+- **ETA denominator now includes `RUNTIME_DEGRADATION` tasks**
+  (issue #183 follow-up, paired with the renderer-bucketing fix above).
+  `_compute_window_stats` previously computed
+  `eta_task_count = tasks_active + tasks_blocked_recovery + tasks_blocked_auto`,
+  excluding `RUNTIME_DEGRADATION` from the auto-recoverable denominator
+  even though an operator restart of `make start` clears it -- so the
+  bucket is auto-recoverable in exactly the same sense as
+  `AWAITING_AMENDMENT_RECOVERY`, `AWAITING_DEPENDENCY`, and
+  `AUTO_CLEARING_VIA_PROPOSAL`. The trailing-summary `attn_blocked`
+  formula had the matching gap and was treating runtime-degradation
+  tasks as operator-attention work. `_compute_window_stats` gains a
+  `tasks_blocked_runtime_degradation` parameter; `WindowStats` gains an
+  `eta_blocked_runtime_degradation` field; `eta_task_count`,
+  `eta_total`, and `attn_blocked` all grow the new term consistently;
+  `_format_est_hours_display`'s breakdown suffix surfaces the new
+  bucket. All three call sites in `_render_report` thread
+  `backlog.tasks_blocked_runtime_degradation` through. Pinned by
+  `tests/test_reporting/test_report.py::TestEtaIncludesBlockedRecoveryAndAuto::test_compute_window_stats_uses_combined_denominator`
+  (extended) and the new
+  `test_runtime_degradation_changes_eta_total`.
+
 - **`devbench report` now buckets `RUNTIME_DEGRADATION` correctly**
   (issue #183 follow-up). The classifier `classify_blocked_task` already
   returned `BlockedTaskState.RUNTIME_DEGRADATION` for tasks whose

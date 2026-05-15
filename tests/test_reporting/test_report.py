@@ -2916,8 +2916,10 @@ class TestReportRowColors:
 
 
 class TestEtaIncludesBlockedRecoveryAndAuto:
-    """Issue #157: the ETA denominator now includes the recovery + auto-clearing
-    blocked buckets, but excludes the operator-attention bucket."""
+    """Issue #157 + issue #183 follow-up: the ETA denominator includes
+    every auto-recoverable bucket -- recovery, auto-clearing, and
+    runtime-degradation -- and excludes only the operator-attention bucket.
+    """
 
     def test_compute_window_stats_uses_combined_denominator(self, tmp_path: Path) -> None:
         from devbench.reporting.report import _compute_window_stats
@@ -2941,13 +2943,50 @@ class TestEtaIncludesBlockedRecoveryAndAuto:
             tasks_active=4,
             tasks_blocked_recovery=60,
             tasks_blocked_auto=27,
+            tasks_blocked_runtime_degradation=2,
         )
         # ETA bucket counts surface on the WindowStats dataclass.
         assert stats.eta_active == 4
         assert stats.eta_blocked_recovery == 60
         assert stats.eta_blocked_auto == 27
-        # est_hours scales with (4 + 60 + 27) -- denominator includes recovery + auto.
+        assert stats.eta_blocked_runtime_degradation == 2
+        # est_hours scales with (4 + 60 + 27 + 2) -- denominator
+        # includes every auto-recoverable bucket.
         assert stats.est_hours > 0
+
+    def test_runtime_degradation_changes_eta_total(self, tmp_path: Path) -> None:
+        """A RUNTIME_DEGRADATION task increments est_hours by exactly one
+        pace-step, confirming it's in the denominator alongside the
+        other auto-recover buckets."""
+        from devbench.reporting.report import _compute_window_stats
+
+        now = datetime(2026, 5, 2, 12, 0, 0, tzinfo=UTC)
+        done_times: dict[str, datetime] = {}
+        progress_times: dict[str, datetime] = {}
+        for i in range(5):
+            tid = f"E0-F1-S1-T{i + 1}"
+            progress_times[tid] = now - timedelta(minutes=20 + i)
+            done_times[tid] = now - timedelta(minutes=10 + i)
+        log_path = tmp_path / "log.log"
+        log_path.write_text("", encoding="utf-8")
+
+        def _eta(rt_degradation: int) -> float:
+            stats = _compute_window_stats(
+                log_path,
+                now - timedelta(hours=1),
+                now,
+                done_times,
+                progress_times,
+                tasks_active=4,
+                tasks_blocked_recovery=0,
+                tasks_blocked_auto=0,
+                tasks_blocked_runtime_degradation=rt_degradation,
+            )
+            return stats.est_hours
+
+        eta_without = _eta(0)
+        eta_with = _eta(4)
+        assert eta_with > eta_without, f"RUNTIME_DEGRADATION must increase est_hours; got {eta_with=} vs {eta_without=}"
 
 
 class TestEtaFallsBackOnInsufficientPaceData:

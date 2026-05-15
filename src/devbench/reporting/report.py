@@ -182,6 +182,12 @@ class WindowStats:
     eta_active: int = 0
     eta_blocked_recovery: int = 0
     eta_blocked_auto: int = 0
+    # Issue #183 follow-up: RUNTIME_DEGRADATION tasks auto-recover when
+    # the orchestrator restarts (cmd_start exit-42 + Makefile while-loop).
+    # They belong in the ETA denominator alongside the other auto-recover
+    # buckets so the projection reflects work that WILL get done without
+    # operator intervention.
+    eta_blocked_runtime_degradation: int = 0
 
     @property
     def total_tokens(self) -> int:
@@ -812,6 +818,7 @@ def _compute_window_stats(
     tasks_active: int,
     tasks_blocked_recovery: int = 0,
     tasks_blocked_auto: int = 0,
+    tasks_blocked_runtime_degradation: int = 0,
     *,
     event_index: EventIndex | None = None,
     recent_per_task_cost: float | None = None,
@@ -819,11 +826,14 @@ def _compute_window_stats(
 ) -> WindowStats:
     """Compute all time-windowed statistics for a single window.
 
-    Issue #157: the ETA denominator now includes blocked tasks that
-    devbench will recover on its own -- ``tasks_blocked_recovery``
-    (AWAITING_AMENDMENT_RECOVERY + AWAITING_DEPENDENCY) and ``tasks_blocked_auto``
-    (AUTO_CLEARING_VIA_PROPOSAL) -- in addition to ``tasks_active``.
-    The operator-attention bucket stays excluded since those represent
+    Issue #157 + issue #183 follow-up: the ETA denominator includes
+    blocked tasks that devbench will recover on its own --
+    ``tasks_blocked_recovery`` (AWAITING_AMENDMENT_RECOVERY +
+    AWAITING_DEPENDENCY), ``tasks_blocked_auto`` (AUTO_CLEARING_VIA_PROPOSAL),
+    and ``tasks_blocked_runtime_degradation`` (RUNTIME_DEGRADATION --
+    `make start`'s auto-restart loop clears these without operator
+    intervention) -- in addition to ``tasks_active``. The
+    operator-attention bucket stays excluded since those represent
     genuine halts with unbounded ETA. When the recent-pace window has
     fewer than ``MIN_PACE_SAMPLES`` completed tasks the pace fallback
     path is taken; ``est_hours`` reads zero (renderer shows "n/a").
@@ -855,7 +865,7 @@ def _compute_window_stats(
     recent_pace_minutes: float | None = _recent_pace_minutes(done_times, progress_times, RECENT_PACE_TASKS)
 
     pace_for_projection = recent_pace_minutes if recent_pace_minutes is not None else avg_minutes
-    eta_task_count = tasks_active + tasks_blocked_recovery + tasks_blocked_auto
+    eta_task_count = tasks_active + tasks_blocked_recovery + tasks_blocked_auto + tasks_blocked_runtime_degradation
     est_hours = (eta_task_count * pace_for_projection) / SECONDS_PER_MINUTE if pace_for_projection else 0.0
 
     # Combine usage from two sources, both filtered by window_start:
@@ -968,6 +978,7 @@ def _compute_window_stats(
         eta_active=tasks_active,
         eta_blocked_recovery=tasks_blocked_recovery,
         eta_blocked_auto=tasks_blocked_auto,
+        eta_blocked_runtime_degradation=tasks_blocked_runtime_degradation,
     )
 
 
@@ -1409,6 +1420,7 @@ def _format_est_hours_display(stats: WindowStats) -> str:
             f"~{stats.est_hours:.1f} h (active {stats.eta_active}"
             f" + blocked-recovery {stats.eta_blocked_recovery}"
             f" + blocked-auto {stats.eta_blocked_auto}"
+            f" + blocked-runtime-degradation {stats.eta_blocked_runtime_degradation}"
             f" at {stats.recent_pace_minutes:.1f} min/task)"
         )
     if stats.est_hours:
@@ -1581,8 +1593,13 @@ def _summary_line(stats: WindowStats, tasks_active: int, tasks_blocked: int) -> 
     ``recent_pace_minutes`` when available; falls back to
     ``avg_minutes`` otherwise.
     """
-    eta_total = tasks_active + stats.eta_blocked_recovery + stats.eta_blocked_auto
-    attn_blocked = max(0, tasks_blocked - stats.eta_blocked_recovery - stats.eta_blocked_auto)
+    eta_total = (
+        tasks_active + stats.eta_blocked_recovery + stats.eta_blocked_auto + stats.eta_blocked_runtime_degradation
+    )
+    attn_blocked = max(
+        0,
+        tasks_blocked - stats.eta_blocked_recovery - stats.eta_blocked_auto - stats.eta_blocked_runtime_degradation,
+    )
     blocked_note = f" -- {attn_blocked} blocked excluded" if attn_blocked else ""
     if eta_total == 0:
         if tasks_blocked:
@@ -2306,6 +2323,7 @@ def generate_report(
             backlog.tasks_active,
             backlog.tasks_blocked_recovery,
             backlog.tasks_blocked_auto,
+            backlog.tasks_blocked_runtime_degradation,
             event_index=event_index,
             recent_per_task_cost=recent_per_task_cost,
         )
@@ -2336,6 +2354,7 @@ def generate_report(
             backlog.tasks_active,
             backlog.tasks_blocked_recovery,
             backlog.tasks_blocked_auto,
+            backlog.tasks_blocked_runtime_degradation,
             event_index=event_index,
             recent_per_task_cost=recent_per_task_cost,
             lifetime_total_cost=lifetime_total_cost,

@@ -235,8 +235,12 @@ def cmd_status(*argv: str) -> int:
     total = len(units)
     unmaterialised_count = _count_unmaterialised_proposed_tasks()
     blocked_counts = _count_blocked_split(units)
+    draft_count = counts.get("draft", 0)
+
     print("Backlog Status Summary")
     print("=" * STATUS_SEPARATOR_WIDTH)
+    print(f"  {'TOTAL':<15} {total:>4}")
+    print(f"  {'Draft':<15} {draft_count:>4}")
     blocked_rows: list[tuple[str, BlockedTaskState]] = [
         ("Blocked (auto-clearing)", BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL),
         ("Blocked (amendment-recovery)", BlockedTaskState.AWAITING_AMENDMENT_RECOVERY),
@@ -254,7 +258,6 @@ def cmd_status(*argv: str) -> int:
         count = counts.get(status_val.lower(), 0)
         print(f"  {status_val:<15} {count:>4}")
     print(f"  {'Un-materialised':<15} {unmaterialised_count:>4}")
-    print(f"  {'TOTAL':<15} {total:>4}")
 
     active = [u for u in units if u.status in (WorkUnitStatus.IN_PROGRESS, WorkUnitStatus.IN_REVIEW)]
     if active:

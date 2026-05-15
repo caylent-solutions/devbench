@@ -119,6 +119,158 @@ class TestCmdStatus:
         assert result == 0
         assert "1 blocked" in capsys.readouterr().out
 
+    @staticmethod
+    def _build_draft_units(draft_count: int, queued_count: int = 1) -> list[WorkUnit]:
+        """Build a list of WorkUnits with the given number of draft and queued tasks."""
+        units: list[WorkUnit] = []
+        for i in range(draft_count):
+            units.append(
+                WorkUnit(
+                    id=f"E0-F1-S1-T{i + 1}",
+                    title=f"Draft task {i + 1}",
+                    status=WorkUnitStatus.DRAFT,
+                    unit_type=WorkUnitType.TASK,
+                    file_path=Path(f"backlog/E0-F1-S1-T{i + 1}.md"),
+                    repo="caylent-solutions/git-repo",
+                    dependencies=[],
+                ),
+            )
+        for i in range(queued_count):
+            idx = draft_count + i + 1
+            units.append(
+                WorkUnit(
+                    id=f"E0-F1-S1-T{idx}",
+                    title=f"Queued task {i + 1}",
+                    status=WorkUnitStatus.IN_QUEUE,
+                    unit_type=WorkUnitType.TASK,
+                    file_path=Path(f"backlog/E0-F1-S1-T{idx}.md"),
+                    repo="caylent-solutions/git-repo",
+                    dependencies=[],
+                ),
+            )
+        return units
+
+    @staticmethod
+    def _make_status_mock_parser(
+        units: list[WorkUnit],
+        candidates: list[WorkUnit] | None = None,
+        blocked: list[WorkUnit] | None = None,
+    ) -> MagicMock:
+        """Create a mock BacklogParser configured for cmd_status tests."""
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = units
+        mock_parser.get_parallel_candidates.return_value = candidates or []
+        mock_parser.all_done.return_value = False
+        mock_parser.get_blocked_units.return_value = blocked or []
+        return mock_parser
+
+    def test_draft_row_rendered_with_correct_count(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """AC-189-6: cmd_status summary table includes a Draft row with correct count."""
+        units = self._build_draft_units(draft_count=2)
+        mock_parser = self._make_status_mock_parser(
+            units,
+            candidates=[units[-1]],
+        )
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_status()
+
+        assert result == 0
+        out = capsys.readouterr().out
+        draft_line = next(line for line in out.splitlines() if "Draft" in line)
+        assert "2" in draft_line
+
+    def test_draft_row_appears_between_total_and_in_queue(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """AC-189-6: Draft row is rendered between TOTAL and In Queue."""
+        units = self._build_draft_units(draft_count=1)
+        mock_parser = self._make_status_mock_parser(
+            units,
+            candidates=[units[-1]],
+        )
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_status()
+
+        assert result == 0
+        out = capsys.readouterr().out
+        lines = out.splitlines()
+        total_idx = next(i for i, line in enumerate(lines) if "TOTAL" in line)
+        draft_idx = next(i for i, line in enumerate(lines) if "Draft" in line)
+        in_queue_idx = next(i for i, line in enumerate(lines) if "In Queue" in line)
+        # Draft must be between TOTAL and In Queue
+        assert total_idx < draft_idx < in_queue_idx
+
+    def test_draft_row_zero_when_no_drafts(
+        self, mock_units: list[WorkUnit], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Draft row shows 0 when no units have draft status."""
+        mock_parser = self._make_status_mock_parser(
+            mock_units,
+            candidates=[mock_units[1]],
+            blocked=[mock_units[2]],
+        )
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_status()
+
+        assert result == 0
+        out = capsys.readouterr().out
+        draft_line = next(line for line in out.splitlines() if "Draft" in line)
+        assert "0" in draft_line
+
+
+class TestCmdStatusDraftRowIntegration:
+    """Integration test: Draft row rendered against a real fixture workspace (no mocks)."""
+
+    @staticmethod
+    def _build_draft_backlog(tmp_path: Path) -> Path:
+        """Build a real backlog workspace with draft-status work units on disk."""
+        wu_dir = tmp_path / "backlog"
+        wu_dir.mkdir(exist_ok=True)
+        rows = [
+            ("E0-F1-S1-T1", "Task", "draft"),
+            ("E0-F1-S1-T2", "Task", "draft"),
+            ("E0-F1-S1-T3", "Task", "in-queue"),
+        ]
+        index_lines = [
+            "# Backlog\n",
+            "## Full Work Unit Index\n",
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |",
+            "|----|-------|------|--------|--------------|------|-----------|",
+        ]
+        for unit_id, unit_type, status in rows:
+            file_path = f"backlog/{unit_id}.md"
+            index_lines.append(
+                f"| {unit_id} | {unit_id} | {unit_type} | {status} | None | "
+                f"caylent-solutions/test-repo | `{file_path}` |"
+            )
+            wu_body = f"# {unit_id}: Test\n\n## Status: {status}\n\n## Description\n\nx\n"
+            (wu_dir / f"{unit_id}.md").write_text(wu_body)
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text("\n".join(index_lines) + "\n")
+        return index_path
+
+    def test_draft_row_real_fixture(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """AC-189-6: Draft row rendered with real BacklogParser against fixture workspace."""
+        index_path = self._build_draft_backlog(tmp_path)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_status()
+        assert rc == 0
+        out = capsys.readouterr().out
+        lines = out.splitlines()
+        # Draft row exists with count of 2
+        draft_line = next(line for line in lines if "Draft" in line)
+        assert "2" in draft_line
+        # Ordering: TOTAL < Draft < In Queue
+        total_idx = next(i for i, line in enumerate(lines) if "TOTAL" in line)
+        draft_idx = next(i for i, line in enumerate(lines) if "Draft" in line)
+        in_queue_idx = next(i for i, line in enumerate(lines) if "In Queue" in line)
+        assert total_idx < draft_idx < in_queue_idx
+
 
 class TestCmdStatusDetail:
     """E220: ``devbench status --detail`` renders in-queue / blocked / held panels."""

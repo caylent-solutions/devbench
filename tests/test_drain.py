@@ -10,7 +10,7 @@ Covers:
 - cancel_drain: deletes file when present (returns True); idempotent when absent (returns False)
 - read_drain_state: returns None when absent; returns DrainState when present;
   raises ValueError for invalid JSON; raises ValueError for non-dict JSON root;
-  raises ValueError for missing required fields; raises ValueError for bad datetime
+  raises KeyError for missing required fields; raises ValueError for bad datetime
 - consume_drain: returns None when absent; returns DrainState and deletes file when present;
   propagates ValueError from read_drain_state
 """
@@ -390,7 +390,7 @@ class TestReadDrainState:
         with pytest.raises(ValueError, match="must contain a JSON object"):
             read_drain_state(tmp_path)
 
-    def test_raises_value_error_for_missing_requested_at(self, tmp_path: Path) -> None:
+    def test_raises_key_error_for_missing_requested_at(self, tmp_path: Path) -> None:
         signal = tmp_path / DRAIN_SIGNAL_NAME
         signal.parent.mkdir(parents=True, exist_ok=True)
         signal.write_text(json.dumps({"requested_by": "alice", "reason": "r"}), encoding="utf-8")

@@ -8,6 +8,7 @@ import pytest
 
 from devbench.backlog.parser import BacklogParser
 from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
+from devbench.scope import ScopeFilter
 
 
 class TestParseIndex:
@@ -984,3 +985,161 @@ class TestParseStatusDraft:
 
         assert len(units) == 1
         assert units[0].status is WorkUnitStatus.DRAFT
+
+
+class TestGetParallelCandidatesWithScope:
+    """Tests for get_parallel_candidates(scope=) -- AC-190-12.
+
+    When a ``ScopeFilter`` is provided, only work units whose IDs are in
+    ``scope.expanded_ids`` are returned.  When ``scope=None`` (the default),
+    the existing behaviour is unchanged.
+    """
+
+    @staticmethod
+    def _make_parser() -> BacklogParser:
+        parser = BacklogParser.__new__(BacklogParser)
+        parser._backlog_root = Path("/tmp")
+        parser._backlog_index = Path("/tmp/B.md")
+        return parser
+
+    @staticmethod
+    def _task(
+        id_: str,
+        *,
+        status: WorkUnitStatus = WorkUnitStatus.IN_QUEUE,
+        deps: list[str] | None = None,
+    ) -> WorkUnit:
+        return WorkUnit(
+            id=id_,
+            title=id_,
+            status=status,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("/dev/null"),
+            repo="r",
+            dependencies=deps or [],
+        )
+
+    def test_no_scope_returns_all_candidates(self) -> None:
+        """Default behaviour (scope=None) is unchanged -- all actionable tasks returned."""
+        parser = self._make_parser()
+        units = [
+            self._task("E0-F1-S1-T1"),
+            self._task("E0-F1-S1-T2"),
+        ]
+        candidates = parser.get_parallel_candidates(units, scope=None)
+        assert len(candidates) == 2
+        candidate_ids = {u.id for u in candidates}
+        assert candidate_ids == {"E0-F1-S1-T1", "E0-F1-S1-T2"}
+
+    def test_scope_filters_to_only_matching_ids(self) -> None:
+        """When scope is provided, only WUs in scope.expanded_ids are returned."""
+        parser = self._make_parser()
+        units = [
+            self._task("E0-F1-S1-T1"),
+            self._task("E0-F1-S1-T2"),
+            self._task("E0-F1-S1-T3"),
+        ]
+        scope = ScopeFilter(
+            include=["E0-F1-S1-T1"],
+            exclude=[],
+            expanded_ids={"E0-F1-S1-T1"},
+        )
+        candidates = parser.get_parallel_candidates(units, scope=scope)
+        assert len(candidates) == 1
+        assert candidates[0].id == "E0-F1-S1-T1"
+
+    def test_scope_empty_expanded_ids_returns_empty_list(self) -> None:
+        """When scope.expanded_ids is empty, no candidates are returned."""
+        parser = self._make_parser()
+        units = [
+            self._task("E0-F1-S1-T1"),
+            self._task("E0-F1-S1-T2"),
+        ]
+        scope = ScopeFilter(
+            include=[],
+            exclude=[],
+            expanded_ids=set(),
+        )
+        candidates = parser.get_parallel_candidates(units, scope=scope)
+        assert candidates == []
+
+    def test_scope_filters_but_deps_still_enforced(self) -> None:
+        """Scope filtering is applied after dependency checking -- a task in scope
+        with unsatisfied deps is still excluded."""
+        parser = self._make_parser()
+        units = [
+            self._task("E0-F1-S1-T1", status=WorkUnitStatus.IN_QUEUE),
+            self._task("E0-F1-S1-T2", deps=["E0-F1-S1-T1"]),
+        ]
+        # Both T1 and T2 are in scope, but T2 depends on T1 which is IN_QUEUE (not DONE).
+        scope = ScopeFilter(
+            include=["E0-F1-S1"],
+            exclude=[],
+            expanded_ids={"E0-F1-S1-T1", "E0-F1-S1-T2"},
+        )
+        candidates = parser.get_parallel_candidates(units, scope=scope)
+        candidate_ids = {u.id for u in candidates}
+        # T1 is actionable and in scope; T2 is not actionable (dep unsatisfied).
+        assert "E0-F1-S1-T1" in candidate_ids
+        assert "E0-F1-S1-T2" not in candidate_ids
+
+    def test_scope_preserves_topological_sort_order(self) -> None:
+        """When scope is active, the returned candidates are still sorted by
+        (status_priority, depth, id) -- scope only narrows the set, not the order."""
+        parser = self._make_parser()
+        done = self._task("E0-F1-S1-T1", status=WorkUnitStatus.DONE)
+        t2 = self._task("E0-F1-S1-T2", deps=["E0-F1-S1-T1"])
+        t3 = self._task("E0-F1-S1-T3", deps=["E0-F1-S1-T1"])
+        units = [done, t3, t2]
+        scope = ScopeFilter(
+            include=["E0-F1-S1-T2", "E0-F1-S1-T3"],
+            exclude=[],
+            expanded_ids={"E0-F1-S1-T2", "E0-F1-S1-T3"},
+        )
+        candidates = parser.get_parallel_candidates(units, scope=scope)
+        assert len(candidates) == 2
+        # Both at same depth; sorted by id (T2 before T3).
+        assert candidates[0].id == "E0-F1-S1-T2"
+        assert candidates[1].id == "E0-F1-S1-T3"
+
+    def test_scope_excludes_non_matching_actionable_tasks(self) -> None:
+        """Actionable tasks NOT in scope.expanded_ids are excluded from the result."""
+        parser = self._make_parser()
+        units = [
+            self._task("E1-F1-S1-T1"),
+            self._task("E2-F1-S1-T1"),
+            self._task("E3-F1-S1-T1"),
+        ]
+        scope = ScopeFilter(
+            include=["E2"],
+            exclude=[],
+            expanded_ids={"E2-F1-S1-T1"},
+        )
+        candidates = parser.get_parallel_candidates(units, scope=scope)
+        assert len(candidates) == 1
+        assert candidates[0].id == "E2-F1-S1-T1"
+
+    @pytest.mark.parametrize(
+        "scope_ids,expected_ids",
+        [
+            ({"E0-F1-S1-T1"}, ["E0-F1-S1-T1"]),
+            ({"E0-F1-S1-T2"}, ["E0-F1-S1-T2"]),
+            ({"E0-F1-S1-T1", "E0-F1-S1-T2"}, ["E0-F1-S1-T1", "E0-F1-S1-T2"]),
+            (set(), []),
+        ],
+    )
+    def test_scope_filter_parametrized(
+        self,
+        scope_ids: set[str],
+        expected_ids: list[str],
+    ) -> None:
+        """Parametrised: various scope sets return exactly the matching in-queue tasks."""
+        parser = self._make_parser()
+        units = [
+            self._task("E0-F1-S1-T1"),
+            self._task("E0-F1-S1-T2"),
+        ]
+        scope = ScopeFilter(include=[], exclude=[], expanded_ids=scope_ids)
+        candidates = parser.get_parallel_candidates(units, scope=scope)
+        result_ids = sorted(u.id for u in candidates)
+        assert result_ids == sorted(expected_ids)

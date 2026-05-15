@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
 from devbench.config import BACKLOG_INDEX, BACKLOG_ROOT
@@ -32,6 +32,9 @@ from devbench.constants import (
     STATUS_IN_REVIEW,
     STATUS_PROPOSED,
 )
+
+if TYPE_CHECKING:
+    from devbench.scope import ScopeFilter
 
 # ---------------------------------------------------------------------------
 # Mapping from raw markdown status strings to WorkUnitStatus enum values.
@@ -312,13 +315,18 @@ class BacklogParser:
         """Return all units whose status is ``BLOCKED``."""
         return [u for u in units if u.status is WorkUnitStatus.BLOCKED]
 
-    def get_parallel_candidates(self, units: list[WorkUnit]) -> list[WorkUnit]:
+    def get_parallel_candidates(
+        self,
+        units: list[WorkUnit],
+        scope: ScopeFilter | None = None,
+    ) -> list[WorkUnit]:
         """Return all actionable tasks sorted by topological depth.
 
         A task is *actionable* when:
         - Its status is ``IN_QUEUE`` or ``IN_PROGRESS`` (resume interrupted work)
         - Its type is ``TASK``
         - All of its dependencies are satisfied (see :meth:`_deps_satisfied`)
+        - Its ID is in ``scope.expanded_ids`` when a ``ScopeFilter`` is provided
 
         ``IN_PROGRESS`` tasks are returned before ``IN_QUEUE`` tasks so that
         interrupted work is resumed before new work is started. Within each
@@ -333,6 +341,17 @@ class BacklogParser:
         holds even when most ancestors are already ``done``. Self-loops or
         unresolvable IDs collapse to depth 0 (no penalty); the
         ``validate-backlog`` integrity rule reports those upstream.
+
+        Args:
+            units: All work units from the parsed backlog.
+            scope: Optional scope filter. When provided, only work units whose
+                IDs appear in ``scope.expanded_ids`` are returned. When
+                ``None`` (the default), all actionable tasks are returned
+                unchanged.
+
+        Returns:
+            List of actionable ``WorkUnit`` objects sorted by
+            ``(status_priority, topological_depth, id)``.
         """
         actionable_statuses = {WorkUnitStatus.IN_QUEUE, WorkUnitStatus.IN_PROGRESS}
         units_by_id = {u.id: u for u in units}
@@ -372,6 +391,10 @@ class BacklogParser:
             d = max_dep_depth + 1
             depth_cache[unit_id] = d
             return d
+
+        # Apply scope filter: remove candidates whose IDs are outside the scope.
+        if scope is not None:
+            candidates = [u for u in candidates if u.id in scope.expanded_ids]
 
         # IN_PROGRESS first (resume interrupted work), then IN_QUEUE; within
         # the same status group, order by topological depth (shallow first),

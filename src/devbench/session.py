@@ -25,6 +25,7 @@ import contextlib
 import fcntl
 import json
 import os
+import shutil
 import time
 from collections.abc import Generator
 from dataclasses import dataclass
@@ -321,6 +322,46 @@ class SessionRegistry:
             Dict mapping ``session.name`` -> ``"ACTIVE"`` or ``"STALE"``.
         """
         return {s.name: ("ACTIVE" if self.is_alive(s.pid) else "STALE") for s in sessions}
+
+    def cleanup_stale_sessions(self) -> list[str]:
+        """Remove state directories and registry entries for STALE sessions.
+
+        A session is STALE when :meth:`is_alive` returns ``False`` for its PID.
+        For each STALE session:
+
+        1. Remove its ``state_dir`` tree (if it exists) via ``shutil.rmtree``.
+        2. Drop it from the in-memory session list.
+
+        After processing, the updated list of surviving sessions is written back
+        to the registry via :meth:`save`.  The operation is idempotent: if a
+        stale session's ``state_dir`` was already absent, the registry entry is
+        still removed.
+
+        Returns:
+            Sorted list of session names that were removed.
+
+        Raises:
+            OSError: :meth:`is_alive` raised an unexpected OS error, or
+                ``shutil.rmtree`` failed to remove the state directory.
+            ValueError: The registry file contains invalid JSON (propagated
+                from :meth:`load`).
+        """
+        sessions = self.load()
+        surviving: list[Session] = []
+        removed_names: list[str] = []
+
+        for session in sessions:
+            if self.is_alive(session.pid):
+                surviving.append(session)
+            else:
+                removed_names.append(session.name)
+                if session.state_dir.exists():
+                    shutil.rmtree(session.state_dir)
+
+        if removed_names:
+            self.save(surviving)
+
+        return sorted(removed_names)
 
 
 # ---------------------------------------------------------------------------

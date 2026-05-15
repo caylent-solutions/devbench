@@ -483,3 +483,114 @@ class TestPidFileRoundTrip:
         reg = SessionRegistry(workspace)
         s = _make_session(name="live", pid=os.getpid())
         assert reg.liveness_of_sessions([s])["live"] == "ACTIVE"
+
+
+class TestCleanupStaleSessions:
+    """cleanup_stale_sessions removes session dirs for STALE sessions and
+    updates the registry.  AC-192-11.
+    """
+
+    def test_cleanup_removes_stale_state_dir(self, workspace: Path) -> None:
+        """State directory of a STALE session is removed on cleanup."""
+        reg = SessionRegistry(workspace)
+        state_dir = workspace / ".devbench" / "sessions" / "dead"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        reg.write_pid(state_dir, 99999999)
+        s = _make_session(name="dead", pid=99999999, state_dir=state_dir)
+        reg.save([s])
+        with patch("devbench.session.os.kill", side_effect=ProcessLookupError):
+            removed = reg.cleanup_stale_sessions()
+        assert "dead" in removed
+        assert not state_dir.exists()
+
+    def test_cleanup_keeps_active_state_dir(self, workspace: Path) -> None:
+        """State directory of an ACTIVE session is NOT removed on cleanup."""
+        reg = SessionRegistry(workspace)
+        state_dir = workspace / ".devbench" / "sessions" / "live"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        reg.write_pid(state_dir, os.getpid())
+        s = _make_session(name="live", pid=os.getpid(), state_dir=state_dir)
+        reg.save([s])
+        removed = reg.cleanup_stale_sessions()
+        assert "live" not in removed
+        assert state_dir.exists()
+
+    def test_cleanup_updates_registry_removing_stale_entries(self, workspace: Path) -> None:
+        """After cleanup, the registry file contains only ACTIVE sessions."""
+        reg = SessionRegistry(workspace)
+        live_dir = workspace / ".devbench" / "sessions" / "live"
+        dead_dir = workspace / ".devbench" / "sessions" / "dead"
+        live_dir.mkdir(parents=True, exist_ok=True)
+        dead_dir.mkdir(parents=True, exist_ok=True)
+        live = _make_session(name="live", pid=os.getpid(), state_dir=live_dir)
+        dead = _make_session(name="dead", pid=99999999, state_dir=dead_dir)
+        reg.save([live, dead])
+
+        def fake_kill(pid: int, sig: int) -> None:
+            if pid == 99999999:
+                raise ProcessLookupError
+
+        with patch("devbench.session.os.kill", side_effect=fake_kill):
+            reg.cleanup_stale_sessions()
+
+        remaining = reg.load()
+        names = [s.name for s in remaining]
+        assert "live" in names
+        assert "dead" not in names
+
+    def test_cleanup_returns_list_of_removed_names(self, workspace: Path) -> None:
+        """cleanup_stale_sessions returns a sorted list of removed session names."""
+        reg = SessionRegistry(workspace)
+        for name in ("bravo", "alpha"):
+            state_dir = workspace / ".devbench" / "sessions" / name
+            state_dir.mkdir(parents=True, exist_ok=True)
+            reg.write_pid(state_dir, 99999999)
+        sessions = [
+            _make_session(
+                name=n,
+                pid=99999999,
+                state_dir=workspace / ".devbench" / "sessions" / n,
+            )
+            for n in ("alpha", "bravo")
+        ]
+        reg.save(sessions)
+        with patch("devbench.session.os.kill", side_effect=ProcessLookupError):
+            removed = reg.cleanup_stale_sessions()
+        assert removed == sorted(removed)
+        assert set(removed) == {"alpha", "bravo"}
+
+    def test_cleanup_empty_registry_returns_empty_list(self, workspace: Path) -> None:
+        """When no sessions are registered, cleanup is a no-op."""
+        reg = SessionRegistry(workspace)
+        removed = reg.cleanup_stale_sessions()
+        assert removed == []
+
+    def test_cleanup_state_dir_absent_still_removes_registry_entry(self, workspace: Path) -> None:
+        """When a stale session's state_dir no longer exists, the registry entry
+        is still removed (idempotent -- the dir may have been deleted manually).
+        """
+        reg = SessionRegistry(workspace)
+        state_dir = workspace / ".devbench" / "sessions" / "ghost"
+        # Do NOT create state_dir -- it is already absent.
+        s = _make_session(name="ghost", pid=99999999, state_dir=state_dir)
+        reg.save([s])
+        with patch("devbench.session.os.kill", side_effect=ProcessLookupError):
+            removed = reg.cleanup_stale_sessions()
+        assert "ghost" in removed
+        remaining = reg.load()
+        assert not any(sess.name == "ghost" for sess in remaining)
+
+    def test_cleanup_with_multiple_active_all_kept(self, workspace: Path) -> None:
+        """When all sessions are ACTIVE, cleanup removes none and returns []."""
+        reg = SessionRegistry(workspace)
+        sessions = []
+        for name in ("a1", "a2"):
+            sd = workspace / ".devbench" / "sessions" / name
+            sd.mkdir(parents=True, exist_ok=True)
+            reg.write_pid(sd, os.getpid())
+            sessions.append(_make_session(name=name, pid=os.getpid(), state_dir=sd))
+        reg.save(sessions)
+        removed = reg.cleanup_stale_sessions()
+        assert removed == []
+        assert (workspace / ".devbench" / "sessions" / "a1").exists()
+        assert (workspace / ".devbench" / "sessions" / "a2").exists()

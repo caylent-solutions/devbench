@@ -36,6 +36,15 @@ Public API:
   request to test whether quota has been restored.  Returns ``True`` on
   success, ``False`` when the response signals continued quota exhaustion, and
   propagates all other exceptions unchanged.
+- :class:`QuotaCheckpoint` -- dataclass capturing all pause-state fields
+  written to ``quota_pause.json`` when the orchestrator detects quota
+  exhaustion.
+- :func:`save_checkpoint` -- atomically writes a :class:`QuotaCheckpoint` to
+  ``<session_dir>/.devbench/quota_pause.json`` using a temp-then-rename
+  strategy (POSIX ``os.replace``) so readers never see a partial file.
+- :func:`load_checkpoint` -- reads and deserializes ``quota_pause.json`` from
+  ``<session_dir>/.devbench/``.  Returns ``None`` when the file is absent,
+  raises :exc:`ValueError` when the file is present but malformed.
 
 Raises:
     None -- this module only defines exception classes and pure-function
@@ -45,17 +54,22 @@ Raises:
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import secrets
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
+from pathlib import Path
 from typing import Any
 
 import anthropic
 
 from devbench.config import get_anthropic_api_key
 from devbench.constants import (
+    QUOTA_CHECKPOINT_FILENAME,
+    QUOTA_DEVBENCH_SUBDIR,
     RECOVERY_PROBE_DEFAULT_REQUEST_SIZE_TOKENS,
     RECOVERY_PROBE_DEFAULT_TIMEOUT_SECONDS,
     RECOVERY_PROBE_MESSAGE_CONTENT,
@@ -657,3 +671,267 @@ def _parse_retry_after(value: str) -> datetime | None:
         return None
     # Normalise to UTC.
     return parsed.astimezone(UTC)
+
+
+# ---------------------------------------------------------------------------
+# QuotaCheckpoint dataclass -- in-memory representation of quota_pause.json
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class QuotaCheckpoint:
+    """Pause-state snapshot written to ``quota_pause.json`` on quota exhaustion.
+
+    Captures all information needed to resume orchestration after the quota
+    window has elapsed.  Serialized to disk by :func:`save_checkpoint` and
+    deserialized by :func:`load_checkpoint`.
+
+    Args:
+        paused_at: UTC datetime at which the orchestrator detected quota
+            exhaustion and wrote this checkpoint.
+        reset_at: UTC datetime at which the quota is expected to reset, or
+            ``None`` when the vendor does not publish a reset time.
+        reason: Short human-readable identifier for the quota signal type
+            (e.g. ``"subscription_rate_limit"``, ``"bedrock_throttle"``).
+        raw_error: The string representation of the original exception or
+            error payload that triggered the pause.
+        in_flight_wu: The work-unit ID that was in-flight at pause time, or
+            ``None`` when no work unit was actively executing.
+        in_flight_phase: The TDD phase (``"RED"``, ``"GREEN"``, ``"REFACTOR"``)
+            that was in-flight, or ``None`` when ``in_flight_wu`` is ``None``.
+        completed_judges: List of review-judge names that had already returned
+            ``REVIEW_PASS`` before the pause (used by
+            ``resume_strategy: continue_current_wu``).
+        pending_judges: List of review-judge names that had not yet been
+            invoked at pause time.
+        stage_artefacts: Arbitrary dict of artefacts captured at pause time
+            (e.g. branch name, commit SHA, PR number) for use by the resume
+            protocol.
+
+    Raises:
+        None -- dataclass constructor only.
+    """
+
+    paused_at: datetime
+    reset_at: datetime | None
+    reason: str
+    raw_error: str
+    in_flight_wu: str | None
+    in_flight_phase: str | None
+    completed_judges: list[str]
+    pending_judges: list[str]
+    stage_artefacts: dict[str, object]
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint path helper (private)
+# ---------------------------------------------------------------------------
+
+
+def _checkpoint_path(session_dir: Path) -> Path:
+    """Return the canonical path for ``quota_pause.json`` under *session_dir*.
+
+    The file is always placed at ``<session_dir>/.devbench/quota_pause.json``,
+    mirroring the layout used by other devbench per-session state files.
+    """
+    return session_dir / QUOTA_DEVBENCH_SUBDIR / QUOTA_CHECKPOINT_FILENAME
+
+
+# ---------------------------------------------------------------------------
+# save_checkpoint -- atomic write of QuotaCheckpoint to quota_pause.json
+# ---------------------------------------------------------------------------
+
+
+def save_checkpoint(
+    session_dir: Path,
+    paused_at: datetime,
+    reset_at: datetime | None,
+    reason: str,
+    raw_error: str,
+    in_flight_wu: str | None,
+    in_flight_phase: str | None,
+    completed_judges: list[str],
+    pending_judges: list[str],
+    stage_artefacts: dict[str, object],
+) -> None:
+    """Atomically write a quota pause checkpoint to ``quota_pause.json``.
+
+    The checkpoint is written to ``<session_dir>/.devbench/quota_pause.json``
+    using a temp-file-then-rename strategy (POSIX ``os.replace``) so that
+    concurrent readers never observe a partial file.
+
+    The parent ``<session_dir>/.devbench/`` directory is created if absent.
+
+    Args:
+        session_dir: Root directory for this session (or workspace root when
+            no named session is active).  The checkpoint file is placed under
+            ``<session_dir>/.devbench/``.
+        paused_at: UTC datetime at which the pause was detected.
+        reset_at: UTC datetime at which the quota is expected to reset, or
+            ``None`` when the vendor does not publish a reset time.
+        reason: Short identifier for the quota signal type.
+        raw_error: String representation of the original exception.
+        in_flight_wu: Work-unit ID that was in-flight at pause time, or
+            ``None``.
+        in_flight_phase: TDD phase in-flight at pause time, or ``None``.
+        completed_judges: List of judge names that had already passed.
+        pending_judges: List of judge names not yet invoked.
+        stage_artefacts: Dict of additional artefacts for the resume protocol.
+
+    Raises:
+        OSError: When the directory cannot be created or the file cannot be
+            written (e.g. permission denied, disk full).
+    """
+    devbench_dir = session_dir / QUOTA_DEVBENCH_SUBDIR
+    devbench_dir.mkdir(parents=True, exist_ok=True)
+
+    target = devbench_dir / QUOTA_CHECKPOINT_FILENAME
+
+    payload: dict[str, object] = {
+        "paused_at": paused_at.isoformat(),
+        "reset_at": reset_at.isoformat() if reset_at is not None else None,
+        "reason": reason,
+        "raw_error": raw_error,
+        "in_flight_wu": in_flight_wu,
+        "in_flight_phase": in_flight_phase,
+        "completed_judges": completed_judges,
+        "pending_judges": pending_judges,
+        "stage_artefacts": stage_artefacts,
+    }
+
+    # Write atomically: serialize to a temp file in the same directory (so
+    # Path.replace() is guaranteed to be a rename, not a cross-device copy),
+    # then rename atomically.  This ensures readers always see either the old
+    # file or the complete new file -- never a partial write.
+    tmp_path = target.with_suffix(".tmp")
+    try:
+        tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp_path.replace(target)
+    except Exception:
+        # Best-effort cleanup of the temp file; failure here is non-fatal
+        # (the original exception is re-raised regardless).
+        with contextlib.suppress(OSError):
+            tmp_path.unlink(missing_ok=True)
+        raise
+
+
+# ---------------------------------------------------------------------------
+# load_checkpoint -- read and deserialize quota_pause.json
+# ---------------------------------------------------------------------------
+
+
+def load_checkpoint(session_dir: Path) -> QuotaCheckpoint | None:
+    """Read and deserialize ``quota_pause.json`` from the session directory.
+
+    Returns ``None`` when the file does not exist (normal condition before the
+    first pause or after a successful resume that removed the file).
+
+    Raises :exc:`ValueError` when the file is present but malformed -- this
+    signals a corrupt checkpoint that the caller must handle explicitly (e.g.
+    by alerting the operator or removing the file).
+
+    Args:
+        session_dir: Root directory for this session.  The checkpoint file is
+            expected at ``<session_dir>/.devbench/quota_pause.json``.
+
+    Returns:
+        A :class:`QuotaCheckpoint` instance when the file is present and
+        valid, or ``None`` when the file does not exist.
+
+    Raises:
+        ValueError: When ``quota_pause.json`` exists but contains invalid JSON,
+            a non-dict root, a missing required field, or an unparseable
+            datetime string.  The message always includes the file path and a
+            description of what is wrong.
+    """
+    target = _checkpoint_path(session_dir)
+    if not target.exists():
+        return None
+
+    raw_text = target.read_text(encoding="utf-8")
+
+    try:
+        data = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"quota_pause.json at {target} contains invalid JSON: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"quota_pause.json at {target} must contain a JSON object at the root; got {type(data).__name__!r}"
+        )
+
+    # Validate and extract required fields.
+    _require_key(data, "paused_at", target)
+    _require_key(data, "reason", target)
+    _require_key(data, "raw_error", target)
+    _require_key(data, "completed_judges", target)
+    _require_key(data, "pending_judges", target)
+    _require_key(data, "stage_artefacts", target)
+
+    paused_at = _parse_checkpoint_dt(data["paused_at"], "paused_at", target)
+    reset_at_raw = data.get("reset_at")
+    reset_at = _parse_checkpoint_dt(reset_at_raw, "reset_at", target) if reset_at_raw is not None else None
+
+    return QuotaCheckpoint(
+        paused_at=paused_at,
+        reset_at=reset_at,
+        reason=data["reason"],
+        raw_error=data["raw_error"],
+        in_flight_wu=data.get("in_flight_wu"),
+        in_flight_phase=data.get("in_flight_phase"),
+        completed_judges=data["completed_judges"],
+        pending_judges=data["pending_judges"],
+        stage_artefacts=data["stage_artefacts"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint deserialization helpers (private)
+# ---------------------------------------------------------------------------
+
+
+def _require_key(data: dict[str, object], key: str, path: Path) -> None:
+    """Raise :exc:`ValueError` when *key* is absent from *data*.
+
+    Args:
+        data: The deserialized JSON dict.
+        key: The field name that must be present.
+        path: The file path, used in the error message.
+
+    Raises:
+        ValueError: When *key* is not present in *data*.
+    """
+    if key not in data:
+        raise ValueError(f"quota_pause.json at {path} is missing required field {key!r}.")
+
+
+def _parse_checkpoint_dt(value: object, field_name: str, path: Path) -> datetime:
+    """Parse *value* as an ISO 8601 datetime string and return a UTC-aware datetime.
+
+    Args:
+        value: The raw value from the JSON payload.  Must be a non-empty string.
+        field_name: The name of the field being parsed (for error messages).
+        path: The file path (for error messages).
+
+    Returns:
+        A timezone-aware UTC :class:`~datetime.datetime`.
+
+    Raises:
+        ValueError: When *value* is not a string or is not a parseable ISO 8601
+            datetime.
+    """
+    if not isinstance(value, str):
+        raise ValueError(
+            f"quota_pause.json at {path}: field {field_name!r} must be a string; got {type(value).__name__!r}."
+        )
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(
+            f"quota_pause.json at {path}: field {field_name!r} is not a valid "
+            f"ISO 8601 datetime: {value!r}. Original error: {exc}"
+        ) from exc
+    # Ensure timezone-aware (normalise to UTC).
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)

@@ -519,3 +519,12 @@ RECOVERY_PROBE_DEFAULT_REQUEST_SIZE_TOKENS: int = 1
 # Minimal message content for the probe; chosen to produce the shortest valid
 # completion (single character elicits a 1-token response on all Claude models).
 RECOVERY_PROBE_MESSAGE_CONTENT: str = "1"
+
+# ---------------------------------------------------------------------------
+# Quota checkpoint constants (quota wait-and-resume, spec 4.5.1)
+# Used by devbench.quota.save_checkpoint / load_checkpoint.
+# ---------------------------------------------------------------------------
+# Subdirectory under session_dir (or workspace root) where quota state is kept.
+QUOTA_DEVBENCH_SUBDIR: str = ".devbench"
+# Filename of the quota pause checkpoint written by save_checkpoint.
+QUOTA_CHECKPOINT_FILENAME: str = "quota_pause.json"

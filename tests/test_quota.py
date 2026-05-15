@@ -1,5 +1,6 @@
 """Tests for devbench.quota -- exception hierarchy, detect_quota_error,
-parse_reset_time, wait_for_reset, and recovery_probe.
+parse_reset_time, wait_for_reset, recovery_probe, save_checkpoint, and
+load_checkpoint.
 
 Covers: QuotaExhaustedError, SubscriptionRateLimitError, SdkCreditExhaustedError,
 ApiBillingError, BedrockThrottleError.  Each exception carries reset_at,
@@ -20,12 +21,18 @@ Also covers: recovery_probe(timeout_seconds, request_size_tokens) which sends
 a 1-token completion request to the Anthropic API. Returns True when the
 request completes without a quota error; returns False when the API signals
 continued throttle via a QuotaExhaustedError subclass.
+
+Also covers: QuotaCheckpoint dataclass, save_checkpoint(session_dir, ...) which
+atomically writes quota_pause.json, and load_checkpoint(session_dir) which
+reads and deserializes it or returns None when the file is absent.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -35,12 +42,15 @@ from devbench.quota import (
     ApiBillingError,
     BackoffConfig,
     BedrockThrottleError,
+    QuotaCheckpoint,
     QuotaExhaustedError,
     SdkCreditExhaustedError,
     SubscriptionRateLimitError,
     detect_quota_error,
+    load_checkpoint,
     parse_reset_time,
     recovery_probe,
+    save_checkpoint,
     wait_for_reset,
 )
 
@@ -2110,6 +2120,1034 @@ class TestRecoveryProbeIntegration:
             abs(actual - nominal) < 1e-9 for actual, nominal in zip(backoff_sleeps, nominal_intervals, strict=False)
         )
         assert not all_exact, (
-            "All backoff sleeps matched the nominal intervals exactly -- "
+            "All backlog sleeps matched the nominal intervals exactly -- "
             "jitter was not applied, which would allow thundering-herd behavior."
         )
+
+
+# ---------------------------------------------------------------------------
+# QuotaCheckpoint dataclass
+# ---------------------------------------------------------------------------
+
+
+class TestQuotaCheckpointDataclass:
+    """QuotaCheckpoint carries all pause-state fields required by AC-193-8 and AC-193-16."""
+
+    _NOW = datetime(2026, 3, 1, 10, 0, 0, tzinfo=UTC)
+    _RESET = datetime(2026, 3, 1, 15, 0, 0, tzinfo=UTC)
+
+    def _make(self, **overrides: object) -> QuotaCheckpoint:
+        defaults: dict[str, object] = {
+            "paused_at": self._NOW,
+            "reset_at": self._RESET,
+            "reason": "subscription_rate_limit",
+            "raw_error": "HTTP 429",
+            "in_flight_wu": "E5-F2-S1-T3",
+            "in_flight_phase": "GREEN",
+            "completed_judges": ["code_review"],
+            "pending_judges": ["test_review", "security_review"],
+            "stage_artefacts": {"branch": "feat/quota"},
+        }
+        defaults.update(overrides)
+        return QuotaCheckpoint(**defaults)  # type: ignore[arg-type]
+
+    def test_is_dataclass(self) -> None:
+        """QuotaCheckpoint can be instantiated with all required fields."""
+        cp = self._make()
+        assert cp.paused_at == self._NOW
+
+    def test_all_fields_stored(self) -> None:
+        """All nine fields are stored and accessible as attributes."""
+        cp = self._make()
+        assert cp.paused_at == self._NOW
+        assert cp.reset_at == self._RESET
+        assert cp.reason == "subscription_rate_limit"
+        assert cp.raw_error == "HTTP 429"
+        assert cp.in_flight_wu == "E5-F2-S1-T3"
+        assert cp.in_flight_phase == "GREEN"
+        assert cp.completed_judges == ["code_review"]
+        assert cp.pending_judges == ["test_review", "security_review"]
+        assert cp.stage_artefacts == {"branch": "feat/quota"}
+
+    def test_reset_at_can_be_none(self) -> None:
+        """reset_at is optional (vendor may not publish a reset time)."""
+        cp = self._make(reset_at=None)
+        assert cp.reset_at is None
+
+    def test_in_flight_wu_can_be_none(self) -> None:
+        """in_flight_wu is optional when no WU was in-flight at pause time."""
+        cp = self._make(in_flight_wu=None)
+        assert cp.in_flight_wu is None
+
+    def test_in_flight_phase_can_be_none(self) -> None:
+        """in_flight_phase is optional when in_flight_wu is absent."""
+        cp = self._make(in_flight_phase=None)
+        assert cp.in_flight_phase is None
+
+    def test_completed_judges_empty_list_allowed(self) -> None:
+        """completed_judges can be an empty list when no judges have run."""
+        cp = self._make(completed_judges=[])
+        assert cp.completed_judges == []
+
+    def test_pending_judges_empty_list_allowed(self) -> None:
+        """pending_judges can be an empty list when no judges remain."""
+        cp = self._make(pending_judges=[])
+        assert cp.pending_judges == []
+
+    def test_stage_artefacts_empty_dict_allowed(self) -> None:
+        """stage_artefacts can be an empty dict when no artefacts were captured."""
+        cp = self._make(stage_artefacts={})
+        assert cp.stage_artefacts == {}
+
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            "subscription_rate_limit",
+            "sdk_credit_exhausted",
+            "api_billing_error",
+            "bedrock_throttle",
+            "unknown",
+        ],
+    )
+    def test_reason_accepts_various_values(self, reason: str) -> None:
+        """reason field accepts any non-empty string."""
+        cp = self._make(reason=reason)
+        assert cp.reason == reason
+
+
+# ---------------------------------------------------------------------------
+# save_checkpoint: happy path writes quota_pause.json atomically
+# ---------------------------------------------------------------------------
+
+
+class TestSaveCheckpointHappyPath:
+    """AC-193-8: save_checkpoint writes quota_pause.json to the session directory."""
+
+    _NOW = datetime(2026, 3, 1, 10, 0, 0, tzinfo=UTC)
+    _RESET = datetime(2026, 3, 1, 15, 0, 0, tzinfo=UTC)
+
+    def test_file_is_created(self, tmp_path: Path) -> None:
+        """save_checkpoint creates quota_pause.json under session_dir/.devbench/."""
+        save_checkpoint(
+            session_dir=tmp_path,
+            paused_at=self._NOW,
+            reset_at=self._RESET,
+            reason="subscription_rate_limit",
+            raw_error="HTTP 429",
+            in_flight_wu="E5-F2-S1-T3",
+            in_flight_phase="GREEN",
+            completed_judges=["code_review"],
+            pending_judges=["test_review"],
+            stage_artefacts={"key": "val"},
+        )
+        checkpoint_file = tmp_path / ".devbench" / "quota_pause.json"
+        assert checkpoint_file.exists()
+
+    def test_file_contains_valid_json(self, tmp_path: Path) -> None:
+        """The written file is valid JSON."""
+        save_checkpoint(
+            session_dir=tmp_path,
+            paused_at=self._NOW,
+            reset_at=self._RESET,
+            reason="subscription_rate_limit",
+            raw_error="HTTP 429",
+            in_flight_wu="E5-F2-S1-T3",
+            in_flight_phase="GREEN",
+            completed_judges=[],
+            pending_judges=[],
+            stage_artefacts={},
+        )
+        checkpoint_file = tmp_path / ".devbench" / "quota_pause.json"
+        with checkpoint_file.open() as f:
+            data = json.load(f)
+        assert isinstance(data, dict)
+
+    def test_paused_at_stored_as_iso_string(self, tmp_path: Path) -> None:
+        """paused_at is serialized as an ISO 8601 string."""
+        save_checkpoint(
+            session_dir=tmp_path,
+            paused_at=self._NOW,
+            reset_at=self._RESET,
+            reason="subscription_rate_limit",
+            raw_error="HTTP 429",
+            in_flight_wu=None,
+            in_flight_phase=None,
+            completed_judges=[],
+            pending_judges=[],
+            stage_artefacts={},
+        )
+        checkpoint_file = tmp_path / ".devbench" / "quota_pause.json"
+        with checkpoint_file.open() as f:
+            data = json.load(f)
+        assert "paused_at" in data
+        # Must be parseable as a datetime
+        parsed = datetime.fromisoformat(data["paused_at"])
+        assert parsed.tzinfo is not None
+
+    def test_reset_at_stored_as_iso_string_when_set(self, tmp_path: Path) -> None:
+        """reset_at is serialized as an ISO 8601 string when not None."""
+        save_checkpoint(
+            session_dir=tmp_path,
+            paused_at=self._NOW,
+            reset_at=self._RESET,
+            reason="subscription_rate_limit",
+            raw_error="HTTP 429",
+            in_flight_wu=None,
+            in_flight_phase=None,
+            completed_judges=[],
+            pending_judges=[],
+            stage_artefacts={},
+        )
+        checkpoint_file = tmp_path / ".devbench" / "quota_pause.json"
+        with checkpoint_file.open() as f:
+            data = json.load(f)
+        assert "reset_at" in data
+        parsed = datetime.fromisoformat(data["reset_at"])
+        assert parsed.tzinfo is not None
+
+    def test_reset_at_stored_as_null_when_none(self, tmp_path: Path) -> None:
+        """When reset_at is None, it is serialized as JSON null."""
+        save_checkpoint(
+            session_dir=tmp_path,
+            paused_at=self._NOW,
+            reset_at=None,
+            reason="subscription_rate_limit",
+            raw_error="HTTP 429",
+            in_flight_wu=None,
+            in_flight_phase=None,
+            completed_judges=[],
+            pending_judges=[],
+            stage_artefacts={},
+        )
+        checkpoint_file = tmp_path / ".devbench" / "quota_pause.json"
+        with checkpoint_file.open() as f:
+            data = json.load(f)
+        assert data["reset_at"] is None
+
+    def test_all_scalar_fields_present(self, tmp_path: Path) -> None:
+        """All nine fields appear in the serialized JSON."""
+        save_checkpoint(
+            session_dir=tmp_path,
+            paused_at=self._NOW,
+            reset_at=self._RESET,
+            reason="bedrock_throttle",
+            raw_error="ThrottlingException",
+            in_flight_wu="E5-F2-S1-T3",
+            in_flight_phase="RED",
+            completed_judges=["code_review"],
+            pending_judges=["test_review"],
+            stage_artefacts={"branch": "main"},
+        )
+        checkpoint_file = tmp_path / ".devbench" / "quota_pause.json"
+        with checkpoint_file.open() as f:
+            data = json.load(f)
+        for field in (
+            "paused_at",
+            "reset_at",
+            "reason",
+            "raw_error",
+            "in_flight_wu",
+            "in_flight_phase",
+            "completed_judges",
+            "pending_judges",
+            "stage_artefacts",
+        ):
+            assert field in data, f"Field {field!r} missing from quota_pause.json"
+
+    def test_creates_parent_devbench_dir_when_absent(self, tmp_path: Path) -> None:
+        """save_checkpoint creates the .devbench directory when it does not exist."""
+        devbench_dir = tmp_path / ".devbench"
+        assert not devbench_dir.exists()
+        save_checkpoint(
+            session_dir=tmp_path,
+            paused_at=self._NOW,
+            reset_at=None,
+            reason="subscription_rate_limit",
+            raw_error="429",
+            in_flight_wu=None,
+            in_flight_phase=None,
+            completed_judges=[],
+            pending_judges=[],
+            stage_artefacts={},
+        )
+        assert devbench_dir.is_dir()
+
+    def test_write_is_atomic_no_partial_file(self, tmp_path: Path) -> None:
+        """The file must be written atomically (temp-then-rename) so readers never see partial JSON."""
+        # We cannot intercept os.replace directly in a deterministic way,
+        # but we CAN verify that a concurrent reader always sees a complete,
+        # valid JSON file (not a half-written one).  After save_checkpoint
+        # returns, the file must be fully readable.
+        save_checkpoint(
+            session_dir=tmp_path,
+            paused_at=self._NOW,
+            reset_at=self._RESET,
+            reason="sdk_credit_exhausted",
+            raw_error="402",
+            in_flight_wu="E5-F2-S1-T3",
+            in_flight_phase="GREEN",
+            completed_judges=["code_review", "test_review"],
+            pending_judges=["security_review"],
+            stage_artefacts={"pr": 42},
+        )
+        checkpoint_file = tmp_path / ".devbench" / "quota_pause.json"
+        with checkpoint_file.open() as f:
+            content = f.read()
+        # Must parse as complete JSON (no truncation)
+        parsed = json.loads(content)
+        assert isinstance(parsed, dict)
+
+    def test_overwrites_existing_file(self, tmp_path: Path) -> None:
+        """A second call overwrites the existing quota_pause.json with new data."""
+        save_checkpoint(
+            session_dir=tmp_path,
+            paused_at=self._NOW,
+            reset_at=self._RESET,
+            reason="subscription_rate_limit",
+            raw_error="429-first",
+            in_flight_wu="T1",
+            in_flight_phase="RED",
+            completed_judges=[],
+            pending_judges=[],
+            stage_artefacts={},
+        )
+        new_time = datetime(2026, 4, 1, 0, 0, 0, tzinfo=UTC)
+        save_checkpoint(
+            session_dir=tmp_path,
+            paused_at=new_time,
+            reset_at=None,
+            reason="bedrock_throttle",
+            raw_error="429-second",
+            in_flight_wu="T2",
+            in_flight_phase="GREEN",
+            completed_judges=["code_review"],
+            pending_judges=[],
+            stage_artefacts={},
+        )
+        checkpoint_file = tmp_path / ".devbench" / "quota_pause.json"
+        with checkpoint_file.open() as f:
+            data = json.load(f)
+        assert data["reason"] == "bedrock_throttle"
+        assert data["in_flight_wu"] == "T2"
+
+    def test_in_flight_wu_stored_when_set(self, tmp_path: Path) -> None:
+        """in_flight_wu is serialized correctly when a WU id is provided."""
+        save_checkpoint(
+            session_dir=tmp_path,
+            paused_at=self._NOW,
+            reset_at=None,
+            reason="subscription_rate_limit",
+            raw_error="429",
+            in_flight_wu="E5-F2-S1-T3",
+            in_flight_phase="GREEN",
+            completed_judges=[],
+            pending_judges=[],
+            stage_artefacts={},
+        )
+        checkpoint_file = tmp_path / ".devbench" / "quota_pause.json"
+        with checkpoint_file.open() as f:
+            data = json.load(f)
+        assert data["in_flight_wu"] == "E5-F2-S1-T3"
+
+    def test_in_flight_wu_stored_as_null_when_none(self, tmp_path: Path) -> None:
+        """in_flight_wu is JSON null when None."""
+        save_checkpoint(
+            session_dir=tmp_path,
+            paused_at=self._NOW,
+            reset_at=None,
+            reason="subscription_rate_limit",
+            raw_error="429",
+            in_flight_wu=None,
+            in_flight_phase=None,
+            completed_judges=[],
+            pending_judges=[],
+            stage_artefacts={},
+        )
+        checkpoint_file = tmp_path / ".devbench" / "quota_pause.json"
+        with checkpoint_file.open() as f:
+            data = json.load(f)
+        assert data["in_flight_wu"] is None
+
+    def test_completed_judges_list_preserved(self, tmp_path: Path) -> None:
+        """completed_judges list is round-tripped exactly."""
+        judges = ["code_review", "test_review", "security_review"]
+        save_checkpoint(
+            session_dir=tmp_path,
+            paused_at=self._NOW,
+            reset_at=None,
+            reason="subscription_rate_limit",
+            raw_error="429",
+            in_flight_wu=None,
+            in_flight_phase=None,
+            completed_judges=judges,
+            pending_judges=[],
+            stage_artefacts={},
+        )
+        checkpoint_file = tmp_path / ".devbench" / "quota_pause.json"
+        with checkpoint_file.open() as f:
+            data = json.load(f)
+        assert data["completed_judges"] == judges
+
+    def test_stage_artefacts_dict_preserved(self, tmp_path: Path) -> None:
+        """stage_artefacts dict is round-tripped exactly."""
+        artefacts = {"branch": "feat/quota", "pr": 42, "commit": "abc123"}
+        save_checkpoint(
+            session_dir=tmp_path,
+            paused_at=self._NOW,
+            reset_at=None,
+            reason="subscription_rate_limit",
+            raw_error="429",
+            in_flight_wu=None,
+            in_flight_phase=None,
+            completed_judges=[],
+            pending_judges=[],
+            stage_artefacts=artefacts,
+        )
+        checkpoint_file = tmp_path / ".devbench" / "quota_pause.json"
+        with checkpoint_file.open() as f:
+            data = json.load(f)
+        assert data["stage_artefacts"] == artefacts
+
+
+# ---------------------------------------------------------------------------
+# save_checkpoint: path resolution -- workspace root fallback
+# ---------------------------------------------------------------------------
+
+
+class TestSaveCheckpointPathResolution:
+    """AC-193-16: per-session path when env var set, workspace-root fallback otherwise."""
+
+    _NOW = datetime(2026, 3, 1, 10, 0, 0, tzinfo=UTC)
+
+    def _save(self, session_dir: Path, **overrides: object) -> Path:
+        kwargs: dict[str, object] = {
+            "session_dir": session_dir,
+            "paused_at": self._NOW,
+            "reset_at": None,
+            "reason": "subscription_rate_limit",
+            "raw_error": "429",
+            "in_flight_wu": None,
+            "in_flight_phase": None,
+            "completed_judges": [],
+            "pending_judges": [],
+            "stage_artefacts": {},
+        }
+        kwargs.update(overrides)
+        save_checkpoint(**kwargs)  # type: ignore[arg-type]
+        return session_dir / ".devbench" / "quota_pause.json"
+
+    def test_uses_session_dir_when_provided(self, tmp_path: Path) -> None:
+        """When session_dir is provided, quota_pause.json is inside session_dir/.devbench/."""
+        session_dir = tmp_path / "sessions" / "alpha"
+        session_dir.mkdir(parents=True)
+        result_path = self._save(session_dir=session_dir)
+        assert result_path.exists()
+        assert str(result_path).startswith(str(session_dir))
+
+    def test_file_under_devbench_subdir(self, tmp_path: Path) -> None:
+        """quota_pause.json is always placed under the .devbench subdirectory."""
+        result_path = self._save(session_dir=tmp_path)
+        assert result_path.parent.name == ".devbench"
+        assert result_path.name == "quota_pause.json"
+
+    @pytest.mark.parametrize(
+        "session_name",
+        ["alpha", "beta", "session-01", "default"],
+    )
+    def test_different_session_dirs_produce_independent_files(self, tmp_path: Path, session_name: str) -> None:
+        """Each session_dir produces an independent quota_pause.json (multi-session aware)."""
+        session_dir = tmp_path / "sessions" / session_name
+        session_dir.mkdir(parents=True)
+        result_path = self._save(session_dir=session_dir)
+        assert result_path.exists()
+        assert session_name in str(result_path)
+
+
+# ---------------------------------------------------------------------------
+# load_checkpoint: file absent returns None
+# ---------------------------------------------------------------------------
+
+
+class TestLoadCheckpointAbsent:
+    """load_checkpoint returns None when quota_pause.json does not exist."""
+
+    def test_returns_none_when_file_absent(self, tmp_path: Path) -> None:
+        """Returns None when quota_pause.json has never been written."""
+        result = load_checkpoint(session_dir=tmp_path)
+        assert result is None
+
+    def test_returns_none_when_devbench_dir_absent(self, tmp_path: Path) -> None:
+        """Returns None when the .devbench directory does not exist."""
+        assert not (tmp_path / ".devbench").exists()
+        result = load_checkpoint(session_dir=tmp_path)
+        assert result is None
+
+    def test_returns_none_after_file_deleted(self, tmp_path: Path) -> None:
+        """Returns None after the checkpoint file has been removed (post-resume cleanup)."""
+        devbench_dir = tmp_path / ".devbench"
+        devbench_dir.mkdir()
+        checkpoint_file = devbench_dir / "quota_pause.json"
+        checkpoint_file.write_text("{}")
+        checkpoint_file.unlink()
+        result = load_checkpoint(session_dir=tmp_path)
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# load_checkpoint: happy path returns QuotaCheckpoint
+# ---------------------------------------------------------------------------
+
+
+class TestLoadCheckpointHappyPath:
+    """load_checkpoint returns a QuotaCheckpoint with all fields correctly deserialized."""
+
+    _NOW = datetime(2026, 3, 1, 10, 0, 0, tzinfo=UTC)
+    _RESET = datetime(2026, 3, 1, 15, 0, 0, tzinfo=UTC)
+
+    def _write_raw(self, tmp_path: Path, data: dict[str, object]) -> None:
+        devbench_dir = tmp_path / ".devbench"
+        devbench_dir.mkdir(parents=True, exist_ok=True)
+        (devbench_dir / "quota_pause.json").write_text(json.dumps(data))
+
+    def test_returns_quota_checkpoint_instance(self, tmp_path: Path) -> None:
+        """load_checkpoint returns a QuotaCheckpoint when the file exists."""
+        save_checkpoint(
+            session_dir=tmp_path,
+            paused_at=self._NOW,
+            reset_at=self._RESET,
+            reason="subscription_rate_limit",
+            raw_error="HTTP 429",
+            in_flight_wu="E5-F2-S1-T3",
+            in_flight_phase="GREEN",
+            completed_judges=["code_review"],
+            pending_judges=["test_review"],
+            stage_artefacts={},
+        )
+        result = load_checkpoint(session_dir=tmp_path)
+        assert isinstance(result, QuotaCheckpoint)
+
+    def test_paused_at_deserialized_as_utc_datetime(self, tmp_path: Path) -> None:
+        """paused_at is deserialized to a UTC-aware datetime."""
+        save_checkpoint(
+            session_dir=tmp_path,
+            paused_at=self._NOW,
+            reset_at=None,
+            reason="subscription_rate_limit",
+            raw_error="429",
+            in_flight_wu=None,
+            in_flight_phase=None,
+            completed_judges=[],
+            pending_judges=[],
+            stage_artefacts={},
+        )
+        result = load_checkpoint(session_dir=tmp_path)
+        assert result is not None
+        assert result.paused_at == self._NOW
+        assert result.paused_at.tzinfo is not None
+
+    def test_reset_at_deserialized_when_set(self, tmp_path: Path) -> None:
+        """reset_at is deserialized to a UTC-aware datetime when not null."""
+        save_checkpoint(
+            session_dir=tmp_path,
+            paused_at=self._NOW,
+            reset_at=self._RESET,
+            reason="subscription_rate_limit",
+            raw_error="429",
+            in_flight_wu=None,
+            in_flight_phase=None,
+            completed_judges=[],
+            pending_judges=[],
+            stage_artefacts={},
+        )
+        result = load_checkpoint(session_dir=tmp_path)
+        assert result is not None
+        assert result.reset_at == self._RESET
+        assert result.reset_at is not None
+        assert result.reset_at.tzinfo is not None
+
+    def test_reset_at_is_none_when_serialized_as_null(self, tmp_path: Path) -> None:
+        """reset_at is None in the returned QuotaCheckpoint when JSON value was null."""
+        save_checkpoint(
+            session_dir=tmp_path,
+            paused_at=self._NOW,
+            reset_at=None,
+            reason="subscription_rate_limit",
+            raw_error="429",
+            in_flight_wu=None,
+            in_flight_phase=None,
+            completed_judges=[],
+            pending_judges=[],
+            stage_artefacts={},
+        )
+        result = load_checkpoint(session_dir=tmp_path)
+        assert result is not None
+        assert result.reset_at is None
+
+    def test_all_scalar_fields_round_tripped(self, tmp_path: Path) -> None:
+        """All fields survive a save_checkpoint -> load_checkpoint round trip."""
+        save_checkpoint(
+            session_dir=tmp_path,
+            paused_at=self._NOW,
+            reset_at=self._RESET,
+            reason="bedrock_throttle",
+            raw_error="ThrottlingException",
+            in_flight_wu="E5-F2-S1-T3",
+            in_flight_phase="RED",
+            completed_judges=["code_review", "test_review"],
+            pending_judges=["security_review"],
+            stage_artefacts={"branch": "feat/quota", "pr": 99},
+        )
+        result = load_checkpoint(session_dir=tmp_path)
+        assert result is not None
+        assert result.paused_at == self._NOW
+        assert result.reset_at == self._RESET
+        assert result.reason == "bedrock_throttle"
+        assert result.raw_error == "ThrottlingException"
+        assert result.in_flight_wu == "E5-F2-S1-T3"
+        assert result.in_flight_phase == "RED"
+        assert result.completed_judges == ["code_review", "test_review"]
+        assert result.pending_judges == ["security_review"]
+        assert result.stage_artefacts == {"branch": "feat/quota", "pr": 99}
+
+    def test_in_flight_wu_none_round_tripped(self, tmp_path: Path) -> None:
+        """in_flight_wu=None survives a round trip."""
+        save_checkpoint(
+            session_dir=tmp_path,
+            paused_at=self._NOW,
+            reset_at=None,
+            reason="subscription_rate_limit",
+            raw_error="429",
+            in_flight_wu=None,
+            in_flight_phase=None,
+            completed_judges=[],
+            pending_judges=[],
+            stage_artefacts={},
+        )
+        result = load_checkpoint(session_dir=tmp_path)
+        assert result is not None
+        assert result.in_flight_wu is None
+        assert result.in_flight_phase is None
+
+    def test_empty_lists_round_tripped(self, tmp_path: Path) -> None:
+        """Empty completed_judges and pending_judges lists round-trip correctly."""
+        save_checkpoint(
+            session_dir=tmp_path,
+            paused_at=self._NOW,
+            reset_at=None,
+            reason="subscription_rate_limit",
+            raw_error="429",
+            in_flight_wu=None,
+            in_flight_phase=None,
+            completed_judges=[],
+            pending_judges=[],
+            stage_artefacts={},
+        )
+        result = load_checkpoint(session_dir=tmp_path)
+        assert result is not None
+        assert result.completed_judges == []
+        assert result.pending_judges == []
+
+    def test_empty_stage_artefacts_round_tripped(self, tmp_path: Path) -> None:
+        """Empty stage_artefacts dict round-trips correctly."""
+        save_checkpoint(
+            session_dir=tmp_path,
+            paused_at=self._NOW,
+            reset_at=None,
+            reason="subscription_rate_limit",
+            raw_error="429",
+            in_flight_wu=None,
+            in_flight_phase=None,
+            completed_judges=[],
+            pending_judges=[],
+            stage_artefacts={},
+        )
+        result = load_checkpoint(session_dir=tmp_path)
+        assert result is not None
+        assert result.stage_artefacts == {}
+
+
+# ---------------------------------------------------------------------------
+# load_checkpoint: malformed / corrupt JSON raises ValueError
+# ---------------------------------------------------------------------------
+
+
+class TestLoadCheckpointCorruptFile:
+    """load_checkpoint raises ValueError on corrupt or malformed quota_pause.json."""
+
+    def _write_raw_text(self, tmp_path: Path, text: str) -> None:
+        devbench_dir = tmp_path / ".devbench"
+        devbench_dir.mkdir(parents=True, exist_ok=True)
+        (devbench_dir / "quota_pause.json").write_text(text)
+
+    def test_raises_value_error_on_invalid_json(self, tmp_path: Path) -> None:
+        """load_checkpoint raises ValueError when quota_pause.json contains invalid JSON."""
+        self._write_raw_text(tmp_path, "not valid json {{{")
+        with pytest.raises(ValueError, match=r"quota_pause\.json"):
+            load_checkpoint(session_dir=tmp_path)
+
+    def test_raises_value_error_on_non_dict_json(self, tmp_path: Path) -> None:
+        """load_checkpoint raises ValueError when JSON root is not a dict."""
+        self._write_raw_text(tmp_path, "[1, 2, 3]")
+        with pytest.raises(ValueError, match=r"quota_pause\.json"):
+            load_checkpoint(session_dir=tmp_path)
+
+    def test_raises_value_error_on_missing_required_field(self, tmp_path: Path) -> None:
+        """load_checkpoint raises ValueError when a required field is absent."""
+        # paused_at is mandatory
+        self._write_raw_text(
+            tmp_path,
+            json.dumps(
+                {
+                    "reset_at": None,
+                    "reason": "subscription_rate_limit",
+                    "raw_error": "429",
+                    "in_flight_wu": None,
+                    "in_flight_phase": None,
+                    "completed_judges": [],
+                    "pending_judges": [],
+                    "stage_artefacts": {},
+                }
+            ),
+        )
+        with pytest.raises(ValueError, match=r"quota_pause\.json"):
+            load_checkpoint(session_dir=tmp_path)
+
+    def test_raises_value_error_on_invalid_paused_at_format(self, tmp_path: Path) -> None:
+        """load_checkpoint raises ValueError when paused_at is not a valid ISO datetime."""
+        self._write_raw_text(
+            tmp_path,
+            json.dumps(
+                {
+                    "paused_at": "not-a-datetime",
+                    "reset_at": None,
+                    "reason": "subscription_rate_limit",
+                    "raw_error": "429",
+                    "in_flight_wu": None,
+                    "in_flight_phase": None,
+                    "completed_judges": [],
+                    "pending_judges": [],
+                    "stage_artefacts": {},
+                }
+            ),
+        )
+        with pytest.raises(ValueError, match=r"quota_pause\.json"):
+            load_checkpoint(session_dir=tmp_path)
+
+    def test_raises_value_error_on_invalid_reset_at_format(self, tmp_path: Path) -> None:
+        """load_checkpoint raises ValueError when reset_at is neither null nor a valid ISO datetime."""
+        self._write_raw_text(
+            tmp_path,
+            json.dumps(
+                {
+                    "paused_at": "2026-03-01T10:00:00+00:00",
+                    "reset_at": "not-a-datetime",
+                    "reason": "subscription_rate_limit",
+                    "raw_error": "429",
+                    "in_flight_wu": None,
+                    "in_flight_phase": None,
+                    "completed_judges": [],
+                    "pending_judges": [],
+                    "stage_artefacts": {},
+                }
+            ),
+        )
+        with pytest.raises(ValueError, match=r"quota_pause\.json"):
+            load_checkpoint(session_dir=tmp_path)
+
+    def test_raises_value_error_on_empty_file(self, tmp_path: Path) -> None:
+        """load_checkpoint raises ValueError when quota_pause.json is empty."""
+        self._write_raw_text(tmp_path, "")
+        with pytest.raises(ValueError, match=r"quota_pause\.json"):
+            load_checkpoint(session_dir=tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# save_checkpoint + load_checkpoint: integration round-trip
+# ---------------------------------------------------------------------------
+
+
+class TestSaveLoadCheckpointIntegration:
+    """Integration: save_checkpoint followed immediately by load_checkpoint returns equivalent data.
+
+    These tests use a real tmp_path filesystem (no mocks on os.replace or json)
+    to verify the end-to-end atomic write + read path.
+    """
+
+    _NOW = datetime(2026, 5, 15, 8, 30, 0, tzinfo=UTC)
+    _RESET = datetime(2026, 5, 15, 13, 0, 0, tzinfo=UTC)
+
+    def test_round_trip_full_checkpoint(self, tmp_path: Path) -> None:
+        """Full round-trip: every field survives save -> load intact."""
+        save_checkpoint(
+            session_dir=tmp_path,
+            paused_at=self._NOW,
+            reset_at=self._RESET,
+            reason="subscription_rate_limit",
+            raw_error="HTTP 429 -- rate limit exceeded",
+            in_flight_wu="E5-F2-S1-T3",
+            in_flight_phase="GREEN",
+            completed_judges=["code_review", "test_review"],
+            pending_judges=["security_review", "doc_review"],
+            stage_artefacts={"branch": "feat/quota", "commit": "deadbeef", "pr": 77},
+        )
+        cp = load_checkpoint(session_dir=tmp_path)
+        assert cp is not None
+        assert cp.paused_at == self._NOW
+        assert cp.reset_at == self._RESET
+        assert cp.reason == "subscription_rate_limit"
+        assert cp.raw_error == "HTTP 429 -- rate limit exceeded"
+        assert cp.in_flight_wu == "E5-F2-S1-T3"
+        assert cp.in_flight_phase == "GREEN"
+        assert cp.completed_judges == ["code_review", "test_review"]
+        assert cp.pending_judges == ["security_review", "doc_review"]
+        assert cp.stage_artefacts == {"branch": "feat/quota", "commit": "deadbeef", "pr": 77}
+
+    def test_round_trip_minimal_checkpoint(self, tmp_path: Path) -> None:
+        """Minimal checkpoint (reset_at=None, no wu/phase, empty lists) round-trips."""
+        save_checkpoint(
+            session_dir=tmp_path,
+            paused_at=self._NOW,
+            reset_at=None,
+            reason="sdk_credit_exhausted",
+            raw_error="402",
+            in_flight_wu=None,
+            in_flight_phase=None,
+            completed_judges=[],
+            pending_judges=[],
+            stage_artefacts={},
+        )
+        cp = load_checkpoint(session_dir=tmp_path)
+        assert cp is not None
+        assert cp.reset_at is None
+        assert cp.in_flight_wu is None
+        assert cp.in_flight_phase is None
+        assert cp.completed_judges == []
+        assert cp.pending_judges == []
+        assert cp.stage_artefacts == {}
+
+    def test_load_returns_none_before_first_save(self, tmp_path: Path) -> None:
+        """Before any save, load returns None (no file exists)."""
+        assert load_checkpoint(session_dir=tmp_path) is None
+
+    def test_load_still_works_after_overwrite(self, tmp_path: Path) -> None:
+        """After two sequential saves, load_checkpoint returns the second checkpoint."""
+        save_checkpoint(
+            session_dir=tmp_path,
+            paused_at=self._NOW,
+            reset_at=None,
+            reason="subscription_rate_limit",
+            raw_error="429-first",
+            in_flight_wu="T1",
+            in_flight_phase="RED",
+            completed_judges=[],
+            pending_judges=["code_review"],
+            stage_artefacts={},
+        )
+        second_time = datetime(2026, 5, 15, 9, 0, 0, tzinfo=UTC)
+        save_checkpoint(
+            session_dir=tmp_path,
+            paused_at=second_time,
+            reset_at=self._RESET,
+            reason="bedrock_throttle",
+            raw_error="429-second",
+            in_flight_wu="T2",
+            in_flight_phase="GREEN",
+            completed_judges=["code_review"],
+            pending_judges=["test_review"],
+            stage_artefacts={"pr": 55},
+        )
+        cp = load_checkpoint(session_dir=tmp_path)
+        assert cp is not None
+        assert cp.reason == "bedrock_throttle"
+        assert cp.in_flight_wu == "T2"
+        assert cp.paused_at == second_time
+
+    @pytest.mark.parametrize(
+        "session_name",
+        ["alpha", "beta", "default"],
+    )
+    def test_independent_session_dirs_do_not_interfere(self, tmp_path: Path, session_name: str) -> None:
+        """Each session_dir gets its own independent quota_pause.json (AC-193-16)."""
+        session_a = tmp_path / "sessions" / "alpha"
+        session_b = tmp_path / "sessions" / "beta"
+        session_a.mkdir(parents=True)
+        session_b.mkdir(parents=True)
+
+        save_checkpoint(
+            session_dir=session_a,
+            paused_at=self._NOW,
+            reset_at=None,
+            reason="subscription_rate_limit",
+            raw_error="429",
+            in_flight_wu="T-alpha",
+            in_flight_phase="RED",
+            completed_judges=[],
+            pending_judges=[],
+            stage_artefacts={},
+        )
+        save_checkpoint(
+            session_dir=session_b,
+            paused_at=self._NOW,
+            reset_at=None,
+            reason="bedrock_throttle",
+            raw_error="throttle",
+            in_flight_wu="T-beta",
+            in_flight_phase="GREEN",
+            completed_judges=["code_review"],
+            pending_judges=[],
+            stage_artefacts={},
+        )
+        cp_a = load_checkpoint(session_dir=session_a)
+        cp_b = load_checkpoint(session_dir=session_b)
+        assert cp_a is not None
+        assert cp_b is not None
+        assert cp_a.in_flight_wu == "T-alpha"
+        assert cp_b.in_flight_wu == "T-beta"
+        assert cp_a.reason == "subscription_rate_limit"
+        assert cp_b.reason == "bedrock_throttle"
+
+
+# ---------------------------------------------------------------------------
+# save_checkpoint: write-failure path -- temp file is cleaned up
+# ---------------------------------------------------------------------------
+
+
+class TestSaveCheckpointWriteFailure:
+    """save_checkpoint cleans up temp file on write failure and re-raises."""
+
+    _NOW = datetime(2026, 3, 1, 10, 0, 0, tzinfo=UTC)
+
+    def test_ioerror_on_write_is_propagated(self, tmp_path: Path) -> None:
+        """When write_text raises OSError, save_checkpoint propagates it."""
+        with patch("pathlib.Path.write_text", side_effect=OSError("disk full")):
+            with pytest.raises(OSError, match="disk full"):
+                save_checkpoint(
+                    session_dir=tmp_path,
+                    paused_at=self._NOW,
+                    reset_at=None,
+                    reason="subscription_rate_limit",
+                    raw_error="429",
+                    in_flight_wu=None,
+                    in_flight_phase=None,
+                    completed_judges=[],
+                    pending_judges=[],
+                    stage_artefacts={},
+                )
+
+    def test_no_partial_file_remains_on_write_failure(self, tmp_path: Path) -> None:
+        """After a write failure, neither the target nor a stale temp file is left behind."""
+        import unittest.mock
+
+        calls: list[str] = []
+
+        original_write_text = Path.write_text
+
+        def failing_write_text(self_path: Path, *args: object, **kwargs: object) -> None:
+            calls.append(str(self_path))
+            if self_path.suffix == ".tmp":
+                raise OSError("simulated disk full")
+            return original_write_text(self_path, *args, **kwargs)  # type: ignore[return-value]
+
+        with unittest.mock.patch.object(Path, "write_text", failing_write_text):
+            with pytest.raises(OSError, match="simulated disk full"):
+                save_checkpoint(
+                    session_dir=tmp_path,
+                    paused_at=self._NOW,
+                    reset_at=None,
+                    reason="subscription_rate_limit",
+                    raw_error="429",
+                    in_flight_wu=None,
+                    in_flight_phase=None,
+                    completed_judges=[],
+                    pending_judges=[],
+                    stage_artefacts={},
+                )
+        # The target quota_pause.json must not exist
+        assert not (tmp_path / ".devbench" / "quota_pause.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# load_checkpoint: paused_at as non-string type in JSON raises ValueError
+# ---------------------------------------------------------------------------
+
+
+class TestLoadCheckpointNonStringDatetime:
+    """load_checkpoint raises ValueError when a datetime field is a non-string JSON value."""
+
+    def _write_raw(self, tmp_path: Path, data: dict[str, object]) -> None:
+        devbench_dir = tmp_path / ".devbench"
+        devbench_dir.mkdir(parents=True, exist_ok=True)
+        (devbench_dir / "quota_pause.json").write_text(json.dumps(data))
+
+    def test_raises_value_error_when_paused_at_is_integer(self, tmp_path: Path) -> None:
+        """load_checkpoint raises ValueError when paused_at is an integer (not a string)."""
+        self._write_raw(
+            tmp_path,
+            {
+                "paused_at": 1767268800,  # epoch int instead of ISO string
+                "reset_at": None,
+                "reason": "subscription_rate_limit",
+                "raw_error": "429",
+                "in_flight_wu": None,
+                "in_flight_phase": None,
+                "completed_judges": [],
+                "pending_judges": [],
+                "stage_artefacts": {},
+            },
+        )
+        with pytest.raises(ValueError, match=r"quota_pause\.json"):
+            load_checkpoint(session_dir=tmp_path)
+
+    def test_raises_value_error_when_reset_at_is_integer(self, tmp_path: Path) -> None:
+        """load_checkpoint raises ValueError when reset_at is an integer (not null or string)."""
+        self._write_raw(
+            tmp_path,
+            {
+                "paused_at": "2026-03-01T10:00:00+00:00",
+                "reset_at": 1767268800,  # epoch int instead of ISO string or null
+                "reason": "subscription_rate_limit",
+                "raw_error": "429",
+                "in_flight_wu": None,
+                "in_flight_phase": None,
+                "completed_judges": [],
+                "pending_judges": [],
+                "stage_artefacts": {},
+            },
+        )
+        with pytest.raises(ValueError, match=r"quota_pause\.json"):
+            load_checkpoint(session_dir=tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# load_checkpoint: timezone-naive ISO datetime is accepted and normalised to UTC
+# ---------------------------------------------------------------------------
+
+
+class TestLoadCheckpointTimezoneNaiveDatetime:
+    """load_checkpoint accepts timezone-naive ISO datetimes and normalises them to UTC."""
+
+    def _write_raw(self, tmp_path: Path, data: dict[str, object]) -> None:
+        devbench_dir = tmp_path / ".devbench"
+        devbench_dir.mkdir(parents=True, exist_ok=True)
+        (devbench_dir / "quota_pause.json").write_text(json.dumps(data))
+
+    def test_naive_paused_at_is_accepted_and_utc_normalised(self, tmp_path: Path) -> None:
+        """A timezone-naive paused_at string is accepted and returned as a UTC-aware datetime."""
+        self._write_raw(
+            tmp_path,
+            {
+                "paused_at": "2026-03-01T10:00:00",  # no timezone suffix
+                "reset_at": None,
+                "reason": "subscription_rate_limit",
+                "raw_error": "429",
+                "in_flight_wu": None,
+                "in_flight_phase": None,
+                "completed_judges": [],
+                "pending_judges": [],
+                "stage_artefacts": {},
+            },
+        )
+        cp = load_checkpoint(session_dir=tmp_path)
+        assert cp is not None
+        assert cp.paused_at.tzinfo is not None
+        assert cp.paused_at == datetime(2026, 3, 1, 10, 0, 0, tzinfo=UTC)

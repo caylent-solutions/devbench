@@ -219,8 +219,11 @@ _RECOVERY_AGENT_TAGS: frozenset[str] = frozenset(
     {"agent/orchestrator", "agent/blocker_resolver", "agent/manifest_amender", "agent/backlog_manager"}
 )
 _RECOVERY_BODY_RE: re.Pattern[str] = re.compile(
-    r"amendment-reject|out-of-scope|ALL_REVIEWS_FAILED|REVIEW_REJECTED"
-    r"|dependency .* not yet terminal|dep .* not yet terminal",
+    r"amendment[- ]reject(?:ed)?"
+    r"|out-of-scope"
+    r"|ALL_REVIEWS_FAILED|REVIEW_REJECTED"
+    r"|dependency .* not yet terminal|dep .* not yet terminal"
+    r"|will auto-requeue when",
     re.IGNORECASE,
 )
 _BLOCKED_AUDIT_RE: re.Pattern[str] = re.compile(
@@ -309,8 +312,9 @@ def _recent_recovery_audit_comment(source_file: Path, now: datetime, window_seco
     ``[<ts>] [<agent>] [BLOCKED] <body>`` line, and returns True iff the
     timestamp is within ``window_seconds`` of ``now`` AND the agent tag
     is one of the canonical recovery agents AND the body matches the
-    recovery-cause regex (amendment-reject / out-of-scope /
-    ALL_REVIEWS_FAILED / REVIEW_REJECTED). Excludes the
+    recovery-cause regex (``amendment reject`` / ``amendment rejected`` /
+    ``amendment-reject`` / ``out-of-scope`` / ``ALL_REVIEWS_FAILED`` /
+    ``REVIEW_REJECTED`` / ``will auto-requeue when``). Excludes the
     ``[BLOCKED_PENDING_PROPOSAL]`` marker rows since those represent
     cascade state, not pending recovery.
 

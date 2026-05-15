@@ -2648,6 +2648,136 @@ class TestRecentRecoveryAuditCommentEdgeCases:
 
 
 # ---------------------------------------------------------------------------
+# E8-F1-S1-T1 / issue #195: _RECOVERY_BODY_RE must match English forms
+# and auto-requeue phrase
+# ---------------------------------------------------------------------------
+
+
+class TestRecoveryBodyRegex:
+    """Parametrised regression tests for ``_RECOVERY_BODY_RE``.
+
+    Issue #195: the original regex only matched kebab-case
+    ``amendment-reject``, missing the natural-English ``Amendment rejected``
+    and the orchestrator's stock ``will auto-requeue when ...`` phrase.
+    """
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            pytest.param("amendment-reject", id="kebab-case-base"),
+            pytest.param("Amendment-reject", id="kebab-case-capitalised"),
+            pytest.param("amendment reject", id="space-separated"),
+            pytest.param("amendment rejected", id="english-past-tense"),
+            pytest.param("Amendment rejected", id="english-capitalised-past-tense"),
+            pytest.param("AMENDMENT REJECTED", id="english-upper-case"),
+            pytest.param(
+                "will auto-requeue when constants.py ownership clears",
+                id="auto-requeue-full-phrase",
+            ),
+            pytest.param("will auto-requeue when", id="auto-requeue-bare"),
+            pytest.param("out-of-scope", id="out-of-scope"),
+            pytest.param("Out-Of-Scope", id="out-of-scope-title-case"),
+            pytest.param("ALL_REVIEWS_FAILED", id="all-reviews-failed"),
+            pytest.param("REVIEW_REJECTED", id="review-rejected"),
+            pytest.param("dependency E0-T1 not yet terminal", id="dependency-not-terminal"),
+            pytest.param("dep E0-T1 not yet terminal", id="dep-short-form"),
+        ],
+        ids=lambda v: "",
+    )
+    def test_positive_match(self, body: str) -> None:
+        from devbench.backlog.proposal import _RECOVERY_BODY_RE
+
+        assert _RECOVERY_BODY_RE.search(body), f"_RECOVERY_BODY_RE should match: {body!r}"
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            pytest.param("unrelated [BLOCKED] reason", id="unrelated-blocked"),
+            pytest.param("task is stuck on an unknown issue", id="generic-stuck"),
+            pytest.param("amend this code", id="partial-amend-no-match"),
+            pytest.param("rejected by the operator", id="rejected-but-not-amendment"),
+            pytest.param("auto-requeue", id="auto-requeue-without-will-when"),
+        ],
+        ids=lambda v: "",
+    )
+    def test_negative_no_match(self, body: str) -> None:
+        from devbench.backlog.proposal import _RECOVERY_BODY_RE
+
+        assert not _RECOVERY_BODY_RE.search(body), f"_RECOVERY_BODY_RE should NOT match: {body!r}"
+
+
+class TestRecoveryBodyRegexIntegration:
+    """End-to-end: synthetic work-unit with English-form [BLOCKED] audit
+    classifies as AWAITING_AMENDMENT_RECOVERY via ``classify_blocked_task``.
+    """
+
+    def _workspace(self, tmp_path: Path) -> Path:
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        story_dir = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+        index = workspace / "BACKLOG.md"
+        index.write_text(
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Test task | Task | blocked | None | r "
+            "| `backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n"
+        )
+        return workspace
+
+    def test_amendment_rejected_english_classifies_recovery(self, tmp_path: Path) -> None:
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        workspace = self._workspace(tmp_path)
+        wu = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
+        now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        ts = now.strftime("%Y-%m-%d %H:%M UTC")
+        wu.write_text(
+            "# E0-F1-S1-T1: Test\n\n## Status: blocked\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
+            "## Comments\n\n"
+            f"[{ts}] [agent/orchestrator] [BLOCKED] Amendment rejected -- emitting fix proposal\n"
+        )
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+            now=now,
+            recovery_window_seconds=300,
+        )
+        assert state is BlockedTaskState.AWAITING_AMENDMENT_RECOVERY
+
+    def test_auto_requeue_phrase_classifies_recovery(self, tmp_path: Path) -> None:
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        workspace = self._workspace(tmp_path)
+        wu = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
+        now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        ts = now.strftime("%Y-%m-%d %H:%M UTC")
+        wu.write_text(
+            "# E0-F1-S1-T1: Test\n\n## Status: blocked\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
+            "## Comments\n\n"
+            f"[{ts}] [agent/orchestrator] [BLOCKED] Task will auto-requeue when constants.py ownership clears\n"
+        )
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+            now=now,
+            recovery_window_seconds=300,
+        )
+        assert state is BlockedTaskState.AWAITING_AMENDMENT_RECOVERY
+
+
+# ---------------------------------------------------------------------------
 # E2-F1-S1-T1 / issue #183(d): BlockedTaskState classifier tests
 # ---------------------------------------------------------------------------
 

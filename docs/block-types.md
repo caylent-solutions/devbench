@@ -398,8 +398,11 @@ for external API` would incorrectly suppress operator-attention alerts).
 
 ```python
 _RECOVERY_BODY_RE: re.Pattern[str] = re.compile(
-    r"amendment-reject|out-of-scope|ALL_REVIEWS_FAILED|REVIEW_REJECTED"
-    r"|dependency .* not yet terminal|dep .* not yet terminal",
+    r"amendment[- ]reject(?:ed)?"
+    r"|out-of-scope"
+    r"|ALL_REVIEWS_FAILED|REVIEW_REJECTED"
+    r"|dependency .* not yet terminal|dep .* not yet terminal"
+    r"|will auto-requeue when",
     re.IGNORECASE,
 )
 ```

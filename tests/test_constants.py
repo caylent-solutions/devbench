@@ -195,3 +195,15 @@ class TestSessionConstants:
         from devbench.constants import SESSION_REGISTRY_TMP_SUFFIX
 
         assert SESSION_REGISTRY_TMP_SUFFIX == ".tmp"
+
+    def test_session_flock_poll_interval_seconds_is_float(self) -> None:
+        """SESSION_FLOCK_POLL_INTERVAL_SECONDS is a float (sub-second poll cadence for flock_backlog)."""
+        from devbench.constants import SESSION_FLOCK_POLL_INTERVAL_SECONDS
+
+        assert isinstance(SESSION_FLOCK_POLL_INTERVAL_SECONDS, float)
+
+    def test_session_flock_poll_interval_seconds_value(self) -> None:
+        """SESSION_FLOCK_POLL_INTERVAL_SECONDS equals 0.1 (100 ms poll cadence, spec 4.4.1)."""
+        from devbench.constants import SESSION_FLOCK_POLL_INTERVAL_SECONDS
+
+        assert SESSION_FLOCK_POLL_INTERVAL_SECONDS == 0.1

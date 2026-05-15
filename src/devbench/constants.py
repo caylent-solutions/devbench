@@ -582,3 +582,11 @@ SESSION_PID_FILENAME: str = "pid"
 # Suffix appended to the registry JSON path for the intermediate temp file
 # used during atomic registry writes (write-then-rename pattern).
 SESSION_REGISTRY_TMP_SUFFIX: str = ".tmp"
+
+# Poll interval (seconds) between non-blocking flock attempts in
+# :func:`devbench.session.flock_backlog`.  A sub-second value keeps the
+# effective wait latency low without busy-spinning.  Callers use
+# ``min(SESSION_FLOCK_POLL_INTERVAL_SECONDS, remaining)`` so the deadline is
+# never overshot.  Override via ``DEVBENCH_SESSION_FLOCK_POLL_INTERVAL``
+# env var if the default 0.1 s is too coarse or too fine for a given deployment.
+SESSION_FLOCK_POLL_INTERVAL_SECONDS: float = 0.1

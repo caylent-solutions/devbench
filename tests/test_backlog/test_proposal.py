@@ -2793,6 +2793,180 @@ class TestRecoveryBodyRegexIntegration:
 
 
 # ---------------------------------------------------------------------------
+# E8-F1-S1-T3 / issue #195: classify_blocked_task end-to-end integration
+# with 'Amendment rejected' audit -- false-positive loophole regression
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyBlockedTaskAmendmentRejectedEndToEnd:
+    """Issue #195 false-positive loophole: a task blocked with a recent
+    ``[BLOCKED] Amendment rejected ...`` audit comment, no
+    ``[BLOCKED_PENDING_PROPOSAL]`` marker, no unsatisfied regular deps,
+    and ``workspace_root`` supplied MUST classify as
+    ``AWAITING_AMENDMENT_RECOVERY`` -- not ``OPERATOR_ACTION_REQUIRED``.
+
+    Before the regex fix in E8-F1-S1-T1, the natural-English phrase
+    ``Amendment rejected`` was not matched by ``_RECOVERY_BODY_RE``
+    (which only accepted kebab-case ``amendment-reject``).  This caused
+    the classifier to fall through the recovery-signal branch and
+    incorrectly report ``OPERATOR_ACTION_REQUIRED``, generating
+    false operator-attention alerts during the 2026-05-15 autonomous run.
+    """
+
+    @staticmethod
+    def _build_workspace(
+        tmp_path: Path,
+        *,
+        audit_body: str,
+        include_marker: bool = False,
+        dep_status: str = "done",
+    ) -> Path:
+        """Build a minimal synthetic workspace for ``classify_blocked_task``.
+
+        Parameters
+        ----------
+        tmp_path:
+            pytest-provided temporary directory.
+        audit_body:
+            The ``[BLOCKED]`` audit comment body text.
+        include_marker:
+            If ``True``, add a ``[BLOCKED_PENDING_PROPOSAL]`` marker row
+            to the work-unit file.
+        dep_status:
+            Status of the dependency task (``done`` means satisfied).
+        """
+        from datetime import UTC, datetime
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        story_dir = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+
+        now = datetime(2026, 5, 15, 14, 0, tzinfo=UTC)
+        ts = now.strftime("%Y-%m-%d %H:%M UTC")
+
+        dep_section = "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
+        marker_section = ""
+        if include_marker:
+            marker_section = "## Blocked Pending Proposals\n\n[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T99\n\n"
+
+        wu = story_dir / "E0-F1-S1-T1.md"
+        wu.write_text(
+            "# E0-F1-S1-T1: Test task\n\n"
+            "## Status: blocked\n\n"
+            + marker_section
+            + dep_section
+            + "## Comments\n\n"
+            + f"[{ts}] [agent/orchestrator] [BLOCKED] {audit_body}\n"
+        )
+
+        index = workspace / "BACKLOG.md"
+        index.write_text(
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Test task | Task | blocked | None | r "
+            "| `backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n"
+        )
+
+        return workspace
+
+    @pytest.mark.parametrize(
+        "audit_body",
+        [
+            pytest.param(
+                "Amendment rejected -- emitting fix proposal",
+                id="english-capitalised-past-tense",
+            ),
+            pytest.param(
+                "amendment rejected for scope violation",
+                id="english-lowercase-past-tense",
+            ),
+            pytest.param(
+                "amendment-reject -- scope mismatch",
+                id="kebab-case-original",
+            ),
+        ],
+    )
+    def test_recovery_signal_fires_with_workspace_root(self, tmp_path: Path, audit_body: str) -> None:
+        """When workspace_root is supplied and the recent audit comment
+        contains an amendment-rejected phrase, the classifier MUST return
+        AWAITING_AMENDMENT_RECOVERY (not OPERATOR_ACTION_REQUIRED).
+        This is the core regression for issue #195.
+        """
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        workspace = self._build_workspace(tmp_path, audit_body=audit_body)
+        now = datetime(2026, 5, 15, 14, 0, tzinfo=UTC)
+
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+            now=now,
+            recovery_window_seconds=300,
+        )
+
+        assert state is BlockedTaskState.AWAITING_AMENDMENT_RECOVERY
+
+    def test_falls_through_without_workspace_root(self, tmp_path: Path) -> None:
+        """Without workspace_root the recovery-signal branch is skipped and
+        the classifier returns OPERATOR_ACTION_REQUIRED -- proving that
+        the workspace_root parameter is load-bearing for the recovery path.
+        """
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        workspace = self._build_workspace(
+            tmp_path,
+            audit_body="Amendment rejected -- emitting fix proposal",
+        )
+        now = datetime(2026, 5, 15, 14, 0, tzinfo=UTC)
+
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            # workspace_root deliberately omitted
+            now=now,
+            recovery_window_seconds=300,
+        )
+
+        assert state is BlockedTaskState.OPERATOR_ACTION_REQUIRED
+
+    def test_stale_audit_outside_window_falls_through(self, tmp_path: Path) -> None:
+        """An amendment-rejected audit older than the recovery window does NOT
+        classify as AWAITING_AMENDMENT_RECOVERY -- the timestamp check is
+        load-bearing.
+        """
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        workspace = self._build_workspace(
+            tmp_path,
+            audit_body="Amendment rejected -- emitting fix proposal",
+        )
+        # Set now to 10 minutes after the audit timestamp (window is 300s / 5min)
+        now = datetime(2026, 5, 15, 14, 10, tzinfo=UTC)
+
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+            now=now,
+            recovery_window_seconds=300,
+        )
+
+        assert state is BlockedTaskState.OPERATOR_ACTION_REQUIRED
+
+
+# ---------------------------------------------------------------------------
 # E2-F1-S1-T1 / issue #183(d): BlockedTaskState classifier tests
 # ---------------------------------------------------------------------------
 

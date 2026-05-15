@@ -1372,6 +1372,50 @@ def cmd_unhold(*argv: str) -> int:
     return 0
 
 
+def cmd_promote(unit_id: str) -> int:
+    """Transition a single work unit from ``draft`` to ``in-queue``.
+
+    Refuses to promote any unit whose current status is not ``draft``
+    (returns rc=1 with a clear error on stderr). On success, appends a
+    ``[PROMOTED] draft -> in-queue`` audit comment via
+    ``BacklogManager._append_agent_comment``.
+
+    Args:
+        unit_id: The work-unit identifier to promote.
+
+    Returns:
+        0 on success, 1 on any error (unit not found, file missing,
+        status is not draft).
+    """
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+
+    target = _find_unit(units, unit_id)
+    if target is None:
+        print(f"ERROR: Work unit '{unit_id}' not found", file=sys.stderr)
+        return 1
+
+    if target.status is not WorkUnitStatus.DRAFT:
+        print(
+            f"ERROR: cannot promote {unit_id!r}: not in 'draft' status (current: {target.status.value!r})",
+            file=sys.stderr,
+        )
+        return 1
+
+    wu_file = _resolve_unit_file(target)
+    if wu_file is None:
+        print(f"ERROR: Work unit file not found for '{unit_id}'", file=sys.stderr)
+        return 1
+
+    mgr = BacklogManager()
+    mgr.force_status(wu_file, BACKLOG_INDEX, unit_id, STATUS_IN_QUEUE)
+    mgr._append_agent_comment(wu_file, "orchestrator", "[PROMOTED] draft -> in-queue")
+
+    logger.info("Promoted %s from draft to in-queue", unit_id)
+    print(f"Promoted {unit_id} from draft to in-queue")
+    return 0
+
+
 def cmd_validate_backlog(*argv: str) -> int:
     """Validate backlog integrity and print any inconsistencies.
 
@@ -5817,6 +5861,7 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
             "unhold <id> --reason <message>. Refuses units not currently on hold."
         ),
     ),
+    "promote": (cmd_promote, 1, "Promote a draft work unit to in-queue: promote <id>"),
     "sync-blocked": (
         cmd_sync_blocked,
         0,

@@ -5834,6 +5834,140 @@ class TestCmdUnhold:
         assert "unhold" in cli._VARIADIC_COMMANDS
 
 
+class TestCmdPromote:
+    """E1-F4-S1-T1: ``devbench promote <id>`` transitions draft -> in-queue."""
+
+    def _make_draft_unit(
+        self, tmp_path: Path, unit_id: str = "EX-F1-S1-T1", status: str = "draft"
+    ) -> tuple[Path, Path]:
+        backlog_md = tmp_path / "BACKLOG.md"
+        backlog_md.write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            f"| {unit_id} | Test | Task | {status} | None | caylent-solutions/git-repo | `backlog/{unit_id}.md` |\n"
+        )
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir(exist_ok=True)
+        wu_file = backlog_dir / f"{unit_id}.md"
+        wu_file.write_text(f"# {unit_id}: Test\n\n## Status: {status}\n\n## Description\n\nx\n\n## Comments\n")
+        return backlog_md, wu_file
+
+    def test_happy_path_transitions_draft_to_in_queue(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        backlog_md, wu_file = self._make_draft_unit(tmp_path)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_promote("EX-F1-S1-T1")
+        assert rc == 0
+        content = wu_file.read_text()
+        assert "## Status: in-queue" in content
+        assert "[PROMOTED] draft -> in-queue" in content
+        out = capsys.readouterr().out.strip()
+        assert "Promoted EX-F1-S1-T1" in out
+
+    def test_refuses_non_draft_status_in_queue(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        backlog_md, _ = self._make_draft_unit(tmp_path, status="in-queue")
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_promote("EX-F1-S1-T1")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "not in 'draft' status" in err
+
+    @pytest.mark.parametrize("status", ["in-progress", "done", "blocked", "hold", "declined"])
+    def test_refuses_non_draft_statuses(self, tmp_path: Path, capsys: pytest.CaptureFixture[str], status: str) -> None:
+        backlog_md, _ = self._make_draft_unit(tmp_path, status=status)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_promote("EX-F1-S1-T1")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "not in 'draft' status" in err
+
+    def test_unknown_unit_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        backlog_md, _ = self._make_draft_unit(tmp_path)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+        ):
+            rc = cli.cmd_promote("NO-SUCH-ID")
+        assert rc == 1
+        assert "not found" in capsys.readouterr().err
+
+    def test_missing_wu_file_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """When _resolve_unit_file returns None (TOCTOU race), cmd_promote returns 1."""
+        backlog_md, _wu_file = self._make_draft_unit(tmp_path)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._resolve_unit_file", return_value=None),
+        ):
+            rc = cli.cmd_promote("EX-F1-S1-T1")
+        assert rc == 1
+        assert "file not found" in capsys.readouterr().err.lower()
+
+    def test_registered_in_commands(self) -> None:
+        assert "promote" in cli._COMMANDS
+
+    def test_audit_comment_contains_promoted_marker(self, tmp_path: Path) -> None:
+        backlog_md, wu_file = self._make_draft_unit(tmp_path)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            cli.cmd_promote("EX-F1-S1-T1")
+        content = wu_file.read_text()
+        # Verify the audit comment has the expected format
+        assert "[agent/orchestrator]" in content
+        assert "[PROMOTED] draft -> in-queue" in content
+
+
+class TestCmdPromoteIntegration:
+    """Integration test: exercises promote against a real fixture workspace."""
+
+    def test_promote_real_fixture_workspace(self, tmp_path: Path) -> None:
+        """End-to-end: construct a real backlog fixture and promote a draft unit."""
+        unit_id = "EX-F1-S1-T1"
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        backlog_md = tmp_path / "BACKLOG.md"
+        backlog_md.write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            f"| {unit_id} | Real Test | Task | draft | None | caylent-solutions/git-repo "
+            f"| `backlog/{unit_id}.md` |\n"
+        )
+        wu_file = backlog_dir / f"{unit_id}.md"
+        wu_file.write_text(
+            f"# {unit_id}: Real Test\n\n## Status: draft\n\n## Description\n\nReal fixture.\n\n## Comments\n"
+        )
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_promote(unit_id)
+        assert rc == 0
+        content = wu_file.read_text()
+        assert "## Status: in-queue" in content
+        assert "[PROMOTED] draft -> in-queue" in content
+        # Verify BACKLOG.md index row was also updated
+        index_content = backlog_md.read_text()
+        assert "in-queue" in index_content
+
+
 class TestWireOrphanCleanupDepChain:
     """Phase 10: orphan-cleanup auto-emission resolves Manifest collisions via auto-wired deps."""
 

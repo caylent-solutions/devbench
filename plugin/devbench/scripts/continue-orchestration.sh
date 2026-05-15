@@ -18,7 +18,17 @@ set -euo pipefail
 WORKSPACE_ROOT="${JUDGE_WORKSPACE_ROOT:-}"
 BACKLOG_INDEX="${WORKSPACE_ROOT}/BACKLOG.md"
 CONFIG_FILE="${WORKSPACE_ROOT}/backlog/config/devbench.yaml"
-STATE_FILE="/tmp/devbench-stop-hook-state.json"
+
+# Per-session circuit-breaker state file (AC-192-15):
+# When DEVBENCH_SESSION_NAME is set, scope the state file to the named session
+# so concurrent orchestrator sessions maintain independent block counters.
+# When unset, fall back to the shared path for single-session (legacy) behaviour.
+SESSION_NAME="${DEVBENCH_SESSION_NAME:-}"
+if [ -n "$SESSION_NAME" ]; then
+    STATE_FILE="/tmp/devbench-stop-hook-state-${SESSION_NAME}.json"
+else
+    STATE_FILE="/tmp/devbench-stop-hook-state.json"
+fi
 
 # If no workspace root or no backlog, allow stop.
 if [ -z "$WORKSPACE_ROOT" ] || [ ! -f "$BACKLOG_INDEX" ]; then

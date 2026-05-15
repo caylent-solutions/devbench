@@ -473,6 +473,134 @@ class TestActiveTaskSelection:
         assert active_idx >= 0 and active_idx < stale_idx
 
 
+class TestPerSessionStateFile:
+    """AC-192-15: Stop hook circuit breaker is per-session when DEVBENCH_SESSION_NAME is set.
+
+    When DEVBENCH_SESSION_NAME is set, the state file path must be
+    /tmp/devbench-stop-hook-state-<session>.json so that concurrent
+    orchestrator sessions maintain independent block counters.
+    When DEVBENCH_SESSION_NAME is unset, the shared path
+    /tmp/devbench-stop-hook-state.json must continue to be used.
+    """
+
+    SESSION_A = "my-session"
+    SESSION_B = "other-session"
+    STATE_FILE_A = Path(f"/tmp/devbench-stop-hook-state-{SESSION_A}.json")
+    STATE_FILE_B = Path(f"/tmp/devbench-stop-hook-state-{SESSION_B}.json")
+
+    def setup_method(self) -> None:
+        STATE_FILE.unlink(missing_ok=True)
+        self.STATE_FILE_A.unlink(missing_ok=True)
+        self.STATE_FILE_B.unlink(missing_ok=True)
+
+    def teardown_method(self) -> None:
+        STATE_FILE.unlink(missing_ok=True)
+        self.STATE_FILE_A.unlink(missing_ok=True)
+        self.STATE_FILE_B.unlink(missing_ok=True)
+
+    def test_uses_session_scoped_state_file_when_session_name_set(self, tmp_path: Path) -> None:
+        """When DEVBENCH_SESSION_NAME is set, state is written to the session-scoped path."""
+        backlog = tmp_path / "BACKLOG.md"
+        backlog.write_text("| E0-F1-S1-T1 | Task | Task | in-progress | none | repo | `backlog/t1.md` |\n")
+        result = _run_hook(str(tmp_path), extra_env={"DEVBENCH_SESSION_NAME": self.SESSION_A})
+        assert result.returncode == 0
+        output = json.loads(result.stdout)
+        assert output["decision"] == "block"
+        assert self.STATE_FILE_A.exists(), (
+            f"Session-scoped state file {self.STATE_FILE_A} must be created when "
+            f"DEVBENCH_SESSION_NAME={self.SESSION_A!r}"
+        )
+        assert not STATE_FILE.exists(), (
+            f"Shared state file {STATE_FILE} must NOT be created when DEVBENCH_SESSION_NAME is set"
+        )
+
+    def test_uses_shared_state_file_when_session_name_unset(self, tmp_path: Path) -> None:
+        """When DEVBENCH_SESSION_NAME is unset, state is written to the shared path."""
+        backlog = tmp_path / "BACKLOG.md"
+        backlog.write_text("| E0-F1-S1-T1 | Task | Task | in-progress | none | repo | `backlog/t1.md` |\n")
+        result = _run_hook(str(tmp_path))
+        assert result.returncode == 0
+        output = json.loads(result.stdout)
+        assert output["decision"] == "block"
+        assert STATE_FILE.exists(), (
+            f"Shared state file {STATE_FILE} must be created when DEVBENCH_SESSION_NAME is unset"
+        )
+        assert not self.STATE_FILE_A.exists(), (
+            f"Session-scoped state file {self.STATE_FILE_A} must NOT be created when DEVBENCH_SESSION_NAME is unset"
+        )
+
+    def test_session_counters_are_independent(self, tmp_path: Path) -> None:
+        """Two sessions running against the same workspace must have independent block counters.
+
+        A max_blocks=2 setting means the circuit breaker trips after 2 blocks per session.
+        Session A at block 2 should trip; Session B should still be at block 1 (not tripped).
+        """
+        backlog = tmp_path / "BACKLOG.md"
+        backlog.write_text("| E0-F1-S1-T1 | Task | Task | in-progress | none | repo | `backlog/t1.md` |\n")
+        env_a = {"DEVBENCH_SESSION_NAME": self.SESSION_A, "JUDGE_STOP_MAX_BLOCKS": "2"}
+        env_b = {"DEVBENCH_SESSION_NAME": self.SESSION_B, "JUDGE_STOP_MAX_BLOCKS": "2"}
+
+        # Session A: two blocks -- circuit breaker trips on the 3rd call.
+        for _ in range(2):
+            result = _run_hook(str(tmp_path), extra_env=env_a)
+            assert json.loads(result.stdout)["decision"] == "block"
+
+        # Session B: one block -- must NOT be tripped yet.
+        result_b = _run_hook(str(tmp_path), extra_env=env_b)
+        assert result_b.stdout.strip() != "", (
+            "Session B ran 1 block but should only trip after 2 blocks, not inherit Session A's count"
+        )
+        assert json.loads(result_b.stdout)["decision"] == "block", (
+            "Session B should still block after 1 block (max=2); counters must be independent"
+        )
+
+        # Verify session A's state reflects its count.
+        state_a = json.loads(self.STATE_FILE_A.read_text())
+        assert state_a["count"] == 2, f"Session A should have count=2, got {state_a['count']}"
+
+        # Verify session B's state reflects its count.
+        state_b = json.loads(self.STATE_FILE_B.read_text())
+        assert state_b["count"] == 1, f"Session B should have count=1, got {state_b['count']}"
+
+        # Session A trips circuit breaker on next call.
+        result_a_tripped = _run_hook(str(tmp_path), extra_env=env_a)
+        assert result_a_tripped.stdout.strip() == "", (
+            "Session A should have tripped the circuit breaker (count reached max_blocks=2)"
+        )
+
+    def test_session_state_file_cleared_when_no_in_progress(self, tmp_path: Path) -> None:
+        """When no in-progress tasks remain, the session-scoped state file must be removed."""
+        backlog = tmp_path / "BACKLOG.md"
+        backlog.write_text("| E0-F1-S1-T1 | Task | Task | in-progress | none | repo | `backlog/t1.md` |\n")
+        # First, accumulate a block count.
+        _run_hook(str(tmp_path), extra_env={"DEVBENCH_SESSION_NAME": self.SESSION_A})
+        assert self.STATE_FILE_A.exists(), "Precondition: session state file should exist after one block"
+
+        # Now all tasks done -- hook should remove the session state file.
+        backlog.write_text("| E0-F1-S1-T1 | Task | Task | done | none | repo | `backlog/t1.md` |\n")
+        result = _run_hook(str(tmp_path), extra_env={"DEVBENCH_SESSION_NAME": self.SESSION_A})
+        assert result.returncode == 0
+        assert result.stdout.strip() == "", "Hook should allow stop when no in-progress tasks"
+        assert not self.STATE_FILE_A.exists(), (
+            f"Session-scoped state file {self.STATE_FILE_A} must be removed when no in-progress tasks remain"
+        )
+
+    def test_circuit_breaker_trips_per_session(self, tmp_path: Path) -> None:
+        """Circuit breaker trips at max_blocks for the session, not the global counter."""
+        backlog = tmp_path / "BACKLOG.md"
+        backlog.write_text("| E0-F1-S1-T1 | Task | Task | in-progress | none | repo | `backlog/t1.md` |\n")
+        env = {"DEVBENCH_SESSION_NAME": self.SESSION_A, "JUDGE_STOP_MAX_BLOCKS": "2"}
+        # Block twice.
+        for _ in range(2):
+            result = _run_hook(str(tmp_path), extra_env=env)
+            assert json.loads(result.stdout)["decision"] == "block"
+        # Third call trips circuit breaker.
+        result = _run_hook(str(tmp_path), extra_env=env)
+        assert result.stdout.strip() == "", "Circuit breaker must trip after max_blocks for a named session"
+        # State file must be removed after circuit breaker trips.
+        assert not self.STATE_FILE_A.exists(), "Session-scoped state file must be removed after circuit breaker trips"
+
+
 class TestStopHookEnvelopeShape:
     """Issue #139 regression: emit BOTH the legacy ``decision``/``reason``
     envelope AND the modern ``hookSpecificOutput`` envelope so the block

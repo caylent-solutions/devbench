@@ -3042,11 +3042,11 @@ class TestSaveCheckpointWriteFailure:
 
         original_write_text = Path.write_text
 
-        def failing_write_text(self_path: Path, *args: object, **kwargs: object) -> None:
+        def failing_write_text(self_path: Path, *args: Any, **kwargs: Any) -> int:
             calls.append(str(self_path))
             if self_path.suffix == ".tmp":
                 raise OSError("simulated disk full")
-            return original_write_text(self_path, *args, **kwargs)  # type: ignore[return-value]
+            return original_write_text(self_path, *args, **kwargs)
 
         with unittest.mock.patch.object(Path, "write_text", failing_write_text):
             with pytest.raises(OSError, match="simulated disk full"):

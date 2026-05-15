@@ -270,7 +270,7 @@ class TestRequestDrain:
 
         call_count = 0
 
-        def failing_write(self: Path, *args: object, **kwargs: object) -> None:
+        def failing_write(self: Path, *args: Any, **kwargs: Any) -> int:
             nonlocal call_count
             call_count += 1
             # Only fail the first write_text call (the tmp file write)
@@ -294,12 +294,12 @@ class TestRequestDrain:
         original_write = Path.write_text
         original_unlink = Path.unlink
 
-        def failing_write(self: Path, *args: object, **kwargs: object) -> None:
+        def failing_write(self: Path, *args: Any, **kwargs: Any) -> int:
             if self.suffix == ".tmp":
                 raise OSError("simulated disk full")
             return original_write(self, *args, **kwargs)
 
-        def failing_unlink(self: Path, **kwargs: object) -> None:
+        def failing_unlink(self: Path, **kwargs: Any) -> None:
             if self.name == "drain.tmp":
                 raise OSError("simulated unlink failure")
             return original_unlink(self, **kwargs)

@@ -373,9 +373,9 @@ $ devbench set-status E1-F2-S3-T9 in-queue
 When `classify_blocked_task` reaches priority 5
 (`AWAITING_AMENDMENT_RECOVERY`) with no marker and no pending dep, it relies on
 three on-disk signals. Signal 3 -- the audit-comment heuristic -- is governed by
-two allowlists defined at `proposal.py` lines 185-192:
+two allowlists defined at `proposal.py` lines 218-225:
 
-### `_RECOVERY_AGENT_TAGS` (line 185)
+### `_RECOVERY_AGENT_TAGS` (line 218)
 
 ```python
 _RECOVERY_AGENT_TAGS: frozenset[str] = frozenset(
@@ -394,7 +394,7 @@ amendment-reject / dependency / review-failure events. Broadening the allowlist
 would generate false positives (e.g., an executor that logs `[BLOCKED] waiting
 for external API` would incorrectly suppress operator-attention alerts).
 
-### `_RECOVERY_BODY_RE` (line 188)
+### `_RECOVERY_BODY_RE` (line 221)
 
 ```python
 _RECOVERY_BODY_RE: re.Pattern[str] = re.compile(

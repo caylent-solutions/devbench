@@ -43,7 +43,7 @@ This file contains a `claudeAiOauth` object with an `accessToken` that has the `
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `JUDGE_CLAUDE_CREDENTIALS_FILE` | `~/.claude/.credentials.json` | Path to the Claude Code credentials file |
-| `JUDGE_CLAUDE_MODEL` | *(required)* | Model used for LLM evaluation (e.g. `claude-opus-4-7`) |
+| `JUDGE_CLAUDE_MODEL` | *(required)* | SDK caller's model -- governs the orchestrate skill's coordination calls (e.g. `claude-opus-4-7`). Per-agent work models live in the `agents:` block of `devbench.yaml` ([ADR-25](adr/25-per-agent-model-overrides.md)) and default to each agent's `.md` frontmatter. |
 | `JUDGE_LLM_TIMEOUT` | `300` | Timeout for LLM API calls (seconds) |
 
 ### Verifying Authentication
@@ -125,7 +125,7 @@ When `JUDGE_USE_BEDROCK=1` is set, DevBench uses `anthropic.AnthropicBedrock` in
 |----------|---------|-------------|
 | `JUDGE_USE_BEDROCK` | `false` | Set to `1`, `true`, or `yes` to enable Bedrock |
 | `JUDGE_BEDROCK_REGION` | `us-east-1` | AWS region for Bedrock API calls (falls back to `AWS_REGION`) |
-| `JUDGE_CLAUDE_MODEL` | *(required)* | Bedrock model ID (e.g. `us.anthropic.claude-opus-4-7-v1`) |
+| `JUDGE_CLAUDE_MODEL` | *(required)* | SDK caller's Bedrock model ID -- governs the orchestrate skill's coordination calls (e.g. `us.anthropic.claude-opus-4-7-v1`). Per-agent work models live in the `agents:` block of `devbench.yaml` ([ADR-25](adr/25-per-agent-model-overrides.md)). |
 | `JUDGE_LLM_TIMEOUT` | `300` | Timeout for LLM API calls (seconds) |
 
 ### Usage

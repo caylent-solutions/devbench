@@ -10,8 +10,6 @@ merge_strategy: squash
 max_executor_retries: 3
 use_bedrock: false
 bedrock_region: us-east-1
-judge_model: test-judge-model
-executor_model: test-executor-model
 
 timeouts:
   gh_api: 10

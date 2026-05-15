@@ -146,7 +146,7 @@ report:
 
 ### Mixed-model setups
 
-If your orchestrator uses different models for different roles (for example, Opus for executor and Sonnet for judges via `executor_model` / `judge_model` in `devbench.yaml`), pick the rate of the model that consumes the most tokens -- usually the executor -- for the most accurate single-figure estimate. There is no per-role cost split in `devbench report` yet (see [Current gaps](architecture.md#10-current-gaps-known-limitations) in the architecture doc).
+If your orchestrator uses different models for different roles (for example, Opus for the executor and Sonnet for the judges via the `agents:` block in `devbench.yaml`; see [ADR-25](adr/25-per-agent-model-overrides.md)), pick the rate of the model that consumes the most tokens -- usually the executor -- for the most accurate single-figure estimate. There is no per-role cost split in `devbench report` yet (see [Current gaps](architecture.md#10-current-gaps-known-limitations) in the architecture doc).
 
 ---
 

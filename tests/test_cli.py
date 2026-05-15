@@ -6376,9 +6376,7 @@ class TestCmdCheck:
             if single_branch
             else "git_ops:\n  defer_pr: false\n"
         )
-        cfg_path.write_text(
-            f"judge_model: test-judge-model\nexecutor_model: test-executor-model\nrepos:\n{repos_block}{ops_block}"
-        )
+        cfg_path.write_text(f"repos:\n{repos_block}{ops_block}")
         return cfg_path
 
     def test_returns_1_when_yaml_missing(
@@ -6542,8 +6540,6 @@ class TestCmdCheck:
         cfg_dir.mkdir(parents=True)
         cfg_path = cfg_dir / "devbench.yaml"
         cfg_path.write_text(
-            "judge_model: test-judge-model\n"
-            "executor_model: test-executor-model\n"
             "repos:\n"
             "  org/repo-a:\n"
             "    checkout_directory: repo-a\n"

@@ -48,11 +48,12 @@ max_executor_retries_per_judge:
 use_bedrock: false                      # (built-in default; Anthropic API path)
 bedrock_region: us-east-1               # (built-in default; harmless when use_bedrock=false)
 
-# Per-role model selection -- intentionally NOT pinned here so JUDGE_CLAUDE_MODEL
-# (set in the launch environment) drives both roles. Set explicitly if you need
-# a different judge / executor split:
-# judge_model: us.anthropic.claude-sonnet-4-6-v1
-# executor_model: us.anthropic.claude-opus-4-7-v1
+# `JUDGE_CLAUDE_MODEL` (env var, set by the launcher) is the SDK caller's
+# model -- it governs the orchestrate skill's coordination calls only. Per-
+# agent work models live in the `agents:` block (ADR-25); each agent loads
+# its default from its plugin .md frontmatter and is overridable
+# independently. Add an `agents:` block here when an operator needs to
+# retarget specific agents to a different model.
 
 # Hard allowlist of GitHub orgs devbench may operate against. Listing the
 # orgs of every repo above is belt-and-suspenders against accidental cross-org

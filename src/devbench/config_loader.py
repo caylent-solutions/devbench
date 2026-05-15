@@ -27,8 +27,6 @@ YAML schema::
     max_executor_retries: <integer>      # optional -- max executor retries per work unit on judge failure
     use_bedrock: false                   # optional -- route LLM calls via AWS Bedrock
     bedrock_region: <aws-region-string>  # optional -- AWS region for Bedrock (env var override applied by config.py)
-    judge_model: <model-id>              # optional -- model for judge agents (env var override applied by config.py)
-    executor_model: <model-id>           # optional -- model for executor agent (env var override applied by config.py)
     allowed_orgs:                        # optional -- permitted GitHub organisations
       - caylent-solutions
 
@@ -753,8 +751,6 @@ class RuntimeConfig:
         stop_hook: Stop hook circuit breaker settings.
         backlog: Backlog lifecycle settings (default status for new WUs).
         allowed_orgs: List of permitted GitHub organisations.
-        judge_model: Model identifier used by judge agents.
-        executor_model: Model identifier used by the executor agent.
         use_bedrock: Whether to route LLM calls through AWS Bedrock.
         bedrock_region: AWS region for Bedrock API calls.
         merge_strategy: Default PR merge strategy for all repos.
@@ -792,8 +788,6 @@ class RuntimeConfig:
     validate: ValidateConfig = field(default_factory=ValidateConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
     allowed_orgs: list[str] = field(default_factory=list)
-    judge_model: str | None = None
-    executor_model: str | None = None
     use_bedrock: bool = False
     bedrock_region: str | None = None
     merge_strategy: str | None = None
@@ -1257,8 +1251,6 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         validate=validate_cfg,
         debug=debug,
         allowed_orgs=allowed_orgs,
-        judge_model=raw.get("judge_model") or None,
-        executor_model=raw.get("executor_model") or None,
         use_bedrock=bool(raw.get("use_bedrock", False)),
         bedrock_region=raw.get("bedrock_region") or None,
         merge_strategy=raw.get("merge_strategy") or None,

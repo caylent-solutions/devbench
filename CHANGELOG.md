@@ -244,6 +244,23 @@ since the last release. PR #119 carries every change.
   denominator. ETA still falls back to `n/a` when fewer than the
   required pace samples have completed in the recent window.
 
+### Removed
+
+- **Dead `judge_model` / `executor_model` YAML fields** removed from
+  `config-schema.json`, `RuntimeConfig`, `load_runtime_config`, the test
+  fixtures, the parser tests, `sample-config.yaml`, and the example backlog
+  config under `examples/backlogs/...`. These were holdover from the
+  pre-plugin "main2" Python-orchestrator architecture (ADR-01); the
+  plugin-based architecture replaced them with per-agent `.md` frontmatter
+  models, leaving the YAML fields parsed but never read. ADR-25
+  (`agents:` block) is the current control surface for per-agent model
+  routing. `docs/architecture.md`, `docs/model-pricing.md`,
+  `docs/llm-authentication.md`, `docs/cli-reference.md`, the example
+  workspace's `README.md` and `devbench-commands.txt` updated to remove
+  references to the dead fields and to clarify that `JUDGE_CLAUDE_MODEL` is
+  the SDK caller's model (orchestrate skill coordination calls), not a
+  global per-role pin.
+
 ### Changed
 
 - **Cost-rate calibration guidance** added to `sample-config.yaml`

@@ -44,9 +44,12 @@ use_bedrock: false
 # AWS region for Bedrock when use_bedrock: true.
 bedrock_region: us-east-1
 
-# Per-role model selection. Each falls back to JUDGE_CLAUDE_MODEL when unset.
-# judge_model: us.anthropic.claude-sonnet-4-6-v1
-# executor_model: us.anthropic.claude-opus-4-7-v1
+# Per-agent model overrides live in the `agents:` block lower in this file
+# (ADR-25). `JUDGE_CLAUDE_MODEL` (env var, required) is the SDK caller's
+# model -- it governs the orchestrate skill's coordination calls only; it
+# does NOT route the work agents (executor / judges / etc.), each of which
+# loads its model from its plugin .md frontmatter and can be overridden
+# via the `agents:` block.
 
 # Hard allowlist of GitHub orgs devbench may operate against. Empty means
 # every org listed in repos: above is permitted; otherwise restrict here.

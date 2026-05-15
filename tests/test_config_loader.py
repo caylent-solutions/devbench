@@ -716,12 +716,6 @@ class TestRuntimeConfigPopulation:
             f"Expected bedrock_region=None when absent from YAML, got {result.bedrock_region!r}"
         )
         assert result.allowed_orgs == [], f"Expected allowed_orgs=[], got {result.allowed_orgs!r}"
-        assert result.judge_model is None, (
-            f"Expected judge_model=None when absent from YAML, got {result.judge_model!r}"
-        )
-        assert result.executor_model is None, (
-            f"Expected executor_model=None when absent from YAML, got {result.executor_model!r}"
-        )
 
     def test_repo_config_merge_strategy_populated(self, tmp_path: Path) -> None:
         """

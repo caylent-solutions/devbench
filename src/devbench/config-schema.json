@@ -64,14 +64,6 @@
       "type": "string",
       "description": "AWS region for Bedrock API calls."
     },
-    "judge_model": {
-      "type": "string",
-      "description": "Model identifier used by judge agents."
-    },
-    "executor_model": {
-      "type": "string",
-      "description": "Model identifier used by the executor agent."
-    },
     "allowed_orgs": {
       "type": "array",
       "items": {

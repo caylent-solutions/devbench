@@ -87,7 +87,7 @@ workspace shape. This example follows the canonical layout.
 | Variable | Value used here | What it does |
 |---|---|---|
 | `JUDGE_WORKSPACE_ROOT` | absolute path to your local `kanon-deps-work/` | Tells DevBench where `BACKLOG.md` and the target-repo siblings live. Every subcommand resolves paths relative to this. |
-| `JUDGE_CLAUDE_MODEL` | `us.anthropic.claude-opus-4-7-v1` | Pins both judge and executor roles. Override `judge_model:` / `executor_model:` in `devbench.yaml` for a split. |
+| `JUDGE_CLAUDE_MODEL` | `us.anthropic.claude-opus-4-7-v1` | SDK caller's model -- governs the orchestrate skill's coordination calls. Per-agent work models live in the `agents:` block of `devbench.yaml` (ADR-25) and default to each agent's `.md` frontmatter setting. |
 | `JUDGE_USE_BEDROCK` (optional) | unset (defaults to Anthropic API) | Set to `1` to route LLM calls through AWS Bedrock instead of the Anthropic API. |
 | `GH_TOKEN` (optional) | unset | If pre-configured, the start scripts skip the interactive `gh auth login` flow. |
 

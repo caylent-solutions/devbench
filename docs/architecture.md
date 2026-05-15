@@ -487,8 +487,6 @@ log_file: logs/orchestrator.log    # optional: shared log path for setup_logging
                                    #   when not absolute. JUDGE_LOG_FILE env wins.
 allowed_orgs:                      # optional: restrict to specific GH orgs
   - caylent-solutions
-judge_model: claude-sonnet-4-6     # optional: model for review judges
-executor_model: claude-opus-4-7    # optional: model for executor
 use_bedrock: false                 # route LLM calls via Bedrock?
 bedrock_region: us-east-1          # AWS region if use_bedrock: true
 

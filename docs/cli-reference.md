@@ -12,7 +12,7 @@ uv run devbench <command> [args]
 Two environment variables MUST be set before any command runs; commands that depend on them exit non-zero with a clear message when unset:
 
 - `JUDGE_WORKSPACE_ROOT` -- absolute path to the backlog workspace (contains `BACKLOG.md`, `backlog/`, `.devbench/`).
-- `JUDGE_CLAUDE_MODEL` -- model identifier (example: `us.anthropic.claude-opus-4-7-v1`).
+- `JUDGE_CLAUDE_MODEL` -- SDK caller's model id (example: `us.anthropic.claude-opus-4-7-v1`). Governs the orchestrate skill's coordination calls only. Per-agent work models live in the `agents:` block of `devbench.yaml` (see [ADR-25](adr/25-per-agent-model-overrides.md)).
 
 Optional: `--config <path>` (or `JUDGE_CONFIG_PATH` env var) overrides the default `backlog/config/devbench.yaml` lookup.
 

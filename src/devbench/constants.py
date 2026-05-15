@@ -528,3 +528,29 @@ RECOVERY_PROBE_MESSAGE_CONTENT: str = "1"
 QUOTA_DEVBENCH_SUBDIR: str = ".devbench"
 # Filename of the quota pause checkpoint written by save_checkpoint.
 QUOTA_CHECKPOINT_FILENAME: str = "quota_pause.json"
+
+# ---------------------------------------------------------------------------
+# Per-agent model overrides (Option A shadow-plugin-dir, ADR-25)
+# ---------------------------------------------------------------------------
+# Workspace-relative directory holding the materialised shadow plugin tree.
+# When operators set ``agents.<name>: <model>`` in ``devbench.yaml`` the
+# canonical marketplace plugin cannot be edited; instead, a shadow tree is
+# built under ``<workspace>/<PLUGIN_SHADOW_DIR_NAME>/devbench/`` that mirrors
+# the canonical via symlinks for every file except the overridden agent .md
+# files. ``cmd_start`` and ``devbench prepare-plugin-shadow`` both point the
+# Claude Agent SDK / ``claude --plugin-dir`` at this path so non-interactive
+# and interactive modes share one mechanism.
+PLUGIN_SHADOW_DIR_NAME: str = ".devbench/plugin-shadow"
+
+# Short-name model aliases accepted in ``agents.*`` YAML values when
+# ``use_bedrock: false``. Mirrors the convenience short forms the Anthropic
+# SDK accepts.
+ALLOWED_AGENT_MODEL_SHORT_NAMES: frozenset[str] = frozenset({"opus", "sonnet", "haiku"})
+
+# Full Anthropic model id pattern (``claude-opus-4-7``, ``claude-sonnet-4-6``,
+# ``claude-haiku-4-5-20251001``). Accepted when ``use_bedrock: false``.
+ANTHROPIC_AGENT_MODEL_PATTERN: re.Pattern[str] = re.compile(r"^claude-[a-z0-9]+(-[a-z0-9]+)+$")
+
+# AWS Bedrock model id pattern (``us.anthropic.claude-opus-4-7-v1``). Accepted
+# only when ``use_bedrock: true``; rejected otherwise.
+BEDROCK_AGENT_MODEL_PATTERN: re.Pattern[str] = re.compile(r"^us\.anthropic\.claude-[a-z0-9-]+-v[0-9]+$")

@@ -452,6 +452,60 @@
           "description": "Rule 20: cross-check Acceptance Criteria and Definition of Done sections of every Task against the Changes Manifest. Backtick-quoted path-shaped tokens that do not appear in the Manifest (and are not declared read-only via a trailing `(ref)` marker) emit an integrity error. Catches spec drift where AC/DoD prose restates a path that disagrees with the Manifest. Default false (opt-in). See docs/backlog-contract.md."
         }
       }
+    },
+    "agents": {
+      "type": "object",
+      "description": "Per-agent model overrides (ADR-25). Each field defaults to null; the agent then runs on the model declared in its .md frontmatter. Set a field to override for this workspace -- devbench materialises a workspace-local shadow plugin tree under <workspace>/.devbench/plugin-shadow/devbench/ and rewrites the matching frontmatter line. JUDGE_AGENT_MODEL_<NAME> env vars override these YAML values. Use short names (opus|sonnet|haiku) or full Anthropic model ids (claude-opus-4-7) when use_bedrock: false; use the matching Bedrock id (us.anthropic.claude-opus-4-7-v1) when use_bedrock: true.",
+      "additionalProperties": false,
+      "properties": {
+        "executor": {
+          "type": "string",
+          "description": "Model for plugin/devbench/agents/executor.md. Default null (use frontmatter)."
+        },
+        "blocker_resolver": {
+          "type": "string",
+          "description": "Model for plugin/devbench/agents/blocker-resolver.md. Default null (use frontmatter)."
+        },
+        "manifest_amender": {
+          "type": "string",
+          "description": "Model for plugin/devbench/agents/manifest-amender.md. Default null (use frontmatter)."
+        },
+        "security_reviewer": {
+          "type": "string",
+          "description": "Model for plugin/devbench/agents/security-reviewer.md. Default null (use frontmatter)."
+        },
+        "task_factory": {
+          "type": "string",
+          "description": "Model for plugin/devbench/agents/task-factory.md. Default null (use frontmatter)."
+        },
+        "review_supervisor": {
+          "type": "string",
+          "description": "Model for plugin/devbench/agents/review-supervisor.md. Default null (use frontmatter)."
+        },
+        "review_team": {
+          "type": "object",
+          "description": "Per-judge overrides for the four review_team agents. Each field defaults to null; the corresponding judge then runs on its frontmatter model.",
+          "additionalProperties": false,
+          "properties": {
+            "code_reviewer": {
+              "type": "string",
+              "description": "Model for plugin/devbench/agents/review_team/code-reviewer.md."
+            },
+            "test_reviewer": {
+              "type": "string",
+              "description": "Model for plugin/devbench/agents/review_team/test-reviewer.md."
+            },
+            "doc_reviewer": {
+              "type": "string",
+              "description": "Model for plugin/devbench/agents/review_team/doc-reviewer.md."
+            },
+            "changes_manifest": {
+              "type": "string",
+              "description": "Model for plugin/devbench/agents/review_team/changes-manifest.md."
+            }
+          }
+        }
+      }
     }
   }
 }

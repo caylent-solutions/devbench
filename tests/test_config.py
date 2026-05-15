@@ -488,3 +488,72 @@ class TestMaxRetriesYamlFirst:
             assert isinstance(config.MAX_RETRY_ATTEMPTS, int)
             assert config.MAX_RETRY_ATTEMPTS > 0
         importlib.reload(config)
+
+
+@pytest.mark.unit
+class TestAgentModelEnvOverrides:
+    """ADR-25: JUDGE_AGENT_MODEL_<NAME> env vars override YAML at config-load time."""
+
+    def test_executor_env_overrides_yaml(self) -> None:
+        with patch.dict(os.environ, {"JUDGE_AGENT_MODEL_EXECUTOR": "opus"}, clear=False):
+            importlib.reload(config)
+            assert config.AGENT_MODELS.executor == "opus"
+        importlib.reload(config)
+
+    def test_review_team_env_overrides_yaml(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "JUDGE_AGENT_MODEL_CODE_REVIEWER": "haiku",
+                "JUDGE_AGENT_MODEL_CHANGES_MANIFEST": "opus",
+            },
+            clear=False,
+        ):
+            importlib.reload(config)
+            assert config.AGENT_MODELS.review_team.code_reviewer == "haiku"
+            assert config.AGENT_MODELS.review_team.changes_manifest == "opus"
+        importlib.reload(config)
+
+    def test_invalid_env_value_rejected_at_load(self) -> None:
+        """A garbage env value should fail-fast at config.py import (re-validated against USE_BEDROCK)."""
+        with patch.dict(os.environ, {"JUDGE_AGENT_MODEL_EXECUTOR": "garbage-value-not-a-model"}, clear=False):
+            with pytest.raises(ValueError, match="not a valid Anthropic API"):
+                importlib.reload(config)
+        importlib.reload(config)
+
+    def test_empty_env_var_treated_as_unset(self) -> None:
+        """Empty string env var must not override (treated as unset)."""
+        with patch.dict(os.environ, {"JUDGE_AGENT_MODEL_EXECUTOR": ""}, clear=False):
+            importlib.reload(config)
+            # Fixture has no agents block, so executor stays None.
+            assert config.AGENT_MODELS.executor is None
+        importlib.reload(config)
+
+    def test_all_agent_env_vars_covered(self) -> None:
+        """Every defined JUDGE_AGENT_MODEL_* env var routes to a real field."""
+        envs = {
+            "JUDGE_AGENT_MODEL_EXECUTOR": "opus",
+            "JUDGE_AGENT_MODEL_BLOCKER_RESOLVER": "opus",
+            "JUDGE_AGENT_MODEL_MANIFEST_AMENDER": "opus",
+            "JUDGE_AGENT_MODEL_SECURITY_REVIEWER": "opus",
+            "JUDGE_AGENT_MODEL_TASK_FACTORY": "opus",
+            "JUDGE_AGENT_MODEL_REVIEW_SUPERVISOR": "opus",
+            "JUDGE_AGENT_MODEL_CODE_REVIEWER": "opus",
+            "JUDGE_AGENT_MODEL_TEST_REVIEWER": "opus",
+            "JUDGE_AGENT_MODEL_DOC_REVIEWER": "opus",
+            "JUDGE_AGENT_MODEL_CHANGES_MANIFEST": "opus",
+        }
+        with patch.dict(os.environ, envs, clear=False):
+            importlib.reload(config)
+            am = config.AGENT_MODELS
+            assert am.executor == "opus"
+            assert am.blocker_resolver == "opus"
+            assert am.manifest_amender == "opus"
+            assert am.security_reviewer == "opus"
+            assert am.task_factory == "opus"
+            assert am.review_supervisor == "opus"
+            assert am.review_team.code_reviewer == "opus"
+            assert am.review_team.test_reviewer == "opus"
+            assert am.review_team.doc_reviewer == "opus"
+            assert am.review_team.changes_manifest == "opus"
+        importlib.reload(config)

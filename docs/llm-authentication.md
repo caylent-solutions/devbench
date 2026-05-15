@@ -6,6 +6,7 @@ DevBench supports two LLM backends for judge evaluation. Choose one based on you
 
 - [Option 1: Anthropic API via Claude Code OAuth (default)](#option-1-anthropic-api-via-claude-code-oauth-default)
 - [Option 2: AWS Bedrock](#option-2-aws-bedrock)
+- [Per-agent model overrides (quota management)](#per-agent-model-overrides-quota-management)
 
 ## Option 1: Anthropic API via Claude Code OAuth (default)
 
@@ -175,3 +176,52 @@ The Bedrock model is not enabled in your AWS account for the configured region. 
 #### Region mismatch
 
 Ensure `JUDGE_BEDROCK_REGION` matches the region where you have Bedrock model access enabled. Cross-region inference model IDs use the `us.anthropic.*` prefix.
+
+---
+
+## Per-agent model overrides (quota management)
+
+DevBench's ten work agents (executor, blocker-resolver, manifest-amender, security-reviewer, task-factory, review-supervisor, plus the four review_team judges) each declare a default model in their `.md` frontmatter. Operators whose per-model quota is uneven -- e.g. opus tokens left, sonnet exhausted, or vice versa -- can retarget any subset of agents to a different model without editing the canonical plugin. See [ADR-25](adr/25-per-agent-model-overrides.md) for the architectural details.
+
+Add an `agents:` block to `backlog/config/devbench.yaml`. The shape below pins each agent to its **current frontmatter default** (nine agents on `sonnet`, `review_supervisor` on `haiku`) -- it is a no-op as written; flip individual fields when you need to retarget:
+
+```yaml
+agents:
+  executor: sonnet
+  blocker_resolver: sonnet
+  manifest_amender: sonnet
+  security_reviewer: sonnet
+  task_factory: sonnet
+  review_supervisor: haiku
+  review_team:
+    code_reviewer: sonnet
+    test_reviewer: sonnet
+    doc_reviewer: sonnet
+    changes_manifest: sonnet
+```
+
+Every field defaults to `null` when absent (the agent runs on its frontmatter model). The values must match your authentication channel:
+
+- `use_bedrock: false` -- short names (`opus` / `sonnet` / `haiku`) or full Anthropic API ids (`claude-opus-4-7`, `claude-sonnet-4-6`).
+- `use_bedrock: true` -- full Bedrock ARNs (`us.anthropic.claude-opus-4-7-v1`, `us.anthropic.claude-sonnet-4-6-v1`).
+
+Mismatches fail fast at config-load time with an actionable error message, rather than as a generic 401/404 on the first agent invocation.
+
+Per-call env-var overrides take precedence over YAML (env > yaml > frontmatter):
+
+```bash
+JUDGE_AGENT_MODEL_EXECUTOR=opus
+JUDGE_AGENT_MODEL_CODE_REVIEWER=opus
+JUDGE_AGENT_MODEL_CHANGES_MANIFEST=opus
+```
+
+Both modes apply the override the same way:
+
+- **Non-interactive** (`devbench start`): a workspace-local shadow plugin tree is materialised at `<workspace>/.devbench/plugin-shadow/devbench/` automatically.
+- **Interactive** (`claude --plugin-dir ...`): run `uv run devbench prepare-plugin-shadow` first to materialise the same shadow tree, then pass its path to `--plugin-dir`:
+
+```bash
+claude --plugin-dir "$(uv run devbench prepare-plugin-shadow)"
+```
+
+Workspaces without an `agents:` block build no shadow and use the canonical plugin path -- behaviour is bit-identical to pre-feature releases.

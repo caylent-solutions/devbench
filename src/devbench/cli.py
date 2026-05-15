@@ -133,6 +133,7 @@ from devbench.backlog.work_unit import (
     WorkUnitType,
 )
 from devbench.config import (
+    AGENT_MODELS,
     BACKLOG_INDEX,
     BACKLOG_ROOT,
     BLOCKED_RECOVERY_WINDOW_SECONDS,
@@ -169,6 +170,7 @@ from devbench.constants import (
     VALID_TDD_PHASES,
 )
 from devbench.log_setup import setup_logging
+from devbench.plugin_shadow import materialise_shadow_plugin
 
 # Re-export from reporting so existing ``cli._format_duration`` callers and tests
 # resolve unchanged after the function moved to report.py for the issue #161
@@ -4150,12 +4152,30 @@ def cmd_watchdog(*argv: str) -> int:
     return 0
 
 
+def _resolve_plugin_path() -> Path:
+    """Return the plugin path to load: shadow when overrides configured, else canonical.
+
+    Materialises a workspace-local shadow plugin (ADR-25) when the operator
+    has set any ``agents.*`` field in ``devbench.yaml`` (or the corresponding
+    ``JUDGE_AGENT_MODEL_*`` env var). When no overrides are configured this
+    is a no-op and the canonical plugin path is returned.
+    """
+    canonical = Path(__file__).parent.parent.parent / DEFAULT_PLUGIN_SUBPATH
+    shadow = materialise_shadow_plugin(canonical, WORKSPACE_ROOT, AGENT_MODELS)
+    return shadow if shadow is not None else canonical
+
+
 def cmd_start() -> int:
     """Run the devbench orchestrate skill non-interactively via the Claude Agent SDK.
 
     Loads the devbench plugin from the plugin directory adjacent to this package
     and invokes the orchestrate skill, which processes the backlog until all
     work units are complete or blocked.
+
+    When ``agents.*`` overrides are configured in ``devbench.yaml`` (or via
+    ``JUDGE_AGENT_MODEL_*`` env vars), a workspace-local shadow plugin tree
+    is materialised at ``<workspace>/.devbench/plugin-shadow/devbench/`` and
+    passed to the SDK in place of the canonical plugin (ADR-25).
 
     Equivalent to running ``claude --plugin-dir <plugin>`` and invoking
     the orchestrate skill interactively, but suitable for CI/unattended runs.
@@ -4164,7 +4184,7 @@ def cmd_start() -> int:
 
     from claude_agent_sdk import ClaudeAgentOptions, query
 
-    plugin_path = Path(__file__).parent.parent.parent / DEFAULT_PLUGIN_SUBPATH
+    plugin_path = _resolve_plugin_path()
 
     async def _run() -> None:
         async for message in query(
@@ -4177,6 +4197,24 @@ def cmd_start() -> int:
             logger.info("sdk message: %s", message)
 
     asyncio.run(_run())
+    return 0
+
+
+def cmd_prepare_plugin_shadow() -> int:
+    """Materialise the per-agent shadow plugin and print its path.
+
+    Used by interactive launchers (``claude --plugin-dir $(devbench
+    prepare-plugin-shadow)``) so the same per-agent model overrides apply
+    whether the operator runs ``devbench start`` non-interactively or hand-
+    drives the orchestrate skill in a Claude Code session. The function
+    shares its implementation with ``cmd_start``'s pre-flight, so the two
+    modes always produce identical plugin trees (ADR-25).
+
+    Prints the resolved plugin path (shadow when overrides configured, else
+    the canonical path) to stdout and exits 0.
+    """
+    plugin_path = _resolve_plugin_path()
+    print(str(plugin_path))
     return 0
 
 
@@ -5865,6 +5903,14 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
         ),
     ),
     "start": (cmd_start, 0, "Run orchestrate skill via Agent SDK (non-interactive)"),
+    "prepare-plugin-shadow": (
+        cmd_prepare_plugin_shadow,
+        0,
+        (
+            "Materialise the per-agent shadow plugin (ADR-25) and print its path; "
+            'use for interactive launchers (claude --plugin-dir "$(devbench prepare-plugin-shadow)")'
+        ),
+    ),
     "watch": (
         cmd_watch,
         0,

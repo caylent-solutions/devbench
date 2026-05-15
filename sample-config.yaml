@@ -272,6 +272,39 @@ validate:
   check_orphan_path_tokens: false
 
 # ---------------------------------------------------------------------------
+# Per-agent model overrides (ADR-25). Every field defaults to null -- the
+# agent runs on the model declared in its .md frontmatter. Operators set
+# these to manage Sonnet / Opus / Bedrock quota independently when a launch's
+# quota envelope is uneven (e.g. opus tokens left, sonnet exhausted).
+#
+# When use_bedrock: false (this file's default), values may be short names
+# ("opus", "sonnet", "haiku") or full Anthropic API ids ("claude-opus-4-7").
+# When use_bedrock: true, values must be full Bedrock ARNs
+# ("us.anthropic.claude-opus-4-7-v1"). Mismatches fail fast at config-load.
+#
+# JUDGE_AGENT_MODEL_<NAME> env vars override this block per-call
+# (precedence: env > yaml > frontmatter). See:
+#   docs/adr/25-per-agent-model-overrides.md
+#   docs/llm-authentication.md#per-agent-model-overrides-quota-management
+# ---------------------------------------------------------------------------
+# Each field below is set to the agent's current .md frontmatter default
+# (nine agents on sonnet, review_supervisor on haiku). Uncomment + edit
+# individual fields to retarget; absent fields stay at their frontmatter
+# default. Writing the same value as the frontmatter default is a no-op.
+# agents:
+#   executor: sonnet
+#   blocker_resolver: sonnet
+#   manifest_amender: sonnet
+#   security_reviewer: sonnet
+#   task_factory: sonnet
+#   review_supervisor: haiku
+#   review_team:
+#     code_reviewer: sonnet
+#     test_reviewer: sonnet
+#     doc_reviewer: sonnet
+#     changes_manifest: sonnet
+
+# ---------------------------------------------------------------------------
 # Diagnostic-tuning knobs (set only when investigating a specific cadence
 # problem; production workspaces leave this section absent).
 # ---------------------------------------------------------------------------

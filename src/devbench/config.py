@@ -24,6 +24,7 @@ from devbench.config_loader import (
     get_repo_local_path,
     load_runtime_config,
     resolve_config_path,
+    validate_agent_model_value,
 )
 from devbench.constants import (
     BACKLOG_SUBDIR,
@@ -485,6 +486,70 @@ BEDROCK_REGION: str = _resolve_str(
     RUNTIME_CONFIG.bedrock_region,
     os.environ.get("AWS_REGION", DEFAULT_BEDROCK_REGION),
 )
+
+# ---------------------------------------------------------------------------
+# Per-agent model overrides (ADR-25, Option A shadow-plugin-dir)
+# ---------------------------------------------------------------------------
+# Merge JUDGE_AGENT_MODEL_<NAME> env vars over the YAML-loaded
+# RUNTIME_CONFIG.agent_models. Precedence: env > YAML > frontmatter (None).
+#
+# Env var name -> AgentModelsConfig attribute path. Flat namespace because
+# top-level agent names and review_team field names cannot collide.
+_AGENT_MODEL_ENV_VARS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("JUDGE_AGENT_MODEL_EXECUTOR", ("executor",)),
+    ("JUDGE_AGENT_MODEL_BLOCKER_RESOLVER", ("blocker_resolver",)),
+    ("JUDGE_AGENT_MODEL_MANIFEST_AMENDER", ("manifest_amender",)),
+    ("JUDGE_AGENT_MODEL_SECURITY_REVIEWER", ("security_reviewer",)),
+    ("JUDGE_AGENT_MODEL_TASK_FACTORY", ("task_factory",)),
+    ("JUDGE_AGENT_MODEL_REVIEW_SUPERVISOR", ("review_supervisor",)),
+    ("JUDGE_AGENT_MODEL_CODE_REVIEWER", ("review_team", "code_reviewer")),
+    ("JUDGE_AGENT_MODEL_TEST_REVIEWER", ("review_team", "test_reviewer")),
+    ("JUDGE_AGENT_MODEL_DOC_REVIEWER", ("review_team", "doc_reviewer")),
+    ("JUDGE_AGENT_MODEL_CHANGES_MANIFEST", ("review_team", "changes_manifest")),
+)
+
+
+def _apply_agent_model_env_overrides() -> None:
+    """Merge ``JUDGE_AGENT_MODEL_*`` env vars over the YAML agent_models block.
+
+    Re-runs validation against the resolved ``USE_BEDROCK`` so an env-supplied
+    value gets the same fail-fast treatment as a YAML value would. Validation
+    of YAML values already ran in ``config_loader.load_runtime_config`` but
+    used the YAML's ``use_bedrock`` flag; the env-driven re-validation here
+    catches the case where ``JUDGE_USE_BEDROCK`` differs from the YAML setting.
+    """
+    for env_var, attr_path in _AGENT_MODEL_ENV_VARS:
+        value = os.environ.get(env_var, "").strip()
+        if not value:
+            continue
+        label = ".".join(attr_path)
+        validate_agent_model_value(env_var, label, value, USE_BEDROCK)
+        target: object = RUNTIME_CONFIG.agent_models
+        for attr in attr_path[:-1]:
+            target = getattr(target, attr)
+        setattr(target, attr_path[-1], value)
+
+    # Re-validate every still-present YAML value against the resolved
+    # USE_BEDROCK. The loader already validated against the YAML flag; this
+    # second pass catches the JUDGE_USE_BEDROCK-overrides-YAML case where the
+    # operator flipped the Bedrock toggle via env without rewriting the YAML
+    # model strings.
+    for attr_path in [p for _, p in _AGENT_MODEL_ENV_VARS]:
+        target = RUNTIME_CONFIG.agent_models
+        for attr in attr_path:
+            target = getattr(target, attr)
+        if target is None:
+            continue
+        validate_agent_model_value(
+            "JUDGE_USE_BEDROCK (env-resolved) vs agent_models",
+            ".".join(attr_path),
+            target,  # type: ignore[arg-type]
+            USE_BEDROCK,
+        )
+
+
+_apply_agent_model_env_overrides()
+AGENT_MODELS = RUNTIME_CONFIG.agent_models
 
 # ---------------------------------------------------------------------------
 # Timeouts -- all values in seconds

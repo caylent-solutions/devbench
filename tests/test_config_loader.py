@@ -2504,3 +2504,147 @@ class TestBacklogConfig:
             match=r"must be one of.*draft.*in-queue|must be one of.*in-queue.*draft",
         ):
             _parse_backlog_config(fake_path, {"default_status_for_new_work_units": "proposed"})
+
+
+@pytest.mark.unit
+class TestAgentModelsConfig:
+    """ADR-25 per-agent model overrides parsed from the YAML ``agents:`` block."""
+
+    def _write(self, path: Path, content: str) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    def test_section_absent_yields_default_dataclass(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.agent_models.executor is None
+        assert rt.agent_models.review_team.code_reviewer is None
+
+    def test_top_level_override_accepted(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            agents:
+              executor: opus
+              manifest_amender: claude-opus-4-7
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.agent_models.executor == "opus"
+        assert rt.agent_models.manifest_amender == "claude-opus-4-7"
+
+    def test_review_team_nested_override(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            agents:
+              review_team:
+                code_reviewer: opus
+                test_reviewer: haiku
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.agent_models.review_team.code_reviewer == "opus"
+        assert rt.agent_models.review_team.test_reviewer == "haiku"
+        assert rt.agent_models.review_team.doc_reviewer is None
+
+    def test_bedrock_id_accepted_when_use_bedrock_true(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            use_bedrock: true
+            agents:
+              executor: us.anthropic.claude-opus-4-7-v1
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.agent_models.executor == "us.anthropic.claude-opus-4-7-v1"
+
+    def test_short_name_rejected_when_use_bedrock_true(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            use_bedrock: true
+            agents:
+              executor: opus
+            """,
+        )
+        with pytest.raises(ValueError, match="not a valid Bedrock model id"):
+            load_runtime_config(cfg, {})
+
+    def test_bedrock_id_rejected_when_use_bedrock_false(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            use_bedrock: false
+            agents:
+              executor: us.anthropic.claude-opus-4-7-v1
+            """,
+        )
+        with pytest.raises(ValueError, match="not a valid Anthropic API"):
+            load_runtime_config(cfg, {})
+
+    def test_unknown_field_rejected_by_schema(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            agents:
+              not-a-real-agent: opus
+            """,
+        )
+        with pytest.raises(ValueError, match="schema validation"):
+            load_runtime_config(cfg, {})
+
+    def test_review_team_unknown_field_rejected_by_schema(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            agents:
+              review_team:
+                not_a_judge: opus
+            """,
+        )
+        with pytest.raises(ValueError, match="schema validation"):
+            load_runtime_config(cfg, {})
+
+    def test_validator_helper_rejects_garbage(self, tmp_path: Path) -> None:
+        """validate_agent_model_value rejects values that are neither short, claude-, nor Bedrock."""
+        from devbench.config_loader import validate_agent_model_value
+
+        with pytest.raises(ValueError, match="not a valid Anthropic API"):
+            validate_agent_model_value("env JUDGE_AGENT_MODEL_X", "executor", "garbage", False)
+        with pytest.raises(ValueError, match="not a valid Bedrock"):
+            validate_agent_model_value("env JUDGE_AGENT_MODEL_X", "executor", "opus", True)
+        # Happy paths return None.
+        validate_agent_model_value("yaml", "executor", "opus", False)
+        validate_agent_model_value("yaml", "executor", "claude-opus-4-7", False)
+        validate_agent_model_value("yaml", "executor", "us.anthropic.claude-opus-4-7-v1", True)

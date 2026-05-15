@@ -76,6 +76,9 @@ import yaml
 
 from devbench.constants import (
     ALL_REQUIRED_JUDGE_NAMES,
+    ALLOWED_AGENT_MODEL_SHORT_NAMES,
+    ANTHROPIC_AGENT_MODEL_PATTERN,
+    BEDROCK_AGENT_MODEL_PATTERN,
     DEFAULT_STOP_HOOK_MAX_BLOCKS,
     DEFAULT_STOP_HOOK_STALE_TASK_MINUTES,
     DEFAULT_STOP_HOOK_WINDOW_SECONDS,
@@ -573,6 +576,166 @@ class RepoConfig:
 
 
 @dataclass
+class ReviewTeamModelsConfig:
+    """Per-judge model overrides for the four review_team agents (ADR-25).
+
+    Every field defaults to ``None``; the corresponding judge runs on the
+    model declared in its ``.md`` frontmatter when its field is ``None``.
+    Operators set fields to opt-in per-judge to manage Sonnet / Opus / Bedrock
+    quota independently.
+
+    Attributes:
+        code_reviewer: Override for ``plugin/devbench/agents/review_team/code-reviewer.md``.
+        test_reviewer: Override for ``plugin/devbench/agents/review_team/test-reviewer.md``.
+        doc_reviewer: Override for ``plugin/devbench/agents/review_team/doc-reviewer.md``.
+        changes_manifest: Override for ``plugin/devbench/agents/review_team/changes-manifest.md``.
+    """
+
+    code_reviewer: str | None = None
+    test_reviewer: str | None = None
+    doc_reviewer: str | None = None
+    changes_manifest: str | None = None
+
+
+@dataclass
+class AgentModelsConfig:
+    """Per-agent model overrides for the work-agents in the devbench plugin (ADR-25).
+
+    Each field corresponds to one ``.md`` file under ``plugin/devbench/agents/``.
+    When a field is ``None`` (the default), the agent runs on the model
+    declared in its frontmatter. When set, ``devbench.plugin_shadow`` rewrites
+    the frontmatter ``model:`` line in a workspace-local shadow copy and the
+    Agent SDK / ``claude --plugin-dir`` is pointed at the shadow.
+
+    Operators set this so they can manage Sonnet / Opus / Bedrock quota
+    separately (e.g. drive ``executor`` on opus when sonnet quota is exhausted).
+    ``config.py`` merges ``JUDGE_AGENT_MODEL_*`` env vars over the YAML values
+    after this dataclass is constructed.
+
+    Attributes:
+        executor: Override for ``plugin/devbench/agents/executor.md``.
+        blocker_resolver: Override for ``plugin/devbench/agents/blocker-resolver.md``.
+        manifest_amender: Override for ``plugin/devbench/agents/manifest-amender.md``.
+        security_reviewer: Override for ``plugin/devbench/agents/security-reviewer.md``.
+        task_factory: Override for ``plugin/devbench/agents/task-factory.md``.
+        review_supervisor: Override for ``plugin/devbench/agents/review-supervisor.md``.
+        review_team: Nested overrides for the four review_team judges.
+    """
+
+    executor: str | None = None
+    blocker_resolver: str | None = None
+    manifest_amender: str | None = None
+    security_reviewer: str | None = None
+    task_factory: str | None = None
+    review_supervisor: str | None = None
+    review_team: ReviewTeamModelsConfig = field(default_factory=ReviewTeamModelsConfig)
+
+
+def validate_agent_model_value(
+    source: str,
+    agent_label: str,
+    value: str,
+    use_bedrock: bool,
+) -> None:
+    """Validate one agent override value against the use_bedrock toggle.
+
+    Per ADR-25 the override must match the same channel as
+    ``use_bedrock``: short names + Anthropic API ids are accepted only when
+    ``use_bedrock`` is False; Bedrock ARNs are accepted only when it is True.
+    Fail fast with a clear actionable message; the SDK's downstream error
+    would otherwise surface as a generic 401/404 at first invocation.
+
+    Used by both the YAML loader (``source`` is the config file path) and
+    ``config.py`` after ``JUDGE_AGENT_MODEL_*`` env var merging (``source``
+    is the env var name) so YAML and env-supplied values get the same
+    fail-fast treatment.
+
+    Args:
+        source: Human-readable origin of the value (file path or env var
+            name) included in the error message.
+        agent_label: Dotted label of the agent (``executor``,
+            ``review_team.code_reviewer``).
+        value: The string value to validate.
+        use_bedrock: Currently-resolved use_bedrock flag.
+
+    Raises:
+        ValueError: When *value* does not match the format implied by
+            *use_bedrock*.
+    """
+    if use_bedrock:
+        if not BEDROCK_AGENT_MODEL_PATTERN.match(value):
+            raise ValueError(
+                f"{source}: agents.{agent_label} = {value!r} is not a valid Bedrock "
+                "model id while use_bedrock: true. Expected pattern "
+                "'us.anthropic.claude-<name>-<ver>-v<N>' (e.g. "
+                "'us.anthropic.claude-opus-4-7-v1')."
+            )
+        return
+    if value in ALLOWED_AGENT_MODEL_SHORT_NAMES:
+        return
+    if ANTHROPIC_AGENT_MODEL_PATTERN.match(value):
+        return
+    short = ", ".join(sorted(ALLOWED_AGENT_MODEL_SHORT_NAMES))
+    raise ValueError(
+        f"{source}: agents.{agent_label} = {value!r} is not a valid Anthropic API "
+        f"model id while use_bedrock: false. Accepted short names: {short}. Accepted "
+        "full ids: 'claude-<name>-<digits>(-...)' (e.g. 'claude-opus-4-7')."
+    )
+
+
+def _parse_agent_models_config(
+    path: Path,
+    raw: object,
+    use_bedrock: bool,
+) -> AgentModelsConfig:
+    """Parse the ``agents`` YAML section into an ``AgentModelsConfig``.
+
+    The JSON Schema already rejects unknown keys + wrong types; this parser
+    cross-validates each value against ``use_bedrock`` so an inconsistent
+    config fails at load time, not at first agent invocation.
+
+    Args:
+        path: Config file path (used in error messages).
+        raw: Raw ``agents`` value from YAML (already schema-validated).
+        use_bedrock: Top-level ``use_bedrock`` flag from the same YAML.
+
+    Returns:
+        ``AgentModelsConfig`` with every supplied override populated and
+        every absent field left at ``None``.
+    """
+    if not isinstance(raw, dict):
+        return AgentModelsConfig()
+
+    top_fields = (
+        "executor",
+        "blocker_resolver",
+        "manifest_amender",
+        "security_reviewer",
+        "task_factory",
+        "review_supervisor",
+    )
+    kwargs: dict[str, str] = {}
+    for key in top_fields:
+        value = raw.get(key)
+        if value is None:
+            continue
+        validate_agent_model_value(f"Config file '{path}'", key, value, use_bedrock)
+        kwargs[key] = value
+
+    review_team_raw = raw.get("review_team") or {}
+    review_team_kwargs: dict[str, str] = {}
+    for key in ("code_reviewer", "test_reviewer", "doc_reviewer", "changes_manifest"):
+        value = review_team_raw.get(key)
+        if value is None:
+            continue
+        validate_agent_model_value(f"Config file '{path}'", f"review_team.{key}", value, use_bedrock)
+        review_team_kwargs[key] = value
+    review_team = ReviewTeamModelsConfig(**review_team_kwargs)
+
+    return AgentModelsConfig(review_team=review_team, **kwargs)
+
+
+@dataclass
 class RuntimeConfig:
     """Merged runtime configuration loaded from the YAML config file.
 
@@ -625,6 +788,7 @@ class RuntimeConfig:
     backlog: BacklogConfig = field(default_factory=BacklogConfig)
     manifest_amendment: AmendmentConfig = field(default_factory=AmendmentConfig)
     task_factory: TaskFactoryConfig = field(default_factory=TaskFactoryConfig)
+    agent_models: AgentModelsConfig = field(default_factory=AgentModelsConfig)
     validate: ValidateConfig = field(default_factory=ValidateConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
     allowed_orgs: list[str] = field(default_factory=list)
@@ -1016,6 +1180,11 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
             "Task-factory runs from the amendment-reject path; it has nothing to do when amendments are off."
         )
 
+    # Populate AgentModelsConfig from YAML agents block (ADR-25). Cross-
+    # validates each non-None value against the top-level use_bedrock flag so
+    # an inconsistent config fails at load time, not at first invocation.
+    agent_models = _parse_agent_models_config(path, raw.get("agents"), bool(raw.get("use_bedrock", False)))
+
     # Populate ValidateConfig from YAML validate block. All toggles default
     # to False so existing backlogs see no behaviour change.
     validate_raw = raw.get("validate") or {}
@@ -1084,6 +1253,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         backlog=backlog,
         manifest_amendment=manifest_amendment,
         task_factory=task_factory,
+        agent_models=agent_models,
         validate=validate_cfg,
         debug=debug,
         allowed_orgs=allowed_orgs,

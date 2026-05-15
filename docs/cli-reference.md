@@ -357,7 +357,40 @@ Useful as a pre-flight sweep before `devbench next` (after manual edits to the b
 uv run devbench start
 ```
 
-Run the orchestrate SKILL non-interactively via the Agent SDK. Invoked by `make start` (the recommended way to run DevBench). Loads the plugin ad-hoc from the devbench checkout; no global `make plugin-install` required. No arguments.
+Run the orchestrate SKILL non-interactively via the Agent SDK. Invoked by `make start` (the recommended way to run DevBench). Loads the plugin ad-hoc from the devbench checkout; no global `make plugin-install` required. When the workspace's `backlog/config/devbench.yaml` declares an `agents:` block (see [`docs/adr/25-per-agent-model-overrides.md`](adr/25-per-agent-model-overrides.md)), `start` materialises a workspace-local shadow plugin tree at `<workspace>/.devbench/plugin-shadow/devbench/` and passes that path to the SDK in place of the canonical plugin. No arguments.
+
+### `prepare-plugin-shadow`
+
+```
+uv run devbench prepare-plugin-shadow
+```
+
+Materialise the workspace-local shadow plugin (ADR-25) without launching anything and print its absolute path to stdout. Used by interactive launchers so the same per-agent model overrides apply when an operator drives the orchestrate skill manually:
+
+```
+claude --plugin-dir "$(uv run devbench prepare-plugin-shadow)"
+```
+
+When the workspace has no `agents:` overrides configured, prints the canonical plugin path; otherwise rewrites every overridden agent `.md` and symlinks the rest. Shares its implementation with `start`'s pre-flight so the two modes always produce identical plugin trees.
+
+The YAML schema for the override block is shown below with each field set to the **current frontmatter default** (nine agents on `sonnet`, `review_supervisor` on `haiku`). Setting a field to its frontmatter default value is a no-op; populate the block with these values as a starting point and change individual fields when you need to retarget an agent:
+
+```yaml
+agents:
+  executor: sonnet
+  blocker_resolver: sonnet
+  manifest_amender: sonnet
+  security_reviewer: sonnet
+  task_factory: sonnet
+  review_supervisor: haiku
+  review_team:
+    code_reviewer: sonnet
+    test_reviewer: sonnet
+    doc_reviewer: sonnet
+    changes_manifest: sonnet
+```
+
+Every field defaults to `null` when absent (use the agent's `.md` frontmatter model). When `use_bedrock: true`, every value must be a Bedrock ARN (`us.anthropic.claude-<name>-<ver>-v<N>`); when `false`, values must be a short name (`opus`/`sonnet`/`haiku`) or an Anthropic API id (`claude-opus-4-7`). `JUDGE_AGENT_MODEL_<NAME>` env vars (e.g. `JUDGE_AGENT_MODEL_EXECUTOR=opus`, `JUDGE_AGENT_MODEL_CODE_REVIEWER=opus`) override the YAML on a per-call basis (env > yaml > frontmatter).
 
 ---
 

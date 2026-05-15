@@ -12,6 +12,23 @@ since the last release. PR #119 carries every change.
 
 ### Added
 
+- **Per-agent model overrides via `agents:` block in `devbench.yaml`** (ADR-25).
+  Each of the ten work agents (executor, blocker-resolver, manifest-amender,
+  security-reviewer, task-factory, review-supervisor, plus the four
+  review_team judges) can be retargeted to a different model independently of
+  its `.md` frontmatter default. Lets operators with uneven per-model quota
+  drive specific agents on opus while leaving the rest on sonnet, etc. A
+  workspace-local shadow plugin tree is materialised at
+  `<workspace>/.devbench/plugin-shadow/devbench/` on every launch -- agent
+  files whose model is overridden are written as plain files with the
+  `model:` frontmatter line rewritten; every other plugin file is symlinked
+  back to the canonical install. New CLI command `devbench
+  prepare-plugin-shadow` builds the same shadow standalone for interactive
+  launchers (`claude --plugin-dir "$(devbench prepare-plugin-shadow)"`).
+  `JUDGE_AGENT_MODEL_<NAME>` env vars override the YAML block on a per-call
+  basis (env > yaml > frontmatter). Defaults preserved: workspaces without
+  an `agents:` block build no shadow and use the canonical plugin path,
+  bit-identical to pre-feature behaviour. See `docs/adr/25-per-agent-model-overrides.md`.
 - **`ScopeFilter` scope selector module** (issue #190). New
   `src/devbench/scope.py` dataclass providing a persistent allow/deny
   scope filter for work-unit execution. Public API: `ScopeFilter`

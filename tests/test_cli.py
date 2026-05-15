@@ -10165,3 +10165,73 @@ class TestCmdGitOpsMultiPrReplay:
         assert rc_a == rc_b == 0
         mock_ops_a.merge_pr.assert_called_once()
         mock_ops_b.merge_pr.assert_called_once()
+
+
+class TestCmdPreparePluginShadow:
+    """ADR-25: ``devbench prepare-plugin-shadow`` materialises the shadow and prints its path."""
+
+    def test_no_overrides_prints_canonical_path(self, capsys: pytest.CaptureFixture[str]) -> None:
+        from devbench.config_loader import AgentModelsConfig
+        from devbench.constants import DEFAULT_PLUGIN_SUBPATH
+
+        with (
+            patch("devbench.cli.AGENT_MODELS", AgentModelsConfig()),
+            patch("devbench.cli.WORKSPACE_ROOT", Path("/tmp/test-workspace")),
+        ):
+            rc = cli.cmd_prepare_plugin_shadow()
+
+        out = capsys.readouterr().out.strip()
+        assert rc == 0
+        assert out.endswith(DEFAULT_PLUGIN_SUBPATH)
+
+    def test_with_override_prints_workspace_shadow_path(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from devbench.config_loader import AgentModelsConfig
+
+        with (
+            patch("devbench.cli.AGENT_MODELS", AgentModelsConfig(executor="opus")),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_prepare_plugin_shadow()
+
+        out = capsys.readouterr().out.strip()
+        assert rc == 0
+        assert out == str(tmp_path / ".devbench" / "plugin-shadow" / "devbench")
+        # Real file (rewritten), not symlink
+        executor = Path(out) / "agents" / "executor.md"
+        assert executor.is_file() and not executor.is_symlink()
+        assert "model: opus\n" in executor.read_text(encoding="utf-8")
+
+
+class TestCmdStartUsesShadow:
+    """cmd_start passes the resolved (shadow-or-canonical) path to ClaudeAgentOptions."""
+
+    def test_cmd_start_with_override_uses_shadow_path(self, tmp_path: Path) -> None:
+        import sys
+        import types
+
+        from devbench.config_loader import AgentModelsConfig
+
+        mock_sdk = types.ModuleType("claude_agent_sdk")
+        mock_options_cls = MagicMock()
+        mock_sdk.ClaudeAgentOptions = mock_options_cls  # type: ignore[attr-defined]
+
+        async def mock_query(**kwargs: object) -> object:
+            yield "test message"
+
+        mock_sdk.query = mock_query  # type: ignore[attr-defined]
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.AGENT_MODELS", AgentModelsConfig(executor="opus")),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_start()
+
+        assert rc == 0
+        # Verify the options constructor was called with the shadow path,
+        # not the canonical.
+        kwargs = mock_options_cls.call_args.kwargs
+        shadow_path = str(tmp_path / ".devbench" / "plugin-shadow" / "devbench")
+        assert kwargs["plugins"] == [{"type": "local", "path": shadow_path}]

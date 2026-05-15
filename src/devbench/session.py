@@ -394,9 +394,16 @@ def flock_backlog(
         ``None`` -- callers use ``with flock_backlog(root):`` without capturing the value.
 
     Raises:
+        ValueError: *timeout_seconds* is not positive.
         TimeoutError: The lock could not be acquired within *timeout_seconds*.
         OSError: An unexpected OS error from ``fcntl.flock``.
     """
+    if timeout_seconds <= 0:
+        raise ValueError(
+            f"timeout_seconds must be positive, got {timeout_seconds}. "
+            f"Pass a value > 0 or omit to use the default "
+            f"({SESSION_DEFAULT_FLOCK_TIMEOUT_SECONDS}s)."
+        )
     lock_dir = workspace_root / ".devbench"
     lock_dir.mkdir(parents=True, exist_ok=True)
     lock_path = lock_dir / SESSION_BACKLOG_LOCK_NAME

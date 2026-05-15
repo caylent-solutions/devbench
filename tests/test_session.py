@@ -4,6 +4,7 @@ detect_scope_overlap, ClaimRaceError, and PID-file management.
 Coverage requirement: 100% line + branch on devbench.session.
 
 AC-192-1: session state_dir creation and PID-file management.
+AC-192-3: concurrent sessions via flock_backlog mutual exclusion.
 AC-192-10: session listing with liveness (ACTIVE / STALE).
 """
 
@@ -416,6 +417,102 @@ class TestFlockBacklog:
         expected = workspace / ".devbench" / "BACKLOG.lock"
         with flock_backlog(workspace, timeout_seconds=5):
             assert expected.exists()
+
+    def test_lock_released_on_exception(self, workspace: Path) -> None:
+        """Lock is released when an exception is raised inside the context block."""
+        with pytest.raises(RuntimeError, match="boom"):
+            with flock_backlog(workspace, timeout_seconds=5):
+                raise RuntimeError("boom")
+        # After exception, the lock must be released so re-acquisition succeeds.
+        with flock_backlog(workspace, timeout_seconds=1):
+            pass
+
+    def test_creates_devbench_dir_when_absent(self, tmp_path: Path) -> None:
+        """flock_backlog creates .devbench/ when the workspace has no such directory."""
+        bare_workspace = tmp_path / "bare"
+        bare_workspace.mkdir()
+        assert not (bare_workspace / ".devbench").exists()
+        with flock_backlog(bare_workspace, timeout_seconds=5):
+            assert (bare_workspace / ".devbench").exists()
+
+    def test_timeout_error_message_contains_lock_path(self, workspace: Path) -> None:
+        """The TimeoutError message includes the lock path for debugging."""
+        lock_path = workspace / ".devbench" / "BACKLOG.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("w") as lock_fd:
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                with pytest.raises(TimeoutError, match=r"BACKLOG\.lock"):
+                    with flock_backlog(workspace, timeout_seconds=1):
+                        pass
+            finally:
+                fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+
+    def test_timeout_error_message_contains_timeout_value(self, workspace: Path) -> None:
+        """The TimeoutError message includes the timeout value for diagnostics."""
+        lock_path = workspace / ".devbench" / "BACKLOG.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("w") as lock_fd:
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                with pytest.raises(TimeoutError, match="1s"):
+                    with flock_backlog(workspace, timeout_seconds=1):
+                        pass
+            finally:
+                fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+
+    def test_mutual_exclusion_via_threading(self, workspace: Path) -> None:
+        """Two threads cannot hold flock_backlog simultaneously (AC-192-3).
+
+        This test verifies actual mutual exclusion: a shared counter is
+        incremented inside the lock from two concurrent threads. Without
+        correct locking the threads would interleave and the final counter
+        would be less than the expected total.
+        """
+        import threading
+
+        iterations_per_thread = 50
+        counter_file = workspace / ".devbench" / "counter.txt"
+        counter_file.parent.mkdir(parents=True, exist_ok=True)
+        counter_file.write_text("0", encoding="utf-8")
+        errors: list[str] = []
+
+        def increment_under_lock() -> None:
+            for _ in range(iterations_per_thread):
+                try:
+                    with flock_backlog(workspace, timeout_seconds=10):
+                        val = int(counter_file.read_text(encoding="utf-8").strip())
+                        counter_file.write_text(str(val + 1), encoding="utf-8")
+                except Exception as exc:
+                    errors.append(str(exc))
+
+        t1 = threading.Thread(target=increment_under_lock)
+        t2 = threading.Thread(target=increment_under_lock)
+        t1.start()
+        t2.start()
+        t1.join(timeout=30)
+        t2.join(timeout=30)
+
+        assert not errors, f"Threads raised errors: {errors}"
+        final_val = int(counter_file.read_text(encoding="utf-8").strip())
+        assert final_val == iterations_per_thread * 2
+
+    @pytest.mark.parametrize("bad_timeout", [0, -1, -100])
+    def test_non_positive_timeout_raises_value_error(self, workspace: Path, bad_timeout: int) -> None:
+        """flock_backlog rejects non-positive timeout_seconds with a clear ValueError."""
+        with pytest.raises(ValueError, match="timeout_seconds must be positive"):
+            with flock_backlog(workspace, timeout_seconds=bad_timeout):
+                pass
+
+    def test_unexpected_os_error_propagates(self, workspace: Path) -> None:
+        """OSError from fcntl.flock that is not BlockingIOError propagates."""
+        with patch(
+            "devbench.session.fcntl.flock",
+            side_effect=OSError(errno.EBADF, "Bad file descriptor"),
+        ):
+            with pytest.raises(OSError, match="Bad file descriptor"):
+                with flock_backlog(workspace, timeout_seconds=5):
+                    pass
 
 
 # ---------------------------------------------------------------------------

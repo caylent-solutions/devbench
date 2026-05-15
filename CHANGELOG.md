@@ -244,6 +244,10 @@ since the last release. PR #119 carries every change.
   denominator. ETA still falls back to `n/a` when fewer than the
   required pace samples have completed in the recent window.
 
+### Fixed
+
+- **Shadow plugin can no longer be cleared while an orchestrator is using it** (ADR-25 sentinel-protected lifecycle). `cmd_start` now writes its PID to `<workspace>/.devbench/plugin-shadow/devbench/.pid` immediately after materialising the shadow. `clear_shadow_plugin` reads the sentinel before deleting the tree: when the recorded PID is alive, it raises `RuntimeError` naming the owning PID and recommends stopping it first. Closes a production race where a stray `devbench prepare-plugin-shadow` (firing when the YAML `agents:` block matched frontmatter defaults, which caused `materialise_shadow_plugin` to clear the shadow and return None) deleted the shadow's hook scripts out from under a running orchestrator. The SDK kept the plugin cached in memory so tool calls continued, but each hook fires as a fresh shell-script subprocess; with the script files gone, hook telemetry silently stopped logging to `hook-logs.jsonl`. The sentinel converts that silent-corruption to a fail-fast error. Sentinel lives inside the shadow tree so a legitimate rebuild's `rmtree` cleans it atomically.
+
 ### Changed (model defaults)
 
 - **Per-agent model defaults retuned by role**. The plugin agent

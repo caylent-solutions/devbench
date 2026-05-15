@@ -154,6 +154,22 @@ rather than as a generic SDK error on first agent invocation.
 build no shadow and use the canonical plugin path -- bit-identical to
 pre-feature behaviour.
 
+**Sentinel-protected lifecycle.** Each `cmd_start` invocation that materialises
+a shadow writes its own PID to `<workspace>/.devbench/plugin-shadow/devbench/.pid`.
+`clear_shadow_plugin` reads the sentinel before deleting the tree: when the
+recorded PID is alive, it raises `RuntimeError` naming the owning PID and
+recommends stopping it first. This closes a real production race: under the
+pre-sentinel design, a stray `devbench prepare-plugin-shadow` invocation
+(triggered when the YAML's `agents:` block matched frontmatter defaults, so
+`materialise_shadow_plugin` decided to clear the shadow and return None) could
+delete the shadow files out from under a running orchestrator. The SDK
+subprocess kept the plugin cached in memory, so tool execution continued, but
+each hook fires as a fresh shell-script subprocess that reads `hook-logger.sh`
+from disk -- after the shadow tree was gone, those scripts could not be
+found and hook telemetry silently stopped. The sentinel makes the clear
+operation fail-fast instead of silently corrupting state. Sentinel lives
+inside the shadow tree so `rmtree` cleans it atomically on legitimate rebuilds.
+
 ## Rollout
 
 Shipped as a single non-pushed branch on the canonical install plus a

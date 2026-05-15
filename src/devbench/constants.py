@@ -545,6 +545,16 @@ QUOTA_CHECKPOINT_FILENAME: str = "quota_pause.json"
 # and interactive modes share one mechanism.
 PLUGIN_SHADOW_DIR_NAME: str = ".devbench/plugin-shadow"
 
+# Filename of the PID sentinel written by ``cmd_start`` inside the shadow
+# plugin tree at ``<workspace>/<PLUGIN_SHADOW_DIR_NAME>/devbench/<filename>``.
+# The sentinel records the orchestrator PID that owns the materialised tree;
+# ``clear_shadow_plugin`` refuses to delete the tree while the recorded PID
+# is alive (raising ``RuntimeError``) so a concurrent ``devbench
+# prepare-plugin-shadow`` invocation cannot clear a running orchestrator's
+# plugin files out from under it. Lives inside the tree so ``rmtree`` of
+# the tree removes the sentinel atomically when a clean rebuild is allowed.
+SHADOW_PID_SENTINEL_FILENAME: str = ".pid"
+
 # Short-name model aliases accepted in ``agents.*`` YAML values when
 # ``use_bedrock: false``. Mirrors the convenience short forms the Anthropic
 # SDK accepts.

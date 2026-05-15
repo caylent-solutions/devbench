@@ -19,12 +19,13 @@ branch coverage (Makefile :: ``test-coverage-new``) is achievable.
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from devbench.constants import PLUGIN_SHADOW_DIR_NAME
+from devbench.constants import PLUGIN_SHADOW_DIR_NAME, SHADOW_PID_SENTINEL_FILENAME
 
 if TYPE_CHECKING:
     from devbench.config_loader import AgentModelsConfig
@@ -73,11 +74,91 @@ def shadow_plugin_path(workspace_root: Path) -> Path:
     return workspace_root / PLUGIN_SHADOW_DIR_NAME / "devbench"
 
 
+def _sentinel_path(workspace_root: Path) -> Path:
+    """Return the absolute path to the shadow plugin's PID sentinel file.
+
+    Lives at ``<workspace_root>/<PLUGIN_SHADOW_DIR_NAME>/devbench/<SHADOW_PID_SENTINEL_FILENAME>``
+    so a ``shutil.rmtree`` of the shadow tree removes the sentinel atomically.
+    The path is deterministic; this function does not consult the filesystem.
+    """
+    return shadow_plugin_path(workspace_root) / SHADOW_PID_SENTINEL_FILENAME
+
+
+def write_pid_sentinel(workspace_root: Path, pid: int) -> None:
+    """Record the orchestrator PID that owns the materialised shadow plugin.
+
+    Called by ``cmd_start`` immediately after ``materialise_shadow_plugin``
+    returns a non-None path. Atomic: writes to ``.pid.tmp`` then renames over
+    the target, so a concurrent reader of the sentinel always sees either the
+    prior PID or the new PID, never a half-written value. The shadow root is
+    assumed to exist (the materialiser created it).
+
+    Args:
+        workspace_root: Workspace whose shadow tree was just materialised.
+        pid: Process id of the orchestrator that owns the shadow.
+
+    Raises:
+        FileNotFoundError: If the shadow plugin root does not exist (caller
+            invoked the function before materialise_shadow_plugin).
+    """
+    sentinel = _sentinel_path(workspace_root)
+    if not sentinel.parent.is_dir():
+        raise FileNotFoundError(
+            f"Cannot write PID sentinel: shadow plugin root '{sentinel.parent}' "
+            "does not exist. Call materialise_shadow_plugin first."
+        )
+    tmp = sentinel.parent / (sentinel.name + ".tmp")
+    tmp.write_text(str(pid), encoding="utf-8")
+    tmp.replace(sentinel)
+
+
+def _read_sentinel_pid(workspace_root: Path) -> int | None:
+    """Return the PID stored in the shadow plugin's sentinel file, or None.
+
+    Returns ``None`` when the sentinel does not exist (the common case before
+    ``cmd_start`` has materialised a shadow or after a clean rebuild).
+
+    Raises:
+        ValueError: If the sentinel exists but does not contain a valid
+            integer. Intentional fail-fast: a corrupt sentinel is a sign of
+            file-system corruption or operator interference; we surface it
+            rather than silently overwriting.
+    """
+    sentinel = _sentinel_path(workspace_root)
+    if not sentinel.exists():
+        return None
+    raw = sentinel.read_text(encoding="utf-8").strip()
+    return int(raw)
+
+
+def _is_pid_alive(pid: int) -> bool:
+    """Return True if *pid* names a live process on this host.
+
+    Uses ``os.kill(pid, 0)`` which sends no signal but raises
+    ``ProcessLookupError`` when the PID does not exist. A ``PermissionError``
+    means the PID exists but is owned by a different uid -- still alive.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def clear_shadow_plugin(workspace_root: Path) -> bool:
     """Remove the shadow plugin tree under *workspace_root*.
 
     Idempotent: a second call after the tree is gone returns ``False`` and
     does not raise.
+
+    Refuses to delete the tree when the recorded PID sentinel names a live
+    process. Lets ``cmd_start`` rebuild its own shadow at startup (the
+    materialise_shadow_plugin path clears + writes its own sentinel), but
+    prevents a stray ``devbench prepare-plugin-shadow`` from clearing a
+    running orchestrator's plugin files out from under it (the bug that
+    silently stops hook telemetry mid-run).
 
     Args:
         workspace_root: Workspace root whose shadow tree should be removed.
@@ -85,10 +166,25 @@ def clear_shadow_plugin(workspace_root: Path) -> bool:
     Returns:
         ``True`` when the shadow tree was present and removed,
         ``False`` when it did not exist.
+
+    Raises:
+        RuntimeError: When a sentinel PID is found AND that PID is alive.
+            The caller is presumed to be a stray operator action; the
+            recommended remedy is to stop the named orchestrator first.
+        ValueError: When the sentinel exists but is corrupt (propagated
+            from ``_read_sentinel_pid``).
     """
     shadow_root = workspace_root / PLUGIN_SHADOW_DIR_NAME
     if not shadow_root.exists():
         return False
+    pid = _read_sentinel_pid(workspace_root)
+    if pid is not None and _is_pid_alive(pid):
+        raise RuntimeError(
+            f"Refusing to clear shadow plugin at '{shadow_root}': "
+            f"orchestrator process PID {pid} is alive and using it. "
+            f"Stop the orchestrator first (e.g. send SIGTERM to PID {pid}) "
+            "before clearing the shadow."
+        )
     shutil.rmtree(shadow_root)
     return True
 

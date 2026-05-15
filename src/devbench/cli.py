@@ -170,7 +170,11 @@ from devbench.constants import (
     VALID_TDD_PHASES,
 )
 from devbench.log_setup import setup_logging
-from devbench.plugin_shadow import materialise_shadow_plugin
+from devbench.plugin_shadow import (
+    materialise_shadow_plugin,
+    shadow_plugin_path,
+    write_pid_sentinel,
+)
 
 # Re-export from reporting so existing ``cli._format_duration`` callers and tests
 # resolve unchanged after the function moved to report.py for the issue #161
@@ -4352,6 +4356,16 @@ def cmd_start() -> int:
     from claude_agent_sdk import ClaudeAgentOptions, query
 
     plugin_path = _resolve_plugin_path()
+
+    # When the resolver returned the shadow path (overrides configured),
+    # record this orchestrator's PID inside the shadow tree. The sentinel
+    # makes clear_shadow_plugin refuse to delete the tree while this
+    # process is alive -- preventing a stray prepare-plugin-shadow
+    # invocation from clearing the shadow out from under the running SDK
+    # subprocess and silently breaking hook telemetry mid-run (ADR-25
+    # sentinel-protected lifecycle).
+    if plugin_path == shadow_plugin_path(WORKSPACE_ROOT):
+        write_pid_sentinel(WORKSPACE_ROOT, os.getpid())
 
     async def _run() -> None:
         async for message in query(

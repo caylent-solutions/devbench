@@ -10942,3 +10942,38 @@ class TestCmdStartUsesShadow:
         kwargs = mock_options_cls.call_args.kwargs
         shadow_path = str(tmp_path / ".devbench" / "plugin-shadow" / "devbench")
         assert kwargs["plugins"] == [{"type": "local", "path": shadow_path}]
+        # cmd_start MUST have written a PID sentinel inside the shadow tree
+        # so a stray prepare-plugin-shadow can't clear it while this run
+        # is alive.
+        sentinel = tmp_path / ".devbench" / "plugin-shadow" / "devbench" / ".pid"
+        assert sentinel.is_file()
+        import os as _os
+
+        assert sentinel.read_text(encoding="utf-8").strip() == str(_os.getpid())
+
+    def test_cmd_start_without_override_does_not_write_sentinel(self, tmp_path: Path) -> None:
+        # When no overrides are configured, _resolve_plugin_path returns the
+        # canonical path -- no shadow exists, so no sentinel must be written.
+        import sys
+        import types
+
+        from devbench.config_loader import AgentModelsConfig
+
+        mock_sdk = types.ModuleType("claude_agent_sdk")
+        mock_options_cls = MagicMock()
+        mock_sdk.ClaudeAgentOptions = mock_options_cls  # type: ignore[attr-defined]
+
+        async def mock_query(**kwargs: object) -> object:
+            yield "test message"
+
+        mock_sdk.query = mock_query  # type: ignore[attr-defined]
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.AGENT_MODELS", AgentModelsConfig()),  # no overrides
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_start()
+
+        assert rc == 0
+        assert not (tmp_path / ".devbench" / "plugin-shadow").exists()

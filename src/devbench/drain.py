@@ -228,22 +228,33 @@ def consume_drain(workspace: Path) -> DrainState | None:
     request. The operation reads the signal, then unlinks the file. If
     parsing fails the file is left in place so the caller can inspect it.
 
+    If the file disappears between the read and the unlink (a concurrent
+    cancel or a second consumer racing this call), the successfully-read
+    :class:`DrainState` is still returned rather than raising
+    ``FileNotFoundError`` -- the drain signal was consumed by whoever deleted
+    it first, so the outcome is identical from the caller's perspective.
+
     Args:
         workspace: Root directory of the devbench workspace.
 
     Returns:
-        A :class:`DrainState` if the signal file existed; ``None`` otherwise.
+        A :class:`DrainState` if the signal file existed at read time;
+        ``None`` if no signal file was present.
 
     Raises:
         ValueError: The signal file contains invalid JSON, a non-dict JSON
             root, or an unparseable ``requested_at`` value.
         KeyError: The signal file is missing a required field.
         OSError: The unlink step fails for a reason other than the file being
-            absent.
+            absent (e.g. permission denied).
     """
     state = read_drain_state(workspace)
     if state is None:
         return None
 
-    _signal_path(workspace).unlink()
+    # If the file vanishes between read and unlink (concurrent cancel or second
+    # consumer), the drain was still observed; suppress the missing-file error.
+    with contextlib.suppress(FileNotFoundError):
+        _signal_path(workspace).unlink()
+
     return state

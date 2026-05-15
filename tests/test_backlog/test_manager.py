@@ -5233,3 +5233,241 @@ class TestUnitTypeLabel:
         """_unit_type_label raises ValueError for an ID that does not match any known hierarchy shape."""
         with pytest.raises(ValueError, match="Unrecognized work-unit ID shape"):
             BacklogManager._unit_type_label("MALFORMED-X99")
+
+
+# ---------------------------------------------------------------------------
+# E1-F2-S3-T1: _check_status_summary + _update_status_summary include Draft column
+# AC-189-6, AC-189-7
+# ---------------------------------------------------------------------------
+
+
+def _make_backlog_with_draft(tmp_path: Path, backlog_dir: Path) -> tuple[Path, dict[str, Path]]:
+    """Create a BACKLOG.md with a draft task and corresponding WU files.
+
+    Returns (index_path, {unit_id: wu_file_path}).
+    """
+    content = (
+        "# Backlog\n\n"
+        "## Full Work Unit Index\n\n"
+        "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+        "|----|-------|------|--------|--------------|------|----------|\n"
+        "| E1 | Epic One | Epic | in-queue | None | repo | `backlog/E1.md` |\n"
+        "| E1-F1-S1-T1 | Task A | Task | done | None | repo | `backlog/E1-F1-S1-T1.md` |\n"
+        "| E1-F1-S1-T2 | Task B | Task | draft | None | repo | `backlog/E1-F1-S1-T2.md` |\n"
+        "| E1-F1-S1-T3 | Task C | Task | in-queue | None | repo | `backlog/E1-F1-S1-T3.md` |\n"
+        "| E2 | Epic Two | Epic | in-queue | None | repo | `backlog/E2.md` |\n"
+        "| E2-F1-S1-T1 | Task D | Task | draft | None | repo | `backlog/E2-F1-S1-T1.md` |\n"
+        "| E2-F1-S1-T2 | Task E | Task | draft | None | repo | `backlog/E2-F1-S1-T2.md` |\n"
+    )
+    index_path = tmp_path / "BACKLOG.md"
+    index_path.write_text(content, encoding="utf-8")
+
+    files: dict[str, Path] = {}
+    units = [
+        ("E1", "in-queue"),
+        ("E1-F1-S1-T1", "done"),
+        ("E1-F1-S1-T2", "draft"),
+        ("E1-F1-S1-T3", "in-queue"),
+        ("E2", "in-queue"),
+        ("E2-F1-S1-T1", "draft"),
+        ("E2-F1-S1-T2", "draft"),
+    ]
+    for uid, status in units:
+        wu = backlog_dir / f"{uid}.md"
+        wu.write_text(f"# {uid}\n\n## Status: {status}\n", encoding="utf-8")
+        files[uid] = wu
+
+    return index_path, files
+
+
+@pytest.mark.unit
+class TestStatusSummaryDraftColumn:
+    """AC-189-7: Status Summary per-epic table includes a Draft column.
+
+    Tests that _update_status_summary writes the Draft column and
+    _check_status_summary validates it.
+    """
+
+    def test_update_status_summary_includes_draft_header(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """AC-189-7: _update_status_summary writes a Draft column header in the table."""
+        index_path, _ = _make_backlog_with_draft(tmp_path, backlog_dir)
+        mgr = BacklogManager()
+        mgr._update_status_summary(index_path)
+
+        result = index_path.read_text(encoding="utf-8")
+        assert "Draft" in result, (
+            "Status Summary table must include a 'Draft' column header after _update_status_summary"
+        )
+
+    def test_update_status_summary_counts_draft_tasks(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """AC-189-7: _update_status_summary correctly counts draft tasks per epic."""
+        index_path, _ = _make_backlog_with_draft(tmp_path, backlog_dir)
+        mgr = BacklogManager()
+        mgr._update_status_summary(index_path)
+
+        result = index_path.read_text(encoding="utf-8")
+        summary_rows = _extract_summary_lines(result)
+
+        e1_lines = [line for line in summary_rows if "| E1 |" in line]
+        e2_lines = [line for line in summary_rows if "| E2 |" in line]
+        assert len(e1_lines) == 1, f"Expected exactly 1 E1 row, got: {e1_lines}"
+        assert len(e2_lines) == 1, f"Expected exactly 1 E2 row, got: {e2_lines}"
+
+        # E1 has: 1 done, 1 draft, 1 in-queue
+        # E2 has: 2 draft
+        # Parse cells: '' | epic | title | done | in-progress | in-queue | blocked | declined | draft | ...
+        # The Draft column position depends on the header order
+        e1_cells = [c.strip() for c in e1_lines[0].split("|")]
+        e2_cells = [c.strip() for c in e2_lines[0].split("|")]
+
+        # Find the Draft column index by parsing the header row
+        header_line = next(
+            (line for line in result.splitlines() if line.strip().startswith("| Epic") and "Draft" in line),
+            None,
+        )
+        assert header_line is not None, "Status Summary table must have a header row containing 'Draft'"
+
+        header_cells = [c.strip() for c in header_line.split("|")]
+        draft_col = next(
+            (i for i, h in enumerate(header_cells) if h.strip() == "Draft"),
+            None,
+        )
+        assert draft_col is not None, f"No 'Draft' column found in header: {header_line}"
+
+        assert e1_cells[draft_col] == "1", (
+            f"E1 draft count should be 1 (one draft task), got: {e1_cells[draft_col]!r}. Row: {e1_lines[0]}"
+        )
+        assert e2_cells[draft_col] == "2", (
+            f"E2 draft count should be 2 (two draft tasks), got: {e2_cells[draft_col]!r}. Row: {e2_lines[0]}"
+        )
+
+    def test_update_status_summary_zero_draft_when_no_draft_tasks(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """AC-189-7: _update_status_summary writes 0 in Draft column when no draft tasks exist."""
+        index_path, _ = _make_backlog_with_epics(tmp_path, backlog_dir)
+        mgr = BacklogManager()
+        mgr._update_status_summary(index_path)
+
+        result = index_path.read_text(encoding="utf-8")
+        summary_rows = _extract_summary_lines(result)
+        assert len(summary_rows) >= 1, "Expected at least one summary row"
+
+        header_line = next(
+            (line for line in result.splitlines() if line.strip().startswith("| Epic") and "Draft" in line),
+            None,
+        )
+        assert header_line is not None, "Status Summary table must have a header row containing 'Draft'"
+
+        header_cells = [c.strip() for c in header_line.split("|")]
+        draft_col = next(
+            (i for i, h in enumerate(header_cells) if h.strip() == "Draft"),
+            None,
+        )
+        assert draft_col is not None, f"No 'Draft' column found in header: {header_line}"
+
+        for row in summary_rows:
+            cells = [c.strip() for c in row.split("|")]
+            assert cells[draft_col] == "0", (
+                f"Draft count should be 0 for row with no draft tasks, got: {cells[draft_col]!r}. Row: {row}"
+            )
+
+    def test_check_status_summary_includes_draft_in_validation(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """AC-189-7: _check_status_summary validates Draft counts match the index."""
+        index_path, _ = _make_backlog_with_draft(tmp_path, backlog_dir)
+        mgr = BacklogManager()
+        # First write a correct summary
+        mgr._update_status_summary(index_path)
+
+        # Validate that no draft mismatch errors are reported
+        errors: list[str] = []
+        rows = mgr._parse_backlog_rows(index_path)
+        mgr._check_status_summary(index_path, rows, errors)
+        draft_errors = [e for e in errors if "draft" in e.lower()]
+        assert not draft_errors, f"Unexpected draft mismatch errors: {draft_errors}"
+
+    def test_check_status_summary_reports_draft_mismatch(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """AC-189-7: _check_status_summary reports an error when Draft count is wrong."""
+        index_path, _ = _make_backlog_with_draft(tmp_path, backlog_dir)
+        mgr = BacklogManager()
+
+        # Write a deliberately wrong summary with Draft count 0 where it should be > 0
+        wrong_summary = (
+            "## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked | Declined | Draft |\n"
+            "|------|-------|------|-------------|----------|---------|----------|-------|\n"
+            "| E1 | Epic One | 1 | 0 | 1 | 0 | 0 | 0 |\n"
+            "| E2 | Epic Two | 0 | 0 | 0 | 0 | 0 | 0 |\n\n"
+        )
+        existing = index_path.read_text(encoding="utf-8")
+        index_path.write_text(wrong_summary + existing, encoding="utf-8")
+
+        errors: list[str] = []
+        rows = mgr._parse_backlog_rows(index_path)
+        mgr._check_status_summary(index_path, rows, errors)
+
+        assert any("draft" in e.lower() or "mismatch" in e.lower() for e in errors), (
+            f"Expected a draft mismatch error but got: {errors}"
+        )
+
+    def test_parse_summary_table_includes_draft_column(self) -> None:
+        """AC-189-7: _parse_summary_table correctly parses the Draft column."""
+        content = (
+            "## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked | Declined | Draft |\n"
+            "|------|-------|------|-------------|----------|---------|----------|-------|\n"
+            "| E1 | Epic One | 1 | 0 | 2 | 0 | 0 | 3 |\n"
+            "\n## Full Work Unit Index\n"
+        )
+        mgr = BacklogManager()
+        result = mgr._parse_summary_table(content)
+
+        assert "E1" in result, f"E1 epic row must be parsed; got: {result}"
+        from devbench.constants import STATUS_DRAFT
+
+        assert result["E1"][STATUS_DRAFT] == 3, f"Draft count for E1 must be 3; got: {result['E1'].get(STATUS_DRAFT)}"
+
+    def test_compute_epic_counts_includes_draft(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """AC-189-7: _compute_epic_counts includes draft tasks in per-epic counts."""
+        index_path, _ = _make_backlog_with_draft(tmp_path, backlog_dir)
+        mgr = BacklogManager()
+        rows = mgr._parse_backlog_rows(index_path)
+        counts = mgr._compute_epic_counts(rows)
+
+        from devbench.constants import STATUS_DRAFT
+
+        assert "E1" in counts, "E1 must be present in epic counts"
+        assert "E2" in counts, "E2 must be present in epic counts"
+        assert counts["E1"][STATUS_DRAFT] == 1, f"E1 must have 1 draft task; got: {counts['E1'].get(STATUS_DRAFT)}"
+        assert counts["E2"][STATUS_DRAFT] == 2, f"E2 must have 2 draft tasks; got: {counts['E2'].get(STATUS_DRAFT)}"
+
+    def test_migration_legacy_table_without_draft_does_not_error_on_check(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """AC-189-7: Legacy BACKLOG.md without Draft column triggers rewrite on _update_status_summary.
+
+        After calling _update_status_summary once on a legacy file, the resulting
+        table must include the Draft column and _check_status_summary must report
+        no errors.
+        """
+        index_path, _ = _make_backlog_with_draft(tmp_path, backlog_dir)
+        # Write a legacy summary without Draft column
+        legacy_summary = (
+            "## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked | Declined |\n"
+            "|------|-------|------|-------------|----------|---------|----------|\n"
+            "| E1 | Epic One | 0 | 0 | 0 | 0 | 0 |\n"
+            "| E2 | Epic Two | 0 | 0 | 0 | 0 | 0 |\n\n"
+        )
+        existing = index_path.read_text(encoding="utf-8")
+        index_path.write_text(legacy_summary + existing, encoding="utf-8")
+
+        mgr = BacklogManager()
+        # _update_status_summary must rewrite the table including Draft column
+        mgr._update_status_summary(index_path)
+
+        result = index_path.read_text(encoding="utf-8")
+        assert "Draft" in result, "After _update_status_summary, Draft column must appear in Status Summary"
+
+        errors: list[str] = []
+        rows = mgr._parse_backlog_rows(index_path)
+        mgr._check_status_summary(index_path, rows, errors)
+        assert not errors, f"After rewrite, _check_status_summary must report no errors; got: {errors}"

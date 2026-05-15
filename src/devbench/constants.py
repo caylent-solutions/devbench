@@ -20,8 +20,8 @@ COMMENTS_SECTION_HEADER: str = "## Comments"
 STATUS_SECTION_PREFIX: str = "## Status:"
 STATUS_SUMMARY_SECTION_HEADER: str = "## Status Summary"
 STATUS_SUMMARY_TABLE_HEADER: str = (
-    "| Epic | Title | Done | In Progress | In Queue | Blocked | Declined |\n"
-    "|------|-------|------|-------------|----------|---------|----------|\n"
+    "| Epic | Title | Done | In Progress | In Queue | Blocked | Declined | Draft |\n"
+    "|------|-------|------|-------------|----------|---------|----------|-------|\n"
 )
 # Pre-compiled pattern to strip the Status Summary section from BACKLOG.md content.
 # Matches from the header up to (but not including) the next ## heading or end of string.

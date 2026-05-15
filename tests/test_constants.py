@@ -88,6 +88,35 @@ class TestStatusStringConstants:
         assert "draft" in VALID_STATUSES
 
 
+class TestStatusSummaryTableHeader:
+    """STATUS_SUMMARY_TABLE_HEADER constant includes Draft column (AC-189-7)."""
+
+    def test_status_summary_table_header_includes_draft_column(self) -> None:
+        """STATUS_SUMMARY_TABLE_HEADER contains a Draft column header cell."""
+        from devbench.constants import STATUS_SUMMARY_TABLE_HEADER
+
+        assert "Draft" in STATUS_SUMMARY_TABLE_HEADER
+
+    def test_status_summary_table_header_is_two_line_markdown_table(self) -> None:
+        """STATUS_SUMMARY_TABLE_HEADER is a two-line markdown table (header row + separator row)."""
+        from devbench.constants import STATUS_SUMMARY_TABLE_HEADER
+
+        lines = STATUS_SUMMARY_TABLE_HEADER.splitlines()
+        assert len(lines) == 2
+        assert lines[0].startswith("|")
+        assert lines[1].startswith("|")
+        # Separator row contains only dashes and pipes
+        assert all(c in "-| " for c in lines[1])
+
+    def test_status_summary_table_header_draft_column_position(self) -> None:
+        """STATUS_SUMMARY_TABLE_HEADER has Draft as the last data column before closing pipe."""
+        from devbench.constants import STATUS_SUMMARY_TABLE_HEADER
+
+        header_row = STATUS_SUMMARY_TABLE_HEADER.splitlines()[0]
+        columns = [col.strip() for col in header_row.strip("|").split("|")]
+        assert "Draft" in columns
+
+
 class TestCascadeDepthConstant:
     """DEFAULT_MAX_CASCADE_DEPTH equals 2 (issue #E8)."""
 

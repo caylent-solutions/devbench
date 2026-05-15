@@ -1394,10 +1394,9 @@ class BacklogManager:
         """Compute per-epic status counts from backlog rows.
 
         Returns a dict mapping epic_id -> {status: count} where status is one
-        of ``done``, ``in-progress``, ``in-queue``, ``blocked``, ``declined``.
-        Only descendant rows (those starting with ``<epic-id>-``) are counted;
-        the epic row itself is excluded. Proposed children are not surfaced
-        in the summary (they are inert drafts awaiting operator action).
+        of ``done``, ``in-progress``, ``in-queue``, ``blocked``, ``declined``,
+        ``draft``. Only descendant rows (those starting with ``<epic-id>-``)
+        are counted; the epic row itself is excluded.
         """
         epic_order: list[str] = []
         for row_id, _, _ in rows:
@@ -1411,6 +1410,7 @@ class BacklogManager:
                 STATUS_IN_QUEUE: 0,
                 STATUS_BLOCKED: 0,
                 STATUS_DECLINED: 0,
+                STATUS_DRAFT: 0,
             }
             for epic_id in epic_order
         }
@@ -1439,7 +1439,7 @@ class BacklogManager:
             table_rows += (
                 f"| {epic_id} | {title} | {c[STATUS_DONE]} | "
                 f"{c[STATUS_IN_PROGRESS]} | {c[STATUS_IN_QUEUE]} | "
-                f"{c[STATUS_BLOCKED]} | {c[STATUS_DECLINED]} |\n"
+                f"{c[STATUS_BLOCKED]} | {c[STATUS_DECLINED]} | {c[STATUS_DRAFT]} |\n"
             )
 
         return STATUS_SUMMARY_SECTION_HEADER + "\n\n" + STATUS_SUMMARY_TABLE_HEADER + table_rows + "\n"
@@ -1474,7 +1474,14 @@ class BacklogManager:
                 errors.append(f"Status Summary missing epic row '{epic_id}'")
                 continue
             actual = actual_counts[epic_id]
-            for status_key in (STATUS_DONE, STATUS_IN_PROGRESS, STATUS_IN_QUEUE, STATUS_BLOCKED, STATUS_DECLINED):
+            for status_key in (
+                STATUS_DONE,
+                STATUS_IN_PROGRESS,
+                STATUS_IN_QUEUE,
+                STATUS_BLOCKED,
+                STATUS_DECLINED,
+                STATUS_DRAFT,
+            ):
                 if expected[status_key] != actual.get(status_key, -1):
                     errors.append(
                         f"Status Summary mismatch for {epic_id}: "
@@ -1500,11 +1507,11 @@ class BacklogManager:
                 continue
             cells = [c.strip() for c in line.split("|")]
             # Splitting "|" around a pipe-delimited row produces empty flank
-            # cells, so a 6-data-column row yields 8 cells total and a
-            # 7-data-column row (with the new trailing Declined column)
-            # yields 9. Both shapes are accepted for backward compatibility;
-            # legacy rows default Declined to 0 until the backlog is
-            # regenerated.
+            # cells, so a 6-data-column row yields 8 cells total, a
+            # 7-data-column row (with the Declined column) yields 9, and an
+            # 8-data-column row (with both Declined and Draft columns) yields
+            # 10. Both older shapes are accepted for backward compatibility;
+            # missing columns default to 0 until the backlog is regenerated.
             if len(cells) < 7:
                 continue
             row_id = cells[1]
@@ -1512,12 +1519,14 @@ class BacklogManager:
                 continue
             try:
                 declined_count = int(cells[7]) if len(cells) >= 9 else 0
+                draft_count = int(cells[8]) if len(cells) >= 10 else 0
                 result[row_id] = {
                     STATUS_DONE: int(cells[3]),
                     STATUS_IN_PROGRESS: int(cells[4]),
                     STATUS_IN_QUEUE: int(cells[5]),
                     STATUS_BLOCKED: int(cells[6]),
                     STATUS_DECLINED: declined_count,
+                    STATUS_DRAFT: draft_count,
                 }
             except (ValueError, IndexError):
                 continue

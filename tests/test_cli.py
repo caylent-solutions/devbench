@@ -3436,7 +3436,13 @@ class TestCmdStart:
 
         mock_sdk.query = mock_query  # type: ignore[attr-defined]
 
-        with patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}):
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch(
+                "devbench.cli._should_auto_restart_after_no_actionable",
+                return_value=(False, []),
+            ),
+        ):
             result = cli.cmd_start()
 
         assert result == 0
@@ -10933,6 +10939,10 @@ class TestCmdStartUsesShadow:
             patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
             patch("devbench.cli.AGENT_MODELS", AgentModelsConfig(executor="opus")),
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch(
+                "devbench.cli._should_auto_restart_after_no_actionable",
+                return_value=(False, []),
+            ),
         ):
             rc = cli.cmd_start()
 
@@ -10972,8 +10982,232 @@ class TestCmdStartUsesShadow:
             patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
             patch("devbench.cli.AGENT_MODELS", AgentModelsConfig()),  # no overrides
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch(
+                "devbench.cli._should_auto_restart_after_no_actionable",
+                return_value=(False, []),
+            ),
         ):
             rc = cli.cmd_start()
 
         assert rc == 0
         assert not (tmp_path / ".devbench" / "plugin-shadow").exists()
+
+
+class TestCmdStartAutoRestartPostMortem:
+    """Cover the post-mortem path that triggers exit-42 auto-restart.
+
+    Three preconditions must all hold for exit 42:
+    1. >= 1 BLOCKED task classifies as RUNTIME_DEGRADATION.
+    2. Zero IN_PROGRESS / IN_REVIEW tasks.
+    3. Zero OPERATOR_ACTION_REQUIRED blockers.
+    Anything else returns 0.
+    """
+
+    def _mocked_sdk(self) -> object:
+        import types
+
+        mock_sdk = types.ModuleType("claude_agent_sdk")
+        mock_sdk.ClaudeAgentOptions = MagicMock()  # type: ignore[attr-defined]
+
+        async def mock_query(**kwargs: object) -> object:
+            yield "msg"
+
+        mock_sdk.query = mock_query  # type: ignore[attr-defined]
+        return mock_sdk
+
+    def test_returns_42_when_only_blockers_are_runtime_degradation(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        import logging
+        import sys
+
+        mock_sdk = self._mocked_sdk()
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch(
+                "devbench.cli._should_auto_restart_after_no_actionable",
+                return_value=(True, ["E1-F4-S1-T3", "E4-F1-S1-T5"]),
+            ),
+            caplog.at_level(logging.INFO, logger="devbench.cli"),
+        ):
+            rc = cli.cmd_start()
+
+        from devbench.constants import (
+            ORCHESTRATOR_AUTO_RESTART_AUDIT_PREFIX,
+            ORCHESTRATOR_RESTART_EXIT_CODE,
+        )
+
+        assert rc == ORCHESTRATOR_RESTART_EXIT_CODE
+        # The audit prefix + comma-joined task id list must appear in the log.
+        assert any(
+            ORCHESTRATOR_AUTO_RESTART_AUDIT_PREFIX in rec.getMessage() and "E1-F4-S1-T3,E4-F1-S1-T5" in rec.getMessage()
+            for rec in caplog.records
+        )
+
+    def test_returns_0_when_post_mortem_says_no_restart(self) -> None:
+        import sys
+
+        mock_sdk = self._mocked_sdk()
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch(
+                "devbench.cli._should_auto_restart_after_no_actionable",
+                return_value=(False, []),
+            ),
+        ):
+            rc = cli.cmd_start()
+
+        assert rc == 0
+
+
+class TestShouldAutoRestartPostMortem:
+    """Direct unit tests for _should_auto_restart_after_no_actionable's
+    three-precondition logic. We stub BacklogParser.parse_index +
+    classify_blocked_task so the function's decision matrix is exercised
+    in isolation from real backlog state.
+    """
+
+    def _make_unit(self, unit_id: str, status: object) -> object:
+        from types import SimpleNamespace
+
+        return SimpleNamespace(id=unit_id, status=status)
+
+    def test_runtime_degradation_only_returns_true(self) -> None:
+        from devbench.backlog.proposal import BlockedTaskState
+        from devbench.backlog.work_unit import WorkUnitStatus
+
+        units = [
+            self._make_unit("T1", WorkUnitStatus.BLOCKED),
+            self._make_unit("T2", WorkUnitStatus.DONE),
+        ]
+        with (
+            patch("devbench.cli.BacklogParser") as mock_parser,
+            patch("devbench.cli.classify_blocked_task") as mock_classify,
+        ):
+            mock_parser.return_value.parse_index.return_value = units
+            mock_classify.return_value = BlockedTaskState.RUNTIME_DEGRADATION
+
+            should, ids = cli._should_auto_restart_after_no_actionable()
+
+        assert should is True
+        assert ids == ["T1"]
+
+    def test_returns_false_when_in_progress_task_exists(self) -> None:
+        from devbench.backlog.proposal import BlockedTaskState
+        from devbench.backlog.work_unit import WorkUnitStatus
+
+        units = [
+            self._make_unit("T1", WorkUnitStatus.IN_PROGRESS),
+            self._make_unit("T2", WorkUnitStatus.BLOCKED),
+        ]
+        with (
+            patch("devbench.cli.BacklogParser") as mock_parser,
+            patch("devbench.cli.classify_blocked_task") as mock_classify,
+        ):
+            mock_parser.return_value.parse_index.return_value = units
+            mock_classify.return_value = BlockedTaskState.RUNTIME_DEGRADATION
+
+            should, ids = cli._should_auto_restart_after_no_actionable()
+
+        assert should is False
+        assert ids == []
+
+    def test_returns_false_when_in_review_task_exists(self) -> None:
+        from devbench.backlog.proposal import BlockedTaskState
+        from devbench.backlog.work_unit import WorkUnitStatus
+
+        units = [
+            self._make_unit("T1", WorkUnitStatus.IN_REVIEW),
+            self._make_unit("T2", WorkUnitStatus.BLOCKED),
+        ]
+        with (
+            patch("devbench.cli.BacklogParser") as mock_parser,
+            patch("devbench.cli.classify_blocked_task") as mock_classify,
+        ):
+            mock_parser.return_value.parse_index.return_value = units
+            mock_classify.return_value = BlockedTaskState.RUNTIME_DEGRADATION
+
+            should, ids = cli._should_auto_restart_after_no_actionable()
+
+        assert should is False
+        assert ids == []
+
+    def test_returns_false_when_operator_action_required_blocker_exists(self) -> None:
+        from devbench.backlog.proposal import BlockedTaskState
+        from devbench.backlog.work_unit import WorkUnitStatus
+
+        units = [
+            self._make_unit("T1", WorkUnitStatus.BLOCKED),
+            self._make_unit("T2", WorkUnitStatus.BLOCKED),
+        ]
+
+        def classify_side_effect(*, task_id: str, **kwargs: object) -> object:
+            if task_id == "T1":
+                return BlockedTaskState.RUNTIME_DEGRADATION
+            return BlockedTaskState.OPERATOR_ACTION_REQUIRED
+
+        with (
+            patch("devbench.cli.BacklogParser") as mock_parser,
+            patch("devbench.cli.classify_blocked_task", side_effect=classify_side_effect),
+        ):
+            mock_parser.return_value.parse_index.return_value = units
+
+            should, ids = cli._should_auto_restart_after_no_actionable()
+
+        assert should is False
+        assert ids == []
+
+    def test_returns_false_when_no_runtime_degradation_blockers(self) -> None:
+        from devbench.backlog.proposal import BlockedTaskState
+        from devbench.backlog.work_unit import WorkUnitStatus
+
+        units = [self._make_unit("T1", WorkUnitStatus.BLOCKED)]
+        with (
+            patch("devbench.cli.BacklogParser") as mock_parser,
+            patch("devbench.cli.classify_blocked_task") as mock_classify,
+        ):
+            mock_parser.return_value.parse_index.return_value = units
+            mock_classify.return_value = BlockedTaskState.AWAITING_DEPENDENCY
+
+            should, ids = cli._should_auto_restart_after_no_actionable()
+
+        assert should is False
+        assert ids == []
+
+    def test_returns_false_when_backlog_empty(self) -> None:
+        with (
+            patch("devbench.cli.BacklogParser") as mock_parser,
+        ):
+            mock_parser.return_value.parse_index.return_value = []
+
+            should, ids = cli._should_auto_restart_after_no_actionable()
+
+        assert should is False
+        assert ids == []
+
+    def test_non_blocked_units_are_ignored_by_classifier(self) -> None:
+        """Done/declined units never get classified -- the function
+        should only call classify_blocked_task on BLOCKED ones."""
+        from devbench.backlog.proposal import BlockedTaskState
+        from devbench.backlog.work_unit import WorkUnitStatus
+
+        units = [
+            self._make_unit("T1", WorkUnitStatus.DONE),
+            self._make_unit("T2", WorkUnitStatus.BLOCKED),
+            self._make_unit("T3", WorkUnitStatus.DECLINED),
+        ]
+        with (
+            patch("devbench.cli.BacklogParser") as mock_parser,
+            patch("devbench.cli.classify_blocked_task") as mock_classify,
+        ):
+            mock_parser.return_value.parse_index.return_value = units
+            mock_classify.return_value = BlockedTaskState.RUNTIME_DEGRADATION
+
+            should, ids = cli._should_auto_restart_after_no_actionable()
+
+        assert should is True
+        assert ids == ["T2"]
+        # Only the BLOCKED unit got passed to the classifier.
+        assert mock_classify.call_count == 1
+        assert mock_classify.call_args.kwargs["task_id"] == "T2"

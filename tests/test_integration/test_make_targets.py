@@ -76,10 +76,10 @@ class TestStartInteractiveFlag:
 
 @pytest.mark.functional
 class TestStartUnchanged:
-    """AC-FUNC-005."""
+    """AC-FUNC-005 + auto-restart loop guards."""
 
     def test_start_resolves_to_cli_start(self) -> None:
-        """AC-FUNC-005: make -n start resolves to 'uv run python -m devbench.cli start'."""
+        """AC-FUNC-005: make -n start invokes 'uv run python -m devbench.cli start'."""
         output = _make_dry_run("start")
         assert "uv run python -m devbench.cli start" in output, (
             f"Expected 'uv run python -m devbench.cli start' in make -n start output, got:\n{output}"
@@ -87,6 +87,129 @@ class TestStartUnchanged:
         assert "--dangerously-skip-permissions" not in output, (
             f"Expected no '--dangerously-skip-permissions' in 'make -n start', got:\n{output}"
         )
+
+    def test_start_recipe_includes_bounded_auto_restart_loop(self) -> None:
+        """The start target must wrap cli.start in a while-loop bounded by
+        DEVBENCH_MAX_AUTO_RESTARTS (default 3); only exit code 42 triggers
+        a restart, anything else exits with the orchestrator's own rc. Any
+        regression that drops the loop (or makes it unbounded) would
+        re-introduce the bug where a RUNTIME_DEGRADATION-only NO_ACTIONABLE
+        exit silently stops the run."""
+        output = _make_dry_run("start")
+        assert "DEVBENCH_MAX_AUTO_RESTARTS" in output, (
+            f"Expected DEVBENCH_MAX_AUTO_RESTARTS in make -n start output, got:\n{output}"
+        )
+        assert "-ne 42" in output, f"Expected exit-code-42 conditional in make -n start output, got:\n{output}"
+        assert "while" in output, f"Expected restart while-loop in make -n start output, got:\n{output}"
+        assert "auto-restart" in output, f"Expected 'auto-restart' INFO message in make -n start output, got:\n{output}"
+        assert "restart cap" in output, f"Expected 'restart cap' ERROR message in make -n start output, got:\n{output}"
+
+    def test_start_recipe_loop_aborts_on_cap(self, tmp_path: Path) -> None:
+        """Integration: stub `python -m devbench.cli start` to exit 42 every
+        time. With DEVBENCH_MAX_AUTO_RESTARTS=2, the Makefile loop must run
+        the command exactly 2 times, print the cap-exhausted error, and
+        the recipe exits non-zero. GNU make returns 2 on any recipe failure
+        regardless of the recipe's specific exit code, so we assert rc != 0
+        + the cap-exhausted message on stderr to pin the actual behaviour
+        rather than make's wrapping."""
+        # Build a fake shim repo with a Makefile copy + stub python wrapper.
+        shim_repo = tmp_path / "shim_repo"
+        shim_repo.mkdir()
+        # Copy real Makefile so we exercise the actual recipe text.
+        real_makefile = (_REPO_ROOT / "Makefile").read_text(encoding="utf-8")
+        (shim_repo / "Makefile").write_text(real_makefile, encoding="utf-8")
+        # Stub `uv` that increments a counter and always exits 42.
+        counter = shim_repo / "calls.txt"
+        stub_uv = shim_repo / "uv"
+        stub_uv.write_text(
+            f'#!/usr/bin/env bash\necho "call" >> "{counter}"\nexit 42\n',
+            encoding="utf-8",
+        )
+        stub_uv.chmod(0o755)
+        env = {**os.environ, "PATH": f"{shim_repo}:{os.environ['PATH']}", "DEVBENCH_MAX_AUTO_RESTARTS": "2"}
+        result = subprocess.run(
+            ["make", "start"],
+            cwd=shim_repo,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        assert result.returncode != 0, (
+            f"Expected non-zero rc (cap exhausted), got 0.\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        call_count = counter.read_text(encoding="utf-8").count("call") if counter.exists() else 0
+        assert call_count == 2, (
+            f"Expected 2 attempts (cap=2), got {call_count}.\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        assert "restart cap" in result.stderr, f"Expected 'restart cap' error message on stderr, got:\n{result.stderr}"
+
+    def test_start_recipe_loop_succeeds_after_one_restart(self, tmp_path: Path) -> None:
+        """Integration: stub exits 42 once then 0 the next call. The loop
+        should run exactly 2 times and exit with the wrapped command's
+        final rc=0."""
+        shim_repo = tmp_path / "shim_repo"
+        shim_repo.mkdir()
+        real_makefile = (_REPO_ROOT / "Makefile").read_text(encoding="utf-8")
+        (shim_repo / "Makefile").write_text(real_makefile, encoding="utf-8")
+        counter = shim_repo / "calls.txt"
+        stub_uv = shim_repo / "uv"
+        stub_uv.write_text(
+            "#!/usr/bin/env bash\n"
+            f'echo "call" >> "{counter}"\n'
+            f'n=$(wc -l < "{counter}" | tr -d " ")\n'
+            'if [ "$n" -lt 2 ]; then exit 42; fi\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        stub_uv.chmod(0o755)
+        env = {**os.environ, "PATH": f"{shim_repo}:{os.environ['PATH']}", "DEVBENCH_MAX_AUTO_RESTARTS": "5"}
+        result = subprocess.run(
+            ["make", "start"],
+            cwd=shim_repo,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        assert result.returncode == 0, (
+            f"Expected rc=0 after one restart succeeded, got {result.returncode}.\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        call_count = counter.read_text(encoding="utf-8").count("call")
+        assert call_count == 2, (
+            f"Expected 2 attempts (one 42 + one 0), got {call_count}.\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+
+    def test_start_recipe_does_not_restart_on_non_42_exit_code(self, tmp_path: Path) -> None:
+        """Integration: stub exits with rc=7 (any non-42 failure). The loop
+        must NOT restart -- the recipe is invoked exactly once. GNU make
+        wraps the failure as rc=2 regardless of the original code; we
+        pin the no-restart behaviour via the call count."""
+        shim_repo = tmp_path / "shim_repo"
+        shim_repo.mkdir()
+        real_makefile = (_REPO_ROOT / "Makefile").read_text(encoding="utf-8")
+        (shim_repo / "Makefile").write_text(real_makefile, encoding="utf-8")
+        counter = shim_repo / "calls.txt"
+        stub_uv = shim_repo / "uv"
+        stub_uv.write_text(
+            f'#!/usr/bin/env bash\necho "call" >> "{counter}"\nexit 7\n',
+            encoding="utf-8",
+        )
+        stub_uv.chmod(0o755)
+        env = {**os.environ, "PATH": f"{shim_repo}:{os.environ['PATH']}", "DEVBENCH_MAX_AUTO_RESTARTS": "5"}
+        result = subprocess.run(
+            ["make", "start"],
+            cwd=shim_repo,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        assert result.returncode != 0, (
+            f"Expected non-zero rc on stub failure, got 0.\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        call_count = counter.read_text(encoding="utf-8").count("call")
+        assert call_count == 1, f"Expected exactly 1 attempt (no restart on non-42), got {call_count}"
+        assert "auto-restart" not in result.stderr, f"Loop must NOT restart on non-42 exit. stderr:\n{result.stderr}"
 
 
 @pytest.mark.functional

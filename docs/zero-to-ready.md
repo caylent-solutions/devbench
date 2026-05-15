@@ -459,6 +459,25 @@ entry, audit comment lands as a commit-worthy diff), you see exactly what the
 orchestrator is doing. Interactive mode adds almost nothing beyond this except the
 ability to type instructions mid-run -- which is the one thing we recommend against.
 
+### What `make start` does on its own (auto-restart on SDK degradation)
+
+`make start` wraps `uv run python -m devbench.cli start` in a bounded while-loop.
+Whenever the orchestrator exits with code `42`, the loop re-launches it -- up to
+`DEVBENCH_MAX_AUTO_RESTARTS` attempts (default 3, override via env var). Any other
+exit code passes through unchanged and the loop stops.
+
+`cmd_start` returns `42` only when the SDK subprocess exited cleanly via
+`NO_ACTIONABLE` AND the post-mortem inspection finds: at least one BLOCKED task
+classified as `BlockedTaskState.RUNTIME_DEGRADATION` (the Claude Agent SDK lost
+Agent-tool access mid-session), zero `IN_PROGRESS` / `IN_REVIEW` tasks, and zero
+`OPERATOR_ACTION_REQUIRED` blockers. A fresh SDK subprocess typically clears the
+degradation, so the loop will pick the same tasks back up on the next attempt.
+If the cap is exhausted, the Makefile fails with rc=1 + a clear error so an
+operator can investigate the persistent SDK-side issue. The audit lines
+(`[ORCHESTRATOR_AUTO_RESTART] reason=runtime_degradation tasks=<ids>` and
+`INFO: orchestrator auto-restart (attempt N/max)`) live in
+`logs/orchestrator.log` and on stderr respectively.
+
 ### If you need to change something while the run is in flight
 
 Stop the orchestrator (Ctrl+C on the `make start` process), then **manage the change

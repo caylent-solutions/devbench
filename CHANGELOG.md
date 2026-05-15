@@ -12,6 +12,35 @@ since the last release. PR #119 carries every change.
 
 ### Added
 
+- **`make start` auto-restarts on SDK `RUNTIME_DEGRADATION`-only
+  `NO_ACTIONABLE` exits** (issue #183 follow-up; pairs with the renderer +
+  ETA fixes below). The orchestrate skill exits cleanly on `NO_ACTIONABLE`
+  whenever no actionable work remains, and previously the Makefile's
+  `start` target ran `uv run python -m devbench.cli start` exactly once --
+  so a session ending purely because every remaining blocker classifies as
+  `BlockedTaskState.RUNTIME_DEGRADATION` (the SDK subprocess lost
+  Agent-tool access mid-session, recoverable by a fresh subprocess) would
+  stop the orchestrator until an operator noticed and re-ran `make start`.
+  `cmd_start` now inspects the backlog post-mortem after `asyncio.run`
+  returns: when there is at least one `RUNTIME_DEGRADATION` blocker AND
+  zero `IN_PROGRESS` / `IN_REVIEW` tasks AND zero
+  `OPERATOR_ACTION_REQUIRED` blockers, it writes one
+  `[ORCHESTRATOR_AUTO_RESTART] reason=runtime_degradation tasks=<ids>`
+  audit line to `logs/orchestrator.log` and returns the new
+  `ORCHESTRATOR_RESTART_EXIT_CODE` (42). The `start` target wraps the CLI
+  call in a bounded while-loop: exit code 42 triggers a restart (printing
+  `INFO: orchestrator auto-restart (attempt N/max)` to stderr), any other
+  code is passed through unchanged, and the cap defaults to
+  `DEVBENCH_MAX_AUTO_RESTARTS=3` (override via env). After the cap, the
+  Makefile fails fast with rc=1 and an `ERROR: orchestrator hit
+  RUNTIME_DEGRADATION restart cap` message naming the SDK subprocess
+  Agent-tool loss as the thing to investigate. Pinned by
+  `tests/test_cli.py::TestCmdStartAutoRestartPostMortem`,
+  `TestShouldAutoRestartPostMortem` (7 cases covering each precondition),
+  and the new `tests/test_integration/test_make_targets.py` Makefile-loop
+  integration tests (cap-exhaustion, restart-then-succeed, non-42
+  pass-through).
+
 - **Per-agent model overrides via `agents:` block in `devbench.yaml`** (ADR-25).
   Each of the ten work agents (executor, blocker-resolver, manifest-amender,
   security-reviewer, task-factory, review-supervisor, plus the four

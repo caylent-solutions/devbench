@@ -115,9 +115,21 @@ clean:
 	find . -type d -name .ruff_cache -exec rm -rf {} + 2>/dev/null || true
 	find . -type d -name .mypy_cache -exec rm -rf {} + 2>/dev/null || true
 
-## start: Run orchestrate skill non-interactively via Claude Agent SDK
+## start: Run orchestrate skill non-interactively via Claude Agent SDK.
+## Auto-restarts on exit code 42 (RUNTIME_DEGRADATION-only NO_ACTIONABLE)
+## up to DEVBENCH_MAX_AUTO_RESTARTS attempts (default 3); fails fast after.
 start:
-	uv run python -m devbench.cli start
+	@attempt=1; max=$${DEVBENCH_MAX_AUTO_RESTARTS:-3}; \
+	while :; do \
+	  rc=0; uv run python -m devbench.cli start || rc=$$?; \
+	  if [ "$$rc" -ne 42 ]; then exit "$$rc"; fi; \
+	  if [ "$$attempt" -ge "$$max" ]; then \
+	    echo "ERROR: orchestrator hit RUNTIME_DEGRADATION restart cap ($$max). Investigate the SDK subprocess Agent-tool loss before re-running." >&2; \
+	    exit 1; \
+	  fi; \
+	  attempt=$$((attempt + 1)); \
+	  echo "INFO: orchestrator auto-restart (attempt $$attempt/$$max) after RUNTIME_DEGRADATION exit." >&2; \
+	done
 
 ## start-interactive: Launch interactive Claude session with devbench plugin loaded
 ifeq ($(JUDGE_SAFE_PERMISSIONS),1)

@@ -161,6 +161,8 @@ from devbench.constants import (
     FINALIZE_COMMIT_TEMPLATE,
     FINALIZE_PR_TITLE_TEMPLATE,
     KNOWN_JUDGE_NAMES,
+    ORCHESTRATOR_AUTO_RESTART_AUDIT_PREFIX,
+    ORCHESTRATOR_RESTART_EXIT_CODE,
     STATUS_BLOCKED,
     STATUS_DONE,
     STATUS_IN_PROGRESS,
@@ -4337,6 +4339,50 @@ def _resolve_plugin_path() -> Path:
     return shadow if shadow is not None else canonical
 
 
+def _should_auto_restart_after_no_actionable() -> tuple[bool, list[str]]:
+    """Post-mortem inspection: should the wrapping launcher auto-restart?
+
+    Returns ``(True, [<task_id>, ...])`` when **all three** preconditions hold:
+
+    1. At least one BLOCKED task currently classifies as
+       :class:`~devbench.backlog.proposal.BlockedTaskState.RUNTIME_DEGRADATION`
+       (the SDK subprocess lost Agent-tool access mid-session, recoverable
+       by a fresh subprocess).
+    2. Zero tasks are :class:`WorkUnitStatus.IN_PROGRESS` or
+       :class:`WorkUnitStatus.IN_REVIEW` (the orchestrator is not mid-claim;
+       a restart will not interrupt active work).
+    3. Zero BLOCKED tasks classify as
+       :class:`~devbench.backlog.proposal.BlockedTaskState.OPERATOR_ACTION_REQUIRED`
+       (no genuine human-attention block is also pending; restarting would
+       not unblock those anyway, so we defer to the operator).
+
+    Returns ``(False, [])`` otherwise. Inspected post-mortem after the SDK
+    subprocess has exited so the function never blocks the running
+    orchestrator.
+    """
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    if any(u.status in (WorkUnitStatus.IN_PROGRESS, WorkUnitStatus.IN_REVIEW) for u in units):
+        return False, []
+    runtime_degraded: list[str] = []
+    for unit in units:
+        if unit.status is not WorkUnitStatus.BLOCKED:
+            continue
+        state = classify_blocked_task(
+            backlog_root=BACKLOG_ROOT,
+            backlog_index=BACKLOG_INDEX,
+            task_id=unit.id,
+            workspace_root=WORKSPACE_ROOT,
+        )
+        if state is BlockedTaskState.OPERATOR_ACTION_REQUIRED:
+            return False, []
+        if state is BlockedTaskState.RUNTIME_DEGRADATION:
+            runtime_degraded.append(unit.id)
+    if not runtime_degraded:
+        return False, []
+    return True, runtime_degraded
+
+
 def cmd_start() -> int:
     """Run the devbench orchestrate skill non-interactively via the Claude Agent SDK.
 
@@ -4348,6 +4394,15 @@ def cmd_start() -> int:
     ``JUDGE_AGENT_MODEL_*`` env vars), a workspace-local shadow plugin tree
     is materialised at ``<workspace>/.devbench/plugin-shadow/devbench/`` and
     passed to the SDK in place of the canonical plugin (ADR-25).
+
+    On clean SDK return, inspects the backlog post-mortem: when the only
+    reason the orchestrator stopped is one or more
+    ``BlockedTaskState.RUNTIME_DEGRADATION`` tasks (SDK lost Agent-tool
+    access mid-session) and no IN_PROGRESS / IN_REVIEW / OPERATOR_ACTION_REQUIRED
+    work is pending, writes an audit line to the orchestrator log and
+    returns :data:`ORCHESTRATOR_RESTART_EXIT_CODE` (42). The wrapping
+    ``make start`` loop interprets that code as "auto-restart" up to its
+    ``DEVBENCH_MAX_AUTO_RESTARTS`` cap. Any other exit returns 0.
 
     Equivalent to running ``claude --plugin-dir <plugin>`` and invoking
     the orchestrate skill interactively, but suitable for CI/unattended runs.
@@ -4379,6 +4434,11 @@ def cmd_start() -> int:
             logger.info("sdk message: %s", message)
 
     asyncio.run(_run())
+
+    should_restart, degraded_ids = _should_auto_restart_after_no_actionable()
+    if should_restart:
+        logger.info("%s%s", ORCHESTRATOR_AUTO_RESTART_AUDIT_PREFIX, ",".join(degraded_ids))
+        return ORCHESTRATOR_RESTART_EXIT_CODE
     return 0
 
 

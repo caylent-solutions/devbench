@@ -435,6 +435,24 @@ DEFAULT_PLUGIN_SUBPATH: str = "plugin/devbench"
 # ---------------------------------------------------------------------------
 SUBPROCESS_ERROR_EXIT_CODE: int = 127
 
+# Exit code emitted by ``cmd_start`` when the orchestrator's SDK subprocess
+# exited via ``NO_ACTIONABLE`` purely because every remaining blocker
+# classifies as ``BlockedTaskState.RUNTIME_DEGRADATION`` (the SDK lost
+# Agent-tool access mid-session, recoverable by a fresh subprocess) and
+# there are zero IN_PROGRESS / IN_REVIEW tasks and zero
+# OPERATOR_ACTION_REQUIRED blockers. The wrapping ``make start`` loop
+# treats this code as "auto-restart" up to ``DEVBENCH_MAX_AUTO_RESTARTS``
+# times. Any other exit (0 = clean, anything-else = real failure) is
+# passed through unchanged.
+ORCHESTRATOR_RESTART_EXIT_CODE: int = 42
+
+# Audit-log template written to ``logs/orchestrator.log`` when
+# ``cmd_start`` triggers an auto-restart. The token + task-id list let
+# operators grep history for restart frequency without parsing
+# free-form prose. Format: ``[ORCHESTRATOR_AUTO_RESTART]
+# reason=runtime_degradation tasks=<id1,id2,...>``.
+ORCHESTRATOR_AUTO_RESTART_AUDIT_PREFIX: str = "[ORCHESTRATOR_AUTO_RESTART] reason=runtime_degradation tasks="
+
 # ---------------------------------------------------------------------------
 # Token arithmetic
 # ---------------------------------------------------------------------------

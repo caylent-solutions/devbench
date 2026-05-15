@@ -504,3 +504,18 @@ PERCENT_MULTIPLIER: int = 100
 # by "|" produces 9 cells (empty leading cell + 7 data + empty trailing cell).
 # ---------------------------------------------------------------------------
 BACKLOG_INDEX_CELL_COUNT: int = 9
+
+# ---------------------------------------------------------------------------
+# Recovery-probe constants (quota wait-and-resume, spec 4.5.1)
+# Used by devbench.quota.recovery_probe to send a minimal 1-token Anthropic
+# API completion request to test whether quota has been restored.
+# ---------------------------------------------------------------------------
+# Cheapest / fastest Anthropic model suitable for a minimal quota probe.
+RECOVERY_PROBE_MODEL: str = "claude-3-haiku-20240307"
+# Timeout for the probe HTTP request in seconds (spec 4.5.1: timeout_seconds=10).
+RECOVERY_PROBE_DEFAULT_TIMEOUT_SECONDS: float = 10.0
+# Maximum tokens requested in the probe completion (spec 4.5.1: request_size_tokens=1).
+RECOVERY_PROBE_DEFAULT_REQUEST_SIZE_TOKENS: int = 1
+# Minimal message content for the probe; chosen to produce the shortest valid
+# completion (single character elicits a 1-token response on all Claude models).
+RECOVERY_PROBE_MESSAGE_CONTENT: str = "1"

@@ -32,6 +32,10 @@ Public API:
 - :func:`wait_for_reset` -- async function that sleeps until ``reset_at``,
   then polls ``probe_fn`` with exponential backoff until recovery or
   ``max_wait`` is exceeded.
+- :func:`recovery_probe` -- sends a minimal 1-token Anthropic API completion
+  request to test whether quota has been restored.  Returns ``True`` on
+  success, ``False`` when the response signals continued quota exhaustion, and
+  propagates all other exceptions unchanged.
 
 Raises:
     None -- this module only defines exception classes and pure-function
@@ -47,6 +51,16 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from typing import Any
+
+import anthropic
+
+from devbench.config import get_anthropic_api_key
+from devbench.constants import (
+    RECOVERY_PROBE_DEFAULT_REQUEST_SIZE_TOKENS,
+    RECOVERY_PROBE_DEFAULT_TIMEOUT_SECONDS,
+    RECOVERY_PROBE_MESSAGE_CONTENT,
+    RECOVERY_PROBE_MODEL,
+)
 
 # ---------------------------------------------------------------------------
 # Protocol constants -- HTTP status codes and header/error-code identifiers
@@ -523,6 +537,81 @@ async def wait_for_reset(
         elapsed += delay
         # Advance the un-jittered interval for the next iteration (capped at max).
         current_interval = min(current_interval * cfg.multiplier, cfg.max_seconds)
+
+
+# ---------------------------------------------------------------------------
+# recovery_probe -- minimal 1-token API probe for quota recovery detection
+# ---------------------------------------------------------------------------
+
+
+def recovery_probe(
+    timeout_seconds: float = RECOVERY_PROBE_DEFAULT_TIMEOUT_SECONDS,
+    request_size_tokens: int = RECOVERY_PROBE_DEFAULT_REQUEST_SIZE_TOKENS,
+) -> bool:
+    """Send a minimal Anthropic API completion request to test quota recovery.
+
+    Constructs an :class:`anthropic.Anthropic` client using the API key
+    returned by :func:`~devbench.config.get_anthropic_api_key`, then issues
+    a ``messages.create`` call requesting at most *request_size_tokens* output
+    tokens.  This is designed to be the cheapest possible probe that exercises
+    the real API path.
+
+    Return value:
+
+    - ``True``  -- the request completed without any quota signal; quota has
+      recovered and normal operations can resume.
+    - ``False`` -- the API raised (or the response contained) a quota signal
+      that :func:`detect_quota_error` classifies as a
+      :class:`QuotaExhaustedError` subclass; quota is still exhausted.
+
+    All other exceptions (network errors, authentication failures,
+    :exc:`RuntimeError` from missing credentials, etc.) propagate unchanged to
+    the caller.  The caller is responsible for deciding whether to retry or
+    surface the error.
+
+    Args:
+        timeout_seconds: Timeout in seconds for the Anthropic API call.  The
+            value is passed directly as the timeout argument to the
+            :class:`anthropic.Anthropic` client constructor.  Defaults to
+            ``RECOVERY_PROBE_DEFAULT_TIMEOUT_SECONDS`` (10 seconds) from
+            :mod:`devbench.constants`.
+        request_size_tokens: Maximum number of tokens to request in the
+            completion response.  A value of 1 produces the shortest (cheapest)
+            valid response.  Defaults to
+            ``RECOVERY_PROBE_DEFAULT_REQUEST_SIZE_TOKENS`` (1 token) from
+            :mod:`devbench.constants`.
+
+    Returns:
+        ``True`` when the probe call succeeds (quota recovered).
+        ``False`` when the API signals continued quota exhaustion.
+
+    Raises:
+        RuntimeError: When :func:`~devbench.config.get_anthropic_api_key`
+            cannot obtain a valid API key (missing or unreadable credentials
+            file, or missing access token).
+        ConnectionError: When the Anthropic API is unreachable due to a
+            network error.
+        TimeoutError: When the API call exceeds *timeout_seconds*.
+        Exception: Any other exception raised by the Anthropic SDK propagates
+            unchanged -- caller decides how to handle it.
+    """
+    api_key = get_anthropic_api_key()
+    client = anthropic.Anthropic(
+        api_key=api_key,
+        timeout=timeout_seconds,
+    )
+    try:
+        client.messages.create(
+            model=RECOVERY_PROBE_MODEL,
+            max_tokens=request_size_tokens,
+            messages=[{"role": "user", "content": RECOVERY_PROBE_MESSAGE_CONTENT}],
+        )
+    except Exception as exc:
+        quota_error = detect_quota_error(exc)
+        if quota_error is not None:
+            return False
+        raise
+    return True
 
 
 # ---------------------------------------------------------------------------

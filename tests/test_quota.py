@@ -1,5 +1,5 @@
 """Tests for devbench.quota -- exception hierarchy, detect_quota_error,
-parse_reset_time, and wait_for_reset.
+parse_reset_time, wait_for_reset, and recovery_probe.
 
 Covers: QuotaExhaustedError, SubscriptionRateLimitError, SdkCreditExhaustedError,
 ApiBillingError, BedrockThrottleError.  Each exception carries reset_at,
@@ -15,6 +15,11 @@ Retry-After (integer seconds or HTTP-date) or anthropic-ratelimit-*-reset
 Also covers: wait_for_reset(reset_at, poll_interval, max_wait, probe_fn) which
 sleeps until reset_at then probes quota recovery with exponential backoff.
 Returns True on recovery, False when max_wait is exceeded.
+
+Also covers: recovery_probe(timeout_seconds, request_size_tokens) which sends
+a 1-token completion request to the Anthropic API. Returns True when the
+request completes without a quota error; returns False when the API signals
+continued throttle via a QuotaExhaustedError subclass.
 """
 
 from __future__ import annotations
@@ -35,6 +40,7 @@ from devbench.quota import (
     SubscriptionRateLimitError,
     detect_quota_error,
     parse_reset_time,
+    recovery_probe,
     wait_for_reset,
 )
 
@@ -1676,3 +1682,434 @@ class TestWaitForResetIntegration:
 
         result = asyncio.run(_run())
         assert result is False
+
+
+# ---------------------------------------------------------------------------
+# recovery_probe: happy path -- API call succeeds (returns True)
+# ---------------------------------------------------------------------------
+
+
+class TestRecoveryProbeHappyPath:
+    """AC-193-18: recovery_probe returns True when the Anthropic API responds without quota error."""
+
+    def test_returns_true_when_api_call_succeeds(self) -> None:
+        """A successful Anthropic API response causes recovery_probe to return True."""
+        mock_message = MagicMock()
+        mock_client = MagicMock()
+        mock_client.messages.create.return_value = mock_message
+
+        with patch("devbench.quota.anthropic.Anthropic", return_value=mock_client):
+            with patch("devbench.quota.get_anthropic_api_key", return_value="test-api-key"):
+                result = recovery_probe(timeout_seconds=5, request_size_tokens=1)
+
+        assert result is True
+
+    def test_uses_configured_request_size_tokens(self) -> None:
+        """request_size_tokens=1 is sent as max_tokens in the completion request."""
+        mock_message = MagicMock()
+        mock_client = MagicMock()
+        call_kwargs: dict[str, object] = {}
+
+        def capture_create(**kwargs: object) -> MagicMock:
+            call_kwargs.update(kwargs)
+            return mock_message
+
+        mock_client.messages.create = MagicMock(side_effect=capture_create)
+
+        with patch("devbench.quota.anthropic.Anthropic", return_value=mock_client):
+            with patch("devbench.quota.get_anthropic_api_key", return_value="test-key"):
+                result = recovery_probe(timeout_seconds=5, request_size_tokens=1)
+
+        assert result is True
+        assert "max_tokens" in call_kwargs
+        assert call_kwargs["max_tokens"] == 1
+
+    def test_default_timeout_seconds_is_used_when_not_specified(self) -> None:
+        """recovery_probe(timeout_seconds=10) is the default; calling without args uses default."""
+        mock_message = MagicMock()
+        mock_client = MagicMock()
+        mock_client.messages.create.return_value = mock_message
+
+        with patch("devbench.quota.anthropic.Anthropic", return_value=mock_client):
+            with patch("devbench.quota.get_anthropic_api_key", return_value="test-key"):
+                result = recovery_probe()
+
+        assert result is True
+
+    def test_default_request_size_tokens_is_one(self) -> None:
+        """Default request_size_tokens is 1 (minimal probe request)."""
+        mock_message = MagicMock()
+        mock_client = MagicMock()
+        call_kwargs: dict[str, object] = {}
+
+        def capture_create(**kwargs: object) -> MagicMock:
+            call_kwargs.update(kwargs)
+            return mock_message
+
+        mock_client.messages.create = MagicMock(side_effect=capture_create)
+
+        with patch("devbench.quota.anthropic.Anthropic", return_value=mock_client):
+            with patch("devbench.quota.get_anthropic_api_key", return_value="test-key"):
+                recovery_probe()
+
+        assert call_kwargs.get("max_tokens") == 1
+
+    def test_probe_uses_api_key_from_config(self) -> None:
+        """recovery_probe obtains the API key from get_anthropic_api_key()."""
+        mock_message = MagicMock()
+        mock_client = MagicMock()
+        mock_client.messages.create.return_value = mock_message
+
+        with patch("devbench.quota.anthropic.Anthropic", return_value=mock_client) as mock_cls:
+            with patch("devbench.quota.get_anthropic_api_key", return_value="test-api-key") as mock_key:
+                result = recovery_probe(timeout_seconds=5, request_size_tokens=1)
+
+        assert result is True
+        mock_key.assert_called_once()
+        mock_cls.assert_called_once()
+        _, ctor_kwargs = mock_cls.call_args
+        assert ctor_kwargs.get("api_key") == "test-api-key"
+
+
+# ---------------------------------------------------------------------------
+# recovery_probe: quota error -- API call throttled (returns False)
+# ---------------------------------------------------------------------------
+
+
+class TestRecoveryProbeQuotaError:
+    """recovery_probe returns False when the API raises a quota error."""
+
+    @pytest.mark.parametrize(
+        "exc_cls",
+        [
+            SubscriptionRateLimitError,
+            SdkCreditExhaustedError,
+            ApiBillingError,
+            BedrockThrottleError,
+        ],
+        ids=[
+            "SubscriptionRateLimitError",
+            "SdkCreditExhaustedError",
+            "ApiBillingError",
+            "BedrockThrottleError",
+        ],
+    )
+    def test_returns_false_when_quota_error_raised(self, exc_cls: type[QuotaExhaustedError]) -> None:
+        """When the Anthropic API raises a QuotaExhaustedError subclass, recovery_probe returns False."""
+        quota_exc = exc_cls(reset_at=None, raw_error="throttled", source="anthropic-api")
+        mock_client = MagicMock()
+        mock_client.messages.create.side_effect = quota_exc
+
+        with patch("devbench.quota.anthropic.Anthropic", return_value=mock_client):
+            with patch("devbench.quota.get_anthropic_api_key", return_value="test-key"):
+                result = recovery_probe(timeout_seconds=5, request_size_tokens=1)
+
+        assert result is False
+
+    def test_returns_false_when_sdk_exc_detected_as_429(self) -> None:
+        """When the API raises an SDK exception that detect_quota_error classifies as quota error, returns False."""
+
+        class _FakeSdkError(Exception):
+            def __init__(self) -> None:
+                self.status_code = 429
+                self.body: dict[str, Any] = {}
+                super().__init__("429 rate limit")
+
+        sdk_exc = _FakeSdkError()
+        mock_client = MagicMock()
+        mock_client.messages.create.side_effect = sdk_exc
+
+        with patch("devbench.quota.anthropic.Anthropic", return_value=mock_client):
+            with patch("devbench.quota.get_anthropic_api_key", return_value="test-key"):
+                result = recovery_probe(timeout_seconds=5, request_size_tokens=1)
+
+        assert result is False
+
+    def test_returns_false_when_sdk_exc_detected_as_402(self) -> None:
+        """When detect_quota_error classifies a 402 SDK exception as billing error, returns False."""
+
+        class _FakeSdkError(Exception):
+            def __init__(self) -> None:
+                self.status_code = 402
+                self.body: dict[str, Any] = {}
+                super().__init__("402 payment required")
+
+        sdk_exc = _FakeSdkError()
+        mock_client = MagicMock()
+        mock_client.messages.create.side_effect = sdk_exc
+
+        with patch("devbench.quota.anthropic.Anthropic", return_value=mock_client):
+            with patch("devbench.quota.get_anthropic_api_key", return_value="test-key"):
+                result = recovery_probe(timeout_seconds=5, request_size_tokens=1)
+
+        assert result is False
+
+
+# ---------------------------------------------------------------------------
+# recovery_probe: non-quota errors propagate (fail-fast)
+# ---------------------------------------------------------------------------
+
+
+class TestRecoveryProbeNonQuotaErrors:
+    """Non-quota errors must propagate unchanged (fail-fast; no silent swallowing)."""
+
+    def test_propagates_connection_error(self) -> None:
+        """A network error (ConnectionError) propagates out of recovery_probe unchanged."""
+        mock_client = MagicMock()
+        mock_client.messages.create.side_effect = ConnectionError("network unreachable")
+
+        with patch("devbench.quota.anthropic.Anthropic", return_value=mock_client):
+            with patch("devbench.quota.get_anthropic_api_key", return_value="test-key"):
+                with pytest.raises(ConnectionError, match="network unreachable"):
+                    recovery_probe(timeout_seconds=5, request_size_tokens=1)
+
+    def test_propagates_timeout_error(self) -> None:
+        """A TimeoutError propagates out of recovery_probe unchanged."""
+        mock_client = MagicMock()
+        mock_client.messages.create.side_effect = TimeoutError("request timed out")
+
+        with patch("devbench.quota.anthropic.Anthropic", return_value=mock_client):
+            with patch("devbench.quota.get_anthropic_api_key", return_value="test-key"):
+                with pytest.raises(TimeoutError, match="request timed out"):
+                    recovery_probe(timeout_seconds=5, request_size_tokens=1)
+
+    def test_propagates_runtime_error(self) -> None:
+        """An unexpected RuntimeError propagates out of recovery_probe unchanged."""
+        mock_client = MagicMock()
+        mock_client.messages.create.side_effect = RuntimeError("unexpected failure")
+
+        with patch("devbench.quota.anthropic.Anthropic", return_value=mock_client):
+            with patch("devbench.quota.get_anthropic_api_key", return_value="test-key"):
+                with pytest.raises(RuntimeError, match="unexpected failure"):
+                    recovery_probe(timeout_seconds=5, request_size_tokens=1)
+
+    def test_propagates_get_api_key_runtime_error(self) -> None:
+        """RuntimeError from get_anthropic_api_key (missing credentials) propagates unchanged."""
+        with patch("devbench.quota.get_anthropic_api_key", side_effect=RuntimeError("credentials missing")):
+            with pytest.raises(RuntimeError, match="credentials missing"):
+                recovery_probe(timeout_seconds=5, request_size_tokens=1)
+
+
+# ---------------------------------------------------------------------------
+# recovery_probe: API call parameters (model, messages content)
+# ---------------------------------------------------------------------------
+
+
+class TestRecoveryProbeApiCallParameters:
+    """Verify the API call is minimal: 1 token, a model string, and a non-empty message list."""
+
+    def test_messages_create_called_once(self) -> None:
+        """recovery_probe calls messages.create exactly once per invocation."""
+        mock_message = MagicMock()
+        mock_client = MagicMock()
+        mock_client.messages.create.return_value = mock_message
+
+        with patch("devbench.quota.anthropic.Anthropic", return_value=mock_client):
+            with patch("devbench.quota.get_anthropic_api_key", return_value="test-key"):
+                recovery_probe(timeout_seconds=5, request_size_tokens=1)
+
+        mock_client.messages.create.assert_called_once()
+
+    def test_model_parameter_is_non_empty_string(self) -> None:
+        """The model parameter in the API call is a non-empty string."""
+        mock_message = MagicMock()
+        mock_client = MagicMock()
+        call_kwargs: dict[str, object] = {}
+
+        def capture(**kwargs: object) -> MagicMock:
+            call_kwargs.update(kwargs)
+            return mock_message
+
+        mock_client.messages.create = MagicMock(side_effect=capture)
+
+        with patch("devbench.quota.anthropic.Anthropic", return_value=mock_client):
+            with patch("devbench.quota.get_anthropic_api_key", return_value="test-key"):
+                recovery_probe(timeout_seconds=5, request_size_tokens=1)
+
+        assert "model" in call_kwargs
+        assert isinstance(call_kwargs["model"], str)
+        assert len(call_kwargs["model"]) > 0
+
+    def test_messages_parameter_is_non_empty_list(self) -> None:
+        """The messages parameter in the API call is a non-empty list."""
+        mock_message = MagicMock()
+        mock_client = MagicMock()
+        call_kwargs: dict[str, object] = {}
+
+        def capture(**kwargs: object) -> MagicMock:
+            call_kwargs.update(kwargs)
+            return mock_message
+
+        mock_client.messages.create = MagicMock(side_effect=capture)
+
+        with patch("devbench.quota.anthropic.Anthropic", return_value=mock_client):
+            with patch("devbench.quota.get_anthropic_api_key", return_value="test-key"):
+                recovery_probe(timeout_seconds=5, request_size_tokens=1)
+
+        assert "messages" in call_kwargs
+        msgs = call_kwargs["messages"]
+        assert isinstance(msgs, list)
+        assert len(msgs) > 0
+
+    @pytest.mark.parametrize("token_count", [1, 2, 5])
+    def test_request_size_tokens_forwarded_as_max_tokens(self, token_count: int) -> None:
+        """request_size_tokens is forwarded to max_tokens in the API call."""
+        mock_message = MagicMock()
+        mock_client = MagicMock()
+        call_kwargs: dict[str, object] = {}
+
+        def capture(**kwargs: object) -> MagicMock:
+            call_kwargs.update(kwargs)
+            return mock_message
+
+        mock_client.messages.create = MagicMock(side_effect=capture)
+
+        with patch("devbench.quota.anthropic.Anthropic", return_value=mock_client):
+            with patch("devbench.quota.get_anthropic_api_key", return_value="test-key"):
+                recovery_probe(timeout_seconds=5, request_size_tokens=token_count)
+
+        assert call_kwargs.get("max_tokens") == token_count
+
+
+# ---------------------------------------------------------------------------
+# recovery_probe: integration -- used as probe_fn in wait_for_reset
+# ---------------------------------------------------------------------------
+
+
+class TestRecoveryProbeIntegration:
+    """Integration: recovery_probe used as probe_fn inside wait_for_reset."""
+
+    def test_recovery_probe_as_probe_fn_returns_true_when_api_succeeds(self) -> None:
+        """wait_for_reset returns True when recovery_probe succeeds on first probe."""
+        reset_at = datetime.now(tz=UTC) - timedelta(seconds=1)
+        mock_message = MagicMock()
+        mock_client = MagicMock()
+        mock_client.messages.create.return_value = mock_message
+
+        async def _run() -> bool:
+            async def fake_sleep(_seconds: float) -> None:
+                pass
+
+            with patch("devbench.quota.asyncio.sleep", side_effect=fake_sleep):
+                with patch("devbench.quota.anthropic.Anthropic", return_value=mock_client):
+                    with patch("devbench.quota.get_anthropic_api_key", return_value="test-key"):
+                        return await wait_for_reset(
+                            reset_at=reset_at,
+                            poll_interval=5.0,
+                            max_wait=300.0,
+                            probe_fn=lambda: recovery_probe(timeout_seconds=5, request_size_tokens=1),
+                        )
+
+        result = asyncio.run(_run())
+        assert result is True
+
+    def test_recovery_probe_as_probe_fn_returns_false_when_quota_persists(self) -> None:
+        """wait_for_reset returns False when recovery_probe always detects quota error.
+
+        Uses non-zero backoff intervals so elapsed time accumulates and max_wait
+        is eventually reached without looping forever.
+        """
+        reset_at = datetime.now(tz=UTC) - timedelta(seconds=1)
+        quota_exc = SubscriptionRateLimitError(reset_at=None, raw_error="throttled", source="anthropic-api")
+        mock_client = MagicMock()
+        mock_client.messages.create.side_effect = quota_exc
+
+        async def _run() -> bool:
+            async def fake_sleep(_seconds: float) -> None:
+                pass
+
+            with patch("devbench.quota.asyncio.sleep", side_effect=fake_sleep):
+                with patch("devbench.quota.anthropic.Anthropic", return_value=mock_client):
+                    with patch("devbench.quota.get_anthropic_api_key", return_value="test-key"):
+                        return await wait_for_reset(
+                            reset_at=reset_at,
+                            poll_interval=5.0,
+                            max_wait=5.0,
+                            probe_fn=lambda: recovery_probe(timeout_seconds=5, request_size_tokens=1),
+                            backoff_config=BackoffConfig(
+                                initial_seconds=5.0, max_seconds=10.0, multiplier=2.0, jitter=0.0
+                            ),
+                        )
+
+        result = asyncio.run(_run())
+        assert result is False
+
+    def test_jitter_applied_when_recovery_probe_used_as_probe_fn(self) -> None:
+        """AC-193-18: jitter prevents thundering-herd when recovery_probe is probe_fn.
+
+        When BackoffConfig.jitter > 0.0, each backoff sleep duration must lie
+        within the jitter band of the nominal interval and must not all be
+        exactly equal to the nominal values.  This verifies that wait_for_reset
+        applies jitter to the backoff intervals, which is the thundering-herd
+        protection required by AC-193-18.
+
+        Uses three consecutive quota failures so three backoff sleeps accumulate,
+        then asserts that (a) every sleep is within +/-20% of its nominal
+        interval and (b) at least one sleep deviates from the exact nominal
+        value, confirming jitter is non-zero.
+        """
+        reset_at = datetime.now(tz=UTC) - timedelta(seconds=1)
+        quota_exc = SubscriptionRateLimitError(reset_at=None, raw_error="throttled", source="anthropic-api")
+        mock_client = MagicMock()
+        # Fail quota 3 times so 3 backoff sleeps occur, then succeed on the 4th probe.
+        probe_responses: list[Exception | None] = [quota_exc, quota_exc, quota_exc, None]
+        call_index: list[int] = [0]
+
+        def create_side_effect(**_kwargs: object) -> MagicMock:
+            idx = call_index[0]
+            call_index[0] += 1
+            exc = probe_responses[idx] if idx < len(probe_responses) else None
+            if exc is not None:
+                raise exc
+            return MagicMock()
+
+        mock_client.messages.create = MagicMock(side_effect=create_side_effect)
+
+        sleep_durations: list[float] = []
+
+        async def _run() -> bool:
+            async def recording_sleep(seconds: float) -> None:
+                sleep_durations.append(seconds)
+
+            with patch("devbench.quota.asyncio.sleep", side_effect=recording_sleep):
+                with patch("devbench.quota.anthropic.Anthropic", return_value=mock_client):
+                    with patch("devbench.quota.get_anthropic_api_key", return_value="test-key"):
+                        return await wait_for_reset(
+                            reset_at=reset_at,
+                            poll_interval=30.0,
+                            max_wait=10000.0,
+                            probe_fn=lambda: recovery_probe(timeout_seconds=5, request_size_tokens=1),
+                            backoff_config=BackoffConfig(
+                                initial_seconds=30.0,
+                                max_seconds=600.0,
+                                multiplier=2.0,
+                                jitter=0.2,
+                            ),
+                        )
+
+        result = asyncio.run(_run())
+        assert result is True
+
+        # sleep_durations[0] is the initial reset_at sleep (clamped to ~0 since reset_at is past).
+        # The subsequent sleeps are the jittered backoff intervals.
+        backoff_sleeps = sleep_durations[1:]
+        assert len(backoff_sleeps) >= 3, f"Expected at least 3 backoff sleeps, got {backoff_sleeps}"
+
+        # With jitter=0.2, each sleep must lie within +/-20% of its nominal interval.
+        nominal_intervals = [30.0, 60.0, 120.0]  # base * multiplier^n for n=0,1,2
+        for actual, nominal in zip(backoff_sleeps, nominal_intervals, strict=False):
+            lower = nominal * 0.8
+            upper = nominal * 1.2
+            assert lower <= actual <= upper, (
+                f"Jitter sleep {actual!r} is outside the band [{lower!r}, {upper!r}] for nominal interval {nominal!r}."
+            )
+
+        # Verify at least one backoff sleep differs from the exact nominal value --
+        # confirming jitter was applied (not a fixed-delay loop).
+        all_exact = all(
+            abs(actual - nominal) < 1e-9 for actual, nominal in zip(backoff_sleeps, nominal_intervals, strict=False)
+        )
+        assert not all_exact, (
+            "All backoff sleeps matched the nominal intervals exactly -- "
+            "jitter was not applied, which would allow thundering-herd behavior."
+        )

@@ -95,3 +95,35 @@ class TestCascadeDepthConstant:
         from devbench.constants import DEFAULT_MAX_CASCADE_DEPTH
 
         assert DEFAULT_MAX_CASCADE_DEPTH == 2
+
+
+class TestRecoveryProbeConstants:
+    """AC-T5-3: RECOVERY_PROBE_* constants in constants.py have correct types and spec values (spec 4.5.1)."""
+
+    def test_recovery_probe_model_is_non_empty_string(self) -> None:
+        """RECOVERY_PROBE_MODEL is a non-empty str naming the cheapest Anthropic probe model."""
+        from devbench.constants import RECOVERY_PROBE_MODEL
+
+        assert isinstance(RECOVERY_PROBE_MODEL, str)
+        assert len(RECOVERY_PROBE_MODEL) > 0
+
+    def test_recovery_probe_default_timeout_seconds_equals_10(self) -> None:
+        """RECOVERY_PROBE_DEFAULT_TIMEOUT_SECONDS equals 10.0 seconds (spec 4.5.1)."""
+        from devbench.constants import RECOVERY_PROBE_DEFAULT_TIMEOUT_SECONDS
+
+        assert isinstance(RECOVERY_PROBE_DEFAULT_TIMEOUT_SECONDS, float)
+        assert RECOVERY_PROBE_DEFAULT_TIMEOUT_SECONDS == 10.0
+
+    def test_recovery_probe_default_request_size_tokens_equals_1(self) -> None:
+        """RECOVERY_PROBE_DEFAULT_REQUEST_SIZE_TOKENS equals 1 (spec 4.5.1: request_size_tokens=1)."""
+        from devbench.constants import RECOVERY_PROBE_DEFAULT_REQUEST_SIZE_TOKENS
+
+        assert isinstance(RECOVERY_PROBE_DEFAULT_REQUEST_SIZE_TOKENS, int)
+        assert RECOVERY_PROBE_DEFAULT_REQUEST_SIZE_TOKENS == 1
+
+    def test_recovery_probe_message_content_is_non_empty_string(self) -> None:
+        """RECOVERY_PROBE_MESSAGE_CONTENT is a non-empty str used as the probe message body."""
+        from devbench.constants import RECOVERY_PROBE_MESSAGE_CONTENT
+
+        assert isinstance(RECOVERY_PROBE_MESSAGE_CONTENT, str)
+        assert len(RECOVERY_PROBE_MESSAGE_CONTENT) > 0

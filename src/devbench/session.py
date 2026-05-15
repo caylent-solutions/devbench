@@ -443,7 +443,21 @@ def detect_scope_overlap(existing_sessions: list[Session], new_scope: list[str])
 
     Returns:
         Sorted list of conflicting IDs (each ID appears at most once).
+
+    Raises:
+        TypeError: *existing_sessions* or *new_scope* is ``None`` instead of a list.
     """
+    if existing_sessions is None:
+        raise TypeError(
+            "existing_sessions must be a list of Session objects, got None. "
+            "Pass an empty list when there are no active sessions."
+        )
+    if new_scope is None:
+        raise TypeError(
+            "new_scope must be a list of work-unit ID strings, got None. "
+            "Pass an empty list when no scope IDs are available."
+        )
+
     existing_ids: set[str] = set()
     for session in existing_sessions:
         existing_ids.update(session.scope)

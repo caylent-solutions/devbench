@@ -559,6 +559,37 @@ class TestDetectScopeOverlap:
         result = detect_scope_overlap(existing, ["E1-F1-S1-T1"])
         assert "E1-F1-S1-T1" in result
 
+    def test_none_new_scope_raises_type_error(self) -> None:
+        """Passing None for new_scope must raise TypeError with actionable message."""
+        existing = [_make_session(name="alpha", scope=["E1"])]
+        with pytest.raises(TypeError, match="new_scope must be a list"):
+            detect_scope_overlap(existing, None)  # type: ignore[arg-type]
+
+    def test_none_existing_sessions_raises_type_error(self) -> None:
+        """Passing None for existing_sessions must raise TypeError with actionable message."""
+        with pytest.raises(TypeError, match="existing_sessions must be a list"):
+            detect_scope_overlap(None, ["E1"])  # type: ignore[arg-type]
+
+    def test_result_is_sorted(self) -> None:
+        """Returned overlap list is always sorted alphabetically (AC-192-4)."""
+        existing = [_make_session(name="alpha", scope=["E3", "E1", "E2"])]
+        result = detect_scope_overlap(existing, ["E2", "E3", "E1"])
+        assert result == ["E1", "E2", "E3"]
+
+    def test_both_empty_returns_empty(self) -> None:
+        """Edge case: no sessions and no new scope yields empty list."""
+        result = detect_scope_overlap([], [])
+        assert result == []
+
+    def test_large_scope_intersection(self) -> None:
+        """Handles non-trivial scope sizes correctly."""
+        ids_a = [f"E1-F1-S1-T{i}" for i in range(50)]
+        ids_b = [f"E1-F1-S1-T{i}" for i in range(25, 75)]
+        existing = [_make_session(name="alpha", scope=ids_a)]
+        result = detect_scope_overlap(existing, ids_b)
+        expected = sorted(f"E1-F1-S1-T{i}" for i in range(25, 50))
+        assert result == expected
+
 
 # ---------------------------------------------------------------------------
 # Integration: write_pid / delete_pid round trip via registry context

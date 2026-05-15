@@ -588,13 +588,20 @@ What `continue-orchestration.sh` does:
    - Detects whether the in-progress task is older than `stop_hook.stale_task_minutes` (default 120) and adds a stale-task warning.
    - Reads the most recent agent / judge comment from the work-unit file to determine the last action.
    - Suggests the specific next step based on the last action (run review-supervisor, run security-reviewer, run git-ops, etc.).
-   - Increments the block counter in `/tmp/devbench-stop-hook-state.json`.
+   - Increments the block counter in the circuit-breaker state file. When `DEVBENCH_SESSION_NAME` is set, the state file is `/tmp/devbench-stop-hook-state-<session>.json` (where `<session>` is the value of `DEVBENCH_SESSION_NAME`); when `DEVBENCH_SESSION_NAME` is unset, the state file is `/tmp/devbench-stop-hook-state.json`. Using a per-session path isolates concurrent orchestrator invocations so their block counters do not interfere.
    - If the counter has reached `stop_hook.max_blocks` within `stop_hook.window_seconds` (default 5 / 180s), trips the circuit breaker: allows the stop, logs a `[CIRCUIT_BREAKER]` comment to the work unit so a human can investigate, and clears the state file.
    - Otherwise blocks the stop with a JSON `{"decision": "block", "reason": "..."}` envelope that injects the continuation instruction into Claude's next turn.
 
 The circuit breaker prevents tight stop-block loops from running forever; it also creates an audit trail in the work unit's Comments so a human can see why the loop ended.
 
-Configuration is under `stop_hook:` in the YAML, with env var overrides `JUDGE_STOP_MAX_BLOCKS`, `JUDGE_STOP_WINDOW_SECONDS`, `JUDGE_STOP_STALE_MINUTES`.
+Configuration is under `stop_hook:` in the YAML. Env var overrides (all optional):
+
+| Env var | YAML key | Default | Effect |
+|---|---|---|---|
+| `JUDGE_STOP_MAX_BLOCKS` | `stop_hook.max_blocks` | `5` | Maximum block count before the circuit breaker trips and allows the stop. |
+| `JUDGE_STOP_WINDOW_SECONDS` | `stop_hook.window_seconds` | `180` | Rolling window in seconds over which `max_blocks` is evaluated; counts older than this are discarded. |
+| `JUDGE_STOP_STALE_MINUTES` | `stop_hook.stale_task_minutes` | `120` | Minutes after which an in-progress task is considered stale; adds a stale-task warning to the block reason. |
+| `DEVBENCH_SESSION_NAME` | _(no YAML key)_ | _(unset)_ | When set, scopes the circuit-breaker state file to the named session: `/tmp/devbench-stop-hook-state-<session>.json`. When unset, the shared path `/tmp/devbench-stop-hook-state.json` is used. Allows concurrent orchestrator sessions to maintain independent block counters. |
 
 **Implementation invariants (issues #130 + #131)**: every JSON serialisation in the Stop hook chain (BLOCK_JSON, state file, diagnostic capture) must use `jq` -- never `python3` -- because the hook can be invoked with an asdf-shimmed PATH where `python3` exits 126 with no version configured, silently dropping the block decision. Active-task selection reads `<workspace>/logs/*.log` for the most recent `Branch ready: ... on <task_id>` or `Set <task_id> to 'in-progress'` entry rather than `head -1` of BACKLOG.md, so a stale `in-progress` row from a crashed prior session does not mask what the orchestrator is actually running. Both invariants are pinned by-content in `tests/unit/test_continue_orchestration_hook.py::TestBlockJsonSerialisationRobustness` and `::TestActiveTaskSelection`.
 

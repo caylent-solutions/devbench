@@ -18,6 +18,7 @@ from devbench.constants import (
     STATUS_DRAFT,
     VALID_STATUSES,
 )
+from devbench.scope import ScopeFilter
 
 
 @pytest.fixture
@@ -5471,3 +5472,140 @@ class TestStatusSummaryDraftColumn:
         rows = mgr._parse_backlog_rows(index_path)
         mgr._check_status_summary(index_path, rows, errors)
         assert not errors, f"After rewrite, _check_status_summary must report no errors; got: {errors}"
+
+
+class TestValidateBacklogIgnoresScope:
+    """AC-190-14: validate-backlog validates the ENTIRE backlog regardless of active scope.
+
+    Scope is a claim-side filter only. Even when a scope.json restricts the
+    orchestrator to a single epic, ``BacklogManager.validate()`` must inspect
+    every work unit in BACKLOG.md -- not just the scoped subset.
+    """
+
+    @staticmethod
+    def _build_two_epic_workspace(
+        tmp_path: Path,
+        backlog_dir: Path,
+        *,
+        e2_file_status: str = "in-queue",
+        e2_index_status: str = "in-queue",
+    ) -> Path:
+        """Build a minimal two-epic workspace and return the BACKLOG.md path.
+
+        E1 contains one well-formed task. E2 contains one task whose file
+        status and index status can be set independently to introduce a
+        deliberate mismatch for detection by validate().
+
+        Args:
+            tmp_path: Temporary directory (pytest fixture).
+            backlog_dir: The ``backlog/`` subdirectory under ``tmp_path``.
+            e2_file_status: Status written inside E2-F1-S1-T1.md.
+            e2_index_status: Status recorded in the BACKLOG.md index row.
+
+        Returns:
+            Path to the created BACKLOG.md.
+        """
+        index_content = (
+            "# Backlog\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|----------|\n"
+            f"| E1 | Epic One | Epic | in-queue | None | repo | `backlog/E1.md` |\n"
+            f"| E1-F1-S1-T1 | Task Alpha | Task | done | None | repo | `backlog/E1-F1-S1-T1.md` |\n"
+            f"| E2 | Epic Two | Epic | in-queue | None | repo | `backlog/E2.md` |\n"
+            f"| E2-F1-S1-T1 | Task Beta | Task | {e2_index_status} | None | repo | `backlog/E2-F1-S1-T1.md` |\n"
+        )
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(index_content, encoding="utf-8")
+
+        units = [
+            ("E1", "in-queue"),
+            ("E1-F1-S1-T1", "done"),
+            ("E2", "in-queue"),
+            ("E2-F1-S1-T1", e2_file_status),
+        ]
+        for uid, status in units:
+            wu = backlog_dir / f"{uid}.md"
+            wu.write_text(f"# {uid}\n\n## Status: {status}\n", encoding="utf-8")
+
+        return index_path
+
+    def test_validate_detects_out_of_scope_errors_with_scope_json_present(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """Regression: validate() catches an E2 status mismatch even when scope restricts to E1.
+
+        Steps:
+        1. Build a two-epic workspace where E2-F1-S1-T1 has a deliberate
+           status mismatch (file says 'done', index says 'in-queue').
+        2. Write a scope.json restricting to E1 only.
+        3. Run validate() and confirm it reports the E2 mismatch error.
+        """
+        index_path = self._build_two_epic_workspace(
+            tmp_path,
+            backlog_dir,
+            e2_file_status="done",
+            e2_index_status="in-queue",
+        )
+
+        all_ids = ["E1", "E1-F1-S1-T1", "E2", "E2-F1-S1-T1"]
+        scope = ScopeFilter.parse("E1", "", all_ids)
+        assert scope.allows("E1-F1-S1-T1"), "Scope must include E1 tasks"
+        assert not scope.allows("E2-F1-S1-T1"), "Scope must exclude E2 tasks"
+        scope.to_file(tmp_path)
+        assert (tmp_path / ".devbench" / "scope.json").exists(), "scope.json must exist"
+
+        mgr = BacklogManager()
+        errors = mgr.validate(index_path, tmp_path)
+
+        e2_mismatch_errors = [e for e in errors if "E2-F1-S1-T1" in e and "status" in e.lower()]
+        assert e2_mismatch_errors, (
+            f"validate() must detect the E2-F1-S1-T1 status mismatch even with E1-only scope active; "
+            f"errors returned: {errors}"
+        )
+
+    def test_validate_inspects_all_units_without_scope(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """Baseline: validate() detects E2 mismatch when no scope.json exists.
+
+        This test is the non-scoped control for the regression test above.
+        If this fails, the production code has a pre-existing bug unrelated to scope.
+        """
+        index_path = self._build_two_epic_workspace(
+            tmp_path,
+            backlog_dir,
+            e2_file_status="done",
+            e2_index_status="in-queue",
+        )
+
+        assert not (tmp_path / ".devbench" / "scope.json").exists()
+
+        mgr = BacklogManager()
+        errors = mgr.validate(index_path, tmp_path)
+
+        e2_mismatch_errors = [e for e in errors if "E2-F1-S1-T1" in e and "status" in e.lower()]
+        assert e2_mismatch_errors, f"validate() must detect the E2-F1-S1-T1 status mismatch; errors returned: {errors}"
+
+    def test_validate_clean_backlog_passes_with_scope_present(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """A valid backlog remains valid when scope.json is present.
+
+        Ensures scope.json does not introduce false positives into validate().
+        """
+        index_path = self._build_two_epic_workspace(
+            tmp_path,
+            backlog_dir,
+            e2_file_status="in-queue",
+            e2_index_status="in-queue",
+        )
+
+        all_ids = ["E1", "E1-F1-S1-T1", "E2", "E2-F1-S1-T1"]
+        scope = ScopeFilter.parse("E1", "", all_ids)
+        scope.to_file(tmp_path)
+
+        mgr = BacklogManager()
+        errors = mgr.validate(index_path, tmp_path)
+
+        status_mismatch_errors = [e for e in errors if "status" in e.lower() and "mismatch" in e.lower()]
+        assert not status_mismatch_errors, (
+            f"A consistent backlog must not produce status-mismatch errors even with scope.json present; "
+            f"got: {status_mismatch_errors}"
+        )

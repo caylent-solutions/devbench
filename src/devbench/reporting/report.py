@@ -1416,13 +1416,21 @@ def _format_est_hours_display(stats: WindowStats) -> str:
     from the window's avg_minutes; falls back to ``n/a`` otherwise.
     """
     if stats.est_hours and stats.recent_pace_minutes is not None:
-        return (
-            f"~{stats.est_hours:.1f} h (active {stats.eta_active}"
-            f" + blocked-recovery {stats.eta_blocked_recovery}"
-            f" + blocked-auto {stats.eta_blocked_auto}"
-            f" + blocked-runtime-degradation {stats.eta_blocked_runtime_degradation}"
-            f" at {stats.recent_pace_minutes:.1f} min/task)"
-        )
+        # Only surface non-zero blocked-bucket terms so a typical report --
+        # where every blocked counter sits at zero -- keeps the breakdown
+        # short enough that the per-cell width does not blow out the
+        # 3-column table. The "active" term always shows. (Width regression
+        # observed after issue #183 added the runtime-degradation term;
+        # this gates each optional term on a positive count.)
+        parts: list[str] = [f"active {stats.eta_active}"]
+        if stats.eta_blocked_recovery:
+            parts.append(f"blocked-recovery {stats.eta_blocked_recovery}")
+        if stats.eta_blocked_auto:
+            parts.append(f"blocked-auto {stats.eta_blocked_auto}")
+        if stats.eta_blocked_runtime_degradation:
+            parts.append(f"blocked-runtime-degradation {stats.eta_blocked_runtime_degradation}")
+        breakdown = " + ".join(parts)
+        return f"~{stats.est_hours:.1f} h ({breakdown} at {stats.recent_pace_minutes:.1f} min/task)"
     if stats.est_hours:
         return f"~{stats.est_hours:.1f} h"
     return "n/a"
@@ -2035,8 +2043,11 @@ def _render_blocked_panels(
         _render_simple_panel(
             runtime_degradation_rows,
             "runtime-degradation",
-            "SDK lost Agent-tool access mid-session; `make start` auto-restarts to recover.",
-            "[runtime-degradation -- auto-restart pending]",
+            (
+                "SDK lost Agent-tool access mid-session; task remains blocked until the orchestrator restarts "
+                "(auto on NO_ACTIONABLE exit; otherwise manual `make start`)."
+            ),
+            "[runtime-degradation -- retries on next orchestrator restart]",
         )
     )
     lines.extend(

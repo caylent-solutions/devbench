@@ -2015,7 +2015,10 @@ class TestUnitListings:
             ),
             (
                 _panel_header("runtime-degradation"),
-                "SDK lost Agent-tool access mid-session; `make start` auto-restarts to recover.",
+                (
+                    "SDK lost Agent-tool access mid-session; task remains blocked until the orchestrator "
+                    "restarts (auto on NO_ACTIONABLE exit; otherwise manual `make start`)."
+                ),
             ),
             (
                 _panel_header("operator action required"),

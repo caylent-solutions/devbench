@@ -153,7 +153,9 @@ Write the task `.md` file to `backlog/<epic-id>-<epic-slug>/<feature-id>-<featur
 - `### Depends On This` table: every downstream task that depends on this task (real WU IDs -- no placeholders).
 - Manifest-conflict serial-dep chains auto-injected: if two tasks modify the same file, the later task depends on the earlier one so `devbench validate-backlog` Rule 5 (Manifest Conflict Rule) passes from cold start.
 
-**Default status**: `## Status: draft` (unless `backlog.default_status_for_new_work_units` is set to `in-queue` in `devbench.yaml`).
+**Default status**: Before writing each task file, read `backlog.default_status_for_new_work_units` from `backlog/config/devbench.yaml` (default: `draft` when that key is absent):
+- Key absent or set to `draft`: write `## Status: draft` as the second line of the task file.
+- Key set to `in-queue` (legacy workspace override): write `## Status: in-queue` as the second line of the task file.
 
 ### 5b -- Self-critique at per-Task granularity
 

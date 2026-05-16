@@ -824,7 +824,14 @@ class TestSpecToBacklogSkillSuccessConditions:
 
 @pytest.mark.unit
 class TestSpecToBacklogSkillDefaultDraftStatus:
-    """AC-191-4: New WUs must default to 'draft' status; overridable via config."""
+    """AC-191-4: New WUs must default to 'draft' status; overridable via config.
+
+    spec-to-backlog reads RUNTIME_CONFIG.backlog.default_status_for_new_work_units and
+    writes that value (default 'draft' for new workspaces, 'in-queue' for legacy).
+    Tests verify both the draft path and the in-queue override path.
+
+    Per spec section 4.6.3 and issue #191.
+    """
 
     def test_skill_defaults_new_wus_to_draft_status(self) -> None:
         """Skill must set new work units to 'draft' status by default."""
@@ -834,12 +841,61 @@ class TestSpecToBacklogSkillDefaultDraftStatus:
             "(per spec section 4.6.3 -- depends on E1 draft-status feature)"
         )
 
+    def test_skill_writes_status_draft_header_for_default_path(self) -> None:
+        """Skill must explicitly instruct writing '## Status: draft' as the status header.
+
+        The generated task file must open with '## Status: draft' (the exact markdown heading)
+        when the config key is absent or set to 'draft'.
+        """
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert "## Status: draft" in content, (
+            "spec-to-backlog/SKILL.md must explicitly instruct writing '## Status: draft' "
+            "as the task file status header for the default (draft) path -- "
+            "per spec section 4.6.3 and AC-191-4"
+        )
+
     def test_skill_mentions_config_override_for_default_status(self) -> None:
         """Default status must be overridable via backlog.default_status_for_new_work_units config."""
         content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
-        assert "default_status_for_new_work_units" in content or "default status" in content.lower(), (
-            "spec-to-backlog/SKILL.md must mention that the default WU status is overridable "
-            "via backlog.default_status_for_new_work_units in devbench.yaml"
+        assert "default_status_for_new_work_units" in content, (
+            "spec-to-backlog/SKILL.md must name the config key 'default_status_for_new_work_units' "
+            "that controls the default status for new work units in devbench.yaml"
+        )
+
+    def test_skill_covers_in_queue_override_path(self) -> None:
+        """Skill must explicitly document the in-queue override path for legacy workspaces.
+
+        When backlog.default_status_for_new_work_units is set to 'in-queue', every generated
+        task file must open with '## Status: in-queue'. The SKILL.md must instruct this
+        alternate path so the legacy (pre-draft-status) workspace behaviour is preserved.
+        """
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert "## Status: in-queue" in content, (
+            "spec-to-backlog/SKILL.md must explicitly instruct writing '## Status: in-queue' "
+            "when backlog.default_status_for_new_work_units is set to 'in-queue' -- "
+            "this is the legacy workspace override path (per spec section 4.6.3 and AC-191-4)"
+        )
+
+    def test_skill_names_config_file_path_for_status_override(self) -> None:
+        """Config key for status override must name the devbench.yaml config file path."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert "backlog/config/devbench.yaml" in content or "devbench.yaml" in content, (
+            "spec-to-backlog/SKILL.md must reference 'devbench.yaml' as the config file "
+            "that holds 'default_status_for_new_work_units' so operators know where to set it"
+        )
+
+    def test_skill_draft_is_default_when_config_key_absent(self) -> None:
+        """Skill must state that 'draft' is the default when the config key is absent.
+
+        Per spec section 4.6.3: 'default is draft when that key is absent'. The SKILL.md
+        must explicitly document this fallback-free default so the agent knows to write
+        '## Status: draft' without requiring the operator to configure anything.
+        """
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert "absent" in content or "not set" in content.lower() or "when that key" in content, (
+            "spec-to-backlog/SKILL.md must state that 'draft' is the default status "
+            "when the config key 'default_status_for_new_work_units' is absent from devbench.yaml -- "
+            "per spec section 4.6.3"
         )
 
 

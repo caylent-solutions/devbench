@@ -611,6 +611,21 @@ SESSION_PID_FILENAME: str = "pid"
 # used during atomic registry writes (write-then-rename pattern).
 SESSION_REGISTRY_TMP_SUFFIX: str = ".tmp"
 
+# Default session name used when --name is not supplied to ``cmd_start``.
+# Consumed by ``src/devbench/session.py`` and ``cmd_start``; defined here so
+# no literal strings appear inline in those modules.
+SESSION_DEFAULT_NAME: str = "default"
+
+# Filename written inside a session's state directory to record the ISO-8601
+# timestamp at which the session was started.
+# Full path: ``<workspace_root>/.devbench/sessions/<name>/<SESSION_STARTED_AT_FILENAME>``.
+SESSION_STARTED_AT_FILENAME: str = "started_at"
+
+# Filename written inside a session's state directory to record the identity
+# (username / process tag) of the agent that started the session.
+# Full path: ``<workspace_root>/.devbench/sessions/<name>/<SESSION_STARTED_BY_FILENAME>``.
+SESSION_STARTED_BY_FILENAME: str = "started_by"
+
 # Poll interval (seconds) between non-blocking flock attempts in
 # :func:`devbench.session.flock_backlog`.  A sub-second value keeps the
 # effective wait latency low without busy-spinning.  Callers use

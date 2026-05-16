@@ -240,6 +240,36 @@ class TestSessionConstants:
         assert SESSION_FLOCK_POLL_INTERVAL_SECONDS == 0.1
 
 
+class TestSessionNameConstants:
+    """AC-FIX-001 through AC-FIX-004: SESSION_DEFAULT_NAME, SESSION_STARTED_AT_FILENAME,
+    and SESSION_STARTED_BY_FILENAME are exported from constants.py with the correct
+    type (str) and spec-mandated values.
+    """
+
+    @pytest.mark.parametrize(
+        ("constant_name", "expected_value"),
+        [
+            ("SESSION_DEFAULT_NAME", "default"),
+            ("SESSION_STARTED_AT_FILENAME", "started_at"),
+            ("SESSION_STARTED_BY_FILENAME", "started_by"),
+        ],
+    )
+    def test_session_name_constant_type_and_value(
+        self,
+        constant_name: str,
+        expected_value: str,
+    ) -> None:
+        """Each SESSION_*_NAME / SESSION_STARTED_* constant is importable from
+        devbench.constants, is of type str, and matches its spec-mandated value.
+        """
+        import importlib
+
+        module = importlib.import_module("devbench.constants")
+        constant = getattr(module, constant_name)
+        assert isinstance(constant, str), f"{constant_name} expected type 'str', got {type(constant).__name__!r}"
+        assert constant == expected_value, f"{constant_name} expected {expected_value!r}, got {constant!r}"
+
+
 class TestQuotaHandlingDefaultConstants:
     """AC-FIX-QUOTA-CONST-2: QUOTA_HANDLING_DEFAULT_* constants in constants.py
     have correct types and spec-mandated values (spec 4.5.6).

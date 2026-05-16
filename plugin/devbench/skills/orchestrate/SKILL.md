@@ -29,7 +29,7 @@ Process the backlog using the steps below, repeating until all work units are do
       - On `state == OPEN`: no-op; the task stays `in-review` and the loop moves on.
    c. After processing every in-review task, proceed to step 2. `devbench next` skips `in-review` tasks (they are not actionable for the executor) so the orchestrator naturally picks up the next claimable work unit.
 
-1c. **Scope filter** -- If `.devbench/scope.json` exists in the workspace, consult it before claiming the next work unit. `devbench next` already respects scope; if it returns `NO_ACTIONABLE_IN_SCOPE`, exit cleanly with a clear message: "no work units match the active scope filter".
+1c. **Scope filter** -- If `.devbench/scope.json` exists in the workspace, consult it before claiming the next work unit. `devbench next` already respects scope; if it returns `NO_ACTIONABLE_IN_SCOPE`, exit cleanly with a clear message: "no work units match the active scope filter". Note: scope.json written by `devbench scope set` (spec section 4.2.6) is byte-identical to the one written by `devbench start --include`; the skill honours both pathways identically (the file is the authority, not the command that wrote it).
 
 2. `uv run devbench next` -- get the next actionable unit ID.
    - If output is `ALL_DONE`: print a completion summary and exit.

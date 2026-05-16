@@ -468,7 +468,7 @@ JUDGE_WORKSPACE_ROOT=$PWD JUDGE_CLAUDE_MODEL=... \
 uv run devbench scope clear
 ```
 
-See [Scope selectors](#scope-selectors-printer-pages-syntax) for the full token syntax reference.
+See [Scope selectors](#scope-selectors-printer-pages-syntax) for the full token syntax reference. For the step-by-step interactive pre-arm workflow, see [`docs/zero-to-ready.md` -- Scoping a run interactively](zero-to-ready.md#scoping-a-run-interactively).
 
 ### `start`
 

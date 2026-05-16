@@ -526,36 +526,36 @@ automatically (no extra flags needed) and render a `SCOPE:` banner above their o
 The scope.json file is deleted on clean orchestrator exit; it survives orchestrator
 crashes so a follow-up `devbench status` still shows the active scope.
 
-### Pre-arming scope without starting the orchestrator
+### Scoping a run interactively
 
 When you want to set the scope before launching interactive Claude Code (so the
 orchestrate skill respects the filter without you having to launch and kill `devbench
-start` first), use `devbench scope set`:
+start` first), use `devbench scope set`. The scope.json it writes is byte-identical to the
+one `devbench start --include` writes -- the orchestrate skill honours both pathways
+identically at Step 1c (consulting scope.json before claiming the next work unit):
 
 ```bash
-# Write scope.json without starting the orchestrator:
+# Step 1: Write scope.json without starting the orchestrator:
 JUDGE_WORKSPACE_ROOT=~/my-workspace \
 uv run --project $DEVBENCH_DIR devbench scope set --include "E1-E3, E5"
 
-# Inspect the active scope:
+# Step 2 (optional): Inspect the active scope:
 JUDGE_WORKSPACE_ROOT=~/my-workspace \
 uv run --project $DEVBENCH_DIR devbench scope show
 
-# Launch interactive Claude Code; the orchestrate skill respects scope.json:
+# Step 3: Launch interactive Claude Code; the orchestrate skill respects scope.json:
 JUDGE_WORKSPACE_ROOT=~/my-workspace \
 JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
 claude --dangerously-skip-permissions \
   --plugin-dir $DEVBENCH_DIR/plugin/devbench
 
-# Clear the scope when done:
+# Step 4: Clear the scope when done:
 JUDGE_WORKSPACE_ROOT=~/my-workspace \
 uv run --project $DEVBENCH_DIR devbench scope clear
 ```
 
-The scope.json written by `devbench scope set` is identical to the one `devbench start
---include` writes, so the orchestrate skill honours it identically. `devbench scope clear`
-is idempotent -- it exits 0 with the message `no scope pending` when no scope file is
-present.
+`devbench scope clear` is idempotent -- it exits 0 with the message `no scope pending`
+when no scope file is present.
 
 `devbench validate-backlog` ignores scope.json entirely -- it always validates the
 whole backlog regardless of any active scope.

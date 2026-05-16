@@ -479,6 +479,391 @@ class TestCmdNext:
         assert "dependencies" in data
 
 
+class TestCmdNextScopeFilter:
+    """E2-F2-S2-T3: cmd_next respects active scope.json and --include/--exclude flags.
+
+    AC-190-15: Zero-matching scope causes cmd_next to output NO_ACTIONABLE_IN_SCOPE
+    and return rc=0.
+    """
+
+    # ------------------------------------------------------------------
+    # Shared helpers
+    # ------------------------------------------------------------------
+
+    def _make_units(self, ids: list[str]) -> list[WorkUnit]:
+        """Return IN_QUEUE WorkUnit stubs for the given IDs."""
+        return [
+            WorkUnit(
+                id=wu_id,
+                title=f"Task {wu_id}",
+                status=WorkUnitStatus.IN_QUEUE,
+                unit_type=WorkUnitType.TASK,
+                file_path=Path(f"backlog/{wu_id}.md"),
+                repo="caylent-solutions/devbench",
+                dependencies=[],
+            )
+            for wu_id in ids
+        ]
+
+    def _write_scope_json(
+        self,
+        tmp_path: Path,
+        include: list[str],
+        exclude: list[str],
+        expanded_ids: list[str],
+        started_at: str = "2026-05-14T13:42:11Z",
+        started_by: str = "testuser",
+    ) -> None:
+        """Write a minimal scope.json under tmp_path/.devbench/scope.json."""
+        scope_dir = tmp_path / ".devbench"
+        scope_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "include": include,
+            "exclude": exclude,
+            "expanded_ids": expanded_ids,
+            "started_at": started_at,
+            "started_by": started_by,
+        }
+        (scope_dir / "scope.json").write_text(json.dumps(payload))
+
+    # ------------------------------------------------------------------
+    # Happy path: active scope.json, matching candidates exist
+    # ------------------------------------------------------------------
+
+    def test_scope_json_filters_candidates_to_matching_unit(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """cmd_next passes the active scope to get_parallel_candidates (AC-190-10).
+
+        When scope.json names only E1-F1-S1-T1 and two candidates exist,
+        only the in-scope candidate is returned.
+        """
+        units = self._make_units(["E1-F1-S1-T1", "E2-F1-S1-T1"])
+        self._write_scope_json(
+            tmp_path,
+            include=["E1"],
+            exclude=[],
+            expanded_ids=["E1-F1-S1-T1"],
+        )
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = units
+        # Simulate parser filtering: only E1-F1-S1-T1 survives when scope is applied.
+        mock_parser.get_parallel_candidates.return_value = [units[0]]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_next()
+
+        assert rc == 0
+        data = json.loads(capsys.readouterr().out.strip())
+        assert data["id"] == "E1-F1-S1-T1"
+        # Verify scope was passed to get_parallel_candidates.
+        call_kwargs = mock_parser.get_parallel_candidates.call_args
+        assert call_kwargs is not None
+        passed_scope = call_kwargs.kwargs.get("scope") or (call_kwargs.args[1] if len(call_kwargs.args) > 1 else None)
+        assert passed_scope is not None
+        assert "E1-F1-S1-T1" in passed_scope.expanded_ids
+
+    # ------------------------------------------------------------------
+    # AC-190-15: scope exhausted -- no WU in scope is actionable
+    # ------------------------------------------------------------------
+
+    def test_no_actionable_in_scope_when_scope_filters_all_out(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """AC-190-15: zero-matching scope causes NO_ACTIONABLE_IN_SCOPE output, rc=0."""
+        units = self._make_units(["E1-F1-S1-T1", "E2-F1-S1-T1"])
+        self._write_scope_json(
+            tmp_path,
+            include=["E3"],
+            exclude=[],
+            expanded_ids=[],  # scope expands to nothing in this backlog
+        )
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = units
+        mock_parser.get_parallel_candidates.return_value = []
+        mock_parser.all_done.return_value = False
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_next()
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "NO_ACTIONABLE_IN_SCOPE" in out
+        # Must NOT print ALL_DONE or NO_ACTIONABLE (the non-scope variant).
+        assert "ALL_DONE" not in out
+        assert out.strip() == "NO_ACTIONABLE_IN_SCOPE"
+
+    # ------------------------------------------------------------------
+    # Without scope.json: existing NO_ACTIONABLE / ALL_DONE paths unchanged
+    # ------------------------------------------------------------------
+
+    def test_no_scope_json_prints_no_actionable_not_in_scope(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Without scope.json, exhausted candidates print NO_ACTIONABLE (not IN_SCOPE variant)."""
+        units = self._make_units(["E1-F1-S1-T1"])
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = units
+        mock_parser.get_parallel_candidates.return_value = []
+        mock_parser.all_done.return_value = False
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_next()
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "NO_ACTIONABLE" in out
+        assert "IN_SCOPE" not in out
+
+    def test_no_scope_json_all_done_unchanged(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Without scope.json, all-done scenario still prints ALL_DONE."""
+        units = self._make_units(["E1-F1-S1-T1"])
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = units
+        mock_parser.get_parallel_candidates.return_value = []
+        mock_parser.all_done.return_value = True
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_next()
+
+        assert rc == 0
+        assert "ALL_DONE" in capsys.readouterr().out
+
+    # ------------------------------------------------------------------
+    # AC-190-11: per-command --include flag overrides active scope.json
+    # ------------------------------------------------------------------
+
+    def test_include_flag_overrides_scope_json(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Per-command --include flag overrides the active scope.json (AC-190-11)."""
+        units = self._make_units(["E1-F1-S1-T1", "E2-F1-S1-T1"])
+        # scope.json says E3 (nothing matches) but --include "E1" should override.
+        self._write_scope_json(
+            tmp_path,
+            include=["E3"],
+            exclude=[],
+            expanded_ids=[],
+        )
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = units
+        mock_parser.get_parallel_candidates.return_value = [units[0]]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_next("--include", "E1")
+
+        assert rc == 0
+        data = json.loads(capsys.readouterr().out.strip())
+        assert data["id"] == "E1-F1-S1-T1"
+        # Verify a scope was passed to get_parallel_candidates with E1 tokens.
+        call_kwargs = mock_parser.get_parallel_candidates.call_args
+        passed_scope = call_kwargs.kwargs.get("scope") or (call_kwargs.args[1] if len(call_kwargs.args) > 1 else None)
+        assert passed_scope is not None
+        assert passed_scope.include == ["E1"]
+
+    def test_exclude_flag_passed_to_scope(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """--exclude flag is parsed and reflected in the scope passed to get_parallel_candidates."""
+        units = self._make_units(["E1-F1-S1-T1"])
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = units
+        mock_parser.get_parallel_candidates.return_value = [units[0]]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_next("--include", "E1", "--exclude", "E1-F1-S1-T2")
+
+        assert rc == 0
+        call_kwargs = mock_parser.get_parallel_candidates.call_args
+        passed_scope = call_kwargs.kwargs.get("scope") or (call_kwargs.args[1] if len(call_kwargs.args) > 1 else None)
+        assert passed_scope is not None
+        assert passed_scope.exclude == ["E1-F1-S1-T2"]
+
+    # ------------------------------------------------------------------
+    # Corrupt scope.json -> rc=1 with actionable error on stderr
+    # ------------------------------------------------------------------
+
+    def test_corrupt_scope_json_returns_rc1_with_stderr(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Corrupt scope.json causes cmd_next to return rc=1 with a stderr message."""
+        scope_dir = tmp_path / ".devbench"
+        scope_dir.mkdir(parents=True, exist_ok=True)
+        (scope_dir / "scope.json").write_text("not valid json{{")
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = []
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_next()
+
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "scope.json" in err
+
+    # ------------------------------------------------------------------
+    # Integration: real fixture -- scope.json on disk selects correct WU
+    # ------------------------------------------------------------------
+
+    def test_integration_scope_json_selects_correct_next(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Integration: real scope.json on disk filters cmd_next output.
+
+        Constructs a minimal BACKLOG.md and two work-unit files, writes a
+        scope.json that includes only E1-F1-S1-T1, and verifies that
+        cmd_next returns only that unit.
+        """
+        from devbench.scope import ScopeFilter
+
+        # Build a minimal BACKLOG.md index.
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir(parents=True)
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text(
+            "# Backlog\n\n"
+            "| ID | Title | Type | Status | Repo | Branch | File |\n"
+            "|----|-------|------|--------|------|--------|------|\n"
+            "| E1-F1-S1-T1 | Alpha Task | Task | in-queue | caylent-solutions/devbench"
+            " | feat/test | backlog/E1-F1-S1-T1.md |\n"
+            "| E2-F1-S1-T1 | Beta Task | Task | in-queue | caylent-solutions/devbench"
+            " | feat/test | backlog/E2-F1-S1-T1.md |\n"
+        )
+
+        # Write minimal work-unit files.
+        dep_header = "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n"
+        for wu_id in ("E1-F1-S1-T1", "E2-F1-S1-T1"):
+            (backlog_dir / f"{wu_id}.md").write_text(f"# {wu_id}: Task\n\n## Status: in-queue\n\n{dep_header}")
+
+        # Write scope.json that includes only E1-F1-S1-T1.
+        scope_filter = ScopeFilter(
+            include=["E1"],
+            exclude=[],
+            expanded_ids={"E1-F1-S1-T1"},
+        )
+        scope_filter.to_file(tmp_path)
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            rc = cli.cmd_next()
+
+        assert rc == 0
+        out = capsys.readouterr().out.strip()
+        data = json.loads(out)
+        assert data["id"] == "E1-F1-S1-T1"
+
+    def test_integration_scope_json_exhausted_prints_no_actionable_in_scope(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Integration: scope.json with empty expanded_ids causes NO_ACTIONABLE_IN_SCOPE.
+
+        AC-190-15: zero-matching scope exits cleanly with a clear message.
+        """
+        from devbench.scope import ScopeFilter
+
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir(parents=True)
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text(
+            "# Backlog\n\n"
+            "| ID | Title | Type | Status | Repo | Branch | File |\n"
+            "|----|-------|------|--------|------|--------|------|\n"
+            "| E1-F1-S1-T1 | Alpha Task | Task | in-queue | caylent-solutions/devbench"
+            " | feat/test | backlog/E1-F1-S1-T1.md |\n"
+        )
+        dep_header = "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n"
+        (backlog_dir / "E1-F1-S1-T1.md").write_text(f"# E1-F1-S1-T1: Task\n\n## Status: in-queue\n\n{dep_header}")
+
+        # Scope that matches nothing in this backlog (E9 does not exist).
+        scope_filter = ScopeFilter(
+            include=["E9"],
+            exclude=[],
+            expanded_ids=set(),
+        )
+        scope_filter.to_file(tmp_path)
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            rc = cli.cmd_next()
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "NO_ACTIONABLE_IN_SCOPE" in out
+
+    # ------------------------------------------------------------------
+    # Error path: --include / --exclude without a following value
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize("flag", ["--include", "--exclude"])
+    def test_flag_without_value_returns_rc1_with_stderr(
+        self,
+        flag: str,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """--include or --exclude supplied without a following value exits rc=1.
+
+        The error message must be emitted to stderr and must mention
+        'requires a value' so the caller can diagnose the problem.
+        """
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_next(flag)
+
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "requires a value" in err
+
+
 class TestCmdClaim:
     """Test cmd_claim command."""
 

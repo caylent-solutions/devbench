@@ -752,14 +752,132 @@ def _latest_hold_reason(content: str) -> str:
     return matches[-1].strip() if matches else ""
 
 
-def cmd_next() -> int:
-    """Print the next actionable work unit."""
-    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
-    units = parser.parse_index()
-    candidates = parser.get_parallel_candidates(units)
+def _build_scope_for_next(
+    include_str: str,
+    exclude_str: str,
+    backlog_ids: list[str],
+) -> tuple[ScopeFilter | None, str]:
+    """Resolve the active scope filter for ``cmd_next``.
+
+    Two resolution paths:
+
+    1. **Per-command flags** (``include_str`` or ``exclude_str`` non-empty):
+       expands tokens against ``backlog_ids`` via :meth:`ScopeFilter.parse`
+       so ``expanded_ids`` is populated for candidate filtering (AC-190-11).
+
+    2. **Active scope.json** (both strings empty): reads
+       ``<WORKSPACE_ROOT>/.devbench/scope.json`` via
+       :meth:`ScopeFilter.from_file`; returns ``None`` when the file is
+       absent.
+
+    Args:
+        include_str: Raw ``--include`` token string (empty = not supplied).
+        exclude_str: Raw ``--exclude`` token string (empty = not supplied).
+        backlog_ids: All work-unit IDs from the parsed backlog; used only
+            for the flag-based path to expand tokens.
+
+    Returns:
+        A two-tuple ``(scope_filter, error_message)``.  When
+        ``error_message`` is non-empty the caller must print it to stderr
+        and return rc=1.  When ``scope_filter`` is ``None`` and
+        ``error_message`` is empty, no scope is active.
+
+    Raises:
+        None -- all exceptions are caught and returned as error messages.
+    """
+    if include_str or exclude_str:
+        try:
+            return (
+                ScopeFilter.parse(
+                    include_str=include_str,
+                    exclude_str=exclude_str,
+                    backlog_ids=backlog_ids,
+                ),
+                "",
+            )
+        except Exception as exc:
+            return None, f"ERROR: invalid scope token: {exc}"
+
+    # No flags -- consult scope.json.
+    try:
+        raw = _read_scope_banner_data(WORKSPACE_ROOT)
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        return None, f"ERROR: scope.json is corrupt and cannot be read: {exc}"
+    if raw is None:
+        return None, ""
+    try:
+        return ScopeFilter.from_file(WORKSPACE_ROOT), ""
+    except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        return None, f"ERROR: scope.json is corrupt and cannot be read: {exc}"
+
+
+def _parse_next_argv(argv: tuple[str, ...]) -> tuple[str, str, int]:
+    """Parse ``--include`` / ``--exclude`` flags for ``cmd_next``.
+
+    Args:
+        argv: Raw argument tuple from the CLI dispatcher.
+
+    Returns:
+        A three-tuple ``(include_str, exclude_str, exit_code)``.
+        ``exit_code`` is non-zero when a flag is missing its value.
+    """
+    include_str = ""
+    exclude_str = ""
+    args = list(argv)
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("--include", "--exclude"):
+            if i + 1 >= len(args) or args[i + 1].startswith("--"):
+                print(f"ERROR: {arg} requires a value", file=sys.stderr)
+                return "", "", 1
+            i += 1
+            if arg == "--include":
+                include_str = args[i]
+            else:
+                exclude_str = args[i]
+        i += 1
+    return include_str, exclude_str, 0
+
+
+def cmd_next(*argv: str) -> int:
+    """Print the next actionable work unit.
+
+    Accepts scope-filter flags (spec section 4.2.2, AC-190-10, AC-190-11):
+
+    - ``--include "<tokens>"`` -- one-off include selector; overrides active
+      scope.json when present.
+    - ``--exclude "<tokens>"`` -- one-off exclude selector.
+
+    When neither flag is supplied, the active ``scope.json`` (if any) is
+    consulted instead.  When a scope is active and no candidates match, prints
+    ``NO_ACTIONABLE_IN_SCOPE`` and returns 0 (AC-190-15).
+
+    Args:
+        *argv: Optional flag arguments (``--include``, ``--exclude``).
+
+    Returns:
+        0 on success or scope-exhausted; 1 on scope-resolution error.
+    """
+    include_str, exclude_str, flag_rc = _parse_next_argv(argv)
+    if flag_rc != 0:
+        return flag_rc
+
+    backlog_parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = backlog_parser.parse_index()
+    all_ids = [u.id for u in units]
+
+    scope_filter, error = _build_scope_for_next(include_str, exclude_str, all_ids)
+    if error:
+        print(error, file=sys.stderr)
+        return 1
+
+    candidates = backlog_parser.get_parallel_candidates(units, scope=scope_filter)
 
     if not candidates:
-        if parser.all_done(units):
+        if scope_filter is not None:
+            print("NO_ACTIONABLE_IN_SCOPE")
+        elif backlog_parser.all_done(units):
             print("ALL_DONE")
         else:
             print("NO_ACTIONABLE")
@@ -6711,6 +6829,8 @@ _VARIADIC_COMMANDS: frozenset[str] = frozenset(
         "promote",
         # Issue #190 E2-F2-S1-T1: --include / --exclude scope selectors
         "start",
+        # Issue #190 E2-F2-S2-T3: cmd_next respects scope filter
+        "next",
     }
 )
 

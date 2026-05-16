@@ -7,6 +7,7 @@ AC-192-1: session state_dir creation and PID-file management.
 AC-192-3: concurrent sessions via flock_backlog mutual exclusion.
 AC-192-5: atomic claim arbitration -- race resolved deterministically via ClaimRaceError.
 AC-192-10: session listing with liveness (ACTIVE / STALE).
+AC-192-16: window-stats + proposal lifecycle remain workspace-shared across sessions.
 """
 
 from __future__ import annotations
@@ -1075,3 +1076,170 @@ class TestCmdClaimRaceIntegration:
         assert "race" in msg or "claim" in msg, (
             f"Expected 'race' or 'claim' in stderr message, got: {loser_stderr[0]!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# AC-192-16: window-stats + proposal lifecycle stay workspace-shared
+# ---------------------------------------------------------------------------
+
+# Minimal backlog structure used by the workspace-shared invariant tests.
+_SHARED_WU_ALPHA = "E0-F1-S1-T1"
+_SHARED_WU_BETA = "E0-F1-S1-T2"
+
+
+def _build_two_session_workspace(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """Create a minimal workspace with two tasks on disjoint scopes.
+
+    Returns:
+        (workspace_root, backlog_root, backlog_index)
+    """
+    workspace = tmp_path
+    backlog_root = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+    backlog_root.mkdir(parents=True)
+
+    for wu_id in (_SHARED_WU_ALPHA, _SHARED_WU_BETA):
+        (backlog_root / f"{wu_id}.md").write_text(
+            f"# {wu_id}: Test\n\n## Status: in-queue\n\n"
+            "## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n",
+            encoding="utf-8",
+        )
+
+    backlog_index = workspace / "BACKLOG.md"
+    backlog_index.write_text(
+        "# Backlog\n\n## Status Summary\n\n"
+        "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
+        "|------|-------|------|-------------|----------|---------|\n"
+        "| E0 | x | 0 | 0 | 2 | 0 |\n\n"
+        "## Full Work Unit Index\n\n"
+        "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+        "|----|-------|------|--------|--------------|------|-----------|\n"
+        f"| {_SHARED_WU_ALPHA} | T1 | Task | in-queue | None | r |"
+        f" `backlog/E0/E0-F1/E0-F1-S1/{_SHARED_WU_ALPHA}.md` |\n"
+        f"| {_SHARED_WU_BETA} | T2 | Task | in-queue | None | r |"
+        f" `backlog/E0/E0-F1/E0-F1-S1/{_SHARED_WU_BETA}.md` |\n",
+        encoding="utf-8",
+    )
+    return workspace, backlog_root, backlog_index
+
+
+class TestWorkspaceSharedWindowStats:
+    """AC-192-16: window-stats aggregates live under the workspace root, not per-session.
+
+    Two sessions with disjoint scopes -- alpha claims T1 and beta claims T2 --
+    both transition tasks.  The resulting aggregates must appear in the single
+    workspace-shared directory ``.devbench/window-stats/``, not inside any
+    per-session state directory.
+    """
+
+    def test_transitions_from_different_sessions_land_in_shared_window_stats_dir(self, tmp_path: Path) -> None:
+        """Transitions from session alpha and session beta both write to the same
+        workspace-shared window-stats directory (AC-192-16).
+
+        Each session's task is in a disjoint scope.  After each transition,
+        the aggregate must live under ``<workspace>/.devbench/window-stats/``
+        -- never inside ``<workspace>/.devbench/sessions/<name>/``.
+        """
+        from devbench.backlog.manager import BacklogManager
+        from devbench.reporting.window_stats import aggregate_dir, aggregate_path, read_aggregate
+
+        workspace, _backlog_root, backlog_index = _build_two_session_workspace(tmp_path)
+
+        wu_alpha_path = workspace / f"backlog/E0/E0-F1/E0-F1-S1/{_SHARED_WU_ALPHA}.md"
+        wu_beta_path = workspace / f"backlog/E0/E0-F1/E0-F1-S1/{_SHARED_WU_BETA}.md"
+
+        # Simulate session "alpha" making a transition for its task.
+        alpha_state_dir = workspace / ".devbench" / "sessions" / "alpha"
+        alpha_state_dir.mkdir(parents=True)
+
+        mgr = BacklogManager()
+        mgr._set_status(wu_alpha_path, backlog_index, _SHARED_WU_ALPHA, "in-progress")
+
+        # Simulate session "beta" making a transition for its own task.
+        beta_state_dir = workspace / ".devbench" / "sessions" / "beta"
+        beta_state_dir.mkdir(parents=True)
+
+        mgr._set_status(wu_beta_path, backlog_index, _SHARED_WU_BETA, "in-progress")
+
+        # Both aggregates must be in the workspace-shared window-stats dir.
+        shared_dir = aggregate_dir(workspace)
+        assert shared_dir.is_dir(), f"Workspace-shared window-stats dir missing at {shared_dir}"
+
+        agg_alpha = read_aggregate(workspace, _SHARED_WU_ALPHA)
+        assert agg_alpha is not None, (
+            f"No aggregate written for {_SHARED_WU_ALPHA} at {aggregate_path(workspace, _SHARED_WU_ALPHA)}"
+        )
+        assert agg_alpha.transitions[0].new_status == "in-progress"
+
+        agg_beta = read_aggregate(workspace, _SHARED_WU_BETA)
+        assert agg_beta is not None, (
+            f"No aggregate written for {_SHARED_WU_BETA} at {aggregate_path(workspace, _SHARED_WU_BETA)}"
+        )
+        assert agg_beta.transitions[0].new_status == "in-progress"
+
+        # No aggregate must exist inside any per-session state directory.
+        for session_name in ("alpha", "beta"):
+            per_session_stats = workspace / ".devbench" / "sessions" / session_name / "window-stats"
+            assert not per_session_stats.exists(), (
+                f"window-stats appeared inside per-session dir {per_session_stats} -- "
+                "aggregates must be workspace-shared"
+            )
+
+    def test_aggregate_files_not_nested_inside_session_dirs(self, tmp_path: Path) -> None:
+        """Aggregate JSON files sit directly under ``.devbench/window-stats/``.
+
+        Verifies the path returned by ``aggregate_path`` is workspace-rooted,
+        NOT session-rooted -- regardless of how many session state dirs exist.
+        """
+        from devbench.reporting.window_stats import aggregate_path
+
+        workspace = tmp_path
+
+        # Create several session dirs to ensure nothing bleeds their path into
+        # the aggregate calculation.
+        for name in ("alpha", "beta", "gamma"):
+            (workspace / ".devbench" / "sessions" / name).mkdir(parents=True)
+
+        path = aggregate_path(workspace, "E0-F1-S1-T1")
+
+        # The aggregate path must be exactly <workspace>/.devbench/window-stats/E0-F1-S1-T1.json
+        assert path == workspace / ".devbench" / "window-stats" / "E0-F1-S1-T1.json", (
+            f"aggregate_path returned {path!r}; expected workspace-rooted path"
+        )
+        # Must not contain any sessions/ component.
+        assert "sessions" not in path.parts, f"aggregate_path contains 'sessions' component: {path}"
+
+    @pytest.mark.parametrize(
+        "session_name,wu_id",
+        [
+            ("alpha", _SHARED_WU_ALPHA),
+            ("beta", _SHARED_WU_BETA),
+        ],
+    )
+    def test_read_aggregate_resolves_from_workspace_root_not_session_dir(
+        self, tmp_path: Path, session_name: str, wu_id: str
+    ) -> None:
+        """read_aggregate uses workspace_root -- the aggregate is visible
+        regardless of which session dir context the caller passes (AC-192-16).
+
+        A transition written by session A can be read back by session B because
+        both use the same workspace_root argument.
+        """
+        import datetime as _dt
+
+        from devbench.reporting.window_stats import read_aggregate, update_aggregate
+
+        workspace = tmp_path
+
+        # Write aggregate via session alpha's context (still uses workspace_root).
+        ts = _dt.datetime(2026, 5, 16, tzinfo=_dt.UTC)
+        update_aggregate(workspace, wu_id, "in-progress", ts)
+
+        # Read aggregate as if from session beta's context (same workspace_root).
+        agg = read_aggregate(workspace, wu_id)
+        assert agg is not None, (
+            f"Aggregate for {wu_id!r} written by session {session_name!r} "
+            "is not visible via workspace_root read -- invariant broken"
+        )
+        assert agg.task_id == wu_id
+        assert agg.transitions[0].new_status == "in-progress"

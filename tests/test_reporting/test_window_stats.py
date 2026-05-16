@@ -2,6 +2,8 @@
 
 Pins the per-task aggregate write contract, atomic-write semantics,
 schema-version invalidation, and the rebuild-from-log parity guarantee.
+
+AC-192-16: window-stats + proposal lifecycle remain workspace-shared across sessions.
 """
 
 from __future__ import annotations
@@ -9,6 +11,8 @@ from __future__ import annotations
 import json as _json
 from datetime import UTC, datetime
 from pathlib import Path
+
+import pytest
 
 from devbench.reporting.window_stats import (
     WINDOW_STATS_DIR_NAME,
@@ -262,3 +266,158 @@ class TestDataclasses:
         assert agg.task_id == "E0-F1-S1-T1"
         assert agg.transitions == []
         assert agg.schema_version == 1
+
+
+# ---------------------------------------------------------------------------
+# AC-192-16: proposal lifecycle stays workspace-shared across sessions
+# ---------------------------------------------------------------------------
+
+_PROPOSAL_SOURCE_TASK = "E0-F1-S1-T1"
+_PROPOSAL_SOURCE_TASK_2 = "E0-F1-S1-T2"
+
+
+def _make_minimal_proposal(source_task_id: str) -> object:
+    """Return a minimal ``Proposal`` for use in tests.
+
+    Returns:
+        A ``Proposal`` instance for use in workspace-shared invariant tests.
+    """
+    from devbench.backlog.proposal import Proposal, ProposedTask
+
+    return Proposal(
+        source_task_id=source_task_id,
+        generated_at="2026-05-16T10:00:00Z",
+        rejection_reason="test rejection reason for workspace-shared invariant",
+        proposed_tasks=[
+            ProposedTask(
+                suggested_id=f"{source_task_id.rsplit('-', 1)[0]}-T99",
+                title="Fix the thing",
+                files_to_own=["src/devbench/foo.py"],
+                linked_scenarios=["S1"],
+                suggested_acs=["AC-001 the fix must do X so that Y behaves correctly"],
+                suggested_approach=(
+                    "TDD red: write a failing test that exercises the missing behaviour. "
+                    "TDD green: implement the minimum change. "
+                    "TDD refactor: remove duplication. "
+                    "Verify with make validate."
+                ),
+            )
+        ],
+    )
+
+
+class TestProposalLifecycleWorkspaceShared:
+    """AC-192-16: proposal lifecycle (.devbench/proposals/, .devbench/rejected-proposals/)
+    is workspace-shared, not per-session.
+
+    A proposal written by session alpha is visible to session beta because both
+    consult the same ``<workspace>/.devbench/proposals/`` directory.
+    """
+
+    def test_proposal_written_by_session_alpha_visible_from_session_beta(self, tmp_path: Path) -> None:
+        """A proposal written in one session's context is readable in another's (AC-192-16).
+
+        Session alpha writes a proposal for its source task.  Session beta (different
+        state_dir, disjoint scope) can list and read the same proposal because
+        ``list_proposals`` and ``read_proposal`` are keyed on workspace_root alone.
+        """
+        from devbench.backlog.proposal import list_proposals, read_proposal, write_proposal
+
+        workspace = tmp_path
+
+        # Simulate session alpha state dir being present but NOT being used by proposals.
+        (workspace / ".devbench" / "sessions" / "alpha").mkdir(parents=True)
+        (workspace / ".devbench" / "sessions" / "beta").mkdir(parents=True)
+
+        proposal = _make_minimal_proposal(_PROPOSAL_SOURCE_TASK)
+
+        # Session alpha writes the proposal (using workspace_root, not alpha-session-dir).
+        written_path = write_proposal(workspace, proposal)
+        assert written_path == workspace / ".devbench" / "proposals" / f"{_PROPOSAL_SOURCE_TASK}.json"
+
+        # Session beta lists proposals using the same workspace_root.
+        proposals = list_proposals(workspace)
+        assert len(proposals) == 1, f"Session beta expected to see 1 proposal, found {len(proposals)}"
+        assert proposals[0].source_task_id == _PROPOSAL_SOURCE_TASK
+
+        # Session beta can read the specific proposal by task ID.
+        loaded = read_proposal(workspace, _PROPOSAL_SOURCE_TASK)
+        assert loaded.source_task_id == _PROPOSAL_SOURCE_TASK
+        assert loaded.rejection_reason == proposal.rejection_reason
+
+    def test_proposals_dir_not_nested_inside_session_dirs(self, tmp_path: Path) -> None:
+        """``write_proposal`` places the JSON under ``<workspace>/.devbench/proposals/``,
+        never inside a per-session state directory (AC-192-16).
+        """
+        from devbench.backlog.proposal import write_proposal
+
+        workspace = tmp_path
+
+        for name in ("alpha", "beta"):
+            (workspace / ".devbench" / "sessions" / name).mkdir(parents=True)
+
+        proposal = _make_minimal_proposal(_PROPOSAL_SOURCE_TASK)
+        written_path = write_proposal(workspace, proposal)
+
+        # Must be under the workspace-shared proposals dir.
+        expected_dir = workspace / ".devbench" / "proposals"
+        assert written_path.parent == expected_dir, (
+            f"Proposal written to {written_path.parent!r}, expected {expected_dir!r}"
+        )
+        assert "sessions" not in written_path.parts, f"Proposal path contains 'sessions' component: {written_path}"
+
+    def test_two_sessions_proposals_both_visible_via_list_proposals(self, tmp_path: Path) -> None:
+        """Proposals emitted by two different sessions are aggregated by list_proposals (AC-192-16).
+
+        Session alpha emits a proposal for T1; session beta emits one for T2.
+        Calling list_proposals(workspace_root) returns both, regardless of which
+        session's perspective is used.
+        """
+        from devbench.backlog.proposal import list_proposals, write_proposal
+
+        workspace = tmp_path
+
+        for name in ("alpha", "beta"):
+            (workspace / ".devbench" / "sessions" / name).mkdir(parents=True)
+
+        proposal_alpha = _make_minimal_proposal(_PROPOSAL_SOURCE_TASK)
+        proposal_beta = _make_minimal_proposal(_PROPOSAL_SOURCE_TASK_2)
+
+        write_proposal(workspace, proposal_alpha)
+        write_proposal(workspace, proposal_beta)
+
+        proposals = list_proposals(workspace)
+        source_ids = {p.source_task_id for p in proposals}
+        assert _PROPOSAL_SOURCE_TASK in source_ids, (
+            f"Proposal from session alpha ({_PROPOSAL_SOURCE_TASK!r}) not found in list_proposals result"
+        )
+        assert _PROPOSAL_SOURCE_TASK_2 in source_ids, (
+            f"Proposal from session beta ({_PROPOSAL_SOURCE_TASK_2!r}) not found in list_proposals result"
+        )
+
+    @pytest.mark.parametrize(
+        "session_name",
+        ["alpha", "beta", "gamma"],
+    )
+    def test_list_proposals_returns_same_result_regardless_of_calling_session(
+        self, tmp_path: Path, session_name: str
+    ) -> None:
+        """list_proposals result is identical regardless of which session's context
+        the caller is in (AC-192-16).
+
+        The result depends only on workspace_root, not on any session identifier.
+        """
+        from devbench.backlog.proposal import list_proposals, write_proposal
+
+        workspace = tmp_path
+
+        # Pre-populate a proposal written by some arbitrary session.
+        (workspace / ".devbench" / "sessions" / "origin-session").mkdir(parents=True)
+        write_proposal(workspace, _make_minimal_proposal(_PROPOSAL_SOURCE_TASK))
+
+        # Now create the calling session's dir to simulate context.
+        (workspace / ".devbench" / "sessions" / session_name).mkdir(parents=True, exist_ok=True)
+
+        proposals = list_proposals(workspace)
+        assert len(proposals) == 1, f"Session {session_name!r} expected 1 proposal but found {len(proposals)}"
+        assert proposals[0].source_task_id == _PROPOSAL_SOURCE_TASK

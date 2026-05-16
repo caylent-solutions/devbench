@@ -1254,3 +1254,336 @@ class TestBootstrapEnvironmentSkillSelfVerifyLoop:
             "bootstrap-environment/SKILL.md must pause on failure with a diagnostic "
             "and suggested fix for the operator"
         )
+
+
+# ---------------------------------------------------------------------------
+# configure-devbench/SKILL.md tests  (AC-191-6)
+# ---------------------------------------------------------------------------
+
+CONFIGURE_DEVBENCH_SKILL_PATH = (
+    Path(__file__).parent.parent.parent
+    / "plugin"
+    / "devbench"
+    / "skills"
+    / "configure-devbench"
+    / "SKILL.md"
+)
+
+
+@pytest.mark.unit
+class TestConfigureDevbenchSkillFrontmatter:
+    """AC-191-6: configure-devbench/SKILL.md must have valid frontmatter with required fields."""
+
+    def test_skill_file_exists(self) -> None:
+        """AC-191-6: configure-devbench/SKILL.md must exist."""
+        assert CONFIGURE_DEVBENCH_SKILL_PATH.exists(), (
+            f"configure-devbench/SKILL.md not found at {CONFIGURE_DEVBENCH_SKILL_PATH}"
+        )
+
+    def test_frontmatter_name_is_configure_devbench(self) -> None:
+        """AC-191-6: Frontmatter must declare name: configure-devbench."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        assert "name: configure-devbench" in content, (
+            "configure-devbench/SKILL.md frontmatter must contain 'name: configure-devbench'"
+        )
+
+    def test_frontmatter_model_is_sonnet(self) -> None:
+        """AC-191-6: Frontmatter must declare model: sonnet per spec section 4.6.5."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        assert "model: sonnet" in content, (
+            "configure-devbench/SKILL.md frontmatter must contain 'model: sonnet'"
+        )
+
+    def test_frontmatter_is_yaml_delimited(self) -> None:
+        """AC-191-6: Frontmatter must be delimited by YAML front-matter markers."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        assert content.startswith("---"), (
+            "configure-devbench/SKILL.md must start with YAML frontmatter delimiter '---'"
+        )
+        assert content.count("---") >= 2, (
+            "configure-devbench/SKILL.md must have at least two '---' markers (open + close frontmatter)"
+        )
+
+
+@pytest.mark.unit
+class TestConfigureDevbenchSkillTools:
+    """AC-191-6: configure-devbench/SKILL.md must declare tools: Read, Write, Edit, Bash."""
+
+    def test_skill_declares_read_tool(self) -> None:
+        """configure-devbench skill must declare the Read tool."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        assert "Read" in content, "configure-devbench/SKILL.md must declare the Read tool"
+
+    def test_skill_declares_write_tool(self) -> None:
+        """configure-devbench skill must declare the Write tool."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        assert "Write" in content, "configure-devbench/SKILL.md must declare the Write tool"
+
+    def test_skill_declares_edit_tool(self) -> None:
+        """configure-devbench skill must declare the Edit tool."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        assert "Edit" in content, "configure-devbench/SKILL.md must declare the Edit tool"
+
+    def test_skill_declares_bash_tool(self) -> None:
+        """configure-devbench skill must declare the Bash tool."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        assert "Bash" in content, "configure-devbench/SKILL.md must declare the Bash tool"
+
+
+@pytest.mark.unit
+class TestConfigureDevbenchSkillReposSection:
+    """AC-191-6: Skill must walk the operator through the repos RuntimeConfig section."""
+
+    def test_skill_covers_repos_section(self) -> None:
+        """Skill must mention the repos: RuntimeConfig section."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        assert "repos" in content, (
+            "configure-devbench/SKILL.md must walk operator through the 'repos' RuntimeConfig section"
+        )
+
+    def test_skill_covers_checkout_directory(self) -> None:
+        """Skill must prompt for checkout_directory within the repos section."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        assert "checkout_directory" in content, (
+            "configure-devbench/SKILL.md must prompt for 'checkout_directory' in the repos section"
+        )
+
+    def test_skill_covers_default_branch(self) -> None:
+        """Skill must prompt for default_branch within the repos section."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        assert "default_branch" in content, (
+            "configure-devbench/SKILL.md must prompt for 'default_branch' in the repos section"
+        )
+
+    def test_skill_covers_merge_strategy(self) -> None:
+        """Skill must prompt for merge_strategy within the repos section."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        assert "merge_strategy" in content, (
+            "configure-devbench/SKILL.md must prompt for 'merge_strategy' in the repos section"
+        )
+
+
+@pytest.mark.unit
+class TestConfigureDevbenchSkillTimeoutsLimitsSection:
+    """AC-191-6: Skill must walk the operator through timeouts and limits sections."""
+
+    def test_skill_covers_timeouts(self) -> None:
+        """Skill must mention the timeouts: RuntimeConfig section."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        assert "timeouts" in content, (
+            "configure-devbench/SKILL.md must walk operator through the 'timeouts' RuntimeConfig section"
+        )
+
+    def test_skill_covers_limits(self) -> None:
+        """Skill must mention the limits: RuntimeConfig section."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        assert "limits" in content, (
+            "configure-devbench/SKILL.md must walk operator through the 'limits' RuntimeConfig section"
+        )
+
+
+@pytest.mark.unit
+class TestConfigureDevbenchSkillModelSection:
+    """AC-191-6: Skill must walk the operator through judge_model and executor_model settings."""
+
+    def test_skill_covers_judge_model(self) -> None:
+        """Skill must mention judge_model (agent_models) configuration."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        assert "judge_model" in content or "agent_models" in content or "agents:" in content, (
+            "configure-devbench/SKILL.md must walk operator through judge_model / agent_models section"
+        )
+
+    def test_skill_covers_executor_model(self) -> None:
+        """Skill must mention executor model configuration."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        assert "executor_model" in content or "executor" in content, (
+            "configure-devbench/SKILL.md must walk operator through the executor_model setting"
+        )
+
+
+@pytest.mark.unit
+class TestConfigureDevbenchSkillBedrockSection:
+    """AC-191-6: Skill must walk the operator through bedrock_region and use_bedrock settings."""
+
+    def test_skill_covers_use_bedrock(self) -> None:
+        """Skill must mention the use_bedrock RuntimeConfig field."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        assert "use_bedrock" in content, (
+            "configure-devbench/SKILL.md must walk operator through the 'use_bedrock' setting"
+        )
+
+    def test_skill_covers_bedrock_region(self) -> None:
+        """Skill must mention the bedrock_region RuntimeConfig field."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        assert "bedrock_region" in content, (
+            "configure-devbench/SKILL.md must walk operator through the 'bedrock_region' setting"
+        )
+
+
+@pytest.mark.unit
+class TestConfigureDevbenchSkillTaskFactorySection:
+    """AC-191-6: Skill must walk the operator through task_factory section."""
+
+    def test_skill_covers_task_factory(self) -> None:
+        """Skill must mention the task_factory: RuntimeConfig section."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        assert "task_factory" in content, (
+            "configure-devbench/SKILL.md must walk operator through the 'task_factory' section"
+        )
+
+
+@pytest.mark.unit
+class TestConfigureDevbenchSkillManifestAmendmentSection:
+    """AC-191-6: Skill must walk the operator through manifest_amendment section."""
+
+    def test_skill_covers_manifest_amendment(self) -> None:
+        """Skill must mention the manifest_amendment: RuntimeConfig section."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        assert "manifest_amendment" in content, (
+            "configure-devbench/SKILL.md must walk operator through the 'manifest_amendment' section"
+        )
+
+
+@pytest.mark.unit
+class TestConfigureDevbenchSkillValidateDebugSection:
+    """AC-191-6: Skill must walk the operator through validate and debug sections."""
+
+    def test_skill_covers_validate(self) -> None:
+        """Skill must mention the validate: RuntimeConfig section."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        assert "validate" in content, (
+            "configure-devbench/SKILL.md must walk operator through the 'validate' section"
+        )
+
+    def test_skill_covers_debug(self) -> None:
+        """Skill must mention the debug: RuntimeConfig section."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        assert "debug" in content, (
+            "configure-devbench/SKILL.md must walk operator through the 'debug' section"
+        )
+
+
+@pytest.mark.unit
+class TestConfigureDevbenchSkillStopHookSection:
+    """AC-191-6: Skill must walk the operator through stop_hook and hook_tail sections."""
+
+    def test_skill_covers_stop_hook(self) -> None:
+        """Skill must mention the stop_hook: RuntimeConfig section."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        assert "stop_hook" in content, (
+            "configure-devbench/SKILL.md must walk operator through the 'stop_hook' section"
+        )
+
+    def test_skill_covers_hook_tail(self) -> None:
+        """Skill must mention the hook_tail: RuntimeConfig section."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        assert "hook_tail" in content, (
+            "configure-devbench/SKILL.md must walk operator through the 'hook_tail' section"
+        )
+
+
+@pytest.mark.unit
+class TestConfigureDevbenchSkillGitOpsSection:
+    """AC-191-6: Skill must walk the operator through git_ops section with all sub-fields."""
+
+    def test_skill_covers_git_ops(self) -> None:
+        """Skill must mention the git_ops: RuntimeConfig section."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        assert "git_ops" in content, (
+            "configure-devbench/SKILL.md must walk operator through the 'git_ops' section"
+        )
+
+    def test_skill_covers_single_branch(self) -> None:
+        """Skill must mention single_branch within the git_ops section."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        assert "single_branch" in content, (
+            "configure-devbench/SKILL.md must prompt for 'single_branch' in the git_ops section"
+        )
+
+    def test_skill_covers_defer_pr(self) -> None:
+        """Skill must mention defer_pr within the git_ops section."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        assert "defer_pr" in content, (
+            "configure-devbench/SKILL.md must prompt for 'defer_pr' in the git_ops section"
+        )
+
+    def test_skill_covers_auto_finalize(self) -> None:
+        """Skill must mention auto_finalize within the git_ops section."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        assert "auto_finalize" in content, (
+            "configure-devbench/SKILL.md must prompt for 'auto_finalize' in the git_ops section"
+        )
+
+    def test_skill_covers_auto_merge(self) -> None:
+        """Skill must mention auto_merge within the git_ops section."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        assert "auto_merge" in content, (
+            "configure-devbench/SKILL.md must prompt for 'auto_merge' in the git_ops section"
+        )
+
+
+@pytest.mark.unit
+class TestConfigureDevbenchSkillBacklogSection:
+    """AC-191-6: Skill must walk the operator through the backlog section (issue #189)."""
+
+    def test_skill_covers_backlog_section(self) -> None:
+        """Skill must mention the backlog: RuntimeConfig section."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        assert "backlog" in content, (
+            "configure-devbench/SKILL.md must walk operator through the 'backlog' section"
+        )
+
+    def test_skill_covers_default_status_for_new_work_units(self) -> None:
+        """Skill must mention default_status_for_new_work_units within the backlog section."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        assert "default_status_for_new_work_units" in content, (
+            "configure-devbench/SKILL.md must prompt for 'default_status_for_new_work_units' "
+            "in the backlog section"
+        )
+
+
+@pytest.mark.unit
+class TestConfigureDevbenchSkillQuotaHandlingSection:
+    """AC-191-6: Skill must walk the operator through the quota_handling section (issue #193)."""
+
+    def test_skill_covers_quota_handling(self) -> None:
+        """Skill must mention the quota_handling: RuntimeConfig section."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        assert "quota_handling" in content, (
+            "configure-devbench/SKILL.md must walk operator through the 'quota_handling' section"
+        )
+
+
+@pytest.mark.unit
+class TestConfigureDevbenchSkillRoundTripValidation:
+    """AC-191-6: Skill must round-trip values through RuntimeConfig before writing YAML."""
+
+    def test_skill_references_runtimeconfig(self) -> None:
+        """Skill must explicitly reference RuntimeConfig or config_loader validation."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        assert "RuntimeConfig" in content or "config_loader" in content or "devbench.yaml" in content, (
+            "configure-devbench/SKILL.md must validate operator values via RuntimeConfig "
+            "before writing backlog/config/devbench.yaml"
+        )
+
+    def test_skill_round_trips_values_immediately(self) -> None:
+        """Skill must round-trip each value through RuntimeConfig parsing immediately after input."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        assert any(kw in content.lower() for kw in ("round-trip", "round trip", "validate", "validation")), (
+            "configure-devbench/SKILL.md must specify that each operator-provided value is "
+            "round-tripped through RuntimeConfig parsing immediately after input"
+        )
+
+    def test_skill_rejects_invalid_values_with_reprompt(self) -> None:
+        """Skill must reject invalid values and re-prompt the operator."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        assert any(kw in content.lower() for kw in ("reject", "re-prompt", "reprompt", "re-ask", "invalid")), (
+            "configure-devbench/SKILL.md must reject invalid values and re-prompt the operator"
+        )
+
+    def test_skill_writes_devbench_yaml(self) -> None:
+        """Skill must write backlog/config/devbench.yaml as its final output."""
+        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
+        assert "devbench.yaml" in content, (
+            "configure-devbench/SKILL.md must write backlog/config/devbench.yaml as its output"
+        )

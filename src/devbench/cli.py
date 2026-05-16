@@ -173,6 +173,7 @@ from devbench.constants import (
     STATUS_SEPARATOR_WIDTH,
     VALID_TDD_PHASES,
 )
+from devbench.drain import cancel_drain, read_drain_state, request_drain
 from devbench.log_setup import setup_logging
 from devbench.plugin_shadow import (
     materialise_shadow_plugin,
@@ -299,6 +300,25 @@ def _render_scope_banner(include: list[str], exclude: list[str], started_at: str
     exclude_part = f"exclude=[{', '.join(exclude)}]"
     started_part = f"(started {started_at})" if started_at else "(one-off)"
     print(f"SCOPE: {include_part} {exclude_part} {started_part}")
+
+
+def _render_drain_banner(workspace_root: Path) -> None:
+    """Print the ``DRAIN REQUESTED: at <ts> by <user> (reason: <text>)`` banner.
+
+    Reads the drain signal file from *workspace_root* non-destructively via
+    :func:`~devbench.drain.read_drain_state`. When no signal is present this
+    function is a no-op. Output goes to stdout immediately before the Status
+    Summary header (spec section 4.3.5, AC-188-7).
+
+    Args:
+        workspace_root: Workspace directory from which the drain signal path is
+            resolved.
+    """
+    state = read_drain_state(workspace_root)
+    if state is None:
+        return
+    reason_part = state.reason if state.reason else "(none)"
+    print(f"DRAIN REQUESTED: at {state.requested_at.isoformat()} by {state.requested_by} (reason: {reason_part})")
 
 
 def _print_active_units(active: list[WorkUnit]) -> None:
@@ -449,6 +469,8 @@ def cmd_status(*argv: str) -> int:
         return 1
     if scope.has_scope:
         _render_scope_banner(scope.include, scope.exclude, scope.started_at)
+
+    _render_drain_banner(WORKSPACE_ROOT)
 
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     units = parser.parse_index()
@@ -5266,6 +5288,88 @@ def cmd_scope(*argv: str) -> int:
     return 2
 
 
+def _parse_drain_argv(argv: tuple[str, ...]) -> tuple[str | None, str, int, str]:
+    """Parse ``cmd_drain`` arguments into (mode, reason, error_rc, error_msg).
+
+    Returns a 4-tuple:
+    - ``mode``: one of ``"request"``, ``"cancel"``, ``"status"``, or ``None`` on error.
+    - ``reason``: the value of ``--reason`` (empty string when not given).
+    - ``error_rc``: 0 on success, 2 on error.
+    - ``error_msg``: human-readable error description (empty string on success).
+
+    Raises:
+        SystemExit: never -- all errors are returned with error_rc=2.
+    """
+    has_cancel = "--cancel" in argv
+    has_status = "--status" in argv
+    has_reason = "--reason" in argv
+
+    exclusive_count = sum([has_cancel, has_status, has_reason])
+    if exclusive_count > 1:
+        return None, "", 2, "ERROR: --cancel, --status, and --reason are mutually exclusive"
+
+    if has_cancel:
+        return "cancel", "", 0, ""
+    if has_status:
+        return "status", "", 0, ""
+
+    # Build reason from --reason VALUE
+    reason = ""
+    if has_reason:
+        idx = argv.index("--reason")
+        if idx + 1 >= len(argv):
+            return None, "", 2, "ERROR: --reason requires a value"
+        reason = argv[idx + 1]
+
+    return "request", reason, 0, ""
+
+
+def cmd_drain(*argv: str) -> int:
+    """Manage the drain signal for graceful orchestrator shutdown (spec section 4.3.2).
+
+    Invocation forms::
+
+        devbench drain                    -- request drain with empty reason
+        devbench drain --reason "<text>"  -- request drain with reason
+        devbench drain --cancel           -- withdraw drain request; idempotent
+        devbench drain --status           -- print drain state or 'no drain pending'; rc=0
+
+    All success paths return rc=0.  Mutually exclusive flag combinations
+    (e.g. ``--cancel --status``) and ``--reason`` without a following value
+    return rc=2 with a distinct diagnostic on stderr for each error condition.
+
+    Args:
+        *argv: Zero or more CLI flags as individual strings.
+
+    Returns:
+        0 on success; 2 on invalid argument combination or missing ``--reason`` value.
+
+    Raises:
+        OSError: Propagated from :func:`~devbench.drain.request_drain` or
+            :func:`~devbench.drain.cancel_drain` when a filesystem operation
+            fails for a reason other than a missing file.
+    """
+    mode, reason, error_rc, error_msg = _parse_drain_argv(argv)
+    if error_rc != 0:
+        print(error_msg, file=sys.stderr)
+        return error_rc
+
+    if mode == "cancel":
+        cancel_drain(WORKSPACE_ROOT)
+        return 0
+
+    if mode == "status":
+        state = read_drain_state(WORKSPACE_ROOT)
+        if state is None:
+            print("no drain pending")
+        else:
+            print(str(state))
+        return 0
+
+    request_drain(WORKSPACE_ROOT, reason=reason)
+    return 0
+
+
 def cmd_request_amendment(unit_id: str) -> int:
     """Register an amendment request for ``unit_id``.
 
@@ -6958,6 +7062,14 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
             "logs/legacy/<session>.parquet (requires `pip install devbench[archive]`)"
         ),
     ),
+    "drain": (
+        cmd_drain,
+        0,
+        (
+            "Graceful orchestrator stop request (spec 4.3.2, issue #188): "
+            "drain [--reason '<text>'] | drain --cancel | drain --status"
+        ),
+    ),
     "start": (cmd_start, 0, "Run orchestrate skill via Agent SDK (non-interactive)"),
     "scope": (
         cmd_scope,
@@ -7097,6 +7209,8 @@ _VARIADIC_COMMANDS: frozenset[str] = frozenset(
         "next",
         # Issue #196 E2-F7: scope set / clear / show subcommand
         "scope",
+        # Issue #188 E3-F2: drain --reason / --cancel / --status flags
+        "drain",
     }
 )
 

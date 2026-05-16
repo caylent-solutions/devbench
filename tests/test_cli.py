@@ -13954,3 +13954,341 @@ class TestCmdScopeParametrised:
             next_rc = cli.cmd_next()
         assert next_rc == 0
         assert "NO_ACTIONABLE_IN_SCOPE" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# cmd_drain tests (E3-F2-S1-T1, issue #188)
+# ---------------------------------------------------------------------------
+
+
+class TestCmdDrainRegistered:
+    """cmd_drain is registered in _COMMANDS and _VARIADIC_COMMANDS."""
+
+    @pytest.mark.unit
+    def test_drain_in_commands(self) -> None:
+        """'drain' key must be present in _COMMANDS."""
+        assert "drain" in cli._COMMANDS
+
+    @pytest.mark.unit
+    def test_drain_in_variadic_commands(self) -> None:
+        """'drain' must be in _VARIADIC_COMMANDS so flag parsing works."""
+        assert "drain" in cli._VARIADIC_COMMANDS
+
+    @pytest.mark.unit
+    def test_drain_command_maps_to_cmd_drain(self) -> None:
+        """_COMMANDS['drain'] callable must be cli.cmd_drain."""
+        func, _min_args, _desc = cli._COMMANDS["drain"]
+        assert func is cli.cmd_drain
+
+
+class TestCmdDrainNoArgs:
+    """devbench drain (no args) -- creates drain.signal with empty reason (AC-188-1)."""
+
+    @pytest.mark.unit
+    def test_creates_signal_file(self, tmp_path: Path) -> None:
+        """drain with no args writes drain.signal to workspace root."""
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_drain()
+        assert rc == 0
+        signal = tmp_path / ".devbench" / "drain.signal"
+        assert signal.exists(), "drain.signal must be created"
+
+    @pytest.mark.unit
+    def test_signal_file_has_valid_json(self, tmp_path: Path) -> None:
+        """drain.signal contains a JSON object with required keys."""
+        import json as _json
+
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            cli.cmd_drain()
+        signal = tmp_path / ".devbench" / "drain.signal"
+        data = _json.loads(signal.read_text())
+        assert "requested_at" in data
+        assert "requested_by" in data
+        assert "reason" in data
+
+    @pytest.mark.unit
+    def test_signal_file_has_empty_reason(self, tmp_path: Path) -> None:
+        """drain with no args writes empty reason."""
+        import json as _json
+
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            cli.cmd_drain()
+        signal = tmp_path / ".devbench" / "drain.signal"
+        data = _json.loads(signal.read_text())
+        assert data["reason"] == ""
+
+    @pytest.mark.unit
+    def test_return_code_is_zero(self, tmp_path: Path) -> None:
+        """drain returns rc=0 on success."""
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_drain()
+        assert rc == 0
+
+
+class TestCmdDrainWithReason:
+    """devbench drain --reason '<text>' -- creates drain.signal with given reason (AC-188-1)."""
+
+    @pytest.mark.unit
+    def test_creates_signal_with_reason(self, tmp_path: Path) -> None:
+        """drain --reason writes the given reason into drain.signal."""
+        import json as _json
+
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_drain("--reason", "planned maintenance")
+        assert rc == 0
+        signal = tmp_path / ".devbench" / "drain.signal"
+        data = _json.loads(signal.read_text())
+        assert data["reason"] == "planned maintenance"
+
+    @pytest.mark.unit
+    def test_return_code_is_zero(self, tmp_path: Path) -> None:
+        """drain --reason returns rc=0."""
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_drain("--reason", "maintenance")
+        assert rc == 0
+
+
+class TestCmdDrainCancel:
+    """devbench drain --cancel -- removes marker; idempotent (AC-188-2)."""
+
+    @pytest.mark.unit
+    def test_removes_existing_signal(self, tmp_path: Path) -> None:
+        """drain --cancel deletes an existing drain.signal."""
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            cli.cmd_drain()
+            rc = cli.cmd_drain("--cancel")
+        assert rc == 0
+        signal = tmp_path / ".devbench" / "drain.signal"
+        assert not signal.exists(), "drain.signal must be deleted after --cancel"
+
+    @pytest.mark.unit
+    def test_idempotent_when_no_signal(self, tmp_path: Path) -> None:
+        """drain --cancel is idempotent -- rc=0 even when no signal file exists."""
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_drain("--cancel")
+        assert rc == 0
+
+    @pytest.mark.unit
+    def test_return_code_is_zero(self, tmp_path: Path) -> None:
+        """drain --cancel returns rc=0 in both present and absent cases."""
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_drain("--cancel")
+        assert rc == 0
+
+
+class TestCmdDrainStatus:
+    """devbench drain --status -- prints state or 'no drain pending'; rc=0 (AC-188-3)."""
+
+    @pytest.mark.unit
+    def test_prints_no_drain_pending_when_absent(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """drain --status prints 'no drain pending' when no signal file exists."""
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_drain("--status")
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "no drain pending" in out
+
+    @pytest.mark.unit
+    def test_prints_drain_state_when_present(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """drain --status prints drain state when signal file exists."""
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            cli.cmd_drain("--reason", "batch closed")
+            rc = cli.cmd_drain("--status")
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "drain pending" in out
+
+    @pytest.mark.unit
+    def test_return_code_is_zero_when_pending(self, tmp_path: Path) -> None:
+        """drain --status returns rc=0 when drain is pending."""
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            cli.cmd_drain()
+            rc = cli.cmd_drain("--status")
+        assert rc == 0
+
+    @pytest.mark.unit
+    def test_return_code_is_zero_when_absent(self, tmp_path: Path) -> None:
+        """drain --status returns rc=0 when no signal is pending."""
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_drain("--status")
+        assert rc == 0
+
+    @pytest.mark.unit
+    def test_does_not_delete_signal_file(self, tmp_path: Path) -> None:
+        """drain --status does not consume the signal (read-only)."""
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            cli.cmd_drain()
+            cli.cmd_drain("--status")
+        signal = tmp_path / ".devbench" / "drain.signal"
+        assert signal.exists(), "drain --status must not delete drain.signal"
+
+
+class TestCmdDrainMutuallyExclusive:
+    """Mutually exclusive flags produce rc=2 and an error on stderr."""
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ("--cancel", "--status"),
+            ("--status", "--reason", "x"),
+            ("--cancel", "--reason", "x"),
+            ("--cancel", "--status", "--reason", "x"),
+        ],
+    )
+    def test_mutual_exclusion_error(
+        self, argv: tuple[str, ...], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Combining mutually exclusive flags yields rc=2."""
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_drain(*argv)
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert err, "An error message must be written to stderr"
+        assert "--cancel" in err or "--status" in err or "mutually exclusive" in err
+
+    @pytest.mark.unit
+    def test_reason_without_value_rc(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """--reason without a following value yields rc=2."""
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_drain("--reason")
+        assert rc == 2
+
+    @pytest.mark.unit
+    def test_reason_without_value_stderr(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """--reason without a following value emits the missing-value error on stderr."""
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            cli.cmd_drain("--reason")
+        err = capsys.readouterr().err
+        assert "requires a value" in err, f"Expected 'requires a value' in stderr, got: {err!r}"
+
+
+class TestCmdStatusDrainBanner:
+    """cmd_status prepends a DRAIN REQUESTED banner when drain.signal is present (AC-188-7)."""
+
+    @pytest.mark.unit
+    def test_drain_banner_shown_when_signal_present(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """cmd_status renders 'DRAIN REQUESTED' banner when drain.signal exists."""
+        # Create drain signal first
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            cli.cmd_drain("--reason", "pre-release freeze")
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = []
+        mock_parser.get_parallel_candidates.return_value = []
+        mock_parser.all_done.return_value = True
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+        ):
+            rc = cli.cmd_status()
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "DRAIN REQUESTED" in out
+
+    @pytest.mark.unit
+    def test_drain_banner_contains_reason(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """cmd_status drain banner includes the reason text."""
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            cli.cmd_drain("--reason", "pre-release freeze")
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = []
+        mock_parser.get_parallel_candidates.return_value = []
+        mock_parser.all_done.return_value = True
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+        ):
+            cli.cmd_status()
+
+        out = capsys.readouterr().out
+        assert "pre-release freeze" in out
+
+    @pytest.mark.unit
+    def test_no_drain_banner_when_signal_absent(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """cmd_status does not render drain banner when no signal file exists."""
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = []
+        mock_parser.get_parallel_candidates.return_value = []
+        mock_parser.all_done.return_value = True
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+        ):
+            rc = cli.cmd_status()
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "DRAIN REQUESTED" not in out
+
+
+class TestCmdDrainIntegration:
+    """Integration tests: full cmd_drain flows against a real tmp workspace fixture (AC-188-1..3).
+
+    No boundary-crossing mocks -- only WORKSPACE_ROOT is patched to isolate
+    the workspace directory. The drain module functions are called for real.
+    """
+
+    @pytest.mark.unit
+    def test_full_request_cancel_cycle(self, tmp_path: Path) -> None:
+        """drain -> drain --status -> drain --cancel -> drain --status cycle works end-to-end."""
+        signal = tmp_path / ".devbench" / "drain.signal"
+
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            # Step 1: request drain
+            rc_request = cli.cmd_drain("--reason", "integration test")
+        assert rc_request == 0
+        assert signal.exists()
+
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            # Step 2: status shows pending
+            rc_status_pending = cli.cmd_drain("--status")
+        assert rc_status_pending == 0
+        assert signal.exists(), "drain --status must not consume signal"
+
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            # Step 3: cancel
+            rc_cancel = cli.cmd_drain("--cancel")
+        assert rc_cancel == 0
+        assert not signal.exists()
+
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            # Step 4: status shows absent (rc still 0)
+            rc_status_absent = cli.cmd_drain("--status")
+        assert rc_status_absent == 0
+
+    @pytest.mark.unit
+    def test_double_cancel_is_idempotent(self, tmp_path: Path) -> None:
+        """Two consecutive drain --cancel calls both return rc=0."""
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc1 = cli.cmd_drain("--cancel")
+            rc2 = cli.cmd_drain("--cancel")
+        assert rc1 == 0
+        assert rc2 == 0
+
+    @pytest.mark.unit
+    def test_reason_roundtrip(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """The reason set via drain --reason round-trips through drain --status output."""
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            cli.cmd_drain("--reason", "roundtrip-check")
+            cli.cmd_drain("--status")
+        out = capsys.readouterr().out
+        assert "roundtrip-check" in out
+
+    @pytest.mark.unit
+    def test_overwrite_existing_drain(self, tmp_path: Path) -> None:
+        """A second drain --reason call overwrites the first signal file."""
+        import json as _json
+
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            cli.cmd_drain("--reason", "first")
+            cli.cmd_drain("--reason", "second")
+
+        signal = tmp_path / ".devbench" / "drain.signal"
+        data = _json.loads(signal.read_text())
+        assert data["reason"] == "second"

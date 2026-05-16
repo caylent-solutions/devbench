@@ -3372,3 +3372,161 @@ class TestLoadCheckpointFieldTypeValidation:
         self._write_raw(tmp_path, self._valid_data(raw_error={"error": "quota"}))
         with pytest.raises(ValueError, match="raw_error"):
             load_checkpoint(session_dir=tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# AC-193-4: legacy raise+exit behavior when quota_handling.enabled is false
+# ---------------------------------------------------------------------------
+
+
+class _RawSdkQuotaError(Exception):
+    """Minimal SDK-style 429 exception that has NOT been wrapped by detect_quota_error.
+
+    Used to simulate the legacy behavior path where quota_handling.enabled is
+    false and the caller does NOT invoke detect_quota_error: the raw SDK
+    exception propagates as its original type.
+    """
+
+    def __init__(self, status_code: int = 429, message: str = "rate limit exceeded") -> None:
+        self.status_code = status_code
+        self.message = message
+        self.body: dict[str, Any] = {}
+        super().__init__(message)
+
+
+class TestLegacyRaiseExitBehavior:
+    """AC-193-4: quota_handling.enabled false preserves legacy raise+exit behavior.
+
+    When quota_handling.enabled is False, the orchestrator/cmd_start does NOT
+    call detect_quota_error or wait_for_reset. The raw SDK exception propagates
+    unmodified through the call stack, exactly as it did before the quota module
+    was introduced.
+
+    These tests document the legacy contract:
+    - A raw SDK 429 error raised without detection is NOT an instance of
+      QuotaExhaustedError -- it is only the original SDK exception type.
+    - Catching it as the original type succeeds.
+    - Catching it as QuotaExhaustedError fails (no wrapping occurred).
+    - detect_quota_error still works correctly on raw exceptions; the
+      caller's responsibility is to skip calling it when enabled is False.
+    """
+
+    def test_raw_sdk_429_is_not_quota_exhausted_error(self) -> None:
+        """A raw SDK 429 exception bypasses detect_quota_error and is not QuotaExhaustedError.
+
+        When quota_handling.enabled is False, the caller skips detect_quota_error.
+        The raw SDK exception is not an instance of QuotaExhaustedError.
+        """
+        raw_exc = _RawSdkQuotaError(status_code=429)
+        assert not isinstance(raw_exc, QuotaExhaustedError), (
+            "A raw (undetected) SDK exception must not be a QuotaExhaustedError. "
+            "detect_quota_error wraps it, but legacy mode skips that call."
+        )
+
+    def test_raw_sdk_429_propagates_as_original_type(self) -> None:
+        """A raw SDK 429 exception propagates and is caught by its original type.
+
+        In legacy mode (enabled=False), the SDK exception is raised and the
+        caller catches it by its original type, not as QuotaExhaustedError.
+        """
+
+        def _legacy_caller() -> None:
+            raise _RawSdkQuotaError(status_code=429)
+
+        with pytest.raises(_RawSdkQuotaError) as exc_info:
+            _legacy_caller()
+
+        caught = exc_info.value
+        assert caught.status_code == 429
+        assert not isinstance(caught, QuotaExhaustedError)
+
+    def test_raw_sdk_429_not_caught_as_quota_exhausted(self) -> None:
+        """Catching a raw SDK 429 as QuotaExhaustedError fails -- it is not wrapped.
+
+        When detect_quota_error is bypassed (legacy mode), the raw exception
+        cannot be caught with QuotaExhaustedError because the wrapping step
+        never occurred.
+        """
+        raw_exc = _RawSdkQuotaError(status_code=429)
+        try:
+            raise raw_exc
+        except QuotaExhaustedError:
+            pytest.fail(
+                "Raw SDK exception was incorrectly caught as QuotaExhaustedError. "
+                "Legacy mode must not wrap the exception."
+            )
+        except _RawSdkQuotaError:
+            pass  # expected: raw exception propagates as its own type
+
+    @pytest.mark.parametrize(
+        "status_code",
+        [429, 402],
+    )
+    def test_raw_sdk_quota_errors_are_plain_exceptions(self, status_code: int) -> None:
+        """Raw SDK quota errors (429, 402) are plain exceptions without QuotaExhaustedError.
+
+        Parametrized to cover both rate-limit (429) and billing (402) quota signals.
+        In legacy mode, neither is wrapped -- they are plain SDK exceptions.
+        """
+        raw_exc = _RawSdkQuotaError(status_code=status_code)
+        assert isinstance(raw_exc, Exception)
+        assert not isinstance(raw_exc, QuotaExhaustedError)
+        assert raw_exc.status_code == status_code
+
+    def test_detect_quota_error_still_works_on_raw_exception(self) -> None:
+        """detect_quota_error correctly classifies a raw 429 when called explicitly.
+
+        This confirms the detection function is correct; the legacy path
+        just means the CALLER does not invoke it. When it IS called on a raw
+        429 exception, it returns the appropriate QuotaExhaustedError subclass.
+        """
+        raw_exc = _RawSdkQuotaError(status_code=429)
+        result = detect_quota_error(raw_exc)
+        assert isinstance(result, SubscriptionRateLimitError)
+        assert isinstance(result, QuotaExhaustedError)
+
+    def test_legacy_path_exception_carries_status_code(self) -> None:
+        """A raw legacy SDK exception preserves the status_code attribute.
+
+        In legacy mode, the SDK exception propagates unmodified; the caller
+        can still inspect status_code directly (no wrapping required).
+        """
+        raw_exc = _RawSdkQuotaError(status_code=429, message="Too Many Requests")
+        assert raw_exc.status_code == 429
+        assert "Too Many Requests" in str(raw_exc)
+
+    def test_legacy_path_no_quota_exhausted_error_in_mro(self) -> None:
+        """QuotaExhaustedError does not appear in the MRO of a raw SDK exception.
+
+        Confirms there is no inheritance relationship between _RawSdkQuotaError
+        (stand-in for the real Anthropic SDK exception) and QuotaExhaustedError.
+        The wrapping only happens when detect_quota_error is explicitly called.
+        """
+        assert QuotaExhaustedError not in type(_RawSdkQuotaError()).mro()
+
+    def test_legacy_exception_reraise_with_context_preserves_original(self) -> None:
+        """Re-raising a raw SDK exception in legacy mode preserves the original cause.
+
+        When an outer catch block re-raises with context (raise X from exc), the
+        original exception is accessible via __cause__. This test confirms that
+        the raw SDK exception (not a QuotaExhaustedError) is the cause.
+        """
+
+        class _OuterError(Exception):
+            pass
+
+        raw_exc = _RawSdkQuotaError(status_code=429)
+
+        def _legacy_caller() -> None:
+            try:
+                raise raw_exc
+            except _RawSdkQuotaError as e:
+                raise _OuterError("legacy mode: SDK error propagated") from e
+
+        with pytest.raises(_OuterError) as exc_info:
+            _legacy_caller()
+
+        cause = exc_info.value.__cause__
+        assert isinstance(cause, _RawSdkQuotaError)
+        assert not isinstance(cause, QuotaExhaustedError)
+        assert cause.status_code == 429

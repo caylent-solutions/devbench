@@ -3479,3 +3479,191 @@ class TestQuotaHandlingConfig:
         n = QuotaNotifyConfig()
         assert n.webhook_url is None
         assert n.slack_webhook_url is None
+
+
+# ---------------------------------------------------------------------------
+# AC-193-4: quota_handling.enabled false preserves legacy behavior
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestQuotaHandlingEnabledFalse:
+    """AC-193-4: enabled: false preserves legacy raise+exit behavior (backwards compat).
+
+    When quota_handling.enabled is false, the orchestrator must NOT invoke
+    quota detection, wait, or audit comment logic. The full QuotaHandlingConfig
+    is still parsed and stored; the ``enabled`` field gates the caller's behavior.
+
+    These tests verify:
+    1. ``enabled: false`` in YAML is stored correctly.
+    2. All other config fields retain their spec defaults when only enabled is
+       set to false (no side-effects from disabling quota handling).
+    3. ``enabled: false`` can coexist with explicit values for other fields,
+       ensuring backwards-compatible configs remain valid.
+    """
+
+    def _write(self, path: Path, content: str) -> Path:
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    def test_enabled_false_other_fields_at_defaults(self, tmp_path: Path) -> None:
+        """When enabled: false and no other overrides, all other fields use spec defaults.
+
+        Legacy operators who set enabled: false to opt out must not accidentally
+        get different values for on_exhaustion, poll_interval_seconds, etc.
+        """
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              enabled: false
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        qh = rt.quota_handling
+        assert qh.enabled is False
+        assert qh.on_exhaustion == "wait"
+        assert qh.poll_interval_seconds == 60
+        assert qh.max_wait_seconds == 18000
+        assert qh.on_exhaustion_timeout == "drain"
+        assert qh.resume_strategy == "continue_current_wu"
+        assert qh.audit_comment_on_wait is True
+        assert qh.audit_comment_on_resume is True
+        assert qh.log_structured_events is True
+
+    def test_enabled_false_detection_modes_at_defaults(self, tmp_path: Path) -> None:
+        """When enabled: false only, detect_modes still holds all four default modes.
+
+        The detect_modes field must not be cleared when enabled is false; the
+        config is a complete, valid representation that the caller gates with
+        the enabled flag.
+        """
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              enabled: false
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.quota_handling.detect_modes == [
+            "subscription_rate_limit",
+            "sdk_credit_exhausted",
+            "api_billing_error",
+            "bedrock_throttle",
+        ]
+
+    def test_enabled_false_recovery_probe_at_defaults(self, tmp_path: Path) -> None:
+        """When enabled: false only, recovery_probe sub-config still has spec defaults."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              enabled: false
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        probe = rt.quota_handling.recovery_probe
+        assert probe.enabled is True
+        assert probe.request_size_tokens == 1
+        assert probe.timeout_seconds == 10.0
+        assert probe.backoff.initial_seconds == 30.0
+        assert probe.backoff.max_seconds == 600.0
+        assert probe.backoff.multiplier == 2.0
+        assert probe.backoff.jitter == 0.2
+
+    def test_enabled_false_notify_fields_at_none(self, tmp_path: Path) -> None:
+        """When enabled: false only, notify_on_pause and notify_on_resume remain None."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              enabled: false
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.quota_handling.notify_on_pause is None
+        assert rt.quota_handling.notify_on_resume is None
+
+    def test_enabled_false_with_on_exhaustion_fail(self, tmp_path: Path) -> None:
+        """enabled: false and on_exhaustion: fail coexist without error.
+
+        A config can set enabled: false alongside other fields to document
+        what the settings would be if re-enabled; the parser must accept it.
+        """
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              enabled: false
+              on_exhaustion: fail
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.quota_handling.enabled is False
+        assert rt.quota_handling.on_exhaustion == "fail"
+
+    def test_enabled_false_with_max_wait_override(self, tmp_path: Path) -> None:
+        """enabled: false alongside max_wait_seconds is accepted and stored correctly."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              enabled: false
+              max_wait_seconds: 7200
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.quota_handling.enabled is False
+        assert rt.quota_handling.max_wait_seconds == 7200
+
+    def test_enabled_false_is_boolean_not_falsy_string(self, tmp_path: Path) -> None:
+        """enabled: false is stored as the Python False bool, not the string 'false'."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              enabled: false
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.quota_handling.enabled is False
+        assert isinstance(rt.quota_handling.enabled, bool)
+
+    def test_enabled_true_is_default_without_section(self, tmp_path: Path) -> None:
+        """When quota_handling section is absent, enabled is True (backwards compat default).
+
+        Pre-existing devbench.yaml files that omit quota_handling get safe defaults
+        including enabled: true -- they do not suddenly get quota handling disabled.
+        """
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.quota_handling.enabled is True

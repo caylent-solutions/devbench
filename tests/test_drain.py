@@ -802,3 +802,46 @@ class TestPerSessionDrainHelpers:
         with patch.dict(os.environ, {"DEVBENCH_SESSION_NAME": session_name}, clear=False):
             result = resolve_drain_signal_path(tmp_path)
         assert result == tmp_path / ".devbench" / "sessions" / session_name / "drain.signal"
+
+
+# ---------------------------------------------------------------------------
+# DRY: drain.py imports SESSION_DRAIN_SIGNAL_FILENAME from constants.py
+# ---------------------------------------------------------------------------
+
+
+class TestDrainSessionDrainSignalFilenameConstant:
+    """Verify that drain.py no longer defines _DRAIN_SIGNAL_FILENAME locally
+    but instead consumes SESSION_DRAIN_SIGNAL_FILENAME from devbench.constants.
+
+    This guards against regression after the DRY refactor that moved the
+    constant (spec 4.4.5, Critical Rule 4).
+    """
+
+    @pytest.mark.unit
+    def test_session_drain_signal_filename_not_defined_locally_in_drain(self) -> None:
+        """drain module must NOT define a private _DRAIN_SIGNAL_FILENAME attribute."""
+        import devbench.drain as _drain
+
+        assert not hasattr(_drain, "_DRAIN_SIGNAL_FILENAME"), (
+            "drain.py defines a private _DRAIN_SIGNAL_FILENAME constant -- "
+            "it was replaced by SESSION_DRAIN_SIGNAL_FILENAME in constants.py (DRY rule 9)"
+        )
+
+    @pytest.mark.unit
+    def test_drain_uses_session_drain_signal_filename_from_constants(self, tmp_path: Path) -> None:
+        """resolve_drain_signal_path uses SESSION_DRAIN_SIGNAL_FILENAME from constants.py.
+
+        This test verifies the constant value is consistent between constants.py and
+        the path produced by resolve_drain_signal_path, confirming drain.py reads the
+        constant from constants.py rather than a local definition.
+        """
+        from devbench.constants import SESSION_DRAIN_SIGNAL_FILENAME
+
+        session_name = "const-check"
+        with patch.dict(os.environ, {"DEVBENCH_SESSION_NAME": session_name}, clear=False):
+            result = resolve_drain_signal_path(tmp_path)
+        assert result.name == SESSION_DRAIN_SIGNAL_FILENAME, (
+            f"resolve_drain_signal_path produced filename {result.name!r} "
+            f"but SESSION_DRAIN_SIGNAL_FILENAME is {SESSION_DRAIN_SIGNAL_FILENAME!r} -- "
+            "drain.py is not using the constant from constants.py"
+        )

@@ -640,6 +640,12 @@ SESSION_STARTED_BY_FILENAME: str = "started_by"
 # env var if the default 0.1 s is too coarse or too fine for a given deployment.
 SESSION_FLOCK_POLL_INTERVAL_SECONDS: float = 0.1
 
+# Filename of the drain signal file written inside a per-session state directory.
+# Full path: ``<workspace_root>/.devbench/sessions/<name>/<SESSION_DRAIN_SIGNAL_FILENAME>``.
+# Consumed by ``src/devbench/drain.py`` (resolve_drain_signal_path) and
+# ``src/devbench/cli.py`` (_session_drain_state_str).
+SESSION_DRAIN_SIGNAL_FILENAME: str = "drain.signal"
+
 # ---------------------------------------------------------------------------
 # Quota-handling defaults (spec section 4.5.6)
 # These constants define the default values for the quota_handling config block

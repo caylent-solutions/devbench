@@ -167,6 +167,7 @@ from devbench.constants import (
     ORCHESTRATOR_AUTO_RESTART_AUDIT_PREFIX,
     ORCHESTRATOR_RESTART_EXIT_CODE,
     SESSION_DEFAULT_NAME,
+    SESSION_DRAIN_SIGNAL_FILENAME,
     SESSION_STARTED_AT_FILENAME,
     SESSION_STARTED_BY_FILENAME,
     STATUS_BLOCKED,
@@ -5741,6 +5742,123 @@ def cmd_drain(*argv: str) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# cmd_sessions helpers (E4-F5-S1-T1, issue #192)
+# ---------------------------------------------------------------------------
+
+
+def _parse_sessions_argv(argv: tuple[str, ...]) -> tuple[str | None, int, str]:
+    """Parse ``cmd_sessions`` arguments into ``(mode, error_rc, error_msg)``.
+
+    Returns a 3-tuple:
+
+    - ``mode``: one of ``"list"`` or ``"cleanup"``, or ``None`` on error.
+    - ``error_rc``: 0 on success, 2 on invalid argument.
+    - ``error_msg``: human-readable error description (empty string on success).
+
+    Only ``--cleanup`` is a recognised flag.  Any other flag-like token
+    (starting with ``-``) is rejected as unknown.
+
+    Raises:
+        SystemExit: never -- all errors are returned via error_rc.
+    """
+    has_cleanup = "--cleanup" in argv
+    unknown = [arg for arg in argv if arg.startswith("-") and arg != "--cleanup"]
+
+    if unknown:
+        return None, 2, f"ERROR: unknown flag(s) for sessions: {', '.join(unknown)}"
+
+    if has_cleanup:
+        return "cleanup", 0, ""
+
+    return "list", 0, ""
+
+
+def _session_drain_state_str(session: Session) -> str:
+    """Return a human-readable drain state string for *session*.
+
+    Reads the drain signal file directly from the session's ``state_dir``
+    (``<state_dir>/drain.signal``).  Does not use ``DEVBENCH_SESSION_NAME``
+    so the check is accurate regardless of the caller's environment.
+
+    Args:
+        session: The :class:`~devbench.session.Session` whose drain state to read.
+
+    Returns:
+        ``"pending"`` when a drain signal file exists in the session state dir;
+        ``"none"`` otherwise.
+
+    Raises:
+        OSError: Reading the drain signal file fails for an unexpected reason.
+    """
+    drain_path = session.state_dir / SESSION_DRAIN_SIGNAL_FILENAME
+    return "pending" if drain_path.exists() else "none"
+
+
+def cmd_sessions(*argv: str) -> int:
+    """List active sessions or remove stale ones (spec section 4.4.5, issue #192).
+
+    Invocation forms::
+
+        devbench sessions              -- list all sessions with name, PID, scope,
+                                          started_at, drain state, and liveness
+        devbench sessions --cleanup    -- remove session dirs whose PID references
+                                          a non-running process
+
+    Exit codes:
+
+    - 0 on success (including when no sessions exist or no stale sessions were found).
+    - 2 on invalid arguments (unknown flags).
+
+    Args:
+        *argv: Zero or more CLI flags as individual strings.
+
+    Returns:
+        0 on success; 2 on invalid argument.
+
+    Raises:
+        OSError: Propagated from :class:`~devbench.session.SessionRegistry`
+            when a filesystem operation fails unexpectedly.
+        ValueError: Propagated from :class:`~devbench.session.SessionRegistry`
+            when the registry file contains invalid JSON.
+    """
+    mode, error_rc, error_msg = _parse_sessions_argv(argv)
+    if error_rc != 0:
+        print(error_msg, file=sys.stderr)
+        return error_rc
+
+    registry = SessionRegistry(WORKSPACE_ROOT)
+
+    if mode == "cleanup":
+        removed = registry.cleanup_stale_sessions()
+        if removed:
+            print(f"Removed {len(removed)} stale session(s): {', '.join(removed)}")
+        else:
+            print("No stale sessions found -- nothing to clean up.")
+        return 0
+
+    sessions = registry.load()
+    if not sessions:
+        print("No active sessions.")
+        return 0
+
+    liveness_map = registry.liveness_of_sessions(sessions)
+
+    # Header row
+    header = f"{'NAME':<20} {'PID':>8}  {'LIVENESS':<8}  {'DRAIN':<8}  {'STARTED_AT':<25}  SCOPE"
+    print(header)
+    print("-" * len(header))
+
+    for session in sessions:
+        liveness = liveness_map[session.name]
+        drain_str = _session_drain_state_str(session)
+        scope_str = ", ".join(session.scope) if session.scope else "(all)"
+        started_str = session.started_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+        print(f"{session.name:<20} {session.pid:>8}  {liveness:<8}  {drain_str:<8}  {started_str:<25}  {scope_str}")
+
+    return 0
+
+
 def cmd_request_amendment(unit_id: str) -> int:
     """Register an amendment request for ``unit_id``.
 
@@ -7441,6 +7559,11 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
             "drain [--reason '<text>'] | drain --cancel | drain --status"
         ),
     ),
+    "sessions": (
+        cmd_sessions,
+        0,
+        ("List active sessions or remove stale ones (spec 4.4.5, issue #192): sessions  |  sessions --cleanup"),
+    ),
     "start": (cmd_start, 0, "Run orchestrate skill via Agent SDK (non-interactive)"),
     "scope": (
         cmd_scope,
@@ -7582,6 +7705,8 @@ _VARIADIC_COMMANDS: frozenset[str] = frozenset(
         "scope",
         # Issue #188 E3-F2: drain --reason / --cancel / --status flags
         "drain",
+        # Issue #192 E4-F5-S1-T1: sessions --cleanup flag
+        "sessions",
     }
 )
 

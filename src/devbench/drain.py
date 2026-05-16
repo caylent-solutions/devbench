@@ -28,7 +28,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from devbench.constants import SESSION_SESSIONS_BASE_DIR
+from devbench.constants import SESSION_DRAIN_SIGNAL_FILENAME, SESSION_SESSIONS_BASE_DIR
 
 # ---------------------------------------------------------------------------
 # Module-level constant
@@ -37,10 +37,6 @@ from devbench.constants import SESSION_SESSIONS_BASE_DIR
 #: Relative path (from workspace root) of the drain signal file.
 #: Spec section 4.3.1.
 DRAIN_SIGNAL_NAME: str = ".devbench/drain.signal"
-
-#: Filename of the drain signal inside a per-session directory.
-#: Used by resolve_drain_signal_path when DEVBENCH_SESSION_NAME is set.
-_DRAIN_SIGNAL_FILENAME: str = "drain.signal"
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +141,7 @@ def resolve_drain_signal_path(workspace: Path) -> Path:
     session_name = os.environ.get("DEVBENCH_SESSION_NAME", "").strip()
     if not session_name:
         return workspace / DRAIN_SIGNAL_NAME
-    return workspace / SESSION_SESSIONS_BASE_DIR / session_name / _DRAIN_SIGNAL_FILENAME
+    return workspace / SESSION_SESSIONS_BASE_DIR / session_name / SESSION_DRAIN_SIGNAL_FILENAME
 
 
 # ---------------------------------------------------------------------------

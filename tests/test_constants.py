@@ -436,3 +436,48 @@ class TestSessionSessionsBaseDirConstant:
         constant = getattr(module, constant_name)
         assert isinstance(constant, str), f"{constant_name} expected type 'str', got {type(constant).__name__!r}"
         assert constant == ".devbench/sessions", f"{constant_name} expected '.devbench/sessions', got {constant!r}"
+
+
+class TestSessionDrainSignalFilenameConstant:
+    """AC-192-CONST-DRAIN: SESSION_DRAIN_SIGNAL_FILENAME is exported from constants.py
+    with the correct type and spec-mandated value.
+
+    The constant names the drain signal file written inside a per-session state
+    directory (spec section 4.4.5 / 4.3.1).  Both drain.py and cli.py import it
+    from here -- any change to the filename must be made in exactly one place.
+    """
+
+    @pytest.mark.unit
+    def test_session_drain_signal_filename_is_importable(self) -> None:
+        """SESSION_DRAIN_SIGNAL_FILENAME is importable from devbench.constants without error."""
+        import devbench.constants as _c
+
+        assert hasattr(_c, "SESSION_DRAIN_SIGNAL_FILENAME")
+
+    @pytest.mark.unit
+    def test_session_drain_signal_filename_is_str(self) -> None:
+        """SESSION_DRAIN_SIGNAL_FILENAME is of type str."""
+        from devbench.constants import SESSION_DRAIN_SIGNAL_FILENAME
+
+        assert isinstance(SESSION_DRAIN_SIGNAL_FILENAME, str)
+
+    @pytest.mark.unit
+    def test_session_drain_signal_filename_is_non_empty(self) -> None:
+        """SESSION_DRAIN_SIGNAL_FILENAME is a non-empty string (no accidental empty reset)."""
+        from devbench.constants import SESSION_DRAIN_SIGNAL_FILENAME
+
+        assert len(SESSION_DRAIN_SIGNAL_FILENAME) > 0
+
+    @pytest.mark.unit
+    def test_session_drain_signal_filename_value(self) -> None:
+        """SESSION_DRAIN_SIGNAL_FILENAME equals 'drain.signal' (spec 4.4.5 / 4.3.1)."""
+        from devbench.constants import SESSION_DRAIN_SIGNAL_FILENAME
+
+        assert SESSION_DRAIN_SIGNAL_FILENAME == "drain.signal"
+
+    @pytest.mark.unit
+    def test_session_drain_signal_filename_has_no_path_separator(self) -> None:
+        """SESSION_DRAIN_SIGNAL_FILENAME contains no '/' -- it is a bare filename, not a path."""
+        from devbench.constants import SESSION_DRAIN_SIGNAL_FILENAME
+
+        assert "/" not in SESSION_DRAIN_SIGNAL_FILENAME

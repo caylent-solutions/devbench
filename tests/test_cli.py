@@ -15846,3 +15846,455 @@ class TestCmdStartPreArmDrain:
 
         assert rc == 0, f"cmd_start must return 0 for pre-armed drain with reason={reason!r}"
         assert not signal_path.exists(), f"drain signal must be consumed for pre-armed drain with reason={reason!r}"
+
+
+# ---------------------------------------------------------------------------
+# cmd_sessions tests (E4-F5-S1-T1, issue #192)
+# ---------------------------------------------------------------------------
+
+
+def _make_session(
+    name: str,
+    pid: int,
+    scope: list[str],
+    state_dir: Path,
+    started_at: datetime | None = None,
+    started_by: str = "tester",
+) -> Any:
+    """Construct a Session fixture for tests."""
+    from devbench.session import Session
+
+    return Session(
+        name=name,
+        pid=pid,
+        scope=scope,
+        started_at=started_at or datetime(2026, 1, 1, tzinfo=UTC),
+        started_by=started_by,
+        state_dir=state_dir,
+    )
+
+
+def _seed_sessions_registry(workspace_root: Path, sessions: list) -> None:
+    """Write registry.json with the given list of Session objects."""
+    from devbench.session import SessionRegistry
+
+    registry = SessionRegistry(workspace_root)
+    registry.save(sessions)
+
+
+class TestCmdSessionsRegistered:
+    """cmd_sessions is registered in _COMMANDS and _VARIADIC_COMMANDS."""
+
+    @pytest.mark.unit
+    def test_sessions_in_commands(self) -> None:
+        """'sessions' key must be present in _COMMANDS."""
+        assert "sessions" in cli._COMMANDS
+
+    @pytest.mark.unit
+    def test_sessions_in_variadic_commands(self) -> None:
+        """'sessions' must be in _VARIADIC_COMMANDS so --cleanup flag parsing works."""
+        assert "sessions" in cli._VARIADIC_COMMANDS
+
+    @pytest.mark.unit
+    def test_sessions_command_maps_to_cmd_sessions(self) -> None:
+        """_COMMANDS['sessions'] callable must be cli.cmd_sessions."""
+        func, _min_args, _desc = cli._COMMANDS["sessions"]
+        assert func is cli.cmd_sessions
+
+
+class TestCmdSessionsListEmpty:
+    """devbench sessions with no active sessions -- prints empty table."""
+
+    @pytest.mark.unit
+    def test_returns_zero_when_no_registry(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """cmd_sessions returns rc=0 when no registry.json exists."""
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_sessions()
+        assert rc == 0
+
+    @pytest.mark.unit
+    def test_prints_no_active_sessions_when_registry_absent(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """cmd_sessions prints a message indicating no sessions when registry absent."""
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            cli.cmd_sessions()
+        out = capsys.readouterr().out
+        assert "no active sessions" in out.lower()
+
+    @pytest.mark.unit
+    def test_prints_no_active_sessions_when_registry_empty(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """cmd_sessions prints no-sessions message when registry exists but is empty."""
+        _seed_sessions_registry(tmp_path, [])
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            cli.cmd_sessions()
+        out = capsys.readouterr().out
+        assert "no active sessions" in out.lower()
+
+
+class TestCmdSessionsListTable:
+    """devbench sessions lists each session's name, PID, scope, started_at, drain state, liveness."""
+
+    @pytest.mark.unit
+    def test_lists_session_name(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """cmd_sessions output includes the session name."""
+        state_dir = tmp_path / ".devbench" / "sessions" / "alpha"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        session = _make_session("alpha", 12345, [], state_dir)
+        _seed_sessions_registry(tmp_path, [session])
+
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_sessions()
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "alpha" in out
+
+    @pytest.mark.unit
+    def test_lists_session_pid(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """cmd_sessions output includes the session PID."""
+        state_dir = tmp_path / ".devbench" / "sessions" / "beta"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        session = _make_session("beta", 99999, [], state_dir)
+        _seed_sessions_registry(tmp_path, [session])
+
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_sessions()
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "99999" in out
+
+    @pytest.mark.unit
+    def test_lists_session_started_at(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """cmd_sessions output includes the started_at timestamp."""
+        state_dir = tmp_path / ".devbench" / "sessions" / "gamma"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        started = datetime(2026, 3, 15, 10, 30, 0, tzinfo=UTC)
+        session = _make_session("gamma", 11111, [], state_dir, started_at=started)
+        _seed_sessions_registry(tmp_path, [session])
+
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_sessions()
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "2026-03-15" in out
+
+    @pytest.mark.unit
+    def test_lists_liveness_active_when_process_alive(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """cmd_sessions shows ACTIVE liveness when process is running."""
+        state_dir = tmp_path / ".devbench" / "sessions" / "live"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        session = _make_session("live", 12345, [], state_dir)
+        _seed_sessions_registry(tmp_path, [session])
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.session.SessionRegistry.is_alive", return_value=True),
+        ):
+            rc = cli.cmd_sessions()
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "ACTIVE" in out
+
+    @pytest.mark.unit
+    def test_lists_liveness_stale_when_process_dead(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """cmd_sessions shows STALE liveness when process is not running."""
+        state_dir = tmp_path / ".devbench" / "sessions" / "stale"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        session = _make_session("stale", 99998, [], state_dir)
+        _seed_sessions_registry(tmp_path, [session])
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.session.SessionRegistry.is_alive", return_value=False),
+        ):
+            rc = cli.cmd_sessions()
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "STALE" in out
+
+    @pytest.mark.unit
+    def test_lists_drain_pending_when_signal_present(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """cmd_sessions shows drain state when drain.signal exists in session dir."""
+        import json as _json
+
+        state_dir = tmp_path / ".devbench" / "sessions" / "draining"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        session = _make_session("draining", 12345, [], state_dir)
+        _seed_sessions_registry(tmp_path, [session])
+        # Write a drain.signal into the session state dir.
+        drain_signal = state_dir / "drain.signal"
+        drain_signal.write_text(
+            _json.dumps(
+                {
+                    "requested_at": "2026-01-01T00:00:00+00:00",
+                    "requested_by": "tester",
+                    "reason": "planned stop",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.session.SessionRegistry.is_alive", return_value=True),
+        ):
+            rc = cli.cmd_sessions()
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "pending" in out.lower() or "drain" in out.lower()
+
+    @pytest.mark.unit
+    def test_lists_no_drain_when_signal_absent(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """cmd_sessions shows no drain state when no drain.signal in session dir."""
+        state_dir = tmp_path / ".devbench" / "sessions" / "quiet"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        session = _make_session("quiet", 12345, [], state_dir)
+        _seed_sessions_registry(tmp_path, [session])
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.session.SessionRegistry.is_alive", return_value=True),
+        ):
+            rc = cli.cmd_sessions()
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "none" in out.lower() or "no drain" in out.lower()
+
+    @pytest.mark.unit
+    def test_lists_scope_ids_in_output(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """cmd_sessions includes scope IDs in the output."""
+        state_dir = tmp_path / ".devbench" / "sessions" / "scoped"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        session = _make_session("scoped", 12345, ["E1-F1-S1-T1", "E1-F1-S1-T2"], state_dir)
+        _seed_sessions_registry(tmp_path, [session])
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.session.SessionRegistry.is_alive", return_value=True),
+        ):
+            rc = cli.cmd_sessions()
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "E1-F1-S1-T1" in out
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "names",
+        [
+            ["alpha"],
+            ["alpha", "beta"],
+            ["alpha", "beta", "gamma"],
+        ],
+    )
+    def test_lists_all_sessions(self, tmp_path: Path, capsys: pytest.CaptureFixture[str], names: list[str]) -> None:
+        """cmd_sessions lists every session in the registry."""
+        sessions = []
+        for name in names:
+            state_dir = tmp_path / ".devbench" / "sessions" / name
+            state_dir.mkdir(parents=True, exist_ok=True)
+            sessions.append(_make_session(name, 12345, [], state_dir))
+        _seed_sessions_registry(tmp_path, sessions)
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.session.SessionRegistry.is_alive", return_value=True),
+        ):
+            rc = cli.cmd_sessions()
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        for name in names:
+            assert name in out, f"session '{name}' must appear in output"
+
+
+class TestCmdSessionsCleanup:
+    """devbench sessions --cleanup -- removes stale session dirs (AC-192-11)."""
+
+    @pytest.mark.unit
+    def test_cleanup_flag_removes_stale_session_dir(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """--cleanup removes the state_dir of a session whose PID is not running."""
+        state_dir = tmp_path / ".devbench" / "sessions" / "stale"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        session = _make_session("stale", 99998, [], state_dir)
+        _seed_sessions_registry(tmp_path, [session])
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.session.SessionRegistry.is_alive", return_value=False),
+        ):
+            rc = cli.cmd_sessions("--cleanup")
+
+        assert rc == 0
+        assert not state_dir.exists(), "stale session dir must be removed by --cleanup"
+
+    @pytest.mark.unit
+    def test_cleanup_prints_removed_names(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """--cleanup prints the names of removed sessions."""
+        state_dir = tmp_path / ".devbench" / "sessions" / "stale"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        session = _make_session("stale", 99998, [], state_dir)
+        _seed_sessions_registry(tmp_path, [session])
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.session.SessionRegistry.is_alive", return_value=False),
+        ):
+            cli.cmd_sessions("--cleanup")
+
+        out = capsys.readouterr().out
+        assert "stale" in out
+
+    @pytest.mark.unit
+    def test_cleanup_returns_zero_when_nothing_stale(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """--cleanup returns rc=0 when no stale sessions exist."""
+        state_dir = tmp_path / ".devbench" / "sessions" / "active"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        session = _make_session("active", 12345, [], state_dir)
+        _seed_sessions_registry(tmp_path, [session])
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.session.SessionRegistry.is_alive", return_value=True),
+        ):
+            rc = cli.cmd_sessions("--cleanup")
+
+        assert rc == 0
+
+    @pytest.mark.unit
+    def test_cleanup_preserves_active_session_dirs(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """--cleanup does not remove state dirs for ACTIVE sessions."""
+        active_dir = tmp_path / ".devbench" / "sessions" / "active"
+        active_dir.mkdir(parents=True, exist_ok=True)
+        stale_dir = tmp_path / ".devbench" / "sessions" / "stale"
+        stale_dir.mkdir(parents=True, exist_ok=True)
+        sessions = [
+            _make_session("active", 12345, [], active_dir),
+            _make_session("stale", 99998, [], stale_dir),
+        ]
+        _seed_sessions_registry(tmp_path, sessions)
+
+        def _is_alive_side_effect(pid: int) -> bool:
+            return pid == 12345
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.session.SessionRegistry.is_alive", side_effect=_is_alive_side_effect),
+        ):
+            rc = cli.cmd_sessions("--cleanup")
+
+        assert rc == 0
+        assert active_dir.exists(), "active session dir must not be removed"
+        assert not stale_dir.exists(), "stale session dir must be removed"
+
+    @pytest.mark.unit
+    def test_cleanup_no_registry_returns_zero(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """--cleanup returns rc=0 when no registry.json exists."""
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_sessions("--cleanup")
+        assert rc == 0
+
+    @pytest.mark.unit
+    def test_cleanup_prints_nothing_removed_when_all_active(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """--cleanup prints a message when no sessions were cleaned up."""
+        state_dir = tmp_path / ".devbench" / "sessions" / "active"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        session = _make_session("active", 12345, [], state_dir)
+        _seed_sessions_registry(tmp_path, [session])
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.session.SessionRegistry.is_alive", return_value=True),
+        ):
+            cli.cmd_sessions("--cleanup")
+
+        out = capsys.readouterr().out
+        assert "no stale" in out.lower() or "nothing" in out.lower() or "0" in out
+
+
+class TestCmdSessionsInvalidArgs:
+    """cmd_sessions rejects invalid flag combinations."""
+
+    @pytest.mark.unit
+    def test_unknown_flag_returns_rc2(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """cmd_sessions with an unrecognised flag returns rc=2 and stderr message."""
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_sessions("--unknown-flag")
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "unknown" in err.lower() or "invalid" in err.lower()
+
+
+class TestCmdSessionsIntegration:
+    """Integration tests for cmd_sessions against real fixture workspaces (no boundary-crossing mocks)."""
+
+    @pytest.mark.unit
+    def test_list_integration_shows_correct_columns(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """Full integration: cmd_sessions lists a seeded session with correct data.
+
+        No mocks on the liveness check -- instead we use os.getpid() as the
+        PID so the process is guaranteed alive.
+        """
+        import os
+
+        state_dir = tmp_path / ".devbench" / "sessions" / "mytest"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        pid = os.getpid()
+        started = datetime(2026, 4, 1, 12, 0, 0, tzinfo=UTC)
+        session = _make_session("mytest", pid, ["E1-F1-S1-T1"], state_dir, started_at=started)
+        _seed_sessions_registry(tmp_path, [session])
+
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_sessions()
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "mytest" in out
+        assert str(pid) in out
+        assert "2026-04-01" in out
+        assert "ACTIVE" in out
+        assert "E1-F1-S1-T1" in out
+
+    @pytest.mark.unit
+    def test_cleanup_integration_removes_stale_and_updates_registry(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Full integration: --cleanup removes stale dir and updates registry.json.
+
+        Spawns a real subprocess and waits for it to exit, capturing its PID.
+        The PID is then guaranteed dead (process fully reaped before we proceed).
+        """
+        import subprocess
+
+        # Spawn and wait -- after wait() the PID is guaranteed not running.
+        proc = subprocess.Popen(["true"])
+        dead_pid = proc.pid
+        proc.wait()
+
+        stale_dir = tmp_path / ".devbench" / "sessions" / "gone"
+        stale_dir.mkdir(parents=True, exist_ok=True)
+        session = _make_session("gone", dead_pid, [], stale_dir)
+        _seed_sessions_registry(tmp_path, [session])
+
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_sessions("--cleanup")
+
+        assert rc == 0
+        assert not stale_dir.exists(), "stale session dir must be deleted"
+
+        # Registry must be updated (entry removed).
+        from devbench.session import SessionRegistry
+
+        remaining = SessionRegistry(tmp_path).load()
+        assert all(s.name != "gone" for s in remaining), "stale session must be removed from registry"

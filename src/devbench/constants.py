@@ -678,3 +678,18 @@ QUOTA_HANDLING_DEFAULT_RECOVERY_PROBE_REQUEST_SIZE_TOKENS: int = 1
 # Must equal RECOVERY_PROBE_DEFAULT_TIMEOUT_SECONDS (10.0) so the quota.py
 # module and the config block share the same spec value.
 QUOTA_HANDLING_DEFAULT_RECOVERY_PROBE_TIMEOUT_SECONDS: float = 10.0
+
+# Exponential-backoff defaults for the recovery probe (spec section 4.5.6).
+# Starting backoff interval in seconds before the first probe retry.
+QUOTA_HANDLING_DEFAULT_BACKOFF_INITIAL_SECONDS: float = 30.0
+
+# Maximum backoff interval in seconds -- probe retries are capped at this value.
+QUOTA_HANDLING_DEFAULT_BACKOFF_MAX_SECONDS: float = 600.0
+
+# Multiplier applied to the current backoff interval after each failed probe.
+QUOTA_HANDLING_DEFAULT_BACKOFF_MULTIPLIER: float = 2.0
+
+# Fractional jitter added or subtracted from each backoff duration (0.0 to 1.0).
+# Default 0.2 (20%) prevents thundering-herd retries when multiple orchestrators
+# wake simultaneously.
+QUOTA_HANDLING_DEFAULT_BACKOFF_JITTER: float = 0.2

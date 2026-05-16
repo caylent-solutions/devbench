@@ -16,6 +16,10 @@ from devbench.config_loader import (
     DEFAULT_CONFIG_SUBPATH,
     BacklogConfig,
     LimitConfig,
+    QuotaBackoffConfig,
+    QuotaHandlingConfig,
+    QuotaNotifyConfig,
+    QuotaRecoveryProbeConfig,
     RepoConfig,
     RuntimeConfig,
     TimeoutConfig,
@@ -2642,3 +2646,633 @@ class TestAgentModelsConfig:
         validate_agent_model_value("yaml", "executor", "opus", False)
         validate_agent_model_value("yaml", "executor", "claude-opus-4-7", False)
         validate_agent_model_value("yaml", "executor", "us.anthropic.claude-opus-4-7-v1", True)
+
+
+# ---------------------------------------------------------------------------
+# QuotaHandlingConfig -- AC-193-19, AC-193-20
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestQuotaHandlingConfig:
+    """AC-193-19: safe defaults when section absent; AC-193-20: schema rejects invalid values.
+
+    Covers the QuotaHandlingConfig, QuotaNotifyConfig, QuotaRecoveryProbeConfig,
+    and QuotaBackoffConfig dataclasses added to config_loader.py (spec section 4.5.6).
+    """
+
+    def _write(self, path: Path, content: str) -> Path:
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    # ------------------------------------------------------------------
+    # AC-193-19: safe defaults when quota_handling section is absent
+    # ------------------------------------------------------------------
+
+    def test_quota_handling_absent_yields_defaults(self, tmp_path: Path) -> None:
+        """When quota_handling is absent, RuntimeConfig.quota_handling has all defaults."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        qh = rt.quota_handling
+        assert qh.enabled is True
+        assert qh.on_exhaustion == "wait"
+        assert qh.poll_interval_seconds == 60
+        assert qh.max_wait_seconds == 18000
+        assert qh.on_exhaustion_timeout == "drain"
+        assert qh.resume_strategy == "continue_current_wu"
+        assert qh.audit_comment_on_wait is True
+        assert qh.audit_comment_on_resume is True
+        assert qh.log_structured_events is True
+
+    def test_quota_handling_absent_detect_modes_defaults(self, tmp_path: Path) -> None:
+        """When quota_handling is absent, detect_modes contains all four default modes."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.quota_handling.detect_modes == [
+            "subscription_rate_limit",
+            "sdk_credit_exhausted",
+            "api_billing_error",
+            "bedrock_throttle",
+        ]
+
+    def test_quota_handling_absent_recovery_probe_defaults(self, tmp_path: Path) -> None:
+        """When quota_handling is absent, recovery_probe uses all defaults."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        probe = rt.quota_handling.recovery_probe
+        assert probe.enabled is True
+        assert probe.request_size_tokens == 1
+        assert probe.timeout_seconds == 10.0
+
+    def test_quota_handling_absent_backoff_defaults(self, tmp_path: Path) -> None:
+        """When quota_handling is absent, recovery_probe.backoff uses spec defaults."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        backoff = rt.quota_handling.recovery_probe.backoff
+        assert backoff.initial_seconds == 30.0
+        assert backoff.max_seconds == 600.0
+        assert backoff.multiplier == 2.0
+        assert backoff.jitter == 0.2
+
+    def test_quota_handling_absent_notify_on_pause_none(self, tmp_path: Path) -> None:
+        """When quota_handling is absent, notify_on_pause is None."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.quota_handling.notify_on_pause is None
+
+    def test_quota_handling_absent_notify_on_resume_none(self, tmp_path: Path) -> None:
+        """When quota_handling is absent, notify_on_resume is None."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.quota_handling.notify_on_resume is None
+
+    # ------------------------------------------------------------------
+    # AC-193-19: individual YAML fields override defaults
+    # ------------------------------------------------------------------
+
+    def test_quota_handling_enabled_false_overrides_default(self, tmp_path: Path) -> None:
+        """Setting enabled: false is reflected on the dataclass."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              enabled: false
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.quota_handling.enabled is False
+
+    def test_quota_handling_on_exhaustion_fail(self, tmp_path: Path) -> None:
+        """on_exhaustion: fail is accepted and stored."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              on_exhaustion: fail
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.quota_handling.on_exhaustion == "fail"
+
+    def test_quota_handling_on_exhaustion_drain(self, tmp_path: Path) -> None:
+        """on_exhaustion: drain is accepted and stored."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              on_exhaustion: drain
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.quota_handling.on_exhaustion == "drain"
+
+    def test_quota_handling_poll_interval_seconds_override(self, tmp_path: Path) -> None:
+        """poll_interval_seconds YAML value overrides the default."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              poll_interval_seconds: 120
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.quota_handling.poll_interval_seconds == 120
+
+    def test_quota_handling_max_wait_seconds_override(self, tmp_path: Path) -> None:
+        """max_wait_seconds YAML value overrides the default."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              max_wait_seconds: 3600
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.quota_handling.max_wait_seconds == 3600
+
+    def test_quota_handling_on_exhaustion_timeout_fail(self, tmp_path: Path) -> None:
+        """on_exhaustion_timeout: fail is accepted and stored."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              on_exhaustion_timeout: fail
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.quota_handling.on_exhaustion_timeout == "fail"
+
+    def test_quota_handling_on_exhaustion_timeout_keep_waiting(self, tmp_path: Path) -> None:
+        """on_exhaustion_timeout: keep_waiting is accepted and stored."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              on_exhaustion_timeout: keep_waiting
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.quota_handling.on_exhaustion_timeout == "keep_waiting"
+
+    def test_quota_handling_resume_strategy_restart_wu(self, tmp_path: Path) -> None:
+        """resume_strategy: restart_wu is accepted and stored."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              resume_strategy: restart_wu
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.quota_handling.resume_strategy == "restart_wu"
+
+    def test_quota_handling_resume_strategy_drain_and_resume(self, tmp_path: Path) -> None:
+        """resume_strategy: drain_and_resume is accepted and stored."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              resume_strategy: drain_and_resume
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.quota_handling.resume_strategy == "drain_and_resume"
+
+    def test_quota_handling_audit_comment_overrides(self, tmp_path: Path) -> None:
+        """audit_comment_on_wait and audit_comment_on_resume accept false."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              audit_comment_on_wait: false
+              audit_comment_on_resume: false
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.quota_handling.audit_comment_on_wait is False
+        assert rt.quota_handling.audit_comment_on_resume is False
+
+    def test_quota_handling_log_structured_events_false(self, tmp_path: Path) -> None:
+        """log_structured_events: false is stored correctly."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              log_structured_events: false
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.quota_handling.log_structured_events is False
+
+    def test_quota_handling_detect_modes_subset(self, tmp_path: Path) -> None:
+        """A subset of detect_modes is accepted and stored."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              detect_modes:
+                - subscription_rate_limit
+                - sdk_credit_exhausted
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.quota_handling.detect_modes == ["subscription_rate_limit", "sdk_credit_exhausted"]
+
+    def test_quota_handling_notify_on_pause_webhook(self, tmp_path: Path) -> None:
+        """notify_on_pause with webhook_url stores the URL correctly."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              notify_on_pause:
+                webhook_url: "https://example.com/hook"
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        notify = rt.quota_handling.notify_on_pause
+        assert notify is not None
+        assert notify.webhook_url == "https://example.com/hook"
+        assert notify.slack_webhook_url is None
+
+    def test_quota_handling_notify_on_resume_slack(self, tmp_path: Path) -> None:
+        """notify_on_resume with slack_webhook_url stores the URL correctly."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              notify_on_resume:
+                slack_webhook_url: "https://hooks.slack.com/services/T/B/X"
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        notify = rt.quota_handling.notify_on_resume
+        assert notify is not None
+        assert notify.slack_webhook_url == "https://hooks.slack.com/services/T/B/X"
+        assert notify.webhook_url is None
+
+    def test_quota_handling_recovery_probe_overrides(self, tmp_path: Path) -> None:
+        """recovery_probe fields are stored from YAML correctly."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              recovery_probe:
+                enabled: false
+                request_size_tokens: 5
+                timeout_seconds: 30.0
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        probe = rt.quota_handling.recovery_probe
+        assert probe.enabled is False
+        assert probe.request_size_tokens == 5
+        assert probe.timeout_seconds == 30.0
+
+    def test_quota_handling_backoff_overrides(self, tmp_path: Path) -> None:
+        """recovery_probe.backoff fields are stored from YAML correctly."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              recovery_probe:
+                backoff:
+                  initial_seconds: 15.0
+                  max_seconds: 300.0
+                  multiplier: 1.5
+                  jitter: 0.1
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        backoff = rt.quota_handling.recovery_probe.backoff
+        assert backoff.initial_seconds == 15.0
+        assert backoff.max_seconds == 300.0
+        assert backoff.multiplier == 1.5
+        assert backoff.jitter == 0.1
+
+    # ------------------------------------------------------------------
+    # AC-193-20: schema validation rejects invalid values
+    # ------------------------------------------------------------------
+
+    def test_quota_handling_invalid_on_exhaustion_rejected(self, tmp_path: Path) -> None:
+        """on_exhaustion with an invalid value triggers a schema validation error."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              on_exhaustion: invalid_value
+            """,
+        )
+        with pytest.raises(ValueError, match="schema validation"):
+            load_runtime_config(cfg, {})
+
+    def test_quota_handling_invalid_on_exhaustion_timeout_rejected(self, tmp_path: Path) -> None:
+        """on_exhaustion_timeout with an invalid value triggers schema validation."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              on_exhaustion_timeout: invalid_value
+            """,
+        )
+        with pytest.raises(ValueError, match="schema validation"):
+            load_runtime_config(cfg, {})
+
+    def test_quota_handling_invalid_resume_strategy_rejected(self, tmp_path: Path) -> None:
+        """resume_strategy with an invalid value triggers schema validation."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              resume_strategy: invalid_strategy
+            """,
+        )
+        with pytest.raises(ValueError, match="schema validation"):
+            load_runtime_config(cfg, {})
+
+    def test_quota_handling_poll_interval_below_minimum_rejected(self, tmp_path: Path) -> None:
+        """poll_interval_seconds below 30 triggers schema validation."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              poll_interval_seconds: 29
+            """,
+        )
+        with pytest.raises(ValueError, match="schema validation"):
+            load_runtime_config(cfg, {})
+
+    def test_quota_handling_poll_interval_above_maximum_rejected(self, tmp_path: Path) -> None:
+        """poll_interval_seconds above 3600 triggers schema validation."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              poll_interval_seconds: 3601
+            """,
+        )
+        with pytest.raises(ValueError, match="schema validation"):
+            load_runtime_config(cfg, {})
+
+    def test_quota_handling_max_wait_seconds_below_minimum_rejected(self, tmp_path: Path) -> None:
+        """max_wait_seconds below 1 triggers schema validation."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              max_wait_seconds: 0
+            """,
+        )
+        with pytest.raises(ValueError, match="schema validation"):
+            load_runtime_config(cfg, {})
+
+    def test_quota_handling_invalid_detect_mode_rejected(self, tmp_path: Path) -> None:
+        """An unknown detect_mode value triggers schema validation."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              detect_modes:
+                - not_a_real_mode
+            """,
+        )
+        with pytest.raises(ValueError, match="schema validation"):
+            load_runtime_config(cfg, {})
+
+    def test_quota_handling_unknown_field_rejected(self, tmp_path: Path) -> None:
+        """An extra unknown field in quota_handling triggers schema validation."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              not_a_real_field: true
+            """,
+        )
+        with pytest.raises(ValueError, match="schema validation"):
+            load_runtime_config(cfg, {})
+
+    def test_quota_handling_recovery_probe_request_size_below_minimum_rejected(self, tmp_path: Path) -> None:
+        """request_size_tokens below 1 triggers schema validation."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              recovery_probe:
+                request_size_tokens: 0
+            """,
+        )
+        with pytest.raises(ValueError, match="schema validation"):
+            load_runtime_config(cfg, {})
+
+    def test_quota_handling_recovery_probe_timeout_below_minimum_rejected(self, tmp_path: Path) -> None:
+        """timeout_seconds below 1 triggers schema validation."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              recovery_probe:
+                timeout_seconds: 0.5
+            """,
+        )
+        with pytest.raises(ValueError, match="schema validation"):
+            load_runtime_config(cfg, {})
+
+    def test_quota_handling_backoff_jitter_above_maximum_rejected(self, tmp_path: Path) -> None:
+        """backoff.jitter above 1.0 triggers schema validation."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              recovery_probe:
+                backoff:
+                  jitter: 1.5
+            """,
+        )
+        with pytest.raises(ValueError, match="schema validation"):
+            load_runtime_config(cfg, {})
+
+    def test_quota_handling_backoff_multiplier_below_minimum_rejected(self, tmp_path: Path) -> None:
+        """backoff.multiplier below 1.0 triggers schema validation."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              recovery_probe:
+                backoff:
+                  multiplier: 0.5
+            """,
+        )
+        with pytest.raises(ValueError, match="schema validation"):
+            load_runtime_config(cfg, {})
+
+    # ------------------------------------------------------------------
+    # Dataclass default-factory tests (pure unit -- no YAML load)
+    # ------------------------------------------------------------------
+
+    def test_quota_handling_config_dataclass_defaults(self) -> None:
+        """QuotaHandlingConfig() with no args yields expected field defaults."""
+        qh = QuotaHandlingConfig()
+        assert qh.enabled is True
+        assert qh.on_exhaustion == "wait"
+        assert qh.poll_interval_seconds == 60
+        assert qh.max_wait_seconds == 18000
+        assert qh.on_exhaustion_timeout == "drain"
+        assert qh.resume_strategy == "continue_current_wu"
+        assert qh.audit_comment_on_wait is True
+        assert qh.audit_comment_on_resume is True
+        assert qh.log_structured_events is True
+        assert qh.notify_on_pause is None
+        assert qh.notify_on_resume is None
+
+    def test_quota_backoff_config_dataclass_defaults(self) -> None:
+        """QuotaBackoffConfig() with no args yields spec defaults."""
+        b = QuotaBackoffConfig()
+        assert b.initial_seconds == 30.0
+        assert b.max_seconds == 600.0
+        assert b.multiplier == 2.0
+        assert b.jitter == 0.2
+
+    def test_quota_recovery_probe_config_dataclass_defaults(self) -> None:
+        """QuotaRecoveryProbeConfig() with no args yields spec defaults."""
+        p = QuotaRecoveryProbeConfig()
+        assert p.enabled is True
+        assert p.request_size_tokens == 1
+        assert p.timeout_seconds == 10.0
+        assert isinstance(p.backoff, QuotaBackoffConfig)
+
+    def test_quota_notify_config_stores_fields(self) -> None:
+        """QuotaNotifyConfig accepts webhook_url and slack_webhook_url."""
+        n = QuotaNotifyConfig(webhook_url="https://w.example.com", slack_webhook_url="https://s.example.com")
+        assert n.webhook_url == "https://w.example.com"
+        assert n.slack_webhook_url == "https://s.example.com"
+
+    def test_quota_notify_config_default_nones(self) -> None:
+        """QuotaNotifyConfig() with no args has both URLs as None."""
+        n = QuotaNotifyConfig()
+        assert n.webhook_url is None
+        assert n.slack_webhook_url is None

@@ -321,6 +321,26 @@ class TestQuotaHandlingDefaultConstants:
                 float,
                 10.0,
             ),
+            (
+                "QUOTA_HANDLING_DEFAULT_BACKOFF_INITIAL_SECONDS",
+                float,
+                30.0,
+            ),
+            (
+                "QUOTA_HANDLING_DEFAULT_BACKOFF_MAX_SECONDS",
+                float,
+                600.0,
+            ),
+            (
+                "QUOTA_HANDLING_DEFAULT_BACKOFF_MULTIPLIER",
+                float,
+                2.0,
+            ),
+            (
+                "QUOTA_HANDLING_DEFAULT_BACKOFF_JITTER",
+                float,
+                0.2,
+            ),
         ],
     )
     def test_quota_handling_default_constant_type_and_value(

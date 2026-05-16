@@ -82,6 +82,23 @@ from devbench.constants import (
     DEFAULT_STOP_HOOK_WINDOW_SECONDS,
     DEFAULT_TOKEN_COST_PER_M_INPUT,
     DEFAULT_TOKEN_COST_PER_M_OUTPUT,
+    QUOTA_HANDLING_DEFAULT_AUDIT_COMMENT_ON_RESUME,
+    QUOTA_HANDLING_DEFAULT_AUDIT_COMMENT_ON_WAIT,
+    QUOTA_HANDLING_DEFAULT_BACKOFF_INITIAL_SECONDS,
+    QUOTA_HANDLING_DEFAULT_BACKOFF_JITTER,
+    QUOTA_HANDLING_DEFAULT_BACKOFF_MAX_SECONDS,
+    QUOTA_HANDLING_DEFAULT_BACKOFF_MULTIPLIER,
+    QUOTA_HANDLING_DEFAULT_DETECT_MODES,
+    QUOTA_HANDLING_DEFAULT_ENABLED,
+    QUOTA_HANDLING_DEFAULT_LOG_STRUCTURED_EVENTS,
+    QUOTA_HANDLING_DEFAULT_MAX_WAIT_SECONDS,
+    QUOTA_HANDLING_DEFAULT_ON_EXHAUSTION,
+    QUOTA_HANDLING_DEFAULT_ON_EXHAUSTION_TIMEOUT,
+    QUOTA_HANDLING_DEFAULT_POLL_INTERVAL_SECONDS,
+    QUOTA_HANDLING_DEFAULT_RECOVERY_PROBE_ENABLED,
+    QUOTA_HANDLING_DEFAULT_RECOVERY_PROBE_REQUEST_SIZE_TOKENS,
+    QUOTA_HANDLING_DEFAULT_RECOVERY_PROBE_TIMEOUT_SECONDS,
+    QUOTA_HANDLING_DEFAULT_RESUME_STRATEGY,
     STATUS_DRAFT,
     STATUS_IN_QUEUE,
 )
@@ -542,6 +559,226 @@ def _parse_backlog_config(path: Path, backlog_raw: dict) -> BacklogConfig:
     return BacklogConfig(default_status_for_new_work_units=raw_status)
 
 
+# ---------------------------------------------------------------------------
+# QuotaHandlingConfig -- spec section 4.5.6, AC-193-19, AC-193-20
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class QuotaBackoffConfig:
+    """Exponential-backoff parameters for recovery probe retries (spec section 4.5.6).
+
+    All fields default to the values from constants.py so the dataclass can be
+    instantiated with no arguments to obtain spec-correct defaults.
+
+    Attributes:
+        initial_seconds: Starting backoff interval in seconds.
+        max_seconds: Maximum backoff interval in seconds.
+        multiplier: Exponent base applied after each failed probe.
+        jitter: Fractional jitter (0.0 to 1.0) added/subtracted from each
+            backoff duration.
+    """
+
+    initial_seconds: float = QUOTA_HANDLING_DEFAULT_BACKOFF_INITIAL_SECONDS
+    max_seconds: float = QUOTA_HANDLING_DEFAULT_BACKOFF_MAX_SECONDS
+    multiplier: float = QUOTA_HANDLING_DEFAULT_BACKOFF_MULTIPLIER
+    jitter: float = QUOTA_HANDLING_DEFAULT_BACKOFF_JITTER
+
+
+@dataclass
+class QuotaNotifyConfig:
+    """Webhook notification config sent on quota pause or resume (spec section 4.5.6).
+
+    Both fields default to ``None`` (no notification).  A ``None`` URL means
+    the corresponding webhook is disabled for that event.
+
+    Attributes:
+        webhook_url: Generic webhook URL to POST a JSON payload to.
+            ``None`` disables the generic webhook.
+        slack_webhook_url: Slack incoming webhook URL.
+            ``None`` disables the Slack notification.
+    """
+
+    webhook_url: str | None = None
+    slack_webhook_url: str | None = None
+
+
+@dataclass
+class QuotaRecoveryProbeConfig:
+    """Recovery probe sub-configuration (spec section 4.5.6).
+
+    Controls the minimal Anthropic API completion used to detect quota recovery.
+    All fields default to spec-correct values from constants.py.
+
+    Attributes:
+        enabled: When ``True`` (default), the recovery probe is activated after
+            the initial reset_at sleep.  When ``False``, only the sleep is used.
+        request_size_tokens: Maximum output tokens requested in the probe call.
+            Default 1 (cheapest valid response).
+        timeout_seconds: Timeout in seconds for the probe HTTP request.
+            Default 10.0.
+        backoff: Exponential-backoff parameters for probe retries.
+    """
+
+    enabled: bool = QUOTA_HANDLING_DEFAULT_RECOVERY_PROBE_ENABLED
+    request_size_tokens: int = QUOTA_HANDLING_DEFAULT_RECOVERY_PROBE_REQUEST_SIZE_TOKENS
+    timeout_seconds: float = QUOTA_HANDLING_DEFAULT_RECOVERY_PROBE_TIMEOUT_SECONDS
+    backoff: QuotaBackoffConfig = field(default_factory=QuotaBackoffConfig)
+
+
+@dataclass
+class QuotaHandlingConfig:
+    """Quota-wait-and-resume configuration (spec section 4.5.6).
+
+    All fields default to the spec-correct values from constants.py.  The
+    entire ``quota_handling:`` YAML section may be omitted; in that case
+    ``load_runtime_config`` constructs this dataclass with all defaults.
+
+    Attributes:
+        enabled: Top-level toggle.  When ``False``, quota detection is
+            disabled entirely.
+        detect_modes: Ordered list of quota-signal detection mode names.
+            Each maps to a ``QuotaExhaustedError`` subclass in
+            ``devbench.quota``.
+        on_exhaustion: Action on first quota detection -- ``'wait'``,
+            ``'fail'``, or ``'drain'``.
+        poll_interval_seconds: Recovery probe poll interval in seconds
+            (min 30, max 3600).
+        max_wait_seconds: Maximum seconds to wait before triggering
+            ``on_exhaustion_timeout`` (min 1).
+        on_exhaustion_timeout: Action when ``max_wait_seconds`` is exceeded --
+            ``'drain'``, ``'fail'``, or ``'keep_waiting'``.
+        resume_strategy: Resume strategy after quota restoration --
+            ``'continue_current_wu'``, ``'restart_wu'``, or
+            ``'drain_and_resume'``.
+        audit_comment_on_wait: When ``True``, writes a ``[QUOTA_WAITING]``
+            audit comment to the in-flight WU at the start of a wait.
+        audit_comment_on_resume: When ``True``, writes a ``[QUOTA_RESUMED]``
+            audit comment after quota is restored.
+        log_structured_events: When ``True``, emits structured log events for
+            quota-wait lifecycle transitions.
+        notify_on_pause: Optional webhook notification sent when the
+            orchestrator pauses due to quota exhaustion.  ``None`` means no
+            notification.
+        notify_on_resume: Optional webhook notification sent when the
+            orchestrator resumes after quota recovery.  ``None`` means no
+            notification.
+        recovery_probe: Recovery probe sub-configuration.
+    """
+
+    enabled: bool = QUOTA_HANDLING_DEFAULT_ENABLED
+    detect_modes: list[str] = field(default_factory=lambda: list(QUOTA_HANDLING_DEFAULT_DETECT_MODES))
+    on_exhaustion: str = QUOTA_HANDLING_DEFAULT_ON_EXHAUSTION
+    poll_interval_seconds: int = QUOTA_HANDLING_DEFAULT_POLL_INTERVAL_SECONDS
+    max_wait_seconds: int = QUOTA_HANDLING_DEFAULT_MAX_WAIT_SECONDS
+    on_exhaustion_timeout: str = QUOTA_HANDLING_DEFAULT_ON_EXHAUSTION_TIMEOUT
+    resume_strategy: str = QUOTA_HANDLING_DEFAULT_RESUME_STRATEGY
+    audit_comment_on_wait: bool = QUOTA_HANDLING_DEFAULT_AUDIT_COMMENT_ON_WAIT
+    audit_comment_on_resume: bool = QUOTA_HANDLING_DEFAULT_AUDIT_COMMENT_ON_RESUME
+    log_structured_events: bool = QUOTA_HANDLING_DEFAULT_LOG_STRUCTURED_EVENTS
+    notify_on_pause: QuotaNotifyConfig | None = None
+    notify_on_resume: QuotaNotifyConfig | None = None
+    recovery_probe: QuotaRecoveryProbeConfig = field(default_factory=QuotaRecoveryProbeConfig)
+
+
+def _parse_quota_notify_config(raw: dict) -> QuotaNotifyConfig:
+    """Parse a ``notify_on_pause`` or ``notify_on_resume`` sub-dict into a ``QuotaNotifyConfig``.
+
+    Args:
+        raw: Raw YAML dict (already schema-validated). May be empty.
+
+    Returns:
+        ``QuotaNotifyConfig`` with ``webhook_url`` and ``slack_webhook_url``
+        set from *raw* (``None`` when absent).
+    """
+    return QuotaNotifyConfig(
+        webhook_url=raw.get("webhook_url") or None,
+        slack_webhook_url=raw.get("slack_webhook_url") or None,
+    )
+
+
+def _parse_quota_backoff_config(raw: dict) -> QuotaBackoffConfig:
+    """Parse a ``recovery_probe.backoff`` sub-dict into a ``QuotaBackoffConfig``.
+
+    Args:
+        raw: Raw YAML dict (already schema-validated). May be empty.
+
+    Returns:
+        ``QuotaBackoffConfig`` with fields set from *raw*; absent fields use
+        the spec-correct constants from ``devbench.constants``.
+    """
+    defaults = QuotaBackoffConfig()
+    return QuotaBackoffConfig(
+        initial_seconds=float(raw.get("initial_seconds", defaults.initial_seconds)),
+        max_seconds=float(raw.get("max_seconds", defaults.max_seconds)),
+        multiplier=float(raw.get("multiplier", defaults.multiplier)),
+        jitter=float(raw.get("jitter", defaults.jitter)),
+    )
+
+
+def _parse_quota_recovery_probe_config(raw: dict) -> QuotaRecoveryProbeConfig:
+    """Parse a ``recovery_probe`` sub-dict into a ``QuotaRecoveryProbeConfig``.
+
+    Args:
+        raw: Raw YAML dict (already schema-validated). May be empty.
+
+    Returns:
+        ``QuotaRecoveryProbeConfig`` with fields set from *raw*; absent fields
+        use the spec-correct constants from ``devbench.constants``.
+    """
+    defaults = QuotaRecoveryProbeConfig()
+    backoff_raw = raw.get("backoff") or {}
+    return QuotaRecoveryProbeConfig(
+        enabled=bool(raw.get("enabled", defaults.enabled)),
+        request_size_tokens=int(raw.get("request_size_tokens", defaults.request_size_tokens)),
+        timeout_seconds=float(raw.get("timeout_seconds", defaults.timeout_seconds)),
+        backoff=_parse_quota_backoff_config(backoff_raw),
+    )
+
+
+def _parse_quota_handling_config(raw: dict) -> QuotaHandlingConfig:
+    """Parse the ``quota_handling:`` YAML section into a ``QuotaHandlingConfig``.
+
+    Called by ``load_runtime_config`` after JSON Schema validation.  All fields
+    are optional in the YAML; absent fields use constants from
+    ``devbench.constants``.  The section may be omitted entirely; in that case
+    *raw* is an empty dict and all defaults apply.
+
+    Args:
+        raw: Raw ``quota_handling`` dict from YAML (already schema-validated).
+            May be an empty dict when the section is absent.
+
+    Returns:
+        ``QuotaHandlingConfig`` populated from *raw*.
+    """
+    defaults = QuotaHandlingConfig()
+
+    notify_pause_raw = raw.get("notify_on_pause")
+    notify_pause = _parse_quota_notify_config(notify_pause_raw) if notify_pause_raw is not None else None
+
+    notify_resume_raw = raw.get("notify_on_resume")
+    notify_resume = _parse_quota_notify_config(notify_resume_raw) if notify_resume_raw is not None else None
+
+    probe_raw = raw.get("recovery_probe") or {}
+    recovery_probe = _parse_quota_recovery_probe_config(probe_raw)
+
+    return QuotaHandlingConfig(
+        enabled=bool(raw.get("enabled", defaults.enabled)),
+        detect_modes=list(raw.get("detect_modes", defaults.detect_modes)),
+        on_exhaustion=raw.get("on_exhaustion", defaults.on_exhaustion),
+        poll_interval_seconds=int(raw.get("poll_interval_seconds", defaults.poll_interval_seconds)),
+        max_wait_seconds=int(raw.get("max_wait_seconds", defaults.max_wait_seconds)),
+        on_exhaustion_timeout=raw.get("on_exhaustion_timeout", defaults.on_exhaustion_timeout),
+        resume_strategy=raw.get("resume_strategy", defaults.resume_strategy),
+        audit_comment_on_wait=bool(raw.get("audit_comment_on_wait", defaults.audit_comment_on_wait)),
+        audit_comment_on_resume=bool(raw.get("audit_comment_on_resume", defaults.audit_comment_on_resume)),
+        log_structured_events=bool(raw.get("log_structured_events", defaults.log_structured_events)),
+        notify_on_pause=notify_pause,
+        notify_on_resume=notify_resume,
+        recovery_probe=recovery_probe,
+    )
+
+
 @dataclass
 class RepoConfig:
     """Per-repository configuration.
@@ -771,6 +1008,11 @@ class RuntimeConfig:
             default) means callers must supply ``JUDGE_LOG_FILE``
             explicitly or rely on the workspace-local convention
             ``logs/orchestrator.log``.
+        quota_handling: Quota-wait-and-resume configuration loaded from the
+            ``quota_handling:`` YAML section (spec section 4.5.6). All fields
+            default to spec-correct values; the entire section may be omitted
+            from devbench.yaml and the orchestrator will behave as if
+            ``enabled: true`` with all other spec defaults applied.
     """
 
     repos: dict[str, RepoConfig] = field(default_factory=dict)
@@ -787,6 +1029,7 @@ class RuntimeConfig:
     agent_models: AgentModelsConfig = field(default_factory=AgentModelsConfig)
     validate: ValidateConfig = field(default_factory=ValidateConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
+    quota_handling: QuotaHandlingConfig = field(default_factory=QuotaHandlingConfig)
     allowed_orgs: list[str] = field(default_factory=list)
     use_bedrock: bool = False
     bedrock_region: str | None = None
@@ -1235,6 +1478,13 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
     backlog_raw = raw.get("backlog") or {}
     backlog = _parse_backlog_config(path, backlog_raw)
 
+    # Populate QuotaHandlingConfig from YAML quota_handling block (spec 4.5.6).
+    # JSON Schema validation enforces enum values, integer/float ranges, and
+    # additionalProperties: false before this call; _parse_quota_handling_config
+    # therefore performs no re-validation -- it only maps YAML to the dataclass.
+    quota_handling_raw = raw.get("quota_handling") or {}
+    quota_handling = _parse_quota_handling_config(quota_handling_raw)
+
     return RuntimeConfig(
         repos=repos,
         timeouts=timeouts,
@@ -1250,6 +1500,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         agent_models=agent_models,
         validate=validate_cfg,
         debug=debug,
+        quota_handling=quota_handling,
         allowed_orgs=allowed_orgs,
         use_bedrock=bool(raw.get("use_bedrock", False)),
         bedrock_region=raw.get("bedrock_region") or None,

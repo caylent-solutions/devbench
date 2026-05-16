@@ -28,6 +28,7 @@ Commands that run a blocking external process (git, tests, judges) propagate the
 
 - [Backlog read](#backlog-read)
 - [Backlog write](#backlog-write)
+- [Scope selectors (printer-pages syntax)](#scope-selectors-printer-pages-syntax)
 - [Orchestration and reporting](#orchestration-and-reporting)
 - [Orchestrator helpers (invoked by agents)](#orchestrator-helpers-invoked-by-agents)
 - [Git operations](#git-operations)
@@ -43,12 +44,25 @@ Non-mutating commands for inspecting backlog state.
 ### `status`
 
 ```
-uv run devbench status
+uv run devbench status [--detail] [--include "<tokens>"] [--exclude "<tokens>"]
 ```
 
 Print a summary of the backlog grouped by status. Output includes counts per lifecycle value (draft, in-queue, in-progress, in-review, done, blocked, proposed, declined, hold) plus an always-rendered `Un-materialised` count of proposal JSONs pending materialisation. Also lists active and blocked work units by ID.
 
 The summary includes a `Draft N` row rendered between the `TOTAL` line and the `In Queue` line when any work units have `draft` status. Draft work units are not eligible for autonomous claim until promoted to `in-queue` via `devbench promote`.
+
+**Scope filter flags:**
+
+- `--include "<tokens>"` -- one-off include selector using printer-pages syntax. Overrides any active `scope.json` when supplied. Accepts comma-separated tokens (single IDs or last-segment ranges). See [Scope selectors](#scope-selectors-printer-pages-syntax) for the full syntax reference.
+- `--exclude "<tokens>"` -- one-off exclude selector. Subtracts the matched IDs from the include set. Applied after include expansion.
+
+When neither flag is supplied, `devbench status` consults the active `<workspace>/.devbench/scope.json` (if present) and applies its filter automatically. When a scope is active -- whether from flags or from `scope.json` -- a `SCOPE:` banner is printed above the Status Summary:
+
+```
+SCOPE: include=[E1-E3, E5] exclude=[] (started 2026-05-14T13:42Z)
+```
+
+The banner names the raw include / exclude token lists and the timestamp from `scope.json` (or omits the timestamp for one-off `--include` invocations). When no scope is active the banner is suppressed entirely.
 
 Pass `--detail` (E220) to additionally render three panels at the bottom of the output:
 
@@ -67,16 +81,20 @@ The summary's `Blocked` row is split into three lines (Part-1, post-issue-#118):
 ### `next`
 
 ```
-uv run devbench next
+uv run devbench next [--include "<tokens>"] [--exclude "<tokens>"]
 ```
 
-Print the next actionable work unit as JSON. Returns `ALL_DONE` when every unit is done and `NO_ACTIONABLE` when something is blocked or in-progress but nothing is ready to start. Used by the orchestrate SKILL to drive the main loop. No arguments.
+Print the next actionable work unit as JSON. Returns `ALL_DONE` when every unit is done and `NO_ACTIONABLE` when something is blocked or in-progress but nothing is ready to start. Used by the orchestrate SKILL to drive the main loop.
+
+**Scope filter flags:** `--include` and `--exclude` accept the same printer-pages-style tokens as `status` and `start`. One-off flags override any active `scope.json`; when neither flag is supplied, the active `scope.json` (if present) is consulted automatically. When a scope is active, only work units within the scope's `expanded_ids` set are eligible candidates. See [Scope selectors](#scope-selectors-printer-pages-syntax) for the token syntax.
 
 ### `report`
 
 ```
-uv run devbench report [--once|--no-stream] [--since <ISO-8601>] [--watch N]
+uv run devbench report [--once|--no-stream] [--since <ISO-8601>] [--watch N] [--include "<tokens>"] [--exclude "<tokens>"]
 ```
+
+**Scope filter flags:** `--include` and `--exclude` accept the same printer-pages-style tokens as `status`, `next`, and `start`. One-off flags override any active `scope.json`; when neither flag is supplied, the active `scope.json` (if present) is consulted automatically. When a scope is active, only work units within the scope's `expanded_ids` set are counted in the per-epic Status Summary table. See [Scope selectors](#scope-selectors-printer-pages-syntax) for the token syntax.
 
 Print the progress report with velocity, token consumption, and estimated cost. Default layout renders two side-by-side tables: **All-time** (full log) and **Current run** (most recent contiguous block of orchestration events, boundary detected as a gap over 10 minutes between consecutive `Set X to ...` log lines).
 
@@ -403,13 +421,85 @@ Tasks carrying an open `[BLOCKED_PENDING_PROPOSAL] <id>` marker are left alone -
 
 Useful as a pre-flight sweep before `devbench next` (after manual edits to the backlog) and for triage when a backlog has drifted out of sync. Combine with `validate-backlog` for a complete consistency check.
 
+### `scope`
+
+```
+uv run devbench scope set --include "<tokens>" [--exclude "<tokens>"]
+uv run devbench scope clear
+uv run devbench scope show
+```
+
+Persistent scope management without starting the orchestrator (spec section 4.2.6, issue #196). Writes, clears, or displays the active `<workspace>/.devbench/scope.json`. Useful for pre-arming a scope before launching interactive Claude Code so the orchestrate skill respects the filter without the operator having to launch and kill `devbench start` first.
+
+**Subcommands:**
+
+- **`scope set --include "<tokens>" [--exclude "<tokens>"]`** -- parse the printer-pages tokens, validate them against the current `BACKLOG.md`, and write `<workspace>/.devbench/scope.json` atomically (temp-then-rename). Out-of-range tokens emit a warning but do not fail (rc=0). The written `scope.json` is byte-identical to the one `devbench start --include "..."` would write -- subsequent `devbench start` / `devbench next` / `devbench status` / `devbench report` invocations honour it identically. Exits 0 on success; exits 1 with an actionable stderr message when a token is a reversed range or structurally malformed.
+
+- **`scope clear`** -- delete `<workspace>/.devbench/scope.json`. Idempotent: exits 0 with the message `no scope pending` when no file is present.
+
+- **`scope show`** -- print the active scope state (include list, exclude list, expanded ID count, `started_at`, `started_by`) or `no scope pending` when no scope file exists. Exits 0 in both cases.
+
+**scope.json schema:**
+
+```json
+{
+  "include": ["E1-E3", "E5"],
+  "exclude": [],
+  "expanded_ids": ["E1-F1-S1-T1", "..."],
+  "started_at": "2026-05-14T13:42:11Z",
+  "started_by": "matt"
+}
+```
+
+The file lives at `<workspace>/.devbench/scope.json`. When `DEVBENCH_SESSION_NAME` is set (named sessions, spec section 4.4), the path is `<workspace>/.devbench/sessions/<name>/scope.json` instead.
+
+**Interactive pre-arm workflow:**
+
+```bash
+# Pre-arm scope for epics E1 through E3 plus E5
+JUDGE_WORKSPACE_ROOT=$PWD JUDGE_CLAUDE_MODEL=... \
+  uv run devbench scope set --include "E1-E3, E5"
+
+# Launch interactive Claude Code; the orchestrate skill respects the pre-armed scope.json
+JUDGE_WORKSPACE_ROOT=$PWD JUDGE_CLAUDE_MODEL=... \
+  claude --dangerously-skip-permissions --plugin-dir <devbench>/plugin/devbench
+
+# Clear when done
+uv run devbench scope clear
+```
+
+See [Scope selectors](#scope-selectors-printer-pages-syntax) for the full token syntax reference.
+
 ### `start`
 
 ```
-uv run devbench start
+uv run devbench start [--include "<tokens>"] [--exclude "<tokens>"]
 ```
 
-Run the orchestrate SKILL non-interactively via the Agent SDK. Invoked by `make start` (the recommended way to run DevBench). Loads the plugin ad-hoc from the devbench checkout; no global `make plugin-install` required. When the workspace's `backlog/config/devbench.yaml` declares an `agents:` block (see [`docs/adr/25-per-agent-model-overrides.md`](adr/25-per-agent-model-overrides.md)), `start` materialises a workspace-local shadow plugin tree at `<workspace>/.devbench/plugin-shadow/devbench/` and passes that path to the SDK in place of the canonical plugin. No arguments.
+Run the orchestrate SKILL non-interactively via the Agent SDK. Invoked by `make start` (the recommended way to run DevBench). Loads the plugin ad-hoc from the devbench checkout; no global `make plugin-install` required. When the workspace's `backlog/config/devbench.yaml` declares an `agents:` block (see [`docs/adr/25-per-agent-model-overrides.md`](adr/25-per-agent-model-overrides.md)), `start` materialises a workspace-local shadow plugin tree at `<workspace>/.devbench/plugin-shadow/devbench/` and passes that path to the SDK in place of the canonical plugin.
+
+**Scope filter flags:**
+
+- `--include "<tokens>"` -- printer-pages-style include selector. Restricts the orchestrator to the named work units and their descendants. Accepts comma-separated tokens (single IDs or last-segment ranges). See [Scope selectors](#scope-selectors-printer-pages-syntax) for the full syntax.
+- `--exclude "<tokens>"` -- subtract the matched IDs from the include set. Applied after include expansion.
+
+When `--include` is supplied, the parsed scope is persisted to `<workspace>/.devbench/scope.json` atomically (temp-then-rename) before the orchestrate SKILL starts. The scope file is deleted on clean orchestrator exit; it survives orchestrator crashes and is visible to subsequent `devbench status` / `devbench report` invocations.
+
+When `--include` is omitted (the default), all work units are eligible -- the existing behaviour is fully preserved.
+
+**Example -- scope to epics E1 through E3 plus E5:**
+
+```bash
+uv run devbench start --include "E1-E3, E5"
+```
+
+**Example -- scope to E1-E10, excluding E5 and everything under E7-F3:**
+
+```bash
+uv run devbench start --include "E1-E10" --exclude "E5, E7-F3"
+```
+
+To pre-arm scope.json without immediately launching the orchestrator, use `devbench scope set` instead.
 
 ### `prepare-plugin-shadow`
 
@@ -443,6 +533,96 @@ agents:
 ```
 
 Every field defaults to `null` when absent (use the agent's `.md` frontmatter model). When `use_bedrock: true`, every value must be a Bedrock ARN (`us.anthropic.claude-<name>-<ver>-v<N>`); when `false`, values must be a short name (`opus`/`sonnet`/`haiku`) or an Anthropic API id (`claude-opus-4-7`). `JUDGE_AGENT_MODEL_<NAME>` env vars (e.g. `JUDGE_AGENT_MODEL_EXECUTOR=opus`, `JUDGE_AGENT_MODEL_CODE_REVIEWER=opus`) override the YAML on a per-call basis (env > yaml > frontmatter).
+
+---
+
+## Scope selectors (printer-pages syntax)
+
+The `--include` and `--exclude` flags on `devbench start`, `devbench status`, `devbench report`, and `devbench next` all accept the same printer-pages-style token syntax described here. `devbench scope set` uses the same parser.
+
+### Token types
+
+Tokens are comma-separated strings. Whitespace around commas is ignored. Evaluation order: the include set is expanded first; then the exclude set is expanded and subtracted from it.
+
+#### Single-ID token
+
+A single-ID token matches the exact work-unit ID and every descendant. Descendants are IDs that start with `<token>-`.
+
+Examples:
+
+| Token | Matches |
+|-------|---------|
+| `E5` | `E5`, `E5-F1`, `E5-F1-S2`, `E5-F1-S2-T3`, ... (all WUs under epic E5) |
+| `E5-F1` | `E5-F1`, `E5-F1-S1`, `E5-F1-S1-T1`, ... (all WUs under feature E5-F1) |
+| `E5-F1-S2-T3` | `E5-F1-S2-T3` only (leaf task; no descendants) |
+
+#### Range token
+
+A range token consists of two adjacent same-type segments at the end of the token (both sharing the same letter prefix such as `E`, `F`, `S`, or `T`, but differing in the numeric suffix). The range expands inclusively on the final segment; earlier segments must match exactly.
+
+Syntax: `<common-prefix><type><start>-<type><end>` where `start <= end`.
+
+Examples:
+
+| Token | Matches |
+|-------|---------|
+| `E1-E3` | all WUs under epics E1, E2, and E3 |
+| `E5-F1-F3` | all WUs under features E5-F1, E5-F2, and E5-F3 |
+| `E5-F1-S1-T2-T5` | tasks E5-F1-S1-T2, T3, T4, T5 and their descendants |
+
+#### Mixed comma-separated list (union)
+
+Multiple tokens are joined as a union. The result is the union of all matched IDs, then subtracted by the exclude set.
+
+Example:
+
+```bash
+--include "E1-E3, E5"
+# matches: all WUs under E1, E2, E3, and E5
+```
+
+### Exclude subtraction
+
+`--exclude` tokens are expanded the same way as `--include` tokens. The expanded exclude set is then subtracted from the expanded include set. Evaluation order:
+
+1. Expand all `--include` tokens (or use all backlog IDs when `--include` is empty).
+2. Expand all `--exclude` tokens.
+3. Subtract the exclude set from the include set.
+
+Example:
+
+```bash
+--include "E1-E10" --exclude "E5, E7-F3"
+# include set: all WUs under E1 through E10
+# exclude set: all WUs under E5 + all WUs under E7-F3
+# result: all WUs under E1-E4, E6, E7 (except E7-F3 descendants), E8-E10
+```
+
+### Edge cases
+
+- **Reverse range** (`E3-E1`, `T5-T2`): rejected immediately with an actionable error message naming the token and the required ascending order. Exit code 1.
+- **Out-of-range token** (no matching WU in the backlog): emits a `WARNING` log line naming the token but does not abort. The run continues with the matched IDs from other tokens.
+- **Empty `--include`** (flag omitted): all backlog IDs are included before any exclusions. The existing behaviour is fully preserved (AC-190-9).
+- **Malformed token** (leading/trailing/consecutive hyphens, e.g. `-E1`, `E1-`, `E1--E3`): rejected immediately with an actionable error message. Exit code 1.
+
+### scope.json persistence
+
+When `devbench start --include "..."` or `devbench scope set --include "..."` runs, the parsed scope is persisted to `<workspace>/.devbench/scope.json`:
+
+```json
+{
+  "include": ["E1-E3", "E5"],
+  "exclude": [],
+  "expanded_ids": ["E1-F1-S1-T1", "..."],
+  "started_at": "2026-05-14T13:42:11Z",
+  "started_by": "matt"
+}
+```
+
+- Written atomically (temp-then-rename) so concurrent readers never see a partial file.
+- Consumed (deleted) on clean orchestrator exit (`devbench start` clean shutdown). Survives orchestrator crashes.
+- `devbench status`, `devbench report`, and `devbench next` consult the file automatically when no per-command `--include`/`--exclude` flags are supplied. Per-command flags override the file for that invocation only.
+- `devbench validate-backlog` ignores `scope.json` entirely -- it always validates the whole backlog regardless of active scope.
 
 ---
 

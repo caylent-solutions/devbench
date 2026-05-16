@@ -112,6 +112,7 @@ class BacklogManager:
         backlog_index: Path,
         unit_id: str,
         new_status: str,
+        session_name: str | None = None,
     ) -> None:
         """Write any status to both files, bypassing all gate checks.
 
@@ -126,13 +127,18 @@ class BacklogManager:
             unit_id: The work-unit identifier (e.g. ``E0-F1-S1-T1``).
             new_status: Status in CLI form (``in-queue``, ``in-progress``,
                 ``in-review``, ``done``, ``blocked``) or title-case form.
+            session_name: Optional named-session identifier sourced from
+                ``DEVBENCH_SESSION_NAME``.  When provided and the target
+                status is ``in-progress``, the ``[WU_CLAIMED]`` audit comment
+                is extended with ``session=<name>`` per spec section 4.4.2
+                and spec section 6 (AC-192-5).
 
         Raises:
             FileNotFoundError: If either file does not exist.
             ValueError: If the status is invalid, the ``## Status:`` line
                 is missing, or the unit is not found in the backlog index.
         """
-        self._set_status(work_unit_path, backlog_index, unit_id, new_status)
+        self._set_status(work_unit_path, backlog_index, unit_id, new_status, session_name=session_name)
 
     def mark_done(self, work_unit_path: Path, backlog_index: Path, unit_id: str) -> None:
         """Mark a work unit as Done in both files.
@@ -822,12 +828,24 @@ class BacklogManager:
         backlog_index: Path,
         unit_id: str,
         new_status: str,
+        session_name: str | None = None,
     ) -> None:
         """Private workhorse: write status to both files with no gate checks.
 
         All public transition methods (``force_status``, ``mark_done``,
         ``mark_blocked``) and internal rollup code call this method so that
         every write goes through a single code path.
+
+        Args:
+            work_unit_path: Path to the work-unit ``.md`` file.
+            backlog_index: Path to the ``BACKLOG.md`` file.
+            unit_id: The work-unit identifier.
+            new_status: Status string (CLI form or title-case).
+            session_name: Optional named-session name from
+                ``DEVBENCH_SESSION_NAME``.  When provided and the target
+                status is ``in-progress``, the ``[WU_CLAIMED]`` audit comment
+                is extended with ``session=<name>`` per spec 4.4.2 /
+                AC-192-5.
         """
         canonical = VALID_STATUSES.get(new_status.lower())
         if canonical is None:
@@ -842,20 +860,21 @@ class BacklogManager:
             canonical,
         )
 
-        # Issue #185: every transition into ``in-progress`` (claim,
-        # resume after blocker clear, force-status) writes a
-        # ``[WU_CLAIMED]`` audit-comment row carrying the canonical
-        # ``Set <id> to 'in-progress'`` phrase so the status-timer
-        # fallback (`_latest_audit_in_progress_ts`) can recover the
-        # claim timestamp from the work-unit file alone when the
-        # orchestrator log has rotated. Skips Stories / Features /
-        # Epics whose status is auto-rolled from children (no human
-        # ever claims those directly).
+        # Issue #185 / spec 4.4.2 / AC-192-5: every transition into
+        # ``in-progress`` writes a ``[WU_CLAIMED]`` audit-comment row.
+        # When a named session is active (``session_name`` is provided),
+        # the comment is extended with ``session=<name>`` so the audit trail
+        # records which session performed the claim.
+        # Skips Stories / Features / Epics whose status is auto-rolled from
+        # children (no human ever claims those directly).
         if canonical == STATUS_IN_PROGRESS and "-T" in unit_id:
+            claim_body = f"[WU_CLAIMED] Set {unit_id} to 'in-progress'"
+            if session_name:
+                claim_body = f"{claim_body} session={session_name}"
             self._append_agent_comment(
                 work_unit_path,
                 "orchestrator",
-                f"[WU_CLAIMED] Set {unit_id} to 'in-progress'",
+                claim_body,
             )
 
         if canonical == STATUS_DONE:

@@ -955,6 +955,269 @@ class TestCmdClaim:
         assert "NONEXISTENT-ID" in capsys.readouterr().err
 
 
+class _FakeFlock:
+    """Minimal no-op context manager used to stand in for :func:`devbench.session.flock_backlog`.
+
+    Instantiated by the module-level factory ``_make_fake_flock`` so tests can
+    choose between a passthrough lock and one that records entry calls.
+    """
+
+    def __init__(self, root: Path, timeout_seconds: int = 30, *, entered: list[bool] | None = None) -> None:
+        self._entered = entered
+
+    def __enter__(self) -> None:
+        if self._entered is not None:
+            self._entered.append(True)
+
+    def __exit__(self, *args: object) -> None:
+        pass
+
+
+class _TimeoutFlock:
+    """Context manager that raises ``TimeoutError`` on ``__enter__``."""
+
+    def __init__(self, root: Path, timeout_seconds: int = 30) -> None:
+        pass
+
+    def __enter__(self) -> None:
+        raise TimeoutError("Lock timeout")
+
+    def __exit__(self, *args: object) -> None:
+        pass
+
+
+def _make_noop_flock(entered: list[bool] | None = None) -> Any:
+    """Return a callable that produces a _FakeFlock; usable as a flock_backlog replacement."""
+
+    def _flock(root: Path, timeout_seconds: int = 30) -> _FakeFlock:
+        return _FakeFlock(root, timeout_seconds, entered=entered)
+
+    return _flock
+
+
+class TestCmdClaimAtomicArbitration:
+    """Tests for spec section 4.4.2: cmd_claim atomic claim arbitration via flock_backlog."""
+
+    def _make_unit(self, backlog_dir: Path, status: str = "in-queue") -> tuple[WorkUnit, Path]:
+        """Build a minimal work-unit file + WorkUnit object for claim tests."""
+        wu_file = backlog_dir / "E0-F1-S1-T2.md"
+        wu_file.write_text(f"# E0-F1-S1-T2: Test\n## Status: {status}\n")
+        unit = WorkUnit(
+            id="E0-F1-S1-T2",
+            title="Test",
+            status=WorkUnitStatus.IN_QUEUE,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T2.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+        return unit, wu_file
+
+    def test_claim_acquires_flock_before_status_write(
+        self,
+        backlog_dir: Path,
+        mock_units: list[WorkUnit],
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """cmd_claim calls flock_backlog before invoking force_status (spec 4.4.2 step 1)."""
+        unit, wu_file = self._make_unit(backlog_dir, "in-queue")
+        mock_mgr = MagicMock()
+        entered: list[bool] = []
+        flock_factory = _make_noop_flock(entered=entered)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=MagicMock(parse_index=MagicMock(return_value=[unit]))),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
+            patch("devbench.cli.WORKSPACE_ROOT", backlog_dir.parent),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+            patch("devbench.cli.flock_backlog", flock_factory),
+        ):
+            rc = cli.cmd_claim("E0-F1-S1-T2")
+
+        assert rc == 0
+        assert entered, "flock_backlog context manager was never entered"
+        mock_mgr.force_status.assert_called_once()
+
+    def test_claim_re_reads_status_under_lock_and_succeeds_for_in_queue(
+        self,
+        backlog_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Under the lock, cmd_claim re-reads the file status; in-queue proceeds normally."""
+        unit, wu_file = self._make_unit(backlog_dir, "in-queue")
+        mock_mgr = MagicMock()
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=MagicMock(parse_index=MagicMock(return_value=[unit]))),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
+            patch("devbench.cli.WORKSPACE_ROOT", backlog_dir.parent),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+            patch("devbench.cli.flock_backlog", _make_noop_flock()),
+        ):
+            rc = cli.cmd_claim("E0-F1-S1-T2")
+
+        assert rc == 0
+        mock_mgr.force_status.assert_called_once()
+        out = capsys.readouterr().out
+        assert "Claimed E0-F1-S1-T2" in out
+
+    @pytest.mark.parametrize("bad_status", ["done", "declined", "in-review", "blocked"])
+    def test_claim_raises_claim_race_error_when_status_not_claimable(
+        self,
+        backlog_dir: Path,
+        bad_status: str,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Status other than in-queue or in-progress under the lock causes rc=1 (race)."""
+        unit, wu_file = self._make_unit(backlog_dir, bad_status)
+        mock_mgr = MagicMock()
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=MagicMock(parse_index=MagicMock(return_value=[unit]))),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
+            patch("devbench.cli.WORKSPACE_ROOT", backlog_dir.parent),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+            patch("devbench.cli.flock_backlog", _make_noop_flock()),
+        ):
+            rc = cli.cmd_claim("E0-F1-S1-T2")
+
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "race" in err.lower() or "claim" in err.lower()
+        mock_mgr.force_status.assert_not_called()
+
+    def test_claim_succeeds_when_status_is_in_progress_under_lock(
+        self,
+        backlog_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """in-progress status under the lock is valid for resume; claim proceeds."""
+        unit, wu_file = self._make_unit(backlog_dir, "in-progress")
+        mock_mgr = MagicMock()
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=MagicMock(parse_index=MagicMock(return_value=[unit]))),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
+            patch("devbench.cli.WORKSPACE_ROOT", backlog_dir.parent),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+            patch("devbench.cli.flock_backlog", _make_noop_flock()),
+        ):
+            rc = cli.cmd_claim("E0-F1-S1-T2")
+
+        assert rc == 0
+        mock_mgr.force_status.assert_called_once()
+
+    def test_claim_returns_1_on_timeout_acquiring_lock(
+        self,
+        backlog_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """TimeoutError from flock_backlog is caught; cmd_claim returns 1 with stderr message."""
+        unit, wu_file = self._make_unit(backlog_dir, "in-queue")
+        mock_mgr = MagicMock()
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=MagicMock(parse_index=MagicMock(return_value=[unit]))),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
+            patch("devbench.cli.WORKSPACE_ROOT", backlog_dir.parent),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+            patch("devbench.cli.flock_backlog", _TimeoutFlock),
+        ):
+            rc = cli.cmd_claim("E0-F1-S1-T2")
+
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "lock" in err.lower() or "timeout" in err.lower()
+
+    def test_claim_stamps_session_name_when_env_var_set(
+        self,
+        backlog_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When DEVBENCH_SESSION_NAME is set, force_status receives session_name."""
+        monkeypatch.setenv("DEVBENCH_SESSION_NAME", "alpha")
+        unit, wu_file = self._make_unit(backlog_dir, "in-queue")
+        mock_mgr = MagicMock()
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=MagicMock(parse_index=MagicMock(return_value=[unit]))),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
+            patch("devbench.cli.WORKSPACE_ROOT", backlog_dir.parent),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+            patch("devbench.cli.flock_backlog", _make_noop_flock()),
+        ):
+            rc = cli.cmd_claim("E0-F1-S1-T2")
+
+        assert rc == 0
+        mock_mgr.force_status.assert_called_once()
+        call_args = mock_mgr.force_status.call_args
+        assert call_args.kwargs.get("session_name") == "alpha" or (
+            len(call_args.args) > 4 and call_args.args[4] == "alpha"
+        )
+
+    def test_claim_no_session_name_when_env_var_not_set(
+        self,
+        backlog_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When DEVBENCH_SESSION_NAME is absent, force_status receives session_name=None."""
+        monkeypatch.delenv("DEVBENCH_SESSION_NAME", raising=False)
+        unit, wu_file = self._make_unit(backlog_dir, "in-queue")
+        mock_mgr = MagicMock()
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=MagicMock(parse_index=MagicMock(return_value=[unit]))),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
+            patch("devbench.cli.WORKSPACE_ROOT", backlog_dir.parent),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+            patch("devbench.cli.flock_backlog", _make_noop_flock()),
+        ):
+            rc = cli.cmd_claim("E0-F1-S1-T2")
+
+        assert rc == 0
+        mock_mgr.force_status.assert_called_once()
+        call_args = mock_mgr.force_status.call_args
+        session_name = call_args.kwargs.get("session_name")
+        if session_name is None and len(call_args.args) > 4:
+            session_name = call_args.args[4]
+        assert session_name is None
+
+    def test_claim_returns_1_when_status_line_missing_under_lock(
+        self,
+        backlog_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """If the work-unit file has no '## Status:' line under lock, cmd_claim returns 1."""
+        wu_file = backlog_dir / "E0-F1-S1-T2.md"
+        wu_file.write_text("# E0-F1-S1-T2: Test\nNo status line here.\n")
+        unit = WorkUnit(
+            id="E0-F1-S1-T2",
+            title="Test",
+            status=WorkUnitStatus.IN_QUEUE,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E0-F1-S1-T2.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+        mock_mgr = MagicMock()
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=MagicMock(parse_index=MagicMock(return_value=[unit]))),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
+            patch("devbench.cli.WORKSPACE_ROOT", backlog_dir.parent),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+            patch("devbench.cli.flock_backlog", _make_noop_flock()),
+        ):
+            rc = cli.cmd_claim("E0-F1-S1-T2")
+
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "Status" in err or "status" in err
+        mock_mgr.force_status.assert_not_called()
+
+
 class TestCmdLog:
     """Test cmd_log command."""
 

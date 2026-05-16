@@ -150,6 +150,7 @@ from devbench.config_loader import RepoConfig, get_configured_default_branch
 from devbench.constants import (
     ALL_REQUIRED_JUDGE_NAMES,
     BACKLOG_LOCAL_PATH_RE,
+    BACKLOG_STATUS_RE,
     COMMENT_AGENT_TEMPLATE,
     COMMENT_ENTRY_TEMPLATE,
     COMMENT_TIMESTAMP_FORMAT,
@@ -187,6 +188,7 @@ from devbench.plugin_shadow import (
 # the banner is implemented there and reporting must not depend on cli.py.
 from devbench.reporting.report import _format_duration
 from devbench.scope import InvalidScopeError, ScopeFilter, _expand_prefix, _scope_file_path, _tokenise
+from devbench.session import ClaimRaceError, flock_backlog
 from devbench.utils.io import atomic_write_text
 from devbench.utils.process import run_command
 
@@ -939,6 +941,17 @@ def cmd_claim(unit_id: str) -> int:
     claim time and either auto-amends (when ``manifest_amendment.enabled:
     true``) or surfaces the failure to the operator -- either way the
     placeholder never reaches the executor.
+
+    Spec 4.4.2 / AC-192-5: wraps the status write in an exclusive
+    ``flock(BACKLOG.lock)`` so that two concurrent sessions cannot claim the
+    same work unit.  Under the lock the current on-disk status is re-read; if
+    the status is no longer ``in-queue`` or ``in-progress`` (i.e. another
+    session won the race) a ``ClaimRaceError`` is raised and the function
+    returns 1 without writing anything.  When ``DEVBENCH_SESSION_NAME`` is
+    set the named session is stamped in the ``[WU_CLAIMED]`` audit comment.
+
+    Raises:
+        SystemExit: Never -- all errors are reported via stderr + return code.
     """
     units = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX).parse_index()
     unit = next((u for u in units if u.id == unit_id), None)
@@ -962,11 +975,62 @@ def cmd_claim(unit_id: str) -> int:
             file=sys.stderr,
         )
         return 1
-    mgr = BacklogManager()
-    mgr.force_status(wu_file, BACKLOG_INDEX, unit_id, STATUS_IN_PROGRESS)
+
+    session_name: str | None = os.environ.get("DEVBENCH_SESSION_NAME", "").strip() or None
+    error_message = _claim_under_lock(wu_file, unit_id, session_name)
+    if error_message is not None:
+        print(error_message, file=sys.stderr)
+        return 1
+
     logger.info("Claimed %s (set to in-progress)", unit_id)
     print(f"Claimed {unit_id}")
     return 0
+
+
+def _claim_under_lock(wu_file: Path, unit_id: str, session_name: str | None) -> str | None:
+    """Acquire BACKLOG.lock, re-read status, and write ``in-progress`` under the lock.
+
+    Returns an error message string when the claim fails (race, timeout, or missing
+    status line), or ``None`` on success.  Keeps ``cmd_claim`` within the
+    PLR0911 return-statement budget.
+
+    Args:
+        wu_file: Absolute path to the work-unit ``.md`` file.
+        unit_id: Work-unit identifier used in error messages and audit comments.
+        session_name: Optional named-session name from ``DEVBENCH_SESSION_NAME``.
+
+    Returns:
+        ``None`` on success; a human-readable error string on failure.
+
+    Raises:
+        OSError: Unexpected OS error from ``fcntl.flock`` (propagated to caller).
+    """
+    try:
+        with flock_backlog(WORKSPACE_ROOT):
+            # Re-read the on-disk status under the lock to detect concurrent claims.
+            current_content = wu_file.read_text(encoding="utf-8")
+            status_match = BACKLOG_STATUS_RE.search(current_content)
+            if status_match is None:
+                return f"ERROR: cannot claim {unit_id!r}: no '## Status:' line found in {wu_file}"
+            current_status = status_match.group(1).strip().lower()
+            # Only in-queue or in-progress (resume) are valid claim targets.
+            if current_status not in (STATUS_IN_QUEUE, STATUS_IN_PROGRESS):
+                raise ClaimRaceError(
+                    unit_id=unit_id,
+                    expected_status=STATUS_IN_QUEUE,
+                    actual_status=current_status,
+                )
+            mgr = BacklogManager()
+            mgr.force_status(wu_file, BACKLOG_INDEX, unit_id, STATUS_IN_PROGRESS, session_name=session_name)
+    except ClaimRaceError as exc:
+        return (
+            f"ERROR: claim race on {unit_id!r} -- another session already changed the status. "
+            f"Expected '{exc.expected_status}' but found '{exc.actual_status}' under lock. "
+            f"Skip this unit and pick the next candidate."
+        )
+    except TimeoutError as exc:
+        return f"ERROR: could not acquire BACKLOG.lock to claim {unit_id!r}: {exc}"
+    return None
 
 
 def cmd_set_status(unit_id: str, new_status: str) -> int:

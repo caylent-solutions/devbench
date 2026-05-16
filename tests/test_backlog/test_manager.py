@@ -170,6 +170,36 @@ class TestForceStatus:
         with pytest.raises(FileNotFoundError):
             judge.force_status(tmp_work_unit_file, tmp_path / "missing.md", "E0-F1-S1-T1", "done")
 
+    def test_force_status_with_session_name_stamps_wu_claimed_comment(
+        self, tmp_work_unit_file: Path, backlog_index_titlecase: Path
+    ) -> None:
+        """force_status with session_name appends 'session=<name>' in WU_CLAIMED audit comment."""
+        judge = BacklogManager()
+        judge.force_status(
+            tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1", "in-progress", session_name="alpha"
+        )
+        content = tmp_work_unit_file.read_text()
+        assert "[WU_CLAIMED] Set E0-F1-S1-T1 to 'in-progress' session=alpha" in content
+
+    def test_force_status_without_session_name_omits_session_in_wu_claimed_comment(
+        self, tmp_work_unit_file: Path, backlog_index_titlecase: Path
+    ) -> None:
+        """force_status without session_name uses the bare WU_CLAIMED format (no session= suffix)."""
+        judge = BacklogManager()
+        judge.force_status(tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1", "in-progress")
+        content = tmp_work_unit_file.read_text()
+        assert "[WU_CLAIMED] Set E0-F1-S1-T1 to 'in-progress'" in content
+        assert "session=" not in content
+
+    def test_force_status_session_name_ignored_for_non_in_progress_transition(
+        self, tmp_work_unit_file: Path, backlog_index_titlecase: Path
+    ) -> None:
+        """session_name is accepted but has no effect when the new status is not in-progress."""
+        judge = BacklogManager()
+        judge.force_status(tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1", "in-review", session_name="beta")
+        content = tmp_work_unit_file.read_text()
+        assert "session=beta" not in content
+
 
 def _judge_comment(judge_name: str, action: str, msg: str = "ok") -> str:
     """Return a single formatted judge comment line (no trailing newline)."""

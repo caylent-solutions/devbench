@@ -1401,27 +1401,42 @@ def cmd_promote(*argv: str) -> int:
             Promote every ``draft``-status descendant of the given story in one
             atomic transaction.
 
+        devbench promote --all
+            Promote every ``draft``-status WU in the workspace.  Prints a
+            confirmation prompt listing the count before writing.  Aborts with
+            rc=1 if the operator does not confirm.
+
+        devbench promote --all --yes
+            Same as ``--all`` but skips the confirmation prompt.
+
     For every promoted unit an audit comment ``[PROMOTED] draft -> in-queue``
     is appended via ``BacklogManager._append_agent_comment``.
 
     Args:
         *argv: Parsed CLI tokens -- either ``(<id>,)`` or
-            ``("--epic"|"--feature"|"--story", <scope_id>)``.
+            ``("--epic"|"--feature"|"--story", <scope_id>)`` or
+            ``("--all",)`` or ``("--all", "--yes")``.
 
     Returns:
         0 on success, 1 on any error (unit not found, file missing,
-        status is not draft, unknown flag).
+        status is not draft, unknown flag, operator declined confirmation).
 
     Raises:
         Nothing -- all errors are reported to stderr and return rc=1.
     """
     bulk_flags = frozenset({"--epic", "--feature", "--story"})
 
-    if len(argv) == 1 and argv[0] not in bulk_flags:
+    if len(argv) == 1 and argv[0] not in bulk_flags and argv[0] != "--all":
         return _promote_single(argv[0])
 
     if len(argv) == 2 and argv[0] in bulk_flags:
         return _promote_bulk(scope_id=argv[1])
+
+    if len(argv) == 1 and argv[0] == "--all":
+        return _promote_all(skip_confirmation=False)
+
+    if len(argv) == 2 and argv[0] == "--all" and argv[1] == "--yes":
+        return _promote_all(skip_confirmation=True)
 
     if len(argv) == 1 and argv[0] in bulk_flags:
         print(
@@ -1431,7 +1446,7 @@ def cmd_promote(*argv: str) -> int:
         return 1
 
     print(
-        "ERROR: promote usage: promote <id>  OR  promote --epic|--feature|--story <id>",
+        "ERROR: promote usage: promote <id>  OR  promote --epic|--feature|--story <id>  OR  promote --all [--yes]",
         file=sys.stderr,
     )
     return 1
@@ -1540,6 +1555,69 @@ def _promote_bulk(scope_id: str) -> int:
 
     count = len(resolved)
     print(f"Promoted {count} unit(s) from draft to in-queue under scope '{scope_id}'")
+    return 0
+
+
+def _promote_all(*, skip_confirmation: bool) -> int:
+    """Promote every ``draft`` work unit in the workspace to ``in-queue``.
+
+    Discovers all draft work units via ``BacklogParser.parse_index``, then
+    optionally asks the operator to confirm before writing.  If the operator
+    declines, no files are modified and the function returns 1.
+
+    The function is fail-fast: all file paths are resolved before any write
+    occurs so that a missing file (TOCTOU race) never causes partial promotion.
+
+    Args:
+        skip_confirmation: When ``True``, no interactive prompt is shown and
+            promotion proceeds immediately.  When ``False``, the operator is
+            shown the count of draft units and must type ``y`` / ``yes``
+            (case-insensitive) to continue; any other input aborts with rc=1.
+
+    Returns:
+        0 when all draft units were promoted successfully.
+        1 when there are no draft units, the operator declined the prompt, any
+        file is missing, or any write fails.
+
+    Raises:
+        Nothing -- all errors are reported to stderr and return rc=1.
+    """
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+
+    draft_units = [u for u in units if u.status is WorkUnitStatus.DRAFT]
+
+    if not draft_units:
+        print(
+            "ERROR: no draft work units found in the workspace",
+            file=sys.stderr,
+        )
+        return 1
+
+    count = len(draft_units)
+
+    if not skip_confirmation:
+        answer = input(f"Promote {count} draft unit(s) to in-queue? [y/N] ")
+        if answer.strip().lower() not in {"y", "yes"}:
+            print("Promotion aborted.", file=sys.stderr)
+            return 1
+
+    # Validate all files exist before writing anything (fail-fast, no partial writes)
+    resolved: list[tuple[WorkUnit, Path]] = []
+    for u in draft_units:
+        wu_file = _resolve_unit_file(u)
+        if wu_file is None:
+            print(f"ERROR: Work unit file not found for '{u.id}'", file=sys.stderr)
+            return 1
+        resolved.append((u, wu_file))
+
+    mgr = BacklogManager()
+    for u, wu_file in resolved:
+        mgr.force_status(wu_file, BACKLOG_INDEX, u.id, STATUS_IN_QUEUE)
+        mgr._append_agent_comment(wu_file, "orchestrator", "[PROMOTED] draft -> in-queue")
+        logger.info("Promoted %s from draft to in-queue", u.id)
+
+    print(f"Promoted {count} unit(s) from draft to in-queue")
     return 0
 
 

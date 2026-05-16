@@ -6399,6 +6399,276 @@ class TestCmdPromoteBulkIntegration:
         assert "## Status: draft" in t1_content
 
 
+class TestCmdPromoteAll:
+    """E1-F4-S1-T3: ``devbench promote --all [--yes]`` promotes every draft WU."""
+
+    # ------------------------------------------------------------------
+    # Happy path: --all --yes skips confirmation and promotes everything
+    # ------------------------------------------------------------------
+
+    def test_all_yes_promotes_every_draft_unit(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """--all --yes promotes all draft WUs without prompting."""
+        units = [
+            ("E1-F1-S1-T1", "draft"),
+            ("E2-F1-S1-T1", "draft"),
+            ("E3-F1-S1-T1", "in-queue"),  # not draft -- must be skipped
+        ]
+        backlog_md, backlog_dir = _build_promote_backlog_fixture(tmp_path, units)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_promote("--all", "--yes")
+        assert rc == 0
+        # Draft units promoted
+        for uid in ("E1-F1-S1-T1", "E2-F1-S1-T1"):
+            content = (backlog_dir / f"{uid}.md").read_text()
+            assert "## Status: in-queue" in content, f"{uid} not promoted"
+            assert "[PROMOTED] draft -> in-queue" in content
+        # Non-draft unit untouched
+        e3_content = (backlog_dir / "E3-F1-S1-T1.md").read_text()
+        assert "## Status: in-queue" in e3_content  # was already in-queue, not promoted
+        out = capsys.readouterr().out
+        assert "2" in out
+        assert "promoted" in out.lower()
+
+    def test_all_yes_no_draft_units_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """--all --yes with no draft WUs returns rc=1 and reports an error."""
+        units = [
+            ("E1-F1-S1-T1", "in-queue"),
+            ("E2-F1-S1-T1", "done"),
+        ]
+        backlog_md, backlog_dir = _build_promote_backlog_fixture(tmp_path, units)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_promote("--all", "--yes")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "no draft" in err.lower()
+
+    def test_all_yes_appends_audit_comment(self, tmp_path: Path) -> None:
+        """Each promoted unit gets an audit comment with [PROMOTED] marker."""
+        units = [("E1-F1-S1-T1", "draft"), ("E1-F1-S1-T2", "draft")]
+        backlog_md, backlog_dir = _build_promote_backlog_fixture(tmp_path, units)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            cli.cmd_promote("--all", "--yes")
+        for uid in ("E1-F1-S1-T1", "E1-F1-S1-T2"):
+            content = (backlog_dir / f"{uid}.md").read_text()
+            assert "[agent/orchestrator]" in content
+            assert "[PROMOTED] draft -> in-queue" in content
+
+    def test_all_yes_updates_backlog_index(self, tmp_path: Path) -> None:
+        """BACKLOG.md index rows are updated to in-queue for every promoted unit."""
+        units = [("E1-F1-S1-T1", "draft"), ("E2-F1-S1-T1", "draft")]
+        backlog_md, backlog_dir = _build_promote_backlog_fixture(tmp_path, units)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            cli.cmd_promote("--all", "--yes")
+        index = backlog_md.read_text()
+        assert "| draft |" not in index
+
+    # ------------------------------------------------------------------
+    # Confirmation prompt behaviour (without --yes)
+    # ------------------------------------------------------------------
+
+    def test_all_without_yes_prompts_and_aborts_on_no(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """--all without --yes prompts; answering 'n' aborts without promoting."""
+        units = [("E1-F1-S1-T1", "draft"), ("E1-F1-S1-T2", "draft")]
+        backlog_md, backlog_dir = _build_promote_backlog_fixture(tmp_path, units)
+        # Simulate user typing 'n'
+        monkeypatch.setattr("builtins.input", lambda _prompt: "n")
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_promote("--all")
+        assert rc == 1
+        # No units promoted
+        for uid in ("E1-F1-S1-T1", "E1-F1-S1-T2"):
+            content = (backlog_dir / f"{uid}.md").read_text()
+            assert "## Status: draft" in content
+
+    def test_all_without_yes_prompts_and_proceeds_on_yes(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """--all without --yes prompts; answering 'y' proceeds with promotion."""
+        units = [("E1-F1-S1-T1", "draft"), ("E1-F1-S1-T2", "draft")]
+        backlog_md, backlog_dir = _build_promote_backlog_fixture(tmp_path, units)
+        # Simulate user typing 'y'
+        monkeypatch.setattr("builtins.input", lambda _prompt: "y")
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_promote("--all")
+        assert rc == 0
+        for uid in ("E1-F1-S1-T1", "E1-F1-S1-T2"):
+            content = (backlog_dir / f"{uid}.md").read_text()
+            assert "## Status: in-queue" in content
+
+    @pytest.mark.parametrize("answer", ["N", "no", "NO", "cancel", ""])
+    def test_all_without_yes_aborts_on_non_affirmative_answers(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+        answer: str,
+    ) -> None:
+        """--all aborts on any answer that is not 'y' or 'yes' (case insensitive)."""
+        units = [("E1-F1-S1-T1", "draft")]
+        backlog_md, backlog_dir = _build_promote_backlog_fixture(tmp_path, units)
+        monkeypatch.setattr("builtins.input", lambda _prompt: answer)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_promote("--all")
+        assert rc == 1
+        content = (backlog_dir / "E1-F1-S1-T1.md").read_text()
+        assert "## Status: draft" in content
+
+    @pytest.mark.parametrize("answer", ["y", "Y", "yes", "YES", "Yes"])
+    def test_all_without_yes_proceeds_on_affirmative_answers(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+        answer: str,
+    ) -> None:
+        """--all proceeds on 'y' or 'yes' answers (case insensitive)."""
+        units = [("E1-F1-S1-T1", "draft")]
+        backlog_md, backlog_dir = _build_promote_backlog_fixture(tmp_path, units)
+        monkeypatch.setattr("builtins.input", lambda _prompt: answer)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_promote("--all")
+        assert rc == 0
+        content = (backlog_dir / "E1-F1-S1-T1.md").read_text()
+        assert "## Status: in-queue" in content
+
+    def test_all_without_yes_shows_count_in_prompt(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The confirmation prompt includes the number of draft units to be promoted."""
+        units = [
+            ("E1-F1-S1-T1", "draft"),
+            ("E1-F1-S1-T2", "draft"),
+            ("E1-F1-S1-T3", "draft"),
+        ]
+        backlog_md, backlog_dir = _build_promote_backlog_fixture(tmp_path, units)
+        prompts: list[str] = []
+
+        def capture_input(prompt: str) -> str:
+            prompts.append(prompt)
+            return "n"
+
+        monkeypatch.setattr("builtins.input", capture_input)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            cli.cmd_promote("--all")
+        assert len(prompts) == 1
+        assert "3" in prompts[0]
+
+    # ------------------------------------------------------------------
+    # Missing file path error (TOCTOU race)
+    # ------------------------------------------------------------------
+
+    def test_all_yes_missing_file_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """--all --yes returns rc=1 if _resolve_unit_file returns None for any draft unit."""
+        units = [("E1-F1-S1-T1", "draft"), ("E1-F1-S1-T2", "draft")]
+        backlog_md, backlog_dir = _build_promote_backlog_fixture(tmp_path, units)
+        original_resolve = cli._resolve_unit_file
+
+        def _resolve_returning_none(unit: WorkUnit) -> Path | None:
+            if unit.id == "E1-F1-S1-T2":
+                return None
+            return original_resolve(unit)
+
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._resolve_unit_file", side_effect=_resolve_returning_none),
+        ):
+            rc = cli.cmd_promote("--all", "--yes")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "E1-F1-S1-T2" in err
+        assert "not found" in err.lower()
+        # T1 also must not be promoted (fail-fast, no partial writes)
+        t1_content = (backlog_dir / "E1-F1-S1-T1.md").read_text()
+        assert "## Status: draft" in t1_content
+
+    # ------------------------------------------------------------------
+    # Invalid usage: unknown extra flags with --all
+    # ------------------------------------------------------------------
+
+    def test_all_with_unknown_extra_flag_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """--all with an unexpected extra argument returns rc=1 with a usage error."""
+        units: list[tuple[str, str]] = [("E1-F1-S1-T1", "draft")]
+        backlog_md, backlog_dir = _build_promote_backlog_fixture(tmp_path, units)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_promote("--all", "--unknown-flag")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "usage" in err.lower() or "promote" in err.lower()
+
+    # ------------------------------------------------------------------
+    # Integration test: full journey with --all --yes
+    # ------------------------------------------------------------------
+
+    def test_all_yes_integration_full_journey(self, tmp_path: Path) -> None:
+        """End-to-end: --all --yes promotes every draft, updates index, appends audit."""
+        units = [
+            ("E1-F1-S1-T1", "draft"),
+            ("E2-F1-S1-T1", "draft"),
+            ("E3-F1-S1-T1", "done"),  # must not be promoted
+            ("E4-F1-S1-T1", "blocked"),  # must not be promoted
+        ]
+        backlog_md, backlog_dir = _build_promote_backlog_fixture(tmp_path, units)
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_md),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_promote("--all", "--yes")
+        assert rc == 0
+        for uid in ("E1-F1-S1-T1", "E2-F1-S1-T1"):
+            wu = (backlog_dir / f"{uid}.md").read_text()
+            assert "## Status: in-queue" in wu, f"{uid} not transitioned"
+            assert "[PROMOTED] draft -> in-queue" in wu, f"{uid} missing audit"
+        # Non-draft units untouched
+        assert "## Status: done" in (backlog_dir / "E3-F1-S1-T1.md").read_text()
+        assert "## Status: blocked" in (backlog_dir / "E4-F1-S1-T1.md").read_text()
+        # Index updated correctly
+        index = backlog_md.read_text()
+        assert "| draft |" not in index
+
+
 class TestWireOrphanCleanupDepChain:
     """Phase 10: orphan-cleanup auto-emission resolves Manifest collisions via auto-wired deps."""
 

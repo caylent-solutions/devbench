@@ -54,6 +54,7 @@ All commands exit 0 on success, non-zero on failure. Output is structured
 for easy parsing by Claude Code or other automation.
 """
 
+import getpass
 import json
 import logging
 import os
@@ -165,6 +166,9 @@ from devbench.constants import (
     KNOWN_JUDGE_NAMES,
     ORCHESTRATOR_AUTO_RESTART_AUDIT_PREFIX,
     ORCHESTRATOR_RESTART_EXIT_CODE,
+    SESSION_DEFAULT_NAME,
+    SESSION_STARTED_AT_FILENAME,
+    SESSION_STARTED_BY_FILENAME,
     STATUS_BLOCKED,
     STATUS_DONE,
     STATUS_DRAFT,
@@ -188,7 +192,7 @@ from devbench.plugin_shadow import (
 # the banner is implemented there and reporting must not depend on cli.py.
 from devbench.reporting.report import _format_duration
 from devbench.scope import InvalidScopeError, ScopeFilter, _expand_prefix, _scope_file_path, _tokenise
-from devbench.session import ClaimRaceError, flock_backlog
+from devbench.session import ClaimRaceError, Session, SessionRegistry, flock_backlog
 from devbench.utils.io import atomic_write_text
 from devbench.utils.process import run_command
 
@@ -5006,10 +5010,12 @@ class _CmdStartArgs:
     Attributes:
         include: Raw ``--include`` token string (empty = include everything).
         exclude: Raw ``--exclude`` token string (empty = exclude nothing).
+        name: Named-session identifier (defaults to ``SESSION_DEFAULT_NAME``).
     """
 
     include: str = ""
     exclude: str = ""
+    name: str = SESSION_DEFAULT_NAME
 
 
 def _parse_start_args(argv: tuple[str, ...]) -> _CmdStartArgs | int:
@@ -5019,6 +5025,7 @@ def _parse_start_args(argv: tuple[str, ...]) -> _CmdStartArgs | int:
 
         --include "<tokens>"   Comma-separated scope-filter include tokens.
         --exclude "<tokens>"   Comma-separated scope-filter exclude tokens.
+        --name "<name>"        Named-session identifier (default: ``SESSION_DEFAULT_NAME``).
 
     Args:
         argv: Trailing arguments after the ``start`` command name (may be empty).
@@ -5031,6 +5038,7 @@ def _parse_start_args(argv: tuple[str, ...]) -> _CmdStartArgs | int:
     """
     include = ""
     exclude = ""
+    name = SESSION_DEFAULT_NAME
     args = list(argv)
     i = 0
     while i < len(args):
@@ -5047,10 +5055,87 @@ def _parse_start_args(argv: tuple[str, ...]) -> _CmdStartArgs | int:
                 return 1
             exclude = args[i + 1]
             i += 2
+        elif arg == "--name":
+            if i + 1 >= len(args):
+                print("ERROR: --name requires a value", file=sys.stderr)
+                return 1
+            name = args[i + 1]
+            i += 2
         else:
             print(f"ERROR: unknown flag for 'start': {arg!r}", file=sys.stderr)
             return 1
-    return _CmdStartArgs(include=include, exclude=exclude)
+    return _CmdStartArgs(include=include, exclude=exclude, name=name)
+
+
+def _write_session_state_files(
+    workspace_root: Path,
+    session_name: str,
+    pid: int,
+    scope_ids: list[str],
+) -> None:
+    """Create the per-session state directory and write all required files.
+
+    Creates ``<workspace_root>/.devbench/sessions/<session_name>/`` and writes:
+
+    - ``pid`` -- the process ID (plain integer text).
+    - ``started_at`` -- UTC ISO-8601 timestamp of when the session was created.
+    - ``started_by`` -- OS username of the process owner.
+    - ``scope.json`` -- JSON array of work-unit IDs in scope (may be empty).
+
+    Also registers the session in the
+    ``<workspace_root>/.devbench/sessions/registry.json`` via
+    :class:`~devbench.session.SessionRegistry`.
+
+    Args:
+        workspace_root: Root directory of the devbench workspace.
+        session_name: Short identifier for this session (e.g. ``"default"``).
+        pid: OS process ID to record.
+        scope_ids: Expanded list of work-unit IDs for this session's scope.
+
+    Raises:
+        OSError: A file or directory write fails.
+        ValueError: *session_name* contains ``..`` path segments.
+    """
+    if ".." in Path(session_name).parts:
+        raise ValueError(
+            f"session_name contains invalid path segment '..': {session_name!r}. "
+            "Use a simple alphanumeric name without directory traversal."
+        )
+
+    state_dir = workspace_root / ".devbench" / "sessions" / session_name
+    state_dir.mkdir(parents=True, exist_ok=True)
+
+    started_at = datetime.now(UTC)
+    started_by = getpass.getuser()
+
+    # pid
+    (state_dir / "pid").write_text(str(pid), encoding="utf-8")
+
+    # started_at
+    (state_dir / SESSION_STARTED_AT_FILENAME).write_text(started_at.isoformat(), encoding="utf-8")
+
+    # started_by
+    (state_dir / SESSION_STARTED_BY_FILENAME).write_text(started_by, encoding="utf-8")
+
+    # scope.json -- written as a JSON array of IDs
+    (state_dir / "scope.json").write_text(json.dumps(scope_ids, indent=2), encoding="utf-8")
+
+    # registry.json -- add or update this session
+    registry = SessionRegistry(workspace_root)
+    sessions = registry.load()
+    # Replace any existing entry with the same name (re-start scenario)
+    sessions = [s for s in sessions if s.name != session_name]
+    sessions.append(
+        Session(
+            name=session_name,
+            pid=pid,
+            scope=scope_ids,
+            started_at=started_at,
+            started_by=started_by,
+            state_dir=state_dir,
+        )
+    )
+    registry.save(sessions)
 
 
 def cmd_start(*argv: str) -> int:
@@ -5101,7 +5186,7 @@ def cmd_start(*argv: str) -> int:
     the orchestrate skill interactively, but suitable for CI/unattended runs.
 
     Args:
-        *argv: Optional flags (``--include``, ``--exclude``).
+        *argv: Optional flags (``--include``, ``--exclude``, ``--name``).
 
     Returns:
         0 on success (including drain-enforced stop), 1 on argument-parse
@@ -5121,6 +5206,9 @@ def cmd_start(*argv: str) -> int:
     if isinstance(parsed, int):
         return parsed
 
+    # Determine the scope IDs for this session (empty when no --include).
+    scope_ids: list[str] = []
+
     # When --include is supplied and non-empty, build + persist a ScopeFilter.
     if parsed.include:
         parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
@@ -5133,6 +5221,12 @@ def cmd_start(*argv: str) -> int:
             return 1
         scope_file = scope.to_file(WORKSPACE_ROOT)
         os.environ["DEVBENCH_SCOPE_FILE"] = str(scope_file)
+        scope_ids = sorted(scope.expanded_ids)
+
+    # AC-192-1/2: Create the per-session state directory and register the session.
+    # This must happen before the SDK run so that concurrent sessions can detect
+    # each other via the registry.
+    _write_session_state_files(WORKSPACE_ROOT, parsed.name, os.getpid(), scope_ids)
 
     plugin_path = _resolve_plugin_path()
 
@@ -5145,6 +5239,12 @@ def cmd_start(*argv: str) -> int:
     # sentinel-protected lifecycle).
     if plugin_path == shadow_plugin_path(WORKSPACE_ROOT):
         write_pid_sentinel(WORKSPACE_ROOT, os.getpid())
+
+    # Set DEVBENCH_SESSION_NAME for the duration of the SDK run.  Use a
+    # try/finally to restore the previous value so test isolation is maintained
+    # (the orchestrator process is long-lived in tests).
+    _prev_session_name = os.environ.get("DEVBENCH_SESSION_NAME")
+    os.environ["DEVBENCH_SESSION_NAME"] = parsed.name
 
     async def _run() -> None:
         """Iterate SDK messages; raise _DrainRequested when claim-while-drain-pending.
@@ -5174,14 +5274,22 @@ def cmd_start(*argv: str) -> int:
                     raise _DrainRequested(drain_state.reason)
 
     try:
-        asyncio.run(_run())
-    except _DrainRequested as exc:
-        # Drain-enforcement backstop (spec section 4.3.3, AC-188-4, AC-188-5, AC-188-8):
-        # consume the marker so the next run starts unscoped, then record the audit.
-        drained = consume_drain(WORKSPACE_ROOT)
-        reason_text = drained.reason if drained is not None else exc.reason
-        logger.info("%s%s", _ORCHESTRATOR_DRAIN_ENFORCED_AUDIT_PREFIX, reason_text)
-        return 0
+        try:
+            asyncio.run(_run())
+        except _DrainRequested as exc:
+            # Drain-enforcement backstop (spec section 4.3.3, AC-188-4, AC-188-5, AC-188-8):
+            # consume the marker so the next run starts unscoped, then record the audit.
+            drained = consume_drain(WORKSPACE_ROOT)
+            reason_text = drained.reason if drained is not None else exc.reason
+            logger.info("%s%s", _ORCHESTRATOR_DRAIN_ENFORCED_AUDIT_PREFIX, reason_text)
+            return 0
+    finally:
+        # Restore the previous DEVBENCH_SESSION_NAME value so test isolation is
+        # maintained when cmd_start is invoked multiple times in the same process.
+        if _prev_session_name is None:
+            os.environ.pop("DEVBENCH_SESSION_NAME", None)
+        else:
+            os.environ["DEVBENCH_SESSION_NAME"] = _prev_session_name
 
     # AC-190-13: delete scope.json on clean SDK exit so the next run starts
     # without a stale scope.  On crash (SDK raises), the exception propagates

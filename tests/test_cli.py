@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import re
+import types
 from collections.abc import Generator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -4096,6 +4097,238 @@ class TestCmdStart:
             result = cli.cmd_start()
 
         assert result == 0
+
+
+class _FakeSdkModule(types.ModuleType):
+    """Typed fake claude_agent_sdk module for tests.
+
+    Subclasses :class:`types.ModuleType` and declares ``ClaudeAgentOptions``
+    and ``query`` as typed attributes so mypy can verify attribute access
+    without suppression annotations.
+    """
+
+    ClaudeAgentOptions: object
+    query: object
+
+    def __init__(self) -> None:
+        super().__init__("claude_agent_sdk")
+
+
+class TestCmdStartNameFlag:
+    """Tests for AC-192-1 and AC-192-2: --name flag creates session registry entry.
+
+    AC-192-1: devbench start --name <name> creates <workspace>/.devbench/sessions/<name>/
+              with pid, scope.json, started_at, started_by files.
+    AC-192-2: --name defaults to 'default' when omitted.
+    """
+
+    def _make_mock_sdk(self) -> _FakeSdkModule:
+        """Return a minimal fake claude_agent_sdk module.
+
+        Returns:
+            A :class:`_FakeSdkModule` instance with ``ClaudeAgentOptions`` set
+            to a :class:`~unittest.mock.MagicMock` and ``query`` set to an
+            async generator that yields a single test message.
+        """
+        mock_sdk = _FakeSdkModule()
+        mock_sdk.ClaudeAgentOptions = MagicMock()
+
+        async def mock_query(**kwargs: object) -> object:
+            yield "test message"
+
+        mock_sdk.query = mock_query
+        return mock_sdk
+
+    @pytest.mark.unit
+    def test_default_name_creates_default_session_dir(self, tmp_path: Path) -> None:
+        """AC-192-2: --name defaults to 'default'; session dir created under sessions/default/."""
+        import sys
+
+        mock_sdk = self._make_mock_sdk()
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+        ):
+            rc = cli.cmd_start()
+
+        assert rc == 0
+        session_dir = tmp_path / ".devbench" / "sessions" / "default"
+        assert session_dir.is_dir(), f"Expected session dir at {session_dir}"
+
+    @pytest.mark.unit
+    def test_named_flag_creates_named_session_dir(self, tmp_path: Path) -> None:
+        """AC-192-1: --name alpha creates .devbench/sessions/alpha/ directory."""
+        import sys
+
+        mock_sdk = self._make_mock_sdk()
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+        ):
+            rc = cli.cmd_start("--name", "alpha")
+
+        assert rc == 0
+        session_dir = tmp_path / ".devbench" / "sessions" / "alpha"
+        assert session_dir.is_dir(), f"Expected session dir at {session_dir}"
+
+    @pytest.mark.unit
+    def test_pid_file_written(self, tmp_path: Path) -> None:
+        """AC-192-1: session dir contains a 'pid' file with the current process PID."""
+        import os
+        import sys
+
+        mock_sdk = self._make_mock_sdk()
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+        ):
+            rc = cli.cmd_start("--name", "beta")
+
+        assert rc == 0
+        pid_path = tmp_path / ".devbench" / "sessions" / "beta" / "pid"
+        assert pid_path.is_file(), f"Expected pid file at {pid_path}"
+        assert pid_path.read_text(encoding="utf-8").strip() == str(os.getpid())
+
+    @pytest.mark.unit
+    def test_started_at_file_written(self, tmp_path: Path) -> None:
+        """AC-192-1: session dir contains a 'started_at' file with ISO-8601 timestamp."""
+        import sys
+        from datetime import UTC, datetime
+
+        mock_sdk = self._make_mock_sdk()
+        before = datetime.now(UTC)
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+        ):
+            rc = cli.cmd_start("--name", "gamma")
+
+        after = datetime.now(UTC)
+        assert rc == 0
+        started_at_path = tmp_path / ".devbench" / "sessions" / "gamma" / "started_at"
+        assert started_at_path.is_file(), f"Expected started_at file at {started_at_path}"
+        raw = started_at_path.read_text(encoding="utf-8").strip()
+        recorded = datetime.fromisoformat(raw)
+        # Normalise to UTC for comparison
+        if recorded.tzinfo is None:
+            recorded = recorded.replace(tzinfo=UTC)
+        assert before <= recorded <= after, (
+            f"started_at {raw!r} must be between {before.isoformat()} and {after.isoformat()}"
+        )
+
+    @pytest.mark.unit
+    def test_started_by_file_written(self, tmp_path: Path) -> None:
+        """AC-192-1: session dir contains a 'started_by' file with the OS username."""
+        import getpass
+        import sys
+
+        mock_sdk = self._make_mock_sdk()
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+        ):
+            rc = cli.cmd_start("--name", "delta")
+
+        assert rc == 0
+        started_by_path = tmp_path / ".devbench" / "sessions" / "delta" / "started_by"
+        assert started_by_path.is_file(), f"Expected started_by file at {started_by_path}"
+        assert started_by_path.read_text(encoding="utf-8").strip() == getpass.getuser()
+
+    @pytest.mark.unit
+    def test_scope_json_written_when_no_include(self, tmp_path: Path) -> None:
+        """AC-192-1: scope.json is written to the session dir (empty scope when no --include)."""
+        import sys
+
+        mock_sdk = self._make_mock_sdk()
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+        ):
+            rc = cli.cmd_start("--name", "epsilon")
+
+        assert rc == 0
+        scope_path = tmp_path / ".devbench" / "sessions" / "epsilon" / "scope.json"
+        assert scope_path.is_file(), f"Expected scope.json at {scope_path}"
+
+    @pytest.mark.unit
+    def test_registry_json_updated(self, tmp_path: Path) -> None:
+        """AC-192-1: registry.json under .devbench/sessions/ contains the new session entry."""
+        import sys
+
+        mock_sdk = self._make_mock_sdk()
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+        ):
+            rc = cli.cmd_start("--name", "zeta")
+
+        assert rc == 0
+        import json as _json
+
+        registry_path = tmp_path / ".devbench" / "sessions" / "registry.json"
+        assert registry_path.is_file(), f"Expected registry.json at {registry_path}"
+        entries = _json.loads(registry_path.read_text(encoding="utf-8"))
+        assert isinstance(entries, list)
+        names = [e["name"] for e in entries]
+        assert "zeta" in names, f"Expected 'zeta' in registry names, got {names}"
+
+    @pytest.mark.unit
+    def test_devbench_session_name_set_during_run(self, tmp_path: Path) -> None:
+        """AC-192-1: DEVBENCH_SESSION_NAME env var is set to the session name during SDK run."""
+        import sys
+
+        captured_env: dict[str, str] = {}
+        mock_sdk_capture = _FakeSdkModule()
+        mock_sdk_capture.ClaudeAgentOptions = MagicMock()
+
+        async def mock_query_capture(**kwargs: object) -> object:
+            import os as _os
+
+            captured_env.update(_os.environ.copy())
+            yield "test message"
+
+        mock_sdk_capture.query = mock_query_capture
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk_capture}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+        ):
+            rc = cli.cmd_start("--name", "eta")
+
+        assert rc == 0
+        assert captured_env.get("DEVBENCH_SESSION_NAME") == "eta", (
+            f"Expected DEVBENCH_SESSION_NAME='eta' during SDK run, got {captured_env.get('DEVBENCH_SESSION_NAME')!r}"
+        )
+
+    @pytest.mark.unit
+    def test_unknown_flag_returns_error(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """--badflg returns exit code 1 with error message (regression guard)."""
+        rc = cli.cmd_start("--badflg")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "--badflg" in err
+
+    @pytest.mark.unit
+    def test_name_missing_value_returns_error(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """--name without a value returns exit code 1."""
+        rc = cli.cmd_start("--name")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "--name" in err
+
+    @pytest.mark.unit
+    def test_path_traversal_in_name_raises_value_error(self, tmp_path: Path) -> None:
+        """_write_session_state_files raises ValueError when session_name contains '..'."""
+        with pytest.raises(ValueError, match=r"invalid path segment '\.\.'"):
+            cli._write_session_state_files(tmp_path, "../evil", 12345, [])
 
 
 class TestMainMinArgs:

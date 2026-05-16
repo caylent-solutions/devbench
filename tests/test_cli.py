@@ -4331,6 +4331,246 @@ class TestCmdStartNameFlag:
             cli._write_session_state_files(tmp_path, "../evil", 12345, [])
 
 
+class TestCmdStartScopeOverlap:
+    """Tests for AC-192-4: scope-overlap detection + --allow-overlap flag.
+
+    AC-192-4: Scope-overlap detection: second session with overlapping scope
+              fails fast (rc=1, stderr lists conflicting WU IDs + session names)
+              unless --allow-overlap is passed (warn but proceed).
+    """
+
+    def _make_mock_sdk(self) -> _FakeSdkModule:
+        """Return a minimal fake claude_agent_sdk module."""
+        mock_sdk = _FakeSdkModule()
+        mock_sdk.ClaudeAgentOptions = MagicMock()
+
+        async def mock_query(**kwargs: object) -> object:
+            yield "test message"
+
+        mock_sdk.query = mock_query
+        return mock_sdk
+
+    def _seed_registry(self, workspace_root: Path, session_name: str, scope: list[str]) -> None:
+        """Write a registry.json entry for an already-running session."""
+        from devbench.session import Session, SessionRegistry
+
+        registry = SessionRegistry(workspace_root)
+        existing = registry.load()
+        state_dir = workspace_root / ".devbench" / "sessions" / session_name
+        state_dir.mkdir(parents=True, exist_ok=True)
+        existing.append(
+            Session(
+                name=session_name,
+                pid=99999,
+                scope=scope,
+                started_at=datetime(2026, 1, 1, tzinfo=UTC),
+                started_by="tester",
+                state_dir=state_dir,
+            )
+        )
+        registry.save(existing)
+
+    @pytest.mark.unit
+    def test_overlap_without_allow_overlap_returns_rc1(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-192-4: overlapping scopes fail-fast with rc=1 when --allow-overlap absent."""
+        import sys
+
+        self._seed_registry(tmp_path, "alpha", ["E1-F1-S1-T1", "E1-F1-S1-T2"])
+        mock_sdk = self._make_mock_sdk()
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch(
+                "devbench.cli.BacklogParser.parse_index",
+                return_value=[
+                    WorkUnit(
+                        id="E1-F1-S1-T1",
+                        title="Task 1",
+                        status=WorkUnitStatus.IN_QUEUE,
+                        unit_type=WorkUnitType.TASK,
+                        file_path=Path("backlog/E1-F1-S1-T1.md"),
+                        repo="caylent-solutions/devbench",
+                        dependencies=[],
+                    ),
+                    WorkUnit(
+                        id="E1-F1-S1-T2",
+                        title="Task 2",
+                        status=WorkUnitStatus.IN_QUEUE,
+                        unit_type=WorkUnitType.TASK,
+                        file_path=Path("backlog/E1-F1-S1-T2.md"),
+                        repo="caylent-solutions/devbench",
+                        dependencies=[],
+                    ),
+                ],
+            ),
+        ):
+            rc = cli.cmd_start("--include", "E1-F1-S1-T1", "--name", "beta")
+
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "E1-F1-S1-T1" in err
+        assert "alpha" in err
+
+    @pytest.mark.unit
+    def test_overlap_with_allow_overlap_returns_rc0_and_warns(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-192-4: --allow-overlap warns but proceeds (rc=0)."""
+        import sys
+
+        self._seed_registry(tmp_path, "alpha", ["E1-F1-S1-T1", "E1-F1-S1-T2"])
+        mock_sdk = self._make_mock_sdk()
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch(
+                "devbench.cli.BacklogParser.parse_index",
+                return_value=[
+                    WorkUnit(
+                        id="E1-F1-S1-T1",
+                        title="Task 1",
+                        status=WorkUnitStatus.IN_QUEUE,
+                        unit_type=WorkUnitType.TASK,
+                        file_path=Path("backlog/E1-F1-S1-T1.md"),
+                        repo="caylent-solutions/devbench",
+                        dependencies=[],
+                    ),
+                ],
+            ),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+        ):
+            rc = cli.cmd_start("--include", "E1-F1-S1-T1", "--name", "beta", "--allow-overlap")
+
+        assert rc == 0
+        err = capsys.readouterr().err
+        assert "WARNING" in err
+        assert "E1-F1-S1-T1" in err
+
+    @pytest.mark.unit
+    def test_no_overlap_proceeds_normally(self, tmp_path: Path) -> None:
+        """AC-192-4: non-overlapping scopes proceed with rc=0."""
+        import sys
+
+        self._seed_registry(tmp_path, "alpha", ["E2-F1-S1-T1"])
+        mock_sdk = self._make_mock_sdk()
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch(
+                "devbench.cli.BacklogParser.parse_index",
+                return_value=[
+                    WorkUnit(
+                        id="E1-F1-S1-T1",
+                        title="Task 1",
+                        status=WorkUnitStatus.IN_QUEUE,
+                        unit_type=WorkUnitType.TASK,
+                        file_path=Path("backlog/E1-F1-S1-T1.md"),
+                        repo="caylent-solutions/devbench",
+                        dependencies=[],
+                    ),
+                ],
+            ),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+        ):
+            rc = cli.cmd_start("--include", "E1-F1-S1-T1", "--name", "beta")
+
+        assert rc == 0
+
+    @pytest.mark.unit
+    def test_empty_scope_no_overlap_check_needed(self, tmp_path: Path) -> None:
+        """AC-192-4: when no --include supplied (empty scope), overlap check is skipped."""
+        import sys
+
+        self._seed_registry(tmp_path, "alpha", ["E1-F1-S1-T1"])
+        mock_sdk = self._make_mock_sdk()
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+        ):
+            rc = cli.cmd_start("--name", "beta")
+
+        assert rc == 0
+
+    @pytest.mark.unit
+    def test_allow_overlap_flag_missing_value_returns_rc1(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """--allow-overlap is a boolean flag; it takes no value argument."""
+        # --allow-overlap is a boolean flag so the parser must accept it without a value.
+        # Passing an unknown flag after --allow-overlap must still error.
+        rc = cli.cmd_start("--allow-overlap", "--unknown-flag-after")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "--unknown-flag-after" in err
+
+    @pytest.mark.unit
+    def test_error_message_lists_conflicting_ids_and_sessions(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-192-4: error message names every conflicting WU ID and the owning session."""
+        import sys
+
+        self._seed_registry(tmp_path, "session-one", ["E1-F1-S1-T1", "E1-F1-S1-T2"])
+        mock_sdk = self._make_mock_sdk()
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+            patch(
+                "devbench.cli.BacklogParser.parse_index",
+                return_value=[
+                    WorkUnit(
+                        id="E1-F1-S1-T1",
+                        title="Task 1",
+                        status=WorkUnitStatus.IN_QUEUE,
+                        unit_type=WorkUnitType.TASK,
+                        file_path=Path("backlog/E1-F1-S1-T1.md"),
+                        repo="caylent-solutions/devbench",
+                        dependencies=[],
+                    ),
+                    WorkUnit(
+                        id="E1-F1-S1-T2",
+                        title="Task 2",
+                        status=WorkUnitStatus.IN_QUEUE,
+                        unit_type=WorkUnitType.TASK,
+                        file_path=Path("backlog/E1-F1-S1-T2.md"),
+                        repo="caylent-solutions/devbench",
+                        dependencies=[],
+                    ),
+                ],
+            ),
+        ):
+            rc = cli.cmd_start("--include", "E1-F1-S1-T1,E1-F1-S1-T2", "--name", "session-two")
+
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "E1-F1-S1-T1" in err
+        assert "E1-F1-S1-T2" in err
+        assert "session-one" in err
+
+    @pytest.mark.unit
+    def test_parse_start_args_allow_overlap_default_false(self) -> None:
+        """_parse_start_args returns allow_overlap=False by default."""
+        result = cli._parse_start_args(())
+        assert isinstance(result, cli._CmdStartArgs)
+        assert result.allow_overlap is False
+
+    @pytest.mark.unit
+    def test_parse_start_args_allow_overlap_flag_sets_true(self) -> None:
+        """_parse_start_args returns allow_overlap=True when --allow-overlap is passed."""
+        result = cli._parse_start_args(("--allow-overlap",))
+        assert isinstance(result, cli._CmdStartArgs)
+        assert result.allow_overlap is True
+
+
 class TestMainMinArgs:
     """Test main() when a command doesn't have enough arguments."""
 

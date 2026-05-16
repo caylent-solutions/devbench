@@ -192,7 +192,7 @@ from devbench.plugin_shadow import (
 # the banner is implemented there and reporting must not depend on cli.py.
 from devbench.reporting.report import _format_duration
 from devbench.scope import InvalidScopeError, ScopeFilter, _expand_prefix, _scope_file_path, _tokenise
-from devbench.session import ClaimRaceError, Session, SessionRegistry, flock_backlog
+from devbench.session import ClaimRaceError, Session, SessionRegistry, detect_scope_overlap, flock_backlog
 from devbench.utils.io import atomic_write_text
 from devbench.utils.process import run_command
 
@@ -5011,11 +5011,15 @@ class _CmdStartArgs:
         include: Raw ``--include`` token string (empty = include everything).
         exclude: Raw ``--exclude`` token string (empty = exclude nothing).
         name: Named-session identifier (defaults to ``SESSION_DEFAULT_NAME``).
+        allow_overlap: When ``True``, scope overlap with active sessions emits
+            a warning but does not abort the start.  When ``False`` (default),
+            any overlap causes an immediate rc=1 failure.
     """
 
     include: str = ""
     exclude: str = ""
     name: str = SESSION_DEFAULT_NAME
+    allow_overlap: bool = False
 
 
 def _parse_start_args(argv: tuple[str, ...]) -> _CmdStartArgs | int:
@@ -5026,6 +5030,8 @@ def _parse_start_args(argv: tuple[str, ...]) -> _CmdStartArgs | int:
         --include "<tokens>"   Comma-separated scope-filter include tokens.
         --exclude "<tokens>"   Comma-separated scope-filter exclude tokens.
         --name "<name>"        Named-session identifier (default: ``SESSION_DEFAULT_NAME``).
+        --allow-overlap        Boolean flag; when present, scope overlap with active
+                               sessions emits a warning but does not abort.
 
     Args:
         argv: Trailing arguments after the ``start`` command name (may be empty).
@@ -5039,6 +5045,7 @@ def _parse_start_args(argv: tuple[str, ...]) -> _CmdStartArgs | int:
     include = ""
     exclude = ""
     name = SESSION_DEFAULT_NAME
+    allow_overlap = False
     args = list(argv)
     i = 0
     while i < len(args):
@@ -5061,10 +5068,13 @@ def _parse_start_args(argv: tuple[str, ...]) -> _CmdStartArgs | int:
                 return 1
             name = args[i + 1]
             i += 2
+        elif arg == "--allow-overlap":
+            allow_overlap = True
+            i += 1
         else:
             print(f"ERROR: unknown flag for 'start': {arg!r}", file=sys.stderr)
             return 1
-    return _CmdStartArgs(include=include, exclude=exclude, name=name)
+    return _CmdStartArgs(include=include, exclude=exclude, name=name, allow_overlap=allow_overlap)
 
 
 def _write_session_state_files(
@@ -5138,6 +5148,69 @@ def _write_session_state_files(
     registry.save(sessions)
 
 
+def _check_scope_overlap(
+    workspace_root: Path,
+    scope_ids: list[str],
+    allow_overlap: bool,
+) -> int | None:
+    """Check whether *scope_ids* overlaps with any active session's scope.
+
+    Loads the session registry from *workspace_root* and calls
+    :func:`~devbench.session.detect_scope_overlap`.  When overlap is found:
+
+    - If *allow_overlap* is ``True``: prints a ``WARNING`` to stderr and
+      returns ``None`` (caller should proceed).
+    - If *allow_overlap* is ``False``: prints an ``ERROR`` to stderr and
+      returns ``1`` (caller should abort with rc=1).
+
+    When no overlap is found (or *scope_ids* is empty), returns ``None`` to
+    signal that the caller should proceed normally.
+
+    Args:
+        workspace_root: Root directory of the devbench workspace.
+        scope_ids: Expanded list of work-unit IDs for the new session.
+        allow_overlap: When ``True``, overlap emits a warning; when ``False``,
+            overlap causes an error return.
+
+    Returns:
+        ``None`` when the caller should proceed; ``1`` when the caller should
+        abort immediately with exit code 1.
+
+    Raises:
+        ValueError: ``SessionRegistry.load()`` found invalid JSON in the registry file.
+        TypeError: ``detect_scope_overlap()`` received a ``None`` input instead of a list.
+    """
+    registry = SessionRegistry(workspace_root)
+    existing_sessions = registry.load()
+    overlapping_ids = detect_scope_overlap(existing_sessions, scope_ids)
+    if not overlapping_ids:
+        return None
+
+    # Build a map of conflicting ID -> owning session name for the message.
+    id_to_sessions: dict[str, list[str]] = {}
+    for session in existing_sessions:
+        for wu_id in session.scope:
+            if wu_id in overlapping_ids:
+                id_to_sessions.setdefault(wu_id, []).append(session.name)
+    conflict_lines = ", ".join(
+        f"{wu_id} (owned by: {', '.join(sorted(names))})" for wu_id, names in sorted(id_to_sessions.items())
+    )
+    if allow_overlap:
+        print(
+            f"WARNING: scope overlap detected with active sessions -- "
+            f"conflicting IDs: {conflict_lines}. Proceeding because --allow-overlap was passed.",
+            file=sys.stderr,
+        )
+        return None
+    print(
+        f"ERROR: scope overlap detected -- the following work-unit IDs are already "
+        f"claimed by an active session: {conflict_lines}. "
+        f"Pass --allow-overlap to start anyway.",
+        file=sys.stderr,
+    )
+    return 1
+
+
 def cmd_start(*argv: str) -> int:
     """Run the devbench orchestrate skill non-interactively via the Claude Agent SDK.
 
@@ -5186,11 +5259,12 @@ def cmd_start(*argv: str) -> int:
     the orchestrate skill interactively, but suitable for CI/unattended runs.
 
     Args:
-        *argv: Optional flags (``--include``, ``--exclude``, ``--name``).
+        *argv: Optional flags (``--include``, ``--exclude``, ``--name``,
+            ``--allow-overlap``).
 
     Returns:
         0 on success (including drain-enforced stop), 1 on argument-parse
-        error or invalid scope token,
+        error, invalid scope token, or scope overlap without ``--allow-overlap``,
         :data:`ORCHESTRATOR_RESTART_EXIT_CODE` (42) when auto-restart is triggered.
 
     Raises:
@@ -5222,6 +5296,14 @@ def cmd_start(*argv: str) -> int:
         scope_file = scope.to_file(WORKSPACE_ROOT)
         os.environ["DEVBENCH_SCOPE_FILE"] = str(scope_file)
         scope_ids = sorted(scope.expanded_ids)
+
+    # AC-192-4: Scope-overlap detection -- before claiming the registry slot,
+    # consult active sessions.  When scope_ids is empty (no --include) there
+    # is nothing to overlap, so skip the check entirely.
+    if scope_ids:
+        overlap_rc = _check_scope_overlap(WORKSPACE_ROOT, scope_ids, parsed.allow_overlap)
+        if overlap_rc is not None:
+            return overlap_rc
 
     # AC-192-1/2: Create the per-session state directory and register the session.
     # This must happen before the SDK run so that concurrent sessions can detect

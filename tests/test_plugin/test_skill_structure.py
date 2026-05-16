@@ -127,3 +127,43 @@ class TestOrchestrateSkillStepZeroSweepProposals:
             "sweep-proposals must run BEFORE validate-backlog so any drafts created by the sweep "
             "are visible to the parse + pre-flight checks of the main loop."
         )
+
+
+@pytest.mark.unit
+class TestOrchestrateSkillStep1cScopeFilter:
+    """AC-190-15: SKILL must have a Step 1c scope-filter instruction between validate-backlog and next."""
+
+    def test_skill_references_scope_json(self) -> None:
+        """Step 1c must mention scope.json so the orchestrator knows which file to consult."""
+        content = SKILL_PATH.read_text()
+        assert "scope.json" in content, "SKILL.md must reference scope.json in the Step 1c scope-filter instruction"
+
+    def test_skill_references_no_actionable_in_scope(self) -> None:
+        """Step 1c must name the NO_ACTIONABLE_IN_SCOPE sentinel so the clean-exit path is clear."""
+        content = SKILL_PATH.read_text()
+        assert "NO_ACTIONABLE_IN_SCOPE" in content, (
+            "SKILL.md Step 1c must name the NO_ACTIONABLE_IN_SCOPE sentinel for the clean-exit path"
+        )
+
+    def test_skill_step1c_appears_between_validate_backlog_and_next(self) -> None:
+        """Step 1c must appear after validate-backlog and before step 2 devbench next."""
+        content = SKILL_PATH.read_text()
+        validate_pos = content.find("uv run devbench validate-backlog")
+        scope_pos = content.find("scope.json")
+        # Step 2 starts with "2." -- find the first occurrence of step 2's next invocation
+        step2_marker = "2. `uv run devbench next`"
+        next_pos = content.find(step2_marker)
+        assert validate_pos >= 0, "SKILL.md must reference uv run devbench validate-backlog"
+        assert scope_pos >= 0, "SKILL.md must reference scope.json"
+        assert next_pos >= 0, f"SKILL.md must contain step 2 marker: {step2_marker!r}"
+        assert validate_pos < scope_pos < next_pos, (
+            "scope.json (Step 1c) must appear AFTER validate-backlog and BEFORE step 2 `uv run devbench next` "
+            "so scope is consulted between the integrity check and the claim decision"
+        )
+
+    def test_skill_step1c_instructs_clean_exit_on_exhausted_scope(self) -> None:
+        """Step 1c must instruct the orchestrator to exit cleanly when no WU matches scope."""
+        content = SKILL_PATH.read_text()
+        assert "exit cleanly" in content, (
+            "SKILL.md Step 1c must instruct the orchestrator to exit cleanly when scope is exhausted"
+        )

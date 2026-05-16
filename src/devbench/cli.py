@@ -4544,6 +4544,10 @@ def cmd_start(*argv: str) -> int:
     When ``--include`` is absent or empty, all work units are eligible (current
     behavior preserved, no scope.json written).
 
+    On clean SDK return, ``ScopeFilter.clear(workspace_root)`` is called to
+    remove any active scope.json (AC-190-13).  When the SDK raises (crash
+    path), scope.json is intentionally left on disk for operator inspection.
+
     When ``agents.*`` overrides are configured in ``devbench.yaml`` (or via
     ``JUDGE_AGENT_MODEL_*`` env vars), a workspace-local shadow plugin tree
     is materialised at ``<workspace>/.devbench/plugin-shadow/devbench/`` and
@@ -4616,6 +4620,12 @@ def cmd_start(*argv: str) -> int:
             logger.info("sdk message: %s", message)
 
     asyncio.run(_run())
+
+    # AC-190-13: delete scope.json on clean SDK exit so the next run starts
+    # without a stale scope.  On crash (SDK raises), the exception propagates
+    # before this line runs, intentionally leaving scope.json in place for
+    # operator inspection.
+    ScopeFilter.clear(WORKSPACE_ROOT)
 
     should_restart, degraded_ids = _should_auto_restart_after_no_actionable()
     if should_restart:

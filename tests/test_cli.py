@@ -11564,12 +11564,13 @@ class TestCmdStartAutoRestartPostMortem:
         assert rc == 0
 
 
-class TestCmdStartScopeFlags:
-    """cmd_start --include / --exclude parse and persist scope.json (AC-190-8, AC-190-9).
+class _CmdStartScopeTestBase:
+    """Shared helpers for cmd_start scope-related test classes.
 
-    Each test constructs a minimal fake BacklogParser so the scope-filter
-    expansion operates on a known set of IDs, then verifies the scope.json
-    output and the command return-code.
+    Provides the SDK mock factory, backlog ID fixture, fake WorkUnit list, and
+    the CLI-patch context manager used by both ``TestCmdStartScopeFlags`` and
+    ``TestCmdStartScopeCleanExit``.  Subclasses inherit all four so neither
+    class needs to duplicate them.
     """
 
     # ------------------------------------------------------------------
@@ -11653,41 +11654,92 @@ class TestCmdStartScopeFlags:
             mock_parser_cls.return_value.parse_index.return_value = self._fake_units()
             yield mock_parser_cls
 
+
+class TestCmdStartScopeFlags(_CmdStartScopeTestBase):
+    """cmd_start --include / --exclude parse and persist scope.json (AC-190-8, AC-190-9).
+
+    Each test constructs a minimal fake BacklogParser so the scope-filter
+    expansion operates on a known set of IDs, then verifies the scope.json
+    output and the command return-code.
+    """
+
     # ------------------------------------------------------------------
     # AC-190-8: --include writes scope.json with raw + expanded sets
     # ------------------------------------------------------------------
 
+    def _make_scope_capturing_sdk(self, scope_path: Path, captured: list[dict[str, list[str]]]) -> object:
+        """Return an SDK mock that reads scope.json content into ``captured`` before yielding.
+
+        This captures the scope.json content while it is live (before cmd_start
+        clears it on clean exit per AC-190-13).
+
+        Args:
+            scope_path: Path to the scope.json file to read during the SDK run.
+            captured: Mutable list; the first element will be the parsed JSON data
+                recorded inside the SDK mock while the file is present.
+
+        Returns:
+            A fake claude_agent_sdk module whose ``query`` coroutine reads the
+            scope.json content on invocation.
+        """
+        import types
+
+        async def _capturing_query(**kwargs: object) -> object:
+            if scope_path.exists():
+                captured.append(json.loads(scope_path.read_text()))
+            yield "msg"
+
+        capturing_sdk = types.ModuleType("claude_agent_sdk")
+        capturing_sdk.ClaudeAgentOptions = MagicMock()  # type: ignore[attr-defined]
+        capturing_sdk.query = _capturing_query  # type: ignore[attr-defined]
+        return capturing_sdk
+
     def test_include_flag_writes_scope_json(self, tmp_path: Path) -> None:
-        """AC-190-8: cmd_start --include writes .devbench/scope.json."""
-        with self._patch_cli(tmp_path):
+        """AC-190-8: cmd_start --include writes .devbench/scope.json during the SDK run.
+
+        scope.json is written before the SDK is invoked and cleared on clean
+        exit (AC-190-13), so this test captures its content from inside the
+        SDK mock while the file is live.
+        """
+        scope_path = tmp_path / ".devbench" / "scope.json"
+        captured: list[dict[str, list[str]]] = []
+        mock_sdk = self._make_scope_capturing_sdk(scope_path, captured)
+
+        with self._patch_cli(tmp_path, mock_sdk=mock_sdk):
             rc = cli.cmd_start("--include", "E1")
 
         assert rc == 0
-        scope_path = tmp_path / ".devbench" / "scope.json"
-        assert scope_path.exists(), "scope.json must be written by cmd_start --include"
-        data = json.loads(scope_path.read_text())
+        assert captured, "scope.json must be written before the SDK is invoked"
+        data = captured[0]
         assert data["include"] == ["E1"]
         assert data["exclude"] == []
         # All E1 descendants must be in expanded_ids
         assert set(data["expanded_ids"]) == {"E1-F1-S1-T1", "E1-F1-S1-T2", "E1-F2-S1-T1"}
         assert "started_at" in data
         assert "started_by" in data
+        # scope.json must be cleared after clean exit (AC-190-13)
+        assert not scope_path.exists(), "scope.json must be cleared on clean exit (AC-190-13)"
 
     def test_include_and_exclude_writes_correct_scope_json(self, tmp_path: Path) -> None:
-        """AC-190-8: --exclude subtracts from the include set in scope.json."""
-        with self._patch_cli(tmp_path):
+        """AC-190-8: --exclude subtracts from the include set in scope.json during SDK run."""
+        scope_path = tmp_path / ".devbench" / "scope.json"
+        captured: list[dict[str, list[str]]] = []
+        mock_sdk = self._make_scope_capturing_sdk(scope_path, captured)
+
+        with self._patch_cli(tmp_path, mock_sdk=mock_sdk):
             rc = cli.cmd_start("--include", "E1", "--exclude", "E1-F2-S1-T1")
 
         assert rc == 0
-        scope_path = tmp_path / ".devbench" / "scope.json"
-        assert scope_path.exists()
-        data = json.loads(scope_path.read_text())
+        assert captured, "scope.json must be written before the SDK is invoked"
+        data = captured[0]
         assert data["include"] == ["E1"]
         assert data["exclude"] == ["E1-F2-S1-T1"]
         # E1-F2-S1-T1 must be excluded
         assert "E1-F2-S1-T1" not in data["expanded_ids"]
         assert "E1-F1-S1-T1" in data["expanded_ids"]
         assert "E1-F1-S1-T2" in data["expanded_ids"]
+        # scope.json must be cleared after clean exit (AC-190-13)
+        assert not scope_path.exists(), "scope.json must be cleared on clean exit (AC-190-13)"
 
     # ------------------------------------------------------------------
     # AC-190-9: empty --include means "include everything"
@@ -11789,6 +11841,83 @@ class TestCmdStartScopeFlags:
             rc = cli.cmd_start("--exclude")
 
         assert rc == 1
+
+
+class TestCmdStartScopeCleanExit(_CmdStartScopeTestBase):
+    """AC-190-13: scope.json is deleted on clean cmd_start exit.
+
+    On a successful SDK return (clean orchestrator exit), any scope.json that
+    was written by ``cmd_start --include`` MUST be deleted.  On crash (SDK
+    raises an exception), scope.json MUST persist so the operator can inspect
+    which scope was active.
+
+    Shared helpers (_make_sdk_mock, _BACKLOG_IDS, _fake_units, _patch_cli) are
+    inherited from ``_CmdStartScopeTestBase``.
+    """
+
+    # ------------------------------------------------------------------
+    # AC-190-13: scope.json cleared on clean exit
+    # ------------------------------------------------------------------
+
+    def test_clean_exit_clears_scope_json(self, tmp_path: Path) -> None:
+        """AC-190-13: scope.json must be deleted after a successful SDK run."""
+        with self._patch_cli(tmp_path):
+            rc = cli.cmd_start("--include", "E1")
+
+        assert rc == 0
+        scope_path = tmp_path / ".devbench" / "scope.json"
+        assert not scope_path.exists(), "scope.json must be deleted on clean cmd_start exit (AC-190-13)"
+
+    def test_clean_exit_without_include_no_scope_json_to_clear(self, tmp_path: Path) -> None:
+        """AC-190-13: when no --include was given, scope.json is absent before and after."""
+        with self._patch_cli(tmp_path):
+            rc = cli.cmd_start()
+
+        assert rc == 0
+        scope_path = tmp_path / ".devbench" / "scope.json"
+        assert not scope_path.exists(), "scope.json must not appear when --include was not supplied"
+
+    def test_preexisting_scope_json_cleared_on_clean_exit(self, tmp_path: Path) -> None:
+        """AC-190-13: a pre-existing scope.json (from a previous run) is also cleared.
+
+        When cmd_start is invoked without --include but a scope.json already
+        exists (written by a prior --include run or by ``devbench scope set``),
+        a clean SDK exit MUST delete it.
+        """
+        scope_path = tmp_path / ".devbench" / "scope.json"
+        scope_path.parent.mkdir(parents=True, exist_ok=True)
+        scope_path.write_text('{"include": ["E1"], "exclude": [], "expanded_ids": ["E1-F1-S1-T1"]}')
+
+        with self._patch_cli(tmp_path):
+            rc = cli.cmd_start()
+
+        assert rc == 0
+        assert not scope_path.exists(), "pre-existing scope.json must be deleted on clean cmd_start exit (AC-190-13)"
+
+    def test_sdk_crash_preserves_scope_json(self, tmp_path: Path) -> None:
+        """AC-190-13: scope.json must persist when the SDK raises (crash path)."""
+        import types
+
+        class _SDKError(RuntimeError):
+            pass
+
+        crash_sdk = types.ModuleType("claude_agent_sdk")
+        crash_sdk.ClaudeAgentOptions = MagicMock()  # type: ignore[attr-defined]
+
+        async def _crash_query(**kwargs: object) -> object:
+            raise _SDKError("simulated SDK crash")
+            yield  # make it a generator
+
+        crash_sdk.query = _crash_query  # type: ignore[attr-defined]
+
+        with self._patch_cli(tmp_path, mock_sdk=crash_sdk):
+            with pytest.raises(_SDKError):
+                cli.cmd_start("--include", "E1")
+
+        scope_path = tmp_path / ".devbench" / "scope.json"
+        assert scope_path.exists(), (
+            "scope.json must persist when the SDK crashes so the operator can inspect the active scope"
+        )
 
 
 class TestShouldAutoRestartPostMortem:

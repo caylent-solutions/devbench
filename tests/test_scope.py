@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from pathlib import Path
 from unittest import mock
+from unittest.mock import patch
 
 import pytest
 
@@ -19,6 +21,7 @@ from devbench.scope import (
     _current_user,
     _letter_prefix,
     _numeric_suffix,
+    resolve_scope_file_path,
 )
 
 # ---------------------------------------------------------------------------
@@ -858,3 +861,229 @@ def test_round_trip_selector_shapes(
         assert loaded.allows(wid), f"{wid} must be in scope after round-trip"
     for wid in absent_ids:
         assert not loaded.allows(wid), f"{wid} must not be in scope after round-trip"
+
+
+# ---------------------------------------------------------------------------
+# resolve_scope_file_path -- per-session path routing (spec 4.4.4, AC-192-1)
+# ---------------------------------------------------------------------------
+
+
+class TestResolveScopeFilePath:
+    """resolve_scope_file_path returns per-session or workspace-root path."""
+
+    @pytest.mark.unit
+    def test_no_session_name_returns_workspace_root_path(self, tmp_path: Path) -> None:
+        """Without DEVBENCH_SESSION_NAME, returns the canonical workspace-root scope.json."""
+        env = {k: v for k, v in os.environ.items() if k != "DEVBENCH_SESSION_NAME"}
+        with patch.dict(os.environ, env, clear=True):
+            result = resolve_scope_file_path(tmp_path)
+        assert result == tmp_path / ".devbench" / "scope.json"
+
+    @pytest.mark.unit
+    def test_empty_session_name_returns_workspace_root_path(self, tmp_path: Path) -> None:
+        """DEVBENCH_SESSION_NAME set to empty string is treated as unset."""
+        with patch.dict(os.environ, {"DEVBENCH_SESSION_NAME": ""}, clear=False):
+            result = resolve_scope_file_path(tmp_path)
+        assert result == tmp_path / ".devbench" / "scope.json"
+
+    @pytest.mark.unit
+    def test_whitespace_only_session_name_returns_workspace_root_path(self, tmp_path: Path) -> None:
+        """DEVBENCH_SESSION_NAME set to whitespace-only is treated as unset."""
+        with patch.dict(os.environ, {"DEVBENCH_SESSION_NAME": "   "}, clear=False):
+            result = resolve_scope_file_path(tmp_path)
+        assert result == tmp_path / ".devbench" / "scope.json"
+
+    @pytest.mark.unit
+    def test_session_name_set_returns_per_session_path(self, tmp_path: Path) -> None:
+        """When DEVBENCH_SESSION_NAME is set, returns path inside the session dir."""
+        with patch.dict(os.environ, {"DEVBENCH_SESSION_NAME": "my-session"}, clear=False):
+            result = resolve_scope_file_path(tmp_path)
+        expected = tmp_path / ".devbench" / "sessions" / "my-session" / "scope.json"
+        assert result == expected
+
+    @pytest.mark.unit
+    def test_session_name_set_different_session_names(self, tmp_path: Path) -> None:
+        """Different session names produce different per-session paths."""
+        with patch.dict(os.environ, {"DEVBENCH_SESSION_NAME": "alpha"}, clear=False):
+            path_alpha = resolve_scope_file_path(tmp_path)
+        with patch.dict(os.environ, {"DEVBENCH_SESSION_NAME": "beta"}, clear=False):
+            path_beta = resolve_scope_file_path(tmp_path)
+        assert path_alpha != path_beta
+        assert "alpha" in str(path_alpha)
+        assert "beta" in str(path_beta)
+
+    @pytest.mark.unit
+    def test_session_path_is_relative_to_workspace_arg(self, tmp_path: Path) -> None:
+        """Per-session scope path is always relative to the workspace argument."""
+        other_path = tmp_path / "other"
+        other_path.mkdir()
+        with patch.dict(os.environ, {"DEVBENCH_SESSION_NAME": "sess"}, clear=False):
+            result_a = resolve_scope_file_path(tmp_path)
+            result_b = resolve_scope_file_path(other_path)
+        assert result_a != result_b
+        assert str(result_a).startswith(str(tmp_path))
+        assert str(result_b).startswith(str(other_path))
+
+    @pytest.mark.unit
+    def test_session_path_contains_sessions_subdir(self, tmp_path: Path) -> None:
+        """Per-session scope path is nested inside the sessions base directory."""
+        with patch.dict(os.environ, {"DEVBENCH_SESSION_NAME": "my-session"}, clear=False):
+            result = resolve_scope_file_path(tmp_path)
+        assert ".devbench/sessions" in str(result)
+
+    @pytest.mark.unit
+    def test_session_path_filename_is_scope_json(self, tmp_path: Path) -> None:
+        """Per-session scope path ends with 'scope.json'."""
+        with patch.dict(os.environ, {"DEVBENCH_SESSION_NAME": "sess"}, clear=False):
+            result = resolve_scope_file_path(tmp_path)
+        assert result.name == "scope.json"
+
+
+# ---------------------------------------------------------------------------
+# Per-session path routing integration -- public helpers use session path
+# when DEVBENCH_SESSION_NAME is set (spec 4.4.4, AC-192-1)
+# ---------------------------------------------------------------------------
+
+
+class TestPerSessionScopeRouting:
+    """All public scope helpers use per-session path when DEVBENCH_SESSION_NAME is set."""
+
+    @pytest.mark.unit
+    def test_to_file_without_session_uses_workspace_root(self, tmp_path: Path, backlog_ids: list[str]) -> None:
+        """to_file() without DEVBENCH_SESSION_NAME writes to workspace-root scope.json."""
+        env = {k: v for k, v in os.environ.items() if k != "DEVBENCH_SESSION_NAME"}
+        sf = ScopeFilter.parse("E1", "", backlog_ids)
+        with patch.dict(os.environ, env, clear=True):
+            written = sf.to_file(tmp_path)
+        assert written == tmp_path / ".devbench" / "scope.json"
+        assert written.exists()
+
+    @pytest.mark.unit
+    def test_to_file_with_session_uses_per_session_path(self, tmp_path: Path, backlog_ids: list[str]) -> None:
+        """to_file() with DEVBENCH_SESSION_NAME writes to per-session scope.json."""
+        sf = ScopeFilter.parse("E1", "", backlog_ids)
+        with patch.dict(os.environ, {"DEVBENCH_SESSION_NAME": "team-a"}, clear=False):
+            written = sf.to_file(tmp_path)
+        expected = tmp_path / ".devbench" / "sessions" / "team-a" / "scope.json"
+        assert written == expected
+        assert written.exists()
+        # Workspace-root path must NOT be created
+        assert not (tmp_path / ".devbench" / "scope.json").exists()
+
+    @pytest.mark.unit
+    def test_to_file_explicit_path_overrides_session_env(self, tmp_path: Path, backlog_ids: list[str]) -> None:
+        """to_file(path=explicit) uses that path even when DEVBENCH_SESSION_NAME is set."""
+        sf = ScopeFilter.parse("E1", "", backlog_ids)
+        explicit = tmp_path / "custom" / "scope.json"
+        with patch.dict(os.environ, {"DEVBENCH_SESSION_NAME": "ignored-session"}, clear=False):
+            written = sf.to_file(tmp_path, path=explicit)
+        assert written == explicit
+        assert written.exists()
+        # Session path must NOT be created
+        session_path = tmp_path / ".devbench" / "sessions" / "ignored-session" / "scope.json"
+        assert not session_path.exists()
+
+    @pytest.mark.unit
+    def test_from_file_without_session_reads_workspace_root(self, tmp_path: Path, backlog_ids: list[str]) -> None:
+        """from_file() without DEVBENCH_SESSION_NAME reads from workspace-root scope.json."""
+        original = ScopeFilter.parse("E2", "", backlog_ids)
+        env = {k: v for k, v in os.environ.items() if k != "DEVBENCH_SESSION_NAME"}
+        with patch.dict(os.environ, env, clear=True):
+            original.to_file(tmp_path)
+            loaded = ScopeFilter.from_file(tmp_path)
+        assert loaded.include == original.include
+        assert loaded.expanded_ids == original.expanded_ids
+
+    @pytest.mark.unit
+    def test_from_file_with_session_reads_per_session_path(self, tmp_path: Path, backlog_ids: list[str]) -> None:
+        """from_file() with DEVBENCH_SESSION_NAME reads from per-session scope.json."""
+        original = ScopeFilter.parse("E3", "", backlog_ids)
+        with patch.dict(os.environ, {"DEVBENCH_SESSION_NAME": "session-x"}, clear=False):
+            original.to_file(tmp_path)
+            loaded = ScopeFilter.from_file(tmp_path)
+        assert loaded.include == original.include
+        assert loaded.expanded_ids == original.expanded_ids
+
+    @pytest.mark.unit
+    def test_from_file_with_session_raises_when_only_workspace_root_exists(
+        self, tmp_path: Path, backlog_ids: list[str]
+    ) -> None:
+        """from_file() with session name raises FileNotFoundError if only workspace-root scope.json exists.
+
+        The per-session path is authoritative when DEVBENCH_SESSION_NAME is set;
+        falling back to workspace-root scope.json is a forbidden silent fallback
+        (spec Code Standards: NO FALLBACK LOGIC).
+        """
+        # Write to workspace-root path (no session env)
+        original = ScopeFilter.parse("E1", "", backlog_ids)
+        env = {k: v for k, v in os.environ.items() if k != "DEVBENCH_SESSION_NAME"}
+        with patch.dict(os.environ, env, clear=True):
+            original.to_file(tmp_path)
+        # Now attempt to read with a session set -- must raise, not silently use workspace-root
+        with patch.dict(os.environ, {"DEVBENCH_SESSION_NAME": "nonexistent-session"}, clear=False):
+            with pytest.raises(FileNotFoundError):
+                ScopeFilter.from_file(tmp_path)
+
+    @pytest.mark.unit
+    def test_clear_without_session_removes_workspace_root(self, tmp_path: Path, backlog_ids: list[str]) -> None:
+        """clear() without DEVBENCH_SESSION_NAME deletes workspace-root scope.json."""
+        sf = ScopeFilter.parse("E1", "", backlog_ids)
+        env = {k: v for k, v in os.environ.items() if k != "DEVBENCH_SESSION_NAME"}
+        with patch.dict(os.environ, env, clear=True):
+            sf.to_file(tmp_path)
+        canonical = tmp_path / ".devbench" / "scope.json"
+        assert canonical.exists()
+        with patch.dict(os.environ, env, clear=True):
+            ScopeFilter.clear(tmp_path)
+        assert not canonical.exists()
+
+    @pytest.mark.unit
+    def test_clear_with_session_removes_per_session_scope(self, tmp_path: Path, backlog_ids: list[str]) -> None:
+        """clear() with DEVBENCH_SESSION_NAME deletes per-session scope.json."""
+        sf = ScopeFilter.parse("E1", "", backlog_ids)
+        with patch.dict(os.environ, {"DEVBENCH_SESSION_NAME": "cleanup-sess"}, clear=False):
+            sf.to_file(tmp_path)
+        session_path = tmp_path / ".devbench" / "sessions" / "cleanup-sess" / "scope.json"
+        assert session_path.exists()
+        with patch.dict(os.environ, {"DEVBENCH_SESSION_NAME": "cleanup-sess"}, clear=False):
+            ScopeFilter.clear(tmp_path)
+        assert not session_path.exists()
+
+    @pytest.mark.unit
+    def test_clear_explicit_path_overrides_session_env(self, tmp_path: Path, backlog_ids: list[str]) -> None:
+        """clear(path=explicit) deletes that path even when DEVBENCH_SESSION_NAME is set."""
+        sf = ScopeFilter.parse("E1", "", backlog_ids)
+        explicit = tmp_path / "custom" / "scope.json"
+        sf.to_file(tmp_path, path=explicit)
+        assert explicit.exists()
+        with patch.dict(os.environ, {"DEVBENCH_SESSION_NAME": "ignored"}, clear=False):
+            ScopeFilter.clear(tmp_path, path=explicit)
+        assert not explicit.exists()
+
+    @pytest.mark.unit
+    def test_session_round_trip_parse_write_read_allows(self, tmp_path: Path, backlog_ids: list[str]) -> None:
+        """End-to-end session routing: parse -> to_file -> from_file -> allows() via session path."""
+        original = ScopeFilter.parse("E1-E2", "E2-F1", backlog_ids)
+        with patch.dict(os.environ, {"DEVBENCH_SESSION_NAME": "e2e-session"}, clear=False):
+            original.to_file(tmp_path)
+            loaded = ScopeFilter.from_file(tmp_path)
+        assert loaded.include == original.include
+        assert loaded.exclude == original.exclude
+        assert loaded.expanded_ids == original.expanded_ids
+        assert loaded.allows("E1-F1-S1-T1")
+        assert not loaded.allows("E2-F1-S1-T1")
+        # Workspace-root path must NOT exist
+        assert not (tmp_path / ".devbench" / "scope.json").exists()
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("session_name", ["alpha", "beta", "session-with-dashes"])
+    def test_different_sessions_produce_isolated_scope_files(
+        self, tmp_path: Path, backlog_ids: list[str], session_name: str
+    ) -> None:
+        """Each session name writes to a distinct, isolated per-session scope.json."""
+        sf = ScopeFilter.parse("E1", "", backlog_ids)
+        with patch.dict(os.environ, {"DEVBENCH_SESSION_NAME": session_name}, clear=False):
+            written = sf.to_file(tmp_path)
+        expected = tmp_path / ".devbench" / "sessions" / session_name / "scope.json"
+        assert written == expected
+        assert written.exists()

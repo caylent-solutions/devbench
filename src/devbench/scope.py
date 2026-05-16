@@ -4,6 +4,13 @@ Provides ``ScopeFilter``: a dataclass that holds raw include/exclude token lists
 the pre-expanded set of matching work-unit IDs.  Supports O(1) membership checks via
 ``allows()``.
 
+When ``DEVBENCH_SESSION_NAME`` is set, all public helpers use the per-session
+scope path ``<workspace>/.devbench/sessions/<name>/scope.json`` instead of the
+workspace-root path (spec 4.4.4, AC-192-1).  Per-session paths are always
+constructed relative to the ``workspace_root`` argument passed to each public
+helper -- no additional environment variable beyond ``DEVBENCH_SESSION_NAME``
+is required.
+
 See spec section 4.2.1 and acceptance criteria AC-190-1 through AC-190-9.
 
 Raises:
@@ -23,6 +30,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
+from devbench.constants import SESSION_SESSIONS_BASE_DIR
+
 logger = logging.getLogger(__name__)
 
 # Subdirectory under the workspace root where devbench state files live.
@@ -41,13 +50,53 @@ class InvalidScopeError(ValueError):
 
 
 # ---------------------------------------------------------------------------
+# Public path resolver
+# ---------------------------------------------------------------------------
+
+
+def resolve_scope_file_path(workspace_root: Path) -> Path:
+    """Return the scope.json path, honouring ``DEVBENCH_SESSION_NAME`` when set.
+
+    When ``DEVBENCH_SESSION_NAME`` is set and non-empty, returns the per-session
+    path ``<workspace_root>/.devbench/sessions/<name>/scope.json`` (spec 4.4.4).
+    The ``workspace_root`` argument is always the workspace root; per-session
+    paths are constructed relative to it.
+
+    When ``DEVBENCH_SESSION_NAME`` is absent or empty, returns the canonical
+    workspace-root path ``<workspace_root>/.devbench/scope.json``.
+
+    Args:
+        workspace_root: Root directory of the devbench workspace.  Both
+            workspace-root and per-session paths are constructed relative to
+            this directory.
+
+    Returns:
+        Absolute :class:`~pathlib.Path` of the scope.json file to use.
+    """
+    session_name = os.environ.get("DEVBENCH_SESSION_NAME", "").strip()
+    if not session_name:
+        return workspace_root / _DEVBENCH_SUBDIR / _SCOPE_FILENAME
+    return workspace_root / SESSION_SESSIONS_BASE_DIR / session_name / _SCOPE_FILENAME
+
+
+# ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
 
 def _scope_file_path(workspace_root: Path) -> Path:
-    """Return the canonical path of scope.json for ``workspace_root``."""
-    return workspace_root / _DEVBENCH_SUBDIR / _SCOPE_FILENAME
+    """Return the scope.json path for ``workspace_root``, honouring session routing.
+
+    Delegates to :func:`resolve_scope_file_path` so that per-session routing
+    (``DEVBENCH_SESSION_NAME``) is applied consistently across all callers.
+
+    Args:
+        workspace_root: Root directory of the devbench workspace.
+
+    Returns:
+        Absolute :class:`~pathlib.Path` of the scope.json file to use.
+    """
+    return resolve_scope_file_path(workspace_root)
 
 
 def _tokenise(raw: str) -> list[str]:

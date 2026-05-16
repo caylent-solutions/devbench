@@ -4070,7 +4070,7 @@ class TestCmdGitOpsFinalizeHappyPath:
 class TestCmdStart:
     """Test cmd_start command by mocking claude_agent_sdk."""
 
-    def test_cmd_start_invokes_agent_sdk(self) -> None:
+    def test_cmd_start_invokes_agent_sdk(self, tmp_path: Path) -> None:
         """Lines 868-885: cmd_start creates an async runner and returns 0."""
         import sys
         import types
@@ -4089,6 +4089,7 @@ class TestCmdStart:
 
         with (
             patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
             patch(
                 "devbench.cli._should_auto_restart_after_no_actionable",
                 return_value=(False, []),
@@ -12647,6 +12648,7 @@ class TestCmdStartAutoRestartPostMortem:
 
     def test_returns_42_when_only_blockers_are_runtime_degradation(
         self,
+        tmp_path: Path,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         import logging
@@ -12655,6 +12657,7 @@ class TestCmdStartAutoRestartPostMortem:
         mock_sdk = self._mocked_sdk()
         with (
             patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
             patch(
                 "devbench.cli._should_auto_restart_after_no_actionable",
                 return_value=(True, ["E1-F4-S1-T3", "E4-F1-S1-T5"]),
@@ -12675,12 +12678,13 @@ class TestCmdStartAutoRestartPostMortem:
             for rec in caplog.records
         )
 
-    def test_returns_0_when_post_mortem_says_no_restart(self) -> None:
+    def test_returns_0_when_post_mortem_says_no_restart(self, tmp_path: Path) -> None:
         import sys
 
         mock_sdk = self._mocked_sdk()
         with (
             patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
             patch(
                 "devbench.cli._should_auto_restart_after_no_actionable",
                 return_value=(False, []),

@@ -1062,3 +1062,195 @@ class TestSpecToBacklogSkillSelfCritiqueRubric:
             "spec-to-backlog/SKILL.md rubric must require the dependency graph to be a DAG "
             "(validated by validate-backlog)"
         )
+
+
+# ---------------------------------------------------------------------------
+# bootstrap-environment/SKILL.md tests  (AC-191-5)
+# ---------------------------------------------------------------------------
+
+BOOTSTRAP_ENV_SKILL_PATH = (
+    Path(__file__).parent.parent.parent
+    / "plugin"
+    / "devbench"
+    / "skills"
+    / "bootstrap-environment"
+    / "SKILL.md"
+)
+
+
+@pytest.mark.unit
+class TestBootstrapEnvironmentSkillFrontmatter:
+    """AC-191-5: bootstrap-environment/SKILL.md must have valid frontmatter."""
+
+    def test_skill_file_exists(self) -> None:
+        """AC-191-5: bootstrap-environment/SKILL.md must exist."""
+        assert BOOTSTRAP_ENV_SKILL_PATH.exists(), (
+            f"bootstrap-environment/SKILL.md not found at {BOOTSTRAP_ENV_SKILL_PATH}"
+        )
+
+    def test_frontmatter_name_is_bootstrap_environment(self) -> None:
+        """AC-191-5: Frontmatter must declare name: bootstrap-environment."""
+        content = BOOTSTRAP_ENV_SKILL_PATH.read_text()
+        assert "name: bootstrap-environment" in content, (
+            "bootstrap-environment/SKILL.md frontmatter must contain 'name: bootstrap-environment'"
+        )
+
+    def test_frontmatter_model_is_sonnet(self) -> None:
+        """AC-191-5: Frontmatter must declare model: sonnet per spec section 4.6.4."""
+        content = BOOTSTRAP_ENV_SKILL_PATH.read_text()
+        assert "model: sonnet" in content, (
+            "bootstrap-environment/SKILL.md frontmatter must contain 'model: sonnet' "
+            "(environment setup does not require top-tier reasoning)"
+        )
+
+    def test_frontmatter_is_yaml_delimited(self) -> None:
+        """AC-191-5: Frontmatter must be delimited by YAML front-matter markers."""
+        content = BOOTSTRAP_ENV_SKILL_PATH.read_text()
+        assert content.startswith("---"), (
+            "bootstrap-environment/SKILL.md must start with YAML frontmatter delimiter '---'"
+        )
+        assert content.count("---") >= 2, (
+            "bootstrap-environment/SKILL.md must have at least two '---' markers (open + close frontmatter)"
+        )
+
+
+@pytest.mark.unit
+class TestBootstrapEnvironmentSkillTools:
+    """AC-191-5: bootstrap-environment/SKILL.md must declare tools: Bash, Read, Edit."""
+
+    def test_skill_declares_bash_tool(self) -> None:
+        """bootstrap-environment skill must declare the Bash tool."""
+        content = BOOTSTRAP_ENV_SKILL_PATH.read_text()
+        assert "Bash" in content, "bootstrap-environment/SKILL.md must declare the Bash tool"
+
+    def test_skill_declares_read_tool(self) -> None:
+        """bootstrap-environment skill must declare the Read tool."""
+        content = BOOTSTRAP_ENV_SKILL_PATH.read_text()
+        assert "Read" in content, "bootstrap-environment/SKILL.md must declare the Read tool"
+
+    def test_skill_declares_edit_tool(self) -> None:
+        """bootstrap-environment skill must declare the Edit tool."""
+        content = BOOTSTRAP_ENV_SKILL_PATH.read_text()
+        assert "Edit" in content, "bootstrap-environment/SKILL.md must declare the Edit tool"
+
+
+@pytest.mark.unit
+class TestBootstrapEnvironmentSkillRepoListStep:
+    """AC-191-5: Skill must read target-repo list from devbench.yaml or ask interactively."""
+
+    def test_skill_reads_repos_from_devbench_yaml(self) -> None:
+        """Skill must read the repos: section from devbench.yaml per spec section 4.6.4."""
+        content = BOOTSTRAP_ENV_SKILL_PATH.read_text()
+        assert "devbench.yaml" in content, (
+            "bootstrap-environment/SKILL.md must read target-repo list from devbench.yaml"
+        )
+
+    def test_skill_reads_repos_section(self) -> None:
+        """Skill must reference the repos: key in devbench.yaml."""
+        content = BOOTSTRAP_ENV_SKILL_PATH.read_text()
+        assert "repos" in content, (
+            "bootstrap-environment/SKILL.md must reference the 'repos:' section in devbench.yaml"
+        )
+
+    def test_skill_asks_interactively_when_yaml_missing(self) -> None:
+        """Skill must ask interactively when devbench.yaml repos section is absent."""
+        content = BOOTSTRAP_ENV_SKILL_PATH.read_text()
+        assert any(
+            kw in content.lower() for kw in ("interactively", "ask", "prompt", "operator")
+        ), (
+            "bootstrap-environment/SKILL.md must ask interactively when repos list "
+            "is not available in devbench.yaml"
+        )
+
+
+@pytest.mark.unit
+class TestBootstrapEnvironmentSkillPerRepoSteps:
+    """AC-191-5: For each repo, skill must: clone, install asdf toolchain, run make validate."""
+
+    def test_skill_clones_to_checkout_directory(self) -> None:
+        """Skill must clone each repo to checkout_directory per spec section 4.6.4."""
+        content = BOOTSTRAP_ENV_SKILL_PATH.read_text()
+        assert "checkout_directory" in content or "clone" in content.lower(), (
+            "bootstrap-environment/SKILL.md must clone repos to checkout_directory"
+        )
+
+    def test_skill_detects_asdf_tool_versions(self) -> None:
+        """Skill must detect + install asdf toolchain from .tool-versions per spec section 4.6.4."""
+        content = BOOTSTRAP_ENV_SKILL_PATH.read_text()
+        assert ".tool-versions" in content, (
+            "bootstrap-environment/SKILL.md must detect .tool-versions file for asdf toolchain"
+        )
+
+    def test_skill_installs_asdf_toolchain(self) -> None:
+        """Skill must install asdf toolchain versions found in .tool-versions."""
+        content = BOOTSTRAP_ENV_SKILL_PATH.read_text()
+        assert "asdf" in content, (
+            "bootstrap-environment/SKILL.md must install the asdf toolchain"
+        )
+
+    def test_skill_runs_make_validate_baseline(self) -> None:
+        """Skill must run make validate as baseline per spec section 4.6.4."""
+        content = BOOTSTRAP_ENV_SKILL_PATH.read_text()
+        assert "make validate" in content, (
+            "bootstrap-environment/SKILL.md must run 'make validate' as the baseline check"
+        )
+
+    def test_skill_reports_per_repo_progress(self) -> None:
+        """Skill must report per-repo progress per spec section 4.6.4."""
+        content = BOOTSTRAP_ENV_SKILL_PATH.read_text()
+        assert any(kw in content.lower() for kw in ("progress", "report", "status")), (
+            "bootstrap-environment/SKILL.md must report per-repo progress"
+        )
+
+
+@pytest.mark.unit
+class TestBootstrapEnvironmentSkillSelfVerifyLoop:
+    """AC-191-5: After every step, skill must run sanity check and retry once on failure."""
+
+    def test_skill_verifies_clone_present(self) -> None:
+        """Self-verify loop: clone present check must be mentioned."""
+        content = BOOTSTRAP_ENV_SKILL_PATH.read_text()
+        assert "clone" in content.lower(), (
+            "bootstrap-environment/SKILL.md self-verify loop must check clone is present"
+        )
+
+    def test_skill_verifies_tools_installed(self) -> None:
+        """Self-verify loop: tools installed check must be mentioned."""
+        content = BOOTSTRAP_ENV_SKILL_PATH.read_text()
+        assert any(kw in content.lower() for kw in ("tools installed", "install", "asdf")), (
+            "bootstrap-environment/SKILL.md self-verify loop must verify tools are installed"
+        )
+
+    def test_skill_verifies_make_validate_green(self) -> None:
+        """Self-verify loop: make validate green check must be mentioned."""
+        content = BOOTSTRAP_ENV_SKILL_PATH.read_text()
+        assert "make validate" in content, (
+            "bootstrap-environment/SKILL.md self-verify loop must verify make validate is green"
+        )
+
+    def test_skill_retries_once_on_failure(self) -> None:
+        """Self-verify loop: on failure, log + retry once per spec section 4.6.4."""
+        content = BOOTSTRAP_ENV_SKILL_PATH.read_text()
+        assert "retry" in content.lower() or "retry once" in content.lower(), (
+            "bootstrap-environment/SKILL.md must log + retry once on self-verify failure"
+        )
+
+    def test_skill_escalates_on_persistent_failure(self) -> None:
+        """On persistent failure after retry, skill must escalate with clear diagnostic."""
+        content = BOOTSTRAP_ENV_SKILL_PATH.read_text()
+        assert any(
+            kw in content.lower() for kw in ("escalate", "diagnostic", "persistent")
+        ), (
+            "bootstrap-environment/SKILL.md must escalate to the operator with a diagnostic "
+            "on persistent failure after retry"
+        )
+
+    def test_skill_pauses_on_failure_with_diagnostic(self) -> None:
+        """Skill must pause on failure with diagnostic + suggested fix per spec section 4.6.4."""
+        content = BOOTSTRAP_ENV_SKILL_PATH.read_text()
+        assert any(
+            kw in content.lower() for kw in ("pause", "diagnostic", "suggested fix", "suggest")
+        ), (
+            "bootstrap-environment/SKILL.md must pause on failure with a diagnostic "
+            "and suggested fix for the operator"
+        )

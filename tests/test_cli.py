@@ -12070,3 +12070,326 @@ class TestShouldAutoRestartPostMortem:
         # Only the BLOCKED unit got passed to the classifier.
         assert mock_classify.call_count == 1
         assert mock_classify.call_args.kwargs["task_id"] == "T2"
+
+
+# ---------------------------------------------------------------------------
+# AC-190-10 / AC-190-11: cmd_status scope flags + SCOPE banner (E2-F2-S2-T1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestCmdStatusScopeBanner:
+    """E2-F2-S2-T1: cmd_status accepts --include/--exclude; renders SCOPE banner.
+
+    AC-190-10: devbench status honors active scope.json without flags.
+    AC-190-11: Per-command --include override of active scope.json works.
+    """
+
+    def _make_parser_mock(self) -> MagicMock:
+        """Return a BacklogParser mock with a minimal parse_index result."""
+        unit = WorkUnit(
+            id="E1-F1-S1-T1",
+            title="Alpha",
+            status=WorkUnitStatus.IN_QUEUE,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E1-F1-S1-T1.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+        parser = MagicMock()
+        parser.parse_index.return_value = [unit]
+        parser.get_parallel_candidates.return_value = [unit]
+        parser.get_blocked_units.return_value = []
+        parser.all_done.return_value = False
+        return parser
+
+    def _write_scope_json(
+        self,
+        tmp_path: Path,
+        include: list[str],
+        exclude: list[str],
+        started_at: str = "2026-05-14T13:42:11Z",
+        started_by: str = "testuser",
+    ) -> None:
+        """Write a minimal scope.json under tmp_path/.devbench/scope.json."""
+        scope_dir = tmp_path / ".devbench"
+        scope_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "include": include,
+            "exclude": exclude,
+            "expanded_ids": ["E1-F1-S1-T1"],
+            "started_at": started_at,
+            "started_by": started_by,
+        }
+        (scope_dir / "scope.json").write_text(json.dumps(payload))
+
+    # ------------------------------------------------------------------
+    # AC-190-10: honors active scope.json without flags
+    # ------------------------------------------------------------------
+
+    def test_scope_banner_rendered_from_scope_json(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """SCOPE banner appears above Status Summary when scope.json is active."""
+        self._write_scope_json(
+            tmp_path,
+            include=["E1-E3"],
+            exclude=["E2"],
+            started_at="2026-05-14T13:42:11Z",
+            started_by="alice",
+        )
+        parser = self._make_parser_mock()
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=parser),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._count_unmaterialised_proposed_tasks", return_value=0),
+        ):
+            rc = cli.cmd_status()
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "SCOPE:" in out
+        assert "include=[E1-E3]" in out
+        assert "exclude=[E2]" in out
+        assert "2026-05-14T13:42:11Z" in out
+        # Banner must appear BEFORE the Status Summary line.
+        assert out.index("SCOPE:") < out.index("Backlog Status Summary")
+
+    def test_scope_banner_absent_when_no_scope_json(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """No SCOPE banner when scope.json does not exist."""
+        parser = self._make_parser_mock()
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=parser),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._count_unmaterialised_proposed_tasks", return_value=0),
+        ):
+            rc = cli.cmd_status()
+
+        assert rc == 0
+        assert "SCOPE:" not in capsys.readouterr().out
+
+    def test_scope_banner_include_empty_exclude_empty(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Banner shows empty include/exclude lists correctly."""
+        self._write_scope_json(
+            tmp_path,
+            include=[],
+            exclude=[],
+            started_at="2026-01-01T00:00:00Z",
+            started_by="bob",
+        )
+        parser = self._make_parser_mock()
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=parser),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._count_unmaterialised_proposed_tasks", return_value=0),
+        ):
+            rc = cli.cmd_status()
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "SCOPE:" in out
+        assert "include=[]" in out
+        assert "exclude=[]" in out
+
+    # ------------------------------------------------------------------
+    # AC-190-11: per-command --include override
+    # ------------------------------------------------------------------
+
+    def test_include_flag_renders_scope_banner(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """--include flag renders SCOPE banner (no scope.json required)."""
+        parser = self._make_parser_mock()
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=parser),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._count_unmaterialised_proposed_tasks", return_value=0),
+        ):
+            rc = cli.cmd_status("--include", "E1")
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "SCOPE:" in out
+        assert "include=[E1]" in out
+        assert "exclude=[]" in out
+
+    def test_include_and_exclude_flags_render_correct_banner(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """--include and --exclude flags together render correct SCOPE banner."""
+        parser = self._make_parser_mock()
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=parser),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._count_unmaterialised_proposed_tasks", return_value=0),
+        ):
+            rc = cli.cmd_status("--include", "E1-E3", "--exclude", "E2")
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "SCOPE:" in out
+        assert "include=[E1-E3]" in out
+        assert "exclude=[E2]" in out
+
+    def test_include_flag_overrides_scope_json(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Per-command --include overrides active scope.json (AC-190-11)."""
+        self._write_scope_json(
+            tmp_path,
+            include=["E5"],
+            exclude=["E6"],
+            started_at="2026-05-01T00:00:00Z",
+            started_by="carol",
+        )
+        parser = self._make_parser_mock()
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=parser),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._count_unmaterialised_proposed_tasks", return_value=0),
+        ):
+            rc = cli.cmd_status("--include", "E1")
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        # The flag override must appear, not the scope.json values.
+        assert "include=[E1]" in out
+        assert "E5" not in out.split("SCOPE:")[1].split("\n")[0]
+
+    # ------------------------------------------------------------------
+    # Error paths for missing flag values
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize("flag", ["--include", "--exclude"])
+    def test_flag_without_value_returns_error(
+        self,
+        flag: str,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """--include or --exclude without a following value exits with rc=1 and error to stderr."""
+        rc = cli.cmd_status(flag)
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert flag in err
+        assert "requires a value" in err
+
+    @pytest.mark.parametrize("flag", ["--include", "--exclude"])
+    def test_flag_followed_by_another_flag_is_error(
+        self,
+        flag: str,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """--include or --exclude followed immediately by another flag is an error."""
+        rc = cli.cmd_status(flag, "--detail")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "requires a value" in err
+
+    # ------------------------------------------------------------------
+    # Backward compatibility: --detail still works with scope flags
+    # ------------------------------------------------------------------
+
+    def test_detail_and_include_flags_coexist(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """--detail and --include can be combined without error."""
+        parser = self._make_parser_mock()
+        parser.get_blocked_units.return_value = []
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=parser),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._count_unmaterialised_proposed_tasks", return_value=0),
+        ):
+            rc = cli.cmd_status("--detail", "--include", "E1")
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "SCOPE:" in out
+        assert "Backlog Status Summary" in out
+
+    # ------------------------------------------------------------------
+    # Corrupt scope.json propagates as error (fail-fast)
+    # ------------------------------------------------------------------
+
+    def test_corrupt_scope_json_exits_with_error(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Corrupt scope.json causes cmd_status to exit rc=1 with a diagnostic to stderr."""
+        scope_dir = tmp_path / ".devbench"
+        scope_dir.mkdir(parents=True, exist_ok=True)
+        (scope_dir / "scope.json").write_text("not valid json{{")
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_status()
+
+        assert rc == 1
+        assert "scope.json" in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        "bad_field,bad_value",
+        [
+            ("include", "E1"),
+            ("exclude", "E2"),
+            ("include", 42),
+            ("exclude", {"key": "val"}),
+        ],
+    )
+    def test_non_list_field_in_scope_json_exits_with_error(
+        self,
+        bad_field: str,
+        bad_value: object,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """scope.json with a non-list include/exclude field causes rc=1 with an actionable error."""
+        scope_dir = tmp_path / ".devbench"
+        scope_dir.mkdir(parents=True, exist_ok=True)
+        payload: dict[str, object] = {
+            "include": ["E1"],
+            "exclude": [],
+            "expanded_ids": [],
+            "started_at": "2026-05-14T13:42:11Z",
+            "started_by": "testuser",
+        }
+        payload[bad_field] = bad_value
+        (scope_dir / "scope.json").write_text(json.dumps(payload))
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_status()
+
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "scope.json" in err
+        assert bad_field in err
+        assert "must be a list" in err

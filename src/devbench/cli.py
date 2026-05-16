@@ -61,7 +61,7 @@ import shutil
 import subprocess
 import sys
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -184,7 +184,7 @@ from devbench.plugin_shadow import (
 # orchestrator-alive banner. Single source of truth lives in report.py because
 # the banner is implemented there and reporting must not depend on cli.py.
 from devbench.reporting.report import _format_duration
-from devbench.scope import InvalidScopeError, ScopeFilter, _expand_prefix
+from devbench.scope import InvalidScopeError, ScopeFilter, _expand_prefix, _scope_file_path, _tokenise
 from devbench.utils.io import atomic_write_text
 from devbench.utils.process import run_command
 
@@ -193,34 +193,243 @@ __all__ = ["_format_duration"]
 logger = logging.getLogger("devbench.cli")
 
 
-def _parse_status_argv(argv: tuple[str, ...]) -> tuple[bool, int]:
-    """Return ``(detail, exit_code)``.
+@dataclass
+class _StatusArgs:
+    """Parsed arguments for ``cmd_status``.
 
-    ``exit_code`` is ``0`` on success and non-zero when an unknown
-    positional argument was supplied (the error message is written to
-    stderr inline). Extracted from ``cmd_status`` so the dispatch body
-    stays under PLR0912's branch ceiling.
+    Attributes:
+        detail: Whether ``--detail`` was supplied.
+        include: Raw ``--include`` token string (empty = not supplied).
+        exclude: Raw ``--exclude`` token string (empty = not supplied).
+        exit_code: Non-zero when argument parsing fails.
     """
-    detail = False
+
+    detail: bool = False
+    include: str = ""
+    exclude: str = ""
+    exit_code: int = 0
+
+
+def _parse_status_argv(argv: tuple[str, ...]) -> _StatusArgs:
+    """Parse ``cmd_status`` arguments.
+
+    Accepts ``--detail``, ``--include <tokens>``, and ``--exclude <tokens>``
+    flags (spec section 4.2.2, AC-190-10, AC-190-11).  Any unrecognised
+    positional argument causes a non-zero ``exit_code`` in the returned
+    :class:`_StatusArgs`.
+
+    Args:
+        argv: The positional argument tuple passed to ``cmd_status``.
+
+    Returns:
+        A :class:`_StatusArgs` instance with parsed values and an
+        ``exit_code`` of ``0`` on success or ``1`` on parse failure.
+    """
+    result = _StatusArgs()
+    args = list(argv)
+    i = 0
     extra_positional: list[str] = []
-    for arg in argv:
+    while i < len(args):
+        arg = args[i]
         if arg == "--detail":
-            detail = True
-            continue
-        if not arg:
-            continue
-        extra_positional.append(arg)
+            result.detail = True
+        elif arg in ("--include", "--exclude"):
+            if i + 1 >= len(args) or args[i + 1].startswith("--"):
+                print(
+                    f"ERROR: {arg} requires a value",
+                    file=sys.stderr,
+                )
+                result.exit_code = 1
+                return result
+            i += 1
+            if arg == "--include":
+                result.include = args[i]
+            else:
+                result.exclude = args[i]
+        elif arg:
+            extra_positional.append(arg)
+        i += 1
     if extra_positional:
         print(
             f"ERROR: cmd_status takes no positional args (got {extra_positional!r})",
             file=sys.stderr,
         )
-        return False, 1
-    return detail, 0
+        result.exit_code = 1
+    return result
+
+
+def _read_scope_banner_data(workspace_root: Path) -> dict[str, object] | None:
+    """Return the raw scope.json payload when scope.json exists, else ``None``.
+
+    Reads scope.json directly to surface ``started_at`` / ``started_by``
+    metadata that :meth:`ScopeFilter.from_file` omits from the dataclass.
+    The file is read and parsed once; ``None`` is returned only when the
+    file is absent.
+
+    Args:
+        workspace_root: Path to the workspace root directory.
+
+    Returns:
+        The decoded JSON payload dict, or ``None`` if scope.json does not exist.
+
+    Raises:
+        json.JSONDecodeError: If the file exists but contains invalid JSON.
+        KeyError: If required keys are missing from the JSON payload.
+        TypeError: If field types in the payload are invalid.
+    """
+    scope_path = _scope_file_path(workspace_root)
+    if not scope_path.exists():
+        return None
+    return dict(json.loads(scope_path.read_text(encoding="utf-8")))
+
+
+def _render_scope_banner(include: list[str], exclude: list[str], started_at: str) -> None:
+    """Print the ``SCOPE: include=[...] exclude=[...] (started ...)`` banner.
+
+    Output goes to stdout immediately before the Status Summary header.
+
+    Args:
+        include: List of raw include token strings.
+        exclude: List of raw exclude token strings.
+        started_at: ISO-8601 UTC timestamp string from scope.json (or empty string
+            when the scope was built from one-off CLI flags with no persistence).
+    """
+    include_part = f"include=[{', '.join(include)}]"
+    exclude_part = f"exclude=[{', '.join(exclude)}]"
+    started_part = f"(started {started_at})" if started_at else "(one-off)"
+    print(f"SCOPE: {include_part} {exclude_part} {started_part}")
+
+
+def _print_active_units(active: list[WorkUnit]) -> None:
+    """Render the ``Active work units:`` panel for ``cmd_status``.
+
+    Prints each IN_PROGRESS / IN_REVIEW unit with an optional duration suffix
+    for IN_PROGRESS tasks.
+
+    Args:
+        active: Work units whose status is IN_PROGRESS or IN_REVIEW.
+    """
+    if not active:
+        return
+    print("\nActive work units:")
+    for u in active:
+        line = f"  [{u.status.value}] {u.id} -- {u.title}"
+        if u.status is WorkUnitStatus.IN_PROGRESS:
+            duration = _in_progress_attempt_duration(u.id)
+            line += f" (in-progress for {duration})" if duration is not None else " (in-progress, timer unavailable)"
+        print(line)
+
+
+def _print_actionable_summary(
+    parser: BacklogParser,
+    units: list[WorkUnit],
+    active: list[WorkUnit],
+) -> None:
+    """Print ``Next actionable``, ``All DONE``, or ``No actionable`` line.
+
+    Issue #185: ``get_parallel_candidates`` includes IN_PROGRESS tasks so
+    an interrupted run can resume, but the ``Next actionable`` line should
+    point at the next DIFFERENT task.  The ``active`` list is used to
+    exclude already-running IDs.
+
+    Args:
+        parser: The :class:`BacklogParser` instance.
+        units: Full list of parsed work units.
+        active: Work units currently IN_PROGRESS or IN_REVIEW.
+    """
+    active_ids = {u.id for u in active}
+    actionable = [u for u in parser.get_parallel_candidates(units) if u.id not in active_ids]
+    if actionable:
+        print(f"\nNext actionable: {actionable[0].id} -- {actionable[0].title}")
+    elif parser.all_done(units):
+        print("\nAll work units are DONE.")
+    else:
+        blocked = parser.get_blocked_units(units)
+        print(f"\nNo actionable units. {len(blocked)} blocked.")
+
+
+@dataclass
+class _ScopeResolution:
+    """Result of resolving the active scope for a status/report command.
+
+    Attributes:
+        has_scope: ``True`` when a scope is active (either per-command flags
+            or an active scope.json).
+        include: Parsed include token list.
+        exclude: Parsed exclude token list.
+        started_at: ISO-8601 timestamp from scope.json (empty for one-off flags).
+        error: Non-empty string means scope.json was corrupt; value is the
+            actionable error message to print to stderr.
+    """
+
+    has_scope: bool = False
+    include: list[str] = field(default_factory=list)
+    exclude: list[str] = field(default_factory=list)
+    started_at: str = ""
+    error: str = ""
+
+
+def _resolve_scope_for_status(parsed: _StatusArgs) -> _ScopeResolution:
+    """Build a ``_ScopeResolution`` from parsed flags or active scope.json.
+
+    Per-command ``--include``/``--exclude`` flags take precedence over any
+    active scope.json (AC-190-11).  When neither flag is supplied, the
+    workspace-root scope.json is consulted (AC-190-10).  Corrupt scope.json
+    returns a non-empty ``error`` field; callers must check this field and
+    short-circuit with rc=1 when it is set.
+
+    Args:
+        parsed: The parsed status argv struct.
+
+    Returns:
+        A :class:`_ScopeResolution` instance.  Check ``error`` first.
+    """
+    if parsed.include or parsed.exclude:
+        # One-off per-command override -- no persistence (AC-190-11).
+        return _ScopeResolution(
+            has_scope=True,
+            include=_tokenise(parsed.include) if parsed.include else [],
+            exclude=_tokenise(parsed.exclude) if parsed.exclude else [],
+        )
+    # Consult active scope.json when no flags supplied (AC-190-10).
+    try:
+        raw = _read_scope_banner_data(WORKSPACE_ROOT)
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        return _ScopeResolution(
+            error=f"ERROR: scope.json is corrupt and cannot be read: {exc}",
+        )
+    if raw is None:
+        return _ScopeResolution()
+    raw_include = raw.get("include", [])
+    raw_exclude = raw.get("exclude", [])
+    if not isinstance(raw_include, list):
+        return _ScopeResolution(
+            error=(f"ERROR: scope.json field 'include' must be a list, got {type(raw_include).__name__}"),
+        )
+    if not isinstance(raw_exclude, list):
+        return _ScopeResolution(
+            error=(f"ERROR: scope.json field 'exclude' must be a list, got {type(raw_exclude).__name__}"),
+        )
+    return _ScopeResolution(
+        has_scope=True,
+        include=list(raw_include),
+        exclude=list(raw_exclude),
+        started_at=str(raw.get("started_at", "")),
+    )
 
 
 def cmd_status(*argv: str) -> int:
     """Print backlog summary grouped by status.
+
+    Accepts scope-filter flags (spec section 4.2.2, AC-190-10, AC-190-11):
+
+    - ``--include "<tokens>"`` -- one-off include selector; overrides active
+      scope.json when present.
+    - ``--exclude "<tokens>"`` -- one-off exclude selector.
+
+    When neither flag is supplied, the active ``scope.json`` (if any) is
+    consulted instead.  In either case, a ``SCOPE: include=[...] exclude=[...]
+    (started ...)`` banner is printed above the Status Summary.
 
     With ``--detail`` (E220), additionally render per-state sections: in-queue
     (every actionable Task with the IDs of its still-open dependencies), six
@@ -229,9 +438,16 @@ def cmd_status(*argv: str) -> int:
     blocked-on-held, operator-required), and held (every Hold Task with
     the most recent ``[HOLD]`` reason from its Comments).
     """
-    detail, parse_rc = _parse_status_argv(argv)
-    if parse_rc != 0:
-        return parse_rc
+    parsed = _parse_status_argv(argv)
+    if parsed.exit_code != 0:
+        return parsed.exit_code
+
+    scope = _resolve_scope_for_status(parsed)
+    if scope.error:
+        print(scope.error, file=sys.stderr)
+        return 1
+    if scope.has_scope:
+        _render_scope_banner(scope.include, scope.exclude, scope.started_at)
 
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     units = parser.parse_index()
@@ -269,34 +485,10 @@ def cmd_status(*argv: str) -> int:
     print(f"  {'Un-materialised':<15} {unmaterialised_count:>4}")
 
     active = [u for u in units if u.status in (WorkUnitStatus.IN_PROGRESS, WorkUnitStatus.IN_REVIEW)]
-    if active:
-        print("\nActive work units:")
-        for u in active:
-            line = f"  [{u.status.value}] {u.id} -- {u.title}"
-            if u.status is WorkUnitStatus.IN_PROGRESS:
-                duration = _in_progress_attempt_duration(u.id)
-                line += (
-                    f" (in-progress for {duration})" if duration is not None else " (in-progress, timer unavailable)"
-                )
-            print(line)
+    _print_active_units(active)
+    _print_actionable_summary(parser, units, active)
 
-    # Issue #185: ``get_parallel_candidates`` includes IN_PROGRESS tasks
-    # (so an interrupted run can resume), but the "Next actionable" line
-    # is meant to point at the next DIFFERENT task to start once the
-    # current claim is done. Exclude any ID already rendered above in
-    # ``Active work units`` so the line is genuinely actionable, not a
-    # redundant echo of the in-progress claim.
-    active_ids = {u.id for u in active}
-    actionable = [u for u in parser.get_parallel_candidates(units) if u.id not in active_ids]
-    if actionable:
-        print(f"\nNext actionable: {actionable[0].id} -- {actionable[0].title}")
-    elif parser.all_done(units):
-        print("\nAll work units are DONE.")
-    else:
-        blocked = parser.get_blocked_units(units)
-        print(f"\nNo actionable units. {len(blocked)} blocked.")
-
-    if detail:
+    if parsed.detail:
         _print_status_detail(units)
 
     return 0

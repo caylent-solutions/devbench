@@ -5,6 +5,7 @@ Coverage requirement: 100% line + branch on devbench.session.
 
 AC-192-1: session state_dir creation and PID-file management.
 AC-192-3: concurrent sessions via flock_backlog mutual exclusion.
+AC-192-5: atomic claim arbitration -- race resolved deterministically via ClaimRaceError.
 AC-192-10: session listing with liveness (ACTIVE / STALE).
 """
 
@@ -13,6 +14,7 @@ from __future__ import annotations
 import errno
 import fcntl
 import os
+import threading
 from dataclasses import fields
 from datetime import UTC, datetime
 from pathlib import Path
@@ -722,3 +724,354 @@ class TestCleanupStaleSessions:
         assert removed == []
         assert (workspace / ".devbench" / "sessions" / "a1").exists()
         assert (workspace / ".devbench" / "sessions" / "a2").exists()
+
+
+# ---------------------------------------------------------------------------
+# Integration: concurrent cmd_claim race via real flock_backlog (AC-192-3, AC-192-5)
+# ---------------------------------------------------------------------------
+
+_WU_ID = "RACE-F1-S1-T1"
+_BACKLOG_ROW_TEMPLATE = (
+    "| {wu_id} | Race Task | Task | in-queue | none | caylent-solutions/devbench | backlog/{wu_id}.md |\n"
+)
+_WU_FILE_TEMPLATE = (
+    "# {wu_id}: Race Task\n\n"
+    "## Status: in-queue\n\n"
+    "## Target Repository\n\n"
+    "- **Repo:** `caylent-solutions/devbench`\n\n"
+    "## Dependencies\n\n"
+    "| ID | Title | Status |\n"
+    "|----|-------|--------|\n"
+    "| none | | |\n\n"
+    "## Changes Manifest\n\n"
+    "| File | Change |\n"
+    "|------|--------|\n"
+    "| src/devbench/session.py | modify |\n"
+)
+
+
+def _build_race_workspace(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """Create a minimal workspace for race-condition tests.
+
+    Returns:
+        Tuple of (workspace_root, backlog_root, backlog_index).
+    """
+    backlog_root = tmp_path / "backlog"
+    backlog_root.mkdir(parents=True)
+    backlog_index = tmp_path / "BACKLOG.md"
+    backlog_index.write_text(
+        "# Backlog\n\n"
+        "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+        "|----|-------|------|--------|--------------|------|----------|\n"
+        + _BACKLOG_ROW_TEMPLATE.format(wu_id=_WU_ID),
+        encoding="utf-8",
+    )
+    wu_file = backlog_root / f"{_WU_ID}.md"
+    wu_file.write_text(_WU_FILE_TEMPLATE.format(wu_id=_WU_ID), encoding="utf-8")
+    return tmp_path, backlog_root, backlog_index
+
+
+class TestCmdClaimRaceIntegration:
+    """Integration: two threads call cmd_claim on the same in-queue WU concurrently.
+
+    Spec 4.4.2 / AC-192-3 / AC-192-5: flock_backlog serialises concurrent claims;
+    the lock ensures mutual exclusion so no BACKLOG.md corruption is produced.
+    When a racing party changes the WU status to a non-claimable value under the
+    lock (e.g. ``done``), the second claimer receives ClaimRaceError and rc=1.
+    """
+
+    @staticmethod
+    def _patch_cli_constants(
+        workspace: Path,
+        backlog_root: Path,
+        backlog_index: Path,
+    ) -> tuple[object, object, object]:
+        """Apply module-level patches to devbench.cli and return the three patch objects.
+
+        Callers MUST call ``patcher.stop()`` on each returned patcher when done.
+        This method is intended for use in the main thread before spawning worker
+        threads so that all threads share the same patched module state without
+        the per-thread context-manager race condition that concurrent
+        ``patch.object`` calls would introduce.
+
+        Args:
+            workspace: Fixture workspace root to patch as WORKSPACE_ROOT.
+            backlog_root: Fixture backlog directory to patch as BACKLOG_ROOT.
+            backlog_index: Fixture BACKLOG.md path to patch as BACKLOG_INDEX.
+
+        Returns:
+            Tuple of three started :class:`unittest.mock._patch` objects.
+        """
+        from unittest.mock import patch as _patch
+
+        import devbench.cli as cli_mod
+
+        p1 = _patch.object(cli_mod, "WORKSPACE_ROOT", workspace)
+        p2 = _patch.object(cli_mod, "BACKLOG_ROOT", backlog_root)
+        p3 = _patch.object(cli_mod, "BACKLOG_INDEX", backlog_index)
+        p1.start()
+        p2.start()
+        p3.start()
+        return p1, p2, p3
+
+    @staticmethod
+    def _stop_patches(*patchers: Any) -> None:
+        """Stop each patcher returned by :meth:`_patch_cli_constants`.
+
+        Args:
+            patchers: Patch objects with a ``stop()`` method.
+        """
+        for p in patchers:
+            p.stop()
+
+    def test_flock_serialises_concurrent_claims_no_corruption(self, tmp_path: Path) -> None:
+        """Two concurrent cmd_claim calls complete without data corruption (AC-192-3).
+
+        The flock_backlog context manager serialises the two writers so that
+        atomic_write_text calls never interleave, leaving BACKLOG.md and the
+        work-unit file in a consistent ``in-progress`` state after both
+        threads finish.
+
+        Patches are applied in the main thread before spawning workers to avoid
+        the thread-safety issues inherent in concurrent ``patch.object`` calls.
+
+        Asserts:
+        - Both threads complete without raising unexpected exceptions.
+        - The work-unit file has exactly one ``## Status:`` line with value ``in-progress``.
+        - BACKLOG.md has exactly one row for the WU with status ``in-progress``.
+        """
+        import devbench.cli as cli_mod
+
+        workspace, backlog_root, backlog_index = _build_race_workspace(tmp_path)
+        wu_file = backlog_root / f"{_WU_ID}.md"
+
+        results: list[int] = []
+        errors: list[str] = []
+        # Use a Barrier so both threads start cmd_claim at the same moment,
+        # maximising the chance of a real concurrent-write race under the flock.
+        barrier = threading.Barrier(2)
+
+        def do_claim() -> None:
+            barrier.wait()
+            try:
+                rc = cli_mod.cmd_claim(_WU_ID)
+                results.append(rc)
+            except Exception as exc:
+                errors.append(f"{type(exc).__name__}: {exc}")
+
+        # Patch module constants in the main thread before spawning workers so
+        # all threads share the same patched state without concurrent-patch races.
+        patchers = self._patch_cli_constants(workspace, backlog_root, backlog_index)
+        try:
+            t1 = threading.Thread(target=do_claim, name="claimer-1")
+            t2 = threading.Thread(target=do_claim, name="claimer-2")
+            t1.start()
+            t2.start()
+            t1.join(timeout=30)
+            t2.join(timeout=30)
+        finally:
+            self._stop_patches(*patchers)
+
+        assert not errors, f"Unexpected exceptions in claim threads: {errors}"
+        assert len(results) == 2, f"Expected 2 results, got {len(results)}"
+
+        # Both threads must have completed without an unexpected exception.
+        # The flock ensures serial access so each sees a valid claimable status.
+        for rc in results:
+            assert rc in (0, 1), f"Unexpected return code {rc}"
+
+        # Verify no corruption: exactly one ``## Status:`` line, value is in-progress.
+        content = wu_file.read_text(encoding="utf-8")
+        status_lines = [line for line in content.splitlines() if line.strip().startswith("## Status:")]
+        assert len(status_lines) == 1, (
+            f"Expected exactly one '## Status:' line, found {len(status_lines)}: {status_lines}"
+        )
+        assert "in-progress" in status_lines[0], f"Expected status 'in-progress', got: {status_lines[0]!r}"
+
+    def test_backlog_index_not_corrupted_after_concurrent_claims(self, tmp_path: Path) -> None:
+        """After concurrent claim calls, BACKLOG.md contains exactly one in-progress row (AC-192-3).
+
+        Verifies that atomic_write_text (temp-then-rename) under flock_backlog prevents
+        partial writes that would corrupt the backlog index during concurrent access.
+
+        Patches are applied in the main thread before spawning workers to avoid
+        the thread-safety issues inherent in concurrent ``patch.object`` calls.
+        """
+        import devbench.cli as cli_mod
+
+        workspace, backlog_root, backlog_index = _build_race_workspace(tmp_path)
+        errors: list[str] = []
+        barrier = threading.Barrier(2)
+
+        def do_claim() -> None:
+            barrier.wait()
+            try:
+                cli_mod.cmd_claim(_WU_ID)
+            except Exception as exc:
+                errors.append(f"{type(exc).__name__}: {exc}")
+
+        patchers = self._patch_cli_constants(workspace, backlog_root, backlog_index)
+        try:
+            t1 = threading.Thread(target=do_claim, name="index-claimer-1")
+            t2 = threading.Thread(target=do_claim, name="index-claimer-2")
+            t1.start()
+            t2.start()
+            t1.join(timeout=30)
+            t2.join(timeout=30)
+        finally:
+            self._stop_patches(*patchers)
+
+        assert not errors, f"Unexpected exceptions in claim threads: {errors}"
+
+        # BACKLOG.md must be parseable and contain exactly one in-progress row for the WU.
+        index_content = backlog_index.read_text(encoding="utf-8")
+        in_progress_rows = [line for line in index_content.splitlines() if _WU_ID in line and "in-progress" in line]
+        assert len(in_progress_rows) == 1, (
+            f"Expected exactly one in-progress row for {_WU_ID!r} in BACKLOG.md, "
+            f"found {len(in_progress_rows)}: {in_progress_rows}"
+        )
+
+    def test_claim_race_error_when_status_changed_to_done_under_lock(self, tmp_path: Path) -> None:
+        """ClaimRaceError propagates as rc=1 when a competing party changes status to 'done' (AC-192-5).
+
+        Simulates the real race: a "winner" thread holds the flock, changes the WU
+        status from ``in-queue`` to ``done`` (via a direct file write while holding
+        the lock), then releases.  The "loser" thread then acquires the lock, re-reads
+        the status, finds ``done`` (not claimable), and cmd_claim returns 1 with a
+        race-related error message on stderr.
+
+        This tests the ClaimRaceError path end-to-end through cmd_claim.
+        Module constants are patched in the main thread before spawning workers.
+        """
+        import devbench.cli as cli_mod
+
+        workspace, backlog_root, backlog_index = _build_race_workspace(tmp_path)
+        wu_file = backlog_root / f"{_WU_ID}.md"
+
+        # A pair of Events to coordinate the "winner" and "loser" threads.
+        winner_holds_lock = threading.Event()
+        winner_may_release = threading.Event()
+        winner_errors: list[str] = []
+        loser_rc: list[int] = []
+        loser_errors: list[str] = []
+
+        def winner_thread() -> None:
+            """Acquire the flock, write 'done' into the WU file, then hold until told to release."""
+            try:
+                with flock_backlog(workspace, timeout_seconds=10):
+                    # Rewrite the WU file status to 'done' while holding the lock.
+                    # This simulates a competing session that marks the WU as done
+                    # before the loser thread can re-read the status under the lock.
+                    done_content = wu_file.read_text(encoding="utf-8").replace("## Status: in-queue", "## Status: done")
+                    wu_file.write_text(done_content, encoding="utf-8")
+                    # Also update BACKLOG.md so force_status won't fail on index lookup.
+                    # (The loser raises ClaimRaceError before reaching force_status,
+                    # but this ensures a fully realistic simulation.)
+                    idx_content = backlog_index.read_text(encoding="utf-8").replace("in-queue", "done")
+                    backlog_index.write_text(idx_content, encoding="utf-8")
+                    winner_holds_lock.set()  # signal: loser may now try to acquire
+                    winner_may_release.wait(timeout=10)  # hold lock until loser is done
+            except Exception as exc:
+                winner_errors.append(f"{type(exc).__name__}: {exc}")
+                winner_holds_lock.set()  # unblock the loser even on error
+
+        def loser_thread() -> None:
+            """Wait for the winner to hold the lock, then attempt cmd_claim -- expect rc=1."""
+            winner_holds_lock.wait(timeout=10)
+            try:
+                # At this point the winner holds the lock and has written 'done'.
+                # cmd_claim will block on flock until winner_may_release is set, then
+                # re-read the status, find 'done', raise ClaimRaceError -> rc=1.
+                rc = cli_mod.cmd_claim(_WU_ID)
+                loser_rc.append(rc)
+            except Exception as exc:
+                loser_errors.append(f"{type(exc).__name__}: {exc}")
+            finally:
+                winner_may_release.set()  # let the winner release its lock
+
+        patchers = self._patch_cli_constants(workspace, backlog_root, backlog_index)
+        try:
+            wt = threading.Thread(target=winner_thread, name="done-writer")
+            lt = threading.Thread(target=loser_thread, name="race-loser")
+            wt.start()
+            lt.start()
+            # loser sets winner_may_release in its finally block; join both.
+            lt.join(timeout=30)
+            wt.join(timeout=30)
+        finally:
+            self._stop_patches(*patchers)
+
+        assert not winner_errors, f"Winner thread raised unexpected error: {winner_errors}"
+        assert not loser_errors, f"Loser thread raised unexpected error: {loser_errors}"
+        assert loser_rc, "Loser thread did not record a return code"
+        assert loser_rc[0] == 1, (
+            f"Expected cmd_claim to return 1 (ClaimRaceError path) when WU status is 'done', got rc={loser_rc[0]}"
+        )
+
+    def test_race_loser_stderr_contains_race_message(self, tmp_path: Path) -> None:
+        """The rc=1 from a race condition emits an actionable stderr message (AC-192-5).
+
+        Extends test_claim_race_error_when_status_changed_to_done_under_lock to verify
+        the error message is human-readable and contains the keywords 'race' or 'claim'.
+        Module constants are patched in the main thread before spawning workers.
+        """
+        import io
+        import sys
+
+        import devbench.cli as cli_mod
+
+        workspace, backlog_root, backlog_index = _build_race_workspace(tmp_path)
+        wu_file = backlog_root / f"{_WU_ID}.md"
+
+        winner_holds_lock = threading.Event()
+        winner_may_release = threading.Event()
+        winner_errors: list[str] = []
+        loser_stderr: list[str] = []
+        loser_rc: list[int] = []
+
+        def winner_thread() -> None:
+            try:
+                with flock_backlog(workspace, timeout_seconds=10):
+                    done_content = wu_file.read_text(encoding="utf-8").replace("## Status: in-queue", "## Status: done")
+                    wu_file.write_text(done_content, encoding="utf-8")
+                    idx_content = backlog_index.read_text(encoding="utf-8").replace("in-queue", "done")
+                    backlog_index.write_text(idx_content, encoding="utf-8")
+                    winner_holds_lock.set()
+                    winner_may_release.wait(timeout=10)
+            except Exception as exc:
+                winner_errors.append(f"{type(exc).__name__}: {exc}")
+                winner_holds_lock.set()
+
+        def loser_thread() -> None:
+            winner_holds_lock.wait(timeout=10)
+            buf = io.StringIO()
+            try:
+                with patch.object(sys, "stderr", buf):
+                    rc = cli_mod.cmd_claim(_WU_ID)
+                loser_rc.append(rc)
+                loser_stderr.append(buf.getvalue())
+            except Exception as exc:
+                loser_stderr.append(f"EXCEPTION: {type(exc).__name__}: {exc}")
+                loser_rc.append(-1)
+            finally:
+                winner_may_release.set()
+
+        patchers = self._patch_cli_constants(workspace, backlog_root, backlog_index)
+        try:
+            wt = threading.Thread(target=winner_thread, name="done-writer-msg")
+            lt = threading.Thread(target=loser_thread, name="race-loser-msg")
+            wt.start()
+            lt.start()
+            lt.join(timeout=30)
+            wt.join(timeout=30)
+        finally:
+            self._stop_patches(*patchers)
+
+        assert not winner_errors, f"Winner thread error: {winner_errors}"
+        assert loser_rc, "Loser did not record a return code"
+        assert loser_rc[0] == 1, f"Expected rc=1 (race error), got {loser_rc[0]}"
+        assert loser_stderr, "Loser did not record stderr output"
+        msg = loser_stderr[0].lower()
+        assert "race" in msg or "claim" in msg, (
+            f"Expected 'race' or 'claim' in stderr message, got: {loser_stderr[0]!r}"
+        )

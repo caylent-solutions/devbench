@@ -731,3 +731,65 @@ def test_from_file_invalid_field_type_raises(tmp_path: Path, bad_payload: dict) 
     (scope_dir / "scope.json").write_text(json.dumps(bad_payload))
     with pytest.raises(TypeError):
         ScopeFilter.from_file(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Optional path= parameter on to_file() and clear()
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_to_file_with_explicit_path_writes_to_that_path(tmp_path: Path, backlog_ids: list[str]) -> None:
+    """to_file(workspace_root, path=custom) writes to the supplied path, not the canonical one."""
+    sf = ScopeFilter.parse("E1", "", backlog_ids)
+    custom_path = tmp_path / "sessions" / "my-session" / "scope.json"
+    written_path = sf.to_file(tmp_path, path=custom_path)
+
+    assert written_path == custom_path
+    assert custom_path.exists(), "File must be written to the supplied path"
+    data = json.loads(custom_path.read_text())
+    assert data["include"] == ["E1"]
+    # Canonical path must NOT be created
+    canonical = tmp_path / ".devbench" / "scope.json"
+    assert not canonical.exists(), "Canonical scope.json must not be created when path= is supplied"
+
+
+@pytest.mark.unit
+def test_to_file_with_explicit_path_creates_parent_dirs(tmp_path: Path, backlog_ids: list[str]) -> None:
+    """to_file with path= creates all parent directories automatically."""
+    sf = ScopeFilter.parse("E1-F1-S1-T1", "", backlog_ids)
+    deep_path = tmp_path / "a" / "b" / "c" / "scope.json"
+    sf.to_file(tmp_path, path=deep_path)
+    assert deep_path.exists()
+
+
+@pytest.mark.unit
+def test_to_file_without_explicit_path_uses_canonical(tmp_path: Path, backlog_ids: list[str]) -> None:
+    """to_file() with no path= still writes to the canonical .devbench/scope.json."""
+    sf = ScopeFilter.parse("E1", "", backlog_ids)
+    sf.to_file(tmp_path)
+    canonical = tmp_path / ".devbench" / "scope.json"
+    assert canonical.exists()
+
+
+@pytest.mark.unit
+def test_clear_with_explicit_path_deletes_that_file(tmp_path: Path, backlog_ids: list[str]) -> None:
+    """clear(workspace_root, path=custom) deletes the supplied path, not the canonical one."""
+    sf = ScopeFilter.parse("E1", "", backlog_ids)
+    custom_path = tmp_path / "sessions" / "beta" / "scope.json"
+    sf.to_file(tmp_path, path=custom_path)
+    assert custom_path.exists()
+
+    ScopeFilter.clear(tmp_path, path=custom_path)
+    assert not custom_path.exists(), "Supplied path must be deleted by clear()"
+    # Canonical path must remain untouched (was never created)
+    canonical = tmp_path / ".devbench" / "scope.json"
+    assert not canonical.exists()
+
+
+@pytest.mark.unit
+def test_clear_with_explicit_path_idempotent_when_absent(tmp_path: Path) -> None:
+    """clear(path=custom) is a no-op when the supplied path does not exist."""
+    custom_path = tmp_path / "sessions" / "gamma" / "scope.json"
+    # Must not raise even though the path was never created
+    ScopeFilter.clear(tmp_path, path=custom_path)

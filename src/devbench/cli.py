@@ -29,6 +29,7 @@ Commands::
     report [since]          Print progress report with velocity stats
     log <message>           Append a message to the orchestrator log file
     start                   Run the orchestrate skill via the Claude Agent SDK (non-interactive)
+    scope set/clear/show    Persistent scope management without starting the orchestrator
     watch [--watch N]       Show a live dashboard of the active orchestration
 
 Plugin agent bridge commands (used by devbench plugin agents)::
@@ -5010,6 +5011,261 @@ def cmd_prepare_plugin_shadow() -> int:
     return 0
 
 
+def _session_scope_file_path(workspace_root: Path) -> Path:
+    """Return the scope.json path, honouring ``DEVBENCH_SESSION_NAME`` when set.
+
+    When a session name is active, scope.json lives at:
+    ``<workspace>/.devbench/sessions/<name>/scope.json``
+
+    When no session is active, scope.json lives at:
+    ``<workspace>/.devbench/scope.json``
+
+    Args:
+        workspace_root: The workspace root (typically ``WORKSPACE_ROOT``).
+
+    Returns:
+        The canonical scope.json ``Path`` for the current session context.
+
+    Raises:
+        ValueError: If ``DEVBENCH_SESSION_NAME`` contains ``..`` path segments.
+    """
+    session_name = os.environ.get("DEVBENCH_SESSION_NAME", "").strip()
+    if not session_name:
+        return _scope_file_path(workspace_root)
+    if ".." in Path(session_name).parts:
+        raise ValueError(f"DEVBENCH_SESSION_NAME contains invalid path segment '..': {session_name!r}")
+    return workspace_root / ".devbench" / "sessions" / session_name / "scope.json"
+
+
+def _scope_set(include: str, exclude: str, workspace_root: Path) -> int:
+    """Persist a ``ScopeFilter`` to scope.json for the current session context.
+
+    Parses ``include``/``exclude`` tokens via ``ScopeFilter.parse()``, then
+    writes the result atomically to the session-scoped (or workspace-root)
+    scope.json via :meth:`ScopeFilter.to_file`.
+
+    Args:
+        include: Raw ``--include`` token string (must be non-empty).
+        exclude: Raw ``--exclude`` token string (may be empty).
+        workspace_root: The workspace root path.
+
+    Returns:
+        0 on success, 1 on parse error or write error.
+
+    Raises:
+        Nothing -- all errors are caught and written to stderr.
+    """
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    backlog_ids = [u.id for u in units]
+    try:
+        scope = ScopeFilter.parse(include, exclude, backlog_ids)
+    except InvalidScopeError as exc:
+        print(f"ERROR: invalid scope token: {exc}", file=sys.stderr)
+        return 1
+    # Determine the target path honouring DEVBENCH_SESSION_NAME
+    try:
+        target_path = _session_scope_file_path(workspace_root)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    try:
+        scope.to_file(workspace_root, path=target_path)
+    except OSError as exc:
+        print(
+            f"ERROR: cannot write scope.json to {target_path}: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"scope set: {target_path}")
+    return 0
+
+
+def _scope_clear(workspace_root: Path) -> int:
+    """Remove the active scope.json (idempotent).
+
+    Exits 0 even when no scope.json is present (outputs ``no scope pending``).
+    Deletion is delegated to :meth:`ScopeFilter.clear` to avoid reimplementing
+    the idempotent-unlink logic.
+
+    Args:
+        workspace_root: The workspace root path.
+
+    Returns:
+        Always 0.
+
+    Raises:
+        Nothing -- all errors are caught and written to stderr.
+    """
+    try:
+        target_path = _session_scope_file_path(workspace_root)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    if not target_path.exists():
+        print("no scope pending")
+        return 0
+    try:
+        ScopeFilter.clear(workspace_root, path=target_path)
+    except OSError as exc:
+        print(f"ERROR: cannot delete scope.json at {target_path}: {exc}", file=sys.stderr)
+        return 1
+    print(f"scope cleared: {target_path}")
+    return 0
+
+
+def _scope_show(workspace_root: Path) -> int:
+    """Print the active scope state or ``no scope pending``.
+
+    Displays the include list, exclude list, expanded ID count, started_at,
+    and started_by metadata from scope.json.  Exits 0 in both cases (file
+    absent and file present).
+
+    Uses ``[]`` key access (not ``.get()`` with defaults) so a corrupt
+    scope.json with missing required fields raises ``KeyError`` immediately
+    (fail-fast) instead of silently masking the corruption with empty values.
+
+    Args:
+        workspace_root: The workspace root path.
+
+    Returns:
+        Always 0.
+
+    Raises:
+        Nothing -- all errors are caught and written to stderr.
+    """
+    try:
+        target_path = _session_scope_file_path(workspace_root)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    if not target_path.exists():
+        print("no scope pending")
+        return 0
+    try:
+        data = json.loads(target_path.read_text(encoding="utf-8"))
+        include = data["include"]
+        exclude = data["exclude"]
+        expanded_ids = data["expanded_ids"]
+        started_at = data["started_at"]
+        started_by = data["started_by"]
+    except (OSError, json.JSONDecodeError, KeyError) as exc:
+        print(f"ERROR: cannot read scope.json at {target_path}: {exc}", file=sys.stderr)
+        return 1
+    print(f"include:      {include}")
+    print(f"exclude:      {exclude}")
+    print(f"expanded IDs: {len(expanded_ids)}")
+    print(f"started_at:   {started_at}")
+    print(f"started_by:   {started_by}")
+    return 0
+
+
+def _parse_scope_set_argv(argv: tuple[str, ...]) -> tuple[str, str, int]:
+    """Parse arguments for ``scope set``.
+
+    Accepts ``--include <tokens>`` (required) and ``--exclude <tokens>``
+    (optional).  Returns ``(include, exclude, exit_code)`` where
+    ``exit_code`` is 1 on parse error and 0 on success.
+
+    Args:
+        argv: Argument tuple after the ``"set"`` token.
+
+    Returns:
+        Tuple of ``(include_str, exclude_str, exit_code)``.  When
+        ``exit_code`` is non-zero the include/exclude values should be
+        ignored.
+    """
+    include: str = ""
+    exclude: str = ""
+    args = list(argv)
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("--include", "--exclude"):
+            if i + 1 >= len(args) or args[i + 1].startswith("--"):
+                print(
+                    f"ERROR: {arg} requires a value",
+                    file=sys.stderr,
+                )
+                return "", "", 1
+            i += 1
+            if arg == "--include":
+                include = args[i]
+            else:
+                exclude = args[i]
+        else:
+            print(f"ERROR: unrecognised argument for 'scope set': {arg!r}", file=sys.stderr)
+            return "", "", 1
+        i += 1
+    if not include:
+        print(
+            "ERROR: 'scope set' requires --include <tokens>",
+            file=sys.stderr,
+        )
+        return "", "", 1
+    return include, exclude, 0
+
+
+def cmd_scope(*argv: str) -> int:
+    """Persistent scope management: set / clear / show.
+
+    CLI surface (spec 4.2.6.1, issue #196)::
+
+        devbench scope set --include "<tokens>" [--exclude "<tokens>"]
+        devbench scope clear
+        devbench scope show
+
+    Dispatches to internal helpers ``_scope_set``, ``_scope_clear``, and
+    ``_scope_show``.  All helpers reuse :class:`~devbench.scope.ScopeFilter`
+    from :mod:`devbench.scope` (built in E2-F1) for token parsing and
+    persistence -- no duplication of parsing or file-write logic.
+
+    When ``DEVBENCH_SESSION_NAME`` env var is set, scope.json is written to /
+    read from ``<workspace>/.devbench/sessions/<name>/scope.json`` (per-session
+    isolation, spec 4.2.6.4, issue #192 integration).
+
+    Error behaviour:
+
+    - Invalid tokens in ``scope set`` -> rc=1, message to stderr identical to
+      ``cmd_start --include``'s parser error (no message drift).
+    - ``scope set`` cannot write scope.json -> rc=1, stderr
+      ``ERROR: cannot write scope.json to <path>: <reason>``.
+    - ``scope clear`` on missing file -> rc=0, stdout ``no scope pending``
+      (idempotent).
+    - ``scope show`` on missing file -> rc=0, stdout ``no scope pending``.
+    - Unknown action verb -> rc=2, stderr
+      ``ERROR: unknown action '<verb>'; valid: set | clear | show``.
+
+    Args:
+        *argv: Positional action verb and optional flags.
+
+    Returns:
+        0 on success, 1 on scope error, 2 on unknown action verb.
+    """
+    if not argv:
+        print(
+            "ERROR: 'scope' requires an action: set | clear | show",
+            file=sys.stderr,
+        )
+        return 2
+    action = argv[0]
+    rest = argv[1:]
+    if action == "set":
+        include, exclude, parse_rc = _parse_scope_set_argv(rest)
+        if parse_rc != 0:
+            return parse_rc
+        return _scope_set(include, exclude, WORKSPACE_ROOT)
+    if action == "clear":
+        return _scope_clear(WORKSPACE_ROOT)
+    if action == "show":
+        return _scope_show(WORKSPACE_ROOT)
+    print(
+        f"ERROR: unknown action {action!r}; valid: set | clear | show",
+        file=sys.stderr,
+    )
+    return 2
+
+
 def cmd_request_amendment(unit_id: str) -> int:
     """Register an amendment request for ``unit_id``.
 
@@ -6703,6 +6959,14 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
         ),
     ),
     "start": (cmd_start, 0, "Run orchestrate skill via Agent SDK (non-interactive)"),
+    "scope": (
+        cmd_scope,
+        0,
+        (
+            "Persistent scope management: scope set --include '<tokens>' "
+            "[--exclude '<tokens>']  |  scope clear  |  scope show"
+        ),
+    ),
     "prepare-plugin-shadow": (
         cmd_prepare_plugin_shadow,
         0,
@@ -6831,6 +7095,8 @@ _VARIADIC_COMMANDS: frozenset[str] = frozenset(
         "start",
         # Issue #190 E2-F2-S2-T3: cmd_next respects scope filter
         "next",
+        # Issue #196 E2-F7: scope set / clear / show subcommand
+        "scope",
     }
 )
 

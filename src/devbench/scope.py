@@ -317,7 +317,7 @@ class ScopeFilter:
     # Persistence
     # ------------------------------------------------------------------
 
-    def to_file(self, workspace_root: Path) -> Path:
+    def to_file(self, workspace_root: Path, *, path: Path | None = None) -> Path:
         """Write this filter to ``<workspace_root>/.devbench/scope.json``.
 
         Creates the ``.devbench`` directory if it does not exist.
@@ -336,6 +336,11 @@ class ScopeFilter:
 
         Args:
             workspace_root: Path to the workspace root directory.
+            path: Optional explicit destination path.  When provided, the file
+                is written to ``path`` instead of the canonical
+                ``<workspace_root>/.devbench/scope.json``.  Use this to write
+                to a per-session path (e.g. for ``DEVBENCH_SESSION_NAME``
+                integration) without reimplementing the atomic-write logic.
 
         Returns:
             Path to the written scope.json file.
@@ -343,7 +348,7 @@ class ScopeFilter:
         Raises:
             OSError: If the file cannot be written (permissions, disk full, etc.).
         """
-        scope_path = _scope_file_path(workspace_root)
+        scope_path = path if path is not None else _scope_file_path(workspace_root)
         scope_path.parent.mkdir(parents=True, exist_ok=True)
 
         payload: dict[str, object] = {
@@ -401,18 +406,23 @@ class ScopeFilter:
         )
 
     @classmethod
-    def clear(cls, workspace_root: Path) -> None:
+    def clear(cls, workspace_root: Path, *, path: Path | None = None) -> None:
         """Delete ``<workspace_root>/.devbench/scope.json`` if it exists.
 
         Idempotent: does not raise if the file is already absent.
 
         Args:
             workspace_root: Path to the workspace root directory.
+            path: Optional explicit file path to delete.  When provided,
+                ``path`` is deleted instead of the canonical
+                ``<workspace_root>/.devbench/scope.json``.  Use this to
+                clear a per-session scope file without reimplementing the
+                deletion logic.
 
         Raises:
             OSError: If the file exists but cannot be deleted (permissions, etc.).
         """
-        scope_path = _scope_file_path(workspace_root)
+        scope_path = path if path is not None else _scope_file_path(workspace_root)
         with contextlib.suppress(FileNotFoundError):
             scope_path.unlink()
 

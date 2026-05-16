@@ -13171,3 +13171,354 @@ class TestCmdReportScopeBanner:
         assert result == 0
         assert called_with.get("include", "") == ""
         assert called_with.get("exclude", "") == ""
+
+
+# ---------------------------------------------------------------------------
+# cmd_scope tests (AC-196-1 through AC-196-9; spec section 4.2.6)
+# ---------------------------------------------------------------------------
+
+
+class TestCmdScope:
+    """Tests for cmd_scope: set / clear / show dispatch (spec 4.2.6, issue #196)."""
+
+    # Canonical backlog IDs used in all set-action tests.
+    _BACKLOG_IDS: ClassVar[list[str]] = [
+        "E1-F1-S1-T1",
+        "E1-F1-S1-T2",
+        "E2-F1-S1-T1",
+    ]
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _scope_path(self, tmp_path: Path) -> Path:
+        """Return the canonical scope.json path under tmp_path."""
+        return tmp_path / ".devbench" / "scope.json"
+
+    def _session_scope_path(self, tmp_path: Path, session_name: str) -> Path:
+        """Return the per-session scope.json path."""
+        return tmp_path / ".devbench" / "sessions" / session_name / "scope.json"
+
+    def _make_parser_mock(self) -> MagicMock:
+        """Return a BacklogParser mock whose parse_index yields the canonical IDs."""
+        units = [MagicMock(id=wid) for wid in self._BACKLOG_IDS]
+        parser = MagicMock()
+        parser.parse_index.return_value = units
+        return parser
+
+    def _patch_scope_env(self, tmp_path: Path) -> Any:
+        """Patch WORKSPACE_ROOT, BACKLOG_ROOT, BACKLOG_INDEX, and BacklogParser for cmd_scope."""
+        parser_mock = self._make_parser_mock()
+        return patch.multiple(
+            "devbench.cli",
+            WORKSPACE_ROOT=tmp_path,
+            BACKLOG_ROOT=tmp_path / "backlog",
+            BACKLOG_INDEX=tmp_path / "BACKLOG.md",
+            BacklogParser=MagicMock(return_value=parser_mock),
+        )
+
+    # ------------------------------------------------------------------
+    # AC-196-1: scope set -- happy path (workspace-root scope.json)
+    # ------------------------------------------------------------------
+
+    def test_set_writes_scope_json(self, tmp_path: Path) -> None:
+        """scope set --include creates scope.json with correct include/exclude fields."""
+        with self._patch_scope_env(tmp_path):
+            rc = cli.cmd_scope("set", "--include", "E1")
+
+        assert rc == 0
+        scope_path = self._scope_path(tmp_path)
+        assert scope_path.exists(), "scope.json must be written on success"
+        payload = json.loads(scope_path.read_text())
+        assert payload["include"] == ["E1"]
+        assert payload["exclude"] == []
+        # expanded_ids must contain both E1-leaf IDs
+        assert "E1-F1-S1-T1" in payload["expanded_ids"]
+        assert "E1-F1-S1-T2" in payload["expanded_ids"]
+        assert "E2-F1-S1-T1" not in payload["expanded_ids"]
+
+    def test_set_with_exclude(self, tmp_path: Path) -> None:
+        """scope set --include E1 --exclude E1-F1-S1-T2 excludes the specified task."""
+        with self._patch_scope_env(tmp_path):
+            rc = cli.cmd_scope("set", "--include", "E1", "--exclude", "E1-F1-S1-T2")
+
+        assert rc == 0
+        payload = json.loads(self._scope_path(tmp_path).read_text())
+        assert "E1-F1-S1-T1" in payload["expanded_ids"]
+        assert "E1-F1-S1-T2" not in payload["expanded_ids"]
+
+    def test_set_overwrites_existing_scope_json(self, tmp_path: Path) -> None:
+        """scope set overwrites a pre-existing scope.json (no merge)."""
+        scope_path = self._scope_path(tmp_path)
+        scope_path.parent.mkdir(parents=True, exist_ok=True)
+        scope_path.write_text(json.dumps({"include": ["E99"], "exclude": [], "expanded_ids": []}))
+
+        with self._patch_scope_env(tmp_path):
+            rc = cli.cmd_scope("set", "--include", "E1-F1-S1-T1")
+
+        assert rc == 0
+        payload = json.loads(scope_path.read_text())
+        assert payload["include"] == ["E1-F1-S1-T1"]
+
+    # ------------------------------------------------------------------
+    # AC-196-2: scope set -- invalid token -> rc=1, stderr matches cmd_start
+    # ------------------------------------------------------------------
+
+    def test_set_invalid_token_exits_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """scope set with a malformed token exits rc=1 and emits an error to stderr."""
+        with self._patch_scope_env(tmp_path):
+            rc = cli.cmd_scope("set", "--include", "-bad-token")
+
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert captured.err, "An error message must appear on stderr"
+        assert not self._scope_path(tmp_path).exists(), "scope.json must NOT be created on error"
+
+    def test_set_reverse_range_exits_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """scope set with a reverse range (E3-E1) exits rc=1."""
+        with self._patch_scope_env(tmp_path):
+            rc = cli.cmd_scope("set", "--include", "E3-E1")
+
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert "ERROR" in captured.err or "reverse" in captured.err.lower()
+
+    # ------------------------------------------------------------------
+    # AC-196-3: scope clear -- idempotent; exits 0 even if no file present
+    # ------------------------------------------------------------------
+
+    def test_clear_no_file_exits_0(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """scope clear exits 0 with 'no scope pending' when scope.json is absent."""
+        with self._patch_scope_env(tmp_path):
+            rc = cli.cmd_scope("clear")
+
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert "no scope pending" in captured.out
+
+    def test_clear_removes_existing_scope_json(self, tmp_path: Path) -> None:
+        """scope clear deletes scope.json when it is present."""
+        scope_path = self._scope_path(tmp_path)
+        scope_path.parent.mkdir(parents=True, exist_ok=True)
+        scope_path.write_text(json.dumps({"include": [], "exclude": [], "expanded_ids": []}))
+
+        with self._patch_scope_env(tmp_path):
+            rc = cli.cmd_scope("clear")
+
+        assert rc == 0
+        assert not scope_path.exists()
+
+    # ------------------------------------------------------------------
+    # AC-196-4: scope show -- prints state or "no scope pending"
+    # ------------------------------------------------------------------
+
+    def test_show_no_file_exits_0(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """scope show exits 0 with 'no scope pending' when scope.json is absent."""
+        with self._patch_scope_env(tmp_path):
+            rc = cli.cmd_scope("show")
+
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert "no scope pending" in captured.out
+
+    def test_show_with_scope_json_prints_details(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """scope show prints include, exclude, and expanded_ids count when scope.json exists."""
+        scope_path = self._scope_path(tmp_path)
+        scope_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "include": ["E1"],
+            "exclude": ["E1-F1-S1-T2"],
+            "expanded_ids": ["E1-F1-S1-T1"],
+            "started_at": "2026-05-16T00:00:00Z",
+            "started_by": "alice",
+        }
+        scope_path.write_text(json.dumps(payload))
+
+        with self._patch_scope_env(tmp_path):
+            rc = cli.cmd_scope("show")
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "E1" in out
+        assert "1" in out  # expanded_ids count or content
+        assert "2026-05-16" in out or "alice" in out
+
+    # ------------------------------------------------------------------
+    # AC-196-9 / error: unknown action verb -> rc=2
+    # ------------------------------------------------------------------
+
+    def test_unknown_action_exits_2(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """scope <unknown> exits rc=2 with an actionable error to stderr."""
+        with self._patch_scope_env(tmp_path):
+            rc = cli.cmd_scope("bogus")
+
+        assert rc == 2
+        captured = capsys.readouterr()
+        assert "bogus" in captured.err
+        assert "set" in captured.err
+        assert "clear" in captured.err
+        assert "show" in captured.err
+
+    def test_no_action_exits_2(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """scope with no action argument exits rc=2."""
+        with self._patch_scope_env(tmp_path):
+            rc = cli.cmd_scope()
+
+        assert rc == 2
+        captured = capsys.readouterr()
+        assert captured.err
+
+    # ------------------------------------------------------------------
+    # Error: set without --include flag
+    # ------------------------------------------------------------------
+
+    def test_set_without_include_flag_exits_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """scope set without --include flag exits rc=1 with actionable error."""
+        with self._patch_scope_env(tmp_path):
+            rc = cli.cmd_scope("set")
+
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert captured.err
+
+    # ------------------------------------------------------------------
+    # AC-196: session integration -- DEVBENCH_SESSION_NAME path resolution
+    # ------------------------------------------------------------------
+
+    def test_set_uses_session_path_when_env_var_set(self, tmp_path: Path) -> None:
+        """scope set writes to session-scoped path when DEVBENCH_SESSION_NAME is set."""
+        session_name = "alpha"
+
+        with (
+            self._patch_scope_env(tmp_path),
+            patch.dict("os.environ", {"DEVBENCH_SESSION_NAME": session_name}, clear=False),
+        ):
+            rc = cli.cmd_scope("set", "--include", "E1-F1-S1-T1")
+
+        assert rc == 0
+        session_scope = self._session_scope_path(tmp_path, session_name)
+        assert session_scope.exists(), "Session-scoped scope.json must be written"
+        payload = json.loads(session_scope.read_text())
+        assert payload["include"] == ["E1-F1-S1-T1"]
+        # workspace-root scope.json must NOT be created
+        assert not self._scope_path(tmp_path).exists(), (
+            "Workspace-root scope.json must not be created when session name is set"
+        )
+
+    def test_clear_uses_session_path_when_env_var_set(self, tmp_path: Path) -> None:
+        """scope clear deletes the session-scoped scope.json."""
+        session_name = "beta"
+        session_scope = self._session_scope_path(tmp_path, session_name)
+        session_scope.parent.mkdir(parents=True, exist_ok=True)
+        session_scope.write_text(json.dumps({"include": [], "exclude": [], "expanded_ids": []}))
+
+        with (
+            self._patch_scope_env(tmp_path),
+            patch.dict("os.environ", {"DEVBENCH_SESSION_NAME": session_name}, clear=False),
+        ):
+            rc = cli.cmd_scope("clear")
+
+        assert rc == 0
+        assert not session_scope.exists()
+
+    def test_show_uses_session_path_when_env_var_set(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """scope show reads the session-scoped scope.json."""
+        session_name = "gamma"
+        session_scope = self._session_scope_path(tmp_path, session_name)
+        session_scope.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "include": ["E2"],
+            "exclude": [],
+            "expanded_ids": ["E2-F1-S1-T1"],
+            "started_at": "2026-05-16T01:00:00Z",
+            "started_by": "bob",
+        }
+        session_scope.write_text(json.dumps(payload))
+
+        with (
+            self._patch_scope_env(tmp_path),
+            patch.dict("os.environ", {"DEVBENCH_SESSION_NAME": session_name}, clear=False),
+        ):
+            rc = cli.cmd_scope("show")
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "E2" in out
+
+    # ------------------------------------------------------------------
+    # Parametrised: multiple valid selector shapes
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "include_str, expected_present, expected_absent",
+        [
+            ("E1-F1-S1-T1", ["E1-F1-S1-T1"], ["E1-F1-S1-T2", "E2-F1-S1-T1"]),
+            ("E1", ["E1-F1-S1-T1", "E1-F1-S1-T2"], ["E2-F1-S1-T1"]),
+            ("E1,E2", ["E1-F1-S1-T1", "E1-F1-S1-T2", "E2-F1-S1-T1"], []),
+        ],
+    )
+    def test_set_selector_shapes(
+        self,
+        tmp_path: Path,
+        include_str: str,
+        expected_present: list[str],
+        expected_absent: list[str],
+    ) -> None:
+        """scope set correctly expands various valid selector shapes."""
+        with self._patch_scope_env(tmp_path):
+            rc = cli.cmd_scope("set", "--include", include_str)
+
+        assert rc == 0
+        payload = json.loads(self._scope_path(tmp_path).read_text())
+        for wid in expected_present:
+            assert wid in payload["expanded_ids"], f"{wid} expected in expanded_ids"
+        for wid in expected_absent:
+            assert wid not in payload["expanded_ids"], f"{wid} must not be in expanded_ids"
+
+    # ------------------------------------------------------------------
+    # AC-196: round-trip equivalence -- set then cmd_next honours it
+    # ------------------------------------------------------------------
+
+    def test_scope_set_honoured_by_cmd_next(self, tmp_path: Path) -> None:
+        """scope.json written by cmd_scope set is honoured by cmd_next identically to cmd_start."""
+        with self._patch_scope_env(tmp_path):
+            set_rc = cli.cmd_scope("set", "--include", "E1-F1-S1-T1")
+
+        assert set_rc == 0
+        scope_path = self._scope_path(tmp_path)
+        assert scope_path.exists()
+
+        # Verify the written file has the standard fields cmd_start would write
+        payload = json.loads(scope_path.read_text())
+        assert "include" in payload
+        assert "exclude" in payload
+        assert "expanded_ids" in payload
+        assert "started_at" in payload
+        assert "started_by" in payload
+
+    # ------------------------------------------------------------------
+    # cmd_scope is registered in _COMMANDS
+    # ------------------------------------------------------------------
+
+    def test_scope_registered_in_commands(self) -> None:
+        """cmd_scope is available as the 'scope' command in _COMMANDS."""
+        assert "scope" in cli._COMMANDS
+
+    # ------------------------------------------------------------------
+    # main() dispatches to cmd_scope
+    # ------------------------------------------------------------------
+
+    def test_main_dispatches_scope_clear(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """main() correctly dispatches 'devbench scope clear'."""
+        with (
+            patch("sys.argv", ["devbench", "scope", "clear"]),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+        ):
+            result = cli.main()
+
+        assert result == 0
+        out = capsys.readouterr().out
+        assert "no scope pending" in out

@@ -7,7 +7,7 @@ Process the backlog using the steps below, repeating until all work units are do
 
 **CRITICAL: This is an autonomous loop. Never stop to ask the user if you should proceed. Never ask "Should I continue?" After completing a work unit, immediately return to step 1 and process the next one. The only valid exit conditions are ALL_DONE or NO_ACTIONABLE from step 2. If the context was compacted, re-read this instruction and continue the loop.**
 
-**CRITICAL (back-to-back tool calls): After every Agent tool result, your very next tool use MUST be either another Agent call (step 4 / 5 / 6 / 7) or a `uv run devbench ...` Bash call (steps 0 / 1 / 2 / 8 / 9). Ending your turn before emitting that next tool call is a loop-exit bug -- the orchestrate loop depends on back-to-back tool calls within a single turn, and the stop-hook's `decision: block` recovery is not 100% reliable. Do NOT summarise or narrate between tool calls; emit the next tool call immediately.**
+**CRITICAL (back-to-back tool calls): After every Agent tool result, your very next tool use MUST be either another Agent call (step 4 / 5 / 6 / 7) or a `uv run devbench ...` Bash call (steps 0 / 1 / 2 / 8 / 9 / 9a). Ending your turn before emitting that next tool call is a loop-exit bug -- the orchestrate loop depends on back-to-back tool calls within a single turn, and the stop-hook's `decision: block` recovery is not 100% reliable. Do NOT summarise or narrate between tool calls; emit the next tool call immediately.**
 
 **CRITICAL (no recap at end of turn -- issue #140): Every turn MUST end with EITHER (a) a tool call (the next concrete action), OR (b) a `uv run devbench next` invocation that returns ALL_DONE / NO_ACTIONABLE / a JSON dispatch. The recap-prose pattern -- ending the turn with sentences like "Next: re-invoke executor" or "Next: log T4 verdicts and re-invoke executor" or any other natural-language description of the planned next step -- is FORBIDDEN. Claude Code interprets a turn-end-without-tool-call as "agent done" and fires the Stop event; the Stop hook's block decision arrives after the turn has already wound down and the orchestrator effectively terminates. If you find yourself about to emit a recap describing the next action, STOP, delete the recap, and emit the actual tool call instead. This rule is regression-tested in `tests/test_integration/test_orchestrate_skill_no_recap_anti_pattern.py`.**
 
@@ -107,6 +107,8 @@ Process the backlog using the steps below, repeating until all work units are do
 9. `uv run devbench mark-done <id>` -- mark the unit done (enforces done-gate).
 
    Then `uv run devbench write-snapshot` to persist a fresh `devbench report` snapshot to `<workspace>/.devbench/report-snapshot.json`. Issue #162 Phase 6 (ADR-20). Subsequent `devbench report --once` invocations serve from the snapshot in single-digit milliseconds when the orchestrator log is unchanged; the snapshot is self-healing (deletion is always safe; the next iteration writes a fresh one) and idempotent (no work-unit mutations).
+
+9a. **Drain check** (issue #188, spec section 4.3.4): Run `uv run devbench drain --status`. If the output indicates a drain is pending, log an `[ORCHESTRATOR_DRAIN]` audit comment on the last work unit (the one just marked done) and exit cleanly with rc=0. If no drain is pending, continue to step 10 immediately.
 
 10. Return to step 1.
 

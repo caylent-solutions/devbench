@@ -167,3 +167,50 @@ class TestOrchestrateSkillStep1cScopeFilter:
         assert "exit cleanly" in content, (
             "SKILL.md Step 1c must instruct the orchestrator to exit cleanly when scope is exhausted"
         )
+
+
+@pytest.mark.unit
+class TestOrchestrateSkillDrainCheck:
+    """AC-188-4, AC-188-8, AC-188-9: SKILL must include a drain check between mark-done and loop-back."""
+
+    def test_skill_references_drain_status(self) -> None:
+        """AC-188-4: SKILL.md must invoke 'devbench drain --status' to detect a pending drain signal."""
+        content = SKILL_PATH.read_text()
+        assert "drain --status" in content, (
+            "SKILL.md must invoke `uv run devbench drain --status` in the drain check step "
+            "between mark-done (step 9) and loop-back (step 10)"
+        )
+
+    def test_skill_drain_check_appears_after_mark_done(self) -> None:
+        """AC-188-4: The drain check must appear after 'mark-done' and before 'Return to step 1'."""
+        content = SKILL_PATH.read_text()
+        mark_done_pos = content.find("mark-done")
+        drain_pos = content.find("drain --status")
+        loop_back_pos = content.find("Return to step 1")
+        assert mark_done_pos >= 0, "SKILL.md must reference mark-done"
+        assert drain_pos >= 0, "SKILL.md must reference drain --status"
+        assert loop_back_pos >= 0, "SKILL.md must reference 'Return to step 1'"
+        assert mark_done_pos < drain_pos < loop_back_pos, (
+            "drain --status check must appear AFTER mark-done and BEFORE 'Return to step 1' "
+            "so the orchestrator checks for a pending drain before restarting the loop"
+        )
+
+    def test_skill_drain_check_logs_orchestrator_drain_comment(self) -> None:
+        """AC-188-8: SKILL.md must instruct the orchestrator to log [ORCHESTRATOR_DRAIN] audit comment."""
+        content = SKILL_PATH.read_text()
+        assert "ORCHESTRATOR_DRAIN" in content, (
+            "SKILL.md drain check step must reference [ORCHESTRATOR_DRAIN] audit comment "
+            "so the orchestrator log records the cooperative drain event"
+        )
+
+    def test_skill_drain_check_exits_cleanly_on_pending(self) -> None:
+        """AC-188-4: SKILL.md must instruct exit with rc=0 when drain is pending."""
+        content = SKILL_PATH.read_text()
+        drain_pos = content.find("drain --status")
+        assert drain_pos >= 0, "SKILL.md must reference drain --status"
+        # The drain check section must mention exiting cleanly
+        drain_section = content[drain_pos : drain_pos + 500]
+        assert "exit" in drain_section.lower(), (
+            "SKILL.md drain check step must instruct the orchestrator to exit cleanly "
+            "when a drain is pending"
+        )

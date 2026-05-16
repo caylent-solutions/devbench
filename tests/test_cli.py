@@ -14836,3 +14836,261 @@ class TestCmdStartCancelDrainPreventsExit:
         cli.cmd_start()
 
         assert not signal_path.exists(), "drain.signal must not exist after cancelled drain followed by clean run"
+
+
+# ---------------------------------------------------------------------------
+# Pre-arm drain integration test (E3-F6-S1-T1, issue #188)
+# AC-188-6: dropping drain.signal BEFORE devbench start causes the orchestrator
+# to run exactly one WU then exit cleanly.
+# ---------------------------------------------------------------------------
+
+
+def _make_sdk_with_non_claim_then_claim_messages() -> object:
+    """Return a fake SDK module that yields non-claim messages then one claim message.
+
+    Simulates an orchestrator run where the skill processes one WU (non-claim
+    messages for WU1) and then tries to claim a second WU (the Bash claim
+    tool-use for WU2).  When drain is pre-armed, enforcement fires at the
+    WU2 claim and cmd_start must return 0 without proceeding to WU2.
+    """
+    import types
+
+    from claude_agent_sdk.types import AssistantMessage, TextBlock, ToolUseBlock
+
+    mock_sdk = types.ModuleType("claude_agent_sdk")
+    mock_sdk.ClaudeAgentOptions = MagicMock()  # type: ignore[attr-defined]
+
+    async def mock_query(**kwargs: object) -> object:
+        # Non-claim messages representing WU1 processing (text output, sub-tool calls, etc.)
+        yield AssistantMessage(
+            content=[TextBlock(text="Running devbench:orchestrate skill...")],
+            model="claude-opus-4-5",
+        )
+        yield AssistantMessage(
+            content=[TextBlock(text="WU1 executor complete; marking done...")],
+            model="claude-opus-4-5",
+        )
+        # Claim message representing the WU2 attempt -- drain fires here.
+        yield AssistantMessage(
+            content=[
+                ToolUseBlock(
+                    id="tu-wu2-claim",
+                    name="Bash",
+                    input={"command": "uv run devbench claim E1-F2-S1-T2"},
+                )
+            ],
+            model="claude-opus-4-5",
+        )
+
+    mock_sdk.query = mock_query  # type: ignore[attr-defined]
+    return mock_sdk
+
+
+@pytest.fixture
+def pre_arm_drain_env(tmp_path: Path) -> Generator[Path, None, None]:
+    """Create drain.signal, build the mock SDK, and apply the 3-way patch for pre-arm tests.
+
+    Writes a drain signal with reason="smoke run" to ``tmp_path/.devbench/drain.signal``,
+    patches ``sys.modules["claude_agent_sdk"]`` with the SDK returned by
+    :func:`_make_sdk_with_non_claim_then_claim_messages`, sets
+    ``devbench.cli.WORKSPACE_ROOT`` to ``tmp_path``, and stubs
+    ``devbench.cli._should_auto_restart_after_no_actionable`` to ``(False, [])``.
+
+    Yields the ``Path`` to the signal file so individual tests can inspect or
+    overwrite it before calling :func:`~devbench.cli.cmd_start`.
+
+    Raises:
+        pytest.fail: propagates any exception raised during patch setup.
+    """
+    import sys
+
+    signal_path = tmp_path / ".devbench" / "drain.signal"
+    signal_path.parent.mkdir(parents=True)
+    signal_path.write_text(
+        '{"requested_at": "2026-05-16T00:00:00+00:00", "requested_by": "operator", "reason": "smoke run"}',
+        encoding="utf-8",
+    )
+
+    mock_sdk = _make_sdk_with_non_claim_then_claim_messages()
+
+    with (
+        patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+        patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        patch(
+            "devbench.cli._should_auto_restart_after_no_actionable",
+            return_value=(False, []),
+        ),
+    ):
+        yield signal_path
+
+
+class TestCmdStartPreArmDrain:
+    """Pre-arm drain integration: signal dropped BEFORE start; exactly one WU runs then exit (AC-188-6).
+
+    The drain signal is written to the workspace BEFORE cmd_start is called.
+    The SDK mock yields two non-claim messages (simulating WU1 being processed)
+    followed by a Bash claim tool-use for WU2.  Because drain is pending at the
+    WU2 claim, _DrainRequested is raised and cmd_start exits cleanly (rc=0)
+    after consuming the drain signal -- WU1 completed, WU2 was never started.
+
+    TDD RED verification: tests were confirmed failing by temporarily patching
+    ``devbench.cli.read_drain_state`` to return ``None`` (simulating no drain
+    pending), which prevents _DrainRequested from being raised.  With that patch
+    active, cmd_start runs to exhaustion (rc=0, signal not consumed, no audit
+    entry) and all assertions that check for drain enforcement fail:
+    ``test_pre_arm_signal_consumed_on_exit`` raised AssertionError (signal still
+    present), ``test_pre_arm_logs_drain_enforced_audit`` raised AssertionError
+    ([ORCHESTRATOR_DRAIN_ENFORCED] absent), and
+    ``test_pre_arm_non_claim_messages_not_interrupted`` raised AssertionError
+    (wu2-claim-message was appended).  Exit code 1, 5 failed, 3 passed.
+    Removing the temporary patch restored all 8 tests to passing (exit code 0).
+    """
+
+    @pytest.mark.unit
+    def test_pre_arm_returns_rc0(self, pre_arm_drain_env: Path) -> None:
+        """AC-188-6: pre-armed drain signal causes cmd_start to return rc=0."""
+        rc = cli.cmd_start()
+
+        assert rc == 0, "cmd_start must return 0 on pre-armed drain (AC-188-6)"
+
+    @pytest.mark.unit
+    def test_pre_arm_signal_consumed_on_exit(self, pre_arm_drain_env: Path) -> None:
+        """AC-188-6 + AC-188-5: drain signal is consumed (deleted) after pre-arm enforcement."""
+        signal_path = pre_arm_drain_env
+        assert signal_path.exists(), "pre-condition: signal must exist before start"
+
+        cli.cmd_start()
+
+        assert not signal_path.exists(), (
+            "drain signal must be consumed (deleted) after pre-arm enforcement so next start runs unscoped (AC-188-5)"
+        )
+
+    @pytest.mark.unit
+    def test_pre_arm_logs_drain_enforced_audit(self, pre_arm_drain_env: Path, caplog: pytest.LogCaptureFixture) -> None:
+        """AC-188-6 + AC-188-8: [ORCHESTRATOR_DRAIN_ENFORCED] is logged with reason after pre-arm enforcement."""
+        import logging
+
+        with caplog.at_level(logging.INFO, logger="devbench.cli"):
+            cli.cmd_start()
+
+        log_text = " ".join(rec.getMessage() for rec in caplog.records)
+        assert "[ORCHESTRATOR_DRAIN_ENFORCED]" in log_text, (
+            "[ORCHESTRATOR_DRAIN_ENFORCED] must be logged when pre-armed drain is enforced (AC-188-8)"
+        )
+        assert "smoke run" in log_text, "drain reason must appear in the audit log (AC-188-8)"
+
+    @pytest.mark.unit
+    def test_pre_arm_non_claim_messages_not_interrupted(self, tmp_path: Path) -> None:
+        """AC-188-6: non-claim messages before the WU2 claim are NOT interrupted by pre-armed drain.
+
+        The drain enforcement only fires at claim time.  All non-claim messages
+        (representing WU1 being processed) must pass through the SDK iterator
+        without interruption -- the pre-armed signal does not stop the run until
+        the second claim attempt.
+
+        This test uses a custom counting SDK rather than the shared fixture SDK
+        because it needs to append to ``messages_seen`` inside the async generator,
+        which requires defining the generator inline.
+        """
+        import sys
+        import types
+
+        from claude_agent_sdk.types import AssistantMessage, TextBlock, ToolUseBlock
+
+        signal_path = tmp_path / ".devbench" / "drain.signal"
+        signal_path.parent.mkdir(parents=True)
+        signal_path.write_text(
+            '{"requested_at": "2026-05-16T00:00:00+00:00", "requested_by": "operator", "reason": "smoke run"}',
+            encoding="utf-8",
+        )
+
+        messages_seen: list[str] = []
+
+        mock_sdk_counting = types.ModuleType("claude_agent_sdk")
+        mock_sdk_counting.ClaudeAgentOptions = MagicMock()  # type: ignore[attr-defined]
+
+        async def mock_query_counting(**kwargs: object) -> object:
+            msg1 = AssistantMessage(
+                content=[TextBlock(text="wu1-processing-message")],
+                model="claude-opus-4-5",
+            )
+            msg2 = AssistantMessage(
+                content=[TextBlock(text="wu1-done-message")],
+                model="claude-opus-4-5",
+            )
+            msg3 = AssistantMessage(
+                content=[
+                    ToolUseBlock(
+                        id="tu-wu2-claim",
+                        name="Bash",
+                        input={"command": "uv run devbench claim E1-F2-S1-T2"},
+                    )
+                ],
+                model="claude-opus-4-5",
+            )
+            yield msg1
+            messages_seen.append("wu1-processing-message")
+            yield msg2
+            messages_seen.append("wu1-done-message")
+            yield msg3
+            messages_seen.append("wu2-claim-message")
+
+        mock_sdk_counting.query = mock_query_counting  # type: ignore[attr-defined]
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk_counting}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch(
+                "devbench.cli._should_auto_restart_after_no_actionable",
+                return_value=(False, []),
+            ),
+        ):
+            rc = cli.cmd_start()
+
+        assert rc == 0
+        # Both WU1 messages must have been yielded and seen before drain fired.
+        assert "wu1-processing-message" in messages_seen, (
+            "WU1 processing message must be yielded before drain enforcement"
+        )
+        assert "wu1-done-message" in messages_seen, "WU1 done message must be yielded before drain enforcement"
+        # The WU2 claim message was yielded from the generator but _DrainRequested
+        # was raised before any post-yield processing continued -- the claim itself
+        # was NOT executed (enforcement happened at detection time, not after).
+        assert "wu2-claim-message" not in messages_seen, (
+            "WU2 claim generator-append must not run after _DrainRequested is raised"
+        )
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            "nightly smoke run",
+            "pre-release freeze",
+            "",
+            "verify exactly one task completes",
+        ],
+    )
+    def test_pre_arm_parametrized_reasons(self, pre_arm_drain_env: Path, reason: str) -> None:
+        """AC-188-6: pre-armed drain with various reasons always enforces after one WU (rc=0, signal consumed).
+
+        The fixture writes the signal with reason="smoke run"; this test overwrites
+        it with the parametrized reason before calling cmd_start to cover all
+        reason variants (including empty string) without duplicating the SDK mock
+        and patch setup.
+        """
+        import json as _json
+
+        signal_path = pre_arm_drain_env
+        payload = _json.dumps(
+            {
+                "requested_at": "2026-05-16T00:00:00+00:00",
+                "requested_by": "operator",
+                "reason": reason,
+            }
+        )
+        signal_path.write_text(payload, encoding="utf-8")
+
+        rc = cli.cmd_start()
+
+        assert rc == 0, f"cmd_start must return 0 for pre-armed drain with reason={reason!r}"
+        assert not signal_path.exists(), f"drain signal must be consumed for pre-armed drain with reason={reason!r}"

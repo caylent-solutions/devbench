@@ -13522,3 +13522,435 @@ class TestCmdScope:
         assert result == 0
         out = capsys.readouterr().out
         assert "no scope pending" in out
+
+
+# ---------------------------------------------------------------------------
+# AC-196-5 through AC-196-10: Parametrised tests + scope-set round-trip
+# equivalence integration test (E2-F7-S1-T2, spec section 4.2.6.5)
+# ---------------------------------------------------------------------------
+
+
+class TestCmdScopeParametrised:
+    """Parametrised tests for cmd_scope covering the selector shapes specified
+    in the work-unit description and the round-trip-equivalence integration test
+    (AC-196-5, AC-196-6, AC-196-7, AC-196-8, AC-196-10).
+    """
+
+    # Backlog IDs used in all parametrised tests -- covers E1 through E5.
+    _BACKLOG_IDS: ClassVar[list[str]] = [
+        "E1-F1-S1-T1",
+        "E1-F1-S1-T2",
+        "E1-F2-S1-T1",
+        "E2-F1-S1-T1",
+        "E2-F1-S1-T2",
+        "E3-F1-S1-T1",
+        "E3-F1-S1-T2",
+        "E4-F1-S1-T1",
+        "E5-F1-S1-T1",
+    ]
+
+    def _scope_path(self, tmp_path: Path) -> Path:
+        """Return the canonical scope.json path under tmp_path."""
+        return tmp_path / ".devbench" / "scope.json"
+
+    def _session_scope_path(self, tmp_path: Path, session_name: str) -> Path:
+        """Return the per-session scope.json path."""
+        return tmp_path / ".devbench" / "sessions" / session_name / "scope.json"
+
+    def _make_parser_mock(self, backlog_ids: list[str]) -> MagicMock:
+        """Return a BacklogParser mock whose parse_index yields the supplied IDs."""
+        units = [MagicMock(id=wid) for wid in backlog_ids]
+        parser = MagicMock()
+        parser.parse_index.return_value = units
+        return parser
+
+    def _patch_scope_env(self, tmp_path: Path, backlog_ids: list[str] | None = None) -> Any:
+        """Patch WORKSPACE_ROOT, BACKLOG_ROOT, BACKLOG_INDEX, and BacklogParser."""
+        ids = backlog_ids if backlog_ids is not None else self._BACKLOG_IDS
+        parser_mock = self._make_parser_mock(ids)
+        return patch.multiple(
+            "devbench.cli",
+            WORKSPACE_ROOT=tmp_path,
+            BACKLOG_ROOT=tmp_path / "backlog",
+            BACKLOG_INDEX=tmp_path / "BACKLOG.md",
+            BacklogParser=MagicMock(return_value=parser_mock),
+        )
+
+    # ------------------------------------------------------------------
+    # AC-196-5: Parametrised selector shapes for scope set
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "include_str, exclude_str, expected_present, expected_absent",
+        [
+            # Single ID -- matches only the named task
+            (
+                "E1-F1-S1-T1",
+                "",
+                ["E1-F1-S1-T1"],
+                ["E1-F1-S1-T2", "E2-F1-S1-T1"],
+            ),
+            # Range E1-E3 -- matches all under E1, E2, E3; excludes E4 and E5
+            (
+                "E1-E3",
+                "",
+                ["E1-F1-S1-T1", "E2-F1-S1-T1", "E3-F1-S1-T1"],
+                ["E4-F1-S1-T1", "E5-F1-S1-T1"],
+            ),
+            # Range E1-E3 plus E5 (mixed comma-separated)
+            (
+                "E1-E3, E5",
+                "",
+                ["E1-F1-S1-T1", "E2-F1-S1-T1", "E3-F1-S1-T1", "E5-F1-S1-T1"],
+                ["E4-F1-S1-T1"],
+            ),
+            # Range E1-E3 with exclude E2-F1
+            (
+                "E1-E3",
+                "E2-F1",
+                ["E1-F1-S1-T1", "E3-F1-S1-T1"],
+                ["E2-F1-S1-T1", "E2-F1-S1-T2"],
+            ),
+        ],
+    )
+    def test_set_selector_shapes_parametrised(
+        self,
+        tmp_path: Path,
+        include_str: str,
+        exclude_str: str,
+        expected_present: list[str],
+        expected_absent: list[str],
+    ) -> None:
+        """scope set expands the specified selector shapes correctly (AC-196-5).
+
+        Covers single-ID, range, mixed comma-separated, and include+exclude combos
+        per spec section 4.2.6.5.
+        """
+        argv: list[str] = ["set", "--include", include_str]
+        if exclude_str:
+            argv += ["--exclude", exclude_str]
+
+        with self._patch_scope_env(tmp_path):
+            rc = cli.cmd_scope(*argv)
+
+        assert rc == 0, f"Expected exit 0 for include={include_str!r}, exclude={exclude_str!r}"
+        payload = json.loads(self._scope_path(tmp_path).read_text())
+        for wid in expected_present:
+            assert wid in payload["expanded_ids"], f"{wid} must be in expanded_ids"
+        for wid in expected_absent:
+            assert wid not in payload["expanded_ids"], f"{wid} must not be in expanded_ids"
+
+    # ------------------------------------------------------------------
+    # AC-196-5: Parametrised negative cases for set
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "bad_include",
+        [
+            "-E1",  # leading hyphen
+            "E1-",  # trailing hyphen
+            "-",  # bare hyphen
+            "E1--E3",  # consecutive hyphens
+        ],
+    )
+    def test_set_malformed_token_exits_1(
+        self,
+        tmp_path: Path,
+        bad_include: str,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """scope set with a malformed token exits rc=1 and emits stderr (AC-196-5).
+
+        Malformed tokens must be rejected fail-fast; scope.json must NOT be written.
+        Error message format matches cmd_start --include (no drift from ScopeFilter.parse).
+        """
+        with self._patch_scope_env(tmp_path):
+            rc = cli.cmd_scope("set", "--include", bad_include)
+
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert captured.err, "A stderr message must be emitted for malformed tokens"
+        assert not self._scope_path(tmp_path).exists(), "scope.json must NOT be created when the token is invalid"
+
+    # ------------------------------------------------------------------
+    # AC-196-5: Reverse range rejection
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "reverse_range",
+        [
+            "E3-E1",
+            "E1-F1-S1-T3-T1",
+        ],
+    )
+    def test_set_reverse_range_exits_1(
+        self,
+        tmp_path: Path,
+        reverse_range: str,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """scope set with a reverse range exits rc=1 with an error on stderr (AC-196-5)."""
+        with self._patch_scope_env(tmp_path):
+            rc = cli.cmd_scope("set", "--include", reverse_range)
+
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert captured.err, "A stderr message must be emitted for reverse ranges"
+        assert not self._scope_path(tmp_path).exists(), "scope.json must NOT be created for reverse-range tokens"
+
+    # ------------------------------------------------------------------
+    # AC-196-6: Unknown action verb exits rc=2 (parametrised)
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "bad_action",
+        [
+            "bogus",
+            "SET",  # case-sensitive mismatch
+            "reset",
+            "delete",
+            "",  # interpreted as action='' after empty argv
+        ],
+    )
+    def test_unknown_action_exits_2_parametrised(
+        self,
+        tmp_path: Path,
+        bad_action: str,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Unknown or misspelled action verbs exit rc=2 (AC-196-6).
+
+        The empty-string case is handled by passing no args, which also triggers
+        the missing-action branch (rc=2).
+        """
+        with self._patch_scope_env(tmp_path):
+            rc = cli.cmd_scope() if bad_action == "" else cli.cmd_scope(bad_action)
+
+        assert rc == 2
+        captured = capsys.readouterr()
+        assert captured.err, "A stderr message must be emitted for unknown actions"
+
+    # ------------------------------------------------------------------
+    # AC-196-7: clear / show -- expected output shapes (parametrised)
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "action, setup_file, expected_in_stdout",
+        [
+            # clear on missing file -> idempotent, "no scope pending"
+            ("clear", False, "no scope pending"),
+            # show on missing file -> "no scope pending"
+            ("show", False, "no scope pending"),
+        ],
+    )
+    def test_clear_show_no_file_parametrised(
+        self,
+        tmp_path: Path,
+        action: str,
+        setup_file: bool,
+        expected_in_stdout: str,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """scope clear and scope show both exit 0 with 'no scope pending' when absent (AC-196-7)."""
+        assert not setup_file, "This test variant does not create a scope.json upfront"
+        with self._patch_scope_env(tmp_path):
+            rc = cli.cmd_scope(action)
+
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert expected_in_stdout in captured.out
+
+    def test_show_active_scope_prints_fields(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """scope show prints include, exclude, expanded_ids count, started_at, and started_by (AC-196-7)."""
+        scope_path = self._scope_path(tmp_path)
+        scope_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "include": ["E1-E3"],
+            "exclude": ["E2-F1"],
+            "expanded_ids": ["E1-F1-S1-T1", "E3-F1-S1-T1"],
+            "started_at": "2026-05-16T10:00:00Z",
+            "started_by": "operator",
+        }
+        scope_path.write_text(json.dumps(payload))
+
+        with self._patch_scope_env(tmp_path):
+            rc = cli.cmd_scope("show")
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "E1-E3" in out
+        assert "E2-F1" in out
+        assert "2" in out  # expanded_ids count is 2
+        assert "2026-05-16" in out
+        assert "operator" in out
+
+    # ------------------------------------------------------------------
+    # AC-196-8: Per-session scope.json path (DEVBENCH_SESSION_NAME)
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize("session_name", ["foo", "my-session", "alpha"])
+    def test_set_writes_to_session_path(
+        self,
+        tmp_path: Path,
+        session_name: str,
+    ) -> None:
+        """scope set writes to sessions/<name>/scope.json when DEVBENCH_SESSION_NAME is set (AC-196-8)."""
+        with (
+            self._patch_scope_env(tmp_path),
+            patch.dict("os.environ", {"DEVBENCH_SESSION_NAME": session_name}, clear=False),
+        ):
+            rc = cli.cmd_scope("set", "--include", "E1-F1-S1-T1")
+
+        assert rc == 0
+        session_path = self._session_scope_path(tmp_path, session_name)
+        assert session_path.exists(), f"Session-scoped scope.json must exist at {session_path}"
+        payload = json.loads(session_path.read_text())
+        assert payload["include"] == ["E1-F1-S1-T1"]
+        # Canonical workspace-root scope.json must NOT be created
+        assert not self._scope_path(tmp_path).exists(), (
+            "Workspace-root scope.json must not exist when DEVBENCH_SESSION_NAME is set"
+        )
+
+    # ------------------------------------------------------------------
+    # AC-196-10: Round-trip equivalence integration test
+    # cmd_scope set + cmd_next == cmd_next --include (same candidate WU id)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_fixture_backlog(tmp_path: Path, unit_rows: list[tuple[str, str]]) -> Path:
+        """Build a real on-disk backlog fixture from (unit_id, status) rows.
+
+        Args:
+            tmp_path: The temporary workspace root.
+            unit_rows: List of (unit_id, status) tuples.  Supports statuses
+                ``in-queue`` and ``done``.
+
+        Returns:
+            Path to the written BACKLOG.md index file.
+        """
+        wu_dir = tmp_path / "backlog"
+        wu_dir.mkdir(exist_ok=True)
+        index_lines = [
+            "# Backlog\n",
+            "## Full Work Unit Index\n",
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |",
+            "|----|-------|------|--------|--------------|------|-----------|",
+        ]
+        for unit_id, status in unit_rows:
+            file_path = f"backlog/{unit_id}.md"
+            index_lines.append(
+                f"| {unit_id} | {unit_id} Task | Task | {status} | None | caylent-solutions/test-repo | `{file_path}` |"
+            )
+            wu_body = f"# {unit_id}: {unit_id} Task\n\n## Status: {status}\n\n## Description\n\nTest fixture.\n"
+            (wu_dir / f"{unit_id}.md").write_text(wu_body)
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text("\n".join(index_lines) + "\n")
+        return index_path
+
+    def test_scope_set_round_trip_cmd_next_equivalence(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """cmd_scope set + cmd_next honours scope.json identically to cmd_next --include (AC-196-10).
+
+        Integration test using a real on-disk backlog fixture:
+        1. Write scope via ``cmd_scope set --include "E2"``.
+        2. Call ``cmd_next`` (no flags) -- reads scope.json from workspace.
+        3. Call ``cmd_next --include "E2"`` (inline flags) -- bypasses scope.json.
+        4. Assert both calls returned the same candidate WU id.
+
+        This verifies the byte-identical scope.json claim from spec 4.2.6.5:
+        both pathways resolve through ``ScopeFilter.parse/from_file`` and produce
+        the same candidate list from ``BacklogParser.get_parallel_candidates``.
+        """
+        # Build a backlog with two in-queue tasks: one in E1, one in E2.
+        # Only the E2 task should be returned when scope is limited to E2.
+        unit_rows = [
+            ("E1-F1-S1-T1", "in-queue"),
+            ("E2-F1-S1-T1", "in-queue"),
+        ]
+        index_path = self._build_fixture_backlog(tmp_path, unit_rows)
+
+        # Step 1: Write scope via cmd_scope set
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index_path),
+        ):
+            set_rc = cli.cmd_scope("set", "--include", "E2")
+        assert set_rc == 0
+        assert self._scope_path(tmp_path).exists()
+        # Drain any stdout printed by cmd_scope set ("scope set: <path>") so
+        # the subsequent cmd_next capture is clean.
+        capsys.readouterr()
+
+        # Step 2: cmd_next with no flags -- reads from scope.json
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index_path),
+        ):
+            next_rc_from_file = cli.cmd_next()
+        assert next_rc_from_file == 0
+        out_from_file = capsys.readouterr().out.strip()
+
+        # Step 3: cmd_next --include "E2" -- inline flags, bypasses scope.json
+        # Remove scope.json so from_file path is not triggered accidentally
+        self._scope_path(tmp_path).unlink()
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index_path),
+        ):
+            next_rc_inline = cli.cmd_next("--include", "E2")
+        assert next_rc_inline == 0
+        out_inline = capsys.readouterr().out.strip()
+
+        # Step 4: Both outputs must be non-empty and contain the same candidate WU id
+        assert out_from_file, "cmd_next (scope.json) must print a candidate"
+        assert out_inline, "cmd_next --include must print a candidate"
+        id_from_file = json.loads(out_from_file)["id"]
+        id_inline = json.loads(out_inline)["id"]
+        assert id_from_file == id_inline, (
+            f"Round-trip equivalence failed: scope.json path returned {id_from_file!r} "
+            f"but --include flag path returned {id_inline!r}"
+        )
+        # Both must return the E2 task, not the E1 task
+        assert id_from_file == "E2-F1-S1-T1", f"Scope filter must select E2 task, got {id_from_file!r}"
+
+    def test_scope_set_round_trip_cmd_next_no_match_in_scope(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """cmd_next returns NO_ACTIONABLE_IN_SCOPE when scope.json excludes all candidates (AC-196-10).
+
+        Validates the zero-match scope case per spec 4.2.6 / AC-190-15:
+        when a scope is active but no candidates fall within it, cmd_next exits 0
+        and prints NO_ACTIONABLE_IN_SCOPE (not NO_ACTIONABLE).
+        """
+        unit_rows = [("E1-F1-S1-T1", "in-queue")]
+        index_path = self._build_fixture_backlog(tmp_path, unit_rows)
+
+        # Set scope to E2 -- no E2 tasks exist in the backlog
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index_path),
+        ):
+            set_rc = cli.cmd_scope("set", "--include", "E2")
+        assert set_rc == 0
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index_path),
+        ):
+            next_rc = cli.cmd_next()
+        assert next_rc == 0
+        assert "NO_ACTIONABLE_IN_SCOPE" in capsys.readouterr().out

@@ -793,3 +793,68 @@ def test_clear_with_explicit_path_idempotent_when_absent(tmp_path: Path) -> None
     custom_path = tmp_path / "sessions" / "gamma" / "scope.json"
     # Must not raise even though the path was never created
     ScopeFilter.clear(tmp_path, path=custom_path)
+
+
+# ---------------------------------------------------------------------------
+# Parametrised round-trip integration tests for cmd_scope selector shapes
+# (AC-196-5 spec section 4.2.6.5 -- E2-F7-S1-T2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "include_str, exclude_str, present_ids, absent_ids",
+    [
+        # Single ID: only that task is in scope
+        (
+            "E1-F1-S1-T1",
+            "",
+            ["E1-F1-S1-T1"],
+            ["E1-F1-S1-T2", "E2-F1-S1-T1"],
+        ),
+        # Range E1-E3 plus E5 (mixed comma-separated) -- covers AC-196-5 shape
+        (
+            "E1-E3, E5",
+            "",
+            ["E1-F1-S1-T1", "E2-F1-S1-T1", "E3-F1-S1-T1", "E5-F1-S1-T1"],
+            ["E4-F1-S1-T1"],
+        ),
+        # Range E1-E3 with exclude E2-F1 -- covers AC-196-5 include+exclude shape
+        (
+            "E1-E3",
+            "E2-F1",
+            ["E1-F1-S1-T1", "E3-F1-S1-T1"],
+            ["E2-F1-S1-T1", "E2-F1-S1-T2"],
+        ),
+    ],
+)
+def test_round_trip_selector_shapes(
+    tmp_path: Path,
+    backlog_ids: list[str],
+    include_str: str,
+    exclude_str: str,
+    present_ids: list[str],
+    absent_ids: list[str],
+) -> None:
+    """Parametrised round-trip: parse -> to_file -> from_file -> allows() for AC-196-5 shapes.
+
+    Verifies that the scope.json written by ScopeFilter.to_file() (same helper used
+    by cmd_scope set and cmd_start --include) round-trips correctly through
+    ScopeFilter.from_file(), preserving the expanded_ids set byte-for-byte.
+
+    Spec: section 4.2.6.5 -- Both pathways produce byte-identical scope.json files.
+    """
+    sf = ScopeFilter.parse(include_str, exclude_str, backlog_ids)
+    written_path = sf.to_file(tmp_path)
+    assert written_path.exists()
+
+    loaded = ScopeFilter.from_file(tmp_path)
+
+    assert loaded.include == sf.include
+    assert loaded.exclude == sf.exclude
+    assert loaded.expanded_ids == sf.expanded_ids
+
+    for wid in present_ids:
+        assert loaded.allows(wid), f"{wid} must be in scope after round-trip"
+    for wid in absent_ids:
+        assert not loaded.allows(wid), f"{wid} must not be in scope after round-trip"

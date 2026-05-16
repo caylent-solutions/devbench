@@ -14419,32 +14419,62 @@ class TestIsClaimToolUse:
         assert cli._is_claim_tool_use(msg) is False
 
 
+# ---------------------------------------------------------------------------
+# Shared helpers for drain-enforcement and cancel-drain test classes
+# ---------------------------------------------------------------------------
+
+
+def _make_sdk_with_claim_message() -> object:
+    """Return a fake SDK module that yields an AssistantMessage with a Bash claim tool use.
+
+    Shared by TestCmdStartDrainEnforcement and TestCmdStartCancelDrainPreventsExit.
+    """
+    import types
+
+    from claude_agent_sdk.types import AssistantMessage, ToolUseBlock
+
+    mock_sdk = types.ModuleType("claude_agent_sdk")
+    mock_sdk.ClaudeAgentOptions = MagicMock()  # type: ignore[attr-defined]
+
+    async def mock_query(**kwargs: object) -> object:
+        yield AssistantMessage(
+            content=[
+                ToolUseBlock(
+                    id="tu-claim",
+                    name="Bash",
+                    input={"command": "uv run devbench claim E1-F2-S1-T1"},
+                )
+            ],
+            model="claude-opus-4-5",
+        )
+
+    mock_sdk.query = mock_query  # type: ignore[attr-defined]
+    return mock_sdk
+
+
+@pytest.fixture
+def drain_cmd_start_patches(tmp_path: Path) -> Generator[None, None, None]:
+    """Patch sys.modules, WORKSPACE_ROOT, and _should_auto_restart for drain tests.
+
+    Yields after entering all patches so the test body runs inside them.
+    Shared by TestCmdStartDrainEnforcement and TestCmdStartCancelDrainPreventsExit.
+    """
+    import sys
+
+    mock_sdk = _make_sdk_with_claim_message()
+    with (
+        patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+        patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        patch(
+            "devbench.cli._should_auto_restart_after_no_actionable",
+            return_value=(False, []),
+        ),
+    ):
+        yield
+
+
 class TestCmdStartDrainEnforcement:
     """cmd_start raises _DrainRequested on claim-while-drain-pending and returns rc=0 (AC-188-4, AC-188-5, AC-188-8)."""
-
-    def _make_sdk_with_claim_message(self) -> object:
-        """Return a fake SDK module that yields an AssistantMessage with a Bash claim tool use."""
-        import types
-
-        from claude_agent_sdk.types import AssistantMessage, ToolUseBlock
-
-        mock_sdk = types.ModuleType("claude_agent_sdk")
-        mock_sdk.ClaudeAgentOptions = MagicMock()  # type: ignore[attr-defined]
-
-        async def mock_query(**kwargs: object) -> object:
-            yield AssistantMessage(
-                content=[
-                    ToolUseBlock(
-                        id="tu-claim",
-                        name="Bash",
-                        input={"command": "uv run devbench claim E1-F2-S1-T1"},
-                    )
-                ],
-                model="claude-opus-4-5",
-            )
-
-        mock_sdk.query = mock_query  # type: ignore[attr-defined]
-        return mock_sdk
 
     def _make_sdk_with_non_claim_messages(self) -> object:
         """Return a fake SDK module that yields only non-claim messages."""
@@ -14476,7 +14506,7 @@ class TestCmdStartDrainEnforcement:
             encoding="utf-8",
         )
 
-        mock_sdk = self._make_sdk_with_claim_message()
+        mock_sdk = _make_sdk_with_claim_message()
 
         with (
             patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
@@ -14507,7 +14537,7 @@ class TestCmdStartDrainEnforcement:
             encoding="utf-8",
         )
 
-        mock_sdk = self._make_sdk_with_claim_message()
+        mock_sdk = _make_sdk_with_claim_message()
 
         with (
             patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
@@ -14531,7 +14561,7 @@ class TestCmdStartDrainEnforcement:
         """When no drain signal is present, claim messages do not interrupt the SDK run."""
         import sys
 
-        mock_sdk = self._make_sdk_with_claim_message()
+        mock_sdk = _make_sdk_with_claim_message()
 
         with (
             patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
@@ -14591,7 +14621,7 @@ class TestCmdStartDrainEnforcement:
             encoding="utf-8",
         )
 
-        mock_sdk = self._make_sdk_with_claim_message()
+        mock_sdk = _make_sdk_with_claim_message()
 
         with (
             patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
@@ -14607,3 +14637,128 @@ class TestCmdStartDrainEnforcement:
         assert rc == 0
         log_text = " ".join(rec.getMessage() for rec in caplog.records)
         assert "[ORCHESTRATOR_DRAIN_ENFORCED]" in log_text
+
+
+# AC-188-10: cancel-drain mid-orchestrate prevents the exit (E3-F3-S1-T2, issue #188)
+# ---------------------------------------------------------------------------
+
+
+class TestCmdStartCancelDrainPreventsExit:
+    """Cancelling drain mid-orchestrate prevents the exit; orchestrator continues normally (AC-188-10).
+
+    RED verification: tests in this class assert [ORCHESTRATOR_DRAIN_ENFORCED] does NOT appear
+    in logs.  That assertion fails when cancel_drain is bypassed (drain signal remains present at
+    claim time), which means drain enforcement DOES occur and the audit marker IS logged.  Verified
+    by temporarily omitting the cancel_drain call: cmd_start logged [ORCHESTRATOR_DRAIN_ENFORCED]
+    and the "not in log_text" assertion raised AssertionError -- exit code 1, 1 failed, 0 passed.
+    """
+
+    @pytest.mark.unit
+    def test_cancelled_drain_before_claim_allows_normal_continuation(
+        self, drain_cmd_start_patches: None, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """AC-188-10: cancelled drain before claim -- orchestrator continues normally.
+
+        The drain signal is written, then removed via cancel_drain before the
+        SDK wrapper observes the claim message.  read_drain_state returns None
+        so no _DrainRequested is raised.  cmd_start must return 0 WITHOUT
+        emitting [ORCHESTRATOR_DRAIN_ENFORCED].
+        """
+        import logging
+
+        from devbench.drain import cancel_drain, request_drain
+
+        signal_path = tmp_path / ".devbench" / "drain.signal"
+
+        # Request then immediately cancel -- signal file is absent at claim time.
+        request_drain(tmp_path, reason="temporary pause")
+        assert signal_path.exists(), "pre-condition: signal must exist after request"
+        cancel_drain(tmp_path)
+        assert not signal_path.exists(), "pre-condition: signal must be absent after cancel"
+
+        with caplog.at_level(logging.INFO, logger="devbench.cli"):
+            rc = cli.cmd_start()
+
+        assert rc == 0, "cmd_start must return 0 when drain was cancelled before claim"
+        log_text = " ".join(rec.getMessage() for rec in caplog.records)
+        assert "[ORCHESTRATOR_DRAIN_ENFORCED]" not in log_text, (
+            "[ORCHESTRATOR_DRAIN_ENFORCED] must NOT appear when drain was cancelled before claim"
+        )
+        assert not signal_path.exists(), "no drain signal must remain after clean run"
+
+    @pytest.mark.unit
+    def test_drain_request_and_cancel_within_same_sdk_tick(
+        self, drain_cmd_start_patches: None, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """AC-188-10 edge case: drain requested AND cancelled within the same SDK tick.
+
+        Even if both operations occur atomically before the SDK iterator
+        advances to the claim message, the absence of the signal at poll time
+        means no drain enforcement.  cmd_start returns 0; no audit entry logged.
+        """
+        import logging
+
+        from devbench.drain import cancel_drain, request_drain
+
+        signal_path = tmp_path / ".devbench" / "drain.signal"
+
+        # Simulate same-tick: write then immediately delete.
+        request_drain(tmp_path, reason="same-tick cancel")
+        cancel_drain(tmp_path)
+        assert not signal_path.exists(), "pre-condition: signal absent after same-tick cancel"
+
+        with caplog.at_level(logging.INFO, logger="devbench.cli"):
+            rc = cli.cmd_start()
+
+        assert rc == 0, "cmd_start must return 0 when drain was cancelled in same tick"
+        log_text = " ".join(rec.getMessage() for rec in caplog.records)
+        assert "[ORCHESTRATOR_DRAIN_ENFORCED]" not in log_text, (
+            "[ORCHESTRATOR_DRAIN_ENFORCED] must NOT appear after same-tick cancel"
+        )
+
+    @pytest.mark.unit
+    def test_double_cancel_then_claim_proceeds_normally(
+        self, drain_cmd_start_patches: None, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """AC-188-10: multiple consecutive cancel calls followed by a claim -- orchestrator not interrupted.
+
+        cancel_drain is idempotent; two consecutive calls must not raise and must
+        leave the system in the no-drain state so the next claim proceeds normally.
+        """
+        import logging
+
+        from devbench.drain import cancel_drain, request_drain
+
+        signal_path = tmp_path / ".devbench" / "drain.signal"
+
+        request_drain(tmp_path, reason="multiple cancel test")
+        cancel_drain(tmp_path)
+        cancel_drain(tmp_path)  # second cancel must not raise
+        assert not signal_path.exists(), "pre-condition: signal absent after double cancel"
+
+        with caplog.at_level(logging.INFO, logger="devbench.cli"):
+            rc = cli.cmd_start()
+
+        assert rc == 0, "cmd_start must return 0 after double cancel"
+        log_text = " ".join(rec.getMessage() for rec in caplog.records)
+        assert "[ORCHESTRATOR_DRAIN_ENFORCED]" not in log_text, (
+            "[ORCHESTRATOR_DRAIN_ENFORCED] must NOT appear after double cancel"
+        )
+
+    @pytest.mark.unit
+    def test_cancelled_drain_leaves_no_signal_artifact(self, drain_cmd_start_patches: None, tmp_path: Path) -> None:
+        """AC-188-10: after cancel, no drain.signal artifact remains in .devbench/.
+
+        Verifies the filesystem is clean -- no stale file that could affect
+        the next orchestrator invocation.
+        """
+        from devbench.drain import cancel_drain, request_drain
+
+        signal_path = tmp_path / ".devbench" / "drain.signal"
+
+        request_drain(tmp_path, reason="artifact check")
+        cancel_drain(tmp_path)
+
+        cli.cmd_start()
+
+        assert not signal_path.exists(), "drain.signal must not exist after cancelled drain followed by clean run"

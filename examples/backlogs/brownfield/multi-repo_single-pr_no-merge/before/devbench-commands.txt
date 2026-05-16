@@ -10,7 +10,7 @@
 # the orchestrate skill's coordination calls. Per-agent work models live in
 # the `agents:` block of backlog/config/devbench.yaml (ADR-25); without an
 # `agents:` block every work agent runs on its plugin .md frontmatter
-# default: executor on sonnet, review-supervisor on haiku, and the five
+# default: executor on sonnet, review-supervisor on sonnet, and the five
 # judges + blocker-resolver + manifest-amender + task-factory on opus.
 
 

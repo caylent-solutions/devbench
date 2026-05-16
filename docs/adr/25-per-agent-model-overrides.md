@@ -17,8 +17,11 @@ model: sonnet
 ---
 ```
 
-Today nine of those agents are pinned to `sonnet`; `review-supervisor` is
-pinned to `haiku`. The top-level orchestrate skill inherits the SDK caller's
+Today every work agent is pinned to `sonnet` by frontmatter default (haiku
+was tried for `review-supervisor` and dropped: under load the SDK silently
+removed the Agent tool from haiku's tool list, breaking parallel review_team
+dispatch -- see CHANGELOG entry for the role-default refresh). The top-level
+orchestrate skill inherits the SDK caller's
 model (set by the launcher via `JUDGE_CLAUDE_MODEL`, typically opus). That
 caller-supplied model **only governs the orchestrate skill's own coordination
 calls**: every `Agent(...)` invocation that fires a work agent uses the
@@ -58,9 +61,27 @@ agent plays:
   fire only on unhappy paths, so cost is bounded; a wrong proposal /
   wrong amendment decision / poor draft creates downstream cascade cost
   larger than the inference savings.
-* `review_supervisor` on `haiku` -- pure fan-out coordinator that spawns
-  the five judges in parallel and merges their JSON verdicts. Opus here
+* `review_supervisor` on `sonnet` -- fan-out coordinator that spawns
+  the five judges in parallel and merges their JSON verdicts. Haiku was
+  tried and dropped: under load the SDK silently removed the Agent tool
+  from haiku's tool list, breaking parallel review_team dispatch. Opus here
   would be waste.
+
+### Haiku is strongly discouraged for every work agent
+
+Empirical observation in this codebase: when `review_supervisor` was pinned to
+`haiku`, the Claude Agent SDK was repeatedly observed to drop the `Agent` tool
+from the running session's tool list mid-orchestration, leaving the agent
+unable to dispatch sub-agents and forcing the orchestrator to classify the
+work-unit as `RUNTIME_DEGRADATION` (issue #183 follow-up). The same risk
+applies to every other work agent that uses the `Agent` tool or any
+multi-tool-call pattern (executor, blocker-resolver, manifest-amender,
+task-factory, the five judges). **Do not pin any work agent to `haiku` in the
+`agents:` block.** Stick with the frontmatter defaults (`sonnet` or `opus`),
+or override deliberately to a different mid-tier / large model when cost
+shaping is needed. The constants module still accepts `haiku` as a valid
+short-name (`ALLOWED_AGENT_MODEL_SHORT_NAMES`) so an operator can experiment,
+but the documented role defaults explicitly avoid it.
 
 The block as written is a no-op; flip individual fields when quota
 pressure makes the default untenable (e.g., drop the judges to `sonnet`
@@ -73,7 +94,7 @@ agents:
   manifest_amender: opus
   security_reviewer: opus
   task_factory: opus
-  review_supervisor: haiku
+  review_supervisor: sonnet
   review_team:
     code_reviewer: opus
     test_reviewer: opus

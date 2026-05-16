@@ -285,7 +285,7 @@ agents:                              # ADR-25: per-agent model overrides
   #   - blocker-resolver, manifest-amender, task-factory (workflow /
   #     recovery): opus -- judgment-heavy and fire only on unhappy
   #     paths, so cost is bounded.
-  #   - review-supervisor: haiku -- pure fan-out coordinator.
+  #   - review-supervisor: sonnet -- fan-out coordinator (Agent-tool reliability).
   # Writing the same value as the frontmatter default is a no-op; flip an
   # individual field when your per-model quota is uneven (e.g. sonnet left,
   # opus exhausted). Omit the agents: block entirely (or set a field to
@@ -299,7 +299,7 @@ agents:                              # ADR-25: per-agent model overrides
   manifest_amender: opus
   security_reviewer: opus
   task_factory: opus
-  review_supervisor: haiku
+  review_supervisor: sonnet
   review_team:
     code_reviewer: opus
     test_reviewer: opus

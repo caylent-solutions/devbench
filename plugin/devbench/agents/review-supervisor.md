@@ -1,7 +1,7 @@
 ---
 name: review-supervisor
 description: Discovers and invokes all review_team agents in parallel, aggregates verdicts, returns consolidated pass/fail. Invoke with a work unit ID (e.g. E0-F1-S1-T1).
-model: haiku
+model: sonnet
 tools: Bash, Agent(code-reviewer, test-reviewer, doc-reviewer, changes-manifest)
 ---
 

@@ -183,7 +183,9 @@ Ensure `JUDGE_BEDROCK_REGION` matches the region where you have Bedrock model ac
 
 DevBench's ten work agents (executor, blocker-resolver, manifest-amender, security-reviewer, task-factory, review-supervisor, plus the four review_team judges) each declare a default model in their `.md` frontmatter. Operators whose per-model quota is uneven -- e.g. opus tokens left, sonnet exhausted, or vice versa -- can retarget any subset of agents to a different model without editing the canonical plugin. See [ADR-25](adr/25-per-agent-model-overrides.md) for the architectural details.
 
-Add an `agents:` block to `backlog/config/devbench.yaml`. The shape below pins each agent to its **current frontmatter default**: `executor` on `sonnet` (writes code under TDD; fast happy path); the five judges plus the three workflow-reasoning agents (`blocker_resolver`, `manifest_amender`, `task_factory`) on `opus` (judgment work where wrong calls cost more than inference); `review_supervisor` on `haiku` (pure fan-out coordinator). The block as written is a no-op; flip individual fields when you need to retarget (e.g., drop the judges to `sonnet` when opus quota is exhausted):
+> **Do not pin any work agent to `haiku`.** Empirical observation in this codebase: under load the Claude Agent SDK was repeatedly observed to silently drop the `Agent` tool (and other multi-call tools) from haiku's tool list mid-orchestration, breaking parallel sub-agent dispatch and forcing the orchestrator to classify work-units as `RUNTIME_DEGRADATION` (issue #183 follow-up). Sonnet is the minimum recommended for every work agent. The short-name `haiku` is still accepted by the parser so operators can experiment, but every documented role default avoids it.
+
+Add an `agents:` block to `backlog/config/devbench.yaml`. The shape below pins each agent to its **current frontmatter default**: `executor` on `sonnet` (writes code under TDD; fast happy path); the five judges plus the three workflow-reasoning agents (`blocker_resolver`, `manifest_amender`, `task_factory`) on `opus` (judgment work where wrong calls cost more than inference); `review_supervisor` on `sonnet` (fan-out coordinator -- haiku was tried and dropped because the SDK was observed to silently remove the Agent tool from haiku's tool list under load). The block as written is a no-op; flip individual fields when you need to retarget (e.g., drop the judges to `sonnet` when opus quota is exhausted):
 
 ```yaml
 agents:
@@ -192,7 +194,7 @@ agents:
   manifest_amender: opus
   security_reviewer: opus
   task_factory: opus
-  review_supervisor: haiku
+  review_supervisor: sonnet
   review_team:
     code_reviewer: opus
     test_reviewer: opus

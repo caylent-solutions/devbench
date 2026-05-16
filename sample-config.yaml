@@ -285,6 +285,14 @@ validate:
 # When use_bedrock: true, values must be full Bedrock ARNs
 # ("us.anthropic.claude-opus-4-7-v1"). Mismatches fail fast at config-load.
 #
+# DO NOT PIN ANY WORK AGENT TO HAIKU. Empirical observation in this codebase:
+# under load the Claude Agent SDK was observed to silently drop the Agent
+# tool from haiku's tool list mid-orchestration, breaking parallel sub-agent
+# dispatch and forcing the orchestrator to classify work units as
+# RUNTIME_DEGRADATION. Sonnet is the minimum recommended for every work
+# agent. The short-name "haiku" is still parsed (you can experiment) but
+# every role default below avoids it.
+#
 # JUDGE_AGENT_MODEL_<NAME> env vars override this block per-call
 # (precedence: env > yaml > frontmatter). See:
 #   docs/adr/25-per-agent-model-overrides.md
@@ -301,9 +309,11 @@ validate:
 #   - blocker-resolver, manifest-amender, task-factory (workflow /
 #     recovery reasoning): opus -- judgment-heavy and fire only on the
 #     unhappy paths, so cost is bounded.
-#   - review-supervisor: haiku -- pure fan-out coordinator (spawns the
-#     five judges in parallel and merges their JSON verdicts); opus here
-#     would be waste.
+#   - review-supervisor: sonnet -- fan-out coordinator (spawns the
+#     five judges in parallel and merges their JSON verdicts). Haiku was
+#     tried and dropped: under load the SDK was observed to silently
+#     remove the Agent tool from haiku's tool list, breaking parallel
+#     review_team dispatch. Opus here would be waste.
 # Uncomment + edit individual fields to retarget; absent fields stay at
 # their frontmatter default. Writing the same value as the frontmatter
 # default is a no-op.
@@ -313,7 +323,7 @@ validate:
 #   manifest_amender: opus
 #   security_reviewer: opus
 #   task_factory: opus
-#   review_supervisor: haiku
+#   review_supervisor: sonnet
 #   review_team:
 #     code_reviewer: opus
 #     test_reviewer: opus

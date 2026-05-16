@@ -373,7 +373,7 @@ claude --plugin-dir "$(uv run devbench prepare-plugin-shadow)"
 
 When the workspace has no `agents:` overrides configured, prints the canonical plugin path; otherwise rewrites every overridden agent `.md` and symlinks the rest. Shares its implementation with `start`'s pre-flight so the two modes always produce identical plugin trees.
 
-The YAML schema for the override block is shown below with each field set to the **current frontmatter default**. The defaults are tuned by the role each agent plays: `executor` (writes code under TDD) on `sonnet` for a fast happy path; the five judges (`code-reviewer`, `test-reviewer`, `doc-reviewer`, `changes-manifest`, `security-reviewer`) on `opus` because a bad verdict costs more than the inference savings; `blocker-resolver`, `manifest-amender`, `task-factory` on `opus` because they fire only on unhappy paths and a wrong call spins the recovery cascade; `review-supervisor` on `haiku` because it is a pure fan-out coordinator. Setting a field to its frontmatter default value is a no-op; flip individual fields when you need to retarget an agent (e.g., drop the judges to `sonnet` when opus quota is exhausted):
+The YAML schema for the override block is shown below with each field set to the **current frontmatter default**. The defaults are tuned by the role each agent plays: `executor` (writes code under TDD) on `sonnet` for a fast happy path; the five judges (`code-reviewer`, `test-reviewer`, `doc-reviewer`, `changes-manifest`, `security-reviewer`) on `opus` because a bad verdict costs more than the inference savings; `blocker-resolver`, `manifest-amender`, `task-factory` on `opus` because they fire only on unhappy paths and a wrong call spins the recovery cascade; `review-supervisor` on `sonnet` because the Agent tool used to fan out to the four reviewers needs the reliability of a mid-tier model (haiku was tried and dropped: the SDK silently removed the Agent tool from haiku's tool list under load, breaking parallel review_team dispatch). Setting a field to its frontmatter default value is a no-op; flip individual fields when you need to retarget an agent (e.g., drop the judges to `sonnet` when opus quota is exhausted):
 
 ```yaml
 agents:
@@ -382,7 +382,7 @@ agents:
   manifest_amender: opus
   security_reviewer: opus
   task_factory: opus
-  review_supervisor: haiku
+  review_supervisor: sonnet
   review_team:
     code_reviewer: opus
     test_reviewer: opus

@@ -259,6 +259,23 @@ since the last release. PR #119 carries every change.
   circuit-breaker quiet window (e.g., a 180s window tolerates a
   3-minute terraform-apply quiet stretch without flashing STOPPED).
 
+### Changed (model defaults)
+
+- **`review-supervisor` frontmatter default is now `sonnet`** (was `haiku`).
+  Empirical observation in the self-improve workspace: under load the
+  Claude Agent SDK was repeatedly observed to silently drop the `Agent`
+  tool from haiku's tool list mid-orchestration, leaving review-supervisor
+  unable to dispatch the four review_team judges and forcing the
+  orchestrator to classify the work-unit as `RUNTIME_DEGRADATION` (issue
+  #183 follow-up). Promoting to `sonnet` closes the failure mode without
+  the cost of `opus` (this is still pure fan-out coordination, not
+  judgment-heavy work). ADR-25, the sample config, `docs/cli-reference.md`,
+  `docs/zero-to-ready.md`, `docs/llm-authentication.md`, and the
+  brownfield example launcher all updated to reflect the new default and
+  to warn operators against pinning ANY work agent to `haiku`. The short
+  name `haiku` is still accepted by the YAML parser so operators can
+  experiment, but every documented role default avoids it.
+
 ### Fixed
 
 - **`devbench report` / `watch` no longer crash on transient WU md

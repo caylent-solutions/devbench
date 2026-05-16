@@ -14292,3 +14292,318 @@ class TestCmdDrainIntegration:
         signal = tmp_path / ".devbench" / "drain.signal"
         data = _json.loads(signal.read_text())
         assert data["reason"] == "second"
+
+
+# ---------------------------------------------------------------------------
+# _DrainRequested sentinel + cmd_start drain check (E3-F3-S1-T1, issue #188)
+# AC-188-4, AC-188-5, AC-188-8
+# ---------------------------------------------------------------------------
+
+
+class TestDrainRequestedSentinel:
+    """_DrainRequested is a module-level exception class in cli.py (AC-188-4)."""
+
+    @pytest.mark.unit
+    def test_drain_requested_is_exception_subclass(self) -> None:
+        """_DrainRequested must be a BaseException subclass."""
+        assert issubclass(cli._DrainRequested, BaseException)
+
+    @pytest.mark.unit
+    def test_drain_requested_can_be_raised_and_caught(self) -> None:
+        """_DrainRequested can be raised and caught as BaseException."""
+        with pytest.raises(cli._DrainRequested):
+            raise cli._DrainRequested("test reason")
+
+    @pytest.mark.unit
+    def test_drain_requested_carries_reason(self) -> None:
+        """_DrainRequested preserves the reason string as its first arg."""
+        exc = cli._DrainRequested("operator stop")
+        assert "operator stop" in str(exc)
+
+
+class TestIsClaimToolUse:
+    """_is_claim_tool_use detects Bash tool messages containing devbench claim."""
+
+    @pytest.mark.unit
+    def test_bash_claim_command_detected(self) -> None:
+        """AssistantMessage with Bash ToolUseBlock running 'devbench claim' returns True."""
+        from claude_agent_sdk.types import AssistantMessage, ToolUseBlock
+
+        msg = AssistantMessage(
+            content=[
+                ToolUseBlock(
+                    id="tu-1",
+                    name="Bash",
+                    input={"command": "uv run devbench claim E1-F2-S1-T1"},
+                )
+            ],
+            model="claude-opus-4-5",
+        )
+        assert cli._is_claim_tool_use(msg) is True
+
+    @pytest.mark.unit
+    def test_bash_non_claim_command_not_detected(self) -> None:
+        """Bash ToolUseBlock with unrelated command returns False."""
+        from claude_agent_sdk.types import AssistantMessage, ToolUseBlock
+
+        msg = AssistantMessage(
+            content=[
+                ToolUseBlock(
+                    id="tu-2",
+                    name="Bash",
+                    input={"command": "uv run devbench next"},
+                )
+            ],
+            model="claude-opus-4-5",
+        )
+        assert cli._is_claim_tool_use(msg) is False
+
+    @pytest.mark.unit
+    def test_non_assistant_message_returns_false(self) -> None:
+        """Non-AssistantMessage objects (e.g., ResultMessage) return False."""
+        from claude_agent_sdk.types import ResultMessage
+
+        msg = ResultMessage(
+            subtype="success",
+            session_id="sid-1",
+            duration_ms=100,
+            duration_api_ms=80,
+            is_error=False,
+            num_turns=1,
+        )
+        assert cli._is_claim_tool_use(msg) is False
+
+    @pytest.mark.unit
+    def test_assistant_message_with_no_tool_use_returns_false(self) -> None:
+        """AssistantMessage with only TextBlocks (no ToolUseBlock) returns False."""
+        from claude_agent_sdk.types import AssistantMessage, TextBlock
+
+        msg = AssistantMessage(
+            content=[TextBlock(text="Claiming the next task now...")],
+            model="claude-opus-4-5",
+        )
+        assert cli._is_claim_tool_use(msg) is False
+
+    @pytest.mark.unit
+    def test_bash_claim_without_devbench_prefix_not_detected(self) -> None:
+        """Bash command containing 'claim' but not 'devbench claim' returns False."""
+        from claude_agent_sdk.types import AssistantMessage, ToolUseBlock
+
+        msg = AssistantMessage(
+            content=[
+                ToolUseBlock(
+                    id="tu-3",
+                    name="Bash",
+                    input={"command": "git claim-something"},
+                )
+            ],
+            model="claude-opus-4-5",
+        )
+        assert cli._is_claim_tool_use(msg) is False
+
+    @pytest.mark.unit
+    def test_bash_tool_use_with_no_command_key_returns_false(self) -> None:
+        """Bash ToolUseBlock with empty input dict returns False."""
+        from claude_agent_sdk.types import AssistantMessage, ToolUseBlock
+
+        msg = AssistantMessage(
+            content=[
+                ToolUseBlock(
+                    id="tu-4",
+                    name="Bash",
+                    input={},
+                )
+            ],
+            model="claude-opus-4-5",
+        )
+        assert cli._is_claim_tool_use(msg) is False
+
+
+class TestCmdStartDrainEnforcement:
+    """cmd_start raises _DrainRequested on claim-while-drain-pending and returns rc=0 (AC-188-4, AC-188-5, AC-188-8)."""
+
+    def _make_sdk_with_claim_message(self) -> object:
+        """Return a fake SDK module that yields an AssistantMessage with a Bash claim tool use."""
+        import types
+
+        from claude_agent_sdk.types import AssistantMessage, ToolUseBlock
+
+        mock_sdk = types.ModuleType("claude_agent_sdk")
+        mock_sdk.ClaudeAgentOptions = MagicMock()  # type: ignore[attr-defined]
+
+        async def mock_query(**kwargs: object) -> object:
+            yield AssistantMessage(
+                content=[
+                    ToolUseBlock(
+                        id="tu-claim",
+                        name="Bash",
+                        input={"command": "uv run devbench claim E1-F2-S1-T1"},
+                    )
+                ],
+                model="claude-opus-4-5",
+            )
+
+        mock_sdk.query = mock_query  # type: ignore[attr-defined]
+        return mock_sdk
+
+    def _make_sdk_with_non_claim_messages(self) -> object:
+        """Return a fake SDK module that yields only non-claim messages."""
+        import types
+
+        mock_sdk = types.ModuleType("claude_agent_sdk")
+        mock_sdk.ClaudeAgentOptions = MagicMock()  # type: ignore[attr-defined]
+
+        async def mock_query(**kwargs: object) -> object:
+            yield "plain string message"
+
+        mock_sdk.query = mock_query  # type: ignore[attr-defined]
+        return mock_sdk
+
+    @pytest.mark.unit
+    def test_claim_while_drain_pending_returns_rc0(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        """AC-188-4/AC-188-5: when drain is pending and claim is observed, cmd_start returns 0.
+
+        The drain sentinel must be consumed (deleted) on exit so the next
+        devbench start runs unscoped (AC-188-5).
+        """
+        import logging
+        import sys
+
+        signal_path = tmp_path / ".devbench" / "drain.signal"
+        signal_path.parent.mkdir(parents=True)
+        signal_path.write_text(
+            '{"requested_at": "2026-05-16T00:00:00+00:00", "requested_by": "operator", "reason": "freeze"}',
+            encoding="utf-8",
+        )
+
+        mock_sdk = self._make_sdk_with_claim_message()
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch(
+                "devbench.cli._should_auto_restart_after_no_actionable",
+                return_value=(False, []),
+            ),
+            caplog.at_level(logging.INFO, logger="devbench.cli"),
+        ):
+            rc = cli.cmd_start()
+
+        assert rc == 0
+        assert not signal_path.exists(), "drain signal must be consumed (deleted) after enforcement (AC-188-5)"
+
+    @pytest.mark.unit
+    def test_claim_while_drain_pending_logs_enforced_audit(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """AC-188-8: cmd_start logs [ORCHESTRATOR_DRAIN_ENFORCED] with reason when drain is enforced."""
+        import logging
+        import sys
+
+        signal_path = tmp_path / ".devbench" / "drain.signal"
+        signal_path.parent.mkdir(parents=True)
+        signal_path.write_text(
+            '{"requested_at": "2026-05-16T00:00:00+00:00", "requested_by": "operator", "reason": "pre-release freeze"}',
+            encoding="utf-8",
+        )
+
+        mock_sdk = self._make_sdk_with_claim_message()
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch(
+                "devbench.cli._should_auto_restart_after_no_actionable",
+                return_value=(False, []),
+            ),
+            caplog.at_level(logging.INFO, logger="devbench.cli"),
+        ):
+            cli.cmd_start()
+
+        log_text = " ".join(rec.getMessage() for rec in caplog.records)
+        assert "[ORCHESTRATOR_DRAIN_ENFORCED]" in log_text, (
+            "log must contain [ORCHESTRATOR_DRAIN_ENFORCED] audit marker (AC-188-8)"
+        )
+        assert "pre-release freeze" in log_text, "drain reason must appear in the audit log (AC-188-8)"
+
+    @pytest.mark.unit
+    def test_no_drain_signal_allows_claim_to_proceed_normally(self, tmp_path: Path) -> None:
+        """When no drain signal is present, claim messages do not interrupt the SDK run."""
+        import sys
+
+        mock_sdk = self._make_sdk_with_claim_message()
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch(
+                "devbench.cli._should_auto_restart_after_no_actionable",
+                return_value=(False, []),
+            ),
+        ):
+            rc = cli.cmd_start()
+
+        assert rc == 0
+        assert not (tmp_path / ".devbench" / "drain.signal").exists()
+
+    @pytest.mark.unit
+    def test_drain_signal_without_claim_does_not_interrupt(self, tmp_path: Path) -> None:
+        """Drain signal present but no claim message -- SDK run completes normally, rc=0.
+
+        The drain polling only interrupts on a claim attempt; non-claim
+        messages do not trigger enforcement.
+        """
+        import sys
+
+        signal_path = tmp_path / ".devbench" / "drain.signal"
+        signal_path.parent.mkdir(parents=True)
+        signal_path.write_text(
+            '{"requested_at": "2026-05-16T00:00:00+00:00", "requested_by": "operator", "reason": ""}',
+            encoding="utf-8",
+        )
+
+        mock_sdk = self._make_sdk_with_non_claim_messages()
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch(
+                "devbench.cli._should_auto_restart_after_no_actionable",
+                return_value=(False, []),
+            ),
+        ):
+            rc = cli.cmd_start()
+
+        assert rc == 0
+        # drain signal NOT consumed because no claim was intercepted
+        assert signal_path.exists(), "drain signal must NOT be consumed if no claim was intercepted"
+
+    @pytest.mark.unit
+    def test_drain_enforced_with_empty_reason(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        """[ORCHESTRATOR_DRAIN_ENFORCED] is logged even when reason is empty string."""
+        import logging
+        import sys
+
+        signal_path = tmp_path / ".devbench" / "drain.signal"
+        signal_path.parent.mkdir(parents=True)
+        signal_path.write_text(
+            '{"requested_at": "2026-05-16T00:00:00+00:00", "requested_by": "operator", "reason": ""}',
+            encoding="utf-8",
+        )
+
+        mock_sdk = self._make_sdk_with_claim_message()
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch(
+                "devbench.cli._should_auto_restart_after_no_actionable",
+                return_value=(False, []),
+            ),
+            caplog.at_level(logging.INFO, logger="devbench.cli"),
+        ):
+            rc = cli.cmd_start()
+
+        assert rc == 0
+        log_text = " ".join(rec.getMessage() for rec in caplog.records)
+        assert "[ORCHESTRATOR_DRAIN_ENFORCED]" in log_text

@@ -173,7 +173,7 @@ from devbench.constants import (
     STATUS_SEPARATOR_WIDTH,
     VALID_TDD_PHASES,
 )
-from devbench.drain import cancel_drain, read_drain_state, request_drain
+from devbench.drain import cancel_drain, consume_drain, read_drain_state, request_drain
 from devbench.log_setup import setup_logging
 from devbench.plugin_shadow import (
     materialise_shadow_plugin,
@@ -4852,6 +4852,83 @@ def _should_auto_restart_after_no_actionable() -> tuple[bool, list[str]]:
     return True, runtime_degraded
 
 
+# ---------------------------------------------------------------------------
+# Drain-enforcement sentinel (spec section 4.3.3, AC-188-4/5/8)
+# ---------------------------------------------------------------------------
+
+#: Audit-log prefix written to the orchestrator log when cmd_start intercepts
+#: a cmd_claim attempt while a drain signal is pending.  Format:
+#: ``[ORCHESTRATOR_DRAIN_ENFORCED] reason=<text-or-none>``.
+_ORCHESTRATOR_DRAIN_ENFORCED_AUDIT_PREFIX: str = "[ORCHESTRATOR_DRAIN_ENFORCED] reason="
+
+
+class _DrainRequested(BaseException):
+    """Sentinel raised inside ``cmd_start._run`` when a drain is pending at claim time.
+
+    Raised as a :class:`BaseException` subclass (not :class:`Exception`) so that
+    ``asyncio.run`` propagates it through the event loop without it being caught
+    by broad ``except Exception`` handlers.  ``cmd_start`` catches it outside
+    ``asyncio.run`` to:
+
+    1. Consume the drain signal via :func:`~devbench.drain.consume_drain`.
+    2. Write a ``[ORCHESTRATOR_DRAIN_ENFORCED]`` audit entry to the orchestrator log.
+    3. Return ``rc=0`` to the caller.
+
+    Args:
+        reason: The ``reason`` field from the :class:`~devbench.drain.DrainState`
+            that triggered the drain.
+
+    Raises:
+        Nothing -- this class is only ever raised, never caught internally.
+    """
+
+    def __init__(self, reason: str = "") -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _is_claim_tool_use(message: object) -> bool:
+    """Return ``True`` when *message* is an SDK message containing a Bash claim tool use.
+
+    Specifically, returns ``True`` when *message* has a ``content`` attribute
+    that is a list containing at least one object with ``name == "Bash"`` and
+    an ``input`` dict whose ``command`` value contains ``"devbench claim"``.
+
+    This is the SDK-layer heuristic used by ``cmd_start._run`` to detect when
+    the orchestrator agent is about to attempt a work-unit claim.  Combined with
+    a pending drain signal, this triggers the ``_DrainRequested`` sentinel to
+    cancel the asyncio loop cleanly (spec section 4.3.3).
+
+    Uses duck-typed attribute access so that both real
+    :class:`~claude_agent_sdk.types.AssistantMessage` instances and test doubles
+    are supported without a hard import of ``claude_agent_sdk.types``.
+
+    Args:
+        message: Any object emitted by the :func:`claude_agent_sdk.query` async
+            generator.  Objects without a ``content`` list attribute always
+            return ``False``.
+
+    Returns:
+        ``True`` if *message* is a Bash claim tool use; ``False`` otherwise.
+
+    Raises:
+        Nothing -- all attribute/type mismatches are handled gracefully.
+    """
+    content = getattr(message, "content", None)
+    if not isinstance(content, list):
+        return False
+    for block in content:
+        if getattr(block, "name", None) != "Bash":
+            continue
+        block_input = getattr(block, "input", None)
+        if not isinstance(block_input, dict):
+            continue
+        command = block_input.get("command", "")
+        if isinstance(command, str) and "devbench claim" in command:
+            return True
+    return False
+
+
 @dataclass(frozen=True)
 class _CmdStartArgs:
     """Parsed arguments for ``cmd_start``.
@@ -4943,6 +5020,13 @@ def cmd_start(*argv: str) -> int:
     ``make start`` loop interprets that code as "auto-restart" up to its
     ``DEVBENCH_MAX_AUTO_RESTARTS`` cap. Any other exit returns 0.
 
+    **Drain enforcement (spec section 4.3.3, AC-188-4/5/8):** Between SDK
+    messages, the inner ``_run`` coroutine checks whether a ``devbench claim``
+    Bash tool-use is being requested.  When one is detected AND the drain
+    signal file is present, ``_run`` raises :class:`_DrainRequested`.
+    ``cmd_start`` catches this sentinel, consumes the drain marker, logs a
+    ``[ORCHESTRATOR_DRAIN_ENFORCED]`` audit entry, and returns 0.
+
     Equivalent to running ``claude --plugin-dir <plugin>`` and invoking
     the orchestrate skill interactively, but suitable for CI/unattended runs.
 
@@ -4950,12 +5034,14 @@ def cmd_start(*argv: str) -> int:
         *argv: Optional flags (``--include``, ``--exclude``).
 
     Returns:
-        0 on success, 1 on argument-parse error or invalid scope token,
+        0 on success (including drain-enforced stop), 1 on argument-parse
+        error or invalid scope token,
         :data:`ORCHESTRATOR_RESTART_EXIT_CODE` (42) when auto-restart is triggered.
 
     Raises:
         Nothing from this function's own scope -- all SDK exceptions propagate
-        as-is through the asyncio boundary.
+        as-is through the asyncio boundary; :class:`_DrainRequested` is
+        caught here and handled as a clean exit.
     """
     import asyncio
 
@@ -4991,6 +5077,19 @@ def cmd_start(*argv: str) -> int:
         write_pid_sentinel(WORKSPACE_ROOT, os.getpid())
 
     async def _run() -> None:
+        """Iterate SDK messages; raise _DrainRequested when claim-while-drain-pending.
+
+        Between each SDK message, checks whether the current message is a
+        Bash tool-use containing ``devbench claim``.  When it is, polls the
+        drain signal via :func:`~devbench.drain.read_drain_state`.  If a drain
+        is pending, raises :class:`_DrainRequested` so the asyncio event loop
+        is cancelled cleanly (spec section 4.3.3, AC-188-4).
+
+        Raises:
+            _DrainRequested: A drain signal is present when a ``cmd_claim``
+                tool-use is observed.  The caller (``cmd_start``) catches this
+                sentinel, consumes the drain marker, and logs the audit entry.
+        """
         async for message in query(
             prompt="Run the devbench:orchestrate skill to process the backlog until complete",
             options=ClaudeAgentOptions(
@@ -4999,8 +5098,20 @@ def cmd_start(*argv: str) -> int:
             ),
         ):
             logger.info("sdk message: %s", message)
+            if _is_claim_tool_use(message):
+                drain_state = read_drain_state(WORKSPACE_ROOT)
+                if drain_state is not None:
+                    raise _DrainRequested(drain_state.reason)
 
-    asyncio.run(_run())
+    try:
+        asyncio.run(_run())
+    except _DrainRequested as exc:
+        # Drain-enforcement backstop (spec section 4.3.3, AC-188-4, AC-188-5, AC-188-8):
+        # consume the marker so the next run starts unscoped, then record the audit.
+        drained = consume_drain(WORKSPACE_ROOT)
+        reason_text = drained.reason if drained is not None else exc.reason
+        logger.info("%s%s", _ORCHESTRATOR_DRAIN_ENFORCED_AUDIT_PREFIX, reason_text)
+        return 0
 
     # AC-190-13: delete scope.json on clean SDK exit so the next run starts
     # without a stale scope.  On crash (SDK raises), the exception propagates

@@ -491,3 +491,46 @@ class TestCreateSpecSkillOperatorFinalReview:
             "create-spec/SKILL.md must state the target output size (1000+ lines) "
             "so the operator understands the quality bar"
         )
+
+
+@pytest.mark.unit
+class TestCreateSpecSkillQualityReference:
+    """AC-191-9: create-spec/SKILL.md must require emitting a [QUALITY_REFERENCE] audit comment.
+
+    Per spec section 4.6.7 (provenance transparency): when create-spec completes, it must
+    emit a [QUALITY_REFERENCE] log line naming the exact exemplar path it read so the
+    audit record captures which quality reference was consulted.
+    """
+
+    def test_skill_requires_quality_reference_audit_comment(self) -> None:
+        """SKILL.md must instruct the skill to emit a [QUALITY_REFERENCE] audit comment on completion."""
+        content = CREATE_SPEC_SKILL_PATH.read_text()
+        assert "[QUALITY_REFERENCE]" in content, (
+            "create-spec/SKILL.md must instruct the skill to emit a [QUALITY_REFERENCE] "
+            "audit comment naming the exemplar path read, per spec section 4.6.7 (provenance transparency)"
+        )
+
+    def test_skill_quality_reference_names_exemplar_path(self) -> None:
+        """[QUALITY_REFERENCE] comment must reference the exemplar file path for provenance transparency."""
+        content = CREATE_SPEC_SKILL_PATH.read_text()
+        qr_pos = content.find("[QUALITY_REFERENCE]")
+        assert qr_pos >= 0, "create-spec/SKILL.md must contain [QUALITY_REFERENCE]"
+        # The surrounding context (within 500 chars) must reference the exemplar path
+        surrounding = content[qr_pos : qr_pos + 500]
+        assert "kanon-list-add-lock-features-spec.md" in surrounding or "exemplar" in surrounding.lower(), (
+            "[QUALITY_REFERENCE] instruction must reference the exemplar path "
+            "(kanon-list-add-lock-features-spec.md) so provenance is unambiguous"
+        )
+
+    def test_skill_quality_reference_appears_after_write_step(self) -> None:
+        """[QUALITY_REFERENCE] must be emitted after the spec is written (completion, not authoring)."""
+        content = CREATE_SPEC_SKILL_PATH.read_text()
+        write_step_pos = content.find("## Step 6")
+        qr_pos = content.find("[QUALITY_REFERENCE]")
+        assert write_step_pos >= 0, "create-spec/SKILL.md must have a Step 6 (write the spec)"
+        assert qr_pos >= 0, "create-spec/SKILL.md must contain [QUALITY_REFERENCE]"
+        assert qr_pos > write_step_pos, (
+            "[QUALITY_REFERENCE] audit comment must appear in or after Step 6 "
+            "(after the spec is written, not during authoring) so the audit log records "
+            "provenance at completion time"
+        )

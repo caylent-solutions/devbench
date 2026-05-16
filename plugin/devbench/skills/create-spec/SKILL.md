@@ -174,6 +174,16 @@ Confirm the write succeeded by reading back the first 20 lines:
 Read spec/<project-name>.md
 ```
 
+Emit the provenance audit comment naming the exact exemplar path read in Step 1 (per spec section 4.6.7 -- quality-bar mining provenance transparency):
+
+```
+[QUALITY_REFERENCE] <full path to kanon-list-add-lock-features-spec.md read in Step 1>
+```
+
+Example: `[QUALITY_REFERENCE] /workspaces/rpm-migration/kanon-deps-work/spec/kanon-list-add-lock-features-spec.md`
+
+This audit line is mandatory -- it records which quality reference was consulted so the orchestrator's audit trail captures provenance for every skill invocation that authors a SKILL.md.
+
 Then offer the spec-to-backlog handoff:
 
 > Spec written to `spec/<project-name>.md` (<line count> lines).

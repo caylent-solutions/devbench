@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
+from collections.abc import Generator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar
@@ -11560,6 +11562,233 @@ class TestCmdStartAutoRestartPostMortem:
             rc = cli.cmd_start()
 
         assert rc == 0
+
+
+class TestCmdStartScopeFlags:
+    """cmd_start --include / --exclude parse and persist scope.json (AC-190-8, AC-190-9).
+
+    Each test constructs a minimal fake BacklogParser so the scope-filter
+    expansion operates on a known set of IDs, then verifies the scope.json
+    output and the command return-code.
+    """
+
+    # ------------------------------------------------------------------
+    # Shared SDK mock factory
+    # ------------------------------------------------------------------
+
+    def _make_sdk_mock(self) -> object:
+        import types
+
+        mock_sdk = types.ModuleType("claude_agent_sdk")
+        mock_sdk.ClaudeAgentOptions = MagicMock()  # type: ignore[attr-defined]
+
+        async def _query(**kwargs: object) -> object:
+            yield "msg"
+
+        mock_sdk.query = _query  # type: ignore[attr-defined]
+        return mock_sdk
+
+    # ------------------------------------------------------------------
+    # Fixture-level backlog IDs used across tests
+    # ------------------------------------------------------------------
+
+    _BACKLOG_IDS: ClassVar[list[str]] = [
+        "E1-F1-S1-T1",
+        "E1-F1-S1-T2",
+        "E1-F2-S1-T1",
+        "E2-F1-S1-T1",
+        "E2-F1-S1-T2",
+        "E3-F1-S1-T1",
+    ]
+
+    def _fake_units(self) -> list:
+        """Return WorkUnit stubs whose IDs match _BACKLOG_IDS."""
+        return [
+            WorkUnit(
+                id=wu_id,
+                title=f"Task {wu_id}",
+                status=WorkUnitStatus.IN_QUEUE,
+                unit_type=WorkUnitType.TASK,
+                file_path=Path(f"backlog/{wu_id}.md"),
+                repo="caylent-solutions/devbench",
+                dependencies=[],
+            )
+            for wu_id in self._BACKLOG_IDS
+        ]
+
+    @contextlib.contextmanager
+    def _patch_cli(self, tmp_path: Path, mock_sdk: object | None = None) -> Generator[MagicMock, None, None]:
+        """Context manager that applies all CLI patches needed by scope-flag tests.
+
+        Patches sys.modules for claude_agent_sdk, WORKSPACE_ROOT, BACKLOG_ROOT,
+        BACKLOG_INDEX, BacklogParser, and _should_auto_restart_after_no_actionable.
+        Pre-configures BacklogParser to return _fake_units().
+
+        Args:
+            tmp_path: Temporary directory to use as WORKSPACE_ROOT.
+            mock_sdk: Optional custom claude_agent_sdk module mock. Defaults to
+                the standard no-op mock returned by ``_make_sdk_mock``.
+
+        Yields:
+            The MagicMock instance used for BacklogParser, already configured
+            with ``parse_index`` returning ``_fake_units()``.
+        """
+        import sys
+
+        if mock_sdk is None:
+            mock_sdk = self._make_sdk_mock()
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}))
+            stack.enter_context(patch("devbench.cli.WORKSPACE_ROOT", tmp_path))
+            stack.enter_context(patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"))
+            stack.enter_context(patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"))
+            mock_parser_cls = stack.enter_context(patch("devbench.cli.BacklogParser"))
+            stack.enter_context(
+                patch(
+                    "devbench.cli._should_auto_restart_after_no_actionable",
+                    return_value=(False, []),
+                )
+            )
+            mock_parser_cls.return_value.parse_index.return_value = self._fake_units()
+            yield mock_parser_cls
+
+    # ------------------------------------------------------------------
+    # AC-190-8: --include writes scope.json with raw + expanded sets
+    # ------------------------------------------------------------------
+
+    def test_include_flag_writes_scope_json(self, tmp_path: Path) -> None:
+        """AC-190-8: cmd_start --include writes .devbench/scope.json."""
+        with self._patch_cli(tmp_path):
+            rc = cli.cmd_start("--include", "E1")
+
+        assert rc == 0
+        scope_path = tmp_path / ".devbench" / "scope.json"
+        assert scope_path.exists(), "scope.json must be written by cmd_start --include"
+        data = json.loads(scope_path.read_text())
+        assert data["include"] == ["E1"]
+        assert data["exclude"] == []
+        # All E1 descendants must be in expanded_ids
+        assert set(data["expanded_ids"]) == {"E1-F1-S1-T1", "E1-F1-S1-T2", "E1-F2-S1-T1"}
+        assert "started_at" in data
+        assert "started_by" in data
+
+    def test_include_and_exclude_writes_correct_scope_json(self, tmp_path: Path) -> None:
+        """AC-190-8: --exclude subtracts from the include set in scope.json."""
+        with self._patch_cli(tmp_path):
+            rc = cli.cmd_start("--include", "E1", "--exclude", "E1-F2-S1-T1")
+
+        assert rc == 0
+        scope_path = tmp_path / ".devbench" / "scope.json"
+        assert scope_path.exists()
+        data = json.loads(scope_path.read_text())
+        assert data["include"] == ["E1"]
+        assert data["exclude"] == ["E1-F2-S1-T1"]
+        # E1-F2-S1-T1 must be excluded
+        assert "E1-F2-S1-T1" not in data["expanded_ids"]
+        assert "E1-F1-S1-T1" in data["expanded_ids"]
+        assert "E1-F1-S1-T2" in data["expanded_ids"]
+
+    # ------------------------------------------------------------------
+    # AC-190-9: empty --include means "include everything"
+    # ------------------------------------------------------------------
+
+    def test_no_flags_does_not_write_scope_json(self, tmp_path: Path) -> None:
+        """AC-190-9: cmd_start with no --include flag must NOT write scope.json."""
+        with self._patch_cli(tmp_path):
+            rc = cli.cmd_start()
+
+        assert rc == 0
+        scope_path = tmp_path / ".devbench" / "scope.json"
+        assert not scope_path.exists(), (
+            "scope.json must NOT be written when --include is not supplied "
+            "(current 'include everything' behavior must be preserved)"
+        )
+
+    def test_include_empty_string_does_not_write_scope_json(self, tmp_path: Path) -> None:
+        """AC-190-9: explicitly empty --include '' is treated as 'include everything'."""
+        with self._patch_cli(tmp_path):
+            rc = cli.cmd_start("--include", "")
+
+        assert rc == 0
+        scope_path = tmp_path / ".devbench" / "scope.json"
+        assert not scope_path.exists(), (
+            "scope.json must NOT be written when --include is empty "
+            "(empty include means 'include everything', no scope file needed)"
+        )
+
+    def test_invalid_include_token_exits_nonzero(self, tmp_path: Path) -> None:
+        """Malformed scope token must cause cmd_start to exit with rc=1 (fail-fast)."""
+        with self._patch_cli(tmp_path):
+            rc = cli.cmd_start("--include", "-bad-token-")
+
+        assert rc == 1
+        scope_path = tmp_path / ".devbench" / "scope.json"
+        assert not scope_path.exists(), "scope.json must not be written when token is invalid"
+
+    def test_reversed_range_token_exits_nonzero(self, tmp_path: Path) -> None:
+        """Reverse-range token (E3-E1) must cause cmd_start to exit with rc=1 (fail-fast)."""
+        with self._patch_cli(tmp_path):
+            rc = cli.cmd_start("--include", "E3-E1")
+
+        assert rc == 1
+
+    def test_devbench_scope_file_env_var_set(self, tmp_path: Path) -> None:
+        """cmd_start --include must set DEVBENCH_SCOPE_FILE in the process env."""
+        import types
+
+        captured_env: dict[str, str] = {}
+
+        async def _capturing_query(**kwargs: object) -> object:
+            import os
+
+            captured_env.update(os.environ)
+            yield "msg"
+
+        custom_sdk = types.ModuleType("claude_agent_sdk")
+        custom_sdk.ClaudeAgentOptions = MagicMock()  # type: ignore[attr-defined]
+        custom_sdk.query = _capturing_query  # type: ignore[attr-defined]
+
+        with self._patch_cli(tmp_path, mock_sdk=custom_sdk):
+            rc = cli.cmd_start("--include", "E1")
+
+        assert rc == 0
+        assert "DEVBENCH_SCOPE_FILE" in captured_env
+        expected_path = str(tmp_path / ".devbench" / "scope.json")
+        assert captured_env["DEVBENCH_SCOPE_FILE"] == expected_path
+
+    def test_unknown_flag_exits_nonzero(self, tmp_path: Path) -> None:
+        """Unknown flags must cause cmd_start to exit with rc=1 (fail-fast)."""
+        with self._patch_cli(tmp_path):
+            rc = cli.cmd_start("--unknown-flag", "value")
+
+        assert rc == 1
+
+    # ------------------------------------------------------------------
+    # Error paths: dangling flags without a value
+    # ------------------------------------------------------------------
+
+    def test_include_without_value_exits_nonzero(self, tmp_path: Path) -> None:
+        """--include with no following value must cause cmd_start to exit rc=1 (fail-fast).
+
+        _parse_start_args prints an actionable error to stderr and returns 1
+        when --include appears as the last argument with no accompanying value.
+        """
+        with self._patch_cli(tmp_path):
+            rc = cli.cmd_start("--include")
+
+        assert rc == 1
+
+    def test_exclude_without_value_exits_nonzero(self, tmp_path: Path) -> None:
+        """--exclude with no following value must cause cmd_start to exit rc=1 (fail-fast).
+
+        _parse_start_args prints an actionable error to stderr and returns 1
+        when --exclude appears as the last argument with no accompanying value.
+        """
+        with self._patch_cli(tmp_path):
+            rc = cli.cmd_start("--exclude")
+
+        assert rc == 1
 
 
 class TestShouldAutoRestartPostMortem:

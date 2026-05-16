@@ -184,7 +184,7 @@ from devbench.plugin_shadow import (
 # orchestrator-alive banner. Single source of truth lives in report.py because
 # the banner is implemented there and reporting must not depend on cli.py.
 from devbench.reporting.report import _format_duration
-from devbench.scope import _expand_prefix
+from devbench.scope import InvalidScopeError, ScopeFilter, _expand_prefix
 from devbench.utils.io import atomic_write_text
 from devbench.utils.process import run_command
 
@@ -4471,12 +4471,78 @@ def _should_auto_restart_after_no_actionable() -> tuple[bool, list[str]]:
     return True, runtime_degraded
 
 
-def cmd_start() -> int:
+@dataclass(frozen=True)
+class _CmdStartArgs:
+    """Parsed arguments for ``cmd_start``.
+
+    Attributes:
+        include: Raw ``--include`` token string (empty = include everything).
+        exclude: Raw ``--exclude`` token string (empty = exclude nothing).
+    """
+
+    include: str = ""
+    exclude: str = ""
+
+
+def _parse_start_args(argv: tuple[str, ...]) -> _CmdStartArgs | int:
+    """Parse ``cmd_start`` flags from ``argv``.
+
+    Accepted flags::
+
+        --include "<tokens>"   Comma-separated scope-filter include tokens.
+        --exclude "<tokens>"   Comma-separated scope-filter exclude tokens.
+
+    Args:
+        argv: Trailing arguments after the ``start`` command name (may be empty).
+
+    Returns:
+        A populated ``_CmdStartArgs`` on success, or an integer exit code on error.
+
+    Raises:
+        Nothing -- all errors are printed to stderr and returned as rc=1.
+    """
+    include = ""
+    exclude = ""
+    args = list(argv)
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--include":
+            if i + 1 >= len(args):
+                print("ERROR: --include requires a value", file=sys.stderr)
+                return 1
+            include = args[i + 1]
+            i += 2
+        elif arg == "--exclude":
+            if i + 1 >= len(args):
+                print("ERROR: --exclude requires a value", file=sys.stderr)
+                return 1
+            exclude = args[i + 1]
+            i += 2
+        else:
+            print(f"ERROR: unknown flag for 'start': {arg!r}", file=sys.stderr)
+            return 1
+    return _CmdStartArgs(include=include, exclude=exclude)
+
+
+def cmd_start(*argv: str) -> int:
     """Run the devbench orchestrate skill non-interactively via the Claude Agent SDK.
 
     Loads the devbench plugin from the plugin directory adjacent to this package
     and invokes the orchestrate skill, which processes the backlog until all
     work units are complete or blocked.
+
+    Accepts optional scope-filter flags (spec section 4.2.2, AC-190-8, AC-190-9):
+
+    - ``--include "<tokens>"`` -- comma-separated printer-pages-style tokens.
+      When supplied, ``ScopeFilter`` is built from the current backlog's WU IDs,
+      persisted to ``<workspace>/.devbench/scope.json``, and the
+      ``DEVBENCH_SCOPE_FILE`` env var is set to that path before the SDK run.
+    - ``--exclude "<tokens>"`` -- comma-separated tokens subtracted from the
+      include set.  Only meaningful together with ``--include``.
+
+    When ``--include`` is absent or empty, all work units are eligible (current
+    behavior preserved, no scope.json written).
 
     When ``agents.*`` overrides are configured in ``devbench.yaml`` (or via
     ``JUDGE_AGENT_MODEL_*`` env vars), a workspace-local shadow plugin tree
@@ -4494,10 +4560,38 @@ def cmd_start() -> int:
 
     Equivalent to running ``claude --plugin-dir <plugin>`` and invoking
     the orchestrate skill interactively, but suitable for CI/unattended runs.
+
+    Args:
+        *argv: Optional flags (``--include``, ``--exclude``).
+
+    Returns:
+        0 on success, 1 on argument-parse error or invalid scope token,
+        :data:`ORCHESTRATOR_RESTART_EXIT_CODE` (42) when auto-restart is triggered.
+
+    Raises:
+        Nothing from this function's own scope -- all SDK exceptions propagate
+        as-is through the asyncio boundary.
     """
     import asyncio
 
     from claude_agent_sdk import ClaudeAgentOptions, query
+
+    parsed = _parse_start_args(argv)
+    if isinstance(parsed, int):
+        return parsed
+
+    # When --include is supplied and non-empty, build + persist a ScopeFilter.
+    if parsed.include:
+        parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+        units = parser.parse_index()
+        backlog_ids = [u.id for u in units]
+        try:
+            scope = ScopeFilter.parse(parsed.include, parsed.exclude, backlog_ids)
+        except InvalidScopeError as exc:
+            print(f"ERROR: invalid scope token: {exc}", file=sys.stderr)
+            return 1
+        scope_file = scope.to_file(WORKSPACE_ROOT)
+        os.environ["DEVBENCH_SCOPE_FILE"] = str(scope_file)
 
     plugin_path = _resolve_plugin_path()
 
@@ -6365,6 +6459,8 @@ _VARIADIC_COMMANDS: frozenset[str] = frozenset(
         "archive-session",
         # Issue #189 E1-F4-S1-T2: bulk selectors --epic/--feature/--story
         "promote",
+        # Issue #190 E2-F2-S1-T1: --include / --exclude scope selectors
+        "start",
     }
 )
 

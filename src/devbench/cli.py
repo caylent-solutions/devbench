@@ -65,7 +65,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 # Resolved once at import time so each watch tick doesn't re-PATH-search.
 # Used by `cmd_report --watch` to clear both the viewport AND the scrollback
@@ -302,23 +302,29 @@ def _render_scope_banner(include: list[str], exclude: list[str], started_at: str
     print(f"SCOPE: {include_part} {exclude_part} {started_part}")
 
 
-def _render_drain_banner(workspace_root: Path) -> None:
+def _render_drain_banner(workspace_root: Path, file: IO[str] | None = None) -> None:
     """Print the ``DRAIN REQUESTED: at <ts> by <user> (reason: <text>)`` banner.
 
     Reads the drain signal file from *workspace_root* non-destructively via
     :func:`~devbench.drain.read_drain_state`. When no signal is present this
-    function is a no-op. Output goes to stdout immediately before the Status
-    Summary header (spec section 4.3.5, AC-188-7).
+    function is a no-op. Output goes to *file* (default ``sys.stdout``)
+    immediately before the Status Summary header (spec section 4.3.5, AC-188-7).
 
     Args:
         workspace_root: Workspace directory from which the drain signal path is
             resolved.
+        file: Output stream to write the banner to. Defaults to ``sys.stdout``
+            when ``None``. Callers may pass an ``io.StringIO`` instance to
+            capture banner text without capturing the full process stdout.
     """
     state = read_drain_state(workspace_root)
     if state is None:
         return
     reason_part = state.reason if state.reason else "(none)"
-    print(f"DRAIN REQUESTED: at {state.requested_at.isoformat()} by {state.requested_by} (reason: {reason_part})")
+    print(
+        f"DRAIN REQUESTED: at {state.requested_at.isoformat()} by {state.requested_by} (reason: {reason_part})",
+        file=file if file is not None else sys.stdout,
+    )
 
 
 def _print_active_units(active: list[WorkUnit]) -> None:

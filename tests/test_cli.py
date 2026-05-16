@@ -14166,21 +14166,30 @@ class TestCmdDrainMutuallyExclusive:
 class TestCmdStatusDrainBanner:
     """cmd_status prepends a DRAIN REQUESTED banner when drain.signal is present (AC-188-7)."""
 
-    @pytest.mark.unit
-    def test_drain_banner_shown_when_signal_present(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        """cmd_status renders 'DRAIN REQUESTED' banner when drain.signal exists."""
-        # Create drain signal first
-        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
-            cli.cmd_drain("--reason", "pre-release freeze")
+    @pytest.fixture()
+    def mock_backlog_parser(self) -> MagicMock:
+        """Return a pre-configured MagicMock that stands in for BacklogParser.
 
+        All 6 test methods share this setup: an empty backlog with all_done=True
+        so cmd_status returns 0 and we can isolate banner-related assertions.
+        """
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = []
         mock_parser.get_parallel_candidates.return_value = []
         mock_parser.all_done.return_value = True
+        return mock_parser
+
+    @pytest.mark.unit
+    def test_drain_banner_shown_when_signal_present(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], mock_backlog_parser: MagicMock
+    ) -> None:
+        """cmd_status renders 'DRAIN REQUESTED' banner when drain.signal exists."""
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            cli.cmd_drain("--reason", "pre-release freeze")
 
         with (
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
-            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BacklogParser", return_value=mock_backlog_parser),
         ):
             rc = cli.cmd_status()
 
@@ -14189,19 +14198,16 @@ class TestCmdStatusDrainBanner:
         assert "DRAIN REQUESTED" in out
 
     @pytest.mark.unit
-    def test_drain_banner_contains_reason(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    def test_drain_banner_contains_reason(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], mock_backlog_parser: MagicMock
+    ) -> None:
         """cmd_status drain banner includes the reason text."""
         with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
             cli.cmd_drain("--reason", "pre-release freeze")
 
-        mock_parser = MagicMock()
-        mock_parser.parse_index.return_value = []
-        mock_parser.get_parallel_candidates.return_value = []
-        mock_parser.all_done.return_value = True
-
         with (
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
-            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BacklogParser", return_value=mock_backlog_parser),
         ):
             cli.cmd_status()
 
@@ -14209,22 +14215,90 @@ class TestCmdStatusDrainBanner:
         assert "pre-release freeze" in out
 
     @pytest.mark.unit
-    def test_no_drain_banner_when_signal_absent(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    def test_no_drain_banner_when_signal_absent(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], mock_backlog_parser: MagicMock
+    ) -> None:
         """cmd_status does not render drain banner when no signal file exists."""
-        mock_parser = MagicMock()
-        mock_parser.parse_index.return_value = []
-        mock_parser.get_parallel_candidates.return_value = []
-        mock_parser.all_done.return_value = True
-
         with (
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
-            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BacklogParser", return_value=mock_backlog_parser),
         ):
             rc = cli.cmd_status()
 
         assert rc == 0
         out = capsys.readouterr().out
         assert "DRAIN REQUESTED" not in out
+
+    @pytest.mark.unit
+    def test_drain_banner_appears_before_status_summary(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], mock_backlog_parser: MagicMock
+    ) -> None:
+        """cmd_status renders the DRAIN REQUESTED banner before the Status Summary header (spec 4.3.5)."""
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            cli.cmd_drain("--reason", "release freeze")
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BacklogParser", return_value=mock_backlog_parser),
+        ):
+            cli.cmd_status()
+
+        out = capsys.readouterr().out
+        assert "DRAIN REQUESTED" in out
+        assert "Backlog Status Summary" in out
+        assert out.index("DRAIN REQUESTED") < out.index("Backlog Status Summary")
+
+    @pytest.mark.unit
+    def test_drain_banner_empty_reason_renders_none_literal(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], mock_backlog_parser: MagicMock
+    ) -> None:
+        """cmd_status drain banner renders '(reason: (none))' when reason is empty string."""
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            cli.cmd_drain()
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BacklogParser", return_value=mock_backlog_parser),
+        ):
+            cli.cmd_status()
+
+        out = capsys.readouterr().out
+        assert "DRAIN REQUESTED" in out
+        assert "(reason: (none))" in out
+
+    @pytest.mark.unit
+    def test_drain_banner_full_format(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], mock_backlog_parser: MagicMock
+    ) -> None:
+        """cmd_status drain banner matches the spec format: 'DRAIN REQUESTED: at <ts> by <user> (reason: <text>)'."""
+        import re
+
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            cli.cmd_drain("--reason", "scheduled maintenance")
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BacklogParser", return_value=mock_backlog_parser),
+        ):
+            cli.cmd_status()
+
+        out = capsys.readouterr().out
+        pattern = r"DRAIN REQUESTED: at \S+ by \S+ \(reason: scheduled maintenance\)"
+        assert re.search(pattern, out), f"Expected banner matching {pattern!r} in output, got: {out!r}"
+
+    @pytest.mark.unit
+    def test_render_drain_banner_file_parameter(self, tmp_path: Path) -> None:
+        """_render_drain_banner writes to the provided file stream, not only sys.stdout."""
+        import io
+
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            cli.cmd_drain("--reason", "file-param test")
+
+        buf = io.StringIO()
+        cli._render_drain_banner(tmp_path, file=buf)
+        output = buf.getvalue()
+        assert "DRAIN REQUESTED" in output
+        assert "file-param test" in output
 
 
 class TestCmdDrainIntegration:

@@ -16,6 +16,7 @@ and be one command away from launching the orchestrator for the first time.
 - [Step 8: Author or import a backlog](#step-8-author-or-import-a-backlog)
 - [Working with draft work units](#working-with-draft-work-units)
 - [Scoping a run](#scoping-a-run)
+- [Stopping a run cleanly](#stopping-a-run-cleanly)
 - [Step 9: Validate](#step-9-validate)
 - [Step 10: Launch](#step-10-launch)
 - [Decision points](#decision-points)
@@ -559,6 +560,87 @@ when no scope file is present.
 
 `devbench validate-backlog` ignores scope.json entirely -- it always validates the
 whole backlog regardless of any active scope.
+
+---
+
+## Stopping a run cleanly
+
+When you want to upgrade devbench, patch a work unit, or simply pause the autonomous
+run between tasks, use `devbench drain` to request a graceful stop. The orchestrator
+finishes the current work unit (reaching `done` or `blocked`), then exits cleanly
+with rc=0. It does NOT kill the in-flight executor mid-claim.
+
+### Requesting a drain
+
+```bash
+# Request a graceful stop with no reason (the orchestrator exits after the current WU):
+JUDGE_WORKSPACE_ROOT=~/my-workspace \
+uv run --project $DEVBENCH_DIR devbench drain
+
+# With a human-readable reason (recorded in the drain marker and audit log):
+JUDGE_WORKSPACE_ROOT=~/my-workspace \
+uv run --project $DEVBENCH_DIR devbench drain --reason "upgrading devbench to v1.2"
+```
+
+Once the drain marker is written, `devbench status` prepends a
+`DRAIN REQUESTED: at <ts> by <user> (reason: <text>)` banner so you can confirm the
+signal is pending.
+
+### Checking drain state
+
+```bash
+# Print marker contents (requested_by, at, reason) if pending; "no drain pending" otherwise.
+# Exit code is rc=0 in both states -- safe to use in scripts.
+JUDGE_WORKSPACE_ROOT=~/my-workspace \
+uv run --project $DEVBENCH_DIR devbench drain --status
+```
+
+### Cancelling a drain request
+
+If you change your mind before the orchestrator picks up the marker, withdraw the
+request. The cancel is idempotent -- it exits rc=0 and prints "no drain pending" if no
+marker is present:
+
+```bash
+JUDGE_WORKSPACE_ROOT=~/my-workspace \
+uv run --project $DEVBENCH_DIR devbench drain --cancel
+```
+
+After cancelling, the orchestrator continues claiming the next work unit as if no drain
+was ever requested (AC-188-10).
+
+### What happens when the orchestrator sees the marker
+
+1. The orchestrator completes the current work unit (executor + judges + git-ops).
+2. Between work units, the skill runs `devbench drain --status`; if pending it logs an
+   `[ORCHESTRATOR_DRAIN]` audit comment on the last WU and exits cleanly.
+3. The drain marker is consumed (deleted) on orchestrator exit, so a subsequent
+   `devbench start` runs without any drain constraint (AC-188-5).
+
+### Pre-arm pattern: run exactly one WU then exit
+
+Drop the drain marker **before** launching `devbench start`. The orchestrator will
+claim one work unit, complete it, detect the pre-armed drain between WUs, and exit.
+This is useful when you want to verify a single task end-to-end before committing to a
+full autonomous run:
+
+```bash
+# Step 1: write the drain marker:
+JUDGE_WORKSPACE_ROOT=~/my-workspace \
+uv run --project $DEVBENCH_DIR devbench drain --reason "single-WU test run"
+
+# Step 2: start the orchestrator; it will process one WU then exit:
+JUDGE_WORKSPACE_ROOT=~/my-workspace \
+JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+make -C $DEVBENCH_DIR start
+```
+
+The drain marker is consumed on exit; run `devbench drain --status` to confirm no
+drain is pending before starting the next full run (AC-188-6).
+
+For the complete flag reference, exit-code table, and session-scoped drain variants
+(`devbench drain --session <name>`, `devbench drain --all`), see
+[`docs/cli-reference.md` -- drain](cli-reference.md#drain).
 
 ---
 

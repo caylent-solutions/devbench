@@ -7,6 +7,7 @@ Covers:
 - AC-FUNC-004: help output includes env-var tokens for report-session and watch-live
 - AC-FUNC-005: make -n start resolves unchanged (uv run python -m devbench.cli start)
 - AC-CYCLE-001: end-to-end invocation via subprocess asserting observed CLI behaviour
+- AC-193-1: test-coverage-new gate includes devbench.quota at 100% line+branch
 """
 
 from __future__ import annotations
@@ -274,3 +275,22 @@ class TestHelpEnvVarTokens:
         assert watch_live_lines, f"No 'watch-live' line in help output:\n{output}"
         matching = [ln for ln in watch_live_lines if "[INTERVAL]" in ln]
         assert matching, "Expected a line with '[INTERVAL]' but watch-live lines were:\n" + "\n".join(watch_live_lines)
+
+
+@pytest.mark.functional
+class TestCoverageNewIncludesQuota:
+    """AC-193-1: test-coverage-new gate must include devbench.quota at 100% coverage."""
+
+    def test_test_coverage_new_includes_quota_module(self) -> None:
+        """AC-193-1: make -n test-coverage-new must include --cov=devbench.quota."""
+        output = _make_dry_run("test-coverage-new")
+        assert "--cov=devbench.quota" in output, (
+            f"Expected '--cov=devbench.quota' in make -n test-coverage-new output, got:\n{output}"
+        )
+
+    def test_test_coverage_new_fails_under_100(self) -> None:
+        """AC-193-1: test-coverage-new gate enforces 100% -- --cov-fail-under=100 must be present."""
+        output = _make_dry_run("test-coverage-new")
+        assert "--cov-fail-under=100" in output, (
+            f"Expected '--cov-fail-under=100' in make -n test-coverage-new output, got:\n{output}"
+        )

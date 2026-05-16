@@ -11,8 +11,12 @@ from __future__ import annotations
 import json as _json
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
+
+if TYPE_CHECKING:
+    from devbench.backlog.proposal import Proposal
 
 from devbench.reporting.window_stats import (
     WINDOW_STATS_DIR_NAME,
@@ -276,7 +280,7 @@ _PROPOSAL_SOURCE_TASK = "E0-F1-S1-T1"
 _PROPOSAL_SOURCE_TASK_2 = "E0-F1-S1-T2"
 
 
-def _make_minimal_proposal(source_task_id: str) -> object:
+def _make_minimal_proposal(source_task_id: str) -> Proposal:
     """Return a minimal ``Proposal`` for use in tests.
 
     Returns:

@@ -40,24 +40,21 @@ class TestReadmeOnboardingSkillsMentioned:
         """README.md must mention the spec-to-backlog marketplace skill (AC-191-9)."""
         text = self._text()
         assert "spec-to-backlog" in text, (
-            "README.md must mention the 'spec-to-backlog' marketplace skill "
-            "(AC-191-9, spec section 4.6.6)."
+            "README.md must mention the 'spec-to-backlog' marketplace skill (AC-191-9, spec section 4.6.6)."
         )
 
     def test_readme_mentions_configure_devbench_skill(self) -> None:
         """README.md must mention the configure-devbench marketplace skill (AC-191-9)."""
         text = self._text()
         assert "configure-devbench" in text, (
-            "README.md must mention the 'configure-devbench' marketplace skill "
-            "(AC-191-9, spec section 4.6.6)."
+            "README.md must mention the 'configure-devbench' marketplace skill (AC-191-9, spec section 4.6.6)."
         )
 
     def test_readme_mentions_bootstrap_environment_skill(self) -> None:
         """README.md must mention the bootstrap-environment marketplace skill (AC-191-9)."""
         text = self._text()
         assert "bootstrap-environment" in text, (
-            "README.md must mention the 'bootstrap-environment' marketplace skill "
-            "(AC-191-9, spec section 4.6.6)."
+            "README.md must mention the 'bootstrap-environment' marketplace skill (AC-191-9, spec section 4.6.6)."
         )
 
 
@@ -100,9 +97,8 @@ class TestReadmeSkillChainDescription:
         """README.md must describe the skill chain as an alternative to manual setup (AC-191-9)."""
         text = self._text()
         lower = text.lower()
-        has_skill_setup_context = (
-            "skill" in lower
-            and ("setup" in lower or "onboard" in lower or "chain" in lower or "zero to" in lower)
+        has_skill_setup_context = "skill" in lower and (
+            "setup" in lower or "onboard" in lower or "chain" in lower or "zero to" in lower
         )
         assert has_skill_setup_context, (
             "README.md must describe the marketplace skill chain as a way to set up or onboard "

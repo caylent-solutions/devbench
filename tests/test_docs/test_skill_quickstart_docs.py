@@ -63,13 +63,10 @@ class TestSkillDocContent:
         lower = text.lower()
         skill_slug = skill_name.lower()
         assert skill_slug in lower, (
-            f"docs/skills/{skill_name}.md must contain the skill name '{skill_name}' "
-            f"in its content (AC-191-9)."
+            f"docs/skills/{skill_name}.md must contain the skill name '{skill_name}' in its content (AC-191-9)."
         )
         # Must have at least one markdown heading.
-        assert "#" in text, (
-            f"docs/skills/{skill_name}.md must contain at least one markdown heading (AC-191-9)."
-        )
+        assert "#" in text, f"docs/skills/{skill_name}.md must contain at least one markdown heading (AC-191-9)."
 
     @pytest.mark.parametrize("skill_name,doc_path", ALL_SKILL_DOCS)
     def test_skill_doc_has_invocation_example(self, skill_name: str, doc_path: Path) -> None:
@@ -83,8 +80,7 @@ class TestSkillDocContent:
             or "plugin" in text.lower()
         )
         assert has_invocation, (
-            f"docs/skills/{skill_name}.md must include an invocation example showing "
-            f"how to run the skill (AC-191-9)."
+            f"docs/skills/{skill_name}.md must include an invocation example showing how to run the skill (AC-191-9)."
         )
 
     @pytest.mark.parametrize("skill_name,doc_path", ALL_SKILL_DOCS)
@@ -144,10 +140,7 @@ class TestCreateSpecDocSpecifics:
         text = CREATE_SPEC_DOC.read_text(encoding="utf-8")
         lower = text.lower()
         has_quality_ref = (
-            "kanon" in lower
-            or "quality" in lower
-            or "exemplar" in lower
-            or "quality bar" in lower.replace("-", " ")
+            "kanon" in lower or "quality" in lower or "exemplar" in lower or "quality bar" in lower.replace("-", " ")
         )
         assert has_quality_ref, (
             "docs/skills/create-spec.md must reference the kanon exemplar as the "
@@ -159,8 +152,7 @@ class TestCreateSpecDocSpecifics:
         """docs/skills/create-spec.md must mention spec/<name>.md as the output."""
         text = CREATE_SPEC_DOC.read_text(encoding="utf-8")
         assert "spec/" in text, (
-            "docs/skills/create-spec.md must document that the output is written "
-            "to spec/<project-name>.md (AC-191-9)."
+            "docs/skills/create-spec.md must document that the output is written to spec/<project-name>.md (AC-191-9)."
         )
 
     def test_create_spec_doc_mentions_iterate_until_perfect(self) -> None:
@@ -188,11 +180,7 @@ class TestSpecToBacklogDocSpecifics:
         """docs/skills/spec-to-backlog.md must mention the kanon quality reference."""
         text = SPEC_TO_BACKLOG_DOC.read_text(encoding="utf-8")
         lower = text.lower()
-        has_quality_ref = (
-            "kanon" in lower
-            or "quality" in lower
-            or "exemplar" in lower
-        )
+        has_quality_ref = "kanon" in lower or "quality" in lower or "exemplar" in lower
         assert has_quality_ref, (
             "docs/skills/spec-to-backlog.md must reference the kanon exemplar as the "
             "quality bar for backlog generation (AC-191-9)."
@@ -218,8 +206,7 @@ class TestSpecToBacklogDocSpecifics:
         """docs/skills/spec-to-backlog.md must document that tasks default to draft."""
         text = SPEC_TO_BACKLOG_DOC.read_text(encoding="utf-8")
         assert "draft" in text, (
-            "docs/skills/spec-to-backlog.md must document that generated tasks "
-            "default to 'draft' status (AC-191-9)."
+            "docs/skills/spec-to-backlog.md must document that generated tasks default to 'draft' status (AC-191-9)."
         )
 
 

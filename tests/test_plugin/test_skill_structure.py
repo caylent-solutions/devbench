@@ -219,8 +219,7 @@ class TestOrchestrateSkillDrainCheck:
         # The drain check section must mention exiting cleanly
         drain_section = content[drain_pos : drain_pos + 500]
         assert "exit" in drain_section.lower(), (
-            "SKILL.md drain check step must instruct the orchestrator to exit cleanly "
-            "when a drain is pending"
+            "SKILL.md drain check step must instruct the orchestrator to exit cleanly when a drain is pending"
         )
 
 
@@ -235,16 +234,12 @@ class TestCreateSpecSkillFrontmatter:
 
     def test_skill_file_exists(self) -> None:
         """AC-191-2: create-spec/SKILL.md must exist."""
-        assert CREATE_SPEC_SKILL_PATH.exists(), (
-            f"create-spec/SKILL.md not found at {CREATE_SPEC_SKILL_PATH}"
-        )
+        assert CREATE_SPEC_SKILL_PATH.exists(), f"create-spec/SKILL.md not found at {CREATE_SPEC_SKILL_PATH}"
 
     def test_frontmatter_name_is_create_spec(self) -> None:
         """AC-191-2: Frontmatter must declare name: create-spec."""
         content = CREATE_SPEC_SKILL_PATH.read_text()
-        assert "name: create-spec" in content, (
-            "create-spec/SKILL.md frontmatter must contain 'name: create-spec'"
-        )
+        assert "name: create-spec" in content, "create-spec/SKILL.md frontmatter must contain 'name: create-spec'"
 
     def test_frontmatter_model_is_opus(self) -> None:
         """AC-191-2: Frontmatter must declare model: opus (top-tier reasoning for authoring + self-critique)."""
@@ -257,9 +252,7 @@ class TestCreateSpecSkillFrontmatter:
     def test_frontmatter_is_yaml_delimited(self) -> None:
         """AC-191-2: Frontmatter must be delimited by YAML front-matter markers."""
         content = CREATE_SPEC_SKILL_PATH.read_text()
-        assert content.startswith("---"), (
-            "create-spec/SKILL.md must start with YAML frontmatter delimiter '---'"
-        )
+        assert content.startswith("---"), "create-spec/SKILL.md must start with YAML frontmatter delimiter '---'"
         # Second --- must close the frontmatter block
         assert content.count("---") >= 2, (
             "create-spec/SKILL.md must have at least two '---' markers (open + close frontmatter)"
@@ -299,8 +292,7 @@ class TestCreateSpecSkillKanonExemplarStep:
         """Step 1 must reference the kanon spec exemplar path so quality bar is internalised."""
         content = CREATE_SPEC_SKILL_PATH.read_text()
         assert "kanon" in content.lower(), (
-            "create-spec/SKILL.md step 1 must reference the kanon spec exemplar "
-            "to internalise the quality bar"
+            "create-spec/SKILL.md step 1 must reference the kanon spec exemplar to internalise the quality bar"
         )
 
     def test_skill_references_kanon_spec_exemplar_path(self) -> None:
@@ -352,16 +344,15 @@ class TestCreateSpecSkillAuthoringFlow:
     def test_skill_mentions_section_by_section_authoring(self) -> None:
         """Step 3 must instruct authoring the spec one section at a time."""
         content = CREATE_SPEC_SKILL_PATH.read_text()
-        assert any(phrase in content.lower() for phrase in ("section at a time", "one section", "section-by-section")), (
+        phrases = ("section at a time", "one section", "section-by-section")
+        assert any(phrase in content.lower() for phrase in phrases), (
             "create-spec/SKILL.md step 3 must instruct authoring the spec one section at a time"
         )
 
     def test_skill_writes_output_to_spec_dir(self) -> None:
         """AC-191-3: Output must be written to spec/<project-name>.md."""
         content = CREATE_SPEC_SKILL_PATH.read_text()
-        assert "spec/" in content, (
-            "create-spec/SKILL.md must write output to spec/<project-name>.md"
-        )
+        assert "spec/" in content, "create-spec/SKILL.md must write output to spec/<project-name>.md"
 
     def test_skill_offers_spec_to_backlog_handoff(self) -> None:
         """End-of-skill must offer to invoke spec-to-backlog."""
@@ -429,9 +420,7 @@ class TestCreateSpecSkillRubricCoverage:
         content = CREATE_SPEC_SKILL_PATH.read_text()
         assert "error" in content.lower() and any(
             kw in content.lower() for kw in ("fr", "functional requirement", "each fr", "every fr")
-        ), (
-            "create-spec/SKILL.md rubric must require explicit error-handling semantics for every FR"
-        )
+        ), "create-spec/SKILL.md rubric must require explicit error-handling semantics for every FR"
 
     def test_rubric_requires_non_goals_stated(self) -> None:
         """Rubric item 4: every non-goal must be stated rather than implied."""
@@ -450,9 +439,9 @@ class TestCreateSpecSkillRubricCoverage:
     def test_rubric_requires_cross_references_to_primitives(self) -> None:
         """Rubric item 6: cross-references to existing primitives must exist for every reused component."""
         content = CREATE_SPEC_SKILL_PATH.read_text()
-        assert "cross-reference" in content.lower() or "cross reference" in content.lower() or "primitives" in content.lower(), (
-            "create-spec/SKILL.md rubric must require cross-references to reused primitives"
-        )
+        lower = content.lower()
+        has_cross_ref = "cross-reference" in lower or "cross reference" in lower or "primitives" in lower
+        assert has_cross_ref, "create-spec/SKILL.md rubric must require cross-references to reused primitives"
 
     def test_rubric_requires_resolved_decisions_record(self) -> None:
         """Rubric item 7: resolved-decisions interview record must capture every design call."""
@@ -573,9 +562,7 @@ class TestSpecToBacklogSkillFrontmatter:
     def test_frontmatter_is_yaml_delimited(self) -> None:
         """AC-191-2: Frontmatter must be delimited by YAML front-matter markers."""
         content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
-        assert content.startswith("---"), (
-            "spec-to-backlog/SKILL.md must start with YAML frontmatter delimiter '---'"
-        )
+        assert content.startswith("---"), "spec-to-backlog/SKILL.md must start with YAML frontmatter delimiter '---'"
         assert content.count("---") >= 2, (
             "spec-to-backlog/SKILL.md must have at least two '---' markers (open + close frontmatter)"
         )
@@ -649,30 +636,22 @@ class TestSpecToBacklogSkillDecompositionHierarchy:
     def test_skill_mentions_epic_level(self) -> None:
         """Skill must decompose at the Epic level."""
         content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
-        assert "Epic" in content, (
-            "spec-to-backlog/SKILL.md must instruct decomposing specs at the Epic level"
-        )
+        assert "Epic" in content, "spec-to-backlog/SKILL.md must instruct decomposing specs at the Epic level"
 
     def test_skill_mentions_feature_level(self) -> None:
         """Skill must decompose at the Feature level."""
         content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
-        assert "Feature" in content, (
-            "spec-to-backlog/SKILL.md must instruct decomposing specs at the Feature level"
-        )
+        assert "Feature" in content, "spec-to-backlog/SKILL.md must instruct decomposing specs at the Feature level"
 
     def test_skill_mentions_story_level(self) -> None:
         """Skill must decompose at the Story level."""
         content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
-        assert "Story" in content, (
-            "spec-to-backlog/SKILL.md must instruct decomposing specs at the Story level"
-        )
+        assert "Story" in content, "spec-to-backlog/SKILL.md must instruct decomposing specs at the Story level"
 
     def test_skill_mentions_task_level(self) -> None:
         """Skill must decompose at the Task level."""
         content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
-        assert "Task" in content, (
-            "spec-to-backlog/SKILL.md must instruct decomposing specs at the Task level"
-        )
+        assert "Task" in content, "spec-to-backlog/SKILL.md must instruct decomposing specs at the Task level"
 
     def test_skill_four_level_hierarchy_expressed(self) -> None:
         """Hierarchy chain Epic -> Feature -> Story -> Task must be explicitly stated."""
@@ -758,9 +737,7 @@ class TestSpecToBacklogSkillIterateUntilPerfect:
     def test_skill_iterates_at_task_granularity(self) -> None:
         """Loop granularity 2: per-Task authoring self-critique."""
         content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
-        assert any(
-            kw in content.lower() for kw in ("per task", "per-task", "each task", "every task")
-        ), (
+        assert any(kw in content.lower() for kw in ("per task", "per-task", "each task", "every task")), (
             "spec-to-backlog/SKILL.md must implement per-Task authoring critique "
             "as the second iterate-until-perfect granularity"
         )
@@ -777,8 +754,7 @@ class TestSpecToBacklogSkillIterateUntilPerfect:
         """On validate-backlog error, skill must regenerate the offending task and re-run validate."""
         content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
         assert any(
-            kw in content.lower()
-            for kw in ("regenerat", "re-run", "re-validate", "offending", "fix", "error")
+            kw in content.lower() for kw in ("regenerat", "re-run", "re-validate", "offending", "fix", "error")
         ), (
             "spec-to-backlog/SKILL.md must instruct regenerating the offending task on "
             "validate-backlog error and re-running validate (whole-backlog post-pass loop)"
@@ -807,8 +783,7 @@ class TestSpecToBacklogSkillSuccessConditions:
         """Skill must exit only when every Task passes the per-task rubric."""
         content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
         assert "rubric" in content.lower(), (
-            "spec-to-backlog/SKILL.md must require every Task to pass the per-task rubric "
-            "as an exit condition"
+            "spec-to-backlog/SKILL.md must require every Task to pass the per-task rubric as an exit condition"
         )
 
     def test_skill_exits_only_when_backlog_index_count_matches(self) -> None:
@@ -960,9 +935,7 @@ class TestSpecToBacklogSkillOutputContract:
     def test_skill_mentions_ac_ties_to_spec(self) -> None:
         """Acceptance criteria in each task file must tie back to the input spec."""
         content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
-        assert any(
-            kw in content.lower() for kw in ("spec section", "ac tie", "ties to spec", "references the spec")
-        ), (
+        assert any(kw in content.lower() for kw in ("spec section", "ac tie", "ties to spec", "references the spec")), (
             "spec-to-backlog/SKILL.md must instruct that task ACs tie back to spec sections "
             "so every AC has a spec justification"
         )
@@ -985,8 +958,7 @@ class TestSpecToBacklogSkillForbiddenPatterns:
         content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
         # Spec says: no "filled in by validate-backlog" placeholders
         assert any(
-            kw in content.lower()
-            for kw in ("placeholder", "real wu id", "real ids", "no placeholder", "filled in at")
+            kw in content.lower() for kw in ("placeholder", "real wu id", "real ids", "no placeholder", "filled in at")
         ), (
             "spec-to-backlog/SKILL.md must prohibit placeholder text in Depends On This tables "
             "and require real WU IDs resolved at generation time"
@@ -996,8 +968,7 @@ class TestSpecToBacklogSkillForbiddenPatterns:
         """Skill must prohibit generic 11-step Approach boilerplate."""
         content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
         assert "Approach" in content and any(
-            kw in content.lower()
-            for kw in ("specific", "task-specific", "generic", "boilerplate", "file", "line")
+            kw in content.lower() for kw in ("specific", "task-specific", "generic", "boilerplate", "file", "line")
         ), (
             "spec-to-backlog/SKILL.md must require task-specific Approach steps "
             "(not generic boilerplate templates) with file/line citations"
@@ -1042,17 +1013,14 @@ class TestSpecToBacklogSkillSelfCritiqueRubric:
         content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
         assert "Epic" in content and any(
             kw in content.lower() for kw in ("fr", "functional requirement", "spec fr", "every fr")
-        ), (
-            "spec-to-backlog/SKILL.md rubric must require every spec FR to have at least one Epic"
-        )
+        ), "spec-to-backlog/SKILL.md rubric must require every spec FR to have at least one Epic"
 
     def test_rubric_requires_no_skipped_hierarchy_levels(self) -> None:
         """Rubric: hierarchy must be exactly Epic -> Feature -> Story -> Task with no skipped levels."""
         content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
         # Verify all four levels appear together in a rubric-like context
         assert all(level in content for level in ["Epic", "Feature", "Story", "Task"]), (
-            "spec-to-backlog/SKILL.md rubric must require Epic->Feature->Story->Task "
-            "with no skipped levels"
+            "spec-to-backlog/SKILL.md rubric must require Epic->Feature->Story->Task with no skipped levels"
         )
 
     def test_rubric_requires_dag_dependency_graph(self) -> None:
@@ -1069,12 +1037,7 @@ class TestSpecToBacklogSkillSelfCritiqueRubric:
 # ---------------------------------------------------------------------------
 
 BOOTSTRAP_ENV_SKILL_PATH = (
-    Path(__file__).parent.parent.parent
-    / "plugin"
-    / "devbench"
-    / "skills"
-    / "bootstrap-environment"
-    / "SKILL.md"
+    Path(__file__).parent.parent.parent / "plugin" / "devbench" / "skills" / "bootstrap-environment" / "SKILL.md"
 )
 
 
@@ -1148,18 +1111,13 @@ class TestBootstrapEnvironmentSkillRepoListStep:
     def test_skill_reads_repos_section(self) -> None:
         """Skill must reference the repos: key in devbench.yaml."""
         content = BOOTSTRAP_ENV_SKILL_PATH.read_text()
-        assert "repos" in content, (
-            "bootstrap-environment/SKILL.md must reference the 'repos:' section in devbench.yaml"
-        )
+        assert "repos" in content, "bootstrap-environment/SKILL.md must reference the 'repos:' section in devbench.yaml"
 
     def test_skill_asks_interactively_when_yaml_missing(self) -> None:
         """Skill must ask interactively when devbench.yaml repos section is absent."""
         content = BOOTSTRAP_ENV_SKILL_PATH.read_text()
-        assert any(
-            kw in content.lower() for kw in ("interactively", "ask", "prompt", "operator")
-        ), (
-            "bootstrap-environment/SKILL.md must ask interactively when repos list "
-            "is not available in devbench.yaml"
+        assert any(kw in content.lower() for kw in ("interactively", "ask", "prompt", "operator")), (
+            "bootstrap-environment/SKILL.md must ask interactively when repos list is not available in devbench.yaml"
         )
 
 
@@ -1184,9 +1142,7 @@ class TestBootstrapEnvironmentSkillPerRepoSteps:
     def test_skill_installs_asdf_toolchain(self) -> None:
         """Skill must install asdf toolchain versions found in .tool-versions."""
         content = BOOTSTRAP_ENV_SKILL_PATH.read_text()
-        assert "asdf" in content, (
-            "bootstrap-environment/SKILL.md must install the asdf toolchain"
-        )
+        assert "asdf" in content, "bootstrap-environment/SKILL.md must install the asdf toolchain"
 
     def test_skill_runs_make_validate_baseline(self) -> None:
         """Skill must run make validate as baseline per spec section 4.6.4."""
@@ -1210,9 +1166,7 @@ class TestBootstrapEnvironmentSkillSelfVerifyLoop:
     def test_skill_verifies_clone_present(self) -> None:
         """Self-verify loop: clone present check must be mentioned."""
         content = BOOTSTRAP_ENV_SKILL_PATH.read_text()
-        assert "clone" in content.lower(), (
-            "bootstrap-environment/SKILL.md self-verify loop must check clone is present"
-        )
+        assert "clone" in content.lower(), "bootstrap-environment/SKILL.md self-verify loop must check clone is present"
 
     def test_skill_verifies_tools_installed(self) -> None:
         """Self-verify loop: tools installed check must be mentioned."""
@@ -1238,9 +1192,7 @@ class TestBootstrapEnvironmentSkillSelfVerifyLoop:
     def test_skill_escalates_on_persistent_failure(self) -> None:
         """On persistent failure after retry, skill must escalate with clear diagnostic."""
         content = BOOTSTRAP_ENV_SKILL_PATH.read_text()
-        assert any(
-            kw in content.lower() for kw in ("escalate", "diagnostic", "persistent")
-        ), (
+        assert any(kw in content.lower() for kw in ("escalate", "diagnostic", "persistent")), (
             "bootstrap-environment/SKILL.md must escalate to the operator with a diagnostic "
             "on persistent failure after retry"
         )
@@ -1248,11 +1200,8 @@ class TestBootstrapEnvironmentSkillSelfVerifyLoop:
     def test_skill_pauses_on_failure_with_diagnostic(self) -> None:
         """Skill must pause on failure with diagnostic + suggested fix per spec section 4.6.4."""
         content = BOOTSTRAP_ENV_SKILL_PATH.read_text()
-        assert any(
-            kw in content.lower() for kw in ("pause", "diagnostic", "suggested fix", "suggest")
-        ), (
-            "bootstrap-environment/SKILL.md must pause on failure with a diagnostic "
-            "and suggested fix for the operator"
+        assert any(kw in content.lower() for kw in ("pause", "diagnostic", "suggested fix", "suggest")), (
+            "bootstrap-environment/SKILL.md must pause on failure with a diagnostic and suggested fix for the operator"
         )
 
 
@@ -1261,12 +1210,7 @@ class TestBootstrapEnvironmentSkillSelfVerifyLoop:
 # ---------------------------------------------------------------------------
 
 CONFIGURE_DEVBENCH_SKILL_PATH = (
-    Path(__file__).parent.parent.parent
-    / "plugin"
-    / "devbench"
-    / "skills"
-    / "configure-devbench"
-    / "SKILL.md"
+    Path(__file__).parent.parent.parent / "plugin" / "devbench" / "skills" / "configure-devbench" / "SKILL.md"
 )
 
 
@@ -1290,16 +1234,12 @@ class TestConfigureDevbenchSkillFrontmatter:
     def test_frontmatter_model_is_sonnet(self) -> None:
         """AC-191-6: Frontmatter must declare model: sonnet per spec section 4.6.5."""
         content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
-        assert "model: sonnet" in content, (
-            "configure-devbench/SKILL.md frontmatter must contain 'model: sonnet'"
-        )
+        assert "model: sonnet" in content, "configure-devbench/SKILL.md frontmatter must contain 'model: sonnet'"
 
     def test_frontmatter_is_yaml_delimited(self) -> None:
         """AC-191-6: Frontmatter must be delimited by YAML front-matter markers."""
         content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
-        assert content.startswith("---"), (
-            "configure-devbench/SKILL.md must start with YAML frontmatter delimiter '---'"
-        )
+        assert content.startswith("---"), "configure-devbench/SKILL.md must start with YAML frontmatter delimiter '---'"
         assert content.count("---") >= 2, (
             "configure-devbench/SKILL.md must have at least two '---' markers (open + close frontmatter)"
         )
@@ -1451,16 +1391,12 @@ class TestConfigureDevbenchSkillValidateDebugSection:
     def test_skill_covers_validate(self) -> None:
         """Skill must mention the validate: RuntimeConfig section."""
         content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
-        assert "validate" in content, (
-            "configure-devbench/SKILL.md must walk operator through the 'validate' section"
-        )
+        assert "validate" in content, "configure-devbench/SKILL.md must walk operator through the 'validate' section"
 
     def test_skill_covers_debug(self) -> None:
         """Skill must mention the debug: RuntimeConfig section."""
         content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
-        assert "debug" in content, (
-            "configure-devbench/SKILL.md must walk operator through the 'debug' section"
-        )
+        assert "debug" in content, "configure-devbench/SKILL.md must walk operator through the 'debug' section"
 
 
 @pytest.mark.unit
@@ -1470,16 +1406,12 @@ class TestConfigureDevbenchSkillStopHookSection:
     def test_skill_covers_stop_hook(self) -> None:
         """Skill must mention the stop_hook: RuntimeConfig section."""
         content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
-        assert "stop_hook" in content, (
-            "configure-devbench/SKILL.md must walk operator through the 'stop_hook' section"
-        )
+        assert "stop_hook" in content, "configure-devbench/SKILL.md must walk operator through the 'stop_hook' section"
 
     def test_skill_covers_hook_tail(self) -> None:
         """Skill must mention the hook_tail: RuntimeConfig section."""
         content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
-        assert "hook_tail" in content, (
-            "configure-devbench/SKILL.md must walk operator through the 'hook_tail' section"
-        )
+        assert "hook_tail" in content, "configure-devbench/SKILL.md must walk operator through the 'hook_tail' section"
 
 
 @pytest.mark.unit
@@ -1489,9 +1421,7 @@ class TestConfigureDevbenchSkillGitOpsSection:
     def test_skill_covers_git_ops(self) -> None:
         """Skill must mention the git_ops: RuntimeConfig section."""
         content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
-        assert "git_ops" in content, (
-            "configure-devbench/SKILL.md must walk operator through the 'git_ops' section"
-        )
+        assert "git_ops" in content, "configure-devbench/SKILL.md must walk operator through the 'git_ops' section"
 
     def test_skill_covers_single_branch(self) -> None:
         """Skill must mention single_branch within the git_ops section."""
@@ -1503,9 +1433,7 @@ class TestConfigureDevbenchSkillGitOpsSection:
     def test_skill_covers_defer_pr(self) -> None:
         """Skill must mention defer_pr within the git_ops section."""
         content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
-        assert "defer_pr" in content, (
-            "configure-devbench/SKILL.md must prompt for 'defer_pr' in the git_ops section"
-        )
+        assert "defer_pr" in content, "configure-devbench/SKILL.md must prompt for 'defer_pr' in the git_ops section"
 
     def test_skill_covers_auto_finalize(self) -> None:
         """Skill must mention auto_finalize within the git_ops section."""
@@ -1529,16 +1457,13 @@ class TestConfigureDevbenchSkillBacklogSection:
     def test_skill_covers_backlog_section(self) -> None:
         """Skill must mention the backlog: RuntimeConfig section."""
         content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
-        assert "backlog" in content, (
-            "configure-devbench/SKILL.md must walk operator through the 'backlog' section"
-        )
+        assert "backlog" in content, "configure-devbench/SKILL.md must walk operator through the 'backlog' section"
 
     def test_skill_covers_default_status_for_new_work_units(self) -> None:
         """Skill must mention default_status_for_new_work_units within the backlog section."""
         content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
         assert "default_status_for_new_work_units" in content, (
-            "configure-devbench/SKILL.md must prompt for 'default_status_for_new_work_units' "
-            "in the backlog section"
+            "configure-devbench/SKILL.md must prompt for 'default_status_for_new_work_units' in the backlog section"
         )
 
 

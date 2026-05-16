@@ -3,7 +3,7 @@ SHELL := /bin/bash
 .DEFAULT_GOAL := help
 unexport VIRTUAL_ENV
 
-.PHONY: help install install-hooks plugin-install plugin-uninstall lint lint-ruff lint-bandit format format-check typecheck test test-unit test-coverage validate clean start start-interactive report report-session pre-commit-check pre-push-check watch watch-live
+.PHONY: help install install-hooks plugin-install plugin-uninstall lint lint-ruff lint-bandit lint-no-duplicates format format-check typecheck test test-unit test-coverage test-coverage-new validate clean start start-interactive report report-session pre-commit-check pre-push-check watch watch-live
 
 ## help: Show available targets
 help:

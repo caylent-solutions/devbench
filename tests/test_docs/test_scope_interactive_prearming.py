@@ -57,10 +57,7 @@ class TestZeroToReadyScopingInteractivelySection:
     def test_section_heading_exists(self) -> None:
         """docs/zero-to-ready.md must contain a 'Scoping a run interactively' heading."""
         text = _read_zero_to_ready()
-        has_heading = (
-            "### Scoping a run interactively" in text
-            or "## Scoping a run interactively" in text
-        )
+        has_heading = "### Scoping a run interactively" in text or "## Scoping a run interactively" in text
         assert has_heading, (
             "docs/zero-to-ready.md must contain a 'Scoping a run interactively' section "
             "showing the scope set + claude --plugin-dir chained workflow "
@@ -70,29 +67,24 @@ class TestZeroToReadyScopingInteractivelySection:
     def test_scope_set_command_shown(self) -> None:
         """The 'Scoping a run interactively' section must show devbench scope set."""
         text = _read_zero_to_ready()
-        section = (
-            _extract_section(text, "### Scoping a run interactively")
-            or _extract_section(text, "## Scoping a run interactively")
+        section = _extract_section(text, "### Scoping a run interactively") or _extract_section(
+            text, "## Scoping a run interactively"
         )
         assert section, (
-            "docs/zero-to-ready.md must have a 'Scoping a run interactively' section "
-            "(spec section 4.2.6.3)."
+            "docs/zero-to-ready.md must have a 'Scoping a run interactively' section (spec section 4.2.6.3)."
         )
         assert "scope set" in section, (
-            "The 'Scoping a run interactively' section must show 'devbench scope set' "
-            "(spec section 4.2.6.3)."
+            "The 'Scoping a run interactively' section must show 'devbench scope set' (spec section 4.2.6.3)."
         )
 
     def test_claude_plugin_dir_invocation_shown(self) -> None:
         """The section must show 'claude --plugin-dir' (or equivalent) for interactive launch."""
         text = _read_zero_to_ready()
-        section = (
-            _extract_section(text, "### Scoping a run interactively")
-            or _extract_section(text, "## Scoping a run interactively")
+        section = _extract_section(text, "### Scoping a run interactively") or _extract_section(
+            text, "## Scoping a run interactively"
         )
         assert section, (
-            "docs/zero-to-ready.md must have a 'Scoping a run interactively' section "
-            "(spec section 4.2.6.3)."
+            "docs/zero-to-ready.md must have a 'Scoping a run interactively' section (spec section 4.2.6.3)."
         )
         has_claude_cmd = "--plugin-dir" in section or "claude --dangerously" in section
         assert has_claude_cmd, (
@@ -104,13 +96,11 @@ class TestZeroToReadyScopingInteractivelySection:
     def test_scope_clear_shown_after_run(self) -> None:
         """The section must show 'devbench scope clear' to clean up after the run."""
         text = _read_zero_to_ready()
-        section = (
-            _extract_section(text, "### Scoping a run interactively")
-            or _extract_section(text, "## Scoping a run interactively")
+        section = _extract_section(text, "### Scoping a run interactively") or _extract_section(
+            text, "## Scoping a run interactively"
         )
         assert section, (
-            "docs/zero-to-ready.md must have a 'Scoping a run interactively' section "
-            "(spec section 4.2.6.3)."
+            "docs/zero-to-ready.md must have a 'Scoping a run interactively' section (spec section 4.2.6.3)."
         )
         assert "scope clear" in section, (
             "The 'Scoping a run interactively' section must show 'devbench scope clear' "
@@ -122,9 +112,7 @@ class TestZeroToReadyScopingInteractivelySection:
         """The 'Scoping a run interactively' section must be under 'Scoping a run'."""
         text = _read_zero_to_ready()
         scoping_idx = text.find("## Scoping a run")
-        assert scoping_idx != -1, (
-            "docs/zero-to-ready.md must have a '## Scoping a run' section."
-        )
+        assert scoping_idx != -1, "docs/zero-to-ready.md must have a '## Scoping a run' section."
         interactive_idx = text.find("Scoping a run interactively", scoping_idx)
         assert interactive_idx != -1, (
             "The 'Scoping a run interactively' subsection must appear within "
@@ -211,10 +199,7 @@ class TestCliReferenceSessionIntegrationNote:
         text = _read_cli_reference()
         scope_section = _extract_section(text, "### `scope`")
         assert scope_section, "### `scope` section must exist in cli-reference.md"
-        has_session_path = (
-            "sessions/" in scope_section
-            or "session" in scope_section.lower()
-        )
+        has_session_path = "sessions/" in scope_section or "session" in scope_section.lower()
         assert has_session_path, (
             "docs/cli-reference.md '### `scope`' section must show the per-session "
             "scope.json path (<workspace>/.devbench/sessions/<name>/scope.json) "

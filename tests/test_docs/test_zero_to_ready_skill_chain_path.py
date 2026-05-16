@@ -34,14 +34,8 @@ class TestZeroToReadyTwoSetupPaths:
         """
         text = self._text()
         lower = text.lower()
-        has_skill_path = (
-            "skill" in lower
-            and (
-                "chain" in lower
-                or "onboarding" in lower
-                or "create-spec" in lower
-                or "spec-to-backlog" in lower
-            )
+        has_skill_path = "skill" in lower and (
+            "chain" in lower or "onboarding" in lower or "create-spec" in lower or "spec-to-backlog" in lower
         )
         assert has_skill_path, (
             "docs/zero-to-ready.md must describe the skill-driven setup path as an "

@@ -32,7 +32,7 @@ def _extract_section(text: str, heading: str) -> str:
         return ""
     section_text = text[idx:]
     # Find the next heading at the same level (### for ### headings, ## for ## headings).
-    level = len(heading.split(" ")[0])  # count leading '#'
+    level = len(heading.split(" ", maxsplit=1)[0])  # count leading '#'
     marker = "\n" + "#" * level + " "
     next_idx = section_text.find(marker, 1)
     if next_idx != -1:
@@ -41,7 +41,7 @@ def _extract_section(text: str, heading: str) -> str:
 
 
 @pytest.mark.unit
-class TestScopeSelectors_SingleIDToken:
+class TestScopeSelectorsSingleIDToken:
     """AC-190-1: Single-ID token syntax is documented."""
 
     def test_single_id_token_mentioned(self) -> None:
@@ -62,7 +62,7 @@ class TestScopeSelectors_SingleIDToken:
             '"E5"' in text
             or "'E5'" in text
             or "--include E5" in text
-            or "--include \"E5\"" in text
+            or '--include "E5"' in text
             or "E5-F1-S2-T3" in text
         )
         assert has_example, (
@@ -72,7 +72,7 @@ class TestScopeSelectors_SingleIDToken:
 
 
 @pytest.mark.unit
-class TestScopeSelectors_RangeToken:
+class TestScopeSelectorsRangeToken:
     """AC-190-2: Range token syntax is documented."""
 
     def test_range_token_mentioned(self) -> None:
@@ -90,8 +90,7 @@ class TestScopeSelectors_RangeToken:
         # E1-E3 is the canonical range example from the spec.
         has_range_example = "E1-E3" in text or "E1-E5" in text or "E1-E10" in text
         assert has_range_example, (
-            "docs/cli-reference.md must include a worked range-token example "
-            "such as 'E1-E3' or 'E1-E10' (AC-190-2)."
+            "docs/cli-reference.md must include a worked range-token example such as 'E1-E3' or 'E1-E10' (AC-190-2)."
         )
 
     def test_reverse_range_error_documented(self) -> None:
@@ -106,7 +105,7 @@ class TestScopeSelectors_RangeToken:
 
 
 @pytest.mark.unit
-class TestScopeSelectors_MixedList:
+class TestScopeSelectorsMixedList:
     """AC-190-3: Mixed comma-separated token list is documented."""
 
     def test_comma_separated_list_mentioned(self) -> None:
@@ -124,11 +123,7 @@ class TestScopeSelectors_MixedList:
         text = _read_doc()
         # Must have at least one example with a comma inside a token string.
         has_mixed = (
-            "E1-E3, E5" in text
-            or "E1-E3,E5" in text
-            or "E1, E3" in text
-            or "E1,E3" in text
-            or "E1-E3, E5" in text
+            "E1-E3, E5" in text or "E1-E3,E5" in text or "E1, E3" in text or "E1,E3" in text or "E1-E3, E5" in text
         )
         assert has_mixed, (
             "docs/cli-reference.md must include a worked example of a comma-separated "
@@ -137,7 +132,7 @@ class TestScopeSelectors_MixedList:
 
 
 @pytest.mark.unit
-class TestScopeSelectors_ExcludeSubtraction:
+class TestScopeSelectorsExcludeSubtraction:
     """AC-190-4: --exclude subtracts from include set; evaluation order documented."""
 
     def test_exclude_flag_present(self) -> None:
@@ -151,14 +146,9 @@ class TestScopeSelectors_ExcludeSubtraction:
         """The doc must state that --exclude subtracts from the include set."""
         text = _read_doc()
         lower = text.lower()
-        has_subtract_doc = (
-            "subtract" in lower
-            or "subtracts" in lower
-            or "exclude" in lower and "include" in lower
-        )
+        has_subtract_doc = "subtract" in lower or "subtracts" in lower or ("exclude" in lower and "include" in lower)
         assert has_subtract_doc, (
-            "docs/cli-reference.md must document that --exclude subtracts from "
-            "the include set (AC-190-4)."
+            "docs/cli-reference.md must document that --exclude subtracts from the include set (AC-190-4)."
         )
 
     def test_evaluation_order_documented(self) -> None:
@@ -167,12 +157,7 @@ class TestScopeSelectors_ExcludeSubtraction:
         lower = text.lower()
         # The spec says: include set is built first, then exclude is subtracted.
         # Must mention order or priority between include and exclude.
-        has_order = (
-            "order" in lower
-            or "first" in lower
-            or "then" in lower
-            or "evaluation" in lower
-        )
+        has_order = "order" in lower or "first" in lower or "then" in lower or "evaluation" in lower
         assert has_order, (
             "docs/cli-reference.md must document the evaluation order for scope selectors: "
             "include set is expanded first, then exclude tokens are subtracted (AC-190-4)."
@@ -180,26 +165,25 @@ class TestScopeSelectors_ExcludeSubtraction:
 
 
 @pytest.mark.unit
-class TestScopeSelectors_ComplexExample:
+class TestScopeSelectorsComplexExample:
     """AC-190-7: The complex --include / --exclude worked example is present."""
 
     def test_complex_example_e1_e10_exclude_e5_e7_f3(self) -> None:
         """The doc must show the canonical AC-190-7 example."""
         text = _read_doc()
         # AC-190-7 requires: --include "E1-E10" --exclude "E5,E7-F3"
-        has_complex = (
-            "E1-E10" in text
-            and ("E5" in text and "E7-F3" in text or "E7" in text and "--exclude" in text)
+        has_complex = "E1-E10" in text and (
+            ("E5" in text and "E7-F3" in text) or ("E7" in text and "--exclude" in text)
         )
         assert has_complex, (
             "docs/cli-reference.md must include the AC-190-7 worked example: "
-            "--include \"E1-E10\" --exclude \"E5,E7-F3\" (or equivalent demonstrating "
+            '--include "E1-E10" --exclude "E5,E7-F3" (or equivalent demonstrating '
             "the combined --include and --exclude behaviour)."
         )
 
 
 @pytest.mark.unit
-class TestScopeSelectors_StartCommandUpdated:
+class TestScopeSelectorsStartCommandUpdated:
     """The start command section must document --include and --exclude flags."""
 
     def test_start_section_documents_include_flag(self) -> None:
@@ -235,7 +219,7 @@ class TestScopeSelectors_StartCommandUpdated:
 
 
 @pytest.mark.unit
-class TestScopeSelectors_StatusCommandUpdated:
+class TestScopeSelectorsStatusCommandUpdated:
     """The status command section must document --include, --exclude, and scope banner."""
 
     def test_status_section_documents_include_flag(self) -> None:
@@ -262,7 +246,7 @@ class TestScopeSelectors_StatusCommandUpdated:
 
 
 @pytest.mark.unit
-class TestScopeSelectors_ScopeSubcommand:
+class TestScopeSelectorsScopeSubcommand:
     """The doc must contain a 'scope' subcommand section with set/clear/show."""
 
     def test_scope_subcommand_section_exists(self) -> None:
@@ -277,24 +261,21 @@ class TestScopeSelectors_ScopeSubcommand:
         """The scope section must document 'devbench scope set'."""
         text = _read_doc()
         assert "scope set" in text, (
-            "docs/cli-reference.md scope section must document 'devbench scope set' "
-            "(spec section 4.2.6.1)."
+            "docs/cli-reference.md scope section must document 'devbench scope set' (spec section 4.2.6.1)."
         )
 
     def test_scope_clear_documented(self) -> None:
         """The scope section must document 'devbench scope clear'."""
         text = _read_doc()
         assert "scope clear" in text, (
-            "docs/cli-reference.md scope section must document 'devbench scope clear' "
-            "(spec section 4.2.6.1)."
+            "docs/cli-reference.md scope section must document 'devbench scope clear' (spec section 4.2.6.1)."
         )
 
     def test_scope_show_documented(self) -> None:
         """The scope section must document 'devbench scope show'."""
         text = _read_doc()
         assert "scope show" in text, (
-            "docs/cli-reference.md scope section must document 'devbench scope show' "
-            "(spec section 4.2.6.1)."
+            "docs/cli-reference.md scope section must document 'devbench scope show' (spec section 4.2.6.1)."
         )
 
     def test_scope_section_include_flag_documented(self) -> None:
@@ -334,7 +315,7 @@ class TestScopeSelectors_ScopeSubcommand:
 
 
 @pytest.mark.unit
-class TestScopeSelectors_OutOfRangeWarning:
+class TestScopeSelectorsOutOfRangeWarning:
     """Out-of-range tokens emit a warning but do not abort (AC-190-6)."""
 
     def test_out_of_range_warning_documented(self) -> None:
@@ -356,7 +337,7 @@ class TestScopeSelectors_OutOfRangeWarning:
 
 
 @pytest.mark.unit
-class TestScopeSelectors_ScopeJsonSchema:
+class TestScopeSelectorsScopeJsonSchema:
     """The doc must describe the scope.json schema (AC-190-8)."""
 
     def test_scope_json_filename_mentioned(self) -> None:
@@ -393,7 +374,7 @@ class TestScopeSelectors_ScopeJsonSchema:
 
 
 @pytest.mark.unit
-class TestScopeSelectors_ReportCommandUpdated:
+class TestScopeSelectorsReportCommandUpdated:
     """The report command section must document --include, --exclude, and scope filter flags."""
 
     def test_report_section_usage_includes_include_flag(self) -> None:
@@ -403,7 +384,7 @@ class TestScopeSelectors_ReportCommandUpdated:
         assert report_section, "### `report` section must exist in cli-reference.md"
         assert '--include "<tokens>"' in report_section or "--include" in report_section, (
             "docs/cli-reference.md '### `report`' usage line must include "
-            "[--include \"<tokens>\"] to match the other scope-aware commands "
+            '[--include "<tokens>"] to match the other scope-aware commands '
             "(scope selectors reference section and code confirm report accepts --include)."
         )
 
@@ -414,7 +395,7 @@ class TestScopeSelectors_ReportCommandUpdated:
         assert report_section, "### `report` section must exist in cli-reference.md"
         assert '--exclude "<tokens>"' in report_section or "--exclude" in report_section, (
             "docs/cli-reference.md '### `report`' usage line must include "
-            "[--exclude \"<tokens>\"] to eliminate the internal contradiction with "
+            '[--exclude "<tokens>"] to eliminate the internal contradiction with '
             "the scope selectors reference section."
         )
 
@@ -442,7 +423,7 @@ class TestScopeSelectors_ReportCommandUpdated:
 
 
 @pytest.mark.unit
-class TestScopeSelectors_ContentsTableUpdated:
+class TestScopeSelectorsContentsTableUpdated:
     """The Contents table must reference the scope subcommand."""
 
     def test_contents_includes_scope_entry_or_backlog_write_section(self) -> None:

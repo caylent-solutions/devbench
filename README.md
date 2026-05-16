@@ -27,6 +27,7 @@ DevBench drives a structured backlog from claim to merged PR without human inter
 - **Autonomous SDLC pipeline.** One operator writes the spec; the orchestrator drives every task from claim to merged PR.
 - **Real LLM review at every gate.** Every verdict is logged as an audit comment on the work unit.
 - **Auditable by default.** Every agent action writes a timestamped comment on the work unit file. The orchestrator can resume from any point after a restart because state lives on disk, not in memory.
+- **Draft status lifecycle.** New work units can be created in `draft` status (pre-`in-queue` gate) so operators can review every generated task before autonomous execution begins. Use `devbench promote <id>` (or `--epic`, `--feature`, `--story`, `--all`) to transition `draft -> in-queue`. Configure the default via `backlog.default_status_for_new_work_units` in `devbench.yaml` (default: `in-queue`, preserving backwards compatibility). See [docs/devbench-yaml-reference.md](docs/devbench-yaml-reference.md) for the full config reference.
 
 The judge / agent layer:
 
@@ -148,7 +149,7 @@ Full per-command details, flags, and examples live in [docs/cli-reference.md](do
 | Group | Commands |
 |-------|----------|
 | **Backlog read** | `status`, `next`, `report`, `watch`, `hook-tail`, `list-proposals`, `validate-backlog`, `read-unit` |
-| **Backlog write** | `claim`, `set-status`, `mark-done`, `decline`, `start` |
+| **Backlog write** | `claim`, `set-status`, `mark-done`, `decline`, `start`, `promote` |
 | **Orchestrator helpers** | `log`, `log-verdict`, `log-comment`, `log-tdd`, `get-diff`, `run-tests`, `ensure-branch`, `git-ops`, `git-ops-finalize` |
 | **Amendment workflow** | `request-amendment`, `apply-amendment`, `reject-amendment` |
 | **Proposal workflow** | `write-proposal`, `materialise-proposal`, `sweep-proposals`, `promote-proposal`, `reject-proposal`, `add-dep` |
@@ -193,7 +194,7 @@ Two environment variables MUST be set before any command runs (otherwise startup
 
 Everything else is optional. Per-repo settings, git-ops mode, stop-hook tuning, token pricing, and reporting timezone all live in `backlog/config/devbench.yaml` (relative to `JUDGE_WORKSPACE_ROOT`). Override the default lookup with the `--config <path>` CLI flag or `JUDGE_CONFIG_PATH` env var.
 
-For the full annotated YAML, value-resolution precedence, and every config key, see [docs/architecture.md §8 Configuration model](docs/architecture.md#8-configuration-model). For per-model token pricing and cost-formula details, see [docs/model-pricing.md](docs/model-pricing.md).
+For the full annotated YAML, value-resolution precedence, and every config key, see [docs/devbench-yaml-reference.md](docs/devbench-yaml-reference.md) and [docs/architecture.md §8 Configuration model](docs/architecture.md#8-configuration-model). For per-model token pricing and cost-formula details, see [docs/model-pricing.md](docs/model-pricing.md).
 
 ### Common tuning
 
@@ -206,6 +207,7 @@ For the full annotated YAML, value-resolution precedence, and every config key, 
 - **Per-judge executor retry budgets** (different judges can flake at different rates; tune retries per failing judge instead of raising the global cap): set `max_executor_retries_per_judge:` map in `devbench.yaml`. Each entry falls back to `max_executor_retries` when absent.
 - **Manifest amendments** (executors can request a `tdd_green_production_fix` to expand their Changes Manifest mid-cycle when TDD GREEN reveals required production fixes; the manifest-amender judges scope, approach-coherence, and standards): toggle via `manifest_amendment.enabled`. See [docs/manifest-amendments.md](docs/manifest-amendments.md) and [ADR-02](docs/adr/02-manifest-amendment-workflow.md).
 - **Task-factory loop** (after manifest-amendment rejects, blocker-resolver decomposes the rejection and task-factory materialises draft work units the source task can depend on): toggle via `task_factory.enabled` and `task_factory.auto_accept_proposals`. See [docs/task-factory.md](docs/task-factory.md) and [ADR-03](docs/adr/03-task-factory.md).
+- **Draft status default** (control whether newly created work units land in `draft` or `in-queue`; `draft` requires explicit `devbench promote` before the orchestrator can claim the task): set `backlog.default_status_for_new_work_units` in `devbench.yaml`. Default `in-queue` preserves backwards compatibility. See [docs/devbench-yaml-reference.md](docs/devbench-yaml-reference.md).
 - **HOLD lifecycle** (`devbench hold <id>` / `devbench unhold <id>`): tasks deliberately deferred without breaking dep-chain math.
 - **Display timezone** in `devbench report` and `devbench hook-tail`: set `report.display_timezone` (IANA zone name) in `devbench.yaml`, or override per invocation via `JUDGE_REPORT_TIMEZONE`. See [model-pricing.md](docs/model-pricing.md#other-settings-under-report).
 - **Per-model token pricing** (needed when you run anything other than Opus 4.7): drop the matching `report.token_cost_per_million_*` block from [model-pricing.md](docs/model-pricing.md) into `devbench.yaml`.

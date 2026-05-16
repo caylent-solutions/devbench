@@ -14,6 +14,7 @@ and be one command away from launching the orchestrator for the first time.
 - [Step 6: Clone the target repo(s)](#step-6-clone-the-target-repos)
 - [Step 7: Author backlog/config/devbench.yaml](#step-7-author-backlogconfigdevbenchyaml)
 - [Step 8: Author or import a backlog](#step-8-author-or-import-a-backlog)
+- [Working with draft work units](#working-with-draft-work-units)
 - [Step 9: Validate](#step-9-validate)
 - [Step 10: Launch](#step-10-launch)
 - [Decision points](#decision-points)
@@ -366,6 +367,97 @@ the Git strategy section, see
 
 ---
 
+## Working with draft work units
+
+When you set `backlog.default_status_for_new_work_units: draft` in
+`backlog/config/devbench.yaml`, every newly created work unit (including those generated
+by `task-factory` or imported via `spec-to-backlog`) lands in `draft` status rather than
+`in-queue`. Draft work units are invisible to the orchestrator: `get_parallel_candidates`
+excludes them, so the autonomous run cannot claim them until an operator explicitly
+promotes them.
+
+This gives you a review gate between generation and execution: inspect every generated
+work unit, tighten scope, verify Manifests, and then release the ones you approve.
+
+### Opting in
+
+Add the following to your `backlog/config/devbench.yaml`:
+
+```yaml
+backlog:
+  default_status_for_new_work_units: draft   # or "in-queue" (legacy default)
+```
+
+**Existing workspaces are unaffected.** Omitting this key (or leaving the default `in-queue`)
+preserves the legacy behaviour exactly: new work units go straight to `in-queue` and are
+eligible for autonomous claim immediately. There is no migration required.
+
+### Reviewing the generated backlog
+
+After generating a backlog (or after `task-factory` materialises new tasks), check how
+many draft work units are waiting for review:
+
+```bash
+JUDGE_WORKSPACE_ROOT=~/my-workspace \
+uv run --project $DEVBENCH_DIR devbench status
+```
+
+The `devbench status` summary includes a `Draft N` row so you can see the pending count
+at a glance. Inspect each draft work unit's `.md` file directly -- the `## Changes
+Manifest`, `## Acceptance Criteria`, and `## Approach` sections are the key places to
+review before promoting.
+
+### Promoting draft work units
+
+Once you are satisfied with a work unit (or a group of them), transition it from
+`draft -> in-queue` with `devbench promote`:
+
+| You want to... | Use |
+|---|---|
+| Promote a single work unit | `devbench promote <ID>` |
+| Promote every draft WU under an epic | `devbench promote --epic <epic-id>` |
+| Promote every draft WU under a feature | `devbench promote --feature <feature-id>` |
+| Promote every draft WU under a story | `devbench promote --story <story-id>` |
+| Promote all draft WUs in the backlog | `devbench promote --all` |
+| Promote all without a confirmation prompt | `devbench promote --all --yes` |
+
+`devbench promote` refuses to promote any work unit that is not currently in `draft`
+status; if you pass an ID that is already `in-queue` or `done`, it exits with rc=1 and
+a clear error. Each promoted work unit receives a `[PROMOTED] draft -> in-queue`
+audit-comment line in its `## Comments` section.
+
+### Common patterns
+
+**Review then release selectively** -- generate the full backlog, inspect each epic,
+promote the epics you want the orchestrator to tackle first:
+
+```bash
+devbench promote --epic E1
+devbench promote --epic E3
+```
+
+**Release everything at once** -- if you trust the generation output and want to start
+the autonomous run immediately:
+
+```bash
+devbench promote --all --yes
+```
+
+**Hold back risky work** -- promote most of the backlog but place high-risk epics on
+hold until you have reviewed them. Note that `draft` is only valid for task-level work
+units (`E7-F1-S1-T1` style IDs); to pause an entire epic or feature use `hold` instead:
+
+```bash
+devbench promote --all --yes
+devbench set-status E7 hold   # pause E7 at epic level for closer review
+devbench set-status E7-F1-S1-T1 draft   # or revert a specific task back to draft
+```
+
+After promoting, proceed to Step 9 (`devbench validate-backlog`) to confirm the promoted
+work units satisfy all backlog-contract rules before launching the orchestrator.
+
+---
+
 ## Step 9: Validate
 
 Run `devbench validate-backlog` from any directory; provide the workspace root and model
@@ -491,6 +583,8 @@ workspace:
 
 | You want to... | Use |
 |---|---|
+| Release a draft work unit for autonomous claim | `devbench promote <ID>` |
+| Release all draft work units in the backlog | `devbench promote --all --yes` |
 | Skip a task entirely | `devbench decline <ID> --reason "<message>"` |
 | Pause a task pending more context | `devbench hold <ID> --reason "<message>"` |
 | Resume a held task | `devbench unhold <ID> --reason "<message>"` |

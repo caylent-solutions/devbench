@@ -3584,7 +3584,7 @@ class TestMainWatchFlagParsing:
     """Test --watch / -w flag extraction in main() (lines 978-988)."""
 
     def test_watch_flag_extracted_from_args(self) -> None:
-        """--watch <N> is extracted from sys.argv for the report command (lines 978-988)."""
+        """--watch <N> is extracted from sys.argv for the report command."""
         with (
             patch("sys.argv", ["devbench", "report", "--watch", "10"]),
             patch("devbench.cli.cmd_report", return_value=0) as mock_report,
@@ -3592,7 +3592,7 @@ class TestMainWatchFlagParsing:
             result = cli.main()
 
         assert result == 0
-        mock_report.assert_called_once_with(since="", watch_interval=10, once=False)
+        mock_report.assert_called_once_with(since="", watch_interval=10, once=False, include="", exclude="")
 
     def test_short_watch_flag_extracted(self) -> None:
         """-w <N> is equivalent to --watch <N>."""
@@ -3603,10 +3603,10 @@ class TestMainWatchFlagParsing:
             result = cli.main()
 
         assert result == 0
-        mock_report.assert_called_once_with(since="", watch_interval=3, once=False)
+        mock_report.assert_called_once_with(since="", watch_interval=3, once=False, include="", exclude="")
 
     def test_watch_flag_with_since_arg(self) -> None:
-        """--watch is separated from the since timestamp argument (lines 996-998)."""
+        """--watch is separated from the since timestamp argument."""
         with (
             patch("sys.argv", ["devbench", "report", "--watch", "5", "2025-01-15T10:30:00Z"]),
             patch("devbench.cli.cmd_report", return_value=0) as mock_report,
@@ -3614,7 +3614,9 @@ class TestMainWatchFlagParsing:
             result = cli.main()
 
         assert result == 0
-        mock_report.assert_called_once_with(since="2025-01-15T10:30:00Z", watch_interval=5, once=False)
+        mock_report.assert_called_once_with(
+            since="2025-01-15T10:30:00Z", watch_interval=5, once=False, include="", exclude=""
+        )
 
     def test_once_flag_extracted_from_args(self) -> None:
         """Issue #163: --once is extracted by main() and forwarded to cmd_report."""
@@ -3625,7 +3627,7 @@ class TestMainWatchFlagParsing:
             result = cli.main()
 
         assert result == 0
-        mock_report.assert_called_once_with(since="", watch_interval=0, once=True)
+        mock_report.assert_called_once_with(since="", watch_interval=0, once=True, include="", exclude="")
 
     def test_no_stream_alias_extracted(self) -> None:
         """Issue #163: --no-stream is an accepted alias for --once."""
@@ -3636,19 +3638,23 @@ class TestMainWatchFlagParsing:
             result = cli.main()
 
         assert result == 0
-        mock_report.assert_called_once_with(since="", watch_interval=0, once=True)
+        mock_report.assert_called_once_with(since="", watch_interval=0, once=True, include="", exclude="")
 
     def test_report_without_watch_dispatches_normally(self) -> None:
-        """report without --watch goes through normal dispatch (line 1002)."""
-        mock_fn = MagicMock(return_value=0)
+        """report without --watch routes directly to cmd_report with scope kwargs.
+
+        Issue #190: main() now dispatches 'report' explicitly (not via generic
+        func(*sliced_args)) so that --include / --exclude scope flags are
+        forwarded as keyword arguments.
+        """
         with (
             patch("sys.argv", ["devbench", "report"]),
-            patch.dict(cli._COMMANDS, {"report": (mock_fn, 0, "Progress report")}),
+            patch("devbench.cli.cmd_report", return_value=0) as mock_report,
         ):
             result = cli.main()
 
         assert result == 0
-        mock_fn.assert_called_once()
+        mock_report.assert_called_once_with(since="", watch_interval=0, once=False, include="", exclude="")
 
 
 class TestMainExtraArgsWarning:
@@ -12393,3 +12399,390 @@ class TestCmdStatusScopeBanner:
         assert "scope.json" in err
         assert bad_field in err
         assert "must be a list" in err
+
+
+# ---------------------------------------------------------------------------
+# AC-190-10 / AC-190-11: cmd_report scope flags + SCOPE banner (E2-F2-S2-T2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestCmdReportScopeBanner:
+    """E2-F2-S2-T2: cmd_report accepts --include/--exclude; renders SCOPE banner.
+
+    AC-190-10: devbench report honors active scope.json without flags.
+    AC-190-11: Per-command --include override of active scope.json works.
+    """
+
+    def _write_scope_json(
+        self,
+        tmp_path: Path,
+        include: list[str],
+        exclude: list[str],
+        started_at: str = "2026-05-14T13:42:11Z",
+        started_by: str = "testuser",
+    ) -> None:
+        """Write a minimal scope.json under tmp_path/.devbench/scope.json."""
+        scope_dir = tmp_path / ".devbench"
+        scope_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "include": include,
+            "exclude": exclude,
+            "expanded_ids": ["E1-F1-S1-T1"],
+            "started_at": started_at,
+            "started_by": started_by,
+        }
+        (scope_dir / "scope.json").write_text(json.dumps(payload))
+
+    # ------------------------------------------------------------------
+    # AC-190-10: honors active scope.json without flags
+    # ------------------------------------------------------------------
+
+    def test_scope_banner_rendered_from_scope_json(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """SCOPE banner appears in report output when scope.json is active (AC-190-10)."""
+        self._write_scope_json(
+            tmp_path,
+            include=["E1-E3"],
+            exclude=["E2"],
+            started_at="2026-05-14T13:42:11Z",
+        )
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.reporting.report.generate_report", return_value="report text"),
+        ):
+            rc = cli.cmd_report(once=True)
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "SCOPE:" in out
+        assert "include=[E1-E3]" in out
+        assert "exclude=[E2]" in out
+        assert "2026-05-14T13:42:11Z" in out
+
+    def test_scope_banner_absent_when_no_scope_json(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """No SCOPE banner when scope.json does not exist and no flags supplied."""
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.reporting.report.generate_report", return_value="plain report"),
+        ):
+            rc = cli.cmd_report(once=True)
+
+        assert rc == 0
+        assert "SCOPE:" not in capsys.readouterr().out
+
+    def test_scope_banner_include_and_exclude_from_scope_json(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Banner shows both include and exclude lists from scope.json."""
+        self._write_scope_json(
+            tmp_path,
+            include=["E1", "E3"],
+            exclude=["E1-F2"],
+            started_at="2026-01-01T00:00:00Z",
+        )
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.reporting.report.generate_report", return_value="report"),
+        ):
+            rc = cli.cmd_report(once=True)
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "SCOPE:" in out
+        assert "include=[E1, E3]" in out
+        assert "exclude=[E1-F2]" in out
+
+    # ------------------------------------------------------------------
+    # AC-190-11: per-command --include override
+    # ------------------------------------------------------------------
+
+    def test_include_flag_renders_scope_banner(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """--include flag renders SCOPE banner (no scope.json required, AC-190-11)."""
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.reporting.report.generate_report", return_value="report"),
+        ):
+            rc = cli.cmd_report(once=True, include="E1")
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "SCOPE:" in out
+        assert "include=[E1]" in out
+        assert "exclude=[]" in out
+        assert "(one-off)" in out
+
+    def test_include_and_exclude_flags_render_correct_banner(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """--include and --exclude flags together render the correct SCOPE banner."""
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.reporting.report.generate_report", return_value="report"),
+        ):
+            rc = cli.cmd_report(once=True, include="E1-E3", exclude="E2")
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "SCOPE:" in out
+        assert "include=[E1-E3]" in out
+        assert "exclude=[E2]" in out
+
+    def test_include_flag_overrides_scope_json(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Per-command --include overrides active scope.json (AC-190-11)."""
+        self._write_scope_json(
+            tmp_path,
+            include=["E5"],
+            exclude=["E6"],
+            started_at="2026-05-01T00:00:00Z",
+        )
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.reporting.report.generate_report", return_value="report"),
+        ):
+            rc = cli.cmd_report(once=True, include="E1")
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        # The flag override must appear, not the scope.json values.
+        assert "include=[E1]" in out
+        scope_line = next(ln for ln in out.splitlines() if "SCOPE:" in ln)
+        assert "E5" not in scope_line
+
+    # ------------------------------------------------------------------
+    # scope_filter forwarded to generate_report
+    # ------------------------------------------------------------------
+
+    def test_scope_filter_passed_to_generate_report_when_include_flag(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """When --include is supplied, generate_report receives a non-None scope_filter."""
+        captured: dict[str, object] = {}
+
+        def fake_generate_report(**kwargs: object) -> str:
+            captured.update(kwargs)
+            return "scoped report"
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.reporting.report.generate_report", side_effect=fake_generate_report),
+        ):
+            rc = cli.cmd_report(once=True, include="E1")
+
+        assert rc == 0
+        # scope_filter must be a non-None ScopeFilter with the include tokens.
+        assert "scope_filter" in captured
+        sf = captured["scope_filter"]
+        assert sf is not None
+        from devbench.scope import ScopeFilter
+
+        assert isinstance(sf, ScopeFilter)
+        assert sf.include == ["E1"]
+
+    def test_scope_filter_passed_to_generate_report_from_scope_json(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """When scope.json is active, generate_report receives a non-None scope_filter."""
+        self._write_scope_json(tmp_path, include=["E1"], exclude=[])
+        captured: dict[str, object] = {}
+
+        def fake_generate_report(**kwargs: object) -> str:
+            captured.update(kwargs)
+            return "scoped report"
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.reporting.report.generate_report", side_effect=fake_generate_report),
+        ):
+            rc = cli.cmd_report(once=True)
+
+        assert rc == 0
+        assert "scope_filter" in captured
+        assert captured["scope_filter"] is not None
+
+    def test_scope_filter_none_when_no_scope(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """When no scope is active, generate_report receives scope_filter=None."""
+        captured: dict[str, object] = {}
+
+        def fake_generate_report(**kwargs: object) -> str:
+            captured.update(kwargs)
+            return "report"
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.reporting.report.generate_report", side_effect=fake_generate_report),
+        ):
+            rc = cli.cmd_report(once=True)
+
+        assert rc == 0
+        assert captured.get("scope_filter") is None
+
+    # ------------------------------------------------------------------
+    # Error paths: corrupt scope.json
+    # ------------------------------------------------------------------
+
+    def test_corrupt_scope_json_returns_error(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Corrupt scope.json causes rc=1 with an actionable error to stderr."""
+        scope_dir = tmp_path / ".devbench"
+        scope_dir.mkdir(parents=True, exist_ok=True)
+        (scope_dir / "scope.json").write_text("{not valid json")
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_report(once=True)
+
+        assert rc == 1
+        assert "scope.json" in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        "bad_field,bad_value",
+        [
+            ("include", "E1"),
+            ("exclude", "E2"),
+        ],
+    )
+    def test_non_list_field_in_scope_json_exits_with_error(
+        self,
+        bad_field: str,
+        bad_value: object,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """scope.json with a non-list include/exclude field causes rc=1 with error."""
+        scope_dir = tmp_path / ".devbench"
+        scope_dir.mkdir(parents=True, exist_ok=True)
+        payload: dict[str, object] = {
+            "include": ["E1"],
+            "exclude": [],
+            "expanded_ids": [],
+            "started_at": "2026-05-14T13:42:11Z",
+            "started_by": "testuser",
+        }
+        payload[bad_field] = bad_value
+        (scope_dir / "scope.json").write_text(json.dumps(payload))
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_report(once=True)
+
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "scope.json" in err
+        assert bad_field in err
+        assert "must be a list" in err
+
+    # ------------------------------------------------------------------
+    # main() integration: --include / --exclude extracted from CLI args
+    # ------------------------------------------------------------------
+
+    def test_main_extracts_include_flag_for_report(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """main() strips --include from 'devbench report --include E1' and forwards it to cmd_report."""
+        called_with: dict[str, object] = {}
+
+        def fake_cmd_report(**kwargs: object) -> int:
+            called_with.update(kwargs)
+            return 0
+
+        with (
+            patch("sys.argv", ["devbench", "report", "--include", "E1", "--once"]),
+            patch("devbench.cli.cmd_report", side_effect=fake_cmd_report),
+        ):
+            result = cli.main()
+
+        assert result == 0
+        assert called_with.get("include") == "E1"
+
+    def test_main_extracts_exclude_flag_for_report(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """main() strips --exclude from 'devbench report --exclude E2' and forwards it to cmd_report."""
+        called_with: dict[str, object] = {}
+
+        def fake_cmd_report(**kwargs: object) -> int:
+            called_with.update(kwargs)
+            return 0
+
+        with (
+            patch("sys.argv", ["devbench", "report", "--exclude", "E2", "--once"]),
+            patch("devbench.cli.cmd_report", side_effect=fake_cmd_report),
+        ):
+            result = cli.main()
+
+        assert result == 0
+        assert called_with.get("exclude") == "E2"
+
+    def test_main_extracts_include_and_exclude_for_report(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """main() extracts both --include and --exclude for the report command."""
+        called_with: dict[str, object] = {}
+
+        def fake_cmd_report(**kwargs: object) -> int:
+            called_with.update(kwargs)
+            return 0
+
+        with (
+            patch("sys.argv", ["devbench", "report", "--include", "E1-E3", "--exclude", "E2", "--once"]),
+            patch("devbench.cli.cmd_report", side_effect=fake_cmd_report),
+        ):
+            result = cli.main()
+
+        assert result == 0
+        assert called_with.get("include") == "E1-E3"
+        assert called_with.get("exclude") == "E2"
+
+    def test_main_report_without_scope_flags_include_empty(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """main() passes include='' and exclude='' to cmd_report when no scope flags given."""
+        called_with: dict[str, object] = {}
+
+        def fake_cmd_report(**kwargs: object) -> int:
+            called_with.update(kwargs)
+            return 0
+
+        with (
+            patch("sys.argv", ["devbench", "report", "--once"]),
+            patch("devbench.cli.cmd_report", side_effect=fake_cmd_report),
+        ):
+            result = cli.main()
+
+        assert result == 0
+        assert called_with.get("include", "") == ""
+        assert called_with.get("exclude", "") == ""

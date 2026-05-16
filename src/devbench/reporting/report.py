@@ -83,6 +83,7 @@ from devbench.constants import (
     TOKENS_PER_MILLION,
 )
 from devbench.reporting.event_index import EventIndex
+from devbench.scope import ScopeFilter
 
 _log = logging.getLogger("devbench.reporting.report")
 
@@ -2202,10 +2203,51 @@ def _listing_by_status(units: list, status: WorkUnitStatus, label: str) -> list[
     return lines
 
 
+def _filter_units_by_scope(units: list, scope_filter: ScopeFilter | None) -> list:
+    """Return ``units`` filtered to those allowed by ``scope_filter``.
+
+    When ``scope_filter`` is ``None``, the original list is returned unchanged.
+
+    A :class:`~devbench.scope.ScopeFilter` whose ``expanded_ids`` set is empty
+    is re-expanded from its ``include`` / ``exclude`` token lists against the
+    full list of unit IDs before filtering.  This handles the per-command
+    ``--include`` / ``--exclude`` path (spec section 4.2.2, AC-190-11) where
+    ``cmd_report`` builds the filter from raw tokens without yet knowing the
+    full backlog ID set.
+
+    Args:
+        units: Full list of parsed :class:`~devbench.backlog.work_unit.WorkUnit`
+            objects from ``BacklogParser.parse_index``.
+        scope_filter: Optional :class:`~devbench.scope.ScopeFilter` instance.
+            Pass ``None`` to skip filtering and return all units.
+
+    Returns:
+        A (possibly shorter) list containing only the units whose IDs satisfy
+        the scope filter, preserving original order.
+
+    Raises:
+        InvalidScopeError: If token lists contain structurally malformed tokens
+            (reversed ranges, empty segments).  Only raised when
+            re-expansion is triggered (empty ``expanded_ids`` + non-empty tokens).
+    """
+    if scope_filter is None:
+        return units
+    active_filter = scope_filter
+    if not active_filter.expanded_ids and (active_filter.include or active_filter.exclude):
+        all_ids = [u.id for u in units]
+        active_filter = ScopeFilter.parse(
+            ", ".join(active_filter.include),
+            ", ".join(active_filter.exclude),
+            all_ids,
+        )
+    return [u for u in units if active_filter.allows(u.id)]
+
+
 def generate_report(
     log_path: Path,
     since: datetime | None = None,
     report_started_at: datetime | None = None,
+    scope_filter: ScopeFilter | None = None,
 ) -> str:
     """Generate a formatted progress report.
 
@@ -2217,9 +2259,21 @@ def generate_report(
         report_started_at: When set, adds a "This run" column tracking activity
             since this timestamp. Used by ``cmd_report`` in watch mode to show
             what's happened since the watch loop began.
+        scope_filter: Optional :class:`~devbench.scope.ScopeFilter` instance
+            (spec section 4.2.2, AC-190-10, AC-190-11).  When provided, only
+            work units whose IDs are in the filter's scope are counted and
+            listed in the report.  A ``ScopeFilter`` with empty
+            ``expanded_ids`` is re-expanded from its ``include`` / ``exclude``
+            token lists against the parsed backlog before filtering.  Pass
+            ``None`` (default) to include all work units.
 
     Returns:
         Formatted report string ready for terminal output.
+
+    Raises:
+        SystemExit(1): If the backlog cannot be read or parsed.
+        InvalidScopeError: If ``scope_filter`` token lists contain
+            structurally invalid tokens (reversed ranges, etc.).
     """
     # Operator-alive banner (issue #161). Prepended to every render so
     # ``devbench report --watch N`` shows liveness state on every tick.
@@ -2289,6 +2343,10 @@ def generate_report(
             "  Run `devbench validate-backlog` for a full list of issues with the index.\n"
         )
         sys.exit(1)
+
+    # Issue #190 (AC-190-10, AC-190-11): apply scope filter when provided.
+    units = _filter_units_by_scope(units, scope_filter)
+
     backlog = _backlog_totals_from_units(units)
 
     # Issue #162 Phase 1+4 cache: refresh the persistent SQLite index

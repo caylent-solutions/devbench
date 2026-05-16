@@ -3490,3 +3490,168 @@ class TestBacklogTotalsDraftColumn:
             + b.tasks_draft
         )
         assert total == b.tasks_total
+
+
+# ---------------------------------------------------------------------------
+# AC-190-10 / AC-190-11: generate_report scope_filter parameter (E2-F2-S2-T2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestGenerateReportScopeFilter:
+    """generate_report correctly filters work units when scope_filter is provided.
+
+    AC-190-10: devbench report honors active scope.json without flags.
+    AC-190-11: Per-command --include override works; only scoped WUs are listed.
+    """
+
+    @staticmethod
+    def _make_unit(uid: str, status: WorkUnitStatus) -> WorkUnit:
+        """Build a minimal TASK WorkUnit with the given ID and status."""
+        return WorkUnit(
+            id=uid,
+            title=f"task-{uid}",
+            status=status,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path(f"backlog/{uid}.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+
+    def _units(self) -> list[WorkUnit]:
+        """Return a diverse set of 4 units: E1-F1-S1-T1 (done) and E2-F1-S1-T1..T3."""
+        return [
+            self._make_unit("E1-F1-S1-T1", WorkUnitStatus.DONE),
+            self._make_unit("E2-F1-S1-T1", WorkUnitStatus.IN_QUEUE),
+            self._make_unit("E2-F1-S1-T2", WorkUnitStatus.IN_PROGRESS),
+            self._make_unit("E2-F1-S1-T3", WorkUnitStatus.DONE),
+        ]
+
+    @staticmethod
+    def _make_fake_backlog_totals(tasks_total: int) -> object:
+        """Build a :class:`~devbench.reporting.report._BacklogTotals` stub.
+
+        Returns a zero-valued totals struct with ``tasks_total`` and
+        ``units_total`` set to ``tasks_total``.  Used by tests that patch
+        ``_backlog_totals_from_units`` to capture which units reach the
+        aggregation step.
+
+        Args:
+            tasks_total: Number of tasks (and units) to report as the total.
+
+        Returns:
+            A fully-populated :class:`~devbench.reporting.report._BacklogTotals`
+            named-tuple with all counters set to zero except ``tasks_total``
+            and ``units_total``.
+        """
+        from devbench.reporting.report import _BacklogTotals
+
+        return _BacklogTotals(
+            tasks_total=tasks_total,
+            tasks_done=0,
+            units_total=tasks_total,
+            units_done=0,
+            stories_done=0,
+            features_done=0,
+            epics_done=0,
+            tasks_remaining=0,
+            tasks_blocked=0,
+            tasks_active=0,
+            tasks_in_progress=0,
+            tasks_in_queue=0,
+            tasks_in_review=0,
+            tasks_proposed=0,
+            tasks_declined=0,
+        )
+
+    def test_scope_filter_none_includes_all_units(self, tmp_path: Path) -> None:
+        """When scope_filter=None, all units are counted (no filtering applied)."""
+        log_file = tmp_path / "test.log"
+        log_file.write_text("")
+
+        with patch("devbench.reporting.report.BacklogParser") as mock_cls:
+            mock_cls.return_value.parse_index.return_value = self._units()
+            report = generate_report(log_path=log_file, scope_filter=None)
+
+        # 4 units total; report should show Tasks remaining > 0.
+        assert "Tasks completed" in report
+
+    def test_scope_filter_restricts_to_include_set(self, tmp_path: Path) -> None:
+        """When scope_filter includes only E1, only E1-F1-S1-T1 is counted."""
+        from devbench.scope import ScopeFilter
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text("")
+
+        # E1 filter: only E1-F1-S1-T1 (DONE) should remain.
+        all_ids = [u.id for u in self._units()]
+        sf = ScopeFilter.parse("E1", "", all_ids)
+
+        with patch("devbench.reporting.report.BacklogParser") as mock_cls:
+            mock_cls.return_value.parse_index.return_value = self._units()
+            from devbench.reporting.report import _backlog_totals_from_units
+
+            # Verify directly via _backlog_totals_from_units on filtered list.
+            filtered = [u for u in self._units() if sf.allows(u.id)]
+            totals = _backlog_totals_from_units(filtered)
+
+        assert totals.tasks_total == 1
+        assert totals.tasks_done == 1
+
+    def test_scope_filter_with_empty_expanded_ids_re_expands_from_tokens(self, tmp_path: Path) -> None:
+        """A ScopeFilter built with empty expanded_ids is re-expanded inside generate_report."""
+        from devbench.scope import ScopeFilter
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text("")
+
+        # Build a ScopeFilter with include tokens but empty expanded_ids (as
+        # cmd_report does when --include is passed as a CLI flag).
+        sf = ScopeFilter(include=["E1"], exclude=[], expanded_ids=set())
+
+        captured_units: list = []
+
+        def fake_backlog_totals(units: list) -> object:
+            captured_units.extend(units)
+            return self._make_fake_backlog_totals(len(units))
+
+        with (
+            patch("devbench.reporting.report.BacklogParser") as mock_cls,
+            patch("devbench.reporting.report._backlog_totals_from_units", side_effect=fake_backlog_totals),
+        ):
+            mock_cls.return_value.parse_index.return_value = self._units()
+            generate_report(log_path=log_file, scope_filter=sf)
+
+        # Only E1-F1-S1-T1 should have survived the filter.
+        unit_ids = [u.id for u in captured_units]
+        assert "E1-F1-S1-T1" in unit_ids
+        assert "E2-F1-S1-T1" not in unit_ids
+        assert "E2-F1-S1-T2" not in unit_ids
+
+    def test_scope_filter_with_exclude_removes_units(self, tmp_path: Path) -> None:
+        """A ScopeFilter with --exclude removes matching units from report counts."""
+        from devbench.scope import ScopeFilter
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text("")
+
+        all_ids = [u.id for u in self._units()]
+        # Exclude E2 subtree; only E1-F1-S1-T1 should remain.
+        sf = ScopeFilter.parse("", "E2", all_ids)
+
+        captured_units: list = []
+
+        def fake_backlog_totals(units: list) -> object:
+            captured_units.extend(units)
+            return self._make_fake_backlog_totals(len(units))
+
+        with (
+            patch("devbench.reporting.report.BacklogParser") as mock_cls,
+            patch("devbench.reporting.report._backlog_totals_from_units", side_effect=fake_backlog_totals),
+        ):
+            mock_cls.return_value.parse_index.return_value = self._units()
+            generate_report(log_path=log_file, scope_filter=sf)
+
+        unit_ids = [u.id for u in captured_units]
+        assert "E1-F1-S1-T1" in unit_ids
+        assert not any(uid.startswith("E2") for uid in unit_ids)

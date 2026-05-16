@@ -2105,8 +2105,25 @@ def _resolve_log_file_path() -> Path:
     raise SystemExit(1)
 
 
-def cmd_report(since: str = "", watch_interval: int = 0, once: bool = False) -> int:
+def cmd_report(
+    since: str = "",
+    watch_interval: int = 0,
+    once: bool = False,
+    include: str = "",
+    exclude: str = "",
+) -> int:
     """Print a formatted progress report with velocity and completion stats.
+
+    Accepts scope-filter flags (spec section 4.2.2, AC-190-10, AC-190-11):
+
+    - ``include`` -- raw ``--include`` token string; one-off include selector
+      that overrides any active scope.json when non-empty.
+    - ``exclude`` -- raw ``--exclude`` token string; one-off exclude selector.
+
+    When neither flag is supplied, the active ``scope.json`` (if any) is
+    consulted instead.  In either case, a ``SCOPE: include=[...] exclude=[...]
+    (started ...)`` banner is printed above the report body, and the WU
+    lists shown in the report are filtered to the resolved scope.
 
     Issue #163: streams continuously by default when stdout is a TTY.
     Pass ``once=True`` (or pipe / redirect stdout) to get the legacy
@@ -2115,11 +2132,39 @@ def cmd_report(since: str = "", watch_interval: int = 0, once: bool = False) -> 
     The legacy ``--watch N`` flag is preserved for backward compatibility
     but emits a deprecation notice and falls through to the streaming
     loop (the integer interval is ignored; cadence is data-driven).
+
+    Args:
+        since: ISO-8601 UTC timestamp string; restricts the report window.
+        watch_interval: Deprecated ``--watch N`` interval (ignored; streaming
+            mode is always cadence-driven).  Pass ``> 0`` to trigger the
+            deprecation notice and streaming fallback.
+        once: When ``True``, forces one-shot rendering regardless of TTY.
+        include: Raw ``--include`` token string (empty = not supplied).
+        exclude: Raw ``--exclude`` token string (empty = not supplied).
+
+    Returns:
+        ``0`` on success; ``1`` on scope-resolution error.
     """
     import warnings as _warnings
     from datetime import datetime
 
     from devbench.reporting.report import generate_report
+
+    # Resolve scope (AC-190-10, AC-190-11): per-command flags take
+    # precedence over an active scope.json; when neither is present,
+    # scope_filter is None and generate_report uses the full backlog.
+    scope_args = _StatusArgs(include=include, exclude=exclude)
+    scope = _resolve_scope_for_status(scope_args)
+    if scope.error:
+        print(scope.error, file=sys.stderr)
+        return 1
+    scope_filter: ScopeFilter | None = None
+    if scope.has_scope:
+        _render_scope_banner(scope.include, scope.exclude, scope.started_at)
+        scope_filter = ScopeFilter(
+            include=scope.include,
+            exclude=scope.exclude,
+        )
 
     log_file = _resolve_log_file_path()
 
@@ -2146,14 +2191,16 @@ def cmd_report(since: str = "", watch_interval: int = 0, once: bool = False) -> 
         # missing, or invalidated by a schema-version mismatch. The
         # ``--since`` path always recomputes because a frozen-window
         # snapshot is never the right answer for a custom-window query.
-        if since_dt is None:
+        # When a scope filter is active, bypass the snapshot (the
+        # snapshot was rendered against the full backlog, not the scope).
+        if since_dt is None and scope_filter is None:
             from devbench.reporting.snapshot import read_snapshot
 
             cached = read_snapshot(WORKSPACE_ROOT, log_file)
             if cached is not None:
                 print(cached.report_text)
                 return 0
-        report = generate_report(log_path=log_file, since=since_dt)
+        report = generate_report(log_path=log_file, since=since_dt, scope_filter=scope_filter)
         print(report)
         return 0
 
@@ -2177,6 +2224,7 @@ def cmd_report(since: str = "", watch_interval: int = 0, once: bool = False) -> 
             log_path=log_path,
             since=since_dt,
             report_started_at=report_started_at,
+            scope_filter=scope_filter,
         )
 
     return stream_report(log_file, _render)
@@ -6710,11 +6758,78 @@ def _extract_once_flag(raw_args: list[str]) -> tuple[bool, list[str]]:
     return once, filtered
 
 
-def _dispatch_watch_commands(command: str, watch_interval: int, args: list[str], once: bool = False) -> int | None:
-    """Dispatch commands that take ``--watch N``. Return ``None`` if not handled."""
-    if command == "report" and (watch_interval > 0 or once):
+def _extract_scope_flags_for_report(
+    raw_args: list[str],
+) -> tuple[str, str, list[str]]:
+    """Strip ``--include`` and ``--exclude`` from report args.
+
+    Returns ``(include, exclude, remaining_args)`` after consuming the
+    ``--include <tokens>`` and ``--exclude <tokens>`` flag pairs.  Any
+    positional argument that is not a recognised flag (i.e. the ``since``
+    timestamp) is preserved in ``remaining_args``.
+
+    Spec section 4.2.2 (AC-190-10, AC-190-11): ``cmd_report`` accepts
+    ``--include`` / ``--exclude`` as one-off scope overrides.
+
+    Args:
+        raw_args: Argument list after ``--watch`` and ``--once`` have
+            already been stripped.
+
+    Returns:
+        A three-tuple ``(include, exclude, remaining_args)`` where
+        ``include`` and ``exclude`` are raw token strings (empty when not
+        supplied) and ``remaining_args`` contains every arg not consumed
+        by the scope flags.
+    """
+    include = ""
+    exclude = ""
+    filtered: list[str] = []
+    i = 0
+    while i < len(raw_args):
+        arg = raw_args[i]
+        if arg in ("--include", "--exclude") and i + 1 < len(raw_args):
+            value = raw_args[i + 1]
+            if arg == "--include":
+                include = value
+            else:
+                exclude = value
+            i += 2
+            continue
+        filtered.append(arg)
+        i += 1
+    return include, exclude, filtered
+
+
+def _dispatch_watch_commands(
+    command: str,
+    watch_interval: int,
+    args: list[str],
+    once: bool = False,
+    include: str = "",
+    exclude: str = "",
+) -> int | None:
+    """Dispatch the ``report`` and ``watch`` commands. Return ``None`` if not handled.
+
+    The ``report`` command is always dispatched here (not via the generic
+    ``func(*sliced_args)`` path) so that ``include`` / ``exclude`` scope flags
+    are forwarded as keyword arguments to :func:`cmd_report`.
+
+    Args:
+        command: The devbench subcommand name.
+        watch_interval: The ``--watch N`` interval extracted by
+            :func:`_extract_watch_flag` (``0`` when not supplied).
+        args: Remaining positional arguments after flag extraction.
+        once: Whether ``--once`` / ``--no-stream`` was supplied.
+        include: Raw ``--include`` token string forwarded to ``cmd_report``.
+        exclude: Raw ``--exclude`` token string forwarded to ``cmd_report``.
+
+    Returns:
+        The command's integer exit code, or ``None`` when the command is
+        not handled by this dispatcher.
+    """
+    if command == "report":
         since_arg = args[0] if args else ""
-        return cmd_report(since=since_arg, watch_interval=watch_interval, once=once)
+        return cmd_report(since=since_arg, watch_interval=watch_interval, once=once, include=include, exclude=exclude)
     if command == "watch" and watch_interval > 0:
         return cmd_watch(watch_interval=watch_interval)
     return None
@@ -6748,21 +6863,27 @@ def main() -> int:
     if command in ("report", "watch"):
         watch_interval, args = _extract_watch_flag(sys.argv[2:])
     else:
-        watch_interval, args = 0, sys.argv[2:]
+        watch_interval, args = 0, list(sys.argv[2:])
 
     # Issue #163: ``devbench report`` accepts ``--once`` / ``--no-stream``
     # to force one-shot snapshot rendering even on a TTY. Strip the flag
     # before the args reach the command function so the positional
     # ``since`` slot stays well-defined.
     once = False
+    include = ""
+    exclude = ""
     if command == "report":
         once, args = _extract_once_flag(args)
+        # Issue #190 (AC-190-10, AC-190-11): strip ``--include`` / ``--exclude``
+        # scope-filter flags before the remaining positional ``since`` arg is
+        # resolved. The extracted strings are forwarded to ``cmd_report``.
+        include, exclude, args = _extract_scope_flags_for_report(args)
 
     if len(args) < min_args:
         print(f"Command '{command}' requires at least {min_args} argument(s)", file=sys.stderr)
         return 1
 
-    watch_rc = _dispatch_watch_commands(command, watch_interval, args, once=once)
+    watch_rc = _dispatch_watch_commands(command, watch_interval, args, once=once, include=include, exclude=exclude)
     if watch_rc is not None:
         return watch_rc
 

@@ -16,6 +16,16 @@ report-as-reader cannot diverge):
 3. ``<JUDGE_WORKSPACE_ROOT>/logs/orchestrator.log`` convention.
 4. ``<devbench source tree>/logs/orchestrator.log`` legacy fallback for
    invocations outside any workspace (test fixtures, local dev).
+
+Per-session routing (spec 4.4.4, AC-192-14):
+When ``DEVBENCH_SESSION_NAME`` is set, ``setup_logging`` attaches a second
+``FileHandler`` routing to
+``<JUDGE_WORKSPACE_ROOT>/<SESSION_SESSIONS_BASE_DIR>/<name>/orchestrator.log``
+in addition to the aggregate log above.  Both handlers are active simultaneously
+so messages appear in both the per-session log and the global aggregate.
+``JUDGE_WORKSPACE_ROOT`` MUST be set when ``DEVBENCH_SESSION_NAME`` is set;
+if it is absent ``_resolve_session_log_file`` raises ``RuntimeError`` with an
+actionable message.
 """
 
 import logging
@@ -29,6 +39,7 @@ from devbench.constants import (
     DEFAULT_LOG_SUBDIR,
     LOG_DATE_FORMAT,
     LOG_FORMAT,
+    SESSION_SESSIONS_BASE_DIR,
 )
 
 _DEFAULT_LOG_DIR = Path(__file__).resolve().parent / DEFAULT_LOG_SUBDIR
@@ -71,6 +82,31 @@ def _resolve_log_file() -> Path:
     return Path(_DEFAULT_LOG_FILE)
 
 
+def _resolve_session_log_file() -> Path | None:
+    """Return the per-session log path when ``DEVBENCH_SESSION_NAME`` is set.
+
+    Returns ``None`` when the env var is absent or empty -- callers must skip
+    attaching a session FileHandler in that case.
+
+    Raises:
+        RuntimeError: When ``DEVBENCH_SESSION_NAME`` is set but
+            ``JUDGE_WORKSPACE_ROOT`` is absent or empty.  Both env vars must
+            be present together; missing ``JUDGE_WORKSPACE_ROOT`` is an
+            operator configuration error that must fail loudly.
+    """
+    session_name = os.environ.get("DEVBENCH_SESSION_NAME", "").strip()
+    if not session_name:
+        return None
+    workspace = os.environ.get("JUDGE_WORKSPACE_ROOT", "").strip()
+    if not workspace:
+        raise RuntimeError(
+            "JUDGE_WORKSPACE_ROOT must be set when DEVBENCH_SESSION_NAME is set. "
+            "The per-session log cannot be routed without a workspace root. "
+            "Set JUDGE_WORKSPACE_ROOT to the devbench workspace directory."
+        )
+    return Path(workspace) / SESSION_SESSIONS_BASE_DIR / session_name / DEFAULT_LOG_FILENAME
+
+
 def setup_logging(level: int | None = None) -> Path:
     """Configure logging with stdout and file handlers.
 
@@ -80,9 +116,19 @@ def setup_logging(level: int | None = None) -> Path:
        e.g. ``DEBUG``, ``INFO``, ``WARNING``).
     3. ``INFO`` as the default.
 
-    Returns the path to the log file.
+    When ``DEVBENCH_SESSION_NAME`` is set, attaches a second ``FileHandler``
+    routing to the per-session log in addition to the aggregate log
+    (spec 4.4.4, AC-192-14).  ``JUDGE_WORKSPACE_ROOT`` must also be set in
+    that case; see ``_resolve_session_log_file`` for the contract.
+
+    Returns the path to the aggregate log file.
 
     Safe to call multiple times -- only configures on the first call.
+
+    Raises:
+        RuntimeError: Propagated from ``_resolve_session_log_file`` when
+            ``DEVBENCH_SESSION_NAME`` is set but ``JUDGE_WORKSPACE_ROOT`` is
+            missing.
     """
     if _state[0]:
         return _resolve_log_file()
@@ -93,6 +139,10 @@ def setup_logging(level: int | None = None) -> Path:
 
     log_file = _resolve_log_file()
     log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # Resolve per-session log path before touching any handlers so a
+    # RuntimeError here aborts the setup cleanly (no partial handler state).
+    session_log_file = _resolve_session_log_file()
 
     root_logger = logging.getLogger()
     root_logger.setLevel(level)
@@ -109,11 +159,21 @@ def setup_logging(level: int | None = None) -> Path:
     stderr_handler.setFormatter(formatter)
     root_logger.addHandler(stderr_handler)
 
-    # File handler -- persistent log for review
+    # Aggregate file handler -- persistent log for review and backwards
+    # compatibility with single-session deployments.
     file_handler = logging.FileHandler(str(log_file), encoding="utf-8")
     file_handler.setLevel(level)
     file_handler.setFormatter(formatter)
     root_logger.addHandler(file_handler)
+
+    # Per-session file handler (spec 4.4.4, AC-192-14) -- attached in addition
+    # to the aggregate handler so both logs receive the same messages.
+    if session_log_file is not None:
+        session_log_file.parent.mkdir(parents=True, exist_ok=True)
+        session_handler = logging.FileHandler(str(session_log_file), encoding="utf-8")
+        session_handler.setLevel(level)
+        session_handler.setFormatter(formatter)
+        root_logger.addHandler(session_handler)
 
     _state[0] = True
     # Demoted to DEBUG (issue #132): every devbench CLI invocation used to

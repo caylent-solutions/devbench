@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 import devbench.log_setup as log_setup_mod
+from devbench.constants import DEFAULT_LOG_FILENAME, SESSION_SESSIONS_BASE_DIR
 
 
 class TestSetupLogging:
@@ -169,3 +173,158 @@ class TestStartupBannerDemoted:
             "At JUDGE_LOG_LEVEL=DEBUG the banner must remain available for "
             "operator diagnostics. Log file contents: " + repr(log_contents)
         )
+
+
+class TestPerSessionLogRouting:
+    """AC-192-14: when DEVBENCH_SESSION_NAME is set, setup_logging() adds a
+    FileHandler routing to <workspace>/.devbench/sessions/<name>/orchestrator.log
+    in addition to the aggregate <workspace>/logs/orchestrator.log.
+    """
+
+    def setup_method(self) -> None:
+        """Reset logging state before each test."""
+        log_setup_mod._state[0] = False
+        logging.getLogger().handlers.clear()
+
+    def teardown_method(self) -> None:
+        """Clean up after each test."""
+        log_setup_mod._state[0] = False
+        logging.getLogger().handlers.clear()
+
+    def _session_file_handlers(self, session_name: str, workspace: str) -> list[logging.FileHandler]:
+        """Return FileHandlers whose baseFilename points inside the session dir."""
+        session_dir = str(Path(workspace) / SESSION_SESSIONS_BASE_DIR / session_name)
+        return [
+            h
+            for h in logging.getLogger().handlers
+            if isinstance(h, logging.FileHandler) and session_dir in h.baseFilename
+        ]
+
+    def test_session_file_handler_added_when_env_var_set(self, tmp_path: Path) -> None:
+        """When DEVBENCH_SESSION_NAME is set, exactly one session FileHandler is added."""
+        log_file = tmp_path / "logs" / "orchestrator.log"
+        env = {
+            "JUDGE_LOG_FILE": str(log_file),
+            "DEVBENCH_SESSION_NAME": "mysession",
+            "JUDGE_WORKSPACE_ROOT": str(tmp_path),
+        }
+        with patch.dict("os.environ", env, clear=False):
+            os.environ.pop("JUDGE_LOG_LEVEL", None)
+            log_setup_mod.setup_logging()
+
+        session_handlers = self._session_file_handlers("mysession", str(tmp_path))
+        assert len(session_handlers) == 1, f"expected exactly 1 session FileHandler; got {session_handlers}"
+
+    def test_session_log_directory_created_automatically(self, tmp_path: Path) -> None:
+        """The per-session directory is created if it does not exist yet."""
+        log_file = tmp_path / "logs" / "orchestrator.log"
+        env = {
+            "JUDGE_LOG_FILE": str(log_file),
+            "DEVBENCH_SESSION_NAME": "newsession",
+            "JUDGE_WORKSPACE_ROOT": str(tmp_path),
+        }
+        with patch.dict("os.environ", env, clear=False):
+            os.environ.pop("JUDGE_LOG_LEVEL", None)
+            log_setup_mod.setup_logging()
+
+        expected_dir = tmp_path / SESSION_SESSIONS_BASE_DIR / "newsession"
+        assert expected_dir.exists(), f"session directory {expected_dir} was not created"
+
+    def test_session_log_filename_is_orchestrator_log(self, tmp_path: Path) -> None:
+        """The per-session log file is named orchestrator.log (DEFAULT_LOG_FILENAME)."""
+        log_file = tmp_path / "logs" / "orchestrator.log"
+        session_name = "alpha"
+        env = {
+            "JUDGE_LOG_FILE": str(log_file),
+            "DEVBENCH_SESSION_NAME": session_name,
+            "JUDGE_WORKSPACE_ROOT": str(tmp_path),
+        }
+        with patch.dict("os.environ", env, clear=False):
+            os.environ.pop("JUDGE_LOG_LEVEL", None)
+            log_setup_mod.setup_logging()
+
+        session_handlers = self._session_file_handlers(session_name, str(tmp_path))
+        assert len(session_handlers) == 1
+        assert session_handlers[0].baseFilename.endswith(DEFAULT_LOG_FILENAME), (
+            f"session log must be named {DEFAULT_LOG_FILENAME}; got {session_handlers[0].baseFilename}"
+        )
+
+    def test_messages_written_to_both_aggregate_and_session_log(self, tmp_path: Path) -> None:
+        """A logged message appears in both the aggregate log and the session log."""
+        log_file = tmp_path / "logs" / "orchestrator.log"
+        session_name = "beta"
+        env = {
+            "JUDGE_LOG_FILE": str(log_file),
+            "DEVBENCH_SESSION_NAME": session_name,
+            "JUDGE_WORKSPACE_ROOT": str(tmp_path),
+        }
+        with patch.dict("os.environ", env, clear=False):
+            os.environ.pop("JUDGE_LOG_LEVEL", None)
+            log_setup_mod.setup_logging()
+
+        logging.getLogger("test.session").info("dual-routing-marker")
+        for h in logging.getLogger().handlers:
+            h.flush()
+
+        aggregate_text = log_file.read_text(encoding="utf-8")
+        session_log = tmp_path / SESSION_SESSIONS_BASE_DIR / session_name / DEFAULT_LOG_FILENAME
+        session_text = session_log.read_text(encoding="utf-8")
+
+        assert "dual-routing-marker" in aggregate_text, "message not found in aggregate log"
+        assert "dual-routing-marker" in session_text, "message not found in session log"
+
+    @pytest.mark.parametrize("session_env_value", ["", None])
+    def test_no_session_handler_when_env_absent_or_empty(self, tmp_path: Path, session_env_value: str | None) -> None:
+        """When DEVBENCH_SESSION_NAME is absent or empty, no session handler is added."""
+        log_file = tmp_path / "logs" / "orchestrator.log"
+        env: dict[str, str] = {
+            "JUDGE_LOG_FILE": str(log_file),
+            "JUDGE_WORKSPACE_ROOT": str(tmp_path),
+        }
+        if session_env_value is not None:
+            env["DEVBENCH_SESSION_NAME"] = session_env_value
+
+        with patch.dict("os.environ", env, clear=False):
+            os.environ.pop("DEVBENCH_SESSION_NAME", None) if session_env_value is None else None
+            log_setup_mod.setup_logging()
+
+        # Only the aggregate FileHandler should exist; no session-scoped handler
+        file_handlers = [h for h in logging.getLogger().handlers if isinstance(h, logging.FileHandler)]
+        # Should have exactly 1 FileHandler (the aggregate log, not a session log)
+        session_dir_path = str(tmp_path / SESSION_SESSIONS_BASE_DIR)
+        session_handlers = [h for h in file_handlers if session_dir_path in h.baseFilename]
+        assert session_handlers == [], (
+            f"no session handler expected when DEVBENCH_SESSION_NAME={session_env_value!r}; got {session_handlers}"
+        )
+
+    def test_raises_runtime_error_when_workspace_root_missing(self, tmp_path: Path) -> None:
+        """When DEVBENCH_SESSION_NAME is set but JUDGE_WORKSPACE_ROOT is unset,
+        _resolve_session_log_file raises RuntimeError with an actionable message.
+        """
+        log_file = tmp_path / "logs" / "orchestrator.log"
+        env = {
+            "JUDGE_LOG_FILE": str(log_file),
+            "DEVBENCH_SESSION_NAME": "orphan",
+        }
+        with patch.dict("os.environ", env, clear=False):
+            os.environ.pop("JUDGE_WORKSPACE_ROOT", None)
+            with pytest.raises(RuntimeError, match="JUDGE_WORKSPACE_ROOT"):
+                log_setup_mod.setup_logging()
+
+    @pytest.mark.parametrize("session_name", ["alpha", "beta-2", "my_session"])
+    def test_session_log_path_constructed_from_session_name(self, tmp_path: Path, session_name: str) -> None:
+        """The session log path uses the exact value of DEVBENCH_SESSION_NAME."""
+        log_file = tmp_path / "logs" / "orchestrator.log"
+        env = {
+            "JUDGE_LOG_FILE": str(log_file),
+            "DEVBENCH_SESSION_NAME": session_name,
+            "JUDGE_WORKSPACE_ROOT": str(tmp_path),
+        }
+        with patch.dict("os.environ", env, clear=False):
+            os.environ.pop("JUDGE_LOG_LEVEL", None)
+            log_setup_mod.setup_logging()
+
+        expected_path = tmp_path / SESSION_SESSIONS_BASE_DIR / session_name / DEFAULT_LOG_FILENAME
+        session_handlers = self._session_file_handlers(session_name, str(tmp_path))
+        assert len(session_handlers) == 1
+        assert Path(session_handlers[0].baseFilename) == expected_path.resolve()

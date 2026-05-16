@@ -3,8 +3,20 @@
 By the end of this guide, your workspace will have a passing `devbench validate-backlog`
 and be one command away from launching the orchestrator for the first time.
 
+## Two setup paths
+
+You have two ways to reach a running DevBench orchestrator:
+
+| Path | When to use |
+|------|-------------|
+| **Skill-driven** (recommended for new projects) | You want the full setup automated -- Claude Code marketplace skills author the spec, generate the backlog, write `devbench.yaml`, and bootstrap every repo. See [docs/onboarding.md](onboarding.md) for the chained-skill workflow (`create-spec -> spec-to-backlog -> configure-devbench -> bootstrap-environment -> make start`). |
+| **Manual** (this guide) | You already have a backlog, need fine-grained control, or prefer to walk through each step yourself. Continue reading. |
+
+---
+
 ## Table of contents
 
+- [Two setup paths](#two-setup-paths)
 - [Prerequisites](#prerequisites)
 - [Step 1: Clone devbench](#step-1-clone-devbench)
 - [Step 2: Install dependencies](#step-2-install-dependencies)
@@ -959,6 +971,7 @@ directory.
 ## Cross-references
 
 - [`README.md`](../README.md) (ref) -- project overview and quick-start
+- [`docs/onboarding.md`](onboarding.md) (ref) -- chained-skill operator workflow (create-spec -> spec-to-backlog -> configure-devbench -> bootstrap-environment -> make start)
 - [`docs/creating-specs-and-backlogs.md`](creating-specs-and-backlogs.md) (ref) -- full backlog-authoring guide
 - [`docs/backlog-contract.md`](backlog-contract.md) (ref) -- validation rule set and workspace layout
 - [`docs/llm-authentication.md`](llm-authentication.md) (ref) -- full Claude / Bedrock auth options

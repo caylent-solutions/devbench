@@ -28,6 +28,7 @@ DevBench drives a structured backlog from claim to merged PR without human inter
 - **Real LLM review at every gate.** Every verdict is logged as an audit comment on the work unit.
 - **Auditable by default.** Every agent action writes a timestamped comment on the work unit file. The orchestrator can resume from any point after a restart because state lives on disk, not in memory.
 - **Draft status lifecycle.** New work units can be created in `draft` status (pre-`in-queue` gate) so operators can review every generated task before autonomous execution begins. Use `devbench promote <id>` (or `--epic`, `--feature`, `--story`, `--all`) to transition `draft -> in-queue`. Configure the default via `backlog.default_status_for_new_work_units` in `devbench.yaml` (default: `in-queue`, preserving backwards compatibility). See [docs/devbench-yaml-reference.md](docs/devbench-yaml-reference.md) for the full config reference.
+- **Skill-driven onboarding.** Four Claude Code marketplace skills automate the full setup chain: `create-spec` (author a rigorous engineering spec), `spec-to-backlog` (decompose the spec into a validated backlog), `configure-devbench` (author `backlog/config/devbench.yaml` with live validation), and `bootstrap-environment` (clone repos + run `make validate`). Use the skill chain instead of manual step-by-step setup. See [docs/onboarding.md](docs/onboarding.md) for the chained-skill operator workflow.
 
 The judge / agent layer:
 

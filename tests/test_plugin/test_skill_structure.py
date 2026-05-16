@@ -1,4 +1,4 @@
-"""Unit tests for orchestrate SKILL.md content correctness."""
+"""Unit tests for orchestrate and create-spec SKILL.md content correctness."""
 
 from __future__ import annotations
 
@@ -7,6 +7,10 @@ from pathlib import Path
 import pytest
 
 SKILL_PATH = Path(__file__).parent.parent.parent / "plugin" / "devbench" / "skills" / "orchestrate" / "SKILL.md"
+
+CREATE_SPEC_SKILL_PATH = (
+    Path(__file__).parent.parent.parent / "plugin" / "devbench" / "skills" / "create-spec" / "SKILL.md"
+)
 
 
 @pytest.mark.unit
@@ -213,4 +217,277 @@ class TestOrchestrateSkillDrainCheck:
         assert "exit" in drain_section.lower(), (
             "SKILL.md drain check step must instruct the orchestrator to exit cleanly "
             "when a drain is pending"
+        )
+
+
+# ---------------------------------------------------------------------------
+# create-spec/SKILL.md tests  (AC-191-2, AC-191-3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestCreateSpecSkillFrontmatter:
+    """AC-191-2: create-spec/SKILL.md must have valid frontmatter with required fields."""
+
+    def test_skill_file_exists(self) -> None:
+        """AC-191-2: create-spec/SKILL.md must exist."""
+        assert CREATE_SPEC_SKILL_PATH.exists(), (
+            f"create-spec/SKILL.md not found at {CREATE_SPEC_SKILL_PATH}"
+        )
+
+    def test_frontmatter_name_is_create_spec(self) -> None:
+        """AC-191-2: Frontmatter must declare name: create-spec."""
+        content = CREATE_SPEC_SKILL_PATH.read_text()
+        assert "name: create-spec" in content, (
+            "create-spec/SKILL.md frontmatter must contain 'name: create-spec'"
+        )
+
+    def test_frontmatter_model_is_opus(self) -> None:
+        """AC-191-2: Frontmatter must declare model: opus (top-tier reasoning for authoring + self-critique)."""
+        content = CREATE_SPEC_SKILL_PATH.read_text()
+        assert "model: opus" in content, (
+            "create-spec/SKILL.md frontmatter must contain 'model: opus' "
+            "(high-quality authoring + self-critique requires top-tier reasoning)"
+        )
+
+    def test_frontmatter_is_yaml_delimited(self) -> None:
+        """AC-191-2: Frontmatter must be delimited by YAML front-matter markers."""
+        content = CREATE_SPEC_SKILL_PATH.read_text()
+        assert content.startswith("---"), (
+            "create-spec/SKILL.md must start with YAML frontmatter delimiter '---'"
+        )
+        # Second --- must close the frontmatter block
+        assert content.count("---") >= 2, (
+            "create-spec/SKILL.md must have at least two '---' markers (open + close frontmatter)"
+        )
+
+
+@pytest.mark.unit
+class TestCreateSpecSkillTools:
+    """AC-191-2: create-spec/SKILL.md must declare tools: Read, Write, Edit, Bash."""
+
+    def test_skill_declares_read_tool(self) -> None:
+        """create-spec skill must declare the Read tool."""
+        content = CREATE_SPEC_SKILL_PATH.read_text()
+        assert "Read" in content, "create-spec/SKILL.md must declare the Read tool"
+
+    def test_skill_declares_write_tool(self) -> None:
+        """create-spec skill must declare the Write tool."""
+        content = CREATE_SPEC_SKILL_PATH.read_text()
+        assert "Write" in content, "create-spec/SKILL.md must declare the Write tool"
+
+    def test_skill_declares_edit_tool(self) -> None:
+        """create-spec skill must declare the Edit tool."""
+        content = CREATE_SPEC_SKILL_PATH.read_text()
+        assert "Edit" in content, "create-spec/SKILL.md must declare the Edit tool"
+
+    def test_skill_declares_bash_tool(self) -> None:
+        """create-spec skill must declare the Bash tool."""
+        content = CREATE_SPEC_SKILL_PATH.read_text()
+        assert "Bash" in content, "create-spec/SKILL.md must declare the Bash tool"
+
+
+@pytest.mark.unit
+class TestCreateSpecSkillKanonExemplarStep:
+    """AC-191-3: Step 1 must instruct reading the kanon spec exemplar to internalise quality bar."""
+
+    def test_skill_reads_kanon_exemplar(self) -> None:
+        """Step 1 must reference the kanon spec exemplar path so quality bar is internalised."""
+        content = CREATE_SPEC_SKILL_PATH.read_text()
+        assert "kanon" in content.lower(), (
+            "create-spec/SKILL.md step 1 must reference the kanon spec exemplar "
+            "to internalise the quality bar"
+        )
+
+    def test_skill_references_kanon_spec_exemplar_path(self) -> None:
+        """Step 1 must include the literal exemplar path from spec section 4.6.0."""
+        content = CREATE_SPEC_SKILL_PATH.read_text()
+        assert "kanon-list-add-lock-features-spec.md" in content, (
+            "create-spec/SKILL.md must reference the kanon spec exemplar file name "
+            "'kanon-list-add-lock-features-spec.md' so the skill reads the canonical quality reference"
+        )
+
+
+@pytest.mark.unit
+class TestCreateSpecSkillOperatorQuestions:
+    """AC-191-3: Step 2 must ask structured questions covering all kanon-spec sections."""
+
+    def test_skill_asks_about_problem_or_goals(self) -> None:
+        """Step 2 must ask the operator about problem statement / goals."""
+        content = CREATE_SPEC_SKILL_PATH.read_text()
+        assert any(kw in content.lower() for kw in ("problem", "goal")), (
+            "create-spec/SKILL.md step 2 must ask the operator about problem/goals"
+        )
+
+    def test_skill_asks_about_non_goals(self) -> None:
+        """Step 2 must ask the operator about non-goals."""
+        content = CREATE_SPEC_SKILL_PATH.read_text()
+        assert "non-goal" in content.lower() or "out-of-scope" in content.lower(), (
+            "create-spec/SKILL.md step 2 must ask the operator about non-goals / out-of-scope"
+        )
+
+    def test_skill_asks_about_functional_requirements(self) -> None:
+        """Step 2 must ask about functional requirements (FR)."""
+        content = CREATE_SPEC_SKILL_PATH.read_text()
+        assert any(kw in content.lower() for kw in ("functional requirement", "fr", "feature")), (
+            "create-spec/SKILL.md step 2 must ask the operator about functional requirements"
+        )
+
+    def test_skill_asks_about_acceptance_criteria(self) -> None:
+        """Step 2 must ask about acceptance criteria."""
+        content = CREATE_SPEC_SKILL_PATH.read_text()
+        assert "acceptance criteria" in content.lower() or " ac" in content.lower(), (
+            "create-spec/SKILL.md step 2 must ask the operator about acceptance criteria"
+        )
+
+
+@pytest.mark.unit
+class TestCreateSpecSkillAuthoringFlow:
+    """AC-191-3: Steps 3-5 must implement the one-section-at-a-time authoring flow."""
+
+    def test_skill_mentions_section_by_section_authoring(self) -> None:
+        """Step 3 must instruct authoring the spec one section at a time."""
+        content = CREATE_SPEC_SKILL_PATH.read_text()
+        assert any(phrase in content.lower() for phrase in ("section at a time", "one section", "section-by-section")), (
+            "create-spec/SKILL.md step 3 must instruct authoring the spec one section at a time"
+        )
+
+    def test_skill_writes_output_to_spec_dir(self) -> None:
+        """AC-191-3: Output must be written to spec/<project-name>.md."""
+        content = CREATE_SPEC_SKILL_PATH.read_text()
+        assert "spec/" in content, (
+            "create-spec/SKILL.md must write output to spec/<project-name>.md"
+        )
+
+    def test_skill_offers_spec_to_backlog_handoff(self) -> None:
+        """End-of-skill must offer to invoke spec-to-backlog."""
+        content = CREATE_SPEC_SKILL_PATH.read_text()
+        assert "spec-to-backlog" in content, (
+            "create-spec/SKILL.md must offer to invoke spec-to-backlog at the end of the skill"
+        )
+
+
+@pytest.mark.unit
+class TestCreateSpecSkillIterateUntilPerfectLoop:
+    """AC-191-3: Step 4 must implement the iterate-until-perfect self-critique loop."""
+
+    def test_skill_implements_self_critique(self) -> None:
+        """Step 4 must include self-critique against the create-spec rubric."""
+        content = CREATE_SPEC_SKILL_PATH.read_text()
+        assert any(kw in content.lower() for kw in ("self-critique", "self critique", "rubric")), (
+            "create-spec/SKILL.md step 4 must implement self-critique against the create-spec rubric"
+        )
+
+    def test_skill_has_max_iterations_config(self) -> None:
+        """Loop must respect max_iterations (configurable; default 5 per spec section 4.6.0)."""
+        content = CREATE_SPEC_SKILL_PATH.read_text()
+        assert "max_iterations" in content or "max iterations" in content.lower(), (
+            "create-spec/SKILL.md must reference max_iterations for the iterate-until-perfect loop"
+        )
+
+    def test_skill_has_quality_threshold(self) -> None:
+        """Loop must run until quality_threshold (zero unresolved items) is met."""
+        content = CREATE_SPEC_SKILL_PATH.read_text()
+        assert "zero" in content.lower() or "quality_threshold" in content or "unresolved" in content.lower(), (
+            "create-spec/SKILL.md must reference the quality_threshold (zero unresolved items)"
+        )
+
+    def test_skill_blocks_on_max_iterations_without_convergence(self) -> None:
+        """When max_iterations is reached without converging, skill must emit a BLOCKED audit."""
+        content = CREATE_SPEC_SKILL_PATH.read_text()
+        assert "BLOCKED" in content or "blocked" in content.lower(), (
+            "create-spec/SKILL.md must emit a BLOCKED audit when max_iterations is reached "
+            "without converging rather than silently shipping a sub-quality artefact"
+        )
+
+
+@pytest.mark.unit
+class TestCreateSpecSkillRubricCoverage:
+    """AC-191-3: Self-critique rubric must cover all 8 items from spec section 4.6.0."""
+
+    def test_rubric_covers_16_kanon_sections(self) -> None:
+        """Rubric item 1: all 16 top-level sections from kanon exemplar must be present."""
+        content = CREATE_SPEC_SKILL_PATH.read_text()
+        assert "16" in content or "sixteen" in content.lower(), (
+            "create-spec/SKILL.md rubric must require all 16 top-level sections "
+            "from the kanon exemplar (or explicit N/A justification)"
+        )
+
+    def test_rubric_requires_worked_examples_per_goal(self) -> None:
+        """Rubric item 2: every goal must have a worked example."""
+        content = CREATE_SPEC_SKILL_PATH.read_text()
+        assert "worked example" in content.lower() or "worked-example" in content.lower(), (
+            "create-spec/SKILL.md rubric must require a worked example for every goal"
+        )
+
+    def test_rubric_requires_error_handling_per_fr(self) -> None:
+        """Rubric item 3: every FR must have explicit error-handling semantics."""
+        content = CREATE_SPEC_SKILL_PATH.read_text()
+        assert "error" in content.lower() and any(
+            kw in content.lower() for kw in ("fr", "functional requirement", "each fr", "every fr")
+        ), (
+            "create-spec/SKILL.md rubric must require explicit error-handling semantics for every FR"
+        )
+
+    def test_rubric_requires_non_goals_stated(self) -> None:
+        """Rubric item 4: every non-goal must be stated rather than implied."""
+        content = CREATE_SPEC_SKILL_PATH.read_text()
+        assert "non-goal" in content.lower() or "non goal" in content.lower(), (
+            "create-spec/SKILL.md rubric must require that non-goals are stated rather than implied"
+        )
+
+    def test_rubric_requires_numbered_testable_acs(self) -> None:
+        """Rubric item 5: acceptance criteria must be numbered and testable from the spec text alone."""
+        content = CREATE_SPEC_SKILL_PATH.read_text()
+        assert "testable" in content.lower() or "numbered" in content.lower(), (
+            "create-spec/SKILL.md rubric must require numbered and testable acceptance criteria"
+        )
+
+    def test_rubric_requires_cross_references_to_primitives(self) -> None:
+        """Rubric item 6: cross-references to existing primitives must exist for every reused component."""
+        content = CREATE_SPEC_SKILL_PATH.read_text()
+        assert "cross-reference" in content.lower() or "cross reference" in content.lower() or "primitives" in content.lower(), (
+            "create-spec/SKILL.md rubric must require cross-references to reused primitives"
+        )
+
+    def test_rubric_requires_resolved_decisions_record(self) -> None:
+        """Rubric item 7: resolved-decisions interview record must capture every design call."""
+        content = CREATE_SPEC_SKILL_PATH.read_text()
+        assert "resolved" in content.lower() and "decision" in content.lower(), (
+            "create-spec/SKILL.md rubric must require a resolved-decisions interview record"
+        )
+
+    def test_rubric_requires_out_of_scope_section(self) -> None:
+        """Rubric item 8: out-of-scope section must name every plausible adjacent ask not covered."""
+        content = CREATE_SPEC_SKILL_PATH.read_text()
+        assert "out-of-scope" in content.lower() or "out of scope" in content.lower(), (
+            "create-spec/SKILL.md rubric must require an out-of-scope section"
+        )
+
+
+@pytest.mark.unit
+class TestCreateSpecSkillOperatorFinalReview:
+    """AC-191-3: Step 5 must include final operator review before writing the spec."""
+
+    def test_skill_presents_spec_to_operator_before_writing(self) -> None:
+        """Step 5 must present the spec to the operator for final review before writing."""
+        content = CREATE_SPEC_SKILL_PATH.read_text()
+        assert any(phrase in content.lower() for phrase in ("operator review", "review", "looks good", "feedback")), (
+            "create-spec/SKILL.md step 5 must present the spec to the operator for final review"
+        )
+
+    def test_skill_re_enters_iterate_loop_on_operator_feedback(self) -> None:
+        """Step 5 must re-enter the iterate loop when the operator provides feedback."""
+        content = CREATE_SPEC_SKILL_PATH.read_text()
+        # The skill should mention re-entering the loop or revising on feedback
+        assert any(phrase in content.lower() for phrase in ("re-enter", "re-run", "revise", "iterate", "feedback")), (
+            "create-spec/SKILL.md step 5 must re-enter the iterate loop on operator feedback"
+        )
+
+    def test_skill_target_output_size_mentioned(self) -> None:
+        """Spec output target of 1000+ lines must be stated so operator knows the quality bar."""
+        content = CREATE_SPEC_SKILL_PATH.read_text()
+        assert "1000" in content or "1,000" in content, (
+            "create-spec/SKILL.md must state the target output size (1000+ lines) "
+            "so the operator understands the quality bar"
         )

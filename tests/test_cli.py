@@ -16298,3 +16298,387 @@ class TestCmdSessionsIntegration:
 
         remaining = SessionRegistry(tmp_path).load()
         assert all(s.name != "gone" for s in remaining), "stale session must be removed from registry"
+
+
+# ---------------------------------------------------------------------------
+# cmd_stop tests (E4-F5-S1-T2, issue #192)
+# ---------------------------------------------------------------------------
+
+
+class TestCmdStopRegistered:
+    """cmd_stop is registered in _COMMANDS and _VARIADIC_COMMANDS."""
+
+    @pytest.mark.unit
+    def test_stop_in_commands(self) -> None:
+        """'stop' key must be present in _COMMANDS."""
+        assert "stop" in cli._COMMANDS
+
+    @pytest.mark.unit
+    def test_stop_in_variadic_commands(self) -> None:
+        """'stop' must be in _VARIADIC_COMMANDS so --session flag parsing works."""
+        assert "stop" in cli._VARIADIC_COMMANDS
+
+    @pytest.mark.unit
+    def test_stop_command_maps_to_cmd_stop(self) -> None:
+        """_COMMANDS['stop'] callable must be cli.cmd_stop."""
+        func, _min_args, _desc = cli._COMMANDS["stop"]
+        assert func is cli.cmd_stop
+
+
+class TestParseStopArgv:
+    """_parse_stop_argv correctly parses --session <name> flags."""
+
+    @pytest.mark.unit
+    def test_valid_session_name_returns_name(self) -> None:
+        """--session <name> returns the session name and rc=0."""
+        name, rc, msg = cli._parse_stop_argv(("--session", "myrun"))
+        assert name == "myrun"
+        assert rc == 0
+        assert msg == ""
+
+    @pytest.mark.unit
+    def test_missing_session_flag_returns_error(self) -> None:
+        """No --session flag returns rc=2 with an error message."""
+        name, rc, msg = cli._parse_stop_argv(())
+        assert name is None
+        assert rc == 2
+        assert "session" in msg.lower()
+
+    @pytest.mark.unit
+    def test_session_flag_without_value_returns_error(self) -> None:
+        """--session with no following value returns rc=2."""
+        name, rc, msg = cli._parse_stop_argv(("--session",))
+        assert name is None
+        assert rc == 2
+        assert "session" in msg.lower()
+
+    @pytest.mark.unit
+    def test_unknown_flag_returns_error(self) -> None:
+        """Unknown flag returns rc=2."""
+        name, rc, msg = cli._parse_stop_argv(("--unknown",))
+        assert name is None
+        assert rc == 2
+        assert "unknown" in msg.lower()
+
+    @pytest.mark.unit
+    def test_empty_session_name_returns_error(self) -> None:
+        """--session with empty string value returns rc=2."""
+        name, rc, msg = cli._parse_stop_argv(("--session", ""))
+        assert name is None
+        assert rc == 2
+        assert "session" in msg.lower()
+
+
+class TestCmdStopErrors:
+    """cmd_stop returns non-zero with actionable messages on error paths."""
+
+    @pytest.mark.unit
+    def test_missing_session_flag_returns_rc2(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """cmd_stop with no args returns rc=2 and prints error to stderr."""
+        rc = cli.cmd_stop()
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "session" in err.lower()
+
+    @pytest.mark.unit
+    def test_unknown_session_returns_rc1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """cmd_stop for a session that has no state dir returns rc=1."""
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_stop("--session", "nonexistent")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "nonexistent" in err or "not found" in err.lower() or "pid" in err.lower()
+
+    @pytest.mark.unit
+    def test_missing_pid_file_returns_rc1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """cmd_stop when state dir exists but pid file is absent returns rc=1."""
+        state_dir = tmp_path / ".devbench" / "sessions" / "nopid"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        # No pid file written
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_stop("--session", "nopid")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "pid" in err.lower() or "nopid" in err
+
+    @pytest.mark.unit
+    def test_non_integer_pid_file_returns_rc1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """cmd_stop when pid file contains non-integer text returns rc=1."""
+        state_dir = tmp_path / ".devbench" / "sessions" / "badpid"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / "pid").write_text("notanumber", encoding="utf-8")
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_stop("--session", "badpid")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "pid" in err.lower()
+
+    @pytest.mark.unit
+    def test_dotdot_session_name_returns_rc1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """cmd_stop with '..' in session name returns rc=2 (invalid name)."""
+        rc = cli.cmd_stop("--session", "../etc/passwd")
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "invalid" in err.lower() or "session" in err.lower()
+
+
+class TestCmdStopSendsSigterm:
+    """cmd_stop reads pid file and sends SIGTERM to the target process."""
+
+    @pytest.mark.unit
+    def test_sends_sigterm_to_pid_in_file(self, tmp_path: Path) -> None:
+        """cmd_stop sends os.kill(pid, signal.SIGTERM) to the PID in the pid file."""
+        import signal
+
+        state_dir = tmp_path / ".devbench" / "sessions" / "myrun"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / "pid").write_text("12345", encoding="utf-8")
+
+        sent_signals: list[tuple[int, int]] = []
+
+        def _fake_kill(pid: int, sig: int) -> None:
+            sent_signals.append((pid, sig))
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.os.kill", side_effect=_fake_kill),
+        ):
+            rc = cli.cmd_stop("--session", "myrun")
+
+        assert rc == 0
+        assert (12345, signal.SIGTERM) in sent_signals, "SIGTERM must be sent to the PID from the pid file"
+
+    @pytest.mark.unit
+    def test_returns_rc0_on_success(self, tmp_path: Path) -> None:
+        """cmd_stop returns rc=0 after successfully sending SIGTERM."""
+        state_dir = tmp_path / ".devbench" / "sessions" / "run1"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / "pid").write_text("12345", encoding="utf-8")
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.os.kill"),
+        ):
+            rc = cli.cmd_stop("--session", "run1")
+
+        assert rc == 0
+
+    @pytest.mark.unit
+    def test_prints_confirmation_message(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """cmd_stop prints a confirmation message to stdout on success."""
+        state_dir = tmp_path / ".devbench" / "sessions" / "run1"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / "pid").write_text("12345", encoding="utf-8")
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.os.kill"),
+        ):
+            cli.cmd_stop("--session", "run1")
+
+        out = capsys.readouterr().out
+        assert "run1" in out or "12345" in out or "sigterm" in out.lower() or "stop" in out.lower()
+
+    @pytest.mark.unit
+    def test_process_not_found_returns_rc1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """cmd_stop returns rc=1 when os.kill raises ProcessLookupError (ESRCH)."""
+        state_dir = tmp_path / ".devbench" / "sessions" / "gone"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / "pid").write_text("99999", encoding="utf-8")
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.os.kill", side_effect=ProcessLookupError("No such process")),
+        ):
+            rc = cli.cmd_stop("--session", "gone")
+
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "99999" in err or "not running" in err.lower() or "not found" in err.lower()
+
+    @pytest.mark.unit
+    def test_permission_error_returns_rc1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """cmd_stop returns rc=1 when os.kill raises PermissionError (EPERM)."""
+        state_dir = tmp_path / ".devbench" / "sessions" / "noperm"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / "pid").write_text("1", encoding="utf-8")
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.os.kill", side_effect=PermissionError("Permission denied")),
+        ):
+            rc = cli.cmd_stop("--session", "noperm")
+
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "permission" in err.lower() or "1" in err
+
+
+class TestCmdStopIntegration:
+    """Integration tests for cmd_stop against real fixture workspaces."""
+
+    @pytest.mark.unit
+    def test_stop_integration_sends_sigterm_to_real_process(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """cmd_stop sends SIGTERM to a live subprocess via its real pid file.
+
+        Spawns a short-lived sleep subprocess, writes its PID into the session
+        state dir, calls cmd_stop, and verifies the subprocess received the signal.
+        """
+        import signal
+        import subprocess
+        import time
+
+        # Spawn a subprocess that will hold alive until signalled.
+        proc = subprocess.Popen(["sleep", "60"])
+        pid = proc.pid
+        state_dir = tmp_path / ".devbench" / "sessions" / "integration"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / "pid").write_text(str(pid), encoding="utf-8")
+
+        try:
+            with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+                rc = cli.cmd_stop("--session", "integration")
+
+            assert rc == 0
+
+            # Wait briefly for the signal to be delivered and the process to exit.
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                if proc.poll() is not None:
+                    break
+                time.monotonic()  # no-sleep busy-check is acceptable in tests
+
+            proc.wait(timeout=1)
+            # returncode -15 means killed by SIGTERM (signal 15).
+            assert proc.returncode == -signal.SIGTERM, (
+                f"expected process killed by SIGTERM (rc={-signal.SIGTERM}), got {proc.returncode}"
+            )
+        finally:
+            # Ensure the subprocess is cleaned up even if the assertion fails.
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+
+# ---------------------------------------------------------------------------
+# SIGTERM handler in cmd_start tests (E4-F5-S1-T2, issue #192)
+# ---------------------------------------------------------------------------
+
+
+class TestCmdStartSigtermHandler:
+    """SIGTERM handler in cmd_start forces in-flight WU to blocked."""
+
+    @pytest.mark.unit
+    def test_forced_blocked_on_stop_audit_constant_defined(self) -> None:
+        """_FORCED_BLOCKED_ON_STOP_AUDIT_PREFIX constant must be defined in cli."""
+        assert hasattr(cli, "_FORCED_BLOCKED_ON_STOP_AUDIT_PREFIX")
+        prefix = cli._FORCED_BLOCKED_ON_STOP_AUDIT_PREFIX
+        assert "FORCED_BLOCKED_ON_STOP" in prefix
+
+    @pytest.mark.unit
+    def test_force_block_in_flight_wu_sets_status_blocked(self, tmp_path: Path) -> None:
+        """_force_block_in_flight_wu sets in-progress WU to blocked and appends audit."""
+        from devbench.backlog.manager import BacklogManager
+        from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
+
+        # Build a minimal in-progress WU file on disk.
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        wu_file = backlog_dir / "E1-F1-S1-T1.md"
+        wu_file.write_text(
+            "# E1-F1-S1-T1: Test Task\n\n## Status: in-progress\n\n## Comments\n",
+            encoding="utf-8",
+        )
+        wu = WorkUnit(
+            id="E1-F1-S1-T1",
+            title="Test Task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=wu_file,
+            repo="test/repo",
+        )
+
+        # Intercept BacklogManager.force_status and _append_agent_comment calls.
+        forced: list[tuple[str, str]] = []
+        appended: list[tuple[str, str]] = []
+
+        def _mock_force_status(
+            self: object, wu_path: Path, index: Path, unit_id: str, status: str, **kw: object
+        ) -> None:
+            forced.append((unit_id, status))
+
+        def _mock_append(self: object, path: Path, agent: str, message: str) -> None:
+            appended.append((agent, message))
+
+        with (
+            patch.object(BacklogManager, "force_status", _mock_force_status),
+            patch.object(BacklogManager, "_append_agent_comment", _mock_append),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+        ):
+            cli._force_block_in_flight_wu(wu, session_name="myrun")
+
+        assert ("E1-F1-S1-T1", "blocked") in forced, "force_status must be called with 'blocked'"
+        audit_messages = [msg for _, msg in appended]
+        assert any("FORCED_BLOCKED_ON_STOP" in m for m in audit_messages), (
+            "audit comment must contain FORCED_BLOCKED_ON_STOP"
+        )
+        assert any("myrun" in m for m in audit_messages), "audit comment must contain the session name"
+
+    @pytest.mark.unit
+    def test_force_block_in_flight_wu_no_op_when_no_in_progress(self, tmp_path: Path) -> None:
+        """_force_block_in_flight_wu does nothing when no in-progress WU is provided (None)."""
+        # Should not raise; calling with None is the no-op signal.
+        cli._force_block_in_flight_wu(None, session_name="myrun")
+
+    @pytest.mark.unit
+    def test_find_in_flight_wu_returns_in_progress_unit(self, tmp_path: Path) -> None:
+        """_find_in_flight_wu returns the first in-progress WU from the backlog."""
+        from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
+
+        wu_in_progress = WorkUnit(
+            id="E1-F1-S1-T2",
+            title="Running Task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=tmp_path / "E1-F1-S1-T2.md",
+            repo="test/repo",
+        )
+        wu_queued = WorkUnit(
+            id="E1-F1-S1-T3",
+            title="Queued Task",
+            status=WorkUnitStatus.IN_QUEUE,
+            unit_type=WorkUnitType.TASK,
+            file_path=tmp_path / "E1-F1-S1-T3.md",
+            repo="test/repo",
+        )
+        units = [wu_queued, wu_in_progress]
+
+        result = cli._find_in_flight_wu(units)
+
+        assert result is wu_in_progress
+
+    @pytest.mark.unit
+    def test_find_in_flight_wu_returns_none_when_none_in_progress(self, tmp_path: Path) -> None:
+        """_find_in_flight_wu returns None when no unit has in-progress status."""
+        from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
+
+        wu_queued = WorkUnit(
+            id="E1-F1-S1-T1",
+            title="Queued Task",
+            status=WorkUnitStatus.IN_QUEUE,
+            unit_type=WorkUnitType.TASK,
+            file_path=tmp_path / "E1-F1-S1-T1.md",
+            repo="test/repo",
+        )
+
+        result = cli._find_in_flight_wu([wu_queued])
+
+        assert result is None
+
+    @pytest.mark.unit
+    def test_find_in_flight_wu_returns_none_for_empty_list(self) -> None:
+        """_find_in_flight_wu returns None when the unit list is empty."""
+        result = cli._find_in_flight_wu([])
+        assert result is None

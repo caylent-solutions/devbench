@@ -60,6 +60,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 from collections.abc import Callable
@@ -168,6 +169,7 @@ from devbench.constants import (
     ORCHESTRATOR_RESTART_EXIT_CODE,
     SESSION_DEFAULT_NAME,
     SESSION_DRAIN_SIGNAL_FILENAME,
+    SESSION_PID_FILENAME,
     SESSION_STARTED_AT_FILENAME,
     SESSION_STARTED_BY_FILENAME,
     STATUS_BLOCKED,
@@ -5329,6 +5331,42 @@ def cmd_start(*argv: str) -> int:
     _prev_session_name = os.environ.get("DEVBENCH_SESSION_NAME")
     os.environ["DEVBENCH_SESSION_NAME"] = parsed.name
 
+    # AC-192-9: Register a SIGTERM handler so that ``devbench stop --session``
+    # can force the in-flight work unit to ``blocked`` before this process exits.
+    # The handler reads the current backlog, finds the in-progress WU, sets it to
+    # ``blocked``, appends a ``[FORCED_BLOCKED_ON_STOP]`` audit comment, then
+    # exits rc=0.  The previous handler is restored in the finally block.
+    _session_name_for_sigterm = parsed.name
+
+    def _sigterm_handler(_signum: int, _frame: object) -> None:
+        """SIGTERM handler: force in-flight WU to blocked then exit.
+
+        Reads the backlog, locates the single in-progress work unit (if any),
+        transitions it to ``blocked``, appends a
+        ``[FORCED_BLOCKED_ON_STOP] session=<name>`` audit entry, then calls
+        ``raise SystemExit(0)`` so the ``finally`` block in ``cmd_start`` runs
+        to restore ``DEVBENCH_SESSION_NAME``.
+
+        Args:
+            _signum: Signal number (SIGTERM) -- unused but required by the
+                signal handler protocol.
+            _frame: Current stack frame -- unused but required by the
+                signal handler protocol.
+
+        Raises:
+            SystemExit: Always -- exits the process with rc=0.
+        """
+        try:
+            parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+            units = parser.parse_index()
+            wu = _find_in_flight_wu(units)
+            _force_block_in_flight_wu(wu, session_name=_session_name_for_sigterm)
+        except (OSError, ValueError) as exc:
+            logger.error("[SIGTERM_HANDLER_ERROR] could not force-block in-flight WU: %s", exc)
+        raise SystemExit(0)
+
+    _prev_sigterm_handler = signal.signal(signal.SIGTERM, _sigterm_handler)
+
     async def _run() -> None:
         """Iterate SDK messages; raise _DrainRequested when claim-while-drain-pending.
 
@@ -5373,6 +5411,8 @@ def cmd_start(*argv: str) -> int:
             os.environ.pop("DEVBENCH_SESSION_NAME", None)
         else:
             os.environ["DEVBENCH_SESSION_NAME"] = _prev_session_name
+        # Restore the previous SIGTERM handler so test isolation is maintained.
+        signal.signal(signal.SIGTERM, _prev_sigterm_handler)
 
     # AC-190-13: delete scope.json on clean SDK exit so the next run starts
     # without a stale scope.  On crash (SDK raises), the exception propagates
@@ -5857,6 +5897,248 @@ def cmd_sessions(*argv: str) -> int:
         print(f"{session.name:<20} {session.pid:>8}  {liveness:<8}  {drain_str:<8}  {started_str:<25}  {scope_str}")
 
     return 0
+
+
+# ---------------------------------------------------------------------------
+# cmd_stop helpers (E4-F5-S1-T2, issue #192)
+# ---------------------------------------------------------------------------
+
+#: Audit-log prefix written when cmd_start intercepts SIGTERM and forces the
+#: in-flight work unit to ``blocked``.  Format:
+#: ``[FORCED_BLOCKED_ON_STOP] session=<name>``.
+_FORCED_BLOCKED_ON_STOP_AUDIT_PREFIX: str = "[FORCED_BLOCKED_ON_STOP] session="
+
+
+def _parse_stop_argv(argv: tuple[str, ...]) -> tuple[str | None, int, str]:
+    """Parse ``cmd_stop`` arguments into ``(session_name, error_rc, error_msg)``.
+
+    Returns a 3-tuple:
+
+    - ``session_name``: the value of ``--session <name>``, or ``None`` on error.
+    - ``error_rc``: 0 on success, 2 on invalid/missing argument.
+    - ``error_msg``: human-readable error description (empty string on success).
+
+    Only ``--session <name>`` is a recognised flag.  Any other flag-like token
+    (starting with ``-``) is rejected as unknown.  An empty session name is
+    rejected as invalid.  A session name containing ``..`` path segments is
+    rejected to prevent directory traversal.
+
+    Args:
+        argv: Trailing arguments after the ``stop`` command name (may be empty).
+
+    Returns:
+        ``(name, 0, "")`` on success; ``(None, 2, message)`` on any parse error.
+
+    Raises:
+        SystemExit: never -- all errors are returned via error_rc.
+    """
+    args = list(argv)
+
+    # Collect unknown flags
+    unknown = [a for a in args if a.startswith("-") and a != "--session"]
+    if unknown:
+        return None, 2, f"ERROR: unknown flag(s) for stop: {', '.join(unknown)}"
+
+    # Require --session
+    if "--session" not in args:
+        return None, 2, "ERROR: --session <name> is required for devbench stop"
+
+    idx = args.index("--session")
+    if idx + 1 >= len(args):
+        return None, 2, "ERROR: --session requires a non-empty session name"
+
+    session_name = args[idx + 1]
+    if not session_name:
+        return None, 2, "ERROR: --session requires a non-empty session name"
+
+    if ".." in Path(session_name).parts:
+        return (
+            None,
+            2,
+            (
+                f"ERROR: session name contains invalid path segment '..': {session_name!r}. "
+                "Use a simple alphanumeric name without directory traversal."
+            ),
+        )
+
+    return session_name, 0, ""
+
+
+def _find_in_flight_wu(units: list[WorkUnit]) -> WorkUnit | None:
+    """Return the first in-progress work unit from *units*, or ``None``.
+
+    Scans *units* linearly and returns the first element whose
+    ``status`` is :data:`~devbench.backlog.work_unit.WorkUnitStatus.IN_PROGRESS`.
+
+    Args:
+        units: List of :class:`~devbench.backlog.work_unit.WorkUnit` objects.
+
+    Returns:
+        The first in-progress :class:`~devbench.backlog.work_unit.WorkUnit`, or
+        ``None`` when none is found.
+
+    Raises:
+        Nothing.
+    """
+    for unit in units:
+        if unit.status is WorkUnitStatus.IN_PROGRESS:
+            return unit
+    return None
+
+
+def _force_block_in_flight_wu(wu: WorkUnit | None, session_name: str) -> None:
+    """Set *wu* to ``blocked`` and append a ``[FORCED_BLOCKED_ON_STOP]`` audit comment.
+
+    This is called by the SIGTERM handler in ``cmd_start`` to mark the
+    in-flight work unit as ``blocked`` with a session-tagged audit entry,
+    satisfying spec section 4.4.5 and AC-192-9.
+
+    When *wu* is ``None`` (no in-flight unit found), this function is a no-op.
+
+    Args:
+        wu: The in-flight :class:`~devbench.backlog.work_unit.WorkUnit` to
+            force-block, or ``None`` for a no-op.
+        session_name: The session name to embed in the audit comment
+            (e.g. ``"default"``).
+
+    Raises:
+        OSError: Reading or writing the work-unit file fails.
+        ValueError: The BacklogManager validation rejects the status transition.
+    """
+    if wu is None:
+        return
+
+    mgr = BacklogManager()
+    mgr.force_status(wu.file_path, BACKLOG_INDEX, wu.id, STATUS_BLOCKED)
+    mgr._append_agent_comment(
+        wu.file_path,
+        "orchestrator",
+        f"{_FORCED_BLOCKED_ON_STOP_AUDIT_PREFIX}{session_name}",
+    )
+
+
+def _send_sigterm_to_session(session_name: str) -> tuple[int, str, str]:
+    """Read the PID file for *session_name* and send SIGTERM.
+
+    Returns a 3-tuple ``(rc, success_msg, error_msg)``:
+
+    - ``rc=0``: SIGTERM was delivered; ``success_msg`` contains the confirmation
+      text; ``error_msg`` is empty.
+    - ``rc=1``: a runtime error prevented delivery; ``success_msg`` is empty;
+      ``error_msg`` contains the actionable diagnostics.
+
+    Args:
+        session_name: Short session identifier (e.g. ``"default"``).
+
+    Returns:
+        ``(0, confirmation, "")`` on success;
+        ``(1, "", error_message)`` on failure.
+
+    Raises:
+        Nothing -- all OS errors are captured and returned as rc=1.
+    """
+    state_dir = WORKSPACE_ROOT / ".devbench" / "sessions" / session_name
+    pid_path = state_dir / SESSION_PID_FILENAME
+
+    if not pid_path.exists():
+        return (
+            1,
+            "",
+            f"ERROR: PID file not found for session '{session_name}' at {pid_path}. "
+            "The session may not be running or may have already exited.",
+        )
+
+    raw = pid_path.read_text(encoding="utf-8").strip()
+    try:
+        pid = int(raw)
+    except ValueError:
+        return (
+            1,
+            "",
+            f"ERROR: PID file for session '{session_name}' contains non-integer content: {raw!r}. "
+            "The pid file may be corrupt.",
+        )
+
+    kill_error = _kill_sigterm(pid, session_name)
+    if kill_error:
+        return 1, "", kill_error
+    return 0, f"Sent SIGTERM to session '{session_name}' (pid={pid}). stop in progress.", ""
+
+
+def _kill_sigterm(pid: int, session_name: str) -> str:
+    """Send ``SIGTERM`` to *pid* and return an error string on failure.
+
+    Returns an empty string on success; a non-empty error message when the
+    signal cannot be delivered.
+
+    Args:
+        pid: OS process ID to signal.
+        session_name: Session name (used only for error messages).
+
+    Returns:
+        ``""`` on success; an actionable ``"ERROR: ..."`` string on failure.
+
+    Raises:
+        Nothing -- all OS errors are captured and returned as strings.
+    """
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return (
+            f"ERROR: process {pid} for session '{session_name}' is not running (ESRCH). "
+            "The session may have already exited."
+        )
+    except PermissionError:
+        return (
+            f"ERROR: permission denied sending SIGTERM to process {pid} for session "
+            f"'{session_name}' (EPERM). The process is owned by a different user."
+        )
+    except OSError as exc:
+        return f"ERROR: cannot send SIGTERM to process {pid} for session '{session_name}': {exc}"
+    return ""
+
+
+def cmd_stop(*argv: str) -> int:
+    """Send SIGTERM to a named session's orchestrator process (spec section 4.4.5, issue #192).
+
+    Invocation form::
+
+        devbench stop --session <name>
+
+    Reads the PID from ``<workspace>/.devbench/sessions/<name>/pid`` and sends
+    ``SIGTERM`` to that process.  The SIGTERM handler registered by ``cmd_start``
+    catches the signal, forces any in-flight work unit to ``blocked`` with a
+    ``[FORCED_BLOCKED_ON_STOP] session=<name>`` audit comment, then exits rc=0.
+
+    Exit codes:
+
+    - 0 on success (SIGTERM delivered).
+    - 1 when the session does not exist, the PID file is absent or malformed, or
+      the signal cannot be delivered (ESRCH, EPERM, or other OS error).
+    - 2 on invalid arguments (missing or unknown flags).
+
+    Args:
+        *argv: CLI flags as individual strings (``--session <name>``).
+
+    Returns:
+        0 on success; 1 on runtime error; 2 on argument parse error.
+
+    Raises:
+        Nothing -- all errors are reported to stderr and returned as exit codes.
+    """
+    session_name, error_rc, error_msg = _parse_stop_argv(argv)
+    if error_rc != 0:
+        print(error_msg, file=sys.stderr)
+        return error_rc
+
+    # At this point session_name is guaranteed non-None by _parse_stop_argv.
+    assert session_name is not None
+    rc, success_msg, err_msg = _send_sigterm_to_session(session_name)
+    if rc != 0:
+        print(err_msg, file=sys.stderr)
+    else:
+        print(success_msg)
+    return rc
 
 
 def cmd_request_amendment(unit_id: str) -> int:
@@ -7564,6 +7846,11 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
         0,
         ("List active sessions or remove stale ones (spec 4.4.5, issue #192): sessions  |  sessions --cleanup"),
     ),
+    "stop": (
+        cmd_stop,
+        0,
+        ("Send SIGTERM to a named session (spec 4.4.5, issue #192): stop --session <name>"),
+    ),
     "start": (cmd_start, 0, "Run orchestrate skill via Agent SDK (non-interactive)"),
     "scope": (
         cmd_scope,
@@ -7707,6 +7994,8 @@ _VARIADIC_COMMANDS: frozenset[str] = frozenset(
         "drain",
         # Issue #192 E4-F5-S1-T1: sessions --cleanup flag
         "sessions",
+        # Issue #192 E4-F5-S1-T2: stop --session <name> flag
+        "stop",
     }
 )
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 
 class TestStatusStringConstants:
     """Status string constants are defined in constants.py and are correct."""
@@ -236,3 +238,105 @@ class TestSessionConstants:
         from devbench.constants import SESSION_FLOCK_POLL_INTERVAL_SECONDS
 
         assert SESSION_FLOCK_POLL_INTERVAL_SECONDS == 0.1
+
+
+class TestQuotaHandlingDefaultConstants:
+    """AC-FIX-QUOTA-CONST-2: QUOTA_HANDLING_DEFAULT_* constants in constants.py
+    have correct types and spec-mandated values (spec 4.5.6).
+
+    Each parametrized case asserts importability, type, and expected value for
+    all 13 quota-handling default constants.
+    """
+
+    @pytest.mark.parametrize(
+        ("constant_name", "expected_type", "expected_value"),
+        [
+            (
+                "QUOTA_HANDLING_DEFAULT_ENABLED",
+                bool,
+                True,
+            ),
+            (
+                "QUOTA_HANDLING_DEFAULT_DETECT_MODES",
+                list,
+                [
+                    "subscription_rate_limit",
+                    "sdk_credit_exhausted",
+                    "api_billing_error",
+                    "bedrock_throttle",
+                ],
+            ),
+            (
+                "QUOTA_HANDLING_DEFAULT_ON_EXHAUSTION",
+                str,
+                "wait",
+            ),
+            (
+                "QUOTA_HANDLING_DEFAULT_POLL_INTERVAL_SECONDS",
+                int,
+                60,
+            ),
+            (
+                "QUOTA_HANDLING_DEFAULT_MAX_WAIT_SECONDS",
+                int,
+                18000,
+            ),
+            (
+                "QUOTA_HANDLING_DEFAULT_ON_EXHAUSTION_TIMEOUT",
+                str,
+                "drain",
+            ),
+            (
+                "QUOTA_HANDLING_DEFAULT_RESUME_STRATEGY",
+                str,
+                "continue_current_wu",
+            ),
+            (
+                "QUOTA_HANDLING_DEFAULT_AUDIT_COMMENT_ON_WAIT",
+                bool,
+                True,
+            ),
+            (
+                "QUOTA_HANDLING_DEFAULT_AUDIT_COMMENT_ON_RESUME",
+                bool,
+                True,
+            ),
+            (
+                "QUOTA_HANDLING_DEFAULT_LOG_STRUCTURED_EVENTS",
+                bool,
+                True,
+            ),
+            (
+                "QUOTA_HANDLING_DEFAULT_RECOVERY_PROBE_ENABLED",
+                bool,
+                True,
+            ),
+            (
+                "QUOTA_HANDLING_DEFAULT_RECOVERY_PROBE_REQUEST_SIZE_TOKENS",
+                int,
+                1,
+            ),
+            (
+                "QUOTA_HANDLING_DEFAULT_RECOVERY_PROBE_TIMEOUT_SECONDS",
+                float,
+                10.0,
+            ),
+        ],
+    )
+    def test_quota_handling_default_constant_type_and_value(
+        self,
+        constant_name: str,
+        expected_type: type,
+        expected_value: object,
+    ) -> None:
+        """Each QUOTA_HANDLING_DEFAULT_* constant is importable, has the
+        expected type, and matches the default value from spec section 4.5.6.
+        """
+        import importlib
+
+        module = importlib.import_module("devbench.constants")
+        constant = getattr(module, constant_name)
+        assert isinstance(constant, expected_type), (
+            f"{constant_name} expected type {expected_type.__name__!r}, got {type(constant).__name__!r}"
+        )
+        assert constant == expected_value, f"{constant_name} expected {expected_value!r}, got {constant!r}"

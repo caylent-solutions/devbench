@@ -445,6 +445,147 @@
         }
       }
     },
+    "quota_handling": {
+      "type": "object",
+      "description": "Quota-wait-and-resume configuration (spec section 4.5.6). All fields are optional; the section can be omitted entirely. When omitted, all defaults apply.",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Top-level toggle. When false, quota detection is disabled and the orchestrator behaves as if no quota signals were received. Default: true."
+        },
+        "detect_modes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "subscription_rate_limit",
+              "sdk_credit_exhausted",
+              "api_billing_error",
+              "bedrock_throttle"
+            ]
+          },
+          "description": "Ordered list of quota-signal detection modes to activate. Each entry maps to a QuotaExhaustedError subclass in devbench.quota. Default: all four modes enabled."
+        },
+        "on_exhaustion": {
+          "type": "string",
+          "enum": ["wait", "fail", "drain"],
+          "description": "Action taken when quota is first detected: 'wait' (default) sleeps until reset then probes; 'fail' raises immediately; 'drain' finishes the current WU then exits."
+        },
+        "poll_interval_seconds": {
+          "type": "integer",
+          "minimum": 30,
+          "maximum": 3600,
+          "description": "Recovery probe poll interval in seconds. Default 60. Min 30, max 3600."
+        },
+        "max_wait_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum seconds to wait before triggering on_exhaustion_timeout. Default 18000 (5 h)."
+        },
+        "on_exhaustion_timeout": {
+          "type": "string",
+          "enum": ["drain", "fail", "keep_waiting"],
+          "description": "Action taken when max_wait_seconds is exceeded: 'drain' (default) finishes the current WU then exits; 'fail' raises immediately; 'keep_waiting' resets the timer and continues probing."
+        },
+        "resume_strategy": {
+          "type": "string",
+          "enum": ["continue_current_wu", "restart_wu", "drain_and_resume"],
+          "description": "Resume strategy after quota is restored: 'continue_current_wu' (default) skips already-passed judges; 'restart_wu' reverts the WU to in-queue; 'drain_and_resume' finishes the current WU then resumes claiming."
+        },
+        "audit_comment_on_wait": {
+          "type": "boolean",
+          "description": "When true (default), writes a [QUOTA_WAITING] audit comment to the in-flight WU at the start of a quota wait."
+        },
+        "audit_comment_on_resume": {
+          "type": "boolean",
+          "description": "When true (default), writes a [QUOTA_RESUMED] audit comment after quota is restored."
+        },
+        "log_structured_events": {
+          "type": "boolean",
+          "description": "When true (default), emits structured log events for quota-wait lifecycle transitions."
+        },
+        "notify_on_pause": {
+          "type": "object",
+          "description": "Optional webhook notification sent when the orchestrator pauses due to quota exhaustion.",
+          "additionalProperties": false,
+          "properties": {
+            "webhook_url": {
+              "type": ["string", "null"],
+              "description": "Generic webhook URL to POST a JSON payload to on quota-pause. null disables."
+            },
+            "slack_webhook_url": {
+              "type": ["string", "null"],
+              "description": "Slack incoming webhook URL. null disables. Payload uses Slack's block-kit JSON format."
+            }
+          }
+        },
+        "notify_on_resume": {
+          "type": "object",
+          "description": "Optional webhook notification sent when the orchestrator resumes after quota recovery.",
+          "additionalProperties": false,
+          "properties": {
+            "webhook_url": {
+              "type": ["string", "null"],
+              "description": "Generic webhook URL to POST a JSON payload to on quota-resume. null disables."
+            },
+            "slack_webhook_url": {
+              "type": ["string", "null"],
+              "description": "Slack incoming webhook URL. null disables. Payload uses Slack's block-kit JSON format."
+            }
+          }
+        },
+        "recovery_probe": {
+          "type": "object",
+          "description": "Recovery probe sub-configuration (spec section 4.5.6). Controls the minimal Anthropic API completion used to detect quota recovery.",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "When true (default), the recovery probe is activated after the initial reset_at sleep. When false, only the reset_at sleep is used -- probe calls are skipped."
+            },
+            "request_size_tokens": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Maximum output tokens requested in the probe call. Default 1 (cheapest valid response). Override only when a different model requires a minimum token count."
+            },
+            "timeout_seconds": {
+              "type": "number",
+              "minimum": 1,
+              "description": "Timeout in seconds for the probe HTTP request. Default 10. Override for slow network environments."
+            },
+            "backoff": {
+              "type": "object",
+              "description": "Exponential-backoff parameters for probe retries (spec section 4.5.6).",
+              "additionalProperties": false,
+              "properties": {
+                "initial_seconds": {
+                  "type": "number",
+                  "minimum": 1,
+                  "description": "Starting backoff interval in seconds. Default 30."
+                },
+                "max_seconds": {
+                  "type": "number",
+                  "minimum": 1,
+                  "description": "Maximum backoff interval in seconds. Default 600."
+                },
+                "multiplier": {
+                  "type": "number",
+                  "minimum": 1,
+                  "description": "Exponent base applied after each failed probe. Default 2.0."
+                },
+                "jitter": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1,
+                  "description": "Fractional jitter added/subtracted from each backoff duration. Default 0.2 (20%)."
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "agents": {
       "type": "object",
       "description": "Per-agent model overrides (ADR-25). Each field defaults to null; the agent then runs on the model declared in its .md frontmatter. Set a field to override for this workspace -- devbench materialises a workspace-local shadow plugin tree under <workspace>/.devbench/plugin-shadow/devbench/ and rewrites the matching frontmatter line. JUDGE_AGENT_MODEL_<NAME> env vars override these YAML values. Use short names (opus|sonnet|haiku) or full Anthropic model ids (claude-opus-4-7) when use_bedrock: false; use the matching Bedrock id (us.anthropic.claude-opus-4-7-v1) when use_bedrock: true.",

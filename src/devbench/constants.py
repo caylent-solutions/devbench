@@ -618,3 +618,63 @@ SESSION_REGISTRY_TMP_SUFFIX: str = ".tmp"
 # never overshot.  Override via ``DEVBENCH_SESSION_FLOCK_POLL_INTERVAL``
 # env var if the default 0.1 s is too coarse or too fine for a given deployment.
 SESSION_FLOCK_POLL_INTERVAL_SECONDS: float = 0.1
+
+# ---------------------------------------------------------------------------
+# Quota-handling defaults (spec section 4.5.6)
+# These constants define the default values for the quota_handling config block
+# in devbench.yaml.  Consumed by config_loader.py's QuotaHandlingConfig
+# dataclass.  All operational defaults live here so no inline literals appear
+# in the loader or any other module.
+# ---------------------------------------------------------------------------
+
+# Top-level quota-handling toggle (default enabled).
+QUOTA_HANDLING_DEFAULT_ENABLED: bool = True
+
+# Ordered list of quota-signal detection modes to activate.  Matches the
+# QuotaExhaustedError subclass names in devbench.quota (spec 4.5.6).
+QUOTA_HANDLING_DEFAULT_DETECT_MODES: list[str] = [
+    "subscription_rate_limit",
+    "sdk_credit_exhausted",
+    "api_billing_error",
+    "bedrock_throttle",
+]
+
+# Action taken when quota is first detected: wait (default), fail, or drain.
+QUOTA_HANDLING_DEFAULT_ON_EXHAUSTION: str = "wait"
+
+# Probe poll interval in seconds (spec 4.5.6: default 60s; min 30; max 3600).
+QUOTA_HANDLING_DEFAULT_POLL_INTERVAL_SECONDS: int = 60
+
+# Maximum seconds to wait before triggering on_exhaustion_timeout (spec 4.5.6:
+# 5 h default = 18000 s).
+QUOTA_HANDLING_DEFAULT_MAX_WAIT_SECONDS: int = 18000
+
+# Action taken when max_wait_seconds is exceeded: drain, fail, or keep_waiting.
+QUOTA_HANDLING_DEFAULT_ON_EXHAUSTION_TIMEOUT: str = "drain"
+
+# Resume strategy after quota is restored: continue_current_wu, restart_wu, or
+# drain_and_resume (spec 4.5.6).
+QUOTA_HANDLING_DEFAULT_RESUME_STRATEGY: str = "continue_current_wu"
+
+# Whether to write [QUOTA_WAITING] audit comments to the in-flight WU.
+QUOTA_HANDLING_DEFAULT_AUDIT_COMMENT_ON_WAIT: bool = True
+
+# Whether to write [QUOTA_RESUMED] audit comments after quota is restored.
+QUOTA_HANDLING_DEFAULT_AUDIT_COMMENT_ON_RESUME: bool = True
+
+# Whether to emit structured log events for quota-wait lifecycle events.
+QUOTA_HANDLING_DEFAULT_LOG_STRUCTURED_EVENTS: bool = True
+
+# Recovery probe sub-config defaults.
+# Whether the recovery probe is active (spec 4.5.6: enabled=true).
+QUOTA_HANDLING_DEFAULT_RECOVERY_PROBE_ENABLED: bool = True
+
+# Maximum output tokens requested in the probe call (spec 4.5.6:
+# request_size_tokens=1).  Must equal RECOVERY_PROBE_DEFAULT_REQUEST_SIZE_TOKENS
+# (1) so the quota.py module and the config block share the same spec value.
+QUOTA_HANDLING_DEFAULT_RECOVERY_PROBE_REQUEST_SIZE_TOKENS: int = 1
+
+# Timeout in seconds for the probe HTTP request (spec 4.5.6: timeout_seconds=10).
+# Must equal RECOVERY_PROBE_DEFAULT_TIMEOUT_SECONDS (10.0) so the quota.py
+# module and the config block share the same spec value.
+QUOTA_HANDLING_DEFAULT_RECOVERY_PROBE_TIMEOUT_SECONDS: float = 10.0

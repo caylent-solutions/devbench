@@ -331,6 +331,78 @@ validate:
 #     changes_manifest: opus
 
 # ---------------------------------------------------------------------------
+# Quota wait-and-resume (spec section 4.5.6)
+# Governs how devbench reacts when the Anthropic API or AWS Bedrock returns
+# a quota-exhaustion signal during orchestration. All fields are optional;
+# omit the entire section to keep the defaults shown below.
+# ---------------------------------------------------------------------------
+# quota_handling:
+#   # Top-level toggle. Set to false to disable quota detection entirely
+#   # (legacy behaviour: orchestrator raises / crashes on quota errors).
+#   enabled: true
+#
+#   # Ordered list of quota signals to detect. Each entry maps to a
+#   # QuotaExhaustedError subclass in devbench.quota.
+#   detect_modes:
+#     - subscription_rate_limit   # HTTP 429 from Anthropic API
+#     - sdk_credit_exhausted      # HTTP 402 insufficient_quota
+#     - api_billing_error         # HTTP 402 billing-level exhaustion
+#     - bedrock_throttle          # AWS Bedrock ThrottlingException
+#
+#   # Action taken when quota is first detected.
+#   #   wait         -- sleep until reset_at, then probe (default)
+#   #   fail         -- raise immediately (legacy behaviour)
+#   #   drain        -- finish current WU then exit
+#   on_exhaustion: wait
+#
+#   # Recovery probe poll interval in seconds (min 30, max 3600).
+#   poll_interval_seconds: 60
+#
+#   # Maximum seconds to wait before triggering on_exhaustion_timeout (5 h).
+#   max_wait_seconds: 18000
+#
+#   # Action taken when max_wait_seconds is exceeded.
+#   #   drain        -- finish current WU then exit (default)
+#   #   fail         -- raise immediately
+#   #   keep_waiting -- reset timer and continue probing
+#   on_exhaustion_timeout: drain
+#
+#   # Resume strategy after quota is restored.
+#   #   continue_current_wu -- skip already-passed judges (default)
+#   #   restart_wu          -- revert WU to in-queue, re-claim
+#   #   drain_and_resume    -- finish current WU then resume claiming
+#   resume_strategy: continue_current_wu
+#
+#   # Write [QUOTA_WAITING] audit comments to the in-flight WU.
+#   audit_comment_on_wait: true
+#
+#   # Write [QUOTA_RESUMED] audit comments after quota is restored.
+#   audit_comment_on_resume: true
+#
+#   # Emit structured log events for quota-wait lifecycle transitions.
+#   log_structured_events: true
+#
+#   # Optional webhook payloads fired on pause and resume. Failures are
+#   # logged but do not crash the orchestrator (best-effort delivery).
+#   notify_on_pause:
+#     webhook_url: null         # Generic webhook URL (null = disabled)
+#     slack_webhook_url: null   # Slack incoming webhook URL (null = disabled)
+#   notify_on_resume:
+#     webhook_url: null
+#     slack_webhook_url: null
+#
+#   # Recovery probe sub-configuration.
+#   recovery_probe:
+#     enabled: true             # Set false to skip probing (only use reset_at sleep)
+#     request_size_tokens: 1    # Max output tokens in probe call (cheapest valid)
+#     timeout_seconds: 10       # HTTP timeout for the probe request
+#     backoff:
+#       initial_seconds: 30     # Starting backoff interval
+#       max_seconds: 600        # Maximum backoff interval (10 min)
+#       multiplier: 2.0         # Exponential base applied after each failed probe
+#       jitter: 0.2             # Fractional jitter (+/- 20% of interval)
+
+# ---------------------------------------------------------------------------
 # Diagnostic-tuning knobs (set only when investigating a specific cadence
 # problem; production workspaces leave this section absent).
 # ---------------------------------------------------------------------------

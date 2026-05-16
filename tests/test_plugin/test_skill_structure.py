@@ -821,6 +821,46 @@ class TestSpecToBacklogSkillSuccessConditions:
             "matches the Full Work Unit Index count as the final exit gate"
         )
 
+    def test_step7_re_enters_loop_bounded_by_max_iterations(self) -> None:
+        """Step 7 must bound the re-entry iterate loop with max_iterations.
+
+        Per spec section 4.6.3 and AC-191-4: 'Failure on any: re-enter the iterate loop
+        until pass or max_iterations exhausted.' The final validation step must name
+        max_iterations as the termination bound -- not just say 'return to step N' without
+        stating when iteration must stop.
+        """
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        step7_start = content.find("## Step 7")
+        step8_start = content.find("## Step 8")
+        assert step7_start != -1, "spec-to-backlog/SKILL.md must contain '## Step 7'"
+        assert step8_start != -1, "spec-to-backlog/SKILL.md must contain '## Step 8'"
+        step7_content = content[step7_start:step8_start]
+        assert "max_iterations" in step7_content, (
+            "spec-to-backlog/SKILL.md Step 7 must state that re-iteration is bounded by "
+            "max_iterations (per spec section 4.6.3: 'until pass or max_iterations exhausted') -- "
+            "without this bound the skill has no termination condition for final validation failures"
+        )
+
+    def test_step7_emits_blocked_on_max_iterations_exhausted(self) -> None:
+        """Step 7 must emit a [BLOCKED] audit comment when max_iterations is reached.
+
+        Per spec section 4.6.3 and the iterate-until-perfect loop contract: if max_iterations
+        is exhausted without all three exit conditions passing, the skill must emit a [BLOCKED]
+        comment listing the unresolved items -- NOT silently exit or ship a sub-quality backlog.
+        """
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        step7_start = content.find("## Step 7")
+        step8_start = content.find("## Step 8")
+        assert step7_start != -1, "spec-to-backlog/SKILL.md must contain '## Step 7'"
+        assert step8_start != -1, "spec-to-backlog/SKILL.md must contain '## Step 8'"
+        step7_content = content[step7_start:step8_start]
+        assert "[BLOCKED]" in step7_content, (
+            "spec-to-backlog/SKILL.md Step 7 must instruct the skill to emit a [BLOCKED] audit "
+            "comment when max_iterations is exhausted without all three exit conditions passing -- "
+            "silently exiting with a sub-quality backlog violates the fail-fast / no-silent-failure "
+            "requirements (spec section 4.6.3, CLAUDE.md Critical Rules 1 and 2)"
+        )
+
 
 @pytest.mark.unit
 class TestSpecToBacklogSkillDefaultDraftStatus:

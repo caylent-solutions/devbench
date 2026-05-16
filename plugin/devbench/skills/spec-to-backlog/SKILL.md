@@ -238,7 +238,19 @@ uv run devbench validate-backlog
 2. Every leaf task passes the per-task rubric (all 10 items scored PASS in Step 5b).
 3. BACKLOG.md Status Summary total equals the Full Work Unit Index row count.
 
-If any condition fails, return to the relevant step (Step 5 for per-task issues, Step 6 for BACKLOG.md count mismatch, Step 5d for validate-backlog errors) and iterate.
+If any condition fails, return to the relevant step (Step 5 for per-task issues, Step 6 for BACKLOG.md count mismatch, Step 5d for validate-backlog errors) and re-run Step 7. Repeat until all three conditions pass or `max_iterations` is exhausted.
+
+**Convergence failure protocol** (when `max_iterations` is exhausted without all three conditions passing):
+
+```
+[BLOCKED] spec-to-backlog final validation reached max_iterations=<N> without converging.
+Unresolved conditions:
+- <condition number>: <detail> -- <suggested-fix>
+...
+Please fix the above issues and re-run the skill.
+```
+
+Do NOT silently exit when `max_iterations` is reached -- emitting a `[BLOCKED]` comment with the unresolved conditions is mandatory so the operator knows exactly what to fix.
 
 ---
 

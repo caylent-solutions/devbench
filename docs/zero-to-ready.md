@@ -810,9 +810,8 @@ edit prose; Claude does. Typical content edits:
 After any content edit, run `devbench validate-backlog` to confirm the file still
 satisfies the 20 backlog-contract rules, then move state with the `devbench` CLI table
 above. Restart with `make start` once the changes are in place. A worked example of
-this two-track workflow lives in
-[`examples/backlogs/brownfield/multi-repo_single-pr_no-merge/operator-interventions.md`](../examples/backlogs/brownfield/multi-repo_single-pr_no-merge/operator-interventions.md)
-(Intervention 1).
+this two-track workflow is described in
+[`examples/backlogs/brownfield/multi-repo_single-pr_no-merge/README.md`](../examples/backlogs/brownfield/multi-repo_single-pr_no-merge/README.md).
 
 ### Interactive mode (rarely needed)
 

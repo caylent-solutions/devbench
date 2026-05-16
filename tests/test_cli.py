@@ -17,7 +17,7 @@ import pytest
 from devbench import cli
 from devbench.backlog.proposal import Proposal
 from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
-from devbench.constants import BACKLOG_SUBDIR
+from devbench.constants import BACKLOG_SUBDIR, SESSION_DEFAULT_NAME, SESSION_SESSIONS_BASE_DIR
 from devbench.github.git_ops import CIResult
 
 
@@ -15309,11 +15309,16 @@ class TestCmdStartDrainEnforcement:
 
         The drain sentinel must be consumed (deleted) on exit so the next
         devbench start runs unscoped (AC-188-5).
+
+        cmd_start sets DEVBENCH_SESSION_NAME=SESSION_DEFAULT_NAME before checking for drain,
+        so the per-session path is used (spec 4.4.4).
         """
         import logging
         import sys
 
-        signal_path = tmp_path / ".devbench" / "drain.signal"
+        # cmd_start sets DEVBENCH_SESSION_NAME='default' before drain checks,
+        # so the drain signal must be written to the per-session path.
+        signal_path = tmp_path / SESSION_SESSIONS_BASE_DIR / SESSION_DEFAULT_NAME / "drain.signal"
         signal_path.parent.mkdir(parents=True)
         signal_path.write_text(
             '{"requested_at": "2026-05-16T00:00:00+00:00", "requested_by": "operator", "reason": "freeze"}',
@@ -15344,7 +15349,8 @@ class TestCmdStartDrainEnforcement:
         import logging
         import sys
 
-        signal_path = tmp_path / ".devbench" / "drain.signal"
+        # Per-session path: cmd_start sets DEVBENCH_SESSION_NAME=SESSION_DEFAULT_NAME (spec 4.4.4).
+        signal_path = tmp_path / SESSION_SESSIONS_BASE_DIR / SESSION_DEFAULT_NAME / "drain.signal"
         signal_path.parent.mkdir(parents=True)
         signal_path.write_text(
             '{"requested_at": "2026-05-16T00:00:00+00:00", "requested_by": "operator", "reason": "pre-release freeze"}',
@@ -15428,7 +15434,8 @@ class TestCmdStartDrainEnforcement:
         import logging
         import sys
 
-        signal_path = tmp_path / ".devbench" / "drain.signal"
+        # Per-session path: cmd_start sets DEVBENCH_SESSION_NAME=SESSION_DEFAULT_NAME (spec 4.4.4).
+        signal_path = tmp_path / SESSION_SESSIONS_BASE_DIR / SESSION_DEFAULT_NAME / "drain.signal"
         signal_path.parent.mkdir(parents=True)
         signal_path.write_text(
             '{"requested_at": "2026-05-16T00:00:00+00:00", "requested_by": "operator", "reason": ""}',
@@ -15630,8 +15637,12 @@ def _make_sdk_with_non_claim_then_claim_messages() -> object:
 def pre_arm_drain_env(tmp_path: Path) -> Generator[Path, None, None]:
     """Create drain.signal, build the mock SDK, and apply the 3-way patch for pre-arm tests.
 
-    Writes a drain signal with reason="smoke run" to ``tmp_path/.devbench/drain.signal``,
-    patches ``sys.modules["claude_agent_sdk"]`` with the SDK returned by
+    Writes a drain signal with reason="smoke run" to the per-session drain path
+    ``tmp_path/.devbench/sessions/<SESSION_DEFAULT_NAME>/drain.signal``.
+    cmd_start sets ``DEVBENCH_SESSION_NAME=SESSION_DEFAULT_NAME`` before checking
+    for drain, so the per-session path is used (spec 4.4.4).
+
+    Patches ``sys.modules["claude_agent_sdk"]`` with the SDK returned by
     :func:`_make_sdk_with_non_claim_then_claim_messages`, sets
     ``devbench.cli.WORKSPACE_ROOT`` to ``tmp_path``, and stubs
     ``devbench.cli._should_auto_restart_after_no_actionable`` to ``(False, [])``.
@@ -15644,7 +15655,7 @@ def pre_arm_drain_env(tmp_path: Path) -> Generator[Path, None, None]:
     """
     import sys
 
-    signal_path = tmp_path / ".devbench" / "drain.signal"
+    signal_path = tmp_path / SESSION_SESSIONS_BASE_DIR / SESSION_DEFAULT_NAME / "drain.signal"
     signal_path.parent.mkdir(parents=True)
     signal_path.write_text(
         '{"requested_at": "2026-05-16T00:00:00+00:00", "requested_by": "operator", "reason": "smoke run"}',
@@ -15737,7 +15748,8 @@ class TestCmdStartPreArmDrain:
 
         from claude_agent_sdk.types import AssistantMessage, TextBlock, ToolUseBlock
 
-        signal_path = tmp_path / ".devbench" / "drain.signal"
+        # Per-session path: cmd_start sets DEVBENCH_SESSION_NAME=SESSION_DEFAULT_NAME (spec 4.4.4).
+        signal_path = tmp_path / SESSION_SESSIONS_BASE_DIR / SESSION_DEFAULT_NAME / "drain.signal"
         signal_path.parent.mkdir(parents=True)
         signal_path.write_text(
             '{"requested_at": "2026-05-16T00:00:00+00:00", "requested_by": "operator", "reason": "smoke run"}',

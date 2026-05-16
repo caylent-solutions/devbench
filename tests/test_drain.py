@@ -15,6 +15,9 @@ Covers:
 - consume_drain: returns None when absent; returns DrainState and deletes file when present;
   propagates ValueError from read_drain_state; tolerates concurrent deletion (TOCTOU);
   propagates non-FileNotFoundError OSErrors from unlink
+- Per-session path routing: when DEVBENCH_SESSION_NAME is set, all public helpers
+  use <workspace>/.devbench/sessions/<name>/drain.signal instead of the workspace-root
+  path (spec 4.4.4, AC-192-7).
 """
 
 from __future__ import annotations
@@ -35,6 +38,7 @@ from devbench.drain import (
     consume_drain,
     read_drain_state,
     request_drain,
+    resolve_drain_signal_path,
 )
 
 # ---------------------------------------------------------------------------
@@ -574,3 +578,227 @@ class TestConsumeDrain:
         with patch.object(Path, "unlink", permission_denied_unlink):
             with pytest.raises(PermissionError):
                 consume_drain(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# resolve_drain_signal_path -- per-session path routing (spec 4.4.4, AC-192-7)
+# ---------------------------------------------------------------------------
+
+
+class TestResolveDrainSignalPath:
+    """resolve_drain_signal_path returns per-session or workspace-root path."""
+
+    @pytest.mark.unit
+    def test_no_session_name_returns_workspace_root_path(self, tmp_path: Path) -> None:
+        """Without DEVBENCH_SESSION_NAME, returns the canonical workspace-root drain.signal."""
+        env = {k: v for k, v in os.environ.items() if k != "DEVBENCH_SESSION_NAME"}
+        with patch.dict(os.environ, env, clear=True):
+            result = resolve_drain_signal_path(tmp_path)
+        assert result == tmp_path / DRAIN_SIGNAL_NAME
+
+    @pytest.mark.unit
+    def test_empty_session_name_returns_workspace_root_path(self, tmp_path: Path) -> None:
+        """DEVBENCH_SESSION_NAME set to empty string is treated as unset."""
+        with patch.dict(os.environ, {"DEVBENCH_SESSION_NAME": ""}, clear=False):
+            result = resolve_drain_signal_path(tmp_path)
+        assert result == tmp_path / DRAIN_SIGNAL_NAME
+
+    @pytest.mark.unit
+    def test_whitespace_only_session_name_returns_workspace_root_path(self, tmp_path: Path) -> None:
+        """DEVBENCH_SESSION_NAME set to whitespace-only is treated as unset."""
+        with patch.dict(os.environ, {"DEVBENCH_SESSION_NAME": "   "}, clear=False):
+            result = resolve_drain_signal_path(tmp_path)
+        assert result == tmp_path / DRAIN_SIGNAL_NAME
+
+    @pytest.mark.unit
+    def test_session_name_set_returns_per_session_path(self, tmp_path: Path) -> None:
+        """When DEVBENCH_SESSION_NAME is set, returns path inside the session dir."""
+        with patch.dict(os.environ, {"DEVBENCH_SESSION_NAME": "my-session"}, clear=False):
+            result = resolve_drain_signal_path(tmp_path)
+        expected = tmp_path / ".devbench" / "sessions" / "my-session" / "drain.signal"
+        assert result == expected
+
+    @pytest.mark.unit
+    def test_session_name_set_different_session_names(self, tmp_path: Path) -> None:
+        """Different session names produce different per-session paths."""
+        with patch.dict(os.environ, {"DEVBENCH_SESSION_NAME": "alpha"}, clear=False):
+            path_alpha = resolve_drain_signal_path(tmp_path)
+        with patch.dict(os.environ, {"DEVBENCH_SESSION_NAME": "beta"}, clear=False):
+            path_beta = resolve_drain_signal_path(tmp_path)
+        assert path_alpha != path_beta
+        assert "alpha" in str(path_alpha)
+        assert "beta" in str(path_beta)
+
+    @pytest.mark.unit
+    def test_session_path_is_relative_to_workspace_arg(self, tmp_path: Path) -> None:
+        """Per-session drain path is always relative to the ``workspace`` argument, not JUDGE_WORKSPACE_ROOT."""
+        other_path = tmp_path / "other-workspace"
+        with patch.dict(os.environ, {"DEVBENCH_SESSION_NAME": "sess"}, clear=False):
+            result_a = resolve_drain_signal_path(tmp_path)
+            result_b = resolve_drain_signal_path(other_path)
+        assert result_a != result_b
+        assert str(result_a).startswith(str(tmp_path))
+        assert str(result_b).startswith(str(other_path))
+
+    @pytest.mark.unit
+    def test_session_path_contains_sessions_subdir(self, tmp_path: Path) -> None:
+        """Per-session drain path is nested inside the sessions base directory."""
+        with patch.dict(os.environ, {"DEVBENCH_SESSION_NAME": "my-session"}, clear=False):
+            result = resolve_drain_signal_path(tmp_path)
+        assert ".devbench/sessions" in str(result)
+
+    @pytest.mark.unit
+    def test_session_path_filename_is_drain_signal(self, tmp_path: Path) -> None:
+        """Per-session drain path ends with 'drain.signal'."""
+        with patch.dict(os.environ, {"DEVBENCH_SESSION_NAME": "sess"}, clear=False):
+            result = resolve_drain_signal_path(tmp_path)
+        assert result.name == "drain.signal"
+
+
+# ---------------------------------------------------------------------------
+# Per-session path routing integration -- public helpers use session path
+# ---------------------------------------------------------------------------
+
+
+class TestPerSessionDrainHelpers:
+    """All public drain helpers use per-session path when DEVBENCH_SESSION_NAME is set."""
+
+    def _session_env(self, workspace: Path, name: str) -> dict[str, str]:
+        """Build an env dict that activates per-session routing.
+
+        Only ``DEVBENCH_SESSION_NAME`` is needed -- the session path is always
+        relative to the ``workspace`` argument passed to drain helpers, so
+        ``JUDGE_WORKSPACE_ROOT`` is not consulted by ``drain.py``.
+        """
+        return {
+            "DEVBENCH_SESSION_NAME": name,
+        }
+
+    def _expected_session_signal(self, workspace: Path, name: str) -> Path:
+        return workspace / ".devbench" / "sessions" / name / "drain.signal"
+
+    @pytest.mark.unit
+    def test_request_drain_writes_to_session_path(self, tmp_path: Path) -> None:
+        """request_drain writes to the per-session path when session name is set."""
+        env = self._session_env(tmp_path, "session-a")
+        with patch.dict(os.environ, env, clear=False):
+            result = request_drain(tmp_path)
+        expected = self._expected_session_signal(tmp_path, "session-a")
+        assert result == expected
+        assert expected.exists()
+
+    @pytest.mark.unit
+    def test_request_drain_does_not_write_workspace_root_path(self, tmp_path: Path) -> None:
+        """When session name is set, workspace-root drain.signal is NOT written."""
+        env = self._session_env(tmp_path, "session-b")
+        with patch.dict(os.environ, env, clear=False):
+            request_drain(tmp_path)
+        workspace_root_signal = tmp_path / DRAIN_SIGNAL_NAME
+        assert not workspace_root_signal.exists()
+
+    @pytest.mark.unit
+    def test_cancel_drain_removes_session_path(self, tmp_path: Path) -> None:
+        """cancel_drain removes the per-session drain.signal when session name is set."""
+        env = self._session_env(tmp_path, "session-c")
+        with patch.dict(os.environ, env, clear=False):
+            request_drain(tmp_path)
+            result = cancel_drain(tmp_path)
+        assert result is True
+        expected = self._expected_session_signal(tmp_path, "session-c")
+        assert not expected.exists()
+
+    @pytest.mark.unit
+    def test_cancel_drain_returns_false_when_session_signal_absent(self, tmp_path: Path) -> None:
+        """cancel_drain returns False when per-session drain.signal is absent."""
+        env = self._session_env(tmp_path, "session-d")
+        with patch.dict(os.environ, env, clear=False):
+            result = cancel_drain(tmp_path)
+        assert result is False
+
+    @pytest.mark.unit
+    def test_read_drain_state_reads_session_path(self, tmp_path: Path) -> None:
+        """read_drain_state reads from the per-session path when session name is set."""
+        env = self._session_env(tmp_path, "session-e")
+        with patch.dict(os.environ, env, clear=False):
+            request_drain(tmp_path, reason="session-read")
+            state = read_drain_state(tmp_path)
+        assert state is not None
+        assert state.reason == "session-read"
+
+    @pytest.mark.unit
+    def test_read_drain_state_returns_none_for_session_when_workspace_root_has_signal(self, tmp_path: Path) -> None:
+        """read_drain_state returns None for session when only workspace-root signal exists."""
+        # Write a drain signal at workspace root (no session env vars)
+        request_drain(tmp_path, reason="root-only")
+        # Now read with session env vars -- should NOT find the workspace-root signal
+        env = self._session_env(tmp_path, "session-f")
+        with patch.dict(os.environ, env, clear=False):
+            state = read_drain_state(tmp_path)
+        assert state is None
+
+    @pytest.mark.unit
+    def test_consume_drain_consumes_session_path(self, tmp_path: Path) -> None:
+        """consume_drain reads and removes the per-session drain.signal."""
+        env = self._session_env(tmp_path, "session-g")
+        with patch.dict(os.environ, env, clear=False):
+            request_drain(tmp_path, reason="session-consume")
+            state = consume_drain(tmp_path)
+        assert state is not None
+        assert state.reason == "session-consume"
+        expected = self._expected_session_signal(tmp_path, "session-g")
+        assert not expected.exists()
+
+    @pytest.mark.unit
+    def test_consume_drain_does_not_touch_workspace_root_signal(self, tmp_path: Path) -> None:
+        """consume_drain with session env set does not touch the workspace-root drain.signal."""
+        # Write a workspace-root drain signal first
+        request_drain(tmp_path, reason="root-signal")
+        workspace_root_signal = tmp_path / DRAIN_SIGNAL_NAME
+        assert workspace_root_signal.exists()
+
+        # Now consume with session env -- should only look at session path
+        env = self._session_env(tmp_path, "session-h")
+        with patch.dict(os.environ, env, clear=False):
+            state = consume_drain(tmp_path)
+        # Session path has no signal, so consume returns None
+        assert state is None
+        # Workspace-root signal must still exist
+        assert workspace_root_signal.exists()
+
+    @pytest.mark.unit
+    def test_session_isolation_across_two_sessions(self, tmp_path: Path) -> None:
+        """Two session names produce isolated drain.signal paths that do not interfere."""
+        env_s1 = self._session_env(tmp_path, "session-s1")
+        env_s2 = self._session_env(tmp_path, "session-s2")
+
+        # Write to session-s1
+        with patch.dict(os.environ, env_s1, clear=False):
+            request_drain(tmp_path, reason="s1-drain")
+
+        # Session s2 must not see session s1's drain signal
+        with patch.dict(os.environ, env_s2, clear=False):
+            state_s2 = read_drain_state(tmp_path)
+        assert state_s2 is None
+
+        # Session s1 still has its signal
+        with patch.dict(os.environ, env_s1, clear=False):
+            state_s1 = read_drain_state(tmp_path)
+        assert state_s1 is not None
+        assert state_s1.reason == "s1-drain"
+
+    @pytest.mark.unit
+    def test_request_drain_returns_session_path(self, tmp_path: Path) -> None:
+        """request_drain returns the session path (not workspace root) when session is active."""
+        env = self._session_env(tmp_path, "session-ret")
+        with patch.dict(os.environ, env, clear=False):
+            result = request_drain(tmp_path)
+        expected = self._expected_session_signal(tmp_path, "session-ret")
+        assert result == expected
+
+    @pytest.mark.parametrize("session_name", ["alpha", "beta-session", "session-123"])
+    @pytest.mark.unit
+    def test_resolve_drain_signal_path_parametrised(self, tmp_path: Path, session_name: str) -> None:
+        """resolve_drain_signal_path correctly encodes various session names into the path."""
+        with patch.dict(os.environ, {"DEVBENCH_SESSION_NAME": session_name}, clear=False):
+            result = resolve_drain_signal_path(tmp_path)
+        assert result == tmp_path / ".devbench" / "sessions" / session_name / "drain.signal"

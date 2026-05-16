@@ -8,6 +8,12 @@ The write path (request_drain) uses a tmp-then-rename pattern so readers
 never observe a partial file. consume_drain is not POSIX-atomic (read then
 unlink).
 
+When ``DEVBENCH_SESSION_NAME`` is set, all public helpers use the per-session
+drain signal path ``<workspace>/.devbench/sessions/<name>/drain.signal``
+instead of the workspace-root path (spec 4.4.4, AC-192-7).  Per-session
+paths are always constructed relative to the ``workspace`` argument passed to
+each public helper -- no additional environment variable is required.
+
 Raised exceptions are documented on each public function. No function
 silently swallows an exception.
 """
@@ -22,6 +28,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from devbench.constants import SESSION_SESSIONS_BASE_DIR
+
 # ---------------------------------------------------------------------------
 # Module-level constant
 # ---------------------------------------------------------------------------
@@ -29,6 +37,10 @@ from typing import Any
 #: Relative path (from workspace root) of the drain signal file.
 #: Spec section 4.3.1.
 DRAIN_SIGNAL_NAME: str = ".devbench/drain.signal"
+
+#: Filename of the drain signal inside a per-session directory.
+#: Used by resolve_drain_signal_path when DEVBENCH_SESSION_NAME is set.
+_DRAIN_SIGNAL_FILENAME: str = "drain.signal"
 
 
 # ---------------------------------------------------------------------------
@@ -108,13 +120,46 @@ class DrainState:
 
 
 # ---------------------------------------------------------------------------
+# Public path resolver
+# ---------------------------------------------------------------------------
+
+
+def resolve_drain_signal_path(workspace: Path) -> Path:
+    """Return the drain signal path, honouring ``DEVBENCH_SESSION_NAME`` when set.
+
+    When ``DEVBENCH_SESSION_NAME`` is set and non-empty, returns the per-session
+    path ``<workspace>/.devbench/sessions/<name>/drain.signal`` (spec 4.4.4).
+    The ``workspace`` argument is always the workspace root; per-session paths
+    are constructed relative to it.
+
+    When ``DEVBENCH_SESSION_NAME`` is absent or empty, returns the canonical
+    workspace-root path ``<workspace>/.devbench/drain.signal``.
+
+    Args:
+        workspace: Root directory of the devbench workspace.  Both workspace-root
+            and per-session paths are constructed relative to this directory.
+
+    Returns:
+        Absolute :class:`~pathlib.Path` of the drain signal file to use.
+    """
+    session_name = os.environ.get("DEVBENCH_SESSION_NAME", "").strip()
+    if not session_name:
+        return workspace / DRAIN_SIGNAL_NAME
+    return workspace / SESSION_SESSIONS_BASE_DIR / session_name / _DRAIN_SIGNAL_FILENAME
+
+
+# ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
 
 
 def _signal_path(workspace: Path) -> Path:
-    """Return the absolute path of the drain signal file for *workspace*."""
-    return workspace / DRAIN_SIGNAL_NAME
+    """Return the absolute path of the drain signal file for *workspace*.
+
+    Delegates to :func:`resolve_drain_signal_path` so that per-session
+    routing (``DEVBENCH_SESSION_NAME``) is applied consistently.
+    """
+    return resolve_drain_signal_path(workspace)
 
 
 def _current_user() -> str:

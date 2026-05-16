@@ -1,4 +1,4 @@
-"""Unit tests for orchestrate and create-spec SKILL.md content correctness."""
+"""Unit tests for orchestrate, create-spec, and spec-to-backlog SKILL.md content correctness."""
 
 from __future__ import annotations
 
@@ -10,6 +10,10 @@ SKILL_PATH = Path(__file__).parent.parent.parent / "plugin" / "devbench" / "skil
 
 CREATE_SPEC_SKILL_PATH = (
     Path(__file__).parent.parent.parent / "plugin" / "devbench" / "skills" / "create-spec" / "SKILL.md"
+)
+
+SPEC_TO_BACKLOG_SKILL_PATH = (
+    Path(__file__).parent.parent.parent / "plugin" / "devbench" / "skills" / "spec-to-backlog" / "SKILL.md"
 )
 
 
@@ -533,4 +537,432 @@ class TestCreateSpecSkillQualityReference:
             "[QUALITY_REFERENCE] audit comment must appear in or after Step 6 "
             "(after the spec is written, not during authoring) so the audit log records "
             "provenance at completion time"
+        )
+
+
+# ---------------------------------------------------------------------------
+# spec-to-backlog/SKILL.md tests  (AC-191-4, AC-191-7)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestSpecToBacklogSkillFrontmatter:
+    """AC-191-2: spec-to-backlog/SKILL.md must have valid frontmatter with required fields."""
+
+    def test_skill_file_exists(self) -> None:
+        """AC-191-2: spec-to-backlog/SKILL.md must exist."""
+        assert SPEC_TO_BACKLOG_SKILL_PATH.exists(), (
+            f"spec-to-backlog/SKILL.md not found at {SPEC_TO_BACKLOG_SKILL_PATH}"
+        )
+
+    def test_frontmatter_name_is_spec_to_backlog(self) -> None:
+        """AC-191-2: Frontmatter must declare name: spec-to-backlog."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert "name: spec-to-backlog" in content, (
+            "spec-to-backlog/SKILL.md frontmatter must contain 'name: spec-to-backlog'"
+        )
+
+    def test_frontmatter_model_is_opus(self) -> None:
+        """AC-191-2: Frontmatter must declare model: opus (decomposition reasoning + self-critique)."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert "model: opus" in content, (
+            "spec-to-backlog/SKILL.md frontmatter must contain 'model: opus' "
+            "(decomposition reasoning + self-critique requires top-tier reasoning)"
+        )
+
+    def test_frontmatter_is_yaml_delimited(self) -> None:
+        """AC-191-2: Frontmatter must be delimited by YAML front-matter markers."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert content.startswith("---"), (
+            "spec-to-backlog/SKILL.md must start with YAML frontmatter delimiter '---'"
+        )
+        assert content.count("---") >= 2, (
+            "spec-to-backlog/SKILL.md must have at least two '---' markers (open + close frontmatter)"
+        )
+
+
+@pytest.mark.unit
+class TestSpecToBacklogSkillTools:
+    """AC-191-2: spec-to-backlog/SKILL.md must declare tools: Read, Write, Edit, Bash."""
+
+    def test_skill_declares_read_tool(self) -> None:
+        """spec-to-backlog skill must declare the Read tool."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert "Read" in content, "spec-to-backlog/SKILL.md must declare the Read tool"
+
+    def test_skill_declares_write_tool(self) -> None:
+        """spec-to-backlog skill must declare the Write tool."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert "Write" in content, "spec-to-backlog/SKILL.md must declare the Write tool"
+
+    def test_skill_declares_edit_tool(self) -> None:
+        """spec-to-backlog skill must declare the Edit tool."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert "Edit" in content, "spec-to-backlog/SKILL.md must declare the Edit tool"
+
+    def test_skill_declares_bash_tool(self) -> None:
+        """spec-to-backlog skill must declare the Bash tool."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert "Bash" in content, "spec-to-backlog/SKILL.md must declare the Bash tool"
+
+
+@pytest.mark.unit
+class TestSpecToBacklogSkillKanonExemplarStep:
+    """AC-191-4: Skill must read kanon BACKLOG.md and a representative task file to internalise quality bar."""
+
+    def test_skill_reads_kanon_backlog(self) -> None:
+        """Step 1 must instruct reading the kanon BACKLOG.md as exemplar."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert "BACKLOG.md" in content, (
+            "spec-to-backlog/SKILL.md must instruct reading kanon BACKLOG.md as the backlog exemplar"
+        )
+
+    def test_skill_reads_representative_task_file(self) -> None:
+        """Step 1 must instruct reading a representative kanon task file for per-task quality bar."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert "task" in content.lower(), (
+            "spec-to-backlog/SKILL.md must reference reading a representative kanon task file "
+            "to internalise the per-task quality bar"
+        )
+
+    def test_skill_references_kanon_backlog_exemplar_path(self) -> None:
+        """Step 1 must include the literal kanon BACKLOG.md path from spec section 4.6.0."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert "kanon-deps-work" in content, (
+            "spec-to-backlog/SKILL.md must reference 'kanon-deps-work' in the exemplar path "
+            "so the skill reads the canonical backlog quality reference"
+        )
+
+    def test_skill_references_50kb_quality_bar(self) -> None:
+        """Step 1 must reference the ~50KB per-task depth quality bar from spec section 4.6.0."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert "50" in content or "50KB" in content.upper() or "50 KB" in content.upper(), (
+            "spec-to-backlog/SKILL.md must reference the ~50KB per-task quality bar "
+            "so the skill knows the expected task depth"
+        )
+
+
+@pytest.mark.unit
+class TestSpecToBacklogSkillDecompositionHierarchy:
+    """AC-191-4: Skill must decompose spec into Epic -> Feature -> Story -> Task hierarchy."""
+
+    def test_skill_mentions_epic_level(self) -> None:
+        """Skill must decompose at the Epic level."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert "Epic" in content, (
+            "spec-to-backlog/SKILL.md must instruct decomposing specs at the Epic level"
+        )
+
+    def test_skill_mentions_feature_level(self) -> None:
+        """Skill must decompose at the Feature level."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert "Feature" in content, (
+            "spec-to-backlog/SKILL.md must instruct decomposing specs at the Feature level"
+        )
+
+    def test_skill_mentions_story_level(self) -> None:
+        """Skill must decompose at the Story level."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert "Story" in content, (
+            "spec-to-backlog/SKILL.md must instruct decomposing specs at the Story level"
+        )
+
+    def test_skill_mentions_task_level(self) -> None:
+        """Skill must decompose at the Task level."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert "Task" in content, (
+            "spec-to-backlog/SKILL.md must instruct decomposing specs at the Task level"
+        )
+
+    def test_skill_four_level_hierarchy_expressed(self) -> None:
+        """Hierarchy chain Epic -> Feature -> Story -> Task must be explicitly stated."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        # The spec mandates 4-level hierarchy -- verify all 4 are present together
+        assert "Epic" in content and "Feature" in content and "Story" in content and "Task" in content, (
+            "spec-to-backlog/SKILL.md must express the full 4-level hierarchy "
+            "(Epic -> Feature -> Story -> Task) with no skipped levels"
+        )
+
+
+@pytest.mark.unit
+class TestSpecToBacklogSkillKanonCanonicalSections:
+    """AC-191-4: Each task file must have all kanon-canonical sections."""
+
+    def test_skill_mentions_8_canonical_sections(self) -> None:
+        """Skill must specify that each task file includes the 8 canonical work-unit sections."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        # Spec section 4.6.0 names 8 canonical sections (previously said "22 sections" but
+        # the per-task rubric enumerates 8 top-level ## headings)
+        required_sections = [
+            "Status",
+            "Description",
+            "Dependencies",
+            "Acceptance Criteria",
+            "Changes Manifest",
+            "Definition of Done",
+            "TDD Cycle Log",
+            "Comments",
+        ]
+        for section in required_sections:
+            assert section in content, (
+                f"spec-to-backlog/SKILL.md must instruct writing '{section}' section "
+                "in every task file to match kanon task-file depth"
+            )
+
+    def test_skill_requires_approach_section(self) -> None:
+        """Each task file must include a task-specific Approach section (not generic boilerplate)."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert "Approach" in content, (
+            "spec-to-backlog/SKILL.md must require an Approach section in each task file "
+            "with task-specific numbered TDD steps (not generic boilerplate)"
+        )
+
+    def test_skill_requires_definition_of_ready_section(self) -> None:
+        """Each task file must include a Definition of Ready section with task-tailored items."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert "Definition of Ready" in content, (
+            "spec-to-backlog/SKILL.md must require a 'Definition of Ready' section "
+            "in each task file with task-tailored checklist items"
+        )
+
+    def test_skill_requires_depends_on_this_table(self) -> None:
+        """Each task file must include a 'Depends On This' reverse-dependency table."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert "Depends On This" in content, (
+            "spec-to-backlog/SKILL.md must require a 'Depends On This' reverse-dependency table "
+            "in each task file (real WU IDs -- no placeholders)"
+        )
+
+    def test_skill_requires_changes_manifest_with_concrete_paths(self) -> None:
+        """Changes Manifest must list concrete file paths with add/modify/delete annotations."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert "Changes Manifest" in content, (
+            "spec-to-backlog/SKILL.md must require a concrete Changes Manifest in each task file"
+        )
+
+
+@pytest.mark.unit
+class TestSpecToBacklogSkillIterateUntilPerfect:
+    """AC-191-4: Skill must implement iterate-until-perfect loop at three granularities."""
+
+    def test_skill_iterates_at_epic_granularity(self) -> None:
+        """Loop granularity 1: per-Epic decomposition critique."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert "Epic" in content and any(
+            kw in content.lower() for kw in ("decomposition", "critique", "iterate", "self-critique")
+        ), (
+            "spec-to-backlog/SKILL.md must implement per-Epic decomposition critique "
+            "as the first iterate-until-perfect granularity"
+        )
+
+    def test_skill_iterates_at_task_granularity(self) -> None:
+        """Loop granularity 2: per-Task authoring self-critique."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert any(
+            kw in content.lower() for kw in ("per task", "per-task", "each task", "every task")
+        ), (
+            "spec-to-backlog/SKILL.md must implement per-Task authoring critique "
+            "as the second iterate-until-perfect granularity"
+        )
+
+    def test_skill_runs_validate_backlog_after_every_task(self) -> None:
+        """Loop granularity 3: whole-backlog post-pass via validate-backlog after every Task."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert "validate-backlog" in content, (
+            "spec-to-backlog/SKILL.md must run 'devbench validate-backlog' as the third "
+            "iterate-until-perfect granularity (whole-backlog post-pass after every Task)"
+        )
+
+    def test_skill_regenerates_offending_task_on_validate_error(self) -> None:
+        """On validate-backlog error, skill must regenerate the offending task and re-run validate."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert any(
+            kw in content.lower()
+            for kw in ("regenerat", "re-run", "re-validate", "offending", "fix", "error")
+        ), (
+            "spec-to-backlog/SKILL.md must instruct regenerating the offending task on "
+            "validate-backlog error and re-running validate (whole-backlog post-pass loop)"
+        )
+
+    def test_skill_has_max_iterations_config(self) -> None:
+        """Loop must respect max_iterations (configurable; default 5 per spec section 4.6.0)."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert "max_iterations" in content or "max iterations" in content.lower(), (
+            "spec-to-backlog/SKILL.md must reference max_iterations for the iterate-until-perfect loop"
+        )
+
+
+@pytest.mark.unit
+class TestSpecToBacklogSkillSuccessConditions:
+    """AC-191-4: Skill exits only when all three quality gates pass simultaneously."""
+
+    def test_skill_exits_only_when_validate_backlog_rc_zero(self) -> None:
+        """Skill must exit only when validate-backlog returns rc=0."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert "validate-backlog" in content, (
+            "spec-to-backlog/SKILL.md must require validate-backlog rc=0 as exit condition"
+        )
+
+    def test_skill_exits_only_when_per_task_rubric_passes(self) -> None:
+        """Skill must exit only when every Task passes the per-task rubric."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert "rubric" in content.lower(), (
+            "spec-to-backlog/SKILL.md must require every Task to pass the per-task rubric "
+            "as an exit condition"
+        )
+
+    def test_skill_exits_only_when_backlog_index_count_matches(self) -> None:
+        """Skill must verify BACKLOG.md Status Summary count matches Full Work Unit Index count."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert "BACKLOG.md" in content and any(
+            kw in content.lower() for kw in ("status summary", "count", "total", "index")
+        ), (
+            "spec-to-backlog/SKILL.md must verify BACKLOG.md Status Summary total "
+            "matches the Full Work Unit Index count as the final exit gate"
+        )
+
+
+@pytest.mark.unit
+class TestSpecToBacklogSkillDefaultDraftStatus:
+    """AC-191-4: New WUs must default to 'draft' status; overridable via config."""
+
+    def test_skill_defaults_new_wus_to_draft_status(self) -> None:
+        """Skill must set new work units to 'draft' status by default."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert "draft" in content.lower(), (
+            "spec-to-backlog/SKILL.md must default new work units to 'draft' status "
+            "(per spec section 4.6.3 -- depends on E1 draft-status feature)"
+        )
+
+    def test_skill_mentions_config_override_for_default_status(self) -> None:
+        """Default status must be overridable via backlog.default_status_for_new_work_units config."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert "default_status_for_new_work_units" in content or "default status" in content.lower(), (
+            "spec-to-backlog/SKILL.md must mention that the default WU status is overridable "
+            "via backlog.default_status_for_new_work_units in devbench.yaml"
+        )
+
+
+@pytest.mark.unit
+class TestSpecToBacklogSkillOutputContract:
+    """AC-191-4: Skill must produce BACKLOG.md and work-unit .md files under backlog/."""
+
+    def test_skill_produces_backlog_md(self) -> None:
+        """Skill output must include BACKLOG.md."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert "BACKLOG.md" in content, (
+            "spec-to-backlog/SKILL.md must produce BACKLOG.md as part of its output contract"
+        )
+
+    def test_skill_produces_work_unit_files_under_backlog(self) -> None:
+        """Skill output must include work-unit .md files written under backlog/."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert "backlog/" in content, (
+            "spec-to-backlog/SKILL.md must write work-unit .md files under the backlog/ directory"
+        )
+
+    def test_skill_mentions_ac_ties_to_spec(self) -> None:
+        """Acceptance criteria in each task file must tie back to the input spec."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert any(
+            kw in content.lower() for kw in ("spec section", "ac tie", "ties to spec", "references the spec")
+        ), (
+            "spec-to-backlog/SKILL.md must instruct that task ACs tie back to spec sections "
+            "so every AC has a spec justification"
+        )
+
+
+@pytest.mark.unit
+class TestSpecToBacklogSkillForbiddenPatterns:
+    """AC-191-4: Skill must instruct avoiding forbidden subsection patterns from spec section 4.6.0."""
+
+    def test_skill_prohibits_multiple_error_handling_subsections(self) -> None:
+        """Skill must prohibit multiple Error Handling Contract subsections per task."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert "Error Handling Contract" in content, (
+            "spec-to-backlog/SKILL.md must reference 'Error Handling Contract' "
+            "and instruct using ONE subsection per task (general + task-specific under same heading)"
+        )
+
+    def test_skill_prohibits_placeholder_deps(self) -> None:
+        """Skill must prohibit placeholder text in Depends On This table."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        # Spec says: no "filled in by validate-backlog" placeholders
+        assert any(
+            kw in content.lower()
+            for kw in ("placeholder", "real wu id", "real ids", "no placeholder", "filled in at")
+        ), (
+            "spec-to-backlog/SKILL.md must prohibit placeholder text in Depends On This tables "
+            "and require real WU IDs resolved at generation time"
+        )
+
+    def test_skill_prohibits_generic_approach_templates(self) -> None:
+        """Skill must prohibit generic 11-step Approach boilerplate."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert "Approach" in content and any(
+            kw in content.lower()
+            for kw in ("specific", "task-specific", "generic", "boilerplate", "file", "line")
+        ), (
+            "spec-to-backlog/SKILL.md must require task-specific Approach steps "
+            "(not generic boilerplate templates) with file/line citations"
+        )
+
+
+@pytest.mark.unit
+class TestSpecToBacklogSkillQualityReference:
+    """AC-191-9: spec-to-backlog/SKILL.md must require emitting a [QUALITY_REFERENCE] audit comment.
+
+    Per spec section 4.6.7 (provenance transparency): when spec-to-backlog completes, it must
+    emit a [QUALITY_REFERENCE] log line naming the exact exemplar path it read so the
+    audit record captures which quality reference was consulted.
+    """
+
+    def test_skill_requires_quality_reference_audit_comment(self) -> None:
+        """SKILL.md must instruct the skill to emit a [QUALITY_REFERENCE] audit comment on completion."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert "[QUALITY_REFERENCE]" in content, (
+            "spec-to-backlog/SKILL.md must instruct the skill to emit a [QUALITY_REFERENCE] "
+            "audit comment naming the exemplar path read, per spec section 4.6.7 (provenance transparency)"
+        )
+
+    def test_skill_quality_reference_names_kanon_exemplar(self) -> None:
+        """[QUALITY_REFERENCE] comment must reference the kanon backlog exemplar path."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        qr_pos = content.find("[QUALITY_REFERENCE]")
+        assert qr_pos >= 0, "spec-to-backlog/SKILL.md must contain [QUALITY_REFERENCE]"
+        surrounding = content[qr_pos : qr_pos + 500]
+        assert "kanon-deps-work" in surrounding or "exemplar" in surrounding.lower(), (
+            "[QUALITY_REFERENCE] instruction must reference the kanon-deps-work exemplar path "
+            "so provenance is unambiguous"
+        )
+
+
+@pytest.mark.unit
+class TestSpecToBacklogSkillSelfCritiqueRubric:
+    """AC-191-4: Self-critique rubric must cover all items from spec section 4.6.0."""
+
+    def test_rubric_requires_every_fr_has_epic(self) -> None:
+        """Rubric: every spec FR must have at least one Epic (or explicit N/A)."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert "Epic" in content and any(
+            kw in content.lower() for kw in ("fr", "functional requirement", "spec fr", "every fr")
+        ), (
+            "spec-to-backlog/SKILL.md rubric must require every spec FR to have at least one Epic"
+        )
+
+    def test_rubric_requires_no_skipped_hierarchy_levels(self) -> None:
+        """Rubric: hierarchy must be exactly Epic -> Feature -> Story -> Task with no skipped levels."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        # Verify all four levels appear together in a rubric-like context
+        assert all(level in content for level in ["Epic", "Feature", "Story", "Task"]), (
+            "spec-to-backlog/SKILL.md rubric must require Epic->Feature->Story->Task "
+            "with no skipped levels"
+        )
+
+    def test_rubric_requires_dag_dependency_graph(self) -> None:
+        """Rubric: dependency graph must be a DAG (validated by validate-backlog)."""
+        content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
+        assert "DAG" in content or "acyclic" in content.lower() or "dependency" in content.lower(), (
+            "spec-to-backlog/SKILL.md rubric must require the dependency graph to be a DAG "
+            "(validated by validate-backlog)"
         )

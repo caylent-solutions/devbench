@@ -127,6 +127,7 @@ IDs are case-insensitive in status matching but written in uppercase by conventi
 
 | Status | Meaning | Written as | Terminal? |
 |--------|---------|-----------|-----------|
+| Draft | Pre-queue; not yet refined / approved for autonomous claim | `draft` | no |
 | In Queue | Ready to be picked up | `in-queue` | no |
 | In Progress | Agent is implementing | `in-progress` | no |
 | In Review | Staged, awaiting judge review | `in-review` | no |
@@ -135,6 +136,22 @@ IDs are case-insensitive in status matching but written in uppercase by conventi
 | Proposed | Auto-emitted draft awaiting human promote / reject | `proposed` | no |
 | Declined | Will never be done; final operator decision | `declined` | yes |
 | Hold | Deferred / under debate; orchestrator skips it until `unhold` | `hold` | no |
+
+> **Note:** `draft` is the agile-standard term for items not yet refined / approved for autonomous claim. A work unit in `draft` is visible in the backlog but is never picked up by the orchestrator. Use `devbench promote <id>` to transition a `draft` unit to `in-queue` when it is ready for autonomous execution.
+
+### Work unit lifecycle
+
+The canonical happy-path lifecycle is:
+
+```
+draft -> in-queue -> in-progress -> in-review -> done
+```
+
+Side branches (all non-terminal unless noted):
+
+- `in-queue` / `in-progress` / `in-review` --> `blocked` (max retries exhausted or dep blocked; non-terminal)
+- `in-queue` / `in-progress` --> `hold` (operator-deferred; non-terminal)
+- `in-queue` / `in-progress` / `blocked` --> `declined` (operator decision; terminal)
 
 A status is *terminal* when a parent's auto-rollup treats it as complete. `done` and `declined` are terminal; `hold` is **not** -- a held child keeps its parent open. This guarantees that pausing a unit cannot accidentally close out its parent.
 

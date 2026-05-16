@@ -591,6 +591,12 @@ BEDROCK_AGENT_MODEL_PATTERN: re.Pattern[str] = re.compile(r"^us\.anthropic\.clau
 # Consumed exclusively by ``src/devbench/session.py``; defined here so no
 # literal values appear inline in that module.
 # ---------------------------------------------------------------------------
+# Workspace-relative path to the base directory holding all session state dirs.
+# Full path is ``<workspace_root>/<SESSION_SESSIONS_BASE_DIR>``.
+# Consumed by ``src/devbench/log_setup.py`` (per-session log routing) and
+# ``src/devbench/session.py`` (registry and per-session state directories).
+SESSION_SESSIONS_BASE_DIR: str = ".devbench/sessions"
+
 # Workspace-relative path to the session registry JSON file.
 # Full path is ``<workspace_root>/<SESSION_REGISTRY_PATH>``.
 SESSION_REGISTRY_PATH: str = ".devbench/sessions/registry.json"

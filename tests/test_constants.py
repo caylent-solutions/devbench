@@ -390,3 +390,49 @@ class TestQuotaHandlingDefaultConstants:
             f"{constant_name} expected type {expected_type.__name__!r}, got {type(constant).__name__!r}"
         )
         assert constant == expected_value, f"{constant_name} expected {expected_value!r}, got {constant!r}"
+
+
+class TestSessionSessionsBaseDirConstant:
+    """AC-CONST-01 through AC-CONST-03: SESSION_SESSIONS_BASE_DIR constant in constants.py.
+
+    The constant must be importable from devbench.constants, must be a str,
+    and must equal '.devbench/sessions' without any absolute-path separators.
+    """
+
+    def test_session_sessions_base_dir_is_importable(self) -> None:
+        """AC-CONST-03: SESSION_SESSIONS_BASE_DIR is importable from devbench.constants without error."""
+        import devbench.constants as _c
+
+        assert hasattr(_c, "SESSION_SESSIONS_BASE_DIR")
+
+    def test_session_sessions_base_dir_is_non_empty_string(self) -> None:
+        """AC-CONST-02: SESSION_SESSIONS_BASE_DIR is a non-empty str."""
+        from devbench.constants import SESSION_SESSIONS_BASE_DIR
+
+        assert isinstance(SESSION_SESSIONS_BASE_DIR, str)
+        assert len(SESSION_SESSIONS_BASE_DIR) > 0
+
+    def test_session_sessions_base_dir_equals_expected_value(self) -> None:
+        """AC-CONST-01: SESSION_SESSIONS_BASE_DIR equals '.devbench/sessions'."""
+        from devbench.constants import SESSION_SESSIONS_BASE_DIR
+
+        assert SESSION_SESSIONS_BASE_DIR == ".devbench/sessions"
+
+    def test_session_sessions_base_dir_is_relative_path(self) -> None:
+        """AC-CONST-02: SESSION_SESSIONS_BASE_DIR does not begin with '/' (relative path only)."""
+        from devbench.constants import SESSION_SESSIONS_BASE_DIR
+
+        assert not SESSION_SESSIONS_BASE_DIR.startswith("/")
+
+    @pytest.mark.parametrize(
+        "constant_name",
+        ["SESSION_SESSIONS_BASE_DIR"],
+    )
+    def test_session_sessions_base_dir_via_importlib(self, constant_name: str) -> None:
+        """AC-CONST-03: constant is dynamically importable via importlib (parametrized form)."""
+        import importlib
+
+        module = importlib.import_module("devbench.constants")
+        constant = getattr(module, constant_name)
+        assert isinstance(constant, str), f"{constant_name} expected type 'str', got {type(constant).__name__!r}"
+        assert constant == ".devbench/sessions", f"{constant_name} expected '.devbench/sessions', got {constant!r}"

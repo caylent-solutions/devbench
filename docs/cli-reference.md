@@ -46,7 +46,9 @@ Non-mutating commands for inspecting backlog state.
 uv run devbench status
 ```
 
-Print a summary of the backlog grouped by status. Output includes counts per lifecycle value (in-queue, in-progress, in-review, done, blocked, proposed, declined, hold) plus an always-rendered `Un-materialised` count of proposal JSONs pending materialisation. Also lists active and blocked work units by ID.
+Print a summary of the backlog grouped by status. Output includes counts per lifecycle value (draft, in-queue, in-progress, in-review, done, blocked, proposed, declined, hold) plus an always-rendered `Un-materialised` count of proposal JSONs pending materialisation. Also lists active and blocked work units by ID.
+
+The summary includes a `Draft N` row rendered between the `TOTAL` line and the `In Queue` line when any work units have `draft` status. Draft work units are not eligible for autonomous claim until promoted to `in-queue` via `devbench promote`.
 
 Pass `--detail` (E220) to additionally render three panels at the bottom of the output:
 
@@ -77,6 +79,8 @@ uv run devbench report [--once|--no-stream] [--since <ISO-8601>] [--watch N]
 ```
 
 Print the progress report with velocity, token consumption, and estimated cost. Default layout renders two side-by-side tables: **All-time** (full log) and **Current run** (most recent contiguous block of orchestration events, boundary detected as a gap over 10 minutes between consecutive `Set X to ...` log lines).
+
+The Status Summary per-epic table (also written to `BACKLOG.md` by `validate-backlog`) includes a `Draft` column alongside the existing status columns. The column count reflects the number of draft-status work units under each epic. Epics with no draft work units show `0` in the `Draft` column.
 
 **Issue #163: streaming default on TTY.** `devbench report` (no flags) opens an always-on streaming view that polls cache stats every ~100ms and re-renders the report whenever any source file advances. The screen never goes blank between refreshes -- the new frame is rendered to memory first, then emitted with the clear sequence in a single buffered write so the terminal flips OLD frame -> NEW frame in one redraw cycle. Ctrl+C exits cleanly. A `[refresh] cold X.Xs / warm Y.YYs / last refresh Z.ZZs` footer at the bottom of every frame exposes the loop's pace.
 
@@ -285,7 +289,9 @@ Set the work unit's status to `in-progress`. Fails if the unit is already in a t
 uv run devbench set-status <id> <status>
 ```
 
-Force any status on a work unit. Skips the done-gate and other workflow checks. Used for recovery (unblock a stuck unit, resurrect a declined unit) and for orchestrator-internal lifecycle transitions. Accepted values: `in-queue`, `in-progress`, `in-review`, `done`, `blocked`, `proposed`, `declined`, `hold`.
+Force any status on a work unit. Skips the done-gate and other workflow checks. Used for recovery (unblock a stuck unit, resurrect a declined unit) and for orchestrator-internal lifecycle transitions. Accepted values: `draft`, `in-queue`, `in-progress`, `in-review`, `done`, `blocked`, `proposed`, `declined`, `hold`.
+
+Note: to transition `draft -> in-queue` on one or more units, prefer `devbench promote` (which validates the source status and writes the `[PROMOTED] draft -> in-queue` audit comment). Use `set-status draft` only for ad-hoc recovery or for setting a new work unit's initial state when the default-status config is not sufficient.
 
 ### `mark-done`
 
@@ -318,6 +324,52 @@ uv run devbench unhold <id> --reason "<message>"
 ```
 
 Return a held work unit to `in-queue`. Refuses any unit whose current status is anything other than `hold` (fail-fast keeps the lifecycle linear -- use `set-status` for ad-hoc transitions). The `--reason` is REQUIRED and captured as `[UNHOLD] <reason>` in the Comments section, so a hold-then-unhold round-trip is fully reconstructible from the audit trail.
+
+### `promote`
+
+```
+uv run devbench promote <id>
+uv run devbench promote --epic <id>
+uv run devbench promote --feature <id>
+uv run devbench promote --story <id>
+uv run devbench promote --all [--yes]
+```
+
+Transition one or more work units from `draft -> in-queue`, making them eligible for autonomous claim. Each promoted work unit receives a `[PROMOTED] draft -> in-queue` audit comment in its `## Comments` section.
+
+Refuses (rc=1) any work unit that is not currently in `draft` status -- use `set-status` for ad-hoc transitions between other statuses.
+
+**Selector variants:**
+
+- `devbench promote <id>` -- promote a single work unit by its ID (e.g. `E1-F2-S3-T4`). Exits 1 with an actionable error if the unit is not currently in `draft`.
+- `devbench promote --epic <id>` -- promote every work unit under the named epic in one transaction (e.g. `devbench promote --epic E1`). All descendants must be in `draft` status; the entire transaction aborts with rc=1 if any descendant is not in `draft`.
+- `devbench promote --feature <id>` -- promote every work unit under the named feature (e.g. `devbench promote --feature E1-F2`). All descendants must be in `draft` status; the entire transaction aborts with rc=1 if any descendant is not in `draft`.
+- `devbench promote --story <id>` -- promote every work unit under the named story (e.g. `devbench promote --story E1-F2-S3`). All descendants must be in `draft` status; the entire transaction aborts with rc=1 if any descendant is not in `draft`.
+- `devbench promote --all` -- promote every `draft`-status work unit in the entire backlog. Prompts for confirmation unless `--yes` is also passed.
+- `devbench promote --all --yes` -- skip the confirmation prompt and promote all draft work units immediately. Safe for automation / CI.
+
+**Example -- single unit:**
+
+```bash
+uv run devbench promote E1-F2-S3-T4
+# -> [PROMOTED] draft -> in-queue appended to E1-F2-S3-T4.md
+```
+
+**Example -- bulk by epic:**
+
+```bash
+uv run devbench promote --epic E5
+# -> all draft WUs under E5 promoted to in-queue in one pass
+```
+
+**Example -- all drafts with confirmation bypass:**
+
+```bash
+uv run devbench promote --all --yes
+# -> every draft WU in the backlog promoted; no interactive prompt
+```
+
+Implementation detail: `promote` delegates to `BacklogManager.force_status` per unit and appends the audit comment via `BacklogManager._append_agent_comment`. No new status-transition logic is introduced; the command is a thin operator-facing wrapper that validates the pre-condition (`draft`) and iterates the selected scope.
 
 ### `new-task`
 

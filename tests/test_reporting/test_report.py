@@ -1386,12 +1386,20 @@ class TestActiveVsBlockedRemaining:
         result = _recent_per_task_cost(log_file, done, prog, RECENT_PACE_TASKS)
         assert result is None
 
-    def test_recent_per_task_cost_falls_back_to_window_avg_when_helper_returns_none(self, tmp_path: Path) -> None:
+    def test_recent_per_task_cost_falls_back_to_window_avg_when_helper_returns_none(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Issue #164 fallback contract: when ``recent_per_task_cost`` is
         None, ``_compute_window_stats`` falls back to the per-window
         average (cost.total_cost / tasks_in_window). When ``recent_per_task_cost``
         IS provided it overrides the per-window denominator."""
         from devbench.reporting.report import _compute_window_stats
+
+        # AC-CODE-001: prevent _hook_log_path from falling back to the live
+        # workspace hook-logs.jsonl when log_path is inside tmp_path.
+        nonexistent = tmp_path / "hook-logs.jsonl"
+        monkeypatch.setattr("devbench.reporting.report._hook_log_path", lambda _p: nonexistent)
+        monkeypatch.setattr("devbench.reporting.report._discover_transcript_dir", lambda _p: None)
 
         log_file = tmp_path / "test.log"
         log_file.write_text("")  # empty log -> all costs are zero
@@ -1422,7 +1430,9 @@ class TestActiveVsBlockedRemaining:
         )
         assert stats_global.est_total_cost == pytest.approx(500.0)
 
-    def test_lifetime_total_cost_overrides_per_window_additive_base(self, tmp_path: Path) -> None:
+    def test_lifetime_total_cost_overrides_per_window_additive_base(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Spanning-row contract: when ``lifetime_total_cost`` is supplied,
         ``est_total_cost`` uses it as the additive base instead of the
         per-window ``cost.total_cost``. This is what makes every column
@@ -1431,6 +1441,12 @@ class TestActiveVsBlockedRemaining:
         direct test callers.
         """
         from devbench.reporting.report import _compute_window_stats
+
+        # AC-CODE-001: prevent _hook_log_path from falling back to the live
+        # workspace hook-logs.jsonl when log_path is inside tmp_path.
+        nonexistent = tmp_path / "hook-logs.jsonl"
+        monkeypatch.setattr("devbench.reporting.report._hook_log_path", lambda _p: nonexistent)
+        monkeypatch.setattr("devbench.reporting.report._discover_transcript_dir", lambda _p: None)
 
         log_file = tmp_path / "test.log"
         log_file.write_text("")

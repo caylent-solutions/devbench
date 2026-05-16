@@ -8963,6 +8963,237 @@ class TestEmitOrphanCleanupDispatch:
             cfg.INLINE_ORPHAN_CLEANUP_ENABLED = original
 
 
+class TestLegacyEmitOrphanCleanupProposalDefaultStatus:
+    """AC-189-8: ``_legacy_emit_orphan_cleanup_proposal`` respects
+    ``backlog.default_status_for_new_work_units``.
+
+    When the config says ``draft``, the materialised cleanup task must remain
+    in ``draft`` status -- the immediate ``promote_proposal`` call must be
+    skipped.  When the config says ``in-queue`` (the default), the function
+    promotes the draft as before so it is immediately actionable.
+    """
+
+    _SOURCE_ID = "E0-F1-S1-T1"
+
+    def _make_unit(self, repo: str = "org/repo") -> WorkUnit:
+        return WorkUnit(
+            id=self._SOURCE_ID,
+            title="Source task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path(f"backlog/E0/E0-F1/E0-F1-S1/{self._SOURCE_ID}.md"),
+            repo=repo,
+            dependencies=[],
+        )
+
+    def _build_workspace(self, tmp_path: Path) -> tuple[Path, Path, Path]:
+        """Return (backlog_root, backlog_index, story_dir).
+
+        Creates the minimal directory + BACKLOG.md structure that
+        ``_legacy_emit_orphan_cleanup_proposal`` needs to run without
+        patching its internal helpers.
+        """
+        backlog_root = tmp_path / "backlog"
+        story_dir = backlog_root / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+
+        # Source-task file so _find_source_task_file finds it when wiring deps.
+        wu_file = story_dir / f"{self._SOURCE_ID}.md"
+        wu_file.write_text(
+            f"# {self._SOURCE_ID}: Source task\n\n"
+            "## Status: in-progress\n\n"
+            "## Target Repository\n\n- **Repo:** `org/repo`\n\n"
+            "## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-FUNC-001\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `src/foo.py` | edit |\n\n"
+            "## Definition of Done\n\n- [ ] done\n\n"
+            "## TDD Cycle Log\n\n"
+            "## Comments\n",
+            encoding="utf-8",
+        )
+
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text(
+            "# Backlog\n\n"
+            "## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
+            "|------|-------|------|-------------|----------|---------|\n"
+            f"| E0 | x | 0 | 1 | 0 | 0 |\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            f"| {self._SOURCE_ID} | Source task | Task | in-progress | None | org/repo |"
+            f" `backlog/E0/E0-F1/E0-F1-S1/{self._SOURCE_ID}.md` |\n",
+            encoding="utf-8",
+        )
+        return backlog_root, backlog_index, story_dir
+
+    def _patch_workspace(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        backlog_root: Path,
+        backlog_index: Path,
+    ) -> None:
+        monkeypatch.setattr(cli, "WORKSPACE_ROOT", tmp_path)
+        monkeypatch.setattr(cli, "BACKLOG_ROOT", backlog_root)
+        monkeypatch.setattr(cli, "BACKLOG_INDEX", backlog_index)
+
+    def _runtime_config_with_default_status(self, status: str) -> Any:
+        """Return a RuntimeConfig clone with the given default_status_for_new_work_units."""
+        import dataclasses
+
+        from devbench.config_loader import BacklogConfig
+
+        base = cli.RUNTIME_CONFIG
+        new_backlog = BacklogConfig(default_status_for_new_work_units=status)
+        return dataclasses.replace(base, backlog=new_backlog)
+
+    @pytest.mark.parametrize("default_status", ["draft", "in-queue"])
+    def test_materialised_file_reflects_configured_status(
+        self,
+        default_status: str,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
+    ) -> None:
+        """The cleanup task file's ``## Status:`` line matches the configured default."""
+        from devbench.backlog import proposal as proposal_mod
+        from devbench.config_loader import BacklogConfig, RuntimeConfig
+
+        backlog_root, backlog_index, story_dir = self._build_workspace(tmp_path)
+        self._patch_workspace(monkeypatch, tmp_path, backlog_root, backlog_index)
+        monkeypatch.setattr(cli, "RUNTIME_CONFIG", self._runtime_config_with_default_status(default_status))
+
+        # Patch proposal_mod's config getter so materialise_proposal writes
+        # the configured status directly into the draft file.
+        fake_cfg = RuntimeConfig.__new__(RuntimeConfig)
+        object.__setattr__(fake_cfg, "backlog", BacklogConfig(default_status_for_new_work_units=default_status))
+        monkeypatch.setattr(proposal_mod, "_get_runtime_config", lambda: fake_cfg)
+
+        result = cli._legacy_emit_orphan_cleanup_proposal(
+            unit_id=self._SOURCE_ID,
+            unit=self._make_unit(),
+            repo_path=tmp_path / "repo",
+            detected=[".coverage"],
+        )
+
+        assert result is True
+
+        # The new draft file must exist in the story dir.
+        drafts = list(story_dir.glob("E0-F1-S1-T*.md"))
+        # Exclude the source task itself.
+        new_drafts = [d for d in drafts if d.name != f"{self._SOURCE_ID}.md"]
+        assert len(new_drafts) == 1, f"Expected exactly one new draft, found: {new_drafts}"
+
+        draft_content = new_drafts[0].read_text(encoding="utf-8")
+        assert f"## Status: {default_status}" in draft_content, (
+            f"Expected '## Status: {default_status}' in draft, got content:\n{draft_content[:500]}"
+        )
+
+    def test_draft_status_skips_promote_and_leaves_draft(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
+    ) -> None:
+        """When default_status is ``draft``, no promote_proposal call is made
+        and the cleanup task remains in ``draft`` status after the function returns."""
+        from devbench.backlog import proposal as proposal_mod
+        from devbench.config_loader import BacklogConfig, RuntimeConfig
+
+        backlog_root, backlog_index, story_dir = self._build_workspace(tmp_path)
+        self._patch_workspace(monkeypatch, tmp_path, backlog_root, backlog_index)
+        monkeypatch.setattr(cli, "RUNTIME_CONFIG", self._runtime_config_with_default_status("draft"))
+
+        fake_cfg = RuntimeConfig.__new__(RuntimeConfig)
+        object.__setattr__(fake_cfg, "backlog", BacklogConfig(default_status_for_new_work_units="draft"))
+        monkeypatch.setattr(proposal_mod, "_get_runtime_config", lambda: fake_cfg)
+
+        result = cli._legacy_emit_orphan_cleanup_proposal(
+            unit_id=self._SOURCE_ID,
+            unit=self._make_unit(),
+            repo_path=tmp_path / "repo",
+            detected=[".coverage"],
+        )
+
+        assert result is True
+
+        new_drafts = [d for d in story_dir.glob("E0-F1-S1-T*.md") if d.name != f"{self._SOURCE_ID}.md"]
+        assert len(new_drafts) == 1
+        content = new_drafts[0].read_text(encoding="utf-8")
+        # Must stay draft -- no promote step should have flipped it to in-queue.
+        assert "## Status: draft" in content
+        assert "## Status: in-queue" not in content
+
+    def test_in_queue_status_promotes_to_in_queue(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
+    ) -> None:
+        """When default_status is ``in-queue``, the cleanup task is promoted
+        and the draft file reflects ``in-queue`` status (backwards-compatible)."""
+        from devbench.backlog import proposal as proposal_mod
+        from devbench.config_loader import BacklogConfig, RuntimeConfig
+
+        backlog_root, backlog_index, story_dir = self._build_workspace(tmp_path)
+        self._patch_workspace(monkeypatch, tmp_path, backlog_root, backlog_index)
+        monkeypatch.setattr(cli, "RUNTIME_CONFIG", self._runtime_config_with_default_status("in-queue"))
+
+        fake_cfg = RuntimeConfig.__new__(RuntimeConfig)
+        object.__setattr__(fake_cfg, "backlog", BacklogConfig(default_status_for_new_work_units="in-queue"))
+        monkeypatch.setattr(proposal_mod, "_get_runtime_config", lambda: fake_cfg)
+
+        result = cli._legacy_emit_orphan_cleanup_proposal(
+            unit_id=self._SOURCE_ID,
+            unit=self._make_unit(),
+            repo_path=tmp_path / "repo",
+            detected=[".coverage"],
+        )
+
+        assert result is True
+
+        new_drafts = [d for d in story_dir.glob("E0-F1-S1-T*.md") if d.name != f"{self._SOURCE_ID}.md"]
+        assert len(new_drafts) == 1
+        content = new_drafts[0].read_text(encoding="utf-8")
+        # Promoted to in-queue.
+        assert "## Status: in-queue" in content
+
+    def test_error_message_reflects_configured_status(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
+    ) -> None:
+        """The stderr message names the status the cleanup task was written with
+        (not a hardcoded ``(in-queue)`` label), so operators see the real status."""
+        from devbench.backlog import proposal as proposal_mod
+        from devbench.config_loader import BacklogConfig, RuntimeConfig
+
+        backlog_root, backlog_index, _ = self._build_workspace(tmp_path)
+        self._patch_workspace(monkeypatch, tmp_path, backlog_root, backlog_index)
+        monkeypatch.setattr(cli, "RUNTIME_CONFIG", self._runtime_config_with_default_status("draft"))
+
+        fake_cfg = RuntimeConfig.__new__(RuntimeConfig)
+        object.__setattr__(fake_cfg, "backlog", BacklogConfig(default_status_for_new_work_units="draft"))
+        monkeypatch.setattr(proposal_mod, "_get_runtime_config", lambda: fake_cfg)
+
+        cli._legacy_emit_orphan_cleanup_proposal(
+            unit_id=self._SOURCE_ID,
+            unit=self._make_unit(),
+            repo_path=tmp_path / "repo",
+            detected=[".coverage"],
+        )
+
+        err = capsys.readouterr().err
+        # The message must not hardcode "(in-queue)" when config says "draft".
+        assert "(in-queue)" not in err, f"Error message hardcodes '(in-queue)' even when config is 'draft': {err!r}"
+        # The message must name the actual configured status.
+        assert "(draft)" in err, f"Expected '(draft)' in stderr message when config is 'draft': {err!r}"
+
+
 class TestFindExistingCleanupProposal:
     """Phase 1 secondary fix: cross-task de-duplication for the legacy proposal flow."""
 

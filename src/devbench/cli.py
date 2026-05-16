@@ -165,6 +165,7 @@ from devbench.constants import (
     ORCHESTRATOR_RESTART_EXIT_CODE,
     STATUS_BLOCKED,
     STATUS_DONE,
+    STATUS_DRAFT,
     STATUS_IN_PROGRESS,
     STATUS_IN_QUEUE,
     STATUS_IN_REVIEW,
@@ -2967,6 +2968,14 @@ def _legacy_emit_orphan_cleanup_proposal(
         ],
     )
 
+    # AC-189-8: read the configured default status once so all writes below
+    # are consistent. When the config says ``draft``, the cleanup task is
+    # left in draft state -- the operator must promote it explicitly before
+    # the orchestrator can claim it. When the config says ``in-queue``
+    # (the backwards-compatible default) the draft is promoted immediately,
+    # matching the pre-AC-189-8 behaviour.
+    new_wu_default_status: str = RUNTIME_CONFIG.backlog.default_status_for_new_work_units
+
     try:
         write_proposal(WORKSPACE_ROOT, proposal)
         materialised_files = materialise_proposal(
@@ -2976,13 +2985,14 @@ def _legacy_emit_orphan_cleanup_proposal(
             proposal=proposal,
             repo=unit.repo,
         )
-        promote_proposal(
-            workspace_root=WORKSPACE_ROOT,
-            backlog_root=BACKLOG_ROOT,
-            backlog_index=BACKLOG_INDEX,
-            task_id=new_id,
-            dep_on_source=True,
-        )
+        if new_wu_default_status != STATUS_DRAFT:
+            promote_proposal(
+                workspace_root=WORKSPACE_ROOT,
+                backlog_root=BACKLOG_ROOT,
+                backlog_index=BACKLOG_INDEX,
+                task_id=new_id,
+                dep_on_source=True,
+            )
         wired_claimants = _wire_orphan_cleanup_dep_chain(
             new_id=new_id,
             files_to_own=[".gitignore"],
@@ -3010,7 +3020,7 @@ def _legacy_emit_orphan_cleanup_proposal(
     print(
         f"ERROR: git-ops refused -- {len(detected)} build/state artifact path(s) "
         f"would pollute the commit (sample: {sample}). "
-        f"Auto-emitted cleanup proposal {new_id} (in-queue); "
+        f"Auto-emitted cleanup proposal {new_id} ({new_wu_default_status}); "
         f"{unit_id} is now blocked-pending-proposal and will auto-clear when the cleanup commits.{extra} "
         f"Materialised: {[str(p) for p in materialised_files]}.",
         file=sys.stderr,

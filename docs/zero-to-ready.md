@@ -15,6 +15,7 @@ and be one command away from launching the orchestrator for the first time.
 - [Step 7: Author backlog/config/devbench.yaml](#step-7-author-backlogconfigdevbenchyaml)
 - [Step 8: Author or import a backlog](#step-8-author-or-import-a-backlog)
 - [Working with draft work units](#working-with-draft-work-units)
+- [Scoping a run](#scoping-a-run)
 - [Step 9: Validate](#step-9-validate)
 - [Step 10: Launch](#step-10-launch)
 - [Decision points](#decision-points)
@@ -455,6 +456,109 @@ devbench set-status E7-F1-S1-T1 draft   # or revert a specific task back to draf
 
 After promoting, proceed to Step 9 (`devbench validate-backlog`) to confirm the promoted
 work units satisfy all backlog-contract rules before launching the orchestrator.
+
+---
+
+## Scoping a run
+
+By default `devbench start` processes every eligible work unit in the backlog. Scope
+selectors let you restrict the orchestrator to a subset -- for example, a single epic you
+want to land first, or all epics except a risky one you want to review manually.
+
+### Printer-pages token syntax
+
+Tokens are comma-separated values passed to `--include` and `--exclude`. Whitespace around
+commas is ignored. Two token types are recognised:
+
+**Single-ID token** -- matches the exact ID and every descendant. Descendants are IDs
+whose string starts with `<token>-`.
+
+| Token | What it matches |
+|-------|-----------------|
+| `E2` | Epic E2 and all features, stories, and tasks under it |
+| `E2-F1` | Feature E2-F1 and all stories and tasks under it |
+| `E2-F1-S1-T3` | Exactly task E2-F1-S1-T3 (leaf; no descendants) |
+
+**Range token** -- two adjacent same-type segments at the end of the token. Expands
+inclusively on the final segment; earlier segments must match exactly.
+
+| Token | What it matches |
+|-------|-----------------|
+| `E1-E3` | All work units under epics E1, E2, and E3 |
+| `E5-F1-F3` | All work units under features E5-F1, E5-F2, and E5-F3 |
+| `E5-F1-S1-T2-T5` | Tasks E5-F1-S1-T2, T3, T4, T5 and any descendants |
+
+**Mixed comma-separated list** -- tokens are unioned:
+
+```
+--include "E1-E3, E5"
+# matches all work units under E1, E2, E3, and E5
+```
+
+**Reverse ranges** (`E3-E1`) are rejected immediately with an actionable error message
+and exit code 1. **Out-of-range tokens** (no matching work unit in the backlog) emit a
+warning but do not abort -- the run continues with the remaining matched IDs.
+
+For the full syntax reference including edge cases and evaluation order, see
+[`docs/cli-reference.md` -- Scope selectors](cli-reference.md#scope-selectors-printer-pages-syntax).
+
+### Scoping devbench start
+
+Pass `--include` (and optionally `--exclude`) to `devbench start`:
+
+```bash
+# Run only epics E1 through E3 plus E5:
+JUDGE_WORKSPACE_ROOT=~/my-workspace \
+JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+uv run --project $DEVBENCH_DIR devbench start --include "E1-E3, E5"
+
+# Run E1 through E10 but skip E5 and everything under E7-F3:
+JUDGE_WORKSPACE_ROOT=~/my-workspace \
+JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+uv run --project $DEVBENCH_DIR devbench start \
+  --include "E1-E10" --exclude "E5, E7-F3"
+```
+
+When `--include` is supplied, the parsed scope is persisted atomically to
+`<workspace>/.devbench/scope.json` before the orchestrate skill starts. Subsequent
+`devbench status`, `devbench report`, and `devbench next` invocations consult this file
+automatically (no extra flags needed) and render a `SCOPE:` banner above their output.
+The scope.json file is deleted on clean orchestrator exit; it survives orchestrator
+crashes so a follow-up `devbench status` still shows the active scope.
+
+### Pre-arming scope without starting the orchestrator
+
+When you want to set the scope before launching interactive Claude Code (so the
+orchestrate skill respects the filter without you having to launch and kill `devbench
+start` first), use `devbench scope set`:
+
+```bash
+# Write scope.json without starting the orchestrator:
+JUDGE_WORKSPACE_ROOT=~/my-workspace \
+uv run --project $DEVBENCH_DIR devbench scope set --include "E1-E3, E5"
+
+# Inspect the active scope:
+JUDGE_WORKSPACE_ROOT=~/my-workspace \
+uv run --project $DEVBENCH_DIR devbench scope show
+
+# Launch interactive Claude Code; the orchestrate skill respects scope.json:
+JUDGE_WORKSPACE_ROOT=~/my-workspace \
+JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+claude --dangerously-skip-permissions \
+  --plugin-dir $DEVBENCH_DIR/plugin/devbench
+
+# Clear the scope when done:
+JUDGE_WORKSPACE_ROOT=~/my-workspace \
+uv run --project $DEVBENCH_DIR devbench scope clear
+```
+
+The scope.json written by `devbench scope set` is identical to the one `devbench start
+--include` writes, so the orchestrate skill honours it identically. `devbench scope clear`
+is idempotent -- it exits 0 with the message `no scope pending` when no scope file is
+present.
+
+`devbench validate-backlog` ignores scope.json entirely -- it always validates the
+whole backlog regardless of any active scope.
 
 ---
 

@@ -28,6 +28,7 @@ Commands that run a blocking external process (git, tests, judges) propagate the
 
 - [Backlog read](#backlog-read)
 - [Backlog write](#backlog-write)
+- [Drain (graceful orchestrator stop)](#drain-graceful-orchestrator-stop)
 - [Scope selectors (printer-pages syntax)](#scope-selectors-printer-pages-syntax)
 - [Orchestration and reporting](#orchestration-and-reporting)
 - [Orchestrator helpers (invoked by agents)](#orchestrator-helpers-invoked-by-agents)
@@ -77,6 +78,14 @@ The summary's `Blocked` row is split into three lines (Part-1, post-issue-#118):
 - `Blocked (auto)` -- ADR-07 cascade-clearing: the task carries a `[BLOCKED_PENDING_PROPOSAL]` marker chain that will resolve when its target tasks reach terminal.
 - `Blocked (recovery)` -- AWAITING_AUTO_RECOVERY: no marker yet, but devbench's recovery loop has an artefact on disk (a pending proposal JSON, a rejected-amendment archive, or a recent recovery-agent `[BLOCKED]` audit comment within `JUDGE_BLOCKED_RECOVERY_WINDOW_SECONDS` -- default 1800s / 30min). The orchestrator's next sweep cycle will advance the task into the auto-clearing bucket. Operator does nothing.
 - `Blocked (attn)` -- the true halt list: manual gates (`DO NOT CLAIM`), unknown marker targets, cascade-stuck states. Operator must act.
+
+**Drain banner (issue #188):** when a `drain.signal` file is present in `<workspace>/.devbench/`, `devbench status` prepends a one-line banner above the Status Summary:
+
+```
+DRAIN REQUESTED: at 2026-05-14T13:55:01Z by matt (reason: nightly cutover)
+```
+
+The banner names the requester, the UTC timestamp, and the reason (or `(none)` when no reason was supplied). When no drain marker is present the banner is suppressed. See [`### drain`](#drain-graceful-orchestrator-stop) for the full drain subcommand reference.
 
 ### `next`
 
@@ -533,6 +542,82 @@ agents:
 ```
 
 Every field defaults to `null` when absent (use the agent's `.md` frontmatter model). When `use_bedrock: true`, every value must be a Bedrock ARN (`us.anthropic.claude-<name>-<ver>-v<N>`); when `false`, values must be a short name (`opus`/`sonnet`/`haiku`) or an Anthropic API id (`claude-opus-4-7`). `JUDGE_AGENT_MODEL_<NAME>` env vars (e.g. `JUDGE_AGENT_MODEL_EXECUTOR=opus`, `JUDGE_AGENT_MODEL_CODE_REVIEWER=opus`) override the YAML on a per-call basis (env > yaml > frontmatter).
+
+---
+
+## Drain (graceful orchestrator stop)
+
+Operator-initiated graceful stop of a running or about-to-start orchestrator. The drain protocol lets the orchestrator finish its current work unit, then exit cleanly rather than being killed mid-task. The mechanism is a JSON signal file at `<workspace>/.devbench/drain.signal`; the orchestrator polls the file between work units. The file is consumed (deleted) on orchestrator exit so a subsequent `devbench start` runs unscoped. Spec source: `spec/devbench-self-improve.md` section 4.3. Issue #188.
+
+### `drain`
+
+```
+uv run devbench drain [--reason "<text>"]
+uv run devbench drain --cancel
+uv run devbench drain --status
+```
+
+Request, withdraw, or inspect the drain signal. The bare form and `--reason` variant create the signal; `--cancel` removes it; `--status` is read-only and always exits rc=0.
+
+**Variants:**
+
+- **`devbench drain`** -- request a graceful stop with no reason. Writes `<workspace>/.devbench/drain.signal` with a JSON payload containing `requested_at` (UTC ISO 8601), `requested_by` (current `USER` / `USERNAME` env var, or `"unknown"`), and `reason` (empty string). The write is atomic (temp-then-rename) so readers never observe a partial file. Overwrites any existing signal. Exits 0 on success; filesystem failures propagate as unhandled exceptions (Python traceback to stderr).
+
+- **`devbench drain --reason "<text>"`** -- same as the bare form, with a non-empty reason string embedded in the payload. The reason is stored verbatim and surfaced by `devbench status` and `devbench drain --status`.
+
+- **`devbench drain --cancel`** -- withdraw the drain request. Deletes `<workspace>/.devbench/drain.signal`. Idempotent: exits 0 silently whether or not a signal file was present. Cancelling while the orchestrator is mid-WU prevents the orchestrator from exiting at the next WU boundary -- it continues as if no drain was requested (AC-188-10). Filesystem failures propagate as unhandled exceptions.
+
+- **`devbench drain --status`** -- print the current drain state and exit rc=0 in both cases:
+  - Signal present: prints a one-line summary of the form `drain pending: requested_by=<user> at=<ISO-8601> reason=<reason-or-none>`.
+  - No signal: prints `no drain pending`.
+
+  The orchestrate skill calls `devbench drain --status` between Step 9 (mark-done) and Step 10 (loop back) so it can exit cleanly without a special sentinel file. rc=0 in both states lets the skill use the printed output as the discriminator rather than the exit code.
+
+**How the orchestrator honours the drain signal:**
+
+When the running orchestrator detects the drain signal between work units (either via the cooperative skill check or the SDK-wrapper poll in `cmd_start::_run`), it:
+
+1. Finishes the current work unit (the WU in-progress reaches `done` or `blocked` first).
+2. Consumes the signal (reads + deletes the marker file atomically from the orchestrator process's perspective).
+3. Logs `[ORCHESTRATOR_DRAIN]` (cooperative skill path) or `[ORCHESTRATOR_DRAIN_ENFORCED]` (SDK-wrapper backstop) to the orchestrator log with the original reason.
+4. Exits cleanly with rc=0.
+
+The next `devbench start` runs without any drain restriction because the marker was consumed.
+
+**Pre-arm pattern (AC-188-6):** dropping the marker BEFORE `devbench start` causes the orchestrator to claim and complete exactly one work unit, then exit. This is useful for a controlled single-step execution or for confirming a work unit runs cleanly before committing to a full unattended run.
+
+**Exit codes:**
+
+| Command | rc=0 | rc!=0 |
+|---------|------|-------|
+| `drain` | Signal written. | Filesystem failures propagate as unhandled OSError (Python traceback). |
+| `drain --reason "<text>"` | Signal written. | Filesystem failures propagate as unhandled OSError (Python traceback). |
+| `drain --cancel` | Signal removed or was already absent (silent, no output). | Filesystem failures propagate as unhandled OSError (Python traceback). |
+| `drain --status` | Always (signal present or absent). | rc=2 on invalid argument combinations; startup errors (unset env vars) raise immediately. |
+
+**Worked examples:**
+
+```bash
+# Request graceful stop with a reason:
+uv run devbench drain --reason "nightly cutover"
+
+# Check current drain state (rc=0 either way):
+uv run devbench drain --status
+# -> drain pending: requested_by=matt at=2026-05-14T13:55:01+00:00 reason=nightly cutover
+# -- or --
+# -> no drain pending
+
+# Withdraw the request before the orchestrator picks it up:
+uv run devbench drain --cancel
+# (no output; exits rc=0 whether or not a signal was present)
+
+# Pre-arm: drop drain before start so orchestrator runs exactly one WU then exits:
+uv run devbench drain
+uv run devbench start --include "E1-F2-S3-T4"
+# -> orchestrator claims E1-F2-S3-T4, completes it, detects drain, exits rc=0
+```
+
+**Status banner:** when a drain signal is present, `devbench status` prepends a `DRAIN REQUESTED: at <ts> by <user> (reason: <text>)` banner above the Status Summary so the operator can see the pending drain at a glance. See the [`status`](#status) section for the full banner format.
 
 ---
 

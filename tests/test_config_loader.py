@@ -3231,6 +3231,209 @@ class TestQuotaHandlingConfig:
             load_runtime_config(cfg, {})
 
     # ------------------------------------------------------------------
+    # AC-193-20: parametrized valid enum acceptance tests
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize("value", ["wait", "fail", "drain"])
+    def test_quota_handling_on_exhaustion_valid_values_accepted(self, tmp_path: Path, value: str) -> None:
+        """Each valid on_exhaustion value is accepted and stored verbatim."""
+        cfg = self._write(
+            tmp_path / f"cfg_{value}.yaml",
+            f"""\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              on_exhaustion: {value}
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.quota_handling.on_exhaustion == value, (
+            f"Expected on_exhaustion={value!r}, got {rt.quota_handling.on_exhaustion!r}"
+        )
+
+    @pytest.mark.parametrize(
+        "value",
+        ["continue_current_wu", "restart_wu", "drain_and_resume"],
+    )
+    def test_quota_handling_resume_strategy_valid_values_accepted(self, tmp_path: Path, value: str) -> None:
+        """Each valid resume_strategy value is accepted and stored verbatim."""
+        cfg = self._write(
+            tmp_path / f"cfg_{value}.yaml",
+            f"""\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              resume_strategy: {value}
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.quota_handling.resume_strategy == value, (
+            f"Expected resume_strategy={value!r}, got {rt.quota_handling.resume_strategy!r}"
+        )
+
+    @pytest.mark.parametrize("value", ["drain", "fail", "keep_waiting"])
+    def test_quota_handling_on_exhaustion_timeout_valid_values_accepted(self, tmp_path: Path, value: str) -> None:
+        """Each valid on_exhaustion_timeout value is accepted and stored verbatim."""
+        cfg = self._write(
+            tmp_path / f"cfg_{value}.yaml",
+            f"""\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              on_exhaustion_timeout: {value}
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.quota_handling.on_exhaustion_timeout == value, (
+            f"Expected on_exhaustion_timeout={value!r}, got {rt.quota_handling.on_exhaustion_timeout!r}"
+        )
+
+    @pytest.mark.parametrize("value", [30, 60, 300, 3600])
+    def test_quota_handling_poll_interval_boundary_values_accepted(self, tmp_path: Path, value: int) -> None:
+        """poll_interval_seconds accepts the minimum (30), maximum (3600), and mid-range values."""
+        cfg = self._write(
+            tmp_path / f"cfg_{value}.yaml",
+            f"""\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              poll_interval_seconds: {value}
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.quota_handling.poll_interval_seconds == value, (
+            f"Expected poll_interval_seconds={value}, got {rt.quota_handling.poll_interval_seconds}"
+        )
+
+    # ------------------------------------------------------------------
+    # AC-193-20: error messages name the valid options (actionable text)
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "bad_value,valid_option",
+        [
+            ("never", "wait"),
+            ("pause", "fail"),
+            ("stop", "drain"),
+        ],
+    )
+    def test_quota_handling_on_exhaustion_error_names_valid_options(
+        self, tmp_path: Path, bad_value: str, valid_option: str
+    ) -> None:
+        """Rejection message for bad on_exhaustion names at least one valid option."""
+        cfg = self._write(
+            tmp_path / f"cfg_{bad_value}.yaml",
+            f"""\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              on_exhaustion: {bad_value}
+            """,
+        )
+        with pytest.raises(ValueError, match=valid_option):
+            load_runtime_config(cfg, {})
+
+    @pytest.mark.parametrize(
+        "bad_value,valid_option",
+        [
+            ("skip", "continue_current_wu"),
+            ("noop", "restart_wu"),
+            ("finish", "drain_and_resume"),
+        ],
+    )
+    def test_quota_handling_resume_strategy_error_names_valid_options(
+        self, tmp_path: Path, bad_value: str, valid_option: str
+    ) -> None:
+        """Rejection message for bad resume_strategy names at least one valid option."""
+        cfg = self._write(
+            tmp_path / f"cfg_{bad_value}.yaml",
+            f"""\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              resume_strategy: {bad_value}
+            """,
+        )
+        with pytest.raises(ValueError, match=valid_option):
+            load_runtime_config(cfg, {})
+
+    @pytest.mark.parametrize("bad_value", [29, 0, 3601, 10000])
+    def test_quota_handling_poll_interval_error_names_valid_range(self, tmp_path: Path, bad_value: int) -> None:
+        """Rejection message for out-of-range poll_interval_seconds mentions the boundary (30 or 3600)."""
+        cfg = self._write(
+            tmp_path / f"cfg_{bad_value}.yaml",
+            f"""\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              poll_interval_seconds: {bad_value}
+            """,
+        )
+        with pytest.raises(ValueError, match=r"30|3600"):
+            load_runtime_config(cfg, {})
+
+    @pytest.mark.parametrize(
+        "bad_value",
+        ["never", "pause", "stop", "quit", "ignore"],
+    )
+    def test_quota_handling_on_exhaustion_error_names_field_path(self, tmp_path: Path, bad_value: str) -> None:
+        """Rejection message for bad on_exhaustion mentions the field name 'on_exhaustion'."""
+        cfg = self._write(
+            tmp_path / f"cfg_{bad_value}.yaml",
+            f"""\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              on_exhaustion: {bad_value}
+            """,
+        )
+        with pytest.raises(ValueError, match="on_exhaustion"):
+            load_runtime_config(cfg, {})
+
+    @pytest.mark.parametrize(
+        "bad_value",
+        ["skip", "noop", "finish", "retry", "abort"],
+    )
+    def test_quota_handling_resume_strategy_error_names_field_path(self, tmp_path: Path, bad_value: str) -> None:
+        """Rejection message for bad resume_strategy mentions the field name 'resume_strategy'."""
+        cfg = self._write(
+            tmp_path / f"cfg_{bad_value}.yaml",
+            f"""\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              resume_strategy: {bad_value}
+            """,
+        )
+        with pytest.raises(ValueError, match="resume_strategy"):
+            load_runtime_config(cfg, {})
+
+    @pytest.mark.parametrize("bad_value", [29, 3601])
+    def test_quota_handling_poll_interval_error_names_field_path(self, tmp_path: Path, bad_value: int) -> None:
+        """Rejection message for out-of-range poll_interval_seconds mentions the field name."""
+        cfg = self._write(
+            tmp_path / f"cfg_{bad_value}.yaml",
+            f"""\
+            repos:
+              org/repo:
+                default_branch: main
+            quota_handling:
+              poll_interval_seconds: {bad_value}
+            """,
+        )
+        with pytest.raises(ValueError, match="poll_interval_seconds"):
+            load_runtime_config(cfg, {})
+
+    # ------------------------------------------------------------------
     # Dataclass default-factory tests (pure unit -- no YAML load)
     # ------------------------------------------------------------------
 

@@ -1204,6 +1204,26 @@ def _validate_auto_finalize_auto_merge(
         )
 
 
+def _schema_error_message(path: Path, exc: jsonschema.ValidationError) -> str:
+    """Format a schema validation error with the dotted field path for actionable diagnostics.
+
+    When the failing field has a known location (``exc.absolute_path`` is non-empty), the
+    message includes the dotted path so the operator knows exactly which config key to fix.
+    Example: ``quota_handling.on_exhaustion: 'never' is not one of ['wait', 'fail', 'drain']``
+
+    Args:
+        path: Config file path (used as context prefix).
+        exc: The jsonschema ``ValidationError`` whose ``.absolute_path`` and ``.message``
+             are extracted.
+
+    Returns:
+        Formatted error string suitable for wrapping in ``ValueError``.
+    """
+    field_path = ".".join(str(p) for p in exc.absolute_path)
+    detail = f"{field_path}: {exc.message}" if field_path else exc.message
+    return f"Config file '{path}' failed schema validation: {detail}"
+
+
 def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
     """Load YAML at *path*, validate against JSON Schema, and return a ``RuntimeConfig``.
 
@@ -1244,7 +1264,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
     try:
         jsonschema.validate(raw, _SCHEMA)
     except jsonschema.ValidationError as exc:
-        raise ValueError(f"Config file '{path}' failed schema validation: {exc.message}") from exc
+        raise ValueError(_schema_error_message(path, exc)) from exc
 
     allowed_orgs: list[str] = raw.get("allowed_orgs") or []
     workspace_root_raw = _env.get("JUDGE_WORKSPACE_ROOT", "")

@@ -214,22 +214,24 @@ class _StatusArgs:
         detail: Whether ``--detail`` was supplied.
         include: Raw ``--include`` token string (empty = not supplied).
         exclude: Raw ``--exclude`` token string (empty = not supplied).
+        session: Named-session filter from ``--session <name>`` (empty = not supplied).
         exit_code: Non-zero when argument parsing fails.
     """
 
     detail: bool = False
     include: str = ""
     exclude: str = ""
+    session: str = ""
     exit_code: int = 0
 
 
 def _parse_status_argv(argv: tuple[str, ...]) -> _StatusArgs:
     """Parse ``cmd_status`` arguments.
 
-    Accepts ``--detail``, ``--include <tokens>``, and ``--exclude <tokens>``
-    flags (spec section 4.2.2, AC-190-10, AC-190-11).  Any unrecognised
-    positional argument causes a non-zero ``exit_code`` in the returned
-    :class:`_StatusArgs`.
+    Accepts ``--detail``, ``--include <tokens>``, ``--exclude <tokens>``,
+    and ``--session <name>`` flags (spec sections 4.2.2, 4.4.6,
+    AC-190-10, AC-190-11, AC-192-12).  Any unrecognised positional argument
+    causes a non-zero ``exit_code`` in the returned :class:`_StatusArgs`.
 
     Args:
         argv: The positional argument tuple passed to ``cmd_status``.
@@ -246,7 +248,7 @@ def _parse_status_argv(argv: tuple[str, ...]) -> _StatusArgs:
         arg = args[i]
         if arg == "--detail":
             result.detail = True
-        elif arg in ("--include", "--exclude"):
+        elif arg in ("--include", "--exclude", "--session"):
             if i + 1 >= len(args) or args[i + 1].startswith("--"):
                 print(
                     f"ERROR: {arg} requires a value",
@@ -257,8 +259,10 @@ def _parse_status_argv(argv: tuple[str, ...]) -> _StatusArgs:
             i += 1
             if arg == "--include":
                 result.include = args[i]
-            else:
+            elif arg == "--exclude":
                 result.exclude = args[i]
+            else:
+                result.session = args[i]
         elif arg:
             extra_positional.append(arg)
         i += 1
@@ -456,18 +460,69 @@ def _resolve_scope_for_status(parsed: _StatusArgs) -> _ScopeResolution:
     )
 
 
+def _extract_session_from_wu(wu: WorkUnit) -> str | None:
+    """Return the session name from the most recent ``[WU_CLAIMED]`` audit in a WU file.
+
+    Reads the ``## Comments`` section of *wu*'s backing Markdown file and
+    searches for lines containing ``[WU_CLAIMED]`` with a ``session=<name>``
+    token.  Returns the name from the last such line (most recent claim wins).
+    Returns ``None`` when the file does not exist, has no Comments section,
+    has no ``[WU_CLAIMED]`` line, or the line carries no ``session=`` token
+    (legacy single-session behaviour).
+
+    Args:
+        wu: The :class:`WorkUnit` whose backing file to inspect.
+
+    Returns:
+        The session name string, or ``None`` when absent.
+
+    Raises:
+        OSError: If the file exists but cannot be read (permissions, I/O error).
+    """
+    if not wu.file_path.exists():
+        return None
+    content = wu.file_path.read_text(encoding="utf-8")
+
+    # Extract only the Comments section to avoid false matches in other sections.
+    comments_start = content.find(COMMENTS_SECTION_HEADER)
+    if comments_start == -1:
+        return None
+    comments_body = content[comments_start + len(COMMENTS_SECTION_HEADER) :]
+
+    session_name: str | None = None
+    session_marker = "session="
+    for line in comments_body.splitlines():
+        if "[WU_CLAIMED]" not in line:
+            continue
+        # Look for session=<token> in the line; token ends at next whitespace or EOL.
+        idx = line.find(session_marker)
+        if idx == -1:
+            continue
+        value_start = idx + len(session_marker)
+        value_end = line.find(" ", value_start)
+        session_name = line[value_start:].strip() if value_end == -1 else line[value_start:value_end].strip()
+
+    return session_name if session_name else None
+
+
 def cmd_status(*argv: str) -> int:
     """Print backlog summary grouped by status.
 
-    Accepts scope-filter flags (spec section 4.2.2, AC-190-10, AC-190-11):
+    Accepts scope-filter flags (spec section 4.2.2, AC-190-10, AC-190-11)
+    and a named-session filter flag (spec section 4.4.6, AC-192-12,
+    AC-192-13):
 
     - ``--include "<tokens>"`` -- one-off include selector; overrides active
       scope.json when present.
     - ``--exclude "<tokens>"`` -- one-off exclude selector.
+    - ``--session <name>`` -- filter rendered output to only work units
+      claimed by the named session.  Without this flag, all work units are
+      shown (aggregated view across sessions).
 
-    When neither flag is supplied, the active ``scope.json`` (if any) is
-    consulted instead.  In either case, a ``SCOPE: include=[...] exclude=[...]
-    (started ...)`` banner is printed above the Status Summary.
+    When neither ``--include`` nor ``--exclude`` is supplied, the active
+    ``scope.json`` (if any) is consulted instead.  In either case a
+    ``SCOPE: include=[...] exclude=[...] (started ...)`` banner is printed
+    above the Status Summary.
 
     With ``--detail`` (E220), additionally render per-state sections: in-queue
     (every actionable Task with the IDs of its still-open dependencies), six
@@ -490,7 +545,12 @@ def cmd_status(*argv: str) -> int:
     _render_drain_banner(WORKSPACE_ROOT)
 
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
-    units = parser.parse_index()
+    all_units = parser.parse_index()
+
+    # AC-192-12: when --session <name> is given, filter to only WUs whose most
+    # recent [WU_CLAIMED] audit names that session.  Without --session, the full
+    # aggregated list is used (AC-192-13).
+    units = [u for u in all_units if _extract_session_from_wu(u) == parsed.session] if parsed.session else all_units
 
     counts: dict[str, int] = {}
     for unit in units:

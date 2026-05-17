@@ -16992,3 +16992,352 @@ class TestCmdStartSigtermHandler:
         """_find_in_flight_wu returns None when the unit list is empty."""
         result = cli._find_in_flight_wu([])
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# AC-192-12 / AC-192-13: cmd_status --session flag (E4-F6-S1-T1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestParseStatusArgvSession:
+    """_parse_status_argv correctly parses --session <name> flag."""
+
+    def test_session_flag_sets_session_field(self) -> None:
+        """--session <name> sets the session field."""
+        result = cli._parse_status_argv(("--session", "alpha"))
+        assert result.session == "alpha"
+        assert result.exit_code == 0
+
+    def test_session_flag_missing_value_returns_error(self) -> None:
+        """--session without a value returns exit_code=1."""
+        result = cli._parse_status_argv(("--session",))
+        assert result.exit_code == 1
+
+    def test_session_flag_missing_value_next_is_flag_returns_error(self) -> None:
+        """--session followed by another flag returns exit_code=1."""
+        result = cli._parse_status_argv(("--session", "--detail"))
+        assert result.exit_code == 1
+
+    def test_session_default_is_empty_string(self) -> None:
+        """Without --session the session field defaults to empty string."""
+        result = cli._parse_status_argv(())
+        assert result.session == ""
+
+    def test_session_combined_with_detail(self) -> None:
+        """--session and --detail can be combined."""
+        result = cli._parse_status_argv(("--session", "beta", "--detail"))
+        assert result.session == "beta"
+        assert result.detail is True
+        assert result.exit_code == 0
+
+    @pytest.mark.parametrize("name", ["alpha", "my-session", "session-1"])
+    def test_session_various_names_accepted(self, name: str) -> None:
+        """Various valid session names are accepted."""
+        result = cli._parse_status_argv(("--session", name))
+        assert result.session == name
+        assert result.exit_code == 0
+
+
+@pytest.mark.unit
+class TestExtractSessionFromWu:
+    """_extract_session_from_wu reads the WU_CLAIMED session name from a WU file."""
+
+    def _wu_with_content(self, tmp_path: Path, unit_id: str, content: str) -> WorkUnit:
+        """Write content to a tmp WU file and return a WorkUnit pointing at it."""
+        wu_file = tmp_path / f"{unit_id}.md"
+        wu_file.write_text(content)
+        return WorkUnit(
+            id=unit_id,
+            title="Test Unit",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=wu_file,
+            repo="test/repo",
+        )
+
+    def test_extracts_session_name_from_wu_claimed_comment(self, tmp_path: Path) -> None:
+        """Session name is extracted from [WU_CLAIMED] ... session=<name> line."""
+        content = (
+            "# E1-F1-S1-T1: Test\n\n"
+            "## Status: in-progress\n\n"
+            "## Comments\n\n"
+            "[2026-05-17 00:05 UTC] [agent/orchestrator] [WU_CLAIMED] "
+            "Set E1-F1-S1-T1 to 'in-progress' session=alpha\n"
+        )
+        wu = self._wu_with_content(tmp_path, "E1-F1-S1-T1", content)
+        assert cli._extract_session_from_wu(wu) == "alpha"
+
+    def test_returns_none_when_no_session_in_wu_claimed(self, tmp_path: Path) -> None:
+        """Returns None when WU_CLAIMED has no session= token (legacy single-session)."""
+        content = (
+            "# E1-F1-S1-T1: Test\n\n"
+            "## Status: in-progress\n\n"
+            "## Comments\n\n"
+            "[2026-05-17 00:05 UTC] [agent/orchestrator] [WU_CLAIMED] "
+            "Set E1-F1-S1-T1 to 'in-progress'\n"
+        )
+        wu = self._wu_with_content(tmp_path, "E1-F1-S1-T1", content)
+        assert cli._extract_session_from_wu(wu) is None
+
+    def test_returns_none_when_no_comments_section(self, tmp_path: Path) -> None:
+        """Returns None when the WU file has no Comments section."""
+        content = "# E1-F1-S1-T1: Test\n\n## Status: in-progress\n\n"
+        wu = self._wu_with_content(tmp_path, "E1-F1-S1-T1", content)
+        assert cli._extract_session_from_wu(wu) is None
+
+    def test_returns_none_when_no_wu_claimed_in_comments(self, tmp_path: Path) -> None:
+        """Returns None when Comments section exists but has no [WU_CLAIMED] line."""
+        content = (
+            "# E1-F1-S1-T1: Test\n\n"
+            "## Status: in-progress\n\n"
+            "## Comments\n\n"
+            "[2026-05-17 00:05 UTC] [agent/executor] Some other comment\n"
+        )
+        wu = self._wu_with_content(tmp_path, "E1-F1-S1-T1", content)
+        assert cli._extract_session_from_wu(wu) is None
+
+    def test_extracts_most_recent_session_from_multiple_wu_claimed(self, tmp_path: Path) -> None:
+        """Most recent [WU_CLAIMED] line determines the session name."""
+        content = (
+            "# E1-F1-S1-T1: Test\n\n"
+            "## Status: in-progress\n\n"
+            "## Comments\n\n"
+            "[2026-05-10 00:00 UTC] [agent/orchestrator] [WU_CLAIMED] "
+            "Set E1-F1-S1-T1 to 'in-progress' session=beta\n"
+            "[2026-05-17 00:05 UTC] [agent/orchestrator] [WU_CLAIMED] "
+            "Set E1-F1-S1-T1 to 'in-progress' session=alpha\n"
+        )
+        wu = self._wu_with_content(tmp_path, "E1-F1-S1-T1", content)
+        assert cli._extract_session_from_wu(wu) == "alpha"
+
+    def test_returns_none_when_file_does_not_exist(self, tmp_path: Path) -> None:
+        """Returns None when the WU file does not exist on disk."""
+        wu = WorkUnit(
+            id="E1-F1-S1-T99",
+            title="Missing",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=tmp_path / "nonexistent.md",
+            repo="test/repo",
+        )
+        assert cli._extract_session_from_wu(wu) is None
+
+
+@pytest.mark.unit
+class TestCmdStatusSessionFilter:
+    """AC-192-12: cmd_status --session <name> filters to that session's WUs."""
+
+    def _make_wu_file(
+        self,
+        tmp_path: Path,
+        unit_id: str,
+        session: str | None,
+        status: WorkUnitStatus = WorkUnitStatus.IN_PROGRESS,
+    ) -> WorkUnit:
+        """Write a WU file with optional session= in WU_CLAIMED and return a WorkUnit."""
+        wu_file = tmp_path / f"{unit_id}.md"
+        claim_line = f"[WU_CLAIMED] Set {unit_id} to 'in-progress'"
+        if session:
+            claim_line += f" session={session}"
+        content = (
+            f"# {unit_id}: Test\n\n"
+            f"## Status: {status.value}\n\n"
+            "## Comments\n\n"
+            f"[2026-05-17 00:05 UTC] [agent/orchestrator] {claim_line}\n"
+        )
+        wu_file.write_text(content)
+        return WorkUnit(
+            id=unit_id,
+            title=f"Task {unit_id}",
+            status=status,
+            unit_type=WorkUnitType.TASK,
+            file_path=wu_file,
+            repo="test/repo",
+        )
+
+    def _make_parser_mock(self, units: list[WorkUnit]) -> MagicMock:
+        parser = MagicMock()
+        parser.parse_index.return_value = units
+        parser.get_parallel_candidates.return_value = []
+        parser.get_blocked_units.return_value = []
+        parser.all_done.return_value = False
+        return parser
+
+    def test_session_filter_shows_only_matching_session_wus(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """--session alpha shows only WUs claimed by session alpha."""
+        wu_alpha = self._make_wu_file(tmp_path, "E1-F1-S1-T1", session="alpha")
+        wu_beta = self._make_wu_file(tmp_path, "E1-F1-S1-T2", session="beta")
+        wu_no_session = self._make_wu_file(tmp_path, "E1-F1-S1-T3", session=None)
+        units = [wu_alpha, wu_beta, wu_no_session]
+        parser = self._make_parser_mock(units)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=parser),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._count_unmaterialised_proposed_tasks", return_value=0),
+        ):
+            rc = cli.cmd_status("--session", "alpha")
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        # The summary should show only 1 WU (the alpha one)
+        assert "TOTAL" in out
+        # The alpha WU should appear in active panel; beta WU should NOT
+        assert "E1-F1-S1-T1" in out
+        assert "E1-F1-S1-T2" not in out
+        assert "E1-F1-S1-T3" not in out
+
+    def test_session_filter_empty_result_when_no_matching_wus(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """--session unknown shows TOTAL=0 when no WUs match."""
+        wu_alpha = self._make_wu_file(tmp_path, "E1-F1-S1-T1", session="alpha")
+        parser = self._make_parser_mock([wu_alpha])
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=parser),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._count_unmaterialised_proposed_tasks", return_value=0),
+        ):
+            rc = cli.cmd_status("--session", "nonexistent")
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "TOTAL" in out
+        # Should show TOTAL 0
+        lines = [l for l in out.splitlines() if "TOTAL" in l]
+        assert lines, "Expected a TOTAL line in output"
+        assert "0" in lines[0]
+
+    def test_session_filter_missing_value_returns_error(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """--session without a value returns rc=1 and prints error to stderr."""
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_status("--session")
+
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "--session" in err
+
+    def test_no_session_flag_shows_all_wus(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Without --session, all WUs are shown (aggregated view)."""
+        wu_alpha = self._make_wu_file(tmp_path, "E1-F1-S1-T1", session="alpha")
+        wu_beta = self._make_wu_file(tmp_path, "E1-F1-S1-T2", session="beta")
+        units = [wu_alpha, wu_beta]
+        parser = self._make_parser_mock(units)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=parser),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._count_unmaterialised_proposed_tasks", return_value=0),
+        ):
+            rc = cli.cmd_status()
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        # Both WUs appear in active panel
+        assert "E1-F1-S1-T1" in out
+        assert "E1-F1-S1-T2" in out
+        # TOTAL should show 2
+        lines = [l for l in out.splitlines() if "TOTAL" in l]
+        assert lines
+        assert "2" in lines[0]
+
+    @pytest.mark.parametrize("session_name", ["alpha", "my-session", "session-1"])
+    def test_session_filter_various_valid_names(
+        self,
+        session_name: str,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Various valid session name values are accepted by --session."""
+        wu = self._make_wu_file(tmp_path, "E1-F1-S1-T1", session=session_name)
+        parser = self._make_parser_mock([wu])
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=parser),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._count_unmaterialised_proposed_tasks", return_value=0),
+        ):
+            rc = cli.cmd_status("--session", session_name)
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "E1-F1-S1-T1" in out
+
+
+@pytest.mark.unit
+class TestCmdStatusSessionAggregation:
+    """AC-192-13: cmd_status without --session aggregates correctly across sessions."""
+
+    def _make_wu_file(
+        self,
+        tmp_path: Path,
+        unit_id: str,
+        session: str | None,
+        status: WorkUnitStatus = WorkUnitStatus.IN_PROGRESS,
+    ) -> WorkUnit:
+        """Write a WU file with optional session= in WU_CLAIMED and return a WorkUnit."""
+        wu_file = tmp_path / f"{unit_id}.md"
+        claim_line = f"[WU_CLAIMED] Set {unit_id} to 'in-progress'"
+        if session:
+            claim_line += f" session={session}"
+        content = (
+            f"# {unit_id}: Test\n\n"
+            f"## Status: {status.value}\n\n"
+            "## Comments\n\n"
+            f"[2026-05-17 00:05 UTC] [agent/orchestrator] {claim_line}\n"
+        )
+        wu_file.write_text(content)
+        return WorkUnit(
+            id=unit_id,
+            title=f"Task {unit_id}",
+            status=status,
+            unit_type=WorkUnitType.TASK,
+            file_path=wu_file,
+            repo="test/repo",
+        )
+
+    def test_aggregated_view_no_double_counting(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Aggregated view (no --session) shows each WU exactly once."""
+        wu_a = self._make_wu_file(tmp_path, "E1-F1-S1-T1", session="alpha")
+        wu_b = self._make_wu_file(tmp_path, "E1-F1-S1-T2", session="beta")
+        wu_c = self._make_wu_file(tmp_path, "E1-F1-S1-T3", session=None, status=WorkUnitStatus.IN_QUEUE)
+        units = [wu_a, wu_b, wu_c]
+        parser = MagicMock()
+        parser.parse_index.return_value = units
+        parser.get_parallel_candidates.return_value = [wu_c]
+        parser.get_blocked_units.return_value = []
+        parser.all_done.return_value = False
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=parser),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._count_unmaterialised_proposed_tasks", return_value=0),
+        ):
+            rc = cli.cmd_status()
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        # TOTAL must be 3 (each WU counted once)
+        total_lines = [l for l in out.splitlines() if "TOTAL" in l]
+        assert total_lines
+        assert "3" in total_lines[0]

@@ -12,6 +12,8 @@ DevBench supports two LLM backends for judge evaluation. Choose one based on you
 
 Uses your existing Claude Code OAuth credentials -- no separate Anthropic API key needed. Requires a Claude Pro or Enterprise subscription.
 
+> **Quota handling:** Claude Pro and Max subscriptions are subject to per-window rate limits. When the limit is hit, DevBench detects the `subscription_rate_limit` error class and automatically waits for the reset window before resuming -- no operator action required. Operators using a direct Anthropic API key (rather than OAuth) may instead encounter `sdk_credit_exhausted` (prepaid credit depleted) or `api_billing_error` (payment failure) -- both are handled the same way. See [docs/quota-handling.md](quota-handling.md) for configuration options, the QUOTA WAIT status banner, and recovery procedures.
+
 ### How It Works
 
 When you authenticate with Claude Code (by running `claude` and logging in), Claude Code stores an OAuth token at:
@@ -109,6 +111,8 @@ To recover: re-authenticate Claude Code (`claude` → complete the browser flow)
 
 Uses the Anthropic Bedrock SDK with your AWS credentials. No Claude Code subscription required -- billing goes through your AWS account.
 
+> **Quota handling:** Bedrock provisioned throughput throttles are detected as the `bedrock_throttle` error class. DevBench waits and probes for recovery automatically. Resets typically occur within minutes. See [docs/quota-handling.md](quota-handling.md) for sample Bedrock configurations, backoff settings, and the recovery probe.
+
 ### How It Works
 
 When `JUDGE_USE_BEDROCK=1` is set, DevBench uses `anthropic.AnthropicBedrock` instead of `anthropic.Anthropic`. AWS credentials are resolved through the standard boto3 credential chain (IAM role, environment variables, AWS config file, etc.).
@@ -182,6 +186,8 @@ Ensure `JUDGE_BEDROCK_REGION` matches the region where you have Bedrock model ac
 ## Per-agent model overrides (quota management)
 
 DevBench's ten work agents (executor, blocker-resolver, manifest-amender, security-reviewer, task-factory, review-supervisor, plus the four review_team judges) each declare a default model in their `.md` frontmatter. Operators whose per-model quota is uneven -- e.g. opus tokens left, sonnet exhausted, or vice versa -- can retarget any subset of agents to a different model without editing the canonical plugin. See [ADR-25](adr/25-per-agent-model-overrides.md) for the architectural details.
+
+> **Quota handling:** When a model's quota is exhausted mid-run, DevBench automatically pauses and waits for the reset window via the quota wait-and-resume mechanism. Retargeting agents to a less-exhausted model tier is a complementary strategy to reduce wait frequency. See [docs/quota-handling.md](quota-handling.md) for the full wait-and-resume configuration, audit trail format, and status banner details.
 
 > **Do not pin any work agent to `haiku`.** Empirical observation in this codebase: under load the Claude Agent SDK was repeatedly observed to silently drop the `Agent` tool (and other multi-call tools) from haiku's tool list mid-orchestration, breaking parallel sub-agent dispatch and forcing the orchestrator to classify work-units as `RUNTIME_DEGRADATION` (issue #183 follow-up). Sonnet is the minimum recommended for every work agent. The short-name `haiku` is still accepted by the parser so operators can experiment, but every documented role default avoids it.
 

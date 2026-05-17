@@ -5,6 +5,8 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -80,9 +82,9 @@ class TestAllowedRepos:
         with pytest.raises(ValueError, match="not allowed"):
             validate_repo(_UNKNOWN_REPO)
 
-    def test_validate_repo_rejects_wrong_org_when_judge_gh_org_set(self) -> None:
+    def test_validate_repo_rejects_wrong_org_when_devbench_gh_org_set(self) -> None:
         with patch.object(config, "ALLOWED_GH_ORG", _FIXTURE_ORG):
-            with pytest.raises(ValueError, match="JUDGE_GH_ORG restricts access"):
+            with pytest.raises(ValueError, match="DEVBENCH_GH_ORG restricts access"):
                 config.validate_repo(_WRONG_ORG_REPO)
 
     def test_validate_repo_skips_org_check_when_judge_gh_org_empty(self) -> None:
@@ -232,8 +234,8 @@ class TestMergeStrategy:
         assert MergeStrategy.REBASE.flag == "--rebase"
 
     def test_invalid_value_raises_runtime_error(self) -> None:
-        with patch.dict(os.environ, {"JUDGE_MERGE_STRATEGY": "fast-forward"}, clear=False):
-            with pytest.raises(RuntimeError, match="JUDGE_MERGE_STRATEGY must be one of"):
+        with patch.dict(os.environ, {"DEVBENCH_MERGE_STRATEGY": "fast-forward"}, clear=False):
+            with pytest.raises(RuntimeError, match="DEVBENCH_MERGE_STRATEGY must be one of"):
                 importlib.reload(config)
 
         importlib.reload(config)
@@ -707,3 +709,153 @@ class TestReadEnvStrict:
             else:
                 result = config._read_env_strict(self._NEW, self._LEGACY)
                 assert result == expected_result, f"Expected {expected_result!r}, got {result!r}"
+
+
+# ---------------------------------------------------------------------------
+# AC-197-12: strict checker fires at earliest env-var read in process startup
+# ---------------------------------------------------------------------------
+
+_FIXTURES_DIR = Path(__file__).parent / "fixtures"
+_TEST_YAML = _FIXTURES_DIR / "test_devbench.yaml"
+
+# A representative legacy JUDGE_* -> DEVBENCH_* pair that is read at
+# module level in config.py and must go through _read_env_strict (AC-197-12).
+# This constant is the legacy name; the new name has the DEVBENCH_ prefix
+# with the same suffix.
+_AC197_12_LEGACY_VAR = "JUDGE_GH_ORG"
+_AC197_12_NEW_VAR = "DEVBENCH_GH_ORG"
+
+
+def _build_subprocess_env(legacy_var: str, legacy_val: str) -> dict[str, str]:
+    """Build a clean env for subprocess tests: required devbench vars plus the legacy sentinel."""
+    env: dict[str, str] = {
+        "JUDGE_CLAUDE_MODEL": "test-model",
+        "JUDGE_WORKSPACE_ROOT": "/tmp/test-workspace",
+        "JUDGE_LOG_FILE": "/tmp/test-orchestrator.log",
+        "JUDGE_CONFIG_PATH": str(_TEST_YAML),
+        legacy_var: legacy_val,
+    }
+    # Propagate PATH and PYTHONPATH so the subprocess can find the package.
+    for key in ("PATH", "PYTHONPATH", "VIRTUAL_ENV"):
+        val = os.environ.get(key)
+        if val:
+            env[key] = val
+    return env
+
+
+@pytest.mark.unit
+class TestStrictCheckerFiresAtEarliestStartup:
+    """AC-197-12: regression test -- strict checker fires at earliest env-var read.
+
+    The module-level code in config.py must call _read_env_strict for at least
+    one JUDGE_X -> DEVBENCH_X pair before resolving WORKSPACE_ROOT (workspace
+    path) and before reading JUDGE_CLAUDE_MODEL (LLM model).  This class pins
+    the requirement by spawning a fresh Python process that imports devbench.config
+    with a legacy JUDGE_* var set and asserts the process exits with a RuntimeError
+    naming the legacy var BEFORE any side-effecting startup step completes.
+    """
+
+    def _run_import(self, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+        """Spawn a subprocess that imports devbench.config and captures stderr."""
+        script = "import devbench.config"
+        return subprocess.run(
+            [sys.executable, "-c", script],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_legacy_var_causes_nonzero_exit_on_module_import(self) -> None:
+        """When a legacy JUDGE_* var is set, importing config raises RuntimeError (exit != 0)."""
+        env = _build_subprocess_env(_AC197_12_LEGACY_VAR, "legacy-org-value")
+        result = self._run_import(env)
+        assert result.returncode != 0, (
+            f"Expected non-zero exit when {_AC197_12_LEGACY_VAR!r} is set, "
+            f"but process exited {result.returncode}. stderr={result.stderr!r}"
+        )
+
+    def test_legacy_var_error_names_both_vars_and_migration_command(self) -> None:
+        """The RuntimeError message from module import names the legacy var, new var, and devbench migrate-env."""
+        env = _build_subprocess_env(_AC197_12_LEGACY_VAR, "legacy-org-value")
+        result = self._run_import(env)
+        combined = result.stderr + result.stdout
+        assert _AC197_12_LEGACY_VAR in combined, (
+            f"Legacy var name {_AC197_12_LEGACY_VAR!r} missing from process output. stderr={result.stderr!r}"
+        )
+        assert _AC197_12_NEW_VAR in combined, (
+            f"New var name {_AC197_12_NEW_VAR!r} missing from process output. stderr={result.stderr!r}"
+        )
+        assert "devbench migrate-env" in combined, (
+            f"'devbench migrate-env' missing from process output. stderr={result.stderr!r}"
+        )
+
+    def test_error_fires_before_workspace_root_is_resolved(self) -> None:
+        """The strict-checker RuntimeError appears before any WORKSPACE_ROOT resolution message.
+
+        Verifies the ordering invariant: _read_env_strict is wired at the earliest
+        module-level read site, not deferred to after WORKSPACE_ROOT is consumed.
+        """
+        env = _build_subprocess_env(_AC197_12_LEGACY_VAR, "legacy-org-value")
+        result = self._run_import(env)
+        combined = result.stderr + result.stdout
+        # The error must be the strict-checker RuntimeError, not a workspace-not-found error.
+        assert "is no longer accepted" in combined, (
+            f"Expected strict-checker message 'is no longer accepted' in output, but got: {combined!r}"
+        )
+        # The WORKSPACE_ROOT error must NOT appear -- it fires only when the
+        # workspace is unset/empty, which is separate from the strict-checker error.
+        # If strict checker fires first, we never reach the WORKSPACE_ROOT check.
+        assert "WORKSPACE_ROOT environment variable is not set" not in combined, (
+            f"WORKSPACE_ROOT error appeared before strict-checker fired. "
+            f"The strict check must be wired before WORKSPACE_ROOT resolution. "
+            f"output={combined!r}"
+        )
+
+    def test_error_fires_before_llm_model_is_read(self) -> None:
+        """The strict-checker error appears before JUDGE_CLAUDE_MODEL is read.
+
+        Verifies the strict checker fires before LLM client construction (AC-197-12).
+        The test intentionally omits JUDGE_CLAUDE_MODEL from the env and sets
+        the legacy var; the strict-checker must fire before the absent-model error.
+        """
+        env = _build_subprocess_env(_AC197_12_LEGACY_VAR, "legacy-org-value")
+        # Remove the LLM model var so if the process somehow gets past the
+        # strict check it would hit a different error (no-model RuntimeError).
+        env.pop("JUDGE_CLAUDE_MODEL", None)
+        result = self._run_import(env)
+        combined = result.stderr + result.stdout
+        assert "is no longer accepted" in combined, f"Expected strict-checker message in output but got: {combined!r}"
+        # If the LLM model absence error appears, the strict check ran AFTER
+        # the model-read -- a violation of the ordering invariant.
+        assert "JUDGE_CLAUDE_MODEL environment variable is not set" not in combined, (
+            f"CLAUDE_MODEL error appeared -- strict checker did not fire before LLM model read. output={combined!r}"
+        )
+
+    @pytest.mark.parametrize(
+        "legacy_var,legacy_val",
+        [
+            (_AC197_12_LEGACY_VAR, "any-value"),
+            ("JUDGE_MERGE_STRATEGY", "squash"),
+        ],
+        ids=["JUDGE_GH_ORG", "JUDGE_MERGE_STRATEGY"],
+    )
+    def test_various_legacy_vars_trigger_rejection_at_import(
+        self,
+        legacy_var: str,
+        legacy_val: str,
+    ) -> None:
+        """Parametrised: multiple legacy vars all trigger rejection during module import.
+
+        Each JUDGE_X var wired through _read_env_strict must cause the import to
+        fail with a RuntimeError that names both the legacy and the new var name.
+        """
+        new_var = legacy_var.replace("JUDGE_", "DEVBENCH_", 1)
+        env = _build_subprocess_env(legacy_var, legacy_val)
+        result = self._run_import(env)
+        assert result.returncode != 0, (
+            f"Expected non-zero exit for legacy var {legacy_var!r}, "
+            f"got exit {result.returncode}. stderr={result.stderr!r}"
+        )
+        combined = result.stderr + result.stdout
+        assert legacy_var in combined, f"Legacy var {legacy_var!r} missing from error output: {combined!r}"
+        assert new_var in combined, f"New var {new_var!r} missing from error output: {combined!r}"

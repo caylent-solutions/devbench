@@ -239,7 +239,9 @@ def _read_env_strict(new_name: str, legacy_name: str) -> str | None:
 # ---------------------------------------------------------------------------
 # When set, restricts all GitHub operations to this org only.
 # Unset or empty to allow any org in the allow-list.
-ALLOWED_GH_ORG: str = os.environ.get("JUDGE_GH_ORG", "")
+# _read_env_strict is called here first -- before WORKSPACE_ROOT, before
+# CLAUDE_MODEL, before any git operation -- satisfying AC-197-12.
+ALLOWED_GH_ORG: str = _read_env_strict("DEVBENCH_GH_ORG", "JUDGE_GH_ORG") or ""
 
 # Absolute path to the workspace root directory containing all repo clones.
 _workspace_root = os.environ.get("JUDGE_WORKSPACE_ROOT", "")
@@ -408,12 +410,12 @@ class MergeStrategy(StrEnum):
 
 
 # Merge strategy for PRs. Defaults to squash.
-_merge_strategy = os.environ.get("JUDGE_MERGE_STRATEGY", "squash")
+_merge_strategy = _read_env_strict("DEVBENCH_MERGE_STRATEGY", "JUDGE_MERGE_STRATEGY") or "squash"
 try:
     MERGE_STRATEGY: MergeStrategy = MergeStrategy(_merge_strategy)
 except ValueError:
     raise RuntimeError(
-        f"JUDGE_MERGE_STRATEGY must be one of: {', '.join(s.value for s in MergeStrategy)}. Got: {_merge_strategy}"
+        f"DEVBENCH_MERGE_STRATEGY must be one of: {', '.join(s.value for s in MergeStrategy)}. Got: {_merge_strategy}"
     ) from None
 
 UPDATE_SUBMODULE: bool = RUNTIME_CONFIG.git_ops.update_submodule
@@ -649,14 +651,15 @@ CLAUDE_CREDENTIALS_FILE: Path = Path(
 def validate_repo(repo: str) -> None:
     """Raise ``ValueError`` if *repo* is not in the allow-list or wrong org.
 
-    When ``JUDGE_GH_ORG`` is set, also validates that the repo belongs
+    When ``DEVBENCH_GH_ORG`` is set, also validates that the repo belongs
     to the specified organization.
     """
     if ALLOWED_GH_ORG and "/" in repo:
         org = repo.split("/", maxsplit=1)[0]
         if org != ALLOWED_GH_ORG:
             raise ValueError(
-                f"Repository '{repo}' belongs to org '{org}', but JUDGE_GH_ORG restricts access to '{ALLOWED_GH_ORG}'."
+                f"Repository '{repo}' belongs to org '{org}', "
+                f"but DEVBENCH_GH_ORG restricts access to '{ALLOWED_GH_ORG}'."
             )
     if repo not in ALLOWED_REPOS:
         raise ValueError(f"Repository '{repo}' is not allowed. Allowed repositories: {sorted(ALLOWED_REPOS)}")

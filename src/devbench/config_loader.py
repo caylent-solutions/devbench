@@ -48,8 +48,10 @@ YAML schema::
       llm_file_context: <integer>
       llm_file_preview_chars: <integer>
 
-    backlog:                             # optional -- backlog lifecycle settings (issue #189)
+    backlog:                             # optional -- backlog lifecycle settings (issue #189, #194)
       default_status_for_new_work_units: in-queue  # 'draft' or 'in-queue' (default 'in-queue')
+      bulk_update_confirm_threshold: 10  # optional -- prompt threshold for bulk set-status (default 10, AC-194-4)
+      bulk_update_audit_path: logs/bulk-updates.log  # optional -- audit log path for bulk updates (AC-194-7)
 
     git_ops:                             # optional -- git workflow settings
       update_submodule: false            # set true only when repos are git submodules of a parent repo
@@ -105,6 +107,8 @@ from devbench.constants import (
 
 _BACKLOG_DEFAULT_STATUS: str = STATUS_IN_QUEUE
 _VALID_DEFAULT_STATUSES: frozenset[str] = frozenset({STATUS_IN_QUEUE, STATUS_DRAFT})
+_BACKLOG_DEFAULT_BULK_UPDATE_CONFIRM_THRESHOLD: int = 10
+_BACKLOG_DEFAULT_BULK_UPDATE_AUDIT_PATH: str = "logs/bulk-updates.log"
 
 # ---------------------------------------------------------------------------
 # Audit-row string constants for auto_finalize / auto_merge skill steps.
@@ -512,7 +516,8 @@ class BacklogConfig:
     """Backlog lifecycle settings loaded from the ``backlog:`` YAML section.
 
     Controls behaviour that applies across all work units in the backlog,
-    such as what lifecycle status new work units receive on creation.
+    such as what lifecycle status new work units receive on creation and
+    confirmation thresholds for bulk operations.
 
     Attributes:
         default_status_for_new_work_units: Lifecycle status written into the
@@ -524,9 +529,20 @@ class BacklogConfig:
             key see no behaviour change (AC-189-9). Set to ``STATUS_DRAFT``
             (``'draft'``) to require explicit human promotion before the
             orchestrator picks up a new task (AC-189-8).
+        bulk_update_confirm_threshold: Number of work units above which
+            ``devbench set-status`` with selector flags prompts for
+            confirmation before applying a bulk status change. Must be >= 0.
+            Zero means always prompt. Defaults to 10 (AC-194-4).
+        bulk_update_audit_path: Workspace-relative path to the file where
+            bulk-update audit rows are appended. Each invocation of
+            ``devbench set-status`` with selector flags writes one
+            ``[BULK_STATUS_UPDATE]`` row. Defaults to
+            ``'logs/bulk-updates.log'`` (AC-194-7).
     """
 
     default_status_for_new_work_units: str = _BACKLOG_DEFAULT_STATUS
+    bulk_update_confirm_threshold: int = _BACKLOG_DEFAULT_BULK_UPDATE_CONFIRM_THRESHOLD
+    bulk_update_audit_path: str = _BACKLOG_DEFAULT_BULK_UPDATE_AUDIT_PATH
 
 
 def _parse_backlog_config(path: Path, backlog_raw: dict) -> BacklogConfig:
@@ -543,6 +559,7 @@ def _parse_backlog_config(path: Path, backlog_raw: dict) -> BacklogConfig:
     Raises:
         ValueError: If ``default_status_for_new_work_units`` is set to a
             value that is not in ``_VALID_DEFAULT_STATUSES``.
+        ValueError: If ``bulk_update_confirm_threshold`` is negative.
     """
     raw_status = backlog_raw.get(
         "default_status_for_new_work_units",
@@ -556,7 +573,27 @@ def _parse_backlog_config(path: Path, backlog_raw: dict) -> BacklogConfig:
             f"Use {STATUS_DRAFT!r} to require explicit promotion before execution, "
             f"or {STATUS_IN_QUEUE!r} (the default) for the legacy behaviour."
         )
-    return BacklogConfig(default_status_for_new_work_units=raw_status)
+    raw_threshold = backlog_raw.get(
+        "bulk_update_confirm_threshold",
+        _BACKLOG_DEFAULT_BULK_UPDATE_CONFIRM_THRESHOLD,
+    )
+    threshold = int(raw_threshold)
+    if threshold < 0:
+        raise ValueError(
+            f"Config file '{path}': backlog.bulk_update_confirm_threshold "
+            f"must be >= 0; got {threshold!r}. "
+            "Set to 0 to always prompt, or a positive integer to prompt only "
+            "when the expansion exceeds that count."
+        )
+    raw_audit_path = backlog_raw.get(
+        "bulk_update_audit_path",
+        _BACKLOG_DEFAULT_BULK_UPDATE_AUDIT_PATH,
+    )
+    return BacklogConfig(
+        default_status_for_new_work_units=raw_status,
+        bulk_update_confirm_threshold=threshold,
+        bulk_update_audit_path=str(raw_audit_path),
+    )
 
 
 # ---------------------------------------------------------------------------

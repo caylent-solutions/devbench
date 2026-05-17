@@ -2503,6 +2503,177 @@ class TestBacklogConfig:
         ):
             _parse_backlog_config(fake_path, {"default_status_for_new_work_units": "proposed"})
 
+    # -- AC-194-4 / AC-194-7: bulk_update_confirm_threshold and bulk_update_audit_path fields --
+
+    def test_backlog_config_default_bulk_update_confirm_threshold(self) -> None:
+        """
+        Given: BacklogConfig constructed with no arguments
+        When: bulk_update_confirm_threshold is accessed
+        Then: it equals 10 (the spec default from section 4.7.3, AC-194-4)
+        """
+        cfg = BacklogConfig()
+        assert cfg.bulk_update_confirm_threshold == 10
+
+    def test_backlog_config_default_bulk_update_audit_path(self) -> None:
+        """
+        Given: BacklogConfig constructed with no arguments
+        When: bulk_update_audit_path is accessed
+        Then: it equals 'logs/bulk-updates.log' (the spec default from section 4.7.3, AC-194-7)
+        """
+        cfg = BacklogConfig()
+        assert cfg.bulk_update_audit_path == "logs/bulk-updates.log"
+
+    def test_backlog_config_accepts_custom_threshold(self) -> None:
+        """
+        Given: BacklogConfig constructed with bulk_update_confirm_threshold=5
+        When: the field is accessed
+        Then: it returns 5
+        """
+        cfg = BacklogConfig(bulk_update_confirm_threshold=5)
+        assert cfg.bulk_update_confirm_threshold == 5
+
+    def test_backlog_config_accepts_zero_threshold(self) -> None:
+        """
+        Given: BacklogConfig constructed with bulk_update_confirm_threshold=0
+        When: the field is accessed
+        Then: it returns 0 (zero is the boundary -- always prompt)
+        """
+        cfg = BacklogConfig(bulk_update_confirm_threshold=0)
+        assert cfg.bulk_update_confirm_threshold == 0
+
+    def test_backlog_config_accepts_custom_audit_path(self) -> None:
+        """
+        Given: BacklogConfig constructed with bulk_update_audit_path='logs/custom.log'
+        When: the field is accessed
+        Then: it returns the custom path
+        """
+        cfg = BacklogConfig(bulk_update_audit_path="logs/custom.log")
+        assert cfg.bulk_update_audit_path == "logs/custom.log"
+
+    def test_parse_backlog_config_threshold_from_yaml(self, tmp_path: Path) -> None:
+        """
+        Given: a YAML config with backlog.bulk_update_confirm_threshold: 25
+        When: load_runtime_config is called
+        Then: RuntimeConfig.backlog.bulk_update_confirm_threshold == 25 (AC-194-4)
+        """
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            backlog:
+              bulk_update_confirm_threshold: 25
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.backlog.bulk_update_confirm_threshold == 25
+
+    def test_parse_backlog_config_audit_path_from_yaml(self, tmp_path: Path) -> None:
+        """
+        Given: a YAML config with backlog.bulk_update_audit_path: 'logs/ops.log'
+        When: load_runtime_config is called
+        Then: RuntimeConfig.backlog.bulk_update_audit_path == 'logs/ops.log' (AC-194-7)
+        """
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            backlog:
+              bulk_update_audit_path: logs/ops.log
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.backlog.bulk_update_audit_path == "logs/ops.log"
+
+    def test_parse_backlog_config_absent_fields_use_defaults(self, tmp_path: Path) -> None:
+        """
+        Given: a YAML config with a backlog: section but no bulk_update_* keys
+        When: load_runtime_config is called
+        Then: defaults (threshold=10, audit_path='logs/bulk-updates.log') are applied
+        """
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            backlog:
+              default_status_for_new_work_units: in-queue
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.backlog.bulk_update_confirm_threshold == 10
+        assert rt.backlog.bulk_update_audit_path == "logs/bulk-updates.log"
+
+    def test_parse_backlog_config_both_new_fields_from_yaml(self, tmp_path: Path) -> None:
+        """
+        Given: a YAML config with both new backlog fields set
+        When: load_runtime_config is called
+        Then: both fields are parsed correctly
+        """
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            backlog:
+              default_status_for_new_work_units: draft
+              bulk_update_confirm_threshold: 50
+              bulk_update_audit_path: audit/bulk-ops.log
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.backlog.default_status_for_new_work_units == "draft"
+        assert rt.backlog.bulk_update_confirm_threshold == 50
+        assert rt.backlog.bulk_update_audit_path == "audit/bulk-ops.log"
+
+    def test_parse_backlog_config_negative_threshold_raises(self, tmp_path: Path) -> None:
+        """
+        Given: _parse_backlog_config is called with bulk_update_confirm_threshold: -1
+        When: _parse_backlog_config is invoked
+        Then: ValueError is raised with a clear message naming the invalid value (AC-194-4)
+        """
+        from devbench.config_loader import _parse_backlog_config
+
+        fake_path = tmp_path / "cfg.yaml"
+        with pytest.raises(
+            ValueError,
+            match=r"bulk_update_confirm_threshold.*must be >= 0",
+        ):
+            _parse_backlog_config(fake_path, {"bulk_update_confirm_threshold": -1})
+
+    @pytest.mark.parametrize("threshold", [-1, -10, -100])
+    def test_parse_backlog_config_negative_threshold_parametrized(self, tmp_path: Path, threshold: int) -> None:
+        """
+        Given: _parse_backlog_config is called with a negative threshold value
+        When: _parse_backlog_config is invoked
+        Then: ValueError is raised for every negative value (AC-194-4)
+        """
+        from devbench.config_loader import _parse_backlog_config
+
+        fake_path = tmp_path / "cfg.yaml"
+        with pytest.raises(ValueError, match=r"bulk_update_confirm_threshold"):
+            _parse_backlog_config(fake_path, {"bulk_update_confirm_threshold": threshold})
+
+    def test_parse_backlog_config_direct_threshold_and_path(self, tmp_path: Path) -> None:
+        """
+        Given: _parse_backlog_config is called directly with both new fields
+        When: _parse_backlog_config is invoked
+        Then: a BacklogConfig with the supplied values is returned
+        """
+        from devbench.config_loader import _parse_backlog_config
+
+        fake_path = tmp_path / "cfg.yaml"
+        result = _parse_backlog_config(
+            fake_path,
+            {
+                "bulk_update_confirm_threshold": 20,
+                "bulk_update_audit_path": "custom/path.log",
+            },
+        )
+        assert result.bulk_update_confirm_threshold == 20
+        assert result.bulk_update_audit_path == "custom/path.log"
+
 
 @pytest.mark.unit
 class TestAgentModelsConfig:

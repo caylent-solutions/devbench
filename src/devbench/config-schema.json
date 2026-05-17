@@ -409,13 +409,22 @@
     },
     "backlog": {
       "type": "object",
-      "description": "Backlog lifecycle settings. Controls how new work units are created and what default status they receive (issue #189).",
+      "description": "Backlog lifecycle settings. Controls how new work units are created, what default status they receive (issue #189), and bulk-operation thresholds (issue #194).",
       "additionalProperties": false,
       "properties": {
         "default_status_for_new_work_units": {
           "type": "string",
           "enum": ["draft", "in-queue"],
           "description": "Lifecycle status written into the '## Status:' line of every newly created work-unit file. Use 'draft' to require explicit human promotion before the orchestrator picks up the task. Use 'in-queue' (the default) for the legacy behaviour where new tasks are picked up immediately. AC-189-8 and AC-189-9."
+        },
+        "bulk_update_confirm_threshold": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of work units above which devbench set-status with selector flags prompts for confirmation before applying a bulk status change. Zero means always prompt. Default: 10. AC-194-4."
+        },
+        "bulk_update_audit_path": {
+          "type": "string",
+          "description": "Workspace-relative path to the file where bulk-update audit rows are appended. Default: 'logs/bulk-updates.log'. AC-194-7."
         }
       }
     },

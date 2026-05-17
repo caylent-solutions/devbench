@@ -322,11 +322,73 @@ Set the work unit's status to `in-progress`. Fails if the unit is already in a t
 
 ```
 uv run devbench set-status <id> <status>
+uv run devbench set-status --include "<tokens>" [--exclude "<tokens>"] [--dry-run] [--yes] <new_status>
 ```
 
 Force any status on a work unit. Skips the done-gate and other workflow checks. Used for recovery (unblock a stuck unit, resurrect a declined unit) and for orchestrator-internal lifecycle transitions. Accepted values: `draft`, `in-queue`, `in-progress`, `in-review`, `done`, `blocked`, `proposed`, `declined`, `hold`.
 
 Note: to transition `draft -> in-queue` on one or more units, prefer `devbench promote` (which validates the source status and writes the `[PROMOTED] draft -> in-queue` audit comment). Use `set-status draft` only for ad-hoc recovery or for setting a new work unit's initial state when the default-status config is not sufficient.
+
+**Range variant (bulk updates):**
+
+The range variant accepts printer-pages-style selector tokens (the same syntax used by `devbench start --include` and `devbench scope set`) and applies the requested status to every matched work unit in a single atomic transaction:
+
+- `--include "<tokens>"` -- printer-pages selector for the target work units. Accepts comma-separated tokens: single IDs (`E1-F2-S3-T4`), last-segment ranges (`E2-F1-S1-T3-T7`), epic/feature/story shorthands (`E1`, `E2-F1`, `E2-F1-S1`). See [Scope selectors](#scope-selectors-printer-pages-syntax) for the full token syntax.
+- `--exclude "<tokens>"` -- subtract the matched IDs from the include set. Applied after include expansion.
+- `--dry-run` -- enumerate the matched work units and the target status without writing any changes. Prints one line per matched unit and a summary count. Exits rc=0.
+- `--yes` -- skip the interactive confirmation prompt. By default, `set-status` prompts for confirmation when the expanded set exceeds `bulk_update_confirm_threshold` (default: 10, configurable in `backlog/config/devbench.yaml`). Pass `--yes` to bypass the prompt in automation / CI.
+
+All writes acquire the `BACKLOG.lock` flock once before iterating matched units, so the operation is atomic -- concurrent orchestrators see either all updates or none. Each per-unit write goes through `BacklogManager._set_status` so audit logic and rollup logic continue to fire. A workspace-level `[BULK_STATUS_UPDATE] <count> WUs set to '<status>' by --include="..." --exclude="..."` audit row is appended to the path declared in `bulk_update_audit_path` (default: `logs/bulk-updates.log`) after every successful bulk invocation.
+
+**BacklogConfig keys consumed by the range variant:**
+
+```yaml
+backlog:
+  bulk_update_confirm_threshold: 10           # prompt when expansion > N (default 10)
+  bulk_update_audit_path: logs/bulk-updates.log   # workspace-relative audit log path
+```
+
+**Worked examples:**
+
+```bash
+# Promote all units in epic E1 to in-queue (release for autonomous work):
+uv run devbench set-status --include "E1" in-queue
+# -> prompts for confirmation if expansion > bulk_update_confirm_threshold
+# -> [BULK_STATUS_UPDATE] 42 WUs set to 'in-queue' by --include="E1" --exclude=""
+
+# Hold all units in epic E5 (pause while scope is reconsidered):
+uv run devbench set-status --include "E5" hold
+# -> [BULK_STATUS_UPDATE] 37 WUs set to 'hold' by --include="E5" --exclude=""
+
+# Decline a range of tasks E2-F1-S1 T3 through T7:
+uv run devbench set-status --include "E2-F1-S1-T3-T7" declined
+# -> [BULK_STATUS_UPDATE] 5 WUs set to 'declined' by --include="E2-F1-S1-T3-T7" --exclude=""
+
+# Preview which units would be affected without writing (--dry-run):
+uv run devbench set-status --include "E3" --dry-run in-queue
+# -> DRY RUN: 18 WUs would be set to 'in-queue':
+#      E3-F1-S1-T1  (draft)
+#      E3-F1-S1-T2  (draft)
+#      ...
+#    No changes written.
+
+# Skip the confirmation prompt for large expansions (CI / automation):
+uv run devbench set-status --include "E1-E4" --yes in-queue
+# -> [BULK_STATUS_UPDATE] 163 WUs set to 'in-queue' by --include="E1-E4" --exclude="" (no prompt)
+
+# Promote epic E2 but exclude a sub-tree already done:
+uv run devbench set-status --include "E2" --exclude "E2-F3" in-queue
+# -> [BULK_STATUS_UPDATE] 29 WUs set to 'in-queue' by --include="E2" --exclude="E2-F3"
+```
+
+**Exit codes:**
+
+| Command | rc=0 | rc!=0 |
+|---------|------|-------|
+| `set-status <id> <status>` | Status written. | rc=1 when ID not found or status value unrecognised. |
+| `set-status --include ... <status>` | All matched units written. | rc=1 when no units match, status value unrecognised, or reversed range token detected. |
+| `set-status --include ... --dry-run <status>` | Preview printed; no write. | rc=1 on invalid selector syntax. |
+| `set-status --include ... --yes <status>` | All matched units written (no prompt). | rc=1 on selector / status errors. |
 
 ### `mark-done`
 

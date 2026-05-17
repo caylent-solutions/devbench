@@ -1725,6 +1725,217 @@ class TestCmdSetStatus:
         assert result == 0
         assert mock_mgr.bulk_set_status.call_count > 0
 
+    # ------------------------------------------------------------------
+    # AC-194-8: parser error messages reused verbatim from #190
+    # ------------------------------------------------------------------
+
+    @pytest.mark.unit
+    def test_invalid_scope_token_error_message_matches_190_verbatim(
+        self, mock_units: list[WorkUnit], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-194-8: reversed-range error uses exact format 'ERROR: invalid scope token: ...' (verbatim from #190)."""
+        from devbench.scope import InvalidScopeError
+
+        exc_text = "Reverse range in token 'E3-E1': 'E1' (=1) > 'E3' (=3). Ranges must be specified in ascending order."
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.ScopeFilter") as mock_sf_class,
+        ):
+            mock_sf_class.parse.side_effect = InvalidScopeError(exc_text)
+            result = cli.cmd_set_status("--include", "E3-E1", "in-queue")
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert err.startswith("ERROR: invalid scope token: "), (
+            f"Expected prefix 'ERROR: invalid scope token: ', got: {err!r}"
+        )
+        assert exc_text in err
+
+    @pytest.mark.unit
+    def test_malformed_scope_token_error_message_matches_190_verbatim(
+        self, mock_units: list[WorkUnit], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-194-8: malformed-token error uses exact format 'ERROR: invalid scope token: ...' (verbatim from #190)."""
+        from devbench.scope import InvalidScopeError
+
+        exc_text = "Malformed scope token '-E1': each hyphen-delimited segment must be non-empty."
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.ScopeFilter") as mock_sf_class,
+        ):
+            mock_sf_class.parse.side_effect = InvalidScopeError(exc_text)
+            result = cli.cmd_set_status("--include", "-E1", "in-queue")
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert err.startswith("ERROR: invalid scope token: "), (
+            f"Expected prefix 'ERROR: invalid scope token: ', got: {err!r}"
+        )
+        assert exc_text in err
+
+    # ------------------------------------------------------------------
+    # AC-194-9: status-enum guard -- draft is Task-only
+    # ------------------------------------------------------------------
+
+    @pytest.mark.unit
+    def test_single_draft_status_rejected_for_epic(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """AC-194-9: set-status <epic-id> draft rejects because draft is Task-only."""
+        epic_unit = WorkUnit(
+            id="E1",
+            title="Epic One",
+            status=WorkUnitStatus.IN_QUEUE,
+            unit_type=WorkUnitType.EPIC,
+            file_path=Path("backlog/E1.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [epic_unit]
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_set_status("E1", "draft")
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "draft" in err.lower()
+        assert "task" in err.lower()
+        assert "E1" in err
+
+    @pytest.mark.unit
+    def test_single_draft_status_rejected_for_feature(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """AC-194-9: set-status <feature-id> draft rejects because draft is Task-only."""
+        feature_unit = WorkUnit(
+            id="E1-F1",
+            title="Feature One",
+            status=WorkUnitStatus.IN_QUEUE,
+            unit_type=WorkUnitType.FEATURE,
+            file_path=Path("backlog/E1-F1.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [feature_unit]
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_set_status("E1-F1", "draft")
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "draft" in err.lower()
+        assert "task" in err.lower()
+
+    @pytest.mark.unit
+    def test_single_draft_status_rejected_for_story(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """AC-194-9: set-status <story-id> draft rejects because draft is Task-only."""
+        story_unit = WorkUnit(
+            id="E1-F1-S1",
+            title="Story One",
+            status=WorkUnitStatus.IN_QUEUE,
+            unit_type=WorkUnitType.STORY,
+            file_path=Path("backlog/E1-F1-S1.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [story_unit]
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_set_status("E1-F1-S1", "draft")
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "draft" in err.lower()
+        assert "task" in err.lower()
+
+    @pytest.mark.unit
+    def test_single_draft_status_allowed_for_task(self, backlog_dir: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """AC-194-9: set-status <task-id> draft is permitted (Task units accept draft)."""
+        task_unit = WorkUnit(
+            id="E1-F1-S1-T1",
+            title="Task One",
+            status=WorkUnitStatus.IN_QUEUE,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("backlog/E1-F1-S1-T1.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+        wu_file = backlog_dir / "E1-F1-S1-T1.md"
+        wu_file.write_text("# E1-F1-S1-T1\n## Status: in-queue\n")
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [task_unit]
+        mock_mgr = MagicMock()
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+        ):
+            result = cli.cmd_set_status("E1-F1-S1-T1", "draft")
+
+        assert result == 0
+        mock_mgr.force_status.assert_called_once()
+
+    @pytest.mark.unit
+    def test_bulk_draft_status_rejected_when_non_task_unit_matched(
+        self, mock_units: list[WorkUnit], backlog_dir: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-194-9: bulk set-status --include to draft rejects if any matched unit is non-Task."""
+        epic_unit = WorkUnit(
+            id="E0",
+            title="Epic Zero",
+            status=WorkUnitStatus.IN_QUEUE,
+            unit_type=WorkUnitType.EPIC,
+            file_path=Path("backlog/E0.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+        units_with_epic = [epic_unit, *mock_units]
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = units_with_epic
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_set_status("--include", "E0", "draft")
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "draft" in err.lower()
+        assert "task" in err.lower()
+
+    @pytest.mark.unit
+    def test_bulk_draft_status_allowed_when_all_matched_units_are_tasks(
+        self, mock_units: list[WorkUnit], backlog_dir: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-194-9: bulk set-status --include to draft succeeds when all matched units are Tasks."""
+        for unit in mock_units:
+            (backlog_dir / unit.file_path.name).write_text(f"# {unit.id}\n## Status: {unit.status.value}\n")
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+        mock_mgr = MagicMock()
+
+        mock_backlog_cfg = MagicMock()
+        mock_backlog_cfg.bulk_update_confirm_threshold = 100
+        mock_runtime_cfg = MagicMock()
+        mock_runtime_cfg.backlog = mock_backlog_cfg
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+        ):
+            result = cli.cmd_set_status("--include", "E0", "draft")
+
+        assert result == 0
+        assert mock_mgr.bulk_set_status.call_count > 0
+
 
 class TestCmdSetStatusBulkIntegration:
     """Integration tests: cmd_set_status bulk --include/--exclude against a real fixture workspace."""
@@ -2092,6 +2303,124 @@ class TestCmdSetStatusBulkIntegration:
         # audit_log_path is the 4th positional argument (unit_ids, new_status, backlog_index, audit_log_path)
         audit_path_arg = call_args[0][3]
         assert Path(audit_path_arg) == expected_audit_path
+
+    def _build_fixture_workspace_with_types(
+        self, tmp_path: Path, units: list[tuple[str, str, str]]
+    ) -> tuple[Path, Path]:
+        """Create a minimal BACKLOG.md + per-WU files with explicit unit types.
+
+        Args:
+            tmp_path: Temporary directory.
+            units: List of (unit_id, status, unit_type) triples.
+
+        Returns:
+            (backlog_root, backlog_index) paths.
+        """
+        backlog_root = tmp_path / "backlog"
+        backlog_root.mkdir(exist_ok=True)
+
+        header = (
+            "# BACKLOG\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|------|\n"
+        )
+        rows = ""
+        for uid, status, utype in units:
+            file_path = f"backlog/{uid}.md"
+            title_status = status.replace("-", " ").title()
+            rows += f"| {uid} | {utype} {uid} | {utype} | {title_status} | None | caylent/r | `{file_path}` |\n"
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text(header + rows)
+
+        for uid, status, utype in units:
+            wu_file = backlog_root / f"{uid}.md"
+            wu_file.write_text(f"# {uid}: {utype} {uid}\n\n## Status: {status}\n\n## Comments\n")
+
+        return backlog_root, backlog_index
+
+    @pytest.mark.unit
+    def test_bulk_draft_rejected_for_epic_integration(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """AC-194-9 integration: bulk set-status draft rejects when an Epic is in the matched set."""
+        units = [
+            ("E1", "in-queue", "Epic"),
+            ("E1-F1-S1-T1", "in-queue", "Task"),
+        ]
+        backlog_root, backlog_index = self._build_fixture_workspace_with_types(tmp_path, units)
+
+        mock_backlog_cfg = MagicMock()
+        mock_backlog_cfg.bulk_update_confirm_threshold = 100
+        mock_backlog_cfg.bulk_update_audit_path = "logs/bulk-updates.log"
+        mock_runtime_cfg = MagicMock()
+        mock_runtime_cfg.backlog = mock_backlog_cfg
+
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_root),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+        ):
+            result = cli.cmd_set_status("--include", "E1", "draft")
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "draft" in err.lower()
+        assert "task" in err.lower()
+
+    @pytest.mark.unit
+    def test_bulk_draft_allowed_for_all_task_units_integration(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-194-9 integration: bulk set-status draft succeeds when all matched units are Tasks."""
+        units = [
+            ("E1-F1-S1-T1", "in-queue", "Task"),
+            ("E1-F1-S1-T2", "in-queue", "Task"),
+        ]
+        backlog_root, backlog_index = self._build_fixture_workspace_with_types(tmp_path, units)
+
+        mock_backlog_cfg = MagicMock()
+        mock_backlog_cfg.bulk_update_confirm_threshold = 100
+        mock_backlog_cfg.bulk_update_audit_path = "logs/bulk-updates.log"
+        mock_runtime_cfg = MagicMock()
+        mock_runtime_cfg.backlog = mock_backlog_cfg
+
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_root),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+        ):
+            result = cli.cmd_set_status("--include", "E1", "draft")
+
+        assert result == 0
+
+    @pytest.mark.unit
+    def test_bulk_reverse_range_error_message_format_integration(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-194-8 integration: reversed-range error uses 'ERROR: invalid scope token: ' prefix."""
+        units = [("E3-F1-S1-T1", "in-queue", "Task")]
+        backlog_root, backlog_index = self._build_fixture_workspace_with_types(tmp_path, units)
+
+        mock_backlog_cfg = MagicMock()
+        mock_backlog_cfg.bulk_update_confirm_threshold = 100
+        mock_backlog_cfg.bulk_update_audit_path = "logs/bulk-updates.log"
+        mock_runtime_cfg = MagicMock()
+        mock_runtime_cfg.backlog = mock_backlog_cfg
+
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_root),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+        ):
+            result = cli.cmd_set_status("--include", "E3-E1", "in-queue")
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert err.startswith("ERROR: invalid scope token: "), (
+            f"Expected prefix 'ERROR: invalid scope token: ', got: {err!r}"
+        )
 
 
 class TestCmdMarkDone:

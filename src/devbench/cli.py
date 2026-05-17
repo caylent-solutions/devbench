@@ -1280,6 +1280,15 @@ def _cmd_set_status_single(unit_id: str, new_status: str) -> int:
         print(f"ERROR: Work unit '{unit_id}' not found", file=sys.stderr)
         return 1
 
+    if new_status.lower() == STATUS_DRAFT and target.unit_type is not WorkUnitType.TASK:
+        print(
+            f"ERROR: Status 'draft' is only valid for Task work units; "
+            f"'{unit_id}' is type {target.unit_type.value}. "
+            f"Epics, Features, and Stories cannot be set to 'draft'.",
+            file=sys.stderr,
+        )
+        return 1
+
     wu_file = _resolve_unit_file(target)
     if wu_file is None:
         print(f"ERROR: Work unit file not found for '{unit_id}'", file=sys.stderr)
@@ -1374,6 +1383,13 @@ def _resolve_bulk_matched_units(
 ) -> list | None:
     """Validate *new_status* and resolve the matched work-unit list for a bulk update.
 
+    Enforces that ``draft`` may only be applied to Task-level work units (AC-194-9,
+    AC-189-10): if any matched unit has type Epic, Feature, or Story and the target
+    status is ``draft``, the entire batch is rejected before any file is written.
+
+    The ``InvalidScopeError`` format mirrors ``cmd_start``/``cmd_next``'s
+    ``--include`` error path verbatim (AC-194-8): ``"ERROR: invalid scope token: ..."``.
+
     Args:
         include_str: Raw ``--include`` token string.
         exclude_str: Raw ``--exclude`` token string.
@@ -1388,7 +1404,6 @@ def _resolve_bulk_matched_units(
         Nothing -- all errors reported to stderr and return ``None``.
     """
     from devbench.backlog.manager import VALID_STATUSES
-    from devbench.scope import InvalidScopeError
 
     if new_status.lower() not in VALID_STATUSES:
         print(
@@ -1404,7 +1419,7 @@ def _resolve_bulk_matched_units(
     try:
         scope = ScopeFilter.parse(include_str, exclude_str, all_ids)
     except InvalidScopeError as exc:
-        print(f"ERROR: invalid scope selector -- {exc}", file=sys.stderr)
+        print(f"ERROR: invalid scope token: {exc}", file=sys.stderr)
         return None
 
     matched = [u for u in units if scope.allows(u.id)]
@@ -1414,6 +1429,18 @@ def _resolve_bulk_matched_units(
             file=sys.stderr,
         )
         return None
+
+    if new_status.lower() == STATUS_DRAFT:
+        non_task = [u for u in matched if u.unit_type is not WorkUnitType.TASK]
+        if non_task:
+            offenders = ", ".join(f"'{u.id}' ({u.unit_type.value})" for u in non_task)
+            print(
+                f"ERROR: Status 'draft' is only valid for Task work units; "
+                f"matched non-Task unit(s): {offenders}. "
+                f"Epics, Features, and Stories cannot be set to 'draft'.",
+                file=sys.stderr,
+            )
+            return None
 
     return matched
 

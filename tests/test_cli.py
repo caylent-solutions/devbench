@@ -18336,3 +18336,385 @@ class TestCmdStartInMessageQuotaDetection:
         assert isinstance(handle_calls[0], BedrockThrottleError), (
             "In-message Bedrock throttle must produce BedrockThrottleError"
         )
+
+
+# ---------------------------------------------------------------------------
+# E5-F4-S1-T3: [QUOTA_WAITING] / [QUOTA_RESUMED] audit comment format tests
+# AC-193-6 and AC-193-7: precise format of quota audit comments (spec 4.5.7)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestQuotaAuditCommentFormat:
+    """AC-193-6 and AC-193-7: precise format of [QUOTA_WAITING] and [QUOTA_RESUMED] audit comments.
+
+    These tests verify the exact field structure written by _handle_quota_pause
+    to the in-flight WU file -- spec section 4.5.7.
+    """
+
+    def _make_wu_file(self, tmp_path: Path) -> Path:
+        """Create a minimal work-unit file with a Comments section."""
+        wu = tmp_path / "E5-F4-S1-T3.md"
+        wu.write_text(
+            "# E5-F4-S1-T3: Test WU\n\n## Status: in-progress\n\n## Comments\n\n",
+            encoding="utf-8",
+        )
+        return wu
+
+    def test_quota_waiting_comment_includes_reset_at_iso_timestamp(self, tmp_path: Path) -> None:
+        """AC-193-6: [QUOTA_WAITING] comment includes reset_at=<ISO-ts> field.
+
+        The audit comment written on pause must contain 'reset_at=' followed by
+        the exception's reset_at timestamp in ISO-8601 format.
+        """
+        import asyncio
+        import re
+
+        from devbench.config_loader import QuotaHandlingConfig
+        from devbench.quota import SubscriptionRateLimitError
+
+        reset_time = datetime(2030, 6, 1, 12, 0, 0, tzinfo=UTC)
+        exc = SubscriptionRateLimitError(
+            reset_at=reset_time,
+            raw_error="429",
+            source="anthropic-api",
+        )
+        quota_cfg = QuotaHandlingConfig(
+            enabled=True,
+            on_exhaustion="wait",
+            audit_comment_on_wait=True,
+            audit_comment_on_resume=False,
+        )
+
+        wu_file = self._make_wu_file(tmp_path)
+
+        async def _fake_wait_for_reset(*_a: object, **_kw: object) -> bool:
+            return True
+
+        with patch("devbench.cli.wait_for_reset", side_effect=_fake_wait_for_reset):
+            asyncio.run(
+                cli._handle_quota_pause(
+                    exc=exc,
+                    quota_cfg=quota_cfg,
+                    workspace_root=tmp_path,
+                    session_name="default",
+                    in_flight_wu_file=wu_file,
+                )
+            )
+
+        content = wu_file.read_text(encoding="utf-8")
+        assert "[QUOTA_WAITING]" in content, f"[QUOTA_WAITING] prefix missing from: {content}"
+        assert "reset_at=" in content, f"reset_at= field missing from: {content}"
+        # reset_at value must be an ISO-8601 timestamp, not "unknown"
+        assert re.search(r"reset_at=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", content), (
+            f"reset_at must be an ISO-8601 datetime in: {content}"
+        )
+        # Verify the actual timestamp value matches the exception's reset_at
+        assert reset_time.isoformat() in content, (
+            f"reset_at must equal exception's reset_at ({reset_time.isoformat()}) in: {content}"
+        )
+
+    def test_quota_waiting_comment_reset_at_unknown_when_none(self, tmp_path: Path) -> None:
+        """AC-193-6: [QUOTA_WAITING] comment writes reset_at=unknown when exc.reset_at is None."""
+        import asyncio
+
+        from devbench.config_loader import QuotaHandlingConfig
+        from devbench.quota import SubscriptionRateLimitError
+
+        exc = SubscriptionRateLimitError(
+            reset_at=None,
+            raw_error="429",
+            source="anthropic-api",
+        )
+        quota_cfg = QuotaHandlingConfig(
+            enabled=True,
+            on_exhaustion="wait",
+            audit_comment_on_wait=True,
+            audit_comment_on_resume=False,
+        )
+
+        wu_file = self._make_wu_file(tmp_path)
+
+        async def _fake_wait_for_reset(*_a: object, **_kw: object) -> bool:
+            return True
+
+        with patch("devbench.cli.wait_for_reset", side_effect=_fake_wait_for_reset):
+            asyncio.run(
+                cli._handle_quota_pause(
+                    exc=exc,
+                    quota_cfg=quota_cfg,
+                    workspace_root=tmp_path,
+                    session_name="default",
+                    in_flight_wu_file=wu_file,
+                )
+            )
+
+        content = wu_file.read_text(encoding="utf-8")
+        assert "[QUOTA_WAITING]" in content, f"[QUOTA_WAITING] prefix missing from: {content}"
+        assert "reset_at=unknown" in content, f"reset_at=unknown expected when exc.reset_at is None; got: {content}"
+
+    def test_quota_waiting_comment_not_written_when_flag_disabled(self, tmp_path: Path) -> None:
+        """AC-193-6: [QUOTA_WAITING] audit comment is suppressed when audit_comment_on_wait=False."""
+        import asyncio
+
+        from devbench.config_loader import QuotaHandlingConfig
+        from devbench.quota import SubscriptionRateLimitError
+
+        exc = SubscriptionRateLimitError(
+            reset_at=datetime(2030, 6, 1, tzinfo=UTC),
+            raw_error="429",
+            source="anthropic-api",
+        )
+        quota_cfg = QuotaHandlingConfig(
+            enabled=True,
+            on_exhaustion="wait",
+            audit_comment_on_wait=False,
+            audit_comment_on_resume=False,
+        )
+
+        wu_file = self._make_wu_file(tmp_path)
+        original_content = wu_file.read_text(encoding="utf-8")
+
+        async def _fake_wait_for_reset(*_a: object, **_kw: object) -> bool:
+            return True
+
+        with patch("devbench.cli.wait_for_reset", side_effect=_fake_wait_for_reset):
+            asyncio.run(
+                cli._handle_quota_pause(
+                    exc=exc,
+                    quota_cfg=quota_cfg,
+                    workspace_root=tmp_path,
+                    session_name="default",
+                    in_flight_wu_file=wu_file,
+                )
+            )
+
+        content = wu_file.read_text(encoding="utf-8")
+        assert "[QUOTA_WAITING]" not in content, (
+            f"[QUOTA_WAITING] must not appear when audit_comment_on_wait=False; got: {content}"
+        )
+        assert content == original_content, "WU file must not be modified when audit_comment_on_wait=False"
+
+    def test_quota_waiting_comment_not_written_when_no_in_flight_wu(self, tmp_path: Path) -> None:
+        """AC-193-6: [QUOTA_WAITING] audit comment is suppressed when in_flight_wu_file=None."""
+        import asyncio
+
+        from devbench.config_loader import QuotaHandlingConfig
+        from devbench.quota import SubscriptionRateLimitError
+
+        exc = SubscriptionRateLimitError(
+            reset_at=datetime(2030, 6, 1, tzinfo=UTC),
+            raw_error="429",
+            source="anthropic-api",
+        )
+        quota_cfg = QuotaHandlingConfig(
+            enabled=True,
+            on_exhaustion="wait",
+            audit_comment_on_wait=True,
+            audit_comment_on_resume=True,
+        )
+
+        async def _fake_wait_for_reset(*_a: object, **_kw: object) -> bool:
+            return True
+
+        # No WU file -- should not raise, no file to modify
+        with patch("devbench.cli.wait_for_reset", side_effect=_fake_wait_for_reset):
+            result = asyncio.run(
+                cli._handle_quota_pause(
+                    exc=exc,
+                    quota_cfg=quota_cfg,
+                    workspace_root=tmp_path,
+                    session_name="default",
+                    in_flight_wu_file=None,
+                )
+            )
+
+        assert result is True, "_handle_quota_pause must return True when wait_for_reset returns True"
+        # Confirm no QUOTA_WAITING file was created
+        md_files = list(tmp_path.rglob("*.md"))
+        for md_file in md_files:
+            content = md_file.read_text(encoding="utf-8")
+            assert "[QUOTA_WAITING]" not in content, (
+                f"[QUOTA_WAITING] must not appear when in_flight_wu_file=None; found in {md_file}"
+            )
+
+    def test_quota_resumed_comment_includes_integer_waited_seconds(self, tmp_path: Path) -> None:
+        """AC-193-7: [QUOTA_RESUMED] comment includes waited_seconds=<N> as an integer value."""
+        import asyncio
+        import re
+
+        from devbench.config_loader import QuotaHandlingConfig
+        from devbench.quota import SubscriptionRateLimitError
+
+        exc = SubscriptionRateLimitError(
+            reset_at=datetime(2030, 6, 1, tzinfo=UTC),
+            raw_error="429",
+            source="anthropic-api",
+        )
+        quota_cfg = QuotaHandlingConfig(
+            enabled=True,
+            on_exhaustion="wait",
+            audit_comment_on_wait=False,
+            audit_comment_on_resume=True,
+        )
+
+        wu_file = self._make_wu_file(tmp_path)
+
+        async def _fake_wait_for_reset(*_a: object, **_kw: object) -> bool:
+            return True
+
+        with patch("devbench.cli.wait_for_reset", side_effect=_fake_wait_for_reset):
+            asyncio.run(
+                cli._handle_quota_pause(
+                    exc=exc,
+                    quota_cfg=quota_cfg,
+                    workspace_root=tmp_path,
+                    session_name="default",
+                    in_flight_wu_file=wu_file,
+                )
+            )
+
+        content = wu_file.read_text(encoding="utf-8")
+        assert "[QUOTA_RESUMED]" in content, f"[QUOTA_RESUMED] prefix missing from: {content}"
+        # waited_seconds must be an integer (non-negative)
+        match = re.search(r"waited_seconds=(\d+)", content)
+        assert match is not None, f"waited_seconds=<integer> missing from: {content}"
+        waited = int(match.group(1))
+        assert waited >= 0, f"waited_seconds must be non-negative; got: {waited}"
+
+    def test_quota_resumed_comment_not_written_when_recovery_fails(self, tmp_path: Path) -> None:
+        """AC-193-7: [QUOTA_RESUMED] is NOT written when wait_for_reset returns False."""
+        import asyncio
+
+        from devbench.config_loader import QuotaHandlingConfig
+        from devbench.quota import SubscriptionRateLimitError
+
+        exc = SubscriptionRateLimitError(
+            reset_at=datetime(2030, 6, 1, tzinfo=UTC),
+            raw_error="429",
+            source="anthropic-api",
+        )
+        quota_cfg = QuotaHandlingConfig(
+            enabled=True,
+            on_exhaustion="wait",
+            audit_comment_on_wait=False,
+            audit_comment_on_resume=True,
+        )
+
+        wu_file = self._make_wu_file(tmp_path)
+        original_content = wu_file.read_text(encoding="utf-8")
+
+        async def _fake_wait_for_reset(*_a: object, **_kw: object) -> bool:
+            return False  # timeout -- did not recover
+
+        with patch("devbench.cli.wait_for_reset", side_effect=_fake_wait_for_reset):
+            result = asyncio.run(
+                cli._handle_quota_pause(
+                    exc=exc,
+                    quota_cfg=quota_cfg,
+                    workspace_root=tmp_path,
+                    session_name="default",
+                    in_flight_wu_file=wu_file,
+                )
+            )
+
+        assert result is False, "_handle_quota_pause must return False when wait_for_reset returns False"
+        content = wu_file.read_text(encoding="utf-8")
+        assert "[QUOTA_RESUMED]" not in content, f"[QUOTA_RESUMED] must not appear when recovery failed; got: {content}"
+        assert content == original_content, (
+            "WU file must not be modified when recovery failed and audit_comment_on_wait=False"
+        )
+
+    def test_quota_resumed_comment_not_written_when_flag_disabled(self, tmp_path: Path) -> None:
+        """AC-193-7: [QUOTA_RESUMED] is NOT written when audit_comment_on_resume=False."""
+        import asyncio
+
+        from devbench.config_loader import QuotaHandlingConfig
+        from devbench.quota import SubscriptionRateLimitError
+
+        exc = SubscriptionRateLimitError(
+            reset_at=datetime(2030, 6, 1, tzinfo=UTC),
+            raw_error="429",
+            source="anthropic-api",
+        )
+        quota_cfg = QuotaHandlingConfig(
+            enabled=True,
+            on_exhaustion="wait",
+            audit_comment_on_wait=False,
+            audit_comment_on_resume=False,
+        )
+
+        wu_file = self._make_wu_file(tmp_path)
+        original_content = wu_file.read_text(encoding="utf-8")
+
+        async def _fake_wait_for_reset(*_a: object, **_kw: object) -> bool:
+            return True  # recovered successfully
+
+        with patch("devbench.cli.wait_for_reset", side_effect=_fake_wait_for_reset):
+            asyncio.run(
+                cli._handle_quota_pause(
+                    exc=exc,
+                    quota_cfg=quota_cfg,
+                    workspace_root=tmp_path,
+                    session_name="default",
+                    in_flight_wu_file=wu_file,
+                )
+            )
+
+        content = wu_file.read_text(encoding="utf-8")
+        assert "[QUOTA_RESUMED]" not in content, (
+            f"[QUOTA_RESUMED] must not appear when audit_comment_on_resume=False; got: {content}"
+        )
+        assert content == original_content, "WU file must not be modified when both audit flags are False"
+
+    @pytest.mark.parametrize(
+        "reason_class,expected_reason",
+        [
+            ("SubscriptionRateLimitError", "subscription_rate_limit"),
+            ("SdkCreditExhaustedError", "sdk_credit_exhausted"),
+            ("ApiBillingError", "api_billing_error"),
+            ("BedrockThrottleError", "bedrock_throttle"),
+        ],
+    )
+    def test_quota_waiting_comment_reason_field_matches_exception_type(
+        self, tmp_path: Path, reason_class: str, expected_reason: str
+    ) -> None:
+        """AC-193-6: [QUOTA_WAITING] reason= field matches the exception type's canonical name."""
+        import asyncio
+
+        import devbench.quota as quota_mod
+        from devbench.config_loader import QuotaHandlingConfig
+
+        exc_class = getattr(quota_mod, reason_class)
+        exc = exc_class(
+            reset_at=datetime(2030, 6, 1, tzinfo=UTC),
+            raw_error="test",
+            source="test",
+        )
+        quota_cfg = QuotaHandlingConfig(
+            enabled=True,
+            on_exhaustion="wait",
+            audit_comment_on_wait=True,
+            audit_comment_on_resume=False,
+        )
+
+        wu_file = self._make_wu_file(tmp_path)
+
+        async def _fake_wait_for_reset(*_a: object, **_kw: object) -> bool:
+            return True
+
+        with patch("devbench.cli.wait_for_reset", side_effect=_fake_wait_for_reset):
+            asyncio.run(
+                cli._handle_quota_pause(
+                    exc=exc,
+                    quota_cfg=quota_cfg,
+                    workspace_root=tmp_path,
+                    session_name="default",
+                    in_flight_wu_file=wu_file,
+                )
+            )
+
+        content = wu_file.read_text(encoding="utf-8")
+        assert f"reason={expected_reason}" in content, (
+            f"Expected reason={expected_reason} in [QUOTA_WAITING] for {reason_class}; got: {content}"
+        )

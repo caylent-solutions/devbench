@@ -21,7 +21,7 @@
 # Exit 2  -> command is deferred/blocked (stderr becomes Claude's feedback)
 #
 # Configuration (environment variables, all optional):
-#   JUDGE_WORKSPACE_ROOT        -- workspace root (required for checkpoint lookup)
+#   DEVBENCH_WORKSPACE_ROOT     -- workspace root (required for checkpoint lookup)
 #   DEVBENCH_SESSION_NAME       -- named session; when set, uses session-scoped path
 #   DEVBENCH_QUOTA_MAX_WAIT_SECONDS -- override for max wait seconds (default: 18000)
 
@@ -56,7 +56,7 @@ fi
 # ---------------------------------------------------------------------------
 # Resolve checkpoint path
 # ---------------------------------------------------------------------------
-WORKSPACE_ROOT="${JUDGE_WORKSPACE_ROOT:-}"
+WORKSPACE_ROOT="${DEVBENCH_WORKSPACE_ROOT:-}"
 if [[ -z "$WORKSPACE_ROOT" ]]; then
   # Cannot locate workspace -- allow through (no checkpoint to check).
   exit 0

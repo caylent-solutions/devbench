@@ -80,8 +80,8 @@ print(d.get('tool_input', {}).get('content', ''))
 
   # Rule 11: reject content whose Manifest table rows or Source: lines are prefixed
   # with a known checkout_directory from devbench.yaml.
-  if [[ -n "$CONTENT" ]] && [[ -n "${JUDGE_WORKSPACE_ROOT:-}" ]]; then
-    YAML_PATH="${JUDGE_WORKSPACE_ROOT}/backlog/config/devbench.yaml"
+  if [[ -n "$CONTENT" ]] && [[ -n "${DEVBENCH_WORKSPACE_ROOT:-}" ]]; then
+    YAML_PATH="${DEVBENCH_WORKSPACE_ROOT}/backlog/config/devbench.yaml"
     if [[ -f "$YAML_PATH" ]]; then
       CHECKOUT_DIRS=$(python3 - "$YAML_PATH" <<'PYEOF'
 import sys, yaml

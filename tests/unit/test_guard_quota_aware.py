@@ -34,7 +34,9 @@ def _run_hook(
     env_overrides: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     """Invoke the hook script with the given JSON payload on stdin."""
-    env = os.environ.copy()
+    # Strip legacy JUDGE_WORKSPACE_ROOT and JUDGE_LOG_FILE: _hook_lib.sh rejects
+    # these vars at source time (AC-197-9) and all hooks source _hook_lib.sh.
+    env = {k: v for k, v in os.environ.items() if k not in ("JUDGE_WORKSPACE_ROOT", "JUDGE_LOG_FILE")}
     if env_overrides:
         env.update(env_overrides)
     return subprocess.run(
@@ -111,19 +113,21 @@ class TestGuardQuotaAwareStructural:
 
     def test_malformed_json_passes_through(self) -> None:
         """A non-JSON stdin payload must not raise; the hook silently passes."""
+        env = {k: v for k, v in os.environ.items() if k not in ("JUDGE_WORKSPACE_ROOT", "JUDGE_LOG_FILE")}
         result = subprocess.run(
             ["bash", str(SCRIPT_PATH)],
             input="not json at all { unclosed",
             capture_output=True,
             text=True,
+            env=env,
         )
         assert result.returncode == 0
 
     def test_no_workspace_root_passes_through(self) -> None:
-        """When JUDGE_WORKSPACE_ROOT is unset, the hook allows through without checking."""
+        """When DEVBENCH_WORKSPACE_ROOT is unset, the hook allows through without checking."""
         payload = _make_payload("uv run devbench next")
-        env = os.environ.copy()
-        env.pop("JUDGE_WORKSPACE_ROOT", None)
+        _excluded = {"JUDGE_WORKSPACE_ROOT", "JUDGE_LOG_FILE", "DEVBENCH_WORKSPACE_ROOT"}
+        env = {k: v for k, v in os.environ.items() if k not in _excluded}
         result = subprocess.run(
             ["bash", str(SCRIPT_PATH)],
             input=json.dumps(payload),
@@ -169,19 +173,19 @@ class TestGuardQuotaAwareNoCheckpointFile:
     def test_no_checkpoint_devbench_command_passes(self, tmp_path: Path) -> None:
         """``uv run devbench next`` passes when no checkpoint file exists."""
         payload = _make_payload("uv run devbench next")
-        result = _run_hook(payload, env_overrides={"JUDGE_WORKSPACE_ROOT": str(tmp_path)})
+        result = _run_hook(payload, env_overrides={"DEVBENCH_WORKSPACE_ROOT": str(tmp_path)})
         assert result.returncode == 0
 
     def test_no_checkpoint_devbench_status_passes(self, tmp_path: Path) -> None:
         """``uv run devbench status`` passes when no checkpoint file exists."""
         payload = _make_payload("uv run devbench status")
-        result = _run_hook(payload, env_overrides={"JUDGE_WORKSPACE_ROOT": str(tmp_path)})
+        result = _run_hook(payload, env_overrides={"DEVBENCH_WORKSPACE_ROOT": str(tmp_path)})
         assert result.returncode == 0
 
     def test_no_checkpoint_devbench_log_comment_passes(self, tmp_path: Path) -> None:
         """``uv run devbench log-comment`` passes when no checkpoint file exists."""
         payload = _make_payload("uv run devbench log-comment executor E1 'done'")
-        result = _run_hook(payload, env_overrides={"JUDGE_WORKSPACE_ROOT": str(tmp_path)})
+        result = _run_hook(payload, env_overrides={"DEVBENCH_WORKSPACE_ROOT": str(tmp_path)})
         assert result.returncode == 0
 
 
@@ -193,28 +197,28 @@ class TestGuardQuotaAwareFutureResetAt:
         """``uv run devbench next`` is blocked when quota_pause.json is active."""
         _write_quota_pause(tmp_path, reset_at=_future_reset_at(3600))
         payload = _make_payload("uv run devbench next")
-        result = _run_hook(payload, env_overrides={"JUDGE_WORKSPACE_ROOT": str(tmp_path)})
+        result = _run_hook(payload, env_overrides={"DEVBENCH_WORKSPACE_ROOT": str(tmp_path)})
         assert result.returncode == 2
 
     def test_devbench_claim_blocked_during_quota_wait(self, tmp_path: Path) -> None:
         """``uv run devbench claim`` is blocked when quota_pause.json is active."""
         _write_quota_pause(tmp_path, reset_at=_future_reset_at(3600))
         payload = _make_payload("uv run devbench claim E1-F1-S1-T1")
-        result = _run_hook(payload, env_overrides={"JUDGE_WORKSPACE_ROOT": str(tmp_path)})
+        result = _run_hook(payload, env_overrides={"DEVBENCH_WORKSPACE_ROOT": str(tmp_path)})
         assert result.returncode == 2
 
     def test_devbench_log_comment_blocked_during_quota_wait(self, tmp_path: Path) -> None:
         """``uv run devbench log-comment`` is blocked when quota_pause.json is active."""
         _write_quota_pause(tmp_path, reset_at=_future_reset_at(7200))
         payload = _make_payload("uv run devbench log-comment executor E1 'msg'")
-        result = _run_hook(payload, env_overrides={"JUDGE_WORKSPACE_ROOT": str(tmp_path)})
+        result = _run_hook(payload, env_overrides={"DEVBENCH_WORKSPACE_ROOT": str(tmp_path)})
         assert result.returncode == 2
 
     def test_stderr_names_checkpoint_path(self, tmp_path: Path) -> None:
         """The block message must name the checkpoint file path."""
         _write_quota_pause(tmp_path, reset_at=_future_reset_at(3600))
         payload = _make_payload("uv run devbench next")
-        result = _run_hook(payload, env_overrides={"JUDGE_WORKSPACE_ROOT": str(tmp_path)})
+        result = _run_hook(payload, env_overrides={"DEVBENCH_WORKSPACE_ROOT": str(tmp_path)})
         assert result.returncode == 2
         assert "quota_pause.json" in result.stderr
 
@@ -222,7 +226,7 @@ class TestGuardQuotaAwareFutureResetAt:
         """The block message must include the quota reason from the checkpoint."""
         _write_quota_pause(tmp_path, reset_at=_future_reset_at(3600), reason="bedrock_throttle")
         payload = _make_payload("uv run devbench next")
-        result = _run_hook(payload, env_overrides={"JUDGE_WORKSPACE_ROOT": str(tmp_path)})
+        result = _run_hook(payload, env_overrides={"DEVBENCH_WORKSPACE_ROOT": str(tmp_path)})
         assert result.returncode == 2
         assert "bedrock_throttle" in result.stderr
 
@@ -231,7 +235,7 @@ class TestGuardQuotaAwareFutureResetAt:
         reset_at = _future_reset_at(3600)
         _write_quota_pause(tmp_path, reset_at=reset_at)
         payload = _make_payload("uv run devbench next")
-        result = _run_hook(payload, env_overrides={"JUDGE_WORKSPACE_ROOT": str(tmp_path)})
+        result = _run_hook(payload, env_overrides={"DEVBENCH_WORKSPACE_ROOT": str(tmp_path)})
         assert result.returncode == 2
         # The reset_at prefix (date portion) must appear in stderr.
         assert reset_at[:10] in result.stderr
@@ -251,7 +255,7 @@ class TestGuardQuotaAwareFutureResetAt:
         """Every ``uv run devbench <sub>`` is blocked during an active quota wait."""
         _write_quota_pause(tmp_path, reset_at=_future_reset_at(3600))
         payload = _make_payload(f"uv run devbench {subcommand}")
-        result = _run_hook(payload, env_overrides={"JUDGE_WORKSPACE_ROOT": str(tmp_path)})
+        result = _run_hook(payload, env_overrides={"DEVBENCH_WORKSPACE_ROOT": str(tmp_path)})
         assert result.returncode == 2, (
             f"Subcommand {subcommand!r} was not blocked during quota wait; stderr={result.stderr!r}"
         )
@@ -265,14 +269,14 @@ class TestGuardQuotaAwarePastResetAt:
         """``uv run devbench next`` is allowed when reset_at is in the past."""
         _write_quota_pause(tmp_path, reset_at=_past_reset_at(60))
         payload = _make_payload("uv run devbench next")
-        result = _run_hook(payload, env_overrides={"JUDGE_WORKSPACE_ROOT": str(tmp_path)})
+        result = _run_hook(payload, env_overrides={"DEVBENCH_WORKSPACE_ROOT": str(tmp_path)})
         assert result.returncode == 0
 
     def test_past_reset_at_allows_claim(self, tmp_path: Path) -> None:
         """``uv run devbench claim`` is allowed when reset_at is in the past."""
         _write_quota_pause(tmp_path, reset_at=_past_reset_at(120))
         payload = _make_payload("uv run devbench claim E1-F1-S1-T1")
-        result = _run_hook(payload, env_overrides={"JUDGE_WORKSPACE_ROOT": str(tmp_path)})
+        result = _run_hook(payload, env_overrides={"DEVBENCH_WORKSPACE_ROOT": str(tmp_path)})
         assert result.returncode == 0
 
 
@@ -284,14 +288,14 @@ class TestGuardQuotaAwareNullResetAt:
         """When reset_at is null, the hook blocks because the quota window is unknown."""
         _write_quota_pause(tmp_path, reset_at=None)
         payload = _make_payload("uv run devbench next")
-        result = _run_hook(payload, env_overrides={"JUDGE_WORKSPACE_ROOT": str(tmp_path)})
+        result = _run_hook(payload, env_overrides={"DEVBENCH_WORKSPACE_ROOT": str(tmp_path)})
         assert result.returncode == 2
 
     def test_null_reset_at_stderr_mentions_unknown(self, tmp_path: Path) -> None:
         """Stderr mentions that reset_at is unknown when null."""
         _write_quota_pause(tmp_path, reset_at=None)
         payload = _make_payload("uv run devbench next")
-        result = _run_hook(payload, env_overrides={"JUDGE_WORKSPACE_ROOT": str(tmp_path)})
+        result = _run_hook(payload, env_overrides={"DEVBENCH_WORKSPACE_ROOT": str(tmp_path)})
         assert result.returncode == 2
         stderr_lower = result.stderr.lower()
         assert "unknown" in stderr_lower or "null" in stderr_lower
@@ -327,7 +331,7 @@ class TestGuardQuotaAwareMaxWait:
         result = _run_hook(
             hook_payload,
             env_overrides={
-                "JUDGE_WORKSPACE_ROOT": str(tmp_path),
+                "DEVBENCH_WORKSPACE_ROOT": str(tmp_path),
                 "DEVBENCH_QUOTA_MAX_WAIT_SECONDS": "3600",  # 1-hour max
             },
         )
@@ -358,7 +362,7 @@ class TestGuardQuotaAwareMaxWait:
         result = _run_hook(
             hook_payload,
             env_overrides={
-                "JUDGE_WORKSPACE_ROOT": str(tmp_path),
+                "DEVBENCH_WORKSPACE_ROOT": str(tmp_path),
                 "DEVBENCH_QUOTA_MAX_WAIT_SECONDS": "7200",  # 2-hour max
             },
         )
@@ -379,7 +383,7 @@ class TestGuardQuotaAwareSessionScoped:
         result = _run_hook(
             payload,
             env_overrides={
-                "JUDGE_WORKSPACE_ROOT": str(tmp_path),
+                "DEVBENCH_WORKSPACE_ROOT": str(tmp_path),
                 "DEVBENCH_SESSION_NAME": session_name,
             },
         )
@@ -394,7 +398,7 @@ class TestGuardQuotaAwareSessionScoped:
         result = _run_hook(
             payload,
             env_overrides={
-                "JUDGE_WORKSPACE_ROOT": str(tmp_path),
+                "DEVBENCH_WORKSPACE_ROOT": str(tmp_path),
                 "DEVBENCH_SESSION_NAME": session_name,
             },
         )
@@ -410,7 +414,7 @@ class TestGuardQuotaAwareSessionScoped:
         result = _run_hook(
             payload,
             env_overrides={
-                "JUDGE_WORKSPACE_ROOT": str(tmp_path),
+                "DEVBENCH_WORKSPACE_ROOT": str(tmp_path),
                 "DEVBENCH_SESSION_NAME": session_name,
             },
         )
@@ -424,7 +428,7 @@ class TestGuardQuotaAwareSessionScoped:
         result = _run_hook(
             payload,
             env_overrides={
-                "JUDGE_WORKSPACE_ROOT": str(tmp_path),
+                "DEVBENCH_WORKSPACE_ROOT": str(tmp_path),
                 "DEVBENCH_SESSION_NAME": "",
             },
         )
@@ -441,7 +445,7 @@ class TestGuardQuotaAwareMalformedCheckpoint:
         devbench_dir.mkdir(parents=True, exist_ok=True)
         (devbench_dir / "quota_pause.json").write_text("{ invalid json unclosed", encoding="utf-8")
         payload = _make_payload("uv run devbench next")
-        result = _run_hook(payload, env_overrides={"JUDGE_WORKSPACE_ROOT": str(tmp_path)})
+        result = _run_hook(payload, env_overrides={"DEVBENCH_WORKSPACE_ROOT": str(tmp_path)})
         assert result.returncode == 2
 
     def test_malformed_json_stderr_actionable(self, tmp_path: Path) -> None:
@@ -450,7 +454,7 @@ class TestGuardQuotaAwareMalformedCheckpoint:
         devbench_dir.mkdir(parents=True, exist_ok=True)
         (devbench_dir / "quota_pause.json").write_text("{ invalid json unclosed", encoding="utf-8")
         payload = _make_payload("uv run devbench next")
-        result = _run_hook(payload, env_overrides={"JUDGE_WORKSPACE_ROOT": str(tmp_path)})
+        result = _run_hook(payload, env_overrides={"DEVBENCH_WORKSPACE_ROOT": str(tmp_path)})
         assert "quota_pause.json" in result.stderr
 
     def test_missing_reset_at_field_blocks(self, tmp_path: Path) -> None:
@@ -460,7 +464,7 @@ class TestGuardQuotaAwareMalformedCheckpoint:
         cp = {"paused_at": datetime.now(tz=UTC).isoformat(), "reason": "test"}
         (devbench_dir / "quota_pause.json").write_text(json.dumps(cp), encoding="utf-8")
         payload = _make_payload("uv run devbench next")
-        result = _run_hook(payload, env_overrides={"JUDGE_WORKSPACE_ROOT": str(tmp_path)})
+        result = _run_hook(payload, env_overrides={"DEVBENCH_WORKSPACE_ROOT": str(tmp_path)})
         assert result.returncode == 2
 
 

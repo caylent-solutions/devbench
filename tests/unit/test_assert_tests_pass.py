@@ -12,6 +12,15 @@ import pytest
 SCRIPT_PATH = Path(__file__).parent.parent.parent / "plugin" / "devbench" / "scripts" / "assert-tests-pass.sh"
 
 
+def _clean_env() -> dict[str, str]:
+    """Return the process env with legacy JUDGE_WORKSPACE_ROOT and JUDGE_LOG_FILE stripped.
+
+    _hook_lib.sh rejects legacy JUDGE_* hook vars (AC-197-9). Tests that source
+    _hook_lib.sh must not inherit those vars from the pytest process environment.
+    """
+    return {k: v for k, v in os.environ.items() if k not in ("JUDGE_WORKSPACE_ROOT", "JUDGE_LOG_FILE")}
+
+
 def _run_hook(payload: dict) -> subprocess.CompletedProcess:
     """Invoke the hook script with the given JSON payload on stdin."""
     return subprocess.run(
@@ -19,6 +28,7 @@ def _run_hook(payload: dict) -> subprocess.CompletedProcess:
         input=json.dumps(payload),
         capture_output=True,
         text=True,
+        env=_clean_env(),
     )
 
 

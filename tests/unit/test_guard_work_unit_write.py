@@ -17,7 +17,9 @@ def _run_hook(
     extra_env: dict | None = None,
 ) -> subprocess.CompletedProcess:
     """Invoke the hook script with the given JSON payload on stdin."""
-    env = os.environ.copy()
+    # Strip legacy JUDGE_WORKSPACE_ROOT and JUDGE_LOG_FILE: _hook_lib.sh rejects
+    # these vars at source time (AC-197-9) and all hooks source _hook_lib.sh.
+    env = {k: v for k, v in os.environ.items() if k not in ("JUDGE_WORKSPACE_ROOT", "JUDGE_LOG_FILE")}
     if extra_env:
         env.update(extra_env)
     return subprocess.run(
@@ -190,7 +192,7 @@ class TestGuardWorkUnitWriteContentValidation:
                 "content": content,
             },
         }
-        result = _run_hook(payload, extra_env={"JUDGE_WORKSPACE_ROOT": str(tmp_path)})
+        result = _run_hook(payload, extra_env={"DEVBENCH_WORKSPACE_ROOT": str(tmp_path)})
         assert result.returncode == 2, (
             f"Expected exit 2 for checkout_directory prefix content, got {result.returncode}. stderr: {result.stderr}"
         )
@@ -275,7 +277,7 @@ class TestGuardWorkUnitWriteOrchestratorBypass:
             payload,
             extra_env={
                 "JUDGE_AGENT_ROLE": "orchestrator",
-                "JUDGE_WORKSPACE_ROOT": str(tmp_path),
+                "DEVBENCH_WORKSPACE_ROOT": str(tmp_path),
             },
         )
         assert result.returncode == 2, (
@@ -310,8 +312,9 @@ class TestGuardWorkUnitWriteOrchestratorBypass:
             },
         }
         # Strip any inherited JUDGE_AGENT_ROLE the dev shell might be carrying.
-        env = os.environ.copy()
-        env.pop("JUDGE_AGENT_ROLE", None)
+        # Also strip legacy JUDGE_WORKSPACE_ROOT and JUDGE_LOG_FILE per AC-197-9.
+        _stripped = {"JUDGE_WORKSPACE_ROOT", "JUDGE_LOG_FILE", "JUDGE_AGENT_ROLE"}
+        env = {k: v for k, v in os.environ.items() if k not in _stripped}
         result = subprocess.run(
             ["bash", str(SCRIPT_PATH)],
             input=json.dumps(payload),

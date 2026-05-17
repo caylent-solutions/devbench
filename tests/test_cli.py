@@ -15041,6 +15041,268 @@ class TestCmdStatusDrainBanner:
         assert "file-param test" in output
 
 
+@pytest.mark.unit
+class TestCmdStatusQuotaWaitBanner:
+    """cmd_status prepends QUOTA WAIT banners when quota_pause.json is present (AC-193-15, AC-193-16)."""
+
+    @pytest.fixture()
+    def mock_backlog_parser(self) -> MagicMock:
+        """Return a minimal MagicMock BacklogParser so cmd_status returns 0."""
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = []
+        mock_parser.get_parallel_candidates.return_value = []
+        mock_parser.all_done.return_value = True
+        return mock_parser
+
+    @pytest.fixture()
+    def quota_checkpoint_dt(self) -> datetime:
+        """Fixed UTC datetime used for quota checkpoint fixtures."""
+        return datetime(2026, 5, 17, 12, 0, 0, tzinfo=UTC)
+
+    def _write_quota_pause(
+        self, session_dir: Path, paused_at: datetime, reset_at: datetime | None, reason: str
+    ) -> None:
+        """Write a minimal quota_pause.json under <session_dir>/.devbench/."""
+        from devbench.quota import save_checkpoint
+
+        save_checkpoint(
+            session_dir=session_dir,
+            paused_at=paused_at,
+            reset_at=reset_at,
+            reason=reason,
+            raw_error="synthetic error",
+            in_flight_wu=None,
+            in_flight_phase=None,
+            completed_judges=[],
+            pending_judges=[],
+            stage_artefacts={},
+        )
+
+    def test_quota_banner_shown_when_pause_file_present(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        mock_backlog_parser: MagicMock,
+        quota_checkpoint_dt: datetime,
+    ) -> None:
+        """cmd_status renders QUOTA WAIT banner when workspace quota_pause.json exists."""
+        reset_at = datetime(2026, 5, 17, 14, 0, 0, tzinfo=UTC)
+        self._write_quota_pause(tmp_path, quota_checkpoint_dt, reset_at, "subscription_rate_limit")
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BacklogParser", return_value=mock_backlog_parser),
+        ):
+            rc = cli.cmd_status()
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "QUOTA WAIT" in out
+
+    def test_quota_banner_absent_when_no_pause_file(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        mock_backlog_parser: MagicMock,
+    ) -> None:
+        """cmd_status does not render QUOTA WAIT banner when quota_pause.json is absent."""
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BacklogParser", return_value=mock_backlog_parser),
+        ):
+            rc = cli.cmd_status()
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "QUOTA WAIT" not in out
+
+    def test_quota_banner_includes_reason(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        mock_backlog_parser: MagicMock,
+        quota_checkpoint_dt: datetime,
+    ) -> None:
+        """cmd_status quota banner includes the reason token from the checkpoint."""
+        reset_at = datetime(2026, 5, 17, 14, 0, 0, tzinfo=UTC)
+        self._write_quota_pause(tmp_path, quota_checkpoint_dt, reset_at, "bedrock_throttle")
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BacklogParser", return_value=mock_backlog_parser),
+        ):
+            cli.cmd_status()
+
+        out = capsys.readouterr().out
+        assert "bedrock_throttle" in out
+
+    def test_quota_banner_includes_reset_time(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        mock_backlog_parser: MagicMock,
+        quota_checkpoint_dt: datetime,
+    ) -> None:
+        """cmd_status quota banner includes the ISO reset timestamp."""
+        reset_at = datetime(2026, 5, 17, 14, 30, 0, tzinfo=UTC)
+        self._write_quota_pause(tmp_path, quota_checkpoint_dt, reset_at, "subscription_rate_limit")
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BacklogParser", return_value=mock_backlog_parser),
+        ):
+            cli.cmd_status()
+
+        out = capsys.readouterr().out
+        assert reset_at.isoformat() in out
+
+    def test_quota_banner_appears_before_status_summary(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        mock_backlog_parser: MagicMock,
+        quota_checkpoint_dt: datetime,
+    ) -> None:
+        """cmd_status renders QUOTA WAIT banner before the Status Summary header."""
+        reset_at = datetime(2026, 5, 17, 14, 0, 0, tzinfo=UTC)
+        self._write_quota_pause(tmp_path, quota_checkpoint_dt, reset_at, "subscription_rate_limit")
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BacklogParser", return_value=mock_backlog_parser),
+        ):
+            cli.cmd_status()
+
+        out = capsys.readouterr().out
+        assert "QUOTA WAIT" in out
+        assert "Backlog Status Summary" in out
+        assert out.index("QUOTA WAIT") < out.index("Backlog Status Summary")
+
+    def test_quota_banner_unknown_reset_when_reset_at_none(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        mock_backlog_parser: MagicMock,
+        quota_checkpoint_dt: datetime,
+    ) -> None:
+        """cmd_status quota banner shows 'reset time unknown' when reset_at is None."""
+        self._write_quota_pause(tmp_path, quota_checkpoint_dt, None, "api_billing_error")
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BacklogParser", return_value=mock_backlog_parser),
+        ):
+            cli.cmd_status()
+
+        out = capsys.readouterr().out
+        assert "QUOTA WAIT" in out
+        assert "reset time unknown" in out
+
+    def test_quota_banner_includes_countdown_when_reset_at_in_future(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        mock_backlog_parser: MagicMock,
+        quota_checkpoint_dt: datetime,
+    ) -> None:
+        """cmd_status quota banner includes a countdown when reset_at is in the future."""
+        reset_at = datetime(2026, 5, 17, 14, 0, 0, tzinfo=UTC)
+        self._write_quota_pause(tmp_path, quota_checkpoint_dt, reset_at, "subscription_rate_limit")
+        fake_now = datetime(2026, 5, 17, 13, 0, 0, tzinfo=UTC)
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BacklogParser", return_value=mock_backlog_parser),
+            patch("devbench.cli._quota_banner_now", return_value=fake_now),
+        ):
+            cli.cmd_status()
+
+        out = capsys.readouterr().out
+        assert "remaining" in out
+
+    def test_quota_banner_full_format(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        mock_backlog_parser: MagicMock,
+        quota_checkpoint_dt: datetime,
+    ) -> None:
+        """cmd_status quota banner matches spec format.
+
+        Expected: 'QUOTA WAIT: <reason> - resumes <ISO-ts> (<countdown> remaining)'.
+        """
+        reset_at = datetime(2026, 5, 17, 14, 0, 0, tzinfo=UTC)
+        self._write_quota_pause(tmp_path, quota_checkpoint_dt, reset_at, "subscription_rate_limit")
+        fake_now = datetime(2026, 5, 17, 13, 0, 0, tzinfo=UTC)
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BacklogParser", return_value=mock_backlog_parser),
+            patch("devbench.cli._quota_banner_now", return_value=fake_now),
+        ):
+            cli.cmd_status()
+
+        out = capsys.readouterr().out
+        pattern = r"QUOTA WAIT: subscription_rate_limit - resumes .+ \(.+ remaining\)"
+        assert re.search(pattern, out), f"Expected banner matching {pattern!r} in output:\n{out}"
+
+    def test_quota_banner_multi_session_shows_all_waiting(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        mock_backlog_parser: MagicMock,
+        quota_checkpoint_dt: datetime,
+    ) -> None:
+        """cmd_status shows one QUOTA WAIT banner per paused session (AC-193-16)."""
+        from devbench.session import Session, SessionRegistry
+
+        reset_at = datetime(2026, 5, 17, 14, 0, 0, tzinfo=UTC)
+
+        # Workspace-root checkpoint (non-session run)
+        self._write_quota_pause(tmp_path, quota_checkpoint_dt, reset_at, "subscription_rate_limit")
+
+        # Session-scoped checkpoint
+        session_state_dir = tmp_path / ".devbench" / "sessions" / "alpha"
+        session_state_dir.mkdir(parents=True, exist_ok=True)
+        self._write_quota_pause(session_state_dir, quota_checkpoint_dt, reset_at, "bedrock_throttle")
+
+        registry = SessionRegistry(tmp_path)
+        registry.save(
+            [
+                Session(
+                    name="alpha",
+                    pid=12345,
+                    scope=[],
+                    started_at=quota_checkpoint_dt,
+                    started_by="testuser",
+                    state_dir=session_state_dir,
+                )
+            ]
+        )
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BacklogParser", return_value=mock_backlog_parser),
+        ):
+            cli.cmd_status()
+
+        out = capsys.readouterr().out
+        assert out.count("QUOTA WAIT") == 2
+
+    def test_render_quota_wait_banner_file_parameter(self, tmp_path: Path, quota_checkpoint_dt: datetime) -> None:
+        """_render_quota_wait_banner writes to the provided file stream, not only sys.stdout."""
+        import io
+
+        reset_at = datetime(2026, 5, 17, 14, 0, 0, tzinfo=UTC)
+        self._write_quota_pause(tmp_path, quota_checkpoint_dt, reset_at, "subscription_rate_limit")
+
+        buf = io.StringIO()
+        cli._render_quota_wait_banner(tmp_path, file=buf)
+        output = buf.getvalue()
+        assert "QUOTA WAIT" in output
+        assert "subscription_rate_limit" in output
+
+
 class TestCmdDrainIntegration:
     """Integration tests: full cmd_drain flows against a real tmp workspace fixture (AC-188-1..3).
 

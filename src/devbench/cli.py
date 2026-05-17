@@ -357,6 +357,70 @@ def _render_drain_banner(workspace_root: Path, file: IO[str] | None = None) -> N
     )
 
 
+def _quota_banner_now() -> datetime:
+    """Return the current UTC time for quota countdown calculations.
+
+    Extracted into a named function so tests can patch it without replacing
+    the ``datetime`` class itself.
+
+    Returns:
+        Current UTC-aware :class:`~datetime.datetime`.
+
+    Raises:
+        None -- always returns a valid timezone-aware datetime.
+    """
+    return datetime.now(tz=UTC)
+
+
+def _render_quota_wait_banner(workspace_root: Path, file: IO[str] | None = None) -> None:
+    """Print a ``QUOTA WAIT: <reason> - resumes <ISO-ts> (<countdown> remaining)`` banner.
+
+    Iterates over *workspace_root* itself plus every session directory listed
+    in the session registry.  For each directory that contains a
+    ``quota_pause.json`` file, one banner line is printed (spec section 4.5,
+    AC-193-15, AC-193-16).  When no pause file is found anywhere this function
+    is a no-op.  Output goes to *file* (default ``sys.stdout``).
+
+    Args:
+        workspace_root: Root workspace directory. Used both as the first search
+            location and as the registry root for session directories.
+        file: Output stream for the banner. Defaults to ``sys.stdout`` when
+            ``None``. Pass an ``io.StringIO`` to capture without touching the
+            real stdout.
+
+    Raises:
+        ValueError: Propagated from :func:`~devbench.quota.load_checkpoint`
+            when ``quota_pause.json`` exists but contains malformed JSON or
+            missing required fields.
+        OSError: Propagated from :func:`~devbench.quota.load_checkpoint` when
+            the file cannot be read due to a permission error or other I/O
+            failure.
+        ValueError: Propagated from :class:`~devbench.session.SessionRegistry`
+            when the registry file exists but contains invalid JSON.
+        OSError: Propagated from :class:`~devbench.session.SessionRegistry`
+            when a filesystem read fails unexpectedly.
+    """
+    out = file if file is not None else sys.stdout
+    watch_dirs = _collect_quota_watch_dirs(workspace_root)
+    for watch_dir in watch_dirs:
+        checkpoint = load_checkpoint(watch_dir)
+        if checkpoint is None:
+            continue
+        if checkpoint.reset_at is not None:
+            reset_iso = checkpoint.reset_at.isoformat()
+            remaining_secs = (checkpoint.reset_at - _quota_banner_now()).total_seconds()
+            if remaining_secs > 0:
+                remaining_mins = int(remaining_secs // 60)
+                remaining_secs_part = int(remaining_secs % 60)
+                countdown = f"{remaining_mins}m{remaining_secs_part:02d}s"
+            else:
+                countdown = "0m00s"
+            resumes_part = f"resumes {reset_iso} ({countdown} remaining)"
+        else:
+            resumes_part = "reset time unknown"
+        print(f"QUOTA WAIT: {checkpoint.reason} - {resumes_part}", file=out)
+
+
 def _print_active_units(active: list[WorkUnit]) -> None:
     """Render the ``Active work units:`` panel for ``cmd_status``.
 
@@ -539,6 +603,11 @@ def cmd_status(*argv: str) -> int:
     ``SCOPE: include=[...] exclude=[...] (started ...)`` banner is printed
     above the Status Summary.
 
+    When ``quota_pause.json`` exists in the workspace root or any session
+    directory, a ``QUOTA WAIT: <reason> - resumes <ISO-ts> (<countdown>
+    remaining)`` banner is prepended above the Status Summary (spec section
+    4.5, AC-193-15, AC-193-16).
+
     With ``--detail`` (E220), additionally render per-state sections: in-queue
     (every actionable Task with the IDs of its still-open dependencies), six
     blocked-task sections (one per :class:`~devbench.backlog.proposal.BlockedTaskState`
@@ -558,6 +627,7 @@ def cmd_status(*argv: str) -> int:
         _render_scope_banner(scope.include, scope.exclude, scope.started_at)
 
     _render_drain_banner(WORKSPACE_ROOT)
+    _render_quota_wait_banner(WORKSPACE_ROOT)
 
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     all_units = parser.parse_index()

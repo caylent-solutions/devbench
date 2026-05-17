@@ -280,3 +280,4 @@ written as before.
 - Issue #192 -- named sessions feature specification.
 - Spec section 4.4 -- detailed behavioural requirements.
 - PR #187 -- original `[WU_CLAIMED]` audit format (extended by this feature).
+- `docs/adr/24-quota-wait-and-resume.md` -- companion ADR for quota handling (shares the per-session state directory layout).

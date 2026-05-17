@@ -10,6 +10,7 @@ Verifies that the ADR exists and contains the required structural elements:
 
 Spec source: spec/devbench-self-improve.md section 5.2.
 Issue: #192.
+Companion: tests/test_docs/test_adr_24_quota_wait.py (ADR-24 structural pins).
 """
 
 from __future__ import annotations

@@ -272,12 +272,25 @@ Then emit the success message:
 > - All tasks default to `draft` status
 > - `devbench validate-backlog` passes with rc=0
 >
-> Next: review the generated epics and promote individual tasks (or whole epics/features) to `in-queue` when ready:
+> Next: review the generated epics in the `draft` status, then release whole epics
+> (or individual tasks) for autonomous orchestrator work using `devbench set-status`:
 >
 > ```bash
-> uv run devbench promote --epic E1   # promote all tasks in E1 to in-queue
-> uv run devbench promote E1-F1-S1-T1  # promote a single task
+> # Release the first epic for autonomous work (canonical follow-up after spec-to-backlog)
+> uv run devbench set-status --include "E1" in-queue
+>
+> # Preview which tasks would be promoted before committing (safe dry-run)
+> uv run devbench set-status --include "E1" --dry-run in-queue
+>
+> # Release multiple epics at once
+> uv run devbench set-status --include "E1,E2" in-queue
+>
+> # Place an epic on hold while releasing others
+> uv run devbench set-status --include "E5" hold
 > ```
+>
+> For full bulk-operations documentation, including threshold confirmation and the
+> `--exclude` flag, see `docs/zero-to-ready.md` (Bulk operations on the backlog).
 
 ---
 

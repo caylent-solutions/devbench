@@ -1265,6 +1265,293 @@ class TestCmdSetStatus:
         assert "in-progress" in capsys.readouterr().out
         mock_mgr.force_status.assert_called_once()
 
+    # ------------------------------------------------------------------
+    # Bulk --include / --exclude tests (AC-194-1, AC-194-2, AC-194-10)
+    # ------------------------------------------------------------------
+
+    def test_bulk_include_returns_0_on_success(
+        self, mock_units: list[WorkUnit], backlog_dir: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-194-1: --include selects WUs and bulk-updates them."""
+        for unit in mock_units:
+            wu_file = backlog_dir / unit.file_path.name
+            wu_file.write_text(f"# {unit.id}\n## Status: {unit.status.value}\n")
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+        mock_mgr = MagicMock()
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+        ):
+            result = cli.cmd_set_status("--include", "E0", "in-queue")
+
+        assert result == 0
+        out = capsys.readouterr().out
+        assert "in-queue" in out
+        assert mock_mgr.force_status.call_count > 0
+
+    def test_bulk_include_invalid_status_returns_1(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """AC-194-1: --include with invalid status returns rc=1 with actionable error."""
+        result = cli.cmd_set_status("--include", "E0", "not-a-status")
+        assert result == 1
+        assert "Invalid status" in capsys.readouterr().err
+
+    def test_bulk_include_no_matching_units_returns_1(
+        self, mock_units: list[WorkUnit], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-194-1: --include with no matching WUs returns rc=1 with actionable error."""
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_set_status("--include", "E99", "in-queue")
+
+        assert result == 1
+        assert "no work units" in capsys.readouterr().err.lower()
+
+    def test_bulk_include_exclude_subtracts_units(
+        self, mock_units: list[WorkUnit], backlog_dir: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-194-1: --exclude subtracts from the --include set."""
+        for unit in mock_units:
+            wu_file = backlog_dir / unit.file_path.name
+            wu_file.write_text(f"# {unit.id}\n## Status: {unit.status.value}\n")
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+        mock_mgr = MagicMock()
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+        ):
+            # Include all, exclude T3 -- only T1 and T2 should be updated
+            result = cli.cmd_set_status("--include", "E0", "--exclude", "E0-F1-S1-T3", "in-queue")
+
+        assert result == 0
+        updated_ids = [call.args[2] for call in mock_mgr.force_status.call_args_list]
+        assert "E0-F1-S1-T3" not in updated_ids
+        assert len(updated_ids) == 2
+
+    def test_bulk_missing_status_arg_returns_1(
+        self, mock_units: list[WorkUnit], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-194-1: --include without a trailing status positional returns rc=1."""
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_set_status("--include", "E0")
+
+        assert result == 1
+        assert "status" in capsys.readouterr().err.lower()
+
+    def test_single_id_form_still_works(
+        self, mock_units: list[WorkUnit], backlog_dir: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-194-2: existing devbench set-status <id> <status> form works unchanged."""
+        wu_file = backlog_dir / "E0-F1-S1-T2.md"
+        wu_file.write_text("# Task\n## Status: in-queue\n")
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+        mock_mgr = MagicMock()
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+        ):
+            result = cli.cmd_set_status("E0-F1-S1-T2", "in-progress")
+
+        assert result == 0
+        out = capsys.readouterr().out
+        assert "in-progress" in out
+        mock_mgr.force_status.assert_called_once()
+
+    def test_bulk_uses_scope_filter_parse(self, mock_units: list[WorkUnit], backlog_dir: Path) -> None:
+        """AC-194-10: bulk mode reuses ScopeFilter.parse() -- no parser duplication."""
+        for unit in mock_units:
+            (backlog_dir / unit.file_path.name).write_text(f"# {unit.id}\n## Status: {unit.status.value}\n")
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+        mock_mgr = MagicMock()
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+            patch("devbench.cli.ScopeFilter") as mock_sf_class,
+        ):
+            mock_sf = MagicMock()
+            mock_sf.expanded_ids = {"E0-F1-S1-T2"}
+            mock_sf_class.parse.return_value = mock_sf
+
+            cli.cmd_set_status("--include", "E0-F1-S1-T2", "in-queue")
+
+        # Verify ScopeFilter.parse was called -- proving no duplication
+        mock_sf_class.parse.assert_called_once()
+        call_args = mock_sf_class.parse.call_args
+        assert call_args.args[0] == "E0-F1-S1-T2"  # include_str
+
+    def test_bulk_file_missing_prints_warning_continues(
+        self, mock_units: list[WorkUnit], backlog_dir: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Bulk update: WU with missing file prints warning but does not abort the batch."""
+        # Only create file for T2, not T1 or T3
+        wu_file = backlog_dir / "E0-F1-S1-T2.md"
+        wu_file.write_text("# Task\n## Status: in-queue\n")
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+        mock_mgr = MagicMock()
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+        ):
+            result = cli.cmd_set_status("--include", "E0", "in-queue")
+
+        # Should succeed for T2 even though T1/T3 files are missing
+        assert result == 0
+        assert mock_mgr.force_status.call_count >= 1
+
+    def test_invalid_scope_token_returns_1(
+        self, mock_units: list[WorkUnit], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-190-5 applies: reversed range rejects with actionable error."""
+        from devbench.scope import InvalidScopeError
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.ScopeFilter") as mock_sf_class,
+        ):
+            mock_sf_class.parse.side_effect = InvalidScopeError("reversed range")
+            result = cli.cmd_set_status("--include", "E3-E1", "in-queue")
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "reversed range" in err.lower() or "scope" in err.lower()
+
+
+class TestCmdSetStatusBulkIntegration:
+    """Integration tests: cmd_set_status bulk --include/--exclude against a real fixture workspace."""
+
+    def _build_fixture_workspace(self, tmp_path: Path, units: list[tuple[str, str]]) -> tuple[Path, Path]:
+        """Create a minimal BACKLOG.md + per-WU files under tmp_path.
+
+        Produces the 7-column BACKLOG.md format expected by BacklogParser.parse_index:
+        ``| ID | Title | Type | Status | Dependencies | Repo | File Path |``
+
+        Args:
+            tmp_path: Temporary directory.
+            units: List of (unit_id, status) pairs.
+
+        Returns:
+            (backlog_root, backlog_index) paths.
+        """
+        backlog_root = tmp_path / "backlog"
+        backlog_root.mkdir()
+
+        header = (
+            "# BACKLOG\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|------|\n"
+        )
+        rows = ""
+        for uid, status in units:
+            file_path = f"backlog/{uid}.md"
+            title_status = status.replace("-", " ").title()
+            rows += f"| {uid} | Task {uid} | Task | {title_status} | None | caylent/r | `{file_path}` |\n"
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text(header + rows)
+
+        for uid, status in units:
+            wu_file = backlog_root / f"{uid}.md"
+            wu_file.write_text(f"# {uid}: Task {uid}\n\n## Status: {status}\n\n## Comments\n")
+
+        return backlog_root, backlog_index
+
+    @pytest.mark.unit
+    def test_bulk_updates_all_matching_units(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """Integration: --include E1 bulk-updates every WU under E1."""
+        units = [
+            ("E1-F1-S1-T1", "in-queue"),
+            ("E1-F1-S1-T2", "in-queue"),
+            ("E2-F1-S1-T1", "in-queue"),
+        ]
+        backlog_root, backlog_index = self._build_fixture_workspace(tmp_path, units)
+
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_root),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            result = cli.cmd_set_status("--include", "E1", "in-progress")
+
+        assert result == 0
+
+        # E2 unit must not be changed
+        e2_file = backlog_root / "E2-F1-S1-T1.md"
+        assert "in-queue" in e2_file.read_text()
+
+        # E1 units must be changed
+        e1t1_file = backlog_root / "E1-F1-S1-T1.md"
+        assert "in-progress" in e1t1_file.read_text()
+        e1t2_file = backlog_root / "E1-F1-S1-T2.md"
+        assert "in-progress" in e1t2_file.read_text()
+
+    @pytest.mark.unit
+    def test_bulk_exclude_subtracts_correctly(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """Integration: --include E1 --exclude E1-F1-S1-T2 updates only T1."""
+        units = [
+            ("E1-F1-S1-T1", "in-queue"),
+            ("E1-F1-S1-T2", "in-queue"),
+        ]
+        backlog_root, backlog_index = self._build_fixture_workspace(tmp_path, units)
+
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_root),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            result = cli.cmd_set_status("--include", "E1", "--exclude", "E1-F1-S1-T2", "in-progress")
+
+        assert result == 0
+
+        t1_file = backlog_root / "E1-F1-S1-T1.md"
+        assert "in-progress" in t1_file.read_text()
+
+        t2_file = backlog_root / "E1-F1-S1-T2.md"
+        assert "in-queue" in t2_file.read_text()
+
+    @pytest.mark.unit
+    def test_single_id_form_unchanged(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """AC-194-2 integration: single-ID form devbench set-status <id> <status> unchanged."""
+        units = [("E1-F1-S1-T1", "in-queue")]
+        backlog_root, backlog_index = self._build_fixture_workspace(tmp_path, units)
+
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_root),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            result = cli.cmd_set_status("E1-F1-S1-T1", "in-progress")
+
+        assert result == 0
+        wu_file = backlog_root / "E1-F1-S1-T1.md"
+        assert "in-progress" in wu_file.read_text()
+
 
 class TestCmdMarkDone:
     """Test cmd_mark_done enforces the done-gate via mark_done()."""

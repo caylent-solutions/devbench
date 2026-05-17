@@ -1187,8 +1187,71 @@ def _claim_under_lock(wu_file: Path, unit_id: str, session_name: str | None) -> 
     return None
 
 
-def cmd_set_status(unit_id: str, new_status: str) -> int:
-    """Set the status of a work unit in both the work-unit file and BACKLOG.md."""
+def cmd_set_status(*argv: str) -> int:
+    """Set the status of one or more work units.
+
+    Supports two invocation forms:
+
+    **Single-ID form** (unchanged behaviour, AC-194-2)::
+
+        devbench set-status <id> <new_status>
+
+    **Bulk form** using printer-pages scope selectors (AC-194-1, AC-194-10)::
+
+        devbench set-status --include "<tokens>" [--exclude "<tokens>"] <new_status>
+
+    The ``--include`` / ``--exclude`` tokens are parsed via
+    :meth:`~devbench.scope.ScopeFilter.parse` (no parser duplication).
+    Every matching work-unit file is updated with
+    :meth:`~devbench.backlog.manager.BacklogManager.force_status` so
+    per-WU audit logic continues to fire.  A workspace-level
+    ``[BULK_STATUS_UPDATE]`` info log records each bulk invocation.
+
+    Args:
+        *argv: Parsed CLI tokens.  Either ``(<id>, <status>)`` for the
+            single-ID form, or ``("--include", "<tokens>", <status>)`` /
+            ``("--include", "<tokens>", "--exclude", "<tokens>", <status>)``
+            for the bulk form.
+
+    Returns:
+        0 on success.  1 on any error (invalid status, unknown unit,
+        missing file, invalid scope token, no matching units, missing
+        positional status argument).
+
+    Raises:
+        Nothing -- all errors are reported to stderr and return rc=1.
+    """
+    args = list(argv)
+
+    # Detect bulk mode: --include flag present anywhere in args.
+    if "--include" in args:
+        return _cmd_set_status_bulk(args)
+
+    # Single-ID form: exactly 2 positional args.
+    if len(args) != 2:
+        print(
+            "ERROR: set-status usage: set-status <id> <status>  OR  "
+            "set-status --include '<tokens>' [--exclude '<tokens>'] <status>",
+            file=sys.stderr,
+        )
+        return 1
+
+    return _cmd_set_status_single(args[0], args[1])
+
+
+def _cmd_set_status_single(unit_id: str, new_status: str) -> int:
+    """Set the status of a single work unit by ID.
+
+    Args:
+        unit_id: The work-unit identifier.
+        new_status: Target status string (CLI form or title-case).
+
+    Returns:
+        0 on success, 1 on any error.
+
+    Raises:
+        Nothing -- all errors reported to stderr and return rc=1.
+    """
     from devbench.backlog.manager import VALID_STATUSES
 
     if new_status.lower() not in VALID_STATUSES:
@@ -1222,6 +1285,119 @@ def cmd_set_status(unit_id: str, new_status: str) -> int:
             print(f"WARNING: target repo cleanup failed for '{unit_id}' (exit {rc})", file=sys.stderr)
 
     print(f"Set {unit_id} to {new_status}")
+    return 0
+
+
+def _cmd_set_status_bulk(args: list[str]) -> int:
+    """Bulk-update work-unit statuses using printer-pages scope selectors.
+
+    Parses ``--include`` / ``--exclude`` flags from ``args`` and resolves
+    matching work-unit IDs via :meth:`~devbench.scope.ScopeFilter.parse`.
+    Every matched unit is updated through
+    :meth:`~devbench.backlog.manager.BacklogManager.force_status`.
+    Units whose on-disk file cannot be resolved are skipped with a
+    per-unit warning; the batch continues.
+
+    A workspace-level ``[BULK_STATUS_UPDATE]`` info log entry records the
+    invocation count, target status, and the raw include/exclude tokens.
+
+    Args:
+        args: Full argument list (includes the ``--include`` flag and its
+            value, optional ``--exclude`` flag and value, and the trailing
+            positional ``<new_status>``).
+
+    Returns:
+        0 on success (at least one unit updated or all skipped due to
+        missing files).  1 on any error (invalid status, invalid scope
+        token, no matching work units).
+
+    Raises:
+        Nothing -- all errors reported to stderr and return rc=1.
+    """
+    from devbench.backlog.manager import VALID_STATUSES
+    from devbench.scope import InvalidScopeError
+
+    include_str = ""
+    exclude_str = ""
+    remaining: list[str] = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("--include", "--exclude"):
+            if i + 1 >= len(args):
+                print(
+                    f"ERROR: '{arg}' requires a value (e.g. --include 'E1,E2')",
+                    file=sys.stderr,
+                )
+                return 1
+            next_val = args[i + 1]
+            if arg == "--include":
+                include_str = next_val
+            else:
+                exclude_str = next_val
+            i += 2
+            continue
+        remaining.append(arg)
+        i += 1
+
+    if not remaining:
+        print(
+            "ERROR: set-status --include requires a trailing <status> positional argument",
+            file=sys.stderr,
+        )
+        return 1
+
+    new_status = remaining[0]
+    if new_status.lower() not in VALID_STATUSES:
+        print(
+            f"ERROR: Invalid status '{new_status}'. Valid: {', '.join(sorted(VALID_STATUSES))}",
+            file=sys.stderr,
+        )
+        return 1
+
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    all_ids = [u.id for u in units]
+
+    try:
+        scope = ScopeFilter.parse(include_str, exclude_str, all_ids)
+    except InvalidScopeError as exc:
+        print(f"ERROR: invalid scope selector -- {exc}", file=sys.stderr)
+        return 1
+
+    matched = [u for u in units if scope.allows(u.id)]
+    if not matched:
+        print(
+            f"ERROR: no work units matched --include={include_str!r} (exclude={exclude_str!r})",
+            file=sys.stderr,
+        )
+        return 1
+
+    mgr = BacklogManager()
+    updated = 0
+    for unit in matched:
+        wu_file = _resolve_unit_file(unit)
+        if wu_file is None:
+            logger.warning("set-status bulk: file not found for '%s'; skipping", unit.id)
+            print(
+                f"WARNING: work unit file not found for '{unit.id}'; skipping",
+                file=sys.stderr,
+            )
+            continue
+        mgr.force_status(wu_file, BACKLOG_INDEX, unit.id, new_status)
+        updated += 1
+
+    logger.info(
+        "[BULK_STATUS_UPDATE] %d WUs set to '%s' by --include=%r --exclude=%r",
+        updated,
+        new_status,
+        include_str,
+        exclude_str,
+    )
+    print(
+        f"Bulk set-status: updated {updated} work unit(s) to '{new_status}' "
+        f"(--include={include_str!r} --exclude={exclude_str!r})"
+    )
     return 0
 
 
@@ -8683,7 +8859,15 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
     "status": (cmd_status, 0, "Show backlog summary"),
     "next": (cmd_next, 0, "Print next actionable work unit"),
     "claim": (cmd_claim, 1, "Claim a work unit: claim <id>"),
-    "set-status": (cmd_set_status, 2, "Set status: set-status <id> <status>"),
+    "set-status": (
+        cmd_set_status,
+        0,
+        (
+            "Set status: set-status <id> <status>  OR  "
+            "set-status --include '<tokens>' [--exclude '<tokens>'] <status> "
+            "(bulk update via printer-pages scope selectors, spec 4.7.1)"
+        ),
+    ),
     "mark-done": (cmd_mark_done, 1, "Mark done: mark-done <id>"),
     "decline": (
         cmd_decline,
@@ -8959,6 +9143,8 @@ _VARIADIC_COMMANDS: frozenset[str] = frozenset(
         "rebuild-window-stats",
         # Issue #162 Phase 7: archive an ended session's log to Parquet (opt-in dep).
         "archive-session",
+        # Issue #194 E7-F1-S1-T1: --include / --exclude scope selectors for bulk status update
+        "set-status",
         # Issue #189 E1-F4-S1-T2: bulk selectors --epic/--feature/--story
         "promote",
         # Issue #190 E2-F2-S1-T1: --include / --exclude scope selectors

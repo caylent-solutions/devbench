@@ -2385,25 +2385,57 @@ def _resolve_log_file_path() -> Path:
     raise SystemExit(1)
 
 
+def _resolve_session_report_log(session_name: str) -> Path | None:
+    """Resolve the per-session orchestrator log path for ``cmd_report --session``.
+
+    Returns the path ``<WORKSPACE_ROOT>/.devbench/sessions/<name>/orchestrator.log``
+    when the session state directory exists.  Returns ``None`` and prints an
+    actionable error to stderr when the session directory is absent (the session
+    was never started or has been cleaned up).
+
+    Args:
+        session_name: Named-session filter from ``--session <name>``.
+
+    Returns:
+        The per-session log :class:`Path`, or ``None`` on error.
+    """
+    session_log = WORKSPACE_ROOT / SESSION_SESSIONS_BASE_DIR / session_name / DEFAULT_LOG_FILENAME
+    if not session_log.parent.exists():
+        sys.stderr.write(
+            f"devbench report: session '{session_name}' not found at "
+            f"'{session_log.parent}'.\n"
+            "  Start the session first with 'devbench start --name "
+            f"{session_name} ...' or check the session name.\n"
+        )
+        return None
+    return session_log
+
+
 def cmd_report(
     since: str = "",
     watch_interval: int = 0,
     once: bool = False,
     include: str = "",
     exclude: str = "",
+    session: str = "",
 ) -> int:
     """Print a formatted progress report with velocity and completion stats.
 
-    Accepts scope-filter flags (spec section 4.2.2, AC-190-10, AC-190-11):
+    Accepts scope-filter flags (spec section 4.2.2, AC-190-10, AC-190-11)
+    and a named-session filter flag (spec section 4.4.6, AC-192-12, AC-192-13):
 
     - ``include`` -- raw ``--include`` token string; one-off include selector
       that overrides any active scope.json when non-empty.
     - ``exclude`` -- raw ``--exclude`` token string; one-off exclude selector.
+    - ``session`` -- named-session filter; restricts the report to WUs claimed
+      by that session and reads from the per-session orchestrator log.  Without
+      this flag, all sessions are aggregated.
 
-    When neither flag is supplied, the active ``scope.json`` (if any) is
-    consulted instead.  In either case, a ``SCOPE: include=[...] exclude=[...]
-    (started ...)`` banner is printed above the report body, and the WU
-    lists shown in the report are filtered to the resolved scope.
+    When neither ``--include`` nor ``--exclude`` is supplied, the active
+    ``scope.json`` (if any) is consulted instead.  In either case, a
+    ``SCOPE: include=[...] exclude=[...] (started ...)`` banner is printed
+    above the report body, and the WU lists shown in the report are filtered
+    to the resolved scope.
 
     Issue #163: streams continuously by default when stdout is a TTY.
     Pass ``once=True`` (or pipe / redirect stdout) to get the legacy
@@ -2421,14 +2453,28 @@ def cmd_report(
         once: When ``True``, forces one-shot rendering regardless of TTY.
         include: Raw ``--include`` token string (empty = not supplied).
         exclude: Raw ``--exclude`` token string (empty = not supplied).
+        session: Named-session name from ``--session <name>`` (empty = not
+            supplied, AC-192-12).  When non-empty, the report is filtered to
+            that session's WUs and event-index queries read from the
+            per-session log.
 
     Returns:
-        ``0`` on success; ``1`` on scope-resolution error.
+        ``0`` on success; ``1`` on scope-resolution error or missing session.
     """
     import warnings as _warnings
     from datetime import datetime
 
     from devbench.reporting.report import generate_report
+
+    # AC-192-12: resolve per-session log when --session is provided.
+    session_name: str | None = session if session else None
+    if session_name is not None:
+        session_log = _resolve_session_report_log(session_name)
+        if session_log is None:
+            return 1
+        log_file: Path = session_log
+    else:
+        log_file = _resolve_log_file_path()
 
     # Resolve scope (AC-190-10, AC-190-11): per-command flags take
     # precedence over an active scope.json; when neither is present,
@@ -2445,8 +2491,6 @@ def cmd_report(
             include=scope.include,
             exclude=scope.exclude,
         )
-
-    log_file = _resolve_log_file_path()
 
     since_dt = None
     if since:
@@ -2471,16 +2515,22 @@ def cmd_report(
         # missing, or invalidated by a schema-version mismatch. The
         # ``--since`` path always recomputes because a frozen-window
         # snapshot is never the right answer for a custom-window query.
-        # When a scope filter is active, bypass the snapshot (the
-        # snapshot was rendered against the full backlog, not the scope).
-        if since_dt is None and scope_filter is None:
+        # When a scope filter or session filter is active, bypass the
+        # snapshot (the snapshot was rendered against the full backlog
+        # and the aggregate log, not a session-specific view).
+        if since_dt is None and scope_filter is None and session_name is None:
             from devbench.reporting.snapshot import read_snapshot
 
             cached = read_snapshot(WORKSPACE_ROOT, log_file)
             if cached is not None:
                 print(cached.report_text)
                 return 0
-        report = generate_report(log_path=log_file, since=since_dt, scope_filter=scope_filter)
+        report = generate_report(
+            log_path=log_file,
+            since=since_dt,
+            scope_filter=scope_filter,
+            session_name=session_name,
+        )
         print(report)
         return 0
 
@@ -2505,6 +2555,7 @@ def cmd_report(
             since=since_dt,
             report_started_at=report_started_at,
             scope_filter=scope_filter,
+            session_name=session_name,
         )
 
     return stream_report(log_file, _render)
@@ -8284,44 +8335,53 @@ def _extract_once_flag(raw_args: list[str]) -> tuple[bool, list[str]]:
 
 def _extract_scope_flags_for_report(
     raw_args: list[str],
-) -> tuple[str, str, list[str]]:
-    """Strip ``--include`` and ``--exclude`` from report args.
+) -> tuple[str, str, str, list[str]]:
+    """Strip ``--include``, ``--exclude``, and ``--session`` from report args.
 
-    Returns ``(include, exclude, remaining_args)`` after consuming the
-    ``--include <tokens>`` and ``--exclude <tokens>`` flag pairs.  Any
-    positional argument that is not a recognised flag (i.e. the ``since``
-    timestamp) is preserved in ``remaining_args``.
+    Returns ``(include, exclude, session, remaining_args)`` after consuming the
+    ``--include <tokens>``, ``--exclude <tokens>``, and ``--session <name>``
+    flag pairs.  Any positional argument that is not a recognised flag (i.e.
+    the ``since`` timestamp) is preserved in ``remaining_args``.
 
-    Spec section 4.2.2 (AC-190-10, AC-190-11): ``cmd_report`` accepts
-    ``--include`` / ``--exclude`` as one-off scope overrides.
+    Spec sections 4.2.2 and 4.4.6 (AC-190-10, AC-190-11, AC-192-12):
+    ``cmd_report`` accepts ``--include`` / ``--exclude`` as one-off scope
+    overrides and ``--session <name>`` to filter to a named session.
 
     Args:
         raw_args: Argument list after ``--watch`` and ``--once`` have
             already been stripped.
 
     Returns:
-        A three-tuple ``(include, exclude, remaining_args)`` where
-        ``include`` and ``exclude`` are raw token strings (empty when not
-        supplied) and ``remaining_args`` contains every arg not consumed
-        by the scope flags.
+        A four-tuple ``(include, exclude, session, remaining_args)`` where
+        ``include``, ``exclude``, and ``session`` are raw token strings (empty
+        when not supplied) and ``remaining_args`` contains every arg not
+        consumed by the flags.
     """
     include = ""
     exclude = ""
+    session = ""
     filtered: list[str] = []
     i = 0
     while i < len(raw_args):
         arg = raw_args[i]
-        if arg in ("--include", "--exclude") and i + 1 < len(raw_args):
-            value = raw_args[i + 1]
+        if arg in ("--include", "--exclude", "--session") and i + 1 < len(raw_args):
+            next_val = raw_args[i + 1]
+            if next_val.startswith("--"):
+                # Next token is another flag -- do not consume it as a value.
+                filtered.append(arg)
+                i += 1
+                continue
             if arg == "--include":
-                include = value
+                include = next_val
+            elif arg == "--exclude":
+                exclude = next_val
             else:
-                exclude = value
+                session = next_val
             i += 2
             continue
         filtered.append(arg)
         i += 1
-    return include, exclude, filtered
+    return include, exclude, session, filtered
 
 
 def _dispatch_watch_commands(
@@ -8331,12 +8391,13 @@ def _dispatch_watch_commands(
     once: bool = False,
     include: str = "",
     exclude: str = "",
+    session: str = "",
 ) -> int | None:
     """Dispatch the ``report`` and ``watch`` commands. Return ``None`` if not handled.
 
     The ``report`` command is always dispatched here (not via the generic
     ``func(*sliced_args)`` path) so that ``include`` / ``exclude`` scope flags
-    are forwarded as keyword arguments to :func:`cmd_report`.
+    and ``session`` are forwarded as keyword arguments to :func:`cmd_report`.
 
     Args:
         command: The devbench subcommand name.
@@ -8346,6 +8407,8 @@ def _dispatch_watch_commands(
         once: Whether ``--once`` / ``--no-stream`` was supplied.
         include: Raw ``--include`` token string forwarded to ``cmd_report``.
         exclude: Raw ``--exclude`` token string forwarded to ``cmd_report``.
+        session: Named-session filter string forwarded to ``cmd_report``
+            (spec section 4.4.6, AC-192-12).  Empty string means no filter.
 
     Returns:
         The command's integer exit code, or ``None`` when the command is
@@ -8353,7 +8416,14 @@ def _dispatch_watch_commands(
     """
     if command == "report":
         since_arg = args[0] if args else ""
-        return cmd_report(since=since_arg, watch_interval=watch_interval, once=once, include=include, exclude=exclude)
+        return cmd_report(
+            since=since_arg,
+            watch_interval=watch_interval,
+            once=once,
+            include=include,
+            exclude=exclude,
+            session=session,
+        )
     if command == "watch" and watch_interval > 0:
         return cmd_watch(watch_interval=watch_interval)
     return None
@@ -8396,18 +8466,22 @@ def main() -> int:
     once = False
     include = ""
     exclude = ""
+    session = ""
     if command == "report":
         once, args = _extract_once_flag(args)
         # Issue #190 (AC-190-10, AC-190-11): strip ``--include`` / ``--exclude``
         # scope-filter flags before the remaining positional ``since`` arg is
         # resolved. The extracted strings are forwarded to ``cmd_report``.
-        include, exclude, args = _extract_scope_flags_for_report(args)
+        # AC-192-12: also strip ``--session <name>`` for per-session filtering.
+        include, exclude, session, args = _extract_scope_flags_for_report(args)
 
     if len(args) < min_args:
         print(f"Command '{command}' requires at least {min_args} argument(s)", file=sys.stderr)
         return 1
 
-    watch_rc = _dispatch_watch_commands(command, watch_interval, args, once=once, include=include, exclude=exclude)
+    watch_rc = _dispatch_watch_commands(
+        command, watch_interval, args, once=once, include=include, exclude=exclude, session=session
+    )
     if watch_rc is not None:
         return watch_rc
 

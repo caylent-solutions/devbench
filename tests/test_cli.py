@@ -4714,7 +4714,7 @@ class TestMainWatchFlagParsing:
             result = cli.main()
 
         assert result == 0
-        mock_report.assert_called_once_with(since="", watch_interval=10, once=False, include="", exclude="")
+        mock_report.assert_called_once_with(since="", watch_interval=10, once=False, include="", exclude="", session="")
 
     def test_short_watch_flag_extracted(self) -> None:
         """-w <N> is equivalent to --watch <N>."""
@@ -4725,7 +4725,7 @@ class TestMainWatchFlagParsing:
             result = cli.main()
 
         assert result == 0
-        mock_report.assert_called_once_with(since="", watch_interval=3, once=False, include="", exclude="")
+        mock_report.assert_called_once_with(since="", watch_interval=3, once=False, include="", exclude="", session="")
 
     def test_watch_flag_with_since_arg(self) -> None:
         """--watch is separated from the since timestamp argument."""
@@ -4737,7 +4737,7 @@ class TestMainWatchFlagParsing:
 
         assert result == 0
         mock_report.assert_called_once_with(
-            since="2025-01-15T10:30:00Z", watch_interval=5, once=False, include="", exclude=""
+            since="2025-01-15T10:30:00Z", watch_interval=5, once=False, include="", exclude="", session=""
         )
 
     def test_once_flag_extracted_from_args(self) -> None:
@@ -4749,7 +4749,7 @@ class TestMainWatchFlagParsing:
             result = cli.main()
 
         assert result == 0
-        mock_report.assert_called_once_with(since="", watch_interval=0, once=True, include="", exclude="")
+        mock_report.assert_called_once_with(since="", watch_interval=0, once=True, include="", exclude="", session="")
 
     def test_no_stream_alias_extracted(self) -> None:
         """Issue #163: --no-stream is an accepted alias for --once."""
@@ -4760,7 +4760,7 @@ class TestMainWatchFlagParsing:
             result = cli.main()
 
         assert result == 0
-        mock_report.assert_called_once_with(since="", watch_interval=0, once=True, include="", exclude="")
+        mock_report.assert_called_once_with(since="", watch_interval=0, once=True, include="", exclude="", session="")
 
     def test_report_without_watch_dispatches_normally(self) -> None:
         """report without --watch routes directly to cmd_report with scope kwargs.
@@ -4776,7 +4776,7 @@ class TestMainWatchFlagParsing:
             result = cli.main()
 
         assert result == 0
-        mock_report.assert_called_once_with(since="", watch_interval=0, once=False, include="", exclude="")
+        mock_report.assert_called_once_with(since="", watch_interval=0, once=False, include="", exclude="", session="")
 
 
 class TestMainExtraArgsWarning:
@@ -17341,3 +17341,176 @@ class TestCmdStatusSessionAggregation:
         total_lines = [l for l in out.splitlines() if "TOTAL" in l]
         assert total_lines
         assert "3" in total_lines[0]
+
+
+# AC-192-12 / AC-192-13: cmd_report --session flag (E4-F6-S1-T2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestExtractScopeFlagsForReportSession:
+    """_extract_scope_flags_for_report strips --session and returns the session name."""
+
+    def test_session_flag_is_extracted(self) -> None:
+        """--session <name> is stripped and returned as session string."""
+        include, exclude, session, remaining = cli._extract_scope_flags_for_report(
+            ["--session", "alpha", "2026-01-01T00:00:00Z"]
+        )
+        assert session == "alpha"
+        assert include == ""
+        assert exclude == ""
+        assert remaining == ["2026-01-01T00:00:00Z"]
+
+    def test_session_flag_without_value_is_preserved_as_remaining(self) -> None:
+        """--session at end of list with no following value is left in remaining_args."""
+        include, exclude, session, remaining = cli._extract_scope_flags_for_report(["--session"])
+        assert session == ""
+        assert "--session" in remaining
+
+    def test_session_combined_with_include_exclude(self) -> None:
+        """--session, --include, and --exclude can all be extracted together."""
+        include, exclude, session, remaining = cli._extract_scope_flags_for_report(
+            ["--include", "E1", "--exclude", "E2", "--session", "beta"]
+        )
+        assert include == "E1"
+        assert exclude == "E2"
+        assert session == "beta"
+        assert remaining == []
+
+    def test_no_session_flag_returns_empty_session(self) -> None:
+        """Without --session the returned session string is empty."""
+        include, exclude, session, remaining = cli._extract_scope_flags_for_report(["--include", "E1"])
+        assert session == ""
+        assert include == "E1"
+        assert remaining == []
+
+    def test_session_value_starting_with_dash_is_not_extracted(self) -> None:
+        """--session followed by another flag (starts with '--') is left in remaining."""
+        include, exclude, session, remaining = cli._extract_scope_flags_for_report(["--session", "--include"])
+        assert session == ""
+        assert "--session" in remaining
+
+
+@pytest.mark.unit
+class TestCmdReportSessionFlag:
+    """cmd_report --session <name> resolves per-session log and filters WUs."""
+
+    def test_session_kwarg_passed_to_generate_report(self, tmp_path: Path) -> None:
+        """cmd_report(session='alpha') passes session_name='alpha' to generate_report."""
+        captured: dict = {}
+
+        def fake_generate_report(**kwargs: object) -> str:
+            captured.update(kwargs)
+            return "report"
+
+        session_log = tmp_path / ".devbench" / "sessions" / "alpha" / "orchestrator.log"
+        session_log.parent.mkdir(parents=True)
+        session_log.write_text("")
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.reporting.report.generate_report", side_effect=fake_generate_report),
+        ):
+            rc = cli.cmd_report(session="alpha")
+
+        assert rc == 0
+        assert captured.get("session_name") == "alpha"
+
+    def test_session_kwarg_resolves_session_log_path(self, tmp_path: Path) -> None:
+        """cmd_report(session='alpha') passes the per-session log path to generate_report."""
+        captured: dict = {}
+
+        def fake_generate_report(**kwargs: object) -> str:
+            captured.update(kwargs)
+            return "report"
+
+        session_log = tmp_path / ".devbench" / "sessions" / "alpha" / "orchestrator.log"
+        session_log.parent.mkdir(parents=True)
+        session_log.write_text("")
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.reporting.report.generate_report", side_effect=fake_generate_report),
+        ):
+            rc = cli.cmd_report(session="alpha")
+
+        assert rc == 0
+        assert captured["log_path"] == session_log
+
+    def test_no_session_kwarg_uses_default_log(self) -> None:
+        """cmd_report without session uses the default log path (no session filtering)."""
+        captured: dict = {}
+
+        def fake_generate_report(**kwargs: object) -> str:
+            captured.update(kwargs)
+            return "report"
+
+        with patch("devbench.reporting.report.generate_report", side_effect=fake_generate_report):
+            rc = cli.cmd_report()
+
+        assert rc == 0
+        assert captured.get("session_name") is None
+
+    def test_session_nonexistent_log_exits_with_error(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """cmd_report(session='missing') fails with rc=1 when the session log does not exist."""
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_report(session="missing")
+
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "missing" in err
+
+    def test_session_streaming_path_passes_session_name_to_render(self, tmp_path: Path) -> None:
+        """On a TTY, the streaming render closure forwards session_name to generate_report."""
+        captured: dict = {}
+
+        def fake_generate_report(**kwargs: object) -> str:
+            captured.update(kwargs)
+            return "frame"
+
+        def fake_stream_report(log_path: object, render_fn: Any, **kwargs: object) -> int:
+            # Invoke the render closure to capture what it passes to generate_report.
+            render_fn(log_path=log_path)
+            return 0
+
+        session_log = tmp_path / ".devbench" / "sessions" / "gamma" / "orchestrator.log"
+        session_log.parent.mkdir(parents=True)
+        session_log.write_text("")
+
+        with (
+            patch("sys.stdout.isatty", return_value=True),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.reporting.report.generate_report", side_effect=fake_generate_report),
+            patch("devbench.reporting.streaming.stream_report", side_effect=fake_stream_report),
+        ):
+            rc = cli.cmd_report(session="gamma")
+
+        assert rc == 0
+        assert captured.get("session_name") == "gamma"
+
+
+@pytest.mark.unit
+class TestDispatchWatchCommandsSession:
+    """_dispatch_watch_commands forwards session kwarg to cmd_report (E4-F6-S1-T2)."""
+
+    def test_session_kwarg_forwarded_to_cmd_report(self, tmp_path: Path) -> None:
+        """_dispatch_watch_commands forwards session='alpha' to cmd_report."""
+        captured: dict = {}
+
+        def fake_cmd_report(**kwargs: object) -> int:
+            captured.update(kwargs)
+            return 0
+
+        with patch("devbench.cli.cmd_report", side_effect=fake_cmd_report):
+            rc = cli._dispatch_watch_commands(
+                command="report",
+                watch_interval=0,
+                args=[],
+                once=True,
+                include="",
+                exclude="",
+                session="alpha",
+            )
+
+        assert rc == 0
+        assert captured.get("session") == "alpha"

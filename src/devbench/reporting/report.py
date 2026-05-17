@@ -53,7 +53,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from devbench.backlog.parser import BacklogParser
-from devbench.backlog.work_unit import WorkUnitStatus, WorkUnitType
+from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
 from devbench.config import (
     BACKLOG_INDEX,
     BACKLOG_ROOT,
@@ -2203,6 +2203,75 @@ def _listing_by_status(units: list, status: WorkUnitStatus, label: str) -> list[
     return lines
 
 
+_WU_COMMENTS_SECTION_HEADER = "## Comments"
+_WU_CLAIMED_MARKER = "[WU_CLAIMED]"
+_WU_SESSION_MARKER = "session="
+
+
+def _extract_session_from_wu(wu: WorkUnit) -> str | None:
+    """Return the session name from the most recent ``[WU_CLAIMED]`` audit in a WU file.
+
+    Reads the ``## Comments`` section of *wu*'s backing Markdown file and
+    searches for lines containing ``[WU_CLAIMED]`` with a ``session=<name>``
+    token.  Returns the name from the last such line (most recent claim wins).
+    Returns ``None`` when the file does not exist, has no Comments section,
+    has no ``[WU_CLAIMED]`` line, or the line carries no ``session=`` token
+    (legacy single-session behaviour).
+
+    Args:
+        wu: The :class:`WorkUnit` whose backing file to inspect.
+
+    Returns:
+        The session name string, or ``None`` when absent.
+
+    Raises:
+        OSError: If the file exists but cannot be read (permissions, I/O error).
+    """
+    if not wu.file_path.exists():
+        return None
+    content = wu.file_path.read_text(encoding="utf-8")
+    comments_start = content.find(_WU_COMMENTS_SECTION_HEADER)
+    if comments_start == -1:
+        return None
+    comments_body = content[comments_start + len(_WU_COMMENTS_SECTION_HEADER) :]
+    session_name: str | None = None
+    for line in comments_body.splitlines():
+        if _WU_CLAIMED_MARKER not in line:
+            continue
+        idx = line.find(_WU_SESSION_MARKER)
+        if idx == -1:
+            continue
+        value_start = idx + len(_WU_SESSION_MARKER)
+        value_end = line.find(" ", value_start)
+        session_name = line[value_start:].strip() if value_end == -1 else line[value_start:value_end].strip()
+    return session_name if session_name else None
+
+
+def _filter_units_by_session(units: list[WorkUnit], session_name: str | None) -> list[WorkUnit]:
+    """Return ``units`` filtered to those claimed by ``session_name``.
+
+    When ``session_name`` is ``None``, the original list is returned unchanged
+    (aggregate view across all sessions, AC-192-13).
+
+    When ``session_name`` is provided, only work units whose most recent
+    ``[WU_CLAIMED]`` audit names that session are included (AC-192-12).
+
+    Args:
+        units: Full list of parsed :class:`~devbench.backlog.work_unit.WorkUnit`
+            objects from ``BacklogParser.parse_index``.
+        session_name: Named-session filter.  Pass ``None`` to skip filtering.
+
+    Returns:
+        A (possibly shorter) list preserving original order.
+
+    Raises:
+        OSError: If any WU file exists but cannot be read (permissions, I/O error).
+    """
+    if session_name is None:
+        return units
+    return [u for u in units if _extract_session_from_wu(u) == session_name]
+
+
 def _filter_units_by_scope(units: list, scope_filter: ScopeFilter | None) -> list:
     """Return ``units`` filtered to those allowed by ``scope_filter``.
 
@@ -2248,11 +2317,15 @@ def generate_report(
     since: datetime | None = None,
     report_started_at: datetime | None = None,
     scope_filter: ScopeFilter | None = None,
+    session_name: str | None = None,
 ) -> str:
     """Generate a formatted progress report.
 
     Args:
-        log_path: Path to the orchestrator log file.
+        log_path: Path to the orchestrator log file.  When ``session_name`` is
+            provided, the caller is expected to pass the per-session log path
+            (``<workspace>/.devbench/sessions/<name>/orchestrator.log``); the
+            event-index queries then operate on that file's events only.
         since: If provided, render a single window starting at this timestamp.
             If omitted, render All-time + Current session, plus This run when
             ``report_started_at`` is also provided (watch mode).
@@ -2266,6 +2339,12 @@ def generate_report(
             ``expanded_ids`` is re-expanded from its ``include`` / ``exclude``
             token lists against the parsed backlog before filtering.  Pass
             ``None`` (default) to include all work units.
+        session_name: Optional named-session filter (spec section 4.4.6,
+            AC-192-12, AC-192-13).  When provided, only work units whose most
+            recent ``[WU_CLAIMED]`` audit names this session are counted and
+            listed in the report.  Pass ``None`` (default) to aggregate across
+            all sessions.  Composes with ``scope_filter``: both filters are
+            applied in sequence (session filter first, then scope filter).
 
     Returns:
         Formatted report string ready for terminal output.
@@ -2274,6 +2353,7 @@ def generate_report(
         SystemExit(1): If the backlog cannot be read or parsed.
         InvalidScopeError: If ``scope_filter`` token lists contain
             structurally invalid tokens (reversed ranges, etc.).
+        OSError: If a WU backing file cannot be read during session filtering.
     """
     # Operator-alive banner (issue #161). Prepended to every render so
     # ``devbench report --watch N`` shows liveness state on every tick.
@@ -2343,6 +2423,11 @@ def generate_report(
             "  Run `devbench validate-backlog` for a full list of issues with the index.\n"
         )
         sys.exit(1)
+
+    # AC-192-12 / AC-192-13: apply session filter first when provided, then scope.
+    # Session filter restricts to WUs claimed by the named session; without it,
+    # all sessions are aggregated (AC-192-13).
+    units = _filter_units_by_session(units, session_name)
 
     # Issue #190 (AC-190-10, AC-190-11): apply scope filter when provided.
     units = _filter_units_by_scope(units, scope_filter)

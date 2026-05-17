@@ -3671,3 +3671,201 @@ class TestGenerateReportScopeFilter:
         unit_ids = [u.id for u in captured_units]
         assert "E1-F1-S1-T1" in unit_ids
         assert not any(uid.startswith("E2") for uid in unit_ids)
+
+
+# AC-192-12 / AC-192-13: generate_report session_name parameter (E4-F6-S1-T2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestGenerateReportSessionFilter:
+    """generate_report correctly filters work units when session_name is provided.
+
+    AC-192-12: Session-filtered report works correctly.
+    AC-192-13: Aggregated report (no session_name) sums correctly across sessions.
+    """
+
+    # ------------------------------------------------------------------ helpers
+
+    @staticmethod
+    def _make_unit(uid: str, status: WorkUnitStatus, tmp_path: Path, session: str | None) -> WorkUnit:
+        """Build a TASK WorkUnit with a backing WU file containing an optional session= claim."""
+        wu_file = tmp_path / f"{uid}.md"
+        claim_line = f"[WU_CLAIMED] Set {uid} to 'in-progress'"
+        if session:
+            claim_line += f" session={session}"
+        content = (
+            f"# {uid}: Test\n\n"
+            f"## Status: {status.value}\n\n"
+            "## Comments\n\n"
+            f"[2026-05-17 00:05 UTC] [agent/orchestrator] {claim_line}\n"
+        )
+        wu_file.write_text(content, encoding="utf-8")
+        return WorkUnit(
+            id=uid,
+            title=f"task-{uid}",
+            status=status,
+            unit_type=WorkUnitType.TASK,
+            file_path=wu_file,
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+
+    @staticmethod
+    def _make_fake_backlog_totals(tasks_total: int) -> object:
+        """Build a minimal _BacklogTotals stub."""
+        from devbench.reporting.report import _BacklogTotals
+
+        return _BacklogTotals(
+            tasks_total=tasks_total,
+            tasks_done=0,
+            units_total=tasks_total,
+            units_done=0,
+            stories_done=0,
+            features_done=0,
+            epics_done=0,
+            tasks_remaining=0,
+            tasks_blocked=0,
+            tasks_active=0,
+            tasks_in_progress=0,
+            tasks_in_queue=0,
+            tasks_in_review=0,
+            tasks_proposed=0,
+            tasks_declined=0,
+        )
+
+    def _units(self, tmp_path: Path) -> list[WorkUnit]:
+        """Return three units across two sessions plus one with no session."""
+        return [
+            self._make_unit("E1-F1-S1-T1", WorkUnitStatus.DONE, tmp_path, session="alpha"),
+            self._make_unit("E2-F1-S1-T1", WorkUnitStatus.IN_QUEUE, tmp_path, session="beta"),
+            self._make_unit("E2-F1-S1-T2", WorkUnitStatus.IN_PROGRESS, tmp_path, session="beta"),
+            self._make_unit("E3-F1-S1-T1", WorkUnitStatus.IN_QUEUE, tmp_path, session=None),
+        ]
+
+    # ------------------------------------------------------------------ AC-192-12: session filter
+
+    def test_session_name_filters_units_to_matching_session(self, tmp_path: Path) -> None:
+        """generate_report(session_name='alpha') passes only alpha-session WUs to aggregation."""
+        log_file = tmp_path / "test.log"
+        log_file.write_text("")
+
+        captured_units: list = []
+
+        def fake_backlog_totals(units: list) -> object:
+            captured_units.extend(units)
+            return self._make_fake_backlog_totals(len(units))
+
+        with (
+            patch("devbench.reporting.report.BacklogParser") as mock_cls,
+            patch("devbench.reporting.report._backlog_totals_from_units", side_effect=fake_backlog_totals),
+        ):
+            mock_cls.return_value.parse_index.return_value = self._units(tmp_path)
+            generate_report(log_path=log_file, session_name="alpha")
+
+        unit_ids = [u.id for u in captured_units]
+        assert "E1-F1-S1-T1" in unit_ids
+        assert "E2-F1-S1-T1" not in unit_ids
+        assert "E2-F1-S1-T2" not in unit_ids
+        assert "E3-F1-S1-T1" not in unit_ids
+
+    def test_session_name_beta_filters_to_beta_units(self, tmp_path: Path) -> None:
+        """generate_report(session_name='beta') passes only beta-session WUs to aggregation."""
+        log_file = tmp_path / "test.log"
+        log_file.write_text("")
+
+        captured_units: list = []
+
+        def fake_backlog_totals(units: list) -> object:
+            captured_units.extend(units)
+            return self._make_fake_backlog_totals(len(units))
+
+        with (
+            patch("devbench.reporting.report.BacklogParser") as mock_cls,
+            patch("devbench.reporting.report._backlog_totals_from_units", side_effect=fake_backlog_totals),
+        ):
+            mock_cls.return_value.parse_index.return_value = self._units(tmp_path)
+            generate_report(log_path=log_file, session_name="beta")
+
+        unit_ids = [u.id for u in captured_units]
+        assert "E2-F1-S1-T1" in unit_ids
+        assert "E2-F1-S1-T2" in unit_ids
+        assert "E1-F1-S1-T1" not in unit_ids
+        assert "E3-F1-S1-T1" not in unit_ids
+
+    def test_session_name_nonexistent_yields_empty_unit_set(self, tmp_path: Path) -> None:
+        """generate_report(session_name='missing') passes empty list to aggregation."""
+        log_file = tmp_path / "test.log"
+        log_file.write_text("")
+
+        captured_units: list = []
+
+        def fake_backlog_totals(units: list) -> object:
+            captured_units.extend(units)
+            return self._make_fake_backlog_totals(len(units))
+
+        with (
+            patch("devbench.reporting.report.BacklogParser") as mock_cls,
+            patch("devbench.reporting.report._backlog_totals_from_units", side_effect=fake_backlog_totals),
+        ):
+            mock_cls.return_value.parse_index.return_value = self._units(tmp_path)
+            generate_report(log_path=log_file, session_name="missing")
+
+        assert captured_units == []
+
+    # ------------------------------------------------------------------ AC-192-13: aggregation (no session)
+
+    def test_session_name_none_includes_all_units(self, tmp_path: Path) -> None:
+        """generate_report(session_name=None) passes all WUs to aggregation (no filtering)."""
+        log_file = tmp_path / "test.log"
+        log_file.write_text("")
+
+        captured_units: list = []
+
+        def fake_backlog_totals(units: list) -> object:
+            captured_units.extend(units)
+            return self._make_fake_backlog_totals(len(units))
+
+        with (
+            patch("devbench.reporting.report.BacklogParser") as mock_cls,
+            patch("devbench.reporting.report._backlog_totals_from_units", side_effect=fake_backlog_totals),
+        ):
+            mock_cls.return_value.parse_index.return_value = self._units(tmp_path)
+            generate_report(log_path=log_file, session_name=None)
+
+        unit_ids = [u.id for u in captured_units]
+        assert "E1-F1-S1-T1" in unit_ids
+        assert "E2-F1-S1-T1" in unit_ids
+        assert "E2-F1-S1-T2" in unit_ids
+        assert "E3-F1-S1-T1" in unit_ids
+
+    # ------------------------------------------------------------------ session filter composition
+
+    def test_session_filter_and_scope_filter_compose(self, tmp_path: Path) -> None:
+        """session_name and scope_filter compose correctly (intersection)."""
+        from devbench.scope import ScopeFilter
+
+        log_file = tmp_path / "test.log"
+        log_file.write_text("")
+
+        all_units = self._units(tmp_path)
+        all_ids = [u.id for u in all_units]
+        # Scope includes E1 only; session beta includes E2 units only.
+        # Intersection should be empty.
+        sf = ScopeFilter.parse("E1", "", all_ids)
+
+        captured_units: list = []
+
+        def fake_backlog_totals(units: list) -> object:
+            captured_units.extend(units)
+            return self._make_fake_backlog_totals(len(units))
+
+        with (
+            patch("devbench.reporting.report.BacklogParser") as mock_cls,
+            patch("devbench.reporting.report._backlog_totals_from_units", side_effect=fake_backlog_totals),
+        ):
+            mock_cls.return_value.parse_index.return_value = all_units
+            generate_report(log_path=log_file, session_name="beta", scope_filter=sf)
+
+        # E1 is alpha session; beta session has E2 units but scope only allows E1 -- no overlap.
+        assert captured_units == []

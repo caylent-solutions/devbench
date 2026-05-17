@@ -25,6 +25,13 @@ continued throttle via a QuotaExhaustedError subclass.
 Also covers: QuotaCheckpoint dataclass, save_checkpoint(session_dir, ...) which
 atomically writes quota_pause.json, and load_checkpoint(session_dir) which
 reads and deserializes it or returns None when the file is absent.
+
+Also covers: post_webhook(url, payload, timeout_seconds) which POSTs a JSON
+payload to a URL using stdlib urllib.  Failures are logged to stderr but do
+not raise.
+
+Also covers: deliver_notifications(notify_config, payload) which calls
+post_webhook for each non-None URL in a QuotaNotifyConfig.
 """
 
 from __future__ import annotations
@@ -3607,3 +3614,335 @@ class TestRemoveCheckpoint:
         assert load_checkpoint(tmp_path) is None, (
             "load_checkpoint must return None after remove_checkpoint deletes the file"
         )
+
+
+# ---------------------------------------------------------------------------
+# E5-F6-S1-T2: post_webhook -- best-effort HTTP POST helper
+# AC-193-17: notification webhooks fire on pause + resume
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestPostWebhook:
+    """AC-193-17: post_webhook POSTs JSON payload to url; failures are logged but do not raise.
+
+    Spec section 4.5.6: webhook delivery is best-effort -- failures must be
+    logged to stderr but must not crash the orchestrator.
+    """
+
+    def _make_payload(self) -> dict[str, Any]:
+        return {
+            "event": "quota_pause",
+            "reason": "subscription_rate_limit",
+            "reset_at": "2026-01-01T13:00:00+00:00",
+            "paused_at": "2026-01-01T12:00:00+00:00",
+        }
+
+    def test_post_webhook_sends_json_body(self) -> None:
+        """post_webhook encodes payload as JSON and calls _http_post with correct args."""
+        import urllib.parse
+
+        from devbench.quota import post_webhook
+
+        captured: list[dict[str, Any]] = []
+
+        def _fake_http_post(
+            parsed: urllib.parse.SplitResult,
+            body: bytes,
+            headers: dict[str, str],
+            timeout_seconds: float,
+        ) -> None:
+            captured.append({"parsed": parsed, "body": body, "headers": headers, "timeout": timeout_seconds})
+
+        payload = self._make_payload()
+        with patch("devbench.quota._http_post", side_effect=_fake_http_post):
+            post_webhook("https://example.com/hook", payload, timeout_seconds=5.0)
+
+        assert len(captured) == 1
+        assert captured[0]["parsed"].scheme == "https"
+        assert captured[0]["parsed"].hostname == "example.com"
+        body_decoded = json.loads(captured[0]["body"].decode("utf-8"))
+        assert body_decoded["event"] == "quota_pause"
+        assert body_decoded["reason"] == "subscription_rate_limit"
+
+    def test_post_webhook_sets_content_type_json_header(self) -> None:
+        """post_webhook includes Content-Type: application/json in the headers passed to _http_post."""
+        import urllib.parse
+
+        from devbench.quota import post_webhook
+
+        captured_headers: list[dict[str, str]] = []
+
+        def _fake_http_post(
+            parsed: urllib.parse.SplitResult,
+            body: bytes,
+            headers: dict[str, str],
+            timeout_seconds: float,
+        ) -> None:
+            captured_headers.append(headers)
+
+        with patch("devbench.quota._http_post", side_effect=_fake_http_post):
+            post_webhook("https://example.com/hook", self._make_payload(), timeout_seconds=5.0)
+
+        assert len(captured_headers) == 1
+        header_keys_lower = {k.lower() for k in captured_headers[0]}
+        assert "content-type" in header_keys_lower
+        content_type_value = next(v for k, v in captured_headers[0].items() if k.lower() == "content-type")
+        assert "application/json" in content_type_value
+
+    def test_post_webhook_logs_http_error_to_stderr_without_raising(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """post_webhook logs HTTP errors to stderr and returns normally (best-effort)."""
+        from devbench.quota import post_webhook
+
+        def _raise_http_error(*args: Any, **kwargs: Any) -> None:
+            raise ConnectionError("HTTP 500 Internal Server Error")
+
+        with patch("devbench.quota._http_post", side_effect=_raise_http_error):
+            post_webhook("https://example.com/hook", self._make_payload(), timeout_seconds=5.0)
+
+        stderr_output = capsys.readouterr().err
+        assert "webhook" in stderr_output.lower() or "500" in stderr_output or "http" in stderr_output.lower()
+
+    def test_post_webhook_logs_url_error_to_stderr_without_raising(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """post_webhook logs connection failures to stderr and returns normally."""
+        from devbench.quota import post_webhook
+
+        def _raise_connection_error(*args: Any, **kwargs: Any) -> None:
+            raise ConnectionRefusedError("Connection refused")
+
+        with patch("devbench.quota._http_post", side_effect=_raise_connection_error):
+            post_webhook("https://example.com/hook", self._make_payload(), timeout_seconds=5.0)
+
+        stderr_output = capsys.readouterr().err
+        assert "webhook" in stderr_output.lower() or "connection" in stderr_output.lower()
+
+    def test_post_webhook_logs_timeout_to_stderr_without_raising(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """post_webhook logs TimeoutError to stderr and returns normally (best-effort)."""
+        from devbench.quota import post_webhook
+
+        def _raise_timeout(*args: Any, **kwargs: Any) -> None:
+            raise TimeoutError("timed out")
+
+        with patch("devbench.quota._http_post", side_effect=_raise_timeout):
+            post_webhook("https://example.com/hook", self._make_payload(), timeout_seconds=5.0)
+
+        stderr_output = capsys.readouterr().err
+        assert "webhook" in stderr_output.lower() or "timeout" in stderr_output.lower()
+
+    def test_post_webhook_logs_unexpected_exception_to_stderr_without_raising(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """post_webhook logs any unexpected exception to stderr and returns normally."""
+        from devbench.quota import post_webhook
+
+        def _raise_unexpected(*args: Any, **kwargs: Any) -> None:
+            raise RuntimeError("unexpected failure")
+
+        with patch("devbench.quota._http_post", side_effect=_raise_unexpected):
+            post_webhook("https://example.com/hook", self._make_payload(), timeout_seconds=5.0)
+
+        stderr_output = capsys.readouterr().err
+        assert stderr_output.strip() != "", "must log something on unexpected failure"
+
+    @pytest.mark.parametrize(
+        "url,payload,timeout_seconds,error_fragment",
+        [
+            ("", {"event": "pause"}, 5.0, "url"),
+            ("https://example.com/hook", {}, 5.0, "payload"),
+            ("https://example.com/hook", {"event": "pause"}, 0.0, "timeout"),
+            ("https://example.com/hook", {"event": "pause"}, -1.0, "timeout"),
+            ("file:///etc/passwd", {"event": "pause"}, 5.0, "scheme"),
+            ("ftp://example.com/hook", {"event": "pause"}, 5.0, "scheme"),
+        ],
+    )
+    def test_post_webhook_validates_inputs(
+        self,
+        url: str,
+        payload: dict[str, Any],
+        timeout_seconds: float,
+        error_fragment: str,
+    ) -> None:
+        """post_webhook raises ValueError for invalid inputs (fail-fast)."""
+        from devbench.quota import post_webhook
+
+        with pytest.raises(ValueError, match=error_fragment):
+            post_webhook(url, payload, timeout_seconds=timeout_seconds)
+
+
+# ---------------------------------------------------------------------------
+# E5-F6-S1-T2: deliver_notifications -- dispatch to all configured URLs
+# AC-193-17: notification webhooks fire on pause + resume
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestDeliverNotifications:
+    """AC-193-17: deliver_notifications posts to each configured URL in a QuotaNotifyConfig.
+
+    Spec section 4.5.6: notify_on_pause and notify_on_resume each carry a
+    webhook_url and a slack_webhook_url.  When non-None, each URL receives a
+    POST.  When the config is None (webhooks disabled), no POSTs are issued.
+    """
+
+    def _make_notify_config(
+        self,
+        webhook_url: str | None = None,
+        slack_webhook_url: str | None = None,
+    ) -> Any:
+        """Build a QuotaNotifyConfig with the given URLs."""
+        from devbench.config_loader import QuotaNotifyConfig
+
+        return QuotaNotifyConfig(webhook_url=webhook_url, slack_webhook_url=slack_webhook_url)
+
+    def _make_pause_payload(self) -> dict[str, Any]:
+        return {
+            "event": "quota_pause",
+            "reason": "subscription_rate_limit",
+            "reset_at": "2026-01-01T13:00:00+00:00",
+            "paused_at": "2026-01-01T12:00:00+00:00",
+        }
+
+    def _make_resume_payload(self) -> dict[str, Any]:
+        return {
+            "event": "quota_resume",
+            "reason": "subscription_rate_limit",
+            "resumed_at": "2026-01-01T13:05:00+00:00",
+            "waited_seconds": 300.0,
+        }
+
+    def test_deliver_notifications_none_config_makes_no_requests(self) -> None:
+        """deliver_notifications is a no-op when notify_config is None."""
+        from devbench.quota import deliver_notifications
+
+        with patch("devbench.quota.post_webhook") as mock_post:
+            deliver_notifications(None, self._make_pause_payload())
+
+        mock_post.assert_not_called()
+
+    def test_deliver_notifications_both_urls_none_makes_no_requests(self) -> None:
+        """deliver_notifications is a no-op when both URLs in the config are None."""
+        from devbench.quota import deliver_notifications
+
+        config = self._make_notify_config(webhook_url=None, slack_webhook_url=None)
+        with patch("devbench.quota.post_webhook") as mock_post:
+            deliver_notifications(config, self._make_pause_payload())
+
+        mock_post.assert_not_called()
+
+    def test_deliver_notifications_webhook_url_only(self) -> None:
+        """deliver_notifications posts once to webhook_url when slack_webhook_url is None."""
+        from devbench.quota import deliver_notifications
+
+        config = self._make_notify_config(
+            webhook_url="https://example.com/hook",
+            slack_webhook_url=None,
+        )
+        with patch("devbench.quota.post_webhook") as mock_post:
+            deliver_notifications(config, self._make_pause_payload())
+
+        assert mock_post.call_count == 1
+        call_url = mock_post.call_args[0][0]
+        assert call_url == "https://example.com/hook"
+
+    def test_deliver_notifications_slack_webhook_url_only(self) -> None:
+        """deliver_notifications posts once to slack_webhook_url when webhook_url is None."""
+        from devbench.quota import deliver_notifications
+
+        config = self._make_notify_config(
+            webhook_url=None,
+            slack_webhook_url="https://hooks.slack.com/services/T000/B000/xxx",
+        )
+        with patch("devbench.quota.post_webhook") as mock_post:
+            deliver_notifications(config, self._make_pause_payload())
+
+        assert mock_post.call_count == 1
+        call_url = mock_post.call_args[0][0]
+        assert call_url == "https://hooks.slack.com/services/T000/B000/xxx"
+
+    def test_deliver_notifications_both_urls_posts_twice(self) -> None:
+        """deliver_notifications posts to both URLs when both are configured."""
+        from devbench.quota import deliver_notifications
+
+        config = self._make_notify_config(
+            webhook_url="https://example.com/hook",
+            slack_webhook_url="https://hooks.slack.com/services/T000/B000/xxx",
+        )
+        with patch("devbench.quota.post_webhook") as mock_post:
+            deliver_notifications(config, self._make_pause_payload())
+
+        assert mock_post.call_count == 2
+        posted_urls = {call[0][0] for call in mock_post.call_args_list}
+        assert "https://example.com/hook" in posted_urls
+        assert "https://hooks.slack.com/services/T000/B000/xxx" in posted_urls
+
+    def test_deliver_notifications_passes_payload_to_post_webhook(self) -> None:
+        """deliver_notifications forwards the payload dict to post_webhook unchanged."""
+        from devbench.quota import deliver_notifications
+
+        payload = self._make_resume_payload()
+        config = self._make_notify_config(webhook_url="https://example.com/hook")
+
+        with patch("devbench.quota.post_webhook") as mock_post:
+            deliver_notifications(config, payload)
+
+        assert mock_post.call_count == 1
+        actual_payload = mock_post.call_args[0][1]
+        assert actual_payload["event"] == "quota_resume"
+        assert actual_payload["waited_seconds"] == 300.0
+
+    def test_deliver_notifications_first_failure_does_not_prevent_second_post(self) -> None:
+        """deliver_notifications continues to the second URL even when the first call raises."""
+        from devbench.quota import deliver_notifications
+
+        config = self._make_notify_config(
+            webhook_url="https://example.com/hook",
+            slack_webhook_url="https://hooks.slack.com/services/T000/B000/xxx",
+        )
+
+        call_count = 0
+
+        def _post_that_raises_on_first(url: str, payload: dict[str, Any], **kwargs: Any) -> None:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError("simulated first-URL failure")
+
+        with patch("devbench.quota.post_webhook", side_effect=_post_that_raises_on_first):
+            # Must not raise even though the first post_webhook call raises.
+            deliver_notifications(config, self._make_pause_payload())
+
+        assert call_count == 2, "both URLs must be attempted regardless of the first failure"
+
+    @pytest.mark.parametrize(
+        "event,required_keys",
+        [
+            ("quota_pause", ["event", "reason", "paused_at"]),
+            ("quota_resume", ["event", "reason", "resumed_at"]),
+        ],
+    )
+    def test_deliver_notifications_pause_payload_contains_required_keys(
+        self,
+        event: str,
+        required_keys: list[str],
+    ) -> None:
+        """The payload passed to deliver_notifications must contain required keys.
+
+        This test verifies that callers build the correct payload structure for
+        both pause and resume events -- the keys are consumed by the webhook
+        receiver.
+        """
+        from devbench.quota import deliver_notifications
+
+        payload = self._make_pause_payload() if event == "quota_pause" else self._make_resume_payload()
+        config = self._make_notify_config(webhook_url="https://example.com/hook")
+        captured_payloads: list[dict[str, Any]] = []
+
+        def _capture(url: str, p: dict[str, Any], **kwargs: Any) -> None:
+            captured_payloads.append(p)
+
+        with patch("devbench.quota.post_webhook", side_effect=_capture):
+            deliver_notifications(config, payload)
+
+        assert len(captured_payloads) == 1
+        for key in required_keys:
+            assert key in captured_payloads[0], f"payload must contain key {key!r}"

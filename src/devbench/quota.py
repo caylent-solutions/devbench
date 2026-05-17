@@ -48,6 +48,11 @@ Public API:
 - :func:`load_checkpoint` -- reads and deserializes ``quota_pause.json`` from
   ``<session_dir>/.devbench/``.  Returns ``None`` when the file is absent,
   raises :exc:`ValueError` when the file is present but malformed.
+- :func:`post_webhook` -- best-effort POST of a JSON payload to a single URL
+  using stdlib ``http.client``.  Failures are logged to stderr but do not raise.
+- :func:`deliver_notifications` -- dispatches a notification payload to every
+  non-``None`` URL in a :class:`~devbench.config_loader.QuotaNotifyConfig`.
+  Calls :func:`post_webhook` for each URL; best-effort per spec section 4.5.6.
 
 Raises:
     None -- this module only defines exception classes and pure-function
@@ -58,14 +63,17 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import http.client
 import json
 import secrets
+import sys
+import urllib.parse
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import anthropic
 
@@ -78,6 +86,9 @@ from devbench.constants import (
     RECOVERY_PROBE_MESSAGE_CONTENT,
     RECOVERY_PROBE_MODEL,
 )
+
+if TYPE_CHECKING:
+    from devbench.config_loader import QuotaNotifyConfig
 
 # ---------------------------------------------------------------------------
 # Protocol constants -- HTTP status codes and header/error-code identifiers
@@ -420,6 +431,18 @@ _BACKOFF_DEFAULT_JITTER: float = 0.2
 # Minimum sleep guard: prevents negative sleep durations (e.g. when reset_at
 # is already in the past).
 _MIN_SLEEP_SECONDS: float = 0.0
+
+# ---------------------------------------------------------------------------
+# Webhook notification constants
+# ---------------------------------------------------------------------------
+
+# Rule 4 exemption: constants.py amendment out of scope (source-test atomicity).
+# Default timeout for best-effort webhook POST calls (spec section 4.5.6).
+_WEBHOOK_DEFAULT_TIMEOUT_SECONDS: float = 10.0
+
+# Allowed URL schemes for webhook POSTs.  Only http and https are permitted;
+# file: and other custom schemes are disallowed (security: untrusted output sinks).
+_WEBHOOK_ALLOWED_SCHEMES: frozenset[str] = frozenset({"http", "https"})
 
 
 # ---------------------------------------------------------------------------
@@ -1028,6 +1051,169 @@ def _require_key(data: dict[str, object], key: str, path: Path) -> None:
     """
     if key not in data:
         raise ValueError(f"quota_pause.json at {path} is missing required field {key!r}.")
+
+
+# ---------------------------------------------------------------------------
+# post_webhook -- best-effort HTTP POST helper (spec section 4.5.6)
+# ---------------------------------------------------------------------------
+
+
+def post_webhook(
+    url: str,
+    payload: dict[str, Any],
+    timeout_seconds: float = _WEBHOOK_DEFAULT_TIMEOUT_SECONDS,
+) -> None:
+    """POST *payload* as JSON to *url*.  Failures are logged to stderr but do not raise.
+
+    Uses stdlib ``http.client`` directly -- no third-party HTTP library and no
+    ``urllib.request.urlopen`` (which triggers bandit B310).  Only ``http://``
+    and ``https://`` scheme URLs are accepted; other schemes raise
+    :exc:`ValueError` before any network I/O (security: untrusted output sinks
+    must not be permitted to use file: or custom scheme handlers).
+
+    Args:
+        url: The webhook URL to POST to.  Must be a non-empty ``http://`` or
+            ``https://`` URL.
+        payload: A non-empty JSON-serialisable dict to send as the request body.
+            Must contain at least one key.
+        timeout_seconds: HTTP request timeout in seconds.  Must be positive.
+            Defaults to ``_WEBHOOK_DEFAULT_TIMEOUT_SECONDS`` (10 seconds).
+
+    Raises:
+        ValueError: When *url* is empty, uses a disallowed scheme, *payload* is
+            empty, or *timeout_seconds* is not positive.  Raised before any
+            network I/O (fail-fast for invalid caller inputs).
+
+    Returns:
+        None -- always; network-level errors are logged to stderr, not raised.
+    """
+    if not url:
+        msg = f"url must be a non-empty string, got {url!r}"
+        raise ValueError(msg)
+    if not payload:
+        msg = "payload must be a non-empty dict"
+        raise ValueError(msg)
+    if timeout_seconds <= 0:
+        msg = f"timeout_seconds must be positive, got {timeout_seconds!r}"
+        raise ValueError(msg)
+
+    # Validate scheme before any network I/O: reject file: and custom handlers.
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in _WEBHOOK_ALLOWED_SCHEMES:
+        msg = f"url scheme {parsed.scheme!r} is not allowed; use one of {sorted(_WEBHOOK_ALLOWED_SCHEMES)}"
+        raise ValueError(msg)
+
+    body = json.dumps(payload).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json; charset=utf-8",
+        "Content-Length": str(len(body)),
+    }
+
+    try:
+        _http_post(parsed, body, headers, timeout_seconds)
+    except Exception as exc:
+        print(
+            f"[WARN] webhook POST to {url!r} failed: {exc!r}",
+            file=sys.stderr,
+        )
+
+
+def _http_post(
+    parsed: urllib.parse.SplitResult,
+    body: bytes,
+    headers: dict[str, str],
+    timeout_seconds: float,
+) -> None:
+    """Perform a low-level HTTP POST via ``http.client``.
+
+    Separated from :func:`post_webhook` so the network I/O is easily mockable
+    in unit tests by patching ``devbench.quota._http_post``.
+
+    Args:
+        parsed: A :class:`urllib.parse.SplitResult` for the target URL.
+            ``parsed.scheme`` must already be validated to be ``http`` or
+            ``https`` by the caller.
+        body: UTF-8 encoded JSON body bytes.
+        headers: HTTP request headers dict (must include ``Content-Type``).
+        timeout_seconds: Socket-level timeout in seconds.
+
+    Raises:
+        Exception: Any network-level exception from ``http.client``.  The
+            caller (:func:`post_webhook`) catches and logs all exceptions.
+    """
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+
+    if parsed.scheme == "https":
+        conn: http.client.HTTPConnection = http.client.HTTPSConnection(
+            parsed.hostname or "",
+            port=parsed.port,
+            timeout=timeout_seconds,
+        )
+    else:
+        conn = http.client.HTTPConnection(
+            parsed.hostname or "",
+            port=parsed.port,
+            timeout=timeout_seconds,
+        )
+
+    try:
+        conn.request("POST", path, body=body, headers=headers)
+        resp = conn.getresponse()
+        resp.read()
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# deliver_notifications -- dispatch to all configured URLs (spec section 4.5.6)
+# ---------------------------------------------------------------------------
+
+
+def deliver_notifications(
+    notify_config: QuotaNotifyConfig | None,
+    payload: dict[str, Any],
+) -> None:
+    """Dispatch *payload* to every non-``None`` URL in *notify_config*.
+
+    Calls :func:`post_webhook` for each non-``None`` URL in *notify_config*.
+    If either call to :func:`post_webhook` raises an exception, the failure is
+    swallowed (best-effort semantics per spec section 4.5.6) and delivery to the
+    remaining URLs continues.
+
+    When *notify_config* is ``None`` or all URLs within it are ``None``, the
+    function returns immediately without issuing any requests.
+
+    Args:
+        notify_config: A :class:`~devbench.config_loader.QuotaNotifyConfig`
+            with up to two webhook URLs, or ``None`` when notifications are
+            disabled.
+        payload: JSON-serialisable dict to deliver.  Must be the notification
+            payload built by the caller (e.g. pause or resume event data).
+
+    Raises:
+        None -- this function swallows all delivery failures; it is designed to
+        be called from the quota-wait protocol where a failed notification must
+        not crash the orchestrator.
+    """
+    if notify_config is None:
+        return
+
+    urls: list[str] = []
+    if notify_config.webhook_url is not None:
+        urls.append(notify_config.webhook_url)
+    if notify_config.slack_webhook_url is not None:
+        urls.append(notify_config.slack_webhook_url)
+
+    for url in urls:
+        try:
+            post_webhook(url, payload)
+        except Exception as exc:
+            print(
+                f"[WARN] deliver_notifications: failed to POST to {url!r}: {exc!r}",
+                file=sys.stderr,
+            )
 
 
 def _parse_checkpoint_dt(value: object, field_name: str, path: Path) -> datetime:

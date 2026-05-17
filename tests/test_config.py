@@ -578,46 +578,6 @@ class TestReadEnvStrict:
         """Return os.environ without both test keys and DEVBENCH_BOOTSTRAP_ENV_VAR."""
         return {k: v for k, v in os.environ.items() if k not in (self._NEW, self._LEGACY, DEVBENCH_BOOTSTRAP_ENV_VAR)}
 
-    def test_new_name_only_returns_value(self) -> None:
-        """When only the new name is set, returns its value."""
-        env = self._clean_env()
-        env[self._NEW] = "new-value"
-        with patch.dict(os.environ, env, clear=True):
-            result = config._read_env_strict(self._NEW, self._LEGACY)
-        assert result == "new-value"
-
-    def test_neither_set_returns_none(self) -> None:
-        """When neither name is set, returns None."""
-        env = self._clean_env()
-        with patch.dict(os.environ, env, clear=True):
-            result = config._read_env_strict(self._NEW, self._LEGACY)
-        assert result is None
-
-    def test_legacy_only_raises_runtime_error(self) -> None:
-        """When only the legacy name is set, raises RuntimeError with actionable message."""
-        env = self._clean_env()
-        env[self._LEGACY] = "old-value"
-        with patch.dict(os.environ, env, clear=True):
-            with pytest.raises(RuntimeError) as exc_info:
-                config._read_env_strict(self._NEW, self._LEGACY)
-        msg = str(exc_info.value)
-        assert self._LEGACY in msg
-        assert self._NEW in msg
-        assert "devbench migrate-env" in msg
-
-    def test_both_set_raises_runtime_error(self) -> None:
-        """When both names are set, legacy presence triggers the hard rejection (AC-197-3)."""
-        env = self._clean_env()
-        env[self._LEGACY] = "old-value"
-        env[self._NEW] = "new-value"
-        with patch.dict(os.environ, env, clear=True):
-            with pytest.raises(RuntimeError) as exc_info:
-                config._read_env_strict(self._NEW, self._LEGACY)
-        msg = str(exc_info.value)
-        assert self._LEGACY in msg
-        assert self._NEW in msg
-        assert "devbench migrate-env" in msg
-
     @pytest.mark.parametrize(
         "legacy_val,new_val",
         [
@@ -702,3 +662,48 @@ class TestReadEnvStrict:
         with patch.dict(os.environ, env, clear=True):
             result = config._read_env_strict(self._NEW, self._LEGACY)
         assert result is None
+
+    @pytest.mark.parametrize(
+        "new_val,legacy_val,expected_result,expect_raise",
+        [
+            # (a) new name only set -> returns value (AC-197-11 case 1)
+            ("new-value", None, "new-value", False),
+            # (b) legacy name only set -> raises RuntimeError naming both vars + devbench migrate-env (AC-197-2)
+            (None, "old-value", None, True),
+            # (c) both set -> same hard rejection as (b), legacy presence is the disqualifier (AC-197-3)
+            ("new-value", "old-value", None, True),
+            # (d) neither set -> returns None (AC-197-11 case 3)
+            (None, None, None, False),
+        ],
+        ids=["new-only-returns-value", "legacy-only-raises", "both-set-raises", "neither-returns-none"],
+    )
+    def test_four_canonical_cases(
+        self,
+        new_val: str | None,
+        legacy_val: str | None,
+        expected_result: str | None,
+        expect_raise: bool,
+    ) -> None:
+        """Parametrised over the four canonical env-var cases (AC-197-2, AC-197-3, AC-197-11).
+
+        (a) New name only set -> returns value.
+        (b) Legacy name only set -> raises RuntimeError naming both vars and 'devbench migrate-env'.
+        (c) Both names set -> same hard rejection as (b): legacy presence is the disqualifier.
+        (d) Neither set -> returns None.
+        """
+        env = self._clean_env()
+        if new_val is not None:
+            env[self._NEW] = new_val
+        if legacy_val is not None:
+            env[self._LEGACY] = legacy_val
+        with patch.dict(os.environ, env, clear=True):
+            if expect_raise:
+                with pytest.raises(RuntimeError) as exc_info:
+                    config._read_env_strict(self._NEW, self._LEGACY)
+                msg = str(exc_info.value)
+                assert self._LEGACY in msg, f"Legacy var name missing from error: {msg!r}"
+                assert self._NEW in msg, f"New var name missing from error: {msg!r}"
+                assert "devbench migrate-env" in msg, f"'devbench migrate-env' missing from error: {msg!r}"
+            else:
+                result = config._read_env_strict(self._NEW, self._LEGACY)
+                assert result == expected_result, f"Expected {expected_result!r}, got {result!r}"

@@ -12,6 +12,7 @@ import pytest
 
 from devbench import config
 from devbench.config import ALLOWED_REPOS, validate_repo
+from devbench.constants import DEVBENCH_BOOTSTRAP_ENV_VAR
 
 # ---------------------------------------------------------------------------
 # Test constants derived from the test fixture (tests/fixtures/test_devbench.yaml)
@@ -557,3 +558,147 @@ class TestAgentModelEnvOverrides:
             assert am.review_team.doc_reviewer == "opus"
             assert am.review_team.changes_manifest == "opus"
         importlib.reload(config)
+
+
+@pytest.mark.unit
+class TestReadEnvStrict:
+    """Tests for the _read_env_strict(new_name, legacy_name) helper.
+
+    Covers the three canonical cases (AC-197-11):
+      1. New-name only set -> returns value.
+      2. Legacy name set (regardless of new-name presence) -> raises RuntimeError.
+      3. Neither set -> returns None.
+    Also covers the DEVBENCH_BOOTSTRAP bypass (AC-197-7).
+    """
+
+    _NEW = "DEVBENCH_TEST_STRICT_VAR"
+    _LEGACY = "JUDGE_TEST_STRICT_VAR"
+
+    def _clean_env(self) -> dict[str, str]:
+        """Return os.environ without both test keys and DEVBENCH_BOOTSTRAP_ENV_VAR."""
+        return {k: v for k, v in os.environ.items() if k not in (self._NEW, self._LEGACY, DEVBENCH_BOOTSTRAP_ENV_VAR)}
+
+    def test_new_name_only_returns_value(self) -> None:
+        """When only the new name is set, returns its value."""
+        env = self._clean_env()
+        env[self._NEW] = "new-value"
+        with patch.dict(os.environ, env, clear=True):
+            result = config._read_env_strict(self._NEW, self._LEGACY)
+        assert result == "new-value"
+
+    def test_neither_set_returns_none(self) -> None:
+        """When neither name is set, returns None."""
+        env = self._clean_env()
+        with patch.dict(os.environ, env, clear=True):
+            result = config._read_env_strict(self._NEW, self._LEGACY)
+        assert result is None
+
+    def test_legacy_only_raises_runtime_error(self) -> None:
+        """When only the legacy name is set, raises RuntimeError with actionable message."""
+        env = self._clean_env()
+        env[self._LEGACY] = "old-value"
+        with patch.dict(os.environ, env, clear=True):
+            with pytest.raises(RuntimeError) as exc_info:
+                config._read_env_strict(self._NEW, self._LEGACY)
+        msg = str(exc_info.value)
+        assert self._LEGACY in msg
+        assert self._NEW in msg
+        assert "devbench migrate-env" in msg
+
+    def test_both_set_raises_runtime_error(self) -> None:
+        """When both names are set, legacy presence triggers the hard rejection (AC-197-3)."""
+        env = self._clean_env()
+        env[self._LEGACY] = "old-value"
+        env[self._NEW] = "new-value"
+        with patch.dict(os.environ, env, clear=True):
+            with pytest.raises(RuntimeError) as exc_info:
+                config._read_env_strict(self._NEW, self._LEGACY)
+        msg = str(exc_info.value)
+        assert self._LEGACY in msg
+        assert self._NEW in msg
+        assert "devbench migrate-env" in msg
+
+    @pytest.mark.parametrize(
+        "legacy_val,new_val",
+        [
+            ("legacy-only", None),
+            ("legacy-val", "new-val"),
+        ],
+    )
+    def test_legacy_presence_always_raises(self, legacy_val: str, new_val: str | None) -> None:
+        """Parametrised: any non-empty legacy value causes hard rejection."""
+        env = self._clean_env()
+        env[self._LEGACY] = legacy_val
+        if new_val is not None:
+            env[self._NEW] = new_val
+        with patch.dict(os.environ, env, clear=True):
+            with pytest.raises(RuntimeError, match="is no longer accepted"):
+                config._read_env_strict(self._NEW, self._LEGACY)
+
+    def test_error_message_canonical_format(self) -> None:
+        """The RuntimeError message follows the exact canonical format from AC-197-2."""
+        env = self._clean_env()
+        env[self._LEGACY] = "some-value"
+        with patch.dict(os.environ, env, clear=True):
+            with pytest.raises(RuntimeError) as exc_info:
+                config._read_env_strict(self._NEW, self._LEGACY)
+        msg = str(exc_info.value)
+        assert "is no longer accepted" in msg
+        assert "use" in msg
+        assert "devbench migrate-env" in msg
+        assert "migration shell-script" in msg
+
+    def test_bootstrap_bypass_skips_rejection(self) -> None:
+        """When DEVBENCH_BOOTSTRAP=1 is set, legacy presence does not raise (AC-197-7)."""
+        env = self._clean_env()
+        env[self._LEGACY] = "old-value"
+        env[DEVBENCH_BOOTSTRAP_ENV_VAR] = "1"
+        with patch.dict(os.environ, env, clear=True):
+            result = config._read_env_strict(self._NEW, self._LEGACY)
+        assert result is None
+
+    def test_bootstrap_bypass_returns_new_value_when_set(self) -> None:
+        """Bootstrap bypass with both names set returns the new-name value, not legacy."""
+        env = self._clean_env()
+        env[self._LEGACY] = "old-value"
+        env[self._NEW] = "new-value"
+        env[DEVBENCH_BOOTSTRAP_ENV_VAR] = "1"
+        with patch.dict(os.environ, env, clear=True):
+            result = config._read_env_strict(self._NEW, self._LEGACY)
+        assert result == "new-value"
+
+    def test_bootstrap_zero_does_not_bypass(self) -> None:
+        """DEVBENCH_BOOTSTRAP=0 must NOT activate the bypass."""
+        env = self._clean_env()
+        env[self._LEGACY] = "old-value"
+        env[DEVBENCH_BOOTSTRAP_ENV_VAR] = "0"
+        with patch.dict(os.environ, env, clear=True):
+            with pytest.raises(RuntimeError):
+                config._read_env_strict(self._NEW, self._LEGACY)
+
+    @pytest.mark.parametrize("non_one_value", ["true", "yes", "True", "YES", "on", "1 "])
+    def test_bootstrap_non_one_values_do_not_bypass(self, non_one_value: str) -> None:
+        """Only the exact string '1' activates the bypass; other truthy values must not (AC-197-7)."""
+        env = self._clean_env()
+        env[self._LEGACY] = "old-value"
+        env[DEVBENCH_BOOTSTRAP_ENV_VAR] = non_one_value
+        with patch.dict(os.environ, env, clear=True):
+            with pytest.raises(RuntimeError):
+                config._read_env_strict(self._NEW, self._LEGACY)
+
+    def test_empty_legacy_value_is_treated_as_unset(self) -> None:
+        """An empty string legacy var is treated as unset; new name is consulted."""
+        env = self._clean_env()
+        env[self._LEGACY] = ""
+        env[self._NEW] = "real-value"
+        with patch.dict(os.environ, env, clear=True):
+            result = config._read_env_strict(self._NEW, self._LEGACY)
+        assert result == "real-value"
+
+    def test_empty_new_value_with_no_legacy_returns_none(self) -> None:
+        """Empty new-name var with no legacy returns None (empty is treated as unset)."""
+        env = self._clean_env()
+        env[self._NEW] = ""
+        with patch.dict(os.environ, env, clear=True):
+            result = config._read_env_strict(self._NEW, self._LEGACY)
+        assert result is None

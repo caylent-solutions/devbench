@@ -512,6 +512,15 @@ REPORT_METRIC_COLUMN_WIDTH: int = 60
 REPORT_VALUE_COLUMN_WIDTH: int = 16
 
 # ---------------------------------------------------------------------------
+# Bootstrap bypass environment variable name (issue #197)
+# The CLI entry-point for `devbench migrate-env` sets this to '1' so that
+# config.py's _read_env_strict helper skips legacy-name rejection, allowing
+# the migrate-env subcommand to inspect legacy vars before the hard cutover.
+# Only the exact value '1' activates the bypass (AC-197-7).
+# ---------------------------------------------------------------------------
+DEVBENCH_BOOTSTRAP_ENV_VAR: str = "DEVBENCH_BOOTSTRAP"
+
+# ---------------------------------------------------------------------------
 # Time unit conversions
 # ---------------------------------------------------------------------------
 MS_PER_SECOND: int = 1000

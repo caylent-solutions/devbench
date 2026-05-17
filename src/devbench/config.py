@@ -71,6 +71,7 @@ from devbench.constants import (
     DEFAULT_TOKEN_COST_DISCOUNT,
     DEFAULT_TOKEN_COST_PER_M_INPUT,
     DEFAULT_TOKEN_COST_PER_M_OUTPUT,
+    DEVBENCH_BOOTSTRAP_ENV_VAR,
 )
 
 _log = logging.getLogger("devbench.config")
@@ -189,6 +190,48 @@ def _resolve_float(env_var: str | None, yaml_value: float | None, default: float
     if yaml_value is not None:
         return yaml_value
     return default
+
+
+def _read_env_strict(new_name: str, legacy_name: str) -> str | None:
+    """Read an env var by its new canonical name, hard-rejecting the legacy name.
+
+    This is the single canonical reader for every env-var consumption site
+    in config.py after the JUDGE_* -> DEVBENCH_* rename (issue #197).
+
+    Behaviour:
+    - If ``DEVBENCH_BOOTSTRAP=1`` is set in ``os.environ``, the legacy-name
+      check is skipped entirely so that ``devbench migrate-env`` (the one
+      subcommand that must work with legacy vars still present) can import
+      config.py without triggering the rejection. This is the ONLY bypass
+      (AC-197-7).
+    - If the legacy name is set to a non-empty value (regardless of whether
+      the new name is also set), raises ``RuntimeError`` with an actionable
+      message naming both vars and directing the operator to
+      ``devbench migrate-env`` (AC-197-2, AC-197-3).
+    - Otherwise reads the new name from ``os.environ``; returns the value
+      if set and non-empty, else returns ``None`` (AC-197-1).
+
+    Args:
+        new_name: the canonical ``DEVBENCH_*`` environment variable name.
+        legacy_name: the deprecated ``JUDGE_*`` environment variable name.
+
+    Returns:
+        The value of ``os.environ[new_name]`` when set and non-empty, or
+        ``None`` when absent / empty.
+
+    Raises:
+        RuntimeError: when ``os.environ[legacy_name]`` is set and non-empty
+            and the bootstrap bypass is not active.
+    """
+    if os.environ.get(DEVBENCH_BOOTSTRAP_ENV_VAR, "") != "1":
+        legacy_val = os.environ.get(legacy_name, "")
+        if legacy_val:
+            raise RuntimeError(
+                f"{legacy_name} is no longer accepted; use {new_name}. "
+                "Run `devbench migrate-env` to produce the migration shell-script."
+            )
+    new_val = os.environ.get(new_name, "")
+    return new_val if new_val else None
 
 
 # ---------------------------------------------------------------------------

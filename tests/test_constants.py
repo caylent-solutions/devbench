@@ -481,3 +481,57 @@ class TestSessionDrainSignalFilenameConstant:
         from devbench.constants import SESSION_DRAIN_SIGNAL_FILENAME
 
         assert "/" not in SESSION_DRAIN_SIGNAL_FILENAME
+
+
+class TestDevbenchBootstrapEnvVarConstant:
+    """AC-197-7: DEVBENCH_BOOTSTRAP_ENV_VAR is exported from constants.py with the
+    correct type and spec-mandated value (issue #197).
+
+    The constant names the environment variable that the CLI entry-point sets to '1'
+    to activate the bootstrap bypass in _read_env_strict, allowing devbench migrate-env
+    to inspect legacy vars before the hard cutover. Only the exact value '1' activates
+    the bypass (AC-197-7).
+    """
+
+    @pytest.mark.unit
+    def test_devbench_bootstrap_env_var_is_importable(self) -> None:
+        """DEVBENCH_BOOTSTRAP_ENV_VAR is importable from devbench.constants without error."""
+        import devbench.constants as _c
+
+        assert hasattr(_c, "DEVBENCH_BOOTSTRAP_ENV_VAR")
+
+    @pytest.mark.unit
+    def test_devbench_bootstrap_env_var_is_str(self) -> None:
+        """DEVBENCH_BOOTSTRAP_ENV_VAR is of type str."""
+        from devbench.constants import DEVBENCH_BOOTSTRAP_ENV_VAR
+
+        assert isinstance(DEVBENCH_BOOTSTRAP_ENV_VAR, str)
+
+    @pytest.mark.unit
+    def test_devbench_bootstrap_env_var_is_non_empty(self) -> None:
+        """DEVBENCH_BOOTSTRAP_ENV_VAR is a non-empty string."""
+        from devbench.constants import DEVBENCH_BOOTSTRAP_ENV_VAR
+
+        assert len(DEVBENCH_BOOTSTRAP_ENV_VAR) > 0
+
+    @pytest.mark.unit
+    def test_devbench_bootstrap_env_var_value(self) -> None:
+        """DEVBENCH_BOOTSTRAP_ENV_VAR equals 'DEVBENCH_BOOTSTRAP' (AC-197-7)."""
+        from devbench.constants import DEVBENCH_BOOTSTRAP_ENV_VAR
+
+        assert DEVBENCH_BOOTSTRAP_ENV_VAR == "DEVBENCH_BOOTSTRAP"
+
+    @pytest.mark.unit
+    def test_devbench_bootstrap_env_var_has_no_spaces(self) -> None:
+        """DEVBENCH_BOOTSTRAP_ENV_VAR contains no spaces (env var name convention)."""
+        from devbench.constants import DEVBENCH_BOOTSTRAP_ENV_VAR
+
+        assert " " not in DEVBENCH_BOOTSTRAP_ENV_VAR
+
+    @pytest.mark.unit
+    def test_devbench_bootstrap_env_var_is_uppercase(self) -> None:
+        """DEVBENCH_BOOTSTRAP_ENV_VAR is all uppercase (POSIX env var naming convention)."""
+        from devbench.constants import DEVBENCH_BOOTSTRAP_ENV_VAR
+
+        upper_form = DEVBENCH_BOOTSTRAP_ENV_VAR.upper()
+        assert upper_form == DEVBENCH_BOOTSTRAP_ENV_VAR

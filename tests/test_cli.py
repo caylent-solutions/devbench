@@ -1442,6 +1442,117 @@ class TestCmdSetStatus:
         err = capsys.readouterr().err
         assert "reversed range" in err.lower() or "scope" in err.lower()
 
+    # ------------------------------------------------------------------
+    # --dry-run tests (AC-194-3)
+    # ------------------------------------------------------------------
+
+    @pytest.mark.unit
+    def test_dry_run_bulk_prints_affected_wus_and_returns_0(
+        self, mock_units: list[WorkUnit], backlog_dir: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-194-3: --dry-run prints id/current/new for each affected WU, rc=0."""
+        for unit in mock_units:
+            (backlog_dir / unit.file_path.name).write_text(
+                f"# {unit.id}\n## Status: {unit.status.value}\n"
+            )
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+        mock_mgr = MagicMock()
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+        ):
+            result = cli.cmd_set_status("--dry-run", "--include", "E0", "in-queue")
+
+        assert result == 0
+        out = capsys.readouterr().out
+        # Each matched WU should appear in output with tab-separated id/current/new
+        for unit in mock_units:
+            assert unit.id in out
+        assert "in-queue" in out
+        # No writes must have happened
+        mock_mgr.force_status.assert_not_called()
+
+    @pytest.mark.unit
+    def test_dry_run_does_not_write_any_files(
+        self, mock_units: list[WorkUnit], backlog_dir: Path
+    ) -> None:
+        """AC-194-3: --dry-run must not call force_status or modify any file."""
+        for unit in mock_units:
+            wu_file = backlog_dir / unit.file_path.name
+            wu_file.write_text(f"# {unit.id}\n## Status: {unit.status.value}\n")
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+        mock_mgr = MagicMock()
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+        ):
+            cli.cmd_set_status("--dry-run", "--include", "E0", "in-queue")
+
+        mock_mgr.force_status.assert_not_called()
+
+    @pytest.mark.unit
+    def test_dry_run_output_format_is_tab_separated(
+        self, mock_units: list[WorkUnit], backlog_dir: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-194-3: each output line is '{id}\\t{current_status}\\t{new_status}'."""
+        for unit in mock_units:
+            (backlog_dir / unit.file_path.name).write_text(
+                f"# {unit.id}\n## Status: {unit.status.value}\n"
+            )
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+        mock_mgr = MagicMock()
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+        ):
+            result = cli.cmd_set_status("--dry-run", "--include", "E0", "in-queue")
+
+        assert result == 0
+        out = capsys.readouterr().out
+        lines = [line for line in out.strip().splitlines() if "\t" in line]
+        assert len(lines) == len(mock_units)
+        for line in lines:
+            parts = line.split("\t")
+            assert len(parts) == 3
+            wu_id, _current, new_s = parts
+            assert wu_id in [u.id for u in mock_units]
+            assert new_s == "in-queue"
+
+    @pytest.mark.unit
+    def test_dry_run_invalid_status_still_returns_1(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-194-3: --dry-run with invalid target status still returns rc=1."""
+        result = cli.cmd_set_status("--dry-run", "--include", "E0", "not-a-status")
+        assert result == 1
+        assert "Invalid status" in capsys.readouterr().err
+
+    @pytest.mark.unit
+    def test_dry_run_no_matching_units_returns_1(
+        self, mock_units: list[WorkUnit], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-194-3: --dry-run with no matching WUs still returns rc=1."""
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_set_status("--dry-run", "--include", "E99", "in-queue")
+
+        assert result == 1
+        assert "no work units" in capsys.readouterr().err.lower()
+
 
 class TestCmdSetStatusBulkIntegration:
     """Integration tests: cmd_set_status bulk --include/--exclude against a real fixture workspace."""
@@ -1551,6 +1662,57 @@ class TestCmdSetStatusBulkIntegration:
         assert result == 0
         wu_file = backlog_root / "E1-F1-S1-T1.md"
         assert "in-progress" in wu_file.read_text()
+
+    @pytest.mark.unit
+    def test_dry_run_does_not_write_files(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """AC-194-3 integration: --dry-run leaves WU files unmodified."""
+        units = [
+            ("E1-F1-S1-T1", "in-queue"),
+            ("E1-F1-S1-T2", "in-queue"),
+        ]
+        backlog_root, backlog_index = self._build_fixture_workspace(tmp_path, units)
+        original_t1 = (backlog_root / "E1-F1-S1-T1.md").read_text()
+        original_t2 = (backlog_root / "E1-F1-S1-T2.md").read_text()
+
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_root),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            result = cli.cmd_set_status("--dry-run", "--include", "E1", "in-progress")
+
+        assert result == 0
+        # Files must be unchanged
+        assert (backlog_root / "E1-F1-S1-T1.md").read_text() == original_t1
+        assert (backlog_root / "E1-F1-S1-T2.md").read_text() == original_t2
+
+        out = capsys.readouterr().out
+        assert "E1-F1-S1-T1" in out
+        assert "E1-F1-S1-T2" in out
+        assert "in-progress" in out
+
+    @pytest.mark.unit
+    def test_dry_run_prints_tab_separated_rows(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """AC-194-3 integration: each dry-run output line is id TAB current TAB new."""
+        units = [("E1-F1-S1-T1", "in-queue")]
+        backlog_root, backlog_index = self._build_fixture_workspace(tmp_path, units)
+
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_root),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            result = cli.cmd_set_status("--dry-run", "--include", "E1", "in-progress")
+
+        assert result == 0
+        out = capsys.readouterr().out
+        lines = [line for line in out.strip().splitlines() if "\t" in line]
+        assert len(lines) == 1
+        parts = lines[0].split("\t")
+        assert len(parts) == 3
+        assert parts[0] == "E1-F1-S1-T1"
+        assert parts[1] == "in-queue"
+        assert parts[2] == "in-progress"
 
 
 class TestCmdMarkDone:

@@ -27,6 +27,7 @@ You have two ways to reach a running DevBench orchestrator:
 - [Step 7: Author backlog/config/devbench.yaml](#step-7-author-backlogconfigdevbenchyaml)
 - [Step 8: Author or import a backlog](#step-8-author-or-import-a-backlog)
 - [Working with draft work units](#working-with-draft-work-units)
+- [Bulk operations on the backlog](#bulk-operations-on-the-backlog)
 - [Scoping a run](#scoping-a-run)
 - [Stopping a run cleanly](#stopping-a-run-cleanly)
 - [Step 9: Validate](#step-9-validate)
@@ -469,6 +470,85 @@ devbench set-status E7-F1-S1-T1 draft   # or revert a specific task back to draf
 
 After promoting, proceed to Step 9 (`devbench validate-backlog`) to confirm the promoted
 work units satisfy all backlog-contract rules before launching the orchestrator.
+
+---
+
+## Bulk operations on the backlog
+
+After `spec-to-backlog` generates your backlog (or after `task-factory` materialises new
+tasks), you often have tens or hundreds of work units to manage before launching the
+orchestrator. The `devbench set-status` command provides a bulk-update surface that
+accepts the same printer-pages selector syntax as `devbench start --include / --exclude`,
+letting you promote, hold, or decline entire epics or task ranges in a single command.
+
+### The three-phase workflow
+
+1. **Review draft work units.** Inspect the generated `.md` files -- especially
+   `## Changes Manifest`, `## Acceptance Criteria`, and `## Approach` -- to confirm each
+   task is ready for autonomous work. Use `devbench status` to see the pending draft count.
+
+2. **Bulk-promote or hold.** Promote the epics you want the orchestrator to tackle first;
+   hold or decline anything you are not ready to run:
+
+   ```bash
+   # Preview what would be promoted -- no state changes yet:
+   JUDGE_WORKSPACE_ROOT=~/my-workspace \
+   uv run --project $DEVBENCH_DIR devbench set-status \
+     --include "E1-E3" --dry-run in-queue
+
+   # Promote E1 through E3 to in-queue (confirm interactively if > threshold):
+   JUDGE_WORKSPACE_ROOT=~/my-workspace \
+   uv run --project $DEVBENCH_DIR devbench set-status \
+     --include "E1-E3" in-queue
+
+   # Promote everything at once, skipping the confirmation prompt:
+   JUDGE_WORKSPACE_ROOT=~/my-workspace \
+   uv run --project $DEVBENCH_DIR devbench set-status \
+     --include "E1-E10" --yes in-queue
+
+   # Hold E5 for closer review while releasing everything else:
+   JUDGE_WORKSPACE_ROOT=~/my-workspace \
+   uv run --project $DEVBENCH_DIR devbench set-status \
+     --include "E1-E10" --exclude "E5" in-queue
+   JUDGE_WORKSPACE_ROOT=~/my-workspace \
+   uv run --project $DEVBENCH_DIR devbench set-status \
+     --include "E5" hold
+   ```
+
+3. **Launch the orchestrator.** Once the promoted work units pass `devbench validate-backlog`,
+   start the autonomous run with `make start` (see [Step 10](#step-10-launch)).
+
+### Flag reference
+
+| Flag | Effect |
+|------|--------|
+| `--include "<tokens>"` | Apply the status change to work units matching the printer-pages selector |
+| `--exclude "<tokens>"` | Remove matching units from the update set (combined with --include) |
+| `--dry-run` | Print the IDs that would be updated; make no state changes |
+| `--yes` | Skip the confirmation prompt even when the expansion exceeds `bulk_update_confirm_threshold` |
+
+When the number of work units that would be updated exceeds `bulk_update_confirm_threshold`
+(default 10, configurable in `backlog/config/devbench.yaml`) and `--yes` is not supplied,
+`set-status` prints the affected IDs and asks for confirmation before proceeding.
+
+Every bulk invocation appends a `[BULK_STATUS_UPDATE]` audit row to the path configured
+in `bulk_update_audit_path` (default `logs/bulk-updates.log`), recording the selector
+expression, target status, affected IDs, and timestamp.
+
+### Complement to devbench promote
+
+`devbench set-status` and `devbench promote` serve different purposes:
+
+- **`devbench promote`** -- moves `draft` WUs to `in-queue` only. Use it when you want the
+  `draft -> in-queue` lifecycle semantics enforced (refuses non-draft inputs) and the
+  `[PROMOTED]` audit comment written per WU.
+- **`devbench set-status --include`** -- moves WUs to any valid status (not just
+  `in-queue`), and does not enforce a source-status constraint. Use it to
+  hold, decline, or re-queue a subtree regardless of its current status.
+
+For the selector syntax reference (single-ID tokens, range tokens, mixed lists), see
+[Scoping a run -- Printer-pages token syntax](#printer-pages-token-syntax) and
+[`docs/cli-reference.md` -- set-status](cli-reference.md#set-status).
 
 ---
 

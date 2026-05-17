@@ -130,8 +130,8 @@ class BacklogManager:
             session_name: Optional named-session identifier sourced from
                 ``DEVBENCH_SESSION_NAME``.  When provided and the target
                 status is ``in-progress``, the ``[WU_CLAIMED]`` audit comment
-                is extended with ``session=<name>`` per spec section 4.4.2
-                and spec section 6 (AC-192-5).
+                is extended with ``session=<name>`` per spec section 4.4.7
+                and spec section 6 (AC-192-6).
 
         Raises:
             FileNotFoundError: If either file does not exist.
@@ -844,8 +844,8 @@ class BacklogManager:
             session_name: Optional named-session name from
                 ``DEVBENCH_SESSION_NAME``.  When provided and the target
                 status is ``in-progress``, the ``[WU_CLAIMED]`` audit comment
-                is extended with ``session=<name>`` per spec 4.4.2 /
-                AC-192-5.
+                is extended with ``session=<name>`` per spec 4.4.7 /
+                AC-192-6.
         """
         canonical = VALID_STATUSES.get(new_status.lower())
         if canonical is None:
@@ -862,9 +862,10 @@ class BacklogManager:
 
         # Issue #185 / spec 4.4.2 / AC-192-5: every transition into
         # ``in-progress`` writes a ``[WU_CLAIMED]`` audit-comment row.
-        # When a named session is active (``session_name`` is provided),
-        # the comment is extended with ``session=<name>`` so the audit trail
-        # records which session performed the claim.
+        # Issue #192 / spec 4.4.7 / AC-192-6: when a named session is active
+        # (``session_name`` is provided), the comment is extended with
+        # ``session=<name>`` so the audit trail records which session
+        # performed the claim.
         # Skips Stories / Features / Epics whose status is auto-rolled from
         # children (no human ever claims those directly).
         if canonical == STATUS_IN_PROGRESS and "-T" in unit_id:

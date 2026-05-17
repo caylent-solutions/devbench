@@ -4505,6 +4505,87 @@ class TestSetStatusWritesWuClaimedAudit:
         assert "[WU_CLAIMED]" not in content
 
 
+class TestWuClaimedSessionSuffix:
+    """Spec section 4.4.7 / AC-192-6: [WU_CLAIMED] audit format extension.
+
+    When ``DEVBENCH_SESSION_NAME`` is set the audit comment becomes
+    ``[WU_CLAIMED] Set <id> to 'in-progress' session=<name>``.
+    When the env var is absent the legacy format is unchanged.
+    """
+
+    def test_set_status_with_session_name_appends_session_suffix(self, tmp_path: Path) -> None:
+        """_set_status with session_name produces 'session=<name>' in [WU_CLAIMED] row."""
+        wu_body = _unit_body("E0-F1-S1-T1", "in-queue")
+        index = _write_workspace(
+            tmp_path,
+            rows=[("E0-F1-S1-T1", "Task", "in-queue")],
+            files={"E0-F1-S1-T1": wu_body},
+        )
+        wu_path = tmp_path / "backlog" / "E0-F1-S1-T1.md"
+        BacklogManager()._set_status(wu_path, index, "E0-F1-S1-T1", "in-progress", session_name="prod-01")
+        content = wu_path.read_text(encoding="utf-8")
+        assert "[WU_CLAIMED] Set E0-F1-S1-T1 to 'in-progress' session=prod-01" in content
+
+    def test_set_status_without_session_name_omits_session_suffix(self, tmp_path: Path) -> None:
+        """_set_status without session_name produces the bare [WU_CLAIMED] format (legacy)."""
+        wu_body = _unit_body("E0-F1-S1-T1", "in-queue")
+        index = _write_workspace(
+            tmp_path,
+            rows=[("E0-F1-S1-T1", "Task", "in-queue")],
+            files={"E0-F1-S1-T1": wu_body},
+        )
+        wu_path = tmp_path / "backlog" / "E0-F1-S1-T1.md"
+        BacklogManager()._set_status(wu_path, index, "E0-F1-S1-T1", "in-progress")
+        content = wu_path.read_text(encoding="utf-8")
+        assert "[WU_CLAIMED] Set E0-F1-S1-T1 to 'in-progress'" in content
+        assert "session=" not in content
+
+    def test_set_status_session_name_none_omits_session_suffix(self, tmp_path: Path) -> None:
+        """_set_status with explicit session_name=None uses the bare [WU_CLAIMED] format."""
+        wu_body = _unit_body("E0-F1-S1-T1", "in-queue")
+        index = _write_workspace(
+            tmp_path,
+            rows=[("E0-F1-S1-T1", "Task", "in-queue")],
+            files={"E0-F1-S1-T1": wu_body},
+        )
+        wu_path = tmp_path / "backlog" / "E0-F1-S1-T1.md"
+        BacklogManager()._set_status(wu_path, index, "E0-F1-S1-T1", "in-progress", session_name=None)
+        content = wu_path.read_text(encoding="utf-8")
+        assert "[WU_CLAIMED] Set E0-F1-S1-T1 to 'in-progress'" in content
+        assert "session=" not in content
+
+    @pytest.mark.parametrize(
+        "session_name",
+        ["alpha", "beta", "my-session-01", "prod"],
+        ids=["alpha", "beta", "hyphenated", "prod"],
+    )
+    def test_set_status_session_name_parametrized(self, tmp_path: Path, session_name: str) -> None:
+        """session_name value is reproduced verbatim in the [WU_CLAIMED] audit row."""
+        wu_body = _unit_body("E0-F1-S1-T1", "in-queue")
+        index = _write_workspace(
+            tmp_path,
+            rows=[("E0-F1-S1-T1", "Task", "in-queue")],
+            files={"E0-F1-S1-T1": wu_body},
+        )
+        wu_path = tmp_path / "backlog" / "E0-F1-S1-T1.md"
+        BacklogManager()._set_status(wu_path, index, "E0-F1-S1-T1", "in-progress", session_name=session_name)
+        content = wu_path.read_text(encoding="utf-8")
+        assert f"session={session_name}" in content
+
+    def test_set_status_session_name_ignored_for_non_in_progress(self, tmp_path: Path) -> None:
+        """session_name has no effect when the target status is not 'in-progress'."""
+        wu_body = _unit_body("E0-F1-S1-T1", "in-progress")
+        index = _write_workspace(
+            tmp_path,
+            rows=[("E0-F1-S1-T1", "Task", "in-progress")],
+            files={"E0-F1-S1-T1": wu_body},
+        )
+        wu_path = tmp_path / "backlog" / "E0-F1-S1-T1.md"
+        BacklogManager()._set_status(wu_path, index, "E0-F1-S1-T1", "in-queue", session_name="ignored-session")
+        content = wu_path.read_text(encoding="utf-8")
+        assert "session=ignored-session" not in content
+
+
 class TestSetStatusWritesUnblockedAudit:
     """Issue #153: when the cascade flips ``blocked -> in-queue`` it writes
     a ``[CASCADE_RESOLVED]`` audit; sync-blocked separately writes

@@ -198,6 +198,7 @@ from devbench.quota import (
     SdkCreditExhaustedError,
     SubscriptionRateLimitError,
     detect_quota_error,
+    remove_checkpoint,
     save_checkpoint,
     wait_for_reset,
 )
@@ -5108,6 +5109,11 @@ _ON_EXHAUSTION_DRAIN: str = "drain"
 #: on_exhaustion_timeout config values (spec section 4.5.6).
 _ON_EXHAUSTION_TIMEOUT_KEEP_WAITING: str = "keep_waiting"
 
+#: resume_strategy config values (spec section 4.5.6, AC-193-9, AC-193-10, AC-193-11).
+_RESUME_STRATEGY_CONTINUE: str = "continue_current_wu"
+_RESUME_STRATEGY_RESTART: str = "restart_wu"
+_RESUME_STRATEGY_DRAIN: str = "drain_and_resume"
+
 #: Tuple of QuotaExhaustedError subclasses in the same order as
 #: QUOTA_HANDLING_DEFAULT_DETECT_MODES (used to build _QUOTA_REASON_MAP
 #: without duplicating string literals -- DRY, spec section 4.5.2).
@@ -5126,6 +5132,81 @@ _QUOTA_REASON_MAP: dict[type[QuotaExhaustedError], str] = dict(
 )
 
 
+def _apply_resume_strategy(
+    resume_strategy: str,
+    session_dir: Path,
+    workspace_root: Path,
+    in_flight_wu_file: Path | None,
+    backlog_index: Path,
+) -> None:
+    """Apply the configured resume strategy after quota recovery.
+
+    Called by :func:`_handle_quota_pause` when :func:`~devbench.quota.wait_for_reset`
+    returns ``True`` (quota has been restored).  The strategy determines what
+    happens to the in-flight work unit and the orchestration loop:
+
+    - ``'continue_current_wu'`` (default, AC-193-9): Remove the checkpoint file
+      and let the SDK loop restart without reverting any WU status.  The
+      orchestrator continues from where it left off -- already-passed judges are
+      visible in the WU file history, and the orchestrate skill can skip them.
+
+    - ``'restart_wu'`` (AC-193-10): Revert the in-flight WU from ``in-progress``
+      to ``in-queue`` so the orchestrator re-claims and re-runs it from scratch.
+      The checkpoint file is then removed.
+
+    - ``'drain_and_resume'`` (AC-193-11): Request a drain so the orchestrator
+      finishes the current WU, then stops cleanly.  On the next ``devbench start``
+      invocation the operator resumes normally.  The checkpoint file is removed
+      before the drain is requested so the watcher daemon does not re-enter wait
+      mode.
+
+    Args:
+        resume_strategy: One of ``'continue_current_wu'``, ``'restart_wu'``,
+            or ``'drain_and_resume'``.  Any other value raises :exc:`ValueError`
+            (fail-fast; spec section 4.5.6 enumerates the full set).
+        session_dir: Session directory used to locate ``quota_pause.json``.
+        workspace_root: Workspace root path (used by ``request_drain`` and
+            ``BacklogManager`` internals).
+        in_flight_wu_file: Path to the in-flight work-unit Markdown file, or
+            ``None`` when no work unit is currently in-progress.  ``restart_wu``
+            requires this to be non-``None`` to revert the status; it logs a
+            warning and skips the status change when ``None``.
+        backlog_index: Path to ``BACKLOG.md`` (the backlog index file) used by
+            ``BacklogManager.force_status`` for the ``restart_wu`` strategy.
+
+    Raises:
+        ValueError: When *resume_strategy* is not one of the three documented
+            values.  Raised before any side effects (fail-fast).
+        OSError: When ``remove_checkpoint`` cannot delete ``quota_pause.json``
+            (e.g. permission denied).
+        OSError: When ``BacklogManager.force_status`` cannot write the WU file
+            (``restart_wu`` strategy only).
+    """
+    valid_strategies = (_RESUME_STRATEGY_CONTINUE, _RESUME_STRATEGY_RESTART, _RESUME_STRATEGY_DRAIN)
+    if resume_strategy not in valid_strategies:
+        raise ValueError(f"Unknown resume_strategy={resume_strategy!r}. Valid values: {', '.join(valid_strategies)}")
+
+    if resume_strategy == _RESUME_STRATEGY_RESTART:
+        # Revert the in-flight WU to in-queue before removing the checkpoint.
+        if in_flight_wu_file is not None:
+            unit_id = in_flight_wu_file.stem
+            mgr = BacklogManager()
+            mgr.force_status(in_flight_wu_file, backlog_index, unit_id, STATUS_IN_QUEUE)
+        # Remove checkpoint regardless of whether a WU was in-flight.
+        remove_checkpoint(session_dir)
+        return
+
+    if resume_strategy == _RESUME_STRATEGY_DRAIN:
+        # Remove checkpoint first so the watcher daemon does not re-enter wait mode,
+        # then request a drain so the current WU finishes before the loop stops.
+        remove_checkpoint(session_dir)
+        request_drain(workspace_root, reason="quota_recovered_drain_and_resume")
+        return
+
+    # _RESUME_STRATEGY_CONTINUE: just remove the checkpoint; SDK loop restarts normally.
+    remove_checkpoint(session_dir)
+
+
 async def _handle_quota_pause(
     exc: QuotaExhaustedError,
     quota_cfg: QuotaHandlingConfig,
@@ -5135,7 +5216,7 @@ async def _handle_quota_pause(
 ) -> bool:
     """Implement the quota-wait-and-resume protocol for a detected quota error.
 
-    Protocol (spec section 4.5.2, AC-193-5):
+    Protocol (spec section 4.5.2, AC-193-5, AC-193-9, AC-193-10, AC-193-11):
 
     1. Determine the session directory (workspace_root when no named session,
        <workspace>/.devbench/sessions/<name> when a session is active).
@@ -5147,7 +5228,10 @@ async def _handle_quota_pause(
     5. If recovery succeeded (returned ``True``) and
        ``quota_cfg.audit_comment_on_resume`` is True, append a
        ``[QUOTA_RESUMED] waited_seconds=<N>`` audit comment.
-    6. Return ``True`` when recovery succeeded, ``False`` when max_wait elapsed.
+    6. If recovery succeeded, call :func:`_apply_resume_strategy` with
+       ``quota_cfg.resume_strategy`` to remove the checkpoint and take the
+       appropriate post-recovery action (continue, restart WU, or drain).
+    7. Return ``True`` when recovery succeeded, ``False`` when max_wait elapsed.
 
     Args:
         exc: The :class:`~devbench.quota.QuotaExhaustedError` that triggered the pause.
@@ -5221,6 +5305,16 @@ async def _handle_quota_pause(
             in_flight_wu_file,
             "orchestrator",
             f"{_QUOTA_RESUMED_AUDIT_PREFIX} waited_seconds={waited_seconds}",
+        )
+
+    # Step 6: apply resume strategy (removes checkpoint, optionally reverts WU or drains).
+    if recovered:
+        _apply_resume_strategy(
+            resume_strategy=quota_cfg.resume_strategy,
+            session_dir=session_dir,
+            workspace_root=workspace_root,
+            in_flight_wu_file=in_flight_wu_file,
+            backlog_index=BACKLOG_INDEX,
         )
 
     return recovered

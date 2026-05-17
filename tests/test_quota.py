@@ -3530,3 +3530,80 @@ class TestLegacyRaiseExitBehavior:
         assert isinstance(cause, _RawSdkQuotaError)
         assert not isinstance(cause, QuotaExhaustedError)
         assert cause.status_code == 429
+
+
+# ---------------------------------------------------------------------------
+# E5-F4-S1-T4: remove_checkpoint -- atomic deletion of quota_pause.json
+# AC-193-8: quota_pause.json removed on resume (spec section 4.5)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestRemoveCheckpoint:
+    """AC-193-8: remove_checkpoint deletes quota_pause.json atomically.
+
+    Spec section 4.5: the pause file is removed on resume so subsequent
+    runs do not think quota is still exhausted.
+    """
+
+    def _write_checkpoint(self, session_dir: Path) -> Path:
+        """Write a minimal quota_pause.json and return its path."""
+        devbench_dir = session_dir / ".devbench"
+        devbench_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_file = devbench_dir / "quota_pause.json"
+        checkpoint_file.write_text(
+            '{"paused_at":"2026-01-01T12:00:00+00:00","reset_at":null,'
+            '"reason":"subscription_rate_limit","raw_error":"429",'
+            '"in_flight_wu":null,"in_flight_phase":null,'
+            '"completed_judges":[],"pending_judges":[],"stage_artefacts":{}}',
+            encoding="utf-8",
+        )
+        return checkpoint_file
+
+    def test_remove_checkpoint_deletes_file(self, tmp_path: Path) -> None:
+        """remove_checkpoint removes quota_pause.json when it exists."""
+        from devbench.quota import remove_checkpoint
+
+        checkpoint_file = self._write_checkpoint(tmp_path)
+        assert checkpoint_file.exists(), "pre-condition: file must exist before removal"
+
+        remove_checkpoint(tmp_path)
+
+        assert not checkpoint_file.exists(), "quota_pause.json must be deleted by remove_checkpoint"
+
+    def test_remove_checkpoint_noop_when_file_absent(self, tmp_path: Path) -> None:
+        """remove_checkpoint is a no-op when quota_pause.json does not exist."""
+        from devbench.quota import remove_checkpoint
+
+        # Ensure directory exists but file does not.
+        devbench_dir = tmp_path / ".devbench"
+        devbench_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_file = devbench_dir / "quota_pause.json"
+        assert not checkpoint_file.exists(), "pre-condition: file must not exist"
+
+        # Should not raise.
+        remove_checkpoint(tmp_path)
+
+    def test_remove_checkpoint_noop_when_devbench_dir_absent(self, tmp_path: Path) -> None:
+        """remove_checkpoint is a no-op when the .devbench directory itself does not exist."""
+        from devbench.quota import remove_checkpoint
+
+        session_dir = tmp_path / "session"
+        session_dir.mkdir()
+        # .devbench sub-dir does not exist.
+
+        # Should not raise.
+        remove_checkpoint(session_dir)
+
+    def test_remove_checkpoint_load_returns_none_after_removal(self, tmp_path: Path) -> None:
+        """After remove_checkpoint, load_checkpoint returns None for the same session_dir."""
+        from devbench.quota import remove_checkpoint
+
+        self._write_checkpoint(tmp_path)
+        assert load_checkpoint(tmp_path) is not None, "pre-condition: checkpoint must be loadable"
+
+        remove_checkpoint(tmp_path)
+
+        assert load_checkpoint(tmp_path) is None, (
+            "load_checkpoint must return None after remove_checkpoint deletes the file"
+        )

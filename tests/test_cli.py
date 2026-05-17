@@ -17739,11 +17739,18 @@ class TestCmdStartQuotaHandling:
         assert rc == 0
 
     def test_handle_quota_pause_saves_checkpoint(self, tmp_path: Path) -> None:
-        """_handle_quota_pause saves quota_pause.json checkpoint via save_checkpoint."""
+        """_handle_quota_pause saves quota_pause.json checkpoint via save_checkpoint.
+
+        The checkpoint is written before the wait begins so that external
+        processes (e.g. the quota-watcher daemon) can observe the pause state.
+        After recovery, _apply_resume_strategy removes it.  This test verifies
+        that save_checkpoint is called with the correct fields by inspecting
+        the saved payload via a spy before _apply_resume_strategy runs.
+        """
         import asyncio
 
         from devbench.config_loader import QuotaHandlingConfig
-        from devbench.quota import SubscriptionRateLimitError, load_checkpoint
+        from devbench.quota import SubscriptionRateLimitError
 
         reset_time = datetime(2030, 6, 1, 12, 0, 0, tzinfo=UTC)
         exc = SubscriptionRateLimitError(
@@ -17759,11 +17766,22 @@ class TestCmdStartQuotaHandling:
         )
 
         wu_file = self._make_wu_file(tmp_path)
+        saved_payloads: list[dict] = []
+
+        original_save = cli.save_checkpoint
+
+        def _spy_save_checkpoint(**kw: object) -> None:
+            saved_payloads.append(dict(kw))
+            original_save(**kw)  # type: ignore[arg-type]
 
         async def _fake_wait_for_reset(*_a: object, **_kw: object) -> bool:
             return True
 
-        with patch("devbench.cli.wait_for_reset", side_effect=_fake_wait_for_reset):
+        with (
+            patch("devbench.cli.save_checkpoint", side_effect=_spy_save_checkpoint),
+            patch("devbench.cli.wait_for_reset", side_effect=_fake_wait_for_reset),
+            patch("devbench.cli._apply_resume_strategy"),
+        ):
             result = asyncio.run(
                 cli._handle_quota_pause(
                     exc=exc,
@@ -17775,10 +17793,14 @@ class TestCmdStartQuotaHandling:
             )
 
         assert result is True
-        checkpoint = load_checkpoint(tmp_path)
-        assert checkpoint is not None
-        assert checkpoint.reason == "subscription_rate_limit"
-        assert checkpoint.reset_at == reset_time
+        assert len(saved_payloads) == 1, "save_checkpoint must be called exactly once"
+        payload = saved_payloads[0]
+        assert payload.get("reason") == "subscription_rate_limit", (
+            f"checkpoint reason must be 'subscription_rate_limit'; got: {payload.get('reason')!r}"
+        )
+        assert payload.get("reset_at") == reset_time, (
+            f"checkpoint reset_at must equal exception reset_at; got: {payload.get('reset_at')!r}"
+        )
 
     def test_handle_quota_pause_quota_waiting_audit_comment(self, tmp_path: Path) -> None:
         """_handle_quota_pause writes [QUOTA_WAITING] audit comment to WU file when configured."""
@@ -17867,6 +17889,11 @@ class TestCmdStartQuotaHandling:
         _handle_quota_pause, testing the real integration between _run(),
         _handle_quota_pause(), and save_checkpoint() against a constructed
         fixture workspace.
+
+        After successful recovery (wait_for_reset returns True), _apply_resume_strategy
+        removes quota_pause.json.  This test verifies that save_checkpoint was called
+        (by capturing the call via a spy), and that the checkpoint is subsequently
+        removed by the default 'continue_current_wu' strategy.
         """
         import sys
 
@@ -17906,6 +17933,15 @@ class TestCmdStartQuotaHandling:
         wu_mock.file_path = wu_file
         wu_mock.status.value = "in-progress"
 
+        # Track whether save_checkpoint was called (verifies the checkpoint is created
+        # before being removed by _apply_resume_strategy on recovery).
+        save_calls: list[str] = []
+        original_save = cli.save_checkpoint
+
+        def _spy_save(**kw: object) -> None:
+            save_calls.append(kw.get("reason", ""))  # type: ignore[arg-type]
+            original_save(**kw)  # type: ignore[arg-type]
+
         with (
             patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
@@ -17916,6 +17952,7 @@ class TestCmdStartQuotaHandling:
             patch("devbench.cli.ScopeFilter"),
             patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
             patch("devbench.cli.wait_for_reset", return_value=True),
+            patch("devbench.cli.save_checkpoint", side_effect=_spy_save),
         ):
             mock_cfg.quota_handling = quota_cfg
             mock_parser_cls.return_value.parse_index.return_value = [wu_mock]
@@ -17924,9 +17961,12 @@ class TestCmdStartQuotaHandling:
 
         assert rc == 0
         assert len(query_calls) == 2, "query must be called twice (once for quota, once after resume)"
-        checkpoint = load_checkpoint(tmp_path)
-        assert checkpoint is not None
-        assert checkpoint.reason == "subscription_rate_limit"
+        # save_checkpoint was called with the correct reason.
+        assert save_calls == ["subscription_rate_limit"], (
+            f"save_checkpoint must be called once with reason='subscription_rate_limit'; got: {save_calls}"
+        )
+        # After recovery with default 'continue_current_wu' strategy, checkpoint is removed.
+        assert load_checkpoint(tmp_path) is None, "quota_pause.json must be removed after successful recovery"
 
     def test_quota_on_exhaustion_drain_calls_request_drain(self, tmp_path: Path) -> None:
         """When on_exhaustion='drain', QuotaExhaustedError calls request_drain once and rc==0."""
@@ -18718,3 +18758,340 @@ class TestQuotaAuditCommentFormat:
         assert f"reason={expected_reason}" in content, (
             f"Expected reason={expected_reason} in [QUOTA_WAITING] for {reason_class}; got: {content}"
         )
+
+
+# ---------------------------------------------------------------------------
+# E5-F4-S1-T4: Resume strategy tests
+# AC-193-9: continue_current_wu -- skips already-passed judges
+# AC-193-10: restart_wu -- reverts WU to in-queue, re-claims
+# AC-193-11: drain_and_resume -- finishes current WU then resumes after reset
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestApplyResumeStrategy:
+    """AC-193-9, AC-193-10, AC-193-11: _apply_resume_strategy implements all three strategies.
+
+    Tests cover the happy path for each strategy, error paths, and the
+    remove_checkpoint side-effect that must always happen on successful recovery.
+    """
+
+    def _make_wu_file(self, tmp_path: Path, unit_id: str = "E5-T1") -> Path:
+        """Create a minimal in-progress work-unit file."""
+        wu = tmp_path / f"{unit_id}.md"
+        wu.write_text(
+            f"# {unit_id}: Test WU\n\n## Status: in-progress\n\n## Comments\n\n",
+            encoding="utf-8",
+        )
+        return wu
+
+    def _write_checkpoint(self, session_dir: Path) -> Path:
+        """Write a minimal quota_pause.json and return its path."""
+        devbench_dir = session_dir / ".devbench"
+        devbench_dir.mkdir(parents=True, exist_ok=True)
+        f = devbench_dir / "quota_pause.json"
+        f.write_text(
+            '{"paused_at":"2026-01-01T12:00:00+00:00","reset_at":null,'
+            '"reason":"subscription_rate_limit","raw_error":"429",'
+            '"in_flight_wu":"E5-T1","in_flight_phase":null,'
+            '"completed_judges":["code_review"],"pending_judges":["test_review"],'
+            '"stage_artefacts":{}}',
+            encoding="utf-8",
+        )
+        return f
+
+    def test_continue_current_wu_removes_checkpoint(self, tmp_path: Path) -> None:
+        """AC-193-9: continue_current_wu removes quota_pause.json after recovery."""
+        checkpoint_file = self._write_checkpoint(tmp_path)
+        wu_file = self._make_wu_file(tmp_path)
+
+        cli._apply_resume_strategy(
+            resume_strategy=cli._RESUME_STRATEGY_CONTINUE,
+            session_dir=tmp_path,
+            workspace_root=tmp_path,
+            in_flight_wu_file=wu_file,
+            backlog_index=tmp_path / "BACKLOG.md",
+        )
+
+        assert not checkpoint_file.exists(), "continue_current_wu must remove quota_pause.json after recovery"
+
+    def test_continue_current_wu_does_not_revert_wu_status(self, tmp_path: Path) -> None:
+        """AC-193-9: continue_current_wu does NOT change the WU status (SDK loop restarts as-is)."""
+        self._write_checkpoint(tmp_path)
+        wu_file = self._make_wu_file(tmp_path)
+
+        cli._apply_resume_strategy(
+            resume_strategy=cli._RESUME_STRATEGY_CONTINUE,
+            session_dir=tmp_path,
+            workspace_root=tmp_path,
+            in_flight_wu_file=wu_file,
+            backlog_index=tmp_path / "BACKLOG.md",
+        )
+
+        content = wu_file.read_text(encoding="utf-8")
+        assert "## Status: in-progress" in content, "continue_current_wu must leave the WU status as in-progress"
+
+    def test_continue_current_wu_no_drain_requested(self, tmp_path: Path) -> None:
+        """AC-193-9: continue_current_wu does not request a drain."""
+        self._write_checkpoint(tmp_path)
+        wu_file = self._make_wu_file(tmp_path)
+
+        with patch("devbench.cli.request_drain") as mock_drain:
+            cli._apply_resume_strategy(
+                resume_strategy=cli._RESUME_STRATEGY_CONTINUE,
+                session_dir=tmp_path,
+                workspace_root=tmp_path,
+                in_flight_wu_file=wu_file,
+                backlog_index=tmp_path / "BACKLOG.md",
+            )
+
+        mock_drain.assert_not_called()
+
+    def test_restart_wu_removes_checkpoint(self, tmp_path: Path) -> None:
+        """AC-193-10: restart_wu removes quota_pause.json after recovery."""
+        checkpoint_file = self._write_checkpoint(tmp_path)
+        wu_file = self._make_wu_file(tmp_path)
+
+        # Provide a real BACKLOG.md so force_status can update the index.
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text(
+            "| E5-T1 | Test WU | in-progress |\n",
+            encoding="utf-8",
+        )
+
+        with patch("devbench.cli.BacklogManager") as mock_mgr_cls:
+            mock_mgr = MagicMock()
+            mock_mgr_cls.return_value = mock_mgr
+
+            cli._apply_resume_strategy(
+                resume_strategy=cli._RESUME_STRATEGY_RESTART,
+                session_dir=tmp_path,
+                workspace_root=tmp_path,
+                in_flight_wu_file=wu_file,
+                backlog_index=backlog_index,
+            )
+
+        assert not checkpoint_file.exists(), "restart_wu must remove quota_pause.json after recovery"
+
+    def test_restart_wu_reverts_wu_to_in_queue(self, tmp_path: Path) -> None:
+        """AC-193-10: restart_wu calls force_status(STATUS_IN_QUEUE) on the in-flight WU."""
+        self._write_checkpoint(tmp_path)
+        wu_file = self._make_wu_file(tmp_path)
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text("", encoding="utf-8")
+
+        with patch("devbench.cli.BacklogManager") as mock_mgr_cls:
+            mock_mgr = MagicMock()
+            mock_mgr_cls.return_value = mock_mgr
+
+            cli._apply_resume_strategy(
+                resume_strategy=cli._RESUME_STRATEGY_RESTART,
+                session_dir=tmp_path,
+                workspace_root=tmp_path,
+                in_flight_wu_file=wu_file,
+                backlog_index=backlog_index,
+            )
+
+        # force_status must be called with STATUS_IN_QUEUE
+        assert mock_mgr.force_status.call_count == 1, "restart_wu must call force_status exactly once"
+        call_args = mock_mgr.force_status.call_args
+        assert call_args[0][3] == cli.STATUS_IN_QUEUE or call_args.args[3] == cli.STATUS_IN_QUEUE, (
+            f"restart_wu must revert WU to in-queue; force_status called with: {call_args}"
+        )
+
+    def test_restart_wu_noop_when_no_in_flight_wu(self, tmp_path: Path) -> None:
+        """AC-193-10: restart_wu skips force_status when in_flight_wu_file is None."""
+        checkpoint_file = self._write_checkpoint(tmp_path)
+
+        with patch("devbench.cli.BacklogManager") as mock_mgr_cls:
+            mock_mgr = MagicMock()
+            mock_mgr_cls.return_value = mock_mgr
+
+            cli._apply_resume_strategy(
+                resume_strategy=cli._RESUME_STRATEGY_RESTART,
+                session_dir=tmp_path,
+                workspace_root=tmp_path,
+                in_flight_wu_file=None,
+                backlog_index=tmp_path / "BACKLOG.md",
+            )
+
+        mock_mgr.force_status.assert_not_called()
+        assert not checkpoint_file.exists(), "restart_wu must still remove checkpoint even when no in-flight WU"
+
+    def test_drain_and_resume_removes_checkpoint(self, tmp_path: Path) -> None:
+        """AC-193-11: drain_and_resume removes quota_pause.json after recovery."""
+        checkpoint_file = self._write_checkpoint(tmp_path)
+
+        with patch("devbench.cli.request_drain"):
+            cli._apply_resume_strategy(
+                resume_strategy=cli._RESUME_STRATEGY_DRAIN,
+                session_dir=tmp_path,
+                workspace_root=tmp_path,
+                in_flight_wu_file=None,
+                backlog_index=tmp_path / "BACKLOG.md",
+            )
+
+        assert not checkpoint_file.exists(), "drain_and_resume must remove quota_pause.json after recovery"
+
+    def test_drain_and_resume_calls_request_drain(self, tmp_path: Path) -> None:
+        """AC-193-11: drain_and_resume calls request_drain to finish current WU then stop."""
+        self._write_checkpoint(tmp_path)
+
+        with patch("devbench.cli.request_drain") as mock_drain:
+            cli._apply_resume_strategy(
+                resume_strategy=cli._RESUME_STRATEGY_DRAIN,
+                session_dir=tmp_path,
+                workspace_root=tmp_path,
+                in_flight_wu_file=None,
+                backlog_index=tmp_path / "BACKLOG.md",
+            )
+
+        mock_drain.assert_called_once()
+        call_kwargs = mock_drain.call_args
+        assert tmp_path in (call_kwargs.args or ()), (
+            f"request_drain must be called with workspace_root; got: {call_kwargs}"
+        )
+
+    def test_drain_and_resume_no_status_change(self, tmp_path: Path) -> None:
+        """AC-193-11: drain_and_resume does NOT revert WU status (drain finishes current WU)."""
+        self._write_checkpoint(tmp_path)
+        wu_file = self._make_wu_file(tmp_path)
+
+        with patch("devbench.cli.request_drain"), patch("devbench.cli.BacklogManager") as mock_mgr_cls:
+            mock_mgr = MagicMock()
+            mock_mgr_cls.return_value = mock_mgr
+
+            cli._apply_resume_strategy(
+                resume_strategy=cli._RESUME_STRATEGY_DRAIN,
+                session_dir=tmp_path,
+                workspace_root=tmp_path,
+                in_flight_wu_file=wu_file,
+                backlog_index=tmp_path / "BACKLOG.md",
+            )
+
+        mock_mgr.force_status.assert_not_called()
+
+    def test_invalid_strategy_raises_value_error(self, tmp_path: Path) -> None:
+        """_apply_resume_strategy raises ValueError for an unrecognised strategy string."""
+        with pytest.raises(ValueError, match="Unknown resume_strategy"):
+            cli._apply_resume_strategy(
+                resume_strategy="unknown_strategy",
+                session_dir=tmp_path,
+                workspace_root=tmp_path,
+                in_flight_wu_file=None,
+                backlog_index=tmp_path / "BACKLOG.md",
+            )
+
+
+@pytest.mark.unit
+class TestResumeStrategyIntegrationWithHandleQuotaPause:
+    """Integration: _handle_quota_pause applies _apply_resume_strategy on successful recovery.
+
+    Verifies that _handle_quota_pause calls _apply_resume_strategy after
+    wait_for_reset returns True, and skips it when wait_for_reset returns False.
+    """
+
+    def _make_wu_file(self, tmp_path: Path) -> Path:
+        wu = tmp_path / "E5-T4-integration.md"
+        wu.write_text(
+            "# E5-T4-integration: Test\n\n## Status: in-progress\n\n## Comments\n\n",
+            encoding="utf-8",
+        )
+        return wu
+
+    def test_handle_quota_pause_calls_apply_resume_strategy_on_recovery(self, tmp_path: Path) -> None:
+        """_handle_quota_pause invokes _apply_resume_strategy when quota recovers.
+
+        After wait_for_reset returns True, _apply_resume_strategy must be
+        called with the configured resume_strategy.
+        """
+        import asyncio
+
+        from devbench.config_loader import QuotaHandlingConfig
+        from devbench.quota import SubscriptionRateLimitError
+
+        exc = SubscriptionRateLimitError(
+            reset_at=datetime(2030, 6, 1, tzinfo=UTC),
+            raw_error="429",
+            source="anthropic-api",
+        )
+        quota_cfg = QuotaHandlingConfig(
+            enabled=True,
+            on_exhaustion="wait",
+            audit_comment_on_wait=False,
+            audit_comment_on_resume=False,
+            resume_strategy="continue_current_wu",
+        )
+        wu_file = self._make_wu_file(tmp_path)
+
+        apply_calls: list[str] = []
+
+        def _fake_apply_resume_strategy(resume_strategy: str, **_kw: object) -> None:
+            apply_calls.append(resume_strategy)
+
+        async def _fake_wait_for_reset(*_a: object, **_kw: object) -> bool:
+            return True
+
+        with (
+            patch("devbench.cli.wait_for_reset", side_effect=_fake_wait_for_reset),
+            patch("devbench.cli._apply_resume_strategy", side_effect=_fake_apply_resume_strategy),
+        ):
+            asyncio.run(
+                cli._handle_quota_pause(
+                    exc=exc,
+                    quota_cfg=quota_cfg,
+                    workspace_root=tmp_path,
+                    session_name="default",
+                    in_flight_wu_file=wu_file,
+                )
+            )
+
+        assert apply_calls == ["continue_current_wu"], (
+            f"_apply_resume_strategy must be called with 'continue_current_wu' on recovery; got: {apply_calls}"
+        )
+
+    def test_handle_quota_pause_skips_apply_resume_strategy_on_timeout(self, tmp_path: Path) -> None:
+        """_handle_quota_pause skips _apply_resume_strategy when wait_for_reset returns False."""
+        import asyncio
+
+        from devbench.config_loader import QuotaHandlingConfig
+        from devbench.quota import SubscriptionRateLimitError
+
+        exc = SubscriptionRateLimitError(
+            reset_at=datetime(2030, 6, 1, tzinfo=UTC),
+            raw_error="429",
+            source="anthropic-api",
+        )
+        quota_cfg = QuotaHandlingConfig(
+            enabled=True,
+            on_exhaustion="wait",
+            audit_comment_on_wait=False,
+            audit_comment_on_resume=False,
+            resume_strategy="restart_wu",
+        )
+        wu_file = self._make_wu_file(tmp_path)
+
+        apply_calls: list[str] = []
+
+        def _fake_apply_resume_strategy(resume_strategy: str, **_kw: object) -> None:
+            apply_calls.append(resume_strategy)
+
+        async def _fake_wait_for_reset(*_a: object, **_kw: object) -> bool:
+            return False  # timeout
+
+        with (
+            patch("devbench.cli.wait_for_reset", side_effect=_fake_wait_for_reset),
+            patch("devbench.cli._apply_resume_strategy", side_effect=_fake_apply_resume_strategy),
+        ):
+            result = asyncio.run(
+                cli._handle_quota_pause(
+                    exc=exc,
+                    quota_cfg=quota_cfg,
+                    workspace_root=tmp_path,
+                    session_name="default",
+                    in_flight_wu_file=wu_file,
+                )
+            )
+
+        assert result is False, "_handle_quota_pause must return False on timeout"
+        assert apply_calls == [], "_apply_resume_strategy must NOT be called when quota wait times out"

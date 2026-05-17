@@ -42,6 +42,9 @@ Public API:
 - :func:`save_checkpoint` -- atomically writes a :class:`QuotaCheckpoint` to
   ``<session_dir>/.devbench/quota_pause.json`` using a temp-then-rename
   strategy (POSIX ``os.replace``) so readers never see a partial file.
+- :func:`remove_checkpoint` -- deletes ``quota_pause.json`` from
+  ``<session_dir>/.devbench/`` after quota recovery.  Idempotent when the
+  file is already absent.
 - :func:`load_checkpoint` -- reads and deserializes ``quota_pause.json`` from
   ``<session_dir>/.devbench/``.  Returns ``None`` when the file is absent,
   raises :exc:`ValueError` when the file is present but malformed.
@@ -845,6 +848,37 @@ def save_checkpoint(
         with contextlib.suppress(OSError):
             tmp_path.unlink(missing_ok=True)
         raise
+
+
+# ---------------------------------------------------------------------------
+# remove_checkpoint -- delete quota_pause.json on quota recovery
+# ---------------------------------------------------------------------------
+
+
+def remove_checkpoint(session_dir: Path) -> None:
+    """Remove ``quota_pause.json`` from the session directory on quota recovery.
+
+    Deletes ``<session_dir>/.devbench/quota_pause.json`` when it exists.
+    This is called after the quota wait protocol completes successfully so
+    subsequent runs (or the quota-watcher daemon) do not interpret a stale
+    file as an active pause.
+
+    The operation is idempotent: when the file does not exist (already removed
+    by a concurrent process, or never written), this function returns normally
+    without raising.
+
+    Args:
+        session_dir: Root directory for this session.  The checkpoint file is
+            expected at ``<session_dir>/.devbench/quota_pause.json``.
+
+    Raises:
+        OSError: When the file exists but cannot be removed (e.g. permission
+            denied).  Callers must not silently swallow this -- a file that
+            cannot be removed causes the watcher daemon to re-enter wait mode
+            unnecessarily.
+    """
+    target = _checkpoint_path(session_dir)
+    target.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------

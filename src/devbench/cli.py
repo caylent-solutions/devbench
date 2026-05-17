@@ -1496,10 +1496,15 @@ def _apply_bulk_set_status(
     include_str: str,
     exclude_str: str,
 ) -> None:
-    """Apply ``force_status`` to every matched work unit and log the bulk audit row.
+    """Delegate the bulk status update to :meth:`~devbench.backlog.manager.BacklogManager.bulk_set_status`.
 
-    Units whose on-disk file cannot be resolved are skipped with a per-unit
-    warning printed to stderr; the batch continues.
+    Resolves each work-unit's on-disk file path, warns and skips any whose
+    file cannot be found, then calls :meth:`bulk_set_status` exactly once so
+    that the entire batch is serialised under a single ``flock(BACKLOG.lock)``
+    (AC-194-5).  The ``[BULK_STATUS_UPDATE]`` audit row is written by
+    ``bulk_set_status`` to the path derived from
+    ``RUNTIME_CONFIG.backlog.bulk_update_audit_path`` resolved relative to
+    ``WORKSPACE_ROOT`` (AC-194-6).
 
     Args:
         matched: Work units selected for update.
@@ -1508,10 +1513,16 @@ def _apply_bulk_set_status(
         exclude_str: Raw ``--exclude`` token (for audit log).
 
     Raises:
-        Nothing -- file-not-found cases are logged as warnings.
+        ValueError: ``new_status`` is not a recognised status value (propagated
+            from :meth:`bulk_set_status`).
+        FileNotFoundError: A work-unit file or ``BACKLOG_INDEX`` does not exist
+            (propagated from :meth:`bulk_set_status`).
+        TimeoutError: The BACKLOG.lock could not be acquired within the default
+            timeout (propagated from :meth:`bulk_set_status`).
+        OSError: An unexpected OS error from ``fcntl.flock`` or file I/O
+            (propagated from :meth:`bulk_set_status`).
     """
-    mgr = BacklogManager()
-    updated = 0
+    unit_ids: list[tuple[str, Path]] = []
     for unit in matched:
         wu_file = _resolve_unit_file(unit)
         if wu_file is None:
@@ -1521,16 +1532,14 @@ def _apply_bulk_set_status(
                 file=sys.stderr,
             )
             continue
-        mgr.force_status(wu_file, BACKLOG_INDEX, unit.id, new_status)
-        updated += 1
+        unit_ids.append((unit.id, wu_file))
 
-    logger.info(
-        "[BULK_STATUS_UPDATE] %d WUs set to '%s' by --include=%r --exclude=%r",
-        updated,
-        new_status,
-        include_str,
-        exclude_str,
-    )
+    audit_log_path = WORKSPACE_ROOT / RUNTIME_CONFIG.backlog.bulk_update_audit_path
+    audit_meta = f"--include={include_str!r} --exclude={exclude_str!r}"
+
+    mgr = BacklogManager()
+    updated = mgr.bulk_set_status(unit_ids, new_status, BACKLOG_INDEX, audit_log_path, audit_meta=audit_meta)
+
     print(
         f"Bulk set-status: updated {updated} work unit(s) to '{new_status}' "
         f"(--include={include_str!r} --exclude={exclude_str!r})"

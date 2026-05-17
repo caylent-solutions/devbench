@@ -1291,7 +1291,7 @@ class TestCmdSetStatus:
         assert result == 0
         out = capsys.readouterr().out
         assert "in-queue" in out
-        assert mock_mgr.force_status.call_count > 0
+        assert mock_mgr.bulk_set_status.call_count > 0
 
     def test_bulk_include_invalid_status_returns_1(self, capsys: pytest.CaptureFixture[str]) -> None:
         """AC-194-1: --include with invalid status returns rc=1 with actionable error."""
@@ -1333,7 +1333,9 @@ class TestCmdSetStatus:
             result = cli.cmd_set_status("--include", "E0", "--exclude", "E0-F1-S1-T3", "in-queue")
 
         assert result == 0
-        updated_ids = [call.args[2] for call in mock_mgr.force_status.call_args_list]
+        mock_mgr.bulk_set_status.assert_called_once()
+        unit_ids_arg = mock_mgr.bulk_set_status.call_args[0][0]
+        updated_ids = [uid for uid, _ in unit_ids_arg]
         assert "E0-F1-S1-T3" not in updated_ids
         assert len(updated_ids) == 2
 
@@ -1420,7 +1422,7 @@ class TestCmdSetStatus:
 
         # Should succeed for T2 even though T1/T3 files are missing
         assert result == 0
-        assert mock_mgr.force_status.call_count >= 1
+        assert mock_mgr.bulk_set_status.call_count >= 1
 
     def test_invalid_scope_token_returns_1(
         self, mock_units: list[WorkUnit], capsys: pytest.CaptureFixture[str]
@@ -1578,7 +1580,7 @@ class TestCmdSetStatus:
 
         assert result == 0
         mock_input.assert_not_called()
-        assert mock_mgr.force_status.call_count > 0
+        assert mock_mgr.bulk_set_status.call_count > 0
 
     @pytest.mark.unit
     def test_prompt_shown_when_count_exceeds_threshold(
@@ -1611,7 +1613,7 @@ class TestCmdSetStatus:
         mock_input.assert_called_once()
         prompt_text = mock_input.call_args.args[0]
         assert "3" in prompt_text  # count of matched units
-        assert mock_mgr.force_status.call_count > 0
+        assert mock_mgr.bulk_set_status.call_count > 0
 
     @pytest.mark.unit
     @pytest.mark.parametrize("answer", ["n", "N", "no", "NO", "", "nope"])
@@ -1676,7 +1678,7 @@ class TestCmdSetStatus:
 
         assert result == 0
         mock_input.assert_not_called()
-        assert mock_mgr.force_status.call_count > 0
+        assert mock_mgr.bulk_set_status.call_count > 0
 
     @pytest.mark.unit
     def test_parse_bulk_args_handles_yes_flag(self) -> None:
@@ -1721,7 +1723,7 @@ class TestCmdSetStatus:
             result = cli.cmd_set_status("--include", "E0", "in-queue")
 
         assert result == 0
-        assert mock_mgr.force_status.call_count > 0
+        assert mock_mgr.bulk_set_status.call_count > 0
 
 
 class TestCmdSetStatusBulkIntegration:
@@ -1976,6 +1978,120 @@ class TestCmdSetStatusBulkIntegration:
 
         for uid, _ in units:
             assert "in-progress" in (backlog_root / f"{uid}.md").read_text()
+
+    @pytest.mark.unit
+    def test_apply_bulk_delegates_to_bulk_set_status(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """AC-194-5: _apply_bulk_set_status calls BacklogManager.bulk_set_status (flock path).
+
+        The per-unit force_status loop must NOT be called; the single
+        bulk_set_status call provides flock serialization.
+        """
+        units = [
+            ("E1-F1-S1-T1", "in-queue"),
+            ("E1-F1-S1-T2", "in-queue"),
+        ]
+        backlog_root, backlog_index = self._build_fixture_workspace(tmp_path, units)
+
+        mock_backlog_cfg = MagicMock()
+        mock_backlog_cfg.bulk_update_confirm_threshold = 100
+        mock_backlog_cfg.bulk_update_audit_path = "logs/bulk-updates.log"
+        mock_runtime_cfg = MagicMock()
+        mock_runtime_cfg.backlog = mock_backlog_cfg
+
+        mock_mgr = MagicMock()
+        mock_mgr.bulk_set_status.return_value = 2
+
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_root),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+        ):
+            result = cli.cmd_set_status("--include", "E1", "in-progress")
+
+        assert result == 0
+        # bulk_set_status must be called exactly once with both IDs
+        mock_mgr.bulk_set_status.assert_called_once()
+        call_args = mock_mgr.bulk_set_status.call_args
+        unit_ids_arg = call_args[0][0]  # positional first arg
+        assert len(unit_ids_arg) == 2
+        ids_passed = [uid for uid, _ in unit_ids_arg]
+        assert "E1-F1-S1-T1" in ids_passed
+        assert "E1-F1-S1-T2" in ids_passed
+        # force_status must NOT be called -- the flock path is through bulk_set_status
+        mock_mgr.force_status.assert_not_called()
+
+    @pytest.mark.unit
+    def test_apply_bulk_writes_audit_row(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """AC-194-6: bulk_set_status is called with a valid audit_log_path.
+
+        The audit_log_path must be derived from
+        RUNTIME_CONFIG.backlog.bulk_update_audit_path resolved relative to
+        WORKSPACE_ROOT.  A [BULK_STATUS_UPDATE] row must appear in the audit file.
+        """
+        units = [("E1-F1-S1-T1", "in-queue")]
+        backlog_root, backlog_index = self._build_fixture_workspace(tmp_path, units)
+        audit_log_path = tmp_path / "logs" / "bulk-updates.log"
+
+        mock_backlog_cfg = MagicMock()
+        mock_backlog_cfg.bulk_update_confirm_threshold = 100
+        mock_backlog_cfg.bulk_update_audit_path = "logs/bulk-updates.log"
+        mock_runtime_cfg = MagicMock()
+        mock_runtime_cfg.backlog = mock_backlog_cfg
+
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_root),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+        ):
+            result = cli.cmd_set_status("--include", "E1", "in-progress")
+
+        assert result == 0
+        # The audit file must exist and contain the BULK_STATUS_UPDATE marker
+        assert audit_log_path.exists(), f"Audit log not created at {audit_log_path}"
+        audit_content = audit_log_path.read_text()
+        assert "[BULK_STATUS_UPDATE]" in audit_content
+        assert "in-progress" in audit_content
+
+    @pytest.mark.unit
+    def test_apply_bulk_audit_path_uses_workspace_root(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-194-6: audit_log_path is resolved relative to WORKSPACE_ROOT, not cwd.
+
+        Two separate workspace roots confirm the path is computed from
+        WORKSPACE_ROOT + RUNTIME_CONFIG.backlog.bulk_update_audit_path.
+        """
+        units = [("E1-F1-S1-T1", "in-queue")]
+        backlog_root, backlog_index = self._build_fixture_workspace(tmp_path, units)
+        custom_audit_rel = "audit/my-bulk.log"
+        expected_audit_path = tmp_path / custom_audit_rel
+
+        mock_backlog_cfg = MagicMock()
+        mock_backlog_cfg.bulk_update_confirm_threshold = 100
+        mock_backlog_cfg.bulk_update_audit_path = custom_audit_rel
+        mock_runtime_cfg = MagicMock()
+        mock_runtime_cfg.backlog = mock_backlog_cfg
+
+        mock_mgr = MagicMock()
+        mock_mgr.bulk_set_status.return_value = 1
+
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_root),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+        ):
+            result = cli.cmd_set_status("--include", "E1", "in-progress")
+
+        assert result == 0
+        call_args = mock_mgr.bulk_set_status.call_args
+        # audit_log_path is the 4th positional argument (unit_ids, new_status, backlog_index, audit_log_path)
+        audit_path_arg = call_args[0][3]
+        assert Path(audit_path_arg) == expected_audit_path
 
 
 class TestCmdMarkDone:

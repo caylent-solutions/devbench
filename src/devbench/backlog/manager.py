@@ -11,6 +11,9 @@ Public API
 ``mark_done``                 -- gated completion: verifies all required review
                                 judges passed before writing ``done``.
 ``mark_blocked``              -- writes ``blocked`` and appends a reason comment.
+``bulk_set_status``           -- set one status on many WUs under a single
+                                flock(BACKLOG.lock); writes a workspace-level
+                                ``[BULK_STATUS_UPDATE]`` audit row per call.
 ``validate``                  -- returns integrity errors (missing files, status
                                 drift, orphans, broken deps, summary mismatch).
 ``log_to_traceability_matrix``-- appends a spec/test mapping entry to the
@@ -68,6 +71,7 @@ from devbench.constants import (
     TRACEABILITY_MATRIX_HEADER,
     VALID_STATUSES,
 )
+from devbench.session import flock_backlog
 from devbench.utils.io import atomic_write_text
 
 # Terminal statuses for parent-rollup purposes: a child in either state is
@@ -242,6 +246,83 @@ class BacklogManager:
         """
         self._set_status(work_unit_path, backlog_index, unit_id, STATUS_IN_QUEUE)
         self._append_comment(work_unit_path, "UNHOLD", reason)
+
+    def bulk_set_status(
+        self,
+        unit_ids: list[tuple[str, Path]],
+        new_status: str,
+        backlog_index: Path,
+        audit_log_path: Path,
+        *,
+        audit_meta: str,
+    ) -> int:
+        """Set the same status on every work unit in the list under a single flock.
+
+        Acquires ``flock(BACKLOG.lock)`` exactly once for the entire batch so that
+        concurrent devbench sessions cannot interleave partial writes.  Every
+        per-WU update is routed through :meth:`_set_status` so existing audit
+        logic (``[WU_CLAIMED]``, checkbox ticks, parent rollup, cascade requeue)
+        continues to fire for each work unit.
+
+        After all per-WU writes complete, a single workspace-level
+        ``[BULK_STATUS_UPDATE] <count> WUs set to '<status>' by <audit_meta>``
+        row is appended to *audit_log_path* (parent directories are created
+        automatically if absent).
+
+        Args:
+            unit_ids: Ordered list of ``(unit_id, work_unit_path)`` pairs to
+                update.  Pass an empty list to record a zero-count audit row
+                without touching any files.
+            new_status: Target status string (CLI form or title-case).  Validated
+                against :data:`~devbench.constants.VALID_STATUSES` before the
+                flock is acquired; raises immediately on invalid input so no
+                partial writes occur.
+            backlog_index: Path to the ``BACKLOG.md`` index file.  The parent
+                directory of this file is used as the workspace root when
+                acquiring the flock.
+            audit_log_path: Path where the ``[BULK_STATUS_UPDATE]`` audit row is
+                appended.  The file and its parent directories are created when
+                absent.
+            audit_meta: Caller-supplied selector description appended verbatim to
+                the audit row (e.g. ``'--include="E7" --exclude="E7-F3"'``).
+
+        Returns:
+            The number of work units that were updated (equals ``len(unit_ids)``
+            on success).
+
+        Raises:
+            ValueError: *new_status* is not a recognised status value.
+            FileNotFoundError: A work-unit file or ``backlog_index`` does not
+                exist.
+            TimeoutError: The BACKLOG.lock could not be acquired within the
+                default timeout.
+            OSError: An unexpected OS error from ``fcntl.flock`` or file I/O.
+        """
+        # Validate status early -- fail fast before acquiring the lock.
+        canonical = VALID_STATUSES.get(new_status.lower())
+        if canonical is None:
+            raise ValueError(f"Invalid status '{new_status}'. Valid statuses: {', '.join(sorted(VALID_STATUSES))}")
+
+        workspace_root = backlog_index.parent
+
+        with flock_backlog(workspace_root):
+            for unit_id, work_unit_path in unit_ids:
+                self._set_status(work_unit_path, backlog_index, unit_id, canonical)
+
+        count = len(unit_ids)
+        audit_log_path.parent.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+        audit_row = f"[{timestamp}] [BULK_STATUS_UPDATE] {count} WUs set to '{canonical}' by {audit_meta}\n"
+        with audit_log_path.open("a", encoding="utf-8") as fh:
+            fh.write(audit_row)
+
+        self.logger.info(
+            "Bulk status update: %d WUs set to '%s'; audit written to %s",
+            count,
+            canonical,
+            audit_log_path,
+        )
+        return count
 
     def validate(self, backlog_index: Path, workspace_root: Path, fix: bool = False) -> list[str]:
         """Check backlog integrity and return a list of error messages.

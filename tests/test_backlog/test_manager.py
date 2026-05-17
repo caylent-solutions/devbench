@@ -5845,3 +5845,474 @@ class TestAppendAgentCommentQuotaFormat:
         assert f"reason={reason}" in content, (
             f"reason={reason} not preserved in _append_agent_comment output: {content}"
         )
+
+
+class TestBulkSetStatus:
+    """Tests for BacklogManager.bulk_set_status -- spec section 4.7.2, AC-194-5/6/7.
+
+    AC-194-5: All writes acquire flock(BACKLOG.lock) once before any per-WU _set_status call.
+    AC-194-6: Per-WU updates go through BacklogManager._set_status so audit + rollup fire.
+    AC-194-7: A workspace-level [BULK_STATUS_UPDATE] audit row is written per invocation.
+    """
+
+    # ------------------------------------------------------------------
+    # Fixture helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _make_backlog(
+        tmp_path: Path,
+        unit_specs: list[tuple[str, str]],
+    ) -> tuple[Path, Path, dict[str, Path]]:
+        """Build BACKLOG.md + per-WU files for a list of (unit_id, status) pairs.
+
+        Returns:
+            (backlog_index_path, backlog_dir, {unit_id: wu_file_path})
+        """
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir(parents=True, exist_ok=True)
+
+        rows = "\n".join(
+            f"| {uid} | Title {uid} | Task | {status} | None | repo | `backlog/{uid}.md` |"
+            for uid, status in unit_specs
+        )
+        index_content = (
+            "# Backlog\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|----------|\n"
+            f"{rows}\n\n"
+            "## Status Summary\n\n"
+            "| Status | Count |\n"
+            "|--------|-------|\n"
+            f"| in-queue | {sum(1 for _, s in unit_specs if s == 'in-queue')} |\n"
+        )
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(index_content, encoding="utf-8")
+
+        wu_paths: dict[str, Path] = {}
+        for uid, status in unit_specs:
+            wu_file = backlog_dir / f"{uid}.md"
+            wu_file.write_text(
+                f"# {uid}: Title {uid}\n\n## Status: {status}\n\n## Comments\n",
+                encoding="utf-8",
+            )
+            wu_paths[uid] = wu_file
+
+        return index_path, backlog_dir, wu_paths
+
+    # ------------------------------------------------------------------
+    # AC-194-5: Happy path -- all WUs updated, flock acquired once
+    # ------------------------------------------------------------------
+
+    @pytest.mark.unit
+    def test_bulk_set_status_updates_all_work_units(self, tmp_path: Path) -> None:
+        """bulk_set_status writes the new status to every WU file listed in unit_ids."""
+        unit_specs = [
+            ("E7-F1-S1-T1", "in-queue"),
+            ("E7-F1-S1-T2", "in-queue"),
+            ("E7-F1-S1-T3", "in-queue"),
+        ]
+        index_path, _, wu_paths = self._make_backlog(tmp_path, unit_specs)
+        audit_log = tmp_path / "logs" / "bulk-updates.log"
+        audit_log.parent.mkdir(parents=True, exist_ok=True)
+
+        mgr = BacklogManager()
+        pairs = [(uid, wu_paths[uid]) for uid, _ in unit_specs]
+        count = mgr.bulk_set_status(
+            pairs,
+            "done",
+            backlog_index=index_path,
+            audit_log_path=audit_log,
+            audit_meta='--include="E7"',
+        )
+
+        assert count == 3, f"Expected 3 updated, got {count}"
+        for uid, wu_path in pairs:
+            content = wu_path.read_text(encoding="utf-8")
+            assert "## Status: done" in content, f"{uid} file should have 'done' status; got:\n{content}"
+
+    @pytest.mark.unit
+    def test_bulk_set_status_updates_backlog_index(self, tmp_path: Path) -> None:
+        """bulk_set_status updates the BACKLOG.md index row for every WU."""
+        unit_specs = [("E7-F2-S1-T1", "in-queue"), ("E7-F2-S1-T2", "in-queue")]
+        index_path, _, wu_paths = self._make_backlog(tmp_path, unit_specs)
+        audit_log = tmp_path / "logs" / "bulk-updates.log"
+        audit_log.parent.mkdir(parents=True, exist_ok=True)
+
+        mgr = BacklogManager()
+        pairs = [(uid, wu_paths[uid]) for uid, _ in unit_specs]
+        mgr.bulk_set_status(
+            pairs,
+            "blocked",
+            backlog_index=index_path,
+            audit_log_path=audit_log,
+            audit_meta='--include="E7-F2"',
+        )
+
+        index_content = index_path.read_text(encoding="utf-8")
+        assert "blocked" in index_content, f"BACKLOG.md should contain 'blocked' after bulk update:\n{index_content}"
+        assert "in-queue" not in index_content.split("## Full Work Unit Index")[1].split("##")[0], (
+            "No 'in-queue' rows should remain in the index after bulk update to 'blocked'"
+        )
+
+    @pytest.mark.unit
+    def test_bulk_set_status_returns_count(self, tmp_path: Path) -> None:
+        """bulk_set_status returns the exact count of WUs it processed."""
+        unit_specs = [
+            ("E7-F3-T1", "in-queue"),
+            ("E7-F3-T2", "in-queue"),
+            ("E7-F3-T3", "in-queue"),
+            ("E7-F3-T4", "in-queue"),
+            ("E7-F3-T5", "in-queue"),
+        ]
+        index_path, _, wu_paths = self._make_backlog(tmp_path, unit_specs)
+        audit_log = tmp_path / "logs" / "bulk-updates.log"
+        audit_log.parent.mkdir(parents=True, exist_ok=True)
+
+        mgr = BacklogManager()
+        pairs = [(uid, wu_paths[uid]) for uid, _ in unit_specs]
+        count = mgr.bulk_set_status(
+            pairs,
+            "hold",
+            backlog_index=index_path,
+            audit_log_path=audit_log,
+            audit_meta='--include="E7-F3"',
+        )
+
+        assert count == 5
+
+    # ------------------------------------------------------------------
+    # AC-194-5: flock acquired exactly once around the entire batch
+    # ------------------------------------------------------------------
+
+    @pytest.mark.unit
+    def test_bulk_set_status_acquires_flock_once(self, tmp_path: Path) -> None:
+        """flock_backlog context manager is entered exactly once for the batch."""
+        from unittest.mock import patch
+
+        unit_specs = [("E7-F4-T1", "in-queue"), ("E7-F4-T2", "in-queue"), ("E7-F4-T3", "in-queue")]
+        index_path, _, wu_paths = self._make_backlog(tmp_path, unit_specs)
+        audit_log = tmp_path / "logs" / "bulk-updates.log"
+        audit_log.parent.mkdir(parents=True, exist_ok=True)
+
+        enter_count = 0
+
+        import contextlib
+
+        @contextlib.contextmanager
+        def fake_flock(workspace_root, timeout_seconds=30):
+            nonlocal enter_count
+            enter_count += 1
+            yield None
+
+        mgr = BacklogManager()
+        pairs = [(uid, wu_paths[uid]) for uid, _ in unit_specs]
+
+        with patch("devbench.backlog.manager.flock_backlog", fake_flock):
+            mgr.bulk_set_status(
+                pairs,
+                "in-progress",
+                backlog_index=index_path,
+                audit_log_path=audit_log,
+                audit_meta='--include="E7-F4"',
+            )
+
+        assert enter_count == 1, f"flock_backlog should be entered exactly once for the batch, got {enter_count}"
+
+    @pytest.mark.unit
+    def test_bulk_set_status_releases_flock_on_exception(self, tmp_path: Path) -> None:
+        """flock is released even when _set_status raises mid-batch."""
+        from unittest.mock import patch
+
+        unit_specs = [("E7-F5-T1", "in-queue"), ("E7-F5-T2", "in-queue")]
+        index_path, _, wu_paths = self._make_backlog(tmp_path, unit_specs)
+        audit_log = tmp_path / "logs" / "bulk-updates.log"
+        audit_log.parent.mkdir(parents=True, exist_ok=True)
+
+        released = {"flag": False}
+
+        import contextlib
+
+        @contextlib.contextmanager
+        def fake_flock(workspace_root, timeout_seconds=30):
+            try:
+                yield None
+            finally:
+                released["flag"] = True
+
+        call_count = {"n": 0}
+        original_set_status = BacklogManager._set_status
+
+        def failing_set_status(self, work_unit_path, backlog_index, unit_id, new_status, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 2:
+                raise RuntimeError("Simulated failure on second WU")
+            original_set_status(self, work_unit_path, backlog_index, unit_id, new_status, **kwargs)
+
+        mgr = BacklogManager()
+        pairs = [(uid, wu_paths[uid]) for uid, _ in unit_specs]
+
+        with (
+            patch("devbench.backlog.manager.flock_backlog", fake_flock),
+            patch.object(BacklogManager, "_set_status", failing_set_status),
+        ):
+            with pytest.raises(RuntimeError, match="Simulated failure"):
+                mgr.bulk_set_status(
+                    pairs,
+                    "blocked",
+                    backlog_index=index_path,
+                    audit_log_path=audit_log,
+                    audit_meta='--include="E7-F5"',
+                )
+
+        assert released["flag"] is True, "flock must be released even when an exception is raised"
+
+    # ------------------------------------------------------------------
+    # AC-194-6: per-WU _set_status is called so audit + rollup fire
+    # ------------------------------------------------------------------
+
+    @pytest.mark.unit
+    def test_bulk_set_status_calls_set_status_per_wu(self, tmp_path: Path) -> None:
+        """_set_status is invoked once per WU in unit_ids (not batched)."""
+        from unittest.mock import patch
+
+        unit_specs = [
+            ("E7-F6-T1", "in-queue"),
+            ("E7-F6-T2", "in-queue"),
+            ("E7-F6-T3", "in-queue"),
+        ]
+        index_path, _, wu_paths = self._make_backlog(tmp_path, unit_specs)
+        audit_log = tmp_path / "logs" / "bulk-updates.log"
+        audit_log.parent.mkdir(parents=True, exist_ok=True)
+
+        called_with: list[tuple[str, str]] = []
+        original_set_status = BacklogManager._set_status
+
+        def recording_set_status(self, work_unit_path, backlog_index, unit_id, new_status, **kwargs):
+            called_with.append((unit_id, new_status))
+            original_set_status(self, work_unit_path, backlog_index, unit_id, new_status, **kwargs)
+
+        mgr = BacklogManager()
+        pairs = [(uid, wu_paths[uid]) for uid, _ in unit_specs]
+
+        with patch.object(BacklogManager, "_set_status", recording_set_status):
+            mgr.bulk_set_status(
+                pairs,
+                "declined",
+                backlog_index=index_path,
+                audit_log_path=audit_log,
+                audit_meta='--include="E7-F6"',
+            )
+
+        assert len(called_with) == 3, f"Expected 3 _set_status calls, got {len(called_with)}"
+        for uid, _ in unit_specs:
+            matched = [(i, s) for i, s in called_with if i == uid]
+            assert len(matched) == 1, f"_set_status not called for {uid}"
+            assert matched[0][1] == "declined", f"Expected 'declined', got {matched[0][1]}"
+
+    # ------------------------------------------------------------------
+    # AC-194-7: workspace-level [BULK_STATUS_UPDATE] audit row is written
+    # ------------------------------------------------------------------
+
+    @pytest.mark.unit
+    def test_bulk_set_status_writes_audit_row(self, tmp_path: Path) -> None:
+        """A [BULK_STATUS_UPDATE] row is appended to the audit_log_path file."""
+        unit_specs = [("E7-F7-T1", "in-queue"), ("E7-F7-T2", "in-queue")]
+        index_path, _, wu_paths = self._make_backlog(tmp_path, unit_specs)
+        audit_log = tmp_path / "logs" / "bulk-updates.log"
+        audit_log.parent.mkdir(parents=True, exist_ok=True)
+
+        mgr = BacklogManager()
+        pairs = [(uid, wu_paths[uid]) for uid, _ in unit_specs]
+        mgr.bulk_set_status(
+            pairs,
+            "hold",
+            backlog_index=index_path,
+            audit_log_path=audit_log,
+            audit_meta='--include="E7-F7" --exclude="E7-F7-T3"',
+        )
+
+        assert audit_log.exists(), "audit_log_path file must be created by bulk_set_status"
+        audit_content = audit_log.read_text(encoding="utf-8")
+        assert "[BULK_STATUS_UPDATE]" in audit_content, (
+            f"Audit log must contain '[BULK_STATUS_UPDATE]'; got:\n{audit_content}"
+        )
+        assert "2 WUs" in audit_content, f"Audit row must include count '2 WUs'; got:\n{audit_content}"
+        assert "hold" in audit_content, f"Audit row must include target status 'hold'; got:\n{audit_content}"
+        assert '--include="E7-F7"' in audit_content, f"Audit row must include audit_meta; got:\n{audit_content}"
+
+    @pytest.mark.unit
+    def test_bulk_set_status_audit_row_format(self, tmp_path: Path) -> None:
+        """[BULK_STATUS_UPDATE] row matches expected format with count, status, and meta."""
+        unit_specs = [
+            ("E7-F8-T1", "in-queue"),
+            ("E7-F8-T2", "in-queue"),
+            ("E7-F8-T3", "in-queue"),
+        ]
+        index_path, _, wu_paths = self._make_backlog(tmp_path, unit_specs)
+        audit_log = tmp_path / "logs" / "bulk-updates.log"
+        audit_log.parent.mkdir(parents=True, exist_ok=True)
+
+        mgr = BacklogManager()
+        pairs = [(uid, wu_paths[uid]) for uid, _ in unit_specs]
+        mgr.bulk_set_status(
+            pairs,
+            "in-queue",
+            backlog_index=index_path,
+            audit_log_path=audit_log,
+            audit_meta='--include="E7-F8"',
+        )
+
+        audit_content = audit_log.read_text(encoding="utf-8")
+        # Must match: [BULK_STATUS_UPDATE] 3 WUs set to 'in-queue' by --include="E7-F8"
+        import re
+
+        pattern = r"\[BULK_STATUS_UPDATE\] 3 WUs set to 'in-queue' by --include=\"E7-F8\""
+        assert re.search(pattern, audit_content), (
+            f"Audit row does not match expected format.\nExpected pattern: {pattern}\nGot:\n{audit_content}"
+        )
+
+    @pytest.mark.unit
+    def test_bulk_set_status_creates_audit_log_parent_dirs(self, tmp_path: Path) -> None:
+        """bulk_set_status creates parent directories for audit_log_path if absent."""
+        unit_specs = [("E7-F9-T1", "in-queue")]
+        index_path, _, wu_paths = self._make_backlog(tmp_path, unit_specs)
+        audit_log = tmp_path / "deep" / "nested" / "logs" / "bulk.log"
+
+        assert not audit_log.parent.exists(), "Pre-condition: parent dirs must not exist"
+
+        mgr = BacklogManager()
+        pairs = [(uid, wu_paths[uid]) for uid, _ in unit_specs]
+        mgr.bulk_set_status(
+            pairs,
+            "in-queue",
+            backlog_index=index_path,
+            audit_log_path=audit_log,
+            audit_meta='--include="E7-F9"',
+        )
+
+        assert audit_log.exists(), "audit_log_path must be created including parent directories"
+
+    @pytest.mark.unit
+    def test_bulk_set_status_appends_multiple_runs(self, tmp_path: Path) -> None:
+        """Successive bulk_set_status calls append rows; they do not overwrite."""
+        unit_specs = [("E7-F10-T1", "in-queue"), ("E7-F10-T2", "in-queue")]
+        index_path, _, wu_paths = self._make_backlog(tmp_path, unit_specs)
+        audit_log = tmp_path / "logs" / "bulk.log"
+        audit_log.parent.mkdir(parents=True, exist_ok=True)
+
+        mgr = BacklogManager()
+
+        # First run: update T1 to done
+        mgr.bulk_set_status(
+            [("E7-F10-T1", wu_paths["E7-F10-T1"])],
+            "done",
+            backlog_index=index_path,
+            audit_log_path=audit_log,
+            audit_meta='--include="E7-F10-T1"',
+        )
+
+        # Revert index/file state for second run (write T2 update)
+        mgr.bulk_set_status(
+            [("E7-F10-T2", wu_paths["E7-F10-T2"])],
+            "blocked",
+            backlog_index=index_path,
+            audit_log_path=audit_log,
+            audit_meta='--include="E7-F10-T2"',
+        )
+
+        audit_content = audit_log.read_text(encoding="utf-8")
+        assert audit_content.count("[BULK_STATUS_UPDATE]") == 2, (
+            f"Expected exactly 2 [BULK_STATUS_UPDATE] rows, got:\n{audit_content}"
+        )
+
+    # ------------------------------------------------------------------
+    # Error paths
+    # ------------------------------------------------------------------
+
+    @pytest.mark.unit
+    def test_bulk_set_status_empty_list_writes_audit_row(self, tmp_path: Path) -> None:
+        """Empty unit_ids list writes a 0 WUs audit row and returns 0."""
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|----------|\n",
+            encoding="utf-8",
+        )
+        audit_log = tmp_path / "logs" / "bulk.log"
+        audit_log.parent.mkdir(parents=True, exist_ok=True)
+
+        mgr = BacklogManager()
+        count = mgr.bulk_set_status(
+            [],
+            "in-queue",
+            backlog_index=index_path,
+            audit_log_path=audit_log,
+            audit_meta='--include="E99"',
+        )
+
+        assert count == 0
+        audit_content = audit_log.read_text(encoding="utf-8")
+        assert "[BULK_STATUS_UPDATE]" in audit_content
+        assert "0 WUs" in audit_content
+
+    @pytest.mark.unit
+    def test_bulk_set_status_invalid_status_raises(self, tmp_path: Path) -> None:
+        """Invalid new_status raises ValueError before any file is written."""
+        unit_specs = [("E7-F11-T1", "in-queue")]
+        index_path, _, wu_paths = self._make_backlog(tmp_path, unit_specs)
+        audit_log = tmp_path / "logs" / "bulk.log"
+        audit_log.parent.mkdir(parents=True, exist_ok=True)
+
+        mgr = BacklogManager()
+        pairs = [(uid, wu_paths[uid]) for uid, _ in unit_specs]
+
+        with pytest.raises(ValueError, match="Invalid status"):
+            mgr.bulk_set_status(
+                pairs,
+                "not-a-real-status",
+                backlog_index=index_path,
+                audit_log_path=audit_log,
+                audit_meta='--include="E7-F11"',
+            )
+
+        # WU file must NOT have been modified
+        content = wu_paths["E7-F11-T1"].read_text(encoding="utf-8")
+        assert "## Status: in-queue" in content, "WU file should remain unchanged when invalid status is provided"
+
+    @pytest.mark.unit
+    def test_bulk_set_status_flock_workspace_root_is_backlog_index_parent(self, tmp_path: Path) -> None:
+        """flock_backlog is called with workspace_root = backlog_index.parent."""
+        import contextlib
+        from unittest.mock import patch
+
+        unit_specs = [("E7-F12-T1", "in-queue")]
+        index_path, _, wu_paths = self._make_backlog(tmp_path, unit_specs)
+        audit_log = tmp_path / "logs" / "bulk.log"
+        audit_log.parent.mkdir(parents=True, exist_ok=True)
+
+        called_with_root: list[Path] = []
+
+        @contextlib.contextmanager
+        def capturing_flock(workspace_root, timeout_seconds=30):
+            called_with_root.append(workspace_root)
+            yield None
+
+        mgr = BacklogManager()
+        pairs = [(uid, wu_paths[uid]) for uid, _ in unit_specs]
+
+        with patch("devbench.backlog.manager.flock_backlog", capturing_flock):
+            mgr.bulk_set_status(
+                pairs,
+                "in-queue",
+                backlog_index=index_path,
+                audit_log_path=audit_log,
+                audit_meta='--include="E7-F12"',
+            )
+
+        assert len(called_with_root) == 1
+        assert called_with_root[0] == index_path.parent, (
+            f"Expected workspace_root={index_path.parent}, got {called_with_root[0]}"
+        )

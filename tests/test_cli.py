@@ -19095,3 +19095,387 @@ class TestResumeStrategyIntegrationWithHandleQuotaPause:
 
         assert result is False, "_handle_quota_pause must return False on timeout"
         assert apply_calls == [], "_apply_resume_strategy must NOT be called when quota wait times out"
+
+
+# ---------------------------------------------------------------------------
+# cmd_quota_watcher tests (E5-F5-S1-T1, issue #193)
+# ---------------------------------------------------------------------------
+
+
+def _make_quota_checkpoint_file(session_dir: Path, reset_at: datetime | None = None) -> Path:
+    """Write a minimal quota_pause.json under *session_dir*/.devbench/ and return its path."""
+    import json as _json
+
+    devbench_dir = session_dir / ".devbench"
+    devbench_dir.mkdir(parents=True, exist_ok=True)
+    target = devbench_dir / "quota_pause.json"
+    payload = {
+        "paused_at": "2030-01-01T00:00:00+00:00",
+        "reset_at": reset_at.isoformat() if reset_at else None,
+        "reason": "subscription_rate_limit",
+        "raw_error": "429 Too Many Requests",
+        "in_flight_wu": None,
+        "in_flight_phase": None,
+        "completed_judges": [],
+        "pending_judges": [],
+        "stage_artefacts": {},
+    }
+    target.write_text(_json.dumps(payload), encoding="utf-8")
+    return target
+
+
+@pytest.mark.unit
+class TestCmdQuotaWatcherRegistered:
+    """quota-watcher is registered in _COMMANDS and _VARIADIC_COMMANDS (AC-193-14)."""
+
+    def test_quota_watcher_in_commands(self) -> None:
+        """'quota-watcher' key must be present in _COMMANDS."""
+        assert "quota-watcher" in cli._COMMANDS
+
+    def test_quota_watcher_in_variadic_commands(self) -> None:
+        """'quota-watcher' must be in _VARIADIC_COMMANDS so flag parsing works."""
+        assert "quota-watcher" in cli._VARIADIC_COMMANDS
+
+    def test_quota_watcher_command_maps_to_cmd_quota_watcher(self) -> None:
+        """_COMMANDS['quota-watcher'] callable must be cli.cmd_quota_watcher."""
+        func, _min_args, _desc = cli._COMMANDS["quota-watcher"]
+        assert func is cli.cmd_quota_watcher
+
+    def test_quota_watcher_min_args_is_zero(self) -> None:
+        """quota-watcher requires 0 positional args."""
+        _, min_args, _ = cli._COMMANDS["quota-watcher"]
+        assert min_args == 0
+
+
+@pytest.mark.unit
+class TestCmdQuotaWatcherArgParsing:
+    """_parse_quota_watcher_argv correctly parses --daemon and --once flags."""
+
+    def test_no_flags_returns_error(self) -> None:
+        """No flags returns error_rc=2 (neither --daemon nor --once)."""
+        mode, error_rc, error_msg = cli._parse_quota_watcher_argv(())
+        assert error_rc == 2
+        assert mode is None
+        assert "once" in error_msg.lower() or "daemon" in error_msg.lower()
+
+    def test_daemon_flag_returns_daemon_mode(self) -> None:
+        """--daemon flag returns mode='daemon' and error_rc=0."""
+        mode, error_rc, error_msg = cli._parse_quota_watcher_argv(("--daemon",))
+        assert error_rc == 0
+        assert mode == "daemon"
+        assert error_msg == ""
+
+    def test_once_flag_returns_once_mode(self) -> None:
+        """--once flag returns mode='once' and error_rc=0."""
+        mode, error_rc, error_msg = cli._parse_quota_watcher_argv(("--once",))
+        assert error_rc == 0
+        assert mode == "once"
+        assert error_msg == ""
+
+    def test_both_flags_returns_error(self) -> None:
+        """--daemon and --once together returns error_rc=2."""
+        mode, error_rc, error_msg = cli._parse_quota_watcher_argv(("--daemon", "--once"))
+        assert error_rc == 2
+        assert mode is None
+
+    def test_unknown_flag_returns_error(self) -> None:
+        """Unknown flag returns error_rc=2."""
+        mode, error_rc, error_msg = cli._parse_quota_watcher_argv(("--unknown",))
+        assert error_rc == 2
+        assert mode is None
+        assert "unknown" in error_msg.lower()
+
+    def test_once_before_daemon_also_errors(self) -> None:
+        """--once followed by --daemon returns error_rc=2."""
+        mode, error_rc, _ = cli._parse_quota_watcher_argv(("--once", "--daemon"))
+        assert error_rc == 2
+        assert mode is None
+
+
+@pytest.mark.unit
+class TestCmdQuotaWatcherInvalidArgs:
+    """cmd_quota_watcher exits with rc=2 on invalid arguments."""
+
+    def test_no_args_returns_2(self, tmp_path: Path) -> None:
+        """cmd_quota_watcher() with no args returns rc=2."""
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_quota_watcher()
+        assert rc == 2
+
+    def test_unknown_flag_returns_2(self, tmp_path: Path) -> None:
+        """cmd_quota_watcher('--invalid') returns rc=2."""
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_quota_watcher("--invalid")
+        assert rc == 2
+
+    def test_daemon_and_once_together_returns_2(self, tmp_path: Path) -> None:
+        """--daemon and --once together returns rc=2."""
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_quota_watcher("--daemon", "--once")
+        assert rc == 2
+
+
+@pytest.mark.unit
+class TestCmdQuotaWatcherCollectDirs:
+    """_collect_quota_watch_dirs returns workspace root + session dirs."""
+
+    def test_returns_workspace_root_when_no_sessions(self, tmp_path: Path) -> None:
+        """Workspace root is always included; no sessions means a single-element list."""
+        dirs = cli._collect_quota_watch_dirs(tmp_path)
+        assert tmp_path in dirs
+
+    def test_returns_session_dirs_from_registry(self, tmp_path: Path) -> None:
+        """Session state_dirs from registry are included alongside workspace root."""
+        import json as _json
+        from datetime import UTC, datetime
+
+        session_dir = tmp_path / ".devbench" / "sessions" / "alpha"
+        session_dir.mkdir(parents=True, exist_ok=True)
+        registry_path = tmp_path / ".devbench" / "sessions" / "registry.json"
+        registry_path.parent.mkdir(parents=True, exist_ok=True)
+        registry_data = [
+            {
+                "name": "alpha",
+                "pid": 99999,
+                "scope": [],
+                "started_at": datetime(2030, 1, 1, tzinfo=UTC).isoformat(),
+                "started_by": "tester",
+                "state_dir": str(session_dir),
+            }
+        ]
+        registry_path.write_text(_json.dumps(registry_data), encoding="utf-8")
+
+        dirs = cli._collect_quota_watch_dirs(tmp_path)
+
+        assert tmp_path in dirs
+        assert session_dir in dirs
+
+    def test_returns_only_workspace_root_when_registry_absent(self, tmp_path: Path) -> None:
+        """When registry.json does not exist, only workspace root is returned."""
+        dirs = cli._collect_quota_watch_dirs(tmp_path)
+        assert dirs == [tmp_path]
+
+
+@pytest.mark.unit
+class TestCmdQuotaWatcherTickOne:
+    """_quota_watcher_tick processes a single watch-dir and handles checkpoint states."""
+
+    def test_no_checkpoint_file_logs_nothing(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """When quota_pause.json is absent, _quota_watcher_tick returns 'no_checkpoint'."""
+        result = cli._quota_watcher_tick(tmp_path, recovery_probe_fn=lambda: True)
+        assert result == "no_checkpoint"
+
+    def test_checkpoint_before_reset_at_returns_wait(self, tmp_path: Path) -> None:
+        """When reset_at is in the future, tick returns 'waiting' without probing."""
+        future = datetime(2099, 12, 31, 23, 59, tzinfo=UTC)
+        _make_quota_checkpoint_file(tmp_path, reset_at=future)
+
+        probe_calls: list[bool] = []
+
+        def _probe() -> bool:
+            probe_calls.append(True)
+            return True
+
+        result = cli._quota_watcher_tick(tmp_path, recovery_probe_fn=_probe)
+        assert result == "waiting"
+        assert probe_calls == [], "probe must not be called when reset_at is in the future"
+
+    def test_checkpoint_past_reset_at_probes_and_resumes_on_green(self, tmp_path: Path) -> None:
+        """When reset_at is past and probe returns True, checkpoint is removed and returns 'resumed'."""
+        past = datetime(2000, 1, 1, tzinfo=UTC)
+        checkpoint_file = _make_quota_checkpoint_file(tmp_path, reset_at=past)
+
+        result = cli._quota_watcher_tick(tmp_path, recovery_probe_fn=lambda: True)
+
+        assert result == "resumed"
+        assert not checkpoint_file.exists(), "checkpoint file must be removed after successful probe"
+
+    def test_checkpoint_past_reset_at_probe_returns_false_keeps_file(self, tmp_path: Path) -> None:
+        """When probe returns False (still exhausted), checkpoint is kept and returns 'still_exhausted'."""
+        past = datetime(2000, 1, 1, tzinfo=UTC)
+        checkpoint_file = _make_quota_checkpoint_file(tmp_path, reset_at=past)
+
+        result = cli._quota_watcher_tick(tmp_path, recovery_probe_fn=lambda: False)
+
+        assert result == "still_exhausted"
+        assert checkpoint_file.exists(), "checkpoint file must remain when probe returns False"
+
+    def test_checkpoint_with_none_reset_at_probes_immediately(self, tmp_path: Path) -> None:
+        """When reset_at is None (no hint from vendor), probe is called immediately."""
+        _make_quota_checkpoint_file(tmp_path, reset_at=None)
+
+        probe_calls: list[bool] = []
+
+        def _probe() -> bool:
+            probe_calls.append(True)
+            return True
+
+        result = cli._quota_watcher_tick(tmp_path, recovery_probe_fn=_probe)
+        assert probe_calls, "probe must be called when reset_at is None"
+        assert result == "resumed"
+
+    def test_malformed_checkpoint_raises_value_error(self, tmp_path: Path) -> None:
+        """When quota_pause.json is present but malformed, _quota_watcher_tick raises ValueError."""
+        devbench_dir = tmp_path / ".devbench"
+        devbench_dir.mkdir(parents=True, exist_ok=True)
+        (devbench_dir / "quota_pause.json").write_text("NOT JSON", encoding="utf-8")
+
+        with pytest.raises(ValueError, match=r"quota_pause\.json"):
+            cli._quota_watcher_tick(tmp_path, recovery_probe_fn=lambda: True)
+
+
+@pytest.mark.unit
+class TestCmdQuotaWatcherOnceModeIntegration:
+    """cmd_quota_watcher --once exercises all watch dirs in one tick."""
+
+    def test_once_no_checkpoints_returns_zero(self, tmp_path: Path) -> None:
+        """--once with no checkpoint files returns rc=0."""
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_quota_watcher("--once")
+        assert rc == 0
+
+    def test_once_workspace_root_checkpoint_resumed(self, tmp_path: Path) -> None:
+        """--once removes workspace-root quota_pause.json when probe succeeds."""
+        past = datetime(2000, 1, 1, tzinfo=UTC)
+        checkpoint = _make_quota_checkpoint_file(tmp_path, reset_at=past)
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._default_recovery_probe", return_value=True),
+        ):
+            rc = cli.cmd_quota_watcher("--once")
+
+        assert rc == 0
+        assert not checkpoint.exists(), "quota_pause.json must be removed after successful probe in --once mode"
+
+    def test_once_session_checkpoint_resumed(self, tmp_path: Path) -> None:
+        """--once removes per-session quota_pause.json when probe succeeds."""
+        import json as _json
+
+        session_dir = tmp_path / ".devbench" / "sessions" / "beta"
+        session_dir.mkdir(parents=True, exist_ok=True)
+
+        registry_path = tmp_path / ".devbench" / "sessions" / "registry.json"
+        registry_data = [
+            {
+                "name": "beta",
+                "pid": 99999,
+                "scope": [],
+                "started_at": datetime(2030, 1, 1, tzinfo=UTC).isoformat(),
+                "started_by": "tester",
+                "state_dir": str(session_dir),
+            }
+        ]
+        registry_path.write_text(_json.dumps(registry_data), encoding="utf-8")
+
+        past = datetime(2000, 1, 1, tzinfo=UTC)
+        checkpoint = _make_quota_checkpoint_file(session_dir, reset_at=past)
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._default_recovery_probe", return_value=True),
+        ):
+            rc = cli.cmd_quota_watcher("--once")
+
+        assert rc == 0
+        assert not checkpoint.exists(), "per-session quota_pause.json must be removed on probe success"
+
+    def test_once_probe_failure_leaves_checkpoint(self, tmp_path: Path) -> None:
+        """--once returns rc=0 but leaves checkpoint when probe returns False."""
+        past = datetime(2000, 1, 1, tzinfo=UTC)
+        checkpoint = _make_quota_checkpoint_file(tmp_path, reset_at=past)
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._default_recovery_probe", return_value=False),
+        ):
+            rc = cli.cmd_quota_watcher("--once")
+
+        assert rc == 0
+        assert checkpoint.exists(), "quota_pause.json must remain when probe returns False"
+
+    def test_once_malformed_checkpoint_propagates_value_error(self, tmp_path: Path) -> None:
+        """--once raises ValueError when checkpoint is present but malformed (fail-fast)."""
+        devbench_dir = tmp_path / ".devbench"
+        devbench_dir.mkdir(parents=True, exist_ok=True)
+        (devbench_dir / "quota_pause.json").write_text("NOT JSON", encoding="utf-8")
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            pytest.raises(ValueError, match=r"quota_pause\.json"),
+        ):
+            cli.cmd_quota_watcher("--once")
+
+
+@pytest.mark.unit
+class TestCmdQuotaWatcherDaemonMode:
+    """cmd_quota_watcher --daemon runs tick loop until stopped."""
+
+    def test_daemon_calls_tick_repeatedly_until_interrupted(self, tmp_path: Path) -> None:
+        """--daemon calls _quota_watcher_tick for each watch dir repeatedly until KeyboardInterrupt."""
+        import asyncio as _asyncio
+
+        tick_calls: list[Path] = []
+        call_count = 0
+
+        def _fake_tick(watch_dir: Path, recovery_probe_fn: object) -> str:
+            nonlocal call_count
+            tick_calls.append(watch_dir)
+            call_count += 1
+            if call_count >= 3:
+                raise KeyboardInterrupt
+            return "no_checkpoint"
+
+        async def _instant_sleep(_seconds: float) -> None:
+            """No-op replacement for asyncio.sleep so daemon ticks are instant in tests."""
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._quota_watcher_tick", side_effect=_fake_tick),
+            patch.object(_asyncio, "sleep", side_effect=_instant_sleep),
+        ):
+            rc = cli.cmd_quota_watcher("--daemon")
+
+        assert rc == 0, "daemon mode must return 0 on KeyboardInterrupt"
+        assert call_count >= 3, "daemon must call tick at least as many times as expected"
+
+    def test_daemon_returns_zero_on_keyboard_interrupt(self, tmp_path: Path) -> None:
+        """--daemon mode exits cleanly with rc=0 on KeyboardInterrupt."""
+        import asyncio as _asyncio
+
+        call_count = 0
+
+        def _raise_after_one(*_a: object, **_kw: object) -> str:
+            nonlocal call_count
+            call_count += 1
+            raise KeyboardInterrupt
+
+        async def _instant_sleep(_seconds: float) -> None:
+            """No-op replacement for asyncio.sleep so daemon ticks are instant in tests."""
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli._quota_watcher_tick", side_effect=_raise_after_one),
+            patch.object(_asyncio, "sleep", side_effect=_instant_sleep),
+        ):
+            rc = cli.cmd_quota_watcher("--daemon")
+
+        assert rc == 0
+
+
+@pytest.mark.unit
+class TestDefaultRecoveryProbe:
+    """_default_recovery_probe delegates to quota.recovery_probe."""
+
+    def test_delegates_to_recovery_probe(self) -> None:
+        """_default_recovery_probe calls quota.recovery_probe and returns its result."""
+        with patch("devbench.cli.recovery_probe", return_value=True) as mock_probe:
+            result = cli._default_recovery_probe()
+        mock_probe.assert_called_once()
+        assert result is True
+
+    def test_propagates_false_from_recovery_probe(self) -> None:
+        """_default_recovery_probe returns False when recovery_probe returns False."""
+        with patch("devbench.cli.recovery_probe", return_value=False):
+            result = cli._default_recovery_probe()
+        assert result is False

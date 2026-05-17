@@ -54,6 +54,7 @@ All commands exit 0 on success, non-zero on failure. Output is structured
 for easy parsing by Claude Code or other automation.
 """
 
+import asyncio
 import contextlib
 import getpass
 import json
@@ -198,6 +199,8 @@ from devbench.quota import (
     SdkCreditExhaustedError,
     SubscriptionRateLimitError,
     detect_quota_error,
+    load_checkpoint,
+    recovery_probe,
     remove_checkpoint,
     save_checkpoint,
     wait_for_reset,
@@ -5631,8 +5634,6 @@ def cmd_start(*argv: str) -> int:
         as-is through the asyncio boundary; :class:`_DrainRequested` is
         caught here and handled as a clean exit.
     """
-    import asyncio
-
     from claude_agent_sdk import ClaudeAgentOptions, query
 
     parsed = _parse_start_args(argv)
@@ -6751,6 +6752,292 @@ def cmd_stop(*argv: str) -> int:
     else:
         print(success_msg)
     return rc
+
+
+# ---------------------------------------------------------------------------
+# cmd_quota_watcher helpers and implementation (E5-F5-S1-T1, issue #193)
+# ---------------------------------------------------------------------------
+
+#: Tick result returned when no quota_pause.json file exists under the watched dir.
+_TICK_NO_CHECKPOINT: str = "no_checkpoint"
+
+#: Tick result returned when the checkpoint exists but reset_at is still in the future.
+_TICK_WAITING: str = "waiting"
+
+#: Tick result returned when the recovery probe reports quota is restored and the
+#: checkpoint has been removed.
+_TICK_RESUMED: str = "resumed"
+
+#: Tick result returned when the recovery probe reports quota is still exhausted.
+_TICK_STILL_EXHAUSTED: str = "still_exhausted"
+
+#: Sleep interval (in seconds) between daemon ticks.  Sourced from the quota
+#: handling config at runtime when available; this is the fallback used when
+#: the global RUNTIME_CONFIG is not initialised (e.g. during tests).
+_QUOTA_WATCHER_DEFAULT_POLL_SECONDS: int = 60
+
+
+def _parse_quota_watcher_argv(
+    argv: tuple[str, ...],
+) -> tuple[str | None, int, str]:
+    """Parse ``cmd_quota_watcher`` arguments.
+
+    Accepted forms::
+
+        quota-watcher --daemon   -- long-running loop
+        quota-watcher --once     -- single tick
+
+    Returns a 3-tuple ``(mode, error_rc, error_msg)`` where:
+
+    - ``mode``: ``"daemon"`` or ``"once"``, or ``None`` on error.
+    - ``error_rc``: ``0`` on success, ``2`` on invalid arguments.
+    - ``error_msg``: human-readable error description (empty string on success).
+
+    Args:
+        argv: Trailing arguments after the ``quota-watcher`` command name.
+
+    Returns:
+        ``(mode, 0, "")`` on success;
+        ``(None, 2, message)`` on any parse error.
+
+    Raises:
+        SystemExit: never -- all errors are returned via error_rc.
+    """
+    has_daemon = "--daemon" in argv
+    has_once = "--once" in argv
+    unknown = [arg for arg in argv if arg.startswith("-") and arg not in ("--daemon", "--once")]
+
+    if unknown:
+        return None, 2, f"ERROR: unknown flag(s) for quota-watcher: {', '.join(unknown)}"
+
+    if has_daemon and has_once:
+        return None, 2, "ERROR: --daemon and --once are mutually exclusive"
+
+    if not has_daemon and not has_once:
+        return None, 2, "ERROR: quota-watcher requires --once or --daemon"
+
+    if has_daemon:
+        return "daemon", 0, ""
+    return "once", 0, ""
+
+
+def _collect_quota_watch_dirs(workspace_root: Path) -> list[Path]:
+    """Return all directories that may contain a ``quota_pause.json`` file.
+
+    Always includes *workspace_root* itself (for non-session runs).  Also
+    includes the ``state_dir`` of every session listed in the session
+    registry (spec section 4.5.3, AC-193-16).
+
+    When the registry file does not exist or is empty, only *workspace_root*
+    is returned.
+
+    Args:
+        workspace_root: Root directory of the devbench workspace.
+
+    Returns:
+        List of :class:`Path` objects to poll.  Workspace root is always
+        first; session dirs follow in registry order.
+
+    Raises:
+        ValueError: Propagated from :class:`~devbench.session.SessionRegistry`
+            when the registry file exists but contains invalid JSON.
+        OSError: Propagated from :class:`~devbench.session.SessionRegistry`
+            when a filesystem read fails unexpectedly.
+    """
+    dirs: list[Path] = [workspace_root]
+    registry = SessionRegistry(workspace_root)
+    sessions = registry.load()
+    for session in sessions:
+        dirs.append(session.state_dir)
+    return dirs
+
+
+def _default_recovery_probe() -> bool:
+    """Send a minimal API probe to test quota recovery.
+
+    Delegates to :func:`~devbench.quota.recovery_probe` with its default
+    arguments (1-token request, 10-second timeout).  Exists as a named
+    function so it can be patched in tests without replacing the full
+    ``recovery_probe`` symbol.
+
+    Returns:
+        ``True`` when quota has recovered; ``False`` when still exhausted.
+
+    Raises:
+        Exception: Any exception raised by
+            :func:`~devbench.quota.recovery_probe` propagates unchanged --
+            callers must decide whether to retry or surface the error.
+    """
+    return recovery_probe()
+
+
+def _quota_watcher_tick(
+    watch_dir: Path,
+    recovery_probe_fn: Callable[[], bool],
+) -> str:
+    """Perform one polling tick for *watch_dir*.
+
+    Reads ``<watch_dir>/.devbench/quota_pause.json`` when present.  When
+    the checkpoint's ``reset_at`` is still in the future, returns
+    ``"waiting"`` without probing.  When ``reset_at`` has passed (or is
+    ``None``), calls *recovery_probe_fn*:
+
+    - ``True``  -- removes the checkpoint and returns ``"resumed"``.
+    - ``False`` -- leaves the checkpoint intact and returns ``"still_exhausted"``.
+
+    When no checkpoint file is found, returns ``"no_checkpoint"``.
+
+    Args:
+        watch_dir: Root of the session or workspace being polled.
+            The checkpoint is expected at
+            ``<watch_dir>/.devbench/quota_pause.json``.
+        recovery_probe_fn: Zero-argument callable that returns ``True`` when
+            quota has recovered, ``False`` otherwise.  Must not raise on
+            normal quota-still-exhausted conditions; other exceptions
+            propagate to the caller.
+
+    Returns:
+        One of ``"no_checkpoint"``, ``"waiting"``, ``"resumed"``, or
+        ``"still_exhausted"``.
+
+    Raises:
+        ValueError: When the checkpoint file is present but malformed (bad
+            JSON, missing required fields, or unparseable datetime).  The
+            caller must handle this -- the tick must not silently continue
+            with a corrupt checkpoint.
+        OSError: Propagated from :func:`~devbench.quota.load_checkpoint` or
+            :func:`~devbench.quota.remove_checkpoint` on unexpected
+            filesystem errors.
+    """
+    checkpoint = load_checkpoint(watch_dir)
+    if checkpoint is None:
+        return _TICK_NO_CHECKPOINT
+
+    now = datetime.now(tz=UTC)
+    if checkpoint.reset_at is not None and checkpoint.reset_at > now:
+        logger.info(
+            "[QUOTA_WATCHER] dir=%s waiting; reset_at=%s",
+            watch_dir,
+            checkpoint.reset_at.isoformat(),
+        )
+        return _TICK_WAITING
+
+    recovered = recovery_probe_fn()
+    if recovered:
+        remove_checkpoint(watch_dir)
+        logger.info(
+            "[QUOTA_WATCHER] dir=%s resumed; checkpoint removed",
+            watch_dir,
+        )
+        return _TICK_RESUMED
+
+    logger.info(
+        "[QUOTA_WATCHER] dir=%s still exhausted; probe returned False",
+        watch_dir,
+    )
+    return _TICK_STILL_EXHAUSTED
+
+
+async def _quota_watcher_daemon_loop(workspace_root: Path) -> None:
+    """Run the quota-watcher daemon loop asynchronously.
+
+    Iterates over all watch dirs (workspace root + session state dirs),
+    calls :func:`_quota_watcher_tick` for each, then sleeps for
+    ``poll_interval_seconds`` (sourced from ``RUNTIME_CONFIG``) before the
+    next iteration.  Uses ``asyncio.sleep`` for the inter-tick wait so the
+    wait is consistent with the quota module's ``wait_for_reset`` approach
+    and avoids blocking the event loop.
+
+    The loop runs until a :exc:`KeyboardInterrupt` is raised (e.g. Ctrl-C
+    or SIGINT).
+
+    Args:
+        workspace_root: Root directory of the devbench workspace.  Passed to
+            :func:`_collect_quota_watch_dirs` and :func:`_quota_watcher_tick`.
+
+    Returns:
+        None -- the function returns only when interrupted by
+        :exc:`KeyboardInterrupt`.
+
+    Raises:
+        ValueError: Propagated from :func:`_quota_watcher_tick` when a
+            checkpoint file is malformed.
+        OSError: Propagated from filesystem operations inside
+            :func:`_quota_watcher_tick`.
+    """
+    poll_seconds = float(RUNTIME_CONFIG.quota_handling.poll_interval_seconds)
+    logger.info("[QUOTA_WATCHER] daemon started; poll_interval=%.1fs", poll_seconds)
+    try:
+        while True:
+            watch_dirs = _collect_quota_watch_dirs(workspace_root)
+            for watch_dir in watch_dirs:
+                result = _quota_watcher_tick(watch_dir, recovery_probe_fn=_default_recovery_probe)
+                logger.debug("[QUOTA_WATCHER] daemon tick dir=%s result=%s", watch_dir, result)
+            await asyncio.sleep(poll_seconds)
+    except KeyboardInterrupt:
+        logger.info("[QUOTA_WATCHER] daemon stopped by KeyboardInterrupt")
+
+
+def cmd_quota_watcher(*argv: str) -> int:
+    """Poll every session's quota_pause.json and resume when quota recovers.
+
+    Invocation forms::
+
+        devbench quota-watcher --once     -- single-tick: check all dirs once
+        devbench quota-watcher --daemon   -- loop: check all dirs repeatedly
+                                            until KeyboardInterrupt
+
+    For each watched directory (workspace root and every session state dir),
+    loads ``<dir>/.devbench/quota_pause.json`` when present.  When the
+    ``reset_at`` timestamp has elapsed, calls :func:`_default_recovery_probe`:
+
+    - If the probe returns ``True``, removes ``quota_pause.json`` and logs a
+      ``[QUOTA_WATCHER] resumed`` event.
+    - If the probe returns ``False``, leaves the checkpoint intact and logs a
+      ``[QUOTA_WATCHER] still_exhausted`` event.
+    - If the checkpoint does not exist, the tick is a no-op.
+
+    Logs every transition.  Returns ``rc=0`` on success, including when
+    stopped by ``KeyboardInterrupt`` in daemon mode.
+
+    Exit codes:
+
+    - 0 on success.
+    - 2 on invalid arguments (missing or unknown flags).
+
+    Args:
+        *argv: Zero or more CLI flags as individual strings.
+
+    Returns:
+        0 on success (including clean daemon shutdown via KeyboardInterrupt);
+        2 on argument parse error.
+
+    Raises:
+        ValueError: Propagated from :func:`_quota_watcher_tick` when a
+            checkpoint file is present but contains malformed data.  The
+            caller (``main``) receives the exception and exits with a
+            non-zero code via the default Python exception handler.
+        OSError: Propagated from filesystem operations inside
+            :func:`_quota_watcher_tick` when a file cannot be read or
+            removed.
+    """
+    mode, error_rc, error_msg = _parse_quota_watcher_argv(argv)
+    if error_rc != 0:
+        print(error_msg, file=sys.stderr)
+        return error_rc
+
+    watch_dirs = _collect_quota_watch_dirs(WORKSPACE_ROOT)
+
+    if mode == "once":
+        for watch_dir in watch_dirs:
+            result = _quota_watcher_tick(watch_dir, recovery_probe_fn=_default_recovery_probe)
+            logger.debug("[QUOTA_WATCHER] once tick dir=%s result=%s", watch_dir, result)
+        return 0
+
+    # daemon mode -- run the async poll loop via asyncio.run so that the
+    # inter-tick wait uses asyncio.sleep (consistent with quota.wait_for_reset).
+    asyncio.run(_quota_watcher_daemon_loop(WORKSPACE_ROOT))
+    return 0
 
 
 def cmd_request_amendment(unit_id: str) -> int:
@@ -8463,6 +8750,14 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
         0,
         ("Send SIGTERM to a named session (spec 4.4.5, issue #192): stop --session <name>"),
     ),
+    "quota-watcher": (
+        cmd_quota_watcher,
+        0,
+        (
+            "Poll quota_pause.json across sessions and resume when quota recovers "
+            "(spec 4.5.3, issue #193): quota-watcher --once | --daemon"
+        ),
+    ),
     "start": (cmd_start, 0, "Run orchestrate skill via Agent SDK (non-interactive)"),
     "scope": (
         cmd_scope,
@@ -8608,6 +8903,8 @@ _VARIADIC_COMMANDS: frozenset[str] = frozenset(
         "sessions",
         # Issue #192 E4-F5-S1-T2: stop --session <name> flag
         "stop",
+        # Issue #193 E5-F5-S1-T1: quota-watcher --once / --daemon flags
+        "quota-watcher",
     }
 )
 

@@ -17546,9 +17546,9 @@ def _make_ok_sdk() -> AsyncGenerator[str, None]:
     return _gen()
 
 
-def _make_sdk_module(query_fn: object) -> types.ModuleType:
+def _make_sdk_module(query_fn: object) -> _FakeSdkModule:
     """Return a fake claude_agent_sdk module with the given *query_fn*."""
-    mod = types.ModuleType("claude_agent_sdk")
+    mod = _FakeSdkModule()
     mod.ClaudeAgentOptions = MagicMock()
     mod.query = query_fn
     return mod
@@ -18020,9 +18020,7 @@ class TestCmdStartQuotaHandling:
         # Capture the in_flight_wu_file argument passed to _handle_quota_pause.
         captured_wu_file: list[object] = []
 
-        async def _fake_handle_quota_pause(
-            *_a: object, in_flight_wu_file: object = None, **_kw: object
-        ) -> bool:
+        async def _fake_handle_quota_pause(*_a: object, in_flight_wu_file: object = None, **_kw: object) -> bool:
             captured_wu_file.append(in_flight_wu_file)
             return True  # recovered -- restart the SDK loop
 
@@ -18044,14 +18042,11 @@ class TestCmdStartQuotaHandling:
         assert rc == 0
         assert captured_wu_file == [None], "wu_file must be None when parse_index raises OSError"
         error_calls = mock_logger.error.call_args_list
-        assert any(
-            "Failed to resolve in-flight work unit for quota checkpoint" in str(call)
-            for call in error_calls
-        ), "logger.error must be called with the diagnostic message on OSError"
+        assert any("Failed to resolve in-flight work unit for quota checkpoint" in str(call) for call in error_calls), (
+            "logger.error must be called with the diagnostic message on OSError"
+        )
 
-    def test_handle_quota_pause_raises_key_error_for_unregistered_subclass(
-        self, tmp_path: Path
-    ) -> None:
+    def test_handle_quota_pause_raises_key_error_for_unregistered_subclass(self, tmp_path: Path) -> None:
         """_handle_quota_pause raises KeyError when an unregistered QuotaExhaustedError subclass is used."""
         import asyncio
 
@@ -18083,3 +18078,261 @@ class TestCmdStartQuotaHandling:
                     in_flight_wu_file=None,
                 )
             )
+
+
+# ---------------------------------------------------------------------------
+# TestCmdStartInMessageQuotaDetection -- spec section 4.5.2 (in-message path)
+# ---------------------------------------------------------------------------
+
+
+def _make_message_sdk(messages: list[object]) -> _FakeSdkModule:
+    """Return a fake claude_agent_sdk with a query that yields *messages* in order.
+
+    Used in tests to simulate the SDK yielding message objects (not raising
+    exceptions) that carry embedded quota signals via content blocks.
+    """
+
+    async def _gen() -> AsyncGenerator[object, None]:
+        for msg in messages:
+            yield msg
+
+    def _query_fn(**_kw: object) -> AsyncGenerator[object, None]:
+        return _gen()
+
+    mod = _FakeSdkModule()
+    mod.ClaudeAgentOptions = MagicMock()
+    mod.query = _query_fn
+    return mod
+
+
+@pytest.mark.unit
+class TestCmdStartInMessageQuotaDetection:
+    """cmd_start._run inspects each SDK message via detect_quota_error (spec 4.5.2).
+
+    Quota errors can arrive as message content blocks (ToolResultBlock,
+    ErrorBlock) rather than raised exceptions.  The inner loop body must call
+    detect_quota_error(message) on every message and raise the returned
+    exception if non-None, so the outer QuotaExhaustedError handler triggers
+    the wait/resume protocol.
+    """
+
+    @pytest.mark.unit
+    def test_in_message_quota_error_triggers_wait_resume(self, tmp_path: Path) -> None:
+        """A message that detect_quota_error classifies as quota triggers _handle_quota_pause.
+
+        When detect_quota_error returns a non-None QuotaExhaustedError for a
+        yielded SDK message (simulating a ToolResultBlock or ErrorBlock carrying
+        a quota signal), _handle_quota_pause must be invoked and the loop must
+        restart on recovery.
+        """
+        import sys
+
+        from devbench.config_loader import QuotaHandlingConfig
+        from devbench.quota import SubscriptionRateLimitError
+
+        # Create a fake message object that detect_quota_error will classify
+        # as a SubscriptionRateLimitError (status_code=429 attribute).
+        class _FakeQuotaMessage:
+            status_code: int = 429
+
+        quota_message = _FakeQuotaMessage()
+        quota_cfg = QuotaHandlingConfig(enabled=True, on_exhaustion="wait", max_wait_seconds=3600)
+
+        # First query yields the quota-bearing message; second yields ok and exits.
+        query_calls: list[int] = []
+
+        async def _gen_first() -> AsyncGenerator[object, None]:
+            yield quota_message
+
+        async def _gen_second() -> AsyncGenerator[object, None]:
+            yield "ok message"
+
+        def _query_fn(**_kw: object) -> AsyncGenerator[object, None]:
+            query_calls.append(1)
+            if len(query_calls) == 1:
+                return _gen_first()
+            return _gen_second()
+
+        mod = _FakeSdkModule()
+        mod.ClaudeAgentOptions = MagicMock()
+        mod.query = _query_fn
+
+        handle_calls: list[object] = []
+
+        async def _fake_handle_quota_pause(exc: object, **_kw: object) -> bool:
+            handle_calls.append(exc)
+            return True  # recovered -- restart
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mod}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.RUNTIME_CONFIG") as mock_cfg,
+            patch("devbench.cli.ScopeFilter"),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+            patch("devbench.cli._handle_quota_pause", side_effect=_fake_handle_quota_pause),
+        ):
+            mock_cfg.quota_handling = quota_cfg
+            rc = cli.cmd_start()
+
+        assert rc == 0
+        assert len(handle_calls) == 1, "_handle_quota_pause must be called once for in-message quota"
+        assert isinstance(handle_calls[0], SubscriptionRateLimitError), (
+            "The raised exception must be classified as SubscriptionRateLimitError"
+        )
+
+    @pytest.mark.unit
+    def test_in_message_non_quota_message_does_not_trigger_handler(self, tmp_path: Path) -> None:
+        """A normal (non-quota) message passes through without invoking _handle_quota_pause.
+
+        When detect_quota_error returns None for a yielded message, the loop
+        continues normally and _handle_quota_pause is never invoked.
+        """
+        import sys
+
+        from devbench.config_loader import QuotaHandlingConfig
+
+        quota_cfg = QuotaHandlingConfig(enabled=True, on_exhaustion="wait", max_wait_seconds=3600)
+
+        # A plain string message carries no quota signal.
+        mod = _make_message_sdk(["normal message"])
+
+        handle_calls: list[object] = []
+
+        async def _fake_handle_quota_pause(*_a: object, **_kw: object) -> bool:
+            handle_calls.append(True)
+            return True
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mod}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.RUNTIME_CONFIG") as mock_cfg,
+            patch("devbench.cli.ScopeFilter"),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+            patch("devbench.cli._handle_quota_pause", side_effect=_fake_handle_quota_pause),
+        ):
+            mock_cfg.quota_handling = quota_cfg
+            rc = cli.cmd_start()
+
+        assert rc == 0
+        assert len(handle_calls) == 0, "_handle_quota_pause must NOT be called for normal messages"
+
+    @pytest.mark.unit
+    def test_in_message_quota_disabled_raises_quota_error(self, tmp_path: Path) -> None:
+        """When quota_handling.enabled=False, in-message quota error propagates unhandled.
+
+        Even when the quota signal arrives via a message block rather than a
+        raised exception, the QuotaExhaustedError raised inside the loop must
+        propagate when quota_handling is disabled.
+        """
+        import sys
+
+        from devbench.config_loader import QuotaHandlingConfig
+        from devbench.quota import SubscriptionRateLimitError
+
+        quota_cfg = QuotaHandlingConfig(enabled=False)
+
+        class _FakeQuotaMessage:
+            status_code: int = 429
+
+        quota_message = _FakeQuotaMessage()
+        mod = _make_message_sdk([quota_message])
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mod}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.RUNTIME_CONFIG") as mock_cfg,
+        ):
+            mock_cfg.quota_handling = quota_cfg
+
+            with pytest.raises(SubscriptionRateLimitError):
+                cli.cmd_start()
+
+    @pytest.mark.unit
+    def test_in_message_quota_on_exhaustion_fail_raises_system_exit(self, tmp_path: Path) -> None:
+        """When on_exhaustion='fail', in-message quota error causes SystemExit with non-zero rc."""
+        import sys
+
+        from devbench.config_loader import QuotaHandlingConfig
+
+        quota_cfg = QuotaHandlingConfig(enabled=True, on_exhaustion="fail")
+
+        class _FakeQuotaMessage:
+            status_code: int = 429
+
+        quota_message = _FakeQuotaMessage()
+        mod = _make_message_sdk([quota_message])
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mod}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.RUNTIME_CONFIG") as mock_cfg,
+        ):
+            mock_cfg.quota_handling = quota_cfg
+
+            with pytest.raises(SystemExit) as exc_info:
+                cli.cmd_start()
+
+        assert exc_info.value.code != 0
+
+    @pytest.mark.unit
+    def test_in_message_bedrock_throttle_triggers_wait_resume(self, tmp_path: Path) -> None:
+        """A Bedrock-throttle-shaped message triggers _handle_quota_pause via detect_quota_error.
+
+        Validates that the in-message detection path handles BedrockThrottleError
+        shapes (not just HTTP 429) so all detect_quota_error branches are exercised.
+        """
+        import sys
+
+        from devbench.config_loader import QuotaHandlingConfig
+        from devbench.quota import BedrockThrottleError
+
+        quota_cfg = QuotaHandlingConfig(enabled=True, on_exhaustion="wait", max_wait_seconds=3600)
+
+        class _FakeBedrockMessage:
+            """Simulates a botocore ClientError with a Bedrock ThrottlingException shape."""
+
+            def __init__(self) -> None:
+                self.response: dict = {"Error": {"Code": "ThrottlingException"}}
+
+        bedrock_message = _FakeBedrockMessage()
+
+        query_calls: list[int] = []
+
+        async def _gen_first() -> AsyncGenerator[object, None]:
+            yield bedrock_message
+
+        async def _gen_second() -> AsyncGenerator[object, None]:
+            yield "ok"
+
+        def _query_fn(**_kw: object) -> AsyncGenerator[object, None]:
+            query_calls.append(1)
+            if len(query_calls) == 1:
+                return _gen_first()
+            return _gen_second()
+
+        mod = _FakeSdkModule()
+        mod.ClaudeAgentOptions = MagicMock()
+        mod.query = _query_fn
+
+        handle_calls: list[object] = []
+
+        async def _fake_handle_quota_pause(exc: object, **_kw: object) -> bool:
+            handle_calls.append(exc)
+            return True
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mod}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.RUNTIME_CONFIG") as mock_cfg,
+            patch("devbench.cli.ScopeFilter"),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+            patch("devbench.cli._handle_quota_pause", side_effect=_fake_handle_quota_pause),
+        ):
+            mock_cfg.quota_handling = quota_cfg
+            rc = cli.cmd_start()
+
+        assert rc == 0
+        assert len(handle_calls) == 1, "_handle_quota_pause must be called once"
+        assert isinstance(handle_calls[0], BedrockThrottleError), (
+            "In-message Bedrock throttle must produce BedrockThrottleError"
+        )

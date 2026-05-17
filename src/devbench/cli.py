@@ -197,6 +197,7 @@ from devbench.quota import (
     QuotaExhaustedError,
     SdkCreditExhaustedError,
     SubscriptionRateLimitError,
+    detect_quota_error,
     save_checkpoint,
     wait_for_reset,
 )
@@ -5634,8 +5635,11 @@ def cmd_start(*argv: str) -> int:
         """Iterate SDK messages with quota-wait-and-resume and drain enforcement.
 
         Outer ``while True:`` restarts the SDK query loop on quota recovery.
-        Inner loop processes SDK messages and raises :class:`_DrainRequested`
-        when a ``devbench claim`` tool-use is detected while a drain is pending.
+        Inner loop processes SDK messages, inspects each one via
+        :func:`~devbench.quota.detect_quota_error` to catch quota errors
+        embedded in content blocks (e.g. ToolResultBlock, ErrorBlock), and
+        raises :class:`_DrainRequested` when a ``devbench claim`` tool-use is
+        detected while a drain is pending.
 
         When quota handling is enabled (``quota_cfg.enabled``), a caught
         :class:`~devbench.quota.QuotaExhaustedError` invokes
@@ -5680,6 +5684,9 @@ def cmd_start(*argv: str) -> int:
                     ),
                 ):
                     logger.info("sdk message: %s", message)
+                    in_message_quota_exc = detect_quota_error(message)
+                    if in_message_quota_exc is not None:
+                        raise in_message_quota_exc
                     if _is_claim_tool_use(message):
                         drain_state = read_drain_state(WORKSPACE_ROOT)
                         if drain_state is not None:
@@ -5704,9 +5711,7 @@ def cmd_start(*argv: str) -> int:
                     wu = _find_in_flight_wu(units)
                     wu_file: Path | None = wu.file_path if wu is not None else None
                 except (OSError, ValueError) as exc:
-                    logger.error(
-                        "Failed to resolve in-flight work unit for quota checkpoint: %s", exc
-                    )
+                    logger.error("Failed to resolve in-flight work unit for quota checkpoint: %s", exc)
                     wu_file = None
                 recovered = await _handle_quota_pause(
                     exc=quota_exc,

@@ -15109,6 +15109,316 @@ class TestCmdDrainIntegration:
 
 
 # ---------------------------------------------------------------------------
+# cmd_drain --session / --all (E4-F5-S1-T3, issue #192)
+# AC-192-7, AC-192-8
+# ---------------------------------------------------------------------------
+
+
+class TestParseDrainArgvSessionAll:
+    """_parse_drain_argv correctly handles --session and --all flags (AC-192-7, AC-192-8)."""
+
+    @pytest.mark.unit
+    def test_session_flag_returns_session_target(self) -> None:
+        """--session <name> yields mode='request', session_target=name."""
+        mode, reason, session_target, rc, msg = cli._parse_drain_argv(("--session", "alpha"))
+        assert rc == 0
+        assert mode == "request"
+        assert session_target == "alpha"
+        assert msg == ""
+
+    @pytest.mark.unit
+    def test_session_flag_without_value_returns_error(self) -> None:
+        """--session without a following value yields rc=2."""
+        mode, reason, session_target, rc, msg = cli._parse_drain_argv(("--session",))
+        assert rc == 2
+        assert mode is None
+        assert "session" in msg.lower()
+
+    @pytest.mark.unit
+    def test_session_flag_with_reason_returns_error(self) -> None:
+        """--session and --reason are not combinable."""
+        mode, reason, session_target, rc, msg = cli._parse_drain_argv(("--session", "alpha", "--reason", "x"))
+        assert rc == 2
+        assert mode is None
+
+    @pytest.mark.unit
+    def test_session_flag_with_cancel_returns_error(self) -> None:
+        """--session and --cancel are not combinable."""
+        mode, reason, session_target, rc, msg = cli._parse_drain_argv(("--session", "alpha", "--cancel"))
+        assert rc == 2
+        assert mode is None
+
+    @pytest.mark.unit
+    def test_session_flag_with_status_returns_error(self) -> None:
+        """--session and --status are not combinable."""
+        mode, reason, session_target, rc, msg = cli._parse_drain_argv(("--session", "alpha", "--status"))
+        assert rc == 2
+        assert mode is None
+
+    @pytest.mark.unit
+    def test_all_flag_returns_all_target(self) -> None:
+        """--all yields mode='request', session_target='__all__'."""
+        mode, reason, session_target, rc, msg = cli._parse_drain_argv(("--all",))
+        assert rc == 0
+        assert mode == "request"
+        assert session_target == "__all__"
+        assert msg == ""
+
+    @pytest.mark.unit
+    def test_all_flag_with_cancel_returns_error(self) -> None:
+        """--all and --cancel are not combinable."""
+        mode, reason, session_target, rc, msg = cli._parse_drain_argv(("--all", "--cancel"))
+        assert rc == 2
+        assert mode is None
+
+    @pytest.mark.unit
+    def test_all_flag_with_status_returns_error(self) -> None:
+        """--all and --status are not combinable."""
+        mode, reason, session_target, rc, msg = cli._parse_drain_argv(("--all", "--status"))
+        assert rc == 2
+        assert mode is None
+
+    @pytest.mark.unit
+    def test_all_flag_with_session_flag_returns_error(self) -> None:
+        """--all and --session are mutually exclusive."""
+        mode, reason, session_target, rc, msg = cli._parse_drain_argv(("--all", "--session", "alpha"))
+        assert rc == 2
+        assert mode is None
+
+    @pytest.mark.unit
+    def test_no_session_flags_returns_none_target(self) -> None:
+        """Plain request (no --session / --all) yields session_target=None."""
+        mode, reason, session_target, rc, msg = cli._parse_drain_argv(())
+        assert rc == 0
+        assert mode == "request"
+        assert session_target is None
+
+    @pytest.mark.unit
+    def test_cancel_returns_none_target(self) -> None:
+        """--cancel yields session_target=None."""
+        mode, reason, session_target, rc, msg = cli._parse_drain_argv(("--cancel",))
+        assert rc == 0
+        assert mode == "cancel"
+        assert session_target is None
+
+    @pytest.mark.unit
+    def test_status_returns_none_target(self) -> None:
+        """--status yields session_target=None."""
+        mode, reason, session_target, rc, msg = cli._parse_drain_argv(("--status",))
+        assert rc == 0
+        assert mode == "status"
+        assert session_target is None
+
+    @pytest.mark.unit
+    def test_empty_session_name_returns_error(self) -> None:
+        """--session with an empty string value yields rc=2."""
+        mode, reason, session_target, rc, msg = cli._parse_drain_argv(("--session", ""))
+        assert rc == 2
+        assert mode is None
+        assert "session" in msg.lower()
+
+
+class TestCmdDrainSessionFlag:
+    """cmd_drain --session <name> writes the drain signal to the named session's state dir (AC-192-7)."""
+
+    @pytest.mark.unit
+    def test_session_drain_creates_signal_in_session_state_dir(self, tmp_path: Path) -> None:
+        """drain --session alpha writes drain.signal into the session's state dir."""
+        from devbench.constants import SESSION_DRAIN_SIGNAL_FILENAME, SESSION_SESSIONS_BASE_DIR
+
+        state_dir = tmp_path / SESSION_SESSIONS_BASE_DIR / "alpha"
+        state_dir.mkdir(parents=True, exist_ok=True)
+
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_drain("--session", "alpha")
+
+        assert rc == 0
+        signal_path = state_dir / SESSION_DRAIN_SIGNAL_FILENAME
+        assert signal_path.exists(), "drain.signal must exist in the session state dir"
+
+    @pytest.mark.unit
+    def test_session_drain_does_not_touch_workspace_root_signal(self, tmp_path: Path) -> None:
+        """drain --session alpha must NOT write the workspace-root drain.signal."""
+        from devbench.constants import SESSION_SESSIONS_BASE_DIR
+
+        state_dir = tmp_path / SESSION_SESSIONS_BASE_DIR / "alpha"
+        state_dir.mkdir(parents=True, exist_ok=True)
+
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            cli.cmd_drain("--session", "alpha")
+
+        workspace_signal = tmp_path / ".devbench" / "drain.signal"
+        assert not workspace_signal.exists(), "workspace-root drain.signal must NOT be created"
+
+    @pytest.mark.unit
+    def test_session_drain_missing_session_dir_returns_error(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """drain --session <nonexistent> returns rc=1 with an actionable stderr message."""
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_drain("--session", "nonexistent")
+
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "nonexistent" in err, f"Session name must appear in error: {err!r}"
+
+    @pytest.mark.unit
+    def test_session_flag_without_value_returns_rc2(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """drain --session with no value returns rc=2."""
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_drain("--session")
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert err, "An error message must be written to stderr"
+
+    @pytest.mark.unit
+    def test_session_drain_reason_roundtrip(self, tmp_path: Path) -> None:
+        """drain --session alpha stores the reason in the session signal file."""
+        import json as _json
+
+        from devbench.constants import SESSION_DRAIN_SIGNAL_FILENAME, SESSION_SESSIONS_BASE_DIR
+
+        state_dir = tmp_path / SESSION_SESSIONS_BASE_DIR / "alpha"
+        state_dir.mkdir(parents=True, exist_ok=True)
+
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_drain("--session", "alpha")
+
+        assert rc == 0
+        signal_path = state_dir / SESSION_DRAIN_SIGNAL_FILENAME
+        data = _json.loads(signal_path.read_text())
+        assert "requested_by" in data
+
+    @pytest.mark.unit
+    def test_session_and_reason_combined_return_error(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """drain --session alpha --reason x is invalid; returns rc=2."""
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_drain("--session", "alpha", "--reason", "x")
+        assert rc == 2
+
+
+class TestCmdDrainAllFlag:
+    """cmd_drain --all writes drain signals for every active session (AC-192-8)."""
+
+    @pytest.mark.unit
+    def test_drain_all_writes_signals_for_every_session(self, tmp_path: Path) -> None:
+        """drain --all creates drain.signal in each active session's state dir."""
+        import os as _os
+
+        from devbench.constants import SESSION_DRAIN_SIGNAL_FILENAME, SESSION_SESSIONS_BASE_DIR
+        from devbench.session import Session, SessionRegistry
+
+        now = datetime.now(tz=UTC)
+        session_alpha = Session(
+            name="alpha",
+            pid=_os.getpid(),
+            scope=[],
+            started_at=now,
+            started_by="tester",
+            state_dir=tmp_path / SESSION_SESSIONS_BASE_DIR / "alpha",
+        )
+        session_beta = Session(
+            name="beta",
+            pid=_os.getpid(),
+            scope=[],
+            started_at=now,
+            started_by="tester",
+            state_dir=tmp_path / SESSION_SESSIONS_BASE_DIR / "beta",
+        )
+        for s in [session_alpha, session_beta]:
+            s.state_dir.mkdir(parents=True, exist_ok=True)
+
+        registry = SessionRegistry(tmp_path)
+        registry.save([session_alpha, session_beta])
+
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_drain("--all")
+
+        assert rc == 0
+        for s in [session_alpha, session_beta]:
+            signal_path = s.state_dir / SESSION_DRAIN_SIGNAL_FILENAME
+            assert signal_path.exists(), f"drain.signal missing for session {s.name!r}"
+
+    @pytest.mark.unit
+    def test_drain_all_does_not_touch_workspace_root_signal(self, tmp_path: Path) -> None:
+        """drain --all must NOT write the workspace-root drain.signal."""
+        import os as _os
+
+        from devbench.constants import SESSION_SESSIONS_BASE_DIR
+        from devbench.session import Session, SessionRegistry
+
+        now = datetime.now(tz=UTC)
+        session_alpha = Session(
+            name="alpha",
+            pid=_os.getpid(),
+            scope=[],
+            started_at=now,
+            started_by="tester",
+            state_dir=tmp_path / SESSION_SESSIONS_BASE_DIR / "alpha",
+        )
+        session_alpha.state_dir.mkdir(parents=True, exist_ok=True)
+        registry = SessionRegistry(tmp_path)
+        registry.save([session_alpha])
+
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            cli.cmd_drain("--all")
+
+        workspace_signal = tmp_path / ".devbench" / "drain.signal"
+        assert not workspace_signal.exists(), "workspace-root drain.signal must NOT be created"
+
+    @pytest.mark.unit
+    def test_drain_all_with_no_active_sessions_prints_message(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """drain --all with no active sessions prints an informational message and returns rc=0."""
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_drain("--all")
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert out, "An informational message must be printed when no sessions are active"
+
+    @pytest.mark.unit
+    def test_drain_all_with_cancel_returns_rc2(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """drain --all --cancel is invalid; returns rc=2."""
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_drain("--all", "--cancel")
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert err
+
+    @pytest.mark.unit
+    def test_drain_all_prints_count_of_drained_sessions(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """drain --all prints how many sessions were drained."""
+        import os as _os
+
+        from devbench.constants import SESSION_SESSIONS_BASE_DIR
+        from devbench.session import Session, SessionRegistry
+
+        now = datetime.now(tz=UTC)
+        session_gamma = Session(
+            name="gamma",
+            pid=_os.getpid(),
+            scope=[],
+            started_at=now,
+            started_by="tester",
+            state_dir=tmp_path / SESSION_SESSIONS_BASE_DIR / "gamma",
+        )
+        session_gamma.state_dir.mkdir(parents=True, exist_ok=True)
+        registry = SessionRegistry(tmp_path)
+        registry.save([session_gamma])
+
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            rc = cli.cmd_drain("--all")
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "1" in out or "gamma" in out, f"Expected count or session name in output: {out!r}"
+
+
+# ---------------------------------------------------------------------------
 # _DrainRequested sentinel + cmd_start drain check (E3-F3-S1-T1, issue #188)
 # AC-188-4, AC-188-5, AC-188-8
 # ---------------------------------------------------------------------------

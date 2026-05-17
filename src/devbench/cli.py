@@ -54,6 +54,7 @@ All commands exit 0 on success, non-zero on failure. Output is structured
 for easy parsing by Claude Code or other automation.
 """
 
+import contextlib
 import getpass
 import json
 import logging
@@ -170,6 +171,7 @@ from devbench.constants import (
     SESSION_DEFAULT_NAME,
     SESSION_DRAIN_SIGNAL_FILENAME,
     SESSION_PID_FILENAME,
+    SESSION_SESSIONS_BASE_DIR,
     SESSION_STARTED_AT_FILENAME,
     SESSION_STARTED_BY_FILENAME,
     STATUS_BLOCKED,
@@ -181,7 +183,7 @@ from devbench.constants import (
     STATUS_SEPARATOR_WIDTH,
     VALID_TDD_PHASES,
 )
-from devbench.drain import cancel_drain, consume_drain, read_drain_state, request_drain
+from devbench.drain import DrainState, _current_user, cancel_drain, consume_drain, read_drain_state, request_drain
 from devbench.log_setup import setup_logging
 from devbench.plugin_shadow import (
     materialise_shadow_plugin,
@@ -5700,14 +5702,23 @@ def cmd_scope(*argv: str) -> int:
     return 2
 
 
-def _parse_drain_argv(argv: tuple[str, ...]) -> tuple[str | None, str, int, str]:
-    """Parse ``cmd_drain`` arguments into (mode, reason, error_rc, error_msg).
+def _parse_drain_argv(argv: tuple[str, ...]) -> tuple[str | None, str, str | None, int, str]:
+    """Parse ``cmd_drain`` arguments into (mode, reason, session_target, error_rc, error_msg).
 
-    Returns a 4-tuple:
+    Returns a 5-tuple:
+
     - ``mode``: one of ``"request"``, ``"cancel"``, ``"status"``, or ``None`` on error.
     - ``reason``: the value of ``--reason`` (empty string when not given).
+    - ``session_target``: one of:
+        - ``None`` -- workspace-level drain (no ``--session`` / ``--all`` flag).
+        - A session name string -- drain only that session (``--session <name>``).
+        - ``"__all__"`` -- drain every active session (``--all``).
     - ``error_rc``: 0 on success, 2 on error.
     - ``error_msg``: human-readable error description (empty string on success).
+
+    ``--session`` and ``--all`` are only valid for the ``request`` mode; combining
+    them with ``--cancel``, ``--status``, or ``--reason`` yields rc=2.  ``--session``
+    and ``--all`` are mutually exclusive with each other.
 
     Raises:
         SystemExit: never -- all errors are returned with error_rc=2.
@@ -5715,25 +5726,178 @@ def _parse_drain_argv(argv: tuple[str, ...]) -> tuple[str | None, str, int, str]
     has_cancel = "--cancel" in argv
     has_status = "--status" in argv
     has_reason = "--reason" in argv
+    has_session = "--session" in argv
+    has_all = "--all" in argv
 
-    exclusive_count = sum([has_cancel, has_status, has_reason])
-    if exclusive_count > 1:
-        return None, "", 2, "ERROR: --cancel, --status, and --reason are mutually exclusive"
+    error_msg = _drain_argv_validate_flags(
+        has_cancel=has_cancel,
+        has_status=has_status,
+        has_reason=has_reason,
+        has_session=has_session,
+        has_all=has_all,
+    )
+    if error_msg:
+        return None, "", None, 2, error_msg
 
     if has_cancel:
-        return "cancel", "", 0, ""
+        return "cancel", "", None, 0, ""
     if has_status:
-        return "status", "", 0, ""
+        return "status", "", None, 0, ""
 
-    # Build reason from --reason VALUE
-    reason = ""
-    if has_reason:
-        idx = argv.index("--reason")
-        if idx + 1 >= len(argv):
-            return None, "", 2, "ERROR: --reason requires a value"
-        reason = argv[idx + 1]
+    reason, reason_err = _drain_argv_parse_reason(argv, has_reason)
+    if reason_err:
+        return None, "", None, 2, reason_err
 
-    return "request", reason, 0, ""
+    session_target, session_err = _drain_argv_parse_session_target(argv, has_all, has_session)
+    if session_err:
+        return None, "", None, 2, session_err
+
+    return "request", reason, session_target, 0, ""
+
+
+def _drain_argv_validate_flags(
+    *,
+    has_cancel: bool,
+    has_status: bool,
+    has_reason: bool,
+    has_session: bool,
+    has_all: bool,
+) -> str:
+    """Return a non-empty error message string when flag combinations are invalid, else empty string.
+
+    Raises:
+        Nothing -- all results are returned as strings.
+    """
+    if has_session and has_all:
+        return "ERROR: --session and --all are mutually exclusive"
+    if (has_session or has_all) and (has_cancel or has_status or has_reason):
+        return "ERROR: --session and --all cannot be combined with --cancel, --status, or --reason"
+    if sum([has_cancel, has_status, has_reason]) > 1:
+        return "ERROR: --cancel, --status, and --reason are mutually exclusive"
+    return ""
+
+
+def _drain_argv_parse_reason(argv: tuple[str, ...], has_reason: bool) -> tuple[str, str]:
+    """Return ``(reason, error_msg)`` from *argv*.
+
+    When *has_reason* is ``True``, extracts the value following ``--reason``.
+    Returns ``("", error_msg)`` if the value is missing.
+
+    Raises:
+        Nothing -- all results are returned as tuples.
+    """
+    if not has_reason:
+        return "", ""
+    idx = argv.index("--reason")
+    if idx + 1 >= len(argv):
+        return "", "ERROR: --reason requires a value"
+    return argv[idx + 1], ""
+
+
+def _drain_argv_parse_session_target(argv: tuple[str, ...], has_all: bool, has_session: bool) -> tuple[str | None, str]:
+    """Return ``(session_target, error_msg)`` from *argv*.
+
+    ``session_target`` is ``"__all__"``, a session name, or ``None`` for the
+    workspace-root path.  Returns ``(None, error_msg)`` when ``--session`` is
+    missing its value.
+
+    Raises:
+        Nothing -- all results are returned as tuples.
+    """
+    if has_all:
+        return "__all__", ""
+    if has_session:
+        idx = argv.index("--session")
+        if idx + 1 >= len(argv) or not argv[idx + 1]:
+            return None, "ERROR: --session requires a non-empty session name"
+        return argv[idx + 1], ""
+    return None, ""
+
+
+def _request_drain_for_session(workspace: Path, session_name: str, reason: str) -> int:
+    """Write the drain signal into a specific named session's state directory.
+
+    Validates that the session state directory exists before writing.  Does not
+    rely on ``DEVBENCH_SESSION_NAME`` -- the path is constructed directly from
+    *session_name* so the caller's environment does not affect which file is
+    written (spec 4.4.4, AC-192-7).
+
+    Args:
+        workspace: Root directory of the devbench workspace.
+        session_name: Name of the target session (must correspond to an existing
+            state directory under ``<workspace>/.devbench/sessions/<name>/``).
+        reason: Optional free-form reason string (may be empty).
+
+    Returns:
+        0 on success; 1 when the session state directory does not exist.
+
+    Raises:
+        OSError: The write or rename step fails for a reason other than a missing
+            directory (e.g. disk full, permission denied).
+    """
+    session_state_dir = workspace / SESSION_SESSIONS_BASE_DIR / session_name
+    if not session_state_dir.is_dir():
+        print(
+            f"ERROR: session {session_name!r} does not exist (no state directory at {session_state_dir})",
+            file=sys.stderr,
+        )
+        return 1
+
+    signal_path = session_state_dir / SESSION_DRAIN_SIGNAL_FILENAME
+    # Construct and write the drain signal directly to the session path.
+    # request_drain(workspace) cannot be used here because it resolves the path
+    # via DEVBENCH_SESSION_NAME -- we need an explicit path regardless of the
+    # caller's environment (spec 4.4.4, AC-192-7).
+    state = DrainState(
+        requested_at=datetime.now(tz=UTC),
+        requested_by=_current_user(),
+        reason=reason,
+    )
+    payload = json.dumps(state.to_dict(), indent=2)
+    tmp = signal_path.parent / "drain.tmp"
+    try:
+        tmp.write_text(payload, encoding="utf-8")
+    except Exception:
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
+        raise
+    tmp.rename(signal_path)
+    return 0
+
+
+def _request_drain_for_all_sessions(workspace: Path, reason: str) -> int:
+    """Write the drain signal for every session in the active session registry.
+
+    Reads the session registry via :class:`~devbench.session.SessionRegistry` and
+    writes ``drain.signal`` into each session's state directory.  Does not touch
+    the workspace-root drain signal (spec 4.4.4, AC-192-8).
+
+    If no active sessions are registered, prints an informational message and
+    returns rc=0 (idempotent; not an error).
+
+    Args:
+        workspace: Root directory of the devbench workspace.
+        reason: Optional free-form reason string (may be empty).
+
+    Returns:
+        0 on success (including the no-sessions case).
+
+    Raises:
+        OSError: A filesystem operation fails when writing a session drain signal.
+        ValueError: The session registry file contains invalid JSON.
+    """
+    registry = SessionRegistry(workspace)
+    sessions = registry.load()
+    if not sessions:
+        print("No active sessions -- nothing to drain.")
+        return 0
+
+    for session in sessions:
+        _request_drain_for_session(workspace, session.name, reason)
+
+    names = ", ".join(s.name for s in sessions)
+    print(f"Drain signal written for {len(sessions)} session(s): {names}")
+    return 0
 
 
 def cmd_drain(*argv: str) -> int:
@@ -5741,27 +5905,36 @@ def cmd_drain(*argv: str) -> int:
 
     Invocation forms::
 
-        devbench drain                    -- request drain with empty reason
-        devbench drain --reason "<text>"  -- request drain with reason
-        devbench drain --cancel           -- withdraw drain request; idempotent
-        devbench drain --status           -- print drain state or 'no drain pending'; rc=0
+        devbench drain                        -- request workspace-root drain (empty reason)
+        devbench drain --reason "<text>"      -- request workspace-root drain with reason
+        devbench drain --cancel               -- withdraw workspace-root drain; idempotent
+        devbench drain --status               -- print workspace-root drain state; rc=0
+        devbench drain --session <name>       -- drain only the named session (AC-192-7)
+        devbench drain --all                  -- drain every active session (AC-192-8)
 
-    All success paths return rc=0.  Mutually exclusive flag combinations
-    (e.g. ``--cancel --status``) and ``--reason`` without a following value
-    return rc=2 with a distinct diagnostic on stderr for each error condition.
+    ``--session`` and ``--all`` are only valid for plain drain requests; combining
+    them with ``--cancel``, ``--status``, or ``--reason`` is an error (rc=2).
+
+    All success paths return rc=0.  Mutually exclusive flag combinations and
+    missing required values return rc=2 with a distinct diagnostic on stderr
+    for each error condition.
 
     Args:
         *argv: Zero or more CLI flags as individual strings.
 
     Returns:
-        0 on success; 2 on invalid argument combination or missing ``--reason`` value.
+        0 on success; 1 when the named session does not exist (``--session`` path);
+        2 on invalid argument combination or missing ``--reason`` / ``--session`` value.
 
     Raises:
-        OSError: Propagated from :func:`~devbench.drain.request_drain` or
-            :func:`~devbench.drain.cancel_drain` when a filesystem operation
-            fails for a reason other than a missing file.
+        OSError: Propagated from :func:`~devbench.drain.request_drain`,
+            :func:`~devbench.drain.cancel_drain`, or
+            :func:`~devbench.cli._request_drain_for_session` when a filesystem
+            operation fails for a reason other than a missing file.
+        ValueError: Propagated from :class:`~devbench.session.SessionRegistry` when
+            the registry file contains invalid JSON (``--all`` path only).
     """
-    mode, reason, error_rc, error_msg = _parse_drain_argv(argv)
+    mode, reason, session_target, error_rc, error_msg = _parse_drain_argv(argv)
     if error_rc != 0:
         print(error_msg, file=sys.stderr)
         return error_rc
@@ -5777,6 +5950,12 @@ def cmd_drain(*argv: str) -> int:
         else:
             print(str(state))
         return 0
+
+    if session_target == "__all__":
+        return _request_drain_for_all_sessions(WORKSPACE_ROOT, reason)
+
+    if session_target is not None:
+        return _request_drain_for_session(WORKSPACE_ROOT, session_target, reason)
 
     request_drain(WORKSPACE_ROOT, reason=reason)
     return 0

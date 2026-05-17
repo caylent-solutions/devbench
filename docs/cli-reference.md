@@ -29,6 +29,7 @@ Commands that run a blocking external process (git, tests, judges) propagate the
 - [Backlog read](#backlog-read)
 - [Backlog write](#backlog-write)
 - [Drain (graceful orchestrator stop)](#drain-graceful-orchestrator-stop)
+- [Named sessions](#named-sessions)
 - [Scope selectors (printer-pages syntax)](#scope-selectors-printer-pages-syntax)
 - [Orchestration and reporting](#orchestration-and-reporting)
 - [Orchestrator helpers (invoked by agents)](#orchestrator-helpers-invoked-by-agents)
@@ -45,7 +46,7 @@ Non-mutating commands for inspecting backlog state.
 ### `status`
 
 ```
-uv run devbench status [--detail] [--include "<tokens>"] [--exclude "<tokens>"]
+uv run devbench status [--detail] [--include "<tokens>"] [--exclude "<tokens>"] [--session <name>]
 ```
 
 Print a summary of the backlog grouped by status. Output includes counts per lifecycle value (draft, in-queue, in-progress, in-review, done, blocked, proposed, declined, hold) plus an always-rendered `Un-materialised` count of proposal JSONs pending materialisation. Also lists active and blocked work units by ID.
@@ -56,6 +57,10 @@ The summary includes a `Draft N` row rendered between the `TOTAL` line and the `
 
 - `--include "<tokens>"` -- one-off include selector using printer-pages syntax. Overrides any active `scope.json` when supplied. Accepts comma-separated tokens (single IDs or last-segment ranges). See [Scope selectors](#scope-selectors-printer-pages-syntax) for the full syntax reference.
 - `--exclude "<tokens>"` -- one-off exclude selector. Subtracts the matched IDs from the include set. Applied after include expansion.
+
+**Named-session filter flag:**
+
+- `--session <name>` -- filter the output to the work units claimed by the named session. Only events emitted under `session=<name>` are counted; the status counts and active-task list reflect that session's view only. Without `--session`, the command aggregates across all active sessions and renders the unified backlog state. See [Named sessions](#named-sessions) for the full session reference.
 
 When neither flag is supplied, `devbench status` consults the active `<workspace>/.devbench/scope.json` (if present) and applies its filter automatically. When a scope is active -- whether from flags or from `scope.json` -- a `SCOPE:` banner is printed above the Status Summary:
 
@@ -100,10 +105,12 @@ Print the next actionable work unit as JSON. Returns `ALL_DONE` when every unit 
 ### `report`
 
 ```
-uv run devbench report [--once|--no-stream] [--since <ISO-8601>] [--watch N] [--include "<tokens>"] [--exclude "<tokens>"]
+uv run devbench report [--once|--no-stream] [--since <ISO-8601>] [--watch N] [--include "<tokens>"] [--exclude "<tokens>"] [--session <name>]
 ```
 
 **Scope filter flags:** `--include` and `--exclude` accept the same printer-pages-style tokens as `status`, `next`, and `start`. One-off flags override any active `scope.json`; when neither flag is supplied, the active `scope.json` (if present) is consulted automatically. When a scope is active, only work units within the scope's `expanded_ids` set are counted in the per-epic Status Summary table. See [Scope selectors](#scope-selectors-printer-pages-syntax) for the token syntax.
+
+**Named-session filter flag:** `--session <name>` restricts the report to the work units and log events associated with the named session. The per-epic Status Summary, velocity, and cost panels reflect that session's activity only. Without `--session`, the command aggregates across all active sessions -- equivalent to the pre-session single-session behaviour and the default for new workspaces. See [Named sessions](#named-sessions) for the full session reference.
 
 Print the progress report with velocity, token consumption, and estimated cost. Default layout renders two side-by-side tables: **All-time** (full log) and **Current run** (most recent contiguous block of orchestration events, boundary detected as a gap over 10 minutes between consecutive `Set X to ...` log lines).
 
@@ -482,7 +489,7 @@ See [Scope selectors](#scope-selectors-printer-pages-syntax) for the full token 
 ### `start`
 
 ```
-uv run devbench start [--include "<tokens>"] [--exclude "<tokens>"]
+uv run devbench start [--include "<tokens>"] [--exclude "<tokens>"] [--name <name>] [--allow-overlap]
 ```
 
 Run the orchestrate SKILL non-interactively via the Agent SDK. Invoked by `make start` (the recommended way to run DevBench). Loads the plugin ad-hoc from the devbench checkout; no global `make plugin-install` required. When the workspace's `backlog/config/devbench.yaml` declares an `agents:` block (see [`docs/adr/25-per-agent-model-overrides.md`](adr/25-per-agent-model-overrides.md)), `start` materialises a workspace-local shadow plugin tree at `<workspace>/.devbench/plugin-shadow/devbench/` and passes that path to the SDK in place of the canonical plugin.
@@ -496,6 +503,12 @@ When `--include` is supplied, the parsed scope is persisted to `<workspace>/.dev
 
 When `--include` is omitted (the default), all work units are eligible -- the existing behaviour is fully preserved.
 
+**Named-session flags:**
+
+- `--name <name>` -- assign the orchestrator session a unique name. The session creates a per-session state directory at `<workspace>/.devbench/sessions/<name>/` containing a `pid` file, `scope.json`, `drain.signal`, `orchestrator.log`, `report.json`, `started_at`, and `started_by` files. The session is registered in `<workspace>/.devbench/sessions/registry.json`. When `--name` is omitted, the session defaults to `default`, preserving the single-session behaviour exactly. The session name is exported as `DEVBENCH_SESSION_NAME` for all subprocesses, which drives per-session routing of logs, drain signals, and scope files. See [Named sessions](#named-sessions) for the full lifecycle reference.
+
+- `--allow-overlap` -- by default, `devbench start` checks active sessions for scope overlap before registering the new session. If the new session's `expanded_ids` intersects any active session's scope, the command fails fast with a clear error naming the conflicting work unit IDs and the owning session(s). Pass `--allow-overlap` to skip this check and start the session anyway; a warning is printed listing the conflicting IDs. The atomic claim arbitration (`flock(BACKLOG.lock)`) resolves the race deterministically when two sessions attempt to claim the same work unit -- only one wins. Use `--allow-overlap` only when the operator has verified that the overlapping IDs are intended (for example, two read-only reporting sessions).
+
 **Example -- scope to epics E1 through E3 plus E5:**
 
 ```bash
@@ -506,6 +519,16 @@ uv run devbench start --include "E1-E3, E5"
 
 ```bash
 uv run devbench start --include "E1-E10" --exclude "E5, E7-F3"
+```
+
+**Example -- launch two named sessions with disjoint scopes:**
+
+```bash
+# Terminal 1: session "alpha" works on E1 through E3
+uv run devbench start --name alpha --include "E1-E3"
+
+# Terminal 2: session "beta" works on E4 through E6
+uv run devbench start --name beta --include "E4-E6"
 ```
 
 To pre-arm scope.json without immediately launching the orchestrator, use `devbench scope set` instead.
@@ -618,6 +641,113 @@ uv run devbench start --include "E1-F2-S3-T4"
 ```
 
 **Status banner:** when a drain signal is present, `devbench status` prepends a `DRAIN REQUESTED: at <ts> by <user> (reason: <text>)` banner above the Status Summary so the operator can see the pending drain at a glance. See the [`status`](#status) section for the full banner format.
+
+---
+
+## Named sessions
+
+Named sessions let multiple independent orchestrator processes run concurrently against the same workspace without corrupting the shared backlog. Each session operates on a disjoint scope, writes to per-session log and drain files, and is registered in a shared `registry.json` so operators can inspect and manage running sessions. Spec source: `spec/devbench-self-improve.md` section 4.4. Issue #192. ADR-23.
+
+Per-session state lives under `<workspace>/.devbench/sessions/<name>/`:
+
+| File | Purpose |
+|------|---------|
+| `pid` | The orchestrator process's PID. Used for liveness checks and SIGTERM delivery. |
+| `scope.json` | Session-scoped scope filter (overrides workspace-root `scope.json`). |
+| `drain.signal` | Session-scoped drain marker (overrides workspace-root `drain.signal`). |
+| `orchestrator.log` | Per-session log, written in addition to the aggregate `<workspace>/logs/orchestrator.log`. |
+| `report.json` | Session-scoped report cache. |
+| `started_at` | ISO 8601 UTC timestamp of session start. |
+| `started_by` | OS user that launched the session (`USER` / `USERNAME` env var, or `"unknown"`). |
+
+The `default` session name is applied implicitly when `--name` is omitted from `devbench start`; single-session operators see no behaviour change.
+
+**[WU_CLAIMED] audit format extension (spec 4.4.7):** when `DEVBENCH_SESSION_NAME` is set (an active named session), the work-unit audit comment written at claim time extends to:
+
+```
+[WU_CLAIMED] Set <id> to 'in-progress' session=<name>
+```
+
+When `DEVBENCH_SESSION_NAME` is unset (single-session legacy behaviour), the comment format is unchanged:
+
+```
+[WU_CLAIMED] Set <id> to 'in-progress'
+```
+
+### `sessions`
+
+```
+uv run devbench sessions [--cleanup]
+```
+
+List all registered orchestrator sessions and their liveness state. Each row in the output includes: session name, PID, scope (included ID count or the raw token list), `started_at` timestamp, drain state (`pending` or `none`), and a liveness indicator (`ACTIVE` when the process is running; `STALE` when the PID is no longer alive).
+
+- **`devbench sessions`** (no flags) -- print a table of all sessions currently in `<workspace>/.devbench/sessions/registry.json`. Stale sessions are listed but not removed, so operators can review them before cleanup. Exits 0 in all cases, even when no sessions are registered (prints `no sessions registered`).
+
+- **`devbench sessions --cleanup`** -- remove session directories whose `pid` file references a non-running process. Stale session entries are removed from `registry.json` and the corresponding `<workspace>/.devbench/sessions/<name>/` directory is deleted. Active sessions are left untouched. Prints one line per removed session (`[CLEANED] session <name> (pid <N>)`). Exits 0 on success.
+
+**Exit codes:**
+
+| Command | rc=0 | rc!=0 |
+|---------|------|-------|
+| `sessions` | Success (zero or more sessions listed). | Startup errors (unset env vars) raise immediately. |
+| `sessions --cleanup` | Success (zero or more stale sessions removed). | Filesystem errors propagate as unhandled OSError. |
+
+**Worked examples:**
+
+```bash
+# List all registered sessions:
+uv run devbench sessions
+# Output (example):
+#   NAME     PID    SCOPE        STARTED_AT              DRAIN    LIVENESS
+#   alpha    12345  E1-E3 (42)   2026-05-14T13:42:00Z    none     ACTIVE
+#   beta     99999  E4-E6 (37)   2026-05-14T13:50:00Z    none     STALE
+
+# Remove stale sessions:
+uv run devbench sessions --cleanup
+# -> [CLEANED] session beta (pid 99999)
+```
+
+### `stop`
+
+```
+uv run devbench stop --session <name>
+```
+
+Send SIGTERM to a running session's orchestrator process, forcing it to exit after the in-flight work unit is marked `blocked`. The SIGTERM is delivered via the session's `pid` file located at `<workspace>/.devbench/sessions/<name>/pid`.
+
+**What happens when stop runs:**
+
+1. `devbench stop` reads the session's `pid` file.
+2. Sends SIGTERM to the process.
+3. The SIGTERM handler in `cmd_start` intercepts the signal, writes a `[FORCED_BLOCKED_ON_STOP] session=<name>` audit comment to the in-flight work unit, marks the work unit `blocked`, and exits with rc=0.
+4. The session directory is NOT cleaned up automatically -- run `devbench sessions --cleanup` afterward to remove the stale entry.
+
+**Flags:**
+
+- `--session <name>` -- REQUIRED. The name of the session to stop. Exits 1 with an actionable error when the session does not exist in the registry, the `pid` file is missing, or the process is not running.
+
+**Exit codes:**
+
+| Scenario | rc |
+|----------|----|
+| SIGTERM delivered successfully. | 0 |
+| Session not found in registry. | 1 |
+| PID file missing or unreadable. | 1 |
+| Process already exited (stale session). | 1 (with actionable message; run `devbench sessions --cleanup`). |
+| `--session` flag omitted. | 2 (argument-parse error). |
+
+**Worked example:**
+
+```bash
+# Stop the session named "alpha" and block its in-flight work unit:
+uv run devbench stop --session alpha
+# The orchestrator for session "alpha" receives SIGTERM, blocks its WU, and exits.
+# The in-flight WU now carries: [FORCED_BLOCKED_ON_STOP] session=alpha
+
+# Clean up the stale session entry:
+uv run devbench sessions --cleanup
+```
 
 ---
 

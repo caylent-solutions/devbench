@@ -6,7 +6,7 @@ import contextlib
 import json
 import re
 import types
-from collections.abc import Generator
+from collections.abc import AsyncGenerator, Generator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar
@@ -17514,3 +17514,572 @@ class TestDispatchWatchCommandsSession:
 
         assert rc == 0
         assert captured.get("session") == "alpha"
+
+
+# ---------------------------------------------------------------------------
+# TestCmdStartQuotaHandling -- spec section 4.5.2, AC-193-5, AC-193-13
+# ---------------------------------------------------------------------------
+
+
+def _make_quota_exhausted_sdk(exc: BaseException) -> AsyncGenerator[str, None]:
+    """Return an async generator that immediately raises *exc*.
+
+    Used in tests to simulate the SDK raising a QuotaExhaustedError during
+    ``async for message in query(...)``.  The return type annotation is
+    AsyncGenerator[str, None] so mypy accepts this as a valid async generator
+    without type-ignore suppressions.
+    """
+
+    async def _gen() -> AsyncGenerator[str, None]:
+        raise exc
+        yield  # make this a valid async generator body
+
+    return _gen()
+
+
+def _make_ok_sdk() -> AsyncGenerator[str, None]:
+    """Return an async generator that yields one message and exits cleanly."""
+
+    async def _gen() -> AsyncGenerator[str, None]:
+        yield "ok message"
+
+    return _gen()
+
+
+def _make_sdk_module(query_fn: object) -> types.ModuleType:
+    """Return a fake claude_agent_sdk module with the given *query_fn*."""
+    mod = types.ModuleType("claude_agent_sdk")
+    mod.ClaudeAgentOptions = MagicMock()
+    mod.query = query_fn
+    return mod
+
+
+@pytest.mark.unit
+class TestCmdStartQuotaHandling:
+    """cmd_start._run wraps SDK query in try/except QuotaExhaustedError (spec 4.5.2)."""
+
+    def _make_wu_file(self, tmp_path: Path) -> Path:
+        """Create a minimal work-unit file with a Comments section."""
+        wu = tmp_path / "E5-F4-S1-T1.md"
+        wu.write_text(
+            "# E5-F4-S1-T1: Test WU\n\n## Status: in-progress\n\n## Comments\n\n",
+            encoding="utf-8",
+        )
+        return wu
+
+    def test_quota_disabled_raises_through(self, tmp_path: Path) -> None:
+        """When quota_handling.enabled=False, QuotaExhaustedError propagates unhandled."""
+        import sys
+
+        from devbench.config_loader import QuotaHandlingConfig
+        from devbench.quota import SubscriptionRateLimitError
+
+        exc = SubscriptionRateLimitError(
+            reset_at=datetime(2030, 1, 1, tzinfo=UTC),
+            raw_error="429",
+            source="anthropic-api",
+        )
+        quota_cfg = QuotaHandlingConfig(enabled=False)
+
+        mock_sdk = _make_sdk_module(lambda **_kw: _make_quota_exhausted_sdk(exc))
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.RUNTIME_CONFIG") as mock_cfg,
+        ):
+            mock_cfg.quota_handling = quota_cfg
+
+            with pytest.raises(SubscriptionRateLimitError):
+                cli.cmd_start()
+
+    def test_quota_enabled_wait_and_resume_returns_zero(self, tmp_path: Path) -> None:
+        """When quota_handling.enabled=True and wait_for_reset returns True, cmd_start returns 0."""
+        import sys
+
+        from devbench.config_loader import QuotaHandlingConfig
+        from devbench.quota import SubscriptionRateLimitError
+
+        exc = SubscriptionRateLimitError(
+            reset_at=datetime(2030, 1, 1, tzinfo=UTC),
+            raw_error="429",
+            source="anthropic-api",
+        )
+        quota_cfg = QuotaHandlingConfig(enabled=True, on_exhaustion="wait", max_wait_seconds=60)
+
+        query_calls: list[int] = []
+
+        def _query_factory(**_kw: object) -> AsyncGenerator[str, None]:
+            query_calls.append(1)
+            if len(query_calls) == 1:
+                return _make_quota_exhausted_sdk(exc)
+            return _make_ok_sdk()
+
+        mock_sdk = _make_sdk_module(_query_factory)
+        handle_calls: list[int] = []
+
+        async def _fake_handle_quota_pause(*_a: object, **_kw: object) -> bool:
+            handle_calls.append(1)
+            return True
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.RUNTIME_CONFIG") as mock_cfg,
+            patch("devbench.cli.ScopeFilter"),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+            patch("devbench.cli._handle_quota_pause", side_effect=_fake_handle_quota_pause),
+        ):
+            mock_cfg.quota_handling = quota_cfg
+
+            rc = cli.cmd_start()
+
+        assert rc == 0
+        assert len(handle_calls) == 1, "_handle_quota_pause must be called exactly once"
+
+    def test_quota_on_exhaustion_fail_raises_system_exit(self, tmp_path: Path) -> None:
+        """When on_exhaustion='fail', cmd_start exits with non-zero rc on quota error."""
+        import sys
+
+        from devbench.config_loader import QuotaHandlingConfig
+        from devbench.quota import SubscriptionRateLimitError
+
+        exc = SubscriptionRateLimitError(
+            reset_at=datetime(2030, 1, 1, tzinfo=UTC),
+            raw_error="429",
+            source="anthropic-api",
+        )
+        quota_cfg = QuotaHandlingConfig(enabled=True, on_exhaustion="fail")
+        mock_sdk = _make_sdk_module(lambda **_kw: _make_quota_exhausted_sdk(exc))
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.RUNTIME_CONFIG") as mock_cfg,
+        ):
+            mock_cfg.quota_handling = quota_cfg
+
+            with pytest.raises(SystemExit) as exc_info:
+                cli.cmd_start()
+
+        assert exc_info.value.code != 0
+
+    def test_quota_timeout_triggers_drain(self, tmp_path: Path) -> None:
+        """When on_exhaustion_timeout='drain', wait timeout calls request_drain."""
+        import sys
+
+        from devbench.config_loader import QuotaHandlingConfig
+        from devbench.quota import SubscriptionRateLimitError
+
+        exc = SubscriptionRateLimitError(
+            reset_at=datetime(2030, 1, 1, tzinfo=UTC),
+            raw_error="429",
+            source="anthropic-api",
+        )
+        quota_cfg = QuotaHandlingConfig(
+            enabled=True,
+            on_exhaustion="wait",
+            max_wait_seconds=0,
+            on_exhaustion_timeout="drain",
+        )
+        mock_sdk = _make_sdk_module(lambda **_kw: _make_quota_exhausted_sdk(exc))
+
+        async def _fake_handle_quota_pause(*_a: object, **_kw: object) -> bool:
+            return False  # simulate timeout
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.RUNTIME_CONFIG") as mock_cfg,
+            patch("devbench.cli._handle_quota_pause", side_effect=_fake_handle_quota_pause),
+            patch("devbench.cli.request_drain") as mock_request_drain,
+        ):
+            mock_cfg.quota_handling = quota_cfg
+
+            rc = cli.cmd_start()
+
+        mock_request_drain.assert_called_once()
+        assert rc == 0
+
+    def test_quota_timeout_keep_waiting_triggers_drain(self, tmp_path: Path) -> None:
+        """on_exhaustion_timeout='keep_waiting' calls request_drain when wait returns False."""
+        import sys
+
+        from devbench.config_loader import QuotaHandlingConfig
+        from devbench.quota import SubscriptionRateLimitError
+
+        exc = SubscriptionRateLimitError(
+            reset_at=datetime(2030, 1, 1, tzinfo=UTC),
+            raw_error="429",
+            source="anthropic-api",
+        )
+        quota_cfg = QuotaHandlingConfig(
+            enabled=True,
+            on_exhaustion="wait",
+            max_wait_seconds=0,
+            on_exhaustion_timeout="keep_waiting",
+        )
+        mock_sdk = _make_sdk_module(lambda **_kw: _make_quota_exhausted_sdk(exc))
+
+        async def _fake_handle_quota_pause(*_a: object, **_kw: object) -> bool:
+            return False  # simulate timeout
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.RUNTIME_CONFIG") as mock_cfg,
+            patch("devbench.cli._handle_quota_pause", side_effect=_fake_handle_quota_pause),
+            patch("devbench.cli.request_drain") as mock_request_drain,
+        ):
+            mock_cfg.quota_handling = quota_cfg
+
+            rc = cli.cmd_start()
+
+        mock_request_drain.assert_called_once()
+        assert rc == 0
+
+    def test_handle_quota_pause_saves_checkpoint(self, tmp_path: Path) -> None:
+        """_handle_quota_pause saves quota_pause.json checkpoint via save_checkpoint."""
+        import asyncio
+
+        from devbench.config_loader import QuotaHandlingConfig
+        from devbench.quota import SubscriptionRateLimitError, load_checkpoint
+
+        reset_time = datetime(2030, 6, 1, 12, 0, 0, tzinfo=UTC)
+        exc = SubscriptionRateLimitError(
+            reset_at=reset_time,
+            raw_error="429",
+            source="anthropic-api",
+        )
+        quota_cfg = QuotaHandlingConfig(
+            enabled=True,
+            on_exhaustion="wait",
+            audit_comment_on_wait=False,
+            audit_comment_on_resume=False,
+        )
+
+        wu_file = self._make_wu_file(tmp_path)
+
+        async def _fake_wait_for_reset(*_a: object, **_kw: object) -> bool:
+            return True
+
+        with patch("devbench.cli.wait_for_reset", side_effect=_fake_wait_for_reset):
+            result = asyncio.run(
+                cli._handle_quota_pause(
+                    exc=exc,
+                    quota_cfg=quota_cfg,
+                    workspace_root=tmp_path,
+                    session_name="default",
+                    in_flight_wu_file=wu_file,
+                )
+            )
+
+        assert result is True
+        checkpoint = load_checkpoint(tmp_path)
+        assert checkpoint is not None
+        assert checkpoint.reason == "subscription_rate_limit"
+        assert checkpoint.reset_at == reset_time
+
+    def test_handle_quota_pause_quota_waiting_audit_comment(self, tmp_path: Path) -> None:
+        """_handle_quota_pause writes [QUOTA_WAITING] audit comment to WU file when configured."""
+        import asyncio
+
+        from devbench.config_loader import QuotaHandlingConfig
+        from devbench.quota import SubscriptionRateLimitError
+
+        reset_time = datetime(2030, 6, 1, 12, 0, 0, tzinfo=UTC)
+        exc = SubscriptionRateLimitError(
+            reset_at=reset_time,
+            raw_error="429",
+            source="anthropic-api",
+        )
+        quota_cfg = QuotaHandlingConfig(
+            enabled=True,
+            on_exhaustion="wait",
+            audit_comment_on_wait=True,
+            audit_comment_on_resume=False,
+        )
+
+        wu_file = self._make_wu_file(tmp_path)
+
+        async def _fake_wait_for_reset(*_a: object, **_kw: object) -> bool:
+            return True
+
+        with patch("devbench.cli.wait_for_reset", side_effect=_fake_wait_for_reset):
+            asyncio.run(
+                cli._handle_quota_pause(
+                    exc=exc,
+                    quota_cfg=quota_cfg,
+                    workspace_root=tmp_path,
+                    session_name="default",
+                    in_flight_wu_file=wu_file,
+                )
+            )
+
+        content = wu_file.read_text(encoding="utf-8")
+        assert "[QUOTA_WAITING]" in content
+        assert "reason=subscription_rate_limit" in content
+
+    def test_handle_quota_pause_quota_resumed_audit_comment(self, tmp_path: Path) -> None:
+        """_handle_quota_pause writes [QUOTA_RESUMED] audit comment to WU file when configured."""
+        import asyncio
+
+        from devbench.config_loader import QuotaHandlingConfig
+        from devbench.quota import SubscriptionRateLimitError
+
+        reset_time = datetime(2030, 6, 1, 12, 0, 0, tzinfo=UTC)
+        exc = SubscriptionRateLimitError(
+            reset_at=reset_time,
+            raw_error="429",
+            source="anthropic-api",
+        )
+        quota_cfg = QuotaHandlingConfig(
+            enabled=True,
+            on_exhaustion="wait",
+            audit_comment_on_wait=False,
+            audit_comment_on_resume=True,
+        )
+
+        wu_file = self._make_wu_file(tmp_path)
+
+        async def _fake_wait_for_reset(*_a: object, **_kw: object) -> bool:
+            return True
+
+        with patch("devbench.cli.wait_for_reset", side_effect=_fake_wait_for_reset):
+            asyncio.run(
+                cli._handle_quota_pause(
+                    exc=exc,
+                    quota_cfg=quota_cfg,
+                    workspace_root=tmp_path,
+                    session_name="default",
+                    in_flight_wu_file=wu_file,
+                )
+            )
+
+        content = wu_file.read_text(encoding="utf-8")
+        assert "[QUOTA_RESUMED]" in content
+        assert "waited_seconds=" in content
+
+    def test_quota_end_to_end_wait_resume_without_handle_quota_pause_mock(self, tmp_path: Path) -> None:
+        """Full cmd_start->QuotaExhaustedError->_handle_quota_pause->wait_for_reset->restart flow.
+
+        Exercises the complete quota-wait-and-resume path without patching
+        _handle_quota_pause, testing the real integration between _run(),
+        _handle_quota_pause(), and save_checkpoint() against a constructed
+        fixture workspace.
+        """
+        import sys
+
+        from devbench.config_loader import QuotaHandlingConfig
+        from devbench.quota import SubscriptionRateLimitError, load_checkpoint
+
+        reset_time = datetime(2030, 6, 1, tzinfo=UTC)
+        exc = SubscriptionRateLimitError(
+            reset_at=reset_time,
+            raw_error="429",
+            source="anthropic-api",
+        )
+        quota_cfg = QuotaHandlingConfig(
+            enabled=True,
+            on_exhaustion="wait",
+            audit_comment_on_wait=False,
+            audit_comment_on_resume=False,
+            max_wait_seconds=3600,
+        )
+
+        # Create a minimal in-progress work unit file.
+        wu_file = self._make_wu_file(tmp_path)
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text("# Backlog\n", encoding="utf-8")
+
+        query_calls: list[int] = []
+
+        def _query_factory(**_kw: object) -> AsyncGenerator[str, None]:
+            query_calls.append(1)
+            if len(query_calls) == 1:
+                return _make_quota_exhausted_sdk(exc)
+            return _make_ok_sdk()
+
+        mock_sdk = _make_sdk_module(_query_factory)
+
+        wu_mock = MagicMock()
+        wu_mock.file_path = wu_file
+        wu_mock.status.value = "in-progress"
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.RUNTIME_CONFIG") as mock_cfg,
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.BacklogParser") as mock_parser_cls,
+            patch("devbench.cli.ScopeFilter"),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+            patch("devbench.cli.wait_for_reset", return_value=True),
+        ):
+            mock_cfg.quota_handling = quota_cfg
+            mock_parser_cls.return_value.parse_index.return_value = [wu_mock]
+
+            rc = cli.cmd_start()
+
+        assert rc == 0
+        assert len(query_calls) == 2, "query must be called twice (once for quota, once after resume)"
+        checkpoint = load_checkpoint(tmp_path)
+        assert checkpoint is not None
+        assert checkpoint.reason == "subscription_rate_limit"
+
+    def test_quota_on_exhaustion_drain_calls_request_drain(self, tmp_path: Path) -> None:
+        """When on_exhaustion='drain', QuotaExhaustedError calls request_drain once and rc==0."""
+        import sys
+
+        from devbench.config_loader import QuotaHandlingConfig
+        from devbench.quota import SubscriptionRateLimitError
+
+        exc = SubscriptionRateLimitError(
+            reset_at=datetime(2030, 1, 1, tzinfo=UTC),
+            raw_error="429",
+            source="anthropic-api",
+        )
+        quota_cfg = QuotaHandlingConfig(enabled=True, on_exhaustion="drain")
+        mock_sdk = _make_sdk_module(lambda **_kw: _make_quota_exhausted_sdk(exc))
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.RUNTIME_CONFIG") as mock_cfg,
+            patch("devbench.cli.request_drain") as mock_request_drain,
+        ):
+            mock_cfg.quota_handling = quota_cfg
+
+            rc = cli.cmd_start()
+
+        mock_request_drain.assert_called_once()
+        assert rc == 0
+
+    def test_quota_timeout_fail_raises_system_exit(self, tmp_path: Path) -> None:
+        """When on_exhaustion_timeout='fail' and _handle_quota_pause returns False, SystemExit with non-zero code."""
+        import sys
+
+        from devbench.config_loader import QuotaHandlingConfig
+        from devbench.quota import SubscriptionRateLimitError
+
+        exc = SubscriptionRateLimitError(
+            reset_at=datetime(2030, 1, 1, tzinfo=UTC),
+            raw_error="429",
+            source="anthropic-api",
+        )
+        quota_cfg = QuotaHandlingConfig(
+            enabled=True,
+            on_exhaustion="wait",
+            max_wait_seconds=0,
+            on_exhaustion_timeout="fail",
+        )
+        mock_sdk = _make_sdk_module(lambda **_kw: _make_quota_exhausted_sdk(exc))
+
+        async def _fake_handle_quota_pause(*_a: object, **_kw: object) -> bool:
+            return False  # simulate wait timeout
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.RUNTIME_CONFIG") as mock_cfg,
+            patch("devbench.cli._handle_quota_pause", side_effect=_fake_handle_quota_pause),
+        ):
+            mock_cfg.quota_handling = quota_cfg
+
+            with pytest.raises(SystemExit) as exc_info:
+                cli.cmd_start()
+
+        assert exc_info.value.code != 0
+
+    def test_backlog_parse_oserror_logs_error_and_continues(self, tmp_path: Path) -> None:
+        """When BacklogParser.parse_index raises OSError, logger.error is called and wu_file=None."""
+        import sys
+
+        from devbench.config_loader import QuotaHandlingConfig
+        from devbench.quota import SubscriptionRateLimitError
+
+        exc = SubscriptionRateLimitError(
+            reset_at=datetime(2030, 1, 1, tzinfo=UTC),
+            raw_error="429",
+            source="anthropic-api",
+        )
+        quota_cfg = QuotaHandlingConfig(enabled=True, on_exhaustion="wait", max_wait_seconds=60)
+
+        # First SDK call raises quota error; second call (after recovery) succeeds cleanly.
+        query_calls: list[int] = []
+
+        def _query_factory(**_kw: object) -> AsyncGenerator[str, None]:
+            query_calls.append(1)
+            if len(query_calls) == 1:
+                return _make_quota_exhausted_sdk(exc)
+            return _make_ok_sdk()
+
+        mock_sdk = _make_sdk_module(_query_factory)
+
+        # Capture the in_flight_wu_file argument passed to _handle_quota_pause.
+        captured_wu_file: list[object] = []
+
+        async def _fake_handle_quota_pause(
+            *_a: object, in_flight_wu_file: object = None, **_kw: object
+        ) -> bool:
+            captured_wu_file.append(in_flight_wu_file)
+            return True  # recovered -- restart the SDK loop
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.RUNTIME_CONFIG") as mock_cfg,
+            patch("devbench.cli.ScopeFilter"),
+            patch("devbench.cli._should_auto_restart_after_no_actionable", return_value=(False, [])),
+            patch("devbench.cli._handle_quota_pause", side_effect=_fake_handle_quota_pause),
+            patch("devbench.cli.BacklogParser") as mock_parser_cls,
+            patch("devbench.cli.logger") as mock_logger,
+        ):
+            mock_cfg.quota_handling = quota_cfg
+            mock_parser_cls.return_value.parse_index.side_effect = OSError("disk read failure")
+
+            rc = cli.cmd_start()
+
+        assert rc == 0
+        assert captured_wu_file == [None], "wu_file must be None when parse_index raises OSError"
+        error_calls = mock_logger.error.call_args_list
+        assert any(
+            "Failed to resolve in-flight work unit for quota checkpoint" in str(call)
+            for call in error_calls
+        ), "logger.error must be called with the diagnostic message on OSError"
+
+    def test_handle_quota_pause_raises_key_error_for_unregistered_subclass(
+        self, tmp_path: Path
+    ) -> None:
+        """_handle_quota_pause raises KeyError when an unregistered QuotaExhaustedError subclass is used."""
+        import asyncio
+
+        from devbench.config_loader import QuotaHandlingConfig
+        from devbench.quota import QuotaExhaustedError
+
+        class _UnregisteredQuotaError(QuotaExhaustedError):
+            pass
+
+        exc = _UnregisteredQuotaError(
+            reset_at=datetime(2030, 1, 1, tzinfo=UTC),
+            raw_error="429",
+            source="anthropic-api",
+        )
+        quota_cfg = QuotaHandlingConfig(
+            enabled=True,
+            on_exhaustion="wait",
+            audit_comment_on_wait=False,
+            audit_comment_on_resume=False,
+        )
+
+        with pytest.raises(KeyError):
+            asyncio.run(
+                cli._handle_quota_pause(
+                    exc=exc,
+                    quota_cfg=quota_cfg,
+                    workspace_root=tmp_path,
+                    session_name="default",
+                    in_flight_wu_file=None,
+                )
+            )

@@ -149,7 +149,7 @@ from devbench.config import (
     resolve_repo,
     validate_repo,
 )
-from devbench.config_loader import RepoConfig, get_configured_default_branch
+from devbench.config_loader import QuotaHandlingConfig, RepoConfig, get_configured_default_branch
 from devbench.constants import (
     ALL_REQUIRED_JUDGE_NAMES,
     BACKLOG_LOCAL_PATH_RE,
@@ -168,6 +168,7 @@ from devbench.constants import (
     KNOWN_JUDGE_NAMES,
     ORCHESTRATOR_AUTO_RESTART_AUDIT_PREFIX,
     ORCHESTRATOR_RESTART_EXIT_CODE,
+    QUOTA_HANDLING_DEFAULT_DETECT_MODES,
     SESSION_DEFAULT_NAME,
     SESSION_DRAIN_SIGNAL_FILENAME,
     SESSION_PID_FILENAME,
@@ -189,6 +190,15 @@ from devbench.plugin_shadow import (
     materialise_shadow_plugin,
     shadow_plugin_path,
     write_pid_sentinel,
+)
+from devbench.quota import (
+    ApiBillingError,
+    BedrockThrottleError,
+    QuotaExhaustedError,
+    SdkCreditExhaustedError,
+    SubscriptionRateLimitError,
+    save_checkpoint,
+    wait_for_reset,
 )
 
 # Re-export from reporting so existing ``cli._format_duration`` callers and tests
@@ -5077,6 +5087,144 @@ class _DrainRequested(BaseException):
         self.reason = reason
 
 
+# ---------------------------------------------------------------------------
+# Quota-wait-and-resume constants (spec section 4.5.2, AC-193-5, AC-193-13)
+# ---------------------------------------------------------------------------
+
+#: Audit-log prefix written to the in-flight WU when quota waiting begins.
+#: Format: ``[QUOTA_WAITING] reason=<reason> reset_at=<ISO-ts>``.
+_QUOTA_WAITING_AUDIT_PREFIX: str = "[QUOTA_WAITING]"
+
+#: Audit-log prefix written to the in-flight WU after quota recovery.
+#: Format: ``[QUOTA_RESUMED] waited_seconds=<N>``.
+_QUOTA_RESUMED_AUDIT_PREFIX: str = "[QUOTA_RESUMED]"
+
+#: on_exhaustion config values (spec section 4.5.6).
+_ON_EXHAUSTION_WAIT: str = "wait"
+_ON_EXHAUSTION_FAIL: str = "fail"
+_ON_EXHAUSTION_DRAIN: str = "drain"
+
+#: on_exhaustion_timeout config values (spec section 4.5.6).
+_ON_EXHAUSTION_TIMEOUT_KEEP_WAITING: str = "keep_waiting"
+
+#: Tuple of QuotaExhaustedError subclasses in the same order as
+#: QUOTA_HANDLING_DEFAULT_DETECT_MODES (used to build _QUOTA_REASON_MAP
+#: without duplicating string literals -- DRY, spec section 4.5.2).
+_QUOTA_EXCEPTION_CLASSES: tuple[type[QuotaExhaustedError], ...] = (
+    SubscriptionRateLimitError,
+    SdkCreditExhaustedError,
+    ApiBillingError,
+    BedrockThrottleError,
+)
+
+#: Map from QuotaExhaustedError subclass to the human-readable reason string
+#: for QuotaCheckpoint.reason.  Built from _QUOTA_EXCEPTION_CLASSES and
+#: QUOTA_HANDLING_DEFAULT_DETECT_MODES so no string is declared twice.
+_QUOTA_REASON_MAP: dict[type[QuotaExhaustedError], str] = dict(
+    zip(_QUOTA_EXCEPTION_CLASSES, QUOTA_HANDLING_DEFAULT_DETECT_MODES, strict=True)
+)
+
+
+async def _handle_quota_pause(
+    exc: QuotaExhaustedError,
+    quota_cfg: QuotaHandlingConfig,
+    workspace_root: Path,
+    session_name: str,
+    in_flight_wu_file: Path | None,
+) -> bool:
+    """Implement the quota-wait-and-resume protocol for a detected quota error.
+
+    Protocol (spec section 4.5.2, AC-193-5):
+
+    1. Determine the session directory (workspace_root when no named session,
+       <workspace>/.devbench/sessions/<name> when a session is active).
+    2. Write a ``quota_pause.json`` checkpoint via :func:`~devbench.quota.save_checkpoint`.
+    3. If ``quota_cfg.audit_comment_on_wait`` is True and an in-flight WU file
+       is known, append a ``[QUOTA_WAITING] reason=<r> reset_at=<ts>`` audit
+       comment to the work unit.
+    4. Call :func:`~devbench.quota.wait_for_reset` and await the result.
+    5. If recovery succeeded (returned ``True``) and
+       ``quota_cfg.audit_comment_on_resume`` is True, append a
+       ``[QUOTA_RESUMED] waited_seconds=<N>`` audit comment.
+    6. Return ``True`` when recovery succeeded, ``False`` when max_wait elapsed.
+
+    Args:
+        exc: The :class:`~devbench.quota.QuotaExhaustedError` that triggered the pause.
+        quota_cfg: Runtime quota-handling configuration.
+        workspace_root: Workspace root path (``WORKSPACE_ROOT``).
+        session_name: Active session name (``DEVBENCH_SESSION_NAME`` or
+            ``SESSION_DEFAULT_NAME``).
+        in_flight_wu_file: Path to the in-flight work-unit Markdown file, or
+            ``None`` when no work unit is currently in-progress.
+
+    Returns:
+        ``True`` when :func:`~devbench.quota.wait_for_reset` returned ``True``
+        (quota recovered within ``max_wait_seconds``).
+        ``False`` when ``max_wait_seconds`` was exceeded before recovery.
+
+    Raises:
+        Exception: Any exception raised by the ``wait_for_reset`` probe_fn
+            propagates unchanged to the caller.
+    """
+    # Step 1: determine session directory.
+    if session_name and session_name != SESSION_DEFAULT_NAME:
+        session_dir = workspace_root / SESSION_SESSIONS_BASE_DIR / session_name
+    else:
+        session_dir = workspace_root
+
+    # Step 2: save the checkpoint.
+    reason = _QUOTA_REASON_MAP[type(exc)]
+    reset_at = exc.reset_at
+    paused_at = datetime.now(tz=UTC)
+    in_flight_wu_id: str | None = None
+    if in_flight_wu_file is not None:
+        in_flight_wu_id = in_flight_wu_file.stem
+
+    save_checkpoint(
+        session_dir=session_dir,
+        paused_at=paused_at,
+        reset_at=reset_at,
+        reason=reason,
+        raw_error=str(exc),
+        in_flight_wu=in_flight_wu_id,
+        in_flight_phase=None,
+        completed_judges=[],
+        pending_judges=[],
+        stage_artefacts={},
+    )
+
+    # Step 3: audit comment on wait.
+    reset_at_str = reset_at.isoformat() if reset_at is not None else "unknown"
+    if quota_cfg.audit_comment_on_wait and in_flight_wu_file is not None:
+        mgr = BacklogManager()
+        mgr._append_agent_comment(
+            in_flight_wu_file,
+            "orchestrator",
+            f"{_QUOTA_WAITING_AUDIT_PREFIX} reason={reason} reset_at={reset_at_str}",
+        )
+
+    # Step 4: wait for reset.
+    effective_reset_at = reset_at if reset_at is not None else datetime.now(tz=UTC)
+    recovered = await wait_for_reset(
+        reset_at=effective_reset_at,
+        poll_interval=float(quota_cfg.poll_interval_seconds),
+        max_wait=float(quota_cfg.max_wait_seconds),
+        probe_fn=lambda: True,
+    )
+
+    # Step 5: audit comment on resume.
+    if recovered and quota_cfg.audit_comment_on_resume and in_flight_wu_file is not None:
+        waited_seconds = int((datetime.now(tz=UTC) - paused_at).total_seconds())
+        mgr = BacklogManager()
+        mgr._append_agent_comment(
+            in_flight_wu_file,
+            "orchestrator",
+            f"{_QUOTA_RESUMED_AUDIT_PREFIX} waited_seconds={waited_seconds}",
+        )
+
+    return recovered
+
+
 def _is_claim_tool_use(message: object) -> bool:
     """Return ``True`` when *message* is an SDK message containing a Bash claim tool use.
 
@@ -5480,32 +5628,107 @@ def cmd_start(*argv: str) -> int:
 
     _prev_sigterm_handler = signal.signal(signal.SIGTERM, _sigterm_handler)
 
-    async def _run() -> None:
-        """Iterate SDK messages; raise _DrainRequested when claim-while-drain-pending.
+    quota_cfg = RUNTIME_CONFIG.quota_handling
 
-        Between each SDK message, checks whether the current message is a
-        Bash tool-use containing ``devbench claim``.  When it is, polls the
-        drain signal via :func:`~devbench.drain.read_drain_state`.  If a drain
-        is pending, raises :class:`_DrainRequested` so the asyncio event loop
-        is cancelled cleanly (spec section 4.3.3, AC-188-4).
+    async def _run() -> None:
+        """Iterate SDK messages with quota-wait-and-resume and drain enforcement.
+
+        Outer ``while True:`` restarts the SDK query loop on quota recovery.
+        Inner loop processes SDK messages and raises :class:`_DrainRequested`
+        when a ``devbench claim`` tool-use is detected while a drain is pending.
+
+        When quota handling is enabled (``quota_cfg.enabled``), a caught
+        :class:`~devbench.quota.QuotaExhaustedError` invokes
+        :func:`_handle_quota_pause`, which saves a checkpoint, optionally
+        writes audit comments, and waits for quota recovery.  On recovery
+        (``wait_for_reset`` returns ``True``), the outer loop restarts the SDK
+        query.  On timeout (``wait_for_reset`` returns ``False``), the
+        ``on_exhaustion_timeout`` action is taken:
+
+        - ``'drain'`` -- calls :func:`~devbench.drain.request_drain` and
+          returns normally (drain enforced on the next claim).
+        - ``'fail'`` -- raises :class:`SystemExit` with rc=1.
+        - ``'keep_waiting'`` -- calls :func:`~devbench.drain.request_drain`
+          (conservative safe default) and returns normally.
+
+        When quota handling is disabled, :class:`~devbench.quota.QuotaExhaustedError`
+        propagates unchanged through ``asyncio.run``.
+
+        When ``on_exhaustion`` is ``'fail'``, the first quota error raises
+        :class:`SystemExit` with rc=1 without waiting.
+
+        When ``on_exhaustion`` is ``'drain'``, the first quota error calls
+        :func:`~devbench.drain.request_drain` and returns normally.
+
+        Args: (none -- captures local variables from ``cmd_start`` closure)
 
         Raises:
             _DrainRequested: A drain signal is present when a ``cmd_claim``
-                tool-use is observed.  The caller (``cmd_start``) catches this
-                sentinel, consumes the drain marker, and logs the audit entry.
+                tool-use is observed.
+            SystemExit: When ``on_exhaustion='fail'`` or
+                ``on_exhaustion_timeout='fail'`` is triggered.
+            QuotaExhaustedError: Propagates when ``quota_cfg.enabled`` is
+                ``False``.
         """
-        async for message in query(
-            prompt="Run the devbench:orchestrate skill to process the backlog until complete",
-            options=ClaudeAgentOptions(
-                plugins=[{"type": "local", "path": str(plugin_path)}],
-                permission_mode="bypassPermissions",
-            ),
-        ):
-            logger.info("sdk message: %s", message)
-            if _is_claim_tool_use(message):
-                drain_state = read_drain_state(WORKSPACE_ROOT)
-                if drain_state is not None:
-                    raise _DrainRequested(drain_state.reason)
+        while True:
+            try:
+                async for message in query(
+                    prompt="Run the devbench:orchestrate skill to process the backlog until complete",
+                    options=ClaudeAgentOptions(
+                        plugins=[{"type": "local", "path": str(plugin_path)}],
+                        permission_mode="bypassPermissions",
+                    ),
+                ):
+                    logger.info("sdk message: %s", message)
+                    if _is_claim_tool_use(message):
+                        drain_state = read_drain_state(WORKSPACE_ROOT)
+                        if drain_state is not None:
+                            raise _DrainRequested(drain_state.reason)
+                # Clean exit from the SDK loop -- done.
+                return
+            except QuotaExhaustedError as quota_exc:
+                if not quota_cfg.enabled:
+                    raise
+                if quota_cfg.on_exhaustion == _ON_EXHAUSTION_FAIL:
+                    print(
+                        f"ERROR: quota exhausted ({quota_exc}); on_exhaustion=fail -- aborting.",
+                        file=sys.stderr,
+                    )
+                    raise SystemExit(1) from quota_exc
+                if quota_cfg.on_exhaustion == _ON_EXHAUSTION_DRAIN:
+                    request_drain(WORKSPACE_ROOT, reason=str(quota_exc))
+                    return
+                # on_exhaustion='wait' branch: invoke the wait/resume protocol.
+                try:
+                    units = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX).parse_index()
+                    wu = _find_in_flight_wu(units)
+                    wu_file: Path | None = wu.file_path if wu is not None else None
+                except (OSError, ValueError) as exc:
+                    logger.error(
+                        "Failed to resolve in-flight work unit for quota checkpoint: %s", exc
+                    )
+                    wu_file = None
+                recovered = await _handle_quota_pause(
+                    exc=quota_exc,
+                    quota_cfg=quota_cfg,
+                    workspace_root=WORKSPACE_ROOT,
+                    session_name=parsed.name,
+                    in_flight_wu_file=wu_file,
+                )
+                if recovered:
+                    # Restart the SDK query loop.
+                    continue
+                # Timeout branch: apply on_exhaustion_timeout action.
+                timeout_action = quota_cfg.on_exhaustion_timeout
+                if timeout_action in (_ON_EXHAUSTION_DRAIN, _ON_EXHAUSTION_TIMEOUT_KEEP_WAITING):
+                    request_drain(WORKSPACE_ROOT, reason=str(quota_exc))
+                    return
+                # on_exhaustion_timeout='fail' branch.
+                print(
+                    f"ERROR: quota wait timed out ({quota_exc}); on_exhaustion_timeout=fail -- aborting.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(1) from quota_exc
 
     try:
         try:

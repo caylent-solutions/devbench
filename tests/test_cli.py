@@ -1452,9 +1452,7 @@ class TestCmdSetStatus:
     ) -> None:
         """AC-194-3: --dry-run prints id/current/new for each affected WU, rc=0."""
         for unit in mock_units:
-            (backlog_dir / unit.file_path.name).write_text(
-                f"# {unit.id}\n## Status: {unit.status.value}\n"
-            )
+            (backlog_dir / unit.file_path.name).write_text(f"# {unit.id}\n## Status: {unit.status.value}\n")
 
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = mock_units
@@ -1477,9 +1475,7 @@ class TestCmdSetStatus:
         mock_mgr.force_status.assert_not_called()
 
     @pytest.mark.unit
-    def test_dry_run_does_not_write_any_files(
-        self, mock_units: list[WorkUnit], backlog_dir: Path
-    ) -> None:
+    def test_dry_run_does_not_write_any_files(self, mock_units: list[WorkUnit], backlog_dir: Path) -> None:
         """AC-194-3: --dry-run must not call force_status or modify any file."""
         for unit in mock_units:
             wu_file = backlog_dir / unit.file_path.name
@@ -1504,9 +1500,7 @@ class TestCmdSetStatus:
     ) -> None:
         """AC-194-3: each output line is '{id}\\t{current_status}\\t{new_status}'."""
         for unit in mock_units:
-            (backlog_dir / unit.file_path.name).write_text(
-                f"# {unit.id}\n## Status: {unit.status.value}\n"
-            )
+            (backlog_dir / unit.file_path.name).write_text(f"# {unit.id}\n## Status: {unit.status.value}\n")
 
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = mock_units
@@ -1531,9 +1525,7 @@ class TestCmdSetStatus:
             assert new_s == "in-queue"
 
     @pytest.mark.unit
-    def test_dry_run_invalid_status_still_returns_1(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_dry_run_invalid_status_still_returns_1(self, capsys: pytest.CaptureFixture[str]) -> None:
         """AC-194-3: --dry-run with invalid target status still returns rc=1."""
         result = cli.cmd_set_status("--dry-run", "--include", "E0", "not-a-status")
         assert result == 1
@@ -1552,6 +1544,184 @@ class TestCmdSetStatus:
 
         assert result == 1
         assert "no work units" in capsys.readouterr().err.lower()
+
+    # ------------------------------------------------------------------
+    # --yes flag and bulk_update_confirm_threshold tests (AC-194-4)
+    # ------------------------------------------------------------------
+
+    @pytest.mark.unit
+    def test_yes_flag_parsed_and_skips_prompt(
+        self, mock_units: list[WorkUnit], backlog_dir: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-194-4: --yes skips the confirmation prompt and proceeds with updates."""
+        for unit in mock_units:
+            (backlog_dir / unit.file_path.name).write_text(f"# {unit.id}\n## Status: {unit.status.value}\n")
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+        mock_mgr = MagicMock()
+
+        # Patch threshold to 0 so prompt would normally be triggered
+        mock_backlog_cfg = MagicMock()
+        mock_backlog_cfg.bulk_update_confirm_threshold = 0
+        mock_runtime_cfg = MagicMock()
+        mock_runtime_cfg.backlog = mock_backlog_cfg
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+            patch("devbench.cli.input") as mock_input,
+        ):
+            result = cli.cmd_set_status("--include", "E0", "--yes", "in-queue")
+
+        assert result == 0
+        mock_input.assert_not_called()
+        assert mock_mgr.force_status.call_count > 0
+
+    @pytest.mark.unit
+    def test_prompt_shown_when_count_exceeds_threshold(
+        self, mock_units: list[WorkUnit], backlog_dir: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-194-4: prompt shown when matched count > threshold and --yes not given; 'y' proceeds."""
+        for unit in mock_units:
+            (backlog_dir / unit.file_path.name).write_text(f"# {unit.id}\n## Status: {unit.status.value}\n")
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+        mock_mgr = MagicMock()
+
+        # threshold=1 means 3 matched units (len(mock_units)=3) > 1 triggers prompt
+        mock_backlog_cfg = MagicMock()
+        mock_backlog_cfg.bulk_update_confirm_threshold = 1
+        mock_runtime_cfg = MagicMock()
+        mock_runtime_cfg.backlog = mock_backlog_cfg
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+            patch("devbench.cli.input", return_value="y") as mock_input,
+        ):
+            result = cli.cmd_set_status("--include", "E0", "in-queue")
+
+        assert result == 0
+        mock_input.assert_called_once()
+        prompt_text = mock_input.call_args.args[0]
+        assert "3" in prompt_text  # count of matched units
+        assert mock_mgr.force_status.call_count > 0
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("answer", ["n", "N", "no", "NO", "", "nope"])
+    def test_prompt_declined_exits_rc0_without_writing(
+        self,
+        answer: str,
+        mock_units: list[WorkUnit],
+        backlog_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """AC-194-4: declining the prompt exits rc=0 and no files are written."""
+        for unit in mock_units:
+            (backlog_dir / unit.file_path.name).write_text(f"# {unit.id}\n## Status: {unit.status.value}\n")
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+        mock_mgr = MagicMock()
+
+        mock_backlog_cfg = MagicMock()
+        mock_backlog_cfg.bulk_update_confirm_threshold = 0
+        mock_runtime_cfg = MagicMock()
+        mock_runtime_cfg.backlog = mock_backlog_cfg
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+            patch("devbench.cli.input", return_value=answer),
+        ):
+            result = cli.cmd_set_status("--include", "E0", "in-queue")
+
+        assert result == 0
+        mock_mgr.force_status.assert_not_called()
+
+    @pytest.mark.unit
+    def test_no_prompt_when_count_at_or_below_threshold(
+        self, mock_units: list[WorkUnit], backlog_dir: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-194-4: no prompt shown when matched count <= threshold."""
+        for unit in mock_units:
+            (backlog_dir / unit.file_path.name).write_text(f"# {unit.id}\n## Status: {unit.status.value}\n")
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+        mock_mgr = MagicMock()
+
+        # threshold=10 means 3 matched units <= 10 -- no prompt
+        mock_backlog_cfg = MagicMock()
+        mock_backlog_cfg.bulk_update_confirm_threshold = 10
+        mock_runtime_cfg = MagicMock()
+        mock_runtime_cfg.backlog = mock_backlog_cfg
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+            patch("devbench.cli.input") as mock_input,
+        ):
+            result = cli.cmd_set_status("--include", "E0", "in-queue")
+
+        assert result == 0
+        mock_input.assert_not_called()
+        assert mock_mgr.force_status.call_count > 0
+
+    @pytest.mark.unit
+    def test_parse_bulk_args_handles_yes_flag(self) -> None:
+        """AC-194-4: _parse_bulk_set_status_args returns yes=True when --yes present."""
+        result = cli._parse_bulk_set_status_args(["--include", "E1", "--yes", "in-queue"])
+        assert not isinstance(result, int)
+        include_str, exclude_str, dry_run, yes_flag, remaining = result
+        assert yes_flag is True
+        assert include_str == "E1"
+        assert remaining == ["in-queue"]
+
+    @pytest.mark.unit
+    def test_parse_bulk_args_yes_false_by_default(self) -> None:
+        """AC-194-4: _parse_bulk_set_status_args returns yes=False when --yes absent."""
+        result = cli._parse_bulk_set_status_args(["--include", "E1", "in-queue"])
+        assert not isinstance(result, int)
+        include_str, exclude_str, dry_run, yes_flag, remaining = result
+        assert yes_flag is False
+
+    @pytest.mark.unit
+    def test_prompt_accepted_with_yes_string(self, mock_units: list[WorkUnit], backlog_dir: Path) -> None:
+        """AC-194-4: typing 'yes' (full word) at the prompt is accepted."""
+        for unit in mock_units:
+            (backlog_dir / unit.file_path.name).write_text(f"# {unit.id}\n## Status: {unit.status.value}\n")
+
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = mock_units
+        mock_mgr = MagicMock()
+
+        mock_backlog_cfg = MagicMock()
+        mock_backlog_cfg.bulk_update_confirm_threshold = 0
+        mock_runtime_cfg = MagicMock()
+        mock_runtime_cfg.backlog = mock_backlog_cfg
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir.parent),
+            patch("devbench.cli.BacklogManager", return_value=mock_mgr),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+            patch("devbench.cli.input", return_value="yes"),
+        ):
+            result = cli.cmd_set_status("--include", "E0", "in-queue")
+
+        assert result == 0
+        assert mock_mgr.force_status.call_count > 0
 
 
 class TestCmdSetStatusBulkIntegration:
@@ -1713,6 +1883,99 @@ class TestCmdSetStatusBulkIntegration:
         assert parts[0] == "E1-F1-S1-T1"
         assert parts[1] == "in-queue"
         assert parts[2] == "in-progress"
+
+    @pytest.mark.unit
+    def test_yes_flag_skips_prompt_integration(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """AC-194-4 integration: --yes skips confirmation prompt and writes all files."""
+        units = [
+            ("E1-F1-S1-T1", "in-queue"),
+            ("E1-F1-S1-T2", "in-queue"),
+            ("E1-F1-S1-T3", "in-queue"),
+        ]
+        backlog_root, backlog_index = self._build_fixture_workspace(tmp_path, units)
+
+        mock_backlog_cfg = MagicMock()
+        mock_backlog_cfg.bulk_update_confirm_threshold = 0  # would prompt without --yes
+        mock_runtime_cfg = MagicMock()
+        mock_runtime_cfg.backlog = mock_backlog_cfg
+
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_root),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+            patch("devbench.cli.input") as mock_input,
+        ):
+            result = cli.cmd_set_status("--include", "E1", "--yes", "in-progress")
+
+        assert result == 0
+        mock_input.assert_not_called()
+
+        # All three files must be updated
+        for uid, _ in units:
+            assert "in-progress" in (backlog_root / f"{uid}.md").read_text()
+
+    @pytest.mark.unit
+    def test_prompt_declined_leaves_files_unchanged_integration(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-194-4 integration: declining the prompt leaves WU files unmodified (rc=0)."""
+        units = [
+            ("E1-F1-S1-T1", "in-queue"),
+            ("E1-F1-S1-T2", "in-queue"),
+        ]
+        backlog_root, backlog_index = self._build_fixture_workspace(tmp_path, units)
+        original_t1 = (backlog_root / "E1-F1-S1-T1.md").read_text()
+        original_t2 = (backlog_root / "E1-F1-S1-T2.md").read_text()
+
+        mock_backlog_cfg = MagicMock()
+        mock_backlog_cfg.bulk_update_confirm_threshold = 0
+        mock_runtime_cfg = MagicMock()
+        mock_runtime_cfg.backlog = mock_backlog_cfg
+
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_root),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+            patch("devbench.cli.input", return_value="n"),
+        ):
+            result = cli.cmd_set_status("--include", "E1", "in-progress")
+
+        assert result == 0
+        assert (backlog_root / "E1-F1-S1-T1.md").read_text() == original_t1
+        assert (backlog_root / "E1-F1-S1-T2.md").read_text() == original_t2
+
+    @pytest.mark.unit
+    def test_threshold_not_exceeded_skips_prompt_integration(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-194-4 integration: no prompt when matched count <= threshold."""
+        units = [
+            ("E1-F1-S1-T1", "in-queue"),
+            ("E1-F1-S1-T2", "in-queue"),
+        ]
+        backlog_root, backlog_index = self._build_fixture_workspace(tmp_path, units)
+
+        mock_backlog_cfg = MagicMock()
+        mock_backlog_cfg.bulk_update_confirm_threshold = 10  # 2 units <= 10, no prompt
+        mock_runtime_cfg = MagicMock()
+        mock_runtime_cfg.backlog = mock_backlog_cfg
+
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", backlog_root),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+            patch("devbench.cli.input") as mock_input,
+        ):
+            result = cli.cmd_set_status("--include", "E1", "in-progress")
+
+        assert result == 0
+        mock_input.assert_not_called()
+
+        for uid, _ in units:
+            assert "in-progress" in (backlog_root / f"{uid}.md").read_text()
 
 
 class TestCmdMarkDone:

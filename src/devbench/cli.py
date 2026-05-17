@@ -17,7 +17,8 @@ Commands::
     status                  Show backlog summary (counts by status)
     next                    Print the next actionable work unit ID and title
     claim <id>              Claim a work unit (transition to in-progress)
-    set-status <id> <s>     Force any status (no gate); bulk: --include "<toks>" [--exclude "<toks>"] [--dry-run] <s>
+    set-status <id> <s>     Force any status; bulk: --include "<toks>" [--exclude "<toks>"] [--dry-run] [--yes] <s>
+
     mark-done <id>          Mark unit as Done (enforces done-gate: all judges must have passed)
     decline <id> --reason M Mark unit Declined (won't ever be done); captures the rationale
     hold <id> --reason M    Mark unit Hold (deferred / under debate); orchestrator skips it
@@ -1198,7 +1199,7 @@ def cmd_set_status(*argv: str) -> int:
 
     **Bulk form** using printer-pages scope selectors (AC-194-1, AC-194-10)::
 
-        devbench set-status --include "<tokens>" [--exclude "<tokens>"] [--dry-run] <new_status>
+        devbench set-status --include "<tokens>" [--exclude "<tokens>"] [--dry-run] [--yes] <new_status>
 
     The ``--include`` / ``--exclude`` tokens are parsed via
     :meth:`~devbench.scope.ScopeFilter.parse` (no parser duplication).
@@ -1206,6 +1207,11 @@ def cmd_set_status(*argv: str) -> int:
     :meth:`~devbench.backlog.manager.BacklogManager.force_status` so
     per-WU audit logic continues to fire.  A workspace-level
     ``[BULK_STATUS_UPDATE]`` info log records each bulk invocation.
+
+    When the matched count exceeds
+    ``RUNTIME_CONFIG.backlog.bulk_update_confirm_threshold`` (default 10),
+    the operator is prompted for confirmation unless ``--yes`` is supplied
+    (AC-194-4).  ``--yes`` is intended for non-interactive scripts.
 
     When ``--dry-run`` is present, no files are written; instead one line
     per affected work unit is printed as ``{id}\\t{current_status}\\t{new_status}``
@@ -1236,7 +1242,7 @@ def cmd_set_status(*argv: str) -> int:
     if len(args) != 2:
         print(
             "ERROR: set-status usage: set-status <id> <status>  OR  "
-            "set-status --include '<tokens>' [--exclude '<tokens>'] <status>",
+            "set-status --include '<tokens>' [--exclude '<tokens>'] [--dry-run] [--yes] <status>",
             file=sys.stderr,
         )
         return 1
@@ -1295,14 +1301,14 @@ def _cmd_set_status_single(unit_id: str, new_status: str) -> int:
 
 def _parse_bulk_set_status_args(
     args: list[str],
-) -> tuple[str, str, bool, list[str]] | int:
-    """Parse ``--include`` / ``--exclude`` / ``--dry-run`` from a bulk set-status arg list.
+) -> tuple[str, str, bool, bool, list[str]] | int:
+    """Parse ``--include`` / ``--exclude`` / ``--dry-run`` / ``--yes`` from a bulk set-status arg list.
 
     Args:
         args: Raw CLI token list for the bulk-update path.
 
     Returns:
-        A 4-tuple ``(include_str, exclude_str, dry_run, remaining_positionals)``
+        A 5-tuple ``(include_str, exclude_str, dry_run, yes_flag, remaining_positionals)``
         on success, or ``1`` (int) if a parse error occurred (error message
         already printed to stderr).
 
@@ -1312,6 +1318,7 @@ def _parse_bulk_set_status_args(
     include_str = ""
     exclude_str = ""
     dry_run = False
+    yes_flag = False
     remaining: list[str] = []
     i = 0
     while i < len(args):
@@ -1333,9 +1340,13 @@ def _parse_bulk_set_status_args(
             dry_run = True
             i += 1
             continue
+        if arg == "--yes":
+            yes_flag = True
+            i += 1
+            continue
         remaining.append(arg)
         i += 1
-    return include_str, exclude_str, dry_run, remaining
+    return include_str, exclude_str, dry_run, yes_flag, remaining
 
 
 def _print_dry_run_bulk(matched: list, new_status: str) -> None:
@@ -1356,16 +1367,72 @@ def _print_dry_run_bulk(matched: list, new_status: str) -> None:
         print(f"{unit.id}\t{current_status_cli}\t{new_status}")
 
 
+def _resolve_bulk_matched_units(
+    include_str: str,
+    exclude_str: str,
+    new_status: str,
+) -> list | None:
+    """Validate *new_status* and resolve the matched work-unit list for a bulk update.
+
+    Args:
+        include_str: Raw ``--include`` token string.
+        exclude_str: Raw ``--exclude`` token string.
+        new_status: Target status CLI string.
+
+    Returns:
+        Non-empty list of :class:`~devbench.backlog.work_unit.WorkUnit` objects
+        selected by the scope tokens on success.  ``None`` when validation fails
+        (error message already printed to stderr).
+
+    Raises:
+        Nothing -- all errors reported to stderr and return ``None``.
+    """
+    from devbench.backlog.manager import VALID_STATUSES
+    from devbench.scope import InvalidScopeError
+
+    if new_status.lower() not in VALID_STATUSES:
+        print(
+            f"ERROR: Invalid status '{new_status}'. Valid: {', '.join(sorted(VALID_STATUSES))}",
+            file=sys.stderr,
+        )
+        return None
+
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    all_ids = [u.id for u in units]
+
+    try:
+        scope = ScopeFilter.parse(include_str, exclude_str, all_ids)
+    except InvalidScopeError as exc:
+        print(f"ERROR: invalid scope selector -- {exc}", file=sys.stderr)
+        return None
+
+    matched = [u for u in units if scope.allows(u.id)]
+    if not matched:
+        print(
+            f"ERROR: no work units matched --include={include_str!r} (exclude={exclude_str!r})",
+            file=sys.stderr,
+        )
+        return None
+
+    return matched
+
+
 def _cmd_set_status_bulk(args: list[str]) -> int:
     """Bulk-update work-unit statuses using printer-pages scope selectors.
 
-    Parses ``--include`` / ``--exclude`` / ``--dry-run`` flags from ``args``
-    and resolves matching work-unit IDs via
+    Parses ``--include`` / ``--exclude`` / ``--dry-run`` / ``--yes`` flags
+    from ``args`` and resolves matching work-unit IDs via
     :meth:`~devbench.scope.ScopeFilter.parse`.
 
     When ``--dry-run`` is present, prints one line per matched work unit in
     the format ``{id}\\t{current_status}\\t{new_status}`` and returns 0
     without writing any files (AC-194-3).
+
+    When the matched count exceeds
+    ``RUNTIME_CONFIG.backlog.bulk_update_confirm_threshold``, the operator is
+    prompted for confirmation unless ``--yes`` is provided (AC-194-4).
+    Declining the prompt returns 0 without writing any files.
 
     Without ``--dry-run``, every matched unit is updated through
     :meth:`~devbench.backlog.manager.BacklogManager.force_status`.
@@ -1378,25 +1445,22 @@ def _cmd_set_status_bulk(args: list[str]) -> int:
     Args:
         args: Full argument list (includes the ``--include`` flag and its
             value, optional ``--exclude`` flag and value, optional
-            ``--dry-run`` boolean flag, and the trailing positional
-            ``<new_status>``).
+            ``--dry-run`` boolean flag, optional ``--yes`` boolean flag,
+            and the trailing positional ``<new_status>``).
 
     Returns:
         0 on success (at least one unit matched; no writes performed in
-        dry-run mode, or at least one unit updated otherwise).  1 on any
-        error (invalid status, invalid scope token, no matching work
-        units).
+        dry-run mode or when the operator declines the prompt; or at least
+        one unit updated otherwise).  1 on any error (invalid status,
+        invalid scope token, no matching work units).
 
     Raises:
         Nothing -- all errors reported to stderr and return rc=1.
     """
-    from devbench.backlog.manager import VALID_STATUSES
-    from devbench.scope import InvalidScopeError
-
     parse_result = _parse_bulk_set_status_args(args)
     if isinstance(parse_result, int):
         return parse_result
-    include_str, exclude_str, dry_run, remaining = parse_result
+    include_str, exclude_str, dry_run, yes_flag, remaining = parse_result
 
     if not remaining:
         print(
@@ -1406,35 +1470,23 @@ def _cmd_set_status_bulk(args: list[str]) -> int:
         return 1
 
     new_status = remaining[0]
-    if new_status.lower() not in VALID_STATUSES:
-        print(
-            f"ERROR: Invalid status '{new_status}'. Valid: {', '.join(sorted(VALID_STATUSES))}",
-            file=sys.stderr,
-        )
-        return 1
-
-    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
-    units = parser.parse_index()
-    all_ids = [u.id for u in units]
-
-    try:
-        scope = ScopeFilter.parse(include_str, exclude_str, all_ids)
-    except InvalidScopeError as exc:
-        print(f"ERROR: invalid scope selector -- {exc}", file=sys.stderr)
-        return 1
-
-    matched = [u for u in units if scope.allows(u.id)]
-    if not matched:
-        print(
-            f"ERROR: no work units matched --include={include_str!r} (exclude={exclude_str!r})",
-            file=sys.stderr,
-        )
+    matched = _resolve_bulk_matched_units(include_str, exclude_str, new_status)
+    if matched is None:
         return 1
 
     if dry_run:
         _print_dry_run_bulk(matched, new_status)
-    else:
-        _apply_bulk_set_status(matched, new_status, include_str, exclude_str)
+        return 0
+
+    threshold = RUNTIME_CONFIG.backlog.bulk_update_confirm_threshold
+    count = len(matched)
+    if count > threshold and not yes_flag:
+        answer = input(f"About to update {count} work units. Continue? [y/N] ")
+        if answer.strip().lower() not in {"y", "yes"}:
+            print("Bulk update aborted.")
+            return 0
+
+    _apply_bulk_set_status(matched, new_status, include_str, exclude_str)
     return 0
 
 
@@ -8948,8 +9000,10 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
         0,
         (
             "Set status: set-status <id> <status>  OR  "
-            "set-status --include '<tokens>' [--exclude '<tokens>'] [--dry-run] <status> "
-            "(bulk update via printer-pages scope selectors, spec 4.7.1; --dry-run prints affected WUs without writing)"
+            "set-status --include '<tokens>' [--exclude '<tokens>'] [--dry-run] [--yes] <status> "
+            "(bulk update via printer-pages scope selectors, spec 4.7.1; "
+            "--dry-run prints affected WUs without writing; "
+            "--yes skips prompt when matched count > bulk_update_confirm_threshold)"
         ),
     ),
     "mark-done": (cmd_mark_done, 1, "Mark done: mark-done <id>"),

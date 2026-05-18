@@ -148,6 +148,7 @@ from devbench.config import (
     RUNTIME_CONFIG,
     UPDATE_SUBMODULE,
     WORKSPACE_ROOT,
+    _read_env_strict,
     resolve_repo,
     validate_repo,
 )
@@ -834,9 +835,9 @@ def _try_resolve_log_file_path() -> Path | None:
     Wraps ``_resolve_log_file_path`` so callers that only need a *hint*
     of the log location (the status timer; the in-progress duration
     helper) degrade gracefully to ``None`` instead of propagating
-    ``SystemExit`` when none of ``JUDGE_LOG_FILE`` / YAML ``log_file`` /
-    ``JUDGE_WORKSPACE_ROOT`` is set. Issue #185: ``devbench status``
-    previously printed ``timer unavailable`` whenever ``JUDGE_LOG_FILE``
+    ``SystemExit`` when none of ``DEVBENCH_LOG_FILE`` / YAML ``log_file`` /
+    ``DEVBENCH_WORKSPACE_ROOT`` is set. Issue #185: ``devbench status``
+    previously printed ``timer unavailable`` whenever ``DEVBENCH_LOG_FILE``
     was unset even when the YAML config carried a usable ``log_file``;
     this wrapper closes that gap.
     """
@@ -2770,52 +2771,39 @@ def cmd_check() -> int:
 
 
 def _resolve_log_file_path() -> Path:
-    """Resolve the orchestrator log file path. Fail-fast on missing inputs.
+    """Resolve the orchestrator log file path.
 
     Resolution precedence (first match wins; no implicit fallbacks):
 
-    1. ``JUDGE_LOG_FILE`` environment variable set to an explicit path.
+    1. ``DEVBENCH_LOG_FILE`` environment variable set to an explicit path.
        Per-invocation override; used in tests and ad-hoc overrides.
+       Setting the legacy ``JUDGE_LOG_FILE`` raises ``RuntimeError``
+       (AC-197-2: hard rejection, no fallback).
     2. ``RUNTIME_CONFIG.log_file`` from ``backlog/config/devbench.yaml``.
        Single source of truth: when the operator sets it once in YAML,
        every devbench invocation against this workspace -- the
        orchestrator's ``setup_logging`` writer and ``cmd_report``'s
        reader alike -- picks up the same path. The value is treated as
        workspace-root-relative when not absolute.
-    3. ``<JUDGE_WORKSPACE_ROOT>/<DEFAULT_LOG_SUBDIR>/<DEFAULT_LOG_FILENAME>``
-       convention. Fires when neither (1) nor (2) is set but the
-       workspace root is known.
+    3. ``<DEVBENCH_WORKSPACE_ROOT>/<DEFAULT_LOG_SUBDIR>/<DEFAULT_LOG_FILENAME>``
+       convention. ``WORKSPACE_ROOT`` is resolved from ``DEVBENCH_WORKSPACE_ROOT``
+       by config.py at import time (raises ``RuntimeError`` if unset), so
+       this path is always deterministic.
 
-    When NONE of the three resolves, raises :class:`SystemExit` with an
-    actionable error naming all three input shapes. The previous
-    implementation silently fell back to the devbench source-tree's
-    log path -- letting operators read a stale, unrelated log without
-    noticing -- which CLAUDE.md "Fail-fast" forbids.
+    Raises:
+        RuntimeError: when the legacy ``JUDGE_LOG_FILE`` env var is set
+            (AC-197-2).
     """
-    explicit = os.environ.get("JUDGE_LOG_FILE", "").strip()
+    explicit = (_read_env_strict("DEVBENCH_LOG_FILE", "JUDGE_LOG_FILE") or "").strip()
     if explicit:
         return Path(explicit)
-    workspace = os.environ.get("JUDGE_WORKSPACE_ROOT", "").strip()
     configured = (RUNTIME_CONFIG.log_file or "").strip()
     if configured:
         configured_path = Path(configured)
         if configured_path.is_absolute():
             return configured_path
-        if workspace:
-            return Path(workspace) / configured_path
-        return configured_path
-    if workspace:
-        return Path(workspace) / DEFAULT_LOG_SUBDIR / DEFAULT_LOG_FILENAME
-    canonical = f"<root>/{DEFAULT_LOG_SUBDIR}/{DEFAULT_LOG_FILENAME}"
-    print(
-        "ERROR: cannot resolve orchestrator log file. Set one of:\n"
-        "  - JUDGE_LOG_FILE=<absolute-path-to-orchestrator.log>\n"
-        "  - 'log_file: <workspace-relative-path>' in backlog/config/devbench.yaml\n"
-        f"  - JUDGE_WORKSPACE_ROOT=<workspace-root>  (log resolves to {canonical})\n"
-        "and re-run.",
-        file=sys.stderr,
-    )
-    raise SystemExit(1)
+        return WORKSPACE_ROOT / configured_path
+    return WORKSPACE_ROOT / DEFAULT_LOG_SUBDIR / DEFAULT_LOG_FILENAME
 
 
 def _resolve_session_report_log(session_name: str) -> Path | None:
@@ -5117,12 +5105,8 @@ def cmd_watch(watch_interval: int = 0) -> int:
     """
     from devbench.activity import collect_snapshot, render_snapshot
 
-    log_file = Path(
-        os.environ.get(
-            "JUDGE_LOG_FILE",
-            str(Path(__file__).resolve().parent / DEFAULT_LOG_SUBDIR / DEFAULT_LOG_FILENAME),
-        )
-    )
+    _log_file_env = (_read_env_strict("DEVBENCH_LOG_FILE", "JUDGE_LOG_FILE") or "").strip()
+    log_file = Path(_log_file_env) if _log_file_env else WORKSPACE_ROOT / DEFAULT_LOG_SUBDIR / DEFAULT_LOG_FILENAME
     hook_log = WORKSPACE_ROOT / "hook-logs.jsonl"
 
     def _resolver(repo_name: str) -> Path | None:
@@ -5239,7 +5223,7 @@ def cmd_hook_tail(*argv: str) -> int:
         hook-tail [<path>] [--tz <zoneinfo-name>] [--no-follow] [--from-start]
                   [--orchestrator-only | --orchestrator-session <id>]
 
-    Defaults ``<path>`` to ``$JUDGE_WORKSPACE_ROOT/hook-logs.jsonl`` (the same
+    Defaults ``<path>`` to ``$DEVBENCH_WORKSPACE_ROOT/hook-logs.jsonl`` (the same
     location ``devbench watch`` reads from). Renders timestamps in the OS
     local timezone; ``--tz`` overrides with any IANA zoneinfo name. Disables
     ANSI color when ``NO_COLOR`` is set or stdout is not a TTY.
@@ -5247,7 +5231,7 @@ def cmd_hook_tail(*argv: str) -> int:
     Phase 11 (E230) session filter:
       ``--orchestrator-only`` filters the stream to events whose
       ``orchestrator_session`` field equals
-      ``$JUDGE_ORCHESTRATOR_SESSION_ID`` (set by the launch command on
+      ``$DEVBENCH_ORCHESTRATOR_SESSION_ID`` (set by the launch command on
       the orchestrator's pane). Events from side-pane Claude sessions
       are silently suppressed. ``--orchestrator-session <id>`` provides
       the same filter with an explicit value (useful for ad-hoc
@@ -5273,17 +5257,19 @@ def cmd_hook_tail(*argv: str) -> int:
     orchestrator_session_id = parsed.orchestrator_session_id
 
     if parsed.orchestrator_only and orchestrator_session_id is None:
-        env_session = os.environ.get("JUDGE_ORCHESTRATOR_SESSION_ID", "").strip()
+        env_session = (
+            _read_env_strict("DEVBENCH_ORCHESTRATOR_SESSION_ID", "JUDGE_ORCHESTRATOR_SESSION_ID") or ""
+        ).strip()
         if not env_session:
             print(
-                "ERROR: --orchestrator-only requires JUDGE_ORCHESTRATOR_SESSION_ID env "
+                "ERROR: --orchestrator-only requires DEVBENCH_ORCHESTRATOR_SESSION_ID env "
                 "to be set, OR pass --orchestrator-session <id> explicitly.",
                 file=sys.stderr,
             )
             return 2
         orchestrator_session_id = env_session
 
-    # Precedence: CLI --tz > JUDGE_DISPLAY_TIMEZONE env > yaml display_timezone
+    # Precedence: CLI --tz > DEVBENCH_DISPLAY_TIMEZONE env > yaml display_timezone
     # > OS local. DISPLAY_TIMEZONE encodes (env > yaml); resolve_timezone
     # itself falls back to the OS zone when its argument is None/empty.
     from devbench.config import DISPLAY_TIMEZONE

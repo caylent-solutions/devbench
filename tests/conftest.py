@@ -28,11 +28,9 @@ os.environ.setdefault(
 )
 
 # Backward-compatibility aliases for modules not yet migrated to DEVBENCH_* names.
-# config.py (JUDGE_WORKSPACE_ROOT / JUDGE_CLAUDE_MODEL) has been migrated by
-# E9-F2-S1-T1 -- those aliases are removed.
-# cli.py (JUDGE_LOG_FILE) and config_loader.py (JUDGE_CONFIG_PATH) are not yet
-# migrated; their aliases remain until the owning tasks complete.
-os.environ["JUDGE_LOG_FILE"] = os.environ["DEVBENCH_LOG_FILE"]
+# config.py (JUDGE_WORKSPACE_ROOT / JUDGE_CLAUDE_MODEL) has been migrated by E9-F2-S1-T1.
+# cli.py (JUDGE_LOG_FILE) has been migrated by E9-F2-S1-T2 -- alias removed.
+# config_loader.py (JUDGE_CONFIG_PATH) is not yet migrated; its alias remains.
 os.environ["JUDGE_CONFIG_PATH"] = os.environ["DEVBENCH_CONFIG_PATH"]
 
 import pytest

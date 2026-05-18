@@ -6408,6 +6408,31 @@ class TestCmdWatch:
     def test_cmd_watch_registered_in_commands(self) -> None:
         assert "watch" in cli._COMMANDS
 
+    def test_cmd_watch_reads_devbench_log_file_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # AC-197-1: cmd_watch reads DEVBENCH_LOG_FILE as the canonical env var.
+        monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
+        monkeypatch.setenv("DEVBENCH_LOG_FILE", "/tmp/test-log.log")
+        captured_paths: list[object] = []
+
+        def fake_collect(**kwargs: object) -> object:
+            captured_paths.append(kwargs.get("orchestrator_log"))
+            return self._fake_snapshot()
+
+        with (
+            patch("devbench.activity.collect_snapshot", side_effect=fake_collect),
+            patch("devbench.activity.render_snapshot", return_value="ok"),
+        ):
+            rc = cli.cmd_watch(watch_interval=0)
+        assert rc == 0
+        assert captured_paths and captured_paths[0] == Path("/tmp/test-log.log")
+
+    def test_cmd_watch_rejects_legacy_judge_log_file(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # AC-197-2: JUDGE_LOG_FILE is hard-rejected in cmd_watch.
+        monkeypatch.setenv("JUDGE_LOG_FILE", "/tmp/legacy.log")
+        monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
+        with pytest.raises(RuntimeError, match="JUDGE_LOG_FILE is no longer accepted"):
+            cli.cmd_watch(watch_interval=0)
+
     def test_resolver_returns_none_on_unknown_repo(self, capsys: pytest.CaptureFixture[str]) -> None:
         """The inline repo resolver returns None when resolve_repo rejects the name."""
         captured_resolver: dict[str, object] = {}
@@ -9408,9 +9433,32 @@ class TestCmdHookTail:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         monkeypatch.delenv("JUDGE_ORCHESTRATOR_SESSION_ID", raising=False)
+        monkeypatch.delenv("DEVBENCH_ORCHESTRATOR_SESSION_ID", raising=False)
         rc = cli.cmd_hook_tail("--orchestrator-only", "--no-follow")
         assert rc == 2
-        assert "JUDGE_ORCHESTRATOR_SESSION_ID" in capsys.readouterr().err
+        assert "DEVBENCH_ORCHESTRATOR_SESSION_ID" in capsys.readouterr().err
+
+    def test_orchestrator_only_with_devbench_env_reads_session_id(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # AC-197-1: canonical DEVBENCH_ORCHESTRATOR_SESSION_ID is read.
+        monkeypatch.delenv("JUDGE_ORCHESTRATOR_SESSION_ID", raising=False)
+        monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_SESSION_ID", "test-session-456")
+        rc = cli.cmd_hook_tail("--orchestrator-only", "--no-follow")
+        # The session ID is consumed; output may vary but exit should not be 2.
+        assert rc != 2
+
+    def test_orchestrator_only_with_legacy_env_raises_runtime_error(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # AC-197-2: JUDGE_ORCHESTRATOR_SESSION_ID is hard-rejected.
+        monkeypatch.setenv("JUDGE_ORCHESTRATOR_SESSION_ID", "legacy-session")
+        monkeypatch.delenv("DEVBENCH_ORCHESTRATOR_SESSION_ID", raising=False)
+        with pytest.raises(RuntimeError, match="JUDGE_ORCHESTRATOR_SESSION_ID is no longer accepted"):
+            cli.cmd_hook_tail("--orchestrator-only", "--no-follow")
 
     def test_orchestrator_session_missing_value_returns_2(
         self,
@@ -10855,8 +10903,8 @@ class TestCmdLogVerdictAllowlist:
 
 
 # ---------------------------------------------------------------------------
-# log-file path resolution: fail-fast when neither JUDGE_LOG_FILE nor
-# JUDGE_WORKSPACE_ROOT is set; canonical workspace-local path otherwise
+# log-file path resolution: fail-fast when neither DEVBENCH_LOG_FILE nor
+# DEVBENCH_WORKSPACE_ROOT is set; canonical workspace-local path otherwise
 # ---------------------------------------------------------------------------
 
 
@@ -10865,53 +10913,67 @@ class TestResolveLogFilePath:
     log file ``devbench report`` reads. Removing the silent source-tree
     fallback prevents the BACKLOG-vs-throughput divergence reported by
     operators (they ran ``devbench report`` from a sub-shell that
-    inherited ``JUDGE_WORKSPACE_ROOT`` but not ``JUDGE_LOG_FILE`` and got
+    inherited ``DEVBENCH_WORKSPACE_ROOT`` but not ``DEVBENCH_LOG_FILE`` and got
     an unrelated dev-tree log instead of their workspace's log).
+
+    After the JUDGE_* -> DEVBENCH_* rename (AC-197-1 / AC-197-2), the resolver
+    uses ``_read_env_strict`` to hard-reject any set legacy ``JUDGE_LOG_FILE``
+    and reads ``DEVBENCH_LOG_FILE`` as the canonical name.
     """
 
-    def test_explicit_judge_log_file_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("JUDGE_LOG_FILE", "/tmp/my-explicit.log")
-        monkeypatch.setenv("JUDGE_WORKSPACE_ROOT", "/tmp/some-workspace")
-        # JUDGE_LOG_FILE is the explicit override and MUST win even when
-        # JUDGE_WORKSPACE_ROOT is also set.
+    def test_explicit_devbench_log_file_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
+        monkeypatch.setenv("DEVBENCH_LOG_FILE", "/tmp/my-explicit.log")
+        # DEVBENCH_LOG_FILE is the explicit override and MUST win even when
+        # DEVBENCH_WORKSPACE_ROOT (via WORKSPACE_ROOT) is also set.
         assert cli._resolve_log_file_path() == Path("/tmp/my-explicit.log")
 
     def test_workspace_root_derives_canonical_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
-        monkeypatch.setenv("JUDGE_WORKSPACE_ROOT", "/tmp/my-workspace")
-        # Default path is <workspace>/<DEFAULT_LOG_SUBDIR>/<DEFAULT_LOG_FILENAME>.
+        monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
+        # Default path is <WORKSPACE_ROOT>/<DEFAULT_LOG_SUBDIR>/<DEFAULT_LOG_FILENAME>.
         # Operators running ``devbench report`` from any shell with
-        # JUDGE_WORKSPACE_ROOT inherited get the same log the
-        # orchestrator writes to.
+        # DEVBENCH_WORKSPACE_ROOT set get the same log the orchestrator writes to.
         from devbench.constants import DEFAULT_LOG_FILENAME, DEFAULT_LOG_SUBDIR
 
-        expected = Path("/tmp/my-workspace") / DEFAULT_LOG_SUBDIR / DEFAULT_LOG_FILENAME
+        expected = cli.WORKSPACE_ROOT / DEFAULT_LOG_SUBDIR / DEFAULT_LOG_FILENAME
         assert cli._resolve_log_file_path() == expected
 
-    def test_empty_judge_log_file_falls_through_to_workspace_root(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # Empty / whitespace-only JUDGE_LOG_FILE behaves as unset
+    def test_empty_devbench_log_file_falls_through_to_workspace_root(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Empty / whitespace-only DEVBENCH_LOG_FILE behaves as unset
         # (avoids "" being treated as a valid path).
-        monkeypatch.setenv("JUDGE_LOG_FILE", "   ")
-        monkeypatch.setenv("JUDGE_WORKSPACE_ROOT", "/tmp/ws")
+        monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
+        monkeypatch.setenv("DEVBENCH_LOG_FILE", "   ")
         from devbench.constants import DEFAULT_LOG_FILENAME, DEFAULT_LOG_SUBDIR
 
-        expected = Path("/tmp/ws") / DEFAULT_LOG_SUBDIR / DEFAULT_LOG_FILENAME
+        expected = cli.WORKSPACE_ROOT / DEFAULT_LOG_SUBDIR / DEFAULT_LOG_FILENAME
         assert cli._resolve_log_file_path() == expected
 
-    def test_neither_set_fails_fast(self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
-        # Per CLAUDE.md "Fail-fast": no fallbacks. When neither env var
-        # is set the helper exits 1 with an actionable error rather
-        # than silently falling back to the devbench source tree's log.
+    def test_neither_env_nor_yaml_falls_back_to_workspace_root_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # When neither DEVBENCH_LOG_FILE nor YAML log_file is set,
+        # the resolver uses WORKSPACE_ROOT (already resolved from
+        # DEVBENCH_WORKSPACE_ROOT by config.py) to derive the canonical path.
         monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
-        monkeypatch.delenv("JUDGE_WORKSPACE_ROOT", raising=False)
-        with pytest.raises(SystemExit) as excinfo:
+        monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
+        from devbench.constants import DEFAULT_LOG_FILENAME, DEFAULT_LOG_SUBDIR
+
+        expected = cli.WORKSPACE_ROOT / DEFAULT_LOG_SUBDIR / DEFAULT_LOG_FILENAME
+        assert cli._resolve_log_file_path() == expected
+
+    def test_legacy_judge_log_file_raises_runtime_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # AC-197-2: setting JUDGE_LOG_FILE causes a hard RuntimeError.
+        # The operator must migrate to DEVBENCH_LOG_FILE via devbench migrate-env.
+        monkeypatch.setenv("JUDGE_LOG_FILE", "/tmp/legacy.log")
+        monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
+        with pytest.raises(RuntimeError, match="JUDGE_LOG_FILE is no longer accepted"):
             cli._resolve_log_file_path()
-        assert excinfo.value.code == 1
-        err = capsys.readouterr().err
-        # Error names BOTH env vars and the canonical workspace-local
-        # path so the operator can self-correct from either direction.
-        assert "JUDGE_LOG_FILE" in err
-        assert "JUDGE_WORKSPACE_ROOT" in err
+
+    def test_legacy_judge_log_file_with_new_also_set_still_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # AC-197-3: legacy presence is the disqualifier regardless of new-name.
+        monkeypatch.setenv("JUDGE_LOG_FILE", "/tmp/legacy.log")
+        monkeypatch.setenv("DEVBENCH_LOG_FILE", "/tmp/new.log")
+        with pytest.raises(RuntimeError, match="JUDGE_LOG_FILE is no longer accepted"):
+            cli._resolve_log_file_path()
 
 
 # ---------------------------------------------------------------------------
@@ -10921,10 +10983,15 @@ class TestResolveLogFilePath:
 
 class TestResolveLogFileYamlConfig:
     """``RUNTIME_CONFIG.log_file`` (from devbench.yaml) drives the resolver
-    when ``JUDGE_LOG_FILE`` env var is not set. This is the canonical
+    when ``DEVBENCH_LOG_FILE`` env var is not set. This is the canonical
     single source of truth for the orchestrator's log path; the
     orchestrator-as-writer (``setup_logging``) and the report-as-reader
     (``cmd_report``) both consult it so they cannot diverge.
+
+    After the JUDGE_* -> DEVBENCH_* rename (AC-197-1), all reads use
+    ``DEVBENCH_LOG_FILE`` as the canonical env-var name.  The workspace
+    root is resolved from the already-computed ``WORKSPACE_ROOT`` constant
+    (which is itself strictly validated in config.py).
     """
 
     def _runtime_config_with_log_file(self, value: str | None) -> Any:
@@ -10934,48 +11001,46 @@ class TestResolveLogFileYamlConfig:
 
     def test_yaml_log_file_workspace_relative(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
-        monkeypatch.setenv("JUDGE_WORKSPACE_ROOT", "/tmp/ws")
+        monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
         monkeypatch.setattr(cli, "RUNTIME_CONFIG", self._runtime_config_with_log_file("logs/orch.log"))
         # YAML log_file is workspace-relative when not absolute; the
-        # resolver joins it with JUDGE_WORKSPACE_ROOT.
-        assert cli._resolve_log_file_path() == Path("/tmp/ws/logs/orch.log")
+        # resolver joins it with WORKSPACE_ROOT (already resolved from DEVBENCH_WORKSPACE_ROOT).
+        assert cli._resolve_log_file_path() == cli.WORKSPACE_ROOT / "logs" / "orch.log"
 
     def test_yaml_log_file_absolute_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
-        monkeypatch.setenv("JUDGE_WORKSPACE_ROOT", "/tmp/ws")
+        monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
         monkeypatch.setattr(cli, "RUNTIME_CONFIG", self._runtime_config_with_log_file("/var/log/d.log"))
         # An absolute YAML path is used as-is, ignoring the workspace
         # root (operator deliberately put the log outside the workspace).
         assert cli._resolve_log_file_path() == Path("/var/log/d.log")
 
-    def test_explicit_judge_log_file_still_wins_over_yaml(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("JUDGE_LOG_FILE", "/tmp/explicit.log")
-        monkeypatch.setenv("JUDGE_WORKSPACE_ROOT", "/tmp/ws")
+    def test_explicit_devbench_log_file_still_wins_over_yaml(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
+        monkeypatch.setenv("DEVBENCH_LOG_FILE", "/tmp/explicit.log")
         monkeypatch.setattr(cli, "RUNTIME_CONFIG", self._runtime_config_with_log_file("logs/orch.log"))
-        # Per-invocation env override beats both YAML config and the
+        # Per-invocation DEVBENCH_LOG_FILE env override beats both YAML config and the
         # workspace-local convention; this matches how ``cmd_check`` and
         # the test fixtures set the path explicitly.
         assert cli._resolve_log_file_path() == Path("/tmp/explicit.log")
 
     def test_yaml_unset_falls_through_to_workspace_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
-        monkeypatch.setenv("JUDGE_WORKSPACE_ROOT", "/tmp/ws")
+        monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
         monkeypatch.setattr(cli, "RUNTIME_CONFIG", self._runtime_config_with_log_file(None))
         from devbench.constants import DEFAULT_LOG_FILENAME, DEFAULT_LOG_SUBDIR
 
-        # When neither JUDGE_LOG_FILE nor YAML log_file is set, the
-        # resolver falls back to the workspace-local convention.
-        assert cli._resolve_log_file_path() == (Path("/tmp/ws") / DEFAULT_LOG_SUBDIR / DEFAULT_LOG_FILENAME)
+        # When neither DEVBENCH_LOG_FILE nor YAML log_file is set, the
+        # resolver falls back to the workspace-local convention using WORKSPACE_ROOT.
+        assert cli._resolve_log_file_path() == (cli.WORKSPACE_ROOT / DEFAULT_LOG_SUBDIR / DEFAULT_LOG_FILENAME)
 
-    def test_yaml_with_no_workspace_treats_relative_as_cwd_relative(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # Edge case: YAML has a relative log_file but JUDGE_WORKSPACE_ROOT
-        # is unset (very rare; only happens in test fixtures). The
-        # resolver returns the path as-is so callers can decide what
-        # to anchor it against.
+    def test_yaml_with_relative_path_and_workspace_root(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # YAML has a relative log_file; WORKSPACE_ROOT is used as the anchor.
         monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
-        monkeypatch.delenv("JUDGE_WORKSPACE_ROOT", raising=False)
+        monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
         monkeypatch.setattr(cli, "RUNTIME_CONFIG", self._runtime_config_with_log_file("logs/orch.log"))
-        assert cli._resolve_log_file_path() == Path("logs/orch.log")
+        # WORKSPACE_ROOT is already resolved; relative YAML path is joined to it.
+        assert cli._resolve_log_file_path() == cli.WORKSPACE_ROOT / "logs" / "orch.log"
 
 
 class TestInlineOrphanCleanup:
@@ -12837,7 +12902,8 @@ class TestInProgressAttemptDurationRender:
             "2026-05-02T12:00:00Z [devbench.cli] INFO Set E0-F1-S1-T2 to 'in-progress'\n",
             encoding="utf-8",
         )
-        monkeypatch.setenv("JUDGE_LOG_FILE", str(log_path))
+        monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
+        monkeypatch.setenv("DEVBENCH_LOG_FILE", str(log_path))
         # Freeze time so the duration output is deterministic.
         fake_now = datetime(2026, 5, 2, 12, 23, 0, tzinfo=UTC)
 
@@ -12984,29 +13050,38 @@ class TestTryResolveLogFilePath:
     inputs is set.
     """
 
-    def test_returns_none_when_resolve_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_returns_workspace_default_when_neither_env_nor_yaml_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # After the JUDGE_* -> DEVBENCH_* rename, WORKSPACE_ROOT is always
+        # resolved at import time (config.py raises if it is not set).
+        # _resolve_log_file_path no longer raises SystemExit when neither
+        # DEVBENCH_LOG_FILE nor YAML log_file is configured; it falls
+        # back to the canonical WORKSPACE_ROOT / DEFAULT_LOG_SUBDIR / DEFAULT_LOG_FILENAME
+        # path.  _try_resolve_log_file_path therefore returns that path
+        # rather than None.
         monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
-        monkeypatch.delenv("JUDGE_WORKSPACE_ROOT", raising=False)
+        monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
+        from devbench.constants import DEFAULT_LOG_FILENAME, DEFAULT_LOG_SUBDIR
+
         cfg = MagicMock()
         cfg.log_file = ""
         with patch("devbench.cli.RUNTIME_CONFIG", cfg):
             result = cli._try_resolve_log_file_path()
-        assert result is None
+        assert result == cli.WORKSPACE_ROOT / DEFAULT_LOG_SUBDIR / DEFAULT_LOG_FILENAME
 
     def test_returns_path_when_yaml_log_file_set(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """When ``JUDGE_LOG_FILE`` is unset but YAML config carries a
+        """When ``DEVBENCH_LOG_FILE`` is unset but YAML config carries a
         ``log_file``, the wrapper resolves the workspace-relative path."""
         monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
-        monkeypatch.setenv("JUDGE_WORKSPACE_ROOT", str(tmp_path))
+        monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
         cfg = MagicMock()
         cfg.log_file = "logs/orch.log"
         with patch("devbench.cli.RUNTIME_CONFIG", cfg):
             result = cli._try_resolve_log_file_path()
-        assert result == tmp_path / "logs" / "orch.log"
+        assert result == cli.WORKSPACE_ROOT / "logs" / "orch.log"
 
     def test_timer_uses_yaml_config_when_env_unset(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """End-to-end: ``_latest_log_in_progress_ts`` resolves the log via
-        YAML ``log_file`` when ``JUDGE_LOG_FILE`` is unset. Prior to
+        YAML ``log_file`` when ``DEVBENCH_LOG_FILE`` is unset. Prior to
         issue #185 the helper bailed out with ``None`` causing
         ``cmd_status`` to render ``timer unavailable`` even though the
         log was discoverable."""
@@ -13017,10 +13092,13 @@ class TestTryResolveLogFilePath:
             encoding="utf-8",
         )
         monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
-        monkeypatch.setenv("JUDGE_WORKSPACE_ROOT", str(tmp_path))
+        monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
         cfg = MagicMock()
         cfg.log_file = "logs/orch.log"
-        with patch("devbench.cli.RUNTIME_CONFIG", cfg):
+        with (
+            patch("devbench.cli.RUNTIME_CONFIG", cfg),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
             ts = cli._latest_log_in_progress_ts("E0-F1-S1-T1", None)
         assert ts is not None
         assert ts.year == 2026 and ts.hour == 12 and ts.minute == 0

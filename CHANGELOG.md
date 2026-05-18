@@ -347,6 +347,48 @@ since the last release. PR #119 carries every change.
 
 ### Fixed
 
+- **Three-defect fix for blocked tasks with satisfied `[BLOCKED_PENDING_PROPOSAL]`
+  markers not auto-clearing** (issue #200). Before this fix, a task that was
+  blocked via a `[BLOCKED_PENDING_PROPOSAL] <child>` marker could remain
+  stuck in `blocked` after `<child>` reached `done`, requiring manual
+  operator intervention to flip it back to `in-queue`.
+
+  Three root causes addressed:
+
+  1. **Classifier fallthrough** (`src/devbench/backlog/proposal.py`
+     `classify_blocked_task` / `_classify_with_markers`): when ALL
+     `[BLOCKED_PENDING_PROPOSAL]` marker targets were terminal (`done` /
+     `declined`), `_classify_with_markers` returned `None`, causing the
+     task to fall through to `OPERATOR_ACTION_REQUIRED` instead of
+     `AUTO_CLEARING_VIA_PROPOSAL`. The fix: when all markers are terminal
+     AND no regular dep or recovery signal exists, the classifier now
+     returns `AUTO_CLEARING_VIA_PROPOSAL` (AC-200-1).
+
+  2. **Cascade trigger condition** (`src/devbench/backlog/manager.py`
+     `_auto_requeue_marker_dependents`): the cascade required the
+     newly-done task to be in the blocked task's Dependencies table. When
+     task-factory wired the dep via a marker comment only (no
+     Dependencies-table row), the cascade never fired. The fix: condition 2
+     now accepts the newly-done task appearing EITHER in the Dependencies
+     table OR as a `[BLOCKED_PENDING_PROPOSAL]` marker ID in the Comments
+     section (AC-200-2).
+
+  3. **Marker regex too broad** (`_BLOCKED_PENDING_PROPOSAL_RE` in
+     `manager.py`): the original `\S+` capture group matched any
+     non-whitespace word, including prose words like "Amendment" in lines
+     such as `[BLOCKED_PENDING_PROPOSAL] Amendment rejected ...`. This
+     injected fake non-terminal marker IDs that prevented the cascade from
+     firing. The fix: the capture group now matches only canonical task IDs
+     (`E\d+(?:-F\d+)?(?:-S\d+)?(?:-T\d+)?`) (AC-200-3).
+
+  Additionally: **`[AMENDMENT_REJECTED]` structured-tag audits now trigger
+  `AWAITING_AMENDMENT_RECOVERY`** (`src/devbench/backlog/proposal.py`
+  `_REJECTION_TAG_RE`). Previously, manifest-amender's structured-tag audit
+  `[AMENDMENT_REJECTED] tdd_green_production_fix; rejected: POST_CHECK: ...`
+  was not matched by `_RECOVERY_BODY_RE` (which required prose like
+  `amendment rejected` without brackets). A new `_REJECTION_TAG_RE` matcher
+  recognises the structured-tag form explicitly (AC-200-4).
+
 - **`devbench report` / `watch` no longer crash on transient WU md
   `FileNotFoundError`**. The user-reported scenario: `devbench watch`
   was running against an active orchestrator; one tick caught a WU md

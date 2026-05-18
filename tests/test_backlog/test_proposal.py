@@ -1772,13 +1772,20 @@ class TestClassifyBlockedTask:
         state = classify_blocked_task(workspace / "backlog", workspace / "BACKLOG.md", "E0-F1-S1-T1")
         assert state is BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL
 
-    def test_task_with_all_terminal_markers_is_operator_action_required(self, tmp_path: Path) -> None:
-        """Cascade should already have fired; the task is still blocked = diagnostic signal."""
+    def test_task_with_all_terminal_markers_is_auto_clearing(self, tmp_path: Path) -> None:
+        """Issue #200 / AC-200-1: all-terminal markers must return AUTO_CLEARING_VIA_PROPOSAL.
+
+        Before the fix this returned OPERATOR_ACTION_REQUIRED via fallthrough.
+        The fix: _classify_with_markers always returns AUTO_CLEARING_VIA_PROPOSAL
+        for any non-empty, non-unknown, non-HOLD marker set. The orchestrator's
+        cascade (_auto_requeue_marker_dependents) is responsible for actually
+        flipping the task to in-queue once all markers are terminal.
+        """
         from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
 
         workspace = self._workspace_with_markers(tmp_path, [("E0-F1-S1-T2", "done"), ("E0-F1-S1-T3", "declined")])
         state = classify_blocked_task(workspace / "backlog", workspace / "BACKLOG.md", "E0-F1-S1-T1")
-        assert state is BlockedTaskState.OPERATOR_ACTION_REQUIRED
+        assert state is BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL
 
     def test_task_with_unknown_marker_id_is_operator_action_required(self, tmp_path: Path) -> None:
         from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
@@ -3332,12 +3339,14 @@ class TestClassifyBlockedTaskAwaitingDependency:
         )
         assert state is BlockedTaskState.AWAITING_DEPENDENCY
 
-    def test_stale_terminal_markers_no_dep_no_recovery_remains_operator_required(self, tmp_path: Path) -> None:
-        """Regression guard: when all markers are terminal AND there is no
-        unsatisfied regular dep AND no recovery signal, the classifier
-        must still bucket as OPERATOR_ACTION_REQUIRED (the cascade
-        should have fired and did not -- the operator must intervene).
-        Issue #186 fall-through must NOT swallow this scenario.
+    def test_stale_terminal_markers_no_dep_no_recovery_is_auto_clearing(self, tmp_path: Path) -> None:
+        """Issue #200 / AC-200-1: when all markers are terminal AND there is no
+        unsatisfied regular dep AND no recovery signal, the classifier MUST return
+        AUTO_CLEARING_VIA_PROPOSAL (not OPERATOR_ACTION_REQUIRED).
+
+        Before the fix this fell through to OPERATOR_ACTION_REQUIRED; the new
+        behaviour signals that the cascade (_auto_requeue_marker_dependents)
+        should flip the task to in-queue. The operator does not need to intervene.
         """
         from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
 
@@ -3370,7 +3379,7 @@ class TestClassifyBlockedTaskAwaitingDependency:
             "E0-F1-S1-T1",
             workspace_root=tmp_path,
         )
-        assert state is BlockedTaskState.OPERATOR_ACTION_REQUIRED
+        assert state is BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL
 
 
 class TestClassifyBlockedTaskAwaitingAmendmentRecovery:
@@ -3600,3 +3609,219 @@ class TestClassifyBlockedTaskEndToEnd:
                 recovery_window_seconds=300,
             )
             assert state is expected, f"{task_id}: expected {expected.name}, got {state.name}"
+
+
+# ---------------------------------------------------------------------------
+# Issue #200 / AC-200-1: classifier returns AUTO_CLEARING_VIA_PROPOSAL
+# even when ALL [BLOCKED_PENDING_PROPOSAL] marker targets are terminal.
+# Before the fix, _classify_with_markers returned None for all-terminal
+# markers, causing a fall-through to OPERATOR_ACTION_REQUIRED.
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyBlockedTaskSatisfiedMarkers:
+    """AC-200-1: classify_blocked_task on satisfied (terminal) markers.
+
+    Parametrised tests cover the four sub-cases in the acceptance criteria:
+    - single satisfied marker
+    - multiple satisfied markers
+    - mixed satisfied + unsatisfied (unsatisfied wins: AUTO_CLEARING_VIA_PROPOSAL)
+    - satisfied marker + operator-attention audit (operator wins:
+      OPERATOR_ACTION_REQUIRED when no recovery signals exist)
+    """
+
+    def _workspace(
+        self,
+        tmp_path: Path,
+        marker_target_status_pairs: list[tuple[str, str]],
+        comments_extra: str = "",
+        dep_ids: list[str] | None = None,
+    ) -> Path:
+        """Build a workspace where E0-F1-S1-T1 has [BLOCKED_PENDING_PROPOSAL] markers."""
+        backlog_dir = tmp_path / "backlog"
+        story_dir = backlog_dir / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+
+        marker_lines = "\n".join(
+            f"[2026-04-20 00:00 UTC] [agent/task_factory] [BLOCKED_PENDING_PROPOSAL] {tid}"
+            for tid, _ in marker_target_status_pairs
+        )
+        dep_rows = "| none | | |"
+        if dep_ids:
+            dep_rows = "\n".join(f"| {d} | (auto) | proposed |" for d in dep_ids)
+
+        source_file = story_dir / "E0-F1-S1-T1.md"
+        source_file.write_text(
+            "# E0-F1-S1-T1: Source\n\n## Status: blocked\n\n"
+            "## Description\n\nfixture\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n"
+            f"{dep_rows}\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-TEST-001\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `t.py` | fixture |\n\n"
+            "## Definition of Done\n\n- [ ] AC complete\n\n"
+            f"## Comments\n\n{marker_lines}\n{comments_extra}"
+        )
+
+        rows = ["| E0-F1-S1-T1 | Source | Task | blocked | None | r | `backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |"]
+        for tid, status in marker_target_status_pairs:
+            (story_dir / f"{tid}.md").write_text(f"# {tid}: X\n\n## Status: {status}\n")
+            rows.append(f"| {tid} | Marker | Task | {status} | None | r | `backlog/E0/E0-F1/E0-F1-S1/{tid}.md` |")
+
+        (tmp_path / "BACKLOG.md").write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n" + "\n".join(rows) + "\n"
+        )
+        return tmp_path
+
+    @pytest.mark.parametrize(
+        "pairs,expected_state",
+        [
+            pytest.param(
+                [("E0-F1-S1-T2", "done")],
+                "AUTO_CLEARING_VIA_PROPOSAL",
+                id="single-satisfied-marker-done",
+            ),
+            pytest.param(
+                [("E0-F1-S1-T2", "declined")],
+                "AUTO_CLEARING_VIA_PROPOSAL",
+                id="single-satisfied-marker-declined",
+            ),
+            pytest.param(
+                [("E0-F1-S1-T2", "done"), ("E0-F1-S1-T3", "declined")],
+                "AUTO_CLEARING_VIA_PROPOSAL",
+                id="multiple-satisfied-markers",
+            ),
+            pytest.param(
+                [("E0-F1-S1-T2", "done"), ("E0-F1-S1-T3", "in-queue")],
+                "AUTO_CLEARING_VIA_PROPOSAL",
+                id="mixed-satisfied-unsatisfied-unsatisfied-wins",
+            ),
+        ],
+    )
+    def test_satisfied_markers_return_auto_clearing(
+        self, tmp_path: Path, pairs: list[tuple[str, str]], expected_state: str
+    ) -> None:
+        """AC-200-1: all-terminal and mixed-terminal markers both produce AUTO_CLEARING_VIA_PROPOSAL."""
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        workspace = self._workspace(tmp_path, pairs)
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+        )
+        assert state is getattr(BlockedTaskState, expected_state), (
+            f"Expected {expected_state}, got {state.name}. Pairs: {pairs}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Issue #200 / AC-200-4: _REJECTION_TAG_RE matches [AMENDMENT_REJECTED]
+# structured-tag audits and causes AWAITING_AMENDMENT_RECOVERY classification.
+# ---------------------------------------------------------------------------
+
+
+class TestRejectionTagRegex:
+    """AC-200-4: separate _REJECTION_TAG_RE for structured [AMENDMENT_REJECTED] tags.
+
+    The classifier's AWAITING_AMENDMENT_RECOVERY path must recognise
+    structured-tag audits like
+    ``[AMENDMENT_REJECTED] tdd_green_production_fix; rejected: POST_CHECK: ...``
+    even though that body text does not contain the prose ``amendment reject``
+    that ``_RECOVERY_BODY_RE`` matches.
+    """
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            pytest.param(
+                "[AMENDMENT_REJECTED] tdd_green_production_fix; rejected: POST_CHECK: scope violation",
+                id="structured-tag-with-reason",
+            ),
+            pytest.param(
+                "[AMENDMENT_REJECTED]",
+                id="structured-tag-bare",
+            ),
+            pytest.param(
+                "[AMENDMENT_REJECTED] out-of-scope: constants.py not in manifest",
+                id="structured-tag-with-out-of-scope",
+            ),
+        ],
+    )
+    def test_positive_match(self, body: str) -> None:
+        """_REJECTION_TAG_RE must match [AMENDMENT_REJECTED] structured tags."""
+        from devbench.backlog.proposal import _REJECTION_TAG_RE
+
+        assert _REJECTION_TAG_RE.search(body), f"_REJECTION_TAG_RE should match: {body!r}"
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            pytest.param("unrelated blocked reason", id="unrelated"),
+            pytest.param("AMENDMENT REJECTED", id="prose-form-no-brackets"),
+            pytest.param("amendment rejected", id="lowercase-prose-no-brackets"),
+        ],
+    )
+    def test_negative_no_match(self, body: str) -> None:
+        """_REJECTION_TAG_RE must NOT match prose forms without brackets."""
+        from devbench.backlog.proposal import _REJECTION_TAG_RE
+
+        assert not _REJECTION_TAG_RE.search(body), f"_REJECTION_TAG_RE should NOT match: {body!r}"
+
+    def _workspace_no_marker(self, tmp_path: Path) -> Path:
+        """Build workspace with E0-F1-S1-T1 blocked, no markers, no regular deps."""
+        backlog_dir = tmp_path / "backlog"
+        story_dir = backlog_dir / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+        (story_dir / "E0-F1-S1-T1.md").write_text(
+            "# E0-F1-S1-T1: Source\n\n## Status: blocked\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
+            "## Comments\n"
+        )
+        (tmp_path / "BACKLOG.md").write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Source | Task | blocked | None | r"
+            " | `backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n"
+        )
+        return tmp_path
+
+    @pytest.mark.parametrize(
+        "audit_body",
+        [
+            pytest.param(
+                "[AMENDMENT_REJECTED] tdd_green_production_fix; rejected: POST_CHECK: scope",
+                id="amendment-rejected-tag-with-reason",
+            ),
+            pytest.param(
+                "[AMENDMENT_REJECTED]",
+                id="amendment-rejected-tag-bare",
+            ),
+        ],
+    )
+    def test_amendment_rejected_tag_classifies_awaiting_amendment_recovery(
+        self, tmp_path: Path, audit_body: str
+    ) -> None:
+        """AC-200-4: [AMENDMENT_REJECTED] structured-tag audit triggers AWAITING_AMENDMENT_RECOVERY."""
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        workspace = self._workspace_no_marker(tmp_path)
+        source_file = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
+        now = datetime(2026, 5, 16, 2, 32, tzinfo=UTC)
+        ts = now.strftime("%Y-%m-%d %H:%M UTC")
+        source_file.write_text(source_file.read_text() + f"\n[{ts}] [agent/manifest_amender] [BLOCKED] {audit_body}\n")
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+            now=now,
+            recovery_window_seconds=3600,
+        )
+        assert state is BlockedTaskState.AWAITING_AMENDMENT_RECOVERY, (
+            f"Expected AWAITING_AMENDMENT_RECOVERY for body {audit_body!r}, got {state.name}"
+        )

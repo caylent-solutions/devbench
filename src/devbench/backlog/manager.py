@@ -87,7 +87,17 @@ _TERMINAL_CHILD_STATUSES: frozenset[str] = frozenset({STATUS_DONE, STATUS_DECLIN
 # regex captures the target task ID in group 1; the scan is scoped to the
 # Comments section so markers quoted in Description/Approach text cannot
 # trigger the cascade.
-_BLOCKED_PENDING_PROPOSAL_RE: re.Pattern[str] = re.compile(r"\[BLOCKED_PENDING_PROPOSAL\]\s+(\S+)")
+#
+# Issue #200 / AC-200-3: the original ``\S+`` capture group was too broad --
+# it matched any non-whitespace word, including prose words like "Amendment"
+# in lines such as ``[BLOCKED_PENDING_PROPOSAL] Amendment rejected``. This
+# caused the auto-requeue cascade to treat "Amendment" as an unknown task ID
+# (non-terminal), preventing the cascade from firing even when the real marker
+# target (e.g. E5-F3-S1-T4) was terminal. The fix narrows the pattern to only
+# capture canonical task IDs matching ``E\d+(-F\d+)?(-S\d+)?(-T\d+)?``.
+_BLOCKED_PENDING_PROPOSAL_RE: re.Pattern[str] = re.compile(
+    r"\[BLOCKED_PENDING_PROPOSAL\]\s+(E\d+(?:-F\d+)?(?:-S\d+)?(?:-T\d+)?)"
+)
 
 
 class BacklogManager:
@@ -1093,8 +1103,12 @@ class BacklogManager:
         of the following hold:
 
         1. Its status is ``blocked`` (non-blocked candidates are skipped).
-        2. The just-completed task (``newly_done_id``) appears in the
-           candidate's declared Dependencies table.
+        2. The just-completed task (``newly_done_id``) appears EITHER in the
+           candidate's declared Dependencies table OR as a
+           ``[BLOCKED_PENDING_PROPOSAL]`` marker ID in the Comments section.
+           Issue #200 / AC-200-2: the marker-only path was previously missing,
+           causing tasks whose only reference to the promoted dep was via a
+           marker (no Dependencies-table row) to stay blocked indefinitely.
         3. The candidate's Comments section carries at least one
            ``[BLOCKED_PENDING_PROPOSAL]`` marker.
         4. Every task ID named by those markers is in a terminal state
@@ -1142,14 +1156,20 @@ class BacklogManager:
                 )
                 continue
 
-            # Must be a declared dep. Parse inline from the file content so
-            # the scan never depends on the full index being loadable.
+            # Issue #200 / AC-200-2: the trigger condition is relaxed to accept
+            # ``newly_done_id`` appearing EITHER in the declared Dependencies
+            # table OR as a ``[BLOCKED_PENDING_PROPOSAL]`` marker in the
+            # Comments section.  Previously only the dep-table path was checked,
+            # which silently skipped tasks where task-factory wired the dep via
+            # a marker-only reference (no Dependencies-table row), leaving them
+            # stuck in ``blocked`` after the marker target reached ``done``.
             content = candidate_file.read_text(encoding="utf-8")
-            if newly_done_id not in self._parse_candidate_dependencies(content):
-                continue
-
             marker_ids = self._extract_pending_proposal_markers(candidate_file)
             if not marker_ids:
+                continue
+            referenced_via_dep = newly_done_id in self._parse_candidate_dependencies(content)
+            referenced_via_marker = newly_done_id in marker_ids
+            if not referenced_via_dep and not referenced_via_marker:
                 continue
             if not marker_ids.issubset(terminal_ids):
                 continue

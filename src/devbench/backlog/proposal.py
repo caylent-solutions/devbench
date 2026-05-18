@@ -227,6 +227,14 @@ _RECOVERY_BODY_RE: re.Pattern[str] = re.compile(
     r"|will auto-requeue when",
     re.IGNORECASE,
 )
+# Issue #200 / AC-200-4: structured [AMENDMENT_REJECTED] tags written by
+# manifest-amender differ from the prose ``amendment rejected`` form matched
+# by ``_RECOVERY_BODY_RE``. A separate matcher avoids widening the prose
+# regex to bracket-enclosed tokens, keeping each matcher's intent clear.
+# Pattern is intentionally case-sensitive: the structured tag is always
+# emitted in upper-case by the manifest-amender; a lower-case occurrence
+# is a prose quote of the tag, not the tag itself.
+_REJECTION_TAG_RE: re.Pattern[str] = re.compile(r"\[AMENDMENT_REJECTED\]")
 _BLOCKED_AUDIT_RE: re.Pattern[str] = re.compile(
     r"\[(?P<ts>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s+UTC)\]\s+\[(?P<agent>[^\]]+)\]\s+\[BLOCKED\]\s+(?P<body>.+)",
 )
@@ -346,7 +354,11 @@ def _recent_recovery_audit_comment(source_file: Path, now: datetime, window_seco
         return False
     if agent not in _RECOVERY_AGENT_TAGS:
         return False
-    return bool(_RECOVERY_BODY_RE.search(body))
+    # Issue #200 / AC-200-4: check the structured-tag matcher FIRST so that
+    # ``[AMENDMENT_REJECTED] tdd_green_production_fix; rejected: POST_CHECK:
+    # ...`` lines are classified even when the prose body lacks the
+    # ``amendment reject`` phrase that ``_RECOVERY_BODY_RE`` requires.
+    return bool(_REJECTION_TAG_RE.search(body) or _RECOVERY_BODY_RE.search(body))
 
 
 def classify_blocked_task(
@@ -370,9 +382,13 @@ def classify_blocked_task(
     2. ``BLOCKED_ON_HELD`` -- the task carries a ``[BLOCKED_PENDING_PROPOSAL]``
        marker whose target is in ``hold``.
     3. ``AUTO_CLEARING_VIA_PROPOSAL`` -- at least one non-terminal, non-HOLD
-       marker target exists; the ADR-07 cascade is in flight.
-    4. ``AWAITING_DEPENDENCY`` -- no marker present, but a regular
-       Dependencies-table row points at a non-terminal task.
+       marker target exists; the ADR-07 cascade is in flight. ALSO fires
+       (AC-200-1 / issue #200) when ALL marker targets are terminal and no
+       regular dep or recovery signal applies: the cascade in
+       ``_auto_requeue_marker_dependents`` will flip the task to ``in-queue``.
+    4. ``AWAITING_DEPENDENCY`` -- no marker present (or all markers terminal
+       but a regular dep is still in flight), and a Dependencies-table row
+       points at a non-terminal task.
     5. ``AWAITING_AMENDMENT_RECOVERY`` -- no marker, no pending dep, but at
        least one recovery signal is on disk (pending proposal JSON,
        rejected-amendment archive, or a recent ``[BLOCKED]`` audit comment
@@ -407,29 +423,30 @@ def classify_blocked_task(
     mgr = BacklogManager()
     marker_ids = mgr._extract_pending_proposal_markers(source_file)
 
+    all_markers_terminal = False
     if marker_ids:
         marker_result = _classify_with_markers(mgr, backlog_index, marker_ids)
         if marker_result is not None:
             return marker_result
-        # Fall through: every marker target is terminal (the cascade
-        # should have fired and did not), so the marker rows are stale.
-        # Consult regular deps + recovery signals before defaulting to
-        # operator attention. Without this fall-through, a task with an
-        # unrelated unsatisfied regular dep gets misclassified as
-        # OPERATOR_ACTION_REQUIRED when it is plainly an
-        # AWAITING_DEPENDENCY situation (issue #186).
+        # _classify_with_markers returned None: every marker target is
+        # terminal. Issue #186 compat: fall through to the regular-dep
+        # and recovery-signal checks first; only return
+        # AUTO_CLEARING_VIA_PROPOSAL when none of those apply (AC-200-1).
+        all_markers_terminal = True
 
     # Priority 4: AWAITING_DEPENDENCY -- regular deps still in flight.
     if _regular_deps_unsatisfied(backlog_root, backlog_index, task_id):
         return BlockedTaskState.AWAITING_DEPENDENCY
 
-    # Priority 5 / 6: recovery signals or operator attention.
-    return _classify_recovery_or_attention(
+    # Priority 3 (late path, AC-200-1) / 5 / 6: satisfied-markers fallback
+    # vs recovery-signal vs operator attention.
+    return _classify_late(
         source_file=source_file,
         task_id=task_id,
         workspace_root=workspace_root,
         now=now,
         recovery_window_seconds=recovery_window_seconds,
+        all_markers_terminal=all_markers_terminal,
     )
 
 
@@ -489,13 +506,15 @@ def _classify_with_markers(
     - ``OPERATOR_ACTION_REQUIRED`` -- backlog index missing or any
       marker target unknown to the index; the operator must clean up
       the stray reference before any automation can proceed.
-    - ``AUTO_CLEARING_VIA_PROPOSAL`` -- at least one non-terminal,
-      non-HOLD marker target exists; the ADR-07 cascade is in flight.
+    - ``AUTO_CLEARING_VIA_PROPOSAL`` -- at least one non-terminal, non-HOLD
+      marker target exists; the ADR-07 cascade is in flight.
 
-    Returns ``None`` when every marker target is terminal -- the marker
-    rows are stale and the caller should fall through to the regular-dep
-    and recovery-signal checks instead of bouncing the task into the
-    operator-attention bucket (issue #186).
+    Returns ``None`` when every marker target is terminal (all satisfied).
+    The caller (``classify_blocked_task``) then checks whether any regular
+    deps are still unsatisfied (AWAITING_DEPENDENCY) or recovery signals
+    are on disk (AWAITING_AMENDMENT_RECOVERY). When none of those apply,
+    the caller returns ``AUTO_CLEARING_VIA_PROPOSAL`` (issue #200 /
+    AC-200-1: satisfied markers with no other blockers = auto-clearing).
     """
     try:
         rows = mgr._parse_backlog_rows(backlog_index)
@@ -514,11 +533,43 @@ def _classify_with_markers(
             non_terminal_marker_found = True
 
     if not non_terminal_marker_found:
-        # All markers terminal -- stale cascade signal. Let the caller
-        # consult regular deps + recovery signals before defaulting to
-        # operator attention.
+        # All markers terminal. Signal to caller by returning None so it
+        # can apply the priority-4 / priority-5 checks. When no regular
+        # dep or recovery signal blocks progress, the caller returns
+        # AUTO_CLEARING_VIA_PROPOSAL (AC-200-1).
         return None
     return BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL
+
+
+def _classify_late(
+    *,
+    source_file: Path,
+    task_id: str,
+    workspace_root: Path | None,
+    now: datetime | None,
+    recovery_window_seconds: int | None,
+    all_markers_terminal: bool,
+) -> BlockedTaskState:
+    """Resolve the post-dep-check priorities (3 late / 5 / 6).
+
+    Called by ``classify_blocked_task`` after the priority-4 dep-check
+    returns False. Three outcomes in priority order:
+
+    1. AC-200-1 (priority 3 late): all marker targets are terminal and
+       no other signal blocks progress -- return AUTO_CLEARING_VIA_PROPOSAL
+       so the cascade can flip the task to in-queue.
+    2. Priority 5: a recovery signal is on disk -- AWAITING_AMENDMENT_RECOVERY.
+    3. Priority 6: no signal -- OPERATOR_ACTION_REQUIRED.
+    """
+    if all_markers_terminal:
+        return BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL
+    return _classify_recovery_or_attention(
+        source_file=source_file,
+        task_id=task_id,
+        workspace_root=workspace_root,
+        now=now,
+        recovery_window_seconds=recovery_window_seconds,
+    )
 
 
 def _classify_recovery_or_attention(

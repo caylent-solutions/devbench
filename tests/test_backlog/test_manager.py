@@ -6316,3 +6316,153 @@ class TestBulkSetStatus:
         assert called_with_root[0] == index_path.parent, (
             f"Expected workspace_root={index_path.parent}, got {called_with_root[0]}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Issue #200 / AC-200-2: cascade fires even when the newly-done ID is only
+# referenced by a [BLOCKED_PENDING_PROPOSAL] marker, NOT in the dep table.
+# Before the fix, condition 2 in _auto_requeue_marker_dependents required
+# newly_done_id to be in _parse_candidate_dependencies (the Dependencies
+# table), which was never true for marker-only references.
+# ---------------------------------------------------------------------------
+
+
+class TestAutoRequeueMarkerOnlyNoDep:
+    """AC-200-2: cascade fires when marker target is not in the dep table.
+
+    The fix must relax condition 2 so that ``newly_done_id`` appearing as a
+    marker ID (in the Comments section) is sufficient to trigger the cascade,
+    even when the Dependencies section contains ``| none | | |``.
+    """
+
+    def test_cascade_fires_when_marker_target_done_but_not_in_dep_table(self, tmp_path: Path) -> None:
+        """AC-200-2 happy path: marker-only reference triggers auto-requeue."""
+        marker_comment = "[2026-05-16 01:57 UTC] [agent/agent/orchestrator] [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2\n"
+        src_file = _unit_body(
+            "E0-F1-S1-T1",
+            "blocked",
+            deps=None,  # No dep table entry -- marker only
+            comments=marker_comment,
+        )
+        dep_file = _unit_body("E0-F1-S1-T2", "done")
+        index = _write_workspace(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Source", "blocked"),
+                ("E0-F1-S1-T2", "MarkerTarget", "done"),
+            ],
+            files={"E0-F1-S1-T1": src_file, "E0-F1-S1-T2": dep_file},
+        )
+        BacklogManager()._auto_requeue_marker_dependents(index, "E0-F1-S1-T2")
+
+        src = (tmp_path / "backlog" / "E0-F1-S1-T1.md").read_text()
+        assert "## Status: in-queue" in src, "Source should be re-queued when its marker target is done"
+        assert "[AUTO_UNBLOCKED]" in src
+        assert "[CASCADE_RESOLVED]" in src
+
+    def test_cascade_does_not_fire_when_other_marker_still_non_terminal(self, tmp_path: Path) -> None:
+        """Two markers with no dep table: cascade stays blocked until both are done."""
+        marker_comment = (
+            "[2026-05-16 01:57 UTC] [agent/agent/orchestrator] [BLOCKED_PENDING_PROPOSAL]"
+            " E0-F1-S1-T2\n"
+            "[2026-05-16 01:58 UTC] [agent/agent/orchestrator] [BLOCKED_PENDING_PROPOSAL]"
+            " E0-F1-S1-T3\n"
+        )
+        src_file = _unit_body(
+            "E0-F1-S1-T1",
+            "blocked",
+            deps=None,
+            comments=marker_comment,
+        )
+        dep_done = _unit_body("E0-F1-S1-T2", "done")
+        dep_queued = _unit_body("E0-F1-S1-T3", "in-queue")
+        index = _write_workspace(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Source", "blocked"),
+                ("E0-F1-S1-T2", "MarkerTarget1", "done"),
+                ("E0-F1-S1-T3", "MarkerTarget2", "in-queue"),
+            ],
+            files={
+                "E0-F1-S1-T1": src_file,
+                "E0-F1-S1-T2": dep_done,
+                "E0-F1-S1-T3": dep_queued,
+            },
+        )
+        BacklogManager()._auto_requeue_marker_dependents(index, "E0-F1-S1-T2")
+
+        src = (tmp_path / "backlog" / "E0-F1-S1-T1.md").read_text()
+        assert "## Status: blocked" in src, "Should stay blocked -- T3 not yet done"
+        assert "[AUTO_UNBLOCKED]" not in src
+
+
+# ---------------------------------------------------------------------------
+# Issue #200 / AC-200-3: regression test for the captured E5-F3-S1-T1 +
+# E5-F3-S1-T4 scenario from 2026-05-16 02:32 UTC. Before the fix, T1
+# remained blocked after T4 completed because the cascade required T4 to
+# be in T1's Dependencies table (it was, but the classifier still returned
+# OPERATOR_ACTION_REQUIRED for satisfied markers).
+# ---------------------------------------------------------------------------
+
+
+class TestAutoRequeueRegressionE5Scenario:
+    """AC-200-3: regression test for the E5-F3-S1-T1 + E5-F3-S1-T4 scenario.
+
+    Reproduces the exact audit-log content from 2026-05-16 02:32 UTC and
+    asserts that within one _auto_requeue_marker_dependents sweep tick,
+    T1 auto-clears with [AUTO_UNBLOCKED] [CASCADE_RESOLVED] and status
+    in-queue -- without operator intervention.
+    """
+
+    # Exact audit-log lines from the 2026-05-16 02:32 UTC capture for T1.
+    _T1_AUDIT_COMMENTS = (
+        "[2026-05-16 01:56 UTC] [agent/task_factory] [PROPOSAL_PROMOTED]"
+        " E5-F3-S1-T4 promoted and wired as dependency of E5-F3-S1-T1."
+        " (auto-accepted via task_factory.auto_accept_proposals=true at"
+        " write-proposal time) [BLOCKED_PENDING_PROPOSAL] E5-F3-S1-T4\n"
+        "[2026-05-16 01:57 UTC] [agent/agent/orchestrator]"
+        " [BLOCKED_PENDING_PROPOSAL] Amendment rejected"
+        " (source-test atomicity on constants.py). Blocker-resolver proposed"
+        " E5-F3-S1-T4 to own constants, schema, and sample-config changes."
+        " Task will auto-requeue once E5-F3-S1-T4 completes.\n"
+    )
+
+    def test_regression_e5_f3_s1_t1_auto_clears_after_t4_done(self, tmp_path: Path) -> None:
+        """T4 completing must trigger T1 auto-unblock in one sweep tick.
+
+        The fixture preserves the exact audit-log text so future audit-format
+        changes do not silently break the regression. The cascade must write
+        [AUTO_UNBLOCKED] [CASCADE_RESOLVED] and flip T1 to in-queue without
+        operator intervention.
+        """
+        src_file = _unit_body(
+            "E5-F3-S1-T1",
+            "blocked",
+            deps=["E5-F3-S1-T4"],  # dep table entry as it existed at capture time
+            comments=self._T1_AUDIT_COMMENTS,
+        )
+        dep_file = _unit_body("E5-F3-S1-T4", "done")
+        index = _write_workspace(
+            tmp_path,
+            rows=[
+                ("E5-F3-S1-T1", "AddQuotaHandlingConfig", "blocked"),
+                ("E5-F3-S1-T4", "QuotaHandlingConfigConstants", "done"),
+            ],
+            files={"E5-F3-S1-T1": src_file, "E5-F3-S1-T4": dep_file},
+        )
+
+        # Single sweep tick: T4 just completed.
+        BacklogManager()._auto_requeue_marker_dependents(index, "E5-F3-S1-T4")
+
+        t1_content = (tmp_path / "backlog" / "E5-F3-S1-T1.md").read_text()
+        assert "## Status: in-queue" in t1_content, "T1 must flip to in-queue in one sweep tick"
+        assert "[AUTO_UNBLOCKED]" in t1_content
+        assert "[CASCADE_RESOLVED]" in t1_content
+        assert "E5-F3-S1-T4" in t1_content  # audit names the marker ID
+        # Verify no operator intervention line was present before the fix:
+        # the [REJECTION_FEEDBACK_RESOLVED] line from the captured log was
+        # an operator action, which should no longer be necessary.
+        assert (
+            "[REJECTION_FEEDBACK_RESOLVED]" not in t1_content
+            or "operator" not in t1_content.split("[REJECTION_FEEDBACK_RESOLVED]")[0].split("\n")[-1]
+        ), "Auto-unblock must precede any operator action"

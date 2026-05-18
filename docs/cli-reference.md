@@ -494,10 +494,12 @@ uv run devbench sync-blocked
 
 Reconcile every task's status against current dependency satisfaction. Walks the parsed index and:
 
-- Flips `in-queue` Tasks whose dependencies are NOT satisfied to `blocked` (with a `[BLOCKED] sync-blocked: dependency '<id>' not yet terminal` audit comment naming the first offending dep).
-- Flips `blocked` Tasks whose dependencies are now satisfied (every dep -- including epic / feature / story-level deps that recurse into descendants -- is `done` or `declined`) back to `in-queue` (with a `[UNBLOCKED] sync-blocked: dependencies now terminal` audit comment).
+- **in-queue to blocked** (forward direction): flips `in-queue` Tasks whose dependencies are NOT satisfied to `blocked` (with a `[BLOCKED] sync-blocked: dependency '<id>' not yet terminal` audit comment naming the first offending dep).
+- **blocked to in-queue** (reverse direction): flips `blocked` Tasks whose dependencies are now satisfied (every dep -- including epic / feature / story-level deps that recurse into descendants -- is `done` or `declined`) back to `in-queue` (with a `[UNBLOCKED] sync-blocked: dependencies now terminal` audit comment).
 
-Tasks carrying an open `[BLOCKED_PENDING_PROPOSAL] <id>` marker are left alone -- the ADR-07 cascade owns that path. Tasks whose status is anything other than `in-queue` or `blocked` (e.g. `in-progress`, `in-review`, `done`, `declined`, `hold`, `proposed`) are also untouched. Output is a JSON envelope of the form `{"flipped_to_blocked": [...], "flipped_to_in_queue": [...]}` for scripting.
+`sync-blocked` is **bidirectional**: it both blocks tasks whose deps are unmet and unblocks tasks whose deps are now satisfied. It operates on regular Dependencies-table rows only. The separate auto-unblock cascade for `[BLOCKED_PENDING_PROPOSAL]` markers fires automatically from `mark_done` via `_auto_requeue_marker_dependents` in `BacklogManager` -- that cascade triggers whenever the newly-done task is referenced either as a declared dependency OR as a `[BLOCKED_PENDING_PROPOSAL]` marker ID in the Comments section (issue #200 / AC-200-2).
+
+Tasks whose status is anything other than `in-queue` or `blocked` (e.g. `in-progress`, `in-review`, `done`, `declined`, `hold`, `proposed`) are untouched by `sync-blocked`. Output is a JSON envelope of the form `{"flipped_to_blocked": [...], "flipped_to_in_queue": [...]}` for scripting.
 
 Useful as a pre-flight sweep before `devbench next` (after manual edits to the backlog) and for triage when a backlog has drifted out of sync. Combine with `validate-backlog` for a complete consistency check.
 

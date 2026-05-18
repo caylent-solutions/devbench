@@ -297,9 +297,24 @@ class TestReadLastLogTimestamp:
         assert result.year == 2025
 
     def test_stat_oserror_returns_none(self, tmp_path: Path) -> None:
+        """``stat()`` may raise after a successful ``is_file()`` check (e.g.,
+        a race where the file vanishes between the two calls).  Simulate
+        that with a counter: first call (is_file) succeeds via the real
+        stat, second call (the explicit stat()) raises ``OSError``.
+        """
         log = tmp_path / "log"
         log.write_text("data", encoding="utf-8")
-        with patch.object(Path, "stat", side_effect=OSError("denied")):
+        original_stat = Path.stat
+        counter = {"n": 0}
+
+        def staggered(self: Path, follow_symlinks: bool = True) -> object:
+            if self == log:
+                counter["n"] += 1
+                if counter["n"] >= 2:
+                    raise OSError("denied")
+            return original_stat(self, follow_symlinks=follow_symlinks)
+
+        with patch("devbench.reporting.report.Path.stat", staggered):
             assert _read_last_log_timestamp(log) is None
 
     def test_open_oserror_returns_none(self, tmp_path: Path) -> None:

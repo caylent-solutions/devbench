@@ -48,7 +48,7 @@ max_executor_retries_per_judge:
 use_bedrock: false                      # (built-in default; Anthropic API path)
 bedrock_region: us-east-1               # (built-in default; harmless when use_bedrock=false)
 
-# `JUDGE_CLAUDE_MODEL` (env var, set by the launcher) is the SDK caller's
+# `DEVBENCH_CLAUDE_MODEL` (env var, set by the launcher) is the SDK caller's
 # model -- it governs the orchestrate skill's coordination calls only. Per-
 # agent work models live in the `agents:` block (ADR-25); each agent loads
 # its default from its plugin .md frontmatter and is overridable

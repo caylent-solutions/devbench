@@ -5,8 +5,8 @@
 # Replace `/path/to/kanon-deps-work` with the absolute path to this workspace
 # (in this workspace: /workspaces/rpm-migration/kanon-deps-work).
 #
-# JUDGE_WORKSPACE_ROOT must point at the directory holding BACKLOG.md (this
-# repo's root). JUDGE_CLAUDE_MODEL is the SDK caller's model -- it drives
+# DEVBENCH_WORKSPACE_ROOT must point at the directory holding BACKLOG.md (this
+# repo's root). DEVBENCH_CLAUDE_MODEL is the SDK caller's model -- it drives
 # the orchestrate skill's coordination calls. Per-agent work models live in
 # the `agents:` block of backlog/config/devbench.yaml (ADR-25); without an
 # `agents:` block every work agent runs on its plugin .md frontmatter
@@ -23,8 +23,8 @@
 #      c. Run review judges + post-checks per work unit,
 #      d. On every-unit-terminal: push the branch, open ONE PR per repo,
 #         watch CI, retry on failure, and auto-merge (squash) on green.
-JUDGE_WORKSPACE_ROOT=/path/to/kanon-deps-work \
-JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_WORKSPACE_ROOT=/path/to/kanon-deps-work \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
 uv run --project /path/to/devbench python -m devbench.cli start
 
 
@@ -34,8 +34,8 @@ uv run --project /path/to/devbench python -m devbench.cli start
 #    process the backlog". Pause with Escape, resume with `Continue`, redirect
 #    with natural-language instructions. State is saved in BACKLOG.md and the
 #    work-unit files between sessions.
-JUDGE_WORKSPACE_ROOT=/path/to/kanon-deps-work \
-JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_WORKSPACE_ROOT=/path/to/kanon-deps-work \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
 claude --dangerously-skip-permissions \
   --plugin-dir /path/to/devbench/plugin/devbench
 
@@ -44,23 +44,23 @@ claude --dangerously-skip-permissions \
 #    Streams a live progress dashboard on TTY (epic-level summary, recent
 #    transitions, judge verdicts, CI status, cost estimate). Use `--once` for
 #    a single snapshot in CI logs.
-JUDGE_WORKSPACE_ROOT=/path/to/kanon-deps-work \
-JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_WORKSPACE_ROOT=/path/to/kanon-deps-work \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
 uv run --project /path/to/devbench devbench report
 
 
 # 4. Hook tail
 #    Pretty-tails the structured hook-event log at
-#    $JUDGE_WORKSPACE_ROOT/hook-logs.jsonl. Each line is one tool call,
+#    $DEVBENCH_WORKSPACE_ROOT/hook-logs.jsonl. Each line is one tool call,
 #    judge verdict, or status transition. Useful for live debugging.
-JUDGE_WORKSPACE_ROOT=/path/to/kanon-deps-work \
-JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_WORKSPACE_ROOT=/path/to/kanon-deps-work \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
 uv run --project /path/to/devbench devbench hook-tail
 
 
 # 5. Backlog status
 #    One-shot summary: epic counts, totals, currently-active unit. Suitable
 #    for `watch -n 30 '...'` in a side terminal.
-JUDGE_WORKSPACE_ROOT=/path/to/kanon-deps-work \
-JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_WORKSPACE_ROOT=/path/to/kanon-deps-work \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
 uv run --project /path/to/devbench devbench status

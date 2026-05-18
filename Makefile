@@ -85,9 +85,9 @@ typecheck:
 test-unit:
 	uv run pytest tests/ -v --tb=short -q
 
-## test-coverage: Run tests with coverage report (fails below 97%)
+## test-coverage: Run tests with coverage report (fails below 98%)
 test-coverage:
-	uv run pytest tests/ --cov=devbench --cov-report=term-missing --cov-fail-under=97
+	uv run pytest tests/ --cov=devbench --cov-report=term-missing --cov-fail-under=98
 
 ## test: Run all tests
 test: test-unit

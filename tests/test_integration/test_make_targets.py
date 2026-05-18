@@ -288,8 +288,8 @@ class TestCoverageGate:
         output = _make_dry_run("test-coverage")
         assert "--cov=devbench" in output, f"Expected '--cov=devbench' in make -n test-coverage output, got:\n{output}"
 
-    def test_test_coverage_enforces_97_percent_floor(self) -> None:
+    def test_test_coverage_enforces_98_percent_floor(self) -> None:
         output = _make_dry_run("test-coverage")
-        assert "--cov-fail-under=97" in output, (
-            f"Expected '--cov-fail-under=97' in make -n test-coverage output, got:\n{output}"
+        assert "--cov-fail-under=98" in output, (
+            f"Expected '--cov-fail-under=98' in make -n test-coverage output, got:\n{output}"
         )

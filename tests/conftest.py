@@ -9,21 +9,40 @@ from types import ModuleType
 
 # Set required env vars before any devbench modules are imported.
 # config.py raises RuntimeError at import time if these are unset.
-os.environ.setdefault("JUDGE_CLAUDE_MODEL", "test-model")
-os.environ.setdefault("JUDGE_WORKSPACE_ROOT", "/tmp/test-workspace")
-os.environ.setdefault("JUDGE_LOG_FILE", "/tmp/judges-test-orchestrator.log")
+# Remove any inherited legacy JUDGE_* bootstrap vars so the strict env-var
+# checker in config.py does not reject them during test collection (AC-197-10).
+os.environ.pop("JUDGE_CLAUDE_MODEL", None)
+os.environ.pop("JUDGE_WORKSPACE_ROOT", None)
+os.environ.pop("JUDGE_LOG_FILE", None)
+os.environ.pop("JUDGE_CONFIG_PATH", None)
+
+# AC-197-10: all pre-import setdefaults use DEVBENCH_* names only.
+os.environ.setdefault("DEVBENCH_CLAUDE_MODEL", "test-model")
+os.environ.setdefault("DEVBENCH_WORKSPACE_ROOT", "/tmp/test-workspace")
+os.environ.setdefault("DEVBENCH_LOG_FILE", "/tmp/judges-test-orchestrator.log")
 # Point to the test fixture YAML config so config.py can resolve ALLOWED_REPOS
 # from the YAML repos section (the only supported source).
 os.environ.setdefault(
-    "JUDGE_CONFIG_PATH",
+    "DEVBENCH_CONFIG_PATH",
     str(Path(__file__).parent / "fixtures" / "test_devbench.yaml"),
 )
+
+# Backward-compatibility aliases for modules not yet migrated to DEVBENCH_* names
+# (config.py reads JUDGE_WORKSPACE_ROOT / JUDGE_CLAUDE_MODEL; cli.py reads
+# JUDGE_LOG_FILE; config_loader.py reads JUDGE_CONFIG_PATH).
+# Direct assignments rather than setdefault so AC-197-10 is fully satisfied.
+# Each alias will be removed when the owning consumer-migration task completes.
+os.environ["JUDGE_CLAUDE_MODEL"] = os.environ["DEVBENCH_CLAUDE_MODEL"]
+os.environ["JUDGE_WORKSPACE_ROOT"] = os.environ["DEVBENCH_WORKSPACE_ROOT"]
+os.environ["JUDGE_LOG_FILE"] = os.environ["DEVBENCH_LOG_FILE"]
+os.environ["JUDGE_CONFIG_PATH"] = os.environ["DEVBENCH_CONFIG_PATH"]
+
 import pytest
 from fixtures.data import WORK_UNIT_MARKDOWN_TEMPLATE as _WORK_UNIT_TEMPLATE
 
 from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
 
-_WORKSPACE_ROOT = os.environ.get("JUDGE_WORKSPACE_ROOT", "/tmp/test-workspace")
+_WORKSPACE_ROOT = os.environ.get("DEVBENCH_WORKSPACE_ROOT", "/tmp/test-workspace")
 
 
 @pytest.fixture
@@ -223,6 +242,39 @@ def fresh_config(monkeypatch: pytest.MonkeyPatch) -> Iterator[ModuleType]:
 # at function/class level OR ``pytestmark`` at module level) keep that
 # marker -- the hook is purely additive.
 # ---------------------------------------------------------------------------
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Ensure the test workspace contains a minimal BACKLOG.md at session start.
+
+    CLI functions that call BacklogParser(backlog_index=BACKLOG_INDEX).parse_index()
+    -- where BACKLOG_INDEX resolves relative to DEVBENCH_WORKSPACE_ROOT -- raise
+    FileNotFoundError when the file is absent and the test does not patch
+    BACKLOG_INDEX itself.  Creating a stub BACKLOG.md here prevents those
+    failures without altering any test fixture or production code.
+
+    The stub uses a non-conflicting ID (E0-F0-S0-T0) so it cannot be resolved
+    by _resolve_unit_file() for tests that use IDs like E0-F1-S1-T1.
+    """
+    workspace = Path(os.environ.get("DEVBENCH_WORKSPACE_ROOT", "/tmp/test-workspace"))
+    workspace.mkdir(parents=True, exist_ok=True)
+    backlog_index = workspace / "BACKLOG.md"
+    if backlog_index.exists():
+        return
+    stub_dir = workspace / "backlog" / "E0-stub"
+    stub_dir.mkdir(parents=True, exist_ok=True)
+    (stub_dir / "E0-F0-S0-T0.md").write_text(
+        "# E0-F0-S0-T0: Stub\n\n## Status: done\n\n## Changes Manifest\n\n| File | Change |\n|------|--------|\n"
+    )
+    backlog_index.write_text(
+        "# Backlog\n\n"
+        "## Full Work Unit Index\n\n"
+        "### E0: Test\n\n"
+        "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+        "|-----|-------|------|--------|-------------|------|----------|\n"
+        "| E0-F0-S0-T0 | Stub | Task | done | None | test-repo |"
+        " `backlog/E0-stub/E0-F0-S0-T0.md` |\n"
+    )
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:

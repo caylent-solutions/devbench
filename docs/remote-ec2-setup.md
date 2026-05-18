@@ -20,7 +20,7 @@ This guide walks an operator from `aws sso login` to a running orchestrator on a
 Local devcontainers are fine for editing and short-lived runs. Move to EC2 when any of the following are true:
 
 - The orchestrator needs to run unattended for hours and you want it isolated from your laptop's sleep / network state.
-- Multiple operators want to share a `JUDGE_WORKSPACE_ROOT` without juggling local filesystem mounts.
+- Multiple operators want to share a `DEVBENCH_WORKSPACE_ROOT` without juggling local filesystem mounts.
 - You need to run multiple parallel orchestrate sessions per operator (the `devbench-session` launcher under `tools/devbench_session.py` is designed for this).
 - Compliance requires the long-running build artefacts to live on company infra rather than personal hardware.
 
@@ -118,12 +118,12 @@ Each session is its own git clone of devbench under `~/workspace/devbench-sessio
 Inside the session, set the same per-backlog env vars the laptop launch commands use:
 
 ```bash
-export JUDGE_WORKSPACE_ROOT=/workspaces/<your-spec-repo>
-export JUDGE_CLAUDE_MODEL=claude-opus-4-7
-export JUDGE_ORCHESTRATOR_SESSION_ID=<unique-session-id>     # E230 hook-tail filter
+export DEVBENCH_WORKSPACE_ROOT=/workspaces/<your-spec-repo>
+export DEVBENCH_CLAUDE_MODEL=claude-opus-4-7
+export DEVBENCH_ORCHESTRATOR_SESSION_ID=<unique-session-id>     # E230 hook-tail filter
 ```
 
-The orchestrator's log file is resolved by precedence: `JUDGE_LOG_FILE` env var > `log_file:` in `backlog/config/devbench.yaml` > `<JUDGE_WORKSPACE_ROOT>/logs/orchestrator.log`. Setting `log_file:` in the YAML keeps reader and writer in sync; see [`docs/cli-reference.md` `report` section](cli-reference.md#report) and [`docs/architecture.md` Reporting & observability](architecture.md#reporting--observability).
+The orchestrator's log file is resolved by precedence: `DEVBENCH_LOG_FILE` env var > `log_file:` in `backlog/config/devbench.yaml` > `<DEVBENCH_WORKSPACE_ROOT>/logs/orchestrator.log`. Setting `log_file:` in the YAML keeps reader and writer in sync; see [`docs/cli-reference.md` `report` section](cli-reference.md#report) and [`docs/architecture.md` Reporting & observability](architecture.md#reporting--observability).
 
 ## 6. Drive the orchestrator
 
@@ -131,13 +131,13 @@ Three panes (tmux is the usual harness):
 
 1. **Orchestrator pane** -- the interactive Claude session.
    ```bash
-   PATH=... JUDGE_CLAUDE_MODEL=claude-opus-4-7 JUDGE_WORKSPACE_ROOT=$JUDGE_WORKSPACE_ROOT \
-     JUDGE_ORCHESTRATOR_SESSION_ID=$JUDGE_ORCHESTRATOR_SESSION_ID \
+   PATH=... DEVBENCH_CLAUDE_MODEL=claude-opus-4-7 DEVBENCH_WORKSPACE_ROOT=$DEVBENCH_WORKSPACE_ROOT \
+     DEVBENCH_ORCHESTRATOR_SESSION_ID=$DEVBENCH_ORCHESTRATOR_SESSION_ID \
      claude --plugin-dir /path/to/devbench/plugin/devbench --dangerously-skip-permissions
    ```
    Inside Claude, run `/devbench:orchestrate` (or the equivalent skill).
 2. **Live report pane** -- `uv run --project /path/to/devbench devbench report --watch 120`.
-3. **Hook-tail pane** -- `uv run --project /path/to/devbench devbench hook-tail --orchestrator-only`. The `--orchestrator-only` flag (E230) filters to events stamped with `JUDGE_ORCHESTRATOR_SESSION_ID` so side-pane Claude sessions in the same workspace do not pollute the audit stream.
+3. **Hook-tail pane** -- `uv run --project /path/to/devbench devbench hook-tail --orchestrator-only`. The `--orchestrator-only` flag (E230) filters to events stamped with `DEVBENCH_ORCHESTRATOR_SESSION_ID` so side-pane Claude sessions in the same workspace do not pollute the audit stream.
 
 The `caylent-telemetry-spec/devbench-launch-commands.txt` file in this repo's sister workspace ships the exact incantation for each backlog; copy from there rather than typing the env-var pile by hand.
 
@@ -154,7 +154,7 @@ The `caylent-telemetry-spec/devbench-launch-commands.txt` file in this repo's si
 
 - `make ec2-apply` fails with credentials error: re-run `aws sso login --profile devbench-remote` and check `aws sts get-caller-identity` shows the expected account.
 - `make ec2-bootstrap` hangs: confirm the instance is in `running` state via `aws ec2 describe-instances`, and that SSM agent is up via `aws ssm describe-instance-information`.
-- Hook-tail is silent despite the orchestrator running: confirm `JUDGE_ORCHESTRATOR_SESSION_ID` matches between the orchestrator and hook-tail panes. With `--orchestrator-only`, mismatched session IDs silently suppress events. See [E230 in `docs/cli-reference.md`](cli-reference.md#hook-tail).
-- Multiple orchestrators write to the same `hook-logs.jsonl`: this is by design when they share the workspace. Use `JUDGE_ORCHESTRATOR_SESSION_ID` + `--orchestrator-only` to scope the per-pane view.
+- Hook-tail is silent despite the orchestrator running: confirm `DEVBENCH_ORCHESTRATOR_SESSION_ID` matches between the orchestrator and hook-tail panes. With `--orchestrator-only`, mismatched session IDs silently suppress events. See [E230 in `docs/cli-reference.md`](cli-reference.md#hook-tail).
+- Multiple orchestrators write to the same `hook-logs.jsonl`: this is by design when they share the workspace. Use `DEVBENCH_ORCHESTRATOR_SESSION_ID` + `--orchestrator-only` to scope the per-pane view.
 
 For deeper architecture context (network topology, IAM roles, cloud-init responsibilities), read [`infra/docs/architecture.md`](../infra/docs/architecture.md). For day-2 operator commands beyond this guide, read [`infra/docs/operator-runbook.md`](../infra/docs/operator-runbook.md).

@@ -348,6 +348,25 @@ since the last release. PR #119 carries every change.
   in the existing `devbench report` / `devbench hook-tail` streams; no new
   infrastructure is required.
 
+### Fixed
+
+- **`devbench status` Backlog Status Summary count column right-aligns to a
+  single column across every row** (issue #201). Before this fix three
+  different label-pad widths (`{label:<15}` for top-level rows, `{label:<28}`
+  for Blocked sub-rows) put counts in two different columns ("In Queue" at
+  col ~19 vs "Blocked (auto-clearing)" at col ~32) and the longest label
+  (`Blocked (runtime-degradation)`, 29 chars) overran the 28-wide pad so
+  the count was jammed against the label with no breathing space. The fix
+  introduces `STATUS_SUMMARY_LABEL_WIDTH: int = 32` in
+  `src/devbench/constants.py` and applies it uniformly across the five
+  format-string sites in `cmd_status` (TOTAL, Draft, top-level, Blocked
+  sub-rows, Un-materialised). A new
+  `tests/test_cli.py::TestCmdStatusSummaryAlignment` class pins the
+  contract: every count value lands at the same column index, the longest
+  label is followed by at least one space, the separator spans the count
+  column, and no hard-coded `:<15` / `:<28` format spec remains in
+  `cmd_status` (regression guard for future Blocked sub-bucket additions).
+
 ### Tests
 
 - **Direct coverage for `quota._http_post`** (issue #203). `_http_post` is

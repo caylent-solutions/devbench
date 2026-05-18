@@ -20939,3 +20939,98 @@ class TestDefaultRecoveryProbe:
         with patch("devbench.cli.recovery_probe", return_value=False):
             result = cli._default_recovery_probe()
         assert result is False
+
+
+@pytest.mark.unit
+class TestCmdStatusSummaryAlignment:
+    """Issue #201: every count value in the Backlog Status Summary right-aligns
+    to a single column regardless of label length.
+
+    The fix introduces ``STATUS_SUMMARY_LABEL_WIDTH`` in
+    ``src/devbench/constants.py`` and applies it uniformly across top-level
+    rows, Blocked sub-rows, the Draft row, the Un-materialised row, and the
+    TOTAL row in ``cmd_status``.
+    """
+
+    _COUNT_RE = re.compile(r"^  (?P<label>\S.*\S)\s{2,}(?P<count>\d+)\s*$")
+
+    @staticmethod
+    def _summary_lines(out: str) -> list[str]:
+        """Return every line that begins with two-space indent + a label + count."""
+        return [line for line in out.splitlines() if TestCmdStatusSummaryAlignment._COUNT_RE.match(line)]
+
+    def _render(self, capsys: pytest.CaptureFixture[str]) -> str:
+        parser = MagicMock()
+        parser.parse_index.return_value = []
+        parser.get_parallel_candidates.return_value = []
+        parser.get_blocked_units.return_value = []
+        parser.all_done.return_value = False
+        with (
+            patch("devbench.cli.BacklogParser", return_value=parser),
+            patch("devbench.cli._count_unmaterialised_proposed_tasks", return_value=0),
+        ):
+            rc = cli.cmd_status()
+        assert rc == 0
+        return capsys.readouterr().out
+
+    def test_every_count_value_at_same_column(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """AC-1: every Backlog Status Summary row places its count value at the same column index."""
+        out = self._render(capsys)
+        rows = self._summary_lines(out)
+        # Expect 7 Blocked sub-rows + TOTAL + Draft + Un-materialised + every DISPLAY_STATUS_VALUES
+        # except the parent "Blocked".  Lower-bound the count to catch silent regressions.
+        assert len(rows) >= 10, f"expected at least 10 Backlog Status Summary rows; got {len(rows)} -- output:\n{out}"
+        # Extract the column at which the count digit starts for each row.
+        first_digit_columns: dict[str, int] = {}
+        for row in rows:
+            match = self._COUNT_RE.match(row)
+            assert match is not None, f"row failed to re-match its own regex: {row!r}"
+            first_digit_columns[row] = row.index(match.group("count"))
+        unique_columns = set(first_digit_columns.values())
+        assert len(unique_columns) == 1, (
+            "Backlog Status Summary count values must all sit at the same column index. "
+            f"Got per-row first-digit columns: {first_digit_columns}"
+        )
+
+    def test_longest_label_has_space_before_count(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """AC-3: the longest label (Blocked (runtime-degradation), 29 chars) has at least one space before the count."""
+        out = self._render(capsys)
+        runtime_row = next(
+            (line for line in out.splitlines() if "Blocked (runtime-degradation)" in line),
+            None,
+        )
+        assert runtime_row is not None, f"runtime-degradation row missing from status output:\n{out}"
+        label = "Blocked (runtime-degradation)"
+        idx = runtime_row.index(label) + len(label)
+        assert runtime_row[idx] == " ", (
+            f"longest label must be followed by at least one space before its count; got {runtime_row!r}"
+        )
+
+    def test_separator_spans_count_column_right_edge(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """AC-2: the ===== separator extends to at least the right edge of the count column."""
+        from devbench.constants import STATUS_SEPARATOR_WIDTH, STATUS_SUMMARY_LABEL_WIDTH
+
+        out = self._render(capsys)
+        separator = next((line for line in out.splitlines() if line.startswith("===")), None)
+        assert separator is not None, f"separator '=====' line missing from status output:\n{out}"
+        right_edge = 2 + STATUS_SUMMARY_LABEL_WIDTH + 1 + 4
+        assert len(separator) >= right_edge, (
+            f"separator must span at least the count column right edge ({right_edge} chars); got {len(separator)} chars"
+        )
+        assert len(separator) == STATUS_SEPARATOR_WIDTH
+
+    def test_uses_constant_not_hardcoded_widths(self) -> None:
+        """AC-4 regression guard: every format string in cmd_status uses STATUS_SUMMARY_LABEL_WIDTH.
+
+        The pre-fix code had two different hard-coded widths (15 and 28); pin that the fix wired
+        every site through the single shared constant so adding a new BlockedTaskState or
+        DISPLAY_STATUS_VALUES entry tomorrow still aligns.
+        """
+        import inspect
+
+        src = inspect.getsource(cli.cmd_status)
+        assert ":<15}" not in src, "cmd_status still contains a hard-coded ':<15}' label-pad width"
+        assert ":<28}" not in src, "cmd_status still contains a hard-coded ':<28}' label-pad width"
+        assert "STATUS_SUMMARY_LABEL_WIDTH" in src, (
+            "cmd_status must reference STATUS_SUMMARY_LABEL_WIDTH for every label-pad width"
+        )

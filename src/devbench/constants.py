@@ -123,6 +123,15 @@ LLM_RESPONSE_FORMAT_INSTRUCTIONS: str = (
 # ---------------------------------------------------------------------------
 STATUS_SEPARATOR_WIDTH: int = 40
 
+# Pad width applied to every label in the ``devbench status`` Backlog Status
+# Summary so count values right-align to a single column regardless of label
+# length.  The current longest label is ``Blocked (amendment-recovery)`` /
+# ``Blocked (runtime-degradation)`` (29 chars); the chosen width keeps at
+# least one space between every label and its count and leaves a few chars
+# of headroom for future Blocked sub-bucket labels.  Used by ``cmd_status``
+# in ``src/devbench/cli.py`` (issue #201).
+STATUS_SUMMARY_LABEL_WIDTH: int = 32
+
 # ---------------------------------------------------------------------------
 # Dependency "none" sentinel
 # ---------------------------------------------------------------------------

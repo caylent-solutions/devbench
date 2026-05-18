@@ -185,6 +185,7 @@ from devbench.constants import (
     STATUS_IN_QUEUE,
     STATUS_IN_REVIEW,
     STATUS_SEPARATOR_WIDTH,
+    STATUS_SUMMARY_LABEL_WIDTH,
     VALID_TDD_PHASES,
 )
 from devbench.drain import DrainState, _current_user, cancel_drain, consume_drain, read_drain_state, request_drain
@@ -651,8 +652,8 @@ def cmd_status(*argv: str) -> int:
 
     print("Backlog Status Summary")
     print("=" * STATUS_SEPARATOR_WIDTH)
-    print(f"  {'TOTAL':<15} {total:>4}")
-    print(f"  {'Draft':<15} {draft_count:>4}")
+    print(f"  {'TOTAL':<{STATUS_SUMMARY_LABEL_WIDTH}} {total:>4}")
+    print(f"  {'Draft':<{STATUS_SUMMARY_LABEL_WIDTH}} {draft_count:>4}")
     blocked_rows: list[tuple[str, BlockedTaskState]] = [
         ("Blocked (auto-clearing)", BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL),
         ("Blocked (amendment-recovery)", BlockedTaskState.AWAITING_AMENDMENT_RECOVERY),
@@ -665,11 +666,11 @@ def cmd_status(*argv: str) -> int:
     for status_val in DISPLAY_STATUS_VALUES:
         if status_val == "Blocked":
             for label, state in blocked_rows:
-                print(f"  {label:<28} {blocked_counts[state]:>4}")
+                print(f"  {label:<{STATUS_SUMMARY_LABEL_WIDTH}} {blocked_counts[state]:>4}")
             continue
         count = counts.get(status_val.lower(), 0)
-        print(f"  {status_val:<15} {count:>4}")
-    print(f"  {'Un-materialised':<15} {unmaterialised_count:>4}")
+        print(f"  {status_val:<{STATUS_SUMMARY_LABEL_WIDTH}} {count:>4}")
+    print(f"  {'Un-materialised':<{STATUS_SUMMARY_LABEL_WIDTH}} {unmaterialised_count:>4}")
 
     active = [u for u in units if u.status in (WorkUnitStatus.IN_PROGRESS, WorkUnitStatus.IN_REVIEW)]
     _print_active_units(active)

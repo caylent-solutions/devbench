@@ -922,6 +922,15 @@ def validate_agent_model_value(
     is the env var name) so YAML and env-supplied values get the same
     fail-fast treatment.
 
+    Haiku is unconditionally rejected for every per-agent field (case-insensitive
+    substring match so both the short name ``haiku``, full Anthropic ids like
+    ``claude-haiku-4-5-20251001``, and Bedrock ARNs containing ``haiku`` are
+    all caught). The rejection raises a ``ValueError`` whose message names the
+    offending field, the rejected value, and references
+    caylent-solutions/devbench#198 so an operator who sees the error can find
+    the rationale. There is no override path; the only way to use haiku is to
+    edit the canonical constants module locally.
+
     Args:
         source: Human-readable origin of the value (file path or env var
             name) included in the error message.
@@ -931,9 +940,17 @@ def validate_agent_model_value(
         use_bedrock: Currently-resolved use_bedrock flag.
 
     Raises:
-        ValueError: When *value* does not match the format implied by
-            *use_bedrock*.
+        ValueError: When *value* contains ``haiku`` (case-insensitive), or when
+            *value* does not match the format implied by *use_bedrock*.
     """
+    if "haiku" in value.lower():
+        raise ValueError(
+            f"{source}: agents.{agent_label} = {value!r} is rejected. "
+            "Haiku is not permitted for any work agent -- under load the Claude "
+            "Agent SDK was repeatedly observed to silently drop the Agent tool from "
+            "haiku's tool list, causing RUNTIME_DEGRADATION failures. Use 'sonnet' "
+            "or 'opus' instead. See caylent-solutions/devbench#198."
+        )
     if use_bedrock:
         if not BEDROCK_AGENT_MODEL_PATTERN.match(value):
             raise ValueError(

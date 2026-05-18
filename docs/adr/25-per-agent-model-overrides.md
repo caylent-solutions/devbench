@@ -67,7 +67,7 @@ agent plays:
   from haiku's tool list, breaking parallel review_team dispatch. Opus here
   would be waste.
 
-### Haiku is strongly discouraged for every work agent
+### Haiku is rejected at config-load for every work agent
 
 Empirical observation in this codebase: when `review_supervisor` was pinned to
 `haiku`, the Claude Agent SDK was repeatedly observed to drop the `Agent` tool
@@ -76,12 +76,18 @@ unable to dispatch sub-agents and forcing the orchestrator to classify the
 work-unit as `RUNTIME_DEGRADATION` (issue #183 follow-up). The same risk
 applies to every other work agent that uses the `Agent` tool or any
 multi-tool-call pattern (executor, blocker-resolver, manifest-amender,
-task-factory, the five judges). **Do not pin any work agent to `haiku` in the
-`agents:` block.** Stick with the frontmatter defaults (`sonnet` or `opus`),
-or override deliberately to a different mid-tier / large model when cost
-shaping is needed. The constants module still accepts `haiku` as a valid
-short-name (`ALLOWED_AGENT_MODEL_SHORT_NAMES`) so an operator can experiment,
-but the documented role defaults explicitly avoid it.
+task-factory, the five judges).
+
+**Haiku is rejected at config-load time (caylent-solutions/devbench#198).**
+Any `agents:` block value that contains `haiku` -- whether the short name
+`"haiku"`, a full Anthropic API id like `"claude-haiku-4-5-20251001"`, or a
+Bedrock ARN containing `haiku` -- raises a `ValueError` at config-load and
+prevents the orchestrator from starting. There is no operator-facing override
+path; re-enabling haiku requires both removing the haiku guard in
+`validate_agent_model_value()` in `src/devbench/config_loader.py` AND
+re-adding `"haiku"` to `ALLOWED_AGENT_MODEL_SHORT_NAMES` in
+`src/devbench/constants.py`. Stick with the frontmatter defaults (`sonnet` or `opus`), or override
+deliberately to a different mid-tier / large model when cost shaping is needed.
 
 The block as written is a no-op; flip individual fields when quota
 pressure makes the default untenable (e.g., drop the judges to `sonnet`
@@ -152,8 +158,8 @@ this idea.
 ## Consequences
 
 **Cost transparency.** Operators can opt every work agent up to opus when
-sonnet quota is gone, or pin individual agents (e.g. keep `task-factory` on
-haiku for cheap recovery loops). The override is auditable in
+sonnet quota is gone, or pin individual agents to sonnet or opus as cost
+shaping requires. The override is auditable in
 `backlog/config/devbench.yaml` -- it lives alongside the rest of the workspace
 config.
 

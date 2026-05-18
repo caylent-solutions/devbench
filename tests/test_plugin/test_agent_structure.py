@@ -725,3 +725,55 @@ class TestReviewJudgesUseGetDiffForScope:
         assert "AUTHORITATIVE" in content, (
             f"{judge_path.name} must state that `devbench get-diff` is the AUTHORITATIVE scope source."
         )
+
+
+def _collect_all_agent_md_files() -> list[Path]:
+    """Return all .md files under plugin/devbench/agents/ recursively."""
+    agents_dir = Path(__file__).parent.parent.parent / "plugin" / "devbench" / "agents"
+    return sorted(agents_dir.rglob("*.md"))
+
+
+def _extract_frontmatter_model(content: str) -> str | None:
+    """Extract the 'model:' value from YAML frontmatter, or None if absent."""
+    lines = content.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        stripped = line.strip()
+        if stripped.startswith("model:"):
+            return stripped[len("model:") :].strip()
+    return None
+
+
+_ALL_AGENT_MD_FILES = _collect_all_agent_md_files()
+
+
+@pytest.mark.unit
+class TestNoAgentFrontmatterPinsHaiku:
+    """AC-198-6: No shipped agent .md file may declare 'model: haiku' in its frontmatter.
+
+    This is a future-drift guard: if anyone re-pins a frontmatter model
+    default to haiku, this test fails immediately (caylent-solutions/devbench#198).
+    """
+
+    @pytest.mark.parametrize(
+        "agent_path",
+        _ALL_AGENT_MD_FILES,
+        ids=lambda p: str(p.name),
+    )
+    def test_agent_frontmatter_model_is_not_haiku(self, agent_path: Path) -> None:
+        """AC-198-6: agent frontmatter 'model:' must not be haiku (case-insensitive)."""
+        content = agent_path.read_text(encoding="utf-8")
+        model_value = _extract_frontmatter_model(content)
+        if model_value is None:
+            # No model line in frontmatter -- acceptable, uses SDK default.
+            return
+        assert "haiku" not in model_value.lower(), (
+            f"{agent_path.name}: frontmatter declares 'model: {model_value}'. "
+            "Haiku is rejected at config-load time (caylent-solutions/devbench#198); "
+            "any agent pinned to haiku will cause config-load failure when the "
+            "operator's YAML explicitly selects it, and risks SDK Agent-tool "
+            "drops under load. Change to 'sonnet' or 'opus'."
+        )

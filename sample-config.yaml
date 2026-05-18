@@ -281,17 +281,17 @@ validate:
 # quota envelope is uneven (e.g. opus tokens left, sonnet exhausted).
 #
 # When use_bedrock: false (this file's default), values may be short names
-# ("opus", "sonnet", "haiku") or full Anthropic API ids ("claude-opus-4-7").
+# ("opus", "sonnet") or full Anthropic API ids ("claude-opus-4-7").
 # When use_bedrock: true, values must be full Bedrock ARNs
 # ("us.anthropic.claude-opus-4-7-v1"). Mismatches fail fast at config-load.
 #
-# DO NOT PIN ANY WORK AGENT TO HAIKU. Empirical observation in this codebase:
-# under load the Claude Agent SDK was observed to silently drop the Agent
+# HAIKU IS REJECTED AT CONFIG-LOAD (caylent-solutions/devbench#198).
+# Under load the Claude Agent SDK was observed to silently drop the Agent
 # tool from haiku's tool list mid-orchestration, breaking parallel sub-agent
 # dispatch and forcing the orchestrator to classify work units as
-# RUNTIME_DEGRADATION. Sonnet is the minimum recommended for every work
-# agent. The short-name "haiku" is still parsed (you can experiment) but
-# every role default below avoids it.
+# RUNTIME_DEGRADATION. Any value containing "haiku" -- short name, full
+# Anthropic id, or Bedrock ARN -- raises a ValueError at config-load.
+# Use "sonnet" or "opus" for every work agent.
 #
 # DEVBENCH_AGENT_MODEL_<NAME> env vars override this block per-call
 # (precedence: env > yaml > frontmatter). See:
@@ -311,9 +311,9 @@ validate:
 #     unhappy paths, so cost is bounded.
 #   - review-supervisor: sonnet -- fan-out coordinator (spawns the
 #     five judges in parallel and merges their JSON verdicts). Haiku was
-#     tried and dropped: under load the SDK was observed to silently
-#     remove the Agent tool from haiku's tool list, breaking parallel
-#     review_team dispatch. Opus here would be waste.
+#     tried and dropped (caylent-solutions/devbench#198): under load the
+#     SDK silently removed the Agent tool from haiku's tool list, breaking
+#     parallel review_team dispatch. Haiku is now rejected at config-load.
 # Uncomment + edit individual fields to retarget; absent fields stay at
 # their frontmatter default. Writing the same value as the frontmatter
 # default is a no-op.

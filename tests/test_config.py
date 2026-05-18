@@ -442,14 +442,21 @@ class TestAgentModelEnvOverrides:
         with patch.dict(
             os.environ,
             {
-                "DEVBENCH_AGENT_MODEL_CODE_REVIEWER": "haiku",
+                "DEVBENCH_AGENT_MODEL_CODE_REVIEWER": "opus",
                 "DEVBENCH_AGENT_MODEL_CHANGES_MANIFEST": "opus",
             },
             clear=False,
         ):
             importlib.reload(config)
-            assert config.AGENT_MODELS.review_team.code_reviewer == "haiku"
+            assert config.AGENT_MODELS.review_team.code_reviewer == "opus"
             assert config.AGENT_MODELS.review_team.changes_manifest == "opus"
+        importlib.reload(config)
+
+    def test_haiku_env_value_rejected_at_load(self) -> None:
+        """AC-198-4: haiku env rejected at config.py import (caylent-solutions/devbench#198)."""
+        with patch.dict(os.environ, {"DEVBENCH_AGENT_MODEL_CODE_REVIEWER": "haiku"}, clear=False):
+            with pytest.raises(ValueError, match="#198"):
+                importlib.reload(config)
         importlib.reload(config)
 
     def test_invalid_env_value_rejected_at_load(self) -> None:

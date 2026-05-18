@@ -535,3 +535,47 @@ class TestDevbenchBootstrapEnvVarConstant:
 
         upper_form = DEVBENCH_BOOTSTRAP_ENV_VAR.upper()
         assert upper_form == DEVBENCH_BOOTSTRAP_ENV_VAR
+
+
+@pytest.mark.unit
+class TestAllowedAgentModelShortNamesHaikuRemoval:
+    """AC-198-1: ALLOWED_AGENT_MODEL_SHORT_NAMES must equal frozenset({'opus', 'sonnet'}).
+
+    Haiku must not be present -- any value containing 'haiku' in the
+    per-agent YAML block is rejected at config-load time (caylent-solutions/devbench#198).
+    """
+
+    @pytest.mark.unit
+    def test_haiku_not_in_allowed_short_names(self) -> None:
+        """AC-198-1: 'haiku' must not be in ALLOWED_AGENT_MODEL_SHORT_NAMES."""
+        from devbench.constants import ALLOWED_AGENT_MODEL_SHORT_NAMES
+
+        assert "haiku" not in ALLOWED_AGENT_MODEL_SHORT_NAMES, (
+            "ALLOWED_AGENT_MODEL_SHORT_NAMES must not contain 'haiku'. "
+            "Haiku is rejected at config-load time (caylent-solutions/devbench#198)."
+        )
+
+    @pytest.mark.unit
+    def test_allowed_short_names_equals_opus_sonnet(self) -> None:
+        """AC-198-1: ALLOWED_AGENT_MODEL_SHORT_NAMES must equal exactly {'opus', 'sonnet'}."""
+        from devbench.constants import ALLOWED_AGENT_MODEL_SHORT_NAMES
+
+        expected = frozenset({"opus", "sonnet"})
+        assert expected == ALLOWED_AGENT_MODEL_SHORT_NAMES, (
+            f"ALLOWED_AGENT_MODEL_SHORT_NAMES must equal frozenset({{'opus', 'sonnet'}}); "
+            f"got {ALLOWED_AGENT_MODEL_SHORT_NAMES!r} (caylent-solutions/devbench#198)."
+        )
+
+    @pytest.mark.unit
+    def test_opus_in_allowed_short_names(self) -> None:
+        """'opus' must remain in ALLOWED_AGENT_MODEL_SHORT_NAMES."""
+        from devbench.constants import ALLOWED_AGENT_MODEL_SHORT_NAMES
+
+        assert "opus" in ALLOWED_AGENT_MODEL_SHORT_NAMES
+
+    @pytest.mark.unit
+    def test_sonnet_in_allowed_short_names(self) -> None:
+        """'sonnet' must remain in ALLOWED_AGENT_MODEL_SHORT_NAMES."""
+        from devbench.constants import ALLOWED_AGENT_MODEL_SHORT_NAMES
+
+        assert "sonnet" in ALLOWED_AGENT_MODEL_SHORT_NAMES

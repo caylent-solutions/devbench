@@ -261,6 +261,29 @@ since the last release. PR #119 carries every change.
 
 ### Changed (BREAKING)
 
+- **`haiku` is rejected at config-load for every per-agent field** (#198).
+  Any `agents:` block value in `devbench.yaml` (or `DEVBENCH_AGENT_MODEL_*`
+  env var) that contains `haiku` -- whether the short name `"haiku"`, a full
+  Anthropic API id such as `"claude-haiku-4-5-20251001"`, or a Bedrock ARN
+  containing `haiku` -- now raises a `ValueError` at config-load and prevents
+  the orchestrator from starting. There is no operator-facing override path.
+
+  **Why:** Under load the Claude Agent SDK was repeatedly observed to silently
+  drop the `Agent` tool from haiku's tool list mid-orchestration, causing
+  `RUNTIME_DEGRADATION` audit events and forcing the orchestrator to classify
+  work units as blocked. Two tasks (E1-F4-S1-T3 and E4-F1-S1-T5) hit the
+  pattern across four separate restarts within one evening. The prior release
+  promoted the `review-supervisor` frontmatter default from `haiku` to
+  `sonnet` and added advisory warnings; this release converts the advisory
+  into a hard config-load rejection so the failure mode cannot be reintroduced
+  by an operator YAML change.
+
+  **Migration:** Replace any `haiku` value in `agents:` or `review_team:` with
+  `sonnet` (minimum recommended) or `opus`. The same applies to
+  `DEVBENCH_AGENT_MODEL_*` env vars. `RECOVERY_PROBE_MODEL` in
+  `constants.py` is not affected -- the probe uses haiku intentionally for
+  its minimal 1-token latency check, not as a work agent.
+
 - **`JUDGE_*` env-var namespace renamed to `DEVBENCH_*`** (#197). Every
   devbench environment variable previously prefixed with `JUDGE_` now
   carries the `DEVBENCH_` prefix. This is a hard cutover with no

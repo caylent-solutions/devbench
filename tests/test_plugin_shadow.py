@@ -73,12 +73,7 @@ def _build_synthetic_plugin(root: Path) -> Path:
         target = plugin_dir / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         name = target.stem
-        if "review-supervisor" in rel:
-            default_model = "haiku"
-        elif rel.endswith("/executor.md"):
-            default_model = "sonnet"
-        else:
-            default_model = "opus"
+        default_model = "sonnet" if "review-supervisor" in rel or rel.endswith("/executor.md") else "opus"
         target.write_text(
             _AGENT_MARKDOWN_TEMPLATE.format(name=name, model=default_model),
             encoding="utf-8",
@@ -149,21 +144,21 @@ class TestCollectOverrides:
         assert _collect_overrides(AgentModelsConfig()) == {}
 
     def test_top_level_fields(self) -> None:
-        cfg = AgentModelsConfig(executor="opus", manifest_amender="haiku")
+        cfg = AgentModelsConfig(executor="opus", manifest_amender="sonnet")
         out = _collect_overrides(cfg)
         assert out == {
             "agents/executor.md": "opus",
-            "agents/manifest-amender.md": "haiku",
+            "agents/manifest-amender.md": "sonnet",
         }
 
     def test_review_team_fields(self) -> None:
         cfg = AgentModelsConfig(
-            review_team=ReviewTeamModelsConfig(code_reviewer="opus", test_reviewer="haiku"),
+            review_team=ReviewTeamModelsConfig(code_reviewer="opus", test_reviewer="sonnet"),
         )
         out = _collect_overrides(cfg)
         assert out == {
             "agents/review_team/code-reviewer.md": "opus",
-            "agents/review_team/test-reviewer.md": "haiku",
+            "agents/review_team/test-reviewer.md": "sonnet",
         }
 
     def test_mixed_top_and_review_team(self) -> None:
@@ -171,13 +166,13 @@ class TestCollectOverrides:
             executor="opus",
             blocker_resolver="sonnet",
             manifest_amender="opus",
-            security_reviewer="haiku",
+            security_reviewer="sonnet",
             task_factory="sonnet",
             review_supervisor="opus",
             review_team=ReviewTeamModelsConfig(
                 code_reviewer="opus",
                 test_reviewer="opus",
-                doc_reviewer="haiku",
+                doc_reviewer="sonnet",
                 changes_manifest="sonnet",
             ),
         )
@@ -483,4 +478,4 @@ class TestClearShadowPluginRefusesWhileRunning:
         materialise_shadow_plugin(plugin_dir, workspace, AgentModelsConfig(executor="opus"))
         write_pid_sentinel(workspace, os.getpid())
         with pytest.raises(RuntimeError, match=f"PID {os.getpid()}"):
-            materialise_shadow_plugin(plugin_dir, workspace, AgentModelsConfig(executor="haiku"))
+            materialise_shadow_plugin(plugin_dir, workspace, AgentModelsConfig(executor="sonnet"))

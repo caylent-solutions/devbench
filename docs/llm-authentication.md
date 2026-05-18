@@ -195,9 +195,9 @@ DevBench's ten work agents (executor, blocker-resolver, manifest-amender, securi
 
 > **Quota handling:** When a model's quota is exhausted mid-run, DevBench automatically pauses and waits for the reset window via the quota wait-and-resume mechanism. Retargeting agents to a less-exhausted model tier is a complementary strategy to reduce wait frequency. See [docs/quota-handling.md](quota-handling.md) for the full wait-and-resume configuration, audit trail format, and status banner details.
 
-> **Do not pin any work agent to `haiku`.** Empirical observation in this codebase: under load the Claude Agent SDK was repeatedly observed to silently drop the `Agent` tool (and other multi-call tools) from haiku's tool list mid-orchestration, breaking parallel sub-agent dispatch and forcing the orchestrator to classify work-units as `RUNTIME_DEGRADATION` (issue #183 follow-up). Sonnet is the minimum recommended for every work agent. The short-name `haiku` is still accepted by the parser so operators can experiment, but every documented role default avoids it.
+> **Haiku is rejected at config-load time (caylent-solutions/devbench#198).** Under load the Claude Agent SDK was repeatedly observed to silently drop the `Agent` tool (and other multi-call tools) from haiku's tool list mid-orchestration, breaking parallel sub-agent dispatch and forcing the orchestrator to classify work-units as `RUNTIME_DEGRADATION`. Any `agents:` block value containing `haiku` -- short name, full Anthropic id, or Bedrock ARN -- raises a `ValueError` at config-load. Use `sonnet` or `opus` for every work agent.
 
-Add an `agents:` block to `backlog/config/devbench.yaml`. The shape below pins each agent to its **current frontmatter default**: `executor` on `sonnet` (writes code under TDD; fast happy path); the five judges plus the three workflow-reasoning agents (`blocker_resolver`, `manifest_amender`, `task_factory`) on `opus` (judgment work where wrong calls cost more than inference); `review_supervisor` on `sonnet` (fan-out coordinator -- haiku was tried and dropped because the SDK was observed to silently remove the Agent tool from haiku's tool list under load). The block as written is a no-op; flip individual fields when you need to retarget (e.g., drop the judges to `sonnet` when opus quota is exhausted):
+Add an `agents:` block to `backlog/config/devbench.yaml`. The shape below pins each agent to its **current frontmatter default**: `executor` on `sonnet` (writes code under TDD; fast happy path); the five judges plus the three workflow-reasoning agents (`blocker_resolver`, `manifest_amender`, `task_factory`) on `opus` (judgment work where wrong calls cost more than inference); `review_supervisor` on `sonnet` (fan-out coordinator). The block as written is a no-op; flip individual fields when you need to retarget (e.g., drop the judges to `sonnet` when opus quota is exhausted):
 
 ```yaml
 agents:
@@ -216,7 +216,7 @@ agents:
 
 Every field defaults to `null` when absent (the agent runs on its frontmatter model). The values must match your authentication channel:
 
-- `use_bedrock: false` -- short names (`opus` / `sonnet` / `haiku`) or full Anthropic API ids (`claude-opus-4-7`, `claude-sonnet-4-6`).
+- `use_bedrock: false` -- short names (`opus` / `sonnet`) or full Anthropic API ids (`claude-opus-4-7`, `claude-sonnet-4-6`).
 - `use_bedrock: true` -- full Bedrock ARNs (`us.anthropic.claude-opus-4-7-v1`, `us.anthropic.claude-sonnet-4-6-v1`).
 
 Mismatches fail fast at config-load time with an actionable error message, rather than as a generic 401/404 on the first agent invocation.

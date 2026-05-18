@@ -585,10 +585,12 @@ SHADOW_PID_SENTINEL_FILENAME: str = ".pid"
 # Short-name model aliases accepted in ``agents.*`` YAML values when
 # ``use_bedrock: false``. Mirrors the convenience short forms the Anthropic
 # SDK accepts.
-ALLOWED_AGENT_MODEL_SHORT_NAMES: frozenset[str] = frozenset({"opus", "sonnet", "haiku"})
+ALLOWED_AGENT_MODEL_SHORT_NAMES: frozenset[str] = frozenset({"opus", "sonnet"})
 
 # Full Anthropic model id pattern (``claude-opus-4-7``, ``claude-sonnet-4-6``,
-# ``claude-haiku-4-5-20251001``). Accepted when ``use_bedrock: false``.
+# ``claude-sonnet-4-6-20250514``). Accepted when ``use_bedrock: false``.
+# Note: ids containing ``haiku`` are rejected by ``validate_agent_model_value()``
+# even though they would otherwise match this pattern.
 ANTHROPIC_AGENT_MODEL_PATTERN: re.Pattern[str] = re.compile(r"^claude-[a-z0-9]+(-[a-z0-9]+)+$")
 
 # AWS Bedrock model id pattern (``us.anthropic.claude-opus-4-7-v1``). Accepted

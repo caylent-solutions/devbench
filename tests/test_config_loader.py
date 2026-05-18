@@ -2723,12 +2723,12 @@ class TestAgentModelsConfig:
             agents:
               review_team:
                 code_reviewer: opus
-                test_reviewer: haiku
+                test_reviewer: sonnet
             """,
         )
         rt = load_runtime_config(cfg, {})
         assert rt.agent_models.review_team.code_reviewer == "opus"
-        assert rt.agent_models.review_team.test_reviewer == "haiku"
+        assert rt.agent_models.review_team.test_reviewer == "sonnet"
         assert rt.agent_models.review_team.doc_reviewer is None
 
     def test_bedrock_id_accepted_when_use_bedrock_true(self, tmp_path: Path) -> None:
@@ -2817,6 +2817,191 @@ class TestAgentModelsConfig:
         validate_agent_model_value("yaml", "executor", "opus", False)
         validate_agent_model_value("yaml", "executor", "claude-opus-4-7", False)
         validate_agent_model_value("yaml", "executor", "us.anthropic.claude-opus-4-7-v1", True)
+
+
+# ---------------------------------------------------------------------------
+# Haiku rejection -- AC-198-2, AC-198-3
+# ---------------------------------------------------------------------------
+
+_ALL_TOP_LEVEL_AGENT_FIELDS = (
+    "executor",
+    "blocker_resolver",
+    "manifest_amender",
+    "security_reviewer",
+    "task_factory",
+    "review_supervisor",
+)
+
+_ALL_REVIEW_TEAM_FIELDS = (
+    "code_reviewer",
+    "test_reviewer",
+    "doc_reviewer",
+    "changes_manifest",
+)
+
+# All haiku input shapes that must be rejected (use_bedrock=False paths)
+_HAIKU_ANTHROPIC_INPUTS = (
+    "haiku",
+    "claude-haiku-4-5-20251001",
+    "Haiku",
+    "HAIKU",
+)
+
+# Haiku Bedrock ARN shape rejected when use_bedrock=True
+_HAIKU_BEDROCK_INPUTS = ("us.anthropic.claude-haiku-4-5-v1",)
+
+
+@pytest.mark.unit
+class TestHaikuRejectionTopLevelFields:
+    """AC-198-2: every top-level per-agent field rejects haiku values at config-load time.
+
+    The validator must raise ValueError naming the offending field, the
+    rejected value, and referencing caylent-solutions/devbench#198.
+    """
+
+    @staticmethod
+    def _write(path: Path, content: str) -> Path:
+        import textwrap
+
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    @pytest.mark.parametrize("field_name", _ALL_TOP_LEVEL_AGENT_FIELDS)
+    @pytest.mark.parametrize("haiku_value", _HAIKU_ANTHROPIC_INPUTS)
+    def test_top_level_field_rejects_haiku_anthropic_input(
+        self, tmp_path: Path, field_name: str, haiku_value: str
+    ) -> None:
+        """AC-198-2: top-level agents field raises ValueError for any haiku value (use_bedrock=false)."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            f"""\
+            repos:
+              org/repo:
+                default_branch: main
+            use_bedrock: false
+            agents:
+              {field_name}: "{haiku_value}"
+            """,
+        )
+        with pytest.raises(ValueError, match="#198"):
+            load_runtime_config(cfg, {})
+
+    @pytest.mark.parametrize("field_name", _ALL_TOP_LEVEL_AGENT_FIELDS)
+    @pytest.mark.parametrize("haiku_value", _HAIKU_BEDROCK_INPUTS)
+    def test_top_level_field_rejects_haiku_bedrock_arn(self, tmp_path: Path, field_name: str, haiku_value: str) -> None:
+        """AC-198-3: top-level agents field raises ValueError for haiku Bedrock ARN (use_bedrock=true)."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            f"""\
+            repos:
+              org/repo:
+                default_branch: main
+            use_bedrock: true
+            agents:
+              {field_name}: "{haiku_value}"
+            """,
+        )
+        with pytest.raises(ValueError, match="#198"):
+            load_runtime_config(cfg, {})
+
+
+@pytest.mark.unit
+class TestHaikuRejectionReviewTeamFields:
+    """AC-198-2: every review_team per-agent field rejects haiku values at config-load time."""
+
+    @staticmethod
+    def _write(path: Path, content: str) -> Path:
+        import textwrap
+
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    @pytest.mark.parametrize("field_name", _ALL_REVIEW_TEAM_FIELDS)
+    @pytest.mark.parametrize("haiku_value", _HAIKU_ANTHROPIC_INPUTS)
+    def test_review_team_field_rejects_haiku_anthropic_input(
+        self, tmp_path: Path, field_name: str, haiku_value: str
+    ) -> None:
+        """AC-198-2: review_team agents field raises ValueError for any haiku value (use_bedrock=false)."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            f"""\
+            repos:
+              org/repo:
+                default_branch: main
+            use_bedrock: false
+            agents:
+              review_team:
+                {field_name}: "{haiku_value}"
+            """,
+        )
+        with pytest.raises(ValueError, match="#198"):
+            load_runtime_config(cfg, {})
+
+    @pytest.mark.parametrize("field_name", _ALL_REVIEW_TEAM_FIELDS)
+    @pytest.mark.parametrize("haiku_value", _HAIKU_BEDROCK_INPUTS)
+    def test_review_team_field_rejects_haiku_bedrock_arn(
+        self, tmp_path: Path, field_name: str, haiku_value: str
+    ) -> None:
+        """AC-198-3: review_team agents field raises ValueError for haiku Bedrock ARN (use_bedrock=true)."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            f"""\
+            repos:
+              org/repo:
+                default_branch: main
+            use_bedrock: true
+            agents:
+              review_team:
+                {field_name}: "{haiku_value}"
+            """,
+        )
+        with pytest.raises(ValueError, match="#198"):
+            load_runtime_config(cfg, {})
+
+
+@pytest.mark.unit
+class TestHaikuRejectionValidatorHelper:
+    """AC-198-2: validate_agent_model_value itself rejects haiku across all input shapes."""
+
+    @pytest.mark.parametrize("haiku_value", _HAIKU_ANTHROPIC_INPUTS)
+    def test_validator_rejects_haiku_short_and_full_anthropic(self, haiku_value: str) -> None:
+        """validate_agent_model_value raises ValueError for haiku values when use_bedrock=False."""
+        from devbench.config_loader import validate_agent_model_value
+
+        with pytest.raises(ValueError, match="#198"):
+            validate_agent_model_value("yaml", "executor", haiku_value, False)
+
+    @pytest.mark.parametrize("haiku_value", _HAIKU_BEDROCK_INPUTS)
+    def test_validator_rejects_haiku_bedrock_arn(self, haiku_value: str) -> None:
+        """validate_agent_model_value raises ValueError for haiku Bedrock ARN when use_bedrock=True."""
+        from devbench.config_loader import validate_agent_model_value
+
+        with pytest.raises(ValueError, match="#198"):
+            validate_agent_model_value("yaml", "executor", haiku_value, True)
+
+    def test_validator_error_message_names_field(self) -> None:
+        """ValueError message must name the offending field (AC-198-2 contract)."""
+        from devbench.config_loader import validate_agent_model_value
+
+        with pytest.raises(ValueError, match="executor"):
+            validate_agent_model_value("yaml", "executor", "haiku", False)
+
+    def test_validator_error_message_names_rejected_value(self) -> None:
+        """ValueError message must name the rejected value (AC-198-2 contract)."""
+        from devbench.config_loader import validate_agent_model_value
+
+        with pytest.raises(ValueError, match="haiku"):
+            validate_agent_model_value("yaml", "executor", "haiku", False)
+
+    def test_non_haiku_values_still_accepted(self) -> None:
+        """Non-haiku short names (opus, sonnet) must still pass validation."""
+        from devbench.config_loader import validate_agent_model_value
+
+        # These must NOT raise.
+        validate_agent_model_value("yaml", "executor", "opus", False)
+        validate_agent_model_value("yaml", "executor", "sonnet", False)
+        validate_agent_model_value("yaml", "executor", "claude-opus-4-7", False)
+        validate_agent_model_value("yaml", "executor", "claude-sonnet-4-6", False)
 
 
 # ---------------------------------------------------------------------------

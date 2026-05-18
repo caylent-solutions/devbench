@@ -93,7 +93,24 @@ def _pre_parse_config(argv: list[str]) -> None:
             return
 
 
+def _pre_parse_migrate_env(argv: list[str]) -> None:
+    """Set DEVBENCH_BOOTSTRAP=1 when the command is ``migrate-env``.
+
+    This MUST run before ``devbench.config`` is imported because config.py
+    executes ``_read_env_strict`` at module level. The bootstrap flag disables
+    the legacy-name rejection in ``_read_env_strict`` so that
+    ``devbench migrate-env`` can be invoked even when JUDGE_* vars are still
+    set in the operator's shell (AC-197-7).
+
+    Args:
+        argv: The full ``sys.argv`` list (including the program name).
+    """
+    if len(argv) >= 2 and argv[1] == "migrate-env":
+        os.environ["DEVBENCH_BOOTSTRAP"] = "1"
+
+
 _pre_parse_config(sys.argv)
+_pre_parse_migrate_env(sys.argv)
 
 from devbench.backlog.amendment import (
     REVIEW_FAILURES_DIR_NAME,
@@ -8994,6 +9011,99 @@ def _find_unit(units: list[WorkUnit], unit_id: str) -> WorkUnit | None:
     return None
 
 
+def _parse_migrate_env_args(args: tuple[str, ...]) -> tuple[str | None, bool, int]:
+    """Parse arguments for cmd_migrate_env and return (output_path, dry_run, error_code).
+
+    Args:
+        args: The raw positional arguments passed to cmd_migrate_env.
+
+    Returns:
+        A 3-tuple ``(output_path, dry_run, error_code)`` where ``error_code`` is 0
+        on success or 1 when an argument error was detected and a message was already
+        written to stderr.
+    """
+    output_path: str | None = None
+    dry_run = False
+    arg_list = list(args)
+    i = 0
+    while i < len(arg_list):
+        arg = arg_list[i]
+        if arg == "--output":
+            if i + 1 >= len(arg_list):
+                print("ERROR: --output requires a path argument", file=sys.stderr)
+                return None, False, 1
+            output_path = arg_list[i + 1]
+            i += 2
+        elif arg == "--dry-run":
+            dry_run = True
+            i += 1
+        else:
+            print(f"ERROR: unrecognised argument: {arg!r}", file=sys.stderr)
+            return None, False, 1
+    return output_path, dry_run, 0
+
+
+def cmd_migrate_env(*args: str) -> int:
+    """Scan the current environment for legacy JUDGE_* vars and emit a migration shell-script.
+
+    Modes:
+    - No-arg mode (default): prints ``export DEVBENCH_<NAME>="$JUDGE_<NAME>"`` and
+      ``unset JUDGE_<NAME>`` lines to stdout for every ``JUDGE_*`` variable found in
+      ``os.environ``.  Exit 0 when at least one legacy var is found; exit 1 with an
+      actionable message on stderr when none are present.
+    - ``--output <path>``: writes the same export + unset lines to *path* (parent
+      directories are created as needed). Exit semantics identical to no-arg mode.
+    - ``--dry-run``: prints a summary count and each legacy var name found, but no
+      export lines.  Exit semantics identical to no-arg mode.
+
+    The command is non-destructive: it never modifies the caller's environment or
+    any shell rc file.
+
+    Args:
+        *args: Zero or more CLI arguments (``--output <path>`` or ``--dry-run``).
+
+    Returns:
+        0 when at least one legacy JUDGE_* var was found; 1 otherwise.
+    """
+    output_path, dry_run, arg_error = _parse_migrate_env_args(args)
+    if arg_error:
+        return 1
+
+    legacy_vars: list[str] = sorted(key for key in os.environ if key.startswith("JUDGE_"))
+
+    if not legacy_vars:
+        print("no legacy JUDGE_* env vars set in current shell", file=sys.stderr)
+        return 1
+
+    if dry_run:
+        print(f"Found {len(legacy_vars)} legacy JUDGE_* variable(s):")
+        for var in legacy_vars:
+            print(f"  {var}")
+        return 0
+
+    lines: list[str] = []
+    for var in legacy_vars:
+        suffix = var[len("JUDGE_") :]
+        new_var = f"DEVBENCH_{suffix}"
+        lines.append(f'export {new_var}="${var}"')
+        lines.append(f"unset {var}")
+
+    script = "\n".join(lines) + "\n"
+
+    if output_path is not None:
+        dest = Path(output_path)
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(script, encoding="utf-8")
+        except OSError as exc:
+            print(f"ERROR: cannot write migration script to {output_path!r}: {exc}", file=sys.stderr)
+            return 1
+        return 0
+
+    print(script, end="")
+    return 0
+
+
 def _resolve_unit_file(unit: WorkUnit) -> Path | None:
     """Return the absolute path to the work unit file, or None if not found.
 
@@ -9269,6 +9379,14 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
         1,
         "Persist a blocker-resolver proposal JSON (stdin): write-proposal <source-task-id>",
     ),
+    "migrate-env": (
+        cmd_migrate_env,
+        0,
+        (
+            "Scan current shell for legacy JUDGE_* vars and emit a migration shell-script: "
+            "migrate-env [--output <path>] [--dry-run]"
+        ),
+    ),
 }
 
 
@@ -9321,6 +9439,8 @@ _VARIADIC_COMMANDS: frozenset[str] = frozenset(
         "stop",
         # Issue #193 E5-F5-S1-T1: quota-watcher --once / --daemon flags
         "quota-watcher",
+        # Issue #197 E9-F4-S1-T1: migrate-env --output / --dry-run flags
+        "migrate-env",
     }
 )
 

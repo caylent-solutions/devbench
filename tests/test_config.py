@@ -1172,4 +1172,49 @@ class TestAC197CallSiteMigration:
         with patch.dict(os.environ, {legacy_var: "old-val", new_var: "new-val"}, clear=False):
             with pytest.raises(RuntimeError, match="is no longer accepted"):
                 importlib.reload(config)
+
+
+@pytest.mark.unit
+class TestBootstrapBypass:
+    """AC-197-7: DEVBENCH_BOOTSTRAP=1 bypasses the strict legacy-name rejection in _read_env_strict."""
+
+    def test_bootstrap_bypass_allows_legacy_var_without_rejection(self) -> None:
+        """When DEVBENCH_BOOTSTRAP=1, _read_env_strict does not raise even if a JUDGE_* var is set."""
+        from devbench.config import _read_env_strict
+
+        # Use a var unlikely to be set in the test environment
+        test_new = "DEVBENCH_SOME_TEST_VAR_XYZ"
+        test_legacy = "JUDGE_SOME_TEST_VAR_XYZ"
+        env_patch = {DEVBENCH_BOOTSTRAP_ENV_VAR: "1", test_legacy: "old-val"}
+        base = {k: v for k, v in os.environ.items() if k not in (test_new, test_legacy)}
+        with patch.dict(os.environ, {**base, **env_patch}, clear=True):
+            result = _read_env_strict(test_new, test_legacy)
+        assert result is None
+
+    def test_bootstrap_bypass_returns_new_var_when_set(self) -> None:
+        """When DEVBENCH_BOOTSTRAP=1, _read_env_strict returns the new-name value."""
+        from devbench.config import _read_env_strict
+
+        test_new = "DEVBENCH_SOME_TEST_VAR_XYZ"
+        test_legacy = "JUDGE_SOME_TEST_VAR_XYZ"
+        env_patch = {
+            DEVBENCH_BOOTSTRAP_ENV_VAR: "1",
+            test_legacy: "old-val",
+            test_new: "/new/path",
+        }
+        base = {k: v for k, v in os.environ.items() if k not in (test_new, test_legacy)}
+        with patch.dict(os.environ, {**base, **env_patch}, clear=True):
+            result = _read_env_strict(test_new, test_legacy)
+        assert result == "/new/path"
+
+    def test_bootstrap_bypass_is_only_bypass(self) -> None:
+        """AC-197-7: with no DEVBENCH_BOOTSTRAP set, legacy var causes RuntimeError."""
+        from devbench.config import _read_env_strict
+
+        test_new = "DEVBENCH_SOME_TEST_VAR_XYZ"
+        test_legacy = "JUDGE_SOME_TEST_VAR_XYZ"
+        base = {k: v for k, v in os.environ.items() if k not in (DEVBENCH_BOOTSTRAP_ENV_VAR, test_new, test_legacy)}
+        with patch.dict(os.environ, {**base, test_legacy: "old-val"}, clear=True):
+            with pytest.raises(RuntimeError, match="is no longer accepted"):
+                _read_env_strict(test_new, test_legacy)
         importlib.reload(config)

@@ -20976,3 +20976,202 @@ class TestDefaultRecoveryProbe:
         with patch("devbench.cli.recovery_probe", return_value=False):
             result = cli._default_recovery_probe()
         assert result is False
+
+
+@pytest.mark.unit
+class TestCmdMigrateEnv:
+    """Tests for cmd_migrate_env subcommand (AC-197-4, AC-197-5, AC-197-6, AC-197-7)."""
+
+    def test_no_args_prints_export_unset_lines_when_judge_vars_present(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-197-4: no-arg mode prints export + unset lines for each JUDGE_* var found."""
+        env_patch = {"JUDGE_WORKSPACE_ROOT": "/some/path", "JUDGE_CLAUDE_MODEL": "test-model"}
+        with patch("devbench.cli.os") as mock_os:
+            mock_os.environ = {**env_patch, "HOME": "/home/user", "PATH": "/usr/bin"}
+            rc = cli.cmd_migrate_env()
+        captured = capsys.readouterr()
+        assert rc == 0
+        assert 'export DEVBENCH_WORKSPACE_ROOT="$JUDGE_WORKSPACE_ROOT"' in captured.out
+        assert "unset JUDGE_WORKSPACE_ROOT" in captured.out
+        assert 'export DEVBENCH_CLAUDE_MODEL="$JUDGE_CLAUDE_MODEL"' in captured.out
+        assert "unset JUDGE_CLAUDE_MODEL" in captured.out
+
+    def test_no_args_exits_1_when_no_judge_vars_present(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """AC-197-4: exit 1 with actionable message when no legacy JUDGE_* vars are set."""
+        with patch("devbench.cli.os") as mock_os:
+            mock_os.environ = {"HOME": "/home/user", "PATH": "/usr/bin"}
+            rc = cli.cmd_migrate_env()
+        captured = capsys.readouterr()
+        assert rc == 1
+        assert "no legacy JUDGE_* env vars set in current shell" in captured.err
+
+    def test_output_flag_writes_lines_to_file(self, tmp_path: Path) -> None:
+        """AC-197-5: --output <path> writes the export + unset lines to path."""
+        out_file = tmp_path / "subdir" / "migrate.sh"
+        env_patch = {"JUDGE_WORKSPACE_ROOT": "/some/path"}
+        with patch("devbench.cli.os") as mock_os:
+            mock_os.environ = {**env_patch, "HOME": "/home/user"}
+            rc = cli.cmd_migrate_env("--output", str(out_file))
+        assert rc == 0
+        assert out_file.exists()
+        content = out_file.read_text()
+        assert 'export DEVBENCH_WORKSPACE_ROOT="$JUDGE_WORKSPACE_ROOT"' in content
+        assert "unset JUDGE_WORKSPACE_ROOT" in content
+
+    def test_output_flag_exits_1_when_no_judge_vars(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """AC-197-5: --output exits 1 (with stderr) when no legacy JUDGE_* vars found."""
+        out_file = tmp_path / "migrate.sh"
+        with patch("devbench.cli.os") as mock_os:
+            mock_os.environ = {"HOME": "/home/user"}
+            rc = cli.cmd_migrate_env("--output", str(out_file))
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert "no legacy JUDGE_* env vars set in current shell" in captured.err
+        assert not out_file.exists()
+
+    def test_dry_run_prints_summary_count_and_var_names_not_export_lines(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-197-6: --dry-run prints summary count + var names, no export lines."""
+        env_patch = {"JUDGE_WORKSPACE_ROOT": "/some/path", "JUDGE_CLAUDE_MODEL": "test-model"}
+        with patch("devbench.cli.os") as mock_os:
+            mock_os.environ = {**env_patch, "HOME": "/home/user"}
+            rc = cli.cmd_migrate_env("--dry-run")
+        captured = capsys.readouterr()
+        assert rc == 0
+        assert "2" in captured.out
+        assert "JUDGE_WORKSPACE_ROOT" in captured.out
+        assert "JUDGE_CLAUDE_MODEL" in captured.out
+        assert "export" not in captured.out
+
+    def test_dry_run_exits_1_when_no_judge_vars(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """AC-197-6: --dry-run exits 1 when no legacy vars found."""
+        with patch("devbench.cli.os") as mock_os:
+            mock_os.environ = {"HOME": "/home/user"}
+            rc = cli.cmd_migrate_env("--dry-run")
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert "no legacy JUDGE_* env vars set in current shell" in captured.err
+
+    @pytest.mark.parametrize(
+        "judge_var,expected_devbench_var",
+        [
+            ("JUDGE_WORKSPACE_ROOT", "DEVBENCH_WORKSPACE_ROOT"),
+            ("JUDGE_CLAUDE_MODEL", "DEVBENCH_CLAUDE_MODEL"),
+            ("JUDGE_GH_TOKEN_FILE", "DEVBENCH_GH_TOKEN_FILE"),
+            ("JUDGE_CLAUDE_CREDENTIALS_FILE", "DEVBENCH_CLAUDE_CREDENTIALS_FILE"),
+            ("JUDGE_MAX_RETRIES", "DEVBENCH_MAX_RETRIES"),
+            ("JUDGE_GH_TIMEOUT", "DEVBENCH_GH_TIMEOUT"),
+        ],
+    )
+    def test_rename_mapping_judge_to_devbench(
+        self,
+        judge_var: str,
+        expected_devbench_var: str,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """AC-197-4: Each JUDGE_<NAME> maps to DEVBENCH_<NAME> in the export line."""
+        with patch("devbench.cli.os") as mock_os:
+            mock_os.environ = {judge_var: "test-value", "HOME": "/home/user"}
+            rc = cli.cmd_migrate_env()
+        captured = capsys.readouterr()
+        assert rc == 0
+        assert f'export {expected_devbench_var}="${judge_var}"' in captured.out
+        assert f"unset {judge_var}" in captured.out
+
+    def test_migrate_env_is_registered_in_commands(self) -> None:
+        """AC-197-7: migrate-env is registered in _COMMANDS."""
+        assert "migrate-env" in cli._COMMANDS
+
+    def test_migrate_env_is_variadic(self) -> None:
+        """migrate-env is in _VARIADIC_COMMANDS so --output / --dry-run flags pass through."""
+        assert "migrate-env" in cli._VARIADIC_COMMANDS
+
+    def test_bootstrap_bypass_set_before_config_import(self) -> None:
+        """AC-197-7: _pre_parse_migrate_env sets DEVBENCH_BOOTSTRAP=1 when command is migrate-env."""
+        import os as real_os
+
+        test_argv = ["devbench", "migrate-env"]
+        original = real_os.environ.get("DEVBENCH_BOOTSTRAP", "")
+        try:
+            cli._pre_parse_migrate_env(test_argv)
+            assert real_os.environ.get("DEVBENCH_BOOTSTRAP") == "1", (
+                "DEVBENCH_BOOTSTRAP must be set to '1' when command is migrate-env"
+            )
+        finally:
+            if original:
+                real_os.environ["DEVBENCH_BOOTSTRAP"] = original
+            else:
+                real_os.environ.pop("DEVBENCH_BOOTSTRAP", None)
+
+    def test_bootstrap_not_set_for_other_commands(self) -> None:
+        """AC-197-7: _pre_parse_migrate_env does NOT set DEVBENCH_BOOTSTRAP for other commands."""
+        import os as real_os
+
+        test_argv = ["devbench", "status"]
+        real_os.environ.pop("DEVBENCH_BOOTSTRAP", None)
+        cli._pre_parse_migrate_env(test_argv)
+        assert "DEVBENCH_BOOTSTRAP" not in real_os.environ, (
+            "DEVBENCH_BOOTSTRAP must not be set for non-migrate-env commands"
+        )
+
+    def test_output_creates_parent_directory(self, tmp_path: Path) -> None:
+        """AC-197-5: --output creates parent directories as needed."""
+        out_file = tmp_path / "deep" / "nested" / "migrate.sh"
+        env_patch = {"JUDGE_WORKSPACE_ROOT": "/some/path"}
+        with patch("devbench.cli.os") as mock_os:
+            mock_os.environ = {**env_patch, "HOME": "/home/user"}
+            rc = cli.cmd_migrate_env("--output", str(out_file))
+        assert rc == 0
+        assert out_file.exists()
+
+    def test_output_does_not_modify_caller_env(self, tmp_path: Path) -> None:
+        """AC-197-5: --output is non-destructive (never modifies caller's env)."""
+        import os as real_os
+
+        out_file = tmp_path / "migrate.sh"
+        env_patch = {"JUDGE_WORKSPACE_ROOT": "/some/path"}
+        snapshot_before = dict(real_os.environ)
+        with patch("devbench.cli.os") as mock_os:
+            mock_os.environ = {**env_patch, "HOME": "/home/user"}
+            cli.cmd_migrate_env("--output", str(out_file))
+        snapshot_after = dict(real_os.environ)
+        assert snapshot_before == snapshot_after, "cmd_migrate_env must not modify the caller's environment"
+
+    def test_output_flag_missing_path_arg_returns_1(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Error path: --output with no following path argument exits 1 with actionable stderr."""
+        env_patch = {"JUDGE_WORKSPACE_ROOT": "/some/path"}
+        with patch("devbench.cli.os") as mock_os:
+            mock_os.environ = {**env_patch, "HOME": "/home/user"}
+            rc = cli.cmd_migrate_env("--output")
+        captured = capsys.readouterr()
+        assert rc == 1
+        assert "requires a path" in captured.err
+
+    def test_unrecognised_argument_returns_1(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Error path: unrecognised argument exits 1 with actionable stderr."""
+        env_patch = {"JUDGE_WORKSPACE_ROOT": "/some/path"}
+        with patch("devbench.cli.os") as mock_os:
+            mock_os.environ = {**env_patch, "HOME": "/home/user"}
+            rc = cli.cmd_migrate_env("--bogus")
+        captured = capsys.readouterr()
+        assert rc == 1
+        assert "unrecognised" in captured.err
+
+    def test_output_write_permission_denied(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """Error path: --output to a read-only directory exits 1 with actionable stderr."""
+        read_only_dir = tmp_path / "readonly"
+        read_only_dir.mkdir()
+        read_only_dir.chmod(0o555)
+        out_file = read_only_dir / "migrate.sh"
+        env_patch = {"JUDGE_WORKSPACE_ROOT": "/some/path"}
+        try:
+            with patch("devbench.cli.os") as mock_os:
+                mock_os.environ = {**env_patch, "HOME": "/home/user"}
+                rc = cli.cmd_migrate_env("--output", str(out_file))
+            captured = capsys.readouterr()
+            assert rc == 1
+            assert captured.err != "", "stderr must contain an actionable error message on write failure"
+        finally:
+            read_only_dir.chmod(0o755)

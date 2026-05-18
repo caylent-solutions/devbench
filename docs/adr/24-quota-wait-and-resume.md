@@ -1,7 +1,16 @@
 # ADR-24: Quota Wait-and-Resume Policy
 
-**Status:** Accepted
+**Status:** Accepted (notification fields superseded by PR #202)
 **Date:** 2026-05-17
+
+> **Update (2026-05-18, PR #202):** the `notify_on_pause` / `notify_on_resume`
+> yaml fields described in §7 below were superseded by the unified
+> `notifications:` block. Quota pause and resume notifications now flow
+> through `notifications.events.quota_pause` /
+> `notifications.events.quota_resume`. See
+> [`docs/slack-notifications.md`](../slack-notifications.md). The rest of
+> this ADR's design (detection, wait, recovery probe, audit comments)
+> remains the live implementation.
 
 ---
 

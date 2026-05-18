@@ -4154,6 +4154,10 @@ def _handle_ci_failure(
         marker = "[CI_FAIL_BLOCKED]" if next_attempt >= MAX_RETRY_ATTEMPTS else "[CI_FAIL]"
         message = f"{marker} {summary}"
         mgr._append_agent_comment(wu_file, "git_ops", message)  # type: ignore[attr-defined]
+    from devbench.notifications import notify_ci_failure
+
+    pr_url_for_notify = f"https://github.com/{canonical_repo}/pull/{pr_number}"
+    notify_ci_failure(unit_id, canonical_repo, pr_url_for_notify, next_attempt)
 
     if next_attempt >= MAX_RETRY_ATTEMPTS:
         print(
@@ -4526,6 +4530,9 @@ def cmd_git_ops(unit_id: str) -> int:
 
     if wu_file is not None:
         mgr._append_agent_comment(wu_file, "git_ops", f"[PR_CREATED] {pr_url}")
+    from devbench.notifications import notify_pr_opened
+
+    notify_pr_opened(unit_id, canonical_repo, pr_url)
 
     # Extract PR number from URL (e.g. https://github.com/org/repo/pull/42)
     pr_number_str = pr_url.rstrip("/").split("/")[-1]
@@ -4833,6 +4840,9 @@ def _finalize_merge_and_submodule(
 
     if wu_file is not None:
         mgr._append_agent_comment(wu_file, "git_ops", f"[PR_MERGED] {pr_url}")  # type: ignore[attr-defined]
+    from devbench.notifications import notify_pr_merged
+
+    notify_pr_merged(unit_id, canonical_repo, pr_url)
 
     logger.info("Merged PR #%d for %s", pr_number, unit_id)
 
@@ -5693,6 +5703,13 @@ async def _handle_quota_pause(
             "orchestrator",
             f"{_QUOTA_WAITING_AUDIT_PREFIX} reason={reason} reset_at={reset_at_str}",
         )
+    from devbench.notifications import notify_quota_pause
+
+    notify_quota_pause(
+        reason=reason,
+        reset_at=reset_at if reset_at is not None else datetime.now(tz=UTC),
+        paused_at=paused_at,
+    )
 
     # Step 4: wait for reset.
     effective_reset_at = reset_at if reset_at is not None else datetime.now(tz=UTC)
@@ -5704,14 +5721,19 @@ async def _handle_quota_pause(
     )
 
     # Step 5: audit comment on resume.
-    if recovered and quota_cfg.audit_comment_on_resume and in_flight_wu_file is not None:
-        waited_seconds = int((datetime.now(tz=UTC) - paused_at).total_seconds())
-        mgr = BacklogManager()
-        mgr._append_agent_comment(
-            in_flight_wu_file,
-            "orchestrator",
-            f"{_QUOTA_RESUMED_AUDIT_PREFIX} waited_seconds={waited_seconds}",
-        )
+    if recovered:
+        resumed_at = datetime.now(tz=UTC)
+        waited_seconds = int((resumed_at - paused_at).total_seconds())
+        if quota_cfg.audit_comment_on_resume and in_flight_wu_file is not None:
+            mgr = BacklogManager()
+            mgr._append_agent_comment(
+                in_flight_wu_file,
+                "orchestrator",
+                f"{_QUOTA_RESUMED_AUDIT_PREFIX} waited_seconds={waited_seconds}",
+            )
+        from devbench.notifications import notify_quota_resume
+
+        notify_quota_resume(resumed_at=resumed_at, waited_seconds=waited_seconds)
 
     # Step 6: apply resume strategy (removes checkpoint, optionally reverts WU or drains).
     if recovered:
@@ -5976,6 +5998,52 @@ def _check_scope_overlap(
     return 1
 
 
+def _check_auto_restart_and_notify(current_reason: str) -> tuple[int, str]:
+    """Decide the post-clean-exit return code and update the stop reason.
+
+    Returns ``(rc, updated_reason)``.  Extracted from ``cmd_start`` so the
+    function's branch count stays under the ruff PLR0912 ceiling.  Fires
+    the auto-restart notification when ``_should_auto_restart_after_no_actionable``
+    says we should restart.
+    """
+    should_restart, degraded_ids = _should_auto_restart_after_no_actionable()
+    if not should_restart:
+        return 0, current_reason
+    logger.info("%s%s", ORCHESTRATOR_AUTO_RESTART_AUDIT_PREFIX, ",".join(degraded_ids))
+    from devbench.notifications import notify_orchestrator_auto_restart
+
+    notify_orchestrator_auto_restart(list(degraded_ids))
+    return ORCHESTRATOR_RESTART_EXIT_CODE, "auto-restart (RUNTIME_DEGRADATION-only NO_ACTIONABLE)"
+
+
+def _fire_orchestrator_stop_notification(reason: str) -> None:
+    """Best-effort always-fire of the ``orchestrator_stop`` notification.
+
+    Wraps the lookup + dispatch in a broad try/except so a buggy
+    notification import or a transient backlog-parser failure during
+    cmd_start's outer try/finally cannot mask the real exit reason.
+    Extracted from ``cmd_start`` body so the branch-count of that
+    function stays under the project's ruff PLR0912 ceiling (12).
+    """
+    try:
+        from devbench.notifications import notify_orchestrator_stop
+
+        in_flight_id: str | None = None
+        try:
+            stop_parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+            stop_units = stop_parser.parse_index()
+            stop_wu = _find_in_flight_wu(stop_units)
+            in_flight_id = stop_wu.id if stop_wu is not None else None
+        except (OSError, ValueError):
+            in_flight_id = None
+        notify_orchestrator_stop(reason, in_flight_id)
+    except Exception as exc:  # broad guard: notification must never mask real exit
+        print(
+            f"[WARN] orchestrator-stop notification failed: {exc!r}",
+            file=sys.stderr,
+        )
+
+
 def cmd_start(*argv: str) -> int:
     """Run the devbench orchestrate skill non-interactively via the Claude Agent SDK.
 
@@ -6233,37 +6301,51 @@ def cmd_start(*argv: str) -> int:
                 )
                 raise SystemExit(1) from quota_exc
 
+    # Always-fire on exit (PR #202): wrap the SDK loop + state-restoration
+    # finally in an outer try/finally that calls notify_orchestrator_stop
+    # regardless of how the function exits (clean, drain, SystemExit from
+    # the SIGTERM handler, or an uncaught SDK exception).  The notify
+    # helper is best-effort so a failure here cannot mask the original
+    # exit reason.
+    _stop_reason: str = "clean"
     try:
         try:
-            asyncio.run(_run())
-        except _DrainRequested as exc:
-            # Drain-enforcement backstop (spec section 4.3.3, AC-188-4, AC-188-5, AC-188-8):
-            # consume the marker so the next run starts unscoped, then record the audit.
-            drained = consume_drain(WORKSPACE_ROOT)
-            reason_text = drained.reason if drained is not None else exc.reason
-            logger.info("%s%s", _ORCHESTRATOR_DRAIN_ENFORCED_AUDIT_PREFIX, reason_text)
-            return 0
+            try:
+                asyncio.run(_run())
+            except _DrainRequested as exc:
+                # Drain-enforcement backstop (spec section 4.3.3, AC-188-4, AC-188-5, AC-188-8):
+                # consume the marker so the next run starts unscoped, then record the audit.
+                drained = consume_drain(WORKSPACE_ROOT)
+                reason_text = drained.reason if drained is not None else exc.reason
+                logger.info("%s%s", _ORCHESTRATOR_DRAIN_ENFORCED_AUDIT_PREFIX, reason_text)
+                _stop_reason = f"drain enforced: {reason_text}"
+                return 0
+        finally:
+            # Restore the previous DEVBENCH_SESSION_NAME value so test isolation is
+            # maintained when cmd_start is invoked multiple times in the same process.
+            if _prev_session_name is None:
+                os.environ.pop("DEVBENCH_SESSION_NAME", None)
+            else:
+                os.environ["DEVBENCH_SESSION_NAME"] = _prev_session_name
+            # Restore the previous SIGTERM handler so test isolation is maintained.
+            signal.signal(signal.SIGTERM, _prev_sigterm_handler)
+
+        # AC-190-13: delete scope.json on clean SDK exit so the next run starts
+        # without a stale scope.  On crash (SDK raises), the exception propagates
+        # before this line runs, intentionally leaving scope.json in place for
+        # operator inspection.
+        ScopeFilter.clear(WORKSPACE_ROOT)
+
+        restart_rc, _stop_reason = _check_auto_restart_and_notify(_stop_reason)
+        return restart_rc
+    except BaseException as exc:
+        # Capture the exit reason for the always-fire notification before
+        # re-raising.  ``BaseException`` covers SystemExit (SIGTERM) and
+        # KeyboardInterrupt in addition to standard exceptions.
+        _stop_reason = f"crash: {type(exc).__name__}: {exc}"
+        raise
     finally:
-        # Restore the previous DEVBENCH_SESSION_NAME value so test isolation is
-        # maintained when cmd_start is invoked multiple times in the same process.
-        if _prev_session_name is None:
-            os.environ.pop("DEVBENCH_SESSION_NAME", None)
-        else:
-            os.environ["DEVBENCH_SESSION_NAME"] = _prev_session_name
-        # Restore the previous SIGTERM handler so test isolation is maintained.
-        signal.signal(signal.SIGTERM, _prev_sigterm_handler)
-
-    # AC-190-13: delete scope.json on clean SDK exit so the next run starts
-    # without a stale scope.  On crash (SDK raises), the exception propagates
-    # before this line runs, intentionally leaving scope.json in place for
-    # operator inspection.
-    ScopeFilter.clear(WORKSPACE_ROOT)
-
-    should_restart, degraded_ids = _should_auto_restart_after_no_actionable()
-    if should_restart:
-        logger.info("%s%s", ORCHESTRATOR_AUTO_RESTART_AUDIT_PREFIX, ",".join(degraded_ids))
-        return ORCHESTRATOR_RESTART_EXIT_CODE
-    return 0
+        _fire_orchestrator_stop_notification(_stop_reason)
 
 
 def cmd_prepare_plugin_shadow() -> int:

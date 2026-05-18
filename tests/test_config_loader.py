@@ -18,7 +18,6 @@ from devbench.config_loader import (
     LimitConfig,
     QuotaBackoffConfig,
     QuotaHandlingConfig,
-    QuotaNotifyConfig,
     QuotaRecoveryProbeConfig,
     RepoConfig,
     RuntimeConfig,
@@ -3047,7 +3046,7 @@ class TestHaikuRejectionValidatorHelper:
 class TestQuotaHandlingConfig:
     """AC-193-19: safe defaults when section absent; AC-193-20: schema rejects invalid values.
 
-    Covers the QuotaHandlingConfig, QuotaNotifyConfig, QuotaRecoveryProbeConfig,
+    Covers the QuotaHandlingConfig, QuotaRecoveryProbeConfig,
     and QuotaBackoffConfig dataclasses added to config_loader.py (spec section 4.5.6).
     """
 
@@ -3131,32 +3130,6 @@ class TestQuotaHandlingConfig:
         assert backoff.max_seconds == 600.0
         assert backoff.multiplier == 2.0
         assert backoff.jitter == 0.2
-
-    def test_quota_handling_absent_notify_on_pause_none(self, tmp_path: Path) -> None:
-        """When quota_handling is absent, notify_on_pause is None."""
-        cfg = self._write(
-            tmp_path / "cfg.yaml",
-            """\
-            repos:
-              org/repo:
-                default_branch: main
-            """,
-        )
-        rt = load_runtime_config(cfg, {})
-        assert rt.quota_handling.notify_on_pause is None
-
-    def test_quota_handling_absent_notify_on_resume_none(self, tmp_path: Path) -> None:
-        """When quota_handling is absent, notify_on_resume is None."""
-        cfg = self._write(
-            tmp_path / "cfg.yaml",
-            """\
-            repos:
-              org/repo:
-                default_branch: main
-            """,
-        )
-        rt = load_runtime_config(cfg, {})
-        assert rt.quota_handling.notify_on_resume is None
 
     # ------------------------------------------------------------------
     # AC-193-19: individual YAML fields override defaults
@@ -3345,44 +3318,6 @@ class TestQuotaHandlingConfig:
         )
         rt = load_runtime_config(cfg, {})
         assert rt.quota_handling.detect_modes == ["subscription_rate_limit", "sdk_credit_exhausted"]
-
-    def test_quota_handling_notify_on_pause_webhook(self, tmp_path: Path) -> None:
-        """notify_on_pause with webhook_url stores the URL correctly."""
-        cfg = self._write(
-            tmp_path / "cfg.yaml",
-            """\
-            repos:
-              org/repo:
-                default_branch: main
-            quota_handling:
-              notify_on_pause:
-                webhook_url: "https://example.com/hook"
-            """,
-        )
-        rt = load_runtime_config(cfg, {})
-        notify = rt.quota_handling.notify_on_pause
-        assert notify is not None
-        assert notify.webhook_url == "https://example.com/hook"
-        assert notify.slack_webhook_url is None
-
-    def test_quota_handling_notify_on_resume_slack(self, tmp_path: Path) -> None:
-        """notify_on_resume with slack_webhook_url stores the URL correctly."""
-        cfg = self._write(
-            tmp_path / "cfg.yaml",
-            """\
-            repos:
-              org/repo:
-                default_branch: main
-            quota_handling:
-              notify_on_resume:
-                slack_webhook_url: "https://hooks.slack.com/services/T/B/X"
-            """,
-        )
-        rt = load_runtime_config(cfg, {})
-        notify = rt.quota_handling.notify_on_resume
-        assert notify is not None
-        assert notify.slack_webhook_url == "https://hooks.slack.com/services/T/B/X"
-        assert notify.webhook_url is None
 
     def test_quota_handling_recovery_probe_overrides(self, tmp_path: Path) -> None:
         """recovery_probe fields are stored from YAML correctly."""
@@ -3839,8 +3774,6 @@ class TestQuotaHandlingConfig:
         assert qh.audit_comment_on_wait is True
         assert qh.audit_comment_on_resume is True
         assert qh.log_structured_events is True
-        assert qh.notify_on_pause is None
-        assert qh.notify_on_resume is None
 
     def test_quota_backoff_config_dataclass_defaults(self) -> None:
         """QuotaBackoffConfig() with no args yields spec defaults."""
@@ -3857,18 +3790,6 @@ class TestQuotaHandlingConfig:
         assert p.request_size_tokens == 1
         assert p.timeout_seconds == 10.0
         assert isinstance(p.backoff, QuotaBackoffConfig)
-
-    def test_quota_notify_config_stores_fields(self) -> None:
-        """QuotaNotifyConfig accepts webhook_url and slack_webhook_url."""
-        n = QuotaNotifyConfig(webhook_url="https://w.example.com", slack_webhook_url="https://s.example.com")
-        assert n.webhook_url == "https://w.example.com"
-        assert n.slack_webhook_url == "https://s.example.com"
-
-    def test_quota_notify_config_default_nones(self) -> None:
-        """QuotaNotifyConfig() with no args has both URLs as None."""
-        n = QuotaNotifyConfig()
-        assert n.webhook_url is None
-        assert n.slack_webhook_url is None
 
 
 # ---------------------------------------------------------------------------
@@ -3970,22 +3891,6 @@ class TestQuotaHandlingEnabledFalse:
         assert probe.backoff.max_seconds == 600.0
         assert probe.backoff.multiplier == 2.0
         assert probe.backoff.jitter == 0.2
-
-    def test_enabled_false_notify_fields_at_none(self, tmp_path: Path) -> None:
-        """When enabled: false only, notify_on_pause and notify_on_resume remain None."""
-        cfg = self._write(
-            tmp_path / "cfg.yaml",
-            """\
-            repos:
-              org/repo:
-                default_branch: main
-            quota_handling:
-              enabled: false
-            """,
-        )
-        rt = load_runtime_config(cfg, {})
-        assert rt.quota_handling.notify_on_pause is None
-        assert rt.quota_handling.notify_on_resume is None
 
     def test_enabled_false_with_on_exhaustion_fail(self, tmp_path: Path) -> None:
         """enabled: false and on_exhaustion: fail coexist without error.

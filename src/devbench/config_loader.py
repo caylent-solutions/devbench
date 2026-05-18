@@ -623,24 +623,6 @@ class QuotaBackoffConfig:
 
 
 @dataclass
-class QuotaNotifyConfig:
-    """Webhook notification config sent on quota pause or resume (spec section 4.5.6).
-
-    Both fields default to ``None`` (no notification).  A ``None`` URL means
-    the corresponding webhook is disabled for that event.
-
-    Attributes:
-        webhook_url: Generic webhook URL to POST a JSON payload to.
-            ``None`` disables the generic webhook.
-        slack_webhook_url: Slack incoming webhook URL.
-            ``None`` disables the Slack notification.
-    """
-
-    webhook_url: str | None = None
-    slack_webhook_url: str | None = None
-
-
-@dataclass
 class QuotaRecoveryProbeConfig:
     """Recovery probe sub-configuration (spec section 4.5.6).
 
@@ -694,13 +676,16 @@ class QuotaHandlingConfig:
             audit comment after quota is restored.
         log_structured_events: When ``True``, emits structured log events for
             quota-wait lifecycle transitions.
-        notify_on_pause: Optional webhook notification sent when the
-            orchestrator pauses due to quota exhaustion.  ``None`` means no
-            notification.
-        notify_on_resume: Optional webhook notification sent when the
-            orchestrator resumes after quota recovery.  ``None`` means no
-            notification.
         recovery_probe: Recovery probe sub-configuration.
+
+    Note:
+        Pause / resume **notifications** moved to the unified
+        :class:`NotificationsConfig` block in PR #202.  The
+        ``quota_handling.notify_on_pause`` / ``notify_on_resume`` yaml
+        fields and their ``QuotaNotifyConfig`` dataclass were removed.
+        Set ``notifications.events.quota_pause: true`` /
+        ``notifications.events.quota_resume: true`` to receive Slack
+        pings on those events.
     """
 
     enabled: bool = QUOTA_HANDLING_DEFAULT_ENABLED
@@ -713,25 +698,7 @@ class QuotaHandlingConfig:
     audit_comment_on_wait: bool = QUOTA_HANDLING_DEFAULT_AUDIT_COMMENT_ON_WAIT
     audit_comment_on_resume: bool = QUOTA_HANDLING_DEFAULT_AUDIT_COMMENT_ON_RESUME
     log_structured_events: bool = QUOTA_HANDLING_DEFAULT_LOG_STRUCTURED_EVENTS
-    notify_on_pause: QuotaNotifyConfig | None = None
-    notify_on_resume: QuotaNotifyConfig | None = None
     recovery_probe: QuotaRecoveryProbeConfig = field(default_factory=QuotaRecoveryProbeConfig)
-
-
-def _parse_quota_notify_config(raw: dict) -> QuotaNotifyConfig:
-    """Parse a ``notify_on_pause`` or ``notify_on_resume`` sub-dict into a ``QuotaNotifyConfig``.
-
-    Args:
-        raw: Raw YAML dict (already schema-validated). May be empty.
-
-    Returns:
-        ``QuotaNotifyConfig`` with ``webhook_url`` and ``slack_webhook_url``
-        set from *raw* (``None`` when absent).
-    """
-    return QuotaNotifyConfig(
-        webhook_url=raw.get("webhook_url") or None,
-        slack_webhook_url=raw.get("slack_webhook_url") or None,
-    )
 
 
 def _parse_quota_backoff_config(raw: dict) -> QuotaBackoffConfig:
@@ -790,12 +757,6 @@ def _parse_quota_handling_config(raw: dict) -> QuotaHandlingConfig:
     """
     defaults = QuotaHandlingConfig()
 
-    notify_pause_raw = raw.get("notify_on_pause")
-    notify_pause = _parse_quota_notify_config(notify_pause_raw) if notify_pause_raw is not None else None
-
-    notify_resume_raw = raw.get("notify_on_resume")
-    notify_resume = _parse_quota_notify_config(notify_resume_raw) if notify_resume_raw is not None else None
-
     probe_raw = raw.get("recovery_probe") or {}
     recovery_probe = _parse_quota_recovery_probe_config(probe_raw)
 
@@ -810,9 +771,162 @@ def _parse_quota_handling_config(raw: dict) -> QuotaHandlingConfig:
         audit_comment_on_wait=bool(raw.get("audit_comment_on_wait", defaults.audit_comment_on_wait)),
         audit_comment_on_resume=bool(raw.get("audit_comment_on_resume", defaults.audit_comment_on_resume)),
         log_structured_events=bool(raw.get("log_structured_events", defaults.log_structured_events)),
-        notify_on_pause=notify_pause,
-        notify_on_resume=notify_resume,
         recovery_probe=recovery_probe,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Notifications (Slack + generic webhook) -- spec / PR #202
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class NotificationsSlackConfig:
+    """Slack endpoint for the notifications dispatcher.
+
+    Attributes:
+        webhook_url: Slack incoming webhook URL (channel-scoped).
+            ``None`` disables Slack notifications.
+        user_id: Slack user id (``U...`` or ``W...``).  When set, every
+            payload prepends ``<@user_id>`` to the headline so the
+            operator gets a desktop + mobile push even when the message
+            lands in a one-person private channel.
+    """
+
+    webhook_url: str | None = None
+    user_id: str | None = None
+
+
+@dataclass
+class NotificationsEventsConfig:
+    """Per-event toggles for the notifications dispatcher.
+
+    Every field defaults to ``False`` so the dispatcher is silent
+    until the operator opts in.  Field names match the
+    ``EVENT_*`` constants in :mod:`devbench.notifications`.
+    """
+
+    work_unit_done: bool = False
+    work_unit_blocked_operator: bool = False
+    work_unit_materialised: bool = False
+    work_unit_promoted: bool = False
+    pr_opened: bool = False
+    pr_merged: bool = False
+    ci_failure: bool = False
+    orchestrator_stop: bool = False
+    orchestrator_auto_restart: bool = False
+    quota_pause: bool = False
+    quota_resume: bool = False
+
+
+@dataclass
+class NotificationsConfig:
+    """Operator-facing notification dispatcher configuration.
+
+    The default-constructed value has ``enabled=False`` and every
+    event toggle off, so omitting the ``notifications:`` yaml block
+    means "no notifications", matching the spec's opt-in posture.
+
+    Attributes:
+        enabled: Master switch.  When ``False``, no event fires
+            regardless of per-event toggles.  Default ``False``.
+        slack: Slack endpoint settings (URL + user id for mention).
+        webhook_url: Optional non-Slack generic webhook URL.  Receives
+            a raw JSON payload (``{"event": "...", ...}``) for every
+            enabled event.  ``None`` disables it.
+        timeout_seconds: Per-POST HTTP timeout.  Default 10.
+        events: Per-event toggle struct.
+    """
+
+    enabled: bool = False
+    slack: NotificationsSlackConfig = field(default_factory=NotificationsSlackConfig)
+    webhook_url: str | None = None
+    timeout_seconds: float = 10.0
+    events: NotificationsEventsConfig = field(default_factory=NotificationsEventsConfig)
+
+
+def _validate_webhook_url(label: str, value: object) -> str | None:
+    """Validate a webhook URL field at config-load time.
+
+    Returns the URL unchanged when valid, ``None`` when *value* is
+    null / empty.  Raises ``ValueError`` for any non-string,
+    non-``https://`` value.  CLAUDE.md "fail-fast at config-load"
+    catches typos and credential-injection attempts before any HTTP
+    traffic.
+    """
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{label}: must be a string or null, got {type(value).__name__}")
+    if not value.startswith("https://"):
+        raise ValueError(f"{label}: must start with 'https://' (got {value[:20]!r}...)")
+    return value
+
+
+def _validate_slack_user_id(value: object) -> str | None:
+    """Validate ``notifications.slack.user_id``.
+
+    Slack member ids are 8+ characters starting with ``U`` (workspace
+    member) or ``W`` (Slack Connect / Enterprise Grid).  Either is
+    accepted.
+    """
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"notifications.slack.user_id: must be a string or null, got {type(value).__name__}")
+    from devbench.notifications import SLACK_USER_ID_RE
+
+    if not SLACK_USER_ID_RE.match(value):
+        raise ValueError(
+            f"notifications.slack.user_id: malformed Slack user id {value!r}; "
+            "expected pattern '[UW][A-Z0-9]{7,}' (find yours in Slack: avatar -> Profile -> Copy member ID)"
+        )
+    return value
+
+
+def _parse_notifications_config(raw: dict) -> NotificationsConfig:
+    """Parse a ``notifications:`` yaml block into a :class:`NotificationsConfig`.
+
+    Schema validation in ``load_runtime_config`` already rejects
+    unknown keys; this function applies the value-level checks
+    (URL scheme, user-id pattern) so a malformed value fails
+    fast at config-load time, not on first dispatch attempt.
+    """
+    defaults = NotificationsConfig()
+
+    slack_raw = raw.get("slack") or {}
+    slack = NotificationsSlackConfig(
+        webhook_url=_validate_webhook_url("notifications.slack.webhook_url", slack_raw.get("webhook_url")),
+        user_id=_validate_slack_user_id(slack_raw.get("user_id")),
+    )
+
+    generic_url = _validate_webhook_url("notifications.webhook_url", raw.get("webhook_url"))
+
+    events_raw = raw.get("events") or {}
+    events = NotificationsEventsConfig(
+        work_unit_done=bool(events_raw.get("work_unit_done", defaults.events.work_unit_done)),
+        work_unit_blocked_operator=bool(
+            events_raw.get("work_unit_blocked_operator", defaults.events.work_unit_blocked_operator)
+        ),
+        work_unit_materialised=bool(events_raw.get("work_unit_materialised", defaults.events.work_unit_materialised)),
+        work_unit_promoted=bool(events_raw.get("work_unit_promoted", defaults.events.work_unit_promoted)),
+        pr_opened=bool(events_raw.get("pr_opened", defaults.events.pr_opened)),
+        pr_merged=bool(events_raw.get("pr_merged", defaults.events.pr_merged)),
+        ci_failure=bool(events_raw.get("ci_failure", defaults.events.ci_failure)),
+        orchestrator_stop=bool(events_raw.get("orchestrator_stop", defaults.events.orchestrator_stop)),
+        orchestrator_auto_restart=bool(
+            events_raw.get("orchestrator_auto_restart", defaults.events.orchestrator_auto_restart)
+        ),
+        quota_pause=bool(events_raw.get("quota_pause", defaults.events.quota_pause)),
+        quota_resume=bool(events_raw.get("quota_resume", defaults.events.quota_resume)),
+    )
+
+    return NotificationsConfig(
+        enabled=bool(raw.get("enabled", defaults.enabled)),
+        slack=slack,
+        webhook_url=generic_url,
+        timeout_seconds=float(raw.get("timeout_seconds", defaults.timeout_seconds)),
+        events=events,
     )
 
 
@@ -1084,6 +1198,7 @@ class RuntimeConfig:
     validate: ValidateConfig = field(default_factory=ValidateConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
     quota_handling: QuotaHandlingConfig = field(default_factory=QuotaHandlingConfig)
+    notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
     allowed_orgs: list[str] = field(default_factory=list)
     use_bedrock: bool = False
     bedrock_region: str | None = None
@@ -1547,6 +1662,12 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
     quota_handling_raw = raw.get("quota_handling") or {}
     quota_handling = _parse_quota_handling_config(quota_handling_raw)
 
+    # Populate NotificationsConfig from YAML notifications block (PR #202).
+    # JSON Schema validation already enforces shape; _parse_notifications_config
+    # applies value-level checks (URL scheme, Slack user-id pattern).
+    notifications_raw = raw.get("notifications") or {}
+    notifications = _parse_notifications_config(notifications_raw)
+
     return RuntimeConfig(
         repos=repos,
         timeouts=timeouts,
@@ -1563,6 +1684,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         validate=validate_cfg,
         debug=debug,
         quota_handling=quota_handling,
+        notifications=notifications,
         allowed_orgs=allowed_orgs,
         use_bedrock=bool(raw.get("use_bedrock", False)),
         bedrock_region=raw.get("bedrock_region") or None,

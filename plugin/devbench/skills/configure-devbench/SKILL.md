@@ -354,11 +354,10 @@ Ask the operator:
 >   audit_comment_on_resume -- Write a [QUOTA_RESUMED] audit comment after recovery. [true/false, default: true]
 >   log_structured_events  -- Emit structured log events for quota-wait lifecycle transitions. [true/false, default: true]
 >
-> Webhook notifications (optional):
->   notify_on_pause.webhook_url        -- POST JSON payload when quota pause starts. [blank to disable]
->   notify_on_pause.slack_webhook_url  -- Slack incoming webhook for quota pause. [blank to disable]
->   notify_on_resume.webhook_url       -- POST JSON payload when quota resumes. [blank to disable]
->   notify_on_resume.slack_webhook_url -- Slack incoming webhook for quota resume. [blank to disable]
+> Pause/resume notifications moved to the unified ``notifications:`` block
+> in PR #202.  See docs/slack-notifications.md and set
+> ``notifications.events.quota_pause`` /
+> ``notifications.events.quota_resume`` to true.
 >
 > Recovery probe sub-configuration:
 >   recovery_probe.model           -- Model name for the minimal probe completion. [default: haiku]
@@ -372,7 +371,48 @@ Validate `on_exhaustion` is one of `wait`, `fail`, `drain`. Validate `on_exhaust
 
 ---
 
-## Step 16 -- Final validation and write
+## Step 16 -- notifications section (PR #202)
+
+The `notifications:` section configures operator-facing Slack / webhook pings on lifecycle events. The entire section may be omitted; defaults are all "off".
+
+Tell the operator (verbatim):
+
+> "Section: notifications (operator Slack / webhook pings; leave blank to keep them all off)
+>
+> Master:
+>   enabled                     -- Master switch; nothing fires when false. [true/false, default: false]
+>
+> Slack endpoint (recommended pattern: leave these BLANK in the yaml and set
+> the DEVBENCH_NOTIFICATIONS_SLACK_WEBHOOK_URL + DEVBENCH_NOTIFICATIONS_SLACK_USER_ID
+> env vars so the credential never gets committed):
+>   slack.webhook_url           -- Slack incoming webhook (https://hooks.slack.com/services/...). [blank]
+>   slack.user_id               -- Slack member id (U... or W...) used for <@mention>. [blank]
+>
+> Generic webhook (optional, non-Slack):
+>   webhook_url                 -- POST raw JSON payload to this URL on every enabled event. [blank]
+>   timeout_seconds             -- Per-POST HTTP timeout. [default: 10]
+>
+> Per-event toggles (all default to false):
+>   events.work_unit_done              -- task transitions to done
+>   events.work_unit_blocked_operator  -- task is blocked AND needs operator action
+>   events.work_unit_materialised      -- draft WU file written from a proposal
+>   events.work_unit_promoted          -- draft WU promoted to in-queue
+>   events.pr_opened                   -- gh pr create succeeded
+>   events.pr_merged                   -- gh pr merge succeeded
+>   events.ci_failure                  -- CI run on the WU PR failed
+>   events.orchestrator_stop           -- orchestrator loop exited (clean / drain / SIGTERM / crash)
+>   events.orchestrator_auto_restart   -- exit-42 RUNTIME_DEGRADATION restart
+>   events.quota_pause                 -- quota detected; sleeping until reset
+>   events.quota_resume                -- recovery probe succeeded; resuming
+>
+> Full operator walkthrough (Slack app creation, webhook URL, user-id lookup):
+>   docs/slack-notifications.md"
+
+Validate `slack.webhook_url` (when present) starts with `https://`. Validate `slack.user_id` (when present) matches `^[UW][A-Z0-9]{7,}$`. Validate every `events.*` value is a boolean. Reject any invalid value and re-prompt.
+
+---
+
+## Step 17 -- Final validation and write
 
 Assemble the complete YAML from all collected sections. Run the full validation round-trip:
 
@@ -417,6 +457,7 @@ Report:
 >   manifest_amendment: enabled=<value>
 >   backlog:            default_status_for_new_work_units=<value>
 >   quota_handling:     enabled=<value>, on_exhaustion=<value>
+>   notifications:      enabled=<value>, events=<comma-separated list of enabled events>
 >   stop_hook:          max_blocks=<value>, window_seconds=<value>
 >
 > Next step: run 'claude run devbench:bootstrap-environment' to clone target repos and verify make validate baselines."

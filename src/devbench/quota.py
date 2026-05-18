@@ -50,9 +50,10 @@ Public API:
   raises :exc:`ValueError` when the file is present but malformed.
 - :func:`post_webhook` -- best-effort POST of a JSON payload to a single URL
   using stdlib ``http.client``.  Failures are logged to stderr but do not raise.
-- :func:`deliver_notifications` -- dispatches a notification payload to every
-  non-``None`` URL in a :class:`~devbench.config_loader.QuotaNotifyConfig`.
-  Calls :func:`post_webhook` for each URL; best-effort per spec section 4.5.6.
+  Reused by :mod:`devbench.notifications` for the unified Slack / generic
+  notification dispatcher (PR #202); the prior ``deliver_notifications``
+  helper here was removed in the same PR after every caller moved to the
+  new module.
 
 Raises:
     None -- this module only defines exception classes and pure-function
@@ -73,7 +74,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import anthropic
 
@@ -86,9 +87,6 @@ from devbench.constants import (
     RECOVERY_PROBE_MESSAGE_CONTENT,
     RECOVERY_PROBE_MODEL,
 )
-
-if TYPE_CHECKING:
-    from devbench.config_loader import QuotaNotifyConfig
 
 # ---------------------------------------------------------------------------
 # Protocol constants -- HTTP status codes and header/error-code identifiers
@@ -1112,8 +1110,14 @@ def post_webhook(
     try:
         _http_post(parsed, body, headers, timeout_seconds)
     except Exception as exc:
+        # Webhook URLs are credentials (CLAUDE.md "Sensitive Data
+        # Handling").  Mask all but the last 8 chars in the log so an
+        # operator can correlate the failure with the URL they
+        # configured without leaking the secret to a shared stdout
+        # capture.
+        masked = "..." + url[-8:] if len(url) > 8 else "***"
         print(
-            f"[WARN] webhook POST to {url!r} failed: {exc!r}",
+            f"[WARN] webhook POST to {masked!r} failed: {exc!r}",
             file=sys.stderr,
         )
 
@@ -1164,56 +1168,6 @@ def _http_post(
         resp.read()
     finally:
         conn.close()
-
-
-# ---------------------------------------------------------------------------
-# deliver_notifications -- dispatch to all configured URLs (spec section 4.5.6)
-# ---------------------------------------------------------------------------
-
-
-def deliver_notifications(
-    notify_config: QuotaNotifyConfig | None,
-    payload: dict[str, Any],
-) -> None:
-    """Dispatch *payload* to every non-``None`` URL in *notify_config*.
-
-    Calls :func:`post_webhook` for each non-``None`` URL in *notify_config*.
-    If either call to :func:`post_webhook` raises an exception, the failure is
-    swallowed (best-effort semantics per spec section 4.5.6) and delivery to the
-    remaining URLs continues.
-
-    When *notify_config* is ``None`` or all URLs within it are ``None``, the
-    function returns immediately without issuing any requests.
-
-    Args:
-        notify_config: A :class:`~devbench.config_loader.QuotaNotifyConfig`
-            with up to two webhook URLs, or ``None`` when notifications are
-            disabled.
-        payload: JSON-serialisable dict to deliver.  Must be the notification
-            payload built by the caller (e.g. pause or resume event data).
-
-    Raises:
-        None -- this function swallows all delivery failures; it is designed to
-        be called from the quota-wait protocol where a failed notification must
-        not crash the orchestrator.
-    """
-    if notify_config is None:
-        return
-
-    urls: list[str] = []
-    if notify_config.webhook_url is not None:
-        urls.append(notify_config.webhook_url)
-    if notify_config.slack_webhook_url is not None:
-        urls.append(notify_config.slack_webhook_url)
-
-    for url in urls:
-        try:
-            post_webhook(url, payload)
-        except Exception as exc:
-            print(
-                f"[WARN] deliver_notifications: failed to POST to {url!r}: {exc!r}",
-                file=sys.stderr,
-            )
 
 
 def _parse_checkpoint_dt(value: object, field_name: str, path: Path) -> datetime:

@@ -296,12 +296,8 @@ quota_handling:
   audit_comment_on_wait: true
   audit_comment_on_resume: true
   log_structured_events: true
-  notify_on_pause:
-    webhook_url: null
-    slack_webhook_url: null
-  notify_on_resume:
-    webhook_url: null
-    slack_webhook_url: null
+  # Quota pause/resume notifications moved to the unified ``notifications:``
+  # block in PR #202; see docs/slack-notifications.md.
   recovery_probe:
     enabled: true
     request_size_tokens: 1
@@ -311,6 +307,41 @@ quota_handling:
       max_seconds: 600
       multiplier: 2.0
       jitter: 0.2
+```
+
+---
+
+## `notifications:` -- operator-facing Slack / webhook pings
+
+Per-event toggles for lifecycle notifications. Each toggle defaults to
+`false` so the dispatcher is silent until the operator opts in. The
+Slack webhook URL + user ID are credentials and should be provided via
+the `DEVBENCH_NOTIFICATIONS_SLACK_WEBHOOK_URL` and
+`DEVBENCH_NOTIFICATIONS_SLACK_USER_ID` env vars; the yaml fields below
+are a fallback for non-secret cases. See
+[`docs/slack-notifications.md`](slack-notifications.md) for the full
+operator walkthrough.
+
+```yaml
+notifications:
+  enabled: true                         # master switch; default false
+  slack:
+    webhook_url: null                   # https://hooks.slack.com/services/T.../B.../...
+    user_id: null                       # Slack member id (U... or W...); enables <@mention>
+  webhook_url: null                     # optional non-Slack generic webhook (raw JSON POST)
+  timeout_seconds: 10                   # per-POST HTTP timeout
+  events:
+    work_unit_done: false
+    work_unit_blocked_operator: false
+    work_unit_materialised: false
+    work_unit_promoted: false
+    pr_opened: false
+    pr_merged: false
+    ci_failure: false
+    orchestrator_stop: false
+    orchestrator_auto_restart: false
+    quota_pause: false
+    quota_resume: false
 ```
 
 ---

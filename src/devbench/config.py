@@ -540,6 +540,31 @@ def _apply_agent_model_env_overrides() -> None:
 _apply_agent_model_env_overrides()
 AGENT_MODELS = RUNTIME_CONFIG.agent_models
 
+
+def _apply_notifications_env_overrides() -> None:
+    """Override ``notifications.slack.*`` URLs / user-id from env vars.
+
+    Slack incoming-webhook URLs are credentials; the recommended
+    operator workflow keeps them in ``~/.devbench/shell.env`` and out
+    of any tracked yaml.  Env-var values take precedence over the
+    yaml ``notifications.slack.webhook_url`` /
+    ``notifications.slack.user_id`` fields when both are present.
+
+    Empty-string values are ignored (treated as "not set"), so a
+    boilerplate ``export DEVBENCH_NOTIFICATIONS_SLACK_WEBHOOK_URL=``
+    in a shell-init script does not clobber a yaml-supplied value.
+    """
+    slack_url = _read_env("DEVBENCH_NOTIFICATIONS_SLACK_WEBHOOK_URL")
+    slack_user = _read_env("DEVBENCH_NOTIFICATIONS_SLACK_USER_ID")
+    if slack_url:
+        RUNTIME_CONFIG.notifications.slack.webhook_url = slack_url
+    if slack_user:
+        RUNTIME_CONFIG.notifications.slack.user_id = slack_user
+
+
+_apply_notifications_env_overrides()
+NOTIFICATIONS = RUNTIME_CONFIG.notifications
+
 # ---------------------------------------------------------------------------
 # Timeouts -- all values in seconds
 # ---------------------------------------------------------------------------

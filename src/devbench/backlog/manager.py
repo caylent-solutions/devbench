@@ -100,6 +100,31 @@ _BLOCKED_PENDING_PROPOSAL_RE: re.Pattern[str] = re.compile(
 )
 
 
+# ``# <id>: <title>`` heading regex used by the operator-notification helper
+# below.  Single source of truth so the manager does not re-parse work-unit
+# files just to surface a Slack-friendly title.
+_WU_TITLE_RE: re.Pattern[str] = re.compile(r"^#\s+\S+:\s*(.+?)\s*$", re.MULTILINE)
+
+
+def _extract_wu_title(work_unit_path: Path, fallback: str) -> str:
+    """Return the human-readable title from a work-unit MD file.
+
+    Reads the first ``# E0-F1-S1-T1: Title here`` heading; returns the
+    title portion stripped of trailing whitespace.  Falls back to
+    *fallback* (typically the unit id) when the file is unreadable or
+    has no heading.  Best-effort: never raises -- consumed by the
+    notifications dispatcher which is itself best-effort.
+    """
+    try:
+        content = work_unit_path.read_text(encoding="utf-8")
+    except OSError:
+        return fallback
+    match = _WU_TITLE_RE.search(content)
+    if match is None:
+        return fallback
+    return match.group(1)
+
+
 class BacklogManager:
     """Owns backlog lifecycle: status writes, done-gate checks, rollups, comments, and validation."""
 
@@ -175,6 +200,13 @@ class BacklogManager:
                 f"Cannot mark {unit_id} done: not all required judges passed in the most recent review round"
             )
         self._set_status(work_unit_path, backlog_index, unit_id, STATUS_DONE)
+        # Operator notification (PR #202).  notify_* helpers are best-effort
+        # and gated by the per-event toggle in devbench.yaml; safe to call
+        # unconditionally.
+        from devbench.notifications import notify_work_unit_done
+
+        title = _extract_wu_title(work_unit_path, unit_id)
+        notify_work_unit_done(unit_id, title)
 
     def mark_blocked(self, work_unit_path: Path, backlog_index: Path, unit_id: str, reason: str) -> None:
         """Mark a work unit as Blocked in both files and append a comment.
@@ -191,6 +223,29 @@ class BacklogManager:
         """
         self._set_status(work_unit_path, backlog_index, unit_id, STATUS_BLOCKED)
         self._append_comment(work_unit_path, "BLOCKED", reason)
+        # Operator notification (PR #202).  Fires only when the classifier
+        # determines the block is OPERATOR_ACTION_REQUIRED -- the other
+        # blocked-buckets (AWAITING_DEPENDENCY, AUTO_CLEARING_VIA_PROPOSAL,
+        # etc.) auto-resolve so notifying on them every time would be noisy.
+        # All notification helpers are best-effort and gated by per-event
+        # toggles in devbench.yaml; safe to call unconditionally.
+        try:
+            from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+            from devbench.notifications import notify_work_unit_blocked_operator
+
+            workspace_root = backlog_index.parent
+            state = classify_blocked_task(
+                backlog_index.parent / "backlog",
+                backlog_index,
+                unit_id,
+                workspace_root=workspace_root,
+            )
+            if state is BlockedTaskState.OPERATOR_ACTION_REQUIRED:
+                title = _extract_wu_title(work_unit_path, unit_id)
+                notify_work_unit_blocked_operator(unit_id, title, reason)
+        except (OSError, ValueError, ImportError):
+            # Classifier I/O failures should not block the status write.
+            pass
 
     def mark_declined(self, work_unit_path: Path, backlog_index: Path, unit_id: str, reason: str) -> None:
         """Mark a work unit as Declined in both files and append a comment.

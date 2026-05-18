@@ -454,6 +454,59 @@
         }
       }
     },
+    "notifications": {
+      "type": "object",
+      "description": "Operator-facing Slack / webhook notifications fired on lifecycle events. Each event under 'events' is independently toggled. Webhook URLs may live in yaml but the recommended pattern is the DEVBENCH_NOTIFICATIONS_SLACK_WEBHOOK_URL / DEVBENCH_NOTIFICATIONS_SLACK_USER_ID env vars so the credential never gets committed. See docs/slack-notifications.md.",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Master switch. When false, no event fires regardless of per-event toggles. Default: false."
+        },
+        "slack": {
+          "type": "object",
+          "description": "Slack endpoint config. Webhook URL is channel-scoped; the user_id supplies the <@mention> that turns a channel message into a push notification.",
+          "additionalProperties": false,
+          "properties": {
+            "webhook_url": {
+              "type": ["string", "null"],
+              "description": "Slack incoming webhook URL (https://hooks.slack.com/...). null disables Slack notifications. Env override: DEVBENCH_NOTIFICATIONS_SLACK_WEBHOOK_URL."
+            },
+            "user_id": {
+              "type": ["string", "null"],
+              "description": "Slack user id (U.../W...). When set, every payload prepends <@user_id>. Env override: DEVBENCH_NOTIFICATIONS_SLACK_USER_ID."
+            }
+          }
+        },
+        "webhook_url": {
+          "type": ["string", "null"],
+          "description": "Optional non-Slack generic webhook URL. Receives a raw JSON payload ({event, ...}) for every enabled event. null disables it."
+        },
+        "timeout_seconds": {
+          "type": "number",
+          "minimum": 1,
+          "description": "Per-POST HTTP timeout in seconds. Default 10."
+        },
+        "events": {
+          "type": "object",
+          "description": "Per-event toggles. Every field defaults to false so the dispatcher is silent until the operator opts in.",
+          "additionalProperties": false,
+          "properties": {
+            "work_unit_done": {"type": "boolean", "description": "Fire when a work unit transitions to done. Default: false."},
+            "work_unit_blocked_operator": {"type": "boolean", "description": "Fire when the classifier flags a blocked WU as OPERATOR_ACTION_REQUIRED. Default: false."},
+            "work_unit_materialised": {"type": "boolean", "description": "Fire when a draft WU file is materialised from a proposal. Default: false."},
+            "work_unit_promoted": {"type": "boolean", "description": "Fire when a draft WU is promoted to in-queue. Default: false."},
+            "pr_opened": {"type": "boolean", "description": "Fire when 'gh pr create' succeeds. Default: false."},
+            "pr_merged": {"type": "boolean", "description": "Fire when 'gh pr merge' succeeds. Default: false."},
+            "ci_failure": {"type": "boolean", "description": "Fire when CI checks on a WU PR fail. Default: false."},
+            "orchestrator_stop": {"type": "boolean", "description": "Fire when the orchestrator loop exits (clean, drain, SIGTERM, or crash). Default: false."},
+            "orchestrator_auto_restart": {"type": "boolean", "description": "Fire when the orchestrator exits 42 (RUNTIME_DEGRADATION-only NO_ACTIONABLE) and the Makefile loop restarts. Default: false."},
+            "quota_pause": {"type": "boolean", "description": "Fire when the orchestrator detects a quota signal and sleeps until reset. Default: false."},
+            "quota_resume": {"type": "boolean", "description": "Fire when the orchestrator's recovery probe succeeds and the loop resumes. Default: false."}
+          }
+        }
+      }
+    },
     "quota_handling": {
       "type": "object",
       "description": "Quota-wait-and-resume configuration (spec section 4.5.6). All fields are optional; the section can be omitted entirely. When omitted, all defaults apply.",
@@ -513,36 +566,6 @@
         "log_structured_events": {
           "type": "boolean",
           "description": "When true (default), emits structured log events for quota-wait lifecycle transitions."
-        },
-        "notify_on_pause": {
-          "type": "object",
-          "description": "Optional webhook notification sent when the orchestrator pauses due to quota exhaustion.",
-          "additionalProperties": false,
-          "properties": {
-            "webhook_url": {
-              "type": ["string", "null"],
-              "description": "Generic webhook URL to POST a JSON payload to on quota-pause. null disables."
-            },
-            "slack_webhook_url": {
-              "type": ["string", "null"],
-              "description": "Slack incoming webhook URL. null disables. Payload uses Slack's block-kit JSON format."
-            }
-          }
-        },
-        "notify_on_resume": {
-          "type": "object",
-          "description": "Optional webhook notification sent when the orchestrator resumes after quota recovery.",
-          "additionalProperties": false,
-          "properties": {
-            "webhook_url": {
-              "type": ["string", "null"],
-              "description": "Generic webhook URL to POST a JSON payload to on quota-resume. null disables."
-            },
-            "slack_webhook_url": {
-              "type": ["string", "null"],
-              "description": "Slack incoming webhook URL. null disables. Payload uses Slack's block-kit JSON format."
-            }
-          }
         },
         "recovery_probe": {
           "type": "object",

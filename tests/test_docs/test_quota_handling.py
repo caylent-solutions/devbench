@@ -426,12 +426,20 @@ class TestQuotaHandlingConfigSchema:
             "listing the four detection modes (spec section 4.5.6)."
         )
 
-    def test_notify_on_pause_described(self) -> None:
-        """The doc must describe the notify_on_pause webhook config."""
+    def test_slack_notifications_cross_link(self) -> None:
+        """quota-handling.md must point operators at the unified notifications doc.
+
+        The legacy ``notify_on_pause`` / ``notify_on_resume`` yaml fields were
+        removed in PR #202; quota pause and resume notifications now flow
+        through ``notifications.events.quota_pause`` /
+        ``notifications.events.quota_resume`` toggles documented in
+        ``docs/slack-notifications.md``.  This test pins the cross-link so
+        operators reading the quota doc can find the new path.
+        """
         text = _read_doc()
-        assert "notify_on_pause" in text or "notify_on_resume" in text, (
-            "docs/quota-handling.md must describe the notify_on_pause / notify_on_resume "
-            "webhook config fields (AC-193-17 / spec section 4.5.6)."
+        assert "slack-notifications" in text, (
+            "docs/quota-handling.md must link to docs/slack-notifications.md "
+            "for the unified pause/resume notification toggles (PR #202)."
         )
 
 

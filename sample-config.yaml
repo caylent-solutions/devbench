@@ -382,14 +382,11 @@ validate:
 #   # Emit structured log events for quota-wait lifecycle transitions.
 #   log_structured_events: true
 #
-#   # Optional webhook payloads fired on pause and resume. Failures are
-#   # logged but do not crash the orchestrator (best-effort delivery).
-#   notify_on_pause:
-#     webhook_url: null         # Generic webhook URL (null = disabled)
-#     slack_webhook_url: null   # Slack incoming webhook URL (null = disabled)
-#   notify_on_resume:
-#     webhook_url: null
-#     slack_webhook_url: null
+#   # NOTE: quota pause/resume notifications now flow through the unified
+#   # ``notifications:`` block (see further down).  Set
+#   # ``notifications.events.quota_pause: true`` and
+#   # ``notifications.events.quota_resume: true`` to receive Slack pings
+#   # when the orchestrator sleeps for / recovers from quota exhaustion.
 #
 #   # Recovery probe sub-configuration.
 #   recovery_probe:
@@ -401,6 +398,34 @@ validate:
 #       max_seconds: 600        # Maximum backoff interval (10 min)
 #       multiplier: 2.0         # Exponential base applied after each failed probe
 #       jitter: 0.2             # Fractional jitter (+/- 20% of interval)
+
+# ---------------------------------------------------------------------------
+# Operator-facing Slack / webhook notifications (PR #202).
+# ---------------------------------------------------------------------------
+# Per-event toggles for lifecycle pings.  Webhook URLs are credentials --
+# the recommended pattern is to leave them ``null`` here and provide them
+# via env vars (`DEVBENCH_NOTIFICATIONS_SLACK_WEBHOOK_URL`,
+# `DEVBENCH_NOTIFICATIONS_SLACK_USER_ID`) so they never get committed.
+# See docs/slack-notifications.md for the full operator walkthrough.
+# notifications:
+#   enabled: false                         # master switch; flip to true to opt in
+#   slack:
+#     webhook_url: null                    # https://hooks.slack.com/services/T.../B.../...
+#     user_id: null                        # Slack member id (U... or W...); enables <@mention>
+#   webhook_url: null                      # optional non-Slack generic webhook (raw JSON POST)
+#   timeout_seconds: 10                    # per-POST HTTP timeout
+#   events:
+#     work_unit_done: false                # task transitions to done
+#     work_unit_blocked_operator: false    # classifier flags WU as OPERATOR_ACTION_REQUIRED
+#     work_unit_materialised: false        # draft WU file written from a proposal
+#     work_unit_promoted: false            # draft WU promoted to in-queue
+#     pr_opened: false                     # `gh pr create` succeeded
+#     pr_merged: false                     # `gh pr merge` succeeded
+#     ci_failure: false                    # CI run on a WU PR failed
+#     orchestrator_stop: false             # orchestrator loop exited (clean / drain / SIGTERM / crash)
+#     orchestrator_auto_restart: false     # exit 42 -> Makefile loop restarting
+#     quota_pause: false                   # quota signal detected; sleeping until reset
+#     quota_resume: false                  # recovery probe succeeded; resuming
 
 # ---------------------------------------------------------------------------
 # Diagnostic-tuning knobs (set only when investigating a specific cadence

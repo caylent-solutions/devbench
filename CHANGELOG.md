@@ -12,6 +12,19 @@ since the last release. PR #119 carries every change.
 
 ### Added
 
+- **Operator-facing Slack notifications** (PR #202) — toggleable per-event
+  Slack pings on every interesting lifecycle event: work-unit done,
+  work-unit blocked-and-operator-action-required, work-unit materialised
+  / promoted, PR opened / merged, CI failure, orchestrator stop (clean,
+  drain, SIGTERM, or crash — always-fire on exit), orchestrator
+  auto-restart, quota pause, quota resume. New `notifications:` yaml
+  block with one independent boolean toggle per event; webhook URL +
+  Slack user-id flow through `DEVBENCH_NOTIFICATIONS_SLACK_WEBHOOK_URL`
+  and `DEVBENCH_NOTIFICATIONS_SLACK_USER_ID` env vars so credentials
+  never touch tracked yaml. New `devbench notify-test --event <name>`
+  CLI for smoke-testing setup. See `docs/slack-notifications.md` for
+  the full operator walkthrough.
+
 - **`make start` auto-restarts on SDK `RUNTIME_DEGRADATION`-only
   `NO_ACTIONABLE` exits** (issue #183 follow-up; pairs with the renderer +
   ETA fixes below). The orchestrate skill exits cleanly on `NO_ACTIONABLE`
@@ -258,6 +271,18 @@ since the last release. PR #119 carries every change.
   the banner stays aligned with the operator's already-tuned
   circuit-breaker quiet window (e.g., a 180s window tolerates a
   3-minute terraform-apply quiet stretch without flashing STOPPED).
+
+### Removed
+
+- **`quota_handling.notify_on_pause` / `quota_handling.notify_on_resume`
+  yaml fields** (PR #202) — superseded by the unified `notifications:`
+  block above. The dispatcher, `QuotaNotifyConfig` dataclass, and
+  `deliver_notifications` helper were also removed (per CLAUDE.md
+  "Complete Replacement of Superseded Code"). Set
+  `notifications.events.quota_pause: true` and
+  `notifications.events.quota_resume: true` to receive Slack pings on
+  those events; webhook URL and Slack user-id flow through the new
+  env-var pair documented in `docs/slack-notifications.md`.
 
 ### Changed (BREAKING)
 

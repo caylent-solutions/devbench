@@ -120,12 +120,10 @@ quota_handling:
   audit_comment_on_wait: true
   audit_comment_on_resume: true
   log_structured_events: true
-  notify_on_pause:
-    webhook_url: null
-    slack_webhook_url: null
-  notify_on_resume:
-    webhook_url: null
-    slack_webhook_url: null
+  # Pause / resume notifications moved to the unified ``notifications:``
+  # block in PR #202.  Set ``notifications.events.quota_pause: true`` and
+  # ``notifications.events.quota_resume: true`` to get a Slack ping on
+  # each event.  See docs/slack-notifications.md for the full setup.
   recovery_probe:
     enabled: true
     request_size_tokens: 1
@@ -513,21 +511,15 @@ authentication:
 
 ### Webhook notifications are not firing
 
-**Symptom:** `notify_on_pause.webhook_url` is set but no notification arrives.
+**Symptom:** quota pause / resume Slack pings don't arrive.
 
-**Diagnosis:** Webhook delivery is best-effort (spec section 4.5.6). Failures
-are logged but do not stop the orchestrator. Check the session log:
-
-```bash
-cat <workspace>/.devbench/sessions/<session-name>/orchestrator.log | grep "WEBHOOK"
-```
-
-Common causes:
-- URL is unreachable from the DevBench host.
-- Webhook endpoint requires authentication headers not supported by the basic
-  delivery mechanism.
-- The URL is a Slack incoming webhook and requires the `slack_webhook_url` field
-  instead of `webhook_url`.
+**Diagnosis:** Quota notifications now flow through the unified
+`notifications:` block (PR #202). The legacy
+`quota_handling.notify_on_pause` / `notify_on_resume` fields were
+removed. See [docs/slack-notifications.md](slack-notifications.md)
+for the operator walkthrough; the relevant toggles are
+`notifications.events.quota_pause` and
+`notifications.events.quota_resume`.
 
 ### devbench status does not show QUOTA WAIT banner
 
@@ -559,6 +551,10 @@ If `quota_pause.json` was written by session `alpha` and you run
   per-session state directory layout that quota_pause.json shares.
 - **`docs/cli-reference.md`** -- full reference for `devbench quota-watcher`,
   `devbench status`, and `devbench set-status`.
+- **[`docs/slack-notifications.md`](slack-notifications.md)** -- the unified
+  Slack / webhook notification system (PR #202); covers the
+  `notifications.events.quota_pause` and
+  `notifications.events.quota_resume` toggles.
 - **`docs/glossary.md`** -- canonical definitions for "quota wait", "session",
   "audit comment", and "drain".
 - **Spec section 4.5** -- authoritative behavioral specification for the

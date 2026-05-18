@@ -43,9 +43,13 @@ but the last 8 characters of any URL it logs.
 
 from __future__ import annotations
 
+import json
 import sys
 from datetime import datetime
+from pathlib import Path
 from typing import Any
+
+from devbench.utils.io import atomic_write_text
 
 # ---------------------------------------------------------------------------
 # Event-kind tokens.  Every public ``notify_*`` function dispatches under
@@ -89,6 +93,28 @@ ALL_EVENTS: tuple[str, ...] = (
 # get a personal push; operators routing to a shared team channel notify the
 # whole online team.  Single payload works for both.
 SLACK_HERE_MENTION: str = "<!here>"
+
+
+# ---------------------------------------------------------------------------
+# Classification-transition cache (#207)
+# ---------------------------------------------------------------------------
+#
+# The base ``notify_work_unit_blocked_operator`` fires once at ``mark_blocked``
+# time and only when classification == OPERATOR_ACTION_REQUIRED at that exact
+# moment.  When a blocked task's classification later transitions into
+# OPERATOR_ACTION_REQUIRED (because a dep landed but the task never
+# auto-unblocked, or a ``[BLOCKED]`` audit went stale), no ping fires --
+# operators silently miss notifications they explicitly enabled.
+#
+# ``notify_blocked_operator_transition`` closes that gap with a per-workspace
+# JSON cache of each task's last-observed classification.  Callers from write
+# sites (``mark_blocked``, ``cmd_sync_blocked``, ``cmd_reconcile_cascade``)
+# route through this helper; read-only sites (the status / report renderers)
+# do not, so classification on every render does not produce duplicate pings.
+
+NOTIFICATION_STATE_FILENAME: str = "notification-state.json"
+
+_OPERATOR_ACTION_REQUIRED_CLASSIFICATION: str = "OPERATOR_ACTION_REQUIRED"
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +302,94 @@ def notify_work_unit_blocked_operator(unit_id: str, title: str, reason: str) -> 
         slack_fields=[("Task", f"`{unit_id}`"), ("Title", title)],
         slack_context=f"Reason: {reason}",
     )
+
+
+def _load_notification_state(state_path: Path) -> dict[str, str]:
+    """Read the per-workspace classification cache.
+
+    Treats missing / corrupt / non-object payloads as empty cache (regenerated
+    on next write).  The cache is best-effort observability state, never a
+    correctness gate -- swallowing decode errors here cannot mis-fire a
+    notification, only delay one by at most one classification round.
+    """
+    if not state_path.is_file():
+        return {}
+    try:
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    # Coerce to str/str: defensively reject non-string keys / values rather
+    # than carrying mismatched shapes forward.
+    return {str(k): str(v) for k, v in payload.items() if isinstance(k, str)}
+
+
+def _save_notification_state(state_path: Path, state: dict[str, str]) -> None:
+    """Atomic-write the classification cache.
+
+    Caught at the call site: a failure here logs a `[WARN]` and skips,
+    matching the dispatcher's best-effort contract -- the orchestrator
+    must never crash because notification state could not be persisted.
+    """
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(state_path, json.dumps(state, sort_keys=True, indent=2))
+
+
+def notify_blocked_operator_transition(
+    unit_id: str,
+    title: str,
+    reason: str,
+    classification: str,
+    workspace_root: Path,
+) -> None:
+    """Fire ``notify_work_unit_blocked_operator`` only on transition *into*
+    ``OPERATOR_ACTION_REQUIRED`` (#207).
+
+    Compares *classification* against the last value observed for *unit_id*
+    in the per-workspace cache at
+    ``<workspace_root>/.devbench/notification-state.json``.  Pings fire only
+    when the cache is missing / differs from ``OPERATOR_ACTION_REQUIRED``
+    and *classification* equals it now.
+
+    Call this from write sites only (``mark_blocked``, ``cmd_sync_blocked``,
+    ``cmd_reconcile_cascade``) -- never from read-only renderers, which
+    classify on every refresh and would otherwise spam pings.
+
+    Args:
+        unit_id: The blocked task id (e.g. ``E10-F2-S1-T3``).
+        title: Work-unit title for the Slack payload.
+        reason: Human-readable reason; surfaced in the Slack context block.
+        classification: The current ``BlockedTaskState`` name returned by
+            :func:`classify_blocked_task` (e.g. ``"OPERATOR_ACTION_REQUIRED"``,
+            ``"AWAITING_DEPENDENCY"``, ``"AUTO_CLEARING_VIA_PROPOSAL"``).
+        workspace_root: The workspace root -- usually
+            ``Path(DEVBENCH_WORKSPACE_ROOT)`` -- under which the cache file
+            is located.
+    """
+    if not is_event_enabled(EVENT_WORK_UNIT_BLOCKED_OPERATOR):
+        return
+
+    state_path = workspace_root / ".devbench" / NOTIFICATION_STATE_FILENAME
+    state = _load_notification_state(state_path)
+    previous = state.get(unit_id)
+
+    fires_now = (
+        classification == _OPERATOR_ACTION_REQUIRED_CLASSIFICATION
+        and previous != _OPERATOR_ACTION_REQUIRED_CLASSIFICATION
+    )
+
+    state[unit_id] = classification
+    try:
+        _save_notification_state(state_path, state)
+    except OSError as exc:
+        print(
+            f"[WARN] notification state cache write failed at {state_path}: {exc}",
+            file=sys.stderr,
+        )
+
+    if fires_now:
+        notify_work_unit_blocked_operator(unit_id, title, reason)
 
 
 def notify_work_unit_materialised(unit_id: str, title: str, source_task_id: str) -> None:

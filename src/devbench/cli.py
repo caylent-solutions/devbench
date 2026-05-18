@@ -315,7 +315,15 @@ def _read_scope_banner_data(workspace_root: Path) -> dict[str, object] | None:
     scope_path = _scope_file_path(workspace_root)
     if not scope_path.exists():
         return None
-    return dict(json.loads(scope_path.read_text(encoding="utf-8")))
+    payload = json.loads(scope_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise TypeError(
+            f"scope.json top-level payload must be an object, "
+            f"got {type(payload).__name__!r}. "
+            f"The file at '{scope_path}' may be corrupt -- "
+            f"remove it and re-run 'devbench start --include ...' to recreate it."
+        )
+    return payload
 
 
 def _render_scope_banner(include: list[str], exclude: list[str], started_at: str) -> None:
@@ -1985,6 +1993,14 @@ def cmd_sync_blocked() -> int:
             manager._append_comment(wu_file, "UNBLOCKED", "deps satisfied; sync-blocked dependencies now terminal")
             flipped_to_in_queue.append(unit.id)
 
+    # Issue #207: classification-transition pass.  Re-classify every task
+    # that is still ``blocked`` after the sweep and route through the
+    # transition-aware notifier so a stale ``[BLOCKED]`` audit that has
+    # drifted into the ``OPERATOR_ACTION_REQUIRED`` bucket since the last
+    # write-site run produces exactly one Slack ping.  Cache-backed and
+    # idempotent: repeated ``sync-blocked`` calls do not duplicate pings.
+    _notify_blocked_operator_transitions(units)
+
     output = {
         "flipped_to_blocked": flipped_to_blocked,
         "flipped_to_in_queue": flipped_to_in_queue,
@@ -1996,6 +2012,48 @@ def cmd_sync_blocked() -> int:
         len(flipped_to_in_queue),
     )
     return 0
+
+
+def _notify_blocked_operator_transitions(units: list) -> None:
+    """Re-classify still-blocked tasks and route into the transition-aware notifier.
+
+    Called from ``cmd_sync_blocked`` and ``cmd_reconcile_cascade`` as a final
+    pass after their main reconciliation work completes (issue #207).  For
+    every task whose status is still ``blocked``, run
+    :func:`classify_blocked_task` and call
+    :func:`notify_blocked_operator_transition` so a stale ``[BLOCKED]`` audit
+    later reclassified as ``OPERATOR_ACTION_REQUIRED`` produces exactly one
+    Slack ping per transition.
+
+    Best-effort: any I/O or classifier exception logs ``[WARN]`` to stderr
+    and continues to the next task -- the orchestrator must never abort
+    because notification bookkeeping failed.
+    """
+    from devbench.backlog.proposal import classify_blocked_task
+    from devbench.notifications import notify_blocked_operator_transition
+
+    workspace_root = BACKLOG_INDEX.parent
+    for unit in units:
+        if unit.unit_type is not WorkUnitType.TASK:
+            continue
+        if unit.status is not WorkUnitStatus.BLOCKED:
+            continue
+        try:
+            state = classify_blocked_task(
+                BACKLOG_INDEX.parent / "backlog",
+                BACKLOG_INDEX,
+                unit.id,
+                workspace_root=workspace_root,
+            )
+        except (OSError, ValueError) as exc:
+            print(
+                f"[WARN] classify_blocked_task failed for {unit.id}: {exc}",
+                file=sys.stderr,
+            )
+            continue
+        title = (unit.title or unit.id).strip()
+        reason = f"sync-blocked classification: {state.name}"
+        notify_blocked_operator_transition(unit.id, title, reason, state.name, workspace_root)
 
 
 def cmd_reconcile_cascade() -> int:
@@ -2073,6 +2131,12 @@ def cmd_reconcile_cascade() -> int:
         )
         manager._append_agent_comment(wu_file, "backlog_manager", message)
         flipped.append({"unit_id": unit.id, "closed_markers": marker_ids})
+
+    # Issue #207: surface classification transitions for tasks that remain
+    # blocked after the reconcile sweep -- a stale ``[BLOCKED]`` audit that
+    # has drifted into ``OPERATOR_ACTION_REQUIRED`` produces exactly one
+    # Slack ping.  Cache-backed, idempotent across repeated invocations.
+    _notify_blocked_operator_transitions(units)
 
     output = {"flipped": flipped, "skipped": skipped}
     print(json.dumps(output))

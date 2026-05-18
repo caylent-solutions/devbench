@@ -2857,6 +2857,189 @@ class TestAutoRequeueMarkerDependents:
         BacklogManager()._auto_requeue_marker_dependents(index_path, "E0-F1-S1-T2")
 
 
+class TestAutoRequeueRegularDepDependents:
+    """Cascade for blocked tasks with regular task-level deps and NO marker (#208).
+
+    The marker-cascade (``_auto_requeue_marker_dependents``) only handles
+    blocked tasks whose Comments section carries a ``[BLOCKED_PENDING_PROPOSAL]``
+    marker.  Tasks that landed in ``blocked`` via ``cmd_sync_blocked`` (regular
+    Dependencies table only, no marker) were ignored — they stayed blocked
+    forever even after the dep transitioned to ``done``.  This class pins
+    the regular-dep cascade that closes that gap.
+    """
+
+    def test_blocked_with_regular_dep_done_is_requeued(self, tmp_path: Path) -> None:
+        """Happy path: T1 deps on T2 (no marker), T2 -> done, scan flips T1 -> in-queue."""
+        sync_blocked_audit = (
+            "[2026-05-11 20:13 UTC] [backlog_manager] "
+            "[BLOCKED] sync-blocked: dependency 'E0-F1-S1-T2' not yet terminal\n"
+        )
+        src_file = _unit_body(
+            "E0-F1-S1-T1",
+            "blocked",
+            deps=["E0-F1-S1-T2"],
+            comments=sync_blocked_audit,
+        )
+        dep_file = _unit_body("E0-F1-S1-T2", "done")
+        index = _write_workspace(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Dependent", "blocked"),
+                ("E0-F1-S1-T2", "Dep", "done"),
+            ],
+            files={"E0-F1-S1-T1": src_file, "E0-F1-S1-T2": dep_file},
+        )
+        BacklogManager()._auto_requeue_regular_dep_dependents(index, "E0-F1-S1-T2")
+
+        src = (tmp_path / "backlog" / "E0-F1-S1-T1.md").read_text()
+        assert "## Status: in-queue" in src
+        assert "[UNBLOCKED]" in src
+        assert "[CASCADE_RESOLVED]" in src
+        assert "E0-F1-S1-T2" in src
+
+    def test_blocked_with_marker_is_left_to_marker_cascade(self, tmp_path: Path) -> None:
+        """Tasks WITH a ``[BLOCKED_PENDING_PROPOSAL]`` marker are owned by the
+        marker cascade; the regular-dep cascade must not touch them to avoid
+        double-handling and conflicting audit comments."""
+        marker = "[2026-04-19 14:00 UTC] [agent/task_factory] [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2\n"
+        src_file = _unit_body(
+            "E0-F1-S1-T1",
+            "blocked",
+            deps=["E0-F1-S1-T2"],
+            comments=marker,
+        )
+        dep_file = _unit_body("E0-F1-S1-T2", "done")
+        index = _write_workspace(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Dependent", "blocked"),
+                ("E0-F1-S1-T2", "Dep", "done"),
+            ],
+            files={"E0-F1-S1-T1": src_file, "E0-F1-S1-T2": dep_file},
+        )
+        BacklogManager()._auto_requeue_regular_dep_dependents(index, "E0-F1-S1-T2")
+
+        src = (tmp_path / "backlog" / "E0-F1-S1-T1.md").read_text()
+        # The regular-dep cascade leaves marker-bearing tasks alone.
+        assert "## Status: blocked" in src
+        assert "[UNBLOCKED]" not in src
+
+    def test_partial_completion_keeps_blocked(self, tmp_path: Path) -> None:
+        """T1 deps on T2 and T3; only T2 is done; scan must NOT requeue T1."""
+        sync_blocked_audit = (
+            "[2026-05-11 20:13 UTC] [backlog_manager] "
+            "[BLOCKED] sync-blocked: dependency 'E0-F1-S1-T2' not yet terminal\n"
+        )
+        src_file = _unit_body(
+            "E0-F1-S1-T1",
+            "blocked",
+            deps=["E0-F1-S1-T2", "E0-F1-S1-T3"],
+            comments=sync_blocked_audit,
+        )
+        dep_done = _unit_body("E0-F1-S1-T2", "done")
+        dep_queued = _unit_body("E0-F1-S1-T3", "in-queue")
+        index = _write_workspace(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Dependent", "blocked"),
+                ("E0-F1-S1-T2", "Dep1", "done"),
+                ("E0-F1-S1-T3", "Dep2", "in-queue"),
+            ],
+            files={
+                "E0-F1-S1-T1": src_file,
+                "E0-F1-S1-T2": dep_done,
+                "E0-F1-S1-T3": dep_queued,
+            },
+        )
+        BacklogManager()._auto_requeue_regular_dep_dependents(index, "E0-F1-S1-T2")
+
+        src = (tmp_path / "backlog" / "E0-F1-S1-T1.md").read_text()
+        assert "## Status: blocked" in src
+        assert "[UNBLOCKED]" not in src
+
+    def test_dep_not_referenced_by_candidate_is_left_untouched(self, tmp_path: Path) -> None:
+        """If newly_done_id is not in T1's Dependencies table, T1 stays blocked."""
+        sync_blocked_audit = (
+            "[2026-05-11 20:13 UTC] [backlog_manager] "
+            "[BLOCKED] sync-blocked: dependency 'E0-F1-S1-T9' not yet terminal\n"
+        )
+        src_file = _unit_body(
+            "E0-F1-S1-T1",
+            "blocked",
+            deps=["E0-F1-S1-T9"],
+            comments=sync_blocked_audit,
+        )
+        unrelated = _unit_body("E0-F1-S1-T2", "done")
+        index = _write_workspace(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Dependent", "blocked"),
+                ("E0-F1-S1-T2", "Unrelated", "done"),
+            ],
+            files={"E0-F1-S1-T1": src_file, "E0-F1-S1-T2": unrelated},
+        )
+        BacklogManager()._auto_requeue_regular_dep_dependents(index, "E0-F1-S1-T2")
+
+        src = (tmp_path / "backlog" / "E0-F1-S1-T1.md").read_text()
+        assert "## Status: blocked" in src
+
+    def test_in_queue_task_is_left_alone(self, tmp_path: Path) -> None:
+        """Only blocked tasks are candidates -- a task already in-queue is ignored."""
+        src_file = _unit_body("E0-F1-S1-T1", "in-queue", deps=["E0-F1-S1-T2"])
+        dep_file = _unit_body("E0-F1-S1-T2", "done")
+        index = _write_workspace(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Dependent", "in-queue"),
+                ("E0-F1-S1-T2", "Dep", "done"),
+            ],
+            files={"E0-F1-S1-T1": src_file, "E0-F1-S1-T2": dep_file},
+        )
+        BacklogManager()._auto_requeue_regular_dep_dependents(index, "E0-F1-S1-T2")
+
+        src = (tmp_path / "backlog" / "E0-F1-S1-T1.md").read_text()
+        assert "## Status: in-queue" in src
+        assert "[UNBLOCKED]" not in src
+
+    def test_mark_done_integration_triggers_regular_dep_cascade(self, tmp_path: Path) -> None:
+        """End-to-end: mark_done(B) flips A (regular-dep blocked, no marker) to in-queue.
+
+        Mirrors the marker-cascade integration test but exercises the
+        regular-dep path that was missing pre-fix (#208).
+        """
+        from devbench.constants import ALL_REQUIRED_JUDGE_NAMES as JUDGES
+
+        sync_blocked_audit = (
+            "[2026-05-11 20:13 UTC] [backlog_manager] "
+            "[BLOCKED] sync-blocked: dependency 'E0-F1-S1-T2' not yet terminal\n"
+        )
+        src_file = _unit_body(
+            "E0-F1-S1-T1",
+            "blocked",
+            deps=["E0-F1-S1-T2"],
+            comments=sync_blocked_audit,
+        )
+        review_passes = "\n".join(f"[2026-04-19 14:05 UTC] [judge/{judge}] [REVIEW_PASS] ok" for judge in JUDGES)
+        dep_file = _unit_body("E0-F1-S1-T2", "in-review", comments=review_passes + "\n")
+        index = _write_workspace(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Dependent", "blocked"),
+                ("E0-F1-S1-T2", "Dep", "in-review"),
+            ],
+            files={"E0-F1-S1-T1": src_file, "E0-F1-S1-T2": dep_file},
+        )
+
+        mgr = BacklogManager()
+        dep_path = tmp_path / "backlog" / "E0-F1-S1-T2.md"
+        mgr.mark_done(dep_path, index, "E0-F1-S1-T2")
+
+        src = (tmp_path / "backlog" / "E0-F1-S1-T1.md").read_text()
+        assert "## Status: in-queue" in src
+        assert "[UNBLOCKED]" in src
+        assert "[CASCADE_RESOLVED]" in src
+
+
 class TestParseCandidateDependencies:
     """Coverage of the inline dependency-table parser used by the auto-requeue scan."""
 

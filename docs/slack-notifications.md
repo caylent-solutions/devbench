@@ -161,7 +161,7 @@ Every event toggle, when it fires, and what's in the payload:
 | Toggle | Fires when | Payload fields |
 |---|---|---|
 | `work_unit_done` | A task transitions to `done`. | Task id, title. |
-| `work_unit_blocked_operator` | A task is blocked AND the classifier flags it as `OPERATOR_ACTION_REQUIRED` (auto-clearing blocks do **not** fire). | Task id, title, reason. |
+| `work_unit_blocked_operator` | A task is blocked AND the classifier flags it as `OPERATOR_ACTION_REQUIRED` (auto-clearing blocks do **not** fire). Fires on every transition *into* the `OPERATOR_ACTION_REQUIRED` bucket — including reclassification of a task that was already blocked but later drifted into that bucket because a `[BLOCKED]` audit went stale (#207). Idempotent: once notified, repeated classifications of the same task do not re-ping until the task exits and re-enters the bucket. | Task id, title, reason. |
 | `work_unit_materialised` | A draft WU file is written from a proposal. | New task id, title, source task id. |
 | `work_unit_promoted` | A draft WU is promoted to `in-queue`. | Task id, title. |
 | `pr_opened` | `gh pr create` succeeded for a work unit. | Task id, repo, PR URL. |

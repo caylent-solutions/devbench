@@ -375,6 +375,61 @@ since the last release. PR #119 carries every change.
 
 ### Fixed
 
+- **`work_unit_blocked_operator` Slack notification now fires on every
+  transition into `OPERATOR_ACTION_REQUIRED`** (issue #207). Before this
+  fix the ping was one-shot at `mark_blocked` time only; a task that
+  entered `blocked` with classification `AWAITING_DEPENDENCY` (silent,
+  correct) and later drifted into `OPERATOR_ACTION_REQUIRED` -- because
+  a dep landed but the cascade missed it (#208) or a `[BLOCKED]` audit
+  went stale -- left the operator silently uninformed.  A new
+  per-workspace classification cache at
+  `<workspace>/.devbench/notification-state.json` tracks each task's
+  last-observed classification; the new
+  `notify_blocked_operator_transition` helper in
+  `src/devbench/notifications.py` fires exactly once per transition into
+  the `OPERATOR_ACTION_REQUIRED` bucket and is wired into `mark_blocked`,
+  `cmd_sync_blocked`, and `cmd_reconcile_cascade`.  Read-only renderers
+  (`devbench status`, `devbench report`) still classify on every refresh
+  but do NOT route through the notifier so they cannot duplicate pings.
+  Cache failures (missing dir, corrupt JSON, non-object payload) are
+  best-effort -- treated as empty cache, regenerated on next write,
+  logged as `[WARN]` without aborting the orchestrator.  Pinned by
+  `tests/test_notifications_transition.py` (9 cases: first-time fire,
+  idempotent re-call, transition into / out of bucket, event-disabled
+  short-circuit, corrupt-cache + non-dict-payload recovery, multi-task
+  independent tracking).
+
+- **Auto-requeue cascade now covers regular task-level dependencies, not
+  only `promoted_proposals`** (issue #208, follow-up to #147). Before
+  this fix, `mark_done(B)` fired the cascade only for tasks linked via
+  `[BLOCKED_PENDING_PROPOSAL]` markers; tasks whose `Dependencies` table
+  named B but carried no marker stayed in `blocked` indefinitely.  The
+  new `BacklogManager._auto_requeue_regular_dep_dependents` helper in
+  `src/devbench/backlog/manager.py` is called from `_set_status`
+  alongside the existing marker cascade and unblocks blocked tasks whose
+  regular `Dependencies` table entries are now all terminal AND that
+  carry no `[BLOCKED_PENDING_PROPOSAL]` marker (the marker cascade owns
+  those).  Each flip writes a `[UNBLOCKED] [CASCADE_RESOLVED] dependency
+  '<dep_id>' now terminal` audit comment matching the supersession shape
+  used by `cmd_sync_blocked` and the marker cascade (#153). Pinned by
+  `tests/test_backlog/test_manager.py::TestAutoRequeueRegularDepDependents`
+  (6 cases including mark_done-driven end-to-end integration).
+
+- **`scope.json` non-object top-level payload now fails fast with an
+  actionable error** (issue #205). Before this fix a top-level JSON
+  list (`[]`, `[1, 2]`), bare string, integer, `null`, or `true` reached
+  the per-field shape check at `src/devbench/scope.py:444-450` via
+  `data[field_name]`, which raised the raw Python `TypeError: list
+  indices must be integers or slices, not str` -- the operator saw the
+  implementation detail and not the recovery step.  A new top-level
+  `isinstance(data, dict)` guard rejects any non-object payload with a
+  message naming the file path and the fix step (`remove and re-run
+  'devbench start --include ...' to recreate`).  Mirrored in
+  `_read_scope_banner_data` (`src/devbench/cli.py`) which previously
+  silently coerced `[]` into `{}` via `dict(json.loads(...))`. Pinned
+  by `tests/test_scope.py::test_from_file_non_object_top_level_raises`
+  (6 parametrised shape cases).
+
 - **`devbench status` Backlog Status Summary count column right-aligns to a
   single column across every row** (issue #201). Before this fix three
   different label-pad widths (`{label:<15}` for top-level rows, `{label:<28}`

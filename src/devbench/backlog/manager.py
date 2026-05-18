@@ -230,8 +230,8 @@ class BacklogManager:
         # All notification helpers are best-effort and gated by per-event
         # toggles in devbench.yaml; safe to call unconditionally.
         try:
-            from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
-            from devbench.notifications import notify_work_unit_blocked_operator
+            from devbench.backlog.proposal import classify_blocked_task
+            from devbench.notifications import notify_blocked_operator_transition
 
             workspace_root = backlog_index.parent
             state = classify_blocked_task(
@@ -240,9 +240,14 @@ class BacklogManager:
                 unit_id,
                 workspace_root=workspace_root,
             )
-            if state is BlockedTaskState.OPERATOR_ACTION_REQUIRED:
-                title = _extract_wu_title(work_unit_path, unit_id)
-                notify_work_unit_blocked_operator(unit_id, title, reason)
+            title = _extract_wu_title(work_unit_path, unit_id)
+            # Issue #207: routes through the transition-aware helper so the
+            # ping fires on every transition INTO OPERATOR_ACTION_REQUIRED,
+            # not only at this initial mark_blocked call.  ``cmd_sync_blocked``
+            # and ``cmd_reconcile_cascade`` re-classify already-blocked tasks
+            # and call the same helper so a stale ``[BLOCKED]`` audit later
+            # reclassified as OPERATOR_ACTION_REQUIRED still surfaces.
+            notify_blocked_operator_transition(unit_id, title, reason, state.name, workspace_root)
         except (OSError, ValueError, ImportError):
             # Classifier I/O failures should not block the status write.
             pass
@@ -1059,6 +1064,12 @@ class BacklogManager:
                 # non-terminal and correctly declines to promote the parent
                 # to done.
                 self._auto_requeue_marker_dependents(backlog_index, unit_id)
+                # Issue #208 follow-up: the marker cascade only covers tasks
+                # carrying a ``[BLOCKED_PENDING_PROPOSAL]`` marker. Tasks that
+                # landed in ``blocked`` via ``cmd_sync_blocked`` (regular
+                # Dependencies table, no marker) were marooned. The regular-dep
+                # cascade closes that gap.
+                self._auto_requeue_regular_dep_dependents(backlog_index, unit_id)
             if canonical == STATUS_DONE:
                 self._rollup_parent_status(backlog_index, unit_id)
 
@@ -1244,6 +1255,88 @@ class BacklogManager:
                 candidate_file,
                 "backlog_manager",
                 f"[AUTO_UNBLOCKED] [CASCADE_RESOLVED] promoted proposals {sorted_markers} are terminal; re-queuing",
+            )
+
+    def _auto_requeue_regular_dep_dependents(self, backlog_index: Path, newly_done_id: str) -> None:
+        """Auto-requeue blocked tasks whose regular Dependencies-table deps are now all terminal.
+
+        Issue #208 (companion to issue #147). The marker cascade in
+        :meth:`_auto_requeue_marker_dependents` only handles blocked tasks
+        carrying a ``[BLOCKED_PENDING_PROPOSAL]`` marker. Tasks that landed
+        in ``blocked`` via ``cmd_sync_blocked`` (regular Dependencies-table
+        deps unsatisfied, no marker) were marooned: even after the dep
+        transitioned to ``done``, the task stayed blocked indefinitely. An
+        operator had to run ``devbench sync-blocked`` or
+        ``devbench reconcile-cascade`` manually.
+
+        Narrow trigger. A blocked candidate is auto-requeued only when ALL
+        of the following hold:
+
+        1. Its status is ``blocked``.
+        2. It carries NO ``[BLOCKED_PENDING_PROPOSAL]`` marker (those are
+           owned by the marker cascade -- double-handling would produce
+           conflicting audit comments).
+        3. The just-completed task (``newly_done_id``) appears in its
+           declared Dependencies table.
+        4. Every other entry in its Dependencies table is in a terminal
+           state (``done`` or ``declined``).
+
+        The transition uses :meth:`force_status` and writes a single
+        ``[UNBLOCKED] [CASCADE_RESOLVED]`` audit comment naming the dep
+        whose completion triggered the cascade. The supersession audit
+        shape mirrors the marker cascade and ``cmd_sync_blocked`` so the
+        status-panel renderer treats all three uniformly (#153).
+
+        Args:
+            backlog_index: Path to ``BACKLOG.md``.
+            newly_done_id: The task that just transitioned to a terminal state.
+        """
+        try:
+            rows = self._parse_backlog_rows(backlog_index)
+        except FileNotFoundError as exc:
+            self.logger.warning("Regular-dep auto-requeue scan skipped -- %s", exc)
+            return
+
+        terminal_ids = {row_id for row_id, status, _ in rows if row_id and status in _TERMINAL_CHILD_STATUSES}
+        workspace = backlog_index.parent
+
+        for row_id, status, file_path in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if status != STATUS_BLOCKED:
+                continue
+            if not file_path:
+                continue
+            candidate_file = workspace / file_path
+            if not candidate_file.exists():
+                self.logger.warning(
+                    "Regular-dep auto-requeue scan: candidate file missing for %s at %s -- skipping",
+                    row_id,
+                    candidate_file,
+                )
+                continue
+
+            # Marker cascade owns marker-bearing candidates.
+            if self._extract_pending_proposal_markers(candidate_file):
+                continue
+
+            content = candidate_file.read_text(encoding="utf-8")
+            declared_deps = self._parse_candidate_dependencies(content)
+            if newly_done_id not in declared_deps:
+                continue
+            if not set(declared_deps).issubset(terminal_ids):
+                continue
+
+            self.logger.info(
+                "Auto-requeuing %s -- regular dependency %r now terminal",
+                row_id,
+                newly_done_id,
+            )
+            self.force_status(candidate_file, backlog_index, row_id, STATUS_IN_QUEUE)
+            self._append_agent_comment(
+                candidate_file,
+                "backlog_manager",
+                f"[UNBLOCKED] [CASCADE_RESOLVED] dependency {newly_done_id!r} now terminal; re-queuing",
             )
 
     @staticmethod

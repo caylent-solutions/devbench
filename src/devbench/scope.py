@@ -439,6 +439,13 @@ class ScopeFilter:
                 f"scope.json not found at '{scope_path}'. Run 'devbench start --include ...' to create one."
             )
         data = json.loads(scope_path.read_text())
+        if not isinstance(data, dict):
+            raise TypeError(
+                f"scope.json top-level payload must be an object, "
+                f"got {type(data).__name__!r}. "
+                f"The file at '{scope_path}' may be corrupt -- "
+                f"remove it and re-run 'devbench start --include ...' to recreate it."
+            )
         for field_name in ("include", "exclude", "expanded_ids"):
             value = data[field_name]
             if not isinstance(value, list):

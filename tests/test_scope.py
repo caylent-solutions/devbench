@@ -736,6 +736,36 @@ def test_from_file_invalid_field_type_raises(tmp_path: Path, bad_payload: dict) 
         ScopeFilter.from_file(tmp_path)
 
 
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "bad_top_level",
+    [
+        "[]",  # empty list
+        "[1, 2, 3]",  # non-empty list
+        '"a-bare-string"',  # bare string
+        "42",  # bare integer
+        "null",  # JSON null
+        "true",  # JSON bool
+    ],
+)
+def test_from_file_non_object_top_level_raises(tmp_path: Path, bad_top_level: str) -> None:
+    """from_file raises TypeError with an actionable message when scope.json's
+    top-level payload is not a JSON object (#205).
+
+    Before the fix, a top-level list payload reached the per-field shape check
+    via ``data[field_name]``, which raised the raw Python ``TypeError: list
+    indices must be integers or slices, not str`` (or analogue) and leaked the
+    implementation detail to the operator. The fail-fast guard now rejects the
+    bad top-level shape with a message naming the file path and the recovery
+    step.
+    """
+    scope_dir = tmp_path / ".devbench"
+    scope_dir.mkdir(parents=True)
+    (scope_dir / "scope.json").write_text(bad_top_level)
+    with pytest.raises(TypeError, match="top-level payload must be an object"):
+        ScopeFilter.from_file(tmp_path)
+
+
 # ---------------------------------------------------------------------------
 # Optional path= parameter on to_file() and clear()
 # ---------------------------------------------------------------------------

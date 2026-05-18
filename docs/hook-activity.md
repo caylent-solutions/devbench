@@ -15,7 +15,7 @@ one line at the bottom; history never redraws.
 ## Usage
 
 ```bash
-# Tail the default workspace hook log ($JUDGE_WORKSPACE_ROOT/hook-logs.jsonl).
+# Tail the default workspace hook log ($DEVBENCH_WORKSPACE_ROOT/hook-logs.jsonl).
 devbench hook-tail
 
 # Tail a specific file.
@@ -87,7 +87,7 @@ suffix). `hook-tail` converts at display time.
 - **Default:** OS local timezone, resolved via `datetime.now().astimezone()`.
 - **Workspace-level override:** set `display_timezone:` at the top level of
   `backlog/config/devbench.yaml` (IANA name), or export
-  `JUDGE_DISPLAY_TIMEZONE=<iana-name>`. Applies to every timestamp-rendering
+  `DEVBENCH_DISPLAY_TIMEZONE=<iana-name>`. Applies to every timestamp-rendering
   command (`report`, `hook-tail`, `watch`, future commands).
 - **Per-invocation override:** `--tz <iana-name>` on the `hook-tail` command
   wins over both of the above. Any IANA zoneinfo name works, e.g.

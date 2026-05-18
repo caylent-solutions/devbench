@@ -207,7 +207,7 @@ Use when:
 | Layer | Knob |
 |-------|------|
 | YAML | `git_ops.pause_before_merge: bool` |
-| Env | `JUDGE_PAUSE_BEFORE_MERGE` (truthy / falsy) |
+| Env | `DEVBENCH_PAUSE_BEFORE_MERGE` (truthy / falsy) |
 
 Both layers compose with the standard env > YAML > default precedence.
 

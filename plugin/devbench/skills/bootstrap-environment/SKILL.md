@@ -191,3 +191,28 @@ If any repo was escalated, remind the operator:
 If all repos succeeded:
 
 > "All repos are bootstrapped and `make validate` is green. You are ready to run `make start` or invoke the `configure-devbench` skill to tune your devbench.yaml."
+
+---
+
+## Self-critique loop (bounded)
+
+The retry loop on a failing `make validate` must terminate -- either when
+every repo reports PASS (success) or when the iteration budget is exhausted
+(escalation). Use the helpers in `src/devbench/skill_state.py`:
+
+- Before retrying a repo, call
+  `read_checkpoint("bootstrap-environment", workspace_root)` to read the
+  previous counter (returns `None` on the first pass).
+- When all repos pass `make validate`
+  (`unresolved_count <= SKILL_QUALITY_THRESHOLD`), call
+  `emit_audit("bootstrap-environment", SKILL_AUDIT_QUALITY_THRESHOLD_REACHED, {...}, workspace_root)`
+  and exit success.
+- Otherwise increment the checkpoint via `write_checkpoint(...)` and retry.
+- When the iteration reaches `SKILL_MAX_ITERATIONS` (defined in
+  `src/devbench/constants.py`), call
+  `emit_audit("bootstrap-environment", SKILL_AUDIT_MAX_ITERATIONS_REACHED, {"unresolved": ...}, workspace_root)`
+  and exit non-zero with the `[ESCALATE]` message so the operator can intervene.
+
+The audit tags `[SKILL_MAX_ITERATIONS_REACHED]` and
+`[SKILL_QUALITY_THRESHOLD_REACHED]` flow through the existing report and
+hook-tail pipelines without any new infrastructure.

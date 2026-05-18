@@ -631,7 +631,7 @@ class TestResolveDrainSignalPath:
 
     @pytest.mark.unit
     def test_session_path_is_relative_to_workspace_arg(self, tmp_path: Path) -> None:
-        """Per-session drain path is always relative to the ``workspace`` argument, not JUDGE_WORKSPACE_ROOT."""
+        """Per-session drain path is always relative to the ``workspace`` argument, not DEVBENCH_WORKSPACE_ROOT."""
         other_path = tmp_path / "other-workspace"
         with patch.dict(os.environ, {"DEVBENCH_SESSION_NAME": "sess"}, clear=False):
             result_a = resolve_drain_signal_path(tmp_path)
@@ -668,7 +668,7 @@ class TestPerSessionDrainHelpers:
 
         Only ``DEVBENCH_SESSION_NAME`` is needed -- the session path is always
         relative to the ``workspace`` argument passed to drain helpers, so
-        ``JUDGE_WORKSPACE_ROOT`` is not consulted by ``drain.py``.
+        ``DEVBENCH_WORKSPACE_ROOT`` is not consulted by ``drain.py``.
         """
         return {
             "DEVBENCH_SESSION_NAME": name,

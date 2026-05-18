@@ -144,3 +144,20 @@ recovery probe interval, webhook notifications, or the on-exhaustion action.
 - [`sample-config.yaml`](../../sample-config.yaml) -- reference config with every possible key
 - [`docs/zero-to-ready.md`](../zero-to-ready.md) -- Step 7 (manual config authoring alternative)
 - [`docs/onboarding.md`](../onboarding.md) -- chained-skill operator workflow
+
+## Bounded self-critique loop
+
+The re-prompt loop that fires on invalid YAML values is bounded by constants
+in `src/devbench/constants.py`:
+
+- `SKILL_MAX_ITERATIONS` -- maximum re-prompts before the skill emits
+  `[SKILL_MAX_ITERATIONS_REACHED]` and exits non-zero.
+- `SKILL_QUALITY_THRESHOLD` -- unresolved-value count at which the skill
+  emits `[SKILL_QUALITY_THRESHOLD_REACHED]` and exits success.
+
+State persistence and audit emission are handled by
+`src/devbench/skill_state.py` (`read_checkpoint`, `write_checkpoint`,
+`emit_audit`). The checkpoint file lives at
+`<workspace>/.devbench/skill-state/configure-devbench.json` between
+iterations. The audit tags flow through `devbench report` and
+`devbench hook-tail`.

@@ -1512,3 +1512,63 @@ class TestConfigureDevbenchSkillRoundTripValidation:
         assert "devbench.yaml" in content, (
             "configure-devbench/SKILL.md must write backlog/config/devbench.yaml as its output"
         )
+
+
+_ONBOARDING_SKILL_PATHS = {
+    "create-spec": CREATE_SPEC_SKILL_PATH,
+    "spec-to-backlog": SPEC_TO_BACKLOG_SKILL_PATH,
+    "bootstrap-environment": (
+        Path(__file__).parent.parent.parent / "plugin" / "devbench" / "skills" / "bootstrap-environment" / "SKILL.md"
+    ),
+    "configure-devbench": (
+        Path(__file__).parent.parent.parent / "plugin" / "devbench" / "skills" / "configure-devbench" / "SKILL.md"
+    ),
+}
+
+
+@pytest.mark.unit
+class TestBoundedSelfCritiqueLoop:
+    """Issue #204: every onboarding skill documents a bounded self-critique loop.
+
+    Each SKILL.md must contain a `## Self-critique loop (bounded)` heading and
+    reference the constants defined in ``src/devbench/constants.py`` by name so
+    the operator-facing contract is observable in the doc and the runtime
+    enforcement points at the same symbols.
+    """
+
+    @pytest.mark.parametrize("skill_name", sorted(_ONBOARDING_SKILL_PATHS))
+    def test_skill_has_bounded_loop_section(self, skill_name: str) -> None:
+        content = _ONBOARDING_SKILL_PATHS[skill_name].read_text(encoding="utf-8")
+        assert "## Self-critique loop (bounded)" in content, (
+            f"{skill_name}/SKILL.md must declare a `## Self-critique loop (bounded)` section "
+            "to document the iteration-budget contract (issue #204)."
+        )
+
+    @pytest.mark.parametrize("skill_name", sorted(_ONBOARDING_SKILL_PATHS))
+    def test_skill_references_max_iterations_constant(self, skill_name: str) -> None:
+        content = _ONBOARDING_SKILL_PATHS[skill_name].read_text(encoding="utf-8")
+        assert "SKILL_MAX_ITERATIONS" in content, f"{skill_name}/SKILL.md must reference SKILL_MAX_ITERATIONS by name."
+
+    @pytest.mark.parametrize("skill_name", sorted(_ONBOARDING_SKILL_PATHS))
+    def test_skill_references_quality_threshold_constant(self, skill_name: str) -> None:
+        content = _ONBOARDING_SKILL_PATHS[skill_name].read_text(encoding="utf-8")
+        assert "SKILL_QUALITY_THRESHOLD" in content, (
+            f"{skill_name}/SKILL.md must reference SKILL_QUALITY_THRESHOLD by name."
+        )
+
+    @pytest.mark.parametrize("skill_name", sorted(_ONBOARDING_SKILL_PATHS))
+    def test_skill_references_audit_tag_constants(self, skill_name: str) -> None:
+        content = _ONBOARDING_SKILL_PATHS[skill_name].read_text(encoding="utf-8")
+        for symbol in (
+            "SKILL_AUDIT_MAX_ITERATIONS_REACHED",
+            "SKILL_AUDIT_QUALITY_THRESHOLD_REACHED",
+        ):
+            assert symbol in content, f"{skill_name}/SKILL.md must reference {symbol} by name."
+
+    @pytest.mark.parametrize("skill_name", sorted(_ONBOARDING_SKILL_PATHS))
+    def test_skill_uses_own_name_in_helper_calls(self, skill_name: str) -> None:
+        """The SKILL.md prose calls helpers with the matching skill name string."""
+        content = _ONBOARDING_SKILL_PATHS[skill_name].read_text(encoding="utf-8")
+        assert f'"{skill_name}"' in content, (
+            f"{skill_name}/SKILL.md must reference its own name string in helper-call examples."
+        )

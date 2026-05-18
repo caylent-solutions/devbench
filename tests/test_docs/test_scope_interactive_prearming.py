@@ -183,7 +183,7 @@ class TestCliReferenceSessionIntegrationNote:
         assert scope_section, "### `scope` section must exist in cli-reference.md"
         has_session = (
             "DEVBENCH_SESSION_NAME" in scope_section
-            or "JUDGE_SESSION_NAME" in scope_section
+            or "DEVBENCH_SESSION_NAME" in scope_section
             or "sessions/<name>" in scope_section
             or "session" in scope_section.lower()
         )

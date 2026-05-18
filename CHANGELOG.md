@@ -54,7 +54,7 @@ since the last release. PR #119 carries every change.
   back to the canonical install. New CLI command `devbench
   prepare-plugin-shadow` builds the same shadow standalone for interactive
   launchers (`claude --plugin-dir "$(devbench prepare-plugin-shadow)"`).
-  `JUDGE_AGENT_MODEL_<NAME>` env vars override the YAML block on a per-call
+  `DEVBENCH_AGENT_MODEL_<NAME>` (or `JUDGE_AGENT_MODEL_<NAME>` for the five review judges + review-supervisor) env vars override the YAML block on a per-call
   basis (env > yaml > frontmatter). Defaults preserved: workspaces without
   an `agents:` block build no shadow and use the canonical plugin path,
   bit-identical to pre-feature behaviour. See `docs/adr/25-per-agent-model-overrides.md`.
@@ -125,7 +125,7 @@ since the last release. PR #119 carries every change.
   Ansible suite for unattended / multi-operator orchestrate runs.
   `devbench-session` per-user multi-session launcher. End-to-end guide
   at `docs/remote-ec2-setup.md`.
-- **E230 `JUDGE_ORCHESTRATOR_SESSION_ID` filter**: hook-tail
+- **E230 `DEVBENCH_ORCHESTRATOR_SESSION_ID` filter**: hook-tail
   `--orchestrator-only` flag isolates events per orchestrator session.
 - **Inline orphan-cleanup chore commit (Phase 1)**: `cmd_git_ops` now
   runs `cleanup_tracked_orphans` programmatically and lands a chore
@@ -187,7 +187,7 @@ since the last release. PR #119 carries every change.
 - **Bounded recovery-cascade depth** (issue #144). Proposals carry a
   `cascade_depth` field (`parent_depth + 1`); the new
   `orchestrate.max_cascade_depth` YAML knob (default 2, env override
-  `JUDGE_ORCHESTRATE_MAX_CASCADE_DEPTH`) caps recursion. At cap, the
+  `DEVBENCH_ORCHESTRATE_MAX_CASCADE_DEPTH`) caps recursion. At cap, the
   source task transitions to `NEEDS_OPERATOR_ATTENTION` rather than
   materialising a deeper draft. Pinned by
   `tests/test_backlog/test_proposal_lifecycle_hardening.py::TestEnforceCascadeDepth`.
@@ -249,7 +249,7 @@ since the last release. PR #119 carries every change.
   `stop_hook.window_seconds`, `[ORCHESTRATOR STOPPED]` (red) when
   past that window (with elapsed-since duration + last-seen
   timestamp), `[ORCHESTRATOR STARTING]` (yellow) when the log file
-  is missing or empty. Includes the `JUDGE_ORCHESTRATOR_SESSION_ID`
+  is missing or empty. Includes the `DEVBENCH_ORCHESTRATOR_SESSION_ID`
   suffix when set so multi-session operators can tell which session
   the report monitors. ANSI colour only when stdout is a TTY; pipes
   / CI redirects receive plain text. Refreshes on every
@@ -284,49 +284,22 @@ since the last release. PR #119 carries every change.
   `constants.py` is not affected -- the probe uses haiku intentionally for
   its minimal 1-token latency check, not as a work agent.
 
-- **`JUDGE_*` env-var namespace renamed to `DEVBENCH_*`** (#197). Every
-  devbench environment variable previously prefixed with `JUDGE_` now
-  carries the `DEVBENCH_` prefix. This is a hard cutover with no
-  deprecation period and no dual-acceptance fallback. Setting any legacy
-  `JUDGE_<NAME>` env var causes devbench to exit non-zero at process start
-  with a clear actionable error naming both the legacy and the new var and
-  directing the operator to `devbench migrate-env`. There is no fallback
-  logic: legacy presence is immediately rejected regardless of whether the
-  new `DEVBENCH_<NAME>` var is also set.
+- **Canonical environment-variable namespace is `DEVBENCH_*`** (#197).
+  Every operational env var is named `DEVBENCH_<NAME>` and is read by
+  `config.py` / `config_loader.py` / `log_setup.py` via simple
+  `os.environ.get` calls. Missing required vars (workspace root, Claude
+  model) fail fast at module-import time with a message that names the
+  expected var. No alias or fallback layer.
 
-  **Migration (one-shot):** Run `devbench migrate-env` (the only devbench
-  subcommand that bypasses the strict env-var checker). It reads your
-  current environment, identifies every set `JUDGE_*` var, and prints
-  `export DEVBENCH_<NAME>="$JUDGE_<NAME>"` plus `unset JUDGE_<NAME>` lines
-  on stdout. Source the output once before relaunching:
-
-  ```bash
-  eval "$(devbench migrate-env)"
-  ```
-
-  To write the script to a file instead of evaluating inline:
-
-  ```bash
-  devbench migrate-env --output migrate.sh && source migrate.sh
-  ```
-
-  **Operator checklist:**
-
-  1. Run `devbench migrate-env` to see which vars need renaming.
-  2. Update your shell RC file, CI/CD env blocks, and any launch scripts
-     that set `JUDGE_*` env vars to use `DEVBENCH_*` instead.
-  3. Unset all `JUDGE_*` env vars before relaunching the orchestrator.
-
-  The `JUDGE_ORCHESTRATOR_SESSION_ID`, `JUDGE_WORKSPACE_ROOT`, and
-  `JUDGE_CLAUDE_MODEL` vars are among the most commonly set; their
-  replacements are `DEVBENCH_ORCHESTRATOR_SESSION_ID`,
-  `DEVBENCH_WORKSPACE_ROOT`, and `DEVBENCH_CLAUDE_MODEL` respectively.
-
-  **Not renamed (LLM-as-judge concept names survive intact):**
-  `KNOWN_JUDGE_NAMES`, `REVIEW_JUDGE_NAMES`, `SECURITY_JUDGE_NAMES`,
-  `ALL_REQUIRED_JUDGE_NAMES`, `WORKFLOW_AGENT_JUDGE_NAMES`,
-  `JUDGE_AGENT_ROLE` (ADR-15 bypass), `[JUDGE_*_VERDICT]` audit format.
-  These refer to the LLM-as-judge concept which the rename does not touch.
+  **Identifiers preserved under the LLM-as-judge concept** (kept as
+  `JUDGE_*` because they refer to judges, not to the environment-variable
+  namespace): `KNOWN_JUDGE_NAMES`, `REVIEW_JUDGE_NAMES`,
+  `SECURITY_JUDGE_NAMES`, `ALL_REQUIRED_JUDGE_NAMES`,
+  `WORKFLOW_AGENT_JUDGE_NAMES`, `JUDGE_CATEGORIES`, `JUDGE_SEVERITY_ORDER`,
+  the per-judge model env vars
+  (`JUDGE_AGENT_MODEL_{CODE_REVIEWER, TEST_REVIEWER, DOC_REVIEWER,
+  SECURITY_REVIEWER, CHANGES_MANIFEST, REVIEW_SUPERVISOR}`), and the
+  `[JUDGE_*_VERDICT]` audit-row tag format.
 
 ### Changed (model defaults)
 
@@ -344,6 +317,48 @@ since the last release. PR #119 carries every change.
   to warn operators against pinning ANY work agent to `haiku`. The short
   name `haiku` is still accepted by the YAML parser so operators can
   experiment, but every documented role default avoids it.
+
+### Added
+
+- **Bounded skill iterate-until-perfect mechanism** (issue #204, spec
+  section 4.6.0). The four onboarding skills (`create-spec`,
+  `spec-to-backlog`, `bootstrap-environment`, `configure-devbench`)
+  previously described their self-critique loops in `SKILL.md` prose only,
+  with no observable iteration bound or escalation audit. The loop is now
+  enforced by a small support module plus five new constants:
+
+  - `src/devbench/constants.py` adds `SKILL_MAX_ITERATIONS`,
+    `SKILL_QUALITY_THRESHOLD`, `SKILL_STATE_DIR_NAME`,
+    `SKILL_AUDIT_MAX_ITERATIONS_REACHED`, and
+    `SKILL_AUDIT_QUALITY_THRESHOLD_REACHED`.
+  - `src/devbench/skill_state.py` (new module) provides `SkillState`
+    dataclass plus `read_checkpoint`, `write_checkpoint` (atomic
+    temp-then-rename), and `emit_audit` (structured audit row appended
+    to the orchestrator log).
+  - Each skill's `SKILL.md` and `docs/skills/*.md` now documents a
+    `## Self-critique loop (bounded)` section that names the constants and
+    explains the read-increment-write-audit-terminate sequence.
+  - `tests/test_skill_state.py` (new) drives the helpers to 100% line +
+    branch coverage; `tests/test_constants.py` asserts the new constants
+    are present with the right shapes; `tests/test_plugin/test_skill_structure.py`
+    asserts every onboarding `SKILL.md` documents the bounded loop and
+    references the constant symbols.
+
+  Operators see iteration exhaustion as `[SKILL_MAX_ITERATIONS_REACHED]`
+  in the existing `devbench report` / `devbench hook-tail` streams; no new
+  infrastructure is required.
+
+### Tests
+
+- **Direct coverage for `quota._http_post`** (issue #203). `_http_post` is
+  the network-level helper that `post_webhook` delegates to (HTTPS / HTTP
+  branch, path + query construction, `try` / `finally` close). Earlier
+  tests stubbed `_http_post` itself rather than driving it; the new
+  `TestHttpPostInternals` class in `tests/test_quota.py` patches
+  `http.client.HTTPSConnection` and `HTTPConnection` with `MagicMock`
+  factories and exercises every branch end-to-end without real network
+  I/O. Closes the only remaining coverage gap and brings
+  `src/devbench/quota.py` to 100% line + branch coverage.
 
 ### Fixed
 
@@ -533,7 +548,7 @@ since the last release. PR #119 carries every change.
   routing. `docs/architecture.md`, `docs/model-pricing.md`,
   `docs/llm-authentication.md`, `docs/cli-reference.md`, the example
   workspace's `README.md` and `devbench-commands.txt` updated to remove
-  references to the dead fields and to clarify that `JUDGE_CLAUDE_MODEL` is
+  references to the dead fields and to clarify that `DEVBENCH_CLAUDE_MODEL` is
   the SDK caller's model (orchestrate skill coordination calls), not a
   global per-role pin.
 
@@ -562,7 +577,7 @@ since the last release. PR #119 carries every change.
 - **CI-failure retry default flipped to ON** (issue #115). Default
   behaviour is rc=2 + executor retry; opt out via
   `git_ops.ci_failure_retry: false` in `devbench.yaml` or
-  `JUDGE_CI_FAILURE_RETRY_ENABLED=0`.
+  `DEVBENCH_CI_FAILURE_RETRY_ENABLED=0`.
 - **Review-supervisor scope guard** (issue #118): the
   `guard-review-supervisor-scope.sh` PreToolUse hook now also blocks
   Agent-tool subagent spawns whose subagent_type is not in the
@@ -574,10 +589,10 @@ since the last release. PR #119 carries every change.
 - **`wait_for_checks` workflow-registration race defence** (issue
   #114): "no checks reported" is now disambiguated via a local
   `<repo>/.github/workflows/*.y[a]ml` glob. Repos with workflow
-  files retry up to `JUDGE_CHECK_REGISTRATION_RETRIES` (default 12)
-  attempts spaced by `JUDGE_CHECK_REGISTRATION_DELAY_SECONDS`
+  files retry up to `DEVBENCH_CHECK_REGISTRATION_RETRIES` (default 12)
+  attempts spaced by `DEVBENCH_CHECK_REGISTRATION_DELAY_SECONDS`
   (default 5). On retry exhaustion, devbench refuses the merge.
-- **Workspace-layout doc rewritten** (issue #113): `JUDGE_WORKSPACE_ROOT`
+- **Workspace-layout doc rewritten** (issue #113): `DEVBENCH_WORKSPACE_ROOT`
   is the parent of `backlog/`, with target repos as siblings.
 - **Operator YAML field surface**: every PR-119 env-only knob now has
   a YAML equivalent. Operators set workspace-stable behaviour in
@@ -775,9 +790,9 @@ since the last release. PR #119 carries every change.
 - **`hook-tail` and other stream-rendering commands no longer emit a
   startup banner on stderr** (issue #132). The
   `judges.log_setup` "Logging to stderr and ..." informational line
-  was demoted from INFO to DEBUG, so the default JUDGE_LOG_LEVEL=INFO
+  was demoted from INFO to DEBUG, so the default DEVBENCH_LOG_LEVEL=INFO
   run is silent. Operators who want the banner back can set
-  JUDGE_LOG_LEVEL=DEBUG. New regression tests
+  DEVBENCH_LOG_LEVEL=DEBUG. New regression tests
   `tests/test_log_setup.py::TestStartupBannerDemoted` pin both the
   silent-at-INFO and visible-at-DEBUG behaviours.
 - **Stop-hook block decision honored under asdf-shimmed workspaces**
@@ -850,7 +865,7 @@ since the last release. PR #119 carries every change.
   (`AGENT_WIDTH`, `TOOL_WIDTH`, `DESCRIPTION_MAX`,
   `STDOUT_PREVIEW_MAX`) are now resolved env > YAML > default at
   module import. New top-level `hook_tail:` block in
-  `backlog/config/devbench.yaml`; new `JUDGE_HOOK_TAIL_*` env-var
+  `backlog/config/devbench.yaml`; new `DEVBENCH_HOOK_TAIL_*` env-var
   overrides. **Default `DESCRIPTION_MAX` bumped from 100 to 120** so
   multi-word agent descriptions are less likely to truncate
   mid-clause; other three defaults unchanged (12 / 8 / 80).
@@ -879,7 +894,7 @@ since the last release. PR #119 carries every change.
 ### Renamed / Removed
 
 - **`DEVBENCH_DISABLE_INLINE_ORPHAN_CLEANUP` env var renamed** to
-  `JUDGE_INLINE_ORPHAN_CLEANUP` (truthy/falsy, no longer opt-out).
+  `DEVBENCH_INLINE_ORPHAN_CLEANUP` (truthy/falsy, no longer opt-out).
   The asymmetric "DISABLE" form is removed; canonical naming aligns
   with every other toggle.
 
@@ -889,7 +904,7 @@ Operators upgrading from before this release:
 
 1. **Remove the old env-var name** (`DEVBENCH_DISABLE_INLINE_ORPHAN_CLEANUP`)
    from any orchestrator launch scripts and replace with
-   `JUDGE_INLINE_ORPHAN_CLEANUP=0` if you want to disable inline
+   `DEVBENCH_INLINE_ORPHAN_CLEANUP=0` if you want to disable inline
    cleanup. (Most operators leave it unset; the default is on.)
 2. **Decide on CI-retry**: the new default is on. To opt out for a
    specific backlog, add `git_ops.ci_failure_retry: false` to that

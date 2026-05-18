@@ -17,7 +17,7 @@ class TestParseIndex:
     def test_parse_index_from_actual_backlog(self, tmp_path: Path) -> None:
         """Parse the workspace BACKLOG.md file and verify results.
 
-        Reads ``JUDGE_WORKSPACE_ROOT`` from the environment when set
+        Reads ``DEVBENCH_WORKSPACE_ROOT`` from the environment when set
         (so CI runs against the live backlog), otherwise falls back to
         the pytest-supplied ``tmp_path`` -- never to a hardcoded
         ``/tmp/test-workspace`` (TD-6). When neither location holds a
@@ -26,7 +26,7 @@ class TestParseIndex:
         """
         import os
 
-        env_workspace = os.environ.get("JUDGE_WORKSPACE_ROOT")
+        env_workspace = os.environ.get("DEVBENCH_WORKSPACE_ROOT")
         workspace = Path(env_workspace) if env_workspace else tmp_path
         actual_backlog = workspace / "BACKLOG.md"
         if not actual_backlog.is_file():
@@ -122,7 +122,6 @@ class TestParseIndexFNFRetry:
     attempt re-raises with the original missing path intact."""
 
     def _build_minimal_backlog(self, tmp_path: Path) -> tuple[BacklogParser, Path]:
-        from unittest.mock import patch  # noqa: F401  # imported for clarity in calling tests
 
         backlog_dir = tmp_path / "backlog"
         backlog_dir.mkdir()

@@ -22,7 +22,7 @@
             },
             "checkout_directory": {
               "type": "string",
-              "description": "Relative path under JUDGE_WORKSPACE_ROOT for this repo's checkout."
+              "description": "Relative path under DEVBENCH_WORKSPACE_ROOT for this repo's checkout."
             },
             "merge_strategy": {
               "type": "string",
@@ -73,11 +73,11 @@
     },
     "display_timezone": {
       "type": ["string", "null"],
-      "description": "IANA timezone name (e.g. 'America/New_York', 'Europe/London') applied by every devbench command that renders timestamps -- `devbench report`, `devbench hook-tail`, `devbench watch`, and any future command. When unset, each command defaults to the OS local timezone. Override per-invocation via the JUDGE_DISPLAY_TIMEZONE env var. Report-specific `report.display_timezone` / JUDGE_REPORT_TIMEZONE take precedence over this top-level setting for the report command only."
+      "description": "IANA timezone name (e.g. 'America/New_York', 'Europe/London') applied by every devbench command that renders timestamps -- `devbench report`, `devbench hook-tail`, `devbench watch`, and any future command. When unset, each command defaults to the OS local timezone. Override per-invocation via the DEVBENCH_DISPLAY_TIMEZONE env var. Report-specific `report.display_timezone` / DEVBENCH_REPORT_TIMEZONE take precedence over this top-level setting for the report command only."
     },
     "log_file": {
       "type": ["string", "null"],
-      "description": "Workspace-relative path to the orchestrator's structured log file (for example 'logs/backlog-a-orchestrator.log'). When set, both `setup_logging` (the writer) and `cmd_report` (the reader) consult this single source of truth so the orchestrator and the report cannot read/write different files by accident. Per-invocation override via the JUDGE_LOG_FILE env var still takes precedence (useful for tests)."
+      "description": "Workspace-relative path to the orchestrator's structured log file (for example 'logs/backlog-a-orchestrator.log'). When set, both `setup_logging` (the writer) and `cmd_report` (the reader) consult this single source of truth so the orchestrator and the report cannot read/write different files by accident. Per-invocation override via the DEVBENCH_LOG_FILE env var still takes precedence (useful for tests)."
     },
     "timeouts": {
       "type": "object",
@@ -154,11 +154,11 @@
         },
         "inline_orphan_cleanup": {
           "type": "boolean",
-          "description": "When true (the default), cmd_git_ops runs cleanup_tracked_orphans inline as a devbench-authored chore commit before the task's commit when build/state orphan paths are detected. When false, falls back to the legacy proposal-task path. Phase 1 of the orphan-cascade fix. Override via JUDGE_INLINE_ORPHAN_CLEANUP."
+          "description": "When true (the default), cmd_git_ops runs cleanup_tracked_orphans inline as a devbench-authored chore commit before the task's commit when build/state orphan paths are detected. When false, falls back to the legacy proposal-task path. Phase 1 of the orphan-cascade fix. Override via DEVBENCH_INLINE_ORPHAN_CLEANUP."
         },
         "ci_failure_retry": {
           "type": "boolean",
-          "description": "When true (the default), cmd_git_ops returns rc=2 on CI failure to trigger an executor retry with the failing-job log as feedback. When false, returns rc=1 BLOCKED on the first CI failure (legacy behaviour). Issue #115. Override via JUDGE_CI_FAILURE_RETRY_ENABLED."
+          "description": "When true (the default), cmd_git_ops returns rc=2 on CI failure to trigger an executor retry with the failing-job log as feedback. When false, returns rc=1 BLOCKED on the first CI failure (legacy behaviour). Issue #115. Override via DEVBENCH_CI_FAILURE_RETRY_ENABLED."
         },
         "orphan_patterns": {
           "type": "array",
@@ -186,28 +186,28 @@
           "properties": {
             "enabled": {
               "type": "boolean",
-              "description": "Top-level toggle. When false (default), the entire phase is a no-op. Override via JUDGE_PR_REVIEW_RESOLUTION_ENABLED."
+              "description": "Top-level toggle. When false (default), the entire phase is a no-op. Override via DEVBENCH_PR_REVIEW_RESOLUTION_ENABLED."
             },
             "agents": {
               "type": "array",
               "items": {
                 "type": "string"
               },
-              "description": "Comma-separated allowlist of GitHub login names whose unresolved review comments block the merge. Empty default; populate when review bots are configured on the target repo. Override via JUDGE_PR_REVIEW_AGENTS."
+              "description": "Comma-separated allowlist of GitHub login names whose unresolved review comments block the merge. Empty default; populate when review bots are configured on the target repo. Override via DEVBENCH_PR_REVIEW_AGENTS."
             },
             "decision_blocks": {
               "type": "boolean",
-              "description": "When true (default), reviewDecision == CHANGES_REQUESTED hard-blocks the merge regardless of bot allowlist. Override via JUDGE_PR_REVIEW_DECISION_BLOCKS."
+              "description": "When true (default), reviewDecision == CHANGES_REQUESTED hard-blocks the merge regardless of bot allowlist. Override via DEVBENCH_PR_REVIEW_DECISION_BLOCKS."
             },
             "settle_seconds": {
               "type": "integer",
               "minimum": 1,
-              "description": "Total settle-window length in seconds for the PR review poll loop. Default 60. Override via JUDGE_PR_REVIEW_SETTLE_SECONDS."
+              "description": "Total settle-window length in seconds for the PR review poll loop. Default 60. Override via DEVBENCH_PR_REVIEW_SETTLE_SECONDS."
             },
             "poll_interval": {
               "type": "integer",
               "minimum": 1,
-              "description": "Per-poll cadence in seconds inside the settle window. Default 5. Override via JUDGE_PR_REVIEW_POLL_INTERVAL."
+              "description": "Per-poll cadence in seconds inside the settle window. Default 5. Override via DEVBENCH_PR_REVIEW_POLL_INTERVAL."
             }
           }
         }
@@ -307,7 +307,7 @@
         "ci_failure_log_bytes": {
           "type": "integer",
           "minimum": 1,
-          "description": "Byte cap for the trimmed failing-job log written to .devbench/ci-failures/<id>-<n>.log when ci_failure_retry is enabled. Default 32768. Override via JUDGE_CI_FAILURE_LOG_BYTES."
+          "description": "Byte cap for the trimmed failing-job log written to .devbench/ci-failures/<id>-<n>.log when ci_failure_retry is enabled. Default 32768. Override via DEVBENCH_CI_FAILURE_LOG_BYTES."
         }
       }
     },
@@ -319,17 +319,17 @@
         "check_registration_retries": {
           "type": "integer",
           "minimum": 1,
-          "description": "Number of times wait_for_checks retries gh pr checks when 'no checks reported' contradicts the local workflow-file glob (issue #114 race-defence). Default 12. Override via JUDGE_CHECK_REGISTRATION_RETRIES."
+          "description": "Number of times wait_for_checks retries gh pr checks when 'no checks reported' contradicts the local workflow-file glob (issue #114 race-defence). Default 12. Override via DEVBENCH_CHECK_REGISTRATION_RETRIES."
         },
         "check_registration_delay_seconds": {
           "type": "integer",
           "minimum": 1,
-          "description": "Sleep between check-registration retries, in seconds. Default 5. Override via JUDGE_CHECK_REGISTRATION_DELAY_SECONDS."
+          "description": "Sleep between check-registration retries, in seconds. Default 5. Override via DEVBENCH_CHECK_REGISTRATION_DELAY_SECONDS."
         },
         "blocked_recovery_window_seconds": {
           "type": "integer",
           "minimum": 1,
-          "description": "Recency cap for the AWAITING_AUTO_RECOVERY signal in the 3-state blocked-task classifier. Tasks whose most recent [BLOCKED] audit-comment timestamp is older than this window fall through to NEEDS_OPERATOR_ATTENTION. Default 1800. Override via JUDGE_BLOCKED_RECOVERY_WINDOW_SECONDS."
+          "description": "Recency cap for the AWAITING_AUTO_RECOVERY signal in the 3-state blocked-task classifier. Tasks whose most recent [BLOCKED] audit-comment timestamp is older than this window fall through to NEEDS_OPERATOR_ATTENTION. Default 1800. Override via DEVBENCH_BLOCKED_RECOVERY_WINDOW_SECONDS."
         }
       }
     },
@@ -348,7 +348,7 @@
         },
         "display_timezone": {
           "type": "string",
-          "description": "IANA timezone name (e.g. 'America/Denver', 'Europe/London') for displaying timestamps in `devbench report`. Defaults to the host system's local timezone. Useful when running inside a devcontainer or VM whose system TZ differs from your actual location. Override via JUDGE_REPORT_TIMEZONE env var."
+          "description": "IANA timezone name (e.g. 'America/Denver', 'Europe/London') for displaying timestamps in `devbench report`. Defaults to the host system's local timezone. Useful when running inside a devcontainer or VM whose system TZ differs from your actual location. Override via DEVBENCH_REPORT_TIMEZONE env var."
         },
         "cache_read_multiplier": {
           "type": "number",
@@ -373,13 +373,13 @@
         "recent_pace_tasks": {
           "type": "integer",
           "minimum": 1,
-          "description": "Number of most-recently-completed tasks averaged for the 'Recent pace' projection in `devbench report`. Defaults to 10. Lower for more responsiveness, higher for more stability. Override via JUDGE_REPORT_RECENT_PACE_TASKS env var."
+          "description": "Number of most-recently-completed tasks averaged for the 'Recent pace' projection in `devbench report`. Defaults to 10. Lower for more responsiveness, higher for more stability. Override via DEVBENCH_REPORT_RECENT_PACE_TASKS env var."
         },
         "token_cost_discount": {
           "type": "number",
           "minimum": 0.0,
           "maximum": 1.0,
-          "description": "Contract discount (correction factor) off list-price token cost, as a fraction in [0.0, 1.0]. final_cost = raw_list_cost * (1 - token_cost_discount). Default 0.0 (no discount, pay full list). Applies uniformly to every per-call cost and to every ETA projection; cache multipliers stay as pure ratios applied to the discounted base rate. Override via JUDGE_REPORT_TOKEN_COST_DISCOUNT env var. See docs/model-pricing.md."
+          "description": "Contract discount (correction factor) off list-price token cost, as a fraction in [0.0, 1.0]. final_cost = raw_list_cost * (1 - token_cost_discount). Default 0.0 (no discount, pay full list). Applies uniformly to every per-call cost and to every ETA projection; cache multipliers stay as pure ratios applied to the discounted base rate. Override via DEVBENCH_REPORT_TOKEN_COST_DISCOUNT env var. See docs/model-pricing.md."
         }
       }
     },

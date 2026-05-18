@@ -2,8 +2,8 @@
 
 This document is the canonical reference for every field in `backlog/config/devbench.yaml`.
 
-The YAML file is loaded from `<JUDGE_WORKSPACE_ROOT>/backlog/config/devbench.yaml` by default.
-Override the lookup path with `--config <path>` (CLI flag) or the `JUDGE_CONFIG_PATH` environment
+The YAML file is loaded from `<DEVBENCH_WORKSPACE_ROOT>/backlog/config/devbench.yaml` by default.
+Override the lookup path with `--config <path>` (CLI flag) or the `DEVBENCH_CONFIG_PATH` environment
 variable.
 
 **Source of truth:** `src/devbench/config_loader.py` (module docstring + dataclass docstrings) and
@@ -44,7 +44,7 @@ At least one entry is required. Each key must be in `org/repo` format.
 repos:
   caylent-solutions/devbench:
     default_branch: main          # optional -- omit to fall back to origin/HEAD
-    checkout_directory: devbench  # optional -- relative to JUDGE_WORKSPACE_ROOT
+    checkout_directory: devbench  # optional -- relative to DEVBENCH_WORKSPACE_ROOT
     merge_strategy: squash        # optional -- overrides top-level merge_strategy
 ```
 

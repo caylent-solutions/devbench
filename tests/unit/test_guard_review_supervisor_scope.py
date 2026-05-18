@@ -31,9 +31,8 @@ SCRIPT_PATH = (
 
 def _run_hook(payload: dict, env: dict | None = None) -> subprocess.CompletedProcess:
     """Invoke the hook with the given JSON payload + env."""
-    # Strip legacy JUDGE_WORKSPACE_ROOT and JUDGE_LOG_FILE: _hook_lib.sh rejects
     # these vars at source time (AC-197-9) and all hooks source _hook_lib.sh.
-    runtime_env = {k: v for k, v in os.environ.items() if k not in ("JUDGE_WORKSPACE_ROOT", "JUDGE_LOG_FILE")}
+    runtime_env = {k: v for k, v in os.environ.items() if k not in ("DEVBENCH_WORKSPACE_ROOT", "DEVBENCH_LOG_FILE")}
     if env:
         runtime_env.update(env)
     return subprocess.run(

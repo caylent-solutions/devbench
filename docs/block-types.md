@@ -150,7 +150,7 @@ targets complete.
 
 | Knob | Default | Description |
 |---|---|---|
-| `orchestrate.max_cascade_depth` env: `JUDGE_ORCHESTRATE_MAX_CASCADE_DEPTH` | Set in `constants.py` | Maximum depth the ADR-07 cascade will recurse when unblocking chained tasks. When the cascade depth reaches this cap the sweep stops and further descendants remain blocked. |
+| `orchestrate.max_cascade_depth` env: `DEVBENCH_ORCHESTRATE_MAX_CASCADE_DEPTH` | Set in `constants.py` | Maximum depth the ADR-07 cascade will recurse when unblocking chained tasks. When the cascade depth reaches this cap the sweep stops and further descendants remain blocked. |
 
 **Operator commands.**
 
@@ -259,7 +259,7 @@ orchestrator has run multiple times), inspect `.devbench/proposals/` and
 
 | Knob | Default | Description |
 |---|---|---|
-| `DEFAULT_BLOCKED_RECOVERY_WINDOW_SECONDS` env: `JUDGE_BLOCKED_RECOVERY_WINDOW_SECONDS` | Set in `constants.py` | Window within which a `[BLOCKED]` audit comment from a recovery agent counts as Signal 3. After this window expires, Signal 3 no longer fires and the task downgrades to `OPERATOR_ACTION_REQUIRED`. |
+| `DEFAULT_BLOCKED_RECOVERY_WINDOW_SECONDS` env: `DEVBENCH_BLOCKED_RECOVERY_WINDOW_SECONDS` | Set in `constants.py` | Window within which a `[BLOCKED]` audit comment from a recovery agent counts as Signal 3. After this window expires, Signal 3 no longer fires and the task downgrades to `OPERATOR_ACTION_REQUIRED`. |
 | `recovery_window_seconds` parameter | `None` (uses `DEFAULT_BLOCKED_RECOVERY_WINDOW_SECONDS`) | Per-call override for `classify_blocked_task`. Used in tests and the report panel to control the window. |
 | `manifest_amendment.enabled` | `false` | When `false`, the manifest-amender is disabled and no amendments are processed; the task cannot enter the rejected-amendment recovery loop (Signal 2 can never be triggered). Set to `true` to activate the amendment workflow. |
 | `task_factory.enabled` | `false` | When `false`, the task-factory loop does not run after amendment rejects; proposal JSON (Signal 1) is never written by this path. Requires `manifest_amendment.enabled: true` to activate. |

@@ -9,8 +9,8 @@ Usage::
 
 Options::
 
-    --config <path>         Path to devbench YAML config (sets JUDGE_CONFIG_PATH).
-                            Overrides the JUDGE_CONFIG_PATH environment variable.
+    --config <path>         Path to devbench YAML config (sets DEVBENCH_CONFIG_PATH).
+                            Overrides the DEVBENCH_CONFIG_PATH environment variable.
 
 Commands::
 
@@ -81,36 +81,19 @@ _TERMINAL_CLEAR_CMD: str | None = shutil.which("clear") or shutil.which("cls")
 
 
 # Pre-parse --config before any devbench imports so that config.py loads the
-# correct YAML at module import time (config.py reads JUDGE_CONFIG_PATH on import).
+# correct YAML at module import time (config.py reads DEVBENCH_CONFIG_PATH on import).
 def _pre_parse_config(argv: list[str]) -> None:
-    """Extract --config <path> from argv and set JUDGE_CONFIG_PATH env var."""
+    """Extract --config <path> from argv and set DEVBENCH_CONFIG_PATH env var."""
     for i, arg in enumerate(argv):
         if arg == "--config" and i + 1 < len(argv):
-            os.environ["JUDGE_CONFIG_PATH"] = argv[i + 1]
+            os.environ["DEVBENCH_CONFIG_PATH"] = argv[i + 1]
             # Remove --config and its value so downstream parsing is unaffected.
             argv.pop(i + 1)
             argv.pop(i)
             return
 
 
-def _pre_parse_migrate_env(argv: list[str]) -> None:
-    """Set DEVBENCH_BOOTSTRAP=1 when the command is ``migrate-env``.
-
-    This MUST run before ``devbench.config`` is imported because config.py
-    executes ``_read_env_strict`` at module level. The bootstrap flag disables
-    the legacy-name rejection in ``_read_env_strict`` so that
-    ``devbench migrate-env`` can be invoked even when JUDGE_* vars are still
-    set in the operator's shell (AC-197-7).
-
-    Args:
-        argv: The full ``sys.argv`` list (including the program name).
-    """
-    if len(argv) >= 2 and argv[1] == "migrate-env":
-        os.environ["DEVBENCH_BOOTSTRAP"] = "1"
-
-
 _pre_parse_config(sys.argv)
-_pre_parse_migrate_env(sys.argv)
 
 from devbench.backlog.amendment import (
     REVIEW_FAILURES_DIR_NAME,
@@ -165,7 +148,7 @@ from devbench.config import (
     RUNTIME_CONFIG,
     UPDATE_SUBMODULE,
     WORKSPACE_ROOT,
-    _read_env_strict,
+    _read_env,
     resolve_repo,
     validate_repo,
 )
@@ -2739,7 +2722,7 @@ def cmd_check() -> int:
 
     For every repo in ``backlog/config/devbench.yaml``'s ``repos:`` map, verify:
 
-    1. Symlink exists at ``$JUDGE_WORKSPACE_ROOT/<checkout_directory>``.
+    1. Symlink exists at ``$DEVBENCH_WORKSPACE_ROOT/<checkout_directory>``.
     2. Origin-remote check (mode-dependent):
 
        - Default mode: the symlink target (the local clone) MUST have an
@@ -2766,7 +2749,7 @@ def cmd_check() -> int:
     cfg_path = resolve_config_path(None, os.environ, WORKSPACE_ROOT)
     if cfg_path is None or not cfg_path.exists():
         print(
-            "ERROR: devbench.yaml not found; set JUDGE_CONFIG_PATH or place at backlog/config/devbench.yaml",
+            "ERROR: devbench.yaml not found; set DEVBENCH_CONFIG_PATH or place at backlog/config/devbench.yaml",
             file=sys.stderr,
         )
         return 1
@@ -2794,7 +2777,7 @@ def _resolve_log_file_path() -> Path:
 
     1. ``DEVBENCH_LOG_FILE`` environment variable set to an explicit path.
        Per-invocation override; used in tests and ad-hoc overrides.
-       Setting the legacy ``JUDGE_LOG_FILE`` raises ``RuntimeError``
+       Setting the legacy ``DEVBENCH_LOG_FILE`` raises ``RuntimeError``
        (AC-197-2: hard rejection, no fallback).
     2. ``RUNTIME_CONFIG.log_file`` from ``backlog/config/devbench.yaml``.
        Single source of truth: when the operator sets it once in YAML,
@@ -2808,10 +2791,10 @@ def _resolve_log_file_path() -> Path:
        this path is always deterministic.
 
     Raises:
-        RuntimeError: when the legacy ``JUDGE_LOG_FILE`` env var is set
+        RuntimeError: when the legacy ``DEVBENCH_LOG_FILE`` env var is set
             (AC-197-2).
     """
-    explicit = (_read_env_strict("DEVBENCH_LOG_FILE", "JUDGE_LOG_FILE") or "").strip()
+    explicit = (_read_env("DEVBENCH_LOG_FILE") or "").strip()
     if explicit:
         return Path(explicit)
     configured = (RUNTIME_CONFIG.log_file or "").strip()
@@ -3716,7 +3699,7 @@ def _run_inline_cleanup_steps(
     does internally (it calls ``repo_path.resolve()`` at its own
     function head). Without this, a symlinked checkout (the documented
     workspace layout for repos that cannot live next to
-    ``JUDGE_WORKSPACE_ROOT``) produces an ``OrphanReport`` whose
+    ``DEVBENCH_WORKSPACE_ROOT``) produces an ``OrphanReport`` whose
     ``gitignore_path`` lives in resolved-path space while this caller's
     ``repo_path`` lives in symlink-path space, and the
     ``gitignore_path.relative_to(repo_path)`` call below raises
@@ -5122,7 +5105,7 @@ def cmd_watch(watch_interval: int = 0) -> int:
     """
     from devbench.activity import collect_snapshot, render_snapshot
 
-    _log_file_env = (_read_env_strict("DEVBENCH_LOG_FILE", "JUDGE_LOG_FILE") or "").strip()
+    _log_file_env = (_read_env("DEVBENCH_LOG_FILE") or "").strip()
     log_file = Path(_log_file_env) if _log_file_env else WORKSPACE_ROOT / DEFAULT_LOG_SUBDIR / DEFAULT_LOG_FILENAME
     hook_log = WORKSPACE_ROOT / "hook-logs.jsonl"
 
@@ -5274,9 +5257,7 @@ def cmd_hook_tail(*argv: str) -> int:
     orchestrator_session_id = parsed.orchestrator_session_id
 
     if parsed.orchestrator_only and orchestrator_session_id is None:
-        env_session = (
-            _read_env_strict("DEVBENCH_ORCHESTRATOR_SESSION_ID", "JUDGE_ORCHESTRATOR_SESSION_ID") or ""
-        ).strip()
+        env_session = (_read_env("DEVBENCH_ORCHESTRATOR_SESSION_ID") or "").strip()
         if not env_session:
             print(
                 "ERROR: --orchestrator-only requires DEVBENCH_ORCHESTRATOR_SESSION_ID env "
@@ -7470,7 +7451,7 @@ def cmd_request_amendment(unit_id: str) -> int:
     fields are filled in by this command -- the caller does not provide them.
 
     On success, writes the request to
-    ``<JUDGE_WORKSPACE_ROOT>/.devbench/amendments/<unit_id>.json`` and prints
+    ``<DEVBENCH_WORKSPACE_ROOT>/.devbench/amendments/<unit_id>.json`` and prints
     a one-line JSON summary. Fails fast on schema errors, duplicate pending
     requests, or unknown reasons.
     """
@@ -9011,99 +8992,6 @@ def _find_unit(units: list[WorkUnit], unit_id: str) -> WorkUnit | None:
     return None
 
 
-def _parse_migrate_env_args(args: tuple[str, ...]) -> tuple[str | None, bool, int]:
-    """Parse arguments for cmd_migrate_env and return (output_path, dry_run, error_code).
-
-    Args:
-        args: The raw positional arguments passed to cmd_migrate_env.
-
-    Returns:
-        A 3-tuple ``(output_path, dry_run, error_code)`` where ``error_code`` is 0
-        on success or 1 when an argument error was detected and a message was already
-        written to stderr.
-    """
-    output_path: str | None = None
-    dry_run = False
-    arg_list = list(args)
-    i = 0
-    while i < len(arg_list):
-        arg = arg_list[i]
-        if arg == "--output":
-            if i + 1 >= len(arg_list):
-                print("ERROR: --output requires a path argument", file=sys.stderr)
-                return None, False, 1
-            output_path = arg_list[i + 1]
-            i += 2
-        elif arg == "--dry-run":
-            dry_run = True
-            i += 1
-        else:
-            print(f"ERROR: unrecognised argument: {arg!r}", file=sys.stderr)
-            return None, False, 1
-    return output_path, dry_run, 0
-
-
-def cmd_migrate_env(*args: str) -> int:
-    """Scan the current environment for legacy JUDGE_* vars and emit a migration shell-script.
-
-    Modes:
-    - No-arg mode (default): prints ``export DEVBENCH_<NAME>="$JUDGE_<NAME>"`` and
-      ``unset JUDGE_<NAME>`` lines to stdout for every ``JUDGE_*`` variable found in
-      ``os.environ``.  Exit 0 when at least one legacy var is found; exit 1 with an
-      actionable message on stderr when none are present.
-    - ``--output <path>``: writes the same export + unset lines to *path* (parent
-      directories are created as needed). Exit semantics identical to no-arg mode.
-    - ``--dry-run``: prints a summary count and each legacy var name found, but no
-      export lines.  Exit semantics identical to no-arg mode.
-
-    The command is non-destructive: it never modifies the caller's environment or
-    any shell rc file.
-
-    Args:
-        *args: Zero or more CLI arguments (``--output <path>`` or ``--dry-run``).
-
-    Returns:
-        0 when at least one legacy JUDGE_* var was found; 1 otherwise.
-    """
-    output_path, dry_run, arg_error = _parse_migrate_env_args(args)
-    if arg_error:
-        return 1
-
-    legacy_vars: list[str] = sorted(key for key in os.environ if key.startswith("JUDGE_"))
-
-    if not legacy_vars:
-        print("no legacy JUDGE_* env vars set in current shell", file=sys.stderr)
-        return 1
-
-    if dry_run:
-        print(f"Found {len(legacy_vars)} legacy JUDGE_* variable(s):")
-        for var in legacy_vars:
-            print(f"  {var}")
-        return 0
-
-    lines: list[str] = []
-    for var in legacy_vars:
-        suffix = var[len("JUDGE_") :]
-        new_var = f"DEVBENCH_{suffix}"
-        lines.append(f'export {new_var}="${var}"')
-        lines.append(f"unset {var}")
-
-    script = "\n".join(lines) + "\n"
-
-    if output_path is not None:
-        dest = Path(output_path)
-        try:
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_text(script, encoding="utf-8")
-        except OSError as exc:
-            print(f"ERROR: cannot write migration script to {output_path!r}: {exc}", file=sys.stderr)
-            return 1
-        return 0
-
-    print(script, end="")
-    return 0
-
-
 def _resolve_unit_file(unit: WorkUnit) -> Path | None:
     """Return the absolute path to the work unit file, or None if not found.
 
@@ -9379,14 +9267,6 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
         1,
         "Persist a blocker-resolver proposal JSON (stdin): write-proposal <source-task-id>",
     ),
-    "migrate-env": (
-        cmd_migrate_env,
-        0,
-        (
-            "Scan current shell for legacy JUDGE_* vars and emit a migration shell-script: "
-            "migrate-env [--output <path>] [--dry-run]"
-        ),
-    ),
 }
 
 
@@ -9439,8 +9319,6 @@ _VARIADIC_COMMANDS: frozenset[str] = frozenset(
         "stop",
         # Issue #193 E5-F5-S1-T1: quota-watcher --once / --daemon flags
         "quota-watcher",
-        # Issue #197 E9-F4-S1-T1: migrate-env --output / --dry-run flags
-        "migrate-env",
     }
 )
 

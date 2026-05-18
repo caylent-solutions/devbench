@@ -127,8 +127,26 @@ backlog:
 
 The skill does not exit until `devbench validate-backlog` returns rc=0. If the final
 pass fails, the skill returns to the relevant fix step and re-runs validation. If
-`max_iterations` is exhausted without convergence, it emits a `[BLOCKED]` comment
-listing the unresolved conditions instead of silently shipping a broken backlog.
+`SKILL_MAX_ITERATIONS` is exhausted without convergence, it emits a
+`[SKILL_MAX_ITERATIONS_REACHED]` audit row listing the unresolved conditions and
+exits non-zero instead of silently shipping a broken backlog.
+
+## Bounded self-critique loop
+
+The iterate-until-perfect loop is bounded by constants in
+`src/devbench/constants.py`:
+
+- `SKILL_MAX_ITERATIONS` -- maximum self-critique passes before the skill
+  emits `[SKILL_MAX_ITERATIONS_REACHED]` and exits non-zero.
+- `SKILL_QUALITY_THRESHOLD` -- unresolved-item count at which the skill
+  emits `[SKILL_QUALITY_THRESHOLD_REACHED]` and exits success.
+
+State persistence and audit emission are handled by
+`src/devbench/skill_state.py` (`read_checkpoint`, `write_checkpoint`,
+`emit_audit`). The checkpoint file lives at
+`<workspace>/.devbench/skill-state/spec-to-backlog.json` between iterations.
+The audit tags flow through the existing `devbench report` and
+`devbench hook-tail` pipelines.
 
 ## Cross-references
 

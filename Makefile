@@ -11,7 +11,7 @@ help:
 	@echo ""
 	@grep -E '^## ' $(MAKEFILE_LIST) | sed \
 	  -e 's/^## /  /' \
-	  -e 's/\(start-interactive:.*\)/\1 [JUDGE_WORKSPACE_ROOT, JUDGE_CLAUDE_MODEL, JUDGE_SAFE_PERMISSIONS]/' \
+	  -e 's/\(start-interactive:.*\)/\1 [DEVBENCH_WORKSPACE_ROOT, DEVBENCH_CLAUDE_MODEL, DEVBENCH_SAFE_PERMISSIONS]/' \
 	  -e 's/\(report-session:.*\)/\1 [SINCE]/' \
 	  -e 's/\(watch-live:.*\)/\1 [INTERVAL]/'
 	@echo ""
@@ -132,7 +132,7 @@ start:
 	done
 
 ## start-interactive: Launch interactive Claude session with devbench plugin loaded
-ifeq ($(JUDGE_SAFE_PERMISSIONS),1)
+ifeq ($(DEVBENCH_SAFE_PERMISSIONS),1)
 start-interactive:
 	claude --plugin-dir plugin/devbench
 else

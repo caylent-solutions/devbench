@@ -702,7 +702,7 @@ def collect_snapshot(
     gracefully.
 
     Args:
-        workspace_root: ``JUDGE_WORKSPACE_ROOT``. Used to locate
+        workspace_root: ``DEVBENCH_WORKSPACE_ROOT``. Used to locate
             ``.devbench/amendments/<id>.json`` and anchor relative paths.
         backlog_index: Path to ``BACKLOG.md``. Used to identify the active
             task via the :class:`devbench.backlog.parser.BacklogParser`.

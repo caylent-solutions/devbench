@@ -15,7 +15,7 @@ Git diff (staged, unstaged, branch, untracked):
 !`uv run devbench get-diff $ARGUMENTS`
 
 Pending amendment request JSON:
-!`cat "$JUDGE_WORKSPACE_ROOT/.devbench/amendments/$ARGUMENTS.json"`
+!`cat "$DEVBENCH_WORKSPACE_ROOT/.devbench/amendments/$ARGUMENTS.json"`
 
 ---
 
@@ -81,7 +81,7 @@ uv run devbench apply-amendment $ARGUMENTS
 ```bash
 # 1. Resolve the target repo.
 REPO_PATH=$(uv run devbench read-unit $ARGUMENTS | python3 -c "import sys, json; print(json.load(sys.stdin)['repo_path'])")
-REQUEST_FILE="$JUDGE_WORKSPACE_ROOT/.devbench/amendments/$ARGUMENTS.json"
+REQUEST_FILE="$DEVBENCH_WORKSPACE_ROOT/.devbench/amendments/$ARGUMENTS.json"
 
 # 2. Revert every file listed in the pending request so staged production
 #    edits do not leak into subsequent tasks.
@@ -105,7 +105,7 @@ if [[ $REJECT_RC -ne 0 ]]; then
   echo "FATAL: reject-amendment exited $REJECT_RC; cannot complete verdict" >&2
   exit 1
 fi
-if ls "$JUDGE_WORKSPACE_ROOT/.devbench/rejected-requests/$ARGUMENTS-"*.json >/dev/null 2>&1; then
+if ls "$DEVBENCH_WORKSPACE_ROOT/.devbench/rejected-requests/$ARGUMENTS-"*.json >/dev/null 2>&1; then
   echo "ARCHIVE_OK -- rejected-requests/$ARGUMENTS-*.json present; blocker-resolver can read it"
 else
   echo "ARCHIVE_MISSING -- reject-amendment returned 0 but the archive did not land on disk; re-run step 3"
@@ -119,8 +119,8 @@ fi
 #    invocation will not see the rejection rationale. The legacy
 #    ``.devbench/amender-rejections/<task-id>-<n>.json`` location is also
 #    accepted for forward compatibility with archived runs.
-if ls "$JUDGE_WORKSPACE_ROOT/.devbench/review-failures/$ARGUMENTS-manifest_amender-"*.json >/dev/null 2>&1 \
-  || ls "$JUDGE_WORKSPACE_ROOT/.devbench/amender-rejections/$ARGUMENTS-"*.json >/dev/null 2>&1; then
+if ls "$DEVBENCH_WORKSPACE_ROOT/.devbench/review-failures/$ARGUMENTS-manifest_amender-"*.json >/dev/null 2>&1 \
+  || ls "$DEVBENCH_WORKSPACE_ROOT/.devbench/amender-rejections/$ARGUMENTS-"*.json >/dev/null 2>&1; then
   echo "FEEDBACK_OK -- review-failures/$ARGUMENTS-manifest_amender-*.json present"
 else
   echo "FEEDBACK_MISSING -- reject-amendment returned 0 but the feedback JSON did not land; re-run step 3"

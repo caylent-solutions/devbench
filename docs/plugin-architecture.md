@@ -273,12 +273,12 @@ orchestrator or executor Python modules exist.
 
 ## Workspace Layout
 
-`devbench.yaml` lives at `$JUDGE_WORKSPACE_ROOT/backlog/config/devbench.yaml` -- the workspace root,
+`devbench.yaml` lives at `$DEVBENCH_WORKSPACE_ROOT/backlog/config/devbench.yaml` -- the workspace root,
 one level above the devbench tool repo. It is workspace-specific configuration (target repos,
 branches, merge strategy, timeouts). The plugin is config-agnostic.
 
 ```text
-$JUDGE_WORKSPACE_ROOT/
+$DEVBENCH_WORKSPACE_ROOT/
 ├── BACKLOG.md
 ├── CLAUDE.md
 ├── backlog/

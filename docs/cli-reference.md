@@ -630,7 +630,7 @@ agents:
     changes_manifest: opus
 ```
 
-Every field defaults to `null` when absent (use the agent's `.md` frontmatter model). When `use_bedrock: true`, every value must be a Bedrock ARN (`us.anthropic.claude-<name>-<ver>-v<N>`); when `false`, values must be a short name (`opus`/`sonnet`) or an Anthropic API id (`claude-opus-4-7`). `haiku` is rejected at config-load time for all per-agent fields (caylent-solutions/devbench#198). `DEVBENCH_AGENT_MODEL_<NAME>` env vars (e.g. `DEVBENCH_AGENT_MODEL_EXECUTOR=opus`, `DEVBENCH_AGENT_MODEL_CODE_REVIEWER=opus`) override the YAML on a per-call basis (env > yaml > frontmatter).
+Every field defaults to `null` when absent (use the agent's `.md` frontmatter model). When `use_bedrock: true`, every value must be a Bedrock ARN (`us.anthropic.claude-<name>-<ver>-v<N>`); when `false`, values must be a short name (`opus`/`sonnet`) or an Anthropic API id (`claude-opus-4-7`). `haiku` is rejected at config-load time for all per-agent fields (caylent-solutions/devbench#198). `DEVBENCH_AGENT_MODEL_<NAME>` env vars (e.g. `DEVBENCH_AGENT_MODEL_EXECUTOR=opus`, `JUDGE_AGENT_MODEL_CODE_REVIEWER=opus`) override the YAML on a per-call basis (env > yaml > frontmatter).
 
 ---
 
@@ -1385,82 +1385,3 @@ Two forms:
 2. **Un-materialised reject** (`--unmaterialised <source-id>`) -- archives the whole proposal JSON to `<workspace>/.devbench/rejected-proposals/<source-id>-unmaterialised-<timestamp>.json` and writes a `[PROPOSAL_JSON_REJECTED]` audit comment. Refuses when any task in the JSON already has a materialised draft; use the per-draft form for those first.
 
 Exactly one form must be supplied; missing or both-supplied raises an argument-parse error. `--reason` is required and non-empty.
-
----
-
-## Environment migration
-
-One-shot tooling for migrating from the legacy `JUDGE_*` env-var namespace to the current `DEVBENCH_*` namespace (issue #197). This section covers the single subcommand in this group.
-
-### `migrate-env`
-
-```
-uv run devbench migrate-env [--output <path>] [--dry-run]
-```
-
-Scan the current environment for legacy `JUDGE_*` variables and emit a shell migration script that renames each one to the corresponding `DEVBENCH_*` name. The command is **non-destructive**: it never modifies the caller's environment, shell session, or any shell rc file (`.bashrc`, `.zshenv`, etc.). The operator sources the output once before relaunching devbench.
-
-`migrate-env` is the **only** devbench subcommand that bypasses the strict env-var checker. Every other subcommand raises and exits non-zero the moment any `JUDGE_*` variable is detected in the environment. `migrate-env` can run even when `JUDGE_*` vars are still set because the CLI entry-point sets `DEVBENCH_BOOTSTRAP=1` before config resolution begins; the strict checker no-ops when that flag is present. This design lets legacy operators read the migration script without first clearing the very variables they need to migrate.
-
-#### Modes
-
-**No-arg mode (default)**
-
-```
-uv run devbench migrate-env
-```
-
-Reads `os.environ`, identifies every set `JUDGE_*` variable, and prints to stdout one `export DEVBENCH_<NAME>="$JUDGE_<NAME>"` line followed by one `unset JUDGE_<NAME>` line per variable. Example output for an environment that has two legacy variables set:
-
-```
-export DEVBENCH_FOO="$JUDGE_FOO"
-unset JUDGE_FOO
-export DEVBENCH_BAR="$JUDGE_BAR"
-unset JUDGE_BAR
-```
-
-Source the output to migrate in one step:
-
-```bash
-eval "$(uv run devbench migrate-env)"
-```
-
-**`--output <path>`**
-
-```
-uv run devbench migrate-env --output /tmp/migrate.sh
-```
-
-Writes the same `export` + `unset` lines to `<path>` instead of stdout. Parent directories are created as needed. Source the file to apply the migration:
-
-```bash
-uv run devbench migrate-env --output /tmp/migrate.sh
-source /tmp/migrate.sh
-```
-
-**`--dry-run`**
-
-```
-uv run devbench migrate-env --dry-run
-```
-
-Prints a summary count and the name of each legacy variable found, but emits no `export` or `unset` lines. Use this to audit the environment before committing to the migration.
-
-Example output:
-
-```
-Found 2 legacy JUDGE_* variable(s):
-  JUDGE_BAR
-  JUDGE_FOO
-```
-
-#### Exit codes
-
-- **exit 0** -- at least one legacy `JUDGE_*` variable was found; the migration script was emitted (or the dry-run summary was printed).
-- **exit 1** -- no legacy `JUDGE_*` variables are present in the current environment (already migrated). An actionable message is printed to stderr.
-
-#### DEVBENCH_BOOTSTRAP bypass contract
-
-The CLI entry-point calls `_pre_parse_migrate_env(sys.argv)` before importing `config.py`. When the first non-option argument is `migrate-env`, that helper sets `os.environ["DEVBENCH_BOOTSTRAP"] = "1"`. The strict env-var checker in `config.py` (`_read_env_strict`) no-ops when `DEVBENCH_BOOTSTRAP` is set to `"1"`. No other subcommand path touches `DEVBENCH_BOOTSTRAP`; every other subcommand triggers the checker on first env-var read and exits non-zero if any `JUDGE_*` variable is present.
-
-This bypass is intentional and pinned by a regression test (AC-197-7). It exists for one reason only: a legacy operator whose shell still exports any `JUDGE_*` variable would otherwise be unable to invoke the migration tool that removes those variables.

@@ -52,7 +52,7 @@ disjoint WU sets.
 
 | Requirement | Notes |
 |-------------|-------|
-| Two workspace root directories | Each instance needs its own directory -- they must NOT share a `JUDGE_WORKSPACE_ROOT`. |
+| Two workspace root directories | Each instance needs its own directory -- they must NOT share a `DEVBENCH_WORKSPACE_ROOT`. |
 | Shared git remote for each target repo | Both clones of a target repo must point to the same remote `origin` so commits from both instances merge via the standard PR workflow. |
 | Non-overlapping `--include` tokens | The two filter strings must expand to disjoint sets of work-unit IDs. See [Step 3](#step-3----verify-the-scopes-are-disjoint). |
 | DevBench installed | Follow [zero-to-ready.md](zero-to-ready.md) for the baseline single-instance setup first. |
@@ -78,7 +78,7 @@ cp -r ~/devbench-workspace/spec ./spec 2>/dev/null || true
 # (Replace "myorg/myrepo" with the actual repo slug.)
 git clone https://github.com/myorg/myrepo.git myrepo
 
-export JUDGE_WORKSPACE_ROOT=~/devbench-workspace-a
+export DEVBENCH_WORKSPACE_ROOT=~/devbench-workspace-a
 ```
 
 ### Step 2 -- Clone the workspace for instance B
@@ -95,7 +95,7 @@ cp -r ~/devbench-workspace/spec ./spec 2>/dev/null || true
 # Clone the same target repo (different working tree, same remote origin).
 git clone https://github.com/myorg/myrepo.git myrepo
 
-export JUDGE_WORKSPACE_ROOT=~/devbench-workspace-b
+export DEVBENCH_WORKSPACE_ROOT=~/devbench-workspace-b
 ```
 
 ### Step 3 -- Verify the scopes are disjoint
@@ -108,16 +108,16 @@ expanded IDs.
 ```bash
 # In workspace A: preview the expanded IDs for the first partition.
 cd ~/devbench-workspace-a
-JUDGE_WORKSPACE_ROOT=~/devbench-workspace-a \
+DEVBENCH_WORKSPACE_ROOT=~/devbench-workspace-a \
   uv run --project $DEVBENCH_DIR devbench scope set --include "E1-E3"
-JUDGE_WORKSPACE_ROOT=~/devbench-workspace-a \
+DEVBENCH_WORKSPACE_ROOT=~/devbench-workspace-a \
   uv run --project $DEVBENCH_DIR devbench scope show
 
 # In workspace B: preview the expanded IDs for the second partition.
 cd ~/devbench-workspace-b
-JUDGE_WORKSPACE_ROOT=~/devbench-workspace-b \
+DEVBENCH_WORKSPACE_ROOT=~/devbench-workspace-b \
   uv run --project $DEVBENCH_DIR devbench scope set --include "E4-E6"
-JUDGE_WORKSPACE_ROOT=~/devbench-workspace-b \
+DEVBENCH_WORKSPACE_ROOT=~/devbench-workspace-b \
   uv run --project $DEVBENCH_DIR devbench scope show
 ```
 
@@ -131,8 +131,8 @@ Open a terminal dedicated to instance A:
 ```bash
 cd ~/devbench-workspace-a
 
-JUDGE_WORKSPACE_ROOT=~/devbench-workspace-a \
-JUDGE_CLAUDE_MODEL=claude-sonnet-4-5 \
+DEVBENCH_WORKSPACE_ROOT=~/devbench-workspace-a \
+DEVBENCH_CLAUDE_MODEL=claude-sonnet-4-5 \
   uv run --project $DEVBENCH_DIR devbench start --include "E1-E3"
 ```
 
@@ -149,8 +149,8 @@ Open a second terminal dedicated to instance B:
 ```bash
 cd ~/devbench-workspace-b
 
-JUDGE_WORKSPACE_ROOT=~/devbench-workspace-b \
-JUDGE_CLAUDE_MODEL=claude-sonnet-4-5 \
+DEVBENCH_WORKSPACE_ROOT=~/devbench-workspace-b \
+DEVBENCH_CLAUDE_MODEL=claude-sonnet-4-5 \
   uv run --project $DEVBENCH_DIR devbench start --include "E4-E6"
 ```
 
@@ -220,11 +220,11 @@ name and carrying its own `scope.json`:
 
 ```bash
 # Terminal 1 -- session "alpha" handles E1-E3 in the shared workspace.
-JUDGE_WORKSPACE_ROOT=~/devbench-workspace \
+DEVBENCH_WORKSPACE_ROOT=~/devbench-workspace \
   devbench start --name alpha --include "E1-E3"
 
 # Terminal 2 -- session "beta" handles E4-E6 in the same workspace.
-JUDGE_WORKSPACE_ROOT=~/devbench-workspace \
+DEVBENCH_WORKSPACE_ROOT=~/devbench-workspace \
   devbench start --name beta --include "E4-E6"
 ```
 

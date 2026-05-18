@@ -1052,7 +1052,7 @@ class TestBedrockConfig:
     def test_use_bedrock_false_by_default(self) -> None:
         from devbench.config import USE_BEDROCK
 
-        # In test env, JUDGE_USE_BEDROCK is not set
+        # In test env, DEVBENCH_USE_BEDROCK is not set
         # Value depends on test environment, just verify it's a bool
         assert isinstance(USE_BEDROCK, bool)
 
@@ -2727,7 +2727,7 @@ class TestThroughputDivergenceWarning:
     is non-zero but the All-time throughput window finds zero
     ``Set <id> to 'done'`` events. This is the deterministic signal that
     the reader is looking at a different log than the orchestrator
-    writes to (typically because ``JUDGE_LOG_FILE`` was unset).
+    writes to (typically because ``DEVBENCH_LOG_FILE`` was unset).
     """
 
     @staticmethod
@@ -2772,7 +2772,7 @@ class TestThroughputDivergenceWarning:
             report = generate_report(log_path=log_file)
         assert "WARNING" in report
         assert "BACKLOG.md shows 3 done" in report
-        assert "JUDGE_LOG_FILE" in report
+        assert "DEVBENCH_LOG_FILE" in report
         assert "shows 0" in report  # the throughput count
 
     def test_warning_silent_when_log_matches_backlog(self, tmp_path: Path) -> None:
@@ -2811,7 +2811,7 @@ class TestThroughputDivergenceWarning:
     def test_warning_message_includes_log_path(self, tmp_path: Path) -> None:
         # The error message must name the log file path so the operator
         # can immediately identify which file got read; this is the
-        # actionable signal that lets them set JUDGE_LOG_FILE correctly.
+        # actionable signal that lets them set DEVBENCH_LOG_FILE correctly.
         log_file = tmp_path / "specific-name.log"
         log_file.write_text("")
         units = self._patch_backlog_with_done_tasks(backlog_total=2, backlog_done=1)

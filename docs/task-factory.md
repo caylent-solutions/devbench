@@ -32,7 +32,7 @@ task_factory:
 
 `task_factory.enabled: true` requires `manifest_amendment.enabled: true`. Config validation fails loud otherwise.
 
-**Trigger is file-based, not verdict-word-based.** The orchestrate skill branches on `test -f $JUDGE_WORKSPACE_ROOT/.devbench/proposals/<source-id>.json` to decide whether to invoke task-factory. Agent verdict words (`proposed` / `resolved` / `escalated` from blocker-resolver; `NEEDS_ESCALATION` from the executor) are audit-only. This is deliberate: the file existing proves a proposal was emitted; verdict words are summaries that cannot override disk state. If no proposal file exists after the executor or blocker-resolver runs, task-factory does NOT fire -- by design. Both triggers use the same file, so only one can fire per source task per run.
+**Trigger is file-based, not verdict-word-based.** The orchestrate skill branches on `test -f $DEVBENCH_WORKSPACE_ROOT/.devbench/proposals/<source-id>.json` to decide whether to invoke task-factory. Agent verdict words (`proposed` / `resolved` / `escalated` from blocker-resolver; `NEEDS_ESCALATION` from the executor) are audit-only. This is deliberate: the file existing proves a proposal was emitted; verdict words are summaries that cannot override disk state. If no proposal file exists after the executor or blocker-resolver runs, task-factory does NOT fire -- by design. Both triggers use the same file, so only one can fire per source task per run.
 
 If the operator decides that some proposed drafts should never be promoted, they can run `devbench decline <id> --reason "<msg>"` instead of `reject-proposal`. `decline` flips the draft's status to `declined` (preserves the file and the audit trail), whereas `reject-proposal` archives the draft and removes the BACKLOG.md row. Use `decline` when you want the draft visible in the backlog's historical record as a considered-and-rejected candidate; use `reject-proposal` when the draft was clearly a misgeneration.
 
@@ -128,7 +128,7 @@ Trigger 2 follows a shorter flow because the executor itself emits the proposal 
 1. **Executor identifies the task as a validation gate.** The Changes Manifest is empty (or absent) and the Approach explicitly forbids production-code changes (wording such as "run and report", "validation gate", "verify only"). The executor runs the prescribed verifications.
 2. **Verifications surface out-of-scope bugs.** The executor confirms bugs that fall outside the source task's scope. Per the executor prompt's BUG ESCALATION FOR VALIDATION GATES section, it does NOT stage a fix and does NOT request an amendment.
 3. **Executor writes the proposal JSON directly.** It allocates `suggested_id` values by scanning sibling task files in the target Story directory, builds the same JSON envelope blocker-resolver would (see the schema below), and pipes it into `uv run devbench write-proposal <source-id>` on stdin.
-4. **Executor verifies the file landed.** `test -f $JUDGE_WORKSPACE_ROOT/.devbench/proposals/<source-id>.json` is the load-bearing check; the orchestrate skill branches on it at step 4a.
+4. **Executor verifies the file landed.** `test -f $DEVBENCH_WORKSPACE_ROOT/.devbench/proposals/<source-id>.json` is the load-bearing check; the orchestrate skill branches on it at step 4a.
 5. **Executor logs NEEDS_ESCALATION** naming the proposal path and the proposed task titles. The source task's review pipeline then runs normally at step 5 -- validation-gate escalation does NOT auto-block the source; its own ACs may still pass.
 6. **Orchestrator detects the proposal at step 4a** and invokes `devbench:task-factory` directly, skipping blocker-resolver (the executor's proposal is already authoritative).
 7. **Task-factory materialises the drafts** exactly as it does on the amendment-reject path: one `.md` per proposed task with `## Status:` set to the config-driven default (see `backlog.default_status_for_new_work_units`; default `in-queue`), one BACKLOG.md row per draft, Status Summary refreshed.
@@ -372,7 +372,7 @@ Recovery cascades (a proposal whose source task is itself the
 materialisation of an earlier proposal) carry a `cascade_depth`
 field equal to `parent_depth + 1`. The
 `orchestrate.max_cascade_depth` YAML knob (default `2`, env override
-`JUDGE_ORCHESTRATE_MAX_CASCADE_DEPTH`) caps recursion. When
+`DEVBENCH_ORCHESTRATE_MAX_CASCADE_DEPTH`) caps recursion. When
 `cmd_materialise_proposal` sees a proposal at the cap, it transitions
 the source task to `NEEDS_OPERATOR_ATTENTION` instead of authoring
 another draft. Default of 2 reflects the bounded cascade depth needed

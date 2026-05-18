@@ -78,8 +78,12 @@ run devbench:create-spec
    skeleton and the quality bar.
 2. It asks a structured question block covering: problem statement, scope, non-goals,
    functional requirements, NFRs, acceptance criteria, and resolved design decisions.
-3. It authors the spec one section at a time and runs a self-critique loop until the
-   rubric score is zero or `max_iterations` is reached.
+3. It authors the spec one section at a time and runs a bounded self-critique
+   loop until the rubric score is zero (`SKILL_QUALITY_THRESHOLD_REACHED`
+   audit) or `SKILL_MAX_ITERATIONS` is reached
+   (`SKILL_MAX_ITERATIONS_REACHED` audit). The iteration counter is persisted
+   in `<workspace>/.devbench/skill-state/create-spec.json` between passes; see
+   `src/devbench/skill_state.py`.
 4. It asks for your final sign-off, then writes `spec/<project-name>.md`.
 5. It offers to invoke `spec-to-backlog` directly as the next step.
 
@@ -206,8 +210,8 @@ Once the backlog is generated, config is written, repos are bootstrapped, and dr
 tasks are promoted to `in-queue`, launch DevBench:
 
 ```bash
-JUDGE_WORKSPACE_ROOT=~/my-workspace \
-JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_WORKSPACE_ROOT=~/my-workspace \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
 make -C $DEVBENCH_DIR start
 ```
 
@@ -236,7 +240,7 @@ This example shows the chain applied to a real project.
 mkdir -p ~/payment-service-ws/backlog/config
 cd ~/payment-service-ws
 git init
-export JUDGE_WORKSPACE_ROOT=~/payment-service-ws
+export DEVBENCH_WORKSPACE_ROOT=~/payment-service-ws
 ```
 
 **Step 1 -- create-spec:**
@@ -293,8 +297,8 @@ uv run --project $DEVBENCH_DIR devbench promote --epic E1
 **Step 5 -- launch:**
 
 ```bash
-JUDGE_WORKSPACE_ROOT=~/payment-service-ws \
-JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_WORKSPACE_ROOT=~/payment-service-ws \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
 make -C $DEVBENCH_DIR start
 ```
 
@@ -327,8 +331,8 @@ branch, set `git_ops.single_branch` in `devbench.yaml` during Step 3.
 To process only a subset of the backlog:
 
 ```bash
-JUDGE_WORKSPACE_ROOT=~/payment-service-ws \
-JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_WORKSPACE_ROOT=~/payment-service-ws \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
 uv run --project $DEVBENCH_DIR devbench start --include "E1-E3"
 ```
 
@@ -355,7 +359,7 @@ and exits cleanly. See [`docs/zero-to-ready.md` -- Stopping a run cleanly](zero-
 | `validate-backlog` fails after Step 2 | 2 | Check the error message; common causes: em-dash in a work-unit file, orphaned file not in BACKLOG.md, dep cycle |
 | `ConfigLoader` error after Step 3 | 3 | Re-run `configure-devbench`; the skill re-prompts for invalid values |
 | `make validate` fails for a repo in Step 4 | 4 | Resolve the failing sub-target (lint, typecheck, test) manually, then re-run `bootstrap-environment` |
-| `JUDGE_WORKSPACE_ROOT not set` at Step 5 | 5 | Export the variable: `export JUDGE_WORKSPACE_ROOT=~/my-workspace` |
+| `DEVBENCH_WORKSPACE_ROOT not set` at Step 5 | 5 | Export the variable: `export DEVBENCH_WORKSPACE_ROOT=~/my-workspace` |
 | No tasks eligible after `make start` | 5 | Check `devbench status` -- tasks may still be in `draft`; run `devbench promote` |
 
 ---

@@ -74,7 +74,7 @@ The following files are operational backlog-tracking artifacts. You may read the
 **STEP 1 -- Detect task-factory mode.** Check for a rejected-requests archive:
 
 ```bash
-ls "$JUDGE_WORKSPACE_ROOT/.devbench/rejected-requests/$ARGUMENTS-"*.json 2>/dev/null
+ls "$DEVBENCH_WORKSPACE_ROOT/.devbench/rejected-requests/$ARGUMENTS-"*.json 2>/dev/null
 ```
 
 If no archive exists, skip this entire section and follow the normal `resolved`/`escalated` path at the bottom. If ANY archive exists, continue -- you MUST emit a proposal JSON. `escalated` is forbidden in this case; `proposed` is the ONLY correct verdict.
@@ -82,7 +82,7 @@ If no archive exists, skip this entire section and follow the normal `resolved`/
 **STEP 2 -- Gather the evidence.** Read the most recent archive and the blocked work unit:
 
 ```bash
-ARCHIVE=$(ls -t "$JUDGE_WORKSPACE_ROOT/.devbench/rejected-requests/$ARGUMENTS-"*.json | head -n 1)
+ARCHIVE=$(ls -t "$DEVBENCH_WORKSPACE_ROOT/.devbench/rejected-requests/$ARGUMENTS-"*.json | head -n 1)
 cat "$ARCHIVE"
 uv run devbench read-unit --strip-comments $ARGUMENTS
 ```
@@ -90,7 +90,7 @@ uv run devbench read-unit --strip-comments $ARGUMENTS
 **STEP 3 -- Allocate free task IDs** for each new work unit you plan to propose. Scan the Story directory for existing IDs:
 
 ```bash
-STORY_DIR="$JUDGE_WORKSPACE_ROOT/$(dirname "$(uv run devbench read-unit $ARGUMENTS | python3 -c 'import sys,json; print(json.load(sys.stdin)["work_unit_path"])')" | sed "s|^$JUDGE_WORKSPACE_ROOT/||")"
+STORY_DIR="$DEVBENCH_WORKSPACE_ROOT/$(dirname "$(uv run devbench read-unit $ARGUMENTS | python3 -c 'import sys,json; print(json.load(sys.stdin)["work_unit_path"])')" | sed "s|^$DEVBENCH_WORKSPACE_ROOT/||")"
 ls "$STORY_DIR"/*.md 2>/dev/null | xargs -n1 basename 2>/dev/null | sort -V
 ```
 
@@ -185,7 +185,7 @@ Example of an acceptable `suggested_approach` (honest four-section structure, ab
 **STEP 6 -- Verify the proposal landed on disk** before logging your verdict. The orchestrator's step 4c branches on FILE EXISTENCE, not on the verdict word -- so the file existing is load-bearing. If it's missing, do NOT log `proposed`.
 
 ```bash
-if test -f "$JUDGE_WORKSPACE_ROOT/.devbench/proposals/$ARGUMENTS.json"; then
+if test -f "$DEVBENCH_WORKSPACE_ROOT/.devbench/proposals/$ARGUMENTS.json"; then
   echo "PROPOSAL_WRITTEN"
 else
   echo "PROPOSAL_MISSING -- write-proposal did not persist; re-check stdin payload and rerun step 5"

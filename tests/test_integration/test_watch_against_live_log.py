@@ -61,10 +61,6 @@ def _run_watch(workspace: Path) -> subprocess.CompletedProcess[str]:
     env["DEVBENCH_WORKSPACE_ROOT"] = str(workspace)
     env["DEVBENCH_LOG_FILE"] = str(workspace / "orchestrator.log")
     env["DEVBENCH_CLAUDE_MODEL"] = env.get("DEVBENCH_CLAUDE_MODEL", "test-model")
-    # Remove legacy vars so the strict env-var checker does not reject them.
-    env.pop("JUDGE_WORKSPACE_ROOT", None)
-    env.pop("JUDGE_CLAUDE_MODEL", None)
-    env.pop("JUDGE_LOG_FILE", None)
     # Use the same Python interpreter pytest is running under; invoke the
     # module directly so we don't depend on `uv run` being in PATH.
     return subprocess.run(

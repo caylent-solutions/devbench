@@ -46,11 +46,8 @@ def _run_hook_tail(
     """Invoke ``python -m devbench.cli hook-tail`` under a clean env."""
     env = os.environ.copy()
     env["DEVBENCH_WORKSPACE_ROOT"] = str(workspace)
-    env["JUDGE_LOG_FILE"] = str(workspace / "orchestrator.log")
+    env["DEVBENCH_LOG_FILE"] = str(workspace / "orchestrator.log")
     env["DEVBENCH_CLAUDE_MODEL"] = env.get("DEVBENCH_CLAUDE_MODEL", "test-model")
-    # Remove legacy vars so the strict env-var checker does not reject them.
-    env.pop("JUDGE_WORKSPACE_ROOT", None)
-    env.pop("JUDGE_CLAUDE_MODEL", None)
     # Force color off so the tests can assert on plain substrings without
     # having to strip ANSI escapes from the output.
     env["NO_COLOR"] = "1"

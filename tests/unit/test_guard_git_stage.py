@@ -15,9 +15,8 @@ SCRIPT_PATH = Path(__file__).parent.parent.parent / "plugin" / "devbench" / "scr
 
 def _run_hook(payload: dict, cwd: str | None = None) -> subprocess.CompletedProcess:
     """Invoke the hook script with the given JSON payload on stdin."""
-    # Strip legacy JUDGE_WORKSPACE_ROOT and JUDGE_LOG_FILE: _hook_lib.sh rejects
     # these vars at source time (AC-197-9) and all hooks source _hook_lib.sh.
-    env = {k: v for k, v in os.environ.items() if k not in ("JUDGE_WORKSPACE_ROOT", "JUDGE_LOG_FILE")}
+    env = {k: v for k, v in os.environ.items() if k not in ("DEVBENCH_WORKSPACE_ROOT", "DEVBENCH_LOG_FILE")}
     if cwd is not None:
         env["PWD"] = cwd
     return subprocess.run(
@@ -246,9 +245,8 @@ class TestGuardGitStageManifestScope:
     """Slice 3b: `git add <path>` must target files listed in the active work unit's manifest."""
 
     def _env_with_unit(self, cwd: str, unit_path: Path) -> dict[str, str]:
-        # Strip legacy JUDGE_WORKSPACE_ROOT and JUDGE_LOG_FILE: _hook_lib.sh rejects
         # these vars at source time (AC-197-9) and all hooks source _hook_lib.sh.
-        env = {k: v for k, v in os.environ.items() if k not in ("JUDGE_WORKSPACE_ROOT", "JUDGE_LOG_FILE")}
+        env = {k: v for k, v in os.environ.items() if k not in ("DEVBENCH_WORKSPACE_ROOT", "DEVBENCH_LOG_FILE")}
         env["PWD"] = cwd
         env["CURRENT_WORK_UNIT_FILE"] = str(unit_path)
         return env
@@ -301,7 +299,7 @@ class TestGuardGitStageManifestScope:
 
     def test_no_work_unit_env_skips_manifest_check(self, tmp_path: Path) -> None:
         """Without CURRENT_WORK_UNIT_FILE the hook allows the add (backward compatibility)."""
-        _legacy = {"JUDGE_WORKSPACE_ROOT", "JUDGE_LOG_FILE", "CURRENT_WORK_UNIT_FILE"}
+        _legacy = {"DEVBENCH_WORKSPACE_ROOT", "DEVBENCH_LOG_FILE", "CURRENT_WORK_UNIT_FILE"}
         env = {k: v for k, v in os.environ.items() if k not in _legacy}
         env["PWD"] = str(tmp_path)
         payload = _make_payload("git add anything.py")
@@ -309,7 +307,7 @@ class TestGuardGitStageManifestScope:
         assert result.returncode == 0
 
     def test_missing_work_unit_file_skips_check(self, tmp_path: Path) -> None:
-        env = {k: v for k, v in os.environ.items() if k not in ("JUDGE_WORKSPACE_ROOT", "JUDGE_LOG_FILE")}
+        env = {k: v for k, v in os.environ.items() if k not in ("DEVBENCH_WORKSPACE_ROOT", "DEVBENCH_LOG_FILE")}
         env["PWD"] = str(tmp_path)
         env["CURRENT_WORK_UNIT_FILE"] = str(tmp_path / "does-not-exist.md")
         payload = _make_payload("git add anything.py")

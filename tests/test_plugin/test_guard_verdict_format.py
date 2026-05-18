@@ -21,12 +21,12 @@ HOOK_PATH = (
 
 
 def _clean_env() -> dict[str, str]:
-    """Return the process env with legacy JUDGE_WORKSPACE_ROOT and JUDGE_LOG_FILE stripped.
+    """Return the process env with legacy DEVBENCH_WORKSPACE_ROOT and DEVBENCH_LOG_FILE stripped.
 
     _hook_lib.sh rejects legacy JUDGE_* hook vars (AC-197-9). Tests that source
     _hook_lib.sh must not inherit those vars from the pytest process environment.
     """
-    return {k: v for k, v in os.environ.items() if k not in ("JUDGE_WORKSPACE_ROOT", "JUDGE_LOG_FILE")}
+    return {k: v for k, v in os.environ.items() if k not in ("DEVBENCH_WORKSPACE_ROOT", "DEVBENCH_LOG_FILE")}
 
 
 def _run(command: str) -> subprocess.CompletedProcess[str]:

@@ -483,61 +483,6 @@ class TestSessionDrainSignalFilenameConstant:
         assert "/" not in SESSION_DRAIN_SIGNAL_FILENAME
 
 
-class TestDevbenchBootstrapEnvVarConstant:
-    """AC-197-7: DEVBENCH_BOOTSTRAP_ENV_VAR is exported from constants.py with the
-    correct type and spec-mandated value (issue #197).
-
-    The constant names the environment variable that the CLI entry-point sets to '1'
-    to activate the bootstrap bypass in _read_env_strict, allowing devbench migrate-env
-    to inspect legacy vars before the hard cutover. Only the exact value '1' activates
-    the bypass (AC-197-7).
-    """
-
-    @pytest.mark.unit
-    def test_devbench_bootstrap_env_var_is_importable(self) -> None:
-        """DEVBENCH_BOOTSTRAP_ENV_VAR is importable from devbench.constants without error."""
-        import devbench.constants as _c
-
-        assert hasattr(_c, "DEVBENCH_BOOTSTRAP_ENV_VAR")
-
-    @pytest.mark.unit
-    def test_devbench_bootstrap_env_var_is_str(self) -> None:
-        """DEVBENCH_BOOTSTRAP_ENV_VAR is of type str."""
-        from devbench.constants import DEVBENCH_BOOTSTRAP_ENV_VAR
-
-        assert isinstance(DEVBENCH_BOOTSTRAP_ENV_VAR, str)
-
-    @pytest.mark.unit
-    def test_devbench_bootstrap_env_var_is_non_empty(self) -> None:
-        """DEVBENCH_BOOTSTRAP_ENV_VAR is a non-empty string."""
-        from devbench.constants import DEVBENCH_BOOTSTRAP_ENV_VAR
-
-        assert len(DEVBENCH_BOOTSTRAP_ENV_VAR) > 0
-
-    @pytest.mark.unit
-    def test_devbench_bootstrap_env_var_value(self) -> None:
-        """DEVBENCH_BOOTSTRAP_ENV_VAR equals 'DEVBENCH_BOOTSTRAP' (AC-197-7)."""
-        from devbench.constants import DEVBENCH_BOOTSTRAP_ENV_VAR
-
-        assert DEVBENCH_BOOTSTRAP_ENV_VAR == "DEVBENCH_BOOTSTRAP"
-
-    @pytest.mark.unit
-    def test_devbench_bootstrap_env_var_has_no_spaces(self) -> None:
-        """DEVBENCH_BOOTSTRAP_ENV_VAR contains no spaces (env var name convention)."""
-        from devbench.constants import DEVBENCH_BOOTSTRAP_ENV_VAR
-
-        assert " " not in DEVBENCH_BOOTSTRAP_ENV_VAR
-
-    @pytest.mark.unit
-    def test_devbench_bootstrap_env_var_is_uppercase(self) -> None:
-        """DEVBENCH_BOOTSTRAP_ENV_VAR is all uppercase (POSIX env var naming convention)."""
-        from devbench.constants import DEVBENCH_BOOTSTRAP_ENV_VAR
-
-        upper_form = DEVBENCH_BOOTSTRAP_ENV_VAR.upper()
-        assert upper_form == DEVBENCH_BOOTSTRAP_ENV_VAR
-
-
-@pytest.mark.unit
 class TestAllowedAgentModelShortNamesHaikuRemoval:
     """AC-198-1: ALLOWED_AGENT_MODEL_SHORT_NAMES must equal frozenset({'opus', 'sonnet'}).
 
@@ -579,3 +524,42 @@ class TestAllowedAgentModelShortNamesHaikuRemoval:
         from devbench.constants import ALLOWED_AGENT_MODEL_SHORT_NAMES
 
         assert "sonnet" in ALLOWED_AGENT_MODEL_SHORT_NAMES
+
+
+class TestSkillIterateUntilPerfectConstants:
+    """Issue #204: constants that bound the skill iterate-until-perfect loop."""
+
+    @pytest.mark.unit
+    def test_max_iterations_is_positive_int(self) -> None:
+        from devbench.constants import SKILL_MAX_ITERATIONS
+
+        assert isinstance(SKILL_MAX_ITERATIONS, int)
+        assert SKILL_MAX_ITERATIONS > 0, "SKILL_MAX_ITERATIONS must bound the loop with a positive value"
+
+    @pytest.mark.unit
+    def test_quality_threshold_is_non_negative_int(self) -> None:
+        from devbench.constants import SKILL_QUALITY_THRESHOLD
+
+        assert isinstance(SKILL_QUALITY_THRESHOLD, int)
+        assert SKILL_QUALITY_THRESHOLD >= 0
+
+    @pytest.mark.unit
+    def test_state_dir_name_is_under_devbench(self) -> None:
+        from devbench.constants import SKILL_STATE_DIR_NAME
+
+        assert isinstance(SKILL_STATE_DIR_NAME, str)
+        assert SKILL_STATE_DIR_NAME.startswith(".devbench/"), (
+            "SKILL_STATE_DIR_NAME must live under .devbench/ to share the state-directory convention"
+        )
+
+    @pytest.mark.unit
+    def test_audit_tags_match_skill_grammar(self) -> None:
+        from devbench.constants import (
+            SKILL_AUDIT_MAX_ITERATIONS_REACHED,
+            SKILL_AUDIT_QUALITY_THRESHOLD_REACHED,
+        )
+
+        for tag in (SKILL_AUDIT_MAX_ITERATIONS_REACHED, SKILL_AUDIT_QUALITY_THRESHOLD_REACHED):
+            assert isinstance(tag, str)
+            assert tag.startswith("[SKILL_"), f"audit tag must start with '[SKILL_' (got {tag!r})"
+            assert tag.endswith("]"), f"audit tag must end with ']' (got {tag!r})"

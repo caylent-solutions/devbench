@@ -22,7 +22,7 @@ was tried for `review-supervisor` and dropped: under load the SDK silently
 removed the Agent tool from haiku's tool list, breaking parallel review_team
 dispatch -- see CHANGELOG entry for the role-default refresh). The top-level
 orchestrate skill inherits the SDK caller's
-model (set by the launcher via `JUDGE_CLAUDE_MODEL`, typically opus). That
+model (set by the launcher via `DEVBENCH_CLAUDE_MODEL`, typically opus). That
 caller-supplied model **only governs the orchestrate skill's own coordination
 calls**: every `Agent(...)` invocation that fires a work agent uses the
 agent's own frontmatter model, not the orchestrate skill's.
@@ -109,7 +109,7 @@ agents:
 ```
 
 Every field defaults to `null` when absent; a null (or absent) field leaves
-the agent running on its frontmatter model. `JUDGE_AGENT_MODEL_<NAME>` env vars override the YAML on
+the agent running on its frontmatter model. `DEVBENCH_AGENT_MODEL_<NAME>` (or `JUDGE_AGENT_MODEL_<NAME>` for the five review judges + review-supervisor) env vars override the YAML on
 a per-call basis (precedence: env > yaml > frontmatter).
 
 The shadow tree lives at `<workspace>/.devbench/plugin-shadow/devbench/`.
@@ -209,6 +209,6 @@ the same workspace that the orchestrator is processing.
 
 - `src/devbench/plugin_shadow.py` -- materialiser implementation.
 - `src/devbench/config_loader.py` -- `AgentModelsConfig` dataclass and parser.
-- `src/devbench/config.py` -- `JUDGE_AGENT_MODEL_*` env var merge.
+- `src/devbench/config.py` -- `DEVBENCH_AGENT_MODEL_* (non-judge agents) / JUDGE_AGENT_MODEL_* (judge agents)` env var merge.
 - `src/devbench/cli.py` -- `cmd_start` pre-flight and `cmd_prepare_plugin_shadow`.
 - `tests/test_plugin_shadow.py` -- 100% line + branch coverage gate.

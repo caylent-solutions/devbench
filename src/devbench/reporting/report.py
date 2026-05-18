@@ -1134,7 +1134,7 @@ def _orchestrator_liveness_banner(
 
     Args:
         log_path: Path to the structured orchestrator log.
-        session_id: Optional ``JUDGE_ORCHESTRATOR_SESSION_ID`` value. When
+        session_id: Optional ``DEVBENCH_ORCHESTRATOR_SESSION_ID`` value. When
             empty/None, the banner suppresses the trailing
             ``-- session ...`` suffix.
         threshold_seconds: Quiet-window cap. ``stop_hook.window_seconds``.
@@ -2366,7 +2366,7 @@ def generate_report(
     # express "last activity Ns ago" -- if we cached it inside the
     # snapshot the elapsed-since string would freeze and a stalled
     # orchestrator would still appear ALIVE on every watch tick.
-    session_id = os.environ.get("JUDGE_ORCHESTRATOR_SESSION_ID", "").strip() or None
+    session_id = os.environ.get("DEVBENCH_ORCHESTRATOR_SESSION_ID", "").strip() or None
     banner_display_tz = _resolve_display_timezone(REPORT_DISPLAY_TIMEZONE or DISPLAY_TIMEZONE)
     banner_line = _orchestrator_liveness_banner(
         log_path=log_path,
@@ -2461,8 +2461,8 @@ def generate_report(
     all_timestamps: list[datetime] = event_index.all_log_timestamps_for_workspace(WORKSPACE_ROOT, log_path)
     log_start_for_window, window_end, log_started = _resolve_window_endpoints(all_timestamps)
 
-    # Precedence: report-specific (env JUDGE_REPORT_TIMEZONE > yaml
-    # report.display_timezone) > top-level (env JUDGE_DISPLAY_TIMEZONE >
+    # Precedence: report-specific (env DEVBENCH_REPORT_TIMEZONE > yaml
+    # report.display_timezone) > top-level (env DEVBENCH_DISPLAY_TIMEZONE >
     # yaml display_timezone) > OS local. REPORT_DISPLAY_TIMEZONE already
     # encodes the first pair; DISPLAY_TIMEZONE the second.
     display_tz = _resolve_display_timezone(REPORT_DISPLAY_TIMEZONE or DISPLAY_TIMEZONE)
@@ -2613,7 +2613,7 @@ def generate_report(
         # All-time throughput window (which spans the entire log) shows
         # zero, the operator is reading a different log than the one
         # the orchestrator writes to -- typically because
-        # ``JUDGE_LOG_FILE`` was unset in the shell that ran
+        # ``DEVBENCH_LOG_FILE`` was unset in the shell that ran
         # ``devbench report`` and the default fell back to the devbench
         # source-tree log. Surface the discrepancy as a one-line
         # warning so the user does not silently misread the table.
@@ -2622,7 +2622,7 @@ def generate_report(
             lines.append("")
             lines.append(
                 f"WARNING: BACKLOG.md shows {backlog.tasks_done} done but log {log_path} shows 0 "
-                "-- check JUDGE_LOG_FILE points at the orchestrator's log."
+                "-- check DEVBENCH_LOG_FILE points at the orchestrator's log."
             )
         # Use the All-time stats for the trailing prose projection -- they're the
         # most stable sample. Narrower windows can have zero completed tasks

@@ -103,16 +103,22 @@ The skill scores the draft against 8 items after every revision:
 | Spec file | `spec/<project-name>.md` | Written after operator approves the draft |
 | Audit comment | stdout | `[QUALITY_REFERENCE] <kanon-spec-path>` emitted on success |
 
-## Configuration
+## Bounded self-critique loop
 
-`max_iterations` (self-critique loop cap) defaults to 5 and is configurable in
-`backlog/config/devbench.yaml` under the `skills` section:
+The iterate-until-perfect loop is bounded by constants in
+`src/devbench/constants.py`:
 
-```yaml
-skills:
-  create_spec:
-    max_iterations: 5
-```
+- `SKILL_MAX_ITERATIONS` -- maximum self-critique passes before the skill
+  emits `[SKILL_MAX_ITERATIONS_REACHED]` and exits non-zero.
+- `SKILL_QUALITY_THRESHOLD` -- unresolved-item count at which the skill
+  emits `[SKILL_QUALITY_THRESHOLD_REACHED]` and exits success.
+
+State persistence and audit emission are handled by
+`src/devbench/skill_state.py` (`read_checkpoint`, `write_checkpoint`,
+`emit_audit`). The checkpoint file lives at
+`<workspace>/.devbench/skill-state/create-spec.json` between iterations.
+The audit tags flow through the existing `devbench report` and
+`devbench hook-tail` pipelines without any new infrastructure.
 
 ## Cross-references
 

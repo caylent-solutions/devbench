@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import urllib.parse
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -2193,8 +2194,8 @@ class TestQuotaCheckpointDataclass:
     _NOW = datetime(2026, 3, 1, 10, 0, 0, tzinfo=UTC)
     _RESET = datetime(2026, 3, 1, 15, 0, 0, tzinfo=UTC)
 
-    def _make(self, **overrides: object) -> QuotaCheckpoint:
-        defaults: dict[str, object] = {
+    def _make(self, **overrides: Any) -> QuotaCheckpoint:
+        defaults: dict[str, Any] = {
             "paused_at": self._NOW,
             "reset_at": self._RESET,
             "reason": "subscription_rate_limit",
@@ -2206,7 +2207,7 @@ class TestQuotaCheckpointDataclass:
             "stage_artefacts": {"branch": "feat/quota"},
         }
         defaults.update(overrides)
-        return QuotaCheckpoint(**defaults)  # type: ignore[arg-type]
+        return QuotaCheckpoint(**defaults)
 
     def test_is_dataclass(self) -> None:
         """QuotaCheckpoint can be instantiated with all required fields."""
@@ -2576,8 +2577,8 @@ class TestSaveCheckpointPathResolution:
 
     _NOW = datetime(2026, 3, 1, 10, 0, 0, tzinfo=UTC)
 
-    def _save(self, session_dir: Path, **overrides: object) -> Path:
-        kwargs: dict[str, object] = {
+    def _save(self, session_dir: Path, **overrides: Any) -> Path:
+        kwargs: dict[str, Any] = {
             "session_dir": session_dir,
             "paused_at": self._NOW,
             "reset_at": None,
@@ -2590,7 +2591,7 @@ class TestSaveCheckpointPathResolution:
             "stage_artefacts": {},
         }
         kwargs.update(overrides)
-        save_checkpoint(**kwargs)  # type: ignore[arg-type]
+        save_checkpoint(**kwargs)
         return session_dir / ".devbench" / "quota_pause.json"
 
     def test_uses_session_dir_when_provided(self, tmp_path: Path) -> None:
@@ -3640,7 +3641,6 @@ class TestPostWebhook:
 
     def test_post_webhook_sends_json_body(self) -> None:
         """post_webhook encodes payload as JSON and calls _http_post with correct args."""
-        import urllib.parse
 
         from devbench.quota import post_webhook
 
@@ -3667,7 +3667,6 @@ class TestPostWebhook:
 
     def test_post_webhook_sets_content_type_json_header(self) -> None:
         """post_webhook includes Content-Type: application/json in the headers passed to _http_post."""
-        import urllib.parse
 
         from devbench.quota import post_webhook
 
@@ -3767,6 +3766,111 @@ class TestPostWebhook:
 
         with pytest.raises(ValueError, match=error_fragment):
             post_webhook(url, payload, timeout_seconds=timeout_seconds)
+
+
+# ---------------------------------------------------------------------------
+# Issue #203: _http_post internals -- direct coverage of the network-level
+# helper that post_webhook delegates to. Existing TestPostWebhook stubs
+# _http_post itself; this class drives _http_post directly with patched
+# http.client connection classes so the HTTPS/HTTP branches, path/query
+# construction, and finally-block close are all exercised.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestHttpPostInternals:
+    """Issue #203: cover the network-level POST helper without real I/O.
+
+    Drives :func:`devbench.quota._http_post` directly with patched
+    ``http.client.HTTPSConnection`` and ``HTTPConnection`` classes that
+    record constructor arguments and the ``request`` / ``getresponse`` /
+    ``read`` / ``close`` call sequence.  No real sockets are opened.
+    """
+
+    @staticmethod
+    def _split(url: str) -> urllib.parse.SplitResult:
+        return urllib.parse.urlsplit(url)
+
+    @staticmethod
+    def _conn_factories(
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        request_raises: Exception | None = None,
+    ) -> tuple[MagicMock, MagicMock, MagicMock]:
+        """Patch http.client connection classes; return (https_cls, http_cls, conn_instance)."""
+        from devbench import quota as quota_mod
+
+        conn = MagicMock(name="conn")
+        if request_raises is not None:
+            conn.request.side_effect = request_raises
+        conn.getresponse.return_value = MagicMock(read=MagicMock(return_value=b""))
+
+        https_cls = MagicMock(name="HTTPSConnection", return_value=conn)
+        http_cls = MagicMock(name="HTTPConnection", return_value=conn)
+        monkeypatch.setattr(quota_mod.http.client, "HTTPSConnection", https_cls)
+        monkeypatch.setattr(quota_mod.http.client, "HTTPConnection", http_cls)
+        return https_cls, http_cls, conn
+
+    def test_https_scheme_uses_https_connection(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An https:// URL is dispatched through HTTPSConnection with hostname + port + timeout."""
+        from devbench.quota import _http_post
+
+        https_cls, http_cls, conn = self._conn_factories(monkeypatch)
+        _http_post(self._split("https://example.com/hook"), b"{}", {"Content-Type": "application/json"}, 7.5)
+
+        https_cls.assert_called_once_with("example.com", port=None, timeout=7.5)
+        http_cls.assert_not_called()
+        conn.request.assert_called_once_with("POST", "/hook", body=b"{}", headers={"Content-Type": "application/json"})
+        conn.getresponse.assert_called_once_with()
+        conn.close.assert_called_once_with()
+
+    def test_http_scheme_with_port_uses_http_connection(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An http:// URL with an explicit port is dispatched through HTTPConnection."""
+        from devbench.quota import _http_post
+
+        https_cls, http_cls, conn = self._conn_factories(monkeypatch)
+        _http_post(self._split("http://example.com:8080/hook"), b"{}", {"Content-Type": "application/json"}, 3.0)
+
+        http_cls.assert_called_once_with("example.com", port=8080, timeout=3.0)
+        https_cls.assert_not_called()
+        conn.request.assert_called_once_with("POST", "/hook", body=b"{}", headers={"Content-Type": "application/json"})
+
+    def test_path_with_query_string_preserved(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A URL with a query string is passed to conn.request with the query intact."""
+        from devbench.quota import _http_post
+
+        _, _, conn = self._conn_factories(monkeypatch)
+        _http_post(self._split("https://example.com/hook?x=1&y=2"), b"{}", {"Content-Type": "application/json"}, 5.0)
+
+        conn.request.assert_called_once_with(
+            "POST", "/hook?x=1&y=2", body=b"{}", headers={"Content-Type": "application/json"}
+        )
+
+    def test_empty_path_defaults_to_root(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A URL with no path component is dispatched with path '/'."""
+        from devbench.quota import _http_post
+
+        _, _, conn = self._conn_factories(monkeypatch)
+        _http_post(self._split("https://example.com"), b"{}", {"Content-Type": "application/json"}, 5.0)
+
+        conn.request.assert_called_once_with("POST", "/", body=b"{}", headers={"Content-Type": "application/json"})
+
+    def test_exception_in_request_still_closes_connection(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When conn.request raises, the finally-block must still call conn.close."""
+        from devbench.quota import _http_post
+
+        boom = RuntimeError("boom")
+        _, _, conn = self._conn_factories(monkeypatch, request_raises=boom)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            _http_post(
+                self._split("https://example.com/hook"),
+                b"{}",
+                {"Content-Type": "application/json"},
+                5.0,
+            )
+
+        conn.close.assert_called_once_with()
 
 
 # ---------------------------------------------------------------------------

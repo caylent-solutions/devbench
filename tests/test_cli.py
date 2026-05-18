@@ -2676,9 +2676,9 @@ class TestPreParseConfig:
 
         config_path = str(tmp_path / "custom.yaml")
         argv = ["judges.cli", "--config", config_path, "status"]
-        monkeypatch.delenv("JUDGE_CONFIG_PATH", raising=False)
+        monkeypatch.delenv("DEVBENCH_CONFIG_PATH", raising=False)
         cli._pre_parse_config(argv)
-        assert os.environ.get("JUDGE_CONFIG_PATH") == config_path
+        assert os.environ.get("DEVBENCH_CONFIG_PATH") == config_path
         assert "--config" not in argv
         assert config_path not in argv
         assert argv == ["judges.cli", "status"]
@@ -5233,16 +5233,16 @@ class TestCmdStart:
         import types
 
         # Create a mock claude_agent_sdk module
-        mock_sdk = types.ModuleType("claude_agent_sdk")
+        mock_sdk: Any = types.ModuleType("claude_agent_sdk")
 
         mock_options_cls = MagicMock()
-        mock_sdk.ClaudeAgentOptions = mock_options_cls  # type: ignore[attr-defined]
+        mock_sdk.ClaudeAgentOptions = mock_options_cls
 
         async def mock_query(**kwargs: object) -> object:
             # Async generator that yields a message to cover line 882
             yield "test message"
 
-        mock_sdk.query = mock_query  # type: ignore[attr-defined]
+        mock_sdk.query = mock_query
 
         with (
             patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
@@ -6410,7 +6410,7 @@ class TestCmdWatch:
 
     def test_cmd_watch_reads_devbench_log_file_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # AC-197-1: cmd_watch reads DEVBENCH_LOG_FILE as the canonical env var.
-        monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
+        monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
         monkeypatch.setenv("DEVBENCH_LOG_FILE", "/tmp/test-log.log")
         captured_paths: list[object] = []
 
@@ -6425,13 +6425,6 @@ class TestCmdWatch:
             rc = cli.cmd_watch(watch_interval=0)
         assert rc == 0
         assert captured_paths and captured_paths[0] == Path("/tmp/test-log.log")
-
-    def test_cmd_watch_rejects_legacy_judge_log_file(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # AC-197-2: JUDGE_LOG_FILE is hard-rejected in cmd_watch.
-        monkeypatch.setenv("JUDGE_LOG_FILE", "/tmp/legacy.log")
-        monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
-        with pytest.raises(RuntimeError, match="JUDGE_LOG_FILE is no longer accepted"):
-            cli.cmd_watch(watch_interval=0)
 
     def test_resolver_returns_none_on_unknown_repo(self, capsys: pytest.CaptureFixture[str]) -> None:
         """The inline repo resolver returns None when resolve_repo rejects the name."""
@@ -9432,7 +9425,7 @@ class TestCmdHookTail:
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        monkeypatch.delenv("JUDGE_ORCHESTRATOR_SESSION_ID", raising=False)
+        monkeypatch.delenv("DEVBENCH_ORCHESTRATOR_SESSION_ID", raising=False)
         monkeypatch.delenv("DEVBENCH_ORCHESTRATOR_SESSION_ID", raising=False)
         rc = cli.cmd_hook_tail("--orchestrator-only", "--no-follow")
         assert rc == 2
@@ -9444,21 +9437,11 @@ class TestCmdHookTail:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         # AC-197-1: canonical DEVBENCH_ORCHESTRATOR_SESSION_ID is read.
-        monkeypatch.delenv("JUDGE_ORCHESTRATOR_SESSION_ID", raising=False)
+        monkeypatch.delenv("DEVBENCH_ORCHESTRATOR_SESSION_ID", raising=False)
         monkeypatch.setenv("DEVBENCH_ORCHESTRATOR_SESSION_ID", "test-session-456")
         rc = cli.cmd_hook_tail("--orchestrator-only", "--no-follow")
         # The session ID is consumed; output may vary but exit should not be 2.
         assert rc != 2
-
-    def test_orchestrator_only_with_legacy_env_raises_runtime_error(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        # AC-197-2: JUDGE_ORCHESTRATOR_SESSION_ID is hard-rejected.
-        monkeypatch.setenv("JUDGE_ORCHESTRATOR_SESSION_ID", "legacy-session")
-        monkeypatch.delenv("DEVBENCH_ORCHESTRATOR_SESSION_ID", raising=False)
-        with pytest.raises(RuntimeError, match="JUDGE_ORCHESTRATOR_SESSION_ID is no longer accepted"):
-            cli.cmd_hook_tail("--orchestrator-only", "--no-follow")
 
     def test_orchestrator_session_missing_value_returns_2(
         self,
@@ -9707,9 +9690,9 @@ class TestCmdCheck:
         capsys: pytest.CaptureFixture[str],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        # Point JUDGE_CONFIG_PATH at a nonexistent file so resolve_config_path
+        # Point DEVBENCH_CONFIG_PATH at a nonexistent file so resolve_config_path
         # does not fall back to the suite-wide test fixture YAML.
-        monkeypatch.setenv("JUDGE_CONFIG_PATH", str(tmp_path / "no-such.yaml"))
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(tmp_path / "no-such.yaml"))
         with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
             rc = cli.cmd_check()
         assert rc == 1
@@ -9725,7 +9708,7 @@ class TestCmdCheck:
             tmp_path,
             "  org/repo-a:\n    checkout_directory: repo-a\n    default_branch: main\n",
         )
-        monkeypatch.setenv("JUDGE_CONFIG_PATH", str(cfg))
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg))
         with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
             rc = cli.cmd_check()
         assert rc == 1
@@ -9748,7 +9731,7 @@ class TestCmdCheck:
             "  org/repo-a:\n    checkout_directory: repo-a\n    default_branch: main\n",
             single_branch="feat/x",
         )
-        monkeypatch.setenv("JUDGE_CONFIG_PATH", str(cfg))
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg))
 
         def fake_run(args: list[str], **_: Any) -> Any:
             mock = MagicMock()
@@ -9788,7 +9771,7 @@ class TestCmdCheck:
             tmp_path,
             "  org/repo-a:\n    checkout_directory: repo-a\n    default_branch: main2\n",
         )
-        monkeypatch.setenv("JUDGE_CONFIG_PATH", str(cfg))
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg))
 
         def fake_run(args: list[str], **_: Any) -> Any:
             mock = MagicMock()
@@ -9828,7 +9811,7 @@ class TestCmdCheck:
             "  org/repo-a:\n    checkout_directory: repo-a\n    default_branch: main\n",
             single_branch="feat/x",
         )
-        monkeypatch.setenv("JUDGE_CONFIG_PATH", str(cfg))
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg))
 
         def fake_run(args: list[str], **_: Any) -> Any:
             mock = MagicMock()
@@ -9884,7 +9867,7 @@ class TestCmdCheck:
         clone.mkdir()
         (tmp_path / "repo-a").symlink_to(clone)
         cfg = self._write_local_only_yaml(tmp_path)
-        monkeypatch.setenv("JUDGE_CONFIG_PATH", str(cfg))
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg))
 
         def fake_run(args: list[str], **_: Any) -> Any:
             mock = MagicMock()
@@ -9917,7 +9900,7 @@ class TestCmdCheck:
         clone.mkdir()
         (tmp_path / "repo-a").symlink_to(clone)
         cfg = self._write_local_only_yaml(tmp_path)
-        monkeypatch.setenv("JUDGE_CONFIG_PATH", str(cfg))
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg))
 
         def fake_run(args: list[str], **_: Any) -> Any:
             mock = MagicMock()
@@ -10917,19 +10900,19 @@ class TestResolveLogFilePath:
     an unrelated dev-tree log instead of their workspace's log).
 
     After the JUDGE_* -> DEVBENCH_* rename (AC-197-1 / AC-197-2), the resolver
-    uses ``_read_env_strict`` to hard-reject any set legacy ``JUDGE_LOG_FILE``
+    reads ``DEVBENCH_LOG_FILE`` directly via os.environ.get
     and reads ``DEVBENCH_LOG_FILE`` as the canonical name.
     """
 
     def test_explicit_devbench_log_file_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
+        monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
         monkeypatch.setenv("DEVBENCH_LOG_FILE", "/tmp/my-explicit.log")
         # DEVBENCH_LOG_FILE is the explicit override and MUST win even when
         # DEVBENCH_WORKSPACE_ROOT (via WORKSPACE_ROOT) is also set.
         assert cli._resolve_log_file_path() == Path("/tmp/my-explicit.log")
 
     def test_workspace_root_derives_canonical_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
+        monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
         monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
         # Default path is <WORKSPACE_ROOT>/<DEFAULT_LOG_SUBDIR>/<DEFAULT_LOG_FILENAME>.
         # Operators running ``devbench report`` from any shell with
@@ -10942,7 +10925,7 @@ class TestResolveLogFilePath:
     def test_empty_devbench_log_file_falls_through_to_workspace_root(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Empty / whitespace-only DEVBENCH_LOG_FILE behaves as unset
         # (avoids "" being treated as a valid path).
-        monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
+        monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
         monkeypatch.setenv("DEVBENCH_LOG_FILE", "   ")
         from devbench.constants import DEFAULT_LOG_FILENAME, DEFAULT_LOG_SUBDIR
 
@@ -10953,32 +10936,12 @@ class TestResolveLogFilePath:
         # When neither DEVBENCH_LOG_FILE nor YAML log_file is set,
         # the resolver uses WORKSPACE_ROOT (already resolved from
         # DEVBENCH_WORKSPACE_ROOT by config.py) to derive the canonical path.
-        monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
+        monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
         monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
         from devbench.constants import DEFAULT_LOG_FILENAME, DEFAULT_LOG_SUBDIR
 
         expected = cli.WORKSPACE_ROOT / DEFAULT_LOG_SUBDIR / DEFAULT_LOG_FILENAME
         assert cli._resolve_log_file_path() == expected
-
-    def test_legacy_judge_log_file_raises_runtime_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # AC-197-2: setting JUDGE_LOG_FILE causes a hard RuntimeError.
-        # The operator must migrate to DEVBENCH_LOG_FILE via devbench migrate-env.
-        monkeypatch.setenv("JUDGE_LOG_FILE", "/tmp/legacy.log")
-        monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
-        with pytest.raises(RuntimeError, match="JUDGE_LOG_FILE is no longer accepted"):
-            cli._resolve_log_file_path()
-
-    def test_legacy_judge_log_file_with_new_also_set_still_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # AC-197-3: legacy presence is the disqualifier regardless of new-name.
-        monkeypatch.setenv("JUDGE_LOG_FILE", "/tmp/legacy.log")
-        monkeypatch.setenv("DEVBENCH_LOG_FILE", "/tmp/new.log")
-        with pytest.raises(RuntimeError, match="JUDGE_LOG_FILE is no longer accepted"):
-            cli._resolve_log_file_path()
-
-
-# ---------------------------------------------------------------------------
-# log_file YAML config (Option 2): YAML drives both writer and reader
-# ---------------------------------------------------------------------------
 
 
 class TestResolveLogFileYamlConfig:
@@ -11000,7 +10963,7 @@ class TestResolveLogFileYamlConfig:
         return dataclasses.replace(cli.RUNTIME_CONFIG, log_file=value)
 
     def test_yaml_log_file_workspace_relative(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
+        monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
         monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
         monkeypatch.setattr(cli, "RUNTIME_CONFIG", self._runtime_config_with_log_file("logs/orch.log"))
         # YAML log_file is workspace-relative when not absolute; the
@@ -11008,7 +10971,7 @@ class TestResolveLogFileYamlConfig:
         assert cli._resolve_log_file_path() == cli.WORKSPACE_ROOT / "logs" / "orch.log"
 
     def test_yaml_log_file_absolute_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
+        monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
         monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
         monkeypatch.setattr(cli, "RUNTIME_CONFIG", self._runtime_config_with_log_file("/var/log/d.log"))
         # An absolute YAML path is used as-is, ignoring the workspace
@@ -11016,7 +10979,7 @@ class TestResolveLogFileYamlConfig:
         assert cli._resolve_log_file_path() == Path("/var/log/d.log")
 
     def test_explicit_devbench_log_file_still_wins_over_yaml(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
+        monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
         monkeypatch.setenv("DEVBENCH_LOG_FILE", "/tmp/explicit.log")
         monkeypatch.setattr(cli, "RUNTIME_CONFIG", self._runtime_config_with_log_file("logs/orch.log"))
         # Per-invocation DEVBENCH_LOG_FILE env override beats both YAML config and the
@@ -11025,7 +10988,7 @@ class TestResolveLogFileYamlConfig:
         assert cli._resolve_log_file_path() == Path("/tmp/explicit.log")
 
     def test_yaml_unset_falls_through_to_workspace_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
+        monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
         monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
         monkeypatch.setattr(cli, "RUNTIME_CONFIG", self._runtime_config_with_log_file(None))
         from devbench.constants import DEFAULT_LOG_FILENAME, DEFAULT_LOG_SUBDIR
@@ -11036,7 +10999,7 @@ class TestResolveLogFileYamlConfig:
 
     def test_yaml_with_relative_path_and_workspace_root(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # YAML has a relative log_file; WORKSPACE_ROOT is used as the anchor.
-        monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
+        monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
         monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
         monkeypatch.setattr(cli, "RUNTIME_CONFIG", self._runtime_config_with_log_file("logs/orch.log"))
         # WORKSPACE_ROOT is already resolved; relative YAML path is joined to it.
@@ -11155,7 +11118,7 @@ class TestInlineOrphanCleanup:
         ``ValueError`` and BLOCKS the work unit. This test exercises the
         documented workspace-layout pattern where target repos sit
         elsewhere on disk and a symlink under
-        ``JUDGE_WORKSPACE_ROOT/<checkout_directory>`` points at them.
+        ``DEVBENCH_WORKSPACE_ROOT/<checkout_directory>`` points at them.
         """
         import subprocess
 
@@ -12902,7 +12865,7 @@ class TestInProgressAttemptDurationRender:
             "2026-05-02T12:00:00Z [devbench.cli] INFO Set E0-F1-S1-T2 to 'in-progress'\n",
             encoding="utf-8",
         )
-        monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
+        monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
         monkeypatch.setenv("DEVBENCH_LOG_FILE", str(log_path))
         # Freeze time so the duration output is deterministic.
         fake_now = datetime(2026, 5, 2, 12, 23, 0, tzinfo=UTC)
@@ -12910,7 +12873,7 @@ class TestInProgressAttemptDurationRender:
         class _FrozenDT(datetime):
             @classmethod
             def now(cls, tz: object = None) -> _FrozenDT:
-                return _FrozenDT.fromtimestamp(fake_now.timestamp(), tz=UTC)  # type: ignore[arg-type]
+                return _FrozenDT.fromtimestamp(fake_now.timestamp(), tz=UTC)
 
         monkeypatch.setattr("devbench.cli.datetime", _FrozenDT)
 
@@ -12970,7 +12933,7 @@ class TestInProgressAttemptDurationFallback:
         class _FrozenDT(datetime):
             @classmethod
             def now(cls, tz: object = None) -> _FrozenDT:
-                return _FrozenDT.fromtimestamp(fake_now.timestamp(), tz=UTC)  # type: ignore[arg-type]
+                return _FrozenDT.fromtimestamp(fake_now.timestamp(), tz=UTC)
 
         monkeypatch.setattr("devbench.cli.datetime", _FrozenDT)
         with patch("devbench.cli._resolve_unit_file_by_id", return_value=wu):
@@ -12998,7 +12961,7 @@ class TestInProgressAttemptDurationLatestAttemptOnly:
         class _FrozenDT(datetime):
             @classmethod
             def now(cls, tz: object = None) -> _FrozenDT:
-                return _FrozenDT.fromtimestamp(fake_now.timestamp(), tz=UTC)  # type: ignore[arg-type]
+                return _FrozenDT.fromtimestamp(fake_now.timestamp(), tz=UTC)
 
         monkeypatch.setattr("devbench.cli.datetime", _FrozenDT)
         result = cli._in_progress_attempt_duration("E0-F1-S1-T1", log_path=log_path)
@@ -13058,7 +13021,7 @@ class TestTryResolveLogFilePath:
         # back to the canonical WORKSPACE_ROOT / DEFAULT_LOG_SUBDIR / DEFAULT_LOG_FILENAME
         # path.  _try_resolve_log_file_path therefore returns that path
         # rather than None.
-        monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
+        monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
         monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
         from devbench.constants import DEFAULT_LOG_FILENAME, DEFAULT_LOG_SUBDIR
 
@@ -13071,7 +13034,7 @@ class TestTryResolveLogFilePath:
     def test_returns_path_when_yaml_log_file_set(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """When ``DEVBENCH_LOG_FILE`` is unset but YAML config carries a
         ``log_file``, the wrapper resolves the workspace-relative path."""
-        monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
+        monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
         monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
         cfg = MagicMock()
         cfg.log_file = "logs/orch.log"
@@ -13091,7 +13054,7 @@ class TestTryResolveLogFilePath:
             "2026-05-02T12:00:00Z [devbench.cli] INFO Set E0-F1-S1-T1 to 'in-progress'\n",
             encoding="utf-8",
         )
-        monkeypatch.delenv("JUDGE_LOG_FILE", raising=False)
+        monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
         monkeypatch.delenv("DEVBENCH_LOG_FILE", raising=False)
         cfg = MagicMock()
         cfg.log_file = "logs/orch.log"
@@ -13792,14 +13755,14 @@ class TestCmdStartUsesShadow:
 
         from devbench.config_loader import AgentModelsConfig
 
-        mock_sdk = types.ModuleType("claude_agent_sdk")
+        mock_sdk: Any = types.ModuleType("claude_agent_sdk")
         mock_options_cls = MagicMock()
-        mock_sdk.ClaudeAgentOptions = mock_options_cls  # type: ignore[attr-defined]
+        mock_sdk.ClaudeAgentOptions = mock_options_cls
 
         async def mock_query(**kwargs: object) -> object:
             yield "test message"
 
-        mock_sdk.query = mock_query  # type: ignore[attr-defined]
+        mock_sdk.query = mock_query
 
         with (
             patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
@@ -13835,14 +13798,14 @@ class TestCmdStartUsesShadow:
 
         from devbench.config_loader import AgentModelsConfig
 
-        mock_sdk = types.ModuleType("claude_agent_sdk")
+        mock_sdk: Any = types.ModuleType("claude_agent_sdk")
         mock_options_cls = MagicMock()
-        mock_sdk.ClaudeAgentOptions = mock_options_cls  # type: ignore[attr-defined]
+        mock_sdk.ClaudeAgentOptions = mock_options_cls
 
         async def mock_query(**kwargs: object) -> object:
             yield "test message"
 
-        mock_sdk.query = mock_query  # type: ignore[attr-defined]
+        mock_sdk.query = mock_query
 
         with (
             patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
@@ -13872,13 +13835,13 @@ class TestCmdStartAutoRestartPostMortem:
     def _mocked_sdk(self) -> object:
         import types
 
-        mock_sdk = types.ModuleType("claude_agent_sdk")
-        mock_sdk.ClaudeAgentOptions = MagicMock()  # type: ignore[attr-defined]
+        mock_sdk: Any = types.ModuleType("claude_agent_sdk")
+        mock_sdk.ClaudeAgentOptions = MagicMock()
 
         async def mock_query(**kwargs: object) -> object:
             yield "msg"
 
-        mock_sdk.query = mock_query  # type: ignore[attr-defined]
+        mock_sdk.query = mock_query
         return mock_sdk
 
     def test_returns_42_when_only_blockers_are_runtime_degradation(
@@ -13946,13 +13909,13 @@ class _CmdStartScopeTestBase:
     def _make_sdk_mock(self) -> object:
         import types
 
-        mock_sdk = types.ModuleType("claude_agent_sdk")
-        mock_sdk.ClaudeAgentOptions = MagicMock()  # type: ignore[attr-defined]
+        mock_sdk: Any = types.ModuleType("claude_agent_sdk")
+        mock_sdk.ClaudeAgentOptions = MagicMock()
 
         async def _query(**kwargs: object) -> object:
             yield "msg"
 
-        mock_sdk.query = _query  # type: ignore[attr-defined]
+        mock_sdk.query = _query
         return mock_sdk
 
     # ------------------------------------------------------------------
@@ -14055,9 +14018,9 @@ class TestCmdStartScopeFlags(_CmdStartScopeTestBase):
                 captured.append(json.loads(scope_path.read_text()))
             yield "msg"
 
-        capturing_sdk = types.ModuleType("claude_agent_sdk")
-        capturing_sdk.ClaudeAgentOptions = MagicMock()  # type: ignore[attr-defined]
-        capturing_sdk.query = _capturing_query  # type: ignore[attr-defined]
+        capturing_sdk: Any = types.ModuleType("claude_agent_sdk")
+        capturing_sdk.ClaudeAgentOptions = MagicMock()
+        capturing_sdk.query = _capturing_query
         return capturing_sdk
 
     def test_include_flag_writes_scope_json(self, tmp_path: Path) -> None:
@@ -14163,9 +14126,9 @@ class TestCmdStartScopeFlags(_CmdStartScopeTestBase):
             captured_env.update(os.environ)
             yield "msg"
 
-        custom_sdk = types.ModuleType("claude_agent_sdk")
-        custom_sdk.ClaudeAgentOptions = MagicMock()  # type: ignore[attr-defined]
-        custom_sdk.query = _capturing_query  # type: ignore[attr-defined]
+        custom_sdk: Any = types.ModuleType("claude_agent_sdk")
+        custom_sdk.ClaudeAgentOptions = MagicMock()
+        custom_sdk.query = _capturing_query
 
         with self._patch_cli(tmp_path, mock_sdk=custom_sdk):
             rc = cli.cmd_start("--include", "E1")
@@ -14267,14 +14230,14 @@ class TestCmdStartScopeCleanExit(_CmdStartScopeTestBase):
         class _SDKError(RuntimeError):
             pass
 
-        crash_sdk = types.ModuleType("claude_agent_sdk")
-        crash_sdk.ClaudeAgentOptions = MagicMock()  # type: ignore[attr-defined]
+        crash_sdk: Any = types.ModuleType("claude_agent_sdk")
+        crash_sdk.ClaudeAgentOptions = MagicMock()
 
         async def _crash_query(**kwargs: object) -> object:
             raise _SDKError("simulated SDK crash")
             yield  # make it a generator
 
-        crash_sdk.query = _crash_query  # type: ignore[attr-defined]
+        crash_sdk.query = _crash_query
 
         with self._patch_cli(tmp_path, mock_sdk=crash_sdk):
             with pytest.raises(_SDKError):
@@ -17054,8 +17017,8 @@ def _make_sdk_with_claim_message() -> object:
 
     from claude_agent_sdk.types import AssistantMessage, ToolUseBlock
 
-    mock_sdk = types.ModuleType("claude_agent_sdk")
-    mock_sdk.ClaudeAgentOptions = MagicMock()  # type: ignore[attr-defined]
+    mock_sdk: Any = types.ModuleType("claude_agent_sdk")
+    mock_sdk.ClaudeAgentOptions = MagicMock()
 
     async def mock_query(**kwargs: object) -> object:
         yield AssistantMessage(
@@ -17069,7 +17032,7 @@ def _make_sdk_with_claim_message() -> object:
             model="claude-opus-4-5",
         )
 
-    mock_sdk.query = mock_query  # type: ignore[attr-defined]
+    mock_sdk.query = mock_query
     return mock_sdk
 
 
@@ -17101,13 +17064,13 @@ class TestCmdStartDrainEnforcement:
         """Return a fake SDK module that yields only non-claim messages."""
         import types
 
-        mock_sdk = types.ModuleType("claude_agent_sdk")
-        mock_sdk.ClaudeAgentOptions = MagicMock()  # type: ignore[attr-defined]
+        mock_sdk: Any = types.ModuleType("claude_agent_sdk")
+        mock_sdk.ClaudeAgentOptions = MagicMock()
 
         async def mock_query(**kwargs: object) -> object:
             yield "plain string message"
 
-        mock_sdk.query = mock_query  # type: ignore[attr-defined]
+        mock_sdk.query = mock_query
         return mock_sdk
 
     @pytest.mark.unit
@@ -17411,8 +17374,8 @@ def _make_sdk_with_non_claim_then_claim_messages() -> object:
 
     from claude_agent_sdk.types import AssistantMessage, TextBlock, ToolUseBlock
 
-    mock_sdk = types.ModuleType("claude_agent_sdk")
-    mock_sdk.ClaudeAgentOptions = MagicMock()  # type: ignore[attr-defined]
+    mock_sdk: Any = types.ModuleType("claude_agent_sdk")
+    mock_sdk.ClaudeAgentOptions = MagicMock()
 
     async def mock_query(**kwargs: object) -> object:
         # Non-claim messages representing WU1 processing (text output, sub-tool calls, etc.)
@@ -17436,7 +17399,7 @@ def _make_sdk_with_non_claim_then_claim_messages() -> object:
             model="claude-opus-4-5",
         )
 
-    mock_sdk.query = mock_query  # type: ignore[attr-defined]
+    mock_sdk.query = mock_query
     return mock_sdk
 
 
@@ -17565,8 +17528,8 @@ class TestCmdStartPreArmDrain:
 
         messages_seen: list[str] = []
 
-        mock_sdk_counting = types.ModuleType("claude_agent_sdk")
-        mock_sdk_counting.ClaudeAgentOptions = MagicMock()  # type: ignore[attr-defined]
+        mock_sdk_counting: Any = types.ModuleType("claude_agent_sdk")
+        mock_sdk_counting.ClaudeAgentOptions = MagicMock()
 
         async def mock_query_counting(**kwargs: object) -> object:
             msg1 = AssistantMessage(
@@ -17594,7 +17557,7 @@ class TestCmdStartPreArmDrain:
             yield msg3
             messages_seen.append("wu2-claim-message")
 
-        mock_sdk_counting.query = mock_query_counting  # type: ignore[attr-defined]
+        mock_sdk_counting.query = mock_query_counting
 
         with (
             patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk_counting}),
@@ -19267,9 +19230,9 @@ class TestCmdStartQuotaHandling:
 
         original_save = cli.save_checkpoint
 
-        def _spy_save_checkpoint(**kw: object) -> None:
+        def _spy_save_checkpoint(**kw: Any) -> None:
             saved_payloads.append(dict(kw))
-            original_save(**kw)  # type: ignore[arg-type]
+            original_save(**kw)
 
         async def _fake_wait_for_reset(*_a: object, **_kw: object) -> bool:
             return True
@@ -19435,9 +19398,9 @@ class TestCmdStartQuotaHandling:
         save_calls: list[str] = []
         original_save = cli.save_checkpoint
 
-        def _spy_save(**kw: object) -> None:
-            save_calls.append(kw.get("reason", ""))  # type: ignore[arg-type]
-            original_save(**kw)  # type: ignore[arg-type]
+        def _spy_save(**kw: Any) -> None:
+            save_calls.append(kw.get("reason", ""))
+            original_save(**kw)
 
         with (
             patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
@@ -20976,283 +20939,3 @@ class TestDefaultRecoveryProbe:
         with patch("devbench.cli.recovery_probe", return_value=False):
             result = cli._default_recovery_probe()
         assert result is False
-
-
-@pytest.mark.unit
-class TestCmdMigrateEnv:
-    """Tests for cmd_migrate_env subcommand (AC-197-4, AC-197-5, AC-197-6, AC-197-7)."""
-
-    def test_no_args_prints_export_unset_lines_when_judge_vars_present(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        """AC-197-4: no-arg mode prints export + unset lines for each JUDGE_* var found."""
-        env_patch = {"JUDGE_WORKSPACE_ROOT": "/some/path", "JUDGE_CLAUDE_MODEL": "test-model"}
-        with patch("devbench.cli.os") as mock_os:
-            mock_os.environ = {**env_patch, "HOME": "/home/user", "PATH": "/usr/bin"}
-            rc = cli.cmd_migrate_env()
-        captured = capsys.readouterr()
-        assert rc == 0
-        assert 'export DEVBENCH_WORKSPACE_ROOT="$JUDGE_WORKSPACE_ROOT"' in captured.out
-        assert "unset JUDGE_WORKSPACE_ROOT" in captured.out
-        assert 'export DEVBENCH_CLAUDE_MODEL="$JUDGE_CLAUDE_MODEL"' in captured.out
-        assert "unset JUDGE_CLAUDE_MODEL" in captured.out
-
-    def test_no_args_exits_1_when_no_judge_vars_present(self, capsys: pytest.CaptureFixture[str]) -> None:
-        """AC-197-4: exit 1 with actionable message when no legacy JUDGE_* vars are set."""
-        with patch("devbench.cli.os") as mock_os:
-            mock_os.environ = {"HOME": "/home/user", "PATH": "/usr/bin"}
-            rc = cli.cmd_migrate_env()
-        captured = capsys.readouterr()
-        assert rc == 1
-        assert "no legacy JUDGE_* env vars set in current shell" in captured.err
-
-    def test_output_flag_writes_lines_to_file(self, tmp_path: Path) -> None:
-        """AC-197-5: --output <path> writes the export + unset lines to path."""
-        out_file = tmp_path / "subdir" / "migrate.sh"
-        env_patch = {"JUDGE_WORKSPACE_ROOT": "/some/path"}
-        with patch("devbench.cli.os") as mock_os:
-            mock_os.environ = {**env_patch, "HOME": "/home/user"}
-            rc = cli.cmd_migrate_env("--output", str(out_file))
-        assert rc == 0
-        assert out_file.exists()
-        content = out_file.read_text()
-        assert 'export DEVBENCH_WORKSPACE_ROOT="$JUDGE_WORKSPACE_ROOT"' in content
-        assert "unset JUDGE_WORKSPACE_ROOT" in content
-
-    def test_output_flag_exits_1_when_no_judge_vars(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        """AC-197-5: --output exits 1 (with stderr) when no legacy JUDGE_* vars found."""
-        out_file = tmp_path / "migrate.sh"
-        with patch("devbench.cli.os") as mock_os:
-            mock_os.environ = {"HOME": "/home/user"}
-            rc = cli.cmd_migrate_env("--output", str(out_file))
-        assert rc == 1
-        captured = capsys.readouterr()
-        assert "no legacy JUDGE_* env vars set in current shell" in captured.err
-        assert not out_file.exists()
-
-    def test_dry_run_prints_summary_count_and_var_names_not_export_lines(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        """AC-197-6: --dry-run prints summary count + var names, no export lines."""
-        env_patch = {"JUDGE_WORKSPACE_ROOT": "/some/path", "JUDGE_CLAUDE_MODEL": "test-model"}
-        with patch("devbench.cli.os") as mock_os:
-            mock_os.environ = {**env_patch, "HOME": "/home/user"}
-            rc = cli.cmd_migrate_env("--dry-run")
-        captured = capsys.readouterr()
-        assert rc == 0
-        assert "2" in captured.out
-        assert "JUDGE_WORKSPACE_ROOT" in captured.out
-        assert "JUDGE_CLAUDE_MODEL" in captured.out
-        assert "export" not in captured.out
-
-    def test_dry_run_exits_1_when_no_judge_vars(self, capsys: pytest.CaptureFixture[str]) -> None:
-        """AC-197-6: --dry-run exits 1 when no legacy vars found."""
-        with patch("devbench.cli.os") as mock_os:
-            mock_os.environ = {"HOME": "/home/user"}
-            rc = cli.cmd_migrate_env("--dry-run")
-        assert rc == 1
-        captured = capsys.readouterr()
-        assert "no legacy JUDGE_* env vars set in current shell" in captured.err
-
-    @pytest.mark.parametrize(
-        "judge_var,expected_devbench_var",
-        [
-            ("JUDGE_WORKSPACE_ROOT", "DEVBENCH_WORKSPACE_ROOT"),
-            ("JUDGE_CLAUDE_MODEL", "DEVBENCH_CLAUDE_MODEL"),
-            ("JUDGE_GH_TOKEN_FILE", "DEVBENCH_GH_TOKEN_FILE"),
-            ("JUDGE_CLAUDE_CREDENTIALS_FILE", "DEVBENCH_CLAUDE_CREDENTIALS_FILE"),
-            ("JUDGE_MAX_RETRIES", "DEVBENCH_MAX_RETRIES"),
-            ("JUDGE_GH_TIMEOUT", "DEVBENCH_GH_TIMEOUT"),
-        ],
-    )
-    def test_rename_mapping_judge_to_devbench(
-        self,
-        judge_var: str,
-        expected_devbench_var: str,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        """AC-197-4: Each JUDGE_<NAME> maps to DEVBENCH_<NAME> in the export line."""
-        with patch("devbench.cli.os") as mock_os:
-            mock_os.environ = {judge_var: "test-value", "HOME": "/home/user"}
-            rc = cli.cmd_migrate_env()
-        captured = capsys.readouterr()
-        assert rc == 0
-        assert f'export {expected_devbench_var}="${judge_var}"' in captured.out
-        assert f"unset {judge_var}" in captured.out
-
-    def test_migrate_env_is_registered_in_commands(self) -> None:
-        """AC-197-7: migrate-env is registered in _COMMANDS."""
-        assert "migrate-env" in cli._COMMANDS
-
-    def test_migrate_env_is_variadic(self) -> None:
-        """migrate-env is in _VARIADIC_COMMANDS so --output / --dry-run flags pass through."""
-        assert "migrate-env" in cli._VARIADIC_COMMANDS
-
-    def test_bootstrap_bypass_set_before_config_import(self) -> None:
-        """AC-197-7: _pre_parse_migrate_env sets DEVBENCH_BOOTSTRAP=1 when command is migrate-env."""
-        import os as real_os
-
-        test_argv = ["devbench", "migrate-env"]
-        original = real_os.environ.get("DEVBENCH_BOOTSTRAP", "")
-        try:
-            cli._pre_parse_migrate_env(test_argv)
-            assert real_os.environ.get("DEVBENCH_BOOTSTRAP") == "1", (
-                "DEVBENCH_BOOTSTRAP must be set to '1' when command is migrate-env"
-            )
-        finally:
-            if original:
-                real_os.environ["DEVBENCH_BOOTSTRAP"] = original
-            else:
-                real_os.environ.pop("DEVBENCH_BOOTSTRAP", None)
-
-    def test_bootstrap_not_set_for_other_commands(self) -> None:
-        """AC-197-7: _pre_parse_migrate_env does NOT set DEVBENCH_BOOTSTRAP for other commands."""
-        import os as real_os
-
-        test_argv = ["devbench", "status"]
-        real_os.environ.pop("DEVBENCH_BOOTSTRAP", None)
-        cli._pre_parse_migrate_env(test_argv)
-        assert "DEVBENCH_BOOTSTRAP" not in real_os.environ, (
-            "DEVBENCH_BOOTSTRAP must not be set for non-migrate-env commands"
-        )
-
-    def test_output_creates_parent_directory(self, tmp_path: Path) -> None:
-        """AC-197-5: --output creates parent directories as needed."""
-        out_file = tmp_path / "deep" / "nested" / "migrate.sh"
-        env_patch = {"JUDGE_WORKSPACE_ROOT": "/some/path"}
-        with patch("devbench.cli.os") as mock_os:
-            mock_os.environ = {**env_patch, "HOME": "/home/user"}
-            rc = cli.cmd_migrate_env("--output", str(out_file))
-        assert rc == 0
-        assert out_file.exists()
-
-    def test_output_does_not_modify_caller_env(self, tmp_path: Path) -> None:
-        """AC-197-5: --output is non-destructive (never modifies caller's env)."""
-        import os as real_os
-
-        out_file = tmp_path / "migrate.sh"
-        env_patch = {"JUDGE_WORKSPACE_ROOT": "/some/path"}
-        snapshot_before = dict(real_os.environ)
-        with patch("devbench.cli.os") as mock_os:
-            mock_os.environ = {**env_patch, "HOME": "/home/user"}
-            cli.cmd_migrate_env("--output", str(out_file))
-        snapshot_after = dict(real_os.environ)
-        assert snapshot_before == snapshot_after, "cmd_migrate_env must not modify the caller's environment"
-
-    def test_output_flag_missing_path_arg_returns_1(self, capsys: pytest.CaptureFixture[str]) -> None:
-        """Error path: --output with no following path argument exits 1 with actionable stderr."""
-        env_patch = {"JUDGE_WORKSPACE_ROOT": "/some/path"}
-        with patch("devbench.cli.os") as mock_os:
-            mock_os.environ = {**env_patch, "HOME": "/home/user"}
-            rc = cli.cmd_migrate_env("--output")
-        captured = capsys.readouterr()
-        assert rc == 1
-        assert "requires a path" in captured.err
-
-    def test_unrecognised_argument_returns_1(self, capsys: pytest.CaptureFixture[str]) -> None:
-        """Error path: unrecognised argument exits 1 with actionable stderr."""
-        env_patch = {"JUDGE_WORKSPACE_ROOT": "/some/path"}
-        with patch("devbench.cli.os") as mock_os:
-            mock_os.environ = {**env_patch, "HOME": "/home/user"}
-            rc = cli.cmd_migrate_env("--bogus")
-        captured = capsys.readouterr()
-        assert rc == 1
-        assert "unrecognised" in captured.err
-
-    def test_output_write_permission_denied(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        """Error path: --output to a read-only directory exits 1 with actionable stderr."""
-        read_only_dir = tmp_path / "readonly"
-        read_only_dir.mkdir()
-        read_only_dir.chmod(0o555)
-        out_file = read_only_dir / "migrate.sh"
-        env_patch = {"JUDGE_WORKSPACE_ROOT": "/some/path"}
-        try:
-            with patch("devbench.cli.os") as mock_os:
-                mock_os.environ = {**env_patch, "HOME": "/home/user"}
-                rc = cli.cmd_migrate_env("--output", str(out_file))
-            captured = capsys.readouterr()
-            assert rc == 1
-            assert captured.err != "", "stderr must contain an actionable error message on write failure"
-        finally:
-            read_only_dir.chmod(0o755)
-
-
-@pytest.mark.unit
-class TestMigrateEnvBootstrapBypass:
-    """AC-197-7 regression: cmd_migrate_env does not raise even when JUDGE_* vars are set.
-
-    The CLI entry-point sets DEVBENCH_BOOTSTRAP=1 before config.py is imported;
-    _read_env_strict no-ops when that flag is present. This class pins the contract
-    from the cmd_migrate_env CLI side: calling cmd_migrate_env with DEVBENCH_BOOTSTRAP=1
-    and a JUDGE_* var present in the real environment succeeds without raising RuntimeError.
-    """
-
-    def test_cmd_migrate_env_dry_run_succeeds_with_bootstrap_and_judge_var(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        """AC-197-7: cmd_migrate_env("--dry-run") succeeds when DEVBENCH_BOOTSTRAP=1 + JUDGE_* var in real env.
-
-        Sets DEVBENCH_BOOTSTRAP=1 and a synthetic JUDGE_* var in the real os.environ via
-        monkeypatch (no manual try/finally), then calls cmd_migrate_env at the CLI level.
-        Verifies the command returns 0 (not raises) and the dry-run output names the legacy var.
-        """
-        from devbench.config import _read_env_strict
-
-        test_legacy = "JUDGE_BYPASS_REGRESSION_VAR"
-        monkeypatch.setenv("DEVBENCH_BOOTSTRAP", "1")
-        monkeypatch.setenv(test_legacy, "legacy-value")
-
-        rc = cli.cmd_migrate_env("--dry-run")
-
-        assert rc == 0, "cmd_migrate_env must return 0 when DEVBENCH_BOOTSTRAP=1 and a JUDGE_* var is set"
-        captured = capsys.readouterr()
-        assert test_legacy in captured.out, f"dry-run output must list {test_legacy} found in the environment"
-
-        result = _read_env_strict("DEVBENCH_BYPASS_REGRESSION_VAR", test_legacy)
-        assert result is None, (
-            "_read_env_strict must return None (not raise) when DEVBENCH_BOOTSTRAP=1 and only the legacy var is set"
-        )
-
-    def test_read_env_strict_raises_without_bootstrap_when_legacy_var_set(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """AC-197-7 negative: _read_env_strict raises when DEVBENCH_BOOTSTRAP is absent + legacy var is set.
-
-        Validates that the bootstrap bypass is doing real work: without it, the same
-        condition (legacy var present, new var absent) raises RuntimeError.
-        """
-        from devbench.config import _read_env_strict
-
-        test_legacy = "JUDGE_NEGATIVE_REGRESSION_VAR"
-        monkeypatch.delenv("DEVBENCH_BOOTSTRAP", raising=False)
-        monkeypatch.setenv(test_legacy, "legacy-value")
-
-        with pytest.raises(RuntimeError, match=test_legacy):
-            _read_env_strict("DEVBENCH_NEGATIVE_REGRESSION_VAR", test_legacy)
-
-    @pytest.mark.parametrize(
-        "judge_var",
-        [
-            "JUDGE_WORKSPACE_ROOT",
-            "JUDGE_CLAUDE_MODEL",
-            "JUDGE_GH_TOKEN_FILE",
-        ],
-    )
-    def test_cmd_migrate_env_dry_run_with_known_judge_vars_when_bootstrap_set(
-        self,
-        judge_var: str,
-        monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        """AC-197-7: cmd_migrate_env("--dry-run") succeeds for known JUDGE_* names when bootstrap is set."""
-        monkeypatch.setenv("DEVBENCH_BOOTSTRAP", "1")
-        monkeypatch.setenv(judge_var, "test-legacy-value")
-
-        rc = cli.cmd_migrate_env("--dry-run")
-
-        assert rc == 0, f"cmd_migrate_env must return 0 when DEVBENCH_BOOTSTRAP=1 and {judge_var} is set"
-        captured = capsys.readouterr()
-        assert judge_var in captured.out, f"dry-run output must list {judge_var} found in the environment"

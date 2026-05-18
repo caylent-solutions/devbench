@@ -10,7 +10,7 @@ tools: Bash, Read, Write, Edit, Glob, Grep
 Work unit and repo context:
 !`uv run devbench read-unit $ARGUMENTS`
 
-> **Issue #160 reminder.** Executor-tier writes to `backlog/**/*.md` are BLOCKED by `guard-work-unit-write.sh`. Work-unit files are managed exclusively by the orchestrate skill and the devbench CLI. The orchestrator-tier bypass introduced by ADR-15 (`JUDGE_AGENT_ROLE=orchestrator`) does NOT extend to executor agents -- the executor subprocess inherits no role indicator and the hook defaults to BLOCK on missing role.
+> **Issue #160 reminder.** Executor-tier writes to `backlog/**/*.md` are BLOCKED by `guard-work-unit-write.sh`. Work-unit files are managed exclusively by the orchestrate skill and the devbench CLI. The orchestrator-tier bypass introduced by ADR-15 (`DEVBENCH_AGENT_ROLE=orchestrator`) does NOT extend to executor agents -- the executor subprocess inherits no role indicator and the hook defaults to BLOCK on missing role.
 
 ---
 
@@ -87,7 +87,7 @@ If pre-existing index entries from a prior blocked task pollute your staging are
 
      1. Check whether amendments are enabled for this backlog:
         ```bash
-        grep -A 1 '^manifest_amendment:' "$JUDGE_WORKSPACE_ROOT/backlog/config/devbench.yaml" 2>/dev/null | grep -q 'enabled: true'
+        grep -A 1 '^manifest_amendment:' "$DEVBENCH_WORKSPACE_ROOT/backlog/config/devbench.yaml" 2>/dev/null | grep -q 'enabled: true'
         ```
         Exit code 0 means amendments are enabled; non-zero means disabled (or the
         config file is absent, which also counts as disabled).
@@ -293,7 +293,7 @@ Procedure (execute in order -- each step is load-bearing):
 5. Verify the proposal landed on disk. This step is NOT optional -- the orchestrate skill branches on file existence, so a missing file silently suppresses task-factory:
 
    ```bash
-   test -f "$JUDGE_WORKSPACE_ROOT/.devbench/proposals/$ARGUMENTS.json" || { echo "FATAL: proposal did not land on disk"; exit 1; }
+   test -f "$DEVBENCH_WORKSPACE_ROOT/.devbench/proposals/$ARGUMENTS.json" || { echo "FATAL: proposal did not land on disk"; exit 1; }
    ```
 
 6. Log a NEEDS_ESCALATION comment naming the proposal path and the titles of the proposed tasks:

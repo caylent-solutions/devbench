@@ -95,7 +95,7 @@ class TestTaskFactoryCascadeDepthAndPlaceholderRules:
         "fragment",
         [
             "orchestrate.max_cascade_depth",
-            "JUDGE_ORCHESTRATE_MAX_CASCADE_DEPTH",
+            "DEVBENCH_ORCHESTRATE_MAX_CASCADE_DEPTH",
             "NEEDS_OPERATOR_ATTENTION",
             "parent_depth + 1",
             "test_cascade_depth_limit.py",

@@ -512,15 +512,6 @@ REPORT_METRIC_COLUMN_WIDTH: int = 60
 REPORT_VALUE_COLUMN_WIDTH: int = 16
 
 # ---------------------------------------------------------------------------
-# Bootstrap bypass environment variable name (issue #197)
-# The CLI entry-point for `devbench migrate-env` sets this to '1' so that
-# config.py's _read_env_strict helper skips legacy-name rejection, allowing
-# the migrate-env subcommand to inspect legacy vars before the hard cutover.
-# Only the exact value '1' activates the bypass (AC-197-7).
-# ---------------------------------------------------------------------------
-DEVBENCH_BOOTSTRAP_ENV_VAR: str = "DEVBENCH_BOOTSTRAP"
-
-# ---------------------------------------------------------------------------
 # Time unit conversions
 # ---------------------------------------------------------------------------
 MS_PER_SECOND: int = 1000
@@ -731,3 +722,32 @@ QUOTA_HANDLING_DEFAULT_BACKOFF_MULTIPLIER: float = 2.0
 # Default 0.2 (20%) prevents thundering-herd retries when multiple orchestrators
 # wake simultaneously.
 QUOTA_HANDLING_DEFAULT_BACKOFF_JITTER: float = 0.2
+
+# ---------------------------------------------------------------------------
+# Bounded skill iterate-until-perfect mechanism (spec section 4.6.0, issue #204)
+# The four onboarding skills (create-spec, spec-to-backlog, bootstrap-environment,
+# configure-devbench) each run a bounded self-critique loop. Iteration state is
+# persisted per skill so a max-iterations exhaustion is observable as an audit
+# row rather than buried in skill prose. Consumed by ``src/devbench/skill_state.py``
+# and the four SKILL.md files in ``plugin/devbench/skills/``.
+# ---------------------------------------------------------------------------
+
+# Maximum number of self-critique iterations a skill may run before emitting
+# the [SKILL_MAX_ITERATIONS_REACHED] audit row and exiting non-zero.
+SKILL_MAX_ITERATIONS: int = 5
+
+# Quality threshold (count of unresolved items) below which the skill is
+# considered converged. Zero means "no unresolved items".
+SKILL_QUALITY_THRESHOLD: int = 0
+
+# Workspace-relative path to the base directory holding per-skill checkpoint
+# files. Full path: ``<workspace_root>/.devbench/<SKILL_STATE_DIR_NAME>/<skill>.json``.
+SKILL_STATE_DIR_NAME: str = ".devbench/skill-state"
+
+# Audit-row tag emitted when a skill exhausts its iteration budget without
+# reaching SKILL_QUALITY_THRESHOLD. Operator-visible signal that the skill
+# needs human attention.
+SKILL_AUDIT_MAX_ITERATIONS_REACHED: str = "[SKILL_MAX_ITERATIONS_REACHED]"
+
+# Audit-row tag emitted when a skill converges (unresolved count <= threshold).
+SKILL_AUDIT_QUALITY_THRESHOLD_REACHED: str = "[SKILL_QUALITY_THRESHOLD_REACHED]"

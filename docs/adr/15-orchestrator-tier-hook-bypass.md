@@ -32,7 +32,7 @@ content checks the hook gains.
 ## Decision
 
 Add a deterministic role indicator that the hook reads from the
-calling environment: `JUDGE_AGENT_ROLE`.
+calling environment: `DEVBENCH_AGENT_ROLE`.
 
 - When the role is **orchestrator**, the hook ALLOWS the write but
   STILL applies the existing content rules (rule 10 em-dash,
@@ -45,11 +45,11 @@ calling environment: `JUDGE_AGENT_ROLE`.
   "fail-fast" / "default-deny" principles.
 
 Implementation: a new `_resolve_caller_role` helper in
-`plugin/devbench/scripts/_hook_lib.sh` reads `JUDGE_AGENT_ROLE` from
+`plugin/devbench/scripts/_hook_lib.sh` reads `DEVBENCH_AGENT_ROLE` from
 the env and returns `orchestrator`, `executor`, or empty string. The
 guard script branches on the result at the final block-or-allow gate.
 
-The orchestrator subprocess sets `JUDGE_AGENT_ROLE=orchestrator` in
+The orchestrator subprocess sets `DEVBENCH_AGENT_ROLE=orchestrator` in
 its env before invoking any Claude tool; executor subprocesses
 inherit no such env var.
 
@@ -80,7 +80,7 @@ inherit no such env var.
   orchestrator+rule-10->BLOCK, orchestrator+rule-11->BLOCK,
   executor->BLOCK, missing-role->BLOCK, unknown-role->BLOCK.
 - Documentation under `docs/architecture.md` (Hooks layer, section
-  "Caller-role indicator: `JUDGE_AGENT_ROLE`") names the env-var
+  "Caller-role indicator: `DEVBENCH_AGENT_ROLE`") names the env-var
   indicator and the expected calling convention.
 
 ## References

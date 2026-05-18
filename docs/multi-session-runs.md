@@ -70,10 +70,10 @@ full protocol.
 
 | Requirement | Notes |
 |-------------|-------|
-| Single shared workspace root | All sessions share one `JUDGE_WORKSPACE_ROOT`. Unlike the two-clone pattern, no duplication is needed. |
+| Single shared workspace root | All sessions share one `DEVBENCH_WORKSPACE_ROOT`. Unlike the two-clone pattern, no duplication is needed. |
 | Non-overlapping `--include` tokens | Plan your partition before launching. See [Step 2](#step-2----verify-disjointness). |
 | Devbench installed | Follow [zero-to-ready.md](zero-to-ready.md) for initial setup. |
-| `JUDGE_WORKSPACE_ROOT` and `JUDGE_CLAUDE_MODEL` set | Both vars must be exported in every shell that launches a session. |
+| `DEVBENCH_WORKSPACE_ROOT` and `DEVBENCH_CLAUDE_MODEL` set | Both vars must be exported in every shell that launches a session. |
 | One terminal per session | Each `devbench start` call is blocking; open a dedicated terminal (or tmux pane) per session. |
 
 ---
@@ -135,8 +135,8 @@ scope.
 **Terminal 1 -- session "early":**
 
 ```bash
-export JUDGE_WORKSPACE_ROOT=~/my-workspace
-export JUDGE_CLAUDE_MODEL=us.anthropic.claude-sonnet-4-7-v1
+export DEVBENCH_WORKSPACE_ROOT=~/my-workspace
+export DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-sonnet-4-7-v1
 export DEVBENCH_SESSION_NAME=early
 
 uv run devbench start --include "E1-E10"
@@ -145,8 +145,8 @@ uv run devbench start --include "E1-E10"
 **Terminal 2 -- session "mid":**
 
 ```bash
-export JUDGE_WORKSPACE_ROOT=~/my-workspace
-export JUDGE_CLAUDE_MODEL=us.anthropic.claude-sonnet-4-7-v1
+export DEVBENCH_WORKSPACE_ROOT=~/my-workspace
+export DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-sonnet-4-7-v1
 export DEVBENCH_SESSION_NAME=mid
 
 uv run devbench start --include "E11-E20"
@@ -155,8 +155,8 @@ uv run devbench start --include "E11-E20"
 **Terminal 3 -- session "late":**
 
 ```bash
-export JUDGE_WORKSPACE_ROOT=~/my-workspace
-export JUDGE_CLAUDE_MODEL=us.anthropic.claude-sonnet-4-7-v1
+export DEVBENCH_WORKSPACE_ROOT=~/my-workspace
+export DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-sonnet-4-7-v1
 export DEVBENCH_SESSION_NAME=late
 
 uv run devbench start --include "E21-E30"

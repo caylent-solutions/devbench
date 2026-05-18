@@ -344,7 +344,7 @@ class TestExecutorValidationGateEscalation:
         section_body = content[heading_pos:]
         assert "test -f" in section_body and ".devbench/proposals/" in section_body, (
             "The BUG ESCALATION section must instruct the agent to `test -f "
-            "$JUDGE_WORKSPACE_ROOT/.devbench/proposals/<id>.json` after write-proposal; "
+            "$DEVBENCH_WORKSPACE_ROOT/.devbench/proposals/<id>.json` after write-proposal; "
             "the orchestrate SKILL branches on file existence, so a missing file silently "
             "suppresses task-factory."
         )

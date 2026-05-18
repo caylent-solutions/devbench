@@ -135,3 +135,21 @@ The skill is idempotent -- repos already cloned and validated are reported as
 - [`docs/zero-to-ready.md`](../zero-to-ready.md) -- manual step-by-step onboarding guide
 - [`docs/onboarding.md`](../onboarding.md) -- chained-skill operator workflow
 - [`sample-config.yaml`](../../sample-config.yaml) -- reference config with annotated repos: section
+
+## Bounded self-critique loop
+
+The make-validate retry loop is bounded by constants in
+`src/devbench/constants.py`:
+
+- `SKILL_MAX_ITERATIONS` -- maximum retries before the skill emits
+  `[SKILL_MAX_ITERATIONS_REACHED]` and exits non-zero with the `[ESCALATE]`
+  message.
+- `SKILL_QUALITY_THRESHOLD` -- unresolved-repo count at which the skill
+  emits `[SKILL_QUALITY_THRESHOLD_REACHED]` and exits success.
+
+State persistence and audit emission are handled by
+`src/devbench/skill_state.py` (`read_checkpoint`, `write_checkpoint`,
+`emit_audit`). The checkpoint file lives at
+`<workspace>/.devbench/skill-state/bootstrap-environment.json` between
+iterations. The audit tags flow through `devbench report` and
+`devbench hook-tail`.

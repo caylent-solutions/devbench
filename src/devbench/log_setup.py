@@ -10,20 +10,20 @@ The log file path resolves with this precedence (matches
 ``cli._resolve_log_file_path`` so the orchestrator-as-writer and the
 report-as-reader cannot diverge):
 
-1. ``JUDGE_LOG_FILE`` environment variable.
+1. ``DEVBENCH_LOG_FILE`` environment variable.
 2. ``log_file`` field in ``backlog/config/devbench.yaml`` (resolved
-   relative to ``JUDGE_WORKSPACE_ROOT``).
-3. ``<JUDGE_WORKSPACE_ROOT>/logs/orchestrator.log`` convention.
+   relative to ``DEVBENCH_WORKSPACE_ROOT``).
+3. ``<DEVBENCH_WORKSPACE_ROOT>/logs/orchestrator.log`` convention.
 4. ``<devbench source tree>/logs/orchestrator.log`` legacy fallback for
    invocations outside any workspace (test fixtures, local dev).
 
 Per-session routing (spec 4.4.4, AC-192-14):
 When ``DEVBENCH_SESSION_NAME`` is set, ``setup_logging`` attaches a second
 ``FileHandler`` routing to
-``<JUDGE_WORKSPACE_ROOT>/<SESSION_SESSIONS_BASE_DIR>/<name>/orchestrator.log``
+``<DEVBENCH_WORKSPACE_ROOT>/<SESSION_SESSIONS_BASE_DIR>/<name>/orchestrator.log``
 in addition to the aggregate log above.  Both handlers are active simultaneously
 so messages appear in both the per-session log and the global aggregate.
-``JUDGE_WORKSPACE_ROOT`` MUST be set when ``DEVBENCH_SESSION_NAME`` is set;
+``DEVBENCH_WORKSPACE_ROOT`` MUST be set when ``DEVBENCH_SESSION_NAME`` is set;
 if it is absent ``_resolve_session_log_file`` raises ``RuntimeError`` with an
 actionable message.
 """
@@ -59,10 +59,10 @@ def _resolve_log_file() -> Path:
     logger keeps working even when the config layer is unavailable
     (test fixtures, ``--help`` paths, very early bootstrap).
     """
-    explicit = os.environ.get("JUDGE_LOG_FILE", "").strip()
+    explicit = os.environ.get("DEVBENCH_LOG_FILE", "").strip()
     if explicit:
         return Path(explicit)
-    workspace = os.environ.get("JUDGE_WORKSPACE_ROOT", "").strip()
+    workspace = os.environ.get("DEVBENCH_WORKSPACE_ROOT", "").strip()
     configured = ""
     try:
         from devbench.config import RUNTIME_CONFIG
@@ -90,19 +90,19 @@ def _resolve_session_log_file() -> Path | None:
 
     Raises:
         RuntimeError: When ``DEVBENCH_SESSION_NAME`` is set but
-            ``JUDGE_WORKSPACE_ROOT`` is absent or empty.  Both env vars must
-            be present together; missing ``JUDGE_WORKSPACE_ROOT`` is an
+            ``DEVBENCH_WORKSPACE_ROOT`` is absent or empty.  Both env vars must
+            be present together; missing ``DEVBENCH_WORKSPACE_ROOT`` is an
             operator configuration error that must fail loudly.
     """
     session_name = os.environ.get("DEVBENCH_SESSION_NAME", "").strip()
     if not session_name:
         return None
-    workspace = os.environ.get("JUDGE_WORKSPACE_ROOT", "").strip()
+    workspace = os.environ.get("DEVBENCH_WORKSPACE_ROOT", "").strip()
     if not workspace:
         raise RuntimeError(
-            "JUDGE_WORKSPACE_ROOT must be set when DEVBENCH_SESSION_NAME is set. "
+            "DEVBENCH_WORKSPACE_ROOT must be set when DEVBENCH_SESSION_NAME is set. "
             "The per-session log cannot be routed without a workspace root. "
-            "Set JUDGE_WORKSPACE_ROOT to the devbench workspace directory."
+            "Set DEVBENCH_WORKSPACE_ROOT to the devbench workspace directory."
         )
     return Path(workspace) / SESSION_SESSIONS_BASE_DIR / session_name / DEFAULT_LOG_FILENAME
 
@@ -112,13 +112,13 @@ def setup_logging(level: int | None = None) -> Path:
 
     The log level is resolved from (in order):
     1. The ``level`` argument if provided.
-    2. The ``JUDGE_LOG_LEVEL`` environment variable (standard level names,
+    2. The ``DEVBENCH_LOG_LEVEL`` environment variable (standard level names,
        e.g. ``DEBUG``, ``INFO``, ``WARNING``).
     3. ``INFO`` as the default.
 
     When ``DEVBENCH_SESSION_NAME`` is set, attaches a second ``FileHandler``
     routing to the per-session log in addition to the aggregate log
-    (spec 4.4.4, AC-192-14).  ``JUDGE_WORKSPACE_ROOT`` must also be set in
+    (spec 4.4.4, AC-192-14).  ``DEVBENCH_WORKSPACE_ROOT`` must also be set in
     that case; see ``_resolve_session_log_file`` for the contract.
 
     Returns the path to the aggregate log file.
@@ -127,14 +127,14 @@ def setup_logging(level: int | None = None) -> Path:
 
     Raises:
         RuntimeError: Propagated from ``_resolve_session_log_file`` when
-            ``DEVBENCH_SESSION_NAME`` is set but ``JUDGE_WORKSPACE_ROOT`` is
+            ``DEVBENCH_SESSION_NAME`` is set but ``DEVBENCH_WORKSPACE_ROOT`` is
             missing.
     """
     if _state[0]:
         return _resolve_log_file()
 
     if level is None:
-        env_level = os.environ.get("JUDGE_LOG_LEVEL", DEFAULT_LOG_LEVEL).upper()
+        env_level = os.environ.get("DEVBENCH_LOG_LEVEL", DEFAULT_LOG_LEVEL).upper()
         level = getattr(logging, env_level, logging.INFO)
 
     log_file = _resolve_log_file()
@@ -179,6 +179,6 @@ def setup_logging(level: int | None = None) -> Path:
     # Demoted to DEBUG (issue #132): every devbench CLI invocation used to
     # emit this banner on stderr, polluting the output of stream-rendering
     # commands like `hook-tail` and `get-diff`. Operators who want the banner
-    # back can re-enable it via JUDGE_LOG_LEVEL=DEBUG.
+    # back can re-enable it via DEVBENCH_LOG_LEVEL=DEBUG.
     logging.getLogger("judges.log_setup").debug("Logging to stderr and %s", log_file)
     return log_file

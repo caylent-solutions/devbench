@@ -2,11 +2,11 @@
 independent recomputation against the user's real backlog.
 
 Skipped by default (CI does not have the workspace). Enable with
-``JUDGE_INTEGRATION_TEST=1`` and a real ``JUDGE_WORKSPACE_ROOT``:
+``DEVBENCH_INTEGRATION_TEST=1`` and a real ``DEVBENCH_WORKSPACE_ROOT``:
 
-    JUDGE_INTEGRATION_TEST=1 \
-    JUDGE_WORKSPACE_ROOT=/workspaces/rpm-migration/kanon-migration-backlog \
-    JUDGE_CLAUDE_MODEL=claude-opus-4-7 \
+    DEVBENCH_INTEGRATION_TEST=1 \
+    DEVBENCH_WORKSPACE_ROOT=/workspaces/rpm-migration/kanon-migration-backlog \
+    DEVBENCH_CLAUDE_MODEL=claude-opus-4-7 \
         uv run pytest tests/test_integration/ -v
 
 This is the "bet your life" verification. Every numeric value the report
@@ -26,21 +26,21 @@ from pathlib import Path
 
 import pytest
 
-INTEGRATION_ENABLED = os.environ.get("JUDGE_INTEGRATION_TEST") == "1"
-WORKSPACE_ROOT_ENV = os.environ.get("JUDGE_WORKSPACE_ROOT", "")
+INTEGRATION_ENABLED = os.environ.get("DEVBENCH_INTEGRATION_TEST") == "1"
+WORKSPACE_ROOT_ENV = os.environ.get("DEVBENCH_WORKSPACE_ROOT", "")
 
 
 pytestmark = pytest.mark.skipif(
     not INTEGRATION_ENABLED or not WORKSPACE_ROOT_ENV,
-    reason="JUDGE_INTEGRATION_TEST=1 and JUDGE_WORKSPACE_ROOT required",
+    reason="DEVBENCH_INTEGRATION_TEST=1 and DEVBENCH_WORKSPACE_ROOT required",
 )
 
 
 def _run_report(workspace_root: Path, model: str) -> str:
     """Invoke `devbench report` and return its stdout (data only)."""
     env = os.environ.copy()
-    env["JUDGE_WORKSPACE_ROOT"] = str(workspace_root)
-    env["JUDGE_CLAUDE_MODEL"] = model
+    env["DEVBENCH_WORKSPACE_ROOT"] = str(workspace_root)
+    env["DEVBENCH_CLAUDE_MODEL"] = model
     result = subprocess.run(
         ["uv", "run", "devbench", "report"],
         capture_output=True,
@@ -159,7 +159,7 @@ def test_report_counts_match_backlog_index() -> None:
     tasks_blocked = tasks.get("blocked", 0)
     tasks_active = tasks_total - tasks_done - tasks_blocked
 
-    report = _run_report(workspace, os.environ["JUDGE_CLAUDE_MODEL"])
+    report = _run_report(workspace, os.environ["DEVBENCH_CLAUDE_MODEL"])
 
     # Per-status breakdown rows added in B8.
     tasks_in_progress = tasks.get("in-progress", 0)
@@ -182,7 +182,7 @@ def test_report_token_totals_match_independent_sum() -> None:
     hook_log = workspace / "hook-logs.jsonl"
     expected = _sum_combined_tokens(hook_log)
 
-    report = _run_report(workspace, os.environ["JUDGE_CLAUDE_MODEL"])
+    report = _run_report(workspace, os.environ["DEVBENCH_CLAUDE_MODEL"])
 
     # The report formats numbers with thousands commas. Render expected values the same way.
     for key, label in [
@@ -203,7 +203,7 @@ def test_report_api_processing_time_matches_hook_log_duration() -> None:
     api_seconds = _sum_hook_log_durations(hook_log) / 1000.0
     api_hours = api_seconds / 3600.0
 
-    report = _run_report(workspace, os.environ["JUDGE_CLAUDE_MODEL"])
+    report = _run_report(workspace, os.environ["DEVBENCH_CLAUDE_MODEL"])
 
     # Display rounds to 1 decimal place: "X.X h"
     expected_str = f"{api_hours:.1f} h"
@@ -213,7 +213,7 @@ def test_report_api_processing_time_matches_hook_log_duration() -> None:
 def test_report_stdout_has_no_log_lines() -> None:
     """B6: stdout must be data-only; log lines belong on stderr."""
     workspace = Path(WORKSPACE_ROOT_ENV)
-    report = _run_report(workspace, os.environ["JUDGE_CLAUDE_MODEL"])
+    report = _run_report(workspace, os.environ["DEVBENCH_CLAUDE_MODEL"])
     # Logging format starts with ISO-8601 timestamp + bracketed logger name.
     log_pattern = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z \[", re.MULTILINE)
     matches = log_pattern.findall(report)
@@ -223,7 +223,7 @@ def test_report_stdout_has_no_log_lines() -> None:
 def test_report_no_negative_time_spans() -> None:
     """No window column may show a negative wall-time span."""
     workspace = Path(WORKSPACE_ROOT_ENV)
-    report = _run_report(workspace, os.environ["JUDGE_CLAUDE_MODEL"])
+    report = _run_report(workspace, os.environ["DEVBENCH_CLAUDE_MODEL"])
     # Match patterns like "-0.5 h" in the Time span row.
     negatives = re.findall(r"-\d+\.\d+ h", report)
     assert not negatives, f"Negative time spans rendered: {negatives}"
@@ -234,7 +234,7 @@ def test_report_no_blocked_tasks_in_active_projection() -> None:
     workspace = Path(WORKSPACE_ROOT_ENV)
     counts = _count_units_by_status(workspace / "BACKLOG.md")
     tasks_blocked = counts.get("Task", {}).get("blocked", 0)
-    report = _run_report(workspace, os.environ["JUDGE_CLAUDE_MODEL"])
+    report = _run_report(workspace, os.environ["DEVBENCH_CLAUDE_MODEL"])
     if tasks_blocked > 0:
         # When at least one task is blocked, the prose must call it out.
         assert "blocked" in report, "Prose must mention blocked tasks when any exist"
@@ -264,7 +264,7 @@ def _task_ids_by_status(backlog_index: Path, target_status: str) -> list[str]:
 def test_report_lists_in_progress_and_blocked_tasks_by_id() -> None:
     """B9: bottom of report enumerates every in-progress and blocked task ID from BACKLOG.md."""
     workspace = Path(WORKSPACE_ROOT_ENV)
-    report = _run_report(workspace, os.environ["JUDGE_CLAUDE_MODEL"])
+    report = _run_report(workspace, os.environ["DEVBENCH_CLAUDE_MODEL"])
 
     in_progress_ids = _task_ids_by_status(workspace / "BACKLOG.md", "in-progress")
     blocked_ids = _task_ids_by_status(workspace / "BACKLOG.md", "blocked")
@@ -283,7 +283,7 @@ def test_report_lists_in_progress_and_blocked_tasks_by_id() -> None:
 def test_report_renders_tables_side_by_side() -> None:
     """B10: the two top tables share rows (impossible in the old stacked layout)."""
     workspace = Path(WORKSPACE_ROOT_ENV)
-    report = _run_report(workspace, os.environ["JUDGE_CLAUDE_MODEL"])
+    report = _run_report(workspace, os.environ["DEVBENCH_CLAUDE_MODEL"])
 
     # At least one line must contain two top-left corners (\u250c) -- one per table.
     two_corner_lines = [ln for ln in report.splitlines() if ln.count("\u250c") >= 2]

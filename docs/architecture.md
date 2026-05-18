@@ -561,17 +561,17 @@ DevBench registers hooks for Claude Code events via `plugin/devbench/hooks/hooks
 
 `${CLAUDE_PLUGIN_ROOT}` in the hooks.json command strings is interpolated by Claude Code at runtime to the absolute path of the loaded plugin directory (the value passed to `--plugin-dir`).
 
-### Caller-role indicator: `JUDGE_AGENT_ROLE` (issue #160, ADR-15)
+### Caller-role indicator: `DEVBENCH_AGENT_ROLE` (issue #160, ADR-15)
 
-`guard-work-unit-write.sh` distinguishes between executor-tier and orchestrator-tier callers via the `JUDGE_AGENT_ROLE` environment variable:
+`guard-work-unit-write.sh` distinguishes between executor-tier and orchestrator-tier callers via the `DEVBENCH_AGENT_ROLE` environment variable:
 
-| `JUDGE_AGENT_ROLE` value | Behaviour on a `backlog/**/*.md` Edit / Write |
+| `DEVBENCH_AGENT_ROLE` value | Behaviour on a `backlog/**/*.md` Edit / Write |
 | --- | --- |
 | `orchestrator` | ALLOW after content rules (rule 10 em-dash, rule 11 checkout_directory prefix) pass. The orchestrator agent itself is the legitimate caller for corrective edits to work-unit content (e.g., post-process strip of a blocker-resolver-emitted rule-11 violation per issue #159). |
 | `executor` | BLOCK. Executor agents must not modify work-unit files directly; that's the orchestrate skill's job. |
 | missing / unrecognised | BLOCK. Default-deny. Preserves the original safety guarantee for any legacy caller that hasn't been updated to set the indicator. |
 
-Implementation: `_resolve_caller_role` in `plugin/devbench/scripts/_hook_lib.sh` reads the env var and returns one of the three normalized values. The orchestrator subprocess sets `JUDGE_AGENT_ROLE=orchestrator` in its env before invoking any Claude tool; executor subprocesses inherit no such env var.
+Implementation: `_resolve_caller_role` in `plugin/devbench/scripts/_hook_lib.sh` reads the env var and returns one of the three normalized values. The orchestrator subprocess sets `DEVBENCH_AGENT_ROLE=orchestrator` in its env before invoking any Claude tool; executor subprocesses inherit no such env var.
 
 Content rules (rule 10 em-dash, rule 11 checkout_directory prefix) ALWAYS fire regardless of role -- the role bypass affects only the final block-or-allow gate. An orchestrator-tier write that violates rule 10 or rule 11 is still rejected with exit 2 + a structured error message.
 

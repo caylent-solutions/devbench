@@ -17,9 +17,8 @@ def _run_hook(
     extra_env: dict | None = None,
 ) -> subprocess.CompletedProcess:
     """Invoke the hook script with the given JSON payload on stdin."""
-    # Strip legacy JUDGE_WORKSPACE_ROOT and JUDGE_LOG_FILE: _hook_lib.sh rejects
     # these vars at source time (AC-197-9) and all hooks source _hook_lib.sh.
-    env = {k: v for k, v in os.environ.items() if k not in ("JUDGE_WORKSPACE_ROOT", "JUDGE_LOG_FILE")}
+    env = {k: v for k, v in os.environ.items() if k not in ("DEVBENCH_WORKSPACE_ROOT", "DEVBENCH_LOG_FILE")}
     if extra_env:
         env.update(extra_env)
     return subprocess.run(
@@ -219,7 +218,7 @@ class TestGuardWorkUnitWriteContentValidation:
 
 @pytest.mark.unit
 class TestGuardWorkUnitWriteOrchestratorBypass:
-    """Issue #160: JUDGE_AGENT_ROLE=orchestrator allows corrective edits
+    """Issue #160: DEVBENCH_AGENT_ROLE=orchestrator allows corrective edits
     on backlog/**/*.md while content rules (rule 10 + rule 11) still fire.
     Executor-role and missing-role still BLOCK (preserves the original
     safety guarantee)."""
@@ -234,7 +233,7 @@ class TestGuardWorkUnitWriteOrchestratorBypass:
                 "content": content,
             },
         }
-        result = _run_hook(payload, extra_env={"JUDGE_AGENT_ROLE": "orchestrator"})
+        result = _run_hook(payload, extra_env={"DEVBENCH_AGENT_ROLE": "orchestrator"})
         assert result.returncode == 0, (
             f"Expected exit 0 for orchestrator-role + clean content, got {result.returncode}. stderr: {result.stderr}"
         )
@@ -251,7 +250,7 @@ class TestGuardWorkUnitWriteOrchestratorBypass:
                 "content": content,
             },
         }
-        result = _run_hook(payload, extra_env={"JUDGE_AGENT_ROLE": "orchestrator"})
+        result = _run_hook(payload, extra_env={"DEVBENCH_AGENT_ROLE": "orchestrator"})
         assert result.returncode == 2, (
             f"Expected exit 2 (rule 10 fires) even for orchestrator-role, "
             f"got {result.returncode}. stderr: {result.stderr}"
@@ -276,7 +275,7 @@ class TestGuardWorkUnitWriteOrchestratorBypass:
         result = _run_hook(
             payload,
             extra_env={
-                "JUDGE_AGENT_ROLE": "orchestrator",
+                "DEVBENCH_AGENT_ROLE": "orchestrator",
                 "DEVBENCH_WORKSPACE_ROOT": str(tmp_path),
             },
         )
@@ -296,12 +295,12 @@ class TestGuardWorkUnitWriteOrchestratorBypass:
                 "content": content,
             },
         }
-        result = _run_hook(payload, extra_env={"JUDGE_AGENT_ROLE": "executor"})
+        result = _run_hook(payload, extra_env={"DEVBENCH_AGENT_ROLE": "executor"})
         assert result.returncode == 2
         assert "guard-work-unit-write" in result.stderr
 
     def test_missing_role_defaults_to_block(self) -> None:
-        """BLOCK: missing JUDGE_AGENT_ROLE defaults to executor-tier behaviour
+        """BLOCK: missing DEVBENCH_AGENT_ROLE defaults to executor-tier behaviour
         (preserves the original safety guarantee for legacy callers)."""
         content = "## Changes Manifest\n| `src/foo.py` | add feature |\n"
         payload = {
@@ -311,9 +310,8 @@ class TestGuardWorkUnitWriteOrchestratorBypass:
                 "content": content,
             },
         }
-        # Strip any inherited JUDGE_AGENT_ROLE the dev shell might be carrying.
-        # Also strip legacy JUDGE_WORKSPACE_ROOT and JUDGE_LOG_FILE per AC-197-9.
-        _stripped = {"JUDGE_WORKSPACE_ROOT", "JUDGE_LOG_FILE", "JUDGE_AGENT_ROLE"}
+        # Also strip legacy DEVBENCH_WORKSPACE_ROOT and DEVBENCH_LOG_FILE per AC-197-9.
+        _stripped = {"DEVBENCH_WORKSPACE_ROOT", "DEVBENCH_LOG_FILE", "DEVBENCH_AGENT_ROLE"}
         env = {k: v for k, v in os.environ.items() if k not in _stripped}
         result = subprocess.run(
             ["bash", str(SCRIPT_PATH)],
@@ -326,7 +324,7 @@ class TestGuardWorkUnitWriteOrchestratorBypass:
         assert "guard-work-unit-write" in result.stderr
 
     def test_unknown_role_defaults_to_block(self) -> None:
-        """BLOCK: an unrecognised JUDGE_AGENT_ROLE value defaults to BLOCK."""
+        """BLOCK: an unrecognised DEVBENCH_AGENT_ROLE value defaults to BLOCK."""
         content = "## Changes Manifest\n| `src/foo.py` | add feature |\n"
         payload = {
             "tool_name": "Write",
@@ -335,6 +333,6 @@ class TestGuardWorkUnitWriteOrchestratorBypass:
                 "content": content,
             },
         }
-        result = _run_hook(payload, extra_env={"JUDGE_AGENT_ROLE": "rogue-agent-007"})
+        result = _run_hook(payload, extra_env={"DEVBENCH_AGENT_ROLE": "rogue-agent-007"})
         assert result.returncode == 2
         assert "guard-work-unit-write" in result.stderr

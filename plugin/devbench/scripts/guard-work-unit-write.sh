@@ -116,11 +116,11 @@ PYEOF
     fi
   fi
 
-  # Issue #160: orchestrator-tier callers (JUDGE_AGENT_ROLE=orchestrator)
+  # Issue #160: orchestrator-tier callers (DEVBENCH_AGENT_ROLE=orchestrator)
   # are allowed to perform corrective edits on work-unit .md files (the
   # rule-10 + rule-11 content checks above already fired and passed; this
   # final block-or-allow gate is what differentiates the two tiers).
-  # Executor-tier callers (JUDGE_AGENT_ROLE=executor) and missing-role
+  # Executor-tier callers (DEVBENCH_AGENT_ROLE=executor) and missing-role
   # callers default to BLOCK so the hook's original safety guarantee --
   # executors must not modify work-unit files directly -- holds.
   CALLER_ROLE=$(_resolve_caller_role)
@@ -132,7 +132,7 @@ PYEOF
   echo "guard-work-unit-write: blocked write to work unit file: ${FILE_PATH}" >&2
   echo "Fix: work unit .md files under backlog/ are managed exclusively by the orchestrate skill." >&2
   echo "Executors must not modify work unit files directly." >&2
-  echo "(Issue #160: set JUDGE_AGENT_ROLE=orchestrator in the calling env to bypass for orchestrator-tier corrective edits.)" >&2
+  echo "(Issue #160: set DEVBENCH_AGENT_ROLE=orchestrator in the calling env to bypass for orchestrator-tier corrective edits.)" >&2
   exit 2
 fi
 

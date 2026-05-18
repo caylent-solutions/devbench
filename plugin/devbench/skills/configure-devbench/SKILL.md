@@ -134,15 +134,15 @@ Ask the operator for each sub-field:
 
 > "Section: timeouts (all values in seconds; leave blank to use the environment-variable / built-in default)
 >
->   gh_api       -- GitHub API call timeout [default: env JUDGE_GH_API_TIMEOUT or 30]
->   test         -- Test suite run timeout [default: env JUDGE_TEST_TIMEOUT or 300]
->   security_fetch -- Security advisory fetch timeout [default: env JUDGE_SECURITY_FETCH_TIMEOUT or 60]
->   llm          -- LLM API call timeout [default: env JUDGE_LLM_TIMEOUT or 600]
->   command      -- Shell command execution timeout [default: env JUDGE_COMMAND_TIMEOUT or 120]
->   executor     -- Executor agent overall timeout [default: env JUDGE_EXECUTOR_TIMEOUT or 3600]
->   executor_max_turns -- Maximum executor turns [default: env JUDGE_EXECUTOR_MAX_TURNS or 200]
+>   gh_api       -- GitHub API call timeout [default: env DEVBENCH_GH_API_TIMEOUT or 30]
+>   test         -- Test suite run timeout [default: env DEVBENCH_TEST_TIMEOUT or 300]
+>   security_fetch -- Security advisory fetch timeout [default: env DEVBENCH_SECURITY_FETCH_TIMEOUT or 60]
+>   llm          -- LLM API call timeout [default: env DEVBENCH_LLM_TIMEOUT or 600]
+>   command      -- Shell command execution timeout [default: env DEVBENCH_COMMAND_TIMEOUT or 120]
+>   executor     -- Executor agent overall timeout [default: env DEVBENCH_EXECUTOR_TIMEOUT or 3600]
+>   executor_max_turns -- Maximum executor turns [default: env DEVBENCH_EXECUTOR_MAX_TURNS or 200]
 >   orchestrator_poll_interval -- Orchestrator polling interval [default: 5]
->   github_check -- GitHub check status polling timeout [default: env JUDGE_GH_TIMEOUT or 600]"
+>   github_check -- GitHub check status polling timeout [default: env DEVBENCH_GH_TIMEOUT or 600]"
 
 Validate each provided value is a positive integer. Reject with:
 
@@ -158,11 +158,11 @@ Ask the operator:
 
 > "Section: limits (leave blank to use the environment-variable / built-in default)
 >
->   alert_summary         -- Max security alert summaries to include [default: env JUDGE_ALERT_SUMMARY_LIMIT or 20]
->   output_truncation     -- Char limit for command output truncation [default: env JUDGE_OUTPUT_TRUNCATION or 10000]
->   llm_evidence_truncation -- Char limit for LLM evidence content [default: env JUDGE_LLM_EVIDENCE_TRUNCATION or 50000]
->   llm_file_context      -- Max files included in LLM context [default: env JUDGE_LLM_FILE_CONTEXT_LIMIT or 50]
->   llm_file_preview_chars -- Char limit for per-file LLM preview [default: env JUDGE_LLM_FILE_PREVIEW_CHARS or 2000]
+>   alert_summary         -- Max security alert summaries to include [default: env DEVBENCH_ALERT_SUMMARY_LIMIT or 20]
+>   output_truncation     -- Char limit for command output truncation [default: env DEVBENCH_OUTPUT_TRUNCATION or 10000]
+>   llm_evidence_truncation -- Char limit for LLM evidence content [default: env DEVBENCH_LLM_EVIDENCE_TRUNCATION or 50000]
+>   llm_file_context      -- Max files included in LLM context [default: env DEVBENCH_LLM_FILE_CONTEXT_LIMIT or 50]
+>   llm_file_preview_chars -- Char limit for per-file LLM preview [default: env DEVBENCH_LLM_FILE_PREVIEW_CHARS or 2000]
 >   ci_failure_log_bytes  -- Max bytes from a CI failure log to feed back to the executor [default: 32768]"
 
 Validate each provided value is a positive integer.
@@ -420,3 +420,28 @@ Report:
 >   stop_hook:          max_blocks=<value>, window_seconds=<value>
 >
 > Next step: run 'claude run devbench:bootstrap-environment' to clone target repos and verify make validate baselines."
+
+---
+
+## Self-critique loop (bounded)
+
+The re-prompt loop that fires on invalid YAML values must terminate -- either
+when the round-trip parse via `ConfigLoader` succeeds for every section
+(success) or when the iteration budget is exhausted (escalation). Use the
+helpers in `src/devbench/skill_state.py`:
+
+- On each pass call `read_checkpoint("configure-devbench", workspace_root)`
+  to load the previous counter (returns `None` on the first pass).
+- When `ConfigLoader.load_runtime_config(...)` succeeds without raising
+  (`unresolved_count <= SKILL_QUALITY_THRESHOLD`), call
+  `emit_audit("configure-devbench", SKILL_AUDIT_QUALITY_THRESHOLD_REACHED, {...}, workspace_root)`
+  and exit success.
+- Otherwise increment the checkpoint via `write_checkpoint(...)` and re-prompt.
+- When the iteration reaches `SKILL_MAX_ITERATIONS` (defined in
+  `src/devbench/constants.py`), call
+  `emit_audit("configure-devbench", SKILL_AUDIT_MAX_ITERATIONS_REACHED, {"unresolved": ...}, workspace_root)`
+  and exit non-zero so the operator can resolve the rejected value manually.
+
+The audit tags `[SKILL_MAX_ITERATIONS_REACHED]` and
+`[SKILL_QUALITY_THRESHOLD_REACHED]` flow through the existing report and
+hook-tail pipelines without any new infrastructure.

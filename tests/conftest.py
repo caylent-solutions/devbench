@@ -8,15 +8,7 @@ from pathlib import Path
 from types import ModuleType
 
 # Set required env vars before any devbench modules are imported.
-# config.py raises RuntimeError at import time if these are unset.
-# Remove any inherited legacy JUDGE_* bootstrap vars so the strict env-var
-# checker in config.py does not reject them during test collection (AC-197-10).
-os.environ.pop("JUDGE_CLAUDE_MODEL", None)
-os.environ.pop("JUDGE_WORKSPACE_ROOT", None)
-os.environ.pop("JUDGE_LOG_FILE", None)
-os.environ.pop("JUDGE_CONFIG_PATH", None)
-
-# AC-197-10: all pre-import setdefaults use DEVBENCH_* names only.
+# config.py raises RuntimeError at import time if DEVBENCH_WORKSPACE_ROOT is unset.
 os.environ.setdefault("DEVBENCH_CLAUDE_MODEL", "test-model")
 os.environ.setdefault("DEVBENCH_WORKSPACE_ROOT", "/tmp/test-workspace")
 os.environ.setdefault("DEVBENCH_LOG_FILE", "/tmp/judges-test-orchestrator.log")
@@ -26,12 +18,6 @@ os.environ.setdefault(
     "DEVBENCH_CONFIG_PATH",
     str(Path(__file__).parent / "fixtures" / "test_devbench.yaml"),
 )
-
-# Backward-compatibility aliases for modules not yet migrated to DEVBENCH_* names.
-# config.py (JUDGE_WORKSPACE_ROOT / JUDGE_CLAUDE_MODEL) has been migrated by E9-F2-S1-T1.
-# cli.py (JUDGE_LOG_FILE) has been migrated by E9-F2-S1-T2 -- alias removed.
-# config_loader.py (JUDGE_CONFIG_PATH) is not yet migrated; its alias remains.
-os.environ["JUDGE_CONFIG_PATH"] = os.environ["DEVBENCH_CONFIG_PATH"]
 
 import pytest
 from fixtures.data import WORK_UNIT_MARKDOWN_TEMPLATE as _WORK_UNIT_TEMPLATE

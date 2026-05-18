@@ -35,28 +35,6 @@
 # https://docs.anthropic.com/en/docs/claude-code/hooks#hook-input
 # and is stable across Claude Code releases.
 
-# ---------------------------------------------------------------------------
-# Startup guard: reject legacy JUDGE_* env vars (AC-197-9, issue #197).
-#
-# The workspace root and log file path are read from DEVBENCH_WORKSPACE_ROOT
-# and DEVBENCH_LOG_FILE only. Setting any legacy JUDGE_* variable causes an
-# immediate non-zero exit with an actionable [E197] error so operators cannot
-# accidentally run hooks against a stale environment.
-#
-# This guard fires once at source time so every hook that sources _hook_lib.sh
-# picks up the rejection automatically without any per-hook changes.
-# ---------------------------------------------------------------------------
-
-if [[ -n "${JUDGE_WORKSPACE_ROOT:-}" ]]; then
-  printf '[E197] JUDGE_WORKSPACE_ROOT no longer accepted. Run '"'"'devbench migrate-env'"'"'.\n' >&2
-  exit 1
-fi
-
-if [[ -n "${JUDGE_LOG_FILE:-}" ]]; then
-  printf '[E197] JUDGE_LOG_FILE no longer accepted. Run '"'"'devbench migrate-env'"'"'.\n' >&2
-  exit 1
-fi
-
 extract_field() {
   local payload="$1" field="$2"
   if command -v jq >/dev/null 2>&1; then
@@ -95,15 +73,15 @@ _resolve_caller_role() {
   # are legitimate -- e.g., post-process strip of a blocker-resolver
   # rule-11 violation per issue #159).
   #
-  # The role indicator is the JUDGE_AGENT_ROLE env var. The orchestrator
-  # subprocess sets ``JUDGE_AGENT_ROLE=orchestrator`` before invoking
+  # The role indicator is the DEVBENCH_AGENT_ROLE env var. The orchestrator
+  # subprocess sets ``DEVBENCH_AGENT_ROLE=orchestrator`` before invoking
   # any Claude tool; executors inherit no such env var so the variable
   # is empty when the hook fires for an executor.
   #
   # Defaults to BLOCK on missing / unknown values so legacy callers that
   # haven't been updated continue to be safely rejected (preserve the
   # original intent of the hook).
-  case "${JUDGE_AGENT_ROLE:-}" in
+  case "${DEVBENCH_AGENT_ROLE:-}" in
     orchestrator) printf 'orchestrator' ;;
     executor)     printf 'executor' ;;
     *)            printf '' ;;

@@ -333,3 +333,28 @@ Score each item as PASS or FAIL. A FAIL is an unresolved item.
 - **Per-task depth**: ~50KB equivalent (kanon quality bar; see Step 1)
 - **Quality gate**: rubric score must be zero unresolved items AND `validate-backlog` rc=0 before the skill exits
 - **Provenance**: `[QUALITY_REFERENCE]` audit comment emitted on completion naming the kanon exemplar path
+
+---
+
+## Self-critique loop (bounded)
+
+The rubric-driven self-critique loop must terminate -- either when scoring
+reports zero unresolved items AND `validate-backlog` returns rc=0 (success)
+or when the iteration budget is exhausted (escalation). Use the helpers in
+`src/devbench/skill_state.py` to make the bound observable:
+
+- On every iteration call `read_checkpoint("spec-to-backlog", workspace_root)`
+  to load the previous counter (returns `None` first time).
+- When the rubric reports `unresolved_count <= SKILL_QUALITY_THRESHOLD` AND
+  `validate-backlog` returns rc=0, call
+  `emit_audit("spec-to-backlog", SKILL_AUDIT_QUALITY_THRESHOLD_REACHED, {...}, workspace_root)`
+  and exit success.
+- Otherwise increment the checkpoint via `write_checkpoint(...)` and continue.
+- When the iteration reaches `SKILL_MAX_ITERATIONS` (defined in
+  `src/devbench/constants.py`), call
+  `emit_audit("spec-to-backlog", SKILL_AUDIT_MAX_ITERATIONS_REACHED, {"unresolved": ...}, workspace_root)`
+  and exit non-zero so the orchestrator surfaces the unresolved items.
+
+The audit tags `[SKILL_MAX_ITERATIONS_REACHED]` and
+`[SKILL_QUALITY_THRESHOLD_REACHED]` flow through the existing report and
+hook-tail pipelines without any new infrastructure.

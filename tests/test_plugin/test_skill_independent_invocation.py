@@ -609,7 +609,7 @@ class TestBootstrapEnvironmentIndependentInvocation:
         """
         # Only devbench.yaml present -- no spec, no backlog
         config_file = _write_valid_devbench_yaml_input(tmp_path, self._REPO_SLUG)
-        env = {**os.environ, "JUDGE_WORKSPACE_ROOT": str(tmp_path)}
+        env = {**os.environ, "DEVBENCH_WORKSPACE_ROOT": str(tmp_path)}
         try:
             runtime_config = load_runtime_config(config_file, env)
         except (ValueError, FileNotFoundError) as exc:
@@ -693,7 +693,7 @@ class TestConfigureDevbenchIndependentInvocation:
         config_file = _write_valid_devbench_yaml_input(tmp_path, self._REPO_SLUG)
         assert config_file.exists(), f"configure-devbench must produce devbench.yaml at: {config_file}"
 
-        env = {**os.environ, "JUDGE_WORKSPACE_ROOT": str(tmp_path)}
+        env = {**os.environ, "DEVBENCH_WORKSPACE_ROOT": str(tmp_path)}
         try:
             runtime_config = load_runtime_config(config_file, env)
         except (ValueError, FileNotFoundError) as exc:

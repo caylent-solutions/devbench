@@ -148,10 +148,10 @@ class TestConcurrentMultiWorkspacePrerequisites:
         )
 
     def test_workspace_root_env_var_mentioned(self) -> None:
-        """The doc must reference the JUDGE_WORKSPACE_ROOT environment variable."""
+        """The doc must reference the DEVBENCH_WORKSPACE_ROOT environment variable."""
         text = _read_doc()
-        assert "JUDGE_WORKSPACE_ROOT" in text, (
-            "docs/concurrent-multi-workspace.md must reference the JUDGE_WORKSPACE_ROOT "
+        assert "DEVBENCH_WORKSPACE_ROOT" in text, (
+            "docs/concurrent-multi-workspace.md must reference the DEVBENCH_WORKSPACE_ROOT "
             "environment variable, which each instance uses to locate its own workspace "
             "(AC-190-12 / spec section 4.2)."
         )

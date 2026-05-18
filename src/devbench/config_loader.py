@@ -2,7 +2,7 @@
 
 Config file path precedence (first match wins):
 1. ``explicit_path`` argument passed to ``resolve_config_path``
-2. ``JUDGE_CONFIG_PATH`` environment variable
+2. ``DEVBENCH_CONFIG_PATH`` environment variable
 3. Default path: ``<WORKSPACE_ROOT>/backlog/config/devbench.yaml``
 
 Config value precedence:
@@ -20,7 +20,7 @@ YAML schema::
     repos:                               # required -- at least one entry
       org/repo:                          # key must be "org/repo" format
         default_branch: main2            # optional -- omit to fall back to origin/HEAD
-        checkout_directory: my-checkout  # optional -- relative to JUDGE_WORKSPACE_ROOT
+        checkout_directory: my-checkout  # optional -- relative to DEVBENCH_WORKSPACE_ROOT
         merge_strategy: squash           # optional -- overrides top-level merge_strategy
 
     merge_strategy: squash               # optional -- default merge strategy for all repos
@@ -823,7 +823,7 @@ class RepoConfig:
     Attributes:
         default_branch: Explicit default branch to use for this repo.
             When ``None``, branch consumers fall back to ``origin/HEAD``.
-        checkout_directory: Path relative to ``JUDGE_WORKSPACE_ROOT`` where
+        checkout_directory: Path relative to ``DEVBENCH_WORKSPACE_ROOT`` where
             the repo is checked out.  Must not be absolute or contain ``..``.
             When ``None``, defaults to the repo short-name (the part after
             the ``/`` in ``org/repo``).
@@ -831,7 +831,7 @@ class RepoConfig:
             the top-level ``RuntimeConfig.merge_strategy`` is used.
         resolved_checkout_path: Absolute filesystem path to the repo
             checkout, populated by ``load_runtime_config``. Equal to
-            ``<JUDGE_WORKSPACE_ROOT>/<checkout_directory or repo_short_name>``
+            ``<DEVBENCH_WORKSPACE_ROOT>/<checkout_directory or repo_short_name>``
             after resolution. Consumers MUST read this field instead of
             re-resolving the path inline (E213).
         validated_repo: Canonical ``org/repo`` form for this entry,
@@ -1057,9 +1057,9 @@ class RuntimeConfig:
             ``cmd_report`` (the reader) both consult this single source
             of truth so they cannot diverge by accident; in earlier
             versions the two were both env-var-driven and could be
-            split silently when an operator set ``JUDGE_LOG_FILE`` to
+            split silently when an operator set ``DEVBENCH_LOG_FILE`` to
             different values in different shells. ``None`` (the
-            default) means callers must supply ``JUDGE_LOG_FILE``
+            default) means callers must supply ``DEVBENCH_LOG_FILE``
             explicitly or rely on the workspace-local convention
             ``logs/orchestrator.log``.
         quota_handling: Quota-wait-and-resume configuration loaded from the
@@ -1099,13 +1099,13 @@ def resolve_config_path(
     env: Mapping[str, str],
     workspace_root: Path,
 ) -> Path:
-    """Return config file path using precedence: explicit > JUDGE_CONFIG_PATH > default.
+    """Return config file path using precedence: explicit > DEVBENCH_CONFIG_PATH > default.
 
     Args:
         explicit_path: Path from the ``--config`` CLI argument, or ``None``.
         env: Environment variable mapping (typically ``os.environ``).
         workspace_root: Absolute path to the workspace root
-            (value of ``JUDGE_WORKSPACE_ROOT``).
+            (value of ``DEVBENCH_WORKSPACE_ROOT``).
 
     Returns:
         Resolved config file path.  The path may not exist on disk -- callers
@@ -1113,7 +1113,7 @@ def resolve_config_path(
     """
     if explicit_path:
         return Path(explicit_path)
-    env_path = env.get("JUDGE_CONFIG_PATH", "")
+    env_path = env.get("DEVBENCH_CONFIG_PATH", "")
     if env_path:
         return Path(env_path)
     return workspace_root / DEFAULT_CONFIG_SUBPATH
@@ -1185,7 +1185,7 @@ def _parse_repos(
         path: Config file path (used in error messages).
         repos_raw: Raw ``repos`` dict from YAML (already schema-validated).
         allowed_orgs: Permitted GitHub organisations.  Empty list means any org.
-        workspace_root: Absolute path to ``JUDGE_WORKSPACE_ROOT`` for
+        workspace_root: Absolute path to ``DEVBENCH_WORKSPACE_ROOT`` for
             populating ``resolved_checkout_path``.
 
     Returns:
@@ -1301,7 +1301,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
     if not path.exists():
         raise FileNotFoundError(
             f"DevBench config file not found at '{path}'. "
-            "Create it or set JUDGE_CONFIG_PATH to point to its location. "
+            "Create it or set DEVBENCH_CONFIG_PATH to point to its location. "
             f"Expected schema: repos map with at least one 'org/repo' entry."
         )
 
@@ -1321,7 +1321,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         raise ValueError(_schema_error_message(path, exc)) from exc
 
     allowed_orgs: list[str] = raw.get("allowed_orgs") or []
-    workspace_root_raw = _env.get("JUDGE_WORKSPACE_ROOT", "")
+    workspace_root_raw = _env.get("DEVBENCH_WORKSPACE_ROOT", "")
     workspace_root = Path(workspace_root_raw) if workspace_root_raw else None
     repos = _parse_repos(path, raw.get("repos") or {}, allowed_orgs, workspace_root)
 

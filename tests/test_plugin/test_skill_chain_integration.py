@@ -402,7 +402,7 @@ class TestConfigureDevbenchOutputContract:
         not raise any ConfigLoader exception.
         """
         config_file = _build_minimal_devbench_yaml(tmp_path, self._REPO_SLUG)
-        env = {**os.environ, "JUDGE_WORKSPACE_ROOT": str(tmp_path)}
+        env = {**os.environ, "DEVBENCH_WORKSPACE_ROOT": str(tmp_path)}
         try:
             runtime_config = load_runtime_config(config_file, env)
         except (ValueError, FileNotFoundError) as exc:
@@ -557,7 +557,7 @@ class TestSkillChainEndToEnd:
         config_file = _build_minimal_devbench_yaml(tmp_path, self._REPO_SLUG)
         _build_minimal_target_repo(tmp_path, self._CHECKOUT_DIR)
 
-        env = {**os.environ, "JUDGE_WORKSPACE_ROOT": str(tmp_path)}
+        env = {**os.environ, "DEVBENCH_WORKSPACE_ROOT": str(tmp_path)}
         try:
             runtime_config = load_runtime_config(config_file, env)
         except (ValueError, FileNotFoundError) as exc:

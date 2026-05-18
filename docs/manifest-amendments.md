@@ -56,7 +56,7 @@ If any post-check fails, the atomic rename is reversed and the work-unit file is
 
 1. Executor hits TDD GREEN and discovers a production fix not in the Changes Manifest.
 2. Executor stages the fix in git and invokes `uv run devbench request-amendment <task-id>` with a JSON payload on stdin.
-3. `request-amendment` runs the Layer 1 schema checks and persists the request to `$JUDGE_WORKSPACE_ROOT/.devbench/amendments/<task-id>.json`.
+3. `request-amendment` runs the Layer 1 schema checks and persists the request to `$DEVBENCH_WORKSPACE_ROOT/.devbench/amendments/<task-id>.json`.
 4. The orchestrator detects the pending request file after the executor returns and invokes the `manifest-amender` agent.
 5. The agent reads the work unit, the staged diff, and the request JSON; decides `apply` or `reject`.
 6. On `apply`: the agent runs `uv run devbench apply-amendment <task-id>`. CLI appends rows, writes audit, atomically commits to disk, runs Layer 3 post-check. On success the request file is deleted; on failure the write is rolled back and the agent logs REVIEW_FAIL.

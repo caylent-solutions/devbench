@@ -17,7 +17,7 @@ set -euo pipefail
 #   - Quota-error detection (AC-193-14): scans transcript for rate-limit
 #     patterns and writes quota_pause.json when a match is found.
 
-WORKSPACE_ROOT="${JUDGE_WORKSPACE_ROOT:-}"
+WORKSPACE_ROOT="${DEVBENCH_WORKSPACE_ROOT:-}"
 BACKLOG_INDEX="${WORKSPACE_ROOT}/BACKLOG.md"
 CONFIG_FILE="${WORKSPACE_ROOT}/backlog/config/devbench.yaml"
 
@@ -196,9 +196,9 @@ _read_yaml_int() {
     echo "$default"
 }
 
-MAX_BLOCKS=$(_read_yaml_int "max_blocks" "5" "JUDGE_STOP_MAX_BLOCKS")
-WINDOW_SECONDS=$(_read_yaml_int "window_seconds" "180" "JUDGE_STOP_WINDOW_SECONDS")
-STALE_MINUTES=$(_read_yaml_int "stale_task_minutes" "120" "JUDGE_STOP_STALE_MINUTES")
+MAX_BLOCKS=$(_read_yaml_int "max_blocks" "5" "DEVBENCH_STOP_MAX_BLOCKS")
+WINDOW_SECONDS=$(_read_yaml_int "window_seconds" "180" "DEVBENCH_STOP_WINDOW_SECONDS")
+STALE_MINUTES=$(_read_yaml_int "stale_task_minutes" "120" "DEVBENCH_STOP_STALE_MINUTES")
 
 # --- Check for in-progress task ---
 

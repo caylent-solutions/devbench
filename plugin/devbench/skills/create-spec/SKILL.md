@@ -198,3 +198,29 @@ Then offer the spec-to-backlog handoff:
 - **Target size**: 1000+ lines for non-trivial programs; smaller for minor features (a 200-line spec is appropriate for a single-feature change; a 50-line spec is always insufficient for a new subsystem)
 - **Quality gate**: rubric score must be zero unresolved items before the spec is written
 - **Handoff**: on operator consent, invoke the `spec-to-backlog` skill with this spec as input
+
+---
+
+## Self-critique loop (bounded)
+
+The self-critique loop must terminate -- either when the rubric reports
+zero unresolved items (success) or when the iteration budget is exhausted
+(escalation). The bound is enforced by the helpers in
+`src/devbench/skill_state.py`:
+
+- Before scoring the spec, call `read_checkpoint("create-spec", workspace_root)`
+  to load the previous iteration counter (returns `None` on the first pass).
+- After scoring, if `unresolved_count <= SKILL_QUALITY_THRESHOLD` (the constant
+  defined in `src/devbench/constants.py`), call
+  `emit_audit("create-spec", SKILL_AUDIT_QUALITY_THRESHOLD_REACHED, {...}, workspace_root)`
+  and exit success.
+- Otherwise increment the iteration in the checkpoint via
+  `write_checkpoint("create-spec", state, workspace_root)` and continue.
+- When the iteration reaches `SKILL_MAX_ITERATIONS`, call
+  `emit_audit("create-spec", SKILL_AUDIT_MAX_ITERATIONS_REACHED, {"unresolved": ...}, workspace_root)`
+  and exit non-zero so the orchestrator surfaces the unresolved items for
+  operator review.
+
+The audit tags `[SKILL_MAX_ITERATIONS_REACHED]` and
+`[SKILL_QUALITY_THRESHOLD_REACHED]` flow through the existing report and
+hook-tail pipelines without any new infrastructure.

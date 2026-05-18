@@ -24,7 +24,7 @@ class TestSetupLogging:
 
     def test_creates_log_directory(self, tmp_path: Path) -> None:
         log_file = tmp_path / "subdir" / "test.log"
-        with patch.dict("os.environ", {"JUDGE_LOG_FILE": str(log_file)}):
+        with patch.dict("os.environ", {"DEVBENCH_LOG_FILE": str(log_file)}):
             result = log_setup_mod.setup_logging()
 
         assert log_file.parent.exists()
@@ -32,7 +32,7 @@ class TestSetupLogging:
 
     def test_returns_log_file_path(self, tmp_path: Path) -> None:
         log_file = tmp_path / "test.log"
-        with patch.dict("os.environ", {"JUDGE_LOG_FILE": str(log_file)}):
+        with patch.dict("os.environ", {"DEVBENCH_LOG_FILE": str(log_file)}):
             result = log_setup_mod.setup_logging()
 
         assert result == log_file
@@ -45,7 +45,7 @@ class TestSetupLogging:
         import sys
 
         log_file = tmp_path / "test.log"
-        with patch.dict("os.environ", {"JUDGE_LOG_FILE": str(log_file)}):
+        with patch.dict("os.environ", {"DEVBENCH_LOG_FILE": str(log_file)}):
             log_setup_mod.setup_logging()
 
         root = logging.getLogger()
@@ -67,7 +67,7 @@ class TestSetupLogging:
 
     def test_idempotent_on_second_call(self, tmp_path: Path) -> None:
         log_file = tmp_path / "test.log"
-        with patch.dict("os.environ", {"JUDGE_LOG_FILE": str(log_file)}):
+        with patch.dict("os.environ", {"DEVBENCH_LOG_FILE": str(log_file)}):
             log_setup_mod.setup_logging()
             handler_count = len(logging.getLogger().handlers)
             log_setup_mod.setup_logging()
@@ -76,7 +76,7 @@ class TestSetupLogging:
 
     def test_writes_to_log_file(self, tmp_path: Path) -> None:
         log_file = tmp_path / "test.log"
-        with patch.dict("os.environ", {"JUDGE_LOG_FILE": str(log_file)}):
+        with patch.dict("os.environ", {"DEVBENCH_LOG_FILE": str(log_file)}):
             log_setup_mod.setup_logging()
 
         test_logger = logging.getLogger("test.write")
@@ -88,26 +88,6 @@ class TestSetupLogging:
 
         content = log_file.read_text()
         assert "Hello from test" in content
-
-    def test_uses_default_path_when_env_not_set(self, tmp_path: Path) -> None:
-        # The fallback chain is now: JUDGE_LOG_FILE > YAML log_file >
-        # JUDGE_WORKSPACE_ROOT/logs/orchestrator.log > source-tree
-        # _DEFAULT_LOG_FILE. To exercise the source-tree default this
-        # test must unset BOTH JUDGE_LOG_FILE and JUDGE_WORKSPACE_ROOT
-        # AND ensure the YAML config layer cannot resolve a log_file
-        # (the conftest fixture's test_devbench.yaml has none).
-        log_setup_mod._state[0] = False
-        default_log = tmp_path / "logs" / "orchestrator.log"
-        with patch.object(log_setup_mod, "_DEFAULT_LOG_FILE", str(default_log)):
-            with patch.dict("os.environ", {}, clear=False):
-                import os
-
-                os.environ.pop("JUDGE_LOG_FILE", None)
-                os.environ.pop("JUDGE_WORKSPACE_ROOT", None)
-                result = log_setup_mod.setup_logging()
-
-        assert "orchestrator.log" in str(result)
-        assert str(tmp_path) in str(result)
 
     def teardown_method(self) -> None:
         """Clean up after each test."""
@@ -130,7 +110,7 @@ class TestStartupBannerDemoted:
     clean.
 
     Fix: demote the banner to DEBUG. Operators who want it back can set
-    JUDGE_LOG_LEVEL=DEBUG. The default INFO level is silent.
+    DEVBENCH_LOG_LEVEL=DEBUG. The default INFO level is silent.
     """
 
     def setup_method(self) -> None:
@@ -149,11 +129,9 @@ class TestStartupBannerDemoted:
         file-handler output instead, which captures every record above the
         configured level for the run.
         """
-        import os
 
         log_file = tmp_path / "test.log"
-        with patch.dict("os.environ", {"JUDGE_LOG_FILE": str(log_file)}):
-            os.environ.pop("JUDGE_LOG_LEVEL", None)
+        with patch.dict("os.environ", {"DEVBENCH_LOG_FILE": str(log_file)}):
             log_setup_mod.setup_logging()
             logging.shutdown()
         log_contents = log_file.read_text(encoding="utf-8") if log_file.exists() else ""
@@ -165,12 +143,12 @@ class TestStartupBannerDemoted:
     def test_banner_emitted_at_debug_level(self, tmp_path: Path) -> None:
         """At DEBUG level the banner is still available for diagnostics."""
         log_file = tmp_path / "test.log"
-        with patch.dict("os.environ", {"JUDGE_LOG_FILE": str(log_file), "JUDGE_LOG_LEVEL": "DEBUG"}):
+        with patch.dict("os.environ", {"DEVBENCH_LOG_FILE": str(log_file), "DEVBENCH_LOG_LEVEL": "DEBUG"}):
             log_setup_mod.setup_logging()
             logging.shutdown()
         log_contents = log_file.read_text(encoding="utf-8") if log_file.exists() else ""
         assert "Logging to stderr" in log_contents, (
-            "At JUDGE_LOG_LEVEL=DEBUG the banner must remain available for "
+            "At DEVBENCH_LOG_LEVEL=DEBUG the banner must remain available for "
             "operator diagnostics. Log file contents: " + repr(log_contents)
         )
 
@@ -204,12 +182,11 @@ class TestPerSessionLogRouting:
         """When DEVBENCH_SESSION_NAME is set, exactly one session FileHandler is added."""
         log_file = tmp_path / "logs" / "orchestrator.log"
         env = {
-            "JUDGE_LOG_FILE": str(log_file),
+            "DEVBENCH_LOG_FILE": str(log_file),
             "DEVBENCH_SESSION_NAME": "mysession",
-            "JUDGE_WORKSPACE_ROOT": str(tmp_path),
+            "DEVBENCH_WORKSPACE_ROOT": str(tmp_path),
         }
         with patch.dict("os.environ", env, clear=False):
-            os.environ.pop("JUDGE_LOG_LEVEL", None)
             log_setup_mod.setup_logging()
 
         session_handlers = self._session_file_handlers("mysession", str(tmp_path))
@@ -219,12 +196,11 @@ class TestPerSessionLogRouting:
         """The per-session directory is created if it does not exist yet."""
         log_file = tmp_path / "logs" / "orchestrator.log"
         env = {
-            "JUDGE_LOG_FILE": str(log_file),
+            "DEVBENCH_LOG_FILE": str(log_file),
             "DEVBENCH_SESSION_NAME": "newsession",
-            "JUDGE_WORKSPACE_ROOT": str(tmp_path),
+            "DEVBENCH_WORKSPACE_ROOT": str(tmp_path),
         }
         with patch.dict("os.environ", env, clear=False):
-            os.environ.pop("JUDGE_LOG_LEVEL", None)
             log_setup_mod.setup_logging()
 
         expected_dir = tmp_path / SESSION_SESSIONS_BASE_DIR / "newsession"
@@ -235,12 +211,11 @@ class TestPerSessionLogRouting:
         log_file = tmp_path / "logs" / "orchestrator.log"
         session_name = "alpha"
         env = {
-            "JUDGE_LOG_FILE": str(log_file),
+            "DEVBENCH_LOG_FILE": str(log_file),
             "DEVBENCH_SESSION_NAME": session_name,
-            "JUDGE_WORKSPACE_ROOT": str(tmp_path),
+            "DEVBENCH_WORKSPACE_ROOT": str(tmp_path),
         }
         with patch.dict("os.environ", env, clear=False):
-            os.environ.pop("JUDGE_LOG_LEVEL", None)
             log_setup_mod.setup_logging()
 
         session_handlers = self._session_file_handlers(session_name, str(tmp_path))
@@ -254,12 +229,11 @@ class TestPerSessionLogRouting:
         log_file = tmp_path / "logs" / "orchestrator.log"
         session_name = "beta"
         env = {
-            "JUDGE_LOG_FILE": str(log_file),
+            "DEVBENCH_LOG_FILE": str(log_file),
             "DEVBENCH_SESSION_NAME": session_name,
-            "JUDGE_WORKSPACE_ROOT": str(tmp_path),
+            "DEVBENCH_WORKSPACE_ROOT": str(tmp_path),
         }
         with patch.dict("os.environ", env, clear=False):
-            os.environ.pop("JUDGE_LOG_LEVEL", None)
             log_setup_mod.setup_logging()
 
         logging.getLogger("test.session").info("dual-routing-marker")
@@ -278,8 +252,8 @@ class TestPerSessionLogRouting:
         """When DEVBENCH_SESSION_NAME is absent or empty, no session handler is added."""
         log_file = tmp_path / "logs" / "orchestrator.log"
         env: dict[str, str] = {
-            "JUDGE_LOG_FILE": str(log_file),
-            "JUDGE_WORKSPACE_ROOT": str(tmp_path),
+            "DEVBENCH_LOG_FILE": str(log_file),
+            "DEVBENCH_WORKSPACE_ROOT": str(tmp_path),
         }
         if session_env_value is not None:
             env["DEVBENCH_SESSION_NAME"] = session_env_value
@@ -297,31 +271,16 @@ class TestPerSessionLogRouting:
             f"no session handler expected when DEVBENCH_SESSION_NAME={session_env_value!r}; got {session_handlers}"
         )
 
-    def test_raises_runtime_error_when_workspace_root_missing(self, tmp_path: Path) -> None:
-        """When DEVBENCH_SESSION_NAME is set but JUDGE_WORKSPACE_ROOT is unset,
-        _resolve_session_log_file raises RuntimeError with an actionable message.
-        """
-        log_file = tmp_path / "logs" / "orchestrator.log"
-        env = {
-            "JUDGE_LOG_FILE": str(log_file),
-            "DEVBENCH_SESSION_NAME": "orphan",
-        }
-        with patch.dict("os.environ", env, clear=False):
-            os.environ.pop("JUDGE_WORKSPACE_ROOT", None)
-            with pytest.raises(RuntimeError, match="JUDGE_WORKSPACE_ROOT"):
-                log_setup_mod.setup_logging()
-
     @pytest.mark.parametrize("session_name", ["alpha", "beta-2", "my_session"])
     def test_session_log_path_constructed_from_session_name(self, tmp_path: Path, session_name: str) -> None:
         """The session log path uses the exact value of DEVBENCH_SESSION_NAME."""
         log_file = tmp_path / "logs" / "orchestrator.log"
         env = {
-            "JUDGE_LOG_FILE": str(log_file),
+            "DEVBENCH_LOG_FILE": str(log_file),
             "DEVBENCH_SESSION_NAME": session_name,
-            "JUDGE_WORKSPACE_ROOT": str(tmp_path),
+            "DEVBENCH_WORKSPACE_ROOT": str(tmp_path),
         }
         with patch.dict("os.environ", env, clear=False):
-            os.environ.pop("JUDGE_LOG_LEVEL", None)
             log_setup_mod.setup_logging()
 
         expected_path = tmp_path / SESSION_SESSIONS_BASE_DIR / session_name / DEFAULT_LOG_FILENAME

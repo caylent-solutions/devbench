@@ -23,7 +23,7 @@ def _run_hook(
             the Stop event payload from Claude Code).  When ``None``, no
             stdin is provided (maintains backward compat with existing tests).
     """
-    env = {"JUDGE_WORKSPACE_ROOT": workspace_root, "PATH": "/usr/bin:/bin"}
+    env = {"DEVBENCH_WORKSPACE_ROOT": workspace_root, "PATH": "/usr/bin:/bin"}
     if extra_env:
         env.update(extra_env)
     return subprocess.run(
@@ -203,11 +203,11 @@ class TestCircuitBreaker:
         backlog.write_text("| E0-F1-S1-T1 | Task | Task | in-progress | none | repo | `backlog/t1.md` |\n")
         # Block max_blocks times (use env to set max to 2 for fast test).
         for _ in range(2):
-            result = _run_hook(str(tmp_path), extra_env={"JUDGE_STOP_MAX_BLOCKS": "2"})
+            result = _run_hook(str(tmp_path), extra_env={"DEVBENCH_STOP_MAX_BLOCKS": "2"})
             output = json.loads(result.stdout)
             assert output["decision"] == "block"
         # Next call should allow stop (circuit breaker trips).
-        result = _run_hook(str(tmp_path), extra_env={"JUDGE_STOP_MAX_BLOCKS": "2"})
+        result = _run_hook(str(tmp_path), extra_env={"DEVBENCH_STOP_MAX_BLOCKS": "2"})
         assert result.stdout.strip() == ""
 
     def test_circuit_breaker_resets_after_window(self, tmp_path: Path) -> None:
@@ -217,7 +217,7 @@ class TestCircuitBreaker:
         old_ts = int(time.time()) - 300
         STATE_FILE.write_text(json.dumps({"count": 4, "first_block_ts": old_ts}))
         # Should reset counter (window expired) and block normally.
-        result = _run_hook(str(tmp_path), extra_env={"JUDGE_STOP_MAX_BLOCKS": "5"})
+        result = _run_hook(str(tmp_path), extra_env={"DEVBENCH_STOP_MAX_BLOCKS": "5"})
         output = json.loads(result.stdout)
         assert output["decision"] == "block"
         # Verify counter was reset -- state file should show count 1.
@@ -252,11 +252,11 @@ class TestCircuitBreaker:
         config_dir.mkdir(parents=True)
         (config_dir / "devbench.yaml").write_text("repos:\n  org/repo: {}\nstop_hook:\n  max_blocks: 10\n")
         # Env var should override YAML -- set to 1.
-        result = _run_hook(str(tmp_path), extra_env={"JUDGE_STOP_MAX_BLOCKS": "1"})
+        result = _run_hook(str(tmp_path), extra_env={"DEVBENCH_STOP_MAX_BLOCKS": "1"})
         output = json.loads(result.stdout)
         assert output["decision"] == "block"
         # After 1 block, circuit breaker trips despite YAML saying 10.
-        result = _run_hook(str(tmp_path), extra_env={"JUDGE_STOP_MAX_BLOCKS": "1"})
+        result = _run_hook(str(tmp_path), extra_env={"DEVBENCH_STOP_MAX_BLOCKS": "1"})
         assert result.stdout.strip() == ""
 
     def test_defaults_when_no_yaml_no_env(self, tmp_path: Path) -> None:
@@ -310,7 +310,7 @@ class TestStaleTaskDetection:
         (log_dir / "orchestrator.log").write_text(f"{old_ts} Set E0-F1-S1-T1 to 'in-progress'\n")
         result = _run_hook(
             str(tmp_path),
-            extra_env={"JUDGE_STOP_STALE_MINUTES": "1"},
+            extra_env={"DEVBENCH_STOP_STALE_MINUTES": "1"},
         )
         output = json.loads(result.stdout)
         assert "stale" in output["reason"].lower() or "may be stale" in output["reason"]
@@ -547,8 +547,8 @@ class TestPerSessionStateFile:
         """
         backlog = tmp_path / "BACKLOG.md"
         backlog.write_text("| E0-F1-S1-T1 | Task | Task | in-progress | none | repo | `backlog/t1.md` |\n")
-        env_a = {"DEVBENCH_SESSION_NAME": self.SESSION_A, "JUDGE_STOP_MAX_BLOCKS": "2"}
-        env_b = {"DEVBENCH_SESSION_NAME": self.SESSION_B, "JUDGE_STOP_MAX_BLOCKS": "2"}
+        env_a = {"DEVBENCH_SESSION_NAME": self.SESSION_A, "DEVBENCH_STOP_MAX_BLOCKS": "2"}
+        env_b = {"DEVBENCH_SESSION_NAME": self.SESSION_B, "DEVBENCH_STOP_MAX_BLOCKS": "2"}
 
         # Session A: two blocks -- circuit breaker trips on the 3rd call.
         for _ in range(2):
@@ -599,7 +599,7 @@ class TestPerSessionStateFile:
         """Circuit breaker trips at max_blocks for the session, not the global counter."""
         backlog = tmp_path / "BACKLOG.md"
         backlog.write_text("| E0-F1-S1-T1 | Task | Task | in-progress | none | repo | `backlog/t1.md` |\n")
-        env = {"DEVBENCH_SESSION_NAME": self.SESSION_A, "JUDGE_STOP_MAX_BLOCKS": "2"}
+        env = {"DEVBENCH_SESSION_NAME": self.SESSION_A, "DEVBENCH_STOP_MAX_BLOCKS": "2"}
         # Block twice.
         for _ in range(2):
             result = _run_hook(str(tmp_path), extra_env=env)

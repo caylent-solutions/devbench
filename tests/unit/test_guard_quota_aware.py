@@ -34,9 +34,8 @@ def _run_hook(
     env_overrides: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     """Invoke the hook script with the given JSON payload on stdin."""
-    # Strip legacy JUDGE_WORKSPACE_ROOT and JUDGE_LOG_FILE: _hook_lib.sh rejects
     # these vars at source time (AC-197-9) and all hooks source _hook_lib.sh.
-    env = {k: v for k, v in os.environ.items() if k not in ("JUDGE_WORKSPACE_ROOT", "JUDGE_LOG_FILE")}
+    env = {k: v for k, v in os.environ.items() if k not in ("DEVBENCH_WORKSPACE_ROOT", "DEVBENCH_LOG_FILE")}
     if env_overrides:
         env.update(env_overrides)
     return subprocess.run(
@@ -113,7 +112,7 @@ class TestGuardQuotaAwareStructural:
 
     def test_malformed_json_passes_through(self) -> None:
         """A non-JSON stdin payload must not raise; the hook silently passes."""
-        env = {k: v for k, v in os.environ.items() if k not in ("JUDGE_WORKSPACE_ROOT", "JUDGE_LOG_FILE")}
+        env = {k: v for k, v in os.environ.items() if k not in ("DEVBENCH_WORKSPACE_ROOT", "DEVBENCH_LOG_FILE")}
         result = subprocess.run(
             ["bash", str(SCRIPT_PATH)],
             input="not json at all { unclosed",
@@ -126,7 +125,7 @@ class TestGuardQuotaAwareStructural:
     def test_no_workspace_root_passes_through(self) -> None:
         """When DEVBENCH_WORKSPACE_ROOT is unset, the hook allows through without checking."""
         payload = _make_payload("uv run devbench next")
-        _excluded = {"JUDGE_WORKSPACE_ROOT", "JUDGE_LOG_FILE", "DEVBENCH_WORKSPACE_ROOT"}
+        _excluded = {"DEVBENCH_WORKSPACE_ROOT", "DEVBENCH_LOG_FILE"}
         env = {k: v for k, v in os.environ.items() if k not in _excluded}
         result = subprocess.run(
             ["bash", str(SCRIPT_PATH)],

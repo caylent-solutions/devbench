@@ -197,7 +197,7 @@ Everything else is optional. Per-repo settings, git-ops mode, stop-hook tuning, 
 
 For the full annotated YAML, value-resolution precedence, and every config key, see [docs/devbench-yaml-reference.md](docs/devbench-yaml-reference.md) and [docs/architecture.md §8 Configuration model](docs/architecture.md#8-configuration-model). For per-model token pricing and cost-formula details, see [docs/model-pricing.md](docs/model-pricing.md).
 
-> **BREAKING (v-next):** Every `JUDGE_*` env var has been renamed to `DEVBENCH_*`. Setting a legacy `JUDGE_*` env var causes devbench to exit non-zero at process start. Run `devbench migrate-env` to generate the one-shot migration shell script. See [CHANGELOG.md](CHANGELOG.md) for details.
+> **Note (v-next):** The operational environment-variable namespace is `DEVBENCH_*`. See [CHANGELOG.md](CHANGELOG.md) for the complete list of canonical names.
 
 ### Common tuning
 

@@ -1,11 +1,5 @@
 # LLM Authentication
 
-> **BREAKING CHANGE (v-next):** The env-var namespace has been renamed from `JUDGE_*` to `DEVBENCH_*`.
-> Every `JUDGE_*` variable documented here has a `DEVBENCH_*` replacement. Setting a legacy `JUDGE_*`
-> variable causes devbench to exit non-zero at startup. Run `devbench migrate-env` once to generate a
-> migration shell script, then source it before relaunching. See [docs/cli-reference.md](cli-reference.md)
-> for the `migrate-env` subcommand reference.
-
 DevBench supports two LLM backends for judge evaluation. Choose one based on your environment.
 
 ## Table of contents
@@ -225,8 +219,8 @@ Per-call env-var overrides take precedence over YAML (env > yaml > frontmatter):
 
 ```bash
 DEVBENCH_AGENT_MODEL_EXECUTOR=opus
-DEVBENCH_AGENT_MODEL_CODE_REVIEWER=opus
-DEVBENCH_AGENT_MODEL_CHANGES_MANIFEST=opus
+JUDGE_AGENT_MODEL_CODE_REVIEWER=opus
+JUDGE_AGENT_MODEL_CHANGES_MANIFEST=opus
 ```
 
 Both modes apply the override the same way:

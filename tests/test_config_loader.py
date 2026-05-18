@@ -37,7 +37,7 @@ from devbench.constants import STATUS_DRAFT, STATUS_IN_QUEUE
 
 @pytest.mark.unit
 class TestResolveConfigPath:
-    """AC-2: config path precedence is explicit > JUDGE_CONFIG_PATH > default."""
+    """AC-2: config path precedence is explicit > DEVBENCH_CONFIG_PATH > default."""
 
     def test_explicit_path_wins_over_env_and_default(self, tmp_path: Path) -> None:
         """
@@ -46,24 +46,24 @@ class TestResolveConfigPath:
         Then: the explicit path is returned
         """
         explicit = tmp_path / "custom.yaml"
-        env = {"JUDGE_CONFIG_PATH": str(tmp_path / "env.yaml")}
+        env = {"DEVBENCH_CONFIG_PATH": str(tmp_path / "env.yaml")}
         result = resolve_config_path(str(explicit), env, tmp_path / "workspace")
         assert result == explicit, f"Expected explicit path {explicit}, got {result}"
 
     def test_judge_config_path_env_wins_over_default(self, tmp_path: Path) -> None:
         """
-        Given: no explicit path but JUDGE_CONFIG_PATH set
+        Given: no explicit path but DEVBENCH_CONFIG_PATH set
         When: resolve_config_path is called
         Then: the env-var path is returned
         """
         env_yaml = tmp_path / "env_config.yaml"
-        env = {"JUDGE_CONFIG_PATH": str(env_yaml)}
+        env = {"DEVBENCH_CONFIG_PATH": str(env_yaml)}
         result = resolve_config_path(None, env, tmp_path / "workspace")
         assert result == env_yaml, f"Expected env path {env_yaml}, got {result}"
 
     def test_default_path_when_no_override(self, tmp_path: Path) -> None:
         """
-        Given: no explicit path and no JUDGE_CONFIG_PATH
+        Given: no explicit path and no DEVBENCH_CONFIG_PATH
         When: resolve_config_path is called
         Then: the default path under workspace_root is returned
         """
@@ -75,12 +75,12 @@ class TestResolveConfigPath:
 
     def test_explicit_none_and_empty_judge_config_path_uses_default(self, tmp_path: Path) -> None:
         """
-        Given: explicit path is None and JUDGE_CONFIG_PATH is empty string
+        Given: explicit path is None and DEVBENCH_CONFIG_PATH is empty string
         When: resolve_config_path is called
-        Then: empty JUDGE_CONFIG_PATH is treated as unset and the default path is used
+        Then: empty DEVBENCH_CONFIG_PATH is treated as unset and the default path is used
         """
         workspace = tmp_path / "ws"
-        result = resolve_config_path(None, {"JUDGE_CONFIG_PATH": ""}, workspace)
+        result = resolve_config_path(None, {"DEVBENCH_CONFIG_PATH": ""}, workspace)
         assert result == workspace / DEFAULT_CONFIG_SUBPATH, (
             f"Expected default path {workspace / DEFAULT_CONFIG_SUBPATH}, got {result}"
         )
@@ -1605,7 +1605,7 @@ class TestRepoConfigRuntimeFields:
                 checkout_directory: my-checkout
             """,
         )
-        rt = load_runtime_config(cfg, {"JUDGE_WORKSPACE_ROOT": str(tmp_path)})
+        rt = load_runtime_config(cfg, {"DEVBENCH_WORKSPACE_ROOT": str(tmp_path)})
         assert rt.repos["org/repo"].resolved_checkout_path == tmp_path / "my-checkout"
 
     def test_resolved_checkout_path_falls_back_to_short_name(self, tmp_path: Path) -> None:
@@ -1617,7 +1617,7 @@ class TestRepoConfigRuntimeFields:
                 default_branch: main
             """,
         )
-        rt = load_runtime_config(cfg, {"JUDGE_WORKSPACE_ROOT": str(tmp_path)})
+        rt = load_runtime_config(cfg, {"DEVBENCH_WORKSPACE_ROOT": str(tmp_path)})
         assert rt.repos["org/repo"].resolved_checkout_path == tmp_path / "repo"
 
     def test_resolved_checkout_path_none_when_workspace_unset(self, tmp_path: Path) -> None:
@@ -2810,9 +2810,9 @@ class TestAgentModelsConfig:
         from devbench.config_loader import validate_agent_model_value
 
         with pytest.raises(ValueError, match="not a valid Anthropic API"):
-            validate_agent_model_value("env JUDGE_AGENT_MODEL_X", "executor", "garbage", False)
+            validate_agent_model_value("env DEVBENCH_AGENT_MODEL_X", "executor", "garbage", False)
         with pytest.raises(ValueError, match="not a valid Bedrock"):
-            validate_agent_model_value("env JUDGE_AGENT_MODEL_X", "executor", "opus", True)
+            validate_agent_model_value("env DEVBENCH_AGENT_MODEL_X", "executor", "opus", True)
         # Happy paths return None.
         validate_agent_model_value("yaml", "executor", "opus", False)
         validate_agent_model_value("yaml", "executor", "claude-opus-4-7", False)

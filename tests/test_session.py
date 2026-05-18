@@ -19,7 +19,7 @@ import threading
 from dataclasses import fields
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
@@ -566,12 +566,12 @@ class TestDetectScopeOverlap:
         """Passing None for new_scope must raise TypeError with actionable message."""
         existing = [_make_session(name="alpha", scope=["E1"])]
         with pytest.raises(TypeError, match="new_scope must be a list"):
-            detect_scope_overlap(existing, None)  # type: ignore[arg-type]
+            detect_scope_overlap(existing, cast(list[str], None))
 
     def test_none_existing_sessions_raises_type_error(self) -> None:
         """Passing None for existing_sessions must raise TypeError with actionable message."""
         with pytest.raises(TypeError, match="existing_sessions must be a list"):
-            detect_scope_overlap(None, ["E1"])  # type: ignore[arg-type]
+            detect_scope_overlap(cast(list[Session], None), ["E1"])
 
     def test_result_is_sorted(self) -> None:
         """Returned overlap list is always sorted alphabetically (AC-192-4)."""

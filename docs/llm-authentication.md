@@ -1,5 +1,11 @@
 # LLM Authentication
 
+> **BREAKING CHANGE (v-next):** The env-var namespace has been renamed from `JUDGE_*` to `DEVBENCH_*`.
+> Every `JUDGE_*` variable documented here has a `DEVBENCH_*` replacement. Setting a legacy `JUDGE_*`
+> variable causes devbench to exit non-zero at startup. Run `devbench migrate-env` once to generate a
+> migration shell script, then source it before relaunching. See [docs/cli-reference.md](cli-reference.md)
+> for the `migrate-env` subcommand reference.
+
 DevBench supports two LLM backends for judge evaluation. Choose one based on your environment.
 
 ## Table of contents
@@ -44,9 +50,9 @@ This file contains a `claudeAiOauth` object with an `accessToken` that has the `
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `JUDGE_CLAUDE_CREDENTIALS_FILE` | `~/.claude/.credentials.json` | Path to the Claude Code credentials file |
-| `JUDGE_CLAUDE_MODEL` | *(required)* | SDK caller's model -- governs the orchestrate skill's coordination calls (e.g. `claude-opus-4-7`). Per-agent work models live in the `agents:` block of `devbench.yaml` ([ADR-25](adr/25-per-agent-model-overrides.md)) and default to each agent's `.md` frontmatter. |
-| `JUDGE_LLM_TIMEOUT` | `300` | Timeout for LLM API calls (seconds) |
+| `DEVBENCH_CLAUDE_CREDENTIALS_FILE` | `~/.claude/.credentials.json` | Path to the Claude Code credentials file |
+| `DEVBENCH_CLAUDE_MODEL` | *(required)* | SDK caller's model -- governs the orchestrate skill's coordination calls (e.g. `claude-opus-4-7`). Per-agent work models live in the `agents:` block of `devbench.yaml` ([ADR-25](adr/25-per-agent-model-overrides.md)) and default to each agent's `.md` frontmatter. |
+| `DEVBENCH_LLM_TIMEOUT` | `300` | Timeout for LLM API calls (seconds) |
 
 ### Verifying Authentication
 
@@ -115,7 +121,7 @@ Uses the Anthropic Bedrock SDK with your AWS credentials. No Claude Code subscri
 
 ### How It Works
 
-When `JUDGE_USE_BEDROCK=1` is set, DevBench uses `anthropic.AnthropicBedrock` instead of `anthropic.Anthropic`. AWS credentials are resolved through the standard boto3 credential chain (IAM role, environment variables, AWS config file, etc.).
+When `DEVBENCH_USE_BEDROCK=1` is set, DevBench uses `anthropic.AnthropicBedrock` instead of `anthropic.Anthropic`. AWS credentials are resolved through the standard boto3 credential chain (IAM role, environment variables, AWS config file, etc.).
 
 ### Requirements
 
@@ -127,17 +133,17 @@ When `JUDGE_USE_BEDROCK=1` is set, DevBench uses `anthropic.AnthropicBedrock` in
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `JUDGE_USE_BEDROCK` | `false` | Set to `1`, `true`, or `yes` to enable Bedrock |
-| `JUDGE_BEDROCK_REGION` | `us-east-1` | AWS region for Bedrock API calls (falls back to `AWS_REGION`) |
-| `JUDGE_CLAUDE_MODEL` | *(required)* | SDK caller's Bedrock model ID -- governs the orchestrate skill's coordination calls (e.g. `us.anthropic.claude-opus-4-7-v1`). Per-agent work models live in the `agents:` block of `devbench.yaml` ([ADR-25](adr/25-per-agent-model-overrides.md)). |
-| `JUDGE_LLM_TIMEOUT` | `300` | Timeout for LLM API calls (seconds) |
+| `DEVBENCH_USE_BEDROCK` | `false` | Set to `1`, `true`, or `yes` to enable Bedrock |
+| `DEVBENCH_BEDROCK_REGION` | `us-east-1` | AWS region for Bedrock API calls (falls back to `AWS_REGION`) |
+| `DEVBENCH_CLAUDE_MODEL` | *(required)* | SDK caller's Bedrock model ID -- governs the orchestrate skill's coordination calls (e.g. `us.anthropic.claude-opus-4-7-v1`). Per-agent work models live in the `agents:` block of `devbench.yaml` ([ADR-25](adr/25-per-agent-model-overrides.md)). |
+| `DEVBENCH_LLM_TIMEOUT` | `300` | Timeout for LLM API calls (seconds) |
 
 ### Usage
 
 ```bash
-JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
-JUDGE_USE_BEDROCK=1 \
-JUDGE_BEDROCK_REGION=us-east-1 \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_USE_BEDROCK=1 \
+DEVBENCH_BEDROCK_REGION=us-east-1 \
 make start
 ```
 
@@ -147,7 +153,7 @@ mode -- non-interactive is the recommended default.)
 ### Verifying Authentication
 
 ```bash
-JUDGE_USE_BEDROCK=1 JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_USE_BEDROCK=1 DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
 python3 -c "
 from devbench.config import USE_BEDROCK, BEDROCK_REGION
 print(f'Bedrock enabled: {USE_BEDROCK}')
@@ -159,7 +165,7 @@ print(f'Region: {BEDROCK_REGION}')
 
 #### Bedrock credential resolution chain
 
-When `JUDGE_USE_BEDROCK=1`, the Anthropic SDK delegates AWS auth to boto3, which checks credentials in this order (first match wins):
+When `DEVBENCH_USE_BEDROCK=1`, the Anthropic SDK delegates AWS auth to boto3, which checks credentials in this order (first match wins):
 
 1. Explicit env vars: `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (+ optional `AWS_SESSION_TOKEN`)
 2. Shared credentials file: `~/.aws/credentials` (profile selected by `AWS_PROFILE`, default `default`)
@@ -179,7 +185,7 @@ The Bedrock model is not enabled in your AWS account for the configured region. 
 
 #### Region mismatch
 
-Ensure `JUDGE_BEDROCK_REGION` matches the region where you have Bedrock model access enabled. Cross-region inference model IDs use the `us.anthropic.*` prefix.
+Ensure `DEVBENCH_BEDROCK_REGION` matches the region where you have Bedrock model access enabled. Cross-region inference model IDs use the `us.anthropic.*` prefix.
 
 ---
 
@@ -218,9 +224,9 @@ Mismatches fail fast at config-load time with an actionable error message, rathe
 Per-call env-var overrides take precedence over YAML (env > yaml > frontmatter):
 
 ```bash
-JUDGE_AGENT_MODEL_EXECUTOR=opus
-JUDGE_AGENT_MODEL_CODE_REVIEWER=opus
-JUDGE_AGENT_MODEL_CHANGES_MANIFEST=opus
+DEVBENCH_AGENT_MODEL_EXECUTOR=opus
+DEVBENCH_AGENT_MODEL_CODE_REVIEWER=opus
+DEVBENCH_AGENT_MODEL_CHANGES_MANIFEST=opus
 ```
 
 Both modes apply the override the same way:

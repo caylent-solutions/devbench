@@ -11,10 +11,10 @@ uv run devbench <command> [args]
 
 Two environment variables MUST be set before any command runs; commands that depend on them exit non-zero with a clear message when unset:
 
-- `JUDGE_WORKSPACE_ROOT` -- absolute path to the backlog workspace (contains `BACKLOG.md`, `backlog/`, `.devbench/`).
-- `JUDGE_CLAUDE_MODEL` -- SDK caller's model id (example: `us.anthropic.claude-opus-4-7-v1`). Governs the orchestrate skill's coordination calls only. Per-agent work models live in the `agents:` block of `devbench.yaml` (see [ADR-25](adr/25-per-agent-model-overrides.md)).
+- `DEVBENCH_WORKSPACE_ROOT` -- absolute path to the backlog workspace (contains `BACKLOG.md`, `backlog/`, `.devbench/`).
+- `DEVBENCH_CLAUDE_MODEL` -- SDK caller's model id (example: `us.anthropic.claude-opus-4-7-v1`). Governs the orchestrate skill's coordination calls only. Per-agent work models live in the `agents:` block of `devbench.yaml` (see [ADR-25](adr/25-per-agent-model-overrides.md)).
 
-Optional: `--config <path>` (or `JUDGE_CONFIG_PATH` env var) overrides the default `backlog/config/devbench.yaml` lookup.
+Optional: `--config <path>` (or `DEVBENCH_CONFIG_PATH` env var) overrides the default `backlog/config/devbench.yaml` lookup.
 
 ## Exit codes (all commands)
 
@@ -82,7 +82,7 @@ Without `--detail` the panels are omitted (default invocation matches the histor
 The summary's `Blocked` row is split into three lines (Part-1, post-issue-#118):
 
 - `Blocked (auto)` -- ADR-07 cascade-clearing: the task carries a `[BLOCKED_PENDING_PROPOSAL]` marker chain that will resolve when its target tasks reach terminal.
-- `Blocked (recovery)` -- AWAITING_AUTO_RECOVERY: no marker yet, but devbench's recovery loop has an artefact on disk (a pending proposal JSON, a rejected-amendment archive, or a recent recovery-agent `[BLOCKED]` audit comment within `JUDGE_BLOCKED_RECOVERY_WINDOW_SECONDS` -- default 1800s / 30min). The orchestrator's next sweep cycle will advance the task into the auto-clearing bucket. Operator does nothing.
+- `Blocked (recovery)` -- AWAITING_AUTO_RECOVERY: no marker yet, but devbench's recovery loop has an artefact on disk (a pending proposal JSON, a rejected-amendment archive, or a recent recovery-agent `[BLOCKED]` audit comment within `DEVBENCH_BLOCKED_RECOVERY_WINDOW_SECONDS` -- default 1800s / 30min). The orchestrator's next sweep cycle will advance the task into the auto-clearing bucket. Operator does nothing.
 - `Blocked (attn)` -- the true halt list: manual gates (`DO NOT CLAIM`), unknown marker targets, cascade-stuck states. Operator must act.
 
 **Drain banner (issue #188):** when a `drain.signal` file is present in `<workspace>/.devbench/`, `devbench status` prepends a one-line banner above the Status Summary:
@@ -127,21 +127,21 @@ Cost is computed per call, per token type, from real `usage` data. See [model-pr
 
 **Log-file resolution (fail-fast, no fallbacks):** `devbench report` reads its log file in this order. The same chain is used by the orchestrator's `setup_logging` writer, so both reader and writer always resolve to the same path:
 
-1. `JUDGE_LOG_FILE` environment variable -- explicit override; the caller takes responsibility. Wins over everything below; useful for ad-hoc redirects and tests.
-2. `log_file:` in the workspace's `backlog/config/devbench.yaml` (top-level field) -- the **single source of truth** for ordinary launches. Resolved relative to `JUDGE_WORKSPACE_ROOT` when not absolute. Both the orchestrator (writer) and `devbench report` / `devbench hook-tail` (readers) consult this field, so coordinating shell envs across panes is no longer required.
-3. `<JUDGE_WORKSPACE_ROOT>/logs/orchestrator.log` -- the canonical per-workspace default applied when neither (1) nor (2) is set.
+1. `DEVBENCH_LOG_FILE` environment variable -- explicit override; the caller takes responsibility. Wins over everything below; useful for ad-hoc redirects and tests.
+2. `log_file:` in the workspace's `backlog/config/devbench.yaml` (top-level field) -- the **single source of truth** for ordinary launches. Resolved relative to `DEVBENCH_WORKSPACE_ROOT` when not absolute. Both the orchestrator (writer) and `devbench report` / `devbench hook-tail` (readers) consult this field, so coordinating shell envs across panes is no longer required.
+3. `<DEVBENCH_WORKSPACE_ROOT>/logs/orchestrator.log` -- the canonical per-workspace default applied when neither (1) nor (2) is set.
 
-When NONE of (1)/(2)/(3) yields a path -- i.e. `JUDGE_LOG_FILE` unset, `log_file:` absent from yaml, AND `JUDGE_WORKSPACE_ROOT` unset -- `devbench report` exits 1 with an actionable error naming all three sources. The previous implementation silently fell back to the devbench source-tree's log (`<devbench>/src/devbench/logs/orchestrator.log`), which let operators read a stale, unrelated log without noticing -- the BACKLOG.md done count and the log-derived throughput count then diverged silently.
+When NONE of (1)/(2)/(3) yields a path -- i.e. `DEVBENCH_LOG_FILE` unset, `log_file:` absent from yaml, AND `DEVBENCH_WORKSPACE_ROOT` unset -- `devbench report` exits 1 with an actionable error naming all three sources. The previous implementation silently fell back to the devbench source-tree's log (`<devbench>/src/devbench/logs/orchestrator.log`), which let operators read a stale, unrelated log without noticing -- the BACKLOG.md done count and the log-derived throughput count then diverged silently.
 
-**Divergence WARNING:** when `BACKLOG.md` reports a non-zero "Tasks completed" count but the All-time throughput window finds zero `Set <id> to 'done'` events, the report emits a one-line WARNING above the trailing summary. The two counts MUST agree on a healthy backlog (the throughput row narrates the events that produced the backlog state). A divergence almost always means `devbench report` is reading a different log than the orchestrator writes to. The warning names the log file path so the operator can immediately identify the mismatch and either set `JUDGE_LOG_FILE` correctly or invoke `devbench report` from the same env the orchestrator was launched with.
+**Divergence WARNING:** when `BACKLOG.md` reports a non-zero "Tasks completed" count but the All-time throughput window finds zero `Set <id> to 'done'` events, the report emits a one-line WARNING above the trailing summary. The two counts MUST agree on a healthy backlog (the throughput row narrates the events that produced the backlog state). A divergence almost always means `devbench report` is reading a different log than the orchestrator writes to. The warning names the log file path so the operator can immediately identify the mismatch and either set `DEVBENCH_LOG_FILE` correctly or invoke `devbench report` from the same env the orchestrator was launched with.
 
 **Blocked-task classification (Part-1, post-issue-#118):** the report renders blocked tasks across three panels, ordered by what the operator should do:
 
 - `Blocked tasks (auto-clearing via proposal)` -- the ADR-07 cascade will fire when every `[BLOCKED_PENDING_PROPOSAL]` marker target reaches terminal. Each row names the IDs the task is waiting on. Operator does nothing.
-- `Blocked tasks (auto-recovery in flight)` -- no marker yet, but devbench's recovery loop has an artefact on disk: a pending proposal JSON, a rejected-amendment archive, or a recent recovery-agent `[BLOCKED]` audit comment within `JUDGE_BLOCKED_RECOVERY_WINDOW_SECONDS` (default 1800s). Each row carries a `[recovery: <signal-source>]` annotation so the operator can see which signal drove the classification. Operator does nothing for now -- the next sweep cycle will advance the task into the auto-clearing bucket.
+- `Blocked tasks (auto-recovery in flight)` -- no marker yet, but devbench's recovery loop has an artefact on disk: a pending proposal JSON, a rejected-amendment archive, or a recent recovery-agent `[BLOCKED]` audit comment within `DEVBENCH_BLOCKED_RECOVERY_WINDOW_SECONDS` (default 1800s). Each row carries a `[recovery: <signal-source>]` annotation so the operator can see which signal drove the classification. Operator does nothing for now -- the next sweep cycle will advance the task into the auto-clearing bucket.
 - `Blocked tasks (needs operator attention)` -- the true halt list: manual gates (`DO NOT CLAIM`), unknown marker targets, cascade-stuck states. Each row carries just ID + title; the operator opens the work-unit file to read the blocker comment.
 
-Empty panels are omitted entirely. The recency-window override (`JUDGE_BLOCKED_RECOVERY_WINDOW_SECONDS=<seconds>`) lets operators with slower iteration cadences extend the audit-comment window.
+Empty panels are omitted entirely. The recency-window override (`DEVBENCH_BLOCKED_RECOVERY_WINDOW_SECONDS=<seconds>`) lets operators with slower iteration cadences extend the audit-comment window.
 
 **ETA formula (issue #157):** the `Est. time to complete remaining` cell now multiplies the recent-pace minutes by `tasks_active + tasks_blocked_recovery + tasks_blocked_auto`. Both blocked buckets resolve on devbench's own (proposal cascade or auto-recovery loop), so excluding them produced an unrealistically optimistic ETA. The `needs operator attention` bucket stays excluded -- those are genuine halts with unbounded ETA. The cell carries a comment-suffix naming the bucket counts and pace, e.g. `~5.4 h (active 4 + blocked-recovery 60 + blocked-auto 27 at 5.6 min/task)`. The cost projection uses the same denominator. ETA falls back to `n/a` when fewer than the required pace samples have completed in the recent window (the metric is fragile and a single completion would project meaningless numbers).
 
@@ -153,7 +153,7 @@ Empty panels are omitted entirely. The recency-window override (`JUDGE_BLOCKED_R
 - `[ORCHESTRATOR STOPPED]` (red) -- last log line older than `stop_hook.window_seconds`. Suffix names elapsed-since plus the last-seen UTC timestamp so the operator can see when the loop went quiet (`no activity for 14m (last seen 2026-05-04 13:21 UTC)`).
 - `[ORCHESTRATOR STARTING]` (yellow) -- log file missing or empty. The orchestrator is starting up or no events have been written yet.
 
-Every banner ends with the active session id when `JUDGE_ORCHESTRATOR_SESSION_ID` is set (`-- session backlog-a-orchestrator`); the suffix is suppressed when the env var is unset so multi-session operators never see a `-- session None` artefact.
+Every banner ends with the active session id when `DEVBENCH_ORCHESTRATOR_SESSION_ID` is set (`-- session backlog-a-orchestrator`); the suffix is suppressed when the env var is unset so multi-session operators never see a `-- session None` artefact.
 
 ANSI colour is emitted only when stdout is a TTY and `NO_COLOR` is unset (mirrors the existing colour rules elsewhere in the report). When piped to `cat`, redirected to a file, or running in CI, the banner renders as plain text.
 
@@ -178,14 +178,14 @@ uv run devbench hook-tail [<path>] [--tz <zone>] [--no-follow] [--from-start]
 
 Read-only pretty-tail of the plugin hook event stream (`hook-logs.jsonl`). One-line colourised summary per PreToolUse / PostToolUse / SubagentStart / SubagentStop / Stop event. Complements `watch`: where `watch` shows current state, `hook-tail` shows events as they happen.
 
-- `<path>` defaults to `$JUDGE_WORKSPACE_ROOT/hook-logs.jsonl`.
-- `--tz <zone>` overrides the display timezone (any IANA zone, for example `America/Denver`). When `--tz` is absent, `hook-tail` falls back to the top-level `display_timezone:` yaml key (or `JUDGE_DISPLAY_TIMEZONE` env), then to OS local. Internal storage stays in UTC.
+- `<path>` defaults to `$DEVBENCH_WORKSPACE_ROOT/hook-logs.jsonl`.
+- `--tz <zone>` overrides the display timezone (any IANA zone, for example `America/Denver`). When `--tz` is absent, `hook-tail` falls back to the top-level `display_timezone:` yaml key (or `DEVBENCH_DISPLAY_TIMEZONE` env), then to OS local. Internal storage stays in UTC.
 - `--no-follow` exits after emitting existing events instead of tailing.
 - `--from-start` emits every event from the beginning of the file before entering follow mode.
-- `--orchestrator-only` (Phase 11 / E230) filters the stream to events whose `orchestrator_session` field equals `$JUDGE_ORCHESTRATOR_SESSION_ID`. When the env var is unset the command exits 2 with an actionable error -- pass `--orchestrator-session <id>` instead to supply the value explicitly.
+- `--orchestrator-only` (Phase 11 / E230) filters the stream to events whose `orchestrator_session` field equals `$DEVBENCH_ORCHESTRATOR_SESSION_ID`. When the env var is unset the command exits 2 with an actionable error -- pass `--orchestrator-session <id>` instead to supply the value explicitly.
 - `--orchestrator-session <id>` filters by an explicit session id (audit / replay use case). Pre-Phase-11 log entries that lack the field are passed through unfiltered so historical events stay visible.
 
-The launch command in `caylent-telemetry-spec/devbench-launch-commands.txt` sets `JUDGE_ORCHESTRATOR_SESSION_ID` on both the orchestrator pane (so the plugin's `hook-logger.sh` stamps every event) and the hook-tail pane (so the filter has a value to match). Side-pane Claude sessions started ad-hoc inherit the workspace root but NOT the session id, so their tool calls land in the log with an empty `orchestrator_session` and are dropped by the filter -- a `tail -f hook-logs.jsonl` would still see them, but the pretty-printed orchestrator pane stays clean.
+The launch command in `caylent-telemetry-spec/devbench-launch-commands.txt` sets `DEVBENCH_ORCHESTRATOR_SESSION_ID` on both the orchestrator pane (so the plugin's `hook-logger.sh` stamps every event) and the hook-tail pane (so the filter has a value to match). Side-pane Claude sessions started ad-hoc inherit the workspace root but NOT the session id, so their tool calls land in the log with an empty `orchestrator_session` and are dropped by the filter -- a `tail -f hook-logs.jsonl` would still see them, but the pretty-printed orchestrator pane stays clean.
 
 See [hook-activity.md](hook-activity.md) for the event glyphs and the full column legend.
 
@@ -200,7 +200,7 @@ Single-shot poll that detects a stuck `/devbench:orchestrate` loop and writes a 
 A run is considered stuck when **both** conditions hold:
 
 1. `BACKLOG.md` contains at least one row with `Status: in-progress`.
-2. The most recent dated line in the orchestrator log is older than `--idle-minutes` (default 5). Path resolution mirrors `devbench report` -- (1) `JUDGE_LOG_FILE`, (2) `log_file:` in `backlog/config/devbench.yaml`, (3) `<JUDGE_WORKSPACE_ROOT>/logs/orchestrator.log`.
+2. The most recent dated line in the orchestrator log is older than `--idle-minutes` (default 5). Path resolution mirrors `devbench report` -- (1) `DEVBENCH_LOG_FILE`, (2) `log_file:` in `backlog/config/devbench.yaml`, (3) `<DEVBENCH_WORKSPACE_ROOT>/logs/orchestrator.log`.
 
 On stuck detection the marker file is written with:
 
@@ -219,8 +219,8 @@ On stuck detection the marker file is written with:
 Flags:
 
 - `--idle-minutes N` -- override the idle threshold (default 5; minimum 1).
-- `--flag-file PATH` -- override the marker path (default `$JUDGE_WORKSPACE_ROOT/.devbench/needs-restart.flag`).
-- `--log-file PATH` -- override the orchestrator log location. Default is the devbench repo's `src/devbench/logs/orchestrator.log` relative to the installed package; pass an explicit path (or set `JUDGE_LOG_FILE` and read `$JUDGE_LOG_FILE`) to point watchdog at the same workspace-local log the orchestrator wrote to. `cmd_watchdog` does NOT consult the `log_file:` yaml field today; pass `--log-file` (or wrap with the env) to keep the writer/reader in sync.
+- `--flag-file PATH` -- override the marker path (default `$DEVBENCH_WORKSPACE_ROOT/.devbench/needs-restart.flag`).
+- `--log-file PATH` -- override the orchestrator log location. Default is the devbench repo's `src/devbench/logs/orchestrator.log` relative to the installed package; pass an explicit path (or set `DEVBENCH_LOG_FILE` and read `$DEVBENCH_LOG_FILE`) to point watchdog at the same workspace-local log the orchestrator wrote to. `cmd_watchdog` does NOT consult the `log_file:` yaml field today; pass `--log-file` (or wrap with the env) to keep the writer/reader in sync.
 - `--print-if-stuck` -- print a one-line `[devbench watchdog] STUCK: <id> (idle Ns, threshold Mm)` status to stdout on detection. Silent when healthy so it pipes cleanly in `PROMPT_COMMAND`.
 
 Typical operator integrations:
@@ -292,7 +292,7 @@ Convert an ended session's JSONL log to a Parquet cold archive at `<workspace>/l
 uv run devbench check
 ```
 
-Pre-flight verifier for orchestrator launch readiness. For every repo in `backlog/config/devbench.yaml`'s `repos:` map, confirms (1) symlink at `$JUDGE_WORKSPACE_ROOT/<checkout_directory>` exists, (2) the local clone has an `origin` remote, (3) the remote's `default_branch` matches `devbench.yaml` (when set), and (4) no open PR already targets `git_ops.single_branch` (when single-branch mode is on). Exits 0 when every repo passes; exits 1 with one actionable error per failure otherwise. The `gh api` / `gh pr list` calls use the timeout in `DEVBENCH_CHECK_GH_API_TIMEOUT` (seconds, default `30`).
+Pre-flight verifier for orchestrator launch readiness. For every repo in `backlog/config/devbench.yaml`'s `repos:` map, confirms (1) symlink at `$DEVBENCH_WORKSPACE_ROOT/<checkout_directory>` exists, (2) the local clone has an `origin` remote, (3) the remote's `default_branch` matches `devbench.yaml` (when set), and (4) no open PR already targets `git_ops.single_branch` (when single-branch mode is on). Exits 0 when every repo passes; exits 1 with one actionable error per failure otherwise. The `gh api` / `gh pr list` calls use the timeout in `DEVBENCH_CHECK_GH_API_TIMEOUT` (seconds, default `30`).
 
 Under `git_ops.local_only: true`, the origin check inverts: the local clone MUST NOT have an `origin` remote (presence is a misconfiguration). Checks (3) and (4) are skipped because there is no remote to query through `gh`.
 
@@ -536,11 +536,11 @@ The file lives at `<workspace>/.devbench/scope.json`. When `DEVBENCH_SESSION_NAM
 
 ```bash
 # Pre-arm scope for epics E1 through E3 plus E5
-JUDGE_WORKSPACE_ROOT=$PWD JUDGE_CLAUDE_MODEL=... \
+DEVBENCH_WORKSPACE_ROOT=$PWD DEVBENCH_CLAUDE_MODEL=... \
   uv run devbench scope set --include "E1-E3, E5"
 
 # Launch interactive Claude Code; the orchestrate skill respects the pre-armed scope.json
-JUDGE_WORKSPACE_ROOT=$PWD JUDGE_CLAUDE_MODEL=... \
+DEVBENCH_WORKSPACE_ROOT=$PWD DEVBENCH_CLAUDE_MODEL=... \
   claude --dangerously-skip-permissions --plugin-dir <devbench>/plugin/devbench
 
 # Clear when done
@@ -627,7 +627,7 @@ agents:
     changes_manifest: opus
 ```
 
-Every field defaults to `null` when absent (use the agent's `.md` frontmatter model). When `use_bedrock: true`, every value must be a Bedrock ARN (`us.anthropic.claude-<name>-<ver>-v<N>`); when `false`, values must be a short name (`opus`/`sonnet`/`haiku`) or an Anthropic API id (`claude-opus-4-7`). `JUDGE_AGENT_MODEL_<NAME>` env vars (e.g. `JUDGE_AGENT_MODEL_EXECUTOR=opus`, `JUDGE_AGENT_MODEL_CODE_REVIEWER=opus`) override the YAML on a per-call basis (env > yaml > frontmatter).
+Every field defaults to `null` when absent (use the agent's `.md` frontmatter model). When `use_bedrock: true`, every value must be a Bedrock ARN (`us.anthropic.claude-<name>-<ver>-v<N>`); when `false`, values must be a short name (`opus`/`sonnet`/`haiku`) or an Anthropic API id (`claude-opus-4-7`). `DEVBENCH_AGENT_MODEL_<NAME>` env vars (e.g. `DEVBENCH_AGENT_MODEL_EXECUTOR=opus`, `DEVBENCH_AGENT_MODEL_CODE_REVIEWER=opus`) override the YAML on a per-call basis (env > yaml > frontmatter).
 
 ---
 
@@ -1014,7 +1014,7 @@ Run the test suite in the work unit's target repo. Uses the repo's `make test` t
 uv run devbench log <message>
 ```
 
-Append a free-form message to the orchestrator log. The destination path is resolved via `setup_logging` (`JUDGE_LOG_FILE` > `log_file:` in `backlog/config/devbench.yaml` > `<JUDGE_WORKSPACE_ROOT>/logs/orchestrator.log` > source-tree default), so `devbench log` and `devbench report` always agree on the file. Not audited to the work-unit file. Useful for emitting narrative breadcrumbs from agents.
+Append a free-form message to the orchestrator log. The destination path is resolved via `setup_logging` (`DEVBENCH_LOG_FILE` > `log_file:` in `backlog/config/devbench.yaml` > `<DEVBENCH_WORKSPACE_ROOT>/logs/orchestrator.log` > source-tree default), so `devbench log` and `devbench report` always agree on the file. Not audited to the work-unit file. Useful for emitting narrative breadcrumbs from agents.
 
 ### `log-verdict`
 
@@ -1089,8 +1089,8 @@ The orchestrator skill ([`plugin/devbench/skills/orchestrate/SKILL.md`](../plugi
 |----|---------|
 | 0 | PR merged (or commit landed locally in deferred mode). |
 | 1 | Hard failure -- block the task with a `[BLOCKED]` audit comment. |
-| 2 | CI failed; executor retry budget not exhausted. Audit comment `[CI_FAIL]` names the trimmed log under `.devbench/ci-failures/<id>-<n>.log`. Re-invoke the executor with `ci-fail` feedback, then re-run git-ops. (Issue #115; **default on**. Disable via `git_ops.ci_failure_retry: false` in `devbench.yaml` or env `JUDGE_CI_FAILURE_RETRY_ENABLED=0`.) |
-| 3 | PR has unresolved review feedback; executor retry budget not exhausted. Audit comment `[PR_BOT_FAIL]` names the JSON feedback file under `.devbench/pr-bot-feedback/<id>-<n>.json`. Re-invoke the executor with `pr-bot` feedback, then re-run git-ops. (Issue #116; opt-in. Enable via `git_ops.pr_review_resolution.enabled: true` in `devbench.yaml` or env `JUDGE_PR_REVIEW_RESOLUTION_ENABLED=1`.) |
+| 2 | CI failed; executor retry budget not exhausted. Audit comment `[CI_FAIL]` names the trimmed log under `.devbench/ci-failures/<id>-<n>.log`. Re-invoke the executor with `ci-fail` feedback, then re-run git-ops. (Issue #115; **default on**. Disable via `git_ops.ci_failure_retry: false` in `devbench.yaml` or env `DEVBENCH_CI_FAILURE_RETRY_ENABLED=0`.) |
+| 3 | PR has unresolved review feedback; executor retry budget not exhausted. Audit comment `[PR_BOT_FAIL]` names the JSON feedback file under `.devbench/pr-bot-feedback/<id>-<n>.json`. Re-invoke the executor with `pr-bot` feedback, then re-run git-ops. (Issue #116; opt-in. Enable via `git_ops.pr_review_resolution.enabled: true` in `devbench.yaml` or env `DEVBENCH_PR_REVIEW_RESOLUTION_ENABLED=1`.) |
 
 The retry budget for rc=2 / rc=3 is shared with the existing review-judge retry budget (`MAX_RETRY_ATTEMPTS`); when exhausted, git-ops returns rc=1 instead of 2/3 and writes a `[CI_FAIL_BLOCKED]` / `[PR_BOT_FAIL_BLOCKED]` marker so the operator sees the full failure surface.
 
@@ -1098,10 +1098,10 @@ Every toggle below resolves with **env > YAML > default** precedence. Boolean en
 
 #### CI-failure retry (issue #115, default on)
 
-Default-on as of v-next; opt out via `git_ops.ci_failure_retry: false` in `devbench.yaml` (or env `JUDGE_CI_FAILURE_RETRY_ENABLED=0`). When `wait_for_checks_and_classify` returns a non-GREEN `CIResult` (i.e. `FAILED_KNOWN_TASK`, `FAILED_UNKNOWN`, or `TIMEOUT`):
+Default-on as of v-next; opt out via `git_ops.ci_failure_retry: false` in `devbench.yaml` (or env `DEVBENCH_CI_FAILURE_RETRY_ENABLED=0`). When `wait_for_checks_and_classify` returns a non-GREEN `CIResult` (i.e. `FAILED_KNOWN_TASK`, `FAILED_UNKNOWN`, or `TIMEOUT`):
 
 1. `gh pr checks --json name,state,link` identifies the failing run.
-2. `gh run view <run-id> --log-failed` fetches the log; the trailing `JUDGE_CI_FAILURE_LOG_BYTES` bytes (default 32 KiB) are saved to `.devbench/ci-failures/<task-id>-<attempt>.log`.
+2. `gh run view <run-id> --log-failed` fetches the log; the trailing `DEVBENCH_CI_FAILURE_LOG_BYTES` bytes (default 32 KiB) are saved to `.devbench/ci-failures/<task-id>-<attempt>.log`.
 3. A `[CI_FAIL]` audit comment names the log path; rc=2 signals the orchestrator to re-invoke the executor.
 4. After `MAX_RETRY_ATTEMPTS` retries the path transitions to `[CI_FAIL_BLOCKED]` + rc=1.
 
@@ -1110,22 +1110,22 @@ Default-on as of v-next; opt out via `git_ops.ci_failure_retry: false` in `devbe
 Configure via YAML `git_ops.pr_review_resolution:` block (every sub-field
 overridable via the env vars below). Or stay env-only:
 
-Set `JUDGE_PR_REVIEW_RESOLUTION_ENABLED=1` AND configure at least one signal (a non-empty `JUDGE_PR_REVIEW_AGENTS` allowlist or `JUDGE_PR_REVIEW_DECISION_BLOCKS=1`) to enable. After `wait_for_checks_and_classify` returns `CIResult.GREEN`, git-ops polls `gh pr view --json reviewDecision,reviews` and `gh api repos/<repo>/pulls/<n>/comments` for up to `JUDGE_PR_REVIEW_SETTLE_SECONDS` seconds (default 60), polling every `JUDGE_PR_REVIEW_POLL_INTERVAL` seconds (default 5). The poll exits early on the first signal; otherwise the merge proceeds. Knobs:
+Set `DEVBENCH_PR_REVIEW_RESOLUTION_ENABLED=1` AND configure at least one signal (a non-empty `DEVBENCH_PR_REVIEW_AGENTS` allowlist or `DEVBENCH_PR_REVIEW_DECISION_BLOCKS=1`) to enable. After `wait_for_checks_and_classify` returns `CIResult.GREEN`, git-ops polls `gh pr view --json reviewDecision,reviews` and `gh api repos/<repo>/pulls/<n>/comments` for up to `DEVBENCH_PR_REVIEW_SETTLE_SECONDS` seconds (default 60), polling every `DEVBENCH_PR_REVIEW_POLL_INTERVAL` seconds (default 5). The poll exits early on the first signal; otherwise the merge proceeds. Knobs:
 
 | env var | default | purpose |
 |---------|---------|---------|
-| `JUDGE_PR_REVIEW_RESOLUTION_ENABLED` | unset (off) | top-level toggle |
-| `JUDGE_PR_REVIEW_AGENTS` | empty | comma-separated bot login allowlist (e.g. `github-copilot[bot],amazon-q-developer[bot]`) whose unresolved comments block merge |
-| `JUDGE_PR_REVIEW_DECISION_BLOCKS` | True | whether `reviewDecision == CHANGES_REQUESTED` blocks merge |
-| `JUDGE_PR_REVIEW_SETTLE_SECONDS` | 60 | total poll budget |
-| `JUDGE_PR_REVIEW_POLL_INTERVAL` | 5 | per-poll cadence |
+| `DEVBENCH_PR_REVIEW_RESOLUTION_ENABLED` | unset (off) | top-level toggle |
+| `DEVBENCH_PR_REVIEW_AGENTS` | empty | comma-separated bot login allowlist (e.g. `github-copilot[bot],amazon-q-developer[bot]`) whose unresolved comments block merge |
+| `DEVBENCH_PR_REVIEW_DECISION_BLOCKS` | True | whether `reviewDecision == CHANGES_REQUESTED` blocks merge |
+| `DEVBENCH_PR_REVIEW_SETTLE_SECONDS` | 60 | total poll budget |
+| `DEVBENCH_PR_REVIEW_POLL_INTERVAL` | 5 | per-poll cadence |
 
 #### Workflow-registration race defence (issue #114)
 
 The `wait_for_checks_and_classify` step that runs between `gh pr create` and `gh pr merge` no longer treats `gh pr checks --watch` returning `"no checks reported"` as an unconditional pass. The previous behaviour merged before GitHub Actions had a chance to enqueue the workflow when CI was actually configured. The new disambiguation:
 
 - **Repo has no `.github/workflows/*.y[a]ml` files locally**: legitimate "no CI configured" -> pass immediately (legacy fast path).
-- **Repo has at least one workflow file**: race condition. Retry `gh pr checks` up to `JUDGE_CHECK_REGISTRATION_RETRIES` times (default 12), sleeping `JUDGE_CHECK_REGISTRATION_DELAY_SECONDS` between attempts (default 5). 12 * 5 = 60s of default coverage for the GitHub Actions queue.
+- **Repo has at least one workflow file**: race condition. Retry `gh pr checks` up to `DEVBENCH_CHECK_REGISTRATION_RETRIES` times (default 12), sleeping `DEVBENCH_CHECK_REGISTRATION_DELAY_SECONDS` between attempts (default 5). 12 * 5 = 60s of default coverage for the GitHub Actions queue.
 - **Retry exhausted**: refuse the merge with an actionable error naming the PR number, the elapsed wait, and the workflow files found. No warn-and-pass fallback.
 
 Operators with unusual CI cadence override the knobs via the env vars above. Defaults live in `src/devbench/constants.py` (`DEFAULT_CHECK_REGISTRATION_RETRIES`, `DEFAULT_CHECK_REGISTRATION_DELAY_SECONDS`).

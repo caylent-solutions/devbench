@@ -175,9 +175,9 @@ Requires AWS credentials with Bedrock model access enabled in your account.
 
 Set the required environment variables in your shell profile or before each invocation:
 
-- `export JUDGE_USE_BEDROCK=1`
-- `export JUDGE_BEDROCK_REGION=us-east-1`
-- `export JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1`
+- `export DEVBENCH_USE_BEDROCK=1`
+- `export DEVBENCH_BEDROCK_REGION=us-east-1`
+- `export DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1`
 
 Verify AWS auth with `aws sts get-caller-identity`. Expected output: a JSON object with
 `UserId`, `Account`, and `Arn`. If this command fails, resolve AWS credentials before
@@ -191,7 +191,7 @@ For the full credential-chain resolution order, see
 
 ## Step 5: Set up the workspace root
 
-The workspace root (`JUDGE_WORKSPACE_ROOT`) is the parent directory that contains your
+The workspace root (`DEVBENCH_WORKSPACE_ROOT`) is the parent directory that contains your
 backlog, your YAML config, and your cloned target repo(s) as siblings. It is **not** the
 devbench clone itself.
 
@@ -221,7 +221,7 @@ The canonical workspace layout at this point (from
 [`docs/backlog-contract.md`](backlog-contract.md) (ref)):
 
 ```
-~/my-workspace/               <- JUDGE_WORKSPACE_ROOT
+~/my-workspace/               <- DEVBENCH_WORKSPACE_ROOT
   .gitignore
   BACKLOG.md
   backlog/
@@ -271,7 +271,7 @@ repos:
 merge_strategy: squash   # or "merge" or "rebase"
 ```
 
-`checkout_directory` is **relative to `JUDGE_WORKSPACE_ROOT`** (do not use an absolute
+`checkout_directory` is **relative to `DEVBENCH_WORKSPACE_ROOT`** (do not use an absolute
 path or `..` traversal). Validation fails with a clear error if it is wrong.
 
 ### Optional toggles to consider
@@ -308,7 +308,7 @@ agents:                              # ADR-25: per-agent model overrides
   # null) to use the frontmatter default. Values must match your auth
   # channel: short names (opus / sonnet / haiku) or claude-<name>-<digits>
   # when use_bedrock: false; full Bedrock ARNs when use_bedrock: true.
-  # JUDGE_AGENT_MODEL_<NAME> env vars override this block per-call
+  # DEVBENCH_AGENT_MODEL_<NAME> env vars override this block per-call
   # (env > yaml > frontmatter). See docs/adr/25-per-agent-model-overrides.md.
   executor: sonnet
   blocker_resolver: opus
@@ -413,7 +413,7 @@ After generating a backlog (or after `task-factory` materialises new tasks), che
 many draft work units are waiting for review:
 
 ```bash
-JUDGE_WORKSPACE_ROOT=~/my-workspace \
+DEVBENCH_WORKSPACE_ROOT=~/my-workspace \
 uv run --project $DEVBENCH_DIR devbench status
 ```
 
@@ -492,25 +492,25 @@ letting you promote, hold, or decline entire epics or task ranges in a single co
 
    ```bash
    # Preview what would be promoted -- no state changes yet:
-   JUDGE_WORKSPACE_ROOT=~/my-workspace \
+   DEVBENCH_WORKSPACE_ROOT=~/my-workspace \
    uv run --project $DEVBENCH_DIR devbench set-status \
      --include "E1-E3" --dry-run in-queue
 
    # Promote E1 through E3 to in-queue (confirm interactively if > threshold):
-   JUDGE_WORKSPACE_ROOT=~/my-workspace \
+   DEVBENCH_WORKSPACE_ROOT=~/my-workspace \
    uv run --project $DEVBENCH_DIR devbench set-status \
      --include "E1-E3" in-queue
 
    # Promote everything at once, skipping the confirmation prompt:
-   JUDGE_WORKSPACE_ROOT=~/my-workspace \
+   DEVBENCH_WORKSPACE_ROOT=~/my-workspace \
    uv run --project $DEVBENCH_DIR devbench set-status \
      --include "E1-E10" --yes in-queue
 
    # Hold E5 for closer review while releasing everything else:
-   JUDGE_WORKSPACE_ROOT=~/my-workspace \
+   DEVBENCH_WORKSPACE_ROOT=~/my-workspace \
    uv run --project $DEVBENCH_DIR devbench set-status \
      --include "E1-E10" --exclude "E5" in-queue
-   JUDGE_WORKSPACE_ROOT=~/my-workspace \
+   DEVBENCH_WORKSPACE_ROOT=~/my-workspace \
    uv run --project $DEVBENCH_DIR devbench set-status \
      --include "E5" hold
    ```
@@ -601,13 +601,13 @@ Pass `--include` (and optionally `--exclude`) to `devbench start`:
 
 ```bash
 # Run only epics E1 through E3 plus E5:
-JUDGE_WORKSPACE_ROOT=~/my-workspace \
-JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_WORKSPACE_ROOT=~/my-workspace \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
 uv run --project $DEVBENCH_DIR devbench start --include "E1-E3, E5"
 
 # Run E1 through E10 but skip E5 and everything under E7-F3:
-JUDGE_WORKSPACE_ROOT=~/my-workspace \
-JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_WORKSPACE_ROOT=~/my-workspace \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
 uv run --project $DEVBENCH_DIR devbench start \
   --include "E1-E10" --exclude "E5, E7-F3"
 ```
@@ -629,21 +629,21 @@ identically at Step 1c (consulting scope.json before claiming the next work unit
 
 ```bash
 # Step 1: Write scope.json without starting the orchestrator:
-JUDGE_WORKSPACE_ROOT=~/my-workspace \
+DEVBENCH_WORKSPACE_ROOT=~/my-workspace \
 uv run --project $DEVBENCH_DIR devbench scope set --include "E1-E3, E5"
 
 # Step 2 (optional): Inspect the active scope:
-JUDGE_WORKSPACE_ROOT=~/my-workspace \
+DEVBENCH_WORKSPACE_ROOT=~/my-workspace \
 uv run --project $DEVBENCH_DIR devbench scope show
 
 # Step 3: Launch interactive Claude Code; the orchestrate skill respects scope.json:
-JUDGE_WORKSPACE_ROOT=~/my-workspace \
-JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_WORKSPACE_ROOT=~/my-workspace \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
 claude --dangerously-skip-permissions \
   --plugin-dir $DEVBENCH_DIR/plugin/devbench
 
 # Step 4: Clear the scope when done:
-JUDGE_WORKSPACE_ROOT=~/my-workspace \
+DEVBENCH_WORKSPACE_ROOT=~/my-workspace \
 uv run --project $DEVBENCH_DIR devbench scope clear
 ```
 
@@ -666,11 +666,11 @@ with rc=0. It does NOT kill the in-flight executor mid-claim.
 
 ```bash
 # Request a graceful stop with no reason (the orchestrator exits after the current WU):
-JUDGE_WORKSPACE_ROOT=~/my-workspace \
+DEVBENCH_WORKSPACE_ROOT=~/my-workspace \
 uv run --project $DEVBENCH_DIR devbench drain
 
 # With a human-readable reason (recorded in the drain marker and audit log):
-JUDGE_WORKSPACE_ROOT=~/my-workspace \
+DEVBENCH_WORKSPACE_ROOT=~/my-workspace \
 uv run --project $DEVBENCH_DIR devbench drain --reason "upgrading devbench to v1.2"
 ```
 
@@ -683,7 +683,7 @@ signal is pending.
 ```bash
 # Print marker contents (requested_by, at, reason) if pending; "no drain pending" otherwise.
 # Exit code is rc=0 in both states -- safe to use in scripts.
-JUDGE_WORKSPACE_ROOT=~/my-workspace \
+DEVBENCH_WORKSPACE_ROOT=~/my-workspace \
 uv run --project $DEVBENCH_DIR devbench drain --status
 ```
 
@@ -694,7 +694,7 @@ request. The cancel is idempotent -- it exits rc=0 and prints "no drain pending"
 marker is present:
 
 ```bash
-JUDGE_WORKSPACE_ROOT=~/my-workspace \
+DEVBENCH_WORKSPACE_ROOT=~/my-workspace \
 uv run --project $DEVBENCH_DIR devbench drain --cancel
 ```
 
@@ -718,12 +718,12 @@ full autonomous run:
 
 ```bash
 # Step 1: write the drain marker:
-JUDGE_WORKSPACE_ROOT=~/my-workspace \
+DEVBENCH_WORKSPACE_ROOT=~/my-workspace \
 uv run --project $DEVBENCH_DIR devbench drain --reason "single-WU test run"
 
 # Step 2: start the orchestrator; it will process one WU then exit:
-JUDGE_WORKSPACE_ROOT=~/my-workspace \
-JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_WORKSPACE_ROOT=~/my-workspace \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
 make -C $DEVBENCH_DIR start
 ```
 
@@ -742,12 +742,12 @@ Run `devbench validate-backlog` from any directory; provide the workspace root a
 via environment variables:
 
 ```bash
-JUDGE_WORKSPACE_ROOT=~/my-workspace \
-JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_WORKSPACE_ROOT=~/my-workspace \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
 uv run --project $DEVBENCH_DIR devbench validate-backlog
 ```
 
-**With Bedrock:** add `JUDGE_USE_BEDROCK=1` and `JUDGE_BEDROCK_REGION=us-east-1` to the
+**With Bedrock:** add `DEVBENCH_USE_BEDROCK=1` and `DEVBENCH_BEDROCK_REGION=us-east-1` to the
 same invocation alongside the other variables.
 
 Expected output on success:
@@ -788,8 +788,8 @@ is the recommended way to run DevBench. The system is stable enough that the bac
 itself is the right place to manage the run, not a live console session.
 
 ```bash
-JUDGE_WORKSPACE_ROOT=~/my-workspace \
-JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_WORKSPACE_ROOT=~/my-workspace \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
 make -C $DEVBENCH_DIR start
 ```
 
@@ -809,18 +809,18 @@ the same workspace:
 
 ```bash
 # Terminal 2: every tool call, judge verdict, status transition streamed live.
-JUDGE_WORKSPACE_ROOT=~/my-workspace \
-JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_WORKSPACE_ROOT=~/my-workspace \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
 uv run --project $DEVBENCH_DIR devbench hook-tail
 
 # Terminal 3: live progress dashboard (epic counts, judges, CI, cost).
-JUDGE_WORKSPACE_ROOT=~/my-workspace \
-JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_WORKSPACE_ROOT=~/my-workspace \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
 uv run --project $DEVBENCH_DIR devbench report
 
 # Terminal 4 (optional): low-frequency status snapshot.
 cd ~/my-workspace && watch -n 60 \
-  'JUDGE_WORKSPACE_ROOT=$PWD JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+  'DEVBENCH_WORKSPACE_ROOT=$PWD DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
    uv run --project $DEVBENCH_DIR devbench status'
 ```
 
@@ -908,22 +908,22 @@ walk-through of how a single task progresses through judges), here is how:
 and write files without per-tool confirmation):
 
 ```bash
-JUDGE_WORKSPACE_ROOT=~/my-workspace \
-JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_WORKSPACE_ROOT=~/my-workspace \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
 make -C $DEVBENCH_DIR start-interactive
 ```
 
-**With `JUDGE_SAFE_PERMISSIONS=1`** (sandboxed: Claude Code asks for confirmation before
+**With `DEVBENCH_SAFE_PERMISSIONS=1`** (sandboxed: Claude Code asks for confirmation before
 each file operation -- slower but safer if you want to watch each tool call confirm):
 
 ```bash
-JUDGE_WORKSPACE_ROOT=~/my-workspace \
-JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
-JUDGE_SAFE_PERMISSIONS=1 \
+DEVBENCH_WORKSPACE_ROOT=~/my-workspace \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_SAFE_PERMISSIONS=1 \
 make -C $DEVBENCH_DIR start-interactive
 ```
 
-When `JUDGE_SAFE_PERMISSIONS=1` is set, the Makefile omits
+When `DEVBENCH_SAFE_PERMISSIONS=1` is set, the Makefile omits
 `--dangerously-skip-permissions`, so Claude Code prompts before every sensitive tool use.
 
 **Note on end-to-end validation of Step 10:** the launch commands open a live orchestrator
@@ -946,9 +946,9 @@ These decisions appear at specific steps. Each is a one-time choice per workspac
 |--|--------------|------------|
 | Credential type | Claude Code OAuth (`~/.claude/.credentials.json`) | AWS IAM role / access keys |
 | Subscription needed | Claude Pro or Enterprise | AWS account with Bedrock access enabled |
-| Extra env var | none | `JUDGE_USE_BEDROCK=1` |
+| Extra env var | none | `DEVBENCH_USE_BEDROCK=1` |
 
-Default is Anthropic API. Set `JUDGE_USE_BEDROCK=1` (and `JUDGE_BEDROCK_REGION`) to switch.
+Default is Anthropic API. Set `DEVBENCH_USE_BEDROCK=1` (and `DEVBENCH_BEDROCK_REGION`) to switch.
 
 ### Single-PR vs multi-PR (Step 7)
 
@@ -991,30 +991,30 @@ runs -- only needed for the optional `make start-interactive` observation mode.
 
 ## Troubleshooting
 
-### `JUDGE_WORKSPACE_ROOT not set`
+### `DEVBENCH_WORKSPACE_ROOT not set`
 
 ```
-RuntimeError: JUDGE_WORKSPACE_ROOT environment variable is not set. Set it to the absolute path of your workspace root.
+RuntimeError: DEVBENCH_WORKSPACE_ROOT environment variable is not set. Set it to the absolute path of your workspace root.
 ```
 
 Export the variable before running any devbench command:
 
-    export JUDGE_WORKSPACE_ROOT=~/my-workspace
+    export DEVBENCH_WORKSPACE_ROOT=~/my-workspace
 
 Or prefix it inline:
 
-    JUDGE_WORKSPACE_ROOT=~/my-workspace uv run --project $DEVBENCH_DIR devbench validate-backlog
+    DEVBENCH_WORKSPACE_ROOT=~/my-workspace uv run --project $DEVBENCH_DIR devbench validate-backlog
 
 ### `DevBench config file not found`
 
 ```
-FileNotFoundError: DevBench config file not found at '<JUDGE_WORKSPACE_ROOT>/backlog/config/devbench.yaml'
+FileNotFoundError: DevBench config file not found at '<DEVBENCH_WORKSPACE_ROOT>/backlog/config/devbench.yaml'
 ```
 
-The config file was not created (Step 7) or `JUDGE_WORKSPACE_ROOT` is pointing at the
+The config file was not created (Step 7) or `DEVBENCH_WORKSPACE_ROOT` is pointing at the
 wrong directory. Verify:
 
-    ls $JUDGE_WORKSPACE_ROOT/backlog/config/devbench.yaml
+    ls $DEVBENCH_WORKSPACE_ROOT/backlog/config/devbench.yaml
 
 ### `Manifest path begins with checkout_directory prefix`
 

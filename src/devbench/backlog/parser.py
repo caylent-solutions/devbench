@@ -97,9 +97,9 @@ def _infer_type_from_id(unit_id: str) -> WorkUnitType:
     if unit_id == EPIC_PLACEHOLDER_ID:
         return WorkUnitType.EPIC
 
-    parts = unit_id.split("-")
-    if not parts:
+    if not unit_id:
         raise ValueError(f"Cannot infer type from empty ID: '{unit_id}'")
+    parts = unit_id.split("-")
 
     last_segment = parts[-1]
     # The first character of the last segment determines the type.

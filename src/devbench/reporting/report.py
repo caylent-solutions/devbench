@@ -805,8 +805,6 @@ def _recent_per_task_cost(
         data_residency_multiplier=REPORT_DATA_RESIDENCY_MULTIPLIER,
         fast_mode_multiplier=REPORT_FAST_MODE_MULTIPLIER,
     )
-    if n <= 0:
-        return None
     return cost.total_cost / n
 
 

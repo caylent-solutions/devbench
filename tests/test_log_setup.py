@@ -287,3 +287,136 @@ class TestPerSessionLogRouting:
         session_handlers = self._session_file_handlers(session_name, str(tmp_path))
         assert len(session_handlers) == 1
         assert Path(session_handlers[0].baseFilename) == expected_path.resolve()
+
+
+class TestResolveLogFile:
+    """Path-resolution chain when DEVBENCH_LOG_FILE is unset.
+
+    ``devbench.config`` is imported at module load time and reads
+    ``DEVBENCH_WORKSPACE_ROOT`` then; we never re-import it.  These tests
+    override env vars via monkeypatch (no ``clear=True``) and patch the
+    cached ``RUNTIME_CONFIG`` attribute on the already-loaded module.
+    """
+
+    def setup_method(self) -> None:
+        log_setup_mod._state[0] = False
+        logging.getLogger().handlers.clear()
+
+    def teardown_method(self) -> None:
+        log_setup_mod._state[0] = False
+        logging.getLogger().handlers.clear()
+
+    def test_workspace_only_uses_default_subdir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Workspace set, no DEVBENCH_LOG_FILE, no configured log_file → <workspace>/logs/orchestrator.log."""
+        from devbench import config as cfg
+        from devbench.constants import DEFAULT_LOG_SUBDIR
+
+        monkeypatch.setenv("DEVBENCH_LOG_FILE", "")
+        monkeypatch.setenv("DEVBENCH_WORKSPACE_ROOT", str(tmp_path))
+
+        class _NoLogFile:
+            log_file = ""
+
+        monkeypatch.setattr(cfg, "RUNTIME_CONFIG", _NoLogFile())
+        result = log_setup_mod._resolve_log_file()
+        assert result == tmp_path / DEFAULT_LOG_SUBDIR / DEFAULT_LOG_FILENAME
+
+    def test_no_workspace_no_configured_falls_back_to_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """No workspace, no configured log_file → legacy default under devbench source tree."""
+        from devbench import config as cfg
+
+        monkeypatch.setenv("DEVBENCH_LOG_FILE", "")
+        monkeypatch.setenv("DEVBENCH_WORKSPACE_ROOT", "")
+
+        class _NoLogFile:
+            log_file = ""
+
+        monkeypatch.setattr(cfg, "RUNTIME_CONFIG", _NoLogFile())
+        result = log_setup_mod._resolve_log_file()
+        assert result == Path(log_setup_mod._DEFAULT_LOG_FILE)
+
+    def test_configured_absolute_path_wins_over_workspace(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """RUNTIME_CONFIG.log_file absolute path is used verbatim."""
+        from devbench import config as cfg
+
+        absolute_path = tmp_path / "configured" / "my.log"
+        monkeypatch.setenv("DEVBENCH_LOG_FILE", "")
+        monkeypatch.setenv("DEVBENCH_WORKSPACE_ROOT", str(tmp_path))
+
+        class _AbsoluteCfg:
+            log_file = str(absolute_path)
+
+        monkeypatch.setattr(cfg, "RUNTIME_CONFIG", _AbsoluteCfg())
+        result = log_setup_mod._resolve_log_file()
+        assert result == absolute_path
+
+    def test_configured_relative_with_workspace_resolves_under_workspace(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """RUNTIME_CONFIG.log_file relative + workspace set → workspace/<relative>."""
+        from devbench import config as cfg
+
+        monkeypatch.setenv("DEVBENCH_LOG_FILE", "")
+        monkeypatch.setenv("DEVBENCH_WORKSPACE_ROOT", str(tmp_path))
+
+        class _RelativeCfg:
+            log_file = "rel/my.log"
+
+        monkeypatch.setattr(cfg, "RUNTIME_CONFIG", _RelativeCfg())
+        result = log_setup_mod._resolve_log_file()
+        assert result == tmp_path / "rel" / "my.log"
+
+    def test_configured_relative_without_workspace_returns_relative(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """RUNTIME_CONFIG.log_file relative + no workspace → returns relative as-is."""
+        from devbench import config as cfg
+
+        monkeypatch.setenv("DEVBENCH_LOG_FILE", "")
+        monkeypatch.setenv("DEVBENCH_WORKSPACE_ROOT", "")
+
+        class _RelativeCfg:
+            log_file = "rel/my.log"
+
+        monkeypatch.setattr(cfg, "RUNTIME_CONFIG", _RelativeCfg())
+        result = log_setup_mod._resolve_log_file()
+        assert result == Path("rel/my.log")
+
+    def test_runtime_config_attribute_error_falls_through(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Object without ``log_file`` raises AttributeError; configured stays empty."""
+        from devbench import config as cfg
+        from devbench.constants import DEFAULT_LOG_SUBDIR
+
+        monkeypatch.setenv("DEVBENCH_LOG_FILE", "")
+        monkeypatch.setenv("DEVBENCH_WORKSPACE_ROOT", str(tmp_path))
+
+        class _NoLogFile:
+            pass
+
+        monkeypatch.setattr(cfg, "RUNTIME_CONFIG", _NoLogFile())
+        result = log_setup_mod._resolve_log_file()
+        assert result == tmp_path / DEFAULT_LOG_SUBDIR / DEFAULT_LOG_FILENAME
+
+
+class TestResolveSessionLogFile:
+    """RuntimeError contract when SESSION_NAME is set without WORKSPACE_ROOT."""
+
+    def setup_method(self) -> None:
+        log_setup_mod._state[0] = False
+        logging.getLogger().handlers.clear()
+
+    def teardown_method(self) -> None:
+        log_setup_mod._state[0] = False
+        logging.getLogger().handlers.clear()
+
+    def test_raises_when_session_name_set_but_workspace_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """DEVBENCH_SESSION_NAME set without DEVBENCH_WORKSPACE_ROOT must raise RuntimeError."""
+        monkeypatch.setenv("DEVBENCH_SESSION_NAME", "mysession")
+        monkeypatch.setenv("DEVBENCH_WORKSPACE_ROOT", "")
+        with pytest.raises(
+            RuntimeError,
+            match=r"DEVBENCH_WORKSPACE_ROOT must be set when DEVBENCH_SESSION_NAME is set",
+        ):
+            log_setup_mod._resolve_session_log_file()

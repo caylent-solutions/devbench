@@ -746,6 +746,31 @@ class TestGetParallelCandidatesTopologicalOrder:
         order = [u.id for u in parser.get_parallel_candidates(units)]
         assert order == ["Y1", "X1"], f"Got {order!r}"
 
+    def test_cycle_in_dep_chain_collapses_to_zero(self) -> None:
+        """When the dep graph has a cycle A -> B -> A, ``_depth`` must return 0
+        for the back-edge instead of recursing infinitely. A is the candidate;
+        B is DONE so A's _deps_satisfied check passes. The depth traversal
+        through B sees A in the visiting set and short-circuits at the cycle
+        guard."""
+        parser = self._make_parser()
+        units = [
+            self._task("A1", deps=["B1"]),
+            self._task("B1", status=WorkUnitStatus.DONE, deps=["A1"]),
+        ]
+        order = [u.id for u in parser.get_parallel_candidates(units)]
+        assert order == ["A1"]
+
+    def test_self_dep_in_transitive_chain_is_skipped(self) -> None:
+        """An indirect self-dep (B depends on B) does not block depth
+        computation -- the self-dep edge is skipped so traversal continues."""
+        parser = self._make_parser()
+        units = [
+            self._task("A1", deps=["B1"]),
+            self._task("B1", status=WorkUnitStatus.DONE, deps=["B1"]),
+        ]
+        order = [u.id for u in parser.get_parallel_candidates(units)]
+        assert order == ["A1"]
+
     def test_self_loop_does_not_cause_infinite_recursion(self) -> None:
         """A self-dep on an in-queue task fails ``_deps_satisfied`` (the dep is
         the unit itself and it's not DONE/DECLINED), so the unit is filtered
@@ -781,13 +806,12 @@ class TestInferTypeFromIdEdgeCases:
         result = _infer_type_from_id("--")
         assert result is WorkUnitType.EPIC
 
-    def test_empty_id_note(self) -> None:
-        """Line 91: dead code -- str.split('-') on '' returns [''], never [], so `not parts` is never True."""
-        # This is intentionally a documentation-only test.
-        # The guard `if not parts:` at line 90 of parser.py is unreachable because
-        # Python's str.split("-") always returns a list with at least one element.
-        result = str.split("", "-")
-        assert len(result) > 0, "str.split always returns non-empty list"
+    def test_raises_for_empty_id(self) -> None:
+        """Empty unit_id raises ValueError before any segment parsing."""
+        from devbench.backlog.parser import _infer_type_from_id
+
+        with pytest.raises(ValueError, match="Cannot infer type from empty ID"):
+            _infer_type_from_id("")
 
     def test_raises_for_unknown_segment_prefix(self) -> None:
         """Line 98: raises ValueError when last segment has unknown prefix."""

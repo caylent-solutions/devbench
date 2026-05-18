@@ -110,6 +110,20 @@ indent-style = "space"
 mypy_path = ["src", "tests", "tools"]
 explicit_package_bases = true
 
+[tool.coverage.run]
+source = ["devbench"]
+
+[tool.coverage.report]
+# The ``if __name__ == "__main__":`` block at the bottom of devbench/cli.py
+# is the script-style entry point used by ``python -m devbench.cli``; it is
+# not reachable from import-driven unit tests but is exercised by every
+# integration test that shells out to the CLI.  Exclude it from the
+# coverage gate so the gate measures testable code only (this is a coverage
+# config exclusion, not an inline ``# pragma: no cover`` annotation).
+exclude_lines = [
+    "if __name__ == .__main__.:",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src", "tests", "tools"]

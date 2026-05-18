@@ -167,6 +167,66 @@ class TestStdinKeypressPending:
         with patch.object(sys, "stdin", io.StringIO("data")):
             assert _stdin_keypress_pending() is False
 
+    def test_returns_true_when_tty_stdin_has_pending_input(self) -> None:
+        """When stdin is a TTY and select.select reports it ready, return True."""
+        from unittest.mock import MagicMock
+
+        fake_stdin = MagicMock()
+        fake_stdin.isatty.return_value = True
+        with (
+            patch.object(sys, "stdin", fake_stdin),
+            patch(
+                "devbench.reporting.streaming.select.select",
+                return_value=([fake_stdin], [], []),
+            ),
+        ):
+            assert _stdin_keypress_pending() is True
+
+    def test_returns_false_when_tty_stdin_has_no_pending_input(self) -> None:
+        """When stdin is a TTY and select.select reports nothing ready, return False."""
+        from unittest.mock import MagicMock
+
+        fake_stdin = MagicMock()
+        fake_stdin.isatty.return_value = True
+        with (
+            patch.object(sys, "stdin", fake_stdin),
+            patch(
+                "devbench.reporting.streaming.select.select",
+                return_value=([], [], []),
+            ),
+        ):
+            assert _stdin_keypress_pending() is False
+
+    def test_returns_false_when_select_raises_oserror(self) -> None:
+        """A broken stdin descriptor (OSError from select) is treated as no keypress."""
+        from unittest.mock import MagicMock
+
+        fake_stdin = MagicMock()
+        fake_stdin.isatty.return_value = True
+        with (
+            patch.object(sys, "stdin", fake_stdin),
+            patch(
+                "devbench.reporting.streaming.select.select",
+                side_effect=OSError("bad fd"),
+            ),
+        ):
+            assert _stdin_keypress_pending() is False
+
+    def test_returns_false_when_select_raises_valueerror(self) -> None:
+        """A closed stdin (ValueError from select) is treated as no keypress."""
+        from unittest.mock import MagicMock
+
+        fake_stdin = MagicMock()
+        fake_stdin.isatty.return_value = True
+        with (
+            patch.object(sys, "stdin", fake_stdin),
+            patch(
+                "devbench.reporting.streaming.select.select",
+                side_effect=ValueError("closed"),
+            ),
+        ):
+            assert _stdin_keypress_pending() is False
+
 
 class TestStreamReport:
     """End-to-end behaviour of ``stream_report``: change-detection, render
@@ -264,3 +324,61 @@ class TestStreamReport:
         assert "[refresh] cold" in out
         assert "warm" in out
         assert "last refresh" in out
+
+    def test_hook_log_and_transcript_dir_extend_stat_paths(self, tmp_path: Path) -> None:
+        """When ``hook_log_path`` and ``transcript_dir`` are passed, their stat
+        tuples participate in the change-detection key, so mutating either one
+        triggers a re-render even when the orchestrator log is untouched."""
+        log_file = tmp_path / "orch.log"
+        log_file.write_text("a")
+        hook_log = tmp_path / "hook.log"
+        hook_log.write_text("h")
+        transcripts = tmp_path / "transcripts"
+        transcripts.mkdir()
+        (transcripts / "t.jsonl").write_text("{}")
+
+        def fake_render(*, log_path: Path) -> str:
+            return "frame"
+
+        sleep_count = 0
+
+        def fake_sleep(_seconds: float) -> None:
+            nonlocal sleep_count
+            sleep_count += 1
+            if sleep_count >= 2:
+                raise KeyboardInterrupt
+            # Touch the hook log so the next tick's key differs.
+            hook_log.write_text("hh")
+
+        with (
+            patch("devbench.reporting.streaming.time.sleep", side_effect=fake_sleep),
+            patch.object(sys, "stdout", io.StringIO()) as cap,
+        ):
+            rc = stream_report(
+                log_file,
+                fake_render,
+                hook_log_path=hook_log,
+                transcript_dir=transcripts,
+            )
+        assert rc == 0
+        # Two renders: initial frame + one re-render after hook_log mutation.
+        assert cap.getvalue().count("\033c") == 2
+
+    def test_keypress_breaks_loop_and_returns_zero(self, tmp_path: Path) -> None:
+        """When ``_stdin_keypress_pending`` returns True, the loop breaks and
+        the function returns rc=0 via the non-KeyboardInterrupt exit path."""
+        log_file = tmp_path / "log"
+        log_file.write_text("a")
+
+        def fake_render(*, log_path: Path) -> str:
+            return "frame"
+
+        with (
+            patch(
+                "devbench.reporting.streaming._stdin_keypress_pending",
+                return_value=True,
+            ),
+            patch.object(sys, "stdout", io.StringIO()),
+        ):
+            rc = stream_report(log_file, fake_render)
+        assert rc == 0

@@ -3,7 +3,7 @@ SHELL := /bin/bash
 .DEFAULT_GOAL := help
 unexport VIRTUAL_ENV
 
-.PHONY: help install install-hooks plugin-install plugin-uninstall lint lint-ruff lint-bandit lint-no-duplicates format format-check typecheck test test-unit test-coverage test-coverage-new validate clean start start-interactive report report-session pre-commit-check pre-push-check watch watch-live
+.PHONY: help install install-hooks plugin-install plugin-uninstall lint lint-ruff lint-bandit lint-no-duplicates format format-check typecheck test test-unit test-coverage validate clean start start-interactive report report-session pre-commit-check pre-push-check watch watch-live
 
 ## help: Show available targets
 help:
@@ -85,19 +85,15 @@ typecheck:
 test-unit:
 	uv run pytest tests/ -v --tb=short -q
 
-## test-coverage: Run tests with coverage report (fails below 90%)
+## test-coverage: Run tests with coverage report (fails below 97%)
 test-coverage:
-	uv run pytest tests/ --cov=devbench --cov-report=term-missing --cov-fail-under=90
-
-## test-coverage-new: Enforce 100% line coverage on modules introduced or hardened by the manifest-amendment, task-factory, watch, git-ops-assertion, hook-tail, auto-requeue, report-perf-roadmap (issue #162), per-agent-model-overrides (ADR-25), scope-selectors (issue #190), named-sessions (issue #192), drain (issue #188), quota-wait-and-resume (issue #193), and atomic WU md writes features
-test-coverage-new:
-	uv run pytest tests/ --cov=devbench.backlog.manifest --cov=devbench.backlog.amendment --cov=devbench.backlog.proposal --cov=devbench.backlog.manager --cov=devbench.activity --cov=devbench.github.git_ops --cov=devbench.hook_tail --cov=devbench.reporting.snapshot --cov=devbench.reporting.window_stats --cov=devbench.reporting.archive --cov=devbench.reporting.sharded_log --cov=devbench.plugin_shadow --cov=devbench.scope --cov=devbench.session --cov=devbench.drain --cov=devbench.utils.io --cov=devbench.quota --cov-report=term-missing --cov-fail-under=100
+	uv run pytest tests/ --cov=devbench --cov-report=term-missing --cov-fail-under=97
 
 ## test: Run all tests
 test: test-unit
 
 ## validate: Full validation (all checks -- identical to CI and pre-push)
-validate: lint-ruff lint-bandit lint-no-duplicates format-check typecheck test-coverage test-coverage-new
+validate: lint-ruff lint-bandit lint-no-duplicates format-check typecheck test-coverage
 	@echo "All validations passed"
 
 ## pre-commit-check: Checks that run on every commit (fast)

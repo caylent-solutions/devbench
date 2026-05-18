@@ -334,6 +334,142 @@ class TestResolveHelpers:
             result = config._resolve_float("TEST_FLOAT_ABSENT", None, 3.0)
         assert result == 3.0
 
+    # ---- _resolve_str -----------------------------------------------------
+
+    def test_resolve_str_env_var_wins(self) -> None:
+        with patch.dict(os.environ, {"TEST_STR_X": "from-env"}, clear=False):
+            assert config._resolve_str("TEST_STR_X", "yaml", "default") == "from-env"
+
+    def test_resolve_str_yaml_when_env_absent(self) -> None:
+        env_copy = {k: v for k, v in os.environ.items() if k != "TEST_STR_X"}
+        with patch.dict(os.environ, env_copy, clear=True):
+            assert config._resolve_str("TEST_STR_X", "yaml-val", "default") == "yaml-val"
+
+    def test_resolve_str_default_when_both_absent(self) -> None:
+        env_copy = {k: v for k, v in os.environ.items() if k != "TEST_STR_X"}
+        with patch.dict(os.environ, env_copy, clear=True):
+            assert config._resolve_str("TEST_STR_X", None, "default-val") == "default-val"
+
+    # ---- _resolve_optional_str -------------------------------------------
+
+    def test_resolve_optional_str_env_var_wins(self) -> None:
+        with patch.dict(os.environ, {"TEST_OPT": "envv"}, clear=False):
+            assert config._resolve_optional_str("TEST_OPT", "yaml") == "envv"
+
+    def test_resolve_optional_str_yaml_when_env_empty(self) -> None:
+        env_copy = {k: v for k, v in os.environ.items() if k != "TEST_OPT"}
+        with patch.dict(os.environ, env_copy, clear=True):
+            assert config._resolve_optional_str("TEST_OPT", "yaml-val") == "yaml-val"
+
+    def test_resolve_optional_str_none_when_both_empty(self) -> None:
+        env_copy = {k: v for k, v in os.environ.items() if k != "TEST_OPT"}
+        with patch.dict(os.environ, env_copy, clear=True):
+            assert config._resolve_optional_str("TEST_OPT", None) is None
+
+    # ---- _resolve_bool ----------------------------------------------------
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("1", True),
+            ("true", True),
+            ("TRUE", True),
+            ("yes", True),
+            ("on", True),
+            ("0", False),
+            ("false", False),
+            ("FALSE", False),
+            ("no", False),
+            ("off", False),
+        ],
+    )
+    def test_resolve_bool_truthy_falsy_env_values(self, raw: str, expected: bool) -> None:
+        with patch.dict(os.environ, {"TEST_BOOL_X": raw}, clear=False):
+            assert config._resolve_bool("TEST_BOOL_X", None, not expected) is expected
+
+    def test_resolve_bool_invalid_env_value_raises(self) -> None:
+        with patch.dict(os.environ, {"TEST_BOOL_X": "maybe"}, clear=False):
+            with pytest.raises(ValueError, match=r"TEST_BOOL_X must be one of"):
+                config._resolve_bool("TEST_BOOL_X", None, False)
+
+    def test_resolve_bool_yaml_when_env_absent(self) -> None:
+        env_copy = {k: v for k, v in os.environ.items() if k != "TEST_BOOL_X"}
+        with patch.dict(os.environ, env_copy, clear=True):
+            assert config._resolve_bool("TEST_BOOL_X", True, False) is True
+
+    # ---- _resolve_str_tuple ----------------------------------------------
+
+    def test_resolve_str_tuple_env_overrides_default(self) -> None:
+        with patch.dict(os.environ, {"TEST_TUPLE": "a, b ,c"}, clear=False):
+            assert config._resolve_str_tuple("TEST_TUPLE", ("x",)) == ("a", "b", "c")
+
+    def test_resolve_str_tuple_default_when_env_empty(self) -> None:
+        with patch.dict(os.environ, {"TEST_TUPLE": "   "}, clear=False):
+            assert config._resolve_str_tuple("TEST_TUPLE", ("x", "y")) == ("x", "y")
+
+    def test_resolve_str_tuple_default_when_env_absent(self) -> None:
+        env_copy = {k: v for k, v in os.environ.items() if k != "TEST_TUPLE"}
+        with patch.dict(os.environ, env_copy, clear=True):
+            assert config._resolve_str_tuple("TEST_TUPLE", ("x", "y")) == ("x", "y")
+
+
+class TestRequireEnv:
+    """The required-env-var contract: ``_require_env`` is the single source of
+    truth for raising RuntimeError when ``DEVBENCH_WORKSPACE_ROOT`` or
+    ``DEVBENCH_CLAUDE_MODEL`` are missing at import time.  Unit-test it
+    directly instead of force-reloading the module.
+    """
+
+    def test_returns_value_when_env_var_set(self) -> None:
+        with patch.dict(os.environ, {"REQ_TEST_VAR": "some-value"}, clear=False):
+            assert config._require_env("REQ_TEST_VAR", "hint") == "some-value"
+
+    def test_raises_when_env_var_absent(self) -> None:
+        env_copy = {k: v for k, v in os.environ.items() if k != "REQ_TEST_VAR"}
+        with patch.dict(os.environ, env_copy, clear=True):
+            with pytest.raises(
+                RuntimeError,
+                match=r"REQ_TEST_VAR environment variable is not set\. set-it-properly",
+            ):
+                config._require_env("REQ_TEST_VAR", "set-it-properly")
+
+    def test_raises_when_env_var_empty(self) -> None:
+        with patch.dict(os.environ, {"REQ_TEST_VAR": ""}, clear=False):
+            with pytest.raises(RuntimeError):
+                config._require_env("REQ_TEST_VAR", "hint")
+
+
+class TestAgentModelEnvOverrideTypeError:
+    """``_apply_agent_model_env_overrides`` raises TypeError when an agent_models
+    field resolves to a non-string in the second-pass validation loop.  This
+    guards against future schema regressions where the field shape changes.
+    """
+
+    def test_typeerror_for_non_string_agent_model_value(self) -> None:
+        # Build a namespace that mirrors every (var, attr_path) entry in
+        # _AGENT_MODEL_ENV_VARS.  Every leaf is None except the one we are
+        # exercising, which is a non-string sentinel.
+        from types import SimpleNamespace
+
+        review_team = SimpleNamespace(
+            code_reviewer=12345,  # the non-string we want the loop to trip on
+            test_reviewer=None,
+            doc_reviewer=None,
+            changes_manifest=None,
+        )
+        fake = SimpleNamespace(
+            executor=None,
+            blocker_resolver=None,
+            manifest_amender=None,
+            security_reviewer=None,
+            task_factory=None,
+            review_supervisor=None,
+            review_team=review_team,
+        )
+        with patch.object(config.RUNTIME_CONFIG, "agent_models", fake):
+            with pytest.raises(TypeError, match=r"resolved to non-string"):
+                config._apply_agent_model_env_overrides()
+
 
 class TestCanonicalConfigToggles:
     """Verify the v-next canonical toggle resolutions read from YAML correctly.

@@ -38,6 +38,14 @@ jobs:
       - run: make lint-bandit
         shell: bash
 
+  lint-no-duplicates:
+    name: Lint (no duplicates)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - run: make lint-no-duplicates
+        shell: bash
+
   format-check:
     name: Format check
     runs-on: ubuntu-24.04
@@ -61,7 +69,7 @@ jobs:
         shell: bash
 
   test-coverage:
-    name: Tests + coverage (>=90%)
+    name: Tests + coverage (>=97%)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6

@@ -1342,6 +1342,21 @@ class TestTaskFactoryConfig:
         assert result.task_factory.enabled is False
         assert result.task_factory.auto_accept_proposals is False
 
+    def test_task_factory_enabled_without_manifest_amendment_raises(self, tmp_path: Path) -> None:
+        """task_factory.enabled=true requires manifest_amendment.enabled=true."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            task_factory:
+              enabled: true
+            """,
+        )
+        with pytest.raises(ValueError, match=r"task_factory\.enabled: true requires manifest_amendment\.enabled: true"):
+            load_runtime_config(cfg, {})
+
     def test_auto_accept_defaults_false_when_key_omitted(self, tmp_path: Path) -> None:
         """Key omitted inside an enabled task_factory block -> default False (backward-compatible)."""
         cfg = self._write(
@@ -1633,6 +1648,25 @@ class TestRepoConfigRuntimeFields:
         assert rt.repos["org/repo"].resolved_checkout_path is None
         # validated_repo remains populated even without workspace_root.
         assert rt.repos["org/repo"].validated_repo == "org/repo"
+
+    def test_get_repo_local_path_uses_resolved_checkout_path_when_set(self, tmp_path: Path) -> None:
+        """get_repo_local_path returns repo_config.resolved_checkout_path directly when populated."""
+        from devbench.config_loader import get_repo_local_path
+
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+                checkout_directory: explicit-dir
+            """,
+        )
+        rt = load_runtime_config(cfg, {"DEVBENCH_WORKSPACE_ROOT": str(tmp_path)})
+        assert rt.repos["org/repo"].resolved_checkout_path == tmp_path / "explicit-dir"
+        # workspace_root argument is ignored because resolved_checkout_path is set.
+        result = get_repo_local_path("org/repo", rt, Path("/different/ws"))
+        assert result == tmp_path / "explicit-dir"
 
 
 @pytest.mark.unit

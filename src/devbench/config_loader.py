@@ -1250,12 +1250,6 @@ def _validate_auto_finalize_auto_merge(
             "auto_merge merges the PR created by auto_finalize; "
             "without auto_finalize there is no PR to merge."
         )
-    if auto_merge and local_only:
-        raise ValueError(
-            f"Config file '{path}': git_ops.auto_merge: true is incompatible with "
-            "git_ops.local_only: true. Local-only repos have no remote or PR; "
-            "there is nothing to merge."
-        )
 
 
 def _schema_error_message(path: Path, exc: jsonschema.ValidationError) -> str:
@@ -1388,12 +1382,6 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
             f"Config file '{path}': git_ops.local_only: true requires git_ops.defer_pr: true. "
             "Local-only repos have no remote to push to; PR creation is meaningless. "
             "Set git_ops.defer_pr: true (and git_ops.single_branch: <name>) alongside local_only."
-        )
-    if local_only and pause_before_merge:
-        raise ValueError(
-            f"Config file '{path}': git_ops.local_only: true is incompatible with "
-            "git_ops.pause_before_merge: true. Local-only mode never creates PRs; "
-            "there is nothing to pause before merging."
         )
     auto_finalize = bool(git_ops_raw.get("auto_finalize", False))
     auto_merge = bool(git_ops_raw.get("auto_merge", False))

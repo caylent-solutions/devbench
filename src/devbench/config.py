@@ -156,13 +156,27 @@ def _resolve_str_tuple(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
 # first command that touches GitHub.
 ALLOWED_GH_ORG: str = _read_env("DEVBENCH_GH_ORG") or ""
 
+
+def _require_env(name: str, hint: str) -> str:
+    """Return the value of a required env var or raise RuntimeError.
+
+    Used for the two import-time required env vars (``DEVBENCH_WORKSPACE_ROOT``
+    and ``DEVBENCH_CLAUDE_MODEL``).  Keeps the failure messages adjacent to
+    the variable name so operators see a single actionable error.
+    """
+    value = _read_env(name) or ""
+    if not value:
+        raise RuntimeError(f"{name} environment variable is not set. {hint}")
+    return value
+
+
 # Absolute path to the workspace root directory containing all repo clones.
-_workspace_root = _read_env("DEVBENCH_WORKSPACE_ROOT") or ""
-if not _workspace_root:
-    raise RuntimeError(
-        "DEVBENCH_WORKSPACE_ROOT environment variable is not set. Set it to the absolute path of your workspace root."
+WORKSPACE_ROOT: Path = Path(
+    _require_env(
+        "DEVBENCH_WORKSPACE_ROOT",
+        "Set it to the absolute path of your workspace root.",
     )
-WORKSPACE_ROOT: Path = Path(_workspace_root)
+)
 
 # ---------------------------------------------------------------------------
 # YAML config loading
@@ -302,13 +316,10 @@ PAUSE_BEFORE_MERGE: bool = _resolve_bool(
     RUNTIME_CONFIG.git_ops.pause_before_merge,
     DEFAULT_PAUSE_BEFORE_MERGE,
 )
-_claude_model = _read_env("DEVBENCH_CLAUDE_MODEL") or ""
-if not _claude_model:
-    raise RuntimeError(
-        "DEVBENCH_CLAUDE_MODEL environment variable is not set. "
-        "Set it to a valid model identifier (e.g. us.anthropic.claude-sonnet-4-6-v1)."
-    )
-CLAUDE_MODEL: str = _claude_model
+CLAUDE_MODEL: str = _require_env(
+    "DEVBENCH_CLAUDE_MODEL",
+    "Set it to a valid model identifier (e.g. us.anthropic.claude-sonnet-4-6-v1).",
+)
 
 
 class MergeStrategy(StrEnum):

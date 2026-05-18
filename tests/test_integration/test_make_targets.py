@@ -278,19 +278,18 @@ class TestHelpEnvVarTokens:
 
 
 @pytest.mark.functional
-class TestCoverageNewIncludesQuota:
-    """AC-193-1: test-coverage-new gate must include devbench.quota at 100% coverage."""
+class TestCoverageGate:
+    """The single consolidated ``test-coverage`` target enforces the package
+    coverage floor.  Replaces the prior ``test-coverage-new`` per-module gate
+    so there is exactly one coverage command surfaced to operators and CI.
+    """
 
-    def test_test_coverage_new_includes_quota_module(self) -> None:
-        """AC-193-1: make -n test-coverage-new must include --cov=devbench.quota."""
-        output = _make_dry_run("test-coverage-new")
-        assert "--cov=devbench.quota" in output, (
-            f"Expected '--cov=devbench.quota' in make -n test-coverage-new output, got:\n{output}"
-        )
+    def test_test_coverage_runs_against_devbench_package(self) -> None:
+        output = _make_dry_run("test-coverage")
+        assert "--cov=devbench" in output, f"Expected '--cov=devbench' in make -n test-coverage output, got:\n{output}"
 
-    def test_test_coverage_new_fails_under_100(self) -> None:
-        """AC-193-1: test-coverage-new gate enforces 100% -- --cov-fail-under=100 must be present."""
-        output = _make_dry_run("test-coverage-new")
-        assert "--cov-fail-under=100" in output, (
-            f"Expected '--cov-fail-under=100' in make -n test-coverage-new output, got:\n{output}"
+    def test_test_coverage_enforces_97_percent_floor(self) -> None:
+        output = _make_dry_run("test-coverage")
+        assert "--cov-fail-under=97" in output, (
+            f"Expected '--cov-fail-under=97' in make -n test-coverage output, got:\n{output}"
         )

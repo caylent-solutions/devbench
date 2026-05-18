@@ -7,14 +7,22 @@ independently in `devbench.yaml`, so you only get pinged on the things
 you actually care about.
 
 This document is the end-to-end operator walkthrough: how Slack
-webhooks work, how to create one bound to your DMs, where the
-credentials live, and how to flip the toggles you want.
+webhooks work, how to create one bound to your DMs (or to a shared
+team channel), where the credentials live, and how to flip the toggles
+you want.
 
 ## What you get
 
-- A Slack message on every event you enable, with a `<@you>` mention
-  that drives a desktop + mobile push notification (even when the
-  message lands in a channel).
+- A Slack message on every event you enable. Every payload starts
+  with a literal `<!here>` mention, so the message drives a desktop +
+  mobile push notification for every online member of the channel
+  the webhook is bound to.
+- The same payload works in two routings:
+  - **DM-yourself pattern.** Bind the webhook to a private channel
+    that has only you in it. `<!here>` notifies you only.
+  - **Team-channel pattern.** Bind the webhook to a shared channel
+    with multiple operators. `<!here>` notifies every online member
+    of the team at once.
 - Best-effort delivery: if Slack is down or the URL is wrong, the
   orchestrator logs a `[WARN]` to stderr and **keeps running**. A
   failed notification never crashes the orchestrator.
@@ -32,40 +40,39 @@ The trick to "DM yourself" is:
 
 1. Create a **private channel** with only yourself as a member.
 2. Bind the webhook to that channel.
-3. Include a `<@your_user_id>` mention in every payload so Slack
-   pushes a notification to your phone / desktop the same way it
-   would for a real DM.
+3. The payload uses `<!here>` so Slack pushes a notification to every
+   online member of the channel — that's just you in this routing.
 
-That's exactly what devbench does. You give it the webhook URL and
-your user ID; it posts to the channel (where only you are) with the
-mention, and you get a push.
+Same payload, bound to a shared channel, pushes to all online
+operators in that channel. One config, two routings.
 
 ## One-time setup (step by step)
 
-### 1. Create a Slack channel for the notifications
+### 1. Decide on the channel routing
 
-In your Slack workspace:
+Either of these works without changing devbench config:
 
-1. Click the `+` next to **Channels** in the left sidebar.
-2. Create a **private** channel named `#devbench-<your-handle>`
-   (e.g. `#devbench-alice`).
-3. Do **not** invite anyone. You should be the only member.
+- **DM-yourself.** Create a private channel `#devbench-<your-handle>`
+  in your Slack workspace and make yourself the only member.
+- **Team channel.** Use an existing shared channel where every
+  operator who should get pinged is already a member.
+
+Whichever you pick, the channel is where the webhook will post.
 
 ### 2. Create a Slack app + incoming webhook
 
 Slack incoming webhooks live inside a Slack app. You'll create a
 single-purpose app named `devbench-notify` and bind one webhook to
-your private channel.
+the channel from step 1.
 
 1. Open <https://api.slack.com/apps>.
 2. Click **Create New App** → **From scratch**.
-3. Name it `devbench-notify`. Pick the Slack workspace you just
-   created the channel in. Click **Create App**.
+3. Name it `devbench-notify`. Pick the Slack workspace your channel
+   is in. Click **Create App**.
 4. In the left sidebar, click **Incoming Webhooks**.
 5. Flip **Activate Incoming Webhooks** to **On**.
 6. Scroll down. Click **Add New Webhook to Workspace**.
-7. Pick the `#devbench-<your-handle>` channel you created. Click
-   **Allow**.
+7. Pick the channel from step 1. Click **Allow**.
 8. Slack drops you back to the Incoming Webhooks page with a new row
    in the **Webhook URLs for Your Workspace** table. Copy the URL —
    it looks like:
@@ -75,32 +82,19 @@ your private channel.
    ```
 
    This URL is a credential. Treat it like a password. Anyone with
-   the URL can post messages to your channel.
+   the URL can post messages to the channel.
 
-### 3. Get your Slack user ID
+### 3. Drop the credential in your shell env
 
-The user ID is the `U...` (or `W...` for Slack Connect / Enterprise
-Grid) string that identifies you to Slack's API.
+The recommended pattern keeps the Slack webhook URL out of any
+checked-in YAML. Put it in `~/.devbench/shell.env` (or wherever you
+keep your devbench operator secrets) so it gets sourced into the
+environment of every devbench process you launch.
 
-1. In Slack desktop, click your avatar in the top-right.
-2. Click **Profile**.
-3. Click the `⋮` menu in the profile pane.
-4. Click **Copy member ID**.
-
-You'll get a string like `U07ABCDEFGH`. Save it.
-
-### 4. Drop the credentials in your shell env
-
-The recommended pattern keeps Slack credentials out of any
-checked-in YAML. Put them in `~/.devbench/shell.env` (or wherever
-you keep your devbench operator secrets) so they get sourced into
-the environment of every devbench process you launch.
-
-Add these two lines (substitute your real URL + user ID):
+Add this line (substitute your real URL):
 
 ```bash
 export DEVBENCH_NOTIFICATIONS_SLACK_WEBHOOK_URL='https://hooks.slack.com/services/T01ABCDEFGH/B02IJKLMNOP/qrstUVWXYZ123456789'
-export DEVBENCH_NOTIFICATIONS_SLACK_USER_ID='U07ABCDEFGH'
 ```
 
 Then source the file:
@@ -109,12 +103,12 @@ Then source the file:
 source ~/.devbench/shell.env
 ```
 
-devbench reads these env vars at config-load and they take precedence
-over any matching yaml field. They never appear in any tracked file
-and never show up in the orchestrator's log output (the dispatcher
+devbench reads this env var at config-load and it takes precedence
+over any matching yaml field. It never appears in any tracked file
+and never shows up in the orchestrator's log output (the dispatcher
 masks the URL whenever it logs a delivery failure).
 
-### 5. Pick the events you want
+### 4. Pick the events you want
 
 Edit `backlog/config/devbench.yaml` in your workspace and add the
 `notifications:` block. Flip on the events you want. Everything not
@@ -133,12 +127,15 @@ notifications:
     orchestrator_stop: true
     quota_pause: true
     quota_resume: true
+  slack:
+    enabled: true
+    # webhook_url left unset; the env var supplies it.
 ```
 
-The `slack:` block is intentionally not included — the env vars from
-step 4 supply the URL + user ID.
+The `slack.webhook_url` field is intentionally not set — the env var
+from step 3 supplies it.
 
-### 6. Smoke-test it
+### 5. Smoke-test it
 
 From the workspace root, run:
 
@@ -148,10 +145,10 @@ DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
 uv run --project /path/to/devbench devbench notify-test --event work_unit_done
 ```
 
-You should see a Slack message arrive in your private channel within
-a second or two, with the body:
+You should see a Slack message arrive in your channel within a
+second or two, with the body:
 
-> 🟢 *<@U07ABCDEFGH> Work unit done: E0-F1-S1-T1*
+> 🟢 *<!here> Work unit done: E0-F1-S1-T1*
 > *Task* `E0-F1-S1-T1`
 > *Title* Sample test task
 
@@ -170,7 +167,7 @@ Every event toggle, when it fires, and what's in the payload:
 | `pr_opened` | `gh pr create` succeeded for a work unit. | Task id, repo, PR URL. |
 | `pr_merged` | `gh pr merge` succeeded. | Task id, repo, PR URL. |
 | `ci_failure` | A CI run on a WU PR is classified as failed. | Task id, repo, PR URL, attempt number. |
-| `orchestrator_stop` | The orchestrator loop exits — clean, drain, SIGTERM, or uncaught exception. **Always fires** when notifications.enabled is true (best-effort try/finally at the top of `cmd_start`). | Reason, in-flight WU id (when one was active). |
+| `orchestrator_stop` | The orchestrator loop exits — clean, drain, SIGTERM, or uncaught exception. **Always fires** when notifications.enabled and slack.enabled are true (best-effort try/finally at the top of `cmd_start`). | Reason, in-flight WU id (when one was active). |
 | `orchestrator_auto_restart` | The orchestrator exited with code 42 (RUNTIME_DEGRADATION-only NO_ACTIONABLE) and the Makefile loop is restarting. | List of blocked task ids (truncated at 5). |
 | `quota_pause` | The orchestrator detects a quota signal and starts the wait. | Reason, reset_at timestamp, paused_at timestamp. |
 | `quota_resume` | The recovery probe succeeded; the orchestrator is resuming. | Resumed_at, waited_seconds. |
@@ -180,7 +177,7 @@ Every event toggle, when it fires, and what's in the payload:
 Webhook URLs are credentials. Anyone with the URL can post to your
 channel. CLAUDE.md treats them as restricted data:
 
-- **Never commit a webhook URL to a tracked yaml.** Use env vars.
+- **Never commit a webhook URL to a tracked yaml.** Use the env var.
 - **Rotate** by deleting the webhook from
   <https://api.slack.com/apps> → your app → Incoming Webhooks
   (click the trash icon next to the URL) and creating a fresh one.
@@ -193,27 +190,29 @@ channel. CLAUDE.md treats them as restricted data:
 
 ## Troubleshooting
 
-**No message arrives, no warning.** The most likely cause is
-`notifications.enabled: false` or the specific event toggle being
-off. Re-run `devbench notify-test --event work_unit_done` (the test
-command forces the toggle on temporarily so it bypasses
-per-event gating).
+**No message arrives, no warning.** The most likely cause is one of
+the three master switches being off. All three must be true for a
+POST to happen: `notifications.enabled`, `notifications.slack.enabled`,
+and the specific `notifications.events.<event_name>`. Re-run
+`devbench notify-test --event work_unit_done` (the test command
+forces the per-event toggle on temporarily so it bypasses the third
+gate while still honoring the first two).
 
 **Stderr shows `[WARN] webhook POST to '...SECRET01' failed: 404`.**
 The webhook was deleted from Slack. Generate a new one from
 <https://api.slack.com/apps> → Incoming Webhooks → Add New Webhook
 to Workspace, and update the env var.
 
-**Stderr shows `403` or `channel_not_found`.** The private channel
-the webhook is bound to was renamed or you got removed from it.
-Either restore the channel or generate a new webhook bound to a
-new channel.
+**Stderr shows `403` or `channel_not_found`.** The channel the
+webhook is bound to was renamed or you got removed from it. Either
+restore the channel or generate a new webhook bound to a new
+channel.
 
-**Message arrives but no push notification.** Check that
-`DEVBENCH_NOTIFICATIONS_SLACK_USER_ID` is your actual Slack member
-ID (`U...` or `W...`). Without it, the message has no `<@you>`
-mention and Slack treats it as a regular channel message — silent
-unless you have channel-level mentions enabled.
+**Message arrives but no push notification.** Check that the channel
+has notifications enabled in your Slack client. `<!here>` only
+notifies online members — if your Slack is "Away" status, you'll
+see the message but not a push. Adjust Slack's notification settings
+for the channel (gear icon → "Get notifications for All messages").
 
 **Test the webhook bypass devbench.** Sanity-check the URL directly
 with curl:

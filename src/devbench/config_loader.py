@@ -784,17 +784,23 @@ def _parse_quota_handling_config(raw: dict) -> QuotaHandlingConfig:
 class NotificationsSlackConfig:
     """Slack endpoint for the notifications dispatcher.
 
+    One shared webhook URL is used for every enabled event; the
+    payload itself carries an ``<!here>`` mention so the same payload
+    works whether the webhook is bound to a one-person private DM
+    channel or a shared team channel.
+
     Attributes:
+        enabled: Endpoint-level toggle.  When ``False``, no Slack POST
+            happens even if the master ``notifications.enabled`` is
+            ``True`` and the per-event toggle is on.  Default
+            ``False`` -- the operator opts in explicitly.
         webhook_url: Slack incoming webhook URL (channel-scoped).
-            ``None`` disables Slack notifications.
-        user_id: Slack user id (``U...`` or ``W...``).  When set, every
-            payload prepends ``<@user_id>`` to the headline so the
-            operator gets a desktop + mobile push even when the message
-            lands in a one-person private channel.
+            ``None`` disables Slack notifications regardless of the
+            ``enabled`` flag.
     """
 
+    enabled: bool = False
     webhook_url: str | None = None
-    user_id: str | None = None
 
 
 @dataclass
@@ -827,22 +833,23 @@ class NotificationsConfig:
     event toggle off, so omitting the ``notifications:`` yaml block
     means "no notifications", matching the spec's opt-in posture.
 
+    Endpoints live in their own nested sub-blocks (today: ``slack``;
+    future: ``discord``, ``teams``, ``generic_webhook``, etc.) so the
+    schema accommodates additional notification transports without
+    touching the per-event toggle surface.
+
     Attributes:
         enabled: Master switch.  When ``False``, no event fires
             regardless of per-event toggles.  Default ``False``.
-        slack: Slack endpoint settings (URL + user id for mention).
-        webhook_url: Optional non-Slack generic webhook URL.  Receives
-            a raw JSON payload (``{"event": "...", ...}``) for every
-            enabled event.  ``None`` disables it.
         timeout_seconds: Per-POST HTTP timeout.  Default 10.
         events: Per-event toggle struct.
+        slack: Slack endpoint config (enabled flag + webhook URL).
     """
 
     enabled: bool = False
-    slack: NotificationsSlackConfig = field(default_factory=NotificationsSlackConfig)
-    webhook_url: str | None = None
     timeout_seconds: float = 10.0
     events: NotificationsEventsConfig = field(default_factory=NotificationsEventsConfig)
+    slack: NotificationsSlackConfig = field(default_factory=NotificationsSlackConfig)
 
 
 def _validate_webhook_url(label: str, value: object) -> str | None:
@@ -863,44 +870,21 @@ def _validate_webhook_url(label: str, value: object) -> str | None:
     return value
 
 
-def _validate_slack_user_id(value: object) -> str | None:
-    """Validate ``notifications.slack.user_id``.
-
-    Slack member ids are 8+ characters starting with ``U`` (workspace
-    member) or ``W`` (Slack Connect / Enterprise Grid).  Either is
-    accepted.
-    """
-    if value is None or value == "":
-        return None
-    if not isinstance(value, str):
-        raise ValueError(f"notifications.slack.user_id: must be a string or null, got {type(value).__name__}")
-    from devbench.notifications import SLACK_USER_ID_RE
-
-    if not SLACK_USER_ID_RE.match(value):
-        raise ValueError(
-            f"notifications.slack.user_id: malformed Slack user id {value!r}; "
-            "expected pattern '[UW][A-Z0-9]{7,}' (find yours in Slack: avatar -> Profile -> Copy member ID)"
-        )
-    return value
-
-
 def _parse_notifications_config(raw: dict) -> NotificationsConfig:
     """Parse a ``notifications:`` yaml block into a :class:`NotificationsConfig`.
 
     Schema validation in ``load_runtime_config`` already rejects
     unknown keys; this function applies the value-level checks
-    (URL scheme, user-id pattern) so a malformed value fails
-    fast at config-load time, not on first dispatch attempt.
+    (URL scheme) so a malformed value fails fast at config-load time,
+    not on first dispatch attempt.
     """
     defaults = NotificationsConfig()
 
     slack_raw = raw.get("slack") or {}
     slack = NotificationsSlackConfig(
+        enabled=bool(slack_raw.get("enabled", defaults.slack.enabled)),
         webhook_url=_validate_webhook_url("notifications.slack.webhook_url", slack_raw.get("webhook_url")),
-        user_id=_validate_slack_user_id(slack_raw.get("user_id")),
     )
-
-    generic_url = _validate_webhook_url("notifications.webhook_url", raw.get("webhook_url"))
 
     events_raw = raw.get("events") or {}
     events = NotificationsEventsConfig(
@@ -923,10 +907,9 @@ def _parse_notifications_config(raw: dict) -> NotificationsConfig:
 
     return NotificationsConfig(
         enabled=bool(raw.get("enabled", defaults.enabled)),
-        slack=slack,
-        webhook_url=generic_url,
         timeout_seconds=float(raw.get("timeout_seconds", defaults.timeout_seconds)),
         events=events,
+        slack=slack,
     )
 
 

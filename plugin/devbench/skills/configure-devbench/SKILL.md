@@ -377,19 +377,10 @@ The `notifications:` section configures operator-facing Slack / webhook pings on
 
 Tell the operator (verbatim):
 
-> "Section: notifications (operator Slack / webhook pings; leave blank to keep them all off)
+> "Section: notifications (operator lifecycle pings; leave blank to keep them all off)
 >
 > Master:
 >   enabled                     -- Master switch; nothing fires when false. [true/false, default: false]
->
-> Slack endpoint (recommended pattern: leave these BLANK in the yaml and set
-> the DEVBENCH_NOTIFICATIONS_SLACK_WEBHOOK_URL + DEVBENCH_NOTIFICATIONS_SLACK_USER_ID
-> env vars so the credential never gets committed):
->   slack.webhook_url           -- Slack incoming webhook (https://hooks.slack.com/services/...). [blank]
->   slack.user_id               -- Slack member id (U... or W...) used for <@mention>. [blank]
->
-> Generic webhook (optional, non-Slack):
->   webhook_url                 -- POST raw JSON payload to this URL on every enabled event. [blank]
 >   timeout_seconds             -- Per-POST HTTP timeout. [default: 10]
 >
 > Per-event toggles (all default to false):
@@ -405,10 +396,19 @@ Tell the operator (verbatim):
 >   events.quota_pause                 -- quota detected; sleeping until reset
 >   events.quota_resume                -- recovery probe succeeded; resuming
 >
-> Full operator walkthrough (Slack app creation, webhook URL, user-id lookup):
+> Slack endpoint (today's only transport; future endpoints land as their own
+> nested blocks alongside slack:).  The payload uses <!here> so the same
+> message works in a one-person DM channel or a shared team channel; you do
+> NOT need to configure a user id.  Recommended pattern: leave webhook_url
+> BLANK in the yaml and set DEVBENCH_NOTIFICATIONS_SLACK_WEBHOOK_URL in
+> shell.env so the credential never gets committed.
+>   slack.enabled               -- Endpoint-level toggle. [true/false, default: false]
+>   slack.webhook_url           -- Slack incoming webhook (https://hooks.slack.com/services/...). [blank]
+>
+> Full operator walkthrough (Slack app creation, webhook URL, channel routing):
 >   docs/slack-notifications.md"
 
-Validate `slack.webhook_url` (when present) starts with `https://`. Validate `slack.user_id` (when present) matches `^[UW][A-Z0-9]{7,}$`. Validate every `events.*` value is a boolean. Reject any invalid value and re-prompt.
+Validate `slack.webhook_url` (when present) starts with `https://`. Validate every `events.*` value is a boolean. Reject any invalid value and re-prompt.
 
 ---
 

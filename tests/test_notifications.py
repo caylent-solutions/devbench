@@ -2,9 +2,10 @@
 
 Pins the per-event dispatcher contract: each ``notify_*`` helper is
 best-effort, returns early when the per-event toggle is off or the
-master switch is off, builds a Slack block-kit payload with ``<@user>``
-mention when configured, posts the raw JSON to the generic ``webhook_url``
-slot, and swallows every HTTP exception (logged as ``[WARN]`` to stderr).
+master switch is off, builds a Slack block-kit payload with the
+``<!here>`` mention (channel-broadcast that pushes to every online
+member of the bound channel), and swallows every HTTP exception
+(logged as ``[WARN]`` to stderr).
 """
 
 from __future__ import annotations
@@ -30,18 +31,16 @@ from devbench.config_loader import (
 def _make_config(
     *,
     enabled: bool = True,
+    slack_enabled: bool = True,
     slack_url: str | None = "https://hooks.slack.com/services/T/B/X",
-    slack_user_id: str | None = "U12345678",
-    generic_url: str | None = None,
     events: dict[str, bool] | None = None,
 ) -> NotificationsConfig:
     """Build a ``NotificationsConfig`` with the toggles flipped per ``events``."""
     return NotificationsConfig(
         enabled=enabled,
-        slack=NotificationsSlackConfig(webhook_url=slack_url, user_id=slack_user_id),
-        webhook_url=generic_url,
         timeout_seconds=10.0,
         events=NotificationsEventsConfig(**(events or {})),
+        slack=NotificationsSlackConfig(enabled=slack_enabled, webhook_url=slack_url),
     )
 
 
@@ -93,62 +92,42 @@ class TestIsEventEnabled:
 
 
 # ---------------------------------------------------------------------------
-# _mention + _build_slack_payload
+# _build_slack_payload
 # ---------------------------------------------------------------------------
 
 
 class TestSlackPayload:
-    def test_mention_empty_when_no_user_id(self) -> None:
-        assert notifications._mention(None) == ""
-
-    def test_mention_renders_with_trailing_space(self) -> None:
-        assert notifications._mention("U12345678") == "<@U12345678> "
-
-    def test_payload_top_line_includes_mention(self) -> None:
+    def test_payload_top_line_starts_with_here_mention(self) -> None:
         payload = notifications._build_slack_payload(
             summary="Sample headline",
             fields=[("Task", "`E0-F1-S1-T1`")],
             context=None,
-            user_id="U12345678",
         )
-        assert payload["text"].startswith("<@U12345678> ")
+        assert payload["text"].startswith("<!here> ")
         assert "Sample headline" in payload["text"]
 
-    def test_payload_top_line_skips_mention_when_no_user(self) -> None:
+    def test_payload_first_block_also_carries_here_mention(self) -> None:
         payload = notifications._build_slack_payload(
             summary="Sample headline",
             fields=[],
             context=None,
-            user_id=None,
         )
-        assert payload["text"] == "Sample headline"
+        first_block_text = payload["blocks"][0]["text"]["text"]
+        assert "<!here>" in first_block_text
 
     def test_payload_blocks_carry_fields_section_when_provided(self) -> None:
         payload = notifications._build_slack_payload(
             summary="x",
             fields=[("Task", "`E0-F1-S1-T1`"), ("Title", "demo")],
             context="Reason: dep",
-            user_id="U12345678",
         )
         block_types = [b["type"] for b in payload["blocks"]]
         assert block_types == ["section", "section", "context"]
 
     def test_payload_blocks_omit_fields_section_when_none(self) -> None:
-        payload = notifications._build_slack_payload(summary="x", fields=[], context=None, user_id=None)
+        payload = notifications._build_slack_payload(summary="x", fields=[], context=None)
         assert len(payload["blocks"]) == 1
         assert payload["blocks"][0]["type"] == "section"
-
-
-# ---------------------------------------------------------------------------
-# _build_generic_payload
-# ---------------------------------------------------------------------------
-
-
-class TestGenericPayload:
-    def test_event_kind_at_top_level(self) -> None:
-        payload = notifications._build_generic_payload("work_unit_done", unit_id="E0-F1-S1-T1")
-        assert payload["event"] == "work_unit_done"
-        assert payload["unit_id"] == "E0-F1-S1-T1"
 
 
 # ---------------------------------------------------------------------------
@@ -177,19 +156,27 @@ class TestNotifyWorkUnitDone:
         args, _ = posted.call_args
         url, payload, timeout = args
         assert url == "https://hooks.slack.com/services/T/B/X"
-        assert "<@U12345678>" in payload["text"]
+        assert "<!here>" in payload["text"]
         assert "E0-F1-S1-T1" in payload["text"]
         assert timeout == 10.0
 
-    def test_generic_post_also_fires_when_url_set(self) -> None:
-        cfg = _make_config(enabled=True, generic_url="https://example.com/hook", events={"work_unit_done": True})
+    def test_no_post_when_slack_endpoint_disabled(self) -> None:
+        cfg = _make_config(enabled=True, slack_enabled=False, events={"work_unit_done": True})
         with (
             patch.object(notifications, "_load_notifications_config", return_value=cfg),
             patch("devbench.quota.post_webhook") as posted,
         ):
             notifications.notify_work_unit_done("E0-F1-S1-T1", "Sample")
-        # Two POSTs: Slack + generic.
-        assert posted.call_count == 2
+        posted.assert_not_called()
+
+    def test_no_post_when_slack_url_is_null(self) -> None:
+        cfg = _make_config(enabled=True, slack_url=None, events={"work_unit_done": True})
+        with (
+            patch.object(notifications, "_load_notifications_config", return_value=cfg),
+            patch("devbench.quota.post_webhook") as posted,
+        ):
+            notifications.notify_work_unit_done("E0-F1-S1-T1", "Sample")
+        posted.assert_not_called()
 
     def test_webhook_failure_does_not_propagate(self, capsys: pytest.CaptureFixture[str]) -> None:
         cfg = _make_config(enabled=True, events={"work_unit_done": True})
@@ -428,8 +415,8 @@ class TestNotificationsConfigParser:
             """
         )
         assert rt.notifications.enabled is False
+        assert rt.notifications.slack.enabled is False
         assert rt.notifications.slack.webhook_url is None
-        assert rt.notifications.slack.user_id is None
         assert rt.notifications.events.work_unit_done is False
 
     def test_full_block_parses_every_field(self) -> None:
@@ -440,21 +427,19 @@ class TestNotificationsConfigParser:
                 default_branch: main
             notifications:
               enabled: true
-              slack:
-                webhook_url: "https://hooks.slack.com/services/T/B/X"
-                user_id: "U12345678"
-              webhook_url: "https://example.com/hook"
               timeout_seconds: 15
               events:
                 work_unit_done: true
                 quota_pause: true
+              slack:
+                enabled: true
+                webhook_url: "https://hooks.slack.com/services/T/B/X"
             """
         )
         n = rt.notifications
         assert n.enabled is True
+        assert n.slack.enabled is True
         assert n.slack.webhook_url == "https://hooks.slack.com/services/T/B/X"
-        assert n.slack.user_id == "U12345678"
-        assert n.webhook_url == "https://example.com/hook"
         assert n.timeout_seconds == 15.0
         assert n.events.work_unit_done is True
         assert n.events.quota_pause is True
@@ -473,30 +458,3 @@ class TestNotificationsConfigParser:
                     webhook_url: "http://hooks.slack.com/services/T/B/X"
                 """
             )
-
-    def test_malformed_user_id_rejected(self) -> None:
-        with pytest.raises(ValueError, match="malformed Slack user id"):
-            self._load(
-                """\
-                repos:
-                  org/repo:
-                    default_branch: main
-                notifications:
-                  enabled: true
-                  slack:
-                    user_id: "not-a-slack-id"
-                """
-            )
-
-    def test_workspace_grade_w_prefix_user_id_accepted(self) -> None:
-        rt = self._load(
-            """\
-            repos:
-              org/repo:
-                default_branch: main
-            notifications:
-              slack:
-                user_id: "W12345678"
-            """
-        )
-        assert rt.notifications.slack.user_id == "W12345678"

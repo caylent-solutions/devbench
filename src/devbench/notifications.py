@@ -1,18 +1,25 @@
-"""Operator-facing Slack notification dispatcher.
+"""Operator-facing notification dispatcher.
 
-devbench can post a Slack message (and/or a generic JSON webhook) on
-every interesting lifecycle event -- work-unit done, blocked,
-materialised, promoted; PR opened, merged, CI failed; orchestrator
-stop, auto-restart; quota pause, quota resume.  Each event is
-independently toggled via ``notifications.events.<event_name>`` in
-``devbench.yaml``.
+devbench can post a Slack message on every interesting lifecycle
+event -- work-unit done, blocked, materialised, promoted; PR opened,
+merged, CI failed; orchestrator stop, auto-restart; quota pause,
+quota resume.  Each event is independently toggled via
+``notifications.events.<event_name>`` in ``devbench.yaml``.  Each
+notification endpoint (Slack today; Discord / Teams / generic raw-JSON
+later) lives in its own nested config block under ``notifications:``
+so future endpoints land as additive change without touching the
+event-toggle surface.
 
 Slack incoming webhooks post to a channel, not a user DM.  The
 recommended pattern is a private channel ``#devbench-<you>`` with
-only the operator as a member, plus a ``<@USER_ID>`` mention in every
+only the operator as a member, plus a ``<!here>`` mention in every
 payload so Slack pushes a desktop + mobile notification even though
-the message lands in a channel.  See ``docs/slack-notifications.md``
-for the end-to-end operator walkthrough.
+the message lands in a channel.  ``<!here>`` notifies every online
+member of the channel: in a one-person private channel that's just
+the operator, and in a shared channel it notifies the whole team,
+so the same payload works for both DM-yourself and team-channel
+routing.  See ``docs/slack-notifications.md`` for the end-to-end
+operator walkthrough.
 
 This module is a thin payload-builder + dispatcher; HTTP transport
 is delegated to :func:`devbench.quota.post_webhook`.  Every public
@@ -26,11 +33,9 @@ Each ``notify_*`` function follows the same pattern:
 1. Read ``RUNTIME_CONFIG.notifications`` once.
 2. Return immediately when the master switch is off or the matching
    event toggle is false (no HTTP calls).
-3. Build the Slack block-kit payload (with a ``<@user_id>`` mention
-   when ``notifications.slack.user_id`` is set) and the generic raw
-   JSON payload.
-4. POST each non-null URL via :func:`devbench.quota.post_webhook`.
-5. Catch and log every exception so dispatch is best-effort.
+3. For each endpoint whose ``enabled`` flag is true and whose
+   ``webhook_url`` is non-null, build the appropriate payload and POST.
+4. Catch and log every exception so dispatch is best-effort.
 
 Sensitive data: webhook URLs are credentials.  This module masks all
 but the last 8 characters of any URL it logs.
@@ -38,7 +43,6 @@ but the last 8 characters of any URL it logs.
 
 from __future__ import annotations
 
-import re
 import sys
 from datetime import datetime
 from typing import Any
@@ -77,22 +81,14 @@ ALL_EVENTS: tuple[str, ...] = (
 
 
 # ---------------------------------------------------------------------------
-# Input-validation patterns
+# Notification-payload constants
 # ---------------------------------------------------------------------------
 
-# Slack user IDs are 8+ chars starting with U (workspace member) or W (Slack
-# Connect / Enterprise Grid).  We accept both so enterprise operators can
-# DM themselves via their W-prefixed external ID.
-SLACK_USER_ID_RE: re.Pattern[str] = re.compile(r"^[UW][A-Z0-9]{7,}$")
-
-# PR URLs must point at github.com.  Other forges are out of scope today;
-# bridge them via the generic ``webhook_url`` slot which accepts raw JSON.
-PR_URL_RE: re.Pattern[str] = re.compile(r"^https://github\.com/[^/]+/[^/]+/pull/\d+")
-
-# Work-unit ID grammar: `E\d+-F\d+-S\d+-T\d+`.  Enforced at the dispatcher
-# edge so a bad call site surfaces as a ``[WARN]`` stderr log rather than
-# a silently-malformed Slack ping.
-UNIT_ID_RE: re.Pattern[str] = re.compile(r"^E\d+-F\d+-S\d+-T\d+$")
+# Slack's broadcast mention that notifies every online member of the channel
+# the webhook posts to.  Operators routing to a one-person private DM channel
+# get a personal push; operators routing to a shared team channel notify the
+# whole online team.  Single payload works for both.
+SLACK_HERE_MENTION: str = "<!here>"
 
 
 # ---------------------------------------------------------------------------
@@ -156,20 +152,19 @@ def is_event_enabled(event_kind: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _mention(user_id: str | None) -> str:
-    """Return ``"<@USER> "`` (trailing space) when *user_id* is set, else ``""``."""
-    if not user_id:
-        return ""
-    return f"<@{user_id}> "
-
-
 def _build_slack_payload(
     summary: str,
     fields: list[tuple[str, str]],
     context: str | None,
-    user_id: str | None,
 ) -> dict[str, Any]:
     """Build a Slack block-kit payload.
+
+    Every payload is prefixed with the literal ``<!here>`` mention so the
+    message triggers a desktop + mobile push for every online member of
+    the channel the webhook posts to.  In a one-person private channel
+    (the recommended DM-yourself pattern) that's just the operator; in
+    a shared channel the whole online team gets pinged.  Single payload,
+    both routings.
 
     Args:
         summary: One-line headline used for both the ``text`` top-line
@@ -180,12 +175,8 @@ def _build_slack_payload(
             section block with up to ten markdown fields.
         context: Optional muted footer line (block-kit ``context``
             element).  ``None`` skips the footer block.
-        user_id: Slack user id (``U...`` / ``W...``).  When set, both
-            the ``text`` top-line and the first block prepend a
-            ``<@USER>`` mention so the operator gets a desktop +
-            mobile push even from a private channel.
     """
-    prefix = _mention(user_id)
+    prefix = f"{SLACK_HERE_MENTION} "
     text_line = f"{prefix}{summary}"
     blocks: list[dict[str, Any]] = [
         {
@@ -210,13 +201,6 @@ def _build_slack_payload(
     return {"text": text_line, "blocks": blocks}
 
 
-def _build_generic_payload(event_kind: str, **fields: Any) -> dict[str, Any]:
-    """Build a raw-JSON payload for the non-Slack ``webhook_url`` slot."""
-    payload: dict[str, Any] = {"event": event_kind}
-    payload.update(fields)
-    return payload
-
-
 # ---------------------------------------------------------------------------
 # Dispatch core (best-effort)
 # ---------------------------------------------------------------------------
@@ -227,15 +211,20 @@ def _dispatch(
     slack_summary: str,
     slack_fields: list[tuple[str, str]],
     slack_context: str | None,
-    generic_payload: dict[str, Any],
 ) -> None:
-    """POST the payloads to every configured URL; never raise.
+    """POST the payload to every enabled endpoint; never raise.
+
+    Walks the per-endpoint sub-blocks under ``notifications:`` and
+    fires a transport-appropriate POST for each one whose
+    ``enabled: true`` AND ``webhook_url`` is non-null.  Today the only
+    endpoint is Slack; future endpoints (Discord, Teams, generic raw
+    JSON) plug in as additional branches without touching event
+    callers.
 
     Outer try / except guards against catastrophic failures
     (config-read errors, payload-build bugs) so a notification bug
-    cannot crash the orchestrator.  Inner per-URL try / except keeps
-    one URL's failure from blocking the other (mirrors the legacy
-    ``deliver_notifications`` semantics).
+    cannot crash the orchestrator.  Inner per-endpoint try / except
+    keeps one endpoint's failure from blocking the others.
     """
     if not is_event_enabled(event_kind):
         return
@@ -246,25 +235,15 @@ def _dispatch(
         if cfg is None:
             return
         timeout = cfg.timeout_seconds
-        slack_url = cfg.slack.webhook_url if cfg.slack is not None else None
-        slack_user_id = cfg.slack.user_id if cfg.slack is not None else None
-        generic_url = cfg.webhook_url
+        slack_url = cfg.slack.webhook_url if (cfg.slack is not None and cfg.slack.enabled) else None
 
         if slack_url:
-            slack_payload = _build_slack_payload(slack_summary, slack_fields, slack_context, slack_user_id)
+            slack_payload = _build_slack_payload(slack_summary, slack_fields, slack_context)
             try:
                 post_webhook(slack_url, slack_payload, timeout)
             except Exception as exc:
                 print(
                     f"[WARN] notifications: slack POST to {_mask_url(slack_url)} failed: {exc!r}",
-                    file=sys.stderr,
-                )
-        if generic_url:
-            try:
-                post_webhook(generic_url, generic_payload, timeout)
-            except Exception as exc:
-                print(
-                    f"[WARN] notifications: webhook POST to {_mask_url(generic_url)} failed: {exc!r}",
                     file=sys.stderr,
                 )
     except Exception as exc:
@@ -286,7 +265,6 @@ def notify_work_unit_done(unit_id: str, title: str) -> None:
         slack_summary=f":white_check_mark: Work unit done: {unit_id}",
         slack_fields=[("Task", f"`{unit_id}`"), ("Title", title)],
         slack_context=None,
-        generic_payload=_build_generic_payload(EVENT_WORK_UNIT_DONE, unit_id=unit_id, title=title),
     )
 
 
@@ -297,12 +275,6 @@ def notify_work_unit_blocked_operator(unit_id: str, title: str, reason: str) -> 
         slack_summary=f":no_entry: Operator action required: {unit_id}",
         slack_fields=[("Task", f"`{unit_id}`"), ("Title", title)],
         slack_context=f"Reason: {reason}",
-        generic_payload=_build_generic_payload(
-            EVENT_WORK_UNIT_BLOCKED_OPERATOR,
-            unit_id=unit_id,
-            title=title,
-            reason=reason,
-        ),
     )
 
 
@@ -317,12 +289,6 @@ def notify_work_unit_materialised(unit_id: str, title: str, source_task_id: str)
             ("From source", f"`{source_task_id}`"),
         ],
         slack_context=None,
-        generic_payload=_build_generic_payload(
-            EVENT_WORK_UNIT_MATERIALISED,
-            unit_id=unit_id,
-            title=title,
-            source_task_id=source_task_id,
-        ),
     )
 
 
@@ -333,7 +299,6 @@ def notify_work_unit_promoted(unit_id: str, title: str) -> None:
         slack_summary=f":rocket: Work unit promoted: {unit_id}",
         slack_fields=[("Task", f"`{unit_id}`"), ("Title", title)],
         slack_context=None,
-        generic_payload=_build_generic_payload(EVENT_WORK_UNIT_PROMOTED, unit_id=unit_id, title=title),
     )
 
 
@@ -347,7 +312,6 @@ def notify_pr_opened(unit_id: str, repo: str, pr_url: str) -> None:
             ("Repo", f"`{repo}`"),
         ],
         slack_context=None,
-        generic_payload=_build_generic_payload(EVENT_PR_OPENED, unit_id=unit_id, repo=repo, pr_url=pr_url),
     )
 
 
@@ -361,7 +325,6 @@ def notify_pr_merged(unit_id: str, repo: str, pr_url: str) -> None:
             ("Repo", f"`{repo}`"),
         ],
         slack_context=None,
-        generic_payload=_build_generic_payload(EVENT_PR_MERGED, unit_id=unit_id, repo=repo, pr_url=pr_url),
     )
 
 
@@ -377,13 +340,6 @@ def notify_ci_failure(unit_id: str, repo: str, pr_url: str, attempt: int) -> Non
             ("Attempt", str(attempt)),
         ],
         slack_context=None,
-        generic_payload=_build_generic_payload(
-            EVENT_CI_FAILURE,
-            unit_id=unit_id,
-            repo=repo,
-            pr_url=pr_url,
-            attempt=attempt,
-        ),
     )
 
 
@@ -397,11 +353,6 @@ def notify_orchestrator_stop(reason: str, in_flight_unit_id: str | None) -> None
         slack_summary=f":octagonal_sign: Orchestrator stopped: {reason}",
         slack_fields=fields,
         slack_context=None,
-        generic_payload=_build_generic_payload(
-            EVENT_ORCHESTRATOR_STOP,
-            reason=reason,
-            in_flight_unit_id=in_flight_unit_id,
-        ),
     )
 
 
@@ -418,10 +369,6 @@ def notify_orchestrator_auto_restart(blocked_task_ids: list[str]) -> None:
             ("Blocked tasks", preview),
         ],
         slack_context=None,
-        generic_payload=_build_generic_payload(
-            EVENT_ORCHESTRATOR_AUTO_RESTART,
-            blocked_task_ids=list(blocked_task_ids),
-        ),
     )
 
 
@@ -435,12 +382,6 @@ def notify_quota_pause(reason: str, reset_at: datetime, paused_at: datetime) -> 
             ("Paused at", paused_at.isoformat()),
         ],
         slack_context=None,
-        generic_payload=_build_generic_payload(
-            EVENT_QUOTA_PAUSE,
-            reason=reason,
-            reset_at=reset_at.isoformat(),
-            paused_at=paused_at.isoformat(),
-        ),
     )
 
 
@@ -454,11 +395,6 @@ def notify_quota_resume(resumed_at: datetime, waited_seconds: int) -> None:
             ("Waited", f"{waited_seconds}s"),
         ],
         slack_context=None,
-        generic_payload=_build_generic_payload(
-            EVENT_QUOTA_RESUME,
-            resumed_at=resumed_at.isoformat(),
-            waited_seconds=waited_seconds,
-        ),
     )
 
 

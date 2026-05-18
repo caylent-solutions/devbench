@@ -456,31 +456,12 @@
     },
     "notifications": {
       "type": "object",
-      "description": "Operator-facing Slack / webhook notifications fired on lifecycle events. Each event under 'events' is independently toggled. Webhook URLs may live in yaml but the recommended pattern is the DEVBENCH_NOTIFICATIONS_SLACK_WEBHOOK_URL / DEVBENCH_NOTIFICATIONS_SLACK_USER_ID env vars so the credential never gets committed. See docs/slack-notifications.md.",
+      "description": "Operator-facing notifications fired on lifecycle events. Each event under 'events' is independently toggled. Each notification endpoint (Slack today; Discord/Teams/etc. later) lives in its own nested sub-block so new transports can be added without touching the event-toggle surface. See docs/slack-notifications.md.",
       "additionalProperties": false,
       "properties": {
         "enabled": {
           "type": "boolean",
           "description": "Master switch. When false, no event fires regardless of per-event toggles. Default: false."
-        },
-        "slack": {
-          "type": "object",
-          "description": "Slack endpoint config. Webhook URL is channel-scoped; the user_id supplies the <@mention> that turns a channel message into a push notification.",
-          "additionalProperties": false,
-          "properties": {
-            "webhook_url": {
-              "type": ["string", "null"],
-              "description": "Slack incoming webhook URL (https://hooks.slack.com/...). null disables Slack notifications. Env override: DEVBENCH_NOTIFICATIONS_SLACK_WEBHOOK_URL."
-            },
-            "user_id": {
-              "type": ["string", "null"],
-              "description": "Slack user id (U.../W...). When set, every payload prepends <@user_id>. Env override: DEVBENCH_NOTIFICATIONS_SLACK_USER_ID."
-            }
-          }
-        },
-        "webhook_url": {
-          "type": ["string", "null"],
-          "description": "Optional non-Slack generic webhook URL. Receives a raw JSON payload ({event, ...}) for every enabled event. null disables it."
         },
         "timeout_seconds": {
           "type": "number",
@@ -503,6 +484,21 @@
             "orchestrator_auto_restart": {"type": "boolean", "description": "Fire when the orchestrator exits 42 (RUNTIME_DEGRADATION-only NO_ACTIONABLE) and the Makefile loop restarts. Default: false."},
             "quota_pause": {"type": "boolean", "description": "Fire when the orchestrator detects a quota signal and sleeps until reset. Default: false."},
             "quota_resume": {"type": "boolean", "description": "Fire when the orchestrator's recovery probe succeeds and the loop resumes. Default: false."}
+          }
+        },
+        "slack": {
+          "type": "object",
+          "description": "Slack endpoint. ONE webhook URL is shared by every event; the payload itself carries an <!here> mention so the same payload works whether the webhook is bound to a one-person private DM channel or a shared team channel.",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Endpoint-level toggle. When false, no Slack POST fires regardless of the master switch or per-event toggles. Default: false."
+            },
+            "webhook_url": {
+              "type": ["string", "null"],
+              "description": "Slack incoming webhook URL (https://hooks.slack.com/...). null disables Slack notifications. Env override: DEVBENCH_NOTIFICATIONS_SLACK_WEBHOOK_URL."
+            }
           }
         }
       }

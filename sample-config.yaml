@@ -400,19 +400,19 @@ validate:
 #       jitter: 0.2             # Fractional jitter (+/- 20% of interval)
 
 # ---------------------------------------------------------------------------
-# Operator-facing Slack / webhook notifications (PR #202).
+# Operator-facing notifications (PR #202).
 # ---------------------------------------------------------------------------
-# Per-event toggles for lifecycle pings.  Webhook URLs are credentials --
-# the recommended pattern is to leave them ``null`` here and provide them
-# via env vars (`DEVBENCH_NOTIFICATIONS_SLACK_WEBHOOK_URL`,
-# `DEVBENCH_NOTIFICATIONS_SLACK_USER_ID`) so they never get committed.
-# See docs/slack-notifications.md for the full operator walkthrough.
+# Per-event toggles for lifecycle pings.  Each notification endpoint
+# (Slack today; Discord / Teams / etc. later) lives in its own nested
+# sub-block under notifications:.  Webhook URLs are credentials -- the
+# recommended pattern is to leave them ``null`` here and provide them
+# via env vars (`DEVBENCH_NOTIFICATIONS_SLACK_WEBHOOK_URL`) so they
+# never get committed.  Every Slack payload carries a `<!here>` mention
+# so the same message works whether the webhook is bound to a one-person
+# private DM channel or a shared team channel.  See
+# docs/slack-notifications.md for the full operator walkthrough.
 # notifications:
 #   enabled: false                         # master switch; flip to true to opt in
-#   slack:
-#     webhook_url: null                    # https://hooks.slack.com/services/T.../B.../...
-#     user_id: null                        # Slack member id (U... or W...); enables <@mention>
-#   webhook_url: null                      # optional non-Slack generic webhook (raw JSON POST)
 #   timeout_seconds: 10                    # per-POST HTTP timeout
 #   events:
 #     work_unit_done: false                # task transitions to done
@@ -426,6 +426,9 @@ validate:
 #     orchestrator_auto_restart: false     # exit 42 -> Makefile loop restarting
 #     quota_pause: false                   # quota signal detected; sleeping until reset
 #     quota_resume: false                  # recovery probe succeeded; resuming
+#   slack:
+#     enabled: false                       # endpoint-level toggle; flip to true to enable Slack POSTs
+#     webhook_url: null                    # https://hooks.slack.com/services/T.../B.../... (or via env)
 
 # ---------------------------------------------------------------------------
 # Diagnostic-tuning knobs (set only when investigating a specific cadence

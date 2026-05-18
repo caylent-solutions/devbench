@@ -40,21 +40,21 @@ backlog/
 Only task files (`*-T[n].md`) are implemented by agents. Epic, feature, and story files track
 rollup status only.
 
-### Workspace layout (what `JUDGE_WORKSPACE_ROOT` points at)
+### Workspace layout (what `DEVBENCH_WORKSPACE_ROOT` points at)
 
-`JUDGE_WORKSPACE_ROOT` is the **parent directory** that contains `backlog/`, `BACKLOG.md`, and the target repos as siblings. The loader (`src/devbench/config.py`) resolves:
+`DEVBENCH_WORKSPACE_ROOT` is the **parent directory** that contains `backlog/`, `BACKLOG.md`, and the target repos as siblings. The loader (`src/devbench/config.py`) resolves:
 
-- `<JUDGE_WORKSPACE_ROOT>/BACKLOG.md` -- the master index (mandatory at this exact path).
-- `<JUDGE_WORKSPACE_ROOT>/backlog/config/devbench.yaml` -- the per-workspace config (mandatory).
-- `<JUDGE_WORKSPACE_ROOT>/backlog/<epic>/<feature>/<story>/*.md` -- work-unit specs.
-- `<JUDGE_WORKSPACE_ROOT>/<repo-name>/` -- each target repo, as a sibling of `backlog/`.
+- `<DEVBENCH_WORKSPACE_ROOT>/BACKLOG.md` -- the master index (mandatory at this exact path).
+- `<DEVBENCH_WORKSPACE_ROOT>/backlog/config/devbench.yaml` -- the per-workspace config (mandatory).
+- `<DEVBENCH_WORKSPACE_ROOT>/backlog/<epic>/<feature>/<story>/*.md` -- work-unit specs.
+- `<DEVBENCH_WORKSPACE_ROOT>/<repo-name>/` -- each target repo, as a sibling of `backlog/`.
 
-So `JUDGE_WORKSPACE_ROOT` is **not** the backlog repo itself; it is the *parent* directory you place the backlog inside. Pointing it at the backlog repo (so `BACKLOG.md` ends up at `<backlog-repo>/BACKLOG.md` instead of `<workspace>/BACKLOG.md`) produces a chain of `FileNotFoundError` and orphan-detection failures that all trace back to this misalignment.
+So `DEVBENCH_WORKSPACE_ROOT` is **not** the backlog repo itself; it is the *parent* directory you place the backlog inside. Pointing it at the backlog repo (so `BACKLOG.md` ends up at `<backlog-repo>/BACKLOG.md` instead of `<workspace>/BACKLOG.md`) produces a chain of `FileNotFoundError` and orphan-detection failures that all trace back to this misalignment.
 
 The recommended layout (used by every backlog in `caylent-telemetry-spec/`):
 
 ```
-<JUDGE_WORKSPACE_ROOT>/
+<DEVBENCH_WORKSPACE_ROOT>/
 ├── BACKLOG.md                       ← master index
 ├── backlog/
 │   ├── config/devbench.yaml         ← per-workspace config
@@ -70,14 +70,14 @@ The recommended layout (used by every backlog in `caylent-telemetry-spec/`):
 repos:
   org/my-repo:
     default_branch: main
-    checkout_directory: my-repo      # relative to JUDGE_WORKSPACE_ROOT
+    checkout_directory: my-repo      # relative to DEVBENCH_WORKSPACE_ROOT
 ```
 
 The loader populates `RepoConfig.resolved_checkout_path` (E213) at config-load time so every consumer reads `<workspace>/<checkout_directory>` from the dataclass field instead of re-resolving the path inline.
 
 #### Keeping the backlog in its own git repo
 
-The backlog directory (`backlog/` + `BACKLOG.md`) is typically committed to its own git repo so backlog progress (status changes, TDD logs, judge comments) lands separately from target-repo history. Init the backlog repo at `<JUDGE_WORKSPACE_ROOT>/.git` and add the target-repo sibling directories to `<JUDGE_WORKSPACE_ROOT>/.gitignore` so they don't pollute the backlog history.
+The backlog directory (`backlog/` + `BACKLOG.md`) is typically committed to its own git repo so backlog progress (status changes, TDD logs, judge comments) lands separately from target-repo history. Init the backlog repo at `<DEVBENCH_WORKSPACE_ROOT>/.git` and add the target-repo sibling directories to `<DEVBENCH_WORKSPACE_ROOT>/.gitignore` so they don't pollute the backlog history.
 
 #### Symlinks (optional, for repos outside the workspace)
 
@@ -86,7 +86,7 @@ The choice between a real directory and a symlink at `<workspace>/<repo-name>` i
 When a target repo cannot live as a workspace sibling (a shared workspace under `/workspaces/<workspace>/` with target repos cloned elsewhere on disk), symlink it into place:
 
 ```bash
-ln -s /real/path/to/my-repo $JUDGE_WORKSPACE_ROOT/my-repo
+ln -s /real/path/to/my-repo $DEVBENCH_WORKSPACE_ROOT/my-repo
 ```
 
 The symlink goes at the sibling path (`<workspace>/my-repo`), NOT inside `backlog/` (`<workspace>/backlog/my-repo`). The loader walks the workspace from `<workspace>/<checkout_directory>`; a symlink at that path is transparent. Putting the symlink under `backlog/` makes `_check_orphans` flag it as an orphaned work-unit file.
@@ -99,7 +99,7 @@ Symlinked checkouts are first-class supported across every devbench engine path,
 
 Validation of `backlog/config/devbench.yaml` happens at config load time (before the orchestrator starts), separate from work-unit validation. Notable rules:
 
-- `checkout_directory` must be **relative** to `JUDGE_WORKSPACE_ROOT`. Absolute paths and `..` traversal are rejected -- the loader raises `ValueError` immediately.
+- `checkout_directory` must be **relative** to `DEVBENCH_WORKSPACE_ROOT`. Absolute paths and `..` traversal are rejected -- the loader raises `ValueError` immediately.
 - `git_ops.defer_pr: true` requires `git_ops.single_branch` to be set. Misconfigured combinations raise `ValueError`.
 - `git_ops.local_only: true` requires `git_ops.defer_pr: true` (a local-only repo has no remote to push to, so PR creation is meaningless).
 - `git_ops.local_only: true` is incompatible with `git_ops.pause_before_merge: true` (there is no PR to pause before merging).
@@ -273,7 +273,7 @@ Below the Status Summary, one row per work unit:
 > cell count) is rejected by `validate-backlog` as a Rule-0 error and causes
 > `devbench report` to exit non-zero with a parse-error diagnostic.
 
-The `File Path` column must be a path relative to `JUDGE_WORKSPACE_ROOT`. `validate-backlog` verifies each file exists at that path.
+The `File Path` column must be a path relative to `DEVBENCH_WORKSPACE_ROOT`. `validate-backlog` verifies each file exists at that path.
 
 ---
 

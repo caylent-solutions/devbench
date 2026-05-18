@@ -35,7 +35,7 @@ Each AC line below is the verbatim text the Task author should paste into the `#
 | AC-FINAL-006 | `pytest tests/integration -v` exits zero (full integration suite green). | `Python`, `Mixed` (Python subset) |
 | AC-FINAL-007 | `pytest tests/functional -v` exits zero (full functional suite green). | `Python`, `Mixed` (Python subset) |
 | AC-FINAL-008 | `bandit -r src -ll` exits zero. | `Python`, `Mixed` (Python subset) |
-| AC-FINAL-009 | `JUDGE_CLAUDE_MODEL=<model> JUDGE_WORKSPACE_ROOT=<workspace> uv run --project <devbench> devbench validate-backlog` exits zero. | All tiers |
+| AC-FINAL-009 | `DEVBENCH_CLAUDE_MODEL=<model> DEVBENCH_WORKSPACE_ROOT=<workspace> uv run --project <devbench> devbench validate-backlog` exits zero. | All tiers |
 | AC-FINAL-010 | The code under test is functionally verified end-to-end (the AC-CYCLE-* evidence above). | All tiers |
 | AC-FINAL-011 | No bypass annotations: no `# noqa`, `# nosec`, `# type: ignore`, `@SuppressWarnings`, `# pragma: no cover`, `--no-verify`, no raised lint thresholds, no added exclusions to linter configs. | All tiers |
 | AC-FINAL-012 | No em-dash characters (U+2014) introduced anywhere. | All tiers |
@@ -66,7 +66,7 @@ A Task whose Changes Manifest contains only `infra/terragrunt/.../terragrunt.hcl
 - [ ] AC-FINAL-006 `pytest tests/integration -v` exits zero (full integration suite green) -- N/A for HCL Tasks (no Python source authored)
 - [ ] AC-FINAL-007 `pytest tests/functional -v` exits zero (full functional suite green) -- N/A for HCL Tasks (no Python source authored)
 - [ ] AC-FINAL-008 `bandit -r src -ll` exits zero -- N/A for HCL Tasks (no Python source authored)
-- [ ] AC-FINAL-009 `JUDGE_CLAUDE_MODEL=... JUDGE_WORKSPACE_ROOT=... uv run --project ... devbench validate-backlog` exits zero.
+- [ ] AC-FINAL-009 `DEVBENCH_CLAUDE_MODEL=... DEVBENCH_WORKSPACE_ROOT=... uv run --project ... devbench validate-backlog` exits zero.
 - [ ] AC-FINAL-010 The code under test is functionally verified end-to-end (the AC-CYCLE-* evidence above).
 - [ ] AC-FINAL-011 No bypass annotations: no `# noqa`, `# nosec`, `# type: ignore`, `@SuppressWarnings`, `# pragma: no cover`, `--no-verify`, no raised lint thresholds, no added exclusions to linter configs.
 - [ ] AC-FINAL-012 No em-dash characters (U+2014) introduced anywhere.

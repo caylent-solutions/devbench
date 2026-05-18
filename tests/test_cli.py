@@ -21175,3 +21175,84 @@ class TestCmdMigrateEnv:
             assert captured.err != "", "stderr must contain an actionable error message on write failure"
         finally:
             read_only_dir.chmod(0o755)
+
+
+@pytest.mark.unit
+class TestMigrateEnvBootstrapBypass:
+    """AC-197-7 regression: cmd_migrate_env does not raise even when JUDGE_* vars are set.
+
+    The CLI entry-point sets DEVBENCH_BOOTSTRAP=1 before config.py is imported;
+    _read_env_strict no-ops when that flag is present. This class pins the contract
+    from the cmd_migrate_env CLI side: calling cmd_migrate_env with DEVBENCH_BOOTSTRAP=1
+    and a JUDGE_* var present in the real environment succeeds without raising RuntimeError.
+    """
+
+    def test_cmd_migrate_env_dry_run_succeeds_with_bootstrap_and_judge_var(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """AC-197-7: cmd_migrate_env("--dry-run") succeeds when DEVBENCH_BOOTSTRAP=1 + JUDGE_* var in real env.
+
+        Sets DEVBENCH_BOOTSTRAP=1 and a synthetic JUDGE_* var in the real os.environ via
+        monkeypatch (no manual try/finally), then calls cmd_migrate_env at the CLI level.
+        Verifies the command returns 0 (not raises) and the dry-run output names the legacy var.
+        """
+        from devbench.config import _read_env_strict
+
+        test_legacy = "JUDGE_BYPASS_REGRESSION_VAR"
+        monkeypatch.setenv("DEVBENCH_BOOTSTRAP", "1")
+        monkeypatch.setenv(test_legacy, "legacy-value")
+
+        rc = cli.cmd_migrate_env("--dry-run")
+
+        assert rc == 0, "cmd_migrate_env must return 0 when DEVBENCH_BOOTSTRAP=1 and a JUDGE_* var is set"
+        captured = capsys.readouterr()
+        assert test_legacy in captured.out, f"dry-run output must list {test_legacy} found in the environment"
+
+        result = _read_env_strict("DEVBENCH_BYPASS_REGRESSION_VAR", test_legacy)
+        assert result is None, (
+            "_read_env_strict must return None (not raise) when DEVBENCH_BOOTSTRAP=1 and only the legacy var is set"
+        )
+
+    def test_read_env_strict_raises_without_bootstrap_when_legacy_var_set(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """AC-197-7 negative: _read_env_strict raises when DEVBENCH_BOOTSTRAP is absent + legacy var is set.
+
+        Validates that the bootstrap bypass is doing real work: without it, the same
+        condition (legacy var present, new var absent) raises RuntimeError.
+        """
+        from devbench.config import _read_env_strict
+
+        test_legacy = "JUDGE_NEGATIVE_REGRESSION_VAR"
+        monkeypatch.delenv("DEVBENCH_BOOTSTRAP", raising=False)
+        monkeypatch.setenv(test_legacy, "legacy-value")
+
+        with pytest.raises(RuntimeError, match=test_legacy):
+            _read_env_strict("DEVBENCH_NEGATIVE_REGRESSION_VAR", test_legacy)
+
+    @pytest.mark.parametrize(
+        "judge_var",
+        [
+            "JUDGE_WORKSPACE_ROOT",
+            "JUDGE_CLAUDE_MODEL",
+            "JUDGE_GH_TOKEN_FILE",
+        ],
+    )
+    def test_cmd_migrate_env_dry_run_with_known_judge_vars_when_bootstrap_set(
+        self,
+        judge_var: str,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """AC-197-7: cmd_migrate_env("--dry-run") succeeds for known JUDGE_* names when bootstrap is set."""
+        monkeypatch.setenv("DEVBENCH_BOOTSTRAP", "1")
+        monkeypatch.setenv(judge_var, "test-legacy-value")
+
+        rc = cli.cmd_migrate_env("--dry-run")
+
+        assert rc == 0, f"cmd_migrate_env must return 0 when DEVBENCH_BOOTSTRAP=1 and {judge_var} is set"
+        captured = capsys.readouterr()
+        assert judge_var in captured.out, f"dry-run output must list {judge_var} found in the environment"

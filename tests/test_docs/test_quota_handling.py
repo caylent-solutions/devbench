@@ -78,8 +78,7 @@ class TestQuotaHandlingDocExists:
         lower = text.lower()
         has_toc = "table of contents" in lower or "## contents" in lower
         assert has_toc, (
-            "docs/quota-handling.md must include a Table of contents section "
-            "for navigation (documentation standards)."
+            "docs/quota-handling.md must include a Table of contents section for navigation (documentation standards)."
         )
 
 
@@ -99,12 +98,7 @@ class TestQuotaHandlingRequiredSections:
         """The doc must have a section explaining when quota waits fire."""
         text = _read_doc()
         lower = text.lower()
-        has_when = (
-            "when quota" in lower
-            or "## when" in lower
-            or "quota waits fire" in lower
-            or "rate limit" in lower
-        )
+        has_when = "when quota" in lower or "## when" in lower or "quota waits fire" in lower or "rate limit" in lower
         assert has_when, (
             "docs/quota-handling.md must have a section explaining when quota waits fire "
             "(HTTP 429, HTTP 402, Bedrock throttle) and which Anthropic plans are affected."
@@ -125,10 +119,7 @@ class TestQuotaHandlingRequiredSections:
         text = _read_doc()
         lower = text.lower()
         has_samples = (
-            "sample config" in lower
-            or "example config" in lower
-            or "## sample" in lower
-            or "## example" in lower
+            "sample config" in lower or "example config" in lower or "## sample" in lower or "## example" in lower
         )
         assert has_samples, (
             "docs/quota-handling.md must have a sample configurations section "
@@ -139,11 +130,7 @@ class TestQuotaHandlingRequiredSections:
         """The doc must have a section explaining what happens when max_wait_seconds is exceeded."""
         text = _read_doc()
         lower = text.lower()
-        has_timeout = (
-            "max_wait" in lower
-            or "on_exhaustion_timeout" in lower
-            or "timeout" in lower
-        )
+        has_timeout = "max_wait" in lower or "on_exhaustion_timeout" in lower or "timeout" in lower
         assert has_timeout, (
             "docs/quota-handling.md must have a section on max_wait_seconds exceeded / "
             "on_exhaustion_timeout behavior (spec section 4.5.6, AC-193-12)."
@@ -203,23 +190,15 @@ class TestQuotaHandlingAc193ConfigCoverage:
         text = _read_doc()
         lower = text.lower()
         has_max = "max" in lower
-        assert has_max, (
-            "docs/quota-handling.md must cover the Claude Max plan scenario."
-        )
+        assert has_max, "docs/quota-handling.md must cover the Claude Max plan scenario."
 
     def test_api_key_covered(self) -> None:
         """Sample configs must include an API-key / SDK-credit-exhausted scenario."""
         text = _read_doc()
         lower = text.lower()
-        has_api = (
-            "api key" in lower
-            or "api_key" in lower
-            or "sdk_credit" in lower
-            or "api billing" in lower
-        )
+        has_api = "api key" in lower or "api_key" in lower or "sdk_credit" in lower or "api billing" in lower
         assert has_api, (
-            "docs/quota-handling.md must cover the API-key / SDK-credit-exhausted scenario "
-            "with a sample yaml config."
+            "docs/quota-handling.md must cover the API-key / SDK-credit-exhausted scenario with a sample yaml config."
         )
 
     def test_bedrock_covered(self) -> None:
@@ -228,8 +207,7 @@ class TestQuotaHandlingAc193ConfigCoverage:
         lower = text.lower()
         has_bedrock = "bedrock" in lower
         assert has_bedrock, (
-            "docs/quota-handling.md must cover the AWS Bedrock throttle scenario "
-            "with a sample yaml config."
+            "docs/quota-handling.md must cover the AWS Bedrock throttle scenario with a sample yaml config."
         )
 
 
@@ -379,8 +357,7 @@ class TestQuotaHandlingCrossReferences:
         """The referenced docs/llm-authentication.md must exist on disk."""
         llm_auth = REPO_ROOT / "docs" / "llm-authentication.md"
         assert llm_auth.is_file(), (
-            "docs/llm-authentication.md is cross-referenced from quota-handling.md "
-            "but does not exist on disk."
+            "docs/llm-authentication.md is cross-referenced from quota-handling.md but does not exist on disk."
         )
 
     def test_cli_reference_cross_reference_present(self) -> None:
@@ -415,16 +392,14 @@ class TestQuotaHandlingConfigSchema:
         """The doc must describe the poll_interval_seconds field."""
         text = _read_doc()
         assert "poll_interval_seconds" in text, (
-            "docs/quota-handling.md must describe the 'poll_interval_seconds' config field "
-            "(spec section 4.5.6)."
+            "docs/quota-handling.md must describe the 'poll_interval_seconds' config field (spec section 4.5.6)."
         )
 
     def test_max_wait_seconds_described(self) -> None:
         """The doc must describe the max_wait_seconds field."""
         text = _read_doc()
         assert "max_wait_seconds" in text, (
-            "docs/quota-handling.md must describe the 'max_wait_seconds' config field "
-            "(AC-193-12 / spec section 4.5.6)."
+            "docs/quota-handling.md must describe the 'max_wait_seconds' config field (AC-193-12 / spec section 4.5.6)."
         )
 
     def test_on_exhaustion_timeout_described(self) -> None:
@@ -469,8 +444,7 @@ class TestQuotaHandlingQuotaWatcherCommand:
         text = _read_doc()
         has_watcher = "quota-watcher" in text
         assert has_watcher, (
-            "docs/quota-handling.md must show the 'devbench quota-watcher' command "
-            "(spec section 4.5.3)."
+            "docs/quota-handling.md must show the 'devbench quota-watcher' command (spec section 4.5.3)."
         )
 
     def test_daemon_flag_shown(self) -> None:
@@ -514,10 +488,7 @@ class TestQuotaHandlingMultiSessionAwareness:
         """The doc must describe per-session quota_pause.json paths (AC-193-16)."""
         text = _read_doc()
         lower = text.lower()
-        has_per_session = (
-            "per-session" in lower
-            or "session" in lower
-        )
+        has_per_session = "per-session" in lower or "session" in lower
         assert has_per_session, (
             "docs/quota-handling.md must describe per-session quota_pause.json "
             "as each session has its own pause file (AC-193-16 / spec 4.5.3)."

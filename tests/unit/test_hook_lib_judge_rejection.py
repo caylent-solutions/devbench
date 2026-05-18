@@ -47,8 +47,7 @@ class TestJudgeWorkspaceRootRejection:
         env["JUDGE_WORKSPACE_ROOT"] = "/some/path"
         result = _source_hook_lib(env)
         assert result.returncode != 0, (
-            "Expected non-zero exit when JUDGE_WORKSPACE_ROOT is set, "
-            f"got returncode={result.returncode}"
+            f"Expected non-zero exit when JUDGE_WORKSPACE_ROOT is set, got returncode={result.returncode}"
         )
 
     def test_judge_workspace_root_only_prints_e197_code(self) -> None:
@@ -56,9 +55,7 @@ class TestJudgeWorkspaceRootRejection:
         env = _minimal_clean_env()
         env["JUDGE_WORKSPACE_ROOT"] = "/some/path"
         result = _source_hook_lib(env)
-        assert "[E197]" in result.stderr, (
-            f"Expected '[E197]' in stderr, got: {result.stderr!r}"
-        )
+        assert "[E197]" in result.stderr, f"Expected '[E197]' in stderr, got: {result.stderr!r}"
 
     def test_judge_workspace_root_only_names_legacy_var(self) -> None:
         """The error message names JUDGE_WORKSPACE_ROOT as the rejected var."""
@@ -100,8 +97,7 @@ class TestJudgeLogFileRejection:
         env["JUDGE_LOG_FILE"] = "/some/log.jsonl"
         result = _source_hook_lib(env)
         assert result.returncode != 0, (
-            "Expected non-zero exit when JUDGE_LOG_FILE is set, "
-            f"got returncode={result.returncode}"
+            f"Expected non-zero exit when JUDGE_LOG_FILE is set, got returncode={result.returncode}"
         )
 
     def test_judge_log_file_only_prints_e197_code(self) -> None:
@@ -109,18 +105,14 @@ class TestJudgeLogFileRejection:
         env = _minimal_clean_env()
         env["JUDGE_LOG_FILE"] = "/some/log.jsonl"
         result = _source_hook_lib(env)
-        assert "[E197]" in result.stderr, (
-            f"Expected '[E197]' in stderr, got: {result.stderr!r}"
-        )
+        assert "[E197]" in result.stderr, f"Expected '[E197]' in stderr, got: {result.stderr!r}"
 
     def test_judge_log_file_only_names_legacy_var(self) -> None:
         """The error message names JUDGE_LOG_FILE as the rejected var."""
         env = _minimal_clean_env()
         env["JUDGE_LOG_FILE"] = "/some/log.jsonl"
         result = _source_hook_lib(env)
-        assert "JUDGE_LOG_FILE" in result.stderr, (
-            f"Expected 'JUDGE_LOG_FILE' in stderr, got: {result.stderr!r}"
-        )
+        assert "JUDGE_LOG_FILE" in result.stderr, f"Expected 'JUDGE_LOG_FILE' in stderr, got: {result.stderr!r}"
 
     def test_judge_log_file_only_instructs_migrate_env(self) -> None:
         """The error message tells the operator to run 'devbench migrate-env'."""
@@ -172,8 +164,7 @@ class TestHappyPath:
         env = _minimal_clean_env()
         result = _source_hook_lib(env)
         assert result.returncode == 0, (
-            f"Expected exit 0 with no legacy vars, got returncode={result.returncode}. "
-            f"stderr={result.stderr!r}"
+            f"Expected exit 0 with no legacy vars, got returncode={result.returncode}. stderr={result.stderr!r}"
         )
 
     def test_devbench_workspace_root_only_exits_zero(self) -> None:
@@ -223,16 +214,12 @@ def test_any_legacy_var_triggers_rejection(legacy_var: str, legacy_value: str) -
     env[legacy_var] = legacy_value
     result = _source_hook_lib(env)
     assert result.returncode != 0, (
-        f"Expected non-zero exit for {legacy_var}={legacy_value!r}, "
-        f"got returncode={result.returncode}"
+        f"Expected non-zero exit for {legacy_var}={legacy_value!r}, got returncode={result.returncode}"
     )
     assert "[E197]" in result.stderr, (
-        f"Expected '[E197]' in stderr for {legacy_var}={legacy_value!r}, "
-        f"got stderr={result.stderr!r}"
+        f"Expected '[E197]' in stderr for {legacy_var}={legacy_value!r}, got stderr={result.stderr!r}"
     )
-    assert legacy_var in result.stderr, (
-        f"Expected legacy var name '{legacy_var}' in stderr, got: {result.stderr!r}"
-    )
+    assert legacy_var in result.stderr, f"Expected legacy var name '{legacy_var}' in stderr, got: {result.stderr!r}"
     assert "devbench migrate-env" in result.stderr, (
         f"Expected 'devbench migrate-env' in stderr for {legacy_var}, got: {result.stderr!r}"
     )
@@ -251,9 +238,7 @@ def test_legacy_presence_overrides_new_name_still_rejects(legacy_var: str, devbe
     env[legacy_var] = "/legacy"
     env[devbench_var] = "/new"
     result = _source_hook_lib(env)
-    assert result.returncode != 0, (
-        f"Expected non-zero exit when both {legacy_var} and {devbench_var} are set"
-    )
+    assert result.returncode != 0, f"Expected non-zero exit when both {legacy_var} and {devbench_var} are set"
     assert "[E197]" in result.stderr
 
 
@@ -261,6 +246,4 @@ def test_no_legacy_var_present_no_error_message() -> None:
     """When no legacy vars are set, no [E197] message appears in stderr."""
     env = _minimal_clean_env()
     result = _source_hook_lib(env)
-    assert "[E197]" not in result.stderr, (
-        f"Unexpected [E197] in stderr when no legacy vars present: {result.stderr!r}"
-    )
+    assert "[E197]" not in result.stderr, f"Unexpected [E197] in stderr when no legacy vars present: {result.stderr!r}"

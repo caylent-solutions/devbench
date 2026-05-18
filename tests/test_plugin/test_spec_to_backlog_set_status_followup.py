@@ -17,14 +17,7 @@ from pathlib import Path
 
 import pytest
 
-SKILL_PATH = (
-    Path(__file__).parent.parent.parent
-    / "plugin"
-    / "devbench"
-    / "skills"
-    / "spec-to-backlog"
-    / "SKILL.md"
-)
+SKILL_PATH = Path(__file__).parent.parent.parent / "plugin" / "devbench" / "skills" / "spec-to-backlog" / "SKILL.md"
 
 
 def _read_skill() -> str:
@@ -51,8 +44,7 @@ class TestSetStatusFollowUpPresent:
         """SKILL.md must contain Step 8 (success message / quality-reference step)."""
         content = _read_skill()
         assert "## Step 8" in content, (
-            "spec-to-backlog/SKILL.md must contain '## Step 8' "
-            "(the success message / quality-reference step)"
+            "spec-to-backlog/SKILL.md must contain '## Step 8' (the success message / quality-reference step)"
         )
 
     def test_set_status_command_in_step8(self) -> None:
@@ -90,7 +82,7 @@ class TestSetStatusFollowUpPresent:
         has_epic_selector = re.search(r'--include\s+["\']?E\d', section) is not None
         assert has_epic_selector, (
             "spec-to-backlog/SKILL.md Step 8 success message must demonstrate "
-            "an epic-scoped --include selector (e.g. --include \"E1\") in the "
+            'an epic-scoped --include selector (e.g. --include "E1") in the '
             "devbench set-status follow-up example (AC-194-1, spec section 4.7.4)."
         )
 

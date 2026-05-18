@@ -20606,7 +20606,7 @@ def _make_quota_checkpoint_file(session_dir: Path, reset_at: datetime | None = N
     devbench_dir = session_dir / ".devbench"
     devbench_dir.mkdir(parents=True, exist_ok=True)
     target = devbench_dir / "quota_pause.json"
-    payload = {
+    payload: dict[str, object] = {
         "paused_at": "2030-01-01T00:00:00+00:00",
         "reset_at": reset_at.isoformat() if reset_at else None,
         "reason": "subscription_rate_limit",

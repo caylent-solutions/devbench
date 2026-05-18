@@ -47,11 +47,6 @@ class TestSessionsSectionExists:
     def test_named_sessions_section_heading_present(self) -> None:
         """The doc must have a section dedicated to named sessions."""
         text = _read_doc()
-        has_section = (
-            "## Named sessions" in text
-            or "named sessions" in text.lower()
-            and "### `sessions`" in text
-        )
         assert "### `sessions`" in text, (
             "docs/cli-reference.md must contain a '### `sessions`' section documenting "
             "the devbench sessions subcommand (spec section 4.4.5, AC-192-10)."
@@ -80,16 +75,13 @@ class TestSessionsListsActiveSessions:
         assert section, "### `sessions` section must exist"
         lower = section.lower()
         assert "name" in lower, (
-            "docs/cli-reference.md '### `sessions`' must mention that 'name' is shown "
-            "in session listings (AC-192-10)."
+            "docs/cli-reference.md '### `sessions`' must mention that 'name' is shown in session listings (AC-192-10)."
         )
         assert "pid" in lower, (
-            "docs/cli-reference.md '### `sessions`' must mention that 'PID' is shown "
-            "in session listings (AC-192-10)."
+            "docs/cli-reference.md '### `sessions`' must mention that 'PID' is shown in session listings (AC-192-10)."
         )
         assert "scope" in lower, (
-            "docs/cli-reference.md '### `sessions`' must mention that 'scope' is shown "
-            "in session listings (AC-192-10)."
+            "docs/cli-reference.md '### `sessions`' must mention that 'scope' is shown in session listings (AC-192-10)."
         )
         assert "started_at" in lower or "started at" in lower, (
             "docs/cli-reference.md '### `sessions`' must mention that 'started_at' is shown "
@@ -274,8 +266,7 @@ class TestStartAllowOverlapFlag:
         section = _extract_section(text, "### `start`")
         assert section, "### `start` section must exist"
         assert "--allow-overlap" in section, (
-            "docs/cli-reference.md '### `start`' must document the '--allow-overlap' "
-            "flag (spec section 4.4.3)."
+            "docs/cli-reference.md '### `start`' must document the '--allow-overlap' flag (spec section 4.4.3)."
         )
 
     def test_overlap_detection_fail_fast_documented(self) -> None:
@@ -284,9 +275,7 @@ class TestStartAllowOverlapFlag:
         section = _extract_section(text, "### `start`")
         assert section, "### `start` section must exist"
         lower = section.lower()
-        has_fail_fast = (
-            "fail" in lower and "overlap" in lower
-        ) or (
+        has_fail_fast = ("fail" in lower and "overlap" in lower) or (
             "overlap" in lower and ("error" in lower or "exit" in lower or "abort" in lower or "reject" in lower)
         )
         assert has_fail_fast, (
@@ -392,10 +381,7 @@ class TestWuClaimedAuditExtension:
     def test_wu_claimed_session_suffix_documented(self) -> None:
         """The doc must mention the session=<name> suffix on [WU_CLAIMED] audits."""
         text = _read_doc()
-        has_audit_doc = (
-            "[WU_CLAIMED]" in text
-            and "session=" in text
-        )
+        has_audit_doc = "[WU_CLAIMED]" in text and "session=" in text
         assert has_audit_doc, (
             "docs/cli-reference.md must document the '[WU_CLAIMED] ... session=<name>' "
             "audit format extension applied when DEVBENCH_SESSION_NAME is set "
@@ -406,9 +392,8 @@ class TestWuClaimedAuditExtension:
         """The doc must state that without DEVBENCH_SESSION_NAME the format is unchanged."""
         text = _read_doc()
         lower = text.lower()
-        has_legacy_note = (
-            "devbench_session_name" in lower
-            and ("unset" in lower or "single-session" in lower or "unchanged" in lower or "omitted" in lower)
+        has_legacy_note = "devbench_session_name" in lower and (
+            "unset" in lower or "single-session" in lower or "unchanged" in lower or "omitted" in lower
         )
         assert has_legacy_note, (
             "docs/cli-reference.md must document that when DEVBENCH_SESSION_NAME is "

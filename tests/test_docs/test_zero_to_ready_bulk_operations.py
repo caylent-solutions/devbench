@@ -49,8 +49,7 @@ class TestBulkOperationsSectionExists:
         """The doc must contain the 'Bulk operations on the backlog' heading."""
         text = _read_doc()
         assert _SECTION_HEADING in text, (
-            "docs/zero-to-ready.md must contain the section heading "
-            f"'{_SECTION_HEADING}' (AC-194-1)."
+            f"docs/zero-to-ready.md must contain the section heading '{_SECTION_HEADING}' (AC-194-1)."
         )
 
     def test_section_appears_in_toc(self) -> None:
@@ -132,14 +131,9 @@ class TestBulkOperationsWorkflow:
         """The section must convey the workflow sequence: inspect drafts then launch."""
         section = self._section()
         lower = section.lower()
-        has_review_step = (
-            "review" in lower or "inspect" in lower or "draft" in lower
-        )
+        has_review_step = "review" in lower or "inspect" in lower or "draft" in lower
         has_launch_step = (
-            "make start" in lower
-            or "devbench start" in lower
-            or "orchestrat" in lower
-            or "launch" in lower
+            "make start" in lower or "devbench start" in lower or "orchestrat" in lower or "launch" in lower
         )
         assert has_review_step, (
             "The 'Bulk operations on the backlog' section must describe the step "
@@ -232,10 +226,7 @@ class TestBulkOperationsTocEntry:
         # ToC entries are typically formatted as '- [Section Title](#anchor)'
         # The anchor for 'Bulk operations on the backlog' would be
         # '#bulk-operations-on-the-backlog'.
-        has_toc_anchor = (
-            "#bulk-operations-on-the-backlog" in text
-            or "Bulk operations on the backlog" in text
-        )
+        has_toc_anchor = "#bulk-operations-on-the-backlog" in text or "Bulk operations on the backlog" in text
         assert has_toc_anchor, (
             "docs/zero-to-ready.md table of contents must include "
             "'Bulk operations on the backlog' with a section anchor link (AC-194-1)."

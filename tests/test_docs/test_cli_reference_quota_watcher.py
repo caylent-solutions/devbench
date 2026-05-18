@@ -97,10 +97,7 @@ class TestQuotaWatcherDaemonFlag:
         assert section, "### `quota-watcher` section must exist"
         lower = section.lower()
         has_long_running = (
-            "long-running" in lower
-            or "long running" in lower
-            or "continuous" in lower
-            or "daemon" in lower
+            "long-running" in lower or "long running" in lower or "continuous" in lower or "daemon" in lower
         )
         assert has_long_running, (
             "docs/cli-reference.md '### `quota-watcher`' section must describe --daemon "
@@ -163,10 +160,7 @@ class TestQuotaWatcherCheckpointFile:
         section = _extract_section(text, "### `quota-watcher`")
         assert section, "### `quota-watcher` section must exist"
         lower = section.lower()
-        has_session_path = (
-            "session" in lower
-            or ".devbench/sessions" in section
-        )
+        has_session_path = "session" in lower or ".devbench/sessions" in section
         assert has_session_path, (
             "docs/cli-reference.md '### `quota-watcher`' section must mention per-session "
             "quota_pause.json paths under .devbench/sessions/<name>/ (AC-193-16)."
@@ -201,12 +195,7 @@ class TestQuotaWatcherInteractiveMode:
         section = _extract_section(text, "### `quota-watcher`")
         assert section, "### `quota-watcher` section must exist"
         lower = section.lower()
-        has_interactive = (
-            "interactive" in lower
-            or "claude" in lower
-            or "resume" in lower
-            or "re-prompt" in lower
-        )
+        has_interactive = "interactive" in lower or "claude" in lower or "resume" in lower or "re-prompt" in lower
         assert has_interactive, (
             "docs/cli-reference.md '### `quota-watcher`' section must describe "
             "re-prompting interactive Claude Code sessions on quota recovery "

@@ -37,8 +37,7 @@ class TestSetStatusRangeSyntaxDocumented:
         """The --include flag must appear in the set-status section."""
         section = _section_text()
         assert "--include" in section, (
-            "docs/cli-reference.md 'set-status' section must document the "
-            "--include flag for bulk updates (AC-194-1)."
+            "docs/cli-reference.md 'set-status' section must document the --include flag for bulk updates (AC-194-1)."
         )
 
     def test_exclude_flag_documented(self) -> None:
@@ -53,8 +52,7 @@ class TestSetStatusRangeSyntaxDocumented:
         """The --dry-run flag must appear in the set-status section."""
         section = _section_text()
         assert "--dry-run" in section, (
-            "docs/cli-reference.md 'set-status' section must document the "
-            "--dry-run flag (AC-194-1)."
+            "docs/cli-reference.md 'set-status' section must document the --dry-run flag (AC-194-1)."
         )
 
     def test_yes_flag_documented(self) -> None:
@@ -68,7 +66,9 @@ class TestSetStatusRangeSyntaxDocumented:
     def test_bulk_range_synopsis_present(self) -> None:
         """The set-status section must show the range-variant synopsis."""
         section = _section_text()
-        assert "--include" in section and "<new_status>" in section or "--include" in section and "new_status" in section, (
+        assert ("--include" in section and "<new_status>" in section) or (
+            "--include" in section and "new_status" in section
+        ), (
             "docs/cli-reference.md 'set-status' section must show the "
             "'set-status --include <tokens> <new_status>' synopsis (AC-194-1)."
         )
@@ -103,8 +103,7 @@ class TestSetStatusRangeSyntaxDocumented:
         """The section must contain no em-dash characters (U+2014)."""
         section = _section_text()
         assert "\u2014" not in section, (
-            "docs/cli-reference.md 'set-status' section must not contain "
-            "em-dash characters (U+2014); use -- instead."
+            "docs/cli-reference.md 'set-status' section must not contain em-dash characters (U+2014); use -- instead."
         )
 
 
@@ -116,7 +115,7 @@ class TestSetStatusWorkedExamples:
         """An example showing 'promote E1' (set all E1 WUs to in-queue) must be present."""
         section = _section_text()
         # Must show --include "E1" with in-queue target or equivalent narrative.
-        assert 'E1' in section and 'in-queue' in section, (
+        assert "E1" in section and "in-queue" in section, (
             "docs/cli-reference.md 'set-status' section must contain a worked example "
             "showing how to promote (set in-queue) all units under epic E1 (AC-194-2)."
         )
@@ -124,7 +123,7 @@ class TestSetStatusWorkedExamples:
     def test_hold_e5_example_present(self) -> None:
         """An example showing 'hold E5' (set all E5 WUs to hold) must be present."""
         section = _section_text()
-        assert 'E5' in section and 'hold' in section, (
+        assert "E5" in section and "hold" in section, (
             "docs/cli-reference.md 'set-status' section must contain a worked example "
             "showing how to hold all units under epic E5 (AC-194-2)."
         )
@@ -133,11 +132,11 @@ class TestSetStatusWorkedExamples:
         """An example showing 'decline E2-F1-S1-T3-T7' must be present."""
         section = _section_text()
         # Must show a range such as T3-T7 or T3:T7 with declined target.
-        assert 'declined' in section or 'decline' in section.lower(), (
+        assert "declined" in section or "decline" in section.lower(), (
             "docs/cli-reference.md 'set-status' section must contain a worked example "
             "showing how to decline a range of tasks (e.g. T3-T7) (AC-194-2)."
         )
-        assert 'T3' in section or 'T3-T7' in section, (
+        assert "T3" in section or "T3-T7" in section, (
             "docs/cli-reference.md 'set-status' section must show the T3-T7 range "
             "example in the decline worked example (AC-194-2)."
         )
@@ -147,8 +146,7 @@ class TestSetStatusWorkedExamples:
         section = _section_text()
         # Find set-status section code block content.
         assert "--dry-run" in section, (
-            "docs/cli-reference.md 'set-status' section must contain a worked "
-            "example using --dry-run (AC-194-2)."
+            "docs/cli-reference.md 'set-status' section must contain a worked example using --dry-run (AC-194-2)."
         )
         # Must also have a code fence demonstrating usage.
         assert "```" in section, (

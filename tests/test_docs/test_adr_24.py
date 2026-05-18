@@ -32,23 +32,18 @@ class TestAdr24QuotaWaitAndResume:
     def test_adr_24_file_exists(self) -> None:
         """The ADR file must exist at the canonical path."""
         assert ADR_24.is_file(), (
-            "docs/adr/24-quota-wait-and-resume.md must exist -- "
-            "spec section 5.2 and E5-F7-S1-T3 mandate this ADR."
+            "docs/adr/24-quota-wait-and-resume.md must exist -- spec section 5.2 and E5-F7-S1-T3 mandate this ADR."
         )
 
     def test_adr_24_has_status_header(self) -> None:
         """ADR-24 must carry an explicit Status line."""
         text = ADR_24.read_text(encoding="utf-8")
-        assert "**Status:**" in text, (
-            "ADR-24 must have a '**Status:**' header line matching the ADR template."
-        )
+        assert "**Status:**" in text, "ADR-24 must have a '**Status:**' header line matching the ADR template."
 
     def test_adr_24_has_date_header(self) -> None:
         """ADR-24 must carry an explicit Date line."""
         text = ADR_24.read_text(encoding="utf-8")
-        assert "**Date:**" in text, (
-            "ADR-24 must have a '**Date:**' header line matching the ADR template."
-        )
+        assert "**Date:**" in text, "ADR-24 must have a '**Date:**' header line matching the ADR template."
 
     def test_adr_24_has_context_section(self) -> None:
         """ADR-24 must include a Context section covering the motivation."""
@@ -62,10 +57,7 @@ class TestAdr24QuotaWaitAndResume:
         text = ADR_24.read_text(encoding="utf-8")
         lower = text.lower()
         has_autonomous = (
-            "autonomous" in lower
-            or "unattended" in lower
-            or "overnight" in lower
-            or "long-running" in lower
+            "autonomous" in lower or "unattended" in lower or "overnight" in lower or "long-running" in lower
         )
         assert has_autonomous, (
             "ADR-24's Context section must address the autonomous-run scenario -- "
@@ -76,19 +68,13 @@ class TestAdr24QuotaWaitAndResume:
     def test_adr_24_has_decision_section(self) -> None:
         """ADR-24 must include a Decision section."""
         text = ADR_24.read_text(encoding="utf-8")
-        assert "## Decision" in text, (
-            "ADR-24 must have a '## Decision' section documenting the chosen design."
-        )
+        assert "## Decision" in text, "ADR-24 must have a '## Decision' section documenting the chosen design."
 
     def test_adr_24_decision_covers_config_driven_wait(self) -> None:
         """The Decision section must describe the config-driven wait/resume mechanism."""
         text = ADR_24.read_text(encoding="utf-8")
         lower = text.lower()
-        has_config_driven = (
-            "config" in lower
-            or "quota_handling" in text
-            or "devbench.yaml" in text
-        )
+        has_config_driven = "config" in lower or "quota_handling" in text or "devbench.yaml" in text
         assert has_config_driven, (
             "ADR-24's Decision section must describe the config-driven wait/resume mechanism "
             "controlled by the quota_handling section in devbench.yaml "
@@ -127,17 +113,13 @@ class TestAdr24QuotaWaitAndResume:
     def test_adr_24_has_alternatives_considered_section(self) -> None:
         """ADR-24 must include an Alternatives considered section."""
         text = ADR_24.read_text(encoding="utf-8")
-        assert "## Alternatives" in text, (
-            "ADR-24 must have an '## Alternatives' section documenting rejected designs."
-        )
+        assert "## Alternatives" in text, "ADR-24 must have an '## Alternatives' section documenting rejected designs."
 
     def test_adr_24_alternatives_covers_operator_driven_retry(self) -> None:
         """Alternatives must include the operator-driven retry approach."""
         text = ADR_24.read_text(encoding="utf-8")
         lower = text.lower()
-        has_operator_retry = (
-            "operator" in lower and ("retry" in lower or "restart" in lower or "manual" in lower)
-        )
+        has_operator_retry = "operator" in lower and ("retry" in lower or "restart" in lower or "manual" in lower)
         assert has_operator_retry, (
             "ADR-24's Alternatives section must discuss operator-driven retry "
             "(the manual restart approach that existed before #193)."
@@ -172,19 +154,14 @@ class TestAdr24QuotaWaitAndResume:
     def test_adr_24_has_consequences_section(self) -> None:
         """ADR-24 must include a Consequences section."""
         text = ADR_24.read_text(encoding="utf-8")
-        assert "## Consequences" in text, (
-            "ADR-24 must have a '## Consequences' section covering operator impact."
-        )
+        assert "## Consequences" in text, "ADR-24 must have a '## Consequences' section covering operator impact."
 
     def test_adr_24_consequences_covers_operator_playbook(self) -> None:
         """The Consequences section must reference the operator playbook."""
         text = ADR_24.read_text(encoding="utf-8")
         lower = text.lower()
         has_playbook = (
-            "playbook" in lower
-            or "quota-handling" in lower
-            or "quota_handling" in lower
-            or "docs/quota" in lower
+            "playbook" in lower or "quota-handling" in lower or "quota_handling" in lower or "docs/quota" in lower
         )
         assert has_playbook, (
             "ADR-24's Consequences section must reference the operator playbook "
@@ -196,11 +173,7 @@ class TestAdr24QuotaWaitAndResume:
         text = ADR_24.read_text(encoding="utf-8")
         lower = text.lower()
         has_safety = (
-            "max_wait" in lower
-            or "safety" in lower
-            or "bound" in lower
-            or "ceiling" in lower
-            or "limit" in lower
+            "max_wait" in lower or "safety" in lower or "bound" in lower or "ceiling" in lower or "limit" in lower
         )
         assert has_safety, (
             "ADR-24's Consequences section must describe the safety bounds "
@@ -228,9 +201,7 @@ class TestAdr24QuotaWaitAndResume:
     def test_adr_24_references_quota_py(self) -> None:
         """ADR-24 must reference the quota.py implementation module."""
         text = ADR_24.read_text(encoding="utf-8")
-        assert "quota.py" in text, (
-            "ADR-24 must cross-reference src/devbench/quota.py as the implementation module."
-        )
+        assert "quota.py" in text, "ADR-24 must cross-reference src/devbench/quota.py as the implementation module."
 
     def test_adr_24_references_quota_handling_doc(self) -> None:
         """ADR-24 must reference the docs/quota-handling.md playbook."""
@@ -244,9 +215,7 @@ class TestAdr24QuotaWaitAndResume:
     def test_adr_24_references_issue_193(self) -> None:
         """ADR-24 must reference GitHub issue #193."""
         text = ADR_24.read_text(encoding="utf-8")
-        assert "#193" in text, (
-            "ADR-24 must reference issue #193 (quota wait-and-resume) for traceability."
-        )
+        assert "#193" in text, "ADR-24 must reference issue #193 (quota wait-and-resume) for traceability."
 
     def test_adr_24_references_adr_23(self) -> None:
         """ADR-24 must reference ADR-23 (named sessions -- quota_pause.json shares the per-session dir)."""

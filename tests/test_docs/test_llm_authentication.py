@@ -82,8 +82,7 @@ class TestLlmAuthQuotaHandlingCrossReference:
     def test_quota_handling_file_resolves(self) -> None:
         """The referenced docs/quota-handling.md must exist on disk."""
         assert QUOTA_DOC.is_file(), (
-            "docs/quota-handling.md is cross-referenced from docs/llm-authentication.md "
-            "but does not exist on disk."
+            "docs/quota-handling.md is cross-referenced from docs/llm-authentication.md but does not exist on disk."
         )
 
     def test_no_em_dash(self) -> None:
@@ -104,10 +103,7 @@ class TestSubscriptionAuthQuotaCrossRef:
         """The Claude Code OAuth section must cross-reference quota-handling.md."""
         text = _read_doc()
         option1_section = _extract_section(text, "## Option 1:")
-        has_quota_ref = (
-            "quota-handling" in option1_section.lower()
-            or "quota_handling" in option1_section.lower()
-        )
+        has_quota_ref = "quota-handling" in option1_section.lower() or "quota_handling" in option1_section.lower()
         assert has_quota_ref, (
             "The 'Option 1' (Claude Code OAuth / subscription) section of "
             "docs/llm-authentication.md must cross-reference docs/quota-handling.md "
@@ -118,10 +114,7 @@ class TestSubscriptionAuthQuotaCrossRef:
         """The subscription section must mention the subscription_rate_limit detect mode."""
         text = _read_doc()
         option1_section = _extract_section(text, "## Option 1:")
-        has_mode = (
-            "subscription_rate_limit" in option1_section
-            or "SubscriptionRateLimit" in option1_section
-        )
+        has_mode = "subscription_rate_limit" in option1_section or "SubscriptionRateLimit" in option1_section
         assert has_mode, (
             "The 'Option 1' section of docs/llm-authentication.md must mention the "
             "'subscription_rate_limit' detect mode so operators know which quota "
@@ -132,10 +125,7 @@ class TestSubscriptionAuthQuotaCrossRef:
         """The subscription section must mention the API key credit / billing error quota modes."""
         text = _read_doc()
         option1_section = _extract_section(text, "## Option 1:")
-        has_api_key_mode = (
-            "sdk_credit_exhausted" in option1_section
-            or "api_billing_error" in option1_section
-        )
+        has_api_key_mode = "sdk_credit_exhausted" in option1_section or "api_billing_error" in option1_section
         assert has_api_key_mode, (
             "The 'Option 1' section of docs/llm-authentication.md must mention the "
             "'sdk_credit_exhausted' or 'api_billing_error' detect modes so that operators "
@@ -161,10 +151,7 @@ class TestBedrockAuthQuotaCrossRef:
         """The AWS Bedrock section must cross-reference quota-handling.md."""
         text = _read_doc()
         option2_section = _extract_section(text, "## Option 2:")
-        has_quota_ref = (
-            "quota-handling" in option2_section.lower()
-            or "quota_handling" in option2_section.lower()
-        )
+        has_quota_ref = "quota-handling" in option2_section.lower() or "quota_handling" in option2_section.lower()
         assert has_quota_ref, (
             "The 'Option 2' (AWS Bedrock) section of docs/llm-authentication.md "
             "must cross-reference docs/quota-handling.md for the bedrock_throttle "
@@ -175,10 +162,7 @@ class TestBedrockAuthQuotaCrossRef:
         """The Bedrock section must mention the bedrock_throttle detect mode."""
         text = _read_doc()
         option2_section = _extract_section(text, "## Option 2:")
-        has_mode = (
-            "bedrock_throttle" in option2_section
-            or "BedrockThrottle" in option2_section
-        )
+        has_mode = "bedrock_throttle" in option2_section or "BedrockThrottle" in option2_section
         assert has_mode, (
             "The 'Option 2' (AWS Bedrock) section of docs/llm-authentication.md "
             "must mention the 'bedrock_throttle' detect mode so operators know "
@@ -190,8 +174,7 @@ class TestBedrockAuthQuotaCrossRef:
         text = _read_doc()
         option2_section = _extract_section(text, "## Option 2:")
         assert option2_section, (
-            "docs/llm-authentication.md must have an 'Option 2' section for "
-            "AWS Bedrock authentication."
+            "docs/llm-authentication.md must have an 'Option 2' section for AWS Bedrock authentication."
         )
 
 
@@ -203,10 +186,7 @@ class TestPerAgentModelOverridesQuotaCrossRef:
         """The per-agent model overrides section must cross-reference quota-handling.md."""
         text = _read_doc()
         per_agent_section = _extract_section(text, "## Per-agent model overrides")
-        has_quota_ref = (
-            "quota-handling" in per_agent_section.lower()
-            or "quota_handling" in per_agent_section.lower()
-        )
+        has_quota_ref = "quota-handling" in per_agent_section.lower() or "quota_handling" in per_agent_section.lower()
         assert has_quota_ref, (
             "The 'Per-agent model overrides' section of docs/llm-authentication.md "
             "must cross-reference docs/quota-handling.md since model selection "
@@ -217,6 +197,4 @@ class TestPerAgentModelOverridesQuotaCrossRef:
         """The per-agent model overrides section must exist."""
         text = _read_doc()
         per_agent_section = _extract_section(text, "## Per-agent model overrides")
-        assert per_agent_section, (
-            "docs/llm-authentication.md must have a 'Per-agent model overrides' section."
-        )
+        assert per_agent_section, "docs/llm-authentication.md must have a 'Per-agent model overrides' section."

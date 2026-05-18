@@ -72,7 +72,7 @@ class TestAcceptanceCriteriaCanonicalNoLegacyJudgeVars:
 
     def test_no_legacy_judge_operational_vars(self) -> None:
         """No JUDGE_* operational env vars (other than concept names) may appear."""
-        _EXEMPT: frozenset[str] = frozenset(
+        exempt: frozenset[str] = frozenset(
             {
                 "KNOWN_JUDGE_NAMES",
                 "REVIEW_JUDGE_NAMES",
@@ -85,7 +85,7 @@ class TestAcceptanceCriteriaCanonicalNoLegacyJudgeVars:
         )
         text = _read_doc(ACCEPTANCE_CRITERIA_DOC)
         all_tokens = re.findall(r"\bJUDGE_[A-Z_]+", text)
-        violations = [t for t in all_tokens if t not in _EXEMPT]
+        violations = [t for t in all_tokens if t not in exempt]
         assert not violations, (
             "docs/acceptance-criteria-canonical.md contains JUDGE_* operational env vars "
             "that must be renamed to DEVBENCH_*: "
@@ -118,8 +118,7 @@ class TestBacklogContractNoLegacyJudgeVars:
         """JUDGE_CLAUDE_MODEL must not appear; use DEVBENCH_CLAUDE_MODEL."""
         text = _read_doc(BACKLOG_CONTRACT_DOC)
         assert "JUDGE_CLAUDE_MODEL" not in text, (
-            "docs/backlog-contract.md still contains JUDGE_CLAUDE_MODEL. "
-            "Rename to DEVBENCH_CLAUDE_MODEL (AC-197-8)."
+            "docs/backlog-contract.md still contains JUDGE_CLAUDE_MODEL. Rename to DEVBENCH_CLAUDE_MODEL (AC-197-8)."
         )
 
     def test_devbench_workspace_root_present(self) -> None:
@@ -132,7 +131,7 @@ class TestBacklogContractNoLegacyJudgeVars:
 
     def test_no_legacy_judge_operational_vars(self) -> None:
         """No JUDGE_* operational env vars (other than concept names) may appear."""
-        _EXEMPT: frozenset[str] = frozenset(
+        exempt: frozenset[str] = frozenset(
             {
                 "KNOWN_JUDGE_NAMES",
                 "REVIEW_JUDGE_NAMES",
@@ -145,7 +144,7 @@ class TestBacklogContractNoLegacyJudgeVars:
         )
         text = _read_doc(BACKLOG_CONTRACT_DOC)
         all_tokens = re.findall(r"\bJUDGE_[A-Z_]+", text)
-        violations = [t for t in all_tokens if t not in _EXEMPT]
+        violations = [t for t in all_tokens if t not in exempt]
         assert not violations, (
             "docs/backlog-contract.md contains JUDGE_* operational env vars "
             "that must be renamed to DEVBENCH_*: "
@@ -194,6 +193,5 @@ class TestNoBackwardsCompatibilityFootnotesInBatch4:
         assert not violations, (
             f"{doc_path.name} contains per-var backwards-compatibility notes for "
             f"JUDGE_* env vars. The rename is hard; compatibility notes are forbidden "
-            f"(AC-197-8 / spec section 4.9.3). Violations:\n"
-            + "\n".join(f"  {v}" for v in violations)
+            f"(AC-197-8 / spec section 4.9.3). Violations:\n" + "\n".join(f"  {v}" for v in violations)
         )

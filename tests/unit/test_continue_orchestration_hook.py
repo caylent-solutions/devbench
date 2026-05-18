@@ -1013,7 +1013,6 @@ class TestQuotaPatternDetection:
         The hook should not crash -- it should emit an [ERROR] diagnostic to
         stderr and return without writing quota_pause.json.
         """
-        import os
         import sys
 
         if sys.platform == "win32":
@@ -1023,7 +1022,7 @@ class TestQuotaPatternDetection:
         backlog.write_text("| E5-F5-S1-T3 | Task | Task | in-progress | none | repo | `backlog/t.md` |\n")
         # Create transcript file then make it unreadable.
         transcript = _make_transcript_file(tmp_path, "rate_limit: 429 Too Many Requests")
-        os.chmod(transcript, 0o000)
+        Path(transcript).chmod(0o000)
         try:
             payload = _make_stop_payload(str(transcript))
             result = _run_hook(str(tmp_path), stdin_payload=payload)
@@ -1031,15 +1030,13 @@ class TestQuotaPatternDetection:
             assert result.returncode == 0
             # No checkpoint must be written when transcript is unreadable.
             checkpoint = tmp_path / ".devbench" / "quota_pause.json"
-            assert not checkpoint.exists(), (
-                "quota_pause.json must NOT be written when transcript file is unreadable"
-            )
+            assert not checkpoint.exists(), "quota_pause.json must NOT be written when transcript file is unreadable"
             # An [ERROR] diagnostic must appear on stderr.
             assert "[ERROR] continue-orchestration" in result.stderr, (
                 f"Hook must log [ERROR] to stderr when transcript is unreadable; got stderr: {result.stderr!r}"
             )
         finally:
-            os.chmod(transcript, 0o644)
+            Path(transcript).chmod(0o644)
 
     def test_mkdir_failure_logs_error_to_stderr(self, tmp_path: Path) -> None:
         """When the checkpoint directory cannot be created, hook logs to stderr and continues.
@@ -1059,7 +1056,8 @@ class TestQuotaPatternDetection:
         assert result.returncode == 0
         # An [ERROR] diagnostic must appear on stderr.
         assert "[ERROR] continue-orchestration" in result.stderr, (
-            f"Hook must log [ERROR] to stderr when checkpoint directory cannot be created; got stderr: {result.stderr!r}"
+            "Hook must log [ERROR] to stderr when checkpoint directory "
+            f"cannot be created; got stderr: {result.stderr!r}"
         )
         # Clean up so teardown doesn't leave stray file.
         devbench_blocker.unlink()

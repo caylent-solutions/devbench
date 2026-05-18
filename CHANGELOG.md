@@ -259,6 +259,52 @@ since the last release. PR #119 carries every change.
   circuit-breaker quiet window (e.g., a 180s window tolerates a
   3-minute terraform-apply quiet stretch without flashing STOPPED).
 
+### Changed (BREAKING)
+
+- **`JUDGE_*` env-var namespace renamed to `DEVBENCH_*`** (#197). Every
+  devbench environment variable previously prefixed with `JUDGE_` now
+  carries the `DEVBENCH_` prefix. This is a hard cutover with no
+  deprecation period and no dual-acceptance fallback. Setting any legacy
+  `JUDGE_<NAME>` env var causes devbench to exit non-zero at process start
+  with a clear actionable error naming both the legacy and the new var and
+  directing the operator to `devbench migrate-env`. There is no fallback
+  logic: legacy presence is immediately rejected regardless of whether the
+  new `DEVBENCH_<NAME>` var is also set.
+
+  **Migration (one-shot):** Run `devbench migrate-env` (the only devbench
+  subcommand that bypasses the strict env-var checker). It reads your
+  current environment, identifies every set `JUDGE_*` var, and prints
+  `export DEVBENCH_<NAME>="$JUDGE_<NAME>"` plus `unset JUDGE_<NAME>` lines
+  on stdout. Source the output once before relaunching:
+
+  ```bash
+  eval "$(devbench migrate-env)"
+  ```
+
+  To write the script to a file instead of evaluating inline:
+
+  ```bash
+  devbench migrate-env --output migrate.sh && source migrate.sh
+  ```
+
+  **Operator checklist:**
+
+  1. Run `devbench migrate-env` to see which vars need renaming.
+  2. Update your shell RC file, CI/CD env blocks, and any launch scripts
+     that set `JUDGE_*` env vars to use `DEVBENCH_*` instead.
+  3. Unset all `JUDGE_*` env vars before relaunching the orchestrator.
+
+  The `JUDGE_ORCHESTRATOR_SESSION_ID`, `JUDGE_WORKSPACE_ROOT`, and
+  `JUDGE_CLAUDE_MODEL` vars are among the most commonly set; their
+  replacements are `DEVBENCH_ORCHESTRATOR_SESSION_ID`,
+  `DEVBENCH_WORKSPACE_ROOT`, and `DEVBENCH_CLAUDE_MODEL` respectively.
+
+  **Not renamed (LLM-as-judge concept names survive intact):**
+  `KNOWN_JUDGE_NAMES`, `REVIEW_JUDGE_NAMES`, `SECURITY_JUDGE_NAMES`,
+  `ALL_REQUIRED_JUDGE_NAMES`, `WORKFLOW_AGENT_JUDGE_NAMES`,
+  `JUDGE_AGENT_ROLE` (ADR-15 bypass), `[JUDGE_*_VERDICT]` audit format.
+  These refer to the LLM-as-judge concept which the rename does not touch.
+
 ### Changed (model defaults)
 
 - **`review-supervisor` frontmatter default is now `sonnet`** (was `haiku`).

@@ -138,7 +138,7 @@ When sending file contents to the LLM, large inputs are truncated to fit context
 
 ### Monitoring
 
-- `tail -f $JUDGE_WORKSPACE_ROOT/logs/<session>-orchestrator.log` for the main log (path is declared in `backlog/config/devbench.yaml` under `log_file:`; the legacy `src/devbench/logs/orchestrator.log` path is no longer used).
+- `tail -f $DEVBENCH_WORKSPACE_ROOT/logs/<session>-orchestrator.log` for the main log (path is declared in `backlog/config/devbench.yaml` under `log_file:`; the legacy `src/devbench/logs/orchestrator.log` path is no longer used).
 - Every work unit `.md` has a `## Comments` section with timestamped entries from every judge and orchestrator action.
 - `uv run devbench watch` prints a one-screen live dashboard (read-only). See [docs/watch-activity.md](docs/watch-activity.md).
 - `uv run devbench hook-tail` pretty-tails the plugin hook event stream in real time (read-only). See [docs/hook-activity.md](docs/hook-activity.md).
@@ -190,30 +190,32 @@ make clean                # Remove caches
 
 Two environment variables MUST be set before any command runs (otherwise startup exits non-zero):
 
-- `JUDGE_WORKSPACE_ROOT` -- absolute path to the workspace containing `BACKLOG.md` and `backlog/`.
-- `JUDGE_CLAUDE_MODEL` -- model identifier (for example, `us.anthropic.claude-opus-4-7-v1`).
+- `DEVBENCH_WORKSPACE_ROOT` -- absolute path to the workspace containing `BACKLOG.md` and `backlog/`.
+- `DEVBENCH_CLAUDE_MODEL` -- model identifier (for example, `us.anthropic.claude-opus-4-7-v1`).
 
-Everything else is optional. Per-repo settings, git-ops mode, stop-hook tuning, token pricing, and reporting timezone all live in `backlog/config/devbench.yaml` (relative to `JUDGE_WORKSPACE_ROOT`). Override the default lookup with the `--config <path>` CLI flag or `JUDGE_CONFIG_PATH` env var.
+Everything else is optional. Per-repo settings, git-ops mode, stop-hook tuning, token pricing, and reporting timezone all live in `backlog/config/devbench.yaml` (relative to `DEVBENCH_WORKSPACE_ROOT`). Override the default lookup with the `--config <path>` CLI flag or `DEVBENCH_CONFIG_PATH` env var.
 
 For the full annotated YAML, value-resolution precedence, and every config key, see [docs/devbench-yaml-reference.md](docs/devbench-yaml-reference.md) and [docs/architecture.md §8 Configuration model](docs/architecture.md#8-configuration-model). For per-model token pricing and cost-formula details, see [docs/model-pricing.md](docs/model-pricing.md).
+
+> **BREAKING (v-next):** Every `JUDGE_*` env var has been renamed to `DEVBENCH_*`. Setting a legacy `JUDGE_*` env var causes devbench to exit non-zero at process start. Run `devbench migrate-env` to generate the one-shot migration shell script. See [CHANGELOG.md](CHANGELOG.md) for details.
 
 ### Common tuning
 
 - **Single-branch mode** (one shared branch for the whole backlog, one PR at the end instead of one per work unit): set `git_ops.single_branch` and `git_ops.defer_pr` in `devbench.yaml`. See [architecture.md §6](docs/architecture.md#6-multi-pr-vs-single-pr-mode).
 - **Local-only mode** (drive operational work -- AWS teardowns, evidence capture, audits -- against a sibling checkout that has no GitHub remote, never pushes, never produces a PR): set `git_ops.local_only: true` (alongside `git_ops.single_branch` + `git_ops.defer_pr: true`) in `devbench.yaml`. See [docs/operational-work.md](docs/operational-work.md) for the end-to-end pattern and [docs/git-ops-modes.md](docs/git-ops-modes.md) for the mode comparison.
-- **Stop-hook circuit breaker** (prevents the orchestrator from stalling after context compaction; auto-allows stop after a configurable burst): tune `stop_hook.max_blocks`, `stop_hook.window_seconds`, `stop_hook.stale_task_minutes` in `devbench.yaml`, or override via `JUDGE_STOP_MAX_BLOCKS`, `JUDGE_STOP_WINDOW_SECONDS`, `JUDGE_STOP_STALE_MINUTES`. See [architecture.md §9 Hooks layer](docs/architecture.md#9-hooks-layer).
-- **Pause-before-merge** (orchestrator pushes the PR + waits for green CI then transitions the task to `in-review` instead of merging; reconciles via `devbench check-merge` on the next loop iteration): set `git_ops.pause_before_merge: true` in `devbench.yaml`, or override via `JUDGE_PAUSE_BEFORE_MERGE`. Cannot be combined with `defer_pr` or `single_branch`. See [docs/git-ops-modes.md](docs/git-ops-modes.md) and [ADR-13](docs/adr/13-pause-before-merge.md).
-- **CI-failure executor retry** (default-on; rc=2 from `git-ops` triggers an executor retry with the failing-job log as feedback under `.devbench/ci-failures/<id>-<n>.log`): toggle via `git_ops.ci_failure_retry` in `devbench.yaml` or `JUDGE_CI_FAILURE_RETRY_ENABLED`.
+- **Stop-hook circuit breaker** (prevents the orchestrator from stalling after context compaction; auto-allows stop after a configurable burst): tune `stop_hook.max_blocks`, `stop_hook.window_seconds`, `stop_hook.stale_task_minutes` in `devbench.yaml`, or override via `DEVBENCH_STOP_MAX_BLOCKS`, `DEVBENCH_STOP_WINDOW_SECONDS`, `DEVBENCH_STOP_STALE_MINUTES`. See [architecture.md §9 Hooks layer](docs/architecture.md#9-hooks-layer).
+- **Pause-before-merge** (orchestrator pushes the PR + waits for green CI then transitions the task to `in-review` instead of merging; reconciles via `devbench check-merge` on the next loop iteration): set `git_ops.pause_before_merge: true` in `devbench.yaml`, or override via `DEVBENCH_PAUSE_BEFORE_MERGE`. Cannot be combined with `defer_pr` or `single_branch`. See [docs/git-ops-modes.md](docs/git-ops-modes.md) and [ADR-13](docs/adr/13-pause-before-merge.md).
+- **CI-failure executor retry** (default-on; rc=2 from `git-ops` triggers an executor retry with the failing-job log as feedback under `.devbench/ci-failures/<id>-<n>.log`): toggle via `git_ops.ci_failure_retry` in `devbench.yaml` or `DEVBENCH_CI_FAILURE_RETRY_ENABLED`.
 - **PR-bot review polling** (between CI-pass and merge, polls for unresolved Copilot / Q-Dev / internal-bot comments and re-invokes the executor with structured feedback): opt in via `git_ops.pr_review_resolution.enabled: true` plus the `agents:` allowlist.
 - **Per-judge executor retry budgets** (different judges can flake at different rates; tune retries per failing judge instead of raising the global cap): set `max_executor_retries_per_judge:` map in `devbench.yaml`. Each entry falls back to `max_executor_retries` when absent.
 - **Manifest amendments** (executors can request a `tdd_green_production_fix` to expand their Changes Manifest mid-cycle when TDD GREEN reveals required production fixes; the manifest-amender judges scope, approach-coherence, and standards): toggle via `manifest_amendment.enabled`. See [docs/manifest-amendments.md](docs/manifest-amendments.md) and [ADR-02](docs/adr/02-manifest-amendment-workflow.md).
 - **Task-factory loop** (after manifest-amendment rejects, blocker-resolver decomposes the rejection and task-factory materialises draft work units the source task can depend on): toggle via `task_factory.enabled` and `task_factory.auto_accept_proposals`. See [docs/task-factory.md](docs/task-factory.md) and [ADR-03](docs/adr/03-task-factory.md).
 - **Draft status default** (control whether newly created work units land in `draft` or `in-queue`; `draft` requires explicit `devbench promote` before the orchestrator can claim the task): set `backlog.default_status_for_new_work_units` in `devbench.yaml`. Default `in-queue` preserves backwards compatibility. See [docs/devbench-yaml-reference.md](docs/devbench-yaml-reference.md).
 - **HOLD lifecycle** (`devbench hold <id>` / `devbench unhold <id>`): tasks deliberately deferred without breaking dep-chain math.
-- **Display timezone** in `devbench report` and `devbench hook-tail`: set `report.display_timezone` (IANA zone name) in `devbench.yaml`, or override per invocation via `JUDGE_REPORT_TIMEZONE`. See [model-pricing.md](docs/model-pricing.md#other-settings-under-report).
+- **Display timezone** in `devbench report` and `devbench hook-tail`: set `report.display_timezone` (IANA zone name) in `devbench.yaml`, or override per invocation via `DEVBENCH_REPORT_TIMEZONE`. See [model-pricing.md](docs/model-pricing.md#other-settings-under-report).
 - **Per-model token pricing** (needed when you run anything other than Opus 4.7): drop the matching `report.token_cost_per_million_*` block from [model-pricing.md](docs/model-pricing.md) into `devbench.yaml`.
 - **Cost premium multipliers**: `report.data_residency_multiplier` (default 1.10) and `report.fast_mode_multiplier` (default 6.0) are applied per-call to the residency-flagged / fast-mode token subsets. Composes with cache + base-rate multipliers, applies before the `report.token_cost_discount` (issue #124).
-- **Hook-tail column caps**: tune `hook_tail.agent_width`, `hook_tail.tool_width`, `hook_tail.description_max` (default 120), `hook_tail.stdout_preview_max` in `devbench.yaml`, or override via `JUDGE_HOOK_TAIL_*` env vars (issue #134).
+- **Hook-tail column caps**: tune `hook_tail.agent_width`, `hook_tail.tool_width`, `hook_tail.description_max` (default 120), `hook_tail.stdout_preview_max` in `devbench.yaml`, or override via `DEVBENCH_HOOK_TAIL_*` env vars (issue #134).
 
 ## Workspace setup
 
@@ -223,7 +225,7 @@ The backlog (`BACKLOG.md`, `backlog/`, specs) should live in a dedicated local g
 
 ```
 /workspaces/my-project/
-  my-backlog/              <-- JUDGE_WORKSPACE_ROOT (its own git repo)
+  my-backlog/              <-- DEVBENCH_WORKSPACE_ROOT (its own git repo)
     BACKLOG.md
     backlog/
       config/devbench.yaml
@@ -232,7 +234,7 @@ The backlog (`BACKLOG.md`, `backlog/`, specs) should live in a dedicated local g
   target-repo/             <-- the repo devbench modifies (separate git repo)
 ```
 
-Set `JUDGE_WORKSPACE_ROOT` to the backlog repo. The repo named in `checkout_directory` must be reachable at `<JUDGE_WORKSPACE_ROOT>/<checkout_directory>`. Two layouts are supported:
+Set `DEVBENCH_WORKSPACE_ROOT` to the backlog repo. The repo named in `checkout_directory` must be reachable at `<DEVBENCH_WORKSPACE_ROOT>/<checkout_directory>`. Two layouts are supported:
 
 **Default (sibling directory)** -- clone the target repo *inside* the backlog repo, alongside `backlog/`:
 
@@ -249,7 +251,7 @@ repos:
     checkout_directory: target-repo    # real directory under the backlog repo
 ```
 
-Add `target-repo/` to `<JUDGE_WORKSPACE_ROOT>/.gitignore` so the target-repo working tree doesn't pollute backlog history.
+Add `target-repo/` to `<DEVBENCH_WORKSPACE_ROOT>/.gitignore` so the target-repo working tree doesn't pollute backlog history.
 
 **Alternative (symlink, for shared / pre-cloned repos)** -- clone the target repo elsewhere and symlink it into the backlog repo. Useful when one target repo serves multiple backlogs or already lives outside the workspace:
 
@@ -288,14 +290,14 @@ repos:
 ```bash
 # Shell 1: start interactive session
 cd /path/to/devbench && \
-  JUDGE_WORKSPACE_ROOT=/path/to/my-backlog \
-  JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+  DEVBENCH_WORKSPACE_ROOT=/path/to/my-backlog \
+  DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
   claude --plugin-dir plugin/devbench
 
 # Shell 2: watch progress
 cd /path/to/devbench && watch -n 30 \
-  'JUDGE_WORKSPACE_ROOT=/path/to/my-backlog \
-   JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+  'DEVBENCH_WORKSPACE_ROOT=/path/to/my-backlog \
+   DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
    uv run devbench status'
 ```
 
@@ -308,26 +310,26 @@ The `make start-interactive` and `make start` targets are thin wrappers. If you 
 **Interactive with `--dangerously-skip-permissions` (default `make start-interactive`)**
 
 ```bash
-JUDGE_WORKSPACE_ROOT=/path/to/my-backlog \
-JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_WORKSPACE_ROOT=/path/to/my-backlog \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
 claude --dangerously-skip-permissions --plugin-dir /path/to/devbench/plugin/devbench
 ```
 
-**Interactive without `--dangerously-skip-permissions` (equivalent to `JUDGE_SAFE_PERMISSIONS=1 make start-interactive`)**
+**Interactive without `--dangerously-skip-permissions` (equivalent to `DEVBENCH_SAFE_PERMISSIONS=1 make start-interactive`)**
 
 ```bash
-JUDGE_WORKSPACE_ROOT=/path/to/my-backlog \
-JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_WORKSPACE_ROOT=/path/to/my-backlog \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
 claude --plugin-dir /path/to/devbench/plugin/devbench
 ```
 
-Setting `JUDGE_SAFE_PERMISSIONS=1` when invoking `make start-interactive` selects the no-flag variant above. This is the safe-mode opt-out for environments that require explicit permission prompts.
+Setting `DEVBENCH_SAFE_PERMISSIONS=1` when invoking `make start-interactive` selects the no-flag variant above. This is the safe-mode opt-out for environments that require explicit permission prompts.
 
 **Non-interactive (equivalent to `make start`)**
 
 ```bash
-JUDGE_WORKSPACE_ROOT=/path/to/my-backlog \
-JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_WORKSPACE_ROOT=/path/to/my-backlog \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
 uv run python -m devbench.cli start
 ```
 
@@ -417,7 +419,7 @@ Restarting picks up where you left off: `done` units are skipped and `in-progres
 
 ### LLM authentication
 
-The judge layer uses your existing Claude Code OAuth credentials; no separate Anthropic API key is needed as long as you are logged into Claude Code (`claude` in terminal). See [docs/llm-authentication.md](docs/llm-authentication.md) for details. Alternatively set `JUDGE_USE_BEDROCK=1` to route LLM calls through AWS Bedrock.
+The judge layer uses your existing Claude Code OAuth credentials; no separate Anthropic API key is needed as long as you are logged into Claude Code (`claude` in terminal). See [docs/llm-authentication.md](docs/llm-authentication.md) for details. Alternatively set `DEVBENCH_USE_BEDROCK=1` to route LLM calls through AWS Bedrock.
 
 ### GitHub pre-configured token
 
@@ -432,7 +434,7 @@ Both start modes authenticate with GitHub (or skip when `GH_TOKEN` is set), gran
 
 ## Remote EC2 dev environments
 
-For unattended runs, multi-operator workflows, or multiple parallel orchestrate sessions per operator, run the orchestrator on a remote EC2 dev box instead of in your local devcontainer. The provisioning stack (Terraform + Terragrunt + Ansible + a per-user multi-session launcher) is documented end-to-end in [`docs/remote-ec2-setup.md`](docs/remote-ec2-setup.md). It covers prerequisites, shared-infra provisioning, per-user instance stamping, Ansible bootstrap, the `devbench-session` launcher, environment configuration (including the E230 `JUDGE_ORCHESTRATOR_SESSION_ID` filter), and refresh / teardown workflows.
+For unattended runs, multi-operator workflows, or multiple parallel orchestrate sessions per operator, run the orchestrator on a remote EC2 dev box instead of in your local devcontainer. The provisioning stack (Terraform + Terragrunt + Ansible + a per-user multi-session launcher) is documented end-to-end in [`docs/remote-ec2-setup.md`](docs/remote-ec2-setup.md). It covers prerequisites, shared-infra provisioning, per-user instance stamping, Ansible bootstrap, the `devbench-session` launcher, environment configuration (including the E230 `DEVBENCH_ORCHESTRATOR_SESSION_ID` filter), and refresh / teardown workflows.
 
 ## Troubleshooting
 
@@ -450,7 +452,7 @@ The done-gate found that not all four review judges (`code_review`, `test_review
 
 ### Judge contradicts its previous feedback
 
-This should not happen with the prior-feedback injection. If it does, check the orchestrator log for previous feedback entries (`grep "judge feedback for <unit-id>" $JUDGE_WORKSPACE_ROOT/logs/<session>-orchestrator.log`).
+This should not happen with the prior-feedback injection. If it does, check the orchestrator log for previous feedback entries (`grep "judge feedback for <unit-id>" $DEVBENCH_WORKSPACE_ROOT/logs/<session>-orchestrator.log`).
 
 ### GitHub token expired
 

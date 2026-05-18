@@ -45,7 +45,7 @@ use_bedrock: false
 bedrock_region: us-east-1
 
 # Per-agent model overrides live in the `agents:` block lower in this file
-# (ADR-25). `JUDGE_CLAUDE_MODEL` (env var, required) is the SDK caller's
+# (ADR-25). `DEVBENCH_CLAUDE_MODEL` (env var, required) is the SDK caller's
 # model -- it governs the orchestrate skill's coordination calls only; it
 # does NOT route the work agents (executor / judges / etc.), each of which
 # loads its model from its plugin .md frontmatter and can be overridden
@@ -187,7 +187,7 @@ orchestrate:
   # Cap on recovery-of-a-recovery cascade depth. When a proposal would land
   # at depth >= this cap, the source task transitions to
   # NEEDS_OPERATOR_ATTENTION instead of materialising another recovery
-  # layer. Override via JUDGE_ORCHESTRATE_MAX_CASCADE_DEPTH env var.
+  # layer. Override via DEVBENCH_ORCHESTRATE_MAX_CASCADE_DEPTH env var.
   max_cascade_depth: 2
 
 # ---------------------------------------------------------------------------
@@ -293,7 +293,7 @@ validate:
 # agent. The short-name "haiku" is still parsed (you can experiment) but
 # every role default below avoids it.
 #
-# JUDGE_AGENT_MODEL_<NAME> env vars override this block per-call
+# DEVBENCH_AGENT_MODEL_<NAME> env vars override this block per-call
 # (precedence: env > yaml > frontmatter). See:
 #   docs/adr/25-per-agent-model-overrides.md
 #   docs/llm-authentication.md#per-agent-model-overrides-quota-management

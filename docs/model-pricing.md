@@ -28,7 +28,7 @@ report:
   token_cost_per_million_output: <your model's output rate>
 ```
 
-If these don't match the model your orchestrator is actually running (set by `JUDGE_CLAUDE_MODEL`), the cost numbers will be off by the ratio of real-vs-configured rates. Pick the row in the table below that matches your model, then drop the snippet from [Picking your defaults](#picking-your-defaults) into your config.
+If these don't match the model your orchestrator is actually running (set by `DEVBENCH_CLAUDE_MODEL`), the cost numbers will be off by the ratio of real-vs-configured rates. Pick the row in the table below that matches your model, then drop the snippet from [Picking your defaults](#picking-your-defaults) into your config.
 
 ---
 
@@ -74,7 +74,7 @@ Edit and re-run `devbench report` once on the same log window; the new value sho
 
 **Why not use `token_cost_discount`?** The discount field is constrained to `[0.0, 1.0]` and only DECREASES reported cost (`final = list * (1 - discount)`). It cannot fix under-reporting. Always correct upward via the per-million rates. If your contract has a real discount on top of list, set `token_cost_discount` to the contract value AND ensure the per-million rates already match list price for your model.
 
-**When to recalibrate.** Re-derive the factor whenever any of these change: `JUDGE_CLAUDE_MODEL`, the workspace's context-tier (200k vs 1M), the orchestrator's cache-hit profile (since reported cost depends on the cache-write-rate-vs-cache-read mix), Anthropic's published list pricing, or your contract terms.
+**When to recalibrate.** Re-derive the factor whenever any of these change: `DEVBENCH_CLAUDE_MODEL`, the workspace's context-tier (200k vs 1M), the orchestrator's cache-hit profile (since reported cost depends on the cache-write-rate-vs-cache-read mix), Anthropic's published list pricing, or your contract terms.
 
 ---
 
@@ -168,10 +168,10 @@ Each multiplier is defined in `src/devbench/constants.py` and can also be set pe
 
 | YAML key                      | Env var                                     | Default |
 | ----------------------------- | ------------------------------------------- | ------- |
-| `cache_read_multiplier`       | `JUDGE_REPORT_CACHE_READ_MULTIPLIER`        | 0.10    |
-| `cache_write_5min_multiplier` | `JUDGE_REPORT_CACHE_WRITE_5MIN_MULTIPLIER`  | 1.25    |
-| `cache_write_1hr_multiplier`  | `JUDGE_REPORT_CACHE_WRITE_1HR_MULTIPLIER`   | 2.0     |
-| `data_residency_multiplier`   | `JUDGE_REPORT_DATA_RESIDENCY_MULTIPLIER`    | 1.10    |
+| `cache_read_multiplier`       | `DEVBENCH_REPORT_CACHE_READ_MULTIPLIER`        | 0.10    |
+| `cache_write_5min_multiplier` | `DEVBENCH_REPORT_CACHE_WRITE_5MIN_MULTIPLIER`  | 1.25    |
+| `cache_write_1hr_multiplier`  | `DEVBENCH_REPORT_CACHE_WRITE_1HR_MULTIPLIER`   | 2.0     |
+| `data_residency_multiplier`   | `DEVBENCH_REPORT_DATA_RESIDENCY_MULTIPLIER`    | 1.10    |
 
 Resolution order is env var > YAML value > constant default.
 
@@ -203,7 +203,7 @@ report:
   display_timezone: America/Denver   # optional report-specific override; defaults to top-level display_timezone, then system local TZ
 ```
 
-When unset (or set to a name that isn't a valid IANA zone), the report falls back to the top-level `display_timezone`, then to the host's system local timezone. Override per-invocation via `JUDGE_REPORT_TIMEZONE=<zone>`.
+When unset (or set to a name that isn't a valid IANA zone), the report falls back to the top-level `display_timezone`, then to the host's system local timezone. Override per-invocation via `DEVBENCH_REPORT_TIMEZONE=<zone>`.
 
 ---
 
@@ -227,7 +227,7 @@ report:
   token_cost_discount: 0.40363636364
 ```
 
-Override via env: `JUDGE_REPORT_TOKEN_COST_DISCOUNT=0.40363636364`. Default: `0.0`.
+Override via env: `DEVBENCH_REPORT_TOKEN_COST_DISCOUNT=0.40363636364`. Default: `0.0`.
 
 Applies uniformly to input, output, cache reads, and cache writes (5-min and 1-hr). Cache multipliers stay as pure ratios; the discount is applied at the base input/output rate before cache multipliers evaluate.
 
@@ -242,12 +242,12 @@ The top-level `display_timezone:` yaml key applies to **every devbench command t
 display_timezone: America/New_York
 ```
 
-Override per-invocation via the `JUDGE_DISPLAY_TIMEZONE` env var. Per-command overrides still apply on top of this global:
+Override per-invocation via the `DEVBENCH_DISPLAY_TIMEZONE` env var. Per-command overrides still apply on top of this global:
 
-- `devbench report` reads `report.display_timezone` (yaml) or `JUDGE_REPORT_TIMEZONE` (env) first, then falls back to `display_timezone` / `JUDGE_DISPLAY_TIMEZONE`.
-- `devbench hook-tail` reads the CLI `--tz <zone>` flag first, then falls back to `display_timezone` / `JUDGE_DISPLAY_TIMEZONE`.
+- `devbench report` reads `report.display_timezone` (yaml) or `DEVBENCH_REPORT_TIMEZONE` (env) first, then falls back to `display_timezone` / `DEVBENCH_DISPLAY_TIMEZONE`.
+- `devbench hook-tail` reads the CLI `--tz <zone>` flag first, then falls back to `display_timezone` / `DEVBENCH_DISPLAY_TIMEZONE`.
 
-Resolution order (per command): CLI flag or command-specific override > `JUDGE_DISPLAY_TIMEZONE` env > top-level `display_timezone` yaml > OS local.
+Resolution order (per command): CLI flag or command-specific override > `DEVBENCH_DISPLAY_TIMEZONE` env > top-level `display_timezone` yaml > OS local.
 
 ---
 

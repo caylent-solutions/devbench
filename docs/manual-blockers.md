@@ -49,8 +49,8 @@ manually clears this gate.
 **To unblock**: once the external work is verified complete, the operator runs:
 
 `​`​`bash
-JUDGE_WORKSPACE_ROOT=/path/to/spec \
-JUDGE_CLAUDE_MODEL=<model> \
+DEVBENCH_WORKSPACE_ROOT=/path/to/spec \
+DEVBENCH_CLAUDE_MODEL=<model> \
 uv run --project /path/to/devbench \
   devbench set-status E0-F<N>-S1-T1 done
 uv run --project /path/to/devbench \
@@ -96,7 +96,7 @@ claimable.
 1. Verify the external deliverable exists (commands specific to the gate).
 2. Manually clear this blocker:
    `​`​`bash
-   JUDGE_WORKSPACE_ROOT=... JUDGE_CLAUDE_MODEL=... \
+   DEVBENCH_WORKSPACE_ROOT=... DEVBENCH_CLAUDE_MODEL=... \
      uv run --project ... devbench set-status E0-F<N>-S1-T1 done
    uv run --project ... devbench set-status E0-F<N>-S1 done
    `​`​`
@@ -151,7 +151,7 @@ Not applicable. No code is authored under this Task.
 After the manual blocker exists in BACKLOG.md, wire each dependent Task with:
 
 ```bash
-JUDGE_WORKSPACE_ROOT=... JUDGE_CLAUDE_MODEL=... \
+DEVBENCH_WORKSPACE_ROOT=... DEVBENCH_CLAUDE_MODEL=... \
   uv run --project ... devbench add-dep <dependent-task-id> E0-F<N>-S1-T1
 ```
 

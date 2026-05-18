@@ -5413,6 +5413,54 @@ def cmd_watchdog(*argv: str) -> int:
     return 0
 
 
+def cmd_notify_test(*argv: str) -> int:
+    """Send one sample notification for ``--event <name>`` (smoke-test setup).
+
+    Usage::
+
+        devbench notify-test --event <event_name>
+
+    Fires the named event's canonical payload through the unified
+    dispatcher.  Honors ``notifications.enabled`` and
+    ``notifications.slack.enabled`` (master + endpoint switches) but
+    temporarily forces the per-event toggle on, so the operator can
+    verify any of the eleven events regardless of their yaml state.
+    Returns rc=2 on bad usage, rc=1 when dispatch raises (best-effort
+    is bypassed for smoke-test diagnostics so the failure is visible).
+    """
+    from devbench.notifications import ALL_EVENTS, send_test_notification
+
+    event_name = ""
+    args = [a for a in argv if a]
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--event":
+            if i + 1 >= len(args):
+                print("ERROR: --event requires a value", file=sys.stderr)
+                return 2
+            event_name = args[i + 1]
+            i += 2
+            continue
+        print(f"ERROR: unknown flag: {arg}", file=sys.stderr)
+        return 2
+    if not event_name:
+        print(
+            "ERROR: --event <name> is required; one of:\n  " + "\n  ".join(ALL_EVENTS),
+            file=sys.stderr,
+        )
+        return 2
+    if event_name not in ALL_EVENTS:
+        print(
+            f"ERROR: unknown event {event_name!r}; expected one of:\n  " + "\n  ".join(ALL_EVENTS),
+            file=sys.stderr,
+        )
+        return 2
+    send_test_notification(event_name)
+    print(f"[OK] notify-test fired {event_name!r}; check the configured channel(s).")
+    return 0
+
+
 def _resolve_plugin_path() -> Path:
     """Return the plugin path to load: shadow when overrides configured, else canonical.
 
@@ -9288,6 +9336,11 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
             "watchdog [--idle-minutes N] [--flag-file PATH] [--log-file PATH] [--print-if-stuck]"
         ),
     ),
+    "notify-test": (
+        cmd_notify_test,
+        0,
+        "Send one sample Slack notification for an event (smoke-test setup): notify-test --event <name>",
+    ),
     # Plugin agent bridge commands -- used by devbench plugin agents
     "read-unit": (cmd_read_unit, 1, "Work unit content + repo path as JSON: read-unit [--strip-comments] <id>"),
     "get-diff": (cmd_get_diff, 1, "Return combined git diff for work unit's repo: get-diff <id>"),
@@ -9369,6 +9422,7 @@ _VARIADIC_COMMANDS: frozenset[str] = frozenset(
     {
         "hook-tail",
         "watchdog",
+        "notify-test",
         "add-dep",
         "decline",
         "hold",

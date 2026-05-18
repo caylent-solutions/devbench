@@ -27,13 +27,11 @@ os.environ.setdefault(
     str(Path(__file__).parent / "fixtures" / "test_devbench.yaml"),
 )
 
-# Backward-compatibility aliases for modules not yet migrated to DEVBENCH_* names
-# (config.py reads JUDGE_WORKSPACE_ROOT / JUDGE_CLAUDE_MODEL; cli.py reads
-# JUDGE_LOG_FILE; config_loader.py reads JUDGE_CONFIG_PATH).
-# Direct assignments rather than setdefault so AC-197-10 is fully satisfied.
-# Each alias will be removed when the owning consumer-migration task completes.
-os.environ["JUDGE_CLAUDE_MODEL"] = os.environ["DEVBENCH_CLAUDE_MODEL"]
-os.environ["JUDGE_WORKSPACE_ROOT"] = os.environ["DEVBENCH_WORKSPACE_ROOT"]
+# Backward-compatibility aliases for modules not yet migrated to DEVBENCH_* names.
+# config.py (JUDGE_WORKSPACE_ROOT / JUDGE_CLAUDE_MODEL) has been migrated by
+# E9-F2-S1-T1 -- those aliases are removed.
+# cli.py (JUDGE_LOG_FILE) and config_loader.py (JUDGE_CONFIG_PATH) are not yet
+# migrated; their aliases remain until the owning tasks complete.
 os.environ["JUDGE_LOG_FILE"] = os.environ["DEVBENCH_LOG_FILE"]
 os.environ["JUDGE_CONFIG_PATH"] = os.environ["DEVBENCH_CONFIG_PATH"]
 

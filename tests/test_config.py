@@ -241,7 +241,7 @@ class TestMergeStrategy:
         importlib.reload(config)
 
     def test_default_is_squash(self) -> None:
-        env_copy = {k: v for k, v in os.environ.items() if k != "JUDGE_MERGE_STRATEGY"}
+        env_copy = {k: v for k, v in os.environ.items() if k != "DEVBENCH_MERGE_STRATEGY"}
         with patch.dict(os.environ, env_copy, clear=True):
             importlib.reload(config)
             assert config.MERGE_STRATEGY == config.MergeStrategy.SQUASH
@@ -254,62 +254,62 @@ class TestConfigOverrides:
     """Test that config values can be overridden via environment variables."""
 
     def test_max_retry_attempts_from_env(self) -> None:
-        with patch.dict(os.environ, {"JUDGE_MAX_RETRIES": "7"}, clear=False):
+        with patch.dict(os.environ, {"DEVBENCH_MAX_RETRIES": "7"}, clear=False):
             importlib.reload(config)
             assert config.MAX_RETRY_ATTEMPTS == 7
 
-        with patch.dict(os.environ, {"JUDGE_MAX_RETRIES": "3"}, clear=False):
+        with patch.dict(os.environ, {"DEVBENCH_MAX_RETRIES": "3"}, clear=False):
             importlib.reload(config)
 
     def test_github_check_timeout_from_env(self) -> None:
-        with patch.dict(os.environ, {"JUDGE_GH_TIMEOUT": "120"}, clear=False):
+        with patch.dict(os.environ, {"DEVBENCH_GH_TIMEOUT": "120"}, clear=False):
             importlib.reload(config)
             assert config.GITHUB_CHECK_TIMEOUT_SECONDS == 120
 
-        with patch.dict(os.environ, {"JUDGE_GH_TIMEOUT": "600"}, clear=False):
+        with patch.dict(os.environ, {"DEVBENCH_GH_TIMEOUT": "600"}, clear=False):
             importlib.reload(config)
 
     def test_backlog_root_derived_from_workspace_root(self) -> None:
-        """BACKLOG_ROOT is always derived from JUDGE_WORKSPACE_ROOT, not from env."""
+        """BACKLOG_ROOT is always derived from DEVBENCH_WORKSPACE_ROOT, not from env."""
         from devbench.constants import BACKLOG_SUBDIR
 
-        env_copy = {k: v for k, v in os.environ.items() if k != "JUDGE_BACKLOG_ROOT"}
+        env_copy = {k: v for k, v in os.environ.items() if k not in ("JUDGE_BACKLOG_ROOT",)}
         with patch.dict(os.environ, env_copy, clear=True):
             importlib.reload(config)
-            expected = Path(os.environ["JUDGE_WORKSPACE_ROOT"]) / BACKLOG_SUBDIR
+            expected = Path(os.environ["DEVBENCH_WORKSPACE_ROOT"]) / BACKLOG_SUBDIR
             assert expected == config.BACKLOG_ROOT
 
         importlib.reload(config)
 
     def test_backlog_index_derived_from_workspace_root(self) -> None:
-        """BACKLOG_INDEX is always derived from JUDGE_WORKSPACE_ROOT, not from env."""
-        env_copy = {k: v for k, v in os.environ.items() if k != "JUDGE_BACKLOG_INDEX"}
+        """BACKLOG_INDEX is always derived from DEVBENCH_WORKSPACE_ROOT, not from env."""
+        env_copy = {k: v for k, v in os.environ.items() if k not in ("JUDGE_BACKLOG_INDEX",)}
         with patch.dict(os.environ, env_copy, clear=True):
             importlib.reload(config)
-            expected = Path(os.environ["JUDGE_WORKSPACE_ROOT"]) / "BACKLOG.md"
+            expected = Path(os.environ["DEVBENCH_WORKSPACE_ROOT"]) / "BACKLOG.md"
             assert expected == config.BACKLOG_INDEX
 
         importlib.reload(config)
 
     def test_judge_backlog_root_env_var_has_no_effect(self, tmp_path: Path) -> None:
-        """JUDGE_BACKLOG_ROOT env var is ignored -- path derived from JUDGE_WORKSPACE_ROOT."""
+        """JUDGE_BACKLOG_ROOT env var is ignored -- path derived from DEVBENCH_WORKSPACE_ROOT."""
         from devbench.constants import BACKLOG_SUBDIR
 
         custom_root = tmp_path / "custom-backlog"
         with patch.dict(os.environ, {"JUDGE_BACKLOG_ROOT": str(custom_root)}, clear=False):
             importlib.reload(config)
-            expected = Path(os.environ["JUDGE_WORKSPACE_ROOT"]) / BACKLOG_SUBDIR
+            expected = Path(os.environ["DEVBENCH_WORKSPACE_ROOT"]) / BACKLOG_SUBDIR
             assert expected == config.BACKLOG_ROOT
             assert custom_root != config.BACKLOG_ROOT
 
         importlib.reload(config)
 
     def test_judge_backlog_index_env_var_has_no_effect(self, tmp_path: Path) -> None:
-        """JUDGE_BACKLOG_INDEX env var is ignored -- path derived from JUDGE_WORKSPACE_ROOT."""
+        """JUDGE_BACKLOG_INDEX env var is ignored -- path derived from DEVBENCH_WORKSPACE_ROOT."""
         custom_index = tmp_path / "CUSTOM_BACKLOG.md"
         with patch.dict(os.environ, {"JUDGE_BACKLOG_INDEX": str(custom_index)}, clear=False):
             importlib.reload(config)
-            expected = Path(os.environ["JUDGE_WORKSPACE_ROOT"]) / "BACKLOG.md"
+            expected = Path(os.environ["DEVBENCH_WORKSPACE_ROOT"]) / "BACKLOG.md"
             assert expected == config.BACKLOG_INDEX
             assert custom_index != config.BACKLOG_INDEX
 
@@ -318,24 +318,7 @@ class TestConfigOverrides:
 
 @pytest.mark.unit
 class TestResolveHelpers:
-    """Tests for _resolve_int and _resolve_float config resolution helpers."""
-
-    def test_resolve_int_env_var_wins(self) -> None:
-        with patch.dict(os.environ, {"TEST_VAR": "42"}, clear=False):
-            result = config._resolve_int("TEST_VAR", 10, 5)
-        assert result == 42
-
-    def test_resolve_int_yaml_when_env_absent(self) -> None:
-        env_copy = {k: v for k, v in os.environ.items() if k != "TEST_VAR_ABSENT"}
-        with patch.dict(os.environ, env_copy, clear=True):
-            result = config._resolve_int("TEST_VAR_ABSENT", 10, 5)
-        assert result == 10
-
-    def test_resolve_int_default_when_both_absent(self) -> None:
-        env_copy = {k: v for k, v in os.environ.items() if k != "TEST_VAR_ABSENT"}
-        with patch.dict(os.environ, env_copy, clear=True):
-            result = config._resolve_int("TEST_VAR_ABSENT", None, 5)
-        assert result == 5
+    """Tests for _resolve_float config resolution helper."""
 
     def test_resolve_float_env_var_wins(self) -> None:
         with patch.dict(os.environ, {"TEST_FLOAT": "1.5"}, clear=False):
@@ -360,54 +343,6 @@ class TestResolveHelpers:
         assert result == 2.5
 
 
-class TestResolveBool:
-    """Tests for ``_resolve_bool`` -- env > YAML > default precedence with strict parsing."""
-
-    @pytest.mark.parametrize(
-        "raw",
-        ["1", "true", "yes", "on", "TRUE", "Yes", "On"],
-    )
-    def test_truthy_env_returns_true(self, raw: str) -> None:
-        with patch.dict(os.environ, {"TEST_BOOL_VAR": raw}, clear=False):
-            assert config._resolve_bool("TEST_BOOL_VAR", None, False) is True
-
-    @pytest.mark.parametrize(
-        "raw",
-        ["0", "false", "no", "off", "FALSE", "No", "Off"],
-    )
-    def test_falsy_env_returns_false(self, raw: str) -> None:
-        with patch.dict(os.environ, {"TEST_BOOL_VAR": raw}, clear=False):
-            assert config._resolve_bool("TEST_BOOL_VAR", None, True) is False
-
-    def test_invalid_env_raises_value_error(self) -> None:
-        with patch.dict(os.environ, {"TEST_BOOL_VAR": "maybe"}, clear=False):
-            with pytest.raises(ValueError, match="must be one of"):
-                config._resolve_bool("TEST_BOOL_VAR", None, False)
-
-    def test_yaml_used_when_env_absent(self) -> None:
-        env_copy = {k: v for k, v in os.environ.items() if k != "TEST_BOOL_ABSENT"}
-        with patch.dict(os.environ, env_copy, clear=True):
-            assert config._resolve_bool("TEST_BOOL_ABSENT", True, False) is True
-            assert config._resolve_bool("TEST_BOOL_ABSENT", False, True) is False
-
-    def test_default_used_when_both_absent(self) -> None:
-        env_copy = {k: v for k, v in os.environ.items() if k != "TEST_BOOL_ABSENT"}
-        with patch.dict(os.environ, env_copy, clear=True):
-            assert config._resolve_bool("TEST_BOOL_ABSENT", None, True) is True
-            assert config._resolve_bool("TEST_BOOL_ABSENT", None, False) is False
-
-    def test_env_overrides_yaml(self) -> None:
-        """env > YAML when both are set."""
-        with patch.dict(os.environ, {"TEST_BOOL_VAR": "0"}, clear=False):
-            assert config._resolve_bool("TEST_BOOL_VAR", True, True) is False
-        with patch.dict(os.environ, {"TEST_BOOL_VAR": "1"}, clear=False):
-            assert config._resolve_bool("TEST_BOOL_VAR", False, False) is True
-
-    def test_empty_env_falls_through_to_yaml(self) -> None:
-        with patch.dict(os.environ, {"TEST_BOOL_VAR": ""}, clear=False):
-            assert config._resolve_bool("TEST_BOOL_VAR", True, False) is True
-
-
 class TestCanonicalConfigToggles:
     """Verify the v-next canonical toggle resolutions read from YAML correctly.
 
@@ -422,7 +357,7 @@ class TestCanonicalConfigToggles:
         from devbench.constants import DEFAULT_INLINE_ORPHAN_CLEANUP_ENABLED
 
         assert DEFAULT_INLINE_ORPHAN_CLEANUP_ENABLED is True
-        assert config._resolve_bool("JUDGE_NONEXISTENT_FOR_TEST", None, True) is True
+        assert config.INLINE_ORPHAN_CLEANUP_ENABLED is True
 
     def test_ci_failure_retry_default_on(self) -> None:
         """v-next default flip: CI_FAILURE_RETRY_ENABLED is True by default."""
@@ -454,19 +389,19 @@ class TestStopHookConfigExposed:
         assert isinstance(config.STOP_HOOK_STALE_TASK_MINUTES, int)
 
     def test_stop_hook_max_blocks_env_override(self) -> None:
-        with patch.dict(os.environ, {"JUDGE_STOP_MAX_BLOCKS": "3"}, clear=False):
+        with patch.dict(os.environ, {"DEVBENCH_STOP_MAX_BLOCKS": "3"}, clear=False):
             importlib.reload(config)
             assert config.STOP_HOOK_MAX_BLOCKS == 3
         importlib.reload(config)
 
     def test_stop_hook_window_seconds_env_override(self) -> None:
-        with patch.dict(os.environ, {"JUDGE_STOP_WINDOW_SECONDS": "60"}, clear=False):
+        with patch.dict(os.environ, {"DEVBENCH_STOP_WINDOW_SECONDS": "60"}, clear=False):
             importlib.reload(config)
             assert config.STOP_HOOK_WINDOW_SECONDS == 60
         importlib.reload(config)
 
     def test_stop_hook_stale_task_minutes_env_override(self) -> None:
-        with patch.dict(os.environ, {"JUDGE_STOP_STALE_MINUTES": "30"}, clear=False):
+        with patch.dict(os.environ, {"DEVBENCH_STOP_STALE_MINUTES": "30"}, clear=False):
             importlib.reload(config)
             assert config.STOP_HOOK_STALE_TASK_MINUTES == 30
         importlib.reload(config)
@@ -477,14 +412,14 @@ class TestMaxRetriesYamlFirst:
     """Verify max_executor_retries reads YAML first, env var overrides."""
 
     def test_max_executor_retries_env_overrides(self) -> None:
-        with patch.dict(os.environ, {"JUDGE_MAX_RETRIES": "15"}, clear=False):
+        with patch.dict(os.environ, {"DEVBENCH_MAX_RETRIES": "15"}, clear=False):
             importlib.reload(config)
             assert config.MAX_RETRY_ATTEMPTS == 15
         importlib.reload(config)
 
     def test_max_executor_retries_uses_yaml_when_env_absent(self) -> None:
-        """When JUDGE_MAX_RETRIES is not set, the YAML value is used."""
-        env_copy = {k: v for k, v in os.environ.items() if k != "JUDGE_MAX_RETRIES"}
+        """When DEVBENCH_MAX_RETRIES is not set, the YAML value is used."""
+        env_copy = {k: v for k, v in os.environ.items() if k != "DEVBENCH_MAX_RETRIES"}
         with patch.dict(os.environ, env_copy, clear=True):
             importlib.reload(config)
             # Value should come from YAML or default -- it should be an int > 0
@@ -495,10 +430,10 @@ class TestMaxRetriesYamlFirst:
 
 @pytest.mark.unit
 class TestAgentModelEnvOverrides:
-    """ADR-25: JUDGE_AGENT_MODEL_<NAME> env vars override YAML at config-load time."""
+    """ADR-25: DEVBENCH_AGENT_MODEL_<NAME> env vars override YAML at config-load time."""
 
     def test_executor_env_overrides_yaml(self) -> None:
-        with patch.dict(os.environ, {"JUDGE_AGENT_MODEL_EXECUTOR": "opus"}, clear=False):
+        with patch.dict(os.environ, {"DEVBENCH_AGENT_MODEL_EXECUTOR": "opus"}, clear=False):
             importlib.reload(config)
             assert config.AGENT_MODELS.executor == "opus"
         importlib.reload(config)
@@ -507,8 +442,8 @@ class TestAgentModelEnvOverrides:
         with patch.dict(
             os.environ,
             {
-                "JUDGE_AGENT_MODEL_CODE_REVIEWER": "haiku",
-                "JUDGE_AGENT_MODEL_CHANGES_MANIFEST": "opus",
+                "DEVBENCH_AGENT_MODEL_CODE_REVIEWER": "haiku",
+                "DEVBENCH_AGENT_MODEL_CHANGES_MANIFEST": "opus",
             },
             clear=False,
         ):
@@ -519,32 +454,32 @@ class TestAgentModelEnvOverrides:
 
     def test_invalid_env_value_rejected_at_load(self) -> None:
         """A garbage env value should fail-fast at config.py import (re-validated against USE_BEDROCK)."""
-        with patch.dict(os.environ, {"JUDGE_AGENT_MODEL_EXECUTOR": "garbage-value-not-a-model"}, clear=False):
+        with patch.dict(os.environ, {"DEVBENCH_AGENT_MODEL_EXECUTOR": "garbage-value-not-a-model"}, clear=False):
             with pytest.raises(ValueError, match="not a valid Anthropic API"):
                 importlib.reload(config)
         importlib.reload(config)
 
     def test_empty_env_var_treated_as_unset(self) -> None:
         """Empty string env var must not override (treated as unset)."""
-        with patch.dict(os.environ, {"JUDGE_AGENT_MODEL_EXECUTOR": ""}, clear=False):
+        with patch.dict(os.environ, {"DEVBENCH_AGENT_MODEL_EXECUTOR": ""}, clear=False):
             importlib.reload(config)
             # Fixture has no agents block, so executor stays None.
             assert config.AGENT_MODELS.executor is None
         importlib.reload(config)
 
     def test_all_agent_env_vars_covered(self) -> None:
-        """Every defined JUDGE_AGENT_MODEL_* env var routes to a real field."""
+        """Every defined DEVBENCH_AGENT_MODEL_* env var routes to a real field."""
         envs = {
-            "JUDGE_AGENT_MODEL_EXECUTOR": "opus",
-            "JUDGE_AGENT_MODEL_BLOCKER_RESOLVER": "opus",
-            "JUDGE_AGENT_MODEL_MANIFEST_AMENDER": "opus",
-            "JUDGE_AGENT_MODEL_SECURITY_REVIEWER": "opus",
-            "JUDGE_AGENT_MODEL_TASK_FACTORY": "opus",
-            "JUDGE_AGENT_MODEL_REVIEW_SUPERVISOR": "opus",
-            "JUDGE_AGENT_MODEL_CODE_REVIEWER": "opus",
-            "JUDGE_AGENT_MODEL_TEST_REVIEWER": "opus",
-            "JUDGE_AGENT_MODEL_DOC_REVIEWER": "opus",
-            "JUDGE_AGENT_MODEL_CHANGES_MANIFEST": "opus",
+            "DEVBENCH_AGENT_MODEL_EXECUTOR": "opus",
+            "DEVBENCH_AGENT_MODEL_BLOCKER_RESOLVER": "opus",
+            "DEVBENCH_AGENT_MODEL_MANIFEST_AMENDER": "opus",
+            "DEVBENCH_AGENT_MODEL_SECURITY_REVIEWER": "opus",
+            "DEVBENCH_AGENT_MODEL_TASK_FACTORY": "opus",
+            "DEVBENCH_AGENT_MODEL_REVIEW_SUPERVISOR": "opus",
+            "DEVBENCH_AGENT_MODEL_CODE_REVIEWER": "opus",
+            "DEVBENCH_AGENT_MODEL_TEST_REVIEWER": "opus",
+            "DEVBENCH_AGENT_MODEL_DOC_REVIEWER": "opus",
+            "DEVBENCH_AGENT_MODEL_CHANGES_MANIFEST": "opus",
         }
         with patch.dict(os.environ, envs, clear=False):
             importlib.reload(config)
@@ -727,10 +662,16 @@ _AC197_12_NEW_VAR = "DEVBENCH_GH_ORG"
 
 
 def _build_subprocess_env(legacy_var: str, legacy_val: str) -> dict[str, str]:
-    """Build a clean env for subprocess tests: required devbench vars plus the legacy sentinel."""
+    """Build a clean env for subprocess tests: required devbench vars plus the legacy sentinel.
+
+    Uses DEVBENCH_* names for the required env vars (AC-197-1) so that only
+    the intentionally-injected legacy var triggers the strict checker.
+    JUDGE_CONFIG_PATH and JUDGE_LOG_FILE remain because config_loader.py and
+    log_setup.py have not yet been migrated to DEVBENCH_* names.
+    """
     env: dict[str, str] = {
-        "JUDGE_CLAUDE_MODEL": "test-model",
-        "JUDGE_WORKSPACE_ROOT": "/tmp/test-workspace",
+        "DEVBENCH_CLAUDE_MODEL": "test-model",
+        "DEVBENCH_WORKSPACE_ROOT": "/tmp/test-workspace",
         "JUDGE_LOG_FILE": "/tmp/test-orchestrator.log",
         "JUDGE_CONFIG_PATH": str(_TEST_YAML),
         legacy_var: legacy_val,
@@ -805,29 +746,29 @@ class TestStrictCheckerFiresAtEarliestStartup:
         # The WORKSPACE_ROOT error must NOT appear -- it fires only when the
         # workspace is unset/empty, which is separate from the strict-checker error.
         # If strict checker fires first, we never reach the WORKSPACE_ROOT check.
-        assert "WORKSPACE_ROOT environment variable is not set" not in combined, (
+        assert "DEVBENCH_WORKSPACE_ROOT environment variable is not set" not in combined, (
             f"WORKSPACE_ROOT error appeared before strict-checker fired. "
             f"The strict check must be wired before WORKSPACE_ROOT resolution. "
             f"output={combined!r}"
         )
 
     def test_error_fires_before_llm_model_is_read(self) -> None:
-        """The strict-checker error appears before JUDGE_CLAUDE_MODEL is read.
+        """The strict-checker error appears before DEVBENCH_CLAUDE_MODEL is read.
 
         Verifies the strict checker fires before LLM client construction (AC-197-12).
-        The test intentionally omits JUDGE_CLAUDE_MODEL from the env and sets
+        The test intentionally omits DEVBENCH_CLAUDE_MODEL from the env and sets
         the legacy var; the strict-checker must fire before the absent-model error.
         """
         env = _build_subprocess_env(_AC197_12_LEGACY_VAR, "legacy-org-value")
         # Remove the LLM model var so if the process somehow gets past the
         # strict check it would hit a different error (no-model RuntimeError).
-        env.pop("JUDGE_CLAUDE_MODEL", None)
+        env.pop("DEVBENCH_CLAUDE_MODEL", None)
         result = self._run_import(env)
         combined = result.stderr + result.stdout
         assert "is no longer accepted" in combined, f"Expected strict-checker message in output but got: {combined!r}"
         # If the LLM model absence error appears, the strict check ran AFTER
         # the model-read -- a violation of the ordering invariant.
-        assert "JUDGE_CLAUDE_MODEL environment variable is not set" not in combined, (
+        assert "DEVBENCH_CLAUDE_MODEL environment variable is not set" not in combined, (
             f"CLAUDE_MODEL error appeared -- strict checker did not fire before LLM model read. output={combined!r}"
         )
 
@@ -859,3 +800,376 @@ class TestStrictCheckerFiresAtEarliestStartup:
         combined = result.stderr + result.stdout
         assert legacy_var in combined, f"Legacy var {legacy_var!r} missing from error output: {combined!r}"
         assert new_var in combined, f"New var {new_var!r} missing from error output: {combined!r}"
+
+
+# ---------------------------------------------------------------------------
+# AC-197-1: every call site in config.py reads DEVBENCH_* via _read_env_strict
+# AC-197-2: setting JUDGE_* causes hard rejection at module load
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestAC197CallSiteMigration:
+    """AC-197-1 / AC-197-2: every config.py call site uses DEVBENCH_* via _read_env_strict.
+
+    For each JUDGE_X -> DEVBENCH_X pair that was previously resolved via legacy
+    helpers (now removed), each site now uses _strict_int / _strict_str /
+    _strict_bool / _strict_float / _strict_optional_str / _strict_str_tuple
+    which delegate to _read_env_strict. We verify:
+      (a) DEVBENCH_X overrides the resolved constant correctly.
+      (b) JUDGE_X set in env causes RuntimeError on config module reload.
+    """
+
+    @pytest.mark.parametrize(
+        "legacy_var,new_var,test_value,attr_name",
+        [
+            ("JUDGE_MAX_RETRIES", "DEVBENCH_MAX_RETRIES", "77", "MAX_RETRY_ATTEMPTS"),
+            ("JUDGE_GH_TIMEOUT", "DEVBENCH_GH_TIMEOUT", "999", "GITHUB_CHECK_TIMEOUT_SECONDS"),
+            ("JUDGE_CI_FAILURE_LOG_BYTES", "DEVBENCH_CI_FAILURE_LOG_BYTES", "1024", "CI_FAILURE_LOG_BYTES"),
+            ("JUDGE_STOP_MAX_BLOCKS", "DEVBENCH_STOP_MAX_BLOCKS", "9", "STOP_HOOK_MAX_BLOCKS"),
+            ("JUDGE_STOP_WINDOW_SECONDS", "DEVBENCH_STOP_WINDOW_SECONDS", "77", "STOP_HOOK_WINDOW_SECONDS"),
+            ("JUDGE_STOP_STALE_MINUTES", "DEVBENCH_STOP_STALE_MINUTES", "55", "STOP_HOOK_STALE_TASK_MINUTES"),
+            ("JUDGE_GH_API_TIMEOUT", "DEVBENCH_GH_API_TIMEOUT", "45", "GH_API_TIMEOUT"),
+            ("JUDGE_TEST_TIMEOUT", "DEVBENCH_TEST_TIMEOUT", "888", "TEST_TIMEOUT"),
+            ("JUDGE_LLM_TIMEOUT", "DEVBENCH_LLM_TIMEOUT", "777", "LLM_TIMEOUT"),
+            ("JUDGE_COMMAND_TIMEOUT", "DEVBENCH_COMMAND_TIMEOUT", "333", "COMMAND_TIMEOUT"),
+            ("JUDGE_ALERT_SUMMARY_LIMIT", "DEVBENCH_ALERT_SUMMARY_LIMIT", "5", "ALERT_SUMMARY_LIMIT"),
+            ("JUDGE_OUTPUT_TRUNCATION", "DEVBENCH_OUTPUT_TRUNCATION", "500", "OUTPUT_TRUNCATION_LIMIT"),
+            ("JUDGE_LLM_EVIDENCE_TRUNCATION", "DEVBENCH_LLM_EVIDENCE_TRUNCATION", "9999", "LLM_EVIDENCE_TRUNCATION"),
+            ("JUDGE_LLM_FILE_CONTEXT_LIMIT", "DEVBENCH_LLM_FILE_CONTEXT_LIMIT", "3", "LLM_FILE_CONTEXT_LIMIT"),
+            ("JUDGE_LLM_FILE_PREVIEW_CHARS", "DEVBENCH_LLM_FILE_PREVIEW_CHARS", "111", "LLM_FILE_PREVIEW_CHARS"),
+            (
+                "JUDGE_ORCHESTRATOR_POLL_INTERVAL",
+                "DEVBENCH_ORCHESTRATOR_POLL_INTERVAL",
+                "99",
+                "ORCHESTRATOR_POLL_INTERVAL",
+            ),
+            (
+                "JUDGE_ORCHESTRATE_MAX_CASCADE_DEPTH",
+                "DEVBENCH_ORCHESTRATE_MAX_CASCADE_DEPTH",
+                "4",
+                "MAX_CASCADE_DEPTH",
+            ),
+            (
+                "JUDGE_CHECK_REGISTRATION_RETRIES",
+                "DEVBENCH_CHECK_REGISTRATION_RETRIES",
+                "3",
+                "CHECK_REGISTRATION_RETRIES",
+            ),
+            (
+                "JUDGE_CHECK_REGISTRATION_DELAY_SECONDS",
+                "DEVBENCH_CHECK_REGISTRATION_DELAY_SECONDS",
+                "2",
+                "CHECK_REGISTRATION_DELAY_SECONDS",
+            ),
+            (
+                "JUDGE_BLOCKED_RECOVERY_WINDOW_SECONDS",
+                "DEVBENCH_BLOCKED_RECOVERY_WINDOW_SECONDS",
+                "600",
+                "BLOCKED_RECOVERY_WINDOW_SECONDS",
+            ),
+            ("JUDGE_PR_REVIEW_SETTLE_SECONDS", "DEVBENCH_PR_REVIEW_SETTLE_SECONDS", "30", "PR_REVIEW_SETTLE_SECONDS"),
+            ("JUDGE_PR_REVIEW_POLL_INTERVAL", "DEVBENCH_PR_REVIEW_POLL_INTERVAL", "2", "PR_REVIEW_POLL_INTERVAL"),
+            ("JUDGE_HOOK_TAIL_AGENT_WIDTH", "DEVBENCH_HOOK_TAIL_AGENT_WIDTH", "20", "HOOK_TAIL_AGENT_WIDTH"),
+            ("JUDGE_HOOK_TAIL_TOOL_WIDTH", "DEVBENCH_HOOK_TAIL_TOOL_WIDTH", "15", "HOOK_TAIL_TOOL_WIDTH"),
+            (
+                "JUDGE_HOOK_TAIL_DESCRIPTION_MAX",
+                "DEVBENCH_HOOK_TAIL_DESCRIPTION_MAX",
+                "200",
+                "HOOK_TAIL_DESCRIPTION_MAX",
+            ),
+            (
+                "JUDGE_HOOK_TAIL_STDOUT_PREVIEW_MAX",
+                "DEVBENCH_HOOK_TAIL_STDOUT_PREVIEW_MAX",
+                "50",
+                "HOOK_TAIL_STDOUT_PREVIEW_MAX",
+            ),
+            ("JUDGE_REPORT_RECENT_PACE_TASKS", "DEVBENCH_REPORT_RECENT_PACE_TASKS", "6", "RECENT_PACE_TASKS"),
+            ("JUDGE_SECURITY_FETCH_TIMEOUT", "DEVBENCH_SECURITY_FETCH_TIMEOUT", "66", "SECURITY_FETCH_TIMEOUT"),
+        ],
+    )
+    def test_devbench_int_var_overrides_constant(
+        self,
+        legacy_var: str,
+        new_var: str,
+        test_value: str,
+        attr_name: str,
+    ) -> None:
+        """DEVBENCH_* int var overrides the resolved constant (AC-197-1)."""
+        with patch.dict(os.environ, {new_var: test_value}, clear=False):
+            importlib.reload(config)
+            assert getattr(config, attr_name) == int(test_value), (
+                f"{new_var}={test_value} expected to set {attr_name}={int(test_value)}, "
+                f"got {getattr(config, attr_name)}"
+            )
+        importlib.reload(config)
+
+    @pytest.mark.parametrize(
+        "legacy_var,legacy_val",
+        [
+            ("JUDGE_MAX_RETRIES", "7"),
+            ("JUDGE_GH_TIMEOUT", "120"),
+            ("JUDGE_CI_FAILURE_LOG_BYTES", "1024"),
+            ("JUDGE_STOP_MAX_BLOCKS", "3"),
+            ("JUDGE_STOP_WINDOW_SECONDS", "60"),
+            ("JUDGE_STOP_STALE_MINUTES", "30"),
+            ("JUDGE_GH_API_TIMEOUT", "45"),
+            ("JUDGE_TEST_TIMEOUT", "300"),
+            ("JUDGE_LLM_TIMEOUT", "600"),
+            ("JUDGE_COMMAND_TIMEOUT", "120"),
+            ("JUDGE_ALERT_SUMMARY_LIMIT", "5"),
+            ("JUDGE_OUTPUT_TRUNCATION", "500"),
+            ("JUDGE_LLM_EVIDENCE_TRUNCATION", "9000"),
+            ("JUDGE_LLM_FILE_CONTEXT_LIMIT", "3"),
+            ("JUDGE_LLM_FILE_PREVIEW_CHARS", "1000"),
+            ("JUDGE_ORCHESTRATOR_POLL_INTERVAL", "5"),
+            ("JUDGE_ORCHESTRATE_MAX_CASCADE_DEPTH", "3"),
+            ("JUDGE_CHECK_REGISTRATION_RETRIES", "3"),
+            ("JUDGE_CHECK_REGISTRATION_DELAY_SECONDS", "2"),
+            ("JUDGE_BLOCKED_RECOVERY_WINDOW_SECONDS", "600"),
+            ("JUDGE_PR_REVIEW_SETTLE_SECONDS", "30"),
+            ("JUDGE_PR_REVIEW_POLL_INTERVAL", "2"),
+            ("JUDGE_HOOK_TAIL_AGENT_WIDTH", "20"),
+            ("JUDGE_HOOK_TAIL_TOOL_WIDTH", "15"),
+            ("JUDGE_HOOK_TAIL_DESCRIPTION_MAX", "200"),
+            ("JUDGE_HOOK_TAIL_STDOUT_PREVIEW_MAX", "50"),
+            ("JUDGE_REPORT_RECENT_PACE_TASKS", "6"),
+            ("JUDGE_SECURITY_FETCH_TIMEOUT", "66"),
+        ],
+    )
+    def test_legacy_int_var_causes_rejection(
+        self,
+        legacy_var: str,
+        legacy_val: str,
+    ) -> None:
+        """Setting a legacy JUDGE_* int var causes RuntimeError on reload (AC-197-2)."""
+        with patch.dict(os.environ, {legacy_var: legacy_val}, clear=False):
+            with pytest.raises(RuntimeError, match="is no longer accepted"):
+                importlib.reload(config)
+        importlib.reload(config)
+
+    @pytest.mark.parametrize(
+        "legacy_var,new_var,test_value,attr_name",
+        [
+            ("JUDGE_INLINE_ORPHAN_CLEANUP", "DEVBENCH_INLINE_ORPHAN_CLEANUP", "0", "INLINE_ORPHAN_CLEANUP_ENABLED"),
+            ("JUDGE_CI_FAILURE_RETRY_ENABLED", "DEVBENCH_CI_FAILURE_RETRY_ENABLED", "0", "CI_FAILURE_RETRY_ENABLED"),
+            ("JUDGE_PR_REVIEW_DECISION_BLOCKS", "DEVBENCH_PR_REVIEW_DECISION_BLOCKS", "0", "PR_REVIEW_DECISION_BLOCKS"),
+            (
+                "JUDGE_PR_REVIEW_RESOLUTION_ENABLED",
+                "DEVBENCH_PR_REVIEW_RESOLUTION_ENABLED",
+                "1",
+                "PR_REVIEW_RESOLUTION_ENABLED",
+            ),
+            ("JUDGE_PAUSE_BEFORE_MERGE", "DEVBENCH_PAUSE_BEFORE_MERGE", "1", "PAUSE_BEFORE_MERGE"),
+            ("JUDGE_USE_BEDROCK", "DEVBENCH_USE_BEDROCK", "1", "USE_BEDROCK"),
+        ],
+    )
+    def test_devbench_bool_var_overrides_constant(
+        self,
+        legacy_var: str,
+        new_var: str,
+        test_value: str,
+        attr_name: str,
+    ) -> None:
+        """DEVBENCH_* bool var overrides the resolved constant (AC-197-1)."""
+        expected = test_value in ("1", "true", "yes", "on")
+        with patch.dict(os.environ, {new_var: test_value}, clear=False):
+            importlib.reload(config)
+            assert getattr(config, attr_name) == expected, (
+                f"{new_var}={test_value} expected to set {attr_name}={expected}, got {getattr(config, attr_name)}"
+            )
+        importlib.reload(config)
+
+    @pytest.mark.parametrize(
+        "legacy_var,legacy_val",
+        [
+            ("JUDGE_INLINE_ORPHAN_CLEANUP", "0"),
+            ("JUDGE_CI_FAILURE_RETRY_ENABLED", "0"),
+            ("JUDGE_PR_REVIEW_DECISION_BLOCKS", "0"),
+            ("JUDGE_PR_REVIEW_RESOLUTION_ENABLED", "1"),
+            ("JUDGE_PAUSE_BEFORE_MERGE", "1"),
+            ("JUDGE_USE_BEDROCK", "1"),
+        ],
+    )
+    def test_legacy_bool_var_causes_rejection(
+        self,
+        legacy_var: str,
+        legacy_val: str,
+    ) -> None:
+        """Setting a legacy JUDGE_* bool var causes RuntimeError on reload (AC-197-2)."""
+        with patch.dict(os.environ, {legacy_var: legacy_val}, clear=False):
+            with pytest.raises(RuntimeError, match="is no longer accepted"):
+                importlib.reload(config)
+        importlib.reload(config)
+
+    @pytest.mark.parametrize(
+        "legacy_var,new_var,test_value,attr_name",
+        [
+            (
+                "JUDGE_REPORT_TOKEN_COST_DISCOUNT",
+                "DEVBENCH_REPORT_TOKEN_COST_DISCOUNT",
+                "0.15",
+                "TOKEN_COST_DISCOUNT",
+            ),
+            (
+                "JUDGE_REPORT_CACHE_READ_MULTIPLIER",
+                "DEVBENCH_REPORT_CACHE_READ_MULTIPLIER",
+                "0.05",
+                "REPORT_CACHE_READ_MULTIPLIER",
+            ),
+            (
+                "JUDGE_REPORT_CACHE_WRITE_5MIN_MULTIPLIER",
+                "DEVBENCH_REPORT_CACHE_WRITE_5MIN_MULTIPLIER",
+                "1.5",
+                "REPORT_CACHE_WRITE_5MIN_MULTIPLIER",
+            ),
+            (
+                "JUDGE_REPORT_CACHE_WRITE_1HR_MULTIPLIER",
+                "DEVBENCH_REPORT_CACHE_WRITE_1HR_MULTIPLIER",
+                "2.5",
+                "REPORT_CACHE_WRITE_1HR_MULTIPLIER",
+            ),
+            (
+                "JUDGE_REPORT_DATA_RESIDENCY_MULTIPLIER",
+                "DEVBENCH_REPORT_DATA_RESIDENCY_MULTIPLIER",
+                "1.2",
+                "REPORT_DATA_RESIDENCY_MULTIPLIER",
+            ),
+            (
+                "JUDGE_REPORT_FAST_MODE_MULTIPLIER",
+                "DEVBENCH_REPORT_FAST_MODE_MULTIPLIER",
+                "5.0",
+                "REPORT_FAST_MODE_MULTIPLIER",
+            ),
+        ],
+    )
+    def test_devbench_float_var_overrides_constant(
+        self,
+        legacy_var: str,
+        new_var: str,
+        test_value: str,
+        attr_name: str,
+    ) -> None:
+        """DEVBENCH_* float var overrides the resolved constant (AC-197-1)."""
+        with patch.dict(os.environ, {new_var: test_value}, clear=False):
+            importlib.reload(config)
+            assert getattr(config, attr_name) == float(test_value), (
+                f"{new_var}={test_value} expected to set {attr_name}={float(test_value)}, "
+                f"got {getattr(config, attr_name)}"
+            )
+        importlib.reload(config)
+
+    @pytest.mark.parametrize(
+        "legacy_var,legacy_val",
+        [
+            ("JUDGE_REPORT_TOKEN_COST_DISCOUNT", "0.15"),
+            ("JUDGE_REPORT_CACHE_READ_MULTIPLIER", "0.05"),
+            ("JUDGE_REPORT_CACHE_WRITE_5MIN_MULTIPLIER", "1.5"),
+            ("JUDGE_REPORT_CACHE_WRITE_1HR_MULTIPLIER", "2.5"),
+            ("JUDGE_REPORT_DATA_RESIDENCY_MULTIPLIER", "1.2"),
+            ("JUDGE_REPORT_FAST_MODE_MULTIPLIER", "5.0"),
+        ],
+    )
+    def test_legacy_float_var_causes_rejection(
+        self,
+        legacy_var: str,
+        legacy_val: str,
+    ) -> None:
+        """Setting a legacy JUDGE_* float var causes RuntimeError on reload (AC-197-2)."""
+        with patch.dict(os.environ, {legacy_var: legacy_val}, clear=False):
+            with pytest.raises(RuntimeError, match="is no longer accepted"):
+                importlib.reload(config)
+        importlib.reload(config)
+
+    @pytest.mark.parametrize(
+        "legacy_var,new_var,test_value,attr_name",
+        [
+            ("JUDGE_REPORT_TIMEZONE", "DEVBENCH_REPORT_TIMEZONE", "US/Eastern", "REPORT_DISPLAY_TIMEZONE"),
+            ("JUDGE_DISPLAY_TIMEZONE", "DEVBENCH_DISPLAY_TIMEZONE", "Europe/Paris", "DISPLAY_TIMEZONE"),
+            ("JUDGE_BEDROCK_REGION", "DEVBENCH_BEDROCK_REGION", "eu-west-1", "BEDROCK_REGION"),
+            ("JUDGE_PR_REVIEW_AGENTS", "DEVBENCH_PR_REVIEW_AGENTS", "bot-a,bot-b", "PR_REVIEW_AGENTS"),
+            (
+                "JUDGE_GH_TOKEN_FILE",
+                "DEVBENCH_GH_TOKEN_FILE",
+                "/tmp/test_gh_token",
+                "GH_TOKEN_FILE",
+            ),
+            (
+                "JUDGE_CLAUDE_CREDENTIALS_FILE",
+                "DEVBENCH_CLAUDE_CREDENTIALS_FILE",
+                "/tmp/test_creds.json",
+                "CLAUDE_CREDENTIALS_FILE",
+            ),
+            (
+                "JUDGE_CLAUDE_MODEL",
+                "DEVBENCH_CLAUDE_MODEL",
+                "test-model-v2",
+                "CLAUDE_MODEL",
+            ),
+        ],
+    )
+    def test_devbench_str_var_overrides_constant(
+        self,
+        legacy_var: str,
+        new_var: str,
+        test_value: str,
+        attr_name: str,
+    ) -> None:
+        """DEVBENCH_* string var overrides the resolved constant (AC-197-1)."""
+        with patch.dict(os.environ, {new_var: test_value}, clear=False):
+            importlib.reload(config)
+            resolved = getattr(config, attr_name)
+            # For PR_REVIEW_AGENTS it's a tuple; for Path types, compare as string.
+            if attr_name == "PR_REVIEW_AGENTS":
+                assert resolved == ("bot-a", "bot-b"), f"Expected ('bot-a', 'bot-b'), got {resolved}"
+            elif hasattr(resolved, "__fspath__"):
+                assert str(resolved) == test_value, f"Expected {test_value!r}, got {resolved!r}"
+            else:
+                assert resolved == test_value, f"Expected {test_value!r}, got {resolved!r}"
+        importlib.reload(config)
+
+    @pytest.mark.parametrize(
+        "legacy_var,legacy_val",
+        [
+            ("JUDGE_REPORT_TIMEZONE", "US/Eastern"),
+            ("JUDGE_DISPLAY_TIMEZONE", "Europe/Paris"),
+            ("JUDGE_BEDROCK_REGION", "eu-west-1"),
+            ("JUDGE_PR_REVIEW_AGENTS", "bot-a,bot-b"),
+            ("JUDGE_GH_TOKEN_FILE", "/tmp/test_gh_token"),
+            ("JUDGE_CLAUDE_CREDENTIALS_FILE", "/tmp/test_creds.json"),
+            ("JUDGE_CLAUDE_MODEL", "some-model"),
+        ],
+    )
+    def test_legacy_str_var_causes_rejection(
+        self,
+        legacy_var: str,
+        legacy_val: str,
+    ) -> None:
+        """Setting a legacy JUDGE_* string var causes RuntimeError on reload (AC-197-2)."""
+        with patch.dict(os.environ, {legacy_var: legacy_val}, clear=False):
+            with pytest.raises(RuntimeError, match="is no longer accepted"):
+                importlib.reload(config)
+        importlib.reload(config)
+
+    @pytest.mark.parametrize(
+        "legacy_var,new_var",
+        [
+            ("JUDGE_MAX_RETRIES", "DEVBENCH_MAX_RETRIES"),
+            ("JUDGE_GH_TIMEOUT", "DEVBENCH_GH_TIMEOUT"),
+            ("JUDGE_INLINE_ORPHAN_CLEANUP", "DEVBENCH_INLINE_ORPHAN_CLEANUP"),
+            ("JUDGE_USE_BEDROCK", "DEVBENCH_USE_BEDROCK"),
+            ("JUDGE_BEDROCK_REGION", "DEVBENCH_BEDROCK_REGION"),
+            ("JUDGE_REPORT_TIMEZONE", "DEVBENCH_REPORT_TIMEZONE"),
+            ("JUDGE_CLAUDE_MODEL", "DEVBENCH_CLAUDE_MODEL"),
+        ],
+    )
+    def test_legacy_presence_rejects_even_when_new_also_set(
+        self,
+        legacy_var: str,
+        new_var: str,
+    ) -> None:
+        """AC-197-3: when both JUDGE_X and DEVBENCH_X are set, the legacy presence causes rejection."""
+        with patch.dict(os.environ, {legacy_var: "old-val", new_var: "new-val"}, clear=False):
+            with pytest.raises(RuntimeError, match="is no longer accepted"):
+                importlib.reload(config)
+        importlib.reload(config)

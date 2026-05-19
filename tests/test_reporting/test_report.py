@@ -2306,19 +2306,16 @@ class TestSpanningRows:
         eta_line = next(ln for ln in lines if "Est. time" in ln)
         assert long_eta in eta_line
 
-    def test_multi_column_table_uses_per_column_widths(self) -> None:
-        """Regression #214: a wide cell in one column must NOT push other
-        columns to the same width.
-
-        The bug: ``value_w`` was a single int shared across all value columns,
-        derived from the global ``max_cell`` across every cell.  When one
-        cell is significantly wider (e.g., the ETA breakdown gains
-        ``+ blocked-runtime-degradation N`` in the All-time column only,
-        adding ~32 chars), every value column inflated to that width.
-
-        Fixed behaviour: each column tracks its own max-cell-width.
+    def test_multi_column_table_caps_columns_and_wraps_long_cells(self) -> None:
+        """Regression #214: a wide cell does NOT inflate every column to its
+        width.  Instead the column is capped at ``MAX_VALUE_COL_WIDTH`` and
+        the cell wraps onto multiple physical lines, preferring `` + ``
+        boundaries and never breaking a word mid-character.
         """
-        from devbench.reporting.report import _render_multi_column_table
+        from devbench.reporting.report import (
+            MAX_VALUE_COL_WIDTH,
+            _render_multi_column_table,
+        )
 
         long_value = (
             "~5.7 h (active 3 + blocked-recovery 12 + blocked-auto 11 + blocked-runtime-degradation 1 at 12.7 min/task)"
@@ -2334,29 +2331,28 @@ class TestSpanningRows:
         )
 
         border_top = lines[0]
-        # Border shape: ┌─...─┬─...─┬─...─┐ -- split on ┬ yields three runs.
         segments = border_top.split("┬")
-        assert len(segments) == 3, f"Expected 3 segments split on ┬, got {len(segments)}: {border_top!r}"
         col1_width = len(segments[1])
-        col2_width = len(segments[2]) - 1  # strip trailing ┐
-        assert col1_width > col2_width, (
-            f"All-time column (long values) should be wider than Session column (shorter values); "
-            f"got col1={col1_width} col2={col2_width}"
+        col2_width = len(segments[2]) - 1
+        assert col1_width <= MAX_VALUE_COL_WIDTH + 2, (
+            f"col1 must be capped near {MAX_VALUE_COL_WIDTH}; got {col1_width}"
         )
-        assert col1_width - col2_width >= 20, (
-            f"Per-column widths must be independent; column 2 should be ~30 chars narrower than column 1, "
-            f"but got col1={col1_width} col2={col2_width} (delta={col1_width - col2_width})"
+        assert col2_width <= MAX_VALUE_COL_WIDTH + 2, (
+            f"col2 must be capped near {MAX_VALUE_COL_WIDTH}; got {col2_width}"
         )
-        # All rendered lines must still have the same overall width.
         widths = {len(ln) for ln in lines}
         assert len(widths) == 1, f"Lines must be uniform width; got {sorted(widths)}"
+        joined = chr(10).join(lines)
+        assert "blocked-recovery 12" in joined, "word must not be broken mid-character"
+        assert "blocked-runtime-degradation 1" in joined, "word must not be broken mid-character"
+        assert not any(long_value in ln for ln in lines), "Long cell must wrap; was found unwrapped on a single line"
 
-    def test_grouped_progress_table_uses_per_column_widths(self) -> None:
-        """Regression #214: ``_render_grouped_progress_table`` shares the same
-        single-width bug as ``_render_multi_column_table``.  Per-column widths
-        must apply to the unified report table too.
-        """
-        from devbench.reporting.report import _render_grouped_progress_table
+    def test_grouped_progress_table_caps_columns_and_wraps_long_cells(self) -> None:
+        """Regression #214: same cap-and-wrap applies to the grouped table."""
+        from devbench.reporting.report import (
+            MAX_VALUE_COL_WIDTH,
+            _render_grouped_progress_table,
+        )
 
         long_value = (
             "~5.7 h (active 3 + blocked-recovery 12 + blocked-auto 11 + blocked-runtime-degradation 1 at 12.7 min/task)"
@@ -2378,15 +2374,43 @@ class TestSpanningRows:
 
         border_top = lines[0]
         segments = border_top.split("┬")
-        assert len(segments) == 3, f"Expected 3 segments split on ┬, got {len(segments)}: {border_top!r}"
         col1_width = len(segments[1])
         col2_width = len(segments[2]) - 1
-        assert col1_width - col2_width >= 20, (
-            f"Per-column widths must be independent in grouped table; "
-            f"got col1={col1_width} col2={col2_width} (delta={col1_width - col2_width})"
-        )
+        assert col1_width <= MAX_VALUE_COL_WIDTH + 2, f"col1 capped; got {col1_width}"
+        assert col2_width <= MAX_VALUE_COL_WIDTH + 2, f"col2 capped; got {col2_width}"
         widths = {len(ln) for ln in lines}
         assert len(widths) == 1, f"Lines must be uniform width; got {sorted(widths)}"
+        joined = chr(10).join(lines)
+        assert "blocked-recovery 12" in joined
+        assert "blocked-runtime-degradation 1" in joined
+        assert not any(long_value in ln for ln in lines), "Long cell must wrap"
+
+    def test_wrap_cell_value_splits_on_plus_boundaries(self) -> None:
+        """Issue #214: ``_wrap_cell_value`` prefers `` + `` boundaries.
+        Every continuation line starts with ``+ `` and every word from the
+        input appears intact somewhere in the wrapped output."""
+        from devbench.reporting.report import _wrap_cell_value
+
+        text = "~5.7 h (active 3 + blocked-recovery 12 + blocked-auto 11 + blocked-runtime-degradation 1)"
+        wrapped = _wrap_cell_value(text, max_width=40)
+        for ln in wrapped[1:]:
+            assert ln.startswith("+ "), f"continuation must start with '+ '; got {ln!r}"
+        for word in text.split():
+            assert any(word in ln for ln in wrapped), f"word {word!r} missing"
+
+    def test_wrap_cell_value_never_breaks_a_word(self) -> None:
+        """Issue #214 critical: even when a single word exceeds max_width,
+        the wrap function must NOT break it.  The line containing the long
+        word may exceed max_width; callers widen the column via
+        ``_longest_word_len`` to fit it."""
+        from devbench.reporting.report import _wrap_cell_value
+
+        long_word = "blocked-runtime-degradation"
+        text = f"head {long_word} tail"
+        wrapped = _wrap_cell_value(text, max_width=10)
+        assert any(long_word in ln for ln in wrapped), (
+            f"Wrap broke a word; long_word {long_word!r} not intact in {wrapped!r}"
+        )
 
     def test_report_end_to_end_spans_recent_pace_and_est_time(self, tmp_path: Path) -> None:
         """In the rendered report, Recent pace and Est. time rows are single spanning cells

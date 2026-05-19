@@ -338,15 +338,21 @@ since the last release. PR #119 carries every change.
   `_render_grouped_progress_table` shared a single `value_w` across every
   value column, derived from `max_cell` over every cell.  A single wide
   cell (e.g., the ETA breakdown All-time value with
-  `+ blocked-runtime-degradation N` appended) inflated all columns to that
-  width, producing ~110-char-wide columns and pushing the table well past
+  `+ blocked-runtime-degradation N` appended, ~107 chars vs Session's
+  ~74) inflated all columns to that width, producing a table well past
   any reasonable terminal width.  Both renderers now compute per-column
-  widths via `_compute_value_widths`: each column's width is the max of
-  default, label, and that column's own cells.  Spanning rows still cause
-  uniform widening of all columns via `_widen_for_spanning` to satisfy
-  the joined-span constraint, preserving the relative column-width
-  ordering.  Pinned by `tests/test_reporting/test_report.py::TestSpanningRows::test_multi_column_table_uses_per_column_widths`
-  and `::test_grouped_progress_table_uses_per_column_widths`.
+  widths AND cap each column at `MAX_VALUE_COL_WIDTH` (50 chars); cells
+  exceeding the cap wrap onto multiple physical lines via
+  `_wrap_cell_value`, which prefers `` + `` boundaries first, falls back
+  to whitespace word-wrap, and never breaks a single word
+  mid-character (the long-word floor `_longest_word_len` keeps the column
+  wide enough to fit unbreakable identifiers like
+  `blocked-runtime-degradation`).  Spanning rows wrap to the joined-span
+  width on the same rules.  Pinned by
+  `tests/test_reporting/test_report.py::TestSpanningRows::test_multi_column_table_caps_columns_and_wraps_long_cells`,
+  `::test_grouped_progress_table_caps_columns_and_wraps_long_cells`,
+  `::test_wrap_cell_value_splits_on_plus_boundaries`, and
+  `::test_wrap_cell_value_never_breaks_a_word`.
 
 - **`RUNTIME_DEGRADATION` classification persists after orchestrator
   restart** (issue #215).  `_has_runtime_degradation_signal` scanned the

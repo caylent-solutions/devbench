@@ -180,6 +180,9 @@ class WindowStats:
     est_completion_at: datetime | None = None
     # Issue #157: ETA breakdown so the renderer can print
     # ``~5.4 h (active 4 + blocked-recovery 60 + blocked-auto 27 at 5.6 min/task)``.
+    # Issue #214: the renderer caps column widths and wraps long
+    # breakdowns at " + " boundaries so this value never blows out the
+    # table layout, even when all four buckets contribute.
     eta_active: int = 0
     eta_blocked_recovery: int = 0
     eta_blocked_auto: int = 0
@@ -1187,28 +1190,119 @@ def _render_table(title: str, rows: list[tuple[str, str]], value_w: int = 18) ->
     return lines
 
 
+#: Issue #214: cap any value column at this width.  Cells longer than the
+#: cap wrap onto multiple physical lines (see :func:`_wrap_cell_value`).
+#: 50 chars accommodates the longest natural ETA breakdown segment
+#: (``blocked-runtime-degradation NN``) with room for the prefix / suffix
+#: without exceeding a comfortable terminal column width.
+MAX_VALUE_COL_WIDTH: int = 50
+
+
+def _longest_word_len(text: str) -> int:
+    """Length of the longest whitespace-delimited token in ``text``.
+
+    Used as a per-column floor so :func:`_wrap_cell_value` never has to
+    break a word mid-character (which would mangle identifiers like
+    ``blocked-runtime-degradation``).
+    """
+    return max((len(w) for w in text.split()), default=0)
+
+
+def _word_wrap(text: str, max_width: int) -> list[str]:
+    """Greedy word-wrap: lines of at most ``max_width`` chars; never breaks
+    a word.  When a single word exceeds ``max_width`` it occupies its own
+    line at its natural length (the renderer's column-width floor ensures
+    the column is wide enough to hold it without truncation).
+    """
+    words = text.split()
+    if not words:
+        return [text]
+    lines: list[str] = []
+    current = words[0]
+    for w in words[1:]:
+        candidate = f"{current} {w}"
+        if len(candidate) <= max_width:
+            current = candidate
+        else:
+            lines.append(current)
+            current = w
+    lines.append(current)
+    return lines
+
+
+def _wrap_cell_value(text: str, max_width: int) -> list[str]:
+    """Wrap ``text`` onto multiple lines, each at most ``max_width`` chars.
+
+    Strategy (#214):
+
+    1. Split on `` + `` boundaries -- the natural ETA-breakdown separator.
+       Continuation segments are prefixed with ``+ `` so the line break is
+       visually unambiguous.
+    2. Greedy: build each line by accumulating segments until the next
+       would push the line past ``max_width``.
+    3. If any built line is still too wide, word-wrap that line internally
+       on whitespace.
+    4. Never break a word: a single token longer than ``max_width`` occupies
+       its own line at its natural length.  Callers must size the column
+       to :func:`_longest_word_len` so it still fits the table border.
+    """
+    if max_width <= 0 or len(text) <= max_width:
+        return [text]
+    plus_segments = text.split(" + ")
+    if len(plus_segments) > 1:
+        prefixed = [plus_segments[0]] + [f"+ {p}" for p in plus_segments[1:]]
+        lines: list[str] = []
+        current = ""
+        for seg in prefixed:
+            if not current:
+                current = seg
+                continue
+            candidate = f"{current} {seg}"
+            if len(candidate) <= max_width:
+                current = candidate
+            else:
+                lines.append(current)
+                current = seg
+        if current:
+            lines.append(current)
+    else:
+        lines = [text]
+    refined: list[str] = []
+    for ln in lines:
+        if len(ln) <= max_width:
+            refined.append(ln)
+        else:
+            refined.extend(_word_wrap(ln, max_width))
+    return refined
+
+
 def _compute_value_widths(
     column_labels: list[str],
     rows_iter: list[tuple[str, list[str] | str]],
     default_min: int,
+    max_width: int = MAX_VALUE_COL_WIDTH,
 ) -> list[int]:
     """Compute per-column value widths so a wide cell in one column does NOT
     inflate the other columns (#214).
 
-    Each column's width is the max of ``default_min``, that column's label
-    length, and the longest cell observed in that column across non-spanning
-    rows.  Spanning rows (value is a single ``str``) are handled separately
-    by :func:`_widen_for_spanning`, which may widen all columns uniformly
-    to satisfy the spanning constraint while preserving the relative
-    ordering of per-column widths.
+    Each column's natural width is the max of ``default_min``, that column's
+    label length, and the longest cell observed in that column across
+    non-spanning rows.  The natural width is then capped at ``max_width`` --
+    but never below the longest single (unbreakable) word found in the column,
+    so :func:`_wrap_cell_value` never has to break a word mid-character.
+
+    Spanning rows (value is a single ``str``) are handled separately by
+    :func:`_widen_for_spanning`.
     """
     n_cols = len(column_labels)
-    widths: list[int] = [max(default_min, len(label)) for label in column_labels]
+    natural: list[int] = [max(default_min, len(label)) for label in column_labels]
+    word_floor: list[int] = [max(default_min, len(label)) for label in column_labels]
     for _, vals in rows_iter:
         if isinstance(vals, list):
             for i in range(min(n_cols, len(vals))):
-                widths[i] = max(widths[i], len(vals[i]))
-    return widths
+                natural[i] = max(natural[i], len(vals[i]))
+                word_floor[i] = max(word_floor[i], _longest_word_len(vals[i]))
+    return [max(word_floor[i], min(natural[i], max_width)) for i in range(n_cols)]
 
 
 def _widen_for_spanning(value_widths: list[int], max_spanning: int) -> list[int]:
@@ -1292,16 +1386,26 @@ def _render_multi_column_table(
         if i > 0:
             lines.append(border_mid)
         if isinstance(values, str):
-            # Spanning row: a single right-aligned value occupies the full width
-            # of all value columns (including the column separators). The top /
-            # bottom borders of this row still show the regular ┬/┴ junctions
-            # so the column boundaries stay visually consistent throughout the
-            # table; only the content row's internal │ separators are merged.
-            row_line = f"\u2502 {metric:<{metric_w}} \u2502 {values:>{spanning_w}} \u2502"
+            # Spanning row: wrap to spanning_w; metric shows on line 0 only.
+            wrapped = _wrap_cell_value(values, spanning_w)
+            for k, wl in enumerate(wrapped):
+                metric_text = metric if k == 0 else ""
+                row_line = f"\u2502 {metric_text:<{metric_w}} \u2502 {wl:>{spanning_w}} \u2502"
+                lines.append(_colorize_row(row_line, metric))
         else:
-            cells = [f" {metric:<{metric_w}} "] + [f" {v:>{value_widths[j]}} " for j, v in enumerate(values)]
-            row_line = "\u2502" + "\u2502".join(cells) + "\u2502"
-        lines.append(_colorize_row(row_line, metric))
+            # Per-column wrap; row height = max wrapped lines across columns.
+            wrapped_cells = [_wrap_cell_value(v, value_widths[j]) for j, v in enumerate(values)]
+            height = max((len(c) for c in wrapped_cells), default=1)
+            for c in wrapped_cells:
+                while len(c) < height:
+                    c.append("")
+            for k in range(height):
+                metric_text = metric if k == 0 else ""
+                cells = [f" {metric_text:<{metric_w}} "] + [
+                    f" {wrapped_cells[j][k]:>{value_widths[j]}} " for j in range(n_cols)
+                ]
+                row_line = "\u2502" + "\u2502".join(cells) + "\u2502"
+                lines.append(_colorize_row(row_line, metric))
     lines.append(border_bot)
     return lines
 
@@ -1375,11 +1479,24 @@ def _render_grouped_progress_table(
         lines.append(f"\u2502 {section_label.upper():<{section_w}} \u2502")
         for metric, values in rows:
             if isinstance(values, str):
-                row_line = f"\u2502 {metric:<{metric_w}} \u2502 {values:>{spanning_w}} \u2502"
+                wrapped = _wrap_cell_value(values, spanning_w)
+                for k, wl in enumerate(wrapped):
+                    metric_text = metric if k == 0 else ""
+                    row_line = f"\u2502 {metric_text:<{metric_w}} \u2502 {wl:>{spanning_w}} \u2502"
+                    lines.append(_colorize_row(row_line, metric))
             else:
-                cells = [f" {metric:<{metric_w}} "] + [f" {v:>{value_widths[j]}} " for j, v in enumerate(values)]
-                row_line = "\u2502" + "\u2502".join(cells) + "\u2502"
-            lines.append(_colorize_row(row_line, metric))
+                wrapped_cells = [_wrap_cell_value(v, value_widths[j]) for j, v in enumerate(values)]
+                height = max((len(c) for c in wrapped_cells), default=1)
+                for c in wrapped_cells:
+                    while len(c) < height:
+                        c.append("")
+                for k in range(height):
+                    metric_text = metric if k == 0 else ""
+                    cells = [f" {metric_text:<{metric_w}} "] + [
+                        f" {wrapped_cells[j][k]:>{value_widths[j]}} " for j in range(n_cols)
+                    ]
+                    row_line = "\u2502" + "\u2502".join(cells) + "\u2502"
+                    lines.append(_colorize_row(row_line, metric))
     lines.append(border_bot)
     return lines
 
@@ -1439,10 +1556,11 @@ def _format_est_hours_display(stats: WindowStats) -> str:
     if stats.est_hours and stats.recent_pace_minutes is not None:
         # Only surface non-zero blocked-bucket terms so a typical report --
         # where every blocked counter sits at zero -- keeps the breakdown
-        # short enough that the per-cell width does not blow out the
-        # 3-column table. The "active" term always shows. (Width regression
-        # observed after issue #183 added the runtime-degradation term;
-        # this gates each optional term on a positive count.)
+        # short. The "active" term always shows.  Issue #214 caps the
+        # rendered cell width by wrapping long breakdowns at " + "
+        # boundaries inside the table renderer; this builder keeps the
+        # full classification names so the table reads naturally on a
+        # wide terminal.
         parts: list[str] = [f"active {stats.eta_active}"]
         if stats.eta_blocked_recovery:
             parts.append(f"blocked-recovery {stats.eta_blocked_recovery}")

@@ -6213,6 +6213,32 @@ def _check_auto_restart_and_notify(current_reason: str) -> tuple[int, str]:
     return ORCHESTRATOR_RESTART_EXIT_CODE, "auto-restart (RUNTIME_DEGRADATION-only NO_ACTIONABLE)"
 
 
+def _label_stop_reason(exc: BaseException) -> str:
+    """Return a human-readable label for the orchestrator's exit (#213).
+
+    Distinguishes clean exits from real crashes so the ``orchestrator_stop``
+    Slack ping carries an accurate label:
+
+    - ``SystemExit(0)`` (or ``SystemExit()`` with no code) -> clean exit.
+      Raised by ``sys.exit(0)`` or the SIGTERM handler when the orchestrator
+      finishes naturally (NO_ACTIONABLE / ALL_DONE) or the operator drains
+      cleanly.
+    - ``KeyboardInterrupt`` -> operator interrupt (Ctrl+C / SIGINT).  Not a
+      crash; the operator chose to stop the run.
+    - Anything else (including ``SystemExit`` with non-zero code, unhandled
+      exceptions) -> crash with the exception type + message.
+
+    Before this helper, ``cmd_start``'s outer except-clause labeled every
+    BaseException as ``"crash: <type>: <msg>"``, so a clean exit fired
+    Slack pings with the wrong wording (``crash: SystemExit: 0``).
+    """
+    if isinstance(exc, SystemExit) and (exc.code is None or exc.code == 0):
+        return "clean exit (SystemExit 0)"
+    if isinstance(exc, KeyboardInterrupt):
+        return "interrupted by operator (Ctrl+C / SIGINT)"
+    return f"crash: {type(exc).__name__}: {exc}"
+
+
 def _fire_orchestrator_stop_notification(reason: str) -> None:
     """Best-effort always-fire of the ``orchestrator_stop`` notification.
 
@@ -6551,6 +6577,15 @@ def cmd_start(*argv: str) -> int:
                 _stop_reason = f"drain enforced: {reason_text}"
                 return 0
         finally:
+            # Issue #212: drop the drain signal on any exit from the SDK run so
+            # the next start does not inherit a stale request.  Run while
+            # DEVBENCH_SESSION_NAME is still set (before the restore below) so
+            # cancel_drain scans both the per-session and workspace-root
+            # candidate paths.  Idempotent on already-clean state.
+            import contextlib as _contextlib
+
+            with _contextlib.suppress(OSError):
+                cancel_drain(WORKSPACE_ROOT)
             # Restore the previous DEVBENCH_SESSION_NAME value so test isolation is
             # maintained when cmd_start is invoked multiple times in the same process.
             if _prev_session_name is None:
@@ -6571,8 +6606,9 @@ def cmd_start(*argv: str) -> int:
     except BaseException as exc:
         # Capture the exit reason for the always-fire notification before
         # re-raising.  ``BaseException`` covers SystemExit (SIGTERM) and
-        # KeyboardInterrupt in addition to standard exceptions.
-        _stop_reason = f"crash: {type(exc).__name__}: {exc}"
+        # KeyboardInterrupt in addition to standard exceptions; see
+        # _label_stop_reason for the bucketing rules (#213).
+        _stop_reason = _label_stop_reason(exc)
         raise
     finally:
         _fire_orchestrator_stop_notification(_stop_reason)
@@ -6583,6 +6619,14 @@ def cmd_start(*argv: str) -> int:
 
         with contextlib.suppress(OSError, NameError):
             remove_pid_file(_orchestrator_pid_workspace)
+        # Issue #212: drop the drain signal on any exit so the next start
+        # does not inherit a stale request.  cancel_drain scans both the
+        # per-session and workspace-root candidate paths and is idempotent
+        # on already-clean state.  Best-effort: NameError guards a very
+        # early exit before WORKSPACE_ROOT was set; OSError covers
+        # permission-denied during unlink.
+        with contextlib.suppress(OSError, NameError):
+            cancel_drain(WORKSPACE_ROOT)
 
 
 def cmd_prepare_plugin_shadow() -> int:

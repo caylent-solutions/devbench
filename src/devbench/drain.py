@@ -158,6 +158,61 @@ def _signal_path(workspace: Path) -> Path:
     return resolve_drain_signal_path(workspace)
 
 
+def _both_signal_paths(workspace: Path) -> list[Path]:
+    """Return the drain signal paths the reader should scan, in priority order.
+
+    Issue #212: an operator running ``devbench drain`` from a shell typically
+    has no ``DEVBENCH_SESSION_NAME`` env var set, so :func:`request_drain`
+    writes to ``<workspace>/.devbench/drain.signal``.  The orchestrator's
+    ``cmd_start``, however, sets ``DEVBENCH_SESSION_NAME = parsed.name``
+    (default ``"default"``) before its drain loop runs, so its
+    :func:`read_drain_state` / :func:`consume_drain` look at
+    ``<workspace>/.devbench/sessions/default/drain.signal`` and never see the
+    operator's signal.  This helper returns both candidate paths so the
+    reader can fall through to the workspace-root path when the per-session
+    path is empty.
+
+    When ``DEVBENCH_SESSION_NAME`` is unset both paths collapse to the same
+    workspace-root path, in which case only one path is returned.
+
+    Args:
+        workspace: Root directory of the devbench workspace.
+
+    Returns:
+        List of one or two absolute :class:`~pathlib.Path` entries.  The
+        first entry is the per-session path (when active); the second is
+        always the workspace-root path.
+    """
+    primary = _signal_path(workspace)
+    fallback = workspace / DRAIN_SIGNAL_NAME
+    if primary == fallback:
+        return [primary]
+    return [primary, fallback]
+
+
+def _parse_drain_signal(signal: Path) -> DrainState:
+    """Parse a drain signal file's contents into a :class:`DrainState`.
+
+    Extracted from :func:`read_drain_state` so the two-path scan in that
+    function can reuse the parse logic.  Does not check for file existence;
+    callers must guard with ``signal.exists()`` first.
+
+    Raises:
+        ValueError: invalid JSON or non-dict JSON root or bad ``requested_at``.
+        KeyError: missing required field.
+    """
+    raw = signal.read_text(encoding="utf-8")
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"drain signal file contains invalid JSON: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise ValueError(f"drain signal file must contain a JSON object, got {type(data).__name__}")
+
+    return DrainState.from_dict(data)
+
+
 def _current_user() -> str:
     """Return the current OS user name, or ``"unknown"`` when undetectable."""
     return os.environ.get("USER") or os.environ.get("USERNAME") or "unknown"
@@ -212,54 +267,58 @@ def request_drain(workspace: Path, *, reason: str = "") -> Path:
 
 
 def cancel_drain(workspace: Path) -> bool:
-    """Remove the drain signal file if it exists.
+    """Remove the drain signal file(s) if any exist.
+
+    Issue #212: scans both the per-session path (when ``DEVBENCH_SESSION_NAME``
+    is set) AND the workspace-root path so the orchestrator's clean-exit
+    cleanup clears a signal regardless of which writer created it.  When no
+    session is active the two paths collapse to one.  Idempotent: returns
+    ``False`` when no signal exists at any candidate path.
 
     Args:
         workspace: Root directory of the devbench workspace.
 
     Returns:
-        ``True`` if the signal file existed and was removed; ``False`` if
-        the signal file was not present (idempotent).
+        ``True`` if at least one signal file existed and was removed;
+        ``False`` if no signal files were present at any candidate path.
 
     Raises:
         OSError: The unlink step fails for a reason other than the file being
             absent (e.g. permission denied).
     """
-    signal = _signal_path(workspace)
-    if not signal.exists():
-        return False
-    signal.unlink()
-    return True
+    removed = False
+    for signal in _both_signal_paths(workspace):
+        if signal.exists():
+            signal.unlink()
+            removed = True
+    return removed
 
 
 def read_drain_state(workspace: Path) -> DrainState | None:
     """Read and parse the drain signal file without removing it.
 
+    Issue #212: when ``DEVBENCH_SESSION_NAME`` is set, the per-session path
+    is checked first; if it has no signal the reader falls through to the
+    workspace-root path so an operator-issued ``devbench drain`` (which writes
+    the workspace-root path because the CLI inherits no session env) is still
+    observed by the session-scoped orchestrator.
+
     Args:
         workspace: Root directory of the devbench workspace.
 
     Returns:
-        A :class:`DrainState` if the signal file exists; ``None`` otherwise.
+        A :class:`DrainState` for the first existing path in priority order;
+        ``None`` if no signal exists at any candidate path.
 
     Raises:
         ValueError: The signal file contains invalid JSON, a non-dict JSON
             root, or an unparseable ``requested_at`` value.
         KeyError: The signal file is missing a required field.
     """
-    signal = _signal_path(workspace)
-    if not signal.exists():
-        return None
-
-    raw = signal.read_text(encoding="utf-8")
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"drain signal file contains invalid JSON: {exc}") from exc
-
-    if not isinstance(data, dict):
-        raise ValueError(f"drain signal file must contain a JSON object, got {type(data).__name__}")
-
-    return DrainState.from_dict(data)
+    for signal in _both_signal_paths(workspace):
+        if signal.exists():
+            return _parse_drain_signal(signal)
+    return None
 
 
 def consume_drain(workspace: Path) -> DrainState | None:
@@ -268,6 +327,11 @@ def consume_drain(workspace: Path) -> DrainState | None:
     This is the canonical way for the orchestrator to acknowledge a drain
     request. The operation reads the signal, then unlinks the file. If
     parsing fails the file is left in place so the caller can inspect it.
+
+    Issue #212: scans both the per-session path (when active) and the
+    workspace-root path so an operator-issued workspace-root drain is observed
+    by the session-scoped orchestrator.  Only the path that actually held the
+    signal is unlinked.
 
     If the file disappears between the read and the unlink (a concurrent
     cancel or a second consumer racing this call), the successfully-read
@@ -279,8 +343,8 @@ def consume_drain(workspace: Path) -> DrainState | None:
         workspace: Root directory of the devbench workspace.
 
     Returns:
-        A :class:`DrainState` if the signal file existed at read time;
-        ``None`` if no signal file was present.
+        A :class:`DrainState` if any signal file existed at read time;
+        ``None`` if no signal file was present at any candidate path.
 
     Raises:
         ValueError: The signal file contains invalid JSON, a non-dict JSON
@@ -289,13 +353,13 @@ def consume_drain(workspace: Path) -> DrainState | None:
         OSError: The unlink step fails for a reason other than the file being
             absent (e.g. permission denied).
     """
-    state = read_drain_state(workspace)
-    if state is None:
-        return None
-
-    # If the file vanishes between read and unlink (concurrent cancel or second
-    # consumer), the drain was still observed; suppress the missing-file error.
-    with contextlib.suppress(FileNotFoundError):
-        _signal_path(workspace).unlink()
-
-    return state
+    for signal in _both_signal_paths(workspace):
+        if signal.exists():
+            state = _parse_drain_signal(signal)
+            # If the file vanishes between read and unlink (concurrent cancel
+            # or second consumer), the drain was still observed; suppress the
+            # missing-file error.
+            with contextlib.suppress(FileNotFoundError):
+                signal.unlink()
+            return state
+    return None

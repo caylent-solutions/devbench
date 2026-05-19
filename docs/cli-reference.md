@@ -636,7 +636,7 @@ Every field defaults to `null` when absent (use the agent's `.md` frontmatter mo
 
 ## Drain (graceful orchestrator stop)
 
-Operator-initiated graceful stop of a running or about-to-start orchestrator. The drain protocol lets the orchestrator finish its current work unit, then exit cleanly rather than being killed mid-task. The mechanism is a JSON signal file at `<workspace>/.devbench/drain.signal`; the orchestrator polls the file between work units. The file is consumed (deleted) on orchestrator exit so a subsequent `devbench start` runs unscoped. Spec source: `spec/devbench-self-improve.md` section 4.3. Issue #188.
+Operator-initiated graceful stop of a running or about-to-start orchestrator. The drain protocol lets the orchestrator finish its current work unit, then exit cleanly rather than being killed mid-task. The mechanism is a JSON signal file at `<workspace>/.devbench/drain.signal` (or `<workspace>/.devbench/sessions/<name>/drain.signal` when a named session is active); the orchestrator polls the file between work units. The orchestrator's reader scans both candidate paths -- the per-session path first, then the workspace-root path as a fallback -- so a `devbench drain` issued from a shell with no `DEVBENCH_SESSION_NAME` env var is still observed by a session-scoped orchestrator (issue #212). The file is consumed (deleted) on orchestrator exit, and the `finally` clause additionally wipes any signal at either path on every exit (clean, drain-enforced, crash) so a subsequent `devbench start` never inherits a stale request. Spec source: `spec/devbench-self-improve.md` section 4.3. Issues #188 and #212.
 
 ### `drain`
 
@@ -654,7 +654,7 @@ Request, withdraw, or inspect the drain signal. The bare form and `--reason` var
 
 - **`devbench drain --reason "<text>"`** -- same as the bare form, with a non-empty reason string embedded in the payload. The reason is stored verbatim and surfaced by `devbench status` and `devbench drain --status`.
 
-- **`devbench drain --cancel`** -- withdraw the drain request. Deletes `<workspace>/.devbench/drain.signal`. Idempotent: exits 0 silently whether or not a signal file was present. Cancelling while the orchestrator is mid-WU prevents the orchestrator from exiting at the next WU boundary -- it continues as if no drain was requested (AC-188-10). Filesystem failures propagate as unhandled exceptions.
+- **`devbench drain --cancel`** -- withdraw the drain request. Deletes the drain signal from both the per-session path (when `DEVBENCH_SESSION_NAME` is set) and the workspace-root path so a writer at either location is cleared in one call (issue #212). Idempotent: exits 0 silently whether or not a signal file was present at either path. Cancelling while the orchestrator is mid-WU prevents the orchestrator from exiting at the next WU boundary -- it continues as if no drain was requested (AC-188-10). Filesystem failures propagate as unhandled exceptions.
 
 - **`devbench drain --status`** -- print the current drain state and exit rc=0 in both cases:
   - Signal present: prints a one-line summary of the form `drain pending: requested_by=<user> at=<ISO-8601> reason=<reason-or-none>`.
@@ -720,7 +720,7 @@ Per-session state lives under `<workspace>/.devbench/sessions/<name>/`:
 |------|---------|
 | `pid` | The orchestrator process's PID. Used for liveness checks and SIGTERM delivery. |
 | `scope.json` | Session-scoped scope filter (overrides workspace-root `scope.json`). |
-| `drain.signal` | Session-scoped drain marker (overrides workspace-root `drain.signal`). |
+| `drain.signal` | Session-scoped drain marker. Takes priority over workspace-root `drain.signal` when both exist; if the session path is empty, the reader falls through to workspace-root so an operator's `devbench drain` (no session env var) is still observed (issue #212). |
 | `orchestrator.log` | Per-session log, written in addition to the aggregate `<workspace>/logs/orchestrator.log`. |
 | `report.json` | Session-scoped report cache. |
 | `started_at` | ISO 8601 UTC timestamp of session start. |

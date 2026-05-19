@@ -384,7 +384,11 @@ these audit stamps to build the per-session view.
 ```
 
 The per-session `scope.json` and `drain.signal` take precedence over the
-workspace-root equivalents when `DEVBENCH_SESSION_NAME` is set. The aggregate
+workspace-root equivalents when `DEVBENCH_SESSION_NAME` is set.  For
+`drain.signal` specifically, an empty per-session path falls through to
+the workspace-root path so an operator-issued `devbench drain` from a
+shell (which has no `DEVBENCH_SESSION_NAME` env var) is still observed by
+the session-scoped orchestrator (issue #212).  The aggregate
 `logs/orchestrator.log` receives events from all sessions (for backward
 compatibility with operators who run `devbench status` without `--session`).
 

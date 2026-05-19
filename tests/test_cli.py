@@ -5224,6 +5224,42 @@ class TestCmdGitOpsFinalizeHappyPath:
         assert result == 2
 
 
+class TestLabelStopReason:
+    """Pin the bucketed stop-reason label so ``orchestrator_stop`` pings
+    do not mis-label clean exits as crashes (#213)."""
+
+    def test_systemexit_code_zero_is_clean(self) -> None:
+        from devbench.cli import _label_stop_reason
+
+        assert _label_stop_reason(SystemExit(0)) == "clean exit (SystemExit 0)"
+
+    def test_systemexit_with_no_code_is_clean(self) -> None:
+        """``sys.exit()`` (no arg) raises ``SystemExit(None)``; treat as clean."""
+        from devbench.cli import _label_stop_reason
+
+        assert _label_stop_reason(SystemExit()) == "clean exit (SystemExit 0)"
+
+    def test_systemexit_nonzero_code_is_crash(self) -> None:
+        from devbench.cli import _label_stop_reason
+
+        assert _label_stop_reason(SystemExit(1)) == "crash: SystemExit: 1"
+
+    def test_keyboard_interrupt_is_interrupted(self) -> None:
+        from devbench.cli import _label_stop_reason
+
+        assert _label_stop_reason(KeyboardInterrupt()) == "interrupted by operator (Ctrl+C / SIGINT)"
+
+    def test_other_exception_is_crash(self) -> None:
+        from devbench.cli import _label_stop_reason
+
+        assert _label_stop_reason(RuntimeError("boom")) == "crash: RuntimeError: boom"
+
+    def test_value_error_with_empty_message_is_crash(self) -> None:
+        from devbench.cli import _label_stop_reason
+
+        assert _label_stop_reason(ValueError("")) == "crash: ValueError: "
+
+
 class TestCmdStart:
     """Test cmd_start command by mocking claude_agent_sdk."""
 
@@ -17171,7 +17207,9 @@ class TestCmdStartDrainEnforcement:
         """Drain signal present but no claim message -- SDK run completes normally, rc=0.
 
         The drain polling only interrupts on a claim attempt; non-claim
-        messages do not trigger enforcement.
+        messages do not trigger enforcement.  However, the finally clause
+        always wipes the drain signal so the next start does not inherit a
+        stale request (#212).
         """
         import sys
 
@@ -17195,8 +17233,9 @@ class TestCmdStartDrainEnforcement:
             rc = cli.cmd_start()
 
         assert rc == 0
-        # drain signal NOT consumed because no claim was intercepted
-        assert signal_path.exists(), "drain signal must NOT be consumed if no claim was intercepted"
+        # #212: finally clause must clean the drain signal on every exit so
+        # a stale workspace-root signal does not auto-drain the next start.
+        assert not signal_path.exists(), "drain signal must be cleared by finally clause on exit (#212)"
 
     @pytest.mark.unit
     def test_drain_enforced_with_empty_reason(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
@@ -17228,6 +17267,118 @@ class TestCmdStartDrainEnforcement:
         assert rc == 0
         log_text = " ".join(rec.getMessage() for rec in caplog.records)
         assert "[ORCHESTRATOR_DRAIN_ENFORCED]" in log_text
+
+
+class TestCmdStartCancelDrainOnExit:
+    """cmd_start finally clause clears drain.signal from both candidate paths (#212).
+
+    The orchestrator's clean-exit cleanup defends against the path-divergence
+    bug where the operator's ``devbench drain`` writes to the workspace-root
+    path but the session-scoped orchestrator reads from the per-session path.
+    On exit we wipe BOTH so the next start does not auto-drain on a stale
+    request.  Regression test for issue #212.
+    """
+
+    @pytest.mark.unit
+    def test_workspace_root_signal_cleared_on_clean_exit(self, tmp_path: Path) -> None:
+        """drain.signal at workspace-root is removed even when no claim triggered enforcement."""
+        import sys
+
+        signal_path = tmp_path / ".devbench" / "drain.signal"
+        signal_path.parent.mkdir(parents=True)
+        signal_path.write_text(
+            '{"requested_at": "2026-05-16T00:00:00+00:00", "requested_by": "operator", "reason": ""}',
+            encoding="utf-8",
+        )
+
+        import types
+
+        mock_sdk: Any = types.ModuleType("claude_agent_sdk")
+        mock_sdk.ClaudeAgentOptions = MagicMock()
+
+        async def mock_query(**kwargs: object) -> object:
+            yield "plain string"
+
+        mock_sdk.query = mock_query
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch(
+                "devbench.cli._should_auto_restart_after_no_actionable",
+                return_value=(False, []),
+            ),
+        ):
+            rc = cli.cmd_start()
+
+        assert rc == 0
+        assert not signal_path.exists(), (
+            "finally clause must call cancel_drain to remove the workspace-root signal on exit (#212)"
+        )
+
+    @pytest.mark.unit
+    def test_session_path_signal_cleared_on_clean_exit(self, tmp_path: Path) -> None:
+        """drain.signal at per-session path is removed by finally clause on exit (#212)."""
+        import sys
+        import types
+
+        # Per-session path -- cmd_start sets DEVBENCH_SESSION_NAME=default
+        signal_path = tmp_path / SESSION_SESSIONS_BASE_DIR / SESSION_DEFAULT_NAME / "drain.signal"
+        signal_path.parent.mkdir(parents=True)
+        signal_path.write_text(
+            '{"requested_at": "2026-05-16T00:00:00+00:00", "requested_by": "operator", "reason": ""}',
+            encoding="utf-8",
+        )
+
+        mock_sdk: Any = types.ModuleType("claude_agent_sdk")
+        mock_sdk.ClaudeAgentOptions = MagicMock()
+
+        async def mock_query(**kwargs: object) -> object:
+            yield "plain string"
+
+        mock_sdk.query = mock_query
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch(
+                "devbench.cli._should_auto_restart_after_no_actionable",
+                return_value=(False, []),
+            ),
+        ):
+            rc = cli.cmd_start()
+
+        assert rc == 0
+        assert not signal_path.exists(), (
+            "finally clause must call cancel_drain to remove the per-session signal on exit (#212)"
+        )
+
+    @pytest.mark.unit
+    def test_no_drain_signal_present_no_error(self, tmp_path: Path) -> None:
+        """cancel_drain in finally is idempotent: no signal present must not raise (#212)."""
+        import sys
+        import types
+
+        mock_sdk: Any = types.ModuleType("claude_agent_sdk")
+        mock_sdk.ClaudeAgentOptions = MagicMock()
+
+        async def mock_query(**kwargs: object) -> object:
+            yield "plain string"
+
+        mock_sdk.query = mock_query
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch(
+                "devbench.cli._should_auto_restart_after_no_actionable",
+                return_value=(False, []),
+            ),
+        ):
+            rc = cli.cmd_start()
+
+        assert rc == 0
+        assert not (tmp_path / ".devbench" / "drain.signal").exists()
 
 
 # AC-188-10: cancel-drain mid-orchestrate prevents the exit (E3-F3-S1-T2, issue #188)

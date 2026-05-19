@@ -331,6 +331,50 @@ since the last release. PR #119 carries every change.
   circuit-breaker quiet window (e.g., a 180s window tolerates a
   3-minute terraform-apply quiet stretch without flashing STOPPED).
 
+### Fixed
+
+- **`drain.signal` not cleared after orchestrator exit** (issue #212).
+  When an operator ran `devbench drain` from a shell, the signal landed at
+  `<workspace>/.devbench/drain.signal` (no `DEVBENCH_SESSION_NAME` in env),
+  but `cmd_start` set `DEVBENCH_SESSION_NAME = parsed.name` (default
+  `"default"`) before its drain loop ran and therefore looked at
+  `<workspace>/.devbench/sessions/default/drain.signal` -- a different path.
+  `consume_drain` never saw the operator's signal, the file persisted on
+  disk after the orchestrator exited, and the next `devbench start` would
+  read it via the same divergent path mismatch (or, with the per-session
+  reader, would auto-drain on the next claim).  Operators had to run
+  `devbench drain --cancel` manually after every drained shutdown.
+
+  `drain.py::read_drain_state`, `consume_drain`, and `cancel_drain` now
+  scan both candidate paths -- the per-session path (priority) and the
+  workspace-root path (fallback).  The session-scoped reader observes an
+  operator's workspace-root drain.signal; the unlink targets the path
+  that actually held the signal.  `cmd_start`'s SDK-run `finally` clause
+  additionally calls `cancel_drain(WORKSPACE_ROOT)` while
+  `DEVBENCH_SESSION_NAME` is still set, so on every exit (clean,
+  drain-enforced, crash) the signal is wiped from both paths -- the next
+  start does not inherit a stale request.  Pinned by new cases in
+  `tests/test_drain.py::TestPerSessionDrainHelpers` (cross-path
+  read / consume / cancel) and
+  `tests/test_cli.py::TestCmdStartCancelDrainOnExit` (finally-clause
+  cleanup for both paths).
+
+- **Clean orchestrator exits mis-labeled as crashes in `orchestrator_stop`
+  Slack pings** (issue #213).  `cmd_start`'s outer
+  `except BaseException as exc: _stop_reason = f"crash: {type(exc).__name__}: {exc}"`
+  caught `SystemExit(0)` (raised by `sys.exit(0)` on NO_ACTIONABLE /
+  ALL_DONE / SIGTERM-after-drain) and `KeyboardInterrupt` (operator Ctrl+C)
+  and fired the Slack ping with text like `crash: SystemExit: 0`, mixing
+  up "exited cleanly because there was nothing left to do" with "crashed
+  unexpectedly".
+
+  New helper `_label_stop_reason(exc)` buckets the reason: `SystemExit`
+  with code `None` or `0` -> `"clean exit (SystemExit 0)"`;
+  `KeyboardInterrupt` -> `"interrupted by operator (Ctrl+C / SIGINT)"`;
+  anything else (including `SystemExit` with non-zero code) ->
+  `"crash: <type>: <msg>"`.  Pinned by six cases in
+  `tests/test_cli.py::TestLabelStopReason`.
+
 ### Removed
 
 - **`quota_handling.notify_on_pause` / `quota_handling.notify_on_resume`

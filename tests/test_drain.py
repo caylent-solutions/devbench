@@ -726,15 +726,36 @@ class TestPerSessionDrainHelpers:
         assert state.reason == "session-read"
 
     @pytest.mark.unit
-    def test_read_drain_state_returns_none_for_session_when_workspace_root_has_signal(self, tmp_path: Path) -> None:
-        """read_drain_state returns None for session when only workspace-root signal exists."""
+    def test_read_drain_state_falls_through_to_workspace_root_when_session_signal_absent(self, tmp_path: Path) -> None:
+        """read_drain_state falls through to workspace-root signal when session path is empty (#212).
+
+        Operators running ``devbench drain`` from a shell have no
+        ``DEVBENCH_SESSION_NAME`` set, so the signal lands at the
+        workspace-root path.  The session-scoped orchestrator must observe
+        that signal (previously it did not, causing drain.signal to stay on
+        disk indefinitely and the next start to auto-drain).
+        """
         # Write a drain signal at workspace root (no session env vars)
         request_drain(tmp_path, reason="root-only")
-        # Now read with session env vars -- should NOT find the workspace-root signal
+        # Now read with session env vars -- must find workspace-root signal as fallback
         env = self._session_env(tmp_path, "session-f")
         with patch.dict(os.environ, env, clear=False):
             state = read_drain_state(tmp_path)
-        assert state is None
+        assert state is not None
+        assert state.reason == "root-only"
+
+    @pytest.mark.unit
+    def test_read_drain_state_prefers_session_path_when_both_exist(self, tmp_path: Path) -> None:
+        """When both per-session and workspace-root signals exist, session wins (#212)."""
+        # Write workspace-root signal first
+        request_drain(tmp_path, reason="root-signal")
+        # Write per-session signal second
+        env = self._session_env(tmp_path, "session-pref")
+        with patch.dict(os.environ, env, clear=False):
+            request_drain(tmp_path, reason="session-signal")
+            state = read_drain_state(tmp_path)
+        assert state is not None
+        assert state.reason == "session-signal"
 
     @pytest.mark.unit
     def test_consume_drain_consumes_session_path(self, tmp_path: Path) -> None:
@@ -749,21 +770,52 @@ class TestPerSessionDrainHelpers:
         assert not expected.exists()
 
     @pytest.mark.unit
-    def test_consume_drain_does_not_touch_workspace_root_signal(self, tmp_path: Path) -> None:
-        """consume_drain with session env set does not touch the workspace-root drain.signal."""
-        # Write a workspace-root drain signal first
+    def test_consume_drain_falls_through_to_workspace_root_when_session_path_empty(self, tmp_path: Path) -> None:
+        """consume_drain with session env set still observes the workspace-root signal (#212).
+
+        This is the orchestrator's exact runtime configuration: cmd_start
+        sets DEVBENCH_SESSION_NAME, but operators writing the drain signal
+        from a shell do not.  consume_drain must find and remove the
+        operator's signal so the drain is acknowledged + cleaned up.
+        """
+        # Operator writes signal at workspace root (no session env vars)
         request_drain(tmp_path, reason="root-signal")
         workspace_root_signal = tmp_path / DRAIN_SIGNAL_NAME
         assert workspace_root_signal.exists()
 
-        # Now consume with session env -- should only look at session path
+        # Orchestrator consumes with session env active
         env = self._session_env(tmp_path, "session-h")
         with patch.dict(os.environ, env, clear=False):
             state = consume_drain(tmp_path)
-        # Session path has no signal, so consume returns None
-        assert state is None
-        # Workspace-root signal must still exist
-        assert workspace_root_signal.exists()
+
+        assert state is not None
+        assert state.reason == "root-signal"
+        # Workspace-root signal must be removed by the consume
+        assert not workspace_root_signal.exists()
+
+    @pytest.mark.unit
+    def test_cancel_drain_clears_both_paths(self, tmp_path: Path) -> None:
+        """cancel_drain removes signals from both per-session and workspace-root paths (#212)."""
+        # Write workspace-root signal
+        request_drain(tmp_path, reason="root-signal")
+        # Write per-session signal
+        env = self._session_env(tmp_path, "session-clear-both")
+        with patch.dict(os.environ, env, clear=False):
+            request_drain(tmp_path, reason="session-signal")
+            result = cancel_drain(tmp_path)
+        assert result is True
+        # Both paths must be cleared
+        assert not (tmp_path / DRAIN_SIGNAL_NAME).exists()
+        session_signal = tmp_path / ".devbench" / "sessions" / "session-clear-both" / "drain.signal"
+        assert not session_signal.exists()
+
+    @pytest.mark.unit
+    def test_cancel_drain_returns_false_when_neither_path_has_signal(self, tmp_path: Path) -> None:
+        """cancel_drain returns False when neither candidate path has a signal (#212)."""
+        env = self._session_env(tmp_path, "session-empty")
+        with patch.dict(os.environ, env, clear=False):
+            result = cancel_drain(tmp_path)
+        assert result is False
 
     @pytest.mark.unit
     def test_session_isolation_across_two_sessions(self, tmp_path: Path) -> None:

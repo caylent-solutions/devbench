@@ -424,6 +424,45 @@ class TestRejectAmendment:
         with pytest.raises(AmendmentError, match="No pending amendment"):
             reject_amendment(tmp_workspace, tmp_workspace / "BACKLOG.md", "EX-F1-S1-T1", "because")
 
+    def test_rejected_archive_exists_before_mark_blocked_runs(
+        self, tmp_workspace: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression for #210: ``reject_amendment`` must write the rejected-requests
+        archive BEFORE calling ``BacklogManager.mark_blocked`` so the
+        ``classify_blocked_task`` recovery-signal check inside ``mark_blocked``
+        sees the archive and returns ``AWAITING_AMENDMENT_RECOVERY``, not
+        ``OPERATOR_ACTION_REQUIRED``.  Pre-fix order had mark_blocked first
+        and the archive write last; the classifier mislabeled the bucket and
+        the wrong per-class Slack toggle fired.
+        """
+        from devbench.backlog import manager as manager_mod
+
+        task_id = "EX-F1-S1-T1"
+        write_request(tmp_workspace, _sample_request(task_id))
+
+        archive_dir = tmp_workspace / ".devbench" / "rejected-requests"
+
+        original_set_status = manager_mod.BacklogManager._set_status
+        observed: dict[str, bool] = {"archive_present_at_mark_blocked": False}
+
+        def _spy(self, work_unit_path, backlog_index, unit_id, status):  # type: ignore[no-untyped-def]
+            # At the moment mark_blocked transitions state (and triggers
+            # classify_blocked_task), the archive must already be on disk.
+            if status == "blocked" and unit_id == task_id:
+                observed["archive_present_at_mark_blocked"] = archive_dir.is_dir() and any(
+                    p.name.startswith(task_id + "-") and p.suffix == ".json" for p in archive_dir.iterdir()
+                )
+            return original_set_status(self, work_unit_path, backlog_index, unit_id, status)
+
+        monkeypatch.setattr(manager_mod.BacklogManager, "_set_status", _spy)
+
+        reject_amendment(tmp_workspace, tmp_workspace / "BACKLOG.md", task_id, "approach forbids prod-code edits")
+
+        assert observed["archive_present_at_mark_blocked"], (
+            "rejected-requests archive must be on disk BEFORE mark_blocked runs so "
+            "classify_blocked_task sees the AWAITING_AMENDMENT_RECOVERY signal"
+        )
+
 
 # ---------------------------------------------------------------------------
 # ALLOWED_AMENDMENT_REASONS is not empty (regression guard)

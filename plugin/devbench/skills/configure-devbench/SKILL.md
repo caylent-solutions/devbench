@@ -474,6 +474,40 @@ Report:
 >
 > Next step: run 'claude run devbench:bootstrap-environment' to clone target repos and verify make validate baselines."
 
+After writing the yaml, also produce or refresh the workspace's
+`devbench-commands.txt` launcher file with both the standard launch
+commands (1-5) AND the daemon-mode lifecycle commands (6-10) below. The
+operator chooses between foreground (command 1) and daemon mode (command
+6) per run; daemon mode is recommended for production / long-running
+sessions because it frees the terminal and supports targeted
+`stop` / `tail` / `restart` lookups by instance id (#209).
+
+The lifecycle commands all read `<workspace>/.devbench/orchestrator.pid`
+(written by daemon-mode start) plus walk PID files under
+`DEVBENCH_INSTANCE_SEARCH_ROOTS` (default `~`), so they work without
+the operator needing to `cd` into the target workspace.
+
+Template (substitute `/path/to/devbench` + `/path/to/kanon-deps-work`):
+
+```text
+# 6. Non-interactive start (DAEMON -- recommended)
+DEVBENCH_WORKSPACE_ROOT=/path/to/<workspace> \
+DEVBENCH_CLAUDE_MODEL=<model> \
+uv run --project /path/to/devbench python -m devbench.cli start --daemon
+
+# 7. List running orchestrators on this host
+uv run --project /path/to/devbench devbench instances
+
+# 8. Stop by instance id (SIGTERM; SIGKILL only with --force)
+uv run --project /path/to/devbench devbench stop-instance <instance_id>
+
+# 9. Tail an orchestrator's log
+uv run --project /path/to/devbench devbench tail <instance_id> --follow
+
+# 10. Restart (stop + start in same mode)
+uv run --project /path/to/devbench devbench restart <instance_id>
+```
+
 ---
 
 ## Self-critique loop (bounded)

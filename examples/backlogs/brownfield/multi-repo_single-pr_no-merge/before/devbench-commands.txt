@@ -64,3 +64,35 @@ uv run --project /path/to/devbench devbench hook-tail
 DEVBENCH_WORKSPACE_ROOT=/path/to/kanon-deps-work \
 DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
 uv run --project /path/to/devbench devbench status
+
+
+# ---------------------------------------------------------------------------
+# Daemon mode + lifecycle CLI (#209)
+# ---------------------------------------------------------------------------
+# `--daemon` detaches the orchestrator into the background and frees the
+# operator's terminal. The instance id is printed on launch and stored in
+# `<workspace>/.devbench/orchestrator.pid`. All lifecycle commands accept
+# either the instance id (`<workspace_name>-<pid-suffix>`) or raw PID.
+
+# 6. Non-interactive start (DAEMON mode -- recommended for production / long runs)
+#    Identical to command 1 except the orchestrator detaches into the
+#    background and returns the shell prompt immediately. Stdout/stderr go
+#    to `<workspace>/logs/orchestrator.log` (append).
+DEVBENCH_WORKSPACE_ROOT=/path/to/kanon-deps-work \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+uv run --project /path/to/devbench python -m devbench.cli start --daemon
+
+# 7. List every running orchestrator on this host
+uv run --project /path/to/devbench devbench instances
+# Or JSON:
+# uv run --project /path/to/devbench devbench instances --json
+
+# 8. Stop an orchestrator by instance id (SIGTERM; SIGKILL only with --force)
+uv run --project /path/to/devbench devbench stop-instance <instance_id>
+# Optional flags: --timeout N (default 30s), --force (escalate to SIGKILL)
+
+# 9. Tail an orchestrator's log by instance id
+uv run --project /path/to/devbench devbench tail <instance_id> --follow
+
+# 10. Restart an orchestrator (stop + start in the same mode)
+uv run --project /path/to/devbench devbench restart <instance_id>

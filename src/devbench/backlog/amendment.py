@@ -317,9 +317,12 @@ def reject_amendment(
     updated = _append_audit_comment(content, audit_entry)
     atomic_write_text(wu_file, updated)
 
-    mgr = BacklogManager()
-    mgr.mark_blocked(wu_file, backlog_index, task_id, rejection_reason)
-
+    # Issue #210: write the rejected-requests archive + rejection-feedback JSON
+    # BEFORE calling mark_blocked.  mark_blocked runs classify_blocked_task
+    # inline; the classifier's AWAITING_AMENDMENT_RECOVERY signal is the
+    # presence of the archive on disk.  Pre-fix the writes happened AFTER
+    # mark_blocked, so the classifier saw no recovery signal and fell through
+    # to OPERATOR_ACTION_REQUIRED -- the wrong per-class Slack toggle fired.
     archive_rejected_request(workspace_root, task_id)
     # Issue #154: persist the rejection feedback so the executor-feedback
     # collector / blocker-resolver can ingest it on the next retry. The
@@ -332,6 +335,9 @@ def reject_amendment(
         rejection_reason=rejection_reason,
         request=request,
     )
+
+    mgr = BacklogManager()
+    mgr.mark_blocked(wu_file, backlog_index, task_id, rejection_reason)
     logger.info("Amendment rejected for %s: %s", task_id, rejection_reason)
 
 

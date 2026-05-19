@@ -12,6 +12,35 @@ since the last release. PR #119 carries every change.
 
 ### Added
 
+- **Daemon mode + lifecycle CLI (`start --daemon`, `instances`, `stop`,
+  `tail`, `restart`)** (issue #209). `devbench start --daemon` (or `-d`)
+  double-forks into the background, redirects stdout/stderr to
+  `<workspace>/logs/orchestrator.log`, writes a PID file at
+  `<workspace>/.devbench/orchestrator.pid`, prints the instance id, and
+  frees the operator's terminal.  Foreground `devbench start` is
+  unchanged (still blocks).  Both modes write the PID file so the new
+  lifecycle commands can target them by short instance id
+  (`<workspace_name>-<pid-suffix>`) or raw PID:
+  - `devbench instances [--json]` enumerates every live orchestrator on
+    this host by walking `**/.devbench/orchestrator.pid` under operator-
+    reachable roots (override via `DEVBENCH_INSTANCE_SEARCH_ROOTS`).
+  - `devbench stop <id> [--timeout N] [--force]` sends SIGTERM, waits up
+    to 30s by default, escalates to SIGKILL only with `--force`.
+  - `devbench tail <id> [--follow|-f] [--lines|-n N]` resolves the
+    instance's workspace via its PID file and tails
+    `logs/orchestrator.log` (defaults: last 50 lines, no follow).
+  - `devbench restart <id>` is a composite stop + start in the same mode
+    (daemon vs foreground) and same session.
+
+  New module `src/devbench/instances.py` owns PID-file IO, instance-id
+  generation, liveness check (`os.kill(pid, 0)`), discovery, and the
+  instance-id / PID resolver.  The PID file is removed on clean exit
+  via the existing `try/finally` cleanup in `cmd_start`; stale entries
+  (process dead) are filtered out at discovery time.  Pinned by 23
+  cases in `tests/test_instances.py` (instance-id format, PID-file
+  round-trip, corrupt-payload guards, liveness check, discovery walk,
+  env-root override, resolver by id and PID, cleanup).
+
 - **Per-class Slack toggles for every blocked classification + Backlog
   field on every payload** (issue #209). The previous notification
   surface fired only on transition into `OPERATOR_ACTION_REQUIRED`;
@@ -404,6 +433,20 @@ since the last release. PR #119 carries every change.
   infrastructure is required.
 
 ### Fixed
+
+- **Amendment-rejection no longer mis-fires the `work_unit_blocked_operator`
+  Slack ping** (issue #210). `reject_amendment` in
+  `src/devbench/backlog/amendment.py` previously called `mark_blocked`
+  BEFORE writing the rejected-requests archive. `mark_blocked` runs
+  `classify_blocked_task` inline; the classifier's
+  `AWAITING_AMENDMENT_RECOVERY` signal is the presence of the archive
+  on disk, so the classifier saw no recovery signal and fell through to
+  `OPERATOR_ACTION_REQUIRED`. Pings fired against the wrong per-class
+  toggle. The fix is a one-line reorder: write the archive +
+  rejection-feedback JSON first, then `mark_blocked`. Pinned by
+  `tests/test_backlog/test_amendment.py::TestRejectAmendment::test_rejected_archive_exists_before_mark_blocked_runs`,
+  which monkey-patches `_set_status` and asserts the archive is on disk
+  at the moment the blocked-write fires.
 
 - **`work_unit_blocked_operator` Slack notification now fires on every
   transition into `OPERATOR_ACTION_REQUIRED`** (issue #207). Before this

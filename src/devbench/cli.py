@@ -5937,6 +5937,69 @@ class _CmdStartArgs:
     exclude: str = ""
     name: str = SESSION_DEFAULT_NAME
     allow_overlap: bool = False
+    daemon: bool = False
+
+
+def _daemonize_to_background(workspace_root: Path) -> None:
+    """Double-fork the current process into the background (#209 ``--daemon``).
+
+    The grandchild process detaches from the controlling terminal, becomes a
+    session leader, and redirects stdin / stdout / stderr to
+    ``<workspace_root>/logs/orchestrator.log`` (append).  The original
+    invoking shell sees the parent exit immediately and the terminal is
+    freed.  The grandchild proceeds with the normal ``cmd_start`` body --
+    PID file write, plugin shadow materialise, SDK init, orchestrate skill.
+
+    Only called from ``cmd_start`` when ``--daemon`` is set.  No-op on
+    Windows (POSIX-only); the operator will see an actionable error if
+    they try it.
+
+    Args:
+        workspace_root: Workspace root whose ``logs/orchestrator.log`` the
+            grandchild redirects stdout / stderr to.
+    """
+    if os.name != "posix":
+        raise RuntimeError("--daemon requires POSIX (fork() not available on this platform)")
+
+    log_dir = workspace_root / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "orchestrator.log"
+
+    # First fork: parent exits, child continues.
+    pid = os.fork()
+    if pid > 0:
+        # Original parent: tell the operator the daemon PID + exit cleanly so
+        # the invoking shell returns to the prompt.  We can only print the
+        # FIRST-fork PID here; the grandchild will write the authoritative
+        # PID file once it starts up.
+        print(
+            f"started devbench orchestrator in daemon mode (parent pid {pid}); "
+            f"follow logs with: devbench tail <instance_id> --follow",
+            flush=True,
+        )
+        os._exit(0)
+
+    # Become session leader so we detach from any controlling terminal.
+    os.setsid()
+
+    # Second fork: prevent re-acquiring a controlling terminal.
+    pid = os.fork()
+    if pid > 0:
+        # First-fork child: exit so the grandchild's parent becomes init.
+        os._exit(0)
+
+    # Grandchild: redirect std streams to the log file.  Append-mode so the
+    # existing orchestrator.log (read by ``devbench report``, ``devbench tail``)
+    # keeps accumulating across daemon restarts.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    log_fd = os.open(str(log_path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    null_fd = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(null_fd, 0)
+    os.dup2(log_fd, 1)
+    os.dup2(log_fd, 2)
+    os.close(null_fd)
+    os.close(log_fd)
 
 
 def _parse_start_args(argv: tuple[str, ...]) -> _CmdStartArgs | int:
@@ -5963,6 +6026,7 @@ def _parse_start_args(argv: tuple[str, ...]) -> _CmdStartArgs | int:
     exclude = ""
     name = SESSION_DEFAULT_NAME
     allow_overlap = False
+    daemon = False
     args = list(argv)
     i = 0
     while i < len(args):
@@ -5988,10 +6052,13 @@ def _parse_start_args(argv: tuple[str, ...]) -> _CmdStartArgs | int:
         elif arg == "--allow-overlap":
             allow_overlap = True
             i += 1
+        elif arg in ("--daemon", "-d"):
+            daemon = True
+            i += 1
         else:
             print(f"ERROR: unknown flag for 'start': {arg!r}", file=sys.stderr)
             return 1
-    return _CmdStartArgs(include=include, exclude=exclude, name=name, allow_overlap=allow_overlap)
+    return _CmdStartArgs(include=include, exclude=exclude, name=name, allow_overlap=allow_overlap, daemon=daemon)
 
 
 def _write_session_state_files(
@@ -6174,6 +6241,30 @@ def _fire_orchestrator_stop_notification(reason: str) -> None:
         )
 
 
+def _setup_daemon_and_pid_file(parsed: _CmdStartArgs) -> None:
+    """Handle daemonisation (when ``--daemon``) and PID-file write (#209).
+
+    Extracted from ``cmd_start`` to keep its branch count under the ruff
+    PLR0912 threshold.  Best-effort PID-file write: a failure logs ``[WARN]``
+    on stderr and continues (the orchestrator still runs, just won't be
+    enumerable via ``devbench instances`` until next start).
+    """
+    from devbench.instances import write_pid_file
+
+    if parsed.daemon:
+        _daemonize_to_background(WORKSPACE_ROOT)
+    try:
+        write_pid_file(
+            WORKSPACE_ROOT,
+            os.getpid(),
+            session=parsed.name,
+            mode="daemon" if parsed.daemon else "foreground",
+            model=os.environ.get("DEVBENCH_CLAUDE_MODEL", ""),
+        )
+    except OSError as exc:
+        print(f"[WARN] failed to write orchestrator PID file: {exc}", file=sys.stderr)
+
+
 def cmd_start(*argv: str) -> int:
     """Run the devbench orchestrate skill non-interactively via the Claude Agent SDK.
 
@@ -6237,9 +6328,18 @@ def cmd_start(*argv: str) -> int:
     """
     from claude_agent_sdk import ClaudeAgentOptions, query
 
+    from devbench.instances import remove_pid_file
+
     parsed = _parse_start_args(argv)
     if isinstance(parsed, int):
         return parsed
+
+    # Issue #209: daemon mode + PID file management.  Daemonisation must
+    # happen BEFORE any heavy work so the parent's exit feels instant; the
+    # PID file is written by the grandchild (or foreground process) and
+    # cleaned up in the try/finally below.
+    _orchestrator_pid_workspace = WORKSPACE_ROOT
+    _setup_daemon_and_pid_file(parsed)
 
     # Determine the scope IDs for this session (empty when no --include).
     scope_ids: list[str] = []
@@ -6476,6 +6576,13 @@ def cmd_start(*argv: str) -> int:
         raise
     finally:
         _fire_orchestrator_stop_notification(_stop_reason)
+        # Issue #209: drop the PID file on clean exit so a fresh start does
+        # not trip the alive-check on a stale entry.  Best-effort: missing /
+        # permission-denied is a no-op.
+        import contextlib
+
+        with contextlib.suppress(OSError, NameError):
+            remove_pid_file(_orchestrator_pid_workspace)
 
 
 def cmd_prepare_plugin_shadow() -> int:
@@ -6946,6 +7053,310 @@ def _request_drain_for_all_sessions(workspace: Path, reason: str) -> int:
 
     names = ", ".join(s.name for s in sessions)
     print(f"Drain signal written for {len(sessions)} session(s): {names}")
+    return 0
+
+
+def cmd_instances(*argv: str) -> int:
+    """List every live devbench orchestrator instance on this host (#209).
+
+    Walks every ``<root>/**/.devbench/orchestrator.pid`` under the operator's
+    reachable search roots (override via ``DEVBENCH_INSTANCE_SEARCH_ROOTS``,
+    default home directory), filters to live PIDs, and prints either a
+    human-readable table (TTY default) or a JSON array (``--json``).
+
+    Args:
+        *argv: Optional ``--json`` flag.
+
+    Returns:
+        0 on success.  Always succeeds; an empty list is not an error.
+    """
+    from devbench.instances import discover_instances
+
+    as_json = False
+    for arg in argv:
+        if arg == "--json":
+            as_json = True
+        else:
+            print(f"ERROR: unknown flag for 'instances': {arg!r}", file=sys.stderr)
+            return 2
+
+    instances = discover_instances()
+    if as_json:
+        payload = [
+            {
+                "instance_id": i.instance_id,
+                "pid": i.pid,
+                "workspace": i.workspace,
+                "workspace_name": i.workspace_name,
+                "session": i.session,
+                "mode": i.mode,
+                "started_at": i.started_at,
+                "model": i.model,
+            }
+            for i in instances
+        ]
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    if not instances:
+        print("no devbench orchestrator instances running")
+        return 0
+
+    header = f"{'INSTANCE_ID':<32} {'PID':>7}  {'MODE':<11} {'SESSION':<15} {'WORKSPACE':<24} STARTED"
+    print(header)
+    print("-" * len(header))
+    for i in instances:
+        print(f"{i.instance_id:<32} {i.pid:>7}  {i.mode:<11} {i.session:<15} {i.workspace_name:<24} {i.started_at}")
+    return 0
+
+
+def _parse_stop_instance_args(argv: tuple[str, ...]) -> tuple[str | None, int, bool, int]:
+    """Parse ``cmd_stop_instance`` argv into (target, timeout, force, rc).
+
+    Returns ``(target, timeout, force, 0)`` on success or ``(None, 0, False, rc)``
+    on parse error (rc=2 for unknown flag / missing value / duplicate target).
+    """
+    target: str | None = None
+    timeout = 30
+    force = False
+    args = list(argv)
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--timeout":
+            if i + 1 >= len(args):
+                print("ERROR: --timeout requires a value", file=sys.stderr)
+                return None, 0, False, 2
+            try:
+                timeout = int(args[i + 1])
+            except ValueError:
+                print(f"ERROR: --timeout must be an integer, got {args[i + 1]!r}", file=sys.stderr)
+                return None, 0, False, 2
+            i += 2
+        elif arg == "--force":
+            force = True
+            i += 1
+        elif arg.startswith("--"):
+            print(f"ERROR: unknown flag for 'stop-instance': {arg!r}", file=sys.stderr)
+            return None, 0, False, 2
+        else:
+            if target is not None:
+                print("ERROR: 'stop-instance' accepts a single instance id or PID", file=sys.stderr)
+                return None, 0, False, 2
+            target = arg
+            i += 1
+    return target, timeout, force, 0
+
+
+def _wait_for_pid_exit(pid: int, timeout: int) -> bool:
+    """Poll ``os.kill(pid, 0)`` until the pid is gone or *timeout* elapses."""
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def _send_signal_and_wait(inst: Any, timeout: int, force: bool) -> int:
+    """Send SIGTERM, wait, optionally escalate to SIGKILL.  Returns CLI rc.
+
+    Extracted from ``cmd_stop_instance`` to keep PLR0911 in check.
+    """
+    import signal
+
+    try:
+        os.kill(inst.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError) as exc:
+        print(f"ERROR: SIGTERM to pid {inst.pid} failed: {exc}", file=sys.stderr)
+        return 1
+    if _wait_for_pid_exit(inst.pid, timeout):
+        print(f"stopped instance {inst.instance_id} (pid {inst.pid})")
+        return 0
+    if not force:
+        print(
+            f"ERROR: instance {inst.instance_id} (pid {inst.pid}) did not exit within {timeout}s; "
+            f"re-run with --force to escalate to SIGKILL",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        os.kill(inst.pid, signal.SIGKILL)
+    except OSError as exc:
+        print(f"ERROR: SIGKILL to pid {inst.pid} failed: {exc}", file=sys.stderr)
+        return 1
+    print(f"force-killed instance {inst.instance_id} (pid {inst.pid})")
+    return 0
+
+
+def cmd_stop_instance(*argv: str) -> int:
+    """Stop a devbench orchestrator instance by id or PID (#209).
+
+    Sends SIGTERM, waits up to ``--timeout`` seconds (default 30), and
+    optionally escalates to SIGKILL with ``--force``.  The orchestrator's
+    ``try/finally`` cleanup runs on SIGTERM: the ``orchestrator_stop``
+    Slack ping fires (if enabled), atomic writes complete-or-rollback,
+    and the PID file is removed.  Current WU in-flight work is lost.
+
+    Args:
+        *argv: ``<instance_id_or_pid>`` and optional ``--timeout N`` /
+            ``--force``.
+
+    Returns:
+        0 on confirmed exit; 1 on unknown instance or signal failure;
+        2 on argument errors.
+    """
+    from devbench.instances import resolve_instance
+
+    target, timeout, force, parse_rc = _parse_stop_instance_args(argv)
+    if parse_rc != 0:
+        return parse_rc
+    if target is None:
+        print("ERROR: 'stop-instance' requires an instance id (run 'devbench instances')", file=sys.stderr)
+        return 2
+
+    inst = resolve_instance(target)
+    if inst is None:
+        print(f"ERROR: instance {target!r} not found; run 'devbench instances' to list", file=sys.stderr)
+        return 1
+
+    return _send_signal_and_wait(inst, timeout, force)
+
+
+def _parse_tail_args(argv: tuple[str, ...]) -> tuple[str | None, bool, int, int]:
+    """Parse ``cmd_tail`` argv into (target, follow, lines, rc)."""
+    target: str | None = None
+    follow = False
+    lines = 50
+    args = list(argv)
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("--follow", "-f"):
+            follow = True
+            i += 1
+        elif arg in ("--lines", "-n"):
+            if i + 1 >= len(args):
+                print("ERROR: --lines requires a value", file=sys.stderr)
+                return None, False, 0, 2
+            try:
+                lines = int(args[i + 1])
+            except ValueError:
+                print(f"ERROR: --lines must be an integer, got {args[i + 1]!r}", file=sys.stderr)
+                return None, False, 0, 2
+            i += 2
+        elif arg.startswith("--"):
+            print(f"ERROR: unknown flag for 'tail': {arg!r}", file=sys.stderr)
+            return None, False, 0, 2
+        else:
+            if target is not None:
+                print("ERROR: 'tail' accepts a single instance id or PID", file=sys.stderr)
+                return None, False, 0, 2
+            target = arg
+            i += 1
+    return target, follow, lines, 0
+
+
+def cmd_tail(*argv: str) -> int:
+    """Tail an orchestrator instance's log file (#209).
+
+    Resolves the instance's workspace via its PID file, then prints
+    ``<workspace>/logs/orchestrator.log`` -- last ``--lines N`` lines by
+    default, or live-tail when ``--follow`` is set.
+
+    Args:
+        *argv: ``<instance_id_or_pid>`` and optional ``--follow`` / ``--lines N``.
+
+    Returns:
+        0 on clean exit; 1 on unknown instance or missing log; 2 on argument errors.
+    """
+    import subprocess
+
+    from devbench.instances import resolve_instance
+
+    target, follow, lines, parse_rc = _parse_tail_args(argv)
+    if parse_rc != 0:
+        return parse_rc
+    if target is None:
+        print("ERROR: 'tail' requires an instance id (run 'devbench instances')", file=sys.stderr)
+        return 2
+
+    inst = resolve_instance(target)
+    if inst is None:
+        print(f"ERROR: instance {target!r} not found; run 'devbench instances' to list", file=sys.stderr)
+        return 1
+
+    log_path = Path(inst.workspace) / "logs" / "orchestrator.log"
+    if not log_path.is_file():
+        print(f"ERROR: log file not found at {log_path}", file=sys.stderr)
+        return 1
+
+    cmd = ["tail", "-n", str(lines)]
+    if follow:
+        cmd.append("-F")
+    cmd.append(str(log_path))
+    # subprocess.run with shell=False; resolves via PATH.  Returns the
+    # child's exit code so an operator can chain in a pipeline.
+    completed = subprocess.run(cmd, check=False)
+    return completed.returncode
+
+
+def cmd_restart(*argv: str) -> int:
+    """Restart a devbench orchestrator instance (#209).
+
+    Composite of stop + start.  Resolves the instance, captures its mode +
+    session + workspace, sends SIGTERM, waits for exit, then re-launches in
+    the SAME mode (daemon vs foreground) and same workspace + session
+    via subprocess.
+
+    Args:
+        *argv: ``<instance_id_or_pid>`` and optional ``--timeout N`` /
+            ``--force`` (passed to the stop phase).
+
+    Returns:
+        0 on confirmed restart; non-zero on resolution / stop / launch failure.
+    """
+    import subprocess
+
+    from devbench.instances import resolve_instance
+
+    if not argv:
+        print("ERROR: 'restart' requires an instance id", file=sys.stderr)
+        return 2
+
+    target = argv[0]
+    inst = resolve_instance(target)
+    if inst is None:
+        print(f"ERROR: instance {target!r} not found; run 'devbench instances' to list", file=sys.stderr)
+        return 1
+
+    workspace = inst.workspace
+    session = inst.session
+    mode = inst.mode
+
+    stop_rc = cmd_stop_instance(*argv)
+    if stop_rc != 0:
+        print(f"ERROR: restart aborted -- stop phase exited {stop_rc}", file=sys.stderr)
+        return stop_rc
+
+    start_args = ["uv", "run", "--project", os.environ.get("DEVBENCH_PROJECT_ROOT", "."), "devbench", "start"]
+    if mode == "daemon":
+        start_args.append("--daemon")
+    if session and session != "default":
+        start_args.extend(["--name", session])
+
+    env = os.environ.copy()
+    env["DEVBENCH_WORKSPACE_ROOT"] = workspace
+    print(f"relaunching in {mode} mode at {workspace}")
+    try:
+        subprocess.run(start_args, env=env, check=True, cwd=workspace)
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        print(f"ERROR: relaunch failed: {exc}", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -9383,7 +9794,30 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
             "(spec 4.5.3, issue #193): quota-watcher --once | --daemon"
         ),
     ),
-    "start": (cmd_start, 0, "Run orchestrate skill via Agent SDK (non-interactive)"),
+    "start": (
+        cmd_start,
+        0,
+        "Run orchestrate skill via Agent SDK (non-interactive). Flag: --daemon detaches to background (#209).",
+    ),
+    "instances": (cmd_instances, 0, "List every live devbench orchestrator on this host (#209). Flag: --json"),
+    "stop-instance": (
+        cmd_stop_instance,
+        0,
+        (
+            "Stop an orchestrator instance by id or PID (SIGTERM, then SIGKILL if --force) (#209): "
+            "stop-instance <id> [--timeout N] [--force]"
+        ),
+    ),
+    "tail": (
+        cmd_tail,
+        0,
+        "Tail an orchestrator instance's log by id (#209): tail <id> [--follow|-f] [--lines|-n N]",
+    ),
+    "restart": (
+        cmd_restart,
+        0,
+        "Restart an orchestrator instance (stop + start in same mode) by id (#209): restart <id>",
+    ),
     "scope": (
         cmd_scope,
         0,
@@ -9526,6 +9960,13 @@ _VARIADIC_COMMANDS: frozenset[str] = frozenset(
         "promote",
         # Issue #190 E2-F2-S1-T1: --include / --exclude scope selectors
         "start",
+        # Issue #209: lifecycle CLI -- flag-bearing subcommands need raw argv.
+        # "stop" is already registered above for #192 (--session targeting);
+        # #209's "stop-instance" handles instance-id / PID targeting.
+        "instances",
+        "stop-instance",
+        "tail",
+        "restart",
         # Issue #190 E2-F2-S2-T3: cmd_next respects scope filter
         "next",
         # Issue #196 E2-F7: scope set / clear / show subcommand

@@ -6213,6 +6213,26 @@ def _check_auto_restart_and_notify(current_reason: str) -> tuple[int, str]:
     return ORCHESTRATOR_RESTART_EXIT_CODE, "auto-restart (RUNTIME_DEGRADATION-only NO_ACTIONABLE)"
 
 
+def _extract_sdk_result_text(message: object) -> str | None:
+    """Return the SDK ``ResultMessage.result`` text from ``message`` if any.
+
+    Issue #217: ``cmd_start`` uses this to capture the orchestrate skill's
+    end-of-run summary (``NO_ACTIONABLE -- 190/212 done, 11 blocked``,
+    ``ALL_DONE``, etc.) and surface it in the ``orchestrator_stop`` Slack
+    ping so the operator can tell at a glance whether the backlog finished
+    or stalled.
+
+    Returns the ``result`` string when ``message`` is a SDK ResultMessage
+    carrying a non-empty string ``result``; ``None`` otherwise.  Duck-typed
+    so unit tests can yield bare ``object`` instances with a ``result``
+    attribute without importing the SDK.
+    """
+    candidate = getattr(message, "result", None)
+    if isinstance(candidate, str) and candidate:
+        return candidate
+    return None
+
+
 def _label_stop_reason(exc: BaseException) -> str:
     """Return a human-readable label for the orchestrator's exit (#213).
 
@@ -6487,6 +6507,12 @@ def cmd_start(*argv: str) -> int:
 
     quota_cfg = RUNTIME_CONFIG.quota_handling
 
+    # Issue #217: capture the SDK's final ResultMessage `result` text so the
+    # orchestrator_stop Slack ping can carry the actual exit reason
+    # (e.g., ``NO_ACTIONABLE -- 190/212 done, 11 blocked``) instead of the
+    # legacy bare ``"clean"`` that hid whether the backlog was finished.
+    _sdk_result_text: str | None = None
+
     async def _run() -> None:
         """Iterate SDK messages with quota-wait-and-resume and drain enforcement.
 
@@ -6530,6 +6556,7 @@ def cmd_start(*argv: str) -> int:
             QuotaExhaustedError: Propagates when ``quota_cfg.enabled`` is
                 ``False``.
         """
+        nonlocal _sdk_result_text
         while True:
             try:
                 async for message in query(
@@ -6543,6 +6570,7 @@ def cmd_start(*argv: str) -> int:
                     in_message_quota_exc = detect_quota_error(message)
                     if in_message_quota_exc is not None:
                         raise in_message_quota_exc
+                    _sdk_result_text = _extract_sdk_result_text(message) or _sdk_result_text
                     if _is_claim_tool_use(message):
                         drain_state = read_drain_state(WORKSPACE_ROOT)
                         if drain_state is not None:
@@ -6634,6 +6662,15 @@ def cmd_start(*argv: str) -> int:
         # before this line runs, intentionally leaving scope.json in place for
         # operator inspection.
         ScopeFilter.clear(WORKSPACE_ROOT)
+
+        # Issue #217: bubble the SDK's final ResultMessage text into the
+        # Slack reason so ``NO_ACTIONABLE -- 190/212 done, 11 blocked`` and
+        # similar end-of-run summaries reach the operator.  Without this,
+        # the reason stayed at the literal ``"clean"`` initial value,
+        # masking whether the backlog actually finished or just ran out of
+        # actionable work mid-cascade.  Ternary form (rather than an
+        # ``if`` block) keeps the branch count under ruff's PLR0912 cap.
+        _stop_reason = f"clean exit: {_sdk_result_text}" if _sdk_result_text else _stop_reason
 
         restart_rc, _stop_reason = _check_auto_restart_and_notify(_stop_reason)
         return restart_rc

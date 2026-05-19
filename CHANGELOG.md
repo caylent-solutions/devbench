@@ -333,6 +333,24 @@ since the last release. PR #119 carries every change.
 
 ### Fixed
 
+- **`orchestrator_stop` Slack ping says bare `"clean"` instead of the real
+  exit reason** (issue #217).  When `cmd_start`'s SDK loop completes
+  normally (e.g., the orchestrate skill returns `NO_ACTIONABLE -- 190/212
+  done, 11 blocked` because of a deadlocked cascade), `_stop_reason`
+  stayed at its initial value `"clean"`.  The Slack ping then read the
+  same regardless of whether the backlog was complete (`ALL_DONE`) or
+  blocked with work remaining -- the operator could not tell the
+  difference at a glance.  `_run` now captures the latest
+  `ResultMessage.result` text via a `nonlocal` closure variable;
+  `cmd_start` promotes it to `_stop_reason = f"clean exit: {text}"`
+  before firing the notification, so the operator sees the actual
+  summary (status counts, NO_ACTIONABLE vs ALL_DONE, etc.) in the
+  Slack ping.  When the SDK emits no `ResultMessage` (degenerate test
+  scenario), the legacy `"clean"` reason is preserved -- behaviour is
+  a strict superset of the pre-fix path.  Pinned by
+  `tests/test_cli.py::TestCmdStartSlackPingResultText::test_slack_ping_includes_sdk_result_text_on_clean_exit`
+  and `::test_slack_ping_falls_back_to_clean_when_no_result_message`.
+
 - **Multi-column status table mis-aligned when one cell is much wider than
   others** (issue #214).  `_render_multi_column_table` /
   `_render_grouped_progress_table` shared a single `value_w` across every

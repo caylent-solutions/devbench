@@ -17310,6 +17310,98 @@ class TestCmdStartWritesRestartMarker:
         assert parsed.tzinfo is not None, "marker timestamp must be timezone-aware"
 
 
+class TestCmdStartSlackPingResultText:
+    """Issue #217: when the SDK loop completes normally, ``cmd_start`` must
+    feed the last ``ResultMessage.result`` text into the ``orchestrator_stop``
+    Slack ping so the operator can distinguish ``ALL_DONE`` from
+    ``NO_ACTIONABLE`` and see the remaining-task counts -- instead of seeing
+    a bare ``"clean"`` that hides whether the backlog is finished.
+    """
+
+    @pytest.mark.unit
+    def test_slack_ping_includes_sdk_result_text_on_clean_exit(self, tmp_path: Path) -> None:
+        import sys
+        import types
+
+        # SDK yields one ResultMessage with the NO_ACTIONABLE summary text the
+        # orchestrate skill emits at end-of-backlog.
+        mock_sdk: Any = types.ModuleType("claude_agent_sdk")
+        mock_sdk.ClaudeAgentOptions = MagicMock()
+
+        class _FakeResultMessage:
+            subtype = "success"
+            result = "Orchestration complete: NO_ACTIONABLE — 190/212 done, 11 blocked."
+
+        async def mock_query(**kwargs: object) -> object:
+            yield _FakeResultMessage()
+
+        mock_sdk.query = mock_query
+
+        captured_reason: list[str] = []
+
+        def _capture(reason: str) -> None:
+            captured_reason.append(reason)
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch(
+                "devbench.cli._should_auto_restart_after_no_actionable",
+                return_value=(False, []),
+            ),
+            patch("devbench.cli._fire_orchestrator_stop_notification", _capture),
+        ):
+            rc = cli.cmd_start()
+
+        assert rc == 0
+        assert captured_reason, "orchestrator_stop notification was not fired"
+        reason = captured_reason[-1]
+        assert "NO_ACTIONABLE" in reason, f"Slack reason must include the SDK's NO_ACTIONABLE summary; got {reason!r}"
+        assert "190/212" in reason, f"Slack reason must include the remaining-task counts; got {reason!r}"
+        # Bare "clean" alone is no longer sufficient -- it hides the fact
+        # that 22 tasks remain.  The new reason must be MORE than just "clean".
+        assert reason != "clean", "Slack reason 'clean' alone is insufficient -- must carry the SDK result text (#217)"
+
+    @pytest.mark.unit
+    def test_slack_ping_falls_back_to_clean_when_no_result_message(self, tmp_path: Path) -> None:
+        """When the SDK never emits a ResultMessage (degenerate / mock test
+        scenario), the legacy ``"clean"`` reason is preserved so existing
+        behaviour is a strict superset of the pre-fix implementation.
+        """
+        import sys
+        import types
+
+        mock_sdk: Any = types.ModuleType("claude_agent_sdk")
+        mock_sdk.ClaudeAgentOptions = MagicMock()
+
+        async def mock_query(**kwargs: object) -> object:
+            yield "plain string"  # not a ResultMessage
+
+        mock_sdk.query = mock_query
+
+        captured_reason: list[str] = []
+
+        def _capture(reason: str) -> None:
+            captured_reason.append(reason)
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch(
+                "devbench.cli._should_auto_restart_after_no_actionable",
+                return_value=(False, []),
+            ),
+            patch("devbench.cli._fire_orchestrator_stop_notification", _capture),
+        ):
+            rc = cli.cmd_start()
+
+        assert rc == 0
+        assert captured_reason
+        assert captured_reason[-1] == "clean", (
+            f"With no ResultMessage emitted, reason must remain 'clean'; got {captured_reason[-1]!r}"
+        )
+
+
 class TestCmdStartCancelDrainOnExit:
     """cmd_start finally clause clears drain.signal from both candidate paths (#212).
 

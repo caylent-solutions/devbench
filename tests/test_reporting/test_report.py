@@ -2306,6 +2306,88 @@ class TestSpanningRows:
         eta_line = next(ln for ln in lines if "Est. time" in ln)
         assert long_eta in eta_line
 
+    def test_multi_column_table_uses_per_column_widths(self) -> None:
+        """Regression #214: a wide cell in one column must NOT push other
+        columns to the same width.
+
+        The bug: ``value_w`` was a single int shared across all value columns,
+        derived from the global ``max_cell`` across every cell.  When one
+        cell is significantly wider (e.g., the ETA breakdown gains
+        ``+ blocked-runtime-degradation N`` in the All-time column only,
+        adding ~32 chars), every value column inflated to that width.
+
+        Fixed behaviour: each column tracks its own max-cell-width.
+        """
+        from devbench.reporting.report import _render_multi_column_table
+
+        long_value = (
+            "~5.7 h (active 3 + blocked-recovery 12 + blocked-auto 11 + blocked-runtime-degradation 1 at 12.7 min/task)"
+        )
+        short_value = "~5.5 h (active 3 + blocked-recovery 12 + blocked-auto 11 at 12.7 min/task)"
+        lines = _render_multi_column_table(
+            "Metric",
+            ["All-time", "Session"],
+            [
+                ("Time span", ["190.3 h", "0.9 h"]),
+                ("Est. time to complete remaining", [long_value, short_value]),
+            ],
+        )
+
+        border_top = lines[0]
+        # Border shape: ┌─...─┬─...─┬─...─┐ -- split on ┬ yields three runs.
+        segments = border_top.split("┬")
+        assert len(segments) == 3, f"Expected 3 segments split on ┬, got {len(segments)}: {border_top!r}"
+        col1_width = len(segments[1])
+        col2_width = len(segments[2]) - 1  # strip trailing ┐
+        assert col1_width > col2_width, (
+            f"All-time column (long values) should be wider than Session column (shorter values); "
+            f"got col1={col1_width} col2={col2_width}"
+        )
+        assert col1_width - col2_width >= 20, (
+            f"Per-column widths must be independent; column 2 should be ~30 chars narrower than column 1, "
+            f"but got col1={col1_width} col2={col2_width} (delta={col1_width - col2_width})"
+        )
+        # All rendered lines must still have the same overall width.
+        widths = {len(ln) for ln in lines}
+        assert len(widths) == 1, f"Lines must be uniform width; got {sorted(widths)}"
+
+    def test_grouped_progress_table_uses_per_column_widths(self) -> None:
+        """Regression #214: ``_render_grouped_progress_table`` shares the same
+        single-width bug as ``_render_multi_column_table``.  Per-column widths
+        must apply to the unified report table too.
+        """
+        from devbench.reporting.report import _render_grouped_progress_table
+
+        long_value = (
+            "~5.7 h (active 3 + blocked-recovery 12 + blocked-auto 11 + blocked-runtime-degradation 1 at 12.7 min/task)"
+        )
+        short_value = "~5.5 h (active 3 + blocked-recovery 12 + blocked-auto 11 at 12.7 min/task)"
+        lines = _render_grouped_progress_table(
+            "Metric",
+            ["All-time", "Session"],
+            [
+                (
+                    "THROUGHPUT",
+                    [
+                        ("Time span", ["190.3 h", "0.9 h"]),
+                        ("Est. time to complete remaining", [long_value, short_value]),
+                    ],
+                ),
+            ],
+        )
+
+        border_top = lines[0]
+        segments = border_top.split("┬")
+        assert len(segments) == 3, f"Expected 3 segments split on ┬, got {len(segments)}: {border_top!r}"
+        col1_width = len(segments[1])
+        col2_width = len(segments[2]) - 1
+        assert col1_width - col2_width >= 20, (
+            f"Per-column widths must be independent in grouped table; "
+            f"got col1={col1_width} col2={col2_width} (delta={col1_width - col2_width})"
+        )
+        widths = {len(ln) for ln in lines}
+        assert len(widths) == 1, f"Lines must be uniform width; got {sorted(widths)}"
+
     def test_report_end_to_end_spans_recent_pace_and_est_time(self, tmp_path: Path) -> None:
         """In the rendered report, Recent pace and Est. time rows are single spanning cells
         -- the underlying value appears exactly once on the row even with multiple window columns."""

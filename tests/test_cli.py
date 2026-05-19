@@ -17269,6 +17269,47 @@ class TestCmdStartDrainEnforcement:
         assert "[ORCHESTRATOR_DRAIN_ENFORCED]" in log_text
 
 
+class TestCmdStartWritesRestartMarker:
+    """Issue #215: ``cmd_start`` writes ``<workspace>/.devbench/last-restart``
+    on every startup so the classifier can scope agent-tool-unavailable
+    audit rows to the current orchestrator instance.
+    """
+
+    @pytest.mark.unit
+    def test_restart_marker_is_written_on_start(self, tmp_path: Path) -> None:
+        import sys
+        import types
+
+        from devbench.constants import LAST_RESTART_MARKER_PATH
+
+        mock_sdk: Any = types.ModuleType("claude_agent_sdk")
+        mock_sdk.ClaudeAgentOptions = MagicMock()
+
+        async def mock_query(**kwargs: object) -> object:
+            yield "plain string"
+
+        mock_sdk.query = mock_query
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch(
+                "devbench.cli._should_auto_restart_after_no_actionable",
+                return_value=(False, []),
+            ),
+        ):
+            rc = cli.cmd_start()
+
+        assert rc == 0
+        marker = tmp_path / LAST_RESTART_MARKER_PATH
+        assert marker.is_file(), f"last-restart marker not written at {marker}"
+        # Marker contents must be a parseable ISO 8601 UTC datetime.
+        from datetime import datetime as _dt
+
+        parsed = _dt.fromisoformat(marker.read_text(encoding="utf-8").strip())
+        assert parsed.tzinfo is not None, "marker timestamp must be timezone-aware"
+
+
 class TestCmdStartCancelDrainOnExit:
     """cmd_start finally clause clears drain.signal from both candidate paths (#212).
 

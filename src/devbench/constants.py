@@ -657,6 +657,14 @@ SESSION_FLOCK_POLL_INTERVAL_SECONDS: float = 0.1
 # ``src/devbench/cli.py`` (_session_drain_state_str).
 SESSION_DRAIN_SIGNAL_FILENAME: str = "drain.signal"
 
+# Relative path (from workspace root) of the orchestrator restart marker
+# file written by ``cmd_start`` on every startup.  Issue #215: bounds the
+# audit-row scan window in
+# ``devbench.backlog.proposal._has_runtime_degradation_signal`` so RUNTIME_DEGRADATION
+# classification clears on operator-driven restart.  The file contains a
+# single ISO 8601 UTC timestamp string.
+LAST_RESTART_MARKER_PATH: str = ".devbench/last-restart"
+
 # ---------------------------------------------------------------------------
 # Quota-handling defaults (spec section 4.5.6)
 # These constants define the default values for the quota_handling config block

@@ -6291,6 +6291,34 @@ def _setup_daemon_and_pid_file(parsed: _CmdStartArgs) -> None:
         print(f"[WARN] failed to write orchestrator PID file: {exc}", file=sys.stderr)
 
 
+def _write_last_restart_marker(workspace_root: Path) -> None:
+    """Write the orchestrator restart marker (#215).
+
+    Records the current UTC timestamp at
+    ``<workspace>/.devbench/last-restart`` so that
+    :func:`devbench.backlog.proposal._has_runtime_degradation_signal`
+    only counts agent-tool-unavailable audit rows newer than this
+    timestamp.  Without the marker, RUNTIME_DEGRADATION classification
+    would persist across restarts for up to 24 hours, defeating the
+    auto-restart recovery loop wired by
+    :func:`_should_auto_restart_after_no_actionable`.
+
+    Best-effort: directory creation / write failures are logged and the
+    orchestrator continues.  Worst case is fallback to the existing 24h
+    sliding-window classifier behaviour.
+    """
+    from datetime import UTC, datetime
+
+    from devbench.constants import LAST_RESTART_MARKER_PATH
+
+    marker = workspace_root / LAST_RESTART_MARKER_PATH
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(datetime.now(UTC).isoformat(), encoding="utf-8")
+    except OSError as exc:
+        print(f"[WARN] failed to write orchestrator restart marker: {exc}", file=sys.stderr)
+
+
 def cmd_start(*argv: str) -> int:
     """Run the devbench orchestrate skill non-interactively via the Claude Agent SDK.
 
@@ -6366,6 +6394,12 @@ def cmd_start(*argv: str) -> int:
     # cleaned up in the try/finally below.
     _orchestrator_pid_workspace = WORKSPACE_ROOT
     _setup_daemon_and_pid_file(parsed)
+    # Issue #215: write the last-restart marker so
+    # ``classify_blocked_task`` can bound the agent-tool-unavailable audit
+    # scan to rows emitted by this fresh orchestrator instance only.
+    # RUNTIME_DEGRADATION audit rows from the previous (now-stopped)
+    # instance MUST not keep the new instance's tasks bucketed there.
+    _write_last_restart_marker(WORKSPACE_ROOT)
 
     # Determine the scope IDs for this session (empty when no --include).
     scope_ids: list[str] = []

@@ -3151,6 +3151,105 @@ class TestClassifyBlockedTaskRuntimeDegradation:
         )
         assert state is not BlockedTaskState.RUNTIME_DEGRADATION
 
+    def test_audit_older_than_restart_marker_does_not_trigger(self, tmp_path: Path) -> None:
+        """Issue #215: an agent-tool-unavailable audit row older than the
+        workspace's last-restart marker must NOT keep the task classified as
+        RUNTIME_DEGRADATION.  The operator-driven restart resets the
+        degradation context; only audit rows emitted by the new orchestrator
+        instance should bucket as RUNTIME_DEGRADATION.
+        """
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+        from devbench.constants import LAST_RESTART_MARKER_PATH
+
+        now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        # Audit row was emitted 30 minutes ago by the OLD instance.
+        old_audit_ts = (now - timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M UTC")
+        workspace = self._workspace(
+            tmp_path,
+            f"[{old_audit_ts}] [agent/review-supervisor] [BLOCKED] agent-tool-unavailable: "
+            "session subprocess dropped Agent tool\n",
+        )
+        # Operator restarted 5 minutes ago -- AFTER the audit row.
+        marker = workspace / LAST_RESTART_MARKER_PATH
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text((now - timedelta(minutes=5)).isoformat(), encoding="utf-8")
+
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+            now=now,
+        )
+        assert state is not BlockedTaskState.RUNTIME_DEGRADATION, (
+            "Audit row predating the last-restart marker must NOT keep RUNTIME_DEGRADATION classification (#215)"
+        )
+
+    def test_audit_after_restart_marker_still_triggers(self, tmp_path: Path) -> None:
+        """Issue #215: a fresh agent-tool-unavailable audit row emitted AFTER
+        the most recent restart marker is still observable; the new instance
+        has independently entered a degraded state and the classifier must
+        surface it.
+        """
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+        from devbench.constants import LAST_RESTART_MARKER_PATH
+
+        now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        # Operator restarted 30 minutes ago.
+        # Audit row was emitted 5 minutes ago by the NEW instance.
+        new_audit_ts = (now - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M UTC")
+        workspace = self._workspace(
+            tmp_path,
+            f"[{new_audit_ts}] [agent/review-supervisor] [BLOCKED] agent-tool-unavailable: "
+            "session subprocess dropped Agent tool (post-restart)\n",
+        )
+        marker = workspace / LAST_RESTART_MARKER_PATH
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text((now - timedelta(minutes=30)).isoformat(), encoding="utf-8")
+
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+            now=now,
+        )
+        assert state is BlockedTaskState.RUNTIME_DEGRADATION, (
+            "Audit row emitted AFTER the last-restart marker must still trigger RUNTIME_DEGRADATION (#215)"
+        )
+
+    def test_missing_restart_marker_falls_back_to_24h_window(self, tmp_path: Path) -> None:
+        """Issue #215: when no restart marker is present (cold-boot /
+        never-restarted workspace), the classifier must use the existing
+        24h window so behaviour is a strict superset of the pre-fix
+        implementation.
+        """
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        ts = (now - timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M UTC")
+        workspace = self._workspace(
+            tmp_path,
+            f"[{ts}] [agent/review-supervisor] [BLOCKED] agent-tool-unavailable: cold-boot\n",
+        )
+        # No marker written.
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+            now=now,
+        )
+        assert state is BlockedTaskState.RUNTIME_DEGRADATION, (
+            "With no restart marker, classifier must use 24h window and still find the recent audit row (#215)"
+        )
+
 
 class TestClassifyBlockedTaskHeld:
     """AC-FUNC-004: HELD state for a unit whose own status is HOLD."""

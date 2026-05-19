@@ -333,6 +333,39 @@ since the last release. PR #119 carries every change.
 
 ### Fixed
 
+- **Multi-column status table mis-aligned when one cell is much wider than
+  others** (issue #214).  `_render_multi_column_table` /
+  `_render_grouped_progress_table` shared a single `value_w` across every
+  value column, derived from `max_cell` over every cell.  A single wide
+  cell (e.g., the ETA breakdown All-time value with
+  `+ blocked-runtime-degradation N` appended) inflated all columns to that
+  width, producing ~110-char-wide columns and pushing the table well past
+  any reasonable terminal width.  Both renderers now compute per-column
+  widths via `_compute_value_widths`: each column's width is the max of
+  default, label, and that column's own cells.  Spanning rows still cause
+  uniform widening of all columns via `_widen_for_spanning` to satisfy
+  the joined-span constraint, preserving the relative column-width
+  ordering.  Pinned by `tests/test_reporting/test_report.py::TestSpanningRows::test_multi_column_table_uses_per_column_widths`
+  and `::test_grouped_progress_table_uses_per_column_widths`.
+
+- **`RUNTIME_DEGRADATION` classification persists after orchestrator
+  restart** (issue #215).  `_has_runtime_degradation_signal` scanned the
+  work-unit's Comments section for `agent-tool-unavailable` audit rows
+  within a 24h window.  Audit rows are append-only, so the same row kept
+  triggering the classification for 24h regardless of how many times the
+  operator restarted -- defeating both the renderer's "task remains
+  blocked until the orchestrator restarts" hint and the auto-restart
+  loop in `_should_auto_restart_after_no_actionable` (which then looped
+  forever).  `cmd_start` now writes
+  `<workspace>/.devbench/last-restart` (new constant
+  `LAST_RESTART_MARKER_PATH`) on every startup; the classifier reads the
+  marker via `_read_last_restart_marker` and filters out audit rows
+  older than it before applying the 24h window.  With no marker
+  (cold-boot / never-restarted workspace), behaviour is unchanged.
+  Pinned by three new cases in
+  `tests/test_backlog/test_proposal.py::TestClassifyBlockedTaskRuntimeDegradation`
+  and `tests/test_cli.py::TestCmdStartWritesRestartMarker`.
+
 - **`drain.signal` not cleared after orchestrator exit** (issue #212).
   When an operator ran `devbench drain` from a shell, the signal landed at
   `<workspace>/.devbench/drain.signal` (no `DEVBENCH_SESSION_NAME` in env),

@@ -1187,6 +1187,56 @@ def _render_table(title: str, rows: list[tuple[str, str]], value_w: int = 18) ->
     return lines
 
 
+def _compute_value_widths(
+    column_labels: list[str],
+    rows_iter: list[tuple[str, list[str] | str]],
+    default_min: int,
+) -> list[int]:
+    """Compute per-column value widths so a wide cell in one column does NOT
+    inflate the other columns (#214).
+
+    Each column's width is the max of ``default_min``, that column's label
+    length, and the longest cell observed in that column across non-spanning
+    rows.  Spanning rows (value is a single ``str``) are handled separately
+    by :func:`_widen_for_spanning`, which may widen all columns uniformly
+    to satisfy the spanning constraint while preserving the relative
+    ordering of per-column widths.
+    """
+    n_cols = len(column_labels)
+    widths: list[int] = [max(default_min, len(label)) for label in column_labels]
+    for _, vals in rows_iter:
+        if isinstance(vals, list):
+            for i in range(min(n_cols, len(vals))):
+                widths[i] = max(widths[i], len(vals[i]))
+    return widths
+
+
+def _widen_for_spanning(value_widths: list[int], max_spanning: int) -> list[int]:
+    """Widen every value column uniformly so the joined span fits a
+    spanning value of length ``max_spanning`` (#214).
+
+    Joined span width formula (mirrors ``spanning_w`` in the renderers):
+    ``spanning_w = sum(w + 2 for w in value_widths) + (n_cols - 1) - 2``.
+    When ``spanning_w < max_spanning``, distribute the deficit by adding
+    ``deficit // n_cols`` to every column and ``+1`` to the first
+    ``deficit % n_cols`` columns -- preserving the relative ordering
+    established by :func:`_compute_value_widths`.
+    """
+    if max_spanning <= 0 or not value_widths:
+        return value_widths
+    n_cols = len(value_widths)
+    current_span = sum(w + 2 for w in value_widths) + (n_cols - 1) - 2
+    deficit = max_spanning - current_span
+    if deficit <= 0:
+        return value_widths
+    bump = deficit // n_cols
+    remainder = deficit - bump * n_cols
+    new_widths = [w + bump for w in value_widths]
+    for i in range(remainder):
+        new_widths[i] += 1
+    return new_widths
+
+
 def _render_multi_column_table(
     title: str,
     column_labels: list[str],
@@ -1209,47 +1259,32 @@ def _render_multi_column_table(
     metric_w = max((len(metric) for metric, _ in rows), default=0)
     metric_w = max(metric_w, len(title))
 
-    # Value column width = max of: default minimum, label width, max cell width.
-    # Spanning rows (value is str) span all n_cols value columns, so they
-    # contribute a derived minimum value_w too -- otherwise a wider-than-default
-    # spanning value (e.g. an ETA breakdown like "~41.9 h (active 4 + blocked-
-    # recovery 60 + blocked-auto 27 at 27.6 min/task)") busts the table layout.
-    def _cells_of(v: list[str] | str) -> list[str]:
-        return v if isinstance(v, list) else []
-
-    max_cell = max((max((len(v) for v in _cells_of(vals)), default=0) for _, vals in rows), default=0)
-    max_label = max((len(label) for label in column_labels), default=0)
-    # Reverse-derive the minimum value_w from the spanning-cell width formula
-    # (spanning_w computed below) so a spanning value never exceeds the joined
-    # span. Ceiling division of (max_spanning + 3 - 3 * n_cols) by n_cols.
+    # Issue #214: per-column widths so one wide cell does NOT inflate every
+    # column.  Each column's natural width is max(default, label, own cells).
+    # Spanning rows are handled afterwards by widening columns uniformly.
+    value_widths = _compute_value_widths(column_labels, rows, default_min=value_w)
     max_spanning = max(
         (len(vals) for _, vals in rows if isinstance(vals, str)),
         default=0,
     )
-    spanning_min_value_w = (
-        (max_spanning + 3 - 3 * n_cols + n_cols - 1) // n_cols if max_spanning > 0 and n_cols > 0 else 0
-    )
-    value_w = max(value_w, max_cell, max_label, spanning_min_value_w)
+    value_widths = _widen_for_spanning(value_widths, max_spanning)
 
     # Width a spanning cell occupies (covers all n_cols value columns plus the
     # n_cols-1 internal "│" separators that would otherwise split them).
-    spanning_w = n_cols * (value_w + 2) + (n_cols - 1) - 2  # -2 for leading/trailing space padding
+    spanning_w = sum(w + 2 for w in value_widths) + (n_cols - 1) - 2
 
     def hborder(left: str, junction_metric: str, junction_inner: str, right: str) -> str:
-        return (
-            left
-            + "\u2500" * (metric_w + 2)
-            + junction_metric
-            + (("\u2500" * (value_w + 2) + junction_inner) * (n_cols - 1))
-            + "\u2500" * (value_w + 2)
-            + right
-        )
+        inner_runs = [("\u2500" * (w + 2)) for w in value_widths]
+        joined = junction_inner.join(inner_runs)
+        return left + "\u2500" * (metric_w + 2) + junction_metric + joined + right
 
     border_top = hborder("\u250c", "\u252c", "\u252c", "\u2510")
     border_mid = hborder("\u251c", "\u253c", "\u253c", "\u2524")
     border_bot = hborder("\u2514", "\u2534", "\u2534", "\u2518")
 
-    header_cells = [f" {title:<{metric_w}} "] + [f" {label:>{value_w}} " for label in column_labels]
+    header_cells = [f" {title:<{metric_w}} "] + [
+        f" {label:>{value_widths[i]}} " for i, label in enumerate(column_labels)
+    ]
     header_line = "\u2502" + "\u2502".join(header_cells) + "\u2502"
 
     lines: list[str] = [border_top, header_line, border_mid]
@@ -1264,7 +1299,7 @@ def _render_multi_column_table(
             # table; only the content row's internal │ separators are merged.
             row_line = f"\u2502 {metric:<{metric_w}} \u2502 {values:>{spanning_w}} \u2502"
         else:
-            cells = [f" {metric:<{metric_w}} "] + [f" {v:>{value_w}} " for v in values]
+            cells = [f" {metric:<{metric_w}} "] + [f" {v:>{value_widths[j]}} " for j, v in enumerate(values)]
             row_line = "\u2502" + "\u2502".join(cells) + "\u2502"
         lines.append(_colorize_row(row_line, metric))
     lines.append(border_bot)
@@ -1295,49 +1330,36 @@ def _render_grouped_progress_table(
     metric_w = max((len(metric) for metric, _ in all_rows), default=0)
     metric_w = max(metric_w, len(title), max((len(name) for name, _ in sections), default=0))
 
-    def _cells_of(v: list[str] | str) -> list[str]:
-        return v if isinstance(v, list) else []
-
-    max_cell = max((max((len(v) for v in _cells_of(vals)), default=0) for _, vals in all_rows), default=0)
-    max_label = max((len(label) for label in column_labels), default=0)
-    # Spanning rows (value is str) cover all n_cols value columns plus their
-    # internal separators. Without measuring them, a wide spanning value (e.g.
-    # the ETA breakdown "~41.9 h (active 4 + blocked-recovery 60 + ...)" busts
-    # the table layout. Reverse-derive the minimum value_w from the spanning
-    # formula below so the joined span fits the longest observed string.
+    # Issue #214: per-column widths so one wide cell does NOT inflate every
+    # column.  Spanning rows are handled afterwards by widening uniformly.
+    value_widths = _compute_value_widths(column_labels, all_rows, default_min=value_w)
     max_spanning = max(
         (len(vals) for _, section_rows in sections for _, vals in section_rows if isinstance(vals, str)),
         default=0,
     )
-    spanning_min_value_w = (
-        (max_spanning + 3 - 3 * n_cols + n_cols - 1) // n_cols if max_spanning > 0 and n_cols > 0 else 0
-    )
-    value_w = max(value_w, max_cell, max_label, spanning_min_value_w)
+    value_widths = _widen_for_spanning(value_widths, max_spanning)
 
     # Width a spanning cell occupies across all n_cols value columns (plus
     # the n_cols-1 internal separators). Used for both the section-header row
     # and any individual metric whose value was merged into a str.
-    spanning_w = n_cols * (value_w + 2) + (n_cols - 1) - 2
+    spanning_w = sum(w + 2 for w in value_widths) + (n_cols - 1) - 2
     # Width of the ENTIRE merged cell for a section-header row: metric column
     # + all value columns + every separator between them - leading/trailing
     # padding (2 spaces).
-    section_w = metric_w + 2 + 1 + (n_cols * (value_w + 2) + (n_cols - 1)) - 2
+    section_w = metric_w + 2 + 1 + (sum(w + 2 for w in value_widths) + (n_cols - 1)) - 2
 
     def hborder(left: str, junction_metric: str, junction_inner: str, right: str) -> str:
-        return (
-            left
-            + "\u2500" * (metric_w + 2)
-            + junction_metric
-            + (("\u2500" * (value_w + 2) + junction_inner) * (n_cols - 1))
-            + "\u2500" * (value_w + 2)
-            + right
-        )
+        inner_runs = [("\u2500" * (w + 2)) for w in value_widths]
+        joined = junction_inner.join(inner_runs)
+        return left + "\u2500" * (metric_w + 2) + junction_metric + joined + right
 
     border_top = hborder("\u250c", "\u252c", "\u252c", "\u2510")
     border_mid = hborder("\u251c", "\u253c", "\u253c", "\u2524")
     border_bot = hborder("\u2514", "\u2534", "\u2534", "\u2518")
 
-    header_cells = [f" {title:<{metric_w}} "] + [f" {label:>{value_w}} " for label in column_labels]
+    header_cells = [f" {title:<{metric_w}} "] + [
+        f" {label:>{value_widths[i]}} " for i, label in enumerate(column_labels)
+    ]
     header_line = "\u2502" + "\u2502".join(header_cells) + "\u2502"
 
     lines: list[str] = [border_top, header_line]
@@ -1355,7 +1377,7 @@ def _render_grouped_progress_table(
             if isinstance(values, str):
                 row_line = f"\u2502 {metric:<{metric_w}} \u2502 {values:>{spanning_w}} \u2502"
             else:
-                cells = [f" {metric:<{metric_w}} "] + [f" {v:>{value_w}} " for v in values]
+                cells = [f" {metric:<{metric_w}} "] + [f" {v:>{value_widths[j]}} " for j, v in enumerate(values)]
                 row_line = "\u2502" + "\u2502".join(cells) + "\u2502"
             lines.append(_colorize_row(row_line, metric))
     lines.append(border_bot)

@@ -281,7 +281,40 @@ def _has_rejected_amendment_archive(workspace_root: Path, task_id: str) -> bool:
     return any(archive_dir.glob(pattern))
 
 
-def _has_runtime_degradation_signal(source_file: Path, now: datetime) -> bool:
+def _read_last_restart_marker(workspace_root: Path) -> datetime | None:
+    """Issue #215: return the UTC timestamp written to
+    ``<workspace>/.devbench/last-restart`` by ``cmd_start`` on every
+    orchestrator startup.
+
+    Used to bound the agent-tool-unavailable audit-row scan window so a
+    RUNTIME_DEGRADATION classification clears on operator-driven restart.
+
+    Returns ``None`` when the marker file is missing, unreadable, or
+    contains an unparseable timestamp -- callers fall back to the
+    pre-existing 24h sliding-window behaviour.
+    """
+    from devbench.constants import LAST_RESTART_MARKER_PATH
+
+    marker = workspace_root / LAST_RESTART_MARKER_PATH
+    if not marker.is_file():
+        return None
+    try:
+        raw = marker.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    try:
+        ts = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return ts.replace(tzinfo=UTC) if ts.tzinfo is None else ts.astimezone(UTC)
+
+
+def _has_runtime_degradation_signal(
+    source_file: Path,
+    now: datetime,
+    *,
+    since: datetime | None = None,
+) -> bool:
     """Issue #183(d): True iff the work-unit's Comments section carries a
     recent ``[BLOCKED]`` audit naming the agent-tool degradation
     payload that review-supervisor's Step 0 self-check emits.
@@ -289,6 +322,12 @@ def _has_runtime_degradation_signal(source_file: Path, now: datetime) -> bool:
     "Recent" means within ``_RUNTIME_DEGRADATION_WINDOW_SECONDS`` (24h)
     of ``now``. A stale payload past the window is treated as already-
     acknowledged by the operator and does NOT trigger this bucket.
+
+    Issue #215: when ``since`` is provided (the workspace's last-restart
+    marker), audit rows older than ``since`` are filtered out before the
+    24h window check.  The operator-driven restart consumes any
+    pre-restart degradation signal; only rows emitted by the new
+    orchestrator instance contribute to the bucket.
     """
     if not source_file.is_file():
         return False
@@ -306,6 +345,8 @@ def _has_runtime_degradation_signal(source_file: Path, now: datetime) -> bool:
         try:
             ts = datetime.strptime(match.group("ts"), "%Y-%m-%d %H:%M UTC").replace(tzinfo=UTC)
         except ValueError:
+            continue
+        if since is not None and ts < since:
             continue
         if most_recent_ts is None or ts > most_recent_ts:
             most_recent_ts = ts
@@ -407,11 +448,17 @@ def classify_blocked_task(
     # degraded. Checked BEFORE every other bucket so a degraded session
     # is surfaced even if the task also looks held / blocked-on-held;
     # only restarting ``make start`` can let the work resume in any case.
-    if source_file is not None and _has_runtime_degradation_signal(
-        source_file,
-        now if now is not None else datetime.now(UTC),
-    ):
-        return BlockedTaskState.RUNTIME_DEGRADATION
+    # Issue #215: an operator-driven restart writes
+    # ``<workspace>/.devbench/last-restart`` which bounds the audit-row
+    # scan so audit rows from the pre-restart instance are NOT counted.
+    if source_file is not None:
+        restart_marker = _read_last_restart_marker(workspace_root) if workspace_root is not None else None
+        if _has_runtime_degradation_signal(
+            source_file,
+            now if now is not None else datetime.now(UTC),
+            since=restart_marker,
+        ):
+            return BlockedTaskState.RUNTIME_DEGRADATION
 
     # Priority 1: HELD -- the task itself is in hold status.
     if _task_status_is_hold(backlog_root, backlog_index, task_id):

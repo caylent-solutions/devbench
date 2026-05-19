@@ -28,6 +28,10 @@ you want.
   failed notification never crashes the orchestrator.
 - One YAML toggle per event. Defaults are all `false` so devbench is
   silent until you opt in.
+- Every payload carries a `Backlog` field naming the workspace the
+  ping came from, so operators monitoring multiple workspaces can tell
+  at a glance which backlog a ping refers to. The label is the
+  basename of `DEVBENCH_WORKSPACE_ROOT`.
 
 ## How Slack incoming webhooks work
 
@@ -161,7 +165,13 @@ Every event toggle, when it fires, and what's in the payload:
 | Toggle | Fires when | Payload fields |
 |---|---|---|
 | `work_unit_done` | A task transitions to `done`. | Task id, title. |
-| `work_unit_blocked_operator` | A task is blocked AND the classifier flags it as `OPERATOR_ACTION_REQUIRED` (auto-clearing blocks do **not** fire). Fires on every transition *into* the `OPERATOR_ACTION_REQUIRED` bucket — including reclassification of a task that was already blocked but later drifted into that bucket because a `[BLOCKED]` audit went stale (#207). Idempotent: once notified, repeated classifications of the same task do not re-ping until the task exits and re-enters the bucket. | Task id, title, reason. |
+| `work_unit_blocked_operator` | A task transitions into the `OPERATOR_ACTION_REQUIRED` bucket (initial entry or reclassification from another bucket). Idempotent per (task × class): repeated classifications without a class change do not re-ping; exiting and re-entering the bucket re-fires (#207). | Task id, title, reason. |
+| `work_unit_blocked_runtime_degradation` | A task transitions into the `RUNTIME_DEGRADATION` bucket (SDK Agent-tool loss; requires `make start` restart) (#209). | Task id, title, reason. |
+| `work_unit_blocked_held` | A task transitions into the `HELD` bucket (status is `hold`; operator must resume manually) (#209). | Task id, title, reason. |
+| `work_unit_blocked_on_held` | A task transitions into the `BLOCKED_ON_HELD` bucket (marker target is in `hold`; operator must resume the held target) (#209). | Task id, title, reason. |
+| `work_unit_blocked_auto_clearing` | A task transitions into the `AUTO_CLEARING_VIA_PROPOSAL` bucket (ADR-07 cascade in flight; will auto-unblock) (#209). | Task id, title, reason. |
+| `work_unit_blocked_awaiting_dependency` | A task transitions into the `AWAITING_DEPENDENCY` bucket (regular dep still in flight; will auto-unblock) (#209). | Task id, title, reason. |
+| `work_unit_blocked_amendment_recovery` | A task transitions into the `AWAITING_AMENDMENT_RECOVERY` bucket (recovery signal on disk; resumes on next sweep) (#209). | Task id, title, reason. |
 | `work_unit_materialised` | A draft WU file is written from a proposal. | New task id, title, source task id. |
 | `work_unit_promoted` | A draft WU is promoted to `in-queue`. | Task id, title. |
 | `pr_opened` | `gh pr create` succeeded for a work unit. | Task id, repo, PR URL. |

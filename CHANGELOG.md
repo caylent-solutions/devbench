@@ -12,6 +12,36 @@ since the last release. PR #119 carries every change.
 
 ### Added
 
+- **Per-class Slack toggles for every blocked classification + Backlog
+  field on every payload** (issue #209). The previous notification
+  surface fired only on transition into `OPERATOR_ACTION_REQUIRED`;
+  the other six blocked classes (RUNTIME_DEGRADATION, HELD,
+  BLOCKED_ON_HELD, AUTO_CLEARING_VIA_PROPOSAL, AWAITING_DEPENDENCY,
+  AWAITING_AMENDMENT_RECOVERY) were silent. The
+  `notifications.events` block now carries six new toggles --
+  `work_unit_blocked_runtime_degradation`, `work_unit_blocked_held`,
+  `work_unit_blocked_on_held`, `work_unit_blocked_auto_clearing`,
+  `work_unit_blocked_awaiting_dependency`,
+  `work_unit_blocked_amendment_recovery` -- each defaulting to
+  `false`. Pings fire on transition INTO the matching class (initial
+  entry or reclassification from a different bucket), idempotent per
+  `(task × class)`. The cache is pruned on `cmd_sync_blocked` /
+  `cmd_reconcile_cascade` for tasks that exit `blocked`, so re-entry
+  into the same class produces a fresh ping rather than being
+  suppressed by a stale entry. Every Slack payload also carries a new
+  `Backlog` field naming the source workspace (operator request
+  2026-05-19), so operators monitoring multiple workspaces can tell
+  at a glance which backlog a ping refers to. Implementation lives in
+  `src/devbench/notifications.py` (new `_EVENT_BY_CLASSIFICATION` +
+  `_NOTIFY_FN_BY_CLASSIFICATION` mappings, six new `notify_*` helpers,
+  generalised `notify_blocked_classification_transition`, new
+  `prune_notification_state_for_unblocked`); pinned by 16 cases in
+  `tests/test_notifications_transition.py` (parametrised across all
+  seven classes) plus six new payload-shape tests in
+  `tests/test_notifications.py`. Replaces the operator-only
+  `notify_blocked_operator_transition` from #207 per CLAUDE.md
+  "Complete Replacement of Superseded Code".
+
 - **Operator-facing Slack notifications** (PR #202) — toggleable per-event
   Slack pings on every interesting lifecycle event: work-unit done,
   work-unit blocked-and-operator-action-required, work-unit materialised

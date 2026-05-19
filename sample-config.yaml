@@ -416,7 +416,18 @@ validate:
 #   timeout_seconds: 10                    # per-POST HTTP timeout
 #   events:
 #     work_unit_done: false                # task transitions to done
-#     work_unit_blocked_operator: false    # classifier flags WU as OPERATOR_ACTION_REQUIRED
+#     # The next seven toggles correspond to the seven blocked-task classes
+#     # (BlockedTaskState).  Each fires when a task transitions INTO that
+#     # class (initial entry or reclassification).  Idempotent per (task ×
+#     # class); exiting and re-entering the class re-fires.  See
+#     # docs/slack-notifications.md for the per-class semantics.
+#     work_unit_blocked_operator: false              # OPERATOR_ACTION_REQUIRED
+#     work_unit_blocked_runtime_degradation: false   # RUNTIME_DEGRADATION (SDK Agent-tool loss; needs `make start` restart)
+#     work_unit_blocked_held: false                  # HELD (status is `hold`)
+#     work_unit_blocked_on_held: false               # BLOCKED_ON_HELD (marker target is `hold`)
+#     work_unit_blocked_auto_clearing: false         # AUTO_CLEARING_VIA_PROPOSAL (cascade in flight)
+#     work_unit_blocked_awaiting_dependency: false   # AWAITING_DEPENDENCY (regular dep still in flight)
+#     work_unit_blocked_amendment_recovery: false    # AWAITING_AMENDMENT_RECOVERY (recovery signal on disk)
 #     work_unit_materialised: false        # draft WU file written from a proposal
 #     work_unit_promoted: false            # draft WU promoted to in-queue
 #     pr_opened: false                     # `gh pr create` succeeded

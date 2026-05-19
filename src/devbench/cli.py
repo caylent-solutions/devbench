@@ -1993,13 +1993,14 @@ def cmd_sync_blocked() -> int:
             manager._append_comment(wu_file, "UNBLOCKED", "deps satisfied; sync-blocked dependencies now terminal")
             flipped_to_in_queue.append(unit.id)
 
-    # Issue #207: classification-transition pass.  Re-classify every task
-    # that is still ``blocked`` after the sweep and route through the
+    # Issues #207, #209: classification-transition pass.  Re-classify every
+    # task still ``blocked`` after the sweep and route through the
     # transition-aware notifier so a stale ``[BLOCKED]`` audit that has
-    # drifted into the ``OPERATOR_ACTION_REQUIRED`` bucket since the last
-    # write-site run produces exactly one Slack ping.  Cache-backed and
+    # drifted into ANY of the seven blocked classes since the last
+    # write-site run produces exactly one Slack ping (gated by the
+    # per-class toggle in ``devbench.yaml``).  Cache-backed and
     # idempotent: repeated ``sync-blocked`` calls do not duplicate pings.
-    _notify_blocked_operator_transitions(units)
+    _notify_blocked_classification_transitions(units)
 
     output = {
         "flipped_to_blocked": flipped_to_blocked,
@@ -2014,30 +2015,42 @@ def cmd_sync_blocked() -> int:
     return 0
 
 
-def _notify_blocked_operator_transitions(units: list) -> None:
+def _notify_blocked_classification_transitions(units: list) -> None:
     """Re-classify still-blocked tasks and route into the transition-aware notifier.
 
     Called from ``cmd_sync_blocked`` and ``cmd_reconcile_cascade`` as a final
-    pass after their main reconciliation work completes (issue #207).  For
-    every task whose status is still ``blocked``, run
+    pass after their main reconciliation work completes (issues #207, #209).
+    For every task whose status is still ``blocked``, run
     :func:`classify_blocked_task` and call
-    :func:`notify_blocked_operator_transition` so a stale ``[BLOCKED]`` audit
-    later reclassified as ``OPERATOR_ACTION_REQUIRED`` produces exactly one
-    Slack ping per transition.
+    :func:`notify_blocked_classification_transition` so a stale ``[BLOCKED]``
+    audit later reclassified into ANY blocked class produces exactly one
+    Slack ping per transition (gated by the per-class toggle in
+    ``devbench.yaml``).
+
+    The pass also prunes cache entries for tasks that exited ``blocked``
+    via the just-run sweep (see :func:`prune_notification_state_for_unblocked`),
+    so a task that re-enters ``blocked`` later -- same or different class --
+    fires a fresh ping rather than being silently suppressed by a stale
+    cache entry.
 
     Best-effort: any I/O or classifier exception logs ``[WARN]`` to stderr
     and continues to the next task -- the orchestrator must never abort
     because notification bookkeeping failed.
     """
     from devbench.backlog.proposal import classify_blocked_task
-    from devbench.notifications import notify_blocked_operator_transition
+    from devbench.notifications import (
+        notify_blocked_classification_transition,
+        prune_notification_state_for_unblocked,
+    )
 
     workspace_root = BACKLOG_INDEX.parent
+    blocked_task_ids: set[str] = set()
     for unit in units:
         if unit.unit_type is not WorkUnitType.TASK:
             continue
         if unit.status is not WorkUnitStatus.BLOCKED:
             continue
+        blocked_task_ids.add(unit.id)
         try:
             state = classify_blocked_task(
                 BACKLOG_INDEX.parent / "backlog",
@@ -2053,7 +2066,12 @@ def _notify_blocked_operator_transitions(units: list) -> None:
             continue
         title = (unit.title or unit.id).strip()
         reason = f"sync-blocked classification: {state.name}"
-        notify_blocked_operator_transition(unit.id, title, reason, state.name, workspace_root)
+        notify_blocked_classification_transition(unit.id, title, reason, state.name, workspace_root)
+    # Prune any cache entries that no longer correspond to a blocked task --
+    # tasks that left ``blocked`` (to ``in-queue`` / ``done`` / etc.) since
+    # the last sweep.  Without this, re-entering ``blocked`` later with the
+    # same class would be silently suppressed by the stale cached value.
+    prune_notification_state_for_unblocked(workspace_root, blocked_task_ids)
 
 
 def cmd_reconcile_cascade() -> int:
@@ -2132,11 +2150,11 @@ def cmd_reconcile_cascade() -> int:
         manager._append_agent_comment(wu_file, "backlog_manager", message)
         flipped.append({"unit_id": unit.id, "closed_markers": marker_ids})
 
-    # Issue #207: surface classification transitions for tasks that remain
+    # Issues #207, #209: surface classification transitions for tasks that remain
     # blocked after the reconcile sweep -- a stale ``[BLOCKED]`` audit that
     # has drifted into ``OPERATOR_ACTION_REQUIRED`` produces exactly one
     # Slack ping.  Cache-backed, idempotent across repeated invocations.
-    _notify_blocked_operator_transitions(units)
+    _notify_blocked_classification_transitions(units)
 
     output = {"flipped": flipped, "skipped": skipped}
     print(json.dumps(output))

@@ -231,7 +231,7 @@ class BacklogManager:
         # toggles in devbench.yaml; safe to call unconditionally.
         try:
             from devbench.backlog.proposal import classify_blocked_task
-            from devbench.notifications import notify_blocked_operator_transition
+            from devbench.notifications import notify_blocked_classification_transition
 
             workspace_root = backlog_index.parent
             state = classify_blocked_task(
@@ -241,13 +241,14 @@ class BacklogManager:
                 workspace_root=workspace_root,
             )
             title = _extract_wu_title(work_unit_path, unit_id)
-            # Issue #207: routes through the transition-aware helper so the
-            # ping fires on every transition INTO OPERATOR_ACTION_REQUIRED,
-            # not only at this initial mark_blocked call.  ``cmd_sync_blocked``
-            # and ``cmd_reconcile_cascade`` re-classify already-blocked tasks
-            # and call the same helper so a stale ``[BLOCKED]`` audit later
-            # reclassified as OPERATOR_ACTION_REQUIRED still surfaces.
-            notify_blocked_operator_transition(unit_id, title, reason, state.name, workspace_root)
+            # Issue #207 + #209: routes through the transition-aware helper
+            # so the ping fires on every transition INTO any of the seven
+            # blocked classes (initial mark_blocked OR later reclassification
+            # via cmd_sync_blocked / cmd_reconcile_cascade).  Each class has
+            # its own per-event toggle in devbench.yaml; the dispatcher
+            # picks the right notify_* helper based on the classifier's
+            # return value.
+            notify_blocked_classification_transition(unit_id, title, reason, state.name, workspace_root)
         except (OSError, ValueError, ImportError):
             # Classifier I/O failures should not block the status write.
             pass

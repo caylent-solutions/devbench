@@ -124,10 +124,28 @@ class TestSlackPayload:
         block_types = [b["type"] for b in payload["blocks"]]
         assert block_types == ["section", "section", "context"]
 
-    def test_payload_blocks_omit_fields_section_when_none(self) -> None:
+    def test_payload_always_carries_fields_section_with_backlog_label(self) -> None:
+        """The Backlog field is auto-injected, so the fields-section block
+        is always present even when the caller passes no event-specific fields."""
         payload = notifications._build_slack_payload(summary="x", fields=[], context=None)
-        assert len(payload["blocks"]) == 1
-        assert payload["blocks"][0]["type"] == "section"
+        block_types = [b["type"] for b in payload["blocks"]]
+        assert block_types == ["section", "section"]
+        # Backlog is the sole field when callers supply none.
+        fields_block = payload["blocks"][1]
+        assert len(fields_block["fields"]) == 1
+        assert "*Backlog*" in fields_block["fields"][0]["text"]
+
+    def test_payload_backlog_field_is_first(self) -> None:
+        """The Backlog field is always the first row of the fields block so
+        operators monitoring multiple workspaces see source-of-ping at a glance."""
+        payload = notifications._build_slack_payload(
+            summary="x",
+            fields=[("Task", "`E0-F1-S1-T1`")],
+            context=None,
+        )
+        fields_block = payload["blocks"][1]
+        assert "*Backlog*" in fields_block["fields"][0]["text"]
+        assert "*Task*" in fields_block["fields"][1]["text"]
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +242,81 @@ class TestPerEventPayloads:
             event_name="work_unit_blocked_operator",
         )
         assert "Operator action required" in payload["text"]
+
+    def test_blocked_runtime_degradation(self) -> None:
+        payload = self._capture_one(
+            notifications.notify_work_unit_blocked_runtime_degradation,
+            "E0-F1-S1-T1",
+            "Sample",
+            "agent-tool-unavailable",
+            event_name="work_unit_blocked_runtime_degradation",
+        )
+        assert "Runtime degradation" in payload["text"]
+
+    def test_blocked_held(self) -> None:
+        payload = self._capture_one(
+            notifications.notify_work_unit_blocked_held,
+            "E0-F1-S1-T1",
+            "Sample",
+            "status is hold",
+            event_name="work_unit_blocked_held",
+        )
+        assert "On hold" in payload["text"]
+
+    def test_blocked_on_held(self) -> None:
+        payload = self._capture_one(
+            notifications.notify_work_unit_blocked_on_held,
+            "E0-F1-S1-T1",
+            "Sample",
+            "marker target is hold",
+            event_name="work_unit_blocked_on_held",
+        )
+        assert "Blocked on held" in payload["text"]
+
+    def test_blocked_auto_clearing(self) -> None:
+        payload = self._capture_one(
+            notifications.notify_work_unit_blocked_auto_clearing,
+            "E0-F1-S1-T1",
+            "Sample",
+            "marker target pending",
+            event_name="work_unit_blocked_auto_clearing",
+        )
+        assert "Auto-clearing" in payload["text"]
+
+    def test_blocked_awaiting_dependency(self) -> None:
+        payload = self._capture_one(
+            notifications.notify_work_unit_blocked_awaiting_dependency,
+            "E0-F1-S1-T1",
+            "Sample",
+            "dep not yet terminal",
+            event_name="work_unit_blocked_awaiting_dependency",
+        )
+        assert "Awaiting dependency" in payload["text"]
+
+    def test_blocked_amendment_recovery(self) -> None:
+        payload = self._capture_one(
+            notifications.notify_work_unit_blocked_amendment_recovery,
+            "E0-F1-S1-T1",
+            "Sample",
+            "rejected-requests archive present",
+            event_name="work_unit_blocked_amendment_recovery",
+        )
+        assert "amendment recovery" in payload["text"].lower()
+
+    def test_every_payload_carries_backlog_field(self) -> None:
+        """Every Slack payload includes a top-level ``Backlog`` field naming the
+        active workspace (operator request 2026-05-19).  Smoke-tests with the
+        ``work_unit_done`` helper since the field is injected by the shared
+        payload builder."""
+        payload = self._capture_one(
+            notifications.notify_work_unit_done,
+            "E0-F1-S1-T1",
+            "Sample title",
+            event_name="work_unit_done",
+        )
+        first_fields_block = next(b for b in payload["blocks"] if b["type"] == "section" and "fields" in b)
+        backlog_field = next(f for f in first_fields_block["fields"] if "*Backlog*" in f["text"])
+        assert backlog_field is not None
 
     def test_materialised(self) -> None:
         payload = self._capture_one(
@@ -444,6 +537,50 @@ class TestNotificationsConfigParser:
         assert n.events.work_unit_done is True
         assert n.events.quota_pause is True
         assert n.events.work_unit_blocked_operator is False  # default
+
+    def test_per_class_blocked_event_toggles_default_false_and_parse(self) -> None:
+        """The 6 new per-class blocked-event toggles (#209) default to false and
+        accept independent boolean settings from yaml."""
+        # Defaults when absent.
+        rt_default = self._load(
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            notifications:
+              enabled: true
+            """
+        )
+        assert rt_default.notifications.events.work_unit_blocked_runtime_degradation is False
+        assert rt_default.notifications.events.work_unit_blocked_held is False
+        assert rt_default.notifications.events.work_unit_blocked_on_held is False
+        assert rt_default.notifications.events.work_unit_blocked_auto_clearing is False
+        assert rt_default.notifications.events.work_unit_blocked_awaiting_dependency is False
+        assert rt_default.notifications.events.work_unit_blocked_amendment_recovery is False
+
+        # Explicit yaml values flip each independently.
+        rt = self._load(
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            notifications:
+              enabled: true
+              events:
+                work_unit_blocked_runtime_degradation: true
+                work_unit_blocked_held: true
+                work_unit_blocked_on_held: true
+                work_unit_blocked_auto_clearing: true
+                work_unit_blocked_awaiting_dependency: true
+                work_unit_blocked_amendment_recovery: true
+            """
+        )
+        assert rt.notifications.events.work_unit_blocked_runtime_degradation is True
+        assert rt.notifications.events.work_unit_blocked_held is True
+        assert rt.notifications.events.work_unit_blocked_on_held is True
+        assert rt.notifications.events.work_unit_blocked_auto_clearing is True
+        assert rt.notifications.events.work_unit_blocked_awaiting_dependency is True
+        assert rt.notifications.events.work_unit_blocked_amendment_recovery is True
 
     def test_non_https_webhook_url_rejected(self) -> None:
         with pytest.raises(ValueError, match="must start with 'https://'"):

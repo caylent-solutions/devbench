@@ -814,6 +814,12 @@ class NotificationsEventsConfig:
 
     work_unit_done: bool = False
     work_unit_blocked_operator: bool = False
+    work_unit_blocked_runtime_degradation: bool = False
+    work_unit_blocked_held: bool = False
+    work_unit_blocked_on_held: bool = False
+    work_unit_blocked_auto_clearing: bool = False
+    work_unit_blocked_awaiting_dependency: bool = False
+    work_unit_blocked_amendment_recovery: bool = False
     work_unit_materialised: bool = False
     work_unit_promoted: bool = False
     pr_opened: bool = False
@@ -891,6 +897,34 @@ def _parse_notifications_config(raw: dict) -> NotificationsConfig:
         work_unit_done=bool(events_raw.get("work_unit_done", defaults.events.work_unit_done)),
         work_unit_blocked_operator=bool(
             events_raw.get("work_unit_blocked_operator", defaults.events.work_unit_blocked_operator)
+        ),
+        work_unit_blocked_runtime_degradation=bool(
+            events_raw.get(
+                "work_unit_blocked_runtime_degradation",
+                defaults.events.work_unit_blocked_runtime_degradation,
+            )
+        ),
+        work_unit_blocked_held=bool(events_raw.get("work_unit_blocked_held", defaults.events.work_unit_blocked_held)),
+        work_unit_blocked_on_held=bool(
+            events_raw.get("work_unit_blocked_on_held", defaults.events.work_unit_blocked_on_held)
+        ),
+        work_unit_blocked_auto_clearing=bool(
+            events_raw.get(
+                "work_unit_blocked_auto_clearing",
+                defaults.events.work_unit_blocked_auto_clearing,
+            )
+        ),
+        work_unit_blocked_awaiting_dependency=bool(
+            events_raw.get(
+                "work_unit_blocked_awaiting_dependency",
+                defaults.events.work_unit_blocked_awaiting_dependency,
+            )
+        ),
+        work_unit_blocked_amendment_recovery=bool(
+            events_raw.get(
+                "work_unit_blocked_amendment_recovery",
+                defaults.events.work_unit_blocked_amendment_recovery,
+            )
         ),
         work_unit_materialised=bool(events_raw.get("work_unit_materialised", defaults.events.work_unit_materialised)),
         work_unit_promoted=bool(events_raw.get("work_unit_promoted", defaults.events.work_unit_promoted)),

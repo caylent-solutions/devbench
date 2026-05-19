@@ -59,6 +59,12 @@ from devbench.utils.io import atomic_write_text
 
 EVENT_WORK_UNIT_DONE = "work_unit_done"
 EVENT_WORK_UNIT_BLOCKED_OPERATOR = "work_unit_blocked_operator"
+EVENT_WORK_UNIT_BLOCKED_RUNTIME_DEGRADATION = "work_unit_blocked_runtime_degradation"
+EVENT_WORK_UNIT_BLOCKED_HELD = "work_unit_blocked_held"
+EVENT_WORK_UNIT_BLOCKED_ON_HELD = "work_unit_blocked_on_held"
+EVENT_WORK_UNIT_BLOCKED_AUTO_CLEARING = "work_unit_blocked_auto_clearing"
+EVENT_WORK_UNIT_BLOCKED_AWAITING_DEPENDENCY = "work_unit_blocked_awaiting_dependency"
+EVENT_WORK_UNIT_BLOCKED_AMENDMENT_RECOVERY = "work_unit_blocked_amendment_recovery"
 EVENT_WORK_UNIT_MATERIALISED = "work_unit_materialised"
 EVENT_WORK_UNIT_PROMOTED = "work_unit_promoted"
 EVENT_PR_OPENED = "pr_opened"
@@ -72,6 +78,12 @@ EVENT_QUOTA_RESUME = "quota_resume"
 ALL_EVENTS: tuple[str, ...] = (
     EVENT_WORK_UNIT_DONE,
     EVENT_WORK_UNIT_BLOCKED_OPERATOR,
+    EVENT_WORK_UNIT_BLOCKED_RUNTIME_DEGRADATION,
+    EVENT_WORK_UNIT_BLOCKED_HELD,
+    EVENT_WORK_UNIT_BLOCKED_ON_HELD,
+    EVENT_WORK_UNIT_BLOCKED_AUTO_CLEARING,
+    EVENT_WORK_UNIT_BLOCKED_AWAITING_DEPENDENCY,
+    EVENT_WORK_UNIT_BLOCKED_AMENDMENT_RECOVERY,
     EVENT_WORK_UNIT_MATERIALISED,
     EVENT_WORK_UNIT_PROMOTED,
     EVENT_PR_OPENED,
@@ -114,7 +126,43 @@ SLACK_HERE_MENTION: str = "<!here>"
 
 NOTIFICATION_STATE_FILENAME: str = "notification-state.json"
 
-_OPERATOR_ACTION_REQUIRED_CLASSIFICATION: str = "OPERATOR_ACTION_REQUIRED"
+# ``BlockedTaskState`` enum member name -> Slack event toggle.  Each
+# blocked classification gets its own per-event toggle so operators can
+# opt in by bucket (issue #209).  Re-using the enum's ``.name`` string
+# (e.g. ``"AWAITING_DEPENDENCY"``) keeps the mapping single-source-of-truth
+# with the classifier in ``backlog/proposal.py``.
+_EVENT_BY_CLASSIFICATION: dict[str, str] = {
+    "RUNTIME_DEGRADATION": EVENT_WORK_UNIT_BLOCKED_RUNTIME_DEGRADATION,
+    "HELD": EVENT_WORK_UNIT_BLOCKED_HELD,
+    "BLOCKED_ON_HELD": EVENT_WORK_UNIT_BLOCKED_ON_HELD,
+    "AUTO_CLEARING_VIA_PROPOSAL": EVENT_WORK_UNIT_BLOCKED_AUTO_CLEARING,
+    "AWAITING_DEPENDENCY": EVENT_WORK_UNIT_BLOCKED_AWAITING_DEPENDENCY,
+    "AWAITING_AMENDMENT_RECOVERY": EVENT_WORK_UNIT_BLOCKED_AMENDMENT_RECOVERY,
+    "OPERATOR_ACTION_REQUIRED": EVENT_WORK_UNIT_BLOCKED_OPERATOR,
+}
+
+
+def _resolve_backlog_label() -> str:
+    """Return a short label identifying the active workspace / backlog.
+
+    Used by every Slack payload so operators monitoring multiple workspaces
+    can tell at a glance which backlog a ping came from (operator request,
+    2026-05-19). Reads ``DEVBENCH_WORKSPACE_ROOT`` and returns its basename;
+    falls back to ``"unknown"`` if the env var is absent (e.g. during a
+    ``devbench notify-test`` smoke check that doesn't bootstrap workspace
+    config).  Best-effort: any exception during lookup returns
+    ``"unknown"`` so a label-resolution bug cannot suppress a notification.
+    """
+    try:
+        from devbench.config import WORKSPACE_ROOT
+
+        if WORKSPACE_ROOT is not None:
+            label = WORKSPACE_ROOT.name
+            if label:
+                return label
+    except (ImportError, RuntimeError, AttributeError):
+        pass
+    return "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -192,31 +240,36 @@ def _build_slack_payload(
     a shared channel the whole online team gets pinged.  Single payload,
     both routings.
 
+    Every payload also carries a ``Backlog`` field as the first row of
+    the fields block so operators monitoring multiple workspaces can
+    tell at a glance which backlog a ping came from (operator request,
+    2026-05-19).  The label is resolved from
+    :func:`_resolve_backlog_label`.
+
     Args:
         summary: One-line headline used for both the ``text`` top-line
             (required by the Slack incoming-webhook contract for
             mobile preview rendering) and the first block's bold
             header.
         fields: Two-column ``(name, value)`` pairs rendered as a
-            section block with up to ten markdown fields.
+            section block with up to ten markdown fields.  The
+            ``Backlog`` row is prepended automatically.
         context: Optional muted footer line (block-kit ``context``
             element).  ``None`` skips the footer block.
     """
     prefix = f"{SLACK_HERE_MENTION} "
     text_line = f"{prefix}{summary}"
+    enriched_fields: list[tuple[str, str]] = [("Backlog", _resolve_backlog_label())] + list(fields)
     blocks: list[dict[str, Any]] = [
         {
             "type": "section",
             "text": {"type": "mrkdwn", "text": f"*{prefix}{summary}*"},
-        }
+        },
+        {
+            "type": "section",
+            "fields": [{"type": "mrkdwn", "text": f"*{name}*\n{value}"} for name, value in enriched_fields],
+        },
     ]
-    if fields:
-        blocks.append(
-            {
-                "type": "section",
-                "fields": [{"type": "mrkdwn", "text": f"*{name}*\n{value}"} for name, value in fields],
-            }
-        )
     if context:
         blocks.append(
             {
@@ -304,6 +357,82 @@ def notify_work_unit_blocked_operator(unit_id: str, title: str, reason: str) -> 
     )
 
 
+def notify_work_unit_blocked_runtime_degradation(unit_id: str, title: str, reason: str) -> None:
+    """A work unit was classified ``RUNTIME_DEGRADATION`` (#183 -- SDK agent-tool loss)."""
+    _dispatch(
+        EVENT_WORK_UNIT_BLOCKED_RUNTIME_DEGRADATION,
+        slack_summary=f":rotating_light: Runtime degradation: {unit_id}",
+        slack_fields=[("Task", f"`{unit_id}`"), ("Title", title)],
+        slack_context=f"Reason: {reason}",
+    )
+
+
+def notify_work_unit_blocked_held(unit_id: str, title: str, reason: str) -> None:
+    """A work unit was classified ``HELD`` (status is ``hold``)."""
+    _dispatch(
+        EVENT_WORK_UNIT_BLOCKED_HELD,
+        slack_summary=f":pause_button: On hold: {unit_id}",
+        slack_fields=[("Task", f"`{unit_id}`"), ("Title", title)],
+        slack_context=f"Reason: {reason}",
+    )
+
+
+def notify_work_unit_blocked_on_held(unit_id: str, title: str, reason: str) -> None:
+    """A work unit was classified ``BLOCKED_ON_HELD`` (marker target is ``hold``)."""
+    _dispatch(
+        EVENT_WORK_UNIT_BLOCKED_ON_HELD,
+        slack_summary=f":pause_button: Blocked on held dependency: {unit_id}",
+        slack_fields=[("Task", f"`{unit_id}`"), ("Title", title)],
+        slack_context=f"Reason: {reason}",
+    )
+
+
+def notify_work_unit_blocked_auto_clearing(unit_id: str, title: str, reason: str) -> None:
+    """A work unit was classified ``AUTO_CLEARING_VIA_PROPOSAL`` (ADR-07 cascade in flight)."""
+    _dispatch(
+        EVENT_WORK_UNIT_BLOCKED_AUTO_CLEARING,
+        slack_summary=f":hourglass_flowing_sand: Auto-clearing via proposal: {unit_id}",
+        slack_fields=[("Task", f"`{unit_id}`"), ("Title", title)],
+        slack_context=f"Reason: {reason}",
+    )
+
+
+def notify_work_unit_blocked_awaiting_dependency(unit_id: str, title: str, reason: str) -> None:
+    """A work unit was classified ``AWAITING_DEPENDENCY`` (regular dep still in flight)."""
+    _dispatch(
+        EVENT_WORK_UNIT_BLOCKED_AWAITING_DEPENDENCY,
+        slack_summary=f":hourglass: Awaiting dependency: {unit_id}",
+        slack_fields=[("Task", f"`{unit_id}`"), ("Title", title)],
+        slack_context=f"Reason: {reason}",
+    )
+
+
+def notify_work_unit_blocked_amendment_recovery(unit_id: str, title: str, reason: str) -> None:
+    """A work unit was classified ``AWAITING_AMENDMENT_RECOVERY`` (recovery signal present)."""
+    _dispatch(
+        EVENT_WORK_UNIT_BLOCKED_AMENDMENT_RECOVERY,
+        slack_summary=f":hammer_and_wrench: Awaiting amendment recovery: {unit_id}",
+        slack_fields=[("Task", f"`{unit_id}`"), ("Title", title)],
+        slack_context=f"Reason: {reason}",
+    )
+
+
+# Map ``BlockedTaskState`` enum-member name -> per-class notify_* function NAME.
+# Stored as a string and resolved through ``globals()`` at call time so test
+# ``patch("devbench.notifications.notify_*")`` patches the same module
+# attribute the dispatcher actually invokes; a direct function-object map
+# would capture the pre-patch object and bypass the mock.
+_NOTIFY_FN_NAME_BY_CLASSIFICATION: dict[str, str] = {
+    "RUNTIME_DEGRADATION": "notify_work_unit_blocked_runtime_degradation",
+    "HELD": "notify_work_unit_blocked_held",
+    "BLOCKED_ON_HELD": "notify_work_unit_blocked_on_held",
+    "AUTO_CLEARING_VIA_PROPOSAL": "notify_work_unit_blocked_auto_clearing",
+    "AWAITING_DEPENDENCY": "notify_work_unit_blocked_awaiting_dependency",
+    "AWAITING_AMENDMENT_RECOVERY": "notify_work_unit_blocked_amendment_recovery",
+    "OPERATOR_ACTION_REQUIRED": "notify_work_unit_blocked_operator",
+}
+
+
 def _load_notification_state(state_path: Path) -> dict[str, str]:
     """Read the per-workspace classification cache.
 
@@ -336,25 +465,40 @@ def _save_notification_state(state_path: Path, state: dict[str, str]) -> None:
     atomic_write_text(state_path, json.dumps(state, sort_keys=True, indent=2))
 
 
-def notify_blocked_operator_transition(
+def notify_blocked_classification_transition(
     unit_id: str,
     title: str,
     reason: str,
     classification: str,
     workspace_root: Path,
 ) -> None:
-    """Fire ``notify_work_unit_blocked_operator`` only on transition *into*
-    ``OPERATOR_ACTION_REQUIRED`` (#207).
+    """Fire the per-class ``notify_work_unit_blocked_<class>`` helper on
+    transition into any of the seven blocked classifications (issue #209;
+    generalisation of the original operator-only transition path from #207).
 
     Compares *classification* against the last value observed for *unit_id*
     in the per-workspace cache at
-    ``<workspace_root>/.devbench/notification-state.json``.  Pings fire only
-    when the cache is missing / differs from ``OPERATOR_ACTION_REQUIRED``
-    and *classification* equals it now.
+    ``<workspace_root>/.devbench/notification-state.json``.  Cache is the
+    sole source of truth for "what was the previous class"; the per-event
+    toggle in ``devbench.yaml`` only gates whether a ping fires once a
+    transition is detected.  The cache is ALWAYS updated on every call
+    regardless of toggle state, so flipping a toggle on later does not
+    fire pings for state that was already cached.
 
-    Call this from write sites only (``mark_blocked``, ``cmd_sync_blocked``,
-    ``cmd_reconcile_cascade``) -- never from read-only renderers, which
-    classify on every refresh and would otherwise spam pings.
+    Fire semantics: a ping fires when ``previous != classification`` (a
+    real transition) AND the matching per-class toggle is enabled.
+    Initial entry (``previous is None``) counts as a transition.  Repeated
+    observations of the same class are no-ops.
+
+    Call this from write sites only -- ``mark_blocked``,
+    ``cmd_sync_blocked``, ``cmd_reconcile_cascade`` -- never from
+    read-only renderers, which classify on every refresh and would
+    otherwise spam pings.
+
+    Unknown classifications (not in ``_EVENT_BY_CLASSIFICATION``) are
+    treated as "do nothing" -- no cache write, no ping -- so a new bucket
+    added to the classifier without a corresponding event mapping fails
+    safe.
 
     Args:
         unit_id: The blocked task id (e.g. ``E10-F2-S1-T3``).
@@ -367,17 +511,14 @@ def notify_blocked_operator_transition(
             ``Path(DEVBENCH_WORKSPACE_ROOT)`` -- under which the cache file
             is located.
     """
-    if not is_event_enabled(EVENT_WORK_UNIT_BLOCKED_OPERATOR):
+    event_kind = _EVENT_BY_CLASSIFICATION.get(classification)
+    if event_kind is None:
         return
 
     state_path = workspace_root / ".devbench" / NOTIFICATION_STATE_FILENAME
     state = _load_notification_state(state_path)
     previous = state.get(unit_id)
-
-    fires_now = (
-        classification == _OPERATOR_ACTION_REQUIRED_CLASSIFICATION
-        and previous != _OPERATOR_ACTION_REQUIRED_CLASSIFICATION
-    )
+    transitioned = previous != classification
 
     state[unit_id] = classification
     try:
@@ -388,8 +529,40 @@ def notify_blocked_operator_transition(
             file=sys.stderr,
         )
 
-    if fires_now:
-        notify_work_unit_blocked_operator(unit_id, title, reason)
+    if transitioned and is_event_enabled(event_kind):
+        # Resolve via globals so test-time patches of ``notify_work_unit_blocked_*``
+        # in this module are honoured (see _NOTIFY_FN_NAME_BY_CLASSIFICATION).
+        notify_fn = globals()[_NOTIFY_FN_NAME_BY_CLASSIFICATION[classification]]
+        notify_fn(unit_id, title, reason)
+
+
+def prune_notification_state_for_unblocked(workspace_root: Path, blocked_unit_ids: set[str]) -> None:
+    """Drop cache entries for tasks no longer in the ``blocked`` status.
+
+    Called by ``cmd_sync_blocked`` / ``cmd_reconcile_cascade`` after a
+    sweep so a task that exits ``blocked`` and later re-enters it (same
+    or different class) fires a fresh ping rather than being silently
+    suppressed by a stale cache entry (issue #209).  Best-effort: an I/O
+    failure logs ``[WARN]`` and returns; the orchestrator never crashes
+    because cache pruning failed.
+
+    Args:
+        workspace_root: The workspace root containing ``.devbench/``.
+        blocked_unit_ids: Set of unit IDs that ARE currently in blocked
+            status.  Any other unit ID in the cache is pruned.
+    """
+    state_path = workspace_root / ".devbench" / NOTIFICATION_STATE_FILENAME
+    state = _load_notification_state(state_path)
+    pruned = {unit_id: cls for unit_id, cls in state.items() if unit_id in blocked_unit_ids}
+    if pruned == state:
+        return
+    try:
+        _save_notification_state(state_path, pruned)
+    except OSError as exc:
+        print(
+            f"[WARN] notification state cache prune failed at {state_path}: {exc}",
+            file=sys.stderr,
+        )
 
 
 def notify_work_unit_materialised(unit_id: str, title: str, source_task_id: str) -> None:
@@ -550,13 +723,28 @@ def send_test_notification(event_kind: str) -> None:
         setattr(cfg.events, event_kind, original)
 
 
+_BLOCKED_CLASS_SAMPLE_DISPATCH = {
+    EVENT_WORK_UNIT_BLOCKED_OPERATOR: notify_work_unit_blocked_operator,
+    EVENT_WORK_UNIT_BLOCKED_RUNTIME_DEGRADATION: notify_work_unit_blocked_runtime_degradation,
+    EVENT_WORK_UNIT_BLOCKED_HELD: notify_work_unit_blocked_held,
+    EVENT_WORK_UNIT_BLOCKED_ON_HELD: notify_work_unit_blocked_on_held,
+    EVENT_WORK_UNIT_BLOCKED_AUTO_CLEARING: notify_work_unit_blocked_auto_clearing,
+    EVENT_WORK_UNIT_BLOCKED_AWAITING_DEPENDENCY: notify_work_unit_blocked_awaiting_dependency,
+    EVENT_WORK_UNIT_BLOCKED_AMENDMENT_RECOVERY: notify_work_unit_blocked_amendment_recovery,
+}
+
+
 def _fire_sample(event_kind: str) -> None:
     """Dispatch a canned payload for *event_kind* with placeholder data."""
     now = datetime.now().astimezone()
+    # All seven blocked-class events share the (unit_id, title, reason)
+    # signature; dispatch via a dict to keep branch count manageable.
+    blocked_fn = _BLOCKED_CLASS_SAMPLE_DISPATCH.get(event_kind)
+    if blocked_fn is not None:
+        blocked_fn("E0-F1-S1-T1", "Sample test task", "manual notify-test invocation")
+        return
     if event_kind == EVENT_WORK_UNIT_DONE:
         notify_work_unit_done("E0-F1-S1-T1", "Sample test task")
-    elif event_kind == EVENT_WORK_UNIT_BLOCKED_OPERATOR:
-        notify_work_unit_blocked_operator("E0-F1-S1-T1", "Sample test task", "manual notify-test invocation")
     elif event_kind == EVENT_WORK_UNIT_MATERIALISED:
         notify_work_unit_materialised("E0-F1-S1-T2", "Sample materialised task", "E0-F1-S1-T1")
     elif event_kind == EVENT_WORK_UNIT_PROMOTED:

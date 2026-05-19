@@ -384,17 +384,29 @@ Tell the operator (verbatim):
 >   timeout_seconds             -- Per-POST HTTP timeout. [default: 10]
 >
 > Per-event toggles (all default to false):
->   events.work_unit_done              -- task transitions to done
->   events.work_unit_blocked_operator  -- task is blocked AND needs operator action
->   events.work_unit_materialised      -- draft WU file written from a proposal
->   events.work_unit_promoted          -- draft WU promoted to in-queue
->   events.pr_opened                   -- gh pr create succeeded
->   events.pr_merged                   -- gh pr merge succeeded
->   events.ci_failure                  -- CI run on the WU PR failed
->   events.orchestrator_stop           -- orchestrator loop exited (clean / drain / SIGTERM / crash)
->   events.orchestrator_auto_restart   -- exit-42 RUNTIME_DEGRADATION restart
->   events.quota_pause                 -- quota detected; sleeping until reset
->   events.quota_resume                -- recovery probe succeeded; resuming
+>   events.work_unit_done                          -- task transitions to done
+>   # The next seven toggles map 1:1 to the BlockedTaskState classifier buckets
+>   # (issue #209). Each fires when a task transitions INTO that class.
+>   events.work_unit_blocked_operator              -- OPERATOR_ACTION_REQUIRED
+>   events.work_unit_blocked_runtime_degradation   -- RUNTIME_DEGRADATION (SDK Agent-tool loss)
+>   events.work_unit_blocked_held                  -- HELD (status is hold)
+>   events.work_unit_blocked_on_held               -- BLOCKED_ON_HELD (marker target is hold)
+>   events.work_unit_blocked_auto_clearing         -- AUTO_CLEARING_VIA_PROPOSAL (cascade in flight)
+>   events.work_unit_blocked_awaiting_dependency   -- AWAITING_DEPENDENCY (regular dep in flight)
+>   events.work_unit_blocked_amendment_recovery    -- AWAITING_AMENDMENT_RECOVERY (recovery signal on disk)
+>   events.work_unit_materialised                  -- draft WU file written from a proposal
+>   events.work_unit_promoted                      -- draft WU promoted to in-queue
+>   events.pr_opened                               -- gh pr create succeeded
+>   events.pr_merged                               -- gh pr merge succeeded
+>   events.ci_failure                              -- CI run on the WU PR failed
+>   events.orchestrator_stop                       -- orchestrator loop exited (clean / drain / SIGTERM / crash)
+>   events.orchestrator_auto_restart               -- exit-42 RUNTIME_DEGRADATION restart
+>   events.quota_pause                             -- quota detected; sleeping until reset
+>   events.quota_resume                            -- recovery probe succeeded; resuming
+>
+> Every payload also carries a Backlog field naming the source workspace
+> (basename of DEVBENCH_WORKSPACE_ROOT) so operators monitoring multiple
+> workspaces can tell at a glance which backlog a ping refers to.
 >
 > Slack endpoint (today's only transport; future endpoints land as their own
 > nested blocks alongside slack:).  The payload uses <!here> so the same

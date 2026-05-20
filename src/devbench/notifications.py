@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import json
 import sys
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -70,6 +71,10 @@ EVENT_WORK_UNIT_PROMOTED = "work_unit_promoted"
 EVENT_PR_OPENED = "pr_opened"
 EVENT_PR_MERGED = "pr_merged"
 EVENT_CI_FAILURE = "ci_failure"
+# Issue #219 / #220: ``ci_pass`` fires on CIResult.GREEN inside the
+# finalize path so operators running ``auto_merge: false`` know the
+# batch PR is ready for manual merge.  Sibling event to ``ci_failure``.
+EVENT_CI_PASS = "ci_pass"
 EVENT_ORCHESTRATOR_STOP = "orchestrator_stop"
 EVENT_ORCHESTRATOR_AUTO_RESTART = "orchestrator_auto_restart"
 EVENT_QUOTA_PAUSE = "quota_pause"
@@ -89,6 +94,7 @@ ALL_EVENTS: tuple[str, ...] = (
     EVENT_PR_OPENED,
     EVENT_PR_MERGED,
     EVENT_CI_FAILURE,
+    EVENT_CI_PASS,
     EVENT_ORCHESTRATOR_STOP,
     EVENT_ORCHESTRATOR_AUTO_RESTART,
     EVENT_QUOTA_PAUSE,
@@ -630,6 +636,29 @@ def notify_ci_failure(unit_id: str, repo: str, pr_url: str, attempt: int) -> Non
     )
 
 
+def notify_ci_pass(unit_id: str, repo: str, pr_url: str) -> None:
+    """CI on the finalize-path batch PR turned GREEN; the PR is ready for
+    operator merge (issue #219).  Sibling to :func:`notify_ci_failure`.
+
+    Under ``git_ops.auto_merge: false`` the operator merges the squashed
+    PR manually.  This ping is the explicit ready-to-merge signal so the
+    operator does not have to poll GitHub.  Gated by
+    ``notifications.events.ci_pass``.  Payload shape mirrors
+    ``notify_pr_opened`` so the operator sees the same fields they
+    expect from other PR-lifecycle pings.
+    """
+    _dispatch(
+        EVENT_CI_PASS,
+        slack_summary=f":white_check_mark: CI passed -- PR ready for manual merge: {pr_url}",
+        slack_fields=[
+            ("Task", f"`{unit_id}`"),
+            ("Repo", f"`{repo}`"),
+            ("PR", pr_url),
+        ],
+        slack_context=None,
+    )
+
+
 def notify_orchestrator_stop(reason: str, in_flight_unit_id: str | None) -> None:
     """The orchestrator loop is exiting (clean, drain, or SIGTERM)."""
     fields: list[tuple[str, str]] = [("Reason", reason)]
@@ -743,18 +772,28 @@ def _fire_sample(event_kind: str) -> None:
     if blocked_fn is not None:
         blocked_fn("E0-F1-S1-T1", "Sample test task", "manual notify-test invocation")
         return
+    # Issue #219: pr_opened / pr_merged / ci_pass all share the
+    # (unit_id, repo, pr_url) signature, so dispatch them via a dict
+    # alongside the blocked-class dispatch to keep ``_fire_sample``
+    # under ruff PLR0912's 12-branch cap as new events are added.
+    pr_url = "https://github.com/acme/widget/pull/1"
+    pr_3arg_dispatch: dict[str, Callable[[str, str, str], None]] = {
+        EVENT_PR_OPENED: notify_pr_opened,
+        EVENT_PR_MERGED: notify_pr_merged,
+        EVENT_CI_PASS: notify_ci_pass,
+    }
+    pr_fn = pr_3arg_dispatch.get(event_kind)
+    if pr_fn is not None:
+        pr_fn("E0-F1-S1-T1", "acme/widget", pr_url)
+        return
     if event_kind == EVENT_WORK_UNIT_DONE:
         notify_work_unit_done("E0-F1-S1-T1", "Sample test task")
     elif event_kind == EVENT_WORK_UNIT_MATERIALISED:
         notify_work_unit_materialised("E0-F1-S1-T2", "Sample materialised task", "E0-F1-S1-T1")
     elif event_kind == EVENT_WORK_UNIT_PROMOTED:
         notify_work_unit_promoted("E0-F1-S1-T2", "Sample promoted task")
-    elif event_kind == EVENT_PR_OPENED:
-        notify_pr_opened("E0-F1-S1-T1", "acme/widget", "https://github.com/acme/widget/pull/1")
-    elif event_kind == EVENT_PR_MERGED:
-        notify_pr_merged("E0-F1-S1-T1", "acme/widget", "https://github.com/acme/widget/pull/1")
     elif event_kind == EVENT_CI_FAILURE:
-        notify_ci_failure("E0-F1-S1-T1", "acme/widget", "https://github.com/acme/widget/pull/1", 2)
+        notify_ci_failure("E0-F1-S1-T1", "acme/widget", pr_url, 2)
     elif event_kind == EVENT_ORCHESTRATOR_STOP:
         notify_orchestrator_stop("notify-test sample", "E0-F1-S1-T1")
     elif event_kind == EVENT_ORCHESTRATOR_AUTO_RESTART:

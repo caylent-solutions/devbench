@@ -338,6 +338,10 @@ notifications:
     pr_opened: false
     pr_merged: false
     ci_failure: false
+    ci_pass: false                       # issue #219 / Bundle C; fires on CIResult.GREEN
+                                         # in the finalize path so operators under
+                                         # auto_merge: false know the PR is ready for
+                                         # manual merge.  Default false on upgrade.
     orchestrator_stop: false
     orchestrator_auto_restart: false
     quota_pause: false

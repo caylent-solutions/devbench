@@ -331,7 +331,73 @@ since the last release. PR #119 carries every change.
   circuit-breaker quiet window (e.g., a 180s window tolerates a
   3-minute terraform-apply quiet stretch without flashing STOPPED).
 
+### Added
+
+- **`notifications.events.ci_pass` event toggle** (issue #219; Bundle C).
+  When CI on the auto-finalize batch PR turns GREEN, `cmd_git_ops_finalize`
+  -> `_handle_finalize_ci_result` now fires a `notify_ci_pass` Slack ping
+  giving the operator an explicit "PR is ready for manual merge" signal
+  -- previously the GREEN branch only wrote a `[CI_GREEN]` audit log line
+  and was silent on Slack, leaving operators running `auto_merge: false`
+  with no way to know CI passed except polling GitHub.  Default `false`
+  so existing workspaces stay silent on upgrade.  New
+  `notify_ci_pass(unit_id, repo, pr_url)` helper in
+  `src/devbench/notifications.py` + `EVENT_CI_PASS` constant + field on
+  `NotificationsEventsConfig` + JSON-schema property.  Configure-devbench
+  skill template (`plugin/devbench/skills/configure-devbench/SKILL.md`)
+  documents the new toggle; sample-config (`docs/devbench-yaml-reference.md`)
+  shows the default-false rendering.  Pinned by
+  `tests/test_notifications.py::TestSendTestNotification::test_every_event_has_a_sample`,
+  `::TestSlackPayloads::test_ci_pass`,
+  `::test_ci_pass_event_toggle_default_false_and_parse`, and
+  `tests/test_cli.py::TestCmdGitOpsFinalizeNotifications::test_notify_ci_pass_fires_on_ci_green`.
+
 ### Fixed
+
+- **Orchestrator burns ~$0.07/turn after orchestrate skill returns
+  ALL_DONE / NO_ACTIONABLE because SDK loop never breaks** (issue #218).
+  After the orchestrate skill prints one of its three terminal sentinels
+  (`ALL_DONE` / `NO_ACTIONABLE` / `NO_ACTIONABLE_IN_SCOPE`) the Claude
+  Agent SDK's `async for message in query(...)` iterator in `_run`
+  (`cli.py:6562-6577`) keeps emitting `ResultMessage` events every ~5 s
+  -- each a paid model turn carrying the same end-of-run summary --
+  because the iterator has no internal natural-exit condition and only
+  unwinds on quota errors, drain-on-claim, or subprocess EOF.  The
+  kanon-deps-work run on 2026-05-20 burned **\$8.30 in 9.5 minutes**
+  ($125.60 -> $133.90 cumulative `total_cost_usd`) before the operator
+  killed the daemon; extrapolates to ~\$50/hr idle re-invocation.  New
+  helper `_is_terminal_orchestrate_result(text)` matches the three
+  sentinels; `_log_terminal_exit_if_applicable` writes an
+  `[ORCHESTRATOR_TERMINAL_EXIT] reason=<text>` audit row and returns
+  True, letting `_run`'s loop break early.  The existing #217 plumbing
+  carries the captured result text into the `orchestrator_stop` Slack
+  ping, so the operator sees the actual exit reason within seconds of
+  the terminal marker.  Pinned by
+  `tests/test_cli.py::TestIsTerminalOrchestrateResult` (7 cases) and
+  `::TestCmdStartTerminalExit` (5 cases).
+
+- **`cmd_git_ops_finalize` never fires `pr_opened` / `ci_failure`
+  Slack pings; auto-finalize PR + CI lifecycle silent on Slack**
+  (issue #219).  Operators running `git_ops.defer_pr: true` +
+  `auto_finalize: true` (the recommended single-PR mode) got zero
+  Slack pings about their batch PR's lifecycle: PR creation,
+  CI failures, and CI green-readiness were all silent because
+  the per-WU `cmd_git_ops` notification calls were never mirrored
+  into the batch-PR code paths.  `cmd_git_ops_finalize` now calls
+  `notify_pr_opened` after `ops.create_pr` returns;
+  `_handle_finalize_ci_result` accepts a new `repo` kwarg and calls
+  `notify_ci_failure` on FAILED_KNOWN_TASK + FAILED_UNKNOWN branches
+  (attempt sentinel `1` -- the finalize path has no retry counter
+  today).  When the finalize path has no in-flight WU to attribute
+  the ping to (degenerate case), a symbolic `"finalize"` sentinel is
+  used as the rep `unit_id`.  `pr_merged` deliberately not added --
+  under `auto_merge: false` the operator merges by hand and GitHub
+  does not signal devbench back; a follow-up issue should add an
+  out-of-band poller if needed.  Pinned by
+  `tests/test_cli.py::TestCmdGitOpsFinalizeNotifications` (5 cases
+  covering pr_opened on create_pr, ci_failure on FAILED_KNOWN_TASK +
+  FAILED_UNKNOWN, no-fire on TIMEOUT, and the Bundle C ci_pass
+  case).
 
 - **`orchestrator_stop` Slack ping says bare `"clean"` instead of the real
   exit reason** (issue #217).  When `cmd_start`'s SDK loop completes

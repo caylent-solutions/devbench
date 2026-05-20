@@ -825,6 +825,11 @@ class NotificationsEventsConfig:
     pr_opened: bool = False
     pr_merged: bool = False
     ci_failure: bool = False
+    # Issue #219: fires on CIResult.GREEN inside the finalize path so
+    # operators running ``git_ops.auto_merge: false`` get an explicit
+    # "PR ready for manual merge" Slack signal.  Default ``False`` --
+    # existing workspaces stay silent on upgrade.
+    ci_pass: bool = False
     orchestrator_stop: bool = False
     orchestrator_auto_restart: bool = False
     quota_pause: bool = False
@@ -931,6 +936,7 @@ def _parse_notifications_config(raw: dict) -> NotificationsConfig:
         pr_opened=bool(events_raw.get("pr_opened", defaults.events.pr_opened)),
         pr_merged=bool(events_raw.get("pr_merged", defaults.events.pr_merged)),
         ci_failure=bool(events_raw.get("ci_failure", defaults.events.ci_failure)),
+        ci_pass=bool(events_raw.get("ci_pass", defaults.events.ci_pass)),
         orchestrator_stop=bool(events_raw.get("orchestrator_stop", defaults.events.orchestrator_stop)),
         orchestrator_auto_restart=bool(
             events_raw.get("orchestrator_auto_restart", defaults.events.orchestrator_auto_restart)

@@ -5060,6 +5060,7 @@ def _handle_finalize_ci_result(
     ci_result: object,
     pr_url: str,
     mgr: BacklogManager,
+    repo: str,
 ) -> int:
     """Resolve a CIResult from :func:`cmd_git_ops_finalize` into an exit code.
 
@@ -5088,6 +5089,14 @@ def _handle_finalize_ci_result(
             wu_file = _resolve_unit_file(most_recent)
             if wu_file is not None:
                 mgr._append_agent_comment(wu_file, "git_ops", f"[CI_GREEN] {pr_url}")
+        # Issue #219: fire `ci_pass` Slack ping so operators running
+        # ``auto_merge: false`` get an explicit "PR ready for manual merge"
+        # signal.  Default-off toggle (off in the schema) keeps existing
+        # workspaces silent on upgrade.
+        from devbench.notifications import notify_ci_pass
+
+        notify_unit_id = most_recent.id if most_recent is not None else "finalize"
+        notify_ci_pass(notify_unit_id, repo, pr_url)
         logger.info("cmd_git_ops_finalize: CI GREEN for %s", pr_url)
         return 0
 
@@ -5100,6 +5109,13 @@ def _handle_finalize_ci_result(
         return 2
 
     if isinstance(ci_result, CIResult.FAILED_KNOWN_TASK):
+        # Issue #219: fire `ci_failure` Slack ping at the dispatch point so
+        # the call happens regardless of the cascade-cap branch inside the
+        # known-task helper.  Attempt sentinel = 1 (the finalize path has no
+        # retry counter today; documented for future enhancement).
+        from devbench.notifications import notify_ci_failure
+
+        notify_ci_failure(ci_result.task_id, repo, pr_url, 1)
         return _handle_finalize_known_task_failure(
             named_task_id=ci_result.task_id,
             named_unit=_find_unit(units, ci_result.task_id),
@@ -5115,6 +5131,15 @@ def _handle_finalize_ci_result(
             f"[CI_FAILED_BATCH_PR] {pr_url} (unknown attribution)",
             mgr,
         )
+    # Issue #219: fire `ci_failure` Slack ping even on unknown-attribution
+    # failures so the operator knows the batch PR's CI failed.  Use the
+    # most-recent active task as the representative unit; fall back to the
+    # symbolic "finalize" sentinel when no WU is in flight.
+    from devbench.notifications import notify_ci_failure
+
+    notify_unit_id = most_recent.id if most_recent is not None else "finalize"
+    notify_ci_failure(notify_unit_id, repo, pr_url, 1)
+
     logger.error(
         "cmd_git_ops_finalize: CI failure with unknown attribution; blocked %s",
         most_recent.id if most_recent else "no task",
@@ -5179,12 +5204,27 @@ def cmd_git_ops_finalize(repo_name: str) -> int:
     pr_url = ops.create_pr(canonical_repo, branch, pr_title, pr_body, repo_path=repo_path)
     logger.info("Created PR: %s", pr_url)
 
+    # Issue #219: fire the operator's `pr_opened` Slack ping now.  The batch
+    # PR carries every WU in the single-branch run, so there is no single
+    # ``unit_id`` -- use the most-recent active task as the representative,
+    # falling back to the symbolic "finalize" sentinel when no WU is in
+    # flight (degenerate case).  Documented in the work-unit-id field of
+    # the Slack payload alongside the workspace ``backlog`` label.
+    parser_for_notify = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units_for_notify = parser_for_notify.parse_index()
+    representative = _find_most_recent_active_task(units_for_notify)
+    notify_unit_id = representative.id if representative is not None else "finalize"
+    from devbench.notifications import notify_pr_opened
+
+    notify_pr_opened(notify_unit_id, canonical_repo, pr_url)
+
     ci_result = ops.wait_for_checks_and_classify(pr_url, repo_path)
 
     return _handle_finalize_ci_result(
         ci_result=ci_result,
         pr_url=pr_url,
         mgr=mgr,
+        repo=canonical_repo,
     )
 
 
@@ -6233,6 +6273,44 @@ def _extract_sdk_result_text(message: object) -> str | None:
     return None
 
 
+#: Issue #218: the three terminal sentinels the orchestrate skill emits
+#: at end-of-run (per ``plugin/devbench/skills/orchestrate/SKILL.md``
+#: lines 8, 32, 35-36).  ``NO_ACTIONABLE_IN_SCOPE`` is caught by the
+#: substring check on ``NO_ACTIONABLE``, so only two distinct tokens
+#: live in the tuple.
+_TERMINAL_ORCHESTRATE_MARKERS: tuple[str, ...] = ("ALL_DONE", "NO_ACTIONABLE")
+
+#: Audit-log prefix written to the orchestrator log when the SDK loop
+#: detects a terminal-marker ResultMessage and breaks early.  Mirrors the
+#: shape of ``_ORCHESTRATOR_DRAIN_ENFORCED_AUDIT_PREFIX``.  Issue #218.
+_ORCHESTRATOR_TERMINAL_EXIT_AUDIT_PREFIX: str = "[ORCHESTRATOR_TERMINAL_EXIT] reason="
+
+
+def _is_terminal_orchestrate_result(text: str | None) -> bool:
+    """Issue #218: True iff ``text`` carries one of the orchestrate
+    skill's three terminal sentinels (``ALL_DONE`` / ``NO_ACTIONABLE`` /
+    ``NO_ACTIONABLE_IN_SCOPE``).  Used by ``_run`` to break the SDK
+    iterator early so the orchestrator does not burn ~$0.07/turn
+    re-invoking the model after the skill has signalled end-of-run.
+    """
+    if not text:
+        return False
+    return any(marker in text for marker in _TERMINAL_ORCHESTRATE_MARKERS)
+
+
+def _log_terminal_exit_if_applicable(text: str | None) -> bool:
+    """Issue #218: log the ``[ORCHESTRATOR_TERMINAL_EXIT]`` audit line
+    when ``text`` matches a terminal sentinel and return True.  Returns
+    False otherwise.  Factored out of ``_run`` so the SDK-iterator loop
+    stays under ruff PLR0912's 12-branch cap while still tearing down
+    the iterator on terminal markers.
+    """
+    if not _is_terminal_orchestrate_result(text):
+        return False
+    logger.info("%s%s", _ORCHESTRATOR_TERMINAL_EXIT_AUDIT_PREFIX, text)
+    return True
+
+
 def _label_stop_reason(exc: BaseException) -> str:
     """Return a human-readable label for the orchestrator's exit (#213).
 
@@ -6571,10 +6649,14 @@ def cmd_start(*argv: str) -> int:
                     if in_message_quota_exc is not None:
                         raise in_message_quota_exc
                     _sdk_result_text = _extract_sdk_result_text(message) or _sdk_result_text
-                    if _is_claim_tool_use(message):
-                        drain_state = read_drain_state(WORKSPACE_ROOT)
-                        if drain_state is not None:
-                            raise _DrainRequested(drain_state.reason)
+                    if _log_terminal_exit_if_applicable(_sdk_result_text):
+                        return
+                    # Issue #188 + #212: drain-on-claim short-circuit.  Combined
+                    # condition (rather than nested ifs) keeps ``_run`` under
+                    # ruff PLR0912's 12-branch cap after the #218 terminal-exit
+                    # check above was added.
+                    if _is_claim_tool_use(message) and (drain_state := read_drain_state(WORKSPACE_ROOT)) is not None:
+                        raise _DrainRequested(drain_state.reason)
                 # Clean exit from the SDK loop -- done.
                 return
             except QuotaExhaustedError as quota_exc:

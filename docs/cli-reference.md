@@ -1143,6 +1143,8 @@ Single-branch mode only: push the shared branch and create one PR for every accu
 
 Not applicable under `git_ops.local_only: true` -- the target repo has no remote to push to. The local single branch is the deliverable; running `git-ops-finalize` against a local-only workspace is an error.
 
+**Slack notifications** (issue #219): when the operator has the corresponding `notifications.events.*` toggle enabled, `git-ops-finalize` fires `pr_opened` immediately after `gh pr create` succeeds, then fires `ci_failure` (FAILED_KNOWN_TASK or FAILED_UNKNOWN) or `ci_pass` (GREEN) when the CI watch resolves. `pr_merged` is NOT fired from this path because `auto_merge: false` leaves the squashed PR open for manual merge. The new `ci_pass` toggle defaults to `false` on upgrade.
+
 ### `check-merge`
 
 ```

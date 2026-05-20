@@ -370,6 +370,20 @@ class TestPerEventPayloads:
         assert "CI failed" in payload["text"]
         assert "attempt 2" in payload["text"]
 
+    def test_ci_pass(self) -> None:
+        """Issue #219 Bundle C: notify_ci_pass fires on CIResult.GREEN
+        in the finalize path so operators under ``auto_merge: false``
+        get an explicit "ready for manual merge" signal."""
+        payload = self._capture_one(
+            notifications.notify_ci_pass,
+            "E0-F1-S1-T1",
+            "acme/widget",
+            "https://github.com/acme/widget/pull/1",
+            event_name="ci_pass",
+        )
+        assert "CI passed" in payload["text"]
+        assert "ready for manual merge" in payload["text"].lower()
+
     def test_orchestrator_stop_with_inflight(self) -> None:
         payload = self._capture_one(
             notifications.notify_orchestrator_stop,
@@ -581,6 +595,37 @@ class TestNotificationsConfigParser:
         assert rt.notifications.events.work_unit_blocked_auto_clearing is True
         assert rt.notifications.events.work_unit_blocked_awaiting_dependency is True
         assert rt.notifications.events.work_unit_blocked_amendment_recovery is True
+
+    def test_ci_pass_event_toggle_default_false_and_parse(self) -> None:
+        """Issue #219 Bundle C: the new ``ci_pass`` event toggle defaults
+        to False and accepts a boolean override from yaml.  Defaulting
+        false on upgrade keeps existing workspaces silent until they opt
+        in."""
+        # Default false when absent from yaml.
+        rt_default = self._load(
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            notifications:
+              enabled: true
+            """
+        )
+        assert rt_default.notifications.events.ci_pass is False
+
+        # Explicit override flips it.
+        rt = self._load(
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            notifications:
+              enabled: true
+              events:
+                ci_pass: true
+            """
+        )
+        assert rt.notifications.events.ci_pass is True
 
     def test_non_https_webhook_url_rejected(self) -> None:
         with pytest.raises(ValueError, match="must start with 'https://'"):

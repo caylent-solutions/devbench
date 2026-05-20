@@ -174,10 +174,11 @@ Every event toggle, when it fires, and what's in the payload:
 | `work_unit_blocked_amendment_recovery` | A task transitions into the `AWAITING_AMENDMENT_RECOVERY` bucket (recovery signal on disk; resumes on next sweep) (#209). | Task id, title, reason. |
 | `work_unit_materialised` | A draft WU file is written from a proposal. | New task id, title, source task id. |
 | `work_unit_promoted` | A draft WU is promoted to `in-queue`. | Task id, title. |
-| `pr_opened` | `gh pr create` succeeded for a work unit. | Task id, repo, PR URL. |
-| `pr_merged` | `gh pr merge` succeeded. | Task id, repo, PR URL. |
-| `ci_failure` | A CI run on a WU PR is classified as failed. | Task id, repo, PR URL, attempt number. |
-| `orchestrator_stop` | The orchestrator loop exits — clean, drain, SIGTERM, or uncaught exception. **Always fires** when notifications.enabled and slack.enabled are true (best-effort try/finally at the top of `cmd_start`). | Reason, in-flight WU id (when one was active). |
+| `pr_opened` | `gh pr create` succeeded — fires from both the per-WU `cmd_git_ops` path AND the auto-finalize batch-PR path `cmd_git_ops_finalize` (#219). | Task id (most-recent active task or symbolic `finalize`), repo, PR URL. |
+| `pr_merged` | `gh pr merge` succeeded. **Not fired from auto-finalize** because that path leaves the PR open for manual merge under `auto_merge: false` (#219). | Task id, repo, PR URL. |
+| `ci_failure` | A CI run on a WU PR is classified as failed — fires from both `cmd_git_ops` (per-WU) and `_handle_finalize_ci_result` FAILED_KNOWN_TASK / FAILED_UNKNOWN branches (#219). | Task id, repo, PR URL, attempt number (sentinel `1` on the finalize path). |
+| `ci_pass` | CI on the auto-finalize batch PR turned GREEN — explicit signal that the PR is ready for manual merge under `auto_merge: false` (#219). **Default off** so existing workspaces stay silent on upgrade. | Task id (most-recent active task or symbolic `finalize`), repo, PR URL. |
+| `orchestrator_stop` | The orchestrator loop exits — clean, drain, SIGTERM, terminal-marker (#218), or uncaught exception. **Always fires** when notifications.enabled and slack.enabled are true (best-effort try/finally at the top of `cmd_start`). | Reason (post-#217 includes the SDK's `ResultMessage.result` text; post-#218 fires within seconds of the terminal marker via the `[ORCHESTRATOR_TERMINAL_EXIT]` audit), in-flight WU id (when one was active). |
 | `orchestrator_auto_restart` | The orchestrator exited with code 42 (RUNTIME_DEGRADATION-only NO_ACTIONABLE) and the Makefile loop is restarting. | List of blocked task ids (truncated at 5). |
 | `quota_pause` | The orchestrator detects a quota signal and starts the wait. | Reason, reset_at timestamp, paused_at timestamp. |
 | `quota_resume` | The recovery probe succeeded; the orchestrator is resuming. | Resumed_at, waited_seconds. |

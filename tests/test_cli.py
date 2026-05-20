@@ -6167,6 +6167,206 @@ class TestCmdGitOpsFinalize:
         assert "defer_pr" in capsys.readouterr().err.lower()
 
 
+class TestCmdGitOpsFinalizeNotifications:
+    """Issue #219: cmd_git_ops_finalize and _handle_finalize_ci_result fire
+    the same Slack notifications as the per-WU cmd_git_ops path.
+
+    Before this fix, the auto-finalize batch-PR path was completely silent on
+    Slack: pr_opened, ci_failure, and (Bundle C) ci_pass all needed wiring.
+    Operators running ``defer_pr: true`` + ``auto_finalize: true`` saw zero
+    Slack pings about their PR's lifecycle.
+    """
+
+    @staticmethod
+    def _make_unit_with_status(unit_id: str, status_attr: str) -> Any:
+        """Build a minimal work-unit stub for _find_most_recent_active_task."""
+        from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
+
+        return WorkUnit(
+            id=unit_id,
+            title=f"Stub {unit_id}",
+            status=getattr(WorkUnitStatus, status_attr),
+            unit_type=WorkUnitType.TASK,
+            file_path=Path(f"backlog/{unit_id}.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+
+    @pytest.mark.unit
+    def test_notify_pr_opened_fires_after_create_pr(self, tmp_path: Path) -> None:
+        """cmd_git_ops_finalize calls notify_pr_opened with the new PR URL
+        immediately after ops.create_pr returns."""
+        from devbench.github.git_ops import CIResult
+
+        mock_ops = MagicMock()
+        mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/99"
+        mock_ops.wait_for_checks_and_classify.return_value = CIResult.GREEN
+
+        captured: list[tuple[str, str, str]] = []
+
+        def _capture(unit_id: str, repo: str, pr_url: str) -> None:
+            captured.append((unit_id, repo, pr_url))
+
+        with (
+            patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
+            patch("devbench.config.DEFER_PR", True),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
+            patch("devbench.cli._handle_finalize_ci_result", return_value=0),
+            patch("devbench.notifications.notify_pr_opened", _capture),
+        ):
+            rc = cli.cmd_git_ops_finalize("caylent-solutions/git-repo")
+
+        assert rc == 0
+        assert captured, "notify_pr_opened was never called after create_pr"
+        unit_id, repo, pr_url = captured[-1]
+        assert pr_url == "https://github.com/org/repo/pull/99"
+        assert repo == "caylent-solutions/git-repo"
+        # rep unit id is either the most-recent active task id or the
+        # symbolic "finalize" fallback -- non-empty either way.
+        assert unit_id, "rep unit id must be non-empty"
+
+    @pytest.mark.unit
+    def test_notify_ci_failure_fires_on_failed_known_task(self, tmp_path: Path) -> None:
+        """_handle_finalize_ci_result calls notify_ci_failure when CI
+        attributes the failure to a specific known task."""
+        from devbench.backlog.manager import BacklogManager
+        from devbench.github.git_ops import CIResult
+
+        captured: list[tuple[str, str, str, int]] = []
+
+        def _capture(unit_id: str, repo: str, pr_url: str, attempt: int) -> None:
+            captured.append((unit_id, repo, pr_url, attempt))
+
+        mgr = MagicMock(spec=BacklogManager)
+        with (
+            patch("devbench.notifications.notify_ci_failure", _capture),
+            patch(
+                "devbench.cli._handle_finalize_known_task_failure",
+                return_value=2,
+            ),
+        ):
+            rc = cli._handle_finalize_ci_result(
+                ci_result=CIResult.FAILED_KNOWN_TASK(task_id="E1-F1-S1-T1"),
+                pr_url="https://github.com/org/repo/pull/99",
+                mgr=mgr,
+                repo="caylent-solutions/git-repo",
+            )
+
+        assert rc == 2
+        assert captured, "notify_ci_failure was never called on FAILED_KNOWN_TASK"
+        unit_id, repo, pr_url, attempt = captured[-1]
+        assert unit_id == "E1-F1-S1-T1"
+        assert repo == "caylent-solutions/git-repo"
+        assert pr_url == "https://github.com/org/repo/pull/99"
+        assert attempt == 1, "Finalize path has no retry counter today; sentinel attempt=1 documented"
+
+    @pytest.mark.unit
+    def test_notify_ci_failure_fires_on_failed_unknown(self, tmp_path: Path) -> None:
+        """_handle_finalize_ci_result calls notify_ci_failure with the
+        most-recent active task id when CI attribution is unknown."""
+        from devbench.backlog.manager import BacklogManager
+        from devbench.github.git_ops import CIResult
+
+        unit = self._make_unit_with_status("E0-F1-S1-T1", "IN_REVIEW")
+        captured: list[tuple[str, str, str, int]] = []
+
+        def _capture(unit_id: str, repo: str, pr_url: str, attempt: int) -> None:
+            captured.append((unit_id, repo, pr_url, attempt))
+
+        mgr = MagicMock(spec=BacklogManager)
+        with (
+            patch("devbench.notifications.notify_ci_failure", _capture),
+            patch(
+                "devbench.cli.BacklogParser",
+                return_value=MagicMock(parse_index=MagicMock(return_value=[unit])),
+            ),
+            patch("devbench.cli._find_most_recent_active_task", return_value=unit),
+            patch("devbench.cli._resolve_unit_file", return_value=None),
+            patch("devbench.cli._finalize_audit_and_block"),
+        ):
+            rc = cli._handle_finalize_ci_result(
+                ci_result=CIResult.FAILED_UNKNOWN,
+                pr_url="https://github.com/org/repo/pull/99",
+                mgr=mgr,
+                repo="caylent-solutions/git-repo",
+            )
+
+        assert rc == 2
+        assert captured, "notify_ci_failure was never called on FAILED_UNKNOWN"
+        assert captured[-1][0] == "E0-F1-S1-T1"
+
+    @pytest.mark.unit
+    def test_notify_ci_pass_fires_on_ci_green(self, tmp_path: Path) -> None:
+        """Issue #219 Bundle C: _handle_finalize_ci_result fires
+        notify_ci_pass when CI on the batch PR is green so the operator
+        running ``auto_merge: false`` knows the PR is ready to merge.
+        No notify_ci_failure on the same path."""
+        from devbench.backlog.manager import BacklogManager
+        from devbench.github.git_ops import CIResult
+
+        captured_pass: list[tuple[str, str, str]] = []
+        captured_failure: list[Any] = []
+
+        def _capture_pass(unit_id: str, repo: str, pr_url: str) -> None:
+            captured_pass.append((unit_id, repo, pr_url))
+
+        mgr = MagicMock(spec=BacklogManager)
+        with (
+            patch("devbench.notifications.notify_ci_pass", _capture_pass),
+            patch(
+                "devbench.notifications.notify_ci_failure",
+                lambda *a, **kw: captured_failure.append(a),
+            ),
+            patch(
+                "devbench.cli.BacklogParser",
+                return_value=MagicMock(parse_index=MagicMock(return_value=[])),
+            ),
+            patch("devbench.cli._find_most_recent_active_task", return_value=None),
+        ):
+            rc = cli._handle_finalize_ci_result(
+                ci_result=CIResult.GREEN,
+                pr_url="https://github.com/org/repo/pull/99",
+                mgr=mgr,
+                repo="caylent-solutions/git-repo",
+            )
+
+        assert rc == 0
+        assert captured_pass, "notify_ci_pass must fire on CI GREEN (#219 Bundle C)"
+        unit_id, repo, pr_url = captured_pass[-1]
+        assert pr_url == "https://github.com/org/repo/pull/99"
+        assert repo == "caylent-solutions/git-repo"
+        # No active WU -> falls back to symbolic "finalize" sentinel.
+        assert unit_id == "finalize"
+        assert not captured_failure, "notify_ci_failure must NOT fire on GREEN"
+
+    @pytest.mark.unit
+    def test_no_notification_on_ci_timeout(self, tmp_path: Path) -> None:
+        """TIMEOUT is audit-log-only; notify_ci_failure must NOT fire."""
+        from devbench.backlog.manager import BacklogManager
+        from devbench.github.git_ops import CIResult
+
+        captured: list[Any] = []
+        mgr = MagicMock(spec=BacklogManager)
+        with (
+            patch("devbench.notifications.notify_ci_failure", lambda *a, **kw: captured.append(a)),
+            patch(
+                "devbench.cli.BacklogParser",
+                return_value=MagicMock(parse_index=MagicMock(return_value=[])),
+            ),
+            patch("devbench.cli._find_most_recent_active_task", return_value=None),
+        ):
+            rc = cli._handle_finalize_ci_result(
+                ci_result=CIResult.TIMEOUT,
+                pr_url="https://github.com/org/repo/pull/99",
+                mgr=mgr,
+                repo="caylent-solutions/git-repo",
+            )
+
+        assert rc == 2
+        assert not captured, "notify_ci_failure must NOT fire on TIMEOUT"
+
+
 class TestRejectEmDash:
     """Agent-supplied text with U+2014 must be rejected at the CLI input boundary.
 
@@ -17308,6 +17508,222 @@ class TestCmdStartWritesRestartMarker:
 
         parsed = _dt.fromisoformat(marker.read_text(encoding="utf-8").strip())
         assert parsed.tzinfo is not None, "marker timestamp must be timezone-aware"
+
+
+class TestIsTerminalOrchestrateResult:
+    """Issue #218: helper that detects the orchestrate skill's three
+    terminal sentinels (``ALL_DONE`` / ``NO_ACTIONABLE`` /
+    ``NO_ACTIONABLE_IN_SCOPE``) inside the SDK ``ResultMessage.result``
+    text.  Used by ``_run`` to break the SDK iterator early so the
+    orchestrator does not burn ~$0.07/turn re-invoking the model after
+    the skill has signalled end-of-run.
+    """
+
+    @pytest.mark.unit
+    def test_all_done_marker_detected(self) -> None:
+        from devbench.cli import _is_terminal_orchestrate_result
+
+        assert _is_terminal_orchestrate_result("Orchestration complete: ALL_DONE") is True
+
+    @pytest.mark.unit
+    def test_no_actionable_marker_detected(self) -> None:
+        from devbench.cli import _is_terminal_orchestrate_result
+
+        assert (
+            _is_terminal_orchestrate_result("Orchestration complete: NO_ACTIONABLE -- 190/212 done, 11 blocked.")
+            is True
+        )
+
+    @pytest.mark.unit
+    def test_no_actionable_in_scope_marker_detected_via_substring(self) -> None:
+        from devbench.cli import _is_terminal_orchestrate_result
+
+        assert _is_terminal_orchestrate_result("Scoped run complete: NO_ACTIONABLE_IN_SCOPE") is True
+
+    @pytest.mark.unit
+    def test_empty_string_is_not_terminal(self) -> None:
+        from devbench.cli import _is_terminal_orchestrate_result
+
+        assert _is_terminal_orchestrate_result("") is False
+
+    @pytest.mark.unit
+    def test_none_is_not_terminal(self) -> None:
+        from devbench.cli import _is_terminal_orchestrate_result
+
+        assert _is_terminal_orchestrate_result(None) is False
+
+    @pytest.mark.unit
+    def test_unrelated_text_is_not_terminal(self) -> None:
+        from devbench.cli import _is_terminal_orchestrate_result
+
+        assert _is_terminal_orchestrate_result("orchestrate step complete") is False
+
+    @pytest.mark.unit
+    def test_partial_prefix_is_not_terminal(self) -> None:
+        from devbench.cli import _is_terminal_orchestrate_result
+
+        assert _is_terminal_orchestrate_result("NO_ACT") is False
+
+
+class TestCmdStartTerminalExit:
+    """Issue #218: ``cmd_start``'s ``_run`` must break out of the SDK
+    ``async for`` loop the first time it observes a terminal-marker
+    ResultMessage.  Without this, the SDK keeps re-invoking the model
+    after the orchestrate skill prints its end-of-run summary, costing
+    ~$0.07/turn (measured $8.30 over 9.5 minutes of idle re-invocation
+    on the kanon-deps-work run that motivated this fix).
+    """
+
+    @staticmethod
+    def _build_counting_sdk(messages: list[Any], counter: list[int]) -> Any:
+        """Construct a fake SDK module whose ``query()`` async iterator
+        yields ``messages`` in order while incrementing ``counter[0]``
+        once per yield.  After the loop breaks the counter records how
+        many messages the loop actually consumed."""
+        import types
+
+        mock_sdk: Any = types.ModuleType("claude_agent_sdk")
+        mock_sdk.ClaudeAgentOptions = MagicMock()
+
+        async def mock_query(**kwargs: object) -> object:
+            for msg in messages:
+                counter[0] += 1
+                yield msg
+
+        mock_sdk.query = mock_query
+        return mock_sdk
+
+    @staticmethod
+    def _result_msg(text: str) -> Any:
+        class _Msg:
+            result = text
+            subtype = "success"
+
+        return _Msg()
+
+    @pytest.mark.unit
+    def test_terminal_no_actionable_breaks_loop_immediately(self, tmp_path: Path) -> None:
+        import sys
+
+        counter = [0]
+        messages = [
+            self._result_msg("orchestrate step done"),
+            self._result_msg("Orchestration complete: NO_ACTIONABLE -- 1/1 done"),
+            self._result_msg("THIS MESSAGE MUST NEVER BE PROCESSED"),
+        ]
+        mock_sdk = self._build_counting_sdk(messages, counter)
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch(
+                "devbench.cli._should_auto_restart_after_no_actionable",
+                return_value=(False, []),
+            ),
+        ):
+            rc = cli.cmd_start()
+
+        assert rc == 0
+        assert counter[0] == 2, f"Loop must break on terminal marker; expected 2 messages consumed, got {counter[0]}"
+
+    @pytest.mark.unit
+    def test_terminal_all_done_breaks_loop(self, tmp_path: Path) -> None:
+        import sys
+
+        counter = [0]
+        messages = [
+            self._result_msg("Orchestration complete: ALL_DONE"),
+            self._result_msg("THIS MESSAGE MUST NEVER BE PROCESSED"),
+        ]
+        mock_sdk = self._build_counting_sdk(messages, counter)
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch(
+                "devbench.cli._should_auto_restart_after_no_actionable",
+                return_value=(False, []),
+            ),
+        ):
+            rc = cli.cmd_start()
+
+        assert rc == 0
+        assert counter[0] == 1
+
+    @pytest.mark.unit
+    def test_terminal_no_actionable_in_scope_breaks_loop(self, tmp_path: Path) -> None:
+        import sys
+
+        counter = [0]
+        messages = [
+            self._result_msg("Scoped run complete: NO_ACTIONABLE_IN_SCOPE"),
+            self._result_msg("THIS MESSAGE MUST NEVER BE PROCESSED"),
+        ]
+        mock_sdk = self._build_counting_sdk(messages, counter)
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch(
+                "devbench.cli._should_auto_restart_after_no_actionable",
+                return_value=(False, []),
+            ),
+        ):
+            rc = cli.cmd_start()
+
+        assert rc == 0
+        assert counter[0] == 1
+
+    @pytest.mark.unit
+    def test_non_terminal_results_do_not_break_loop(self, tmp_path: Path) -> None:
+        import sys
+
+        counter = [0]
+        messages = [
+            self._result_msg("orchestrate step done"),
+            self._result_msg("another non-terminal turn"),
+            self._result_msg("yet another non-terminal turn"),
+        ]
+        mock_sdk = self._build_counting_sdk(messages, counter)
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch(
+                "devbench.cli._should_auto_restart_after_no_actionable",
+                return_value=(False, []),
+            ),
+        ):
+            rc = cli.cmd_start()
+
+        assert rc == 0
+        assert counter[0] == 3
+
+    @pytest.mark.unit
+    def test_terminal_exit_writes_audit_log(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        import logging
+        import sys
+
+        counter = [0]
+        messages = [
+            self._result_msg("Orchestration complete: NO_ACTIONABLE -- 1/1 done"),
+        ]
+        mock_sdk = self._build_counting_sdk(messages, counter)
+
+        with (
+            patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch(
+                "devbench.cli._should_auto_restart_after_no_actionable",
+                return_value=(False, []),
+            ),
+            caplog.at_level(logging.INFO, logger="devbench.cli"),
+        ):
+            cli.cmd_start()
+
+        log_text = " ".join(rec.getMessage() for rec in caplog.records)
+        assert "[ORCHESTRATOR_TERMINAL_EXIT]" in log_text, f"Audit log line missing; recorded: {log_text!r}"
+        assert "NO_ACTIONABLE" in log_text
 
 
 class TestCmdStartSlackPingResultText:

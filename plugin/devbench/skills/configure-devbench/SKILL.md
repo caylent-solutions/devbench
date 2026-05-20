@@ -399,6 +399,9 @@ Tell the operator (verbatim):
 >   events.pr_opened                               -- gh pr create succeeded
 >   events.pr_merged                               -- gh pr merge succeeded
 >   events.ci_failure                              -- CI run on the WU PR failed
+>   events.ci_pass                                 -- CI on the finalize-path batch PR turned green (#219;
+>                                                     fires under auto_merge: false so the operator knows the
+>                                                     PR is ready for manual merge)
 >   events.orchestrator_stop                       -- orchestrator loop exited (clean / drain / SIGTERM / crash)
 >   events.orchestrator_auto_restart               -- exit-42 RUNTIME_DEGRADATION restart
 >   events.quota_pause                             -- quota detected; sleeping until reset

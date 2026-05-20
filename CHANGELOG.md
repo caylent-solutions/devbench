@@ -12,6 +12,24 @@ since the last release. PR #119 carries every change.
 
 ### Fixed
 
+- **Manifest entries with glob patterns are rejected** (issue #221 B4).
+  A Changes Manifest entry containing ``*`` or ``**`` (e.g.,
+  ``src/devbench/**/*.py``) used to silently flow through to
+  ``_check_source_test_pairs`` which then emitted a confusing error
+  about a missing ``test_*.py`` pair for the glob literal. The
+  validator now rejects globs at a dedicated pre-check
+  (``_check_no_glob_in_manifest``) with a message pointing at the
+  sentinel + ``manifest_amendment`` alternative.
+- **Source-test atomicity Update-vs-Add docs** (issue #221 B5). Added
+  worked example to ``docs/source-test-atomicity.md`` clarifying that
+  an ``Update`` annotation on an existing ``test_*.py`` file satisfies
+  Rule 14 the same way an ``Add`` does. The docstring of
+  ``_check_source_test_pairs`` references the doc.
+- **Status Summary count semantics documented** (issue #221 B6). The
+  "In Queue" column counts ALL in-queue work units per epic, not just
+  leaf tasks. ``docs/backlog-contract.md`` now explains the count
+  formula and shows a worked example so authors building BACKLOG.md by
+  hand don't miscount.
 - **Manifest parser honours markdown-escaped pipes** (issue #221 B1).
   ``_parse_body`` now treats ``\|`` as a literal pipe inside Changes
   Manifest cells, so prose like ``run cmd output \| grep -v debug`` no

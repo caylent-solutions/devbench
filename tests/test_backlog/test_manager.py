@@ -6742,3 +6742,67 @@ class TestSentinelManifestExemption:
 
         assert BacklogManager._is_real_manifest_path("(none)") is False
         assert BacklogManager._is_real_manifest_path("(no file changes; documentation only)") is False
+
+
+# ---------------------------------------------------------------------------
+# Issue #221 B4: Manifest entries with glob patterns are rejected
+# ---------------------------------------------------------------------------
+
+
+class TestManifestGlobRejection:
+    """Issue #221 B4: globs (``*``, ``**``) in Manifest paths emit a clear error."""
+
+    H = _ValidateRuleHarness
+
+    def test_glob_in_manifest_rejected(self, tmp_path: Path, backlog_dir: Path) -> None:
+        repo = "ex/foo"
+        TestValidateNoOrphanPathTokens._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `src/**/*.py` | Update conditional |\n",
+            "- [ ] AC-FUNC-001: drift fixed.",
+        )
+        TestManifestGlobRejection.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        glob_errors = [e for e in errors if "glob pattern" in e]
+        assert len(glob_errors) == 1
+        assert "src/**/*.py" in glob_errors[0]
+        assert "sentinel" in glob_errors[0]
+        assert "manifest_amendment" in glob_errors[0]
+
+    def test_no_glob_no_error(self, tmp_path: Path, backlog_dir: Path) -> None:
+        repo = "ex/foo"
+        TestValidateNoOrphanPathTokens._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `src/real.py` | new |\n| `tests/unit/test_real.py` | new |\n",
+            "- [ ] AC-FUNC-001: done.",
+        )
+        TestManifestGlobRejection.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        assert not any("glob pattern" in e for e in errors)
+
+    def test_sentinel_with_no_glob_passes(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """Sentinels are exempt from glob rejection -- they're not paths."""
+        repo = "ex/foo"
+        TestValidateNoOrphanPathTokens._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `<source-drift-fix-targets-determined-at-execution>` | run-time list |\n",
+            "- [ ] AC-FUNC-001: done.",
+        )
+        TestManifestGlobRejection.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        assert not any("glob pattern" in e for e in errors)

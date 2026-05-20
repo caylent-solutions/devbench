@@ -317,6 +317,55 @@ All sections below are required unless noted as optional.
 | `tests/test_bar.py` | New -- unit tests |
 | `README.md` | Updated -- architecture section |
 
+#### Manifest Glob Rejection (issue #221 B4)
+
+The validator rejects any Changes Manifest entry that contains ``*`` or
+``**`` (glob patterns). Manifest paths must be concrete file paths so
+that ``manifest_conflict`` detection, source-test atomicity, and the
+``changes_manifest`` judge all operate on real, comparable values.
+
+Tasks whose actual file list is determined at execution time (e.g.,
+"fix every error-message drift between source and fixture") have two
+alternatives:
+
+1. **Use a sentinel value** (see "Sentinel Manifest Values" below).
+   For example, ``<source-drift-fix-targets-determined-at-execution>``
+   declares the Manifest intentionally non-concrete; the orchestrator's
+   ``manifest_amendment`` workflow concretises it at runtime.
+2. **List the canonical candidate files**. Enumerate the files most
+   likely to need modification. Mark each ``Update (conditional on
+   T1/T2 outcome)``. The executor stages only the files actually
+   modified.
+
+Glob rejection emits an error like:
+
+```
+EX-F1-S1-T1: Manifest entry 'src/**/*.py' contains a glob pattern.
+Manifest paths must be concrete; for execution-determined file lists,
+use a sentinel value (e.g.,
+`<source-drift-fix-targets-determined-at-execution>`) and amend the
+Manifest at runtime via `manifest_amendment`.
+```
+
+#### Status Summary count semantics (issue #221 B6 clarification)
+
+The Status Summary table has one row per Epic and one column per status
+value. Each cell counts the number of work units **of any type**
+(Epic, Feature, Story, Task) in that Epic that currently hold that
+status. The "In Queue" column is therefore not a leaf-task count -- it
+is the count of all in-queue work units within the Epic's subtree
+(including the Epic itself when its status is in-queue, plus every
+in-queue Feature, Story, and Task).
+
+Worked example: an Epic E1 with status in-queue containing 4 in-queue
+Features, 4 in-queue Stories, and 11 in-queue Tasks contributes 20 to
+the "In Queue" column (1 + 4 + 4 + 11). When the Epic transitions to
+in-progress, that 20 decomposes: 1 to "In Progress", 19 to "In Queue".
+
+Authors building BACKLOG.md by hand often miscount by listing only
+leaf Tasks. The validator emits "Status Summary mismatch for E\<N\>:
+expected in-queue=\<actual\>, got \<author-value\>" to flag the gap.
+
 #### Sentinel Manifest Values (issue #221 B3)
 
 For tasks that produce no concrete file changes -- verification gates,

@@ -48,9 +48,34 @@ class SkillState:
     started_at: str
 
 
+@dataclass
+class PerTaskCheckpoint:
+    """Persisted per-task authoring progress for one skill (issue #221 A3).
+
+    Used by ``spec-to-backlog`` to track which leaf-task IDs have already
+    been written so a re-invocation skips them instead of regenerating
+    every file from scratch. The checkpoint is a separate JSON file from
+    :class:`SkillState`'s iteration counter so the two pieces of skill
+    progress can evolve independently.
+
+    Attributes:
+        completed_task_ids: Set of fully-qualified work-unit IDs
+            (e.g., ``E1-F1-S1-T1``) the skill has already authored.
+        last_updated: ISO-8601 UTC timestamp of the most recent write.
+    """
+
+    completed_task_ids: set[str]
+    last_updated: str
+
+
 def _checkpoint_path(skill_name: str, workspace_root: Path) -> Path:
     """Return the absolute checkpoint path for *skill_name* under *workspace_root*."""
     return workspace_root / SKILL_STATE_DIR_NAME / f"{skill_name}.json"
+
+
+def _per_task_checkpoint_path(skill_name: str, workspace_root: Path) -> Path:
+    """Return the absolute per-task checkpoint path for *skill_name*."""
+    return workspace_root / SKILL_STATE_DIR_NAME / f"{skill_name}-tasks.json"
 
 
 def read_checkpoint(skill_name: str, workspace_root: Path) -> SkillState | None:
@@ -98,6 +123,62 @@ def write_checkpoint(skill_name: str, state: SkillState, workspace_root: Path) -
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     tmp_path.write_text(json.dumps(asdict(state), indent=2), encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def read_per_task_checkpoint(skill_name: str, workspace_root: Path) -> PerTaskCheckpoint | None:
+    """Return the persisted per-task checkpoint, or ``None`` if absent (issue #221 A3).
+
+    Args:
+        skill_name: The skill identifier (e.g. ``spec-to-backlog``).
+        workspace_root: Absolute path to the devbench workspace root.
+
+    Returns:
+        The decoded :class:`PerTaskCheckpoint` when the file exists, or
+        ``None`` when it does not.
+
+    Raises:
+        json.JSONDecodeError: When the file exists but is not valid JSON.
+        KeyError: When the JSON payload is missing a required field.
+        OSError: When the file exists but cannot be read.
+    """
+    path = _per_task_checkpoint_path(skill_name, workspace_root)
+    if not path.exists():
+        return None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return PerTaskCheckpoint(
+        completed_task_ids=set(payload["completed_task_ids"]),
+        last_updated=payload["last_updated"],
+    )
+
+
+def write_per_task_checkpoint(
+    skill_name: str,
+    checkpoint: PerTaskCheckpoint,
+    workspace_root: Path,
+) -> None:
+    """Atomically persist the per-task checkpoint for *skill_name* (issue #221 A3).
+
+    Uses the same tmp-then-rename pattern as :func:`write_checkpoint` so
+    a reader never observes a partial file.
+
+    Args:
+        skill_name: The skill identifier (e.g. ``spec-to-backlog``).
+        checkpoint: The :class:`PerTaskCheckpoint` to persist.
+        workspace_root: Absolute path to the devbench workspace root.
+
+    Raises:
+        OSError: When the checkpoint directory cannot be created or the
+            file cannot be written / renamed.
+    """
+    path = _per_task_checkpoint_path(skill_name, workspace_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    payload = {
+        "completed_task_ids": sorted(checkpoint.completed_task_ids),
+        "last_updated": checkpoint.last_updated,
+    }
+    tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     tmp_path.replace(path)
 
 

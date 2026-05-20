@@ -12,6 +12,29 @@ since the last release. PR #119 carries every change.
 
 ### Added
 
+- **Per-task checkpoint API for resumable spec-to-backlog runs** (issue
+  #221 A3). New ``PerTaskCheckpoint`` dataclass plus
+  ``read_per_task_checkpoint`` / ``write_per_task_checkpoint`` helpers
+  in ``src/devbench/skill_state.py``. Persists the set of leaf-task IDs
+  already authored to ``<workspace>/.devbench/skill-state/
+  spec-to-backlog-tasks.json`` (alongside but separate from the
+  iteration-counter file). When the skill is re-invoked after an
+  interrupted run, it reads the checkpoint and resumes from the first
+  un-completed task instead of regenerating every file. Atomic-write
+  contract identical to the existing checkpoint API (tmp + rename, no
+  partial reads). 100% coverage in ``tests/test_skill_state.py``.
+- **Skill arg parsing for spec-to-backlog** (issue #221 A2).
+  ``spec-to-backlog/SKILL.md`` Step 2 now accepts the spec path via
+  ``args`` and only prompts when no arg was supplied -- the orchestrator
+  can dispatch the skill non-interactively as part of a longer chain.
+- **AC N/A-suffix grammar documented** (issue #221 D3). New section in
+  ``docs/acceptance-criteria-canonical.md`` enumerates the
+  case-insensitive accepted variants (mixed case OK; structure is what
+  matters) and the things that must NOT change (``--`` double-dash
+  sentinel, literal ``N/A`` token, literal ``Tasks`` plural, trailing
+  parenthesised reason). Catches authors who write ``- N/A``,
+  ``NA without slash``, or omit the parenthesised reason.
+
 - **Backlog post-processor module for spec-to-backlog skill** (issue
   #221 A11, A12, A13). New ``src/devbench/plugin_helpers/`` package
   with ``backlog_post_processor.py`` exposing three deterministic

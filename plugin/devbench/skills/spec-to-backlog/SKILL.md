@@ -62,9 +62,11 @@ Every leaf task `.md` file MUST contain these 15 sections, in this order:
 
 ---
 
-## Step 2 -- Ask for the input spec path
+## Step 2 -- Resolve the input spec path
 
-Ask the operator:
+The skill accepts the spec path via skill ``args`` (issue #221 A2). If
+``args`` is non-empty, treat its first token as the spec path and skip
+the prompt below entirely. Otherwise ask the operator:
 
 > Which spec file should I decompose into a backlog? (Provide the path, e.g. `spec/<project-name>.md`)
 
@@ -131,6 +133,18 @@ Please clarify the above items and re-run the skill.
 ---
 
 ## Step 5 -- Author task files one at a time (iterate-until-perfect granularity 2)
+
+**Resume support** (issue #221 A3): before authoring, call
+``read_per_task_checkpoint("spec-to-backlog", workspace_root)`` from
+``src/devbench/skill_state.py``. If the returned checkpoint is non-None,
+treat its ``completed_task_ids`` as the set of leaf tasks already
+authored in a prior interrupted run -- skip those IDs and resume from
+the first un-completed task. After each successful task write, call
+``write_per_task_checkpoint(...)`` with the cumulative set of completed
+IDs. The two-file split (``spec-to-backlog.json`` for the iteration
+counter, ``spec-to-backlog-tasks.json`` for the completed-task set)
+means a re-invocation after a crash resumes mid-backlog instead of
+regenerating every file.
 
 For each leaf task in the Epic -> Feature -> Story -> Task tree:
 

@@ -53,6 +53,30 @@ For each AC whose Applicability does NOT include the Task's manifest tier, the a
 
 Where `<tier>` is the Task's manifest tier (e.g., `HCL`, `YAML`, `JSON`, `Mixed (HCL+JSON)`) and `<language>` is the source language the AC requires (e.g., `Python` for AC-FINAL-002..008, AC-FINAL-014).
 
+### Case sensitivity and accepted variants (issue #221 D3)
+
+The suffix is parsed by ``BacklogManager`` when it computes which AC lines apply to a Task. The match is **case-insensitive**, so authors may write any of these equivalent forms:
+
+- `-- N/A for HCL Tasks (no Python source authored)` (canonical)
+- `-- n/a for hcl tasks (no python source authored)` (lower-case)
+- `-- N/A FOR HCL TASKS (NO PYTHON SOURCE AUTHORED)` (upper-case)
+
+What MUST be preserved verbatim regardless of case:
+
+1. The double-dash sentinel ``--`` (two ASCII hyphens). An em-dash (U+2014) is forbidden by AC-FINAL-012 and would be flagged as a separate violation.
+2. The literal token ``N/A`` (with the slash). ``NA`` without the slash is NOT recognised.
+3. The literal token ``Tasks`` (plural). ``Task`` (singular) is NOT recognised.
+4. The trailing parenthesised reason. The validator strips leading/trailing whitespace from the reason but does not parse its contents; any descriptive text inside the parentheses is acceptable.
+
+What is NOT accepted (these will trip Rule 19 -- canonical-AC drift):
+
+- Replacing the double-dash with a single dash (``- N/A``).
+- Omitting the parenthesised reason (``-- N/A for HCL Tasks``).
+- Reordering the suffix elements (``-- (no Python source authored) N/A``).
+- Translating to a non-English locale.
+
+The strict structure exists so the validator can deterministically identify Tasks that opt out of a canonical AC line; loose pattern matching would silently accept malformed suffixes that fail later when the orchestrator's executor parses the same AC at runtime.
+
 ### Example: a pure-HCL Task
 
 A Task whose Changes Manifest contains only `infra/terragrunt/.../terragrunt.hcl` files has tier `HCL`. Its AC-FINAL block looks like:

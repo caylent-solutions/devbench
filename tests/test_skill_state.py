@@ -14,11 +14,15 @@ from pathlib import Path
 import pytest
 
 from devbench.skill_state import (
+    PerTaskCheckpoint,
     SkillState,
     _checkpoint_path,
+    _per_task_checkpoint_path,
     emit_audit,
     read_checkpoint,
+    read_per_task_checkpoint,
     write_checkpoint,
+    write_per_task_checkpoint,
 )
 
 _SKILL_NAMES = ["create-spec", "spec-to-backlog", "bootstrap-environment", "configure-devbench"]
@@ -157,3 +161,97 @@ class TestEmitAudit:
         """Empty field keys are also rejected."""
         with pytest.raises(ValueError, match="non-empty"):
             emit_audit("create-spec", "[SKILL_MAX_ITERATIONS_REACHED]", {"": "x"}, tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Per-task checkpoint API (issue #221 A3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestPerTaskCheckpoint:
+    """``write_per_task_checkpoint`` + ``read_per_task_checkpoint`` round-trip
+    the set of completed task IDs across re-invocations of spec-to-backlog."""
+
+    def test_read_returns_none_when_absent(self, tmp_path: Path) -> None:
+        """No checkpoint on disk -> None, no exception."""
+        assert read_per_task_checkpoint("spec-to-backlog", tmp_path) is None
+
+    def test_round_trip_preserves_completed_ids(self, tmp_path: Path) -> None:
+        """Write a set of task IDs; read back returns the same set."""
+        checkpoint = PerTaskCheckpoint(
+            completed_task_ids={"E1-F1-S1-T1", "E1-F1-S1-T2", "E2-F1-S1-T1"},
+            last_updated="2026-05-20T13:00:00Z",
+        )
+        write_per_task_checkpoint("spec-to-backlog", checkpoint, tmp_path)
+        result = read_per_task_checkpoint("spec-to-backlog", tmp_path)
+        assert result is not None
+        assert result.completed_task_ids == checkpoint.completed_task_ids
+        assert result.last_updated == checkpoint.last_updated
+
+    def test_checkpoint_path_distinct_from_skill_state_path(self, tmp_path: Path) -> None:
+        """Per-task checkpoint lives at ``<name>-tasks.json``; the iteration
+        checkpoint lives at ``<name>.json``. They never collide."""
+        iter_path = _checkpoint_path("spec-to-backlog", tmp_path)
+        task_path = _per_task_checkpoint_path("spec-to-backlog", tmp_path)
+        assert iter_path != task_path
+        assert task_path.name == "spec-to-backlog-tasks.json"
+        assert iter_path.name == "spec-to-backlog.json"
+
+    def test_write_uses_atomic_rename(self, tmp_path: Path) -> None:
+        """No stray ``.tmp`` file remains after a successful write."""
+        write_per_task_checkpoint(
+            "spec-to-backlog",
+            PerTaskCheckpoint(completed_task_ids={"E1-F1-S1-T1"}, last_updated="2026-05-20T13:00:00Z"),
+            tmp_path,
+        )
+        skill_dir = tmp_path / ".devbench" / "skill-state"
+        leftovers = [p for p in skill_dir.iterdir() if p.suffix == ".tmp"]
+        assert leftovers == []
+
+    def test_completed_ids_serialised_as_sorted_list(self, tmp_path: Path) -> None:
+        """The JSON payload encodes completed_task_ids as a sorted list so
+        the file is deterministic across runs (sets are unordered)."""
+        write_per_task_checkpoint(
+            "spec-to-backlog",
+            PerTaskCheckpoint(
+                completed_task_ids={"E2-F1-S1-T1", "E1-F1-S1-T1", "E1-F2-S1-T1"},
+                last_updated="2026-05-20T13:00:00Z",
+            ),
+            tmp_path,
+        )
+        path = _per_task_checkpoint_path("spec-to-backlog", tmp_path)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        assert payload["completed_task_ids"] == ["E1-F1-S1-T1", "E1-F2-S1-T1", "E2-F1-S1-T1"]
+
+    def test_read_raises_on_malformed_json(self, tmp_path: Path) -> None:
+        """Corrupt JSON is not silently swallowed -- fail-fast per CLAUDE.md."""
+        path = _per_task_checkpoint_path("spec-to-backlog", tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{ not valid json", encoding="utf-8")
+        with pytest.raises(json.JSONDecodeError):
+            read_per_task_checkpoint("spec-to-backlog", tmp_path)
+
+    def test_read_raises_on_missing_required_field(self, tmp_path: Path) -> None:
+        """A payload missing ``completed_task_ids`` raises KeyError."""
+        path = _per_task_checkpoint_path("spec-to-backlog", tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"last_updated": "2026-05-20T13:00:00Z"}), encoding="utf-8")
+        with pytest.raises(KeyError):
+            read_per_task_checkpoint("spec-to-backlog", tmp_path)
+
+    def test_overwriting_checkpoint_replaces_completed_ids(self, tmp_path: Path) -> None:
+        """A second write replaces (not unions) the completed-ids set."""
+        write_per_task_checkpoint(
+            "spec-to-backlog",
+            PerTaskCheckpoint(completed_task_ids={"T1"}, last_updated="2026-05-20T13:00:00Z"),
+            tmp_path,
+        )
+        write_per_task_checkpoint(
+            "spec-to-backlog",
+            PerTaskCheckpoint(completed_task_ids={"T2"}, last_updated="2026-05-20T14:00:00Z"),
+            tmp_path,
+        )
+        result = read_per_task_checkpoint("spec-to-backlog", tmp_path)
+        assert result is not None
+        assert result.completed_task_ids == {"T2"}

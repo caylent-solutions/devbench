@@ -177,9 +177,21 @@ Score each item PASS or FAIL:
 
 Address each FAIL item. Re-run the per-task rubric. Repeat until score is zero or `skills.max_iterations` is reached. If `max_iterations` is reached without converging, emit a `[BLOCKED]` comment naming the task file and the unresolved items.
 
-### 5d -- Run validate-backlog (iterate-until-perfect granularity 3)
+### 5d -- Post-process + run validate-backlog (iterate-until-perfect granularity 3)
 
-After writing each task file, run:
+After writing each task file, FIRST run the deterministic post-processing passes that fix mechanical issues authoring commonly produces (issue #221 A11, A12, A13). The post-processor is pure Python; it covers transforms the LLM cannot reliably do across N files:
+
+```bash
+uv run python -c "from pathlib import Path; from devbench.plugin_helpers import backlog_post_processor as bpp; print(bpp.run_all(Path('backlog')))"
+```
+
+For each pass that reports a non-zero count, emit one audit row:
+
+```
+[POST_PROCESS] <pass_name>: <count> file(s)
+```
+
+THEN run validate-backlog:
 
 ```bash
 uv run devbench validate-backlog
@@ -188,10 +200,10 @@ uv run devbench validate-backlog
 On any error:
 1. Parse the error message to identify the offending task file.
 2. Regenerate (or fix via `Edit`) the offending task file.
-3. Re-run `uv run devbench validate-backlog`.
+3. Re-run the post-processor + `uv run devbench validate-backlog`.
 4. Repeat until rc=0.
 
-Repeat for every leaf task until all tasks are written and `validate-backlog` is green.
+Repeat for every leaf task until all tasks are written and `validate-backlog` is green. See `docs/skills/backlog-post-processor.md` for the full list of post-processing passes and how to add new ones.
 
 ---
 

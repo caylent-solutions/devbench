@@ -12,6 +12,25 @@ since the last release. PR #119 carries every change.
 
 ### Added
 
+- **Backlog post-processor module for spec-to-backlog skill** (issue
+  #221 A11, A12, A13). New ``src/devbench/plugin_helpers/`` package
+  with ``backlog_post_processor.py`` exposing three deterministic
+  passes the LLM-driven ``spec-to-backlog`` skill invokes between task
+  authoring (Step 5) and validate-backlog (Step 5d):
+  - ``sanitize_markdown_pipes_in_manifest`` escapes raw ``|`` inside
+    Manifest annotation cells.
+  - ``dedupe_manifest_rows`` collapses identical Manifest rows to one.
+  - ``suffix_ref_on_orphan_paths`` adds ``(ref)`` after backtick-quoted
+    path tokens in AC / DoD prose that are not in the Manifest.
+  All passes are idempotent. The convenience entry point
+  ``run_all(backlog_dir)`` returns a ``{pass_name: count}`` mapping
+  the skill emits as ``[POST_PROCESS]`` audit rows. New docs page
+  ``docs/skills/backlog-post-processor.md`` documents the module
+  contract and the pattern for adding future passes. The skill's
+  ``spec-to-backlog/SKILL.md`` Step 5d now invokes the post-processor
+  before each ``validate-backlog`` call so the backlog lands green on
+  first try instead of requiring an operator-facing fix loop.
+
 - **Application-agnostic `spec-to-backlog` and `create-spec` skills**
   (issue #221 E1-E10). Both bundled SKILL.md files no longer hardcode
   the ``/workspaces/rpm-migration/kanon-deps-work/...`` exemplar path.

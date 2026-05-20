@@ -5201,22 +5201,29 @@ def cmd_git_ops_finalize(repo_name: str) -> int:
     ops.commit_and_push(canonical_repo, repo_path, branch, FINALIZE_COMMIT_TEMPLATE.format(branch=branch))
     logger.info("Pushed branch %s to %s", branch, canonical_repo)
 
+    # Issue #220: probe for an existing open PR BEFORE calling create_pr so
+    # we can distinguish fresh creation from re-encountering an
+    # already-open PR.  Without this check, every restart of a finalize
+    # cycle that hits an already-pushed branch fires a misleading
+    # ":git: PR opened" Slack ping even though nothing was opened.
+    pre_existing_pr = ops.find_open_pr(canonical_repo, branch, repo_path=repo_path)
     pr_url = ops.create_pr(canonical_repo, branch, pr_title, pr_body, repo_path=repo_path)
     logger.info("Created PR: %s", pr_url)
 
-    # Issue #219: fire the operator's `pr_opened` Slack ping now.  The batch
-    # PR carries every WU in the single-branch run, so there is no single
-    # ``unit_id`` -- use the most-recent active task as the representative,
-    # falling back to the symbolic "finalize" sentinel when no WU is in
-    # flight (degenerate case).  Documented in the work-unit-id field of
-    # the Slack payload alongside the workspace ``backlog`` label.
-    parser_for_notify = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
-    units_for_notify = parser_for_notify.parse_index()
-    representative = _find_most_recent_active_task(units_for_notify)
-    notify_unit_id = representative.id if representative is not None else "finalize"
-    from devbench.notifications import notify_pr_opened
+    # Issue #219 + #220: fire ``pr_opened`` Slack ping ONLY when this run
+    # actually created the PR (pre_existing_pr was None).  The batch PR
+    # carries every WU in the single-branch run, so there is no single
+    # ``unit_id`` -- use the most-recent active task as the
+    # representative, falling back to the symbolic "finalize" sentinel
+    # when no WU is in flight.
+    if pre_existing_pr is None:
+        parser_for_notify = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+        units_for_notify = parser_for_notify.parse_index()
+        representative = _find_most_recent_active_task(units_for_notify)
+        notify_unit_id = representative.id if representative is not None else "finalize"
+        from devbench.notifications import notify_pr_opened
 
-    notify_pr_opened(notify_unit_id, canonical_repo, pr_url)
+        notify_pr_opened(notify_unit_id, canonical_repo, pr_url)
 
     ci_result = ops.wait_for_checks_and_classify(pr_url, repo_path)
 

@@ -6195,10 +6195,13 @@ class TestCmdGitOpsFinalizeNotifications:
     @pytest.mark.unit
     def test_notify_pr_opened_fires_after_create_pr(self, tmp_path: Path) -> None:
         """cmd_git_ops_finalize calls notify_pr_opened with the new PR URL
-        immediately after ops.create_pr returns."""
+        when ``ops.create_pr`` actually creates a fresh PR (#219).  The
+        firing is gated on ``ops.find_open_pr`` returning None beforehand
+        (#220) -- the legitimate fresh-PR path."""
         from devbench.github.git_ops import CIResult
 
         mock_ops = MagicMock()
+        mock_ops.find_open_pr.return_value = None  # no pre-existing -> fresh create
         mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/99"
         mock_ops.wait_for_checks_and_classify.return_value = CIResult.GREEN
 
@@ -6218,13 +6221,44 @@ class TestCmdGitOpsFinalizeNotifications:
             rc = cli.cmd_git_ops_finalize("caylent-solutions/git-repo")
 
         assert rc == 0
-        assert captured, "notify_pr_opened was never called after create_pr"
+        assert captured, "notify_pr_opened must fire on fresh PR creation"
         unit_id, repo, pr_url = captured[-1]
         assert pr_url == "https://github.com/org/repo/pull/99"
         assert repo == "caylent-solutions/git-repo"
-        # rep unit id is either the most-recent active task id or the
-        # symbolic "finalize" fallback -- non-empty either way.
         assert unit_id, "rep unit id must be non-empty"
+
+    @pytest.mark.unit
+    def test_notify_pr_opened_not_fired_when_pr_already_open(self, tmp_path: Path) -> None:
+        """Issue #220: when ``ops.find_open_pr`` returns an existing URL,
+        ``cmd_git_ops_finalize`` is restarting against a previously-opened
+        batch PR.  No fresh PR was created, so ``notify_pr_opened`` must
+        NOT fire -- avoids the misleading ':git: PR opened' Slack ping that
+        previously fired on every restart of a finalize cycle."""
+        from devbench.github.git_ops import CIResult
+
+        existing_url = "https://github.com/org/repo/pull/60"
+        mock_ops = MagicMock()
+        mock_ops.find_open_pr.return_value = existing_url  # PR already open
+        mock_ops.create_pr.return_value = existing_url  # create_pr returns existing
+        mock_ops.wait_for_checks_and_classify.return_value = CIResult.GREEN
+
+        captured: list[Any] = []
+
+        with (
+            patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
+            patch("devbench.config.DEFER_PR", True),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
+            patch("devbench.cli._handle_finalize_ci_result", return_value=0),
+            patch(
+                "devbench.notifications.notify_pr_opened",
+                lambda *a, **kw: captured.append(a),
+            ),
+        ):
+            rc = cli.cmd_git_ops_finalize("caylent-solutions/git-repo")
+
+        assert rc == 0
+        assert not captured, f"notify_pr_opened MUST NOT fire on PR reuse (#220); captured={captured!r}"
 
     @pytest.mark.unit
     def test_notify_ci_failure_fires_on_failed_known_task(self, tmp_path: Path) -> None:

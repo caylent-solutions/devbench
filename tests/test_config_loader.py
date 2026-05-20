@@ -21,6 +21,7 @@ from devbench.config_loader import (
     QuotaRecoveryProbeConfig,
     RepoConfig,
     RuntimeConfig,
+    SkillsConfig,
     TimeoutConfig,
     get_configured_default_branch,
     get_repo_local_path,
@@ -3962,3 +3963,163 @@ class TestQuotaHandlingEnabledFalse:
         )
         rt = load_runtime_config(cfg, {})
         assert rt.quota_handling.enabled is True
+
+
+# ---------------------------------------------------------------------------
+# SkillsConfig -- issue #221 E1-E10 (application-agnostic SKILL.md + config)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestSkillsConfig:
+    """SkillsConfig dataclass and ``skills:`` YAML section parsing.
+
+    issue #221 E1-E10: the bundled spec-to-backlog and create-spec skills
+    are application-agnostic; operators point them at workspace exemplars
+    via this config block. All fields are optional.
+    """
+
+    def _write(self, path: Path, content: str) -> Path:
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    def test_skills_config_defaults(self) -> None:
+        """Given no args, SkillsConfig holds None paths + 10 fan-out + 5 iterations."""
+        cfg = SkillsConfig()
+        assert cfg.exemplar_backlog_path is None
+        assert cfg.exemplar_spec_path is None
+        assert cfg.fan_out_threshold == 10
+        assert cfg.max_iterations == 5
+
+    def test_runtime_config_has_skills_field(self) -> None:
+        """RuntimeConfig exposes ``skills`` populated with SkillsConfig defaults."""
+        rt = RuntimeConfig()
+        assert isinstance(rt.skills, SkillsConfig)
+        assert rt.skills.exemplar_backlog_path is None
+        assert rt.skills.fan_out_threshold == 10
+
+    def test_absent_skills_section_falls_back_to_defaults(self, tmp_path: Path) -> None:
+        """A YAML config without a ``skills:`` section yields default SkillsConfig values."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.skills.exemplar_backlog_path is None
+        assert rt.skills.exemplar_spec_path is None
+        assert rt.skills.fan_out_threshold == 10
+        assert rt.skills.max_iterations == 5
+
+    def test_skills_section_parses_all_fields(self, tmp_path: Path) -> None:
+        """All four ``skills:`` keys round-trip into SkillsConfig fields."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            skills:
+              exemplar_backlog_path: backlog/_exemplars/representative/BACKLOG.md
+              exemplar_spec_path: spec/_exemplars/representative.md
+              fan_out_threshold: 25
+              max_iterations: 8
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.skills.exemplar_backlog_path == "backlog/_exemplars/representative/BACKLOG.md"
+        assert rt.skills.exemplar_spec_path == "spec/_exemplars/representative.md"
+        assert rt.skills.fan_out_threshold == 25
+        assert rt.skills.max_iterations == 8
+
+    def test_skills_section_partial_yaml_keeps_defaults(self, tmp_path: Path) -> None:
+        """Only one field set; the others retain their defaults."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            skills:
+              fan_out_threshold: 3
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.skills.fan_out_threshold == 3
+        assert rt.skills.exemplar_backlog_path is None
+        assert rt.skills.exemplar_spec_path is None
+        assert rt.skills.max_iterations == 5
+
+    def test_schema_rejects_unknown_skills_key(self, tmp_path: Path) -> None:
+        """JSON Schema ``additionalProperties: false`` rejects unknown ``skills:`` keys."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            skills:
+              unknown_field: foo
+            """,
+        )
+        with pytest.raises(ValueError, match=r"Additional properties are not allowed.*unknown_field"):
+            load_runtime_config(cfg, {})
+
+    def test_schema_rejects_fan_out_threshold_below_minimum(self, tmp_path: Path) -> None:
+        """JSON Schema ``minimum: 1`` rejects fan_out_threshold: 0."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            skills:
+              fan_out_threshold: 0
+            """,
+        )
+        with pytest.raises(ValueError):
+            load_runtime_config(cfg, {})
+
+    def test_schema_rejects_max_iterations_below_minimum(self, tmp_path: Path) -> None:
+        """JSON Schema ``minimum: 1`` rejects max_iterations: 0."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            skills:
+              max_iterations: 0
+            """,
+        )
+        with pytest.raises(ValueError):
+            load_runtime_config(cfg, {})
+
+    def test_parse_skills_config_raises_on_negative_fan_out_direct(self, tmp_path: Path) -> None:
+        """_parse_skills_config defensive guard fires when the schema layer is bypassed."""
+        from devbench.config_loader import _parse_skills_config
+
+        fake_path = tmp_path / "cfg.yaml"
+        with pytest.raises(ValueError, match=r"skills.fan_out_threshold must be >= 1"):
+            _parse_skills_config(fake_path, {"fan_out_threshold": 0})
+
+    def test_parse_skills_config_raises_on_negative_max_iterations_direct(self, tmp_path: Path) -> None:
+        """_parse_skills_config defensive guard fires for max_iterations < 1."""
+        from devbench.config_loader import _parse_skills_config
+
+        fake_path = tmp_path / "cfg.yaml"
+        with pytest.raises(ValueError, match=r"skills.max_iterations must be >= 1"):
+            _parse_skills_config(fake_path, {"max_iterations": 0})
+
+    def test_empty_string_exemplar_paths_normalise_to_none(self, tmp_path: Path) -> None:
+        """An empty-string exemplar path normalises to None (treated as unset)."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            skills:
+              exemplar_backlog_path: ""
+              exemplar_spec_path: ""
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.skills.exemplar_backlog_path is None
+        assert rt.skills.exemplar_spec_path is None

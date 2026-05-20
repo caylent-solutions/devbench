@@ -10,6 +10,34 @@ configuration refactor, the EC2 remote-dev provisioning stack, and the
 work-unit lifecycle / authoring CLI improvements that have accumulated
 since the last release. PR #119 carries every change.
 
+### Added
+
+- **Application-agnostic `spec-to-backlog` and `create-spec` skills**
+  (issue #221 E1-E10). Both bundled SKILL.md files no longer hardcode
+  the ``/workspaces/rpm-migration/kanon-deps-work/...`` exemplar path.
+  Each skill now:
+  - Resolves an optional workspace exemplar from a new ``skills:``
+    YAML section (``skills.exemplar_backlog_path`` and
+    ``skills.exemplar_spec_path``). Absent / non-existent paths cause
+    the skill to skip the read entirely and rely on the canonical-
+    section list embedded in the SKILL.md as the authoritative quality
+    bar.
+  - Enumerates the canonical structure (15 task-file sections for
+    spec-to-backlog; 16 spec sections for create-spec) directly inside
+    the SKILL.md so a workspace with no exemplar still produces a
+    valid artefact.
+  - Emits ``[QUALITY_REFERENCE] <resolved-path>`` on success when an
+    exemplar was configured, or
+    ``[QUALITY_REFERENCE] <embedded-canonical-sections>`` when one was
+    not (the audit trail records what was consulted).
+  - Reads ``skills.fan_out_threshold`` (default 10) and
+    ``skills.max_iterations`` (default 5) for its parallel-authoring
+    and convergence-budget knobs. New ``SkillsConfig`` dataclass +
+    schema block + ``_parse_skills_config`` runtime validation +
+    ``sample-config.yaml`` entry. New docs page
+    ``docs/skills/exemplar-reference.md`` documents the
+    resolution-order and provenance contract.
+
 ### Fixed
 
 - **Manifest entries with glob patterns are rejected** (issue #221 B4).

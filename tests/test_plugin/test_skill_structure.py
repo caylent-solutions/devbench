@@ -285,22 +285,32 @@ class TestCreateSpecSkillTools:
 
 
 @pytest.mark.unit
-class TestCreateSpecSkillKanonExemplarStep:
-    """AC-191-3: Step 1 must instruct reading the kanon spec exemplar to internalise quality bar."""
+class TestCreateSpecSkillExemplarConfig:
+    """issue #221 E1-E10: Step 1 must reference a configurable exemplar path (not a hardcoded one)
+    AND must enumerate the canonical 16-section skeleton as the embedded quality bar."""
 
-    def test_skill_reads_kanon_exemplar(self) -> None:
-        """Step 1 must reference the kanon spec exemplar path so quality bar is internalised."""
+    def test_skill_references_configurable_exemplar_path(self) -> None:
+        """Step 1 must point at skills.exemplar_spec_path (configurable, not hardcoded)."""
         content = CREATE_SPEC_SKILL_PATH.read_text()
-        assert "kanon" in content.lower(), (
-            "create-spec/SKILL.md step 1 must reference the kanon spec exemplar to internalise the quality bar"
+        assert "skills.exemplar_spec_path" in content, (
+            "create-spec/SKILL.md step 1 must reference skills.exemplar_spec_path so operators "
+            "can point the skill at their workspace exemplar without modifying SKILL.md"
+        )
+        assert "kanon-list-add-lock-features-spec.md" not in content, (
+            "create-spec/SKILL.md must NOT contain the literal 'kanon-list-add-lock-features-spec.md' "
+            "filename -- the skill is application-agnostic (issue #221 E1-E10)"
+        )
+        assert "kanon-deps-work" not in content, (
+            "create-spec/SKILL.md must NOT contain the literal 'kanon-deps-work' path -- "
+            "the skill is application-agnostic (issue #221 E1-E10)"
         )
 
-    def test_skill_references_kanon_spec_exemplar_path(self) -> None:
-        """Step 1 must include the literal exemplar path from spec section 4.6.0."""
+    def test_skill_enumerates_16_canonical_sections(self) -> None:
+        """Step 1b must enumerate the 16 canonical spec sections as the embedded quality bar."""
         content = CREATE_SPEC_SKILL_PATH.read_text()
-        assert "kanon-list-add-lock-features-spec.md" in content, (
-            "create-spec/SKILL.md must reference the kanon spec exemplar file name "
-            "'kanon-list-add-lock-features-spec.md' so the skill reads the canonical quality reference"
+        assert "Section 0" in content and "Section 15" in content, (
+            "create-spec/SKILL.md step 1b must enumerate Sections 0 through 15 explicitly "
+            "as the embedded quality bar (independent of any external exemplar)"
         )
 
 
@@ -400,12 +410,12 @@ class TestCreateSpecSkillIterateUntilPerfectLoop:
 class TestCreateSpecSkillRubricCoverage:
     """AC-191-3: Self-critique rubric must cover all 8 items from spec section 4.6.0."""
 
-    def test_rubric_covers_16_kanon_sections(self) -> None:
-        """Rubric item 1: all 16 top-level sections from kanon exemplar must be present."""
+    def test_rubric_covers_16_canonical_sections(self) -> None:
+        """Rubric item 1: all 16 top-level canonical sections (Sections 0-15) must be present."""
         content = CREATE_SPEC_SKILL_PATH.read_text()
         assert "16" in content or "sixteen" in content.lower(), (
-            "create-spec/SKILL.md rubric must require all 16 top-level sections "
-            "from the kanon exemplar (or explicit N/A justification)"
+            "create-spec/SKILL.md rubric must require all 16 top-level canonical sections "
+            "(or explicit N/A justification)"
         )
 
     def test_rubric_requires_worked_examples_per_goal(self) -> None:
@@ -503,16 +513,20 @@ class TestCreateSpecSkillQualityReference:
             "audit comment naming the exemplar path read, per spec section 4.6.7 (provenance transparency)"
         )
 
-    def test_skill_quality_reference_names_exemplar_path(self) -> None:
-        """[QUALITY_REFERENCE] comment must reference the exemplar file path for provenance transparency."""
+    def test_skill_quality_reference_names_resolved_exemplar(self) -> None:
+        """[QUALITY_REFERENCE] comment must reference the resolved exemplar path or the
+        ``<embedded-canonical-sections>`` sentinel (issue #221 E1-E10)."""
         content = CREATE_SPEC_SKILL_PATH.read_text()
         qr_pos = content.find("[QUALITY_REFERENCE]")
         assert qr_pos >= 0, "create-spec/SKILL.md must contain [QUALITY_REFERENCE]"
-        # The surrounding context (within 500 chars) must reference the exemplar path
         surrounding = content[qr_pos : qr_pos + 500]
-        assert "kanon-list-add-lock-features-spec.md" in surrounding or "exemplar" in surrounding.lower(), (
-            "[QUALITY_REFERENCE] instruction must reference the exemplar path "
-            "(kanon-list-add-lock-features-spec.md) so provenance is unambiguous"
+        assert "exemplar" in surrounding.lower() or "embedded-canonical-sections" in surrounding, (
+            "[QUALITY_REFERENCE] instruction must reference the resolved exemplar path or "
+            "the <embedded-canonical-sections> sentinel so provenance is unambiguous"
+        )
+        assert "kanon" not in surrounding.lower(), (
+            "[QUALITY_REFERENCE] instruction must NOT name 'kanon' literally -- "
+            "the skill is application-agnostic (issue #221 E1-E10)"
         )
 
     def test_skill_quality_reference_appears_after_write_step(self) -> None:
@@ -597,35 +611,39 @@ class TestSpecToBacklogSkillTools:
 class TestSpecToBacklogSkillKanonExemplarStep:
     """AC-191-4: Skill must read kanon BACKLOG.md and a representative task file to internalise quality bar."""
 
-    def test_skill_reads_kanon_backlog(self) -> None:
-        """Step 1 must instruct reading the kanon BACKLOG.md as exemplar."""
+    def test_skill_references_backlog_output(self) -> None:
+        """Step 1 must reference BACKLOG.md as the artefact the skill produces and (optionally)
+        consults as a configured exemplar."""
         content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
-        assert "BACKLOG.md" in content, (
-            "spec-to-backlog/SKILL.md must instruct reading kanon BACKLOG.md as the backlog exemplar"
-        )
+        assert "BACKLOG.md" in content, "spec-to-backlog/SKILL.md must reference BACKLOG.md"
 
     def test_skill_reads_representative_task_file(self) -> None:
-        """Step 1 must instruct reading a representative kanon task file for per-task quality bar."""
+        """Step 1 must reference task-file authoring as the per-task quality bar."""
         content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
         assert "task" in content.lower(), (
-            "spec-to-backlog/SKILL.md must reference reading a representative kanon task file "
-            "to internalise the per-task quality bar"
+            "spec-to-backlog/SKILL.md must reference per-task authoring to internalise the per-task quality bar"
         )
 
-    def test_skill_references_kanon_backlog_exemplar_path(self) -> None:
-        """Step 1 must include the literal kanon BACKLOG.md path from spec section 4.6.0."""
+    def test_skill_references_configurable_exemplar_path(self) -> None:
+        """Step 1 must reference the configurable exemplar path via skills.exemplar_backlog_path
+        (issue #221 E1-E10: skill is application-agnostic; no hardcoded workspace path)."""
         content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
-        assert "kanon-deps-work" in content, (
-            "spec-to-backlog/SKILL.md must reference 'kanon-deps-work' in the exemplar path "
-            "so the skill reads the canonical backlog quality reference"
+        assert "skills.exemplar_backlog_path" in content, (
+            "spec-to-backlog/SKILL.md must reference skills.exemplar_backlog_path so operators "
+            "can point the skill at their workspace exemplar without modifying the SKILL.md"
+        )
+        assert "kanon-deps-work" not in content, (
+            "spec-to-backlog/SKILL.md must NOT contain the literal 'kanon-deps-work' path -- "
+            "the skill is application-agnostic (issue #221 E1-E10)"
         )
 
-    def test_skill_references_50kb_quality_bar(self) -> None:
-        """Step 1 must reference the ~50KB per-task depth quality bar from spec section 4.6.0."""
+    def test_skill_references_canonical_15_section_skeleton(self) -> None:
+        """Step 1b must enumerate the 15 canonical task-file sections (the embedded quality bar
+        that floors the skill when no workspace exemplar is configured)."""
         content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
-        assert "50" in content or "50KB" in content.upper() or "50 KB" in content.upper(), (
-            "spec-to-backlog/SKILL.md must reference the ~50KB per-task quality bar "
-            "so the skill knows the expected task depth"
+        assert "15 canonical" in content or "15-section" in content or "15 canonical sections" in content, (
+            "spec-to-backlog/SKILL.md must enumerate the 15 canonical task-file sections "
+            "as the embedded quality bar (independent of any external exemplar)"
         )
 
 
@@ -992,15 +1010,21 @@ class TestSpecToBacklogSkillQualityReference:
             "audit comment naming the exemplar path read, per spec section 4.6.7 (provenance transparency)"
         )
 
-    def test_skill_quality_reference_names_kanon_exemplar(self) -> None:
-        """[QUALITY_REFERENCE] comment must reference the kanon backlog exemplar path."""
+    def test_skill_quality_reference_names_resolved_exemplar(self) -> None:
+        """[QUALITY_REFERENCE] comment must reference the resolved exemplar path or the
+        ``<embedded-canonical-sections>`` sentinel (issue #221 E1-E10 -- skill is
+        application-agnostic so the comment cannot reference any hardcoded workspace path)."""
         content = SPEC_TO_BACKLOG_SKILL_PATH.read_text()
         qr_pos = content.find("[QUALITY_REFERENCE]")
         assert qr_pos >= 0, "spec-to-backlog/SKILL.md must contain [QUALITY_REFERENCE]"
         surrounding = content[qr_pos : qr_pos + 500]
-        assert "kanon-deps-work" in surrounding or "exemplar" in surrounding.lower(), (
-            "[QUALITY_REFERENCE] instruction must reference the kanon-deps-work exemplar path "
-            "so provenance is unambiguous"
+        assert "exemplar" in surrounding.lower() or "embedded-canonical-sections" in surrounding, (
+            "[QUALITY_REFERENCE] instruction must reference the resolved exemplar path or "
+            "the <embedded-canonical-sections> sentinel so provenance is unambiguous"
+        )
+        assert "kanon-deps-work" not in surrounding, (
+            "[QUALITY_REFERENCE] instruction must NOT name 'kanon-deps-work' literally -- "
+            "the skill is application-agnostic (issue #221 E1-E10)"
         )
 
 

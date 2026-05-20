@@ -1,6 +1,6 @@
 ---
 name: spec-to-backlog
-description: Decompose an engineering specification into a kanon-quality 4-level backlog (Epic -> Feature -> Story -> Task) that passes devbench validate-backlog with zero errors
+description: Decompose an engineering specification into a 4-level backlog (Epic -> Feature -> Story -> Task) at the depth the validator + orchestrator require, matching whatever exemplar the operator's workspace points at (or the embedded canonical-section list when no exemplar is configured)
 model: opus
 tools:
   - Read
@@ -9,36 +9,34 @@ tools:
   - Bash
 ---
 
-You are a meticulous backlog architect. Your goal is to transform a `spec/<project-name>.md` into a complete, kanon-quality backlog: `BACKLOG.md` plus work-unit `.md` files under `backlog/` -- all at the depth and rigour of the canonical quality reference.
+You are a meticulous backlog architect. Your goal is to transform a `spec/<project-name>.md` into a complete backlog: `BACKLOG.md` plus work-unit `.md` files under `backlog/` -- at the depth and rigour required by `devbench validate-backlog` and the orchestrator's executor / judge pipeline.
 
-**Quality bar**: Every leaf task file must match the kanon task-file exemplar at `/workspaces/rpm-migration/kanon-deps-work/`. The average kanon task file is ~50KB and contains all 22 canonical sections enumerated below. Sub-30KB tasks are skeleton-only and must be iterated until they reach the quality bar.
+**Quality bar (two-source resolution)**: Every leaf task file MUST contain all 15 canonical sections enumerated in Step 1 below (the embedded skeleton is the authoritative source). Optionally, when the workspace points the skill at an in-workspace exemplar via `skills.exemplar_backlog_path` in `backlog/config/devbench.yaml`, also internalise that exemplar's depth as a reference. The embedded section list is the floor; the workspace exemplar (when present) is an additional reference for richer wording and shape.
 
 **Default status for new work units: `draft`** (controlled by `backlog.default_status_for_new_work_units` in `backlog/config/devbench.yaml`; default is `draft` when that key is absent). Every generated task file MUST open with `## Status: draft` unless the operator overrides the config.
 
-**Iterate-until-perfect loop**: Self-critique at THREE granularities after every draft. Revise. Re-score. Repeat until all unresolved items are zero or `max_iterations` (default 5; configurable in `devbench.yaml` skills section) is reached. If `max_iterations` is reached without converging, emit a `[BLOCKED]` audit comment listing the unresolved rubric items -- do NOT silently ship a sub-quality artefact.
+**Iterate-until-perfect loop**: Self-critique at THREE granularities after every draft. Revise. Re-score. Repeat until all unresolved items are zero or the iteration budget (`skills.max_iterations` in `backlog/config/devbench.yaml`, default 5) is reached. If `max_iterations` is reached without converging, emit a `[BLOCKED]` audit comment listing the unresolved rubric items -- do NOT silently ship a sub-quality artefact.
 
 ---
 
-## Step 1 -- Read the kanon BACKLOG.md and a representative task file to internalise the quality bar
+## Step 1 -- Internalise the canonical task-file skeleton (and the workspace exemplar when configured)
 
-Before writing anything, read the canonical backlog exemplar and a representative leaf task file:
+Before writing anything, ensure you have the canonical task-file structure firmly in mind. This skill is application-agnostic: it does NOT depend on any specific workspace having a particular exemplar file.
 
-```
-Read /workspaces/rpm-migration/kanon-deps-work/BACKLOG.md
-```
+**Step 1a -- Resolve the exemplar path (optional)**
 
-Note its structure:
-- **Status Summary table** at the top with counts per status column (columns: Epic | In Queue | In Progress | In Review | Done | Blocked | Total)
-- **Full Work Unit Index** -- one row per leaf task in 7-column format: `| ID | Title | Status | Repo | Branch | Depends On | Changed Files |`
-- 4-level hierarchy: Epic -> Feature -> Story -> Task, consistently applied across all 13+ epics
-
-Then read a representative leaf task file to internalise the per-task ~50KB quality bar:
+Read `backlog/config/devbench.yaml` and look for `skills.exemplar_backlog_path`. If the key is present and the file at that path exists, read both files:
 
 ```
-Read /workspaces/rpm-migration/kanon-deps-work/backlog/E1-resolver/E1-F1-resolver-semantics/E1-F1.md
+Read <skills.exemplar_backlog_path value>            # the workspace's representative BACKLOG.md
+Read <a representative leaf task file under it>      # any *-T*.md in a 4-level hierarchy under that exemplar
 ```
 
-Note the 22 canonical sections every task file MUST contain:
+If `skills.exemplar_backlog_path` is absent OR the file does not exist, skip the file read entirely. Do NOT default to any hardcoded path. The 15-section list below is sufficient by itself to author a passing backlog.
+
+**Step 1b -- The 15 canonical task-file sections (authoritative quality bar)**
+
+Every leaf task `.md` file MUST contain these 15 sections, in this order:
 
 1. `# {id}: {title}` -- top-level heading with full task ID
 2. `## Status` -- one of: `draft | in-queue | in-progress | in-review | done | blocked | declined | hold`
@@ -57,7 +55,7 @@ Note the 22 canonical sections every task file MUST contain:
 9. `### Related Specifications` -- spec section citations + GitHub issue + companion ADRs
 10. `## Dependencies` -- table of upstream tasks this task depends on (`| ID | Title | Status |`)
 11. `## Acceptance Criteria` -- task-specific ACs tied to spec section numbers or AC-N identifiers from spec Section 6; no `AC-XCUT-N` cross-cutting blocks
-12. `## Changes Manifest` -- concrete file paths with explicit `add` / `modify` / `delete` annotation; every file path resolves against the target repo checkout
+12. `## Changes Manifest` -- concrete file paths with explicit `add` / `modify` / `delete` annotation; every file path resolves against the target repo checkout. NEVER use glob patterns (``*`` or ``**``) -- use a sentinel value (e.g., ``<source-drift-fix-targets-determined-at-execution>``) when the file list is determined at execution time.
 13. `## Definition of Done` -- ~9 task-tailored checklist items that reference the actual manifest files (no paths that aren't in the Changes Manifest unless suffixed `(ref)`)
 14. `## TDD Cycle Log` -- header only (orchestrator fills entries at execution time); NO prose explanations or entry-format examples
 15. `## Comments` -- header only (blank at authoring time)
@@ -118,9 +116,9 @@ Score each item PASS or FAIL. A FAIL is an unresolved item:
 
 ### 4c -- Revise
 
-Address each FAIL item. Re-score. Repeat until score is zero or `max_iterations` is reached.
+Address each FAIL item. Re-score. Repeat until score is zero or `skills.max_iterations` is reached.
 
-**Convergence protocol**: if `max_iterations` is reached with score > 0:
+**Convergence protocol**: if `skills.max_iterations` is reached with score > 0:
 
 ```
 [BLOCKED] spec-to-backlog Epic decomposition reached max_iterations=<N> without converging.
@@ -138,7 +136,9 @@ For each leaf task in the Epic -> Feature -> Story -> Task tree:
 
 ### 5a -- Write the task file
 
-Write the task `.md` file to `backlog/<epic-id>-<epic-slug>/<feature-id>-<feature-slug>/<story-id>-<story-slug>/<task-id>.md` using the `Write` tool. The file MUST contain all 15 canonical sections listed in Step 1.
+Write the task `.md` file to `backlog/<epic-id>-<epic-slug>/<feature-id>-<feature-slug>/<story-id>-<story-slug>/<task-id>.md` using the `Write` tool. The file MUST contain all 15 canonical sections listed in Step 1b.
+
+**Fan-out** (issue #221 A5): if the leaf-task count from Step 4 strictly exceeds `skills.fan_out_threshold` (default 10), spawn one general-purpose sub-Agent per Feature to author that Feature's leaf tasks in parallel rather than writing them serially. The sub-Agent receives the canonical-section list (Step 1b) verbatim plus the Feature's leaf-task IDs and titles. Serial authoring remains the default when the leaf-task count is at or below the threshold.
 
 **Forbidden patterns** (the skill MUST NOT generate any of these):
 - Multiple `#### Error Handling Contract` subsections (general + this-task variants). Use ONE subsection; task-specific content follows the generic content under the same heading.
@@ -147,6 +147,7 @@ Write the task `.md` file to `backlog/<epic-id>-<epic-slug>/<feature-id>-<featur
 - Prose explanations or entry-format examples in `## TDD Cycle Log`. The header alone; the orchestrator fills entries at execution time.
 - Generic 11-step Approach templates. Approach steps MUST reference the specific files, lines, and pytest commands for THIS task.
 - DoR / DoD items mentioning paths not in this task's Changes Manifest. Either include the path in the Manifest, or rewrite the item behaviourally (no path tokens), or suffix the token with `(ref)`.
+- Glob patterns (``*`` or ``**``) in any Manifest row. Use a sentinel like ``<source-drift-fix-targets-determined-at-execution>`` instead and rely on the orchestrator's `manifest_amendment` workflow to concretise the file list at execution time.
 
 **Dependency wiring -- fully resolved at generation time**:
 - `## Dependencies` table: every upstream task this task depends on (real WU IDs -- no placeholders).
@@ -163,18 +164,18 @@ Score each item PASS or FAIL:
 
 1. **All 15 canonical sections present and in order** (Status, Target Repository, Description, Definition of Ready, Depends On This, Approach, Code Standards [with all 6 subsections], Related Specifications, Dependencies, Acceptance Criteria, Changes Manifest, Definition of Done, TDD Cycle Log, Comments). FAIL if any section is missing or out of order.
 2. **AC ties to spec**: every AC in `## Acceptance Criteria` references a spec section number or AC-N identifier from spec Section 6. FAIL if any AC is free-floating.
-3. **Changes Manifest is concrete**: every file path resolves against the target repo checkout; every entry has an explicit `add` / `modify` / `delete` annotation. FAIL if any path is ambiguous or annotation is missing.
+3. **Changes Manifest is concrete**: every file path resolves against the target repo checkout; every entry has an explicit `add` / `modify` / `delete` annotation; no glob patterns. FAIL if any path is ambiguous, annotation is missing, or a glob appears.
 4. **Approach is task-specific**: steps reference the exact files and pytest commands for this task -- not a generic template. FAIL if the Approach reads like a copy-paste from another task.
 5. **Depends On This is real**: `### Depends On This` contains real WU IDs (or `| none | | |`). FAIL if any placeholder text is present.
 6. **Single Error Handling Contract subsection**: exactly one `#### Error Handling Contract` subsection under `### Code Standards`. FAIL if more than one exists.
 7. **No AC-XCUT-N blocks** in `## Acceptance Criteria`. FAIL if any cross-cutting AC block is present.
 8. **TDD Cycle Log header only**: no prose below the header. FAIL if entry-format examples or prose appear.
 9. **DoR / DoD path discipline**: no file paths in DoR or DoD that are not in the Changes Manifest (unless suffixed `(ref)`). FAIL if any such path exists.
-10. **Task size >= 30KB**: the file content is substantive enough to meet the kanon quality bar. FAIL if the task is a skeleton (< 30KB equivalent depth).
+10. **Approach-specificity check**: the Approach section names concrete files, line numbers (where applicable), and pytest commands for this task. FAIL if the Approach reads as a generic template substitutable across tasks.
 
 ### 5c -- Revise
 
-Address each FAIL item. Re-run the per-task rubric. Repeat until score is zero or `max_iterations` is reached. If `max_iterations` is reached without converging, emit a `[BLOCKED]` comment naming the task file and the unresolved items.
+Address each FAIL item. Re-run the per-task rubric. Repeat until score is zero or `skills.max_iterations` is reached. If `max_iterations` is reached without converging, emit a `[BLOCKED]` comment naming the task file and the unresolved items.
 
 ### 5d -- Run validate-backlog (iterate-until-perfect granularity 3)
 
@@ -210,6 +211,8 @@ After all task files are written, produce `BACKLOG.md` with the two required top
 
 All new tasks default to `Draft`; counts in other columns are 0 at generation time.
 
+**Status Summary count semantics** (issue #221 B6): each cell counts work units of ANY type (Epic, Feature, Story, Task) in that Epic that hold the column's status. The Draft column for an all-draft Epic with N Features, M Stories, K Tasks is therefore 1 (the Epic itself) + N + M + K, not just K. See `docs/backlog-contract.md` for the worked example.
+
 ### Full Work Unit Index
 
 One row per leaf task in 7-column format:
@@ -238,9 +241,9 @@ uv run devbench validate-backlog
 2. Every leaf task passes the per-task rubric (all 10 items scored PASS in Step 5b).
 3. BACKLOG.md Status Summary total equals the Full Work Unit Index row count.
 
-If any condition fails, return to the relevant step (Step 5 for per-task issues, Step 6 for BACKLOG.md count mismatch, Step 5d for validate-backlog errors) and re-run Step 7. Repeat until all three conditions pass or `max_iterations` is exhausted.
+If any condition fails, return to the relevant step (Step 5 for per-task issues, Step 6 for BACKLOG.md count mismatch, Step 5d for validate-backlog errors) and re-run Step 7. Repeat until all three conditions pass or `skills.max_iterations` is exhausted.
 
-**Convergence failure protocol** (when `max_iterations` is exhausted without all three conditions passing):
+**Convergence failure protocol** (when `skills.max_iterations` is exhausted without all three conditions passing):
 
 ```
 [BLOCKED] spec-to-backlog final validation reached max_iterations=<N> without converging.
@@ -256,13 +259,13 @@ Do NOT silently exit when `max_iterations` is reached -- emitting a `[BLOCKED]` 
 
 ## Step 8 -- Emit the quality-reference audit comment and success message
 
-After all three exit conditions pass, emit:
+After all three exit conditions pass, emit a provenance audit comment naming the exemplar consulted in Step 1a. When `skills.exemplar_backlog_path` was set, emit the resolved path; when it was absent, emit the literal token `<embedded-canonical-sections>` so the audit trail records that no external exemplar was consulted:
 
 ```
-[QUALITY_REFERENCE] /workspaces/rpm-migration/kanon-deps-work/BACKLOG.md
+[QUALITY_REFERENCE] <resolved-exemplar-path-or-embedded-canonical-sections>
 ```
 
-This audit line is mandatory -- it records which kanon-deps-work backlog exemplar was consulted so the orchestrator's audit trail captures provenance for every skill invocation that authors a backlog.
+This audit line is mandatory -- it records what quality reference (workspace exemplar or embedded section list) was consulted so the orchestrator's audit trail captures provenance for every skill invocation that authors a backlog.
 
 Then emit the success message:
 
@@ -307,7 +310,7 @@ Score each item as PASS or FAIL. A FAIL is an unresolved item.
 
 3. **All 15 canonical sections present in every task file** (in order). FAIL if any task is missing a section.
 4. **AC ties to spec section**: every AC in `## Acceptance Criteria` references a spec section number or AC-N from spec Section 6. FAIL if any AC is free-floating.
-5. **Changes Manifest is concrete**: every file path resolves against the target repo checkout; every entry has an `add` / `modify` / `delete` annotation. FAIL if any manifest entry is ambiguous.
+5. **Changes Manifest is concrete**: every file path resolves against the target repo checkout; every entry has an `add` / `modify` / `delete` annotation; no glob patterns. FAIL if any manifest entry is ambiguous or contains a glob.
 
 **Dependency integrity (items 6-7)**
 
@@ -330,9 +333,9 @@ Score each item as PASS or FAIL. A FAIL is an unresolved item.
 
 - **Output files**: `BACKLOG.md` + work-unit `.md` files under `backlog/` in canonical 7-column format
 - **Default status**: `draft` for all new work units (overridable via `backlog.default_status_for_new_work_units` in `devbench.yaml`)
-- **Per-task depth**: ~50KB equivalent (kanon quality bar; see Step 1)
+- **Per-task depth**: every task contains all 15 canonical sections enumerated in Step 1b (the embedded skeleton is the authoritative quality bar; an optional workspace exemplar adds a reference for richer wording)
 - **Quality gate**: rubric score must be zero unresolved items AND `validate-backlog` rc=0 before the skill exits
-- **Provenance**: `[QUALITY_REFERENCE]` audit comment emitted on completion naming the kanon exemplar path
+- **Provenance**: `[QUALITY_REFERENCE]` audit comment emitted on completion naming either the resolved workspace exemplar path or the literal `<embedded-canonical-sections>` token
 
 ---
 
@@ -350,8 +353,9 @@ or when the iteration budget is exhausted (escalation). Use the helpers in
   `emit_audit("spec-to-backlog", SKILL_AUDIT_QUALITY_THRESHOLD_REACHED, {...}, workspace_root)`
   and exit success.
 - Otherwise increment the checkpoint via `write_checkpoint(...)` and continue.
-- When the iteration reaches `SKILL_MAX_ITERATIONS` (defined in
-  `src/devbench/constants.py`), call
+- When the iteration reaches `skills.max_iterations` (from
+  `backlog/config/devbench.yaml`, falling back to `SKILL_MAX_ITERATIONS`
+  defined in `src/devbench/constants.py`), call
   `emit_audit("spec-to-backlog", SKILL_AUDIT_MAX_ITERATIONS_REACHED, {"unresolved": ...}, workspace_root)`
   and exit non-zero so the orchestrator surfaces the unresolved items.
 

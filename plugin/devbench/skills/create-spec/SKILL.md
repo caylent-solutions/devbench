@@ -1,6 +1,6 @@
 ---
 name: create-spec
-description: Author a rigorous engineering specification matching the kanon quality bar, then offer spec-to-backlog handoff
+description: Author a rigorous engineering specification at the depth `spec-to-backlog` requires, matching the operator's workspace exemplar (when configured) or the embedded 16-section skeleton otherwise; then offer spec-to-backlog handoff
 model: opus
 tools:
   - Read
@@ -9,23 +9,32 @@ tools:
   - Bash
 ---
 
-You are a meticulous specification author. Your goal is to produce a `spec/<project-name>.md` that matches the canonical quality reference for this program. The spec must be deep enough that a developer who has never seen the codebase can implement every feature from the spec alone, and a QA engineer can derive every test case from the spec's acceptance criteria.
+You are a meticulous specification author. Your goal is to produce a `spec/<project-name>.md` deep enough that a developer who has never seen the codebase can implement every feature from the spec alone, and a QA engineer can derive every test case from the spec's acceptance criteria.
 
-**Quality bar**: The kanon spec exemplar (`kanon-list-add-lock-features-spec.md`) is the canonical quality reference. Target: 1000+ lines for non-trivial programs (smaller for minor features), covering all 16 top-level sections present in the kanon exemplar (or with explicit N/A justification for sections not applicable to the project).
+**Quality bar (two-source resolution)**: The 16-section structural skeleton below (Sections 0-15) is the authoritative quality bar. When the workspace points the skill at an in-workspace exemplar via `skills.exemplar_spec_path` in `backlog/config/devbench.yaml`, also internalise that exemplar's depth as a reference. Target: 1000+ lines for non-trivial programs (smaller for minor features); every spec MUST cover all 16 sections or explicitly mark each absent section "N/A -- reason".
 
-**Iterate-until-perfect loop**: Self-critique against the rubric below after every draft. Revise. Re-score. Repeat until the score is zero unresolved items, or until `max_iterations` (default 5, configurable in `backlog/config/devbench.yaml` skills section) is reached. If `max_iterations` is reached without converging, emit a [BLOCKED] audit comment listing the unresolved rubric items and ask the operator to clarify the ambiguous or under-specified areas. Do NOT silently ship a sub-quality artefact.
+**Iterate-until-perfect loop**: Self-critique against the rubric below after every draft. Revise. Re-score. Repeat until the score is zero unresolved items, or until `skills.max_iterations` in `backlog/config/devbench.yaml` (default 5) is reached. If `max_iterations` is reached without converging, emit a [BLOCKED] audit comment listing the unresolved rubric items and ask the operator to clarify the ambiguous or under-specified areas. Do NOT silently ship a sub-quality artefact.
 
 ---
 
-## Step 1 -- Read the kanon spec exemplar to internalise the quality bar
+## Step 1 -- Internalise the canonical spec structure (and the workspace exemplar when configured)
 
-Read the canonical spec exemplar before authoring anything:
+This skill is application-agnostic: it does NOT depend on any specific workspace having a particular exemplar file.
+
+**Step 1a -- Resolve the exemplar path (optional)**
+
+Read `backlog/config/devbench.yaml` and look for `skills.exemplar_spec_path`. If the key is present and the file at that path exists, read it:
 
 ```
-Read /workspaces/rpm-migration/kanon-deps-work/spec/kanon-list-add-lock-features-spec.md
+Read <skills.exemplar_spec_path value>
 ```
 
-Note its structure:
+If `skills.exemplar_spec_path` is absent OR the file does not exist, skip the file read entirely. Do NOT default to any hardcoded path. The 16-section skeleton below is sufficient by itself to author a passing spec.
+
+**Step 1b -- The 16 canonical spec sections (authoritative quality bar)**
+
+Every spec MUST cover these 16 top-level sections (or mark each absent section "N/A -- reason"):
+
 - **Section 0** -- Items that change existing user-facing behavior (prefaced review)
 - **Section 1** -- Context (current verified state of the codebase)
 - **Section 2** -- Goals (with worked operator examples)
@@ -45,13 +54,13 @@ Note its structure:
 - **Section 14** -- CLI `--help` reference / snapshot
 - **Section 15** -- Future work (explicitly deferred)
 
-These 16 top-level sections (0-15) define the structural skeleton every spec MUST cover or explicitly mark N/A.
-
 ---
 
 ## Step 2 -- Ask the operator structured questions
 
-Ask the operator one block of questions covering every section of the kanon-spec skeleton. Do not proceed to authoring until you have answers (or explicit "N/A / skip" for optional items). Structure your questions as follows:
+Ask the operator one block of questions covering every section of the canonical skeleton. Do not proceed to authoring until you have answers (or explicit "N/A / skip" for optional items). Structure your questions as follows:
+
+**Optional discovery-artifact mode** (issue #221 C1): if the operator invokes the skill with a `discovery_artifacts_dir` argument naming a directory of pre-collected research artifacts (architecture notes, oncall postmortems, existing READMEs), walk that directory first via `Read` on each artifact and use the contents as the evidence base for Sections 1, 3, 3.5, 3.6, and 4 instead of asking blank-slate questions. The operator question block then narrows to the *gaps* the artifacts do not cover.
 
 **Block A -- Problem and context**
 1. What is the project name and one-sentence problem statement?
@@ -93,12 +102,12 @@ Ask the operator one block of questions covering every section of the kanon-spec
 
 ## Step 3 -- Author the spec one section at a time
 
-Using the operator's answers, author `spec/<project-name>.md` following the kanon structural skeleton. Work through one section at a time:
+Using the operator's answers, author `spec/<project-name>.md` following the canonical structural skeleton from Step 1b. Work through one section at a time:
 
 1. Write Section 0 (behavior-change prefaced items, if any) -- present it to the operator for spot-check before continuing.
 2. Write Section 1 (Context) -- verify with the operator that the current codebase state is accurate.
 3. Write Section 2 (Goals) -- ensure each goal has a worked operator example.
-4. Continue through Sections 3-15, applying the kanon-spec depth at each section.
+4. Continue through Sections 3-15, applying the canonical depth at each section.
 
 **Per-FR discipline**: for every functional requirement, the spec must state:
 - The happy-path behavior
@@ -111,14 +120,14 @@ Using the operator's answers, author `spec/<project-name>.md` following the kano
 
 ## Step 4 -- Run the iterate-until-perfect self-critique loop
 
-After drafting the full spec, run the self-critique rubric below. Generate a finding list (each finding: criteria-group + detail + suggested-fix). Then revise one finding at a time. Re-run the full rubric after each revision batch. Repeat until the rubric score is zero unresolved items or `max_iterations` is reached.
+After drafting the full spec, run the self-critique rubric below. Generate a finding list (each finding: criteria-group + detail + suggested-fix). Then revise one finding at a time. Re-run the full rubric after each revision batch. Repeat until the rubric score is zero unresolved items or `skills.max_iterations` is reached.
 
 ### Self-critique rubric for create-spec
 
 Score each item as PASS or FAIL. A FAIL is an unresolved item.
 
 **Structure (items 1-2)**
-1. **16 sections**: All 16 top-level sections from the kanon exemplar are present (Sections 0-15) or each absent section has an explicit "N/A -- reason" statement. FAIL if any section is missing without justification.
+1. **16 sections**: All 16 top-level sections from the canonical skeleton (Step 1b) are present (Sections 0-15) or each absent section has an explicit "N/A -- reason" statement. FAIL if any section is missing without justification.
 2. **Worked examples per goal**: Every goal in Section 2 has at least one worked operator example (concrete command + expected output). FAIL if any goal lacks a worked example.
 
 **Functional requirements (items 3-4)**
@@ -133,7 +142,7 @@ Score each item as PASS or FAIL. A FAIL is an unresolved item.
 7. **Resolved decisions**: Section 13 (Resolved decisions / interview record) captures every "we decided X because Y" call made during spec authoring, with alternatives considered. FAIL if any design call made during authoring is not recorded.
 8. **Out-of-scope section**: Section 12 (Out of scope) names every plausible adjacent ask not covered by this spec. FAIL if the section is absent or names fewer adjacent asks than were discussed during the operator question block.
 
-**Convergence protocol**: If the rubric score after revision is still > 0 and the loop count equals `max_iterations`, emit a [BLOCKED] comment:
+**Convergence protocol**: If the rubric score after revision is still > 0 and the loop count equals `skills.max_iterations`, emit a [BLOCKED] comment:
 
 ```
 [BLOCKED] create-spec iterate-until-perfect loop reached max_iterations=<N> without converging.
@@ -174,21 +183,19 @@ Confirm the write succeeded by reading back the first 20 lines:
 Read spec/<project-name>.md
 ```
 
-Emit the provenance audit comment naming the exact exemplar path read in Step 1 (per spec section 4.6.7 -- quality-bar mining provenance transparency):
+Emit the provenance audit comment naming the exemplar consulted in Step 1a. When `skills.exemplar_spec_path` was set and resolved, emit the resolved path; when it was absent, emit the literal token `<embedded-canonical-sections>` so the audit trail records that no external exemplar was consulted:
 
 ```
-[QUALITY_REFERENCE] <full path to kanon-list-add-lock-features-spec.md read in Step 1>
+[QUALITY_REFERENCE] <resolved-exemplar-path-or-embedded-canonical-sections>
 ```
 
-Example: `[QUALITY_REFERENCE] /workspaces/rpm-migration/kanon-deps-work/spec/kanon-list-add-lock-features-spec.md`
-
-This audit line is mandatory -- it records which quality reference was consulted so the orchestrator's audit trail captures provenance for every skill invocation that authors a SKILL.md.
+This audit line is mandatory -- it records what quality reference (workspace exemplar or embedded section list) was consulted so the orchestrator's audit trail captures provenance for every skill invocation that authors a spec.
 
 Then offer the spec-to-backlog handoff:
 
 > Spec written to `spec/<project-name>.md` (<line count> lines).
 >
-> Would you like me to invoke the `spec-to-backlog` skill now to decompose this spec into a BACKLOG.md + work-unit files? The skill will read this spec as input and produce a kanon-quality 4-level backlog hierarchy (Epic -> Feature -> Story -> Task).
+> Would you like me to invoke the `spec-to-backlog` skill now to decompose this spec into a BACKLOG.md + work-unit files? The skill will read this spec as input and produce a 4-level backlog hierarchy (Epic -> Feature -> Story -> Task).
 
 ---
 
@@ -198,6 +205,7 @@ Then offer the spec-to-backlog handoff:
 - **Target size**: 1000+ lines for non-trivial programs; smaller for minor features (a 200-line spec is appropriate for a single-feature change; a 50-line spec is always insufficient for a new subsystem)
 - **Quality gate**: rubric score must be zero unresolved items before the spec is written
 - **Handoff**: on operator consent, invoke the `spec-to-backlog` skill with this spec as input
+- **Provenance**: `[QUALITY_REFERENCE]` audit comment emitted on completion naming either the resolved workspace exemplar path or the literal `<embedded-canonical-sections>` token
 
 ---
 
@@ -216,7 +224,9 @@ zero unresolved items (success) or when the iteration budget is exhausted
   and exit success.
 - Otherwise increment the iteration in the checkpoint via
   `write_checkpoint("create-spec", state, workspace_root)` and continue.
-- When the iteration reaches `SKILL_MAX_ITERATIONS`, call
+- When the iteration reaches `skills.max_iterations` (from
+  `backlog/config/devbench.yaml`, falling back to `SKILL_MAX_ITERATIONS`),
+  call
   `emit_audit("create-spec", SKILL_AUDIT_MAX_ITERATIONS_REACHED, {"unresolved": ...}, workspace_root)`
   and exit non-zero so the orchestrator surfaces the unresolved items for
   operator review.

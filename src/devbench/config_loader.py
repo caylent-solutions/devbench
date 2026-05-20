@@ -110,6 +110,10 @@ _VALID_DEFAULT_STATUSES: frozenset[str] = frozenset({STATUS_IN_QUEUE, STATUS_DRA
 _BACKLOG_DEFAULT_BULK_UPDATE_CONFIRM_THRESHOLD: int = 10
 _BACKLOG_DEFAULT_BULK_UPDATE_AUDIT_PATH: str = "logs/bulk-updates.log"
 
+# Skills plugin configuration defaults (issue #221 E1-E10).
+_SKILLS_DEFAULT_FAN_OUT_THRESHOLD: int = 10
+_SKILLS_DEFAULT_MAX_ITERATIONS: int = 5
+
 # ---------------------------------------------------------------------------
 # Audit-row string constants for auto_finalize / auto_merge skill steps.
 # Pinned here so SKILL.md prose and tests reference the same literals.
@@ -543,6 +547,76 @@ class BacklogConfig:
     default_status_for_new_work_units: str = _BACKLOG_DEFAULT_STATUS
     bulk_update_confirm_threshold: int = _BACKLOG_DEFAULT_BULK_UPDATE_CONFIRM_THRESHOLD
     bulk_update_audit_path: str = _BACKLOG_DEFAULT_BULK_UPDATE_AUDIT_PATH
+
+
+@dataclass
+class SkillsConfig:
+    """Plugin-skill configuration loaded from the ``skills:`` YAML section.
+
+    Controls how the bundled spec-to-backlog and create-spec skills resolve
+    operator-facing knobs (exemplar paths, fan-out and iteration budgets).
+    Every field is optional; when a workspace omits the section entirely
+    each skill falls back to defaults baked into its SKILL.md prompt.
+
+    Attributes:
+        exemplar_backlog_path: Absolute or workspace-relative path to a
+            representative ``BACKLOG.md`` the ``spec-to-backlog`` skill
+            consults to internalise the project's quality bar. ``None``
+            (the default) means the skill uses the canonical-section list
+            embedded in its prompt as the sole quality reference (issue
+            #221 E1).
+        exemplar_spec_path: Absolute or workspace-relative path to a
+            representative spec file the ``create-spec`` skill consults
+            for its quality bar. ``None`` falls back to the 16-section
+            structural skeleton embedded in the prompt (E2).
+        fan_out_threshold: When the Epic decomposition produces strictly
+            more than this many leaf tasks, the spec-to-backlog skill
+            fans the per-task authoring out across one sub-Agent per
+            Feature instead of writing tasks serially. Defaults to 10.
+        max_iterations: Maximum self-critique iterations per skill
+            invocation before emitting a ``[SKILL_MAX_ITERATIONS_REACHED]``
+            audit comment with the unresolved rubric items. Defaults to 5.
+    """
+
+    exemplar_backlog_path: str | None = None
+    exemplar_spec_path: str | None = None
+    fan_out_threshold: int = _SKILLS_DEFAULT_FAN_OUT_THRESHOLD
+    max_iterations: int = _SKILLS_DEFAULT_MAX_ITERATIONS
+
+
+def _parse_skills_config(path: Path, skills_raw: dict) -> SkillsConfig:
+    """Parse and validate the ``skills:`` YAML section into a ``SkillsConfig``.
+
+    Args:
+        path: Config file path (used in error messages).
+        skills_raw: Raw ``skills`` dict from YAML (already schema-validated
+            for unknown keys and types). May be an empty dict when the
+            section is absent.
+
+    Returns:
+        ``SkillsConfig`` populated from *skills_raw*.
+
+    Raises:
+        ValueError: If ``fan_out_threshold`` or ``max_iterations`` is
+            present but not a positive integer (the schema enforces
+            ``minimum: 1``; this is the defensive runtime re-check).
+    """
+    exemplar_backlog = skills_raw.get("exemplar_backlog_path") or None
+    exemplar_spec = skills_raw.get("exemplar_spec_path") or None
+    fan_out_raw = skills_raw.get("fan_out_threshold", _SKILLS_DEFAULT_FAN_OUT_THRESHOLD)
+    max_iter_raw = skills_raw.get("max_iterations", _SKILLS_DEFAULT_MAX_ITERATIONS)
+    fan_out = int(fan_out_raw)
+    if fan_out < 1:
+        raise ValueError(f"Config file '{path}': skills.fan_out_threshold must be >= 1; got {fan_out_raw!r}.")
+    max_iter = int(max_iter_raw)
+    if max_iter < 1:
+        raise ValueError(f"Config file '{path}': skills.max_iterations must be >= 1; got {max_iter_raw!r}.")
+    return SkillsConfig(
+        exemplar_backlog_path=str(exemplar_backlog) if exemplar_backlog else None,
+        exemplar_spec_path=str(exemplar_spec) if exemplar_spec else None,
+        fan_out_threshold=fan_out,
+        max_iterations=max_iter,
+    )
 
 
 def _parse_backlog_config(path: Path, backlog_raw: dict) -> BacklogConfig:
@@ -1215,6 +1289,7 @@ class RuntimeConfig:
     hook_tail: HookTailConfig = field(default_factory=HookTailConfig)
     orchestrate: OrchestrateConfig = field(default_factory=OrchestrateConfig)
     backlog: BacklogConfig = field(default_factory=BacklogConfig)
+    skills: SkillsConfig = field(default_factory=SkillsConfig)
     manifest_amendment: AmendmentConfig = field(default_factory=AmendmentConfig)
     task_factory: TaskFactoryConfig = field(default_factory=TaskFactoryConfig)
     agent_models: AgentModelsConfig = field(default_factory=AgentModelsConfig)
@@ -1678,6 +1753,12 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
     backlog_raw = raw.get("backlog") or {}
     backlog = _parse_backlog_config(path, backlog_raw)
 
+    # Populate SkillsConfig from YAML skills block (issue #221 E1-E10).
+    # JSON Schema validates types + minimums; _parse_skills_config
+    # re-validates at runtime to emit clearer messages naming the field.
+    skills_raw = raw.get("skills") or {}
+    skills = _parse_skills_config(path, skills_raw)
+
     # Populate QuotaHandlingConfig from YAML quota_handling block (spec 4.5.6).
     # JSON Schema validation enforces enum values, integer/float ranges, and
     # additionalProperties: false before this call; _parse_quota_handling_config
@@ -1701,6 +1782,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         hook_tail=hook_tail,
         orchestrate=orchestrate,
         backlog=backlog,
+        skills=skills,
         manifest_amendment=manifest_amendment,
         task_factory=task_factory,
         agent_models=agent_models,

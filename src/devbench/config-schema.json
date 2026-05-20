@@ -454,6 +454,31 @@
         }
       }
     },
+    "skills": {
+      "type": "object",
+      "description": "Plugin-skill (spec-to-backlog, create-spec) operator-facing configuration. Lets operators point the skills at their own workspace exemplars (a representative backlog and a representative spec) rather than a hardcoded built-in path, plus tune the fan-out and iteration budget. All fields are optional; absent values fall through to skill-side defaults (issue #221 E1-E10).",
+      "additionalProperties": false,
+      "properties": {
+        "exemplar_backlog_path": {
+          "type": "string",
+          "description": "Absolute or workspace-relative path to a representative BACKLOG.md the spec-to-backlog skill consults to internalise the project's quality bar. Optional; when absent the skill falls back to the canonical-section list embedded in its prompt rather than reading any exemplar file. Operators set this when they have a richer in-workspace exemplar than the embedded section list."
+        },
+        "exemplar_spec_path": {
+          "type": "string",
+          "description": "Absolute or workspace-relative path to a representative spec file the create-spec skill consults to internalise the project's quality bar. Optional; when absent the skill falls back to the 16-section structural skeleton embedded in its prompt rather than reading any exemplar file."
+        },
+        "fan_out_threshold": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "When the Epic decomposition yields more than this many leaf tasks, the spec-to-backlog skill fans the per-task authoring out across one Agent invocation per Feature instead of writing tasks serially. Default 10. Set higher to keep the work serial on small workspaces; set lower to fan out aggressively on large ones."
+        },
+        "max_iterations": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum self-critique iterations per skill invocation. When exceeded, the skill emits a [SKILL_MAX_ITERATIONS_REACHED] audit comment with the unresolved rubric items instead of silently shipping a sub-quality artefact. Default 5."
+        }
+      }
+    },
     "notifications": {
       "type": "object",
       "description": "Operator-facing notifications fired on lifecycle events. Each event under 'events' is independently toggled. Each notification endpoint (Slack today; Discord/Teams/etc. later) lives in its own nested sub-block so new transports can be added without touching the event-toggle surface. See docs/slack-notifications.md.",

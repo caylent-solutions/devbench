@@ -358,16 +358,18 @@ class TestCreateSpecIndependentInvocation:
 
     _SKILL_NAME = "create-spec"
 
-    def test_skill_input_contract_references_kanon_exemplar(self) -> None:
-        """create-spec SKILL.md must reference the kanon exemplar as Step 1 input.
-
-        The kanon exemplar is the only pre-existing input required by create-spec.
-        When this path is present, the skill is fully invocable in isolation.
-        """
+    def test_skill_input_contract_references_configurable_exemplar(self) -> None:
+        """create-spec SKILL.md must reference the configurable ``skills.exemplar_spec_path``
+        as its optional Step 1 input (issue #221 E1-E10: skill is application-agnostic and
+        has no hardcoded exemplar input)."""
         content = _read_skill_md(self._SKILL_NAME)
-        assert "kanon-list-add-lock-features-spec.md" in content, (
-            f"{self._SKILL_NAME} SKILL.md must reference the kanon exemplar path as its Step 1 input. "
-            "This is the only pre-existing file required for standalone invocation."
+        assert "skills.exemplar_spec_path" in content, (
+            f"{self._SKILL_NAME} SKILL.md must reference 'skills.exemplar_spec_path' as the "
+            "configurable optional Step 1 input -- the skill is application-agnostic and "
+            "must not hardcode any exemplar path."
+        )
+        assert "kanon-list-add-lock-features-spec.md" not in content, (
+            f"{self._SKILL_NAME} SKILL.md must NOT contain the literal kanon exemplar filename (issue #221 E1-E10)."
         )
 
     def test_skill_output_contract_specifies_spec_path(self) -> None:
@@ -415,18 +417,20 @@ class TestCreateSpecIndependentInvocation:
             "it is the first skill in the chain and must be invocable without prior skill output"
         )
 
-    def test_skill_does_not_require_devbench_yaml_input(self) -> None:
-        """create-spec SKILL.md Step 1 must NOT mandate devbench.yaml as a precondition.
+    def test_skill_step_1_makes_devbench_yaml_optional(self) -> None:
+        """create-spec SKILL.md Step 1 references devbench.yaml only as an OPTIONAL exemplar
+        lookup, not as a precondition (issue #221 E1-E10).
 
-        Allowing create-spec to run without a configured devbench.yaml enables the
-        canonical onboarding flow where spec authoring precedes configuration.
-        Step 1 reads the kanon exemplar, not devbench.yaml -- the file must not
-        appear as a required precondition in the first step.
+        Step 1a reads ``backlog/config/devbench.yaml`` to discover ``skills.exemplar_spec_path``,
+        but the SKILL.md must explicitly state that an absent key or absent file is fine: the
+        skill falls back to the embedded 16-section skeleton. So Step 1 may MENTION devbench.yaml
+        but must not REQUIRE it as a precondition.
         """
         step1_content = _extract_step_content(self._SKILL_NAME, 1)
-        assert "devbench.yaml" not in step1_content, (
-            f"{self._SKILL_NAME} SKILL.md Step 1 must not mandate 'devbench.yaml' as a precondition. "
-            "create-spec must be invocable before configure-devbench has run. "
+        assert "absent" in step1_content.lower() and "skip" in step1_content.lower(), (
+            f"{self._SKILL_NAME} SKILL.md Step 1 must explicitly describe what happens when "
+            "skills.exemplar_spec_path is absent (skip the read; the embedded 16-section "
+            "skeleton is sufficient). "
             f"Step 1 content:\n{step1_content}"
         )
 

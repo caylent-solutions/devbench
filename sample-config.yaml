@@ -275,6 +275,37 @@ validate:
   check_orphan_path_tokens: false
 
 # ---------------------------------------------------------------------------
+# Plugin-skill (spec-to-backlog, create-spec) configuration (issue #221
+# E1-E10). The bundled skills are application-agnostic: by default they
+# operate against the canonical-section list embedded in their SKILL.md
+# prompts. Operators can additionally point them at a workspace-local
+# exemplar for richer wording and shape, plus tune the fan-out and
+# iteration budgets. All fields are optional; absent values fall through
+# to skill-side defaults. See docs/skills/exemplar-reference.md.
+# ---------------------------------------------------------------------------
+skills:
+  # Optional workspace-relative or absolute path to a representative
+  # BACKLOG.md the spec-to-backlog skill consults to internalise the
+  # project's quality bar. Absent => skill uses only the embedded
+  # 15-section list.
+  # exemplar_backlog_path: backlog/_exemplars/representative/BACKLOG.md
+  #
+  # Optional workspace-relative or absolute path to a representative
+  # spec the create-spec skill consults. Absent => skill uses only the
+  # embedded 16-section skeleton.
+  # exemplar_spec_path: spec/_exemplars/representative.md
+  #
+  # When the Epic decomposition yields more than this many leaf tasks,
+  # spec-to-backlog fans the per-task authoring out across one
+  # general-purpose sub-Agent per Feature instead of writing tasks
+  # serially. Default 10.
+  fan_out_threshold: 10
+  #
+  # Maximum self-critique iterations per skill invocation before
+  # emitting a [SKILL_MAX_ITERATIONS_REACHED] audit comment. Default 5.
+  max_iterations: 5
+
+# ---------------------------------------------------------------------------
 # Per-agent model overrides (ADR-25). Every field defaults to null -- the
 # agent runs on the model declared in its .md frontmatter. Operators set
 # these to manage Sonnet / Opus / Bedrock quota independently when a launch's

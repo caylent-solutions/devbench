@@ -5009,3 +5009,99 @@ class TestRollupParentTicksCheckboxes:
         assert "## Status: done" in story_result
         assert f"- [x] AC-FUNC-001: story criterion {_GREEN_CHECK}" in story_result
         assert f"- [x] All tasks complete. {_GREEN_CHECK}" in story_result
+
+
+# ---------------------------------------------------------------------------
+# Issue #221 B2: bare ``.md`` extension in AC prose MUST NOT be flagged
+# ---------------------------------------------------------------------------
+
+
+class TestBareMdExtensionNotOrphan:
+    """Issue #221 B2: bare ``.md`` (the extension only) in prose isn't a path.
+
+    Prose like "only ``.md`` files modified" or "the work-unit ``.md``
+    file" backticks the extension itself for emphasis. The orphan-path
+    rule must not flag this 3-char string as a path; only tokens with
+    a real filename stem or a directory separator qualify.
+    """
+
+    H = _ValidateRuleHarness
+
+    @staticmethod
+    def _runtime_with_rule_on(repo: str) -> RuntimeConfig:
+        return RuntimeConfig(
+            repos={repo: RepoConfig(checkout_directory=None)},
+            validate=ValidateConfig(check_orphan_path_tokens=True),
+        )
+
+    def test_bare_md_in_ac_not_flagged(self, tmp_path: Path, backlog_dir: Path) -> None:
+        repo = "ex/foo"
+        TestValidateNoOrphanPathTokens._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `src/real.py` | new |\n| `tests/unit/test_real.py` | new |\n",
+            "- [ ] AC-FUNC-001: only `.md` files modified in this task.",
+        )
+        TestBareMdExtensionNotOrphan.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        with patch("devbench.config.RUNTIME_CONFIG", self._runtime_with_rule_on(repo)):
+            errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        orphans = [e for e in errors if "orphan path" in e]
+        assert not orphans, f"bare `.md` should not be flagged; got: {orphans}"
+
+    def test_real_md_path_still_flagged(self, tmp_path: Path, backlog_dir: Path) -> None:
+        # Sanity: a real `.md` path (with stem) is still flagged as expected.
+        repo = "ex/foo"
+        TestValidateNoOrphanPathTokens._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `src/real.py` | new |\n| `tests/unit/test_real.py` | new |\n",
+            "- [ ] AC-FUNC-001: `docs/imaginary.md` updated.",
+        )
+        TestBareMdExtensionNotOrphan.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        with patch("devbench.config.RUNTIME_CONFIG", self._runtime_with_rule_on(repo)):
+            errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        orphans = [e for e in errors if "orphan path" in e and "docs/imaginary.md" in e]
+        assert len(orphans) == 1
+
+
+# ---------------------------------------------------------------------------
+# Issue #221 B3: sentinel values are exempt from path-based rules
+# ---------------------------------------------------------------------------
+
+
+class TestSentinelManifestExemption:
+    """Issue #221 B3: ``<verification-only>`` etc. are NOT real Manifest paths.
+
+    Two tasks both claiming ``<verification-only>`` must NOT trigger
+    the Manifest Conflict Rule. A decision-only task whose Manifest is
+    ``<decision-only>`` must NOT trigger source-test atomicity.
+    """
+
+    def test_sentinel_not_real_manifest_path(self) -> None:
+        from devbench.backlog.manager import BacklogManager
+
+        assert BacklogManager._is_real_manifest_path("<verification-only>") is False
+        assert BacklogManager._is_real_manifest_path("<decision-only>") is False
+        assert BacklogManager._is_real_manifest_path("<no-op>") is False
+        assert BacklogManager._is_real_manifest_path("<no changes>") is False
+        assert BacklogManager._is_real_manifest_path("<verification-only:E15-F5-S1-T2>") is False
+        # Real path with angle brackets in surrounding prose-style is still real.
+        assert BacklogManager._is_real_manifest_path("src/foo.py") is True
+        # Sentinel-shaped but with leading/trailing whitespace still recognised.
+        assert BacklogManager._is_real_manifest_path("  <verification-only>  ") is False
+
+    def test_placeholder_paren_form_still_filtered(self) -> None:
+        # The pre-existing ``(none)`` / ``(no file changes; ...)`` placeholder
+        # form must continue to be filtered out alongside sentinels.
+        from devbench.backlog.manager import BacklogManager
+
+        assert BacklogManager._is_real_manifest_path("(none)") is False
+        assert BacklogManager._is_real_manifest_path("(no file changes; documentation only)") is False

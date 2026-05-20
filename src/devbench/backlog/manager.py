@@ -1719,12 +1719,19 @@ class BacklogManager:
 
         Filters out placeholder strings like ``(none)``, ``(no file changes;
         ...)``, etc. that documentation-only or verification-only tasks use to
-        indicate an empty Manifest.
+        indicate an empty Manifest. Also filters out sentinel values like
+        ``<verification-only>``, ``<decision-only>``, and any
+        ``<name>``-shaped variant -- see ``devbench.backlog.sentinels`` for
+        the canonical allowlist + pattern + rationale.
         """
+        from devbench.backlog.sentinels import is_sentinel_manifest_value
+
         if not path:
             return False
         stripped = path.strip()
-        return not (stripped.startswith("(") and stripped.endswith(")"))
+        if stripped.startswith("(") and stripped.endswith(")"):
+            return False
+        return not is_sentinel_manifest_value(stripped)
 
     def _check_manifest_conflicts(
         self,
@@ -2262,12 +2269,23 @@ class BacklogManager:
         prefix, or starting with a directory prefix observed anywhere in
         the Task's parsed Manifest. Uses no domain knowledge -- the
         prefix and extension lists are static.
+
+        Bare extensions like ``.md`` (3 chars, no filename stem, no
+        directory) appear in prose like "only ``.md`` files modified" and
+        are NOT path references. Tokens that end in a known extension
+        must have either a ``/`` separator OR at least one alphanumeric
+        character in the stem to qualify as a path.
         """
         if not token or token.startswith("-") or "=" in token or "*" in token or "://" in token:
             return False
         lower = token.lower()
-        if any(lower.endswith(ext) for ext in cls._ORPHAN_PATH_EXTS):
-            return True
+        for ext in cls._ORPHAN_PATH_EXTS:
+            if lower.endswith(ext):
+                stem = token[: -len(ext)]
+                # Require a directory separator OR a real filename stem.
+                # Bare ``.md`` / ``.py`` / etc. (literal extension in prose)
+                # have an empty stem and MUST NOT be treated as paths.
+                return "/" in stem or bool(stem and any(c.isalnum() for c in stem))
         if any(token.startswith(p) for p in cls._ORPHAN_KNOWN_PREFIXES):
             return True
         return any(token.startswith(prefix) for prefix in manifest_dir_prefixes)

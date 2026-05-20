@@ -300,6 +300,36 @@ All sections below are required unless noted as optional.
 | `tests/test_bar.py` | New -- unit tests |
 | `README.md` | Updated -- architecture section |
 
+#### Sentinel Manifest Values (issue #221 B3)
+
+For tasks that produce no concrete file changes -- verification gates,
+decision-only tasks, audit-flip tasks -- the Changes Manifest may use
+one of the accepted sentinel values in place of a real path. Sentinels
+are exempt from the Manifest Conflict Rule, the source-test atomicity
+rule, and the orphan-path-token rule.
+
+Accepted sentinel values (canonical list in
+`src/devbench/backlog/sentinels.py`):
+
+| Sentinel | Semantics |
+|----------|-----------|
+| `<verification-only>` | The task runs a verification step (test, lint, scan) and records evidence in `## Comments`. No source files are modified. |
+| `<decision-only>` | The task makes a decision and records it in `## Comments`. No source files are modified. Typically paired with a follow-up task that executes the decision. |
+| `<no changes>` | The task is a placeholder or audit-flip with no executor work. Rare. |
+| `<no-op>` | The task collapses to a no-op based on prior-task outcomes. Conditional cleanup tasks use this. |
+| `<source-drift-fix-targets-determined-at-execution>` | The task's concrete file list is enumerated at execution time via `manifest_amendment`. Acceptable when the surface depends on diagnostics that haven't run yet. |
+
+Additionally, **any** token shaped as ``<name>`` (single ``<``,
+no whitespace, single ``>``) is treated as a sentinel by the
+``SENTINEL_PATTERN`` regex in ``sentinels.py``. This lets operators
+introduce per-task variants like ``<verification-only:E15-F5-S1-T2>``
+without round-tripping through the validator. Use the explicit
+allowlist when possible; the pattern is a fallback for ad-hoc cases.
+
+When a task uses a sentinel Manifest, the orchestrator's
+``manifest_amendment`` workflow can replace it with concrete paths
+mid-execution if real changes turn out to be required.
+
 ## Definition of Done
 
 - [ ] All ACs checked

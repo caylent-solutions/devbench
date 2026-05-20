@@ -444,3 +444,63 @@ class TestAssertStagedMatchesManifest:
         assert "TRACE_FILE" in msg
         # src/a.py appears in the "Manifest declares" list but not in the offender list
         assert "staged file(s) not in Changes Manifest: ['TRACE_FILE']" in msg
+
+
+# ---------------------------------------------------------------------------
+# Issue #221 B1: markdown-escaped pipes inside cells are literal pipes
+# ---------------------------------------------------------------------------
+
+
+class TestMarkdownPipeEscapes:
+    """Issue #221 B1: parser must honour ``\\|`` inside Manifest cells.
+
+    Manifest descriptions sometimes reference shell pipelines or other
+    prose that contains a literal pipe. Authors write such pipes as
+    ``\\|`` (markdown-escape form). The parser must split rows on
+    unescaped pipes only and restore ``\\|`` to ``|`` in each cell.
+    """
+
+    def test_escaped_pipe_in_change_cell_treated_as_literal(self) -> None:
+        content = (
+            "# T1: Verify completion script\n\n"
+            "## Changes Manifest\n\n"
+            "| File | Change |\n"
+            "|------|--------|\n"
+            "| `tests/fixtures/completion/expected.sh` | "
+            "run `my-cmd output \\| grep -v debug` and verify byte-for-byte match |\n\n"
+            "## Definition of Done\n"
+        )
+        rows = parse_manifest(content)
+        assert len(rows) == 1
+        assert rows[0].file == "tests/fixtures/completion/expected.sh"
+        assert "my-cmd output | grep -v debug" in rows[0].change
+
+    def test_multiple_escaped_pipes_in_one_cell(self) -> None:
+        content = (
+            "## Changes Manifest\n\n"
+            "| File | Change |\n"
+            "|------|--------|\n"
+            "| `a/b.sh` | run a \\| b \\| c three-stage pipeline |\n\n"
+            "## End\n"
+        )
+        rows = parse_manifest(content)
+        assert len(rows) == 1
+        assert rows[0].change == "run a | b | c three-stage pipeline"
+
+    def test_unescaped_extra_pipe_still_raises(self) -> None:
+        content = "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `a.py` | one | two |\n\n## End\n"
+        with pytest.raises(ManifestParseError) as exc:
+            parse_manifest(content)
+        assert "exactly 2 columns" in str(exc.value)
+
+    def test_escaped_pipe_in_file_cell_preserves_pipe(self) -> None:
+        content = "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `a \\| b` | change |\n\n## End\n"
+        rows = parse_manifest(content)
+        assert len(rows) == 1
+        assert rows[0].file == "a | b"
+
+    def test_no_pipe_no_change_in_behaviour(self) -> None:
+        rows = parse_manifest(SAMPLE_ONE_ROW)
+        assert len(rows) == 1
+        assert rows[0].file == "src/example/parser.py"
+        assert rows[0].change == "add feature"

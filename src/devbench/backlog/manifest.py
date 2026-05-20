@@ -189,13 +189,20 @@ def append_rows(content: str, new_rows: list[ManifestRow]) -> str:
 
 
 def _parse_body(body: str) -> list[ManifestRow]:
-    """Parse the body of the Changes Manifest section into typed rows."""
+    """Parse the body of the Changes Manifest section into typed rows.
+
+    Honours markdown-style pipe escapes inside cells: a ``\\|`` sequence
+    is treated as a literal pipe within a cell, not as a cell separator.
+    This lets Manifest descriptions reference command-line examples like
+    ``my-cmd output \\| grep -v debug`` (or any prose that names a
+    pipe) without breaking the parser's 2-column invariant.
+    """
     rows: list[ManifestRow] = []
     for raw_line in body.splitlines():
         line = raw_line.strip()
         if not line or not line.startswith("|"):
             continue
-        cells = [c.strip() for c in line.strip("|").split("|")]
+        cells = _split_cells_honouring_escapes(line)
         if _is_header_row(cells) or _is_separator_row(cells):
             continue
         if len(cells) != 2:
@@ -207,6 +214,25 @@ def _parse_body(body: str) -> list[ManifestRow]:
         except ValueError as exc:
             raise ManifestParseError(f"Invalid manifest row {line!r}: {exc}") from exc
     return rows
+
+
+# Sentinel byte that cannot occur naturally in Markdown source. Used by
+# ``_split_cells_honouring_escapes`` to temporarily replace markdown-escaped
+# pipes (``\\|``) so the line can be split on unescaped pipes via
+# ``str.split`` without a regex-based tokenizer.
+_ESC_PIPE_SENTINEL = "\x00ESC_PIPE\x00"
+
+
+def _split_cells_honouring_escapes(line: str) -> list[str]:
+    """Split a Manifest table row on unescaped pipes; preserve ``\\|`` literal.
+
+    The line is split on ``|`` as separators, but any backslash-escaped
+    pipe (``\\|``) inside a cell is treated as a literal pipe and does
+    NOT split. After splitting, each cell's literal pipes are restored.
+    """
+    protected = line.replace("\\|", _ESC_PIPE_SENTINEL)
+    raw_cells = protected.strip("|").split("|")
+    return [c.strip().replace(_ESC_PIPE_SENTINEL, "|") for c in raw_cells]
 
 
 def _is_header_row(cells: list[str]) -> bool:

@@ -10,6 +10,31 @@ configuration refactor, the EC2 remote-dev provisioning stack, and the
 work-unit lifecycle / authoring CLI improvements that have accumulated
 since the last release. PR #119 carries every change.
 
+### Fixed
+
+- **Manifest parser honours markdown-escaped pipes** (issue #221 B1).
+  ``_parse_body`` now treats ``\|`` as a literal pipe inside Changes
+  Manifest cells, so prose like ``run cmd output \| grep -v debug`` no
+  longer triggers ``ManifestParseError: Manifest row must have exactly
+  2 columns``. Genuine 3-column rows (no backslash) still raise.
+- **Bare ``.md`` extension is no longer a path token** (issue #221 B2).
+  Rule 20 (orphan path) used to flag prose like "only ``.md`` files
+  modified" because the 3-char string ends in a known extension.
+  ``_is_path_shaped`` now requires a filename stem or directory
+  separator before treating a token as a path; bare extensions in
+  prose pass through. Real paths (``docs/foo.md``) are still flagged.
+- **Sentinel Manifest values are exempt from path-based rules** (issue
+  #221 B3). New ``devbench.backlog.sentinels`` module enumerates the
+  accepted Manifest sentinel values (``<verification-only>``,
+  ``<decision-only>``, ``<no changes>``, ``<no-op>``,
+  ``<source-drift-fix-targets-determined-at-execution>``) plus the
+  ``<name>``-pattern that catches operator-defined variants. These
+  values are no longer treated as "real paths", so multiple tasks
+  declaring the same sentinel don't trigger spurious Manifest Conflict
+  Rule violations, decision-only tasks don't trigger source-test
+  atomicity, and AC prose mentioning ``<verification-only>`` doesn't
+  trigger orphan-path detection.
+
 ### Added
 
 - **Daemon mode + lifecycle CLI (`start --daemon`, `instances`, `stop`,

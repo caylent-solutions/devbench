@@ -291,6 +291,7 @@ class BacklogManager:
             rows = self._parse_backlog_rows(backlog_index)
         self._check_task_content(rows, workspace_root, errors)
         self._check_manifest_path_prefixes(rows, workspace_root, errors)
+        self._check_no_glob_in_manifest(rows, workspace_root, errors)
         self._check_manifest_conflicts(rows, workspace_root, errors)
         self._check_language_ac_alignment(rows, workspace_root, errors)
         self._check_source_test_pairs(rows, workspace_root, errors)
@@ -1927,6 +1928,56 @@ class BacklogManager:
                     f"per docs/acceptance-criteria-canonical.md."
                 )
 
+    def _check_no_glob_in_manifest(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """Issue #221 B4: reject Manifest entries containing ``*`` or ``**`` globs.
+
+        Globs in a Changes Manifest produce confusing downstream errors -- the
+        source-test atomicity rule, the path-prefix rule, and the conflict
+        detector all treat the glob as a literal path and emit misleading
+        diagnostics. Manifest paths must be concrete; tasks whose actual file
+        list is determined at execution time should either (a) use a sentinel
+        value like ``<source-drift-fix-targets-determined-at-execution>``
+        (see ``devbench.backlog.sentinels``), or (b) declare the canonical
+        candidates and rely on ``manifest_amendment`` to amend the Manifest
+        at runtime when the surface is known.
+        """
+        from devbench.backlog.manifest import ManifestParseError, parse_manifest
+        from devbench.backlog.sentinels import is_sentinel_manifest_value
+
+        for row_id, _, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not file_path_str or not self._is_task_id(row_id):
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.exists():
+                continue
+            content = wu_path.read_text(encoding="utf-8")
+            try:
+                manifest_rows = parse_manifest(content)
+            except ManifestParseError:
+                continue
+            for manifest_row in manifest_rows:
+                path = manifest_row.file
+                if is_sentinel_manifest_value(path):
+                    continue
+                if "*" in path:
+                    errors.append(
+                        f"{row_id}: Manifest entry {path!r} contains a glob "
+                        f"pattern. Manifest paths must be concrete; for "
+                        f"execution-determined file lists, use a sentinel "
+                        f"value (e.g., "
+                        f"`<source-drift-fix-targets-determined-at-execution>`) "
+                        f"and amend the Manifest at runtime via "
+                        f"`manifest_amendment`. See "
+                        f"docs/backlog-contract.md 'Manifest Glob Rejection'."
+                    )
+
     def _check_source_test_pairs(
         self,
         rows: list[tuple[str, str, str]],
@@ -1934,6 +1985,13 @@ class BacklogManager:
         errors: list[str],
     ) -> None:
         """Check 14: every production-source .py file in a Manifest needs a matching test entry.
+
+        Source-test atomicity (Update vs Add): an ``Update`` annotation on
+        an EXISTING ``tests/<...>/test_<basename>.py`` file satisfies the
+        rule the same way an ``Add`` annotation does. The rule asserts
+        only that the test file appears in the Manifest -- whether the
+        executor creates it or augments it is a per-task implementation
+        detail. See ``docs/source-test-atomicity.md`` for a worked example.
 
         Per docs/source-test-atomicity.md, splitting source and test across
         sibling tasks causes AC-FINAL-014 (100% coverage) to fail in the

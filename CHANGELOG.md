@@ -76,6 +76,32 @@ since the last release. PR #119 carries every change.
 
 ### Added
 
+- **`spec-to-backlog` append-mode `BACKLOG.md` regeneration**
+  (issue #225). Materialising a new spec on top of an existing
+  populated backlog (E17+ on top of E1-E16) previously required the
+  operator to merge `BACKLOG.md` by hand because Step 6 of the
+  skill rewrote the file from scratch. The new
+  `regenerate_backlog_index` post-processor pass appends new epic
+  rows to the Status Summary table and new work-unit rows to the
+  Full Work Unit Index; existing rows are byte-for-byte preserved.
+  When a new epic ID collides with an existing index row at a
+  different file path the pass raises
+  `BacklogAppendCollisionError` (fail-fast). Greenfield invocations
+  fall back to the skill's existing write path.
+
+- **Code Standards block templater** (issue #230). The
+  `spec-to-backlog` skill no longer needs to re-type the ~50-line
+  `### Code Standards` block per task. A new
+  `devbench.plugin_helpers.code_standards_template.emit_code_standards_block`
+  helper emits the canonical block with three placeholder
+  substitutions (`<WORKSPACE_CLAUDE_MD>`,
+  `<TASK_SPECIFIC_ERROR_PATHS>`, `<REPO_CARVE_OUTS>`). Workspaces
+  override the default body by placing
+  `code-standards-canonical.md` at the workspace root. The
+  companion `verify_code_standards_canonical` post-processor pass
+  reports the count of tasks whose Code Standards block has drifted
+  (check-only; does NOT mutate). See `docs/code-standards-canonical.md`.
+
 - **`devbench report --by-role` per-role token/cost breakdown panel**
   (issue #206). Wires the data path landed in PR #202 (issue #123 via
   ``_parse_transcript_metrics_by_role``) into the rendered output of
@@ -235,6 +261,49 @@ since the last release. PR #119 carries every change.
     resolution-order and provenance contract.
 
 ### Fixed
+
+- **`backlog_post_processor` scope + terminal-status guards**
+  (issue #226). Materialising a new spec on top of an existing
+  populated backlog could silently mutate already-done work units
+  because every pass walked the full backlog tree. Every pass now
+  accepts an optional `scope_paths=[...]` argument that confines
+  the walk to the supplied epic directories, AND defaults to
+  skipping any file with `## Status: done` or `## Status: declined`
+  (terminal-status guard). The `force_terminal=True` override
+  remains available for one-time mass migrations.
+
+- **`spec-to-backlog` Changes Manifest column-format pinning +
+  normaliser** (issue #227). The skill prompt now explicitly
+  mandates the 2-column `| File | Change |` form (`parse_manifest`
+  rejects any other column count). The new
+  `normalize_manifest_column_count` post-processor pass collapses
+  N-column variants (`| Repo | Path | Action |`,
+  `| File | Change | Notes |`, 4-column variants) to the canonical
+  form losslessly: when `header[0]` is `Repo`, columns 0+1 merge
+  into the File cell as `repo -- path` and column 2+ joins into
+  Change with ` -- `.
+
+- **`spec-to-backlog` AC-FINAL N/A tier-suffix auto-fixup**
+  (issue #228). The validator's Rule 13 requires Python-tooling
+  AC-FINAL lines (002 ruff format, 003 ruff check, 004 mypy, 005
+  pytest tier, 006 pytest other tier, 008 bandit, 014 coverage) to
+  carry an explicit `-- N/A for <Tier> Tasks (no Python source
+  authored)` suffix on tasks whose Changes Manifest contains zero
+  `.py` paths. The skill prompt's Step 5b rubric now mandates this,
+  and the new `suffix_na_on_non_python_tasks` post-processor pass
+  appends the suffix deterministically when missing.
+
+- **`spec-to-backlog` prompt drift from validator** (issue #229).
+  Three sub-drifts resolved: Step 1b item 2 (Status) now explicitly
+  pins the constraint that `draft` is only valid for Task work
+  units (`_check_status_enum` rejects `draft` on Epic / Feature /
+  Story); Step 5a now mandates the canonical dep-ID regex
+  `E\d+(-F\d+)?(-S\d+)?(-T\d+)?` and forbids directory-slug forms
+  (`E16-test-cleanup`); Step 6 Status Summary count semantics now
+  match what the validator's `_compute_epic_counts` does (Features
+  + Stories + Tasks under the Epic; the Epic file itself is NOT
+  counted). The new `normalize_dep_ids` post-processor pass
+  rewrites slug-form dep IDs to canonical form when found.
 
 - **`devbench` exits cleanly when a required env var is missing**
   (issue #221 B7). The two import-time required env vars

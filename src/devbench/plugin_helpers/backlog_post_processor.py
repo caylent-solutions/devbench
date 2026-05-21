@@ -621,6 +621,156 @@ _TASK_ID_RE = re.compile(r"^E\d+-F\d+-S\d+-T\d+$")
 _AC_CHECKBOX_RE = re.compile(r"^(\s*- \[[ xX]\] )(AC-FINAL-\d{3})\b(.*)$")
 
 
+# Regex matching the canonical task-ID form ``E<n>[-F<n>][-S<n>][-T<n>]``.
+# Used by ``normalize_dep_ids`` to strip slug-suffix material after the
+# canonical prefix when the operator wrote ``E16-test-cleanup`` instead
+# of the bare canonical ``E16``.
+_CANONICAL_ID_PREFIX_RE = re.compile(r"^(E\d+(?:-F\d+(?:-S\d+(?:-T\d+)?)?)?)")
+
+
+def normalize_dep_ids(
+    backlog_dir: Path,
+    *,
+    scope_paths: Iterable[Path] | None = None,
+    force_terminal: bool = False,
+) -> int:
+    """Rewrite slug-form dep IDs to canonical regex form (#229).
+
+    The validator's ``_check_dep_id_format`` rule enforces the canonical
+    task-ID regex ``^E\\d+(-F\\d+)?(-S\\d+)?(-T\\d+)?$`` on the first
+    column of every row in ``## Dependencies`` and ``### Depends On
+    This``. When an author cites an existing-backlog epic by its
+    directory slug (e.g., ``E16-test-cleanup``), the validator fails
+    with ``dependency ID '<slug>' does not match the canonical
+    task-ID regex``. This pass strips the slug suffix to leave the
+    canonical prefix (``E16``).
+
+    Walks the two dependency-table sections in each work-unit file:
+
+    - ``## Dependencies`` (level-2 heading, upstream deps)
+    - ``### Depends On This`` (level-3 heading, downstream deps)
+
+    For each table row whose first cell matches ``E<n>-<lowercase>``,
+    the cell is replaced with the canonical prefix. Cells already in
+    canonical form, the ``none`` placeholder, header rows, and
+    separator rows are left alone.
+
+    Args:
+        backlog_dir: Root of the backlog tree.
+        scope_paths: Optional iterable of epic directories to limit the
+            walk to (issue #226).
+        force_terminal: When ``True``, also rewrite files with terminal
+            status. Default ``False`` skips them.
+
+    Returns the number of files modified.
+    """
+    modified = 0
+    for path in _iter_work_unit_files(backlog_dir, scope_paths=scope_paths):
+        text = path.read_text(encoding="utf-8")
+        if not force_terminal and _is_terminal_status(text):
+            continue
+        new_text, changed = _normalize_dep_ids_in_text(text)
+        if changed:
+            path.write_text(new_text, encoding="utf-8")
+            modified += 1
+    return modified
+
+
+def _normalize_dep_ids_in_text(text: str) -> tuple[str, bool]:
+    """Rewrite slug-form dep IDs inside ``## Dependencies`` and ``### Depends On This``.
+
+    Returns ``(new_text, changed)``. ``changed`` is ``False`` when no
+    rewrites were necessary.
+    """
+    # Find both dep-table sections and rewrite each in place. The two
+    # sections live at different heading levels; we handle both.
+    sections = (
+        ("## Dependencies", "## "),
+        ("### Depends On This", "### "),
+    )
+    new_text = text
+    changed = False
+    for header, _ in sections:
+        bounds = _find_dep_section_bounds(new_text, header)
+        if bounds is None:
+            continue
+        start, end = bounds
+        body = new_text[start:end]
+        rewritten = _rewrite_dep_table_first_cells(body)
+        if rewritten != body:
+            new_text = new_text[:start] + rewritten + new_text[end:]
+            changed = True
+    return new_text, changed
+
+
+def _find_dep_section_bounds(text: str, header: str) -> tuple[int, int] | None:
+    """Return ``(body_start, body_end)`` for ``header`` or ``None``.
+
+    The body starts immediately after the header line and ends at the
+    next heading of the same-or-higher level (``## `` for level-2,
+    ``### `` or ``## `` for level-3) or end-of-file.
+    """
+    idx = text.find(header)
+    if idx < 0:
+        return None
+    body_start = idx + len(header)
+    # Advance past the header's trailing newline.
+    nl = text.find("\n", body_start)
+    if nl < 0:
+        return None
+    body_start = nl + 1
+    if header.startswith("### "):
+        # Level-3 header: stops at next level-2 or level-3 heading.
+        next_heading = re.compile(r"^(##|###)\s+", re.MULTILINE)
+    else:
+        # Level-2 header: stops at next level-2 heading.
+        next_heading = re.compile(r"^##\s+", re.MULTILINE)
+    match = next_heading.search(text, body_start)
+    body_end = match.start() if match else len(text)
+    return body_start, body_end
+
+
+def _rewrite_dep_table_first_cells(body: str) -> str:
+    """Rewrite the first cell of each dep-table row to canonical-ID form."""
+    new_lines: list[str] = []
+    for line in body.splitlines(keepends=True):
+        stripped = line.rstrip("\n").strip()
+        # Skip non-table lines and header / separator rows.
+        if not stripped.startswith("|") or stripped.startswith("|-"):
+            new_lines.append(line)
+            continue
+        cells = _split_row_cells(stripped)
+        if cells is None or not cells:
+            new_lines.append(line)
+            continue
+        first = cells[0].strip()
+        # Skip the table header ``| ID | Title | Status |`` and the
+        # ``| none | | |`` sentinel.
+        if first.lower() in ("id", "none", ""):
+            new_lines.append(line)
+            continue
+        match = _CANONICAL_ID_PREFIX_RE.match(first)
+        if match is None:
+            new_lines.append(line)
+            continue
+        canonical = match.group(1)
+        if canonical == first:
+            # Already canonical; nothing to rewrite.
+            new_lines.append(line)
+            continue
+        # Replace the slug-form ID with the canonical prefix. Preserve
+        # the cell padding the original row used (the leading column is
+        # ``| <ID> |``).
+        old_cell = f"| {first} |"
+        new_cell = f"| {canonical} |"
+        if old_cell in line:
+            new_lines.append(line.replace(old_cell, new_cell, 1))
+            continue
+        # Fall back to a regex replace tolerant of variable whitespace.
+        new_lines.append(re.sub(rf"\|\s*{re.escape(first)}\s*\|", new_cell, line, count=1))
+    return "".join(new_lines)
+
+
 def suffix_na_on_non_python_tasks(
     backlog_dir: Path,
     *,
@@ -752,6 +902,11 @@ def run_all(
             force_terminal=force_terminal,
         ),
         "dedupe_manifest_rows": dedupe_manifest_rows(
+            backlog_dir,
+            scope_paths=materialised_scope,
+            force_terminal=force_terminal,
+        ),
+        "normalize_dep_ids": normalize_dep_ids(
             backlog_dir,
             scope_paths=materialised_scope,
             force_terminal=force_terminal,

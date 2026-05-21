@@ -556,6 +556,123 @@ class TestSuffixRefOnOrphanPaths:
 
 
 # ---------------------------------------------------------------------------
+# normalize_dep_ids -- issue #229
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestNormalizeDepIds:
+    """Issue #229: rewrite slug-form dep IDs to canonical regex form."""
+
+    _SLUG_DEPS = """\
+        # E17-F1-S1-T1: Title
+
+        ## Status: in-queue
+
+        ## Dependencies
+
+        | ID | Title | Status |
+        |----|-------|--------|
+        | E16-test-cleanup | E16: Test cleanup for `feat/...` (PR #60) | done |
+        | E15-impl-cleanup | E15: Implementation cleanup | done |
+
+        ### Depends On This
+
+        | ID | Title | Status |
+        |----|-------|--------|
+        | E20-F1-S1-T1-verification | E20-F1-S1-T1: Cross-repo gate | in-queue |
+
+        ## Next
+        """
+
+    _CANONICAL_DEPS = """\
+        # E17-F1-S1-T1: Title
+
+        ## Status: in-queue
+
+        ## Dependencies
+
+        | ID | Title | Status |
+        |----|-------|--------|
+        | E16 | E16: Test cleanup | done |
+
+        ### Depends On This
+
+        | ID | Title | Status |
+        |----|-------|--------|
+        | none | | |
+
+        ## Next
+        """
+
+    def test_slug_form_rewritten(self, tmp_path: Path) -> None:
+        wu = _write(tmp_path / "T.md", self._SLUG_DEPS)
+        count = bpp.normalize_dep_ids(tmp_path)
+        assert count == 1
+        text = wu.read_text(encoding="utf-8")
+        # Slug suffix stripped to canonical prefix.
+        assert "| E16 | E16: Test cleanup for `feat/...` (PR #60) | done |" in text
+        assert "| E15 | E15: Implementation cleanup | done |" in text
+        # ``### Depends On This`` block also rewritten.
+        assert "| E20-F1-S1-T1 | E20-F1-S1-T1: Cross-repo gate | in-queue |" in text
+        # Original slug strings gone.
+        assert "E16-test-cleanup" not in text
+        assert "E15-impl-cleanup" not in text
+        assert "E20-F1-S1-T1-verification" not in text
+
+    def test_canonical_unchanged(self, tmp_path: Path) -> None:
+        wu = _write(tmp_path / "T.md", self._CANONICAL_DEPS)
+        before = wu.read_text(encoding="utf-8")
+        count = bpp.normalize_dep_ids(tmp_path)
+        assert count == 0
+        assert wu.read_text(encoding="utf-8") == before
+
+    def test_idempotent(self, tmp_path: Path) -> None:
+        _write(tmp_path / "T.md", self._SLUG_DEPS)
+        first = bpp.normalize_dep_ids(tmp_path)
+        second = bpp.normalize_dep_ids(tmp_path)
+        assert first == 1
+        assert second == 0
+
+    def test_header_and_none_left_alone(self, tmp_path: Path) -> None:
+        """``ID`` header row and ``none`` sentinel are not rewritten."""
+        wu = _write(tmp_path / "T.md", self._CANONICAL_DEPS)
+        bpp.normalize_dep_ids(tmp_path)
+        text = wu.read_text(encoding="utf-8")
+        assert "| ID | Title | Status |" in text
+        assert "| none | | |" in text
+
+    def test_skips_files_without_dep_sections(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path / "T.md",
+            """\
+            # T
+
+            ## Status: in-queue
+
+            (no dep sections)
+            """,
+        )
+        assert bpp.normalize_dep_ids(tmp_path) == 0
+
+    def test_terminal_status_skipped_by_default(self, tmp_path: Path) -> None:
+        content = self._SLUG_DEPS.replace("## Status: in-queue", "## Status: done")
+        wu = _write(tmp_path / "T.md", content)
+        before = wu.read_text(encoding="utf-8")
+        assert bpp.normalize_dep_ids(tmp_path) == 0
+        assert wu.read_text(encoding="utf-8") == before
+
+    def test_scope_paths_honoured(self, tmp_path: Path) -> None:
+        in_scope = _write(tmp_path / "E2" / "E2-F1-S1-T1.md", self._SLUG_DEPS)
+        out_of_scope = _write(tmp_path / "E1" / "E1-F1-S1-T1.md", self._SLUG_DEPS)
+        out_before = out_of_scope.read_text(encoding="utf-8")
+        count = bpp.normalize_dep_ids(tmp_path, scope_paths=[tmp_path / "E2"])
+        assert count == 1
+        assert "E16-test-cleanup" not in in_scope.read_text(encoding="utf-8")
+        assert out_of_scope.read_text(encoding="utf-8") == out_before
+
+
+# ---------------------------------------------------------------------------
 # suffix_na_on_non_python_tasks -- issue #228
 # ---------------------------------------------------------------------------
 
@@ -760,6 +877,7 @@ class TestRunAll:
             "normalize_manifest_column_count": 0,
             "sanitize_markdown_pipes_in_manifest": 0,
             "dedupe_manifest_rows": 0,
+            "normalize_dep_ids": 0,
             "suffix_ref_on_orphan_paths": 0,
             "suffix_na_on_non_python_tasks": 0,
         }
@@ -874,6 +992,7 @@ class TestScopeAwareness:
             "normalize_manifest_column_count": 0,
             "sanitize_markdown_pipes_in_manifest": 0,
             "dedupe_manifest_rows": 0,
+            "normalize_dep_ids": 0,
             "suffix_ref_on_orphan_paths": 0,
             "suffix_na_on_non_python_tasks": 0,
         }

@@ -35,6 +35,10 @@ Issue #221 A12. Escapes raw `|` characters that appear inside Changes Manifest a
 
 Issue #221 A13. Collapses identical Manifest rows down to one entry. The validator's intra-Task Manifest Conflict check fires when the same `(path, annotation)` pair appears twice in one Manifest; this pass removes the duplicate while preserving first-occurrence order.
 
+### `normalize_dep_ids(backlog_dir, *, scope_paths=None, force_terminal=False)`
+
+Issue #229. Rewrites slug-form dep IDs in `## Dependencies` and `### Depends On This` tables to the canonical regex form `E\d+(-F\d+)?(-S\d+)?(-T\d+)?`. When an author cites an existing-backlog epic by its directory slug (`E16-test-cleanup`), the validator's `_check_dep_id_format` rule fires; this pass strips the slug suffix to leave the canonical prefix (`E16`). Header rows (`| ID | ... |`), separator rows, and the `| none | | |` sentinel are left alone. Cells already in canonical form are no-op (idempotent).
+
 ### `suffix_na_on_non_python_tasks(backlog_dir, *, scope_paths=None, force_terminal=False)`
 
 Issue #228. For Task work units whose Changes Manifest contains zero `.py` paths, appends the canonical suffix `-- N/A for <Tier> Tasks (no Python source authored)` to the Python-tooling AC-FINAL lines (`AC-FINAL-002`, `AC-FINAL-003`, `AC-FINAL-004`, `AC-FINAL-005`, `AC-FINAL-006`, `AC-FINAL-008`, `AC-FINAL-014`). Tier is derived from the task's Manifest paths via the same classifier the validator uses (`BacklogManager._classify_manifest_tier`). Python-tier, Mixed-tier, and empty-Manifest tasks are skipped. AC lines that already carry an `-- N/A` substring are left alone (idempotent). Cross-link: `docs/acceptance-criteria-canonical.md`.
@@ -60,6 +64,7 @@ result = bpp.run_all(
 #     "normalize_manifest_column_count": 0,
 #     "sanitize_markdown_pipes_in_manifest": 2,
 #     "dedupe_manifest_rows": 1,
+#     "normalize_dep_ids": 1,
 #     "suffix_ref_on_orphan_paths": 5,
 #     "suffix_na_on_non_python_tasks": 3,
 # }

@@ -39,7 +39,7 @@ If `skills.exemplar_backlog_path` is absent OR the file does not exist, skip the
 Every leaf task `.md` file MUST contain these 15 sections, in this order:
 
 1. `# {id}: {title}` -- top-level heading with full task ID
-2. `## Status` -- one of: `draft | in-queue | in-progress | in-review | done | blocked | declined | hold`
+2. `## Status: <value>` where `<value>` is one of `draft`, `in-queue`, `in-progress`, `in-review`, `done`, `blocked`, `declined`, `hold`. **CONSTRAINT (issue #229)**: `draft` is ONLY VALID for Task work units. The validator's `_check_status_enum` rule (see `src/devbench/backlog/manager.py`) rejects `draft` on Epic / Feature / Story with `Status "draft" is only valid for Task work units; <ID> is type <Type>.`. For non-Task levels the operator may intend a "not-ready" state -- map that intent to `hold` (the orchestrator's claim sweep promotes `in-queue` -> claimed; `hold` / `draft` / `declined` all keep the WU paused).
 3. `## Target Repository` -- `Repo:` + `Branch:` fields
 4. `## Description` -- full prose description (not a one-liner; explains WHY and what the implementation does)
 5. `### Definition of Ready` -- 5 task-tailored checklist items (NOT generic boilerplate; each item is specific to this task's prerequisites)
@@ -190,6 +190,8 @@ Write the task `.md` file to `backlog/<epic-id>-<epic-slug>/<feature-id>-<featur
 - DoR / DoD items mentioning paths not in this task's Changes Manifest. Either include the path in the Manifest, or rewrite the item behaviourally (no path tokens), or suffix the token with `(ref)`.
 - Glob patterns (``*`` or ``**``) in any Manifest row. Use a sentinel like ``<source-drift-fix-targets-determined-at-execution>`` instead and rely on the orchestrator's `manifest_amendment` workflow to concretise the file list at execution time.
 
+**Canonical dep-ID form (issue #229)**: every row in `## Dependencies` and `### Depends On This` MUST have its first column match the regex `E\d+(-F\d+)?(-S\d+)?(-T\d+)?`. Directory names are slugs (e.g., `E16-test-cleanup`) and are NOT valid IDs. Use the bare `E<n>` / `E<n>-F<m>` form. When citing existing-backlog epics, look up the canonical ID from `BACKLOG.md`'s Full Work Unit Index ID column (the first cell of each index row). The validator's `_check_dep_id_format` rule rejects slug-form IDs with `dependency ID '<slug>' does not match the canonical task-ID regex E<n>[-F<n>][-S<n>][-T<n>]`. The `normalize_dep_ids` post-processor pass (Step 5d) rewrites slug-form IDs to canonical form when found.
+
 **Dependency wiring -- fully resolved at generation time**:
 - `## Dependencies` table: every upstream task this task depends on (real WU IDs -- no placeholders).
 - `### Depends On This` table: every downstream task that depends on this task (real WU IDs -- no placeholders).
@@ -268,7 +270,7 @@ After all task files are written, produce `BACKLOG.md` with the two required top
 
 All new tasks default to `Draft`; counts in other columns are 0 at generation time.
 
-**Status Summary count semantics** (issue #221 B6): each cell counts work units of ANY type (Epic, Feature, Story, Task) in that Epic that hold the column's status. The Draft column for an all-draft Epic with N Features, M Stories, K Tasks is therefore 1 (the Epic itself) + N + M + K, not just K. See `docs/backlog-contract.md` for the worked example.
+**Status Summary count semantics** (issue #229; supersedes #221 B6): each cell counts Features + Stories + Tasks under that Epic that hold the column's status. The Epic file itself is NOT counted in any cell (the row IS the epic; counting the epic in its own row would double-count). For an all-in-queue Epic with N Features, M Stories, K Tasks: In Queue column = N + M + K. CONSTRAINT (Step 1b item 2): Epic / Feature / Story cannot hold `draft`; if the operator's intent is "everything paused", expect Features and Stories under Hold and only Tasks under Draft. See `docs/backlog-contract.md` for the worked example.
 
 ### Full Work Unit Index
 

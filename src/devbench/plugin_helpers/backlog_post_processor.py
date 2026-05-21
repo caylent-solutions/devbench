@@ -610,6 +610,105 @@ def _find_section_bounds(text: str, header: str) -> tuple[int, int] | None:
     return section_start, section_end
 
 
+# Canonical regex matching one task ID -- ``E<digits>-F<digits>-S<digits>-T<digits>``.
+# Used by ``suffix_na_on_non_python_tasks`` to detect Task work units (skipping
+# Epic / Feature / Story files, which never carry AC-FINAL lines).
+_TASK_ID_RE = re.compile(r"^E\d+-F\d+-S\d+-T\d+$")
+
+# Regex matching an Acceptance Criteria checkbox row. Captures the AC ID so
+# the pass can decide whether the row is one of the Python-tooling
+# AC-FINAL-* lines.
+_AC_CHECKBOX_RE = re.compile(r"^(\s*- \[[ xX]\] )(AC-FINAL-\d{3})\b(.*)$")
+
+
+def suffix_na_on_non_python_tasks(
+    backlog_dir: Path,
+    *,
+    scope_paths: Iterable[Path] | None = None,
+    force_terminal: bool = False,
+) -> int:
+    """Append the canonical N/A tier suffix to Python-tooling AC-FINAL lines
+    on non-Python task files (#228).
+
+    Validator Rule 13 (``_check_language_ac_alignment`` in
+    ``devbench.backlog.manager``) requires AC-FINAL-002 (ruff format),
+    003 (ruff check), 004 (mypy), 005 (pytest tier), 006 (pytest other
+    tier), 008 (bandit), and 014 (coverage) to carry the explicit
+    suffix ``-- N/A for <Tier> Tasks (no Python source authored)``
+    whenever the task's Changes Manifest contains zero ``.py`` paths.
+    The skill prompt's Step 5b rubric now mandates this, but tasks
+    authored before the rubric update fail on first validate. This
+    pass adds the missing suffix deterministically.
+
+    Tier is derived from the task's Manifest paths via the same
+    classifier the validator uses
+    (``BacklogManager._classify_manifest_tier``): one of ``YAML``,
+    ``Markdown``, ``TOML``, ``HCL``, ``JSON``, ``XML``, or ``Mixed``.
+    Python-tier and Mixed-tier tasks are skipped (Mixed includes at
+    least one ``.py`` file so the Python ACs apply to that subset).
+
+    Args:
+        backlog_dir: Root of the backlog tree.
+        scope_paths: Optional iterable of epic directories to limit the
+            walk to (issue #226).
+        force_terminal: When ``True``, also rewrite files with terminal
+            status. Default ``False`` skips them.
+
+    Returns the number of files modified.
+    """
+    # Imported here so the module has no import-time dependency on the
+    # validator class (and the post-processor remains usable from
+    # standalone scripts even if the validator side-effects change).
+    from devbench.backlog.manager import BacklogManager
+    from devbench.backlog.manifest import ManifestParseError, parse_manifest
+
+    ac_final_ids: frozenset[str] = BacklogManager._AC_FINAL_LANGUAGE_TIER_IDS
+
+    modified = 0
+    for path in _iter_work_unit_files(backlog_dir, scope_paths=scope_paths):
+        if not _TASK_ID_RE.match(path.stem):
+            continue
+        text = path.read_text(encoding="utf-8")
+        if not force_terminal and _is_terminal_status(text):
+            continue
+        try:
+            manifest_rows = parse_manifest(text)
+        except ManifestParseError:
+            # Other validator rules surface the underlying defect; this
+            # pass cannot reason about an unparseable Manifest.
+            continue
+        paths = [row.file for row in manifest_rows]
+        tier = BacklogManager._classify_manifest_tier(paths)
+        if tier in ("", "Python", "Mixed"):
+            continue
+        suffix = f" -- N/A for {tier} Tasks (no Python source authored)"
+
+        new_lines: list[str] = []
+        changed = False
+        for line in text.splitlines(keepends=True):
+            match = _AC_CHECKBOX_RE.match(line.rstrip("\n"))
+            if match is None:
+                new_lines.append(line)
+                continue
+            ac_id = match.group(2)
+            if ac_id not in ac_final_ids:
+                new_lines.append(line)
+                continue
+            tail = match.group(3)
+            if "-- N/A" in tail:
+                new_lines.append(line)
+                continue
+            # Append the suffix at the end of the line (preserving the
+            # trailing newline if present).
+            ending = "\n" if line.endswith("\n") else ""
+            new_lines.append(f"{match.group(1)}{ac_id}{tail}{suffix}{ending}")
+            changed = True
+        if changed:
+            path.write_text("".join(new_lines), encoding="utf-8")
+            modified += 1
+    return modified
+
+
 def run_all(
     backlog_dir: Path,
     *,
@@ -658,6 +757,11 @@ def run_all(
             force_terminal=force_terminal,
         ),
         "suffix_ref_on_orphan_paths": suffix_ref_on_orphan_paths(
+            backlog_dir,
+            scope_paths=materialised_scope,
+            force_terminal=force_terminal,
+        ),
+        "suffix_na_on_non_python_tasks": suffix_na_on_non_python_tasks(
             backlog_dir,
             scope_paths=materialised_scope,
             force_terminal=force_terminal,

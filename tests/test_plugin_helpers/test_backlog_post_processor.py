@@ -556,6 +556,196 @@ class TestSuffixRefOnOrphanPaths:
 
 
 # ---------------------------------------------------------------------------
+# suffix_na_on_non_python_tasks -- issue #228
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestSuffixNAOnNonPythonTasks:
+    """Issue #228: AC-FINAL Python-tooling lines on non-Python tasks get the N/A tier suffix."""
+
+    _YAML_TASK = """\
+        # E1-F1-S1-T1: YAML task
+
+        ## Status: in-queue
+
+        ## Changes Manifest
+
+        | File | Change |
+        |------|--------|
+        | `.github/workflows/audit.yml` | modify |
+
+        ## Acceptance Criteria
+
+        - [ ] AC-FUNC-001 the workflow installs kanon-cli.
+        - [ ] AC-FINAL-001 every AC-TEST-* test runs and passes.
+        - [ ] AC-FINAL-002 ruff format --check exits zero.
+        - [ ] AC-FINAL-003 ruff check exits zero.
+        - [ ] AC-FINAL-004 mypy src exits zero.
+        - [ ] AC-FINAL-008 bandit -r src -ll exits zero.
+        - [ ] AC-FINAL-014 coverage gate is met.
+
+        ## Next
+        """
+
+    _PYTHON_TASK = """\
+        # E1-F1-S1-T1: Python task
+
+        ## Status: in-queue
+
+        ## Changes Manifest
+
+        | File | Change |
+        |------|--------|
+        | `src/foo.py` | add |
+
+        ## Acceptance Criteria
+
+        - [ ] AC-FINAL-002 ruff format --check exits zero.
+
+        ## Next
+        """
+
+    _MARKDOWN_TASK = """\
+        # E1-F1-S1-T1: Markdown task
+
+        ## Status: in-queue
+
+        ## Changes Manifest
+
+        | File | Change |
+        |------|--------|
+        | `docs/contributing.md` | modify |
+
+        ## Acceptance Criteria
+
+        - [ ] AC-FINAL-002 ruff format --check exits zero.
+
+        ## Next
+        """
+
+    _MIXED_TASK = """\
+        # E1-F1-S1-T1: Mixed task (one .py + one .yml)
+
+        ## Status: in-queue
+
+        ## Changes Manifest
+
+        | File | Change |
+        |------|--------|
+        | `src/foo.py` | add |
+        | `.github/workflows/x.yml` | modify |
+
+        ## Acceptance Criteria
+
+        - [ ] AC-FINAL-002 ruff format --check exits zero.
+
+        ## Next
+        """
+
+    def test_yaml_tier_gets_suffix(self, tmp_path: Path) -> None:
+        wu = _write(tmp_path / "E1-F1-S1-T1.md", self._YAML_TASK)
+        count = bpp.suffix_na_on_non_python_tasks(tmp_path)
+        assert count == 1
+        text = wu.read_text(encoding="utf-8")
+        # All Python-tooling AC-FINAL rows get the YAML suffix.
+        assert "AC-FINAL-002 ruff format --check exits zero. -- N/A for YAML Tasks (no Python source authored)" in text
+        assert "AC-FINAL-004 mypy src exits zero. -- N/A for YAML Tasks (no Python source authored)" in text
+        assert "AC-FINAL-014 coverage gate is met. -- N/A for YAML Tasks (no Python source authored)" in text
+        # AC-FINAL-001 is NOT in the language-tier set; left alone.
+        assert "AC-FINAL-001 every AC-TEST-* test runs and passes." in text
+        assert "AC-FINAL-001 every AC-TEST-* test runs and passes. -- N/A" not in text
+        # AC-FUNC-001 is not an AC-FINAL line; left alone.
+        assert "AC-FUNC-001 the workflow installs kanon-cli." in text
+
+    def test_python_task_untouched(self, tmp_path: Path) -> None:
+        wu = _write(tmp_path / "E1-F1-S1-T1.md", self._PYTHON_TASK)
+        before = wu.read_text(encoding="utf-8")
+        count = bpp.suffix_na_on_non_python_tasks(tmp_path)
+        assert count == 0
+        assert wu.read_text(encoding="utf-8") == before
+
+    def test_markdown_tier(self, tmp_path: Path) -> None:
+        wu = _write(tmp_path / "E1-F1-S1-T1.md", self._MARKDOWN_TASK)
+        count = bpp.suffix_na_on_non_python_tasks(tmp_path)
+        assert count == 1
+        text = wu.read_text(encoding="utf-8")
+        assert (
+            "AC-FINAL-002 ruff format --check exits zero. -- N/A for Markdown Tasks (no Python source authored)" in text
+        )
+
+    def test_mixed_tier_untouched(self, tmp_path: Path) -> None:
+        """Mixed-tier tasks (>=1 .py file) are NOT suffixed -- the Python ACs apply."""
+        wu = _write(tmp_path / "E1-F1-S1-T1.md", self._MIXED_TASK)
+        before = wu.read_text(encoding="utf-8")
+        count = bpp.suffix_na_on_non_python_tasks(tmp_path)
+        assert count == 0
+        assert wu.read_text(encoding="utf-8") == before
+
+    def test_already_suffixed_idempotent(self, tmp_path: Path) -> None:
+        """AC lines that already carry `-- N/A` are left alone."""
+        _write(tmp_path / "E1-F1-S1-T1.md", self._YAML_TASK)
+        first = bpp.suffix_na_on_non_python_tasks(tmp_path)
+        second = bpp.suffix_na_on_non_python_tasks(tmp_path)
+        assert first == 1
+        assert second == 0
+
+    def test_skips_epic_feature_story(self, tmp_path: Path) -> None:
+        """Only Task work units are processed (Epic / Feature / Story files have no AC-FINAL rows)."""
+        # Epic file ID 'E1' should be skipped even with AC-FINAL lines in body.
+        _write(tmp_path / "E1.md", self._YAML_TASK.replace("E1-F1-S1-T1", "E1"))
+        count = bpp.suffix_na_on_non_python_tasks(tmp_path)
+        assert count == 0
+
+    def test_unparseable_manifest_skipped(self, tmp_path: Path) -> None:
+        """A task with a malformed Manifest (3-col header) is skipped silently."""
+        # 3-col header would fail parse_manifest; this pass skips so other
+        # passes (normalize_manifest_column_count) can fix the root cause.
+        bad = """\
+            # E1-F1-S1-T1: bad manifest
+
+            ## Status: in-queue
+
+            ## Changes Manifest
+
+            | Repo | Path | Action |
+            |------|------|--------|
+            | caylent/cpk | foo.yml | modify |
+
+            ## Acceptance Criteria
+
+            - [ ] AC-FINAL-002 ruff format --check exits zero.
+            """
+        _write(tmp_path / "E1-F1-S1-T1.md", bad)
+        count = bpp.suffix_na_on_non_python_tasks(tmp_path)
+        assert count == 0
+
+    def test_terminal_status_skipped_by_default(self, tmp_path: Path) -> None:
+        content = self._YAML_TASK.replace("## Status: in-queue", "## Status: done")
+        wu = _write(tmp_path / "E1-F1-S1-T1.md", content)
+        before = wu.read_text(encoding="utf-8")
+        assert bpp.suffix_na_on_non_python_tasks(tmp_path) == 0
+        assert wu.read_text(encoding="utf-8") == before
+
+    def test_force_terminal_processes_done(self, tmp_path: Path) -> None:
+        content = self._YAML_TASK.replace("## Status: in-queue", "## Status: done")
+        wu = _write(tmp_path / "E1-F1-S1-T1.md", content)
+        count = bpp.suffix_na_on_non_python_tasks(tmp_path, force_terminal=True)
+        assert count == 1
+        text = wu.read_text(encoding="utf-8")
+        assert "-- N/A for YAML Tasks (no Python source authored)" in text
+
+    def test_scope_paths_honoured(self, tmp_path: Path) -> None:
+        in_scope = _write(tmp_path / "E2" / "E2-F1-S1-T1.md", self._YAML_TASK.replace("E1-F1-S1-T1", "E2-F1-S1-T1"))
+        out_of_scope = _write(tmp_path / "E1" / "E1-F1-S1-T1.md", self._YAML_TASK)
+        out_before = out_of_scope.read_text(encoding="utf-8")
+        count = bpp.suffix_na_on_non_python_tasks(tmp_path, scope_paths=[tmp_path / "E2"])
+        assert count == 1
+        assert "-- N/A for YAML" in in_scope.read_text(encoding="utf-8")
+        assert out_of_scope.read_text(encoding="utf-8") == out_before
+
+
+# ---------------------------------------------------------------------------
 # run_all
 # ---------------------------------------------------------------------------
 
@@ -571,6 +761,7 @@ class TestRunAll:
             "sanitize_markdown_pipes_in_manifest": 0,
             "dedupe_manifest_rows": 0,
             "suffix_ref_on_orphan_paths": 0,
+            "suffix_na_on_non_python_tasks": 0,
         }
 
 
@@ -684,6 +875,7 @@ class TestScopeAwareness:
             "sanitize_markdown_pipes_in_manifest": 0,
             "dedupe_manifest_rows": 0,
             "suffix_ref_on_orphan_paths": 0,
+            "suffix_na_on_non_python_tasks": 0,
         }
 
     def test_scope_paths_nonexistent_raises(self, tmp_path: Path) -> None:

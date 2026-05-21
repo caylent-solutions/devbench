@@ -1151,10 +1151,10 @@ class ReviewTeamModelsConfig:
     quota independently.
 
     Attributes:
-        code_reviewer: Override for ``plugin/devbench/agents/review_team/code-reviewer.md``.
-        test_reviewer: Override for ``plugin/devbench/agents/review_team/test-reviewer.md``.
-        doc_reviewer: Override for ``plugin/devbench/agents/review_team/doc-reviewer.md``.
-        changes_manifest: Override for ``plugin/devbench/agents/review_team/changes-manifest.md``.
+        code_reviewer: Override for ``plugin/devbench-orchestrate/agents/review_team/code-reviewer.md``.
+        test_reviewer: Override for ``plugin/devbench-orchestrate/agents/review_team/test-reviewer.md``.
+        doc_reviewer: Override for ``plugin/devbench-orchestrate/agents/review_team/doc-reviewer.md``.
+        changes_manifest: Override for ``plugin/devbench-orchestrate/agents/review_team/changes-manifest.md``.
     """
 
     code_reviewer: str | None = None
@@ -1167,7 +1167,7 @@ class ReviewTeamModelsConfig:
 class AgentModelsConfig:
     """Per-agent model overrides for the work-agents in the devbench plugin (ADR-25).
 
-    Each field corresponds to one ``.md`` file under ``plugin/devbench/agents/``.
+    Each field corresponds to one ``.md`` file under ``plugin/devbench-orchestrate/agents/``.
     When a field is ``None`` (the default), the agent runs on the model
     declared in its frontmatter. When set, ``devbench.plugin_shadow`` rewrites
     the frontmatter ``model:`` line in a workspace-local shadow copy and the
@@ -1179,12 +1179,12 @@ class AgentModelsConfig:
     after this dataclass is constructed.
 
     Attributes:
-        executor: Override for ``plugin/devbench/agents/executor.md``.
-        blocker_resolver: Override for ``plugin/devbench/agents/blocker-resolver.md``.
-        manifest_amender: Override for ``plugin/devbench/agents/manifest-amender.md``.
-        security_reviewer: Override for ``plugin/devbench/agents/security-reviewer.md``.
-        task_factory: Override for ``plugin/devbench/agents/task-factory.md``.
-        review_supervisor: Override for ``plugin/devbench/agents/review-supervisor.md``.
+        executor: Override for ``plugin/devbench-orchestrate/agents/executor.md``.
+        blocker_resolver: Override for ``plugin/devbench-orchestrate/agents/blocker-resolver.md``.
+        manifest_amender: Override for ``plugin/devbench-orchestrate/agents/manifest-amender.md``.
+        security_reviewer: Override for ``plugin/devbench-orchestrate/agents/security-reviewer.md``.
+        task_factory: Override for ``plugin/devbench-orchestrate/agents/task-factory.md``.
+        review_supervisor: Override for ``plugin/devbench-orchestrate/agents/review-supervisor.md``.
         review_team: Nested overrides for the four review_team judges.
     """
 

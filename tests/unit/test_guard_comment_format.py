@@ -23,7 +23,9 @@ from pathlib import Path
 
 import pytest
 
-SCRIPT_PATH = Path(__file__).parent.parent.parent / "plugin" / "devbench" / "scripts" / "guard-comment-format.sh"
+SCRIPT_PATH = (
+    Path(__file__).parent.parent.parent / "plugin" / "devbench-orchestrate" / "scripts" / "guard-comment-format.sh"
+)
 
 FORBIDDEN_PHRASES = [
     "halt orchestration",

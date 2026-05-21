@@ -43,7 +43,7 @@ Operators can grep audit logs for the literal token to verify the skill operated
 
 Even when no exemplar is configured, every skill invocation produces an artefact that satisfies the canonical structure:
 
-- **`spec-to-backlog`** -- every leaf task `.md` contains the 15 canonical sections enumerated in `plugin/devbench/skills/spec-to-backlog/SKILL.md` Step 1b.
-- **`create-spec`** -- every spec covers the 16 canonical sections (Sections 0-15) enumerated in `plugin/devbench/skills/create-spec/SKILL.md` Step 1b, or each absent section carries an explicit "N/A -- reason" statement.
+- **`spec-to-backlog`** -- every leaf task `.md` contains the 15 canonical sections enumerated in `plugin-authoring/devbench-authoring/skills/spec-to-backlog/SKILL.md` Step 1b.
+- **`create-spec`** -- every spec covers the 16 canonical sections (Sections 0-15) enumerated in `plugin-authoring/devbench-authoring/skills/create-spec/SKILL.md` Step 1b, or each absent section carries an explicit "N/A -- reason" statement.
 
 The embedded section lists are the authoritative quality bar. The optional workspace exemplar is an additional reference for richer wording, never a substitute for the structural skeleton.

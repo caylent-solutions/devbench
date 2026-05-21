@@ -1,6 +1,6 @@
 """Unit tests for the guard-review-supervisor-scope PreToolUse hook (issue #118).
 
-The hook enforces read-only scope on the ``devbench:review-supervisor``
+The hook enforces read-only scope on the ``devbench-orchestrate:review-supervisor``
 agent. It blocks two classes of escalation:
 
 1. **Bash mutations** -- destructive shell commands (rm, git commit, sed -i,
@@ -8,8 +8,8 @@ agent. It blocks two classes of escalation:
    tested here for regression coverage.
 2. **Agent-tool subagent spawn** (issue #118) -- Agent-tool invocations
    whose ``subagent_type`` is not in the canonical review_team allowlist
-   (``devbench:code_review`` / ``devbench:test_review`` /
-   ``devbench:doc_review`` / ``devbench:changes_manifest``). New branch.
+   (``devbench-orchestrate:code_review`` / ``devbench-orchestrate:test_review`` /
+   ``devbench-orchestrate:doc_review`` / ``devbench-orchestrate:changes_manifest``). New branch.
 
 Both paths share the operator override env var
 ``DEVBENCH_ALLOW_REVIEW_SUPERVISOR_MUTATIONS=1``.
@@ -25,7 +25,11 @@ from pathlib import Path
 import pytest
 
 SCRIPT_PATH = (
-    Path(__file__).parent.parent.parent / "plugin" / "devbench" / "scripts" / "guard-review-supervisor-scope.sh"
+    Path(__file__).parent.parent.parent
+    / "plugin"
+    / "devbench-orchestrate"
+    / "scripts"
+    / "guard-review-supervisor-scope.sh"
 )
 
 
@@ -47,7 +51,7 @@ def _run_hook(payload: dict, env: dict | None = None) -> subprocess.CompletedPro
 def _agent_payload(subagent_type: str) -> dict:
     """Build a minimal PreToolUse Agent payload from the supervisor."""
     return {
-        "agent_type": "devbench:review-supervisor",
+        "agent_type": "devbench-orchestrate:review-supervisor",
         "tool_name": "Agent",
         "tool_input": {
             "subagent_type": subagent_type,
@@ -60,7 +64,7 @@ def _agent_payload(subagent_type: str) -> dict:
 def _bash_payload(command: str) -> dict:
     """Build a minimal PreToolUse Bash payload from the supervisor."""
     return {
-        "agent_type": "devbench:review-supervisor",
+        "agent_type": "devbench-orchestrate:review-supervisor",
         "tool_name": "Bash",
         "tool_input": {"command": command},
     }
@@ -71,7 +75,7 @@ class TestNonSupervisorAgentTypeIsNoOp:
 
     def test_executor_agent_passes_through(self) -> None:
         payload = {
-            "agent_type": "devbench:executor",
+            "agent_type": "devbench-orchestrate:executor",
             "tool_name": "Bash",
             "tool_input": {"command": "git commit -m 'wip'"},
         }
@@ -85,10 +89,10 @@ class TestAgentToolAllowlist:
     @pytest.mark.parametrize(
         "subagent_type",
         [
-            "devbench:code_review",
-            "devbench:test_review",
-            "devbench:doc_review",
-            "devbench:changes_manifest",
+            "devbench-orchestrate:code_review",
+            "devbench-orchestrate:test_review",
+            "devbench-orchestrate:doc_review",
+            "devbench-orchestrate:changes_manifest",
         ],
     )
     def test_review_team_subagents_allowed(self, subagent_type: str) -> None:
@@ -100,11 +104,11 @@ class TestAgentToolAllowlist:
     @pytest.mark.parametrize(
         "subagent_type",
         [
-            "devbench:executor",
-            "devbench:blocker_resolver",
-            "devbench:task_factory",
-            "devbench:manifest_amender",
-            "devbench:security_review",
+            "devbench-orchestrate:executor",
+            "devbench-orchestrate:blocker_resolver",
+            "devbench-orchestrate:task_factory",
+            "devbench-orchestrate:manifest_amender",
+            "devbench-orchestrate:security_review",
             "devbench:git-ops",
             "claude",
             "",
@@ -118,7 +122,7 @@ class TestAgentToolAllowlist:
 
     def test_override_env_var_unblocks_subagent_spawn(self) -> None:
         result = _run_hook(
-            _agent_payload("devbench:executor"),
+            _agent_payload("devbench-orchestrate:executor"),
             env={"DEVBENCH_ALLOW_REVIEW_SUPERVISOR_MUTATIONS": "1"},
         )
         assert result.returncode == 0

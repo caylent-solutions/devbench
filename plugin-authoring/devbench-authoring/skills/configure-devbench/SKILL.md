@@ -475,7 +475,7 @@ Report:
 >   notifications:      enabled=<value>, events=<comma-separated list of enabled events>
 >   stop_hook:          max_blocks=<value>, window_seconds=<value>
 >
-> Next step: run 'claude run devbench:bootstrap-environment' to clone target repos and verify make validate baselines."
+> Next step: run 'claude run devbench-authoring:bootstrap-environment' to clone target repos and verify make validate baselines."
 
 After writing the yaml, also produce or refresh the workspace's
 `devbench-commands.txt` launcher file with both the standard launch

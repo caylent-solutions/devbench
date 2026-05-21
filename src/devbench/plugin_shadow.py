@@ -61,7 +61,7 @@ def shadow_plugin_path(workspace_root: Path) -> Path:
 
     The path is deterministic; this function does not check whether the
     directory exists. The trailing ``/devbench`` segment mirrors the
-    canonical layout (``plugin/devbench/.claude-plugin/plugin.json``) so the
+    canonical layout (``plugin/devbench-orchestrate/.claude-plugin/plugin.json``) so the
     plugin loader finds the same metadata under both roots.
 
     Args:

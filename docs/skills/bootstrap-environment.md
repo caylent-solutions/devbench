@@ -130,7 +130,7 @@ The skill is idempotent -- repos already cloned and validated are reported as
 
 ## Cross-references
 
-- [`plugin/devbench/skills/bootstrap-environment/SKILL.md`](../../plugin/devbench/skills/bootstrap-environment/SKILL.md) -- full skill prompt
+- [`plugin-authoring/devbench-authoring/skills/bootstrap-environment/SKILL.md`](../../plugin-authoring/devbench-authoring/skills/bootstrap-environment/SKILL.md) -- full skill prompt
 - [`docs/skills/configure-devbench.md`](configure-devbench.md) -- configure devbench.yaml before bootstrapping
 - [`docs/zero-to-ready.md`](../zero-to-ready.md) -- manual step-by-step onboarding guide
 - [`docs/onboarding.md`](../onboarding.md) -- chained-skill operator workflow

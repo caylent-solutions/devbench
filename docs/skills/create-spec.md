@@ -122,7 +122,7 @@ The audit tags flow through the existing `devbench report` and
 
 ## Cross-references
 
-- [`plugin/devbench/skills/create-spec/SKILL.md`](../../plugin/devbench/skills/create-spec/SKILL.md) -- full skill prompt
+- [`plugin-authoring/devbench-authoring/skills/create-spec/SKILL.md`](../../plugin-authoring/devbench-authoring/skills/create-spec/SKILL.md) -- full skill prompt
 - [`docs/skills/spec-to-backlog.md`](spec-to-backlog.md) -- the downstream skill that consumes this spec
 - [`docs/creating-specs-and-backlogs.md`](../creating-specs-and-backlogs.md) -- manual spec authoring guide
 - [`docs/onboarding.md`](../onboarding.md) -- chained-skill operator workflow

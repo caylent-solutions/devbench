@@ -23,8 +23,8 @@
 set -euo pipefail
 
 # Single source of truth for forbidden phrases. Mirrored in:
-#   - plugin/devbench/agents/executor.md (Comment language discipline section)
-#   - plugin/devbench/skills/orchestrate/SKILL.md (Subagent text is diagnostic section)
+#   - plugin/devbench-orchestrate/agents/executor.md (Comment language discipline section)
+#   - plugin/devbench-orchestrate/skills/orchestrate/SKILL.md (Subagent text is diagnostic section)
 # Match is case-insensitive substring against the message body.
 FORBIDDEN_PHRASES=(
   "halt orchestration"
@@ -140,8 +140,8 @@ for phrase in "${FORBIDDEN_PHRASES[@]}"; do
     echo "Subagent log-comment text is diagnostic narration, not orchestrator control flow." >&2
     echo "The orchestrator's loop is controlled ONLY by 'uv run devbench next' return values" >&2
     echo "and the stop-hook circuit breaker -- never by subagent prose. See" >&2
-    echo "plugin/devbench/agents/executor.md (COMMENT LANGUAGE DISCIPLINE section) and" >&2
-    echo "plugin/devbench/skills/orchestrate/SKILL.md (Subagent text is diagnostic section)." >&2
+    echo "plugin/devbench-orchestrate/agents/executor.md (COMMENT LANGUAGE DISCIPLINE section) and" >&2
+    echo "plugin/devbench-orchestrate/skills/orchestrate/SKILL.md (Subagent text is diagnostic section)." >&2
     echo "" >&2
     echo "Fix: rewrite the message describing the condition factually without imperatives" >&2
     echo "directed at the loop. Example replacements:" >&2

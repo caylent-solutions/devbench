@@ -6490,7 +6490,7 @@ def _extract_sdk_result_text(message: object) -> str | None:
 
 
 #: Issue #218: the three terminal sentinels the orchestrate skill emits
-#: at end-of-run (per ``plugin/devbench/skills/orchestrate/SKILL.md``
+#: at end-of-run (per ``plugin/devbench-orchestrate/skills/orchestrate/SKILL.md``
 #: lines 8, 32, 35-36).  ``NO_ACTIONABLE_IN_SCOPE`` is caught by the
 #: substring check on ``NO_ACTIONABLE``, so only two distinct tokens
 #: live in the tuple.
@@ -6854,7 +6854,7 @@ def cmd_start(*argv: str) -> int:
         while True:
             try:
                 async for message in query(
-                    prompt="Run the devbench:orchestrate skill to process the backlog until complete",
+                    prompt="Run the devbench-orchestrate:orchestrate skill to process the backlog until complete",
                     options=ClaudeAgentOptions(
                         plugins=[{"type": "local", "path": str(plugin_path)}],
                         permission_mode="bypassPermissions",

@@ -1,0 +1,19 @@
+{
+  "name": "devbench-authoring",
+  "owner": {
+    "name": "Caylent",
+    "url": "https://www.caylent.com"
+  },
+  "metadata": {
+    "description": "DevBench authoring marketplace -- ships the devbench-authoring plugin (spec authoring + backlog materialization phase). The companion devbench-orchestrate marketplace lives at plugin/ in the same repo (issue #224).",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "devbench-authoring",
+      "source": "./devbench-authoring/",
+      "description": "Spec authoring + backlog materialization skills (spec-to-backlog, create-spec, configure-devbench, bootstrap-environment). No hooks; safe to enable in any workspace where authoring happens. Use during the planning phase.",
+      "version": "0.1.0"
+    }
+  ]
+}

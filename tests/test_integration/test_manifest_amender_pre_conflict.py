@@ -9,7 +9,7 @@ Conflicts were approved, the source task transitioned to ``blocked`` on
 the next ``validate-backlog``, and the recovery cascade had to clean up
 after the fact.
 
-Fix: ``plugin/devbench/agents/manifest-amender.md`` adds a fourth
+Fix: ``plugin/devbench-orchestrate/agents/manifest-amender.md`` adds a fourth
 pre-filter rule -- a "pre-conflict check" that scans every other
 work-unit's Manifest before approving. Reject (or auto-recommend dep)
 on conflict. This test pins the rule by-content via the existing
@@ -22,7 +22,9 @@ from pathlib import Path
 
 import pytest
 
-PROMPT_PATH = Path(__file__).resolve().parent.parent.parent / "plugin" / "devbench" / "agents" / "manifest-amender.md"
+PROMPT_PATH = (
+    Path(__file__).resolve().parent.parent.parent / "plugin" / "devbench-orchestrate" / "agents" / "manifest-amender.md"
+)
 
 
 @pytest.fixture(scope="module")

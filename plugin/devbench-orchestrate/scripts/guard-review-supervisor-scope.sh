@@ -4,7 +4,7 @@
 #
 # Receives JSON on stdin (Claude Code PreToolUse contract):
 #   { "tool_name": "Bash", "tool_input": { "command": "..." },
-#     "agent_type": "devbench:review-supervisor", ... }
+#     "agent_type": "devbench-orchestrate:review-supervisor", ... }
 #
 # A reviewer's job is to AUDIT the diff and DELEGATE via the Agent tool.
 # It MUST NOT mutate worktree, index, or filesystem state. The
@@ -14,7 +14,7 @@
 # to disk) is out of scope and is rejected here.
 #
 # This hook is a no-op for any agent_type other than
-# "devbench:review-supervisor"; main-session and other-agent Bash calls
+# "devbench-orchestrate:review-supervisor"; main-session and other-agent Bash calls
 # are unaffected.
 #
 # Override mechanism (operator-only):
@@ -36,7 +36,7 @@ INPUT=$(cat)
 # Without a Claude-supplied agent_type we cannot scope the rule, so the
 # hook bows out (exit 0).
 AGENT_TYPE=$(extract_field "$INPUT" "agent_type")
-if [[ "$AGENT_TYPE" != "devbench:review-supervisor" ]]; then
+if [[ "$AGENT_TYPE" != "devbench-orchestrate:review-supervisor" ]]; then
   exit 0
 fi
 
@@ -55,7 +55,7 @@ if [[ "$TOOL_NAME" == "Agent" ]]; then
     SUBAGENT=$(printf '%s' "$INPUT" | sed -nE 's/.*"subagent_type"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p')
   fi
   case "$SUBAGENT" in
-    devbench:code_review|devbench:test_review|devbench:doc_review|devbench:changes_manifest)
+    devbench-orchestrate:code_review|devbench-orchestrate:test_review|devbench-orchestrate:doc_review|devbench-orchestrate:changes_manifest)
       exit 0
       ;;
   esac
@@ -65,7 +65,7 @@ if [[ "$TOOL_NAME" == "Agent" ]]; then
   fi
   {
     printf 'guard-review-supervisor-scope: BLOCKED -- review-supervisor attempted to spawn subagent_type %s.\n' "$SUBAGENT"
-    printf 'Reason: review-supervisor may only invoke review_team subagents (devbench:code_review, devbench:test_review, devbench:doc_review, devbench:changes_manifest). Spawning any other agent (executor, git-ops, blocker_resolver, etc.) bypasses the documented pipeline (executor -> review-supervisor -> security-reviewer -> git-ops -> mark-done).\n'
+    printf 'Reason: review-supervisor may only invoke review_team subagents (devbench-orchestrate:code_review, devbench-orchestrate:test_review, devbench-orchestrate:doc_review, devbench-orchestrate:changes_manifest). Spawning any other agent (executor, git-ops, blocker_resolver, etc.) bypasses the documented pipeline (executor -> review-supervisor -> security-reviewer -> git-ops -> mark-done).\n'
     printf 'Override: only an operator may set DEVBENCH_ALLOW_REVIEW_SUPERVISOR_MUTATIONS=1 in the env to permit a one-off non-review-team subagent.\n'
   } >&2
   exit 2

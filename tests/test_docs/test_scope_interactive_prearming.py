@@ -3,7 +3,7 @@
 Verifies that:
 - docs/zero-to-ready.md has a dedicated 'Scoping a run interactively' section
   showing the scope set + claude --plugin-dir chained workflow (spec 4.2.6.3).
-- plugin/devbench/skills/orchestrate/SKILL.md carries a note that pre-armed
+- plugin/devbench-orchestrate/skills/orchestrate/SKILL.md carries a note that pre-armed
   scope.json is equivalent whether written by cmd_start --include or cmd_scope set
   (spec 4.2.6, AC-196-9).
 - docs/cli-reference.md scope section mentions the session integration path
@@ -21,7 +21,7 @@ import pytest
 REPO_ROOT = Path(__file__).parent.parent.parent
 ZERO_TO_READY_DOC = REPO_ROOT / "docs" / "zero-to-ready.md"
 CLI_REFERENCE_DOC = REPO_ROOT / "docs" / "cli-reference.md"
-SKILL_DOC = REPO_ROOT / "plugin" / "devbench" / "skills" / "orchestrate" / "SKILL.md"
+SKILL_DOC = REPO_ROOT / "plugin" / "devbench-orchestrate" / "skills" / "orchestrate" / "SKILL.md"
 
 
 def _read_zero_to_ready() -> str:
@@ -143,7 +143,7 @@ class TestSkillMdScopeEquivalenceNote:
             or ("scope.json" in text and ("identical" in lower or "equivalent" in lower))
         )
         assert has_equivalence, (
-            "plugin/devbench/skills/orchestrate/SKILL.md must contain a note that "
+            "plugin/devbench-orchestrate/skills/orchestrate/SKILL.md must contain a note that "
             "pre-armed scope.json written by 'devbench scope set' is honoured identically "
             "to scope written by 'devbench start --include' "
             "(spec section 4.2.6, AC-196-9)."
@@ -166,7 +166,7 @@ class TestSkillMdScopeEquivalenceNote:
             or ("scope.json" in step_1c_section and "identically" in step_1c_section.lower())
         )
         assert has_pathway_note, (
-            "plugin/devbench/skills/orchestrate/SKILL.md step 1c must note that "
+            "plugin/devbench-orchestrate/skills/orchestrate/SKILL.md step 1c must note that "
             "'devbench scope set' and 'devbench start --include' both write scope.json "
             "and the skill honours them identically (spec section 4.2.6, AC-196-9)."
         )

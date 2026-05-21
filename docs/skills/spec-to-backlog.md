@@ -150,7 +150,7 @@ The audit tags flow through the existing `devbench report` and
 
 ## Cross-references
 
-- [`plugin/devbench/skills/spec-to-backlog/SKILL.md`](../../plugin/devbench/skills/spec-to-backlog/SKILL.md) -- full skill prompt
+- [`plugin-authoring/devbench-authoring/skills/spec-to-backlog/SKILL.md`](../../plugin-authoring/devbench-authoring/skills/spec-to-backlog/SKILL.md) -- full skill prompt
 - [`docs/skills/create-spec.md`](create-spec.md) -- the upstream skill that authors the spec
 - [`docs/skills/configure-devbench.md`](configure-devbench.md) -- configure devbench.yaml before running
 - [`docs/creating-specs-and-backlogs.md`](../creating-specs-and-backlogs.md) -- manual backlog authoring guide

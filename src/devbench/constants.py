@@ -218,7 +218,7 @@ ALL_REQUIRED_JUDGE_NAMES: frozenset[str] = REVIEW_JUDGE_NAMES | SECURITY_JUDGE_N
 # ``log-verdict``. They are NOT counted by the done-gate's
 # ``_last_round_all_passed`` (only ``ALL_REQUIRED_JUDGE_NAMES`` is); the
 # entries land in the work-unit Comments section as audit metadata.
-# Mirrored in ``plugin/devbench/scripts/guard-verdict-format.sh``'s
+# Mirrored in ``plugin/devbench-orchestrate/scripts/guard-verdict-format.sh``'s
 # ``KNOWN_JUDGES`` array; both lists must stay in sync.
 WORKFLOW_AGENT_JUDGE_NAMES: frozenset[str] = frozenset(
     {
@@ -581,7 +581,7 @@ FINALIZE_PR_TITLE_TEMPLATE: str = "feat: {branch}"
 # ---------------------------------------------------------------------------
 # Plugin path (relative to package root)
 # ---------------------------------------------------------------------------
-DEFAULT_PLUGIN_SUBPATH: str = "plugin/devbench"
+DEFAULT_PLUGIN_SUBPATH: str = "plugin/devbench-orchestrate"
 
 # ---------------------------------------------------------------------------
 # Subprocess error exit code (Unix convention for command-not-found / timeout)
@@ -890,7 +890,7 @@ QUOTA_HANDLING_DEFAULT_BACKOFF_JITTER: float = 0.2
 # configure-devbench) each run a bounded self-critique loop. Iteration state is
 # persisted per skill so a max-iterations exhaustion is observable as an audit
 # row rather than buried in skill prose. Consumed by ``src/devbench/skill_state.py``
-# and the four SKILL.md files in ``plugin/devbench/skills/``.
+# and the four SKILL.md files in ``plugin/devbench-orchestrate/skills/``.
 # ---------------------------------------------------------------------------
 
 # Maximum number of self-critique iterations a skill may run before emitting

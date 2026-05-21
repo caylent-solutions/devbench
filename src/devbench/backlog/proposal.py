@@ -2,8 +2,8 @@
 
 After the manifest-amender rejects an amendment whose changes are legitimate
 production fixes outside the task's scope, the orchestrator invokes
-``devbench:blocker-resolver`` which writes a proposal JSON file describing
-one or more new work units the factory should generate. ``devbench:task-factory``
+``devbench-orchestrate:blocker-resolver`` which writes a proposal JSON file describing
+one or more new work units the factory should generate. ``devbench-orchestrate:task-factory``
 then materialises each proposed task as a draft ``.md`` file with a status
 determined by ``backlog.default_status_for_new_work_units`` in
 ``backlog/config/devbench.yaml`` (default: ``in-queue``; ``draft`` when opted in
@@ -1378,7 +1378,7 @@ def materialise_proposal(
     Refuses (with ``ProposalError``) when any proposed task's
     ``suggested_approach`` is too terse to produce a useful draft. The
     threshold is a module-level constant; blocker-resolver's prompt
-    (``plugin/devbench/agents/blocker-resolver.md``) requires the
+    (``plugin/devbench-orchestrate/agents/blocker-resolver.md``) requires the
     Context / Scope / TDD approach / Verify four-section structure whose
     minimum honest length exceeds the threshold. Drafts below the floor
     always require operator hand-editing before promotion, so stopping

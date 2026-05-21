@@ -902,13 +902,13 @@ class TestTranscriptParsing:
         transcript_dir.mkdir()
         # Three turns across three roles: orchestrator (no attribution),
         # executor, and code_review (note the canonical normalisation:
-        # ``devbench:code-reviewer`` -> ``code_review``).
+        # ``devbench-orchestrate:code-reviewer`` -> ``code_review``).
         (transcript_dir / "session1.jsonl").write_text(
             '{"timestamp":"2026-03-05T10:01:00Z","message":{"role":"assistant",'
             '"usage":{"input_tokens":100,"output_tokens":50}}}\n'
-            '{"timestamp":"2026-03-05T10:02:00Z","attributionAgent":"devbench:executor",'
+            '{"timestamp":"2026-03-05T10:02:00Z","attributionAgent":"devbench-orchestrate:executor",'
             '"message":{"role":"assistant","usage":{"input_tokens":200,"output_tokens":75}}}\n'
-            '{"timestamp":"2026-03-05T10:03:00Z","attributionAgent":"devbench:code-reviewer",'
+            '{"timestamp":"2026-03-05T10:03:00Z","attributionAgent":"devbench-orchestrate:code-reviewer",'
             '"message":{"role":"assistant","usage":{"input_tokens":40,"output_tokens":10}}}\n'
         )
         window_start = datetime(2026, 3, 5, 10, 0, 0, tzinfo=UTC)
@@ -916,7 +916,7 @@ class TestTranscriptParsing:
 
         assert "orchestrator" in by_role
         assert "executor" in by_role
-        assert "code_review" in by_role  # devbench:code-reviewer -> code_review
+        assert "code_review" in by_role  # devbench-orchestrate:code-reviewer -> code_review
         assert by_role["orchestrator"].input_tokens == 100
         assert by_role["executor"].input_tokens == 200
         assert by_role["code_review"].input_tokens == 40
@@ -936,15 +936,15 @@ class TestTranscriptParsing:
     def test_role_for_entry_strips_devbench_prefix_and_normalises(self) -> None:
         from devbench.reporting.report import _role_for_entry
 
-        assert _role_for_entry({"attributionAgent": "devbench:executor"}) == "executor"
-        assert _role_for_entry({"attributionAgent": "devbench:code-reviewer"}) == "code_review"
-        assert _role_for_entry({"attributionAgent": "devbench:test-reviewer"}) == "test_review"
-        assert _role_for_entry({"attributionAgent": "devbench:doc-reviewer"}) == "doc_review"
-        assert _role_for_entry({"attributionAgent": "devbench:changes-manifest"}) == "changes_manifest"
-        assert _role_for_entry({"attributionAgent": "devbench:security-reviewer"}) == "security_review"
-        assert _role_for_entry({"attributionAgent": "devbench:blocker-resolver"}) == "blocker_resolver"
-        assert _role_for_entry({"attributionAgent": "devbench:manifest-amender"}) == "manifest_amender"
-        assert _role_for_entry({"attributionAgent": "devbench:task-factory"}) == "task_factory"
+        assert _role_for_entry({"attributionAgent": "devbench-orchestrate:executor"}) == "executor"
+        assert _role_for_entry({"attributionAgent": "devbench-orchestrate:code-reviewer"}) == "code_review"
+        assert _role_for_entry({"attributionAgent": "devbench-orchestrate:test-reviewer"}) == "test_review"
+        assert _role_for_entry({"attributionAgent": "devbench-orchestrate:doc-reviewer"}) == "doc_review"
+        assert _role_for_entry({"attributionAgent": "devbench-orchestrate:changes-manifest"}) == "changes_manifest"
+        assert _role_for_entry({"attributionAgent": "devbench-orchestrate:security-reviewer"}) == "security_review"
+        assert _role_for_entry({"attributionAgent": "devbench-orchestrate:blocker-resolver"}) == "blocker_resolver"
+        assert _role_for_entry({"attributionAgent": "devbench-orchestrate:manifest-amender"}) == "manifest_amender"
+        assert _role_for_entry({"attributionAgent": "devbench-orchestrate:task-factory"}) == "task_factory"
         # Missing or malformed -> orchestrator bucket.
         assert _role_for_entry({"attributionAgent": None}) == "orchestrator"
         assert _role_for_entry({}) == "orchestrator"
@@ -4148,10 +4148,10 @@ class TestByRolePanel:
         # data rows to print.
         transcript.write_text(
             '{"timestamp":"2026-05-04T10:30:00.000000+00:00","type":"assistant",'
-            '"attributionAgent":"devbench:executor","message":{"id":"m1",'
+            '"attributionAgent":"devbench-orchestrate:executor","message":{"id":"m1",'
             '"model":"claude-opus-4-7","usage":{"input_tokens":500000,"output_tokens":100000}}}\n'
             '{"timestamp":"2026-05-04T10:31:00.000000+00:00","type":"assistant",'
-            '"attributionAgent":"devbench:code-reviewer","message":{"id":"m2",'
+            '"attributionAgent":"devbench-orchestrate:code-reviewer","message":{"id":"m2",'
             '"model":"claude-sonnet-4-6","usage":{"input_tokens":200000,"output_tokens":40000}}}\n',
             encoding="utf-8",
         )
@@ -4209,10 +4209,10 @@ class TestByRolePanelTotalsConsistency:
         transcript_dir.mkdir()
         (transcript_dir / "session.jsonl").write_text(
             '{"timestamp":"2026-05-04T10:30:00.000000+00:00","type":"assistant",'
-            '"attributionAgent":"devbench:executor","message":{"id":"m1",'
+            '"attributionAgent":"devbench-orchestrate:executor","message":{"id":"m1",'
             '"usage":{"input_tokens":1000000,"output_tokens":0}}}\n'
             '{"timestamp":"2026-05-04T10:31:00.000000+00:00","type":"assistant",'
-            '"attributionAgent":"devbench:code-reviewer","message":{"id":"m2",'
+            '"attributionAgent":"devbench-orchestrate:code-reviewer","message":{"id":"m2",'
             '"usage":{"input_tokens":1000000,"output_tokens":0}}}\n',
             encoding="utf-8",
         )

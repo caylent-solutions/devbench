@@ -9,7 +9,9 @@ from pathlib import Path
 
 import pytest
 
-SCRIPT_PATH = Path(__file__).parent.parent.parent / "plugin" / "devbench" / "scripts" / "guard-verdict-format.sh"
+SCRIPT_PATH = (
+    Path(__file__).parent.parent.parent / "plugin" / "devbench-orchestrate" / "scripts" / "guard-verdict-format.sh"
+)
 
 
 def _clean_env() -> dict[str, str]:

@@ -5,7 +5,9 @@ import subprocess
 import time
 from pathlib import Path
 
-HOOK_SCRIPT = Path(__file__).parent.parent.parent / "plugin" / "devbench" / "scripts" / "continue-orchestration.sh"
+HOOK_SCRIPT = (
+    Path(__file__).parent.parent.parent / "plugin" / "devbench-orchestrate" / "scripts" / "continue-orchestration.sh"
+)
 STATE_FILE = Path("/tmp/devbench-stop-hook-state.json")
 
 

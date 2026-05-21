@@ -1069,7 +1069,7 @@ Two enforcement layers prevent malformed audit rows:
 1. **CLI layer** (`cmd_log_verdict`): refuses any `<judge>` outside `KNOWN_JUDGE_NAMES` with a clear error naming the valid choices. Catches typos like `judge` (literal) or hyphenated forms like `code-reviewer`.
 2. **Hook layer** (`guard-verdict-format.sh`, PreToolUse): mirrors the same allowlist, plus an additional **executor scope** rule -- when the calling agent's `agent_type == "devbench:executor"` AND the judge is one of the canonical 5 reviewers, the hook blocks. The executor is an authoring agent, not a reviewer; the audit-only `executor` judge name remains allowed (records progress without satisfying the gate). Other agents (review-supervisor, security-reviewer, main session) can still write canonical reviewer verdicts.
 
-Override env var: none -- this is a security/correctness gate, not a tunable. If a legitimate use case needs to write a verdict outside the allowlist, extend `KNOWN_JUDGE_NAMES` in `src/devbench/constants.py` AND update `KNOWN_JUDGES` in `plugin/devbench/scripts/guard-verdict-format.sh` (the two lists must stay in sync).
+Override env var: none -- this is a security/correctness gate, not a tunable. If a legitimate use case needs to write a verdict outside the allowlist, extend `KNOWN_JUDGE_NAMES` in `src/devbench/constants.py` AND update `KNOWN_JUDGES` in `plugin/devbench-orchestrate/scripts/guard-verdict-format.sh` (the two lists must stay in sync).
 
 ### `log-comment`
 
@@ -1118,7 +1118,7 @@ Each rail exits 1 with a clear diagnostic when violated.
 
 #### Exit code contract
 
-The orchestrator skill ([`plugin/devbench/skills/orchestrate/SKILL.md`](../plugin/devbench/skills/orchestrate/SKILL.md) step 8) handles each non-zero exit code distinctly:
+The orchestrator skill ([`plugin/devbench-orchestrate/skills/orchestrate/SKILL.md`](../plugin/devbench-orchestrate/skills/orchestrate/SKILL.md) step 8) handles each non-zero exit code distinctly:
 
 | rc | Meaning |
 |----|---------|
@@ -1192,7 +1192,7 @@ Issue #101 reconciliation step for `pause_before_merge: true` workspaces. Querie
 
 Returns rc=0 in every normal case; rc=1 only on hard failure (gh API failure, malformed JSON, done-gate refusal). Output is a single JSON line so the orchestrator skill's step 1b reconciliation can parse it.
 
-The orchestrator skill (`plugin/devbench/skills/orchestrate/SKILL.md`) calls this command on every `in-review` work unit at the top of each loop iteration when `git_ops.pause_before_merge: true` is set in the YAML. See [`docs/git-ops-modes.md`](git-ops-modes.md) for the full pause-before-merge mode reference and [ADR-13](adr/13-pause-before-merge.md) for the design rationale.
+The orchestrator skill (`plugin/devbench-orchestrate/skills/orchestrate/SKILL.md`) calls this command on every `in-review` work unit at the top of each loop iteration when `git_ops.pause_before_merge: true` is set in the YAML. See [`docs/git-ops-modes.md`](git-ops-modes.md) for the full pause-before-merge mode reference and [ADR-13](adr/13-pause-before-merge.md) for the design rationale.
 
 ### `git-ops` orphan-pattern auto-emit (Phase 10 hardening)
 

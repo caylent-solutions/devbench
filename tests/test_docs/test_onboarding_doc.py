@@ -122,7 +122,7 @@ class TestOnboardingDocWorkedExample:
         has_commands = "claude run" in text or "devbench:" in text or "```" in text
         assert has_commands, (
             "docs/onboarding.md must show actual CLI commands (e.g., 'claude run "
-            "devbench:create-spec') so operators know how to invoke each skill "
+            "devbench-authoring:create-spec') so operators know how to invoke each skill "
             "in the chain (AC-191-9)."
         )
 

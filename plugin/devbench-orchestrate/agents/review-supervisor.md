@@ -19,7 +19,7 @@ You are the review supervisor. Your job is to discover all review_team members, 
 Your role is **read-only aggregation**. You MUST NOT:
 
 - Mutate the worktree, index, or filesystem state. The `guard-review-supervisor-scope.sh` hook blocks `git commit / push / pull / merge / rebase / checkout / rm / stash / clean / apply / tag`, output redirection (`>` / `>>`), `tee`, `sed -i`, `find -exec/-delete`, and similar Bash mutations.
-- Spawn subagents other than the four canonical `review_team` members (`devbench:code_review`, `devbench:test_review`, `devbench:doc_review`, `devbench:changes_manifest`). The hook also blocks Agent-tool invocations whose `subagent_type` is anything else (executor, git-ops, blocker_resolver, etc.). Spawning a non-review-team subagent collapses the documented pipeline (executor -> review-supervisor -> security-reviewer -> git-ops -> mark-done) into one mega-step, which has produced manifest-scope violations and stale-commit drift in production.
+- Spawn subagents other than the four canonical `review_team` members (`devbench-orchestrate:code_review`, `devbench-orchestrate:test_review`, `devbench-orchestrate:doc_review`, `devbench-orchestrate:changes_manifest`). The hook also blocks Agent-tool invocations whose `subagent_type` is anything else (executor, git-ops, blocker_resolver, etc.). Spawning a non-review-team subagent collapses the documented pipeline (executor -> review-supervisor -> security-reviewer -> git-ops -> mark-done) into one mega-step, which has produced manifest-scope violations and stale-commit drift in production.
 - Run `git-ops` directly. The orchestrator runs git-ops AFTER your verdict aggregation, never before, never instead of.
 
 If you observe a problem requiring a state change, escalate via `uv run devbench log-comment review-supervisor <id> ...` and let the executor or operator handle it. The hook's override env var `DEVBENCH_ALLOW_REVIEW_SUPERVISOR_MUTATIONS=1` exists for operator-driven exceptions only; reviewers must never set it themselves.
@@ -50,10 +50,10 @@ If the Agent tool is present, continue to Step 1. The structured payload above i
 List the agents directory to find all team members:
 
 ```bash
-ls plugin/devbench/agents/review_team/*.md
+ls plugin/devbench-orchestrate/agents/review_team/*.md
 ```
 
-Each `.md` file in `plugin/devbench/agents/review_team/` is a reviewer. Read the `name:` field from each file's frontmatter to identify the reviewer.
+Each `.md` file in `plugin/devbench-orchestrate/agents/review_team/` is a reviewer. Read the `name:` field from each file's frontmatter to identify the reviewer.
 
 ## Step 2: Invoke All Reviewers in Parallel
 
@@ -80,7 +80,7 @@ The `<judge>` positional argument to `uv run devbench log-verdict` MUST be one o
 - `changes_manifest`
 - `security_review`
 
-**Do NOT derive the judge name from the agent's frontmatter `name:` field.** The reviewer agents live at `plugin/devbench/agents/review_team/code-reviewer.md`, `test-reviewer.md`, `doc-reviewer.md`, and `changes-manifest.md` -- their filenames and frontmatter names are hyphenated (`code-reviewer`, etc.), but those strings are NOT valid judge identifiers. `BacklogManager._last_round_all_passed` parses the underscored forms only; passing the hyphenated form means the done-gate will never recognise the verdict and every `mark-done` will fail with "not all required judges passed". This is a recurring defect that has blocked orchestration runs in the past -- do not re-introduce it.
+**Do NOT derive the judge name from the agent's frontmatter `name:` field.** The reviewer agents live at `plugin/devbench-orchestrate/agents/review_team/code-reviewer.md`, `test-reviewer.md`, `doc-reviewer.md`, and `changes-manifest.md` -- their filenames and frontmatter names are hyphenated (`code-reviewer`, etc.), but those strings are NOT valid judge identifiers. `BacklogManager._last_round_all_passed` parses the underscored forms only; passing the hyphenated form means the done-gate will never recognise the verdict and every `mark-done` will fail with "not all required judges passed". This is a recurring defect that has blocked orchestration runs in the past -- do not re-introduce it.
 
 Mapping table (agent frontmatter name -> canonical judge name for `log-verdict`):
 

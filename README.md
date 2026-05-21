@@ -383,18 +383,28 @@ match to their own setup and copy it as a starting point.
 > belong in the backlog, not the console).
 >
 > **Plugin install caveat (read before considering interactive).** Interactive
-> mode requires the devbench Claude Code plugin to be loaded. The user-scope
-> install (`make plugin-install`) registers the plugin's hooks **globally on
-> this machine**, which **blocks every other Claude Code session you open
-> from writing to `backlog/**` files** -- breaking the two-track operator
-> workflow below. Prefer the per-session `--plugin-dir` approach
-> (`claude --plugin-dir $DEVBENCH_DIR/plugin/devbench`) so the hooks load
-> only for the observation session, OR uninstall (`claude plugin uninstall
-> devbench --scope user && claude plugin marketplace remove devbench --scope
-> user`) as soon as you're done observing. **For non-interactive runs the
-> plugin is never needed** -- the Agent SDK loads it ad-hoc from the
-> checkout. Skip `make plugin-install` entirely unless you have a specific
-> reason to run interactive.
+> mode requires the `devbench-orchestrate` Claude Code plugin to be loaded.
+> Issue #224 split the original `devbench` plugin into TWO marketplaces /
+> two plugins: `devbench-orchestrate` (this side) and `devbench-authoring`
+> (under `plugin-authoring/` in this same repo). **Use project scope, not
+> user scope** -- a user-scope install of `devbench-orchestrate` registers
+> the guard hooks **globally on this machine**, which blocks every other
+> Claude Code session you open from writing to `backlog/**` files,
+> re-creating the cross-session conflict the split was designed to
+> eliminate. Recommended install (from inside the workspace where you
+> want orchestrate available):
+>
+> ```bash
+> cd /path/to/execution-workspace
+> claude plugin marketplace add /path/to/devbench/plugin
+> claude plugin install devbench-orchestrate@devbench --scope project
+> ```
+>
+> Migrating from a v0.3.0 user-scope install? See
+> [`docs/migration-0.4.0.md`](docs/migration-0.4.0.md). **For non-interactive
+> runs the plugin is never needed** -- the Agent SDK loads it ad-hoc from
+> the checkout via `DEFAULT_PLUGIN_SUBPATH`. Skip the plugin install entirely
+> unless you have a specific reason to run interactive.
 >
 > **When you need to change something, stop the run and split the work
 > across two tools:**

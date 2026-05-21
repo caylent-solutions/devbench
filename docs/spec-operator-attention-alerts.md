@@ -103,7 +103,7 @@ The attention-alert surface is orthogonal to the multi-target wiring that prompt
 ## Related files (when this ships)
 
 - `src/devbench/backlog/proposal.py::classify_proposed_task` + `::classify_blocked_task` -- the two helpers the surface composes.
-- `plugin/devbench/skills/orchestrate/SKILL.md` -- option B (alert file) would add an end-of-tick write step.
+- `plugin/devbench-orchestrate/skills/orchestrate/SKILL.md` -- option B (alert file) would add an end-of-tick write step.
 - `src/devbench/activity.py` -- option C (watch panel) lives here.
 - `docs/adr/XX-operator-attention-alerts.md` -- the ADR that records which option was chosen.
 - `docs/cli-reference.md` -- new `check-attention` entry if option A lands.

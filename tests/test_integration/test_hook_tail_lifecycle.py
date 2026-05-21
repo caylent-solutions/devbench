@@ -26,7 +26,7 @@ def _entry(**overrides) -> dict:
         "timestamp": "2026-04-19T03:51:00Z",
         "event": "PreToolUse",
         "input": {
-            "agent_type": "devbench:executor",
+            "agent_type": "devbench-orchestrate:executor",
             "tool_name": "Bash",
             "tool_input": {"description": "Run tests"},
         },
@@ -70,7 +70,7 @@ def populated_workspace(tmp_path: Path) -> Path:
             timestamp="2026-04-19T00:00:05Z",
             event="PreToolUse",
             input={
-                "agent_type": "devbench:executor",
+                "agent_type": "devbench-orchestrate:executor",
                 "tool_name": "Bash",
                 "tool_input": {"description": "Run make validate"},
             },
@@ -79,7 +79,7 @@ def populated_workspace(tmp_path: Path) -> Path:
             timestamp="2026-04-19T00:00:12Z",
             event="PostToolUse",
             input={
-                "agent_type": "devbench:executor",
+                "agent_type": "devbench-orchestrate:executor",
                 "tool_name": "Bash",
                 "tool_input": {"description": "Run make validate"},
                 "tool_response": {"stdout": "All checks passed\n========= 42 passed =========\n"},

@@ -5,14 +5,15 @@
     "url": "https://www.caylent.com"
   },
   "metadata": {
-    "description": "DevBench autonomous backlog execution plugin",
-    "version": "0.2.0"
+    "description": "DevBench orchestrate marketplace -- ships the devbench-orchestrate plugin (autonomous execution phase). The companion devbench-authoring marketplace lives at plugin-authoring/ in the same repo (issue #224).",
+    "version": "0.3.0"
   },
   "plugins": [
     {
-      "name": "devbench",
-      "source": "./devbench/",
-      "description": "Autonomous backlog execution with LLM-as-judge review"
+      "name": "devbench-orchestrate",
+      "source": "./devbench-orchestrate/",
+      "description": "Autonomous backlog execution with LLM-as-judge review, guarded hooks, and the orchestrate skill. Use during the execution phase.",
+      "version": "0.4.0"
     }
   ]
 }

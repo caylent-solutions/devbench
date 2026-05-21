@@ -1,6 +1,6 @@
 """Structural pin tests for spec-to-backlog/SKILL.md set-status follow-up recommendation.
 
-Verifies that plugin/devbench/skills/spec-to-backlog/SKILL.md (AC-194-1):
+Verifies that plugin-authoring/devbench-authoring/skills/spec-to-backlog/SKILL.md (AC-194-1):
 - Recommends the canonical post-generation follow-up command:
   ``devbench set-status --include "E1" in-queue``
 - References ``docs/zero-to-ready.md`` for full bulk-operations documentation.
@@ -17,7 +17,14 @@ from pathlib import Path
 
 import pytest
 
-SKILL_PATH = Path(__file__).parent.parent.parent / "plugin" / "devbench" / "skills" / "spec-to-backlog" / "SKILL.md"
+SKILL_PATH = (
+    Path(__file__).parent.parent.parent
+    / "plugin-authoring"
+    / "devbench-authoring"
+    / "skills"
+    / "spec-to-backlog"
+    / "SKILL.md"
+)
 
 
 def _read_skill() -> str:

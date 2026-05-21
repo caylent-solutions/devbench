@@ -9,7 +9,9 @@ from pathlib import Path
 
 import pytest
 
-SCRIPT_PATH = Path(__file__).parent.parent.parent / "plugin" / "devbench" / "scripts" / "guard-work-unit-write.sh"
+SCRIPT_PATH = (
+    Path(__file__).parent.parent.parent / "plugin" / "devbench-orchestrate" / "scripts" / "guard-work-unit-write.sh"
+)
 
 
 def _run_hook(
@@ -117,8 +119,8 @@ class TestGuardWorkUnitWriteHook:
             "BACKLOG.md",
             "/workspace/BACKLOG.md",
             "docs/architecture.md",
-            "/home/user/plugin/devbench/scripts/guard-bash.sh",
-            "plugin/devbench/hooks/hooks.json",
+            "/home/user/plugin/devbench-orchestrate/scripts/guard-bash.sh",
+            "plugin/devbench-orchestrate/hooks/hooks.json",
         ],
     )
     def test_non_backlog_file_paths_are_allowed(self, file_path: str) -> None:

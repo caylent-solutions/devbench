@@ -54,7 +54,7 @@ What devbench does today, grouped by theme:
 - Recursive work-unit hierarchy (Epic → Feature → Story → Task) with automatic status rollup of parents when children complete.
 
 ### Multi-judge review
-- Four review judges (code, test, doc, changes-manifest) run in parallel via `review-supervisor`. The supervisor is **read-only**: a PreToolUse hook (`plugin/devbench/scripts/guard-review-supervisor-scope.sh`) blocks any Bash mutation (git commit/push, rm, sed -i, etc.) AND any Agent-tool invocation whose `subagent_type` is outside the canonical review_team allowlist (`devbench:code_review`, `devbench:test_review`, `devbench:doc_review`, `devbench:changes_manifest`). This closes the loophole where the supervisor previously escalated to commit / push / PR-create rights by spawning an executor subagent (issue #118).
+- Four review judges (code, test, doc, changes-manifest) run in parallel via `review-supervisor`. The supervisor is **read-only**: a PreToolUse hook (`plugin/devbench-orchestrate/scripts/guard-review-supervisor-scope.sh`) blocks any Bash mutation (git commit/push, rm, sed -i, etc.) AND any Agent-tool invocation whose `subagent_type` is outside the canonical review_team allowlist (`devbench:code_review`, `devbench:test_review`, `devbench:doc_review`, `devbench:changes_manifest`). This closes the loophole where the supervisor previously escalated to commit / push / PR-create rights by spawning an executor subagent (issue #118).
 - A separate security judge runs sequentially after the review tier passes.
 - Done-gate enforces all four review judges must REVIEW_PASS before a unit can be marked done.
 - Review failures inject prior feedback into the next executor attempt to prevent loops.
@@ -132,7 +132,7 @@ What devbench does today, grouped by theme:
 
 ```mermaid
 graph TB
-  subgraph Plugin["plugin/devbench/ (runtime prompts + hooks)"]
+  subgraph Plugin["plugin/devbench-orchestrate/ (runtime prompts + hooks)"]
     Skill["skills/orchestrate/SKILL.md"]
     Agents["agents/* (executor,<br/>review-supervisor,<br/>security-reviewer,<br/>blocker-resolver)"]
     Judges["agents/review_team/* (code,<br/>test, doc, changes-manifest)"]
@@ -180,11 +180,11 @@ The CLI is the single entry point that the runtime prompts (skill, agents, hooks
 | Reporting | `src/devbench/reporting/report.py` | Velocity + token + cost report generator |
 | Logging | `src/devbench/log_setup.py` | Stdout + file logging |
 | Scope filter | `src/devbench/scope.py` | `ScopeFilter` dataclass + `InvalidScopeError`; allow/deny scope filter with `parse`/`allows`/`to_file`/`from_file`/`clear` API; persists to `scope.json` |
-| Plugin: skill | `plugin/devbench/skills/orchestrate/SKILL.md` | The autonomous orchestration loop |
-| Plugin: agents | `plugin/devbench/agents/` | Top-level agents (executor, review-supervisor, security-reviewer, blocker-resolver) |
-| Plugin: judges | `plugin/devbench/agents/review_team/` | Four parallel review judges |
-| Plugin: hooks | `plugin/devbench/hooks/hooks.json` | Maps Claude Code hook events to scripts |
-| Plugin: scripts | `plugin/devbench/scripts/` | Bash hook implementations (guards, circuit breaker, logger) |
+| Plugin: skill | `plugin/devbench-orchestrate/skills/orchestrate/SKILL.md` | The autonomous orchestration loop |
+| Plugin: agents | `plugin/devbench-orchestrate/agents/` | Top-level agents (executor, review-supervisor, security-reviewer, blocker-resolver) |
+| Plugin: judges | `plugin/devbench-orchestrate/agents/review_team/` | Four parallel review judges |
+| Plugin: hooks | `plugin/devbench-orchestrate/hooks/hooks.json` | Maps Claude Code hook events to scripts |
+| Plugin: scripts | `plugin/devbench-orchestrate/scripts/` | Bash hook implementations (guards, circuit breaker, logger) |
 
 ---
 
@@ -379,7 +379,7 @@ graph TD
 
 ### Tier 1 -- Review tier (parallel, gated)
 
-Four judges in `plugin/devbench/agents/review_team/`:
+Four judges in `plugin/devbench-orchestrate/agents/review_team/`:
 
 - `code-reviewer.md` -- SOLID, DRY, fail-fast, evidence-based communication, security smells
 - `test-reviewer.md` -- TDD discipline, real tests not stubs, test framework discipline
@@ -414,18 +414,18 @@ The done-gate (`BacklogManager._last_round_all_passed`) checks **only** `REVIEW_
 
 Walkthrough adding a hypothetical `api-contract` judge that verifies API changes against an OpenAPI spec:
 
-1. Create `plugin/devbench/agents/review_team/api-contract.md` with the standard agent frontmatter (`name`, `description`, `model`, `tools`, `disallowedTools`) and the review logic body. Use one of the existing judges as a template -- the `name:` field becomes the judge's identifier in the verdict log.
+1. Create `plugin/devbench-orchestrate/agents/review_team/api-contract.md` with the standard agent frontmatter (`name`, `description`, `model`, `tools`, `disallowedTools`) and the review logic body. Use one of the existing judges as a template -- the `name:` field becomes the judge's identifier in the verdict log.
 2. Add `"api_contract"` to `REVIEW_JUDGE_NAMES` in `constants.py`.
-3. (Optional) If `plugin/devbench/scripts/guard-verdict-format.sh` hard-codes the allowed judge names rather than importing from constants, update it to include the new name.
+3. (Optional) If `plugin/devbench-orchestrate/scripts/guard-verdict-format.sh` hard-codes the allowed judge names rather than importing from constants, update it to include the new name.
 4. Mention the new judge in `docs/example-work-unit-template.md` so backlog authors know it exists.
 5. Run `make validate` to confirm tests still pass.
 6. Test end-to-end on a sample work unit.
 
-`review-supervisor` discovers judges by listing `plugin/devbench/agents/review_team/*.md` at runtime, so no change to `review-supervisor.md` is required -- it picks up the new agent automatically.
+`review-supervisor` discovers judges by listing `plugin/devbench-orchestrate/agents/review_team/*.md` at runtime, so no change to `review-supervisor.md` is required -- it picks up the new agent automatically.
 
 ### Removing a judge
 
-1. Delete the agent markdown file from `plugin/devbench/agents/review_team/`.
+1. Delete the agent markdown file from `plugin/devbench-orchestrate/agents/review_team/`.
 2. Remove the name from `REVIEW_JUDGE_NAMES` in `constants.py`.
 3. Existing work units that have stale REVIEW_PASS entries from the removed judge in their Comments are still valid -- the done-gate just ignores extra entries.
 
@@ -540,7 +540,7 @@ For the cost values under `report:`, see [model-pricing.md](model-pricing.md) fo
 
 ## 9. Hooks layer
 
-DevBench registers hooks for Claude Code events via `plugin/devbench/hooks/hooks.json`. Hooks run shell scripts that can either log silently or block the action by exiting with a non-zero code.
+DevBench registers hooks for Claude Code events via `plugin/devbench-orchestrate/hooks/hooks.json`. Hooks run shell scripts that can either log silently or block the action by exiting with a non-zero code.
 
 | Hook event | Matcher | Script(s) | Purpose |
 | --- | --- | --- | --- |
@@ -571,7 +571,7 @@ DevBench registers hooks for Claude Code events via `plugin/devbench/hooks/hooks
 | `executor` | BLOCK. Executor agents must not modify work-unit files directly; that's the orchestrate skill's job. |
 | missing / unrecognised | BLOCK. Default-deny. Preserves the original safety guarantee for any legacy caller that hasn't been updated to set the indicator. |
 
-Implementation: `_resolve_caller_role` in `plugin/devbench/scripts/_hook_lib.sh` reads the env var and returns one of the three normalized values. The orchestrator subprocess sets `DEVBENCH_AGENT_ROLE=orchestrator` in its env before invoking any Claude tool; executor subprocesses inherit no such env var.
+Implementation: `_resolve_caller_role` in `plugin/devbench-orchestrate/scripts/_hook_lib.sh` reads the env var and returns one of the three normalized values. The orchestrator subprocess sets `DEVBENCH_AGENT_ROLE=orchestrator` in its env before invoking any Claude tool; executor subprocesses inherit no such env var.
 
 Content rules (rule 10 em-dash, rule 11 checkout_directory prefix) ALWAYS fire regardless of role -- the role bypass affects only the final block-or-allow gate. An orchestrator-tier write that violates rule 10 or rule 11 is still rejected with exit 2 + a structured error message.
 

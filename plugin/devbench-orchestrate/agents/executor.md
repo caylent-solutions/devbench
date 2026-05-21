@@ -302,7 +302,7 @@ Procedure (execute in order -- each step is load-bearing):
    uv run devbench log-comment executor $ARGUMENTS "NEEDS_ESCALATION: validation gate surfaced N out-of-scope production bugs. Proposal emitted: .devbench/proposals/$ARGUMENTS.json with N proposed tasks (<T-ID-1: title>, <T-ID-2: title>, ...). Source task should be marked done iff its own ACs passed; the proposed tasks are independent follow-ups."
    ```
 
-7. The orchestrate skill (step 4c) detects the proposal file and invokes `devbench:task-factory`, which materialises the drafts at `## Status: proposed`. Do NOT attempt to run task-factory yourself.
+7. The orchestrate skill (step 4c) detects the proposal file and invokes `devbench-orchestrate:task-factory`, which materialises the drafts at `## Status: proposed`. Do NOT attempt to run task-factory yourself.
 
 Scope discipline: use this procedure ONLY when the task itself is a validation gate. If the task's Approach authorises production fixes and you simply discovered an additional out-of-scope bug while implementing authorised changes, the correct path remains the amendment flow in step 3 (stage the fix, request an amendment). Do not use bug-escalation to route around a rejected amendment.
 
@@ -310,7 +310,7 @@ Scope discipline: use this procedure ONLY when the task itself is a validation g
 
 When you call `uv run devbench log-comment` or return a final assistant message, you MUST describe conditions factually. You MUST NOT use imperatives that direct the orchestrator's loop. The orchestrator decides its own control flow based ONLY on `uv run devbench next` and the stop-hook circuit breaker -- per the SKILL halt-discipline rule. Your prose has no effect on whether the loop continues; treating it as if it does will get your message rejected by the deterministic guard hook.
 
-Forbidden phrases (case-insensitive substring match -- enforced by `plugin/devbench/scripts/guard-comment-format.sh`):
+Forbidden phrases (case-insensitive substring match -- enforced by `plugin/devbench-orchestrate/scripts/guard-comment-format.sh`):
 
 - `halt orchestration`
 - `halting orchestration`

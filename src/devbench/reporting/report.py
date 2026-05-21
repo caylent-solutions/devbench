@@ -501,8 +501,8 @@ def _role_for_entry(entry: dict) -> str:
     """Return the per-role bucket for one transcript entry (issue #123).
 
     Each Claude Code transcript message carries an ``attributionAgent`` field
-    naming the active agent (e.g. ``"devbench:executor"``,
-    ``"devbench:code-reviewer"``). Messages emitted by the outer orchestrator
+    naming the active agent (e.g. ``"devbench-orchestrate:executor"``,
+    ``"devbench-orchestrate:code-reviewer"``). Messages emitted by the outer orchestrator
     loop have no attributionAgent and are bucketed as ``orchestrator``.
     Subagent attributions are stripped of the ``devbench:`` prefix and
     normalised to underscores so the buckets match the canonical role names

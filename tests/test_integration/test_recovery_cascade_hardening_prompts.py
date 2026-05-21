@@ -15,7 +15,7 @@ import pytest
 
 from devbench.constants import DEFAULT_MAX_CASCADE_DEPTH
 
-PLUGIN_ROOT = Path(__file__).resolve().parent.parent.parent / "plugin" / "devbench"
+PLUGIN_ROOT = Path(__file__).resolve().parent.parent.parent / "plugin" / "devbench-orchestrate"
 BLOCKER_RESOLVER = PLUGIN_ROOT / "agents" / "blocker-resolver.md"
 MANIFEST_AMENDER = PLUGIN_ROOT / "agents" / "manifest-amender.md"
 TASK_FACTORY = PLUGIN_ROOT / "agents" / "task-factory.md"

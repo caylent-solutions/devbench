@@ -19,7 +19,9 @@ from pathlib import Path
 
 import pytest
 
-HOOKS_JSON_PATH = Path(__file__).resolve().parent.parent.parent / "plugin" / "devbench" / "hooks" / "hooks.json"
+HOOKS_JSON_PATH = (
+    Path(__file__).resolve().parent.parent.parent / "plugin" / "devbench-orchestrate" / "hooks" / "hooks.json"
+)
 
 
 @pytest.fixture(scope="module")

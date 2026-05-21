@@ -138,7 +138,7 @@ recovery probe interval, webhook notifications, or the on-exhaustion action.
 
 ## Cross-references
 
-- [`plugin/devbench/skills/configure-devbench/SKILL.md`](../../plugin/devbench/skills/configure-devbench/SKILL.md) -- full skill prompt
+- [`plugin-authoring/devbench-authoring/skills/configure-devbench/SKILL.md`](../../plugin-authoring/devbench-authoring/skills/configure-devbench/SKILL.md) -- full skill prompt
 - [`docs/skills/bootstrap-environment.md`](bootstrap-environment.md) -- next step after configure-devbench
 - [`docs/devbench-yaml-reference.md`](../devbench-yaml-reference.md) -- full annotated YAML reference
 - [`sample-config.yaml`](../../sample-config.yaml) -- reference config with every possible key

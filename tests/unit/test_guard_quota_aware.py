@@ -5,7 +5,7 @@ The hook intercepts ``uv run devbench *`` Bash invocations and defers them
 workspace-root or session-scoped path AND the ``reset_at`` epoch has not yet
 passed.
 
-The hook is registered in ``plugin/devbench/hooks/hooks.json`` under the Bash
+The hook is registered in ``plugin/devbench-orchestrate/hooks/hooks.json`` under the Bash
 matcher.  It is invoked before any ``uv run devbench`` command so that the
 orchestrator does not race past an active quota wait window.
 
@@ -26,7 +26,9 @@ from pathlib import Path
 
 import pytest
 
-SCRIPT_PATH = Path(__file__).parent.parent.parent / "plugin" / "devbench" / "scripts" / "guard-quota-aware.sh"
+SCRIPT_PATH = (
+    Path(__file__).parent.parent.parent / "plugin" / "devbench-orchestrate" / "scripts" / "guard-quota-aware.sh"
+)
 
 
 def _run_hook(
@@ -471,7 +473,9 @@ class TestGuardQuotaAwareMalformedCheckpoint:
 class TestGuardQuotaAwareHooksJsonRegistration:
     """guard-quota-aware.sh must be registered in hooks.json under the Bash PreToolUse matcher."""
 
-    HOOKS_JSON_PATH = Path(__file__).resolve().parent.parent.parent / "plugin" / "devbench" / "hooks" / "hooks.json"
+    HOOKS_JSON_PATH = (
+        Path(__file__).resolve().parent.parent.parent / "plugin" / "devbench-orchestrate" / "hooks" / "hooks.json"
+    )
 
     def test_hooks_json_contains_guard_quota_aware(self) -> None:
         """hooks.json must register guard-quota-aware.sh for Bash PreToolUse."""

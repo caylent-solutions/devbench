@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-SCRIPT_PATH = Path(__file__).parent.parent.parent / "plugin" / "devbench" / "scripts" / "_hook_lib.sh"
+SCRIPT_PATH = Path(__file__).parent.parent.parent / "plugin" / "devbench-orchestrate" / "scripts" / "_hook_lib.sh"
 
 
 def _clean_env() -> dict[str, str]:

@@ -35,7 +35,7 @@ Implemented in `src/devbench/backlog/amendment.py::PreFilter`. Every rule below 
 
 ### Layer 2 -- LLM semantic judge
 
-Implemented as `plugin/devbench/agents/manifest-amender.md`. Only invoked when Layer 1 passes. Answers three questions:
+Implemented as `plugin/devbench-orchestrate/agents/manifest-amender.md`. Only invoked when Layer 1 passes. Answers three questions:
 
 1. **Approach authorisation.** Does the work unit's Approach text authorise the *kind* of change the request describes? (Natural-language variation across backlogs makes this hard to encode deterministically.)
 2. **Scope minimality.** Is the diff for each file in `files_to_add` minimal and scoped to the linked ACs, or does it sprawl into unrelated work?
@@ -113,7 +113,7 @@ The directory layout mirrors `<workspace>/.devbench/ci-failures/` (used by `_han
 - **It does not let the executor edit work-unit files directly.** The guard hook `guard-work-unit-write.sh` continues to block Edit/Write on `backlog/**/*.md`. The CLI writes via subprocess, bypassing the hook the same way `log-verdict` has always worked.
 - **It does not allow amendments outside the staged diff.** Every file in `files_to_add` must be in the staged diff against base; the pre-filter rejects attempts to include unrelated files.
 - **It does not retry.** One pending request per task at a time; `max_requests_per_execution` caps the total per executor run. If the amender rejects, the task blocks for human review.
-- **It does not cover validation-gate tasks.** Validation gates (empty Changes Manifest / Approach that forbids production-code changes) never stage a fix, so they never produce an amendment request for the amender to review. When a validation gate surfaces an out-of-scope production bug, the executor uses a separate path -- the BUG ESCALATION FOR VALIDATION GATES procedure in `plugin/devbench/agents/executor.md`, which writes a proposal JSON directly so task-factory can materialise follow-up work units. See [ADR-06: Validation-gate bug escalation](adr/06-validation-gate-bug-escalation.md) and [docs/task-factory.md](task-factory.md) for the full flow.
+- **It does not cover validation-gate tasks.** Validation gates (empty Changes Manifest / Approach that forbids production-code changes) never stage a fix, so they never produce an amendment request for the amender to review. When a validation gate surfaces an out-of-scope production bug, the executor uses a separate path -- the BUG ESCALATION FOR VALIDATION GATES procedure in `plugin/devbench-orchestrate/agents/executor.md`, which writes a proposal JSON directly so task-factory can materialise follow-up work units. See [ADR-06: Validation-gate bug escalation](adr/06-validation-gate-bug-escalation.md) and [docs/task-factory.md](task-factory.md) for the full flow.
 
 ### Amendments vs. bug-escalation -- which applies?
 
@@ -128,8 +128,8 @@ The directory layout mirrors `<workspace>/.devbench/ci-failures/` (used by `_han
 - `src/devbench/backlog/manifest.py` -- Changes Manifest parser and writer (Layer 3 mechanics).
 - `src/devbench/backlog/amendment.py` -- amendment request schema, PreFilter, apply/reject lifecycle, post-check.
 - `src/devbench/cli.py` -- `cmd_request_amendment`, `cmd_apply_amendment`, `cmd_reject_amendment`.
-- `plugin/devbench/agents/manifest-amender.md` -- Layer 2 judge prompt.
-- `plugin/devbench/skills/orchestrate/SKILL.md` -- step 4b of the main loop.
+- `plugin/devbench-orchestrate/agents/manifest-amender.md` -- Layer 2 judge prompt.
+- `plugin/devbench-orchestrate/skills/orchestrate/SKILL.md` -- step 4b of the main loop.
 - `tests/test_backlog/test_manifest.py`, `tests/test_backlog/test_amendment.py`, `tests/test_backlog/test_amendment_prefilter.py`, `tests/test_integration/test_amendment_lifecycle.py` -- unit + integration coverage.
 
 ## Pre-conflict check (issue #137)

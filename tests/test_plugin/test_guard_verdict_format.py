@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 HOOK_PATH = (
-    Path(__file__).parent.parent.parent / "plugin" / "devbench" / "scripts" / "guard-verdict-format.sh"
+    Path(__file__).parent.parent.parent / "plugin" / "devbench-orchestrate" / "scripts" / "guard-verdict-format.sh"
 ).resolve()
 
 

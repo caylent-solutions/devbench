@@ -6,14 +6,26 @@ from pathlib import Path
 
 import pytest
 
-SKILL_PATH = Path(__file__).parent.parent.parent / "plugin" / "devbench" / "skills" / "orchestrate" / "SKILL.md"
+SKILL_PATH = (
+    Path(__file__).parent.parent.parent / "plugin" / "devbench-orchestrate" / "skills" / "orchestrate" / "SKILL.md"
+)
 
 CREATE_SPEC_SKILL_PATH = (
-    Path(__file__).parent.parent.parent / "plugin" / "devbench" / "skills" / "create-spec" / "SKILL.md"
+    Path(__file__).parent.parent.parent
+    / "plugin-authoring"
+    / "devbench-authoring"
+    / "skills"
+    / "create-spec"
+    / "SKILL.md"
 )
 
 SPEC_TO_BACKLOG_SKILL_PATH = (
-    Path(__file__).parent.parent.parent / "plugin" / "devbench" / "skills" / "spec-to-backlog" / "SKILL.md"
+    Path(__file__).parent.parent.parent
+    / "plugin-authoring"
+    / "devbench-authoring"
+    / "skills"
+    / "spec-to-backlog"
+    / "SKILL.md"
 )
 
 
@@ -1061,7 +1073,12 @@ class TestSpecToBacklogSkillSelfCritiqueRubric:
 # ---------------------------------------------------------------------------
 
 BOOTSTRAP_ENV_SKILL_PATH = (
-    Path(__file__).parent.parent.parent / "plugin" / "devbench" / "skills" / "bootstrap-environment" / "SKILL.md"
+    Path(__file__).parent.parent.parent
+    / "plugin-authoring"
+    / "devbench-authoring"
+    / "skills"
+    / "bootstrap-environment"
+    / "SKILL.md"
 )
 
 
@@ -1234,7 +1251,12 @@ class TestBootstrapEnvironmentSkillSelfVerifyLoop:
 # ---------------------------------------------------------------------------
 
 CONFIGURE_DEVBENCH_SKILL_PATH = (
-    Path(__file__).parent.parent.parent / "plugin" / "devbench" / "skills" / "configure-devbench" / "SKILL.md"
+    Path(__file__).parent.parent.parent
+    / "plugin-authoring"
+    / "devbench-authoring"
+    / "skills"
+    / "configure-devbench"
+    / "SKILL.md"
 )
 
 
@@ -1542,10 +1564,20 @@ _ONBOARDING_SKILL_PATHS = {
     "create-spec": CREATE_SPEC_SKILL_PATH,
     "spec-to-backlog": SPEC_TO_BACKLOG_SKILL_PATH,
     "bootstrap-environment": (
-        Path(__file__).parent.parent.parent / "plugin" / "devbench" / "skills" / "bootstrap-environment" / "SKILL.md"
+        Path(__file__).parent.parent.parent
+        / "plugin-authoring"
+        / "devbench-authoring"
+        / "skills"
+        / "bootstrap-environment"
+        / "SKILL.md"
     ),
     "configure-devbench": (
-        Path(__file__).parent.parent.parent / "plugin" / "devbench" / "skills" / "configure-devbench" / "SKILL.md"
+        Path(__file__).parent.parent.parent
+        / "plugin-authoring"
+        / "devbench-authoring"
+        / "skills"
+        / "configure-devbench"
+        / "SKILL.md"
     ),
 }
 

@@ -126,5 +126,5 @@ The commit history in the sibling checkout becomes the audit log.
   modes; local-only is one of four.
 - [`docs/cli-reference.md`](cli-reference.md) -- `devbench check`,
   `devbench ensure-branch`, `devbench git-ops`.
-- [`plugin/devbench/skills/orchestrate/SKILL.md`](../plugin/devbench/skills/orchestrate/SKILL.md)
+- [`plugin/devbench-orchestrate/skills/orchestrate/SKILL.md`](../plugin/devbench-orchestrate/skills/orchestrate/SKILL.md)
   -- the orchestrator loop the local-only path flows through.

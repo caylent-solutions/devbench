@@ -129,7 +129,7 @@ make -C $DEVBENCH_DIR plugin-install && claude plugin list
 This registers the devbench marketplace directory and installs the plugin at user scope so
 every `claude` session on this machine can see DevBench's orchestrate skill.
 
-**What is registered:** the `plugin/devbench/` directory in your devbench clone is added to
+**What is registered:** the `plugin/devbench-orchestrate/` directory in your devbench clone is added to
 Claude Code's marketplace, and the `devbench` plugin entry is installed under your user
 profile (`~/.claude/`).
 

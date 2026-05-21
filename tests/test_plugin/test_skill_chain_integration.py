@@ -29,7 +29,8 @@ from devbench.config_loader import load_runtime_config
 # Absolute path to the repo root so tests are portable regardless of cwd.
 _REPO_ROOT = Path(__file__).parent.parent.parent
 
-_SKILLS_DIR = _REPO_ROOT / "plugin" / "devbench" / "skills"
+# Issue #224: all four chain skills live in the authoring plugin after the split.
+_SKILLS_DIR = _REPO_ROOT / "plugin-authoring" / "devbench-authoring" / "skills"
 _FIXTURES_DIR = _REPO_ROOT / "tests" / "fixtures" / "skill_chain"
 
 _SKILL_NAMES = (
@@ -592,7 +593,7 @@ class TestMakeValidatePassesWithSkillsInstalled:
     """AC-191-10: make validate must pass against the devbench codebase with new skills installed."""
 
     def test_all_skill_dirs_present(self) -> None:
-        """All four onboarding skill directories must be present under plugin/devbench/skills/."""
+        """All four onboarding skill dirs must be present under the authoring plugin (issue #224)."""
         for skill_name in _SKILL_NAMES:
             skill_dir = _SKILLS_DIR / skill_name
             assert skill_dir.is_dir(), (

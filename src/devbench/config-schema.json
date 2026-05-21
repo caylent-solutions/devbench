@@ -683,27 +683,27 @@
       "properties": {
         "executor": {
           "type": "string",
-          "description": "Model for plugin/devbench/agents/executor.md. Default null (use frontmatter)."
+          "description": "Model for plugin/devbench-orchestrate/agents/executor.md. Default null (use frontmatter)."
         },
         "blocker_resolver": {
           "type": "string",
-          "description": "Model for plugin/devbench/agents/blocker-resolver.md. Default null (use frontmatter)."
+          "description": "Model for plugin/devbench-orchestrate/agents/blocker-resolver.md. Default null (use frontmatter)."
         },
         "manifest_amender": {
           "type": "string",
-          "description": "Model for plugin/devbench/agents/manifest-amender.md. Default null (use frontmatter)."
+          "description": "Model for plugin/devbench-orchestrate/agents/manifest-amender.md. Default null (use frontmatter)."
         },
         "security_reviewer": {
           "type": "string",
-          "description": "Model for plugin/devbench/agents/security-reviewer.md. Default null (use frontmatter)."
+          "description": "Model for plugin/devbench-orchestrate/agents/security-reviewer.md. Default null (use frontmatter)."
         },
         "task_factory": {
           "type": "string",
-          "description": "Model for plugin/devbench/agents/task-factory.md. Default null (use frontmatter)."
+          "description": "Model for plugin/devbench-orchestrate/agents/task-factory.md. Default null (use frontmatter)."
         },
         "review_supervisor": {
           "type": "string",
-          "description": "Model for plugin/devbench/agents/review-supervisor.md. Default null (use frontmatter)."
+          "description": "Model for plugin/devbench-orchestrate/agents/review-supervisor.md. Default null (use frontmatter)."
         },
         "review_team": {
           "type": "object",
@@ -712,19 +712,19 @@
           "properties": {
             "code_reviewer": {
               "type": "string",
-              "description": "Model for plugin/devbench/agents/review_team/code-reviewer.md."
+              "description": "Model for plugin/devbench-orchestrate/agents/review_team/code-reviewer.md."
             },
             "test_reviewer": {
               "type": "string",
-              "description": "Model for plugin/devbench/agents/review_team/test-reviewer.md."
+              "description": "Model for plugin/devbench-orchestrate/agents/review_team/test-reviewer.md."
             },
             "doc_reviewer": {
               "type": "string",
-              "description": "Model for plugin/devbench/agents/review_team/doc-reviewer.md."
+              "description": "Model for plugin/devbench-orchestrate/agents/review_team/doc-reviewer.md."
             },
             "changes_manifest": {
               "type": "string",
-              "description": "Model for plugin/devbench/agents/review_team/changes-manifest.md."
+              "description": "Model for plugin/devbench-orchestrate/agents/review_team/changes-manifest.md."
             }
           }
         }

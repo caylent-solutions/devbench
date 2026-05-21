@@ -1,11 +1,14 @@
-"""Unit tests for plugin/devbench/.claude-plugin/plugin.json marketplace manifest.
+"""Unit tests for both plugin.json manifests after the issue #224 split.
 
-AC-191-1: Plugin registers in Claude Code marketplace OR is installable via
-local plugin path with name `devbench`.
+After the split, this repo ships TWO marketplaces from sibling directory
+roots:
 
-These tests verify the manifest has the full set of metadata fields required
-for Claude Code marketplace discovery: version (bumped from 0.1.0), keywords,
-repository, license, and homepage.
+- ``plugin/devbench-orchestrate/`` (the orchestrate plugin)
+- ``plugin-authoring/devbench-authoring/`` (the authoring plugin)
+
+These tests assert that each manifest has the full set of metadata
+fields required for Claude Code marketplace discovery: version (semver),
+keywords, repository, license, and homepage.
 """
 
 from __future__ import annotations
@@ -17,9 +20,14 @@ from typing import Any
 
 import pytest
 
-PLUGIN_JSON_PATH = Path(__file__).parent.parent.parent / "plugin" / "devbench" / ".claude-plugin" / "plugin.json"
+REPO_ROOT = Path(__file__).parent.parent.parent
 
-REQUIRED_FIELDS = (
+ORCHESTRATE_PLUGIN_JSON = REPO_ROOT / "plugin" / "devbench-orchestrate" / ".claude-plugin" / "plugin.json"
+ORCHESTRATE_MARKETPLACE_JSON = REPO_ROOT / "plugin" / ".claude-plugin" / "marketplace.json"
+AUTHORING_PLUGIN_JSON = REPO_ROOT / "plugin-authoring" / "devbench-authoring" / ".claude-plugin" / "plugin.json"
+AUTHORING_MARKETPLACE_JSON = REPO_ROOT / "plugin-authoring" / ".claude-plugin" / "marketplace.json"
+
+REQUIRED_PLUGIN_FIELDS = (
     "name",
     "description",
     "version",
@@ -30,149 +38,145 @@ REQUIRED_FIELDS = (
 )
 
 
-@pytest.fixture(scope="session")
-def plugin_manifest() -> dict[str, Any]:
-    """Load and parse plugin.json once per test session -- shared across all test classes."""
-    raw = PLUGIN_JSON_PATH.read_text(encoding="utf-8")
+def _load_json(path: Path) -> dict[str, Any]:
+    raw = path.read_text(encoding="utf-8")
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
-        pytest.fail(f"plugin.json is not valid JSON: {exc}")
-    assert isinstance(data, dict), "plugin.json top-level value must be a JSON object."
+        pytest.fail(f"{path} is not valid JSON: {exc}")
+    assert isinstance(data, dict), f"{path} top-level value must be a JSON object."
     return data
 
 
+@pytest.fixture(scope="session")
+def orchestrate_plugin_manifest() -> dict[str, Any]:
+    return _load_json(ORCHESTRATE_PLUGIN_JSON)
+
+
+@pytest.fixture(scope="session")
+def authoring_plugin_manifest() -> dict[str, Any]:
+    return _load_json(AUTHORING_PLUGIN_JSON)
+
+
+@pytest.fixture(scope="session")
+def orchestrate_marketplace_manifest() -> dict[str, Any]:
+    return _load_json(ORCHESTRATE_MARKETPLACE_JSON)
+
+
+@pytest.fixture(scope="session")
+def authoring_marketplace_manifest() -> dict[str, Any]:
+    return _load_json(AUTHORING_MARKETPLACE_JSON)
+
+
 @pytest.mark.unit
-class TestPluginJsonExists:
-    """Sanity: the manifest file must exist at the expected path."""
+class TestBothPluginJsonFilesExist:
+    """Issue #224 AC-2 / AC-8: both plugin.json manifests must exist."""
 
-    def test_plugin_json_file_exists(self) -> None:
-        """plugin.json must exist at plugin/devbench/.claude-plugin/plugin.json."""
-        assert PLUGIN_JSON_PATH.exists(), f"plugin.json not found at expected path: {PLUGIN_JSON_PATH}"
+    def test_orchestrate_plugin_json_exists(self) -> None:
+        assert ORCHESTRATE_PLUGIN_JSON.exists(), f"orchestrate plugin.json missing at {ORCHESTRATE_PLUGIN_JSON}"
 
+    def test_authoring_plugin_json_exists(self) -> None:
+        assert AUTHORING_PLUGIN_JSON.exists(), f"authoring plugin.json missing at {AUTHORING_PLUGIN_JSON}"
 
-@pytest.mark.unit
-class TestPluginJsonIsValid:
-    """plugin.json must be valid JSON."""
-
-    def test_plugin_json_is_parseable(self, plugin_manifest: dict[str, Any]) -> None:
-        """plugin.json must be valid, parseable JSON -- not empty or malformed."""
-        assert isinstance(plugin_manifest, dict), "plugin.json top-level value must be a JSON object."
-
-
-@pytest.mark.unit
-class TestPluginJsonRequiredFields:
-    """plugin.json must contain all required marketplace-discovery fields."""
-
-    @pytest.mark.parametrize("field", REQUIRED_FIELDS)
-    def test_required_field_present(self, plugin_manifest: dict[str, Any], field: str) -> None:
-        """Each required marketplace metadata field must be present in plugin.json."""
-        assert field in plugin_manifest, (
-            f"plugin.json is missing required field '{field}'. Present fields: {sorted(plugin_manifest.keys())}"
+    def test_orchestrate_marketplace_json_exists(self) -> None:
+        assert ORCHESTRATE_MARKETPLACE_JSON.exists(), (
+            f"orchestrate marketplace.json missing at {ORCHESTRATE_MARKETPLACE_JSON}"
         )
 
-    @pytest.mark.parametrize("field", REQUIRED_FIELDS)
-    def test_required_field_non_empty(self, plugin_manifest: dict[str, Any], field: str) -> None:
-        """Each required field must have a non-empty value."""
-        value = plugin_manifest.get(field)
-        if isinstance(value, list):
-            assert len(value) > 0, f"plugin.json field '{field}' must be a non-empty list, got: {value!r}"
-        else:
-            assert value, f"plugin.json field '{field}' must be a non-empty string, got: {value!r}"
-
-
-@pytest.mark.unit
-class TestPluginJsonName:
-    """plugin.json 'name' field must equal 'devbench'."""
-
-    def test_name_is_devbench(self, plugin_manifest: dict[str, Any]) -> None:
-        """AC-191-1: plugin name must be 'devbench' for local plugin path install."""
-        assert plugin_manifest["name"] == "devbench", (
-            f"plugin.json 'name' must be 'devbench', got: {plugin_manifest.get('name')!r}"
+    def test_authoring_marketplace_json_exists(self) -> None:
+        assert AUTHORING_MARKETPLACE_JSON.exists(), (
+            f"authoring marketplace.json missing at {AUTHORING_MARKETPLACE_JSON}"
         )
 
 
 @pytest.mark.unit
-class TestPluginJsonVersion:
-    """plugin.json version must be bumped beyond 0.1.0."""
+class TestOrchestratePluginJsonShape:
+    """Orchestrate plugin.json content (issue #224)."""
 
-    def test_version_bumped_from_stub(self, plugin_manifest: dict[str, Any]) -> None:
-        """version must be bumped from the old 3-field stub value (0.1.0)."""
-        version = plugin_manifest.get("version", "")
-        assert version != "0.1.0", (
-            f"plugin.json version must be bumped from '0.1.0' (the pre-expansion stub). Got: {version!r}"
+    @pytest.mark.parametrize("field", REQUIRED_PLUGIN_FIELDS)
+    def test_required_field_present(self, orchestrate_plugin_manifest: dict[str, Any], field: str) -> None:
+        assert field in orchestrate_plugin_manifest, (
+            f"orchestrate plugin.json missing required field {field!r}; "
+            f"present fields: {sorted(orchestrate_plugin_manifest.keys())}"
         )
 
-    def test_version_is_semver_like(self, plugin_manifest: dict[str, Any]) -> None:
-        """version must match a semver-like pattern (X.Y.Z)."""
-        version = plugin_manifest.get("version", "")
-        assert re.match(r"^\d+\.\d+\.\d+$", version), (
-            f"plugin.json version must follow semantic versioning (X.Y.Z). Got: {version!r}"
+    def test_name_is_devbench_orchestrate(self, orchestrate_plugin_manifest: dict[str, Any]) -> None:
+        assert orchestrate_plugin_manifest["name"] == "devbench-orchestrate", (
+            f"orchestrate plugin.json name must be 'devbench-orchestrate' "
+            f"(issue #224 AC-2); got {orchestrate_plugin_manifest['name']!r}"
         )
 
-
-@pytest.mark.unit
-class TestPluginJsonKeywords:
-    """plugin.json 'keywords' field must be a non-empty list of strings."""
-
-    def test_keywords_is_list(self, plugin_manifest: dict[str, Any]) -> None:
-        """keywords must be a JSON array."""
-        assert isinstance(plugin_manifest.get("keywords"), list), (
-            f"plugin.json 'keywords' must be a list, got: {type(plugin_manifest.get('keywords'))}"
+    def test_version_is_0_4_0_or_higher(self, orchestrate_plugin_manifest: dict[str, Any]) -> None:
+        version = orchestrate_plugin_manifest["version"]
+        assert re.match(r"^\d+\.\d+\.\d+$", version), f"orchestrate plugin.json version must be semver; got {version!r}"
+        major, minor, _ = (int(part) for part in version.split("."))
+        assert (major, minor) >= (0, 4), (
+            f"orchestrate plugin.json version must be >= 0.4.0 (issue #224 split bump); got {version!r}"
         )
 
-    def test_keywords_contains_only_strings(self, plugin_manifest: dict[str, Any]) -> None:
-        """Each keyword must be a non-empty string."""
-        keywords = plugin_manifest.get("keywords", [])
-        for idx, kw in enumerate(keywords):
-            assert isinstance(kw, str) and kw, f"plugin.json 'keywords[{idx}]' must be a non-empty string, got: {kw!r}"
-
-    def test_keywords_includes_devbench(self, plugin_manifest: dict[str, Any]) -> None:
-        """keywords must include 'devbench' for marketplace search relevance."""
-        keywords = plugin_manifest.get("keywords", [])
-        assert "devbench" in keywords, f"plugin.json 'keywords' must include 'devbench'. Got: {keywords!r}"
-
-
-@pytest.mark.unit
-class TestPluginJsonRepository:
-    """plugin.json 'repository' field must be a non-empty string (URL or shorthand)."""
-
-    def test_repository_is_string(self, plugin_manifest: dict[str, Any]) -> None:
-        """repository must be a string."""
-        assert isinstance(plugin_manifest.get("repository"), str), (
-            f"plugin.json 'repository' must be a string, got: {type(plugin_manifest.get('repository'))}"
+    def test_repository_references_caylent_solutions(self, orchestrate_plugin_manifest: dict[str, Any]) -> None:
+        repo = orchestrate_plugin_manifest["repository"]
+        assert "caylent-solutions" in repo and "devbench" in repo, (
+            f"orchestrate plugin.json repository must reference caylent-solutions/devbench; got {repo!r}"
         )
 
-    def test_repository_references_caylent_solutions(self, plugin_manifest: dict[str, Any]) -> None:
-        """repository must reference the canonical caylent-solutions/devbench repo."""
-        repository = plugin_manifest.get("repository", "")
-        assert "caylent-solutions" in repository and "devbench" in repository, (
-            f"plugin.json 'repository' must reference 'caylent-solutions/devbench'. Got: {repository!r}"
+    def test_homepage_is_https(self, orchestrate_plugin_manifest: dict[str, Any]) -> None:
+        assert orchestrate_plugin_manifest["homepage"].startswith("https://"), (
+            f"orchestrate plugin.json homepage must be https://; got {orchestrate_plugin_manifest['homepage']!r}"
         )
 
 
 @pytest.mark.unit
-class TestPluginJsonLicense:
-    """plugin.json 'license' field must be a non-empty string."""
+class TestAuthoringPluginJsonShape:
+    """Authoring plugin.json content (issue #224)."""
 
-    def test_license_is_string(self, plugin_manifest: dict[str, Any]) -> None:
-        """license must be a string."""
-        assert isinstance(plugin_manifest.get("license"), str), (
-            f"plugin.json 'license' must be a string, got: {type(plugin_manifest.get('license'))}"
+    @pytest.mark.parametrize("field", REQUIRED_PLUGIN_FIELDS)
+    def test_required_field_present(self, authoring_plugin_manifest: dict[str, Any], field: str) -> None:
+        assert field in authoring_plugin_manifest, (
+            f"authoring plugin.json missing required field {field!r}; "
+            f"present fields: {sorted(authoring_plugin_manifest.keys())}"
         )
+
+    def test_name_is_devbench_authoring(self, authoring_plugin_manifest: dict[str, Any]) -> None:
+        assert authoring_plugin_manifest["name"] == "devbench-authoring", (
+            f"authoring plugin.json name must be 'devbench-authoring' "
+            f"(issue #224 AC-2); got {authoring_plugin_manifest['name']!r}"
+        )
+
+    def test_version_is_semver(self, authoring_plugin_manifest: dict[str, Any]) -> None:
+        version = authoring_plugin_manifest["version"]
+        assert re.match(r"^\d+\.\d+\.\d+$", version), f"authoring plugin.json version must be semver; got {version!r}"
 
 
 @pytest.mark.unit
-class TestPluginJsonHomepage:
-    """plugin.json 'homepage' field must be a non-empty string (URL)."""
+class TestOrchestrateMarketplaceManifest:
+    """Orchestrate marketplace lists exactly one plugin: devbench-orchestrate (issue #224 AC-2)."""
 
-    def test_homepage_is_string(self, plugin_manifest: dict[str, Any]) -> None:
-        """homepage must be a string."""
-        assert isinstance(plugin_manifest.get("homepage"), str), (
-            f"plugin.json 'homepage' must be a string, got: {type(plugin_manifest.get('homepage'))}"
+    def test_marketplace_lists_exactly_one_plugin(self, orchestrate_marketplace_manifest: dict[str, Any]) -> None:
+        plugins = orchestrate_marketplace_manifest.get("plugins", [])
+        assert isinstance(plugins, list)
+        assert len(plugins) == 1, (
+            f"orchestrate marketplace must list exactly one plugin (issue #224 AC-2); got {len(plugins)}"
         )
 
-    def test_homepage_is_url(self, plugin_manifest: dict[str, Any]) -> None:
-        """homepage must look like a URL (starts with https://)."""
-        homepage = plugin_manifest.get("homepage", "")
-        assert homepage.startswith("https://"), f"plugin.json 'homepage' must be an https:// URL. Got: {homepage!r}"
+    def test_plugin_entry_is_devbench_orchestrate(self, orchestrate_marketplace_manifest: dict[str, Any]) -> None:
+        plugin = orchestrate_marketplace_manifest["plugins"][0]
+        assert plugin["name"] == "devbench-orchestrate"
+        assert plugin["source"].rstrip("/") == "./devbench-orchestrate"
+
+
+@pytest.mark.unit
+class TestAuthoringMarketplaceManifest:
+    """Authoring marketplace lists exactly one plugin: devbench-authoring (issue #224 AC-2)."""
+
+    def test_marketplace_lists_exactly_one_plugin(self, authoring_marketplace_manifest: dict[str, Any]) -> None:
+        plugins = authoring_marketplace_manifest.get("plugins", [])
+        assert isinstance(plugins, list)
+        assert len(plugins) == 1, (
+            f"authoring marketplace must list exactly one plugin (issue #224 AC-2); got {len(plugins)}"
+        )
+
+    def test_plugin_entry_is_devbench_authoring(self, authoring_marketplace_manifest: dict[str, Any]) -> None:
+        plugin = authoring_marketplace_manifest["plugins"][0]
+        assert plugin["name"] == "devbench-authoring"
+        assert plugin["source"].rstrip("/") == "./devbench-authoring"

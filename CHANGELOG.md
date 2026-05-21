@@ -10,6 +10,70 @@ configuration refactor, the EC2 remote-dev provisioning stack, and the
 work-unit lifecycle / authoring CLI improvements that have accumulated
 since the last release. PR #119 carries every change.
 
+### Changed (BREAKING)
+
+- **Plugin split: `devbench@devbench` retired in favour of two
+  marketplaces / two plugins** (issue #224). The single plugin had a
+  structural conflict between the authoring audience
+  (`spec-to-backlog`, which writes `backlog/*.md`) and the executor
+  audience (the `guard-work-unit-write.sh` hook blocks any write to
+  `backlog/*.md`). The split encodes the policy at the plugin-
+  installation layer:
+  - **`devbench-orchestrate`** (orchestrate marketplace, this repo's
+    `plugin/`) -- ships the orchestrate skill + every agent + every
+    PreToolUse guard hook. Install in a workspace where you run
+    autonomous execution.
+  - **`devbench-authoring`** (authoring marketplace, this repo's
+    `plugin-authoring/`) -- ships `spec-to-backlog`, `create-spec`,
+    `configure-devbench`, `bootstrap-environment`. No hooks; safe to
+    enable in any authoring workspace.
+
+  See `docs/migration-0.4.0.md` for the operator migration walkthrough.
+  Note: prior CHANGELOG entries that reference `plugin/devbench/`
+  paths describe the pre-split layout and are not rewritten.
+
+  **Source-tree changes** (paths relative to repo root):
+  - `plugin/devbench/` -> `plugin/devbench-orchestrate/` (renamed;
+    four authoring skills removed from this side).
+  - `plugin-authoring/devbench-authoring/` (new; receives the four
+    authoring skills + a fresh `.claude-plugin/plugin.json`).
+  - `plugin/.claude-plugin/marketplace.json` -- orchestrate
+    marketplace, version `0.2.0` -> `0.3.0`; lists one plugin
+    `devbench-orchestrate@0.4.0` at `./devbench-orchestrate/`.
+  - `plugin-authoring/.claude-plugin/marketplace.json` (NEW) --
+    authoring marketplace, version `0.1.0`; lists one plugin
+    `devbench-authoring@0.1.0` at `./devbench-authoring/`.
+
+  **Sub-agent invocation prefix changed** (every reference inside
+  the orchestrate plugin): `devbench:executor` ->
+  `devbench-orchestrate:executor`, same for `blocker-resolver`,
+  `task-factory`, `manifest-amender`, `security-reviewer`,
+  `review-supervisor`, `code_review`, `test_review`, `doc_review`,
+  `changes_manifest`, `orchestrate`. The `guard-review-supervisor-
+  scope.sh` and `guard-verdict-format.sh` scripts now check the
+  new prefix.
+
+  **Narrow Python source edits** (AC-12 deviation, called out for
+  audit):
+  - `src/devbench/constants.py`: `DEFAULT_PLUGIN_SUBPATH` flipped
+    from `"plugin/devbench"` to `"plugin/devbench-orchestrate"`.
+  - `src/devbench/cli.py`: the SDK launch prompt that invokes the
+    orchestrate skill now reads `"Run the
+    devbench-orchestrate:orchestrate skill..."`.
+
+  These two are the minimum required for non-interactive
+  `devbench start --daemon` runs to find the renamed plugin tree.
+  No agent prompt, no hook script, and no other Python source is
+  changed.
+
+  **New regression tests** pin the orchestrate side's behaviour
+  (`tests/test_plugin/test_orchestrate_isolation.py`,
+  `test_executor_guard_unchanged.py`,
+  `test_work_unit_write_block_message.py`). Any future drift in
+  the PreToolUse hook list, the guard-work-unit-write stderr
+  format, or the orchestrate plugin's self-containedness fails
+  these tests locally before push.
+
 ### Added
 
 - **`devbench report --by-role` per-role token/cost breakdown panel**

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-AGENTS_DIR = Path(__file__).parent.parent.parent / "plugin" / "devbench" / "agents"
+AGENTS_DIR = Path(__file__).parent.parent.parent / "plugin" / "devbench-orchestrate" / "agents"
 
 REVIEW_TEAM_DIR = AGENTS_DIR / "review_team"
 
@@ -354,7 +354,9 @@ class TestExecutorValidationGateEscalation:
 class TestSkillValidationGateEscalationBranch:
     """Orchestrate SKILL must have a step 4a branch that fires task-factory on executor-emitted proposals."""
 
-    _SKILL_PATH = Path(__file__).parent.parent.parent / "plugin" / "devbench" / "skills" / "orchestrate" / "SKILL.md"
+    _SKILL_PATH = (
+        Path(__file__).parent.parent.parent / "plugin" / "devbench-orchestrate" / "skills" / "orchestrate" / "SKILL.md"
+    )
 
     def test_skill_file_exists(self) -> None:
         assert self._SKILL_PATH.exists(), f"orchestrate/SKILL.md not found at {self._SKILL_PATH}"
@@ -398,7 +400,9 @@ class TestSkillSubagentTextIsDiagnostic:
     stop-hook circuit breaker.
     """
 
-    _SKILL_PATH = Path(__file__).parent.parent.parent / "plugin" / "devbench" / "skills" / "orchestrate" / "SKILL.md"
+    _SKILL_PATH = (
+        Path(__file__).parent.parent.parent / "plugin" / "devbench-orchestrate" / "skills" / "orchestrate" / "SKILL.md"
+    )
 
     def test_skill_declares_subagent_text_is_diagnostic(self) -> None:
         """SKILL must declare that subagent text is not control flow."""
@@ -728,8 +732,11 @@ class TestReviewJudgesUseGetDiffForScope:
 
 
 def _collect_all_agent_md_files() -> list[Path]:
-    """Return all .md files under plugin/devbench/agents/ recursively."""
-    agents_dir = Path(__file__).parent.parent.parent / "plugin" / "devbench" / "agents"
+    """Return all .md files under plugin/devbench-orchestrate/agents/ recursively.
+
+    Issue #224: agents all live in the orchestrate plugin after the split.
+    """
+    agents_dir = Path(__file__).parent.parent.parent / "plugin" / "devbench-orchestrate" / "agents"
     return sorted(agents_dir.rglob("*.md"))
 
 

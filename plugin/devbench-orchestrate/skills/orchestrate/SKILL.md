@@ -53,31 +53,31 @@ Process the backlog using the steps below, repeating until all work units are do
     e. If no staged files AND reviews are not all present: proceed to step 4 (executor
        did not stage its output -- recovery run).
 
-4. Invoke `devbench:executor` with the unit ID.
+4. Invoke `devbench-orchestrate:executor` with the unit ID.
 
 4a. Validation-gate bug-escalation check -- handles proposal JSONs that the executor wrote directly via `uv run devbench write-proposal` because the task is a validation gate (empty Changes Manifest / Approach forbids production fixes) that surfaced out-of-scope production bugs. This is a separate trigger from the amendment-reject loop at step 4c:
     a. Run `test -f "$DEVBENCH_WORKSPACE_ROOT/.devbench/amendments/<id>.json"`. If that file exists: skip to step 4b immediately. The amendment flow owns the proposal handling for this task (step 4c will fire if the amender rejects). The validation-gate branch MUST NOT double-fire when the amendment path is in play.
     b. Run `test -f "$DEVBENCH_WORKSPACE_ROOT/.devbench/proposals/<id>.json"`. If that file does not exist: proceed to step 4b. No bug-escalation was emitted.
     c. If the proposal file exists and no amendment request exists: the executor identified the task as a validation gate and emitted a proposal JSON directly. `task_factory.enabled` must also be true in `backlog/config/devbench.yaml` for materialisation to proceed; if disabled, log an audit comment on the source task naming the proposal path and informing the operator that task-factory is opt-out, then proceed to step 4b.
-    d. When enabled: invoke `devbench:task-factory` with the source task ID. The agent calls `uv run devbench materialise-proposal <source-id>`, which reads the proposal JSON, writes one draft `.md` per proposed task with `## Status: proposed`, and appends a row to `BACKLOG.md` for each.
+    d. When enabled: invoke `devbench-orchestrate:task-factory` with the source task ID. The agent calls `uv run devbench materialise-proposal <source-id>`, which reads the proposal JSON, writes one draft `.md` per proposed task with `## Status: proposed`, and appends a row to `BACKLOG.md` for each.
     e. After task-factory returns: log an audit comment on the source task summarising the N proposed tasks created, then proceed to step 4b. The source task is NOT automatically blocked by validation-gate escalation; its own review pipeline runs at step 5 and determines pass / fail independently. The proposed tasks track the out-of-scope production fixes as separate `proposed` drafts the operator reviews and promotes.
 
 4b. Amendment check -- handles TDD GREEN production fixes that were not pre-declared in the Changes Manifest:
     a. Check whether the file `$DEVBENCH_WORKSPACE_ROOT/.devbench/amendments/<id>.json` exists. Use `test -f "$DEVBENCH_WORKSPACE_ROOT/.devbench/amendments/<id>.json"` in Bash.
     b. If absent: proceed to step 5 unchanged. The executor did not request an amendment; the standard review pipeline applies.
-    c. If present: invoke `devbench:manifest-amender` with the unit ID.
+    c. If present: invoke `devbench-orchestrate:manifest-amender` with the unit ID.
        - The agent reads the pending request, the work unit, and the staged diff; decides `apply` or `reject` on three semantic questions (Approach authorisation, scope minimality, justification coherence).
        - On `apply`: the agent invokes `uv run devbench apply-amendment <id>`, which appends rows to the Changes Manifest and runs the Layer 3 deterministic post-check (manifest re-parse, em-dash scan, full `validate-backlog`). If post-check fails, `apply-amendment` atomically rolls back the write and the task is blocked via an audit comment.
-       - On `reject`: the agent first reverts every file listed in the pending request from the target repo (unstages, restores the tracked baseline, and cleans untracked additions) so stale staged edits do not leak into subsequent tasks. It then invokes `uv run devbench reject-amendment <id> "<reason>"`, which writes an audit comment, transitions the task to `blocked`, and archives the pending request to `<workspace>/.devbench/rejected-requests/<id>-<timestamp>.json` for blocker-resolver input. The git-cleanup recipe (restore --staged, checkout --, clean -f) appears in `plugin/devbench/agents/manifest-amender.md` and runs BEFORE the CLI invocation.
+       - On `reject`: the agent first reverts every file listed in the pending request from the target repo (unstages, restores the tracked baseline, and cleans untracked additions) so stale staged edits do not leak into subsequent tasks. It then invokes `uv run devbench reject-amendment <id> "<reason>"`, which writes an audit comment, transitions the task to `blocked`, and archives the pending request to `<workspace>/.devbench/rejected-requests/<id>-<timestamp>.json` for blocker-resolver input. The git-cleanup recipe (restore --staged, checkout --, clean -f) appears in `plugin/devbench-orchestrate/agents/manifest-amender.md` and runs BEFORE the CLI invocation.
        - Either way the agent finishes by running `uv run devbench log-verdict manifest_amender <id> <pass|fail> "<summary>"`.
     d. After `manifest-amender` returns:
        - If the verdict was `pass` (amendment applied and post-check passed): proceed to step 5. The review-supervisor judges now see the updated Changes Manifest.
        - If the verdict was `fail` (rejected, or post-check rolled back): the task is already marked `blocked` with an audit comment. If `task_factory.enabled: true` in `backlog/config/devbench.yaml`, proceed to step 4c (blocker-resolver + task-factory). Otherwise, log a blocker comment and return to step 2.
 
 4c. Task-factory loop (runs only when `task_factory.enabled: true` and the amender just rejected):
-    a. Invoke `devbench:blocker-resolver` with the blocked task's ID. The agent reads the rejected-requests archive written by `reject-amendment` and emits a structured proposal JSON via `uv run devbench write-proposal <source-id>` describing one or more new work units that own the out-of-scope fixes.
+    a. Invoke `devbench-orchestrate:blocker-resolver` with the blocked task's ID. The agent reads the rejected-requests archive written by `reject-amendment` and emits a structured proposal JSON via `uv run devbench write-proposal <source-id>` describing one or more new work units that own the out-of-scope fixes.
     b. Check whether the proposal JSON exists on disk: `test -f "$DEVBENCH_WORKSPACE_ROOT/.devbench/proposals/<source-id>.json"`. The check is on the FILE, not on the agent's verdict word. The verdict word (`proposed`, `escalated`, `resolved`, `blocked`) stays in audit comments for operator review but is NEVER a control point -- the file existing is the sole trigger for step 4c.c. If the file is absent: log a blocker comment summarising the resolver's rationale and return to step 2.
-    c. If the proposal JSON exists: invoke `devbench:task-factory` with the same source task ID. The agent calls `uv run devbench materialise-proposal <source-id>`, which reads the proposal JSON, writes one draft `.md` per proposed task with `## Status: proposed`, and appends a row to `BACKLOG.md` for each.
+    c. If the proposal JSON exists: invoke `devbench-orchestrate:task-factory` with the same source task ID. The agent calls `uv run devbench materialise-proposal <source-id>`, which reads the proposal JSON, writes one draft `.md` per proposed task with `## Status: proposed`, and appends a row to `BACKLOG.md` for each.
     d. After task-factory returns: log a blocker comment on the source task summarising the N proposed tasks created, then return to step 2. The source task remains `blocked` until the operator reviews and promotes the proposed tasks (via `uv run devbench promote-proposal <id>`) and they complete; promotion automatically wires the source task's dependencies so the orchestrator picks the source task back up only after the fixes land.
 
 5. Invoke `review-supervisor` with the unit ID.
@@ -85,14 +85,14 @@ Process the backlog using the steps below, repeating until all work units are do
    - If result is REVIEW_PASS: go to step 7.
 
 6. On REVIEW_FAIL:
-   a. **Immediately** invoke the `devbench:executor` Agent with the unit ID. Do NOT summarise, do NOT explain, do NOT log a comment first -- the Agent tool call is the very next tool use after the REVIEW_FAIL result. Natural turn-end before this Agent call is the loop-exit bug described in the top-level CRITICAL directive.
+   a. **Immediately** invoke the `devbench-orchestrate:executor` Agent with the unit ID. Do NOT summarise, do NOT explain, do NOT log a comment first -- the Agent tool call is the very next tool use after the REVIEW_FAIL result. Natural turn-end before this Agent call is the loop-exit bug described in the top-level CRITICAL directive.
    b. When executor returns, Return to step 5 -- immediately re-invoke `review-supervisor`. Do NOT invoke security-reviewer here.
    c. After `max_executor_retries` consecutive failures, the next tool calls (in this order, same turn) are mandatory and explicit: (1) `uv run devbench log-comment agent/orchestrator <id> "[BLOCKED] ..."` naming the failing checks, (2) `uv run devbench next`. The `devbench next` call is the only authorised loop-continuation signal -- treat its output exactly like step 2 (ALL_DONE / NO_ACTIONABLE / JSON).
    d. **Per-judge retry budgets (issue #122)**: when `max_executor_retries_per_judge` is set in `backlog/config/devbench.yaml`, the budget for the cycle is the value for the failing judge if listed (e.g., `max_executor_retries_per_judge.test_review`); otherwise fall back to the global `max_executor_retries`. Different judges can fail in different cycles -- count failures **per judge** in the per-task counter and trip the BLOCKED transition the moment ANY single judge's per-judge budget is exhausted. Read both fields once at the start of the work-unit cycle: `uv run devbench config-resolve max_executor_retries max_executor_retries_per_judge` returns the resolved values. Schema validation rejects unknown judge names; an unknown name is a config bug not a runtime concern.
 
 7. On review team REVIEW_PASS:
    - **CRITICAL (issue #128)**: REVIEW_PASS is a terminal signal. After ALL judges return REVIEW_PASS, branch SOLELY on pass-vs-fail -- do NOT inspect verdict bodies, summary text, findings, or comments looking for improvement opportunities. Informational content in PASS verdicts (MEDIUM severity notes, refactor suggestions, "consider also..." remarks) MUST NOT trigger additional executor work cycles. The executor is invoked only when a judge returns REVIEW_FAIL (step 6). Surfacing informational PASS-verdict content in the PR description or a comment is fine; re-running the executor against PASS-verdict content is a violation of this rule and will be regression-tested in `tests/test_integration/test_executor_review_pass_terminality.py`.
-   - Invoke `devbench:security-reviewer` with the unit ID.
+   - Invoke `devbench-orchestrate:security-reviewer` with the unit ID.
    - If security PASS: proceed immediately to step 8. Do NOT re-run review-supervisor. Do NOT re-invoke executor based on the security_review verdict body's informational content.
    - If security FAIL: log a blocker comment and return to step 2.
 
@@ -101,8 +101,8 @@ Process the backlog using the steps below, repeating until all work units are do
    **Exit code contract**:
    - `0`: PR merged (or commit landed locally in deferred mode). Continue to step 9.
    - `1`: hard failure that requires operator attention. Block the task, log a `[BLOCKED]` audit comment with the exact failure surface, return to step 2.
-   - `2` (issue #115, **default on** as of v-next; disable via `git_ops.ci_failure_retry: false` in `devbench.yaml` or `DEVBENCH_CI_FAILURE_RETRY_ENABLED=0`): CI failed but the executor retry budget is not exhausted. The work-unit gained a `[CI_FAIL]` audit comment naming the trimmed log path under `.devbench/ci-failures/<id>-<n>.log`. Re-invoke `devbench:executor` with a `ci-fail` feedback payload pointing at that log, then return to step 8 (git-ops will push the executor's fix and re-wait for CI). The retry budget is shared with the existing review-judge retry budget (`MAX_RETRY_ATTEMPTS`); when exhausted, git-ops returns `1` instead of `2`.
-   - `3` (issue #116, opt-in via `git_ops.pr_review_resolution.enabled: true` in `devbench.yaml` or `DEVBENCH_PR_REVIEW_RESOLUTION_ENABLED=1`): the PR has unresolved review feedback (`reviewDecision == CHANGES_REQUESTED`, or unresolved comments authored by an agent in the configured allowlist). The work-unit gained a `[PR_BOT_FAIL]` audit comment naming the JSON feedback file under `.devbench/pr-bot-feedback/<id>-<n>.json`. Re-invoke `devbench:executor` with a `pr-bot` feedback payload pointing at that file, then return to step 8. Same shared retry budget; exhaustion -> `1`.
+   - `2` (issue #115, **default on** as of v-next; disable via `git_ops.ci_failure_retry: false` in `devbench.yaml` or `DEVBENCH_CI_FAILURE_RETRY_ENABLED=0`): CI failed but the executor retry budget is not exhausted. The work-unit gained a `[CI_FAIL]` audit comment naming the trimmed log path under `.devbench/ci-failures/<id>-<n>.log`. Re-invoke `devbench-orchestrate:executor` with a `ci-fail` feedback payload pointing at that log, then return to step 8 (git-ops will push the executor's fix and re-wait for CI). The retry budget is shared with the existing review-judge retry budget (`MAX_RETRY_ATTEMPTS`); when exhausted, git-ops returns `1` instead of `2`.
+   - `3` (issue #116, opt-in via `git_ops.pr_review_resolution.enabled: true` in `devbench.yaml` or `DEVBENCH_PR_REVIEW_RESOLUTION_ENABLED=1`): the PR has unresolved review feedback (`reviewDecision == CHANGES_REQUESTED`, or unresolved comments authored by an agent in the configured allowlist). The work-unit gained a `[PR_BOT_FAIL]` audit comment naming the JSON feedback file under `.devbench/pr-bot-feedback/<id>-<n>.json`. Re-invoke `devbench-orchestrate:executor` with a `pr-bot` feedback payload pointing at that file, then return to step 8. Same shared retry budget; exhaustion -> `1`.
 
 9. `uv run devbench mark-done <id>` -- mark the unit done (enforces done-gate).
 
@@ -141,7 +141,7 @@ Process the backlog using the steps below, repeating until all work units are do
 The orchestrator halts ONLY in two cases:
 
 1. `uv run devbench next` returns `ALL_DONE` or `NO_ACTIONABLE`. Print the final report and stop.
-2. The stop-hook circuit breaker (`plugin/devbench/scripts/continue-orchestration.sh`) blocks continuation -- respect that signal and stop.
+2. The stop-hook circuit breaker (`plugin/devbench-orchestrate/scripts/continue-orchestration.sh`) blocks continuation -- respect that signal and stop.
 
 Every other failure mode is a per-task concern and MUST NOT halt the loop:
 
@@ -159,7 +159,7 @@ Words like "halt", "halting", "stop the loop", "abort orchestration", "operator 
 The ONLY halt triggers are file / exit-code based:
 
 1. `uv run devbench next` returning `ALL_DONE` or `NO_ACTIONABLE` (file-driven; the CLI computes the actionable set from on-disk state).
-2. The stop-hook circuit breaker exit code (process-driven; `plugin/devbench/scripts/continue-orchestration.sh`).
+2. The stop-hook circuit breaker exit code (process-driven; `plugin/devbench-orchestrate/scripts/continue-orchestration.sh`).
 
 After every per-task failure -- regardless of how dramatically the subagent described it -- the orchestrator MUST: (a) ensure the task is marked `blocked` with the diagnostic comment, (b) call `uv run devbench next`, (c) act ONLY on the JSON / sentinel that command returns. The orchestrator's control flow is determined by `devbench next`, never by subagent prose.
 

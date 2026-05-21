@@ -203,7 +203,7 @@ fi
 # ``executor`` judge name remains allowed (logs progress + signals
 # completion) -- the restriction is specifically about the executor
 # claiming to BE a reviewer.
-if [[ "$AGENT_TYPE" == "devbench:executor" ]]; then
+if [[ "$AGENT_TYPE" == "devbench-orchestrate:executor" ]]; then
   for canonical in "${CANONICAL_REVIEWER_JUDGES[@]}"; do
     if [[ "$JUDGE" == "$canonical" ]]; then
       echo "guard-verdict-format: BLOCKED -- the executor agent must not write canonical reviewer verdicts." >&2

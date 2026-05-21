@@ -20,10 +20,10 @@ This document describes the structure and design of the DevBench Claude Code plu
 
 ## Plugin Directory Structure
 
-All plugin artifacts live under `plugin/devbench/` in the devbench repo:
+After the issue #224 split, plugin artifacts live under two marketplaces in this repo. The orchestrate plugin (this section) lives at `plugin/devbench-orchestrate/`; the authoring plugin lives at `plugin-authoring/devbench-authoring/`:
 
 ```text
-plugin/devbench/
+plugin/devbench-orchestrate/
 ├── .claude-plugin/
 │   └── plugin.json              ← manifest: name, description, version, keywords, repository, license, homepage
 ├── agents/
@@ -285,7 +285,7 @@ $DEVBENCH_WORKSPACE_ROOT/
 │   └── config/
 │       └── devbench.yaml        ← workspace config, not part of plugin
 └── devbench/                    ← this repo (plugin source lives here)
-    └── plugin/devbench/         ← Claude Code plugin
+    └── plugin/devbench-orchestrate/         ← Claude Code plugin
 ```
 
 ---

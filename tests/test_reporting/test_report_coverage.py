@@ -167,7 +167,7 @@ class TestParseTranscriptMetricsEdgeLines:
         tfile = tdir / "a.jsonl"
         # blank, malformed json, out-of-window entry, in-window entry
         in_window = (
-            '{"timestamp": "2030-01-01T00:00:00Z", "attributionAgent": "devbench:executor", '
+            '{"timestamp": "2030-01-01T00:00:00Z", "attributionAgent": "devbench-orchestrate:executor", '
             '"message": {"usage": {"input_tokens": 7}, "id": "new"}}\n'
         )
         tfile.write_text(

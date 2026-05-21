@@ -186,7 +186,7 @@ Repo                      Clone     Toolchain  Validate
 
 If any repo was escalated, remind the operator:
 
-> "One or more repos could not be fully bootstrapped automatically. Review the [ESCALATE] messages above, resolve the issues, and re-run `claude run devbench:bootstrap-environment` to retry."
+> "One or more repos could not be fully bootstrapped automatically. Review the [ESCALATE] messages above, resolve the issues, and re-run `claude run devbench-authoring:bootstrap-environment` to retry."
 
 If all repos succeeded:
 

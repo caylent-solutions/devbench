@@ -182,7 +182,7 @@ The executor is allowed a bounded number of retry rounds on `REVIEW_FAIL`. When 
 
 1. Open the work unit's Comments and read the last `[REVIEW_REJECTED]` block. The reviewer's finding is the actionable signal.
 2. Either fix the underlying issue manually (tighten an AC, split scope, correct a Changes Manifest row) or `uv run devbench set-status <id> in-queue` to retry from scratch if you believe the failure was transient.
-3. The retry budget is a prompt variable inside `plugin/devbench/skills/orchestrate/SKILL.md` (search for `max_executor_retries`). Adjust downward for cost control or upward if your task class is genuinely slow to converge; the default is documented inline in the SKILL.
+3. The retry budget is a prompt variable inside `plugin/devbench-orchestrate/skills/orchestrate/SKILL.md` (search for `max_executor_retries`). Adjust downward for cost control or upward if your task class is genuinely slow to converge; the default is documented inline in the SKILL.
 
 ### I don't see "Lifetime X" rows in the report anymore, where did they go?
 

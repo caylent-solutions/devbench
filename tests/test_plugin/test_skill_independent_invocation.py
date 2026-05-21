@@ -29,7 +29,8 @@ from devbench.config_loader import load_runtime_config
 # Absolute path to the repo root so tests are portable regardless of cwd.
 _REPO_ROOT = Path(__file__).parent.parent.parent
 
-_SKILLS_DIR = _REPO_ROOT / "plugin" / "devbench" / "skills"
+# Issue #224: all four authoring skills live in the authoring plugin after the split.
+_SKILLS_DIR = _REPO_ROOT / "plugin-authoring" / "devbench-authoring" / "skills"
 
 _ONBOARDING_SKILLS = (
     "create-spec",

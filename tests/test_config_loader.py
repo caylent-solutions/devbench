@@ -1052,7 +1052,12 @@ class TestGitOpsConfig:
         with pytest.raises(ValueError, match=r"defer_pr requires.*single_branch"):
             load_runtime_config(cfg, {})
 
-    def test_token_cost_defaults(self, tmp_path: Path) -> None:
+    def test_report_models_empty_when_absent(self, tmp_path: Path) -> None:
+        """Issue #223: with no ``report.models`` block, the parsed mapping is
+        empty.  ``devbench.config`` then folds in the per-package
+        ``DEFAULT_MODEL_RATES`` so the runtime view still prices every
+        canonical model id.
+        """
         cfg = self._write(
             tmp_path / "cfg.yaml",
             """\
@@ -1062,16 +1067,21 @@ class TestGitOpsConfig:
             """,
         )
         result = load_runtime_config(cfg, {})
-        assert result.report.token_cost_per_million_input == 5.0
-        assert result.report.token_cost_per_million_output == 25.0
-        # Cache multipliers default to None in the parsed YAML layer; config.py
-        # applies the constant defaults via _resolve_float (env > YAML > const).
+        assert result.report.models == {}
+        # default_model falls back to the package constant when YAML
+        # leaves it unset.
+        from devbench.constants import DEFAULT_FALLBACK_MODEL_RATES
+
+        assert result.report.default_model == DEFAULT_FALLBACK_MODEL_RATES
+        # Cache multipliers default to None in the parsed YAML layer;
+        # config.py applies the constant defaults via _resolve_float
+        # (env > YAML > const).
         assert result.report.cache_read_multiplier is None
         assert result.report.cache_write_5min_multiplier is None
         assert result.report.cache_write_1hr_multiplier is None
         assert result.report.data_residency_multiplier is None
 
-    def test_token_cost_overrides_from_yaml(self, tmp_path: Path) -> None:
+    def test_report_models_parsed_from_yaml(self, tmp_path: Path) -> None:
         cfg = self._write(
             tmp_path / "cfg.yaml",
             """\
@@ -1079,8 +1089,17 @@ class TestGitOpsConfig:
               caylent-solutions/devbench:
                 default_branch: main
             report:
-              token_cost_per_million_input: 10.0
-              token_cost_per_million_output: 50.0
+              models:
+                claude-sonnet-4-6:
+                  input: 3.0
+                  output: 15.0
+                claude-opus-4-7:
+                  input: 5.0
+                  output: 25.0
+                  correction_factor: 1.05
+              default_model:
+                input: 5.0
+                output: 25.0
               cache_read_multiplier: 0.05
               cache_write_5min_multiplier: 1.5
               cache_write_1hr_multiplier: 2.5
@@ -1088,14 +1107,23 @@ class TestGitOpsConfig:
             """,
         )
         result = load_runtime_config(cfg, {})
-        assert result.report.token_cost_per_million_input == 10.0
-        assert result.report.token_cost_per_million_output == 50.0
+        assert set(result.report.models.keys()) == {"claude-sonnet-4-6", "claude-opus-4-7"}
+        sonnet = result.report.models["claude-sonnet-4-6"]
+        assert (sonnet.input, sonnet.output, sonnet.correction_factor) == (3.0, 15.0, 1.0)
+        opus = result.report.models["claude-opus-4-7"]
+        assert (opus.input, opus.output, opus.correction_factor) == (5.0, 25.0, 1.05)
+        assert result.report.default_model.input == 5.0
+        assert result.report.default_model.output == 25.0
         assert result.report.cache_read_multiplier == 0.05
         assert result.report.cache_write_5min_multiplier == 1.5
         assert result.report.cache_write_1hr_multiplier == 2.5
         assert result.report.data_residency_multiplier == 1.2
 
-    def test_token_cost_partial_override(self, tmp_path: Path) -> None:
+    def test_legacy_token_cost_keys_rejected_with_actionable_message(self, tmp_path: Path) -> None:
+        """Issue #223: complete-replacement per CLAUDE.md.  Workspaces that
+        still set the retired scalar fields get a fail-fast error that
+        names the field AND points at the new ``report.models`` block.
+        """
         cfg = self._write(
             tmp_path / "cfg.yaml",
             """\
@@ -1103,14 +1131,19 @@ class TestGitOpsConfig:
               caylent-solutions/devbench:
                 default_branch: main
             report:
-              token_cost_per_million_input: 8.0
+              token_cost_per_million_input: 5.0
+              token_cost_per_million_output: 25.0
+              token_cost_discount: 0.0
             """,
         )
-        result = load_runtime_config(cfg, {})
-        assert result.report.token_cost_per_million_input == 8.0
-        assert result.report.token_cost_per_million_output == 25.0
-        # Unspecified multiplier fields stay None (meaning "fall back to constant default").
-        assert result.report.cache_read_multiplier is None
+        with pytest.raises(ValueError) as exc:
+            load_runtime_config(cfg, {})
+        msg = str(exc.value)
+        assert "token_cost_per_million_input" in msg
+        assert "token_cost_per_million_output" in msg
+        assert "token_cost_discount" in msg
+        assert "report.models" in msg
+        assert "docs/model-pricing.md" in msg
 
     def test_schema_rejects_unknown_git_ops_keys(self, tmp_path: Path) -> None:
         """
@@ -1447,27 +1480,23 @@ class TestTaskFactoryConfig:
 
 
 @pytest.mark.unit
-class TestReportConfigTokenCostDiscount:
-    """F1: ``report.token_cost_discount`` -- contract discount off list price."""
+class TestReportModelsBlock:
+    """Issue #223: per-model rate table replaces the retired scalar
+    ``token_cost_per_million_*`` / ``token_cost_discount`` fields.
+
+    Asserts the schema validation contract (AC-8): unknown keys under
+    ``report.models.<id>`` are rejected; model-id keys themselves are
+    open (any string accepted) so operators can register new model ids
+    without code changes.
+    """
 
     @staticmethod
     def _write(path: Path, content: str) -> Path:
         path.write_text(textwrap.dedent(content))
         return path
 
-    def test_default_is_none_when_key_absent(self, tmp_path: Path) -> None:
-        cfg = self._write(
-            tmp_path / "cfg.yaml",
-            """\
-            repos:
-              org/repo:
-                default_branch: main
-            """,
-        )
-        rt = load_runtime_config(cfg, {})
-        assert rt.report.token_cost_discount is None
-
-    def test_parsed_when_key_present(self, tmp_path: Path) -> None:
+    def test_unknown_per_model_field_rejected(self, tmp_path: Path) -> None:
+        """AC-8: ``additionalProperties: false`` on each model entry."""
         cfg = self._write(
             tmp_path / "cfg.yaml",
             """\
@@ -1475,55 +1504,21 @@ class TestReportConfigTokenCostDiscount:
               org/repo:
                 default_branch: main
             report:
-              token_cost_discount: 0.40363636364
-            """,
-        )
-        rt = load_runtime_config(cfg, {})
-        assert rt.report.token_cost_discount == 0.40363636364
-
-    def test_boundary_zero_accepted(self, tmp_path: Path) -> None:
-        cfg = self._write(
-            tmp_path / "cfg.yaml",
-            """\
-            repos:
-              org/repo:
-                default_branch: main
-            report:
-              token_cost_discount: 0.0
-            """,
-        )
-        rt = load_runtime_config(cfg, {})
-        assert rt.report.token_cost_discount == 0.0
-
-    def test_boundary_one_accepted(self, tmp_path: Path) -> None:
-        cfg = self._write(
-            tmp_path / "cfg.yaml",
-            """\
-            repos:
-              org/repo:
-                default_branch: main
-            report:
-              token_cost_discount: 1.0
-            """,
-        )
-        rt = load_runtime_config(cfg, {})
-        assert rt.report.token_cost_discount == 1.0
-
-    def test_negative_value_rejected_by_schema(self, tmp_path: Path) -> None:
-        cfg = self._write(
-            tmp_path / "cfg.yaml",
-            """\
-            repos:
-              org/repo:
-                default_branch: main
-            report:
-              token_cost_discount: -0.1
+              models:
+                claude-opus-4-7:
+                  input: 5.0
+                  output: 25.0
+                  typo_field: 1.0
             """,
         )
         with pytest.raises(ValueError, match="schema validation"):
             load_runtime_config(cfg, {})
 
-    def test_above_one_rejected_by_schema(self, tmp_path: Path) -> None:
+    def test_arbitrary_model_id_accepted(self, tmp_path: Path) -> None:
+        """AC-8: the model-id KEY is open (any string).  Operators add
+        new model ids by listing them under ``report.models`` -- no code
+        change required.
+        """
         cfg = self._write(
             tmp_path / "cfg.yaml",
             """\
@@ -1531,11 +1526,128 @@ class TestReportConfigTokenCostDiscount:
               org/repo:
                 default_branch: main
             report:
-              token_cost_discount: 1.5
+              models:
+                future-model-9000:
+                  input: 0.5
+                  output: 2.5
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert "future-model-9000" in rt.report.models
+        assert rt.report.models["future-model-9000"].input == 0.5
+
+    def test_missing_required_field_in_model_rejected(self, tmp_path: Path) -> None:
+        """``input`` and ``output`` are both mandatory per model entry."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            report:
+              models:
+                claude-sonnet-4-6:
+                  input: 3.0
             """,
         )
         with pytest.raises(ValueError, match="schema validation"):
             load_runtime_config(cfg, {})
+
+    def test_negative_input_rejected(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            report:
+              models:
+                claude-opus-4-7:
+                  input: -1.0
+                  output: 25.0
+            """,
+        )
+        with pytest.raises(ValueError, match="schema validation"):
+            load_runtime_config(cfg, {})
+
+    def test_correction_factor_zero_rejected(self, tmp_path: Path) -> None:
+        """``correction_factor`` must be strictly positive; 0 makes cost
+        identically zero and would silence the cost panel."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+            report:
+              models:
+                claude-opus-4-7:
+                  input: 5.0
+                  output: 25.0
+                  correction_factor: 0.0
+            """,
+        )
+        with pytest.raises(ValueError, match="schema validation"):
+            load_runtime_config(cfg, {})
+
+
+@pytest.mark.unit
+class TestParseModelRatesRuntime:
+    """Issue #223: direct unit tests on ``_parse_model_rates`` /
+    ``_parse_report_models`` / ``_parse_default_model_rates``.
+
+    Schema validation fires BEFORE these runtime checks on the
+    ``load_runtime_config`` happy path, so the runtime checks are
+    belt-and-suspenders -- triggered when an in-memory raw dict is fed
+    directly (e.g. a JSON-derived config tree).  These tests pin the
+    runtime contract independently of the schema.
+    """
+
+    def test_parse_model_rates_rejects_non_mapping(self) -> None:
+        from devbench.config_loader import _parse_model_rates
+
+        with pytest.raises(ValueError, match="must be a mapping"):
+            _parse_model_rates("claude-opus-4-7", "not-a-dict", "test.yaml")
+
+    def test_parse_model_rates_rejects_missing_required_field(self) -> None:
+        from devbench.config_loader import _parse_model_rates
+
+        with pytest.raises(ValueError, match="missing required field"):
+            _parse_model_rates("claude-opus-4-7", {"input": 5.0}, "test.yaml")
+
+    def test_parse_model_rates_rejects_negative_rate(self) -> None:
+        from devbench.config_loader import _parse_model_rates
+
+        with pytest.raises(ValueError, match="must be non-negative"):
+            _parse_model_rates("claude-opus-4-7", {"input": -1.0, "output": 25.0}, "test.yaml")
+
+    def test_parse_model_rates_rejects_non_positive_correction_factor(self) -> None:
+        from devbench.config_loader import _parse_model_rates
+
+        with pytest.raises(ValueError, match="correction_factor must be > 0"):
+            _parse_model_rates(
+                "claude-opus-4-7",
+                {"input": 5.0, "output": 25.0, "correction_factor": 0.0},
+                "test.yaml",
+            )
+
+    def test_parse_report_models_returns_empty_for_none(self) -> None:
+        from devbench.config_loader import _parse_report_models
+
+        assert _parse_report_models(None, "test.yaml") == {}
+
+    def test_parse_report_models_rejects_non_mapping(self) -> None:
+        from devbench.config_loader import _parse_report_models
+
+        with pytest.raises(ValueError, match="must be a mapping of"):
+            _parse_report_models(["not", "a", "mapping"], "test.yaml")
+
+    def test_parse_default_model_rates_falls_back_when_none(self) -> None:
+        from devbench.config_loader import _parse_default_model_rates
+        from devbench.constants import DEFAULT_FALLBACK_MODEL_RATES
+
+        result = _parse_default_model_rates(None, "test.yaml")
+        assert result == DEFAULT_FALLBACK_MODEL_RATES
 
 
 @pytest.mark.unit

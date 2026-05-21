@@ -66,6 +66,7 @@ Example config file (``backlog/config/devbench.yaml``)::
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -79,11 +80,10 @@ from devbench.constants import (
     ALLOWED_AGENT_MODEL_SHORT_NAMES,
     ANTHROPIC_AGENT_MODEL_PATTERN,
     BEDROCK_AGENT_MODEL_PATTERN,
+    DEFAULT_FALLBACK_MODEL_RATES,
     DEFAULT_STOP_HOOK_MAX_BLOCKS,
     DEFAULT_STOP_HOOK_STALE_TASK_MINUTES,
     DEFAULT_STOP_HOOK_WINDOW_SECONDS,
-    DEFAULT_TOKEN_COST_PER_M_INPUT,
-    DEFAULT_TOKEN_COST_PER_M_OUTPUT,
     QUOTA_HANDLING_DEFAULT_AUDIT_COMMENT_ON_RESUME,
     QUOTA_HANDLING_DEFAULT_AUDIT_COMMENT_ON_WAIT,
     QUOTA_HANDLING_DEFAULT_BACKOFF_INITIAL_SECONDS,
@@ -103,6 +103,7 @@ from devbench.constants import (
     QUOTA_HANDLING_DEFAULT_RESUME_STRATEGY,
     STATUS_DRAFT,
     STATUS_IN_QUEUE,
+    ModelRates,
 )
 
 _BACKLOG_DEFAULT_STATUS: str = STATUS_IN_QUEUE
@@ -350,13 +351,27 @@ class DebugConfig:
 class ReportConfig:
     """Report and cost estimation settings.
 
+    Issue #223: the legacy scalar fields (``token_cost_per_million_input``,
+    ``token_cost_per_million_output``, ``token_cost_discount``) were removed
+    in favour of a per-model rate table (``models`` + ``default_model``).
+    Existing workspaces that set the old fields get a clear fail-fast error
+    at config-load time pointing at the new ``report.models`` block.
+
     Attributes:
-        token_cost_per_million_input: Cost per million input tokens in USD.
-        token_cost_per_million_output: Cost per million output tokens in USD.
+        models: Mapping of model id (e.g. ``claude-opus-4-7``) to its
+            ``ModelRates``.  When empty, every observed model id is priced
+            against ``default_model``.  Operators typically populate this
+            block from ``docs/model-pricing.md``'s Standard pricing table.
+        default_model: Rates applied to the ``"<unknown>"`` bucket -- any
+            transcript message whose ``model`` field is missing OR any
+            model id not present in ``models``.  Defaults to
+            ``DEFAULT_FALLBACK_MODEL_RATES`` when absent from YAML.
         display_timezone: IANA timezone name for displaying report timestamps.
             ``None`` means use the host's system local timezone.
         cache_read_multiplier: Cost multiplier for cache-read tokens, relative
-            to the base input rate. ``None`` means use the constant default.
+            to the base input rate.  ``None`` means use the constant default.
+            Applied to a model id only when that ``ModelRates`` does not
+            override ``cache_read_multiplier`` itself.
         cache_write_5min_multiplier: Cost multiplier for 5-minute prompt-cache
             write tokens, relative to the base input rate.
         cache_write_1hr_multiplier: Cost multiplier for 1-hour prompt-cache
@@ -368,15 +383,10 @@ class ReportConfig:
         recent_pace_tasks: Number of most recently completed tasks to average
             for the "Recent pace" projection. ``None`` falls back to
             ``DEFAULT_RECENT_PACE_TASKS``.
-        token_cost_discount: Contract discount (correction factor) off
-            list-price token cost, as a fraction in ``[0.0, 1.0]``.
-            ``final_cost = raw_list_cost * (1 - token_cost_discount)``.
-            ``None`` falls back to ``DEFAULT_TOKEN_COST_DISCOUNT`` (``0.0``,
-            pay full list).
     """
 
-    token_cost_per_million_input: float = DEFAULT_TOKEN_COST_PER_M_INPUT
-    token_cost_per_million_output: float = DEFAULT_TOKEN_COST_PER_M_OUTPUT
+    models: dict[str, ModelRates] = dataclasses.field(default_factory=dict)
+    default_model: ModelRates = dataclasses.field(default_factory=lambda: DEFAULT_FALLBACK_MODEL_RATES)
     display_timezone: str | None = None
     cache_read_multiplier: float | None = None
     cache_write_5min_multiplier: float | None = None
@@ -384,7 +394,6 @@ class ReportConfig:
     data_residency_multiplier: float | None = None
     fast_mode_multiplier: float | None = None
     recent_pace_tasks: int | None = None
-    token_cost_discount: float | None = None
 
 
 @dataclass(frozen=True)
@@ -582,6 +591,80 @@ class SkillsConfig:
     exemplar_spec_path: str | None = None
     fan_out_threshold: int = _SKILLS_DEFAULT_FAN_OUT_THRESHOLD
     max_iterations: int = _SKILLS_DEFAULT_MAX_ITERATIONS
+
+
+def _parse_model_rates(model_id: str, raw: object, source: str) -> ModelRates:
+    """Parse one ``report.models.<id>`` entry into a ``ModelRates``.
+
+    Issue #223.  The schema (``config-schema.json``) enforces shape with
+    ``additionalProperties: false`` per model entry; this runtime helper
+    validates ranges and converts the raw dict into the dataclass.  Raises
+    ``ValueError`` with the offending model id and source path so operators
+    see exactly which entry tripped the check.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"Config file '{source}': report.models.{model_id!r} must be a mapping; got {type(raw).__name__}."
+        )
+    if "input" not in raw or "output" not in raw:
+        raise ValueError(
+            f"Config file '{source}': report.models.{model_id!r} missing required field "
+            "(both 'input' and 'output' are mandatory per model entry)."
+        )
+    input_rate = float(raw["input"])
+    output_rate = float(raw["output"])
+    if input_rate < 0 or output_rate < 0:
+        raise ValueError(
+            f"Config file '{source}': report.models.{model_id!r} rates must be non-negative; "
+            f"got input={input_rate}, output={output_rate}."
+        )
+    correction = float(raw.get("correction_factor", 1.0))
+    if correction <= 0:
+        raise ValueError(
+            f"Config file '{source}': report.models.{model_id!r} correction_factor must be > 0; got {correction}."
+        )
+    return ModelRates(
+        input=input_rate,
+        output=output_rate,
+        cache_read_multiplier=(float(raw["cache_read_multiplier"]) if "cache_read_multiplier" in raw else None),
+        cache_write_5min_multiplier=(
+            float(raw["cache_write_5min_multiplier"]) if "cache_write_5min_multiplier" in raw else None
+        ),
+        cache_write_1hr_multiplier=(
+            float(raw["cache_write_1hr_multiplier"]) if "cache_write_1hr_multiplier" in raw else None
+        ),
+        correction_factor=correction,
+    )
+
+
+def _parse_report_models(raw: object, source: str) -> dict[str, ModelRates]:
+    """Parse the ``report.models`` block (issue #223).
+
+    Returns an empty mapping when the block is absent OR explicitly empty.
+    Operators with an empty block fall back entirely to
+    ``report.default_model`` for every observed model id, which is a valid
+    minimal configuration for workspaces that only ever run one model.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"Config file '{source}': report.models must be a mapping of model-id -> rates; got {type(raw).__name__}."
+        )
+    return {model_id: _parse_model_rates(model_id, entry, source) for model_id, entry in raw.items()}
+
+
+def _parse_default_model_rates(raw: object, source: str) -> ModelRates:
+    """Parse the ``report.default_model`` block (issue #223).
+
+    Falls back to ``DEFAULT_FALLBACK_MODEL_RATES`` when absent.  Operators
+    on standard Anthropic pricing typically leave this unset; the default
+    matches Opus 4.7 list pricing so an unknown-model bucket errs toward
+    over-reporting cost rather than under-reporting.
+    """
+    if raw is None:
+        return DEFAULT_FALLBACK_MODEL_RATES
+    return _parse_model_rates("<default_model>", raw, source)
 
 
 def _parse_skills_config(path: Path, skills_raw: dict) -> SkillsConfig:
@@ -1630,15 +1713,33 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         blocked_recovery_window_seconds=debug_raw.get("blocked_recovery_window_seconds"),
     )
 
-    # Populate ReportConfig from YAML report block.
+    # Populate ReportConfig from YAML report block.  Issue #223: per-model
+    # pricing replaces the legacy scalar token_cost_per_million_* +
+    # token_cost_discount fields.  Operators with the old keys get a
+    # fail-fast error pointing at the new ``report.models`` block.
     report_raw = raw.get("report") or {}
+    legacy_report_keys = {
+        "token_cost_per_million_input",
+        "token_cost_per_million_output",
+        "token_cost_discount",
+    }
+    legacy_present = sorted(legacy_report_keys & set(report_raw.keys()))
+    if legacy_present:
+        raise ValueError(
+            "Config file '"
+            + str(path)
+            + "' contains removed report fields: "
+            + ", ".join(legacy_present)
+            + ". These were retired in issue #223 (per-model cost pricing). Replace with a "
+            + "`report.models` block listing per-model rates; see docs/model-pricing.md for the "
+            + "default rate table. Each model id maps to {input, output, "
+            + "[cache_read_multiplier], [cache_write_5min_multiplier], [cache_write_1hr_multiplier], "
+            + "[correction_factor]}. `report.default_model` is applied to any observed model id "
+            + "not present in `report.models`."
+        )
     report = ReportConfig(
-        token_cost_per_million_input=float(
-            report_raw.get("token_cost_per_million_input", DEFAULT_TOKEN_COST_PER_M_INPUT),
-        ),
-        token_cost_per_million_output=float(
-            report_raw.get("token_cost_per_million_output", DEFAULT_TOKEN_COST_PER_M_OUTPUT),
-        ),
+        models=_parse_report_models(report_raw.get("models"), str(path)),
+        default_model=_parse_default_model_rates(report_raw.get("default_model"), str(path)),
         display_timezone=report_raw.get("display_timezone") or None,
         cache_read_multiplier=(
             float(report_raw["cache_read_multiplier"]) if "cache_read_multiplier" in report_raw else None
@@ -1656,7 +1757,6 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
             float(report_raw["fast_mode_multiplier"]) if "fast_mode_multiplier" in report_raw else None
         ),
         recent_pace_tasks=(int(report_raw["recent_pace_tasks"]) if "recent_pace_tasks" in report_raw else None),
-        token_cost_discount=(float(report_raw["token_cost_discount"]) if "token_cost_discount" in report_raw else None),
     )
 
     # Populate ManifestAmendment config from YAML manifest_amendment block.

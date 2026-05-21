@@ -335,16 +335,40 @@
     },
     "report": {
       "type": "object",
-      "description": "Report and cost estimation settings.",
+      "description": "Report and cost estimation settings. Issue #223: the legacy scalar token_cost_per_million_input / token_cost_per_million_output / token_cost_discount fields were retired in favour of a per-model rate table. Workspaces that still set the old fields get a fail-fast error at config-load time.",
       "additionalProperties": false,
       "properties": {
-        "token_cost_per_million_input": {
-          "type": "number",
-          "description": "Cost per million input tokens in USD. Default: 15.0 (Opus list price)."
+        "models": {
+          "type": "object",
+          "description": "Per-model token-pricing table (issue #223). Each key is a Claude model id (matches the literal `message.model` field in transcripts, e.g. `claude-opus-4-7`). Operators add new model ids without code changes by listing them here. See docs/model-pricing.md for the default rate table.",
+          "additionalProperties": {
+            "type": "object",
+            "description": "Rates for a single model. `input` and `output` are required. The four optional fields override the top-level `cache_*_multiplier` defaults and the global correction factor for this model only.",
+            "additionalProperties": false,
+            "required": ["input", "output"],
+            "properties": {
+              "input": {"type": "number", "minimum": 0, "description": "Cost per million input tokens in USD."},
+              "output": {"type": "number", "minimum": 0, "description": "Cost per million output tokens in USD."},
+              "cache_read_multiplier": {"type": "number", "minimum": 0, "description": "Optional per-model override for cache-read multiplier (relative to input rate). When omitted, the top-level report.cache_read_multiplier applies."},
+              "cache_write_5min_multiplier": {"type": "number", "minimum": 0, "description": "Optional per-model override for 5-min cache-write multiplier."},
+              "cache_write_1hr_multiplier": {"type": "number", "minimum": 0, "description": "Optional per-model override for 1-hour cache-write multiplier."},
+              "correction_factor": {"type": "number", "exclusiveMinimum": 0, "description": "Per-model contract correction factor (issue #223). Computed cost is multiplied by this value after every other factor. Default 1.0 (no correction). Set via `devbench cost-calibrate <actual-usd>` rather than hand-editing in most workflows."}
+            }
+          }
         },
-        "token_cost_per_million_output": {
-          "type": "number",
-          "description": "Cost per million output tokens in USD. Default: 75.0 (Opus list price)."
+        "default_model": {
+          "type": "object",
+          "description": "Rates applied to the `<unknown>` bucket: any transcript message whose `model` field is missing OR a model id not present in `report.models`. When absent, falls back to the Opus 4.7 list rates so unknown models err toward over-reporting cost.",
+          "additionalProperties": false,
+          "required": ["input", "output"],
+          "properties": {
+            "input": {"type": "number", "minimum": 0},
+            "output": {"type": "number", "minimum": 0},
+            "cache_read_multiplier": {"type": "number", "minimum": 0},
+            "cache_write_5min_multiplier": {"type": "number", "minimum": 0},
+            "cache_write_1hr_multiplier": {"type": "number", "minimum": 0},
+            "correction_factor": {"type": "number", "exclusiveMinimum": 0}
+          }
         },
         "display_timezone": {
           "type": "string",
@@ -375,11 +399,17 @@
           "minimum": 1,
           "description": "Number of most-recently-completed tasks averaged for the 'Recent pace' projection in `devbench report`. Defaults to 10. Lower for more responsiveness, higher for more stability. Override via DEVBENCH_REPORT_RECENT_PACE_TASKS env var."
         },
+        "token_cost_per_million_input": {
+          "description": "REMOVED in issue #223 (per-model cost pricing). Schema-accepts the key so the runtime fail-fast in config_loader.py can name the new `report.models` block in its error message; setting this key produces an immediate ValueError pointing at docs/model-pricing.md.",
+          "$comment": "removed-in-#223"
+        },
+        "token_cost_per_million_output": {
+          "description": "REMOVED in issue #223. See token_cost_per_million_input.",
+          "$comment": "removed-in-#223"
+        },
         "token_cost_discount": {
-          "type": "number",
-          "minimum": 0.0,
-          "maximum": 1.0,
-          "description": "Contract discount (correction factor) off list-price token cost, as a fraction in [0.0, 1.0]. final_cost = raw_list_cost * (1 - token_cost_discount). Default 0.0 (no discount, pay full list). Applies uniformly to every per-call cost and to every ETA projection; cache multipliers stay as pure ratios applied to the discounted base rate. Override via DEVBENCH_REPORT_TOKEN_COST_DISCOUNT env var. See docs/model-pricing.md."
+          "description": "REMOVED in issue #223. Per-model contract correction is now expressed via `report.models.<id>.correction_factor`.",
+          "$comment": "removed-in-#223"
         }
       }
     },

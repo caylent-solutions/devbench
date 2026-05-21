@@ -46,6 +46,7 @@ import logging
 import os
 import re
 import sys
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, tzinfo
 from itertools import pairwise
@@ -63,12 +64,11 @@ from devbench.config import (
     REPORT_CACHE_WRITE_1HR_MULTIPLIER,
     REPORT_CACHE_WRITE_5MIN_MULTIPLIER,
     REPORT_DATA_RESIDENCY_MULTIPLIER,
+    REPORT_DEFAULT_MODEL_RATES,
     REPORT_DISPLAY_TIMEZONE,
     REPORT_FAST_MODE_MULTIPLIER,
+    REPORT_MODEL_RATES,
     STOP_HOOK_WINDOW_SECONDS,
-    TOKEN_COST_DISCOUNT,
-    TOKEN_COST_PER_M_INPUT,
-    TOKEN_COST_PER_M_OUTPUT,
     WORKSPACE_ROOT,
 )
 from devbench.constants import (
@@ -549,6 +549,19 @@ def _parse_transcript_metrics_by_role(transcript_dir: Path | None, window_start:
     return {role: HookLogTotals(**acc) for role, acc in by_role.items()}
 
 
+def _combine_many(parts: Iterable[HookLogTotals]) -> HookLogTotals:
+    """Sum any iterable of ``HookLogTotals`` into one (empty -> zero).
+
+    Issue #223 helper: per-model aggregation produces N buckets that some
+    downstream renderers still want as a single roll-up; reuse the
+    pairwise ``_combine_totals`` here so the field-list stays in one place.
+    """
+    aggregate = HookLogTotals()
+    for part in parts:
+        aggregate = _combine_totals(aggregate, part)
+    return aggregate
+
+
 def _combine_totals(a: HookLogTotals, b: HookLogTotals) -> HookLogTotals:
     """Sum two HookLogTotals field-by-field. Used to merge hook-log + transcript usage."""
     return HookLogTotals(
@@ -746,6 +759,97 @@ def _recent_pace_minutes(
     return sum(durations) / len(durations)
 
 
+def _resolve_rates_for_model(model_id: str) -> tuple[float, float, float, float, float, float]:
+    """Return ``(input_rate, output_rate, cache_read_mult, cache_5m_mult, cache_1h_mult, correction)``.
+
+    Issue #223 lookup: per-model rates from ``REPORT_MODEL_RATES`` win for
+    the four scalar pricing fields; per-model cache multiplier overrides
+    (when set) win, otherwise the top-level ``REPORT_CACHE_*_MULTIPLIER``
+    defaults apply.  An unknown ``model_id`` falls back to
+    ``REPORT_DEFAULT_MODEL_RATES`` -- the canonical pricing for the
+    ``"<unknown>"`` aggregation bucket.
+    """
+    rates = REPORT_MODEL_RATES.get(model_id, REPORT_DEFAULT_MODEL_RATES)
+    cache_read = (
+        rates.cache_read_multiplier if rates.cache_read_multiplier is not None else REPORT_CACHE_READ_MULTIPLIER
+    )
+    cache_5m = (
+        rates.cache_write_5min_multiplier
+        if rates.cache_write_5min_multiplier is not None
+        else REPORT_CACHE_WRITE_5MIN_MULTIPLIER
+    )
+    cache_1h = (
+        rates.cache_write_1hr_multiplier
+        if rates.cache_write_1hr_multiplier is not None
+        else REPORT_CACHE_WRITE_1HR_MULTIPLIER
+    )
+    return (rates.input, rates.output, cache_read, cache_5m, cache_1h, rates.correction_factor)
+
+
+def _compute_cost_by_model(
+    totals_by_model: dict[str, HookLogTotals],
+    *,
+    data_residency_multiplier: float = 1.0,
+    fast_mode_multiplier: float = 1.0,
+) -> CostBreakdown:
+    """Sum per-model cost across every model id observed in the window (issue #223).
+
+    For each model id, look up its rates via ``_resolve_rates_for_model``
+    and price that bucket via ``_compute_cost``.  Each model's contribution
+    is multiplied by its own ``correction_factor`` BEFORE being added to
+    the aggregate so per-model contract corrections compose cleanly.
+
+    Returns a single aggregate ``CostBreakdown`` whose per-bucket totals
+    sum to ``total_cost`` (the existing invariant ``_compute_cost``'s
+    callers rely on).  The ``"<unknown>"`` bucket -- transcript messages
+    with no ``model`` field, plus model ids not present in
+    ``REPORT_MODEL_RATES`` -- is priced against
+    ``REPORT_DEFAULT_MODEL_RATES``.
+
+    The two side-channel multipliers (data-residency and fast-mode) apply
+    inside each per-model call, so a residency premium on a Sonnet bucket
+    multiplies the Sonnet input rate, not the Opus input rate.
+    """
+    aggregate = CostBreakdown(
+        input_cost=0.0,
+        output_cost=0.0,
+        cache_read_cost=0.0,
+        cache_write_5m_cost=0.0,
+        cache_write_1h_cost=0.0,
+        total_cost=0.0,
+    )
+    for model_id, totals in totals_by_model.items():
+        input_rate, output_rate, cache_read, cache_5m, cache_1h, correction = _resolve_rates_for_model(model_id)
+        bucket = _compute_cost(
+            totals,
+            input_rate,
+            output_rate,
+            cache_read,
+            cache_5m,
+            cache_1h,
+            data_residency_multiplier=data_residency_multiplier,
+            fast_mode_multiplier=fast_mode_multiplier,
+        )
+        if correction != 1.0:
+            bucket = CostBreakdown(
+                input_cost=bucket.input_cost * correction,
+                output_cost=bucket.output_cost * correction,
+                cache_read_cost=bucket.cache_read_cost * correction,
+                cache_write_5m_cost=bucket.cache_write_5m_cost * correction,
+                cache_write_1h_cost=bucket.cache_write_1h_cost * correction,
+                total_cost=bucket.total_cost * correction,
+            )
+        aggregate = CostBreakdown(
+            input_cost=aggregate.input_cost + bucket.input_cost,
+            output_cost=aggregate.output_cost + bucket.output_cost,
+            cache_read_cost=aggregate.cache_read_cost + bucket.cache_read_cost,
+            cache_write_5m_cost=aggregate.cache_write_5m_cost + bucket.cache_write_5m_cost,
+            cache_write_1h_cost=aggregate.cache_write_1h_cost + bucket.cache_write_1h_cost,
+            total_cost=aggregate.total_cost + bucket.total_cost,
+        )
+    return aggregate
+
+
 def _recent_per_task_cost(
     log_path: Path,
     done_times: dict[str, datetime],
@@ -787,28 +891,66 @@ def _recent_per_task_cost(
     hook_log_path = _hook_log_path(log_path)
     if event_index is not None:
         transcript_dir_indexed = _resolve_transcript_dir(event_index, hook_log_path)
-        totals_hook = HookLogTotals(**event_index.aggregate_hook_window(hook_log_path, earliest_progress))
-        totals_transcript = HookLogTotals(
-            **event_index.aggregate_transcript_window(transcript_dir_indexed, earliest_progress)
+        totals_hook_by_model = _per_model_totals_from_aggregator(
+            event_index.aggregate_hook_window_by_model, hook_log_path, earliest_progress
+        )
+        totals_transcript_by_model = _per_model_totals_from_aggregator(
+            event_index.aggregate_transcript_window_by_model, transcript_dir_indexed, earliest_progress
         )
     else:
+        # Non-indexed fallback: parser path doesn't yet bucket by model, so
+        # every entry collapses to the ``"<unknown>"`` bucket priced against
+        # ``REPORT_DEFAULT_MODEL_RATES``.  The indexed path (the normal
+        # case for any real workspace) preserves per-model attribution.
         totals_hook = _parse_hook_log_metrics(log_path, earliest_progress)
         transcript_dir = _discover_transcript_dir(hook_log_path)
         totals_transcript = _parse_transcript_metrics(transcript_dir, earliest_progress)
-    totals = _combine_totals(totals_hook, totals_transcript)
-
-    rate_factor = 1.0 - TOKEN_COST_DISCOUNT
-    cost = _compute_cost(
-        totals,
-        TOKEN_COST_PER_M_INPUT * rate_factor,
-        TOKEN_COST_PER_M_OUTPUT * rate_factor,
-        REPORT_CACHE_READ_MULTIPLIER,
-        REPORT_CACHE_WRITE_5MIN_MULTIPLIER,
-        REPORT_CACHE_WRITE_1HR_MULTIPLIER,
+        totals_hook_by_model = {"<unknown>": totals_hook}
+        totals_transcript_by_model = {"<unknown>": totals_transcript}
+    totals_by_model = _merge_totals_by_model(totals_hook_by_model, totals_transcript_by_model)
+    cost = _compute_cost_by_model(
+        totals_by_model,
         data_residency_multiplier=REPORT_DATA_RESIDENCY_MULTIPLIER,
         fast_mode_multiplier=REPORT_FAST_MODE_MULTIPLIER,
     )
     return cost.total_cost / n
+
+
+def _per_model_totals_from_aggregator(
+    aggregator: Callable[..., dict[str, dict[str, int]]],
+    source: object,
+    window_start: datetime,
+) -> dict[str, HookLogTotals]:
+    """Wrap an event-index per-model aggregator result into ``HookLogTotals``.
+
+    Issue #223.  The aggregator returns ``{model_id -> totals_dict}``;
+    this helper materialises each ``totals_dict`` as a frozen
+    ``HookLogTotals``.  Empty source -> empty dict (callers iterate so
+    no cost is contributed, which matches the pre-#223 single-bucket
+    "no rows" semantic).
+    """
+    raw = aggregator(source, window_start)
+    return {model_id: HookLogTotals(**totals_dict) for model_id, totals_dict in raw.items()}
+
+
+def _merge_totals_by_model(
+    *per_model_buckets: dict[str, HookLogTotals],
+) -> dict[str, HookLogTotals]:
+    """Sum per-model totals across one or more source buckets.
+
+    Used to combine ``hook_entries`` and ``transcript_entries`` per-model
+    aggregates into a single ``{model_id -> HookLogTotals}`` view that
+    feeds ``_compute_cost_by_model``.  Each model id contributes its
+    summed ``HookLogTotals`` across every source bucket it appears in.
+    """
+    merged: dict[str, HookLogTotals] = {}
+    for bucket in per_model_buckets:
+        for model_id, totals in bucket.items():
+            if model_id in merged:
+                merged[model_id] = _combine_totals(merged[model_id], totals)
+            else:
+                merged[model_id] = totals
+    return merged
 
 
 def _compute_window_stats(
@@ -880,28 +1022,30 @@ def _compute_window_stats(
     hook_log_path = _hook_log_path(log_path)
     if event_index is not None:
         transcript_dir_indexed = _resolve_transcript_dir(event_index, hook_log_path)
-        totals_hook = HookLogTotals(**event_index.aggregate_hook_window(hook_log_path, window_start))
-        totals_transcript = HookLogTotals(
-            **event_index.aggregate_transcript_window(transcript_dir_indexed, window_start)
+        totals_hook_by_model = _per_model_totals_from_aggregator(
+            event_index.aggregate_hook_window_by_model, hook_log_path, window_start
+        )
+        totals_transcript_by_model = _per_model_totals_from_aggregator(
+            event_index.aggregate_transcript_window_by_model, transcript_dir_indexed, window_start
         )
     else:
+        # Non-indexed fallback: see ``_recent_per_task_cost`` for the
+        # equivalent ``"<unknown>"`` collapse rationale.
         totals_hook = _parse_hook_log_metrics(log_path, window_start)
         transcript_dir = _discover_transcript_dir(hook_log_path)
         totals_transcript = _parse_transcript_metrics(transcript_dir, window_start)
-    totals = _combine_totals(totals_hook, totals_transcript)
-    # Apply the configured token-cost discount (contract rate / correction
-    # factor off list) to the base input/output rates. final = list * (1 - d).
-    # Cache multipliers stay as pure ratios; the discounted base propagates
-    # into every component cost AND the ETA projection (est_total_cost is
-    # derived from cost.total_cost), so one multiplication covers both.
-    rate_factor = 1.0 - TOKEN_COST_DISCOUNT
-    cost = _compute_cost(
-        totals,
-        TOKEN_COST_PER_M_INPUT * rate_factor,
-        TOKEN_COST_PER_M_OUTPUT * rate_factor,
-        REPORT_CACHE_READ_MULTIPLIER,
-        REPORT_CACHE_WRITE_5MIN_MULTIPLIER,
-        REPORT_CACHE_WRITE_1HR_MULTIPLIER,
+        totals_hook_by_model = {"<unknown>": totals_hook}
+        totals_transcript_by_model = {"<unknown>": totals_transcript}
+    totals_by_model = _merge_totals_by_model(totals_hook_by_model, totals_transcript_by_model)
+    # Aggregate totals across every model id for downstream renderers that
+    # still need a single ``HookLogTotals``-shaped view of the window.
+    totals = _combine_many(totals_by_model.values())
+    # Per-model cost: each model id is priced against its own rates; the
+    # per-model contract correction factor (issue #223) composes inside the
+    # helper.  The premium multipliers (residency / fast-mode) apply
+    # inside each per-model call so they multiply the correct base rate.
+    cost = _compute_cost_by_model(
+        totals_by_model,
         data_residency_multiplier=REPORT_DATA_RESIDENCY_MULTIPLIER,
         fast_mode_multiplier=REPORT_FAST_MODE_MULTIPLIER,
     )
@@ -2515,9 +2659,8 @@ def generate_report(
 
     # Issue #162 Phase 6 (rendered-body snapshot) is deferred.
     # A snapshot keyed on log mtime + size is fast but unsafe:
-    # cost-rate config (``TOKEN_COST_DISCOUNT``,
-    # ``TOKEN_COST_PER_M_INPUT/OUTPUT``, the cache + residency + fast-
-    # mode multipliers, the display timezone, ``RECENT_PACE_TASKS``)
+    # cost-rate config (``REPORT_MODEL_RATES``, the cache + residency +
+    # fast-mode multipliers, the display timezone, ``RECENT_PACE_TASKS``)
     # can change between invocations without the log advancing, and a
     # snapshot keyed only on the log would silently return numbers
     # computed against the old config. Per CLAUDE.md fail-fast: better

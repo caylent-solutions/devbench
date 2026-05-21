@@ -364,14 +364,158 @@ DEFAULT_PR_REVIEW_DECISION_BLOCKS: bool = True
 # a no-op for repos without review bots. Override via
 # ``JUDGE_PR_REVIEW_AGENTS`` (e.g. ``github-copilot[bot],amazon-q-developer[bot]``).
 DEFAULT_PR_REVIEW_AGENTS: tuple[str, ...] = ()
-DEFAULT_TOKEN_COST_PER_M_INPUT: float = 5.0
-DEFAULT_TOKEN_COST_PER_M_OUTPUT: float = 25.0
+# ---------------------------------------------------------------------------
+# Per-model token pricing (issue #223). Each model id maps to a ``ModelRates``
+# carrying the four scalar rates that devbench charges against. The cache
+# multipliers + correction_factor are optional per-model overrides; when None
+# the report falls back to the top-level ``ReportConfig`` multipliers.
+#
+# The legacy scalar fields (``DEFAULT_TOKEN_COST_PER_M_INPUT`` /
+# ``DEFAULT_TOKEN_COST_PER_M_OUTPUT`` / ``DEFAULT_TOKEN_COST_DISCOUNT``) were
+# removed in the same commit per CLAUDE.md "Complete Replacement of
+# Superseded Code". Existing workspaces that set the old keys get a clear
+# fail-fast error at config-load time pointing at the new ``report.models``
+# block; see ``docs/model-pricing.md``.
+# ---------------------------------------------------------------------------
 
-# Token-cost discount (contract / correction factor off list price). See
-# ``devbench.config.TOKEN_COST_DISCOUNT`` and ``docs/model-pricing.md``.
-# final_cost = raw_list_cost * (1 - token_cost_discount). Default 0.0 =
-# no discount (pay full list), preserving pre-feature behaviour.
-DEFAULT_TOKEN_COST_DISCOUNT: float = 0.0
+
+def _opt_float(value: float | None) -> float | None:
+    """Return ``float(value)`` when ``value`` is not None, else ``None``.
+
+    Helper for ``ModelRates.__init__``: keeps the per-multiplier "unset"
+    sentinel intact (so the runtime falls back to the top-level
+    ``ReportConfig`` defaults) while still coercing JSON / YAML ints to
+    float for the arithmetic path.
+    """
+    return None if value is None else float(value)
+
+
+class ModelRates:
+    """Per-model cost rates (issue #223).
+
+    The four scalar fields are the canonical Anthropic-published rates
+    expressed in USD per 1M tokens (input + output) and as multipliers
+    relative to ``input`` (cache read / write 5min / write 1hr). All cache
+    multiplier fields are optional -- when None the per-window report falls
+    back to the top-level ``ReportConfig`` defaults so operators on
+    standard Anthropic pricing only need to override the two scalar rates.
+
+    ``correction_factor`` is the per-model contract correction; defaults to
+    1.0 (no correction). Computed cost is multiplied by this value AFTER
+    all other factors so operators can tune individual models without
+    distorting cost for other models in a multi-model run.
+
+    The class is a plain attribute container (not a frozen dataclass) so
+    ``cli.py::cmd_cost_calibrate`` can construct mutated copies via
+    ``replace``-style helpers without dataclass plumbing.
+    """
+
+    __slots__ = (
+        "cache_read_multiplier",
+        "cache_write_1hr_multiplier",
+        "cache_write_5min_multiplier",
+        "correction_factor",
+        "input",
+        "output",
+    )
+
+    def __init__(self, **kwargs: float | None) -> None:
+        # **kwargs (rather than named ``input=``/``output=``) so the
+        # attribute names match the YAML keys verbatim without shadowing
+        # the builtin ``input()`` in this scope.  Callers always pass
+        # keyword arguments (``ModelRates(input=5.0, output=25.0)``); the
+        # init validates required keys and rejects unknown ones so type
+        # safety is preserved at the boundary.  ``float | None`` covers
+        # both the required scalar fields (always float) and the optional
+        # multiplier fields (None when unset).
+        allowed = {
+            "input",
+            "output",
+            "cache_read_multiplier",
+            "cache_write_5min_multiplier",
+            "cache_write_1hr_multiplier",
+            "correction_factor",
+        }
+        unknown = set(kwargs) - allowed
+        if unknown:
+            raise TypeError(f"ModelRates got unexpected keyword argument(s): {sorted(unknown)}")
+        for required in ("input", "output"):
+            if kwargs.get(required) is None:
+                raise TypeError(f"ModelRates requires keyword arguments 'input' and 'output'; missing {required!r}")
+        # All four numeric inputs may already be float; the float(...) cast
+        # ensures ints coming through JSON or YAML are normalised to the
+        # arithmetic domain ``_compute_cost`` expects.  The conditional
+        # ``None`` preserves the "unset" sentinel on the optional fields.
+        self.input = float(kwargs["input"] or 0.0)
+        self.output = float(kwargs["output"] or 0.0)
+        self.cache_read_multiplier = _opt_float(kwargs.get("cache_read_multiplier"))
+        self.cache_write_5min_multiplier = _opt_float(kwargs.get("cache_write_5min_multiplier"))
+        self.cache_write_1hr_multiplier = _opt_float(kwargs.get("cache_write_1hr_multiplier"))
+        self.correction_factor = float(kwargs.get("correction_factor") or 1.0)
+
+    def __repr__(self) -> str:
+        return (
+            f"ModelRates(input={self.input}, output={self.output}, "
+            f"cache_read_multiplier={self.cache_read_multiplier}, "
+            f"cache_write_5min_multiplier={self.cache_write_5min_multiplier}, "
+            f"cache_write_1hr_multiplier={self.cache_write_1hr_multiplier}, "
+            f"correction_factor={self.correction_factor})"
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, ModelRates):
+            return NotImplemented
+        return (
+            self.input == other.input
+            and self.output == other.output
+            and self.cache_read_multiplier == other.cache_read_multiplier
+            and self.cache_write_5min_multiplier == other.cache_write_5min_multiplier
+            and self.cache_write_1hr_multiplier == other.cache_write_1hr_multiplier
+            and self.correction_factor == other.correction_factor
+        )
+
+    def __hash__(self) -> int:
+        return hash(
+            (
+                self.input,
+                self.output,
+                self.cache_read_multiplier,
+                self.cache_write_5min_multiplier,
+                self.cache_write_1hr_multiplier,
+                self.correction_factor,
+            )
+        )
+
+
+# Default per-model rates table -- single source of truth.  Lifted verbatim
+# from ``docs/model-pricing.md`` Standard pricing table.  Operators who
+# leave ``report.models`` absent get this table plus DEFAULT_FALLBACK_MODEL_RATES
+# for any model id observed at runtime that isn't in the table (sentinel key
+# ``"<unknown>"``).
+#
+# Keys match the literal ``model`` strings emitted by Claude Code in the
+# transcript ``message.model`` field (e.g. ``claude-opus-4-7``, NOT
+# ``us.anthropic.claude-opus-4-7-v1``).
+DEFAULT_MODEL_RATES: dict[str, ModelRates] = {
+    "claude-opus-4-7": ModelRates(input=5.0, output=25.0),
+    "claude-opus-4-6": ModelRates(input=5.0, output=25.0),
+    "claude-opus-4-5": ModelRates(input=5.0, output=25.0),
+    "claude-opus-4-1": ModelRates(input=15.0, output=75.0),
+    "claude-opus-4": ModelRates(input=15.0, output=75.0),
+    "claude-sonnet-4-6": ModelRates(input=3.0, output=15.0),
+    "claude-sonnet-4-5": ModelRates(input=3.0, output=15.0),
+    "claude-sonnet-4": ModelRates(input=3.0, output=15.0),
+    "claude-haiku-4-5": ModelRates(input=1.0, output=5.0),
+    "claude-haiku-3-5": ModelRates(input=0.80, output=4.0),
+    "claude-haiku-3": ModelRates(input=0.25, output=1.25),
+}
+
+# Rates applied to the ``"<unknown>"`` aggregation bucket: any transcript
+# message whose ``model`` field is missing, or any model id that does not
+# appear in the loaded ``report.models`` table. Default mirrors Opus 4.7 list
+# so devbench errs on the conservative (over-report) side -- under-reporting
+# is the operator-pain failure mode #223 is filed against.
+DEFAULT_FALLBACK_MODEL_RATES: ModelRates = ModelRates(input=5.0, output=25.0)
 
 # Em-dash (U+2014). Prohibited in work-unit markdown files by the
 # validate-backlog Check 10 (manager.py). Any CLI writer that accepts

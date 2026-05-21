@@ -194,26 +194,66 @@ orchestrate:
 # Report / cost estimation
 # ---------------------------------------------------------------------------
 report:
-  # Defaults match Opus 4.7 list pricing. Set explicitly only when running a
-  # different model or when your contract has a different rate structure.
+  # Per-model token pricing (issue #223).  Each key is a Claude model id
+  # (the literal `message.model` value Claude Code records on every
+  # `assistant` message envelope, e.g. `claude-opus-4-7`).  The two
+  # mandatory fields are `input` and `output` in USD per 1M tokens.
   #
-  # Calibration guidance:
-  # The reported cost should equal actual API billing within ~1%. If reported
-  # cost drifts from actual (e.g., model swap, 1M-context premium tier, or
-  # non-list contract pricing), derive a correction factor from a recent run:
-  #     correction = actual_billing / reported_cost
-  # Multiply BOTH per-million rates below by that factor; the input/output
-  # ratio is preserved and the cache-read / cache-write / data-residency
-  # multipliers below compose correctly on top of the corrected base rate.
+  # Optional per-model overrides:
+  #   - cache_read_multiplier      override report.cache_read_multiplier for this model
+  #   - cache_write_5min_multiplier override report.cache_write_5min_multiplier
+  #   - cache_write_1hr_multiplier  override report.cache_write_1hr_multiplier
+  #   - correction_factor          per-model contract correction; default 1.0
   #
-  # NOTE: `token_cost_discount` (below) only DECREASES reported cost, so it is
-  # the wrong knob for under-reporting. Always correct upward via the per-
-  # million rates above.
-  token_cost_per_million_input: 5.0
-  token_cost_per_million_output: 25.0
-  # Contract discount off list price as a fraction in [0.0, 1.0].
-  # final_cost = raw_list_cost * (1 - token_cost_discount). 0.0 = full list.
-  token_cost_discount: 0.0
+  # Set `correction_factor` per model when reported cost drifts from your
+  # actual Anthropic invoice on THAT model only.  Use
+  # `devbench cost-calibrate <actual-usd>` to compute and write the
+  # correction factor instead of editing this file by hand.
+  #
+  # The legacy scalar fields (`token_cost_per_million_input`,
+  # `token_cost_per_million_output`, `token_cost_discount`) were retired
+  # in issue #223 in favour of this block.  Workspaces that still set
+  # them get a fail-fast error at config-load time.
+  models:
+    claude-opus-4-7:
+      input: 5.0
+      output: 25.0
+    claude-opus-4-6:
+      input: 5.0
+      output: 25.0
+    claude-opus-4-5:
+      input: 5.0
+      output: 25.0
+    claude-opus-4-1:
+      input: 15.0
+      output: 75.0
+    claude-opus-4:
+      input: 15.0
+      output: 75.0
+    claude-sonnet-4-6:
+      input: 3.0
+      output: 15.0
+    claude-sonnet-4-5:
+      input: 3.0
+      output: 15.0
+    claude-sonnet-4:
+      input: 3.0
+      output: 15.0
+    claude-haiku-4-5:
+      input: 1.0
+      output: 5.0
+    claude-haiku-3-5:
+      input: 0.80
+      output: 4.0
+    claude-haiku-3:
+      input: 0.25
+      output: 1.25
+  # Rates applied to any transcript message whose `model` field is missing
+  # OR a model id not present in `report.models` above.  Defaults to Opus
+  # 4.7 list rates so unknown models err toward over-reporting.
+  default_model:
+    input: 5.0
+    output: 25.0
   # Anthropic's published cache pricing -- override only on platforms with
   # different cache pricing (some Bedrock configurations).
   cache_read_multiplier: 0.10

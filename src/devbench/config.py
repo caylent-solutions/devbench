@@ -55,6 +55,7 @@ from devbench.constants import (
     DEFAULT_LLM_TIMEOUT,
     DEFAULT_MAX_CASCADE_DEPTH,
     DEFAULT_MAX_RETRY_ATTEMPTS,
+    DEFAULT_MODEL_RATES,
     DEFAULT_ORCHESTRATOR_POLL_INTERVAL,
     DEFAULT_OUTPUT_TRUNCATION_LIMIT,
     DEFAULT_PAUSE_BEFORE_MERGE,
@@ -69,9 +70,7 @@ from devbench.constants import (
     DEFAULT_STOP_HOOK_STALE_TASK_MINUTES,
     DEFAULT_STOP_HOOK_WINDOW_SECONDS,
     DEFAULT_TEST_TIMEOUT,
-    DEFAULT_TOKEN_COST_DISCOUNT,
-    DEFAULT_TOKEN_COST_PER_M_INPUT,
-    DEFAULT_TOKEN_COST_PER_M_OUTPUT,
+    ModelRates,
 )
 
 _log = logging.getLogger("devbench.config")
@@ -364,25 +363,22 @@ AUTO_FINALIZE: bool = RUNTIME_CONFIG.git_ops.auto_finalize
 AUTO_MERGE: bool = RUNTIME_CONFIG.git_ops.auto_merge
 MANIFEST_AMENDMENT_CONFIG = RUNTIME_CONFIG.manifest_amendment
 TASK_FACTORY_CONFIG = RUNTIME_CONFIG.task_factory
-TOKEN_COST_PER_M_INPUT: float = (
-    RUNTIME_CONFIG.report.token_cost_per_million_input
-    if RUNTIME_CONFIG.report.token_cost_per_million_input is not None
-    else DEFAULT_TOKEN_COST_PER_M_INPUT
-)
-TOKEN_COST_PER_M_OUTPUT: float = (
-    RUNTIME_CONFIG.report.token_cost_per_million_output
-    if RUNTIME_CONFIG.report.token_cost_per_million_output is not None
-    else DEFAULT_TOKEN_COST_PER_M_OUTPUT
-)
-# Contract discount off list-price token cost. Fraction in the inclusive
-# range zero to one. Default is zero meaning no discount. See
-# docs/model-pricing.md for the full semantic. Resolution precedence is
-# env var, then YAML, then constant default.
-TOKEN_COST_DISCOUNT: float = _resolve_float(
-    "DEVBENCH_REPORT_TOKEN_COST_DISCOUNT",
-    RUNTIME_CONFIG.report.token_cost_discount,
-    DEFAULT_TOKEN_COST_DISCOUNT,
-)
+# Per-model token-pricing table (issue #223).  Operators set per-model rates
+# in ``backlog/config/devbench.yaml`` under ``report.models``; we merge that
+# with ``DEFAULT_MODEL_RATES`` so the operator's overrides win for the model
+# ids they list and the canonical Anthropic defaults apply for everything
+# else.  The retired scalar token-cost constants are no longer exposed --
+# callers consume ``REPORT_MODEL_RATES`` instead.  Removed per CLAUDE.md
+# "Complete Replacement of Superseded Code"; no deprecation shim.
+REPORT_MODEL_RATES: dict[str, ModelRates] = {
+    **DEFAULT_MODEL_RATES,
+    **RUNTIME_CONFIG.report.models,
+}
+# Rates applied to the ``"<unknown>"`` aggregation bucket (transcript
+# messages with no ``model`` field, or model ids not present in
+# REPORT_MODEL_RATES).  Operator override via ``report.default_model``;
+# falls back to ``DEFAULT_FALLBACK_MODEL_RATES`` (Opus 4.7 list rates).
+REPORT_DEFAULT_MODEL_RATES: ModelRates = RUNTIME_CONFIG.report.default_model
 # IANA timezone name for displaying timestamps in `devbench report`.
 # None means "use the host's system local timezone." Resolution: env > YAML > None.
 REPORT_DISPLAY_TIMEZONE: str | None = _resolve_optional_str(

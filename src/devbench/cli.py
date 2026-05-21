@@ -66,7 +66,7 @@ import shutil
 import signal
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -2913,6 +2913,212 @@ def _resolve_session_report_log(session_name: str) -> Path | None:
         )
         return None
     return session_log
+
+
+class _CostCalibrateArgs:
+    """Parsed args for ``cmd_cost_calibrate``.  Lifted into a small
+    container so the dispatcher splits cleanly between "parse" and
+    "act" responsibilities (SRP) and the dispatcher's branch count
+    stays under the ruff PLR0912 ceiling.
+    """
+
+    __slots__ = ("actual_usd", "window_start")
+
+    def __init__(self, actual_usd: float, window_start: datetime) -> None:
+        self.actual_usd = actual_usd
+        self.window_start = window_start
+
+
+def _parse_cost_calibrate_argv(argv: tuple[str, ...]) -> _CostCalibrateArgs | int:
+    """Parse ``cost-calibrate`` argv into a ``_CostCalibrateArgs`` or
+    return an exit code on validation failure.
+
+    Operators invoke as ``cost-calibrate <actual-usd> [--window <ISO-8601>]``;
+    this helper handles the variadic dispatch path so the main command
+    body only has to handle the success case.
+    """
+    actual_usd: float | None = None
+    window_start: datetime = datetime(1970, 1, 1, tzinfo=UTC)
+    err: str | None = None
+    it = iter(argv)
+    for token in it:
+        if token == "--window":
+            window_iso = next(it, None)
+            if window_iso is None or not window_iso.strip():
+                err = "cost-calibrate: --window requires an ISO-8601 timestamp value"
+                break
+            try:
+                parsed = datetime.fromisoformat(window_iso.replace("Z", "+00:00"))
+            except ValueError as exc:
+                err = f"cost-calibrate: invalid --window value {window_iso!r}: {exc}"
+                break
+            window_start = parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+            continue
+        if actual_usd is not None:
+            err = f"cost-calibrate: unexpected extra argument {token!r}"
+            break
+        try:
+            actual_usd = float(token)
+        except ValueError:
+            err = f"cost-calibrate: actual USD must be a numeric value; got {token!r}"
+            break
+    if err is None and actual_usd is None:
+        err = (
+            "cost-calibrate: missing required <actual-usd> argument. "
+            "Usage: devbench cost-calibrate <actual-usd> [--window <ISO-8601>]"
+        )
+    elif err is None and actual_usd is not None and actual_usd <= 0:
+        err = (
+            f"cost-calibrate: actual USD must be > 0; got {actual_usd}. "
+            "Use a positive billing figure from your most recent Anthropic invoice."
+        )
+    if err is not None:
+        print(err, file=sys.stderr)
+        return 2
+    return _CostCalibrateArgs(actual_usd=actual_usd or 0.0, window_start=window_start)
+
+
+def cmd_cost_calibrate(*argv: str) -> int:
+    """``devbench cost-calibrate <actual-usd> [--window <ISO-8601>]`` (issue #223).
+
+    Reads the most-recent reported per-model spend over the window
+    starting at ``--window`` (default: log start, which folds in every
+    recorded event), derives a per-model correction factor from the
+    ratio ``actual_usd / reported_total``, apportions the resulting
+    correction across each observed model by its share of reported spend,
+    and writes the result back to ``<workspace>/backlog/config/devbench.yaml``
+    under ``report.models.<id>.correction_factor``.
+
+    Verifies AC-6: round-trip a workspace whose actual billing is $X and
+    reported $Y by writing per-model correction factors so the next
+    ``devbench report`` reflects the corrected total.
+
+    Args parsing is delegated to ``_parse_cost_calibrate_argv``.
+    """
+    parsed = _parse_cost_calibrate_argv(argv)
+    if isinstance(parsed, int):
+        return parsed
+    actual_usd = parsed.actual_usd
+    window_start = parsed.window_start
+
+    from devbench.reporting.event_index import EventIndex
+    from devbench.reporting.report import _per_model_totals_from_aggregator, _resolve_rates_for_model
+
+    config_yaml = WORKSPACE_ROOT / "backlog" / "config" / "devbench.yaml"
+    if not config_yaml.is_file():
+        print(
+            f"cost-calibrate: cannot find {config_yaml}. Provide a workspace "
+            "with backlog/config/devbench.yaml or set DEVBENCH_WORKSPACE_ROOT correctly.",
+            file=sys.stderr,
+        )
+        return 2
+
+    event_index = EventIndex.open(WORKSPACE_ROOT)
+    try:
+        hook_log_path = WORKSPACE_ROOT / "hook-logs.jsonl"
+        # Refresh the hook-log cache FIRST so ``first_hook_transcript_path``
+        # has rows to read on the lookup that follows; without this order
+        # the lookup on a cold cache returns None even when the live hook
+        # log carries ``transcript_path`` entries.
+        event_index.refresh_hook_log(hook_log_path)
+        transcript_path_raw = event_index.first_hook_transcript_path(hook_log_path)
+        transcript_dir = Path(transcript_path_raw).parent if transcript_path_raw else None
+        if transcript_dir is not None:
+            event_index.refresh_transcripts(transcript_dir)
+        hook_by_model = _per_model_totals_from_aggregator(
+            event_index.aggregate_hook_window_by_model, hook_log_path, window_start
+        )
+        transcript_by_model = _per_model_totals_from_aggregator(
+            event_index.aggregate_transcript_window_by_model, transcript_dir, window_start
+        )
+    finally:
+        event_index.close()
+
+    # Sum per-model spend at the CURRENT rate table to derive each
+    # model's share of total reported spend.  We do NOT compose the
+    # existing correction_factor here -- the new factor replaces (not
+    # multiplies) whatever was there before so successive calibrations
+    # don't compound.
+    per_model_spend: dict[str, float] = {}
+    from devbench.reporting.report import _compute_cost
+
+    for source in (hook_by_model, transcript_by_model):
+        for model_id, totals in source.items():
+            input_rate, output_rate, cache_read, cache_5m, cache_1h, _existing_correction = _resolve_rates_for_model(
+                model_id
+            )
+            bucket = _compute_cost(totals, input_rate, output_rate, cache_read, cache_5m, cache_1h)
+            per_model_spend[model_id] = per_model_spend.get(model_id, 0.0) + bucket.total_cost
+
+    reported_total = sum(per_model_spend.values())
+    if reported_total <= 0:
+        print(
+            "cost-calibrate: reported cost in the selected window is $0.00. "
+            "Nothing to calibrate against. Widen the window or run after a session with billable activity.",
+            file=sys.stderr,
+        )
+        return 1
+
+    global_correction = actual_usd / reported_total
+    print(f"cost-calibrate: reported total = ${reported_total:.4f}, actual = ${actual_usd:.4f}")
+    print(f"cost-calibrate: derived global correction factor = {global_correction:.6f}")
+
+    # Same correction is applied to every observed model id because the
+    # operator only supplies one aggregate USD figure; per-model
+    # differentiation would require per-model invoice data, which
+    # Anthropic does not break out today.  Operators with a per-model
+    # invoice can edit the resulting yaml manually for finer control.
+    write_per_model_correction_factors(config_yaml, per_model_spend.keys(), global_correction)
+    print(f"cost-calibrate: wrote correction_factor={global_correction:.6f} for {len(per_model_spend)} model(s)")
+    return 0
+
+
+def write_per_model_correction_factors(config_yaml: Path, model_ids: Iterable[str], correction_factor: float) -> None:
+    """Update ``<config_yaml>::report.models.<id>.correction_factor`` for every
+    model id in ``model_ids`` (issue #223 AC-6).
+
+    Uses a minimal YAML round-trip via ``yaml.safe_load`` + ``yaml.safe_dump``
+    -- this loses operator comments but preserves data.  Operators
+    typically run ``cost-calibrate`` infrequently (after an Anthropic
+    invoice arrives) so this trade is acceptable; if comment-preservation
+    becomes a requirement the helper can swap to ``ruamel.yaml``.
+    """
+    import yaml as _yaml
+
+    raw = _yaml.safe_load(config_yaml.read_text(encoding="utf-8")) or {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"cost-calibrate: {config_yaml} top-level YAML must be a mapping; got {type(raw).__name__}.")
+    report_section = raw.setdefault("report", {})
+    if not isinstance(report_section, dict):
+        raise ValueError(
+            f"cost-calibrate: {config_yaml} has report: that is not a mapping; cannot inject correction factors."
+        )
+    models_section = report_section.setdefault("models", {})
+    if not isinstance(models_section, dict):
+        raise ValueError(
+            f"cost-calibrate: {config_yaml} has report.models: that is not a mapping; cannot inject correction factors."
+        )
+    for model_id in model_ids:
+        entry = models_section.setdefault(model_id, {})
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"cost-calibrate: report.models.{model_id} is not a mapping in {config_yaml}; "
+                "cannot inject correction factor."
+            )
+        # If the operator has NOT listed this model's input/output yet,
+        # seed them from the canonical defaults so the resulting yaml is
+        # immediately valid (the schema requires both fields).
+        if "input" not in entry or "output" not in entry:
+            from devbench.constants import DEFAULT_FALLBACK_MODEL_RATES, DEFAULT_MODEL_RATES
+
+            seed = DEFAULT_MODEL_RATES.get(model_id, DEFAULT_FALLBACK_MODEL_RATES)
+            entry.setdefault("input", seed.input)
+            entry.setdefault("output", seed.output)
+        entry["correction_factor"] = float(correction_factor)
+    # Atomic write to avoid partial reads if cost-calibrate is interrupted.
+    tmp = config_yaml.with_suffix(config_yaml.suffix + ".tmp")
+    tmp.write_text(_yaml.safe_dump(raw, sort_keys=False, default_flow_style=False), encoding="utf-8")
+    tmp.replace(config_yaml)
 
 
 def cmd_report(
@@ -9980,6 +10186,14 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
             "drain [--reason '<text>'] | drain --cancel | drain --status"
         ),
     ),
+    "cost-calibrate": (
+        cmd_cost_calibrate,
+        0,
+        (
+            "Calibrate per-model correction factors against an actual Anthropic invoice (issue #223): "
+            "cost-calibrate <actual-usd> [--window <ISO-8601>]"
+        ),
+    ),
     "sessions": (
         cmd_sessions,
         0,
@@ -10140,6 +10354,7 @@ _HELP_FLAGS: frozenset[str] = frozenset({"--help", "-h"})
 # variadic dispatch lets the value through.
 _VARIADIC_COMMANDS: frozenset[str] = frozenset(
     {
+        "cost-calibrate",
         "hook-tail",
         "watchdog",
         "notify-test",

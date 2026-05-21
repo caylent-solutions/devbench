@@ -241,6 +241,25 @@ watch -n 60 'uv run devbench watchdog --print-if-stuck'
 
 The watchdog never attempts to restart orchestration itself. Restarts remain under operator control because they may overlap with manual edits and affect billing.
 
+### `cost-calibrate`
+
+```
+uv run devbench cost-calibrate <actual-usd> [--window <ISO-8601>]
+```
+
+Issue #223: calibrate per-model correction factors against an actual Anthropic invoice. Sums devbench's reported cost across every model observed in the window, derives `correction_factor = actual_usd / reported_total`, and writes the factor back to `report.models.<id>.correction_factor` in `backlog/config/devbench.yaml` for every model that contributed. The next `devbench report` reflects the corrected total without further operator action.
+
+- `<actual-usd>` -- required; the operator's actual spend in USD for the window (typically taken from an Anthropic invoice line). Must be > 0.
+- `--window <ISO-8601>` -- optional; restricts the calibration window to events at or after the given timestamp. Defaults to `1970-01-01T00:00:00Z` (every event in the cache).
+
+Exit codes:
+
+- `0` on success (file written, summary printed).
+- `1` when the selected window's reported cost is `$0.00` (no billable activity yet -- widen the window or run after a real session).
+- `2` on argument validation errors or missing `backlog/config/devbench.yaml`.
+
+Successive calibrations replace (not multiply) the prior `correction_factor` so re-running with the same actual-spend figure is idempotent. See [model-pricing.md](model-pricing.md) for the full calibration workflow.
+
 ### `list-proposals`
 
 ```

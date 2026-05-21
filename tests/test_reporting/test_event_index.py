@@ -823,3 +823,200 @@ class TestRefreshOrchLogSourcesShardAware:
             assert len(timestamps) == 2
         finally:
             idx.close()
+
+
+# ---------------------------------------------------------------------------
+# Issue #223: per-model attribution in SQL index + per-model aggregators
+# ---------------------------------------------------------------------------
+
+
+class TestPerModelAttribution:
+    """Issue #223 AC-1: every hook + transcript entry has its ``model``
+    recorded in the SQL index so per-model aggregation can run.
+
+    AC-5: bumping the schema version drops + rebuilds the index (this
+    behaviour already existed for prior schema bumps; the test asserts
+    the model column is present in the rebuilt schema, which is the
+    operator-visible artefact of the v4 migration).
+    """
+
+    def test_hook_entries_table_has_model_column(self, workspace: Path) -> None:
+        """AC-1: ``SELECT DISTINCT model FROM hook_entries`` returns
+        the model attributions captured at parse time.
+        """
+        hook = workspace / "hook-logs.jsonl"
+        _write_jsonl(
+            hook,
+            [
+                {
+                    "timestamp": "2026-05-04T10:00:00.000000+00:00",
+                    "input": {
+                        "tool_response": {
+                            "model": "claude-sonnet-4-6",
+                            "usage": {"input_tokens": 1000},
+                        }
+                    },
+                },
+                {
+                    "timestamp": "2026-05-04T10:01:00.000000+00:00",
+                    "input": {
+                        "tool_response": {
+                            "model": "claude-opus-4-7",
+                            "usage": {"input_tokens": 2000},
+                        }
+                    },
+                },
+            ],
+        )
+        idx = EventIndex.open(workspace)
+        try:
+            idx.refresh_hook_log(hook)
+            rows = idx._conn.execute("SELECT DISTINCT model FROM hook_entries ORDER BY model").fetchall()
+            models = [row[0] for row in rows]
+            assert models == ["claude-opus-4-7", "claude-sonnet-4-6"]
+        finally:
+            idx.close()
+
+    def test_transcript_entries_table_has_model_column(self, workspace: Path, tmp_path: Path) -> None:
+        """AC-1 mirror for transcript_entries -- ``message.model`` is
+        captured at parse time and queryable.
+        """
+        from devbench.reporting.event_index import _KIND_TRANSCRIPT
+
+        del _KIND_TRANSCRIPT  # imported to confirm module symbol exists
+        transcript_dir = tmp_path / "transcripts"
+        transcript_dir.mkdir()
+        transcript_file = transcript_dir / "session.jsonl"
+        _write_jsonl(
+            transcript_file,
+            [
+                {
+                    "timestamp": "2026-05-04T10:00:00.000000+00:00",
+                    "type": "assistant",
+                    "message": {
+                        "id": "msg-abc",
+                        "model": "claude-sonnet-4-6",
+                        "usage": {"input_tokens": 1500},
+                    },
+                },
+                {
+                    "timestamp": "2026-05-04T10:01:00.000000+00:00",
+                    "type": "assistant",
+                    "message": {
+                        "id": "msg-def",
+                        "model": "claude-haiku-4-5",
+                        "usage": {"input_tokens": 500},
+                    },
+                },
+            ],
+        )
+        idx = EventIndex.open(workspace)
+        try:
+            idx.refresh_transcripts(transcript_dir)
+            rows = idx._conn.execute("SELECT DISTINCT model FROM transcript_entries ORDER BY model").fetchall()
+            models = [row[0] for row in rows]
+            assert models == ["claude-haiku-4-5", "claude-sonnet-4-6"]
+        finally:
+            idx.close()
+
+    def test_aggregate_hook_window_by_model_buckets_per_model(self, workspace: Path) -> None:
+        """Per-model aggregation produces one totals dict per observed
+        model id; the buckets sum back to the single-bucket aggregator's
+        rollup (sanity check that we are not silently dropping tokens).
+        """
+        hook = workspace / "hook-logs.jsonl"
+        _write_jsonl(
+            hook,
+            [
+                {
+                    "timestamp": "2026-05-04T10:00:00.000000+00:00",
+                    "input": {
+                        "tool_response": {
+                            "model": "claude-sonnet-4-6",
+                            "usage": {"input_tokens": 1000, "output_tokens": 200},
+                        }
+                    },
+                },
+                {
+                    "timestamp": "2026-05-04T10:01:00.000000+00:00",
+                    "input": {
+                        "tool_response": {
+                            "model": "claude-opus-4-7",
+                            "usage": {"input_tokens": 3000, "output_tokens": 600},
+                        }
+                    },
+                },
+                {
+                    "timestamp": "2026-05-04T10:02:00.000000+00:00",
+                    "input": {
+                        # No model attribution -- aggregates under "<unknown>".
+                        "tool_response": {"usage": {"input_tokens": 500, "output_tokens": 100}},
+                    },
+                },
+            ],
+        )
+        idx = EventIndex.open(workspace)
+        try:
+            idx.refresh_hook_log(hook)
+            window_start = datetime(2026, 5, 4, 9, 0, tzinfo=UTC)
+            by_model = idx.aggregate_hook_window_by_model(hook, window_start)
+            assert set(by_model.keys()) == {"claude-sonnet-4-6", "claude-opus-4-7", "<unknown>"}
+            assert by_model["claude-sonnet-4-6"]["input_tokens"] == 1000
+            assert by_model["claude-opus-4-7"]["input_tokens"] == 3000
+            assert by_model["<unknown>"]["input_tokens"] == 500
+            # Roll-up sanity check.
+            rollup = idx.aggregate_hook_window(hook, window_start)
+            assert rollup["input_tokens"] == sum(b["input_tokens"] for b in by_model.values())
+            assert rollup["output_tokens"] == sum(b["output_tokens"] for b in by_model.values())
+        finally:
+            idx.close()
+
+    def test_aggregate_transcript_window_by_model_buckets_per_model(self, workspace: Path, tmp_path: Path) -> None:
+        transcript_dir = tmp_path / "transcripts"
+        transcript_dir.mkdir()
+        transcript_file = transcript_dir / "session.jsonl"
+        _write_jsonl(
+            transcript_file,
+            [
+                {
+                    "timestamp": "2026-05-04T10:00:00.000000+00:00",
+                    "type": "assistant",
+                    "message": {
+                        "id": "msg-1",
+                        "model": "claude-opus-4-7",
+                        "usage": {"input_tokens": 5000, "output_tokens": 1000},
+                    },
+                },
+                {
+                    "timestamp": "2026-05-04T10:01:00.000000+00:00",
+                    "type": "assistant",
+                    "message": {
+                        "id": "msg-2",
+                        "model": "claude-sonnet-4-6",
+                        "usage": {"input_tokens": 2000, "output_tokens": 400},
+                    },
+                },
+            ],
+        )
+        idx = EventIndex.open(workspace)
+        try:
+            idx.refresh_transcripts(transcript_dir)
+            window_start = datetime(2026, 5, 4, 9, 0, tzinfo=UTC)
+            by_model = idx.aggregate_transcript_window_by_model(transcript_dir, window_start)
+            assert set(by_model.keys()) == {"claude-opus-4-7", "claude-sonnet-4-6"}
+            assert by_model["claude-opus-4-7"]["input_tokens"] == 5000
+            assert by_model["claude-sonnet-4-6"]["input_tokens"] == 2000
+        finally:
+            idx.close()
+
+    def test_schema_version_is_v4(self) -> None:
+        """AC-5: bumping the schema version triggers a rebuild on next
+        open.  The constant itself is the operator-visible artefact;
+        existing prior-version tests in TestSchemaInitialisation already
+        cover the rebuild-on-mismatch behaviour.
+        """
+        from devbench.reporting.event_index import _SCHEMA_VERSION
+
+        assert _SCHEMA_VERSION >= 4, (
+            f"Issue #223 bumps the schema to v4 to add the model column; got _SCHEMA_VERSION={_SCHEMA_VERSION}"
+        )

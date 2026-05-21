@@ -12,6 +12,61 @@ since the last release. PR #119 carries every change.
 
 ### Added
 
+- **Per-model token pricing in `devbench report`** (issue #223). The
+  retired single-rate model is replaced by a per-model rate table under
+  ``report.models`` in ``backlog/config/devbench.yaml``. Every key is a
+  Claude model id (the literal ``message.model`` value Claude Code
+  records on every ``assistant`` envelope, e.g. ``claude-opus-4-7``);
+  every value is a ``{input, output, [cache_read_multiplier],
+  [cache_write_5min_multiplier], [cache_write_1hr_multiplier],
+  [correction_factor]}`` block. ``report.default_model`` is applied to
+  any model id not present in ``report.models`` and to entries with no
+  model attribution (NULL rows in the SQL cache aggregate under the
+  ``"<unknown>"`` sentinel bucket). Schema enforces
+  ``additionalProperties: false`` on each model entry while leaving the
+  model-id KEY open (any string), so operators add new models without a
+  code change. Default rate table in ``src/devbench/constants.py``
+  mirrors the canonical Anthropic Standard pricing table verbatim;
+  ``sample-config.yaml`` ships the same table as a starter block. New
+  module-level constants ``REPORT_MODEL_RATES`` and
+  ``REPORT_DEFAULT_MODEL_RATES`` expose the merged view at runtime.
+  ``docs/model-pricing.md`` rewritten; new ``docs/cost-accuracy.md``
+  documents the attribution chain (transcript -> SQL -> aggregator ->
+  cost) and how to audit it.
+- **Per-call model attribution end-to-end** (issue #223 phase 1).
+  ``hook_entries`` and ``transcript_entries`` SQL tables gain a
+  ``model TEXT`` column populated at parse time from
+  ``tool_response.model`` and ``message.model`` respectively. NULL
+  rows aggregate under the sentinel key ``"<unknown>"``. Schema bumped
+  to v4; pre-v4 caches are dropped + rebuilt at next open via the
+  existing version-mismatch handler. New aggregators
+  ``aggregate_hook_window_by_model`` and
+  ``aggregate_transcript_window_by_model`` return
+  ``dict[str, dict[str, int]]`` (``model_id -> totals_dict``); their
+  per-bucket totals roll up to the single-bucket aggregator's result
+  so no tokens are silently dropped. New per-model dispatcher
+  ``_compute_cost_by_model`` in ``reporting/report.py`` iterates
+  ``{model_id -> HookLogTotals}``, prices each bucket against its own
+  rates via the existing ``_compute_cost``, and composes the per-model
+  ``correction_factor`` AFTER all other factors. Both call sites of
+  ``_compute_cost`` (in-window cost and the ``_recent_per_task_cost``
+  projection) now feed the new dispatcher.
+- **`devbench cost-calibrate <actual-usd> [--window <ISO-8601>]`**
+  (issue #223 phase 3). Operator-facing calibration command: sums
+  devbench's reported per-model cost across the window, derives
+  ``correction_factor = actual_usd / reported_total``, and writes the
+  factor back to ``report.models.<id>.correction_factor`` in
+  ``backlog/config/devbench.yaml`` for every model that contributed.
+  Successive calibrations replace (not multiply) the prior factor so
+  re-running is idempotent against a fixed actual-spend figure. Writes
+  ``input`` and ``output`` from the canonical default rate table when
+  the operator's yaml does not yet list a model the calibration
+  observed (the resulting yaml is immediately schema-valid). YAML
+  round-trip via ``yaml.safe_load`` + ``yaml.safe_dump``; atomic
+  tmp+rename write so an interrupted calibrate does not corrupt the
+  config. Reuses the per-model attribution from phase 1, so the
+  command works against any ``feat/issues-188-193`` workspace whose
+  cache has been refreshed.
 - **Discovery-artifact coverage rubric for `spec-to-backlog`** (issue
   #221 A1). ``plugin/devbench/skills/spec-to-backlog/SKILL.md`` Step 2
   now accepts an optional second positional argument
@@ -171,6 +226,34 @@ since the last release. PR #119 carries every change.
   Rule violations, decision-only tasks don't trigger source-test
   atomicity, and AC prose mentioning ``<verification-only>`` doesn't
   trigger orphan-path detection.
+
+### Breaking changes
+
+- **Removed legacy single-rate token-cost fields** (issue #223).
+  ``report.token_cost_per_million_input``,
+  ``report.token_cost_per_million_output``, and
+  ``report.token_cost_discount`` were retired in favour of per-model
+  pricing under ``report.models`` (see Added above). Per CLAUDE.md
+  "Complete Replacement of Superseded Code" there is no deprecation
+  shim: workspaces that still set the legacy keys get an immediate
+  ``ValueError`` at config-load time naming the offending fields and
+  pointing at the new block syntax + ``docs/model-pricing.md``.
+  Migration: replace the three scalar keys with a ``report.models``
+  block (copy the starter block from ``sample-config.yaml`` or the
+  Standard pricing table in ``docs/model-pricing.md``); express any
+  non-zero ``token_cost_discount`` as a per-model
+  ``correction_factor = 1.0 - <old_discount>``, OR run
+  ``devbench cost-calibrate <actual-usd>`` once to derive the
+  corrected factor from a real invoice. The package-level constants
+  ``DEFAULT_TOKEN_COST_PER_M_INPUT``,
+  ``DEFAULT_TOKEN_COST_PER_M_OUTPUT``, and
+  ``DEFAULT_TOKEN_COST_DISCOUNT`` were removed from
+  ``src/devbench/constants.py``; callers consume
+  ``DEFAULT_MODEL_RATES`` + ``DEFAULT_FALLBACK_MODEL_RATES`` instead.
+  Module-level constants ``TOKEN_COST_PER_M_INPUT``,
+  ``TOKEN_COST_PER_M_OUTPUT``, and ``TOKEN_COST_DISCOUNT`` in
+  ``src/devbench/config.py`` were removed; consumers read
+  ``REPORT_MODEL_RATES`` and ``REPORT_DEFAULT_MODEL_RATES``.
 
 ### Added
 

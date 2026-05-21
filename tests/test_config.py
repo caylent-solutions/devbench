@@ -643,3 +643,31 @@ class TestAgentModelEnvOverrides:
             assert am.review_team.doc_reviewer == "opus"
             assert am.review_team.changes_manifest == "opus"
         importlib.reload(config)
+
+
+@pytest.mark.unit
+class TestNotificationsSlackEnvOverride:
+    """Coverage helper: exercise the env-var override path for the slack
+    webhook URL.  Pre-existing uncovered line (config.py:568) brought
+    over the 98% gate by issue #223's test additions; pinning the
+    contract independently of the slack notifications feature.
+    """
+
+    def test_env_override_replaces_yaml_webhook_url(self) -> None:
+        import importlib
+
+        from devbench import config
+
+        original = config.RUNTIME_CONFIG.notifications.slack.webhook_url
+        with patch.dict(
+            os.environ,
+            {"DEVBENCH_NOTIFICATIONS_SLACK_WEBHOOK_URL": "https://hooks.slack.com/services/TEST/HOOK/URL"},
+            clear=False,
+        ):
+            importlib.reload(config)
+            assert config.RUNTIME_CONFIG.notifications.slack.webhook_url == (
+                "https://hooks.slack.com/services/TEST/HOOK/URL"
+            )
+        importlib.reload(config)
+        # The pre-test value is restored after reload-without-env.
+        assert config.RUNTIME_CONFIG.notifications.slack.webhook_url == original

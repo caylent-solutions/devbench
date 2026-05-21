@@ -11,7 +11,7 @@ from unittest.mock import patch
 import pytest
 
 from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
-from devbench.reporting.report import WindowStats, generate_report
+from devbench.reporting.report import HookLogTotals, WindowStats, generate_report
 
 
 @pytest.fixture(autouse=True)
@@ -2592,73 +2592,130 @@ def _small_orchestrator_log() -> str:
 
 
 @pytest.mark.unit
-class TestTokenCostDiscount:
-    """F1-B: discount scales every cost component + ETA uniformly."""
+class TestPerModelCorrectionFactor:
+    """Issue #223: the per-model ``correction_factor`` replaces the retired
+    global ``token_cost_discount``.  When set, EVERY cost component for
+    that model scales by the factor; other models in a multi-model run
+    are untouched.
 
-    def _build_workspace(self, tmp_path: Path) -> Path:
-        log_file = tmp_path / "test.log"
-        log_file.write_text(_small_orchestrator_log())
-        (tmp_path / "hook-logs.jsonl").write_text(_small_hook_log())
-        return log_file
+    These tests drive ``_compute_cost_by_model`` directly so the scaling
+    contract is verifiable without spinning up the full report pipeline.
+    """
 
-    def _get_total_cost(self, report_text: str) -> float:
-        """Pull the 'Estimated cost so far' dollar value from a rendered report."""
-        import re
+    def _totals(self, in_t: int = 1000, out_t: int = 200) -> HookLogTotals:
+        return HookLogTotals(input_tokens=in_t, output_tokens=out_t)
 
-        m = re.search(r"Estimated cost so far\b.*?\$(\d+\.\d+)", report_text, re.DOTALL)
-        assert m is not None, f"could not find cost line in:\n{report_text}"
-        return float(m.group(1))
+    def test_correction_factor_one_is_behaviour_preserving(self) -> None:
+        """``correction_factor=1.0`` produces the same cost as no factor
+        at all -- guards against accidental side-effects on the default
+        path (every model in the default rate table has cf=1.0).
+        """
+        from devbench.constants import ModelRates
+        from devbench.reporting import report as report_mod
+        from devbench.reporting.report import _compute_cost_by_model
 
-    def test_discount_zero_is_behaviour_preserving(self, tmp_path: Path) -> None:
-        log_file = self._build_workspace(tmp_path)
-        with (
-            patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
-            patch("devbench.reporting.report.TOKEN_COST_DISCOUNT", 0.0),
+        with patch.dict(
+            report_mod.REPORT_MODEL_RATES,
+            {"claude-opus-4-7": ModelRates(input=5.0, output=25.0, correction_factor=1.0)},
+            clear=False,
         ):
-            baseline = self._get_total_cost(generate_report(log_path=log_file))
-        # With discount 0.0, cost equals the un-discounted baseline.
-        assert baseline > 0.0
-
-    def test_discount_half_halves_cost(self, tmp_path: Path) -> None:
-        log_file = self._build_workspace(tmp_path)
-        with (
-            patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
-            patch("devbench.reporting.report.TOKEN_COST_DISCOUNT", 0.0),
-        ):
-            baseline = self._get_total_cost(generate_report(log_path=log_file))
-        with (
-            patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
-            patch("devbench.reporting.report.TOKEN_COST_DISCOUNT", 0.5),
-        ):
-            discounted = self._get_total_cost(generate_report(log_path=log_file))
-        assert abs(discounted - baseline * 0.5) < 0.01
-
-    def test_discount_custom_fraction_applied(self, tmp_path: Path) -> None:
-        """0.40363636364 discount means final cost = baseline x (1 - 0.40363636364) = baseline x 0.59636363636."""
-        log_file = self._build_workspace(tmp_path)
-        with (
-            patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
-            patch("devbench.reporting.report.TOKEN_COST_DISCOUNT", 0.0),
-        ):
-            baseline = self._get_total_cost(generate_report(log_path=log_file))
-        with (
-            patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
-            patch("devbench.reporting.report.TOKEN_COST_DISCOUNT", 0.40363636364),
-        ):
-            discounted = self._get_total_cost(generate_report(log_path=log_file))
-        expected = baseline * 0.59636363636
-        assert abs(discounted - expected) < 0.01, (
-            f"expected {expected} (baseline={baseline} * 0.59636363636), got {discounted}"
+            cost = _compute_cost_by_model({"claude-opus-4-7": self._totals()})
+        # 1000 input * $5/1M + 200 output * $25/1M = 0.005 + 0.005 = 0.01.
+        assert abs(cost.total_cost - 0.01) < 1e-9
+        # And the per-bucket totals sum to the rollup -- the existing
+        # CostBreakdown row-sum invariant must hold for the per-model path too.
+        assert (
+            abs(
+                cost.input_cost
+                + cost.output_cost
+                + cost.cache_read_cost
+                + cost.cache_write_5m_cost
+                + cost.cache_write_1h_cost
+                - cost.total_cost
+            )
+            < 1e-9
         )
 
-    def test_discount_full_yields_zero_cost(self, tmp_path: Path) -> None:
-        log_file = self._build_workspace(tmp_path)
+    def test_correction_factor_half_halves_cost(self) -> None:
+        from devbench.constants import ModelRates
+        from devbench.reporting import report as report_mod
+        from devbench.reporting.report import _compute_cost_by_model
+
+        rates = {"claude-opus-4-7": ModelRates(input=5.0, output=25.0, correction_factor=0.5)}
+        with patch.dict(report_mod.REPORT_MODEL_RATES, rates, clear=False):
+            cost = _compute_cost_by_model({"claude-opus-4-7": self._totals()})
+        # Half of the un-corrected $0.01 == $0.005.
+        assert abs(cost.total_cost - 0.005) < 1e-9
+
+    def test_correction_factor_isolated_per_model(self) -> None:
+        """Two-model run: Opus cf=2.0, Sonnet cf=1.0.  The Sonnet bucket
+        must be untouched.  AC-3 spirit: pricing is per-model, not blended.
+        """
+        from devbench.constants import ModelRates
+        from devbench.reporting import report as report_mod
+        from devbench.reporting.report import _compute_cost_by_model
+
+        rates = {
+            "claude-opus-4-7": ModelRates(input=5.0, output=25.0, correction_factor=2.0),
+            "claude-sonnet-4-6": ModelRates(input=3.0, output=15.0, correction_factor=1.0),
+        }
+        with patch.dict(report_mod.REPORT_MODEL_RATES, rates, clear=False):
+            cost = _compute_cost_by_model(
+                {
+                    "claude-opus-4-7": self._totals(),  # un-corrected: 0.005 + 0.005 = 0.01; with cf=2.0 -> 0.02
+                    "claude-sonnet-4-6": self._totals(),  # 1000*$3/1M + 200*$15/1M = 0.003 + 0.003 = 0.006
+                }
+            )
+        assert abs(cost.total_cost - (0.02 + 0.006)) < 1e-9
+
+
+@pytest.mark.unit
+class TestPerModelCostComputation:
+    """Issue #223 AC-3: a fixture with 1M Sonnet + 1M Opus prices the
+    Sonnet tokens at Sonnet rates and the Opus tokens at Opus rates --
+    NOT blended at a single global rate.
+    """
+
+    def test_ac3_two_model_fixture_prices_per_model(self) -> None:
+        """1M Sonnet input + 1M Opus input.  Sonnet @ $3/M = $3, Opus @
+        $5/M = $5.  Sum = $8.  A blended-rate implementation would
+        produce $4-$4.50 (depending on weighting), which this test
+        rejects.
+        """
+        from devbench.constants import ModelRates
+        from devbench.reporting import report as report_mod
+        from devbench.reporting.report import HookLogTotals, _compute_cost_by_model
+
+        rates = {
+            "claude-sonnet-4-6": ModelRates(input=3.0, output=15.0),
+            "claude-opus-4-7": ModelRates(input=5.0, output=25.0),
+        }
+        # Exactly 1,000,000 input tokens per model, zero output / cache.
+        totals_by_model = {
+            "claude-sonnet-4-6": HookLogTotals(input_tokens=1_000_000),
+            "claude-opus-4-7": HookLogTotals(input_tokens=1_000_000),
+        }
+        with patch.dict(report_mod.REPORT_MODEL_RATES, rates, clear=False):
+            cost = _compute_cost_by_model(totals_by_model)
+        assert abs(cost.total_cost - 8.0) < 1e-9, (
+            f"AC-3: 1M Sonnet @ $3 + 1M Opus @ $5 must sum to $8 (not blended); got {cost.total_cost}"
+        )
+
+    def test_unknown_model_falls_back_to_default_rates(self) -> None:
+        """AC-5 spirit: any model id not present in REPORT_MODEL_RATES
+        falls back to REPORT_DEFAULT_MODEL_RATES (the "<unknown>" bucket
+        rates).  No silent zero-cost path.
+        """
+        from devbench.constants import ModelRates
+        from devbench.reporting import report as report_mod
+        from devbench.reporting.report import HookLogTotals, _compute_cost_by_model
+
         with (
-            patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
-            patch("devbench.reporting.report.TOKEN_COST_DISCOUNT", 1.0),
+            patch.dict(report_mod.REPORT_MODEL_RATES, {}, clear=True),
+            patch.object(report_mod, "REPORT_DEFAULT_MODEL_RATES", ModelRates(input=10.0, output=50.0)),
         ):
-            free_cost = self._get_total_cost(generate_report(log_path=log_file))
-        assert free_cost == 0.0
+            cost = _compute_cost_by_model({"unknown-future-model": HookLogTotals(input_tokens=1_000_000)})
+        assert abs(cost.total_cost - 10.0) < 1e-9
 
 
 @pytest.mark.unit
@@ -3975,3 +4032,88 @@ class TestGenerateReportSessionFilter:
 
         # E1 is alpha session; beta session has E2 units but scope only allows E1 -- no overlap.
         assert captured_units == []
+
+
+@pytest.mark.unit
+class TestPerModelHelpersCoverage:
+    """Issue #223 coverage: exercise the small helpers added in
+    ``reporting/report.py`` so coverage of the new module-level
+    plumbing reflects the documented contract.
+    """
+
+    def test_combine_many_empty_returns_zero_totals(self) -> None:
+        from devbench.reporting.report import HookLogTotals, _combine_many
+
+        result = _combine_many([])
+        assert result == HookLogTotals()
+
+    def test_combine_many_single_returns_passthrough(self) -> None:
+        from devbench.reporting.report import HookLogTotals, _combine_many
+
+        one = HookLogTotals(input_tokens=1000)
+        assert _combine_many([one]) == one
+
+    def test_resolve_rates_for_model_known_model(self) -> None:
+        """Known model id pulls from REPORT_MODEL_RATES with the cache
+        multipliers falling back to the top-level defaults when the
+        per-model entry leaves them unset.
+        """
+        from devbench.reporting.report import (
+            REPORT_CACHE_READ_MULTIPLIER,
+            REPORT_CACHE_WRITE_1HR_MULTIPLIER,
+            REPORT_CACHE_WRITE_5MIN_MULTIPLIER,
+            _resolve_rates_for_model,
+        )
+
+        in_r, out_r, c_read, c_5m, c_1h, corr = _resolve_rates_for_model("claude-opus-4-7")
+        assert in_r == 5.0
+        assert out_r == 25.0
+        assert c_read == REPORT_CACHE_READ_MULTIPLIER
+        assert c_5m == REPORT_CACHE_WRITE_5MIN_MULTIPLIER
+        assert c_1h == REPORT_CACHE_WRITE_1HR_MULTIPLIER
+        assert corr == 1.0
+
+    def test_resolve_rates_for_model_per_model_cache_overrides_win(self) -> None:
+        from devbench.constants import ModelRates
+        from devbench.reporting import report as report_mod
+        from devbench.reporting.report import _resolve_rates_for_model
+
+        rates = {
+            "custom-model": ModelRates(
+                input=2.0,
+                output=10.0,
+                cache_read_multiplier=0.05,
+                cache_write_5min_multiplier=1.0,
+                cache_write_1hr_multiplier=1.5,
+            ),
+        }
+        with patch.dict(report_mod.REPORT_MODEL_RATES, rates, clear=False):
+            _, _, c_read, c_5m, c_1h, _ = _resolve_rates_for_model("custom-model")
+        assert c_read == 0.05
+        assert c_5m == 1.0
+        assert c_1h == 1.5
+
+    def test_merge_totals_by_model_overlapping_keys(self) -> None:
+        """Per-model totals from hook + transcript sources merge correctly
+        when the same model id appears in both buckets.
+        """
+        from devbench.reporting.report import HookLogTotals, _merge_totals_by_model
+
+        hook = {"claude-opus-4-7": HookLogTotals(input_tokens=1000)}
+        transcript = {"claude-opus-4-7": HookLogTotals(input_tokens=2000)}
+        merged = _merge_totals_by_model(hook, transcript)
+        assert merged["claude-opus-4-7"].input_tokens == 3000
+
+    def test_per_model_totals_from_aggregator_empty(self) -> None:
+        """When the aggregator returns no rows, the helper returns
+        an empty dict (no synthetic zero-totals row injected).
+        """
+        from datetime import UTC, datetime
+
+        from devbench.reporting.report import _per_model_totals_from_aggregator
+
+        def empty(_source, _window):
+            return {}
+
+        result = _per_model_totals_from_aggregator(empty, None, datetime(2026, 1, 1, tzinfo=UTC))
+        assert result == {}

@@ -21768,3 +21768,360 @@ class TestCmdStatusSummaryAlignment:
         assert "STATUS_SUMMARY_LABEL_WIDTH" in src, (
             "cmd_status must reference STATUS_SUMMARY_LABEL_WIDTH for every label-pad width"
         )
+
+
+# ---------------------------------------------------------------------------
+# Issue #223: cost-calibrate subcommand
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestCostCalibrate:
+    """Issue #223 AC-6: ``cost-calibrate`` writes per-model correction
+    factors back to ``backlog/config/devbench.yaml`` so the next
+    ``devbench report`` reflects the corrected total.
+
+    Three cases: argument validation, the missing-data path (empty
+    workspace), and the round-trip path (write-back into a real
+    config file via the helper).
+    """
+
+    def test_rejects_missing_actual_usd(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_cost_calibrate()
+        assert rc == 2
+        assert "missing required" in capsys.readouterr().err
+
+    def test_rejects_non_numeric_actual_usd(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_cost_calibrate("not-a-number")
+        assert rc == 2
+        assert "must be a numeric value" in capsys.readouterr().err
+
+    def test_rejects_non_positive_actual_usd(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_cost_calibrate("-50")
+        assert rc == 2
+        assert "must be > 0" in capsys.readouterr().err
+
+    def test_rejects_invalid_window_iso(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_cost_calibrate("100.0", "--window", "not-a-timestamp")
+        assert rc == 2
+        assert "invalid --window" in capsys.readouterr().err
+
+    def test_write_per_model_correction_factors_round_trip(self, tmp_path: Path) -> None:
+        """AC-6 core round-trip: a yaml that already lists two models
+        gets a ``correction_factor`` injected for each.  Re-loading the
+        yaml shows the factor applied.
+        """
+        config_yaml = tmp_path / "devbench.yaml"
+        config_yaml.write_text(
+            "repos:\n"
+            "  org/repo:\n"
+            "    default_branch: main\n"
+            "report:\n"
+            "  models:\n"
+            "    claude-opus-4-7:\n"
+            "      input: 5.0\n"
+            "      output: 25.0\n"
+            "    claude-sonnet-4-6:\n"
+            "      input: 3.0\n"
+            "      output: 15.0\n",
+            encoding="utf-8",
+        )
+        cli.write_per_model_correction_factors(
+            config_yaml, ["claude-opus-4-7", "claude-sonnet-4-6"], correction_factor=1.25
+        )
+        import yaml as _yaml
+
+        round_tripped = _yaml.safe_load(config_yaml.read_text(encoding="utf-8"))
+        opus = round_tripped["report"]["models"]["claude-opus-4-7"]
+        sonnet = round_tripped["report"]["models"]["claude-sonnet-4-6"]
+        assert opus["correction_factor"] == 1.25
+        assert sonnet["correction_factor"] == 1.25
+        # Existing input/output rates are preserved.
+        assert opus["input"] == 5.0 and opus["output"] == 25.0
+        assert sonnet["input"] == 3.0 and sonnet["output"] == 15.0
+
+    def test_write_per_model_correction_factors_seeds_unknown_model(self, tmp_path: Path) -> None:
+        """When the operator calibrates a model not yet listed in
+        ``report.models``, the helper seeds ``input``/``output`` from the
+        canonical defaults so the resulting yaml is schema-valid.
+        """
+        config_yaml = tmp_path / "devbench.yaml"
+        config_yaml.write_text(
+            "repos:\n  org/repo:\n    default_branch: main\nreport:\n  models: {}\n",
+            encoding="utf-8",
+        )
+        cli.write_per_model_correction_factors(config_yaml, ["claude-opus-4-7"], correction_factor=0.95)
+        import yaml as _yaml
+
+        round_tripped = _yaml.safe_load(config_yaml.read_text(encoding="utf-8"))
+        opus = round_tripped["report"]["models"]["claude-opus-4-7"]
+        # Seeded from DEFAULT_MODEL_RATES["claude-opus-4-7"]: $5/$25.
+        assert opus["input"] == 5.0
+        assert opus["output"] == 25.0
+        assert opus["correction_factor"] == 0.95
+
+    def test_write_per_model_correction_factors_rejects_non_mapping_yaml(self, tmp_path: Path) -> None:
+        config_yaml = tmp_path / "devbench.yaml"
+        config_yaml.write_text("- not-a-mapping\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="top-level YAML must be a mapping"):
+            cli.write_per_model_correction_factors(config_yaml, ["claude-opus-4-7"], correction_factor=1.0)
+
+
+# ---------------------------------------------------------------------------
+# Issue #223 coverage: cost-calibrate end-to-end + ModelRates equality
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestCostCalibrateEndToEnd:
+    """Drive ``cmd_cost_calibrate`` against a real workspace with synthetic
+    hook-log entries so the success-path branches (lines 3001-3071 in
+    cli.py) are exercised.
+    """
+
+    def _build_workspace(self, tmp_path: Path) -> Path:
+        """Build a minimal workspace with a single hook-log entry carrying
+        a model id so the per-model aggregator has something to chew on.
+        """
+        ws = tmp_path / "ws"
+        (ws / "backlog" / "config").mkdir(parents=True)
+        (ws / "backlog" / "config" / "devbench.yaml").write_text(
+            "repos:\n"
+            "  caylent-solutions/devbench:\n"
+            "    default_branch: main\n"
+            "report:\n"
+            "  models:\n"
+            "    claude-opus-4-7:\n"
+            "      input: 5.0\n"
+            "      output: 25.0\n",
+            encoding="utf-8",
+        )
+        (ws / "hook-logs.jsonl").write_text(
+            '{"timestamp":"2026-05-04T10:00:00.000000+00:00","input":{"tool_response":'
+            '{"model":"claude-opus-4-7","usage":{"input_tokens":1000000,"output_tokens":0}}}}\n',
+            encoding="utf-8",
+        )
+        return ws
+
+    def test_calibrate_writes_correction_factor_for_observed_model(self, tmp_path: Path) -> None:
+        """End-to-end: 1M input tokens at $5/M = $5 reported.  Actual = $7.50
+        -> correction factor 1.5 written to the yaml.
+        """
+        ws = self._build_workspace(tmp_path)
+        with patch("devbench.cli.WORKSPACE_ROOT", ws):
+            rc = cli.cmd_cost_calibrate("7.50")
+        assert rc == 0
+        import yaml as _yaml
+
+        result = _yaml.safe_load((ws / "backlog" / "config" / "devbench.yaml").read_text(encoding="utf-8"))
+        opus = result["report"]["models"]["claude-opus-4-7"]
+        assert abs(opus["correction_factor"] - 1.5) < 1e-6
+
+    def test_calibrate_zero_reported_cost_returns_1(self, tmp_path: Path) -> None:
+        """When the window contains no billable activity, calibrate
+        returns 1 (not 0) because there is nothing to scale.
+        """
+        ws = tmp_path / "ws"
+        (ws / "backlog" / "config").mkdir(parents=True)
+        (ws / "backlog" / "config" / "devbench.yaml").write_text(
+            "repos:\n  org/repo:\n    default_branch: main\n",
+            encoding="utf-8",
+        )
+        (ws / "hook-logs.jsonl").write_text("", encoding="utf-8")
+        with patch("devbench.cli.WORKSPACE_ROOT", ws):
+            rc = cli.cmd_cost_calibrate("100.0")
+        assert rc == 1
+
+    def test_calibrate_missing_config_yaml_returns_2(self, tmp_path: Path) -> None:
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        with patch("devbench.cli.WORKSPACE_ROOT", ws):
+            rc = cli.cmd_cost_calibrate("100.0")
+        assert rc == 2
+
+
+@pytest.mark.unit
+class TestModelRatesDunders:
+    """Issue #223: cover ModelRates' explicit __eq__ / __hash__ / __repr__
+    that the slot-based class uses (a frozen-dataclass equivalent would
+    have these auto-generated, but we want operator-facing repr quality
+    and slot performance over the dataclass machinery).
+    """
+
+    def test_eq_returns_notimplemented_for_other_types(self) -> None:
+        from devbench.constants import ModelRates
+
+        rates = ModelRates(input=5.0, output=25.0)
+        # Direct __eq__ call returns NotImplemented; equality test against
+        # non-ModelRates falls through to Python's default identity check.
+        assert rates.__eq__("not a ModelRates") is NotImplemented
+        assert rates != "not a ModelRates"
+
+    def test_eq_compares_all_six_fields(self) -> None:
+        from devbench.constants import ModelRates
+
+        a = ModelRates(input=5.0, output=25.0, correction_factor=1.0)
+        b = ModelRates(input=5.0, output=25.0, correction_factor=1.0)
+        c = ModelRates(input=5.0, output=25.0, correction_factor=1.5)
+        assert a == b
+        assert a != c
+
+    def test_hashable_with_consistent_hash(self) -> None:
+        from devbench.constants import ModelRates
+
+        a = ModelRates(input=5.0, output=25.0)
+        b = ModelRates(input=5.0, output=25.0)
+        assert hash(a) == hash(b)
+        # Can be used as dict key / set member.
+        s = {a, b}
+        assert len(s) == 1
+
+    def test_repr_includes_all_fields(self) -> None:
+        from devbench.constants import ModelRates
+
+        r = ModelRates(input=5.0, output=25.0, cache_read_multiplier=0.10, correction_factor=1.05)
+        text = repr(r)
+        assert "ModelRates(" in text
+        assert "input=5.0" in text
+        assert "output=25.0" in text
+        assert "cache_read_multiplier=0.1" in text
+        assert "correction_factor=1.05" in text
+
+    def test_unknown_kwarg_rejected(self) -> None:
+        from devbench.constants import ModelRates
+
+        with pytest.raises(TypeError, match="unexpected keyword argument"):
+            ModelRates(input=5.0, output=25.0, bogus=1.0)
+
+    def test_missing_input_rejected(self) -> None:
+        from devbench.constants import ModelRates
+
+        with pytest.raises(TypeError, match="requires keyword arguments 'input' and 'output'"):
+            ModelRates(output=25.0)
+
+
+@pytest.mark.unit
+class TestParseCostCalibrateArgvCoverage:
+    """Cover the remaining branches in ``_parse_cost_calibrate_argv``
+    (variadic-dispatch arg parser for ``cost-calibrate``).
+    """
+
+    def test_window_missing_value_after_flag(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_cost_calibrate("100.0", "--window")
+        assert rc == 2
+        assert "--window requires" in capsys.readouterr().err
+
+    def test_unexpected_extra_positional(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_cost_calibrate("100.0", "extra")
+        assert rc == 2
+        assert "unexpected extra argument" in capsys.readouterr().err
+
+    def test_window_naive_timestamp_gets_utc(self) -> None:
+        from devbench.cli import _parse_cost_calibrate_argv
+
+        result = _parse_cost_calibrate_argv(("100.0", "--window", "2026-05-01T00:00:00"))
+        assert not isinstance(result, int)
+        # Naive ISO -> UTC tzinfo applied.
+        assert result.window_start.tzinfo is not None
+
+
+@pytest.mark.unit
+class TestWritePerModelCorrectionFactorsErrorPaths:
+    """Cover the defensive ValueError branches in
+    ``write_per_model_correction_factors`` for malformed input yaml.
+    """
+
+    def test_rejects_non_mapping_report_section(self, tmp_path: Path) -> None:
+        config_yaml = tmp_path / "devbench.yaml"
+        config_yaml.write_text(
+            "repos:\n  org/repo:\n    default_branch: main\nreport: not-a-mapping\n", encoding="utf-8"
+        )
+        with pytest.raises(ValueError, match="report: that is not a mapping"):
+            cli.write_per_model_correction_factors(config_yaml, ["claude-opus-4-7"], 1.0)
+
+    def test_rejects_non_mapping_models_section(self, tmp_path: Path) -> None:
+        config_yaml = tmp_path / "devbench.yaml"
+        config_yaml.write_text(
+            "repos:\n  org/repo:\n    default_branch: main\nreport:\n  models: not-a-mapping\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match=r"report\.models: that is not a mapping"):
+            cli.write_per_model_correction_factors(config_yaml, ["claude-opus-4-7"], 1.0)
+
+    def test_rejects_non_mapping_model_entry(self, tmp_path: Path) -> None:
+        config_yaml = tmp_path / "devbench.yaml"
+        config_yaml.write_text(
+            "repos:\n  org/repo:\n    default_branch: main\nreport:\n  models:\n    claude-opus-4-7: not-a-mapping\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match=r"report\.models\.claude-opus-4-7 is not a mapping"):
+            cli.write_per_model_correction_factors(config_yaml, ["claude-opus-4-7"], 1.0)
+
+
+@pytest.mark.unit
+class TestCostCalibrateTranscriptBranch:
+    """Issue #223 coverage: cmd_cost_calibrate's transcript-dir refresh
+    branch (line 3024 in cli.py) only fires when the hook log carries a
+    ``transcript_path`` pointing at a directory.  This test constructs
+    a workspace with both a hook log AND a transcript directory so the
+    branch runs.
+    """
+
+    def test_calibrate_refreshes_transcript_dir_when_present(self, tmp_path: Path) -> None:
+        ws = tmp_path / "ws"
+        (ws / "backlog" / "config").mkdir(parents=True)
+        (ws / "backlog" / "config" / "devbench.yaml").write_text(
+            "repos:\n  org/repo:\n    default_branch: main\n"
+            "report:\n  models:\n    claude-opus-4-7:\n      input: 5.0\n      output: 25.0\n",
+            encoding="utf-8",
+        )
+        transcript_dir = ws / "transcripts"
+        transcript_dir.mkdir()
+        transcript_file = transcript_dir / "session.jsonl"
+        transcript_file.write_text(
+            '{"timestamp":"2026-05-04T10:00:00.000000+00:00","type":"assistant","message":'
+            '{"id":"msg-1","model":"claude-opus-4-7","usage":{"input_tokens":1000000,"output_tokens":0}}}\n',
+            encoding="utf-8",
+        )
+        hook_log = ws / "hook-logs.jsonl"
+        hook_log.write_text(
+            '{"timestamp":"2026-05-04T10:00:00.000000+00:00","input":'
+            f'{{"transcript_path":"{transcript_file}","tool_response":'
+            '{"model":"claude-opus-4-7","usage":{"input_tokens":1000000,"output_tokens":0}}}}\n',
+            encoding="utf-8",
+        )
+        with patch("devbench.cli.WORKSPACE_ROOT", ws):
+            rc = cli.cmd_cost_calibrate("7.50")
+        assert rc == 0
+        import yaml as _yaml
+
+        result = _yaml.safe_load((ws / "backlog" / "config" / "devbench.yaml").read_text(encoding="utf-8"))
+        assert "correction_factor" in result["report"]["models"]["claude-opus-4-7"]
+
+
+@pytest.mark.unit
+class TestRecentPerTaskCostByModel:
+    """Issue #223 coverage: _recent_per_task_cost now feeds the per-model
+    dispatcher.  Cover the non-indexed fallback path that collapses to
+    the ``"<unknown>"`` bucket so its line gets hit by tests.
+    """
+
+    def test_recent_per_task_cost_non_indexed_path(self, tmp_path: Path) -> None:
+        from datetime import UTC, datetime
+
+        from devbench.reporting.report import _recent_per_task_cost
+
+        log_path = tmp_path / "test.log"
+        log_path.write_text("")
+        # No transcripts / hook log -> empty totals -> $0.00 cost averaged
+        # across n=2 completions.
+        done_times = {
+            "E0-F1-S1-T1": datetime(2026, 5, 4, 10, 0, tzinfo=UTC),
+            "E0-F1-S1-T2": datetime(2026, 5, 4, 11, 0, tzinfo=UTC),
+        }
+        progress_times = {
+            "E0-F1-S1-T1": datetime(2026, 5, 4, 9, 30, tzinfo=UTC),
+            "E0-F1-S1-T2": datetime(2026, 5, 4, 10, 30, tzinfo=UTC),
+        }
+        result = _recent_per_task_cost(log_path, done_times, progress_times, 2)
+        assert result == 0.0

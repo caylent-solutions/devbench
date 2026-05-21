@@ -615,6 +615,411 @@ def _find_section_bounds(text: str, header: str) -> tuple[int, int] | None:
 # Epic / Feature / Story files, which never carry AC-FINAL lines).
 _TASK_ID_RE = re.compile(r"^E\d+-F\d+-S\d+-T\d+$")
 
+# Canonical regex matching any work-unit ID at any of the four levels.
+_WORK_UNIT_ID_RE = re.compile(r"^E\d+(?:-F\d+(?:-S\d+(?:-T\d+)?)?)?$")
+
+# Canonical regex matching an Epic ID specifically (level 1).
+_EPIC_ID_RE = re.compile(r"^E\d+$")
+
+
+class BacklogAppendCollisionError(RuntimeError):
+    """Raised when ``regenerate_backlog_index`` detects a colliding epic ID.
+
+    The collision means the on-disk scope path contains an epic ID that
+    already exists in the BACKLOG.md Full Work Unit Index with a
+    different file path. Per the fail-fast policy the pass writes
+    nothing and asks the operator to resolve the collision (re-number
+    the new epic or rename the existing directory) before retrying.
+    """
+
+
+def regenerate_backlog_index(
+    backlog_dir: Path,
+    *,
+    scope_paths: Iterable[Path] | None = None,
+    workspace_root: Path | None = None,
+) -> int:
+    """Append newly-authored epic + leaf-task rows to ``BACKLOG.md`` (#225).
+
+    Materialising a new spec on top of an existing backlog must preserve
+    every existing E1...E16 row verbatim and only APPEND new rows for
+    the epics this materialisation produced. Today the skill's Step 6
+    re-writes BACKLOG.md from scratch, so the operator had to merge
+    the new content into the existing file by hand.
+
+    This pass implements append-first semantics:
+
+    1. If ``BACKLOG.md`` does not exist at ``workspace_root / BACKLOG.md``
+       (or ``workspace_root`` is ``None``), the pass returns 0 -- the
+       skill falls back to its existing greenfield write path.
+    2. If ``BACKLOG.md`` exists, parses the existing Status Summary and
+       Full Work Unit Index. For each scope path, walks the task files
+       and appends ROWS NOT ALREADY IN THE INDEX. Existing rows are
+       byte-for-byte preserved.
+    3. If any new epic ID collides with an existing index ID
+       (different file path), raises ``BacklogAppendCollisionError``
+       and writes nothing.
+
+    Args:
+        backlog_dir: Root of the backlog tree (used for scope walks).
+        scope_paths: Optional iterable of epic directories to walk.
+            When ``None``, walks the full ``backlog_dir`` tree.
+        workspace_root: Root of the workspace -- the directory holding
+            ``BACKLOG.md``. When ``None``, the pass is a no-op (the
+            skill must supply the workspace root explicitly).
+
+    The terminal-status guard does not apply to this pass: existing
+    rows in BACKLOG.md are byte-for-byte preserved regardless of
+    status, so there is nothing for ``force_terminal`` to override.
+
+    Returns:
+        ``1`` when ``BACKLOG.md`` was modified, ``0`` otherwise.
+
+    Raises:
+        BacklogAppendCollisionError: when a new epic ID collides with
+            an existing index row that references a different file
+            path.
+    """
+    if workspace_root is None:
+        return 0
+    backlog_md = workspace_root / "BACKLOG.md"
+
+    materialised_scope: list[Path] | None = list(scope_paths) if scope_paths is not None else None
+
+    # Gather (id, type, status, file_path) tuples for every work-unit
+    # file under the requested scope. ``_TASK_ID_RE`` and friends
+    # classify the level from the filename stem.
+    new_rows = _collect_work_unit_rows(backlog_dir, materialised_scope, workspace_root)
+
+    if not backlog_md.exists():
+        # Greenfield: skip this pass; the skill's existing write path
+        # handles greenfield invocations.
+        return 0
+
+    existing_text = backlog_md.read_text(encoding="utf-8")
+    existing_ids = _parse_existing_index_ids(existing_text)
+
+    # Filter new rows to the ones not already in the existing index.
+    rows_to_append = []
+    for row in new_rows:
+        if row["id"] in existing_ids:
+            # Collision: the same ID appears in the existing index but
+            # may reference a different file. Compare paths.
+            if existing_ids[row["id"]] != row["path"]:
+                raise BacklogAppendCollisionError(
+                    f"Cannot append {row['id']}: existing index row references "
+                    f"{existing_ids[row['id']]!r} but new work-unit file is "
+                    f"{row['path']!r}. Resolve by re-numbering the new epic or "
+                    f"renaming the existing directory."
+                )
+            # Same ID + same path: already present, no append needed.
+            continue
+        rows_to_append.append(row)
+
+    if not rows_to_append:
+        return 0
+
+    new_text = _append_rows_to_backlog_index(existing_text, rows_to_append)
+    if new_text == existing_text:
+        return 0
+
+    backlog_md.write_text(new_text, encoding="utf-8")
+    return 1
+
+
+def _classify_work_unit_level(stem: str) -> str | None:
+    """Return ``Epic`` / ``Feature`` / ``Story`` / ``Task`` from the file stem, or None."""
+    if re.fullmatch(r"E\d+", stem):
+        return "Epic"
+    if re.fullmatch(r"E\d+-F\d+", stem):
+        return "Feature"
+    if re.fullmatch(r"E\d+-F\d+-S\d+", stem):
+        return "Story"
+    if re.fullmatch(r"E\d+-F\d+-S\d+-T\d+", stem):
+        return "Task"
+    return None
+
+
+def _collect_work_unit_rows(
+    backlog_dir: Path,
+    scope_paths: Iterable[Path] | None,
+    workspace_root: Path,
+) -> list[dict[str, str]]:
+    """Return a list of row dicts for each work-unit file under scope.
+
+    Each dict has keys ``id``, ``type``, ``status``, ``title``, ``path``
+    (path is relative to ``workspace_root`` so the BACKLOG.md row
+    matches the canonical ``backlog/...`` shape).
+    """
+    rows: list[dict[str, str]] = []
+    for path in _iter_work_unit_files(backlog_dir, scope_paths=scope_paths):
+        level = _classify_work_unit_level(path.stem)
+        if level is None:
+            continue
+        text = path.read_text(encoding="utf-8")
+        status_match = _STATUS_LINE_RE.search(text)
+        status = status_match.group(1).strip().lower() if status_match else ""
+        title_match = re.search(r"^#\s+([^\n]+)\n", text)
+        title = title_match.group(1).strip() if title_match else path.stem
+        # Strip the ID prefix from the title if the H1 is ``# <ID>: <title>``.
+        if ":" in title and title.split(":", 1)[0].strip() == path.stem:
+            title = title.split(":", 1)[1].strip()
+        try:
+            rel_path = path.relative_to(workspace_root).as_posix()
+        except ValueError:
+            # File is outside workspace_root; record the absolute path.
+            rel_path = str(path)
+        rows.append(
+            {
+                "id": path.stem,
+                "type": level,
+                "status": status,
+                "title": title,
+                "path": rel_path,
+            }
+        )
+    return rows
+
+
+def _parse_existing_index_ids(content: str) -> dict[str, str]:
+    """Return ``{id: file_path}`` for every row in the existing Full Work Unit Index.
+
+    Only rows whose first cell matches the canonical work-unit-ID regex
+    are included. The Status Summary table's rows have their own format
+    (the ID column is the epic ID, not a path), so this parser focuses
+    on the Full Work Unit Index where the row carries a path.
+    """
+    ids: dict[str, str] = {}
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            continue
+        cells = _split_row_cells(stripped)
+        if cells is None or len(cells) < 2:
+            continue
+        first = cells[0].strip()
+        if not _WORK_UNIT_ID_RE.match(first):
+            continue
+        # Find the file path in the row: look for a backtick-wrapped
+        # ``backlog/.../*.md`` token in any cell.
+        file_path = ""
+        for cell in cells:
+            token = cell.strip().strip("`")
+            if token.startswith("backlog/") and token.endswith(".md"):
+                file_path = token
+                break
+        ids[first] = file_path
+    return ids
+
+
+def _append_rows_to_backlog_index(existing_text: str, rows: list[dict[str, str]]) -> str:
+    """Append ``rows`` to the existing BACKLOG.md tables.
+
+    For each row, two operations:
+    - Status Summary table: append one row per NEW epic ID with the
+      computed per-status counts of its children (sourced from the
+      ``rows`` list itself; existing epics in the table are left
+      alone).
+    - Full Work Unit Index table: append one row per work unit (any
+      level) whose ID is not already in the index.
+
+    Existing rows in both tables are byte-for-byte preserved.
+    """
+    # Group new rows by epic for Status Summary aggregation.
+    by_epic: dict[str, list[dict[str, str]]] = {}
+    new_epics: list[str] = []
+    new_epic_titles: dict[str, str] = {}
+    for row in rows:
+        epic_id = row["id"].split("-", 1)[0]
+        if row["id"] == epic_id and epic_id not in new_epic_titles:
+            new_epic_titles[epic_id] = row["title"]
+        by_epic.setdefault(epic_id, []).append(row)
+    for row in rows:
+        epic_id = row["id"].split("-", 1)[0]
+        if epic_id not in new_epics and epic_id in new_epic_titles:
+            new_epics.append(epic_id)
+
+    with_summary = _append_status_summary_rows(existing_text, new_epics, new_epic_titles, by_epic)
+    return _append_full_index_rows(with_summary, rows)
+
+
+def _table_body_end(text: str, after_header: int) -> int | None:
+    """Return the offset at which to append new rows to a Markdown table.
+
+    Walks forward from ``after_header`` (the position immediately after
+    the table's header row's terminator) through the separator row and
+    all subsequent pipe-prefixed data rows. Returns the offset just
+    AFTER the last data row's trailing newline -- the position at which
+    a caller can splice new rows.
+
+    Returns ``None`` when no separator row is found, indicating the
+    text does not contain a valid Markdown table starting at this
+    header.
+    """
+    # ``after_header`` points to the position of the header row's
+    # trailing newline character (or end-of-string). Advance past it.
+    pos = after_header
+    if pos < len(text) and text[pos] == "\n":
+        pos += 1
+    # The separator row follows. Match it explicitly. The character
+    # class explicitly excludes ``\n`` so the greedy ``+`` cannot
+    # overflow into the next data row -- ``\s`` would include ``\n``
+    # and an overflowing greedy match plus backtrack would land the
+    # match end one char inside the data row.
+    sep_match = re.match(r"\|[-| \t]+\|[ \t]*\n?", text[pos:])
+    if sep_match is None:
+        return None
+    pos += sep_match.end()
+    # Walk forward through every consecutive pipe-prefixed line.
+    while pos < len(text):
+        line_end = text.find("\n", pos)
+        if line_end < 0:
+            # Last line without trailing newline.
+            line = text[pos:]
+            if line.startswith("|"):
+                pos = len(text)
+            break
+        line = text[pos : line_end + 1]
+        if not line.startswith("|"):
+            break
+        pos = line_end + 1
+    return pos
+
+
+def _append_status_summary_rows(
+    text: str,
+    new_epics: list[str],
+    epic_titles: dict[str, str],
+    by_epic: dict[str, list[dict[str, str]]],
+) -> str:
+    """Append new epic rows to the Status Summary table.
+
+    Counts EXCLUDE the epic file itself, matching the validator's
+    ``_compute_epic_counts`` semantics (issue #229 fix). The table's
+    column order is preserved verbatim from the existing header.
+    """
+    # Locate the Status Summary table (header row that starts ``| Epic |``).
+    header_match = re.search(r"^\| Epic \| [^\n]+ \|\s*$", text, re.MULTILINE)
+    if header_match is None:
+        return text
+    body_end = _table_body_end(text, header_match.end())
+    if body_end is None:
+        return text
+
+    # Parse the header to learn column order.
+    header_cells = _split_row_cells(text[header_match.start() : header_match.end()].strip())
+    if header_cells is None:
+        return text
+    # Build new rows matching the column order.
+    status_columns = [c.strip().lower() for c in header_cells]
+    new_rows_text = ""
+    for epic_id in new_epics:
+        children = [r for r in by_epic.get(epic_id, []) if r["id"] != epic_id]
+        counts = {
+            "done": sum(1 for c in children if c["status"] == "done"),
+            "in progress": sum(1 for c in children if c["status"] == "in-progress"),
+            "in queue": sum(1 for c in children if c["status"] == "in-queue"),
+            "in review": sum(1 for c in children if c["status"] == "in-review"),
+            "blocked": sum(1 for c in children if c["status"] == "blocked"),
+            "declined": sum(1 for c in children if c["status"] == "declined"),
+            "draft": sum(1 for c in children if c["status"] == "draft"),
+            "hold": sum(1 for c in children if c["status"] == "hold"),
+        }
+        cells = []
+        for col in status_columns:
+            if col == "epic":
+                cells.append(epic_id)
+            elif col in ("title",):
+                cells.append(epic_titles.get(epic_id, ""))
+            elif col == "total":
+                cells.append(str(len(children)))
+            else:
+                cells.append(str(counts.get(col, 0)))
+        new_rows_text += "| " + " | ".join(cells) + " |\n"
+
+    if not new_rows_text:
+        return text
+
+    return text[:body_end] + new_rows_text + text[body_end:]
+
+
+def _index_row_sort_key(row: dict[str, str]) -> tuple[int, ...]:
+    """Sort key that places Epic rows first, then Features, Stories, Tasks.
+
+    Within the same level, sort lexicographically by ID so the resulting
+    order matches the natural reading flow operators expect when
+    inspecting the index.
+    """
+    parts = row["id"].split("-")
+    nums: list[int] = []
+    for part in parts:
+        match = re.match(r"[A-Z](\d+)", part)
+        nums.append(int(match.group(1)) if match else 0)
+    return tuple(nums)
+
+
+_INDEX_COLUMN_FIELD: dict[str, str] = {
+    "id": "id",
+    "title": "title",
+    "type": "type",
+    "status": "status",
+}
+_INDEX_DEPS_HEADERS: frozenset[str] = frozenset({"dependencies", "depends on"})
+_INDEX_PATH_HEADERS: frozenset[str] = frozenset({"file path", "changed files", "file"})
+
+
+def _cell_for_index_column(column: str, row: dict[str, str]) -> str:
+    """Return the cell content for ``column`` in the Full Work Unit Index.
+
+    Maps column-header text (case-insensitive) to the appropriate field
+    on ``row``. Unknown columns (e.g., operator-added custom columns)
+    are left blank so the surrounding table layout stays intact.
+    """
+    col_l = column.strip().lower()
+    field = _INDEX_COLUMN_FIELD.get(col_l)
+    if field is not None:
+        return row[field]
+    if col_l in _INDEX_DEPS_HEADERS:
+        return "None"
+    if col_l in _INDEX_PATH_HEADERS:
+        return f"`{row['path']}`"
+    return ""
+
+
+def _append_full_index_rows(text: str, rows: list[dict[str, str]]) -> str:
+    """Append new work-unit rows to the Full Work Unit Index table.
+
+    The index's column order is detected from the existing header. Each
+    new row populates the cells in that order; columns not derivable
+    from the row dict (e.g., custom operator-added columns) are left
+    blank.
+    """
+    # Locate the Full Work Unit Index header. Typical shapes:
+    #   | ID | Title | Type | Status | Dependencies | Repo | File Path |
+    #   | ID | Title | Status | Repo | Branch | Depends On | Changed Files |
+    # The header always starts with ``| ID |``.
+    header_match = re.search(r"^\| ID \| [^\n]+ \|\s*$", text, re.MULTILINE)
+    if header_match is None:
+        return text
+    body_end = _table_body_end(text, header_match.end())
+    if body_end is None:
+        return text
+
+    header_cells = _split_row_cells(text[header_match.start() : header_match.end()].strip())
+    if header_cells is None:
+        return text
+
+    new_rows_text = ""
+    for row in sorted(rows, key=_index_row_sort_key):
+        cells = [_cell_for_index_column(col, row) for col in header_cells]
+        new_rows_text += "| " + " | ".join(cells) + " |\n"
+
+    if not new_rows_text:
+        return text
+
+    return text[:body_end] + new_rows_text + text[body_end:]
+
+
 # Regex matching an Acceptance Criteria checkbox row. Captures the AC ID so
 # the pass can decide whether the row is one of the Python-tooling
 # AC-FINAL-* lines.
@@ -864,6 +1269,7 @@ def run_all(
     *,
     scope_paths: Iterable[Path] | None = None,
     force_terminal: bool = False,
+    workspace_root: Path | None = None,
 ) -> dict[str, int]:
     """Run every available post-processing pass over *backlog_dir*.
 
@@ -920,5 +1326,10 @@ def run_all(
             backlog_dir,
             scope_paths=materialised_scope,
             force_terminal=force_terminal,
+        ),
+        "regenerate_backlog_index": regenerate_backlog_index(
+            backlog_dir,
+            scope_paths=materialised_scope,
+            workspace_root=workspace_root,
         ),
     }

@@ -7,6 +7,7 @@ not corrupt files lacking the section it operates on.
 
 from __future__ import annotations
 
+import re
 import textwrap
 from pathlib import Path
 
@@ -863,6 +864,207 @@ class TestSuffixNAOnNonPythonTasks:
 
 
 # ---------------------------------------------------------------------------
+# regenerate_backlog_index -- issue #225
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestRegenerateBacklogIndex:
+    """Issue #225: BACKLOG.md append mode preserves existing rows."""
+
+    _EXISTING_BACKLOG = """\
+        # Backlog
+
+        ## Status Summary
+
+        | Epic | Title | Done | In Progress | In Queue | Blocked | Declined | Draft |
+        |------|-------|------|-------------|----------|---------|----------|-------|
+        | E1 | First epic | 3 | 0 | 0 | 0 | 0 | 0 |
+
+        ## Full Work Unit Index
+
+        | ID | Title | Type | Status | Dependencies | Repo | File Path |
+        |----|-------|------|--------|--------------|------|-----------|
+        | E1 | First epic | Epic | done | None | caylent/foo | `backlog/E1-first/E1.md` |
+        | E1-F1-S1-T1 | First task | Task | done | None | caylent/foo | `backlog/E1-first/E1-F1-S1-T1.md` |
+        """
+
+    def _write_existing_workspace(self, tmp_path: Path) -> Path:
+        """Author the existing BACKLOG.md + backlog/ tree under tmp_path. Returns the workspace root."""
+        ws = tmp_path
+        _write(ws / "BACKLOG.md", self._EXISTING_BACKLOG)
+        _write(
+            ws / "backlog" / "E1-first" / "E1.md",
+            """\
+            # E1: First epic
+
+            ## Status: done
+            """,
+        )
+        _write(
+            ws / "backlog" / "E1-first" / "E1-F1-S1-T1.md",
+            """\
+            # E1-F1-S1-T1: First task
+
+            ## Status: done
+
+            ## Changes Manifest
+
+            | File | Change |
+            |------|--------|
+            | `src/foo.py` | Done. |
+            """,
+        )
+        return ws
+
+    def _write_new_epic(self, ws: Path) -> None:
+        """Add a new E2 epic + one Feature + one Story + one Task under ws/backlog/."""
+        _write(
+            ws / "backlog" / "E2-second" / "E2.md",
+            """\
+            # E2: Second epic
+
+            ## Status: in-queue
+            """,
+        )
+        _write(
+            ws / "backlog" / "E2-second" / "E2-F1-feat" / "E2-F1.md",
+            """\
+            # E2-F1: Feature
+
+            ## Status: in-queue
+            """,
+        )
+        _write(
+            ws / "backlog" / "E2-second" / "E2-F1-feat" / "E2-F1-S1-story" / "E2-F1-S1.md",
+            """\
+            # E2-F1-S1: Story
+
+            ## Status: in-queue
+            """,
+        )
+        _write(
+            ws / "backlog" / "E2-second" / "E2-F1-feat" / "E2-F1-S1-story" / "E2-F1-S1-T1.md",
+            """\
+            # E2-F1-S1-T1: New task
+
+            ## Status: in-queue
+
+            ## Changes Manifest
+
+            | File | Change |
+            |------|--------|
+            | `src/bar.py` | Add. |
+            """,
+        )
+
+    def test_no_workspace_root_is_noop(self, tmp_path: Path) -> None:
+        ws = self._write_existing_workspace(tmp_path)
+        self._write_new_epic(ws)
+        result = bpp.regenerate_backlog_index(ws / "backlog", scope_paths=[ws / "backlog" / "E2-second"])
+        assert result == 0  # workspace_root not supplied; no-op.
+
+    def test_missing_backlog_md_is_noop(self, tmp_path: Path) -> None:
+        # No BACKLOG.md exists yet -- the skill's greenfield write handles it.
+        _write(tmp_path / "backlog" / "E2-second" / "E2.md", "# E2: Second\n\n## Status: in-queue\n")
+        result = bpp.regenerate_backlog_index(
+            tmp_path / "backlog",
+            scope_paths=[tmp_path / "backlog" / "E2-second"],
+            workspace_root=tmp_path,
+        )
+        assert result == 0
+        assert not (tmp_path / "BACKLOG.md").exists()
+
+    def test_append_preserves_existing_rows(self, tmp_path: Path) -> None:
+        ws = self._write_existing_workspace(tmp_path)
+        self._write_new_epic(ws)
+        before = (ws / "BACKLOG.md").read_text(encoding="utf-8")
+        result = bpp.regenerate_backlog_index(
+            ws / "backlog",
+            scope_paths=[ws / "backlog" / "E2-second"],
+            workspace_root=ws,
+        )
+        assert result == 1
+        after = (ws / "BACKLOG.md").read_text(encoding="utf-8")
+        # Every existing row from BEFORE is still in AFTER, byte-for-byte.
+        for original_row in before.splitlines():
+            if original_row.strip().startswith("| E1"):
+                assert original_row in after, f"row lost: {original_row!r}"
+        # E2 Status Summary row appended (3 children: 1F + 1S + 1T = 3 in-queue).
+        assert "| E2 | Second epic |" in after
+        # E2 Full Work Unit Index rows appended.
+        assert "| E2 | Second epic | Epic |" in after
+        assert "| E2-F1 |" in after
+        assert "| E2-F1-S1 |" in after
+        assert "| E2-F1-S1-T1 | New task | Task |" in after
+
+    def test_collision_raises(self, tmp_path: Path) -> None:
+        ws = self._write_existing_workspace(tmp_path)
+        # Author a new E1 epic at a different path -- collision.
+        _write(
+            ws / "backlog" / "E1-different" / "E1.md",
+            "# E1: Collision\n\n## Status: in-queue\n",
+        )
+        before = (ws / "BACKLOG.md").read_text(encoding="utf-8")
+        with pytest.raises(bpp.BacklogAppendCollisionError, match="E1"):
+            bpp.regenerate_backlog_index(
+                ws / "backlog",
+                scope_paths=[ws / "backlog" / "E1-different"],
+                workspace_root=ws,
+            )
+        # File on disk is unchanged after the collision.
+        assert (ws / "BACKLOG.md").read_text(encoding="utf-8") == before
+
+    def test_idempotent(self, tmp_path: Path) -> None:
+        ws = self._write_existing_workspace(tmp_path)
+        self._write_new_epic(ws)
+        first = bpp.regenerate_backlog_index(
+            ws / "backlog",
+            scope_paths=[ws / "backlog" / "E2-second"],
+            workspace_root=ws,
+        )
+        second = bpp.regenerate_backlog_index(
+            ws / "backlog",
+            scope_paths=[ws / "backlog" / "E2-second"],
+            workspace_root=ws,
+        )
+        assert first == 1
+        assert second == 0
+
+    def test_status_summary_counts_exclude_epic(self, tmp_path: Path) -> None:
+        """The Epic file itself is NOT counted in its Status Summary row (issue #229)."""
+        ws = self._write_existing_workspace(tmp_path)
+        self._write_new_epic(ws)
+        bpp.regenerate_backlog_index(
+            ws / "backlog",
+            scope_paths=[ws / "backlog" / "E2-second"],
+            workspace_root=ws,
+        )
+        text = (ws / "BACKLOG.md").read_text(encoding="utf-8")
+        # E2 has 1 Feature + 1 Story + 1 Task all in-queue, plus the Epic
+        # itself (in-queue but excluded). So the In Queue column should be 3.
+        m = re.search(r"^\| E2 \| Second epic \| (\d+) \| (\d+) \| (\d+) \|", text, re.MULTILINE)
+        assert m is not None, f"E2 row not found in:\n{text}"
+        done, in_progress, in_queue = m.group(1), m.group(2), m.group(3)
+        assert done == "0"
+        assert in_progress == "0"
+        assert in_queue == "3"
+
+    def test_collision_same_path_is_noop(self, tmp_path: Path) -> None:
+        """Re-running with the existing E1 in scope is a no-op (same path)."""
+        ws = self._write_existing_workspace(tmp_path)
+        before = (ws / "BACKLOG.md").read_text(encoding="utf-8")
+        result = bpp.regenerate_backlog_index(
+            ws / "backlog",
+            scope_paths=[ws / "backlog" / "E1-first"],
+            workspace_root=ws,
+        )
+        # No new rows to append; existing rows already cover the scope.
+        assert result == 0
+        assert (ws / "BACKLOG.md").read_text(encoding="utf-8") == before
+
+
+# ---------------------------------------------------------------------------
 # run_all
 # ---------------------------------------------------------------------------
 
@@ -880,6 +1082,7 @@ class TestRunAll:
             "normalize_dep_ids": 0,
             "suffix_ref_on_orphan_paths": 0,
             "suffix_na_on_non_python_tasks": 0,
+            "regenerate_backlog_index": 0,
         }
 
 
@@ -995,6 +1198,7 @@ class TestScopeAwareness:
             "normalize_dep_ids": 0,
             "suffix_ref_on_orphan_paths": 0,
             "suffix_na_on_non_python_tasks": 0,
+            "regenerate_backlog_index": 0,
         }
 
     def test_scope_paths_nonexistent_raises(self, tmp_path: Path) -> None:

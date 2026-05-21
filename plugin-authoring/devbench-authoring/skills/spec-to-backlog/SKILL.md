@@ -229,8 +229,10 @@ After writing each task file, FIRST run the deterministic post-processing passes
 **Pass the newly-authored epic directories via `scope_paths`** so the post-processor only walks files this materialisation produced (issue #226). Without `scope_paths`, the helper still defaults to skipping any file with `## Status: done` or `## Status: declined` (terminal-status guard) -- but passing `scope_paths` is the explicit-correctness path the skill MUST follow:
 
 ```bash
-uv run python -c "from pathlib import Path; from devbench.plugin_helpers import backlog_post_processor as bpp; print(bpp.run_all(Path('backlog'), scope_paths=[Path('backlog/<new-epic-id-1>'), Path('backlog/<new-epic-id-2>')]))"
+uv run python -c "from pathlib import Path; from devbench.plugin_helpers import backlog_post_processor as bpp; print(bpp.run_all(Path('backlog'), scope_paths=[Path('backlog/<new-epic-id-1>'), Path('backlog/<new-epic-id-2>')], workspace_root=Path('.')))"
 ```
+
+The `workspace_root` kwarg lets the `regenerate_backlog_index` pass (issue #225) append the new epic + work-unit rows to an existing `BACKLOG.md` instead of overwriting it. When omitted, the pass no-ops and the skill falls back to its greenfield write path in Step 6.
 
 For each pass that reports a non-zero count, emit one audit row:
 
@@ -254,9 +256,17 @@ Repeat for every leaf task until all tasks are written and `validate-backlog` is
 
 ---
 
-## Step 6 -- Write BACKLOG.md
+## Step 6 -- Write or update BACKLOG.md (append-mode by default)
 
-After all task files are written, produce `BACKLOG.md` with the two required top-level tables:
+After all task files are written, produce or extend `BACKLOG.md` so the operator sees the new epic rows alongside any existing ones.
+
+**Append-mode semantics (issue #225)**: the `regenerate_backlog_index` post-processor pass (run via Step 5d's `run_all`, with `scope_paths` + `workspace_root` supplied) handles three cases:
+
+1. **Greenfield** (`BACKLOG.md` does not exist): the skill writes the file from scratch using the canonical shapes shown below.
+2. **Append** (`BACKLOG.md` exists with E1...EN already present, materialisation adds EN+1...): existing rows are byte-for-byte preserved; the pass APPENDS one new row per new epic to the Status Summary table and one new row per work unit (any level) to the Full Work Unit Index. The operator never has to merge by hand.
+3. **Collision** (a new epic ID already appears in the index with a different file path): the pass raises `BacklogAppendCollisionError` and writes nothing -- the operator re-numbers the new epic or renames the existing directory before retrying.
+
+Pass the workspace root via the `workspace_root` kwarg to `run_all` (Step 5d) so the pass can locate `BACKLOG.md`. When called without `workspace_root`, the pass no-ops (legacy callers preserved).
 
 ### Status Summary table
 

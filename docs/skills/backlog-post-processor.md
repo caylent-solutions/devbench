@@ -35,6 +35,16 @@ Issue #221 A12. Escapes raw `|` characters that appear inside Changes Manifest a
 
 Issue #221 A13. Collapses identical Manifest rows down to one entry. The validator's intra-Task Manifest Conflict check fires when the same `(path, annotation)` pair appears twice in one Manifest; this pass removes the duplicate while preserving first-occurrence order.
 
+### `regenerate_backlog_index(backlog_dir, *, scope_paths=None, force_terminal=False, workspace_root=None)`
+
+Issue #225. Appends newly-authored epic + work-unit rows to an existing `BACKLOG.md` rather than overwriting it. Three behaviours:
+
+1. **`workspace_root` is `None` or `BACKLOG.md` is absent**: the pass no-ops (the skill's greenfield write path handles those cases).
+2. **`BACKLOG.md` exists with rows**: existing rows are byte-for-byte preserved; one row per new epic is appended to the Status Summary table (with per-status counts computed from the scope's child work units, excluding the Epic file itself per #229), and one row per work unit (any level) is appended to the Full Work Unit Index.
+3. **Collision**: a new epic ID already in the index with a different file path raises `BacklogAppendCollisionError` and writes nothing -- the operator re-numbers the new epic or renames the existing directory.
+
+The `force_terminal` argument is accepted for `run_all` uniformity but has no effect; this pass treats existing rows as preserved regardless of status. The pass returns `1` when `BACKLOG.md` was modified, `0` otherwise.
+
 ### `normalize_dep_ids(backlog_dir, *, scope_paths=None, force_terminal=False)`
 
 Issue #229. Rewrites slug-form dep IDs in `## Dependencies` and `### Depends On This` tables to the canonical regex form `E\d+(-F\d+)?(-S\d+)?(-T\d+)?`. When an author cites an existing-backlog epic by its directory slug (`E16-test-cleanup`), the validator's `_check_dep_id_format` rule fires; this pass strips the slug suffix to leave the canonical prefix (`E16`). Header rows (`| ID | ... |`), separator rows, and the `| none | | |` sentinel are left alone. Cells already in canonical form are no-op (idempotent).
@@ -67,6 +77,7 @@ result = bpp.run_all(
 #     "normalize_dep_ids": 1,
 #     "suffix_ref_on_orphan_paths": 5,
 #     "suffix_na_on_non_python_tasks": 3,
+#     "regenerate_backlog_index": 1,
 # }
 ```
 

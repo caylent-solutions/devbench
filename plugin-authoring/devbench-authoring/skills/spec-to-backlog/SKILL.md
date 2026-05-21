@@ -192,6 +192,14 @@ Write the task `.md` file to `backlog/<epic-id>-<epic-slug>/<feature-id>-<featur
 
 **Canonical dep-ID form (issue #229)**: every row in `## Dependencies` and `### Depends On This` MUST have its first column match the regex `E\d+(-F\d+)?(-S\d+)?(-T\d+)?`. Directory names are slugs (e.g., `E16-test-cleanup`) and are NOT valid IDs. Use the bare `E<n>` / `E<n>-F<m>` form. When citing existing-backlog epics, look up the canonical ID from `BACKLOG.md`'s Full Work Unit Index ID column (the first cell of each index row). The validator's `_check_dep_id_format` rule rejects slug-form IDs with `dependency ID '<slug>' does not match the canonical task-ID regex E<n>[-F<n>][-S<n>][-T<n>]`. The `normalize_dep_ids` post-processor pass (Step 5d) rewrites slug-form IDs to canonical form when found.
 
+**Code Standards block (issue #230)**: do NOT re-type the ~50-line Code Standards block in every task file. Call the canonical-block helper instead:
+
+```bash
+uv run python -c "from devbench.plugin_helpers.code_standards_template import emit_code_standards_block; from pathlib import Path; print(emit_code_standards_block(Path('<workspace-root>'), task_specific_error_paths=['<unique-to-this-task error 1>', '<error 2>']))"
+```
+
+The output starts with `### Code Standards` and ends after the `#### Error Handling Contract` subsection -- paste it verbatim into the task file as section 8 of the 15 canonical sections. Workspaces that want a customised canonical body place a `code-standards-canonical.md` file at the workspace root; the helper resolves the override automatically. The `verify_code_standards_canonical` post-processor pass (Step 5d) reports the count of tasks whose Code Standards block has drifted from the canonical body (check-only, no mutation). See `docs/code-standards-canonical.md`.
+
 **Dependency wiring -- fully resolved at generation time**:
 - `## Dependencies` table: every upstream task this task depends on (real WU IDs -- no placeholders).
 - `### Depends On This` table: every downstream task that depends on this task (real WU IDs -- no placeholders).

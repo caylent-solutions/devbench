@@ -1065,6 +1065,128 @@ class TestRegenerateBacklogIndex:
 
 
 # ---------------------------------------------------------------------------
+# verify_code_standards_canonical -- issue #230
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestVerifyCodeStandardsCanonical:
+    """Issue #230: drift detector reports without mutating."""
+
+    def _make_task_with_canonical(self, tmp_path: Path) -> Path:
+        from devbench.plugin_helpers.code_standards_template import emit_code_standards_block
+
+        block = emit_code_standards_block(tmp_path, task_specific_error_paths=["task-specific error 1"])
+        # Compose a minimal Task work-unit file.
+        content = (
+            textwrap.dedent("""\
+            # E1-F1-S1-T1: Title
+
+            ## Status: in-queue
+
+            """)
+            + block
+            + "\n## Next\n"
+        )
+        return _write(tmp_path / "E1-F1-S1-T1.md", content)
+
+    def _make_task_with_drift(self, tmp_path: Path) -> Path:
+        # Same shape as canonical but Critical Rule 1 is paraphrased.
+        drifted_block = textwrap.dedent("""\
+            ### Code Standards
+
+            Some paraphrased intro that does not match the canonical wording.
+
+            #### Critical Rules (Violation = Automatic Rejection)
+
+            1. **Different rule** -- paraphrased.
+
+            #### Error Handling Contract
+
+            Generic.
+
+            Task-specific error paths for this work unit:
+
+            (none)
+            """)
+        content = (
+            textwrap.dedent("""\
+            # E1-F1-S1-T1: Title
+
+            ## Status: in-queue
+
+            """)
+            + drifted_block
+            + "\n## Next\n"
+        )
+        return _write(tmp_path / "E1-F1-S1-T1.md", content)
+
+    def test_canonical_match_returns_zero(self, tmp_path: Path) -> None:
+        wu = self._make_task_with_canonical(tmp_path)
+        before = wu.read_text(encoding="utf-8")
+        count = bpp.verify_code_standards_canonical(tmp_path, workspace_root=tmp_path)
+        assert count == 0
+        # File is not mutated.
+        assert wu.read_text(encoding="utf-8") == before
+
+    def test_drift_detected_but_not_mutated(self, tmp_path: Path) -> None:
+        wu = self._make_task_with_drift(tmp_path)
+        before = wu.read_text(encoding="utf-8")
+        count = bpp.verify_code_standards_canonical(tmp_path)
+        assert count == 1
+        # File is NOT mutated -- check-only pass.
+        assert wu.read_text(encoding="utf-8") == before
+
+    def test_skips_non_task_files(self, tmp_path: Path) -> None:
+        """Epic / Feature / Story files are skipped (they may not carry the block)."""
+        # Author the drift content but use an Epic-shaped filename.
+        self._make_task_with_drift(tmp_path)
+        # Rename to Epic shape.
+        (tmp_path / "E1-F1-S1-T1.md").rename(tmp_path / "E1.md")
+        count = bpp.verify_code_standards_canonical(tmp_path)
+        assert count == 0
+
+    def test_terminal_status_skipped_by_default(self, tmp_path: Path) -> None:
+        wu = self._make_task_with_drift(tmp_path)
+        # Mark the file done.
+        content = wu.read_text(encoding="utf-8").replace("## Status: in-queue", "## Status: done")
+        wu.write_text(content, encoding="utf-8")
+        count = bpp.verify_code_standards_canonical(tmp_path)
+        assert count == 0
+
+    def test_force_terminal_includes_done_tasks(self, tmp_path: Path) -> None:
+        wu = self._make_task_with_drift(tmp_path)
+        content = wu.read_text(encoding="utf-8").replace("## Status: in-queue", "## Status: done")
+        wu.write_text(content, encoding="utf-8")
+        count = bpp.verify_code_standards_canonical(tmp_path, force_terminal=True)
+        assert count == 1
+
+    def test_no_code_standards_section_is_zero(self, tmp_path: Path) -> None:
+        _write(tmp_path / "E1-F1-S1-T1.md", "# T\n\n## Status: in-queue\n\n(no code standards block)\n")
+        count = bpp.verify_code_standards_canonical(tmp_path)
+        assert count == 0
+
+    def test_scope_paths_honoured(self, tmp_path: Path) -> None:
+        # Out-of-scope task is drifted but scope only includes E2.
+        out_scope_dir = tmp_path / "E1"
+        out_scope_dir.mkdir()
+        drifted_block = "### Code Standards\n\nbad\n\n#### Error Handling Contract\n\n(none)\n"
+        _write(
+            out_scope_dir / "E1-F1-S1-T1.md",
+            "# T\n\n## Status: in-queue\n\n" + drifted_block,
+        )
+        in_scope_dir = tmp_path / "E2"
+        in_scope_dir.mkdir()
+        _write(
+            in_scope_dir / "E2-F1-S1-T1.md",
+            "# T\n\n## Status: in-queue\n\n" + drifted_block,
+        )
+        count = bpp.verify_code_standards_canonical(tmp_path, scope_paths=[in_scope_dir])
+        # Only the in-scope drift is counted.
+        assert count == 1
+
+
+# ---------------------------------------------------------------------------
 # run_all
 # ---------------------------------------------------------------------------
 
@@ -1083,6 +1205,7 @@ class TestRunAll:
             "suffix_ref_on_orphan_paths": 0,
             "suffix_na_on_non_python_tasks": 0,
             "regenerate_backlog_index": 0,
+            "verify_code_standards_canonical": 0,
         }
 
 
@@ -1199,6 +1322,7 @@ class TestScopeAwareness:
             "suffix_ref_on_orphan_paths": 0,
             "suffix_na_on_non_python_tasks": 0,
             "regenerate_backlog_index": 0,
+            "verify_code_standards_canonical": 0,
         }
 
     def test_scope_paths_nonexistent_raises(self, tmp_path: Path) -> None:

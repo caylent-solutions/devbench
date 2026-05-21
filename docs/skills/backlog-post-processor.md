@@ -35,6 +35,10 @@ Issue #221 A12. Escapes raw `|` characters that appear inside Changes Manifest a
 
 Issue #221 A13. Collapses identical Manifest rows down to one entry. The validator's intra-Task Manifest Conflict check fires when the same `(path, annotation)` pair appears twice in one Manifest; this pass removes the duplicate while preserving first-occurrence order.
 
+### `verify_code_standards_canonical(backlog_dir, *, scope_paths=None, force_terminal=False)`
+
+Issue #230. CHECK-ONLY pass: walks every Task work-unit file in scope and compares its `### Code Standards` block (excluding the `#### Error Handling Contract` subsection, which is intentionally task-specific) against the canonical body returned by `devbench.plugin_helpers.code_standards_template.canonical_body_excluding_error_contract`. Reports the count of drifted task files; does NOT mutate any file. The operator decides whether to fix manually or via a future regenerate pass. See `docs/code-standards-canonical.md` for the canonical body and the per-workspace override mechanism.
+
 ### `regenerate_backlog_index(backlog_dir, *, scope_paths=None, force_terminal=False, workspace_root=None)`
 
 Issue #225. Appends newly-authored epic + work-unit rows to an existing `BACKLOG.md` rather than overwriting it. Three behaviours:
@@ -78,6 +82,7 @@ result = bpp.run_all(
 #     "suffix_ref_on_orphan_paths": 5,
 #     "suffix_na_on_non_python_tasks": 3,
 #     "regenerate_backlog_index": 1,
+#     "verify_code_standards_canonical": 0,
 # }
 ```
 

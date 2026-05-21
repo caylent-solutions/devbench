@@ -1264,6 +1264,101 @@ def suffix_na_on_non_python_tasks(
     return modified
 
 
+def verify_code_standards_canonical(
+    backlog_dir: Path,
+    *,
+    scope_paths: Iterable[Path] | None = None,
+    force_terminal: bool = False,
+    workspace_root: Path | None = None,
+) -> int:
+    """Report (but do not mutate) tasks whose Code Standards block has drifted (#230).
+
+    Walks every Task work-unit file in scope and compares the contents
+    of its ``### Code Standards`` block (excluding the
+    ``#### Error Handling Contract`` subsection, which is intentionally
+    task-specific) against the canonical body returned by
+    ``code_standards_template.canonical_body_excluding_error_contract``.
+
+    This is a CHECK-ONLY pass: it counts drifted task files but never
+    rewrites them. The operator decides whether to fix manually or via
+    a future regenerate pass; the audit row is the surfacing
+    mechanism. Returning a non-zero count is the signal that drift
+    exists, not an error condition the pass itself should resolve.
+
+    Args:
+        backlog_dir: Root of the backlog tree.
+        scope_paths: Optional iterable of epic directories to limit
+            the walk to (issue #226).
+        force_terminal: When ``True``, also check files with terminal
+            status. Default ``False`` skips them so already-frozen
+            tasks are not flagged for drift that was acceptable at
+            their authoring time.
+        workspace_root: Optional workspace directory. When supplied,
+            the canonical body is rendered with the workspace's
+            ``CLAUDE.md`` path substituted, matching what
+            ``emit_code_standards_block`` produces for the same
+            workspace. When ``None``, the canonical body keeps the
+            ``<WORKSPACE_CLAUDE_MD>`` placeholder verbatim.
+
+    Returns the count of task files whose Code Standards block (excluding
+    the Error Handling Contract subsection) differs from the canonical
+    body.
+    """
+    from devbench.plugin_helpers.code_standards_template import (
+        canonical_body_excluding_error_contract,
+    )
+
+    canonical_trimmed = canonical_body_excluding_error_contract().rstrip("\n")
+    if workspace_root is not None:
+        canonical_trimmed = canonical_trimmed.replace(
+            "<WORKSPACE_CLAUDE_MD>",
+            str(workspace_root / "CLAUDE.md"),
+        )
+    # The carve-outs placeholder is set to its empty-list rendering so
+    # tasks that emit no carve-outs match the canonical exactly.
+    canonical_trimmed = canonical_trimmed.replace("<REPO_CARVE_OUTS>", "(none)")
+
+    drifted = 0
+    for path in _iter_work_unit_files(backlog_dir, scope_paths=scope_paths):
+        if not _TASK_ID_RE.match(path.stem):
+            continue
+        text = path.read_text(encoding="utf-8")
+        if not force_terminal and _is_terminal_status(text):
+            continue
+        block = _extract_code_standards_block_excluding_error_contract(text)
+        if block is None:
+            continue
+        if block.rstrip("\n") != canonical_trimmed:
+            drifted += 1
+    return drifted
+
+
+def _extract_code_standards_block_excluding_error_contract(text: str) -> str | None:
+    """Return the `### Code Standards` block content trimmed of its Error Handling Contract subsection.
+
+    Returns ``None`` when the file has no ``### Code Standards`` heading.
+    The trimmed block starts at the ``### Code Standards`` line and
+    ends just before the ``#### Error Handling Contract`` subsection
+    (or the next ``###`` / ``##`` heading, whichever comes first).
+    Trailing whitespace is preserved to allow exact comparison with
+    the canonical body.
+    """
+    start_marker = "### Code Standards"
+    start = text.find(start_marker)
+    if start < 0:
+        return None
+    # Find the section's end: the next ``##``-level heading or end-of-file.
+    next_h2 = re.search(r"^##\s+", text[start + len(start_marker) :], re.MULTILINE)
+    end = (start + len(start_marker) + next_h2.start()) if next_h2 else len(text)
+    section = text[start:end]
+    # Trim the Error Handling Contract subsection.
+    error_marker = "#### Error Handling Contract"
+    error_idx = section.find(error_marker)
+    if error_idx >= 0:
+        section = section[:error_idx].rstrip() + "\n"
+    return section
+
+
 def run_all(
     backlog_dir: Path,
     *,
@@ -1330,6 +1425,12 @@ def run_all(
         "regenerate_backlog_index": regenerate_backlog_index(
             backlog_dir,
             scope_paths=materialised_scope,
+            workspace_root=workspace_root,
+        ),
+        "verify_code_standards_canonical": verify_code_standards_canonical(
+            backlog_dir,
+            scope_paths=materialised_scope,
+            force_terminal=force_terminal,
             workspace_root=workspace_root,
         ),
     }

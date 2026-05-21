@@ -2655,6 +2655,174 @@ class TestRecentRecoveryAuditCommentEdgeCases:
 
 
 # ---------------------------------------------------------------------------
+# Issue #211: agent-tag hyphen vs underscore parity
+# ---------------------------------------------------------------------------
+
+
+class TestRecoveryAgentTagHyphenUnderscoreParity:
+    """Issue #211: ``_recent_recovery_audit_comment`` must accept both
+    hyphen-form (``agent/manifest-amender``) and underscore-form
+    (``agent/manifest_amender``) audit-row agent tags.
+
+    ``_RECOVERY_AGENT_TAGS`` enumerates the canonical underscore form,
+    but ``amendment.py::AMENDER_AGENT_ID = "agent/manifest-amender"``
+    and other writers emit the hyphen form. Before the fix the hyphen
+    form silently failed the frozenset membership check, causing
+    ``classify_blocked_task`` to fall through to
+    ``OPERATOR_ACTION_REQUIRED`` for rejected-amendment audits it
+    should have classified as ``AWAITING_AMENDMENT_RECOVERY``.
+    """
+
+    @pytest.mark.parametrize(
+        "agent_tag",
+        [
+            pytest.param("agent/orchestrator", id="orchestrator-no-dashes"),
+            pytest.param("agent/blocker_resolver", id="blocker_resolver-underscore"),
+            pytest.param("agent/blocker-resolver", id="blocker-resolver-hyphen"),
+            pytest.param("agent/manifest_amender", id="manifest_amender-underscore"),
+            pytest.param("agent/manifest-amender", id="manifest-amender-hyphen"),
+            pytest.param("agent/backlog_manager", id="backlog_manager-underscore"),
+            pytest.param("agent/backlog-manager", id="backlog-manager-hyphen"),
+        ],
+    )
+    def test_recovery_audit_helper_accepts_both_forms(self, tmp_path: Path, agent_tag: str) -> None:
+        """Direct unit test on ``_recent_recovery_audit_comment``: both
+        hyphen and underscore forms of each recovery-agent tag return True
+        when the body matches a recovery cause.
+        """
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import _recent_recovery_audit_comment
+
+        wu = tmp_path / "wu.md"
+        now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        ts = now.strftime("%Y-%m-%d %H:%M UTC")
+        wu.write_text(
+            f"## Comments\n\n[{ts}] [{agent_tag}] [BLOCKED] Amendment rejected -- emitting fix proposal\n",
+        )
+        assert _recent_recovery_audit_comment(wu, now, 300) is True, (
+            f"recovery helper should accept agent tag {agent_tag!r} regardless of hyphen/underscore form"
+        )
+
+    @pytest.mark.parametrize(
+        "agent_tag",
+        [
+            pytest.param("agent/manifest-amender", id="manifest-amender-hyphen-structured-tag"),
+            pytest.param("agent/manifest_amender", id="manifest_amender-underscore-structured-tag"),
+        ],
+    )
+    def test_recovery_audit_helper_accepts_both_forms_for_structured_rejection_tag(
+        self, tmp_path: Path, agent_tag: str
+    ) -> None:
+        """The ``[AMENDMENT_REJECTED]`` structured-tag path (issue #200)
+        also passes through ``_recent_recovery_audit_comment``; verify the
+        hyphen/underscore parity holds on that path too -- this is the
+        exact reproducer named in the issue body.
+        """
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import _recent_recovery_audit_comment
+
+        wu = tmp_path / "wu.md"
+        now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        ts = now.strftime("%Y-%m-%d %H:%M UTC")
+        wu.write_text(
+            f"## Comments\n\n[{ts}] [{agent_tag}] [BLOCKED] [AMENDMENT_REJECTED] "
+            f"tdd_green_production_fix; rejected: APPROACH_AUTH: secret leaked into log\n",
+        )
+        assert _recent_recovery_audit_comment(wu, now, 300) is True
+
+    @pytest.mark.parametrize(
+        "agent_tag",
+        [
+            pytest.param("agent/code-reviewer", id="non-recovery-hyphen"),
+            pytest.param("agent/executor", id="non-recovery-no-dashes"),
+            pytest.param("operator/manifest-amender", id="non-agent-prefix"),
+        ],
+    )
+    def test_recovery_audit_helper_still_rejects_non_recovery_agents(self, tmp_path: Path, agent_tag: str) -> None:
+        """The normalisation must NOT widen the agent allowlist beyond the
+        four canonical recovery agents. Tags like ``agent/code-reviewer``
+        (review-team agent, not a recovery agent) and ``operator/...``
+        must still return False.
+        """
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import _recent_recovery_audit_comment
+
+        wu = tmp_path / "wu.md"
+        now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        ts = now.strftime("%Y-%m-%d %H:%M UTC")
+        wu.write_text(
+            f"## Comments\n\n[{ts}] [{agent_tag}] [BLOCKED] Amendment rejected -- emitting fix proposal\n",
+        )
+        assert _recent_recovery_audit_comment(wu, now, 300) is False
+
+    def test_normalize_agent_tag_is_idempotent_on_canonical_form(self) -> None:
+        """The normaliser is a no-op when the input is already in the
+        canonical underscore form -- guards against accidental double-
+        normalisation regressions.
+        """
+        from devbench.backlog.proposal import _normalize_agent_tag
+
+        assert _normalize_agent_tag("agent/manifest_amender") == "agent/manifest_amender"
+        assert _normalize_agent_tag("agent/manifest-amender") == "agent/manifest_amender"
+        assert _normalize_agent_tag("operator/manifest-amender") == "operator/manifest-amender"
+
+
+# ---------------------------------------------------------------------------
+# Issue #211 end-to-end: classify_blocked_task on a hyphen-form amender audit
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyBlockedTaskHyphenFormAmenderAudit:
+    """Issue #211 reproducer: a work unit whose Comments section carries
+    only a ``[BLOCKED] [AMENDMENT_REJECTED]`` audit from
+    ``agent/manifest-amender`` (hyphen form, as written by
+    ``amendment.py::AMENDER_AGENT_ID``), and no proposal / archive on
+    disk, must classify as ``AWAITING_AMENDMENT_RECOVERY``.
+
+    Before the issue #211 fix this returned ``OPERATOR_ACTION_REQUIRED``
+    because the hyphen-form agent tag failed the frozenset membership
+    check in ``_recent_recovery_audit_comment``.
+    """
+
+    def test_hyphen_form_amender_rejection_classifies_recovery(self, tmp_path: Path) -> None:
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        story_dir = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+        wu = story_dir / "E0-F1-S1-T1.md"
+        now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        ts = now.strftime("%Y-%m-%d %H:%M UTC")
+        wu.write_text(
+            "# E0-F1-S1-T1: Test\n\n## Status: blocked\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
+            "## Comments\n\n"
+            f"[{ts}] [agent/manifest-amender] [BLOCKED] [AMENDMENT_REJECTED] "
+            "tdd_green_production_fix; rejected: APPROACH_AUTH: secret leaked into log\n",
+        )
+        (tmp_path / "BACKLOG.md").write_text(
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Test | Task | blocked | None | r "
+            "| `backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n",
+        )
+        state = classify_blocked_task(
+            tmp_path / "backlog",
+            tmp_path / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=tmp_path,
+            now=now,
+            recovery_window_seconds=300,
+        )
+        assert state is BlockedTaskState.AWAITING_AMENDMENT_RECOVERY
+
+
+# ---------------------------------------------------------------------------
 # E8-F1-S1-T1 / issue #195: _RECOVERY_BODY_RE must match English forms
 # and auto-requeue phrase
 # ---------------------------------------------------------------------------

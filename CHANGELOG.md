@@ -82,6 +82,20 @@ since the last release. PR #119 carries every change.
 
 ### Fixed
 
+- **Classifier accepts hyphen-form recovery-agent tags in `[BLOCKED]`
+  audit rows** (issue #211). ``_RECOVERY_AGENT_TAGS`` enumerates the
+  canonical underscore form (``agent/manifest_amender``), but
+  ``amendment.py::AMENDER_AGENT_ID`` and several other writers emit the
+  hyphen form (``agent/manifest-amender``). Before the fix the hyphen
+  form silently failed the frozenset membership check inside
+  ``_recent_recovery_audit_comment``, so ``classify_blocked_task`` fell
+  through to ``OPERATOR_ACTION_REQUIRED`` for rejected-amendment audits
+  that should have classified as ``AWAITING_AMENDMENT_RECOVERY``. Adds
+  a tiny one-way normaliser (``_normalize_agent_tag`` -- ``hyphen ->
+  underscore`` inside the ``agent/`` namespace only) that runs before
+  the frozenset lookup. New parametrised regression matrix in
+  ``tests/test_backlog/test_proposal.py`` covers both forms for every
+  recovery agent plus a negative case for non-recovery agents.
 - **Manifest entries with glob patterns are rejected** (issue #221 B4).
   A Changes Manifest entry containing ``*`` or ``**`` (e.g.,
   ``src/devbench/**/*.py``) used to silently flow through to

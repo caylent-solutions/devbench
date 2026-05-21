@@ -219,6 +219,28 @@ class BlockedTaskState(Enum):
 _RECOVERY_AGENT_TAGS: frozenset[str] = frozenset(
     {"agent/orchestrator", "agent/blocker_resolver", "agent/manifest_amender", "agent/backlog_manager"}
 )
+
+
+def _normalize_agent_tag(raw: str) -> str:
+    """Normalise an audit-row agent tag to the canonical underscore form.
+
+    Issue #211: ``_RECOVERY_AGENT_TAGS`` enumerates the canonical
+    underscore form (``agent/manifest_amender``), but
+    ``amendment.py::AMENDER_AGENT_ID`` and other writers emit the
+    hyphen form (``agent/manifest-amender``). The two forms refer to
+    the same agent; the underscore form is canonical (matches the
+    Python module/identifier convention), so the hyphen form is
+    normalised to it before the frozenset membership check.
+
+    The normalisation is one-way (hyphen -> underscore) and case-
+    sensitive on the ``agent/`` prefix so unrelated tags
+    (``operator/...``, ``human/...``) are left untouched.
+    """
+    if not raw.startswith("agent/"):
+        return raw
+    return "agent/" + raw[len("agent/") :].replace("-", "_")
+
+
 _RECOVERY_BODY_RE: re.Pattern[str] = re.compile(
     r"amendment[- ]reject(?:ed)?"
     r"|out-of-scope"
@@ -393,7 +415,11 @@ def _recent_recovery_audit_comment(source_file: Path, now: datetime, window_seco
     ts, agent, body = most_recent
     if (now - ts).total_seconds() > window_seconds:
         return False
-    if agent not in _RECOVERY_AGENT_TAGS:
+    # Issue #211: writers emit either ``agent/manifest_amender`` (canonical
+    # underscore form) or ``agent/manifest-amender`` (hyphen form, e.g.
+    # ``amendment.py::AMENDER_AGENT_ID``). Normalise before the membership
+    # check so both spellings classify identically.
+    if _normalize_agent_tag(agent) not in _RECOVERY_AGENT_TAGS:
         return False
     # Issue #200 / AC-200-4: check the structured-tag matcher FIRST so that
     # ``[AMENDMENT_REJECTED] tdd_green_production_fix; rejected: POST_CHECK:

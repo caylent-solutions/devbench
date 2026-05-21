@@ -16,6 +16,7 @@ allow-list -- the YAML repos section is the only source.
 import json
 import logging
 import os
+import sys
 from enum import StrEnum
 from pathlib import Path
 
@@ -158,15 +159,27 @@ ALLOWED_GH_ORG: str = _read_env("DEVBENCH_GH_ORG") or ""
 
 
 def _require_env(name: str, hint: str) -> str:
-    """Return the value of a required env var or raise RuntimeError.
+    """Return the value of a required env var or exit with a clean error.
 
     Used for the two import-time required env vars (``DEVBENCH_WORKSPACE_ROOT``
     and ``DEVBENCH_CLAUDE_MODEL``).  Keeps the failure messages adjacent to
     the variable name so operators see a single actionable error.
+
+    Issue #221 B7: previously raised ``RuntimeError``.  Because this check
+    fires at module-import time (before ``cli.py::main`` is reached), a
+    plain ``raise`` produced a Python traceback to stderr and empty stdout
+    -- the operator-visible symptom that the issue is filed against.
+    Now writes the same actionable hint to stderr and exits non-zero so
+    the operator sees a one-line error instead of a traceback.  Tests are
+    unaffected: ``tests/conftest.py`` sets both env vars before the first
+    import of ``devbench.config``.
     """
     value = _read_env(name) or ""
     if not value:
-        raise RuntimeError(f"{name} environment variable is not set. {hint}")
+        # Print + sys.exit(2) so the operator gets a clean, single-line
+        # error.  Fail-fast (CLAUDE.md): no fallback, no silent default.
+        print(f"devbench: {name} environment variable is not set. {hint}", file=sys.stderr)
+        sys.exit(2)
     return value
 
 

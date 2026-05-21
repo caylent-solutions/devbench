@@ -12,6 +12,25 @@ since the last release. PR #119 carries every change.
 
 ### Added
 
+- **Discovery-artifact coverage rubric for `spec-to-backlog`** (issue
+  #221 A1). ``plugin/devbench/skills/spec-to-backlog/SKILL.md`` Step 2
+  now accepts an optional second positional argument
+  ``discovery_artifacts_dir`` pointing at a directory of discovery
+  artefacts (typically ``spec/<run>/_workspace/``) that the spec was
+  authored from. Recognised artefact filenames:
+  ``verification_matrix.md``, ``ci_failures.md``,
+  ``test_coverage_audit.md``, ``ambiguities.md``, ``scope_creep.md``.
+  When supplied, Step 4b adds a new mandatory rubric item ("every row
+  in every recognised artefact file must be covered by at least one
+  leaf task") and Step 5b adds a per-task counterpart asserting the
+  covering task explicitly cites the artefact row in its AC or
+  Approach. Step 8 emits a new
+  ``[DISCOVERY_COVERAGE] <covered>/<total>`` audit line so the audit
+  trail records the coverage check having run. Skipped silently when
+  ``discovery_artifacts_dir`` is absent -- no behavioural change for
+  legacy invocations. The orthogonal spec-AC -> leaf-task rubric item
+  (Step 4b item 4) is unchanged; this new rubric is the safety net for
+  rows the spec author may have omitted an AC for.
 - **Per-task checkpoint API for resumable spec-to-backlog runs** (issue
   #221 A3). New ``PerTaskCheckpoint`` dataclass plus
   ``read_per_task_checkpoint`` / ``write_per_task_checkpoint`` helpers
@@ -82,6 +101,22 @@ since the last release. PR #119 carries every change.
 
 ### Fixed
 
+- **`devbench` exits cleanly when a required env var is missing**
+  (issue #221 B7). The two import-time required env vars
+  (``DEVBENCH_WORKSPACE_ROOT`` and ``DEVBENCH_CLAUDE_MODEL``) used to
+  raise ``RuntimeError`` when absent, which fires before
+  ``cli.py::main`` is reached and prints a multi-line Python traceback
+  to stderr with empty stdout. Operators running ``devbench report``
+  with stdout-only redirection (``devbench report > out.txt``) saw the
+  empty output as "rc=0, no useful output" -- the exact symptom the
+  issue is filed against. ``_require_env`` now writes a single
+  actionable line to stderr (``devbench: DEVBENCH_WORKSPACE_ROOT
+  environment variable is not set. Set it to the absolute path of your
+  workspace root.``) and exits with code 2. Conftest sets both env
+  vars, so the test suite is unaffected; the new contract is asserted
+  directly in ``tests/test_config.py::TestRequireEnv``.
+  ``docs/cli-reference.md`` calls out the required-env-vars contract
+  under the ``report`` section so operators don't run into this again.
 - **Classifier accepts hyphen-form recovery-agent tags in `[BLOCKED]`
   audit rows** (issue #211). ``_RECOVERY_AGENT_TAGS`` enumerates the
   canonical underscore form (``agent/manifest_amender``), but

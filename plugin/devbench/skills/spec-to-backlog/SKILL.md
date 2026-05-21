@@ -62,7 +62,7 @@ Every leaf task `.md` file MUST contain these 15 sections, in this order:
 
 ---
 
-## Step 2 -- Resolve the input spec path
+## Step 2 -- Resolve the input spec path (and optional discovery-artifact directory)
 
 The skill accepts the spec path via skill ``args`` (issue #221 A2). If
 ``args`` is non-empty, treat its first token as the spec path and skip
@@ -71,6 +71,32 @@ the prompt below entirely. Otherwise ask the operator:
 > Which spec file should I decompose into a backlog? (Provide the path, e.g. `spec/<project-name>.md`)
 
 If the operator already provided the path in their invocation message, skip this step and proceed.
+
+**Optional second positional argument: `discovery_artifacts_dir`** (issue
+#221 A1). If a SECOND token follows the spec path in ``args``, treat it
+as the path to a directory of discovery artifacts (typically
+`spec/<run-name>/_workspace/`) produced by a prior discovery pass that
+the spec was authored from. Recognised artefact filenames:
+
+- `verification_matrix.md` -- row-per-claim verification grid
+- `ci_failures.md` -- CI-failure rows the spec must address
+- `test_coverage_audit.md` -- coverage-gap rows the spec must address
+- `ambiguities.md` -- unresolved-question rows the spec must clarify
+- `scope_creep.md` -- out-of-scope rows the spec must explicitly mark
+
+When the discovery directory is supplied, the rubric items added in
+Steps 4b and 5b for "Discovery-artifact coverage" become MANDATORY: every
+row in every recognised artefact file must be covered by at least one
+leaf task's `## Acceptance Criteria` or `## Approach`. A spec authored
+from a discovery run can omit an AC for a discovered finding and pass
+the spec-AC -> leaf-task rubric silently; the discovery-coverage rubric
+is the orthogonal safety net.
+
+When the discovery directory is NOT supplied (legacy invocations and
+specs that were not authored from a discovery run), the
+discovery-coverage rubric items are skipped and Steps 4b / 5b behave as
+they did before -- there is no behavioural change for callers that do
+not pass the optional argument.
 
 ---
 
@@ -115,6 +141,7 @@ Score each item PASS or FAIL. A FAIL is an unresolved item:
 4. **Spec coverage**: every AC-N from spec Section 6 is addressed by at least one leaf task's Acceptance Criteria. FAIL if any AC-N is orphaned.
 5. **Dependency graph is a DAG**: no circular dependencies. FAIL if any cycle exists (pre-validate mentally).
 6. **Cross-epic deps at Feature level**: no Task-level cross-epic dependency (use Feature-level). FAIL if any such dep exists.
+7. **Discovery-artifact coverage** (issue #221 A1): when Step 2 supplied a `discovery_artifacts_dir`, every row in every recognised artefact file (`verification_matrix.md`, `ci_failures.md`, `test_coverage_audit.md`, `ambiguities.md`, `scope_creep.md`) must be covered by at least one leaf task in the drafted tree -- either via a planned AC, an explicit task title that names the discovery row, or an Approach step that references it. FAIL if any artefact row is orphaned (no covering leaf task). Skipped when `discovery_artifacts_dir` is absent.
 
 ### 4c -- Revise
 
@@ -186,6 +213,7 @@ Score each item PASS or FAIL:
 8. **TDD Cycle Log header only**: no prose below the header. FAIL if entry-format examples or prose appear.
 9. **DoR / DoD path discipline**: no file paths in DoR or DoD that are not in the Changes Manifest (unless suffixed `(ref)`). FAIL if any such path exists.
 10. **Approach-specificity check**: the Approach section names concrete files, line numbers (where applicable), and pytest commands for this task. FAIL if the Approach reads as a generic template substitutable across tasks.
+11. **Discovery-artifact coverage at task granularity** (issue #221 A1): when Step 2 supplied a `discovery_artifacts_dir`, if this task is the covering task for any artefact row (from the mapping established at Step 4b item 7), the AC or Approach explicitly cites the artefact row -- either by quoting the row text or by naming the artefact filename + the row identifier (line number, file path, claim ID, etc., depending on the artefact's row shape). FAIL if a discovery-artefact row mapped to this task has no citation in either AC or Approach. Skipped when `discovery_artifacts_dir` is absent or no rows map to this task.
 
 ### 5c -- Revise
 
@@ -292,6 +320,14 @@ After all three exit conditions pass, emit a provenance audit comment naming the
 ```
 
 This audit line is mandatory -- it records what quality reference (workspace exemplar or embedded section list) was consulted so the orchestrator's audit trail captures provenance for every skill invocation that authors a backlog.
+
+When Step 2 supplied a `discovery_artifacts_dir` (issue #221 A1), ALSO emit a discovery-coverage audit line beneath the quality-reference line:
+
+```
+[DISCOVERY_COVERAGE] <covered>/<total> rows from <discovery_artifacts_dir>
+```
+
+Where `<covered>` is the number of recognised-artefact rows mapped to a covering leaf task and `<total>` is the total number of recognised-artefact rows found in the directory. The two numbers MUST be equal at this point because the Step 4b item 7 and Step 5b item 11 rubric items fail the convergence loop when they are not -- the audit line is a record of the coverage check having run, not a place to report shortfalls. Skip the line entirely when `discovery_artifacts_dir` was not supplied.
 
 Then emit the success message:
 

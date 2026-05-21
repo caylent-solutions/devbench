@@ -415,28 +415,41 @@ class TestResolveHelpers:
 
 class TestRequireEnv:
     """The required-env-var contract: ``_require_env`` is the single source of
-    truth for raising RuntimeError when ``DEVBENCH_WORKSPACE_ROOT`` or
-    ``DEVBENCH_CLAUDE_MODEL`` are missing at import time.  Unit-test it
-    directly instead of force-reloading the module.
+    truth for the import-time required env vars (``DEVBENCH_WORKSPACE_ROOT``
+    and ``DEVBENCH_CLAUDE_MODEL``).
+
+    Issue #221 B7: the helper now prints an actionable one-line error to
+    stderr and exits with code 2 instead of raising ``RuntimeError``.
+    The previous traceback path produced "empty stdout, traceback to
+    stderr" which operators saw as silent failure on stdout-only consumers
+    (``devbench report > out.txt``).
     """
 
     def test_returns_value_when_env_var_set(self) -> None:
         with patch.dict(os.environ, {"REQ_TEST_VAR": "some-value"}, clear=False):
             assert config._require_env("REQ_TEST_VAR", "hint") == "some-value"
 
-    def test_raises_when_env_var_absent(self) -> None:
+    def test_exits_with_actionable_message_when_env_var_absent(self, capsys: pytest.CaptureFixture[str]) -> None:
         env_copy = {k: v for k, v in os.environ.items() if k != "REQ_TEST_VAR"}
         with patch.dict(os.environ, env_copy, clear=True):
-            with pytest.raises(
-                RuntimeError,
-                match=r"REQ_TEST_VAR environment variable is not set\. set-it-properly",
-            ):
+            with pytest.raises(SystemExit) as excinfo:
                 config._require_env("REQ_TEST_VAR", "set-it-properly")
+        assert excinfo.value.code == 2
+        captured = capsys.readouterr()
+        # Actionable message on stderr; stdout stays empty so log scrapers
+        # don't false-positive on a missing-env-var line.
+        assert captured.out == ""
+        assert "REQ_TEST_VAR environment variable is not set. set-it-properly" in captured.err
+        # The "devbench:" prefix marks the line as coming from devbench's
+        # fail-fast layer, not from an unrelated upstream component.
+        assert captured.err.startswith("devbench: ")
 
-    def test_raises_when_env_var_empty(self) -> None:
+    def test_exits_when_env_var_empty(self, capsys: pytest.CaptureFixture[str]) -> None:
         with patch.dict(os.environ, {"REQ_TEST_VAR": ""}, clear=False):
-            with pytest.raises(RuntimeError):
+            with pytest.raises(SystemExit) as excinfo:
                 config._require_env("REQ_TEST_VAR", "hint")
+        assert excinfo.value.code == 2
+        assert "REQ_TEST_VAR environment variable is not set. hint" in capsys.readouterr().err
 
 
 class TestAgentModelEnvOverrideTypeError:

@@ -221,10 +221,12 @@ Address each FAIL item. Re-run the per-task rubric. Repeat until score is zero o
 
 ### 5d -- Post-process + run validate-backlog (iterate-until-perfect granularity 3)
 
-After writing each task file, FIRST run the deterministic post-processing passes that fix mechanical issues authoring commonly produces (issue #221 A11, A12, A13). The post-processor is pure Python; it covers transforms the LLM cannot reliably do across N files:
+After writing each task file, FIRST run the deterministic post-processing passes that fix mechanical issues authoring commonly produces (issue #221 A11, A12, A13). The post-processor is pure Python; it covers transforms the LLM cannot reliably do across N files.
+
+**Pass the newly-authored epic directories via `scope_paths`** so the post-processor only walks files this materialisation produced (issue #226). Without `scope_paths`, the helper still defaults to skipping any file with `## Status: done` or `## Status: declined` (terminal-status guard) -- but passing `scope_paths` is the explicit-correctness path the skill MUST follow:
 
 ```bash
-uv run python -c "from pathlib import Path; from devbench.plugin_helpers import backlog_post_processor as bpp; print(bpp.run_all(Path('backlog')))"
+uv run python -c "from pathlib import Path; from devbench.plugin_helpers import backlog_post_processor as bpp; print(bpp.run_all(Path('backlog'), scope_paths=[Path('backlog/<new-epic-id-1>'), Path('backlog/<new-epic-id-2>')]))"
 ```
 
 For each pass that reports a non-zero count, emit one audit row:
@@ -242,10 +244,10 @@ uv run devbench validate-backlog
 On any error:
 1. Parse the error message to identify the offending task file.
 2. Regenerate (or fix via `Edit`) the offending task file.
-3. Re-run the post-processor + `uv run devbench validate-backlog`.
+3. Re-run the post-processor (with the same `scope_paths`) + `uv run devbench validate-backlog`.
 4. Repeat until rc=0.
 
-Repeat for every leaf task until all tasks are written and `validate-backlog` is green. See `docs/skills/backlog-post-processor.md` for the full list of post-processing passes and how to add new ones.
+Repeat for every leaf task until all tasks are written and `validate-backlog` is green. See `docs/skills/backlog-post-processor.md` for the full list of post-processing passes, the `scope_paths` / `force_terminal` arguments, and how to add new ones.
 
 ---
 

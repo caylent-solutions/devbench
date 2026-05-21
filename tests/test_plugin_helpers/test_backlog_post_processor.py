@@ -404,6 +404,203 @@ class TestRunAll:
 
 
 # ---------------------------------------------------------------------------
+# Scope-awareness + terminal-status guard -- issue #226
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestScopeAwareness:
+    """Issue #226: passes default-skip done/declined files and honour scope_paths."""
+
+    _DONE_WITH_ORPHAN = """\
+        # E1-F1-S1-T1: existing done task
+
+        ## Status: done
+
+        ## Changes Manifest
+
+        | File | Change |
+        |------|--------|
+        | `src/old.py` | Done. |
+
+        ## Acceptance Criteria
+
+        - AC-1: cite `src/orphan.py` for context.
+
+        ## Next
+        """
+
+    _NEW_WITH_ORPHAN = """\
+        # E2-F1-S1-T1: new task
+
+        ## Status: in-queue
+
+        ## Changes Manifest
+
+        | File | Change |
+        |------|--------|
+        | `src/new.py` | Add. |
+
+        ## Acceptance Criteria
+
+        - AC-1: cite `src/orphan.py` for context.
+
+        ## Next
+        """
+
+    def test_run_all_respects_scope_paths(self, tmp_path: Path) -> None:
+        """When ``scope_paths`` is supplied, files outside scope are untouched."""
+        old = _write(tmp_path / "E1" / "E1-F1-S1-T1.md", self._DONE_WITH_ORPHAN)
+        new = _write(tmp_path / "E2" / "E2-F1-S1-T1.md", self._NEW_WITH_ORPHAN)
+        old_before = old.read_text(encoding="utf-8")
+        new_before = new.read_text(encoding="utf-8")
+
+        result = bpp.run_all(tmp_path, scope_paths=[tmp_path / "E2"])
+
+        # E1 (out of scope) is bit-identical.
+        assert old.read_text(encoding="utf-8") == old_before
+        # E2 (in scope) had its orphan path suffixed.
+        new_after = new.read_text(encoding="utf-8")
+        assert new_after != new_before
+        assert "`src/orphan.py` (ref)" in new_after
+        # Only E2 was modified.
+        assert result["suffix_ref_on_orphan_paths"] == 1
+
+    def test_run_all_skips_terminal_status_by_default(self, tmp_path: Path) -> None:
+        """Default behaviour: done/declined files are skipped even without ``scope_paths``."""
+        done = _write(tmp_path / "E1" / "E1-F1-S1-T1.md", self._DONE_WITH_ORPHAN)
+        before = done.read_text(encoding="utf-8")
+
+        result = bpp.run_all(tmp_path)
+
+        # Done task is not mutated even though it has an orphan path.
+        assert done.read_text(encoding="utf-8") == before
+        assert result["suffix_ref_on_orphan_paths"] == 0
+
+    def test_force_terminal_overrides_status_guard(self, tmp_path: Path) -> None:
+        """``force_terminal=True`` mutates done/declined files."""
+        done = _write(tmp_path / "E1" / "E1-F1-S1-T1.md", self._DONE_WITH_ORPHAN)
+        before = done.read_text(encoding="utf-8")
+
+        result = bpp.run_all(tmp_path, force_terminal=True)
+
+        after = done.read_text(encoding="utf-8")
+        assert after != before
+        assert "`src/orphan.py` (ref)" in after
+        assert result["suffix_ref_on_orphan_paths"] == 1
+
+    def test_declined_status_also_skipped_by_default(self, tmp_path: Path) -> None:
+        """``declined`` is treated as terminal alongside ``done``."""
+        declined_content = self._DONE_WITH_ORPHAN.replace("## Status: done", "## Status: declined")
+        declined = _write(tmp_path / "E1" / "E1-F1-S1-T1.md", declined_content)
+        before = declined.read_text(encoding="utf-8")
+
+        result = bpp.run_all(tmp_path)
+
+        assert declined.read_text(encoding="utf-8") == before
+        assert result["suffix_ref_on_orphan_paths"] == 0
+
+    def test_idempotency_under_scope_paths(self, tmp_path: Path) -> None:
+        """Re-running with the same scope returns 0 across all passes."""
+        _write(tmp_path / "E2" / "E2-F1-S1-T1.md", self._NEW_WITH_ORPHAN)
+
+        first = bpp.run_all(tmp_path, scope_paths=[tmp_path / "E2"])
+        second = bpp.run_all(tmp_path, scope_paths=[tmp_path / "E2"])
+
+        assert first["suffix_ref_on_orphan_paths"] == 1
+        assert second == {
+            "sanitize_markdown_pipes_in_manifest": 0,
+            "dedupe_manifest_rows": 0,
+            "suffix_ref_on_orphan_paths": 0,
+        }
+
+    def test_scope_paths_nonexistent_raises(self, tmp_path: Path) -> None:
+        """A typo in ``scope_paths`` raises ``FileNotFoundError`` (fail-fast)."""
+        with pytest.raises(FileNotFoundError, match="scope_paths entry does not exist"):
+            bpp.run_all(tmp_path, scope_paths=[tmp_path / "missing"])
+
+    def test_scope_paths_overlap_dedupes(self, tmp_path: Path) -> None:
+        """Overlapping ``scope_paths`` do not double-process the same file."""
+        _write(tmp_path / "E2" / "E2-F1-S1-T1.md", self._NEW_WITH_ORPHAN)
+
+        # The parent directory and the explicit E2 directory both contain
+        # the same file; the walk yields it once.
+        result = bpp.run_all(tmp_path, scope_paths=[tmp_path, tmp_path / "E2"])
+
+        assert result["suffix_ref_on_orphan_paths"] == 1
+
+    def test_sanitize_pipes_skips_done_task_by_default(self, tmp_path: Path) -> None:
+        """The pipe-sanitizer also honours the terminal-status guard."""
+        content = """\
+            # E1-F1-S1-T1: done with bad pipes
+
+            ## Status: done
+
+            ## Changes Manifest
+
+            | File | Change |
+            |------|--------|
+            | `src/foo.py` | Add prose with run cmd | grep -v debug shell pipeline. |
+
+            ## Next
+            """
+        wu = _write(tmp_path / "E1" / "E1-F1-S1-T1.md", content)
+        before = wu.read_text(encoding="utf-8")
+
+        result = bpp.sanitize_markdown_pipes_in_manifest(tmp_path)
+
+        assert wu.read_text(encoding="utf-8") == before
+        assert result == 0
+
+    def test_dedupe_skips_done_task_by_default(self, tmp_path: Path) -> None:
+        """The dedupe pass also honours the terminal-status guard."""
+        content = """\
+            # E1-F1-S1-T1: done with dup rows
+
+            ## Status: done
+
+            ## Changes Manifest
+
+            | File | Change |
+            |------|--------|
+            | `src/foo.py` | Add foo. |
+            | `src/foo.py` | Add foo. |
+
+            ## Next
+            """
+        wu = _write(tmp_path / "E1" / "E1-F1-S1-T1.md", content)
+        before = wu.read_text(encoding="utf-8")
+
+        result = bpp.dedupe_manifest_rows(tmp_path)
+
+        assert wu.read_text(encoding="utf-8") == before
+        assert result == 0
+
+
+@pytest.mark.unit
+class TestIsTerminalStatus:
+    """Direct tests for the terminal-status helper."""
+
+    def test_done_is_terminal(self) -> None:
+        assert bpp._is_terminal_status("## Status: done\n") is True
+
+    def test_declined_is_terminal(self) -> None:
+        assert bpp._is_terminal_status("## Status: declined\n") is True
+
+    def test_draft_is_not_terminal(self) -> None:
+        assert bpp._is_terminal_status("## Status: draft\n") is False
+
+    def test_in_queue_is_not_terminal(self) -> None:
+        assert bpp._is_terminal_status("## Status: in-queue\n") is False
+
+    def test_missing_status_line_returns_false(self) -> None:
+        assert bpp._is_terminal_status("# Title only\n") is False
+
+    def test_status_value_is_case_insensitive(self) -> None:
+        assert bpp._is_terminal_status("## Status: DONE\n") is True
+
+
+# ---------------------------------------------------------------------------
 # Helper functions: _split_manifest_section / _extract_manifest_paths
 # ---------------------------------------------------------------------------
 

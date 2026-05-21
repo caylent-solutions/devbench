@@ -11,6 +11,10 @@ the filesystem inputs:
 - Each returns ``int`` -- the number of files modified.
 - Each is idempotent: re-running on the same backlog after a fix should
   modify zero additional files.
+- Each accepts the optional ``scope_paths`` and ``force_terminal`` arguments
+  documented below; passes default to skipping terminal-status files so a
+  fresh materialisation cannot retroactively mutate already-done work
+  (issue #226).
 
 Issue #221 A8-A17 enumerated nine candidate passes; this module
 implements the three most-frequently-tripped ones (A11, A12, A13) and
@@ -21,9 +25,32 @@ The skill's Step 5 invokes these helpers via the Bash tool, e.g.::
     uv run python -c "from devbench.plugin_helpers import \\
         backlog_post_processor as bpp; \\
         import pathlib; \\
-        bpp.run_all(pathlib.Path('backlog'))"
+        bpp.run_all(pathlib.Path('backlog'), \\
+            scope_paths=[pathlib.Path('backlog/E17-...')])"
 
 The returned counts are also useful for the audit-comment surface.
+
+Scope and terminal-status guards (issue #226)
+=============================================
+
+Every pass accepts two optional arguments that control which work-unit
+files it touches:
+
+- ``scope_paths``: an iterable of ``Path`` objects naming the epic
+  directories the pass may walk. ``None`` (the default) walks the full
+  ``backlog_dir`` tree. When supplied, only files under those scope
+  paths are considered candidates.
+- ``force_terminal``: when ``False`` (the default), files whose
+  ``## Status:`` line is one of the terminal states in
+  ``_TERMINAL_STATUSES`` are skipped even when otherwise in scope. Set to
+  ``True`` to override the guard (one-time mass migrations of an old
+  backlog under a new convention).
+
+Together, the two guards make the post-processor safe to run from a
+``spec-to-backlog`` invocation that adds new epics on top of an existing
+populated backlog: the operator-supplied ``scope_paths`` lists only the
+newly-authored epics, and the terminal-status guard catches any stray
+done / declined file the scope happened to include.
 """
 
 from __future__ import annotations
@@ -48,20 +75,80 @@ _MANIFEST_ROW_RE = re.compile(r"^\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*$")
 # to identify candidates needing a trailing ``(ref)`` suffix.
 _BACKTICK_PATH_RE = re.compile(r"`([^`\s]+/[^`\s]+)`")
 
+# Regex extracting the ``## Status:`` value from a work-unit file. Used by
+# ``_is_terminal_status`` to decide whether to skip a file. Mirrors the
+# canonical status-line shape every work unit ships with.
+_STATUS_LINE_RE = re.compile(r"^##\s+Status:\s*(\S+)", re.MULTILINE)
 
-def _iter_work_unit_files(backlog_dir: Path) -> Iterable[Path]:
-    """Yield every work-unit ``.md`` file under *backlog_dir*.
+# Statuses considered terminal: passes never modify a file in one of these
+# states unless ``force_terminal=True`` is passed. ``declined`` is included
+# alongside ``done`` because a declined work unit is also frozen --
+# retroactive mechanical edits would reopen settled decisions.
+_TERMINAL_STATUSES: frozenset[str] = frozenset({"done", "declined"})
+
+
+def _iter_work_unit_files(
+    backlog_dir: Path,
+    scope_paths: Iterable[Path] | None = None,
+) -> Iterable[Path]:
+    """Yield every work-unit ``.md`` file under *backlog_dir* (or *scope_paths*).
 
     Excludes ``BACKLOG.md`` (the index, not a work unit) and any file under
     a ``config/`` subdirectory (operator config, not work-unit content).
     Sorted for deterministic ordering across runs.
+
+    Args:
+        backlog_dir: Root of the backlog tree. Used as the walk root when
+            ``scope_paths`` is ``None``.
+        scope_paths: Optional iterable of directories to walk instead of
+            ``backlog_dir`` (issue #226). When supplied, the walk yields
+            only files under one of the supplied directories. Duplicate
+            files (the same path reachable from multiple scope roots) are
+            yielded exactly once.
+
+    Raises:
+        FileNotFoundError: when a supplied ``scope_paths`` entry does not
+            exist. The error is explicit per the fail-fast policy; an
+            operator-supplied typo in the scope list is a defect, not
+            something the helper should silently absorb.
     """
-    for path in sorted(backlog_dir.rglob("*.md")):
-        if path.name == "BACKLOG.md":
-            continue
-        if "config" in path.parts:
-            continue
-        yield path
+    if scope_paths is None:
+        walk_roots = [backlog_dir]
+    else:
+        walk_roots = [Path(p) for p in scope_paths]
+        for root in walk_roots:
+            if not root.exists():
+                raise FileNotFoundError(
+                    f"scope_paths entry does not exist: {root}. "
+                    "Check the caller's scope_paths list against the on-disk "
+                    "epic directories."
+                )
+    seen: set[Path] = set()
+    for root in walk_roots:
+        for path in sorted(root.rglob("*.md")):
+            if path.name == "BACKLOG.md":
+                continue
+            if "config" in path.parts:
+                continue
+            resolved = path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            yield path
+
+
+def _is_terminal_status(text: str) -> bool:
+    """Return ``True`` when the work-unit ``text`` carries a terminal status.
+
+    Terminal statuses (``done``, ``declined``) freeze the work unit from
+    further mechanical mutation. Files lacking a ``## Status:`` line return
+    ``False`` so the passes still operate on freshly-authored files where
+    the status line has not yet been written.
+    """
+    match = _STATUS_LINE_RE.search(text)
+    if match is None:
+        return False
+    return match.group(1).strip().lower() in _TERMINAL_STATUSES
 
 
 def _split_manifest_section(text: str) -> tuple[str, str, str] | None:
@@ -82,7 +169,12 @@ def _split_manifest_section(text: str) -> tuple[str, str, str] | None:
     return text[:block_start], text[block_start:block_end], text[block_end:]
 
 
-def sanitize_markdown_pipes_in_manifest(backlog_dir: Path) -> int:
+def sanitize_markdown_pipes_in_manifest(
+    backlog_dir: Path,
+    *,
+    scope_paths: Iterable[Path] | None = None,
+    force_terminal: bool = False,
+) -> int:
     """Escape unescaped ``|`` characters inside Manifest cells (issue #221 A12).
 
     The validator's manifest parser now honours markdown-escaped pipes
@@ -96,11 +188,21 @@ def sanitize_markdown_pipes_in_manifest(backlog_dir: Path) -> int:
     trailing) rewrites the extra pipes as ``\\|`` so the row parses as
     2 columns.
 
+    Args:
+        backlog_dir: Root of the backlog tree.
+        scope_paths: Optional iterable of epic directories to limit the
+            walk to (issue #226). ``None`` walks the full tree.
+        force_terminal: When ``True``, also rewrite files with terminal
+            status (``done`` / ``declined``). Default ``False`` skips
+            terminal-status files so already-frozen work is preserved.
+
     Returns the number of files modified.
     """
     modified = 0
-    for path in _iter_work_unit_files(backlog_dir):
+    for path in _iter_work_unit_files(backlog_dir, scope_paths=scope_paths):
         text = path.read_text(encoding="utf-8")
+        if not force_terminal and _is_terminal_status(text):
+            continue
         parts = _split_manifest_section(text)
         if parts is None:
             continue
@@ -161,7 +263,12 @@ def _escape_inner_pipes(row: str) -> str:
     return "".join(result)
 
 
-def dedupe_manifest_rows(backlog_dir: Path) -> int:
+def dedupe_manifest_rows(
+    backlog_dir: Path,
+    *,
+    scope_paths: Iterable[Path] | None = None,
+    force_terminal: bool = False,
+) -> int:
     """Remove duplicate rows from each Manifest section (issue #221 A13).
 
     When the spec-to-backlog skill produces a Manifest with two identical
@@ -171,11 +278,20 @@ def dedupe_manifest_rows(backlog_dir: Path) -> int:
     identical adjacent or non-adjacent rows down to one entry, preserving
     first-occurrence order.
 
+    Args:
+        backlog_dir: Root of the backlog tree.
+        scope_paths: Optional iterable of epic directories to limit the
+            walk to (issue #226).
+        force_terminal: When ``True``, also dedupe files with terminal
+            status. Default ``False`` skips them.
+
     Returns the number of files modified.
     """
     modified = 0
-    for path in _iter_work_unit_files(backlog_dir):
+    for path in _iter_work_unit_files(backlog_dir, scope_paths=scope_paths):
         text = path.read_text(encoding="utf-8")
+        if not force_terminal and _is_terminal_status(text):
+            continue
         parts = _split_manifest_section(text)
         if parts is None:
             continue
@@ -221,7 +337,13 @@ def _dedupe_block_rows(block: str) -> tuple[str, bool]:
     return "".join(output), changed
 
 
-def suffix_ref_on_orphan_paths(backlog_dir: Path, manifest_paths: dict[Path, set[str]] | None = None) -> int:
+def suffix_ref_on_orphan_paths(
+    backlog_dir: Path,
+    manifest_paths: dict[Path, set[str]] | None = None,
+    *,
+    scope_paths: Iterable[Path] | None = None,
+    force_terminal: bool = False,
+) -> int:
     """Suffix ``(ref)`` on backtick-quoted path tokens in AC / DoD prose
     that do NOT appear in the same Task's Manifest (issue #221 A11).
 
@@ -238,12 +360,19 @@ def suffix_ref_on_orphan_paths(backlog_dir: Path, manifest_paths: dict[Path, set
         manifest_paths: Optional pre-computed ``{file_path: {manifest_paths}}``
             map. When ``None``, each file's own Manifest is parsed to derive
             the set of in-Manifest paths.
+        scope_paths: Optional iterable of epic directories to limit the
+            walk to (issue #226).
+        force_terminal: When ``True``, also suffix files with terminal
+            status. Default ``False`` skips them so already-frozen work
+            is not retroactively mutated.
 
     Returns the number of files modified.
     """
     modified = 0
-    for path in _iter_work_unit_files(backlog_dir):
+    for path in _iter_work_unit_files(backlog_dir, scope_paths=scope_paths):
         text = path.read_text(encoding="utf-8")
+        if not force_terminal and _is_terminal_status(text):
+            continue
         in_manifest = manifest_paths.get(path) if manifest_paths else _extract_manifest_paths(text)
         if not in_manifest:
             continue
@@ -322,15 +451,51 @@ def _find_section_bounds(text: str, header: str) -> tuple[int, int] | None:
     return section_start, section_end
 
 
-def run_all(backlog_dir: Path) -> dict[str, int]:
+def run_all(
+    backlog_dir: Path,
+    *,
+    scope_paths: Iterable[Path] | None = None,
+    force_terminal: bool = False,
+) -> dict[str, int]:
     """Run every available post-processing pass over *backlog_dir*.
 
     Returns a ``{pass_name: files_modified}`` mapping the skill can log
     as audit output. The passes are run in a deterministic order so the
     audit row is stable across invocations.
+
+    Args:
+        backlog_dir: Root of the backlog tree.
+        scope_paths: Optional iterable of epic directories to limit the
+            walk to. ``None`` walks the full tree. Recommended for any
+            ``spec-to-backlog`` invocation that adds new epics on top of
+            an existing populated backlog (issue #226).
+        force_terminal: When ``True``, also rewrite files with terminal
+            status. Default ``False`` skips ``done`` / ``declined`` work
+            so already-frozen tasks are not retroactively mutated.
+
+    Scope paths are accepted as keyword-only arguments so the legacy
+    single-arg call form ``run_all(backlog_dir)`` keeps working; the
+    only behavioural change for legacy callers is that terminal-status
+    files are now skipped by default (this is the issue #226 fix).
     """
+    # The scope list is materialised once so each pass walks the same
+    # set of files. Without this, an iterable would be exhausted by the
+    # first pass and subsequent passes would silently no-op.
+    materialised_scope = list(scope_paths) if scope_paths is not None else None
     return {
-        "sanitize_markdown_pipes_in_manifest": sanitize_markdown_pipes_in_manifest(backlog_dir),
-        "dedupe_manifest_rows": dedupe_manifest_rows(backlog_dir),
-        "suffix_ref_on_orphan_paths": suffix_ref_on_orphan_paths(backlog_dir),
+        "sanitize_markdown_pipes_in_manifest": sanitize_markdown_pipes_in_manifest(
+            backlog_dir,
+            scope_paths=materialised_scope,
+            force_terminal=force_terminal,
+        ),
+        "dedupe_manifest_rows": dedupe_manifest_rows(
+            backlog_dir,
+            scope_paths=materialised_scope,
+            force_terminal=force_terminal,
+        ),
+        "suffix_ref_on_orphan_paths": suffix_ref_on_orphan_paths(
+            backlog_dir,
+            scope_paths=materialised_scope,
+            force_terminal=force_terminal,
+        ),
     }

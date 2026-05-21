@@ -8,19 +8,28 @@ This module is **invoked by the skill, not by the orchestrator**. The orchestrat
 
 The LLM-driven `spec-to-backlog` skill cannot reliably apply mechanical transforms across N work-unit files (e.g., deduping a Manifest row that appears twice in the same file is trivial in Python but error-prone to do via Edit calls). The post-processor exposes those transforms as pure functions the skill calls via Bash.
 
+## Scope and terminal-status guards (issue #226)
+
+Every pass accepts two optional keyword-only arguments that bound what it touches:
+
+- **`scope_paths`**: an iterable of `Path` objects naming the epic directories the pass may walk. When `None` (the default) the walk covers the full `backlog_dir` tree. When supplied, only files under one of the supplied directories are considered. Pass this whenever a fresh `spec-to-backlog` materialisation is adding new epics on top of an existing populated backlog -- the scope confines the walk to the new epic directories so no pre-existing work-unit file can be touched by accident. A non-existent scope path raises `FileNotFoundError` (fail-fast).
+- **`force_terminal`**: when `False` (the default), files whose `## Status:` line is `done` or `declined` are skipped even when otherwise in scope. Set to `True` only for one-time mass-migrations of an old backlog under a new convention.
+
+The two guards combine: a fresh materialisation should pass `scope_paths=[<new-epic-dirs>]`; the default terminal-status skip catches any stray done / declined file the scope happened to include. Without either guard, the legacy single-arg call form (`run_all(backlog_dir)`) still works, but terminal-status files are now skipped by default. This is the issue #226 fix: passes never mutate already-frozen work.
+
 ## Available passes
 
-Each pass takes a `backlog_dir: pathlib.Path` and returns an `int` (the count of files modified). All passes are **idempotent**: a second invocation on the same backlog returns 0.
+Each pass takes a `backlog_dir: pathlib.Path` (plus the two scope keyword arguments above) and returns an `int` (the count of files modified). All passes are **idempotent**: a second invocation on the same backlog returns 0.
 
-### `sanitize_markdown_pipes_in_manifest(backlog_dir)`
+### `sanitize_markdown_pipes_in_manifest(backlog_dir, *, scope_paths=None, force_terminal=False)`
 
 Issue #221 A12. Escapes raw `|` characters that appear inside Changes Manifest annotation cells, which would otherwise cause `ManifestParseError: Manifest row must have exactly 2 columns`. Skills sometimes emit prose like `run cmd | grep -v debug` inside an annotation; this pass rewrites the inner pipe as `\|` so the parser sees a valid 2-column row.
 
-### `dedupe_manifest_rows(backlog_dir)`
+### `dedupe_manifest_rows(backlog_dir, *, scope_paths=None, force_terminal=False)`
 
 Issue #221 A13. Collapses identical Manifest rows down to one entry. The validator's intra-Task Manifest Conflict check fires when the same `(path, annotation)` pair appears twice in one Manifest; this pass removes the duplicate while preserving first-occurrence order.
 
-### `suffix_ref_on_orphan_paths(backlog_dir)`
+### `suffix_ref_on_orphan_paths(backlog_dir, manifest_paths=None, *, scope_paths=None, force_terminal=False)`
 
 Issue #221 A11. Suffixes `(ref)` after backtick-quoted path tokens in Acceptance Criteria and Definition of Done sections that do not appear in the same Task's Changes Manifest. Validator Rule 20 (orphan path tokens) flags such tokens unless they are declared read-only references via the `(ref)` suffix; this pass adds the missing suffix where the path was clearly intended as a citation.
 
@@ -32,7 +41,11 @@ The pass accepts an optional `manifest_paths={file_path: {path1, path2, ...}}` m
 from pathlib import Path
 from devbench.plugin_helpers import backlog_post_processor as bpp
 
-result = bpp.run_all(Path("backlog"))
+# Scoped to the freshly-authored epic directories (the recommended form).
+result = bpp.run_all(
+    Path("backlog"),
+    scope_paths=[Path("backlog/E17-compat-ci-cpk"), Path("backlog/E18-compat-ci-marketplace")],
+)
 # result == {
 #     "sanitize_markdown_pipes_in_manifest": 2,
 #     "dedupe_manifest_rows": 1,

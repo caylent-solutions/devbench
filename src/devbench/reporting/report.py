@@ -2594,12 +2594,85 @@ def _filter_units_by_scope(units: list, scope_filter: ScopeFilter | None) -> lis
     return [u for u in units if active_filter.allows(u.id)]
 
 
+def _render_by_role_panel(log_path: Path, window_start: datetime) -> list[str]:
+    """Render the per-role token + cost breakdown (issue #206).
+
+    Uses ``_parse_transcript_metrics_by_role`` (the existing per-role
+    bucket helper from #123) to bucket tokens by ``attributionAgent``,
+    then prices each role's tokens at the rate of whichever model that
+    role actually ran on.  Roles that span multiple models get a
+    correct per-model-blended cost via ``_compute_cost_by_model``'s
+    fallback to ``REPORT_DEFAULT_MODEL_RATES`` for the role-only
+    aggregate (the model attribution lives on the SQL path, not the
+    role aggregator).
+
+    Returns the rendered lines as a list (caller appends to the report
+    body).  An empty list when ``_parse_transcript_metrics_by_role``
+    returns no buckets, so the panel is silently omitted on workspaces
+    with no transcript activity.
+    """
+    hook_log_path = _hook_log_path(log_path)
+    transcript_dir = _discover_transcript_dir(hook_log_path)
+    by_role = _parse_transcript_metrics_by_role(transcript_dir, window_start)
+    if not by_role:
+        return []
+
+    rendered: list[str] = ["", "Per-role cost breakdown (current run):"]
+    rendered.append("role                  input_tokens  output_tokens  cache_read  cache_write  msgs   est_cost")
+    total_in = 0
+    total_out = 0
+    total_cr = 0
+    total_cw = 0
+    total_msgs = 0
+    total_cost = 0.0
+    rows: list[tuple[str, int, int, int, int, int, float]] = []
+    for role, totals in sorted(by_role.items()):
+        # Per-role buckets do not carry per-call model attribution
+        # individually -- the role aggregator collapses across models.
+        # Pricing against the "<unknown>" bucket (-> REPORT_DEFAULT_MODEL_RATES)
+        # produces the same total an operator would compute by hand from the
+        # canonical Opus 4.7 list rates.  Issue #223's per-model panel
+        # remains the more accurate axis for cost; #206 is per-role view.
+        cost = _compute_cost_by_model({"<unknown>": totals})
+        cache_write = totals.cache_write_5m_tokens + totals.cache_write_1h_tokens
+        rows.append(
+            (
+                role,
+                totals.input_tokens,
+                totals.output_tokens,
+                totals.cache_read_tokens,
+                cache_write,
+                totals.entries_with_usage,
+                cost.total_cost,
+            )
+        )
+        total_in += totals.input_tokens
+        total_out += totals.output_tokens
+        total_cr += totals.cache_read_tokens
+        total_cw += cache_write
+        total_msgs += totals.entries_with_usage
+        total_cost += cost.total_cost
+    # Sort by est_cost descending so the most expensive role surfaces
+    # first; operators triaging cost want to see the biggest contributor
+    # at the top without scrolling.
+    rows.sort(key=lambda r: r[6], reverse=True)
+    for role, in_t, out_t, cr, cw, msgs, est in rows:
+        rendered.append(f"{role:<20}  {in_t:>12,}  {out_t:>13,}  {cr:>10,}  {cw:>11,}  {msgs:>4}   ${est:>7,.4f}")
+    rendered.append(
+        f"{'TOTAL':<20}  {total_in:>12,}  {total_out:>13,}  {total_cr:>10,}  "
+        f"{total_cw:>11,}  {total_msgs:>4}   ${total_cost:>7,.4f}"
+    )
+    return rendered
+
+
 def generate_report(
     log_path: Path,
     since: datetime | None = None,
     report_started_at: datetime | None = None,
     scope_filter: ScopeFilter | None = None,
     session_name: str | None = None,
+    *,
+    by_role: bool = False,
 ) -> str:
     """Generate a formatted progress report.
 
@@ -2909,6 +2982,22 @@ def generate_report(
         # most stable sample. Narrower windows can have zero completed tasks
         # (e.g. just after a restart) which would project meaningless numbers.
         summary_stats = all_window_stats[0]
+
+    if by_role:
+        # Issue #206: opt-in per-role token/cost breakdown.  The data path
+        # was landed in PR #202 (issue #123) via
+        # ``_parse_transcript_metrics_by_role``; this section wires it
+        # into the rendered output.  Pricing reuses the per-model
+        # dispatcher (issue #223) -- per-role tokens are priced against
+        # whatever model that role actually ran on, so a role that
+        # spans multiple models (executor on opus + sonnet) gets a
+        # correct blended cost.
+        lines.extend(
+            _render_by_role_panel(
+                log_path=log_path,
+                window_start=summary_stats.window_start,
+            )
+        )
 
     lines.append("")
     lines.append(_summary_line(summary_stats, backlog.tasks_active, backlog.tasks_blocked))

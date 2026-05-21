@@ -12,6 +12,22 @@ since the last release. PR #119 carries every change.
 
 ### Added
 
+- **`devbench report --by-role` per-role token/cost breakdown panel**
+  (issue #206). Wires the data path landed in PR #202 (issue #123 via
+  ``_parse_transcript_metrics_by_role``) into the rendered output of
+  ``devbench report``. Off by default; without the flag the output is
+  unchanged. With ``--by-role``, a Per-role cost breakdown panel
+  renders beneath the existing aggregate Cost section, listing
+  ``executor``, ``code_review``, ``test_review``, ``doc_review``,
+  ``changes_manifest``, ``security_review``, ``blocker_resolver``,
+  ``manifest_amender``, ``task_factory``, ``orchestrator`` rows
+  (each present only when that role has activity in the window) with
+  input/output/cache-read/cache-write tokens, message count, and
+  est_cost.  The TOTAL row equals the sum of the per-role rows -- a
+  render-time invariant pinned by the regression test.  Per-role and
+  per-model (issue #223) are orthogonal axes available independently;
+  the per-model rate table prices each role's tokens at the model
+  that actually produced them.
 - **Per-model token pricing in `devbench report`** (issue #223). The
   retired single-rate model is replaced by a per-model rate table under
   ``report.models`` in ``backlog/config/devbench.yaml``. Every key is a

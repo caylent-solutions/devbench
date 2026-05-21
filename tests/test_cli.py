@@ -5907,7 +5907,9 @@ class TestMainWatchFlagParsing:
             result = cli.main()
 
         assert result == 0
-        mock_report.assert_called_once_with(since="", watch_interval=10, once=False, include="", exclude="", session="")
+        mock_report.assert_called_once_with(
+            since="", watch_interval=10, once=False, include="", exclude="", session="", by_role=False
+        )
 
     def test_short_watch_flag_extracted(self) -> None:
         """-w <N> is equivalent to --watch <N>."""
@@ -5918,7 +5920,9 @@ class TestMainWatchFlagParsing:
             result = cli.main()
 
         assert result == 0
-        mock_report.assert_called_once_with(since="", watch_interval=3, once=False, include="", exclude="", session="")
+        mock_report.assert_called_once_with(
+            since="", watch_interval=3, once=False, include="", exclude="", session="", by_role=False
+        )
 
     def test_watch_flag_with_since_arg(self) -> None:
         """--watch is separated from the since timestamp argument."""
@@ -5930,7 +5934,13 @@ class TestMainWatchFlagParsing:
 
         assert result == 0
         mock_report.assert_called_once_with(
-            since="2025-01-15T10:30:00Z", watch_interval=5, once=False, include="", exclude="", session=""
+            since="2025-01-15T10:30:00Z",
+            watch_interval=5,
+            once=False,
+            include="",
+            exclude="",
+            session="",
+            by_role=False,
         )
 
     def test_once_flag_extracted_from_args(self) -> None:
@@ -5942,7 +5952,9 @@ class TestMainWatchFlagParsing:
             result = cli.main()
 
         assert result == 0
-        mock_report.assert_called_once_with(since="", watch_interval=0, once=True, include="", exclude="", session="")
+        mock_report.assert_called_once_with(
+            since="", watch_interval=0, once=True, include="", exclude="", session="", by_role=False
+        )
 
     def test_no_stream_alias_extracted(self) -> None:
         """Issue #163: --no-stream is an accepted alias for --once."""
@@ -5953,7 +5965,9 @@ class TestMainWatchFlagParsing:
             result = cli.main()
 
         assert result == 0
-        mock_report.assert_called_once_with(since="", watch_interval=0, once=True, include="", exclude="", session="")
+        mock_report.assert_called_once_with(
+            since="", watch_interval=0, once=True, include="", exclude="", session="", by_role=False
+        )
 
     def test_report_without_watch_dispatches_normally(self) -> None:
         """report without --watch routes directly to cmd_report with scope kwargs.
@@ -5969,7 +5983,9 @@ class TestMainWatchFlagParsing:
             result = cli.main()
 
         assert result == 0
-        mock_report.assert_called_once_with(since="", watch_interval=0, once=False, include="", exclude="", session="")
+        mock_report.assert_called_once_with(
+            since="", watch_interval=0, once=False, include="", exclude="", session="", by_role=False
+        )
 
 
 class TestMainExtraArgsWarning:

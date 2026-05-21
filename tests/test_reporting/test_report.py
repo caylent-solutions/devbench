@@ -4117,3 +4117,120 @@ class TestPerModelHelpersCoverage:
 
         result = _per_model_totals_from_aggregator(empty, None, datetime(2026, 1, 1, tzinfo=UTC))
         assert result == {}
+
+
+@pytest.mark.unit
+class TestByRolePanel:
+    """Issue #206: ``devbench report --by-role`` renders a per-role
+    token/cost breakdown panel beneath the aggregate Cost section.
+
+    Data path was landed in PR #202 (issue #123) via
+    ``_parse_transcript_metrics_by_role``; this test pins the new
+    render contract: panel appears when ``by_role=True``, absent when
+    ``by_role=False``, and the TOTAL row sums each column.
+    """
+
+    def _build_workspace_with_transcripts(self, tmp_path: Path) -> tuple[Path, Path]:
+        """Build a minimal workspace with a hook log pointing at a
+        transcript directory containing one role-attributed message
+        per role.  Returns ``(log_path, transcript_dir)``.
+        """
+        log = tmp_path / "orch.log"
+        log.write_text(
+            "2026-05-04T10:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'\n"
+            "2026-05-04T11:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'\n",
+            encoding="utf-8",
+        )
+        transcript_dir = tmp_path / "transcripts"
+        transcript_dir.mkdir()
+        transcript = transcript_dir / "session.jsonl"
+        # Two messages, one per role, so the per-role panel has two
+        # data rows to print.
+        transcript.write_text(
+            '{"timestamp":"2026-05-04T10:30:00.000000+00:00","type":"assistant",'
+            '"attributionAgent":"devbench:executor","message":{"id":"m1",'
+            '"model":"claude-opus-4-7","usage":{"input_tokens":500000,"output_tokens":100000}}}\n'
+            '{"timestamp":"2026-05-04T10:31:00.000000+00:00","type":"assistant",'
+            '"attributionAgent":"devbench:code-reviewer","message":{"id":"m2",'
+            '"model":"claude-sonnet-4-6","usage":{"input_tokens":200000,"output_tokens":40000}}}\n',
+            encoding="utf-8",
+        )
+        hook = tmp_path / "hook-logs.jsonl"
+        hook.write_text(
+            '{"timestamp":"2026-05-04T10:30:00.000000+00:00","input":'
+            f'{{"transcript_path":"{transcript}","tool_response":'
+            '{"usage":{"input_tokens":0,"output_tokens":0}}}}\n',
+            encoding="utf-8",
+        )
+        return log, transcript_dir
+
+    def test_panel_absent_when_flag_false(self, tmp_path: Path) -> None:
+        log, _td = self._build_workspace_with_transcripts(tmp_path)
+        with patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
+            output = generate_report(log_path=log, by_role=False)
+        assert "Per-role cost breakdown" not in output
+
+    def test_panel_present_when_flag_true(self, tmp_path: Path) -> None:
+        log, _td = self._build_workspace_with_transcripts(tmp_path)
+        with patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
+            output = generate_report(log_path=log, by_role=True)
+        assert "Per-role cost breakdown" in output
+        # Both roles appear as their canonical bucket names (devbench:
+        # prefix stripped; -reviewer normalised to _review).
+        assert "executor" in output
+        assert "code_review" in output
+        # TOTAL row sits at the bottom of the panel.
+        assert "TOTAL" in output
+
+    def test_panel_omitted_when_no_transcripts(self, tmp_path: Path) -> None:
+        """When no transcripts exist (brand-new workspace with no
+        agent activity), the panel is silently omitted -- there is
+        nothing to render.
+        """
+        log = tmp_path / "orch.log"
+        log.write_text("", encoding="utf-8")
+        with patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
+            output = generate_report(log_path=log, by_role=True)
+        assert "Per-role cost breakdown" not in output
+
+
+@pytest.mark.unit
+class TestByRolePanelTotalsConsistency:
+    """Issue #206: the panel's TOTAL row must equal the sum of the
+    per-role rows (a render-time invariant the existing
+    _parse_transcript_metrics_by_role aggregator already asserts).
+    """
+
+    def test_total_row_equals_sum_of_role_rows(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import _render_by_role_panel
+
+        # Build a transcript directory with two roles.
+        transcript_dir = tmp_path / "transcripts"
+        transcript_dir.mkdir()
+        (transcript_dir / "session.jsonl").write_text(
+            '{"timestamp":"2026-05-04T10:30:00.000000+00:00","type":"assistant",'
+            '"attributionAgent":"devbench:executor","message":{"id":"m1",'
+            '"usage":{"input_tokens":1000000,"output_tokens":0}}}\n'
+            '{"timestamp":"2026-05-04T10:31:00.000000+00:00","type":"assistant",'
+            '"attributionAgent":"devbench:code-reviewer","message":{"id":"m2",'
+            '"usage":{"input_tokens":1000000,"output_tokens":0}}}\n',
+            encoding="utf-8",
+        )
+        hook = tmp_path / "hook-logs.jsonl"
+        hook.write_text(
+            '{"timestamp":"2026-05-04T10:30:00.000000+00:00","input":'
+            f'{{"transcript_path":"{transcript_dir}/session.jsonl",'
+            '"tool_response":{"usage":{"input_tokens":0,"output_tokens":0}}}}\n',
+            encoding="utf-8",
+        )
+        log = tmp_path / "log"
+        log.write_text("")
+        from datetime import UTC, datetime
+
+        with patch("devbench.reporting.report.BACKLOG_INDEX", tmp_path / "BACKLOG.md"):
+            lines = _render_by_role_panel(log_path=log, window_start=datetime(2026, 1, 1, tzinfo=UTC))
+        # Find the TOTAL row and the two data rows; assert that input
+        # tokens sum (which we know is 1M+1M=2M) appears in TOTAL.
+        total_lines = [line for line in lines if "TOTAL" in line]
+        assert len(total_lines) == 1
+        assert "2,000,000" in total_lines[0]

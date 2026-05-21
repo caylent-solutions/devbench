@@ -107,7 +107,7 @@ Print the next actionable work unit as JSON. Returns `ALL_DONE` when every unit 
 ### `report`
 
 ```
-uv run devbench report [--once|--no-stream] [--since <ISO-8601>] [--watch N] [--include "<tokens>"] [--exclude "<tokens>"] [--session <name>]
+uv run devbench report [--once|--no-stream] [--since <ISO-8601>] [--watch N] [--include "<tokens>"] [--exclude "<tokens>"] [--session <name>] [--by-role]
 ```
 
 **Scope filter flags:** `--include` and `--exclude` accept the same printer-pages-style tokens as `status`, `next`, and `start`. One-off flags override any active `scope.json`; when neither flag is supplied, the active `scope.json` (if present) is consulted automatically. When a scope is active, only work units within the scope's `expanded_ids` set are counted in the per-epic Status Summary table. See [Scope selectors](#scope-selectors-printer-pages-syntax) for the token syntax.
@@ -125,6 +125,17 @@ The Status Summary per-epic table (also written to `BACKLOG.md` by `validate-bac
 - `--once` (alias `--no-stream`) -- forces the legacy one-shot snapshot, suitable for scripts and CI consumers that pipe the output. Auto-engaged when stdout is not a TTY (pipe / file redirect / CI).
 - `--since <ISO-8601>` -- renders a single custom-window table and exits one-shot. A frozen-window snapshot doesn't benefit from streaming.
 - `--watch N` -- *deprecated.* Kept for backward compatibility; emits a one-line deprecation notice and falls through to the streaming loop. The integer interval is ignored (cadence is data-driven).
+- `--by-role` (issue #206) -- opt-in per-role token/cost breakdown panel rendered beneath the aggregate Cost section. Default OFF; without the flag the output is unchanged from the pre-#206 layout. The panel groups every transcript message by `attributionAgent` (executor, code_review, test_review, doc_review, changes_manifest, security_review, blocker_resolver, manifest_amender, task_factory, orchestrator) and prints input/output/cache-read/cache-write tokens, message count, and est_cost per role. The TOTAL row is asserted equal to the sum of the per-role rows at render time. Example output:
+
+  ```
+  Per-role cost breakdown (current run):
+  role                  input_tokens  output_tokens  cache_read  cache_write  msgs   est_cost
+  executor                   500,000        100,000           0            0    47    $5.0000
+  code_review                200,000         40,000           0            0    18    $2.0000
+  TOTAL                      700,000        140,000           0            0    65    $7.0000
+  ```
+
+  Per-role and per-model (issue #223) are orthogonal axes; the per-model rate table in `report.models` prices each row's tokens at the model that actually produced them.
 
 Cost is computed per call, per token type, from real `usage` data. See [model-pricing.md](model-pricing.md) for the cost formula, per-model rates, and cache-multiplier env vars.
 

@@ -3128,6 +3128,7 @@ def cmd_report(
     include: str = "",
     exclude: str = "",
     session: str = "",
+    by_role: bool = False,
 ) -> int:
     """Print a formatted progress report with velocity and completion stats.
 
@@ -3240,6 +3241,7 @@ def cmd_report(
             since=since_dt,
             scope_filter=scope_filter,
             session_name=session_name,
+            by_role=by_role,
         )
         print(report)
         return 0
@@ -3266,6 +3268,7 @@ def cmd_report(
             report_started_at=report_started_at,
             scope_filter=scope_filter,
             session_name=session_name,
+            by_role=by_role,
         )
 
     return stream_report(log_file, _render)
@@ -10445,6 +10448,23 @@ def _extract_once_flag(raw_args: list[str]) -> tuple[bool, list[str]]:
     return once, filtered
 
 
+def _extract_by_role_flag(raw_args: list[str]) -> tuple[bool, list[str]]:
+    """Return ``(by_role, remaining_args)`` after stripping ``--by-role``.
+
+    Issue #206: opt-in per-role token/cost breakdown panel rendered
+    beneath the existing aggregate Cost section.  Default OFF
+    (omitting the flag preserves the pre-#206 output verbatim).
+    """
+    filtered: list[str] = []
+    by_role = False
+    for arg in raw_args:
+        if arg == "--by-role":
+            by_role = True
+            continue
+        filtered.append(arg)
+    return by_role, filtered
+
+
 def _extract_scope_flags_for_report(
     raw_args: list[str],
 ) -> tuple[str, str, str, list[str]]:
@@ -10504,6 +10524,7 @@ def _dispatch_watch_commands(
     include: str = "",
     exclude: str = "",
     session: str = "",
+    by_role: bool = False,
 ) -> int | None:
     """Dispatch the ``report`` and ``watch`` commands. Return ``None`` if not handled.
 
@@ -10521,6 +10542,9 @@ def _dispatch_watch_commands(
         exclude: Raw ``--exclude`` token string forwarded to ``cmd_report``.
         session: Named-session filter string forwarded to ``cmd_report``
             (spec section 4.4.6, AC-192-12).  Empty string means no filter.
+        by_role: Issue #206; whether ``--by-role`` was supplied so the
+            per-role token/cost panel is rendered beneath the aggregate
+            Cost section.
 
     Returns:
         The command's integer exit code, or ``None`` when the command is
@@ -10535,6 +10559,7 @@ def _dispatch_watch_commands(
             include=include,
             exclude=exclude,
             session=session,
+            by_role=by_role,
         )
     if command == "watch" and watch_interval > 0:
         return cmd_watch(watch_interval=watch_interval)
@@ -10576,11 +10601,14 @@ def main() -> int:
     # before the args reach the command function so the positional
     # ``since`` slot stays well-defined.
     once = False
+    by_role = False
     include = ""
     exclude = ""
     session = ""
     if command == "report":
         once, args = _extract_once_flag(args)
+        # Issue #206: opt-in per-role breakdown.
+        by_role, args = _extract_by_role_flag(args)
         # Issue #190 (AC-190-10, AC-190-11): strip ``--include`` / ``--exclude``
         # scope-filter flags before the remaining positional ``since`` arg is
         # resolved. The extracted strings are forwarded to ``cmd_report``.
@@ -10592,7 +10620,14 @@ def main() -> int:
         return 1
 
     watch_rc = _dispatch_watch_commands(
-        command, watch_interval, args, once=once, include=include, exclude=exclude, session=session
+        command,
+        watch_interval,
+        args,
+        once=once,
+        include=include,
+        exclude=exclude,
+        session=session,
+        by_role=by_role,
     )
     if watch_rc is not None:
         return watch_rc

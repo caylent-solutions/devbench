@@ -21,6 +21,12 @@ The two guards combine: a fresh materialisation should pass `scope_paths=[<new-e
 
 Each pass takes a `backlog_dir: pathlib.Path` (plus the two scope keyword arguments above) and returns an `int` (the count of files modified). All passes are **idempotent**: a second invocation on the same backlog returns 0.
 
+### `normalize_manifest_column_count(backlog_dir, *, scope_paths=None, force_terminal=False)`
+
+Issue #227. Collapses N-column Manifest tables (3+) to the canonical 2-column form (`| File | Change |`) losslessly. When the header row starts with `Repo`, the first two columns merge into the File cell as `repo -- path` and the remaining columns join into Change with ` -- `. Other N-column variants keep column 0 as File and join columns 1..N into Change. Already-canonical 2-column tables are skipped.
+
+Runs first in `run_all` so downstream passes (pipe escape, dedupe, orphan-path suffix) see canonical 2-column shape.
+
 ### `sanitize_markdown_pipes_in_manifest(backlog_dir, *, scope_paths=None, force_terminal=False)`
 
 Issue #221 A12. Escapes raw `|` characters that appear inside Changes Manifest annotation cells, which would otherwise cause `ManifestParseError: Manifest row must have exactly 2 columns`. Skills sometimes emit prose like `run cmd | grep -v debug` inside an annotation; this pass rewrites the inner pipe as `\|` so the parser sees a valid 2-column row.
@@ -47,6 +53,7 @@ result = bpp.run_all(
     scope_paths=[Path("backlog/E17-compat-ci-cpk"), Path("backlog/E18-compat-ci-marketplace")],
 )
 # result == {
+#     "normalize_manifest_column_count": 0,
 #     "sanitize_markdown_pipes_in_manifest": 2,
 #     "dedupe_manifest_rows": 1,
 #     "suffix_ref_on_orphan_paths": 5,

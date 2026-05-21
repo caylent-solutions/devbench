@@ -45,6 +45,176 @@ class TestIterWorkUnitFiles:
 
 
 # ---------------------------------------------------------------------------
+# normalize_manifest_column_count -- issue #227
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestNormalizeManifestColumnCount:
+    """Issue #227: collapse N-col Manifest tables to canonical 2-col form."""
+
+    _THREE_COL_REPO = """\
+        # E1-F1-S1-T1: Title
+
+        ## Status: in-queue
+
+        ## Changes Manifest
+
+        | Repo | Path | Action |
+        |------|------|--------|
+        | caylent/cpk | .github/workflows/audit.yml | modify |
+        | caylent/cpk | docs/contributing.md | modify |
+
+        ## Next Section
+        """
+
+    _THREE_COL_FILE_FIRST = """\
+        # E1-F1-S1-T1: Title
+
+        ## Status: in-queue
+
+        ## Changes Manifest
+
+        | File | Change | Notes |
+        |------|--------|-------|
+        | `src/foo.py` | add | new feature |
+        | `tests/test_foo.py` | add | covers AC-1 |
+
+        ## Next
+        """
+
+    _FOUR_COL = """\
+        # E1-F1-S1-T1: Title
+
+        ## Status: in-queue
+
+        ## Changes Manifest
+
+        | Repo | Path | Action | Notes |
+        |------|------|--------|-------|
+        | caylent/cpk | audit.yml | modify | install pkg fix |
+
+        ## Next
+        """
+
+    _CANONICAL = """\
+        # E1-F1-S1-T1: Title
+
+        ## Status: in-queue
+
+        ## Changes Manifest
+
+        | File | Change |
+        |------|--------|
+        | `src/foo.py` | add |
+
+        ## Next
+        """
+
+    def test_3col_repo_path_action_to_canonical(self, tmp_path: Path) -> None:
+        wu = _write(tmp_path / "T.md", self._THREE_COL_REPO)
+        count = bpp.normalize_manifest_column_count(tmp_path)
+        assert count == 1
+        text = wu.read_text(encoding="utf-8")
+        # Canonical header.
+        assert "| File | Change |" in text
+        assert "|------|--------|" in text
+        # Row preserves repo + path + action.
+        assert "| `caylent/cpk -- .github/workflows/audit.yml` | modify |" in text
+        assert "| `caylent/cpk -- docs/contributing.md` | modify |" in text
+        # Original headers gone.
+        assert "| Repo | Path | Action |" not in text
+
+    def test_3col_file_change_notes_to_canonical(self, tmp_path: Path) -> None:
+        wu = _write(tmp_path / "T.md", self._THREE_COL_FILE_FIRST)
+        count = bpp.normalize_manifest_column_count(tmp_path)
+        assert count == 1
+        text = wu.read_text(encoding="utf-8")
+        assert "| File | Change |" in text
+        # Notes appended to Change with ' -- '.
+        assert "| `src/foo.py` | add -- new feature |" in text
+        assert "| `tests/test_foo.py` | add -- covers AC-1 |" in text
+
+    def test_4col_collapses_losslessly(self, tmp_path: Path) -> None:
+        wu = _write(tmp_path / "T.md", self._FOUR_COL)
+        count = bpp.normalize_manifest_column_count(tmp_path)
+        assert count == 1
+        text = wu.read_text(encoding="utf-8")
+        # Repo + Path merge, then Action -- Notes in Change.
+        assert "| `caylent/cpk -- audit.yml` | modify -- install pkg fix |" in text
+
+    def test_canonical_unchanged(self, tmp_path: Path) -> None:
+        wu = _write(tmp_path / "T.md", self._CANONICAL)
+        before = wu.read_text(encoding="utf-8")
+        count = bpp.normalize_manifest_column_count(tmp_path)
+        assert count == 0
+        assert wu.read_text(encoding="utf-8") == before
+
+    def test_idempotent(self, tmp_path: Path) -> None:
+        _write(tmp_path / "T.md", self._THREE_COL_REPO)
+        first = bpp.normalize_manifest_column_count(tmp_path)
+        second = bpp.normalize_manifest_column_count(tmp_path)
+        assert first == 1
+        assert second == 0
+
+    def test_post_normalize_parse_manifest_succeeds(self, tmp_path: Path) -> None:
+        """After normalisation, the public parse_manifest accepts the file."""
+        from devbench.backlog.manifest import parse_manifest
+
+        wu = _write(tmp_path / "T.md", self._THREE_COL_REPO)
+        bpp.normalize_manifest_column_count(tmp_path)
+        rows = parse_manifest(wu.read_text(encoding="utf-8"))
+        assert len(rows) == 2
+        assert rows[0].file == "caylent/cpk -- .github/workflows/audit.yml"
+        assert rows[0].change == "modify"
+
+    def test_skips_files_without_manifest(self, tmp_path: Path) -> None:
+        _write(tmp_path / "E.md", "# E1: Epic\n\n## Status: in-queue\n\n(no Manifest.)\n")
+        assert bpp.normalize_manifest_column_count(tmp_path) == 0
+
+    def test_terminal_status_skipped_by_default(self, tmp_path: Path) -> None:
+        content = self._THREE_COL_REPO.replace("## Status: in-queue", "## Status: done")
+        wu = _write(tmp_path / "T.md", content)
+        before = wu.read_text(encoding="utf-8")
+        assert bpp.normalize_manifest_column_count(tmp_path) == 0
+        assert wu.read_text(encoding="utf-8") == before
+
+    def test_scope_paths_honoured(self, tmp_path: Path) -> None:
+        in_scope = _write(tmp_path / "E2" / "E2-F1-S1-T1.md", self._THREE_COL_REPO)
+        out_of_scope = _write(tmp_path / "E1" / "E1-F1-S1-T1.md", self._THREE_COL_REPO)
+        out_before = out_of_scope.read_text(encoding="utf-8")
+        count = bpp.normalize_manifest_column_count(tmp_path, scope_paths=[tmp_path / "E2"])
+        assert count == 1
+        # In-scope file collapsed.
+        assert "| File | Change |" in in_scope.read_text(encoding="utf-8")
+        # Out-of-scope file unchanged.
+        assert out_of_scope.read_text(encoding="utf-8") == out_before
+
+
+@pytest.mark.unit
+class TestSplitRowCells:
+    """Direct tests for the cell splitter that honours backslash-escaped pipes."""
+
+    def test_two_cells(self) -> None:
+        assert bpp._split_row_cells("| a | b |") == ["a", "b"]
+
+    def test_three_cells(self) -> None:
+        assert bpp._split_row_cells("| a | b | c |") == ["a", "b", "c"]
+
+    def test_escaped_pipe_kept_inside_cell(self) -> None:
+        assert bpp._split_row_cells(r"| cmd \| grep | desc |") == ["cmd | grep", "desc"]
+
+    def test_missing_leading_pipe_returns_none(self) -> None:
+        assert bpp._split_row_cells("a | b |") is None
+
+    def test_missing_trailing_pipe_returns_none(self) -> None:
+        assert bpp._split_row_cells("| a | b") is None
+
+    def test_empty_cells_kept(self) -> None:
+        assert bpp._split_row_cells("|  |  |") == ["", ""]
+
+
+# ---------------------------------------------------------------------------
 # sanitize_markdown_pipes_in_manifest -- A12
 # ---------------------------------------------------------------------------
 
@@ -397,6 +567,7 @@ class TestRunAll:
     def test_returns_count_per_pass(self, tmp_path: Path) -> None:
         result = bpp.run_all(tmp_path)
         assert result == {
+            "normalize_manifest_column_count": 0,
             "sanitize_markdown_pipes_in_manifest": 0,
             "dedupe_manifest_rows": 0,
             "suffix_ref_on_orphan_paths": 0,
@@ -509,6 +680,7 @@ class TestScopeAwareness:
 
         assert first["suffix_ref_on_orphan_paths"] == 1
         assert second == {
+            "normalize_manifest_column_count": 0,
             "sanitize_markdown_pipes_in_manifest": 0,
             "dedupe_manifest_rows": 0,
             "suffix_ref_on_orphan_paths": 0,

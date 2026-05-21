@@ -169,6 +169,165 @@ def _split_manifest_section(text: str) -> tuple[str, str, str] | None:
     return text[:block_start], text[block_start:block_end], text[block_end:]
 
 
+def normalize_manifest_column_count(
+    backlog_dir: Path,
+    *,
+    scope_paths: Iterable[Path] | None = None,
+    force_terminal: bool = False,
+) -> int:
+    """Collapse N-column Manifest tables (3+) to the canonical 2-column form (#227).
+
+    The validator's ``parse_manifest`` enforces exactly two columns
+    (``| File | Change |``). LLM authors -- including sub-agents the
+    skill spawns via fan-out -- sometimes emit 3-column variants
+    (``| Repo | Path | Action |`` for multi-repo work) or 4-column
+    variants (``| Repo | Path | Action | Notes |``). The validator
+    fail-fasts on those with ``ManifestParseError: Manifest row must
+    have exactly 2 columns``, blocking the entire backlog.
+
+    This pass rewrites N-column Manifests losslessly:
+
+    - ``| Repo | Path | Action |`` (header[0] is ``Repo``): File cell
+      becomes ``<repo> -- <path>``; Change cell is the third column.
+    - Anything else with ``N >= 3`` columns: File cell is the first
+      column; Change cell joins the remaining columns with `` -- ``
+      so no information is dropped.
+
+    Already-canonical 2-column tables are skipped (no mutation).
+
+    Args:
+        backlog_dir: Root of the backlog tree.
+        scope_paths: Optional iterable of epic directories to limit the
+            walk to (issue #226).
+        force_terminal: When ``True``, also rewrite files with terminal
+            status. Default ``False`` skips them.
+
+    Returns the number of files modified.
+    """
+    modified = 0
+    for path in _iter_work_unit_files(backlog_dir, scope_paths=scope_paths):
+        text = path.read_text(encoding="utf-8")
+        if not force_terminal and _is_terminal_status(text):
+            continue
+        parts = _split_manifest_section(text)
+        if parts is None:
+            continue
+        before, block, after = parts
+        new_block, changed = _collapse_manifest_block(block)
+        if changed:
+            path.write_text(before + new_block + after, encoding="utf-8")
+            modified += 1
+    return modified
+
+
+def _split_row_cells(stripped: str) -> list[str] | None:
+    """Split a Markdown table row into cell contents.
+
+    ``stripped`` is the row with leading / trailing whitespace removed.
+    Returns ``None`` when the line is not a well-formed table row
+    (missing leading or trailing ``|``).
+
+    Honours backslash-escaped pipes (``\\|``) inside cells: the escaped
+    sequence is treated as part of the cell content, NOT as a cell
+    separator. Mirrors the parser's escape handling in
+    ``src/devbench/backlog/manifest.py``.
+    """
+    if not stripped.startswith("|") or not stripped.endswith("|"):
+        return None
+    inner = stripped[1:-1]
+    cells: list[str] = []
+    buf: list[str] = []
+    idx = 0
+    while idx < len(inner):
+        char = inner[idx]
+        if char == "\\" and idx + 1 < len(inner) and inner[idx + 1] == "|":
+            buf.append("|")
+            idx += 2
+            continue
+        if char == "|":
+            cells.append("".join(buf).strip())
+            buf = []
+            idx += 1
+            continue
+        buf.append(char)
+        idx += 1
+    cells.append("".join(buf).strip())
+    return cells
+
+
+def _collapse_manifest_block(block: str) -> tuple[str, bool]:
+    """Collapse an N-column Manifest table block to the canonical 2-column form.
+
+    Returns ``(new_block, changed)``. ``changed`` is ``False`` when the
+    block is already in canonical 2-column form or when no table can be
+    located inside the block.
+    """
+    lines = block.splitlines(keepends=True)
+
+    # Locate the header row (first non-separator pipe line).
+    header_idx: int | None = None
+    header_cells: list[str] = []
+    for i, line in enumerate(lines):
+        stripped = line.rstrip("\n").strip()
+        if not stripped.startswith("|") or stripped.startswith("|-"):
+            continue
+        cells = _split_row_cells(stripped)
+        if cells is None:
+            continue
+        header_idx = i
+        header_cells = cells
+        break
+
+    if header_idx is None or len(header_cells) <= 2:
+        return block, False
+
+    # Locate the separator row (first ``|---|---|`` line after the header).
+    sep_idx: int | None = None
+    for i in range(header_idx + 1, len(lines)):
+        if lines[i].rstrip("\n").strip().startswith("|-"):
+            sep_idx = i
+            break
+
+    # When the header is ``| Repo | Path | Action |`` we collapse the
+    # first two columns into the File cell; otherwise we treat the
+    # first column as File and join the rest into Change with `` -- ``.
+    repo_first = header_cells[0].lower() == "repo"
+
+    new_lines: list[str] = []
+    new_lines.extend(lines[:header_idx])
+    new_lines.append("| File | Change |\n")
+    new_lines.append("|------|--------|\n")
+
+    data_start = (sep_idx + 1) if sep_idx is not None else (header_idx + 1)
+    for line in lines[data_start:]:
+        stripped = line.rstrip("\n").strip()
+        if not stripped.startswith("|"):
+            new_lines.append(line)
+            continue
+        cells = _split_row_cells(stripped)
+        if cells is None or len(cells) <= 2:
+            new_lines.append(line)
+            continue
+        if repo_first and len(cells) >= 3:
+            repo_value = cells[0].strip().strip("`").strip()
+            path_value = cells[1].strip().strip("`").strip()
+            file_cell = f"{repo_value} -- {path_value}"
+            change_cell = " -- ".join(c.strip() for c in cells[2:] if c.strip())
+        else:
+            file_cell = cells[0].strip().strip("`").strip()
+            change_cell = " -- ".join(c.strip() for c in cells[1:] if c.strip())
+        if not change_cell:
+            # An N-column row whose tail cells were all empty collapses to
+            # a single-column row, which is malformed. Skip the rewrite for
+            # that row so the validator surfaces the underlying defect
+            # instead of silently absorbing it.
+            new_lines.append(line)
+            continue
+        new_lines.append(f"| `{file_cell}` | {change_cell} |\n")
+
+    return "".join(new_lines), True
+
+
 def sanitize_markdown_pipes_in_manifest(
     backlog_dir: Path,
     *,
@@ -483,6 +642,11 @@ def run_all(
     # first pass and subsequent passes would silently no-op.
     materialised_scope = list(scope_paths) if scope_paths is not None else None
     return {
+        "normalize_manifest_column_count": normalize_manifest_column_count(
+            backlog_dir,
+            scope_paths=materialised_scope,
+            force_terminal=force_terminal,
+        ),
         "sanitize_markdown_pipes_in_manifest": sanitize_markdown_pipes_in_manifest(
             backlog_dir,
             scope_paths=materialised_scope,

@@ -262,6 +262,30 @@ since the last release. PR #119 carries every change.
 
 ### Fixed
 
+- **SDK teardown race downgraded to WARNING with tracking-issue link**
+  (issue #232; tracks upstream #231). `claude-agent-sdk`'s
+  `Query.close()` raises
+  `RuntimeError: Attempted to exit cancel scope in a different task
+  than it was entered in` on every successful session teardown.
+  Surfaced as `[asyncio] ERROR Task exception was never retrieved`
+  AFTER `[ORCHESTRATOR_TERMINAL_EXIT]`, the trace caused remote
+  execution environments to mis-classify a successful orchestrator
+  run as failed (any stderr `ERROR` line tripped their pipeline). A
+  narrow asyncio exception-handler filter in the new
+  `devbench.sdk_teardown_filter` module intercepts the EXACT known
+  signature (RuntimeError class + verbatim marker substring + a
+  traceback frame in `claude_agent_sdk/_internal/*`) and logs a single
+  WARNING on the `devbench.sdk` logger that references devbench#231.
+  Anything that does NOT match the signature falls through to the
+  default handler and surfaces at ERROR. Full traceback is preserved
+  at DEBUG. The filter is installed via an async context manager
+  (`sdk_teardown_filter.guard()`) wrapped around the SDK query loop in
+  `cmd_start`, so the previous handler is restored on every exit
+  path. Filed upstream as
+  [anthropics/claude-agent-sdk-python#983](https://github.com/anthropics/claude-agent-sdk-python/issues/983);
+  the workaround is removed in the same commit that bumps the SDK
+  pin once that lands (devbench#231 stays open until then).
+
 - **`backlog_post_processor` scope + terminal-status guards**
   (issue #226). Materialising a new spec on top of an existing
   populated backlog could silently mutate already-done work units

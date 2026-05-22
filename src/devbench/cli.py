@@ -6851,71 +6851,91 @@ def cmd_start(*argv: str) -> int:
                 ``False``.
         """
         nonlocal _sdk_result_text
-        while True:
-            try:
-                async for message in query(
-                    prompt="Run the devbench-orchestrate:orchestrate skill to process the backlog until complete",
-                    options=ClaudeAgentOptions(
-                        plugins=[{"type": "local", "path": str(plugin_path)}],
-                        permission_mode="bypassPermissions",
-                    ),
-                ):
-                    logger.info("sdk message: %s", message)
-                    in_message_quota_exc = detect_quota_error(message)
-                    if in_message_quota_exc is not None:
-                        raise in_message_quota_exc
-                    _sdk_result_text = _extract_sdk_result_text(message) or _sdk_result_text
-                    if _log_terminal_exit_if_applicable(_sdk_result_text):
+        # Issue #232: install the SDK-teardown exception filter so the
+        # known cross-task cancel-scope RuntimeError raised by
+        # claude-agent-sdk Query.close() during session shutdown is
+        # downgraded to a WARNING (with a link to the upstream tracking
+        # issue #231) instead of surfacing as
+        # ``[asyncio] ERROR Task exception was never retrieved`` AFTER
+        # the orchestrator has already exited successfully. The context
+        # manager installs the filter on enter and uninstalls on exit;
+        # the single ``async with`` keeps this function's branch count
+        # flat (no extra ``try / finally`` branches in this scope, so
+        # the existing ruff PLR0912 12-branch cap is preserved).
+        from devbench.sdk_teardown_filter import guard as _sdk_teardown_guard
+
+        async with _sdk_teardown_guard():
+            while True:
+                try:
+                    async for message in query(
+                        prompt="Run the devbench-orchestrate:orchestrate skill to process the backlog until complete",
+                        options=ClaudeAgentOptions(
+                            plugins=[{"type": "local", "path": str(plugin_path)}],
+                            permission_mode="bypassPermissions",
+                        ),
+                    ):
+                        logger.info("sdk message: %s", message)
+                        in_message_quota_exc = detect_quota_error(message)
+                        if in_message_quota_exc is not None:
+                            raise in_message_quota_exc
+                        _sdk_result_text = _extract_sdk_result_text(message) or _sdk_result_text
+                        if _log_terminal_exit_if_applicable(_sdk_result_text):
+                            return
+                        # Issue #188 + #212: drain-on-claim short-circuit. Combined
+                        # condition (rather than nested ifs) keeps ``_run`` under
+                        # ruff PLR0912's 12-branch cap after the #218 terminal-exit
+                        # check above was added. Walrus binding kept inside the
+                        # ``if`` so mypy narrows ``drain_state`` to non-None in
+                        # the body; the explicit paren break keeps the line
+                        # under 120 cols at this indent depth (issue #232).
+                        if (
+                            _is_claim_tool_use(message)
+                            and (drain_state := read_drain_state(WORKSPACE_ROOT)) is not None
+                        ):
+                            raise _DrainRequested(drain_state.reason)
+                    # Clean exit from the SDK loop -- done.
+                    return
+                except QuotaExhaustedError as quota_exc:
+                    if not quota_cfg.enabled:
+                        raise
+                    if quota_cfg.on_exhaustion == _ON_EXHAUSTION_FAIL:
+                        print(
+                            f"ERROR: quota exhausted ({quota_exc}); on_exhaustion=fail -- aborting.",
+                            file=sys.stderr,
+                        )
+                        raise SystemExit(1) from quota_exc
+                    if quota_cfg.on_exhaustion == _ON_EXHAUSTION_DRAIN:
+                        request_drain(WORKSPACE_ROOT, reason=str(quota_exc))
                         return
-                    # Issue #188 + #212: drain-on-claim short-circuit.  Combined
-                    # condition (rather than nested ifs) keeps ``_run`` under
-                    # ruff PLR0912's 12-branch cap after the #218 terminal-exit
-                    # check above was added.
-                    if _is_claim_tool_use(message) and (drain_state := read_drain_state(WORKSPACE_ROOT)) is not None:
-                        raise _DrainRequested(drain_state.reason)
-                # Clean exit from the SDK loop -- done.
-                return
-            except QuotaExhaustedError as quota_exc:
-                if not quota_cfg.enabled:
-                    raise
-                if quota_cfg.on_exhaustion == _ON_EXHAUSTION_FAIL:
+                    # on_exhaustion='wait' branch: invoke the wait/resume protocol.
+                    try:
+                        units = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX).parse_index()
+                        wu = _find_in_flight_wu(units)
+                        wu_file: Path | None = wu.file_path if wu is not None else None
+                    except (OSError, ValueError) as exc:
+                        logger.error("Failed to resolve in-flight work unit for quota checkpoint: %s", exc)
+                        wu_file = None
+                    recovered = await _handle_quota_pause(
+                        exc=quota_exc,
+                        quota_cfg=quota_cfg,
+                        workspace_root=WORKSPACE_ROOT,
+                        session_name=parsed.name,
+                        in_flight_wu_file=wu_file,
+                    )
+                    if recovered:
+                        # Restart the SDK query loop.
+                        continue
+                    # Timeout branch: apply on_exhaustion_timeout action.
+                    timeout_action = quota_cfg.on_exhaustion_timeout
+                    if timeout_action in (_ON_EXHAUSTION_DRAIN, _ON_EXHAUSTION_TIMEOUT_KEEP_WAITING):
+                        request_drain(WORKSPACE_ROOT, reason=str(quota_exc))
+                        return
+                    # on_exhaustion_timeout='fail' branch.
                     print(
-                        f"ERROR: quota exhausted ({quota_exc}); on_exhaustion=fail -- aborting.",
+                        f"ERROR: quota wait timed out ({quota_exc}); on_exhaustion_timeout=fail -- aborting.",
                         file=sys.stderr,
                     )
                     raise SystemExit(1) from quota_exc
-                if quota_cfg.on_exhaustion == _ON_EXHAUSTION_DRAIN:
-                    request_drain(WORKSPACE_ROOT, reason=str(quota_exc))
-                    return
-                # on_exhaustion='wait' branch: invoke the wait/resume protocol.
-                try:
-                    units = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX).parse_index()
-                    wu = _find_in_flight_wu(units)
-                    wu_file: Path | None = wu.file_path if wu is not None else None
-                except (OSError, ValueError) as exc:
-                    logger.error("Failed to resolve in-flight work unit for quota checkpoint: %s", exc)
-                    wu_file = None
-                recovered = await _handle_quota_pause(
-                    exc=quota_exc,
-                    quota_cfg=quota_cfg,
-                    workspace_root=WORKSPACE_ROOT,
-                    session_name=parsed.name,
-                    in_flight_wu_file=wu_file,
-                )
-                if recovered:
-                    # Restart the SDK query loop.
-                    continue
-                # Timeout branch: apply on_exhaustion_timeout action.
-                timeout_action = quota_cfg.on_exhaustion_timeout
-                if timeout_action in (_ON_EXHAUSTION_DRAIN, _ON_EXHAUSTION_TIMEOUT_KEEP_WAITING):
-                    request_drain(WORKSPACE_ROOT, reason=str(quota_exc))
-                    return
-                # on_exhaustion_timeout='fail' branch.
-                print(
-                    f"ERROR: quota wait timed out ({quota_exc}); on_exhaustion_timeout=fail -- aborting.",
-                    file=sys.stderr,
-                )
-                raise SystemExit(1) from quota_exc
 
     # Always-fire on exit (PR #202): wrap the SDK loop + state-restoration
     # finally in an outer try/finally that calls notify_orchestrator_stop

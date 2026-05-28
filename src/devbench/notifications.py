@@ -2,8 +2,8 @@
 
 devbench can post a Slack message on every interesting lifecycle
 event -- work-unit done, blocked, materialised, promoted; PR opened,
-merged, CI failed; orchestrator stop, auto-restart; quota pause,
-quota resume.  Each event is independently toggled via
+merged, CI failed; orchestrator stop, auto-restart.  Each event is
+independently toggled via
 ``notifications.events.<event_name>`` in ``devbench.yaml``.  Each
 notification endpoint (Slack today; Discord / Teams / generic raw-JSON
 later) lives in its own nested config block under ``notifications:``
@@ -22,7 +22,7 @@ routing.  See ``docs/slack-notifications.md`` for the end-to-end
 operator walkthrough.
 
 This module is a thin payload-builder + dispatcher; HTTP transport
-is delegated to :func:`devbench.quota.post_webhook`.  Every public
+is handled by the local :func:`post_webhook` helper.  Every public
 ``notify_*`` function is **best-effort** -- any exception during
 delivery is logged to stderr but never propagates, mirroring the
 ``post_webhook`` contract.  The orchestrator must never crash because
@@ -43,10 +43,11 @@ but the last 8 characters of any URL it logs.
 
 from __future__ import annotations
 
+import http.client
 import json
 import sys
+import urllib.parse
 from collections.abc import Callable
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -77,8 +78,6 @@ EVENT_CI_FAILURE = "ci_failure"
 EVENT_CI_PASS = "ci_pass"
 EVENT_ORCHESTRATOR_STOP = "orchestrator_stop"
 EVENT_ORCHESTRATOR_AUTO_RESTART = "orchestrator_auto_restart"
-EVENT_QUOTA_PAUSE = "quota_pause"
-EVENT_QUOTA_RESUME = "quota_resume"
 
 ALL_EVENTS: tuple[str, ...] = (
     EVENT_WORK_UNIT_DONE,
@@ -97,8 +96,6 @@ ALL_EVENTS: tuple[str, ...] = (
     EVENT_CI_PASS,
     EVENT_ORCHESTRATOR_STOP,
     EVENT_ORCHESTRATOR_AUTO_RESTART,
-    EVENT_QUOTA_PAUSE,
-    EVENT_QUOTA_RESUME,
 )
 
 
@@ -287,6 +284,132 @@ def _build_slack_payload(
 
 
 # ---------------------------------------------------------------------------
+# Webhook transport (stdlib http.client, best-effort)
+# ---------------------------------------------------------------------------
+
+# Default timeout for best-effort webhook POST calls.
+_WEBHOOK_DEFAULT_TIMEOUT_SECONDS: float = 10.0
+
+# Allowed URL schemes for webhook POSTs.  Only http and https are permitted;
+# file: and other custom schemes are disallowed (security: untrusted output sinks).
+_WEBHOOK_ALLOWED_SCHEMES: frozenset[str] = frozenset({"http", "https"})
+
+
+def post_webhook(
+    url: str,
+    payload: dict[str, Any],
+    timeout_seconds: float = _WEBHOOK_DEFAULT_TIMEOUT_SECONDS,
+) -> None:
+    """POST *payload* as JSON to *url*.  Failures are logged to stderr but do not raise.
+
+    Uses stdlib ``http.client`` directly -- no third-party HTTP library and no
+    ``urllib.request.urlopen`` (which triggers bandit B310).  Only ``http://``
+    and ``https://`` scheme URLs are accepted; other schemes raise
+    :exc:`ValueError` before any network I/O (security: untrusted output sinks
+    must not be permitted to use file: or custom scheme handlers).
+
+    Args:
+        url: The webhook URL to POST to.  Must be a non-empty ``http://`` or
+            ``https://`` URL.
+        payload: A non-empty JSON-serialisable dict to send as the request body.
+            Must contain at least one key.
+        timeout_seconds: HTTP request timeout in seconds.  Must be positive.
+            Defaults to ``_WEBHOOK_DEFAULT_TIMEOUT_SECONDS`` (10 seconds).
+
+    Raises:
+        ValueError: When *url* is empty, uses a disallowed scheme, *payload* is
+            empty, or *timeout_seconds* is not positive.  Raised before any
+            network I/O (fail-fast for invalid caller inputs).
+
+    Returns:
+        None -- always; network-level errors are logged to stderr, not raised.
+    """
+    if not url:
+        msg = f"url must be a non-empty string, got {url!r}"
+        raise ValueError(msg)
+    if not payload:
+        msg = "payload must be a non-empty dict"
+        raise ValueError(msg)
+    if timeout_seconds <= 0:
+        msg = f"timeout_seconds must be positive, got {timeout_seconds!r}"
+        raise ValueError(msg)
+
+    # Validate scheme before any network I/O: reject file: and custom handlers.
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in _WEBHOOK_ALLOWED_SCHEMES:
+        msg = f"url scheme {parsed.scheme!r} is not allowed; use one of {sorted(_WEBHOOK_ALLOWED_SCHEMES)}"
+        raise ValueError(msg)
+
+    body = json.dumps(payload).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json; charset=utf-8",
+        "Content-Length": str(len(body)),
+    }
+
+    try:
+        _http_post(parsed, body, headers, timeout_seconds)
+    except Exception as exc:
+        # Webhook URLs are credentials (CLAUDE.md "Sensitive Data
+        # Handling").  Mask all but the last 8 chars in the log so an
+        # operator can correlate the failure with the URL they
+        # configured without leaking the secret to a shared stdout
+        # capture.
+        masked = "..." + url[-8:] if len(url) > 8 else "***"
+        print(
+            f"[WARN] webhook POST to {masked!r} failed: {exc!r}",
+            file=sys.stderr,
+        )
+
+
+def _http_post(
+    parsed: urllib.parse.SplitResult,
+    body: bytes,
+    headers: dict[str, str],
+    timeout_seconds: float,
+) -> None:
+    """Perform a low-level HTTP POST via ``http.client``.
+
+    Separated from :func:`post_webhook` so the network I/O is easily mockable
+    in unit tests by patching ``devbench.notifications._http_post``.
+
+    Args:
+        parsed: A :class:`urllib.parse.SplitResult` for the target URL.
+            ``parsed.scheme`` must already be validated to be ``http`` or
+            ``https`` by the caller.
+        body: UTF-8 encoded JSON body bytes.
+        headers: HTTP request headers dict (must include ``Content-Type``).
+        timeout_seconds: Socket-level timeout in seconds.
+
+    Raises:
+        Exception: Any network-level exception from ``http.client``.  The
+            caller (:func:`post_webhook`) catches and logs all exceptions.
+    """
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+
+    if parsed.scheme == "https":
+        conn: http.client.HTTPConnection = http.client.HTTPSConnection(
+            parsed.hostname or "",
+            port=parsed.port,
+            timeout=timeout_seconds,
+        )
+    else:
+        conn = http.client.HTTPConnection(
+            parsed.hostname or "",
+            port=parsed.port,
+            timeout=timeout_seconds,
+        )
+
+    try:
+        conn.request("POST", path, body=body, headers=headers)
+        resp = conn.getresponse()
+        resp.read()
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Dispatch core (best-effort)
 # ---------------------------------------------------------------------------
 
@@ -314,8 +437,6 @@ def _dispatch(
     if not is_event_enabled(event_kind):
         return
     try:
-        from devbench.quota import post_webhook  # lazy import: quota.py imports config which imports this
-
         cfg = _load_notifications_config()
         if cfg is None:
             return
@@ -688,32 +809,6 @@ def notify_orchestrator_auto_restart(blocked_task_ids: list[str]) -> None:
     )
 
 
-def notify_quota_pause(reason: str, reset_at: datetime, paused_at: datetime) -> None:
-    """The orchestrator detected a quota signal and is sleeping until *reset_at*."""
-    _dispatch(
-        EVENT_QUOTA_PAUSE,
-        slack_summary=f":zzz: Quota pause: {reason}",
-        slack_fields=[
-            ("Reset at", reset_at.isoformat()),
-            ("Paused at", paused_at.isoformat()),
-        ],
-        slack_context=None,
-    )
-
-
-def notify_quota_resume(resumed_at: datetime, waited_seconds: int) -> None:
-    """The orchestrator's recovery probe succeeded; the loop is resuming."""
-    _dispatch(
-        EVENT_QUOTA_RESUME,
-        slack_summary=":sunrise: Quota recovered; orchestrator resuming",
-        slack_fields=[
-            ("Resumed at", resumed_at.isoformat()),
-            ("Waited", f"{waited_seconds}s"),
-        ],
-        slack_context=None,
-    )
-
-
 # ---------------------------------------------------------------------------
 # Self-test driver (used by ``devbench notify-test``)
 # ---------------------------------------------------------------------------
@@ -765,7 +860,6 @@ _BLOCKED_CLASS_SAMPLE_DISPATCH = {
 
 def _fire_sample(event_kind: str) -> None:
     """Dispatch a canned payload for *event_kind* with placeholder data."""
-    now = datetime.now().astimezone()
     # All seven blocked-class events share the (unit_id, title, reason)
     # signature; dispatch via a dict to keep branch count manageable.
     blocked_fn = _BLOCKED_CLASS_SAMPLE_DISPATCH.get(event_kind)
@@ -798,10 +892,6 @@ def _fire_sample(event_kind: str) -> None:
         notify_orchestrator_stop("notify-test sample", "E0-F1-S1-T1")
     elif event_kind == EVENT_ORCHESTRATOR_AUTO_RESTART:
         notify_orchestrator_auto_restart(["E0-F1-S1-T2", "E0-F1-S1-T3"])
-    elif event_kind == EVENT_QUOTA_PAUSE:
-        notify_quota_pause("notify-test sample", now, now)
-    elif event_kind == EVENT_QUOTA_RESUME:
-        notify_quota_resume(now, 60)
     else:
         # ALL_EVENTS guard above keeps us off this branch in practice;
         # the explicit raise is defensive only for future-event additions

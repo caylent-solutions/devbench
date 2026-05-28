@@ -283,13 +283,13 @@ git_ops:
   pause_before_merge: false              # when true, waits for CI green before merging
 
 manifest_amendment:
-  enabled: false   # set true to allow executor to request Manifest changes mid-task
+  enabled: true    # default; set false to stop executors requesting Manifest changes mid-task
 
 task_factory:
   enabled: false   # set true to let the orchestrator auto-generate follow-up tasks
 
 validate:
-  check_orphan_path_tokens: false   # opt-in path-coherence check on AC / DoD prose
+  check_orphan_path_tokens: true    # Rule 20 (default on); set false to opt out of the AC / DoD path-coherence check
 
 agents:                              # ADR-25: per-agent model overrides
   # Each field below pins the agent to its CURRENT frontmatter default,
@@ -963,8 +963,8 @@ Single-PR mode requires `git_ops.defer_pr: false` (default) or pairing with
 ### manifest_amendment.enabled (Step 7)
 
 When enabled, the executor can request to add files to its Manifest mid-task (for TDD
-scenarios where a production fix is discovered after the spec was written). Disabled by
-default. Enable only when your backlog's TDD discipline requires it.
+scenarios where a production fix is discovered after the spec was written). Enabled by
+default; set `false` to opt out.
 
 ### task_factory.enabled (Step 7)
 

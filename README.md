@@ -216,7 +216,7 @@ For the full annotated YAML, value-resolution precedence, and every config key, 
 - **Per-model token pricing** (needed when you run anything other than Opus 4.7): drop the matching `report.token_cost_per_million_*` block from [model-pricing.md](docs/model-pricing.md) into `devbench.yaml`.
 - **Cost premium multipliers**: `report.data_residency_multiplier` (default 1.10) and `report.fast_mode_multiplier` (default 6.0) are applied per-call to the residency-flagged / fast-mode token subsets. Composes with cache + base-rate multipliers, applies before the `report.token_cost_discount` (issue #124).
 - **Hook-tail column caps**: tune `hook_tail.agent_width`, `hook_tail.tool_width`, `hook_tail.description_max` (default 120), `hook_tail.stdout_preview_max` in `devbench.yaml`, or override via `DEVBENCH_HOOK_TAIL_*` env vars (issue #134).
-- **Slack notifications** (operator pings on work-unit done/blocked, PR opened/merged, orchestrator stop, quota pause/resume, etc.): each lifecycle event is a separate toggle under `notifications.events.*`. Webhook URL + Slack user id flow via env vars so secrets never touch the yaml. See [docs/slack-notifications.md](docs/slack-notifications.md) for the full setup walkthrough.
+- **Slack notifications** (operator pings on work-unit done/blocked, PR opened/merged, orchestrator stop, etc.): each lifecycle event is a separate toggle under `notifications.events.*`. Webhook URL + Slack user id flow via env vars so secrets never touch the yaml. See [docs/slack-notifications.md](docs/slack-notifications.md) for the full setup walkthrough.
 
 ## Workspace setup
 

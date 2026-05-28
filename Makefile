@@ -86,8 +86,10 @@ test-unit:
 	uv run pytest tests/ -v --tb=short -q
 
 ## test-coverage: Run tests with coverage report (fails below 98%)
+## --cov-precision=2 so the fail-under compares the real value (e.g. 97.70 < 98)
+## instead of the default precision=0 which rounds 97.70 -> 98 and never fails.
 test-coverage:
-	uv run pytest tests/ --cov=devbench --cov-report=term-missing --cov-fail-under=98
+	uv run pytest tests/ --cov=devbench --cov-report=term-missing --cov-fail-under=98 --cov-precision=2
 
 ## test: Run all tests
 test: test-unit

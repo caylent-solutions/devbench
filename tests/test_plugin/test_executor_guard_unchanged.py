@@ -31,7 +31,6 @@ EXPECTED_PRE_TOOL_USE: dict[str, list[str]] = {
         "guard-git-stage.sh",
         "guard-destructive-git.sh",
         "guard-review-supervisor-scope.sh",
-        "guard-quota-aware.sh",
     ],
     "Write": ["guard-work-unit-write.sh"],
     "Edit": ["guard-work-unit-write.sh"],

@@ -158,9 +158,9 @@ claude run devbench:configure-devbench
 
 1. If `devbench.yaml` already exists, the skill reads it and pre-populates defaults.
    Enter a blank line to accept a shown default.
-2. The skill walks through 16 sections: `repos`, top-level scalars, `timeouts`,
+2. The skill walks through 15 sections: `repos`, top-level scalars, `timeouts`,
    `limits`, `agents`, `git_ops`, `task_factory`, `manifest_amendment`, `validate`,
-   `stop_hook`, `hook_tail`, `debug`, `backlog`, `quota_handling`, and a final write.
+   `stop_hook`, `hook_tail`, `debug`, `backlog`, `notifications`, and a final write.
 3. Each section validates against `RuntimeConfig` before moving to the next.
 4. The final `devbench.yaml` is written only after every section validates.
 

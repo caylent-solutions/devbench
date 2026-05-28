@@ -74,7 +74,8 @@ The skill walks through 16 sections, validating each before moving to the next:
 12. **hook_tail section** -- column-cap settings for `devbench hook-tail`.
 13. **debug section** -- diagnostic knobs (leave blank for production workspaces).
 14. **backlog section** -- `default_status_for_new_work_units` (`in-queue` or `draft`).
-15. **quota_handling section** -- quota-wait-and-resume protocol settings.
+15. **notifications section** -- per-event Slack toggles under `notifications.events.*`
+    plus the `notifications.slack` endpoint (PR #202).
 16. **Final validation and write** -- assembles the YAML, runs the full
     `RuntimeConfig` round-trip, then writes `backlog/config/devbench.yaml`.
 
@@ -122,12 +123,6 @@ rejects absolute paths and `..` traversals immediately.
 
 `draft` gives you a review gate after `spec-to-backlog` generates the backlog. Use
 `devbench promote` to transition tasks to `in-queue` when ready.
-
-### quota_handling
-
-The entire `quota_handling:` section may be omitted -- all fields default to
-spec-correct values. Enable this section only if you want to customise the quota
-recovery probe interval, webhook notifications, or the on-exhaustion action.
 
 ## Output contract
 

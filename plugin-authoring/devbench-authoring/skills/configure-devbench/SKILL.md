@@ -108,7 +108,7 @@ Accepted values: `squash`, `merge`, `rebase`. Reject anything else with:
 
 ### max_executor_retries
 
-> "max_executor_retries [default: 3]: Maximum executor retry attempts per work unit when judge reviews fail. Integer >= 1."
+> "max_executor_retries [default: 10]: Maximum executor retry attempts per work unit when judge reviews fail. Integer >= 1."
 
 Reject non-integers or values < 1 with:
 
@@ -136,12 +136,10 @@ Ask the operator for each sub-field:
 >
 >   gh_api       -- GitHub API call timeout [default: env DEVBENCH_GH_API_TIMEOUT or 30]
 >   test         -- Test suite run timeout [default: env DEVBENCH_TEST_TIMEOUT or 300]
->   security_fetch -- Security advisory fetch timeout [default: env DEVBENCH_SECURITY_FETCH_TIMEOUT or 60]
->   llm          -- LLM API call timeout [default: env DEVBENCH_LLM_TIMEOUT or 600]
+>   security_fetch -- Security advisory fetch timeout [default: env DEVBENCH_SECURITY_FETCH_TIMEOUT or 120]
+>   llm          -- LLM API call timeout [default: env DEVBENCH_LLM_TIMEOUT or 300]
 >   command      -- Shell command execution timeout [default: env DEVBENCH_COMMAND_TIMEOUT or 120]
->   executor     -- Executor agent overall timeout [default: env DEVBENCH_EXECUTOR_TIMEOUT or 3600]
->   executor_max_turns -- Maximum executor turns [default: env DEVBENCH_EXECUTOR_MAX_TURNS or 200]
->   orchestrator_poll_interval -- Orchestrator polling interval [default: 5]
+>   orchestrator_poll_interval -- Orchestrator polling interval [default: 10]
 >   github_check -- GitHub check status polling timeout [default: env DEVBENCH_GH_TIMEOUT or 600]"
 
 Validate each provided value is a positive integer. Reject with:
@@ -158,11 +156,11 @@ Ask the operator:
 
 > "Section: limits (leave blank to use the environment-variable / built-in default)
 >
->   alert_summary         -- Max security alert summaries to include [default: env DEVBENCH_ALERT_SUMMARY_LIMIT or 20]
->   output_truncation     -- Char limit for command output truncation [default: env DEVBENCH_OUTPUT_TRUNCATION or 10000]
->   llm_evidence_truncation -- Char limit for LLM evidence content [default: env DEVBENCH_LLM_EVIDENCE_TRUNCATION or 50000]
->   llm_file_context      -- Max files included in LLM context [default: env DEVBENCH_LLM_FILE_CONTEXT_LIMIT or 50]
->   llm_file_preview_chars -- Char limit for per-file LLM preview [default: env DEVBENCH_LLM_FILE_PREVIEW_CHARS or 2000]
+>   alert_summary         -- Max security alert summaries to include [default: env DEVBENCH_ALERT_SUMMARY_LIMIT or 10]
+>   output_truncation     -- Char limit for command output truncation [default: env DEVBENCH_OUTPUT_TRUNCATION or 2000]
+>   llm_evidence_truncation -- Char limit for LLM evidence content [default: env DEVBENCH_LLM_EVIDENCE_TRUNCATION or 15000]
+>   llm_file_context      -- Max files included in LLM context [default: env DEVBENCH_LLM_FILE_CONTEXT_LIMIT or 5]
+>   llm_file_preview_chars -- Char limit for per-file LLM preview [default: env DEVBENCH_LLM_FILE_PREVIEW_CHARS or 3000]
 >   ci_failure_log_bytes  -- Max bytes from a CI failure log to feed back to the executor [default: 32768]"
 
 Validate each provided value is a positive integer.
@@ -243,7 +241,8 @@ Ask the operator:
 >   enabled               -- Run the blocker-resolver + task-factory loop after amendment rejects.
 >                            Requires manifest_amendment.enabled: true. [true/false, default: false]
 >   auto_accept_proposals -- Auto-promote task-factory drafts to in-queue without operator review.
->                            Default false preserves the 'proposed' draft review step. [true/false, default: false]"
+>                            [true/false, default: true]; set false for the 'proposed' draft review step.
+>                            Only takes effect when enabled: true."
 
 ---
 
@@ -253,7 +252,7 @@ Ask the operator:
 
 > "Section: manifest_amendment
 >
->   enabled                    -- Enable the Changes Manifest amendment workflow. [true/false, default: false]
+>   enabled                    -- Enable the Changes Manifest amendment workflow. [true/false, default: true]
 >   allowed_reasons            -- List of amendment reasons accepted by the pre-filter.
 >                                 Default: [tdd_green_production_fix]
 >                                 (Enter comma-separated values, or leave blank for the default.)
@@ -265,10 +264,10 @@ Ask the operator:
 
 Ask the operator:
 
-> "Section: validate (opt-in validation rules for validate-backlog)
+> "Section: validate (validate-backlog rule toggles)
 >
 >   check_orphan_path_tokens -- Rule 20. When true, scan AC / DoD sections for backtick-quoted
->                               path tokens not listed in the Changes Manifest. [true/false, default: false]"
+>                               path tokens not listed in the Changes Manifest. [true/false, default: true]"
 
 ---
 
@@ -307,7 +306,7 @@ Ask the operator:
 > "Section: debug (diagnostic knobs; leave all blank for production workspaces)
 >
 >   check_registration_retries          -- Times 'wait_for_checks' retries 'gh pr checks' when
->                                          no checks are reported. [integer, default: 3]
+>                                          no checks are reported. [integer, default: 12]
 >   check_registration_delay_seconds    -- Sleep between check-registration retries. [integer, default: 5]
 >   blocked_recovery_window_seconds     -- Recency cap for AWAITING_AUTO_RECOVERY signal. [integer, default: 1800]"
 
@@ -334,44 +333,7 @@ Validate the value is exactly `in-queue` or `draft`. Reject anything else with:
 
 ---
 
-## Step 15 -- quota_handling section (issue #193)
-
-The `quota_handling:` section configures the quota-wait-and-resume protocol. The entire section may be omitted (all fields default to spec-correct values).
-
-Ask the operator:
-
-> "Section: quota_handling (quota-wait-and-resume; leave blank to accept all spec defaults)
->
->   enabled                -- Top-level toggle. When false, quota detection is disabled. [true/false, default: true]
->   on_exhaustion          -- Action on first quota detection: 'wait', 'fail', or 'drain'. [default: wait]
->   poll_interval_seconds  -- Recovery probe poll interval in seconds (min 30, max 3600). [default: 300]
->   max_wait_seconds       -- Max seconds to wait before triggering on_exhaustion_timeout. [default: 14400]
->   on_exhaustion_timeout  -- Action when max_wait_seconds is exceeded: 'drain', 'fail', or 'keep_waiting'.
->                             [default: drain]
->   resume_strategy        -- Resume strategy after quota restoration:
->                             'continue_current_wu', 'restart_wu', or 'drain_and_resume'. [default: continue_current_wu]
->   audit_comment_on_wait  -- Write a [QUOTA_WAITING] audit comment when waiting starts. [true/false, default: true]
->   audit_comment_on_resume -- Write a [QUOTA_RESUMED] audit comment after recovery. [true/false, default: true]
->   log_structured_events  -- Emit structured log events for quota-wait lifecycle transitions. [true/false, default: true]
->
-> Pause/resume notifications moved to the unified ``notifications:`` block
-> in PR #202.  See docs/slack-notifications.md and set
-> ``notifications.events.quota_pause`` /
-> ``notifications.events.quota_resume`` to true.
->
-> Recovery probe sub-configuration:
->   recovery_probe.model           -- Model name for the minimal probe completion. [default: haiku]
->   recovery_probe.max_tokens      -- Max tokens for the probe completion. [default: 5]
->   recovery_probe.backoff.initial_seconds -- Starting backoff interval. [default: 60]
->   recovery_probe.backoff.max_seconds     -- Maximum backoff interval. [default: 900]
->   recovery_probe.backoff.multiplier      -- Exponent base applied after each failed probe. [default: 2.0]
->   recovery_probe.backoff.jitter          -- Fractional jitter 0.0-1.0. [default: 0.1]"
-
-Validate `on_exhaustion` is one of `wait`, `fail`, `drain`. Validate `on_exhaustion_timeout` is one of `drain`, `fail`, `keep_waiting`. Validate `resume_strategy` is one of `continue_current_wu`, `restart_wu`, `drain_and_resume`. Validate `poll_interval_seconds` is between 30 and 3600. Reject any invalid value with a clear message and re-prompt.
-
----
-
-## Step 16 -- notifications section (PR #202)
+## Step 15 -- notifications section (PR #202)
 
 The `notifications:` section configures operator-facing Slack / webhook pings on lifecycle events. The entire section may be omitted; defaults are all "off".
 
@@ -404,8 +366,6 @@ Tell the operator (verbatim):
 >                                                     PR is ready for manual merge)
 >   events.orchestrator_stop                       -- orchestrator loop exited (clean / drain / SIGTERM / crash)
 >   events.orchestrator_auto_restart               -- exit-42 RUNTIME_DEGRADATION restart
->   events.quota_pause                             -- quota detected; sleeping until reset
->   events.quota_resume                            -- recovery probe succeeded; resuming
 >
 > Every payload also carries a Backlog field naming the source workspace
 > (basename of DEVBENCH_WORKSPACE_ROOT) so operators monitoring multiple
@@ -427,7 +387,7 @@ Validate `slack.webhook_url` (when present) starts with `https://`. Validate eve
 
 ---
 
-## Step 17 -- Final validation and write
+## Step 16 -- Final validation and write
 
 Assemble the complete YAML from all collected sections. Run the full validation round-trip:
 
@@ -471,7 +431,6 @@ Report:
 >   task_factory:       enabled=<value>, auto_accept_proposals=<value>
 >   manifest_amendment: enabled=<value>
 >   backlog:            default_status_for_new_work_units=<value>
->   quota_handling:     enabled=<value>, on_exhaustion=<value>
 >   notifications:      enabled=<value>, events=<comma-separated list of enabled events>
 >   stop_hook:          max_blocks=<value>, window_seconds=<value>
 >

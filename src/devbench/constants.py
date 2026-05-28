@@ -680,30 +680,6 @@ PERCENT_MULTIPLIER: int = 100
 BACKLOG_INDEX_CELL_COUNT: int = 9
 
 # ---------------------------------------------------------------------------
-# Recovery-probe constants (quota wait-and-resume, spec 4.5.1)
-# Used by devbench.quota.recovery_probe to send a minimal 1-token Anthropic
-# API completion request to test whether quota has been restored.
-# ---------------------------------------------------------------------------
-# Cheapest / fastest Anthropic model suitable for a minimal quota probe.
-RECOVERY_PROBE_MODEL: str = "claude-3-haiku-20240307"
-# Timeout for the probe HTTP request in seconds (spec 4.5.1: timeout_seconds=10).
-RECOVERY_PROBE_DEFAULT_TIMEOUT_SECONDS: float = 10.0
-# Maximum tokens requested in the probe completion (spec 4.5.1: request_size_tokens=1).
-RECOVERY_PROBE_DEFAULT_REQUEST_SIZE_TOKENS: int = 1
-# Minimal message content for the probe; chosen to produce the shortest valid
-# completion (single character elicits a 1-token response on all Claude models).
-RECOVERY_PROBE_MESSAGE_CONTENT: str = "1"
-
-# ---------------------------------------------------------------------------
-# Quota checkpoint constants (quota wait-and-resume, spec 4.5.1)
-# Used by devbench.quota.save_checkpoint / load_checkpoint.
-# ---------------------------------------------------------------------------
-# Subdirectory under session_dir (or workspace root) where quota state is kept.
-QUOTA_DEVBENCH_SUBDIR: str = ".devbench"
-# Filename of the quota pause checkpoint written by save_checkpoint.
-QUOTA_CHECKPOINT_FILENAME: str = "quota_pause.json"
-
-# ---------------------------------------------------------------------------
 # Per-agent model overrides (Option A shadow-plugin-dir, ADR-25)
 # ---------------------------------------------------------------------------
 # Workspace-relative directory holding the materialised shadow plugin tree.
@@ -808,81 +784,6 @@ SESSION_DRAIN_SIGNAL_FILENAME: str = "drain.signal"
 # classification clears on operator-driven restart.  The file contains a
 # single ISO 8601 UTC timestamp string.
 LAST_RESTART_MARKER_PATH: str = ".devbench/last-restart"
-
-# ---------------------------------------------------------------------------
-# Quota-handling defaults (spec section 4.5.6)
-# These constants define the default values for the quota_handling config block
-# in devbench.yaml.  Consumed by config_loader.py's QuotaHandlingConfig
-# dataclass.  All operational defaults live here so no inline literals appear
-# in the loader or any other module.
-# ---------------------------------------------------------------------------
-
-# Top-level quota-handling toggle (default enabled).
-QUOTA_HANDLING_DEFAULT_ENABLED: bool = True
-
-# Ordered list of quota-signal detection modes to activate.  Matches the
-# QuotaExhaustedError subclass names in devbench.quota (spec 4.5.6).
-QUOTA_HANDLING_DEFAULT_DETECT_MODES: list[str] = [
-    "subscription_rate_limit",
-    "sdk_credit_exhausted",
-    "api_billing_error",
-    "bedrock_throttle",
-]
-
-# Action taken when quota is first detected: wait (default), fail, or drain.
-QUOTA_HANDLING_DEFAULT_ON_EXHAUSTION: str = "wait"
-
-# Probe poll interval in seconds (spec 4.5.6: default 60s; min 30; max 3600).
-QUOTA_HANDLING_DEFAULT_POLL_INTERVAL_SECONDS: int = 60
-
-# Maximum seconds to wait before triggering on_exhaustion_timeout (spec 4.5.6:
-# 5 h default = 18000 s).
-QUOTA_HANDLING_DEFAULT_MAX_WAIT_SECONDS: int = 18000
-
-# Action taken when max_wait_seconds is exceeded: drain, fail, or keep_waiting.
-QUOTA_HANDLING_DEFAULT_ON_EXHAUSTION_TIMEOUT: str = "drain"
-
-# Resume strategy after quota is restored: continue_current_wu, restart_wu, or
-# drain_and_resume (spec 4.5.6).
-QUOTA_HANDLING_DEFAULT_RESUME_STRATEGY: str = "continue_current_wu"
-
-# Whether to write [QUOTA_WAITING] audit comments to the in-flight WU.
-QUOTA_HANDLING_DEFAULT_AUDIT_COMMENT_ON_WAIT: bool = True
-
-# Whether to write [QUOTA_RESUMED] audit comments after quota is restored.
-QUOTA_HANDLING_DEFAULT_AUDIT_COMMENT_ON_RESUME: bool = True
-
-# Whether to emit structured log events for quota-wait lifecycle events.
-QUOTA_HANDLING_DEFAULT_LOG_STRUCTURED_EVENTS: bool = True
-
-# Recovery probe sub-config defaults.
-# Whether the recovery probe is active (spec 4.5.6: enabled=true).
-QUOTA_HANDLING_DEFAULT_RECOVERY_PROBE_ENABLED: bool = True
-
-# Maximum output tokens requested in the probe call (spec 4.5.6:
-# request_size_tokens=1).  Must equal RECOVERY_PROBE_DEFAULT_REQUEST_SIZE_TOKENS
-# (1) so the quota.py module and the config block share the same spec value.
-QUOTA_HANDLING_DEFAULT_RECOVERY_PROBE_REQUEST_SIZE_TOKENS: int = 1
-
-# Timeout in seconds for the probe HTTP request (spec 4.5.6: timeout_seconds=10).
-# Must equal RECOVERY_PROBE_DEFAULT_TIMEOUT_SECONDS (10.0) so the quota.py
-# module and the config block share the same spec value.
-QUOTA_HANDLING_DEFAULT_RECOVERY_PROBE_TIMEOUT_SECONDS: float = 10.0
-
-# Exponential-backoff defaults for the recovery probe (spec section 4.5.6).
-# Starting backoff interval in seconds before the first probe retry.
-QUOTA_HANDLING_DEFAULT_BACKOFF_INITIAL_SECONDS: float = 30.0
-
-# Maximum backoff interval in seconds -- probe retries are capped at this value.
-QUOTA_HANDLING_DEFAULT_BACKOFF_MAX_SECONDS: float = 600.0
-
-# Multiplier applied to the current backoff interval after each failed probe.
-QUOTA_HANDLING_DEFAULT_BACKOFF_MULTIPLIER: float = 2.0
-
-# Fractional jitter added or subtracted from each backoff duration (0.0 to 1.0).
-# Default 0.2 (20%) prevents thundering-herd retries when multiple orchestrators
-# wake simultaneously.
-QUOTA_HANDLING_DEFAULT_BACKOFF_JITTER: float = 0.2
 
 # ---------------------------------------------------------------------------
 # Bounded skill iterate-until-perfect mechanism (spec section 4.6.0, issue #204)

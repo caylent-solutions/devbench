@@ -10,9 +10,10 @@ member of the bound channel), and swallows every HTTP exception
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import json
+import urllib.parse
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -158,7 +159,7 @@ class TestNotifyWorkUnitDone:
         cfg = _make_config(enabled=True, events={"work_unit_done": False})
         with (
             patch.object(notifications, "_load_notifications_config", return_value=cfg),
-            patch("devbench.quota.post_webhook") as posted,
+            patch("devbench.notifications.post_webhook") as posted,
         ):
             notifications.notify_work_unit_done("E0-F1-S1-T1", "Sample")
         posted.assert_not_called()
@@ -167,7 +168,7 @@ class TestNotifyWorkUnitDone:
         cfg = _make_config(enabled=True, events={"work_unit_done": True})
         with (
             patch.object(notifications, "_load_notifications_config", return_value=cfg),
-            patch("devbench.quota.post_webhook") as posted,
+            patch("devbench.notifications.post_webhook") as posted,
         ):
             notifications.notify_work_unit_done("E0-F1-S1-T1", "Sample title")
         posted.assert_called_once()
@@ -182,7 +183,7 @@ class TestNotifyWorkUnitDone:
         cfg = _make_config(enabled=True, slack_enabled=False, events={"work_unit_done": True})
         with (
             patch.object(notifications, "_load_notifications_config", return_value=cfg),
-            patch("devbench.quota.post_webhook") as posted,
+            patch("devbench.notifications.post_webhook") as posted,
         ):
             notifications.notify_work_unit_done("E0-F1-S1-T1", "Sample")
         posted.assert_not_called()
@@ -191,7 +192,7 @@ class TestNotifyWorkUnitDone:
         cfg = _make_config(enabled=True, slack_url=None, events={"work_unit_done": True})
         with (
             patch.object(notifications, "_load_notifications_config", return_value=cfg),
-            patch("devbench.quota.post_webhook") as posted,
+            patch("devbench.notifications.post_webhook") as posted,
         ):
             notifications.notify_work_unit_done("E0-F1-S1-T1", "Sample")
         posted.assert_not_called()
@@ -204,7 +205,7 @@ class TestNotifyWorkUnitDone:
 
         with (
             patch.object(notifications, "_load_notifications_config", return_value=cfg),
-            patch("devbench.quota.post_webhook", side_effect=boom),
+            patch("devbench.notifications.post_webhook", side_effect=boom),
         ):
             # Must not raise.
             notifications.notify_work_unit_done("E0-F1-S1-T1", "Sample")
@@ -227,7 +228,7 @@ class TestPerEventPayloads:
 
         with (
             patch.object(notifications, "_load_notifications_config", return_value=cfg),
-            patch("devbench.quota.post_webhook", side_effect=_grab),
+            patch("devbench.notifications.post_webhook", side_effect=_grab),
         ):
             dispatch(*args, **kwargs)
         assert captured, "expected at least one POST"
@@ -425,27 +426,6 @@ class TestPerEventPayloads:
         field_blob = " ".join(f.get("text", "") for block in payload["blocks"] for f in block.get("fields", []))
         assert "+15 more" in field_blob
 
-    def test_quota_pause(self) -> None:
-        now = datetime.now(tz=UTC)
-        payload = self._capture_one(
-            notifications.notify_quota_pause,
-            "subscription rate limit",
-            now,
-            now,
-            event_name="quota_pause",
-        )
-        assert "Quota pause" in payload["text"]
-
-    def test_quota_resume(self) -> None:
-        now = datetime.now(tz=UTC)
-        payload = self._capture_one(
-            notifications.notify_quota_resume,
-            now,
-            60,
-            event_name="quota_resume",
-        )
-        assert "Quota recovered" in payload["text"]
-
 
 # ---------------------------------------------------------------------------
 # send_test_notification (CLI self-test driver)
@@ -468,7 +448,7 @@ class TestSendTestNotification:
         cfg = _make_config(enabled=True, events={"work_unit_done": False})
         with (
             patch.object(notifications, "_load_notifications_config", return_value=cfg),
-            patch("devbench.quota.post_webhook") as posted,
+            patch("devbench.notifications.post_webhook") as posted,
         ):
             notifications.send_test_notification("work_unit_done")
         # Despite work_unit_done=False in the config, send_test_notification
@@ -479,7 +459,7 @@ class TestSendTestNotification:
         cfg = _make_config(enabled=True, events={"work_unit_done": False})
         with (
             patch.object(notifications, "_load_notifications_config", return_value=cfg),
-            patch("devbench.quota.post_webhook"),
+            patch("devbench.notifications.post_webhook"),
         ):
             notifications.send_test_notification("work_unit_done")
         assert cfg.events.work_unit_done is False
@@ -489,7 +469,7 @@ class TestSendTestNotification:
         cfg = _make_config(enabled=True)
         with (
             patch.object(notifications, "_load_notifications_config", return_value=cfg),
-            patch("devbench.quota.post_webhook") as posted,
+            patch("devbench.notifications.post_webhook") as posted,
         ):
             notifications.send_test_notification(event)
         posted.assert_called_once()
@@ -537,7 +517,6 @@ class TestNotificationsConfigParser:
               timeout_seconds: 15
               events:
                 work_unit_done: true
-                quota_pause: true
               slack:
                 enabled: true
                 webhook_url: "https://hooks.slack.com/services/T/B/X"
@@ -549,7 +528,6 @@ class TestNotificationsConfigParser:
         assert n.slack.webhook_url == "https://hooks.slack.com/services/T/B/X"
         assert n.timeout_seconds == 15.0
         assert n.events.work_unit_done is True
-        assert n.events.quota_pause is True
         assert n.events.work_unit_blocked_operator is False  # default
 
     def test_per_class_blocked_event_toggles_default_false_and_parse(self) -> None:
@@ -640,3 +618,261 @@ class TestNotificationsConfigParser:
                     webhook_url: "http://hooks.slack.com/services/T/B/X"
                 """
             )
+
+
+# ---------------------------------------------------------------------------
+# post_webhook -- best-effort HTTP POST helper (webhook transport).
+#
+# Relocated webhook-transport tests: post_webhook / _http_post now live in
+# devbench.notifications. The webhook transport lives here, so its tests do too.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestPostWebhook:
+    """post_webhook POSTs JSON payload to url; failures are logged but do not raise.
+
+    Webhook delivery is best-effort -- failures must be logged to stderr but
+    must not crash the orchestrator.
+    """
+
+    def _make_payload(self) -> dict[str, Any]:
+        return {
+            "event": "work_unit_done",
+            "reason": "completed",
+            "unit_id": "E0-F1-S1-T1",
+            "emitted_at": "2026-01-01T12:00:00+00:00",
+        }
+
+    def test_post_webhook_sends_json_body(self) -> None:
+        """post_webhook encodes payload as JSON and calls _http_post with correct args."""
+
+        from devbench.notifications import post_webhook
+
+        captured: list[dict[str, Any]] = []
+
+        def _fake_http_post(
+            parsed: urllib.parse.SplitResult,
+            body: bytes,
+            headers: dict[str, str],
+            timeout_seconds: float,
+        ) -> None:
+            captured.append({"parsed": parsed, "body": body, "headers": headers, "timeout": timeout_seconds})
+
+        payload = self._make_payload()
+        with patch("devbench.notifications._http_post", side_effect=_fake_http_post):
+            post_webhook("https://example.com/hook", payload, timeout_seconds=5.0)
+
+        assert len(captured) == 1
+        assert captured[0]["parsed"].scheme == "https"
+        assert captured[0]["parsed"].hostname == "example.com"
+        body_decoded = json.loads(captured[0]["body"].decode("utf-8"))
+        assert body_decoded["event"] == "work_unit_done"
+        assert body_decoded["reason"] == "completed"
+
+    def test_post_webhook_sets_content_type_json_header(self) -> None:
+        """post_webhook includes Content-Type: application/json in the headers passed to _http_post."""
+
+        from devbench.notifications import post_webhook
+
+        captured_headers: list[dict[str, str]] = []
+
+        def _fake_http_post(
+            parsed: urllib.parse.SplitResult,
+            body: bytes,
+            headers: dict[str, str],
+            timeout_seconds: float,
+        ) -> None:
+            captured_headers.append(headers)
+
+        with patch("devbench.notifications._http_post", side_effect=_fake_http_post):
+            post_webhook("https://example.com/hook", self._make_payload(), timeout_seconds=5.0)
+
+        assert len(captured_headers) == 1
+        header_keys_lower = {k.lower() for k in captured_headers[0]}
+        assert "content-type" in header_keys_lower
+        content_type_value = next(v for k, v in captured_headers[0].items() if k.lower() == "content-type")
+        assert "application/json" in content_type_value
+
+    def test_post_webhook_logs_http_error_to_stderr_without_raising(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """post_webhook logs HTTP errors to stderr and returns normally (best-effort)."""
+        from devbench.notifications import post_webhook
+
+        def _raise_http_error(*args: Any, **kwargs: Any) -> None:
+            raise ConnectionError("HTTP 500 Internal Server Error")
+
+        with patch("devbench.notifications._http_post", side_effect=_raise_http_error):
+            post_webhook("https://example.com/hook", self._make_payload(), timeout_seconds=5.0)
+
+        stderr_output = capsys.readouterr().err
+        assert "webhook" in stderr_output.lower() or "500" in stderr_output or "http" in stderr_output.lower()
+
+    def test_post_webhook_logs_url_error_to_stderr_without_raising(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """post_webhook logs connection failures to stderr and returns normally."""
+        from devbench.notifications import post_webhook
+
+        def _raise_connection_error(*args: Any, **kwargs: Any) -> None:
+            raise ConnectionRefusedError("Connection refused")
+
+        with patch("devbench.notifications._http_post", side_effect=_raise_connection_error):
+            post_webhook("https://example.com/hook", self._make_payload(), timeout_seconds=5.0)
+
+        stderr_output = capsys.readouterr().err
+        assert "webhook" in stderr_output.lower() or "connection" in stderr_output.lower()
+
+    def test_post_webhook_logs_timeout_to_stderr_without_raising(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """post_webhook logs TimeoutError to stderr and returns normally (best-effort)."""
+        from devbench.notifications import post_webhook
+
+        def _raise_timeout(*args: Any, **kwargs: Any) -> None:
+            raise TimeoutError("timed out")
+
+        with patch("devbench.notifications._http_post", side_effect=_raise_timeout):
+            post_webhook("https://example.com/hook", self._make_payload(), timeout_seconds=5.0)
+
+        stderr_output = capsys.readouterr().err
+        assert "webhook" in stderr_output.lower() or "timeout" in stderr_output.lower()
+
+    def test_post_webhook_logs_unexpected_exception_to_stderr_without_raising(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """post_webhook logs any unexpected exception to stderr and returns normally."""
+        from devbench.notifications import post_webhook
+
+        def _raise_unexpected(*args: Any, **kwargs: Any) -> None:
+            raise RuntimeError("unexpected failure")
+
+        with patch("devbench.notifications._http_post", side_effect=_raise_unexpected):
+            post_webhook("https://example.com/hook", self._make_payload(), timeout_seconds=5.0)
+
+        stderr_output = capsys.readouterr().err
+        assert stderr_output.strip() != "", "must log something on unexpected failure"
+
+    @pytest.mark.parametrize(
+        "url,payload,timeout_seconds,error_fragment",
+        [
+            ("", {"event": "pause"}, 5.0, "url"),
+            ("https://example.com/hook", {}, 5.0, "payload"),
+            ("https://example.com/hook", {"event": "pause"}, 0.0, "timeout"),
+            ("https://example.com/hook", {"event": "pause"}, -1.0, "timeout"),
+            ("file:///etc/passwd", {"event": "pause"}, 5.0, "scheme"),
+            ("ftp://example.com/hook", {"event": "pause"}, 5.0, "scheme"),
+        ],
+    )
+    def test_post_webhook_validates_inputs(
+        self,
+        url: str,
+        payload: dict[str, Any],
+        timeout_seconds: float,
+        error_fragment: str,
+    ) -> None:
+        """post_webhook raises ValueError for invalid inputs (fail-fast)."""
+        from devbench.notifications import post_webhook
+
+        with pytest.raises(ValueError, match=error_fragment):
+            post_webhook(url, payload, timeout_seconds=timeout_seconds)
+
+
+# ---------------------------------------------------------------------------
+# Issue #203: _http_post internals -- direct coverage of the network-level
+# helper that post_webhook delegates to. Existing TestPostWebhook stubs
+# _http_post itself; this class drives _http_post directly with patched
+# http.client connection classes so the HTTPS/HTTP branches, path/query
+# construction, and finally-block close are all exercised.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestHttpPostInternals:
+    """Issue #203: cover the network-level POST helper without real I/O.
+
+    Drives :func:`devbench.notifications._http_post` directly with patched
+    ``http.client.HTTPSConnection`` and ``HTTPConnection`` classes that
+    record constructor arguments and the ``request`` / ``getresponse`` /
+    ``read`` / ``close`` call sequence.  No real sockets are opened.
+    """
+
+    @staticmethod
+    def _split(url: str) -> urllib.parse.SplitResult:
+        return urllib.parse.urlsplit(url)
+
+    @staticmethod
+    def _conn_factories(
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        request_raises: Exception | None = None,
+    ) -> tuple[MagicMock, MagicMock, MagicMock]:
+        """Patch http.client connection classes; return (https_cls, http_cls, conn_instance)."""
+        from devbench import notifications as notifications_mod
+
+        conn = MagicMock(name="conn")
+        if request_raises is not None:
+            conn.request.side_effect = request_raises
+        conn.getresponse.return_value = MagicMock(read=MagicMock(return_value=b""))
+
+        https_cls = MagicMock(name="HTTPSConnection", return_value=conn)
+        http_cls = MagicMock(name="HTTPConnection", return_value=conn)
+        monkeypatch.setattr(notifications_mod.http.client, "HTTPSConnection", https_cls)
+        monkeypatch.setattr(notifications_mod.http.client, "HTTPConnection", http_cls)
+        return https_cls, http_cls, conn
+
+    def test_https_scheme_uses_https_connection(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An https:// URL is dispatched through HTTPSConnection with hostname + port + timeout."""
+        from devbench.notifications import _http_post
+
+        https_cls, http_cls, conn = self._conn_factories(monkeypatch)
+        _http_post(self._split("https://example.com/hook"), b"{}", {"Content-Type": "application/json"}, 7.5)
+
+        https_cls.assert_called_once_with("example.com", port=None, timeout=7.5)
+        http_cls.assert_not_called()
+        conn.request.assert_called_once_with("POST", "/hook", body=b"{}", headers={"Content-Type": "application/json"})
+        conn.getresponse.assert_called_once_with()
+        conn.close.assert_called_once_with()
+
+    def test_http_scheme_with_port_uses_http_connection(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An http:// URL with an explicit port is dispatched through HTTPConnection."""
+        from devbench.notifications import _http_post
+
+        https_cls, http_cls, conn = self._conn_factories(monkeypatch)
+        _http_post(self._split("http://example.com:8080/hook"), b"{}", {"Content-Type": "application/json"}, 3.0)
+
+        http_cls.assert_called_once_with("example.com", port=8080, timeout=3.0)
+        https_cls.assert_not_called()
+        conn.request.assert_called_once_with("POST", "/hook", body=b"{}", headers={"Content-Type": "application/json"})
+
+    def test_path_with_query_string_preserved(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A URL with a query string is passed to conn.request with the query intact."""
+        from devbench.notifications import _http_post
+
+        _, _, conn = self._conn_factories(monkeypatch)
+        _http_post(self._split("https://example.com/hook?x=1&y=2"), b"{}", {"Content-Type": "application/json"}, 5.0)
+
+        conn.request.assert_called_once_with(
+            "POST", "/hook?x=1&y=2", body=b"{}", headers={"Content-Type": "application/json"}
+        )
+
+    def test_empty_path_defaults_to_root(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A URL with no path component is dispatched with path '/'."""
+        from devbench.notifications import _http_post
+
+        _, _, conn = self._conn_factories(monkeypatch)
+        _http_post(self._split("https://example.com"), b"{}", {"Content-Type": "application/json"}, 5.0)
+
+        conn.request.assert_called_once_with("POST", "/", body=b"{}", headers={"Content-Type": "application/json"})
+
+    def test_exception_in_request_still_closes_connection(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When conn.request raises, the finally-block must still call conn.close."""
+        from devbench.notifications import _http_post
+
+        boom = RuntimeError("boom")
+        _, _, conn = self._conn_factories(monkeypatch, request_raises=boom)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            _http_post(
+                self._split("https://example.com/hook"),
+                b"{}",
+                {"Content-Type": "application/json"},
+                5.0,
+            )
+
+        conn.close.assert_called_once_with()

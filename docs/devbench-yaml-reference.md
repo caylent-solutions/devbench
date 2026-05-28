@@ -26,13 +26,13 @@ For every configurable parameter:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `merge_strategy` | `squash` \| `merge` \| `rebase` | `squash` | Default merge strategy for every repo unless overridden per-repo under `repos:`. |
+| `merge_strategy` | `squash` \| `merge` \| `rebase` | `squash` | Default merge strategy for every repo unless overridden per-repo under `repos:`. Effective precedence at merge time: `DEVBENCH_MERGE_STRATEGY` env > per-repo > this top-level > `squash`. |
 | `max_executor_retries` | integer | `10` | Shared retry budget across review-judge retries, CI-failure retries, and PR-bot-feedback retries. |
 | `use_bedrock` | boolean | `false` | Route LLM calls via AWS Bedrock instead of the Anthropic API. |
 | `bedrock_region` | string | `us-east-1` | AWS region for Bedrock when `use_bedrock: true`. |
 | `allowed_orgs` | list of strings | `[]` | Hard allowlist of GitHub orgs devbench may operate against. Empty means every org listed under `repos:` is permitted. |
 | `display_timezone` | IANA zone string | OS local | Timezone applied to every timestamp-rendering command (`report`, `hook-tail`, `watch`). |
-| `log_file` | string (relative path) | `logs/orchestrator.log` | Workspace-relative path to the orchestrator structured log file. |
+| `log_file` | string (relative path) | `logs/orchestrator.log` | Shared aggregate orchestrator log. Named sessions additionally write a per-session log at `.devbench/sessions/<name>/orchestrator.log` (read via `report --session <name>`). An explicit value (or `DEVBENCH_LOG_FILE`) overrides; relative values are workspace-relative. |
 
 ---
 
@@ -127,8 +127,6 @@ timeouts:
   security_fetch: 120
   llm: 300
   command: 120
-  executor: 600
-  executor_max_turns: 100
   orchestrator_poll_interval: 10
   github_check: 600
 ```
@@ -226,11 +224,11 @@ See [docs/model-pricing.md](model-pricing.md) for per-model pricing blocks and t
 
 ---
 
-## `manifest_amendment:` -- opt-in amendment workflow
+## `manifest_amendment:` -- amendment workflow (on by default)
 
 ```yaml
 manifest_amendment:
-  enabled: false
+  enabled: true                    # default; set false to opt out
   allowed_reasons:
     - tdd_green_production_fix
   max_requests_per_execution: 1
@@ -242,17 +240,17 @@ manifest_amendment:
 
 ```yaml
 task_factory:
-  enabled: false
-  auto_accept_proposals: false
+  enabled: false                   # opt-in; requires manifest_amendment.enabled: true
+  auto_accept_proposals: true      # default; only applies when enabled: true
 ```
 
 ---
 
-## `validate:` -- opt-in validate-backlog rules
+## `validate:` -- validate-backlog rule toggles
 
 ```yaml
 validate:
-  check_orphan_path_tokens: false  # Rule 20
+  check_orphan_path_tokens: true   # Rule 20; default on, set false to opt out
 ```
 
 ---
@@ -276,38 +274,6 @@ agents:
 
 All fields default to `null` (agent's `.md` frontmatter default). See
 [docs/adr/25-per-agent-model-overrides.md](adr/25-per-agent-model-overrides.md).
-
----
-
-## `quota_handling:` -- quota wait-and-resume (spec section 4.5)
-
-```yaml
-quota_handling:
-  enabled: true
-  detect_modes:
-    - subscription_rate_limit
-    - sdk_credit_exhausted
-    - api_billing_error
-    - bedrock_throttle
-  on_exhaustion: wait          # 'wait' | 'fail' | 'drain'
-  poll_interval_seconds: 60
-  max_wait_seconds: 18000
-  on_exhaustion_timeout: drain # 'drain' | 'fail' | 'keep_waiting'
-  audit_comment_on_wait: true
-  audit_comment_on_resume: true
-  log_structured_events: true
-  # Quota pause/resume notifications moved to the unified ``notifications:``
-  # block in PR #202; see docs/slack-notifications.md.
-  recovery_probe:
-    enabled: true
-    request_size_tokens: 1
-    timeout_seconds: 10
-    backoff:
-      initial_seconds: 30
-      max_seconds: 600
-      multiplier: 2.0
-      jitter: 0.2
-```
 
 ---
 
@@ -344,8 +310,6 @@ notifications:
                                          # manual merge.  Default false on upgrade.
     orchestrator_stop: false
     orchestrator_auto_restart: false
-    quota_pause: false
-    quota_resume: false
 ```
 
 ---

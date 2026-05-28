@@ -207,7 +207,12 @@ def _parse_body(body: str) -> list[ManifestRow]:
             continue
         if len(cells) != 2:
             raise ManifestParseError(f"Manifest row must have exactly 2 columns, got {len(cells)}: {line!r}")
-        file_cell = cells[0].strip("`").strip()
+        raw_file = cells[0]
+        # Handle repo-prefixed manifest format: `<repo>` -- `<path>`
+        if "` -- `" in raw_file:
+            file_cell = raw_file.split("` -- `", 1)[1].strip("`").strip()
+        else:
+            file_cell = raw_file.strip("`").strip()
         change_cell = cells[1]
         try:
             rows.append(ManifestRow(file=file_cell, change=change_cell))

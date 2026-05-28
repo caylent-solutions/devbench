@@ -12,6 +12,7 @@ import pytest
 
 from devbench import config
 from devbench.config import ALLOWED_REPOS, validate_repo
+from devbench.config_loader import RepoConfig, RuntimeConfig
 
 # ---------------------------------------------------------------------------
 # Test constants derived from the test fixture (tests/fixtures/test_devbench.yaml)
@@ -244,6 +245,52 @@ class TestMergeStrategy:
             assert config.MERGE_STRATEGY == config.MergeStrategy.SQUASH
 
         importlib.reload(config)
+
+
+@pytest.mark.unit
+class TestResolveMergeStrategy:
+    """#237: resolve_merge_strategy precedence env > per-repo > top-level > squash.
+
+    Patches the module inputs (_read_env / MERGE_STRATEGY / RUNTIME_CONFIG) directly
+    rather than reloading the module, so each precedence layer is isolated.
+    """
+
+    def _cfg(self, *, top: str | None = None, per_repo: str | None = None) -> RuntimeConfig:
+        repo = RepoConfig(merge_strategy=per_repo) if per_repo is not None else RepoConfig()
+        return RuntimeConfig(repos={"org/repo": repo}, merge_strategy=top)
+
+    def test_env_override_wins_over_yaml(self) -> None:
+        # env set -> returns the (validated, import-time) MERGE_STRATEGY regardless of YAML.
+        with (
+            patch.object(config, "_read_env", return_value="merge"),
+            patch.object(config, "MERGE_STRATEGY", config.MergeStrategy.MERGE),
+            patch.object(config, "RUNTIME_CONFIG", self._cfg(top="squash", per_repo="rebase")),
+        ):
+            assert config.resolve_merge_strategy("org/repo") is config.MergeStrategy.MERGE
+
+    def test_per_repo_yaml_when_env_unset(self) -> None:
+        with (
+            patch.object(config, "_read_env", return_value=None),
+            patch.object(config, "MERGE_STRATEGY", config.MergeStrategy.SQUASH),
+            patch.object(config, "RUNTIME_CONFIG", self._cfg(top="squash", per_repo="rebase")),
+        ):
+            assert config.resolve_merge_strategy("org/repo") is config.MergeStrategy.REBASE
+
+    def test_top_level_yaml_when_no_per_repo(self) -> None:
+        with (
+            patch.object(config, "_read_env", return_value=None),
+            patch.object(config, "MERGE_STRATEGY", config.MergeStrategy.SQUASH),
+            patch.object(config, "RUNTIME_CONFIG", self._cfg(top="merge")),
+        ):
+            assert config.resolve_merge_strategy("org/repo") is config.MergeStrategy.MERGE
+
+    def test_squash_default_when_env_and_yaml_unset(self) -> None:
+        with (
+            patch.object(config, "_read_env", return_value=None),
+            patch.object(config, "MERGE_STRATEGY", config.MergeStrategy.SQUASH),
+            patch.object(config, "RUNTIME_CONFIG", self._cfg()),
+        ):
+            assert config.resolve_merge_strategy("org/repo") is config.MergeStrategy.SQUASH
 
 
 @pytest.mark.unit

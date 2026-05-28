@@ -1514,18 +1514,6 @@ class TestConfigureDevbenchSkillBacklogSection:
 
 
 @pytest.mark.unit
-class TestConfigureDevbenchSkillQuotaHandlingSection:
-    """AC-191-6: Skill must walk the operator through the quota_handling section (issue #193)."""
-
-    def test_skill_covers_quota_handling(self) -> None:
-        """Skill must mention the quota_handling: RuntimeConfig section."""
-        content = CONFIGURE_DEVBENCH_SKILL_PATH.read_text()
-        assert "quota_handling" in content, (
-            "configure-devbench/SKILL.md must walk operator through the 'quota_handling' section"
-        )
-
-
-@pytest.mark.unit
 class TestConfigureDevbenchSkillRoundTripValidation:
     """AC-191-6: Skill must round-trip values through RuntimeConfig before writing YAML."""
 

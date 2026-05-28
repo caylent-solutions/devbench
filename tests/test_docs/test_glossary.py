@@ -31,7 +31,6 @@ CANONICAL_TERMS = [
     "scope",
     "drain",
     "session",
-    "quota wait",
     "marketplace plugin",
     "skill",
     "audit comment",
@@ -146,21 +145,6 @@ class TestTerminologyConsistencyInDocs:
             "No docs/ file uses the canonical lower-case 'draft' status term. "
             "At least one doc must use '`draft`' or 'draft status' to confirm the "
             "canonical spelling is in use across the docs suite (spec section 5.2)."
-        )
-
-    def test_quota_wait_canonical_form_present(self) -> None:
-        """'quota wait' canonical term must appear somewhere in docs/."""
-        doc_files = self._collect_doc_files()
-        found = False
-        for doc in doc_files:
-            text = doc.read_text(encoding="utf-8")
-            if "quota wait" in text.lower() or "quota-wait" in text.lower():
-                found = True
-                break
-        assert found, (
-            "No docs/ file uses the canonical 'quota wait' term. "
-            "At least one doc must use 'quota wait' or 'quota-wait' so the "
-            "term is discoverable (spec section 1.2 and 5.2)."
         )
 
     def test_drain_canonical_form_present(self) -> None:

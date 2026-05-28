@@ -152,7 +152,7 @@ from devbench.config import (
     resolve_repo,
     validate_repo,
 )
-from devbench.config_loader import QuotaHandlingConfig, RepoConfig, get_configured_default_branch
+from devbench.config_loader import RepoConfig, get_configured_default_branch
 from devbench.constants import (
     ALL_REQUIRED_JUDGE_NAMES,
     BACKLOG_LOCAL_PATH_RE,
@@ -171,7 +171,6 @@ from devbench.constants import (
     KNOWN_JUDGE_NAMES,
     ORCHESTRATOR_AUTO_RESTART_AUDIT_PREFIX,
     ORCHESTRATOR_RESTART_EXIT_CODE,
-    QUOTA_HANDLING_DEFAULT_DETECT_MODES,
     SESSION_DEFAULT_NAME,
     SESSION_DRAIN_SIGNAL_FILENAME,
     SESSION_PID_FILENAME,
@@ -194,19 +193,6 @@ from devbench.plugin_shadow import (
     materialise_shadow_plugin,
     shadow_plugin_path,
     write_pid_sentinel,
-)
-from devbench.quota import (
-    ApiBillingError,
-    BedrockThrottleError,
-    QuotaExhaustedError,
-    SdkCreditExhaustedError,
-    SubscriptionRateLimitError,
-    detect_quota_error,
-    load_checkpoint,
-    recovery_probe,
-    remove_checkpoint,
-    save_checkpoint,
-    wait_for_reset,
 )
 
 # Re-export from reporting so existing ``cli._format_duration`` callers and tests
@@ -366,70 +352,6 @@ def _render_drain_banner(workspace_root: Path, file: IO[str] | None = None) -> N
         f"DRAIN REQUESTED: at {state.requested_at.isoformat()} by {state.requested_by} (reason: {reason_part})",
         file=file if file is not None else sys.stdout,
     )
-
-
-def _quota_banner_now() -> datetime:
-    """Return the current UTC time for quota countdown calculations.
-
-    Extracted into a named function so tests can patch it without replacing
-    the ``datetime`` class itself.
-
-    Returns:
-        Current UTC-aware :class:`~datetime.datetime`.
-
-    Raises:
-        None -- always returns a valid timezone-aware datetime.
-    """
-    return datetime.now(tz=UTC)
-
-
-def _render_quota_wait_banner(workspace_root: Path, file: IO[str] | None = None) -> None:
-    """Print a ``QUOTA WAIT: <reason> - resumes <ISO-ts> (<countdown> remaining)`` banner.
-
-    Iterates over *workspace_root* itself plus every session directory listed
-    in the session registry.  For each directory that contains a
-    ``quota_pause.json`` file, one banner line is printed (spec section 4.5,
-    AC-193-15, AC-193-16).  When no pause file is found anywhere this function
-    is a no-op.  Output goes to *file* (default ``sys.stdout``).
-
-    Args:
-        workspace_root: Root workspace directory. Used both as the first search
-            location and as the registry root for session directories.
-        file: Output stream for the banner. Defaults to ``sys.stdout`` when
-            ``None``. Pass an ``io.StringIO`` to capture without touching the
-            real stdout.
-
-    Raises:
-        ValueError: Propagated from :func:`~devbench.quota.load_checkpoint`
-            when ``quota_pause.json`` exists but contains malformed JSON or
-            missing required fields.
-        OSError: Propagated from :func:`~devbench.quota.load_checkpoint` when
-            the file cannot be read due to a permission error or other I/O
-            failure.
-        ValueError: Propagated from :class:`~devbench.session.SessionRegistry`
-            when the registry file exists but contains invalid JSON.
-        OSError: Propagated from :class:`~devbench.session.SessionRegistry`
-            when a filesystem read fails unexpectedly.
-    """
-    out = file if file is not None else sys.stdout
-    watch_dirs = _collect_quota_watch_dirs(workspace_root)
-    for watch_dir in watch_dirs:
-        checkpoint = load_checkpoint(watch_dir)
-        if checkpoint is None:
-            continue
-        if checkpoint.reset_at is not None:
-            reset_iso = checkpoint.reset_at.isoformat()
-            remaining_secs = (checkpoint.reset_at - _quota_banner_now()).total_seconds()
-            if remaining_secs > 0:
-                remaining_mins = int(remaining_secs // 60)
-                remaining_secs_part = int(remaining_secs % 60)
-                countdown = f"{remaining_mins}m{remaining_secs_part:02d}s"
-            else:
-                countdown = "0m00s"
-            resumes_part = f"resumes {reset_iso} ({countdown} remaining)"
-        else:
-            resumes_part = "reset time unknown"
-        print(f"QUOTA WAIT: {checkpoint.reason} - {resumes_part}", file=out)
 
 
 def _print_active_units(active: list[WorkUnit]) -> None:
@@ -614,11 +536,6 @@ def cmd_status(*argv: str) -> int:
     ``SCOPE: include=[...] exclude=[...] (started ...)`` banner is printed
     above the Status Summary.
 
-    When ``quota_pause.json`` exists in the workspace root or any session
-    directory, a ``QUOTA WAIT: <reason> - resumes <ISO-ts> (<countdown>
-    remaining)`` banner is prepended above the Status Summary (spec section
-    4.5, AC-193-15, AC-193-16).
-
     With ``--detail`` (E220), additionally render per-state sections: in-queue
     (every actionable Task with the IDs of its still-open dependencies), six
     blocked-task sections (one per :class:`~devbench.backlog.proposal.BlockedTaskState`
@@ -638,7 +555,6 @@ def cmd_status(*argv: str) -> int:
         _render_scope_banner(scope.include, scope.exclude, scope.started_at)
 
     _render_drain_banner(WORKSPACE_ROOT)
-    _render_quota_wait_banner(WORKSPACE_ROOT)
 
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     all_units = parser.parse_index()
@@ -2869,9 +2785,13 @@ def _resolve_log_file_path() -> Path:
        reader alike -- picks up the same path. The value is treated as
        workspace-root-relative when not absolute.
     3. ``<DEVBENCH_WORKSPACE_ROOT>/<DEFAULT_LOG_SUBDIR>/<DEFAULT_LOG_FILENAME>``
-       convention. ``WORKSPACE_ROOT`` is resolved from ``DEVBENCH_WORKSPACE_ROOT``
-       by config.py at import time (raises ``RuntimeError`` if unset), so
-       this path is always deterministic.
+       convention (the shared aggregate log). ``WORKSPACE_ROOT`` is resolved from
+       ``DEVBENCH_WORKSPACE_ROOT`` by config.py at import time (raises
+       ``RuntimeError`` if unset), so this path is always deterministic. It
+       mirrors ``log_setup._resolve_log_file`` exactly so the writer and reader
+       never disagree. (Per-session logs live at
+       ``.devbench/sessions/<name>/orchestrator.log`` and are read via
+       ``report --session <name>``.)
 
     Raises:
         RuntimeError: when the legacy ``DEVBENCH_LOG_FILE`` env var is set
@@ -5454,8 +5374,10 @@ def cmd_watch(watch_interval: int = 0) -> int:
     """
     from devbench.activity import collect_snapshot, render_snapshot
 
-    _log_file_env = (_read_env("DEVBENCH_LOG_FILE") or "").strip()
-    log_file = Path(_log_file_env) if _log_file_env else WORKSPACE_ROOT / DEFAULT_LOG_SUBDIR / DEFAULT_LOG_FILENAME
+    # Canonical resolver (env -> yaml -> logs/orchestrator.log default) so
+    # `watch`, the orchestrator writer, and `report` all read/write the same
+    # file (previously this hand-rolled the path and ignored yaml log_file).
+    log_file = _resolve_log_file_path()
     hook_log = WORKSPACE_ROOT / "hook-logs.jsonl"
 
     def _resolver(repo_name: str) -> Path | None:
@@ -5889,249 +5811,6 @@ class _DrainRequested(BaseException):
     def __init__(self, reason: str = "") -> None:
         super().__init__(reason)
         self.reason = reason
-
-
-# ---------------------------------------------------------------------------
-# Quota-wait-and-resume constants (spec section 4.5.2, AC-193-5, AC-193-13)
-# ---------------------------------------------------------------------------
-
-#: Audit-log prefix written to the in-flight WU when quota waiting begins.
-#: Format: ``[QUOTA_WAITING] reason=<reason> reset_at=<ISO-ts>``.
-_QUOTA_WAITING_AUDIT_PREFIX: str = "[QUOTA_WAITING]"
-
-#: Audit-log prefix written to the in-flight WU after quota recovery.
-#: Format: ``[QUOTA_RESUMED] waited_seconds=<N>``.
-_QUOTA_RESUMED_AUDIT_PREFIX: str = "[QUOTA_RESUMED]"
-
-#: on_exhaustion config values (spec section 4.5.6).
-_ON_EXHAUSTION_WAIT: str = "wait"
-_ON_EXHAUSTION_FAIL: str = "fail"
-_ON_EXHAUSTION_DRAIN: str = "drain"
-
-#: on_exhaustion_timeout config values (spec section 4.5.6).
-_ON_EXHAUSTION_TIMEOUT_KEEP_WAITING: str = "keep_waiting"
-
-#: resume_strategy config values (spec section 4.5.6, AC-193-9, AC-193-10, AC-193-11).
-_RESUME_STRATEGY_CONTINUE: str = "continue_current_wu"
-_RESUME_STRATEGY_RESTART: str = "restart_wu"
-_RESUME_STRATEGY_DRAIN: str = "drain_and_resume"
-
-#: Tuple of QuotaExhaustedError subclasses in the same order as
-#: QUOTA_HANDLING_DEFAULT_DETECT_MODES (used to build _QUOTA_REASON_MAP
-#: without duplicating string literals -- DRY, spec section 4.5.2).
-_QUOTA_EXCEPTION_CLASSES: tuple[type[QuotaExhaustedError], ...] = (
-    SubscriptionRateLimitError,
-    SdkCreditExhaustedError,
-    ApiBillingError,
-    BedrockThrottleError,
-)
-
-#: Map from QuotaExhaustedError subclass to the human-readable reason string
-#: for QuotaCheckpoint.reason.  Built from _QUOTA_EXCEPTION_CLASSES and
-#: QUOTA_HANDLING_DEFAULT_DETECT_MODES so no string is declared twice.
-_QUOTA_REASON_MAP: dict[type[QuotaExhaustedError], str] = dict(
-    zip(_QUOTA_EXCEPTION_CLASSES, QUOTA_HANDLING_DEFAULT_DETECT_MODES, strict=True)
-)
-
-
-def _apply_resume_strategy(
-    resume_strategy: str,
-    session_dir: Path,
-    workspace_root: Path,
-    in_flight_wu_file: Path | None,
-    backlog_index: Path,
-) -> None:
-    """Apply the configured resume strategy after quota recovery.
-
-    Called by :func:`_handle_quota_pause` when :func:`~devbench.quota.wait_for_reset`
-    returns ``True`` (quota has been restored).  The strategy determines what
-    happens to the in-flight work unit and the orchestration loop:
-
-    - ``'continue_current_wu'`` (default, AC-193-9): Remove the checkpoint file
-      and let the SDK loop restart without reverting any WU status.  The
-      orchestrator continues from where it left off -- already-passed judges are
-      visible in the WU file history, and the orchestrate skill can skip them.
-
-    - ``'restart_wu'`` (AC-193-10): Revert the in-flight WU from ``in-progress``
-      to ``in-queue`` so the orchestrator re-claims and re-runs it from scratch.
-      The checkpoint file is then removed.
-
-    - ``'drain_and_resume'`` (AC-193-11): Request a drain so the orchestrator
-      finishes the current WU, then stops cleanly.  On the next ``devbench start``
-      invocation the operator resumes normally.  The checkpoint file is removed
-      before the drain is requested so the watcher daemon does not re-enter wait
-      mode.
-
-    Args:
-        resume_strategy: One of ``'continue_current_wu'``, ``'restart_wu'``,
-            or ``'drain_and_resume'``.  Any other value raises :exc:`ValueError`
-            (fail-fast; spec section 4.5.6 enumerates the full set).
-        session_dir: Session directory used to locate ``quota_pause.json``.
-        workspace_root: Workspace root path (used by ``request_drain`` and
-            ``BacklogManager`` internals).
-        in_flight_wu_file: Path to the in-flight work-unit Markdown file, or
-            ``None`` when no work unit is currently in-progress.  ``restart_wu``
-            requires this to be non-``None`` to revert the status; it logs a
-            warning and skips the status change when ``None``.
-        backlog_index: Path to ``BACKLOG.md`` (the backlog index file) used by
-            ``BacklogManager.force_status`` for the ``restart_wu`` strategy.
-
-    Raises:
-        ValueError: When *resume_strategy* is not one of the three documented
-            values.  Raised before any side effects (fail-fast).
-        OSError: When ``remove_checkpoint`` cannot delete ``quota_pause.json``
-            (e.g. permission denied).
-        OSError: When ``BacklogManager.force_status`` cannot write the WU file
-            (``restart_wu`` strategy only).
-    """
-    valid_strategies = (_RESUME_STRATEGY_CONTINUE, _RESUME_STRATEGY_RESTART, _RESUME_STRATEGY_DRAIN)
-    if resume_strategy not in valid_strategies:
-        raise ValueError(f"Unknown resume_strategy={resume_strategy!r}. Valid values: {', '.join(valid_strategies)}")
-
-    if resume_strategy == _RESUME_STRATEGY_RESTART:
-        # Revert the in-flight WU to in-queue before removing the checkpoint.
-        if in_flight_wu_file is not None:
-            unit_id = in_flight_wu_file.stem
-            mgr = BacklogManager()
-            mgr.force_status(in_flight_wu_file, backlog_index, unit_id, STATUS_IN_QUEUE)
-        # Remove checkpoint regardless of whether a WU was in-flight.
-        remove_checkpoint(session_dir)
-        return
-
-    if resume_strategy == _RESUME_STRATEGY_DRAIN:
-        # Remove checkpoint first so the watcher daemon does not re-enter wait mode,
-        # then request a drain so the current WU finishes before the loop stops.
-        remove_checkpoint(session_dir)
-        request_drain(workspace_root, reason="quota_recovered_drain_and_resume")
-        return
-
-    # _RESUME_STRATEGY_CONTINUE: just remove the checkpoint; SDK loop restarts normally.
-    remove_checkpoint(session_dir)
-
-
-async def _handle_quota_pause(
-    exc: QuotaExhaustedError,
-    quota_cfg: QuotaHandlingConfig,
-    workspace_root: Path,
-    session_name: str,
-    in_flight_wu_file: Path | None,
-) -> bool:
-    """Implement the quota-wait-and-resume protocol for a detected quota error.
-
-    Protocol (spec section 4.5.2, AC-193-5, AC-193-9, AC-193-10, AC-193-11):
-
-    1. Determine the session directory (workspace_root when no named session,
-       <workspace>/.devbench/sessions/<name> when a session is active).
-    2. Write a ``quota_pause.json`` checkpoint via :func:`~devbench.quota.save_checkpoint`.
-    3. If ``quota_cfg.audit_comment_on_wait`` is True and an in-flight WU file
-       is known, append a ``[QUOTA_WAITING] reason=<r> reset_at=<ts>`` audit
-       comment to the work unit.
-    4. Call :func:`~devbench.quota.wait_for_reset` and await the result.
-    5. If recovery succeeded (returned ``True``) and
-       ``quota_cfg.audit_comment_on_resume`` is True, append a
-       ``[QUOTA_RESUMED] waited_seconds=<N>`` audit comment.
-    6. If recovery succeeded, call :func:`_apply_resume_strategy` with
-       ``quota_cfg.resume_strategy`` to remove the checkpoint and take the
-       appropriate post-recovery action (continue, restart WU, or drain).
-    7. Return ``True`` when recovery succeeded, ``False`` when max_wait elapsed.
-
-    Args:
-        exc: The :class:`~devbench.quota.QuotaExhaustedError` that triggered the pause.
-        quota_cfg: Runtime quota-handling configuration.
-        workspace_root: Workspace root path (``WORKSPACE_ROOT``).
-        session_name: Active session name (``DEVBENCH_SESSION_NAME`` or
-            ``SESSION_DEFAULT_NAME``).
-        in_flight_wu_file: Path to the in-flight work-unit Markdown file, or
-            ``None`` when no work unit is currently in-progress.
-
-    Returns:
-        ``True`` when :func:`~devbench.quota.wait_for_reset` returned ``True``
-        (quota recovered within ``max_wait_seconds``).
-        ``False`` when ``max_wait_seconds`` was exceeded before recovery.
-
-    Raises:
-        Exception: Any exception raised by the ``wait_for_reset`` probe_fn
-            propagates unchanged to the caller.
-    """
-    # Step 1: determine session directory.
-    if session_name and session_name != SESSION_DEFAULT_NAME:
-        session_dir = workspace_root / SESSION_SESSIONS_BASE_DIR / session_name
-    else:
-        session_dir = workspace_root
-
-    # Step 2: save the checkpoint.
-    reason = _QUOTA_REASON_MAP[type(exc)]
-    reset_at = exc.reset_at
-    paused_at = datetime.now(tz=UTC)
-    in_flight_wu_id: str | None = None
-    if in_flight_wu_file is not None:
-        in_flight_wu_id = in_flight_wu_file.stem
-
-    save_checkpoint(
-        session_dir=session_dir,
-        paused_at=paused_at,
-        reset_at=reset_at,
-        reason=reason,
-        raw_error=str(exc),
-        in_flight_wu=in_flight_wu_id,
-        in_flight_phase=None,
-        completed_judges=[],
-        pending_judges=[],
-        stage_artefacts={},
-    )
-
-    # Step 3: audit comment on wait.
-    reset_at_str = reset_at.isoformat() if reset_at is not None else "unknown"
-    if quota_cfg.audit_comment_on_wait and in_flight_wu_file is not None:
-        mgr = BacklogManager()
-        mgr._append_agent_comment(
-            in_flight_wu_file,
-            "orchestrator",
-            f"{_QUOTA_WAITING_AUDIT_PREFIX} reason={reason} reset_at={reset_at_str}",
-        )
-    from devbench.notifications import notify_quota_pause
-
-    notify_quota_pause(
-        reason=reason,
-        reset_at=reset_at if reset_at is not None else datetime.now(tz=UTC),
-        paused_at=paused_at,
-    )
-
-    # Step 4: wait for reset.
-    effective_reset_at = reset_at if reset_at is not None else datetime.now(tz=UTC)
-    recovered = await wait_for_reset(
-        reset_at=effective_reset_at,
-        poll_interval=float(quota_cfg.poll_interval_seconds),
-        max_wait=float(quota_cfg.max_wait_seconds),
-        probe_fn=lambda: True,
-    )
-
-    # Step 5: audit comment on resume.
-    if recovered:
-        resumed_at = datetime.now(tz=UTC)
-        waited_seconds = int((resumed_at - paused_at).total_seconds())
-        if quota_cfg.audit_comment_on_resume and in_flight_wu_file is not None:
-            mgr = BacklogManager()
-            mgr._append_agent_comment(
-                in_flight_wu_file,
-                "orchestrator",
-                f"{_QUOTA_RESUMED_AUDIT_PREFIX} waited_seconds={waited_seconds}",
-            )
-        from devbench.notifications import notify_quota_resume
-
-        notify_quota_resume(resumed_at=resumed_at, waited_seconds=waited_seconds)
-
-    # Step 6: apply resume strategy (removes checkpoint, optionally reverts WU or drains).
-    if recovered:
-        _apply_resume_strategy(
-            resume_strategy=quota_cfg.resume_strategy,
-            session_dir=session_dir,
-            workspace_root=workspace_root,
-            in_flight_wu_file=in_flight_wu_file,
-            backlog_index=BACKLOG_INDEX,
-        )
-
-    return recovered
 
 
 def _is_claim_tool_use(message: object) -> bool:
@@ -6799,8 +6478,6 @@ def cmd_start(*argv: str) -> int:
 
     _prev_sigterm_handler = signal.signal(signal.SIGTERM, _sigterm_handler)
 
-    quota_cfg = RUNTIME_CONFIG.quota_handling
-
     # Issue #217: capture the SDK's final ResultMessage `result` text so the
     # orchestrator_stop Slack ping can carry the actual exit reason
     # (e.g., ``NO_ACTIONABLE -- 190/212 done, 11 blocked``) instead of the
@@ -6808,47 +6485,16 @@ def cmd_start(*argv: str) -> int:
     _sdk_result_text: str | None = None
 
     async def _run() -> None:
-        """Iterate SDK messages with quota-wait-and-resume and drain enforcement.
+        """Iterate SDK messages with drain enforcement.
 
-        Outer ``while True:`` restarts the SDK query loop on quota recovery.
-        Inner loop processes SDK messages, inspects each one via
-        :func:`~devbench.quota.detect_quota_error` to catch quota errors
-        embedded in content blocks (e.g. ToolResultBlock, ErrorBlock), and
-        raises :class:`_DrainRequested` when a ``devbench claim`` tool-use is
-        detected while a drain is pending.
-
-        When quota handling is enabled (``quota_cfg.enabled``), a caught
-        :class:`~devbench.quota.QuotaExhaustedError` invokes
-        :func:`_handle_quota_pause`, which saves a checkpoint, optionally
-        writes audit comments, and waits for quota recovery.  On recovery
-        (``wait_for_reset`` returns ``True``), the outer loop restarts the SDK
-        query.  On timeout (``wait_for_reset`` returns ``False``), the
-        ``on_exhaustion_timeout`` action is taken:
-
-        - ``'drain'`` -- calls :func:`~devbench.drain.request_drain` and
-          returns normally (drain enforced on the next claim).
-        - ``'fail'`` -- raises :class:`SystemExit` with rc=1.
-        - ``'keep_waiting'`` -- calls :func:`~devbench.drain.request_drain`
-          (conservative safe default) and returns normally.
-
-        When quota handling is disabled, :class:`~devbench.quota.QuotaExhaustedError`
-        propagates unchanged through ``asyncio.run``.
-
-        When ``on_exhaustion`` is ``'fail'``, the first quota error raises
-        :class:`SystemExit` with rc=1 without waiting.
-
-        When ``on_exhaustion`` is ``'drain'``, the first quota error calls
-        :func:`~devbench.drain.request_drain` and returns normally.
+        Processes SDK messages and raises :class:`_DrainRequested` when a
+        ``devbench claim`` tool-use is detected while a drain is pending.
 
         Args: (none -- captures local variables from ``cmd_start`` closure)
 
         Raises:
             _DrainRequested: A drain signal is present when a ``cmd_claim``
                 tool-use is observed.
-            SystemExit: When ``on_exhaustion='fail'`` or
-                ``on_exhaustion_timeout='fail'`` is triggered.
-            QuotaExhaustedError: Propagates when ``quota_cfg.enabled`` is
-                ``False``.
         """
         nonlocal _sdk_result_text
         # Issue #232: install the SDK-teardown exception filter so the
@@ -6865,77 +6511,25 @@ def cmd_start(*argv: str) -> int:
         from devbench.sdk_teardown_filter import guard as _sdk_teardown_guard
 
         async with _sdk_teardown_guard():
-            while True:
-                try:
-                    async for message in query(
-                        prompt="Run the devbench-orchestrate:orchestrate skill to process the backlog until complete",
-                        options=ClaudeAgentOptions(
-                            plugins=[{"type": "local", "path": str(plugin_path)}],
-                            permission_mode="bypassPermissions",
-                        ),
-                    ):
-                        logger.info("sdk message: %s", message)
-                        in_message_quota_exc = detect_quota_error(message)
-                        if in_message_quota_exc is not None:
-                            raise in_message_quota_exc
-                        _sdk_result_text = _extract_sdk_result_text(message) or _sdk_result_text
-                        if _log_terminal_exit_if_applicable(_sdk_result_text):
-                            return
-                        # Issue #188 + #212: drain-on-claim short-circuit. Combined
-                        # condition (rather than nested ifs) keeps ``_run`` under
-                        # ruff PLR0912's 12-branch cap after the #218 terminal-exit
-                        # check above was added. Walrus binding kept inside the
-                        # ``if`` so mypy narrows ``drain_state`` to non-None in
-                        # the body; the explicit paren break keeps the line
-                        # under 120 cols at this indent depth (issue #232).
-                        if (
-                            _is_claim_tool_use(message)
-                            and (drain_state := read_drain_state(WORKSPACE_ROOT)) is not None
-                        ):
-                            raise _DrainRequested(drain_state.reason)
-                    # Clean exit from the SDK loop -- done.
+            async for message in query(
+                prompt="Run the devbench-orchestrate:orchestrate skill to process the backlog until complete",
+                options=ClaudeAgentOptions(
+                    plugins=[{"type": "local", "path": str(plugin_path)}],
+                    permission_mode="bypassPermissions",
+                ),
+            ):
+                logger.info("sdk message: %s", message)
+                _sdk_result_text = _extract_sdk_result_text(message) or _sdk_result_text
+                if _log_terminal_exit_if_applicable(_sdk_result_text):
                     return
-                except QuotaExhaustedError as quota_exc:
-                    if not quota_cfg.enabled:
-                        raise
-                    if quota_cfg.on_exhaustion == _ON_EXHAUSTION_FAIL:
-                        print(
-                            f"ERROR: quota exhausted ({quota_exc}); on_exhaustion=fail -- aborting.",
-                            file=sys.stderr,
-                        )
-                        raise SystemExit(1) from quota_exc
-                    if quota_cfg.on_exhaustion == _ON_EXHAUSTION_DRAIN:
-                        request_drain(WORKSPACE_ROOT, reason=str(quota_exc))
-                        return
-                    # on_exhaustion='wait' branch: invoke the wait/resume protocol.
-                    try:
-                        units = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX).parse_index()
-                        wu = _find_in_flight_wu(units)
-                        wu_file: Path | None = wu.file_path if wu is not None else None
-                    except (OSError, ValueError) as exc:
-                        logger.error("Failed to resolve in-flight work unit for quota checkpoint: %s", exc)
-                        wu_file = None
-                    recovered = await _handle_quota_pause(
-                        exc=quota_exc,
-                        quota_cfg=quota_cfg,
-                        workspace_root=WORKSPACE_ROOT,
-                        session_name=parsed.name,
-                        in_flight_wu_file=wu_file,
-                    )
-                    if recovered:
-                        # Restart the SDK query loop.
-                        continue
-                    # Timeout branch: apply on_exhaustion_timeout action.
-                    timeout_action = quota_cfg.on_exhaustion_timeout
-                    if timeout_action in (_ON_EXHAUSTION_DRAIN, _ON_EXHAUSTION_TIMEOUT_KEEP_WAITING):
-                        request_drain(WORKSPACE_ROOT, reason=str(quota_exc))
-                        return
-                    # on_exhaustion_timeout='fail' branch.
-                    print(
-                        f"ERROR: quota wait timed out ({quota_exc}); on_exhaustion_timeout=fail -- aborting.",
-                        file=sys.stderr,
-                    )
-                    raise SystemExit(1) from quota_exc
+                # Issue #188 + #212: drain-on-claim short-circuit. Combined
+                # condition (rather than nested ifs) keeps ``_run`` under
+                # ruff PLR0912's 12-branch cap. Walrus binding kept inside the
+                # ``if`` so mypy narrows ``drain_state`` to non-None in the body.
+                if _is_claim_tool_use(message) and (drain_state := read_drain_state(WORKSPACE_ROOT)) is not None:
+                    raise _DrainRequested(drain_state.reason)
+            # Clean exit from the SDK loop -- done.
+            return
 
     # Always-fire on exit (PR #202): wrap the SDK loop + state-restoration
     # finally in an outer try/finally that calls notify_orchestrator_stop
@@ -8211,292 +7805,6 @@ def cmd_stop(*argv: str) -> int:
     else:
         print(success_msg)
     return rc
-
-
-# ---------------------------------------------------------------------------
-# cmd_quota_watcher helpers and implementation (E5-F5-S1-T1, issue #193)
-# ---------------------------------------------------------------------------
-
-#: Tick result returned when no quota_pause.json file exists under the watched dir.
-_TICK_NO_CHECKPOINT: str = "no_checkpoint"
-
-#: Tick result returned when the checkpoint exists but reset_at is still in the future.
-_TICK_WAITING: str = "waiting"
-
-#: Tick result returned when the recovery probe reports quota is restored and the
-#: checkpoint has been removed.
-_TICK_RESUMED: str = "resumed"
-
-#: Tick result returned when the recovery probe reports quota is still exhausted.
-_TICK_STILL_EXHAUSTED: str = "still_exhausted"
-
-#: Sleep interval (in seconds) between daemon ticks.  Sourced from the quota
-#: handling config at runtime when available; this is the fallback used when
-#: the global RUNTIME_CONFIG is not initialised (e.g. during tests).
-_QUOTA_WATCHER_DEFAULT_POLL_SECONDS: int = 60
-
-
-def _parse_quota_watcher_argv(
-    argv: tuple[str, ...],
-) -> tuple[str | None, int, str]:
-    """Parse ``cmd_quota_watcher`` arguments.
-
-    Accepted forms::
-
-        quota-watcher --daemon   -- long-running loop
-        quota-watcher --once     -- single tick
-
-    Returns a 3-tuple ``(mode, error_rc, error_msg)`` where:
-
-    - ``mode``: ``"daemon"`` or ``"once"``, or ``None`` on error.
-    - ``error_rc``: ``0`` on success, ``2`` on invalid arguments.
-    - ``error_msg``: human-readable error description (empty string on success).
-
-    Args:
-        argv: Trailing arguments after the ``quota-watcher`` command name.
-
-    Returns:
-        ``(mode, 0, "")`` on success;
-        ``(None, 2, message)`` on any parse error.
-
-    Raises:
-        SystemExit: never -- all errors are returned via error_rc.
-    """
-    has_daemon = "--daemon" in argv
-    has_once = "--once" in argv
-    unknown = [arg for arg in argv if arg.startswith("-") and arg not in ("--daemon", "--once")]
-
-    if unknown:
-        return None, 2, f"ERROR: unknown flag(s) for quota-watcher: {', '.join(unknown)}"
-
-    if has_daemon and has_once:
-        return None, 2, "ERROR: --daemon and --once are mutually exclusive"
-
-    if not has_daemon and not has_once:
-        return None, 2, "ERROR: quota-watcher requires --once or --daemon"
-
-    if has_daemon:
-        return "daemon", 0, ""
-    return "once", 0, ""
-
-
-def _collect_quota_watch_dirs(workspace_root: Path) -> list[Path]:
-    """Return all directories that may contain a ``quota_pause.json`` file.
-
-    Always includes *workspace_root* itself (for non-session runs).  Also
-    includes the ``state_dir`` of every session listed in the session
-    registry (spec section 4.5.3, AC-193-16).
-
-    When the registry file does not exist or is empty, only *workspace_root*
-    is returned.
-
-    Args:
-        workspace_root: Root directory of the devbench workspace.
-
-    Returns:
-        List of :class:`Path` objects to poll.  Workspace root is always
-        first; session dirs follow in registry order.
-
-    Raises:
-        ValueError: Propagated from :class:`~devbench.session.SessionRegistry`
-            when the registry file exists but contains invalid JSON.
-        OSError: Propagated from :class:`~devbench.session.SessionRegistry`
-            when a filesystem read fails unexpectedly.
-    """
-    dirs: list[Path] = [workspace_root]
-    registry = SessionRegistry(workspace_root)
-    sessions = registry.load()
-    for session in sessions:
-        dirs.append(session.state_dir)
-    return dirs
-
-
-def _default_recovery_probe() -> bool:
-    """Send a minimal API probe to test quota recovery.
-
-    Delegates to :func:`~devbench.quota.recovery_probe` with its default
-    arguments (1-token request, 10-second timeout).  Exists as a named
-    function so it can be patched in tests without replacing the full
-    ``recovery_probe`` symbol.
-
-    Returns:
-        ``True`` when quota has recovered; ``False`` when still exhausted.
-
-    Raises:
-        Exception: Any exception raised by
-            :func:`~devbench.quota.recovery_probe` propagates unchanged --
-            callers must decide whether to retry or surface the error.
-    """
-    return recovery_probe()
-
-
-def _quota_watcher_tick(
-    watch_dir: Path,
-    recovery_probe_fn: Callable[[], bool],
-) -> str:
-    """Perform one polling tick for *watch_dir*.
-
-    Reads ``<watch_dir>/.devbench/quota_pause.json`` when present.  When
-    the checkpoint's ``reset_at`` is still in the future, returns
-    ``"waiting"`` without probing.  When ``reset_at`` has passed (or is
-    ``None``), calls *recovery_probe_fn*:
-
-    - ``True``  -- removes the checkpoint and returns ``"resumed"``.
-    - ``False`` -- leaves the checkpoint intact and returns ``"still_exhausted"``.
-
-    When no checkpoint file is found, returns ``"no_checkpoint"``.
-
-    Args:
-        watch_dir: Root of the session or workspace being polled.
-            The checkpoint is expected at
-            ``<watch_dir>/.devbench/quota_pause.json``.
-        recovery_probe_fn: Zero-argument callable that returns ``True`` when
-            quota has recovered, ``False`` otherwise.  Must not raise on
-            normal quota-still-exhausted conditions; other exceptions
-            propagate to the caller.
-
-    Returns:
-        One of ``"no_checkpoint"``, ``"waiting"``, ``"resumed"``, or
-        ``"still_exhausted"``.
-
-    Raises:
-        ValueError: When the checkpoint file is present but malformed (bad
-            JSON, missing required fields, or unparseable datetime).  The
-            caller must handle this -- the tick must not silently continue
-            with a corrupt checkpoint.
-        OSError: Propagated from :func:`~devbench.quota.load_checkpoint` or
-            :func:`~devbench.quota.remove_checkpoint` on unexpected
-            filesystem errors.
-    """
-    checkpoint = load_checkpoint(watch_dir)
-    if checkpoint is None:
-        return _TICK_NO_CHECKPOINT
-
-    now = datetime.now(tz=UTC)
-    if checkpoint.reset_at is not None and checkpoint.reset_at > now:
-        logger.info(
-            "[QUOTA_WATCHER] dir=%s waiting; reset_at=%s",
-            watch_dir,
-            checkpoint.reset_at.isoformat(),
-        )
-        return _TICK_WAITING
-
-    recovered = recovery_probe_fn()
-    if recovered:
-        remove_checkpoint(watch_dir)
-        logger.info(
-            "[QUOTA_WATCHER] dir=%s resumed; checkpoint removed",
-            watch_dir,
-        )
-        return _TICK_RESUMED
-
-    logger.info(
-        "[QUOTA_WATCHER] dir=%s still exhausted; probe returned False",
-        watch_dir,
-    )
-    return _TICK_STILL_EXHAUSTED
-
-
-async def _quota_watcher_daemon_loop(workspace_root: Path) -> None:
-    """Run the quota-watcher daemon loop asynchronously.
-
-    Iterates over all watch dirs (workspace root + session state dirs),
-    calls :func:`_quota_watcher_tick` for each, then sleeps for
-    ``poll_interval_seconds`` (sourced from ``RUNTIME_CONFIG``) before the
-    next iteration.  Uses ``asyncio.sleep`` for the inter-tick wait so the
-    wait is consistent with the quota module's ``wait_for_reset`` approach
-    and avoids blocking the event loop.
-
-    The loop runs until a :exc:`KeyboardInterrupt` is raised (e.g. Ctrl-C
-    or SIGINT).
-
-    Args:
-        workspace_root: Root directory of the devbench workspace.  Passed to
-            :func:`_collect_quota_watch_dirs` and :func:`_quota_watcher_tick`.
-
-    Returns:
-        None -- the function returns only when interrupted by
-        :exc:`KeyboardInterrupt`.
-
-    Raises:
-        ValueError: Propagated from :func:`_quota_watcher_tick` when a
-            checkpoint file is malformed.
-        OSError: Propagated from filesystem operations inside
-            :func:`_quota_watcher_tick`.
-    """
-    poll_seconds = float(RUNTIME_CONFIG.quota_handling.poll_interval_seconds)
-    logger.info("[QUOTA_WATCHER] daemon started; poll_interval=%.1fs", poll_seconds)
-    try:
-        while True:
-            watch_dirs = _collect_quota_watch_dirs(workspace_root)
-            for watch_dir in watch_dirs:
-                result = _quota_watcher_tick(watch_dir, recovery_probe_fn=_default_recovery_probe)
-                logger.debug("[QUOTA_WATCHER] daemon tick dir=%s result=%s", watch_dir, result)
-            await asyncio.sleep(poll_seconds)
-    except KeyboardInterrupt:
-        logger.info("[QUOTA_WATCHER] daemon stopped by KeyboardInterrupt")
-
-
-def cmd_quota_watcher(*argv: str) -> int:
-    """Poll every session's quota_pause.json and resume when quota recovers.
-
-    Invocation forms::
-
-        devbench quota-watcher --once     -- single-tick: check all dirs once
-        devbench quota-watcher --daemon   -- loop: check all dirs repeatedly
-                                            until KeyboardInterrupt
-
-    For each watched directory (workspace root and every session state dir),
-    loads ``<dir>/.devbench/quota_pause.json`` when present.  When the
-    ``reset_at`` timestamp has elapsed, calls :func:`_default_recovery_probe`:
-
-    - If the probe returns ``True``, removes ``quota_pause.json`` and logs a
-      ``[QUOTA_WATCHER] resumed`` event.
-    - If the probe returns ``False``, leaves the checkpoint intact and logs a
-      ``[QUOTA_WATCHER] still_exhausted`` event.
-    - If the checkpoint does not exist, the tick is a no-op.
-
-    Logs every transition.  Returns ``rc=0`` on success, including when
-    stopped by ``KeyboardInterrupt`` in daemon mode.
-
-    Exit codes:
-
-    - 0 on success.
-    - 2 on invalid arguments (missing or unknown flags).
-
-    Args:
-        *argv: Zero or more CLI flags as individual strings.
-
-    Returns:
-        0 on success (including clean daemon shutdown via KeyboardInterrupt);
-        2 on argument parse error.
-
-    Raises:
-        ValueError: Propagated from :func:`_quota_watcher_tick` when a
-            checkpoint file is present but contains malformed data.  The
-            caller (``main``) receives the exception and exits with a
-            non-zero code via the default Python exception handler.
-        OSError: Propagated from filesystem operations inside
-            :func:`_quota_watcher_tick` when a file cannot be read or
-            removed.
-    """
-    mode, error_rc, error_msg = _parse_quota_watcher_argv(argv)
-    if error_rc != 0:
-        print(error_msg, file=sys.stderr)
-        return error_rc
-
-    watch_dirs = _collect_quota_watch_dirs(WORKSPACE_ROOT)
-
-    if mode == "once":
-        for watch_dir in watch_dirs:
-            result = _quota_watcher_tick(watch_dir, recovery_probe_fn=_default_recovery_probe)
-            logger.debug("[QUOTA_WATCHER] once tick dir=%s result=%s", watch_dir, result)
-        return 0
-
-    # daemon mode -- run the async poll loop via asyncio.run so that the
-    # inter-tick wait uses asyncio.sleep (consistent with quota.wait_for_reset).
-    asyncio.run(_quota_watcher_daemon_loop(WORKSPACE_ROOT))
-    return 0
 
 
 def cmd_request_amendment(unit_id: str) -> int:
@@ -10227,14 +9535,6 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
         0,
         ("Send SIGTERM to a named session (spec 4.4.5, issue #192): stop --session <name>"),
     ),
-    "quota-watcher": (
-        cmd_quota_watcher,
-        0,
-        (
-            "Poll quota_pause.json across sessions and resume when quota recovers "
-            "(spec 4.5.3, issue #193): quota-watcher --once | --daemon"
-        ),
-    ),
     "start": (
         cmd_start,
         0,
@@ -10419,8 +9719,6 @@ _VARIADIC_COMMANDS: frozenset[str] = frozenset(
         "sessions",
         # Issue #192 E4-F5-S1-T2: stop --session <name> flag
         "stop",
-        # Issue #193 E5-F5-S1-T1: quota-watcher --once / --daemon flags
-        "quota-watcher",
     }
 )
 

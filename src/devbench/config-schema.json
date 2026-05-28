@@ -37,7 +37,7 @@
     "merge_strategy": {
       "type": "string",
       "enum": ["merge", "squash", "rebase"],
-      "description": "Default PR merge strategy for all repos."
+      "description": "Default PR merge strategy for all repos. Effective strategy at merge time resolves as: DEVBENCH_MERGE_STRATEGY env var > per-repo repos.<org/repo>.merge_strategy > this top-level value > 'squash'."
     },
     "max_executor_retries": {
       "type": "integer",
@@ -77,7 +77,7 @@
     },
     "log_file": {
       "type": ["string", "null"],
-      "description": "Workspace-relative path to the orchestrator's structured log file (for example 'logs/backlog-a-orchestrator.log'). When set, both `setup_logging` (the writer) and `cmd_report` (the reader) consult this single source of truth so the orchestrator and the report cannot read/write different files by accident. Per-invocation override via the DEVBENCH_LOG_FILE env var still takes precedence (useful for tests)."
+      "description": "Workspace-relative path to the orchestrator's structured shared aggregate log file (for example 'logs/backlog-a-orchestrator.log'). When set, both `setup_logging` (the writer) and `cmd_report` (the reader) consult this single source of truth so the orchestrator and the report cannot read/write different files by accident. When unset, the default is '<DEFAULT_LOG_SUBDIR>/<DEFAULT_LOG_FILENAME>' (logs/orchestrator.log). Named sessions additionally write a per-session log at '.devbench/sessions/<name>/orchestrator.log' (read via 'report --session <name>'). Per-invocation override via the DEVBENCH_LOG_FILE env var still takes precedence (useful for tests)."
     },
     "timeouts": {
       "type": "object",
@@ -108,16 +108,6 @@
           "type": "integer",
           "minimum": 1,
           "description": "Shell command execution timeout in seconds."
-        },
-        "executor": {
-          "type": "integer",
-          "minimum": 1,
-          "description": "Executor agent overall timeout in seconds."
-        },
-        "executor_max_turns": {
-          "type": "integer",
-          "minimum": 1,
-          "description": "Maximum number of turns for the executor agent."
         },
         "orchestrator_poll_interval": {
           "type": "integer",
@@ -415,12 +405,12 @@
     },
     "manifest_amendment": {
       "type": "object",
-      "description": "Opt-in configuration for the Changes Manifest amendment workflow. When enabled, executors that discover a required production fix during TDD GREEN can request an amendment to the Changes Manifest; a dedicated judge reviews the request, and on approval the manifest is updated atomically with a Layer 3 deterministic post-check.",
+      "description": "Configuration for the Changes Manifest amendment workflow (enabled by default). When enabled, executors that discover a required production fix during TDD GREEN can request an amendment to the Changes Manifest; a dedicated judge reviews the request, and on approval the manifest is updated atomically with a Layer 3 deterministic post-check.",
       "additionalProperties": false,
       "properties": {
         "enabled": {
           "type": "boolean",
-          "description": "Whether the amendment workflow is active for this backlog. Default false (opt-in)."
+          "description": "Whether the amendment workflow is active for this backlog. Default true (set false to opt out)."
         },
         "allowed_reasons": {
           "type": "array",
@@ -469,18 +459,18 @@
         },
         "auto_accept_proposals": {
           "type": "boolean",
-          "description": "When true, devbench auto-promotes every task-factory-produced draft at sweep time instead of leaving it at status `proposed` for operator review. Default false. ADR-11."
+          "description": "When true (the default), devbench auto-promotes every task-factory-produced draft at sweep time instead of leaving it at status `proposed` for operator review. Set false to require operator review. Only takes effect when task_factory.enabled is true. ADR-11."
         }
       }
     },
     "validate": {
       "type": "object",
-      "description": "Opt-in toggles for additional validate-backlog rules. Existing rules (1-19) run unconditionally; rules listed here are gated to keep pre-existing backlogs green during rollout.",
+      "description": "Toggles for additional validate-backlog rules. Existing rules (1-19) run unconditionally; the rules listed here are individually toggleable.",
       "additionalProperties": false,
       "properties": {
         "check_orphan_path_tokens": {
           "type": "boolean",
-          "description": "Rule 20: cross-check Acceptance Criteria and Definition of Done sections of every Task against the Changes Manifest. Backtick-quoted path-shaped tokens that do not appear in the Manifest (and are not declared read-only via a trailing `(ref)` marker) emit an integrity error. Catches spec drift where AC/DoD prose restates a path that disagrees with the Manifest. Default false (opt-in). See docs/backlog-contract.md."
+          "description": "Rule 20: cross-check Acceptance Criteria and Definition of Done sections of every Task against the Changes Manifest. Backtick-quoted path-shaped tokens that do not appear in the Manifest (and are not declared read-only via a trailing `(ref)` marker) emit an integrity error. Catches spec drift where AC/DoD prose restates a path that disagrees with the Manifest. Default true (set false to opt out). See docs/backlog-contract.md."
         }
       }
     },
@@ -543,9 +533,7 @@
             "ci_failure": {"type": "boolean", "description": "Fire when CI checks on a WU PR fail. Default: false."},
             "ci_pass": {"type": "boolean", "description": "Fire when CI checks on the finalize-path batch PR turn green (PR ready for manual merge under auto_merge: false). Issue #219. Default: false."},
             "orchestrator_stop": {"type": "boolean", "description": "Fire when the orchestrator loop exits (clean, drain, SIGTERM, or crash). Default: false."},
-            "orchestrator_auto_restart": {"type": "boolean", "description": "Fire when the orchestrator exits 42 (RUNTIME_DEGRADATION-only NO_ACTIONABLE) and the Makefile loop restarts. Default: false."},
-            "quota_pause": {"type": "boolean", "description": "Fire when the orchestrator detects a quota signal and sleeps until reset. Default: false."},
-            "quota_resume": {"type": "boolean", "description": "Fire when the orchestrator's recovery probe succeeds and the loop resumes. Default: false."}
+            "orchestrator_auto_restart": {"type": "boolean", "description": "Fire when the orchestrator exits 42 (RUNTIME_DEGRADATION-only NO_ACTIONABLE) and the Makefile loop restarts. Default: false."}
           }
         },
         "slack": {
@@ -560,117 +548,6 @@
             "webhook_url": {
               "type": ["string", "null"],
               "description": "Slack incoming webhook URL (https://hooks.slack.com/...). null disables Slack notifications. Env override: DEVBENCH_NOTIFICATIONS_SLACK_WEBHOOK_URL."
-            }
-          }
-        }
-      }
-    },
-    "quota_handling": {
-      "type": "object",
-      "description": "Quota-wait-and-resume configuration (spec section 4.5.6). All fields are optional; the section can be omitted entirely. When omitted, all defaults apply.",
-      "additionalProperties": false,
-      "properties": {
-        "enabled": {
-          "type": "boolean",
-          "description": "Top-level toggle. When false, quota detection is disabled and the orchestrator behaves as if no quota signals were received. Default: true."
-        },
-        "detect_modes": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "enum": [
-              "subscription_rate_limit",
-              "sdk_credit_exhausted",
-              "api_billing_error",
-              "bedrock_throttle"
-            ]
-          },
-          "description": "Ordered list of quota-signal detection modes to activate. Each entry maps to a QuotaExhaustedError subclass in devbench.quota. Default: all four modes enabled."
-        },
-        "on_exhaustion": {
-          "type": "string",
-          "enum": ["wait", "fail", "drain"],
-          "description": "Action taken when quota is first detected: 'wait' (default) sleeps until reset then probes; 'fail' raises immediately; 'drain' finishes the current WU then exits."
-        },
-        "poll_interval_seconds": {
-          "type": "integer",
-          "minimum": 30,
-          "maximum": 3600,
-          "description": "Recovery probe poll interval in seconds. Default 60. Min 30, max 3600."
-        },
-        "max_wait_seconds": {
-          "type": "integer",
-          "minimum": 1,
-          "description": "Maximum seconds to wait before triggering on_exhaustion_timeout. Default 18000 (5 h)."
-        },
-        "on_exhaustion_timeout": {
-          "type": "string",
-          "enum": ["drain", "fail", "keep_waiting"],
-          "description": "Action taken when max_wait_seconds is exceeded: 'drain' (default) finishes the current WU then exits; 'fail' raises immediately; 'keep_waiting' resets the timer and continues probing."
-        },
-        "resume_strategy": {
-          "type": "string",
-          "enum": ["continue_current_wu", "restart_wu", "drain_and_resume"],
-          "description": "Resume strategy after quota is restored: 'continue_current_wu' (default) skips already-passed judges; 'restart_wu' reverts the WU to in-queue; 'drain_and_resume' finishes the current WU then resumes claiming."
-        },
-        "audit_comment_on_wait": {
-          "type": "boolean",
-          "description": "When true (default), writes a [QUOTA_WAITING] audit comment to the in-flight WU at the start of a quota wait."
-        },
-        "audit_comment_on_resume": {
-          "type": "boolean",
-          "description": "When true (default), writes a [QUOTA_RESUMED] audit comment after quota is restored."
-        },
-        "log_structured_events": {
-          "type": "boolean",
-          "description": "When true (default), emits structured log events for quota-wait lifecycle transitions."
-        },
-        "recovery_probe": {
-          "type": "object",
-          "description": "Recovery probe sub-configuration (spec section 4.5.6). Controls the minimal Anthropic API completion used to detect quota recovery.",
-          "additionalProperties": false,
-          "properties": {
-            "enabled": {
-              "type": "boolean",
-              "description": "When true (default), the recovery probe is activated after the initial reset_at sleep. When false, only the reset_at sleep is used -- probe calls are skipped."
-            },
-            "request_size_tokens": {
-              "type": "integer",
-              "minimum": 1,
-              "description": "Maximum output tokens requested in the probe call. Default 1 (cheapest valid response). Override only when a different model requires a minimum token count."
-            },
-            "timeout_seconds": {
-              "type": "number",
-              "minimum": 1,
-              "description": "Timeout in seconds for the probe HTTP request. Default 10. Override for slow network environments."
-            },
-            "backoff": {
-              "type": "object",
-              "description": "Exponential-backoff parameters for probe retries (spec section 4.5.6).",
-              "additionalProperties": false,
-              "properties": {
-                "initial_seconds": {
-                  "type": "number",
-                  "minimum": 1,
-                  "description": "Starting backoff interval in seconds. Default 30."
-                },
-                "max_seconds": {
-                  "type": "number",
-                  "minimum": 1,
-                  "description": "Maximum backoff interval in seconds. Default 600."
-                },
-                "multiplier": {
-                  "type": "number",
-                  "minimum": 1,
-                  "description": "Exponent base applied after each failed probe. Default 2.0."
-                },
-                "jitter": {
-                  "type": "number",
-                  "minimum": 0,
-                  "maximum": 1,
-                  "description": "Fractional jitter added/subtracted from each backoff duration. Default 0.2 (20%)."
-                }
-              }
             }
           }
         }

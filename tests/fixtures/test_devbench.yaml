@@ -17,8 +17,6 @@ timeouts:
   security_fetch: 30
   llm: 60
   command: 30
-  executor: 300
-  executor_max_turns: 10
   orchestrator_poll_interval: 5
   github_check: 60
 

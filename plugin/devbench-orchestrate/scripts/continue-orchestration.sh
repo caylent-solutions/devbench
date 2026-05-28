@@ -14,155 +14,17 @@ set -euo pipefail
 #   - Stale task detection for zombie sessions
 #   - Blocked transitional state detection
 #   - Audit trail: logs blocks and circuit breaker trips
-#   - Quota-error detection (AC-193-14): scans transcript for rate-limit
-#     patterns and writes quota_pause.json when a match is found.
 
 WORKSPACE_ROOT="${DEVBENCH_WORKSPACE_ROOT:-}"
 BACKLOG_INDEX="${WORKSPACE_ROOT}/BACKLOG.md"
 CONFIG_FILE="${WORKSPACE_ROOT}/backlog/config/devbench.yaml"
 
-# ---------------------------------------------------------------------------
-# Quota-error detection (AC-193-14)
-# ---------------------------------------------------------------------------
-# Read the Stop event payload from stdin.  The payload contains
-# ``transcript_path`` which points to the current session transcript JSONL.
-# Scan recent transcript content for quota-exhaustion text patterns.
-# On a match, write quota_pause.json atomically to the workspace .devbench/
-# directory (or the session-scoped path when DEVBENCH_SESSION_NAME is set).
-#
-# Scan order: we read all of stdin once and cache it; the transcript scan
-# happens before the main in-progress check so a quota event is always
-# recorded even when the circuit breaker later allows the stop.
-
-_HOOK_STDIN=""
-if [ -t 0 ]; then
-    # stdin is a terminal (interactive shell, e.g. test runner without input) --
-    # do not block waiting for input.
-    true
-else
-    _HOOK_STDIN=$(cat 2>/dev/null || { echo >&2 "[ERROR] continue-orchestration: failed to read Stop event payload from stdin"; true; })
-fi
-
-_detect_and_write_quota_checkpoint() {
-    local workspace_root="$1"
-    local session_name="$2"
-    local stdin_payload="$3"
-
-    # Extract transcript_path from the Stop event payload.
-    if [ -z "$stdin_payload" ]; then
-        return 0
-    fi
-
-    local transcript_path
-    transcript_path=$(printf '%s' "$stdin_payload" | jq -r '.transcript_path // ""' 2>/dev/null || { echo >&2 "[ERROR] continue-orchestration: jq failed to extract transcript_path from Stop event payload"; return 0; })
-
-    if [ -z "$transcript_path" ] || [ ! -f "$transcript_path" ]; then
-        return 0
-    fi
-
-    # Resolve the checkpoint path (session-scoped or workspace-root).
-    local checkpoint_path
-    if [ -n "$session_name" ]; then
-        checkpoint_path="${workspace_root}/.devbench/sessions/${session_name}/.devbench/quota_pause.json"
-    else
-        checkpoint_path="${workspace_root}/.devbench/quota_pause.json"
-    fi
-
-    # If a checkpoint already exists, do not overwrite it.
-    # The quota-watcher daemon is responsible for clearing the checkpoint.
-    if [ -f "$checkpoint_path" ]; then
-        return 0
-    fi
-
-    # Slurp the transcript file (JSONL) and scan for quota-error patterns.
-    # Each line is a JSON object; we inspect the full text of each line for
-    # any known quota-error signal substring.  Using grep for speed; jq would
-    # be more precise but the text scan is safe here because all patterns are
-    # distinctive enough to avoid false positives in normal transcript content.
-    local transcript_text
-    transcript_text=$(cat "$transcript_path" 2>/dev/null || { echo >&2 "[ERROR] continue-orchestration: failed to read transcript file: ${transcript_path}"; return 0; })
-
-    if [ -z "$transcript_text" ]; then
-        return 0
-    fi
-
-    # Determine which quota reason applies (first match wins, priority order
-    # matches the detect_modes list in constants.py).
-    local quota_reason=""
-
-    # subscription_rate_limit: HTTP 429 / rate_limit / overloaded_error
-    if printf '%s\n' "$transcript_text" | grep -qiE \
-        "(rate_limit|Too Many Requests|overloaded_error|anthropic-ratelimit|HTTP 429|error 429|status.*429|429.*status)" \
-        2>/dev/null; then
-        quota_reason="subscription_rate_limit"
-    # sdk_credit_exhausted: insufficient_quota
-    elif printf '%s\n' "$transcript_text" | grep -qiE \
-        "(insufficient_quota)" \
-        2>/dev/null; then
-        quota_reason="sdk_credit_exhausted"
-    # bedrock_throttle: ThrottlingException / ServiceQuotaExceededException
-    elif printf '%s\n' "$transcript_text" | grep -qE \
-        "(ThrottlingException|ServiceQuotaExceededException)" \
-        2>/dev/null; then
-        quota_reason="bedrock_throttle"
-    # api_billing_error: HTTP 402 (billing, without insufficient_quota already matched above)
-    elif printf '%s\n' "$transcript_text" | grep -qiE \
-        "(HTTP 402|402 Payment Required|payment required|billing)" \
-        2>/dev/null; then
-        quota_reason="api_billing_error"
-    fi
-
-    if [ -z "$quota_reason" ]; then
-        return 0
-    fi
-
-    # Write the checkpoint atomically (temp-then-rename).
-    local paused_at
-    paused_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-
-    local checkpoint_dir
-    checkpoint_dir=$(dirname "$checkpoint_path")
-    mkdir -p "$checkpoint_dir" 2>/dev/null || { echo >&2 "[ERROR] continue-orchestration: failed to create checkpoint directory: ${checkpoint_dir}"; return 0; }
-
-    local tmp_file
-    tmp_file="${checkpoint_path}.tmp.$$"
-
-    if ! jq -n \
-        --arg paused_at "$paused_at" \
-        --arg reason "$quota_reason" \
-        '{
-            paused_at: $paused_at,
-            reset_at: null,
-            reason: $reason,
-            raw_error: ("quota-pattern detected in transcript: " + $reason),
-            in_flight_wu: null,
-            in_flight_phase: null,
-            completed_judges: [],
-            pending_judges: [],
-            stage_artefacts: {}
-        }' > "$tmp_file" 2>/dev/null; then
-        echo >&2 "[ERROR] continue-orchestration: jq failed to write quota checkpoint to ${tmp_file}"
-        rm -f "$tmp_file" 2>/dev/null || true
-        return 0
-    fi
-    if ! mv -f "$tmp_file" "$checkpoint_path" 2>/dev/null; then
-        echo >&2 "[ERROR] continue-orchestration: failed to atomically rename ${tmp_file} to ${checkpoint_path}"
-        rm -f "$tmp_file" 2>/dev/null || true
-    fi
-}
-
 SESSION_NAME="${DEVBENCH_SESSION_NAME:-}"
-
-# Run quota detection before the main in-progress check.
-if [ -n "${WORKSPACE_ROOT:-}" ]; then
-    _detect_and_write_quota_checkpoint "$WORKSPACE_ROOT" "$SESSION_NAME" "$_HOOK_STDIN"
-fi
 
 # Per-session circuit-breaker state file (AC-192-15):
 # When DEVBENCH_SESSION_NAME is set, scope the state file to the named session
 # so concurrent orchestrator sessions maintain independent block counters.
 # When unset, fall back to the shared path for single-session (legacy) behaviour.
-# SESSION_NAME was already assigned above for quota-checkpoint routing.
 if [ -n "$SESSION_NAME" ]; then
     STATE_FILE="/tmp/devbench-stop-hook-state-${SESSION_NAME}.json"
 else

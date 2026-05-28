@@ -12,6 +12,19 @@ since the last release. PR #119 carries every change.
 
 ### Changed (BREAKING)
 
+- **devbench.yaml default changes.** Several built-in defaults changed; workspaces
+  that omit these keys get the new behaviour:
+  - `manifest_amendment.enabled` now defaults **true** (was `false`) -- the Changes
+    Manifest amendment workflow is active unless explicitly disabled.
+  - `validate.check_orphan_path_tokens` now defaults **true** (was `false`) --
+    `validate-backlog` runs Rule 20 (AC/DoD path-coherence) by default. Set `false`
+    to opt out if a pre-existing backlog is not yet compatible.
+  - `task_factory.auto_accept_proposals` now defaults **true** (was `false`); only
+    takes effect when `task_factory.enabled` is `true`.
+  - `merge_strategy` default is now explicitly `squash` at the config layer.
+  - `timeouts.executor` and `timeouts.executor_max_turns` were **removed** -- they
+    were parsed but never consumed (dead config); removing them changes no behaviour.
+
 - **Plugin split: `devbench@devbench` retired in favour of two
   marketplaces / two plugins** (issue #224). The single plugin had a
   structural conflict between the authoring audience
@@ -494,7 +507,7 @@ since the last release. PR #119 carries every change.
   work-unit blocked-and-operator-action-required, work-unit materialised
   / promoted, PR opened / merged, CI failure, orchestrator stop (clean,
   drain, SIGTERM, or crash — always-fire on exit), orchestrator
-  auto-restart, quota pause, quota resume. New `notifications:` yaml
+  auto-restart. New `notifications:` yaml
   block with one independent boolean toggle per event; webhook URL +
   Slack user-id flow through `DEVBENCH_NOTIFICATIONS_SLACK_WEBHOOK_URL`
   and `DEVBENCH_NOTIFICATIONS_SLACK_USER_ID` env vars so credentials
@@ -916,18 +929,6 @@ since the last release. PR #119 carries every change.
   `"crash: <type>: <msg>"`.  Pinned by six cases in
   `tests/test_cli.py::TestLabelStopReason`.
 
-### Removed
-
-- **`quota_handling.notify_on_pause` / `quota_handling.notify_on_resume`
-  yaml fields** (PR #202) — superseded by the unified `notifications:`
-  block above. The dispatcher, `QuotaNotifyConfig` dataclass, and
-  `deliver_notifications` helper were also removed (per CLAUDE.md
-  "Complete Replacement of Superseded Code"). Set
-  `notifications.events.quota_pause: true` and
-  `notifications.events.quota_resume: true` to receive Slack pings on
-  those events; webhook URL and Slack user-id flow through the new
-  env-var pair documented in `docs/slack-notifications.md`.
-
 ### Changed (BREAKING)
 
 - **`haiku` is rejected at config-load for every per-agent field** (#198).
@@ -1104,18 +1105,6 @@ since the last release. PR #119 carries every change.
   label is followed by at least one space, the separator spans the count
   column, and no hard-coded `:<15` / `:<28` format spec remains in
   `cmd_status` (regression guard for future Blocked sub-bucket additions).
-
-### Tests
-
-- **Direct coverage for `quota._http_post`** (issue #203). `_http_post` is
-  the network-level helper that `post_webhook` delegates to (HTTPS / HTTP
-  branch, path + query construction, `try` / `finally` close). Earlier
-  tests stubbed `_http_post` itself rather than driving it; the new
-  `TestHttpPostInternals` class in `tests/test_quota.py` patches
-  `http.client.HTTPSConnection` and `HTTPConnection` with `MagicMock`
-  factories and exercises every branch end-to-end without real network
-  I/O. Closes the only remaining coverage gap and brings
-  `src/devbench/quota.py` to 100% line + branch coverage.
 
 ### Fixed
 

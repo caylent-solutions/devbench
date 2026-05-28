@@ -182,9 +182,9 @@ Every backlog must pass `devbench validate-backlog`. The full rule set is enforc
 17. Dependency-ID format (every `## Dependencies` row's first cell matches `E[A-Z0-9]+(-F\d+)?(-S\d+)?(-T\d+)?`)
 18. Branch uniqueness (no two Tasks derive the same branch name; skipped under single-PR mode)
 19. No placeholder Manifest rows (no active Task -- `in-queue` / `in-progress` / `blocked` -- carries a `TBD` row in its Changes Manifest; terminal statuses are skipped)
-20. No orphan path tokens in AC / DoD (gated by `validate.check_orphan_path_tokens` -- default off; opt in per workspace)
+20. No orphan path tokens in AC / DoD (gated by `validate.check_orphan_path_tokens` -- default on; set `false` to opt out per workspace)
 
-Rules 15-17 were added by E209 to harden the contract; rule 18 was added by E219 to prevent silent branch collisions; rule 19 was added by issue #117 to stop the `changes_manifest` reviewer from passing work units whose authors never replaced the canonical placeholder row. Rule 20 was added after a teardown backlog burned an executor cycle on a spec where AC / DoD prose restated a path that disagreed with the Changes Manifest; it gates on a per-workspace toggle so existing backlogs see no behaviour change until they opt in. Together they catch hand-edited drift that the runtime parser would later silently survive.
+Rules 15-17 were added by E209 to harden the contract; rule 18 was added by E219 to prevent silent branch collisions; rule 19 was added by issue #117 to stop the `changes_manifest` reviewer from passing work units whose authors never replaced the canonical placeholder row. Rule 20 was added after a teardown backlog burned an executor cycle on a spec where AC / DoD prose restated a path that disagreed with the Changes Manifest; it is on by default (set `validate.check_orphan_path_tokens: false` to opt a workspace out). Together they catch hand-edited drift that the runtime parser would later silently survive.
 
 #### No Placeholder Rows Rule (issue #117)
 

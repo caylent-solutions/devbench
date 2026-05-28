@@ -4060,8 +4060,8 @@ class TestValidateNoOrphanPathTokens:
     """Rule 20: backtick-quoted path-shaped tokens in AC / DoD must appear in
     the Task's Changes Manifest after normalisation, OR be marked read-only
     via a trailing ``(ref)`` suffix. Gated by
-    ``RUNTIME_CONFIG.validate.check_orphan_path_tokens``; default OFF so
-    pre-existing backlogs are unaffected.
+    ``RUNTIME_CONFIG.validate.check_orphan_path_tokens``; defaults ON (set
+    ``false`` to opt out).
     """
 
     H = _ValidateRuleHarness
@@ -5905,131 +5905,6 @@ class TestValidateBacklogIgnoresScope:
         )
 
 
-# ---------------------------------------------------------------------------
-# E5-F4-S1-T3: _append_agent_comment with quota audit comment format strings
-# (AC-193-6, AC-193-7 -- verifies BacklogManager correctly persists quota tokens)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.unit
-class TestAppendAgentCommentQuotaFormat:
-    """BacklogManager._append_agent_comment persists [QUOTA_WAITING] and [QUOTA_RESUMED] audit tokens.
-
-    These tests verify that the raw quota audit strings produced by _handle_quota_pause
-    are faithfully written to the WU file by _append_agent_comment, including the
-    exact format of the reason=, reset_at=, and waited_seconds= fields.
-    (spec section 4.5.7, AC-193-6, AC-193-7)
-    """
-
-    def _make_wu_file(self, tmp_path: Path, unit_id: str = "E5-F4-S1-T3") -> Path:
-        """Create a minimal work-unit file with a Comments section."""
-        wu = tmp_path / f"{unit_id}.md"
-        wu.write_text(
-            f"# {unit_id}: Test WU\n\n## Status: in-progress\n\n## Comments\n\n",
-            encoding="utf-8",
-        )
-        return wu
-
-    def test_append_quota_waiting_comment_writes_full_token(self, tmp_path: Path) -> None:
-        """_append_agent_comment faithfully writes [QUOTA_WAITING] reason= reset_at= fields."""
-        import re
-
-        wu = self._make_wu_file(tmp_path)
-        mgr = BacklogManager()
-
-        quota_waiting_msg = "[QUOTA_WAITING] reason=subscription_rate_limit reset_at=2030-06-01T12:00:00+00:00"
-        mgr._append_agent_comment(wu, "orchestrator", quota_waiting_msg)
-
-        content = wu.read_text(encoding="utf-8")
-        assert "[QUOTA_WAITING]" in content, f"[QUOTA_WAITING] missing from: {content}"
-        assert "reason=subscription_rate_limit" in content, f"reason= field missing from: {content}"
-        assert "reset_at=2030-06-01T12:00:00+00:00" in content, f"reset_at= field missing from: {content}"
-        assert "[agent/orchestrator]" in content, f"agent name missing from: {content}"
-        # Timestamp must be present in standard format
-        assert re.search(r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC\]", content), (
-            f"UTC timestamp missing from quota comment: {content}"
-        )
-
-    def test_append_quota_resumed_comment_writes_full_token(self, tmp_path: Path) -> None:
-        """_append_agent_comment faithfully writes [QUOTA_RESUMED] waited_seconds=<N> field."""
-        import re
-
-        wu = self._make_wu_file(tmp_path)
-        mgr = BacklogManager()
-
-        quota_resumed_msg = "[QUOTA_RESUMED] waited_seconds=120"
-        mgr._append_agent_comment(wu, "orchestrator", quota_resumed_msg)
-
-        content = wu.read_text(encoding="utf-8")
-        assert "[QUOTA_RESUMED]" in content, f"[QUOTA_RESUMED] missing from: {content}"
-        assert "waited_seconds=120" in content, f"waited_seconds= field missing from: {content}"
-        assert "[agent/orchestrator]" in content, f"agent name missing from: {content}"
-        # waited_seconds value must be a non-negative integer
-        match = re.search(r"waited_seconds=(\d+)", content)
-        assert match is not None, f"waited_seconds=<int> not found in: {content}"
-        assert int(match.group(1)) == 120, f"waited_seconds value must be 120; got: {match.group(1)}"
-
-    def test_append_quota_waiting_with_unknown_reset_at(self, tmp_path: Path) -> None:
-        """_append_agent_comment correctly persists reset_at=unknown when reset time is absent."""
-        wu = self._make_wu_file(tmp_path)
-        mgr = BacklogManager()
-
-        quota_waiting_msg = "[QUOTA_WAITING] reason=sdk_credit_exhausted reset_at=unknown"
-        mgr._append_agent_comment(wu, "orchestrator", quota_waiting_msg)
-
-        content = wu.read_text(encoding="utf-8")
-        assert "[QUOTA_WAITING]" in content, f"[QUOTA_WAITING] missing from: {content}"
-        assert "reset_at=unknown" in content, f"reset_at=unknown missing from: {content}"
-        assert "reason=sdk_credit_exhausted" in content, f"reason= field missing from: {content}"
-
-    def test_quota_waiting_and_resumed_both_appear_in_sequence(self, tmp_path: Path) -> None:
-        """Both [QUOTA_WAITING] and [QUOTA_RESUMED] comments accumulate in WU file in order.
-
-        When both audit comments are written (wait then resume), both must appear
-        in the file and [QUOTA_WAITING] must appear before [QUOTA_RESUMED].
-        """
-        wu = self._make_wu_file(tmp_path)
-        mgr = BacklogManager()
-
-        waiting_msg = "[QUOTA_WAITING] reason=bedrock_throttle reset_at=2030-01-01T00:00:00+00:00"
-        resumed_msg = "[QUOTA_RESUMED] waited_seconds=45"
-
-        mgr._append_agent_comment(wu, "orchestrator", waiting_msg)
-        mgr._append_agent_comment(wu, "orchestrator", resumed_msg)
-
-        content = wu.read_text(encoding="utf-8")
-        assert "[QUOTA_WAITING]" in content, f"[QUOTA_WAITING] missing from: {content}"
-        assert "[QUOTA_RESUMED]" in content, f"[QUOTA_RESUMED] missing from: {content}"
-        # WAITING must appear before RESUMED
-        waiting_pos = content.index("[QUOTA_WAITING]")
-        resumed_pos = content.index("[QUOTA_RESUMED]")
-        assert waiting_pos < resumed_pos, (
-            f"[QUOTA_WAITING] (pos {waiting_pos}) must precede [QUOTA_RESUMED] (pos {resumed_pos})"
-        )
-
-    @pytest.mark.parametrize(
-        "reason",
-        [
-            "subscription_rate_limit",
-            "sdk_credit_exhausted",
-            "api_billing_error",
-            "bedrock_throttle",
-        ],
-    )
-    def test_append_quota_waiting_all_reason_values(self, tmp_path: Path, reason: str) -> None:
-        """All canonical quota reason values are accepted and preserved by _append_agent_comment."""
-        wu = self._make_wu_file(tmp_path, unit_id=f"E5-T3-{reason}")
-        mgr = BacklogManager()
-
-        msg = f"[QUOTA_WAITING] reason={reason} reset_at=2030-01-01T00:00:00+00:00"
-        mgr._append_agent_comment(wu, "orchestrator", msg)
-
-        content = wu.read_text(encoding="utf-8")
-        assert f"reason={reason}" in content, (
-            f"reason={reason} not preserved in _append_agent_comment output: {content}"
-        )
-
-
 class TestBulkSetStatus:
     """Tests for BacklogManager.bulk_set_status -- spec section 4.7.2, AC-194-5/6/7.
 
@@ -6628,8 +6503,8 @@ class TestAutoRequeueRegressionE5Scenario:
         index = _write_workspace(
             tmp_path,
             rows=[
-                ("E5-F3-S1-T1", "AddQuotaHandlingConfig", "blocked"),
-                ("E5-F3-S1-T4", "QuotaHandlingConfigConstants", "done"),
+                ("E5-F3-S1-T1", "AddSampleConfig", "blocked"),
+                ("E5-F3-S1-T4", "SampleConfigConstants", "done"),
             ],
             files={"E5-F3-S1-T1": src_file, "E5-F3-S1-T4": dep_file},
         )

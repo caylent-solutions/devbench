@@ -22,6 +22,7 @@ from pathlib import Path
 
 from devbench.config_loader import (
     RuntimeConfig,
+    get_effective_merge_strategy,
     get_repo_local_path,
     load_runtime_config,
     resolve_config_path,
@@ -355,6 +356,38 @@ except ValueError:
     raise RuntimeError(
         f"DEVBENCH_MERGE_STRATEGY must be one of: {', '.join(s.value for s in MergeStrategy)}. Got: {_merge_strategy}"
     ) from None
+
+
+def resolve_merge_strategy(repo: str) -> MergeStrategy:
+    """Return the effective ``MergeStrategy`` for *repo*.
+
+    Precedence: ``DEVBENCH_MERGE_STRATEGY`` env var > per-repo
+    ``repos.<org/repo>.merge_strategy`` > top-level ``merge_strategy`` >
+    ``"squash"`` default.  The env override (and the squash default) are already
+    captured in ``MERGE_STRATEGY``; the YAML layers are resolved here per-repo.
+
+    Args:
+        repo: Fully-qualified repository name (e.g. ``'org/repo'``).
+
+    Returns:
+        The resolved :class:`MergeStrategy`.
+
+    Raises:
+        RuntimeError: If a YAML-configured value is not a valid strategy.
+    """
+    if _read_env("DEVBENCH_MERGE_STRATEGY") is not None:
+        return MERGE_STRATEGY
+    configured = get_effective_merge_strategy(repo, RUNTIME_CONFIG)
+    if configured is None:
+        return MERGE_STRATEGY
+    try:
+        return MergeStrategy(configured)
+    except ValueError:
+        raise RuntimeError(
+            f"merge_strategy {configured!r} for repo {repo!r} must be one of: "
+            f"{', '.join(s.value for s in MergeStrategy)}."
+        ) from None
+
 
 UPDATE_SUBMODULE: bool = RUNTIME_CONFIG.git_ops.update_submodule
 SINGLE_BRANCH: str | None = RUNTIME_CONFIG.git_ops.single_branch

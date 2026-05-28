@@ -1,6 +1,6 @@
 # The Changes Manifest amendment workflow
 
-This doc describes the opt-in runtime workflow that lets an executor update a work unit's `## Changes Manifest` during execution, when TDD GREEN exposes a production fix that was not pre-declared. For guidance on when to rely on this workflow versus pre-declaring files, see [docs/authoring-manifests.md](authoring-manifests.md).
+This doc describes the runtime workflow (on by default; set `manifest_amendment.enabled: false` to opt out) that lets an executor update a work unit's `## Changes Manifest` during execution, when TDD GREEN exposes a production fix that was not pre-declared. For guidance on when to rely on this workflow versus pre-declaring files, see [docs/authoring-manifests.md](authoring-manifests.md).
 
 ## Opt in
 

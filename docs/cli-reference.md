@@ -30,7 +30,6 @@ Commands that run a blocking external process (git, tests, judges) propagate the
 - [Backlog write](#backlog-write)
 - [Drain (graceful orchestrator stop)](#drain-graceful-orchestrator-stop)
 - [Named sessions](#named-sessions)
-- [Quota wait-and-resume](#quota-wait-and-resume)
 - [Scope selectors (printer-pages syntax)](#scope-selectors-printer-pages-syntax)
 - [Orchestration and reporting](#orchestration-and-reporting)
 - [Orchestrator helpers (invoked by agents)](#orchestrator-helpers-invoked-by-agents)
@@ -851,75 +850,6 @@ uv run devbench sessions --cleanup
 
 ---
 
-## Quota wait-and-resume
-
-Automated detection and recovery when an Anthropic API rate-limit (HTTP 429), SDK-credit exhaustion (HTTP 402), API billing error, or Bedrock throttle interrupts a running orchestrator. When quota handling is enabled (the default), the orchestrator pauses the in-flight work unit, writes a `quota_pause.json` checkpoint, and resumes autonomously once the reset window passes and a recovery probe confirms the quota is available. Spec source: `spec/devbench-self-improve.md` section 4.5. Issue #193. ADR-24.
-
-The `quota-watcher` subcommand is the operator-facing daemon that drives interactive-mode recovery: it monitors the pause file and re-prompts Claude Code sessions when the quota resets.
-
-### `quota-watcher`
-
-```
-uv run devbench quota-watcher --daemon
-uv run devbench quota-watcher --once
-```
-
-Poll every active session's `quota_pause.json` (and the workspace-root `quota_pause.json` for non-session runs), call the recovery probe when the reset time arrives, and resume interrupted orchestrations.
-
-**Modes:**
-
-- **`devbench quota-watcher --daemon`** -- long-running background loop. Starts an indefinite polling loop with the interval configured by `quota_handling.poll_interval_seconds` (default 60 s; minimum 30 s; maximum 3600 s). On each tick, all known `quota_pause.json` files are scanned. For each pause file whose `reset_at` timestamp has passed, `recovery_probe` is called; if the probe succeeds, the pause file is removed and (for interactive Claude Code sessions) the session is re-prompted via `claude --resume <session-id> -p "<resume-prompt>"`. If the probe still fails, the watcher backs off using the `recovery_probe.backoff` config (initial 30 s, multiplier 2.0, max 600 s, jitter 0.2) and re-polls. Every transition (pause detected, probe success, probe failure, resume) is logged to the orchestrator log. Exit with Ctrl-C (SIGINT) or SIGTERM; both are handled cleanly with rc=0.
-
-- **`devbench quota-watcher --once`** -- single-tick mode. Executes exactly one scan of all known `quota_pause.json` files, calls `recovery_probe` for any whose reset time has passed, removes pause files on success, logs outcomes, and exits. Useful for operator-driven checks, health-check scripts, and unit-test fixtures that need deterministic one-shot behaviour without a persistent process.
-
-**What the watcher scans:**
-
-The watcher looks for `quota_pause.json` in two locations, in order:
-
-1. Per-session paths: `<workspace>/.devbench/sessions/<name>/quota_pause.json` for every session registered in `sessions/registry.json` (multi-session aware; AC-193-16).
-2. Workspace-root path: `<workspace>/.devbench/quota_pause.json` for non-session (default-session) runs.
-
-**Recovery probe:**
-
-When a pause file's reset time arrives, the watcher calls `quota.recovery_probe(timeout_seconds=<config>)`, which sends a minimal 1-token completion to the Anthropic API. A successful probe confirms quota is available and triggers resume. A failed probe (still throttled) increments the backoff counter and re-schedules the next check. The probe respects `quota_handling.recovery_probe.request_size_tokens`, `timeout_seconds`, and the full `backoff` configuration from `devbench.yaml` (AC-193-18).
-
-**Interactive-mode resume:**
-
-For sessions started in interactive Claude Code mode (detected via session metadata), a successful probe triggers re-prompting via `claude --resume <session-id> -p "<resume-prompt>"` to wake the paused Claude Code instance (AC-193-14).
-
-**Exit codes:**
-
-| Command | rc=0 | rc!=0 |
-|---------|------|-------|
-| `quota-watcher --daemon` | Clean exit (SIGINT/SIGTERM received). | Startup errors (unset env vars, invalid config) exit immediately with an actionable message. |
-| `quota-watcher --once` | Scan complete (zero or more pauses found/resolved). | Startup errors exit immediately. |
-| Either (flag omitted) | -- | rc=2 (argument-parse error): exactly one of `--daemon` or `--once` is required. |
-
-**Worked examples:**
-
-```bash
-# Run as a long-lived background daemon (typical usage alongside devbench start):
-uv run devbench quota-watcher --daemon &
-
-# Run a single scan to check for any pending quota pauses right now:
-uv run devbench quota-watcher --once
-# -> [QUOTA_PROBE] session=default: reset_at=2026-05-14T14:00:00Z; probe succeeded; resumed.
-# -- or --
-# -> no quota pauses detected.
-
-# Check quota status via devbench status (shows QUOTA WAIT banner when paused):
-uv run devbench status
-# -> QUOTA WAIT: reset_at=2026-05-14T14:00:00Z (in 4m 32s) reason=HTTP 429 subscription_rate_limit
-
-# Daemon auto-resumes the orchestrator when quota recovers -- no operator action needed.
-```
-
-**Configuration (quota_handling section in devbench.yaml):**
-
-The full `quota_handling` YAML schema governs detection modes, wait limits, resume strategy, and notification webhooks. See [`docs/quota-handling.md`](quota-handling.md) for the complete operator playbook and sample configs. The `devbench.yaml` section is optional; all fields default to safe values when omitted.
-
----
-
 ## Scope selectors (printer-pages syntax)
 
 The `--include` and `--exclude` flags on `devbench start`, `devbench status`, `devbench report`, and `devbench next` all accept the same printer-pages-style token syntax described here. `devbench scope set` uses the same parser.
@@ -1225,7 +1155,7 @@ Self-resolving integration: `git-ops` invokes the same detection before every co
 
 ## Amendment workflow
 
-See [manifest-amendments.md](manifest-amendments.md) and [ADR-02](adr/02-manifest-amendment-workflow.md) for the full design. This workflow is opt-in: enable with `manifest_amendment.enabled: true` in `backlog/config/devbench.yaml`.
+See [manifest-amendments.md](manifest-amendments.md) and [ADR-02](adr/02-manifest-amendment-workflow.md) for the full design. This workflow is on by default; set `manifest_amendment.enabled: false` in `backlog/config/devbench.yaml` to opt out.
 
 ### `request-amendment`
 

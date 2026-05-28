@@ -481,9 +481,10 @@ repos:
 # Top-level: defaults for all repos
 merge_strategy: squash
 max_executor_retries: 10           # max retries before marking blocked
-log_file: logs/orchestrator.log    # optional: shared log path for setup_logging
-                                   #   writer + report/hook-tail readers.
-                                   #   Resolved relative to DEVBENCH_WORKSPACE_ROOT
+log_file: logs/orchestrator.log    # optional: shared aggregate log path for
+                                   #   setup_logging writer + report/hook-tail
+                                   #   readers. Default when unset. Resolved
+                                   #   relative to DEVBENCH_WORKSPACE_ROOT
                                    #   when not absolute. DEVBENCH_LOG_FILE env wins.
 allowed_orgs:                      # optional: restrict to specific GH orgs
   - caylent-solutions
@@ -520,8 +521,6 @@ timeouts:
   security_fetch: 120
   llm: 300
   command: 120
-  executor: 1800
-  executor_max_turns: 100
   orchestrator_poll_interval: 10
   github_check: 600
 

@@ -7,7 +7,6 @@ Covers:
 - AC-FUNC-004: help output includes env-var tokens for report-session and watch-live
 - AC-FUNC-005: make -n start resolves unchanged (uv run python -m devbench.cli start)
 - AC-CYCLE-001: end-to-end invocation via subprocess asserting observed CLI behaviour
-- AC-193-1: test-coverage-new gate includes devbench.quota at 100% line+branch
 """
 
 from __future__ import annotations

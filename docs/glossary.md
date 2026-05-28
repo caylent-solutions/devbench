@@ -19,7 +19,6 @@ see the [Glossary section in docs/architecture.md](architecture.md#12-glossary).
 | `scope` | lower-case | A subset of the backlog selected via printer-pages-style `--include` / `--exclude` tokens (e.g., `E1,E3-E5`). Persisted across commands in `<workspace>/.devbench/sessions/<name>/scope.json`. |
 | `drain` | lower-case | An operator-initiated graceful stop request. The orchestrator finishes the current work unit, detects the drain marker between work units, and exits cleanly. Written by `devbench drain`; consumed on orchestrator exit. |
 | `session` | lower-case | A named orchestrator process with its own scope, drain marker, log file, report cache, and PID file under `<workspace>/.devbench/sessions/<name>/`. The implicit session name when `--name` is omitted is `default`. |
-| `quota wait` | two words, lower-case | An involuntary orchestrator pause due to Anthropic API quota exhaustion. The orchestrator waits for the quota-reset epoch, then resumes automatically without operator intervention. |
 | `marketplace plugin` | two words, lower-case | The `devbench` Claude Code plugin published with a manifest sufficient for discovery via `claude plugin marketplace`. Hosts the four onboarding skills. |
 | `skill` | lower-case | A single conversational capability inside the marketplace plugin (e.g., `create-spec`, `spec-to-backlog`, `bootstrap-environment`, `configure-devbench`). |
 | `audit comment` | two words, lower-case | A timestamped row appended to a work-unit file's `## Comments` section. Used by classifiers, reports, and the done-gate. Format: `[YYYY-MM-DD HH:MM UTC] [author] [TAG] message`. |
@@ -61,19 +60,12 @@ and "session id" interchangeably -- they refer to different things:
   identifier stamped into every audit log event, used by `hook-tail` for
   filtering and by reports for per-session aggregation.
 
-### quota wait vs. quota-wait
-
-Use **quota wait** (two words, no hyphen) when referring to the feature in prose.
-The hyphenated form `quota-wait` appears in YAML keys (e.g., `quota_handling:`)
-and in compound modifiers (e.g., `quota-wait protocol`). The canonical term in
-the glossary and spec is **quota wait**.
-
 ---
 
 ## See also
 
 - [docs/architecture.md -- Section 12: Glossary](architecture.md#12-glossary) -- broader architectural term definitions
-- [docs/zero-to-ready.md](zero-to-ready.md) -- operator walkthrough covering draft, scope, drain, session, and quota wait
+- [docs/zero-to-ready.md](zero-to-ready.md) -- operator walkthrough covering draft, scope, drain, and session
 - [docs/cli-reference.md](cli-reference.md) -- full CLI reference with all commands and flags
 - [docs/onboarding.md](onboarding.md) -- chained-skill workflow using marketplace plugin and skills
-- [docs/devbench-yaml-reference.md](devbench-yaml-reference.md) -- configuration reference including `backlog.default_status_for_new_work_units` and `quota_handling`
+- [docs/devbench-yaml-reference.md](devbench-yaml-reference.md) -- configuration reference including `backlog.default_status_for_new_work_units`

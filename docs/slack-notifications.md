@@ -2,7 +2,7 @@
 
 devbench can send a Slack message on every interesting lifecycle event —
 a work unit finishes, a task gets blocked, a PR is opened, the
-orchestrator stops, quota recovers, and so on. Each event is toggled
+orchestrator stops, and so on. Each event is toggled
 independently in `devbench.yaml`, so you only get pinged on the things
 you actually care about.
 
@@ -119,8 +119,7 @@ Edit `backlog/config/devbench.yaml` in your workspace and add the
 listed defaults to `false`.
 
 Example: a typical operator wants to know when a task finishes, when
-something needs human attention, when the orchestrator stops, and
-when quota pauses or resumes:
+something needs human attention, and when the orchestrator stops:
 
 ```yaml
 notifications:
@@ -129,8 +128,6 @@ notifications:
     work_unit_done: true
     work_unit_blocked_operator: true
     orchestrator_stop: true
-    quota_pause: true
-    quota_resume: true
   slack:
     enabled: true
     # webhook_url left unset; the env var supplies it.
@@ -180,8 +177,6 @@ Every event toggle, when it fires, and what's in the payload:
 | `ci_pass` | CI on the auto-finalize batch PR turned GREEN — explicit signal that the PR is ready for manual merge under `auto_merge: false` (#219). **Default off** so existing workspaces stay silent on upgrade. | Task id (most-recent active task or symbolic `finalize`), repo, PR URL. |
 | `orchestrator_stop` | The orchestrator loop exits — clean, drain, SIGTERM, terminal-marker (#218), or uncaught exception. **Always fires** when notifications.enabled and slack.enabled are true (best-effort try/finally at the top of `cmd_start`). | Reason (post-#217 includes the SDK's `ResultMessage.result` text; post-#218 fires within seconds of the terminal marker via the `[ORCHESTRATOR_TERMINAL_EXIT]` audit), in-flight WU id (when one was active). |
 | `orchestrator_auto_restart` | The orchestrator exited with code 42 (RUNTIME_DEGRADATION-only NO_ACTIONABLE) and the Makefile loop is restarting. | List of blocked task ids (truncated at 5). |
-| `quota_pause` | The orchestrator detects a quota signal and starts the wait. | Reason, reset_at timestamp, paused_at timestamp. |
-| `quota_resume` | The recovery probe succeeded; the orchestrator is resuming. | Resumed_at, waited_seconds. |
 
 ## Authentication & secret hygiene
 
@@ -239,11 +234,5 @@ A response of `ok` means the URL is good. Anything else (`no_team`,
 
 ## Cross-references
 
-- [docs/quota-handling.md](quota-handling.md) — the quota pause /
-  resume lifecycle the `quota_pause` / `quota_resume` events fire
-  on top of.
 - [docs/devbench-yaml-reference.md](devbench-yaml-reference.md) —
   full reference for every `notifications:` field.
-- ADR-24 (`docs/adr/24-quota-wait-and-resume.md`) — the original
-  pause/resume design that introduced the notification webhooks
-  (PR #202 unified the dispatch path across every lifecycle event).

@@ -77,6 +77,10 @@ def _resolve_log_file() -> Path:
         if workspace:
             return Path(workspace) / configured_path
         return configured_path
+    # Unset default: the shared, workspace-local aggregate log. Per-session
+    # isolation is provided additionally by the session FileHandler below
+    # (attached when DEVBENCH_SESSION_NAME is set); cli._resolve_log_file_path
+    # mirrors this default exactly.
     if workspace:
         return Path(workspace) / DEFAULT_LOG_SUBDIR / DEFAULT_LOG_FILENAME
     return Path(_DEFAULT_LOG_FILE)
@@ -167,8 +171,10 @@ def setup_logging(level: int | None = None) -> Path:
     root_logger.addHandler(file_handler)
 
     # Per-session file handler (spec 4.4.4, AC-192-14) -- attached in addition
-    # to the aggregate handler so both logs receive the same messages.
-    if session_log_file is not None:
+    # to the aggregate handler so both logs receive the same messages. Skipped
+    # in the edge case where an explicit log_file points at the same path as the
+    # session log, to avoid attaching two handlers to one file (duplicate lines).
+    if session_log_file is not None and session_log_file != log_file:
         session_log_file.parent.mkdir(parents=True, exist_ok=True)
         session_handler = logging.FileHandler(str(session_log_file), encoding="utf-8")
         session_handler.setLevel(level)

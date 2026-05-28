@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-AGENTS_DIR = Path(__file__).parent.parent.parent / "plugin" / "devbench" / "agents"
+AGENTS_DIR = Path(__file__).parent.parent.parent / "plugin" / "devbench-orchestrate" / "agents"
 
 REVIEW_TEAM_DIR = AGENTS_DIR / "review_team"
 
@@ -144,12 +144,19 @@ class TestNoStaleFlatAgentPaths:
 
 
 @pytest.mark.unit
-class TestReviewTeamModelUpgrade:
-    """AC-11: All four review_team agents must use model: sonnet."""
+class TestReviewTeamModelDefault:
+    """ADR-25: All four review_team agents default to model: opus (judges).
+
+    The four review_team agents are LLM-as-judge agents whose verdicts gate
+    a task's done state. A bad verdict costs more than the inference savings,
+    so the frontmatter pins them to opus; operators with opus quota pressure
+    can drop individual judges to sonnet via the workspace's ``agents:``
+    block (ADR-25).
+    """
 
     @pytest.mark.parametrize("agent_filename", REVIEW_TEAM_AGENTS)
-    def test_review_team_agent_uses_sonnet_model(self, agent_filename: str) -> None:
-        """AC-11: Each review_team agent must declare model: sonnet in frontmatter."""
+    def test_review_team_agent_uses_opus_model(self, agent_filename: str) -> None:
+        """ADR-25: Each review_team agent must declare model: opus in frontmatter."""
         agent_path = REVIEW_TEAM_DIR / agent_filename
         assert agent_path.exists(), f"Agent file not found: {agent_path}"
         content = agent_path.read_text()
@@ -163,8 +170,9 @@ class TestReviewTeamModelUpgrade:
         assert end_idx is not None, f"{agent_filename} frontmatter closing --- not found"
         frontmatter = "\n".join(lines[1:end_idx])
 
-        assert re.search(r"^model:\s*sonnet\s*$", frontmatter, re.MULTILINE), (
-            f"{agent_filename} must declare 'model: sonnet' in frontmatter.\nFound frontmatter:\n{frontmatter}"
+        assert re.search(r"^model:\s*opus\s*$", frontmatter, re.MULTILINE), (
+            f"{agent_filename} must declare 'model: opus' in frontmatter (ADR-25 default).\n"
+            f"Found frontmatter:\n{frontmatter}"
         )
 
 
@@ -336,7 +344,7 @@ class TestExecutorValidationGateEscalation:
         section_body = content[heading_pos:]
         assert "test -f" in section_body and ".devbench/proposals/" in section_body, (
             "The BUG ESCALATION section must instruct the agent to `test -f "
-            "$JUDGE_WORKSPACE_ROOT/.devbench/proposals/<id>.json` after write-proposal; "
+            "$DEVBENCH_WORKSPACE_ROOT/.devbench/proposals/<id>.json` after write-proposal; "
             "the orchestrate SKILL branches on file existence, so a missing file silently "
             "suppresses task-factory."
         )
@@ -346,7 +354,9 @@ class TestExecutorValidationGateEscalation:
 class TestSkillValidationGateEscalationBranch:
     """Orchestrate SKILL must have a step 4a branch that fires task-factory on executor-emitted proposals."""
 
-    _SKILL_PATH = Path(__file__).parent.parent.parent / "plugin" / "devbench" / "skills" / "orchestrate" / "SKILL.md"
+    _SKILL_PATH = (
+        Path(__file__).parent.parent.parent / "plugin" / "devbench-orchestrate" / "skills" / "orchestrate" / "SKILL.md"
+    )
 
     def test_skill_file_exists(self) -> None:
         assert self._SKILL_PATH.exists(), f"orchestrate/SKILL.md not found at {self._SKILL_PATH}"
@@ -390,7 +400,9 @@ class TestSkillSubagentTextIsDiagnostic:
     stop-hook circuit breaker.
     """
 
-    _SKILL_PATH = Path(__file__).parent.parent.parent / "plugin" / "devbench" / "skills" / "orchestrate" / "SKILL.md"
+    _SKILL_PATH = (
+        Path(__file__).parent.parent.parent / "plugin" / "devbench-orchestrate" / "skills" / "orchestrate" / "SKILL.md"
+    )
 
     def test_skill_declares_subagent_text_is_diagnostic(self) -> None:
         """SKILL must declare that subagent text is not control flow."""
@@ -716,4 +728,59 @@ class TestReviewJudgesUseGetDiffForScope:
         assert "ADR-12" in content, f"{judge_path.name} must reference ADR-12 so readers can trace the rationale."
         assert "AUTHORITATIVE" in content, (
             f"{judge_path.name} must state that `devbench get-diff` is the AUTHORITATIVE scope source."
+        )
+
+
+def _collect_all_agent_md_files() -> list[Path]:
+    """Return all .md files under plugin/devbench-orchestrate/agents/ recursively.
+
+    Issue #224: agents all live in the orchestrate plugin after the split.
+    """
+    agents_dir = Path(__file__).parent.parent.parent / "plugin" / "devbench-orchestrate" / "agents"
+    return sorted(agents_dir.rglob("*.md"))
+
+
+def _extract_frontmatter_model(content: str) -> str | None:
+    """Extract the 'model:' value from YAML frontmatter, or None if absent."""
+    lines = content.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        stripped = line.strip()
+        if stripped.startswith("model:"):
+            return stripped[len("model:") :].strip()
+    return None
+
+
+_ALL_AGENT_MD_FILES = _collect_all_agent_md_files()
+
+
+@pytest.mark.unit
+class TestNoAgentFrontmatterPinsHaiku:
+    """AC-198-6: No shipped agent .md file may declare 'model: haiku' in its frontmatter.
+
+    This is a future-drift guard: if anyone re-pins a frontmatter model
+    default to haiku, this test fails immediately (caylent-solutions/devbench#198).
+    """
+
+    @pytest.mark.parametrize(
+        "agent_path",
+        _ALL_AGENT_MD_FILES,
+        ids=lambda p: str(p.name),
+    )
+    def test_agent_frontmatter_model_is_not_haiku(self, agent_path: Path) -> None:
+        """AC-198-6: agent frontmatter 'model:' must not be haiku (case-insensitive)."""
+        content = agent_path.read_text(encoding="utf-8")
+        model_value = _extract_frontmatter_model(content)
+        if model_value is None:
+            # No model line in frontmatter -- acceptable, uses SDK default.
+            return
+        assert "haiku" not in model_value.lower(), (
+            f"{agent_path.name}: frontmatter declares 'model: {model_value}'. "
+            "Haiku is rejected at config-load time (caylent-solutions/devbench#198); "
+            "any agent pinned to haiku will cause config-load failure when the "
+            "operator's YAML explicitly selects it, and risks SDK Agent-tool "
+            "drops under load. Change to 'sonnet' or 'opus'."
         )

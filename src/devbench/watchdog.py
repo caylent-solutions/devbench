@@ -1,4 +1,4 @@
-"""Watchdog for detecting stuck `/devbench:orchestrate` loops.
+"""Watchdog for detecting stuck `/devbench-orchestrate:orchestrate` loops.
 
 Polls two on-disk signals:
 

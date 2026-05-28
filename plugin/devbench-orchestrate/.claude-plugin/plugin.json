@@ -1,0 +1,17 @@
+{
+  "name": "devbench-orchestrate",
+  "description": "Autonomous backlog execution with LLM-as-judge review, guarded hooks, and the orchestrate skill. Ships the executor + review-team agents and the PreToolUse guard hooks that scope each agent's authority during the execution phase. Use during autonomous execution; pair with devbench-authoring during the planning phase.",
+  "version": "0.4.0",
+  "keywords": [
+    "devbench",
+    "backlog",
+    "orchestration",
+    "llm-as-judge",
+    "code-review",
+    "tdd",
+    "automation"
+  ],
+  "repository": "https://github.com/caylent-solutions/devbench",
+  "license": "MIT",
+  "homepage": "https://github.com/caylent-solutions/devbench"
+}

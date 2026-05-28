@@ -9,14 +9,24 @@ assert the exit code + stderr contents for each failure mode.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
 import pytest
 
 HOOK_PATH = (
-    Path(__file__).parent.parent.parent / "plugin" / "devbench" / "scripts" / "guard-verdict-format.sh"
+    Path(__file__).parent.parent.parent / "plugin" / "devbench-orchestrate" / "scripts" / "guard-verdict-format.sh"
 ).resolve()
+
+
+def _clean_env() -> dict[str, str]:
+    """Return the process env with legacy DEVBENCH_WORKSPACE_ROOT and DEVBENCH_LOG_FILE stripped.
+
+    _hook_lib.sh rejects legacy JUDGE_* hook vars (AC-197-9). Tests that source
+    _hook_lib.sh must not inherit those vars from the pytest process environment.
+    """
+    return {k: v for k, v in os.environ.items() if k not in ("DEVBENCH_WORKSPACE_ROOT", "DEVBENCH_LOG_FILE")}
 
 
 def _run(command: str) -> subprocess.CompletedProcess[str]:
@@ -28,6 +38,7 @@ def _run(command: str) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         text=True,
         check=False,
+        env=_clean_env(),
     )
 
 

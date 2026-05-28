@@ -46,6 +46,7 @@ import logging
 import os
 import re
 import sys
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, tzinfo
 from itertools import pairwise
@@ -53,7 +54,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from devbench.backlog.parser import BacklogParser
-from devbench.backlog.work_unit import WorkUnitStatus, WorkUnitType
+from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
 from devbench.config import (
     BACKLOG_INDEX,
     BACKLOG_ROOT,
@@ -63,12 +64,11 @@ from devbench.config import (
     REPORT_CACHE_WRITE_1HR_MULTIPLIER,
     REPORT_CACHE_WRITE_5MIN_MULTIPLIER,
     REPORT_DATA_RESIDENCY_MULTIPLIER,
+    REPORT_DEFAULT_MODEL_RATES,
     REPORT_DISPLAY_TIMEZONE,
     REPORT_FAST_MODE_MULTIPLIER,
+    REPORT_MODEL_RATES,
     STOP_HOOK_WINDOW_SECONDS,
-    TOKEN_COST_DISCOUNT,
-    TOKEN_COST_PER_M_INPUT,
-    TOKEN_COST_PER_M_OUTPUT,
     WORKSPACE_ROOT,
 )
 from devbench.constants import (
@@ -83,6 +83,7 @@ from devbench.constants import (
     TOKENS_PER_MILLION,
 )
 from devbench.reporting.event_index import EventIndex
+from devbench.scope import ScopeFilter
 
 _log = logging.getLogger("devbench.reporting.report")
 
@@ -179,9 +180,18 @@ class WindowStats:
     est_completion_at: datetime | None = None
     # Issue #157: ETA breakdown so the renderer can print
     # ``~5.4 h (active 4 + blocked-recovery 60 + blocked-auto 27 at 5.6 min/task)``.
+    # Issue #214: the renderer caps column widths and wraps long
+    # breakdowns at " + " boundaries so this value never blows out the
+    # table layout, even when all four buckets contribute.
     eta_active: int = 0
     eta_blocked_recovery: int = 0
     eta_blocked_auto: int = 0
+    # Issue #183 follow-up: RUNTIME_DEGRADATION tasks auto-recover when
+    # the orchestrator restarts (cmd_start exit-42 + Makefile while-loop).
+    # They belong in the ETA denominator alongside the other auto-recover
+    # buckets so the projection reflects work that WILL get done without
+    # operator intervention.
+    eta_blocked_runtime_degradation: int = 0
 
     @property
     def total_tokens(self) -> int:
@@ -491,8 +501,8 @@ def _role_for_entry(entry: dict) -> str:
     """Return the per-role bucket for one transcript entry (issue #123).
 
     Each Claude Code transcript message carries an ``attributionAgent`` field
-    naming the active agent (e.g. ``"devbench:executor"``,
-    ``"devbench:code-reviewer"``). Messages emitted by the outer orchestrator
+    naming the active agent (e.g. ``"devbench-orchestrate:executor"``,
+    ``"devbench-orchestrate:code-reviewer"``). Messages emitted by the outer orchestrator
     loop have no attributionAgent and are bucketed as ``orchestrator``.
     Subagent attributions are stripped of the ``devbench:`` prefix and
     normalised to underscores so the buckets match the canonical role names
@@ -537,6 +547,19 @@ def _parse_transcript_metrics_by_role(transcript_dir: Path | None, window_start:
             acc = by_role.setdefault(role, _empty_totals_acc())
             _accumulate_transcript_message(entry.get("message"), acc, seen_ids)
     return {role: HookLogTotals(**acc) for role, acc in by_role.items()}
+
+
+def _combine_many(parts: Iterable[HookLogTotals]) -> HookLogTotals:
+    """Sum any iterable of ``HookLogTotals`` into one (empty -> zero).
+
+    Issue #223 helper: per-model aggregation produces N buckets that some
+    downstream renderers still want as a single roll-up; reuse the
+    pairwise ``_combine_totals`` here so the field-list stays in one place.
+    """
+    aggregate = HookLogTotals()
+    for part in parts:
+        aggregate = _combine_totals(aggregate, part)
+    return aggregate
 
 
 def _combine_totals(a: HookLogTotals, b: HookLogTotals) -> HookLogTotals:
@@ -736,6 +759,97 @@ def _recent_pace_minutes(
     return sum(durations) / len(durations)
 
 
+def _resolve_rates_for_model(model_id: str) -> tuple[float, float, float, float, float, float]:
+    """Return ``(input_rate, output_rate, cache_read_mult, cache_5m_mult, cache_1h_mult, correction)``.
+
+    Issue #223 lookup: per-model rates from ``REPORT_MODEL_RATES`` win for
+    the four scalar pricing fields; per-model cache multiplier overrides
+    (when set) win, otherwise the top-level ``REPORT_CACHE_*_MULTIPLIER``
+    defaults apply.  An unknown ``model_id`` falls back to
+    ``REPORT_DEFAULT_MODEL_RATES`` -- the canonical pricing for the
+    ``"<unknown>"`` aggregation bucket.
+    """
+    rates = REPORT_MODEL_RATES.get(model_id, REPORT_DEFAULT_MODEL_RATES)
+    cache_read = (
+        rates.cache_read_multiplier if rates.cache_read_multiplier is not None else REPORT_CACHE_READ_MULTIPLIER
+    )
+    cache_5m = (
+        rates.cache_write_5min_multiplier
+        if rates.cache_write_5min_multiplier is not None
+        else REPORT_CACHE_WRITE_5MIN_MULTIPLIER
+    )
+    cache_1h = (
+        rates.cache_write_1hr_multiplier
+        if rates.cache_write_1hr_multiplier is not None
+        else REPORT_CACHE_WRITE_1HR_MULTIPLIER
+    )
+    return (rates.input, rates.output, cache_read, cache_5m, cache_1h, rates.correction_factor)
+
+
+def _compute_cost_by_model(
+    totals_by_model: dict[str, HookLogTotals],
+    *,
+    data_residency_multiplier: float = 1.0,
+    fast_mode_multiplier: float = 1.0,
+) -> CostBreakdown:
+    """Sum per-model cost across every model id observed in the window (issue #223).
+
+    For each model id, look up its rates via ``_resolve_rates_for_model``
+    and price that bucket via ``_compute_cost``.  Each model's contribution
+    is multiplied by its own ``correction_factor`` BEFORE being added to
+    the aggregate so per-model contract corrections compose cleanly.
+
+    Returns a single aggregate ``CostBreakdown`` whose per-bucket totals
+    sum to ``total_cost`` (the existing invariant ``_compute_cost``'s
+    callers rely on).  The ``"<unknown>"`` bucket -- transcript messages
+    with no ``model`` field, plus model ids not present in
+    ``REPORT_MODEL_RATES`` -- is priced against
+    ``REPORT_DEFAULT_MODEL_RATES``.
+
+    The two side-channel multipliers (data-residency and fast-mode) apply
+    inside each per-model call, so a residency premium on a Sonnet bucket
+    multiplies the Sonnet input rate, not the Opus input rate.
+    """
+    aggregate = CostBreakdown(
+        input_cost=0.0,
+        output_cost=0.0,
+        cache_read_cost=0.0,
+        cache_write_5m_cost=0.0,
+        cache_write_1h_cost=0.0,
+        total_cost=0.0,
+    )
+    for model_id, totals in totals_by_model.items():
+        input_rate, output_rate, cache_read, cache_5m, cache_1h, correction = _resolve_rates_for_model(model_id)
+        bucket = _compute_cost(
+            totals,
+            input_rate,
+            output_rate,
+            cache_read,
+            cache_5m,
+            cache_1h,
+            data_residency_multiplier=data_residency_multiplier,
+            fast_mode_multiplier=fast_mode_multiplier,
+        )
+        if correction != 1.0:
+            bucket = CostBreakdown(
+                input_cost=bucket.input_cost * correction,
+                output_cost=bucket.output_cost * correction,
+                cache_read_cost=bucket.cache_read_cost * correction,
+                cache_write_5m_cost=bucket.cache_write_5m_cost * correction,
+                cache_write_1h_cost=bucket.cache_write_1h_cost * correction,
+                total_cost=bucket.total_cost * correction,
+            )
+        aggregate = CostBreakdown(
+            input_cost=aggregate.input_cost + bucket.input_cost,
+            output_cost=aggregate.output_cost + bucket.output_cost,
+            cache_read_cost=aggregate.cache_read_cost + bucket.cache_read_cost,
+            cache_write_5m_cost=aggregate.cache_write_5m_cost + bucket.cache_write_5m_cost,
+            cache_write_1h_cost=aggregate.cache_write_1h_cost + bucket.cache_write_1h_cost,
+            total_cost=aggregate.total_cost + bucket.total_cost,
+        )
+    return aggregate
+
+
 def _recent_per_task_cost(
     log_path: Path,
     done_times: dict[str, datetime],
@@ -777,30 +891,66 @@ def _recent_per_task_cost(
     hook_log_path = _hook_log_path(log_path)
     if event_index is not None:
         transcript_dir_indexed = _resolve_transcript_dir(event_index, hook_log_path)
-        totals_hook = HookLogTotals(**event_index.aggregate_hook_window(hook_log_path, earliest_progress))
-        totals_transcript = HookLogTotals(
-            **event_index.aggregate_transcript_window(transcript_dir_indexed, earliest_progress)
+        totals_hook_by_model = _per_model_totals_from_aggregator(
+            event_index.aggregate_hook_window_by_model, hook_log_path, earliest_progress
+        )
+        totals_transcript_by_model = _per_model_totals_from_aggregator(
+            event_index.aggregate_transcript_window_by_model, transcript_dir_indexed, earliest_progress
         )
     else:
+        # Non-indexed fallback: parser path doesn't yet bucket by model, so
+        # every entry collapses to the ``"<unknown>"`` bucket priced against
+        # ``REPORT_DEFAULT_MODEL_RATES``.  The indexed path (the normal
+        # case for any real workspace) preserves per-model attribution.
         totals_hook = _parse_hook_log_metrics(log_path, earliest_progress)
         transcript_dir = _discover_transcript_dir(hook_log_path)
         totals_transcript = _parse_transcript_metrics(transcript_dir, earliest_progress)
-    totals = _combine_totals(totals_hook, totals_transcript)
-
-    rate_factor = 1.0 - TOKEN_COST_DISCOUNT
-    cost = _compute_cost(
-        totals,
-        TOKEN_COST_PER_M_INPUT * rate_factor,
-        TOKEN_COST_PER_M_OUTPUT * rate_factor,
-        REPORT_CACHE_READ_MULTIPLIER,
-        REPORT_CACHE_WRITE_5MIN_MULTIPLIER,
-        REPORT_CACHE_WRITE_1HR_MULTIPLIER,
+        totals_hook_by_model = {"<unknown>": totals_hook}
+        totals_transcript_by_model = {"<unknown>": totals_transcript}
+    totals_by_model = _merge_totals_by_model(totals_hook_by_model, totals_transcript_by_model)
+    cost = _compute_cost_by_model(
+        totals_by_model,
         data_residency_multiplier=REPORT_DATA_RESIDENCY_MULTIPLIER,
         fast_mode_multiplier=REPORT_FAST_MODE_MULTIPLIER,
     )
-    if n <= 0:
-        return None
     return cost.total_cost / n
+
+
+def _per_model_totals_from_aggregator(
+    aggregator: Callable[..., dict[str, dict[str, int]]],
+    source: object,
+    window_start: datetime,
+) -> dict[str, HookLogTotals]:
+    """Wrap an event-index per-model aggregator result into ``HookLogTotals``.
+
+    Issue #223.  The aggregator returns ``{model_id -> totals_dict}``;
+    this helper materialises each ``totals_dict`` as a frozen
+    ``HookLogTotals``.  Empty source -> empty dict (callers iterate so
+    no cost is contributed, which matches the pre-#223 single-bucket
+    "no rows" semantic).
+    """
+    raw = aggregator(source, window_start)
+    return {model_id: HookLogTotals(**totals_dict) for model_id, totals_dict in raw.items()}
+
+
+def _merge_totals_by_model(
+    *per_model_buckets: dict[str, HookLogTotals],
+) -> dict[str, HookLogTotals]:
+    """Sum per-model totals across one or more source buckets.
+
+    Used to combine ``hook_entries`` and ``transcript_entries`` per-model
+    aggregates into a single ``{model_id -> HookLogTotals}`` view that
+    feeds ``_compute_cost_by_model``.  Each model id contributes its
+    summed ``HookLogTotals`` across every source bucket it appears in.
+    """
+    merged: dict[str, HookLogTotals] = {}
+    for bucket in per_model_buckets:
+        for model_id, totals in bucket.items():
+            if model_id in merged:
+                merged[model_id] = _combine_totals(merged[model_id], totals)
+            else:
+                merged[model_id] = totals
+    return merged
 
 
 def _compute_window_stats(
@@ -812,6 +962,7 @@ def _compute_window_stats(
     tasks_active: int,
     tasks_blocked_recovery: int = 0,
     tasks_blocked_auto: int = 0,
+    tasks_blocked_runtime_degradation: int = 0,
     *,
     event_index: EventIndex | None = None,
     recent_per_task_cost: float | None = None,
@@ -819,11 +970,14 @@ def _compute_window_stats(
 ) -> WindowStats:
     """Compute all time-windowed statistics for a single window.
 
-    Issue #157: the ETA denominator now includes blocked tasks that
-    devbench will recover on its own -- ``tasks_blocked_recovery``
-    (AWAITING_AMENDMENT_RECOVERY + AWAITING_DEPENDENCY) and ``tasks_blocked_auto``
-    (AUTO_CLEARING_VIA_PROPOSAL) -- in addition to ``tasks_active``.
-    The operator-attention bucket stays excluded since those represent
+    Issue #157 + issue #183 follow-up: the ETA denominator includes
+    blocked tasks that devbench will recover on its own --
+    ``tasks_blocked_recovery`` (AWAITING_AMENDMENT_RECOVERY +
+    AWAITING_DEPENDENCY), ``tasks_blocked_auto`` (AUTO_CLEARING_VIA_PROPOSAL),
+    and ``tasks_blocked_runtime_degradation`` (RUNTIME_DEGRADATION --
+    `make start`'s auto-restart loop clears these without operator
+    intervention) -- in addition to ``tasks_active``. The
+    operator-attention bucket stays excluded since those represent
     genuine halts with unbounded ETA. When the recent-pace window has
     fewer than ``MIN_PACE_SAMPLES`` completed tasks the pace fallback
     path is taken; ``est_hours`` reads zero (renderer shows "n/a").
@@ -855,7 +1009,7 @@ def _compute_window_stats(
     recent_pace_minutes: float | None = _recent_pace_minutes(done_times, progress_times, RECENT_PACE_TASKS)
 
     pace_for_projection = recent_pace_minutes if recent_pace_minutes is not None else avg_minutes
-    eta_task_count = tasks_active + tasks_blocked_recovery + tasks_blocked_auto
+    eta_task_count = tasks_active + tasks_blocked_recovery + tasks_blocked_auto + tasks_blocked_runtime_degradation
     est_hours = (eta_task_count * pace_for_projection) / SECONDS_PER_MINUTE if pace_for_projection else 0.0
 
     # Combine usage from two sources, both filtered by window_start:
@@ -868,28 +1022,30 @@ def _compute_window_stats(
     hook_log_path = _hook_log_path(log_path)
     if event_index is not None:
         transcript_dir_indexed = _resolve_transcript_dir(event_index, hook_log_path)
-        totals_hook = HookLogTotals(**event_index.aggregate_hook_window(hook_log_path, window_start))
-        totals_transcript = HookLogTotals(
-            **event_index.aggregate_transcript_window(transcript_dir_indexed, window_start)
+        totals_hook_by_model = _per_model_totals_from_aggregator(
+            event_index.aggregate_hook_window_by_model, hook_log_path, window_start
+        )
+        totals_transcript_by_model = _per_model_totals_from_aggregator(
+            event_index.aggregate_transcript_window_by_model, transcript_dir_indexed, window_start
         )
     else:
+        # Non-indexed fallback: see ``_recent_per_task_cost`` for the
+        # equivalent ``"<unknown>"`` collapse rationale.
         totals_hook = _parse_hook_log_metrics(log_path, window_start)
         transcript_dir = _discover_transcript_dir(hook_log_path)
         totals_transcript = _parse_transcript_metrics(transcript_dir, window_start)
-    totals = _combine_totals(totals_hook, totals_transcript)
-    # Apply the configured token-cost discount (contract rate / correction
-    # factor off list) to the base input/output rates. final = list * (1 - d).
-    # Cache multipliers stay as pure ratios; the discounted base propagates
-    # into every component cost AND the ETA projection (est_total_cost is
-    # derived from cost.total_cost), so one multiplication covers both.
-    rate_factor = 1.0 - TOKEN_COST_DISCOUNT
-    cost = _compute_cost(
-        totals,
-        TOKEN_COST_PER_M_INPUT * rate_factor,
-        TOKEN_COST_PER_M_OUTPUT * rate_factor,
-        REPORT_CACHE_READ_MULTIPLIER,
-        REPORT_CACHE_WRITE_5MIN_MULTIPLIER,
-        REPORT_CACHE_WRITE_1HR_MULTIPLIER,
+        totals_hook_by_model = {"<unknown>": totals_hook}
+        totals_transcript_by_model = {"<unknown>": totals_transcript}
+    totals_by_model = _merge_totals_by_model(totals_hook_by_model, totals_transcript_by_model)
+    # Aggregate totals across every model id for downstream renderers that
+    # still need a single ``HookLogTotals``-shaped view of the window.
+    totals = _combine_many(totals_by_model.values())
+    # Per-model cost: each model id is priced against its own rates; the
+    # per-model contract correction factor (issue #223) composes inside the
+    # helper.  The premium multipliers (residency / fast-mode) apply
+    # inside each per-model call so they multiply the correct base rate.
+    cost = _compute_cost_by_model(
+        totals_by_model,
         data_residency_multiplier=REPORT_DATA_RESIDENCY_MULTIPLIER,
         fast_mode_multiplier=REPORT_FAST_MODE_MULTIPLIER,
     )
@@ -968,6 +1124,7 @@ def _compute_window_stats(
         eta_active=tasks_active,
         eta_blocked_recovery=tasks_blocked_recovery,
         eta_blocked_auto=tasks_blocked_auto,
+        eta_blocked_runtime_degradation=tasks_blocked_runtime_degradation,
     )
 
 
@@ -1122,7 +1279,7 @@ def _orchestrator_liveness_banner(
 
     Args:
         log_path: Path to the structured orchestrator log.
-        session_id: Optional ``JUDGE_ORCHESTRATOR_SESSION_ID`` value. When
+        session_id: Optional ``DEVBENCH_ORCHESTRATOR_SESSION_ID`` value. When
             empty/None, the banner suppresses the trailing
             ``-- session ...`` suffix.
         threshold_seconds: Quiet-window cap. ``stop_hook.window_seconds``.
@@ -1177,6 +1334,147 @@ def _render_table(title: str, rows: list[tuple[str, str]], value_w: int = 18) ->
     return lines
 
 
+#: Issue #214: cap any value column at this width.  Cells longer than the
+#: cap wrap onto multiple physical lines (see :func:`_wrap_cell_value`).
+#: 50 chars accommodates the longest natural ETA breakdown segment
+#: (``blocked-runtime-degradation NN``) with room for the prefix / suffix
+#: without exceeding a comfortable terminal column width.
+MAX_VALUE_COL_WIDTH: int = 50
+
+
+def _longest_word_len(text: str) -> int:
+    """Length of the longest whitespace-delimited token in ``text``.
+
+    Used as a per-column floor so :func:`_wrap_cell_value` never has to
+    break a word mid-character (which would mangle identifiers like
+    ``blocked-runtime-degradation``).
+    """
+    return max((len(w) for w in text.split()), default=0)
+
+
+def _word_wrap(text: str, max_width: int) -> list[str]:
+    """Greedy word-wrap: lines of at most ``max_width`` chars; never breaks
+    a word.  When a single word exceeds ``max_width`` it occupies its own
+    line at its natural length (the renderer's column-width floor ensures
+    the column is wide enough to hold it without truncation).
+    """
+    words = text.split()
+    if not words:
+        return [text]
+    lines: list[str] = []
+    current = words[0]
+    for w in words[1:]:
+        candidate = f"{current} {w}"
+        if len(candidate) <= max_width:
+            current = candidate
+        else:
+            lines.append(current)
+            current = w
+    lines.append(current)
+    return lines
+
+
+def _wrap_cell_value(text: str, max_width: int) -> list[str]:
+    """Wrap ``text`` onto multiple lines, each at most ``max_width`` chars.
+
+    Strategy (#214):
+
+    1. Split on `` + `` boundaries -- the natural ETA-breakdown separator.
+       Continuation segments are prefixed with ``+ `` so the line break is
+       visually unambiguous.
+    2. Greedy: build each line by accumulating segments until the next
+       would push the line past ``max_width``.
+    3. If any built line is still too wide, word-wrap that line internally
+       on whitespace.
+    4. Never break a word: a single token longer than ``max_width`` occupies
+       its own line at its natural length.  Callers must size the column
+       to :func:`_longest_word_len` so it still fits the table border.
+    """
+    if max_width <= 0 or len(text) <= max_width:
+        return [text]
+    plus_segments = text.split(" + ")
+    if len(plus_segments) > 1:
+        prefixed = [plus_segments[0]] + [f"+ {p}" for p in plus_segments[1:]]
+        lines: list[str] = []
+        current = ""
+        for seg in prefixed:
+            if not current:
+                current = seg
+                continue
+            candidate = f"{current} {seg}"
+            if len(candidate) <= max_width:
+                current = candidate
+            else:
+                lines.append(current)
+                current = seg
+        if current:
+            lines.append(current)
+    else:
+        lines = [text]
+    refined: list[str] = []
+    for ln in lines:
+        if len(ln) <= max_width:
+            refined.append(ln)
+        else:
+            refined.extend(_word_wrap(ln, max_width))
+    return refined
+
+
+def _compute_value_widths(
+    column_labels: list[str],
+    rows_iter: list[tuple[str, list[str] | str]],
+    default_min: int,
+    max_width: int = MAX_VALUE_COL_WIDTH,
+) -> list[int]:
+    """Compute per-column value widths so a wide cell in one column does NOT
+    inflate the other columns (#214).
+
+    Each column's natural width is the max of ``default_min``, that column's
+    label length, and the longest cell observed in that column across
+    non-spanning rows.  The natural width is then capped at ``max_width`` --
+    but never below the longest single (unbreakable) word found in the column,
+    so :func:`_wrap_cell_value` never has to break a word mid-character.
+
+    Spanning rows (value is a single ``str``) are handled separately by
+    :func:`_widen_for_spanning`.
+    """
+    n_cols = len(column_labels)
+    natural: list[int] = [max(default_min, len(label)) for label in column_labels]
+    word_floor: list[int] = [max(default_min, len(label)) for label in column_labels]
+    for _, vals in rows_iter:
+        if isinstance(vals, list):
+            for i in range(min(n_cols, len(vals))):
+                natural[i] = max(natural[i], len(vals[i]))
+                word_floor[i] = max(word_floor[i], _longest_word_len(vals[i]))
+    return [max(word_floor[i], min(natural[i], max_width)) for i in range(n_cols)]
+
+
+def _widen_for_spanning(value_widths: list[int], max_spanning: int) -> list[int]:
+    """Widen every value column uniformly so the joined span fits a
+    spanning value of length ``max_spanning`` (#214).
+
+    Joined span width formula (mirrors ``spanning_w`` in the renderers):
+    ``spanning_w = sum(w + 2 for w in value_widths) + (n_cols - 1) - 2``.
+    When ``spanning_w < max_spanning``, distribute the deficit by adding
+    ``deficit // n_cols`` to every column and ``+1`` to the first
+    ``deficit % n_cols`` columns -- preserving the relative ordering
+    established by :func:`_compute_value_widths`.
+    """
+    if max_spanning <= 0 or not value_widths:
+        return value_widths
+    n_cols = len(value_widths)
+    current_span = sum(w + 2 for w in value_widths) + (n_cols - 1) - 2
+    deficit = max_spanning - current_span
+    if deficit <= 0:
+        return value_widths
+    bump = deficit // n_cols
+    remainder = deficit - bump * n_cols
+    new_widths = [w + bump for w in value_widths]
+    for i in range(remainder):
+        new_widths[i] += 1
+    return new_widths
+
+
 def _render_multi_column_table(
     title: str,
     column_labels: list[str],
@@ -1199,47 +1497,32 @@ def _render_multi_column_table(
     metric_w = max((len(metric) for metric, _ in rows), default=0)
     metric_w = max(metric_w, len(title))
 
-    # Value column width = max of: default minimum, label width, max cell width.
-    # Spanning rows (value is str) span all n_cols value columns, so they
-    # contribute a derived minimum value_w too -- otherwise a wider-than-default
-    # spanning value (e.g. an ETA breakdown like "~41.9 h (active 4 + blocked-
-    # recovery 60 + blocked-auto 27 at 27.6 min/task)") busts the table layout.
-    def _cells_of(v: list[str] | str) -> list[str]:
-        return v if isinstance(v, list) else []
-
-    max_cell = max((max((len(v) for v in _cells_of(vals)), default=0) for _, vals in rows), default=0)
-    max_label = max((len(label) for label in column_labels), default=0)
-    # Reverse-derive the minimum value_w from the spanning-cell width formula
-    # (spanning_w computed below) so a spanning value never exceeds the joined
-    # span. Ceiling division of (max_spanning + 3 - 3 * n_cols) by n_cols.
+    # Issue #214: per-column widths so one wide cell does NOT inflate every
+    # column.  Each column's natural width is max(default, label, own cells).
+    # Spanning rows are handled afterwards by widening columns uniformly.
+    value_widths = _compute_value_widths(column_labels, rows, default_min=value_w)
     max_spanning = max(
         (len(vals) for _, vals in rows if isinstance(vals, str)),
         default=0,
     )
-    spanning_min_value_w = (
-        (max_spanning + 3 - 3 * n_cols + n_cols - 1) // n_cols if max_spanning > 0 and n_cols > 0 else 0
-    )
-    value_w = max(value_w, max_cell, max_label, spanning_min_value_w)
+    value_widths = _widen_for_spanning(value_widths, max_spanning)
 
     # Width a spanning cell occupies (covers all n_cols value columns plus the
     # n_cols-1 internal "│" separators that would otherwise split them).
-    spanning_w = n_cols * (value_w + 2) + (n_cols - 1) - 2  # -2 for leading/trailing space padding
+    spanning_w = sum(w + 2 for w in value_widths) + (n_cols - 1) - 2
 
     def hborder(left: str, junction_metric: str, junction_inner: str, right: str) -> str:
-        return (
-            left
-            + "\u2500" * (metric_w + 2)
-            + junction_metric
-            + (("\u2500" * (value_w + 2) + junction_inner) * (n_cols - 1))
-            + "\u2500" * (value_w + 2)
-            + right
-        )
+        inner_runs = [("\u2500" * (w + 2)) for w in value_widths]
+        joined = junction_inner.join(inner_runs)
+        return left + "\u2500" * (metric_w + 2) + junction_metric + joined + right
 
     border_top = hborder("\u250c", "\u252c", "\u252c", "\u2510")
     border_mid = hborder("\u251c", "\u253c", "\u253c", "\u2524")
     border_bot = hborder("\u2514", "\u2534", "\u2534", "\u2518")
 
-    header_cells = [f" {title:<{metric_w}} "] + [f" {label:>{value_w}} " for label in column_labels]
+    header_cells = [f" {title:<{metric_w}} "] + [
+        f" {label:>{value_widths[i]}} " for i, label in enumerate(column_labels)
+    ]
     header_line = "\u2502" + "\u2502".join(header_cells) + "\u2502"
 
     lines: list[str] = [border_top, header_line, border_mid]
@@ -1247,16 +1530,26 @@ def _render_multi_column_table(
         if i > 0:
             lines.append(border_mid)
         if isinstance(values, str):
-            # Spanning row: a single right-aligned value occupies the full width
-            # of all value columns (including the column separators). The top /
-            # bottom borders of this row still show the regular ┬/┴ junctions
-            # so the column boundaries stay visually consistent throughout the
-            # table; only the content row's internal │ separators are merged.
-            row_line = f"\u2502 {metric:<{metric_w}} \u2502 {values:>{spanning_w}} \u2502"
+            # Spanning row: wrap to spanning_w; metric shows on line 0 only.
+            wrapped = _wrap_cell_value(values, spanning_w)
+            for k, wl in enumerate(wrapped):
+                metric_text = metric if k == 0 else ""
+                row_line = f"\u2502 {metric_text:<{metric_w}} \u2502 {wl:>{spanning_w}} \u2502"
+                lines.append(_colorize_row(row_line, metric))
         else:
-            cells = [f" {metric:<{metric_w}} "] + [f" {v:>{value_w}} " for v in values]
-            row_line = "\u2502" + "\u2502".join(cells) + "\u2502"
-        lines.append(_colorize_row(row_line, metric))
+            # Per-column wrap; row height = max wrapped lines across columns.
+            wrapped_cells = [_wrap_cell_value(v, value_widths[j]) for j, v in enumerate(values)]
+            height = max((len(c) for c in wrapped_cells), default=1)
+            for c in wrapped_cells:
+                while len(c) < height:
+                    c.append("")
+            for k in range(height):
+                metric_text = metric if k == 0 else ""
+                cells = [f" {metric_text:<{metric_w}} "] + [
+                    f" {wrapped_cells[j][k]:>{value_widths[j]}} " for j in range(n_cols)
+                ]
+                row_line = "\u2502" + "\u2502".join(cells) + "\u2502"
+                lines.append(_colorize_row(row_line, metric))
     lines.append(border_bot)
     return lines
 
@@ -1285,49 +1578,36 @@ def _render_grouped_progress_table(
     metric_w = max((len(metric) for metric, _ in all_rows), default=0)
     metric_w = max(metric_w, len(title), max((len(name) for name, _ in sections), default=0))
 
-    def _cells_of(v: list[str] | str) -> list[str]:
-        return v if isinstance(v, list) else []
-
-    max_cell = max((max((len(v) for v in _cells_of(vals)), default=0) for _, vals in all_rows), default=0)
-    max_label = max((len(label) for label in column_labels), default=0)
-    # Spanning rows (value is str) cover all n_cols value columns plus their
-    # internal separators. Without measuring them, a wide spanning value (e.g.
-    # the ETA breakdown "~41.9 h (active 4 + blocked-recovery 60 + ...)" busts
-    # the table layout. Reverse-derive the minimum value_w from the spanning
-    # formula below so the joined span fits the longest observed string.
+    # Issue #214: per-column widths so one wide cell does NOT inflate every
+    # column.  Spanning rows are handled afterwards by widening uniformly.
+    value_widths = _compute_value_widths(column_labels, all_rows, default_min=value_w)
     max_spanning = max(
         (len(vals) for _, section_rows in sections for _, vals in section_rows if isinstance(vals, str)),
         default=0,
     )
-    spanning_min_value_w = (
-        (max_spanning + 3 - 3 * n_cols + n_cols - 1) // n_cols if max_spanning > 0 and n_cols > 0 else 0
-    )
-    value_w = max(value_w, max_cell, max_label, spanning_min_value_w)
+    value_widths = _widen_for_spanning(value_widths, max_spanning)
 
     # Width a spanning cell occupies across all n_cols value columns (plus
     # the n_cols-1 internal separators). Used for both the section-header row
     # and any individual metric whose value was merged into a str.
-    spanning_w = n_cols * (value_w + 2) + (n_cols - 1) - 2
+    spanning_w = sum(w + 2 for w in value_widths) + (n_cols - 1) - 2
     # Width of the ENTIRE merged cell for a section-header row: metric column
     # + all value columns + every separator between them - leading/trailing
     # padding (2 spaces).
-    section_w = metric_w + 2 + 1 + (n_cols * (value_w + 2) + (n_cols - 1)) - 2
+    section_w = metric_w + 2 + 1 + (sum(w + 2 for w in value_widths) + (n_cols - 1)) - 2
 
     def hborder(left: str, junction_metric: str, junction_inner: str, right: str) -> str:
-        return (
-            left
-            + "\u2500" * (metric_w + 2)
-            + junction_metric
-            + (("\u2500" * (value_w + 2) + junction_inner) * (n_cols - 1))
-            + "\u2500" * (value_w + 2)
-            + right
-        )
+        inner_runs = [("\u2500" * (w + 2)) for w in value_widths]
+        joined = junction_inner.join(inner_runs)
+        return left + "\u2500" * (metric_w + 2) + junction_metric + joined + right
 
     border_top = hborder("\u250c", "\u252c", "\u252c", "\u2510")
     border_mid = hborder("\u251c", "\u253c", "\u253c", "\u2524")
     border_bot = hborder("\u2514", "\u2534", "\u2534", "\u2518")
 
-    header_cells = [f" {title:<{metric_w}} "] + [f" {label:>{value_w}} " for label in column_labels]
+    header_cells = [f" {title:<{metric_w}} "] + [
+        f" {label:>{value_widths[i]}} " for i, label in enumerate(column_labels)
+    ]
     header_line = "\u2502" + "\u2502".join(header_cells) + "\u2502"
 
     lines: list[str] = [border_top, header_line]
@@ -1343,11 +1623,24 @@ def _render_grouped_progress_table(
         lines.append(f"\u2502 {section_label.upper():<{section_w}} \u2502")
         for metric, values in rows:
             if isinstance(values, str):
-                row_line = f"\u2502 {metric:<{metric_w}} \u2502 {values:>{spanning_w}} \u2502"
+                wrapped = _wrap_cell_value(values, spanning_w)
+                for k, wl in enumerate(wrapped):
+                    metric_text = metric if k == 0 else ""
+                    row_line = f"\u2502 {metric_text:<{metric_w}} \u2502 {wl:>{spanning_w}} \u2502"
+                    lines.append(_colorize_row(row_line, metric))
             else:
-                cells = [f" {metric:<{metric_w}} "] + [f" {v:>{value_w}} " for v in values]
-                row_line = "\u2502" + "\u2502".join(cells) + "\u2502"
-            lines.append(_colorize_row(row_line, metric))
+                wrapped_cells = [_wrap_cell_value(v, value_widths[j]) for j, v in enumerate(values)]
+                height = max((len(c) for c in wrapped_cells), default=1)
+                for c in wrapped_cells:
+                    while len(c) < height:
+                        c.append("")
+                for k in range(height):
+                    metric_text = metric if k == 0 else ""
+                    cells = [f" {metric_text:<{metric_w}} "] + [
+                        f" {wrapped_cells[j][k]:>{value_widths[j]}} " for j in range(n_cols)
+                    ]
+                    row_line = "\u2502" + "\u2502".join(cells) + "\u2502"
+                    lines.append(_colorize_row(row_line, metric))
     lines.append(border_bot)
     return lines
 
@@ -1405,12 +1698,22 @@ def _format_est_hours_display(stats: WindowStats) -> str:
     from the window's avg_minutes; falls back to ``n/a`` otherwise.
     """
     if stats.est_hours and stats.recent_pace_minutes is not None:
-        return (
-            f"~{stats.est_hours:.1f} h (active {stats.eta_active}"
-            f" + blocked-recovery {stats.eta_blocked_recovery}"
-            f" + blocked-auto {stats.eta_blocked_auto}"
-            f" at {stats.recent_pace_minutes:.1f} min/task)"
-        )
+        # Only surface non-zero blocked-bucket terms so a typical report --
+        # where every blocked counter sits at zero -- keeps the breakdown
+        # short. The "active" term always shows.  Issue #214 caps the
+        # rendered cell width by wrapping long breakdowns at " + "
+        # boundaries inside the table renderer; this builder keeps the
+        # full classification names so the table reads naturally on a
+        # wide terminal.
+        parts: list[str] = [f"active {stats.eta_active}"]
+        if stats.eta_blocked_recovery:
+            parts.append(f"blocked-recovery {stats.eta_blocked_recovery}")
+        if stats.eta_blocked_auto:
+            parts.append(f"blocked-auto {stats.eta_blocked_auto}")
+        if stats.eta_blocked_runtime_degradation:
+            parts.append(f"blocked-runtime-degradation {stats.eta_blocked_runtime_degradation}")
+        breakdown = " + ".join(parts)
+        return f"~{stats.est_hours:.1f} h ({breakdown} at {stats.recent_pace_minutes:.1f} min/task)"
     if stats.est_hours:
         return f"~{stats.est_hours:.1f} h"
     return "n/a"
@@ -1581,8 +1884,13 @@ def _summary_line(stats: WindowStats, tasks_active: int, tasks_blocked: int) -> 
     ``recent_pace_minutes`` when available; falls back to
     ``avg_minutes`` otherwise.
     """
-    eta_total = tasks_active + stats.eta_blocked_recovery + stats.eta_blocked_auto
-    attn_blocked = max(0, tasks_blocked - stats.eta_blocked_recovery - stats.eta_blocked_auto)
+    eta_total = (
+        tasks_active + stats.eta_blocked_recovery + stats.eta_blocked_auto + stats.eta_blocked_runtime_degradation
+    )
+    attn_blocked = max(
+        0,
+        tasks_blocked - stats.eta_blocked_recovery - stats.eta_blocked_auto - stats.eta_blocked_runtime_degradation,
+    )
     blocked_note = f" -- {attn_blocked} blocked excluded" if attn_blocked else ""
     if eta_total == 0:
         if tasks_blocked:
@@ -1622,12 +1930,14 @@ class _BacklogTotals:
     tasks_in_review: int  # non-Done tasks with status == IN_REVIEW (subset of tasks_active)
     tasks_proposed: int  # task-factory-generated drafts awaiting human review
     tasks_declined: int  # explicitly declined work (won't ever be done)
-    # E2-F2-S1: six per-state blocked counts (one per BlockedTaskState).
+    tasks_draft: int = 0  # pre-queue gate; not yet promoted to in-queue
+    # E2-F2-S1: per-state blocked counts (one per BlockedTaskState).
     tasks_blocked_auto_clearing: int = 0  # AUTO_CLEARING_VIA_PROPOSAL
     tasks_blocked_amendment_recovery: int = 0  # AWAITING_AMENDMENT_RECOVERY
     tasks_blocked_dependency: int = 0  # AWAITING_DEPENDENCY
     tasks_blocked_held: int = 0  # HELD (task's own status is hold)
     tasks_blocked_on_held: int = 0  # BLOCKED_ON_HELD
+    tasks_blocked_runtime_degradation: int = 0  # RUNTIME_DEGRADATION (auto-recovers on orchestrator restart)
     tasks_blocked_operator: int = 0  # OPERATOR_ACTION_REQUIRED
 
     @property
@@ -1663,7 +1973,8 @@ def _backlog_totals_from_units(units: list) -> _BacklogTotals:
     tasks_in_review = [t for t in tasks if t.status == WorkUnitStatus.IN_REVIEW]
     tasks_proposed = [t for t in tasks if t.status == WorkUnitStatus.PROPOSED]
     tasks_declined = [t for t in tasks if t.status == WorkUnitStatus.DECLINED]
-    tasks_remaining = len(tasks) - len(tasks_done) - len(tasks_proposed) - len(tasks_declined)
+    tasks_draft = [t for t in tasks if t.status == WorkUnitStatus.DRAFT]
+    tasks_remaining = len(tasks) - len(tasks_done) - len(tasks_proposed) - len(tasks_declined) - len(tasks_draft)
     n_blocked_total = len(tasks_blocked_and_hold)
 
     # E2-F2-S1: classify each blocked/hold task into one of the six
@@ -1674,6 +1985,7 @@ def _backlog_totals_from_units(units: list) -> _BacklogTotals:
     cnt_dependency = 0
     cnt_held = 0
     cnt_on_held = 0
+    cnt_runtime_degradation = 0
     cnt_operator = 0
     if tasks_blocked_and_hold:
         from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
@@ -1702,8 +2014,20 @@ def _backlog_totals_from_units(units: list) -> _BacklogTotals:
                 cnt_held += 1
             elif state is BlockedTaskState.BLOCKED_ON_HELD:
                 cnt_on_held += 1
-            else:
+            elif state is BlockedTaskState.RUNTIME_DEGRADATION:
+                cnt_runtime_degradation += 1
+            elif state is BlockedTaskState.OPERATOR_ACTION_REQUIRED:
                 cnt_operator += 1
+            else:
+                # Every BlockedTaskState enum member must be handled
+                # explicitly above. Hitting this branch means a new
+                # member was added to the enum without updating this
+                # renderer -- fail loud rather than silently routing
+                # to operator-required (CLAUDE.md: no fallback logic).
+                raise RuntimeError(
+                    f"Unhandled BlockedTaskState {state!r} in report counter path; "
+                    "update _BacklogTotals + this if/elif chain."
+                )
 
     return _BacklogTotals(
         tasks_total=len(tasks),
@@ -1721,11 +2045,13 @@ def _backlog_totals_from_units(units: list) -> _BacklogTotals:
         tasks_in_review=len(tasks_in_review),
         tasks_proposed=len(tasks_proposed),
         tasks_declined=len(tasks_declined),
+        tasks_draft=len(tasks_draft),
         tasks_blocked_auto_clearing=cnt_auto_clearing,
         tasks_blocked_amendment_recovery=cnt_amendment_recovery,
         tasks_blocked_dependency=cnt_dependency,
         tasks_blocked_held=cnt_held,
         tasks_blocked_on_held=cnt_on_held,
+        tasks_blocked_runtime_degradation=cnt_runtime_degradation,
         tasks_blocked_operator=cnt_operator,
     )
 
@@ -1749,6 +2075,7 @@ def _backlog_state_rows(b: _BacklogTotals, lifetime: WindowStats | None = None) 
             f"{b.units_done} of {b.units_total} ({total_pct}%)",
         ),
         ("Tasks in-progress", str(b.tasks_in_progress)),
+        ("Tasks draft", str(b.tasks_draft)),
         ("Tasks proposed", str(b.tasks_proposed)),
         ("Tasks declined", str(b.tasks_declined)),
         ("Tasks blocked", str(b.tasks_blocked)),
@@ -1850,6 +2177,7 @@ def _classify_blocked_unit_into_buckets(
     dependency_rows: list,
     held_rows: list,
     on_held_rows: list,
+    runtime_degradation_rows: list,
     operator_rows: list,
 ) -> None:
     """Route one blocked/hold task unit into the appropriate display bucket.
@@ -1857,6 +2185,12 @@ def _classify_blocked_unit_into_buckets(
     Separated from ``_blocked_listing`` to keep the outer function's branch
     count within the PLR0912 threshold.  HOLD-status units short-circuit to
     the held bucket without a filesystem read.
+
+    Every ``BlockedTaskState`` enum member is handled explicitly. Adding a
+    new member to the enum without extending this routing function raises
+    ``RuntimeError`` -- CLAUDE.md forbids silent fallbacks for unhandled
+    cases. Tests in ``tests/test_reporting/test_report.py`` parametrise
+    every enum member against this function.
     """
     from devbench.backlog.proposal import (
         BlockedTaskState,
@@ -1887,8 +2221,55 @@ def _classify_blocked_unit_into_buckets(
         held_rows.append(u)
     elif state is BlockedTaskState.BLOCKED_ON_HELD:
         on_held_rows.append(u)
-    else:
+    elif state is BlockedTaskState.RUNTIME_DEGRADATION:
+        runtime_degradation_rows.append(u)
+    elif state is BlockedTaskState.OPERATOR_ACTION_REQUIRED:
         operator_rows.append(u)
+    else:
+        raise RuntimeError(
+            f"Unhandled BlockedTaskState {state!r} in report per-row routing; "
+            "update _classify_blocked_unit_into_buckets + _render_blocked_panels."
+        )
+
+
+def _render_simple_panel(rows: list, title: str, hint: str, row_suffix: str) -> list[str]:
+    """Render one blocked-task panel with a fixed per-row suffix."""
+    if not rows:
+        return []
+    out = ["", f"Blocked tasks ({title}) ({len(rows)}):", hint]
+    for u in rows:
+        out.append(f"  - {u.id}: {u.title}    {row_suffix}")
+    return out
+
+
+def _render_auto_clearing_panel(auto_rows: list) -> list[str]:
+    """Render the AUTO_CLEARING_VIA_PROPOSAL panel; per-row suffix names marker targets."""
+    if not auto_rows:
+        return []
+    out = [
+        "",
+        f"Blocked tasks (auto-clearing via proposal) ({len(auto_rows)}):",
+        "Resolves when marker targets reach terminal; no action.",
+    ]
+    for u, waiting_on in auto_rows:
+        suffix = f"    [waiting on {', '.join(waiting_on)}]" if waiting_on else ""
+        out.append(f"  - {u.id}: {u.title}{suffix}")
+    return out
+
+
+def _render_amendment_recovery_panel(rows: list) -> list[str]:
+    """Render the AWAITING_AMENDMENT_RECOVERY panel; per-row suffix names recovery signal."""
+    if not rows:
+        return []
+    out = [
+        "",
+        f"Blocked tasks (awaiting amendment recovery) ({len(rows)}):",
+        "Recovery agent in flight; orchestrator's next sweep advances these.",
+    ]
+    for u, signal in rows:
+        suffix = f"    [recovery: {signal}]" if signal else ""
+        out.append(f"  - {u.id}: {u.title}{suffix}")
+    return out
 
 
 def _render_blocked_panels(
@@ -1897,73 +2278,81 @@ def _render_blocked_panels(
     dependency_rows: list,
     held_rows: list,
     on_held_rows: list,
+    runtime_degradation_rows: list,
     operator_rows: list,
 ) -> list[str]:
-    """Render the six per-state blocked panels into display lines.
+    """Render every per-state blocked panel into display lines.
 
     Each non-empty panel produces a header, a canonical resolution hint,
     and one row per task unit.  Empty panels are omitted.  Kept separate
     from ``_blocked_listing`` so the branch count of the outer function
     stays within the PLR0912 threshold.
+
+    Display order matches the priority ordering of ``BlockedTaskState``
+    in ``devbench.backlog.proposal``: auto-clearing first (purely
+    cascade-driven), then amendment-recovery (orchestrator-driven), then
+    dependency, then held / blocked-on-held (operator-driven HOLD state),
+    then runtime-degradation (SDK auto-restart), and finally
+    operator-action-required (the residual "needs human").
     """
     lines: list[str] = []
-
-    if auto_rows:
-        lines.append("")
-        lines.append(f"Blocked tasks (auto-clearing via proposal) ({len(auto_rows)}):")
-        lines.append("Resolves when marker targets reach terminal; no action.")
-        for u, waiting_on in auto_rows:
-            suffix = f"    [waiting on {', '.join(waiting_on)}]" if waiting_on else ""
-            lines.append(f"  - {u.id}: {u.title}{suffix}")
-
-    if amendment_recovery_rows:
-        lines.append("")
-        lines.append(f"Blocked tasks (awaiting amendment recovery) ({len(amendment_recovery_rows)}):")
-        lines.append("Recovery agent in flight; orchestrator's next sweep advances these.")
-        for u, signal in amendment_recovery_rows:
-            suffix = f"    [recovery: {signal}]" if signal else ""
-            lines.append(f"  - {u.id}: {u.title}{suffix}")
-
-    if dependency_rows:
-        lines.append("")
-        lines.append(f"Blocked tasks (awaiting dependency) ({len(dependency_rows)}):")
-        lines.append("Resolves when the dependency completes; no action.")
-        for u in dependency_rows:
-            lines.append(f"  - {u.id}: {u.title}    [dependency not yet terminal]")
-
-    if held_rows:
-        lines.append("")
-        lines.append(f"Blocked tasks (held) ({len(held_rows)}):")
-        lines.append("On hold by operator; unhold to release.")
-        for u in held_rows:
-            lines.append(f"  - {u.id}: {u.title}    [HOLD]")
-
-    if on_held_rows:
-        lines.append("")
-        lines.append(f"Blocked tasks (blocked-on-held) ({len(on_held_rows)}):")
-        lines.append("Waiting on a held unit; unhold the target or redirect this task.")
-        for u in on_held_rows:
-            lines.append(f"  - {u.id}: {u.title}    [blocked-on-held]")
-
-    if operator_rows:
-        lines.append("")
-        lines.append(f"Blocked tasks (operator action required) ({len(operator_rows)}):")
-        lines.append("No automation path; operator must inspect and resolve manually.")
-        for u in operator_rows:
-            lines.append(f"  - {u.id}: {u.title}    [operator action required]")
-
+    lines.extend(_render_auto_clearing_panel(auto_rows))
+    lines.extend(_render_amendment_recovery_panel(amendment_recovery_rows))
+    lines.extend(
+        _render_simple_panel(
+            dependency_rows,
+            "awaiting dependency",
+            "Resolves when the dependency completes; no action.",
+            "[dependency not yet terminal]",
+        )
+    )
+    lines.extend(
+        _render_simple_panel(
+            held_rows,
+            "held",
+            "On hold by operator; unhold to release.",
+            "[HOLD]",
+        )
+    )
+    lines.extend(
+        _render_simple_panel(
+            on_held_rows,
+            "blocked-on-held",
+            "Waiting on a held unit; unhold the target or redirect this task.",
+            "[blocked-on-held]",
+        )
+    )
+    lines.extend(
+        _render_simple_panel(
+            runtime_degradation_rows,
+            "runtime-degradation",
+            (
+                "SDK lost Agent-tool access mid-session; task remains blocked until the orchestrator restarts "
+                "(auto on NO_ACTIONABLE exit; otherwise manual `make start`)."
+            ),
+            "[runtime-degradation -- retries on next orchestrator restart]",
+        )
+    )
+    lines.extend(
+        _render_simple_panel(
+            operator_rows,
+            "operator action required",
+            "No automation path; operator must inspect and resolve manually.",
+            "[operator action required]",
+        )
+    )
     return lines
 
 
 def _blocked_listing(units: list) -> list[str]:
-    """Render blocked tasks as six panels, one per BlockedTaskState.
+    """Render blocked tasks as one panel per BlockedTaskState.
 
     Each panel header reads ``Blocked tasks (<panel-name>) (<count>):``
     and is immediately followed by the canonical resolution hint for that
     state.  Empty panels are omitted so the operator's eye lands on the
     panels that have content.
 
-    The six panels in canonical order:
+    The panels in canonical display order:
 
     1. ``auto-clearing via proposal`` -- ADR-07 cascade resolves once every
        ``[BLOCKED_PENDING_PROPOSAL]`` marker target reaches terminal.
@@ -1974,7 +2363,12 @@ def _blocked_listing(units: list) -> list[str]:
     4. ``held`` -- the unit's own status is ``hold``; operator must resume.
     5. ``blocked-on-held`` -- a marker target is held; operator must unhold
        or redirect.
-    6. ``operator action required`` -- no automation path; operator must act.
+    6. ``runtime-degradation`` -- the SDK lost Agent-tool access mid-session
+       (issue #183); the orchestrate skill exits NO_ACTIONABLE and ``cmd_start``
+       returns the auto-restart exit code so ``make start``'s wrapping loop
+       respawns the orchestrator with a fresh SDK subprocess. Operator does
+       nothing.
+    7. ``operator action required`` -- no automation path; operator must act.
     """
     # Admit BOTH BLOCKED and HOLD task units.
     eligible = [
@@ -1985,21 +2379,35 @@ def _blocked_listing(units: list) -> list[str]:
     if not eligible:
         return []
 
-    # Six per-state row buckets in canonical display order.
+    # Per-state row buckets in canonical display order.
     auto_rows: list[tuple] = []  # (unit, list[str] of marker targets)
     amendment_recovery_rows: list[tuple] = []  # (unit, signal-source string)
     dependency_rows: list = []
     held_rows: list = []
     on_held_rows: list = []
+    runtime_degradation_rows: list = []
     operator_rows: list = []
 
     for u in eligible:
         _classify_blocked_unit_into_buckets(
-            u, auto_rows, amendment_recovery_rows, dependency_rows, held_rows, on_held_rows, operator_rows
+            u,
+            auto_rows,
+            amendment_recovery_rows,
+            dependency_rows,
+            held_rows,
+            on_held_rows,
+            runtime_degradation_rows,
+            operator_rows,
         )
 
     return _render_blocked_panels(
-        auto_rows, amendment_recovery_rows, dependency_rows, held_rows, on_held_rows, operator_rows
+        auto_rows,
+        amendment_recovery_rows,
+        dependency_rows,
+        held_rows,
+        on_held_rows,
+        runtime_degradation_rows,
+        operator_rows,
     )
 
 
@@ -2077,24 +2485,230 @@ def _listing_by_status(units: list, status: WorkUnitStatus, label: str) -> list[
     return lines
 
 
+_WU_COMMENTS_SECTION_HEADER = "## Comments"
+_WU_CLAIMED_MARKER = "[WU_CLAIMED]"
+_WU_SESSION_MARKER = "session="
+
+
+def _extract_session_from_wu(wu: WorkUnit) -> str | None:
+    """Return the session name from the most recent ``[WU_CLAIMED]`` audit in a WU file.
+
+    Reads the ``## Comments`` section of *wu*'s backing Markdown file and
+    searches for lines containing ``[WU_CLAIMED]`` with a ``session=<name>``
+    token.  Returns the name from the last such line (most recent claim wins).
+    Returns ``None`` when the file does not exist, has no Comments section,
+    has no ``[WU_CLAIMED]`` line, or the line carries no ``session=`` token
+    (legacy single-session behaviour).
+
+    Args:
+        wu: The :class:`WorkUnit` whose backing file to inspect.
+
+    Returns:
+        The session name string, or ``None`` when absent.
+
+    Raises:
+        OSError: If the file exists but cannot be read (permissions, I/O error).
+    """
+    if not wu.file_path.exists():
+        return None
+    content = wu.file_path.read_text(encoding="utf-8")
+    comments_start = content.find(_WU_COMMENTS_SECTION_HEADER)
+    if comments_start == -1:
+        return None
+    comments_body = content[comments_start + len(_WU_COMMENTS_SECTION_HEADER) :]
+    session_name: str | None = None
+    for line in comments_body.splitlines():
+        if _WU_CLAIMED_MARKER not in line:
+            continue
+        idx = line.find(_WU_SESSION_MARKER)
+        if idx == -1:
+            continue
+        value_start = idx + len(_WU_SESSION_MARKER)
+        value_end = line.find(" ", value_start)
+        session_name = line[value_start:].strip() if value_end == -1 else line[value_start:value_end].strip()
+    return session_name if session_name else None
+
+
+def _filter_units_by_session(units: list[WorkUnit], session_name: str | None) -> list[WorkUnit]:
+    """Return ``units`` filtered to those claimed by ``session_name``.
+
+    When ``session_name`` is ``None``, the original list is returned unchanged
+    (aggregate view across all sessions, AC-192-13).
+
+    When ``session_name`` is provided, only work units whose most recent
+    ``[WU_CLAIMED]`` audit names that session are included (AC-192-12).
+
+    Args:
+        units: Full list of parsed :class:`~devbench.backlog.work_unit.WorkUnit`
+            objects from ``BacklogParser.parse_index``.
+        session_name: Named-session filter.  Pass ``None`` to skip filtering.
+
+    Returns:
+        A (possibly shorter) list preserving original order.
+
+    Raises:
+        OSError: If any WU file exists but cannot be read (permissions, I/O error).
+    """
+    if session_name is None:
+        return units
+    return [u for u in units if _extract_session_from_wu(u) == session_name]
+
+
+def _filter_units_by_scope(units: list, scope_filter: ScopeFilter | None) -> list:
+    """Return ``units`` filtered to those allowed by ``scope_filter``.
+
+    When ``scope_filter`` is ``None``, the original list is returned unchanged.
+
+    A :class:`~devbench.scope.ScopeFilter` whose ``expanded_ids`` set is empty
+    is re-expanded from its ``include`` / ``exclude`` token lists against the
+    full list of unit IDs before filtering.  This handles the per-command
+    ``--include`` / ``--exclude`` path (spec section 4.2.2, AC-190-11) where
+    ``cmd_report`` builds the filter from raw tokens without yet knowing the
+    full backlog ID set.
+
+    Args:
+        units: Full list of parsed :class:`~devbench.backlog.work_unit.WorkUnit`
+            objects from ``BacklogParser.parse_index``.
+        scope_filter: Optional :class:`~devbench.scope.ScopeFilter` instance.
+            Pass ``None`` to skip filtering and return all units.
+
+    Returns:
+        A (possibly shorter) list containing only the units whose IDs satisfy
+        the scope filter, preserving original order.
+
+    Raises:
+        InvalidScopeError: If token lists contain structurally malformed tokens
+            (reversed ranges, empty segments).  Only raised when
+            re-expansion is triggered (empty ``expanded_ids`` + non-empty tokens).
+    """
+    if scope_filter is None:
+        return units
+    active_filter = scope_filter
+    if not active_filter.expanded_ids and (active_filter.include or active_filter.exclude):
+        all_ids = [u.id for u in units]
+        active_filter = ScopeFilter.parse(
+            ", ".join(active_filter.include),
+            ", ".join(active_filter.exclude),
+            all_ids,
+        )
+    return [u for u in units if active_filter.allows(u.id)]
+
+
+def _render_by_role_panel(log_path: Path, window_start: datetime) -> list[str]:
+    """Render the per-role token + cost breakdown (issue #206).
+
+    Uses ``_parse_transcript_metrics_by_role`` (the existing per-role
+    bucket helper from #123) to bucket tokens by ``attributionAgent``,
+    then prices each role's tokens at the rate of whichever model that
+    role actually ran on.  Roles that span multiple models get a
+    correct per-model-blended cost via ``_compute_cost_by_model``'s
+    fallback to ``REPORT_DEFAULT_MODEL_RATES`` for the role-only
+    aggregate (the model attribution lives on the SQL path, not the
+    role aggregator).
+
+    Returns the rendered lines as a list (caller appends to the report
+    body).  An empty list when ``_parse_transcript_metrics_by_role``
+    returns no buckets, so the panel is silently omitted on workspaces
+    with no transcript activity.
+    """
+    hook_log_path = _hook_log_path(log_path)
+    transcript_dir = _discover_transcript_dir(hook_log_path)
+    by_role = _parse_transcript_metrics_by_role(transcript_dir, window_start)
+    if not by_role:
+        return []
+
+    rendered: list[str] = ["", "Per-role cost breakdown (current run):"]
+    rendered.append("role                  input_tokens  output_tokens  cache_read  cache_write  msgs   est_cost")
+    total_in = 0
+    total_out = 0
+    total_cr = 0
+    total_cw = 0
+    total_msgs = 0
+    total_cost = 0.0
+    rows: list[tuple[str, int, int, int, int, int, float]] = []
+    for role, totals in sorted(by_role.items()):
+        # Per-role buckets do not carry per-call model attribution
+        # individually -- the role aggregator collapses across models.
+        # Pricing against the "<unknown>" bucket (-> REPORT_DEFAULT_MODEL_RATES)
+        # produces the same total an operator would compute by hand from the
+        # canonical Opus 4.7 list rates.  Issue #223's per-model panel
+        # remains the more accurate axis for cost; #206 is per-role view.
+        cost = _compute_cost_by_model({"<unknown>": totals})
+        cache_write = totals.cache_write_5m_tokens + totals.cache_write_1h_tokens
+        rows.append(
+            (
+                role,
+                totals.input_tokens,
+                totals.output_tokens,
+                totals.cache_read_tokens,
+                cache_write,
+                totals.entries_with_usage,
+                cost.total_cost,
+            )
+        )
+        total_in += totals.input_tokens
+        total_out += totals.output_tokens
+        total_cr += totals.cache_read_tokens
+        total_cw += cache_write
+        total_msgs += totals.entries_with_usage
+        total_cost += cost.total_cost
+    # Sort by est_cost descending so the most expensive role surfaces
+    # first; operators triaging cost want to see the biggest contributor
+    # at the top without scrolling.
+    rows.sort(key=lambda r: r[6], reverse=True)
+    for role, in_t, out_t, cr, cw, msgs, est in rows:
+        rendered.append(f"{role:<20}  {in_t:>12,}  {out_t:>13,}  {cr:>10,}  {cw:>11,}  {msgs:>4}   ${est:>7,.4f}")
+    rendered.append(
+        f"{'TOTAL':<20}  {total_in:>12,}  {total_out:>13,}  {total_cr:>10,}  "
+        f"{total_cw:>11,}  {total_msgs:>4}   ${total_cost:>7,.4f}"
+    )
+    return rendered
+
+
 def generate_report(
     log_path: Path,
     since: datetime | None = None,
     report_started_at: datetime | None = None,
+    scope_filter: ScopeFilter | None = None,
+    session_name: str | None = None,
+    *,
+    by_role: bool = False,
 ) -> str:
     """Generate a formatted progress report.
 
     Args:
-        log_path: Path to the orchestrator log file.
+        log_path: Path to the orchestrator log file.  When ``session_name`` is
+            provided, the caller is expected to pass the per-session log path
+            (``<workspace>/.devbench/sessions/<name>/orchestrator.log``); the
+            event-index queries then operate on that file's events only.
         since: If provided, render a single window starting at this timestamp.
             If omitted, render All-time + Current session, plus This run when
             ``report_started_at`` is also provided (watch mode).
         report_started_at: When set, adds a "This run" column tracking activity
             since this timestamp. Used by ``cmd_report`` in watch mode to show
             what's happened since the watch loop began.
+        scope_filter: Optional :class:`~devbench.scope.ScopeFilter` instance
+            (spec section 4.2.2, AC-190-10, AC-190-11).  When provided, only
+            work units whose IDs are in the filter's scope are counted and
+            listed in the report.  A ``ScopeFilter`` with empty
+            ``expanded_ids`` is re-expanded from its ``include`` / ``exclude``
+            token lists against the parsed backlog before filtering.  Pass
+            ``None`` (default) to include all work units.
+        session_name: Optional named-session filter (spec section 4.4.6,
+            AC-192-12, AC-192-13).  When provided, only work units whose most
+            recent ``[WU_CLAIMED]`` audit names this session are counted and
+            listed in the report.  Pass ``None`` (default) to aggregate across
+            all sessions.  Composes with ``scope_filter``: both filters are
+            applied in sequence (session filter first, then scope filter).
 
     Returns:
         Formatted report string ready for terminal output.
+
+    Raises:
+        SystemExit(1): If the backlog cannot be read or parsed.
+        InvalidScopeError: If ``scope_filter`` token lists contain
+            structurally invalid tokens (reversed ranges, etc.).
+        OSError: If a WU backing file cannot be read during session filtering.
     """
     # Operator-alive banner (issue #161). Prepended to every render so
     # ``devbench report --watch N`` shows liveness state on every tick.
@@ -2107,7 +2721,7 @@ def generate_report(
     # express "last activity Ns ago" -- if we cached it inside the
     # snapshot the elapsed-since string would freeze and a stalled
     # orchestrator would still appear ALIVE on every watch tick.
-    session_id = os.environ.get("JUDGE_ORCHESTRATOR_SESSION_ID", "").strip() or None
+    session_id = os.environ.get("DEVBENCH_ORCHESTRATOR_SESSION_ID", "").strip() or None
     banner_display_tz = _resolve_display_timezone(REPORT_DISPLAY_TIMEZONE or DISPLAY_TIMEZONE)
     banner_line = _orchestrator_liveness_banner(
         log_path=log_path,
@@ -2118,9 +2732,8 @@ def generate_report(
 
     # Issue #162 Phase 6 (rendered-body snapshot) is deferred.
     # A snapshot keyed on log mtime + size is fast but unsafe:
-    # cost-rate config (``TOKEN_COST_DISCOUNT``,
-    # ``TOKEN_COST_PER_M_INPUT/OUTPUT``, the cache + residency + fast-
-    # mode multipliers, the display timezone, ``RECENT_PACE_TASKS``)
+    # cost-rate config (``REPORT_MODEL_RATES``, the cache + residency +
+    # fast-mode multipliers, the display timezone, ``RECENT_PACE_TASKS``)
     # can change between invocations without the log advancing, and a
     # snapshot keyed only on the log would silently return numbers
     # computed against the old config. Per CLAUDE.md fail-fast: better
@@ -2137,7 +2750,24 @@ def generate_report(
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     try:
         units = parser.parse_index()
-    except (FileNotFoundError, ValueError) as exc:
+    except FileNotFoundError as exc:
+        # FileNotFoundError can name either BACKLOG.md itself or a WU md
+        # referenced by it. Surface the actual path so the diagnostic
+        # stops blaming the index when the real culprit is a transient
+        # writer-window race on a single WU md (SDK-driven Write/Edit
+        # tools outside BacklogManager can leave a WU md momentarily
+        # unreadable; the parser already does one retry, this prefix
+        # tells the operator what to re-run if even the retry lost).
+        missing = getattr(exc, "filename", None) or str(exc)
+        sys.stderr.write(
+            f"devbench report: cannot read '{missing}' "
+            f"(referenced by '{BACKLOG_INDEX}'): {exc}\n"
+            "  If the missing path is a work-unit md and your orchestrator is\n"
+            "  active, this may be a transient writer-window race; re-run.\n"
+            "  Otherwise run `devbench validate-backlog` for a full index audit.\n"
+        )
+        sys.exit(1)
+    except ValueError as exc:
         # Issue #174: a malformed or non-canonical BACKLOG.md surfaces here
         # as a parser-level exception. Fail fast with an actionable
         # diagnostic naming the file + the parse failure so the operator
@@ -2147,6 +2777,15 @@ def generate_report(
             "  Run `devbench validate-backlog` for a full list of issues with the index.\n"
         )
         sys.exit(1)
+
+    # AC-192-12 / AC-192-13: apply session filter first when provided, then scope.
+    # Session filter restricts to WUs claimed by the named session; without it,
+    # all sessions are aggregated (AC-192-13).
+    units = _filter_units_by_session(units, session_name)
+
+    # Issue #190 (AC-190-10, AC-190-11): apply scope filter when provided.
+    units = _filter_units_by_scope(units, scope_filter)
+
     backlog = _backlog_totals_from_units(units)
 
     # Issue #162 Phase 1+4 cache: refresh the persistent SQLite index
@@ -2176,8 +2815,8 @@ def generate_report(
     all_timestamps: list[datetime] = event_index.all_log_timestamps_for_workspace(WORKSPACE_ROOT, log_path)
     log_start_for_window, window_end, log_started = _resolve_window_endpoints(all_timestamps)
 
-    # Precedence: report-specific (env JUDGE_REPORT_TIMEZONE > yaml
-    # report.display_timezone) > top-level (env JUDGE_DISPLAY_TIMEZONE >
+    # Precedence: report-specific (env DEVBENCH_REPORT_TIMEZONE > yaml
+    # report.display_timezone) > top-level (env DEVBENCH_DISPLAY_TIMEZONE >
     # yaml display_timezone) > OS local. REPORT_DISPLAY_TIMEZONE already
     # encodes the first pair; DISPLAY_TIMEZONE the second.
     display_tz = _resolve_display_timezone(REPORT_DISPLAY_TIMEZONE or DISPLAY_TIMEZONE)
@@ -2209,6 +2848,7 @@ def generate_report(
             backlog.tasks_active,
             backlog.tasks_blocked_recovery,
             backlog.tasks_blocked_auto,
+            backlog.tasks_blocked_runtime_degradation,
             event_index=event_index,
             recent_per_task_cost=recent_per_task_cost,
         )
@@ -2239,6 +2879,7 @@ def generate_report(
             backlog.tasks_active,
             backlog.tasks_blocked_recovery,
             backlog.tasks_blocked_auto,
+            backlog.tasks_blocked_runtime_degradation,
             event_index=event_index,
             recent_per_task_cost=recent_per_task_cost,
             lifetime_total_cost=lifetime_total_cost,
@@ -2326,7 +2967,7 @@ def generate_report(
         # All-time throughput window (which spans the entire log) shows
         # zero, the operator is reading a different log than the one
         # the orchestrator writes to -- typically because
-        # ``JUDGE_LOG_FILE`` was unset in the shell that ran
+        # ``DEVBENCH_LOG_FILE`` was unset in the shell that ran
         # ``devbench report`` and the default fell back to the devbench
         # source-tree log. Surface the discrepancy as a one-line
         # warning so the user does not silently misread the table.
@@ -2335,12 +2976,28 @@ def generate_report(
             lines.append("")
             lines.append(
                 f"WARNING: BACKLOG.md shows {backlog.tasks_done} done but log {log_path} shows 0 "
-                "-- check JUDGE_LOG_FILE points at the orchestrator's log."
+                "-- check DEVBENCH_LOG_FILE points at the orchestrator's log."
             )
         # Use the All-time stats for the trailing prose projection -- they're the
         # most stable sample. Narrower windows can have zero completed tasks
         # (e.g. just after a restart) which would project meaningless numbers.
         summary_stats = all_window_stats[0]
+
+    if by_role:
+        # Issue #206: opt-in per-role token/cost breakdown.  The data path
+        # was landed in PR #202 (issue #123) via
+        # ``_parse_transcript_metrics_by_role``; this section wires it
+        # into the rendered output.  Pricing reuses the per-model
+        # dispatcher (issue #223) -- per-role tokens are priced against
+        # whatever model that role actually ran on, so a role that
+        # spans multiple models (executor on opus + sonnet) gets a
+        # correct blended cost.
+        lines.extend(
+            _render_by_role_panel(
+                log_path=log_path,
+                window_start=summary_stats.window_start,
+            )
+        )
 
     lines.append("")
     lines.append(_summary_line(summary_stats, backlog.tasks_active, backlog.tasks_blocked))

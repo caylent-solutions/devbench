@@ -150,7 +150,7 @@ targets complete.
 
 | Knob | Default | Description |
 |---|---|---|
-| `orchestrate.max_cascade_depth` env: `JUDGE_ORCHESTRATE_MAX_CASCADE_DEPTH` | Set in `constants.py` | Maximum depth the ADR-07 cascade will recurse when unblocking chained tasks. When the cascade depth reaches this cap the sweep stops and further descendants remain blocked. |
+| `orchestrate.max_cascade_depth` env: `DEVBENCH_ORCHESTRATE_MAX_CASCADE_DEPTH` | Set in `constants.py` | Maximum depth the ADR-07 cascade will recurse when unblocking chained tasks. When the cascade depth reaches this cap the sweep stops and further descendants remain blocked. |
 
 **Operator commands.**
 
@@ -259,7 +259,7 @@ orchestrator has run multiple times), inspect `.devbench/proposals/` and
 
 | Knob | Default | Description |
 |---|---|---|
-| `DEFAULT_BLOCKED_RECOVERY_WINDOW_SECONDS` env: `JUDGE_BLOCKED_RECOVERY_WINDOW_SECONDS` | Set in `constants.py` | Window within which a `[BLOCKED]` audit comment from a recovery agent counts as Signal 3. After this window expires, Signal 3 no longer fires and the task downgrades to `OPERATOR_ACTION_REQUIRED`. |
+| `DEFAULT_BLOCKED_RECOVERY_WINDOW_SECONDS` env: `DEVBENCH_BLOCKED_RECOVERY_WINDOW_SECONDS` | Set in `constants.py` | Window within which a `[BLOCKED]` audit comment from a recovery agent counts as Signal 3. After this window expires, Signal 3 no longer fires and the task downgrades to `OPERATOR_ACTION_REQUIRED`. |
 | `recovery_window_seconds` parameter | `None` (uses `DEFAULT_BLOCKED_RECOVERY_WINDOW_SECONDS`) | Per-call override for `classify_blocked_task`. Used in tests and the report panel to control the window. |
 | `manifest_amendment.enabled` | `false` | When `false`, the manifest-amender is disabled and no amendments are processed; the task cannot enter the rejected-amendment recovery loop (Signal 2 can never be triggered). Set to `true` to activate the amendment workflow. |
 | `task_factory.enabled` | `false` | When `false`, the task-factory loop does not run after amendment rejects; proposal JSON (Signal 1) is never written by this path. Requires `manifest_amendment.enabled: true` to activate. |
@@ -373,9 +373,9 @@ $ devbench set-status E1-F2-S3-T9 in-queue
 When `classify_blocked_task` reaches priority 5
 (`AWAITING_AMENDMENT_RECOVERY`) with no marker and no pending dep, it relies on
 three on-disk signals. Signal 3 -- the audit-comment heuristic -- is governed by
-two allowlists defined at `proposal.py` lines 185-192:
+two allowlists defined at `proposal.py` lines 218-225:
 
-### `_RECOVERY_AGENT_TAGS` (line 185)
+### `_RECOVERY_AGENT_TAGS` (line 218)
 
 ```python
 _RECOVERY_AGENT_TAGS: frozenset[str] = frozenset(
@@ -394,12 +394,15 @@ amendment-reject / dependency / review-failure events. Broadening the allowlist
 would generate false positives (e.g., an executor that logs `[BLOCKED] waiting
 for external API` would incorrectly suppress operator-attention alerts).
 
-### `_RECOVERY_BODY_RE` (line 188)
+### `_RECOVERY_BODY_RE` (line 221)
 
 ```python
 _RECOVERY_BODY_RE: re.Pattern[str] = re.compile(
-    r"amendment-reject|out-of-scope|ALL_REVIEWS_FAILED|REVIEW_REJECTED"
-    r"|dependency .* not yet terminal|dep .* not yet terminal",
+    r"amendment[- ]reject(?:ed)?"
+    r"|out-of-scope"
+    r"|ALL_REVIEWS_FAILED|REVIEW_REJECTED"
+    r"|dependency .* not yet terminal|dep .* not yet terminal"
+    r"|will auto-requeue when",
     re.IGNORECASE,
 )
 ```

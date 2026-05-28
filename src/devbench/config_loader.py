@@ -2,7 +2,7 @@
 
 Config file path precedence (first match wins):
 1. ``explicit_path`` argument passed to ``resolve_config_path``
-2. ``JUDGE_CONFIG_PATH`` environment variable
+2. ``DEVBENCH_CONFIG_PATH`` environment variable
 3. Default path: ``<WORKSPACE_ROOT>/backlog/config/devbench.yaml``
 
 Config value precedence:
@@ -20,15 +20,13 @@ YAML schema::
     repos:                               # required -- at least one entry
       org/repo:                          # key must be "org/repo" format
         default_branch: main2            # optional -- omit to fall back to origin/HEAD
-        checkout_directory: my-checkout  # optional -- relative to JUDGE_WORKSPACE_ROOT
+        checkout_directory: my-checkout  # optional -- relative to DEVBENCH_WORKSPACE_ROOT
         merge_strategy: squash           # optional -- overrides top-level merge_strategy
 
     merge_strategy: squash               # optional -- default merge strategy for all repos
     max_executor_retries: <integer>      # optional -- max executor retries per work unit on judge failure
     use_bedrock: false                   # optional -- route LLM calls via AWS Bedrock
     bedrock_region: <aws-region-string>  # optional -- AWS region for Bedrock (env var override applied by config.py)
-    judge_model: <model-id>              # optional -- model for judge agents (env var override applied by config.py)
-    executor_model: <model-id>           # optional -- model for executor agent (env var override applied by config.py)
     allowed_orgs:                        # optional -- permitted GitHub organisations
       - caylent-solutions
 
@@ -38,8 +36,6 @@ YAML schema::
       security_fetch: <integer>
       llm: <integer>
       command: <integer>
-      executor: <integer>
-      executor_max_turns: <integer>
       orchestrator_poll_interval: <integer>
       github_check: <integer>
 
@@ -49,6 +45,11 @@ YAML schema::
       llm_evidence_truncation: <integer>
       llm_file_context: <integer>
       llm_file_preview_chars: <integer>
+
+    backlog:                             # optional -- backlog lifecycle settings (issue #189, #194)
+      default_status_for_new_work_units: in-queue  # 'draft' or 'in-queue' (default 'in-queue')
+      bulk_update_confirm_threshold: 10  # optional -- prompt threshold for bulk set-status (default 10, AC-194-4)
+      bulk_update_audit_path: logs/bulk-updates.log  # optional -- audit log path for bulk updates (AC-194-7)
 
     git_ops:                             # optional -- git workflow settings
       update_submodule: false            # set true only when repos are git submodules of a parent repo
@@ -63,6 +64,7 @@ Example config file (``backlog/config/devbench.yaml``)::
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -73,12 +75,26 @@ import yaml
 
 from devbench.constants import (
     ALL_REQUIRED_JUDGE_NAMES,
+    ALLOWED_AGENT_MODEL_SHORT_NAMES,
+    ANTHROPIC_AGENT_MODEL_PATTERN,
+    BEDROCK_AGENT_MODEL_PATTERN,
+    DEFAULT_FALLBACK_MODEL_RATES,
     DEFAULT_STOP_HOOK_MAX_BLOCKS,
     DEFAULT_STOP_HOOK_STALE_TASK_MINUTES,
     DEFAULT_STOP_HOOK_WINDOW_SECONDS,
-    DEFAULT_TOKEN_COST_PER_M_INPUT,
-    DEFAULT_TOKEN_COST_PER_M_OUTPUT,
+    STATUS_DRAFT,
+    STATUS_IN_QUEUE,
+    ModelRates,
 )
+
+_BACKLOG_DEFAULT_STATUS: str = STATUS_IN_QUEUE
+_VALID_DEFAULT_STATUSES: frozenset[str] = frozenset({STATUS_IN_QUEUE, STATUS_DRAFT})
+_BACKLOG_DEFAULT_BULK_UPDATE_CONFIRM_THRESHOLD: int = 10
+_BACKLOG_DEFAULT_BULK_UPDATE_AUDIT_PATH: str = "logs/bulk-updates.log"
+
+# Skills plugin configuration defaults (issue #221 E1-E10).
+_SKILLS_DEFAULT_FAN_OUT_THRESHOLD: int = 10
+_SKILLS_DEFAULT_MAX_ITERATIONS: int = 5
 
 # ---------------------------------------------------------------------------
 # Audit-row string constants for auto_finalize / auto_merge skill steps.
@@ -138,8 +154,6 @@ class TimeoutConfig:
         security_fetch: Security advisory fetch timeout.
         llm: LLM API call timeout.
         command: Shell command execution timeout.
-        executor: Executor agent overall timeout.
-        executor_max_turns: Maximum number of executor turns.
         orchestrator_poll_interval: Orchestrator polling interval.
         github_check: GitHub check status polling timeout.
     """
@@ -149,8 +163,6 @@ class TimeoutConfig:
     security_fetch: int | None = None
     llm: int | None = None
     command: int | None = None
-    executor: int | None = None
-    executor_max_turns: int | None = None
     orchestrator_poll_interval: int | None = None
     github_check: int | None = None
 
@@ -316,13 +328,27 @@ class DebugConfig:
 class ReportConfig:
     """Report and cost estimation settings.
 
+    Issue #223: the legacy scalar fields (``token_cost_per_million_input``,
+    ``token_cost_per_million_output``, ``token_cost_discount``) were removed
+    in favour of a per-model rate table (``models`` + ``default_model``).
+    Existing workspaces that set the old fields get a clear fail-fast error
+    at config-load time pointing at the new ``report.models`` block.
+
     Attributes:
-        token_cost_per_million_input: Cost per million input tokens in USD.
-        token_cost_per_million_output: Cost per million output tokens in USD.
+        models: Mapping of model id (e.g. ``claude-opus-4-7``) to its
+            ``ModelRates``.  When empty, every observed model id is priced
+            against ``default_model``.  Operators typically populate this
+            block from ``docs/model-pricing.md``'s Standard pricing table.
+        default_model: Rates applied to the ``"<unknown>"`` bucket -- any
+            transcript message whose ``model`` field is missing OR any
+            model id not present in ``models``.  Defaults to
+            ``DEFAULT_FALLBACK_MODEL_RATES`` when absent from YAML.
         display_timezone: IANA timezone name for displaying report timestamps.
             ``None`` means use the host's system local timezone.
         cache_read_multiplier: Cost multiplier for cache-read tokens, relative
-            to the base input rate. ``None`` means use the constant default.
+            to the base input rate.  ``None`` means use the constant default.
+            Applied to a model id only when that ``ModelRates`` does not
+            override ``cache_read_multiplier`` itself.
         cache_write_5min_multiplier: Cost multiplier for 5-minute prompt-cache
             write tokens, relative to the base input rate.
         cache_write_1hr_multiplier: Cost multiplier for 1-hour prompt-cache
@@ -334,15 +360,10 @@ class ReportConfig:
         recent_pace_tasks: Number of most recently completed tasks to average
             for the "Recent pace" projection. ``None`` falls back to
             ``DEFAULT_RECENT_PACE_TASKS``.
-        token_cost_discount: Contract discount (correction factor) off
-            list-price token cost, as a fraction in ``[0.0, 1.0]``.
-            ``final_cost = raw_list_cost * (1 - token_cost_discount)``.
-            ``None`` falls back to ``DEFAULT_TOKEN_COST_DISCOUNT`` (``0.0``,
-            pay full list).
     """
 
-    token_cost_per_million_input: float = DEFAULT_TOKEN_COST_PER_M_INPUT
-    token_cost_per_million_output: float = DEFAULT_TOKEN_COST_PER_M_OUTPUT
+    models: dict[str, ModelRates] = dataclasses.field(default_factory=dict)
+    default_model: ModelRates = dataclasses.field(default_factory=lambda: DEFAULT_FALLBACK_MODEL_RATES)
     display_timezone: str | None = None
     cache_read_multiplier: float | None = None
     cache_write_5min_multiplier: float | None = None
@@ -350,16 +371,14 @@ class ReportConfig:
     data_residency_multiplier: float | None = None
     fast_mode_multiplier: float | None = None
     recent_pace_tasks: int | None = None
-    token_cost_discount: float | None = None
 
 
 @dataclass(frozen=True)
 class ValidateConfig:
     """Per-backlog opt-in toggles for additional ``validate-backlog`` rules.
 
-    Existing rules (1-19) run unconditionally. Rules added here are gated so
-    pre-existing backlogs see no behaviour change until they explicitly opt
-    in. See ``docs/backlog-contract.md`` for the full rule list.
+    Existing rules (1-19) run unconditionally. Rules here are individually
+    toggleable. See ``docs/backlog-contract.md`` for the full rule list.
 
     Attributes:
         check_orphan_path_tokens: Rule 20. When ``True``, validate-backlog
@@ -370,10 +389,10 @@ class ValidateConfig:
             (after path normalisation). A token followed by ``(ref)`` is
             treated as a declared read-only reference and skipped. Catches
             spec drift where AC/DoD prose restates a path that disagrees
-            with the Manifest. Default ``False`` (opt-in).
+            with the Manifest. Default ``True`` (set ``false`` to opt out).
     """
 
-    check_orphan_path_tokens: bool = False
+    check_orphan_path_tokens: bool = True
 
 
 @dataclass(frozen=True)
@@ -391,25 +410,25 @@ class TaskFactoryConfig:
             the amendment-reject path).
         auto_accept_proposals: When ``True``, ``devbench sweep-proposals``
             auto-promotes every task-factory-produced draft to ``in-queue``
-            immediately, skipping the human review step. Default ``False``
-            preserves pre-ADR-11 behaviour (drafts land at ``proposed``
-            and wait for the operator). See ADR-11.
+            immediately, skipping the human review step. Default ``True``
+            (set ``false`` to make drafts land at ``proposed`` and wait for
+            the operator). Only takes effect when ``enabled`` is true. See ADR-11.
     """
 
     enabled: bool = False
-    auto_accept_proposals: bool = False
+    auto_accept_proposals: bool = True
 
 
 @dataclass(frozen=True)
 class AmendmentConfig:
     """Per-backlog Changes Manifest amendment workflow configuration.
 
-    Loaded from the ``manifest_amendment`` YAML section (opt-in, defaults off).
+    Loaded from the ``manifest_amendment`` YAML section (defaults on).
     Consumed by the Layer 1 PreFilter in ``devbench.backlog.amendment``.
 
     Attributes:
         enabled: Whether the amendment workflow is active for this backlog.
-            Default ``False`` -- backlogs must explicitly opt in.
+            Default ``True`` -- set ``false`` to opt out.
         allowed_reasons: Set of amendment reasons this backlog accepts.
             Requests whose reason is not in this set are rejected by the
             pre-filter.
@@ -417,7 +436,7 @@ class AmendmentConfig:
             single task during one executor run; prevents amendment loops.
     """
 
-    enabled: bool = False
+    enabled: bool = True
     allowed_reasons: frozenset[str] = field(default_factory=lambda: frozenset({"tdd_green_production_fix"}))
     max_requests_per_execution: int = 1
 
@@ -481,6 +500,409 @@ class OrchestrateConfig:
     max_cascade_depth: int | None = None
 
 
+@dataclass(frozen=True)
+class BacklogConfig:
+    """Backlog lifecycle settings loaded from the ``backlog:`` YAML section.
+
+    Controls behaviour that applies across all work units in the backlog,
+    such as what lifecycle status new work units receive on creation and
+    confirmation thresholds for bulk operations.
+
+    Attributes:
+        default_status_for_new_work_units: Lifecycle status written into the
+            ``## Status:`` line of every newly created work-unit file.
+            Accepted values: ``STATUS_DRAFT`` (``'draft'``) or
+            ``STATUS_IN_QUEUE`` (``'in-queue'``), imported from
+            ``devbench.constants``. Defaults to ``STATUS_IN_QUEUE`` for
+            backwards compatibility -- existing workspaces without the config
+            key see no behaviour change (AC-189-9). Set to ``STATUS_DRAFT``
+            (``'draft'``) to require explicit human promotion before the
+            orchestrator picks up a new task (AC-189-8).
+        bulk_update_confirm_threshold: Number of work units above which
+            ``devbench set-status`` with selector flags prompts for
+            confirmation before applying a bulk status change. Must be >= 0.
+            Zero means always prompt. Defaults to 10 (AC-194-4).
+        bulk_update_audit_path: Workspace-relative path to the file where
+            bulk-update audit rows are appended. Each invocation of
+            ``devbench set-status`` with selector flags writes one
+            ``[BULK_STATUS_UPDATE]`` row. Defaults to
+            ``'logs/bulk-updates.log'`` (AC-194-7).
+    """
+
+    default_status_for_new_work_units: str = _BACKLOG_DEFAULT_STATUS
+    bulk_update_confirm_threshold: int = _BACKLOG_DEFAULT_BULK_UPDATE_CONFIRM_THRESHOLD
+    bulk_update_audit_path: str = _BACKLOG_DEFAULT_BULK_UPDATE_AUDIT_PATH
+
+
+@dataclass
+class SkillsConfig:
+    """Plugin-skill configuration loaded from the ``skills:`` YAML section.
+
+    Controls how the bundled spec-to-backlog and create-spec skills resolve
+    operator-facing knobs (exemplar paths, fan-out and iteration budgets).
+    Every field is optional; when a workspace omits the section entirely
+    each skill falls back to defaults baked into its SKILL.md prompt.
+
+    Attributes:
+        exemplar_backlog_path: Absolute or workspace-relative path to a
+            representative ``BACKLOG.md`` the ``spec-to-backlog`` skill
+            consults to internalise the project's quality bar. ``None``
+            (the default) means the skill uses the canonical-section list
+            embedded in its prompt as the sole quality reference (issue
+            #221 E1).
+        exemplar_spec_path: Absolute or workspace-relative path to a
+            representative spec file the ``create-spec`` skill consults
+            for its quality bar. ``None`` falls back to the 16-section
+            structural skeleton embedded in the prompt (E2).
+        fan_out_threshold: When the Epic decomposition produces strictly
+            more than this many leaf tasks, the spec-to-backlog skill
+            fans the per-task authoring out across one sub-Agent per
+            Feature instead of writing tasks serially. Defaults to 10.
+        max_iterations: Maximum self-critique iterations per skill
+            invocation before emitting a ``[SKILL_MAX_ITERATIONS_REACHED]``
+            audit comment with the unresolved rubric items. Defaults to 5.
+    """
+
+    exemplar_backlog_path: str | None = None
+    exemplar_spec_path: str | None = None
+    fan_out_threshold: int = _SKILLS_DEFAULT_FAN_OUT_THRESHOLD
+    max_iterations: int = _SKILLS_DEFAULT_MAX_ITERATIONS
+
+
+def _parse_model_rates(model_id: str, raw: object, source: str) -> ModelRates:
+    """Parse one ``report.models.<id>`` entry into a ``ModelRates``.
+
+    Issue #223.  The schema (``config-schema.json``) enforces shape with
+    ``additionalProperties: false`` per model entry; this runtime helper
+    validates ranges and converts the raw dict into the dataclass.  Raises
+    ``ValueError`` with the offending model id and source path so operators
+    see exactly which entry tripped the check.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"Config file '{source}': report.models.{model_id!r} must be a mapping; got {type(raw).__name__}."
+        )
+    if "input" not in raw or "output" not in raw:
+        raise ValueError(
+            f"Config file '{source}': report.models.{model_id!r} missing required field "
+            "(both 'input' and 'output' are mandatory per model entry)."
+        )
+    input_rate = float(raw["input"])
+    output_rate = float(raw["output"])
+    if input_rate < 0 or output_rate < 0:
+        raise ValueError(
+            f"Config file '{source}': report.models.{model_id!r} rates must be non-negative; "
+            f"got input={input_rate}, output={output_rate}."
+        )
+    correction = float(raw.get("correction_factor", 1.0))
+    if correction <= 0:
+        raise ValueError(
+            f"Config file '{source}': report.models.{model_id!r} correction_factor must be > 0; got {correction}."
+        )
+    return ModelRates(
+        input=input_rate,
+        output=output_rate,
+        cache_read_multiplier=(float(raw["cache_read_multiplier"]) if "cache_read_multiplier" in raw else None),
+        cache_write_5min_multiplier=(
+            float(raw["cache_write_5min_multiplier"]) if "cache_write_5min_multiplier" in raw else None
+        ),
+        cache_write_1hr_multiplier=(
+            float(raw["cache_write_1hr_multiplier"]) if "cache_write_1hr_multiplier" in raw else None
+        ),
+        correction_factor=correction,
+    )
+
+
+def _parse_report_models(raw: object, source: str) -> dict[str, ModelRates]:
+    """Parse the ``report.models`` block (issue #223).
+
+    Returns an empty mapping when the block is absent OR explicitly empty.
+    Operators with an empty block fall back entirely to
+    ``report.default_model`` for every observed model id, which is a valid
+    minimal configuration for workspaces that only ever run one model.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"Config file '{source}': report.models must be a mapping of model-id -> rates; got {type(raw).__name__}."
+        )
+    return {model_id: _parse_model_rates(model_id, entry, source) for model_id, entry in raw.items()}
+
+
+def _parse_default_model_rates(raw: object, source: str) -> ModelRates:
+    """Parse the ``report.default_model`` block (issue #223).
+
+    Falls back to ``DEFAULT_FALLBACK_MODEL_RATES`` when absent.  Operators
+    on standard Anthropic pricing typically leave this unset; the default
+    matches Opus 4.7 list pricing so an unknown-model bucket errs toward
+    over-reporting cost rather than under-reporting.
+    """
+    if raw is None:
+        return DEFAULT_FALLBACK_MODEL_RATES
+    return _parse_model_rates("<default_model>", raw, source)
+
+
+def _parse_skills_config(path: Path, skills_raw: dict) -> SkillsConfig:
+    """Parse and validate the ``skills:`` YAML section into a ``SkillsConfig``.
+
+    Args:
+        path: Config file path (used in error messages).
+        skills_raw: Raw ``skills`` dict from YAML (already schema-validated
+            for unknown keys and types). May be an empty dict when the
+            section is absent.
+
+    Returns:
+        ``SkillsConfig`` populated from *skills_raw*.
+
+    Raises:
+        ValueError: If ``fan_out_threshold`` or ``max_iterations`` is
+            present but not a positive integer (the schema enforces
+            ``minimum: 1``; this is the defensive runtime re-check).
+    """
+    exemplar_backlog = skills_raw.get("exemplar_backlog_path") or None
+    exemplar_spec = skills_raw.get("exemplar_spec_path") or None
+    fan_out_raw = skills_raw.get("fan_out_threshold", _SKILLS_DEFAULT_FAN_OUT_THRESHOLD)
+    max_iter_raw = skills_raw.get("max_iterations", _SKILLS_DEFAULT_MAX_ITERATIONS)
+    fan_out = int(fan_out_raw)
+    if fan_out < 1:
+        raise ValueError(f"Config file '{path}': skills.fan_out_threshold must be >= 1; got {fan_out_raw!r}.")
+    max_iter = int(max_iter_raw)
+    if max_iter < 1:
+        raise ValueError(f"Config file '{path}': skills.max_iterations must be >= 1; got {max_iter_raw!r}.")
+    return SkillsConfig(
+        exemplar_backlog_path=str(exemplar_backlog) if exemplar_backlog else None,
+        exemplar_spec_path=str(exemplar_spec) if exemplar_spec else None,
+        fan_out_threshold=fan_out,
+        max_iterations=max_iter,
+    )
+
+
+def _parse_backlog_config(path: Path, backlog_raw: dict) -> BacklogConfig:
+    """Parse and validate the ``backlog:`` YAML section into a ``BacklogConfig``.
+
+    Args:
+        path: Config file path (used in error messages).
+        backlog_raw: Raw ``backlog`` dict from YAML (already schema-validated
+            for unknown keys). May be an empty dict when the section is absent.
+
+    Returns:
+        ``BacklogConfig`` populated from *backlog_raw*.
+
+    Raises:
+        ValueError: If ``default_status_for_new_work_units`` is set to a
+            value that is not in ``_VALID_DEFAULT_STATUSES``.
+        ValueError: If ``bulk_update_confirm_threshold`` is negative.
+    """
+    raw_status = backlog_raw.get(
+        "default_status_for_new_work_units",
+        _BACKLOG_DEFAULT_STATUS,
+    )
+    if raw_status not in _VALID_DEFAULT_STATUSES:
+        valid_sorted = ", ".join(sorted(_VALID_DEFAULT_STATUSES))
+        raise ValueError(
+            f"Config file '{path}': backlog.default_status_for_new_work_units "
+            f"must be one of [{valid_sorted}]; got {raw_status!r}. "
+            f"Use {STATUS_DRAFT!r} to require explicit promotion before execution, "
+            f"or {STATUS_IN_QUEUE!r} (the default) for the legacy behaviour."
+        )
+    raw_threshold = backlog_raw.get(
+        "bulk_update_confirm_threshold",
+        _BACKLOG_DEFAULT_BULK_UPDATE_CONFIRM_THRESHOLD,
+    )
+    threshold = int(raw_threshold)
+    if threshold < 0:
+        raise ValueError(
+            f"Config file '{path}': backlog.bulk_update_confirm_threshold "
+            f"must be >= 0; got {threshold!r}. "
+            "Set to 0 to always prompt, or a positive integer to prompt only "
+            "when the expansion exceeds that count."
+        )
+    raw_audit_path = backlog_raw.get(
+        "bulk_update_audit_path",
+        _BACKLOG_DEFAULT_BULK_UPDATE_AUDIT_PATH,
+    )
+    return BacklogConfig(
+        default_status_for_new_work_units=raw_status,
+        bulk_update_confirm_threshold=threshold,
+        bulk_update_audit_path=str(raw_audit_path),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Notifications (Slack + generic webhook) -- spec / PR #202
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class NotificationsSlackConfig:
+    """Slack endpoint for the notifications dispatcher.
+
+    One shared webhook URL is used for every enabled event; the
+    payload itself carries an ``<!here>`` mention so the same payload
+    works whether the webhook is bound to a one-person private DM
+    channel or a shared team channel.
+
+    Attributes:
+        enabled: Endpoint-level toggle.  When ``False``, no Slack POST
+            happens even if the master ``notifications.enabled`` is
+            ``True`` and the per-event toggle is on.  Default
+            ``False`` -- the operator opts in explicitly.
+        webhook_url: Slack incoming webhook URL (channel-scoped).
+            ``None`` disables Slack notifications regardless of the
+            ``enabled`` flag.
+    """
+
+    enabled: bool = False
+    webhook_url: str | None = None
+
+
+@dataclass
+class NotificationsEventsConfig:
+    """Per-event toggles for the notifications dispatcher.
+
+    Every field defaults to ``False`` so the dispatcher is silent
+    until the operator opts in.  Field names match the
+    ``EVENT_*`` constants in :mod:`devbench.notifications`.
+    """
+
+    work_unit_done: bool = False
+    work_unit_blocked_operator: bool = False
+    work_unit_blocked_runtime_degradation: bool = False
+    work_unit_blocked_held: bool = False
+    work_unit_blocked_on_held: bool = False
+    work_unit_blocked_auto_clearing: bool = False
+    work_unit_blocked_awaiting_dependency: bool = False
+    work_unit_blocked_amendment_recovery: bool = False
+    work_unit_materialised: bool = False
+    work_unit_promoted: bool = False
+    pr_opened: bool = False
+    pr_merged: bool = False
+    ci_failure: bool = False
+    # Issue #219: fires on CIResult.GREEN inside the finalize path so
+    # operators running ``git_ops.auto_merge: false`` get an explicit
+    # "PR ready for manual merge" Slack signal.  Default ``False`` --
+    # existing workspaces stay silent on upgrade.
+    ci_pass: bool = False
+    orchestrator_stop: bool = False
+    orchestrator_auto_restart: bool = False
+
+
+@dataclass
+class NotificationsConfig:
+    """Operator-facing notification dispatcher configuration.
+
+    The default-constructed value has ``enabled=False`` and every
+    event toggle off, so omitting the ``notifications:`` yaml block
+    means "no notifications", matching the spec's opt-in posture.
+
+    Endpoints live in their own nested sub-blocks (today: ``slack``;
+    future: ``discord``, ``teams``, ``generic_webhook``, etc.) so the
+    schema accommodates additional notification transports without
+    touching the per-event toggle surface.
+
+    Attributes:
+        enabled: Master switch.  When ``False``, no event fires
+            regardless of per-event toggles.  Default ``False``.
+        timeout_seconds: Per-POST HTTP timeout.  Default 10.
+        events: Per-event toggle struct.
+        slack: Slack endpoint config (enabled flag + webhook URL).
+    """
+
+    enabled: bool = False
+    timeout_seconds: float = 10.0
+    events: NotificationsEventsConfig = field(default_factory=NotificationsEventsConfig)
+    slack: NotificationsSlackConfig = field(default_factory=NotificationsSlackConfig)
+
+
+def _validate_webhook_url(label: str, value: object) -> str | None:
+    """Validate a webhook URL field at config-load time.
+
+    Returns the URL unchanged when valid, ``None`` when *value* is
+    null / empty.  Raises ``ValueError`` for any non-string,
+    non-``https://`` value.  CLAUDE.md "fail-fast at config-load"
+    catches typos and credential-injection attempts before any HTTP
+    traffic.
+    """
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{label}: must be a string or null, got {type(value).__name__}")
+    if not value.startswith("https://"):
+        raise ValueError(f"{label}: must start with 'https://' (got {value[:20]!r}...)")
+    return value
+
+
+def _parse_notifications_config(raw: dict) -> NotificationsConfig:
+    """Parse a ``notifications:`` yaml block into a :class:`NotificationsConfig`.
+
+    Schema validation in ``load_runtime_config`` already rejects
+    unknown keys; this function applies the value-level checks
+    (URL scheme) so a malformed value fails fast at config-load time,
+    not on first dispatch attempt.
+    """
+    defaults = NotificationsConfig()
+
+    slack_raw = raw.get("slack") or {}
+    slack = NotificationsSlackConfig(
+        enabled=bool(slack_raw.get("enabled", defaults.slack.enabled)),
+        webhook_url=_validate_webhook_url("notifications.slack.webhook_url", slack_raw.get("webhook_url")),
+    )
+
+    events_raw = raw.get("events") or {}
+    events = NotificationsEventsConfig(
+        work_unit_done=bool(events_raw.get("work_unit_done", defaults.events.work_unit_done)),
+        work_unit_blocked_operator=bool(
+            events_raw.get("work_unit_blocked_operator", defaults.events.work_unit_blocked_operator)
+        ),
+        work_unit_blocked_runtime_degradation=bool(
+            events_raw.get(
+                "work_unit_blocked_runtime_degradation",
+                defaults.events.work_unit_blocked_runtime_degradation,
+            )
+        ),
+        work_unit_blocked_held=bool(events_raw.get("work_unit_blocked_held", defaults.events.work_unit_blocked_held)),
+        work_unit_blocked_on_held=bool(
+            events_raw.get("work_unit_blocked_on_held", defaults.events.work_unit_blocked_on_held)
+        ),
+        work_unit_blocked_auto_clearing=bool(
+            events_raw.get(
+                "work_unit_blocked_auto_clearing",
+                defaults.events.work_unit_blocked_auto_clearing,
+            )
+        ),
+        work_unit_blocked_awaiting_dependency=bool(
+            events_raw.get(
+                "work_unit_blocked_awaiting_dependency",
+                defaults.events.work_unit_blocked_awaiting_dependency,
+            )
+        ),
+        work_unit_blocked_amendment_recovery=bool(
+            events_raw.get(
+                "work_unit_blocked_amendment_recovery",
+                defaults.events.work_unit_blocked_amendment_recovery,
+            )
+        ),
+        work_unit_materialised=bool(events_raw.get("work_unit_materialised", defaults.events.work_unit_materialised)),
+        work_unit_promoted=bool(events_raw.get("work_unit_promoted", defaults.events.work_unit_promoted)),
+        pr_opened=bool(events_raw.get("pr_opened", defaults.events.pr_opened)),
+        pr_merged=bool(events_raw.get("pr_merged", defaults.events.pr_merged)),
+        ci_failure=bool(events_raw.get("ci_failure", defaults.events.ci_failure)),
+        ci_pass=bool(events_raw.get("ci_pass", defaults.events.ci_pass)),
+        orchestrator_stop=bool(events_raw.get("orchestrator_stop", defaults.events.orchestrator_stop)),
+        orchestrator_auto_restart=bool(
+            events_raw.get("orchestrator_auto_restart", defaults.events.orchestrator_auto_restart)
+        ),
+    )
+
+    return NotificationsConfig(
+        enabled=bool(raw.get("enabled", defaults.enabled)),
+        timeout_seconds=float(raw.get("timeout_seconds", defaults.timeout_seconds)),
+        events=events,
+        slack=slack,
+    )
+
+
 @dataclass
 class RepoConfig:
     """Per-repository configuration.
@@ -488,7 +910,7 @@ class RepoConfig:
     Attributes:
         default_branch: Explicit default branch to use for this repo.
             When ``None``, branch consumers fall back to ``origin/HEAD``.
-        checkout_directory: Path relative to ``JUDGE_WORKSPACE_ROOT`` where
+        checkout_directory: Path relative to ``DEVBENCH_WORKSPACE_ROOT`` where
             the repo is checked out.  Must not be absolute or contain ``..``.
             When ``None``, defaults to the repo short-name (the part after
             the ``/`` in ``org/repo``).
@@ -496,7 +918,7 @@ class RepoConfig:
             the top-level ``RuntimeConfig.merge_strategy`` is used.
         resolved_checkout_path: Absolute filesystem path to the repo
             checkout, populated by ``load_runtime_config``. Equal to
-            ``<JUDGE_WORKSPACE_ROOT>/<checkout_directory or repo_short_name>``
+            ``<DEVBENCH_WORKSPACE_ROOT>/<checkout_directory or repo_short_name>``
             after resolution. Consumers MUST read this field instead of
             re-resolving the path inline (E213).
         validated_repo: Canonical ``org/repo`` form for this entry,
@@ -510,6 +932,183 @@ class RepoConfig:
     merge_strategy: str | None = None
     resolved_checkout_path: Path | None = None
     validated_repo: str | None = None
+
+
+@dataclass
+class ReviewTeamModelsConfig:
+    """Per-judge model overrides for the four review_team agents (ADR-25).
+
+    Every field defaults to ``None``; the corresponding judge runs on the
+    model declared in its ``.md`` frontmatter when its field is ``None``.
+    Operators set fields to opt-in per-judge to manage Sonnet / Opus / Bedrock
+    quota independently.
+
+    Attributes:
+        code_reviewer: Override for ``plugin/devbench-orchestrate/agents/review_team/code-reviewer.md``.
+        test_reviewer: Override for ``plugin/devbench-orchestrate/agents/review_team/test-reviewer.md``.
+        doc_reviewer: Override for ``plugin/devbench-orchestrate/agents/review_team/doc-reviewer.md``.
+        changes_manifest: Override for ``plugin/devbench-orchestrate/agents/review_team/changes-manifest.md``.
+    """
+
+    code_reviewer: str | None = None
+    test_reviewer: str | None = None
+    doc_reviewer: str | None = None
+    changes_manifest: str | None = None
+
+
+@dataclass
+class AgentModelsConfig:
+    """Per-agent model overrides for the work-agents in the devbench plugin (ADR-25).
+
+    Each field corresponds to one ``.md`` file under ``plugin/devbench-orchestrate/agents/``.
+    When a field is ``None`` (the default), the agent runs on the model
+    declared in its frontmatter. When set, ``devbench.plugin_shadow`` rewrites
+    the frontmatter ``model:`` line in a workspace-local shadow copy and the
+    Agent SDK / ``claude --plugin-dir`` is pointed at the shadow.
+
+    Operators set this so they can manage Sonnet / Opus / Bedrock quota
+    separately (e.g. drive ``executor`` on opus when sonnet quota is exhausted).
+    ``config.py`` merges ``JUDGE_AGENT_MODEL_*`` env vars over the YAML values
+    after this dataclass is constructed.
+
+    Attributes:
+        executor: Override for ``plugin/devbench-orchestrate/agents/executor.md``.
+        blocker_resolver: Override for ``plugin/devbench-orchestrate/agents/blocker-resolver.md``.
+        manifest_amender: Override for ``plugin/devbench-orchestrate/agents/manifest-amender.md``.
+        security_reviewer: Override for ``plugin/devbench-orchestrate/agents/security-reviewer.md``.
+        task_factory: Override for ``plugin/devbench-orchestrate/agents/task-factory.md``.
+        review_supervisor: Override for ``plugin/devbench-orchestrate/agents/review-supervisor.md``.
+        review_team: Nested overrides for the four review_team judges.
+    """
+
+    executor: str | None = None
+    blocker_resolver: str | None = None
+    manifest_amender: str | None = None
+    security_reviewer: str | None = None
+    task_factory: str | None = None
+    review_supervisor: str | None = None
+    review_team: ReviewTeamModelsConfig = field(default_factory=ReviewTeamModelsConfig)
+
+
+def validate_agent_model_value(
+    source: str,
+    agent_label: str,
+    value: str,
+    use_bedrock: bool,
+) -> None:
+    """Validate one agent override value against the use_bedrock toggle.
+
+    Per ADR-25 the override must match the same channel as
+    ``use_bedrock``: short names + Anthropic API ids are accepted only when
+    ``use_bedrock`` is False; Bedrock ARNs are accepted only when it is True.
+    Fail fast with a clear actionable message; the SDK's downstream error
+    would otherwise surface as a generic 401/404 at first invocation.
+
+    Used by both the YAML loader (``source`` is the config file path) and
+    ``config.py`` after ``JUDGE_AGENT_MODEL_*`` env var merging (``source``
+    is the env var name) so YAML and env-supplied values get the same
+    fail-fast treatment.
+
+    Haiku is unconditionally rejected for every per-agent field (case-insensitive
+    substring match so both the short name ``haiku``, full Anthropic ids like
+    ``claude-haiku-4-5-20251001``, and Bedrock ARNs containing ``haiku`` are
+    all caught). The rejection raises a ``ValueError`` whose message names the
+    offending field, the rejected value, and references
+    caylent-solutions/devbench#198 so an operator who sees the error can find
+    the rationale. There is no override path; the only way to use haiku is to
+    edit the canonical constants module locally.
+
+    Args:
+        source: Human-readable origin of the value (file path or env var
+            name) included in the error message.
+        agent_label: Dotted label of the agent (``executor``,
+            ``review_team.code_reviewer``).
+        value: The string value to validate.
+        use_bedrock: Currently-resolved use_bedrock flag.
+
+    Raises:
+        ValueError: When *value* contains ``haiku`` (case-insensitive), or when
+            *value* does not match the format implied by *use_bedrock*.
+    """
+    if "haiku" in value.lower():
+        raise ValueError(
+            f"{source}: agents.{agent_label} = {value!r} is rejected. "
+            "Haiku is not permitted for any work agent -- under load the Claude "
+            "Agent SDK was repeatedly observed to silently drop the Agent tool from "
+            "haiku's tool list, causing RUNTIME_DEGRADATION failures. Use 'sonnet' "
+            "or 'opus' instead. See caylent-solutions/devbench#198."
+        )
+    if use_bedrock:
+        if not BEDROCK_AGENT_MODEL_PATTERN.match(value):
+            raise ValueError(
+                f"{source}: agents.{agent_label} = {value!r} is not a valid Bedrock "
+                "model id while use_bedrock: true. Expected pattern "
+                "'us.anthropic.claude-<name>-<ver>-v<N>' (e.g. "
+                "'us.anthropic.claude-opus-4-7-v1')."
+            )
+        return
+    if value in ALLOWED_AGENT_MODEL_SHORT_NAMES:
+        return
+    if ANTHROPIC_AGENT_MODEL_PATTERN.match(value):
+        return
+    short = ", ".join(sorted(ALLOWED_AGENT_MODEL_SHORT_NAMES))
+    raise ValueError(
+        f"{source}: agents.{agent_label} = {value!r} is not a valid Anthropic API "
+        f"model id while use_bedrock: false. Accepted short names: {short}. Accepted "
+        "full ids: 'claude-<name>-<digits>(-...)' (e.g. 'claude-opus-4-7')."
+    )
+
+
+def _parse_agent_models_config(
+    path: Path,
+    raw: object,
+    use_bedrock: bool,
+) -> AgentModelsConfig:
+    """Parse the ``agents`` YAML section into an ``AgentModelsConfig``.
+
+    The JSON Schema already rejects unknown keys + wrong types; this parser
+    cross-validates each value against ``use_bedrock`` so an inconsistent
+    config fails at load time, not at first agent invocation.
+
+    Args:
+        path: Config file path (used in error messages).
+        raw: Raw ``agents`` value from YAML (already schema-validated).
+        use_bedrock: Top-level ``use_bedrock`` flag from the same YAML.
+
+    Returns:
+        ``AgentModelsConfig`` with every supplied override populated and
+        every absent field left at ``None``.
+    """
+    if not isinstance(raw, dict):
+        return AgentModelsConfig()
+
+    top_fields = (
+        "executor",
+        "blocker_resolver",
+        "manifest_amender",
+        "security_reviewer",
+        "task_factory",
+        "review_supervisor",
+    )
+    kwargs: dict[str, str] = {}
+    for key in top_fields:
+        value = raw.get(key)
+        if value is None:
+            continue
+        validate_agent_model_value(f"Config file '{path}'", key, value, use_bedrock)
+        kwargs[key] = value
+
+    review_team_raw = raw.get("review_team") or {}
+    review_team_kwargs: dict[str, str] = {}
+    for key in ("code_reviewer", "test_reviewer", "doc_reviewer", "changes_manifest"):
+        value = review_team_raw.get(key)
+        if value is None:
+            continue
+        validate_agent_model_value(f"Config file '{path}'", f"review_team.{key}", value, use_bedrock)
+        review_team_kwargs[key] = value
+    review_team = ReviewTeamModelsConfig(**review_team_kwargs)
+
+    return AgentModelsConfig(review_team=review_team, **kwargs)
 
 
 @dataclass
@@ -528,9 +1127,8 @@ class RuntimeConfig:
         git_ops: Git operations workflow settings.
         report: Report and cost estimation settings.
         stop_hook: Stop hook circuit breaker settings.
+        backlog: Backlog lifecycle settings (default status for new WUs).
         allowed_orgs: List of permitted GitHub organisations.
-        judge_model: Model identifier used by judge agents.
-        executor_model: Model identifier used by the executor agent.
         use_bedrock: Whether to route LLM calls through AWS Bedrock.
         bedrock_region: AWS region for Bedrock API calls.
         merge_strategy: Default PR merge strategy for all repos.
@@ -546,9 +1144,9 @@ class RuntimeConfig:
             ``cmd_report`` (the reader) both consult this single source
             of truth so they cannot diverge by accident; in earlier
             versions the two were both env-var-driven and could be
-            split silently when an operator set ``JUDGE_LOG_FILE`` to
+            split silently when an operator set ``DEVBENCH_LOG_FILE`` to
             different values in different shells. ``None`` (the
-            default) means callers must supply ``JUDGE_LOG_FILE``
+            default) means callers must supply ``DEVBENCH_LOG_FILE``
             explicitly or rely on the workspace-local convention
             ``logs/orchestrator.log``.
     """
@@ -561,16 +1159,18 @@ class RuntimeConfig:
     stop_hook: StopHookConfig = field(default_factory=StopHookConfig)
     hook_tail: HookTailConfig = field(default_factory=HookTailConfig)
     orchestrate: OrchestrateConfig = field(default_factory=OrchestrateConfig)
+    backlog: BacklogConfig = field(default_factory=BacklogConfig)
+    skills: SkillsConfig = field(default_factory=SkillsConfig)
     manifest_amendment: AmendmentConfig = field(default_factory=AmendmentConfig)
     task_factory: TaskFactoryConfig = field(default_factory=TaskFactoryConfig)
+    agent_models: AgentModelsConfig = field(default_factory=AgentModelsConfig)
     validate: ValidateConfig = field(default_factory=ValidateConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
+    notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
     allowed_orgs: list[str] = field(default_factory=list)
-    judge_model: str | None = None
-    executor_model: str | None = None
     use_bedrock: bool = False
     bedrock_region: str | None = None
-    merge_strategy: str | None = None
+    merge_strategy: str | None = "squash"
     max_executor_retries: int | None = None
     max_executor_retries_per_judge: dict[str, int] = field(default_factory=dict)
     display_timezone: str | None = None
@@ -582,13 +1182,13 @@ def resolve_config_path(
     env: Mapping[str, str],
     workspace_root: Path,
 ) -> Path:
-    """Return config file path using precedence: explicit > JUDGE_CONFIG_PATH > default.
+    """Return config file path using precedence: explicit > DEVBENCH_CONFIG_PATH > default.
 
     Args:
         explicit_path: Path from the ``--config`` CLI argument, or ``None``.
         env: Environment variable mapping (typically ``os.environ``).
         workspace_root: Absolute path to the workspace root
-            (value of ``JUDGE_WORKSPACE_ROOT``).
+            (value of ``DEVBENCH_WORKSPACE_ROOT``).
 
     Returns:
         Resolved config file path.  The path may not exist on disk -- callers
@@ -596,7 +1196,7 @@ def resolve_config_path(
     """
     if explicit_path:
         return Path(explicit_path)
-    env_path = env.get("JUDGE_CONFIG_PATH", "")
+    env_path = env.get("DEVBENCH_CONFIG_PATH", "")
     if env_path:
         return Path(env_path)
     return workspace_root / DEFAULT_CONFIG_SUBPATH
@@ -668,7 +1268,7 @@ def _parse_repos(
         path: Config file path (used in error messages).
         repos_raw: Raw ``repos`` dict from YAML (already schema-validated).
         allowed_orgs: Permitted GitHub organisations.  Empty list means any org.
-        workspace_root: Absolute path to ``JUDGE_WORKSPACE_ROOT`` for
+        workspace_root: Absolute path to ``DEVBENCH_WORKSPACE_ROOT`` for
             populating ``resolved_checkout_path``.
 
     Returns:
@@ -733,12 +1333,26 @@ def _validate_auto_finalize_auto_merge(
             "auto_merge merges the PR created by auto_finalize; "
             "without auto_finalize there is no PR to merge."
         )
-    if auto_merge and local_only:
-        raise ValueError(
-            f"Config file '{path}': git_ops.auto_merge: true is incompatible with "
-            "git_ops.local_only: true. Local-only repos have no remote or PR; "
-            "there is nothing to merge."
-        )
+
+
+def _schema_error_message(path: Path, exc: jsonschema.ValidationError) -> str:
+    """Format a schema validation error with the dotted field path for actionable diagnostics.
+
+    When the failing field has a known location (``exc.absolute_path`` is non-empty), the
+    message includes the dotted path so the operator knows exactly which config key to fix.
+    Example: ``merge_strategy: 'never' is not one of ['merge', 'squash', 'rebase']``
+
+    Args:
+        path: Config file path (used as context prefix).
+        exc: The jsonschema ``ValidationError`` whose ``.absolute_path`` and ``.message``
+             are extracted.
+
+    Returns:
+        Formatted error string suitable for wrapping in ``ValueError``.
+    """
+    field_path = ".".join(str(p) for p in exc.absolute_path)
+    detail = f"{field_path}: {exc.message}" if field_path else exc.message
+    return f"Config file '{path}' failed schema validation: {detail}"
 
 
 def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
@@ -764,7 +1378,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
     if not path.exists():
         raise FileNotFoundError(
             f"DevBench config file not found at '{path}'. "
-            "Create it or set JUDGE_CONFIG_PATH to point to its location. "
+            "Create it or set DEVBENCH_CONFIG_PATH to point to its location. "
             f"Expected schema: repos map with at least one 'org/repo' entry."
         )
 
@@ -781,10 +1395,10 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
     try:
         jsonschema.validate(raw, _SCHEMA)
     except jsonschema.ValidationError as exc:
-        raise ValueError(f"Config file '{path}' failed schema validation: {exc.message}") from exc
+        raise ValueError(_schema_error_message(path, exc)) from exc
 
     allowed_orgs: list[str] = raw.get("allowed_orgs") or []
-    workspace_root_raw = _env.get("JUDGE_WORKSPACE_ROOT", "")
+    workspace_root_raw = _env.get("DEVBENCH_WORKSPACE_ROOT", "")
     workspace_root = Path(workspace_root_raw) if workspace_root_raw else None
     repos = _parse_repos(path, raw.get("repos") or {}, allowed_orgs, workspace_root)
 
@@ -796,8 +1410,6 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         security_fetch=timeouts_raw.get("security_fetch"),
         llm=timeouts_raw.get("llm"),
         command=timeouts_raw.get("command"),
-        executor=timeouts_raw.get("executor"),
-        executor_max_turns=timeouts_raw.get("executor_max_turns"),
         orchestrator_poll_interval=timeouts_raw.get("orchestrator_poll_interval"),
         github_check=timeouts_raw.get("github_check"),
     )
@@ -852,12 +1464,6 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
             "Local-only repos have no remote to push to; PR creation is meaningless. "
             "Set git_ops.defer_pr: true (and git_ops.single_branch: <name>) alongside local_only."
         )
-    if local_only and pause_before_merge:
-        raise ValueError(
-            f"Config file '{path}': git_ops.local_only: true is incompatible with "
-            "git_ops.pause_before_merge: true. Local-only mode never creates PRs; "
-            "there is nothing to pause before merging."
-        )
     auto_finalize = bool(git_ops_raw.get("auto_finalize", False))
     auto_merge = bool(git_ops_raw.get("auto_merge", False))
     _validate_auto_finalize_auto_merge(path, defer_pr, local_only, auto_finalize, auto_merge)
@@ -892,15 +1498,33 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         blocked_recovery_window_seconds=debug_raw.get("blocked_recovery_window_seconds"),
     )
 
-    # Populate ReportConfig from YAML report block.
+    # Populate ReportConfig from YAML report block.  Issue #223: per-model
+    # pricing replaces the legacy scalar token_cost_per_million_* +
+    # token_cost_discount fields.  Operators with the old keys get a
+    # fail-fast error pointing at the new ``report.models`` block.
     report_raw = raw.get("report") or {}
+    legacy_report_keys = {
+        "token_cost_per_million_input",
+        "token_cost_per_million_output",
+        "token_cost_discount",
+    }
+    legacy_present = sorted(legacy_report_keys & set(report_raw.keys()))
+    if legacy_present:
+        raise ValueError(
+            "Config file '"
+            + str(path)
+            + "' contains removed report fields: "
+            + ", ".join(legacy_present)
+            + ". These were retired in issue #223 (per-model cost pricing). Replace with a "
+            + "`report.models` block listing per-model rates; see docs/model-pricing.md for the "
+            + "default rate table. Each model id maps to {input, output, "
+            + "[cache_read_multiplier], [cache_write_5min_multiplier], [cache_write_1hr_multiplier], "
+            + "[correction_factor]}. `report.default_model` is applied to any observed model id "
+            + "not present in `report.models`."
+        )
     report = ReportConfig(
-        token_cost_per_million_input=float(
-            report_raw.get("token_cost_per_million_input", DEFAULT_TOKEN_COST_PER_M_INPUT),
-        ),
-        token_cost_per_million_output=float(
-            report_raw.get("token_cost_per_million_output", DEFAULT_TOKEN_COST_PER_M_OUTPUT),
-        ),
+        models=_parse_report_models(report_raw.get("models"), str(path)),
+        default_model=_parse_default_model_rates(report_raw.get("default_model"), str(path)),
         display_timezone=report_raw.get("display_timezone") or None,
         cache_read_multiplier=(
             float(report_raw["cache_read_multiplier"]) if "cache_read_multiplier" in report_raw else None
@@ -918,7 +1542,6 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
             float(report_raw["fast_mode_multiplier"]) if "fast_mode_multiplier" in report_raw else None
         ),
         recent_pace_tasks=(int(report_raw["recent_pace_tasks"]) if "recent_pace_tasks" in report_raw else None),
-        token_cost_discount=(float(report_raw["token_cost_discount"]) if "token_cost_discount" in report_raw else None),
     )
 
     # Populate ManifestAmendment config from YAML manifest_amendment block.
@@ -953,6 +1576,11 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
             f"Config file '{path}': task_factory.enabled: true requires manifest_amendment.enabled: true. "
             "Task-factory runs from the amendment-reject path; it has nothing to do when amendments are off."
         )
+
+    # Populate AgentModelsConfig from YAML agents block (ADR-25). Cross-
+    # validates each non-None value against the top-level use_bedrock flag so
+    # an inconsistent config fails at load time, not at first invocation.
+    agent_models = _parse_agent_models_config(path, raw.get("agents"), bool(raw.get("use_bedrock", False)))
 
     # Populate ValidateConfig from YAML validate block. All toggles default
     # to False so existing backlogs see no behaviour change.
@@ -1002,6 +1630,26 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         ),
     )
 
+    # Populate BacklogConfig from YAML backlog block (issue #189).
+    # Schema enforces enum on default_status_for_new_work_units and
+    # additionalProperties: false. We re-validate at runtime so that
+    # _parse_backlog_config can emit a clear, actionable error message
+    # that names both the invalid value and the allowed values.
+    backlog_raw = raw.get("backlog") or {}
+    backlog = _parse_backlog_config(path, backlog_raw)
+
+    # Populate SkillsConfig from YAML skills block (issue #221 E1-E10).
+    # JSON Schema validates types + minimums; _parse_skills_config
+    # re-validates at runtime to emit clearer messages naming the field.
+    skills_raw = raw.get("skills") or {}
+    skills = _parse_skills_config(path, skills_raw)
+
+    # Populate NotificationsConfig from YAML notifications block (PR #202).
+    # JSON Schema validation already enforces shape; _parse_notifications_config
+    # applies value-level checks (URL scheme, Slack user-id pattern).
+    notifications_raw = raw.get("notifications") or {}
+    notifications = _parse_notifications_config(notifications_raw)
+
     return RuntimeConfig(
         repos=repos,
         timeouts=timeouts,
@@ -1011,16 +1659,18 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         stop_hook=stop_hook,
         hook_tail=hook_tail,
         orchestrate=orchestrate,
+        backlog=backlog,
+        skills=skills,
         manifest_amendment=manifest_amendment,
         task_factory=task_factory,
+        agent_models=agent_models,
         validate=validate_cfg,
         debug=debug,
+        notifications=notifications,
         allowed_orgs=allowed_orgs,
-        judge_model=raw.get("judge_model") or None,
-        executor_model=raw.get("executor_model") or None,
         use_bedrock=bool(raw.get("use_bedrock", False)),
         bedrock_region=raw.get("bedrock_region") or None,
-        merge_strategy=raw.get("merge_strategy") or None,
+        merge_strategy=raw.get("merge_strategy") or "squash",
         max_executor_retries=raw.get("max_executor_retries") or None,
         max_executor_retries_per_judge=_load_per_judge_retries(raw.get("max_executor_retries_per_judge")),
         display_timezone=raw.get("display_timezone") or None,
@@ -1071,4 +1721,28 @@ def get_configured_default_branch(repo: str, runtime_config: RuntimeConfig) -> s
     repo_config = runtime_config.repos.get(repo)
     if repo_config and repo_config.default_branch:
         return repo_config.default_branch
+    return None
+
+
+def get_effective_merge_strategy(repo: str, runtime_config: RuntimeConfig) -> str | None:
+    """Return the YAML-configured merge strategy for *repo*.
+
+    Resolution: per-repo ``repos.<org/repo>.merge_strategy`` override, else the
+    top-level ``merge_strategy``, else ``None``.  Pure function -- no env reads,
+    no I/O.  Environment-variable precedence (``DEVBENCH_MERGE_STRATEGY``) is the
+    caller's responsibility (see ``config.resolve_merge_strategy``).
+
+    Args:
+        repo: Fully-qualified repository name (e.g. ``'org/repo'``).
+        runtime_config: Loaded runtime configuration.
+
+    Returns:
+        The configured merge-strategy string (``'merge'`` / ``'squash'`` /
+        ``'rebase'``), or ``None`` when neither per-repo nor top-level sets one.
+    """
+    repo_config = runtime_config.repos.get(repo)
+    if repo_config and repo_config.merge_strategy:
+        return repo_config.merge_strategy
+    if runtime_config.merge_strategy:
+        return runtime_config.merge_strategy
     return None

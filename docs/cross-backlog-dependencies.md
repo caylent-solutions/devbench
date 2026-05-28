@@ -11,7 +11,7 @@ This document is the canonical pattern for representing cross-backlog dependenci
 You have one if either of these is true:
 
 - A Task in this backlog references modules / packages / images / secrets / DNS records produced by Tasks in a different backlog AND the producer backlog has its own `BACKLOG.md` that this backlog cannot validate against.
-- A Task in this backlog reads a tag / release / artifact whose creation is owned by a separate orchestrator that runs against a different `JUDGE_WORKSPACE_ROOT`.
+- A Task in this backlog reads a tag / release / artifact whose creation is owned by a separate orchestrator that runs against a different `DEVBENCH_WORKSPACE_ROOT`.
 
 Examples observed in production:
 
@@ -33,7 +33,7 @@ Follow the canonical Story + Task templates from `manual-blockers.md`. The Story
 For each Task in this backlog that consumes the external producer's output:
 
 ```bash
-JUDGE_WORKSPACE_ROOT=... JUDGE_CLAUDE_MODEL=... \
+DEVBENCH_WORKSPACE_ROOT=... DEVBENCH_CLAUDE_MODEL=... \
   uv run --project ... devbench add-dep <dependent-task-id> E0-F<N>-S1-T1
 ```
 
@@ -71,8 +71,8 @@ Wired dependents (16 Tasks across E1 + E2 + E3):
 Once Backlog B's 14 modules are tagged on terraform-modules main, the operator runs:
 
 ```bash
-JUDGE_WORKSPACE_ROOT=/workspaces/rpm-migration/caylent-telemetry-spec \
-JUDGE_CLAUDE_MODEL=claude-opus-4-7 \
+DEVBENCH_WORKSPACE_ROOT=/workspaces/rpm-migration/caylent-telemetry-spec \
+DEVBENCH_CLAUDE_MODEL=claude-opus-4-7 \
 uv run --project /workspaces/rpm-migration/devbench \
   devbench set-status E0-F4-S1-T1 done
 uv run --project /workspaces/rpm-migration/devbench \

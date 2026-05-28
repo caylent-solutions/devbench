@@ -12,7 +12,7 @@ owned by a different work unit (E1-F2-S4-T1's
 ``infra/remote-state/prod/terragrunt.hcl``), and BLOCKed the in-flight
 work unit on a problem that didn't belong to it. Issue #126.
 
-Fix: ``plugin/devbench/agents/security-reviewer.md`` now contains an
+Fix: ``plugin/devbench-orchestrate/agents/security-reviewer.md`` now contains an
 explicit five-bullet "Scope contract (issue #126 -- enforced)" block
 that:
   1. Mandates capturing the in-scope path set from ``devbench get-diff``
@@ -34,7 +34,13 @@ from pathlib import Path
 
 import pytest
 
-PROMPT_PATH = Path(__file__).resolve().parent.parent.parent / "plugin" / "devbench" / "agents" / "security-reviewer.md"
+PROMPT_PATH = (
+    Path(__file__).resolve().parent.parent.parent
+    / "plugin"
+    / "devbench-orchestrate"
+    / "agents"
+    / "security-reviewer.md"
+)
 
 
 @pytest.fixture(scope="module")

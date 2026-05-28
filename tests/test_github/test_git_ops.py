@@ -650,6 +650,26 @@ class TestMergePr:
         assert kwargs.get("cwd") == tmp_path
         assert kwargs.get("repo") == "caylent-solutions/git-repo"
 
+    def test_merge_pr_uses_resolved_strategy_flag(self, tmp_path: Path) -> None:
+        """Regression for #237: merge_pr passes the flag from the per-repo/top-level
+        resolved strategy, not the static global (which ignored YAML merge_strategy)."""
+        from devbench.config import MergeStrategy
+
+        judge = GitOpsService()
+        with (
+            patch.object(judge, "_gh", return_value=(0, "", "")) as mock_gh,
+            patch(
+                "devbench.github.git_ops.resolve_merge_strategy",
+                return_value=MergeStrategy.REBASE,
+            ) as mock_resolve,
+        ):
+            judge.merge_pr("caylent-solutions/git-repo", 42, repo_path=tmp_path)
+
+        mock_resolve.assert_called_once_with("caylent-solutions/git-repo")
+        args, _ = mock_gh.call_args
+        assert "--rebase" in args[0]
+        assert "--squash" not in args[0]
+
 
 class TestCreateTag:
     """Test create_tag method."""

@@ -2,10 +2,12 @@
 
 After the manifest-amender rejects an amendment whose changes are legitimate
 production fixes outside the task's scope, the orchestrator invokes
-``devbench:blocker-resolver`` which writes a proposal JSON file describing
-one or more new work units the factory should generate. ``devbench:task-factory``
-then materialises each proposed task as a draft ``.md`` file with status
-``proposed`` and inserts a row in ``BACKLOG.md``. The human reviews, edits,
+``devbench-orchestrate:blocker-resolver`` which writes a proposal JSON file describing
+one or more new work units the factory should generate. ``devbench-orchestrate:task-factory``
+then materialises each proposed task as a draft ``.md`` file with a status
+determined by ``backlog.default_status_for_new_work_units`` in
+``backlog/config/devbench.yaml`` (default: ``in-queue``; ``draft`` when opted in
+via AC-189-8) and inserts a row in ``BACKLOG.md``. The human reviews, edits,
 and promotes (``devbench promote-proposal``) or rejects
 (``devbench reject-proposal``) each draft.
 
@@ -30,6 +32,10 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from devbench.config_loader import RuntimeConfig
 
 from devbench.backlog.manager import BacklogManager
 from devbench.backlog.parser import BacklogParser
@@ -40,16 +46,39 @@ from devbench.constants import (
     DEFAULT_BLOCKED_RECOVERY_WINDOW_SECONDS,
     STATUS_DECLINED,
     STATUS_DONE,
+    STATUS_DRAFT,
     STATUS_HOLD,
     STATUS_IN_QUEUE,
     STATUS_PROPOSED,
 )
+from devbench.utils.io import atomic_write_text
 
 logger = logging.getLogger(__name__)
+
+
+def _get_runtime_config() -> RuntimeConfig:
+    """Return the live ``RUNTIME_CONFIG`` singleton.
+
+    Isolated into a module-level function so tests can monkeypatch it without
+    importing ``devbench.config`` at module load time (which would trigger the
+    full config-load cycle and potentially fail in environments without a
+    ``devbench.yaml``).
+
+    Returns:
+        The ``RuntimeConfig`` instance from ``devbench.config``.
+    """
+    from devbench.config import RUNTIME_CONFIG
+
+    return RUNTIME_CONFIG
+
 
 PROPOSAL_DIR_NAME = ".devbench/proposals"
 REJECTED_PROPOSAL_DIR_NAME = ".devbench/rejected-proposals"
 LOCK_FILE_NAME = ".devbench/task-factory.lock"
+
+# Allowed values for ``backlog.default_status_for_new_work_units`` (AC-189-8).
+# Only these two statuses are valid initial states for materialised work units.
+_ALLOWED_NEW_WU_STATUSES: frozenset[str] = frozenset({STATUS_IN_QUEUE, STATUS_DRAFT})
 
 # Minimum character length for a ``suggested_approach`` field. Enforced by
 # ``materialise_proposal`` as a fail-fast contract against thin auto-generated
@@ -190,11 +219,44 @@ class BlockedTaskState(Enum):
 _RECOVERY_AGENT_TAGS: frozenset[str] = frozenset(
     {"agent/orchestrator", "agent/blocker_resolver", "agent/manifest_amender", "agent/backlog_manager"}
 )
+
+
+def _normalize_agent_tag(raw: str) -> str:
+    """Normalise an audit-row agent tag to the canonical underscore form.
+
+    Issue #211: ``_RECOVERY_AGENT_TAGS`` enumerates the canonical
+    underscore form (``agent/manifest_amender``), but
+    ``amendment.py::AMENDER_AGENT_ID`` and other writers emit the
+    hyphen form (``agent/manifest-amender``). The two forms refer to
+    the same agent; the underscore form is canonical (matches the
+    Python module/identifier convention), so the hyphen form is
+    normalised to it before the frozenset membership check.
+
+    The normalisation is one-way (hyphen -> underscore) and case-
+    sensitive on the ``agent/`` prefix so unrelated tags
+    (``operator/...``, ``human/...``) are left untouched.
+    """
+    if not raw.startswith("agent/"):
+        return raw
+    return "agent/" + raw[len("agent/") :].replace("-", "_")
+
+
 _RECOVERY_BODY_RE: re.Pattern[str] = re.compile(
-    r"amendment-reject|out-of-scope|ALL_REVIEWS_FAILED|REVIEW_REJECTED"
-    r"|dependency .* not yet terminal|dep .* not yet terminal",
+    r"amendment[- ]reject(?:ed)?"
+    r"|out-of-scope"
+    r"|ALL_REVIEWS_FAILED|REVIEW_REJECTED"
+    r"|dependency .* not yet terminal|dep .* not yet terminal"
+    r"|will auto-requeue when",
     re.IGNORECASE,
 )
+# Issue #200 / AC-200-4: structured [AMENDMENT_REJECTED] tags written by
+# manifest-amender differ from the prose ``amendment rejected`` form matched
+# by ``_RECOVERY_BODY_RE``. A separate matcher avoids widening the prose
+# regex to bracket-enclosed tokens, keeping each matcher's intent clear.
+# Pattern is intentionally case-sensitive: the structured tag is always
+# emitted in upper-case by the manifest-amender; a lower-case occurrence
+# is a prose quote of the tag, not the tag itself.
+_REJECTION_TAG_RE: re.Pattern[str] = re.compile(r"\[AMENDMENT_REJECTED\]")
 _BLOCKED_AUDIT_RE: re.Pattern[str] = re.compile(
     r"\[(?P<ts>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s+UTC)\]\s+\[(?P<agent>[^\]]+)\]\s+\[BLOCKED\]\s+(?P<body>.+)",
 )
@@ -241,7 +303,40 @@ def _has_rejected_amendment_archive(workspace_root: Path, task_id: str) -> bool:
     return any(archive_dir.glob(pattern))
 
 
-def _has_runtime_degradation_signal(source_file: Path, now: datetime) -> bool:
+def _read_last_restart_marker(workspace_root: Path) -> datetime | None:
+    """Issue #215: return the UTC timestamp written to
+    ``<workspace>/.devbench/last-restart`` by ``cmd_start`` on every
+    orchestrator startup.
+
+    Used to bound the agent-tool-unavailable audit-row scan window so a
+    RUNTIME_DEGRADATION classification clears on operator-driven restart.
+
+    Returns ``None`` when the marker file is missing, unreadable, or
+    contains an unparseable timestamp -- callers fall back to the
+    pre-existing 24h sliding-window behaviour.
+    """
+    from devbench.constants import LAST_RESTART_MARKER_PATH
+
+    marker = workspace_root / LAST_RESTART_MARKER_PATH
+    if not marker.is_file():
+        return None
+    try:
+        raw = marker.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    try:
+        ts = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return ts.replace(tzinfo=UTC) if ts.tzinfo is None else ts.astimezone(UTC)
+
+
+def _has_runtime_degradation_signal(
+    source_file: Path,
+    now: datetime,
+    *,
+    since: datetime | None = None,
+) -> bool:
     """Issue #183(d): True iff the work-unit's Comments section carries a
     recent ``[BLOCKED]`` audit naming the agent-tool degradation
     payload that review-supervisor's Step 0 self-check emits.
@@ -249,6 +344,12 @@ def _has_runtime_degradation_signal(source_file: Path, now: datetime) -> bool:
     "Recent" means within ``_RUNTIME_DEGRADATION_WINDOW_SECONDS`` (24h)
     of ``now``. A stale payload past the window is treated as already-
     acknowledged by the operator and does NOT trigger this bucket.
+
+    Issue #215: when ``since`` is provided (the workspace's last-restart
+    marker), audit rows older than ``since`` are filtered out before the
+    24h window check.  The operator-driven restart consumes any
+    pre-restart degradation signal; only rows emitted by the new
+    orchestrator instance contribute to the bucket.
     """
     if not source_file.is_file():
         return False
@@ -267,6 +368,8 @@ def _has_runtime_degradation_signal(source_file: Path, now: datetime) -> bool:
             ts = datetime.strptime(match.group("ts"), "%Y-%m-%d %H:%M UTC").replace(tzinfo=UTC)
         except ValueError:
             continue
+        if since is not None and ts < since:
+            continue
         if most_recent_ts is None or ts > most_recent_ts:
             most_recent_ts = ts
     if most_recent_ts is None:
@@ -281,8 +384,9 @@ def _recent_recovery_audit_comment(source_file: Path, now: datetime, window_seco
     ``[<ts>] [<agent>] [BLOCKED] <body>`` line, and returns True iff the
     timestamp is within ``window_seconds`` of ``now`` AND the agent tag
     is one of the canonical recovery agents AND the body matches the
-    recovery-cause regex (amendment-reject / out-of-scope /
-    ALL_REVIEWS_FAILED / REVIEW_REJECTED). Excludes the
+    recovery-cause regex (``amendment reject`` / ``amendment rejected`` /
+    ``amendment-reject`` / ``out-of-scope`` / ``ALL_REVIEWS_FAILED`` /
+    ``REVIEW_REJECTED`` / ``will auto-requeue when``). Excludes the
     ``[BLOCKED_PENDING_PROPOSAL]`` marker rows since those represent
     cascade state, not pending recovery.
 
@@ -311,9 +415,17 @@ def _recent_recovery_audit_comment(source_file: Path, now: datetime, window_seco
     ts, agent, body = most_recent
     if (now - ts).total_seconds() > window_seconds:
         return False
-    if agent not in _RECOVERY_AGENT_TAGS:
+    # Issue #211: writers emit either ``agent/manifest_amender`` (canonical
+    # underscore form) or ``agent/manifest-amender`` (hyphen form, e.g.
+    # ``amendment.py::AMENDER_AGENT_ID``). Normalise before the membership
+    # check so both spellings classify identically.
+    if _normalize_agent_tag(agent) not in _RECOVERY_AGENT_TAGS:
         return False
-    return bool(_RECOVERY_BODY_RE.search(body))
+    # Issue #200 / AC-200-4: check the structured-tag matcher FIRST so that
+    # ``[AMENDMENT_REJECTED] tdd_green_production_fix; rejected: POST_CHECK:
+    # ...`` lines are classified even when the prose body lacks the
+    # ``amendment reject`` phrase that ``_RECOVERY_BODY_RE`` requires.
+    return bool(_REJECTION_TAG_RE.search(body) or _RECOVERY_BODY_RE.search(body))
 
 
 def classify_blocked_task(
@@ -337,9 +449,13 @@ def classify_blocked_task(
     2. ``BLOCKED_ON_HELD`` -- the task carries a ``[BLOCKED_PENDING_PROPOSAL]``
        marker whose target is in ``hold``.
     3. ``AUTO_CLEARING_VIA_PROPOSAL`` -- at least one non-terminal, non-HOLD
-       marker target exists; the ADR-07 cascade is in flight.
-    4. ``AWAITING_DEPENDENCY`` -- no marker present, but a regular
-       Dependencies-table row points at a non-terminal task.
+       marker target exists; the ADR-07 cascade is in flight. ALSO fires
+       (AC-200-1 / issue #200) when ALL marker targets are terminal and no
+       regular dep or recovery signal applies: the cascade in
+       ``_auto_requeue_marker_dependents`` will flip the task to ``in-queue``.
+    4. ``AWAITING_DEPENDENCY`` -- no marker present (or all markers terminal
+       but a regular dep is still in flight), and a Dependencies-table row
+       points at a non-terminal task.
     5. ``AWAITING_AMENDMENT_RECOVERY`` -- no marker, no pending dep, but at
        least one recovery signal is on disk (pending proposal JSON,
        rejected-amendment archive, or a recent ``[BLOCKED]`` audit comment
@@ -358,11 +474,17 @@ def classify_blocked_task(
     # degraded. Checked BEFORE every other bucket so a degraded session
     # is surfaced even if the task also looks held / blocked-on-held;
     # only restarting ``make start`` can let the work resume in any case.
-    if source_file is not None and _has_runtime_degradation_signal(
-        source_file,
-        now if now is not None else datetime.now(UTC),
-    ):
-        return BlockedTaskState.RUNTIME_DEGRADATION
+    # Issue #215: an operator-driven restart writes
+    # ``<workspace>/.devbench/last-restart`` which bounds the audit-row
+    # scan so audit rows from the pre-restart instance are NOT counted.
+    if source_file is not None:
+        restart_marker = _read_last_restart_marker(workspace_root) if workspace_root is not None else None
+        if _has_runtime_degradation_signal(
+            source_file,
+            now if now is not None else datetime.now(UTC),
+            since=restart_marker,
+        ):
+            return BlockedTaskState.RUNTIME_DEGRADATION
 
     # Priority 1: HELD -- the task itself is in hold status.
     if _task_status_is_hold(backlog_root, backlog_index, task_id):
@@ -374,29 +496,30 @@ def classify_blocked_task(
     mgr = BacklogManager()
     marker_ids = mgr._extract_pending_proposal_markers(source_file)
 
+    all_markers_terminal = False
     if marker_ids:
         marker_result = _classify_with_markers(mgr, backlog_index, marker_ids)
         if marker_result is not None:
             return marker_result
-        # Fall through: every marker target is terminal (the cascade
-        # should have fired and did not), so the marker rows are stale.
-        # Consult regular deps + recovery signals before defaulting to
-        # operator attention. Without this fall-through, a task with an
-        # unrelated unsatisfied regular dep gets misclassified as
-        # OPERATOR_ACTION_REQUIRED when it is plainly an
-        # AWAITING_DEPENDENCY situation (issue #186).
+        # _classify_with_markers returned None: every marker target is
+        # terminal. Issue #186 compat: fall through to the regular-dep
+        # and recovery-signal checks first; only return
+        # AUTO_CLEARING_VIA_PROPOSAL when none of those apply (AC-200-1).
+        all_markers_terminal = True
 
     # Priority 4: AWAITING_DEPENDENCY -- regular deps still in flight.
     if _regular_deps_unsatisfied(backlog_root, backlog_index, task_id):
         return BlockedTaskState.AWAITING_DEPENDENCY
 
-    # Priority 5 / 6: recovery signals or operator attention.
-    return _classify_recovery_or_attention(
+    # Priority 3 (late path, AC-200-1) / 5 / 6: satisfied-markers fallback
+    # vs recovery-signal vs operator attention.
+    return _classify_late(
         source_file=source_file,
         task_id=task_id,
         workspace_root=workspace_root,
         now=now,
         recovery_window_seconds=recovery_window_seconds,
+        all_markers_terminal=all_markers_terminal,
     )
 
 
@@ -456,13 +579,15 @@ def _classify_with_markers(
     - ``OPERATOR_ACTION_REQUIRED`` -- backlog index missing or any
       marker target unknown to the index; the operator must clean up
       the stray reference before any automation can proceed.
-    - ``AUTO_CLEARING_VIA_PROPOSAL`` -- at least one non-terminal,
-      non-HOLD marker target exists; the ADR-07 cascade is in flight.
+    - ``AUTO_CLEARING_VIA_PROPOSAL`` -- at least one non-terminal, non-HOLD
+      marker target exists; the ADR-07 cascade is in flight.
 
-    Returns ``None`` when every marker target is terminal -- the marker
-    rows are stale and the caller should fall through to the regular-dep
-    and recovery-signal checks instead of bouncing the task into the
-    operator-attention bucket (issue #186).
+    Returns ``None`` when every marker target is terminal (all satisfied).
+    The caller (``classify_blocked_task``) then checks whether any regular
+    deps are still unsatisfied (AWAITING_DEPENDENCY) or recovery signals
+    are on disk (AWAITING_AMENDMENT_RECOVERY). When none of those apply,
+    the caller returns ``AUTO_CLEARING_VIA_PROPOSAL`` (issue #200 /
+    AC-200-1: satisfied markers with no other blockers = auto-clearing).
     """
     try:
         rows = mgr._parse_backlog_rows(backlog_index)
@@ -481,11 +606,43 @@ def _classify_with_markers(
             non_terminal_marker_found = True
 
     if not non_terminal_marker_found:
-        # All markers terminal -- stale cascade signal. Let the caller
-        # consult regular deps + recovery signals before defaulting to
-        # operator attention.
+        # All markers terminal. Signal to caller by returning None so it
+        # can apply the priority-4 / priority-5 checks. When no regular
+        # dep or recovery signal blocks progress, the caller returns
+        # AUTO_CLEARING_VIA_PROPOSAL (AC-200-1).
         return None
     return BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL
+
+
+def _classify_late(
+    *,
+    source_file: Path,
+    task_id: str,
+    workspace_root: Path | None,
+    now: datetime | None,
+    recovery_window_seconds: int | None,
+    all_markers_terminal: bool,
+) -> BlockedTaskState:
+    """Resolve the post-dep-check priorities (3 late / 5 / 6).
+
+    Called by ``classify_blocked_task`` after the priority-4 dep-check
+    returns False. Three outcomes in priority order:
+
+    1. AC-200-1 (priority 3 late): all marker targets are terminal and
+       no other signal blocks progress -- return AUTO_CLEARING_VIA_PROPOSAL
+       so the cascade can flip the task to in-queue.
+    2. Priority 5: a recovery signal is on disk -- AWAITING_AMENDMENT_RECOVERY.
+    3. Priority 6: no signal -- OPERATOR_ACTION_REQUIRED.
+    """
+    if all_markers_terminal:
+        return BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL
+    return _classify_recovery_or_attention(
+        source_file=source_file,
+        task_id=task_id,
+        workspace_root=workspace_root,
+        now=now,
+        recovery_window_seconds=recovery_window_seconds,
+    )
 
 
 def _classify_recovery_or_attention(
@@ -1044,7 +1201,7 @@ def write_proposal(workspace_root: Path, proposal: Proposal) -> Path:
             "Resolve or reject its tasks before generating new proposals."
         )
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(proposal.to_dict(), indent=2) + "\n", encoding="utf-8")
+    atomic_write_text(target, json.dumps(proposal.to_dict(), indent=2) + "\n")
     return target
 
 
@@ -1179,7 +1336,7 @@ def _append_backlog_row(backlog_index: Path, row: str) -> None:
     # Append at EOF (end of index block); after every existing row the
     # Status Summary regeneration will pick this up.
     content = content.rstrip("\n") + "\n" + row
-    backlog_index.write_text(content, encoding="utf-8")
+    atomic_write_text(backlog_index, content)
 
 
 def _remove_backlog_row(backlog_index: Path, task_id: str) -> None:
@@ -1196,7 +1353,7 @@ def _remove_backlog_row(backlog_index: Path, task_id: str) -> None:
         kept.append(line)
     if not removed:
         raise ProposalError(f"Row for {task_id} not found in {backlog_index}")
-    backlog_index.write_text("".join(kept), encoding="utf-8")
+    atomic_write_text(backlog_index, "".join(kept))
 
 
 # ---------------------------------------------------------------------------
@@ -1221,14 +1378,32 @@ def materialise_proposal(
     Refuses (with ``ProposalError``) when any proposed task's
     ``suggested_approach`` is too terse to produce a useful draft. The
     threshold is a module-level constant; blocker-resolver's prompt
-    (``plugin/devbench/agents/blocker-resolver.md``) requires the
+    (``plugin/devbench-orchestrate/agents/blocker-resolver.md``) requires the
     Context / Scope / TDD approach / Verify four-section structure whose
     minimum honest length exceeds the threshold. Drafts below the floor
     always require operator hand-editing before promotion, so stopping
     them at the materialise boundary surfaces the defect upstream in
     blocker-resolver where it can be fixed once, instead of downstream
     every time a thin draft lands.
+
+    The ``## Status:`` line in every new draft file and the corresponding
+    BACKLOG.md row are set to
+    ``RUNTIME_CONFIG.backlog.default_status_for_new_work_units`` (AC-189-8).
+    When the config key is absent the dataclass default (``in-queue``) is
+    used, preserving backwards compatibility for workspaces that have not
+    opted in to the ``backlog:`` YAML section (AC-189-9).
     """
+    # Read the configured default status for new work units once per call.
+    # The lazy _get_runtime_config() helper is monkeypatched in tests to avoid
+    # loading the real config from disk.
+    runtime_cfg = _get_runtime_config()
+    new_wu_status: str = runtime_cfg.backlog.default_status_for_new_work_units
+    if new_wu_status not in _ALLOWED_NEW_WU_STATUSES:
+        raise ProposalError(
+            f"backlog.default_status_for_new_work_units has invalid value {new_wu_status!r}; "
+            f"allowed values are {sorted(_ALLOWED_NEW_WU_STATUSES)!r}. "
+            "Update backlog/config/devbench.yaml to use 'in-queue' or 'draft'."
+        )
     # Thin-approach refusal -- fail fast before any file write so a partial
     # materialisation cannot leave the backlog half-written. Applies to the
     # whole proposal, even if some tasks are already resolved, because a
@@ -1292,13 +1467,14 @@ def materialise_proposal(
             repo=repo,
             source_task_id=proposal.source_task_id,
             generated_at=proposal.generated_at,
+            status=new_wu_status,
         )
-        target.write_text(content, encoding="utf-8")
+        atomic_write_text(target, content)
         rel_path = target.relative_to(workspace_root).as_posix()
         row = _render_backlog_row(
             task_id=proposed.suggested_id,
             title=proposed.title,
-            status=STATUS_PROPOSED,
+            status=new_wu_status,
             repo=repo,
             rel_path=rel_path,
         )
@@ -1381,7 +1557,7 @@ def _rewrite_status(md_path: Path, new_status: str) -> None:
     if not _STATUS_LINE_RE.search(content):
         raise ProposalError(f"Draft {md_path} has no '## Status:' line")
     content = _STATUS_LINE_RE.sub(rf"\g<1>{new_status}", content, count=1)
-    md_path.write_text(content, encoding="utf-8")
+    atomic_write_text(md_path, content)
 
 
 def _rewrite_backlog_status(backlog_index: Path, task_id: str, new_status: str) -> None:
@@ -1402,7 +1578,7 @@ def _rewrite_backlog_status(backlog_index: Path, task_id: str, new_status: str) 
             break
     if not updated:
         raise ProposalError(f"Row for {task_id} not found in {backlog_index}")
-    backlog_index.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    atomic_write_text(backlog_index, "\n".join(lines) + "\n")
 
 
 def _append_dependency_to_source(backlog_root: Path, backlog_index: Path, source_task_id: str, new_dep_id: str) -> None:
@@ -1426,7 +1602,7 @@ def _append_dependency_to_source(backlog_root: Path, backlog_index: Path, source
         section = none_row_re.sub(f"| {new_dep_id} | (auto) | proposed |", section, count=1)
     else:
         section = section.rstrip("\n") + f"\n| {new_dep_id} | (auto) | proposed |\n"
-    source_unit.write_text(content[:idx] + section + remainder, encoding="utf-8")
+    atomic_write_text(source_unit, content[:idx] + section + remainder)
 
 
 def _find_source_task_file(backlog_root: Path, backlog_index: Path, task_id: str) -> Path | None:
@@ -1590,7 +1766,7 @@ def _append_promote_comment(
         content = content.rstrip("\n") + "\n\n" + entry
     else:
         content = content.rstrip("\n") + "\n\n" + COMMENTS_SECTION_HEADER + "\n\n" + entry
-    source_file.write_text(content, encoding="utf-8")
+    atomic_write_text(source_file, content)
 
 
 def _append_manual_dep_comment(
@@ -1627,7 +1803,7 @@ def _append_manual_dep_comment(
         content = content.rstrip("\n") + "\n\n" + entry
     else:
         content = content.rstrip("\n") + "\n\n" + COMMENTS_SECTION_HEADER + "\n\n" + entry
-    source_file.write_text(content, encoding="utf-8")
+    atomic_write_text(source_file, content)
 
 
 def _comments_have_marker(source_file: Path, marker_task_id: str) -> bool:
@@ -1906,7 +2082,7 @@ def _reject_unmaterialised_proposal(
             content = content.rstrip("\n") + "\n\n" + entry
         else:
             content = content.rstrip("\n") + "\n\n" + COMMENTS_SECTION_HEADER + "\n\n" + entry
-        source_file.write_text(content, encoding="utf-8")
+        atomic_write_text(source_file, content)
 
     return archive_path
 
@@ -1921,7 +2097,7 @@ def _append_reject_audit_comment(source_file: Path, task_id: str, reason: str) -
         content = content.rstrip("\n") + "\n\n" + entry
     else:
         content = content.rstrip("\n") + "\n\n" + COMMENTS_SECTION_HEADER + "\n\n" + entry
-    source_file.write_text(content, encoding="utf-8")
+    atomic_write_text(source_file, content)
 
 
 # Single-marker regex lifted from manager.py. Duplicated here (as a constant,
@@ -1953,4 +2129,4 @@ def _strip_pending_proposal_marker(source_file: Path, rejected_task_id: str) -> 
     # Collapse runs of 3+ newlines down to 2 (one blank line between paragraphs).
     updated = re.sub(r"\n{3,}", "\n\n", updated)
     if updated != content:
-        source_file.write_text(updated, encoding="utf-8")
+        atomic_write_text(source_file, updated)

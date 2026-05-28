@@ -1,7 +1,7 @@
 """Issue #128 regression: executor must not act on REVIEW_PASS verdict bodies.
 
-The orchestrate skill (`plugin/devbench/skills/orchestrate/SKILL.md`) and the
-executor agent prompt (`plugin/devbench/agents/executor.md`) are runtime
+The orchestrate skill (`plugin/devbench-orchestrate/skills/orchestrate/SKILL.md`) and the
+executor agent prompt (`plugin/devbench-orchestrate/agents/executor.md`) are runtime
 prompts the LLM reads via Claude Agent SDK; there is no Python entry point to
 call-and-assert against. This test pins the canonical "REVIEW_PASS is
 terminal" language by-content so a future edit cannot silently remove the
@@ -30,7 +30,7 @@ from pathlib import Path
 
 import pytest
 
-PLUGIN_ROOT = Path(__file__).resolve().parent.parent.parent / "plugin" / "devbench"
+PLUGIN_ROOT = Path(__file__).resolve().parent.parent.parent / "plugin" / "devbench-orchestrate"
 SKILL_PATH = PLUGIN_ROOT / "skills" / "orchestrate" / "SKILL.md"
 EXECUTOR_PATH = PLUGIN_ROOT / "agents" / "executor.md"
 

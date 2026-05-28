@@ -20,12 +20,12 @@ This document describes the structure and design of the DevBench Claude Code plu
 
 ## Plugin Directory Structure
 
-All plugin artifacts live under `plugin/devbench/` in the devbench repo:
+After the issue #224 split, plugin artifacts live under two marketplaces in this repo. The orchestrate plugin (this section) lives at `plugin/devbench-orchestrate/`; the authoring plugin lives at `plugin-authoring/devbench-authoring/`:
 
 ```text
-plugin/devbench/
+plugin/devbench-orchestrate/
 ├── .claude-plugin/
-│   └── plugin.json              ← manifest: name, description, version
+│   └── plugin.json              ← manifest: name, description, version, keywords, repository, license, homepage
 ├── agents/
 │   ├── executor.md              ← dev agent: implements work units via TDD
 │   ├── review-supervisor.md     ← discovers and invokes all review_team agents in parallel
@@ -273,19 +273,19 @@ orchestrator or executor Python modules exist.
 
 ## Workspace Layout
 
-`devbench.yaml` lives at `$JUDGE_WORKSPACE_ROOT/backlog/config/devbench.yaml` -- the workspace root,
+`devbench.yaml` lives at `$DEVBENCH_WORKSPACE_ROOT/backlog/config/devbench.yaml` -- the workspace root,
 one level above the devbench tool repo. It is workspace-specific configuration (target repos,
 branches, merge strategy, timeouts). The plugin is config-agnostic.
 
 ```text
-$JUDGE_WORKSPACE_ROOT/
+$DEVBENCH_WORKSPACE_ROOT/
 ├── BACKLOG.md
 ├── CLAUDE.md
 ├── backlog/
 │   └── config/
 │       └── devbench.yaml        ← workspace config, not part of plugin
 └── devbench/                    ← this repo (plugin source lives here)
-    └── plugin/devbench/         ← Claude Code plugin
+    └── plugin/devbench-orchestrate/         ← Claude Code plugin
 ```
 
 ---

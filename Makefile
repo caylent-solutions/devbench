@@ -3,7 +3,7 @@ SHELL := /bin/bash
 .DEFAULT_GOAL := help
 unexport VIRTUAL_ENV
 
-.PHONY: help install install-hooks plugin-install plugin-uninstall lint lint-ruff lint-bandit format format-check typecheck test test-unit test-coverage validate clean start start-interactive report report-session pre-commit-check pre-push-check watch watch-live
+.PHONY: help install install-hooks plugin-install plugin-uninstall lint lint-ruff lint-bandit lint-no-duplicates format format-check typecheck test test-unit test-coverage validate clean start start-interactive report report-session pre-commit-check pre-push-check watch watch-live
 
 ## help: Show available targets
 help:
@@ -11,7 +11,7 @@ help:
 	@echo ""
 	@grep -E '^## ' $(MAKEFILE_LIST) | sed \
 	  -e 's/^## /  /' \
-	  -e 's/\(start-interactive:.*\)/\1 [JUDGE_WORKSPACE_ROOT, JUDGE_CLAUDE_MODEL, JUDGE_SAFE_PERMISSIONS]/' \
+	  -e 's/\(start-interactive:.*\)/\1 [DEVBENCH_WORKSPACE_ROOT, DEVBENCH_CLAUDE_MODEL, DEVBENCH_SAFE_PERMISSIONS]/' \
 	  -e 's/\(report-session:.*\)/\1 [SINCE]/' \
 	  -e 's/\(watch-live:.*\)/\1 [INTERVAL]/'
 	@echo ""
@@ -85,19 +85,17 @@ typecheck:
 test-unit:
 	uv run pytest tests/ -v --tb=short -q
 
-## test-coverage: Run tests with coverage report (fails below 90%)
+## test-coverage: Run tests with coverage report (fails below 98%)
+## --cov-precision=2 so the fail-under compares the real value (e.g. 97.70 < 98)
+## instead of the default precision=0 which rounds 97.70 -> 98 and never fails.
 test-coverage:
-	uv run pytest tests/ --cov=devbench --cov-report=term-missing --cov-fail-under=90
-
-## test-coverage-new: Enforce 100% line coverage on modules introduced or hardened by the manifest-amendment, task-factory, watch, git-ops-assertion, hook-tail, auto-requeue, and report-perf-roadmap (issue #162) features
-test-coverage-new:
-	uv run pytest tests/ --cov=devbench.backlog.manifest --cov=devbench.backlog.amendment --cov=devbench.backlog.proposal --cov=devbench.backlog.manager --cov=devbench.activity --cov=devbench.github.git_ops --cov=devbench.hook_tail --cov=devbench.reporting.snapshot --cov=devbench.reporting.window_stats --cov=devbench.reporting.archive --cov=devbench.reporting.sharded_log --cov-report=term-missing --cov-fail-under=100
+	uv run pytest tests/ --cov=devbench --cov-report=term-missing --cov-fail-under=98 --cov-precision=2
 
 ## test: Run all tests
 test: test-unit
 
 ## validate: Full validation (all checks -- identical to CI and pre-push)
-validate: lint-ruff lint-bandit lint-no-duplicates format-check typecheck test-coverage test-coverage-new
+validate: lint-ruff lint-bandit lint-no-duplicates format-check typecheck test-coverage
 	@echo "All validations passed"
 
 ## pre-commit-check: Checks that run on every commit (fast)
@@ -115,12 +113,24 @@ clean:
 	find . -type d -name .ruff_cache -exec rm -rf {} + 2>/dev/null || true
 	find . -type d -name .mypy_cache -exec rm -rf {} + 2>/dev/null || true
 
-## start: Run orchestrate skill non-interactively via Claude Agent SDK
+## start: Run orchestrate skill non-interactively via Claude Agent SDK.
+## Auto-restarts on exit code 42 (RUNTIME_DEGRADATION-only NO_ACTIONABLE)
+## up to DEVBENCH_MAX_AUTO_RESTARTS attempts (default 3); fails fast after.
 start:
-	uv run python -m devbench.cli start
+	@attempt=1; max=$${DEVBENCH_MAX_AUTO_RESTARTS:-3}; \
+	while :; do \
+	  rc=0; uv run python -m devbench.cli start || rc=$$?; \
+	  if [ "$$rc" -ne 42 ]; then exit "$$rc"; fi; \
+	  if [ "$$attempt" -ge "$$max" ]; then \
+	    echo "ERROR: orchestrator hit RUNTIME_DEGRADATION restart cap ($$max). Investigate the SDK subprocess Agent-tool loss before re-running." >&2; \
+	    exit 1; \
+	  fi; \
+	  attempt=$$((attempt + 1)); \
+	  echo "INFO: orchestrator auto-restart (attempt $$attempt/$$max) after RUNTIME_DEGRADATION exit." >&2; \
+	done
 
 ## start-interactive: Launch interactive Claude session with devbench plugin loaded
-ifeq ($(JUDGE_SAFE_PERMISSIONS),1)
+ifeq ($(DEVBENCH_SAFE_PERMISSIONS),1)
 start-interactive:
 	claude --plugin-dir plugin/devbench
 else

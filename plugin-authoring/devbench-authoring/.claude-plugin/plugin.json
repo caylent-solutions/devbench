@@ -1,0 +1,16 @@
+{
+  "name": "devbench-authoring",
+  "description": "Spec authoring + backlog materialization for the devbench workflow. Ships the spec-to-backlog, create-spec, configure-devbench, and bootstrap-environment skills. No PreToolUse hooks; safe to enable in any workspace where backlog authoring happens. Use during the planning phase; pair with devbench-orchestrate during autonomous execution.",
+  "version": "0.2.0",
+  "keywords": [
+    "devbench",
+    "spec",
+    "backlog",
+    "authoring",
+    "planning",
+    "tdd"
+  ],
+  "repository": "https://github.com/caylent-solutions/devbench",
+  "license": "MIT",
+  "homepage": "https://github.com/caylent-solutions/devbench"
+}

@@ -12,12 +12,22 @@ unescaped byte sequence.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
 import pytest
 
-SCRIPT_PATH = Path(__file__).parent.parent.parent / "plugin" / "devbench" / "scripts" / "_hook_lib.sh"
+SCRIPT_PATH = Path(__file__).parent.parent.parent / "plugin" / "devbench-orchestrate" / "scripts" / "_hook_lib.sh"
+
+
+def _clean_env() -> dict[str, str]:
+    """Return the process env with legacy DEVBENCH_WORKSPACE_ROOT and DEVBENCH_LOG_FILE stripped.
+
+    _hook_lib.sh rejects legacy JUDGE_* hook vars (AC-197-9). Tests that source
+    _hook_lib.sh must not inherit those vars from the pytest process environment.
+    """
+    return {k: v for k, v in os.environ.items() if k not in ("DEVBENCH_WORKSPACE_ROOT", "DEVBENCH_LOG_FILE")}
 
 
 def _run_decode(escaped: str) -> str:
@@ -34,7 +44,7 @@ def _run_decode(escaped: str) -> str:
         "-c",
         f". {SCRIPT_PATH}; var={quoted}; decode_json_escapes var; printf '%s' \"$var\"",
     ]
-    return subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
+    return subprocess.run(cmd, capture_output=True, text=True, check=True, env=_clean_env()).stdout
 
 
 @pytest.mark.parametrize(

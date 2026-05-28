@@ -8,6 +8,7 @@ import pytest
 
 from devbench.backlog.parser import BacklogParser
 from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
+from devbench.scope import ScopeFilter
 
 
 class TestParseIndex:
@@ -16,7 +17,7 @@ class TestParseIndex:
     def test_parse_index_from_actual_backlog(self, tmp_path: Path) -> None:
         """Parse the workspace BACKLOG.md file and verify results.
 
-        Reads ``JUDGE_WORKSPACE_ROOT`` from the environment when set
+        Reads ``DEVBENCH_WORKSPACE_ROOT`` from the environment when set
         (so CI runs against the live backlog), otherwise falls back to
         the pytest-supplied ``tmp_path`` -- never to a hardcoded
         ``/tmp/test-workspace`` (TD-6). When neither location holds a
@@ -25,7 +26,7 @@ class TestParseIndex:
         """
         import os
 
-        env_workspace = os.environ.get("JUDGE_WORKSPACE_ROOT")
+        env_workspace = os.environ.get("DEVBENCH_WORKSPACE_ROOT")
         workspace = Path(env_workspace) if env_workspace else tmp_path
         actual_backlog = workspace / "BACKLOG.md"
         if not actual_backlog.is_file():
@@ -111,6 +112,76 @@ class TestParseIndex:
         assert len(units) == 1
         assert units[0].status.value == "In Progress"  # file is source of truth
         assert any("mismatch" in r.message.lower() for r in caplog.records)
+
+
+class TestParseIndexFNFRetry:
+    """parse_index does a single-shot synchronous retry on FileNotFoundError
+    from parse_work_unit_file to absorb the atomic-rename / writer-window
+    race that SDK-driven Write/Edit tools (outside BacklogManager) create
+    when they overwrite a WU md file. On persistent failure the second
+    attempt re-raises with the original missing path intact."""
+
+    def _build_minimal_backlog(self, tmp_path: Path) -> tuple[BacklogParser, Path]:
+
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        wu_file = backlog_dir / "E0-F1-S1-T1.md"
+        wu_file.write_text("# E0-F1-S1-T1: Create Makefile\n\n## Status: in-queue\n")
+
+        index = tmp_path / "BACKLOG.md"
+        index.write_text(
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|----------|\n"
+            "| E0-F1-S1-T1 | Create Makefile | Task | in-queue | None | git-repo | `backlog/E0-F1-S1-T1.md` |\n"
+        )
+        return BacklogParser(backlog_root=backlog_dir, backlog_index=index), wu_file
+
+    def test_transient_fnf_recovers_via_single_retry(self, tmp_path: Path) -> None:
+        """First call raises FileNotFoundError (mimicking the writer-window
+        race); second call returns the real WorkUnit; parse_index succeeds."""
+        from unittest.mock import patch
+
+        parser, wu_file = self._build_minimal_backlog(tmp_path)
+        real = parser.parse_work_unit_file  # bind unwrapped reference
+
+        call_count = {"n": 0}
+
+        def flaky(file_path: Path) -> WorkUnit:
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise FileNotFoundError(2, "No such file or directory", str(file_path))
+            return real(file_path)
+
+        with patch.object(parser, "parse_work_unit_file", side_effect=flaky):
+            units = parser.parse_index()
+
+        assert len(units) == 1
+        assert units[0].id == "E0-F1-S1-T1"
+        assert call_count["n"] == 2, "Expected exactly one retry on transient FNF"
+
+    def test_persistent_fnf_propagates_after_retry(self, tmp_path: Path) -> None:
+        """Both calls raise FileNotFoundError -- parse_index re-raises so
+        the operator sees a genuine missing-file diagnostic with the path
+        preserved on the exception."""
+        from unittest.mock import patch
+
+        parser, wu_file = self._build_minimal_backlog(tmp_path)
+        call_count = {"n": 0}
+        fake_path = str(wu_file)
+
+        def always_missing(file_path: Path) -> WorkUnit:
+            call_count["n"] += 1
+            raise FileNotFoundError(2, "No such file or directory", fake_path)
+
+        with (
+            patch.object(parser, "parse_work_unit_file", side_effect=always_missing),
+            pytest.raises(FileNotFoundError) as excinfo,
+        ):
+            parser.parse_index()
+
+        assert call_count["n"] == 2, "Expected exactly one retry before propagating"
+        assert excinfo.value.filename == fake_path
 
 
 class TestParseWorkUnitFile:
@@ -675,6 +746,31 @@ class TestGetParallelCandidatesTopologicalOrder:
         order = [u.id for u in parser.get_parallel_candidates(units)]
         assert order == ["Y1", "X1"], f"Got {order!r}"
 
+    def test_cycle_in_dep_chain_collapses_to_zero(self) -> None:
+        """When the dep graph has a cycle A -> B -> A, ``_depth`` must return 0
+        for the back-edge instead of recursing infinitely. A is the candidate;
+        B is DONE so A's _deps_satisfied check passes. The depth traversal
+        through B sees A in the visiting set and short-circuits at the cycle
+        guard."""
+        parser = self._make_parser()
+        units = [
+            self._task("A1", deps=["B1"]),
+            self._task("B1", status=WorkUnitStatus.DONE, deps=["A1"]),
+        ]
+        order = [u.id for u in parser.get_parallel_candidates(units)]
+        assert order == ["A1"]
+
+    def test_self_dep_in_transitive_chain_is_skipped(self) -> None:
+        """An indirect self-dep (B depends on B) does not block depth
+        computation -- the self-dep edge is skipped so traversal continues."""
+        parser = self._make_parser()
+        units = [
+            self._task("A1", deps=["B1"]),
+            self._task("B1", status=WorkUnitStatus.DONE, deps=["B1"]),
+        ]
+        order = [u.id for u in parser.get_parallel_candidates(units)]
+        assert order == ["A1"]
+
     def test_self_loop_does_not_cause_infinite_recursion(self) -> None:
         """A self-dep on an in-queue task fails ``_deps_satisfied`` (the dep is
         the unit itself and it's not DONE/DECLINED), so the unit is filtered
@@ -710,13 +806,12 @@ class TestInferTypeFromIdEdgeCases:
         result = _infer_type_from_id("--")
         assert result is WorkUnitType.EPIC
 
-    def test_empty_id_note(self) -> None:
-        """Line 91: dead code -- str.split('-') on '' returns [''], never [], so `not parts` is never True."""
-        # This is intentionally a documentation-only test.
-        # The guard `if not parts:` at line 90 of parser.py is unreachable because
-        # Python's str.split("-") always returns a list with at least one element.
-        result = str.split("", "-")
-        assert len(result) > 0, "str.split always returns non-empty list"
+    def test_raises_for_empty_id(self) -> None:
+        """Empty unit_id raises ValueError before any segment parsing."""
+        from devbench.backlog.parser import _infer_type_from_id
+
+        with pytest.raises(ValueError, match="Cannot infer type from empty ID"):
+            _infer_type_from_id("")
 
     def test_raises_for_unknown_segment_prefix(self) -> None:
         """Line 98: raises ValueError when last segment has unknown prefix."""
@@ -931,3 +1026,214 @@ class TestDepsSatisfiedHierarchical:
         candidate_ids = {u.id for u in candidates}
         assert "E0-F1-S1-T1" in candidate_ids
         assert "E0-F1-S2-T1" not in candidate_ids
+
+
+class TestParseStatusDraft:
+    """Test that the parser recognises 'draft' as a valid work-unit status."""
+
+    @pytest.mark.parametrize(
+        "raw_input",
+        ["draft", "DRAFT", "Draft", "  draft  "],
+    )
+    def test_parse_status_draft_normalised(self, raw_input: str) -> None:
+        """_parse_status accepts 'draft' in any case and with leading/trailing whitespace."""
+        from devbench.backlog.parser import _parse_status
+
+        result = _parse_status(raw_input)
+        assert result is WorkUnitStatus.DRAFT
+
+    def test_draft_key_present_in_raw_status_map(self) -> None:
+        """'draft' must be a key in _RAW_STATUS_TO_ENUM mapping to WorkUnitStatus.DRAFT."""
+        from devbench.backlog.parser import _RAW_STATUS_TO_ENUM
+
+        assert "draft" in _RAW_STATUS_TO_ENUM
+        assert _RAW_STATUS_TO_ENUM["draft"] is WorkUnitStatus.DRAFT
+
+    def test_parse_work_unit_file_draft_status(self, tmp_path: Path) -> None:
+        """parse_work_unit_file returns DRAFT status when the file contains '## Status: draft'."""
+        wu_file = tmp_path / "E0-F1-S1-T1.md"
+        wu_file.write_text("# E0-F1-S1-T1: Draft Task\n\n## Status: draft\n")
+
+        parser = BacklogParser(backlog_root=tmp_path, backlog_index=tmp_path / "B.md")
+        wu = parser.parse_work_unit_file(wu_file)
+
+        assert wu.status is WorkUnitStatus.DRAFT
+
+    def test_parse_index_draft_status(self, tmp_path: Path) -> None:
+        """parse_index parses a BACKLOG.md row with status 'draft' without error."""
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        wu_file = backlog_dir / "E0-F1-S1-T1.md"
+        wu_file.write_text("# E0-F1-S1-T1: Draft Task\n\n## Status: draft\n")
+
+        index = tmp_path / "BACKLOG.md"
+        index.write_text(
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|----------|\n"
+            "| E0-F1-S1-T1 | Draft Task | Task | draft | None | git-repo | `backlog/E0-F1-S1-T1.md` |\n"
+        )
+
+        parser = BacklogParser(backlog_root=backlog_dir, backlog_index=index)
+        units = parser.parse_index()
+
+        assert len(units) == 1
+        assert units[0].status is WorkUnitStatus.DRAFT
+
+
+class TestGetParallelCandidatesWithScope:
+    """Tests for get_parallel_candidates(scope=) -- AC-190-12.
+
+    When a ``ScopeFilter`` is provided, only work units whose IDs are in
+    ``scope.expanded_ids`` are returned.  When ``scope=None`` (the default),
+    the existing behaviour is unchanged.
+    """
+
+    @staticmethod
+    def _make_parser() -> BacklogParser:
+        parser = BacklogParser.__new__(BacklogParser)
+        parser._backlog_root = Path("/tmp")
+        parser._backlog_index = Path("/tmp/B.md")
+        return parser
+
+    @staticmethod
+    def _task(
+        id_: str,
+        *,
+        status: WorkUnitStatus = WorkUnitStatus.IN_QUEUE,
+        deps: list[str] | None = None,
+    ) -> WorkUnit:
+        return WorkUnit(
+            id=id_,
+            title=id_,
+            status=status,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("/dev/null"),
+            repo="r",
+            dependencies=deps or [],
+        )
+
+    def test_no_scope_returns_all_candidates(self) -> None:
+        """Default behaviour (scope=None) is unchanged -- all actionable tasks returned."""
+        parser = self._make_parser()
+        units = [
+            self._task("E0-F1-S1-T1"),
+            self._task("E0-F1-S1-T2"),
+        ]
+        candidates = parser.get_parallel_candidates(units, scope=None)
+        assert len(candidates) == 2
+        candidate_ids = {u.id for u in candidates}
+        assert candidate_ids == {"E0-F1-S1-T1", "E0-F1-S1-T2"}
+
+    def test_scope_filters_to_only_matching_ids(self) -> None:
+        """When scope is provided, only WUs in scope.expanded_ids are returned."""
+        parser = self._make_parser()
+        units = [
+            self._task("E0-F1-S1-T1"),
+            self._task("E0-F1-S1-T2"),
+            self._task("E0-F1-S1-T3"),
+        ]
+        scope = ScopeFilter(
+            include=["E0-F1-S1-T1"],
+            exclude=[],
+            expanded_ids={"E0-F1-S1-T1"},
+        )
+        candidates = parser.get_parallel_candidates(units, scope=scope)
+        assert len(candidates) == 1
+        assert candidates[0].id == "E0-F1-S1-T1"
+
+    def test_scope_empty_expanded_ids_returns_empty_list(self) -> None:
+        """When scope.expanded_ids is empty, no candidates are returned."""
+        parser = self._make_parser()
+        units = [
+            self._task("E0-F1-S1-T1"),
+            self._task("E0-F1-S1-T2"),
+        ]
+        scope = ScopeFilter(
+            include=[],
+            exclude=[],
+            expanded_ids=set(),
+        )
+        candidates = parser.get_parallel_candidates(units, scope=scope)
+        assert candidates == []
+
+    def test_scope_filters_but_deps_still_enforced(self) -> None:
+        """Scope filtering is applied after dependency checking -- a task in scope
+        with unsatisfied deps is still excluded."""
+        parser = self._make_parser()
+        units = [
+            self._task("E0-F1-S1-T1", status=WorkUnitStatus.IN_QUEUE),
+            self._task("E0-F1-S1-T2", deps=["E0-F1-S1-T1"]),
+        ]
+        # Both T1 and T2 are in scope, but T2 depends on T1 which is IN_QUEUE (not DONE).
+        scope = ScopeFilter(
+            include=["E0-F1-S1"],
+            exclude=[],
+            expanded_ids={"E0-F1-S1-T1", "E0-F1-S1-T2"},
+        )
+        candidates = parser.get_parallel_candidates(units, scope=scope)
+        candidate_ids = {u.id for u in candidates}
+        # T1 is actionable and in scope; T2 is not actionable (dep unsatisfied).
+        assert "E0-F1-S1-T1" in candidate_ids
+        assert "E0-F1-S1-T2" not in candidate_ids
+
+    def test_scope_preserves_topological_sort_order(self) -> None:
+        """When scope is active, the returned candidates are still sorted by
+        (status_priority, depth, id) -- scope only narrows the set, not the order."""
+        parser = self._make_parser()
+        done = self._task("E0-F1-S1-T1", status=WorkUnitStatus.DONE)
+        t2 = self._task("E0-F1-S1-T2", deps=["E0-F1-S1-T1"])
+        t3 = self._task("E0-F1-S1-T3", deps=["E0-F1-S1-T1"])
+        units = [done, t3, t2]
+        scope = ScopeFilter(
+            include=["E0-F1-S1-T2", "E0-F1-S1-T3"],
+            exclude=[],
+            expanded_ids={"E0-F1-S1-T2", "E0-F1-S1-T3"},
+        )
+        candidates = parser.get_parallel_candidates(units, scope=scope)
+        assert len(candidates) == 2
+        # Both at same depth; sorted by id (T2 before T3).
+        assert candidates[0].id == "E0-F1-S1-T2"
+        assert candidates[1].id == "E0-F1-S1-T3"
+
+    def test_scope_excludes_non_matching_actionable_tasks(self) -> None:
+        """Actionable tasks NOT in scope.expanded_ids are excluded from the result."""
+        parser = self._make_parser()
+        units = [
+            self._task("E1-F1-S1-T1"),
+            self._task("E2-F1-S1-T1"),
+            self._task("E3-F1-S1-T1"),
+        ]
+        scope = ScopeFilter(
+            include=["E2"],
+            exclude=[],
+            expanded_ids={"E2-F1-S1-T1"},
+        )
+        candidates = parser.get_parallel_candidates(units, scope=scope)
+        assert len(candidates) == 1
+        assert candidates[0].id == "E2-F1-S1-T1"
+
+    @pytest.mark.parametrize(
+        "scope_ids,expected_ids",
+        [
+            ({"E0-F1-S1-T1"}, ["E0-F1-S1-T1"]),
+            ({"E0-F1-S1-T2"}, ["E0-F1-S1-T2"]),
+            ({"E0-F1-S1-T1", "E0-F1-S1-T2"}, ["E0-F1-S1-T1", "E0-F1-S1-T2"]),
+            (set(), []),
+        ],
+    )
+    def test_scope_filter_parametrized(
+        self,
+        scope_ids: set[str],
+        expected_ids: list[str],
+    ) -> None:
+        """Parametrised: various scope sets return exactly the matching in-queue tasks."""
+        parser = self._make_parser()
+        units = [
+            self._task("E0-F1-S1-T1"),
+            self._task("E0-F1-S1-T2"),
+        ]
+        scope = ScopeFilter(include=[], exclude=[], expanded_ids=scope_ids)
+        candidates = parser.get_parallel_candidates(units, scope=scope)
+        result_ids = sorted(u.id for u in candidates)
+        assert result_ids == sorted(expected_ids)

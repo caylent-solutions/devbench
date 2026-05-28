@@ -11,6 +11,9 @@ Public API
 ``mark_done``                 -- gated completion: verifies all required review
                                 judges passed before writing ``done``.
 ``mark_blocked``              -- writes ``blocked`` and appends a reason comment.
+``bulk_set_status``           -- set one status on many WUs under a single
+                                flock(BACKLOG.lock); writes a workspace-level
+                                ``[BULK_STATUS_UPDATE]`` audit row per call.
 ``validate``                  -- returns integrity errors (missing files, status
                                 drift, orphans, broken deps, summary mismatch).
 ``log_to_traceability_matrix``-- appends a spec/test mapping entry to the
@@ -38,6 +41,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import ClassVar
 
+from devbench.backlog.work_unit import WorkUnitType
 from devbench.constants import (
     ALL_REQUIRED_JUDGE_NAMES,
     BACKLOG_INDEX_CELL_COUNT,
@@ -53,6 +57,7 @@ from devbench.constants import (
     STATUS_BLOCKED,
     STATUS_DECLINED,
     STATUS_DONE,
+    STATUS_DRAFT,
     STATUS_HOLD,
     STATUS_IN_PROGRESS,
     STATUS_IN_QUEUE,
@@ -66,6 +71,8 @@ from devbench.constants import (
     TRACEABILITY_MATRIX_HEADER,
     VALID_STATUSES,
 )
+from devbench.session import flock_backlog
+from devbench.utils.io import atomic_write_text
 
 # Terminal statuses for parent-rollup purposes: a child in either state is
 # "finalised" and does not block its parent from rolling to done. Kept at
@@ -80,7 +87,42 @@ _TERMINAL_CHILD_STATUSES: frozenset[str] = frozenset({STATUS_DONE, STATUS_DECLIN
 # regex captures the target task ID in group 1; the scan is scoped to the
 # Comments section so markers quoted in Description/Approach text cannot
 # trigger the cascade.
-_BLOCKED_PENDING_PROPOSAL_RE: re.Pattern[str] = re.compile(r"\[BLOCKED_PENDING_PROPOSAL\]\s+(\S+)")
+#
+# Issue #200 / AC-200-3: the original ``\S+`` capture group was too broad --
+# it matched any non-whitespace word, including prose words like "Amendment"
+# in lines such as ``[BLOCKED_PENDING_PROPOSAL] Amendment rejected``. This
+# caused the auto-requeue cascade to treat "Amendment" as an unknown task ID
+# (non-terminal), preventing the cascade from firing even when the real marker
+# target (e.g. E5-F3-S1-T4) was terminal. The fix narrows the pattern to only
+# capture canonical task IDs matching ``E\d+(-F\d+)?(-S\d+)?(-T\d+)?``.
+_BLOCKED_PENDING_PROPOSAL_RE: re.Pattern[str] = re.compile(
+    r"\[BLOCKED_PENDING_PROPOSAL\]\s+(E\d+(?:-F\d+)?(?:-S\d+)?(?:-T\d+)?)"
+)
+
+
+# ``# <id>: <title>`` heading regex used by the operator-notification helper
+# below.  Single source of truth so the manager does not re-parse work-unit
+# files just to surface a Slack-friendly title.
+_WU_TITLE_RE: re.Pattern[str] = re.compile(r"^#\s+\S+:\s*(.+?)\s*$", re.MULTILINE)
+
+
+def _extract_wu_title(work_unit_path: Path, fallback: str) -> str:
+    """Return the human-readable title from a work-unit MD file.
+
+    Reads the first ``# E0-F1-S1-T1: Title here`` heading; returns the
+    title portion stripped of trailing whitespace.  Falls back to
+    *fallback* (typically the unit id) when the file is unreadable or
+    has no heading.  Best-effort: never raises -- consumed by the
+    notifications dispatcher which is itself best-effort.
+    """
+    try:
+        content = work_unit_path.read_text(encoding="utf-8")
+    except OSError:
+        return fallback
+    match = _WU_TITLE_RE.search(content)
+    if match is None:
+        return fallback
+    return match.group(1)
 
 
 class BacklogManager:
@@ -109,6 +151,7 @@ class BacklogManager:
         backlog_index: Path,
         unit_id: str,
         new_status: str,
+        session_name: str | None = None,
     ) -> None:
         """Write any status to both files, bypassing all gate checks.
 
@@ -123,13 +166,18 @@ class BacklogManager:
             unit_id: The work-unit identifier (e.g. ``E0-F1-S1-T1``).
             new_status: Status in CLI form (``in-queue``, ``in-progress``,
                 ``in-review``, ``done``, ``blocked``) or title-case form.
+            session_name: Optional named-session identifier sourced from
+                ``DEVBENCH_SESSION_NAME``.  When provided and the target
+                status is ``in-progress``, the ``[WU_CLAIMED]`` audit comment
+                is extended with ``session=<name>`` per spec section 4.4.7
+                and spec section 6 (AC-192-6).
 
         Raises:
             FileNotFoundError: If either file does not exist.
             ValueError: If the status is invalid, the ``## Status:`` line
                 is missing, or the unit is not found in the backlog index.
         """
-        self._set_status(work_unit_path, backlog_index, unit_id, new_status)
+        self._set_status(work_unit_path, backlog_index, unit_id, new_status, session_name=session_name)
 
     def mark_done(self, work_unit_path: Path, backlog_index: Path, unit_id: str) -> None:
         """Mark a work unit as Done in both files.
@@ -152,6 +200,13 @@ class BacklogManager:
                 f"Cannot mark {unit_id} done: not all required judges passed in the most recent review round"
             )
         self._set_status(work_unit_path, backlog_index, unit_id, STATUS_DONE)
+        # Operator notification (PR #202).  notify_* helpers are best-effort
+        # and gated by the per-event toggle in devbench.yaml; safe to call
+        # unconditionally.
+        from devbench.notifications import notify_work_unit_done
+
+        title = _extract_wu_title(work_unit_path, unit_id)
+        notify_work_unit_done(unit_id, title)
 
     def mark_blocked(self, work_unit_path: Path, backlog_index: Path, unit_id: str, reason: str) -> None:
         """Mark a work unit as Blocked in both files and append a comment.
@@ -168,6 +223,35 @@ class BacklogManager:
         """
         self._set_status(work_unit_path, backlog_index, unit_id, STATUS_BLOCKED)
         self._append_comment(work_unit_path, "BLOCKED", reason)
+        # Operator notification (PR #202).  Fires only when the classifier
+        # determines the block is OPERATOR_ACTION_REQUIRED -- the other
+        # blocked-buckets (AWAITING_DEPENDENCY, AUTO_CLEARING_VIA_PROPOSAL,
+        # etc.) auto-resolve so notifying on them every time would be noisy.
+        # All notification helpers are best-effort and gated by per-event
+        # toggles in devbench.yaml; safe to call unconditionally.
+        try:
+            from devbench.backlog.proposal import classify_blocked_task
+            from devbench.notifications import notify_blocked_classification_transition
+
+            workspace_root = backlog_index.parent
+            state = classify_blocked_task(
+                backlog_index.parent / "backlog",
+                backlog_index,
+                unit_id,
+                workspace_root=workspace_root,
+            )
+            title = _extract_wu_title(work_unit_path, unit_id)
+            # Issue #207 + #209: routes through the transition-aware helper
+            # so the ping fires on every transition INTO any of the seven
+            # blocked classes (initial mark_blocked OR later reclassification
+            # via cmd_sync_blocked / cmd_reconcile_cascade).  Each class has
+            # its own per-event toggle in devbench.yaml; the dispatcher
+            # picks the right notify_* helper based on the classifier's
+            # return value.
+            notify_blocked_classification_transition(unit_id, title, reason, state.name, workspace_root)
+        except (OSError, ValueError, ImportError):
+            # Classifier I/O failures should not block the status write.
+            pass
 
     def mark_declined(self, work_unit_path: Path, backlog_index: Path, unit_id: str, reason: str) -> None:
         """Mark a work unit as Declined in both files and append a comment.
@@ -234,6 +318,83 @@ class BacklogManager:
         self._set_status(work_unit_path, backlog_index, unit_id, STATUS_IN_QUEUE)
         self._append_comment(work_unit_path, "UNHOLD", reason)
 
+    def bulk_set_status(
+        self,
+        unit_ids: list[tuple[str, Path]],
+        new_status: str,
+        backlog_index: Path,
+        audit_log_path: Path,
+        *,
+        audit_meta: str,
+    ) -> int:
+        """Set the same status on every work unit in the list under a single flock.
+
+        Acquires ``flock(BACKLOG.lock)`` exactly once for the entire batch so that
+        concurrent devbench sessions cannot interleave partial writes.  Every
+        per-WU update is routed through :meth:`_set_status` so existing audit
+        logic (``[WU_CLAIMED]``, checkbox ticks, parent rollup, cascade requeue)
+        continues to fire for each work unit.
+
+        After all per-WU writes complete, a single workspace-level
+        ``[BULK_STATUS_UPDATE] <count> WUs set to '<status>' by <audit_meta>``
+        row is appended to *audit_log_path* (parent directories are created
+        automatically if absent).
+
+        Args:
+            unit_ids: Ordered list of ``(unit_id, work_unit_path)`` pairs to
+                update.  Pass an empty list to record a zero-count audit row
+                without touching any files.
+            new_status: Target status string (CLI form or title-case).  Validated
+                against :data:`~devbench.constants.VALID_STATUSES` before the
+                flock is acquired; raises immediately on invalid input so no
+                partial writes occur.
+            backlog_index: Path to the ``BACKLOG.md`` index file.  The parent
+                directory of this file is used as the workspace root when
+                acquiring the flock.
+            audit_log_path: Path where the ``[BULK_STATUS_UPDATE]`` audit row is
+                appended.  The file and its parent directories are created when
+                absent.
+            audit_meta: Caller-supplied selector description appended verbatim to
+                the audit row (e.g. ``'--include="E7" --exclude="E7-F3"'``).
+
+        Returns:
+            The number of work units that were updated (equals ``len(unit_ids)``
+            on success).
+
+        Raises:
+            ValueError: *new_status* is not a recognised status value.
+            FileNotFoundError: A work-unit file or ``backlog_index`` does not
+                exist.
+            TimeoutError: The BACKLOG.lock could not be acquired within the
+                default timeout.
+            OSError: An unexpected OS error from ``fcntl.flock`` or file I/O.
+        """
+        # Validate status early -- fail fast before acquiring the lock.
+        canonical = VALID_STATUSES.get(new_status.lower())
+        if canonical is None:
+            raise ValueError(f"Invalid status '{new_status}'. Valid statuses: {', '.join(sorted(VALID_STATUSES))}")
+
+        workspace_root = backlog_index.parent
+
+        with flock_backlog(workspace_root):
+            for unit_id, work_unit_path in unit_ids:
+                self._set_status(work_unit_path, backlog_index, unit_id, canonical)
+
+        count = len(unit_ids)
+        audit_log_path.parent.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+        audit_row = f"[{timestamp}] [BULK_STATUS_UPDATE] {count} WUs set to '{canonical}' by {audit_meta}\n"
+        with audit_log_path.open("a", encoding="utf-8") as fh:
+            fh.write(audit_row)
+
+        self.logger.info(
+            "Bulk status update: %d WUs set to '%s'; audit written to %s",
+            count,
+            canonical,
+            audit_log_path,
+        )
+        return count
+
     def validate(self, backlog_index: Path, workspace_root: Path, fix: bool = False) -> list[str]:
         """Check backlog integrity and return a list of error messages.
 
@@ -291,6 +452,7 @@ class BacklogManager:
             rows = self._parse_backlog_rows(backlog_index)
         self._check_task_content(rows, workspace_root, errors)
         self._check_manifest_path_prefixes(rows, workspace_root, errors)
+        self._check_no_glob_in_manifest(rows, workspace_root, errors)
         self._check_manifest_conflicts(rows, workspace_root, errors)
         self._check_language_ac_alignment(rows, workspace_root, errors)
         self._check_source_test_pairs(rows, workspace_root, errors)
@@ -485,7 +647,7 @@ class BacklogManager:
 
             if content != original or audit_lines:
                 content = self._append_fix_audit(content, timestamp, audit_lines)
-                wu_path.write_text(content, encoding="utf-8")
+                atomic_write_text(wu_path, content)
                 files_fixed.add(wu_path)
 
         return fix_count, len(files_fixed)
@@ -741,7 +903,7 @@ class BacklogManager:
         if not matrix_path.exists():
             header = TRACEABILITY_MATRIX_HEADER
             matrix_path.parent.mkdir(parents=True, exist_ok=True)
-            matrix_path.write_text(header, encoding="utf-8")
+            atomic_write_text(matrix_path, header)
             self.logger.info("Created traceability matrix at %s", matrix_path)
 
         row = f"| {spec_ref} | {test_ref} | {timestamp} |\n"
@@ -811,7 +973,7 @@ class BacklogManager:
             new_lines.append(line)
 
         if changed:
-            work_unit_path.write_text("".join(new_lines), encoding="utf-8")
+            atomic_write_text(work_unit_path, "".join(new_lines))
 
     def _set_status(
         self,
@@ -819,12 +981,24 @@ class BacklogManager:
         backlog_index: Path,
         unit_id: str,
         new_status: str,
+        session_name: str | None = None,
     ) -> None:
         """Private workhorse: write status to both files with no gate checks.
 
         All public transition methods (``force_status``, ``mark_done``,
         ``mark_blocked``) and internal rollup code call this method so that
         every write goes through a single code path.
+
+        Args:
+            work_unit_path: Path to the work-unit ``.md`` file.
+            backlog_index: Path to the ``BACKLOG.md`` file.
+            unit_id: The work-unit identifier.
+            new_status: Status string (CLI form or title-case).
+            session_name: Optional named-session name from
+                ``DEVBENCH_SESSION_NAME``.  When provided and the target
+                status is ``in-progress``, the ``[WU_CLAIMED]`` audit comment
+                is extended with ``session=<name>`` per spec 4.4.7 /
+                AC-192-6.
         """
         canonical = VALID_STATUSES.get(new_status.lower())
         if canonical is None:
@@ -839,20 +1013,22 @@ class BacklogManager:
             canonical,
         )
 
-        # Issue #185: every transition into ``in-progress`` (claim,
-        # resume after blocker clear, force-status) writes a
-        # ``[WU_CLAIMED]`` audit-comment row carrying the canonical
-        # ``Set <id> to 'in-progress'`` phrase so the status-timer
-        # fallback (`_latest_audit_in_progress_ts`) can recover the
-        # claim timestamp from the work-unit file alone when the
-        # orchestrator log has rotated. Skips Stories / Features /
-        # Epics whose status is auto-rolled from children (no human
-        # ever claims those directly).
+        # Issue #185 / spec 4.4.2 / AC-192-5: every transition into
+        # ``in-progress`` writes a ``[WU_CLAIMED]`` audit-comment row.
+        # Issue #192 / spec 4.4.7 / AC-192-6: when a named session is active
+        # (``session_name`` is provided), the comment is extended with
+        # ``session=<name>`` so the audit trail records which session
+        # performed the claim.
+        # Skips Stories / Features / Epics whose status is auto-rolled from
+        # children (no human ever claims those directly).
         if canonical == STATUS_IN_PROGRESS and "-T" in unit_id:
+            claim_body = f"[WU_CLAIMED] Set {unit_id} to 'in-progress'"
+            if session_name:
+                claim_body = f"{claim_body} session={session_name}"
             self._append_agent_comment(
                 work_unit_path,
                 "orchestrator",
-                f"[WU_CLAIMED] Set {unit_id} to 'in-progress'",
+                claim_body,
             )
 
         if canonical == STATUS_DONE:
@@ -890,6 +1066,12 @@ class BacklogManager:
                 # non-terminal and correctly declines to promote the parent
                 # to done.
                 self._auto_requeue_marker_dependents(backlog_index, unit_id)
+                # Issue #208 follow-up: the marker cascade only covers tasks
+                # carrying a ``[BLOCKED_PENDING_PROPOSAL]`` marker. Tasks that
+                # landed in ``blocked`` via ``cmd_sync_blocked`` (regular
+                # Dependencies table, no marker) were marooned. The regular-dep
+                # cascade closes that gap.
+                self._auto_requeue_regular_dep_dependents(backlog_index, unit_id)
             if canonical == STATUS_DONE:
                 self._rollup_parent_status(backlog_index, unit_id)
 
@@ -953,7 +1135,7 @@ class BacklogManager:
             content = content.rstrip("\n") + "\n\n" + rollup_comment
         else:
             content = content.rstrip("\n") + "\n\n" + COMMENTS_SECTION_HEADER + "\n\n" + rollup_comment
-        parent_file.write_text(content, encoding="utf-8")
+        atomic_write_text(parent_file, content)
 
     def _extract_pending_proposal_markers(self, work_unit_path: Path) -> set[str]:
         """Return the set of task IDs flagged by ``[BLOCKED_PENDING_PROPOSAL]`` markers.
@@ -989,8 +1171,12 @@ class BacklogManager:
         of the following hold:
 
         1. Its status is ``blocked`` (non-blocked candidates are skipped).
-        2. The just-completed task (``newly_done_id``) appears in the
-           candidate's declared Dependencies table.
+        2. The just-completed task (``newly_done_id``) appears EITHER in the
+           candidate's declared Dependencies table OR as a
+           ``[BLOCKED_PENDING_PROPOSAL]`` marker ID in the Comments section.
+           Issue #200 / AC-200-2: the marker-only path was previously missing,
+           causing tasks whose only reference to the promoted dep was via a
+           marker (no Dependencies-table row) to stay blocked indefinitely.
         3. The candidate's Comments section carries at least one
            ``[BLOCKED_PENDING_PROPOSAL]`` marker.
         4. Every task ID named by those markers is in a terminal state
@@ -1038,14 +1224,20 @@ class BacklogManager:
                 )
                 continue
 
-            # Must be a declared dep. Parse inline from the file content so
-            # the scan never depends on the full index being loadable.
+            # Issue #200 / AC-200-2: the trigger condition is relaxed to accept
+            # ``newly_done_id`` appearing EITHER in the declared Dependencies
+            # table OR as a ``[BLOCKED_PENDING_PROPOSAL]`` marker in the
+            # Comments section.  Previously only the dep-table path was checked,
+            # which silently skipped tasks where task-factory wired the dep via
+            # a marker-only reference (no Dependencies-table row), leaving them
+            # stuck in ``blocked`` after the marker target reached ``done``.
             content = candidate_file.read_text(encoding="utf-8")
-            if newly_done_id not in self._parse_candidate_dependencies(content):
-                continue
-
             marker_ids = self._extract_pending_proposal_markers(candidate_file)
             if not marker_ids:
+                continue
+            referenced_via_dep = newly_done_id in self._parse_candidate_dependencies(content)
+            referenced_via_marker = newly_done_id in marker_ids
+            if not referenced_via_dep and not referenced_via_marker:
                 continue
             if not marker_ids.issubset(terminal_ids):
                 continue
@@ -1065,6 +1257,88 @@ class BacklogManager:
                 candidate_file,
                 "backlog_manager",
                 f"[AUTO_UNBLOCKED] [CASCADE_RESOLVED] promoted proposals {sorted_markers} are terminal; re-queuing",
+            )
+
+    def _auto_requeue_regular_dep_dependents(self, backlog_index: Path, newly_done_id: str) -> None:
+        """Auto-requeue blocked tasks whose regular Dependencies-table deps are now all terminal.
+
+        Issue #208 (companion to issue #147). The marker cascade in
+        :meth:`_auto_requeue_marker_dependents` only handles blocked tasks
+        carrying a ``[BLOCKED_PENDING_PROPOSAL]`` marker. Tasks that landed
+        in ``blocked`` via ``cmd_sync_blocked`` (regular Dependencies-table
+        deps unsatisfied, no marker) were marooned: even after the dep
+        transitioned to ``done``, the task stayed blocked indefinitely. An
+        operator had to run ``devbench sync-blocked`` or
+        ``devbench reconcile-cascade`` manually.
+
+        Narrow trigger. A blocked candidate is auto-requeued only when ALL
+        of the following hold:
+
+        1. Its status is ``blocked``.
+        2. It carries NO ``[BLOCKED_PENDING_PROPOSAL]`` marker (those are
+           owned by the marker cascade -- double-handling would produce
+           conflicting audit comments).
+        3. The just-completed task (``newly_done_id``) appears in its
+           declared Dependencies table.
+        4. Every other entry in its Dependencies table is in a terminal
+           state (``done`` or ``declined``).
+
+        The transition uses :meth:`force_status` and writes a single
+        ``[UNBLOCKED] [CASCADE_RESOLVED]`` audit comment naming the dep
+        whose completion triggered the cascade. The supersession audit
+        shape mirrors the marker cascade and ``cmd_sync_blocked`` so the
+        status-panel renderer treats all three uniformly (#153).
+
+        Args:
+            backlog_index: Path to ``BACKLOG.md``.
+            newly_done_id: The task that just transitioned to a terminal state.
+        """
+        try:
+            rows = self._parse_backlog_rows(backlog_index)
+        except FileNotFoundError as exc:
+            self.logger.warning("Regular-dep auto-requeue scan skipped -- %s", exc)
+            return
+
+        terminal_ids = {row_id for row_id, status, _ in rows if row_id and status in _TERMINAL_CHILD_STATUSES}
+        workspace = backlog_index.parent
+
+        for row_id, status, file_path in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if status != STATUS_BLOCKED:
+                continue
+            if not file_path:
+                continue
+            candidate_file = workspace / file_path
+            if not candidate_file.exists():
+                self.logger.warning(
+                    "Regular-dep auto-requeue scan: candidate file missing for %s at %s -- skipping",
+                    row_id,
+                    candidate_file,
+                )
+                continue
+
+            # Marker cascade owns marker-bearing candidates.
+            if self._extract_pending_proposal_markers(candidate_file):
+                continue
+
+            content = candidate_file.read_text(encoding="utf-8")
+            declared_deps = self._parse_candidate_dependencies(content)
+            if newly_done_id not in declared_deps:
+                continue
+            if not set(declared_deps).issubset(terminal_ids):
+                continue
+
+            self.logger.info(
+                "Auto-requeuing %s -- regular dependency %r now terminal",
+                row_id,
+                newly_done_id,
+            )
+            self.force_status(candidate_file, backlog_index, row_id, STATUS_IN_QUEUE)
+            self._append_agent_comment(
+                candidate_file,
+                "backlog_manager",
+                f"[UNBLOCKED] [CASCADE_RESOLVED] dependency {newly_done_id!r} now terminal; re-queuing",
             )
 
     @staticmethod
@@ -1175,7 +1449,7 @@ class BacklogManager:
             raise ValueError(f"Could not find '## Status: ...' line in {work_unit_path}")
 
         updated = STATUS_LINE_RE.sub(rf"\g<1>{new_status}", content, count=1)
-        work_unit_path.write_text(updated, encoding="utf-8")
+        atomic_write_text(work_unit_path, updated)
 
     def _update_backlog_index(self, backlog_index: Path, unit_id: str, new_status: str) -> None:
         """Update the status column for a work unit in the BACKLOG.md table."""
@@ -1209,7 +1483,7 @@ class BacklogManager:
         if not updated:
             raise ValueError(f"Could not find unit '{unit_id}' with a recognized status in {backlog_index}")
 
-        backlog_index.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        atomic_write_text(backlog_index, "\n".join(lines) + "\n")
         self.logger.info("Updated %s status to '%s' in %s", unit_id, new_status, backlog_index.name)
 
     def _append_comment(self, work_unit_path: Path, action: str, message: str) -> None:
@@ -1230,7 +1504,7 @@ class BacklogManager:
         else:
             content = content.rstrip("\n") + "\n\n" + comments_header + "\n\n" + entry
 
-        work_unit_path.write_text(content, encoding="utf-8")
+        atomic_write_text(work_unit_path, content)
 
     def _append_agent_comment(self, work_unit_path: Path, agent_name: str, message: str) -> None:
         """Append an agent comment using COMMENT_AGENT_TEMPLATE format.
@@ -1256,7 +1530,7 @@ class BacklogManager:
         else:
             content = content.rstrip("\n") + "\n\n" + COMMENTS_SECTION_HEADER + "\n\n" + entry
 
-        work_unit_path.write_text(content, encoding="utf-8")
+        atomic_write_text(work_unit_path, content)
 
     @staticmethod
     def _find_next_section_index(lines: list[str], start: int) -> int:
@@ -1331,7 +1605,7 @@ class BacklogManager:
             new_lines.extend(lines[next_section_idx + 1 :])
             content = "\n".join(new_lines) + "\n"
 
-        work_unit_path.write_text(content, encoding="utf-8")
+        atomic_write_text(work_unit_path, content)
 
     def _update_status_summary(self, backlog_index: Path) -> None:
         """Rewrite the Status Summary table section in BACKLOG.md.
@@ -1366,7 +1640,7 @@ class BacklogManager:
         else:
             content = content.rstrip("\n") + "\n\n" + summary_block
 
-        backlog_index.write_text(content, encoding="utf-8")
+        atomic_write_text(backlog_index, content)
 
     def _parse_epic_titles(self, backlog_index: Path) -> dict[str, str]:
         """Parse epic IDs to their titles from BACKLOG.md table rows.
@@ -1392,10 +1666,9 @@ class BacklogManager:
         """Compute per-epic status counts from backlog rows.
 
         Returns a dict mapping epic_id -> {status: count} where status is one
-        of ``done``, ``in-progress``, ``in-queue``, ``blocked``, ``declined``.
-        Only descendant rows (those starting with ``<epic-id>-``) are counted;
-        the epic row itself is excluded. Proposed children are not surfaced
-        in the summary (they are inert drafts awaiting operator action).
+        of ``done``, ``in-progress``, ``in-queue``, ``blocked``, ``declined``,
+        ``draft``. Only descendant rows (those starting with ``<epic-id>-``)
+        are counted; the epic row itself is excluded.
         """
         epic_order: list[str] = []
         for row_id, _, _ in rows:
@@ -1409,6 +1682,7 @@ class BacklogManager:
                 STATUS_IN_QUEUE: 0,
                 STATUS_BLOCKED: 0,
                 STATUS_DECLINED: 0,
+                STATUS_DRAFT: 0,
             }
             for epic_id in epic_order
         }
@@ -1437,7 +1711,7 @@ class BacklogManager:
             table_rows += (
                 f"| {epic_id} | {title} | {c[STATUS_DONE]} | "
                 f"{c[STATUS_IN_PROGRESS]} | {c[STATUS_IN_QUEUE]} | "
-                f"{c[STATUS_BLOCKED]} | {c[STATUS_DECLINED]} |\n"
+                f"{c[STATUS_BLOCKED]} | {c[STATUS_DECLINED]} | {c[STATUS_DRAFT]} |\n"
             )
 
         return STATUS_SUMMARY_SECTION_HEADER + "\n\n" + STATUS_SUMMARY_TABLE_HEADER + table_rows + "\n"
@@ -1472,7 +1746,14 @@ class BacklogManager:
                 errors.append(f"Status Summary missing epic row '{epic_id}'")
                 continue
             actual = actual_counts[epic_id]
-            for status_key in (STATUS_DONE, STATUS_IN_PROGRESS, STATUS_IN_QUEUE, STATUS_BLOCKED, STATUS_DECLINED):
+            for status_key in (
+                STATUS_DONE,
+                STATUS_IN_PROGRESS,
+                STATUS_IN_QUEUE,
+                STATUS_BLOCKED,
+                STATUS_DECLINED,
+                STATUS_DRAFT,
+            ):
                 if expected[status_key] != actual.get(status_key, -1):
                     errors.append(
                         f"Status Summary mismatch for {epic_id}: "
@@ -1498,11 +1779,11 @@ class BacklogManager:
                 continue
             cells = [c.strip() for c in line.split("|")]
             # Splitting "|" around a pipe-delimited row produces empty flank
-            # cells, so a 6-data-column row yields 8 cells total and a
-            # 7-data-column row (with the new trailing Declined column)
-            # yields 9. Both shapes are accepted for backward compatibility;
-            # legacy rows default Declined to 0 until the backlog is
-            # regenerated.
+            # cells, so a 6-data-column row yields 8 cells total, a
+            # 7-data-column row (with the Declined column) yields 9, and an
+            # 8-data-column row (with both Declined and Draft columns) yields
+            # 10. Both older shapes are accepted for backward compatibility;
+            # missing columns default to 0 until the backlog is regenerated.
             if len(cells) < 7:
                 continue
             row_id = cells[1]
@@ -1510,12 +1791,14 @@ class BacklogManager:
                 continue
             try:
                 declined_count = int(cells[7]) if len(cells) >= 9 else 0
+                draft_count = int(cells[8]) if len(cells) >= 10 else 0
                 result[row_id] = {
                     STATUS_DONE: int(cells[3]),
                     STATUS_IN_PROGRESS: int(cells[4]),
                     STATUS_IN_QUEUE: int(cells[5]),
                     STATUS_BLOCKED: int(cells[6]),
                     STATUS_DECLINED: declined_count,
+                    STATUS_DRAFT: draft_count,
                 }
             except (ValueError, IndexError):
                 continue
@@ -1719,12 +2002,19 @@ class BacklogManager:
 
         Filters out placeholder strings like ``(none)``, ``(no file changes;
         ...)``, etc. that documentation-only or verification-only tasks use to
-        indicate an empty Manifest.
+        indicate an empty Manifest. Also filters out sentinel values like
+        ``<verification-only>``, ``<decision-only>``, and any
+        ``<name>``-shaped variant -- see ``devbench.backlog.sentinels`` for
+        the canonical allowlist + pattern + rationale.
         """
+        from devbench.backlog.sentinels import is_sentinel_manifest_value
+
         if not path:
             return False
         stripped = path.strip()
-        return not (stripped.startswith("(") and stripped.endswith(")"))
+        if stripped.startswith("(") and stripped.endswith(")"):
+            return False
+        return not is_sentinel_manifest_value(stripped)
 
     def _check_manifest_conflicts(
         self,
@@ -1920,6 +2210,56 @@ class BacklogManager:
                     f"per docs/acceptance-criteria-canonical.md."
                 )
 
+    def _check_no_glob_in_manifest(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """Issue #221 B4: reject Manifest entries containing ``*`` or ``**`` globs.
+
+        Globs in a Changes Manifest produce confusing downstream errors -- the
+        source-test atomicity rule, the path-prefix rule, and the conflict
+        detector all treat the glob as a literal path and emit misleading
+        diagnostics. Manifest paths must be concrete; tasks whose actual file
+        list is determined at execution time should either (a) use a sentinel
+        value like ``<source-drift-fix-targets-determined-at-execution>``
+        (see ``devbench.backlog.sentinels``), or (b) declare the canonical
+        candidates and rely on ``manifest_amendment`` to amend the Manifest
+        at runtime when the surface is known.
+        """
+        from devbench.backlog.manifest import ManifestParseError, parse_manifest
+        from devbench.backlog.sentinels import is_sentinel_manifest_value
+
+        for row_id, _, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not file_path_str or not self._is_task_id(row_id):
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.exists():
+                continue
+            content = wu_path.read_text(encoding="utf-8")
+            try:
+                manifest_rows = parse_manifest(content)
+            except ManifestParseError:
+                continue
+            for manifest_row in manifest_rows:
+                path = manifest_row.file
+                if is_sentinel_manifest_value(path):
+                    continue
+                if "*" in path:
+                    errors.append(
+                        f"{row_id}: Manifest entry {path!r} contains a glob "
+                        f"pattern. Manifest paths must be concrete; for "
+                        f"execution-determined file lists, use a sentinel "
+                        f"value (e.g., "
+                        f"`<source-drift-fix-targets-determined-at-execution>`) "
+                        f"and amend the Manifest at runtime via "
+                        f"`manifest_amendment`. See "
+                        f"docs/backlog-contract.md 'Manifest Glob Rejection'."
+                    )
+
     def _check_source_test_pairs(
         self,
         rows: list[tuple[str, str, str]],
@@ -1927,6 +2267,13 @@ class BacklogManager:
         errors: list[str],
     ) -> None:
         """Check 14: every production-source .py file in a Manifest needs a matching test entry.
+
+        Source-test atomicity (Update vs Add): an ``Update`` annotation on
+        an EXISTING ``tests/<...>/test_<basename>.py`` file satisfies the
+        rule the same way an ``Add`` annotation does. The rule asserts
+        only that the test file appears in the Manifest -- whether the
+        executor creates it or augments it is a per-task implementation
+        detail. See ``docs/source-test-atomicity.md`` for a worked example.
 
         Per docs/source-test-atomicity.md, splitting source and test across
         sibling tasks causes AC-FINAL-014 (100% coverage) to fail in the
@@ -2025,6 +2372,11 @@ class BacklogManager:
         values at write time, but a hand-edited file can drift; this
         check catches the drift at validate-backlog time so the
         orchestrator never sees a bad status mid-run.
+
+        Additionally enforces that ``draft`` is only permitted for Task-level
+        work units (i.e. IDs containing a ``-T<digits>`` segment).  Epics,
+        Features, and Stories are managed by automatic rollup logic and must
+        never carry a ``draft`` status.
         """
         for row_id, _, file_path_str in rows:
             if not row_id or row_id.startswith("-"):
@@ -2044,6 +2396,13 @@ class BacklogManager:
             if raw_status not in VALID_STATUSES:
                 errors.append(
                     f"{row_id}: invalid '## Status:' value {raw_status!r}. Allowed values: {sorted(VALID_STATUSES)}."
+                )
+                continue
+            if raw_status == STATUS_DRAFT and not self._is_task_id(row_id):
+                unit_type = self._unit_type_label(row_id)
+                errors.append(
+                    f'{row_id}: Status "{STATUS_DRAFT}" is only valid for Task work units;'
+                    f" {row_id} is type {unit_type}."
                 )
 
     def _check_dep_id_format(
@@ -2262,12 +2621,23 @@ class BacklogManager:
         prefix, or starting with a directory prefix observed anywhere in
         the Task's parsed Manifest. Uses no domain knowledge -- the
         prefix and extension lists are static.
+
+        Bare extensions like ``.md`` (3 chars, no filename stem, no
+        directory) appear in prose like "only ``.md`` files modified" and
+        are NOT path references. Tokens that end in a known extension
+        must have either a ``/`` separator OR at least one alphanumeric
+        character in the stem to qualify as a path.
         """
         if not token or token.startswith("-") or "=" in token or "*" in token or "://" in token:
             return False
         lower = token.lower()
-        if any(lower.endswith(ext) for ext in cls._ORPHAN_PATH_EXTS):
-            return True
+        for ext in cls._ORPHAN_PATH_EXTS:
+            if lower.endswith(ext):
+                stem = token[: -len(ext)]
+                # Require a directory separator OR a real filename stem.
+                # Bare ``.md`` / ``.py`` / etc. (literal extension in prose)
+                # have an empty stem and MUST NOT be treated as paths.
+                return "/" in stem or bool(stem and any(c.isalnum() for c in stem))
         if any(token.startswith(p) for p in cls._ORPHAN_KNOWN_PREFIXES):
             return True
         return any(token.startswith(prefix) for prefix in manifest_dir_prefixes)
@@ -2488,6 +2858,41 @@ class BacklogManager:
         """Return True if the ID represents a task (contains -T followed by digits)."""
         parts = unit_id.split("-")
         return any(p.startswith("T") and p[1:].isdigit() for p in parts)
+
+    @staticmethod
+    def _unit_type_label(unit_id: str) -> str:
+        """Return the hierarchy level label for a work-unit ID.
+
+        Derives the label purely from ID structure:
+        - ``E<n>``               -> ``"Epic"``
+        - ``E<n>-F<n>``          -> ``"Feature"``
+        - ``E<n>-F<n>-S<n>``     -> ``"Story"``
+        - ``E<n>-F<n>-S<n>-T<n>`` -> ``"Task"``
+
+        Args:
+            unit_id: A canonical work-unit identifier such as ``"E1-F2-S3-T4"``.
+
+        Returns:
+            One of ``"Epic"``, ``"Feature"``, ``"Story"``, or ``"Task"``
+            (the corresponding ``WorkUnitType`` enum value).
+
+        Raises:
+            ValueError: If ``unit_id`` does not match any recognised hierarchy
+                shape (E<n>, E<n>-F<n>, E<n>-F<n>-S<n>, or E<n>-F<n>-S<n>-T<n>).
+        """
+        if BacklogManager._is_task_id(unit_id):
+            return WorkUnitType.TASK.value
+        parts = unit_id.split("-")
+        if any(p.startswith("S") and p[1:].isdigit() for p in parts):
+            return WorkUnitType.STORY.value
+        if any(p.startswith("F") and p[1:].isdigit() for p in parts):
+            return WorkUnitType.FEATURE.value
+        if len(parts) == 1 and parts[0].startswith("E"):
+            return WorkUnitType.EPIC.value
+        raise ValueError(
+            f"Unrecognized work-unit ID shape: {unit_id!r}. "
+            "Expected one of: E<n>, E<n>-F<n>, E<n>-F<n>-S<n>, E<n>-F<n>-S<n>-T<n>."
+        )
 
     @staticmethod
     def _extract_sections(content: str) -> dict[str, str]:

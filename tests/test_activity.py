@@ -419,7 +419,7 @@ class TestParseSubagentRecentActivity:
                 {
                     "timestamp": "2026-04-18T03:00:00Z",
                     "message": {"content": [{"type": "text", "text": "thinking"}]},
-                    "subagent_type": "devbench:executor",
+                    "subagent_type": "devbench-orchestrate:executor",
                 },
                 {
                     "timestamp": "2026-04-18T03:00:05Z",
@@ -429,7 +429,7 @@ class TestParseSubagentRecentActivity:
         )
         out = parse_subagent_recent_activity(f)
         assert out.latest_text == "thinking"
-        assert out.subagent_type == "devbench:executor"
+        assert out.subagent_type == "devbench-orchestrate:executor"
         assert len(out.recent_tools) == 1
         assert out.recent_tools[0].tool == "Bash"
         assert out.last_activity_at == datetime(2026, 4, 18, 3, 0, 5, tzinfo=UTC)
@@ -491,15 +491,15 @@ class TestParseSubagentRecentActivity:
 
     def test_reads_agent_type_alias(self, tmp_path: Path) -> None:
         f = tmp_path / "agent.jsonl"
-        _write_jsonl(f, [{"agent_type": "devbench:executor"}])
+        _write_jsonl(f, [{"agent_type": "devbench-orchestrate:executor"}])
         out = parse_subagent_recent_activity(f)
-        assert out.subagent_type == "devbench:executor"
+        assert out.subagent_type == "devbench-orchestrate:executor"
 
     def test_reads_agenttype_alias(self, tmp_path: Path) -> None:
         f = tmp_path / "agent.jsonl"
-        _write_jsonl(f, [{"agentType": "devbench:review-supervisor"}])
+        _write_jsonl(f, [{"agentType": "devbench-orchestrate:review-supervisor"}])
         out = parse_subagent_recent_activity(f)
-        assert out.subagent_type == "devbench:review-supervisor"
+        assert out.subagent_type == "devbench-orchestrate:review-supervisor"
 
 
 # ---------------------------------------------------------------------------
@@ -753,12 +753,13 @@ class TestCheckAmendmentRequest:
 class TestDetectPhase:
     def test_executor_subagent_wins(self) -> None:
         assert (
-            detect_phase(subagent_type="devbench:executor", recent_cli=[], idle_seconds=0) == "executor subagent active"
+            detect_phase(subagent_type="devbench-orchestrate:executor", recent_cli=[], idle_seconds=0)
+            == "executor subagent active"
         )
 
     def test_review_supervisor_subagent(self) -> None:
         assert (
-            detect_phase(subagent_type="devbench:review-supervisor", recent_cli=[], idle_seconds=0)
+            detect_phase(subagent_type="devbench-orchestrate:review-supervisor", recent_cli=[], idle_seconds=0)
             == "review-supervisor running"
         )
 
@@ -1049,7 +1050,7 @@ class TestCollectSnapshot:
             [
                 {
                     "timestamp": "2026-04-18T03:05:25Z",
-                    "subagent_type": "devbench:executor",
+                    "subagent_type": "devbench-orchestrate:executor",
                     "message": {
                         "content": [
                             {"type": "text", "text": "thinking about it"},
@@ -1093,7 +1094,7 @@ class TestCollectSnapshot:
         assert snapshot.mode_label == "single-branch + defer_pr (branch: feat/x)"
         assert snapshot.claimed_at is not None
         assert snapshot.subagent is not None
-        assert snapshot.subagent.subagent_type == "devbench:executor"
+        assert snapshot.subagent.subagent_type == "devbench-orchestrate:executor"
         assert snapshot.subagent.latest_text == "thinking about it"
         assert snapshot.phase == "executor subagent active"
         assert snapshot.repo_state is not None
@@ -1215,7 +1216,7 @@ class TestRenderSnapshot:
     def test_agent_thinking_panel(self) -> None:
         sub = SubagentActivity(
             transcript_path=None,
-            subagent_type="devbench:executor",
+            subagent_type="devbench-orchestrate:executor",
             latest_text="first\nsecond",
             recent_tools=[],
         )
@@ -1228,7 +1229,7 @@ class TestRenderSnapshot:
     def test_recent_tools_panel(self) -> None:
         sub = SubagentActivity(
             transcript_path=None,
-            subagent_type="devbench:executor",
+            subagent_type="devbench-orchestrate:executor",
             latest_text=None,
             recent_tools=[
                 ToolCallEvent(at=datetime(2026, 4, 18, 3, 5, 0, tzinfo=UTC), tool="Bash", summary="ls"),

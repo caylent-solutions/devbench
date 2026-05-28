@@ -26,7 +26,7 @@ def _entry(**overrides) -> dict:
         "timestamp": "2026-04-19T03:51:00Z",
         "event": "PreToolUse",
         "input": {
-            "agent_type": "devbench:executor",
+            "agent_type": "devbench-orchestrate:executor",
             "tool_name": "Bash",
             "tool_input": {"description": "Run tests"},
         },
@@ -45,9 +45,9 @@ def _run_hook_tail(
 ) -> subprocess.CompletedProcess[str]:
     """Invoke ``python -m devbench.cli hook-tail`` under a clean env."""
     env = os.environ.copy()
-    env["JUDGE_WORKSPACE_ROOT"] = str(workspace)
-    env["JUDGE_LOG_FILE"] = str(workspace / "orchestrator.log")
-    env["JUDGE_CLAUDE_MODEL"] = env.get("JUDGE_CLAUDE_MODEL", "test-model")
+    env["DEVBENCH_WORKSPACE_ROOT"] = str(workspace)
+    env["DEVBENCH_LOG_FILE"] = str(workspace / "orchestrator.log")
+    env["DEVBENCH_CLAUDE_MODEL"] = env.get("DEVBENCH_CLAUDE_MODEL", "test-model")
     # Force color off so the tests can assert on plain substrings without
     # having to strip ANSI escapes from the output.
     env["NO_COLOR"] = "1"
@@ -70,7 +70,7 @@ def populated_workspace(tmp_path: Path) -> Path:
             timestamp="2026-04-19T00:00:05Z",
             event="PreToolUse",
             input={
-                "agent_type": "devbench:executor",
+                "agent_type": "devbench-orchestrate:executor",
                 "tool_name": "Bash",
                 "tool_input": {"description": "Run make validate"},
             },
@@ -79,7 +79,7 @@ def populated_workspace(tmp_path: Path) -> Path:
             timestamp="2026-04-19T00:00:12Z",
             event="PostToolUse",
             input={
-                "agent_type": "devbench:executor",
+                "agent_type": "devbench-orchestrate:executor",
                 "tool_name": "Bash",
                 "tool_input": {"description": "Run make validate"},
                 "tool_response": {"stdout": "All checks passed\n========= 42 passed =========\n"},
@@ -91,7 +91,7 @@ def populated_workspace(tmp_path: Path) -> Path:
 
 
 class TestHookTailDefaultPath:
-    """The command reads $JUDGE_WORKSPACE_ROOT/hook-logs.jsonl when no path is given."""
+    """The command reads $DEVBENCH_WORKSPACE_ROOT/hook-logs.jsonl when no path is given."""
 
     def test_prints_header_with_workspace_path(self, populated_workspace: Path) -> None:
         result = _run_hook_tail(populated_workspace, "--no-follow", "--from-start")

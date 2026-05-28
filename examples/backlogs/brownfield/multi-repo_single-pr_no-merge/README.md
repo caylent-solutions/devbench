@@ -40,7 +40,7 @@ so readers can see at a glance:
 
 The mode name `multi-repo_single-pr_no-merge` means:
 - **multi-repo**: three target repos, coordinated as siblings under one
-  `JUDGE_WORKSPACE_ROOT`.
+  `DEVBENCH_WORKSPACE_ROOT`.
 - **single-pr**: one PR per repo (`single_branch` + `defer_pr`).
 - **no-merge**: no manual merge step required from the operator
   (`auto_finalize` + `auto_merge` ON, `pause_before_merge` OFF). DevBench does
@@ -86,9 +86,9 @@ workspace shape. This example follows the canonical layout.
 
 | Variable | Value used here | What it does |
 |---|---|---|
-| `JUDGE_WORKSPACE_ROOT` | absolute path to your local `kanon-deps-work/` | Tells DevBench where `BACKLOG.md` and the target-repo siblings live. Every subcommand resolves paths relative to this. |
-| `JUDGE_CLAUDE_MODEL` | `us.anthropic.claude-opus-4-7-v1` | Pins both judge and executor roles. Override `judge_model:` / `executor_model:` in `devbench.yaml` for a split. |
-| `JUDGE_USE_BEDROCK` (optional) | unset (defaults to Anthropic API) | Set to `1` to route LLM calls through AWS Bedrock instead of the Anthropic API. |
+| `DEVBENCH_WORKSPACE_ROOT` | absolute path to your local `kanon-deps-work/` | Tells DevBench where `BACKLOG.md` and the target-repo siblings live. Every subcommand resolves paths relative to this. |
+| `DEVBENCH_CLAUDE_MODEL` | `us.anthropic.claude-opus-4-7-v1` | SDK caller's model -- governs the orchestrate skill's coordination calls. Per-agent work models live in the `agents:` block of `devbench.yaml` (ADR-25) and default to each agent's `.md` frontmatter setting. |
+| `DEVBENCH_USE_BEDROCK` (optional) | unset (defaults to Anthropic API) | Set to `1` to route LLM calls through AWS Bedrock instead of the Anthropic API. |
 | `GH_TOKEN` (optional) | unset | If pre-configured, the start scripts skip the interactive `gh auth login` flow. |
 
 These are the same variables shown at the top of every command in
@@ -96,7 +96,7 @@ These are the same variables shown at the top of every command in
 
 ### The symlink layout
 
-`JUDGE_WORKSPACE_ROOT` is the **parent directory** that holds both
+`DEVBENCH_WORKSPACE_ROOT` is the **parent directory** that holds both
 `BACKLOG.md` and the target-repo checkouts as siblings. With three target
 repos cloned alongside the backlog and symlinked in, the layout looks like:
 
@@ -105,7 +105,7 @@ repos cloned alongside the backlog and symlinked in, the layout looks like:
 ├── kanon/                               # real clone of caylent-solutions/kanon
 ├── caylent-private-kanon/               # real clone of caylent/caylent-private-kanon
 ├── kanon-claude-marketplaces/           # real clone of caylent/kanon-claude-marketplaces
-└── kanon-deps-work/                     # JUDGE_WORKSPACE_ROOT (this is its own git repo)
+└── kanon-deps-work/                     # DEVBENCH_WORKSPACE_ROOT (this is its own git repo)
     ├── .git/                            # backlog history -- tracked separately from the target repos
     ├── .gitignore                       # excludes the three symlinks + .devbench/ + logs/
     ├── BACKLOG.md                       # status summary + full work unit index
@@ -121,9 +121,9 @@ repos cloned alongside the backlog and symlinked in, the layout looks like:
 
 **Why symlinks:** DevBench's `repos:` map keys names like
 `caylent-solutions/kanon` to a `checkout_directory: kanon` -- a path
-**relative to `JUDGE_WORKSPACE_ROOT`**. Symlinks let you keep each target
+**relative to `DEVBENCH_WORKSPACE_ROOT`**. Symlinks let you keep each target
 repo as an independent clone (so you can `git pull` it without touching the
-backlog) while still letting DevBench resolve `${JUDGE_WORKSPACE_ROOT}/kanon`
+backlog) while still letting DevBench resolve `${DEVBENCH_WORKSPACE_ROOT}/kanon`
 to the real working tree.
 
 The symlinks are **`.gitignored` in the backlog repo**, so committing the
@@ -187,8 +187,8 @@ ln -s ../caylent-private-kanon caylent-private-kanon
 ln -s ../kanon-claude-marketplaces kanon-claude-marketplaces
 
 # 3. Validate the backlog locally (sanity check).
-JUDGE_WORKSPACE_ROOT=$PWD \
-JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_WORKSPACE_ROOT=$PWD \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
 uv run --project ~/work/devbench devbench validate-backlog
 
 # 4. Launch DevBench. See devbench-commands.txt for the 5 standard invocations.

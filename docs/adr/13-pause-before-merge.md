@@ -59,7 +59,7 @@ Schema validation rejects two combinations as mutually exclusive:
   mode puts every work unit's commits on one branch; there is no per-unit
   branch to create a PR from.
 
-Override via env var: `JUDGE_PAUSE_BEFORE_MERGE=1` (or any
+Override via env var: `DEVBENCH_PAUSE_BEFORE_MERGE=1` (or any
 `_resolve_bool`-truthy value).
 
 ### State machine

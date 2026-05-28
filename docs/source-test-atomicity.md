@@ -33,6 +33,33 @@ Caylent Telemetry's original Backlog A had:
 
 When the orchestrator picked T3 first, T3's `AC-FINAL-014` failed (the test file did not exist in T3's Manifest, so it was not authored, so coverage was 0%). The fix applied: merge T3+T4 into a single Task (T3) that owns BOTH the source and the test files; mark T4 as `declined` with reason "merged-into-T3-source-test-pair-must-be-atomic-AC-FINAL-014". After the merge, T3 became claimable and self-closing.
 
+## Update vs Add: existing test files satisfy the rule
+
+A common confusion (issue #221 B5): the rule requires the test file to
+appear in the same Manifest as the production source, but does NOT
+require it to be a new file. If a `test_<basename>.py` already exists
+on the branch and the Task augments it (adds a parametrized case,
+extends fixture coverage), the Manifest entry uses an `Update`
+annotation; the rule still passes.
+
+Worked example:
+
+- Task authoring `src/foo/parser.py` (already exists) updates a regex.
+- Test file `tests/unit/test_parser.py` already exists; the Task
+  augments it with three new parametrized cases.
+- `## Changes Manifest`:
+
+  | File | Change |
+  |------|--------|
+  | `src/foo/parser.py` | Update -- widen the bare-spec regex. |
+  | `tests/unit/test_parser.py` | Update -- add three parametrized cases for the new spec shapes. |
+
+Both rows are `Update`; the source-test atomicity rule passes because
+the test file is present in the Manifest regardless of the annotation.
+What matters is *atomicity* (one git commit, one TDD cycle), not
+*newness*. Authoring NEW source paired with an `Update` to an existing
+test is the canonical TDD pattern.
+
 ## When the rule does NOT apply
 
 - **Tests-only Tasks for code authored elsewhere**: rare but legitimate. Example: the Task adds an integration test that exercises code already shipped in a prior milestone. The test does not have a "source" pair within this Task; AC-FINAL-014 measures coverage of the test file's own assertions against existing code, not of new source. These Tasks are rare and each one needs an explicit `Description` justifying why the source-test pair is split.

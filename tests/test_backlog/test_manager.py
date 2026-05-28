@@ -8,14 +8,17 @@ from unittest.mock import patch
 import pytest
 
 from devbench.backlog.manager import BacklogManager
+from devbench.backlog.work_unit import WorkUnitType
 from devbench.config_loader import RepoConfig, RuntimeConfig, ValidateConfig
 from devbench.constants import (
     ALL_REQUIRED_JUDGE_NAMES,
     BACKLOG_INDEX_CELL_COUNT,
     REVIEW_JUDGE_NAMES,
     SECURITY_JUDGE_NAMES,
+    STATUS_DRAFT,
     VALID_STATUSES,
 )
+from devbench.scope import ScopeFilter
 
 
 @pytest.fixture
@@ -166,6 +169,36 @@ class TestForceStatus:
         judge = BacklogManager()
         with pytest.raises(FileNotFoundError):
             judge.force_status(tmp_work_unit_file, tmp_path / "missing.md", "E0-F1-S1-T1", "done")
+
+    def test_force_status_with_session_name_stamps_wu_claimed_comment(
+        self, tmp_work_unit_file: Path, backlog_index_titlecase: Path
+    ) -> None:
+        """force_status with session_name appends 'session=<name>' in WU_CLAIMED audit comment."""
+        judge = BacklogManager()
+        judge.force_status(
+            tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1", "in-progress", session_name="alpha"
+        )
+        content = tmp_work_unit_file.read_text()
+        assert "[WU_CLAIMED] Set E0-F1-S1-T1 to 'in-progress' session=alpha" in content
+
+    def test_force_status_without_session_name_omits_session_in_wu_claimed_comment(
+        self, tmp_work_unit_file: Path, backlog_index_titlecase: Path
+    ) -> None:
+        """force_status without session_name uses the bare WU_CLAIMED format (no session= suffix)."""
+        judge = BacklogManager()
+        judge.force_status(tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1", "in-progress")
+        content = tmp_work_unit_file.read_text()
+        assert "[WU_CLAIMED] Set E0-F1-S1-T1 to 'in-progress'" in content
+        assert "session=" not in content
+
+    def test_force_status_session_name_ignored_for_non_in_progress_transition(
+        self, tmp_work_unit_file: Path, backlog_index_titlecase: Path
+    ) -> None:
+        """session_name is accepted but has no effect when the new status is not in-progress."""
+        judge = BacklogManager()
+        judge.force_status(tmp_work_unit_file, backlog_index_titlecase, "E0-F1-S1-T1", "in-review", session_name="beta")
+        content = tmp_work_unit_file.read_text()
+        assert "session=beta" not in content
 
 
 def _judge_comment(judge_name: str, action: str, msg: str = "ok") -> str:
@@ -2824,6 +2857,189 @@ class TestAutoRequeueMarkerDependents:
         BacklogManager()._auto_requeue_marker_dependents(index_path, "E0-F1-S1-T2")
 
 
+class TestAutoRequeueRegularDepDependents:
+    """Cascade for blocked tasks with regular task-level deps and NO marker (#208).
+
+    The marker-cascade (``_auto_requeue_marker_dependents``) only handles
+    blocked tasks whose Comments section carries a ``[BLOCKED_PENDING_PROPOSAL]``
+    marker.  Tasks that landed in ``blocked`` via ``cmd_sync_blocked`` (regular
+    Dependencies table only, no marker) were ignored — they stayed blocked
+    forever even after the dep transitioned to ``done``.  This class pins
+    the regular-dep cascade that closes that gap.
+    """
+
+    def test_blocked_with_regular_dep_done_is_requeued(self, tmp_path: Path) -> None:
+        """Happy path: T1 deps on T2 (no marker), T2 -> done, scan flips T1 -> in-queue."""
+        sync_blocked_audit = (
+            "[2026-05-11 20:13 UTC] [backlog_manager] "
+            "[BLOCKED] sync-blocked: dependency 'E0-F1-S1-T2' not yet terminal\n"
+        )
+        src_file = _unit_body(
+            "E0-F1-S1-T1",
+            "blocked",
+            deps=["E0-F1-S1-T2"],
+            comments=sync_blocked_audit,
+        )
+        dep_file = _unit_body("E0-F1-S1-T2", "done")
+        index = _write_workspace(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Dependent", "blocked"),
+                ("E0-F1-S1-T2", "Dep", "done"),
+            ],
+            files={"E0-F1-S1-T1": src_file, "E0-F1-S1-T2": dep_file},
+        )
+        BacklogManager()._auto_requeue_regular_dep_dependents(index, "E0-F1-S1-T2")
+
+        src = (tmp_path / "backlog" / "E0-F1-S1-T1.md").read_text()
+        assert "## Status: in-queue" in src
+        assert "[UNBLOCKED]" in src
+        assert "[CASCADE_RESOLVED]" in src
+        assert "E0-F1-S1-T2" in src
+
+    def test_blocked_with_marker_is_left_to_marker_cascade(self, tmp_path: Path) -> None:
+        """Tasks WITH a ``[BLOCKED_PENDING_PROPOSAL]`` marker are owned by the
+        marker cascade; the regular-dep cascade must not touch them to avoid
+        double-handling and conflicting audit comments."""
+        marker = "[2026-04-19 14:00 UTC] [agent/task_factory] [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2\n"
+        src_file = _unit_body(
+            "E0-F1-S1-T1",
+            "blocked",
+            deps=["E0-F1-S1-T2"],
+            comments=marker,
+        )
+        dep_file = _unit_body("E0-F1-S1-T2", "done")
+        index = _write_workspace(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Dependent", "blocked"),
+                ("E0-F1-S1-T2", "Dep", "done"),
+            ],
+            files={"E0-F1-S1-T1": src_file, "E0-F1-S1-T2": dep_file},
+        )
+        BacklogManager()._auto_requeue_regular_dep_dependents(index, "E0-F1-S1-T2")
+
+        src = (tmp_path / "backlog" / "E0-F1-S1-T1.md").read_text()
+        # The regular-dep cascade leaves marker-bearing tasks alone.
+        assert "## Status: blocked" in src
+        assert "[UNBLOCKED]" not in src
+
+    def test_partial_completion_keeps_blocked(self, tmp_path: Path) -> None:
+        """T1 deps on T2 and T3; only T2 is done; scan must NOT requeue T1."""
+        sync_blocked_audit = (
+            "[2026-05-11 20:13 UTC] [backlog_manager] "
+            "[BLOCKED] sync-blocked: dependency 'E0-F1-S1-T2' not yet terminal\n"
+        )
+        src_file = _unit_body(
+            "E0-F1-S1-T1",
+            "blocked",
+            deps=["E0-F1-S1-T2", "E0-F1-S1-T3"],
+            comments=sync_blocked_audit,
+        )
+        dep_done = _unit_body("E0-F1-S1-T2", "done")
+        dep_queued = _unit_body("E0-F1-S1-T3", "in-queue")
+        index = _write_workspace(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Dependent", "blocked"),
+                ("E0-F1-S1-T2", "Dep1", "done"),
+                ("E0-F1-S1-T3", "Dep2", "in-queue"),
+            ],
+            files={
+                "E0-F1-S1-T1": src_file,
+                "E0-F1-S1-T2": dep_done,
+                "E0-F1-S1-T3": dep_queued,
+            },
+        )
+        BacklogManager()._auto_requeue_regular_dep_dependents(index, "E0-F1-S1-T2")
+
+        src = (tmp_path / "backlog" / "E0-F1-S1-T1.md").read_text()
+        assert "## Status: blocked" in src
+        assert "[UNBLOCKED]" not in src
+
+    def test_dep_not_referenced_by_candidate_is_left_untouched(self, tmp_path: Path) -> None:
+        """If newly_done_id is not in T1's Dependencies table, T1 stays blocked."""
+        sync_blocked_audit = (
+            "[2026-05-11 20:13 UTC] [backlog_manager] "
+            "[BLOCKED] sync-blocked: dependency 'E0-F1-S1-T9' not yet terminal\n"
+        )
+        src_file = _unit_body(
+            "E0-F1-S1-T1",
+            "blocked",
+            deps=["E0-F1-S1-T9"],
+            comments=sync_blocked_audit,
+        )
+        unrelated = _unit_body("E0-F1-S1-T2", "done")
+        index = _write_workspace(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Dependent", "blocked"),
+                ("E0-F1-S1-T2", "Unrelated", "done"),
+            ],
+            files={"E0-F1-S1-T1": src_file, "E0-F1-S1-T2": unrelated},
+        )
+        BacklogManager()._auto_requeue_regular_dep_dependents(index, "E0-F1-S1-T2")
+
+        src = (tmp_path / "backlog" / "E0-F1-S1-T1.md").read_text()
+        assert "## Status: blocked" in src
+
+    def test_in_queue_task_is_left_alone(self, tmp_path: Path) -> None:
+        """Only blocked tasks are candidates -- a task already in-queue is ignored."""
+        src_file = _unit_body("E0-F1-S1-T1", "in-queue", deps=["E0-F1-S1-T2"])
+        dep_file = _unit_body("E0-F1-S1-T2", "done")
+        index = _write_workspace(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Dependent", "in-queue"),
+                ("E0-F1-S1-T2", "Dep", "done"),
+            ],
+            files={"E0-F1-S1-T1": src_file, "E0-F1-S1-T2": dep_file},
+        )
+        BacklogManager()._auto_requeue_regular_dep_dependents(index, "E0-F1-S1-T2")
+
+        src = (tmp_path / "backlog" / "E0-F1-S1-T1.md").read_text()
+        assert "## Status: in-queue" in src
+        assert "[UNBLOCKED]" not in src
+
+    def test_mark_done_integration_triggers_regular_dep_cascade(self, tmp_path: Path) -> None:
+        """End-to-end: mark_done(B) flips A (regular-dep blocked, no marker) to in-queue.
+
+        Mirrors the marker-cascade integration test but exercises the
+        regular-dep path that was missing pre-fix (#208).
+        """
+        from devbench.constants import ALL_REQUIRED_JUDGE_NAMES as JUDGES
+
+        sync_blocked_audit = (
+            "[2026-05-11 20:13 UTC] [backlog_manager] "
+            "[BLOCKED] sync-blocked: dependency 'E0-F1-S1-T2' not yet terminal\n"
+        )
+        src_file = _unit_body(
+            "E0-F1-S1-T1",
+            "blocked",
+            deps=["E0-F1-S1-T2"],
+            comments=sync_blocked_audit,
+        )
+        review_passes = "\n".join(f"[2026-04-19 14:05 UTC] [judge/{judge}] [REVIEW_PASS] ok" for judge in JUDGES)
+        dep_file = _unit_body("E0-F1-S1-T2", "in-review", comments=review_passes + "\n")
+        index = _write_workspace(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Dependent", "blocked"),
+                ("E0-F1-S1-T2", "Dep", "in-review"),
+            ],
+            files={"E0-F1-S1-T1": src_file, "E0-F1-S1-T2": dep_file},
+        )
+
+        mgr = BacklogManager()
+        dep_path = tmp_path / "backlog" / "E0-F1-S1-T2.md"
+        mgr.mark_done(dep_path, index, "E0-F1-S1-T2")
+
+        src = (tmp_path / "backlog" / "E0-F1-S1-T1.md").read_text()
+        assert "## Status: in-queue" in src
+        assert "[UNBLOCKED]" in src
+        assert "[CASCADE_RESOLVED]" in src
+
+
 class TestParseCandidateDependencies:
     """Coverage of the inline dependency-table parser used by the auto-requeue scan."""
 
@@ -3522,6 +3738,84 @@ class TestValidateStatusEnum:
         errors = BacklogManager().validate(idx, tmp_path)
         assert not any("invalid '## Status:'" in e for e in errors)
 
+    def test_draft_status_accepted_for_task(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """AC-189-2: draft is a valid status for Task work units."""
+        _ValidateRuleHarness.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `f.py` | new |\n| `tests/unit/test_f.py` | new |\n",
+            status=STATUS_DRAFT,
+        )
+        idx = _ValidateRuleHarness.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | draft | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        assert not any(STATUS_DRAFT in e and "EX-F1-S1-T1" in e for e in errors), (
+            f"Task with draft status should not produce an error; got: {errors}"
+        )
+
+    @pytest.mark.parametrize(
+        "unit_id,unit_type,index_row",
+        [
+            (
+                "EX",
+                WorkUnitType.EPIC.value,
+                "| EX | An Epic | Epic | draft | none | ex/foo | `backlog/EX.md` |\n",
+            ),
+            (
+                "EX-F1",
+                WorkUnitType.FEATURE.value,
+                "| EX-F1 | A Feature | Feature | draft | none | ex/foo | `backlog/EX-F1.md` |\n",
+            ),
+            (
+                "EX-F1-S1",
+                WorkUnitType.STORY.value,
+                "| EX-F1-S1 | A Story | Story | draft | none | ex/foo | `backlog/EX-F1-S1.md` |\n",
+            ),
+        ],
+    )
+    def test_draft_status_rejected_for_non_task(
+        self,
+        tmp_path: Path,
+        backlog_dir: Path,
+        unit_id: str,
+        unit_type: str,
+        index_row: str,
+    ) -> None:
+        """AC-189-10: draft status is rejected for Epic, Feature, and Story work units."""
+        wu = backlog_dir / f"{unit_id}.md"
+        wu.write_text(
+            f"# {unit_id}\n\n## Status: draft\n\n## Description\n\nSummary.\n",
+            encoding="utf-8",
+        )
+        idx = _ValidateRuleHarness.make_index(tmp_path, index_row)
+        errors = BacklogManager().validate(idx, tmp_path)
+        assert any(
+            f'Status "{STATUS_DRAFT}" is only valid for Task work units' in e and unit_id in e and unit_type in e
+            for e in errors
+        ), f"Expected draft-for-non-task error for {unit_id} ({unit_type}); got: {errors}"
+
+    def test_draft_rejected_for_epic_error_message_format(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """AC-189-10: error message for draft Epic names the type explicitly."""
+        wu = backlog_dir / "EX.md"
+        wu.write_text(
+            "# EX\n\n## Status: draft\n\n## Description\n\nEpic summary.\n",
+            encoding="utf-8",
+        )
+        idx = _ValidateRuleHarness.make_index(
+            tmp_path,
+            "| EX | An Epic | Epic | draft | none | ex/foo | `backlog/EX.md` |\n",
+        )
+        errors = BacklogManager().validate(idx, tmp_path)
+        matching = [e for e in errors if "EX" in e and STATUS_DRAFT in e]
+        assert matching, f"Expected at least one error mentioning EX and {STATUS_DRAFT!r}; got: {errors}"
+        expected_msg = (
+            f'EX: Status "{STATUS_DRAFT}" is only valid for Task work units; EX is type {WorkUnitType.EPIC.value}.'
+        )
+        assert any(e == expected_msg for e in matching), f"Error message format mismatch; got: {matching}"
+
 
 class TestValidateDepIdFormat:
     """E209: dep-row IDs in '## Dependencies' must match the canonical regex."""
@@ -3766,8 +4060,8 @@ class TestValidateNoOrphanPathTokens:
     """Rule 20: backtick-quoted path-shaped tokens in AC / DoD must appear in
     the Task's Changes Manifest after normalisation, OR be marked read-only
     via a trailing ``(ref)`` suffix. Gated by
-    ``RUNTIME_CONFIG.validate.check_orphan_path_tokens``; default OFF so
-    pre-existing backlogs are unaffected.
+    ``RUNTIME_CONFIG.validate.check_orphan_path_tokens``; defaults ON (set
+    ``false`` to opt out).
     """
 
     H = _ValidateRuleHarness
@@ -4394,6 +4688,87 @@ class TestSetStatusWritesWuClaimedAudit:
         assert "[WU_CLAIMED]" not in content
 
 
+class TestWuClaimedSessionSuffix:
+    """Spec section 4.4.7 / AC-192-6: [WU_CLAIMED] audit format extension.
+
+    When ``DEVBENCH_SESSION_NAME`` is set the audit comment becomes
+    ``[WU_CLAIMED] Set <id> to 'in-progress' session=<name>``.
+    When the env var is absent the legacy format is unchanged.
+    """
+
+    def test_set_status_with_session_name_appends_session_suffix(self, tmp_path: Path) -> None:
+        """_set_status with session_name produces 'session=<name>' in [WU_CLAIMED] row."""
+        wu_body = _unit_body("E0-F1-S1-T1", "in-queue")
+        index = _write_workspace(
+            tmp_path,
+            rows=[("E0-F1-S1-T1", "Task", "in-queue")],
+            files={"E0-F1-S1-T1": wu_body},
+        )
+        wu_path = tmp_path / "backlog" / "E0-F1-S1-T1.md"
+        BacklogManager()._set_status(wu_path, index, "E0-F1-S1-T1", "in-progress", session_name="prod-01")
+        content = wu_path.read_text(encoding="utf-8")
+        assert "[WU_CLAIMED] Set E0-F1-S1-T1 to 'in-progress' session=prod-01" in content
+
+    def test_set_status_without_session_name_omits_session_suffix(self, tmp_path: Path) -> None:
+        """_set_status without session_name produces the bare [WU_CLAIMED] format (legacy)."""
+        wu_body = _unit_body("E0-F1-S1-T1", "in-queue")
+        index = _write_workspace(
+            tmp_path,
+            rows=[("E0-F1-S1-T1", "Task", "in-queue")],
+            files={"E0-F1-S1-T1": wu_body},
+        )
+        wu_path = tmp_path / "backlog" / "E0-F1-S1-T1.md"
+        BacklogManager()._set_status(wu_path, index, "E0-F1-S1-T1", "in-progress")
+        content = wu_path.read_text(encoding="utf-8")
+        assert "[WU_CLAIMED] Set E0-F1-S1-T1 to 'in-progress'" in content
+        assert "session=" not in content
+
+    def test_set_status_session_name_none_omits_session_suffix(self, tmp_path: Path) -> None:
+        """_set_status with explicit session_name=None uses the bare [WU_CLAIMED] format."""
+        wu_body = _unit_body("E0-F1-S1-T1", "in-queue")
+        index = _write_workspace(
+            tmp_path,
+            rows=[("E0-F1-S1-T1", "Task", "in-queue")],
+            files={"E0-F1-S1-T1": wu_body},
+        )
+        wu_path = tmp_path / "backlog" / "E0-F1-S1-T1.md"
+        BacklogManager()._set_status(wu_path, index, "E0-F1-S1-T1", "in-progress", session_name=None)
+        content = wu_path.read_text(encoding="utf-8")
+        assert "[WU_CLAIMED] Set E0-F1-S1-T1 to 'in-progress'" in content
+        assert "session=" not in content
+
+    @pytest.mark.parametrize(
+        "session_name",
+        ["alpha", "beta", "my-session-01", "prod"],
+        ids=["alpha", "beta", "hyphenated", "prod"],
+    )
+    def test_set_status_session_name_parametrized(self, tmp_path: Path, session_name: str) -> None:
+        """session_name value is reproduced verbatim in the [WU_CLAIMED] audit row."""
+        wu_body = _unit_body("E0-F1-S1-T1", "in-queue")
+        index = _write_workspace(
+            tmp_path,
+            rows=[("E0-F1-S1-T1", "Task", "in-queue")],
+            files={"E0-F1-S1-T1": wu_body},
+        )
+        wu_path = tmp_path / "backlog" / "E0-F1-S1-T1.md"
+        BacklogManager()._set_status(wu_path, index, "E0-F1-S1-T1", "in-progress", session_name=session_name)
+        content = wu_path.read_text(encoding="utf-8")
+        assert f"session={session_name}" in content
+
+    def test_set_status_session_name_ignored_for_non_in_progress(self, tmp_path: Path) -> None:
+        """session_name has no effect when the target status is not 'in-progress'."""
+        wu_body = _unit_body("E0-F1-S1-T1", "in-progress")
+        index = _write_workspace(
+            tmp_path,
+            rows=[("E0-F1-S1-T1", "Task", "in-progress")],
+            files={"E0-F1-S1-T1": wu_body},
+        )
+        wu_path = tmp_path / "backlog" / "E0-F1-S1-T1.md"
+        BacklogManager()._set_status(wu_path, index, "E0-F1-S1-T1", "in-queue", session_name="ignored-session")
+        content = wu_path.read_text(encoding="utf-8")
+        assert "session=ignored-session" not in content
+
+
 class TestSetStatusWritesUnblockedAudit:
     """Issue #153: when the cascade flips ``blocked -> in-queue`` it writes
     a ``[CASCADE_RESOLVED]`` audit; sync-blocked separately writes
@@ -5009,3 +5384,1300 @@ class TestRollupParentTicksCheckboxes:
         assert "## Status: done" in story_result
         assert f"- [x] AC-FUNC-001: story criterion {_GREEN_CHECK}" in story_result
         assert f"- [x] All tasks complete. {_GREEN_CHECK}" in story_result
+
+
+class TestSetStatusAcceptsDraft:
+    """AC-189-2: _set_status accepts STATUS_DRAFT as a valid transition target.
+
+    Verifies that draft is present in VALID_STATUSES and that calling
+    _set_status with 'draft' writes the status to both the work-unit file
+    and BACKLOG.md without raising an exception.
+    """
+
+    def _make_index(self, tmp_path: Path, unit_id: str, initial_status: str) -> Path:
+        """Create a minimal BACKLOG.md with a single task row."""
+        index = tmp_path / "BACKLOG.md"
+        index.write_text(
+            "# Backlog\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|-----------|\n"
+            f"| {unit_id} | Task | Task | {initial_status} | None | git-repo |"
+            f" `backlog/{unit_id}.md` |\n",
+            encoding="utf-8",
+        )
+        return index
+
+    def _make_work_unit(self, directory: Path, unit_id: str, initial_status: str) -> Path:
+        """Create a minimal work-unit file with a Status line and Comments section."""
+        wu_file = directory / f"{unit_id}.md"
+        wu_file.write_text(
+            f"# {unit_id}\n\n## Status: {initial_status}\n\n## Comments\n",
+            encoding="utf-8",
+        )
+        return wu_file
+
+    def test_status_draft_present_in_valid_statuses(self) -> None:
+        """STATUS_DRAFT constant is present in VALID_STATUSES lookup (AC-189-2)."""
+        assert STATUS_DRAFT in VALID_STATUSES, f"STATUS_DRAFT ('{STATUS_DRAFT}') must be a key in VALID_STATUSES"
+        assert VALID_STATUSES[STATUS_DRAFT] == STATUS_DRAFT, (
+            "VALID_STATUSES[STATUS_DRAFT] must normalise to STATUS_DRAFT itself"
+        )
+
+    def test_set_status_draft_updates_work_unit_file(self, tmp_path: Path) -> None:
+        """_set_status('draft') writes '## Status: draft' to the work-unit file (AC-189-2)."""
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        index = self._make_index(tmp_path, "E0-F1-S1-T1", "in-queue")
+        wu_file = self._make_work_unit(backlog_dir, "E0-F1-S1-T1", "in-queue")
+
+        BacklogManager()._set_status(wu_file, index, "E0-F1-S1-T1", STATUS_DRAFT)
+
+        wu_text = wu_file.read_text(encoding="utf-8")
+        assert "## Status: draft" in wu_text, (
+            f"Work-unit file must contain '## Status: draft' after transition; got:\n{wu_text}"
+        )
+
+    def test_set_status_draft_updates_backlog_index(self, tmp_path: Path) -> None:
+        """_set_status('draft') updates the BACKLOG.md status cell for the unit (AC-189-2)."""
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        index = self._make_index(tmp_path, "E0-F1-S1-T1", "in-queue")
+        wu_file = self._make_work_unit(backlog_dir, "E0-F1-S1-T1", "in-queue")
+
+        BacklogManager()._set_status(wu_file, index, "E0-F1-S1-T1", STATUS_DRAFT)
+
+        index_text = index.read_text(encoding="utf-8")
+        assert "draft" in index_text, (
+            f"BACKLOG.md must contain 'draft' after _set_status transition; got:\n{index_text}"
+        )
+
+    def test_set_status_draft_does_not_raise(self, tmp_path: Path) -> None:
+        """_set_status('draft') completes without raising ValueError (AC-189-2)."""
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        index = self._make_index(tmp_path, "E0-F1-S1-T1", "in-progress")
+        wu_file = self._make_work_unit(backlog_dir, "E0-F1-S1-T1", "in-progress")
+
+        # Must not raise -- draft is a valid transition target
+        BacklogManager()._set_status(wu_file, index, "E0-F1-S1-T1", STATUS_DRAFT)
+
+    def test_set_status_draft_does_not_write_wu_claimed_audit(self, tmp_path: Path) -> None:
+        """draft transition does not append a [WU_CLAIMED] audit comment (AC-189-2, spec 4.1.2)."""
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        index = self._make_index(tmp_path, "E0-F1-S1-T1", "in-queue")
+        wu_file = self._make_work_unit(backlog_dir, "E0-F1-S1-T1", "in-queue")
+
+        BacklogManager()._set_status(wu_file, index, "E0-F1-S1-T1", STATUS_DRAFT)
+
+        wu_text = wu_file.read_text(encoding="utf-8")
+        assert "[WU_CLAIMED]" not in wu_text, "draft transitions must not produce a [WU_CLAIMED] audit comment"
+
+    def test_set_status_draft_does_not_tick_checkboxes(self, tmp_path: Path) -> None:
+        """draft transition does not tick AC/DoD checkboxes (only 'done' triggers ticking)."""
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        index = self._make_index(tmp_path, "E0-F1-S1-T1", "in-queue")
+        wu_file = backlog_dir / "E0-F1-S1-T1.md"
+        wu_file.write_text(
+            "# E0-F1-S1-T1\n\n"
+            "## Status: in-queue\n\n"
+            "## Acceptance Criteria\n\n"
+            "- [ ] AC-001: some criterion\n\n"
+            "## Definition of Done\n\n"
+            "- [ ] All done.\n\n"
+            "## Comments\n",
+            encoding="utf-8",
+        )
+
+        BacklogManager()._set_status(wu_file, index, "E0-F1-S1-T1", STATUS_DRAFT)
+
+        wu_text = wu_file.read_text(encoding="utf-8")
+        assert "- [ ] AC-001: some criterion" in wu_text, "draft transition must leave AC checkboxes unchecked"
+        assert "- [ ] All done." in wu_text, "draft transition must leave DoD checkboxes unchecked"
+
+
+class TestUnitTypeLabel:
+    """Unit tests for BacklogManager._unit_type_label static method."""
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "unit_id,expected_label",
+        [
+            ("EX-F1-S1-T1", WorkUnitType.TASK.value),
+            ("EX-F1-S1", WorkUnitType.STORY.value),
+            ("EX-F1", WorkUnitType.FEATURE.value),
+            ("EX", WorkUnitType.EPIC.value),
+        ],
+    )
+    def test_unit_type_label_returns_correct_label(self, unit_id: str, expected_label: str) -> None:
+        """_unit_type_label derives the hierarchy level from the ID structure."""
+        assert BacklogManager._unit_type_label(unit_id) == expected_label, (
+            f"Expected _unit_type_label({unit_id!r}) == {expected_label!r}"
+        )
+
+    @pytest.mark.unit
+    def test_unit_type_label_task_delegates_to_is_task_id(self) -> None:
+        """_unit_type_label('EX-F1-S1-T1') returns WorkUnitType.TASK.value via _is_task_id delegation."""
+        result = BacklogManager._unit_type_label("EX-F1-S1-T1")
+        assert result == WorkUnitType.TASK.value, f"Expected {WorkUnitType.TASK.value!r}, got {result!r}"
+
+    @pytest.mark.unit
+    def test_unit_type_label_raises_for_unrecognized_id(self) -> None:
+        """_unit_type_label raises ValueError for an ID that does not match any known hierarchy shape."""
+        with pytest.raises(ValueError, match="Unrecognized work-unit ID shape"):
+            BacklogManager._unit_type_label("MALFORMED-X99")
+
+
+# ---------------------------------------------------------------------------
+# E1-F2-S3-T1: _check_status_summary + _update_status_summary include Draft column
+# AC-189-6, AC-189-7
+# ---------------------------------------------------------------------------
+
+
+def _make_backlog_with_draft(tmp_path: Path, backlog_dir: Path) -> tuple[Path, dict[str, Path]]:
+    """Create a BACKLOG.md with a draft task and corresponding WU files.
+
+    Returns (index_path, {unit_id: wu_file_path}).
+    """
+    content = (
+        "# Backlog\n\n"
+        "## Full Work Unit Index\n\n"
+        "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+        "|----|-------|------|--------|--------------|------|----------|\n"
+        "| E1 | Epic One | Epic | in-queue | None | repo | `backlog/E1.md` |\n"
+        "| E1-F1-S1-T1 | Task A | Task | done | None | repo | `backlog/E1-F1-S1-T1.md` |\n"
+        "| E1-F1-S1-T2 | Task B | Task | draft | None | repo | `backlog/E1-F1-S1-T2.md` |\n"
+        "| E1-F1-S1-T3 | Task C | Task | in-queue | None | repo | `backlog/E1-F1-S1-T3.md` |\n"
+        "| E2 | Epic Two | Epic | in-queue | None | repo | `backlog/E2.md` |\n"
+        "| E2-F1-S1-T1 | Task D | Task | draft | None | repo | `backlog/E2-F1-S1-T1.md` |\n"
+        "| E2-F1-S1-T2 | Task E | Task | draft | None | repo | `backlog/E2-F1-S1-T2.md` |\n"
+    )
+    index_path = tmp_path / "BACKLOG.md"
+    index_path.write_text(content, encoding="utf-8")
+
+    files: dict[str, Path] = {}
+    units = [
+        ("E1", "in-queue"),
+        ("E1-F1-S1-T1", "done"),
+        ("E1-F1-S1-T2", "draft"),
+        ("E1-F1-S1-T3", "in-queue"),
+        ("E2", "in-queue"),
+        ("E2-F1-S1-T1", "draft"),
+        ("E2-F1-S1-T2", "draft"),
+    ]
+    for uid, status in units:
+        wu = backlog_dir / f"{uid}.md"
+        wu.write_text(f"# {uid}\n\n## Status: {status}\n", encoding="utf-8")
+        files[uid] = wu
+
+    return index_path, files
+
+
+@pytest.mark.unit
+class TestStatusSummaryDraftColumn:
+    """AC-189-7: Status Summary per-epic table includes a Draft column.
+
+    Tests that _update_status_summary writes the Draft column and
+    _check_status_summary validates it.
+    """
+
+    def test_update_status_summary_includes_draft_header(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """AC-189-7: _update_status_summary writes a Draft column header in the table."""
+        index_path, _ = _make_backlog_with_draft(tmp_path, backlog_dir)
+        mgr = BacklogManager()
+        mgr._update_status_summary(index_path)
+
+        result = index_path.read_text(encoding="utf-8")
+        assert "Draft" in result, (
+            "Status Summary table must include a 'Draft' column header after _update_status_summary"
+        )
+
+    def test_update_status_summary_counts_draft_tasks(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """AC-189-7: _update_status_summary correctly counts draft tasks per epic."""
+        index_path, _ = _make_backlog_with_draft(tmp_path, backlog_dir)
+        mgr = BacklogManager()
+        mgr._update_status_summary(index_path)
+
+        result = index_path.read_text(encoding="utf-8")
+        summary_rows = _extract_summary_lines(result)
+
+        e1_lines = [line for line in summary_rows if "| E1 |" in line]
+        e2_lines = [line for line in summary_rows if "| E2 |" in line]
+        assert len(e1_lines) == 1, f"Expected exactly 1 E1 row, got: {e1_lines}"
+        assert len(e2_lines) == 1, f"Expected exactly 1 E2 row, got: {e2_lines}"
+
+        # E1 has: 1 done, 1 draft, 1 in-queue
+        # E2 has: 2 draft
+        # Parse cells: '' | epic | title | done | in-progress | in-queue | blocked | declined | draft | ...
+        # The Draft column position depends on the header order
+        e1_cells = [c.strip() for c in e1_lines[0].split("|")]
+        e2_cells = [c.strip() for c in e2_lines[0].split("|")]
+
+        # Find the Draft column index by parsing the header row
+        header_line = next(
+            (line for line in result.splitlines() if line.strip().startswith("| Epic") and "Draft" in line),
+            None,
+        )
+        assert header_line is not None, "Status Summary table must have a header row containing 'Draft'"
+
+        header_cells = [c.strip() for c in header_line.split("|")]
+        draft_col = next(
+            (i for i, h in enumerate(header_cells) if h.strip() == "Draft"),
+            None,
+        )
+        assert draft_col is not None, f"No 'Draft' column found in header: {header_line}"
+
+        assert e1_cells[draft_col] == "1", (
+            f"E1 draft count should be 1 (one draft task), got: {e1_cells[draft_col]!r}. Row: {e1_lines[0]}"
+        )
+        assert e2_cells[draft_col] == "2", (
+            f"E2 draft count should be 2 (two draft tasks), got: {e2_cells[draft_col]!r}. Row: {e2_lines[0]}"
+        )
+
+    def test_update_status_summary_zero_draft_when_no_draft_tasks(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """AC-189-7: _update_status_summary writes 0 in Draft column when no draft tasks exist."""
+        index_path, _ = _make_backlog_with_epics(tmp_path, backlog_dir)
+        mgr = BacklogManager()
+        mgr._update_status_summary(index_path)
+
+        result = index_path.read_text(encoding="utf-8")
+        summary_rows = _extract_summary_lines(result)
+        assert len(summary_rows) >= 1, "Expected at least one summary row"
+
+        header_line = next(
+            (line for line in result.splitlines() if line.strip().startswith("| Epic") and "Draft" in line),
+            None,
+        )
+        assert header_line is not None, "Status Summary table must have a header row containing 'Draft'"
+
+        header_cells = [c.strip() for c in header_line.split("|")]
+        draft_col = next(
+            (i for i, h in enumerate(header_cells) if h.strip() == "Draft"),
+            None,
+        )
+        assert draft_col is not None, f"No 'Draft' column found in header: {header_line}"
+
+        for row in summary_rows:
+            cells = [c.strip() for c in row.split("|")]
+            assert cells[draft_col] == "0", (
+                f"Draft count should be 0 for row with no draft tasks, got: {cells[draft_col]!r}. Row: {row}"
+            )
+
+    def test_check_status_summary_includes_draft_in_validation(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """AC-189-7: _check_status_summary validates Draft counts match the index."""
+        index_path, _ = _make_backlog_with_draft(tmp_path, backlog_dir)
+        mgr = BacklogManager()
+        # First write a correct summary
+        mgr._update_status_summary(index_path)
+
+        # Validate that no draft mismatch errors are reported
+        errors: list[str] = []
+        rows = mgr._parse_backlog_rows(index_path)
+        mgr._check_status_summary(index_path, rows, errors)
+        draft_errors = [e for e in errors if "draft" in e.lower()]
+        assert not draft_errors, f"Unexpected draft mismatch errors: {draft_errors}"
+
+    def test_check_status_summary_reports_draft_mismatch(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """AC-189-7: _check_status_summary reports an error when Draft count is wrong."""
+        index_path, _ = _make_backlog_with_draft(tmp_path, backlog_dir)
+        mgr = BacklogManager()
+
+        # Write a deliberately wrong summary with Draft count 0 where it should be > 0
+        wrong_summary = (
+            "## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked | Declined | Draft |\n"
+            "|------|-------|------|-------------|----------|---------|----------|-------|\n"
+            "| E1 | Epic One | 1 | 0 | 1 | 0 | 0 | 0 |\n"
+            "| E2 | Epic Two | 0 | 0 | 0 | 0 | 0 | 0 |\n\n"
+        )
+        existing = index_path.read_text(encoding="utf-8")
+        index_path.write_text(wrong_summary + existing, encoding="utf-8")
+
+        errors: list[str] = []
+        rows = mgr._parse_backlog_rows(index_path)
+        mgr._check_status_summary(index_path, rows, errors)
+
+        assert any("draft" in e.lower() or "mismatch" in e.lower() for e in errors), (
+            f"Expected a draft mismatch error but got: {errors}"
+        )
+
+    def test_parse_summary_table_includes_draft_column(self) -> None:
+        """AC-189-7: _parse_summary_table correctly parses the Draft column."""
+        content = (
+            "## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked | Declined | Draft |\n"
+            "|------|-------|------|-------------|----------|---------|----------|-------|\n"
+            "| E1 | Epic One | 1 | 0 | 2 | 0 | 0 | 3 |\n"
+            "\n## Full Work Unit Index\n"
+        )
+        mgr = BacklogManager()
+        result = mgr._parse_summary_table(content)
+
+        assert "E1" in result, f"E1 epic row must be parsed; got: {result}"
+        from devbench.constants import STATUS_DRAFT
+
+        assert result["E1"][STATUS_DRAFT] == 3, f"Draft count for E1 must be 3; got: {result['E1'].get(STATUS_DRAFT)}"
+
+    def test_compute_epic_counts_includes_draft(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """AC-189-7: _compute_epic_counts includes draft tasks in per-epic counts."""
+        index_path, _ = _make_backlog_with_draft(tmp_path, backlog_dir)
+        mgr = BacklogManager()
+        rows = mgr._parse_backlog_rows(index_path)
+        counts = mgr._compute_epic_counts(rows)
+
+        from devbench.constants import STATUS_DRAFT
+
+        assert "E1" in counts, "E1 must be present in epic counts"
+        assert "E2" in counts, "E2 must be present in epic counts"
+        assert counts["E1"][STATUS_DRAFT] == 1, f"E1 must have 1 draft task; got: {counts['E1'].get(STATUS_DRAFT)}"
+        assert counts["E2"][STATUS_DRAFT] == 2, f"E2 must have 2 draft tasks; got: {counts['E2'].get(STATUS_DRAFT)}"
+
+    def test_migration_legacy_table_without_draft_does_not_error_on_check(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """AC-189-7: Legacy BACKLOG.md without Draft column triggers rewrite on _update_status_summary.
+
+        After calling _update_status_summary once on a legacy file, the resulting
+        table must include the Draft column and _check_status_summary must report
+        no errors.
+        """
+        index_path, _ = _make_backlog_with_draft(tmp_path, backlog_dir)
+        # Write a legacy summary without Draft column
+        legacy_summary = (
+            "## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked | Declined |\n"
+            "|------|-------|------|-------------|----------|---------|----------|\n"
+            "| E1 | Epic One | 0 | 0 | 0 | 0 | 0 |\n"
+            "| E2 | Epic Two | 0 | 0 | 0 | 0 | 0 |\n\n"
+        )
+        existing = index_path.read_text(encoding="utf-8")
+        index_path.write_text(legacy_summary + existing, encoding="utf-8")
+
+        mgr = BacklogManager()
+        # _update_status_summary must rewrite the table including Draft column
+        mgr._update_status_summary(index_path)
+
+        result = index_path.read_text(encoding="utf-8")
+        assert "Draft" in result, "After _update_status_summary, Draft column must appear in Status Summary"
+
+        errors: list[str] = []
+        rows = mgr._parse_backlog_rows(index_path)
+        mgr._check_status_summary(index_path, rows, errors)
+        assert not errors, f"After rewrite, _check_status_summary must report no errors; got: {errors}"
+
+
+class TestValidateBacklogIgnoresScope:
+    """AC-190-14: validate-backlog validates the ENTIRE backlog regardless of active scope.
+
+    Scope is a claim-side filter only. Even when a scope.json restricts the
+    orchestrator to a single epic, ``BacklogManager.validate()`` must inspect
+    every work unit in BACKLOG.md -- not just the scoped subset.
+    """
+
+    @staticmethod
+    def _build_two_epic_workspace(
+        tmp_path: Path,
+        backlog_dir: Path,
+        *,
+        e2_file_status: str = "in-queue",
+        e2_index_status: str = "in-queue",
+    ) -> Path:
+        """Build a minimal two-epic workspace and return the BACKLOG.md path.
+
+        E1 contains one well-formed task. E2 contains one task whose file
+        status and index status can be set independently to introduce a
+        deliberate mismatch for detection by validate().
+
+        Args:
+            tmp_path: Temporary directory (pytest fixture).
+            backlog_dir: The ``backlog/`` subdirectory under ``tmp_path``.
+            e2_file_status: Status written inside E2-F1-S1-T1.md.
+            e2_index_status: Status recorded in the BACKLOG.md index row.
+
+        Returns:
+            Path to the created BACKLOG.md.
+        """
+        index_content = (
+            "# Backlog\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|----------|\n"
+            f"| E1 | Epic One | Epic | in-queue | None | repo | `backlog/E1.md` |\n"
+            f"| E1-F1-S1-T1 | Task Alpha | Task | done | None | repo | `backlog/E1-F1-S1-T1.md` |\n"
+            f"| E2 | Epic Two | Epic | in-queue | None | repo | `backlog/E2.md` |\n"
+            f"| E2-F1-S1-T1 | Task Beta | Task | {e2_index_status} | None | repo | `backlog/E2-F1-S1-T1.md` |\n"
+        )
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(index_content, encoding="utf-8")
+
+        units = [
+            ("E1", "in-queue"),
+            ("E1-F1-S1-T1", "done"),
+            ("E2", "in-queue"),
+            ("E2-F1-S1-T1", e2_file_status),
+        ]
+        for uid, status in units:
+            wu = backlog_dir / f"{uid}.md"
+            wu.write_text(f"# {uid}\n\n## Status: {status}\n", encoding="utf-8")
+
+        return index_path
+
+    def test_validate_detects_out_of_scope_errors_with_scope_json_present(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """Regression: validate() catches an E2 status mismatch even when scope restricts to E1.
+
+        Steps:
+        1. Build a two-epic workspace where E2-F1-S1-T1 has a deliberate
+           status mismatch (file says 'done', index says 'in-queue').
+        2. Write a scope.json restricting to E1 only.
+        3. Run validate() and confirm it reports the E2 mismatch error.
+        """
+        index_path = self._build_two_epic_workspace(
+            tmp_path,
+            backlog_dir,
+            e2_file_status="done",
+            e2_index_status="in-queue",
+        )
+
+        all_ids = ["E1", "E1-F1-S1-T1", "E2", "E2-F1-S1-T1"]
+        scope = ScopeFilter.parse("E1", "", all_ids)
+        assert scope.allows("E1-F1-S1-T1"), "Scope must include E1 tasks"
+        assert not scope.allows("E2-F1-S1-T1"), "Scope must exclude E2 tasks"
+        scope.to_file(tmp_path)
+        assert (tmp_path / ".devbench" / "scope.json").exists(), "scope.json must exist"
+
+        mgr = BacklogManager()
+        errors = mgr.validate(index_path, tmp_path)
+
+        e2_mismatch_errors = [e for e in errors if "E2-F1-S1-T1" in e and "status" in e.lower()]
+        assert e2_mismatch_errors, (
+            f"validate() must detect the E2-F1-S1-T1 status mismatch even with E1-only scope active; "
+            f"errors returned: {errors}"
+        )
+
+    def test_validate_inspects_all_units_without_scope(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """Baseline: validate() detects E2 mismatch when no scope.json exists.
+
+        This test is the non-scoped control for the regression test above.
+        If this fails, the production code has a pre-existing bug unrelated to scope.
+        """
+        index_path = self._build_two_epic_workspace(
+            tmp_path,
+            backlog_dir,
+            e2_file_status="done",
+            e2_index_status="in-queue",
+        )
+
+        assert not (tmp_path / ".devbench" / "scope.json").exists()
+
+        mgr = BacklogManager()
+        errors = mgr.validate(index_path, tmp_path)
+
+        e2_mismatch_errors = [e for e in errors if "E2-F1-S1-T1" in e and "status" in e.lower()]
+        assert e2_mismatch_errors, f"validate() must detect the E2-F1-S1-T1 status mismatch; errors returned: {errors}"
+
+    def test_validate_clean_backlog_passes_with_scope_present(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """A valid backlog remains valid when scope.json is present.
+
+        Ensures scope.json does not introduce false positives into validate().
+        """
+        index_path = self._build_two_epic_workspace(
+            tmp_path,
+            backlog_dir,
+            e2_file_status="in-queue",
+            e2_index_status="in-queue",
+        )
+
+        all_ids = ["E1", "E1-F1-S1-T1", "E2", "E2-F1-S1-T1"]
+        scope = ScopeFilter.parse("E1", "", all_ids)
+        scope.to_file(tmp_path)
+
+        mgr = BacklogManager()
+        errors = mgr.validate(index_path, tmp_path)
+
+        status_mismatch_errors = [e for e in errors if "status" in e.lower() and "mismatch" in e.lower()]
+        assert not status_mismatch_errors, (
+            f"A consistent backlog must not produce status-mismatch errors even with scope.json present; "
+            f"got: {status_mismatch_errors}"
+        )
+
+
+class TestBulkSetStatus:
+    """Tests for BacklogManager.bulk_set_status -- spec section 4.7.2, AC-194-5/6/7.
+
+    AC-194-5: All writes acquire flock(BACKLOG.lock) once before any per-WU _set_status call.
+    AC-194-6: Per-WU updates go through BacklogManager._set_status so audit + rollup fire.
+    AC-194-7: A workspace-level [BULK_STATUS_UPDATE] audit row is written per invocation.
+    """
+
+    # ------------------------------------------------------------------
+    # Fixture helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _make_backlog(
+        tmp_path: Path,
+        unit_specs: list[tuple[str, str]],
+    ) -> tuple[Path, Path, dict[str, Path]]:
+        """Build BACKLOG.md + per-WU files for a list of (unit_id, status) pairs.
+
+        Returns:
+            (backlog_index_path, backlog_dir, {unit_id: wu_file_path})
+        """
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir(parents=True, exist_ok=True)
+
+        rows = "\n".join(
+            f"| {uid} | Title {uid} | Task | {status} | None | repo | `backlog/{uid}.md` |"
+            for uid, status in unit_specs
+        )
+        index_content = (
+            "# Backlog\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|----------|\n"
+            f"{rows}\n\n"
+            "## Status Summary\n\n"
+            "| Status | Count |\n"
+            "|--------|-------|\n"
+            f"| in-queue | {sum(1 for _, s in unit_specs if s == 'in-queue')} |\n"
+        )
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(index_content, encoding="utf-8")
+
+        wu_paths: dict[str, Path] = {}
+        for uid, status in unit_specs:
+            wu_file = backlog_dir / f"{uid}.md"
+            wu_file.write_text(
+                f"# {uid}: Title {uid}\n\n## Status: {status}\n\n## Comments\n",
+                encoding="utf-8",
+            )
+            wu_paths[uid] = wu_file
+
+        return index_path, backlog_dir, wu_paths
+
+    # ------------------------------------------------------------------
+    # AC-194-5: Happy path -- all WUs updated, flock acquired once
+    # ------------------------------------------------------------------
+
+    @pytest.mark.unit
+    def test_bulk_set_status_updates_all_work_units(self, tmp_path: Path) -> None:
+        """bulk_set_status writes the new status to every WU file listed in unit_ids."""
+        unit_specs = [
+            ("E7-F1-S1-T1", "in-queue"),
+            ("E7-F1-S1-T2", "in-queue"),
+            ("E7-F1-S1-T3", "in-queue"),
+        ]
+        index_path, _, wu_paths = self._make_backlog(tmp_path, unit_specs)
+        audit_log = tmp_path / "logs" / "bulk-updates.log"
+        audit_log.parent.mkdir(parents=True, exist_ok=True)
+
+        mgr = BacklogManager()
+        pairs = [(uid, wu_paths[uid]) for uid, _ in unit_specs]
+        count = mgr.bulk_set_status(
+            pairs,
+            "done",
+            backlog_index=index_path,
+            audit_log_path=audit_log,
+            audit_meta='--include="E7"',
+        )
+
+        assert count == 3, f"Expected 3 updated, got {count}"
+        for uid, wu_path in pairs:
+            content = wu_path.read_text(encoding="utf-8")
+            assert "## Status: done" in content, f"{uid} file should have 'done' status; got:\n{content}"
+
+    @pytest.mark.unit
+    def test_bulk_set_status_updates_backlog_index(self, tmp_path: Path) -> None:
+        """bulk_set_status updates the BACKLOG.md index row for every WU."""
+        unit_specs = [("E7-F2-S1-T1", "in-queue"), ("E7-F2-S1-T2", "in-queue")]
+        index_path, _, wu_paths = self._make_backlog(tmp_path, unit_specs)
+        audit_log = tmp_path / "logs" / "bulk-updates.log"
+        audit_log.parent.mkdir(parents=True, exist_ok=True)
+
+        mgr = BacklogManager()
+        pairs = [(uid, wu_paths[uid]) for uid, _ in unit_specs]
+        mgr.bulk_set_status(
+            pairs,
+            "blocked",
+            backlog_index=index_path,
+            audit_log_path=audit_log,
+            audit_meta='--include="E7-F2"',
+        )
+
+        index_content = index_path.read_text(encoding="utf-8")
+        assert "blocked" in index_content, f"BACKLOG.md should contain 'blocked' after bulk update:\n{index_content}"
+        assert "in-queue" not in index_content.split("## Full Work Unit Index")[1].split("##")[0], (
+            "No 'in-queue' rows should remain in the index after bulk update to 'blocked'"
+        )
+
+    @pytest.mark.unit
+    def test_bulk_set_status_returns_count(self, tmp_path: Path) -> None:
+        """bulk_set_status returns the exact count of WUs it processed."""
+        unit_specs = [
+            ("E7-F3-T1", "in-queue"),
+            ("E7-F3-T2", "in-queue"),
+            ("E7-F3-T3", "in-queue"),
+            ("E7-F3-T4", "in-queue"),
+            ("E7-F3-T5", "in-queue"),
+        ]
+        index_path, _, wu_paths = self._make_backlog(tmp_path, unit_specs)
+        audit_log = tmp_path / "logs" / "bulk-updates.log"
+        audit_log.parent.mkdir(parents=True, exist_ok=True)
+
+        mgr = BacklogManager()
+        pairs = [(uid, wu_paths[uid]) for uid, _ in unit_specs]
+        count = mgr.bulk_set_status(
+            pairs,
+            "hold",
+            backlog_index=index_path,
+            audit_log_path=audit_log,
+            audit_meta='--include="E7-F3"',
+        )
+
+        assert count == 5
+
+    # ------------------------------------------------------------------
+    # AC-194-5: flock acquired exactly once around the entire batch
+    # ------------------------------------------------------------------
+
+    @pytest.mark.unit
+    def test_bulk_set_status_acquires_flock_once(self, tmp_path: Path) -> None:
+        """flock_backlog context manager is entered exactly once for the batch."""
+        from unittest.mock import patch
+
+        unit_specs = [("E7-F4-T1", "in-queue"), ("E7-F4-T2", "in-queue"), ("E7-F4-T3", "in-queue")]
+        index_path, _, wu_paths = self._make_backlog(tmp_path, unit_specs)
+        audit_log = tmp_path / "logs" / "bulk-updates.log"
+        audit_log.parent.mkdir(parents=True, exist_ok=True)
+
+        enter_count = 0
+
+        import contextlib
+
+        @contextlib.contextmanager
+        def fake_flock(workspace_root, timeout_seconds=30):
+            nonlocal enter_count
+            enter_count += 1
+            yield None
+
+        mgr = BacklogManager()
+        pairs = [(uid, wu_paths[uid]) for uid, _ in unit_specs]
+
+        with patch("devbench.backlog.manager.flock_backlog", fake_flock):
+            mgr.bulk_set_status(
+                pairs,
+                "in-progress",
+                backlog_index=index_path,
+                audit_log_path=audit_log,
+                audit_meta='--include="E7-F4"',
+            )
+
+        assert enter_count == 1, f"flock_backlog should be entered exactly once for the batch, got {enter_count}"
+
+    @pytest.mark.unit
+    def test_bulk_set_status_releases_flock_on_exception(self, tmp_path: Path) -> None:
+        """flock is released even when _set_status raises mid-batch."""
+        from unittest.mock import patch
+
+        unit_specs = [("E7-F5-T1", "in-queue"), ("E7-F5-T2", "in-queue")]
+        index_path, _, wu_paths = self._make_backlog(tmp_path, unit_specs)
+        audit_log = tmp_path / "logs" / "bulk-updates.log"
+        audit_log.parent.mkdir(parents=True, exist_ok=True)
+
+        released = {"flag": False}
+
+        import contextlib
+
+        @contextlib.contextmanager
+        def fake_flock(workspace_root, timeout_seconds=30):
+            try:
+                yield None
+            finally:
+                released["flag"] = True
+
+        call_count = {"n": 0}
+        original_set_status = BacklogManager._set_status
+
+        def failing_set_status(self, work_unit_path, backlog_index, unit_id, new_status, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 2:
+                raise RuntimeError("Simulated failure on second WU")
+            original_set_status(self, work_unit_path, backlog_index, unit_id, new_status, **kwargs)
+
+        mgr = BacklogManager()
+        pairs = [(uid, wu_paths[uid]) for uid, _ in unit_specs]
+
+        with (
+            patch("devbench.backlog.manager.flock_backlog", fake_flock),
+            patch.object(BacklogManager, "_set_status", failing_set_status),
+        ):
+            with pytest.raises(RuntimeError, match="Simulated failure"):
+                mgr.bulk_set_status(
+                    pairs,
+                    "blocked",
+                    backlog_index=index_path,
+                    audit_log_path=audit_log,
+                    audit_meta='--include="E7-F5"',
+                )
+
+        assert released["flag"] is True, "flock must be released even when an exception is raised"
+
+    # ------------------------------------------------------------------
+    # AC-194-6: per-WU _set_status is called so audit + rollup fire
+    # ------------------------------------------------------------------
+
+    @pytest.mark.unit
+    def test_bulk_set_status_calls_set_status_per_wu(self, tmp_path: Path) -> None:
+        """_set_status is invoked once per WU in unit_ids (not batched)."""
+        from unittest.mock import patch
+
+        unit_specs = [
+            ("E7-F6-T1", "in-queue"),
+            ("E7-F6-T2", "in-queue"),
+            ("E7-F6-T3", "in-queue"),
+        ]
+        index_path, _, wu_paths = self._make_backlog(tmp_path, unit_specs)
+        audit_log = tmp_path / "logs" / "bulk-updates.log"
+        audit_log.parent.mkdir(parents=True, exist_ok=True)
+
+        called_with: list[tuple[str, str]] = []
+        original_set_status = BacklogManager._set_status
+
+        def recording_set_status(self, work_unit_path, backlog_index, unit_id, new_status, **kwargs):
+            called_with.append((unit_id, new_status))
+            original_set_status(self, work_unit_path, backlog_index, unit_id, new_status, **kwargs)
+
+        mgr = BacklogManager()
+        pairs = [(uid, wu_paths[uid]) for uid, _ in unit_specs]
+
+        with patch.object(BacklogManager, "_set_status", recording_set_status):
+            mgr.bulk_set_status(
+                pairs,
+                "declined",
+                backlog_index=index_path,
+                audit_log_path=audit_log,
+                audit_meta='--include="E7-F6"',
+            )
+
+        assert len(called_with) == 3, f"Expected 3 _set_status calls, got {len(called_with)}"
+        for uid, _ in unit_specs:
+            matched = [(i, s) for i, s in called_with if i == uid]
+            assert len(matched) == 1, f"_set_status not called for {uid}"
+            assert matched[0][1] == "declined", f"Expected 'declined', got {matched[0][1]}"
+
+    # ------------------------------------------------------------------
+    # AC-194-7: workspace-level [BULK_STATUS_UPDATE] audit row is written
+    # ------------------------------------------------------------------
+
+    @pytest.mark.unit
+    def test_bulk_set_status_writes_audit_row(self, tmp_path: Path) -> None:
+        """A [BULK_STATUS_UPDATE] row is appended to the audit_log_path file."""
+        unit_specs = [("E7-F7-T1", "in-queue"), ("E7-F7-T2", "in-queue")]
+        index_path, _, wu_paths = self._make_backlog(tmp_path, unit_specs)
+        audit_log = tmp_path / "logs" / "bulk-updates.log"
+        audit_log.parent.mkdir(parents=True, exist_ok=True)
+
+        mgr = BacklogManager()
+        pairs = [(uid, wu_paths[uid]) for uid, _ in unit_specs]
+        mgr.bulk_set_status(
+            pairs,
+            "hold",
+            backlog_index=index_path,
+            audit_log_path=audit_log,
+            audit_meta='--include="E7-F7" --exclude="E7-F7-T3"',
+        )
+
+        assert audit_log.exists(), "audit_log_path file must be created by bulk_set_status"
+        audit_content = audit_log.read_text(encoding="utf-8")
+        assert "[BULK_STATUS_UPDATE]" in audit_content, (
+            f"Audit log must contain '[BULK_STATUS_UPDATE]'; got:\n{audit_content}"
+        )
+        assert "2 WUs" in audit_content, f"Audit row must include count '2 WUs'; got:\n{audit_content}"
+        assert "hold" in audit_content, f"Audit row must include target status 'hold'; got:\n{audit_content}"
+        assert '--include="E7-F7"' in audit_content, f"Audit row must include audit_meta; got:\n{audit_content}"
+
+    @pytest.mark.unit
+    def test_bulk_set_status_audit_row_format(self, tmp_path: Path) -> None:
+        """[BULK_STATUS_UPDATE] row matches expected format with count, status, and meta."""
+        unit_specs = [
+            ("E7-F8-T1", "in-queue"),
+            ("E7-F8-T2", "in-queue"),
+            ("E7-F8-T3", "in-queue"),
+        ]
+        index_path, _, wu_paths = self._make_backlog(tmp_path, unit_specs)
+        audit_log = tmp_path / "logs" / "bulk-updates.log"
+        audit_log.parent.mkdir(parents=True, exist_ok=True)
+
+        mgr = BacklogManager()
+        pairs = [(uid, wu_paths[uid]) for uid, _ in unit_specs]
+        mgr.bulk_set_status(
+            pairs,
+            "in-queue",
+            backlog_index=index_path,
+            audit_log_path=audit_log,
+            audit_meta='--include="E7-F8"',
+        )
+
+        audit_content = audit_log.read_text(encoding="utf-8")
+        # Must match: [BULK_STATUS_UPDATE] 3 WUs set to 'in-queue' by --include="E7-F8"
+        import re
+
+        pattern = r"\[BULK_STATUS_UPDATE\] 3 WUs set to 'in-queue' by --include=\"E7-F8\""
+        assert re.search(pattern, audit_content), (
+            f"Audit row does not match expected format.\nExpected pattern: {pattern}\nGot:\n{audit_content}"
+        )
+
+    @pytest.mark.unit
+    def test_bulk_set_status_creates_audit_log_parent_dirs(self, tmp_path: Path) -> None:
+        """bulk_set_status creates parent directories for audit_log_path if absent."""
+        unit_specs = [("E7-F9-T1", "in-queue")]
+        index_path, _, wu_paths = self._make_backlog(tmp_path, unit_specs)
+        audit_log = tmp_path / "deep" / "nested" / "logs" / "bulk.log"
+
+        assert not audit_log.parent.exists(), "Pre-condition: parent dirs must not exist"
+
+        mgr = BacklogManager()
+        pairs = [(uid, wu_paths[uid]) for uid, _ in unit_specs]
+        mgr.bulk_set_status(
+            pairs,
+            "in-queue",
+            backlog_index=index_path,
+            audit_log_path=audit_log,
+            audit_meta='--include="E7-F9"',
+        )
+
+        assert audit_log.exists(), "audit_log_path must be created including parent directories"
+
+    @pytest.mark.unit
+    def test_bulk_set_status_appends_multiple_runs(self, tmp_path: Path) -> None:
+        """Successive bulk_set_status calls append rows; they do not overwrite."""
+        unit_specs = [("E7-F10-T1", "in-queue"), ("E7-F10-T2", "in-queue")]
+        index_path, _, wu_paths = self._make_backlog(tmp_path, unit_specs)
+        audit_log = tmp_path / "logs" / "bulk.log"
+        audit_log.parent.mkdir(parents=True, exist_ok=True)
+
+        mgr = BacklogManager()
+
+        # First run: update T1 to done
+        mgr.bulk_set_status(
+            [("E7-F10-T1", wu_paths["E7-F10-T1"])],
+            "done",
+            backlog_index=index_path,
+            audit_log_path=audit_log,
+            audit_meta='--include="E7-F10-T1"',
+        )
+
+        # Revert index/file state for second run (write T2 update)
+        mgr.bulk_set_status(
+            [("E7-F10-T2", wu_paths["E7-F10-T2"])],
+            "blocked",
+            backlog_index=index_path,
+            audit_log_path=audit_log,
+            audit_meta='--include="E7-F10-T2"',
+        )
+
+        audit_content = audit_log.read_text(encoding="utf-8")
+        assert audit_content.count("[BULK_STATUS_UPDATE]") == 2, (
+            f"Expected exactly 2 [BULK_STATUS_UPDATE] rows, got:\n{audit_content}"
+        )
+
+    # ------------------------------------------------------------------
+    # Error paths
+    # ------------------------------------------------------------------
+
+    @pytest.mark.unit
+    def test_bulk_set_status_empty_list_writes_audit_row(self, tmp_path: Path) -> None:
+        """Empty unit_ids list writes a 0 WUs audit row and returns 0."""
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|----------|\n",
+            encoding="utf-8",
+        )
+        audit_log = tmp_path / "logs" / "bulk.log"
+        audit_log.parent.mkdir(parents=True, exist_ok=True)
+
+        mgr = BacklogManager()
+        count = mgr.bulk_set_status(
+            [],
+            "in-queue",
+            backlog_index=index_path,
+            audit_log_path=audit_log,
+            audit_meta='--include="E99"',
+        )
+
+        assert count == 0
+        audit_content = audit_log.read_text(encoding="utf-8")
+        assert "[BULK_STATUS_UPDATE]" in audit_content
+        assert "0 WUs" in audit_content
+
+    @pytest.mark.unit
+    def test_bulk_set_status_invalid_status_raises(self, tmp_path: Path) -> None:
+        """Invalid new_status raises ValueError before any file is written."""
+        unit_specs = [("E7-F11-T1", "in-queue")]
+        index_path, _, wu_paths = self._make_backlog(tmp_path, unit_specs)
+        audit_log = tmp_path / "logs" / "bulk.log"
+        audit_log.parent.mkdir(parents=True, exist_ok=True)
+
+        mgr = BacklogManager()
+        pairs = [(uid, wu_paths[uid]) for uid, _ in unit_specs]
+
+        with pytest.raises(ValueError, match="Invalid status"):
+            mgr.bulk_set_status(
+                pairs,
+                "not-a-real-status",
+                backlog_index=index_path,
+                audit_log_path=audit_log,
+                audit_meta='--include="E7-F11"',
+            )
+
+        # WU file must NOT have been modified
+        content = wu_paths["E7-F11-T1"].read_text(encoding="utf-8")
+        assert "## Status: in-queue" in content, "WU file should remain unchanged when invalid status is provided"
+
+    @pytest.mark.unit
+    def test_bulk_set_status_flock_workspace_root_is_backlog_index_parent(self, tmp_path: Path) -> None:
+        """flock_backlog is called with workspace_root = backlog_index.parent."""
+        import contextlib
+        from unittest.mock import patch
+
+        unit_specs = [("E7-F12-T1", "in-queue")]
+        index_path, _, wu_paths = self._make_backlog(tmp_path, unit_specs)
+        audit_log = tmp_path / "logs" / "bulk.log"
+        audit_log.parent.mkdir(parents=True, exist_ok=True)
+
+        called_with_root: list[Path] = []
+
+        @contextlib.contextmanager
+        def capturing_flock(workspace_root, timeout_seconds=30):
+            called_with_root.append(workspace_root)
+            yield None
+
+        mgr = BacklogManager()
+        pairs = [(uid, wu_paths[uid]) for uid, _ in unit_specs]
+
+        with patch("devbench.backlog.manager.flock_backlog", capturing_flock):
+            mgr.bulk_set_status(
+                pairs,
+                "in-queue",
+                backlog_index=index_path,
+                audit_log_path=audit_log,
+                audit_meta='--include="E7-F12"',
+            )
+
+        assert len(called_with_root) == 1
+        assert called_with_root[0] == index_path.parent, (
+            f"Expected workspace_root={index_path.parent}, got {called_with_root[0]}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Issue #200 / AC-200-2: cascade fires even when the newly-done ID is only
+# referenced by a [BLOCKED_PENDING_PROPOSAL] marker, NOT in the dep table.
+# Before the fix, condition 2 in _auto_requeue_marker_dependents required
+# newly_done_id to be in _parse_candidate_dependencies (the Dependencies
+# table), which was never true for marker-only references.
+# ---------------------------------------------------------------------------
+
+
+class TestAutoRequeueMarkerOnlyNoDep:
+    """AC-200-2: cascade fires when marker target is not in the dep table.
+
+    The fix must relax condition 2 so that ``newly_done_id`` appearing as a
+    marker ID (in the Comments section) is sufficient to trigger the cascade,
+    even when the Dependencies section contains ``| none | | |``.
+    """
+
+    def test_cascade_fires_when_marker_target_done_but_not_in_dep_table(self, tmp_path: Path) -> None:
+        """AC-200-2 happy path: marker-only reference triggers auto-requeue."""
+        marker_comment = "[2026-05-16 01:57 UTC] [agent/agent/orchestrator] [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T2\n"
+        src_file = _unit_body(
+            "E0-F1-S1-T1",
+            "blocked",
+            deps=None,  # No dep table entry -- marker only
+            comments=marker_comment,
+        )
+        dep_file = _unit_body("E0-F1-S1-T2", "done")
+        index = _write_workspace(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Source", "blocked"),
+                ("E0-F1-S1-T2", "MarkerTarget", "done"),
+            ],
+            files={"E0-F1-S1-T1": src_file, "E0-F1-S1-T2": dep_file},
+        )
+        BacklogManager()._auto_requeue_marker_dependents(index, "E0-F1-S1-T2")
+
+        src = (tmp_path / "backlog" / "E0-F1-S1-T1.md").read_text()
+        assert "## Status: in-queue" in src, "Source should be re-queued when its marker target is done"
+        assert "[AUTO_UNBLOCKED]" in src
+        assert "[CASCADE_RESOLVED]" in src
+
+    def test_cascade_does_not_fire_when_other_marker_still_non_terminal(self, tmp_path: Path) -> None:
+        """Two markers with no dep table: cascade stays blocked until both are done."""
+        marker_comment = (
+            "[2026-05-16 01:57 UTC] [agent/agent/orchestrator] [BLOCKED_PENDING_PROPOSAL]"
+            " E0-F1-S1-T2\n"
+            "[2026-05-16 01:58 UTC] [agent/agent/orchestrator] [BLOCKED_PENDING_PROPOSAL]"
+            " E0-F1-S1-T3\n"
+        )
+        src_file = _unit_body(
+            "E0-F1-S1-T1",
+            "blocked",
+            deps=None,
+            comments=marker_comment,
+        )
+        dep_done = _unit_body("E0-F1-S1-T2", "done")
+        dep_queued = _unit_body("E0-F1-S1-T3", "in-queue")
+        index = _write_workspace(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Source", "blocked"),
+                ("E0-F1-S1-T2", "MarkerTarget1", "done"),
+                ("E0-F1-S1-T3", "MarkerTarget2", "in-queue"),
+            ],
+            files={
+                "E0-F1-S1-T1": src_file,
+                "E0-F1-S1-T2": dep_done,
+                "E0-F1-S1-T3": dep_queued,
+            },
+        )
+        BacklogManager()._auto_requeue_marker_dependents(index, "E0-F1-S1-T2")
+
+        src = (tmp_path / "backlog" / "E0-F1-S1-T1.md").read_text()
+        assert "## Status: blocked" in src, "Should stay blocked -- T3 not yet done"
+        assert "[AUTO_UNBLOCKED]" not in src
+
+
+# ---------------------------------------------------------------------------
+# Issue #200 / AC-200-3: regression test for the captured E5-F3-S1-T1 +
+# E5-F3-S1-T4 scenario from 2026-05-16 02:32 UTC. Before the fix, T1
+# remained blocked after T4 completed because the cascade required T4 to
+# be in T1's Dependencies table (it was, but the classifier still returned
+# OPERATOR_ACTION_REQUIRED for satisfied markers).
+# ---------------------------------------------------------------------------
+
+
+class TestAutoRequeueRegressionE5Scenario:
+    """AC-200-3: regression test for the E5-F3-S1-T1 + E5-F3-S1-T4 scenario.
+
+    Reproduces the exact audit-log content from 2026-05-16 02:32 UTC and
+    asserts that within one _auto_requeue_marker_dependents sweep tick,
+    T1 auto-clears with [AUTO_UNBLOCKED] [CASCADE_RESOLVED] and status
+    in-queue -- without operator intervention.
+    """
+
+    # Exact audit-log lines from the 2026-05-16 02:32 UTC capture for T1.
+    _T1_AUDIT_COMMENTS = (
+        "[2026-05-16 01:56 UTC] [agent/task_factory] [PROPOSAL_PROMOTED]"
+        " E5-F3-S1-T4 promoted and wired as dependency of E5-F3-S1-T1."
+        " (auto-accepted via task_factory.auto_accept_proposals=true at"
+        " write-proposal time) [BLOCKED_PENDING_PROPOSAL] E5-F3-S1-T4\n"
+        "[2026-05-16 01:57 UTC] [agent/agent/orchestrator]"
+        " [BLOCKED_PENDING_PROPOSAL] Amendment rejected"
+        " (source-test atomicity on constants.py). Blocker-resolver proposed"
+        " E5-F3-S1-T4 to own constants, schema, and sample-config changes."
+        " Task will auto-requeue once E5-F3-S1-T4 completes.\n"
+    )
+
+    def test_regression_e5_f3_s1_t1_auto_clears_after_t4_done(self, tmp_path: Path) -> None:
+        """T4 completing must trigger T1 auto-unblock in one sweep tick.
+
+        The fixture preserves the exact audit-log text so future audit-format
+        changes do not silently break the regression. The cascade must write
+        [AUTO_UNBLOCKED] [CASCADE_RESOLVED] and flip T1 to in-queue without
+        operator intervention.
+        """
+        src_file = _unit_body(
+            "E5-F3-S1-T1",
+            "blocked",
+            deps=["E5-F3-S1-T4"],  # dep table entry as it existed at capture time
+            comments=self._T1_AUDIT_COMMENTS,
+        )
+        dep_file = _unit_body("E5-F3-S1-T4", "done")
+        index = _write_workspace(
+            tmp_path,
+            rows=[
+                ("E5-F3-S1-T1", "AddSampleConfig", "blocked"),
+                ("E5-F3-S1-T4", "SampleConfigConstants", "done"),
+            ],
+            files={"E5-F3-S1-T1": src_file, "E5-F3-S1-T4": dep_file},
+        )
+
+        # Single sweep tick: T4 just completed.
+        BacklogManager()._auto_requeue_marker_dependents(index, "E5-F3-S1-T4")
+
+        t1_content = (tmp_path / "backlog" / "E5-F3-S1-T1.md").read_text()
+        assert "## Status: in-queue" in t1_content, "T1 must flip to in-queue in one sweep tick"
+        assert "[AUTO_UNBLOCKED]" in t1_content
+        assert "[CASCADE_RESOLVED]" in t1_content
+        assert "E5-F3-S1-T4" in t1_content  # audit names the marker ID
+        # Verify no operator intervention line was present before the fix:
+        # the [REJECTION_FEEDBACK_RESOLVED] line from the captured log was
+        # an operator action, which should no longer be necessary.
+        assert (
+            "[REJECTION_FEEDBACK_RESOLVED]" not in t1_content
+            or "operator" not in t1_content.split("[REJECTION_FEEDBACK_RESOLVED]")[0].split("\n")[-1]
+        ), "Auto-unblock must precede any operator action"
+
+
+# ---------------------------------------------------------------------------
+# Issue #221 B2: bare ``.md`` extension in AC prose MUST NOT be flagged
+# ---------------------------------------------------------------------------
+
+
+class TestBareMdExtensionNotOrphan:
+    """Issue #221 B2: bare ``.md`` (the extension only) in prose isn't a path.
+
+    Prose like "only ``.md`` files modified" or "the work-unit ``.md``
+    file" backticks the extension itself for emphasis. The orphan-path
+    rule must not flag this 3-char string as a path; only tokens with
+    a real filename stem or a directory separator qualify.
+    """
+
+    H = _ValidateRuleHarness
+
+    @staticmethod
+    def _runtime_with_rule_on(repo: str) -> RuntimeConfig:
+        return RuntimeConfig(
+            repos={repo: RepoConfig(checkout_directory=None)},
+            validate=ValidateConfig(check_orphan_path_tokens=True),
+        )
+
+    def test_bare_md_in_ac_not_flagged(self, tmp_path: Path, backlog_dir: Path) -> None:
+        repo = "ex/foo"
+        TestValidateNoOrphanPathTokens._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `src/real.py` | new |\n| `tests/unit/test_real.py` | new |\n",
+            "- [ ] AC-FUNC-001: only `.md` files modified in this task.",
+        )
+        TestBareMdExtensionNotOrphan.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        with patch("devbench.config.RUNTIME_CONFIG", self._runtime_with_rule_on(repo)):
+            errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        orphans = [e for e in errors if "orphan path" in e]
+        assert not orphans, f"bare `.md` should not be flagged; got: {orphans}"
+
+    def test_real_md_path_still_flagged(self, tmp_path: Path, backlog_dir: Path) -> None:
+        repo = "ex/foo"
+        TestValidateNoOrphanPathTokens._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `src/real.py` | new |\n| `tests/unit/test_real.py` | new |\n",
+            "- [ ] AC-FUNC-001: `docs/imaginary.md` updated.",
+        )
+        TestBareMdExtensionNotOrphan.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        with patch("devbench.config.RUNTIME_CONFIG", self._runtime_with_rule_on(repo)):
+            errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        orphans = [e for e in errors if "orphan path" in e and "docs/imaginary.md" in e]
+        assert len(orphans) == 1
+
+
+# ---------------------------------------------------------------------------
+# Issue #221 B3: sentinel values are exempt from path-based rules
+# ---------------------------------------------------------------------------
+
+
+class TestSentinelManifestExemption:
+    """Issue #221 B3: ``<verification-only>`` etc. are NOT real Manifest paths.
+
+    Two tasks both claiming ``<verification-only>`` must NOT trigger
+    the Manifest Conflict Rule. A decision-only task whose Manifest is
+    ``<decision-only>`` must NOT trigger source-test atomicity.
+    """
+
+    def test_sentinel_not_real_manifest_path(self) -> None:
+        from devbench.backlog.manager import BacklogManager
+
+        assert BacklogManager._is_real_manifest_path("<verification-only>") is False
+        assert BacklogManager._is_real_manifest_path("<decision-only>") is False
+        assert BacklogManager._is_real_manifest_path("<no-op>") is False
+        assert BacklogManager._is_real_manifest_path("<no changes>") is False
+        assert BacklogManager._is_real_manifest_path("<verification-only:E15-F5-S1-T2>") is False
+        # Real path with angle brackets in surrounding prose-style is still real.
+        assert BacklogManager._is_real_manifest_path("src/foo.py") is True
+        # Sentinel-shaped but with leading/trailing whitespace still recognised.
+        assert BacklogManager._is_real_manifest_path("  <verification-only>  ") is False
+
+    def test_placeholder_paren_form_still_filtered(self) -> None:
+        from devbench.backlog.manager import BacklogManager
+
+        assert BacklogManager._is_real_manifest_path("(none)") is False
+        assert BacklogManager._is_real_manifest_path("(no file changes; documentation only)") is False
+
+
+# ---------------------------------------------------------------------------
+# Issue #221 B4: Manifest entries with glob patterns are rejected
+# ---------------------------------------------------------------------------
+
+
+class TestManifestGlobRejection:
+    """Issue #221 B4: globs (``*``, ``**``) in Manifest paths emit a clear error."""
+
+    H = _ValidateRuleHarness
+
+    def test_glob_in_manifest_rejected(self, tmp_path: Path, backlog_dir: Path) -> None:
+        repo = "ex/foo"
+        TestValidateNoOrphanPathTokens._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `src/**/*.py` | Update conditional |\n",
+            "- [ ] AC-FUNC-001: drift fixed.",
+        )
+        TestManifestGlobRejection.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        glob_errors = [e for e in errors if "glob pattern" in e]
+        assert len(glob_errors) == 1
+        assert "src/**/*.py" in glob_errors[0]
+        assert "sentinel" in glob_errors[0]
+        assert "manifest_amendment" in glob_errors[0]
+
+    def test_no_glob_no_error(self, tmp_path: Path, backlog_dir: Path) -> None:
+        repo = "ex/foo"
+        TestValidateNoOrphanPathTokens._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `src/real.py` | new |\n| `tests/unit/test_real.py` | new |\n",
+            "- [ ] AC-FUNC-001: done.",
+        )
+        TestManifestGlobRejection.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        assert not any("glob pattern" in e for e in errors)
+
+    def test_sentinel_with_no_glob_passes(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """Sentinels are exempt from glob rejection -- they're not paths."""
+        repo = "ex/foo"
+        TestValidateNoOrphanPathTokens._make_task_with_sections(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            repo,
+            "| `<source-drift-fix-targets-determined-at-execution>` | run-time list |\n",
+            "- [ ] AC-FUNC-001: done.",
+        )
+        TestManifestGlobRejection.H.make_index(
+            tmp_path,
+            f"| EX-F1-S1-T1 | T1 | Task | in-queue | none | {repo} | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        assert not any("glob pattern" in e for e in errors)

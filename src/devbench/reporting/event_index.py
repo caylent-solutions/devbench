@@ -81,7 +81,16 @@ _log = logging.getLogger("devbench.reporting.event_index")
 # correct without a query-side ``DISTINCT``. Entries without a stable
 # ``message.id`` continue to insert -- the partial predicate excludes
 # NULLs from the uniqueness check.
-_SCHEMA_VERSION = 3
+#
+# Version 4 (issue #223): ``hook_entries`` + ``transcript_entries`` both
+# gain a ``model TEXT`` column carrying the Claude model id (the literal
+# ``message.model`` from the transcript envelope, e.g.
+# ``claude-opus-4-7``).  NULL means "no model attribution available"
+# and aggregates under the ``"<unknown>"`` bucket priced against
+# ``REPORT_DEFAULT_MODEL_RATES``.  Pre-v4 caches are dropped + rebuilt by
+# the open-time version-mismatch handler (rebuild is lossless because
+# every row is a deterministic transformation of the source files).
+_SCHEMA_VERSION = 4
 
 
 _KIND_ORCH_LOG = "orchestrator_log"
@@ -143,10 +152,15 @@ CREATE TABLE IF NOT EXISTS hook_entries (
     is_us_only INTEGER NOT NULL DEFAULT 0,
     is_fast INTEGER NOT NULL DEFAULT 0,
     transcript_path TEXT,
+    -- Issue #223: per-call model attribution.  NULL aggregates under the
+    -- ``"<unknown>"`` bucket; non-NULL values match a row in
+    -- ``REPORT_MODEL_RATES`` or fall back to ``REPORT_DEFAULT_MODEL_RATES``.
+    model TEXT,
     PRIMARY KEY (file_id, line_offset),
     FOREIGN KEY (file_id) REFERENCES source_files(file_id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_hook_entries_ts ON hook_entries(ts_epoch_us);
+CREATE INDEX IF NOT EXISTS idx_hook_entries_model_ts ON hook_entries(model, ts_epoch_us);
 
 CREATE TABLE IF NOT EXISTS transcript_entries (
     file_id INTEGER NOT NULL,
@@ -162,12 +176,16 @@ CREATE TABLE IF NOT EXISTS transcript_entries (
     is_fast INTEGER NOT NULL DEFAULT 0,
     has_usage INTEGER NOT NULL DEFAULT 0,
     message_id TEXT,  -- issue #169: assistant message id for cross-file dedup; NULL allowed
+    -- Issue #223: per-call model attribution; same semantic as hook_entries.model.
+    model TEXT,
     PRIMARY KEY (file_id, line_offset),
     FOREIGN KEY (file_id) REFERENCES source_files(file_id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_transcript_entries_ts ON transcript_entries(ts_epoch_us);
 CREATE INDEX IF NOT EXISTS idx_transcript_entries_role_ts
     ON transcript_entries(role, ts_epoch_us);
+CREATE INDEX IF NOT EXISTS idx_transcript_entries_model_ts
+    ON transcript_entries(model, ts_epoch_us);
 -- Issue #169: cross-file dedup. Resumed sessions copy prior assistant
 -- messages into new files; the partial unique index lets
 -- ``INSERT OR IGNORE`` reject the second insert of the same message_id
@@ -498,6 +516,13 @@ class EventIndex:
             tokens = _tokens_from_usage(usage)
             transcript_path = (entry.get("input") or {}).get("transcript_path")
             transcript_path_str = transcript_path if isinstance(transcript_path, str) else None
+            # Issue #223: hook log entries typically carry the model id
+            # inside ``tool_response.model`` (Claude Code's PostToolUse
+            # envelope).  Some entries fall back to ``entry.model``.
+            # When neither is present the row is stored with model=NULL
+            # and aggregates under the ``"<unknown>"`` bucket downstream.
+            raw_model = tool_resp.get("model") or entry.get("model")
+            model_str = raw_model if isinstance(raw_model, str) and raw_model else None
             rows.append(
                 (
                     file_id,
@@ -513,6 +538,7 @@ class EventIndex:
                     tokens.is_us_only,
                     tokens.is_fast,
                     transcript_path_str,
+                    model_str,
                 )
             )
         if rows:
@@ -520,8 +546,8 @@ class EventIndex:
                 "INSERT OR REPLACE INTO hook_entries "
                 "(file_id, line_offset, ts_epoch_us, duration_ms, input_tokens, output_tokens, "
                 "cache_read_tokens, cache_write_5m_tokens, cache_write_1h_tokens, "
-                "has_usage, is_us_only, is_fast, transcript_path) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "has_usage, is_us_only, is_fast, transcript_path, model) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 rows,
             )
         self._update_file_row(file_id, mtime_ns, size_bytes, new_parsed_offset)
@@ -590,6 +616,12 @@ class EventIndex:
             # which the partial predicate excludes from uniqueness.
             raw_id = message.get("id")
             message_id = raw_id if isinstance(raw_id, str) and raw_id else None
+            # Issue #223: capture the model id Claude Code records on
+            # every ``assistant`` message envelope.  NULL when the field
+            # is missing or non-string; the aggregator buckets such rows
+            # under ``"<unknown>"`` priced against ``REPORT_DEFAULT_MODEL_RATES``.
+            raw_model = message.get("model")
+            model_str = raw_model if isinstance(raw_model, str) and raw_model else None
             rows.append(
                 (
                     file_id,
@@ -605,6 +637,7 @@ class EventIndex:
                     tokens.is_fast,
                     tokens.has_usage,
                     message_id,
+                    model_str,
                 )
             )
         if rows:
@@ -617,8 +650,8 @@ class EventIndex:
                 "INSERT OR IGNORE INTO transcript_entries "
                 "(file_id, line_offset, ts_epoch_us, role, input_tokens, output_tokens, "
                 "cache_read_tokens, cache_write_5m_tokens, cache_write_1h_tokens, "
-                "is_us_only, is_fast, has_usage, message_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "is_us_only, is_fast, has_usage, message_id, model) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 rows,
             )
         self._update_file_row(file_id, mtime_ns, size_bytes, new_parsed_offset)
@@ -890,6 +923,91 @@ class EventIndex:
             (_KIND_TRANSCRIPT, f"{transcript_dir}/%.jsonl", boundary),
         ).fetchone()
         return _row_to_totals_dict(row)
+
+    def aggregate_hook_window_by_model(self, hook_log_path: Path, window_start: datetime) -> dict[str, dict[str, int]]:
+        """Per-model variant of :meth:`aggregate_hook_window` (issue #223).
+
+        Returns ``{model_id -> totals_dict}`` where ``totals_dict`` has the
+        same shape as the single-bucket ``aggregate_hook_window`` return
+        value.  Rows with a NULL ``model`` aggregate under the sentinel
+        key ``"<unknown>"`` so legacy data (pre-#223 caches) and any
+        future entry that lacks model attribution contribute to a single
+        catch-all bucket priced against ``REPORT_DEFAULT_MODEL_RATES``.
+        Empty result -> empty dict (no rows in the window).
+        """
+        file_id = self._file_id_for(hook_log_path)
+        if file_id is None:
+            return {}
+        boundary = _datetime_to_epoch_us(window_start)
+        rows = self._conn.execute(
+            "SELECT COALESCE(model, ?), "
+            "COALESCE(SUM(duration_ms), 0), "
+            "COALESCE(SUM(input_tokens), 0), "
+            "COALESCE(SUM(output_tokens), 0), "
+            "COALESCE(SUM(cache_read_tokens), 0), "
+            "COALESCE(SUM(cache_write_5m_tokens), 0), "
+            "COALESCE(SUM(cache_write_1h_tokens), 0), "
+            "COALESCE(SUM(has_usage), 0), "
+            "COALESCE(SUM(is_us_only), 0), "
+            "COALESCE(SUM(is_fast), 0), "
+            "COALESCE(SUM(CASE WHEN is_us_only=1 THEN input_tokens ELSE 0 END), 0), "
+            "COALESCE(SUM(CASE WHEN is_us_only=1 THEN output_tokens ELSE 0 END), 0), "
+            "COALESCE(SUM(CASE WHEN is_us_only=1 THEN cache_read_tokens ELSE 0 END), 0), "
+            "COALESCE(SUM(CASE WHEN is_us_only=1 THEN cache_write_5m_tokens ELSE 0 END), 0), "
+            "COALESCE(SUM(CASE WHEN is_us_only=1 THEN cache_write_1h_tokens ELSE 0 END), 0), "
+            "COALESCE(SUM(CASE WHEN is_fast=1 THEN input_tokens ELSE 0 END), 0), "
+            "COALESCE(SUM(CASE WHEN is_fast=1 THEN output_tokens ELSE 0 END), 0), "
+            "COALESCE(SUM(CASE WHEN is_fast=1 THEN cache_read_tokens ELSE 0 END), 0), "
+            "COALESCE(SUM(CASE WHEN is_fast=1 THEN cache_write_5m_tokens ELSE 0 END), 0), "
+            "COALESCE(SUM(CASE WHEN is_fast=1 THEN cache_write_1h_tokens ELSE 0 END), 0) "
+            "FROM hook_entries WHERE file_id = ? AND (ts_epoch_us IS NULL OR ts_epoch_us >= ?) "
+            "GROUP BY COALESCE(model, ?)",
+            ("<unknown>", file_id, boundary, "<unknown>"),
+        ).fetchall()
+        return {row[0]: _row_to_totals_dict(row[1:]) for row in rows}
+
+    def aggregate_transcript_window_by_model(
+        self, transcript_dir: Path | None, window_start: datetime
+    ) -> dict[str, dict[str, int]]:
+        """Per-model variant of :meth:`aggregate_transcript_window` (issue #223).
+
+        Returns ``{model_id -> totals_dict}``; NULL model rows aggregate
+        under ``"<unknown>"``.  Empty source dir / no rows -> empty dict.
+        Transcripts contribute zero duration (the column is hard-coded
+        to 0 in the single-bucket aggregator and that semantic is
+        preserved here).
+        """
+        if transcript_dir is None:
+            return {}
+        boundary = _datetime_to_epoch_us(window_start)
+        rows = self._conn.execute(
+            "SELECT COALESCE(model, ?), "
+            "0, "
+            "COALESCE(SUM(input_tokens), 0), "
+            "COALESCE(SUM(output_tokens), 0), "
+            "COALESCE(SUM(cache_read_tokens), 0), "
+            "COALESCE(SUM(cache_write_5m_tokens), 0), "
+            "COALESCE(SUM(cache_write_1h_tokens), 0), "
+            "COALESCE(SUM(has_usage), 0), "
+            "COALESCE(SUM(is_us_only), 0), "
+            "COALESCE(SUM(is_fast), 0), "
+            "COALESCE(SUM(CASE WHEN is_us_only=1 THEN input_tokens ELSE 0 END), 0), "
+            "COALESCE(SUM(CASE WHEN is_us_only=1 THEN output_tokens ELSE 0 END), 0), "
+            "COALESCE(SUM(CASE WHEN is_us_only=1 THEN cache_read_tokens ELSE 0 END), 0), "
+            "COALESCE(SUM(CASE WHEN is_us_only=1 THEN cache_write_5m_tokens ELSE 0 END), 0), "
+            "COALESCE(SUM(CASE WHEN is_us_only=1 THEN cache_write_1h_tokens ELSE 0 END), 0), "
+            "COALESCE(SUM(CASE WHEN is_fast=1 THEN input_tokens ELSE 0 END), 0), "
+            "COALESCE(SUM(CASE WHEN is_fast=1 THEN output_tokens ELSE 0 END), 0), "
+            "COALESCE(SUM(CASE WHEN is_fast=1 THEN cache_read_tokens ELSE 0 END), 0), "
+            "COALESCE(SUM(CASE WHEN is_fast=1 THEN cache_write_5m_tokens ELSE 0 END), 0), "
+            "COALESCE(SUM(CASE WHEN is_fast=1 THEN cache_write_1h_tokens ELSE 0 END), 0) "
+            "FROM transcript_entries "
+            "WHERE file_id IN (SELECT file_id FROM source_files WHERE kind = ? AND path LIKE ?) "
+            "AND (ts_epoch_us IS NULL OR ts_epoch_us >= ?) "
+            "GROUP BY COALESCE(model, ?)",
+            ("<unknown>", _KIND_TRANSCRIPT, f"{transcript_dir}/%.jsonl", boundary, "<unknown>"),
+        ).fetchall()
+        return {row[0]: _row_to_totals_dict(row[1:]) for row in rows}
 
     def first_hook_transcript_path(self, hook_log_path: Path) -> str | None:
         """Return the earliest non-null ``transcript_path`` recorded on a hook entry from ``hook_log_path``.

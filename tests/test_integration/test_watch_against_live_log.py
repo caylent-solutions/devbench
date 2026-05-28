@@ -3,7 +3,7 @@
 Builds a realistic tmp workspace out of ``tests/fixtures/activity/*`` --
 a BACKLOG.md, one work-unit .md, an orchestrator.log, a hook-logs.jsonl,
 and a subagent transcript -- then runs ``devbench watch`` as a subprocess
-with a freshly-set ``JUDGE_WORKSPACE_ROOT`` pointing at the tmp directory.
+with a freshly-set ``DEVBENCH_WORKSPACE_ROOT`` pointing at the tmp directory.
 The captured stdout must contain the mode label, active task ID, and the
 latest subagent text; the process must exit 0 with no stderr surprises.
 """
@@ -58,9 +58,9 @@ def _materialise_workspace(tmp_path: Path) -> Path:
 
 def _run_watch(workspace: Path) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
-    env["JUDGE_WORKSPACE_ROOT"] = str(workspace)
-    env["JUDGE_LOG_FILE"] = str(workspace / "orchestrator.log")
-    env["JUDGE_CLAUDE_MODEL"] = env.get("JUDGE_CLAUDE_MODEL", "test-model")
+    env["DEVBENCH_WORKSPACE_ROOT"] = str(workspace)
+    env["DEVBENCH_LOG_FILE"] = str(workspace / "orchestrator.log")
+    env["DEVBENCH_CLAUDE_MODEL"] = env.get("DEVBENCH_CLAUDE_MODEL", "test-model")
     # Use the same Python interpreter pytest is running under; invoke the
     # module directly so we don't depend on `uv run` being in PATH.
     return subprocess.run(

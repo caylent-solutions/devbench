@@ -54,7 +54,7 @@ Streaming callers benefit from Phase 1+4 cache only.
 Why text-cache vs data-cache. Caching the rendered text is the
 simplest correct solution and saves the entire aggregate + render
 cost. The trade-off is that runtime-determined rendering (terminal
-width, color via `NO_COLOR`, timezone via `JUDGE_DISPLAY_TIMEZONE`)
+width, color via `NO_COLOR`, timezone via `DEVBENCH_DISPLAY_TIMEZONE`)
 gets baked into the snapshot at write time. For the orchestrate-
 skill use case this is acceptable -- the orchestrator runs in a
 stable terminal env. A future ADR can promote the cache to a data-

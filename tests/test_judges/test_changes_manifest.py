@@ -26,7 +26,12 @@ from pathlib import Path
 import pytest
 
 CHANGES_MANIFEST_JUDGE = (
-    Path(__file__).parent.parent.parent / "plugin" / "devbench" / "agents" / "review_team" / "changes-manifest.md"
+    Path(__file__).parent.parent.parent
+    / "plugin"
+    / "devbench-orchestrate"
+    / "agents"
+    / "review_team"
+    / "changes-manifest.md"
 )
 
 

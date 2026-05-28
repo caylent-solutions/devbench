@@ -501,7 +501,13 @@ class TestRewriteStatus:
 
 
 class TestMaterialiseProposal:
-    def test_creates_drafts_and_appends_rows(self, tmp_path: Path) -> None:
+    def test_creates_drafts_and_appends_rows(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from devbench.config_loader import BacklogConfig, RuntimeConfig
+
+        fake_config = RuntimeConfig.__new__(RuntimeConfig)
+        object.__setattr__(fake_config, "backlog", BacklogConfig(default_status_for_new_work_units="in-queue"))
+        monkeypatch.setattr(proposal_mod, "_get_runtime_config", lambda: fake_config)
+
         workspace = _build_workspace(tmp_path)
         proposal = _sample_proposal()
         drafts = materialise_proposal(
@@ -514,7 +520,7 @@ class TestMaterialiseProposal:
         assert len(drafts) == 2
         for draft in drafts:
             assert draft.is_file()
-            assert "## Status: proposed" in draft.read_text()
+            assert "## Status: in-queue" in draft.read_text()
         backlog = (workspace / "BACKLOG.md").read_text()
         assert "E0-F1-S1-T2" in backlog
         assert "E0-F1-S1-T3" in backlog
@@ -699,6 +705,171 @@ class TestMaterialiseProposalIdempotent:
         assert result == [], "rejected draft must not be resurrected on re-materialise"
         story_dir = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
         assert not (story_dir / "E0-F1-S1-T2.md").exists()
+
+
+# ---------------------------------------------------------------------------
+# materialise_proposal -- config-driven default status (AC-189-8)
+# ---------------------------------------------------------------------------
+
+
+class TestMaterialiseProposalDefaultStatus:
+    """AC-189-8: materialise_proposal respects backlog.default_status_for_new_work_units."""
+
+    def test_default_status_proposed_when_config_in_queue(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When RUNTIME_CONFIG.backlog.default_status_for_new_work_units == 'in-queue',
+        the draft file must have '## Status: in-queue' and the BACKLOG.md row must
+        carry 'in-queue' (not 'proposed').
+        """
+        from devbench.config_loader import BacklogConfig, RuntimeConfig
+
+        fake_config = RuntimeConfig.__new__(RuntimeConfig)
+        object.__setattr__(fake_config, "backlog", BacklogConfig(default_status_for_new_work_units="in-queue"))
+        monkeypatch.setattr(proposal_mod, "_get_runtime_config", lambda: fake_config)
+
+        workspace = _build_workspace(tmp_path)
+        proposal = _sample_proposal(task_ids=["E0-F1-S1-T2"])
+        drafts = materialise_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            proposal=proposal,
+            repo="caylent-solutions/example",
+        )
+
+        assert len(drafts) == 1
+        draft_text = drafts[0].read_text()
+        assert "## Status: in-queue" in draft_text, "draft must carry in-queue status"
+        backlog_text = (workspace / "BACKLOG.md").read_text()
+        assert "| in-queue |" in backlog_text, "BACKLOG.md row must carry in-queue status in a pipe-delimited cell"
+
+    def test_default_status_draft_when_config_draft(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When RUNTIME_CONFIG.backlog.default_status_for_new_work_units == 'draft',
+        the draft file must have '## Status: draft' and the BACKLOG.md row must
+        carry 'draft'.
+        """
+        from devbench.config_loader import BacklogConfig, RuntimeConfig
+
+        fake_config = RuntimeConfig.__new__(RuntimeConfig)
+        object.__setattr__(fake_config, "backlog", BacklogConfig(default_status_for_new_work_units="draft"))
+        monkeypatch.setattr(proposal_mod, "_get_runtime_config", lambda: fake_config)
+
+        workspace = _build_workspace(tmp_path)
+        proposal = _sample_proposal(task_ids=["E0-F1-S1-T2"])
+        drafts = materialise_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            proposal=proposal,
+            repo="caylent-solutions/example",
+        )
+
+        assert len(drafts) == 1
+        draft_text = drafts[0].read_text()
+        assert "## Status: draft" in draft_text, "draft must carry draft status"
+        backlog_text = (workspace / "BACKLOG.md").read_text()
+        assert "| draft |" in backlog_text, "BACKLOG.md row must carry draft status in a pipe-delimited cell"
+
+    def test_backlog_index_row_status_matches_config(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The BACKLOG.md row's Status cell (column 4) matches the configured default status."""
+        from devbench.config_loader import BacklogConfig, RuntimeConfig
+
+        fake_config = RuntimeConfig.__new__(RuntimeConfig)
+        object.__setattr__(fake_config, "backlog", BacklogConfig(default_status_for_new_work_units="draft"))
+        monkeypatch.setattr(proposal_mod, "_get_runtime_config", lambda: fake_config)
+
+        workspace = _build_workspace(tmp_path)
+        proposal = _sample_proposal(task_ids=["E0-F1-S1-T2"])
+        materialise_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            proposal=proposal,
+            repo="caylent-solutions/example",
+        )
+
+        backlog_text = (workspace / "BACKLOG.md").read_text()
+        # Find the row for E0-F1-S1-T2 and check its Status cell (index 4 in pipe-split).
+        for line in backlog_text.splitlines():
+            if "E0-F1-S1-T2" in line and line.strip().startswith("|"):
+                cells = [c.strip() for c in line.split("|")]
+                if cells[1] == "E0-F1-S1-T2":
+                    assert cells[4] == "draft", f"Expected Status cell to be 'draft', got {cells[4]!r}"
+                    break
+        else:
+            pytest.fail("Row for E0-F1-S1-T2 not found in BACKLOG.md")
+
+    @pytest.mark.parametrize("configured_status", ["in-queue", "draft"])
+    def test_parametrized_status_values_written_correctly(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        configured_status: str,
+    ) -> None:
+        """Both allowed config values produce the correct status in draft and BACKLOG.md."""
+        from devbench.config_loader import BacklogConfig, RuntimeConfig
+
+        fake_config = RuntimeConfig.__new__(RuntimeConfig)
+        object.__setattr__(
+            fake_config,
+            "backlog",
+            BacklogConfig(default_status_for_new_work_units=configured_status),
+        )
+        monkeypatch.setattr(proposal_mod, "_get_runtime_config", lambda: fake_config)
+
+        workspace = _build_workspace(tmp_path)
+        proposal = _sample_proposal(task_ids=["E0-F1-S1-T2"])
+        drafts = materialise_proposal(
+            workspace_root=workspace,
+            backlog_root=workspace / "backlog",
+            backlog_index=workspace / "BACKLOG.md",
+            proposal=proposal,
+            repo="caylent-solutions/example",
+        )
+
+        assert len(drafts) == 1
+        assert f"## Status: {configured_status}" in drafts[0].read_text()
+        backlog_text = (workspace / "BACKLOG.md").read_text()
+        for line in backlog_text.splitlines():
+            if "E0-F1-S1-T2" in line and line.strip().startswith("|"):
+                cells = [c.strip() for c in line.split("|")]
+                if cells[1] == "E0-F1-S1-T2":
+                    assert cells[4] == configured_status
+                    break
+        else:
+            pytest.fail("Row for E0-F1-S1-T2 not found in BACKLOG.md")
+
+    def test_invalid_default_status_raises_proposal_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When default_status_for_new_work_units has an invalid value, materialise_proposal
+        raises ProposalError with an actionable message before writing any files.
+        """
+        from devbench.config_loader import BacklogConfig, RuntimeConfig
+
+        fake_config = RuntimeConfig.__new__(RuntimeConfig)
+        object.__setattr__(
+            fake_config,
+            "backlog",
+            BacklogConfig(default_status_for_new_work_units="in_queue"),  # underscore -- invalid
+        )
+        monkeypatch.setattr(proposal_mod, "_get_runtime_config", lambda: fake_config)
+
+        workspace = _build_workspace(tmp_path)
+        prop = _sample_proposal(task_ids=["E0-F1-S1-T2"])
+        with pytest.raises(ProposalError, match=r"invalid value.*in_queue"):
+            materialise_proposal(
+                workspace_root=workspace,
+                backlog_root=workspace / "backlog",
+                backlog_index=workspace / "BACKLOG.md",
+                proposal=prop,
+                repo="caylent-solutions/example",
+            )
+        # No draft files should have been written before the error was raised.
+        story_dir = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        draft_file = story_dir / "E0-F1-S1-T2.md"
+        assert not draft_file.exists(), "No draft file should be written when config is invalid"
 
 
 class TestHasUnresolvedProposals:
@@ -1601,13 +1772,20 @@ class TestClassifyBlockedTask:
         state = classify_blocked_task(workspace / "backlog", workspace / "BACKLOG.md", "E0-F1-S1-T1")
         assert state is BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL
 
-    def test_task_with_all_terminal_markers_is_operator_action_required(self, tmp_path: Path) -> None:
-        """Cascade should already have fired; the task is still blocked = diagnostic signal."""
+    def test_task_with_all_terminal_markers_is_auto_clearing(self, tmp_path: Path) -> None:
+        """Issue #200 / AC-200-1: all-terminal markers must return AUTO_CLEARING_VIA_PROPOSAL.
+
+        Before the fix this returned OPERATOR_ACTION_REQUIRED via fallthrough.
+        The fix: _classify_with_markers always returns AUTO_CLEARING_VIA_PROPOSAL
+        for any non-empty, non-unknown, non-HOLD marker set. The orchestrator's
+        cascade (_auto_requeue_marker_dependents) is responsible for actually
+        flipping the task to in-queue once all markers are terminal.
+        """
         from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
 
         workspace = self._workspace_with_markers(tmp_path, [("E0-F1-S1-T2", "done"), ("E0-F1-S1-T3", "declined")])
         state = classify_blocked_task(workspace / "backlog", workspace / "BACKLOG.md", "E0-F1-S1-T1")
-        assert state is BlockedTaskState.OPERATOR_ACTION_REQUIRED
+        assert state is BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL
 
     def test_task_with_unknown_marker_id_is_operator_action_required(self, tmp_path: Path) -> None:
         from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
@@ -2477,6 +2655,493 @@ class TestRecentRecoveryAuditCommentEdgeCases:
 
 
 # ---------------------------------------------------------------------------
+# Issue #211: agent-tag hyphen vs underscore parity
+# ---------------------------------------------------------------------------
+
+
+class TestRecoveryAgentTagHyphenUnderscoreParity:
+    """Issue #211: ``_recent_recovery_audit_comment`` must accept both
+    hyphen-form (``agent/manifest-amender``) and underscore-form
+    (``agent/manifest_amender``) audit-row agent tags.
+
+    ``_RECOVERY_AGENT_TAGS`` enumerates the canonical underscore form,
+    but ``amendment.py::AMENDER_AGENT_ID = "agent/manifest-amender"``
+    and other writers emit the hyphen form. Before the fix the hyphen
+    form silently failed the frozenset membership check, causing
+    ``classify_blocked_task`` to fall through to
+    ``OPERATOR_ACTION_REQUIRED`` for rejected-amendment audits it
+    should have classified as ``AWAITING_AMENDMENT_RECOVERY``.
+    """
+
+    @pytest.mark.parametrize(
+        "agent_tag",
+        [
+            pytest.param("agent/orchestrator", id="orchestrator-no-dashes"),
+            pytest.param("agent/blocker_resolver", id="blocker_resolver-underscore"),
+            pytest.param("agent/blocker-resolver", id="blocker-resolver-hyphen"),
+            pytest.param("agent/manifest_amender", id="manifest_amender-underscore"),
+            pytest.param("agent/manifest-amender", id="manifest-amender-hyphen"),
+            pytest.param("agent/backlog_manager", id="backlog_manager-underscore"),
+            pytest.param("agent/backlog-manager", id="backlog-manager-hyphen"),
+        ],
+    )
+    def test_recovery_audit_helper_accepts_both_forms(self, tmp_path: Path, agent_tag: str) -> None:
+        """Direct unit test on ``_recent_recovery_audit_comment``: both
+        hyphen and underscore forms of each recovery-agent tag return True
+        when the body matches a recovery cause.
+        """
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import _recent_recovery_audit_comment
+
+        wu = tmp_path / "wu.md"
+        now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        ts = now.strftime("%Y-%m-%d %H:%M UTC")
+        wu.write_text(
+            f"## Comments\n\n[{ts}] [{agent_tag}] [BLOCKED] Amendment rejected -- emitting fix proposal\n",
+        )
+        assert _recent_recovery_audit_comment(wu, now, 300) is True, (
+            f"recovery helper should accept agent tag {agent_tag!r} regardless of hyphen/underscore form"
+        )
+
+    @pytest.mark.parametrize(
+        "agent_tag",
+        [
+            pytest.param("agent/manifest-amender", id="manifest-amender-hyphen-structured-tag"),
+            pytest.param("agent/manifest_amender", id="manifest_amender-underscore-structured-tag"),
+        ],
+    )
+    def test_recovery_audit_helper_accepts_both_forms_for_structured_rejection_tag(
+        self, tmp_path: Path, agent_tag: str
+    ) -> None:
+        """The ``[AMENDMENT_REJECTED]`` structured-tag path (issue #200)
+        also passes through ``_recent_recovery_audit_comment``; verify the
+        hyphen/underscore parity holds on that path too -- this is the
+        exact reproducer named in the issue body.
+        """
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import _recent_recovery_audit_comment
+
+        wu = tmp_path / "wu.md"
+        now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        ts = now.strftime("%Y-%m-%d %H:%M UTC")
+        wu.write_text(
+            f"## Comments\n\n[{ts}] [{agent_tag}] [BLOCKED] [AMENDMENT_REJECTED] "
+            f"tdd_green_production_fix; rejected: APPROACH_AUTH: secret leaked into log\n",
+        )
+        assert _recent_recovery_audit_comment(wu, now, 300) is True
+
+    @pytest.mark.parametrize(
+        "agent_tag",
+        [
+            pytest.param("agent/code-reviewer", id="non-recovery-hyphen"),
+            pytest.param("agent/executor", id="non-recovery-no-dashes"),
+            pytest.param("operator/manifest-amender", id="non-agent-prefix"),
+        ],
+    )
+    def test_recovery_audit_helper_still_rejects_non_recovery_agents(self, tmp_path: Path, agent_tag: str) -> None:
+        """The normalisation must NOT widen the agent allowlist beyond the
+        four canonical recovery agents. Tags like ``agent/code-reviewer``
+        (review-team agent, not a recovery agent) and ``operator/...``
+        must still return False.
+        """
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import _recent_recovery_audit_comment
+
+        wu = tmp_path / "wu.md"
+        now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        ts = now.strftime("%Y-%m-%d %H:%M UTC")
+        wu.write_text(
+            f"## Comments\n\n[{ts}] [{agent_tag}] [BLOCKED] Amendment rejected -- emitting fix proposal\n",
+        )
+        assert _recent_recovery_audit_comment(wu, now, 300) is False
+
+    def test_normalize_agent_tag_is_idempotent_on_canonical_form(self) -> None:
+        """The normaliser is a no-op when the input is already in the
+        canonical underscore form -- guards against accidental double-
+        normalisation regressions.
+        """
+        from devbench.backlog.proposal import _normalize_agent_tag
+
+        assert _normalize_agent_tag("agent/manifest_amender") == "agent/manifest_amender"
+        assert _normalize_agent_tag("agent/manifest-amender") == "agent/manifest_amender"
+        assert _normalize_agent_tag("operator/manifest-amender") == "operator/manifest-amender"
+
+
+# ---------------------------------------------------------------------------
+# Issue #211 end-to-end: classify_blocked_task on a hyphen-form amender audit
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyBlockedTaskHyphenFormAmenderAudit:
+    """Issue #211 reproducer: a work unit whose Comments section carries
+    only a ``[BLOCKED] [AMENDMENT_REJECTED]`` audit from
+    ``agent/manifest-amender`` (hyphen form, as written by
+    ``amendment.py::AMENDER_AGENT_ID``), and no proposal / archive on
+    disk, must classify as ``AWAITING_AMENDMENT_RECOVERY``.
+
+    Before the issue #211 fix this returned ``OPERATOR_ACTION_REQUIRED``
+    because the hyphen-form agent tag failed the frozenset membership
+    check in ``_recent_recovery_audit_comment``.
+    """
+
+    def test_hyphen_form_amender_rejection_classifies_recovery(self, tmp_path: Path) -> None:
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        story_dir = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+        wu = story_dir / "E0-F1-S1-T1.md"
+        now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        ts = now.strftime("%Y-%m-%d %H:%M UTC")
+        wu.write_text(
+            "# E0-F1-S1-T1: Test\n\n## Status: blocked\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
+            "## Comments\n\n"
+            f"[{ts}] [agent/manifest-amender] [BLOCKED] [AMENDMENT_REJECTED] "
+            "tdd_green_production_fix; rejected: APPROACH_AUTH: secret leaked into log\n",
+        )
+        (tmp_path / "BACKLOG.md").write_text(
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Test | Task | blocked | None | r "
+            "| `backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n",
+        )
+        state = classify_blocked_task(
+            tmp_path / "backlog",
+            tmp_path / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=tmp_path,
+            now=now,
+            recovery_window_seconds=300,
+        )
+        assert state is BlockedTaskState.AWAITING_AMENDMENT_RECOVERY
+
+
+# ---------------------------------------------------------------------------
+# E8-F1-S1-T1 / issue #195: _RECOVERY_BODY_RE must match English forms
+# and auto-requeue phrase
+# ---------------------------------------------------------------------------
+
+
+class TestRecoveryBodyRegex:
+    """Parametrised regression tests for ``_RECOVERY_BODY_RE``.
+
+    Issue #195: the original regex only matched kebab-case
+    ``amendment-reject``, missing the natural-English ``Amendment rejected``
+    and the orchestrator's stock ``will auto-requeue when ...`` phrase.
+    """
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            pytest.param("amendment-reject", id="kebab-case-base"),
+            pytest.param("Amendment-reject", id="kebab-case-capitalised"),
+            pytest.param("AMENDMENT-REJECT", id="kebab-case-upper"),
+            pytest.param("amendment-rejected", id="kebab-case-past-tense"),
+            pytest.param("amendment reject", id="space-separated"),
+            pytest.param("amendment rejected", id="english-past-tense"),
+            pytest.param("Amendment rejected", id="english-capitalised-past-tense"),
+            pytest.param("AMENDMENT REJECTED", id="english-upper-case"),
+            pytest.param(
+                "will auto-requeue when constants.py ownership clears",
+                id="auto-requeue-full-phrase",
+            ),
+            pytest.param("will auto-requeue when", id="auto-requeue-bare"),
+            pytest.param(
+                "[BLOCKED] will auto-requeue when dep X clears",
+                id="auto-requeue-in-blocked-audit",
+            ),
+            pytest.param("out-of-scope", id="out-of-scope"),
+            pytest.param("Out-Of-Scope", id="out-of-scope-title-case"),
+            pytest.param("ALL_REVIEWS_FAILED", id="all-reviews-failed"),
+            pytest.param("REVIEW_REJECTED", id="review-rejected"),
+            pytest.param(
+                "dependency E0-T1 not yet terminal",
+                id="dependency-not-terminal",
+            ),
+            pytest.param("dep E0-T1 not yet terminal", id="dep-short-form"),
+        ],
+    )
+    def test_positive_match(self, body: str) -> None:
+        from devbench.backlog.proposal import _RECOVERY_BODY_RE
+
+        assert _RECOVERY_BODY_RE.search(body), f"_RECOVERY_BODY_RE should match: {body!r}"
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            pytest.param("unrelated [BLOCKED] reason", id="unrelated-blocked"),
+            pytest.param(
+                "not in any recovery scenario",
+                id="no-recovery-keywords",
+            ),
+            pytest.param("task is stuck on an unknown issue", id="generic-stuck"),
+            pytest.param("amend this code", id="partial-amend-no-match"),
+            pytest.param(
+                "rejected by the operator",
+                id="rejected-but-not-amendment",
+            ),
+            pytest.param("auto-requeue", id="auto-requeue-without-will-when"),
+            pytest.param("amendment", id="amendment-bare-no-reject"),
+        ],
+    )
+    def test_negative_no_match(self, body: str) -> None:
+        from devbench.backlog.proposal import _RECOVERY_BODY_RE
+
+        assert not _RECOVERY_BODY_RE.search(body), f"_RECOVERY_BODY_RE should NOT match: {body!r}"
+
+
+class TestRecoveryBodyRegexIntegration:
+    """End-to-end: synthetic work-unit with English-form [BLOCKED] audit
+    classifies as AWAITING_AMENDMENT_RECOVERY via ``classify_blocked_task``.
+    """
+
+    def _workspace(self, tmp_path: Path) -> Path:
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        story_dir = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+        index = workspace / "BACKLOG.md"
+        index.write_text(
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Test task | Task | blocked | None | r "
+            "| `backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n"
+        )
+        return workspace
+
+    def test_amendment_rejected_english_classifies_recovery(self, tmp_path: Path) -> None:
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        workspace = self._workspace(tmp_path)
+        wu = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
+        now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        ts = now.strftime("%Y-%m-%d %H:%M UTC")
+        wu.write_text(
+            "# E0-F1-S1-T1: Test\n\n## Status: blocked\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
+            "## Comments\n\n"
+            f"[{ts}] [agent/orchestrator] [BLOCKED] Amendment rejected -- emitting fix proposal\n"
+        )
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+            now=now,
+            recovery_window_seconds=300,
+        )
+        assert state is BlockedTaskState.AWAITING_AMENDMENT_RECOVERY
+
+    def test_auto_requeue_phrase_classifies_recovery(self, tmp_path: Path) -> None:
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        workspace = self._workspace(tmp_path)
+        wu = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
+        now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        ts = now.strftime("%Y-%m-%d %H:%M UTC")
+        wu.write_text(
+            "# E0-F1-S1-T1: Test\n\n## Status: blocked\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
+            "## Comments\n\n"
+            f"[{ts}] [agent/orchestrator] [BLOCKED] Task will auto-requeue when constants.py ownership clears\n"
+        )
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+            now=now,
+            recovery_window_seconds=300,
+        )
+        assert state is BlockedTaskState.AWAITING_AMENDMENT_RECOVERY
+
+
+# ---------------------------------------------------------------------------
+# E8-F1-S1-T3 / issue #195: classify_blocked_task end-to-end integration
+# with 'Amendment rejected' audit -- false-positive loophole regression
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyBlockedTaskAmendmentRejectedEndToEnd:
+    """Issue #195 false-positive loophole: a task blocked with a recent
+    ``[BLOCKED] Amendment rejected ...`` audit comment, no
+    ``[BLOCKED_PENDING_PROPOSAL]`` marker, no unsatisfied regular deps,
+    and ``workspace_root`` supplied MUST classify as
+    ``AWAITING_AMENDMENT_RECOVERY`` -- not ``OPERATOR_ACTION_REQUIRED``.
+
+    Before the regex fix in E8-F1-S1-T1, the natural-English phrase
+    ``Amendment rejected`` was not matched by ``_RECOVERY_BODY_RE``
+    (which only accepted kebab-case ``amendment-reject``).  This caused
+    the classifier to fall through the recovery-signal branch and
+    incorrectly report ``OPERATOR_ACTION_REQUIRED``, generating
+    false operator-attention alerts during the 2026-05-15 autonomous run.
+    """
+
+    @staticmethod
+    def _build_workspace(
+        tmp_path: Path,
+        *,
+        audit_body: str,
+        include_marker: bool = False,
+        dep_status: str = "done",
+    ) -> Path:
+        """Build a minimal synthetic workspace for ``classify_blocked_task``.
+
+        Parameters
+        ----------
+        tmp_path:
+            pytest-provided temporary directory.
+        audit_body:
+            The ``[BLOCKED]`` audit comment body text.
+        include_marker:
+            If ``True``, add a ``[BLOCKED_PENDING_PROPOSAL]`` marker row
+            to the work-unit file.
+        dep_status:
+            Status of the dependency task (``done`` means satisfied).
+        """
+        from datetime import UTC, datetime
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        story_dir = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+
+        now = datetime(2026, 5, 15, 14, 0, tzinfo=UTC)
+        ts = now.strftime("%Y-%m-%d %H:%M UTC")
+
+        dep_section = "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
+        marker_section = ""
+        if include_marker:
+            marker_section = "## Blocked Pending Proposals\n\n[BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T99\n\n"
+
+        wu = story_dir / "E0-F1-S1-T1.md"
+        wu.write_text(
+            "# E0-F1-S1-T1: Test task\n\n"
+            "## Status: blocked\n\n"
+            + marker_section
+            + dep_section
+            + "## Comments\n\n"
+            + f"[{ts}] [agent/orchestrator] [BLOCKED] {audit_body}\n"
+        )
+
+        index = workspace / "BACKLOG.md"
+        index.write_text(
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Test task | Task | blocked | None | r "
+            "| `backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n"
+        )
+
+        return workspace
+
+    @pytest.mark.parametrize(
+        "audit_body",
+        [
+            pytest.param(
+                "Amendment rejected -- emitting fix proposal",
+                id="english-capitalised-past-tense",
+            ),
+            pytest.param(
+                "amendment rejected for scope violation",
+                id="english-lowercase-past-tense",
+            ),
+            pytest.param(
+                "amendment-reject -- scope mismatch",
+                id="kebab-case-original",
+            ),
+        ],
+    )
+    def test_recovery_signal_fires_with_workspace_root(self, tmp_path: Path, audit_body: str) -> None:
+        """When workspace_root is supplied and the recent audit comment
+        contains an amendment-rejected phrase, the classifier MUST return
+        AWAITING_AMENDMENT_RECOVERY (not OPERATOR_ACTION_REQUIRED).
+        This is the core regression for issue #195.
+        """
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        workspace = self._build_workspace(tmp_path, audit_body=audit_body)
+        now = datetime(2026, 5, 15, 14, 0, tzinfo=UTC)
+
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+            now=now,
+            recovery_window_seconds=300,
+        )
+
+        assert state is BlockedTaskState.AWAITING_AMENDMENT_RECOVERY
+
+    def test_falls_through_without_workspace_root(self, tmp_path: Path) -> None:
+        """Without workspace_root the recovery-signal branch is skipped and
+        the classifier returns OPERATOR_ACTION_REQUIRED -- proving that
+        the workspace_root parameter is load-bearing for the recovery path.
+        """
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        workspace = self._build_workspace(
+            tmp_path,
+            audit_body="Amendment rejected -- emitting fix proposal",
+        )
+        now = datetime(2026, 5, 15, 14, 0, tzinfo=UTC)
+
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            # workspace_root deliberately omitted
+            now=now,
+            recovery_window_seconds=300,
+        )
+
+        assert state is BlockedTaskState.OPERATOR_ACTION_REQUIRED
+
+    def test_stale_audit_outside_window_falls_through(self, tmp_path: Path) -> None:
+        """An amendment-rejected audit older than the recovery window does NOT
+        classify as AWAITING_AMENDMENT_RECOVERY -- the timestamp check is
+        load-bearing.
+        """
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        workspace = self._build_workspace(
+            tmp_path,
+            audit_body="Amendment rejected -- emitting fix proposal",
+        )
+        # Set now to 10 minutes after the audit timestamp (window is 300s / 5min)
+        now = datetime(2026, 5, 15, 14, 10, tzinfo=UTC)
+
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+            now=now,
+            recovery_window_seconds=300,
+        )
+
+        assert state is BlockedTaskState.OPERATOR_ACTION_REQUIRED
+
+
+# ---------------------------------------------------------------------------
 # E2-F1-S1-T1 / issue #183(d): BlockedTaskState classifier tests
 # ---------------------------------------------------------------------------
 
@@ -2653,6 +3318,105 @@ class TestClassifyBlockedTaskRuntimeDegradation:
             now=now,
         )
         assert state is not BlockedTaskState.RUNTIME_DEGRADATION
+
+    def test_audit_older_than_restart_marker_does_not_trigger(self, tmp_path: Path) -> None:
+        """Issue #215: an agent-tool-unavailable audit row older than the
+        workspace's last-restart marker must NOT keep the task classified as
+        RUNTIME_DEGRADATION.  The operator-driven restart resets the
+        degradation context; only audit rows emitted by the new orchestrator
+        instance should bucket as RUNTIME_DEGRADATION.
+        """
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+        from devbench.constants import LAST_RESTART_MARKER_PATH
+
+        now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        # Audit row was emitted 30 minutes ago by the OLD instance.
+        old_audit_ts = (now - timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M UTC")
+        workspace = self._workspace(
+            tmp_path,
+            f"[{old_audit_ts}] [agent/review-supervisor] [BLOCKED] agent-tool-unavailable: "
+            "session subprocess dropped Agent tool\n",
+        )
+        # Operator restarted 5 minutes ago -- AFTER the audit row.
+        marker = workspace / LAST_RESTART_MARKER_PATH
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text((now - timedelta(minutes=5)).isoformat(), encoding="utf-8")
+
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+            now=now,
+        )
+        assert state is not BlockedTaskState.RUNTIME_DEGRADATION, (
+            "Audit row predating the last-restart marker must NOT keep RUNTIME_DEGRADATION classification (#215)"
+        )
+
+    def test_audit_after_restart_marker_still_triggers(self, tmp_path: Path) -> None:
+        """Issue #215: a fresh agent-tool-unavailable audit row emitted AFTER
+        the most recent restart marker is still observable; the new instance
+        has independently entered a degraded state and the classifier must
+        surface it.
+        """
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+        from devbench.constants import LAST_RESTART_MARKER_PATH
+
+        now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        # Operator restarted 30 minutes ago.
+        # Audit row was emitted 5 minutes ago by the NEW instance.
+        new_audit_ts = (now - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M UTC")
+        workspace = self._workspace(
+            tmp_path,
+            f"[{new_audit_ts}] [agent/review-supervisor] [BLOCKED] agent-tool-unavailable: "
+            "session subprocess dropped Agent tool (post-restart)\n",
+        )
+        marker = workspace / LAST_RESTART_MARKER_PATH
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text((now - timedelta(minutes=30)).isoformat(), encoding="utf-8")
+
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+            now=now,
+        )
+        assert state is BlockedTaskState.RUNTIME_DEGRADATION, (
+            "Audit row emitted AFTER the last-restart marker must still trigger RUNTIME_DEGRADATION (#215)"
+        )
+
+    def test_missing_restart_marker_falls_back_to_24h_window(self, tmp_path: Path) -> None:
+        """Issue #215: when no restart marker is present (cold-boot /
+        never-restarted workspace), the classifier must use the existing
+        24h window so behaviour is a strict superset of the pre-fix
+        implementation.
+        """
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        ts = (now - timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M UTC")
+        workspace = self._workspace(
+            tmp_path,
+            f"[{ts}] [agent/review-supervisor] [BLOCKED] agent-tool-unavailable: cold-boot\n",
+        )
+        # No marker written.
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+            now=now,
+        )
+        assert state is BlockedTaskState.RUNTIME_DEGRADATION, (
+            "With no restart marker, classifier must use 24h window and still find the recent audit row (#215)"
+        )
 
 
 class TestClassifyBlockedTaskHeld:
@@ -2842,12 +3606,14 @@ class TestClassifyBlockedTaskAwaitingDependency:
         )
         assert state is BlockedTaskState.AWAITING_DEPENDENCY
 
-    def test_stale_terminal_markers_no_dep_no_recovery_remains_operator_required(self, tmp_path: Path) -> None:
-        """Regression guard: when all markers are terminal AND there is no
-        unsatisfied regular dep AND no recovery signal, the classifier
-        must still bucket as OPERATOR_ACTION_REQUIRED (the cascade
-        should have fired and did not -- the operator must intervene).
-        Issue #186 fall-through must NOT swallow this scenario.
+    def test_stale_terminal_markers_no_dep_no_recovery_is_auto_clearing(self, tmp_path: Path) -> None:
+        """Issue #200 / AC-200-1: when all markers are terminal AND there is no
+        unsatisfied regular dep AND no recovery signal, the classifier MUST return
+        AUTO_CLEARING_VIA_PROPOSAL (not OPERATOR_ACTION_REQUIRED).
+
+        Before the fix this fell through to OPERATOR_ACTION_REQUIRED; the new
+        behaviour signals that the cascade (_auto_requeue_marker_dependents)
+        should flip the task to in-queue. The operator does not need to intervene.
         """
         from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
 
@@ -2880,7 +3646,7 @@ class TestClassifyBlockedTaskAwaitingDependency:
             "E0-F1-S1-T1",
             workspace_root=tmp_path,
         )
-        assert state is BlockedTaskState.OPERATOR_ACTION_REQUIRED
+        assert state is BlockedTaskState.AUTO_CLEARING_VIA_PROPOSAL
 
 
 class TestClassifyBlockedTaskAwaitingAmendmentRecovery:
@@ -3110,3 +3876,219 @@ class TestClassifyBlockedTaskEndToEnd:
                 recovery_window_seconds=300,
             )
             assert state is expected, f"{task_id}: expected {expected.name}, got {state.name}"
+
+
+# ---------------------------------------------------------------------------
+# Issue #200 / AC-200-1: classifier returns AUTO_CLEARING_VIA_PROPOSAL
+# even when ALL [BLOCKED_PENDING_PROPOSAL] marker targets are terminal.
+# Before the fix, _classify_with_markers returned None for all-terminal
+# markers, causing a fall-through to OPERATOR_ACTION_REQUIRED.
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyBlockedTaskSatisfiedMarkers:
+    """AC-200-1: classify_blocked_task on satisfied (terminal) markers.
+
+    Parametrised tests cover the four sub-cases in the acceptance criteria:
+    - single satisfied marker
+    - multiple satisfied markers
+    - mixed satisfied + unsatisfied (unsatisfied wins: AUTO_CLEARING_VIA_PROPOSAL)
+    - satisfied marker + operator-attention audit (operator wins:
+      OPERATOR_ACTION_REQUIRED when no recovery signals exist)
+    """
+
+    def _workspace(
+        self,
+        tmp_path: Path,
+        marker_target_status_pairs: list[tuple[str, str]],
+        comments_extra: str = "",
+        dep_ids: list[str] | None = None,
+    ) -> Path:
+        """Build a workspace where E0-F1-S1-T1 has [BLOCKED_PENDING_PROPOSAL] markers."""
+        backlog_dir = tmp_path / "backlog"
+        story_dir = backlog_dir / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+
+        marker_lines = "\n".join(
+            f"[2026-04-20 00:00 UTC] [agent/task_factory] [BLOCKED_PENDING_PROPOSAL] {tid}"
+            for tid, _ in marker_target_status_pairs
+        )
+        dep_rows = "| none | | |"
+        if dep_ids:
+            dep_rows = "\n".join(f"| {d} | (auto) | proposed |" for d in dep_ids)
+
+        source_file = story_dir / "E0-F1-S1-T1.md"
+        source_file.write_text(
+            "# E0-F1-S1-T1: Source\n\n## Status: blocked\n\n"
+            "## Description\n\nfixture\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n"
+            f"{dep_rows}\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC-TEST-001\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `t.py` | fixture |\n\n"
+            "## Definition of Done\n\n- [ ] AC complete\n\n"
+            f"## Comments\n\n{marker_lines}\n{comments_extra}"
+        )
+
+        rows = ["| E0-F1-S1-T1 | Source | Task | blocked | None | r | `backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |"]
+        for tid, status in marker_target_status_pairs:
+            (story_dir / f"{tid}.md").write_text(f"# {tid}: X\n\n## Status: {status}\n")
+            rows.append(f"| {tid} | Marker | Task | {status} | None | r | `backlog/E0/E0-F1/E0-F1-S1/{tid}.md` |")
+
+        (tmp_path / "BACKLOG.md").write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n" + "\n".join(rows) + "\n"
+        )
+        return tmp_path
+
+    @pytest.mark.parametrize(
+        "pairs,expected_state",
+        [
+            pytest.param(
+                [("E0-F1-S1-T2", "done")],
+                "AUTO_CLEARING_VIA_PROPOSAL",
+                id="single-satisfied-marker-done",
+            ),
+            pytest.param(
+                [("E0-F1-S1-T2", "declined")],
+                "AUTO_CLEARING_VIA_PROPOSAL",
+                id="single-satisfied-marker-declined",
+            ),
+            pytest.param(
+                [("E0-F1-S1-T2", "done"), ("E0-F1-S1-T3", "declined")],
+                "AUTO_CLEARING_VIA_PROPOSAL",
+                id="multiple-satisfied-markers",
+            ),
+            pytest.param(
+                [("E0-F1-S1-T2", "done"), ("E0-F1-S1-T3", "in-queue")],
+                "AUTO_CLEARING_VIA_PROPOSAL",
+                id="mixed-satisfied-unsatisfied-unsatisfied-wins",
+            ),
+        ],
+    )
+    def test_satisfied_markers_return_auto_clearing(
+        self, tmp_path: Path, pairs: list[tuple[str, str]], expected_state: str
+    ) -> None:
+        """AC-200-1: all-terminal and mixed-terminal markers both produce AUTO_CLEARING_VIA_PROPOSAL."""
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        workspace = self._workspace(tmp_path, pairs)
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+        )
+        assert state is getattr(BlockedTaskState, expected_state), (
+            f"Expected {expected_state}, got {state.name}. Pairs: {pairs}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Issue #200 / AC-200-4: _REJECTION_TAG_RE matches [AMENDMENT_REJECTED]
+# structured-tag audits and causes AWAITING_AMENDMENT_RECOVERY classification.
+# ---------------------------------------------------------------------------
+
+
+class TestRejectionTagRegex:
+    """AC-200-4: separate _REJECTION_TAG_RE for structured [AMENDMENT_REJECTED] tags.
+
+    The classifier's AWAITING_AMENDMENT_RECOVERY path must recognise
+    structured-tag audits like
+    ``[AMENDMENT_REJECTED] tdd_green_production_fix; rejected: POST_CHECK: ...``
+    even though that body text does not contain the prose ``amendment reject``
+    that ``_RECOVERY_BODY_RE`` matches.
+    """
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            pytest.param(
+                "[AMENDMENT_REJECTED] tdd_green_production_fix; rejected: POST_CHECK: scope violation",
+                id="structured-tag-with-reason",
+            ),
+            pytest.param(
+                "[AMENDMENT_REJECTED]",
+                id="structured-tag-bare",
+            ),
+            pytest.param(
+                "[AMENDMENT_REJECTED] out-of-scope: constants.py not in manifest",
+                id="structured-tag-with-out-of-scope",
+            ),
+        ],
+    )
+    def test_positive_match(self, body: str) -> None:
+        """_REJECTION_TAG_RE must match [AMENDMENT_REJECTED] structured tags."""
+        from devbench.backlog.proposal import _REJECTION_TAG_RE
+
+        assert _REJECTION_TAG_RE.search(body), f"_REJECTION_TAG_RE should match: {body!r}"
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            pytest.param("unrelated blocked reason", id="unrelated"),
+            pytest.param("AMENDMENT REJECTED", id="prose-form-no-brackets"),
+            pytest.param("amendment rejected", id="lowercase-prose-no-brackets"),
+        ],
+    )
+    def test_negative_no_match(self, body: str) -> None:
+        """_REJECTION_TAG_RE must NOT match prose forms without brackets."""
+        from devbench.backlog.proposal import _REJECTION_TAG_RE
+
+        assert not _REJECTION_TAG_RE.search(body), f"_REJECTION_TAG_RE should NOT match: {body!r}"
+
+    def _workspace_no_marker(self, tmp_path: Path) -> Path:
+        """Build workspace with E0-F1-S1-T1 blocked, no markers, no regular deps."""
+        backlog_dir = tmp_path / "backlog"
+        story_dir = backlog_dir / "E0" / "E0-F1" / "E0-F1-S1"
+        story_dir.mkdir(parents=True)
+        (story_dir / "E0-F1-S1-T1.md").write_text(
+            "# E0-F1-S1-T1: Source\n\n## Status: blocked\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n| none | | |\n\n"
+            "## Comments\n"
+        )
+        (tmp_path / "BACKLOG.md").write_text(
+            "# Backlog\n\n## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            "| E0-F1-S1-T1 | Source | Task | blocked | None | r"
+            " | `backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1-T1.md` |\n"
+        )
+        return tmp_path
+
+    @pytest.mark.parametrize(
+        "audit_body",
+        [
+            pytest.param(
+                "[AMENDMENT_REJECTED] tdd_green_production_fix; rejected: POST_CHECK: scope",
+                id="amendment-rejected-tag-with-reason",
+            ),
+            pytest.param(
+                "[AMENDMENT_REJECTED]",
+                id="amendment-rejected-tag-bare",
+            ),
+        ],
+    )
+    def test_amendment_rejected_tag_classifies_awaiting_amendment_recovery(
+        self, tmp_path: Path, audit_body: str
+    ) -> None:
+        """AC-200-4: [AMENDMENT_REJECTED] structured-tag audit triggers AWAITING_AMENDMENT_RECOVERY."""
+        from datetime import UTC, datetime
+
+        from devbench.backlog.proposal import BlockedTaskState, classify_blocked_task
+
+        workspace = self._workspace_no_marker(tmp_path)
+        source_file = workspace / "backlog" / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1-T1.md"
+        now = datetime(2026, 5, 16, 2, 32, tzinfo=UTC)
+        ts = now.strftime("%Y-%m-%d %H:%M UTC")
+        source_file.write_text(source_file.read_text() + f"\n[{ts}] [agent/manifest_amender] [BLOCKED] {audit_body}\n")
+        state = classify_blocked_task(
+            workspace / "backlog",
+            workspace / "BACKLOG.md",
+            "E0-F1-S1-T1",
+            workspace_root=workspace,
+            now=now,
+            recovery_window_seconds=3600,
+        )
+        assert state is BlockedTaskState.AWAITING_AMENDMENT_RECOVERY, (
+            f"Expected AWAITING_AMENDMENT_RECOVERY for body {audit_body!r}, got {state.name}"
+        )

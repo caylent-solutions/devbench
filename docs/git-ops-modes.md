@@ -207,7 +207,7 @@ Use when:
 | Layer | Knob |
 |-------|------|
 | YAML | `git_ops.pause_before_merge: bool` |
-| Env | `JUDGE_PAUSE_BEFORE_MERGE` (truthy / falsy) |
+| Env | `DEVBENCH_PAUSE_BEFORE_MERGE` (truthy / falsy) |
 
 Both layers compose with the standard env > YAML > default precedence.
 
@@ -271,7 +271,7 @@ behavior.
 - [`operational-work.md`](operational-work.md) -- end-to-end pattern for
   using devbench to drive non-code operational work under
   `local_only: true`.
-- [`plugin/devbench/skills/orchestrate/SKILL.md`](../plugin/devbench/skills/orchestrate/SKILL.md) -- step 1b reconciliation
+- [`plugin/devbench-orchestrate/skills/orchestrate/SKILL.md`](../plugin/devbench-orchestrate/skills/orchestrate/SKILL.md) -- step 1b reconciliation
   loop and step 8 mode dispatch.
 - [`docs/cli-reference.md`](cli-reference.md) -- the `git-ops` and
   `check-merge` command references.

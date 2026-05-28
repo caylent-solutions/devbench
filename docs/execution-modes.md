@@ -206,7 +206,7 @@ The BACKLOG.md index is an at-a-glance summary; the work-unit file is authoritat
 | --- | --- |
 | Judge FAIL | Feedback injected into the next executor invocation; executor reads feedback, fixes code, re-runs review. |
 | BLOCKED (executor reported) | Work unit marked `blocked`. Stays blocked until human intervention (the `blocker-resolver` agent is not currently invoked -- see architecture doc gaps). |
-| Max executor retries exhausted (`max_executor_retries` / `JUDGE_MAX_RETRIES`, default 10) | `devbench set-status <id> blocked` -- unit marked BLOCKED in BACKLOG.md and orchestrator moves on. |
+| Max executor retries exhausted (`max_executor_retries` / `DEVBENCH_MAX_RETRIES`, default 10) | `devbench set-status <id> blocked` -- unit marked BLOCKED in BACKLOG.md and orchestrator moves on. |
 | Security FAIL | `SECURITY_FAIL` + `REVIEW_REJECTED` written to work unit; done-gate window reset; review tier re-runs after fix. Security tier is **not** retried. |
 
 ---
@@ -243,6 +243,6 @@ All values are configured in `backlog/config/devbench.yaml` under `stop_hook:`, 
 
 | YAML key | Env var | Default | Description |
 | --- | --- | --- | --- |
-| `max_blocks` | `JUDGE_STOP_MAX_BLOCKS` | 5 | Circuit breaker trips after this many blocks |
-| `window_seconds` | `JUDGE_STOP_WINDOW_SECONDS` | 180 | Counter resets after this period |
-| `stale_task_minutes` | `JUDGE_STOP_STALE_MINUTES` | 120 | Warn about stale tasks older than this |
+| `max_blocks` | `DEVBENCH_STOP_MAX_BLOCKS` | 5 | Circuit breaker trips after this many blocks |
+| `window_seconds` | `DEVBENCH_STOP_WINDOW_SECONDS` | 180 | Counter resets after this period |
+| `stale_task_minutes` | `DEVBENCH_STOP_STALE_MINUTES` | 120 | Warn about stale tasks older than this |

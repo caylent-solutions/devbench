@@ -19,10 +19,10 @@ from devbench.config import (
     CHECK_REGISTRATION_RETRIES,
     GH_API_TIMEOUT,
     GITHUB_CHECK_TIMEOUT_SECONDS,
-    MERGE_STRATEGY,
     RUNTIME_CONFIG,
     WORKSPACE_ROOT,
     get_gh_token,
+    resolve_merge_strategy,
     validate_repo,
 )
 from devbench.config_loader import get_configured_default_branch
@@ -528,7 +528,12 @@ class GitOpsService:
         return pr_url
 
     def merge_pr(self, repo: str, pr_number: int, *, repo_path: Path | None = None) -> None:
-        """Merge a pull request using the strategy set by JUDGE_MERGE_STRATEGY.
+        """Merge a pull request using the effective merge strategy for *repo*.
+
+        The strategy is resolved by :func:`devbench.config.resolve_merge_strategy`
+        with precedence ``DEVBENCH_MERGE_STRATEGY`` env > per-repo
+        ``repos.<org/repo>.merge_strategy`` > top-level ``merge_strategy`` >
+        ``"squash"``.
 
         Args:
             repo: GitHub repository in ``owner/name`` format.
@@ -541,8 +546,9 @@ class GitOpsService:
         """
         validate_repo(repo)
 
+        strategy = resolve_merge_strategy(repo)
         rc, _, stderr = self._gh(
-            ["pr", "merge", str(pr_number), MERGE_STRATEGY.flag],
+            ["pr", "merge", str(pr_number), strategy.flag],
             cwd=repo_path,
             repo=repo,
         )
@@ -550,7 +556,7 @@ class GitOpsService:
             if "CONFLICTING" in stderr:
                 raise ConflictingPRError(f"PR #{pr_number} on {repo} is in CONFLICTING state: {stderr.strip()}")
             raise RuntimeError(f"Failed to merge PR #{pr_number} on {repo}: {stderr.strip()}")
-        self.logger.info("Merged PR #%d on %s", pr_number, repo)
+        self.logger.info("Merged PR #%d on %s using %s", pr_number, repo, strategy.value)
 
     def create_tag(self, repo: str, repo_path: Path, tag: str, message: str) -> None:
         """Create an annotated git tag and push it to the remote.

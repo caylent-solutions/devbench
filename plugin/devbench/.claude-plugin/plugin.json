@@ -1,5 +1,0 @@
-{
-  "name": "devbench",
-  "description": "Autonomous backlog execution with LLM-as-judge review. Provides agents for code review, test review, documentation review, and orchestration of the full backlog lifecycle.",
-  "version": "0.1.0"
-}

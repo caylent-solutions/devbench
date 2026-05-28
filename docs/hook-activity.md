@@ -15,7 +15,7 @@ one line at the bottom; history never redraws.
 ## Usage
 
 ```bash
-# Tail the default workspace hook log ($JUDGE_WORKSPACE_ROOT/hook-logs.jsonl).
+# Tail the default workspace hook log ($DEVBENCH_WORKSPACE_ROOT/hook-logs.jsonl).
 devbench hook-tail
 
 # Tail a specific file.
@@ -87,7 +87,7 @@ suffix). `hook-tail` converts at display time.
 - **Default:** OS local timezone, resolved via `datetime.now().astimezone()`.
 - **Workspace-level override:** set `display_timezone:` at the top level of
   `backlog/config/devbench.yaml` (IANA name), or export
-  `JUDGE_DISPLAY_TIMEZONE=<iana-name>`. Applies to every timestamp-rendering
+  `DEVBENCH_DISPLAY_TIMEZONE=<iana-name>`. Applies to every timestamp-rendering
   command (`report`, `hook-tail`, `watch`, future commands).
 - **Per-invocation override:** `--tz <iana-name>` on the `hook-tail` command
   wins over both of the above. Any IANA zoneinfo name works, e.g.
@@ -162,5 +162,5 @@ The two answer different questions: "what is the orchestrator doing
 - Source: `src/devbench/hook_tail.py`, `src/devbench/cli.py::cmd_hook_tail`.
 - Tests: `tests/unit/test_hook_tail.py`, `tests/test_integration/test_hook_tail_lifecycle.py`, `tests/test_cli.py::TestCmdHookTail`.
 - Complementary commands: [`devbench watch`](watch-activity.md), [`devbench report`](architecture.md).
-- Hook-logger that writes the stream: `plugin/devbench/scripts/hook-logger.sh`.
+- Hook-logger that writes the stream: `plugin/devbench-orchestrate/scripts/hook-logger.sh`.
 - Stop-hook block diagnostics: `<workspace>/.devbench/stop-hook-diag/<ts>-<task-id>.json` -- one file per `continue-orchestration.sh` block event, capturing the exact JSON payload emitted to Claude Code plus circuit-breaker counters. Read these after a hang to confirm the hook's block response was well-formed.

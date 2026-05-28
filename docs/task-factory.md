@@ -1,6 +1,6 @@
 # Task Factory (Proposed Work Units)
 
-The task-factory feature automates the "an operator must author new work units" step that follows a legitimate amendment rejection. When the `manifest-amender` correctly rejects an amendment whose changes describe real production fixes that fall outside the source task's scope, the orchestrator invokes the `blocker-resolver` + `task-factory` agents to generate draft work-unit `.md` files with status `proposed`. The human reviews, edits, and promotes each draft; the orchestrator continues on other actionable tasks until promotion.
+The task-factory feature automates the "an operator must author new work units" step that follows a legitimate amendment rejection. When the `manifest-amender` correctly rejects an amendment whose changes describe real production fixes that fall outside the source task's scope, the orchestrator invokes the `blocker-resolver` + `task-factory` agents to generate draft work-unit `.md` files. Each draft's initial status is determined by `backlog.default_status_for_new_work_units` in `backlog/config/devbench.yaml` (`in-queue` by default; `draft` when opted in via AC-189-8). The human reviews, edits, and promotes each draft; the orchestrator continues on other actionable tasks until promotion.
 
 See [ADR-03: Task factory](adr/03-task-factory.md) for the design rationale and alternatives considered.
 
@@ -32,7 +32,7 @@ task_factory:
 
 `task_factory.enabled: true` requires `manifest_amendment.enabled: true`. Config validation fails loud otherwise.
 
-**Trigger is file-based, not verdict-word-based.** The orchestrate skill branches on `test -f $JUDGE_WORKSPACE_ROOT/.devbench/proposals/<source-id>.json` to decide whether to invoke task-factory. Agent verdict words (`proposed` / `resolved` / `escalated` from blocker-resolver; `NEEDS_ESCALATION` from the executor) are audit-only. This is deliberate: the file existing proves a proposal was emitted; verdict words are summaries that cannot override disk state. If no proposal file exists after the executor or blocker-resolver runs, task-factory does NOT fire -- by design. Both triggers use the same file, so only one can fire per source task per run.
+**Trigger is file-based, not verdict-word-based.** The orchestrate skill branches on `test -f $DEVBENCH_WORKSPACE_ROOT/.devbench/proposals/<source-id>.json` to decide whether to invoke task-factory. Agent verdict words (`proposed` / `resolved` / `escalated` from blocker-resolver; `NEEDS_ESCALATION` from the executor) are audit-only. This is deliberate: the file existing proves a proposal was emitted; verdict words are summaries that cannot override disk state. If no proposal file exists after the executor or blocker-resolver runs, task-factory does NOT fire -- by design. Both triggers use the same file, so only one can fire per source task per run.
 
 If the operator decides that some proposed drafts should never be promoted, they can run `devbench decline <id> --reason "<msg>"` instead of `reject-proposal`. `decline` flips the draft's status to `declined` (preserves the file and the audit trail), whereas `reject-proposal` archives the draft and removes the BACKLOG.md row. Use `decline` when you want the draft visible in the backlog's historical record as a considered-and-rejected candidate; use `reject-proposal` when the draft was clearly a misgeneration.
 
@@ -44,8 +44,8 @@ If the operator decides that some proposed drafts should never be promoted, they
 4. **Orchestrator invokes `devbench:blocker-resolver`**. The agent reads the archived request + rejection rationale and decomposes the out-of-scope fixes into a structured proposal JSON. It calls `uv run devbench write-proposal <id>` with the JSON on stdin; the file lands at `<workspace>/.devbench/proposals/<id>.json`.
 5. **Orchestrator invokes `devbench:task-factory`**. The agent calls `uv run devbench materialise-proposal <id>`, which:
    - Reads the proposal JSON.
-   - Writes one draft `.md` per proposed task under `backlog/<epic>/<feature>/<story>/<task-id>.md`, each with `## Status: proposed` and an auto-generated header marker naming the source task.
-   - Inserts a matching row in `BACKLOG.md` with the same `proposed` status.
+   - Writes one draft `.md` per proposed task under `backlog/<epic>/<feature>/<story>/<task-id>.md`, each with a `## Status:` line set to the value of `backlog.default_status_for_new_work_units` (default `in-queue`; `draft` when opted in via AC-189-8), plus an auto-generated header marker naming the source task.
+   - Inserts a matching row in `BACKLOG.md` carrying the same config-driven default status.
    - Refreshes the Status Summary table.
 6. **Orchestrator returns to step 1** (`devbench next`). Proposed tasks are NOT in the actionable set, so the loop picks another task; the source task stays blocked.
 7. **Operator reviews proposals** at their convenience:
@@ -128,10 +128,10 @@ Trigger 2 follows a shorter flow because the executor itself emits the proposal 
 1. **Executor identifies the task as a validation gate.** The Changes Manifest is empty (or absent) and the Approach explicitly forbids production-code changes (wording such as "run and report", "validation gate", "verify only"). The executor runs the prescribed verifications.
 2. **Verifications surface out-of-scope bugs.** The executor confirms bugs that fall outside the source task's scope. Per the executor prompt's BUG ESCALATION FOR VALIDATION GATES section, it does NOT stage a fix and does NOT request an amendment.
 3. **Executor writes the proposal JSON directly.** It allocates `suggested_id` values by scanning sibling task files in the target Story directory, builds the same JSON envelope blocker-resolver would (see the schema below), and pipes it into `uv run devbench write-proposal <source-id>` on stdin.
-4. **Executor verifies the file landed.** `test -f $JUDGE_WORKSPACE_ROOT/.devbench/proposals/<source-id>.json` is the load-bearing check; the orchestrate skill branches on it at step 4a.
+4. **Executor verifies the file landed.** `test -f $DEVBENCH_WORKSPACE_ROOT/.devbench/proposals/<source-id>.json` is the load-bearing check; the orchestrate skill branches on it at step 4a.
 5. **Executor logs NEEDS_ESCALATION** naming the proposal path and the proposed task titles. The source task's review pipeline then runs normally at step 5 -- validation-gate escalation does NOT auto-block the source; its own ACs may still pass.
 6. **Orchestrator detects the proposal at step 4a** and invokes `devbench:task-factory` directly, skipping blocker-resolver (the executor's proposal is already authoritative).
-7. **Task-factory materialises the drafts** exactly as it does on the amendment-reject path: one `.md` per proposed task with `## Status: proposed`, one BACKLOG.md row per draft, Status Summary refreshed.
+7. **Task-factory materialises the drafts** exactly as it does on the amendment-reject path: one `.md` per proposed task with `## Status:` set to the config-driven default (see `backlog.default_status_for_new_work_units`; default `in-queue`), one BACKLOG.md row per draft, Status Summary refreshed.
 8. **Operator reviews and promotes** on their own cadence using the same `promote-proposal` / `reject-proposal` / `decline` commands as Trigger 1.
 
 The key behavioural difference from Trigger 1 is that the source validation-gate task can still complete (`done`) if its own acceptance criteria passed -- for example, a gate whose AC is "43/46 scenarios pass with a documented diagnosis of the remaining 3" can ship while the three proposed fix tasks queue up as independent follow-ups. Trigger 1, by contrast, always leaves the source blocked because the amender rejected the in-scope implementation.
@@ -208,7 +208,7 @@ task_factory:
   auto_accept_proposals: true
 ```
 
-When the flag is `true`, `devbench sweep-proposals` calls `promote-proposal` automatically for every draft currently at `## Status: proposed`. Auto-promote runs on the standard SKILL step 0 tick, so no separate command or cron job is required. The flag is workspace-wide -- every proposal produced in this workspace gets auto-accepted, not individual proposals.
+When the flag is `true`, `devbench sweep-proposals` calls `promote-proposal` automatically for every draft currently at `## Status: proposed`. When `backlog.default_status_for_new_work_units` is `in-queue` (the default), new drafts materialise directly at `in-queue` and the promote loop skips them (they are already in the actionable queue). When the value is `draft`, drafts materialise at `draft` status and the auto-accept sweep promotes them to `in-queue`. Auto-promote runs on the standard SKILL step 0 tick, so no separate command or cron job is required. The flag is workspace-wide -- every proposal produced in this workspace gets auto-accepted, not individual proposals.
 
 Behavioural details:
 
@@ -289,8 +289,8 @@ See [ADR-09](adr/09-idempotent-materialise-proposal.md) for the rationale and re
 ## Related files
 
 - Source: `src/devbench/backlog/proposal.py`, `src/devbench/cli.py` (`cmd_list_proposals`, `cmd_promote_proposal`, `cmd_reject_proposal`, `cmd_materialise_proposal`, `cmd_write_proposal`), `src/devbench/config_loader.py::TaskFactoryConfig`.
-- Agents: `plugin/devbench/agents/blocker-resolver.md`, `plugin/devbench/agents/task-factory.md`.
-- Orchestrator: `plugin/devbench/skills/orchestrate/SKILL.md` (step 4c).
+- Agents: `plugin/devbench-orchestrate/agents/blocker-resolver.md`, `plugin/devbench-orchestrate/agents/task-factory.md`.
+- Orchestrator: `plugin/devbench-orchestrate/skills/orchestrate/SKILL.md` (step 4c).
 - Tests: `tests/test_backlog/test_proposal.py`, `tests/test_integration/test_task_factory_lifecycle.py`.
 - ADR: [ADR-03: Task factory](adr/03-task-factory.md).
 
@@ -331,13 +331,13 @@ When authoring a proposal where the new Task is test-validates-source, set a fla
 "source_dep_direction": "test_validates_source"
 ```
 
-`promote-proposal` honors the flag if present (auto-applies `--no-dep-on-source` and wires the reverse dep). When the flag is absent, the default direction is preserved (backward compatible). See [`plugin/devbench/agents/blocker-resolver.md`](../plugin/devbench/agents/blocker-resolver.md) for when the agent should set this flag.
+`promote-proposal` honors the flag if present (auto-applies `--no-dep-on-source` and wires the reverse dep). When the flag is absent, the default direction is preserved (backward compatible). See [`plugin/devbench-orchestrate/agents/blocker-resolver.md`](../plugin/devbench-orchestrate/agents/blocker-resolver.md) for when the agent should set this flag.
 
 ## Spec-correction recovery tasks (issue #136)
 
 When task-factory materialises a draft whose job is to remove or modify rows in another work-unit's Changes Manifest table, the draft's OWN Changes Manifest contains a **single row pointing at the work-unit markdown file being edited** -- e.g. `backlog/E2/E2-F3/E2-F3-S2/E2-F3-S2-T1.md`. Source files referenced inside that markdown's Manifest table (e.g. `pyproject.toml`, `Makefile`) are NOT listed in the draft's Manifest. Listing them re-introduces the very Manifest Conflict the recovery task was created to resolve.
 
-The agent prompt (`plugin/devbench/agents/task-factory.md`) carries the rule + a self-correcting heuristic gated on Description / Approach verbs ("remove the row", "drop the entry", "correct the manifest table"). Regression coverage: `tests/test_integration/test_task_factory_spec_correction_scope.py`.
+The agent prompt (`plugin/devbench-orchestrate/agents/task-factory.md`) carries the rule + a self-correcting heuristic gated on Description / Approach verbs ("remove the row", "drop the entry", "correct the manifest table"). Regression coverage: `tests/test_integration/test_task_factory_spec_correction_scope.py`.
 
 ## Recovery-proposal dedup (issue #141)
 
@@ -372,7 +372,7 @@ Recovery cascades (a proposal whose source task is itself the
 materialisation of an earlier proposal) carry a `cascade_depth`
 field equal to `parent_depth + 1`. The
 `orchestrate.max_cascade_depth` YAML knob (default `2`, env override
-`JUDGE_ORCHESTRATE_MAX_CASCADE_DEPTH`) caps recursion. When
+`DEVBENCH_ORCHESTRATE_MAX_CASCADE_DEPTH`) caps recursion. When
 `cmd_materialise_proposal` sees a proposal at the cap, it transitions
 the source task to `NEEDS_OPERATOR_ATTENTION` instead of authoring
 another draft. Default of 2 reflects the bounded cascade depth needed

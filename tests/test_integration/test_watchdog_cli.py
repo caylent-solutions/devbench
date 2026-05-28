@@ -33,8 +33,8 @@ def _run_watchdog(
     *extra_args: str,
 ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
-    env["JUDGE_WORKSPACE_ROOT"] = str(workspace)
-    env["JUDGE_CLAUDE_MODEL"] = env.get("JUDGE_CLAUDE_MODEL", "test-model")
+    env["DEVBENCH_WORKSPACE_ROOT"] = str(workspace)
+    env["DEVBENCH_CLAUDE_MODEL"] = env.get("DEVBENCH_CLAUDE_MODEL", "test-model")
     return subprocess.run(
         [
             sys.executable,

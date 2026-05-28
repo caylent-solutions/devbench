@@ -12,6 +12,7 @@ import pytest
 
 from devbench import config
 from devbench.config import ALLOWED_REPOS, validate_repo
+from devbench.config_loader import RepoConfig, RuntimeConfig
 
 # ---------------------------------------------------------------------------
 # Test constants derived from the test fixture (tests/fixtures/test_devbench.yaml)
@@ -35,7 +36,7 @@ class TestAllowedRepos:
 
     def test_allowed_repos_from_yaml(self) -> None:
         """ALLOWED_REPOS is sourced exclusively from YAML repos keys."""
-        env = {k: v for k, v in os.environ.items() if k != "JUDGE_ALLOWED_REPOS"}
+        env = {k: v for k, v in os.environ.items() if k != "DEVBENCH_ALLOWED_REPOS"}
         with patch.dict(os.environ, env, clear=True):
             importlib.reload(config)
             assert isinstance(config.ALLOWED_REPOS, frozenset), (
@@ -46,16 +47,16 @@ class TestAllowedRepos:
         importlib.reload(config)
 
     def test_judge_allowed_repos_env_var_has_no_effect(self) -> None:
-        """JUDGE_ALLOWED_REPOS env var is ignored -- repos come from YAML only."""
+        """DEVBENCH_ALLOWED_REPOS env var is ignored -- repos come from YAML only."""
         # Capture the baseline ALLOWED_REPOS before patching.
         baseline = frozenset(config.ALLOWED_REPOS)
         assert len(baseline) > 0, "Baseline ALLOWED_REPOS must be non-empty for this test to be meaningful"
 
-        with patch.dict(os.environ, {"JUDGE_ALLOWED_REPOS": "org/repo-a,org/repo-b"}, clear=False):
+        with patch.dict(os.environ, {"DEVBENCH_ALLOWED_REPOS": "org/repo-a,org/repo-b"}, clear=False):
             importlib.reload(config)
             # The env var must not alter ALLOWED_REPOS -- it must remain the same as baseline.
             assert baseline == config.ALLOWED_REPOS, (
-                f"ALLOWED_REPOS changed after setting JUDGE_ALLOWED_REPOS -- "
+                f"ALLOWED_REPOS changed after setting DEVBENCH_ALLOWED_REPOS -- "
                 f"it must only come from YAML. Before: {baseline}, After: {config.ALLOWED_REPOS}"
             )
 
@@ -79,9 +80,9 @@ class TestAllowedRepos:
         with pytest.raises(ValueError, match="not allowed"):
             validate_repo(_UNKNOWN_REPO)
 
-    def test_validate_repo_rejects_wrong_org_when_judge_gh_org_set(self) -> None:
+    def test_validate_repo_rejects_wrong_org_when_devbench_gh_org_set(self) -> None:
         with patch.object(config, "ALLOWED_GH_ORG", _FIXTURE_ORG):
-            with pytest.raises(ValueError, match="JUDGE_GH_ORG restricts access"):
+            with pytest.raises(ValueError, match="DEVBENCH_GH_ORG restricts access"):
                 config.validate_repo(_WRONG_ORG_REPO)
 
     def test_validate_repo_skips_org_check_when_judge_gh_org_empty(self) -> None:
@@ -231,14 +232,14 @@ class TestMergeStrategy:
         assert MergeStrategy.REBASE.flag == "--rebase"
 
     def test_invalid_value_raises_runtime_error(self) -> None:
-        with patch.dict(os.environ, {"JUDGE_MERGE_STRATEGY": "fast-forward"}, clear=False):
-            with pytest.raises(RuntimeError, match="JUDGE_MERGE_STRATEGY must be one of"):
+        with patch.dict(os.environ, {"DEVBENCH_MERGE_STRATEGY": "fast-forward"}, clear=False):
+            with pytest.raises(RuntimeError, match="DEVBENCH_MERGE_STRATEGY must be one of"):
                 importlib.reload(config)
 
         importlib.reload(config)
 
     def test_default_is_squash(self) -> None:
-        env_copy = {k: v for k, v in os.environ.items() if k != "JUDGE_MERGE_STRATEGY"}
+        env_copy = {k: v for k, v in os.environ.items() if k != "DEVBENCH_MERGE_STRATEGY"}
         with patch.dict(os.environ, env_copy, clear=True):
             importlib.reload(config)
             assert config.MERGE_STRATEGY == config.MergeStrategy.SQUASH
@@ -247,66 +248,112 @@ class TestMergeStrategy:
 
 
 @pytest.mark.unit
+class TestResolveMergeStrategy:
+    """#237: resolve_merge_strategy precedence env > per-repo > top-level > squash.
+
+    Patches the module inputs (_read_env / MERGE_STRATEGY / RUNTIME_CONFIG) directly
+    rather than reloading the module, so each precedence layer is isolated.
+    """
+
+    def _cfg(self, *, top: str | None = None, per_repo: str | None = None) -> RuntimeConfig:
+        repo = RepoConfig(merge_strategy=per_repo) if per_repo is not None else RepoConfig()
+        return RuntimeConfig(repos={"org/repo": repo}, merge_strategy=top)
+
+    def test_env_override_wins_over_yaml(self) -> None:
+        # env set -> returns the (validated, import-time) MERGE_STRATEGY regardless of YAML.
+        with (
+            patch.object(config, "_read_env", return_value="merge"),
+            patch.object(config, "MERGE_STRATEGY", config.MergeStrategy.MERGE),
+            patch.object(config, "RUNTIME_CONFIG", self._cfg(top="squash", per_repo="rebase")),
+        ):
+            assert config.resolve_merge_strategy("org/repo") is config.MergeStrategy.MERGE
+
+    def test_per_repo_yaml_when_env_unset(self) -> None:
+        with (
+            patch.object(config, "_read_env", return_value=None),
+            patch.object(config, "MERGE_STRATEGY", config.MergeStrategy.SQUASH),
+            patch.object(config, "RUNTIME_CONFIG", self._cfg(top="squash", per_repo="rebase")),
+        ):
+            assert config.resolve_merge_strategy("org/repo") is config.MergeStrategy.REBASE
+
+    def test_top_level_yaml_when_no_per_repo(self) -> None:
+        with (
+            patch.object(config, "_read_env", return_value=None),
+            patch.object(config, "MERGE_STRATEGY", config.MergeStrategy.SQUASH),
+            patch.object(config, "RUNTIME_CONFIG", self._cfg(top="merge")),
+        ):
+            assert config.resolve_merge_strategy("org/repo") is config.MergeStrategy.MERGE
+
+    def test_squash_default_when_env_and_yaml_unset(self) -> None:
+        with (
+            patch.object(config, "_read_env", return_value=None),
+            patch.object(config, "MERGE_STRATEGY", config.MergeStrategy.SQUASH),
+            patch.object(config, "RUNTIME_CONFIG", self._cfg()),
+        ):
+            assert config.resolve_merge_strategy("org/repo") is config.MergeStrategy.SQUASH
+
+
+@pytest.mark.unit
 class TestConfigOverrides:
     """Test that config values can be overridden via environment variables."""
 
     def test_max_retry_attempts_from_env(self) -> None:
-        with patch.dict(os.environ, {"JUDGE_MAX_RETRIES": "7"}, clear=False):
+        with patch.dict(os.environ, {"DEVBENCH_MAX_RETRIES": "7"}, clear=False):
             importlib.reload(config)
             assert config.MAX_RETRY_ATTEMPTS == 7
 
-        with patch.dict(os.environ, {"JUDGE_MAX_RETRIES": "3"}, clear=False):
+        with patch.dict(os.environ, {"DEVBENCH_MAX_RETRIES": "3"}, clear=False):
             importlib.reload(config)
 
     def test_github_check_timeout_from_env(self) -> None:
-        with patch.dict(os.environ, {"JUDGE_GH_TIMEOUT": "120"}, clear=False):
+        with patch.dict(os.environ, {"DEVBENCH_GH_TIMEOUT": "120"}, clear=False):
             importlib.reload(config)
             assert config.GITHUB_CHECK_TIMEOUT_SECONDS == 120
 
-        with patch.dict(os.environ, {"JUDGE_GH_TIMEOUT": "600"}, clear=False):
+        with patch.dict(os.environ, {"DEVBENCH_GH_TIMEOUT": "600"}, clear=False):
             importlib.reload(config)
 
     def test_backlog_root_derived_from_workspace_root(self) -> None:
-        """BACKLOG_ROOT is always derived from JUDGE_WORKSPACE_ROOT, not from env."""
+        """BACKLOG_ROOT is always derived from DEVBENCH_WORKSPACE_ROOT, not from env."""
         from devbench.constants import BACKLOG_SUBDIR
 
-        env_copy = {k: v for k, v in os.environ.items() if k != "JUDGE_BACKLOG_ROOT"}
+        env_copy = {k: v for k, v in os.environ.items() if k not in ("DEVBENCH_BACKLOG_ROOT",)}
         with patch.dict(os.environ, env_copy, clear=True):
             importlib.reload(config)
-            expected = Path(os.environ["JUDGE_WORKSPACE_ROOT"]) / BACKLOG_SUBDIR
+            expected = Path(os.environ["DEVBENCH_WORKSPACE_ROOT"]) / BACKLOG_SUBDIR
             assert expected == config.BACKLOG_ROOT
 
         importlib.reload(config)
 
     def test_backlog_index_derived_from_workspace_root(self) -> None:
-        """BACKLOG_INDEX is always derived from JUDGE_WORKSPACE_ROOT, not from env."""
-        env_copy = {k: v for k, v in os.environ.items() if k != "JUDGE_BACKLOG_INDEX"}
+        """BACKLOG_INDEX is always derived from DEVBENCH_WORKSPACE_ROOT, not from env."""
+        env_copy = {k: v for k, v in os.environ.items() if k not in ("DEVBENCH_BACKLOG_INDEX",)}
         with patch.dict(os.environ, env_copy, clear=True):
             importlib.reload(config)
-            expected = Path(os.environ["JUDGE_WORKSPACE_ROOT"]) / "BACKLOG.md"
+            expected = Path(os.environ["DEVBENCH_WORKSPACE_ROOT"]) / "BACKLOG.md"
             assert expected == config.BACKLOG_INDEX
 
         importlib.reload(config)
 
     def test_judge_backlog_root_env_var_has_no_effect(self, tmp_path: Path) -> None:
-        """JUDGE_BACKLOG_ROOT env var is ignored -- path derived from JUDGE_WORKSPACE_ROOT."""
+        """DEVBENCH_BACKLOG_ROOT env var is ignored -- path derived from DEVBENCH_WORKSPACE_ROOT."""
         from devbench.constants import BACKLOG_SUBDIR
 
         custom_root = tmp_path / "custom-backlog"
-        with patch.dict(os.environ, {"JUDGE_BACKLOG_ROOT": str(custom_root)}, clear=False):
+        with patch.dict(os.environ, {"DEVBENCH_BACKLOG_ROOT": str(custom_root)}, clear=False):
             importlib.reload(config)
-            expected = Path(os.environ["JUDGE_WORKSPACE_ROOT"]) / BACKLOG_SUBDIR
+            expected = Path(os.environ["DEVBENCH_WORKSPACE_ROOT"]) / BACKLOG_SUBDIR
             assert expected == config.BACKLOG_ROOT
             assert custom_root != config.BACKLOG_ROOT
 
         importlib.reload(config)
 
     def test_judge_backlog_index_env_var_has_no_effect(self, tmp_path: Path) -> None:
-        """JUDGE_BACKLOG_INDEX env var is ignored -- path derived from JUDGE_WORKSPACE_ROOT."""
+        """DEVBENCH_BACKLOG_INDEX env var is ignored -- path derived from DEVBENCH_WORKSPACE_ROOT."""
         custom_index = tmp_path / "CUSTOM_BACKLOG.md"
-        with patch.dict(os.environ, {"JUDGE_BACKLOG_INDEX": str(custom_index)}, clear=False):
+        with patch.dict(os.environ, {"DEVBENCH_BACKLOG_INDEX": str(custom_index)}, clear=False):
             importlib.reload(config)
-            expected = Path(os.environ["JUDGE_WORKSPACE_ROOT"]) / "BACKLOG.md"
+            expected = Path(os.environ["DEVBENCH_WORKSPACE_ROOT"]) / "BACKLOG.md"
             assert expected == config.BACKLOG_INDEX
             assert custom_index != config.BACKLOG_INDEX
 
@@ -315,24 +362,7 @@ class TestConfigOverrides:
 
 @pytest.mark.unit
 class TestResolveHelpers:
-    """Tests for _resolve_int and _resolve_float config resolution helpers."""
-
-    def test_resolve_int_env_var_wins(self) -> None:
-        with patch.dict(os.environ, {"TEST_VAR": "42"}, clear=False):
-            result = config._resolve_int("TEST_VAR", 10, 5)
-        assert result == 42
-
-    def test_resolve_int_yaml_when_env_absent(self) -> None:
-        env_copy = {k: v for k, v in os.environ.items() if k != "TEST_VAR_ABSENT"}
-        with patch.dict(os.environ, env_copy, clear=True):
-            result = config._resolve_int("TEST_VAR_ABSENT", 10, 5)
-        assert result == 10
-
-    def test_resolve_int_default_when_both_absent(self) -> None:
-        env_copy = {k: v for k, v in os.environ.items() if k != "TEST_VAR_ABSENT"}
-        with patch.dict(os.environ, env_copy, clear=True):
-            result = config._resolve_int("TEST_VAR_ABSENT", None, 5)
-        assert result == 5
+    """Tests for _resolve_float config resolution helper."""
 
     def test_resolve_float_env_var_wins(self) -> None:
         with patch.dict(os.environ, {"TEST_FLOAT": "1.5"}, clear=False):
@@ -351,58 +381,154 @@ class TestResolveHelpers:
             result = config._resolve_float("TEST_FLOAT_ABSENT", None, 3.0)
         assert result == 3.0
 
-    def test_resolve_float_no_env_var_name(self) -> None:
-        """When env_var is None, skip env lookup entirely."""
-        result = config._resolve_float(None, 2.5, 3.0)
-        assert result == 2.5
+    # ---- _resolve_str -----------------------------------------------------
 
+    def test_resolve_str_env_var_wins(self) -> None:
+        with patch.dict(os.environ, {"TEST_STR_X": "from-env"}, clear=False):
+            assert config._resolve_str("TEST_STR_X", "yaml", "default") == "from-env"
 
-class TestResolveBool:
-    """Tests for ``_resolve_bool`` -- env > YAML > default precedence with strict parsing."""
+    def test_resolve_str_yaml_when_env_absent(self) -> None:
+        env_copy = {k: v for k, v in os.environ.items() if k != "TEST_STR_X"}
+        with patch.dict(os.environ, env_copy, clear=True):
+            assert config._resolve_str("TEST_STR_X", "yaml-val", "default") == "yaml-val"
+
+    def test_resolve_str_default_when_both_absent(self) -> None:
+        env_copy = {k: v for k, v in os.environ.items() if k != "TEST_STR_X"}
+        with patch.dict(os.environ, env_copy, clear=True):
+            assert config._resolve_str("TEST_STR_X", None, "default-val") == "default-val"
+
+    # ---- _resolve_optional_str -------------------------------------------
+
+    def test_resolve_optional_str_env_var_wins(self) -> None:
+        with patch.dict(os.environ, {"TEST_OPT": "envv"}, clear=False):
+            assert config._resolve_optional_str("TEST_OPT", "yaml") == "envv"
+
+    def test_resolve_optional_str_yaml_when_env_empty(self) -> None:
+        env_copy = {k: v for k, v in os.environ.items() if k != "TEST_OPT"}
+        with patch.dict(os.environ, env_copy, clear=True):
+            assert config._resolve_optional_str("TEST_OPT", "yaml-val") == "yaml-val"
+
+    def test_resolve_optional_str_none_when_both_empty(self) -> None:
+        env_copy = {k: v for k, v in os.environ.items() if k != "TEST_OPT"}
+        with patch.dict(os.environ, env_copy, clear=True):
+            assert config._resolve_optional_str("TEST_OPT", None) is None
+
+    # ---- _resolve_bool ----------------------------------------------------
 
     @pytest.mark.parametrize(
-        "raw",
-        ["1", "true", "yes", "on", "TRUE", "Yes", "On"],
+        ("raw", "expected"),
+        [
+            ("1", True),
+            ("true", True),
+            ("TRUE", True),
+            ("yes", True),
+            ("on", True),
+            ("0", False),
+            ("false", False),
+            ("FALSE", False),
+            ("no", False),
+            ("off", False),
+        ],
     )
-    def test_truthy_env_returns_true(self, raw: str) -> None:
-        with patch.dict(os.environ, {"TEST_BOOL_VAR": raw}, clear=False):
-            assert config._resolve_bool("TEST_BOOL_VAR", None, False) is True
+    def test_resolve_bool_truthy_falsy_env_values(self, raw: str, expected: bool) -> None:
+        with patch.dict(os.environ, {"TEST_BOOL_X": raw}, clear=False):
+            assert config._resolve_bool("TEST_BOOL_X", None, not expected) is expected
 
-    @pytest.mark.parametrize(
-        "raw",
-        ["0", "false", "no", "off", "FALSE", "No", "Off"],
-    )
-    def test_falsy_env_returns_false(self, raw: str) -> None:
-        with patch.dict(os.environ, {"TEST_BOOL_VAR": raw}, clear=False):
-            assert config._resolve_bool("TEST_BOOL_VAR", None, True) is False
+    def test_resolve_bool_invalid_env_value_raises(self) -> None:
+        with patch.dict(os.environ, {"TEST_BOOL_X": "maybe"}, clear=False):
+            with pytest.raises(ValueError, match=r"TEST_BOOL_X must be one of"):
+                config._resolve_bool("TEST_BOOL_X", None, False)
 
-    def test_invalid_env_raises_value_error(self) -> None:
-        with patch.dict(os.environ, {"TEST_BOOL_VAR": "maybe"}, clear=False):
-            with pytest.raises(ValueError, match="must be one of"):
-                config._resolve_bool("TEST_BOOL_VAR", None, False)
-
-    def test_yaml_used_when_env_absent(self) -> None:
-        env_copy = {k: v for k, v in os.environ.items() if k != "TEST_BOOL_ABSENT"}
+    def test_resolve_bool_yaml_when_env_absent(self) -> None:
+        env_copy = {k: v for k, v in os.environ.items() if k != "TEST_BOOL_X"}
         with patch.dict(os.environ, env_copy, clear=True):
-            assert config._resolve_bool("TEST_BOOL_ABSENT", True, False) is True
-            assert config._resolve_bool("TEST_BOOL_ABSENT", False, True) is False
+            assert config._resolve_bool("TEST_BOOL_X", True, False) is True
 
-    def test_default_used_when_both_absent(self) -> None:
-        env_copy = {k: v for k, v in os.environ.items() if k != "TEST_BOOL_ABSENT"}
+    # ---- _resolve_str_tuple ----------------------------------------------
+
+    def test_resolve_str_tuple_env_overrides_default(self) -> None:
+        with patch.dict(os.environ, {"TEST_TUPLE": "a, b ,c"}, clear=False):
+            assert config._resolve_str_tuple("TEST_TUPLE", ("x",)) == ("a", "b", "c")
+
+    def test_resolve_str_tuple_default_when_env_empty(self) -> None:
+        with patch.dict(os.environ, {"TEST_TUPLE": "   "}, clear=False):
+            assert config._resolve_str_tuple("TEST_TUPLE", ("x", "y")) == ("x", "y")
+
+    def test_resolve_str_tuple_default_when_env_absent(self) -> None:
+        env_copy = {k: v for k, v in os.environ.items() if k != "TEST_TUPLE"}
         with patch.dict(os.environ, env_copy, clear=True):
-            assert config._resolve_bool("TEST_BOOL_ABSENT", None, True) is True
-            assert config._resolve_bool("TEST_BOOL_ABSENT", None, False) is False
+            assert config._resolve_str_tuple("TEST_TUPLE", ("x", "y")) == ("x", "y")
 
-    def test_env_overrides_yaml(self) -> None:
-        """env > YAML when both are set."""
-        with patch.dict(os.environ, {"TEST_BOOL_VAR": "0"}, clear=False):
-            assert config._resolve_bool("TEST_BOOL_VAR", True, True) is False
-        with patch.dict(os.environ, {"TEST_BOOL_VAR": "1"}, clear=False):
-            assert config._resolve_bool("TEST_BOOL_VAR", False, False) is True
 
-    def test_empty_env_falls_through_to_yaml(self) -> None:
-        with patch.dict(os.environ, {"TEST_BOOL_VAR": ""}, clear=False):
-            assert config._resolve_bool("TEST_BOOL_VAR", True, False) is True
+class TestRequireEnv:
+    """The required-env-var contract: ``_require_env`` is the single source of
+    truth for the import-time required env vars (``DEVBENCH_WORKSPACE_ROOT``
+    and ``DEVBENCH_CLAUDE_MODEL``).
+
+    Issue #221 B7: the helper now prints an actionable one-line error to
+    stderr and exits with code 2 instead of raising ``RuntimeError``.
+    The previous traceback path produced "empty stdout, traceback to
+    stderr" which operators saw as silent failure on stdout-only consumers
+    (``devbench report > out.txt``).
+    """
+
+    def test_returns_value_when_env_var_set(self) -> None:
+        with patch.dict(os.environ, {"REQ_TEST_VAR": "some-value"}, clear=False):
+            assert config._require_env("REQ_TEST_VAR", "hint") == "some-value"
+
+    def test_exits_with_actionable_message_when_env_var_absent(self, capsys: pytest.CaptureFixture[str]) -> None:
+        env_copy = {k: v for k, v in os.environ.items() if k != "REQ_TEST_VAR"}
+        with patch.dict(os.environ, env_copy, clear=True):
+            with pytest.raises(SystemExit) as excinfo:
+                config._require_env("REQ_TEST_VAR", "set-it-properly")
+        assert excinfo.value.code == 2
+        captured = capsys.readouterr()
+        # Actionable message on stderr; stdout stays empty so log scrapers
+        # don't false-positive on a missing-env-var line.
+        assert captured.out == ""
+        assert "REQ_TEST_VAR environment variable is not set. set-it-properly" in captured.err
+        # The "devbench:" prefix marks the line as coming from devbench's
+        # fail-fast layer, not from an unrelated upstream component.
+        assert captured.err.startswith("devbench: ")
+
+    def test_exits_when_env_var_empty(self, capsys: pytest.CaptureFixture[str]) -> None:
+        with patch.dict(os.environ, {"REQ_TEST_VAR": ""}, clear=False):
+            with pytest.raises(SystemExit) as excinfo:
+                config._require_env("REQ_TEST_VAR", "hint")
+        assert excinfo.value.code == 2
+        assert "REQ_TEST_VAR environment variable is not set. hint" in capsys.readouterr().err
+
+
+class TestAgentModelEnvOverrideTypeError:
+    """``_apply_agent_model_env_overrides`` raises TypeError when an agent_models
+    field resolves to a non-string in the second-pass validation loop.  This
+    guards against future schema regressions where the field shape changes.
+    """
+
+    def test_typeerror_for_non_string_agent_model_value(self) -> None:
+        # Build a namespace that mirrors every (var, attr_path) entry in
+        # _AGENT_MODEL_ENV_VARS.  Every leaf is None except the one we are
+        # exercising, which is a non-string sentinel.
+        from types import SimpleNamespace
+
+        review_team = SimpleNamespace(
+            code_reviewer=12345,  # the non-string we want the loop to trip on
+            test_reviewer=None,
+            doc_reviewer=None,
+            changes_manifest=None,
+        )
+        fake = SimpleNamespace(
+            executor=None,
+            blocker_resolver=None,
+            manifest_amender=None,
+            security_reviewer=None,
+            task_factory=None,
+            review_supervisor=None,
+            review_team=review_team,
+        )
+        with patch.object(config.RUNTIME_CONFIG, "agent_models", fake):
+            with pytest.raises(TypeError, match=r"resolved to non-string"):
+                config._apply_agent_model_env_overrides()
 
 
 class TestCanonicalConfigToggles:
@@ -419,7 +545,7 @@ class TestCanonicalConfigToggles:
         from devbench.constants import DEFAULT_INLINE_ORPHAN_CLEANUP_ENABLED
 
         assert DEFAULT_INLINE_ORPHAN_CLEANUP_ENABLED is True
-        assert config._resolve_bool("JUDGE_NONEXISTENT_FOR_TEST", None, True) is True
+        assert config.INLINE_ORPHAN_CLEANUP_ENABLED is True
 
     def test_ci_failure_retry_default_on(self) -> None:
         """v-next default flip: CI_FAILURE_RETRY_ENABLED is True by default."""
@@ -451,19 +577,19 @@ class TestStopHookConfigExposed:
         assert isinstance(config.STOP_HOOK_STALE_TASK_MINUTES, int)
 
     def test_stop_hook_max_blocks_env_override(self) -> None:
-        with patch.dict(os.environ, {"JUDGE_STOP_MAX_BLOCKS": "3"}, clear=False):
+        with patch.dict(os.environ, {"DEVBENCH_STOP_MAX_BLOCKS": "3"}, clear=False):
             importlib.reload(config)
             assert config.STOP_HOOK_MAX_BLOCKS == 3
         importlib.reload(config)
 
     def test_stop_hook_window_seconds_env_override(self) -> None:
-        with patch.dict(os.environ, {"JUDGE_STOP_WINDOW_SECONDS": "60"}, clear=False):
+        with patch.dict(os.environ, {"DEVBENCH_STOP_WINDOW_SECONDS": "60"}, clear=False):
             importlib.reload(config)
             assert config.STOP_HOOK_WINDOW_SECONDS == 60
         importlib.reload(config)
 
     def test_stop_hook_stale_task_minutes_env_override(self) -> None:
-        with patch.dict(os.environ, {"JUDGE_STOP_STALE_MINUTES": "30"}, clear=False):
+        with patch.dict(os.environ, {"DEVBENCH_STOP_STALE_MINUTES": "30"}, clear=False):
             importlib.reload(config)
             assert config.STOP_HOOK_STALE_TASK_MINUTES == 30
         importlib.reload(config)
@@ -474,17 +600,121 @@ class TestMaxRetriesYamlFirst:
     """Verify max_executor_retries reads YAML first, env var overrides."""
 
     def test_max_executor_retries_env_overrides(self) -> None:
-        with patch.dict(os.environ, {"JUDGE_MAX_RETRIES": "15"}, clear=False):
+        with patch.dict(os.environ, {"DEVBENCH_MAX_RETRIES": "15"}, clear=False):
             importlib.reload(config)
             assert config.MAX_RETRY_ATTEMPTS == 15
         importlib.reload(config)
 
     def test_max_executor_retries_uses_yaml_when_env_absent(self) -> None:
-        """When JUDGE_MAX_RETRIES is not set, the YAML value is used."""
-        env_copy = {k: v for k, v in os.environ.items() if k != "JUDGE_MAX_RETRIES"}
+        """When DEVBENCH_MAX_RETRIES is not set, the YAML value is used."""
+        env_copy = {k: v for k, v in os.environ.items() if k != "DEVBENCH_MAX_RETRIES"}
         with patch.dict(os.environ, env_copy, clear=True):
             importlib.reload(config)
             # Value should come from YAML or default -- it should be an int > 0
             assert isinstance(config.MAX_RETRY_ATTEMPTS, int)
             assert config.MAX_RETRY_ATTEMPTS > 0
         importlib.reload(config)
+
+
+@pytest.mark.unit
+class TestAgentModelEnvOverrides:
+    """ADR-25: DEVBENCH_AGENT_MODEL_<NAME> env vars override YAML at config-load time."""
+
+    def test_executor_env_overrides_yaml(self) -> None:
+        with patch.dict(os.environ, {"DEVBENCH_AGENT_MODEL_EXECUTOR": "opus"}, clear=False):
+            importlib.reload(config)
+            assert config.AGENT_MODELS.executor == "opus"
+        importlib.reload(config)
+
+    def test_review_team_env_overrides_yaml(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "JUDGE_AGENT_MODEL_CODE_REVIEWER": "opus",
+                "JUDGE_AGENT_MODEL_CHANGES_MANIFEST": "opus",
+            },
+            clear=False,
+        ):
+            importlib.reload(config)
+            assert config.AGENT_MODELS.review_team.code_reviewer == "opus"
+            assert config.AGENT_MODELS.review_team.changes_manifest == "opus"
+        importlib.reload(config)
+
+    def test_haiku_env_value_rejected_at_load(self) -> None:
+        """AC-198-4: haiku env rejected at config.py import (caylent-solutions/devbench#198)."""
+        with patch.dict(os.environ, {"JUDGE_AGENT_MODEL_CODE_REVIEWER": "haiku"}, clear=False):
+            with pytest.raises(ValueError, match="#198"):
+                importlib.reload(config)
+        importlib.reload(config)
+
+    def test_invalid_env_value_rejected_at_load(self) -> None:
+        """A garbage env value should fail-fast at config.py import (re-validated against USE_BEDROCK)."""
+        with patch.dict(os.environ, {"DEVBENCH_AGENT_MODEL_EXECUTOR": "garbage-value-not-a-model"}, clear=False):
+            with pytest.raises(ValueError, match="not a valid Anthropic API"):
+                importlib.reload(config)
+        importlib.reload(config)
+
+    def test_empty_env_var_treated_as_unset(self) -> None:
+        """Empty string env var must not override (treated as unset)."""
+        with patch.dict(os.environ, {"DEVBENCH_AGENT_MODEL_EXECUTOR": ""}, clear=False):
+            importlib.reload(config)
+            # Fixture has no agents block, so executor stays None.
+            assert config.AGENT_MODELS.executor is None
+        importlib.reload(config)
+
+    def test_all_agent_env_vars_covered(self) -> None:
+        """Every defined DEVBENCH_AGENT_MODEL_* env var routes to a real field."""
+        envs = {
+            "DEVBENCH_AGENT_MODEL_EXECUTOR": "opus",
+            "DEVBENCH_AGENT_MODEL_BLOCKER_RESOLVER": "opus",
+            "DEVBENCH_AGENT_MODEL_MANIFEST_AMENDER": "opus",
+            "JUDGE_AGENT_MODEL_SECURITY_REVIEWER": "opus",
+            "DEVBENCH_AGENT_MODEL_TASK_FACTORY": "opus",
+            "JUDGE_AGENT_MODEL_REVIEW_SUPERVISOR": "opus",
+            "JUDGE_AGENT_MODEL_CODE_REVIEWER": "opus",
+            "JUDGE_AGENT_MODEL_TEST_REVIEWER": "opus",
+            "JUDGE_AGENT_MODEL_DOC_REVIEWER": "opus",
+            "JUDGE_AGENT_MODEL_CHANGES_MANIFEST": "opus",
+        }
+        with patch.dict(os.environ, envs, clear=False):
+            importlib.reload(config)
+            am = config.AGENT_MODELS
+            assert am.executor == "opus"
+            assert am.blocker_resolver == "opus"
+            assert am.manifest_amender == "opus"
+            assert am.security_reviewer == "opus"
+            assert am.task_factory == "opus"
+            assert am.review_supervisor == "opus"
+            assert am.review_team.code_reviewer == "opus"
+            assert am.review_team.test_reviewer == "opus"
+            assert am.review_team.doc_reviewer == "opus"
+            assert am.review_team.changes_manifest == "opus"
+        importlib.reload(config)
+
+
+@pytest.mark.unit
+class TestNotificationsSlackEnvOverride:
+    """Coverage helper: exercise the env-var override path for the slack
+    webhook URL.  Pre-existing uncovered line (config.py:568) brought
+    over the 98% gate by issue #223's test additions; pinning the
+    contract independently of the slack notifications feature.
+    """
+
+    def test_env_override_replaces_yaml_webhook_url(self) -> None:
+        import importlib
+
+        from devbench import config
+
+        original = config.RUNTIME_CONFIG.notifications.slack.webhook_url
+        with patch.dict(
+            os.environ,
+            {"DEVBENCH_NOTIFICATIONS_SLACK_WEBHOOK_URL": "https://hooks.slack.com/services/TEST/HOOK/URL"},
+            clear=False,
+        ):
+            importlib.reload(config)
+            assert config.RUNTIME_CONFIG.notifications.slack.webhook_url == (
+                "https://hooks.slack.com/services/TEST/HOOK/URL"
+            )
+        importlib.reload(config)
+        # The pre-test value is restored after reload-without-env.
+        assert config.RUNTIME_CONFIG.notifications.slack.webhook_url == original

@@ -112,7 +112,7 @@ tools: Bash
 
 Claude Code reads the `model:` field when invoking the agent and routes the inference call to that model. There is no per-role wiring in the Python code -- the routing is data-driven by the agent file itself.
 
-This was not possible when a single global `JUDGE_CLAUDE_MODEL` applied to all roles. With the per-agent model field, the executor can use Opus (long context, complex implementation), the four review judges can use Sonnet or Haiku (shorter, structured evaluation), and the security reviewer can use Sonnet (security reasoning) -- all configured independently and changeable without code changes.
+This was not possible when a single global `DEVBENCH_CLAUDE_MODEL` applied to all roles. With the per-agent model field, the executor can use Opus (long context, complex implementation), the four review judges can use Sonnet or Haiku (shorter, structured evaluation), and the security reviewer can use Sonnet (security reasoning) -- all configured independently and changeable without code changes.
 
 Agent files live at `plugin/devbench/agents/` (top-level agents: executor, review-supervisor, security-reviewer, blocker-resolver, manifest-amender, task-factory) and `plugin/devbench/agents/review_team/` (the four parallel review judges).
 
@@ -145,7 +145,7 @@ Agent files live at `plugin/devbench/agents/` (top-level agents: executor, revie
   Python package remains the authoritative source for structured state management, config
   resolution, and git operations.
 - `devbench.yaml` workspace configuration is unchanged and continues to live at
-  `$JUDGE_WORKSPACE_ROOT/backlog/config/devbench.yaml`, outside the plugin.
+  `$DEVBENCH_WORKSPACE_ROOT/backlog/config/devbench.yaml`, outside the plugin.
 
 ---
 

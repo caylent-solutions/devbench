@@ -44,9 +44,12 @@ use_bedrock: false
 # AWS region for Bedrock when use_bedrock: true.
 bedrock_region: us-east-1
 
-# Per-role model selection. Each falls back to JUDGE_CLAUDE_MODEL when unset.
-# judge_model: us.anthropic.claude-sonnet-4-6-v1
-# executor_model: us.anthropic.claude-opus-4-7-v1
+# Per-agent model overrides live in the `agents:` block lower in this file
+# (ADR-25). `DEVBENCH_CLAUDE_MODEL` (env var, required) is the SDK caller's
+# model -- it governs the orchestrate skill's coordination calls only; it
+# does NOT route the work agents (executor / judges / etc.), each of which
+# loads its model from its plugin .md frontmatter and can be overridden
+# via the `agents:` block.
 
 # Hard allowlist of GitHub orgs devbench may operate against. Empty means
 # every org listed in repos: above is permitted; otherwise restrict here.
@@ -56,9 +59,11 @@ allowed_orgs: []
 # hook-tail, watch). Unset = OS local timezone.
 # display_timezone: America/New_York
 
-# Workspace-relative path to the orchestrator's structured log file. Both
-# the writer (setup_logging) and the readers (report, hook-tail) consult
-# this single source of truth so they cannot diverge.
+# Workspace-relative path to the orchestrator's shared aggregate log file.
+# Both the writer (setup_logging) and the readers (report, hook-tail, watch)
+# consult this single source of truth so they cannot diverge. Named sessions
+# additionally get a per-session log at .devbench/sessions/<name>/orchestrator.log
+# (read via `report --session <name>`). DEVBENCH_LOG_FILE overrides at runtime.
 log_file: logs/orchestrator.log
 
 # ---------------------------------------------------------------------------
@@ -70,8 +75,6 @@ timeouts:
   security_fetch: 120
   llm: 300
   command: 120
-  executor: 600
-  executor_max_turns: 100
   orchestrator_poll_interval: 10
   github_check: 600
 
@@ -184,33 +187,73 @@ orchestrate:
   # Cap on recovery-of-a-recovery cascade depth. When a proposal would land
   # at depth >= this cap, the source task transitions to
   # NEEDS_OPERATOR_ATTENTION instead of materialising another recovery
-  # layer. Override via JUDGE_ORCHESTRATE_MAX_CASCADE_DEPTH env var.
+  # layer. Override via DEVBENCH_ORCHESTRATE_MAX_CASCADE_DEPTH env var.
   max_cascade_depth: 2
 
 # ---------------------------------------------------------------------------
 # Report / cost estimation
 # ---------------------------------------------------------------------------
 report:
-  # Defaults match Opus 4.7 list pricing. Set explicitly only when running a
-  # different model or when your contract has a different rate structure.
+  # Per-model token pricing (issue #223).  Each key is a Claude model id
+  # (the literal `message.model` value Claude Code records on every
+  # `assistant` message envelope, e.g. `claude-opus-4-7`).  The two
+  # mandatory fields are `input` and `output` in USD per 1M tokens.
   #
-  # Calibration guidance:
-  # The reported cost should equal actual API billing within ~1%. If reported
-  # cost drifts from actual (e.g., model swap, 1M-context premium tier, or
-  # non-list contract pricing), derive a correction factor from a recent run:
-  #     correction = actual_billing / reported_cost
-  # Multiply BOTH per-million rates below by that factor; the input/output
-  # ratio is preserved and the cache-read / cache-write / data-residency
-  # multipliers below compose correctly on top of the corrected base rate.
+  # Optional per-model overrides:
+  #   - cache_read_multiplier      override report.cache_read_multiplier for this model
+  #   - cache_write_5min_multiplier override report.cache_write_5min_multiplier
+  #   - cache_write_1hr_multiplier  override report.cache_write_1hr_multiplier
+  #   - correction_factor          per-model contract correction; default 1.0
   #
-  # NOTE: `token_cost_discount` (below) only DECREASES reported cost, so it is
-  # the wrong knob for under-reporting. Always correct upward via the per-
-  # million rates above.
-  token_cost_per_million_input: 5.0
-  token_cost_per_million_output: 25.0
-  # Contract discount off list price as a fraction in [0.0, 1.0].
-  # final_cost = raw_list_cost * (1 - token_cost_discount). 0.0 = full list.
-  token_cost_discount: 0.0
+  # Set `correction_factor` per model when reported cost drifts from your
+  # actual Anthropic invoice on THAT model only.  Use
+  # `devbench cost-calibrate <actual-usd>` to compute and write the
+  # correction factor instead of editing this file by hand.
+  #
+  # The legacy scalar fields (`token_cost_per_million_input`,
+  # `token_cost_per_million_output`, `token_cost_discount`) were retired
+  # in issue #223 in favour of this block.  Workspaces that still set
+  # them get a fail-fast error at config-load time.
+  models:
+    claude-opus-4-7:
+      input: 5.0
+      output: 25.0
+    claude-opus-4-6:
+      input: 5.0
+      output: 25.0
+    claude-opus-4-5:
+      input: 5.0
+      output: 25.0
+    claude-opus-4-1:
+      input: 15.0
+      output: 75.0
+    claude-opus-4:
+      input: 15.0
+      output: 75.0
+    claude-sonnet-4-6:
+      input: 3.0
+      output: 15.0
+    claude-sonnet-4-5:
+      input: 3.0
+      output: 15.0
+    claude-sonnet-4:
+      input: 3.0
+      output: 15.0
+    claude-haiku-4-5:
+      input: 1.0
+      output: 5.0
+    claude-haiku-3-5:
+      input: 0.80
+      output: 4.0
+    claude-haiku-3:
+      input: 0.25
+      output: 1.25
+  # Rates applied to any transcript message whose `model` field is missing
+  # OR a model id not present in `report.models` above.  Defaults to Opus
+  # 4.7 list rates so unknown models err toward over-reporting.
+  default_model:
+    input: 5.0
+    output: 25.0
   # Anthropic's published cache pricing -- override only on platforms with
   # different cache pricing (some Bedrock configurations).
   cache_read_multiplier: 0.10
@@ -224,10 +267,10 @@ report:
   # display_timezone: America/New_York
 
 # ---------------------------------------------------------------------------
-# Manifest amendment workflow (opt-in)
+# Manifest amendment workflow (on by default; set enabled: false to opt out)
 # ---------------------------------------------------------------------------
 manifest_amendment:
-  enabled: false
+  enabled: true
   allowed_reasons:
     - tdd_green_production_fix
   max_requests_per_execution: 1
@@ -237,15 +280,31 @@ manifest_amendment:
 # ---------------------------------------------------------------------------
 task_factory:
   enabled: false
-  # When true, sweep-proposals auto-promotes every produced draft at the
-  # next loop tick. Default false preserves "human reviews every proposal".
-  auto_accept_proposals: false
+  # When true (the default), sweep-proposals auto-promotes every produced
+  # draft at the next loop tick. Set false to make a human review every
+  # proposal. Only takes effect when task_factory.enabled is true.
+  auto_accept_proposals: true
 
 # ---------------------------------------------------------------------------
-# Opt-in validate-backlog rules. Existing rules (1-19) run unconditionally;
-# rules listed here are gated to keep pre-existing backlogs green during
-# rollout. Flip a toggle to true after auditing your backlog's AC / DoD
-# prose for compatibility with the rule.
+# Backlog lifecycle settings (issue #189)
+# ---------------------------------------------------------------------------
+# backlog:
+#   # Status written into '## Status:' of every newly created work-unit file.
+#   # 'draft'    -- task requires explicit human promotion (git push / status
+#   #               set-status <id> in-queue) before the orchestrator picks
+#   #               it up. Use this when you want a human to review every
+#   #               generated work unit before execution begins.
+#   # 'in-queue' -- legacy behaviour; new tasks are immediately eligible for
+#   #               the next orchestrator sweep. This is the default and
+#   #               preserves backwards compatibility for existing workspaces
+#   #               that do not set this key (AC-189-9).
+#   default_status_for_new_work_units: in-queue
+
+# ---------------------------------------------------------------------------
+# validate-backlog rule toggles. Existing rules (1-19) run unconditionally;
+# the rules listed here are individually toggleable. Set a toggle to false
+# to opt out (e.g. when a pre-existing backlog's AC / DoD prose is not yet
+# compatible with the rule).
 # ---------------------------------------------------------------------------
 validate:
   # Rule 20 (issue / spec-coherence): cross-check every Task's Acceptance
@@ -254,7 +313,134 @@ validate:
   # (after path normalisation) emit a validate-backlog error. Use the
   # inline "(ref)" suffix to declare a token a read-only reference and
   # exempt it from the check. See docs/backlog-contract.md.
-  check_orphan_path_tokens: false
+  check_orphan_path_tokens: true
+
+# ---------------------------------------------------------------------------
+# Plugin-skill (spec-to-backlog, create-spec) configuration (issue #221
+# E1-E10). The bundled skills are application-agnostic: by default they
+# operate against the canonical-section list embedded in their SKILL.md
+# prompts. Operators can additionally point them at a workspace-local
+# exemplar for richer wording and shape, plus tune the fan-out and
+# iteration budgets. All fields are optional; absent values fall through
+# to skill-side defaults. See docs/skills/exemplar-reference.md.
+# ---------------------------------------------------------------------------
+skills:
+  # Optional workspace-relative or absolute path to a representative
+  # BACKLOG.md the spec-to-backlog skill consults to internalise the
+  # project's quality bar. Absent => skill uses only the embedded
+  # 15-section list.
+  # exemplar_backlog_path: backlog/_exemplars/representative/BACKLOG.md
+  #
+  # Optional workspace-relative or absolute path to a representative
+  # spec the create-spec skill consults. Absent => skill uses only the
+  # embedded 16-section skeleton.
+  # exemplar_spec_path: spec/_exemplars/representative.md
+  #
+  # When the Epic decomposition yields more than this many leaf tasks,
+  # spec-to-backlog fans the per-task authoring out across one
+  # general-purpose sub-Agent per Feature instead of writing tasks
+  # serially. Default 10.
+  fan_out_threshold: 10
+  #
+  # Maximum self-critique iterations per skill invocation before
+  # emitting a [SKILL_MAX_ITERATIONS_REACHED] audit comment. Default 5.
+  max_iterations: 5
+
+# ---------------------------------------------------------------------------
+# Per-agent model overrides (ADR-25). Every field defaults to null -- the
+# agent runs on the model declared in its .md frontmatter. Operators set
+# these to manage Sonnet / Opus / Bedrock quota independently when a launch's
+# quota envelope is uneven (e.g. opus tokens left, sonnet exhausted).
+#
+# When use_bedrock: false (this file's default), values may be short names
+# ("opus", "sonnet") or full Anthropic API ids ("claude-opus-4-7").
+# When use_bedrock: true, values must be full Bedrock ARNs
+# ("us.anthropic.claude-opus-4-7-v1"). Mismatches fail fast at config-load.
+#
+# HAIKU IS REJECTED AT CONFIG-LOAD (caylent-solutions/devbench#198).
+# Under load the Claude Agent SDK was observed to silently drop the Agent
+# tool from haiku's tool list mid-orchestration, breaking parallel sub-agent
+# dispatch and forcing the orchestrator to classify work units as
+# RUNTIME_DEGRADATION. Any value containing "haiku" -- short name, full
+# Anthropic id, or Bedrock ARN -- raises a ValueError at config-load.
+# Use "sonnet" or "opus" for every work agent.
+#
+# DEVBENCH_AGENT_MODEL_<NAME> env vars override this block per-call
+# (precedence: env > yaml > frontmatter). See:
+#   docs/adr/25-per-agent-model-overrides.md
+#   docs/llm-authentication.md#per-agent-model-overrides-quota-management
+# ---------------------------------------------------------------------------
+# Each field below is set to the agent's current .md frontmatter default.
+# The defaults are tuned by the role each agent plays:
+#   - executor (writes code under TDD): sonnet -- keeps the happy-path
+#     loop fast.
+#   - All five judges (code-reviewer, test-reviewer, doc-reviewer,
+#     changes-manifest, security-reviewer): opus -- a bad verdict costs
+#     more than the inference savings; judges fire only after the
+#     executor finishes a task.
+#   - blocker-resolver, manifest-amender, task-factory (workflow /
+#     recovery reasoning): opus -- judgment-heavy and fire only on the
+#     unhappy paths, so cost is bounded.
+#   - review-supervisor: sonnet -- fan-out coordinator (spawns the
+#     five judges in parallel and merges their JSON verdicts). Haiku was
+#     tried and dropped (caylent-solutions/devbench#198): under load the
+#     SDK silently removed the Agent tool from haiku's tool list, breaking
+#     parallel review_team dispatch. Haiku is now rejected at config-load.
+# Uncomment + edit individual fields to retarget; absent fields stay at
+# their frontmatter default. Writing the same value as the frontmatter
+# default is a no-op.
+# agents:
+#   executor: sonnet
+#   blocker_resolver: opus
+#   manifest_amender: opus
+#   security_reviewer: opus
+#   task_factory: opus
+#   review_supervisor: sonnet
+#   review_team:
+#     code_reviewer: opus
+#     test_reviewer: opus
+#     doc_reviewer: opus
+#     changes_manifest: opus
+
+# ---------------------------------------------------------------------------
+# Operator-facing notifications (PR #202).
+# ---------------------------------------------------------------------------
+# Per-event toggles for lifecycle pings.  Each notification endpoint
+# (Slack today; Discord / Teams / etc. later) lives in its own nested
+# sub-block under notifications:.  Webhook URLs are credentials -- the
+# recommended pattern is to leave them ``null`` here and provide them
+# via env vars (`DEVBENCH_NOTIFICATIONS_SLACK_WEBHOOK_URL`) so they
+# never get committed.  Every Slack payload carries a `<!here>` mention
+# so the same message works whether the webhook is bound to a one-person
+# private DM channel or a shared team channel.  See
+# docs/slack-notifications.md for the full operator walkthrough.
+# notifications:
+#   enabled: false                         # master switch; flip to true to opt in
+#   timeout_seconds: 10                    # per-POST HTTP timeout
+#   events:
+#     work_unit_done: false                # task transitions to done
+#     # The next seven toggles correspond to the seven blocked-task classes
+#     # (BlockedTaskState).  Each fires when a task transitions INTO that
+#     # class (initial entry or reclassification).  Idempotent per (task ×
+#     # class); exiting and re-entering the class re-fires.  See
+#     # docs/slack-notifications.md for the per-class semantics.
+#     work_unit_blocked_operator: false              # OPERATOR_ACTION_REQUIRED
+#     work_unit_blocked_runtime_degradation: false   # RUNTIME_DEGRADATION (SDK Agent-tool loss; needs `make start` restart)
+#     work_unit_blocked_held: false                  # HELD (status is `hold`)
+#     work_unit_blocked_on_held: false               # BLOCKED_ON_HELD (marker target is `hold`)
+#     work_unit_blocked_auto_clearing: false         # AUTO_CLEARING_VIA_PROPOSAL (cascade in flight)
+#     work_unit_blocked_awaiting_dependency: false   # AWAITING_DEPENDENCY (regular dep still in flight)
+#     work_unit_blocked_amendment_recovery: false    # AWAITING_AMENDMENT_RECOVERY (recovery signal on disk)
+#     work_unit_materialised: false        # draft WU file written from a proposal
+#     work_unit_promoted: false            # draft WU promoted to in-queue
+#     pr_opened: false                     # `gh pr create` succeeded
+#     pr_merged: false                     # `gh pr merge` succeeded
+#     ci_failure: false                    # CI run on a WU PR failed
+#     orchestrator_stop: false             # orchestrator loop exited (clean / drain / SIGTERM / crash)
+#     orchestrator_auto_restart: false     # exit 42 -> Makefile loop restarting
+#   slack:
+#     enabled: false                       # endpoint-level toggle; flip to true to enable Slack POSTs
+#     webhook_url: null                    # https://hooks.slack.com/services/T.../B.../... (or via env)
 
 # ---------------------------------------------------------------------------
 # Diagnostic-tuning knobs (set only when investigating a specific cadence

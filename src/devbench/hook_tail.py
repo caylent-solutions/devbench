@@ -292,7 +292,7 @@ class FollowOptions:
     # Phase 11 (E230): when set, hook-tail emits ONLY events whose
     # ``orchestrator_session`` field equals this value. Enables the
     # orchestrator pane to filter out tool calls fired by side-pane
-    # Claude sessions sharing the same JUDGE_WORKSPACE_ROOT.
+    # Claude sessions sharing the same DEVBENCH_WORKSPACE_ROOT.
     orchestrator_session_id: str | None = None
 
 

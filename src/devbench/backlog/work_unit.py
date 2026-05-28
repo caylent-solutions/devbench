@@ -12,6 +12,7 @@ from enum import Enum
 from pathlib import Path
 
 from devbench.constants import COMMENT_ENTRY_TEMPLATE, COMMENTS_SECTION_HEADER, EM_DASH, STATUS_LINE_RE
+from devbench.utils.io import atomic_write_text
 
 
 def validate_manifest_paths(paths: list[str], checkout_directories: list[str]) -> None:
@@ -51,6 +52,7 @@ def validate_manifest_paths(paths: list[str], checkout_directories: list[str]) -
 class WorkUnitStatus(Enum):
     """Lifecycle status of a work unit."""
 
+    DRAFT = "Draft"
     IN_QUEUE = "In Queue"
     IN_PROGRESS = "In Progress"
     IN_REVIEW = "In Review"
@@ -135,7 +137,7 @@ class WorkUnit:
             raise ValueError(f"Could not find '## Status: ...' line in {self.file_path}")
 
         updated = STATUS_LINE_RE.sub(rf"\g<1>{new_status.value}", content, count=1)
-        self.file_path.write_text(updated)
+        atomic_write_text(self.file_path, updated)
         self.status = new_status
 
     def log_comment(self, agent_id: str, action: str, message: str) -> None:
@@ -159,4 +161,4 @@ class WorkUnit:
         else:
             content = content.rstrip("\n") + "\n\n" + comments_header + "\n\n" + entry
 
-        self.file_path.write_text(content)
+        atomic_write_text(self.file_path, content)

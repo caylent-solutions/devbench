@@ -40,7 +40,7 @@ See docs/faq.md and docs/adr/05-declined-status.md for the full semantics.
 ### Definition of Ready
 
 - [ ] All dependency work units are `done`
-- [ ] Target repository is cloned and accessible at `{JUDGE_WORKSPACE_ROOT}/{repo_short}`
+- [ ] Target repository is cloned and accessible at `{DEVBENCH_WORKSPACE_ROOT}/{repo_short}`
 - [ ] All prerequisite tools are installed (`uv`, `ruff`, `pytest`)
 - [ ] The branch `backlog/{id_lower}` does not already exist (or is from a prior attempt)
 - [ ] The spec and acceptance criteria are unambiguous -- no open questions

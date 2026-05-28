@@ -40,21 +40,21 @@ backlog/
 Only task files (`*-T[n].md`) are implemented by agents. Epic, feature, and story files track
 rollup status only.
 
-### Workspace layout (what `JUDGE_WORKSPACE_ROOT` points at)
+### Workspace layout (what `DEVBENCH_WORKSPACE_ROOT` points at)
 
-`JUDGE_WORKSPACE_ROOT` is the **parent directory** that contains `backlog/`, `BACKLOG.md`, and the target repos as siblings. The loader (`src/devbench/config.py`) resolves:
+`DEVBENCH_WORKSPACE_ROOT` is the **parent directory** that contains `backlog/`, `BACKLOG.md`, and the target repos as siblings. The loader (`src/devbench/config.py`) resolves:
 
-- `<JUDGE_WORKSPACE_ROOT>/BACKLOG.md` -- the master index (mandatory at this exact path).
-- `<JUDGE_WORKSPACE_ROOT>/backlog/config/devbench.yaml` -- the per-workspace config (mandatory).
-- `<JUDGE_WORKSPACE_ROOT>/backlog/<epic>/<feature>/<story>/*.md` -- work-unit specs.
-- `<JUDGE_WORKSPACE_ROOT>/<repo-name>/` -- each target repo, as a sibling of `backlog/`.
+- `<DEVBENCH_WORKSPACE_ROOT>/BACKLOG.md` -- the master index (mandatory at this exact path).
+- `<DEVBENCH_WORKSPACE_ROOT>/backlog/config/devbench.yaml` -- the per-workspace config (mandatory).
+- `<DEVBENCH_WORKSPACE_ROOT>/backlog/<epic>/<feature>/<story>/*.md` -- work-unit specs.
+- `<DEVBENCH_WORKSPACE_ROOT>/<repo-name>/` -- each target repo, as a sibling of `backlog/`.
 
-So `JUDGE_WORKSPACE_ROOT` is **not** the backlog repo itself; it is the *parent* directory you place the backlog inside. Pointing it at the backlog repo (so `BACKLOG.md` ends up at `<backlog-repo>/BACKLOG.md` instead of `<workspace>/BACKLOG.md`) produces a chain of `FileNotFoundError` and orphan-detection failures that all trace back to this misalignment.
+So `DEVBENCH_WORKSPACE_ROOT` is **not** the backlog repo itself; it is the *parent* directory you place the backlog inside. Pointing it at the backlog repo (so `BACKLOG.md` ends up at `<backlog-repo>/BACKLOG.md` instead of `<workspace>/BACKLOG.md`) produces a chain of `FileNotFoundError` and orphan-detection failures that all trace back to this misalignment.
 
 The recommended layout (used by every backlog in `caylent-telemetry-spec/`):
 
 ```
-<JUDGE_WORKSPACE_ROOT>/
+<DEVBENCH_WORKSPACE_ROOT>/
 ├── BACKLOG.md                       ← master index
 ├── backlog/
 │   ├── config/devbench.yaml         ← per-workspace config
@@ -70,14 +70,14 @@ The recommended layout (used by every backlog in `caylent-telemetry-spec/`):
 repos:
   org/my-repo:
     default_branch: main
-    checkout_directory: my-repo      # relative to JUDGE_WORKSPACE_ROOT
+    checkout_directory: my-repo      # relative to DEVBENCH_WORKSPACE_ROOT
 ```
 
 The loader populates `RepoConfig.resolved_checkout_path` (E213) at config-load time so every consumer reads `<workspace>/<checkout_directory>` from the dataclass field instead of re-resolving the path inline.
 
 #### Keeping the backlog in its own git repo
 
-The backlog directory (`backlog/` + `BACKLOG.md`) is typically committed to its own git repo so backlog progress (status changes, TDD logs, judge comments) lands separately from target-repo history. Init the backlog repo at `<JUDGE_WORKSPACE_ROOT>/.git` and add the target-repo sibling directories to `<JUDGE_WORKSPACE_ROOT>/.gitignore` so they don't pollute the backlog history.
+The backlog directory (`backlog/` + `BACKLOG.md`) is typically committed to its own git repo so backlog progress (status changes, TDD logs, judge comments) lands separately from target-repo history. Init the backlog repo at `<DEVBENCH_WORKSPACE_ROOT>/.git` and add the target-repo sibling directories to `<DEVBENCH_WORKSPACE_ROOT>/.gitignore` so they don't pollute the backlog history.
 
 #### Symlinks (optional, for repos outside the workspace)
 
@@ -86,7 +86,7 @@ The choice between a real directory and a symlink at `<workspace>/<repo-name>` i
 When a target repo cannot live as a workspace sibling (a shared workspace under `/workspaces/<workspace>/` with target repos cloned elsewhere on disk), symlink it into place:
 
 ```bash
-ln -s /real/path/to/my-repo $JUDGE_WORKSPACE_ROOT/my-repo
+ln -s /real/path/to/my-repo $DEVBENCH_WORKSPACE_ROOT/my-repo
 ```
 
 The symlink goes at the sibling path (`<workspace>/my-repo`), NOT inside `backlog/` (`<workspace>/backlog/my-repo`). The loader walks the workspace from `<workspace>/<checkout_directory>`; a symlink at that path is transparent. Putting the symlink under `backlog/` makes `_check_orphans` flag it as an orphaned work-unit file.
@@ -99,7 +99,7 @@ Symlinked checkouts are first-class supported across every devbench engine path,
 
 Validation of `backlog/config/devbench.yaml` happens at config load time (before the orchestrator starts), separate from work-unit validation. Notable rules:
 
-- `checkout_directory` must be **relative** to `JUDGE_WORKSPACE_ROOT`. Absolute paths and `..` traversal are rejected -- the loader raises `ValueError` immediately.
+- `checkout_directory` must be **relative** to `DEVBENCH_WORKSPACE_ROOT`. Absolute paths and `..` traversal are rejected -- the loader raises `ValueError` immediately.
 - `git_ops.defer_pr: true` requires `git_ops.single_branch` to be set. Misconfigured combinations raise `ValueError`.
 - `git_ops.local_only: true` requires `git_ops.defer_pr: true` (a local-only repo has no remote to push to, so PR creation is meaningless).
 - `git_ops.local_only: true` is incompatible with `git_ops.pause_before_merge: true` (there is no PR to pause before merging).
@@ -127,6 +127,7 @@ IDs are case-insensitive in status matching but written in uppercase by conventi
 
 | Status | Meaning | Written as | Terminal? |
 |--------|---------|-----------|-----------|
+| Draft | Pre-queue; not yet refined / approved for autonomous claim | `draft` | no |
 | In Queue | Ready to be picked up | `in-queue` | no |
 | In Progress | Agent is implementing | `in-progress` | no |
 | In Review | Staged, awaiting judge review | `in-review` | no |
@@ -135,6 +136,22 @@ IDs are case-insensitive in status matching but written in uppercase by conventi
 | Proposed | Auto-emitted draft awaiting human promote / reject | `proposed` | no |
 | Declined | Will never be done; final operator decision | `declined` | yes |
 | Hold | Deferred / under debate; orchestrator skips it until `unhold` | `hold` | no |
+
+> **Note:** `draft` is the agile-standard term for items not yet refined / approved for autonomous claim. A work unit in `draft` is visible in the backlog but is never picked up by the orchestrator. Use `devbench promote <id>` to transition a `draft` unit to `in-queue` when it is ready for autonomous execution.
+
+### Work unit lifecycle
+
+The canonical happy-path lifecycle is:
+
+```
+draft -> in-queue -> in-progress -> in-review -> done
+```
+
+Side branches (all non-terminal unless noted):
+
+- `in-queue` / `in-progress` / `in-review` --> `blocked` (max retries exhausted or dep blocked; non-terminal)
+- `in-queue` / `in-progress` --> `hold` (operator-deferred; non-terminal)
+- `in-queue` / `in-progress` / `blocked` --> `declined` (operator decision; terminal)
 
 A status is *terminal* when a parent's auto-rollup treats it as complete. `done` and `declined` are terminal; `hold` is **not** -- a held child keeps its parent open. This guarantees that pausing a unit cannot accidentally close out its parent.
 
@@ -165,9 +182,9 @@ Every backlog must pass `devbench validate-backlog`. The full rule set is enforc
 17. Dependency-ID format (every `## Dependencies` row's first cell matches `E[A-Z0-9]+(-F\d+)?(-S\d+)?(-T\d+)?`)
 18. Branch uniqueness (no two Tasks derive the same branch name; skipped under single-PR mode)
 19. No placeholder Manifest rows (no active Task -- `in-queue` / `in-progress` / `blocked` -- carries a `TBD` row in its Changes Manifest; terminal statuses are skipped)
-20. No orphan path tokens in AC / DoD (gated by `validate.check_orphan_path_tokens` -- default off; opt in per workspace)
+20. No orphan path tokens in AC / DoD (gated by `validate.check_orphan_path_tokens` -- default on; set `false` to opt out per workspace)
 
-Rules 15-17 were added by E209 to harden the contract; rule 18 was added by E219 to prevent silent branch collisions; rule 19 was added by issue #117 to stop the `changes_manifest` reviewer from passing work units whose authors never replaced the canonical placeholder row. Rule 20 was added after a teardown backlog burned an executor cycle on a spec where AC / DoD prose restated a path that disagreed with the Changes Manifest; it gates on a per-workspace toggle so existing backlogs see no behaviour change until they opt in. Together they catch hand-edited drift that the runtime parser would later silently survive.
+Rules 15-17 were added by E209 to harden the contract; rule 18 was added by E219 to prevent silent branch collisions; rule 19 was added by issue #117 to stop the `changes_manifest` reviewer from passing work units whose authors never replaced the canonical placeholder row. Rule 20 was added after a teardown backlog burned an executor cycle on a spec where AC / DoD prose restated a path that disagreed with the Changes Manifest; it is on by default (set `validate.check_orphan_path_tokens: false` to opt a workspace out). Together they catch hand-edited drift that the runtime parser would later silently survive.
 
 #### No Placeholder Rows Rule (issue #117)
 
@@ -256,7 +273,7 @@ Below the Status Summary, one row per work unit:
 > cell count) is rejected by `validate-backlog` as a Rule-0 error and causes
 > `devbench report` to exit non-zero with a parse-error diagnostic.
 
-The `File Path` column must be a path relative to `JUDGE_WORKSPACE_ROOT`. `validate-backlog` verifies each file exists at that path.
+The `File Path` column must be a path relative to `DEVBENCH_WORKSPACE_ROOT`. `validate-backlog` verifies each file exists at that path.
 
 ---
 
@@ -299,6 +316,85 @@ All sections below are required unless noted as optional.
 | `src/foo/bar.py` | New -- description |
 | `tests/test_bar.py` | New -- unit tests |
 | `README.md` | Updated -- architecture section |
+
+#### Manifest Glob Rejection (issue #221 B4)
+
+The validator rejects any Changes Manifest entry that contains ``*`` or
+``**`` (glob patterns). Manifest paths must be concrete file paths so
+that ``manifest_conflict`` detection, source-test atomicity, and the
+``changes_manifest`` judge all operate on real, comparable values.
+
+Tasks whose actual file list is determined at execution time (e.g.,
+"fix every error-message drift between source and fixture") have two
+alternatives:
+
+1. **Use a sentinel value** (see "Sentinel Manifest Values" below).
+   For example, ``<source-drift-fix-targets-determined-at-execution>``
+   declares the Manifest intentionally non-concrete; the orchestrator's
+   ``manifest_amendment`` workflow concretises it at runtime.
+2. **List the canonical candidate files**. Enumerate the files most
+   likely to need modification. Mark each ``Update (conditional on
+   T1/T2 outcome)``. The executor stages only the files actually
+   modified.
+
+Glob rejection emits an error like:
+
+```
+EX-F1-S1-T1: Manifest entry 'src/**/*.py' contains a glob pattern.
+Manifest paths must be concrete; for execution-determined file lists,
+use a sentinel value (e.g.,
+`<source-drift-fix-targets-determined-at-execution>`) and amend the
+Manifest at runtime via `manifest_amendment`.
+```
+
+#### Status Summary count semantics (issue #221 B6 clarification)
+
+The Status Summary table has one row per Epic and one column per status
+value. Each cell counts the number of work units **of any type**
+(Epic, Feature, Story, Task) in that Epic that currently hold that
+status. The "In Queue" column is therefore not a leaf-task count -- it
+is the count of all in-queue work units within the Epic's subtree
+(including the Epic itself when its status is in-queue, plus every
+in-queue Feature, Story, and Task).
+
+Worked example: an Epic E1 with status in-queue containing 4 in-queue
+Features, 4 in-queue Stories, and 11 in-queue Tasks contributes 20 to
+the "In Queue" column (1 + 4 + 4 + 11). When the Epic transitions to
+in-progress, that 20 decomposes: 1 to "In Progress", 19 to "In Queue".
+
+Authors building BACKLOG.md by hand often miscount by listing only
+leaf Tasks. The validator emits "Status Summary mismatch for E\<N\>:
+expected in-queue=\<actual\>, got \<author-value\>" to flag the gap.
+
+#### Sentinel Manifest Values (issue #221 B3)
+
+For tasks that produce no concrete file changes -- verification gates,
+decision-only tasks, audit-flip tasks -- the Changes Manifest may use
+one of the accepted sentinel values in place of a real path. Sentinels
+are exempt from the Manifest Conflict Rule, the source-test atomicity
+rule, and the orphan-path-token rule.
+
+Accepted sentinel values (canonical list in
+`src/devbench/backlog/sentinels.py`):
+
+| Sentinel | Semantics |
+|----------|-----------|
+| `<verification-only>` | The task runs a verification step (test, lint, scan) and records evidence in `## Comments`. No source files are modified. |
+| `<decision-only>` | The task makes a decision and records it in `## Comments`. No source files are modified. Typically paired with a follow-up task that executes the decision. |
+| `<no changes>` | The task is a placeholder or audit-flip with no executor work. Rare. |
+| `<no-op>` | The task collapses to a no-op based on prior-task outcomes. Conditional cleanup tasks use this. |
+| `<source-drift-fix-targets-determined-at-execution>` | The task's concrete file list is enumerated at execution time via `manifest_amendment`. Acceptable when the surface depends on diagnostics that haven't run yet. |
+
+Additionally, **any** token shaped as ``<name>`` (single ``<``,
+no whitespace, single ``>``) is treated as a sentinel by the
+``SENTINEL_PATTERN`` regex in ``sentinels.py``. This lets operators
+introduce per-task variants like ``<verification-only:E15-F5-S1-T2>``
+without round-tripping through the validator. Use the explicit
+allowlist when possible; the pattern is a fallback for ad-hoc cases.
+
+When a task uses a sentinel Manifest, the orchestrator's
+``manifest_amendment`` workflow can replace it with concrete paths
+mid-execution if real changes turn out to be required.
 
 ## Definition of Done
 

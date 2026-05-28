@@ -6,6 +6,9 @@ module instead of embedding literals inline.
 
 Operational parameters that vary by environment (timeouts, thresholds, paths)
 live in ``config.py`` with environment-variable overrides.
+
+Session-management constants (SESSION_*) are defined in the session-management
+region below and consumed by ``src/devbench/session.py``.
 """
 
 import re
@@ -17,8 +20,8 @@ COMMENTS_SECTION_HEADER: str = "## Comments"
 STATUS_SECTION_PREFIX: str = "## Status:"
 STATUS_SUMMARY_SECTION_HEADER: str = "## Status Summary"
 STATUS_SUMMARY_TABLE_HEADER: str = (
-    "| Epic | Title | Done | In Progress | In Queue | Blocked | Declined |\n"
-    "|------|-------|------|-------------|----------|---------|----------|\n"
+    "| Epic | Title | Done | In Progress | In Queue | Blocked | Declined | Draft |\n"
+    "|------|-------|------|-------------|----------|---------|----------|-------|\n"
 )
 # Pre-compiled pattern to strip the Status Summary section from BACKLOG.md content.
 # Matches from the header up to (but not including) the next ## heading or end of string.
@@ -120,6 +123,15 @@ LLM_RESPONSE_FORMAT_INSTRUCTIONS: str = (
 # ---------------------------------------------------------------------------
 STATUS_SEPARATOR_WIDTH: int = 40
 
+# Pad width applied to every label in the ``devbench status`` Backlog Status
+# Summary so count values right-align to a single column regardless of label
+# length.  The current longest label is ``Blocked (amendment-recovery)`` /
+# ``Blocked (runtime-degradation)`` (29 chars); the chosen width keeps at
+# least one space between every label and its count and leaves a few chars
+# of headroom for future Blocked sub-bucket labels.  Used by ``cmd_status``
+# in ``src/devbench/cli.py`` (issue #201).
+STATUS_SUMMARY_LABEL_WIDTH: int = 32
+
 # ---------------------------------------------------------------------------
 # Dependency "none" sentinel
 # ---------------------------------------------------------------------------
@@ -144,6 +156,11 @@ STATUS_DECLINED: str = "declined"
 # held children as complete; an operator must explicitly unhold to
 # return the unit to the in-queue lifecycle.
 STATUS_HOLD: str = "hold"
+# Draft units are pre-queue planning artefacts: the spec is authored and
+# reviewed but the unit has not yet been accepted into the execution queue.
+# Unlike declined (terminal) or hold (deferred), draft is a pre-lifecycle
+# state -- the orchestrator's parallel-candidate scan skips draft units.
+STATUS_DRAFT: str = "draft"
 
 # Ordered mapping from any accepted input form to the canonical write form.
 # Used by BacklogManager._set_status() for validation and normalisation.
@@ -156,6 +173,7 @@ VALID_STATUSES: dict[str, str] = {
     STATUS_PROPOSED: STATUS_PROPOSED,
     STATUS_DECLINED: STATUS_DECLINED,
     STATUS_HOLD: STATUS_HOLD,
+    STATUS_DRAFT: STATUS_DRAFT,
 }
 
 # ---------------------------------------------------------------------------
@@ -200,7 +218,7 @@ ALL_REQUIRED_JUDGE_NAMES: frozenset[str] = REVIEW_JUDGE_NAMES | SECURITY_JUDGE_N
 # ``log-verdict``. They are NOT counted by the done-gate's
 # ``_last_round_all_passed`` (only ``ALL_REQUIRED_JUDGE_NAMES`` is); the
 # entries land in the work-unit Comments section as audit metadata.
-# Mirrored in ``plugin/devbench/scripts/guard-verdict-format.sh``'s
+# Mirrored in ``plugin/devbench-orchestrate/scripts/guard-verdict-format.sh``'s
 # ``KNOWN_JUDGES`` array; both lists must stay in sync.
 WORKFLOW_AGENT_JUDGE_NAMES: frozenset[str] = frozenset(
     {
@@ -346,14 +364,158 @@ DEFAULT_PR_REVIEW_DECISION_BLOCKS: bool = True
 # a no-op for repos without review bots. Override via
 # ``JUDGE_PR_REVIEW_AGENTS`` (e.g. ``github-copilot[bot],amazon-q-developer[bot]``).
 DEFAULT_PR_REVIEW_AGENTS: tuple[str, ...] = ()
-DEFAULT_TOKEN_COST_PER_M_INPUT: float = 5.0
-DEFAULT_TOKEN_COST_PER_M_OUTPUT: float = 25.0
+# ---------------------------------------------------------------------------
+# Per-model token pricing (issue #223). Each model id maps to a ``ModelRates``
+# carrying the four scalar rates that devbench charges against. The cache
+# multipliers + correction_factor are optional per-model overrides; when None
+# the report falls back to the top-level ``ReportConfig`` multipliers.
+#
+# The legacy scalar fields (``DEFAULT_TOKEN_COST_PER_M_INPUT`` /
+# ``DEFAULT_TOKEN_COST_PER_M_OUTPUT`` / ``DEFAULT_TOKEN_COST_DISCOUNT``) were
+# removed in the same commit per CLAUDE.md "Complete Replacement of
+# Superseded Code". Existing workspaces that set the old keys get a clear
+# fail-fast error at config-load time pointing at the new ``report.models``
+# block; see ``docs/model-pricing.md``.
+# ---------------------------------------------------------------------------
 
-# Token-cost discount (contract / correction factor off list price). See
-# ``devbench.config.TOKEN_COST_DISCOUNT`` and ``docs/model-pricing.md``.
-# final_cost = raw_list_cost * (1 - token_cost_discount). Default 0.0 =
-# no discount (pay full list), preserving pre-feature behaviour.
-DEFAULT_TOKEN_COST_DISCOUNT: float = 0.0
+
+def _opt_float(value: float | None) -> float | None:
+    """Return ``float(value)`` when ``value`` is not None, else ``None``.
+
+    Helper for ``ModelRates.__init__``: keeps the per-multiplier "unset"
+    sentinel intact (so the runtime falls back to the top-level
+    ``ReportConfig`` defaults) while still coercing JSON / YAML ints to
+    float for the arithmetic path.
+    """
+    return None if value is None else float(value)
+
+
+class ModelRates:
+    """Per-model cost rates (issue #223).
+
+    The four scalar fields are the canonical Anthropic-published rates
+    expressed in USD per 1M tokens (input + output) and as multipliers
+    relative to ``input`` (cache read / write 5min / write 1hr). All cache
+    multiplier fields are optional -- when None the per-window report falls
+    back to the top-level ``ReportConfig`` defaults so operators on
+    standard Anthropic pricing only need to override the two scalar rates.
+
+    ``correction_factor`` is the per-model contract correction; defaults to
+    1.0 (no correction). Computed cost is multiplied by this value AFTER
+    all other factors so operators can tune individual models without
+    distorting cost for other models in a multi-model run.
+
+    The class is a plain attribute container (not a frozen dataclass) so
+    ``cli.py::cmd_cost_calibrate`` can construct mutated copies via
+    ``replace``-style helpers without dataclass plumbing.
+    """
+
+    __slots__ = (
+        "cache_read_multiplier",
+        "cache_write_1hr_multiplier",
+        "cache_write_5min_multiplier",
+        "correction_factor",
+        "input",
+        "output",
+    )
+
+    def __init__(self, **kwargs: float | None) -> None:
+        # **kwargs (rather than named ``input=``/``output=``) so the
+        # attribute names match the YAML keys verbatim without shadowing
+        # the builtin ``input()`` in this scope.  Callers always pass
+        # keyword arguments (``ModelRates(input=5.0, output=25.0)``); the
+        # init validates required keys and rejects unknown ones so type
+        # safety is preserved at the boundary.  ``float | None`` covers
+        # both the required scalar fields (always float) and the optional
+        # multiplier fields (None when unset).
+        allowed = {
+            "input",
+            "output",
+            "cache_read_multiplier",
+            "cache_write_5min_multiplier",
+            "cache_write_1hr_multiplier",
+            "correction_factor",
+        }
+        unknown = set(kwargs) - allowed
+        if unknown:
+            raise TypeError(f"ModelRates got unexpected keyword argument(s): {sorted(unknown)}")
+        for required in ("input", "output"):
+            if kwargs.get(required) is None:
+                raise TypeError(f"ModelRates requires keyword arguments 'input' and 'output'; missing {required!r}")
+        # All four numeric inputs may already be float; the float(...) cast
+        # ensures ints coming through JSON or YAML are normalised to the
+        # arithmetic domain ``_compute_cost`` expects.  The conditional
+        # ``None`` preserves the "unset" sentinel on the optional fields.
+        self.input = float(kwargs["input"] or 0.0)
+        self.output = float(kwargs["output"] or 0.0)
+        self.cache_read_multiplier = _opt_float(kwargs.get("cache_read_multiplier"))
+        self.cache_write_5min_multiplier = _opt_float(kwargs.get("cache_write_5min_multiplier"))
+        self.cache_write_1hr_multiplier = _opt_float(kwargs.get("cache_write_1hr_multiplier"))
+        self.correction_factor = float(kwargs.get("correction_factor") or 1.0)
+
+    def __repr__(self) -> str:
+        return (
+            f"ModelRates(input={self.input}, output={self.output}, "
+            f"cache_read_multiplier={self.cache_read_multiplier}, "
+            f"cache_write_5min_multiplier={self.cache_write_5min_multiplier}, "
+            f"cache_write_1hr_multiplier={self.cache_write_1hr_multiplier}, "
+            f"correction_factor={self.correction_factor})"
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, ModelRates):
+            return NotImplemented
+        return (
+            self.input == other.input
+            and self.output == other.output
+            and self.cache_read_multiplier == other.cache_read_multiplier
+            and self.cache_write_5min_multiplier == other.cache_write_5min_multiplier
+            and self.cache_write_1hr_multiplier == other.cache_write_1hr_multiplier
+            and self.correction_factor == other.correction_factor
+        )
+
+    def __hash__(self) -> int:
+        return hash(
+            (
+                self.input,
+                self.output,
+                self.cache_read_multiplier,
+                self.cache_write_5min_multiplier,
+                self.cache_write_1hr_multiplier,
+                self.correction_factor,
+            )
+        )
+
+
+# Default per-model rates table -- single source of truth.  Lifted verbatim
+# from ``docs/model-pricing.md`` Standard pricing table.  Operators who
+# leave ``report.models`` absent get this table plus DEFAULT_FALLBACK_MODEL_RATES
+# for any model id observed at runtime that isn't in the table (sentinel key
+# ``"<unknown>"``).
+#
+# Keys match the literal ``model`` strings emitted by Claude Code in the
+# transcript ``message.model`` field (e.g. ``claude-opus-4-7``, NOT
+# ``us.anthropic.claude-opus-4-7-v1``).
+DEFAULT_MODEL_RATES: dict[str, ModelRates] = {
+    "claude-opus-4-7": ModelRates(input=5.0, output=25.0),
+    "claude-opus-4-6": ModelRates(input=5.0, output=25.0),
+    "claude-opus-4-5": ModelRates(input=5.0, output=25.0),
+    "claude-opus-4-1": ModelRates(input=15.0, output=75.0),
+    "claude-opus-4": ModelRates(input=15.0, output=75.0),
+    "claude-sonnet-4-6": ModelRates(input=3.0, output=15.0),
+    "claude-sonnet-4-5": ModelRates(input=3.0, output=15.0),
+    "claude-sonnet-4": ModelRates(input=3.0, output=15.0),
+    "claude-haiku-4-5": ModelRates(input=1.0, output=5.0),
+    "claude-haiku-3-5": ModelRates(input=0.80, output=4.0),
+    "claude-haiku-3": ModelRates(input=0.25, output=1.25),
+}
+
+# Rates applied to the ``"<unknown>"`` aggregation bucket: any transcript
+# message whose ``model`` field is missing, or any model id that does not
+# appear in the loaded ``report.models`` table. Default mirrors Opus 4.7 list
+# so devbench errs on the conservative (over-report) side -- under-reporting
+# is the operator-pain failure mode #223 is filed against.
+DEFAULT_FALLBACK_MODEL_RATES: ModelRates = ModelRates(input=5.0, output=25.0)
 
 # Em-dash (U+2014). Prohibited in work-unit markdown files by the
 # validate-backlog Check 10 (manager.py). Any CLI writer that accepts
@@ -419,12 +581,30 @@ FINALIZE_PR_TITLE_TEMPLATE: str = "feat: {branch}"
 # ---------------------------------------------------------------------------
 # Plugin path (relative to package root)
 # ---------------------------------------------------------------------------
-DEFAULT_PLUGIN_SUBPATH: str = "plugin/devbench"
+DEFAULT_PLUGIN_SUBPATH: str = "plugin/devbench-orchestrate"
 
 # ---------------------------------------------------------------------------
 # Subprocess error exit code (Unix convention for command-not-found / timeout)
 # ---------------------------------------------------------------------------
 SUBPROCESS_ERROR_EXIT_CODE: int = 127
+
+# Exit code emitted by ``cmd_start`` when the orchestrator's SDK subprocess
+# exited via ``NO_ACTIONABLE`` purely because every remaining blocker
+# classifies as ``BlockedTaskState.RUNTIME_DEGRADATION`` (the SDK lost
+# Agent-tool access mid-session, recoverable by a fresh subprocess) and
+# there are zero IN_PROGRESS / IN_REVIEW tasks and zero
+# OPERATOR_ACTION_REQUIRED blockers. The wrapping ``make start`` loop
+# treats this code as "auto-restart" up to ``DEVBENCH_MAX_AUTO_RESTARTS``
+# times. Any other exit (0 = clean, anything-else = real failure) is
+# passed through unchanged.
+ORCHESTRATOR_RESTART_EXIT_CODE: int = 42
+
+# Audit-log template written to ``logs/orchestrator.log`` when
+# ``cmd_start`` triggers an auto-restart. The token + task-id list let
+# operators grep history for restart frequency without parsing
+# free-form prose. Format: ``[ORCHESTRATOR_AUTO_RESTART]
+# reason=runtime_degradation tasks=<id1,id2,...>``.
+ORCHESTRATOR_AUTO_RESTART_AUDIT_PREFIX: str = "[ORCHESTRATOR_AUTO_RESTART] reason=runtime_degradation tasks="
 
 # ---------------------------------------------------------------------------
 # Token arithmetic
@@ -498,3 +678,138 @@ PERCENT_MULTIPLIER: int = 100
 # by "|" produces 9 cells (empty leading cell + 7 data + empty trailing cell).
 # ---------------------------------------------------------------------------
 BACKLOG_INDEX_CELL_COUNT: int = 9
+
+# ---------------------------------------------------------------------------
+# Per-agent model overrides (Option A shadow-plugin-dir, ADR-25)
+# ---------------------------------------------------------------------------
+# Workspace-relative directory holding the materialised shadow plugin tree.
+# When operators set ``agents.<name>: <model>`` in ``devbench.yaml`` the
+# canonical marketplace plugin cannot be edited; instead, a shadow tree is
+# built under ``<workspace>/<PLUGIN_SHADOW_DIR_NAME>/devbench/`` that mirrors
+# the canonical via symlinks for every file except the overridden agent .md
+# files. ``cmd_start`` and ``devbench prepare-plugin-shadow`` both point the
+# Claude Agent SDK / ``claude --plugin-dir`` at this path so non-interactive
+# and interactive modes share one mechanism.
+PLUGIN_SHADOW_DIR_NAME: str = ".devbench/plugin-shadow"
+
+# Filename of the PID sentinel written by ``cmd_start`` inside the shadow
+# plugin tree at ``<workspace>/<PLUGIN_SHADOW_DIR_NAME>/devbench/<filename>``.
+# The sentinel records the orchestrator PID that owns the materialised tree;
+# ``clear_shadow_plugin`` refuses to delete the tree while the recorded PID
+# is alive (raising ``RuntimeError``) so a concurrent ``devbench
+# prepare-plugin-shadow`` invocation cannot clear a running orchestrator's
+# plugin files out from under it. Lives inside the tree so ``rmtree`` of
+# the tree removes the sentinel atomically when a clean rebuild is allowed.
+SHADOW_PID_SENTINEL_FILENAME: str = ".pid"
+
+# Short-name model aliases accepted in ``agents.*`` YAML values when
+# ``use_bedrock: false``. Mirrors the convenience short forms the Anthropic
+# SDK accepts.
+ALLOWED_AGENT_MODEL_SHORT_NAMES: frozenset[str] = frozenset({"opus", "sonnet"})
+
+# Full Anthropic model id pattern (``claude-opus-4-7``, ``claude-sonnet-4-6``,
+# ``claude-sonnet-4-6-20250514``). Accepted when ``use_bedrock: false``.
+# Note: ids containing ``haiku`` are rejected by ``validate_agent_model_value()``
+# even though they would otherwise match this pattern.
+ANTHROPIC_AGENT_MODEL_PATTERN: re.Pattern[str] = re.compile(r"^claude-[a-z0-9]+(-[a-z0-9]+)+$")
+
+# AWS Bedrock model id pattern (``us.anthropic.claude-opus-4-7-v1``). Accepted
+# only when ``use_bedrock: true``; rejected otherwise.
+BEDROCK_AGENT_MODEL_PATTERN: re.Pattern[str] = re.compile(r"^us\.anthropic\.claude-[a-z0-9-]+-v[0-9]+$")
+
+# ---------------------------------------------------------------------------
+# Session-management constants (spec 4.4.1 named sessions, issue #192)
+# Consumed exclusively by ``src/devbench/session.py``; defined here so no
+# literal values appear inline in that module.
+# ---------------------------------------------------------------------------
+# Workspace-relative path to the base directory holding all session state dirs.
+# Full path is ``<workspace_root>/<SESSION_SESSIONS_BASE_DIR>``.
+# Consumed by ``src/devbench/log_setup.py`` (per-session log routing) and
+# ``src/devbench/session.py`` (registry and per-session state directories).
+SESSION_SESSIONS_BASE_DIR: str = ".devbench/sessions"
+
+# Workspace-relative path to the session registry JSON file.
+# Full path is ``<workspace_root>/<SESSION_REGISTRY_PATH>``.
+SESSION_REGISTRY_PATH: str = ".devbench/sessions/registry.json"
+
+# Filename of the exclusive flock file created under ``<workspace_root>/.devbench/``.
+# Full path is ``<workspace_root>/.devbench/<SESSION_BACKLOG_LOCK_NAME>``.
+SESSION_BACKLOG_LOCK_NAME: str = "BACKLOG.lock"
+
+# Default timeout in seconds for acquiring the BACKLOG.lock via ``fcntl.flock``.
+# Raises ``TimeoutError`` when the lock cannot be acquired within this window.
+SESSION_DEFAULT_FLOCK_TIMEOUT_SECONDS: int = 30
+
+# Filename of the PID file written inside each session's state directory
+# (``<workspace_root>/.devbench/sessions/<name>/<SESSION_PID_FILENAME>``).
+SESSION_PID_FILENAME: str = "pid"
+
+# Suffix appended to the registry JSON path for the intermediate temp file
+# used during atomic registry writes (write-then-rename pattern).
+SESSION_REGISTRY_TMP_SUFFIX: str = ".tmp"
+
+# Default session name used when --name is not supplied to ``cmd_start``.
+# Consumed by ``src/devbench/session.py`` and ``cmd_start``; defined here so
+# no literal strings appear inline in those modules.
+SESSION_DEFAULT_NAME: str = "default"
+
+# Filename written inside a session's state directory to record the ISO-8601
+# timestamp at which the session was started.
+# Full path: ``<workspace_root>/.devbench/sessions/<name>/<SESSION_STARTED_AT_FILENAME>``.
+SESSION_STARTED_AT_FILENAME: str = "started_at"
+
+# Filename written inside a session's state directory to record the identity
+# (username / process tag) of the agent that started the session.
+# Full path: ``<workspace_root>/.devbench/sessions/<name>/<SESSION_STARTED_BY_FILENAME>``.
+SESSION_STARTED_BY_FILENAME: str = "started_by"
+
+# Poll interval (seconds) between non-blocking flock attempts in
+# :func:`devbench.session.flock_backlog`.  A sub-second value keeps the
+# effective wait latency low without busy-spinning.  Callers use
+# ``min(SESSION_FLOCK_POLL_INTERVAL_SECONDS, remaining)`` so the deadline is
+# never overshot.  Override via ``DEVBENCH_SESSION_FLOCK_POLL_INTERVAL``
+# env var if the default 0.1 s is too coarse or too fine for a given deployment.
+SESSION_FLOCK_POLL_INTERVAL_SECONDS: float = 0.1
+
+# Filename of the drain signal file written inside a per-session state directory.
+# Full path: ``<workspace_root>/.devbench/sessions/<name>/<SESSION_DRAIN_SIGNAL_FILENAME>``.
+# Consumed by ``src/devbench/drain.py`` (resolve_drain_signal_path) and
+# ``src/devbench/cli.py`` (_session_drain_state_str).
+SESSION_DRAIN_SIGNAL_FILENAME: str = "drain.signal"
+
+# Relative path (from workspace root) of the orchestrator restart marker
+# file written by ``cmd_start`` on every startup.  Issue #215: bounds the
+# audit-row scan window in
+# ``devbench.backlog.proposal._has_runtime_degradation_signal`` so RUNTIME_DEGRADATION
+# classification clears on operator-driven restart.  The file contains a
+# single ISO 8601 UTC timestamp string.
+LAST_RESTART_MARKER_PATH: str = ".devbench/last-restart"
+
+# ---------------------------------------------------------------------------
+# Bounded skill iterate-until-perfect mechanism (spec section 4.6.0, issue #204)
+# The four onboarding skills (create-spec, spec-to-backlog, bootstrap-environment,
+# configure-devbench) each run a bounded self-critique loop. Iteration state is
+# persisted per skill so a max-iterations exhaustion is observable as an audit
+# row rather than buried in skill prose. Consumed by ``src/devbench/skill_state.py``
+# and the four SKILL.md files in ``plugin/devbench-orchestrate/skills/``.
+# ---------------------------------------------------------------------------
+
+# Maximum number of self-critique iterations a skill may run before emitting
+# the [SKILL_MAX_ITERATIONS_REACHED] audit row and exiting non-zero.
+SKILL_MAX_ITERATIONS: int = 5
+
+# Quality threshold (count of unresolved items) below which the skill is
+# considered converged. Zero means "no unresolved items".
+SKILL_QUALITY_THRESHOLD: int = 0
+
+# Workspace-relative path to the base directory holding per-skill checkpoint
+# files. Full path: ``<workspace_root>/.devbench/<SKILL_STATE_DIR_NAME>/<skill>.json``.
+SKILL_STATE_DIR_NAME: str = ".devbench/skill-state"
+
+# Audit-row tag emitted when a skill exhausts its iteration budget without
+# reaching SKILL_QUALITY_THRESHOLD. Operator-visible signal that the skill
+# needs human attention.
+SKILL_AUDIT_MAX_ITERATIONS_REACHED: str = "[SKILL_MAX_ITERATIONS_REACHED]"
+
+# Audit-row tag emitted when a skill converges (unresolved count <= threshold).
+SKILL_AUDIT_QUALITY_THRESHOLD_REACHED: str = "[SKILL_QUALITY_THRESHOLD_REACHED]"

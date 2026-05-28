@@ -5,9 +5,13 @@
 # Replace `/path/to/kanon-deps-work` with the absolute path to this workspace
 # (in this workspace: /workspaces/rpm-migration/kanon-deps-work).
 #
-# JUDGE_WORKSPACE_ROOT must point at the directory holding BACKLOG.md (this
-# repo's root). JUDGE_CLAUDE_MODEL pins both judge and executor roles unless
-# overridden in backlog/config/devbench.yaml.
+# DEVBENCH_WORKSPACE_ROOT must point at the directory holding BACKLOG.md (this
+# repo's root). DEVBENCH_CLAUDE_MODEL is the SDK caller's model -- it drives
+# the orchestrate skill's coordination calls. Per-agent work models live in
+# the `agents:` block of backlog/config/devbench.yaml (ADR-25); without an
+# `agents:` block every work agent runs on its plugin .md frontmatter
+# default: executor on sonnet, review-supervisor on sonnet, and the five
+# judges + blocker-resolver + manifest-amender + task-factory on opus.
 
 
 # 1. Non-interactive start
@@ -19,8 +23,8 @@
 #      c. Run review judges + post-checks per work unit,
 #      d. On every-unit-terminal: push the branch, open ONE PR per repo,
 #         watch CI, retry on failure, and auto-merge (squash) on green.
-JUDGE_WORKSPACE_ROOT=/path/to/kanon-deps-work \
-JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_WORKSPACE_ROOT=/path/to/kanon-deps-work \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
 uv run --project /path/to/devbench python -m devbench.cli start
 
 
@@ -30,8 +34,8 @@ uv run --project /path/to/devbench python -m devbench.cli start
 #    process the backlog". Pause with Escape, resume with `Continue`, redirect
 #    with natural-language instructions. State is saved in BACKLOG.md and the
 #    work-unit files between sessions.
-JUDGE_WORKSPACE_ROOT=/path/to/kanon-deps-work \
-JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_WORKSPACE_ROOT=/path/to/kanon-deps-work \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
 claude --dangerously-skip-permissions \
   --plugin-dir /path/to/devbench/plugin/devbench
 
@@ -40,23 +44,55 @@ claude --dangerously-skip-permissions \
 #    Streams a live progress dashboard on TTY (epic-level summary, recent
 #    transitions, judge verdicts, CI status, cost estimate). Use `--once` for
 #    a single snapshot in CI logs.
-JUDGE_WORKSPACE_ROOT=/path/to/kanon-deps-work \
-JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_WORKSPACE_ROOT=/path/to/kanon-deps-work \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
 uv run --project /path/to/devbench devbench report
 
 
 # 4. Hook tail
 #    Pretty-tails the structured hook-event log at
-#    $JUDGE_WORKSPACE_ROOT/hook-logs.jsonl. Each line is one tool call,
+#    $DEVBENCH_WORKSPACE_ROOT/hook-logs.jsonl. Each line is one tool call,
 #    judge verdict, or status transition. Useful for live debugging.
-JUDGE_WORKSPACE_ROOT=/path/to/kanon-deps-work \
-JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_WORKSPACE_ROOT=/path/to/kanon-deps-work \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
 uv run --project /path/to/devbench devbench hook-tail
 
 
 # 5. Backlog status
 #    One-shot summary: epic counts, totals, currently-active unit. Suitable
 #    for `watch -n 30 '...'` in a side terminal.
-JUDGE_WORKSPACE_ROOT=/path/to/kanon-deps-work \
-JUDGE_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+DEVBENCH_WORKSPACE_ROOT=/path/to/kanon-deps-work \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
 uv run --project /path/to/devbench devbench status
+
+
+# ---------------------------------------------------------------------------
+# Daemon mode + lifecycle CLI (#209)
+# ---------------------------------------------------------------------------
+# `--daemon` detaches the orchestrator into the background and frees the
+# operator's terminal. The instance id is printed on launch and stored in
+# `<workspace>/.devbench/orchestrator.pid`. All lifecycle commands accept
+# either the instance id (`<workspace_name>-<pid-suffix>`) or raw PID.
+
+# 6. Non-interactive start (DAEMON mode -- recommended for production / long runs)
+#    Identical to command 1 except the orchestrator detaches into the
+#    background and returns the shell prompt immediately. Stdout/stderr go
+#    to `<workspace>/logs/orchestrator.log` (append).
+DEVBENCH_WORKSPACE_ROOT=/path/to/kanon-deps-work \
+DEVBENCH_CLAUDE_MODEL=us.anthropic.claude-opus-4-7-v1 \
+uv run --project /path/to/devbench python -m devbench.cli start --daemon
+
+# 7. List every running orchestrator on this host
+uv run --project /path/to/devbench devbench instances
+# Or JSON:
+# uv run --project /path/to/devbench devbench instances --json
+
+# 8. Stop an orchestrator by instance id (SIGTERM; SIGKILL only with --force)
+uv run --project /path/to/devbench devbench stop-instance <instance_id>
+# Optional flags: --timeout N (default 30s), --force (escalate to SIGKILL)
+
+# 9. Tail an orchestrator's log by instance id
+uv run --project /path/to/devbench devbench tail <instance_id> --follow
+
+# 10. Restart an orchestrator (stop + start in the same mode)
+uv run --project /path/to/devbench devbench restart <instance_id>

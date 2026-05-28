@@ -91,7 +91,7 @@ The attention-alert surface is ADDITIVE. Removing it does not lose operator-visi
 These are not rhetorical. A future PR answering them concretely is how this spec ships.
 
 1. **How does the surface differentiate "new since last check" from "still waiting"?** Options: a state file persisted per workspace; an operator-supplied `--since <timestamp>` flag; the SKILL's own session-boundary detection; the orchestrator log's last `Set X to` line; a per-item "first-seen" timestamp embedded in the backlog. Trade-offs: persistence complexity vs operator cognitive load.
-2. **How does a multi-workspace operator keep alerts separate?** Options: include the workspace root in every output line; scope state to `$JUDGE_WORKSPACE_ROOT`; require `--workspace <path>` on every call; enforce one-workspace-per-terminal-session via env.
+2. **How does a multi-workspace operator keep alerts separate?** Options: include the workspace root in every output line; scope state to `$DEVBENCH_WORKSPACE_ROOT`; require `--workspace <path>` on every call; enforce one-workspace-per-terminal-session via env.
 3. **Should `sweep-proposals` step 0 also update the alert surface?** If yes, un-materialised JSONs get signalled alongside proposed drafts. If no, the operator has to poll `list-proposals` separately. Trade-off: signal completeness vs surface complexity.
 4. **Is there value in a `--format=json | --format=text` split on `check-attention` output?** JSON is natural for downstream tooling (Slack bots, CI dashboards); text is natural for terminal readers. Implementing both is cheap but adds a small invariant to maintain.
 5. **Should the attention surface write an audit comment on items as it surfaces them?** If yes, every item picks up a `[ATTENTION_FLAGGED]` line the first time it is surfaced -- useful for audit, but clutters the Comments section for operators who prefer a clean file. If no, the surface is read-only (matches current surfaces like `watch` and `hook-tail`).
@@ -103,7 +103,7 @@ The attention-alert surface is orthogonal to the multi-target wiring that prompt
 ## Related files (when this ships)
 
 - `src/devbench/backlog/proposal.py::classify_proposed_task` + `::classify_blocked_task` -- the two helpers the surface composes.
-- `plugin/devbench/skills/orchestrate/SKILL.md` -- option B (alert file) would add an end-of-tick write step.
+- `plugin/devbench-orchestrate/skills/orchestrate/SKILL.md` -- option B (alert file) would add an end-of-tick write step.
 - `src/devbench/activity.py` -- option C (watch panel) lives here.
 - `docs/adr/XX-operator-attention-alerts.md` -- the ADR that records which option was chosen.
 - `docs/cli-reference.md` -- new `check-attention` entry if option A lands.

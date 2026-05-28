@@ -13,7 +13,7 @@ amendment that requested adding two files (``services/api/pyproject.toml``
 on SCOPE because "the requested files are not in the Changes Manifest"
 -- which is the entire purpose of an amendment. Issue #127.
 
-Fix: ``plugin/devbench/agents/manifest-amender.md`` SCOPE rule (rule 2)
+Fix: ``plugin/devbench-orchestrate/agents/manifest-amender.md`` SCOPE rule (rule 2)
 now contains an explicit "Critical (issue #127)" sub-section that:
   1. Forbids using "the requested file is not in the current Changes
      Manifest" as a SCOPE-failure reason.
@@ -37,7 +37,9 @@ from pathlib import Path
 
 import pytest
 
-PROMPT_PATH = Path(__file__).resolve().parent.parent.parent / "plugin" / "devbench" / "agents" / "manifest-amender.md"
+PROMPT_PATH = (
+    Path(__file__).resolve().parent.parent.parent / "plugin" / "devbench-orchestrate" / "agents" / "manifest-amender.md"
+)
 
 
 @pytest.fixture(scope="module")

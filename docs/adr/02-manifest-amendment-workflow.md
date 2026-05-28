@@ -29,7 +29,9 @@ DevBench adds a two-layer solution:
   2. **Layer 2 (narrow LLM judge)** -- `plugin/devbench/agents/manifest-amender.md` answers only the three genuinely-semantic questions: does the Approach authorise the kind of change, is the diff minimal and scoped to linked ACs, does the justification coherently describe the diff. Structural facts are given, not re-litigated.
   3. **Layer 3 (deterministic post-check + atomic rollback)** -- `apply-amendment` appends rows, writes an audit comment, commits via temp-file-plus-rename, and runs em-dash + `validate-backlog` post-checks. Any post-check failure reverts the work-unit file atomically and logs REVIEW_FAIL.
 
-The feature is opt-in per backlog via `backlog/config/devbench.yaml::manifest_amendment.enabled: true` and defaults off. Existing backlogs see no change until they explicitly enable it.
+The feature is configured per backlog via `backlog/config/devbench.yaml::manifest_amendment.enabled`.
+
+> **Update (2026-05):** the default was later flipped to **on** (`enabled: true`); set `enabled: false` to opt out. The original rollout (recorded above) shipped it off-by-default. See CHANGELOG `[Unreleased]`.
 
 ## Consequences
 

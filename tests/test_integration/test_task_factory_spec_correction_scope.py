@@ -16,7 +16,7 @@ the next ``validate-backlog`` run reported the same Manifest Conflict on
 ``pyproject.toml`` (now claimed by 5 tasks including T5) and ``Makefile``
 (now claimed by T1 + T5). The cascade's "fix" reintroduced the bug.
 
-Fix: ``plugin/devbench/agents/task-factory.md`` adds an explicit
+Fix: ``plugin/devbench-orchestrate/agents/task-factory.md`` adds an explicit
 "spec-correction recovery tasks must list ONLY the work-unit markdown"
 section. This test pins the rule by-content via the existing
 ``test_security_review_scope.py`` pattern.
@@ -28,7 +28,9 @@ from pathlib import Path
 
 import pytest
 
-PROMPT_PATH = Path(__file__).resolve().parent.parent.parent / "plugin" / "devbench" / "agents" / "task-factory.md"
+PROMPT_PATH = (
+    Path(__file__).resolve().parent.parent.parent / "plugin" / "devbench-orchestrate" / "agents" / "task-factory.md"
+)
 
 
 @pytest.fixture(scope="module")

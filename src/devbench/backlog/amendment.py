@@ -45,6 +45,7 @@ from devbench.backlog.manifest import (
 )
 from devbench.backlog.parser import BacklogParser
 from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus
+from devbench.utils.io import atomic_write_text
 
 if TYPE_CHECKING:
     from devbench.config_loader import AmendmentConfig
@@ -194,7 +195,7 @@ def write_request(workspace_root: Path, request: AmendmentRequest) -> Path:
             f"Amendment reason {request.reason!r} is not in allowed reasons: {sorted(ALLOWED_AMENDMENT_REASONS)}"
         )
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(request.to_dict(), indent=2) + "\n", encoding="utf-8")
+    atomic_write_text(target, json.dumps(request.to_dict(), indent=2) + "\n")
     return target
 
 
@@ -279,12 +280,12 @@ def apply_amendment(workspace_root: Path, backlog_index: Path, task_id: str) -> 
     audit_entry = _build_audit_entry(request, AMENDMENT_APPLIED_ACTION)
     final_content = _append_audit_comment(content_with_rows, audit_entry)
 
-    _atomic_write(wu_file, final_content)
+    atomic_write_text(wu_file, final_content)
 
     try:
         _post_check(final_content, backlog_index)
     except AmendmentError:
-        _atomic_write(wu_file, original_content)
+        atomic_write_text(wu_file, original_content)
         raise
 
     delete_request(workspace_root, task_id)
@@ -314,11 +315,14 @@ def reject_amendment(
     audit_entry = _build_audit_entry(request, AMENDMENT_REJECTED_ACTION, rejection_reason=rejection_reason)
     content = wu_file.read_text(encoding="utf-8")
     updated = _append_audit_comment(content, audit_entry)
-    _atomic_write(wu_file, updated)
+    atomic_write_text(wu_file, updated)
 
-    mgr = BacklogManager()
-    mgr.mark_blocked(wu_file, backlog_index, task_id, rejection_reason)
-
+    # Issue #210: write the rejected-requests archive + rejection-feedback JSON
+    # BEFORE calling mark_blocked.  mark_blocked runs classify_blocked_task
+    # inline; the classifier's AWAITING_AMENDMENT_RECOVERY signal is the
+    # presence of the archive on disk.  Pre-fix the writes happened AFTER
+    # mark_blocked, so the classifier saw no recovery signal and fell through
+    # to OPERATOR_ACTION_REQUIRED -- the wrong per-class Slack toggle fired.
     archive_rejected_request(workspace_root, task_id)
     # Issue #154: persist the rejection feedback so the executor-feedback
     # collector / blocker-resolver can ingest it on the next retry. The
@@ -331,6 +335,9 @@ def reject_amendment(
         rejection_reason=rejection_reason,
         request=request,
     )
+
+    mgr = BacklogManager()
+    mgr.mark_blocked(wu_file, backlog_index, task_id, rejection_reason)
     logger.info("Amendment rejected for %s: %s", task_id, rejection_reason)
 
 
@@ -396,7 +403,7 @@ def persist_rejection_feedback(
         "recorded_at": rejected_at,
     }
     target = archive_dir / f"{task_id}-{judge}-{attempt}.json"
-    target.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    atomic_write_text(target, json.dumps(payload, indent=2, sort_keys=True) + "\n")
     return target
 
 
@@ -449,13 +456,6 @@ def _categorise_rejection_reason(rejection_reason: str) -> str:
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
-
-
-def _atomic_write(path: Path, content: str) -> None:
-    """Atomically replace the file at ``path`` with ``content``."""
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(content, encoding="utf-8")
-    tmp.replace(path)
 
 
 def _resolve_task_file(backlog_index: Path, task_id: str) -> Path:

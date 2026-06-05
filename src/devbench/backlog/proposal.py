@@ -486,6 +486,90 @@ def classify_blocked_task(
         ):
             return BlockedTaskState.RUNTIME_DEGRADATION
 
+    return _classify_structural_bucket(
+        backlog_root=backlog_root,
+        backlog_index=backlog_index,
+        task_id=task_id,
+        source_file=source_file,
+        workspace_root=workspace_root,
+        now=now,
+        recovery_window_seconds=recovery_window_seconds,
+    )
+
+
+def classify_blocked_task_excluding_degradation(
+    backlog_root: Path,
+    backlog_index: Path,
+    task_id: str,
+    *,
+    workspace_root: Path | None = None,
+    now: datetime | None = None,
+    recovery_window_seconds: int | None = None,
+) -> BlockedTaskState:
+    """Classify ``task_id`` into one of the blocked-task states, skipping the RUNTIME_DEGRADATION rung.
+
+    Issue #248a: ``classify_blocked_task`` early-returns ``RUNTIME_DEGRADATION``
+    at priority 0, masking any co-existing structural blocker. This variant
+    walks the same decision tree with the degradation rung removed so callers
+    can discover the underlying structural bucket independently.
+
+    Decision priority (identical to ``classify_blocked_task`` except priority 0 is absent):
+
+    1. ``HELD`` -- the task's own status in the backlog index is ``hold``.
+    2. ``BLOCKED_ON_HELD`` -- carries a ``[BLOCKED_PENDING_PROPOSAL]`` marker
+       whose target is in ``hold``.
+    3. ``AUTO_CLEARING_VIA_PROPOSAL`` -- at least one non-terminal, non-HOLD
+       marker target exists.
+    4. ``AWAITING_DEPENDENCY`` -- no marker present but a Dependencies-table
+       row points at a non-terminal task.
+    5. ``AWAITING_AMENDMENT_RECOVERY`` -- no marker, no pending dep, but at
+       least one recovery signal is on disk.
+    6. ``OPERATOR_ACTION_REQUIRED`` -- none of the above; operator must act.
+
+    ``RUNTIME_DEGRADATION`` is **never** returned by this function. Use
+    ``classify_blocked_task`` when you need the full seven-bucket result.
+    Consumed by ``generate_report`` to surface the composite line
+    ``RUNTIME_DEGRADATION + structural blocker (<bucket>): ...`` and by the
+    assistant plugin for the same purpose.
+    """
+    source_file = _find_source_task_file(backlog_root, backlog_index, task_id)
+    return _classify_structural_bucket(
+        backlog_root=backlog_root,
+        backlog_index=backlog_index,
+        task_id=task_id,
+        source_file=source_file,
+        workspace_root=workspace_root,
+        now=now,
+        recovery_window_seconds=recovery_window_seconds,
+    )
+
+
+def _classify_structural_bucket(
+    backlog_root: Path,
+    backlog_index: Path,
+    task_id: str,
+    source_file: Path | None,
+    *,
+    workspace_root: Path | None = None,
+    now: datetime | None = None,
+    recovery_window_seconds: int | None = None,
+) -> BlockedTaskState:
+    """Classify ``task_id`` into a structural (non-degradation) blocked-task bucket.
+
+    Shared post-degradation logic consumed by both ``classify_blocked_task``
+    (after the RUNTIME_DEGRADATION rung fires or is skipped) and
+    ``classify_blocked_task_excluding_degradation``. Decision priority:
+
+    1. ``HELD`` -- the task's own status in the backlog index is ``hold``.
+    2. ``BLOCKED_ON_HELD`` / ``AUTO_CLEARING_VIA_PROPOSAL`` -- via
+       ``[BLOCKED_PENDING_PROPOSAL]`` markers (``_classify_with_markers``).
+    3. ``AWAITING_DEPENDENCY`` -- regular Dependencies-table row points at a
+       non-terminal task.
+    4. ``AWAITING_AMENDMENT_RECOVERY`` / ``OPERATOR_ACTION_REQUIRED`` -- via
+       ``_classify_late`` (recovery signals or catch-all).
+
+    Never returns ``RUNTIME_DEGRADATION``.
+    """
     # Priority 1: HELD -- the task itself is in hold status.
     if _task_status_is_hold(backlog_root, backlog_index, task_id):
         return BlockedTaskState.HELD

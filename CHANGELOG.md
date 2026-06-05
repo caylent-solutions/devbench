@@ -89,6 +89,25 @@ since the last release. PR #119 carries every change.
 
 ### Added
 
+- **Composite `RUNTIME_DEGRADATION` + structural blocker classification and report
+  rendering** (issue #248a). `classify_blocked_task` previously returned
+  `RUNTIME_DEGRADATION` at priority 0, masking any co-existing structural blocker
+  (e.g., `AWAITING_DEPENDENCY`). A new
+  `classify_blocked_task_excluding_degradation` function in
+  `src/devbench/backlog/proposal.py` walks the same decision tree with the
+  degradation rung skipped so the underlying structural bucket can be discovered
+  independently. `generate_report` now calls both classifiers for
+  `RUNTIME_DEGRADATION` tasks and, when a structural blocker is present, renders
+  the verbatim composite line:
+  `RUNTIME_DEGRADATION + structural blocker (<bucket>): a restart alone will not
+  clear the structural blocker <task-id>`.
+  Pure `RUNTIME_DEGRADATION` tasks with no structural blocker render the existing
+  `[runtime-degradation]` suffix unchanged. Both classifiers share the
+  post-degradation decision logic via the private `_classify_structural_bucket`
+  helper. `docs/block-types.md` updated with the new function, the composite
+  rendering behaviour, and a full `RUNTIME_DEGRADATION` per-class reference
+  section.
+
 - **claude-opus-4-8 model support** (issue #254d). `DEFAULT_MODEL_RATES` and
   `REPORT_MODEL_RATES` now include `claude-opus-4-8` priced at $5.00 input /
   $25.00 output per MTok -- identical to claude-opus-4-7 list pricing.

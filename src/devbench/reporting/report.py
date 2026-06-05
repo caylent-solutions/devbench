@@ -2195,6 +2195,7 @@ def _classify_blocked_unit_into_buckets(
     from devbench.backlog.proposal import (
         BlockedTaskState,
         classify_blocked_task,
+        classify_blocked_task_excluding_degradation,
         recovery_signal_for_task,
     )
 
@@ -2222,7 +2223,15 @@ def _classify_blocked_unit_into_buckets(
     elif state is BlockedTaskState.BLOCKED_ON_HELD:
         on_held_rows.append(u)
     elif state is BlockedTaskState.RUNTIME_DEGRADATION:
-        runtime_degradation_rows.append(u)
+        # Issue #248a: check for a co-existing structural blocker so the
+        # operator sees that a restart alone will not clear the task.
+        structural_state = classify_blocked_task_excluding_degradation(
+            BACKLOG_ROOT,
+            BACKLOG_INDEX,
+            u.id,
+            workspace_root=WORKSPACE_ROOT,
+        )
+        runtime_degradation_rows.append((u, structural_state))
     elif state is BlockedTaskState.OPERATOR_ACTION_REQUIRED:
         operator_rows.append(u)
     else:
@@ -2239,6 +2248,44 @@ def _render_simple_panel(rows: list, title: str, hint: str, row_suffix: str) -> 
     out = ["", f"Blocked tasks ({title}) ({len(rows)}):", hint]
     for u in rows:
         out.append(f"  - {u.id}: {u.title}    {row_suffix}")
+    return out
+
+
+def _render_runtime_degradation_panel(rows: list) -> list[str]:
+    """Render the RUNTIME_DEGRADATION panel; composite rows carry the structural-blocker suffix.
+
+    Issue #248a: each row in ``rows`` is a ``(unit, structural_state)`` tuple where
+    ``structural_state`` is the result of ``classify_blocked_task_excluding_degradation``.
+    When ``structural_state`` is not ``OPERATOR_ACTION_REQUIRED``, the row carries the
+    verbatim composite line:
+
+        RUNTIME_DEGRADATION + structural blocker (<bucket>): a restart alone will not
+        clear the structural blocker <id>
+
+    A pure-degradation task (``structural_state`` is ``OPERATOR_ACTION_REQUIRED``) renders
+    the standard ``[runtime-degradation -- retries on next orchestrator restart]`` suffix.
+    """
+    if not rows:
+        return []
+    from devbench.backlog.proposal import BlockedTaskState
+
+    out = [
+        "",
+        f"Blocked tasks (runtime-degradation) ({len(rows)}):",
+        (
+            "SDK lost Agent-tool access mid-session; task remains blocked until the orchestrator restarts "
+            "(auto on NO_ACTIONABLE exit; otherwise manual `make start`)."
+        ),
+    ]
+    for u, structural_state in rows:
+        if structural_state is not BlockedTaskState.OPERATOR_ACTION_REQUIRED:
+            suffix = (
+                f"RUNTIME_DEGRADATION + structural blocker ({structural_state.value}): "
+                f"a restart alone will not clear the structural blocker {u.id}"
+            )
+        else:
+            suffix = "[runtime-degradation -- retries on next orchestrator restart]"
+        out.append(f"  - {u.id}: {u.title}    {suffix}")
     return out
 
 
@@ -2322,17 +2369,7 @@ def _render_blocked_panels(
             "[blocked-on-held]",
         )
     )
-    lines.extend(
-        _render_simple_panel(
-            runtime_degradation_rows,
-            "runtime-degradation",
-            (
-                "SDK lost Agent-tool access mid-session; task remains blocked until the orchestrator restarts "
-                "(auto on NO_ACTIONABLE exit; otherwise manual `make start`)."
-            ),
-            "[runtime-degradation -- retries on next orchestrator restart]",
-        )
-    )
+    lines.extend(_render_runtime_degradation_panel(runtime_degradation_rows))
     lines.extend(
         _render_simple_panel(
             operator_rows,
@@ -2385,7 +2422,7 @@ def _blocked_listing(units: list) -> list[str]:
     dependency_rows: list = []
     held_rows: list = []
     on_held_rows: list = []
-    runtime_degradation_rows: list = []
+    runtime_degradation_rows: list[tuple] = []  # (unit, structural_state: BlockedTaskState)
     operator_rows: list = []
 
     for u in eligible:

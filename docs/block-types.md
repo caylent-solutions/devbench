@@ -3,29 +3,121 @@
 ## Overview
 
 Every work unit that carries status `blocked` is classified into exactly one of
-six mutually exclusive states by the `BlockedTaskState` classifier defined in
+seven mutually exclusive states by the `BlockedTaskState` classifier defined in
 `src/devbench/backlog/proposal.py`. The classifier runs during the orchestrator's
 triage sweep and drives the report panel, the `devbench list-blocked` output, and
 the ADR-07 cascade-unblock logic. Understanding which state a task is in tells the
 operator whether to act immediately, wait for automation, or resume a held
-dependency. The six states are, in decision priority order:
-`HELD`, `BLOCKED_ON_HELD`, `AUTO_CLEARING_VIA_PROPOSAL`, `AWAITING_DEPENDENCY`,
-`AWAITING_AMENDMENT_RECOVERY`, and `OPERATOR_ACTION_REQUIRED`.
+dependency. The seven states are, in decision priority order:
+`RUNTIME_DEGRADATION`, `HELD`, `BLOCKED_ON_HELD`, `AUTO_CLEARING_VIA_PROPOSAL`,
+`AWAITING_DEPENDENCY`, `AWAITING_AMENDMENT_RECOVERY`, and
+`OPERATOR_ACTION_REQUIRED`.
+
+Two public classifier functions are available:
+
+- **`classify_blocked_task`** -- full seven-bucket classifier. Returns
+  `RUNTIME_DEGRADATION` at priority 0 when a degradation signal is present,
+  masking any co-existing structural blocker.
+- **`classify_blocked_task_excluding_degradation`** -- six-bucket classifier
+  (issue #248a). Walks the same decision tree with the degradation rung skipped.
+  Returns the underlying structural bucket even when a degradation signal is
+  present. Never returns `RUNTIME_DEGRADATION`. Consumed by `generate_report`
+  to produce the composite line and by the assistant plugin for the same purpose.
 
 
-## Six Classes -- Summary Table
+## Seven Classes -- Summary Table
 
-| State | Cause | Resolution hint | Operator action |
-|---|---|---|---|
-| `HELD` | The task's own status is `hold` -- a deliberate operator pause. | Resume via `devbench set-status <id> in-queue`. | **Required** -- must resume manually. |
-| `BLOCKED_ON_HELD` | The task has a `[BLOCKED_PENDING_PROPOSAL]` marker pointing at a task whose status is `hold`. | Resume the held target task first; the cascade fires once it completes. | **Required** -- resume the held target. |
-| `AUTO_CLEARING_VIA_PROPOSAL` | At least one `[BLOCKED_PENDING_PROPOSAL]` marker target is non-terminal and not `hold`. ADR-07 cascade is in flight. | Wait; the cascade will unblock this task when all marker targets reach `done`/`declined`. | None -- automation handles it. |
-| `AWAITING_DEPENDENCY` | No marker present, but a regular Dependencies-table row points at a non-terminal task. | Wait for the declared dependency to complete. | None -- automation handles it. |
-| `AWAITING_AMENDMENT_RECOVERY` | No marker or pending dep, but a recovery signal is on disk (pending proposal JSON, rejected-amendment archive, or a recent `[BLOCKED]` audit comment from a recovery agent). | Wait; the orchestrator's next sweep will run blocker-resolver / task-factory. | None -- check back if the state persists beyond two sweep cycles. |
-| `OPERATOR_ACTION_REQUIRED` | None of the above match: no marker, no pending dep, no recovery signal. Includes manual gates (`DO NOT CLAIM`), unknown marker targets, and cascade-stuck states. | Inspect the work-unit's Comments section for the most recent `[BLOCKED]` audit row. | **Required** -- operator must investigate and unblock. |
+| State | Priority | Cause | Resolution hint | Operator action |
+|---|---|---|---|---|
+| `RUNTIME_DEGRADATION` | 0 | A recent `[BLOCKED]` audit comment (within 24h) names `agent-tool-unavailable` or `review-supervisor ... only Bash`. Orchestrator runtime is degraded. | Restart the orchestrator via `make start`. | **Required** -- restart resolves automatically. |
+| `HELD` | 1 | The task's own status is `hold` -- a deliberate operator pause. | Resume via `devbench set-status <id> in-queue`. | **Required** -- must resume manually. |
+| `BLOCKED_ON_HELD` | 2 | The task has a `[BLOCKED_PENDING_PROPOSAL]` marker pointing at a task whose status is `hold`. | Resume the held target task first; the cascade fires once it completes. | **Required** -- resume the held target. |
+| `AUTO_CLEARING_VIA_PROPOSAL` | 3 | At least one `[BLOCKED_PENDING_PROPOSAL]` marker target is non-terminal and not `hold`. ADR-07 cascade is in flight. | Wait; the cascade will unblock this task when all marker targets reach `done`/`declined`. | None -- automation handles it. |
+| `AWAITING_DEPENDENCY` | 4 | No marker present, but a regular Dependencies-table row points at a non-terminal task. | Wait for the declared dependency to complete. | None -- automation handles it. |
+| `AWAITING_AMENDMENT_RECOVERY` | 5 | No marker or pending dep, but a recovery signal is on disk (pending proposal JSON, rejected-amendment archive, or a recent `[BLOCKED]` audit comment from a recovery agent). | Wait; the orchestrator's next sweep will run blocker-resolver / task-factory. | None -- check back if the state persists beyond two sweep cycles. |
+| `OPERATOR_ACTION_REQUIRED` | 6 | None of the above match: no marker, no pending dep, no recovery signal. Includes manual gates (`DO NOT CLAIM`), unknown marker targets, and cascade-stuck states. | Inspect the work-unit's Comments section for the most recent `[BLOCKED]` audit row. | **Required** -- operator must investigate and unblock. |
 
 
 ## Per-Class Reference
+
+### RUNTIME_DEGRADATION
+
+**Cause.**
+A recent `[BLOCKED]` audit comment (written within the last 24 hours, after the
+most recent `make start` restart) contains a signal phrase indicating the
+orchestrator runtime is degraded -- specifically `agent-tool-unavailable` or
+`review-supervisor ... only Bash`. The orchestrator cannot dispatch tool calls to
+sub-agents; only restarting the orchestrator via `make start` restores normal
+operation (issue #183).
+
+**Detection.**
+`classify_blocked_task` checks this at priority 0 (before any structural bucket)
+via `_has_runtime_degradation_signal` (`proposal.py`). The check reads the
+work-unit's most recent `[BLOCKED]` audit comment within the 24-hour window
+bounded by the `last-restart` marker at `<workspace>/.devbench/last-restart`.
+If the signal is present the function returns `RUNTIME_DEGRADATION` immediately
+without examining markers, dependencies, or recovery signals.
+
+**Relationship to structural blockers.**
+Because `classify_blocked_task` returns `RUNTIME_DEGRADATION` at priority 0, any
+co-existing structural blocker (e.g., `AWAITING_DEPENDENCY`) is masked. Issue
+#248a introduces `classify_blocked_task_excluding_degradation` to discover the
+underlying structural bucket. When both a degradation signal and a structural
+blocker are present, `generate_report` renders the composite line:
+
+```
+RUNTIME_DEGRADATION + structural blocker (<bucket>): a restart alone will not
+clear the structural blocker <task-id>
+```
+
+This tells the operator that restarting the orchestrator is necessary but
+insufficient -- after the restart the structural blocker still needs to be
+resolved independently.
+
+**Resolution path.**
+Restart the orchestrator (`make start`). The next orchestrator sweep re-classifies
+the task. If the composite line is shown, also resolve the named structural blocker
+after the restart.
+
+**Config / env knobs.**
+
+| Knob | Default | Description |
+|---|---|---|
+| `DEFAULT_BLOCKED_RECOVERY_WINDOW_SECONDS` env: `DEVBENCH_BLOCKED_RECOVERY_WINDOW_SECONDS` | Set in `constants.py` | Window for degradation signal scan (default 24 hours). |
+| `<workspace>/.devbench/last-restart` | Written by `make start` | Timestamp bounding the audit-row scan so pre-restart rows are ignored (issue #215). |
+
+**Operator commands.**
+
+```bash
+# Restart the orchestrator:
+make start
+
+# Check for a co-existing structural blocker (composite case):
+devbench list-blocked --task <task-id>
+# Look for the "RUNTIME_DEGRADATION + structural blocker" composite line.
+```
+
+**Worked example -- pure RUNTIME_DEGRADATION.**
+
+```
+$ devbench list-blocked
+E3-F2-S1-T1  RUNTIME_DEGRADATION  [runtime-degradation]
+
+$ make start
+# After restart, T1 re-classifies on the next sweep.
+```
+
+**Worked example -- composite RUNTIME_DEGRADATION + structural blocker.**
+
+```
+$ devbench list-blocked
+E3-F2-S1-T2  RUNTIME_DEGRADATION + structural blocker (AWAITING_DEPENDENCY):
+             a restart alone will not clear the structural blocker E3-F2-S1-T2
+
+# After `make start`, T2 will show AWAITING_DEPENDENCY.
+# The structural dep must then be resolved separately.
+```
+
 
 ### HELD
 
@@ -526,6 +618,74 @@ devbench show <task-id>
 # Inspect Comments. If the most recent [BLOCKED] row has agent/executor
 # or a review-judge tag, it must NOT produce AWAITING_AMENDMENT_RECOVERY.
 ```
+
+
+## Classifier API
+
+### `classify_blocked_task`
+
+```python
+classify_blocked_task(
+    backlog_root: Path,
+    backlog_index: Path,
+    task_id: str,
+    *,
+    workspace_root: Path | None = None,
+    now: datetime | None = None,
+    recovery_window_seconds: int | None = None,
+) -> BlockedTaskState
+```
+
+Full seven-bucket classifier. Returns one of the seven `BlockedTaskState` values.
+`RUNTIME_DEGRADATION` is returned at priority 0 when a degradation signal is
+detected within the configured window. Because it fires first, any co-existing
+structural blocker is masked. Use `classify_blocked_task_excluding_degradation`
+alongside this function when you need to surface the composite state.
+
+### `classify_blocked_task_excluding_degradation`
+
+```python
+classify_blocked_task_excluding_degradation(
+    backlog_root: Path,
+    backlog_index: Path,
+    task_id: str,
+    *,
+    workspace_root: Path | None = None,
+    now: datetime | None = None,
+    recovery_window_seconds: int | None = None,
+) -> BlockedTaskState
+```
+
+Six-bucket classifier (issue #248a). Identical to `classify_blocked_task` except
+the `RUNTIME_DEGRADATION` rung (priority 0) is skipped. Never returns
+`RUNTIME_DEGRADATION`. Returns the structural bucket that would be reported if
+no degradation signal were present.
+
+**Use cases:**
+
+- **Composite report rendering** -- `generate_report` calls
+  `classify_blocked_task` first. When the result is `RUNTIME_DEGRADATION`, it
+  then calls `classify_blocked_task_excluding_degradation` to obtain the
+  underlying structural bucket and renders the composite line:
+
+  ```
+  RUNTIME_DEGRADATION + structural blocker (<bucket>): a restart alone will not
+  clear the structural blocker <task-id>
+  ```
+
+  The composite line is only emitted when `classify_blocked_task_excluding_degradation`
+  returns a bucket OTHER than `OPERATOR_ACTION_REQUIRED` -- a pure
+  `RUNTIME_DEGRADATION` task with no structural blocker renders the standard
+  `[runtime-degradation]` suffix only.
+
+- **Assistant plugin** -- the plugin calls this function directly so it can
+  explain the structural blocker to the operator even during a degraded session.
+
+**Implementation note.** Both `classify_blocked_task` and
+`classify_blocked_task_excluding_degradation` share the post-degradation
+classification logic via the private helper `_classify_structural_bucket`
+(`proposal.py`). Changes to the structural bucket logic only need to be applied
+once.
 
 
 ## Cross-References

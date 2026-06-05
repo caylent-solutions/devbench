@@ -62,13 +62,13 @@ uv run devbench cost-calibrate <actual-usd> [--window <ISO-8601>]
 
 The command sums devbench's reported cost across every model observed in the window, derives `correction_factor = actual_usd / reported_total`, and writes the factor back to `report.models.<id>.correction_factor` in `backlog/config/devbench.yaml` for every model that contributed to the window. The next `devbench report` reflects the corrected total without further operator action.
 
-**Worked example.** A live workspace running Opus 4.7 with 1M-context observed actual API spend of `$83.66` against `devbench report` reading `$39.57` for the same window:
+**Worked example.** A live workspace running Opus 4.8 with 1M-context observed actual API spend of `$83.66` against `devbench report` reading `$39.57` for the same window:
 
 ```bash
 uv run devbench cost-calibrate 83.66 --window 2026-05-01T00:00:00Z
 ```
 
-The command writes `correction_factor = 83.66 / 39.57 = 2.114` to `report.models.claude-opus-4-7.correction_factor` (and any other model that contributed). Re-run `devbench report` on the same window and the new value matches the invoice within rounding.
+The command writes `correction_factor = 83.66 / 39.57 = 2.114` to `report.models.claude-opus-4-8.correction_factor` (and any other model that contributed). Re-run `devbench report` on the same window and the new value matches the invoice within rounding.
 
 **When to recalibrate.** Re-run `devbench cost-calibrate` whenever any of these change: model routing in `agents:`, the workspace's context-tier (200k vs 1M), Anthropic's published list pricing, or your contract terms. Successive calibrations replace (not multiply) the prior `correction_factor` so re-running is idempotent against a fixed actual-spend figure.
 
@@ -81,6 +81,9 @@ The command writes `correction_factor = 83.66 / 39.57 = 2.114` to `report.models
 ```yaml
 report:
   models:
+    claude-opus-4-8:
+      input: 5.0
+      output: 25.0
     claude-opus-4-7:
       input: 5.0
       output: 25.0
@@ -124,6 +127,7 @@ The legacy fields `report.token_cost_per_million_input`, `report.token_cost_per_
 
 | Model            | Input | Output | Cache read | 5-min cache write | 1-hr cache write |
 | ---------------- | ----- | ------ | ---------- | ----------------- | ---------------- |
+| Claude Opus 4.8  | $5    | $25    | $0.50      | $6.25             | $10              |
 | Claude Opus 4.7  | $5    | $25    | $0.50      | $6.25             | $10              |
 | Claude Opus 4.6  | $5    | $25    | $0.50      | $6.25             | $10              |
 | Claude Opus 4.5  | $5    | $25    | $0.50      | $6.25             | $10              |
@@ -136,7 +140,7 @@ The legacy fields `report.token_cost_per_million_input`, `report.token_cost_per_
 | Claude Haiku 3.5  | $0.80 | $4    | $0.08      | $1                | $1.60            |
 | Claude Haiku 3    | $0.25 | $1.25 | $0.03      | $0.30             | $0.50            |
 
-> Opus 4.7 introduced a new tokenizer that may use significantly more tokens for the same fixed text compared to earlier models -- factor this into cost projections when migrating between Opus generations.
+> Opus 4.8 and 4.7 introduced a new tokenizer that may use significantly more tokens for the same fixed text compared to earlier models -- factor this into cost projections when migrating between Opus generations.
 
 The cache columns are derived from the input rate via the standard Anthropic multipliers (0.10x for reads, 1.25x for 5-min writes, 2.0x for 1-hr writes) and are applied automatically by `devbench report` -- you do not need to set them unless your deployment platform uses different multipliers.
 
@@ -146,11 +150,14 @@ The cache columns are derived from the input rate via the standard Anthropic mul
 
 Drop the matching block into the `report:` section of `backlog/config/devbench.yaml`. Input and output rates are mandatory; cache multipliers default to Anthropic's published values and only need overriding on non-Anthropic platforms.
 
-### Opus 4.7 / 4.6 / 4.5
+### Opus 4.8 / 4.7 / 4.6 / 4.5
 
 ```yaml
 report:
   models:
+    claude-opus-4-8:
+      input: 5.0
+      output: 25.0
     claude-opus-4-7:
       input: 5.0
       output: 25.0
@@ -218,7 +225,7 @@ All cost multipliers are overridable in the `report:` block. The defaults match 
 ```yaml
 report:
   models:
-    claude-opus-4-7:
+    claude-opus-4-8:
       input: 5.0
       output: 25.0
   cache_read_multiplier: 0.10           # default: 0.10 (Anthropic)
@@ -262,7 +269,7 @@ The `report:` section also accepts a `display_timezone` field (IANA zone name) t
 ```yaml
 report:
   models:
-    claude-opus-4-7:
+    claude-opus-4-8:
       input: 5.0
       output: 25.0
   display_timezone: America/Denver   # optional report-specific override; defaults to top-level display_timezone, then system local TZ
@@ -318,7 +325,7 @@ Resolution order (per command): CLI flag or command-specific override > `DEVBENC
 
 ## Long context and batch pricing
 
-Claude Opus 4.7, Opus 4.6, and Sonnet 4.6 support a **1M-token context window** at the same per-token rate as smaller requests -- there is no long-context premium for these models on the Claude API.
+Claude Opus 4.8, Opus 4.7, Opus 4.6, and Sonnet 4.6 support a **1M-token context window** at the same per-token rate as smaller requests -- there is no long-context premium for these models on the Claude API.
 
 The **Batch API** offers 50% off input and output for asynchronous workloads (devbench does not currently use the Batch API; the orchestrator runs interactive sessions).
 
